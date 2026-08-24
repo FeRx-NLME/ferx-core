@@ -110,6 +110,10 @@ section of the SDLC for the versioning policy).
   with no diagnostic from NONMEM (`nonmem_anchor/dose_attr_double_use_{A,B}.ctl`).
 
 ### Fixed
+- **A `[derived]` row aggregate followed by more expression is now an error instead of silently
+  dropping the rest (#1030 review).** `CMAX = max(IPRED) * 2` parsed as the aggregate and discarded
+  the `* 2`, reporting the unscaled maximum. There is no aggregate form that continues into a larger
+  expression, so it now says so rather than returning a wrong number.
 - **A sigma declared past the ones a `combined` `[error_model]` names no longer perturbs the FOCE
   score or the `s` / `rsr` standard errors (#1001 review).** `dr_diag_d_log_sigma`'s `Combined` arm
   answered every `sigma_k >= 1` with the *additive* sigma's derivative, where its `additive` and
@@ -241,7 +245,10 @@ section of the SDLC for the versioning policy).
   one with it, in `[individual_parameters]`, `[odes]`, `[scaling]`, `[derived]`, and
   `[initial_conditions]`; (3) **`min(a, b)`
   and `max(a, b)`** are available everywhere the DSL parses expressions, desugaring to the inline
-  conditional so they differentiate and compile exactly like the hand-written `if (a >= b) a else b`.
+  conditional so they differentiate and compile exactly like the hand-written `if (a >= b) a else b`
+  — each argument appears twice in the desugared tree, so clamp a named intermediate rather than a
+  long expression. In `[derived]`, where `min`/`max` also name the row aggregate, the two are told
+  apart by the second argument: a comparison is a row filter, anything else is the numeric clamp.
   The three-line readout now reads the way the published Mlxtran does. Two smaller diagnostics come
   with it: `max(a, b)` used to report `Missing closing parenthesis for function max`, which sent the
   reader after a bracket bug that did not exist — arity errors now say so — and a `[scaling]` key

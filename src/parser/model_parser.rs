@@ -4079,8 +4079,36 @@ fn parse_derived_block(
                         }
                     );
                     (kind, uses)
+                } else if matches!(fname_lc.as_str(), "max" | "min")
+                    && args.len() == 2
+                    && !tokens_contain_comparison(args[1])
+                {
+                    // Two-argument numeric `min(a, b)` / `max(a, b)` (#1030) shares a
+                    // spelling with the aggregate's `min(<value>, <row filter>)`.
+                    // Disambiguate the way the rest of the parser already does: a
+                    // second argument with no comparison operator cannot be a row
+                    // filter, so this is the numeric form. Parsed as a plain expression
+                    // over the *whole* statement, so it means the same thing at
+                    // statement top level as it does nested one level in.
+                    let expr = parse_derived_expr(&tokens, ctx)?;
+                    let uses = expr_refs_compartments(&expr, ctx.ode_state_names);
+                    (
+                        DerivedKind::PerRow {
+                            eval: build_derived_eval_fn(expr),
+                        },
+                        uses,
+                    )
                 } else {
                     // max / min / tmax
+                    // Trailing tokens after the aggregate's closing `)` used to be
+                    // silently dropped: `max(A1) * 2` computed `max(A1)`. No aggregate
+                    // form continues into a larger expression, so say so.
+                    if close_idx + 1 != tokens.len() {
+                        return Err(format!(
+                            "[derived] `{name}`: unexpected token(s) after `{fname_lc}(…)` — an \
+                             aggregate over rows cannot be combined into a larger expression."
+                        ));
+                    }
                     let agg_fn = match fname_lc.as_str() {
                         "max" => AggFunction::Max,
                         "min" => AggFunction::Min,
@@ -7916,6 +7944,12 @@ fn parse_scaling_block(
         // An intermediate whose name is already a θ / η / individual parameter /
         // state would never be read: the expression parser binds those before it
         // consults the intermediate table, so the binding would be silently dead.
+        //
+        // A declared covariate clashes the other way round — an unresolved
+        // identifier in `[scaling]` parses as `Covariate(name)`, which the
+        // substituter *does* rewrite, so the binding would silently shadow the data
+        // column and drop it from the required-column set (#1030). Rejected either
+        // way: one name, one meaning.
         let clash = theta_names
             .iter()
             .map(|n| (n, "a theta"))
@@ -7926,12 +7960,17 @@ fn parse_scaling_block(
                     .map(|n| (n, "an individual parameter")),
             )
             .chain(state_names.iter().map(|n| (n, "a compartment")))
+            .chain(
+                declared_covariates
+                    .iter()
+                    .map(|n| (n, "a declared covariate")),
+            )
             .find(|(n, _)| *n == name);
         if let Some((_, what)) = clash {
             return Err(format!(
                 "[scaling]: `{name}` is already {what}, so it cannot also be a named \
-                 intermediate — a reference to it would resolve to {what}, never to this \
-                 line. Rename the intermediate."
+                 intermediate — one name cannot mean two things here. Rename the \
+                 intermediate."
             ));
         }
     }
@@ -14212,6 +14251,12 @@ fn scaling_intermediate_reserved(name: &str) -> Option<&'static str> {
     if is_synthetic_readout_param(name) {
         return Some("a reserved internal parameter prefix");
     }
+    if matches!(
+        name.to_ascii_uppercase().as_str(),
+        "TAD" | "TAFD" | "MACHEPS"
+    ) {
+        return Some("an eval-time built-in");
+    }
     None
 }
 
@@ -14349,22 +14394,31 @@ fn inline_scaling_intermediates(
     Ok(())
 }
 
-/// Every identifier appearing in a `[scaling]` source expression, as raw tokens.
+/// Every identifier appearing in a `[scaling]` source expression **in a position
+/// the AST substituter can reach**, as raw tokens.
+///
 /// Used for the reachability scan behind the unused-intermediate rejection, which
 /// needs names only and must not depend on how any particular scope resolves them.
+/// The one thing it must agree with is [`substitute_scaling_intermediates`], which
+/// only rewrites `Variable` / `Covariate` *leaves*: an identifier followed by `(`
+/// parses as a function call and one followed by `.` as an `[covariate_nn]` output
+/// access, so an intermediate named in either position is never inlined and must
+/// still be reported as unused rather than counted as a read (#1030).
 fn source_identifiers(src: &str) -> Vec<String> {
-    match tokenize(src) {
-        Ok(toks) => toks
-            .into_iter()
-            .filter_map(|t| match t {
-                Token::Ident(s) => Some(s),
-                _ => None,
-            })
-            .collect(),
-        // A malformed expression is reported with full context by the real parse;
-        // contributing no names here just means it reaches nothing.
-        Err(_) => Vec::new(),
+    // A malformed expression is reported with full context by the real parse;
+    // contributing no names here just means it reaches nothing.
+    let Ok(toks) = tokenize(src) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (i, tok) in toks.iter().enumerate() {
+        let Token::Ident(name) = tok else { continue };
+        if matches!(toks.get(i + 1), Some(Token::LParen) | Some(Token::Dot)) {
+            continue;
+        }
+        out.push(name.clone());
     }
+    out
 }
 
 /// Reject a named intermediate that no `obs_scale` / `y` entry reaches (#1030).
@@ -14383,6 +14437,7 @@ fn check_scaling_intermediates_used(
     }
     let mut reached: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut queue: Vec<String> = Vec::new();
+    let mut declared_above: Vec<&str> = Vec::new();
     for line in lines {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -14390,9 +14445,26 @@ fn check_scaling_intermediates_used(
         }
         let (key, value) = split_scaling_entry(trimmed)?;
         let (base, _cmt) = parse_scaling_key(key)?;
-        if is_scaling_entry_key(base) {
-            queue.extend(source_identifiers(value));
+        if !is_scaling_entry_key(base) {
+            declared_above.push(base);
+            continue;
         }
+        // Entries obey the same define-above-use-below rule the intermediates
+        // themselves do. `inline_scaling_intermediates` substitutes an entry
+        // against the whole table regardless of source order, so without this the
+        // rule would be enforced on one side only (#1030).
+        for name in source_identifiers(value) {
+            if intermediates.iter().any(|(n, _)| *n == name)
+                && !declared_above.contains(&name.as_str())
+            {
+                return Err(format!(
+                    "[scaling] {key}: references the named intermediate `{name}`, which is \
+                     declared on or below this line. An intermediate must be declared above \
+                     every entry that uses it."
+                ));
+            }
+        }
+        queue.extend(source_identifiers(value));
     }
     while let Some(name) = queue.pop() {
         let Some((n, src)) = intermediates.iter().find(|(n, _)| *n == name) else {

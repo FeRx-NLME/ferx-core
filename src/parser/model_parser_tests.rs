@@ -11472,6 +11472,93 @@ fn test_scaling_intermediate_reserved_name_rejected() {
     );
 }
 
+/// `TAD` / `TAFD` / `MACHEPS` are supplied by the evaluator, so a binding under one
+/// of those names is either dead or a silent override. Rejected like `TIME`.
+#[test]
+fn test_scaling_intermediate_eval_builtin_name_rejected() {
+    for name in ["TAD", "TAFD", "MACHEPS"] {
+        let src =
+            analytical_model_with_scaling(Some(&format!("  {name} = 2\n  obs_scale = {name}\n")));
+        let err = parse_model_string(&src)
+            .expect_err("an eval-time built-in must be rejected as an intermediate");
+        assert!(
+            err.contains("eval-time built-in") && err.contains(name),
+            "expected built-in shadowing error for {name}, got: {}",
+            err
+        );
+    }
+}
+
+/// A declared covariate clashes the *other* way round from a θ/η/state: an
+/// unresolved `[scaling]` identifier parses as `Covariate(name)`, which the
+/// substituter does rewrite — so an intermediate named after a data column would
+/// silently shadow it and drop it from the required-column set. Rejected too.
+#[test]
+fn test_scaling_intermediate_covariate_shadowing_rejected() {
+    let src = "\
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(50.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.05 (sd)
+
+[covariates]
+  WT continuous
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[scaling]
+  WT = 70
+  obs_scale = WT
+";
+    let err = parse_model_string(src)
+        .expect_err("an intermediate named after a declared covariate must be rejected");
+    assert!(
+        err.contains("a declared covariate") && err.contains("WT"),
+        "expected covariate shadowing error, got: {}",
+        err
+    );
+}
+
+/// Define-above-use-below is enforced on both sides: an *entry* may not read an
+/// intermediate declared below it either, even though the substitution itself is
+/// order-independent.
+#[test]
+fn test_scaling_entry_forward_reference_rejected() {
+    let src = analytical_model_with_scaling(Some("  obs_scale = FOO * 2\n  FOO = 3\n"));
+    let err = parse_model_string(&src)
+        .expect_err("an entry reading an intermediate declared below it must be rejected");
+    assert!(
+        err.contains("declared on or below this line") && err.contains("FOO"),
+        "expected entry forward-reference error, got: {}",
+        err
+    );
+}
+
+/// The dead-binding guard scans tokens while the substitution walks the AST, so the
+/// two must agree on what counts as a *read*. An identifier followed by `(` parses
+/// as a function call, never a `Variable`/`Covariate` leaf — so the intermediate is
+/// not inlined, and must be reported rather than silently vanishing.
+#[test]
+fn test_scaling_intermediate_in_unreachable_position_is_reported() {
+    let src = analytical_model_with_scaling(Some("  FOO = 2\n  obs_scale = FOO(V)\n"));
+    let err = parse_model_string(&src)
+        .expect_err("an intermediate the substituter cannot reach must be reported unused");
+    assert!(
+        err.contains("is never used") && err.contains("FOO"),
+        "expected unused-intermediate error, got: {}",
+        err
+    );
+}
+
 // ── Two-argument min / max (#1030) ──────────────────────────────────────────
 
 #[test]
@@ -14488,6 +14575,72 @@ fn parse_derived_per_row() {
     } else {
         panic!("expected PerRow");
     }
+}
+
+/// `min`/`max` at a `[derived]` statement's top level used to be read *only* as the
+/// row aggregate, so the two-argument numeric form (#1030) meant one thing nested
+/// (`1 * max(CL, 2)`) and failed outright unnested. A second argument with no
+/// comparison operator cannot be a row filter, so both spellings now agree.
+#[test]
+fn parse_derived_two_arg_max_at_statement_top_level() {
+    let (theta, eta, indiv_params, covariates, prev_derived) = make_derived_ctx_simple();
+    let eval_one = |derived: &str| {
+        let src = minimal_model_with_derived(derived);
+        let parsed = parse_full_model(&src).expect("two-arg max at top level parses");
+        let DerivedKind::PerRow { eval } = &parsed.model.derived_exprs[0].kind else {
+            panic!("expected PerRow, got the row aggregate");
+        };
+        let ctx = DerivedContext {
+            theta: &theta,
+            eta: &eta,
+            indiv_params: &indiv_params,
+            covariates: &covariates,
+            ipred: 0.0,
+            pred: 0.0,
+            dv: 0.0,
+            time: 1.0,
+            tafd: 1.0,
+            tad: 1.0,
+            prev_derived: &prev_derived,
+            compartments: &[],
+            compartment_names: &[],
+        };
+        eval(&ctx)
+    };
+    // CL = 1: the floor bites at top level exactly as it does nested.
+    assert_eq!(eval_one("X = max(CL, 2.0)"), 2.0);
+    assert_eq!(eval_one("X = 1 * max(CL, 2.0)"), 2.0);
+    assert_eq!(eval_one("X = min(CL, 2.0)"), 1.0);
+    // Still an expression, not a call: trailing operators are honoured.
+    assert_eq!(eval_one("X = max(CL, 2.0) * 3"), 6.0);
+}
+
+/// A second argument that *is* a comparison keeps meaning the row filter.
+#[test]
+fn parse_derived_aggregate_filter_still_parses() {
+    let src = minimal_model_with_derived("CMAX = max(IPRED, TIME > 0)");
+    let parsed = parse_full_model(&src).expect("aggregate with a row filter parses");
+    assert!(matches!(
+        parsed.model.derived_exprs[0].kind,
+        DerivedKind::Aggregate { .. }
+    ));
+}
+
+/// Trailing tokens after a row aggregate's `)` used to be dropped in silence, so
+/// `max(IPRED) * 2` computed `max(IPRED)`. No aggregate form continues into a
+/// larger expression, so it is now an error rather than a wrong number.
+#[test]
+fn parse_derived_aggregate_rejects_trailing_tokens() {
+    let src = minimal_model_with_derived("CMAX = max(IPRED) * 2");
+    let err = match parse_full_model(&src) {
+        Ok(_) => panic!("trailing tokens after an aggregate must error"),
+        Err(e) => e,
+    };
+    assert!(
+        err.contains("unexpected token(s) after"),
+        "expected the trailing-token error, got: {}",
+        err
+    );
 }
 
 #[test]
