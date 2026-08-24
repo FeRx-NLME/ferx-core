@@ -1,8 +1,8 @@
 //! Integration tests for custom / time-varying residual-error magnitude (#484).
 //!
 //! Tier-2: each test calls the public `fit()` boundary but returns immediately
-//! — eval-only (`outer_maxiter = 0`) OFV evaluations or an `Err` (the method
-//! reject) — so they stay fast and are compile-checked on every PR.
+//! — eval-only (`outer_maxiter = 0`) OFV evaluations, or a couple of SAEM
+//! passes — so they stay fast and are compile-checked on every PR.
 //!
 //! The headline check is that a sigma magnitude written as an expression of
 //! TIME / a theta reaches the FOCEI objective: with the late-phase inflation
@@ -140,19 +140,39 @@ fn active_magnitude_changes_ofv() {
     );
 }
 
-#[test]
-fn magnitude_rejects_saem() {
-    // SAEM does not yet apply the per-observation magnitude — reject up front.
-    let model = parse_model_string(&time_varying_ruv_src("2.0")).expect("parses");
+/// Two SAEM passes on the custom-magnitude model, at the given late-phase
+/// inflation factor. SAEM used to be rejected outright for a custom magnitude;
+/// since #1029 it applies the per-observation multiplier like every other
+/// estimator, so this must run and score.
+fn saem_ofv(ruv_late_init: &str) -> f64 {
+    let model = parse_model_string(&time_varying_ruv_src(ruv_late_init)).expect("model must parse");
     let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
         .expect("warfarin data must load");
     let mut opts = FitOptions::default();
     opts.method = EstimationMethod::Saem;
     opts.methods = vec![];
-    let err = fit(&model, &population, &model.default_params, &opts)
-        .expect_err("SAEM with a custom magnitude must be rejected");
+    // A couple of cheap passes: this is a wiring check, not a convergence test.
+    opts.saem_n_exploration = 2;
+    opts.saem_n_convergence = 2;
+    opts.saem_seed = Some(1);
+    let result = fit(&model, &population, &model.default_params, &opts)
+        .expect("SAEM must accept a custom residual-error magnitude");
+    assert!(result.ofv.is_finite(), "SAEM OFV must be finite");
+    result.ofv
+}
+
+/// SAEM accepts the custom magnitude *and* applies it: the same two passes with
+/// the late-phase inflation at 1 (inert) and at 2 (active) must not score the
+/// same objective. A SAEM path that read the residual variance without the
+/// per-observation multiplier would return identical OFVs.
+#[test]
+fn saem_applies_the_custom_magnitude() {
+    let ofv_inert = saem_ofv("1.0");
+    let ofv_active = saem_ofv("2.0");
     assert!(
-        err.contains("custom residual-error magnitude") && err.contains("foce"),
-        "unexpected error: {err}"
+        (ofv_active - ofv_inert).abs() > 1e-6,
+        "SAEM scored an inert and an active magnitude identically \
+         (inert={ofv_inert}, active={ofv_active}) — the per-observation \
+         multiplier is not reaching its likelihood"
     );
 }
