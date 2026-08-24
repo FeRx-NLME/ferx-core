@@ -203,6 +203,17 @@ worst_of <- function(col) {
 worst_pct <- worst_of("pct")
 worst_se <- worst_of("se_units")
 
+# Gridlines for a ratio axis: the coarsest step that still yields ~5 ticks over the observed
+# span, always including 1 since that is the line the whole figure is read against.
+ratio_breaks <- function(v, target = 7) {
+  span <- range(v, finite = TRUE)
+  cand <- c(0.01, 0.02, 0.05, 0.10, 0.25, 0.50, 1.00)
+  step <- cand[diff(span) / cand <= target][1]
+  if (is.na(step)) step <- 1
+  b <- seq(floor(span[1] / step) * step, ceiling(span[2] / step) * step, by = step)
+  sort(unique(c(1, b[b > 0])))
+}
+
 panel <- function(xvar, band, xlab, fmt, labels, lab_at = band) {
   lab <- dev |> filter(abs(.data[[xvar]]) > lab_at)
   ggplot(dev, aes(.data[[xvar]], parameter, group = estimator)) +
@@ -402,7 +413,10 @@ p4 <- ggplot(rat, aes(factor(id), r, fill = tool)) +
   geom_point(shape = 21, size = 2.6, colour = "white", stroke = 0.6) +
   facet_wrap(~eta, nrow = 1) +
   scale_fill_manual(values = COL) +
-  scale_y_log10(breaks = c(0.5, 0.75, 1, 1.5, 2), labels = c("0.5×", "0.75×", "1×", "1.5×", "2×")) +
+  # Ticks follow the data. A fixed ladder (0.5, 0.75, 1, 1.5, 2) left the 10% arm with a single
+  # labelled gridline at 1x, because everything there sits inside 0.86-1.15 -- the reader could
+  # see points scattered around a line and had no way to tell whether that scatter was 2% or 40%.
+  scale_y_log10(breaks = ratio_breaks(rat$r), labels = function(b) sprintf("%g×", b)) +
   labs(
     title = "Tier 2b, as a ratio — how far off each tool is, per subject",
     subtitle = sprintf(paste0(
