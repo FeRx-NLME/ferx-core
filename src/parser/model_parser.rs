@@ -7405,6 +7405,26 @@ fn build_init_amount_fn(
     let expr = parse_scalar_expression(value, ctx)
         .map_err(|e| format!("[initial_conditions] init: {}", e))?;
 
+    // Same `TIME` rejection as the `[odes]` init directive (#994): the analytical
+    // baseline amount is evaluated once per subject at t = 0, so an
+    // `Expression::Time` here reads the model-time thread-local's 0.0 and the
+    // reference silently contributes nothing. Only `TIME` is rejected on this
+    // surface — `T` / `TAFD` / `TAD` / `MACHEPS` are *not* built-ins outside
+    // `[odes]`, they parse as covariate leaves and become required data columns,
+    // the same deliberate rule `[scaling]` follows (#1028). See
+    // `ODE_INIT_REJECTED_BUILTINS`.
+    if expr_references_time_node(&expr) {
+        return Err(format!(
+            "[initial_conditions] init: `{}` references the `TIME` built-in, but an \
+             initial condition is evaluated at the time origin — `TIME` there is \
+             always exactly 0, so the expression can only ever read as its t = 0 \
+             value. Write that value directly; a time-dependent readout belongs in \
+             `[scaling]` Form C (`y = <expr>`), where `TIME` resolves per \
+             observation. See issue #994.",
+            value.trim()
+        ));
+    }
+
     // Reject KAPPA_* (IOV) references, mirroring the Form C ODE readout guard
     // (`build_y_output_fn`, issue #107). The init expression's eta scope is
     // BSV-only, so a kappa name parses as an unresolved identifier and would
@@ -9840,23 +9860,83 @@ fn build_ode_spec(
                 .map_err(|e| format!("[odes] init({}): {}", name, e))?;
             let mut undef: std::collections::HashSet<String> = std::collections::HashSet::new();
             collect_undefined_vars(&expr, &init_defined, &mut undef);
-            // MACHEPS is a builtin constant that `eval_expression` resolves to
-            // f64::EPSILON case-insensitively, so accept any casing here (the
-            // exact-key `init_defined` carries only states/params, not MACHEPS).
-            undef.retain(|n| !n.eq_ignore_ascii_case("MACHEPS"));
-            if !undef.is_empty() {
-                let mut names: Vec<String> = undef.into_iter().collect();
-                names.sort();
+            // The init built-ins are constants/indices that `eval_expression`
+            // resolves case-insensitively, so accept any casing here (the
+            // exact-key `init_defined` carries only states/params). `MIXNUM`
+            // never reaches `undef` — it parses to its own `Expression::MixNum`
+            // node — but is filtered anyway so this list is the single place the
+            // accepted built-ins are named.
+            undef.retain(|n| {
+                !ODE_INIT_SCOPE_BUILTINS
+                    .iter()
+                    .any(|b| n.eq_ignore_ascii_case(b))
+            });
+            // Split the out-of-scope names into the time clocks and everything
+            // else, so each gets the diagnostic that explains it (#994). The
+            // clocks reach `undef` under any casing (`T`, `t`, `Tafd`, …), and a
+            // bare `TIME`/`time` reaches none of it at all — it parses to
+            // `Expression::Time`, a dedicated node rather than a `Variable`,
+            // which is exactly how it evaded this check and became the bug. Both
+            // routes converge here so all spellings of all four clocks get one
+            // message: previously `TIME` was accepted, `time` accepted, and
+            // `Time` reported as a plain undefined name.
+            let mut clocks: Vec<String> = Vec::new();
+            if expr_references_time_node(&expr) {
+                clocks.push("TIME".to_string());
+            }
+            undef.retain(|n| {
+                if ODE_INIT_REJECTED_BUILTINS
+                    .iter()
+                    .any(|b| n.eq_ignore_ascii_case(b))
+                {
+                    clocks.push(n.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            clocks.sort();
+            clocks.dedup();
+            let mut names: Vec<String> = undef.into_iter().collect();
+            names.sort();
+            // Report both problems from one parse — an expression can carry a
+            // clock and an undefined name at once, and fixing them one error per
+            // parse is two round-trips for one line.
+            if !clocks.is_empty() {
+                let also = if names.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " It also references undefined name(s): {}.",
+                        names.join(", ")
+                    )
+                };
+                return Err(format!(
+                    "[odes] init({}): references the time built-in(s): {}. An initial \
+                     condition is evaluated at the time origin, so a clock there is \
+                     always exactly 0 and the expression can only ever read as its \
+                     t = 0 value. Write that value directly, or move the time \
+                     dependence into the `d/dt(...)` RHS, where `TIME` resolves to \
+                     the integrator's current time.{} See issue #994.",
+                    name,
+                    clocks.join(", "),
+                    also,
+                ));
+            }
+            if !names.is_empty() {
                 let mut defined = init_ctx_defined.clone();
                 defined.sort();
                 return Err(format!(
                     "[odes] init({}): references undefined name(s): {}. An init \
                      expression may only reference declared states (0 at init \
-                     time), individual parameters, or the MACHEPS constant \
-                     (defined: {}).",
+                     time), individual parameters, or the {} built-ins \
+                     (defined: {}). The time built-ins ({}) are out of scope — an \
+                     initial condition is evaluated at the time origin.",
                     name,
                     names.join(", "),
+                    ODE_INIT_SCOPE_BUILTINS.join(" / "),
                     defined.join(", "),
+                    ODE_INIT_REJECTED_BUILTINS.join(", "),
                 ));
             }
             init_specs.push((idx, expr));
@@ -14092,6 +14172,22 @@ fn collect_covariates_in_stmts(stmts: &[Statement], out: &mut std::collections::
     });
 }
 
+/// Whether `expr` contains the model-time built-in node itself — the
+/// `Expression::Time` a bare `TIME` / `time` parses to. Unlike
+/// [`expr_references_time_builtin`] this does **not** also match the `T` / `t`
+/// alias: the alias fold (`rewrite_scaling_time_alias`) never runs on an
+/// `init(...)` RHS, so `T` there is an ordinary identifier that the surrounding
+/// scope checks already handle. Drives the init-time rejection (#994).
+fn expr_references_time_node(expr: &Expression) -> bool {
+    let mut found = false;
+    visit_expr_nodes(expr, &mut |e| {
+        if matches!(e, Expression::Time) {
+            found = true;
+        }
+    });
+    found
+}
+
 fn stmts_use_time_builtin(stmts: &[Statement]) -> bool {
     let mut found = false;
     visit_stmt_nodes(stmts, &mut |e| {
@@ -14156,6 +14252,43 @@ pub(crate) fn compiled_model_uses_time_builtin(model: &CompiledModel) -> bool {
         .as_ref()
         .is_some_and(|program| program.uses_time_builtin)
 }
+
+/// Built-in names an `[odes] init(state) = ...` expression may reference **in
+/// addition to** the model's own declared states (bound to 0 at t = 0) and its
+/// individual parameters. Matched case-insensitively, as both built-ins are.
+///
+/// Scoped to the `[odes]` surface on purpose. The analytical
+/// `[initial_conditions] init(cmt) = ...` surface parses with `ParseCtx::new`,
+/// where an unresolved identifier is an `Expression::Covariate` rather than an
+/// `Expression::Variable` — so `MACHEPS` there is an ordinary (and therefore
+/// required) data column, not machine epsilon, which only [`MapEnv::resolve`]'s
+/// `Variable` arm supplies. `MIXNUM` is the one entry that does carry over: it
+/// parses to its own `Expression::MixNum` node and resolves through
+/// `current_mixture_class()` on both surfaces.
+///
+/// Public so a downstream generator (`ferxtranslate`) can mirror the init scope
+/// rule instead of probing the engine one name at a time (issue #994). The
+/// `[odes] init(...)` diagnostic is rendered from this list, so the message and
+/// the guard cannot drift apart.
+pub const ODE_INIT_SCOPE_BUILTINS: &[&str] = &["MACHEPS", "MIXNUM"];
+
+/// Built-in names an `[odes] init(state) = ...` expression may **not**
+/// reference. Every one of them is a time-since-something clock, and an initial
+/// condition is evaluated at the time origin, so each would read a constant 0
+/// and silently flatten the expression (issue #994). `TIME` is rejected by an
+/// AST-node guard ([`expr_references_time_node`] — a bare `TIME` parses to a
+/// dedicated `Expression::Time` node, not a variable, which is how it evaded the
+/// undefined-name check); `T`, `TAFD` and `TAD` are ordinary identifiers in an
+/// `[odes]` init RHS and are caught by the undefined-name check around it.
+///
+/// Only the first entry carries to the analytical `[initial_conditions]`
+/// surface. `TIME` is rejected there too (same node guard, same reason), but
+/// `T` / `TAFD` / `TAD` are ordinary covariates outside `[odes]` — the same
+/// deliberate rule `[scaling]` follows, so a dataset that really carries a `TAD`
+/// column can use it (see `ODE_ONLY_BUILTINS` in `api::validation`, #1028).
+/// A consumer mirroring this list on an analytical model would reject a legal
+/// covariate reference.
+pub const ODE_INIT_REJECTED_BUILTINS: &[&str] = &["TIME", "T", "TAFD", "TAD"];
 
 /// Accumulate every `Variable(name)` in an expression whose name is not a key in
 /// `defined` — i.e. a name that would resolve to the `usize::MAX` "reads 0.0"

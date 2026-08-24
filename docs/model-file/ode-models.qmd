@@ -81,6 +81,51 @@ for an indirect-response / turnover model — declare an initial condition in th
 - Compartments without an `init(...)` line start at zero, as before.
 - This is the analogue of NONMEM's `A_0(n)`.
 
+### What an `init(...)` expression may reference {#init-scope}
+
+The scope is closed. It is **not** identical on the two init surfaces — the
+`[odes]` block injects solver built-ins that do not exist outside it, so
+`[odes] init(...)` and the analytical
+[`[initial_conditions]`](initial-conditions.qmd) block differ on four names:
+
+| Name | `[odes] init(...)` | `[initial_conditions] init(...)` |
+|---|---|---|
+| declared states | yes — bound to `0` (no drug is present yet) | n/a |
+| individual parameters | yes (folds in `theta` / `eta` / covariates) | yes, plus `theta` / `eta` directly |
+| covariates by name | no — reach them through `[individual_parameters]` | yes — a required, case-sensitive data column |
+| `MIXNUM` | yes (any casing) | yes (any casing) |
+| `MACHEPS` | yes (any casing) — machine epsilon | **no** — an ordinary covariate here |
+| `TIME` / `time` | **rejected** | **rejected** |
+| `T`, `TAFD`, `TAD` | **rejected** | ordinary covariates |
+| `KAPPA_*` (IOV) | n/a | rejected (see that page) |
+
+`MIXNUM` resolves to the subject's mixture class on both surfaces, so a
+class-switched baseline works. `MACHEPS` / `TAFD` / `TAD` are **solver-injected
+built-ins only inside `[odes]`**; anywhere else — `[scaling]` and
+`[initial_conditions]` alike — the name is an ordinary covariate that must be a
+data column. That is deliberate, so a dataset that really carries a `TAD` column
+can use it.
+
+`TIME` is the one name rejected on both surfaces. An initial condition is
+evaluated at the time origin, so a clock there reads exactly `0` and the
+expression can only ever produce its `t = 0` value. Before issue
+[#994](https://github.com/FeRx-NLME/ferx-core/issues/994) a bare `TIME` was
+**accepted** on both — `init(central) = TIME * SOMETHING` initialised the
+compartment to zero, validated clean, and fitted — while `Time` was reported as
+an undefined name and `T` / `TAFD` / `TAD` were rejected, a split that followed
+how each name happened to be represented in the parser rather than any scope
+decision. Put the time dependence in `d/dt(...)`, where `TIME` resolves to the
+integrator's current time, or in a `[scaling]` Form C readout on the analytical
+path, where it resolves per observation.
+
+The `[odes]` built-in name sets are exposed by the engine
+(`ODE_INIT_SCOPE_BUILTINS` / `ODE_INIT_REJECTED_BUILTINS`) so a code generator
+can source the rule from the same binary it will parse with, instead of keeping
+its own copy — the same arrangement as `known_block_names()` for block names.
+They are named for the `[odes]` surface because that is what they describe:
+mirroring them on an analytical model would reject a legal `TAD` covariate and
+accept a `MACHEPS` that is really a missing data column.
+
 **Time-varying covariates.** Because the initial condition is a pre-record
 baseline, it is evaluated a single time using the covariate values from the
 subject's **first record**. If a covariate that feeds the `init` expression
