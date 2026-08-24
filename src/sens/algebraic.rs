@@ -36,11 +36,18 @@
 //!
 //! # Scope
 //!
-//! Declined (→ finite differences, loudly, via [`supported`]) for IOV (`n_kappa >
-//! 0`), for a per-CMT readout, for a readout that is not dual-evaluable (a bare
-//! θ/η the parser could not desugar, or a neural-network output), and past the
-//! axis cap. Each is a *route* decline, not a silent wrong gradient — the same
-//! contract the closed-form and ODE providers hold.
+//! Two pairs of walks: [`subject_sensitivities`] / [`subject_eta_grad`] for a
+//! model with between-subject variability only, and
+//! [`subject_sensitivities_iov`] / [`subject_eta_grad_iov`] for one that also
+//! carries κ (see the IOV section below). The BSV walks decline a κ-carrying model
+//! outright — its κ has nowhere to go in their axis layout — which is why
+//! [`supported`] and [`supported_iov`] are separate predicates rather than one.
+//!
+//! Declined (→ finite differences, loudly, at the gate) for a per-CMT readout, for
+//! a readout that is not dual-evaluable (a bare θ/η the parser could not desugar,
+//! or a neural-network output), and past the axis cap. Each is a *route* decline,
+//! not a silent wrong gradient — the same contract the closed-form and ODE
+//! providers hold.
 
 use super::dual1::Dual1;
 use super::dual2::Dual2;
@@ -269,6 +276,349 @@ const _: () = assert!(
     "the two `disp!` ladders above enumerate 1..=24 explicitly; widening the cap \
      without widening both would let an in-scope model hit `_ => None` and fall \
      back to FD while the fit reports an analytic gradient"
+);
+
+// ── Inter-occasion variability ──────────────────────────────────────────────
+//
+// A compartment-free model's κ enters through the individual parameters the
+// readout reads, and nowhere else — there is no concentration to carry a
+// per-occasion dynamic. That is why `pk::predict_iov` evaluates the readout **per
+// occasion** for such a model instead of once from the BSV η, and it is the same
+// reason these walks seed the κ axes rather than dropping them: a BSV-only jet
+// would report `∂y/∂κ = 0` for a model whose whole between-arm structure lives
+// there.
+//
+// The axis layout is the stacked one every IOV provider uses: θ on `0..n_theta`,
+// η_bsv on `n_theta..n_theta+n_eta`, and occasion group `g`'s κ block at
+// `n_theta + n_eta + g·n_kappa`. Widths are bucketed (`ODE_IOV_WIDTH_BUCKETS`)
+// because the stacked count grows with the number of occasions — an MBMA study
+// with many treatment arms is exactly that case — and monomorphising every width
+// to 96 is the compile-cost trap #971 measured.
+
+/// One observation's occasion-group index, or `None` when it carries no occasion
+/// label (κ held at 0, matching `pk::predict_iov`).
+type ObsGroups = Vec<Option<usize>>;
+
+/// Per-observation occasion groups and the stacked-η width, or `None` when the
+/// subject's labelling does not fit the stacked convention.
+fn iov_layout(
+    model: &CompiledModel,
+    subject: &Subject,
+    stacked_eta: &[f64],
+) -> Option<(ObsGroups, usize)> {
+    let occ_groups = crate::stats::likelihood::iov_occasion_groups(subject);
+    if occ_groups.is_empty() {
+        return None;
+    }
+    let n_stacked = model.n_eta + occ_groups.len() * model.n_kappa;
+    if stacked_eta.len() != n_stacked {
+        return None;
+    }
+    let occ_to_k = crate::stats::likelihood::iov_occ_to_k(&occ_groups);
+    // An unlabelled observation is legitimate (production holds its κ at 0); an
+    // observation whose label is not a known group is not, and declining beats
+    // guessing which block its κ derivatives belong in.
+    let groups = (0..subject.obs_times.len())
+        .map(|j| match subject.occasions.get(j) {
+            Some(occ) => occ_to_k.get(occ).copied().map(Some),
+            None => Some(None),
+        })
+        .collect::<Option<ObsGroups>>()?;
+    Some((groups, n_stacked))
+}
+
+/// Widest stacked `(θ, η_bsv, κ…)` axis count these IOV walks admit. Shares the
+/// ODE IOV cap and its bucket ladder: the stacked width is the only thing that
+/// grows with the occasion count, while the per-occasion derivative source
+/// (`iov_combined_derivs_dyn`) runs over `(θ, η_bsv, κ_current)` and stays under
+/// the ordinary 24-axis table — which `supported_iov` checks separately.
+const MAX_ALGEBRAIC_IOV_AXES: usize = crate::sens::ode_provider::MAX_ODE_IOV_AXES;
+
+/// Whether these IOV walks serve `model`. As with [`supported`], a caller that
+/// reports a gradient method must consult this rather than `is_algebraic()`.
+///
+/// The per-occasion width bound (`n_theta + n_eta + n_kappa ≤ MAX_ALGEBRAIC_AXES`)
+/// is the `iov_combined_derivs_dyn` table's, and is checked here rather than
+/// discovered at the first observation — otherwise a model past it would report
+/// analytic and then decline per subject.
+pub(crate) fn supported_iov(model: &CompiledModel) -> bool {
+    if !model.is_algebraic() || model.n_kappa == 0 {
+        return false;
+    }
+    // `programs` declines every model with a κ (the non-IOV walks cannot serve
+    // one), so re-do its readout/program checks here without that clause.
+    let Some(readout) = model.analytic_readout.as_ref() else {
+        return false;
+    };
+    let dual_ok = match (&readout.readout, &readout.program) {
+        (crate::ode::OdeReadout::Single(_), Some(p)) => p.is_dual_evaluable(),
+        _ => false,
+    };
+    // Under IOV the individual-parameter program is built over the **combined**
+    // random-effect vector `[η_bsv, κ]`, so its η axis is `n_eta + n_kappa` — not
+    // `n_eta`, which is what the non-IOV `programs` checks. Same convention as
+    // `iov_analytical_supported`.
+    let n_eff = model.n_eta + model.n_kappa;
+    let prog_ok = model
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .is_some_and(|p| p.n_theta_axis() == model.n_theta && p.n_eta_axis() == n_eff);
+    dual_ok
+        && prog_ok
+        && (1..=MAX_ALGEBRAIC_AXES).contains(&(model.n_theta + model.n_eta + model.n_kappa))
+}
+
+/// The readout program and the individual-parameter program, for the IOV walks.
+/// [`programs`] cannot be reused: it declines every κ-carrying model.
+fn iov_programs(model: &CompiledModel) -> Option<(&IndivParamProgram, &OdeOutputProgram)> {
+    if !supported_iov(model) {
+        return None;
+    }
+    let readout = model.analytic_readout.as_ref()?;
+    let prog_out = match &readout.readout {
+        crate::ode::OdeReadout::Single(_) => readout.program.as_ref()?,
+        _ => return None,
+    };
+    let prog_indiv = model.indiv_param_partials.indiv_param_program.as_ref()?;
+    Some((prog_indiv, prog_out))
+}
+
+/// Second-order stacked-axis jet for the FOCE/FOCEI outer gradient under IOV.
+fn run_obs_iov<const M: usize>(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    stacked_eta: &[f64],
+) -> Option<SubjectSens> {
+    let (prog_indiv, prog_out) = iov_programs(model)?;
+    let (n_theta, n_eta, n_kappa) = (model.n_theta, model.n_eta, model.n_kappa);
+    let n_eff = n_eta + n_kappa;
+    let (groups, n_stacked) = iov_layout(model, subject, stacked_eta)?;
+    let slot_row = crate::sens::provider::seed_dim_from_slots(prog_indiv.pk_slots_ref());
+    let n_rows = prog_indiv.pk_slots_ref().len();
+    let uses_time = compiled_model_uses_time_builtin(model);
+
+    let (mut vars, mut stack): (Vec<Dual2<M>>, Vec<Dual2<M>>) = (Vec::new(), Vec::new());
+    let mut obs: Vec<ObsSens> = Vec::with_capacity(subject.obs_times.len());
+    for (j, &group) in groups.iter().enumerate() {
+        // The occasion's combined effect: `[η_bsv, κ_g]`, or `[η_bsv, 0…]` for an
+        // unlabelled observation — the same two cases `predict_iov` distinguishes.
+        let combined = match group {
+            Some(g) => {
+                crate::stats::likelihood::iov_combined_effect(stacked_eta, n_eta, n_kappa, g)
+            }
+            None => crate::stats::likelihood::iov_combined_pk_only(stacked_eta, n_eta, n_kappa),
+        };
+        let cov = subject.obs_cov(j);
+        let param_time = subject.obs_times.get(j).copied().unwrap_or(0.0);
+        let pk = {
+            let _guard = ModelTimeGuard::enter_if(uses_time, param_time);
+            (model.pk_param_fn)(theta, &combined, cov, param_time)
+        };
+        let cd = {
+            let _guard = ModelTimeGuard::enter_if(uses_time, param_time);
+            crate::sens::provider::iov_combined_derivs_dyn(
+                prog_indiv, n_theta, n_eff, n_rows, cov, theta, &combined,
+            )?
+        };
+
+        // Combined column `c` → stacked axis. η_bsv is shared across occasions;
+        // κ lands in this group's block, or is dropped when the row carries no
+        // occasion (its κ is held at 0, so it has no derivative).
+        let kappa_base = group.map(|g| n_theta + n_eta + g * n_kappa);
+        let axis = |c: usize| -> Option<usize> {
+            let ax = if c < n_eta {
+                n_theta + c
+            } else {
+                kappa_base? + (c - n_eta)
+            };
+            (ax < M).then_some(ax)
+        };
+        let params: Vec<Dual2<M>> = (0..pk.values.len())
+            .map(|s| {
+                let val = pk.values[s];
+                let Some(i) = slot_row.get(s).copied().flatten() else {
+                    return Dual2::constant(val);
+                };
+                let n_th = n_theta.min(M);
+                let mut grad = [0.0; M];
+                let mut hess = [[0.0; M]; M];
+                grad[..n_th].copy_from_slice(&cd.dtheta[i][..n_th]);
+                for c in 0..n_eff {
+                    let Some(ax) = axis(c) else { continue };
+                    grad[ax] = cd.deta[i][c];
+                    for d in 0..n_eff {
+                        if let Some(bx) = axis(d) {
+                            hess[ax][bx] = cd.d2eta[i][c][d];
+                        }
+                    }
+                    // Writes the symmetric pair `hess[ax][m]` / `hess[m][ax]`, so
+                    // the index is used on both sides of the matrix — an iterator
+                    // over one row cannot express it.
+                    #[allow(clippy::needless_range_loop)]
+                    for m in 0..n_th {
+                        let v = cd.d2eta_theta[i][c][m];
+                        hess[ax][m] = v;
+                        hess[m][ax] = v;
+                    }
+                }
+                Dual2 {
+                    value: val,
+                    grad,
+                    hess,
+                }
+            })
+            .collect();
+
+        let y = {
+            let _guard = ModelTimeGuard::enter(subject.readout_time(j));
+            prog_out.eval_output_g::<Dual2<M>>(&[], &params, cov, &mut vars, &mut stack)
+        };
+        let y = apply_output_transform(model, y);
+        // Scatter over the **stacked** η, which is what the block-Ω assembly
+        // (`prepare_stacked`) consumes for an IOV subject.
+        obs.push(obs_sens_from_dual2(&y, n_theta, n_stacked));
+    }
+    Some(SubjectSens { obs })
+}
+
+/// First-order stacked-axis jet for the inner EBE loop under IOV.
+fn run_obs_grad_iov<const N: usize>(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    stacked_eta: &[f64],
+) -> Option<Vec<ObsGrad>> {
+    let (prog_indiv, prog_out) = iov_programs(model)?;
+    let (n_theta, n_eta, n_kappa) = (model.n_theta, model.n_eta, model.n_kappa);
+    let n_eff = n_eta + n_kappa;
+    let (groups, n_stacked) = iov_layout(model, subject, stacked_eta)?;
+    let slot_row = crate::sens::provider::seed_dim_from_slots(prog_indiv.pk_slots_ref());
+    let n_rows = prog_indiv.pk_slots_ref().len();
+    let uses_time = compiled_model_uses_time_builtin(model);
+
+    let (mut vars, mut stack): (Vec<Dual1<N>>, Vec<Dual1<N>>) = (Vec::new(), Vec::new());
+    let mut out: Vec<ObsGrad> = Vec::with_capacity(subject.obs_times.len());
+    for (j, &group) in groups.iter().enumerate() {
+        let combined = match group {
+            Some(g) => {
+                crate::stats::likelihood::iov_combined_effect(stacked_eta, n_eta, n_kappa, g)
+            }
+            None => crate::stats::likelihood::iov_combined_pk_only(stacked_eta, n_eta, n_kappa),
+        };
+        let cov = subject.obs_cov(j);
+        let param_time = subject.obs_times.get(j).copied().unwrap_or(0.0);
+        let pk = {
+            let _guard = ModelTimeGuard::enter_if(uses_time, param_time);
+            (model.pk_param_fn)(theta, &combined, cov, param_time)
+        };
+        let cd = {
+            let _guard = ModelTimeGuard::enter_if(uses_time, param_time);
+            crate::sens::provider::iov_combined_derivs_dyn(
+                prog_indiv, n_theta, n_eff, n_rows, cov, theta, &combined,
+            )?
+        };
+        // Inner axes are the stacked η alone — no θ block, no Hessian.
+        let kappa_base = group.map(|g| n_eta + g * n_kappa);
+        let axis = |c: usize| -> Option<usize> {
+            let ax = if c < n_eta {
+                c
+            } else {
+                kappa_base? + (c - n_eta)
+            };
+            (ax < N).then_some(ax)
+        };
+        let params: Vec<Dual1<N>> = (0..pk.values.len())
+            .map(|s| {
+                let val = pk.values[s];
+                let Some(i) = slot_row.get(s).copied().flatten() else {
+                    return Dual1::constant(val);
+                };
+                let mut grad = [0.0; N];
+                for c in 0..n_eff {
+                    if let Some(ax) = axis(c) {
+                        grad[ax] = cd.deta[i][c];
+                    }
+                }
+                Dual1 { value: val, grad }
+            })
+            .collect();
+
+        let y = {
+            let _guard = ModelTimeGuard::enter(subject.readout_time(j));
+            prog_out.eval_output_g::<Dual1<N>>(&[], &params, cov, &mut vars, &mut stack)
+        };
+        let y = apply_output_transform(model, y);
+        out.push(ObsGrad {
+            f: y.value,
+            df_deta: y.grad[..n_stacked.min(N)].to_vec(),
+        });
+    }
+    Some(out)
+}
+
+/// Outer IOV entry point over the stacked `[η_bsv, κ_0…κ_{K−1}]` vector.
+///
+/// Widths are **bucketed**: the runtime stacked count is rounded up to the next
+/// entry of `ODE_IOV_WIDTH_BUCKETS` and the extra lanes are left zero, which is
+/// inert (every seed guards its axis writes, every read indexes by the runtime
+/// count). Enumerating all 96 widths instead would monomorphise this walk 96
+/// times for no numerical gain — the compile-cost trap #971 measured.
+pub(crate) fn subject_sensitivities_iov(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    stacked_eta: &[f64],
+) -> Option<SubjectSens> {
+    let dim = model.n_theta + stacked_eta.len();
+    macro_rules! arms {
+        ($($m:literal),+ $(,)?) => {
+            match crate::sens::widths::bucket_for(dim, &crate::sens::ode_provider::ODE_IOV_WIDTH_BUCKETS)? {
+                $($m => run_obs_iov::<$m>(model, subject, theta, stacked_eta),)+
+                _ => None,
+            }
+        };
+    }
+    arms!(
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 28,
+        32, 40, 48, 56, 64, 80, 96
+    )
+}
+
+/// Inner IOV entry point: `∂f/∂(stacked η)` per observation.
+pub(crate) fn subject_eta_grad_iov(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    stacked_eta: &[f64],
+) -> Option<Vec<ObsGrad>> {
+    let dim = stacked_eta.len();
+    macro_rules! arms {
+        ($($n:literal),+ $(,)?) => {
+            match crate::sens::widths::bucket_for(dim, &crate::sens::ode_provider::ODE_IOV_WIDTH_BUCKETS)? {
+                $($n => run_obs_grad_iov::<$n>(model, subject, theta, stacked_eta),)+
+                _ => None,
+            }
+        };
+    }
+    arms!(
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 28,
+        32, 40, 48, 56, 64, 80, 96
+    )
+}
+
+// Both IOV ladders above enumerate `ODE_IOV_WIDTH_BUCKETS` literally, because
+// `macro_rules!` cannot iterate a const. If the ladder is retuned there without
+// editing both arm lists here, an in-scope subject would hit `_ => None` and fall
+// back to FD silently — the failure this assert exists to turn into a compile error.
+const _: () = assert!(
+    crate::sens::widths::buckets_well_formed(
+        &crate::sens::ode_provider::ODE_IOV_WIDTH_BUCKETS,
+        MAX_ALGEBRAIC_IOV_AXES
+    ),
+    "the algebraic IOV ladders are written against ODE_IOV_WIDTH_BUCKETS; keep the \
+     literal arm lists in step with it"
 );
 
 #[cfg(test)]

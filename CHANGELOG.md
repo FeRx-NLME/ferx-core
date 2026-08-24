@@ -264,11 +264,15 @@ section of the SDLC for the versioning policy).
   draws from. Blocks that presuppose compartments (`[odes]`, `[initial_conditions]`,
   `[diffusion]`, `[scaling]`) are rejected by name rather than silently ignored. Such a model
   takes the **analytic** `Dual2` gradient on both the inner and outer loops — with no state to
-  integrate the sensitivity is a chain rule over the individual-parameter program — falling back
-  to finite differences (reported as such) only for inter-occasion variability or more than 24
-  estimated `(θ, η)`. Anchored against the equivalent NONMEM `$PRED` fit: agreement to ~1e-4
+  integrate the sensitivity is a chain rule over the individual-parameter program — including
+  under inter-occasion variability, where the equation is evaluated per occasion and the gradient
+  seeded on that occasion's `kappa` axes (what makes a between-treatment-arm variance component
+  estimable rather than frozen). Finite differences remain only past the axis caps, and are
+  reported as such. Anchored against the equivalent NONMEM `$PRED` fit: agreement to ~1e-4
   relative on every estimate and standard error, and to 5 decimal places on the objective
-  (`nonmem_anchor/algebraic_emax.*`). See `examples/emax_timecourse.ferx`.
+  (`nonmem_anchor/algebraic_emax.*`). See `examples/emax_timecourse.ferx`, and
+  `examples/mbma_naproxen.ferx` for the published model-based meta-analysis case study
+  (Bracis et al., *CPT:PSP* 2026;15:e70158) it reproduces to three significant figures.
 - **`[scaling]` accepts named intermediates, expressions can be split across lines, and `min`/`max`
   take two arguments (#1030).** Three restrictions that individually looked defensible combined to
   make a standard bounded-endpoint readout unmaintainable: a model-based meta-analysis logit-Emax

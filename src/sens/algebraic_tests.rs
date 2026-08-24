@@ -296,38 +296,258 @@ fn algebraic_model_declines_the_closed_form_provider() {
     );
 }
 
-/// IOV is out of scope for now (the readout would need per-occasion seeding).
-/// It must decline here *and* stop reporting analytic, so the fit falls back to
-/// FD — which differentiates the per-occasion f64 predictor and is correct.
-#[test]
-fn algebraic_model_with_iov_declines_to_fd() {
-    let src = "[parameters]\n\
+// ── Inter-occasion variability ──────────────────────────────────────────────
+
+/// An MBMA-shaped IOV model: between-study η on the baseline, between-arm κ on the
+/// maximum effect. `extra_params` / `extra_indiv` vary the equation per test.
+fn iov_model_src(extra_params: &str, extra_indiv: &str, equation: &str) -> String {
+    format!(
+        "[parameters]\n\
         \x20 theta TVE0(10.0, 0.1, 100.0)\n\
         \x20 theta TVEMAX(6.0, 0.1, 100.0)\n\
         \x20 theta TVET50(2.0, 0.01, 100.0)\n\
-        \x20 omega ETA_E0 ~ 0.09\n\
-        \x20 kappa KAPPA_E0 ~ 0.04\n\
+        {extra_params}\
+        \x20 omega ETA_E0   ~ 0.09\n\
+        \x20 kappa KAPPA_EMAX ~ 0.04\n\
         \x20 sigma PROP ~ 0.04 (sd)\n\n\
         [individual_parameters]\n\
-        \x20 E0   = TVE0 * exp(ETA_E0 + KAPPA_E0)\n\
-        \x20 EMAX = TVEMAX\n\
-        \x20 ET50 = TVET50\n\n\
+        \x20 E0   = TVE0 * exp(ETA_E0)\n\
+        \x20 EMAX = TVEMAX * exp(KAPPA_EMAX)\n\
+        \x20 ET50 = TVET50\n\
+        {extra_indiv}\n\
         [structural_model]\n\
-        \x20 y = E0 - EMAX * TIME / (ET50 + TIME)\n\n\
+        {equation}\n\
         [error_model]\n\
-        \x20 DV ~ proportional(PROP)\n";
-    let model = compile(src);
-    assert!(model.is_algebraic());
-    assert!(model.n_kappa > 0, "the test must exercise the IOV path");
-    assert!(!supported(&model), "IOV is out of scope for now");
-    let subj = subject(vec![], vec![]);
+        \x20 DV ~ proportional(PROP)\n\n\
+        [fit_options]\n\
+        \x20 iov_column = OCC\n"
+    )
+}
+
+/// Six observations split across two occasions (treatment arms), the shape an MBMA
+/// study has. `obs_cov` optionally makes the covariates time-varying.
+fn iov_subject(obs_cov: Vec<Vec<(&str, f64)>>) -> Subject {
+    let mut s = subject(vec![], obs_cov);
+    s.occasions = vec![1, 1, 1, 2, 2, 2];
+    s
+}
+
+/// The IOV jet, every block, against central finite differences of the production
+/// per-occasion predictor `pk::predict_iov`. This is the check that would fail if
+/// the κ axes were dropped: the derivative would be exactly zero while the FD is
+/// not.
+fn check_iov_vs_fd(model: &crate::types::CompiledModel, subject: &Subject, stacked: &[f64]) {
+    let theta: Vec<f64> = model.default_params.theta.clone();
+    let (n_eta, n_kappa, n_theta) = (model.n_eta, model.n_kappa, theta.len());
+    let k_groups = crate::stats::likelihood::iov_occasion_groups(subject).len();
+    assert_eq!(stacked.len(), n_eta + k_groups * n_kappa);
+
+    let sens = subject_sensitivities_iov(model, subject, &theta, stacked)
+        .expect("the IOV walk must serve this model");
+
+    // Stacked vector → `predict_iov`'s (η_bsv, per-group κ) form.
+    let pred = |st: &[f64], th: &[f64], j: usize| -> f64 {
+        let eta_bsv = st[..n_eta].to_vec();
+        let kappas: Vec<Vec<f64>> = (0..k_groups)
+            .map(|g| {
+                let base = n_eta + g * n_kappa;
+                st[base..base + n_kappa].to_vec()
+            })
+            .collect();
+        crate::pk::predict_iov(model, subject, th, &eta_bsv, &kappas)[j]
+    };
+
+    let stacked = stacked.to_vec();
+    let n_st = stacked.len();
+    let (he, ht, heh) = (1e-6_f64, 1e-6_f64, 1e-4_f64);
+
+    for (j, obs) in sens.obs.iter().enumerate() {
+        approx::assert_relative_eq!(obs.f, pred(&stacked, &theta, j), max_relative = 1e-12);
+
+        for k in 0..n_st {
+            let (mut sp, mut sm) = (stacked.clone(), stacked.clone());
+            sp[k] += he;
+            sm[k] -= he;
+            let g = (pred(&sp, &theta, j) - pred(&sm, &theta, j)) / (2.0 * he);
+            approx::assert_relative_eq!(obs.df_deta[k], g, max_relative = 2e-4, epsilon = 1e-7);
+
+            for l in 0..n_st {
+                let at = |dk: f64, dl: f64| {
+                    let mut s = stacked.clone();
+                    s[k] += dk;
+                    s[l] += dl;
+                    pred(&s, &theta, j)
+                };
+                let hh = (at(heh, heh) - at(heh, -heh) - at(-heh, heh) + at(-heh, -heh))
+                    / (4.0 * heh * heh);
+                approx::assert_relative_eq!(
+                    obs.d2f_deta2[k * n_st + l],
+                    hh,
+                    max_relative = 3e-3,
+                    epsilon = 1e-5
+                );
+            }
+        }
+
+        for m in 0..n_theta {
+            let step = ht * (1.0 + theta[m].abs());
+            let (mut tp, mut tm) = (theta.clone(), theta.clone());
+            tp[m] += step;
+            tm[m] -= step;
+            let g = (pred(&stacked, &tp, j) - pred(&stacked, &tm, j)) / (2.0 * step);
+            approx::assert_relative_eq!(obs.df_dtheta[m], g, max_relative = 2e-4, epsilon = 1e-7);
+        }
+
+        for k in 0..n_st {
+            for m in 0..n_theta {
+                let s = heh * (1.0 + theta[m].abs());
+                let at = |dk: f64, dm: f64| {
+                    let (mut st, mut th) = (stacked.clone(), theta.clone());
+                    st[k] += dk;
+                    th[m] += dm;
+                    pred(&st, &th, j)
+                };
+                let hh = (at(heh, s) - at(heh, -s) - at(-heh, s) + at(-heh, -s)) / (4.0 * heh * s);
+                approx::assert_relative_eq!(
+                    obs.d2f_deta_dtheta[k * n_theta + m],
+                    hh,
+                    max_relative = 3e-3,
+                    epsilon = 1e-5
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn algebraic_iov_jet_matches_fd_of_predict_iov() {
+    let model = compile(&iov_model_src(
+        "",
+        "",
+        "  y = E0 - EMAX * TIME / (ET50 + TIME)\n",
+    ));
+    assert!(model.is_algebraic() && model.n_kappa == 1);
+    assert!(supported_iov(&model));
+    // stacked = [η_E0, κ_group0, κ_group1].
+    check_iov_vs_fd(&model, &iov_subject(vec![]), &[0.15, 0.08, -0.12]);
+}
+
+/// Time-varying covariates under IOV: the per-observation re-seeding and the
+/// per-occasion κ block have to compose.
+#[test]
+fn algebraic_iov_jet_matches_fd_with_time_varying_covariates() {
+    let model = compile(&iov_model_src(
+        "  theta TVSLOPE(0.4, -5.0, 5.0)\n",
+        "  SLOPE = TVSLOPE\n",
+        "  y = E0 - EMAX * TIME / (ET50 + TIME) + SLOPE * DOSE\n",
+    ));
+    let per_obs: Vec<Vec<(&str, f64)>> = (0..6).map(|i| vec![("DOSE", 5.0 * (i as f64))]).collect();
+    let subj = iov_subject(per_obs);
+    assert!(subj.has_tv_covariates());
+    check_iov_vs_fd(&model, &subj, &[0.15, 0.08, -0.12]);
+}
+
+/// A nonlinear readout, so the κ-κ and κ-θ second-order blocks are not trivially
+/// zero — a linear equation would pass the Hessian checks by accident.
+#[test]
+fn algebraic_iov_jet_matches_fd_on_a_nonlinear_readout() {
+    let model = compile(&iov_model_src(
+        "",
+        "",
+        "  y = ln(E0 + exp(EMAX * TIME / (ET50 + TIME)))\n",
+    ));
+    check_iov_vs_fd(&model, &iov_subject(vec![]), &[0.15, 0.08, -0.12]);
+}
+
+/// The whole point of seeding the κ axes: `∂y/∂κ` must be non-zero, and must
+/// belong to the observation's *own* occasion block. A BSV-only jet would report
+/// zero for both, and every κ estimate would sit at its initial value.
+#[test]
+fn algebraic_iov_kappa_derivatives_are_per_occasion() {
+    let model = compile(&iov_model_src(
+        "",
+        "",
+        "  y = E0 - EMAX * TIME / (ET50 + TIME)\n",
+    ));
+    let subj = iov_subject(vec![]);
     let theta = model.default_params.theta.clone();
-    let eta = vec![0.1; model.n_eta];
+    let sens =
+        subject_sensitivities_iov(&model, &subj, &theta, &[0.15, 0.08, -0.12]).expect("in scope");
+    // Observation 0 is in group 0, observation 3 in group 1. Stacked layout is
+    // [η_E0, κ_g0, κ_g1], and `TIME = 0` for observation 0 makes its EMAX term
+    // vanish — so use the later observation of each group.
+    let (k_g0, k_g1) = (1, 2);
+    let a = &sens.obs[1]; // group 0
+    let b = &sens.obs[4]; // group 1
     assert!(
-        subject_sensitivities(&model, &subj, &theta, &eta).is_none(),
-        "an out-of-scope model must decline, not return a gradient"
+        a.df_deta[k_g0].abs() > 1e-6,
+        "an observation must depend on its own occasion's kappa"
     );
-    assert!(subject_eta_grad(&model, &subj, &theta, &eta).is_none());
+    assert_eq!(a.df_deta[k_g1], 0.0, "and not on another occasion's kappa");
+    assert!(b.df_deta[k_g1].abs() > 1e-6);
+    assert_eq!(b.df_deta[k_g0], 0.0);
+}
+
+/// The inner IOV walk must agree with the outer jet's own stacked `∂f/∂η`.
+#[test]
+fn algebraic_iov_inner_grad_matches_the_outer_jet() {
+    let model = compile(&iov_model_src(
+        "",
+        "",
+        "  y = ln(E0 + exp(EMAX * TIME / (ET50 + TIME)))\n",
+    ));
+    let subj = iov_subject(vec![]);
+    let theta = model.default_params.theta.clone();
+    let stacked = [0.15, 0.08, -0.12];
+    let outer = subject_sensitivities_iov(&model, &subj, &theta, &stacked).expect("outer");
+    let inner = subject_eta_grad_iov(&model, &subj, &theta, &stacked).expect("inner");
+    assert_eq!(outer.obs.len(), inner.len());
+    for (o, i) in outer.obs.iter().zip(&inner) {
+        approx::assert_relative_eq!(o.f, i.f, max_relative = 1e-14);
+        for k in 0..stacked.len() {
+            approx::assert_relative_eq!(o.df_deta[k], i.df_deta[k], max_relative = 1e-14);
+        }
+    }
+}
+
+/// An IOV model reports analytic on both loops, so the reported gradient method
+/// matches the route taken.
+#[test]
+fn algebraic_iov_model_reports_analytic() {
+    let model = compile(&iov_model_src(
+        "",
+        "",
+        "  y = E0 - EMAX * TIME / (ET50 + TIME)\n",
+    ));
+    assert!(crate::sens::provider::iov_sens_supported(&model));
+    assert!(crate::sens::provider::analytic_outer_gradient_available(
+        &model
+    ));
+    // The non-IOV walks still decline it — an IOV model's κ has nowhere to go there.
+    assert!(!supported(&model));
+}
+
+/// A compartment IOV model must not be claimed by this provider.
+#[test]
+fn compartment_iov_models_are_not_claimed() {
+    let src = "[parameters]\n\
+        \x20 theta TVCL(3.0, 0.01, 100.0)\n\
+        \x20 theta TVV(20.0, 1.0, 500.0)\n\
+        \x20 omega ETA_CL ~ 0.09\n\
+        \x20 kappa KAPPA_CL ~ 0.04\n\
+        \x20 sigma PROP ~ 0.04 (sd)\n\n\
+        [individual_parameters]\n\
+        \x20 CL = TVCL * exp(ETA_CL + KAPPA_CL)\n\
+        \x20 V  = TVV\n\n\
+        [structural_model]\n\
+        \x20 pk one_cpt_iv(cl=CL, v=V)\n\n\
+        [error_model]\n\
+        \x20 DV ~ proportional(PROP)\n\n\
+        [fit_options]\n\
+        \x20 iov_column = OCC\n";
+    let model = compile(src);
+    assert!(model.n_kappa > 0 && !model.is_algebraic());
+    assert!(!supported_iov(&model));
 }
 
 /// A compartment model must not be claimed by this provider.

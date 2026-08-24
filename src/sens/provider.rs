@@ -1194,7 +1194,7 @@ fn resolve_param_derivs(
 /// PK slot → differentiated-row index of a `pd`/`dp_deta` whose rows follow `slots`
 /// order: `out[slots[i]] = Some(i)` for every in-range slot, `None` otherwise.
 /// Hoisted from the five identical `[None; N_PK]` build loops (F4).
-fn seed_dim_from_slots(slots: &[usize]) -> [Option<usize>; N_PK] {
+pub(crate) fn seed_dim_from_slots(slots: &[usize]) -> [Option<usize>; N_PK] {
     let mut seed_dim: [Option<usize>; N_PK] = [None; N_PK];
     for (i, &slot) in slots.iter().enumerate() {
         if slot < N_PK {
@@ -1454,6 +1454,10 @@ pub fn iov_sens_supported(model: &CompiledModel) -> bool {
     }
     iov_analytical_supported(model)
         || (ODE_SENS_ENABLED && crate::sens::ode_provider::ode_iov_supported(model))
+        // Compartment-free (#811): κ reaches the prediction only through the
+        // individual parameters the readout reads, so its IOV jet is the ordinary
+        // readout jet seeded on the stacked κ axes — no walk, no carryover.
+        || crate::sens::algebraic::supported_iov(model)
 }
 
 /// Light **inner** η-gradient (`∂f/∂(stacked-η)` per observation) for an IOV subject
@@ -1470,6 +1474,11 @@ pub(crate) fn subject_eta_grad_iov(
     // Closed-form transit/IG IOV → its ODE twin (issue #719); no-op otherwise. See
     // `subject_sensitivities_iov`.
     let model = model.effective_for(subject);
+    // Compartment-free (#811) first: `ode_spec` is `None` and `pk_model` is a
+    // placeholder, so the closed-form branch below would misread it.
+    if model.is_algebraic() {
+        return crate::sens::algebraic::subject_eta_grad_iov(model, subject, theta, stacked_eta);
+    }
     if model.ode_spec.is_some() {
         if ODE_SENS_ENABLED {
             return crate::sens::ode_provider::ode_subject_eta_grad_iov(
@@ -1508,6 +1517,18 @@ pub fn subject_sensitivities_iov(
     // this fires only on the model-blind loader that put the TTE rows in `obs_times`.
     if model.ode_spec.is_none() && !crate::pk::subject_feeds_analytical_pk(model, subject) {
         return None;
+    }
+    // Compartment-free (#811): no walk to gate, no dose to route, no `pk_model` to
+    // dispatch on — its κ jet is the readout jet seeded on the stacked axes.
+    // Returned before every closed-form guard below, all of which are about a walk
+    // this model does not take.
+    if model.is_algebraic() {
+        return crate::sens::algebraic::subject_sensitivities_iov(
+            model,
+            subject,
+            theta,
+            stacked_eta,
+        );
     }
     // Cheap, model/subject-only decline before any dual seeding (#822 review #9) — see
     // `subject_sensitivities_tvcov`. Harmless for the ODE-twin branch below: an ODE model has no

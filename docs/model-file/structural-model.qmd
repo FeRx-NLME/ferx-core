@@ -263,11 +263,20 @@ and would not be comparable.
 Compartment-free models take the **analytic** `Dual2` gradient on both loops:
 with no state to integrate, the sensitivity is the chain rule
 `∂y/∂θ = (∂y/∂p)·(∂p/∂θ)` over the individual-parameter program, evaluated once
-per observation. Two cases currently fall back to finite differences — correct,
-just slower, and reported honestly as FD rather than claimed as analytic:
+per observation.
 
-- inter-occasion variability (a `kappa` in the model), and
-- more than 24 estimated `(θ, η)` in total.
+Inter-occasion variability is analytic too. Because such a model has no
+concentration to carry a per-occasion effect, `kappa` reaches the prediction only
+through the individual parameters the equation reads — so the equation is
+evaluated **per occasion**, and the gradient is seeded on that occasion's `kappa`
+axes. This is what makes a between-treatment-arm variance component
+(BTAV, the arm-level random effect of an MBMA model) estimable here rather than
+frozen at its initial value.
+
+Finite differences are used — correctly, just more slowly, and reported as FD
+rather than claimed as analytic — past the axis caps: more than 24 estimated
+`(θ, η)` without `kappa`, more than 24 `(θ, η, kappa)` per occasion with it, or
+more than 96 stacked `(θ, η, kappa₁…kappa_K)` axes across a subject's occasions.
 
 See [Scaling](scaling.qmd) for the Form C readout on top of a *compartment*
 model, which shares this grammar.

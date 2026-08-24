@@ -17,7 +17,7 @@
 
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::types::Population;
-use ferx_core::{fit, predict, FitOptions};
+use ferx_core::{fit, pk, predict, FitOptions};
 
 mod common;
 
@@ -75,6 +75,61 @@ fn dummy_ode_src() -> String {
 [error_model]
   DV ~ proportional(PROP_ERR)
 "
+    )
+}
+
+/// The same pair with inter-occasion variability on the maximum effect — the
+/// between-treatment-arm variance component of an MBMA model (#1031). κ reaches
+/// the prediction only through the individual parameters the equation reads, so
+/// this is the case where a BSV-only convention would silently drop it.
+const IOV_THETAS_AND_INDIV: &str = r"
+[parameters]
+  theta TVE0(10.0, 0.1, 100.0)
+  theta TVEMAX(6.0, 0.1, 100.0)
+  theta TVET50(2.0, 0.01, 100.0)
+
+  omega ETA_E0 ~ 0.09
+  kappa KAPPA_EMAX ~ 0.04
+
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[individual_parameters]
+  E0   = TVE0 * exp(ETA_E0)
+  EMAX = TVEMAX * exp(KAPPA_EMAX)
+  ET50 = TVET50
+";
+
+const IOV_TAIL: &str = r"
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  iov_column = OCC
+";
+
+fn iov_algebraic_src() -> String {
+    format!(
+        "{IOV_THETAS_AND_INDIV}
+[structural_model]
+  EFF = EMAX * TIME / (ET50 + TIME)
+  y   = E0 - EFF
+{IOV_TAIL}"
+    )
+}
+
+fn iov_dummy_ode_src() -> String {
+    format!(
+        "{IOV_THETAS_AND_INDIV}
+[structural_model]
+  ode(states=[clock])
+
+[odes]
+  d/dt(clock) = 1
+
+[scaling]
+  EFF = EMAX * TIME / (ET50 + TIME)
+  y   = E0 - EFF
+{IOV_TAIL}"
     )
 }
 
@@ -202,5 +257,78 @@ fn algebraic_structural_model_fits() {
         result.ofv.is_finite(),
         "OFV must be finite, got {}",
         result.ofv
+    );
+}
+
+/// Inter-occasion variability on a compartment-free model must agree with the
+/// dummy-ODE twin, which reaches the same prediction through a state it integrates.
+///
+/// This is the sharpest check on the per-occasion readout: κ enters only through
+/// the individual parameters the equation reads, so a BSV-only evaluation would
+/// hold κ at zero and still produce a perfectly plausible — and wrong — fit.
+#[test]
+fn algebraic_iov_matches_the_dummy_ode_twin() {
+    let alg = parse_full_model(&iov_algebraic_src())
+        .expect("compartment-free IOV model parses")
+        .model;
+    let ode = parse_full_model(&iov_dummy_ode_src())
+        .expect("dummy-ODE IOV twin parses")
+        .model;
+    assert!(alg.is_algebraic() && alg.n_kappa == 1);
+    assert!(ode.ode_spec.is_some() && ode.n_kappa == 1);
+
+    // Two occasions per subject — the treatment arms of a study.
+    let mut pop = population();
+    let (e0, emax, et50) = (10.0_f64, 6.0_f64, 2.0_f64);
+    for s in &mut pop.subjects {
+        s.occasions = s
+            .obs_times
+            .iter()
+            .enumerate()
+            .map(|(i, _)| if i < s.obs_times.len() / 2 { 1 } else { 2 })
+            .collect();
+        s.observations = s
+            .obs_times
+            .iter()
+            .map(|t| e0 - emax * t / (et50 + t))
+            .collect();
+    }
+
+    // Compare the *predictions* at a fixed parameter point rather than two fits:
+    // an optimizer comparison would confound a readout difference with the
+    // different paths two gradient routes take from the same start.
+    let theta = alg.default_params.theta.clone();
+    let eta_bsv = vec![0.15];
+    let kappas = vec![vec![0.30], vec![-0.25]];
+    let subject = &pop.subjects[0];
+
+    let a = pk::predict_iov(&alg, subject, &theta, &eta_bsv, &kappas);
+    let d = pk::predict_iov(&ode, subject, &theta, &eta_bsv, &kappas);
+    assert_eq!(a.len(), d.len());
+    for (j, (x, y)) in a.iter().zip(&d).enumerate() {
+        assert!(
+            (x - y).abs() <= 1e-6 + 1e-6 * x.abs(),
+            "obs {j} (t={:.3}): compartment-free {x:.9} vs dummy-ODE {y:.9}",
+            subject.obs_times[j]
+        );
+    }
+
+    // The two occasions carry different κ, so the prediction must actually differ
+    // between them — otherwise both engines could be dropping κ and this test
+    // would pass by agreeing on the wrong answer. Compare the same elapsed time in
+    // each half (index 0 of occasion 1 vs index 0 of occasion 2 share no time, so
+    // use the κ = 0 baseline as the reference instead).
+    let flat = pk::predict_iov(&alg, subject, &theta, &eta_bsv, &[vec![0.0], vec![0.0]]);
+    let moved = a
+        .iter()
+        .zip(&flat)
+        .enumerate()
+        // t = 0 has no Emax term, so κ on EMAX cannot move it.
+        .filter(|(j, _)| subject.obs_times[*j] > 0.0)
+        .filter(|(_, (x, f))| (*x - *f).abs() > 1e-9)
+        .count();
+    assert!(
+        moved > 0,
+        "kappa must move the prediction — otherwise the equivalence above is vacuous"
     );
 }
