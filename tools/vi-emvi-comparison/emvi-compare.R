@@ -104,6 +104,51 @@ vi_control <- function(viFamily = "fullRank", ...) {
 fmt <- function(x) sprintf("%.6f", x)
 res <- list()
 
+# emvi's ELBO trace is a stochastic sequence sampled every `evalElbo` iterations, so its last
+# value carries the full gradient noise of one step -- the same last-iterate effect 4.11
+# suspects behind the S[1,1] spread. Report the tail mean alongside it so the family
+# comparison in (b) does not rest on a single noisy draw.
+elbo_summary <- function(fit) {
+  tr <- fit$env$viElbo
+  if (is.null(tr) || !length(tr)) {
+    return(list(n = 0L, last = NA_real_, tail_mean = NA_real_, trace = numeric(0)))
+  }
+  k <- min(5L, length(tr))
+  list(
+    n = length(tr), last = utils::tail(tr, 1),
+    tail_mean = mean(utils::tail(tr, k)), tail_k = k, trace = tr
+  )
+}
+
+# ---- The ELBO convention, derived from nlmixr2est's source (VI_VALIDATION.md 4.7, closed) --
+#
+# `viElbo` is NOT on ferx's scale, and the difference is a constant, not a mystery. From
+# nlmixr2est 7.0.2 `src/inner.cpp` (adviElboGradCoreFR, :15059-15163) the reported value is
+#
+#     elbo = sum_i [ -likInner0(eta_i)  +  sum_k log|L_kk,i| ]  -  0.5 * N * log|Omega|
+#
+# averaged over `nMc` draws (:15239). `likInner0` returns the NEGATIVE log joint on the 1x
+# scale with NO 2*pi constants (:1738ff, `-0.5*err^2/r - 0.5*log r` per observation and
+# `-0.5*eta' Omega^-1 eta`), so relative to a fully-normalized ELBO this drops, per subject:
+#
+#     the eta-prior normalizer      -(d/2) log 2*pi
+#     the Gaussian entropy constant +(d/2) (1 + log 2*pi)   [entropy = sum log|L_kk| + that]
+#
+# which net to +d/2. Both tools drop the observation constant (1/2) n_obs log 2*pi -- the
+# NONMEM convention, and the FOCEI check above measures that agreement rather than assuming
+# it. So, at the same parameter vector,
+#
+#     ferx_ELBO = emvi_ELBO + N*d/2,   and ferx reports -2*ELBO.
+#
+# On warfarin (N = 10, d = 3) that is +15 exactly.
+elbo_to_ferx <- function(elbo, N, d) {
+  if (is.null(elbo) || !length(elbo) || is.na(elbo)) {
+    return(c(elbo = NA_real_, neg_two_elbo = NA_real_))
+  }
+  ferx_elbo <- elbo + N * d / 2
+  c(elbo = ferx_elbo, neg_two_elbo = -2 * ferx_elbo)
+}
+
 # =========================================================================================
 # PART 1 -- diagonal omega
 # =========================================================================================
@@ -122,18 +167,27 @@ cat("omega diag:", paste(fmt(res$focei$omega), collapse = "  "), "\n")
 
 # ---- 2. emvi: Tier 1 --------------------------------------------------------------------
 e <- nlmixr2(mod, dat, est = "emvi", control = vi_control())
+# elbo_summary() (defined below for Part 2) is used here too: the LAST iterate of a
+# stochastic optimizer carries the full noise of one step, and reading the diagonal arm's
+# bound off it is what left 4.11's Tier 3 looking like a scale mismatch. Keep the trace.
 res$emvi <- list(
   objf = e$objf,
   est = setNames(e$parFixedDf$`Back-transformed`, rownames(e$parFixedDf)),
   omega = diag(e$omega),
   elbo_last = utils::tail(e$env$viElbo, 1),
-  elbo_n = length(e$env$viElbo)
+  elbo_n = length(e$env$viElbo),
+  elbo = elbo_summary(e),
+  elbo_ferx = elbo_to_ferx(elbo_summary(e)$tail_mean, N = length(unique(dat$ID)), d = 3L)
 )
 cat("\n=== nlmixr2 emvi ===\n")
 cat("objf:", fmt(e$objf), "  (likelihood=\"focei\" objective at the emvi estimate)\n")
 print(res$emvi$est)
 cat("omega diag:", paste(fmt(res$emvi$omega), collapse = "  "), "\n")
-cat("ELBO evals:", res$emvi$elbo_n, " last:", fmt(res$emvi$elbo_last), "\n")
+cat("ELBO evals:", res$emvi$elbo_n, " last:", fmt(res$emvi$elbo_last),
+  " mean(last", res$emvi$elbo$tail_k, "):", fmt(res$emvi$elbo$tail_mean), "\n")
+cat("  in ferx's convention (+N*d/2): ELBO", fmt(res$emvi$elbo_ferx[["elbo"]]),
+  " -2*ELBO", fmt(res$emvi$elbo_ferx[["neg_two_elbo"]]),
+  " <- compare with ferx's neg_two_elbo\n")
 
 # ---- 3. emvi with returnVi: Tier 2 ------------------------------------------------------
 vi <- nlmixr2(mod, dat, est = "emvi", control = vi_control(returnVi = TRUE))
@@ -144,10 +198,14 @@ d <- ncol(mu)
 # The Cholesky diagonal is stored RAW, not logged: src/inner.cpp's grad_L comment reads
 # "(-lp)_i eps_j + [i==j] / L_ii", which is d(log|L|)/dL_ii for a raw diagonal.
 #
-# NOTE (VI_VALIDATION.md 4.7, still open): row- vs column-major packing is not proven.
-# Row-major reproduces plausible variances and column-major does not, so row-major is very
-# likely right -- but until it is settled, only S[1,1] (which is L[1,1]^2 under EITHER
-# convention) should be compared against ferx. The off-diagonals below are provisional.
+# ROW-MAJOR, and this is now READ FROM THE SOURCE rather than inferred (VI_VALIDATION.md 4.7,
+# closed). nlmixr2est 7.0.2 `src/inner.cpp` indexes the pack as `Lpack(s, i*(i+1)/2 + j)` for
+# `j <= i` when it draws `eta = mu + L eps` (:15107), and unpacks it the same way when it
+# reports the per-subject covariance: `for r, for c <= r: L(r,c) = Lpack(i, r*(r+1)/2 + c)`
+# (:15293). Row `i` starts at offset i(i+1)/2, column `j` within it -- row-major lower
+# triangular. The earlier reading (plausible variances under row-major, implausible under
+# column-major) was right, and `tier2-offdiag.R` now also confirms it against the Anchor C
+# NUTS reference, where column-major misses the posterior correlations by up to 1.39.
 unpack_row_major <- function(v) {
   L <- matrix(0, d, d)
   k <- 1
@@ -213,22 +271,6 @@ mod_block <- function() {
     ka <- exp(tvka + eta.ka)
     linCmt() ~ prop(prop.err)
   })
-}
-
-# emvi's ELBO trace is a stochastic sequence sampled every `evalElbo` iterations, so its last
-# value carries the full gradient noise of one step -- the same last-iterate effect 4.11
-# suspects behind the S[1,1] spread. Report the tail mean alongside it so the family
-# comparison in (b) does not rest on a single noisy draw.
-elbo_summary <- function(fit) {
-  tr <- fit$env$viElbo
-  if (is.null(tr) || !length(tr)) {
-    return(list(n = 0L, last = NA_real_, tail_mean = NA_real_, trace = numeric(0)))
-  }
-  k <- min(5L, length(tr))
-  list(
-    n = length(tr), last = utils::tail(tr, 1),
-    tail_mean = mean(utils::tail(tr, k)), tail_k = k, trace = tr
-  )
 }
 
 # Pull omega by ETA NAME rather than by position: the block declaration fixes the order here,

@@ -57,6 +57,7 @@ minutes.
 | `run.sh` | driver — installs, sets the linker workaround, runs both sides |
 | `emvi-compare.R` | nlmixr2 side, both models: FOCEI (convention anchor), `emvi`, `emvi` with `returnVi`, then the three mixed-Ω fits |
 | `plots.R` | the four figures, drawn from both sides' saved output — run after `run.sh`, fits nothing; `FERX_VI_FIGS` sets where they land |
+| `tier2-offdiag.R` | Tier 2b — the per-subject **covariance**, ferx and `emvi` both read against the Anchor C NUTS reference; also confirms the `Lpack` convention against that arbiter. Needs `tools/vi-nuts-anchor/run.sh` to have produced `anchor-c.json` |
 | `warfarin_cmp.ferx` | ferx FOCEI, diagonal Ω |
 | `vi_adam.ferx` | ferx VI, `vi_omega_update = adam` |
 | `vi_closed_form.ferx` | ferx VI, `vi_omega_update = closed_form` |
@@ -162,13 +163,35 @@ a deprecation cycle". So this is **co-validation, not anchoring**: independent c
 authors, same mathematics — agreement raises confidence a lot, but neither side is ground truth.
 The only item here with actual ground truth is Anchor A (`src/estimation/vi/elbo_agq_bound.rs`).
 
-## Known limitation
+## Two conventions, both now read from nlmixr2est's source
 
-The per-subject Cholesky packing in nlmixr2's `Lpack` is **not yet proven** row- vs column-major
-(`VI_VALIDATION.md` §4.7). Row-major reproduces plausible variances and column-major does not, so
-row-major is very likely right — but until it is settled, only `S[1,1]` should be compared
-against ferx, since it equals `L[1,1]²` under either convention. `emvi-compare.R` says so at the
-point of use.
+Both were open questions (`VI_VALIDATION.md` §4.7) that got settled by reading nlmixr2est 7.0.2
+rather than by inferring from the numbers.
+
+**`Lpack` is row-major.** `src/inner.cpp:15107` draws `η = μ + L·ε` indexing
+`Lpack(s, i*(i+1)/2 + j)` for `j ≤ i`, and `:15293` unpacks the reported covariance the same way
+— row `i` starts at offset `i(i+1)/2`, column `j` within it. So the whole matrix is comparable,
+not just `S[1,1]`. `tier2-offdiag.R` confirms it independently against the Anchor C NUTS
+posterior: row-major reproduces the reference correlations to 0.20 worst-case, column-major
+misses by up to 1.39 — which is outside the range a correlation can even be wrong by, if the
+matrix meant what it says.
+
+**`viElbo` is on the log scale with two per-subject constants dropped.** From
+`adviElboGradCoreFR` the reported value is
+`Σᵢ[−likInner0(ηᵢ) + Σₖ log|L_kk,i|] − ½·N·log|Ω|`, averaged over `nMc` draws. `likInner0` is
+the negative log joint on the 1× scale with no `2π` constants, so relative to a fully-normalized
+ELBO this drops the `η`-prior normalizer `−(d/2)log 2π` and the Gaussian entropy constant
+`+(d/2)(1 + log 2π)`, netting `+d/2` per subject. Both tools drop the observation constant
+`½·n_obs·log 2π` (the NONMEM convention — measured, not assumed, by the FOCEI arm). Hence
+
+```
+ferx_ELBO = emvi_ELBO + N·d/2          (+15 on warfarin), and ferx reports −2·ELBO
+```
+
+`emvi-compare.R` applies this and prints the converted value beside the raw one. Read `emvi`'s
+bound off the **tail mean**, not the last iterate: one iterate of a stochastic optimizer carries
+the noise of its final step, and reading the diagonal arm off it is what left §4.11's Tier 3
+looking like an unreconciled scale.
 
 ## The macOS linker trap
 

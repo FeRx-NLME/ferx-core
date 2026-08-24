@@ -103,4 +103,7 @@ echo "  vi_block_*-fit.yaml     mixed omega -- structural zeros and the mean_fie
 echo "  agq_ref-fit.yaml        near-exact AGQ reference -- the arbiter for both tools"
 echo "interpretation: VI_VALIDATION.md section 4.11 (diagonal), 4.13 (mixed omega)"
 echo
-echo "figures: Rscript tools/vi-emvi-comparison/plots.R   (FERX_VI_FIGS=<dir> to place them)"
+echo "figures:      Rscript tools/vi-emvi-comparison/plots.R   (FERX_VI_FIGS=<dir> to place them)"
+echo "off-diagonals: Rscript tools/vi-emvi-comparison/tier2-offdiag.R"
+echo "  Tier 2b -- the per-subject COVARIANCE, both tools against the Anchor C NUTS"
+echo "  reference. Needs tools/vi-nuts-anchor/run.sh to have produced anchor-c.json."
