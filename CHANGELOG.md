@@ -30,6 +30,31 @@ section of the SDLC for the versioning policy).
   solver-injected built-ins (the same deliberate rule `[scaling]` follows), so only `TIME` is
   rejected in `[initial_conditions]`. Both surfaces are documented side by side under
   [ODE models → What an `init(...)` expression may reference](https://ferx-nlme.github.io/ferx-core/model-file/ode-models.html#init-scope).
+- **`center` / `scale` on `[covariate_nn]`** — per-input normalization, so the network
+  sees `(x - center) / scale`. Both default to the identity, leaving existing models
+  unchanged. Raw covariates are badly scaled for a neural net: `WT ≈ 70` saturates a
+  `tanh` layer at initialization, where its derivative is ~0 and the layer is nearly
+  blind to its input. On a two-covariate DCM, unnormalized inputs pushed weights to ~1e11
+  and left the residual error 15× too high; the same model with standardized inputs kept
+  every weight inside `[-1.3, 1.6]`. The constants are declared rather than estimated
+  from the data so that `predict()` applies the same transform the fit used — recomputing
+  statistics on new data would silently change the model — and so the model file remains
+  a complete description of the transform, as `(WT/70)^0.75` already is.
+
+- **`init` on `[covariate_nn]`** — one starting value per output, on the parameter's own
+  scale (`init = [1.0, 10.0]` for a CL of 1 L/h and a V of 10 L). **Set this on every
+  DCM.** Without it every output-layer bias starts at 0, so a `softplus` head starts
+  *every* PK parameter at `softplus(0) = 0.693` — a 0.69 L volume regardless of what the
+  parameter means — and the fit begins orders of magnitude away from the data. That is not
+  a slow start, it changes the answer: on a 60-subject busulfan-shaped deep compartment
+  model with identical data and seed, the bare head converged to `−2 log L` 2033.6 with the
+  clearance decline understated 43%, and **reported `converged: true`**; declaring
+  `init = [1.0, 10.0]` reached 1061.0 and recovered the decline. The value is realised
+  exactly rather than approximately — the output-layer weight block is zeroed alongside the
+  biases, so the network emits exactly `init` for every subject at iteration 0 whatever its
+  covariates, and those weights take gradient from the first step. Values must be reachable
+  by the output activation, or the model file is rejected rather than producing a `NaN`
+  weight.
 
 ### Changed
 - **A single-endpoint `[error_model]` must now name its sigmas in declaration order (#1001).**
@@ -279,6 +304,19 @@ section of the SDLC for the versioning policy).
   Sigma is blended with the same `γ_θ` on the same gate: theta and sigma come out of one joint
   NLopt solve, so damping only theta would leave sigma absorbing the misfit the damping just
   stopped theta from fixing.
+- **`[covariate_nn]` inputs were frozen at each subject's baseline value when the
+  covariate varied over time.** The network reads its inputs from the same per-event
+  covariate map every other consumer uses, but its input names are declared in the block
+  rather than in an expression, so nothing registered them as *referenced* covariates.
+  The fit pipeline then pruned their trajectories as irrelevant and the network saw one
+  constant value per subject for the entire record — silently, with no error or warning,
+  so a time-varying covariate simply had no effect on the fit. NN input names are now
+  registered alongside `[scaling]` / error-selector / `[initial_conditions]` covariates.
+  The same registration also closes a second silent failure: a `[covariate_nn]` input the
+  data does not carry — a typo, or `inputs = [TIME]` (a reserved column, not a covariate)
+  — used to be zero-filled, degenerating the network to a constant and producing a
+  plausible-looking fit that had learned nothing. Such an input is now rejected at fit
+  time with `E_MISSING_COVARIATE`, like any other missing covariate.
 
 ### Added
 - **Sample-size-weighted IOV: `weight = <expr>` on a `kappa` declaration (#1031).** The arm-level
@@ -516,6 +554,36 @@ section of the SDLC for the versioning policy).
   cost at all; wider subjects run up to ~1.5× more work in the outer walk for the padded
   lanes, and the 96-axis cap (past which a subject falls back to finite differences) is
   unchanged (#971).
+- **Deep compartment models with IOV no longer fall back to finite-difference η-gradients.**
+  `[covariate_nn]` weights are auto-generated thetas, so `model.n_theta` (declared +
+  weights) can never equal the compiled `[individual_parameters]` program's θ-axis count
+  (declared only — the program can only reference θ by name). The analytic IOV predicate
+  required them equal, so **every** subject of every DCM+IOV fit took the slow path: 60 of
+  60 on a busulfan-shaped model, correct but roughly twice the necessary runtime. That
+  clause is load-bearing for the outer gradient, which seeds θ axes, but not for the inner
+  η-gradient, whose walk documents that it uses no θ axes and reads only the η block. The
+  two predicates are now separate. Measured on that fit: 336 s → **162 s** (2.07×), with
+  `n_fd_subjects` 60 → 0 and the objective unchanged at 1060.99 after an identical 14 625
+  iterations. Models that already had the analytic path keep it byte-for-byte — the η-only
+  route is taken only where the full one was unavailable.
+
+- **Analytic weight gradients for `[covariate_nn]` models** — the fixed-η θ gradient that
+  SAEM's M-step, IMP and VI share used one perturbed model solve per θ, and on a deep
+  compartment model the network's weights *are* θ. It now takes the network's weights
+  analytically: the NN reaches the likelihood only through its output layer, so
+  `∂NLL/∂w = Σₖ (∂NLL/∂zₖ)·(∂zₖ/∂w)`, where the second factor is exact backpropagation and
+  only the `n_outputs` values of the first need the model solved. Those are obtained from
+  the output-layer biases, which move one output's pre-activation and nothing else. On the
+  reference 141-weight DCM (2 → 8 → 8 → 5) that is 10 solves per subject per draw instead
+  of 141. Because the few remaining differences are now shared by every weight, they are
+  taken *centrally* rather than forward, and agreement with a central finite difference of
+  the objective improves from ~2e-5 to ~1e-9 relative — the weight gradients stop being the
+  least accurate part of a DCM fit. Wall-clock on that model is ~1.4× (42 s → 30 s at a
+  fixed 1500 VI iterations, estimates unchanged); the finite-difference loop was roughly
+  30% of VI's runtime there, so the 14× cut in solves does not carry through to the total.
+  Models whose NN inputs vary within a subject keep the per-θ loop — a single output vector
+  no longer mediates every observation — and models with no `[covariate_nn]` block are
+  untouched.
 
 ### Fixed
 - **`optimizer = trust_region` no longer reports `Converged: YES` when it merely ran out of
@@ -718,47 +786,6 @@ section of the SDLC for the versioning policy).
 ## [0.3.0] - 2026-08-07
 
 ### Added
-- **`init` on `[covariate_nn]`** — one starting value per output, on the parameter's own
-  scale (`init = [1.0, 10.0]` for a CL of 1 L/h and a V of 10 L). **Set this on every
-  DCM.** Without it every output-layer bias starts at 0, so a `softplus` head starts
-  *every* PK parameter at `softplus(0) = 0.693` — a 0.69 L volume regardless of what the
-  parameter means — and the fit begins orders of magnitude away from the data. That is not
-  a slow start, it changes the answer: on a 60-subject busulfan-shaped deep compartment
-  model with identical data and seed, the bare head converged to `−2 log L` 2033.6 with the
-  clearance decline understated 43%, and **reported `converged: true`**; declaring
-  `init = [1.0, 10.0]` reached 1061.0 and recovered the decline. The value is realised
-  exactly rather than approximately — the output-layer weight block is zeroed alongside the
-  biases, so the network emits exactly `init` for every subject at iteration 0 whatever its
-  covariates, and those weights take gradient from the first step. Values must be reachable
-  by the output activation, or the model file is rejected rather than producing a `NaN`
-  weight.
-
-- **`center` / `scale` on `[covariate_nn]`** — per-input normalization, so the network
-  sees `(x - center) / scale`. Both default to the identity, leaving existing models
-  unchanged. Raw covariates are badly scaled for a neural net: `WT ≈ 70` saturates a
-  `tanh` layer at initialization, where its derivative is ~0 and the layer is nearly
-  blind to its input. On a two-covariate DCM, unnormalized inputs pushed weights to ~1e11
-  and left the residual error 15× too high; the same model with standardized inputs kept
-  every weight inside `[-1.3, 1.6]`. The constants are declared rather than estimated
-  from the data so that `predict()` applies the same transform the fit used — recomputing
-  statistics on new data would silently change the model — and so the model file remains
-  a complete description of the transform, as `(WT/70)^0.75` already is.
-
-- **`init` on `[covariate_nn]`** — one starting value per output, on the parameter's own
-  scale (`init = [1.0, 10.0]` for a CL of 1 L/h and a V of 10 L). **Set this on every
-  DCM.** Without it every output-layer bias starts at 0, so a `softplus` head starts
-  *every* PK parameter at `softplus(0) = 0.693` — a 0.69 L volume regardless of what the
-  parameter means — and the fit begins orders of magnitude away from the data. That is not
-  a slow start, it changes the answer: on a 60-subject busulfan-shaped deep compartment
-  model with identical data and seed, the bare head converged to `−2 log L` 2033.6 with the
-  clearance decline understated 43%, and **reported `converged: true`**; declaring
-  `init = [1.0, 10.0]` reached 1061.0 and recovered the decline. The value is realised
-  exactly rather than approximately — the output-layer weight block is zeroed alongside the
-  biases, so the network emits exactly `init` for every subject at iteration 0 whatever its
-  covariates, and those weights take gradient from the first step. Values must be reachable
-  by the output activation, or the model file is rejected rather than producing a `NaN`
-  weight.
-
 - **New ODE steppers via `[fit_options] ode_method`,** on two independent axes. For
   **stability**: the linearly implicit Rosenbrock methods `rosenbrock23` (order 2, aliases
   `ros23`/`ode23s`), `rodas4` (order 4) and `rodas5p` (order 5). These are stable at the step size the tolerance needs on **stiff**
@@ -898,20 +925,6 @@ section of the SDLC for the versioning policy).
   for any external code that constructs or exhaustively destructures these variants.
 
 ### Fixed
-- **`[covariate_nn]` inputs were frozen at each subject's baseline value when the
-  covariate varied over time.** The network reads its inputs from the same per-event
-  covariate map every other consumer uses, but its input names are declared in the block
-  rather than in an expression, so nothing registered them as *referenced* covariates.
-  The fit pipeline then pruned their trajectories as irrelevant and the network saw one
-  constant value per subject for the entire record — silently, with no error or warning,
-  so a time-varying covariate simply had no effect on the fit. NN input names are now
-  registered alongside `[scaling]` / error-selector / `[initial_conditions]` covariates.
-  The same registration also closes a second silent failure: a `[covariate_nn]` input the
-  data does not carry — a typo, or `inputs = [TIME]` (a reserved column, not a covariate)
-  — used to be zero-filled, degenerating the network to a constant and producing a
-  plausible-looking fit that had learned nothing. Such an input is now rejected at fit
-  time with `E_MISSING_COVARIATE`, like any other missing covariate.
-
 - **Gradient-path-dependent FOCE/FOCEI objective on proportional-error models with a
   near-zero prediction** (#958). The residual-variance floor (`MIN_VARIANCE`, which clamps
   `(f·σ)²` so a vanishing prediction cannot produce a zero variance) was applied to the
@@ -997,37 +1010,6 @@ section of the SDLC for the versioning policy).
   through both the endpoint-routed and model-blind loaders.
 
 ### Performance
-- **Deep compartment models with IOV no longer fall back to finite-difference η-gradients.**
-  `[covariate_nn]` weights are auto-generated thetas, so `model.n_theta` (declared +
-  weights) can never equal the compiled `[individual_parameters]` program's θ-axis count
-  (declared only — the program can only reference θ by name). The analytic IOV predicate
-  required them equal, so **every** subject of every DCM+IOV fit took the slow path: 60 of
-  60 on a busulfan-shaped model, correct but roughly twice the necessary runtime. That
-  clause is load-bearing for the outer gradient, which seeds θ axes, but not for the inner
-  η-gradient, whose walk documents that it uses no θ axes and reads only the η block. The
-  two predicates are now separate. Measured on that fit: 336 s → **162 s** (2.07×), with
-  `n_fd_subjects` 60 → 0 and the objective unchanged at 1060.99 after an identical 14 625
-  iterations. Models that already had the analytic path keep it byte-for-byte — the η-only
-  route is taken only where the full one was unavailable.
-
-- **Analytic weight gradients for `[covariate_nn]` models** — the fixed-η θ gradient that
-  SAEM's M-step, IMP and VI share used one perturbed model solve per θ, and on a deep
-  compartment model the network's weights *are* θ. It now takes the network's weights
-  analytically: the NN reaches the likelihood only through its output layer, so
-  `∂NLL/∂w = Σₖ (∂NLL/∂zₖ)·(∂zₖ/∂w)`, where the second factor is exact backpropagation and
-  only the `n_outputs` values of the first need the model solved. Those are obtained from
-  the output-layer biases, which move one output's pre-activation and nothing else. On the
-  reference 141-weight DCM (2 → 8 → 8 → 5) that is 10 solves per subject per draw instead
-  of 141. Because the few remaining differences are now shared by every weight, they are
-  taken *centrally* rather than forward, and agreement with a central finite difference of
-  the objective improves from ~2e-5 to ~1e-9 relative — the weight gradients stop being the
-  least accurate part of a DCM fit. Wall-clock on that model is ~1.4× (42 s → 30 s at a
-  fixed 1500 VI iterations, estimates unchanged); the finite-difference loop was roughly
-  30% of VI's runtime there, so the 14× cut in solves does not carry through to the total.
-  Models whose NN inputs vary within a subject keep the per-θ loop — a single output vector
-  no longer mediates every observation — and models with no `[covariate_nn]` block are
-  untouched.
-
 - **`method = laplace` gradients are far more accurate, and its objective is faster.** The
   posterior Hessian that scales the quadrature grid is now taken analytically — it is the exact
   conditional `∂²nll/∂b²` the shared sensitivity sweep already assembles — instead of being
