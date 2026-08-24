@@ -2552,6 +2552,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             &model.theta_names,
             &model.eta_names,
             &model.indiv_param_names,
+            &[],
             "[adaptive_dosing] observe",
         )?;
         // The `T` / `t` model-time fold warns wherever it fires — but `observe` is
@@ -2752,6 +2753,12 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         // below splits on the engine (ODE via `ode_slot_map`, analytical via the
         // `pk(...)` mapping — #1004), the `D{n}`/`R{n}` recording does not.
         let mut scaling_reads: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Named intermediates are inlined first (#1030), so a readout that reaches
+        // `F` through one is caught by the double-use rejection exactly as if it had
+        // been written inline. Scanning the intermediate lines directly instead would
+        // over-report — an intermediate no entry uses is rejected upstream, but one
+        // used by `y` only would still be charged against `obs_scale`.
+        let scaling_intermediates_for_reads = scaling_intermediates(scaling_lines)?;
         for line in scaling_lines {
             let trimmed = line.trim();
             if trimmed.is_empty() {
@@ -2767,6 +2774,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                 &theta_names_for_scaling,
                 &eta_names_for_scaling,
                 &indiv_var_names_for_scaling,
+                &scaling_intermediates_for_reads,
                 &format!("[scaling] {base}"),
             )?);
         }
@@ -7094,6 +7102,7 @@ fn compile_scale_deriv_program(
 /// amount, not concentration) — on a `pk` block it silently divides by `v` a
 /// second time. Since ferx can't tell intent from mistake here, it warns
 /// (`parse_warnings`) rather than erroring (#712).
+#[allow(clippy::too_many_arguments)]
 fn build_obs_scale_spec(
     value: &str,
     theta_names: &[String],
@@ -7102,6 +7111,7 @@ fn build_obs_scale_spec(
     pk_indices: &[usize],
     volume_indiv_name: Option<&str>,
     declared_covariates: &[String],
+    intermediates: &[(String, String)],
     parse_warnings: &mut Vec<String>,
 ) -> Result<(ScalingSpec, Vec<String>), String> {
     // Try scalar first (Form A). Otherwise parse as expression (Form B).
@@ -7117,8 +7127,11 @@ fn build_obs_scale_spec(
         return Ok((ScalingSpec::ScalarScale(k), Vec::new()));
     }
     let ctx = ParseCtx::new(theta_names, eta_names, indiv_var_names);
-    let expr =
+    let mut expr =
         parse_scalar_expression(value, ctx).map_err(|e| format!("[scaling] obs_scale: {}", e))?;
+    // Named intermediates are inlined before any of the checks below, so each one
+    // sees the expression the user would have had to write by hand (#1030).
+    inline_scaling_intermediates(&mut expr, intermediates, ctx)?;
     // `obs_scale` is a **subject-static** divisor: `apply_scaling` evaluates it once
     // per subject against the baseline covariate map and a `t = 0` `pk_param_fn`
     // snapshot, then divides the whole prediction vector by the result. A `TIME`
@@ -7597,6 +7610,7 @@ pub(crate) fn build_y_output_fn(
     readout_synth: &[ReadoutSynthParam],
     forbidden_state_names: &[String],
     declared_covariates: &[String],
+    intermediates: &[(String, String)],
     parse_warnings: &mut Vec<String>,
 ) -> Result<(crate::ode::OdeOutputFn, OdeOutputProgram, Vec<String>), String> {
     // Form C: expression may reference state names, individual params,
@@ -7609,6 +7623,11 @@ pub(crate) fn build_y_output_fn(
     }
     let ctx = ParseCtx::new(theta_names, eta_names, &defined);
     let mut expr = parse_scalar_expression(value, ctx).map_err(|e| format!("{context}: {e}"))?;
+
+    // Named intermediates are inlined first, so every check and rewrite below —
+    // the `T` fold, the forbidden-compartment and kappa rejections, the #486
+    // desugaring, the covariate scan — runs on the fully expanded readout (#1030).
+    inline_scaling_intermediates(&mut expr, intermediates, ctx)?;
 
     // `T` / `t` is the `[odes]` spelling of the model-time built-in; fold it into
     // the `Expression::Time` node a bare `TIME` already parses to, so the two
@@ -7889,6 +7908,35 @@ fn parse_scaling_block(
     let mut y_uniform_program: Option<OdeOutputProgram> = None;
     let mut scaling_covariates: Vec<String> = Vec::new();
 
+    // Named intermediates (#1030): every non-`obs_scale`/`y` key. Collected up
+    // front — this is the one place with the full name scope in hand, so it owns
+    // the shadowing rejection the pre-scans can't make.
+    let intermediates = scaling_intermediates(lines)?;
+    for (name, _) in &intermediates {
+        // An intermediate whose name is already a θ / η / individual parameter /
+        // state would never be read: the expression parser binds those before it
+        // consults the intermediate table, so the binding would be silently dead.
+        let clash = theta_names
+            .iter()
+            .map(|n| (n, "a theta"))
+            .chain(eta_names.iter().map(|n| (n, "an eta")))
+            .chain(
+                indiv_var_names
+                    .iter()
+                    .map(|n| (n, "an individual parameter")),
+            )
+            .chain(state_names.iter().map(|n| (n, "a compartment")))
+            .find(|(n, _)| *n == name);
+        if let Some((_, what)) = clash {
+            return Err(format!(
+                "[scaling]: `{name}` is already {what}, so it cannot also be a named \
+                 intermediate — a reference to it would resolve to {what}, never to this \
+                 line. Rename the intermediate."
+            ));
+        }
+    }
+    check_scaling_intermediates_used(lines, &intermediates)?;
+
     for line in lines {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -7910,6 +7958,7 @@ fn parse_scaling_block(
                     pk_indices,
                     volume_indiv_name,
                     declared_covariates,
+                    &intermediates,
                     parse_warnings,
                 )?;
                 // Form B `obs_scale` covariate leaves are required data columns too
@@ -7971,6 +8020,7 @@ fn parse_scaling_block(
                     readout_synth,
                     &forbidden,
                     declared_covariates,
+                    &intermediates,
                     parse_warnings,
                 )?;
                 for cov in cov_names {
@@ -8010,9 +8060,10 @@ fn parse_scaling_block(
                     }
                 }
             }
-            _ => {
-                return Err(format!("[scaling]: unknown key `{}`", base));
-            }
+            // A named intermediate (#1030). Already collected and validated above,
+            // and inlined into the entries that reference it — nothing left to do
+            // on its own line.
+            _ => {}
         }
     }
 
@@ -9210,10 +9261,13 @@ fn collect_indiv_param_reads(
     theta_names: &[String],
     eta_names: &[String],
     indiv_var_names: &[String],
+    intermediates: &[(String, String)],
     context: &str,
 ) -> Result<std::collections::HashSet<String>, String> {
     let ctx = ParseCtx::new(theta_names, eta_names, indiv_var_names);
-    let expr = parse_scalar_expression(src, ctx).map_err(|e| format!("{context}: {e}"))?;
+    let mut expr = parse_scalar_expression(src, ctx).map_err(|e| format!("{context}: {e}"))?;
+    // `[scaling]` named intermediates (#1030); empty for every other caller.
+    inline_scaling_intermediates(&mut expr, intermediates, ctx)?;
     let mut reads: std::collections::HashSet<String> = std::collections::HashSet::new();
     visit_expr_nodes(&expr, &mut |e: &Expression| {
         if let Expression::Variable(name) = e {
@@ -10837,6 +10891,16 @@ fn extract_blocks(content: &str) -> Result<ExtractedBlocks, String> {
 
     check_block_names(&headers)?;
 
+    // Fold operator continuation lines into single logical lines before anyone
+    // reads the block (#1030). Done here rather than in each block's parser so the
+    // token-stream consumers (`[individual_parameters]`, `[odes]`) and the
+    // line-oriented ones (`[scaling]`) can't drift on what a "line" is.
+    for ty in CONTINUATION_BLOCKS {
+        if let Some(lines) = out.unnamed.get_mut(*ty) {
+            *lines = join_continuation_lines(lines);
+        }
+    }
+
     Ok(out)
 }
 
@@ -10888,6 +10952,71 @@ fn join_bracketed_lines(lines: &[String]) -> Vec<String> {
     // rather than the line silently vanishing.
     if !buf.is_empty() {
         out.push(buf);
+    }
+    out
+}
+
+/// Block types whose lines are expression statements, and therefore accept
+/// operator continuation lines (#1030). Everything else (`[parameters]`,
+/// `[fit_options]`, …) keeps its strict one-declaration-per-line grammar.
+const CONTINUATION_BLOCKS: &[&str] = &["individual_parameters", "odes", "scaling", "derived"];
+
+/// Leading characters that mark a line as the continuation of the previous one.
+/// Every statement in a continuation block starts with an identifier, `d/dt(`,
+/// `if`, or a brace — never with a binary operator — so a line opening with one
+/// of these can only be a continuation, and joining it strictly widens the
+/// accepted grammar rather than reinterpreting anything that parsed before.
+const CONTINUATION_LEADERS: &[char] = &['+', '-', '*', '/', '^'];
+
+/// Trailing characters that mark a line as unfinished, so the *next* line
+/// continues it. `=` is included so `LEMAX =` followed by an indented expression
+/// works; `,` so a multi-line argument list does.
+const CONTINUATION_TRAILERS: &[char] = &['+', '-', '*', '/', '^', ',', '='];
+
+/// Join operator continuation lines into single logical lines (#1030).
+///
+/// A long `[individual_parameters]` expression — the additive-on-logit covariate
+/// model, one covariate per line — is unreadable collapsed onto one line, but the
+/// statement parser treats a newline as an end-of-statement marker, so the natural
+/// layout used to fail with ``Expected an assignment, an `if` block, or
+/// `d/dt(...)`, got Plus``. Two spellings are accepted, both unambiguous because
+/// no statement can begin with a binary operator:
+///
+/// ```text
+///   LEMAX = LEMAX0                     LEMAX = LEMAX0 +
+///           + log(OR_ABATA) * ABATA            log(OR_ABATA) * ABATA
+/// ```
+///
+/// Newlines inside `(...)` / `[...]` are already dropped by
+/// [`strip_newlines_in_groups`], so this only has to cover the top level. It runs
+/// on the comment-stripped, trimmed lines [`extract_blocks`] produces, and is
+/// applied there so every consumer of a block's lines — including the
+/// line-oriented `[scaling]` scans, which never see the token stream — gets the
+/// joined form.
+fn join_continuation_lines(lines: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let starts_continuation = trimmed
+            .chars()
+            .next()
+            .is_some_and(|c| CONTINUATION_LEADERS.contains(&c));
+        let prev_unfinished = out
+            .last()
+            .and_then(|l: &String| l.trim_end().chars().last())
+            .is_some_and(|c| CONTINUATION_TRAILERS.contains(&c));
+        match out.last_mut() {
+            Some(last) if starts_continuation || prev_unfinished => {
+                last.push(' ');
+                last.push_str(trimmed);
+            }
+            // A block's first line can't continue anything; leave it alone so the
+            // downstream parser reports its own error.
+            _ => out.push(trimmed.to_string()),
+        }
     }
     out
 }
@@ -14019,6 +14148,262 @@ fn split_scaling_entry(trimmed: &str) -> Result<(&str, &str), String> {
     Ok((trimmed[..split_at].trim(), trimmed[split_at + 1..].trim()))
 }
 
+// ── [scaling] named intermediates (#1030) ───────────────────────────────────
+//
+// `[scaling]` used to accept exactly two keys, so a bounded-endpoint readout had
+// to repeat its guarded sub-expression once per occurrence — four times for the
+// standard `min(max(x, 0.01), 0.99)` clamp, on a single ~200-character line that
+// no reviewer can check. Any other key is now a *named intermediate*: a local
+// binding usable by the `obs_scale` / `y` entries below it, exactly as
+// `[individual_parameters]` already allows.
+//
+// Intermediates are **inlined into the AST** of each entry that references them,
+// right after that entry is parsed and before anything else looks at it. That is
+// deliberate: it means every downstream consumer — bytecode compilation, the
+// `Dual2` sensitivity programs, the covariate/required-column scan (#1028), the
+// dose-attribute double-use rejection (#993/#1004), the `T`-alias fold, the
+// direct-θ/η desugaring (#486), the readout slot allocator (#650) — sees exactly
+// the expression the user would have written by hand, with no new node type to
+// teach any of them about. The cost is that a repeated intermediate is evaluated
+// once per occurrence, which is what hand-expansion costs today.
+
+/// Whether `base` is one of the two reserved `[scaling]` entry keys. Anything else
+/// on the left of an `=` is a named intermediate.
+fn is_scaling_entry_key(base: &str) -> bool {
+    base == "y" || base == "obs_scale"
+}
+
+/// Whether `name` is a syntactically valid DSL identifier (the shape the
+/// tokenizer produces for `Token::Ident`).
+fn is_plain_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Names a `[scaling]` intermediate may not take: the built-ins the expression
+/// parser resolves before it would ever consult the intermediate table, so a
+/// binding under one of these names would silently never be read.
+fn scaling_intermediate_reserved(name: &str) -> Option<&'static str> {
+    if name == "TIME" || name == "time" {
+        return Some("the model-time built-in");
+    }
+    if is_time_alias(name) {
+        return Some("the `[odes]` model-time alias for `TIME`");
+    }
+    if name.eq_ignore_ascii_case("MIXNUM") {
+        return Some("the mixture subpopulation index");
+    }
+    if name.eq_ignore_ascii_case("if") || name.eq_ignore_ascii_case("else") {
+        return Some("an inline-conditional keyword");
+    }
+    if is_synthetic_readout_param(name) {
+        return Some("a reserved internal parameter prefix");
+    }
+    None
+}
+
+/// Collect the `[scaling]` block's named intermediates, in declaration order, as
+/// `(name, source expression)` pairs.
+///
+/// Shared by every scan over `[scaling]` lines — `parse_scaling_block` itself and
+/// the three pre-scans that run before it (`collect_readout_theta_eta_synth`,
+/// `allocate_readout_extra_slots`, and the dose-attribute read scan in
+/// `parse_model_file`) — so none of them can disagree about which lines are
+/// entries and which are bindings.
+fn scaling_intermediates(lines: &[String]) -> Result<Vec<(String, String)>, String> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (key, value) = split_scaling_entry(trimmed)?;
+        let (base, cmt) = parse_scaling_key(key)?;
+        if is_scaling_entry_key(base) {
+            continue;
+        }
+        if cmt.is_some() {
+            return Err(format!(
+                "[scaling]: unknown key `{base}` — only `obs_scale` and `y` take a \
+                 `[CMT=N]` subscript. A named intermediate is written `{base} = <expr>`, \
+                 with no subscript."
+            ));
+        }
+        if !is_plain_identifier(base) {
+            return Err(format!("[scaling]: unknown key `{base}`"));
+        }
+        if let Some(what) = scaling_intermediate_reserved(base) {
+            return Err(format!(
+                "[scaling]: `{base}` cannot be used as a named intermediate — it is \
+                 {what}. Pick another name."
+            ));
+        }
+        if out.iter().any(|(n, _)| n == base) {
+            return Err(format!(
+                "[scaling]: duplicate named intermediate `{base}` — each one is assigned once."
+            ));
+        }
+        if value.is_empty() {
+            return Err(format!(
+                "[scaling]: named intermediate `{base}` has no right-hand side."
+            ));
+        }
+        out.push((base.to_string(), value.to_string()));
+    }
+    Ok(out)
+}
+
+/// Replace every leaf that names one of `expanded` with a clone of that
+/// intermediate's (already fully expanded) expression.
+///
+/// Both leaf spellings are matched: `[scaling]` parses with
+/// `fallback_covariate = true`, so an unresolved identifier arrives as
+/// `Covariate(name)`, while `Variable(name)` is what it becomes in the contexts
+/// that put states / individual parameters in scope.
+///
+/// [`visit_expr_nodes_mut`] descends into the node it just replaced, which is safe
+/// here precisely because `expanded` holds *expanded* bodies: an intermediate can
+/// only reference intermediates declared above it (enforced in
+/// [`inline_scaling_intermediates`]), so a substituted body contains no
+/// intermediate name and the walk cannot re-fire on its own output.
+fn substitute_scaling_intermediates(expr: &mut Expression, expanded: &[(String, Expression)]) {
+    if expanded.is_empty() {
+        return;
+    }
+    visit_expr_nodes_mut(expr, &mut |e: &mut Expression| {
+        let name = match e {
+            Expression::Covariate(n) | Expression::Variable(n) => n.as_str(),
+            _ => return,
+        };
+        if let Some((_, body)) = expanded.iter().find(|(n, _)| n == name) {
+            *e = body.clone();
+        }
+    });
+}
+
+/// First identifier in `expr` that names one of `names`, if any.
+fn first_scaling_intermediate_ref(expr: &Expression, names: &[(String, String)]) -> Option<String> {
+    let mut found: Option<String> = None;
+    visit_expr_nodes(expr, &mut |e: &Expression| {
+        if found.is_some() {
+            return;
+        }
+        let name = match e {
+            Expression::Covariate(n) | Expression::Variable(n) => n.as_str(),
+            _ => return,
+        };
+        if names.iter().any(|(m, _)| m == name) {
+            found = Some(name.to_string());
+        }
+    });
+    found
+}
+
+/// Inline the `[scaling]` named intermediates into a just-parsed entry expression.
+///
+/// `ctx` must be the same `ParseCtx` the entry itself was parsed with, so an
+/// intermediate resolves its θ / η / individual-parameter / state names against the
+/// scope of the entry that uses it. (`obs_scale` has no states in scope; `y` does —
+/// an intermediate that reads a state is therefore legal in `y` and becomes a
+/// required data column in `obs_scale`, the same as writing it inline.)
+///
+/// Forward and self references are rejected: intermediate `i` is expanded against
+/// `0..i` only, which makes a reference cycle unrepresentable rather than a
+/// recursion guard to get right.
+fn inline_scaling_intermediates(
+    expr: &mut Expression,
+    intermediates: &[(String, String)],
+    ctx: ParseCtx<'_>,
+) -> Result<(), String> {
+    if intermediates.is_empty() {
+        return Ok(());
+    }
+    let mut expanded: Vec<(String, Expression)> = Vec::with_capacity(intermediates.len());
+    for (i, (name, src)) in intermediates.iter().enumerate() {
+        let mut body =
+            parse_scalar_expression(src, ctx).map_err(|e| format!("[scaling] {name}: {e}"))?;
+        substitute_scaling_intermediates(&mut body, &expanded);
+        if let Some(later) = first_scaling_intermediate_ref(&body, &intermediates[i..]) {
+            return Err(format!(
+                "[scaling] {name}: references the named intermediate `{later}`, which is \
+                 declared on or below this line. An intermediate may only use ones \
+                 declared above it."
+            ));
+        }
+        expanded.push((name.clone(), body));
+    }
+    substitute_scaling_intermediates(expr, &expanded);
+    Ok(())
+}
+
+/// Every identifier appearing in a `[scaling]` source expression, as raw tokens.
+/// Used for the reachability scan behind the unused-intermediate rejection, which
+/// needs names only and must not depend on how any particular scope resolves them.
+fn source_identifiers(src: &str) -> Vec<String> {
+    match tokenize(src) {
+        Ok(toks) => toks
+            .into_iter()
+            .filter_map(|t| match t {
+                Token::Ident(s) => Some(s),
+                _ => None,
+            })
+            .collect(),
+        // A malformed expression is reported with full context by the real parse;
+        // contributing no names here just means it reaches nothing.
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Reject a named intermediate that no `obs_scale` / `y` entry reaches (#1030).
+///
+/// Before intermediates existed, every key other than `obs_scale` / `y` was an
+/// error — which is what caught a typo like `obs_scal = V`. Now that any key is
+/// syntactically legal, that typo would silently disable scaling instead, so the
+/// same protection is re-established from the other side: a binding nothing reads
+/// is a mistake, and is rejected with both readings named.
+fn check_scaling_intermediates_used(
+    lines: &[String],
+    intermediates: &[(String, String)],
+) -> Result<(), String> {
+    if intermediates.is_empty() {
+        return Ok(());
+    }
+    let mut reached: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut queue: Vec<String> = Vec::new();
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (key, value) = split_scaling_entry(trimmed)?;
+        let (base, _cmt) = parse_scaling_key(key)?;
+        if is_scaling_entry_key(base) {
+            queue.extend(source_identifiers(value));
+        }
+    }
+    while let Some(name) = queue.pop() {
+        let Some((n, src)) = intermediates.iter().find(|(n, _)| *n == name) else {
+            continue;
+        };
+        if reached.insert(n.as_str()) {
+            queue.extend(source_identifiers(src));
+        }
+    }
+    if let Some((unused, _)) = intermediates
+        .iter()
+        .find(|(n, _)| !reached.contains(n.as_str()))
+    {
+        return Err(format!(
+            "[scaling]: `{unused}` is never used. If it is a named intermediate, \
+             reference it from an `obs_scale` / `y` entry below it; if it is a \
+             misspelled `obs_scale` / `y` key, fix the spelling — as written it does \
+             nothing."
+        ));
+    }
+    Ok(())
+}
+
 /// Outcome of [`allocate_readout_extra_slots`]: the `(indiv param name, PK slot)` pairs the
 /// analytic Form-C readout needs, plus — for the analytical engine only — which synthetic
 /// θ/η parameters (#486) actually got a slot and, if they did not, the FD-fallback note.
@@ -14070,6 +14455,9 @@ fn allocate_readout_extra_slots(
         indiv_var_names.iter().map(|s| s.as_str()).collect();
     let mut referenced: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // An individual parameter can be referenced only from a named intermediate the
+    // readout uses (#1030); it still needs a slot, so inline before scanning.
+    let intermediates = scaling_intermediates(lines)?;
     for line in lines {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -14083,7 +14471,9 @@ fn allocate_readout_extra_slots(
         // Individual params in scope resolve to `Variable(name)`; θ/η/covariate
         // references resolve elsewhere and are ignored here.
         let ctx = ParseCtx::new(theta_names, eta_names, indiv_var_names);
-        let expr = parse_scalar_expression(value, ctx).map_err(|e| format!("[scaling] y: {e}"))?;
+        let mut expr =
+            parse_scalar_expression(value, ctx).map_err(|e| format!("[scaling] y: {e}"))?;
+        inline_scaling_intermediates(&mut expr, &intermediates, ctx)?;
         visit_expr_nodes(&expr, &mut |e: &Expression| {
             if let Expression::Variable(name) = e {
                 if indiv_set.contains(name.as_str())
@@ -14196,6 +14586,10 @@ fn collect_readout_theta_eta_synth(
 ) -> Result<Vec<ReadoutSynthParam>, String> {
     let mut thetas: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
     let mut etas: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    // A θ/η reference can sit inside a named intermediate the readout uses (#1030);
+    // inline them here too, or the desugaring would miss it and drop an otherwise
+    // analytic readout to the FD fallback.
+    let intermediates = scaling_intermediates(scaling_lines)?;
     for line in scaling_lines {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -14209,7 +14603,9 @@ fn collect_readout_theta_eta_synth(
         // θ/η names resolve to `Theta`/`Eta`; every other identifier falls back to a
         // covariate (no `defined` set needed) since we only collect the θ/η axes.
         let ctx = ParseCtx::new(theta_names, eta_names, &[]);
-        let expr = parse_scalar_expression(value, ctx).map_err(|e| format!("[scaling] y: {e}"))?;
+        let mut expr =
+            parse_scalar_expression(value, ctx).map_err(|e| format!("[scaling] y: {e}"))?;
+        inline_scaling_intermediates(&mut expr, &intermediates, ctx)?;
         visit_expr_nodes(&expr, &mut |e: &Expression| match e {
             Expression::Theta(i) => {
                 thetas.insert(*i);
@@ -18094,12 +18490,58 @@ fn parse_atom(
                 ));
             }
 
-            // Check if it's a function call: name(expr)
+            // Check if it's a function call: `name(expr)` — or, for `min` / `max`,
+            // the two-argument `name(a, b)` form (#1030).
             if pos + 1 < tokens.len() && tokens[pos + 1] == Token::LParen {
                 let func_name = name.to_lowercase();
+                let is_min_max = matches!(func_name.as_str(), "min" | "max");
                 let (arg, p) = parse_add_sub(tokens, pos + 2, ctx)?;
-                if p >= tokens.len() || tokens[p] != Token::RParen {
+                if is_min_max && tokens.get(p) == Some(&Token::Comma) {
+                    let (arg2, p) = parse_add_sub(tokens, p + 1, ctx)?;
+                    if tokens.get(p) != Some(&Token::RParen) {
+                        return Err(format!(
+                            "Missing closing parenthesis for function {} — `{}` takes exactly \
+                             two arguments, `{}(a, b)`.",
+                            name, name, func_name
+                        ));
+                    }
+                    // Desugar to the inline conditional rather than adding a
+                    // two-argument AST node: `Expression::Conditional` is already
+                    // evaluated, bytecode-compiled, `Dual2`-differentiated and
+                    // index-resolved everywhere in the pipeline, so `min`/`max` gets
+                    // all of that for free and cannot drift from the hand-written
+                    // `if (a > b) a else b` it replaces. The guarded expression is
+                    // duplicated in the tree, exactly as it is when written by hand;
+                    // name it with an intermediate to keep the source readable.
+                    let op = if func_name == "min" {
+                        CmpOp::Le
+                    } else {
+                        CmpOp::Ge
+                    };
+                    let cond = Condition::Compare(arg.clone(), op, arg2.clone());
+                    return Ok((
+                        Expression::Conditional(Box::new(cond), Box::new(arg), Box::new(arg2)),
+                        p + 1,
+                    ));
+                }
+                if tokens.get(p) != Some(&Token::RParen) {
+                    // Say what's actually wrong. A stray `,` used to be reported as a
+                    // missing `)`, which sends the reader looking for a bracket bug
+                    // that doesn't exist (#1030).
+                    if tokens.get(p) == Some(&Token::Comma) {
+                        return Err(format!(
+                            "function `{}` takes 1 argument, but a `,` was found — only \
+                             `min(a, b)` and `max(a, b)` take two.",
+                            name
+                        ));
+                    }
                     return Err(format!("Missing closing parenthesis for function {}", name));
+                }
+                if is_min_max {
+                    return Err(format!(
+                        "`{}` takes exactly two arguments: `{}(a, b)`.",
+                        name, func_name
+                    ));
                 }
                 return Ok((Expression::UnaryFn(func_name, Box::new(arg)), p + 1));
             }

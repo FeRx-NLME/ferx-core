@@ -45,10 +45,42 @@ name from quietly reading as zero and collapsing the formula.
 | `log()`, `ln()` | `log(TVCL)` |
 | `sqrt()` | `sqrt(WT)` |
 | `abs()` | `abs(ETA_CL)` |
+| `min(a, b)`, `max(a, b)` | `max(TVCL * WT / 70, 0.1)` |
 | Parentheses | `TVCL * (WT/70)^0.75` |
 | Comparisons (in `if` conditions) | `WT > 70`, `SEX == 1`, `AGE != 0` |
 | Logical (in `if` conditions) | `&&` (and), `\|\|` (or), `!` (not) |
 | Inline conditional | `if (SEX == 1) TVCL * 1.5 else TVCL` |
+
+`min` / `max` take **exactly two** arguments and desugar to the inline
+conditional (`max(a, b)` → `if (a >= b) a else b`), so they differentiate and
+compile identically to the hand-written form. A one-argument `max(x)` is a parse
+error rather than the silent identity it used to be
+([#1030](https://github.com/FeRx-NLME/ferx-core/issues/1030)).
+
+## Continuation Lines
+
+A long expression may be split across several physical lines. Two spellings work,
+and both are unambiguous because no statement can *begin* with a binary operator:
+put the operator at the start of the continued line, or at the end of the line
+being continued.
+
+```
+[individual_parameters]
+  LEMAX = LEMAX0
+          + log(OR_ABATA) * ABATA
+          + log(OR_ADALI) * ADALI
+          + ETA_EMAX
+
+  KEL   = CL /
+          V
+```
+
+This is the natural layout for an additive-on-logit covariate model — one
+covariate per line — which previously had to be collapsed onto a single line
+([#1030](https://github.com/FeRx-NLME/ferx-core/issues/1030)). A trailing `=`
+continues too, so `LEMAX =` on its own line followed by an indented expression is
+accepted. The same applies in `[odes]`, `[scaling]`, and `[derived]`; newlines
+*inside* `(...)` or `[...]` have always been ignored and still are.
 
 ## Conditional Logic (`if` / `else`)
 
