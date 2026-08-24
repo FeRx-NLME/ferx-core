@@ -291,7 +291,9 @@ for the hour-based convention typical of PK models (and the one the default tole
 The same model written in days reads 24× smaller and may not trigger. On an unusual time scale,
 set `ode_method` explicitly instead.
 
-Two counters report what `auto` did, alongside the step counts:
+Two counters record what `auto` did. They sit on the solver-statistics struct alongside the
+step counts, which a fit does not currently print — they are what a diagnostic caller
+(`ode_predictions_with_solver_stats`) and the test suite read:
 
 - **auto-stiff segments** — integrations that started on a stiff method because the probe
   escalated. Always `0` under a named method, so any non-zero value is `auto` at work.

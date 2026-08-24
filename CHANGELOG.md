@@ -33,7 +33,7 @@ section of the SDLC for the versioning policy).
   answer at twice the cost rather than a corrupted objective; the guard applies to `auto` only, and a
   named `ode_method` is honoured exactly as before. Measured 6× faster than `rk45` on the stiff
   cyclophosphamide models with predictions agreeing to 8 digits, and unchanged where nothing is
-  stiff. Two new solver counters report what it did (segments escalated, escalations rejected). The
+  stiff. Two new counters on the solver-statistics struct record what it did — segments escalated, escalations rejected — for diagnostic callers and the test suite (a fit does not print solver statistics today). The
   threshold is a rate and therefore carries the model's time unit (calibrated on the hour-based PK
   convention), so name a method explicitly on an unusual time scale. See
   [ODE models → Letting ferx pick the stepper](https://ferx-nlme.github.io/ferx-core/model-file/ode-models.html#letting-ferx-pick-the-stepper-ode_method-auto).
