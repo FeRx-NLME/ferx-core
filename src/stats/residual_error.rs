@@ -494,6 +494,26 @@ impl ErrorSpec {
         }
     }
 
+    /// [`dvar_dlogsigma`](Self::dvar_dlogsigma) with a per-observation custom
+    /// magnitude (#484 / #1029).
+    ///
+    /// Slot `k`'s variance contribution is `(coeff · m_k · σ_k)²`, so its
+    /// `log σ_k` derivative is the unscaled one times `m_k²` — the multiplier
+    /// rides the loading, exactly as it does in
+    /// [`variance_at_scaled`](Self::variance_at_scaled). A `mult` of all ones
+    /// reproduces `dvar_dlogsigma`.
+    pub fn dvar_dlogsigma_scaled(
+        &self,
+        cmt: usize,
+        k: usize,
+        f: f64,
+        sigma: &[f64],
+        mult: &[f64],
+    ) -> f64 {
+        let m = mult.get(k).copied().unwrap_or(1.0);
+        self.dvar_dlogsigma(cmt, k, f, sigma) * m * m
+    }
+
     /// Residual variance for one observation, dispatching on its compartment.
     ///
     /// For `Single` the `cmt` is ignored and the full `sigma` slice is used
@@ -584,6 +604,87 @@ pub fn compute_r_diag(
         .zip(obs_cmts.iter())
         .map(|(&f, &cmt)| error_spec.variance_at(cmt, f, sigma_values))
         .collect()
+}
+
+/// [`compute_r_diag`] with the optional per-observation custom-magnitude
+/// multiplier (#484 / #1029): `Some(mult)` routes each observation through
+/// [`ErrorSpec::variance_at_scaled`], `None` reproduces the bare
+/// [`ErrorSpec::variance_at`] association exactly (the two differ by ~1 ULP
+/// under IEEE-754 reassociation, so the split is preserved, not merged).
+pub fn compute_r_diag_maybe_scaled(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    sigma_values: &[f64],
+    ruv_mult: Option<&[Vec<f64>]>,
+) -> Vec<f64> {
+    let Some(mult) = ruv_mult else {
+        return compute_r_diag(error_spec, ipreds, obs_cmts, sigma_values);
+    };
+    ipreds
+        .iter()
+        .zip(obs_cmts.iter())
+        .enumerate()
+        .map(|(j, (&f, &cmt))| error_spec.variance_at_scaled(cmt, f, sigma_values, &[], &mult[j]))
+        .collect()
+}
+
+/// Gaussian observation NLL `Σ_j ½(ln V_j + (y_j − f_j)²/V_j)` from a supplied
+/// prediction vector, with the per-observation custom magnitude (#484 / #1029)
+/// and the `iiv_on_ruv` variance scale folded in.
+///
+/// Single owner of the "score these predictions against this magnitude" formula
+/// so a diagonal-`R` estimator can evaluate it at a *perturbed* parameter point
+/// without duplicating it. SAEM's M-step θ gradient uses exactly that: with a
+/// magnitude active it forward-differences this whole quantity — capturing both
+/// the prediction channel and the magnitude's own direct-θ channel — instead of
+/// chaining an analytic `∂nll/∂f` that would silently drop the second one.
+///
+/// `frem_var[j] = Some(v)` overrides observation `j`'s variance outright (FREM
+/// covariate pseudo-observations use `EPSCOV²`, not the PK residual error, and
+/// carry neither the magnitude nor `ruv_scale`). Predictions and variances are
+/// floored exactly as the callers' inline loops do, so this is a drop-in for
+/// them. Censored (M3) rows are **not** handled — callers with `BloqMethod::M3`
+/// take their own path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gaussian_obs_nll_scaled(
+    error_spec: &ErrorSpec,
+    err_keys: &[usize],
+    observations: &[f64],
+    preds: &[f64],
+    sigma_values: &[f64],
+    correlations: &[ResidualCorrelation],
+    ruv_scale: f64,
+    frem_var: Option<&[Option<f64>]>,
+    ruv_mult: Option<&[Vec<f64>]>,
+) -> f64 {
+    let mut nll = 0.0_f64;
+    for (j, (&y, &f_raw)) in observations.iter().zip(preds.iter()).enumerate() {
+        let f = f_raw.max(MIN_VARIANCE);
+        let frem_vj = frem_var.and_then(|o| o.get(j)).and_then(|x| *x);
+        let v = match frem_vj {
+            Some(vv) => vv.max(MIN_VARIANCE),
+            None => {
+                // Same dispatch as `CompiledModel::residual_variance_at_scaled`,
+                // correlations and all, so a caller's base NLL and the perturbed
+                // one it differences against are built by identical arithmetic.
+                let raw = match ruv_mult {
+                    Some(m) => error_spec.variance_at_scaled(
+                        err_keys[j],
+                        f,
+                        sigma_values,
+                        correlations,
+                        &m[j],
+                    ),
+                    None => error_spec.variance_at(err_keys[j], f, sigma_values),
+                };
+                (raw * ruv_scale).max(MIN_VARIANCE)
+            }
+        };
+        let resid = y - f;
+        nll += 0.5 * (v.ln() + resid * resid / v);
+    }
+    nll
 }
 
 /// Compute residual variances including fixed residual correlations from

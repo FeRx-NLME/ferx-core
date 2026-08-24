@@ -229,6 +229,52 @@ fn check_per_cmt_error_model(model: &CompiledModel, population: &Population) -> 
     .with_block("error_model")]
 }
 
+/// Every per-observation residual-error magnitude (#484) — including the one a
+/// `weight = <expr>` modifier compiles to (#1029) — must be strictly positive
+/// and finite at the initial estimates.
+///
+/// The magnitude multiplies a sigma loading, so the observation's variance is
+/// proportional to its square: a zero multiplier collapses the variance onto the
+/// `1e-12` floor and lets that single row dominate the entire objective, and a
+/// non-finite one poisons the OFV. The concrete way to get there is a missing
+/// cell in the weight column — an MBMA dataset with no reported standard error
+/// for one arm — which evaluates the covariate to `0` and silently gives that
+/// row infinite precision. A negative multiplier squares away to the same
+/// variance as its absolute value, so it is never what was meant either.
+fn check_residual_magnitude(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+    if !model.has_custom_ruv_magnitude() {
+        return Vec::new();
+    }
+    let theta = &model.default_params.theta;
+    for subj in &population.subjects {
+        let Some(mult) = model.ruv_obs_mult(subj, theta) else {
+            continue;
+        };
+        for (j, row) in mult.iter().enumerate() {
+            for (k, &m) in row.iter().enumerate() {
+                if m.is_finite() && m > 0.0 {
+                    continue;
+                }
+                let time = subj.obs_times.get(j).copied().unwrap_or(f64::NAN);
+                return vec![Diagnostic::error(
+                    "E_RUV_MAGNITUDE_NONPOSITIVE",
+                    format!(
+                        "[error_model] residual-error magnitude for sigma slot {k} evaluates to \
+                         {m} at subject `{}`, TIME {time} — it must be strictly positive and \
+                         finite. The variance is proportional to its square, so a zero magnitude \
+                         collapses that observation's variance onto the floor and lets one row \
+                         dominate the fit. The usual cause is a missing or non-numeric cell in a \
+                         covariate the magnitude (or a `weight = ...` modifier) references.",
+                        subj.id
+                    ),
+                )
+                .with_block("error_model")];
+            }
+        }
+    }
+    Vec::new()
+}
+
 /// All data-dependent *fatal* compatibility checks between a compiled model and
 /// a dataset, collected into one diagnostic list. Shared by `fit()` (which
 /// stops at the first error via [`first_error`]) and `ferx check` (which
@@ -252,6 +298,7 @@ pub fn check_model_data_rule(
     diags.extend(check_covariates(model, population));
     diags.extend(check_per_cmt_scaling(model, population));
     diags.extend(check_per_cmt_error_model(model, population));
+    diags.extend(check_residual_magnitude(model, population));
     diags.extend(check_iov_occasions(model, population, iov_rule));
     diags.extend(check_absorption_dosing(model, population));
     diags.extend(check_modeled_dose_rates(model, population));
@@ -2297,29 +2344,6 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         );
     }
 
-    // Custom residual-error magnitude (#484) is wired through the FOCE/FOCEI
-    // objective (data term + Laplace curvature) only. SAEM's σ/θ M-step, the
-    // Gauss-Newton BHHH gradient, and the importance-sampling likelihood read
-    // the residual variance through paths that do not yet apply the
-    // per-observation magnitude, so reject them up front rather than silently
-    // fitting a mis-specified error model.
-    if model.has_custom_ruv_magnitude() {
-        for &m in &chain {
-            if !matches!(m, EstimationMethod::Foce | EstimationMethod::FoceI) {
-                diags.push(
-                    Diagnostic::error(
-                        "E_RUV_MAGNITUDE_METHOD_UNSUPPORTED",
-                        "a custom residual-error magnitude (an [error_model] sigma written as an \
-                         expression of TIME / covariates / thetas) is currently supported for \
-                         method = foce and method = focei only. SAEM, GN, GN-hybrid, and \
-                         importance-sampling paths do not yet apply the per-observation magnitude.",
-                    )
-                    .with_block("error_model"),
-                );
-            }
-        }
-    }
-
     if !model.residual_correlations.is_empty() {
         for &m in &chain {
             if !matches!(
@@ -3106,6 +3130,10 @@ const NEGLIGIBLE_ADD_FRACTION: f64 = 0.01;
 #[cfg(test)]
 #[path = "tests/additive_init_scale_tests.rs"]
 mod additive_init_scale_tests;
+
+#[cfg(test)]
+#[path = "tests/residual_magnitude_tests.rs"]
+mod residual_magnitude_tests;
 
 /// Feature-presence (data-independent) *warning*-level checks for experimental
 /// features (issue #175). Stochastic differential equations and neural-network

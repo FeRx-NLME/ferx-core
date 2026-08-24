@@ -191,8 +191,15 @@ A bare sigma name keeps the legacy behaviour exactly ($m_k \equiv 1$).
   available.
 - The `TIME` fed to the expression is the raw data-file time (matching NONMEM's
   `$ERROR`).
-- Supported for `method = foce` and `method = focei` only. SAEM, GN, GN-hybrid,
-  and importance-sampling are rejected up front.
+- A magnitude that evaluates to zero, a negative number, or a non-finite value at
+  the initial estimates is rejected (`E_RUV_MAGNITUDE_NONPOSITIVE`): the variance
+  is proportional to its square, so a zero multiplier collapses that
+  observation's variance onto the internal floor.
+- **Supported by every estimator** (#1029). FOCE, FOCEI, Laplace/AGQ, SAEM, IMP,
+  IMPMAP, Gauss-Newton, GN-hybrid and Bayes all score the same magnitude-aware
+  likelihood, so switching method changes the algorithm, not the model. (Before
+  #1029 everything but FOCE/FOCEI was rejected up front, because those paths read
+  the residual variance through call sites that never applied the multiplier.)
 - **Analytic gradient (#576/#486).** The inner EBE η-gradient and the outer
   θ/σ population gradient are both analytic for a magnitude-active model under
   **FOCE and FOCEI** — the magnitude is η-independent, so the inner loop just
@@ -205,6 +212,136 @@ A bare sigma name keeps the legacy behaviour exactly ($m_k \equiv 1$).
   combinations still fall back to finite differences (which remain
   magnitude-aware, so fits stay correct, just slower): `block_sigma` correlated
   residual error, `iiv_on_ruv`, an M3-BLOQ censored row, and more than 32 thetas.
+- **The direct-θ channel and the other estimators.** When the magnitude
+  expression names a θ, that θ moves the residual variance *directly* as well as
+  through the prediction. SAEM's M-step carries both (it differences the whole
+  observation likelihood for a magnitude-active model rather than chaining
+  `∂nll/∂f` alone). The **Gauss-Newton** closed forms have no direct-`∂R/∂θ`
+  term, so a θ-dependent magnitude routes those subjects to GN's
+  finite-difference fallback — correct, just slower. A magnitude built only from
+  covariates and `TIME` — including every `weight =` model — has no direct-θ
+  channel at all, and keeps the fast closed forms everywhere.
+
+## Residual weighting (`weight = ...`)
+
+> **Maturity: experimental** ([#1029](https://github.com/FeRx-NLME/ferx-core/issues/1029)).
+
+Meta-analysis data does not arrive one observation at a time. Each row is a
+*trial-arm summary* — a mean effect with its own reported standard error, or a
+responder proportion out of a known arm size — and rows differ enormously in how
+much they should count. Declaring that precision is what makes a model-based
+meta-analysis (MBMA) a meta-analysis rather than an unweighted curve fit.
+
+Add a `weight = <expr>` modifier to the error-model statement:
+
+```
+[parameters]
+  sigma ADD_ERR ~ 1.0 (variance) FIX
+
+[error_model]
+  DV ~ additive(ADD_ERR) weight = WPSE
+
+[covariates]
+  WPSE continuous     # reported standard error of this arm's mean
+```
+
+`DV` stays on the **natural scale** in the data file, and so do `PRED`,
+`IPRED`, `CWRES`, `sdtab` and the VPC — there is no back-transformation step to
+remember before plotting.
+
+### What it means
+
+`weight = W` declares "score this row as if `DV` and the prediction were both
+divided by `W`". Writing $y' = y/W$ and $f' = f/W$, the natural-scale residual
+variance is
+
+$$
+\text{Var}(y - f) \;=\; W^2 \cdot \text{Var}\!\left(f/W\right)
+$$
+
+so the **additive** loading picks up a factor of `W` while the **proportional**
+loading is untouched — $W \cdot (f/W) = f$, because a common scale factor
+cancels out of a constant-CV error. Concretely:
+
+| Error model | Unweighted variance | With `weight = W` |
+|---|---|---|
+| `additive(A)` | $\sigma_A^2$ | $W^2\sigma_A^2$ |
+| `proportional(P)` | $(f\sigma_P)^2$ | unchanged — **rejected**, see below |
+| `combined(P, A)` | $(f\sigma_P)^2 + \sigma_A^2$ | $(f\sigma_P)^2 + W^2\sigma_A^2$ |
+
+With `sigma ADD_ERR ~ 1.0 (variance) FIX` this is exactly inverse-variance
+weighting: each row contributes $1/W_i^2$ to the objective.
+
+### Replaces the hand-built three-site construction
+
+Without `weight =`, the same model has to be assembled in three places that must
+agree — the observation is divided in R (`DV = WP / WPSE`), the prediction is
+divided again in `[scaling]`, and the residual is pinned with a fixed sigma.
+Dividing in only two of the three still fits; it just answers a different
+question. `weight =` collapses all three into one declaration and leaves the
+data and the diagnostics alone.
+
+### Is sigma fixed?
+
+That stays your call, because both conventions are real:
+
+- **Continuous endpoint, known SE** (the naproxen-style analysis): fix it —
+  `sigma ADD_ERR ~ 1.0 (variance) FIX`. The weight already carries the whole
+  precision, so a free sigma would double-count the scale.
+- **Weighted logit of a responder proportion** (the canakinumab-style analysis,
+  `DV = logit(p)` with `weight = 1/sqrt(N)`): **estimate** it. The
+  $p(1-p)$ factor was never divided out, and sigma absorbs it —
+  $1/\sqrt{p(1-p)} \approx 2.04$ at $p \approx 0.4$, which is most of a published
+  σ of 2.466.
+
+`weight =` does not silently fix or free sigma; it just makes the weighting
+explicit so the two cases are distinguishable in the model file.
+
+### Objective-function value
+
+ferx scores on the natural scale, so the reported OFV differs from a hand-built
+(`DV/W`, `PRED/W`) NONMEM or Monolix run by the Jacobian of that change of
+variable:
+
+$$
+\text{OFV}_{\text{ferx}} \;=\; \text{OFV}_{\text{hand-built}} \;+\; \sum_j 2\ln W_j
+$$
+
+That term depends only on the data, so it is identical for every model fitted to
+the same rows with the same weight column and cancels out of every ΔOFV,
+likelihood-ratio test, and AIC comparison. Only the absolute number differs from
+a published figure.
+
+### Rules and restrictions (current)
+
+- The weight expression may reference declared covariates, `TIME`, and thetas —
+  the same scope as a [magnitude expression](#time-varying-covariate-dependent-magnitude).
+  It may **not** depend on a random effect (η), an individual parameter, or the
+  prediction: a weight is a property of the datum, not of the individual.
+- `weight =` is **rejected on a purely proportional error model**. Weighting
+  divides both `DV` and the prediction, and a common scale factor cancels out of
+  a constant-CV error — so the modifier would silently do nothing. Use
+  `additive(...)` or `combined(...)`.
+- Not supported with per-CMT (multi-endpoint) error models or inside a
+  covariate-selected `if/else` block.
+- The modifier composes with a magnitude expression on the same slot:
+  `additive(ADD_ERR * TIME) weight = WPSE` multiplies both.
+- A weighted model is still a single-endpoint one, so [Sigma order](#sigma-order)
+  applies unchanged: `additive(ADD_ERR) weight = WPSE` requires `ADD_ERR` to be
+  the **first** declared sigma, and `combined(PROP_ERR, ADD_ERR) weight = WPSE`
+  requires that declaration order. The weight expression itself must not name a
+  sigma — the argument would then reference two, which no positional slot can
+  express.
+- A weight that evaluates to **zero, a negative number, or a non-finite value**
+  at the initial estimates is rejected (`E_RUV_MAGNITUDE_NONPOSITIVE`). A zero
+  weight — the usual cause is an arm with no reported standard error — would
+  collapse that row's variance onto the internal floor and let a single
+  observation own the whole objective.
+- **Every estimator applies the weight.** FOCE, FOCEI, Laplace/AGQ, SAEM, IMP,
+  IMPMAP, Gauss-Newton, GN-hybrid and Bayes score the same weighted likelihood,
+  so `method =` picks the algorithm, not the model. A weight is a per-observation
+  constant (covariates and `TIME` only), so the inner η-gradient and the outer
+  θ/σ gradient stay analytic throughout.
 
 ## Log-transform-both-sides (LTBS)
 

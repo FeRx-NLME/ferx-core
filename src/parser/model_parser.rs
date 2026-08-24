@@ -3115,7 +3115,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     let ruv_magnitude_used_thetas: std::collections::HashSet<usize> = {
         let ruv_theta_names = model.theta_names.clone();
         let ruv_eta_names = model.eta_names.clone();
-        let (rm, used_thetas) = build_ruv_magnitude(
+        let (rm, used_thetas, used_covs) = build_ruv_magnitude(
             &single_error_args,
             &ruv_sigma_names,
             &ruv_theta_names,
@@ -3123,6 +3123,13 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             &covariate_decls,
         )?;
         model.ruv_magnitude = rm;
+        // A covariate that appears *only* in a magnitude / `weight =` expression
+        // is still model-referenced: without registering it here,
+        // `prune_irrelevant_tv_covariates` would drop the per-observation
+        // snapshots for a subject whose only time-varying covariate is the
+        // magnitude's, and every observation would silently be scored with the
+        // subject's *first* value (#484 / #1029).
+        register_referenced_covariates(&mut model.referenced_covariates, used_covs);
         used_thetas
     };
 
@@ -12320,6 +12327,80 @@ fn split_top_level_args(s: &str) -> Vec<String> {
     out
 }
 
+/// Peel an optional trailing `weight = <expr>` modifier off an `[error_model]`
+/// statement (#1029):
+///
+/// ```text
+/// DV ~ additive(ADD_ERR) weight = WPSE
+/// DV ~ combined(PROP_ERR, ADD_ERR) weight = 1 / sqrt(NARM)
+/// ```
+///
+/// The `weight` keyword is recognised only at bracket depth 0 and only when
+/// followed by a single `=`, so a weight expression carrying its own parens
+/// survives intact and a covariate named `weight` *inside* a magnitude
+/// expression (#484) is not mistaken for the modifier. Returns
+/// `(statement_without_modifier, Some(weight_expr))`, or `(statement, None)`
+/// when no modifier is present.
+fn split_weight_modifier(body: &str) -> Result<(String, Option<String>), String> {
+    const KW: &[u8] = b"weight";
+    let bytes = body.as_bytes();
+    let mut depth: i32 = 0;
+    let mut found: Option<usize> = None;
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' => {
+                depth += 1;
+                continue;
+            }
+            b')' | b']' => {
+                depth -= 1;
+                continue;
+            }
+            _ => {}
+        }
+        if depth != 0 || i + KW.len() > bytes.len() {
+            continue;
+        }
+        if !bytes[i..i + KW.len()].eq_ignore_ascii_case(KW) {
+            continue;
+        }
+        // Whole-word match on both sides, so `WEIGHTED` / `X_weight` are not it.
+        let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        if i > 0 && is_ident(bytes[i - 1]) {
+            continue;
+        }
+        if bytes.get(i + KW.len()).copied().is_some_and(is_ident) {
+            continue;
+        }
+        let eq = skip_ascii_ws(body, i + KW.len());
+        // `==` is a comparison, not the modifier's assignment.
+        if bytes.get(eq) != Some(&b'=') || bytes.get(eq + 1) == Some(&b'=') {
+            continue;
+        }
+        found = Some(i);
+        break;
+    }
+    let Some(i) = found else {
+        return Ok((body.to_string(), None));
+    };
+    let eq = skip_ascii_ws(body, i + KW.len());
+    let expr = body[eq + 1..].trim();
+    if expr.is_empty() {
+        return Err(format!(
+            "[error_model] `weight =` has no expression on its right-hand side: `{}`",
+            body.trim()
+        ));
+    }
+    let stmt = body[..i].trim();
+    if stmt.is_empty() {
+        return Err(format!(
+            "[error_model] `weight = {}` must follow a `DV ~ TYPE(...)` statement on the same line",
+            expr
+        ));
+    }
+    Ok((stmt.to_string(), Some(expr.to_string())))
+}
+
 /// Does `s[i..]` begin with the keyword `kw`, terminated by a non-identifier
 /// character (so `if` matches but `iffy` does not)?
 fn starts_with_keyword(s: &str, i: usize, kw: &str) -> bool {
@@ -12374,6 +12455,15 @@ fn match_delim(s: &str, open: usize, open_ch: u8, close_ch: u8) -> Result<usize,
 /// a single ordinary error model (LTBS + covariate selection is out of scope).
 fn parse_error_endpoint_body(body: &str) -> Result<(ErrorModel, Vec<String>), String> {
     let body = body.trim();
+    // #1029: `weight = …` would otherwise be swallowed by the statement regex's
+    // failure path and silently ignored inside a branch.
+    if split_weight_modifier(body)?.1.is_some() {
+        return Err(
+            "[error_model] `weight = …` is not supported inside a covariate-selected if/else \
+             block"
+                .to_string(),
+        );
+    }
     let log_lhs_re = Regex::new(r"^\s*log\s*\(\s*\w+\s*\)\s*~").unwrap();
     if log_lhs_re.is_match(body) {
         return Err(
@@ -12622,6 +12712,11 @@ fn parse_error_model(
             (None, trimmed.to_string())
         };
 
+        // Inverse-variance weighting (#1029): `… weight = <expr>` is peeled off
+        // before the statement regexes run — its trailing `= expr` would defeat
+        // their `$` anchor and the whole line would be silently ignored.
+        let (body, weight_expr) = split_weight_modifier(&body)?;
+
         // A `log(DV)` LHS (case 2) is detected first since the plain regex's
         // `\w+` LHS can't match the parenthesised form.
         let (lhs_logged, caps) = if let Some(c) = log_lhs_re.captures(&body) {
@@ -12635,7 +12730,7 @@ fn parse_error_model(
         let error_type = caps[2].to_lowercase();
         // Split on top-level commas only, so a magnitude expression's own
         // commas (e.g. inside a future `min(a, b)`) don't fragment an argument.
-        let sigma_names: Vec<String> = split_top_level_args(&caps[3]);
+        let mut sigma_names: Vec<String> = split_top_level_args(&caps[3]);
         // `log_additive` (case 1) is additive error whose prediction is logged
         // while DV is taken as-is (already log-transformed in the data).
         let type_is_log_additive = error_type == "log_additive";
@@ -12653,6 +12748,45 @@ fn parse_error_model(
                 sigma_names.len(),
                 trimmed
             ));
+        }
+
+        // Inverse-variance weighting (#1029). `weight = W` declares that each
+        // observation carries its own precision — the study-as-subject MBMA
+        // construction where the observed quantity is a trial-level mean with a
+        // known standard error. It is defined as "divide DV and the prediction
+        // by `W`, score on that scale": with `y' = y/W` and `f' = f/W` the
+        // natural-scale variance of the residual is `W² · Var(f/W)`, i.e. the
+        // *additive* loading picks up a factor `W` while the proportional
+        // loading is untouched (`W · (f/W) = f` — a common scale factor cancels
+        // out of a CV). So the modifier desugars exactly into a #484
+        // per-observation residual magnitude on the additive slot, reusing that
+        // channel's compiler, θ-derivative program, and runtime plumbing
+        // wholesale; DV, PRED, IPRED, CWRES and the VPC all stay on the natural
+        // scale with no back-transformation.
+        if let Some(w) = &weight_expr {
+            if cmt_opt.is_some() {
+                return Err(
+                    "[error_model] `weight = …` is not supported with per-CMT (multi-endpoint) \
+                     error models"
+                        .to_string(),
+                );
+            }
+            // Combined's argument order is (proportional, additive) — see
+            // `ErrorModel::sigma_types` — so the weighted slot is the last one.
+            let slot = match error_model {
+                ErrorModel::Additive => 0,
+                ErrorModel::Combined => 1,
+                ErrorModel::Proportional => {
+                    return Err(format!(
+                        "[error_model] `weight = {}` has no effect on a purely proportional error \
+                         model: weighting divides both DV and the prediction by the weight, and a \
+                         common scale factor cancels out of a proportional (constant-CV) error. \
+                         Use `additive(...)` or `combined(...)` — or drop the `weight =`.",
+                        w
+                    ));
+                }
+            };
+            sigma_names[slot] = format!("({}) * ({})", sigma_names[slot], w);
         }
 
         // LTBS validation. `log(DV) ~ log_additive(...)` double-logs the data and
@@ -13097,10 +13231,18 @@ fn build_ruv_magnitude(
     theta_names: &[String],
     eta_names: &[String],
     covariate_decls: &Option<Vec<CovariateDecl>>,
-) -> Result<(Option<RuvMagnitude>, std::collections::HashSet<usize>), String> {
+) -> Result<
+    (
+        Option<RuvMagnitude>,
+        std::collections::HashSet<usize>,
+        Vec<String>,
+    ),
+    String,
+> {
     let mut used_thetas = std::collections::HashSet::new();
+    let mut used_covs: std::collections::HashSet<String> = std::collections::HashSet::new();
     let Some((_em, args)) = single_error_args else {
-        return Ok((None, used_thetas));
+        return Ok((None, used_thetas, Vec::new()));
     };
     let allowed_covs: Option<Vec<String>> = covariate_decls
         .as_ref()
@@ -13145,6 +13287,7 @@ fn build_ruv_magnitude(
                 used_thetas.insert(*i);
             }
         });
+        collect_covariates(&expr, &mut used_covs);
         per_sigma_deriv.push(Some(compile_ruv_mag_deriv_program(
             &expr,
             &sigma_name,
@@ -13170,11 +13313,14 @@ fn build_ruv_magnitude(
         Some(RuvMagnitude {
             per_sigma,
             per_sigma_deriv,
+            theta_dependent: !used_thetas.is_empty(),
         })
     } else {
         None
     };
-    Ok((rm, used_thetas))
+    let mut covs: Vec<String> = used_covs.into_iter().collect();
+    covs.sort();
+    Ok((rm, used_thetas, covs))
 }
 
 // --- Individual parameter function builder ---
