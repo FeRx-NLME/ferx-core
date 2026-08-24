@@ -100,15 +100,22 @@ section of the SDLC for the versioning policy).
   binary would refuse.
 - **A dose attribute that is also read by the model is now an error (#993).** `F`,
   `LAGTIME`/`ALAG` and the compartment-indexed `F{n}`/`ALAG{n}`/`LAGTIME{n}` are applied by the
-  engine **at the dose event**. A model that declares one and *also* references it in `[odes]`
-  (the RHS or an `init(...)` seed), the `[scaling]` readout, or the `[adaptive_dosing] observe`
+  engine **at the dose event**. A model that declares one and *also* references it in the `[odes]`
+  **RHS**, the `[scaling]` readout, or the `[adaptive_dosing] observe`
   controller signal was applying it twice — silently, and by exactly that factor: an
   ODE model reading its own `F` produced every prediction scaled by `F`, and renaming the parameter
   changed the fit by that amount with no diagnostic either way. This is now rejected at parse time
   with `E_DOSE_ATTR_DOUBLE_USE`, naming both readings and the fix. `D{n}`/`R{n}` carry the same
   reservation but are consulted only for a coded `RATE=-2`/`-1` dose, so that collision is reported
   against the dataset (same code) and a model whose data never codes `RATE` is untouched. Reads from
-  `[derived]`/`[output]` are post-solve reporting and remain silent. (Analytical models were left out
+  `[derived]`/`[output]` are post-solve reporting and remain silent, and so is an **initial
+  condition** on either engine (`[odes] init(state) = …`, `[initial_conditions]`): the engine seeds
+  the state with the raw expression value and consults dose attributes only at dose events, so
+  `init(central) = F * 100` — the bioavailable residue of a pre-study dose — applies `F` exactly
+  once and is a legitimate model ([#1046](https://github.com/FeRx-NLME/ferx-core/issues/1046)).
+  NONMEM agrees: `A_0(1) = F1*100` with `F1 = 0.5` seeds 50, not 25, and `A_0(1) = ALAG1*100` is
+  deposited unshifted, each run byte-identical to the twin seeding from an ordinary parameter of
+  equal value (`nonmem_anchor/odes_init_dose_attr_{f,lag}_{A,B}.ctl`). (Analytical models were left out
   of this first pass; they are covered by #1004 above.) **Breaking** for a model that folds `F` into the absorption flux
   — the pre-dose-entry convention the ODE docs' migration note describes, which until now computed
   `F²` without complaint; the fix is to drop `F` from the right-hand side, or rename the parameter
@@ -131,6 +138,10 @@ section of the SDLC for the versioning policy).
   `MIXNUM`, the other built-in the check cannot see, stays in scope: it resolves to the subject's
   mixture class, so a class-switched baseline does real work — it is now named in the diagnostic,
   which previously listed neither.
+- **A `[derived]` row aggregate followed by more expression is now an error instead of silently
+  dropping the rest (#1030 review).** `CMAX = max(IPRED) * 2` parsed as the aggregate and discarded
+  the `* 2`, reporting the unscaled maximum. There is no aggregate form that continues into a larger
+  expression, so it now says so rather than returning a wrong number.
 - **A zero, negative, or non-finite residual-error magnitude is now rejected (#484 / #1029).** The
   magnitude multiplies a sigma loading, so a zero one — an MBMA arm with no reported standard error,
   say — collapses that observation's variance onto the internal `1e-12` floor and lets a single row
@@ -261,6 +272,28 @@ section of the SDLC for the versioning policy).
   stopped theta from fixing.
 
 ### Added
+- **`[scaling]` accepts named intermediates, expressions can be split across lines, and `min`/`max`
+  take two arguments (#1030).** Three restrictions that individually looked defensible combined to
+  make a standard bounded-endpoint readout unmaintainable: a model-based meta-analysis logit-Emax
+  readout with the published `[0.01, 0.99]` clamp came out as one ~200-character line with the same
+  sub-expression written four times, because there was nowhere to name it. Now: (1) any `[scaling]`
+  line whose key is not `obs_scale` / `y` declares a **named intermediate** usable by the entries
+  below it, following the same define-above-use-below rule as `[individual_parameters]` —
+  intermediates are inlined, so covariates reached only through one are still required data columns
+  and the dose-attribute double-use rejection still sees them; (2) a long expression may be
+  **continued across lines** by starting the continued line with an operator or ending the previous
+  one with it, in `[individual_parameters]`, `[odes]`, `[scaling]`, `[derived]`, and
+  `[initial_conditions]`; (3) **`min(a, b)`
+  and `max(a, b)`** are available everywhere the DSL parses expressions, desugaring to the inline
+  conditional so they differentiate and compile exactly like the hand-written `if (a >= b) a else b`
+  — each argument appears twice in the desugared tree, so clamp a named intermediate rather than a
+  long expression. In `[derived]`, where `min`/`max` also name the row aggregate, the two are told
+  apart by the second argument: a comparison is a row filter, anything else is the numeric clamp.
+  The three-line readout now reads the way the published Mlxtran does. Two smaller diagnostics come
+  with it: `max(a, b)` used to report `Missing closing parenthesis for function max`, which sent the
+  reader after a bracket bug that did not exist — arity errors now say so — and a `[scaling]` key
+  that is neither `obs_scale`/`y` nor read by any entry is rejected, so a misspelt `obs_scal = V`
+  still fails loudly instead of silently disabling scaling.
 - **First-class residual weighting: `weight = <expr>` on the error model (#1029).** Meta-analysis
   rows are trial-arm summaries that differ in precision, and inverse-variance weighting is what makes
   an MBMA an MBMA. Until now it had to be hand-built in three places that must agree — divide `DV` in

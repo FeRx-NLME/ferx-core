@@ -335,6 +335,80 @@ bit-for-bit-equal predictions on the analytic and ODE paths at matched
 parameters — the analytic-vs-ODE equivalence is checked by
 `analytic_form_c_matches_ode_form_c_binding_readout`.
 
+## Named intermediates (since #1030)
+
+Any line in `[scaling]` whose key is **not** `obs_scale` or `y` declares a
+**named intermediate** — a local binding the `obs_scale` / `y` entries below it
+can reference, exactly as `[individual_parameters]` already allows. This is what
+makes a bounded-endpoint readout writable once instead of once per occurrence.
+
+The standard model-based meta-analysis readout — a weighted logit of an Emax time
+course with the published `[0.01, 0.99]` clamp — reads as three lines:
+
+```ferx
+[scaling]
+  ACR20    = EMAX * TIME / (TIME + T50)
+  ACR20SAT = min(max(ACR20, 0.01), 0.99)
+  y        = log(ACR20SAT / (1 - ACR20SAT)) * sqrt(NARM)
+```
+
+Before intermediates existed the same model was one ~200-character line with the
+guarded sub-expression written four times, because there was nowhere to name it.
+
+The rules are the ones `[individual_parameters]` uses, plus two that follow from
+`[scaling]`'s two reserved keys:
+
+- **Define above, use below.** An intermediate may reference intermediates
+  declared above it; a forward or self reference is a parse error, not a silent
+  `0.0`. Reference cycles are therefore unrepresentable. The rule binds the
+  `obs_scale` / `y` entries too: an entry may only read an intermediate declared
+  above it, so the block always reads top-to-bottom.
+- **No `[CMT=N]` subscript.** That belongs to `obs_scale` / `y`; a subscripted
+  unknown key is still an unknown-key error.
+- **No shadowing.** A name that is already a theta, an eta, an individual
+  parameter, or a compartment is rejected — a reference to it would resolve to
+  the thing already in scope, never to the binding, so the binding would be
+  silently dead. The same goes for the `TIME` / `T` built-ins and the eval-time
+  built-ins `TAD`, `TAFD`, `MACHEPS`. A name declared in `[covariates]` is
+  rejected for the mirror-image reason: there the *binding* would win, silently
+  shadowing the data column and dropping it from the required-column set. Either
+  way, one name means one thing.
+- **No dead bindings.** An intermediate that no `obs_scale` / `y` entry reaches
+  is a parse error. Before #1030 every key other than `obs_scale` / `y` was
+  rejected outright, which is what caught a misspelt `obs_scal = V`; now that any
+  key is legal syntax, rejecting the unread binding is what keeps that typo from
+  silently disabling scaling.
+
+Intermediates are **inlined** into the entry that uses them, so they are not a
+separate evaluation stage and nothing downstream can tell them from the
+hand-expanded form: covariates reached only through an intermediate are required
+data columns just the same (see *Undefined names are data columns, not zeros*
+above), the dose-attribute double-use rejection sees through them, and the
+analytic-sensitivity path is unaffected. The one consequence of inlining is that
+an intermediate used twice is *evaluated* twice — which is exactly what writing
+it out by hand costs. Note that `min` / `max` count as two uses each (see below),
+so a two-sided clamp on a named value expands that value eight times.
+
+### `min(a, b)` and `max(a, b)`
+
+Two-argument `min` / `max` are available in every expression the DSL parses —
+`[scaling]`, `[individual_parameters]`, `[odes]`, `[derived]`. They desugar to the
+inline conditional (`max(a, b)` → `if (a >= b) a else b`), so they differentiate
+and compile exactly like the hand-written form.
+
+The desugaring puts **both** arguments in the guard *and* in a branch, so each one
+appears twice in the compiled tree, and the duplication multiplies through nesting:
+`min(max(x, 0.01), 0.99)` contains four copies of `x`, and reading that clamp from
+two places in a readout makes eight. Clamp a *named* value rather than a long
+expression — that is the pairing the block above uses, and it keeps the growth on a
+short leaf instead of on a whole sub-model.
+
+In `[derived]`, `min` / `max` also name the row aggregate (`max(IPRED, TIME > 0)` is
+"the largest `IPRED` over rows where `TIME > 0`"). The two are told apart by the
+second argument: a comparison is a row filter, anything else is the numeric clamp.
+An aggregate cannot be combined into a larger expression — `max(IPRED) * 2` is an
+error, not a scaled maximum.
+
 ## Runtime behaviour on bad scales
 
 If an expression scale (Form B or C) evaluates to a non-positive or
