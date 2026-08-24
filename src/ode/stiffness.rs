@@ -67,9 +67,10 @@
 //! # Cost
 //!
 //! `n + 1` right-hand-side evaluations for the finite-difference Jacobian plus one `O(n³)`
-//! eigensolve — about the cost of a single Rosenbrock step attempt, against a segment that
-//! takes tens to thousands of steps. On the models measured in #978 this is 1–5 µs, against
-//! stiff solves that ran to 300 s under an explicit method.
+//! eigensolve — the same work a *single* Rosenbrock step attempt does, against a segment that
+//! takes tens to thousands of steps. Zero-length segments skip it entirely. On the testdata
+//! models that read non-stiff, `auto` is not measurably slower than naming `rk45`; where it
+//! fires it turns a 372 s fit into a 2.3 s one.
 
 use crate::ode::solver::{OdeMethod, OdeSolverOptions};
 use crate::sens::num::PkNum;
@@ -81,7 +82,7 @@ use crate::sens::num::PkNum;
 /// and even the fast TMDD parameterizations sit at 1.8–2.1 — and well below the 20–234 the
 /// stiff cyclophosphamide models read at every segment.
 ///
-/// It is *not* a gap with nothing in it. The TMDD `cr`/`crib`/`ib` models sweep 3.7 to 126
+/// It is *not* a gap with nothing in it. The TMDD `cr`/`crib`/`ib` models sweep 1.7 to 126
 /// across their own segments, so they cross it within a single fit, on the high-dose subjects.
 /// That is the intended behaviour rather than a miscalibration — those segments really are
 /// stiff, and fitting one of them under `auto` is 160× faster than under the explicit default —
@@ -116,10 +117,12 @@ const fn stiff_method_for(opts: &OdeSolverOptions) -> OdeMethod {
 /// an empty system, or an eigensolve that does not converge. A caller that cannot classify
 /// must not guess — see [`resolve_method`], which keeps the explicit default in that case.
 ///
-/// The Jacobian is one-sided (`n + 1` evaluations rather than `2n`), which is the right
-/// trade for a classifier reading a 7× gap: the FD truncation error is orders of magnitude
-/// below the separation being resolved, and halving the evaluation count is what keeps the
-/// probe cheaper than one step of the solver it is choosing.
+/// The Jacobian is one-sided (`n + 1` evaluations rather than `2n`). One-sided FD carries
+/// `O(h)` truncation error where central differences carry `O(h²)`, which would matter for a
+/// derivative and does not matter here: the result is thresholded, not used, and it would take
+/// an error of tens of percent to move a model across the threshold from where the measured
+/// ones sit. Halving the evaluation count is what keeps the probe cheaper than one step of the
+/// solver it is choosing.
 pub(crate) fn max_abs_re_eigenvalue<T: PkNum>(
     rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
     u: &[T],
