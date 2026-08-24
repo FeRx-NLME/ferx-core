@@ -2576,6 +2576,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                 &observe_reads,
                 n_states,
                 "[adaptive_dosing]",
+                "[adaptive_dosing]",
                 None,
             )?;
         } else {
@@ -2586,6 +2587,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                 &analytical_slots,
                 &observe_reads,
                 usize::MAX,
+                "[adaptive_dosing]",
                 "[adaptive_dosing]",
                 Some(&pk_param_map),
             )?;
@@ -2786,6 +2788,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                 &scaling_reads,
                 state_names_for_scaling.len(),
                 "[scaling]",
+                "[scaling]",
                 None,
             )?;
         } else {
@@ -2796,6 +2799,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                 &analytical_slots,
                 &scaling_reads,
                 usize::MAX,
+                "[scaling]",
                 "[scaling]",
                 Some(&pk_param_map),
             )?;
@@ -9011,12 +9015,20 @@ fn ode_free_slot_count(names: &[String]) -> usize {
 /// amount is propagated by `pk::analytical_init_concentration_g` with `F = 1` and
 /// no lag, so reading a mapped dose attribute in an init expression applies it
 /// once, not twice — see the note at that block.
+/// `read_site` names the surface the `reads` set was actually collected from, for the
+/// "read in …" and "remove it from …" clauses. It is usually the same as `block`, but
+/// not always: since #1046 only the **RHS** of `[odes]` is a prediction-path read —
+/// an `init(...)` seed is not — so telling an `[odes]` user to "remove it from
+/// `[odes]`" would send them to delete a read that is legal and whose removal does not
+/// clear the error. `block` stays the `"{block}:"` prefix every block-scoped parse
+/// error carries (and that `parse_error_to_diagnostic` / the tests key on).
 fn check_dose_attr_double_use(
     indiv_param_names: &[String],
     indiv_param_slots: &[usize],
     reads: &std::collections::HashSet<String>,
     n_states: usize,
     block: &str,
+    read_site: &str,
     analytical_pk_map: Option<&HashMap<String, String>>,
 ) -> Result<(), String> {
     for (i, name) in indiv_param_names.iter().enumerate() {
@@ -9081,9 +9093,9 @@ fn check_dose_attr_double_use(
         };
         return Err(format!(
             "{block}: `{name}` is this model's {noun}{scope} — the engine already \
-             {applied} — but it is also read in {block}, so the value is applied \
+             {applied} — but it is also read in {read_site}, so the value is applied \
              twice: once at the dose, once where you read it ({issue}). If `{name}` is \
-             meant to be {noun}, remove it from {block}; if it is meant to be an \
+             meant to be {noun}, remove it from {read_site}; if it is meant to be an \
              ordinary parameter, {ordinary_remedy}.",
             noun = attr.noun(),
             applied = attr.applied_as(),
@@ -10048,6 +10060,7 @@ fn build_ode_spec(
         &rhs_reads,
         n_states,
         "[odes]",
+        "the [odes] RHS",
         None,
     )?;
 

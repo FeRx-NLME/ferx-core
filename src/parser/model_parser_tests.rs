@@ -1823,23 +1823,72 @@ fn dose_attr_read_in_odes_init_is_accepted() {
     // `dose_attr_read_in_odes_rhs_is_rejected`.
     for name in ["F", "LAGTIME", "ALAG", "F1", "ALAG1", "LAGTIME1"] {
         let src = dose_attr_init_model(name);
-        let parsed = match parse_full_model(&src) {
-            Ok(p) => p,
-            Err(e) => panic!("`init(central) = {name} * 100` applies `{name}` once: {e}"),
-        };
-        // And it must not merely parse — the census must not then call the parameter
-        // dead. An `init(...)` line is block text the token census counts, so a
-        // reachable model produces no "computed but never used" advice either.
-        assert!(
-            parsed
-                .model
-                .parse_warnings
-                .iter()
-                .all(|w| !w.contains("never used")),
-            "`{name}` is read by the init seed, so it is not unused: {:?}",
-            parsed.model.parse_warnings
-        );
+        if let Err(e) = parse_full_model(&src) {
+            panic!("`init(central) = {name} * 100` applies `{name}` once: {e}");
+        }
     }
+}
+
+#[test]
+fn an_init_read_counts_as_a_use_for_the_never_used_census() {
+    // Companion to the acceptance test above, and deliberately *not* folded into it:
+    // asserting "no never-used warning" for `F`/`LAGTIME`/`F1`/… cannot fail, because
+    // the census exempts every dose-attribute name before it looks at block text
+    // (`RESERVED_PK_SLOTS` for the bare names, `DoseAttr::from_indexed_name` for the
+    // indexed ones). Measured: with the `init(...)` line deleted entirely, all six
+    // still produce zero "never used" warnings.
+    //
+    // So the census claim has to be made with a name the exemption does not cover. An
+    // ordinary parameter read *only* from the init is that name — and it is the shape
+    // that would regress if the seed ever stopped being counted as a use.
+    let src = "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVA(0.5, 0.0, 1.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  FSEED = TVA
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  init(central) = FSEED * 100.0
+  d/dt(central) = -(CL/V) * central
+
+[error_model]
+  DV ~ proportional(EPS1)
+";
+    let never_used = |s: &str| -> Vec<String> {
+        parse_full_model(s)
+            .expect("parses")
+            .model
+            .parse_warnings
+            .iter()
+            .filter(|w| w.contains("never used"))
+            .cloned()
+            .collect()
+    };
+    assert!(
+        never_used(src).is_empty(),
+        "`FSEED` is read by the init seed, so it is used: {:?}",
+        never_used(src)
+    );
+    // Non-vacuity: delete the init line and the very same parameter *is* reported —
+    // so the assertion above is a statement about the init read, not about the census
+    // being silent in general.
+    let without = src.replace("  init(central) = FSEED * 100.0\n", "");
+    assert_ne!(without, src, "the init line must actually be removed");
+    assert!(
+        never_used(&without).iter().any(|w| w.contains("`FSEED`")),
+        "with the init read gone `FSEED` must be reported unused: {:?}",
+        never_used(&without)
+    );
 }
 
 #[test]
@@ -1893,6 +1942,15 @@ fn dose_attr_read_in_both_odes_init_and_rhs_is_still_rejected() {
     assert!(
         err.contains("[odes]:") && err.contains("reserved dose-attribute name"),
         "the RHS read is still a double use even when an init also reads it: {err}"
+    );
+    // And the message must say *which* read to remove. This is the exact model where
+    // the un-narrowed wording misled: "remove it from [odes]" invites deleting the
+    // `init(...)` line, which is legal (#1046) and does not clear the error. The
+    // sibling data-gated half already says "[odes] RHS or [scaling]"
+    // (`api/validation.rs`), so the two halves of `E_DOSE_ATTR_DOUBLE_USE` agree.
+    assert!(
+        err.contains("read in the [odes] RHS") && err.contains("remove it from the [odes] RHS"),
+        "the remedy must name the RHS, not the whole block: {err}"
     );
 }
 

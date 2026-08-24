@@ -335,16 +335,18 @@ RHS that is *not* bioavailability, give it a different name.
 ### Reading a dose attribute is an error, not a warning
 
 `F` is consumed by the engine **at the dose event**, so a correct model never
-reads it back. Declaring `F` *and* referencing it in `[odes]` or `[scaling]` is
+reads it back on the prediction path. Declaring `F` *and* referencing it in the
+`[odes]` **RHS** or `[scaling]` is
 rejected at parse time with `E_DOSE_ATTR_DOUBLE_USE`
-([#993](https://github.com/FeRx-NLME/ferx-core/issues/993)):
+([#993](https://github.com/FeRx-NLME/ferx-core/issues/993)) — an `init(...)` seed
+is exempt, see below:
 
 ```text
 [odes]: `F` is this model's bioavailability — the engine already scales each dose
-amount by it — but it is also read in [odes], so the value is applied twice: once
-at the dose, once where you read it (#993). If `F` is meant to be bioavailability,
-remove it from [odes]; if it is meant to be an ordinary parameter, rename it —
-`F` is a reserved dose-attribute name.
+amount by it — but it is also read in the [odes] RHS, so the value is applied
+twice: once at the dose, once where you read it (#993). If `F` is meant to be
+bioavailability, remove it from the [odes] RHS; if it is meant to be an ordinary
+parameter, rename it — `F` is a reserved dose-attribute name.
 ```
 
 The rule follows the **expressions compiled against your individual parameters**,

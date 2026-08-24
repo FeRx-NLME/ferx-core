@@ -324,11 +324,16 @@ The parameter names on the left side of each assignment must map to recognized P
 
 On an ODE model the engine consumes `F`, `LAGTIME`/`ALAG` and the indexed
 `F{n}`/`ALAG{n}`/`LAGTIME{n}` **at the dose event** — they never appear in a
-correct `[odes]` block (RHS or `init(...)` seed), `[scaling]` readout, or
-`[adaptive_dosing] observe` signal. Declaring one *and* referencing it on
+correct `[odes]` **RHS**, `[scaling]` readout, or `[adaptive_dosing] observe`
+signal. Declaring one *and* referencing it on
 the prediction path applies it twice and is rejected with
 `E_DOSE_ATTR_DOUBLE_USE` ([#993](https://github.com/FeRx-NLME/ferx-core/issues/993)).
 If you need an ordinary parameter, rename it: the name is what routes it.
+
+An `init(...)` seed is **not** one of those surfaces, on either engine: an
+initial condition is not an absorbed dose, so the engine seeds it with the raw
+value and `init(central) = F * 100` applies `F` exactly once
+([#1046](https://github.com/FeRx-NLME/ferx-core/issues/1046)).
 
 The **analytical** engine applies the same rule, with one difference: there the
 `pk(...)` mapping — not the name — is what binds a parameter to the dose
@@ -339,9 +344,9 @@ differs: **drop the mapping**, not the name — renaming a mapped parameter chan
 nothing, because the mapping follows it. A parameter merely *named* `F` that no
 `pk(...)` argument maps is an ordinary parameter on this engine and stays silent.
 
-`[initial_conditions]` is *not* one of those surfaces: an initial condition is not
-an absorbed dose, so the engine deposits the amount with `F = 1` and no lag, and
-`init(depot) = F * 500` applies `F` exactly once.
+`[initial_conditions]` is *not* one of those surfaces either — the analytical
+spelling of the same carve-out: the engine deposits the amount with `F = 1` and no
+lag, so `init(depot) = F * 500` applies `F` exactly once.
 
 This is a deliberate divergence from NONMEM, which computes the same doubled
 value without a diagnostic: `$PK` defining `F1` **and** `S2 = V/F1` (rather than

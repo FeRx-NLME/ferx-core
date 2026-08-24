@@ -134,9 +134,11 @@ const NONMEM_LAG: [f64; 6] = [
     1.4000E+00, 1.3317E+00, 1.2050E+00, 3.0871E+00, 2.5275E+00, 1.6942E+00,
 ];
 
-fn preds(src: &str) -> Vec<f64> {
+/// `predict` at fixed parameters over `csv`. Single implementation so the reset arm
+/// below cannot drift from the anchor arms.
+fn preds_on(csv: &str, src: &str) -> Vec<f64> {
     let mut f = NamedTempFile::new().expect("temp csv");
-    write!(f, "{CSV}").expect("write csv");
+    write!(f, "{csv}").expect("write csv");
     f.flush().expect("flush csv");
     let pop = read_nonmem_csv(f.path(), None, None).expect("dataset loads");
     let model = parse_full_model(src).expect("the model parses").model;
@@ -144,6 +146,10 @@ fn preds(src: &str) -> Vec<f64> {
         .into_iter()
         .map(|p| p.pred)
         .collect()
+}
+
+fn preds(src: &str) -> Vec<f64> {
+    preds_on(CSV, src)
 }
 
 fn assert_matches(got: &[f64], want: &[f64], label: &str) {
@@ -212,21 +218,12 @@ fn an_init_seed_reading_a_dose_attribute_survives_a_system_reset() {
     // measured one; it is the only place the accepted expression runs more than once.
     for (attr, value) in [("F", 0.5), ("LAGTIME", 0.7)] {
         let run = |csv: &str, init_reads: &str| -> Vec<f64> {
-            let mut f = NamedTempFile::new().expect("temp csv");
-            write!(f, "{csv}").expect("write csv");
-            f.flush().expect("flush csv");
-            let pop = read_nonmem_csv(f.path(), None, None).expect("dataset loads");
-            let m = parse_full_model(&model(attr, value, init_reads))
-                .expect("the model parses")
-                .model;
-            predict(&m, &pop, &m.default_params)
-                .into_iter()
-                .map(|p| p.pred)
-                .collect()
+            preds_on(csv, &model(attr, value, init_reads))
         };
         let a = run(CSV_RESET, attr);
         let b = run(CSV_RESET, "SEED");
         assert_eq!(a.len(), 4, "{attr}: four observations across the reset");
+        assert_eq!(b.len(), a.len(), "{attr}: same number of predictions");
         for (i, (&x, &y)) in a.iter().zip(b.iter()).enumerate() {
             assert_eq!(
                 x.to_bits(),
@@ -235,16 +232,26 @@ fn an_init_seed_reading_a_dose_attribute_survives_a_system_reset() {
                  must equal re-seeding from an ordinary parameter ({y})"
             );
         }
-        // Non-vacuity: the reset must actually re-seed, or the twin above would agree
-        // on a trajectory that merely decayed through t = 1 and never exercised the
-        // re-seed path at all. Compared against the identical model on a dataset with
-        // the reset record removed.
+        // Non-vacuity, in both directions. The twin above compares two arms of the
+        // same run, so it would agree just as happily on a reset that never re-seeded
+        // — including one that zeroed the compartment, since two zeros are also
+        // bit-identical. Two independent pins are needed:
         //
-        // Note the post-reset points do *not* differ from their pre-reset
-        // counterparts by inspection — t = 1.5 sits 0.5 h after the re-seed exactly as
-        // t = 0.5 sits 0.5 h after the original seed, so both read
-        // `seed·e^(−k/2)/V` and are bit-identical. That coincidence is *why* this
-        // needs the no-reset arm rather than a monotonicity check on `a` alone.
+        // (a) the reset **did** re-seed, to the seed value. t = 1.5 sits 0.5 h after
+        //     the re-seed exactly as t = 0.5 sits 0.5 h after the original seed, so a
+        //     genuine re-seed makes those two points bit-identical — while a zeroing
+        //     reset (0.0) or a reset that never fired (continued decay) cannot.
+        assert_eq!(
+            a[2].to_bits(),
+            a[1].to_bits(),
+            "{attr}: t=1.5 after the re-seed ({}) must equal t=0.5 after the original \
+             seed ({}) — a zeroing or absent re-seed cannot produce that equality",
+            a[2],
+            a[1]
+        );
+        // (b) the reset record actually changed the trajectory, against the identical
+        //     model on a dataset with the reset row removed. On its own this would
+        //     admit a zeroing reset, which is why (a) carries the value.
         let plain = run(CSV_NO_RESET, attr);
         assert_eq!(
             plain.len(),
@@ -272,9 +279,16 @@ fn seeding_from_a_dose_attribute_equals_seeding_from_an_ordinary_parameter() {
     // This is what makes the anchor a measurement of the *rule* rather than of one
     // model: if the engine ever began applying `F` to the seed, A would diverge from B
     // here even if both still happened to sit inside a loose tolerance of the table.
-    for (attr, value) in [("F", 0.5), ("LAGTIME", 0.7)] {
+    for (attr, value, want) in [("F", 0.5, &NONMEM_F), ("LAGTIME", 0.7, &NONMEM_LAG)] {
         let a = preds(&model(attr, value, attr));
         let b = preds(&model(attr, value, "SEED"));
+        // Anchor both arms to the reference before comparing them to each other.
+        // Bit-equality alone would hold just as well if both arms returned all-zeros
+        // or all-NaN (`NaN.to_bits() == NaN.to_bits()`), so without this the
+        // "strongest statement" above would rest entirely on the two anchor tests
+        // happening to cover the same models.
+        assert_matches(&a, want, &format!("{attr} twin arm A"));
+        assert_matches(&b, want, &format!("{attr} twin arm B"));
         assert_eq!(a.len(), b.len(), "{attr}: same number of predictions");
         for (i, (&x, &y)) in a.iter().zip(b.iter()).enumerate() {
             assert_eq!(
