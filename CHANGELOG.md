@@ -19,6 +19,15 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Added
+- **The `init(...)` scope rule is now published by the engine (#994).** `INIT_SCOPE_BUILTINS` and
+  `INIT_REJECTED_BUILTINS` name the built-ins an init expression may and may not reference, so a
+  code generator can source the rule from the same binary it will parse with instead of mirroring it
+  by guesswork — the arrangement `known_block_names()` (#1040) already provides for block names. The
+  `[odes] init(...)` diagnostic is rendered from the same lists, so message and guard cannot drift.
+  The full rule is documented under
+  [ODE models → What an `init(...)` expression may reference](https://ferx-nlme.github.io/ferx-core/model-file/ode-models.html#init-scope).
+
 ### Changed
 - **A single-endpoint `[error_model]` must now name its sigmas in declaration order (#1001).**
   A one-line `DV ~ ...` error model consumes its sigmas **positionally** from the `[parameters]`
@@ -110,6 +119,18 @@ section of the SDLC for the versioning policy).
   with no diagnostic from NONMEM (`nonmem_anchor/dose_attr_double_use_{A,B}.ctl`).
 
 ### Fixed
+- **`TIME` in an `init(...)` expression is now rejected instead of silently reading zero (#994).**
+  Both init surfaces — `[odes] init(state) = ...` and the analytical `[initial_conditions]
+  init(cmt) = ...` — accepted a bare `TIME` (and `time`), while rejecting `Time`, `T`, `TAFD` and
+  `TAD`. An initial condition is evaluated at the time origin, so `TIME` there always read exactly
+  `0`: `init(central) = TIME + 50` was bit-identical to `init(central) = 0 + 50`, and
+  `init(central) = TIME * SOMETHING` initialised the compartment to zero, validated clean, and
+  fitted. The leak was representational, not a scope decision — a bare `TIME` parses to its own AST
+  node rather than to a variable, so the undefined-name check could not see it. It now errors,
+  pointing at `d/dt(...)` (or `[scaling]` Form C) for a genuinely time-dependent expression.
+  `MIXNUM`, the other built-in the check cannot see, stays in scope: it resolves to the subject's
+  mixture class, so a class-switched baseline does real work — it is now named in the diagnostic,
+  which previously listed neither.
 - **A zero, negative, or non-finite residual-error magnitude is now rejected (#484 / #1029).** The
   magnitude multiplies a sigma loading, so a zero one — an MBMA arm with no reported standard error,
   say — collapses that observation's variance onto the internal `1e-12` floor and lets a single row

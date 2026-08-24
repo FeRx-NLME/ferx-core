@@ -81,6 +81,33 @@ for an indirect-response / turnover model — declare an initial condition in th
 - Compartments without an `init(...)` line start at zero, as before.
 - This is the analogue of NONMEM's `A_0(n)`.
 
+### What an `init(...)` expression may reference {#init-scope}
+
+The scope is closed, and the same on both init surfaces (`[odes] init(...)` and
+the analytical [`[initial_conditions]`](initial-conditions.qmd) block):
+
+| Name | In scope? | Why |
+|---|---|---|
+| declared states | yes — bound to `0` | no drug is present yet |
+| individual parameters | yes | folds in `theta` / `eta` / covariates |
+| covariates | analytical block only | on the ODE path, reach them through `[individual_parameters]` |
+| `MACHEPS` | yes (any casing) | machine-epsilon constant |
+| `MIXNUM` | yes (any casing) | resolves to the subject's mixture class, so a class-switched baseline works |
+| `TIME`, `T`, `TAFD`, `TAD` | **no** | an initial condition is evaluated at the time origin, so every clock reads exactly `0` |
+
+The time built-ins are rejected with an error rather than silently read as `0`.
+Before issue [#994](https://github.com/FeRx-NLME/ferx-core/issues/994) a bare
+`TIME` was accepted on both surfaces — `init(central) = TIME * SOMETHING`
+initialised the compartment to zero, validated clean, and fitted. `T` / `TAFD` /
+`TAD` were rejected all along, so the two halves of the rule disagreed. Put the
+time dependence in `d/dt(...)`, where `TIME` resolves to the integrator's
+current time.
+
+The accepted and rejected built-in name sets are exposed by the engine
+(`INIT_SCOPE_BUILTINS` / `INIT_REJECTED_BUILTINS`) so a code generator can
+source the rule from the same binary it will parse with, instead of keeping its
+own copy — the same arrangement as `known_block_names()` for block names.
+
 **Time-varying covariates.** Because the initial condition is a pre-record
 baseline, it is evaluated a single time using the covariate values from the
 subject's **first record**. If a covariate that feeds the `init` expression

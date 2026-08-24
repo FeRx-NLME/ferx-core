@@ -10036,6 +10036,134 @@ fn test_init_macheps_is_case_insensitive() {
 }
 
 #[test]
+fn test_init_time_builtin_rejected() {
+    // #994: a bare `TIME` parses to `Expression::Time`, not to a `Variable`, so
+    // the undefined-name check could not see it and it was silently accepted —
+    // while `TAFD`/`TAD`, its siblings in the same reserved list, were rejected.
+    // Model time at an initial condition is 0 by definition, so the reference
+    // could only ever flatten the expression (`init = TIME * X` → 0).
+    for rhs in ["TIME", "TIME + 50", "time * KIN", "2 * (TIME + KIN)"] {
+        let src = turnover_ode_model(&format!("  init(response) = {rhs}"));
+        let err = parse_full_model(&src)
+            .err()
+            .unwrap_or_else(|| panic!("`init(response) = {rhs}` must be rejected"));
+        assert!(
+            err.contains("init(response)") && err.contains("`TIME` built-in"),
+            "error should name init(response) and the TIME built-in, got: {err}"
+        );
+        assert!(
+            err.contains("#994"),
+            "error should cite the issue, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_init_time_alias_and_siblings_still_rejected() {
+    // The other reserved clocks are ordinary identifiers in an init RHS, so they
+    // fall out of the undefined-name check — that behaviour predates #994 and
+    // must not regress when the `TIME` node guard is added in front of it.
+    for rhs in INIT_REJECTED_BUILTINS.iter().filter(|n| **n != "TIME") {
+        let src = turnover_ode_model(&format!("  init(response) = {rhs}"));
+        let err = parse_full_model(&src)
+            .err()
+            .unwrap_or_else(|| panic!("`init(response) = {rhs}` must be rejected"));
+        assert!(
+            err.contains("init(response)"),
+            "error should name init(response), got: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_init_undefined_name_message_lists_the_real_scope() {
+    // The diagnostic is the only place the init scope rule is written down
+    // (#994), so it must name every accepted built-in — including `MIXNUM`,
+    // which is in scope and was absent from the message — and say that the time
+    // built-ins are not.
+    let src = turnover_ode_model("  init(response) = BASE");
+    let err = parse_full_model(&src)
+        .err()
+        .expect("undefined name must be rejected");
+    for builtin in INIT_SCOPE_BUILTINS {
+        assert!(
+            err.contains(builtin),
+            "message should list the accepted built-in {builtin}, got: {err}"
+        );
+    }
+    for rejected in INIT_REJECTED_BUILTINS {
+        assert!(
+            err.contains(rejected),
+            "message should list the out-of-scope built-in {rejected}, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_init_mixnum_accepted_in_mixture_model() {
+    // The other payload-free built-in node, `Expression::MixNum`, is invisible to
+    // the undefined-name check for the same structural reason `TIME` was — but
+    // unlike `TIME` it does real work at init: it resolves to the subject's class
+    // and discriminates the classes. It stays in scope (#994 comment); the class-1
+    // default gives 100 here.
+    let src = r"
+[parameters]
+  theta TVKIN(10.0, 0.001, 100.0)
+  theta TVKOUT(2.0, 0.001, 100.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_KIN ~ 0.09
+  sigma ADD ~ 0.1
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  KIN  = TVKIN * exp(ETA_KIN)
+  KOUT = TVKOUT
+
+[structural_model]
+  ode(obs_cmt=response, states=[response])
+
+[odes]
+  init(response) = MIXNUM * 100
+  d/dt(response) = KIN - KOUT * response
+
+[error_model]
+  DV ~ additive(ADD)
+";
+    let parsed = parse_full_model(src).expect("MIXNUM is in scope in an init expression");
+    let ode = parsed.model.ode_spec.as_ref().expect("ODE spec");
+    assert_eq!(ode.initial_state(&[10.0, 2.0]), vec![100.0]);
+}
+
+#[test]
+fn test_analytical_init_time_builtin_rejected() {
+    // #994: the `[initial_conditions]` surface took the same leak. The baseline
+    // amount is evaluated once per subject at t = 0, so `TIME` reads the
+    // model-time thread-local's 0.0 and the reference contributes nothing.
+    for rhs in ["TIME", "TIME + 50", "time * V"] {
+        let src = analytical_oral_with_init(&format!(
+            "
+[initial_conditions]
+  init(central) = {rhs}
+"
+        ));
+        let err = parse_full_model(&src)
+            .err()
+            .unwrap_or_else(|| panic!("`init(central) = {rhs}` must be rejected"));
+        assert!(
+            err.contains("[initial_conditions] init") && err.contains("`TIME` built-in"),
+            "error should name the block and the TIME built-in, got: {err}"
+        );
+        assert!(
+            err.contains("#994"),
+            "error should cite the issue, got: {err}"
+        );
+    }
+}
+
+#[test]
 fn test_diffusion_block_parsed_into_theta() {
     let src = minimal_ode_model_with_diffusion("  central ~ 0.05");
     let parsed = parse_full_model(&src).unwrap();
