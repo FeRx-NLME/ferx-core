@@ -1446,6 +1446,35 @@ mod invert_tests {
         assert!(Activation::Identity.invert(f64::INFINITY).is_none());
     }
 
+    /// The range blurb is user-facing error text (`[covariate_nn] init` quotes it
+    /// when a declared output value cannot be inverted), so it has to *describe
+    /// the range `invert` actually enforces*. Pinning the string alone would let
+    /// the two drift apart silently — a widened `invert` with a stale blurb tells
+    /// the user their value is out of range when it is not. So each arm is paired
+    /// with a probe the text excludes, and `invert` must agree by declining it.
+    #[test]
+    fn range_description_describes_the_range_invert_enforces() {
+        let cases = [
+            (Activation::Identity, "any finite value", f64::NAN),
+            (Activation::Relu, "a value > 0", 0.0),
+            (Activation::Softplus, "a value > 0", 0.0),
+            (Activation::Tanh, "a value strictly between -1 and 1", 1.0),
+            (Activation::Sigmoid, "a value strictly between 0 and 1", 1.0),
+            (Activation::Exp, "a value > 0", 0.0),
+        ];
+        for (act, expected, excluded) in cases {
+            assert_eq!(
+                act.range_description(),
+                expected,
+                "{act:?} reports an unexpected range description"
+            );
+            assert!(
+                act.invert(excluded).is_none(),
+                "{act:?} says its range is `{expected}` but inverts the excluded value {excluded}"
+            );
+        }
+    }
+
     /// The output-layer weight block must be exactly the entries between the
     /// last layer's start and its first bias — the range `init` zeroes.
     #[test]

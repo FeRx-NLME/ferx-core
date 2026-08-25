@@ -855,3 +855,409 @@ fn the_generic_evaluator_sees_real_nn_outputs_under_the_guard() {
     );
     drop(outer);
 }
+
+// ---------------------------------------------------------------------------
+// The `fd_all` branch: M3 / dense-residual-covariance / TTE
+// ---------------------------------------------------------------------------
+//
+// `obs_nll_subject_grad` and `obs_nll_subject_grad_iov` each fork on `fd_all`
+// (`BloqMethod::M3`, a non-empty `residual_correlations`, or — under `survival` —
+// any endpoint) into a *second* FD loop that reuses none of the non-M3 code. The
+// hybrid is wired into both forks separately: each has its own
+// `NnGradPlan::build`, its own `covers(i)` skip, and its own `plan.accumulate`.
+//
+// So the parity checks above, which run on a plain `proportional` error model,
+// say nothing about the M3 fork — a plan dropped there, or a `covers` skip left
+// without the matching `accumulate`, would leave every NN weight's gradient at
+// exactly 0.0 and no existing test would notice. These two mirror the non-M3
+// parity tests across that fork, against central FD of the same evaluators.
+
+/// `dcm_model_src()` plus `bloq_method = m3`, which is what selects the `fd_all`
+/// fork. The censoring itself is incidental — the fork is chosen by the *option*,
+/// not by the data — but one genuinely censored row is included so the M3
+/// normal-tail term contributes to the objective the FD reference differentiates.
+fn dcm_m3_model_src() -> String {
+    format!("{}\n[fit_options]\n  bloq_method = m3\n", dcm_model_src())
+}
+
+/// A subject whose last observation is below the quantitation limit.
+fn m3_subject() -> Subject {
+    let mut subject = static_subject();
+    // `cens = 1` marks the row censored; the recorded DV is the LOQ.
+    subject.cens = vec![0, 0, 0, 1];
+    subject.observations[3] = 2.0;
+    subject
+}
+
+/// The M3 fork of `obs_nll_subject_grad` must serve NN weights through the hybrid,
+/// to the same tolerance as the non-M3 fork.
+#[test]
+fn hybrid_nn_weight_gradient_matches_central_fd_under_m3() {
+    let model = parse_model_string(&dcm_m3_model_src()).expect("M3 DCM model parses");
+    assert!(
+        matches!(model.bloq_method, crate::types::BloqMethod::M3),
+        "fixture must select the fd_all fork"
+    );
+
+    let subject = m3_subject();
+    let theta = probe_theta(&model);
+    let sigma_values = vec![0.2f64];
+    let eta = vec![0.15f64, -0.1f64];
+    let n_theta = theta.len();
+    let n_sigma = 1;
+    let (mask, lo, hi) = unpinned(&model, n_theta + n_sigma);
+
+    // Same premise guard as the non-M3 test: without a plan this would be
+    // comparing the plain FD loop against FD and would pass for the wrong reason.
+    assert!(
+        NnGradPlan::build(&model, &subject, &theta, n_theta).is_some(),
+        "static-covariate DCM subject must be served by the hybrid path under M3"
+    );
+
+    let mut scratch = EventPkParams::default();
+    let (_nll, grad) = obs_nll_subject_grad(
+        &model,
+        &subject,
+        &theta,
+        &sigma_values,
+        &eta,
+        &mask,
+        &lo,
+        &hi,
+        n_theta,
+        n_sigma,
+        &mut scratch,
+    );
+    let reference = central_fd_theta_grad(&model, &subject, &theta, &sigma_values, &eta, &mask);
+
+    let nn_idx = nn_theta_indices(&model);
+    let peak = nn_idx
+        .iter()
+        .map(|&i| reference[i].abs())
+        .fold(0.0f64, f64::max);
+    assert!(
+        peak > 0.0,
+        "the M3 objective must actually depend on the network weights"
+    );
+    let mut n_informative = 0;
+    for &i in &nn_idx {
+        if reference[i].abs() > 1e-3 * peak {
+            n_informative += 1;
+        }
+        assert!(
+            relative(grad[i], reference[i]) < 1e-5,
+            "M3 NN weight theta[{i}]: hybrid={:.8e}, central FD={:.8e}, rel={:.2e}",
+            grad[i],
+            reference[i],
+            relative(grad[i], reference[i])
+        );
+    }
+    assert!(
+        n_informative >= 12,
+        "expected most NN weights to carry signal under M3, got {n_informative}/{}",
+        nn_idx.len()
+    );
+}
+
+/// The IOV × M3 corner: `obs_nll_subject_grad_iov`'s own `fd_all` fork. Reached by
+/// no other test — the IOV parity test above is non-M3, and the M3 test above is
+/// non-IOV — yet it is where a heavily-censored DCM+IOV fit actually runs (#654).
+#[test]
+fn hybrid_nn_weight_gradient_matches_central_fd_under_m3_iov() {
+    let src = dcm_m3_model_src()
+        .replace(
+            "  CL = TYPICAL_PK.CL * exp(ETA_CL)",
+            "  CL = TYPICAL_PK.CL * exp(ETA_CL + KAPPA_CL)",
+        )
+        .replace(
+            "  omega ETA_V  ~ 0.09",
+            "  omega ETA_V  ~ 0.09\n  kappa KAPPA_CL ~ 0.05",
+        );
+    let model = parse_model_string(&src).expect("M3 IOV DCM model parses");
+    assert!(model.n_kappa > 0, "model must carry IOV");
+    assert!(
+        matches!(model.bloq_method, crate::types::BloqMethod::M3),
+        "fixture must select the fd_all fork"
+    );
+
+    let mut subject = m3_subject();
+    subject.occasions = vec![1, 1, 2, 2];
+    subject.dose_occasions = vec![1];
+
+    let theta = probe_theta(&model);
+    let sigma_values = vec![0.2f64];
+    let eta = vec![0.15f64, -0.1f64];
+    let kappas = vec![vec![0.08f64], vec![-0.06f64]];
+    let n_theta = theta.len();
+    let n_sigma = 1;
+    let (mask, lo, hi) = unpinned(&model, n_theta + n_sigma);
+
+    assert!(
+        NnGradPlan::build(&model, &subject, &theta, n_theta).is_some(),
+        "IOV DCM subject must be served by the hybrid path under M3"
+    );
+
+    let mut scratch = EventPkParams::default();
+    let (_nll, grad) = obs_nll_subject_grad_iov(
+        &model,
+        &subject,
+        &theta,
+        &sigma_values,
+        &eta,
+        &kappas,
+        &mask,
+        &lo,
+        &hi,
+        n_theta,
+        n_sigma,
+        &mut scratch,
+    );
+
+    let mut reference = vec![0.0f64; n_theta];
+    for i in 0..n_theta {
+        let h = 1e-6 * (1.0 + theta[i].abs());
+        let mut tp = theta.clone();
+        tp[i] += h;
+        let f_plus = obs_nll_subject_into_iov(
+            &model,
+            &subject,
+            &tp,
+            &sigma_values,
+            &eta,
+            &kappas,
+            &mut scratch,
+        );
+        tp[i] = theta[i] - h;
+        let f_minus = obs_nll_subject_into_iov(
+            &model,
+            &subject,
+            &tp,
+            &sigma_values,
+            &eta,
+            &kappas,
+            &mut scratch,
+        );
+        let raw = (f_plus - f_minus) / (2.0 * h);
+        reference[i] = if mask[i] { theta[i] * raw } else { raw };
+    }
+
+    let nn_idx = nn_theta_indices(&model);
+    let peak = nn_idx
+        .iter()
+        .map(|&i| reference[i].abs())
+        .fold(0.0f64, f64::max);
+    assert!(
+        peak > 0.0,
+        "the M3 IOV objective must actually depend on the network weights"
+    );
+    for &i in &nn_idx {
+        assert!(
+            relative(grad[i], reference[i]) < 1e-5,
+            "M3 IOV NN weight theta[{i}]: hybrid={:.8e}, central FD={:.8e}, rel={:.2e}",
+            grad[i],
+            reference[i],
+            relative(grad[i], reference[i])
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `NnGradPlan` guard rails
+// ---------------------------------------------------------------------------
+
+/// `NnGradPlan::build` declines rather than panicking when a block's weight run
+/// would fall outside the caller's θ accounting.
+///
+/// This is the wiring-bug guard, not a user-facing condition: a `weights_offset`
+/// past `n_theta` means the parser and the optimizer disagree about the θ layout.
+/// Declining routes the caller to its plain per-θ FD loop, which is slower but
+/// correct; indexing would be an out-of-bounds panic mid-fit.
+#[test]
+fn nn_grad_plan_declines_when_a_block_runs_past_the_theta_count() {
+    let model = parse_model_string(&dcm_model_src()).expect("DCM parses");
+    let subject = static_subject();
+    let theta = probe_theta(&model);
+    let n_theta = theta.len();
+
+    // The premise: the honest accounting is served.
+    assert!(
+        NnGradPlan::build(&model, &subject, &theta, n_theta).is_some(),
+        "the plan must be available at the true theta count"
+    );
+
+    // `n_theta` understated — the block's run ends past it.
+    let nn = &model.covariate_nns[0];
+    let short_n_theta = nn.weights_offset + nn.mapper.mlp().n_weights() - 1;
+    assert!(
+        NnGradPlan::build(&model, &subject, &theta, short_n_theta).is_none(),
+        "a block ending past `n_theta` must decline the plan"
+    );
+
+    // The θ slice itself truncated, with `n_theta` still honest — the second half
+    // of the same guard, and the one an out-of-bounds slice would trip.
+    let truncated = &theta[..theta.len() - 1];
+    assert!(
+        NnGradPlan::build(&model, &subject, truncated, n_theta).is_none(),
+        "a block ending past the theta slice must decline the plan"
+    );
+}
+
+/// A block whose every weight is pinned is skipped outright — including the two
+/// output-bias solves, which are the whole cost of the hybrid.
+///
+/// `pinned_output_bias_reports_zero_without_disturbing_free_weights` covers a
+/// *partly* pinned block; this is the all-pinned short circuit, where the right
+/// behaviour is to do no work at all rather than to solve and multiply by zero.
+#[test]
+fn a_fully_pinned_nn_block_does_no_solves() {
+    let model = parse_model_string(&dcm_model_src()).expect("DCM parses");
+    let subject = static_subject();
+    let theta = probe_theta(&model);
+    let n_theta = theta.len();
+    let n_sigma = 1;
+    let (mask, mut lo, mut hi) = unpinned(&model, n_theta + n_sigma);
+
+    let plan = NnGradPlan::build(&model, &subject, &theta, n_theta).expect("plan available");
+
+    // Pin every NN weight by collapsing its bounds onto its value.
+    for &i in &nn_theta_indices(&model) {
+        lo[i] = theta[i];
+        hi[i] = theta[i];
+    }
+
+    let mut solves = 0usize;
+    let mut grad = vec![0.0f64; n_theta + n_sigma];
+    plan.accumulate(
+        |_i, _sign| {
+            solves += 1;
+            1.0
+        },
+        &theta,
+        &mask,
+        &lo,
+        &hi,
+        &mut grad,
+    );
+
+    assert_eq!(
+        solves, 0,
+        "an all-pinned block must skip its output-bias solves, not just zero the result"
+    );
+    for &i in &nn_theta_indices(&model) {
+        assert_eq!(
+            grad[i], 0.0,
+            "pinned NN weight theta[{i}] must be left at zero"
+        );
+    }
+}
+
+/// A log-packed NN weight's entry is scaled by `theta[g]`, matching the chain rule
+/// the caller's own FD loop applies to log-packed θ.
+///
+/// The DSL gives NN weights a lower bound of `-inf`, so `theta_packs_log` is false
+/// for all of them and the production mask never selects this arm. It is still the
+/// arm that would run if a future parameterization change made a weight positive-
+/// bounded, so it is pinned here against the same `theta[g] * raw` rule the rest of
+/// the θ vector obeys — driven through `accumulate` with a hand-built mask.
+#[test]
+fn a_log_packed_nn_weight_is_scaled_by_its_value() {
+    let model = parse_model_string(&dcm_model_src()).expect("DCM parses");
+    let subject = static_subject();
+    let theta = probe_theta(&model);
+    let n_theta = theta.len();
+    let n_sigma = 1;
+    let (_mask, lo, hi) = unpinned(&model, n_theta + n_sigma);
+    let nn_idx = nn_theta_indices(&model);
+
+    let plan = NnGradPlan::build(&model, &subject, &theta, n_theta).expect("plan available");
+
+    // A constant derivative makes the two runs differ *only* by the log-packing
+    // factor, so the assertion below isolates that factor.
+    let deriv = |_i: usize, _sign: f64| 0.25f64;
+
+    let mut raw_grad = vec![0.0f64; n_theta + n_sigma];
+    plan.accumulate(
+        deriv,
+        &theta,
+        &vec![false; n_theta + n_sigma],
+        &lo,
+        &hi,
+        &mut raw_grad,
+    );
+
+    let mut logged_grad = vec![0.0f64; n_theta + n_sigma];
+    plan.accumulate(
+        deriv,
+        &theta,
+        &vec![true; n_theta + n_sigma],
+        &lo,
+        &hi,
+        &mut logged_grad,
+    );
+
+    let mut n_checked = 0;
+    for &g in &nn_idx {
+        if raw_grad[g] == 0.0 {
+            continue;
+        }
+        n_checked += 1;
+        let expected = theta[g] * raw_grad[g];
+        assert!(
+            (logged_grad[g] - expected).abs() <= 1e-12 * expected.abs().max(1e-12),
+            "log-packed NN weight theta[{g}]: got {:.8e}, want theta[g]*raw = {:.8e}",
+            logged_grad[g],
+            expected
+        );
+    }
+    assert!(
+        n_checked > 0,
+        "the fixture must produce at least one non-zero weight entry to scale"
+    );
+}
+
+/// The snapshots can be perfectly self-consistent and *still* disagree with the
+/// subject-static covariate map — that is the second half of
+/// `static_nn_input_map`'s check, and a distinct decline from the time-varying
+/// case above (where the snapshots disagree with each other).
+///
+/// It matters because the static map is what a subject's records fall back to for
+/// a *kind* of record it has none of: a subject with observation snapshots but no
+/// dose snapshots reads `subject.covariates` at its dose events. If the two
+/// disagree, the network sees one input vector at the doses and another at the
+/// observations — time-varying in effect, however uniform each snapshot set looks
+/// — so the single-`z` factorization cannot represent it and the plan must
+/// decline rather than pick one of the two maps.
+#[test]
+fn snapshots_disagreeing_with_the_static_map_decline_the_plan() {
+    let model = parse_model_string(&dcm_model_src()).expect("DCM model parses");
+    let mut subject = static_subject();
+    // Every snapshot agrees with every other snapshot...
+    let snap = HashMap::from([("WT".into(), 80.0), ("CRCL".into(), 95.0)]);
+    subject.obs_covariates = vec![snap.clone(), snap.clone(), snap.clone(), snap.clone()];
+    // ...but `subject.covariates` still carries WT = 72 (see `static_subject`),
+    // and this subject has no dose snapshots, so its dose event reads that.
+    assert!(subject.dose_covariates.is_empty());
+    assert_ne!(
+        subject.covariates.get("WT"),
+        snap.get("WT"),
+        "the premise is a base map that disagrees with the snapshots"
+    );
+
+    let theta = probe_theta(&model);
+    let n_theta = theta.len();
+    assert!(
+        NnGradPlan::build(&model, &subject, &theta, n_theta).is_none(),
+        "a static map disagreeing with the snapshots must route to the per-theta FD loop"
+    );
+
+    // Agreeing on the NN's inputs is enough — the base map may still differ on a
+    // covariate the network does not read, which pins the check to `input_names`
+    // rather than to the whole map.
+    let mut agreeing = subject.clone();
+    agreeing.covariates.insert("WT".to_string(), 80.0);
+    agreeing.covariates.insert("UNREAD".to_string(), 1234.0);
+    assert!(
+        NnGradPlan::build(&model, &agreeing, &theta, n_theta).is_some(),
+        "agreement on the network's own inputs must be sufficient"
+    );
+}

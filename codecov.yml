@@ -8,16 +8,17 @@
 #   project/floor_weekly -> 90% floor ENFORCED on the weekly main run (goes red
 #                           below 90%); never evaluated on PRs, so it blocks no one
 # Slow-tests NEVER run on PRs. Per-PR uploads = `fast` (--features ci, from
-# `Tests + coverage (core)`) + `survival` AND `markov`, which are BOTH uploaded from
-# the single `Tests + coverage (TTE/CTMM endpoints)` job (--features ci,markov, and
-# `markov = ["survival"]` so that build is a strict superset of a survival-only one);
-# nightly upload = `slow` flag (--features ci,slow-tests). carryforward lets the
-# nightly `slow` data augment the project number on PRs without re-running it. The
-# `survival` and `markov` flags exist because that feature-gated code is compiled OUT
-# of the `fast`/`slow` FD builds — Codecov merges the flags in so those lines are
-# counted where they're actually exercised (#293). Both flags are kept as distinct
-# names (rather than collapsed into one) so the patch status can require each family
-# independently and so a future split of the jobs needs no config change.
+# `Tests + coverage (core)`) + `survival`, `markov` AND `nn`, which are ALL uploaded
+# from the single `Tests + coverage (TTE/CTMM endpoints)` job (--features
+# ci,markov,nn, and `markov = ["survival"]` so that build is a strict superset of a
+# survival-only one); nightly upload = `slow` flag (--features ci,slow-tests).
+# carryforward lets the nightly `slow` data augment the project number on PRs without
+# re-running it. The `survival`, `markov` and `nn` flags exist because that
+# feature-gated code is compiled OUT of the `fast`/`slow` FD builds — Codecov merges
+# the flags in so those lines are counted where they're actually exercised (#293).
+# All three flags are kept as distinct names (rather than collapsed into one) so the
+# patch status can require each family independently and so a future split of the
+# jobs needs no config change.
 
 coverage:
   range: 85..95
@@ -41,6 +42,7 @@ coverage:
           - slow
           - survival
           - markov
+          - nn
       # The explicit 90% gap, shown on every PR so the author sees how far
       # under the floor they are — informational, so it challenges without
       # gatekeeping.
@@ -53,6 +55,7 @@ coverage:
           - slow
           - survival
           - markov
+          - nn
       # The teeth: ENFORCED on the weekly full-coverage run on `main` only, so
       # the project status genuinely goes RED there while we're below 90%.
       # Never evaluated on PRs (branches: main), so it blocks no one. No later
@@ -69,6 +72,7 @@ coverage:
           - slow
           - survival
           - markov
+          - nn
     patch:
       default:
         target: 90% # new/changed lines must be tested
@@ -78,16 +82,17 @@ coverage:
         # blocks nothing); `only_pulls` confines the status to PR comparisons.
         # (#300)
         only_pulls: true
-        # `fast`, `survival`, and `markov` are the FRESH per-PR coverage sources,
-        # so they grade the changed lines. `survival` and `markov` are each
-        # required here: their feature-gated code is compiled out of the `fast`
-        # build, so without the flag a survival- or markov-only PR's own new lines
-        # would read as uncovered and fail this gate at 0%. `slow` stays excluded —
-        # it's carryforward (stale for brand-new code).
+        # `fast`, `survival`, `markov`, and `nn` are the FRESH per-PR coverage
+        # sources, so they grade the changed lines. `survival`, `markov` and `nn`
+        # are each required here: their feature-gated code is compiled out of the
+        # `fast` build, so without the flag a survival-, markov- or nn-only PR's own
+        # new lines would read as uncovered and fail this gate at 0%. `slow` stays
+        # excluded — it's carryforward (stale for brand-new code).
         flags:
           - fast
           - survival
           - markov
+          - nn
 
 flag_management:
   default_rules:
@@ -105,6 +110,12 @@ flag_management:
       carryforward: true
     - name: markov
       # Same job, same upload, same rationale as `survival` above.
+      carryforward: true
+    - name: nn
+      # Same job, same upload, same rationale as `survival` above. Covers the
+      # `[covariate_nn]` / DCM surface (`src/nn`, the θ-gradient module, and the
+      # `nn`-gated branches of the parser, sens provider and io/output), which is
+      # compiled out of every non-`nn` build.
       carryforward: true
 
 comment:

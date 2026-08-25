@@ -18813,3 +18813,55 @@ fn covariate_nn_init_requires_one_entry_per_output() {
         "error should explain the arity: {err}"
     );
 }
+
+/// `ModelNnGuard::enter_for` must return `None` for a model with no
+/// `[covariate_nn]` blocks — the ambient-outputs slot is left untouched, so the
+/// generic evaluator's `Op::PushNnOutput` arm stays unreachable rather than
+/// reading an empty block.
+///
+/// Deliberately **not** `#[cfg(feature = "nn")]`. There are two `enter_for`
+/// bodies — the real one and a `#[cfg(not(feature = "nn"))]` stub that returns
+/// `None` unconditionally — and only one of them is compiled in any given build.
+/// An ungated test exercises whichever one this build has, so the contract
+/// "a model with no networks declines the guard" is pinned in the base `ci` build
+/// and the `nn` build alike. Gating it would leave the stub untested and let a
+/// future edit give the two bodies different answers.
+#[test]
+fn model_nn_guard_declines_a_model_with_no_networks() {
+    use crate::parser::model_parser::ModelNnGuard;
+    use std::collections::HashMap;
+
+    let src = r#"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma ADD ~ 0.1
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ additive(ADD)
+"#;
+    let model = parse_model_string(src).expect("plain model parses");
+    // `covariate_nns` is itself an `nn`-gated field, so the premise can only be
+    // stated in the `nn` build. In the base build there is no such field and the
+    // premise holds by construction.
+    #[cfg(feature = "nn")]
+    assert!(
+        model.covariate_nns.is_empty(),
+        "the premise is a model with no networks"
+    );
+
+    let cov = HashMap::from([("WT".to_string(), 72.0)]);
+    let guard = ModelNnGuard::enter_for(&model, &model.default_params.theta, &cov);
+    assert!(
+        guard.is_none(),
+        "a model with no [covariate_nn] blocks must not install a guard"
+    );
+}
