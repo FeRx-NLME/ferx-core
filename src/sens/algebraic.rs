@@ -81,10 +81,12 @@ fn programs(model: &CompiledModel) -> Option<(&IndivParamProgram, &OdeOutputProg
     if !model.is_algebraic() {
         return None;
     }
-    // IOV: the readout would have to be evaluated per occasion under a stacked
-    // `(θ, η_bsv, κ)` seeding, as the f64 path already does (`predict_iov`).
-    // Deferred — such a subject routes to FD, which differentiates that same
-    // per-occasion predictor and is therefore correct, just slower.
+    // These are the **BSV** walks: their axis layout has no room for κ, so a
+    // κ-carrying model is not theirs to serve. It is not declined outright —
+    // [`supported_iov`] and the stacked walks below take it. Keep this predicate
+    // and that one separate rather than merging them: the two layouts differ, and a
+    // single "supported" that covered both would have to be re-derived at every
+    // call site to know which pair of walks it licensed.
     if model.n_kappa > 0 {
         return None;
     }

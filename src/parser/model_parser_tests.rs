@@ -18501,3 +18501,89 @@ fn algebraic_structural_model_allows_many_readout_parameters() {
         .expect("a compartment-free model is not bound by the analytical spare-slot region");
     assert!(model.is_algebraic());
 }
+
+/// A bare `THETA(i)` / `ETA(k)` in the equation must ride the #486 desugaring:
+/// the parser appends a synthetic individual parameter and rewrites the reference
+/// to it, so the readout stays dual-evaluable and keeps the analytic gradient.
+///
+/// The synthetics are appended on the ODE-layout path (which a compartment-free
+/// model takes), but the *acceptance list* was then overwritten with the analytical
+/// allocator's empty result — so the reference was never rewritten, the readout
+/// reported `dual_evaluable = false`, and the model silently dropped to finite
+/// differences while carrying a warning blaming the readout's shape.
+#[test]
+fn algebraic_structural_model_desugars_a_bare_theta_and_eta() {
+    let src = "[parameters]\n\
+        \x20 theta TVE0(10.0, 0.1, 100.0)\n\
+        \x20 theta TVSLOPE(0.5, -5.0, 5.0)\n\
+        \x20 omega ETA_E0 ~ 0.09\n\
+        \x20 sigma PROP ~ 0.02 (sd)\n\n\
+        [individual_parameters]\n\
+        \x20 E0 = TVE0 * exp(ETA_E0)\n\n\
+        [structural_model]\n\
+        \x20 y = E0 + TVSLOPE * TIME + ETA_E0\n\n\
+        [error_model]\n\
+        \x20 DV ~ proportional(PROP)\n";
+    let model = parse_model_string(src).expect("a bare theta/eta in the equation parses");
+    assert!(model.is_algebraic());
+    let program = model
+        .analytic_readout
+        .as_ref()
+        .and_then(|ar| ar.program.as_ref())
+        .expect("the equation compiles to a readout program");
+    assert!(
+        program.is_dual_evaluable(),
+        "a desugared THETA/ETA must leave the readout dual-evaluable — otherwise the \
+         model loses its analytic gradient"
+    );
+    assert!(
+        !model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("finite-difference")),
+        "no FD-fallback warning should be emitted, got {:?}",
+        model.parse_warnings
+    );
+    assert!(
+        crate::sens::algebraic::supported(&model),
+        "and the analytic walks must actually serve it"
+    );
+    // Exactly one synthetic per referenced θ/η. The append runs on the ODE-layout
+    // path a compartment-free model takes; a second append from the analytical
+    // allocator would double them and silently consume two PK slots each.
+    let synths: Vec<&String> = model
+        .indiv_param_names
+        .iter()
+        .filter(|n| n.starts_with(READOUT_SYNTH_PREFIX))
+        .collect();
+    assert_eq!(
+        synths.len(),
+        2,
+        "one synthetic for TVSLOPE and one for ETA_E0, got {synths:?}"
+    );
+}
+
+/// A compartment name is rejected in the equation because the model has no
+/// compartments — but a parameter the user *declared* with that name is not a
+/// compartment reference at all, and the rejection's own advice ("define it in
+/// [individual_parameters]") is what they already did.
+#[test]
+fn algebraic_structural_model_accepts_a_declared_parameter_named_like_a_compartment() {
+    for name in ["central", "depot", "periph"] {
+        let src = format!(
+            "[parameters]\n\
+            \x20 theta TVE0(10.0, 0.1, 100.0)\n\
+            \x20 sigma PROP ~ 0.02 (sd)\n\n\
+            [individual_parameters]\n\
+            \x20 {name} = TVE0\n\n\
+            [structural_model]\n\
+            \x20 y = {name} * 2\n\n\
+            [error_model]\n\
+            \x20 DV ~ proportional(PROP)\n"
+        );
+        let model = parse_model_string(&src).unwrap_or_else(|e| {
+            panic!("`{name}` is a declared individual parameter here, not a compartment: {e}")
+        });
+        assert!(model.is_algebraic());
+    }
+}

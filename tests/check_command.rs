@@ -789,3 +789,82 @@ fn ss_plus_lag_transit_is_rejected_by_check() {
     let _ = std::fs::remove_file(&model);
     let _ = std::fs::remove_file(&data);
 }
+
+/// `ferx check` and `fit()` must agree on which data-reader warnings a user sees.
+///
+/// The reader is model-blind, so a dose-free dataset raises `W_NO_DOSES` ("check
+/// that the dataset has an AMT column"). For a compartment-free model (#811) that
+/// is its normal shape — every MBMA dataset is dose-free — so `fit()` suppresses
+/// it. `ferx check` re-emits `population.warnings` wholesale, so without the
+/// shared filter it warned on every such model while `fit()` on the same pair was
+/// clean.
+#[test]
+fn compartment_free_model_does_not_warn_about_missing_doses() {
+    let report = validate_model_file(
+        "examples/emax_timecourse.ferx",
+        Some("data/emax_timecourse.csv"),
+    );
+    assert!(
+        report.valid,
+        "unexpected diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("W_NO_DOSES")),
+        "a compartment-free model has nothing to dose: {:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (&d.code, &d.message))
+            .collect::<Vec<_>>()
+    );
+
+    // And the same pair through `fit()` — the agreement this test is about.
+    let model = parse_full_model_file(Path::new("examples/emax_timecourse.ferx"))
+        .expect("example parses")
+        .model;
+    let pop = read_nonmem_csv(Path::new("data/emax_timecourse.csv"), None, None)
+        .expect("example data loads");
+    let opts = FitOptions {
+        outer_maxiter: 1,
+        run_covariance_step: false,
+        verbose: false,
+        ..Default::default()
+    };
+    let result = fit(&model, &pop, &model.default_params, &opts).expect("fit runs");
+    assert!(
+        !result.warnings.iter().any(|w| w.contains("W_NO_DOSES")),
+        "fit() must suppress it too: {:?}",
+        result.warnings
+    );
+}
+
+/// A *compartment* model on a dose-free dataset must still be warned about — the
+/// suppression is scoped to models that cannot be dosed, not to dose-free data.
+#[test]
+fn compartment_model_still_warns_about_missing_doses() {
+    let model = temp_model(
+        "no_doses_pk",
+        "[parameters]\n  theta TVE0(10.0, 0.1, 100.0)\n  sigma PROP ~ 0.02 (sd)\n\n\
+         [individual_parameters]\n  CL = TVE0\n  V = TVE0\n\n\
+         [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\n\
+         [error_model]\n  DV ~ proportional(PROP)\n",
+    );
+    let report = validate_model_file(model.to_str().unwrap(), Some("data/emax_timecourse.csv"));
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("W_NO_DOSES")),
+        "a PK model on dose-free data is still worth flagging: {:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (&d.code, &d.message))
+            .collect::<Vec<_>>()
+    );
+    let _ = std::fs::remove_file(&model);
+}

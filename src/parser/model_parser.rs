@@ -2142,7 +2142,15 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // Dropping the rest keeps `readout_synth_params` in step with the slots that exist, so
     // `parse_scaling_block`'s rewrite only rewrites θ/η it can actually resolve; anything left
     // bare keeps `dual_evaluable = false` and the readout falls back to FD, as before #486.
-    if !is_ode {
+    //
+    // Keyed on `uses_ode_param_layout`, **not** `is_ode`: a compartment-free model (#811) has
+    // `is_ode == false` but appended its synthetics on the ODE-layout path upstream, and the
+    // allocator returns an empty `accepted_synths` for it. Testing `is_ode` here therefore
+    // overwrote `readout_synth_params` with that empty list, so `parse_scaling_block` never
+    // rewrote the bare θ/η — leaving `PushTheta`/`PushEta` in the bytecode,
+    // `dual_evaluable = false`, and the model silently on finite differences behind a warning
+    // that blamed the readout's shape.
+    if !uses_ode_param_layout {
         for s in &readout_alloc.accepted_synths {
             append_readout_synth_param(s, &mut indiv_var_names, &mut indiv_stmts);
         }
@@ -7983,7 +7991,23 @@ pub(crate) fn build_y_output_fn(
     // expose those amounts with cross-compartment sensitivity. Empty for ODE
     // callers (any state name is integrated), so this is a no-op there. Point the
     // user at an ODE model, mirroring `[initial_conditions]`'s scope.
-    if let Some(name) = expr_references_any(&expr, forbidden_state_names) {
+    // A name the user **declared** as an individual parameter is not a compartment
+    // reference, whatever it is spelled: the expression parser resolved it to that
+    // parameter (state names take precedence in `defined` above, so anything that
+    // is a real state in scope still resolves to the state and stays rejected).
+    // Without this the rejection fires on a model that never mentioned a
+    // compartment — and its own advice, "define it in [individual_parameters]", is
+    // what the user already did. Compartment-free models (#811) forbid the whole
+    // canonical vocabulary, including `central`, so they meet this first; a
+    // closed-form model can hit it too, with `peripheral` and friends.
+    let declared: std::collections::HashSet<&str> =
+        indiv_var_names.iter().map(String::as_str).collect();
+    let forbidden_in_scope: Vec<String> = forbidden_state_names
+        .iter()
+        .filter(|n| !declared.contains(n.as_str()))
+        .cloned()
+        .collect();
+    if let Some(name) = expr_references_any(&expr, &forbidden_in_scope) {
         // A compartment-free model (#811) has an EMPTY allowed set, so *every*
         // compartment name is forbidden — for a different reason than a
         // peripheral is on a closed form, and with different advice.

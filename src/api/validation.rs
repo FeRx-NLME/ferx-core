@@ -409,6 +409,22 @@ fn check_kappa_weight_variation(model: &CompiledModel, population: &Population) 
     diags
 }
 
+/// Whether a data-reader warning is inapplicable to this model and should not be
+/// surfaced.
+///
+/// The reader is deliberately model-blind, so a few of its findings are about a
+/// shape the model cannot have. Shared by `fit()` and `ferx check` so the two
+/// cannot disagree about which warnings a user sees.
+///
+/// Currently one case: `W_NO_DOSES` on a compartment-free model (#811). The reader
+/// reads a dose-free dataset as a probable missing `AMT` column; for a model with
+/// no compartments that is its normal shape — every model-based meta-analysis
+/// dataset is dose-free — so the advice ("check that the dataset has an AMT
+/// column") is wrong rather than merely noisy.
+pub(crate) fn reader_warning_suppressed(model: &CompiledModel, warning: &str) -> bool {
+    model.is_algebraic() && warning.starts_with("W_NO_DOSES")
+}
+
 /// All data-dependent *fatal* compatibility checks between a compiled model and
 /// a dataset, collected into one diagnostic list. Shared by `fit()` (which
 /// stops at the first error via [`first_error`]) and `ferx check` (which
@@ -3612,7 +3628,14 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
             Ok((population, _table)) => {
                 // Surface datareader warnings (ADDL missing II, IOV OCC missing)
                 // into the check report so `ferx check` sees the same findings as `fit()`.
-                for w in &population.warnings {
+                // Through the shared filter, or the two would disagree on exactly the
+                // warnings `fit()` suppresses — which is the agreement this block exists
+                // to keep.
+                for w in population
+                    .warnings
+                    .iter()
+                    .filter(|w| !reader_warning_suppressed(&parsed.model, w))
+                {
                     let code = if w.starts_with("W_ADDL_MISSING_II") {
                         "W_ADDL_MISSING_II"
                     } else if w.starts_with("W_IOV_OCC_MISSING") {

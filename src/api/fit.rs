@@ -998,16 +998,13 @@ fn fit_inner(
     // Data-reader warnings (W_ADDL_MISSING_II, W_IOV_OCC_MISSING) accumulated
     // by read_nonmem_csv into population.warnings.
     //
-    // `W_NO_DOSES` is dropped for a compartment-free model (#811): the reader is
-    // model-blind, so it flags a dose-free dataset as a probable missing `AMT`
-    // column, but such a model has nothing to dose — a dose-free dataset is its
-    // normal shape, and the warning would fire on every MBMA fit. Every other
-    // reader warning is kept.
+    // Through the shared filter, so `ferx check` suppresses exactly what `fit()`
+    // does — see `reader_warning_suppressed`.
     accumulated_warnings.extend(
         population
             .warnings
             .iter()
-            .filter(|w| !(model.is_algebraic() && w.starts_with("W_NO_DOSES")))
+            .filter(|w| !crate::api::validation::reader_warning_suppressed(model, w))
             .cloned(),
     );
 
