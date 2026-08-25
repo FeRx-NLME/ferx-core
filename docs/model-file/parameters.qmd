@@ -223,9 +223,12 @@ Inter-Occasion Variability (IOV) is declared with `kappa` (independent per-param
 kappa NAME ~ value              # value interpreted as variance (default)
 kappa NAME ~ value (sd)         # value interpreted as standard deviation
 kappa NAME ~ value FIX
+kappa NAME ~ value weight = W   # kappa ~ N(0, value / W) — sample-size-weighted IOV
 ```
 
 Each `kappa` line adds one diagonal element to the IOV omega matrix. Occasions are independent. The `(sd)` annotation is accepted with the same semantics as for `omega`. `block_kappa` is variance-only.
+
+The optional `weight = <expr>` modifier declares a **sample-size-weighted** kappa, `κ ~ N(0, value / W)` — the between-treatment-arm variability of a longitudinal MBMA, which scales with the number of subjects in the arm. See [Sample-size-weighted IOV](iov.qmd#sample-size-weighted-iov-weight-...).
 
 Example:
 ```

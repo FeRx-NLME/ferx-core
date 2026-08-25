@@ -375,6 +375,8 @@ mod tests {
             kappa_names: vec![],
             kappa_fixed: vec![],
             kappa_init_as_sd: vec![],
+            kappa_weights: Vec::new(),
+            kappa_weight_typical: Vec::new(),
             se_kappa: None,
             shrinkage_kappa: vec![],
             shrinkage_kappa_by_occ: vec![],

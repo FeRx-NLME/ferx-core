@@ -422,6 +422,178 @@ const TWOCPT_ODE_READOUT_TIME: &str = r#"
   ode_abstol = 1e-11
 "#;
 
+// #1046: an ODE `init(...)` seed that reads a **dose attribute**. Before #1046 the
+// parser rejected these, so no model could reach the provider with `∂init/∂F ≠ 0`.
+// `F` carries IIV here deliberately (`ETA_F`), so the seed depends on both θ and η and
+// the two `∂/∂F` contributions — the F-scaled dose bolus and the F-scaled initial
+// amount — have to compose in the same gradient.
+//
+// The tight `ode_reltol`/`ode_abstol` are load-bearing, not decoration: the FD side of
+// the parity harness differences the *production* ODE predictor, so at the default
+// tolerances the reference is under-resolved and a correct model can miss the
+// harness's `2e-4` bound on integrator noise alone. `TVCOV_INIT_ODE` below tightens
+// them for the same reason.
+const ONECPT_ODE_INIT_READS_F: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVF(0.5, 0.01, 1.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_F  ~ 0.04
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  F  = TVF * exp(ETA_F)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = F * 100.0
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+// The lag twin. `LAGTIME` shifts the dose event *and* scales the seed, so its two
+// contributions compose through different mechanisms than `F`'s: an event-time
+// saltation on the dose side, a plain multiplier on the seed side.
+const ONECPT_ODE_INIT_READS_LAGTIME: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVLAG(0.7, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_LAG ~ 0.04
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  LAGTIME = TVLAG * exp(ETA_LAG)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = LAGTIME * 100.0
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+// Control: the identical model seeding from an ordinary parameter. Pins that the
+// parity above is a property of the seed arithmetic, not of the name.
+const ONECPT_ODE_INIT_READS_ORDINARY: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVF(0.5, 0.01, 1.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_F  ~ 0.04
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  FSEED = TVF * exp(ETA_F)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = FSEED * 100.0
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+/// #1046 made `init(state) = F * …` / `= LAGTIME * …` writable for the first time, so
+/// this is a **newly reachable gradient class**: the provider now has to carry
+/// `∂init/∂F` (and `∂init/∂lag`) alongside the `∂/∂F` it already carried on the dose
+/// bolus and the `∂/∂lag` on the event-time saltation. Those contributions had never
+/// had to compose, because the parser rejected every model that would make them.
+///
+/// Per CLAUDE.md, a newly reachable analytic-sensitivity path needs a `Dual2`-vs-FD
+/// parity test — the code was not edited, but the set of models that can reach it was
+/// widened, and a wrong composition here would compile, run, and silently return a bad
+/// gradient. Both fixtures put IIV on the attribute so the seed varies with η as well
+/// as θ.
+#[test]
+fn ode_provider_init_reading_a_dose_attribute_matches_fd() {
+    for (label, src, theta, eta) in [
+        (
+            "init reads F",
+            ONECPT_ODE_INIT_READS_F,
+            vec![0.2, 10.0, 0.5],
+            vec![0.12, -0.08],
+        ),
+        (
+            "init reads LAGTIME",
+            ONECPT_ODE_INIT_READS_LAGTIME,
+            vec![0.2, 10.0, 0.7],
+            vec![0.12, -0.08],
+        ),
+        (
+            "init reads an ordinary parameter (control)",
+            ONECPT_ODE_INIT_READS_ORDINARY,
+            vec![0.2, 10.0, 0.5],
+            vec![0.12, -0.08],
+        ),
+    ] {
+        let model = parse_model_string(src).unwrap_or_else(|e| panic!("{label}: parse: {e}"));
+        // The routing half of the CLAUDE.md rule: if one of these ever falls out of
+        // analytic scope it must do so loudly here rather than quietly returning a
+        // FOCE-shaped gradient from a path that no longer models the seed.
+        assert!(
+            ode_analytical_supported(&model),
+            "{label}: must be served analytically, not silently dropped to FD"
+        );
+        // Observations start before the lag (0.25 < 0.7) so the lag fixture is sampled
+        // on both sides of its dose arrival — the seed alone, then seed + lagged dose.
+        let subject = bolus_subject(&[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        check_vs_production(&model, &subject, &theta, &eta);
+        check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+        check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
+
+        // Non-vacuity: the attribute's θ (index 2) and its η (index 1) must actually
+        // move the prediction, or the parity checks above would agree on a derivative
+        // that is identically zero and would pin nothing about the newly reachable
+        // composition. `∂f/∂TVF` is non-zero only because the seed reads it — a bolus
+        // at t=0 into the observed compartment contributes through `F` too, so this
+        // asserts the pair is live rather than isolating the seed term.
+        let sens = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("supported");
+        let max_dtheta = sens
+            .obs
+            .iter()
+            .map(|o| o.df_dtheta[2].abs())
+            .fold(0.0_f64, f64::max);
+        let max_deta = sens
+            .obs
+            .iter()
+            .map(|o| o.df_deta[1].abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_dtheta > 1e-6,
+            "{label}: max |∂f/∂θ_attr| = {max_dtheta:.3e} — the attribute does not \
+             reach the prediction, so the parity check above is vacuous"
+        );
+        assert!(
+            max_deta > 1e-6,
+            "{label}: max |∂f/∂η_attr| = {max_deta:.3e} — the attribute's IIV does not \
+             reach the prediction, so the parity check above is vacuous"
+        );
+    }
+}
+
 /// #1028: a `TIME`-referencing ODE Form C readout must evaluate `TIME` at each
 /// observation. `∂y/∂TVBETA` equals that observation's time — it would be 0 at every
 /// row if the readout read a stale model-time of 0 — and `check_vs_production` ties

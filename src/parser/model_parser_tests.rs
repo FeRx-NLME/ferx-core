@@ -1773,40 +1773,184 @@ fn dose_attr_read_in_odes_rhs_is_matched_case_insensitively() {
     );
 }
 
-#[test]
-fn dose_attr_read_in_odes_init_is_rejected() {
-    // `init(state) = <expr>` lives in `[odes]` but is split out of the block before
-    // the derivative statements are parsed, so it needs its own walk. Without one
-    // the rule has a hole the exact size of its own remedy: a user told to drop `F`
-    // from the RHS can move it into the initial condition and get the same silent
-    // double application from the same block.
-    let src = "
+/// Build a 1-compartment ODE model that declares dose attribute `name` and reads it
+/// in an `init(...)` seed — never in the RHS. Companion to [`dose_attr_rhs_model`],
+/// which is the rejected shape; this is the accepted one (#1046).
+fn dose_attr_init_model(name: &str) -> String {
+    format!(
+        "
 [parameters]
   theta TVCL(5.0, 0.0, 1e15)
   theta TVV(50.0, 0.0, 1e15)
-  theta TVF(0.5, 0.0, 1.0)
+  theta TVA(0.5, 0.0, 1.0)
   omega ETA_CL ~ 0.09
   sigma EPS1 ~ 0.1 (sd)
 
 [individual_parameters]
   CL = TVCL * exp(ETA_CL)
   V  = TVV
-  F  = TVF
+  {name} = TVA
 
 [structural_model]
   ode(obs_cmt=central, states=[central])
 
 [odes]
-  init(central) = F * 100.0
+  init(central) = {name} * 100.0
+  d/dt(central) = -(CL/V) * central
+
+[error_model]
+  DV ~ proportional(EPS1)
+"
+    )
+}
+
+#[test]
+fn dose_attr_read_in_odes_init_is_accepted() {
+    // The scope floor of the #993 rule, and the one surface it must NOT claim
+    // (#1046). An `init(...)` seed is not a dose: `OdeSpec::initial_state` writes the
+    // raw expression value into the state vector, and `F`/lag are resolved through
+    // `DoseAttrMap` at dose events only — a path the seed never takes. So
+    // `init(central) = F * 100` (the bioavailable residue of a pre-study 100 mg dose)
+    // applies `F` exactly once, to a quantity the engine never scales.
+    //
+    // Anchored on NONMEM 7.6.0, which agrees: `A_0(1) = F1*100` with `F1 = 0.5` seeds
+    // 50, not 25, and its table is byte-identical to the twin seeding from an ordinary
+    // parameter of the same value (`nonmem_anchor/odes_init_dose_attr_f_{A,B}.ctl`;
+    // same for lag). Rejecting this made a correct model unwritable and advised the
+    // wrong repair — renaming the parameter whose meaning *is* bioavailability.
+    //
+    // Contrast the RHS, which IS a doubling and stays rejected:
+    // `dose_attr_read_in_odes_rhs_is_rejected`.
+    for name in ["F", "LAGTIME", "ALAG", "F1", "ALAG1", "LAGTIME1"] {
+        let src = dose_attr_init_model(name);
+        if let Err(e) = parse_full_model(&src) {
+            panic!("`init(central) = {name} * 100` applies `{name}` once: {e}");
+        }
+    }
+}
+
+#[test]
+fn an_init_read_counts_as_a_use_for_the_never_used_census() {
+    // Companion to the acceptance test above, and deliberately *not* folded into it:
+    // asserting "no never-used warning" for `F`/`LAGTIME`/`F1`/… cannot fail, because
+    // the census exempts every dose-attribute name before it looks at block text
+    // (`RESERVED_PK_SLOTS` for the bare names, `DoseAttr::from_indexed_name` for the
+    // indexed ones). Measured: with the `init(...)` line deleted entirely, all six
+    // still produce zero "never used" warnings.
+    //
+    // So the census claim has to be made with a name the exemption does not cover. An
+    // ordinary parameter read *only* from the init is that name — and it is the shape
+    // that would regress if the seed ever stopped being counted as a use.
+    let src = "
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVA(0.5, 0.0, 1.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS1 ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  FSEED = TVA
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  init(central) = FSEED * 100.0
   d/dt(central) = -(CL/V) * central
 
 [error_model]
   DV ~ proportional(EPS1)
 ";
-    let err = expect_parse_err(src);
+    let never_used = |s: &str| -> Vec<String> {
+        parse_full_model(s)
+            .expect("parses")
+            .model
+            .parse_warnings
+            .iter()
+            .filter(|w| w.contains("never used"))
+            .cloned()
+            .collect()
+    };
+    assert!(
+        never_used(src).is_empty(),
+        "`FSEED` is read by the init seed, so it is used: {:?}",
+        never_used(src)
+    );
+    // Non-vacuity: delete the init line and the very same parameter *is* reported —
+    // so the assertion above is a statement about the init read, not about the census
+    // being silent in general.
+    let without = src.replace("  init(central) = FSEED * 100.0\n", "");
+    assert_ne!(without, src, "the init line must actually be removed");
+    assert!(
+        never_used(&without).iter().any(|w| w.contains("`FSEED`")),
+        "with the init read gone `FSEED` must be reported unused: {:?}",
+        never_used(&without)
+    );
+}
+
+#[test]
+fn coded_rate_param_read_in_odes_init_is_not_recorded() {
+    // The `D{n}`/`R{n}` half of #1046, and the reason the fix had to drop the init
+    // walk from `rhs_reads` rather than skip the check: that same set drives
+    // `mark_prediction_path_read`, whose marks `check_modeled_dose_rates` turns into
+    // a data-gated error once a `RATE=-2` dose lands on the compartment. An init
+    // amount consults no dose attribute at all — modeled duration included — so a
+    // `D1` read there must record nothing, or a correct model would be rejected as
+    // soon as its dataset happened to carry a coded RATE.
+    use crate::types::DoseAttr;
+    let parsed = parse_full_model(&dose_attr_init_model("D1")).expect("`D1` in an init parses");
+    assert_eq!(
+        parsed
+            .model
+            .active_dose_attr_map()
+            .prediction_path_read(DoseAttr::Duration, 1),
+        None,
+        "an init-only `D1` read is not a prediction-path read"
+    );
+
+    // Control: the same parameter read in the RHS *is* recorded, so the assertion
+    // above cannot pass for a map that simply never marks anything.
+    let rhs = dose_attr_init_model("D1").replace(
+        "d/dt(central) = -(CL/V) * central",
+        "d/dt(central) = -(CL/V) * D1 * central",
+    );
+    assert_eq!(
+        parse_full_model(&rhs)
+            .expect("`D1` in the RHS parses — it is data-gated, not rejected")
+            .model
+            .active_dose_attr_map()
+            .prediction_path_read(DoseAttr::Duration, 1),
+        Some("D1"),
+        "a `D1` read by the [odes] RHS must still be recorded for the data check"
+    );
+}
+
+#[test]
+fn dose_attr_read_in_both_odes_init_and_rhs_is_still_rejected() {
+    // Overshoot guard for #1046. Accepting the init read must not disarm the RHS
+    // walk: a model that seeds from `F` *and* folds `F` into the flux still applies
+    // it twice on the dose-driven term, which is exactly the #993 defect. Pins that
+    // the fix dropped the init walk only.
+    let src = dose_attr_init_model("F").replace(
+        "d/dt(central) = -(CL/V) * central",
+        "d/dt(central) = -(CL/V) * F * central",
+    );
+    let err = expect_parse_err(&src);
     assert!(
         err.contains("[odes]:") && err.contains("reserved dose-attribute name"),
-        "an `init(...)` read of `F` is the same double use: {err}"
+        "the RHS read is still a double use even when an init also reads it: {err}"
+    );
+    // And the message must say *which* read to remove. This is the exact model where
+    // the un-narrowed wording misled: "remove it from [odes]" invites deleting the
+    // `init(...)` line, which is legal (#1046) and does not clear the error. The
+    // sibling data-gated half already says "[odes] RHS or [scaling]"
+    // (`api/validation.rs`), so the two halves of `E_DOSE_ATTR_DOUBLE_USE` agree.
+    assert!(
+        err.contains("read in the [odes] RHS") && err.contains("remove it from the [odes] RHS"),
+        "the remedy must name the RHS, not the whole block: {err}"
     );
 }
 
@@ -10055,6 +10199,200 @@ fn test_init_macheps_is_case_insensitive() {
 }
 
 #[test]
+fn test_init_time_builtin_rejected() {
+    // #994: a bare `TIME` parses to `Expression::Time`, not to a `Variable`, so
+    // the undefined-name check could not see it and it was silently accepted —
+    // while `TAFD`/`TAD`, its siblings in the same reserved list, were rejected.
+    // Model time at an initial condition is 0 by definition, so the reference
+    // could only ever flatten the expression (`init = TIME * X` → 0).
+    for rhs in ["TIME", "TIME + 50", "time * KIN", "2 * (TIME + KIN)"] {
+        let src = turnover_ode_model(&format!("  init(response) = {rhs}"));
+        let err = parse_full_model(&src)
+            .err()
+            .unwrap_or_else(|| panic!("`init(response) = {rhs}` must be rejected"));
+        assert!(
+            err.contains("init(response)")
+                && err.contains("time built-in(s): TIME")
+                && err.contains("evaluated at the time origin"),
+            "error should name init(response) and the TIME built-in, got: {err}"
+        );
+        assert!(
+            err.contains("#994"),
+            "error should cite the issue, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_init_time_clocks_rejected_in_every_casing() {
+    // Every clock, every spelling, one diagnostic (#994). Before this, the four
+    // names split three ways on representation alone: `TIME`/`time` were
+    // accepted (an `Expression::Time` node the undefined-name walker cannot
+    // see), `Time` was reported as a plain undefined name, and `T`/`TAFD`/`TAD`
+    // were reported as undefined names. The casing asymmetry was the tell that
+    // none of it was a scope decision.
+    //
+    // The assertion is on the *clock* diagnostic specifically, not merely on
+    // "some error": the node guard feeds the same message as the undefined-name
+    // split, so a regression that reported one as the other would otherwise
+    // pass unnoticed.
+    for base in ODE_INIT_REJECTED_BUILTINS {
+        for rhs in [
+            base.to_string(),
+            base.to_lowercase(),
+            // `Tafd` / `Time` / `T` — mixed case, the spelling that used to be
+            // handled differently from the other two.
+            base[..1].to_string() + &base[1..].to_lowercase(),
+        ] {
+            let src = turnover_ode_model(&format!("  init(response) = {rhs}"));
+            let err = parse_full_model(&src)
+                .err()
+                .unwrap_or_else(|| panic!("`init(response) = {rhs}` must be rejected"));
+            assert!(
+                err.contains("init(response)") && err.contains("time built-in(s)"),
+                "`{rhs}` should get the clock diagnostic, not a bare undefined-name \
+                 error, got: {err}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_init_reports_clock_and_undefined_name_together() {
+    // One parse, both problems (#994 review): an init RHS can carry a clock and
+    // an undefined name at once, and reporting them one per parse costs the user
+    // two round-trips for a single line.
+    let src = turnover_ode_model("  init(response) = TIME + BASE");
+    let err = parse_full_model(&src)
+        .err()
+        .expect("`init(response) = TIME + BASE` must be rejected");
+    assert!(
+        err.contains("time built-in(s): TIME"),
+        "error should name the clock, got: {err}"
+    );
+    assert!(
+        err.contains("undefined name(s): BASE"),
+        "error should name the undefined BASE in the same message, got: {err}"
+    );
+}
+
+#[test]
+fn test_init_undefined_name_message_lists_the_real_scope() {
+    // The diagnostic is the only place the init scope rule is written down
+    // (#994), so it must name every accepted built-in — including `MIXNUM`,
+    // which is in scope and was absent from the message — and say that the time
+    // built-ins are not.
+    let src = turnover_ode_model("  init(response) = BASE");
+    let err = parse_full_model(&src)
+        .err()
+        .expect("undefined name must be rejected");
+    for builtin in ODE_INIT_SCOPE_BUILTINS {
+        assert!(
+            err.contains(builtin),
+            "message should list the accepted built-in {builtin}, got: {err}"
+        );
+    }
+    for rejected in ODE_INIT_REJECTED_BUILTINS {
+        assert!(
+            err.contains(rejected),
+            "message should list the out-of-scope built-in {rejected}, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_init_mixnum_accepted_in_mixture_model() {
+    // The other payload-free built-in node, `Expression::MixNum`, is invisible to
+    // the undefined-name check for the same structural reason `TIME` was — but
+    // unlike `TIME` it does real work at init: it resolves to the subject's class
+    // and discriminates the classes. It stays in scope (#994 comment); the class-1
+    // default gives 100 here.
+    let src = r"
+[parameters]
+  theta TVKIN(10.0, 0.001, 100.0)
+  theta TVKOUT(2.0, 0.001, 100.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_KIN ~ 0.09
+  sigma ADD ~ 0.1
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  KIN  = TVKIN * exp(ETA_KIN)
+  KOUT = TVKOUT
+
+[structural_model]
+  ode(obs_cmt=response, states=[response])
+
+[odes]
+  init(response) = MIXNUM * 100
+  d/dt(response) = KIN - KOUT * response
+
+[error_model]
+  DV ~ additive(ADD)
+";
+    let parsed = parse_full_model(src).expect("MIXNUM is in scope in an init expression");
+    let ode = parsed.model.ode_spec.as_ref().expect("ODE spec");
+    assert_eq!(ode.initial_state(&[10.0, 2.0]), vec![100.0]);
+}
+
+#[test]
+fn test_analytical_init_time_builtin_rejected() {
+    // #994: the `[initial_conditions]` surface took the same leak. The baseline
+    // amount is evaluated once per subject at t = 0, so `TIME` reads the
+    // model-time thread-local's 0.0 and the reference contributes nothing.
+    for rhs in ["TIME", "TIME + 50", "time * V"] {
+        let src = analytical_oral_with_init(&format!(
+            "
+[initial_conditions]
+  init(central) = {rhs}
+"
+        ));
+        let err = parse_full_model(&src)
+            .err()
+            .unwrap_or_else(|| panic!("`init(central) = {rhs}` must be rejected"));
+        assert!(
+            err.contains("[initial_conditions] init") && err.contains("`TIME` built-in"),
+            "error should name the block and the TIME built-in, got: {err}"
+        );
+        assert!(
+            err.contains("#994"),
+            "error should cite the issue, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_analytical_init_clock_names_are_ordinary_covariates() {
+    // The `[odes]`-only built-ins are ordinary covariates everywhere else — the
+    // same deliberate rule `[scaling]` follows so a dataset that really carries a
+    // `TAD` column can use it (#1028, `ODE_ONLY_BUILTINS` in `api::validation`).
+    // `[initial_conditions]` is "everywhere else", so only `TIME` is rejected
+    // there; `T`/`TAFD`/`TAD`/`MACHEPS` parse as covariate leaves and become
+    // required data columns. Pinned because `ODE_INIT_REJECTED_BUILTINS` is
+    // public and a consumer mirroring it on an analytical model would otherwise
+    // reject a legal reference (#994 review).
+    for name in ["T", "TAFD", "TAD", "MACHEPS"] {
+        let src = analytical_oral_with_init(&format!(
+            "
+[initial_conditions]
+  init(central) = {name} * 10
+"
+        ));
+        let model = parse_model_string(&src)
+            .unwrap_or_else(|e| panic!("`init(central) = {name} * 10` must parse: {e}"));
+        assert_eq!(model.analytical_init.len(), 1);
+        assert!(
+            model.referenced_covariates.iter().any(|c| c == name),
+            "`{name}` must be registered as a required data column, got: {:?}",
+            model.referenced_covariates
+        );
+    }
+}
+
+#[test]
 fn test_diffusion_block_parsed_into_theta() {
     let src = minimal_ode_model_with_diffusion("  central ~ 0.05");
     let parsed = parse_full_model(&src).unwrap();
@@ -17334,28 +17672,48 @@ fn test_weight_modifier_rejects_eta_dependence() {
 fn test_split_weight_modifier_ignores_a_weight_inside_the_sigma_parens() {
     // A covariate literally named `WEIGHT` inside a magnitude expression is at
     // paren depth 1 and must not be mistaken for the modifier.
-    let (stmt, w) = super::split_weight_modifier("DV ~ additive(ADD * WEIGHT)").unwrap();
+    let (stmt, w) = super::split_weight_modifier(
+        "DV ~ additive(ADD * WEIGHT)",
+        "error_model",
+        "a `DV ~ TYPE(...)` statement",
+    )
+    .unwrap();
     assert_eq!(stmt, "DV ~ additive(ADD * WEIGHT)");
     assert!(w.is_none());
 }
 
 #[test]
 fn test_split_weight_modifier_ignores_a_comparison() {
-    let (stmt, w) = super::split_weight_modifier("DV ~ additive(ADD) weight == 2").unwrap();
+    let (stmt, w) = super::split_weight_modifier(
+        "DV ~ additive(ADD) weight == 2",
+        "error_model",
+        "a `DV ~ TYPE(...)` statement",
+    )
+    .unwrap();
     assert_eq!(stmt, "DV ~ additive(ADD) weight == 2");
     assert!(w.is_none());
 }
 
 #[test]
 fn test_split_weight_modifier_ignores_a_longer_identifier() {
-    let (stmt, w) = super::split_weight_modifier("DV ~ additive(ADD) weighted = 2").unwrap();
+    let (stmt, w) = super::split_weight_modifier(
+        "DV ~ additive(ADD) weighted = 2",
+        "error_model",
+        "a `DV ~ TYPE(...)` statement",
+    )
+    .unwrap();
     assert_eq!(stmt, "DV ~ additive(ADD) weighted = 2");
     assert!(w.is_none());
 }
 
 #[test]
 fn test_split_weight_modifier_requires_a_statement_before_it() {
-    let err = super::split_weight_modifier("weight = WPSE").unwrap_err();
+    let err = super::split_weight_modifier(
+        "weight = WPSE",
+        "error_model",
+        "a `DV ~ TYPE(...)` statement",
+    )
+    .unwrap_err();
     assert!(
         err.contains("must follow a `DV ~ TYPE(...)` statement"),
         "got: {err}"
@@ -17445,6 +17803,430 @@ fn test_weight_modifier_rejects_a_sigma_in_the_weight_expression() {
         "  DV ~ additive(ADD_ERR) weight = PROP_ERR",
     ));
     assert!(err.contains("multiple sigmas"), "got: {err}");
+}
+
+// ── #1031: sample-size-weighted IOV (`kappa K ~ γ² weight = W`) ─────────────
+//
+// `κ_ik ~ N(0, Ω_IOV / W_ik)` — the between-treatment-arm variability of a
+// longitudinal MBMA, whose arm-level effect scales with the number of subjects
+// behind the arm. The engine applies it by rewriting every reference to the
+// kappa as `K / sqrt(W)`, which is the same distribution and the same model the
+// modifier replaces.
+
+/// One arm-level random effect on CL, weighted by the arm size `NARM`.
+/// `kappa_line` and `extra_block` are varied by the negative tests.
+fn weighted_kappa_model_str(kappa_line: &str, extra_block: &str) -> String {
+    format!(
+        r"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  omega ETA_CL ~ 0.09
+{kappa_line}
+  sigma PROP_ERR ~ 0.04
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[covariates]
+  NARM continuous
+{extra_block}
+[fit_options]
+  iov_column = OCC
+"
+    )
+}
+
+/// The individual parameter a weighted kappa feeds must come out identical to
+/// the hand-written `KAPPA / sqrt(NARM)` form — that equivalence is the whole
+/// implementation, and it is what lets every estimator downstream stay unaware
+/// of the feature.
+#[test]
+fn test_weighted_kappa_divides_the_kappa_by_sqrt_of_the_weight() {
+    let weighted = parse_model_string(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "",
+    ))
+    .unwrap();
+    let plain =
+        parse_model_string(&weighted_kappa_model_str("  kappa KAPPA_CL ~ 0.09", "")).unwrap();
+    let theta = weighted.default_params.theta.clone();
+    let cov: std::collections::HashMap<String, f64> =
+        [("NARM".to_string(), 4.0)].into_iter().collect();
+    // Extended η = [ETA_CL, KAPPA_CL]. κ = 0.8 at NARM = 4 must act as κ = 0.4.
+    let got = (weighted.pk_param_fn)(&theta, &[0.1, 0.8], &cov, 0.0);
+    let want = (plain.pk_param_fn)(&theta, &[0.1, 0.4], &cov, 0.0);
+    approx::assert_relative_eq!(got.values[0], want.values[0], max_relative = 1e-12);
+    // ... and it is genuinely scaled, not passed through.
+    let unscaled = (plain.pk_param_fn)(&theta, &[0.1, 0.8], &cov, 0.0);
+    assert!(
+        (got.values[0] - unscaled.values[0]).abs() > 1e-6,
+        "weight had no effect: {got:?} vs {unscaled:?}"
+    );
+}
+
+/// The weight is per *record*, so a covariate that differs between occasions
+/// scales each occasion by its own arm size.
+#[test]
+fn test_weighted_kappa_reads_the_weight_at_the_record() {
+    let model = parse_model_string(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "",
+    ))
+    .unwrap();
+    let theta = model.default_params.theta.clone();
+    let big: std::collections::HashMap<String, f64> =
+        [("NARM".to_string(), 100.0)].into_iter().collect();
+    let small: std::collections::HashMap<String, f64> =
+        [("NARM".to_string(), 1.0)].into_iter().collect();
+    let cl_big = (model.pk_param_fn)(&theta, &[0.0, 1.0], &big, 0.0).values[0];
+    let cl_small = (model.pk_param_fn)(&theta, &[0.0, 1.0], &small, 0.0).values[0];
+    let tvcl = theta[0];
+    approx::assert_relative_eq!(cl_big, tvcl * (1.0f64 / 10.0).exp(), max_relative = 1e-12);
+    approx::assert_relative_eq!(cl_small, tvcl * 1.0f64.exp(), max_relative = 1e-12);
+}
+
+/// Ω_IOV keeps its declared (unweighted) scale — the γ² a published MBMA
+/// reports. Only the *effect* is divided.
+#[test]
+fn test_weighted_kappa_leaves_omega_iov_on_the_unweighted_scale() {
+    let model = parse_model_string(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 2.0 (sd) weight = NARM",
+        "",
+    ))
+    .unwrap();
+    let iov = model
+        .default_params
+        .omega_iov
+        .as_ref()
+        .expect("IOV present");
+    approx::assert_relative_eq!(iov.matrix[(0, 0)], 4.0, max_relative = 1e-12);
+}
+
+/// The model carries the weight for reporting: the source text plus an
+/// evaluator, so a fit can print the effective SD `γ/√W` at a typical arm size.
+#[test]
+fn test_weighted_kappa_is_reported_on_the_compiled_model() {
+    let model = parse_model_string(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "",
+    ))
+    .unwrap();
+    assert!(model.has_weighted_kappa());
+    let w = model.kappa_weights[0].as_ref().expect("weight recorded");
+    assert_eq!(w.expr, "NARM");
+    let cov: std::collections::HashMap<String, f64> =
+        [("NARM".to_string(), 200.0)].into_iter().collect();
+    approx::assert_relative_eq!(
+        (w.eval)(&model.default_params.theta, &cov, 0.0),
+        200.0,
+        max_relative = 1e-12
+    );
+}
+
+/// An unweighted IOV model must not start carrying weight metadata — the
+/// `kappa_weights` slots exist but stay empty.
+#[test]
+fn test_unweighted_kappa_carries_no_weight() {
+    let model =
+        parse_model_string(&weighted_kappa_model_str("  kappa KAPPA_CL ~ 0.09", "")).unwrap();
+    assert!(!model.has_weighted_kappa());
+    assert!(model.kappa_weights.iter().all(|w| w.is_none()));
+}
+
+/// A covariate named only by a weight expression is still model-referenced:
+/// without it in `referenced_covariates` the per-observation snapshots are
+/// pruned and every occasion silently reads the subject's first arm size
+/// (the #484 / #1029 trap).
+#[test]
+fn test_weighted_kappa_registers_its_covariate() {
+    let model = parse_model_string(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "",
+    ))
+    .unwrap();
+    assert!(
+        model.referenced_covariates.contains(&"NARM".to_string()),
+        "got: {:?}",
+        model.referenced_covariates
+    );
+}
+
+/// Weighting a kappa must not cost the *BSV* eta sharing its `exp(...)` its
+/// mu-reference — that would silently drop SAEM/IMP to the general θ step.
+#[test]
+fn test_weighted_kappa_preserves_the_bsv_mu_reference() {
+    let weighted = parse_model_string(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "",
+    ))
+    .unwrap();
+    let plain =
+        parse_model_string(&weighted_kappa_model_str("  kappa KAPPA_CL ~ 0.09", "")).unwrap();
+    let plain_ref = plain.mu_refs.get("ETA_CL").expect("baseline mu-ref");
+    let weighted_ref = weighted
+        .mu_refs
+        .get("ETA_CL")
+        .expect("BSV mu-ref survives the kappa rewrite");
+    assert_eq!(weighted_ref.theta_name, plain_ref.theta_name);
+    assert_eq!(weighted_ref.log_transformed, plain_ref.log_transformed);
+}
+
+#[test]
+fn test_weighted_kappa_rejects_a_random_effect_in_the_weight() {
+    let err = expect_parse_err(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = exp(ETA_CL)",
+        "",
+    ));
+    assert!(err.contains("references a random effect"), "got: {err}");
+}
+
+#[test]
+fn test_weighted_kappa_rejects_an_empty_right_hand_side() {
+    let err = expect_parse_err(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight =",
+        "",
+    ));
+    assert!(
+        err.contains("no expression on its right-hand side"),
+        "got: {err}"
+    );
+}
+
+/// A weight on anything but a `kappa` is rejected rather than ignored: the
+/// unanchored declaration regexes would otherwise drop it silently, which is
+/// the failure mode the feature exists to remove.
+#[test]
+fn test_weight_modifier_rejected_on_a_non_kappa_declaration() {
+    let err = expect_parse_err(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09\n  omega ETA_V ~ 0.04 weight = NARM",
+        "",
+    ));
+    assert!(
+        err.contains("only supported on a `kappa NAME ~ VALUE` declaration"),
+        "got: {err}"
+    );
+}
+
+/// A `block_kappa` cannot carry a weight: the divisor would have to apply to
+/// the block's covariances too for the matrix to stay a valid one.
+#[test]
+fn test_weight_modifier_rejected_on_block_kappa() {
+    let err = expect_parse_err(&weighted_kappa_model_str(
+        "  block_kappa (KAPPA_CL, KAPPA_V) = [0.09, 0.01, 0.04] weight = NARM",
+        "",
+    ));
+    assert!(err.contains("`block_kappa` cannot carry one"), "got: {err}");
+}
+
+/// Only `[individual_parameters]` applies the scaling, so a weighted kappa
+/// named anywhere else would read as the *unweighted* κ — a plausible wrong
+/// answer. Reject it instead.
+#[test]
+fn test_weighted_kappa_rejected_outside_individual_parameters() {
+    let err = expect_parse_err(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "\n[derived]\n  KOUT = KAPPA_CL\n",
+    ));
+    assert!(
+        err.contains("references `KAPPA_CL`, a kappa declared with `weight = ...`"),
+        "got: {err}"
+    );
+}
+
+/// The unweighted kappa keeps its freedom to appear elsewhere.
+#[test]
+fn test_unweighted_kappa_is_not_restricted_to_individual_parameters() {
+    parse_model_string(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09",
+        "\n[derived]\n  KOUT = KAPPA_CL\n",
+    ))
+    .expect("an unweighted kappa is unaffected by the #1031 guard");
+}
+
+/// A weighted kappa that no individual parameter references scales nothing —
+/// but the fit still reports `→ SD = γ/√N`, and a covariate named *only* by the
+/// weight never reaches `referenced_covariates`, so the datareader skips the
+/// column and the data check then blames a present column for reading 0.
+#[test]
+fn test_weighted_kappa_must_be_referenced_in_individual_parameters() {
+    let model_str = weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM\n  kappa KAPPA_V ~ 0.04 weight = NARM",
+        "",
+    );
+    let err = expect_parse_err(&model_str);
+    assert!(
+        err.contains("`KAPPA_V`") && err.contains("never referenced in [individual_parameters]"),
+        "got: {err}"
+    );
+}
+
+/// The same guard must not fire on a kappa that *is* referenced, including one
+/// reached only from inside a conditional branch.
+#[test]
+fn test_weighted_kappa_referenced_in_a_branch_is_not_inert() {
+    let model_str = r"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_CL ~ 0.09 weight = NARM
+  sigma PROP_ERR ~ 0.04
+
+[individual_parameters]
+  if (NARM > 1) {
+    CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[covariates]
+  NARM continuous
+
+[fit_options]
+  iov_column = OCC
+";
+    parse_model_string(model_str).expect("a kappa referenced inside a branch is not inert");
+}
+
+/// An *estimated* theta in the weight moves the divisor during the outer
+/// optimisation, so the up-front `E_KAPPA_WEIGHT_NONPOSITIVE` check — evaluated
+/// at the initial θ — certifies nothing: a weight that starts positive and
+/// crosses zero mid-fit divides an individual parameter by zero silently.
+#[test]
+fn test_weighted_kappa_rejects_an_estimated_theta_in_the_weight() {
+    let err = expect_parse_err(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = TVCL * NARM",
+        "",
+    ));
+    assert!(
+        err.contains("references estimated theta(s) `TVCL`"),
+        "got: {err}"
+    );
+}
+
+/// A FIXed theta is a known constant, so it is as safe as a covariate column
+/// and stays allowed.
+#[test]
+fn test_weighted_kappa_allows_a_fixed_theta_in_the_weight() {
+    let model_str = weighted_kappa_model_str(
+        "  theta NSCALE(2.0) FIX\n  kappa KAPPA_CL ~ 0.09 weight = NSCALE * NARM",
+        "",
+    );
+    let model = parse_model_string(&model_str).expect("a FIXed theta in the weight is allowed");
+    let w = model.kappa_weights[0].as_ref().expect("weight recorded");
+    // 2.0 (NSCALE, FIXed) × 100 (NARM) = 200.
+    let cov: std::collections::HashMap<String, f64> =
+        [("NARM".to_string(), 100.0)].into_iter().collect();
+    assert_eq!(
+        (w.eval)(&model.default_params.theta, &cov, 0.0),
+        200.0,
+        "the fixed theta enters the weight"
+    );
+}
+
+/// The "outside `[individual_parameters]`" error names the block the author
+/// wrote (`event_model armA`), not the bare instance label (`armA`), which on
+/// its own reads as a block name that does not exist. Every *named* block type
+/// is feature-gated, so this is the survival build's case.
+#[cfg(feature = "survival")]
+#[test]
+fn test_weighted_kappa_outside_error_names_the_block_type() {
+    let model_str = r"
+[parameters]
+  theta TVLAMBDA(0.1, 0.001, 10.0)
+  omega ETA ~ 0.09
+  kappa KAPPA_CL ~ 0.09 weight = NARM
+
+[event_model armA]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA * exp(KAPPA_CL)
+
+[covariates]
+  NARM continuous
+
+[fit_options]
+  iov_column = OCC
+";
+    let err = expect_parse_err(model_str);
+    assert!(
+        err.contains("[event_model armA] references `KAPPA_CL`"),
+        "got: {err}"
+    );
+}
+
+/// Mu-reference detection runs on the *rewritten* statements, so the declared
+/// `weight = W` form and the hand-written `K / sqrt(W)` agree on their mu-refs
+/// exactly as they agree on the objective. Detecting on a pre-rewrite snapshot
+/// registered a kappa mu-ref the rewritten model does not satisfy — which
+/// `method = bayes` then rejects while accepting the hand-written twin.
+#[test]
+fn test_weighted_kappa_mu_refs_match_the_hand_written_form() {
+    let declared = parse_model_string(&weighted_kappa_model_str(
+        "  kappa KAPPA_CL ~ 0.09 weight = NARM",
+        "",
+    ))
+    .unwrap();
+    let hand_written = parse_model_string(
+        &weighted_kappa_model_str("  kappa KAPPA_CL ~ 0.09", "")
+            .replace("ETA_CL + KAPPA_CL", "ETA_CL + KAPPA_CL / sqrt(NARM)"),
+    )
+    .unwrap();
+    assert_eq!(
+        declared.kappa_mu_refs.contains_key("KAPPA_CL"),
+        hand_written.kappa_mu_refs.contains_key("KAPPA_CL"),
+        "declared and hand-written forms must agree on kappa mu-refs"
+    );
+    assert!(
+        !declared.kappa_mu_refs.contains_key("KAPPA_CL"),
+        "a weighted kappa is not a bare Eta after the rewrite, so it is not a mu-ref"
+    );
+}
+
+/// The order-dependent case the pre-rewrite snapshot got backwards: in
+/// `TVCL * exp(KAPPA_CL) * exp(ETA_CL)` the left-to-right `or_else` returns the
+/// *kappa* index on the snapshot, losing the BSV eta's mu-ref that survives the
+/// rewrite — and with it SAEM/IMP's closed-form θ step.
+#[test]
+fn test_weighted_kappa_left_of_the_bsv_eta_keeps_the_bsv_mu_reference() {
+    let model_str = weighted_kappa_model_str("  kappa KAPPA_CL ~ 0.09 weight = NARM", "").replace(
+        "CL = TVCL * exp(ETA_CL + KAPPA_CL)",
+        "CL = TVCL * exp(KAPPA_CL) * exp(ETA_CL)",
+    );
+    let model = parse_model_string(&model_str).unwrap();
+    let mu = model
+        .mu_refs
+        .get("ETA_CL")
+        .expect("BSV mu-ref survives a kappa written to its left");
+    assert_eq!(mu.theta_name, "TVCL");
+    assert!(mu.log_transformed);
+}
+
+#[test]
+fn test_split_weight_modifier_peels_a_kappa_declaration() {
+    let (stmt, w) = super::split_weight_modifier(
+        "kappa KAPPA_EMAX ~ 2.0 (sd) weight = NARM",
+        "parameters",
+        "a `kappa NAME ~ VALUE` declaration",
+    )
+    .unwrap();
+    assert_eq!(stmt, "kappa KAPPA_EMAX ~ 2.0 (sd)");
+    assert_eq!(w.as_deref(), Some("NARM"));
 }
 
 // ── #811: compartment-free (`$PRED`-equivalent) structural model ─────────────

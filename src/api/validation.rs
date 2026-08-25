@@ -275,6 +275,140 @@ fn check_residual_magnitude(model: &CompiledModel, population: &Population) -> V
     Vec::new()
 }
 
+/// A kappa's sample-size weight (#1031) must be strictly positive and finite at
+/// every record, and constant within an occasion.
+///
+/// `κ_ik ~ N(0, Ω_IOV / W_ik)` is applied as `κ / sqrt(W)`, so a zero or
+/// missing weight divides an individual parameter by zero and a negative one
+/// takes `sqrt` of a negative number — both land as a non-finite prediction
+/// deep inside the inner loop, where the cause is invisible. The concrete way
+/// to get there is a blank arm-size cell in an MBMA dataset.
+///
+/// This is the *error* half; the within-occasion-variation warning is
+/// [`check_kappa_weight_variation`]. They are separate walks so neither caller
+/// pays for the other's work — the fatal list and the warning list are built by
+/// different entry points, and folding both into one function meant every fit
+/// walked every observation *and* every dose twice.
+pub(crate) fn check_kappa_weights(
+    model: &CompiledModel,
+    population: &Population,
+) -> Vec<Diagnostic> {
+    if !model.has_weighted_kappa() {
+        return Vec::new();
+    }
+    let theta = &model.default_params.theta;
+    for (k, weight) in model.kappa_weights.iter().enumerate() {
+        let Some(weight) = weight else { continue };
+        let name = model
+            .kappa_names
+            .get(k)
+            .map(String::as_str)
+            .unwrap_or("<kappa>");
+        for subj in &population.subjects {
+            for j in 0..subj.obs_times.len() {
+                let time = subj.obs_times[j];
+                let w = (weight.eval)(theta, subj.obs_cov(j), time);
+                if !(w.is_finite() && w > 0.0) {
+                    return vec![Diagnostic::error(
+                        "E_KAPPA_WEIGHT_NONPOSITIVE",
+                        format!(
+                            "[parameters] kappa `{name}` weight `{}` evaluates to {w} at \
+                             subject `{}`, TIME {time} — it must be strictly positive and \
+                             finite. The weight declares κ ~ N(0, Ω_IOV / W) and is applied \
+                             as κ/√W, so a zero or missing one divides an individual \
+                             parameter by zero. The usual cause is a missing or non-numeric \
+                             cell in the covariate it references.",
+                            weight.expr, subj.id
+                        ),
+                    )
+                    .with_block("parameters")];
+                }
+            }
+            // Dose records read the weight too (the individual parameters are
+            // rebuilt at every dose event), and a dose-only occasion has no
+            // observation to have caught it above.
+            for d in 0..subj.doses.len() {
+                let time = subj.doses[d].time;
+                let w = (weight.eval)(theta, subj.dose_cov(d), time);
+                if !(w.is_finite() && w > 0.0) {
+                    return vec![Diagnostic::error(
+                        "E_KAPPA_WEIGHT_NONPOSITIVE",
+                        format!(
+                            "[parameters] kappa `{name}` weight `{}` evaluates to {w} at the dose \
+                             record of subject `{}`, TIME {time} — it must be strictly positive \
+                             and finite. The weight declares κ ~ N(0, Ω_IOV / W) and is applied \
+                             as κ/√W, so a zero or missing one divides an individual parameter by \
+                             zero. The usual cause is a missing or non-numeric cell in the \
+                             covariate it references.",
+                            weight.expr, subj.id
+                        ),
+                    )
+                    .with_block("parameters")];
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Warning half of the kappa-weight check (#1031): a sample-size weight that is
+/// not constant *within* an occasion.
+///
+/// A warning rather than an error: κ is drawn once per occasion, so a weight
+/// that changes underneath it makes the arm's effective variance ambiguous —
+/// but the model still evaluates, and a dataset whose arm size legitimately
+/// changes mid-occasion (a dropout-adjusted N) may be exactly what the author
+/// intends. Observations only; a dose-only occasion has no within-occasion
+/// sequence to vary over.
+fn check_kappa_weight_variation(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+    if !model.has_weighted_kappa() {
+        return Vec::new();
+    }
+    let theta = &model.default_params.theta;
+    let mut diags = Vec::new();
+    for (k, weight) in model.kappa_weights.iter().enumerate() {
+        let Some(weight) = weight else { continue };
+        let name = model
+            .kappa_names
+            .get(k)
+            .map(String::as_str)
+            .unwrap_or("<kappa>");
+        // One variation warning per kappa — the condition is a property of the
+        // dataset's shape, so repeating it per subject-occasion is noise.
+        'kappa: for subj in &population.subjects {
+            for (occ, obs_idx) in crate::stats::likelihood::iov_occasion_groups(subj) {
+                let mut seen: Option<f64> = None;
+                for &j in &obs_idx {
+                    let time = subj.obs_times.get(j).copied().unwrap_or(0.0);
+                    let w = (weight.eval)(theta, subj.obs_cov(j), time);
+                    match seen {
+                        None => seen = Some(w),
+                        Some(prev) if (prev - w).abs() > 1e-9 * prev.abs().max(1.0) => {
+                            diags.push(
+                                Diagnostic::warning(
+                                    "W_KAPPA_WEIGHT_VARIES_WITHIN_OCCASION",
+                                    format!(
+                                        "[parameters] kappa `{name}` weight `{}` is not constant \
+                                         within occasion {occ} of subject `{}` ({prev} then {w}). \
+                                         κ is drawn once per occasion, so the occasion's \
+                                         effective variance Ω_IOV/W is ambiguous; the records are \
+                                         each scaled by their own weight.",
+                                        weight.expr, subj.id
+                                    ),
+                                )
+                                .with_block("parameters"),
+                            );
+                            break 'kappa;
+                        }
+                        Some(_) => {}
+                    }
+                }
+            }
+        }
+    }
+    diags
+}
+
 /// All data-dependent *fatal* compatibility checks between a compiled model and
 /// a dataset, collected into one diagnostic list. Shared by `fit()` (which
 /// stops at the first error via [`first_error`]) and `ferx check` (which
@@ -299,6 +433,10 @@ pub fn check_model_data_rule(
     diags.extend(check_per_cmt_scaling(model, population));
     diags.extend(check_per_cmt_error_model(model, population));
     diags.extend(check_residual_magnitude(model, population));
+    // Errors only; the within-occasion-variation *warning* is a separate walk,
+    // surfaced by `check_model_data_warnings` so `fit()` reports it too (this
+    // list is consumed error-first by `first_error`).
+    diags.extend(check_kappa_weights(model, population));
     diags.extend(check_iov_occasions(model, population, iov_rule));
     diags.extend(check_absorption_dosing(model, population));
     diags.extend(check_modeled_dose_rates(model, population));
@@ -2508,6 +2646,10 @@ pub fn check_model_data_warnings(
 ) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
 
+    // Warning half of the kappa-weight check (#1031) — a sample-size weight that
+    // moves within an occasion. The error half rides the fatal list.
+    diags.extend(check_kappa_weight_variation(model, population));
+
     // SS=1 with II ≤ 0 — the SS branch is gated on `dose.ii > 0`, so the dose
     // is silently treated as a single (non-SS) dose.
     let n_ss_bad_ii = population
@@ -3134,6 +3276,10 @@ mod additive_init_scale_tests;
 #[cfg(test)]
 #[path = "tests/residual_magnitude_tests.rs"]
 mod residual_magnitude_tests;
+
+#[cfg(test)]
+#[path = "tests/kappa_weight_tests.rs"]
+mod kappa_weight_tests;
 
 /// Feature-presence (data-independent) *warning*-level checks for experimental
 /// features (issue #175). Stochastic differential equations and neural-network

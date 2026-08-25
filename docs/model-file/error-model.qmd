@@ -343,6 +343,14 @@ a published figure.
   constant (covariates and `TIME` only), so the inner η-gradient and the outer
   θ/σ gradient stay analytic throughout.
 
+### The random-effect sibling
+
+The same modifier rides an IOV `kappa` declaration, where it weights the
+*random effect* rather than the residual:
+`kappa KAPPA_EMAX ~ 2.0 (sd) weight = NARM` declares
+`κ ~ N(0, Ω_IOV / N)` — the arm-level random effect of a longitudinal MBMA. See
+[Sample-size-weighted IOV](iov.qmd#sample-size-weighted-iov-weight-).
+
 ## Log-transform-both-sides (LTBS)
 
 For data whose residual error is *multiplicative* (a constant CV across the

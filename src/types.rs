@@ -2032,6 +2032,32 @@ impl ErrorSpec {
 /// parser's event-time built-in.
 pub type RuvMagFn = Box<dyn Fn(&[f64], &HashMap<String, f64>, f64) -> f64 + Send + Sync>;
 
+/// Closure signature for a kappa's `weight = <expr>` (#1031): `(theta,
+/// covariates, time) -> weight`. Same inputs as [`RuvMagFn`] and for the same
+/// reason — a variance weight may not depend on the random effects it scales.
+pub type KappaWeightFn = Box<dyn Fn(&[f64], &HashMap<String, f64>, f64) -> f64 + Send + Sync>;
+
+/// A kappa's declared sample-size weight (#1031): `kappa K ~ γ² weight = W`
+/// means `κ_ik ~ N(0, Ω_IOV / W_ik)`.
+///
+/// Carried on [`CompiledModel::kappa_weights`] for reporting and validation
+/// only — the scaling itself is desugared into the individual-parameter
+/// expressions at parse time.
+pub struct KappaWeight {
+    /// The weight expression exactly as written in the model file.
+    pub expr: String,
+    /// Evaluates the weight for one record's covariate snapshot.
+    pub eval: KappaWeightFn,
+}
+
+impl std::fmt::Debug for KappaWeight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KappaWeight")
+            .field("expr", &self.expr)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Custom residual-error magnitude (#484): one optional multiplier per flat
 /// sigma slot, indexed positionally to match `ErrorSpec::Single`'s sigma
 /// consumption order. `per_sigma[k] == None` means slot `k` is a bare sigma
@@ -3005,6 +3031,22 @@ pub struct CompiledModel {
     /// Per-kappa flag (parallel to `kappa_names`): `true` when the user wrote
     /// `kappa NAME ~ X (sd)`. Empty when no kappa declarations are present.
     pub kappa_init_as_sd: Vec<bool>,
+    /// Per-kappa sample-size weight (parallel to `kappa_names`, #1031): `Some`
+    /// when the user wrote `kappa NAME ~ X weight = <expr>`, declaring
+    /// `κ_ik ~ N(0, Ω_IOV / W_ik)` — the between-treatment-arm variability of a
+    /// longitudinal MBMA, whose arm-level random effect scales with the number
+    /// of subjects behind the arm. Empty when no kappa declarations are present.
+    ///
+    /// The scaling itself is applied by the parser, which desugars every
+    /// reference to a weighted kappa in `[individual_parameters]` into
+    /// `KAPPA / sqrt(W)`. That reparameterisation is exactly the hand-written
+    /// form it replaces (`κ/√W` with `κ ~ N(0, Ω_IOV)` *is* `κ' ~ N(0, Ω_IOV/W)`),
+    /// so every estimator, sensitivity, and diagnostic sees a model it already
+    /// supports, and the estimated Ω_IOV stays the unweighted γ² a published
+    /// analysis reports. This field is what the model carries for *reporting* —
+    /// the source text plus an evaluator for the effective SD at a typical arm
+    /// size (`γ/√W`), which is the number a reader actually needs.
+    pub kappa_weights: Vec<Option<KappaWeight>>,
     /// Detected mu-referencing relationships: eta_name → (theta_name, log_transformed).
     /// Populated by the parser; empty map means no mu-referencing detected.
     pub mu_refs: HashMap<String, MuRef>,
@@ -3924,6 +3966,12 @@ impl CompiledModel {
     #[inline]
     pub fn has_custom_ruv_magnitude(&self) -> bool {
         self.ruv_magnitude.as_ref().is_some_and(|m| m.is_active())
+    }
+
+    /// Whether any kappa carries a `weight = <expr>` modifier (#1031).
+    #[inline]
+    pub fn has_weighted_kappa(&self) -> bool {
+        self.kappa_weights.iter().any(|w| w.is_some())
     }
 
     /// Whether an *active* custom residual magnitude depends on `θ`
@@ -4915,6 +4963,22 @@ pub struct FitResult {
     /// semantics as `omega_init_as_sd` — `true` when the user wrote
     /// `kappa NAME ~ X (sd)`. Always `false` for block_kappa entries.
     pub kappa_init_as_sd: Vec<bool>,
+    /// Per-kappa sample-size weight source text (parallel to `kappa_names`,
+    /// #1031): `Some("NARM")` for `kappa K ~ γ² weight = NARM`. Empty for a
+    /// model with no weighted kappa, so an existing fit YAML is byte-identical.
+    ///
+    /// The estimate reported for a weighted kappa is the *unweighted* γ² — the
+    /// quantity a published MBMA reports — and the arm's effective SD is
+    /// `γ/√W`; see `kappa_weight_typical` for the arm size that goes with it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kappa_weights: Vec<Option<String>>,
+    /// Median weight over this dataset's subject-occasions, parallel to
+    /// `kappa_weights` (#1031). `Some(200.0)` next to `weight = NARM` means the
+    /// median arm carried 200 subjects, so the effective between-arm SD there is
+    /// `γ/√200` — the number a reader needs to judge a γ that looks alarming
+    /// undivided. `None` when that kappa has no weight.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kappa_weight_typical: Vec<Option<f64>>,
     pub se_kappa: Option<Vec<f64>>,
     /// Pooled kappa shrinkage: one value per kappa parameter, averaged over all
     /// subject-occasion pairs.  Empty when `n_kappa == 0`.

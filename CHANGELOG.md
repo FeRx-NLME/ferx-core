@@ -19,6 +19,18 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Added
+- **The `init(...)` scope rule is now published by the engine (#994).** `ODE_INIT_SCOPE_BUILTINS` and
+  `ODE_INIT_REJECTED_BUILTINS` name the built-ins an `[odes] init(...)` expression may and may not
+  reference, so a code generator can source the rule from the same binary it will parse with instead
+  of mirroring it by guesswork — the arrangement `known_block_names()` (#1040) already provides for
+  block names. The `[odes] init(...)` diagnostics are rendered from the same lists, so message and
+  guard cannot drift. They are named for the `[odes]` surface because the two surfaces genuinely
+  differ: outside `[odes]`, `MACHEPS` / `TAFD` / `TAD` are ordinary covariates rather than
+  solver-injected built-ins (the same deliberate rule `[scaling]` follows), so only `TIME` is
+  rejected in `[initial_conditions]`. Both surfaces are documented side by side under
+  [ODE models → What an `init(...)` expression may reference](https://ferx-nlme.github.io/ferx-core/model-file/ode-models.html#init-scope).
+
 ### Changed
 - **Every line in `[structural_model]` is now checked (#811).** The block was scanned for the first
   `pk NAME(...)` match with an unanchored pattern and every other line was discarded, so
@@ -99,15 +111,22 @@ section of the SDLC for the versioning policy).
   binary would refuse.
 - **A dose attribute that is also read by the model is now an error (#993).** `F`,
   `LAGTIME`/`ALAG` and the compartment-indexed `F{n}`/`ALAG{n}`/`LAGTIME{n}` are applied by the
-  engine **at the dose event**. A model that declares one and *also* references it in `[odes]`
-  (the RHS or an `init(...)` seed), the `[scaling]` readout, or the `[adaptive_dosing] observe`
+  engine **at the dose event**. A model that declares one and *also* references it in the `[odes]`
+  **RHS**, the `[scaling]` readout, or the `[adaptive_dosing] observe`
   controller signal was applying it twice — silently, and by exactly that factor: an
   ODE model reading its own `F` produced every prediction scaled by `F`, and renaming the parameter
   changed the fit by that amount with no diagnostic either way. This is now rejected at parse time
   with `E_DOSE_ATTR_DOUBLE_USE`, naming both readings and the fix. `D{n}`/`R{n}` carry the same
   reservation but are consulted only for a coded `RATE=-2`/`-1` dose, so that collision is reported
   against the dataset (same code) and a model whose data never codes `RATE` is untouched. Reads from
-  `[derived]`/`[output]` are post-solve reporting and remain silent. (Analytical models were left out
+  `[derived]`/`[output]` are post-solve reporting and remain silent, and so is an **initial
+  condition** on either engine (`[odes] init(state) = …`, `[initial_conditions]`): the engine seeds
+  the state with the raw expression value and consults dose attributes only at dose events, so
+  `init(central) = F * 100` — the bioavailable residue of a pre-study dose — applies `F` exactly
+  once and is a legitimate model ([#1046](https://github.com/FeRx-NLME/ferx-core/issues/1046)).
+  NONMEM agrees: `A_0(1) = F1*100` with `F1 = 0.5` seeds 50, not 25, and `A_0(1) = ALAG1*100` is
+  deposited unshifted, each run byte-identical to the twin seeding from an ordinary parameter of
+  equal value (`nonmem_anchor/odes_init_dose_attr_{f,lag}_{A,B}.ctl`). (Analytical models were left out
   of this first pass; they are covered by #1004 above.) **Breaking** for a model that folds `F` into the absorption flux
   — the pre-dose-entry convention the ODE docs' migration note describes, which until now computed
   `F²` without complaint; the fix is to drop `F` from the right-hand side, or rename the parameter
@@ -118,6 +137,24 @@ section of the SDLC for the versioning policy).
   with no diagnostic from NONMEM (`nonmem_anchor/dose_attr_double_use_{A,B}.ctl`).
 
 ### Fixed
+- **`TIME` in an `init(...)` expression is now rejected instead of silently reading zero (#994).**
+  Both init surfaces — `[odes] init(state) = ...` and the analytical `[initial_conditions]
+  init(cmt) = ...` — accepted a bare `TIME` (and `time`), while rejecting `Time`, `T`, `TAFD` and
+  `TAD`. An initial condition is evaluated at the time origin, so `TIME` there always read exactly
+  `0`: `init(central) = TIME + 50` was bit-identical to `init(central) = 0 + 50`, and
+  `init(central) = TIME * SOMETHING` initialised the compartment to zero, validated clean, and
+  fitted. The leak was representational, not a scope decision — a bare `TIME` parses to its own AST
+  node rather than to a variable, so the undefined-name check could not see it. It now errors,
+  pointing at `d/dt(...)` (or `[scaling]` Form C) for a genuinely time-dependent expression.
+  `MIXNUM`, the other built-in the check cannot see, stays in scope: it resolves to the subject's
+  mixture class, so a class-switched baseline does real work — it is now named in the diagnostic,
+  which previously listed neither.
+- **Every spelling of every clock in an `[odes] init(...)` now gets the same explanation (#994).**
+  `TIME`, `time`, `Time`, `T`, `TAFD` and `TAD` used to split three ways on representation alone —
+  accepted, reported as a plain undefined name, or reported as an undefined name — so the message a
+  user got depended on the casing they happened to type. All of them now report why a clock cannot
+  appear in an initial condition. An expression carrying both a clock and an undefined name reports
+  both problems from one parse instead of one per parse.
 - **A `[derived]` row aggregate followed by more expression is now an error instead of silently
   dropping the rest (#1030 review).** `CMAX = max(IPRED) * 2` parsed as the aggregate and discarded
   the `* 2`, reporting the unscaled maximum. There is no aggregate form that continues into a larger
@@ -273,6 +310,28 @@ section of the SDLC for the versioning policy).
   (`nonmem_anchor/algebraic_emax.*`). See `examples/emax_timecourse.ferx`, and
   `examples/mbma_naproxen.ferx` for the published model-based meta-analysis case study
   (Bracis et al., *CPT:PSP* 2026;15:e70158) it reproduces to three significant figures.
+- **Sample-size-weighted IOV: `weight = <expr>` on a `kappa` declaration (#1031).** The arm-level
+  random effect of every longitudinal MBMA — between-treatment-arm variability — is distributed
+  `κ_ik ~ N(0, γ²/N_ik)`: a 400-subject arm's mean wanders a quarter as far as a 25-subject arm's.
+  ferx could express that only by hand, inside a structural equation
+  (`... + ETA_EMAX + KAPPA_EMAX / sqrt(NARM)`), which put a variance-structure decision where
+  `/ NARM` instead of `/ sqrt(NARM)` produces a plausible wrong answer rather than an error, and
+  where nothing marks the term as weighted. Declare it where the rest of the variance structure is
+  declared instead: `kappa KAPPA_EMAX ~ 2.0 (sd) weight = NARM`, and write the structural expression
+  as `... + ETA_EMAX + KAPPA_EMAX`. The engine applies the scaling by rewriting the kappa as
+  `KAPPA / sqrt(W)`, which is exactly the hand-written form — so the objective, the analytic
+  sensitivities, the EBEs and every estimator that supports IOV (FOCE, FOCEI, Laplace/AGQ, SAEM)
+  are unchanged, and the reported Ω_IOV stays the **unweighted** γ² a published analysis quotes.
+  The fit printout adds the number a reader actually needs next to it — the effective SD at the
+  median arm, `γ/√N` — and `FitResult` carries `kappa_weights` / `kappa_weight_typical`. The weight
+  may reference covariates, `FIX`ed thetas and `TIME` but neither a random effect nor an estimated
+  theta (both would make the divisor move underneath the up-front positivity check); a weighted
+  kappa may be referenced only in `[individual_parameters]`, and must be referenced somewhere in it
+  (elsewhere it would read as the unweighted κ, and nowhere would report a scaling that was never
+  applied); `block_kappa` cannot carry one. A weight that is zero, negative or non-finite at any
+  record — a blank arm-size cell — is rejected up front by both `fit()` and `simulate()` with
+  `E_KAPPA_WEIGHT_NONPOSITIVE` instead of dividing an individual parameter by zero mid-run, and one
+  that moves *within* an occasion warns.
 - **`[scaling]` accepts named intermediates, expressions can be split across lines, and `min`/`max`
   take two arguments (#1030).** Three restrictions that individually looked defensible combined to
   make a standard bounded-endpoint readout unmaintainable: a model-based meta-analysis logit-Emax

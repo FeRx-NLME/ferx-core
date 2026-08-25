@@ -45,6 +45,7 @@ pub use frem::{prepare_frem, FremDataInfo, FremFitInit, FremPrepareResult};
 pub use io::datareader::{read_nonmem_csv, read_nonmem_csv_with_covariates};
 pub use parser::model_parser::{
     known_block_names, parse_full_model_file, parse_model_file, parse_model_string,
+    ODE_INIT_REJECTED_BUILTINS, ODE_INIT_SCOPE_BUILTINS,
 };
 pub use propensity_match::MatchMethod;
 // Adaptive (feedback) dosing vocabulary (#391). Re-exported at the crate root so

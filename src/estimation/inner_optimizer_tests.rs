@@ -1118,6 +1118,7 @@ fn test_frem_jacobian_overrides_fd_with_exact_values() {
         omega_init_as_sd: vec![false; 3],
         sigma_init_as_sd: vec![false],
         kappa_init_as_sd: vec![],
+        kappa_weights: Vec::new(),
         mu_refs: HashMap::new(),
         kappa_mu_refs: HashMap::new(),
         tv_fn: None,

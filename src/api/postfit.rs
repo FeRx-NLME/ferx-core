@@ -769,6 +769,50 @@ pub(crate) fn compute_subject_results(
         .collect()
 }
 
+/// Per-kappa weight of the *median* subject-occasion in this dataset (#1031),
+/// parallel to `CompiledModel::kappa_names`; `None` for an unweighted kappa.
+///
+/// This is the arm size that makes a reported γ readable: a `weight = NARM`
+/// kappa estimated at γ = 2.0 on a logit scale looks alarming until it is
+/// divided, and `γ/√median(N)` — 0.14 at N = 200 — is the between-arm SD a
+/// reader is actually looking for. One weight is taken per subject-occasion
+/// (the occasion's first observation, or the subject's covariates when the
+/// occasion carries only doses), matching the granularity κ is drawn at.
+pub(crate) fn kappa_weight_typicals(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+) -> Vec<Option<f64>> {
+    if !model.has_weighted_kappa() {
+        return Vec::new();
+    }
+    model
+        .kappa_weights
+        .iter()
+        .map(|w| {
+            let w = w.as_ref()?;
+            let mut vals: Vec<f64> = Vec::new();
+            for subj in &population.subjects {
+                for (_occ, obs_idx) in crate::stats::likelihood::iov_occasion_groups(subj) {
+                    let (cov, time) = match obs_idx.first() {
+                        Some(&j) => (subj.obs_cov(j), subj.obs_times.get(j).copied()),
+                        None => (&subj.covariates, None),
+                    };
+                    let v = (w.eval)(theta, cov, time.unwrap_or(0.0));
+                    if v.is_finite() {
+                        vals.push(v);
+                    }
+                }
+            }
+            if vals.is_empty() {
+                return None;
+            }
+            vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            Some(vals[vals.len() / 2])
+        })
+        .collect()
+}
+
 /// Kappa shrinkage pooled across all subject-occasion pairs.
 ///
 /// `1 - sqrt(mean(κ̂²)) / sqrt(omega_iov_kk)` for each kappa k, where the mean
