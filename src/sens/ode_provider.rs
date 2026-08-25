@@ -5129,7 +5129,44 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                         // `δlag` has value 0, so the f64 value (dose at `t_event`) is
                         // unchanged. (For the first dose `x⁻ = 0`, `g(x⁻) = 0`, so this
                         // reduces to `−g(x⁺)·δlag + ½ẋ̇⁺·δlag²` — the single-dose time-shift.)
+                        //
+                        // #1060: the two sides of the boundary are evaluated under
+                        // **different PK snapshots** whenever the dose row's covariates
+                        // differ from the next record's. Production integrates the segment
+                        // *ending* at the arrival under the dose row's snapshot and the
+                        // segment *starting* there under the next record's (the
+                        // end-of-interval convention above, `predictions.rs` `Kind::Dose`),
+                        // so `g(x⁻)`/`J⁻` belong to `pk_at_dose[idx]` while `g(x⁺)`, `J⁺`
+                        // and the cross term belong to the arrival segment's snapshot.
+                        // Reading the post side from the dose row biased `∂f/∂η_lag` by the
+                        // ratio of the two covariate-scaled fields — 6% on the issue's
+                        // reproducer, and invisible in the value because `δlag` is jet-only.
+                        // This is the same post-side lookahead the rate-on onset (#880) and
+                        // the rate-off boundary (#653) already carry; the bolus arrival was
+                        // the last saltation without one.
                         let params = &pk_at_dose[idx];
+                        // Snapshot of the segment the arrival opens: the next timeline
+                        // event that is an actual record (`_` arms are the param-less
+                        // boundaries, which reuse `last_params` — set to this dose's own
+                        // snapshot at the end of this branch, so the fallbacks agree).
+                        let post_params: &[T] = 'post_snap: {
+                            let leps = crate::ode::predictions::INFUSION_EPS;
+                            for q in (p + 1)..tl.len() {
+                                let (tq, kq, iq) = tl[q];
+                                if (kq == K_INF_END || kq == K_ZO_END || kq == K_ROUTE_ONSET)
+                                    && (tq - t_event).abs() <= leps
+                                {
+                                    continue;
+                                }
+                                break 'post_snap match kq {
+                                    K_DOSE | K_SS_SEED => &pk_at_dose[iq],
+                                    K_PKONLY => &pk_at_pk_only[iq],
+                                    K_OBS => &pk_at_obs[iq],
+                                    _ => &pk_at_dose[idx],
+                                };
+                            }
+                            &pk_at_dose[idx]
+                        };
                         let lag = params[dose_lag_slot[idx]];
                         let dlag = jet_only(lag);
                         // TAD anchor for the *pre*-dose velocity `g(x⁻)`: the most recent
@@ -5175,7 +5212,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                         eval_rhs_anchored::<T>(
                             program,
                             &u,
-                            params,
+                            post_params,
                             t_event,
                             first_dose_time,
                             t_event,
@@ -5183,15 +5220,21 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                             &mut vars_cell.borrow_mut(),
                             &mut stack_cell.borrow_mut(),
                         );
-                        // dD/dt values via exact `J·g` directional evals (Dual1<1>).
-                        let params_d1: Vec<Dual1<1>> =
+                        // dD/dt values via exact `J·g` directional evals (Dual1<1>). Each
+                        // side takes its own field (#1060): `J⁻` from the segment ending at
+                        // the arrival, `J⁺` (and the cross term) from the one it opens.
+                        let pre_d1: Vec<Dual1<1>> =
                             params.iter().map(|p| Dual1::constant(p.val())).collect();
+                        let post_d1: Vec<Dual1<1>> = post_params
+                            .iter()
+                            .map(|p| Dual1::constant(p.val()))
+                            .collect();
                         let jg_minus = jdotg_value::<T>(
                             program,
                             n_states,
                             &u_minus,
                             &g_minus,
-                            &params_d1,
+                            &pre_d1,
                             t_event,
                             first_dose_time,
                             pre_anchor,
@@ -5203,7 +5246,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                             n_states,
                             &u,
                             &g_plus,
-                            &params_d1,
+                            &post_d1,
                             t_event,
                             first_dose_time,
                             t_event,
@@ -5217,7 +5260,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                             n_states,
                             &u,
                             &g_minus,
-                            &params_d1,
+                            &post_d1,
                             t_event,
                             first_dose_time,
                             t_event,
