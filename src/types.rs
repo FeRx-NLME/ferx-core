@@ -3406,6 +3406,28 @@ impl CompiledModel {
         self.ode_spec.is_some()
     }
 
+    /// Returns true for a **compartment-free** (`$PRED`-equivalent) model — one
+    /// whose `[structural_model]` declares its prediction as an equation with no
+    /// compartments underneath (issue #811).
+    ///
+    /// Such a model has no ODE spec *and* no closed form: its prediction is the
+    /// readout alone. [`Self::pk_model`] holds a placeholder that must never be
+    /// dispatched on, so every site that reads it — the closed-form predictors,
+    /// the dose/absorption validators, the analytic sensitivity gates, the
+    /// starting-estimate heuristics — branches on this predicate first.
+    ///
+    /// **Derived, not stored**, so the two cannot drift: an
+    /// [`AnalyticReadout`] with an EMPTY `state_names` *is* the marker, and one
+    /// can only be built by the parser (the type is `#[non_exhaustive]` and
+    /// every compartment-bearing readout carries at least `central`).
+    pub fn is_algebraic(&self) -> bool {
+        self.ode_spec.is_none()
+            && self
+                .analytic_readout
+                .as_ref()
+                .is_some_and(|ar| ar.state_names.is_empty())
+    }
+
     /// The model that should actually serve `subject`'s predictions / sensitivities.
     ///
     /// For a closed-form absorption model (transit `one_cpt_transit` / `two_cpt_transit`, or
@@ -4033,6 +4055,14 @@ impl CompiledModel {
             self.ode_spec.is_none(),
             "analytical_compartment_names called on an ODE model — use ode_spec.state_names instead"
         );
+        // A compartment-free model (#811) has no compartments to name. Its
+        // `pk_model` is a placeholder, so the match below would advertise
+        // `["central"]` — and `[derived]` would then resolve a bare `central` to a
+        // compartment reference that reads NaN forever, instead of reporting it as
+        // the undefined name it is.
+        if self.is_algebraic() {
+            return &[];
+        }
         use std::sync::OnceLock;
         // Exhaustive `match` on `pk_model` so adding an 11th `PkModel` variant is a
         // COMPILE error here (a missing arm), not a runtime index-out-of-bounds on a

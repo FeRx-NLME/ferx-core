@@ -98,6 +98,18 @@ per observation and `TIME` resolves to each row's own time.
 
 ## Form C — explicit output expression
 
+::: {.callout-note}
+## A model with no compartments belongs in `[structural_model]`, not here
+
+Form C is a readout **on top of** a compartment model. If the prediction is an
+equation with no compartments underneath — a dose-response curve, a response
+time-course, a meta-regression — write it directly in `[structural_model]`
+instead; it uses this same grammar, including the named intermediates and
+continuation lines described below. See [Compartment-Free Models](structural-model.qmd#compartment-free-models-the-pred-equivalent).
+A `[scaling]` block alongside such a model is rejected: that block already
+declares the prediction.
+:::
+
 Use when the built-in concentration readout is not the observed quantity —
 e.g. an ODE state is held as an amount and the observation is a concentration,
 or the observation is a nonlinear function of the concentration (a

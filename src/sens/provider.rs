@@ -514,6 +514,14 @@ pub fn analytical_supported(model: &CompiledModel) -> bool {
 /// [`tvcov_analytical_supported`] — everything except the `TIME`-routing clause, so the
 /// two can compose without recursion (#637 review #1).
 fn analytical_supported_core(model: &CompiledModel) -> bool {
+    // A compartment-free model (#811) carries a *placeholder* `pk_model` that the
+    // `matches!` below would happily admit — and then every walk here would
+    // evaluate a closed form the model does not have, against doses it does not
+    // carry. Decline before the match so the placeholder can never be dispatched
+    // on; such a model is served by `sens::algebraic`, which needs no closed form.
+    if model.is_algebraic() {
+        return false;
+    }
     matches!(
         model.pk_model,
         PkModel::OneCptIv
@@ -915,6 +923,9 @@ fn scaling_supported(model: &CompiledModel) -> bool {
 pub fn sens_supported(model: &CompiledModel) -> bool {
     analytical_supported(model)
         || (ODE_SENS_ENABLED && crate::sens::ode_provider::ode_analytical_supported(model))
+        // Compartment-free models (#811) are served by neither: they have no closed
+        // form and no ODE spec, only a readout over the individual-parameter jet.
+        || crate::sens::algebraic::supported(model)
 }
 
 /// Whether the exact analytic **outer** (population) FOCE/FOCEI gradient is
@@ -1183,7 +1194,7 @@ fn resolve_param_derivs(
 /// PK slot → differentiated-row index of a `pd`/`dp_deta` whose rows follow `slots`
 /// order: `out[slots[i]] = Some(i)` for every in-range slot, `None` otherwise.
 /// Hoisted from the five identical `[None; N_PK]` build loops (F4).
-fn seed_dim_from_slots(slots: &[usize]) -> [Option<usize>; N_PK] {
+pub(crate) fn seed_dim_from_slots(slots: &[usize]) -> [Option<usize>; N_PK] {
     let mut seed_dim: [Option<usize>; N_PK] = [None; N_PK];
     for (i, &slot) in slots.iter().enumerate() {
         if slot < N_PK {
@@ -1443,6 +1454,10 @@ pub fn iov_sens_supported(model: &CompiledModel) -> bool {
     }
     iov_analytical_supported(model)
         || (ODE_SENS_ENABLED && crate::sens::ode_provider::ode_iov_supported(model))
+        // Compartment-free (#811): κ reaches the prediction only through the
+        // individual parameters the readout reads, so its IOV jet is the ordinary
+        // readout jet seeded on the stacked κ axes — no walk, no carryover.
+        || crate::sens::algebraic::supported_iov(model)
 }
 
 /// Light **inner** η-gradient (`∂f/∂(stacked-η)` per observation) for an IOV subject
@@ -1459,6 +1474,11 @@ pub(crate) fn subject_eta_grad_iov(
     // Closed-form transit/IG IOV → its ODE twin (issue #719); no-op otherwise. See
     // `subject_sensitivities_iov`.
     let model = model.effective_for(subject);
+    // Compartment-free (#811) first: `ode_spec` is `None` and `pk_model` is a
+    // placeholder, so the closed-form branch below would misread it.
+    if model.is_algebraic() {
+        return crate::sens::algebraic::subject_eta_grad_iov(model, subject, theta, stacked_eta);
+    }
     if model.ode_spec.is_some() {
         if ODE_SENS_ENABLED {
             return crate::sens::ode_provider::ode_subject_eta_grad_iov(
@@ -1497,6 +1517,18 @@ pub fn subject_sensitivities_iov(
     // this fires only on the model-blind loader that put the TTE rows in `obs_times`.
     if model.ode_spec.is_none() && !crate::pk::subject_feeds_analytical_pk(model, subject) {
         return None;
+    }
+    // Compartment-free (#811): no walk to gate, no dose to route, no `pk_model` to
+    // dispatch on — its κ jet is the readout jet seeded on the stacked axes.
+    // Returned before every closed-form guard below, all of which are about a walk
+    // this model does not take.
+    if model.is_algebraic() {
+        return crate::sens::algebraic::subject_sensitivities_iov(
+            model,
+            subject,
+            theta,
+            stacked_eta,
+        );
     }
     // Cheap, model/subject-only decline before any dual seeding (#822 review #9) — see
     // `subject_sensitivities_tvcov`. Harmless for the ODE-twin branch below: an ODE model has no
@@ -3864,6 +3896,15 @@ fn subject_eta_grad_impl(
     // takes the ODE-provider branch below (that branch ignores the analytical
     // `cached_schedule`, so a stale one is harmless). Unchanged for every other model (#486).
     let model = crate::pk::effective_model_for_eval(model, subject, theta, eta);
+    // Compartment-free models (#811), before the ODE/analytical split for the same
+    // reason as in `subject_sensitivities_impl` — and so the inner and outer take
+    // the same route, which is the property `subject_eta_grad_tvcov_with_schedule`
+    // exists to protect. Time-varying covariates are ordinary here (a per-row study
+    // or arm covariate), so this must come before the event-walk test below, which
+    // would otherwise claim such a subject for a walk it cannot run.
+    if model.is_algebraic() {
+        return crate::sens::algebraic::subject_eta_grad(model, subject, theta, eta);
+    }
     // ODE models: the light `Dual1` inner η-gradient (#410), gated by the master
     // switch. Out-of-scope ODE subjects decline (→ FD inner), the same per-subject
     // scope the outer provider uses, so inner and outer stay on the same route.
@@ -5134,6 +5175,13 @@ fn subject_sensitivities_impl(
     // routes to its exact ODE `transit()` equivalent, which then takes the ODE-provider
     // branch below; every other model is unchanged (#486).
     let model = crate::pk::effective_model_for_eval(model, subject, theta, eta);
+    // Compartment-free models (#811) first: they have `ode_spec == None` and a
+    // placeholder `pk_model`, so both branches below would misread them — the ODE
+    // test as "analytical", then `analytical_supported` (which declines them
+    // explicitly) as "out of scope", losing an analytic gradient that exists.
+    if model.is_algebraic() {
+        return crate::sens::algebraic::subject_sensitivities(model, subject, theta, eta);
+    }
     // ODE models route to the ODE sensitivity provider (issue #367, Option A;
     // armed in #410) when in its supported scope; out-of-scope ODE subjects return
     // `None` and fall back to the prior path (gradient-free outer, FD inner). The

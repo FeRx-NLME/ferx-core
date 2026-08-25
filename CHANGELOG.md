@@ -70,6 +70,14 @@ section of the SDLC for the versioning policy).
   shipping experimental components to every ODE user. The promotion rests on this release's
   validation: a NONMEM FOCEI anchor on the cyclophosphamide model (ferx 3241.708 vs NONMEM
   3241.721) and prediction-equivalence tests across all five methods.
+- **Every line in `[structural_model]` is now checked (#811).** The block was scanned for the first
+  `pk NAME(...)` match with an unanchored pattern and every other line was discarded, so
+  `zpk one_cpt_iv(cl=CL, v=V)` parsed as a valid one-compartment IV model and a mistyped or stray
+  line vanished without a word. Each line must now be one of the four accepted forms —
+  `pk NAME(...)`, `ode(states=[...])`, `ode_template NAME(...)`, or an equation line — and anything
+  else, a second disposition line, or a mix of a compartment model with equation lines is a parse
+  error naming the offending line. A model file that relied on the old leniency was already being
+  read as something other than what it said.
 - **A single-endpoint `[error_model]` must now name its sigmas in declaration order (#1001).**
   A one-line `DV ~ ...` error model consumes its sigmas **positionally** from the `[parameters]`
   declaration order. The names written in the arguments were checked for existence and then
@@ -167,6 +175,24 @@ section of the SDLC for the versioning policy).
   with no diagnostic from NONMEM (`nonmem_anchor/dose_attr_double_use_{A,B}.ctl`).
 
 ### Fixed
+- **An estimated lagtime whose lagged dose arrival crossed a time-varying covariate change got a
+  silently wrong analytic gradient on ODE models (#1060).** The dose lands at a moving boundary
+  `t + ALAG`, and the walk injects the resulting jump as a saltation. The segment ending at that
+  arrival belongs to the dose record's covariate snapshot and the segment it opens to the next
+  record's, but the injection evaluated *both* sides on the dose record's — so whenever those two
+  records carried different covariates, the post-arrival velocity, its Jacobian and the cross term
+  all used the wrong parameters. Individual predictions were unaffected (the correction is
+  derivative-only) — but the FOCEI objective builds its `h` matrix from this same analytic
+  `∂f/∂η`, so the **reported OFV was wrong too**: on a crossing dataset the objective missed
+  NONMEM 7.6.0 by 7.52 units before the fix and by 5e-6 after it, with every EBE reproduced to
+  the printed digits (`nonmem_anchor/tvcov_lag_saltation.ctl`). Against finite differences of the
+  production predictor the gradient error reached 300× and the Hessian 23×. Fixed with it: the
+  matching defect at a finite-duration **infusion**'s lagged rate-on; concurrently active
+  forcings missing from the boundary velocities, which cost a further ~2% of the second order
+  once the two sides read different snapshots; and a value-only snapshot comparison that let an
+  IOV occasion boundary at the rate-on drop a κ jet, giving `∂²f/∂η_LAG∂κ` the wrong sign.
+  Constant-covariate fits, and any fit whose arrivals do not cross a covariate change, are
+  bit-identical to before.
 - **`TIME` in an `init(...)` expression is now rejected instead of silently reading zero (#994).**
   Both init surfaces — `[odes] init(state) = ...` and the analytical `[initial_conditions]
   init(cmt) = ...` — accepted a bare `TIME` (and `time`), while rejecting `Time`, `T`, `TAFD` and
@@ -319,6 +345,27 @@ section of the SDLC for the versioning policy).
   stopped theta from fixing.
 
 ### Added
+- **`[structural_model]` accepts a compartment-free model — the `$PRED` equivalent (#811).** A
+  block with no `pk ...` / `ode(...)` line and at least one `NAME = <expr>` line declares its
+  prediction directly, with no compartments underneath: write named intermediates above a final
+  `y = <expr>`, exactly as in `[scaling]`, and reference thetas, etas, individual parameters,
+  `TIME`, and any data column. This is the shape of every model-based meta-analysis structural
+  model (a dose-response or time-course regression, not a PK system), which until now had to be
+  written as a dummy compartment driven by `d/dt(clock) = 1` with the real equation hidden in a
+  `[scaling]` readout. Such a model carries no doses and lays its individual parameters out like an
+  ODE model, so it is not limited to the handful of spare parameter slots an analytical readout
+  draws from. Blocks that presuppose compartments (`[odes]`, `[initial_conditions]`,
+  `[diffusion]`, `[scaling]`) are rejected by name rather than silently ignored. Such a model
+  takes the **analytic** `Dual2` gradient on both the inner and outer loops — with no state to
+  integrate the sensitivity is a chain rule over the individual-parameter program — including
+  under inter-occasion variability, where the equation is evaluated per occasion and the gradient
+  seeded on that occasion's `kappa` axes (what makes a between-treatment-arm variance component
+  estimable rather than frozen). Finite differences remain only past the axis caps, and are
+  reported as such. Anchored against the equivalent NONMEM `$PRED` fit: agreement to ~1e-4
+  relative on every estimate and standard error, and to 5 decimal places on the objective
+  (`nonmem_anchor/algebraic_emax.*`). See `examples/emax_timecourse.ferx`, and
+  `examples/mbma_naproxen.ferx` for the published model-based meta-analysis case study
+  (Bracis et al., *CPT:PSP* 2026;15:e70158) it reproduces to three significant figures.
 - **Sample-size-weighted IOV: `weight = <expr>` on a `kappa` declaration (#1031).** The arm-level
   random effect of every longitudinal MBMA — between-treatment-arm variability — is distributed
   `κ_ik ~ N(0, γ²/N_ik)`: a 400-subject arm's mean wanders a quarter as far as a 25-subject arm's.

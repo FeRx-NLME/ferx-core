@@ -622,6 +622,15 @@ pub(crate) fn compute_extra_output_columns(
                                     subject,
                                     &grid_times,
                                 )
+                            } else if model.is_algebraic() {
+                                // A compartment-free model (#811) has no compartments to
+                                // report on the grid, and its `pk_model` is a placeholder the
+                                // superposition below would read as a real one — returning
+                                // all-zero one-compartment amounts as if they were this
+                                // model's state. Empty → NaN, the convention every other
+                                // out-of-scope case here uses. Mirrors the per-obs branch in
+                                // `compute_predictions_with_states`.
+                                vec![]
                             } else if !model.analytical_init.is_empty() {
                                 // Analytical model + [initial_conditions] baseline (#521):
                                 // the superposition state reconstruction does not seed the
