@@ -3,11 +3,12 @@
 Longitudinal model-based meta-analysis of naproxen vs placebo in osteoarthritis:
 18 trials, 36 treatment arms, WOMAC pain over time.
 
-> **Licence: CC BY-NC 4.0 — not MIT.** This file is the one exception to the
-> repository's MIT grant. See [`mbma_naproxen.LICENSE`](mbma_naproxen.LICENSE)
-> beside it, and the note in the root [`LICENSE`](../LICENSE). Commercial use is
-> not granted. It is a test fixture, never linked into the binary, and
-> `Cargo.toml` excludes it from the packaged crate.
+> **Licence: CC BY-NC 4.0 — not MIT.** `mbma_naproxen.csv` is the one exception to
+> the repository's MIT grant (this README is not — it is repo-authored MIT prose).
+> See [`mbma_naproxen.LICENSE`](mbma_naproxen.LICENSE) beside it, and the note in
+> the root [`LICENSE`](../LICENSE). Commercial use of the CSV is not granted. It is
+> a test fixture, never linked into the binary, and `Cargo.toml` excludes it from
+> the packaged crate.
 
 ## Source
 

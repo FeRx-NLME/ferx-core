@@ -7,9 +7,12 @@ license = "MIT"
 authors = ["Ron Keizer", "Teun Post", "Hidde van de Beek"]
 repository = "https://github.com/FeRx-NLME/ferx-core"
 readme = "README.md"
-# `data/mbma_naproxen.*` is CC BY-NC 4.0, not MIT (see the root LICENSE and
+# `data/mbma_naproxen.csv` is CC BY-NC 4.0, not MIT (see the root LICENSE and
 # data/mbma_naproxen.LICENSE). It is a slow-test fixture, so excluding it keeps
-# the crate published to crates.io uniformly MIT.
+# the crate published to crates.io free of any CC BY-NC file. The glob also takes
+# its README and licence companions, which are MIT / Creative Commons' own text
+# respectively — they are dropped because they are meaningless without the data,
+# not because of their licence.
 exclude = ["data/mbma_naproxen.*"]
 
 [[bin]]

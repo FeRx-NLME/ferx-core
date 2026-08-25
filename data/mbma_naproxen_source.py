@@ -23,7 +23,8 @@ Transformations, all of them mechanical:
     TRT    <- NFLG   (the same indicator, read as a treatment covariate)
     DV     <- WP / WPSE, the SE-weighted response
     NIND   <- NTRT   (subjects behind the arm)
-FLARE, TIME and WPSE pass through unchanged.
+FLARE and TIME pass through unchanged; WPSE passes through its value but is
+reformatted to 9 decimals, which is exact for every value in the published file.
 
 `DV` is computed here rather than read from the file: the upstream CSV carries the
 arm mean (`WP`) and its standard error (`WPSE`), not their ratio.
@@ -39,6 +40,16 @@ import sys
 
 DEFAULT_DST = "data/mbma_naproxen.csv"
 
+# The published file's exact shape. `NFLG` is written into both `ARM` and `TRT`
+# without inspecting its contents, so nothing downstream would notice if a
+# re-issued supplementary file renamed or recoded a column — the previous
+# derivation at least tested `TRT == "Naproxen"` and would have miscoded loudly.
+# Checking the shape up front restores that: a file that is not the one this
+# script was written for fails here rather than producing a wrong `TRT` column.
+EXPECTED_COLUMNS = {"STUD", "NFLG", "TIME", "NTRT", "FLARE", "WP", "WPSE"}
+EXPECTED_ROWS = 122
+EXPECTED_FLAGS = {"0", "1"}
+
 
 def main(argv):
     if len(argv) < 2:
@@ -47,7 +58,32 @@ def main(argv):
     src, dst = argv[1], (argv[2] if len(argv) > 2 else DEFAULT_DST)
 
     with open(src) as fh:
-        rows = list(csv.DictReader(fh))
+        reader = csv.DictReader(fh)
+        columns = set(reader.fieldnames or [])
+        rows = list(reader)
+
+    if columns != EXPECTED_COLUMNS:
+        print(
+            f"error: {src} has columns {sorted(columns)}, expected "
+            f"{sorted(EXPECTED_COLUMNS)}. This is not the PSP4-7-288-s007.csv this "
+            "script derives from; see data/mbma_naproxen.README.md.",
+            file=sys.stderr,
+        )
+        return 1
+    if len(rows) != EXPECTED_ROWS:
+        print(
+            f"error: {src} has {len(rows)} rows, expected {EXPECTED_ROWS}.",
+            file=sys.stderr,
+        )
+        return 1
+    flags = {r["NFLG"].strip() for r in rows}
+    if flags != EXPECTED_FLAGS:
+        print(
+            f"error: NFLG holds {sorted(flags)}, expected a 0/1 placebo/naproxen "
+            "indicator. TRT would be miscoded.",
+            file=sys.stderr,
+        )
+        return 1
 
     out = ["ID,ARM,TIME,DV,TRT,FLARE,WPSE,NIND,MDV"]
     for r in rows:

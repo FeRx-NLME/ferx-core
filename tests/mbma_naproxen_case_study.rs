@@ -15,12 +15,12 @@
 //!
 //! Two things are being asserted, and they are different claims:
 //!
-//! 1. **The published analysis is reproduced.** Every point estimate matches the
-//!    NONMEM column of Boucher & Bennetts Table 2 to the last published digit, and
-//!    the subset Bracis et al. report matches their Monolix values to three
-//!    significant figures. A structural model that predicted the wrong thing could
-//!    not — and because Table 2 is the same model fitted in BUGS, NONMEM and
-//!    `nlme`, this is an anchor against three independent engines, not one.
+//! 1. **The published analysis is reproduced.** Every point estimate is within
+//!    0.01 of the NONMEM column of Boucher & Bennetts Table 2, and the subset
+//!    Bracis et al. report matches their Monolix values to three significant
+//!    figures. A structural model that predicted the wrong thing could not — and
+//!    because Table 2 is the same model fitted in BUGS, NONMEM and `nlme`, this is
+//!    an anchor against three independent engines, not one.
 //! 2. **The compartment-free form is equivalent to the dummy-compartment
 //!    workaround it replaces.** Until #811 this model had to be written as a state
 //!    nobody reads, driven by `d/dt(clock) = 1`, with the real equation hidden in
@@ -40,7 +40,8 @@
 //! ## Published reference values
 //!
 //! Boucher & Bennetts Table 2 fits this model in **three independent engines**.
-//! ferx reproduces every point estimate in it:
+//! ferx reproduces every point estimate in it, to within 0.01 absolute of the
+//! NONMEM column (worst observed residual 0.005, on ln(ΔET50_n)):
 //!
 //! | Parameter | BUGS | NONMEM | R (`nlme`) | Monolix | ferx (this test) |
 //! |---|---|---|---|---|---|
@@ -75,7 +76,9 @@
 //! on their standard errors — τ1 is 0.86 in BUGS against 0.62 in the other two,
 //! and the SE of ΔEmax_p is 0.47 / 0.09 / 0.39 across BUGS / NONMEM / `nlme`. A
 //! tolerance wide enough to cover that spread would assert nothing. The one SE all
-//! three (plus Monolix) agree on is ΔEmax_n, 0.06–0.09, and that one is asserted.
+//! three (plus Monolix) broadly agree on is ΔEmax_n, 0.06–0.09, and that one is
+//! asserted — as the published spread, not against any single column, since ferx's
+//! 0.0646 sits with BUGS and `nlme` rather than with NONMEM.
 //! ferx's SEs are pure `R⁻¹`, which is NONMEM's `MATRIX=R`, not its default
 //! sandwich — another reason not to read the SE columns as a single number.
 
@@ -241,12 +244,20 @@ fn mbma_naproxen_reproduces_the_published_analysis() {
         );
     }
 
-    // The one SE the paper's three engines agree on (0.06 / 0.09 / 0.07) — and it
-    // is the headline estimate's. The rest of Table 2's SE column is not asserted;
-    // see the module docs for why.
+    // The one SE the paper's three engines broadly agree on, and it is the headline
+    // estimate's: 0.06 (BUGS) / 0.09 (NONMEM) / 0.07 (nlme). Asserted as the
+    // published *spread* rather than against any single column, because ferx's
+    // 0.0646 sits with BUGS and nlme, not with NONMEM — pinning it to the NONMEM
+    // value alone would put the tolerance floor 0.005 below the observed value and
+    // fail on a routine covariance-step wobble, while reporting the wrong engine as
+    // the reference. Widened by 0.005 either side, since the paper reports 2 dp.
+    // The rest of Table 2's SE column is not asserted; see the module docs for why.
+    const SE_PUBLISHED_LO: f64 = 0.06 - 0.005;
+    const SE_PUBLISHED_HI: f64 = 0.09 + 0.005;
     assert!(
-        (se - 0.09_f64).abs() < 0.03,
-        "SE of ΔEmax_n: ferx {se:.4} vs Table 2 NONMEM 0.09 (BUGS 0.06, nlme 0.07)"
+        (SE_PUBLISHED_LO..=SE_PUBLISHED_HI).contains(&se),
+        "SE of ΔEmax_n: ferx {se:.4} outside the published spread \
+         [{SE_PUBLISHED_LO}, {SE_PUBLISHED_HI}] (BUGS 0.06, NONMEM 0.09, nlme 0.07)"
     );
 }
 

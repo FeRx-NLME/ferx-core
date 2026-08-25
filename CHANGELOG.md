@@ -77,8 +77,8 @@ section of the SDLC for the versioning policy).
   Bennetts, *Many Flavors of Model-Based Meta-Analysis: Part II*, *CPT:PSP* 2018;7:288–297
   (CC BY-NC, no ND clause), whom that tutorial replicates. The fixture is now derived from the
   primary source instead, which removes the no-derivatives problem and makes the attribution
-  correct. Everything in the repository stays MIT **except** `data/mbma_naproxen.*`, which carries
-  CC BY-NC 4.0 — so commercial use of those files is not granted. The exception is recorded in the
+  correct. Everything in the repository stays MIT **except** `data/mbma_naproxen.csv`, which carries
+  CC BY-NC 4.0 — so commercial use of that file is not granted. The exception is recorded in the
   root `LICENSE`, in `data/mbma_naproxen.LICENSE`, and in the data README, and `Cargo.toml` now
   excludes the files so the crate published to crates.io is uniformly MIT. The data itself is
   unchanged but for one digit: the tutorial's precomputed `WP / WPSE` column stores 7 decimals, and
