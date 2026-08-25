@@ -66,10 +66,29 @@ use crate::types::{CompiledModel, Subject};
 /// take an analytic outer gradient against an FD inner — the scope split the ODE
 /// provider forbids for the same reason.
 ///
-/// Raising it is cheaper here than there (no integrator is monomorphised behind
-/// these walks, only a bytecode readout eval), but it must be raised *together*
-/// with `MAX_ODE_AXES` and its four tables, never alone.
-const MAX_ALGEBRAIC_AXES: usize = MAX_ODE_AXES;
+/// It is a **separate constant on purpose**, initialised to `MAX_ODE_AXES` rather
+/// than spelled as it: the coupling is a real constraint today, but it is one
+/// direction of dependency, and raising this cap should never be confused with
+/// raising the ODE one (which drags four `disp!` ladders and the whole integrator
+/// stack with it).
+///
+/// **Do not raise it.** Measured per gradient evaluation on a compartment-free
+/// model (8 observations, one subject, release build):
+///
+/// | axes | analytic | FD of the predictor | ratio |
+/// |---|---|---|---|
+/// | 5  | 5.6 µs   | 4.7 µs  | 1.2× |
+/// | 14 | 28.1 µs  | 10.8 µs | 2.6× |
+/// | 24 | 141.8 µs | 26.6 µs | 5.3× |
+///
+/// `Dual2<M>` is O(M²) while the prediction it differentiates is a single scalar
+/// expression per row, so the jet loses to finite differences here and loses
+/// faster the wider it gets — the opposite of the ODE case, where one integration
+/// dominates any number of dual lanes. The cap is therefore not a performance
+/// cliff to be pushed back; past it, FD is the better route anyway. (Whether the
+/// crossover means these models should prefer FD *below* the cap too is a real
+/// question, but it is a change of default, not a constant — see the follow-up.)
+pub(crate) const MAX_ALGEBRAIC_AXES: usize = MAX_ODE_AXES;
 
 /// The two programs a compartment-free model's sensitivities are built from: the
 /// individual-parameter program (`∂p/∂(θ,η)`) and the readout program (`∂y/∂p`).

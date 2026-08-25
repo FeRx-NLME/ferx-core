@@ -527,6 +527,83 @@ fn algebraic_iov_model_reports_analytic() {
     assert!(!supported(&model));
 }
 
+/// The reported gradient method must match the route actually taken, in every
+/// combination — the drift #637 exists to prevent is the *report* going stale, not
+/// the route. Asserted through `build_info`, which is what the fit persists and
+/// what a user reads, rather than through the predicates it wraps.
+#[test]
+fn build_info_reports_the_route_the_model_takes() {
+    use crate::build_info::{gradient_method_inner, gradient_method_outer, GradientMethodKind};
+    use crate::types::{EstimationMethod, Optimizer};
+
+    let build = crate::build_info::BUILD_INFO;
+    let report = |m: &crate::types::CompiledModel| {
+        (
+            gradient_method_inner(&build, m),
+            gradient_method_outer(&build, EstimationMethod::FoceI, Optimizer::NloptLbfgs, m),
+        )
+    };
+
+    // BSV only, in scope → analytic on both loops.
+    let bsv = compile(&model_src(
+        "",
+        "",
+        "  y = E0 - EMAX * TIME / (ET50 + TIME)\n",
+    ));
+    assert_eq!(
+        report(&bsv),
+        (GradientMethodKind::Analytic, GradientMethodKind::Analytic),
+        "a compartment-free model in scope is analytic on both loops"
+    );
+
+    // IOV, in scope → still analytic; the stacked walks serve it.
+    let iov = compile(&iov_model_src(
+        "",
+        "",
+        "  y = E0 - EMAX * TIME / (ET50 + TIME)\n",
+    ));
+    assert!(supported_iov(&iov));
+    assert_eq!(
+        report(&iov),
+        (GradientMethodKind::Analytic, GradientMethodKind::Analytic),
+        "kappa does not cost the analytic route"
+    );
+
+    // Past the axis cap → FD on both, and said so at parse.
+    let mut params = String::new();
+    let mut indiv = String::new();
+    let mut terms = String::new();
+    for i in 0..MAX_ALGEBRAIC_AXES {
+        params.push_str(&format!("  theta TVX{i}(0.5, -5.0, 5.0)\n"));
+        indiv.push_str(&format!("  X{i} = TVX{i}\n"));
+        terms.push_str(&format!(" + X{i}"));
+    }
+    let wide = compile(&model_src(
+        &params,
+        &indiv,
+        &format!("  y = E0 - EMAX * TIME / (ET50 + TIME){terms}\n"),
+    ));
+    assert!(wide.n_theta + wide.n_eta > MAX_ALGEBRAIC_AXES);
+    assert_eq!(
+        report(&wide),
+        (
+            GradientMethodKind::FiniteDifferences,
+            GradientMethodKind::FiniteDifferences
+        ),
+        "past the cap the report must say FD, because the route is FD"
+    );
+    let warning = wide
+        .parse_warnings
+        .iter()
+        .find(|w| w.contains("axis cap"))
+        .expect("the cap decline must be announced at parse");
+    assert!(
+        warning.contains(&(wide.n_theta + wide.n_eta).to_string())
+            && warning.contains(&MAX_ALGEBRAIC_AXES.to_string()),
+        "the warning must name both the model's axis count and the cap: {warning}"
+    );
+}
+
 /// A compartment IOV model must not be claimed by this provider.
 #[test]
 fn compartment_iov_models_are_not_claimed() {
@@ -689,4 +766,181 @@ fn a_population_fit_past_the_cap_still_runs() {
     ));
     let preds = crate::predict(&model, &pop, &model.default_params);
     assert!(preds.iter().all(|p| p.pred.is_finite()));
+}
+
+// ── Closed-form anchors: the whole stack, without NONMEM ─────────────────────
+
+/// The objective of a compartment-free model with **no random effects** is a
+/// closed-form sum over rows, so it can be pinned against a value computed by
+/// hand. That anchors the readout, the error model, the weighting and the
+/// objective assembly in one assertion — and unlike every other test here it
+/// cannot be wrong in the same way the code is wrong, because the reference is
+/// arithmetic rather than another code path.
+///
+/// With `n_eta = 0` there is no inner loop and no `log|H|` term, so for an
+/// additive residual
+///
+/// ```text
+///   OFV = Σ_j [ ln(v_j) + (y_j − f_j)² / v_j ],   v_j = σ²
+/// ```
+///
+/// — the Gaussian form with the `ln(2π)` constant dropped, which is NONMEM's
+/// objective-function convention and therefore ferx's. Pinning the constant is
+/// half the point of this test: an OFV that silently gained or lost a `n·ln(2π)`
+/// would still converge to the same estimates and would still look plausible,
+/// while every likelihood-ratio comparison against a NONMEM run would be off by a
+/// term that depends on the number of observations.
+#[test]
+fn algebraic_fixed_effects_only_ofv_matches_a_hand_computed_value() {
+    // No `omega` at all: a naive-pooled fit. `sigma` is an SD, FIXed so the
+    // objective below is evaluated at exactly this value.
+    let src = "[parameters]\n\
+        \x20 theta TVE0(10.0, 0.1, 100.0)\n\
+        \x20 theta TVEMAX(6.0, 0.1, 100.0)\n\
+        \x20 theta TVET50(2.0, 0.01, 100.0)\n\
+        \x20 sigma ADD ~ 0.5 (sd) FIX\n\n\
+        [individual_parameters]\n\
+        \x20 E0   = TVE0\n\
+        \x20 EMAX = TVEMAX\n\
+        \x20 ET50 = TVET50\n\n\
+        [structural_model]\n\
+        \x20 y = E0 - EMAX * TIME / (ET50 + TIME)\n\n\
+        [error_model]\n\
+        \x20 DV ~ additive(ADD)\n";
+    let model = compile(src);
+    assert!(model.is_algebraic());
+    assert_eq!(
+        model.n_eta, 0,
+        "the closed form below assumes no inner loop"
+    );
+
+    // Observations deliberately offset from the prediction by a known amount, so
+    // the residual term is not zero and a sign or scaling error shows up.
+    let obs_times = vec![0.0, 1.0, 2.0, 6.0];
+    let (e0, emax, et50, sd) = (10.0_f64, 6.0_f64, 2.0_f64, 0.5_f64);
+    let offsets = [0.25_f64, -0.5, 0.75, -0.25];
+    let observations: Vec<f64> = obs_times
+        .iter()
+        .zip(&offsets)
+        .map(|(t, d)| e0 - emax * t / (et50 + t) + d)
+        .collect();
+
+    let mut subj = subject(vec![], vec![]);
+    subj.obs_times = obs_times;
+    subj.cens = vec![0; subj.obs_times.len()];
+    subj.obs_cmts = vec![1; subj.obs_times.len()];
+    subj.observations = observations;
+
+    // The objective by hand.
+    let v = sd * sd;
+    let expected: f64 = offsets.iter().map(|d| v.ln() + d * d / v).sum();
+
+    let p = &model.default_params;
+    let nll = crate::stats::likelihood::individual_nll(
+        &model,
+        &subj,
+        &p.theta,
+        &[],
+        &p.omega,
+        &p.sigma.values,
+    );
+    // `individual_nll` returns −log L; the objective is twice that.
+    approx::assert_relative_eq!(2.0 * nll, expected, max_relative = 1e-12);
+}
+
+/// A residual weight of 1 must be **bit-identical** to declaring no weight at all.
+/// The degenerate oracle for the `weight =` wiring (#1029) on this path: it
+/// catches a weight applied to the wrong side, applied twice, or applied as a
+/// variance where it should be an SD — none of which a single weighted model can
+/// distinguish from a correct one.
+#[test]
+fn algebraic_unit_residual_weight_is_identical_to_no_weight() {
+    let model_src_with = |error_line: &str, extra_cov: &str| {
+        format!(
+            "[parameters]\n\
+            \x20 theta TVE0(10.0, 0.1, 100.0)\n\
+            \x20 theta TVEMAX(6.0, 0.1, 100.0)\n\
+            \x20 theta TVET50(2.0, 0.01, 100.0)\n\
+            \x20 omega ETA_E0 ~ 0.09\n\
+            \x20 sigma ADD ~ 0.5 (sd)\n\n\
+            [individual_parameters]\n\
+            \x20 E0   = TVE0 * exp(ETA_E0)\n\
+            \x20 EMAX = TVEMAX\n\
+            \x20 ET50 = TVET50\n\n\
+            [structural_model]\n\
+            \x20 y = E0 - EMAX * TIME / (ET50 + TIME)\n\n\
+            [error_model]\n\
+            {error_line}\n\
+            {extra_cov}"
+        )
+    };
+    let plain = compile(&model_src_with("  DV ~ additive(ADD)", ""));
+    let weighted = compile(&model_src_with(
+        "  DV ~ additive(ADD) weight = WONE",
+        "\n[covariates]\n  WONE continuous\n",
+    ));
+
+    let mut subj = subject(vec![("WONE", 1.0)], vec![]);
+    subj.observations = subj.obs_times.iter().map(|t| 10.0 - 0.5 * t).collect();
+
+    let eta = vec![0.2_f64];
+    let (pp, pw) = (&plain.default_params, &weighted.default_params);
+    let a = crate::stats::likelihood::individual_nll(
+        &plain,
+        &subj,
+        &pp.theta,
+        &eta,
+        &pp.omega,
+        &pp.sigma.values,
+    );
+    let b = crate::stats::likelihood::individual_nll(
+        &weighted,
+        &subj,
+        &pw.theta,
+        &eta,
+        &pw.omega,
+        &pw.sigma.values,
+    );
+    assert_eq!(
+        a, b,
+        "weight = 1 must be bit-identical to no weight (plain {a}, weighted {b})"
+    );
+}
+
+/// The MBMA objective shape specifically: the prediction divided by a per-row
+/// standard error with the residual variance FIXed to 1, so each row enters with
+/// weight `1/SE²`. That is a much more sharply curved individual objective than
+/// the proportional-error models the other parity tests use, and it is the shape
+/// every real MBMA fit has — so the analytic jet is checked against FD on it
+/// directly rather than by extrapolation from the easy case.
+#[test]
+fn algebraic_outer_jet_matches_fd_on_the_weighted_mbma_objective() {
+    let src = "[parameters]\n\
+        \x20 theta TVE0(5.19, 1.0, 20.0)\n\
+        \x20 theta TVEMAX(0.88, -5.0, 20.0)\n\
+        \x20 theta TVET50(0.70, 0.01, 20.0)\n\
+        \x20 omega ETA_E0 ~ 0.627 (sd)\n\
+        \x20 sigma ADD_ERR ~ 1.0 (variance) FIX\n\n\
+        [individual_parameters]\n\
+        \x20 E0   = TVE0 * exp(ETA_E0)\n\
+        \x20 EMAX = TVEMAX\n\
+        \x20 ET50 = TVET50\n\n\
+        [structural_model]\n\
+        \x20 EFF = EMAX * TIME / (TIME + ET50)\n\
+        \x20 y   = (E0 - EFF) / WPSE\n\n\
+        [error_model]\n\
+        \x20 DV ~ additive(ADD_ERR)\n\n\
+        [covariates]\n\
+        \x20 WPSE continuous\n";
+    let model = compile(src);
+    assert!(model.is_algebraic());
+    assert!(supported(&model));
+    // Per-row standard errors spanning an order of magnitude, as a real
+    // literature dataset's do — a constant SE would reduce to a rescaling and
+    // hide a per-row weighting error.
+    let per_obs: Vec<Vec<(&str, f64)>> = [0.11, 0.14, 0.20, 0.35, 0.62, 1.05]
+        .iter()
+        .map(|se| vec![("WPSE", *se)])
+        .collect();
+    check_outer_vs_fd(&model, &subject(vec![("WPSE", 0.11)], per_obs));
 }

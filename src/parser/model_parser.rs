@@ -3172,6 +3172,26 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         model.scaling = scaling;
     }
 
+    // A compartment-free model past the analytic axis cap (#811) routes to finite
+    // differences. That is correct, just slower — but silently slower: nothing else
+    // tells the user, and "my fit got sluggish when I added a covariate effect" is
+    // not a debuggable symptom. Name both numbers so the cause is visible, and say
+    // which direction to move.
+    if is_algebraic {
+        let axes = model.n_theta + model.n_eta + model.n_kappa;
+        let cap = crate::sens::algebraic::MAX_ALGEBRAIC_AXES;
+        if axes > cap {
+            model.parse_warnings.push(format!(
+                "[structural_model]: this model estimates {axes} parameters (theta + eta{}), \
+                 past the {cap}-axis cap of the analytic gradient path, so it falls back to \
+                 finite differences. The fit is correct, only slower. Reduce the number of \
+                 simultaneously estimated parameters, or FIX the ones you are not estimating. \
+                 See issue #811.",
+                if model.n_kappa > 0 { " + kappa" } else { "" },
+            ));
+        }
+    }
+
     // Covariate-selected [error_model] (issue #658): the selector's covariates
     // are required data columns, so register them like scaling covariates.
     if !selector_covariates.is_empty() {

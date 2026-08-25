@@ -21,12 +21,24 @@ use ferx_core::{fit, pk, predict, FitOptions};
 
 mod common;
 
-/// The dummy `clock` state is integrated by RK45, so the twin can only match the
-/// closed-form evaluation to solver tolerance (defaults: abstol 1e-6, reltol 1e-4).
-/// The readout itself is evaluated identically on both sides — the only difference
-/// is that one of them integrated a state it never reads.
-const ATOL: f64 = 1e-6;
-const RTOL: f64 = 1e-6;
+/// # What this twin proves, and what it does not
+///
+/// It proves the **values** agree. It is not evidence about the new sensitivity
+/// kernel: the two sides reach the same number by structurally different routes —
+/// the twin's readout reads a *state* (`clock`, carried through the ODE jet),
+/// while the compartment-free readout reads the `TIME` built-in (`Op::PushTime`,
+/// whose derivative is identically zero). A green twin says nothing about
+/// `∂y/∂θ` or `∂y/∂η`; `Dual2`-vs-FD parity (`src/sens/algebraic_tests.rs`) is the
+/// only oracle for that half.
+///
+/// The tolerance is deliberately tight. The twin integrates, so *some* slack is
+/// needed — but the quantity being compared is an expression evaluation on both
+/// sides, not an integration result, so anything loose enough to absorb a real
+/// disagreement (a dropped term, a parameter read at the wrong occasion) would
+/// make the test worthless. 1e-10 relative is comfortably above the observed
+/// agreement and far below any difference that could matter.
+const ATOL: f64 = 1e-10;
+const RTOL: f64 = 1e-10;
 
 const THETAS_AND_INDIV: &str = r"
 [parameters]
@@ -307,7 +319,7 @@ fn algebraic_iov_matches_the_dummy_ode_twin() {
     assert_eq!(a.len(), d.len());
     for (j, (x, y)) in a.iter().zip(&d).enumerate() {
         assert!(
-            (x - y).abs() <= 1e-6 + 1e-6 * x.abs(),
+            (x - y).abs() <= ATOL + RTOL * x.abs(),
             "obs {j} (t={:.3}): compartment-free {x:.9} vs dummy-ODE {y:.9}",
             subject.obs_times[j]
         );
