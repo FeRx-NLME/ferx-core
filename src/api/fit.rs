@@ -1026,18 +1026,6 @@ fn fit_inner(
     // Emit NLopt / covariance warnings before any work starts.
     accumulated_warnings.extend(nlopt_missing.iter().cloned());
 
-    // Warning-severity option diagnostics. `check_model_options` is consumed twice on
-    // purpose: `first_error` above aborts the fit on an incompatibility, and this
-    // collects the findings that are worth saying but not worth refusing (an option
-    // *combination* the user may well have chosen deliberately). Without this they
-    // would surface only under `ferx check`.
-    for d in check_model_options(model, options)
-        .into_iter()
-        .filter(|d| d.severity != crate::diagnostics::Severity::Error)
-    {
-        accumulated_warnings.push(d.message);
-    }
-
     // Data-dependent warnings: malformed steady-state rows, EVID=3/4 resets
     // under an SDE model, and a negative typical-value lag time. Extracted into
     // `check_model_data_warnings` so `ferx check` reports the same findings;
@@ -1046,10 +1034,14 @@ fn fit_inner(
     for d in check_model_data_warnings(model, population, init_params) {
         accumulated_warnings.push(d.message);
     }
-    // Warning-severity *option* diagnostics (e.g. W_GN_NO_RANDOM_EFFECTS, #1006).
-    // `first_error` above consumes only errors, so without this a warning added to
-    // `check_model_options` is reported by `ferx check` and silently dropped by
-    // `fit()` — the same treatment `check_model_data_warnings` gets, one line up.
+    // Warning-severity *option* diagnostics (e.g. W_GN_NO_RANDOM_EFFECTS, #1006):
+    // the findings worth saying but not worth refusing, since an option *combination*
+    // may well have been chosen deliberately. `first_error` above consumes only
+    // errors, so without this a warning added to `check_model_options` is reported by
+    // `ferx check` and silently dropped by `fit()` — the same treatment
+    // `check_model_data_warnings` gets, one line up. Reuses the `option_diags` already
+    // computed for `first_error`; re-calling `check_model_options` here would emit
+    // every one of these twice.
     for d in option_diags.iter().filter(|d| !d.is_error()) {
         accumulated_warnings.push(d.message.clone());
     }
