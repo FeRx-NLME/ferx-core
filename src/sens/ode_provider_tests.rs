@@ -5843,6 +5843,39 @@ fn ode_provider_lagtime_tvcov_indexed_alag_matches_production() {
     check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
 }
 
+/// The lagged-**infusion** neighbour of #1060. A finite-duration infusion under an
+/// estimated lagtime switches its rate on at the same moving arrival, through
+/// `inject_rate_saltation` rather than the bolus branch — and that call also reads
+/// its PK snapshot from the dose row. The `init(...)` baseline makes the state
+/// non-zero at the rate-on instant, which is the only condition under which the
+/// bare-field half of that boundary term is non-zero, so this is the fixture that
+/// would expose the same defect on the infusion path.
+#[test]
+fn ode_provider_lagtime_tvcov_infusion_rate_on_crosses_covariate_matches_production() {
+    let model = parse_model_string(ONECPT_LAG_INIT_CROSS_ODE).expect("parse");
+    let mut subject = lag_crossing_subject();
+    // amt 100 at rate 50 ⇒ a 2 h window opening at the lagged arrival ≈1.751 and
+    // closing ≈3.751, so the rate-on lands past the `t = 1.5` record and the
+    // window spans the `t = 2` one.
+    subject.doses = vec![DoseEvent::new(1.0, 100.0, 1, 50.0, false, 0.0)];
+    // Widen the weight step across the arrival: the boundary term this fixture
+    // is about scales with the difference between the two fields, and the gentle
+    // 70→76 ramp puts it barely at the harness bound.
+    let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+    subject.obs_covariates[3] = wt(140.0);
+    subject.obs_covariates[4] = wt(150.0);
+    subject.obs_covariates[5] = wt(160.0);
+    assert!(
+        ode_tvcov_supported(&model, &subject),
+        "infusion + lag + TV-cov"
+    );
+    let theta = vec![10.0, 50.0, 0.75, 0.7, 500.0];
+    let eta = vec![0.1, -0.05, 0.07];
+    check_vs_production(&model, &subject, &theta, &eta);
+    check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
+}
+
 /// A TV-cov model whose RHS references the `TAD` (time-after-dose) builtin, so
 /// the event-driven TV-cov walk's `last_dose_eff` / time-anchoring is exercised
 /// — the other TV-cov parity tests use a `t`-independent RHS, leaving the
