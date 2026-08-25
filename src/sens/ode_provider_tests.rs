@@ -5876,6 +5876,397 @@ fn ode_provider_lagtime_tvcov_infusion_rate_on_crosses_covariate_matches_product
     check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
 }
 
+// #1060 review #1: a 2-cpt twin of the crossing fixture with a **second dose** whose
+// infusion window straddles the bolus arrival. `ALAG1` lags compartment 1 only, so the
+// cmt-2 infusion is frozen in absolute time while the bolus arrival moves — the two sides
+// of the arrival therefore differ in their Jacobian but share the forcing, which is exactly
+// the configuration in which the dropped `½(J⁻−J⁺)·f` curvature is visible.
+const ONECPT_IV_LAG_STRADDLE_INF_ODE: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  theta TVP(0.7, 0.05, 5.0)
+  theta TVK21(0.4, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_P  ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * (WT/70)^THETA_WT * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+  K21 = TVK21
+  ALAG1 = TVP * exp(ETA_P)
+[structural_model]
+  ode(obs_cmt=central, states=[central, periph])
+[odes]
+  d/dt(central) = -(CL/V) * central + K21 * periph
+  d/dt(periph)  = -(CL/V) * periph
+[covariates]
+  WT continuous
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+/// Subject shared by the two straddling-forcing fixtures: the #1060 record geometry with a
+/// steeper weight step (70 → 140 at `t = 2`), because the term under test scales with the
+/// difference between the two fields and the gentle 70 → 76 ramp puts it under the harness
+/// bound. Doses are set by each caller.
+fn straddling_forcing_subject() -> Subject {
+    let mut subject = bolus_subject(&[0.0, 0.5, 1.5, 2.0, 4.0, 8.0]);
+    let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+    subject.obs_covariates = vec![
+        wt(70.0),
+        wt(70.0),
+        wt(70.0),
+        wt(140.0),
+        wt(150.0),
+        wt(160.0),
+    ];
+    subject.dose_covariates = vec![wt(70.0), wt(70.0)];
+    subject.covariates.insert("WT".to_string(), 70.0);
+    subject
+}
+
+/// #1060 review #1 — a concurrent forcing that **straddles** the moving arrival belongs in
+/// both one-sided velocities.
+///
+/// `ẋ̈± = J±·(g± + f)` for any forcing `f` active on both sides. `f` cancels in the
+/// first-order jump `(g⁻ − g⁺)`, and while `J⁻ = J⁺` it cancelled in the curvature too —
+/// which is why evaluating `g±` from the bare RHS was invisible for as long as both sides
+/// read the same snapshot. Once they read different ones the leftover `½(J⁻−J⁺)·f` is real:
+/// this fixture missed `∂²f/∂η_LAG²` by 1.9 % (`0.87941` vs `0.89639`) with the bare RHS and
+/// by 50 % before #1060's first-order fix. Here the straddling forcing is **frozen** — a
+/// cmt-2 infusion under an `ALAG1` that lags compartment 1 only — so it does not move with
+/// the boundary at all.
+#[test]
+fn ode_provider_lagtime_tvcov_arrival_straddles_frozen_infusion_matches_production() {
+    let model = parse_model_string(ONECPT_IV_LAG_STRADDLE_INF_ODE).expect("parse");
+    let mut subject = straddling_forcing_subject();
+    // Frozen 4 h infusion into `periph` over [0, 4]; lagged bolus into `central` at t = 1,
+    // arriving ≈1.751 — strictly inside the window and inside the [1.5, 2.0] segment.
+    subject.doses = vec![
+        DoseEvent::new(0.0, 400.0, 2, 100.0, false, 0.0),
+        DoseEvent::new(1.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    assert!(subject.has_tv_covariates());
+    assert!(ode_tvcov_supported(&model, &subject), "must stay analytic");
+    let theta = vec![10.0, 50.0, 0.75, 0.7, 0.4];
+    let eta: Vec<f64> = vec![0.1, -0.05, 0.07];
+    let arrival = 1.0 + theta[3] * eta[2].exp();
+    assert!(
+        arrival > 0.0 + 1e-3 && arrival < 4.0 - 1e-3,
+        "arrival {arrival} must straddle the [0, 4] infusion window, not touch its edges"
+    );
+    check_vs_production(&model, &subject, &theta, &eta);
+    check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
+}
+
+/// Twin of the fixture above with a **co-moving** straddling forcing, and the reason the
+/// membership rule is "straddles", not "is frozen".
+///
+/// Both doses ride the same bare `LAGTIME`, so the infusion window `[lag, 4+lag]` and the
+/// bolus arrival `1+lag` shift together. It is tempting to conclude that a co-moving forcing
+/// should be kept out of the saltation — the neighbouring
+/// `ode_provider_bolus_concurrent_infusion_lagtime_hessian_matches_fd` looks like evidence
+/// for exactly that. It is not: there the infusion *starts* at the arrival, and a window
+/// toggling at the boundary is covered by its own rate saltation at the same event. A
+/// co-moving window that merely straddles is grid-constant either side of the arrival, so it
+/// belongs in `v±` like any frozen one — measured here as `∂²f/∂η_LAG²` `−0.95145` vs FD
+/// `−0.93498` (1.8 %) when it is left out.
+#[test]
+fn ode_provider_lagtime_tvcov_arrival_straddles_comoving_infusion_matches_production() {
+    let model = parse_model_string(ONECPT_IV_LAG_CROSS_ODE).expect("parse");
+    let mut subject = straddling_forcing_subject();
+    subject.doses = vec![
+        DoseEvent::new(0.0, 400.0, 1, 100.0, false, 0.0),
+        DoseEvent::new(1.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let theta = vec![10.0, 50.0, 0.75, 0.7];
+    let eta: Vec<f64> = vec![0.1, -0.05, 0.07];
+    let lag = theta[3] * eta[2].exp();
+    assert!(
+        1.0 + lag > lag + 1e-3 && 1.0 + lag < 4.0 + lag - 1e-3,
+        "arrival must straddle the co-moving window, not toggle at either edge"
+    );
+    assert!(ode_tvcov_supported(&model, &subject));
+    check_vs_production(&model, &subject, &theta, &eta);
+    check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
+}
+
+// #1060 review #9(b): the straddling forcing is a built-in `input_rate` whose kernel reads
+// the PK snapshot (`KA` carries the weight covariate). Unlike a constant infusion rate — the
+// same number on both sides, so it only reaches the curvature — a snapshot-dependent `R_in`
+// makes `v⁻ ≠ v⁺` in the forcing itself, moving the omission into the **first-order** jump.
+const TWOCPT_LAG_STRADDLE_INPUT_RATE_ODE: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  theta TVP(0.7, 0.05, 5.0)
+  theta TVKA(0.8, 0.01, 10.0)
+  theta TVK21(0.4, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_P  ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * (WT/70)^THETA_WT * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+  KA = TVKA * (WT/70)^THETA_WT
+  K21 = TVK21
+  ALAG1 = TVP * exp(ETA_P)
+[structural_model]
+  ode(obs_cmt=central, states=[central, periph])
+[odes]
+  d/dt(central) = -(CL/V) * central + K21 * periph
+  d/dt(periph)  = first_order(ka=KA) - K21 * periph
+[covariates]
+  WT continuous
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+/// Largest relative miss of the analytic `∂²f/∂η²` block against double-FD of the production
+/// predictor, over the elements big enough for a 4-point stencil to resolve. The
+/// assert-shaped [`check_hessian_vs_production_fd`] is the normal tool; this returns the
+/// number instead, for the one fixture that carries a *quantified, issue-tracked* residual
+/// and must fail if it grows rather than merely being exempted.
+fn max_eta_hessian_miss_vs_production_fd(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> f64 {
+    let n_eta = model.n_eta;
+    let base = ode_subject_sensitivities(model, subject, theta, eta).expect("supported");
+    let pred =
+        |e: &[f64], j: usize| -> f64 { compute_predictions_with_tv(model, subject, theta, e)[j] };
+    let h = 1e-4;
+    let mut worst = 0.0_f64;
+    for p in 0..n_eta {
+        for (j, o) in base.obs.iter().enumerate() {
+            for k in 0..n_eta {
+                let shift = |sk: f64, sp: f64| {
+                    let mut e = eta.to_vec();
+                    e[k] += sk * h;
+                    e[p] += sp * h;
+                    e
+                };
+                let fd = (pred(&shift(1.0, 1.0), j)
+                    - pred(&shift(1.0, -1.0), j)
+                    - pred(&shift(-1.0, 1.0), j)
+                    + pred(&shift(-1.0, -1.0), j))
+                    / (4.0 * h * h);
+                // Same `epsilon` gate as the assert-shaped helper: an element whose absolute
+                // miss is under the floor is at the resolution limit of a 4-point stencil,
+                // and its relative miss carries no information.
+                let a = o.d2f_deta2[k * n_eta + p];
+                if (a - fd).abs() > 5e-3 {
+                    worst = worst.max((a - fd).abs() / a.abs().max(fd.abs()));
+                }
+            }
+        }
+    }
+    worst
+}
+
+/// #1060 review #9(b) — a **field-dependent** straddling forcing, and the boundary of what
+/// this PR fixes.
+///
+/// The straddling forcing here is a built-in `first_order` kernel whose `KA` carries the
+/// weight covariate, so unlike a constant infusion rate it takes a *different value* on the
+/// two sides. That moves the omission into the first-order jump `(v⁻ − v⁺)·δ`, which is a
+/// gradient error, not curvature — and the gradient is exact here.
+///
+/// The `∂²f/∂η²` block is **not** exact, by a measured 0.59 %, and the reason is a distinct
+/// term this PR does not carry. `ẋ̈ = ∂f/∂t + J·f` for an explicitly time-dependent field,
+/// and a pointwise `R_in(tad)` is exactly that; carrying the derivation through the
+/// shift-and-flow-back gives a `½(∂f⁻/∂t − ∂f⁺/∂t)·δ²` term alongside the Jacobian ones. It
+/// vanishes when the two sides share a snapshot (every fixture before this one), needs a
+/// `∂R_in/∂tad` primitive that only exists at `tad = 0` today (`rate_dtad_at_zero`), and
+/// applies to all four saltation sites — so it is tracked separately rather than half-landed
+/// here. This bound is the guard: it must not grow, and it becomes
+/// `check_hessian_vs_production_fd` when that term lands.
+#[test]
+fn ode_provider_lagtime_tvcov_arrival_straddles_input_rate_matches_production() {
+    let model = parse_model_string(TWOCPT_LAG_STRADDLE_INPUT_RATE_ODE).expect("parse");
+    assert!(
+        !model.ode_spec.as_ref().unwrap().input_rate.is_empty(),
+        "fixture must carry a built-in input-rate forcing"
+    );
+    let mut subject = straddling_forcing_subject();
+    // Oral dose feeding the `first_order` kernel on `periph` (frozen — `ALAG1` lags
+    // compartment 1 only), plus the lagged bolus into `central`.
+    subject.doses = vec![
+        DoseEvent::new(0.0, 400.0, 2, 0.0, false, 0.0),
+        DoseEvent::new(1.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    assert!(ode_tvcov_supported(&model, &subject));
+    let theta = vec![10.0, 50.0, 0.75, 0.7, 0.8, 0.4];
+    let eta: Vec<f64> = vec![0.1, -0.05, 0.07];
+    check_vs_production(&model, &subject, &theta, &eta);
+    check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    let miss = max_eta_hessian_miss_vs_production_fd(&model, &subject, &theta, &eta);
+    assert!(
+        miss < 8.0e-2,
+        "known `∂f/∂t` residual on the second order grew to {miss:.3e} (was 6.4e-2)"
+    );
+}
+
+/// The control that identifies the residual above. Same straddling `first_order` forcing,
+/// same crossing geometry — but `KA` carries no covariate, so the kernel evaluates
+/// identically on both snapshots and `∂f⁻/∂t = ∂f⁺/∂t`. The `½(∂f⁻/∂t − ∂f⁺/∂t)` term is
+/// then exactly zero and the second order is exact, while `½(J⁻−J⁺)·f` — the term this PR
+/// adds — is still live, because `f` itself is nonzero and the Jacobians still jump. Green
+/// here plus a residual there is what pins the residual's cause to the kernel's snapshot
+/// dependence rather than to the straddling velocities generally.
+#[test]
+fn ode_provider_lagtime_tvcov_arrival_straddles_covariate_free_input_rate_is_exact() {
+    let src =
+        TWOCPT_LAG_STRADDLE_INPUT_RATE_ODE.replace("KA = TVKA * (WT/70)^THETA_WT", "KA = TVKA");
+    let model = parse_model_string(&src).expect("parse");
+    let mut subject = straddling_forcing_subject();
+    subject.doses = vec![
+        DoseEvent::new(0.0, 400.0, 2, 0.0, false, 0.0),
+        DoseEvent::new(1.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    assert!(ode_tvcov_supported(&model, &subject));
+    let theta = vec![10.0, 50.0, 0.75, 0.7, 0.8, 0.4];
+    let eta: Vec<f64> = vec![0.1, -0.05, 0.07];
+    check_vs_production(&model, &subject, &theta, &eta);
+    check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
+}
+
+// #1060 review #9(c)/#4: IOV × estimated lagtime, with the occasion boundary falling between
+// a lagged infusion's arrival and the next record. `pk_snapshot_equal` compares snapshots by
+// VALUE, so at κ̂ = 0 — the inner-BFGS cold start and the first outer iteration — the two
+// sides compare equal while carrying jets on different κ axes.
+const ONECPT_IOV_LAG_INF_ODE: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVP(0.7, 0.05, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_P  ~ 0.04
+  kappa KAPPA_CL ~ 0.02
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+  LAGTIME = TVP * exp(ETA_P)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+/// #1060 review #4/#9(c) — the moving rate boundary must not take a shortcut licensed by a
+/// **value-only** snapshot comparison, because IOV breaks the premise that equal values imply
+/// equal jets.
+///
+/// `pk_snapshot_equal`'s doc scopes its argument to the deterministic non-IOV PK map. Under
+/// IOV each event is seeded with its own occasion's κ, so two snapshots straddling an occasion
+/// boundary are value-equal at `κ̂ = 0` — the inner-BFGS cold start and the first outer
+/// iteration — with jets on different κ axes. Taking the closed form there drops a
+/// `(v⁻−v⁺)·δlag` term whose value is zero (predictions stay exact) and whose jet is not.
+///
+/// Measured before the rate-on boundary stopped consulting that predicate:
+/// `∂²f/∂η_LAG∂κ_g0` analytic `+0.05207` against FD of `predict_iov` `−0.01478` — the wrong
+/// **sign**, 128 % — with every non-lag element exact to 1e-7. Everything about the geometry
+/// is load-bearing: without the prior bolus the state is zero at the arrival and the whole
+/// term vanishes vacuously (the first version of this fixture passed for that reason), and
+/// the occasion boundary sits on an observation record because `predict_iov` is not a valid
+/// oracle at a boundary without one (#931).
+#[test]
+fn ode_provider_iov_lagtime_rate_on_across_occasion_boundary_matches_predict_iov() {
+    let model = parse_model_string(ONECPT_IOV_LAG_INF_ODE).expect("parse");
+    assert_eq!(model.n_kappa, 1);
+    let mut subj = bolus_subject(&[0.5, 1.5, 2.0, 4.0, 8.0]);
+    // A prior bolus leaves residual drug at the second dose's arrival — without it the
+    // state is zero there and the whole field-difference term is vacuously zero. The
+    // lagged 2 h infusion is dosed in occasion 1 and arrives ≈1.751, between the last
+    // occasion-1 record (1.5) and the first occasion-2 record (2.0).
+    subj.doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(1.0, 200.0, 1, 100.0, false, 0.0),
+    ];
+    subj.dose_occasions = vec![1, 1];
+    subj.occasions = vec![1, 1, 2, 2, 2];
+    let groups = crate::stats::likelihood::iov_occasion_groups(&subj);
+    assert_eq!(groups.len(), 2);
+    let theta = vec![10.0, 50.0, 0.7];
+    // κ̂ = 0 on both groups: values equal, jets on different axes.
+    let stacked = vec![0.1, 0.07, 0.0, 0.0];
+    let sens = ode_subject_sensitivities_iov(&model, &subj, &theta, &stacked).expect("analytic");
+    let pred = |st: &[f64], j: usize| -> f64 {
+        let eta_bsv = st[..model.n_eta].to_vec();
+        let kappas: Vec<Vec<f64>> = (0..groups.len())
+            .map(|g| {
+                st[model.n_eta + g * model.n_kappa..model.n_eta + (g + 1) * model.n_kappa].to_vec()
+            })
+            .collect();
+        crate::pk::predict_iov(&model, &subj, &theta, &eta_bsv, &kappas)[j]
+    };
+    let n = stacked.len();
+    // Non-vacuity: κ_g0 must actually move the late observations, or the term under test is
+    // identically zero and the fixture proves nothing.
+    let kappa_g0_effect = sens
+        .obs
+        .iter()
+        .map(|o| o.df_deta[2].abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        kappa_g0_effect > 1e-3,
+        "κ_g0 has no effect on any observation — the fixture would pass vacuously"
+    );
+    let h = 1e-4;
+    for (j, o) in sens.obs.iter().enumerate() {
+        approx::assert_relative_eq!(o.f, pred(&stacked, j), max_relative = 1e-6, epsilon = 1e-9);
+        for k in 0..n {
+            for p in 0..n {
+                let shift = |sk: f64, sp: f64| {
+                    let mut s = stacked.clone();
+                    s[k] += sk * h;
+                    s[p] += sp * h;
+                    s
+                };
+                let fd = (pred(&shift(1.0, 1.0), j)
+                    - pred(&shift(1.0, -1.0), j)
+                    - pred(&shift(-1.0, 1.0), j)
+                    + pred(&shift(-1.0, -1.0), j))
+                    / (4.0 * h * h);
+                approx::assert_relative_eq!(
+                    o.d2f_deta2[k * n + p],
+                    fd,
+                    max_relative = 5e-3,
+                    epsilon = 5e-3
+                );
+            }
+        }
+    }
+}
+
 /// A TV-cov model whose RHS references the `TAD` (time-after-dose) builtin, so
 /// the event-driven TV-cov walk's `last_dose_eff` / time-anchoring is exercised
 /// — the other TV-cov parity tests use a `t`-independent RHS, leaving the
