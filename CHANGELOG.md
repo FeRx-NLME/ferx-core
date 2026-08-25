@@ -129,6 +129,18 @@ section of the SDLC for the versioning policy).
   with no diagnostic from NONMEM (`nonmem_anchor/dose_attr_double_use_{A,B}.ctl`).
 
 ### Fixed
+- **An estimated lagtime whose lagged dose arrival crossed a time-varying covariate change got a
+  silently wrong analytic gradient on ODE models (#1060).** The dose lands at a moving boundary
+  `t + ALAG`, and the walk injects the resulting jump as a saltation. The segment ending at that
+  arrival belongs to the dose record's covariate snapshot and the segment it opens to the next
+  record's, but the injection evaluated *both* sides on the dose record's — so whenever those two
+  records carried different covariates, the post-arrival velocity, its Jacobian and the cross term
+  all used the wrong parameters. Predictions were unaffected (the correction is derivative-only),
+  so a FOCE/FOCEI fit converged quietly to the wrong optimum with nothing in the output to look
+  at; against finite differences of the production predictor the error reached 300× on `∂f/∂η` and
+  23× on the Hessian. The same boundary under a finite-duration **infusion** carried the matching
+  defect and is fixed with it. Constant-covariate fits, and any fit whose arrivals do not cross a
+  covariate change, are bit-identical to before.
 - **`TIME` in an `init(...)` expression is now rejected instead of silently reading zero (#994).**
   Both init surfaces — `[odes] init(state) = ...` and the analytical `[initial_conditions]
   init(cmt) = ...` — accepted a bare `TIME` (and `time`), while rejecting `Time`, `T`, `TAFD` and
