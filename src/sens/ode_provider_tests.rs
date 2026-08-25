@@ -5978,8 +5978,8 @@ fn ode_provider_lagtime_tvcov_arrival_straddles_frozen_infusion_matches_producti
 /// for exactly that. It is not: there the infusion *starts* at the arrival, and a window
 /// toggling at the boundary is covered by its own rate saltation at the same event. A
 /// co-moving window that merely straddles is grid-constant either side of the arrival, so it
-/// belongs in `v±` like any frozen one — measured here as `∂²f/∂η_LAG²` `−0.95145` vs FD
-/// `−0.93498` (1.8 %) when it is left out.
+/// belongs in `v±` like any frozen one — measured here as `∂²f/∂η_LAG²` `−0.65279` vs FD
+/// `−0.48247` (35 %) when it is left out.
 #[test]
 fn ode_provider_lagtime_tvcov_arrival_straddles_comoving_infusion_matches_production() {
     let model = parse_model_string(ONECPT_IV_LAG_CROSS_ODE).expect("parse");
