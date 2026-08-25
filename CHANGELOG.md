@@ -154,6 +154,24 @@ section of the SDLC for the versioning policy).
   with no diagnostic from NONMEM (`nonmem_anchor/dose_attr_double_use_{A,B}.ctl`).
 
 ### Fixed
+- **An estimated lagtime whose lagged dose arrival crossed a time-varying covariate change got a
+  silently wrong analytic gradient on ODE models (#1060).** The dose lands at a moving boundary
+  `t + ALAG`, and the walk injects the resulting jump as a saltation. The segment ending at that
+  arrival belongs to the dose record's covariate snapshot and the segment it opens to the next
+  record's, but the injection evaluated *both* sides on the dose record's — so whenever those two
+  records carried different covariates, the post-arrival velocity, its Jacobian and the cross term
+  all used the wrong parameters. Individual predictions were unaffected (the correction is
+  derivative-only) — but the FOCEI objective builds its `h` matrix from this same analytic
+  `∂f/∂η`, so the **reported OFV was wrong too**: on a crossing dataset the objective missed
+  NONMEM 7.6.0 by 7.52 units before the fix and by 5e-6 after it, with every EBE reproduced to
+  the printed digits (`nonmem_anchor/tvcov_lag_saltation.ctl`). Against finite differences of the
+  production predictor the gradient error reached 300× and the Hessian 23×. Fixed with it: the
+  matching defect at a finite-duration **infusion**'s lagged rate-on; concurrently active
+  forcings missing from the boundary velocities, which cost a further ~2% of the second order
+  once the two sides read different snapshots; and a value-only snapshot comparison that let an
+  IOV occasion boundary at the rate-on drop a κ jet, giving `∂²f/∂η_LAG∂κ` the wrong sign.
+  Constant-covariate fits, and any fit whose arrivals do not cross a covariate change, are
+  bit-identical to before.
 - **`TIME` in an `init(...)` expression is now rejected instead of silently reading zero (#994).**
   Both init surfaces — `[odes] init(state) = ...` and the analytical `[initial_conditions]
   init(cmt) = ...` — accepted a bare `TIME` (and `time`), while rejecting `Time`, `T`, `TAFD` and

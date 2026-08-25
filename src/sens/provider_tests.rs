@@ -5425,6 +5425,73 @@ fn lagtime_tvcov_walk_matches_fd_of_production() {
     check_full_provider_vs_fd(&model, &subject, &theta, &eta);
 }
 
+// #1060: the ODE twin of the cell above. The closed-form walk carries the lagged
+// arrival as a dual sub-interval length, so its bolus saltation falls out of the
+// flow to all orders; the ODE walk has an `f64` timeline and must inject the
+// saltation explicitly, which is where the covariate snapshot can be — and was —
+// taken from the wrong side of the moving boundary. Running it through this
+// harness rather than the ODE module's own (2e-3) puts the strict 2e-4 gradient
+// bound on the configuration the issue measured.
+const ONECPT_IV_LAG_TVCOV_ODE: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  theta TVP(0.7, 0.05, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_P  ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * (WT/70)^THETA_WT * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+  LAGTIME = TVP * exp(ETA_P)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[covariates]
+  WT continuous
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+/// #1060 under the strict harness: an ODE model whose lagged arrival lands past a
+/// covariate record must match FD of the production predictor to the same 2e-4 /
+/// 3e-3 bounds every other analytic cell is held to. The dose sits at `t = 1` on
+/// the `WT = 70` row and arrives at `1 + 0.7·e^0.07 ≈ 1.751`, inside the segment
+/// the `t = 2` record (`WT = 76`) governs.
+#[test]
+fn ode_lagtime_tvcov_arrival_crosses_covariate_matches_fd_of_production() {
+    let model = parse_model_string(ONECPT_IV_LAG_TVCOV_ODE).expect("parse ODE lag + tvcov");
+    assert!(model.has_lagtime());
+    let subject = tvcov_subject(
+        vec![DoseEvent::new(1.0, 100.0, 1, 0.0, false, 0.0)],
+        &[70.0],
+        &[0.0, 0.5, 1.5, 2.0, 4.0, 8.0],
+        &[70.0, 72.0, 74.0, 76.0, 80.0, 85.0],
+        Vec::new(),
+        Vec::new(),
+        &[],
+    );
+    assert!(subject.has_tv_covariates());
+    let theta = [10.0, 50.0, 0.75, 0.7];
+    let eta = [0.1, -0.05, 0.07];
+    // Non-vacuity: this must be served analytically, or the harness would be
+    // comparing FD against FD and could never fail.
+    assert!(
+        subject_sensitivities(&model, &subject, &theta, &eta).is_some(),
+        "the configuration is in analytic scope (#486) — a decline here would \
+         make the parity check vacuous"
+    );
+    check_full_provider_vs_fd(&model, &subject, &theta, &eta);
+}
+
 /// The inner (`Dual1`, η-only) twin of the walk must agree with the outer `Dual2` walk on
 /// `∂f/∂η` — the two are separate monomorphizations of the same moving-boundary logic, and
 /// a lag jet threaded into one but not the other would silently split inner/outer scope.
