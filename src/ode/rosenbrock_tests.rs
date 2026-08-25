@@ -1186,3 +1186,29 @@ fn vern7_carries_its_end_derivative_across_an_accepted_dense_step() {
          re-evaluate it"
     );
 }
+
+/// The Rosenbrock helpers spell out their non-Rosenbrock arms rather than ending in a
+/// catch-all, so that adding an [`OdeMethod`] fails to compile here instead of routing silently
+/// into this stepper. `Auto` joined those arms in #978 — every driver resolves it to a concrete
+/// method first, so reaching them means a caller bypassed the resolution, and the contract is
+/// that it fails loudly at the boundary rather than integrating something wrong.
+#[test]
+fn the_rosenbrock_stepper_refuses_auto_loudly() {
+    for build in [
+        || {
+            let _ = RosStepper::<f64>::new(1, OdeMethod::Auto);
+        },
+        || {
+            let _ = method_gamma(OdeMethod::Auto);
+        },
+        || {
+            let _ = method_err_exp(OdeMethod::Auto);
+        },
+    ] {
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(build));
+        assert!(
+            caught.is_err(),
+            "a non-Rosenbrock method must not be accepted by the Rosenbrock stepper"
+        );
+    }
+}

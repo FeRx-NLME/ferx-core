@@ -1438,6 +1438,134 @@ mod tests {
         assert_relative_eq!(u[0], 10.0, epsilon = 1e-6);
     }
 
+    /// The event-time driver honours `auto` too (#978), and has to: it is the path a
+    /// joint PK-TTE fit locates event times on, and a stiff hazard system left on the explicit
+    /// method exhausts its step budget and comes back `Failed` — which the TTE layer must not
+    /// launder into a censored subject.
+    ///
+    /// `d/dt(fast) = -1e4·(fast − 1)` relaxes to 1 on a 1e-4 timescale, so the accumulator
+    /// `d/dt(chz) = fast` grows at ~1 per unit and crosses 4.0 just after t = 4. RK45 needs
+    /// `dt < 2e-4` for stability, so it runs out of its default 10 000 steps around t = 2 —
+    /// before the crossing. (The threshold is 4 and not 2 for exactly that reason: at 2 the
+    /// explicit method reaches the crossing on its last few steps and the contrast vanishes.)
+    #[test]
+    fn until_threshold_escalates_a_stiff_system_and_finds_the_crossing() {
+        let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
+            du[0] = -1.0e4 * (u[0] - 1.0);
+            du[1] = u[0];
+        };
+
+        let mut u = [0.0, 0.0];
+        let auto = solve_ode_until_threshold(
+            &rhs,
+            &mut u,
+            (0.0, 5.0),
+            &[],
+            &OdeSolverOptions::default(),
+            1,
+            4.0,
+        );
+        match auto {
+            ThresholdCrossing::Crossed(t) => assert_relative_eq!(t, 4.0001, epsilon = 1e-3),
+            other => panic!("expected a crossing under auto, got {other:?}"),
+        }
+
+        // Non-vacuity, and the reason the escalation matters here: the same system on the
+        // explicit method does not merely run slower, it fails outright.
+        let mut u_rk = [0.0, 0.0];
+        let explicit = solve_ode_until_threshold(
+            &rhs,
+            &mut u_rk,
+            (0.0, 5.0),
+            &[],
+            &OdeSolverOptions {
+                method: OdeMethod::Rk45,
+                ..Default::default()
+            },
+            1,
+            4.0,
+        );
+        assert!(
+            matches!(explicit, ThresholdCrossing::Failed(_)),
+            "RK45 was expected to fail on this stiff system, got {explicit:?}"
+        );
+    }
+
+    /// The event-time driver's half of the `auto` guard: an escalation that comes back
+    /// `Failed` is re-run on the explicit method, from the **entry** state (`u` is unspecified
+    /// after a failure, so the retry cannot reuse it).
+    ///
+    /// `d/dt(x) = x²` from `x₀ = 1e6` blows up at `t* = 1e-6`; both methods fail, which is the
+    /// point — what is under test is that the retry *happens*, not that it rescues this
+    /// system. Counting right-hand-side calls is what makes that observable: a failure the
+    /// guard did not retry would cost one solve, not two.
+    #[test]
+    fn until_threshold_retries_a_failed_escalation_on_the_explicit_method() {
+        use std::cell::Cell;
+        let calls = Cell::new(0usize);
+        let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
+            calls.set(calls.get() + 1);
+            du[0] = u[0] * u[0];
+            du[1] = u[0];
+        };
+        let entry = [1.0e6, 0.0];
+
+        let mut u = entry;
+        let named = solve_ode_until_threshold(
+            &rhs,
+            &mut u,
+            (0.0, 1.0),
+            &[],
+            &OdeSolverOptions {
+                method: OdeMethod::Rodas4,
+                ..Default::default()
+            },
+            1,
+            f64::INFINITY,
+        );
+        assert!(matches!(named, ThresholdCrossing::Failed(_)), "{named:?}");
+        let named_calls = calls.get();
+
+        calls.set(0);
+        let mut u = entry;
+        let auto = solve_ode_until_threshold(
+            &rhs,
+            &mut u,
+            (0.0, 1.0),
+            &[],
+            &OdeSolverOptions::default(),
+            1,
+            f64::INFINITY,
+        );
+        assert!(matches!(auto, ThresholdCrossing::Failed(_)), "{auto:?}");
+        assert!(
+            calls.get() > named_calls,
+            "auto spent {} right-hand-side calls against rodas4's {named_calls} — the failed \
+             escalation was not retried on the explicit method",
+            calls.get()
+        );
+    }
+
+    /// `Auto` never reaches [`make_stepper`] through a driver — every one resolves it first —
+    /// but the arm exists so a caller that builds a stepper straight from the options keeps
+    /// integrating instead of panicking inside a fit's worker thread. Pin that it really is the
+    /// explicit stepper and not a placeholder.
+    #[test]
+    fn make_stepper_falls_back_to_the_explicit_stepper_for_auto() {
+        let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| du[0] = -0.3 * u[0];
+        let opts = OdeSolverOptions::default();
+        let u = [2.0];
+
+        let mut from_auto = make_stepper::<f64>(1, OdeMethod::Auto);
+        let mut from_rk45 = make_stepper::<f64>(1, OdeMethod::EXPLICIT_FALLBACK);
+        let e_auto = from_auto.attempt(&rhs, &u, &[], 0.0, 0.1, &opts);
+        let e_rk45 = from_rk45.attempt(&rhs, &u, &[], 0.0, 0.1, &opts);
+
+        assert_eq!(e_auto, e_rk45);
+        assert_eq!(from_auto.u_new(), from_rk45.u_new());
+        assert_eq!(from_auto.err_exp(), from_rk45.err_exp());
+    }
+
     /// A decreasing monitored state (negative rate ⇒ negative hazard) is not a
     /// censor — it invalidates the crossing argument and must be a hard failure.
     #[test]
