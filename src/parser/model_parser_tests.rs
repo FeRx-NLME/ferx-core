@@ -18228,3 +18228,362 @@ fn test_split_weight_modifier_peels_a_kappa_declaration() {
     assert_eq!(stmt, "kappa KAPPA_EMAX ~ 2.0 (sd)");
     assert_eq!(w.as_deref(), Some("NARM"));
 }
+
+// ── #811: compartment-free (`$PRED`-equivalent) structural model ─────────────
+
+/// A compartment-free model: `[structural_model]` holds the equation itself, with
+/// no `pk` / `ode` line anywhere. `equations` is the block body.
+fn algebraic_model_str(equations: &str) -> String {
+    format!(
+        "[parameters]\n\
+        \x20 theta TVE0(10.0, 0.1, 100.0)\n\
+        \x20 theta TVEMAX(5.0, 0.1, 100.0)\n\
+        \x20 theta TVET50(2.0, 0.01, 100.0)\n\
+        \x20 omega ETA_E0 ~ 0.09\n\
+        \x20 sigma PROP ~ 0.02 (sd)\n\n\
+        [individual_parameters]\n\
+        \x20 E0   = TVE0 * exp(ETA_E0)\n\
+        \x20 EMAX = TVEMAX\n\
+        \x20 ET50 = TVET50\n\n\
+        [structural_model]\n\
+        {equations}\n\
+        [error_model]\n\
+        \x20 DV ~ proportional(PROP)\n"
+    )
+}
+
+/// The base case: an Emax time-course with no compartments at all parses, and is
+/// recognised as compartment-free — no ODE spec, a Form C readout whose state
+/// layout is empty.
+#[test]
+fn algebraic_structural_model_parses_without_pk_or_ode() {
+    let model = parse_model_string(&algebraic_model_str(
+        "  y = E0 - EMAX * TIME / (ET50 + TIME)\n",
+    ))
+    .expect("a compartment-free [structural_model] parses");
+    assert!(
+        model.is_algebraic(),
+        "must be recognised as compartment-free"
+    );
+    assert!(model.ode_spec.is_none(), "no ODE spec");
+    let ar = model
+        .analytic_readout
+        .as_ref()
+        .expect("the equation compiles to a Form C readout");
+    assert!(
+        ar.state_names.is_empty(),
+        "a compartment-free readout reconstructs no amounts, got {:?}",
+        ar.state_names
+    );
+}
+
+/// Named intermediates (#1030) work here for free: the equations are moved into
+/// the Form C pipeline verbatim, so a `y` built from bindings above it compiles to
+/// the same readout as the inlined form.
+#[test]
+fn algebraic_structural_model_accepts_named_intermediates() {
+    let model = parse_model_string(&algebraic_model_str(
+        "  EFF = EMAX * TIME / (ET50 + TIME)\n  y   = E0 - EFF\n",
+    ))
+    .expect("intermediates are usable in a compartment-free model");
+    assert!(model.is_algebraic());
+    assert!(
+        model
+            .analytic_readout
+            .as_ref()
+            .is_some_and(|ar| ar.program.is_some()),
+        "the readout carries a sensitivity program"
+    );
+}
+
+/// The block must produce a prediction. Intermediates alone are not a model, and
+/// the diagnostic says so rather than surfacing the Form C pipeline's downstream
+/// "a binding no entry reads".
+#[test]
+fn algebraic_structural_model_requires_a_y_entry() {
+    let err = expect_parse_err(&algebraic_model_str("  EFF = EMAX * TIME\n"));
+    assert!(
+        err.contains("[structural_model]") && err.contains("`y = <expr>`"),
+        "got: {err}"
+    );
+}
+
+/// `obs_scale` divides a *built-in* prediction; a compartment-free model has none.
+#[test]
+fn algebraic_structural_model_rejects_obs_scale() {
+    let err = expect_parse_err(&algebraic_model_str("  y = E0\n  obs_scale = 1000\n"));
+    assert!(
+        err.contains("obs_scale") && err.contains("compartment-free"),
+        "got: {err}"
+    );
+}
+
+/// A compartment amount cannot be referenced when there are no compartments. The
+/// message names the real problem (no compartment model declared) instead of
+/// falling through to "undefined identifier" or a silent covariate lookup.
+#[test]
+fn algebraic_structural_model_rejects_a_compartment_reference() {
+    for name in ["central", "depot", "peripheral"] {
+        let err = expect_parse_err(&algebraic_model_str(&format!("  y = {name} / E0\n")));
+        assert!(
+            err.contains(name) && err.contains("no compartments"),
+            "for `{name}`, got: {err}"
+        );
+    }
+}
+
+/// The equation lives in `[structural_model]`, so its diagnostics must say so —
+/// the `[scaling]` pipeline that parses it after the desugaring must not leak the
+/// block name the user never wrote.
+#[test]
+fn algebraic_structural_model_diagnostics_name_the_structural_block() {
+    let err = expect_parse_err(&algebraic_model_str("  y = E0\n  y = EMAX\n"));
+    assert!(
+        err.contains("[structural_model]"),
+        "diagnostic must name [structural_model], got: {err}"
+    );
+    assert!(
+        !err.contains("[scaling]"),
+        "diagnostic must not name a block the user never wrote, got: {err}"
+    );
+}
+
+/// A name the model does not define is a **data column** — that is how an MBMA
+/// equation reaches the per-row covariates it regresses on (arm size, dose,
+/// study-level flags). It must land in `referenced_covariates` so the data check
+/// requires it, exactly as in `[scaling]`.
+#[test]
+fn algebraic_structural_model_registers_free_names_as_covariates() {
+    let model = parse_model_string(&algebraic_model_str("  y = E0 + EMAX * DOSE\n"))
+        .expect("an undeclared name in the equation is a data column");
+    assert!(
+        model.referenced_covariates.iter().any(|c| c == "DOSE"),
+        "`DOSE` must become a required data column, got {:?}",
+        model.referenced_covariates
+    );
+}
+
+/// `[scaling]` alongside a compartment-free model would either declare a second
+/// readout or divide the equation's own output.
+#[test]
+fn algebraic_structural_model_rejects_a_scaling_block() {
+    let src = format!(
+        "{}\n[scaling]\n  y = E0\n",
+        algebraic_model_str("  y = E0 - EMAX\n")
+    );
+    let err = expect_parse_err(&src);
+    assert!(
+        err.contains("[scaling]") && err.contains("compartment-free"),
+        "got: {err}"
+    );
+}
+
+/// Blocks that only mean something with compartments underneath are rejected by
+/// name, rather than silently ignored (`[odes]` is only read when
+/// `[structural_model]` declares `ode(...)`).
+#[test]
+fn algebraic_structural_model_rejects_compartment_only_blocks() {
+    for (block, body) in [
+        ("odes", "  d/dt(central) = -0.1 * central\n"),
+        ("initial_conditions", "  init(central) = 1.0\n"),
+        ("diffusion", "  central ~ 0.1\n"),
+    ] {
+        let src = format!(
+            "{}\n[{block}]\n{body}",
+            algebraic_model_str("  y = E0 - EMAX\n")
+        );
+        let err = expect_parse_err(&src);
+        assert!(
+            err.contains(&format!("[{block}]")) && err.contains("compartment-free"),
+            "for [{block}], got: {err}"
+        );
+    }
+}
+
+/// A mistyped disposition used to parse: the `pk` matcher was unanchored, so
+/// `zpk one_cpt_iv(...)` matched `pk one_cpt_iv(...)` inside it and the model
+/// silently became a one-compartment IV fit (#811).
+#[test]
+fn structural_model_rejects_a_mistyped_pk_line() {
+    let err = expect_parse_err(&algebraic_model_str(
+        "  zpk one_cpt_iv(cl=E0, v=EMAX)\n  y = E0\n",
+    ));
+    assert!(
+        err.contains("unrecognized line") && err.contains("zpk"),
+        "got: {err}"
+    );
+}
+
+/// Every line in the block is now classified, so a stray one errors instead of
+/// being dropped — before #811 the scan returned on the first `pk` match and
+/// discarded the rest of the block without a word.
+#[test]
+fn structural_model_rejects_a_stray_line_next_to_a_pk_model() {
+    let src = "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n\
+        \n[individual_parameters]\n  CL = TVCL\n  V = TVV\n\
+        \n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n  this is not a directive\n\
+        \n[error_model]\n  DV ~ additive(1.0)\n";
+    let err = expect_parse_err(src);
+    assert!(err.contains("unrecognized line"), "got: {err}");
+}
+
+/// A readout on top of a compartment model belongs in `[scaling]`; mixing the two
+/// forms in one block is ambiguous about which one is the model.
+#[test]
+fn structural_model_rejects_mixing_a_compartment_model_with_an_equation() {
+    let src = "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n\
+        \n[individual_parameters]\n  CL = TVCL\n  V = TVV\n\
+        \n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n  y = central / V\n\
+        \n[error_model]\n  DV ~ additive(1.0)\n";
+    let err = expect_parse_err(src);
+    assert!(
+        err.contains("cannot mix") && err.contains("[scaling]"),
+        "got: {err}"
+    );
+}
+
+/// Two dispositions in one block used to be silently resolved as "first one wins".
+#[test]
+fn structural_model_rejects_two_disposition_lines() {
+    let src = "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n\
+        \n[individual_parameters]\n  CL = TVCL\n  V = TVV\n\
+        \n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n  pk one_cpt_oral(cl=CL, v=V, ka=CL)\n\
+        \n[error_model]\n  DV ~ additive(1.0)\n";
+    let err = expect_parse_err(src);
+    assert!(err.contains("more than one structural model"), "got: {err}");
+}
+
+/// An empty `[structural_model]` is a model that predicts nothing. Block
+/// extraction records a block only once it has a content line, so an empty one is
+/// indistinguishable from an absent one and reports as missing — which is the
+/// same instruction to the user. Pinned so the #811 classifier, which has its own
+/// "is empty" arm for a block that reaches it with no classifiable line, cannot
+/// quietly take over this case with a worse message. (A TTE-only model omits the
+/// block entirely, which is a different, valid case.)
+#[test]
+fn structural_model_rejects_an_empty_block() {
+    let src = "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n\
+        \n[individual_parameters]\n  CL = TVCL\n\
+        \n[structural_model]\n\
+        \n[error_model]\n  DV ~ additive(1.0)\n";
+    let err = expect_parse_err(src);
+    assert!(
+        err.contains("Missing [structural_model] block"),
+        "got: {err}"
+    );
+}
+
+/// A compartment-free model lays its parameters out like an ODE model — every
+/// individual parameter gets a slot from the full `MAX_PK_PARAMS` layout — so it
+/// is not bound by the handful of spare slots an analytical Form C readout draws
+/// from. This is what lets an MBMA-style model carry dozens of fixed effects.
+#[test]
+fn algebraic_structural_model_allows_many_readout_parameters() {
+    // Well past the `0..=PK_IDX_MTT` spare region an analytical readout is
+    // confined to (at most 11 slots, and fewer once a closed form takes its own).
+    const N: usize = 40;
+    let mut params = String::new();
+    let mut indiv = String::new();
+    let mut terms: Vec<String> = Vec::new();
+    for i in 0..N {
+        params.push_str(&format!("  theta TV{i}(1.0, 0.01, 100.0)\n"));
+        indiv.push_str(&format!("  P{i} = TV{i}\n"));
+        terms.push(format!("P{i}"));
+    }
+    let src = format!(
+        "[parameters]\n{params}  sigma PROP ~ 0.02 (sd)\n\n\
+        [individual_parameters]\n{indiv}\n\
+        [structural_model]\n  y = {}\n\n\
+        [error_model]\n  DV ~ proportional(PROP)\n",
+        terms.join(" + ")
+    );
+    let model = parse_model_string(&src)
+        .expect("a compartment-free model is not bound by the analytical spare-slot region");
+    assert!(model.is_algebraic());
+}
+
+/// A bare `THETA(i)` / `ETA(k)` in the equation must ride the #486 desugaring:
+/// the parser appends a synthetic individual parameter and rewrites the reference
+/// to it, so the readout stays dual-evaluable and keeps the analytic gradient.
+///
+/// The synthetics are appended on the ODE-layout path (which a compartment-free
+/// model takes), but the *acceptance list* was then overwritten with the analytical
+/// allocator's empty result — so the reference was never rewritten, the readout
+/// reported `dual_evaluable = false`, and the model silently dropped to finite
+/// differences while carrying a warning blaming the readout's shape.
+#[test]
+fn algebraic_structural_model_desugars_a_bare_theta_and_eta() {
+    let src = "[parameters]\n\
+        \x20 theta TVE0(10.0, 0.1, 100.0)\n\
+        \x20 theta TVSLOPE(0.5, -5.0, 5.0)\n\
+        \x20 omega ETA_E0 ~ 0.09\n\
+        \x20 sigma PROP ~ 0.02 (sd)\n\n\
+        [individual_parameters]\n\
+        \x20 E0 = TVE0 * exp(ETA_E0)\n\n\
+        [structural_model]\n\
+        \x20 y = E0 + TVSLOPE * TIME + ETA_E0\n\n\
+        [error_model]\n\
+        \x20 DV ~ proportional(PROP)\n";
+    let model = parse_model_string(src).expect("a bare theta/eta in the equation parses");
+    assert!(model.is_algebraic());
+    let program = model
+        .analytic_readout
+        .as_ref()
+        .and_then(|ar| ar.program.as_ref())
+        .expect("the equation compiles to a readout program");
+    assert!(
+        program.is_dual_evaluable(),
+        "a desugared THETA/ETA must leave the readout dual-evaluable — otherwise the \
+         model loses its analytic gradient"
+    );
+    assert!(
+        !model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("finite-difference")),
+        "no FD-fallback warning should be emitted, got {:?}",
+        model.parse_warnings
+    );
+    assert!(
+        crate::sens::algebraic::supported(&model),
+        "and the analytic walks must actually serve it"
+    );
+    // Exactly one synthetic per referenced θ/η. The append runs on the ODE-layout
+    // path a compartment-free model takes; a second append from the analytical
+    // allocator would double them and silently consume two PK slots each.
+    let synths: Vec<&String> = model
+        .indiv_param_names
+        .iter()
+        .filter(|n| n.starts_with(READOUT_SYNTH_PREFIX))
+        .collect();
+    assert_eq!(
+        synths.len(),
+        2,
+        "one synthetic for TVSLOPE and one for ETA_E0, got {synths:?}"
+    );
+}
+
+/// A compartment name is rejected in the equation because the model has no
+/// compartments — but a parameter the user *declared* with that name is not a
+/// compartment reference at all, and the rejection's own advice ("define it in
+/// [individual_parameters]") is what they already did.
+#[test]
+fn algebraic_structural_model_accepts_a_declared_parameter_named_like_a_compartment() {
+    for name in ["central", "depot", "periph"] {
+        let src = format!(
+            "[parameters]\n\
+            \x20 theta TVE0(10.0, 0.1, 100.0)\n\
+            \x20 sigma PROP ~ 0.02 (sd)\n\n\
+            [individual_parameters]\n\
+            \x20 {name} = TVE0\n\n\
+            [structural_model]\n\
+            \x20 y = {name} * 2\n\n\
+            [error_model]\n\
+            \x20 DV ~ proportional(PROP)\n"
+        );
+        let model = parse_model_string(&src).unwrap_or_else(|e| {
+            panic!("`{name}` is a declared individual parameter here, not a compartment: {e}")
+        });
+        assert!(model.is_algebraic());
+    }
+}
