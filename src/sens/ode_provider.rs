@@ -4966,7 +4966,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             // scan. Falling back to the dose row is provably right: it is also what
             // `last_params` becomes at the end of this branch, so a later param-less
             // boundary agrees with it.
-            let post_params = || post_snapshot(p, t_event).unwrap_or(&pk_at_dose[idx]);
+            let arrival_post_params = || post_snapshot(p, t_event).unwrap_or(&pk_at_dose[idx]);
             // Steady-state (SS=1) dose: load the compartments with the infinite-past
             // pulse train's trough (dual equilibration carries `∂SS/∂(θ,η)`), replacing
             // the running state, *before* the SS dose's own pulse is applied below
@@ -5058,7 +5058,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                             // snapshot the bolus/rate-on saltations need, so it shares their
                             // lookahead rather than re-scanning the timeline for itself
                             // (#1060 review #5/#7).
-                            let onset_params: &[T] = post_params();
+                            let onset_params: &[T] = arrival_post_params();
                             let prep_onset = prep_for(onset_params);
                             let mut onset = T::from_f64(0.0);
                             // Onset **slope** `∂Δr/∂tad` (#880), summed over the same forcings
@@ -5207,10 +5207,11 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                             // entirely (`cmt_raw() >= 1`, mirrored in `boundary_velocity`),
                             // so there is no rate boundary here to differentiate — injecting
                             // one would give the gradient a jump the trajectory never had
-                            // (#1060 review #11). Unreachable from a validated call; the
-                            // walk/production divergence it exposes is tracked separately.
+                            // (#1060 review #11). Unreachable from a validated call; that the
+                            // walk skips it at all while production's `active_infusions`
+                            // delivers it — a *value* divergence — is tracked in #1077.
                             if d.cmt_raw() >= 1 {
-                                let post_params = post_params();
+                                let post_params = arrival_post_params();
                                 let prep_post = prep_for(post_params);
                                 // Strict membership (#1060 review #2): only forcings that
                                 // genuinely straddle this instant belong in both velocities.
@@ -5310,7 +5311,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                         // This is the same post-side lookahead the rate-on onset (#880) and
                         // the rate-off boundary (#653) already carry; the bolus arrival was
                         // the last saltation without one.
-                        let post_params = post_params();
+                        let post_params = arrival_post_params();
                         let params = &pk_at_dose[idx];
                         let lag = params[dose_lag_slot[idx]];
                         let dlag = jet_only(lag);
@@ -5369,17 +5370,22 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                         // segment's snapshot, exactly as the segment integration builds
                         // them — but only when that snapshot is a different object;
                         // otherwise reuse this event's prep rather than rebuilding it on
-                        // every dose of every provider evaluation. Pointer identity, not
-                        // `pk_snapshot_equal`: `prepare_dual` reads the full duals, so
-                        // value equality would not license the reuse.
+                        // every dose of every provider evaluation. Slice identity, not
+                        // `pk_snapshot_equal`: `prepare_dual` reads the full duals, so value
+                        // equality would not license the reuse. The length is part of the
+                        // identity test because two distinct *empty* slices can share a
+                        // dangling pointer (a PK snapshot is never empty, but the idiom
+                        // should not depend on that).
                         let post_prep_owned: Vec<PreparedInputRate<T>>;
-                        let post_prep: &[PreparedInputRate<T>] =
-                            if std::ptr::eq(params.as_ptr(), post_params.as_ptr()) {
-                                &prepared_forcings
-                            } else {
-                                post_prep_owned = prep_for(post_params);
-                                &post_prep_owned
-                            };
+                        let post_prep: &[PreparedInputRate<T>] = if params.len()
+                            == post_params.len()
+                            && std::ptr::eq(params.as_ptr(), post_params.as_ptr())
+                        {
+                            &prepared_forcings
+                        } else {
+                            post_prep_owned = prep_for(post_params);
+                            &post_prep_owned
+                        };
                         let g_plus = boundary_velocity(
                             &u,
                             post_params,

@@ -6091,14 +6091,14 @@ fn max_eta_hessian_miss_vs_production_fd(
 /// two sides. That moves the omission into the first-order jump `(v⁻ − v⁺)·δ`, which is a
 /// gradient error, not curvature — and the gradient is exact here.
 ///
-/// The `∂²f/∂η²` block is **not** exact, by a measured 0.59 %, and the reason is a distinct
-/// term this PR does not carry. `ẋ̈ = ∂f/∂t + J·f` for an explicitly time-dependent field,
-/// and a pointwise `R_in(tad)` is exactly that; carrying the derivation through the
-/// shift-and-flow-back gives a `½(∂f⁻/∂t − ∂f⁺/∂t)·δ²` term alongside the Jacobian ones. It
-/// vanishes when the two sides share a snapshot (every fixture before this one), needs a
-/// `∂R_in/∂tad` primitive that only exists at `tad = 0` today (`rate_dtad_at_zero`), and
-/// applies to all four saltation sites — so it is tracked separately rather than half-landed
-/// here. This bound is the guard: it must not grow, and it becomes
+/// The `∂²f/∂η²` block is **not** exact — up to 6.4 % on the late observations — and the
+/// reason is a distinct term this PR does not carry (#1075). `ẋ̈ = ∂f/∂t + J·f` for an
+/// explicitly time-dependent field, and a pointwise `R_in(tad)` is exactly that; carrying the
+/// derivation through the shift-and-flow-back gives a `½(∂f⁻/∂t − ∂f⁺/∂t)·δ²` term alongside
+/// the Jacobian ones. It vanishes when the two sides share a snapshot (every fixture before
+/// this one), needs a `∂R_in/∂tad` primitive that only exists at `tad = 0` today
+/// (`rate_dtad_at_zero`), and applies to all four saltation sites — so it is tracked there
+/// rather than half-landed here. This bound is the guard: it must not grow, and it becomes
 /// `check_hessian_vs_production_fd` when that term lands.
 #[test]
 fn ode_provider_lagtime_tvcov_arrival_straddles_input_rate_matches_production() {
@@ -6122,7 +6122,7 @@ fn ode_provider_lagtime_tvcov_arrival_straddles_input_rate_matches_production() 
     let miss = max_eta_hessian_miss_vs_production_fd(&model, &subject, &theta, &eta);
     assert!(
         miss < 8.0e-2,
-        "known `∂f/∂t` residual on the second order grew to {miss:.3e} (was 6.4e-2)"
+        "#1075's known `∂f/∂t` residual on the second order grew to {miss:.3e} (was 6.4e-2)"
     );
 }
 
