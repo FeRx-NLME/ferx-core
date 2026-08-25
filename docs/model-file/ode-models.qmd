@@ -194,11 +194,12 @@ A one-compartment oral model with saturable (Michaelis-Menten) elimination:
 
 ## Solver Details
 
-ferx-core integrates with an adaptive Dormand-Prince RK45 solver by default:
+ferx-core chooses the stepper from the equations by default, and integrates non-stiff systems
+with an adaptive Dormand-Prince RK45:
 
 | Setting | Value |
 |---------|-------|
-| Method | Explicit Runge-Kutta 4(5) |
+| Method | `auto` — explicit Runge-Kutta 4(5), switching to a stiff method where the system calls for one ([below](#letting-ferx-pick-the-stepper-ode_method-auto)) |
 | Absolute tolerance | 1e-6 |
 | Relative tolerance | 1e-4 |
 | Max steps | 10,000 |
@@ -223,12 +224,12 @@ Set `ode_method` in `[fit_options]` to pick a different stepper:
 
 | `ode_method` | Order | Stages | Stiff? | Use for |
 |---|---|---|---|---|
-| `rk45` (default) | 5(4) | 7 | no | the general-purpose choice; fastest at default tolerances |
+| `rk45` | 5(4) | 7 | no | the general-purpose explicit choice; fastest at default tolerances, and what `auto` selects on a non-stiff system |
 | `vern7` (alias `verner7`) | 7(6) | 10 | no | **accuracy**-limited fits at tight tolerances (`ode_reltol` ≤ 1e-8) |
 | `rosenbrock23` (aliases `ros23`, `ode23s`) | 2(3) | 3 | yes | crude tolerances, rough right-hand sides |
 | `rodas4` | 4(3) | 6 | yes | the stiff workhorse at typical tolerances (1e-6 – 1e-9) |
 | `rodas5p` | 5(4) | 8 | yes | stiff systems at tight tolerances (`ode_reltol` ≤ 1e-9) |
-| `auto` | — | — | decides | letting ferx pick between the two families per integration — see [below](#letting-ferx-pick-the-stepper-ode_method-auto) |
+| `auto` (default) | — | — | decides | letting ferx pick between the two families per integration — see [below](#letting-ferx-pick-the-stepper-ode_method-auto) |
 
 Note the two different axes. The Rosenbrock methods buy **stability**; `vern7` buys **order**.
 Which one helps depends on what is capping your step size, and picking the wrong one costs
@@ -248,11 +249,13 @@ stiffness, not accuracy, is what is capping the step size.
 
 #### Letting ferx pick the stepper (`ode_method = auto`)
 
-`auto` decides for you, from the model rather than from the data:
+`auto` is **the default**, so this section describes what happens to a model that says nothing
+about `ode_method` at all. It decides from the model rather than from the data. To opt out and
+pin a stepper, name one:
 
 ```
 [fit_options]
-  ode_method = auto
+  ode_method = rk45      # or rodas4, rodas5p, rosenbrock23, vern7
 ```
 
 Before each integration, ferx builds the Jacobian `J = ∂f/∂u` of your `[odes]` right-hand
@@ -324,11 +327,20 @@ is stability-limited throughout. The TMDD models are the more interesting case �
 high-dose segments and not on the low-dose ones, which is exactly the situation a single
 per-model choice cannot serve and a per-segment probe can.
 
-`auto` is not the default. The explicit default is right for the overwhelming majority of PK
-models, `auto` adds a Jacobian build and an eigensolve to every segment (~1–5 µs, roughly one
-solver step), and a fixed method is the more predictable thing to have in a control stream you
-intend to publish. Reach for it when you do not know whether a model is stiff, or — as in the
-TMDD case — when the answer differs between subjects.
+**When to pin a method instead.** `auto` is the default because whether a system is stiff is a
+property of the equations, and a user who has to know the answer in advance in order to get a
+tractable fit is being asked the wrong question. Three situations still call for naming one:
+
+- **A model on an unusual time scale**, per the threshold caveat above.
+- **A control stream you intend to publish or archive.** A per-segment decision is reproducible
+  — same model, same data, same parameters, same choice — but it is not readable off the file,
+  and a reviewer cannot tell which stepper produced a number without running it. Naming the
+  method `auto` selected makes the run self-documenting, and costs nothing.
+- **Diagnosing a solver problem.** Pinning removes a variable.
+
+The cost when nothing is stiff is one Jacobian build and one eigensolve per integration segment
+— the same work a single Rosenbrock step attempt does, against a segment that takes tens to
+thousands of steps. Zero-length segments skip it entirely.
 
 #### Which regime am I in?
 

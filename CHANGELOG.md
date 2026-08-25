@@ -20,7 +20,7 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
-- **`ode_method = auto` picks the ODE stepper for you (#978).** An a-priori stiffness probe builds
+- **`ode_method = auto` picks the ODE stepper for you, and is now the default (#978).** An a-priori stiffness probe builds
   the Jacobian `J = ∂f/∂u` of the `[odes]` right-hand side at the state each integration segment
   starts from and reads its fastest mode, `max |Re λ(J)|`; a system above `30` per time unit starts
   on a stiff Rosenbrock method (`rodas4`, or `rodas5p` at `ode_reltol ≤ 1e-8`), everything else stays
@@ -50,6 +50,22 @@ section of the SDLC for the versioning policy).
   [ODE models → What an `init(...)` expression may reference](https://ferx-nlme.github.io/ferx-core/model-file/ode-models.html#init-scope).
 
 ### Changed
+- **ODE models now choose their own stepper by default (#978).** `ode_method` defaults to `auto`
+  instead of `rk45`, so a model that names no stepper is probed per integration segment and runs
+  a stiff method on the segments that need one. A model that *does* name a method is unaffected —
+  naming a stepper still pins it exactly, probe and all. Two consequences worth knowing:
+  predictions on a **stiff** model will change, because they are now produced by a different (and
+  better-conditioned) integrator — on the cyclophosphamide model this is the difference between a
+  fit that converges in 0.7 s and one that spends 827 s without finishing an optimizer iteration;
+  and a model that reports its resolved options will show `auto` where it used to show `rk45`.
+  Non-stiff models keep the explicit stepper and their existing numbers, paying one Jacobian and
+  one eigensolve per segment — the work of a single Rosenbrock step attempt — for the check. Pin
+  `ode_method = rk45` to restore the previous behaviour exactly.
+- **The Rosenbrock steppers are promoted from experimental to beta (#978).** Making `auto` the
+  default puts them on the default path, so leaving them marked experimental would have meant
+  shipping experimental components to every ODE user. The promotion rests on this release's
+  validation: a NONMEM FOCEI anchor on the cyclophosphamide model (ferx 3241.708 vs NONMEM
+  3241.721) and prediction-equivalence tests across all five methods.
 - **A single-endpoint `[error_model]` must now name its sigmas in declaration order (#1001).**
   A one-line `DV ~ ...` error model consumes its sigmas **positionally** from the `[parameters]`
   declaration order. The names written in the arguments were checked for existence and then

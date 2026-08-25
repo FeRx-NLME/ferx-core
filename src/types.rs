@@ -5944,7 +5944,7 @@ impl Default for FitOptions {
             ode_reltol: 1e-4,
             ode_abstol: 1e-6,
             ode_max_steps: 10_000,
-            ode_method: crate::ode::OdeMethod::Rk45,
+            ode_method: crate::ode::OdeMethod::Auto,
             run_covariance_step: true,
             fd_hessian_step: 1e-2,
             covariance_fallback: CovarianceFallback::None,

@@ -186,7 +186,7 @@ pub(crate) fn resolve_method<T: PkNum>(
     }
     match max_abs_re_eigenvalue(rhs, u, params, t) {
         Some(lambda) if lambda >= STIFF_RE_LAMBDA_THRESHOLD => stiff_method_for(opts),
-        _ => OdeMethod::default(),
+        _ => OdeMethod::EXPLICIT_FALLBACK,
     }
 }
 

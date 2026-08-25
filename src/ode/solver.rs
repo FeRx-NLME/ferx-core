@@ -114,8 +114,9 @@ pub type OdeRhsFn = Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync>;
 /// the whole set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OdeMethod {
-    /// Explicit Dormand-Prince RK45 (default) — see the module docs.
-    #[default]
+    /// Explicit Dormand-Prince RK45 — see the module docs. The stepper
+    /// [`Auto`](OdeMethod::Auto) falls back to, and what it selects on any system that is not
+    /// stability-limited; name it to pin it and skip the probe.
     Rk45,
     /// `ode23s`: 3-stage, order 2(3), L-stable. Cheapest stiff option; use at crude
     /// tolerances or when the right-hand side is rough.
@@ -142,10 +143,28 @@ pub enum OdeMethod {
     /// This is a *starting* decision per integrated segment, not a mid-step switch: the
     /// method is still fixed for the duration of one segment, so every guarantee the other
     /// variants carry (dense output, event root-finding, `Dual2` sensitivities) is unchanged.
+    ///
+    /// **The default.** A model that names no `ode_method` is probed, which is the right
+    /// behaviour for the same reason the feature exists: whether a system is stiff is a
+    /// property of the equations, and a user who has to know the answer in advance to get a
+    /// tractable fit is being asked the wrong question. Every model that is *not* stiff keeps
+    /// [`Rk45`](OdeMethod::Rk45) and pays one Jacobian per segment for the privilege; every
+    /// model that is stiff stops being stability-limited without anyone having to notice.
+    #[default]
     Auto,
 }
 
 impl OdeMethod {
+    /// The explicit stepper [`Auto`](OdeMethod::Auto) starts from and falls back to.
+    ///
+    /// Deliberately **not** spelled `OdeMethod::EXPLICIT_FALLBACK`, even though the two coincided
+    /// before `auto` became the default: one of those names means "what a user who said
+    /// nothing gets" and the other means "the method to retreat to when a stiff solve fails",
+    /// and they stopped being the same thing the moment the default changed. Writing
+    /// `default()` for the second would have made the guard fall back to `auto` — i.e. to the
+    /// escalation it is trying to undo.
+    pub const EXPLICIT_FALLBACK: OdeMethod = OdeMethod::Rk45;
+
     /// Parse the `[fit_options] ode_method` token (case-insensitive). Aliases: `ros23` /
     /// `ode23s` for [`Rosenbrock23`](OdeMethod::Rosenbrock23).
     pub fn parse(s: &str) -> Option<Self> {
@@ -194,7 +213,7 @@ impl Default for OdeSolverOptions {
             max_steps: 10000,
             initial_dt: 0.1,
             min_dt: 1e-12,
-            method: OdeMethod::Rk45,
+            method: OdeMethod::Auto,
         }
     }
 }
@@ -846,11 +865,11 @@ pub fn solve_ode_until_threshold(
             opts,
             monitor,
             threshold,
-            OdeMethod::default(),
+            OdeMethod::EXPLICIT_FALLBACK,
         );
     }
     let method = super::stiffness::resolve_method(rhs, u, params, t_span.0, opts);
-    if method == OdeMethod::default() || opts.method != OdeMethod::Auto {
+    if method == OdeMethod::EXPLICIT_FALLBACK || opts.method != OdeMethod::Auto {
         return until_threshold_with(rhs, u, t_span, params, opts, monitor, threshold, method);
     }
     // Escalated by the probe — the same guard `integrate_resolved_g` applies, in the shape
@@ -871,7 +890,7 @@ pub fn solve_ode_until_threshold(
                 opts,
                 monitor,
                 threshold,
-                OdeMethod::default(),
+                OdeMethod::EXPLICIT_FALLBACK,
             )
         }
         ok => ok,
@@ -1080,7 +1099,7 @@ fn integrate_resolved_g<T: PkNum>(
     // no stepper to choose and no reason to pay for a Jacobian. Dosing timelines produce these
     // wherever two events share a time.
     let method = if (t_span.1 - t_span.0).abs() < 1e-15 {
-        OdeMethod::default()
+        OdeMethod::EXPLICIT_FALLBACK
     } else {
         super::stiffness::resolve_method(rhs, u0, params, t_span.0, opts)
     };
@@ -1101,7 +1120,7 @@ fn integrate_resolved_g<T: PkNum>(
 
     // Not an escalation — a named method, or `auto` reading the system as non-stiff. Nothing
     // to guard, and the caller's counters are written directly by the one and only solve.
-    if opts.method != OdeMethod::Auto || method == OdeMethod::default() {
+    if opts.method != OdeMethod::Auto || method == OdeMethod::EXPLICIT_FALLBACK {
         return run(method, stats);
     }
 
@@ -1135,7 +1154,7 @@ fn integrate_resolved_g<T: PkNum>(
     if usable {
         return out;
     }
-    run(OdeMethod::default(), stats)
+    run(OdeMethod::EXPLICIT_FALLBACK, stats)
 }
 
 /// Whether every saved state is finite, reading values only (`T = Dual2` decides identically
@@ -1584,11 +1603,17 @@ mod tests {
         let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
             du[0] = -100.0 * u[0];
         };
+        // RK45 named rather than defaulted: `|Re λ|max = 100` here, so under the `auto`
+        // default (#978) the probe escalates *and* the `min_dt = 1.0` clamp then trips the
+        // guard into a second, explicit solve — which is correct behaviour and would double
+        // every counter this test is asserting on. What is under test is the explicit
+        // driver's clamp bookkeeping.
         let opts = OdeSolverOptions {
             initial_dt: 1.0,
             min_dt: 1.0,
             abstol: 1e-12,
             reltol: 1e-12,
+            method: OdeMethod::Rk45,
             ..OdeSolverOptions::default()
         };
         let mut stats = OdeSolverStats::default();
