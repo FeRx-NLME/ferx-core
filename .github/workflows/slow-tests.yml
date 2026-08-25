@@ -17,11 +17,19 @@ on:
       # `src/ode/solver.rs` is in the list because the EKF in `src/ode/ekf.rs`
       # uses `solve_ode` from it — a change to the integrator otherwise
       # wouldn't trigger this workflow until the next scheduled run.
-      - 'src/api.rs'
+      - 'src/api/**'
       - 'src/estimation/**'
       - 'src/ode/ekf.rs'
       - 'src/ode/predictions.rs'
       - 'src/ode/solver.rs'
+      # The analytic-sensitivity kernels supply the FOCE/FOCEI gradients every
+      # heavy fit consumes (#949): a sens-only change can shift a fit's
+      # objective or its convergence path without touching estimation/.
+      - 'src/sens/**'
+      # Adaptive-dosing simulation drivers (#391) are exercised by the slow
+      # mrgsolve-anchored simulation tests; without this entry an
+      # adaptive-only change never triggers the push leg (#949).
+      - 'src/sim/**'
       # The parser compiles every model the heavy fits run, so a change to model
       # compilation (e.g. the structural-param binding in #261) can shift a fit's
       # objective or break it outright — including the NONMEM-anchored slow test
