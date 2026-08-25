@@ -13,44 +13,31 @@ on:
   push:
     branches: [main]
     paths:
-      # Re-run when a push to `main` touches either the code the heavy fits
-      # exercise or the inputs that decide what they run and what they are
-      # compared against.
+      # One rule, no per-module judgement: re-run when a push to `main` touches
+      # the code compiled into this job's test binaries, the data those tests
+      # read, or the definition of the job itself.
       #
-      # Directories are matched with `**` rather than enumerated file-by-file.
-      # A named file that later moves, splits, or is renamed leaves behind a
-      # glob that matches nothing, and a stale glob is indistinguishable from a
-      # correct one in review — that is exactly how `src/api.rs` stopped firing
-      # this leg after the `src/api/` split, silently, for months (#949).
+      # It is deliberately NOT a curated list of "modules that can move a fit".
+      # That list existed, and it rotted: `src/api.rs` was named here, the file
+      # was split into `src/api/`, and the glob went dead — silently, for
+      # months, because a stale glob and a correct one look identical in review
+      # (#949). Enumerating by module also means every new module is a silent
+      # omission until someone remembers. `src/**` cannot fail either way.
+      #
+      # The narrower list was also measured to be worth nothing: over the last
+      # 252 first-parent commits on `main`, a per-module filter and `src/**`
+      # fire on exactly the same 208 commits. The 44 commits that skip the
+      # suite (docs, CI, CHANGELOG) skip it under both. There is no CI-time
+      # saving to trade the rot risk against.
+      #
       # `.github/workflows/ci.yml` has a `Slow-test path filter` job that fails
-      # if an entry here matches nothing, or if a new top-level `src/` module
-      # appears that is neither listed here nor on that job's explicit
-      # "cannot move a fit" allowlist.
-      - 'Cargo.toml'            # `ci-test` profile + the `slow-tests` / `survival` features
-      - 'data/**'               # fixture CSVs the NONMEM-anchored fits read by literal path
-      - 'src/api/**'
-      - 'src/dosing.rs'         # dose resolution + SS equilibration, shared by pk/ode/sens
-      - 'src/estimation/**'
-      - 'src/frem/**'           # tests/frem_warfarin.rs
-      - 'src/io/**'             # the dataset reader every fit is fed from
-      - 'src/markov/**'         # tests/markov_nonmem.rs
-      - 'src/nn/**'             # tests/nn_fit_convergence.rs
-      - 'src/ode/**'            # integrator + every stepper (rk45, vern7, rosenbrock/rodas)
-                                # and the EKF, which reaches `solve_ode` from `src/ode/solver.rs`
-      - 'src/parser/**'         # compiles every model the heavy fits run, so a change to model
-                                # compilation (e.g. the structural-param binding in #261) can
-                                # shift a fit's objective or break it outright — including the
-                                # NONMEM anchor in tests/structural_param_nonmem.rs
-      - 'src/pk/**'             # the analytic closed forms the analytical anchors integrate
-      - 'src/sens/**'           # exact ∂f/∂η, ∂f/∂θ that every FOCE/FOCEI heavy fit consumes,
-                                # so a sens-only change can shift a fit's objective or its
-                                # convergence path without touching estimation/ at all
-      - 'src/sim/**'            # adaptive-dosing drivers (#391) behind the mrgsolve anchors
-      - 'src/stats/**'          # likelihood + residual_error (dense R, IWRES/CWRES, sigma)
-      - 'src/suggest_start/**'  # tests/suggest_start_comparison.rs
-      - 'src/survival/**'       # hazard closed forms behind the `survival`-gated TTE fits
-      - 'src/types.rs'          # CompiledModel / Population / FitOptions, shared by every fit
-      - 'tests/**'              # the gated fits themselves + the shared tests/common harness
+      # if any entry below matches no tracked file.
+      - '.github/workflows/slow-tests.yml'  # the feature set / cargo command this job runs
+      - 'Cargo.lock'                        # a nlopt/nalgebra/rand bump moves fit numbers and RNG streams
+      - 'Cargo.toml'                        # the `ci-test` profile + the `slow-tests` / `survival` features
+      - 'data/**'                           # fixture CSVs the NONMEM-anchored fits read by literal path
+      - 'src/**'                            # everything linked into the fits
+      - 'tests/**'                          # the gated fits themselves + the shared tests/common harness
 
 env:
   CARGO_TERM_COLOR: always
