@@ -5543,6 +5543,213 @@ fn ode_provider_lagtime_tvcov_matches_production() {
             }
         }
     }
+    // The self-FD Hessian block above differentiates the analytic gradient by
+    // itself, so it cannot see an error that is *consistent* across η — which is
+    // exactly what #1060 was. Anchor the second order against production FD too.
+    check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
+}
+
+// #1060: the same 1-cpt oral model as `ONECPT_ORAL_LAG_TVCOV_ODE`, but the
+// lagtime is large enough that the dose's arrival lands *past* a covariate
+// record. The event-driven walk integrates the segment ending at the arrival
+// under the dose record's PK snapshot and the segment starting there under the
+// next record's (NONMEM end-of-interval, `predictions.rs` `Kind::Dose`), so the
+// bolus saltation's post-side velocity/Jacobian belong to the *later* snapshot.
+// Reading them from the dose snapshot biases `∂f/∂η_LAG` by the ratio of the two
+// covariate-scaled clearances — invisible in the value (the injection is
+// jet-only) and invisible to a self-FD Hessian check.
+// This is issue #1060's own reproducer, transcribed. The dose lands in
+// `central`, whose RHS carries the weight-scaled clearance — that is what makes
+// the wrong-snapshot velocity bite at full strength. (An *oral* variant, where
+// the dose lands in a `-KA * depot` compartment, leaks only a few percent into
+// the Hessian, because the dose compartment's own velocity has no covariate in
+// it; that variant is covered separately below.)
+const ONECPT_IV_LAG_CROSS_ODE: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  theta TVP(0.7, 0.05, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_P  ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * (WT/70)^THETA_WT * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+  LAGTIME = TVP * exp(ETA_P)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[covariates]
+  WT continuous
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+/// Subject for the #1060 crossing geometry, also transcribed from the issue: one
+/// bolus of 100 into `CMT = 1` at `t = 1` carrying `WT = 70`, with observations
+/// at 0 / 0.5 / 1.5 / 2 / 4 / 8 on a rising weight ramp. With `TVP = 0.7` and
+/// `ETA_P = 0.07` the arrival is `1 + 0.7 · e^0.07 ≈ 1.751` — inside the
+/// `[1.5, 2.0]` segment, whose PK snapshot is the `t = 2` record's (`WT = 76`),
+/// not the dose row's (`WT = 70`), and ≥ 0.24 from either break so the FD steps
+/// (1e-6 gradient, 1e-4 Hessian) never move it across one.
+///
+/// The `t = 0` observation is load-bearing for the `init(...)` variant: it makes
+/// the subject's first record precede the dose, so the baseline is seeded at a
+/// covariate snapshot both engines agree on (cf. #1046 — the seed lands at the
+/// first record, not at `t = 0` by fiat).
+fn lag_crossing_subject() -> Subject {
+    let mut subject = bolus_subject(&[0.0, 0.5, 1.5, 2.0, 4.0, 8.0]);
+    subject.doses = vec![DoseEvent::new(1.0, 100.0, 1, 0.0, false, 0.0)];
+    let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+    subject.dose_covariates = vec![wt(70.0)];
+    subject.obs_covariates = vec![wt(70.0), wt(72.0), wt(74.0), wt(76.0), wt(80.0), wt(85.0)];
+    subject.covariates.insert("WT".to_string(), 70.0);
+    subject
+}
+
+/// #1060 row C — ODE + time-varying covariates + IIV on the lagtime, with the
+/// lagged arrival crossing a covariate change.
+///
+/// Before the saltation snapshot fix this failed on `∂f/∂η_LAG` with analytic
+/// `0.34487735` against an FD reference of `0.36681859` — a relative miss of
+/// `0.059815`, which is `1 − (70/76)^0.75 = 0.0598143` to five significant
+/// figures. That is the arithmetic signature of evaluating the post-arrival
+/// velocity under the dose row's `WT = 70` instead of the arrival segment's
+/// `WT = 76`, and it is why this fixture pins the defect rather than merely
+/// exercising the code path. The value stayed exact to 1e-6 throughout — the
+/// injection is jet-only, so nothing in the prediction ever looked wrong.
+#[test]
+fn ode_provider_lagtime_tvcov_arrival_crosses_covariate_matches_production() {
+    let model = parse_model_string(ONECPT_IV_LAG_CROSS_ODE).expect("parse");
+    assert!(model.has_lagtime());
+    let subject = lag_crossing_subject();
+    assert!(subject.has_tv_covariates());
+    assert!(
+        ode_tvcov_supported(&model, &subject),
+        "TV-cov + lagtime is in analytic scope (#486) — this must be a kernel \
+         test, not a routing test"
+    );
+    let theta = vec![10.0, 50.0, 0.75, 0.7];
+    let eta: Vec<f64> = vec![0.1, -0.05, 0.07];
+    // Non-vacuity: the lag must actually carry an η-jet, and the arrival must
+    // land strictly inside the segment whose snapshot differs from the dose's.
+    let sens = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("supported");
+    let max_dlag = sens
+        .obs
+        .iter()
+        .map(|o| o.df_deta[2].abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        max_dlag > 1e-6,
+        "∂f/∂η_LAG is vacuously zero — the fixture would pass without \
+         exercising the saltation at all"
+    );
+    let arrival = 1.0 + theta[3] * eta[2].exp();
+    assert!(
+        arrival > 1.5 + 1e-3 && arrival < 2.0 - 1e-3,
+        "arrival {arrival} must sit strictly inside the [1.5, 2.0] segment"
+    );
+    check_vs_production(&model, &subject, &theta, &eta);
+    check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
+}
+
+/// #1060 control — same model, same subject, but a lagtime small enough that the
+/// arrival stays inside the *first* segment, whose snapshot is the dose record's
+/// own. Pre- and post-arrival fields coincide, so this passes before the fix and
+/// must stay bit-identical after it: it pins that the fix changes nothing when
+/// the arrival does not cross a covariate change.
+#[test]
+fn ode_provider_lagtime_tvcov_arrival_before_covariate_change_matches_production() {
+    let model = parse_model_string(ONECPT_IV_LAG_CROSS_ODE).expect("parse");
+    let mut subject = lag_crossing_subject();
+    // Make the record that ends the arrival segment carry the dose row's own
+    // weight, so the pre- and post-arrival fields coincide: the fix must be a
+    // no-op here, both before and after.
+    let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+    subject.obs_covariates[3] = wt(70.0);
+    let theta = vec![10.0, 50.0, 0.75, 0.7];
+    let eta: Vec<f64> = vec![0.1, -0.05, 0.07];
+    let arrival = 1.0 + theta[3] * eta[2].exp();
+    assert!(
+        arrival > 1.5 + 1e-3 && arrival < 2.0 - 1e-3,
+        "control arrival {arrival} must sit in the same segment as the \
+         crossing case — only the covariate value differs"
+    );
+    check_vs_production(&model, &subject, &theta, &eta);
+    check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
+}
+
+// #1060 row A — the crossing geometry plus an `init(...)` baseline, on a
+// *three-way* covariate ramp (dose row 70, first record 73, second 76). The
+// baseline makes the pre-arrival state non-zero, so `g(x⁻)` is live and the
+// first-order term `(g⁻ − g⁺)·δlag` needs each side on its own snapshot: `g⁻`
+// on the dose row's (the segment ending at the arrival) and `g⁺` on the
+// arrival segment's. A fix that moved *both* sides to the post snapshot would
+// pass the two-way fixtures above and fail here.
+const ONECPT_LAG_INIT_CROSS_ODE: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  theta TVP(0.7, 0.05, 5.0)
+  theta TVBASE(500.0, 10.0, 5000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_P  ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * (WT/70)^THETA_WT * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+  LAGTIME = TVP * exp(ETA_P)
+  BASE = TVBASE
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = BASE / V
+  d/dt(central) = -(CL/V) * central
+[covariates]
+  WT continuous
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+/// #1060 row A: init + TV covariates + IIV lagtime, arrival crossing a covariate
+/// change on a three-way ramp. The issue measured this cell at a 588× gradient
+/// margin (vs 299× without `init`) — the baseline amplifies the same defect by
+/// giving the pre-arrival segment signal to carry.
+#[test]
+fn ode_provider_lagtime_tvcov_init_arrival_crosses_covariate_matches_production() {
+    let model = parse_model_string(ONECPT_LAG_INIT_CROSS_ODE).expect("parse");
+    assert!(model.has_lagtime());
+    // Same crossing geometry and the same rising weight ramp: the record ending
+    // the pre-arrival segment (`t = 1.5`, WT 74), the dose row (WT 70) and the
+    // record ending the arrival segment (`t = 2`, WT 76) are three distinct
+    // snapshots, so each evaluation is pinned to its own — a fix that moved the
+    // *pre*-side velocity to the post snapshot as well would pass the
+    // no-baseline fixture above and fail here.
+    let subject = lag_crossing_subject();
+    assert!(subject.has_tv_covariates());
+    assert!(ode_tvcov_supported(&model, &subject), "init + lag + TV-cov");
+    let theta = vec![10.0, 50.0, 0.75, 0.7, 500.0];
+    let eta = vec![0.1, -0.05, 0.07];
+    check_vs_production(&model, &subject, &theta, &eta);
+    check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
 }
 
 /// A TV-cov model whose RHS references the `TAD` (time-after-dose) builtin, so
