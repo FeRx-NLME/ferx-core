@@ -59,8 +59,9 @@ visible at the point of use:
 | Individual parameters DSL | **beta** | [Individual Parameters](model-file/individual-parameters.qmd) |
 | BLOQ / censored observations (M3) | **beta** | [BLOQ](model-file/bloq.qmd) |
 | ODE models (Dormand-Prince RK45) | **beta** | [ODE Models](model-file/ode-models.qmd) |
-| Stiff ODE steppers (`ode_method` = Rosenbrock23 / Rodas4 / Rodas5P) | **experimental** | [Stiff systems](model-file/ode-models.qmd#stiff-systems) |
+| Stiff ODE steppers (`ode_method` = Rosenbrock23 / Rodas4 / Rodas5P) | **beta** | [Stiff systems](model-file/ode-models.qmd#stiff-systems) |
 | High-order ODE stepper (`ode_method` = Vern7) | **experimental** | [Choosing a method](model-file/ode-models.qmd#stiff-systems) |
+| Automatic stiff-solver selection (`ode_method = auto`, the default) | **beta** | [Letting ferx pick the stepper](model-file/ode-models.qmd#letting-ferx-pick-the-stepper-ode_method-auto) |
 | Built-in absorption models (transit / inverse-Gaussian / Weibull) | **beta** | [Absorption](model-file/absorption.qmd) |
 | Scaling | **beta** | [Scaling](model-file/scaling.qmd) |
 | Data selection | **beta** | [Data Selection](model-file/data-selection.qmd) |

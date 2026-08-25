@@ -5440,10 +5440,13 @@ pub struct FitOptions {
     /// segments. See [`FitOptions::ode_reltol`].
     pub ode_max_steps: usize,
     /// ODE stepper (`[fit_options] ode_method`). Default
-    /// [`Rk45`](crate::ode::OdeMethod::Rk45) — the explicit Dormand-Prince method every
-    /// existing fit uses. The alternatives (`rosenbrock23`, `rodas4`, `rodas5p`) are
-    /// linearly-implicit stiff methods; see [`crate::ode::OdeMethod`] for when they pay and
-    /// which integration paths honour them. Copied onto `OdeSpec::solver_opts` via
+    /// [`Auto`](crate::ode::OdeMethod::Auto) (#978) — an a-priori Jacobian eigenvalue probe
+    /// picks the stepper per integration segment, keeping the explicit
+    /// [`Rk45`](crate::ode::OdeMethod::Rk45) on everything that is not stability-limited.
+    /// Naming a method pins it and skips the probe; `rk45` reproduces the pre-#978 default
+    /// exactly. The stiff alternatives (`rosenbrock23`, `rodas4`, `rodas5p`) are
+    /// linearly-implicit; see [`crate::ode::OdeMethod`] for when they pay and which
+    /// integration paths honour them. Copied onto `OdeSpec::solver_opts` via
     /// [`CompiledModel::sync_ode_solver_opts`], alongside the tolerances.
     pub ode_method: crate::ode::OdeMethod,
     pub run_covariance_step: bool,
@@ -5974,7 +5977,7 @@ impl Default for FitOptions {
             ode_reltol: 1e-4,
             ode_abstol: 1e-6,
             ode_max_steps: 10_000,
-            ode_method: crate::ode::OdeMethod::Rk45,
+            ode_method: crate::ode::OdeMethod::Auto,
             run_covariance_step: true,
             fd_hessian_step: 1e-2,
             covariance_fallback: CovarianceFallback::None,

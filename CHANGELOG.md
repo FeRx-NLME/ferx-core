@@ -20,6 +20,24 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **`ode_method = auto` picks the ODE stepper for you, and is now the default (#978).** An a-priori stiffness probe builds
+  the Jacobian `J = ∂f/∂u` of the `[odes]` right-hand side at the state each integration segment
+  starts from and reads its fastest mode, `max |Re λ(J)|`; a system above `30` per time unit starts
+  on a stiff Rosenbrock method (`rodas4`, or `rodas5p` at `ode_reltol ≤ 1e-8`), everything else stays
+  on the explicit default. Probing **per segment** rather than once per model is what makes it work
+  on binding/TMDD models, whose fast eigenvalue is carried by a term like `KON · central` and so is
+  identically zero at the declared initial condition — the one state at which such a model looks
+  non-stiff — and it re-decides as the optimizer moves θ. An escalation that returns a non-finite
+  trajectory, or that clamps at the minimum step (the freeze-pad failure that produces finite,
+  silently wrong output), is discarded and re-solved explicitly, so the worst case is the explicit
+  answer at twice the cost rather than a corrupted objective; the guard applies to `auto` only, and a
+  named `ode_method` is honoured exactly as before. Measured on ferx-testdata: the stiff cyclophosphamide model
+  converges in 0.7 s at OFV 3241.708 (NONMEM FOCEI: 3241.721) where `rk45` spends 827 s
+  without finishing one optimizer iteration, and a TMDD fit runs 372.4 s → 2.3 s at a
+  fixed iteration budget; nothing changes where nothing is stiff. Two new counters on the solver-statistics struct record what it did — segments escalated, escalations rejected — for diagnostic callers and the test suite (a fit does not print solver statistics today). The
+  threshold is a rate and therefore carries the model's time unit (calibrated on the hour-based PK
+  convention), so name a method explicitly on an unusual time scale. See
+  [ODE models → Letting ferx pick the stepper](https://ferx-nlme.github.io/ferx-core/model-file/ode-models.html#letting-ferx-pick-the-stepper-ode_method-auto).
 - **The `init(...)` scope rule is now published by the engine (#994).** `ODE_INIT_SCOPE_BUILTINS` and
   `ODE_INIT_REJECTED_BUILTINS` name the built-ins an `[odes] init(...)` expression may and may not
   reference, so a code generator can source the rule from the same binary it will parse with instead
@@ -32,6 +50,26 @@ section of the SDLC for the versioning policy).
   [ODE models → What an `init(...)` expression may reference](https://ferx-nlme.github.io/ferx-core/model-file/ode-models.html#init-scope).
 
 ### Changed
+- **ODE models now choose their own stepper by default (#978).** `ode_method` defaults to `auto`
+  instead of `rk45`, so a model that names no stepper is probed per integration segment and runs
+  a stiff method on the segments that need one. A model that *does* name a method is unaffected —
+  naming a stepper still pins it exactly, probe and all. Two consequences worth knowing:
+  predictions on a **stiff** model will change, because they are now produced by a different (and
+  better-conditioned) integrator — on the cyclophosphamide model this is the difference between a
+  fit that converges in 0.7 s and one that spends 827 s without finishing an optimizer iteration;
+  and a model that reports its resolved options will show `auto` where it used to show `rk45`.
+  Most non-stiff models keep the explicit stepper and their existing numbers, paying one Jacobian
+  and one eigensolve per segment — the work of a single Rosenbrock step attempt — for the check.
+  Two kinds do not, because the probe reads how *fast* a system's fastest mode is and not how
+  *separated* its modes are: a model on a minute clock (the threshold is a rate, calibrated for
+  hours) and a model whose modes are all equally fast (a transit chain written out in `[odes]`
+  with a large `ktr`). Those escalate without being stiff, which costs time rather than accuracy.
+  Pin `ode_method = rk45` to restore the previous behaviour exactly.
+- **The Rosenbrock steppers are promoted from experimental to beta (#978).** Making `auto` the
+  default puts them on the default path, so leaving them marked experimental would have meant
+  shipping experimental components to every ODE user. The promotion rests on this release's
+  validation: a NONMEM FOCEI anchor on the cyclophosphamide model (ferx 3241.708 vs NONMEM
+  3241.721) and prediction-equivalence tests across all five methods.
 - **Every line in `[structural_model]` is now checked (#811).** The block was scanned for the first
   `pk NAME(...)` match with an unanchored pattern and every other line was discarded, so
   `zpk one_cpt_iv(cl=CL, v=V)` parsed as a valid one-compartment IV model and a mistyped or stray

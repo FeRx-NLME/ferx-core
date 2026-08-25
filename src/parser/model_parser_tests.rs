@@ -3740,8 +3740,14 @@ fn test_apply_fit_option_ode_solver_tolerances() {
 fn test_apply_fit_option_ode_method() {
     use crate::ode::OdeMethod;
     let mut opts = FitOptions::default();
-    // The engine default is the explicit stepper — an existing fit is unaffected.
+    // The engine default is the probe (#978): a model that names no stepper gets `auto`, which
+    // keeps the explicit method on everything that is not stability-limited.
+    assert_eq!(opts.ode_method, OdeMethod::Auto);
+
+    assert_eq!(apply_fit_option(&mut opts, "ode_method", "rk45"), Ok(true));
     assert_eq!(opts.ode_method, OdeMethod::Rk45);
+    assert_eq!(apply_fit_option(&mut opts, "ode_method", "auto"), Ok(true));
+    assert_eq!(opts.ode_method, OdeMethod::Auto);
 
     assert_eq!(
         apply_fit_option(&mut opts, "ode_method", "rodas5p"),
@@ -3801,7 +3807,7 @@ fn test_ode_reltol_from_fit_options_reaches_ode_spec() {
     assert_eq!(s.abstol, 1e-6);
     assert_eq!(s.max_steps, 10_000);
 
-    assert_eq!(s.method, crate::ode::OdeMethod::Rk45);
+    assert_eq!(s.method, crate::ode::OdeMethod::Auto);
 
     // Override via [fit_options].
     let with_opts = format!(
