@@ -6126,6 +6126,35 @@ fn ode_provider_lagtime_tvcov_arrival_straddles_input_rate_matches_production() 
     );
 }
 
+/// Two **co-timed** lagged doses arriving together on the far side of a covariate change.
+///
+/// Each injects its own saltation, and the pair is exact only because they telescope: the
+/// first dose's post side must be the second dose's pre side — which is the second's own
+/// `pk_at_dose` row, not the next record's — so that
+/// `[g(x,p₀) − g(x+Δ₁,p₁)] + [g(x+Δ₁,p₁) − g(x+Δ₁+Δ₂,p_post)]` collapses to a single jump.
+/// Handing the first dose the next *record's* snapshot instead leaves an uncancelled
+/// `g(x+Δ₁,p₁) − g(x+Δ₁,p_post)` behind, which is nonzero exactly when the covariates change
+/// across the arrival — the case this fixture is in. Every other co-timed-dose fixture in the
+/// suite has constant covariates, where the leftover is identically zero, so nothing else
+/// catches it.
+#[test]
+fn ode_provider_lagtime_tvcov_co_timed_doses_telescope_across_covariate_change() {
+    let model = parse_model_string(ONECPT_IV_LAG_CROSS_ODE).expect("parse");
+    let mut subject = straddling_forcing_subject();
+    // Both doses at t = 1, both lagged, arriving together at ≈1.751 — inside the [1.5, 2.0]
+    // segment, whose snapshot (WT = 140) differs from the dose rows' (WT = 70).
+    subject.doses = vec![
+        DoseEvent::new(1.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(1.0, 60.0, 1, 0.0, false, 0.0),
+    ];
+    assert!(ode_tvcov_supported(&model, &subject));
+    let theta = vec![10.0, 50.0, 0.75, 0.7];
+    let eta: Vec<f64> = vec![0.1, -0.05, 0.07];
+    check_vs_production(&model, &subject, &theta, &eta);
+    check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
+}
+
 /// The control that identifies the residual above, and the only fixture in this group that
 /// is green on both sides of the fix.
 ///

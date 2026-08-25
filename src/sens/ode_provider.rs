@@ -4731,24 +4731,33 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     // (#653) — so they share one scan instead of the five near-copies that had already drifted
     // apart in their skip sets (#1060 review #5).
     //
-    // "Strictly later" is not a tolerance detail, it is the rule: the loop below integrates a
-    // segment only `if t_event > cur_t`, so every co-timed event opens a zero-length segment
-    // that is never integrated. The first segment this boundary actually opens is therefore the
-    // one *ending* at the first strictly-later event, and — NONMEM end-of-interval — it runs
-    // under that event's snapshot. That covers the co-timed rate-off / route-onset siblings the
-    // old copies skipped by kind, and also the co-timed *record* they did not (#1060 review #6):
-    // a record sitting exactly on a moving arrival is the #1068 coincidence, and its own
-    // snapshot governs nothing after the boundary.
+    // Generally that means the first event **strictly** later, not simply the next one: the
+    // loop below integrates a segment only `if t_event > cur_t`, so a co-timed event opens a
+    // zero-length segment that is never integrated and its own snapshot governs nothing after
+    // the boundary. That covers the co-timed rate-off / route-onset siblings the old copies
+    // skipped by kind, and also the co-timed *record* they did not (#1060 review #6) — a
+    // record sitting exactly on a moving arrival is the #1068 coincidence.
     //
-    // `None` means no strictly-later event carries params (only rate boundaries or a reset
-    // follow, or the timeline ends); each caller then supplies the fallback its own site
-    // proved correct — the dose row for the `K_DOSE`/`K_ROUTE_ONSET` onsets, `last_params` for
-    // the rate-offs.
+    // The one exception is a co-timed sibling **dose**, which must be returned. Two doses
+    // arriving together each inject their own saltation, and the pair telescopes only if the
+    // first one's post side is the second one's pre side (which is the second's own
+    // `pk_at_dose`, straight off the `match kind` table):
+    //
+    //   [g(x,p₀) − g(x+Δ₁,p₁)] + [g(x+Δ₁,p₁) − g(x+Δ₁+Δ₂,p_post)] = g(x,p₀) − g(x+Δ₁+Δ₂,p_post)
+    //
+    // Skipping it leaves an uncancelled `g(x+Δ₁,p₁) − g(x+Δ₁,p_post)` behind. Doses sort before
+    // every record kind, so this only ever arises at a `K_DOSE` lookahead — but the predicate
+    // lives here so no site can lose it. (`K_SS_SEED` sorts *before* `K_DOSE`, so it is never
+    // the co-timed successor; it is matched for the strictly-later case only.)
+    //
+    // `None` means no such event carries params (only rate boundaries or a reset follow, or
+    // the timeline ends); each caller then supplies the fallback its own site proved correct —
+    // the dose row for the `K_DOSE`/`K_ROUTE_ONSET` onsets, `last_params` for the rate-offs.
     let post_snapshot = |p: usize, t_ev: f64| -> Option<&[T]> {
         let leps = crate::ode::predictions::INFUSION_EPS;
         for q in (p + 1)..tl.len() {
             let (tq, kq, iq) = tl[q];
-            if tq - t_ev <= leps {
+            if tq - t_ev <= leps && kq != K_DOSE {
                 continue;
             }
             return match kq {
