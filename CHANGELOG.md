@@ -34,10 +34,27 @@ section of the SDLC for the versioning policy).
   named `ode_method` is honoured exactly as before. Measured on ferx-testdata: the stiff cyclophosphamide model
   converges in 0.7 s at OFV 3241.708 (NONMEM FOCEI: 3241.721) where `rk45` spends 827 s
   without finishing one optimizer iteration, and a TMDD fit runs 372.4 s → 2.3 s at a
-  fixed iteration budget; nothing changes where nothing is stiff. Two new counters on the solver-statistics struct record what it did — segments escalated, escalations rejected — for diagnostic callers and the test suite (a fit does not print solver statistics today). The
+  fixed iteration budget; nothing changes where nothing is stiff. Two new counters on the solver-statistics struct record what it did — segments escalated, escalations rejected — and the fit reports them through the `ode_solver` warning (#1080). The
   threshold is a rate and therefore carries the model's time unit (calibrated on the hour-based PK
   convention), so name a method explicitly on an unusual time scale. See
   [ODE models → Letting ferx pick the stepper](https://ferx-nlme.github.io/ferx-core/model-file/ode-models.html#letting-ferx-pick-the-stepper-ode_method-auto).
+- **Fits now report what the ODE solver did (#1080).** A new `ode_solver` warning summarises one
+  post-fit prediction pass over every subject: steps that clamped at the minimum step size (a
+  stability-limited segment whose un-integrated tail is freeze-padded with the last state), segments
+  `ode_method = auto` escalated to a stiff method, and — the actionable one — escalations the guard
+  had to discard and re-solve explicitly, which means the stiffness probe was right that the segment
+  is stiff and wrong about which stiff method could integrate it. Until now no production path
+  reported solver statistics at all, so both the escalation and its rejection were invisible outside
+  the test suite. An escalation that simply worked is reported at `Info` severity; anything that did
+  not integrate cleanly is a `Warning`. The counters ride along in the warning's `details` payload.
+- **`ode_stiff_abort_after` bounds what a stalled ODE segment costs (#708, #1080).** A segment that is
+  stability-limited keeps stepping at the minimum step size until it exhausts `ode_max_steps`;
+  setting this key gives up after that many clamped steps instead. Off by default and deliberately
+  so — aborting freeze-pads the segment's remaining output times, trading a slow-but-integrated
+  segment for a padded one — so it is a way to make a grinding fit say so quickly, not a substitute
+  for choosing a stiff method. On the time-to-event path an abort is reported as a failed segment
+  rather than padded. See
+  [ODE models → Which regime am I in?](https://ferx-nlme.github.io/ferx-core/model-file/ode-models.html#which-regime-am-i-in).
 - **The `init(...)` scope rule is now published by the engine (#994).** `ODE_INIT_SCOPE_BUILTINS` and
   `ODE_INIT_REJECTED_BUILTINS` name the built-ins an `[odes] init(...)` expression may and may not
   reference, so a code generator can source the rule from the same binary it will parse with instead
@@ -48,6 +65,16 @@ section of the SDLC for the versioning policy).
   solver-injected built-ins (the same deliberate rule `[scaling]` follows), so only `TIME` is
   rejected in `[initial_conditions]`. Both surfaces are documented side by side under
   [ODE models → What an `init(...)` expression may reference](https://ferx-nlme.github.io/ferx-core/model-file/ode-models.html#init-scope).
+
+### Performance
+- **The `ode_method = auto` probe is ~10× cheaper on models that are not stiff (#1080).** Before
+  running the eigensolve, the probe now checks Gershgorin's bound on the Jacobian's spectrum: a bound
+  below the stiffness threshold *proves* no eigenvalue reaches it, so the segment can keep the
+  explicit stepper without the `O(n³)` decomposition. Ordinary absorption/elimination segments — the
+  overwhelming majority of what a fit integrates — exit there. Measured on a 3-state binding model:
+  the probe drops from 0.56 µs to 0.055 µs per segment, taking `auto`'s overhead over a pinned `rk45`
+  from 33 % to 3 % on a bare segment and from 19 % to 1.3 % on a realistic observation grid. No
+  decision changes — the bound only short-circuits the direction it can prove.
 
 ### Changed
 - **ODE models now choose their own stepper by default (#978).** `ode_method` defaults to `auto`

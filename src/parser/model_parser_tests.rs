@@ -3776,6 +3776,73 @@ fn test_apply_fit_option_ode_method() {
     );
 }
 
+/// `ode_stiff_abort_after` (#708 / #1080 Part B): opt-in, disable-able without deleting the
+/// key, and framework-level so it is not reported as ignored.
+#[test]
+fn test_apply_fit_option_ode_stiff_abort_after() {
+    let mut opts = FitOptions::default();
+    assert_eq!(opts.ode_stiff_abort_after, None, "must be opt-in");
+
+    assert_eq!(
+        apply_fit_option(&mut opts, "ode_stiff_abort_after", "25"),
+        Ok(true)
+    );
+    assert_eq!(opts.ode_stiff_abort_after, Some(25));
+
+    // `0` / `off` / `none` turn the budget back off, so a settings list can disable it
+    // without removing the key.
+    for off in ["0", "off", "none", "false"] {
+        opts.ode_stiff_abort_after = Some(25);
+        assert_eq!(
+            apply_fit_option(&mut opts, "ode_stiff_abort_after", off),
+            Ok(true)
+        );
+        assert_eq!(opts.ode_stiff_abort_after, None, "{off}");
+    }
+
+    assert!(apply_fit_option(&mut opts, "ode_stiff_abort_after", "x").is_err());
+}
+
+/// The budget reaches the integrator the same way the tolerances do — through
+/// `sync_ode_solver_opts` at parse time — so `predict()`, which gets no fit options, honours
+/// it too.
+#[test]
+fn test_ode_stiff_abort_after_reaches_ode_spec() {
+    let src = r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 10.0)
+  theta TVV(10.0, 0.1, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_stiff_abort_after = 40
+"#;
+    let p = parse_full_model(src).unwrap();
+    assert_eq!(
+        p.model
+            .ode_spec
+            .as_ref()
+            .unwrap()
+            .solver_opts
+            .stiff_abort_after,
+        Some(40)
+    );
+    assert!(!p
+        .fit_options
+        .unsupported_keys_warnings()
+        .iter()
+        .any(|w| w.contains("ode_stiff_abort_after")));
+}
+
 #[test]
 fn test_ode_reltol_from_fit_options_reaches_ode_spec() {
     // [fit_options] ODE solver tolerances must be baked onto

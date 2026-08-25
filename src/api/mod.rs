@@ -53,8 +53,8 @@ pub(crate) use postfit::{
     compute_param_corr, compute_subject_results, cov_diagnostics, eps_shrinkage_warning,
     eta_shrinkage_warning, extract_standard_errors, high_correlation_warning, inflated_rse_warning,
     is_last_estimating_stage, kappa_weight_typicals, keep_gn_zero_eta_warning,
-    probe_nlopt_algorithms, rebuild_warnings_structured, resolve_covariance_status,
-    resolve_sir_fallback, sir_unavailable_warning,
+    ode_solver_diagnostics_warning, probe_nlopt_algorithms, rebuild_warnings_structured,
+    resolve_covariance_status, resolve_sir_fallback, sir_unavailable_warning,
 };
 pub use predict::{predict, PredictionResult};
 #[cfg(feature = "survival")]
@@ -220,6 +220,10 @@ mod tests_sir_fallback;
 #[cfg(test)]
 #[path = "tests/tests_param_corr.rs"]
 mod tests_param_corr;
+
+#[cfg(test)]
+#[path = "tests/ode_solver_diagnostics_tests.rs"]
+mod ode_solver_diagnostics_tests;
 
 #[cfg(test)]
 #[path = "tests/simulate_with_uncertainty_tests.rs"]

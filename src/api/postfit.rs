@@ -1393,6 +1393,123 @@ pub(crate) fn absorption_flip_flop_ebe_warning(
     Some((msg, entry))
 }
 
+/// The `W_` token that opens the post-fit ODE-solver diagnostics message, and the string
+/// [`classify_warning`](crate::types::classify_warning) keys the `ode_solver` code off.
+const ODE_SOLVER_WARNING_TOKEN: &str = "W_ODE_SOLVER_DIAGNOSTICS";
+
+/// Turn the post-fit pass's [`OdeSolverStats`] into the fit's one ODE-solver warning (#1080
+/// Part B item 2).
+///
+/// Until now no production path reported solver statistics at all: `auto` could escalate a
+/// model's segments, have the escalation rejected, and re-solve explicitly, and the only trace
+/// was in counters the test suite could read and a user could not. A rejected escalation in
+/// particular is the single most actionable ODE diagnostic there is — the probe was right that
+/// the segment is stiff and wrong about which method could integrate it — and it is the user,
+/// not ferx, who can act on it by naming a different `ode_method`.
+///
+/// Two severities, because the two things being reported are not the same kind of event:
+///
+/// * **Warning** — a step clamped at `min_dt`, an escalation was discarded, or a segment was
+///   cut short by `ode_stiff_abort_after`. Each of those means part of some subject's
+///   trajectory was freeze-padded or re-solved, i.e. the integration was not clean.
+/// * **Info** — `auto` escalated and everything worked. Routine on a stiff model (the TMDD
+///   `cr` testdata escalates 240 of 580 segments) and not a problem, but it *is* a decision
+///   the user never asked for and could not otherwise see.
+///
+/// The counters come from the post-fit per-subject prediction pass, so they describe the
+/// production dispatch (TV covariates, resets, the event-driven walker, IOV) at the final
+/// estimates — one `f64` sweep, not the thousands of likelihood evaluations that preceded it.
+/// A fit whose solver only misbehaved at parameter values the optimizer passed through and
+/// left behind therefore reads clean here, which is the honest scope: the warning is about the
+/// trajectories the fit *reports*, not about every one it visited.
+pub(crate) fn ode_solver_diagnostics_warning(
+    stats: &crate::ode::OdeSolverStats,
+    options: &FitOptions,
+) -> Option<(String, WarningEntry)> {
+    let clamped = stats.min_step_clamped_steps;
+    let rejected = stats.auto_stiff_rejected;
+    let aborted = stats.stiff_aborted_segments;
+    let escalated = stats.auto_stiff_segments;
+    let unclean = clamped > 0 || rejected > 0 || aborted > 0;
+    if !unclean && escalated == 0 {
+        return None;
+    }
+
+    let details = Some(serde_json::json!({
+        "phase": "postfit_predictions",
+        "ode_method": options.ode_method.as_str(),
+        "attempted_steps": stats.attempted_steps,
+        "accepted_steps": stats.accepted_steps,
+        "rejected_steps": stats.rejected_steps,
+        "min_step_clamped_steps": clamped,
+        "auto_stiff_segments": escalated,
+        "auto_stiff_rejected": rejected,
+        "stiff_aborted_segments": aborted,
+    }));
+
+    if !unclean {
+        // Escalation only: the probe fired, the stiff method coped, nothing was discarded.
+        let msg = format!(
+            "{ODE_SOLVER_WARNING_TOKEN}: ode_method = auto escalated {escalated} integration \
+             segment(s) to a stiff stepper at the final estimates; every other segment used \
+             {explicit}, no escalation was rejected, and no step clamped at the minimum step \
+             size. Informational — set ode_method = {explicit} to pin the explicit stepper, or \
+             name a stiff method to pin the other half.",
+            explicit = crate::ode::OdeMethod::EXPLICIT_FALLBACK.as_str(),
+        );
+        let entry = WarningEntry {
+            severity: WarningSeverity::Info,
+            category: WarningCode::OdeSolver,
+            message: msg.clone(),
+            source_method: None,
+            details,
+        };
+        return Some((msg, entry));
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    if clamped > 0 {
+        parts.push(format!(
+            "{clamped} step(s) clamped at the minimum step size — the local-error test failed \
+             and the step was accepted anyway because dt could not shrink further, so those \
+             segments are stability-limited rather than accuracy-limited, and any output times \
+             left in a segment the solver could not finish are freeze-padded with the last \
+             state (finite, but not integrated)"
+        ));
+    }
+    if rejected > 0 {
+        parts.push(format!(
+            "{rejected} of {escalated} stiff escalation(s) chosen by ode_method = auto were \
+             discarded as unusable and re-solved with {explicit} — the stiffness probe was \
+             right that those segments are stiff and wrong that the stiff method it picked \
+             could integrate them, and the fit paid for both solves; naming ode_method = \
+             rodas5p (or rosenbrock23) explicitly is the next thing to try",
+            explicit = crate::ode::OdeMethod::EXPLICIT_FALLBACK.as_str(),
+        ));
+    }
+    if aborted > 0 {
+        parts.push(format!(
+            "{aborted} segment(s) were abandoned early by ode_stiff_abort_after{budget}, which \
+             bounds their cost and freeze-pads their tails",
+            budget = options
+                .ode_stiff_abort_after
+                .map(|b| format!(" = {b}"))
+                .unwrap_or_default(),
+        ));
+    }
+
+    let msg = format!(
+        "{ODE_SOLVER_WARNING_TOKEN}: the ODE solver did not integrate cleanly at the final \
+         estimates (ode_method = {method}): {body}. Counters are from the post-fit prediction \
+         pass over all subjects; consider a different ode_method, a looser ode_reltol / \
+         ode_abstol, or checking the parameter estimates that produce these dynamics.",
+        method = options.ode_method.as_str(),
+        body = parts.join("; "),
+    );
+    let entry = warning_entry(WarningCode::OdeSolver, msg.clone(), details);
+    Some((msg, entry))
+}
+
 /// Extract standard errors from covariance matrix on the packed parameter scale,
 /// then transform back to the original scale via delta method.
 pub(crate) fn extract_standard_errors(
