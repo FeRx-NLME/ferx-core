@@ -1507,6 +1507,29 @@ fn iov_analytical_supported_core(model: &CompiledModel, require_theta_axis: bool
 /// per subject with per-subject reconverged-FD salvage), the IOV analogue of
 /// [`sens_supported`] (#439 ODE IOV).
 pub fn iov_sens_supported(model: &CompiledModel) -> bool {
+    iov_sens_supported_core(model, true)
+}
+
+/// The **η-only** variant of [`iov_sens_supported`], for the inner EBE gradient
+/// (`subject_eta_grad_iov`). Its closed-form arm is [`iov_analytical_eta_supported`]
+/// rather than [`iov_analytical_supported`]; the ODE arms are identical, since
+/// `ode_iov_supported` carries no θ-axis clause to relax.
+///
+/// This is the gate the **inner** loop must consult. `subject_eta_grad_iov_analytical`
+/// admits the η-only scope internally, but every inner-loop caller screens on a model-level
+/// predicate first (`iov_inner_subject_route`, `analytic_iov_inner`,
+/// `inner_reports_analytic_model`, `iov_fd_reason`); pointing those at the strict predicate
+/// left every `[covariate_nn]` DCM subject on finite differences regardless, and let AGQ —
+/// which reaches `analytic_eta_nll_gradient_iov` with no such screen — take a route the
+/// reporting path called FD. Both halves now read the same predicate.
+pub(crate) fn iov_sens_eta_supported(model: &CompiledModel) -> bool {
+    iov_sens_supported_core(model, false)
+}
+
+/// Shared body. `require_theta_axis` selects the outer predicate (`true`, which needs the
+/// program's θ axes to seed `∂p/∂θ`) or the η-only one (`false`); every other clause applies
+/// to both.
+fn iov_sens_supported_core(model: &CompiledModel, require_theta_axis: bool) -> bool {
     // A closed-form transit/IG IOV model is served by its ODE twin (issue #719, routed
     // per-subject by `CompiledModel::effective_for`), so its analytic-IOV outer-gradient scope
     // is the twin's ODE-IOV scope. (The twin is built at parse time, #1008.)
@@ -1515,7 +1538,7 @@ pub fn iov_sens_supported(model: &CompiledModel) -> bool {
             return ODE_SENS_ENABLED && crate::sens::ode_provider::ode_iov_supported(eq.built());
         }
     }
-    iov_analytical_supported(model)
+    iov_analytical_supported_core(model, require_theta_axis)
         || (ODE_SENS_ENABLED && crate::sens::ode_provider::ode_iov_supported(model))
 }
 

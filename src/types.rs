@@ -5303,6 +5303,26 @@ pub struct NeuralNetworkInfo {
     pub input_names: Vec<String>,
     /// PK output names in declaration order.
     pub output_names: Vec<String>,
+    /// Per-input `center`, in `input_names` order (all-zero when the model
+    /// declares no normalisation).
+    ///
+    /// Recorded because the network computes on `(x − center) / scale`, not on
+    /// the raw covariate: without these the reported `weights_offset` slice of
+    /// `theta` cannot be evaluated on new data. Consumers that reconstruct the
+    /// network from the fit output (`ferx-r`'s `.fitrx` round-trip) need both
+    /// vectors. `init` is deliberately **not** recorded — it is a starting value
+    /// for the optimizer, superseded by the fitted weights, and says nothing
+    /// about what the converged network computes.
+    ///
+    /// `serde(default)` so a `.fitrx` bundle written before this field existed still
+    /// deserialises; such a bundle predates `center`/`scale` entirely, so the empty
+    /// vector it yields means "no transform" and should be read as the identity.
+    #[serde(default)]
+    pub input_center: Vec<f64>,
+    /// Per-input `scale`, in `input_names` order (all-one when the model declares
+    /// no normalisation). See [`NeuralNetworkInfo::input_center`].
+    #[serde(default)]
+    pub input_scale: Vec<f64>,
 }
 
 /// How the IOV occasion partition — which data rows belong to which occasion —

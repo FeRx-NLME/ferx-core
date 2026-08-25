@@ -207,6 +207,19 @@ also exposed on each `FitResult.neural_networks[k]` entry). `ferx-r`
 loaders round-trip them losslessly via `fit.json` inside the `.fitrx`
 archive.
 
+When the model declares [normalization](#normalize-your-inputs),
+the summary carries `center:` and `scale:` alongside the shape, and each
+`FitResult.neural_networks[k]` entry carries `input_center` / `input_scale`
+in `input_names` order. Both are needed to *use* the reported weights: the
+network was fitted against `(x - center) / scale`, so evaluating the same
+weights on raw covariates yields a different network with nothing to signal
+it. Models that declare no normalization report the identity (all-zero
+`center`, all-one `scale`) and the YAML omits the two lines entirely.
+
+The `init` values are deliberately not reported. They set where the
+optimizer *starts*; the fitted weights supersede them, and they say nothing
+about what the converged network computes.
+
 ## Start the network at plausible values (`init`)
 
 Declare one starting value per output, on the scale the parameter actually has:
@@ -252,7 +265,7 @@ a parse error rather than a `NaN` weight.
 
 Estimators that hold the random effects fixed while differentiating the
 population parameters — SAEM's M-step, importance sampling, and
-[variational inference](../estimation/vi.qmd) — used to obtain
+variational inference — used to obtain
 `∂NLL/∂θ` by perturbing each `θ` in turn and re-solving the subject.
 For a classical model that is a handful of solves. For a DCM the
 weights *are* `θ`, so a 141-weight network meant 141 solves per subject

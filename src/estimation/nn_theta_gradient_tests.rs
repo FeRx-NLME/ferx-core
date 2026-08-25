@@ -717,6 +717,79 @@ fn dcm_iov_eta_gradient_is_analytic_and_matches_central_fd() {
     }
 }
 
+/// The η-only scope must reach the **inner loop's own gate**, not just the walk it guards.
+///
+/// `subject_eta_grad_iov_analytical` consults `iov_analytical_eta_supported` internally, but
+/// every inner-loop entry point screens on a model-level predicate *first*
+/// (`iov_inner_subject_route`, `analytic_iov_inner`, `inner_reports_analytic_model`). While
+/// those read the strict `iov_sens_supported`, relaxing the walk changed nothing for FOCE /
+/// FOCEI: every DCM+IOV subject still took the FD η-gradient and still counted toward
+/// `n_fd_subjects`. Worse, AGQ reaches `analytic_eta_nll_gradient_iov` with no such screen, so
+/// the route taken and the route reported disagreed — the drift the #637 guards exist to stop.
+///
+/// Pinned on the predicates rather than on a fit, so a regression names the gate that moved.
+#[test]
+fn the_dcm_iov_eta_scope_reaches_the_inner_loop_gate() {
+    use crate::estimation::inner_optimizer::inner_reports_analytic_model;
+    use crate::sens::provider::{iov_sens_eta_supported, iov_sens_supported};
+
+    let model = dcm_iov_model();
+    assert!(model.n_kappa > 0, "fixture must carry IOV");
+
+    // The two predicates must genuinely differ on this model, or the rest is vacuous.
+    assert!(
+        iov_sens_eta_supported(&model),
+        "a DCM+IOV model is inside the η-only IOV scope"
+    );
+    assert!(
+        !iov_sens_supported(&model),
+        "and outside the strict one — if this flips, the θ-axis accounting changed and this \
+         test no longer exercises the relaxation"
+    );
+
+    // The reported inner method — which `build_info::gradient_method_inner` and the
+    // FD-fallback warning both read — must follow the route the subject actually takes.
+    assert!(
+        inner_reports_analytic_model(&model),
+        "the inner loop must report (and take) the analytic η-gradient for a DCM+IOV model"
+    );
+
+    // A closed-form IOV model with **no** weight block is unaffected: its program seeds every
+    // declared θ, so the two predicates agree and the relaxation cannot have widened anything
+    // for a model that was already served.
+    let plain = parse_model_string(
+        r#"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.001, 500.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_CL ~ 0.05
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+"#,
+    )
+    .expect("plain IOV model parses");
+    assert!(plain.covariate_nns.is_empty(), "control must carry no NN");
+    assert!(
+        iov_sens_supported(&plain),
+        "a plain closed-form IOV model is inside the strict scope"
+    );
+    assert_eq!(
+        iov_sens_eta_supported(&plain),
+        iov_sens_supported(&plain),
+        "the two predicates must agree on every model without an NN weight block"
+    );
+}
+
 /// The generic (`PkNum`) statement evaluator must see the network's **real** output.
 ///
 /// `IndivParamProgram` carries statements and layout but no `[covariate_nn]` handles, so

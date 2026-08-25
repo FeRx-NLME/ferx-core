@@ -45,6 +45,16 @@ fn param_corr_fallback(
 }
 
 /// Summary statistics over an NN's flat weight vector for the compact
+/// Comma-separated `{:.6}` rendering of a float vector, for the
+/// `center:` / `scale:` lines of the `neural_networks:` YAML block.
+#[cfg(feature = "nn")]
+fn fmt_f64_list(v: &[f64]) -> String {
+    v.iter()
+        .map(|x| format!("{:.6}", x))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// `neural_networks:` section in the fit YAML / CLI output. Empty input
 /// yields all zeros (defensive — shouldn't happen in practice because
 /// the parser refuses zero-weight NNs).
@@ -1844,6 +1854,17 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
             writeln!(f, "    outputs: [{}]", nn.output_names.join(", "))
                 .map_err(|e| e.to_string())?;
             writeln!(f, "    n_weights: {}", nn.n_weights).map_err(|e| e.to_string())?;
+            // Emitted only when the model actually normalises, so a plain network's
+            // block is byte-identical to before. The reported weights are meaningless
+            // without the `(x − center) / scale` they were fitted under, so a consumer
+            // reconstructing the network from this file must see both vectors.
+            if nn.input_center.iter().any(|c| *c != 0.0) || nn.input_scale.iter().any(|s| *s != 1.0)
+            {
+                writeln!(f, "    center: [{}]", fmt_f64_list(&nn.input_center))
+                    .map_err(|e| e.to_string())?;
+                writeln!(f, "    scale: [{}]", fmt_f64_list(&nn.input_scale))
+                    .map_err(|e| e.to_string())?;
+            }
             // Summary statistics over the trained weight values.
             let w_slice = &result.theta[nn.weights_offset..nn.weights_offset + nn.n_weights];
             let (mn, mx, mean, sd) = weight_summary(w_slice);
@@ -2539,8 +2560,49 @@ mod tests {
             weights_offset: 1,
             input_names: vec!["WT".to_string(), "CRCL".to_string()],
             output_names: vec!["CL".to_string(), "V".to_string()],
+            input_center: vec![0.0, 0.0],
+            input_scale: vec![1.0, 1.0],
         }];
         base
+    }
+
+    /// The fitted weights are only interpretable alongside the `(x − center) / scale` they
+    /// were fitted under, so a normalised network must report both vectors — and an
+    /// un-normalised one must not grow two identity lines it never needed.
+    #[cfg(feature = "nn")]
+    #[test]
+    fn yaml_reports_nn_normalization_only_when_the_model_declares_it() {
+        let write = |result: &FitResult| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("fit.yaml");
+            write_estimates_yaml(result, path.to_str().unwrap()).expect("yaml write");
+            std::fs::read_to_string(&path).expect("yaml read")
+        };
+
+        // Identity transform (the default): no `center:` / `scale:` lines at all.
+        let plain = write(&make_nn_result());
+        assert!(
+            !plain.contains("    center: ["),
+            "an un-normalised network must not report a center:\n{plain}"
+        );
+        assert!(
+            !plain.contains("    scale: ["),
+            "an un-normalised network must not report a scale:\n{plain}"
+        );
+
+        // Declared normalisation: both vectors, in input order.
+        let mut result = make_nn_result();
+        result.neural_networks[0].input_center = vec![70.0, 90.0];
+        result.neural_networks[0].input_scale = vec![15.0, 30.0];
+        let yaml = write(&result);
+        assert!(
+            yaml.contains("    center: [70.000000, 90.000000]"),
+            "center missing or misformatted:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("    scale: [15.000000, 30.000000]"),
+            "scale missing or misformatted:\n{yaml}"
+        );
     }
 
     #[cfg(feature = "nn")]

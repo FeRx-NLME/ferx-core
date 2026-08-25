@@ -39,7 +39,11 @@ section of the SDLC for the versioning policy).
   every weight inside `[-1.3, 1.6]`. The constants are declared rather than estimated
   from the data so that `predict()` applies the same transform the fit used — recomputing
   statistics on new data would silently change the model — and so the model file remains
-  a complete description of the transform, as `(WT/70)^0.75` already is.
+  a complete description of the transform, as `(WT/70)^0.75` already is. The fit output
+  records the transform alongside the weights: `FitResult.neural_networks[k]` carries
+  `input_center` / `input_scale`, and the `neural_networks:` YAML block prints `center:` /
+  `scale:` when the model declares them — the reported weights were fitted against
+  `(x - center) / scale`, so a consumer that reconstructs the network needs both.
 
 - **`init` on `[covariate_nn]`** — one starting value per output, on the parameter's own
   scale (`init = [1.0, 10.0]` for a CL of 1 L/h and a V of 10 L). **Set this on every
@@ -580,10 +584,12 @@ section of the SDLC for the versioning policy).
   60 on a busulfan-shaped model, correct but roughly twice the necessary runtime. That
   clause is load-bearing for the outer gradient, which seeds θ axes, but not for the inner
   η-gradient, whose walk documents that it uses no θ axes and reads only the η block. The
-  two predicates are now separate. Measured on that fit: 336 s → **162 s** (2.07×), with
-  `n_fd_subjects` 60 → 0 and the objective unchanged at 1060.99 after an identical 14 625
-  iterations. Models that already had the analytic path keep it byte-for-byte — the η-only
-  route is taken only where the full one was unavailable.
+  two predicates are now separate, and the inner loop's own gates — the ones that decide the
+  route and the ones that report it — read the η-only one, so FOCE/FOCEI, AGQ and the
+  reported `gradient_method_inner` all agree on the route taken. Measured on that fit:
+  336 s → **162 s** (2.07×), with `n_fd_subjects` 60 → 0 and the objective unchanged at
+  1060.99 after an identical 14 625 iterations. Models that already had the analytic path
+  keep it byte-for-byte — the η-only route is taken only where the full one was unavailable.
 
 - **Analytic weight gradients for `[covariate_nn]` models** — the fixed-η θ gradient that
   SAEM's M-step, IMP and VI share used one perturbed model solve per θ, and on a deep

@@ -53,9 +53,15 @@ fn build_neural_network_infos(model: &CompiledModel) -> Vec<NeuralNetworkInfo> {
             weights_offset: nn.weights_offset,
             input_names: nn.mapper.input_names().to_vec(),
             output_names: nn.mapper.output_names().to_vec(),
+            input_center: nn.mapper.input_center().to_vec(),
+            input_scale: nn.mapper.input_scale().to_vec(),
         })
         .collect()
 }
+
+#[cfg(all(test, feature = "nn"))]
+#[path = "tests/nn_info_tests.rs"]
+mod nn_info_tests;
 
 /// High-level fit: model file path + data file path → FitResult
 ///

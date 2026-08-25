@@ -57,6 +57,8 @@ pub enum NnError {
     },
     #[error("`scale` for input '{input}' must be finite and non-zero; got {value}")]
     InvalidScale { input: String, value: f64 },
+    #[error("`center` for input '{input}' must be finite; got {value}")]
+    InvalidCenter { input: String, value: f64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -705,15 +707,32 @@ impl NamedMlpMapper {
                 });
             }
         }
-        if center.iter().any(|c| !c.is_finite()) {
-            return Err(NnError::InvalidScale {
-                input: "center".to_string(),
-                value: f64::NAN,
-            });
+        // Mirror the `scale` loop rather than reporting a single fabricated key: the user
+        // needs the offending input's real name and the value they actually wrote.
+        for (i, c) in center.iter().enumerate() {
+            if !c.is_finite() {
+                return Err(NnError::InvalidCenter {
+                    input: self.input_names[i].clone(),
+                    value: *c,
+                });
+            }
         }
         self.input_center = center;
         self.input_scale = scale;
         Ok(self)
+    }
+
+    /// Per-input `center`, in `inputs` order. All-zero unless the model declares
+    /// normalisation. Reported on `NeuralNetworkInfo` because the fitted weights
+    /// are only meaningful alongside the transform they were fitted under.
+    pub fn input_center(&self) -> &[f64] {
+        &self.input_center
+    }
+
+    /// Per-input `scale`, in `inputs` order. All-one unless the model declares
+    /// normalisation. See [`NamedMlpMapper::input_center`].
+    pub fn input_scale(&self) -> &[f64] {
+        &self.input_scale
     }
 
     /// `(x - center) / scale` for input `i`. Identity unless the model declares
@@ -1312,6 +1331,70 @@ mod tests {
         let cl_indiv = tv_cl * eta_cl.exp();
         assert!(cl_indiv > tv_cl); // positive eta increases CL
         assert_relative_eq!(cl_indiv / tv_cl, eta_cl.exp(), epsilon = 1e-12);
+    }
+
+    /// A rejected `center` or `scale` entry must name the **offending input** and report
+    /// the value the user actually wrote.
+    ///
+    /// The center check used to reuse `InvalidScale` with a hardcoded `input: "center"`
+    /// and a fabricated `NaN`, so `center = [inf, 0]` was reported as a *scale* error, on
+    /// an input named "center", carrying a value that never appeared in the model file —
+    /// three wrong facts in one message.
+    #[test]
+    fn normalization_errors_name_the_offending_input_and_value() {
+        let mapper = || {
+            NamedMlpMapper::new(
+                MlpMapper::new(vec![2, 2, 1], Activation::Tanh, Activation::Identity)
+                    .expect("valid layers"),
+                vec!["WT".to_string(), "CRCL".to_string()],
+                vec!["CL".to_string()],
+            )
+            .expect("valid mapper")
+        };
+
+        // Second input's scale is zero — a division the forward pass cannot survive.
+        match mapper().with_normalization(vec![0.0, 0.0], vec![1.0, 0.0]) {
+            Err(NnError::InvalidScale { input, value }) => {
+                assert_eq!(input, "CRCL");
+                assert_eq!(value, 0.0);
+            }
+            other => panic!("expected InvalidScale on CRCL, got {other:?}"),
+        }
+
+        // Second input's center is non-finite. Distinct variant, real name, real value.
+        match mapper().with_normalization(vec![0.0, f64::INFINITY], vec![1.0, 1.0]) {
+            Err(NnError::InvalidCenter { input, value }) => {
+                assert_eq!(input, "CRCL");
+                assert!(value.is_infinite());
+                assert!(
+                    format!("{}", NnError::InvalidCenter { input, value }).contains("`center`"),
+                    "the message must say which key is at fault"
+                );
+            }
+            other => panic!("expected InvalidCenter on CRCL, got {other:?}"),
+        }
+    }
+
+    /// The transform a network was fitted under is readable back off the mapper, which is
+    /// what lets `NeuralNetworkInfo` report it. Identity by default, so a model that
+    /// declares no normalisation reports vectors that change nothing.
+    #[test]
+    fn normalization_vectors_are_readable_and_default_to_identity() {
+        let base = NamedMlpMapper::new(
+            MlpMapper::new(vec![2, 2, 1], Activation::Tanh, Activation::Identity)
+                .expect("valid layers"),
+            vec!["WT".to_string(), "CRCL".to_string()],
+            vec!["CL".to_string()],
+        )
+        .expect("valid mapper");
+        assert_eq!(base.input_center(), &[0.0, 0.0]);
+        assert_eq!(base.input_scale(), &[1.0, 1.0]);
+
+        let normed = base
+            .with_normalization(vec![70.0, 90.0], vec![15.0, 30.0])
+            .expect("valid normalisation");
+        assert_eq!(normed.input_center(), &[70.0, 90.0]);
+        assert_eq!(normed.input_scale(), &[15.0, 30.0]);
     }
 }
 

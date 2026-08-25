@@ -18504,7 +18504,6 @@ fn covariate_nn_input_missing_from_data_is_rejected() {
 #[cfg(feature = "nn")]
 #[test]
 fn covariate_nn_center_and_scale_normalize_the_inputs() {
-    use crate::nn::CovariateMapper;
     use std::collections::HashMap;
 
     let build = |extra: &str| {
@@ -18587,7 +18586,6 @@ fn covariate_nn_center_and_scale_normalize_the_inputs() {
 #[cfg(feature = "nn")]
 #[test]
 fn normalization_keeps_the_hidden_layer_responsive() {
-    use crate::nn::CovariateMapper;
     use std::collections::HashMap;
 
     let build = |extra: &str| {

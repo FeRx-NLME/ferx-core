@@ -14281,6 +14281,7 @@ pub(crate) struct ModelNnGuard(Vec<Vec<f64>>);
 
 impl ModelNnGuard {
     /// Install `outputs` for the current thread, restoring the previous value on drop.
+    #[cfg(feature = "nn")]
     pub(crate) fn enter(outputs: Vec<Vec<f64>>) -> Self {
         let prev = MODEL_NN_OUTPUTS.with(|cell| cell.replace(outputs));
         ModelNnGuard(prev)
@@ -14292,6 +14293,13 @@ impl ModelNnGuard {
     ///
     /// Uses `forward_raw`, the same entry point `pk_param_fn` calls, so the value the
     /// gradient path differentiates around is the value the prediction path produced.
+    ///
+    /// A `forward_raw` failure `panic!`s, exactly as `pk_param_fn` does on the same call.
+    /// It zero-fills an absent covariate, so the only ways it can fail are a mis-sized
+    /// weight slice or an input/layer count mismatch — wiring bugs, not runtime conditions.
+    /// Defaulting the block to `vec![]` instead would make `Op::PushNnOutput` read every
+    /// output as `0.0` in a release build, which is the silent-zero defect this guard
+    /// exists to prevent.
     #[cfg(feature = "nn")]
     pub(crate) fn enter_for(
         model: &crate::types::CompiledModel,
@@ -14307,7 +14315,11 @@ impl ModelNnGuard {
             .map(|nn| {
                 let n_w = nn.mapper.mlp().n_weights();
                 let w = &theta[nn.weights_offset..nn.weights_offset + n_w];
-                nn.mapper.forward_raw(w, covariates).unwrap_or_default()
+                nn.mapper.forward_raw(w, covariates).expect(
+                    "NN forward_raw failed in ModelNnGuard::enter_for: this indicates a \
+                     wiring bug (wrong weight slice or input/layer count), not a \
+                     recoverable condition",
+                )
             })
             .collect();
         Some(Self::enter(outputs))
@@ -17014,8 +17026,33 @@ fn eval_statements_g<T: crate::sens::num::PkNum>(
     // parameter — see that type for why, and for the invariant that they are lifted as
     // constants (exact for `∂/∂η`, deliberately *not* a route to `∂/∂θ` for NN weights).
     // Empty when no guard is live, which is correct for every model without a network.
-    let nn_outputs: Vec<Vec<f64>> = with_nn_outputs(|o| o.to_vec());
-    let empty_nn: &[Vec<f64>] = &nn_outputs;
+    //
+    // Resolved **once** here and threaded down the `If` recursion by reference. This walk is
+    // the FOCE inner loop's hot evaluator; re-reading the thread-local — and deep-cloning it
+    // into a fresh `Vec<Vec<f64>>` — once per statement list, i.e. once more per nested branch
+    // body, is pure per-frame overhead. The borrow is held for the whole walk, so no
+    // `ModelNnGuard` may be entered or dropped beneath it; none is (guards are installed by
+    // the sensitivity provider, outside this call).
+    with_nn_outputs(|nn| {
+        eval_statements_g_inner::<T>(stmts, theta, eta, cov, vars, du, bc_stack, skip, nn)
+    })
+}
+
+/// The recursive body of [`eval_statements_g`], with the ambient `[covariate_nn]` outputs
+/// already resolved and borrowed by the caller.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+fn eval_statements_g_inner<T: crate::sens::num::PkNum>(
+    stmts: &[Statement],
+    theta: &[T],
+    eta: &[T],
+    cov: &[f64],
+    vars: &mut [T],
+    du: Option<&mut [T]>,
+    bc_stack: &mut Vec<T>,
+    skip: &[bool],
+    empty_nn: &[Vec<f64>],
+) {
     let mut du_opt = du;
     for s in stmts {
         match s {
@@ -17048,7 +17085,7 @@ fn eval_statements_g<T: crate::sens::num::PkNum>(
                 for (cond, body) in branches {
                     if eval_condition_indexed(cond, &theta_val, &eta_val, cov, &vars_val, empty_nn)
                     {
-                        eval_statements_g::<T>(
+                        eval_statements_g_inner::<T>(
                             body,
                             theta,
                             eta,
@@ -17057,6 +17094,7 @@ fn eval_statements_g<T: crate::sens::num::PkNum>(
                             du_opt.as_deref_mut(),
                             bc_stack,
                             skip,
+                            empty_nn,
                         );
                         taken = true;
                         break;
@@ -17064,7 +17102,7 @@ fn eval_statements_g<T: crate::sens::num::PkNum>(
                 }
                 if !taken {
                     if let Some(eb) = else_body {
-                        eval_statements_g::<T>(
+                        eval_statements_g_inner::<T>(
                             eb,
                             theta,
                             eta,
@@ -17073,6 +17111,7 @@ fn eval_statements_g<T: crate::sens::num::PkNum>(
                             du_opt.as_deref_mut(),
                             bc_stack,
                             skip,
+                            empty_nn,
                         );
                     }
                 }
