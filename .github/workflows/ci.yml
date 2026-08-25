@@ -162,6 +162,23 @@ jobs:
       - name: cargo fmt
         run: cargo fmt -- --check
 
+  slow-test-paths:
+    name: Slow-test path filter
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Fails if the `push:` path filter in slow-tests.yml lists a glob that
+      # matches nothing (a deleted/renamed/split path — how `src/api.rs` went
+      # dark, #949), or if a new top-level `src/` module is neither listed
+      # there nor on the script's explicit "cannot move a fit" allowlist.
+      #
+      # This lives here, in the fast PR workflow, and NOT in slow-tests.yml:
+      # that workflow only runs once its filter has already matched, so a
+      # self-check inside it can never fire on the stale entry that caused the
+      # skip.
+      - name: Check slow-tests path filter
+        run: .github/scripts/check-slow-test-paths.sh
+
   coverage:
     name: Tests + coverage (full, slow-tests)
     runs-on: ubuntu-latest

@@ -13,29 +13,44 @@ on:
   push:
     branches: [main]
     paths:
-      # Re-run when something touches the code that the heavy fits exercise.
-      # `src/ode/solver.rs` is in the list because the EKF in `src/ode/ekf.rs`
-      # uses `solve_ode` from it — a change to the integrator otherwise
-      # wouldn't trigger this workflow until the next scheduled run.
+      # Re-run when a push to `main` touches either the code the heavy fits
+      # exercise or the inputs that decide what they run and what they are
+      # compared against.
+      #
+      # Directories are matched with `**` rather than enumerated file-by-file.
+      # A named file that later moves, splits, or is renamed leaves behind a
+      # glob that matches nothing, and a stale glob is indistinguishable from a
+      # correct one in review — that is exactly how `src/api.rs` stopped firing
+      # this leg after the `src/api/` split, silently, for months (#949).
+      # `.github/workflows/ci.yml` has a `Slow-test path filter` job that fails
+      # if an entry here matches nothing, or if a new top-level `src/` module
+      # appears that is neither listed here nor on that job's explicit
+      # "cannot move a fit" allowlist.
+      - 'Cargo.toml'            # `ci-test` profile + the `slow-tests` / `survival` features
+      - 'data/**'               # fixture CSVs the NONMEM-anchored fits read by literal path
       - 'src/api/**'
+      - 'src/dosing.rs'         # dose resolution + SS equilibration, shared by pk/ode/sens
       - 'src/estimation/**'
-      - 'src/ode/ekf.rs'
-      - 'src/ode/predictions.rs'
-      - 'src/ode/solver.rs'
-      # The analytic-sensitivity kernels supply the FOCE/FOCEI gradients every
-      # heavy fit consumes (#949): a sens-only change can shift a fit's
-      # objective or its convergence path without touching estimation/.
-      - 'src/sens/**'
-      # Adaptive-dosing simulation drivers (#391) are exercised by the slow
-      # mrgsolve-anchored simulation tests; without this entry an
-      # adaptive-only change never triggers the push leg (#949).
-      - 'src/sim/**'
-      # The parser compiles every model the heavy fits run, so a change to model
-      # compilation (e.g. the structural-param binding in #261) can shift a fit's
-      # objective or break it outright — including the NONMEM-anchored slow test
-      # in tests/structural_param_nonmem.rs.
-      - 'src/parser/**'
-      - 'src/stats/likelihood.rs'
+      - 'src/frem/**'           # tests/frem_warfarin.rs
+      - 'src/io/**'             # the dataset reader every fit is fed from
+      - 'src/markov/**'         # tests/markov_nonmem.rs
+      - 'src/nn/**'             # tests/nn_fit_convergence.rs
+      - 'src/ode/**'            # integrator + every stepper (rk45, vern7, rosenbrock/rodas)
+                                # and the EKF, which reaches `solve_ode` from `src/ode/solver.rs`
+      - 'src/parser/**'         # compiles every model the heavy fits run, so a change to model
+                                # compilation (e.g. the structural-param binding in #261) can
+                                # shift a fit's objective or break it outright — including the
+                                # NONMEM anchor in tests/structural_param_nonmem.rs
+      - 'src/pk/**'             # the analytic closed forms the analytical anchors integrate
+      - 'src/sens/**'           # exact ∂f/∂η, ∂f/∂θ that every FOCE/FOCEI heavy fit consumes,
+                                # so a sens-only change can shift a fit's objective or its
+                                # convergence path without touching estimation/ at all
+      - 'src/sim/**'            # adaptive-dosing drivers (#391) behind the mrgsolve anchors
+      - 'src/stats/**'          # likelihood + residual_error (dense R, IWRES/CWRES, sigma)
+      - 'src/suggest_start/**'  # tests/suggest_start_comparison.rs
+      - 'src/survival/**'       # hazard closed forms behind the `survival`-gated TTE fits
+      - 'src/types.rs'          # CompiledModel / Population / FitOptions, shared by every fit
+      - 'tests/**'              # the gated fits themselves + the shared tests/common harness
 
 env:
   CARGO_TERM_COLOR: always
