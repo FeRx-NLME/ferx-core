@@ -6126,13 +6126,15 @@ fn ode_provider_lagtime_tvcov_arrival_straddles_input_rate_matches_production() 
     );
 }
 
-/// The control that identifies the residual above. Same straddling `first_order` forcing,
-/// same crossing geometry — but `KA` carries no covariate, so the kernel evaluates
-/// identically on both snapshots and `∂f⁻/∂t = ∂f⁺/∂t`. The `½(∂f⁻/∂t − ∂f⁺/∂t)` term is
-/// then exactly zero and the second order is exact, while `½(J⁻−J⁺)·f` — the term this PR
-/// adds — is still live, because `f` itself is nonzero and the Jacobians still jump. Green
-/// here plus a residual there is what pins the residual's cause to the kernel's snapshot
-/// dependence rather than to the straddling velocities generally.
+/// The control that identifies the residual above, and the only fixture in this group that
+/// is green on both sides of the fix.
+///
+/// Same straddling `first_order` forcing, same crossing geometry — but `KA` carries no
+/// covariate, so the kernel evaluates identically on the two snapshots and
+/// `∂f⁻/∂t = ∂f⁺/∂t`. Both orders are then exact. Green here beside a 5 % gradient miss and a
+/// 6.4 % second-order residual on the twin is what pins the twin's numbers to the kernel's
+/// *snapshot dependence* specifically, rather than to straddling forcings in general or to
+/// anything about the crossing geometry the two fixtures share.
 #[test]
 fn ode_provider_lagtime_tvcov_arrival_straddles_covariate_free_input_rate_is_exact() {
     let src =
@@ -6146,6 +6148,19 @@ fn ode_provider_lagtime_tvcov_arrival_straddles_covariate_free_input_rate_is_exa
     assert!(ode_tvcov_supported(&model, &subject));
     let theta = vec![10.0, 50.0, 0.75, 0.7, 0.8, 0.4];
     let eta: Vec<f64> = vec![0.1, -0.05, 0.07];
+    // Non-vacuity: the straddling forcing must actually be carrying mass at the arrival, or
+    // "exact" here says nothing about the term it is supposed to isolate.
+    let with_forcing = compute_predictions_with_tv(&model, &subject, &theta, &eta);
+    let mut bolus_only = subject.clone();
+    bolus_only.doses = vec![subject.doses[1].clone()];
+    let without = compute_predictions_with_tv(&model, &bolus_only, &theta, &eta);
+    assert!(
+        with_forcing
+            .iter()
+            .zip(&without)
+            .any(|(a, b)| (a - b).abs() > 0.1 * b.abs().max(1e-6)),
+        "the `first_order` forcing contributes nothing — the control is vacuous"
+    );
     check_vs_production(&model, &subject, &theta, &eta);
     check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
 }
