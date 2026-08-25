@@ -103,6 +103,21 @@ These run nightly via `slow-tests.yml` and on any push to `main` that touches es
 > added when that tool is available in the environment; its absence does not block the closed-form
 > + reduction validation above.
 
+**A NONMEM anchor must keep every side of the object under test non-degenerate.** A
+single-dose dataset cannot test a dose event's *incoming* side: the state is zero
+before a first arrival, so `g(x⁻) = 0` and any error there cancels rather than
+showing up. Pair every dose-event anchor with a **multi-dose** case whose later dose
+lands with residual drug present, and check that the quantity under test is actually
+live on both sides — a covariate that genuinely differs across the boundary, a
+covariate on the compartment the dose *lands in* rather than only on downstream ones,
+an `init(...)` baseline where a first dose would otherwise start from zero. The same
+applies to a fixture asserted against ferx's own predictor: it agrees with a wrong
+answer by construction whenever both paths share the convention under test, so the
+external reference is what has to see both sides. #1060 shipped a green single-dose
+anchor next to a 14.9-OFV multi-dose divergence (#1073) that no fixture could see.
+When an anchor does fail, vary **one input at a time** — the pair that differs by a
+single number is what localises the defect (`nonmem_anchor/tvcov_lag_saltation*`).
+
 **Every change to an analytic sensitivity, gradient, marginal, or likelihood path requires a `Dual2`-vs-FD parity test.** The closed-form PK solutions and event-driven propagators are written once as generic `*_g<T: PkNum>` functions; instantiating `T = Dual2<M>` yields the exact `∂f/∂η` / `∂f/∂θ` that FOCE/FOCEI/HMC consume (`sens/`). A wrong sensitivity compiles and runs silently — there is no second copy of the formula to disagree with it — so when you add or modify one of these kernels, or the provider that assembles them, assert it against central finite differences of the `T = f64` production predictor, to tolerance, in a Tier-1 unit test. Follow the existing pattern: per-kernel `*_g_dual_matches_fd` checks (`sens/propagate.rs`, `sens/dual2.rs`) and the end-to-end `check_full_provider_vs_fd` harness (`sens/provider_tests.rs`). If a model is outside the analytic scope it must route to FD via the support predicates (`sens_supported` / `analytic_inner_grad_supported_model`); unit-test that routing so a scope gap fails loudly to FD instead of silently returning a wrong gradient. (This is the post-Enzyme successor to the retired `AD↔FD` parity rule — see #285 / #281.)
 
 **Coverage is gated per PR.** A PR's changed lines must carry their own tests — the Codecov `patch` status enforces ≥90% coverage on the diff, and a 90% project floor is enforced on the weekly `main` run (see `codecov.yml`). This is the automated backstop to the rules above; slow-tests never run on PRs, so unit / Tier-2 tests are what register coverage. When excluding code from coverage, **scope `ignore`s by role, not by coverage %**: leave code out for *what it is* — dev-only tooling (e.g. `src/bin/generate_data.rs`), generated code (`build.rs`), or test scaffolding (`tests/`) — never because it reads red. (Feature-gated code that the coverage build doesn't compile reads as "missed" but is a measurement gap, not an ignore target — see #293.)
