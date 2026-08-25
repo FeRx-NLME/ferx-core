@@ -5752,6 +5752,97 @@ fn ode_provider_lagtime_tvcov_init_arrival_crosses_covariate_matches_production(
     check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
 }
 
+/// #1060, two doses placed on either side of the question: the first arrives
+/// inside a segment whose record carries the dose row's own weight (no crossing),
+/// the second arrives past a weight change with drug still in the compartment
+/// from the first — so the pre-arrival velocity is live without needing an
+/// `init(...)` baseline, and one subject exercises both the no-op and the
+/// corrected path in a single walk.
+#[test]
+fn ode_provider_lagtime_tvcov_two_doses_split_segments_matches_production() {
+    let model = parse_model_string(ONECPT_IV_LAG_CROSS_ODE).expect("parse");
+    let mut subject = bolus_subject(&[0.0, 0.5, 1.5, 2.0, 4.0, 5.5, 6.0, 9.0]);
+    subject.doses = vec![
+        DoseEvent::new(1.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(5.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+    subject.dose_covariates = vec![wt(70.0), wt(80.0)];
+    // Dose 1 arrives ≈1.751 in the segment the `t = 2` record ends; that record
+    // carries the dose row's 70, so nothing changes there. Dose 2 arrives ≈5.751
+    // in the segment the `t = 6` record ends, and that one steps to 88.
+    subject.obs_covariates = vec![
+        wt(70.0),
+        wt(70.0),
+        wt(70.0),
+        wt(70.0),
+        wt(80.0),
+        wt(80.0),
+        wt(88.0),
+        wt(88.0),
+    ];
+    subject.covariates.insert("WT".to_string(), 70.0);
+    assert!(subject.has_tv_covariates());
+    assert!(
+        ode_tvcov_supported(&model, &subject),
+        "two-dose TV-cov + lag"
+    );
+    let theta = vec![10.0, 50.0, 0.75, 0.7];
+    let eta = vec![0.1, -0.05, 0.07];
+    check_vs_production(&model, &subject, &theta, &eta);
+    check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
+}
+
+// #1060 via the compartment-indexed spelling: `ALAG1` resolves through
+// `DoseAttrMap::lag_slot` rather than the bare `PK_IDX_LAGTIME` slot, so the
+// per-dose lag slot lookup is a second route into the same saltation. Same
+// crossing geometry, same expected arithmetic.
+const ONECPT_IV_INDEXED_ALAG_CROSS_ODE: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  theta TVP(0.7, 0.05, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_P  ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * (WT/70)^THETA_WT * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+  ALAG1 = TVP * exp(ETA_P)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[covariates]
+  WT continuous
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+/// #1060 with the lag declared as a compartment-indexed `ALAG1` (#369). The walk
+/// resolves this dose's slot through the dose-attribute map instead of the bare
+/// lagtime slot, so this pins that the corrected snapshot reaches both spellings.
+#[test]
+fn ode_provider_lagtime_tvcov_indexed_alag_matches_production() {
+    let model = parse_model_string(ONECPT_IV_INDEXED_ALAG_CROSS_ODE).expect("parse");
+    assert!(model.has_lagtime(), "ALAG1 must register as a lagtime");
+    let subject = lag_crossing_subject();
+    assert!(ode_tvcov_supported(&model, &subject), "ALAG1 + TV-cov");
+    let theta = vec![10.0, 50.0, 0.75, 0.7];
+    let eta = vec![0.1, -0.05, 0.07];
+    check_vs_production(&model, &subject, &theta, &eta);
+    check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
+}
+
 /// A TV-cov model whose RHS references the `TAD` (time-after-dose) builtin, so
 /// the event-driven TV-cov walk's `last_dose_eff` / time-anchoring is exercised
 /// — the other TV-cov parity tests use a `t`-independent RHS, leaving the
