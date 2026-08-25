@@ -7,6 +7,10 @@ license = "MIT"
 authors = ["Ron Keizer", "Teun Post", "Hidde van de Beek"]
 repository = "https://github.com/FeRx-NLME/ferx-core"
 readme = "README.md"
+# `data/mbma_naproxen.*` is CC BY-NC 4.0, not MIT (see the root LICENSE and
+# data/mbma_naproxen.LICENSE). It is a slow-test fixture, so excluding it keeps
+# the crate published to crates.io uniformly MIT.
+exclude = ["data/mbma_naproxen.*"]
 
 [[bin]]
 name = "ferx"
