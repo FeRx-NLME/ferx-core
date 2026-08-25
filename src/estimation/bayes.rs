@@ -612,6 +612,9 @@ pub fn run_bayes(
         .map(|subject| {
             if (subject.has_tv_covariates() || subject.has_resets())
                 && model.ode_spec.is_none()
+                // Compartment-free models (#811) never take the event-driven walk;
+                // see the twin guard in `inner_optimizer::cacheable_schedule`.
+                && !model.is_algebraic()
                 && crate::pk::event_driven::supports_event_driven(model.pk_model)
                 && !model.has_lagtime()
                 && !(model.has_bioavailability() && subject.has_rate_defined_infusion())

@@ -1003,7 +1003,16 @@ fn fit_inner(
     accumulated_warnings.extend(pre_run_warnings);
     // Data-reader warnings (W_ADDL_MISSING_II, W_IOV_OCC_MISSING) accumulated
     // by read_nonmem_csv into population.warnings.
-    accumulated_warnings.extend(population.warnings.iter().cloned());
+    //
+    // Through the shared filter, so `ferx check` suppresses exactly what `fit()`
+    // does — see `reader_warning_suppressed`.
+    accumulated_warnings.extend(
+        population
+            .warnings
+            .iter()
+            .filter(|w| !crate::api::validation::reader_warning_suppressed(model, w))
+            .cloned(),
+    );
 
     // Inner-gradient FD-fallback notice for the gradient-driven methods: if some
     // (but not all) subjects fall outside the analytic provider's scope, surface

@@ -61,6 +61,14 @@ section of the SDLC for the versioning policy).
   weight.
 
 ### Changed
+- **Every line in `[structural_model]` is now checked (#811).** The block was scanned for the first
+  `pk NAME(...)` match with an unanchored pattern and every other line was discarded, so
+  `zpk one_cpt_iv(cl=CL, v=V)` parsed as a valid one-compartment IV model and a mistyped or stray
+  line vanished without a word. Each line must now be one of the four accepted forms —
+  `pk NAME(...)`, `ode(states=[...])`, `ode_template NAME(...)`, or an equation line — and anything
+  else, a second disposition line, or a mix of a compartment model with equation lines is a parse
+  error naming the offending line. A model file that relied on the old leniency was already being
+  read as something other than what it said.
 - **A single-endpoint `[error_model]` must now name its sigmas in declaration order (#1001).**
   A one-line `DV ~ ...` error model consumes its sigmas **positionally** from the `[parameters]`
   declaration order. The names written in the arguments were checked for existence and then
@@ -341,6 +349,27 @@ section of the SDLC for the versioning policy).
   time with `E_MISSING_COVARIATE`, like any other missing covariate.
 
 ### Added
+- **`[structural_model]` accepts a compartment-free model — the `$PRED` equivalent (#811).** A
+  block with no `pk ...` / `ode(...)` line and at least one `NAME = <expr>` line declares its
+  prediction directly, with no compartments underneath: write named intermediates above a final
+  `y = <expr>`, exactly as in `[scaling]`, and reference thetas, etas, individual parameters,
+  `TIME`, and any data column. This is the shape of every model-based meta-analysis structural
+  model (a dose-response or time-course regression, not a PK system), which until now had to be
+  written as a dummy compartment driven by `d/dt(clock) = 1` with the real equation hidden in a
+  `[scaling]` readout. Such a model carries no doses and lays its individual parameters out like an
+  ODE model, so it is not limited to the handful of spare parameter slots an analytical readout
+  draws from. Blocks that presuppose compartments (`[odes]`, `[initial_conditions]`,
+  `[diffusion]`, `[scaling]`) are rejected by name rather than silently ignored. Such a model
+  takes the **analytic** `Dual2` gradient on both the inner and outer loops — with no state to
+  integrate the sensitivity is a chain rule over the individual-parameter program — including
+  under inter-occasion variability, where the equation is evaluated per occasion and the gradient
+  seeded on that occasion's `kappa` axes (what makes a between-treatment-arm variance component
+  estimable rather than frozen). Finite differences remain only past the axis caps, and are
+  reported as such. Anchored against the equivalent NONMEM `$PRED` fit: agreement to ~1e-4
+  relative on every estimate and standard error, and to 5 decimal places on the objective
+  (`nonmem_anchor/algebraic_emax.*`). See `examples/emax_timecourse.ferx`, and
+  `examples/mbma_naproxen.ferx` for the published model-based meta-analysis case study
+  (Bracis et al., *CPT:PSP* 2026;15:e70158) it reproduces to three significant figures.
 - **Sample-size-weighted IOV: `weight = <expr>` on a `kappa` declaration (#1031).** The arm-level
   random effect of every longitudinal MBMA — between-treatment-arm variability — is distributed
   `κ_ik ~ N(0, γ²/N_ik)`: a 400-subject arm's mean wanders a quarter as far as a 25-subject arm's.

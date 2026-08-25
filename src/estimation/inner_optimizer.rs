@@ -625,6 +625,12 @@ pub(crate) fn cacheable_schedule(
 ) -> Option<pk::event_driven::EventSchedule> {
     if (subject.has_tv_covariates() || subject.has_resets())
         && model.ode_spec.is_none()
+        // A compartment-free model (#811) never runs the event-driven walk — the
+        // predictor short-circuits before it — and its `pk_model` is a placeholder,
+        // so a schedule built from it would be a cache for a route nothing takes.
+        // Time-varying covariates are the norm for such models (a per-row study or
+        // arm covariate), so this is the common path, not an edge case.
+        && !model.is_algebraic()
         && pk::event_driven::supports_event_driven(model.pk_model)
         && !model.has_lagtime()
         && !(model.has_bioavailability() && subject.has_rate_defined_infusion())
@@ -1848,6 +1854,9 @@ pub(crate) fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool
 /// population, by that same warning *because* this predicate reports analytic.
 pub(crate) fn inner_reports_analytic_model(model: &CompiledModel) -> bool {
     analytic_inner_grad_supported_model(model)
+        // Compartment-free (#811): served by neither the closed-form predicate (which
+        // declines the placeholder `pk_model` outright) nor the ODE one (no `ode_spec`).
+        || (crate::sens::algebraic::supported(model) && !analytic_inner_common_bail(model))
         || (crate::sens::provider::ode_inner_grad_supported_model(model)
             && !analytic_inner_common_bail(model))
         || (crate::sens::provider::iov_sens_eta_supported(model)
@@ -1908,6 +1917,15 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
     // left is the prior. (Pinned by `program_less_endpoint_only_ctmm_stays_fd`.)
     if subject.obs_times.is_empty() {
         return !analytic_inner_common_bail(model);
+    }
+    // Compartment-free (#811): its own provider, with a model-level scope and no
+    // per-subject exclusions — there are no doses, no resets and no absorption for a
+    // subject to carry that could put it out of scope, and time-varying covariates
+    // are served (the readout is re-seeded per observation, exactly as production
+    // re-evaluates it). Placed before the ODE and closed-form branches, which would
+    // both misread the placeholder `pk_model`.
+    if model.is_algebraic() {
+        return crate::sens::algebraic::supported(model) && !analytic_inner_common_bail(model);
     }
     // ODE models use the light `Dual1` inner provider (#410) with their own
     // per-subject scope ([`ode_inner_grad_supported`]). The global escape hatches
