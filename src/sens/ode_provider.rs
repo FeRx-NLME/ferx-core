@@ -4957,20 +4957,16 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             // moving boundary, so the field discontinuity across it is part of the
             // saltation — the bolus arrival, a lagged infusion's rate-on and a
             // built-in absorption forcing's onset (#880) all need the post side
-            // evaluated here rather than on the dose row, and all three read this
-            // one binding. Falling back to the dose row is provably right: it is
-            // also what `last_params` becomes at the end of this branch, so a
-            // later param-less boundary agrees with it.
+            // evaluated here rather than on the dose row.
             //
-            // Only an estimated lagtime makes this instant a *moving* boundary, so
-            // only then is there a saltation to inject and a post side to find.
-            // Every consumer below is under `has_lagtime`; gate the scan on it too,
-            // so a lagtime-free model does not pay a forward timeline walk per dose.
-            let post_params: &[T] = if !has_lagtime {
-                &pk_at_dose[idx]
-            } else {
-                post_snapshot(p, t_event).unwrap_or(&pk_at_dose[idx])
-            };
+            // Bound as a closure, not a value: only an estimated lagtime makes this
+            // instant a *moving* boundary, and only the three saltation arms below
+            // read it, so a lagtime-free dose must not pay a forward timeline walk
+            // (#1060 review #7). Exactly one arm runs per dose, so this is still one
+            // scan. Falling back to the dose row is provably right: it is also what
+            // `last_params` becomes at the end of this branch, so a later param-less
+            // boundary agrees with it.
+            let post_params = || post_snapshot(p, t_event).unwrap_or(&pk_at_dose[idx]);
             // Steady-state (SS=1) dose: load the compartments with the infinite-past
             // pulse train's trough (dual equilibration carries `∂SS/∂(θ,η)`), replacing
             // the running state, *before* the SS dose's own pulse is applied below
@@ -5059,10 +5055,10 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                             // dose snapshot diverges (a several-percent gradient error). The dose
                             // **mass** `F·amt` stays fixed at dose time (`f_bio_at_dose`,
                             // mass-exact), matching production. This is the same post-arrival
-                            // snapshot the bolus/rate-on saltations need, so it reads the one
-                            // hoisted at the top of this branch rather than re-scanning the
-                            // timeline for itself (#1060 review #5/#7).
-                            let onset_params: &[T] = post_params;
+                            // snapshot the bolus/rate-on saltations need, so it shares their
+                            // lookahead rather than re-scanning the timeline for itself
+                            // (#1060 review #5/#7).
+                            let onset_params: &[T] = post_params();
                             let prep_onset = prep_for(onset_params);
                             let mut onset = T::from_f64(0.0);
                             // Onset **slope** `∂Δr/∂tad` (#880), summed over the same forcings
@@ -5214,6 +5210,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                             // (#1060 review #11). Unreachable from a validated call; the
                             // walk/production divergence it exposes is tracked separately.
                             if d.cmt_raw() >= 1 {
+                                let post_params = post_params();
                                 let prep_post = prep_for(post_params);
                                 // Strict membership (#1060 review #2): only forcings that
                                 // genuinely straddle this instant belong in both velocities.
@@ -5312,9 +5309,8 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                         // reproducer, and invisible in the value because `δlag` is jet-only.
                         // This is the same post-side lookahead the rate-on onset (#880) and
                         // the rate-off boundary (#653) already carry; the bolus arrival was
-                        // the last saltation without one. `post_params` is hoisted to the
-                        // top of this `K_DOSE` branch — the lagged-infusion rate-on above
-                        // needs the same field.
+                        // the last saltation without one.
+                        let post_params = post_params();
                         let params = &pk_at_dose[idx];
                         let lag = params[dose_lag_slot[idx]];
                         let dlag = jet_only(lag);
