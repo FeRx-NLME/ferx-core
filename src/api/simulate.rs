@@ -377,15 +377,13 @@ pub fn simulate_with_options_diag(
     // Parity with `fit()`: a referenced covariate absent from the data would
     // silently read 0.0 (e.g. a `Selected` error model's `if (FREE==0)` selector
     // would route every row to branch 0, applying the wrong residual variance
-    // with no diagnostic). Reject it here the same way `fit()` does (#658).
-    first_error(&check_covariates(model, population))?;
-
-    // Same parity for a sample-size-weighted kappa (#1031): the weight is applied
-    // as `κ/√W`, so a blank or zero arm-size cell — the exact MBMA case the check
-    // exists for — divides an individual parameter by zero and yields NaN/Inf DV
-    // instead of an up-front error. Only the fatal half; the within-occasion
-    // variation warning belongs to `fit()`'s warning list.
-    first_error(&check_kappa_weights(model, population))?;
+    // with no diagnostic), a blank arm-size cell would collapse a weighted κ
+    // (#1031), and a blank standard-error cell would collapse a `weight = <expr>`
+    // residual magnitude (#1029). One shared list so no simulate entry point can
+    // carry a different subset than the others (#658 / #1083). Only the fatal
+    // half; the within-occasion variation warning belongs to `fit()`'s warning
+    // list.
+    first_error(&check_simulation_data(model, population))?;
 
     // Validate the TTE horizon on the library path too — the `.ferx` parser
     // already rejects a non-finite / non-positive horizon, but a direct caller of
@@ -906,6 +904,23 @@ fn simulate_inner_with_draw<R: rand::Rng>(
         panic!("{e}");
     }
 
+    // Same split again for the model-vs-population checks (#1083). The
+    // `Result`-returning entry points above have already run this list and
+    // returned a clean `Err`; `simulate` / `simulate_with_seed` funnel through
+    // here and cannot signal, and the failures this catches are silent by
+    // construction — a weight that underflows to zero produces finite, plottable
+    // rows with the variability quietly removed.
+    //
+    // Redundant on those `Result` paths, and `simulate_with_uncertainty` reaches
+    // here once per draw, so the walk repeats. It is affordable because both
+    // expensive halves are gated on the model actually declaring a weight
+    // (`has_weighted_kappa` / `has_custom_ruv_magnitude`), which is false for
+    // every model that does not use one; and where it is true, the pass is linear
+    // in the observations the draw is about to simulate anyway.
+    if let Err(e) = first_error(&check_simulation_data(model, population)) {
+        panic!("{e}");
+    }
+
     let normal = Normal::new(0.0, 1.0).unwrap();
     let n_eta = model.n_eta;
 
@@ -1014,10 +1029,10 @@ pub fn simulate_with_uncertainty(
 
     // Parity with `fit()`: reject a referenced covariate absent from the data
     // rather than silently reading it as 0.0 (a `Selected` error-model selector
-    // would otherwise route every row to branch 0). See #658 — and, for a
-    // weighted kappa, a non-positive weight before it divides by zero (#1031).
-    first_error(&check_covariates(model, population))?;
-    first_error(&check_kappa_weights(model, population))?;
+    // would otherwise route every row to branch 0). See #658 — and, for a weighted
+    // κ or a weighted residual, a non-positive weight before it collapses to zero
+    // (#1031 / #1029 / #1083).
+    first_error(&check_simulation_data(model, population))?;
 
     let mut rng: rand::rngs::StdRng = match opts.seed {
         Some(seed) => rand::rngs::StdRng::seed_from_u64(seed),

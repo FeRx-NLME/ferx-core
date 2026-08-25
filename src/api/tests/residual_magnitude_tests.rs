@@ -96,3 +96,120 @@ fn a_model_with_no_magnitude_is_not_checked() {
         .iter()
         .all(|d| d.code != "E_RUV_MAGNITUDE_NONPOSITIVE"));
 }
+
+// ── simulate() parity (#1083) ────────────────────────────────────────────────
+//
+// `fit()` has rejected a non-positive magnitude since #1029, but every
+// `simulate()` entry point ran its own hand-picked subset of the model-vs-data
+// checks and this one was in none of them. The failure is silent in the worst
+// way: a `weight = <expr>` modifier multiplies the *additive* loading, so a zero
+// weight removes that arm's residual noise entirely and the simulated
+// observation comes back equal to its own IPRED — finite, plottable, and wrong.
+
+use crate::api::{simulate_with_options_diag, simulate_with_seed};
+use crate::types::SimOutcome;
+use crate::SimulateOptions;
+
+/// The Gaussian value on a simulated row, or a panic for a non-Gaussian one.
+fn continuous(r: &crate::api::SimulationResult) -> f64 {
+    match r.outcome {
+        SimOutcome::Continuous { value } => value,
+        _ => panic!("expected a Gaussian row"),
+    }
+}
+
+fn sim_opts() -> SimulateOptions {
+    SimulateOptions {
+        seed: Some(42),
+        match_method: None,
+        horizon: None,
+    }
+}
+
+#[test]
+fn simulate_rejects_a_zero_weight_the_way_fit_does() {
+    let model = weighted_model();
+    let pop = population_with_weights(&[0.5, 0.0, 2.0]);
+    let err = simulate_with_options_diag(&model, &pop, &model.default_params, 1, &sim_opts())
+        .expect_err("a zero weight must not simulate");
+    assert!(
+        err.contains("sigma slot 0") && err.contains("TIME 2"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn simulate_still_runs_with_positive_weights() {
+    // The guard must not cost the working case: the same fixture with every
+    // weight positive simulates one row per observation, as before.
+    let model = weighted_model();
+    let pop = population_with_weights(&[0.5, 1.5, 2.0]);
+    let out = simulate_with_options_diag(&model, &pop, &model.default_params, 1, &sim_opts())
+        .expect("positive weights simulate");
+    assert_eq!(out.results.len(), 3);
+}
+
+#[test]
+#[should_panic(expected = "sigma slot 0")]
+fn the_vec_returning_entry_point_panics_on_a_zero_weight() {
+    // `simulate` / `simulate_with_seed` return a bare `Vec` and cannot signal, so
+    // the contract is enforced as a panic at the shared chokepoint — the same
+    // split `validate_iov_simulatable` already uses. Failing loud beats emitting
+    // rows whose variability has been quietly removed.
+    let model = weighted_model();
+    let pop = population_with_weights(&[0.5, 0.0, 2.0]);
+    let _ = simulate_with_seed(&model, &pop, &model.default_params, 1, 42);
+}
+
+#[test]
+fn a_weight_of_one_is_bit_identical_to_no_weight() {
+    // The degenerate oracle for the whole mechanism: `weight = W` desugars to a
+    // magnitude multiplying the additive loading, so `W ≡ 1` must reproduce the
+    // unweighted model's draws exactly — same seed, same epsilons, same rows. A
+    // scaling applied on the wrong side, or applied twice, shows up here and
+    // nowhere else, because the two models are otherwise identical.
+    let weighted = weighted_model();
+    let plain = parse_model_string(
+        "[parameters]\n  theta TVCL(0.2)\n  theta TVV(10.0)\n  omega ETA_CL ~ 0.09\n  \
+         sigma ADD_ERR ~ 1.0 (variance) FIX\n[individual_parameters]\n  CL = TVCL * \
+         exp(ETA_CL)\n  V  = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, \
+         v=V)\n[error_model]\n  DV ~ additive(ADD_ERR)\n",
+    )
+    .expect("parse");
+    let pop = population_with_weights(&[1.0, 1.0, 1.0]);
+
+    let a = simulate_with_options_diag(&weighted, &pop, &weighted.default_params, 1, &sim_opts())
+        .expect("weighted simulates");
+    let b = simulate_with_options_diag(&plain, &pop, &plain.default_params, 1, &sim_opts())
+        .expect("unweighted simulates");
+    assert_eq!(a.results.len(), b.results.len());
+    for (x, y) in a.results.iter().zip(b.results.iter()) {
+        assert_eq!(
+            continuous(x).to_bits(),
+            continuous(y).to_bits(),
+            "weight = 1 must be bit-identical to no weight at TIME {}",
+            x.time
+        );
+    }
+}
+
+#[test]
+fn a_larger_weight_widens_the_simulated_residual() {
+    // The half the degenerate oracle can't see: the weight must actually reach
+    // the draw, and in the right direction. Same seed and same single-observation
+    // subject, so the standard normal is shared and only the loading differs —
+    // the deviation from IPRED then scales with the weight.
+    let model = weighted_model();
+    let dev = |w: f64| -> f64 {
+        let pop = population_with_weights(&[w]);
+        let out = simulate_with_options_diag(&model, &pop, &model.default_params, 1, &sim_opts())
+            .expect("simulates");
+        let r = &out.results[0];
+        (continuous(r) - r.ipred).abs()
+    };
+    let (small, large) = (dev(0.5), dev(2.0));
+    assert!(
+        large > small * 3.0,
+        "a 4x weight must widen the residual ~4x: {small} then {large}"
+    );
+}

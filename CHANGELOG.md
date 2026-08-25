@@ -20,6 +20,15 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **`[simulation]` can now state the covariates of the arms it invents (#1083).** `covariate NAME = <value>`
+  — a scalar for every subject, or `= [v1, v2, ...]` with one value per subject — gives the synthetic
+  subjects a covariate value, which a `[simulation]` design previously had no way to express at all.
+  This is what makes trial simulation work for a model-based meta-analysis: `kappa K ~ γ² weight = NARM`
+  and `DV ~ additive(S) weight = WPSE` both read a data column, and the arm a simulation is proposing
+  has no row to read it from. A model that references a covariate the design does not supply is now
+  refused by name, with the fix in the message, rather than reported as a column "not found in data" on
+  a path that has no data file. See `docs/model-file/simulation.qmd`.
+
 - **`ode_method = auto` picks the ODE stepper for you, and is now the default (#978).** An a-priori stiffness probe builds
   the Jacobian `J = ∂f/∂u` of the `[odes]` right-hand side at the state each integration segment
   starts from and reads its fastest mode, `max |Re λ(J)|`; a system above `30` per time unit starts
@@ -175,6 +184,18 @@ section of the SDLC for the versioning policy).
   with no diagnostic from NONMEM (`nonmem_anchor/dose_attr_double_use_{A,B}.ctl`).
 
 ### Fixed
+- **`simulate()` silently removed an arm's residual noise when its `weight = <expr>` column was blank
+  or zero (#1083).** `fit()` has rejected a non-positive residual magnitude since #1029, but no
+  `simulate()` entry point ran that check — each ran its own subset of the model-vs-data checks and
+  this one was in none of them. Because the modifier multiplies the *additive* loading, a zero weight
+  did not blow up: it removed that arm's residual variability entirely, and the simulated observation
+  came back equal to its own IPRED — finite, plottable, and wrong. The weighted-kappa check had the
+  same uneven coverage: present on `simulate_with_options*` but absent from `simulate` /
+  `simulate_with_seed` and from the adaptive-dosing path, where `κ/√W` with a zero `W` evaluates to
+  zero rather than to infinity, so the arm quietly lost its between-arm variability with no `NaN` to
+  trip over. Every simulate entry point now runs one shared list of checks; the two that return a
+  bare `Vec` and cannot signal enforce it as a panic, matching the existing IOV precondition.
+
 - **An estimated lagtime whose lagged dose arrival crossed a time-varying covariate change got a
   silently wrong analytic gradient on ODE models (#1060).** The dose lands at a moving boundary
   `t + ALAG`, and the walk injects the resulting jump as a saltation. The segment ending at that

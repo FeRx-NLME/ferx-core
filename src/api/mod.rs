@@ -11,6 +11,11 @@ use std::path::Path;
 
 // ── validation subsystem (extracted verbatim; see src/api/validation.rs) ──
 mod validation;
+// `check_covariates` / `check_kappa_weights` / `check_residual_magnitude` are the
+// *parts* of `check_simulation_data` (#1083). Production now calls the bundle, so
+// the parts are re-exported for the unit tests that pin each one's message
+// individually — hence the allow, which would otherwise fire on a non-test build.
+#[allow(unused_imports)]
 pub(crate) use validation::{
     apply_iov_occasion_rule, assert_absorption_closed_form_support,
     assert_absorption_dosing_supported, assert_absorption_flip_flop_no_twin,
@@ -18,6 +23,7 @@ pub(crate) use validation::{
     assert_modeled_doses_supported, check_absorption_closed_form_support, check_absorption_dosing,
     check_absorption_flip_flop_no_twin, check_analytic_readout_support, check_covariates,
     check_dose_compartments, check_kappa_weights, check_modeled_dose_rates,
+    check_residual_magnitude, check_simulation_data,
 };
 #[cfg(feature = "survival")]
 pub(crate) use validation::{
@@ -173,6 +179,10 @@ mod scaling_undefined_tests;
 #[cfg(test)]
 #[path = "tests/simulation_template_tests.rs"]
 mod simulation_template_tests;
+
+#[cfg(test)]
+#[path = "tests/simulation_design_covariates_tests.rs"]
+mod simulation_design_covariates_tests;
 
 // ======================================================================
 // Adaptive (state-reactive / feedback) dosing — epic #391, beta.

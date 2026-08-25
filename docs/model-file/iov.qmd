@@ -197,6 +197,16 @@ This is the random-effect sibling of the residual
 [`weight = ...`](error-model.qmd#residual-weighting-weight-...) modifier, and the
 two share syntax and validation.
 
+### Simulating an arm that is not in the data
+
+The weight is a data column, and `fit()` always has one — the arm exists, and its
+size is a column. A simulated trial frequently does not: the point of simulating
+one is to propose arms that are *not* in the data. Arm sizes are therefore part of
+a `[simulation]` design and must be stated with `covariate NARM = [...]`; a design
+that omits one is refused rather than defaulted. See
+[Covariates in simulation](simulation.qmd#sim-covariates-required) for why neither
+silent default is safe.
+
 ## Model File Setup
 
 ```
