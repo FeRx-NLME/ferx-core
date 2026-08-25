@@ -4880,23 +4880,32 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             // is set to this dose's own snapshot at the end of this branch, so the
             // fallbacks agree. Same shape as the rate-on onset (#880) and rate-off
             // (#653) lookaheads, plus a skip for a co-timed route onset.
-            let post_params: &[T] = 'post_snap: {
-                let leps = crate::ode::predictions::INFUSION_EPS;
-                for q in (p + 1)..tl.len() {
-                    let (tq, kq, iq) = tl[q];
-                    if (kq == K_INF_END || kq == K_ZO_END || kq == K_ROUTE_ONSET)
-                        && (tq - t_event).abs() <= leps
-                    {
-                        continue;
-                    }
-                    break 'post_snap match kq {
-                        K_DOSE | K_SS_SEED => &pk_at_dose[iq],
-                        K_PKONLY => &pk_at_pk_only[iq],
-                        K_OBS => &pk_at_obs[iq],
-                        _ => &pk_at_dose[idx],
-                    };
-                }
+            //
+            // Only an estimated lagtime makes this instant a *moving* boundary, so
+            // only then is there a saltation to inject and a post side to find.
+            // Both consumers below are under `has_lagtime`; gate the scan on it too,
+            // so a lagtime-free model does not pay a forward timeline walk per dose.
+            let post_params: &[T] = if !has_lagtime {
                 &pk_at_dose[idx]
+            } else {
+                'post_snap: {
+                    let leps = crate::ode::predictions::INFUSION_EPS;
+                    for q in (p + 1)..tl.len() {
+                        let (tq, kq, iq) = tl[q];
+                        if (kq == K_INF_END || kq == K_ZO_END || kq == K_ROUTE_ONSET)
+                            && (tq - t_event).abs() <= leps
+                        {
+                            continue;
+                        }
+                        break 'post_snap match kq {
+                            K_DOSE | K_SS_SEED => &pk_at_dose[iq],
+                            K_PKONLY => &pk_at_pk_only[iq],
+                            K_OBS => &pk_at_obs[iq],
+                            _ => &pk_at_dose[idx],
+                        };
+                    }
+                    &pk_at_dose[idx]
+                }
             };
             // Steady-state (SS=1) dose: load the compartments with the infinite-past
             // pulse train's trough (dual equilibration carries `∂SS/∂(θ,η)`), replacing
