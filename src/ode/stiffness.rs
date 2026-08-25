@@ -35,11 +35,31 @@
 //! and hence the guard in `integrate_resolved_g`, which stops being a formality once a real
 //! model is expected to cross the threshold in normal operation.
 //!
-//! **The threshold is dimensional.** `λ_max` is a rate, so a model written in days reads 24×
-//! smaller than the same model written in hours. It is calibrated for the PK convention the
-//! testdata library uses (hours), which is also the convention `ode_reltol`'s defaults assume;
-//! a model on a very different clock should set `ode_method` explicitly rather than rely on
-//! `auto`.
+//! # Two things this discriminator cannot see
+//!
+//! Both are reasons to name a method by hand, and both matter more now that `auto` is the
+//! default (#978) than they did when it was opt-in.
+//!
+//! **It is a rate, so it carries the model's time unit.** A model written in days reads 24×
+//! smaller than the same model written in hours. The threshold is calibrated for the PK
+//! convention the testdata library uses (hours), which is also what `ode_reltol`'s defaults
+//! assume. A model on a minute clock reads 60× *larger* and can escalate wholesale — an oral
+//! absorption model with `ka = 0.6/min` puts `λ_max` at 36 with nothing stiff anywhere in it.
+//!
+//! **It measures speed, not separation.** Textbook stiffness is a *ratio* — a fast mode
+//! alongside a slow one — and this reads only the fast end. A system whose modes are all
+//! equally fast is not stiff and an explicit method handles it comfortably, but it reads the
+//! same as one that is: a transit-absorption chain written out in `[odes]` with `ktr = 50` has
+//! every eigenvalue at `−50`, escalates, and pays a Jacobian and an `O(n³)` factorization per
+//! step for nothing. Reading `|Re λ|` rather than `Re λ` widens this further, so a *growing*
+//! mode escalates too — a diverging system is not a stiff one, and the guard rather than the
+//! probe is what catches that.
+//!
+//! Both were accepted rather than fixed, because the alternatives are worse in ways the
+//! measurement supports: a ratio `λ_max/λ_min` is undefined the moment any mode sits at zero,
+//! which is every compartment before its first dose, and normalizing by the segment length
+//! makes a long segment on a benign model read stiff. The escalations they cause are slower,
+//! not wrong — the guard bounds the damage — and `ode_method = rk45` opts out completely.
 //!
 //! # Where it is evaluated
 //!
@@ -97,14 +117,27 @@ pub const STIFF_TAU_FAST: f64 = 1.0 / STIFF_RE_LAMBDA_THRESHOLD;
 /// at zero (every state before its first dose) still gets a usable perturbation.
 const JAC_FD_REL_STEP: f64 = 1e-7;
 
+/// Iteration cap for the probe's Schur decomposition.
+///
+/// Generous — PK Jacobians are small and well behaved, and nothing here has been observed to
+/// need more than a handful of sweeps — but *finite*, which is the point: an uncapped QR
+/// iteration on a pathological Jacobian would hang a worker thread, and this probe is only ever
+/// a hint about which stepper to prefer. Failing to classify costs the explicit default;
+/// failing to return costs the fit.
+const EIGENSOLVE_MAX_ITERATIONS: usize = 1000;
+
 /// The stiff stepper `auto` escalates to.
 ///
 /// [`Rodas4`](OdeMethod::Rodas4) is the stiff workhorse at the tolerances PK fits actually
 /// run at; [`Rodas5P`](OdeMethod::Rodas5P) earns its extra stages only once the tolerance is
-/// tight enough for its higher order to pay, which is the same `ode_reltol ≤ 1e-8` regime
-/// where an ODE-form OFV is being matched against an analytical one.
+/// tight enough for its higher order to pay.
+///
+/// The cut is `1e-9`, matching what [`OdeMethod`]'s own documentation tells a user choosing by
+/// hand ("`rodas5p` at `ode_reltol ≤ 1e-9`"). It was `1e-8` here, which put a model on
+/// `ode_reltol = 1e-8` on a *different* stepper than the docs would have sent its author to —
+/// a gratuitous way for `auto` and a hand-written control stream to disagree.
 const fn stiff_method_for(opts: &OdeSolverOptions) -> OdeMethod {
-    if opts.reltol <= 1e-8 {
+    if opts.reltol <= 1e-9 {
         OdeMethod::Rodas5P
     } else {
         OdeMethod::Rodas4
@@ -158,9 +191,18 @@ pub(crate) fn max_abs_re_eigenvalue<T: PkNum>(
         }
     }
 
+    // `DMatrix::complex_eigenvalues` is *not* usable here: it runs the Schur QR iteration with
+    // `max_niter = 0`, which disables the iteration cap rather than setting it to zero, and
+    // `.unwrap()`s the result — so a matrix it cannot reduce spins inside a fit's worker
+    // thread instead of failing. The probe must be bounded above all else: it is a hint, and a
+    // hint is never worth hanging for. `try_new` with an explicit cap gives back the `None`
+    // this function documents, which the caller reads as "cannot classify → stay explicit".
     let m = nalgebra::DMatrix::from_vec(n, n, jac);
-    let eigs = m.complex_eigenvalues();
-    let lambda_max = eigs.iter().fold(0.0_f64, |acc, z| acc.max(z.re.abs()));
+    let schur = nalgebra::linalg::Schur::try_new(m, f64::EPSILON, EIGENSOLVE_MAX_ITERATIONS)?;
+    let lambda_max = schur
+        .complex_eigenvalues()
+        .iter()
+        .fold(0.0_f64, |acc, z| acc.max(z.re.abs()));
     lambda_max.is_finite().then_some(lambda_max)
 }
 

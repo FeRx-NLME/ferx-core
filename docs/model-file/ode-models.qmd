@@ -289,10 +289,26 @@ and the segment is re-solved explicitly. That bounds the worst case to "the expl
 at twice the cost" rather than a corrupted objective function. The guard applies only to
 `auto`: a named method is always honoured as asked.
 
-**The threshold is a rate, so it carries your model's time unit.** `λ_max ≥ 30` is calibrated
-for the hour-based convention typical of PK models (and the one the default tolerances assume).
-The same model written in days reads 24× smaller and may not trigger. On an unusual time scale,
-set `ode_method` explicitly instead.
+**Two things the probe cannot see**, both worth knowing now that it is the default. Neither
+makes an answer wrong — the guard bounds that — but both can make a fit slower than pinning a
+method by hand.
+
+*It is a rate, so it carries your model's time unit.* `λ_max ≥ 30` is calibrated for the
+hour-based convention typical of PK models, and the one the default tolerances assume. The same
+model written in days reads 24× smaller and may never trigger; written in minutes it reads 60×
+larger and can escalate wholesale — an oral model with `ka = 0.6/min` puts `λ_max` at 36 with
+nothing stiff in it anywhere.
+
+*It measures speed, not separation.* Stiffness is really a *ratio* — a fast mode alongside a slow
+one — and this reads only the fast end. A system whose modes are all equally fast is not stiff
+and RK45 handles it comfortably, but it reads the same as one that is: a transit chain written
+out in `[odes]` with `ktr = 50` has every eigenvalue at −50 and escalates, paying a Jacobian and
+a matrix factorization per step for nothing.
+
+Both were accepted rather than fixed, because the obvious alternatives are worse: a ratio
+`λ_max/λ_min` is undefined the moment any mode sits at zero, which is every compartment before
+its first dose, and scaling by the segment length makes a long segment on a benign model read
+stiff. On either of these, name a method.
 
 Two counters record what `auto` did. They sit on the solver-statistics struct alongside the
 step counts, which a fit does not currently print — they are what a diagnostic caller

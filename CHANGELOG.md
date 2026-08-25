@@ -58,9 +58,13 @@ section of the SDLC for the versioning policy).
   better-conditioned) integrator — on the cyclophosphamide model this is the difference between a
   fit that converges in 0.7 s and one that spends 827 s without finishing an optimizer iteration;
   and a model that reports its resolved options will show `auto` where it used to show `rk45`.
-  Non-stiff models keep the explicit stepper and their existing numbers, paying one Jacobian and
-  one eigensolve per segment — the work of a single Rosenbrock step attempt — for the check. Pin
-  `ode_method = rk45` to restore the previous behaviour exactly.
+  Most non-stiff models keep the explicit stepper and their existing numbers, paying one Jacobian
+  and one eigensolve per segment — the work of a single Rosenbrock step attempt — for the check.
+  Two kinds do not, because the probe reads how *fast* a system's fastest mode is and not how
+  *separated* its modes are: a model on a minute clock (the threshold is a rate, calibrated for
+  hours) and a model whose modes are all equally fast (a transit chain written out in `[odes]`
+  with a large `ktr`). Those escalate without being stiff, which costs time rather than accuracy.
+  Pin `ode_method = rk45` to restore the previous behaviour exactly.
 - **The Rosenbrock steppers are promoted from experimental to beta (#978).** Making `auto` the
   default puts them on the default path, so leaving them marked experimental would have meant
   shipping experimental components to every ODE user. The promotion rests on this release's

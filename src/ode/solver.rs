@@ -157,12 +157,12 @@ pub enum OdeMethod {
 impl OdeMethod {
     /// The explicit stepper [`Auto`](OdeMethod::Auto) starts from and falls back to.
     ///
-    /// Deliberately **not** spelled `OdeMethod::EXPLICIT_FALLBACK`, even though the two coincided
-    /// before `auto` became the default: one of those names means "what a user who said
-    /// nothing gets" and the other means "the method to retreat to when a stiff solve fails",
-    /// and they stopped being the same thing the moment the default changed. Writing
-    /// `default()` for the second would have made the guard fall back to `auto` — i.e. to the
-    /// escalation it is trying to undo.
+    /// Deliberately a separate name from `OdeMethod::default()`, even though the two values
+    /// coincided before `auto` became the default: `default()` means "what a user who said
+    /// nothing gets" and this means "the method to retreat to when a stiff solve fails", and
+    /// they stopped being the same thing the moment the default changed. Spelling the second
+    /// as `default()` would make the guard fall back to `auto` — i.e. to the escalation it is
+    /// trying to undo.
     pub const EXPLICIT_FALLBACK: OdeMethod = OdeMethod::Rk45;
 
     /// Parse the `[fit_options] ode_method` token (case-insensitive). Aliases: `ros23` /
@@ -267,8 +267,10 @@ pub struct OdeSolverStats {
     /// Integrations that [`OdeMethod::Auto`] started on a stiff method because the a-priori
     /// probe read `|Re λ|max ≥` [`crate::ode::stiffness::STIFF_RE_LAMBDA_THRESHOLD`].
     ///
-    /// Zero under every explicitly-named `ode_method`, so a non-zero value says exactly one
-    /// thing: `auto` was asked, and it escalated this many segments.
+    /// Zero under every explicitly-named `ode_method`, so a non-zero value means `auto` was
+    /// asked and escalated. It is a floor, not a total: [`solve_ode_until_threshold`] takes no
+    /// stats, so escalations on the event-time path (TTE / adaptive dosing) are not counted
+    /// here.
     pub auto_stiff_segments: usize,
     /// Escalated integrations whose stiff solve was thrown away — it came back non-finite, or
     /// it clamped at `min_dt` and freeze-padded — and were re-solved with the explicit default,
@@ -866,11 +868,12 @@ pub fn solve_ode_until_threshold(
             monitor,
             threshold,
             OdeMethod::EXPLICIT_FALLBACK,
-        );
+        )
+        .0;
     }
     let method = super::stiffness::resolve_method(rhs, u, params, t_span.0, opts);
     if method == OdeMethod::EXPLICIT_FALLBACK || opts.method != OdeMethod::Auto {
-        return until_threshold_with(rhs, u, t_span, params, opts, monitor, threshold, method);
+        return until_threshold_with(rhs, u, t_span, params, opts, monitor, threshold, method).0;
     }
     // Escalated by the probe — the same guard `integrate_resolved_g` applies, in the shape
     // this driver reports failure in. A stiff method that cannot form a step, or that
@@ -879,26 +882,51 @@ pub fn solve_ode_until_threshold(
     // a failure. A censored draw laundered out of a diverged stiff solve would be the worst
     // possible outcome here, so the retry is not optional.
     let u_entry = u.to_vec();
-    match until_threshold_with(rhs, u, t_span, params, opts, monitor, threshold, method) {
-        ThresholdCrossing::Failed(_) => {
-            u.copy_from_slice(&u_entry);
-            until_threshold_with(
-                rhs,
-                u,
-                t_span,
-                params,
-                opts,
-                monitor,
-                threshold,
-                OdeMethod::EXPLICIT_FALLBACK,
-            )
-        }
-        ok => ok,
+    let (outcome, clamped) =
+        until_threshold_with(rhs, u, t_span, params, opts, monitor, threshold, method);
+
+    // Both halves of the dense driver's guard, in the shape this driver reports outcomes in.
+    //
+    // `Failed` is the loud half. The quiet half is a **clamp**: this driver force-accepts at
+    // `min_dt` and keeps going, so a stiff method that could not form a step still returns an
+    // ordinary-looking `Crossed`/`ReachedEnd` built on a trajectory it did not actually
+    // integrate. That is the same freeze-pad shape (#959) the dense guard was widened for, and
+    // here it means a wrong simulated event time — or, worse, a censoring laundered out of a
+    // diverged solve. Nothing downstream can tell; the flag is the only trace.
+    if !matches!(outcome, ThresholdCrossing::Failed(_)) && !clamped {
+        return outcome;
     }
+    // `u` is unspecified after a failure and untrustworthy after a stall, so the re-solve
+    // starts from the entry state rather than from wherever the escalation left it.
+    u.copy_from_slice(&u_entry);
+    until_threshold_with(
+        rhs,
+        u,
+        t_span,
+        params,
+        opts,
+        monitor,
+        threshold,
+        OdeMethod::EXPLICIT_FALLBACK,
+    )
+    .0
 }
 
 /// [`solve_ode_until_threshold`] with the stepper already chosen — the body both the probed
 /// and the re-solved pass run through.
+///
+/// Reports `(outcome, min_step_clamped)`. The second half is what lets the caller's guard see a
+/// stall: a clamped step here is force-accepted and the run continues, so a stalled solve
+/// returns a perfectly ordinary-looking `Crossed`/`ReachedEnd` that no inspection of the
+/// outcome alone can distinguish from a healthy one.
+/// Pair a hard failure with the clamp flag. A failure is a failure whether or not the solver
+/// clamped on the way there, so the flag is irrelevant to the caller in this arm — but the
+/// return type is one type, and spelling it out at eight call sites is noise.
+#[inline]
+fn failed(msg: String) -> (ThresholdCrossing, bool) {
+    (ThresholdCrossing::Failed(msg), true)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn until_threshold_with(
     rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
@@ -909,19 +937,23 @@ fn until_threshold_with(
     monitor: usize,
     threshold: f64,
     method: OdeMethod,
-) -> ThresholdCrossing {
+) -> (ThresholdCrossing, bool) {
     let (t0, tf) = t_span;
 
     // Already at/above threshold at the span start (e.g. threshold ≈ 0 from u≈1, or a non-zero
     // initial accumulator). Catch before stepping so the loop's crossing test can assume
     // `y0 < threshold`.
     if u[monitor] >= threshold {
-        return ThresholdCrossing::Crossed(t0);
+        return (ThresholdCrossing::Crossed(t0), false);
     }
     if (tf - t0).abs() < 1e-15 {
-        return ThresholdCrossing::ReachedEnd;
+        return (ThresholdCrossing::ReachedEnd, false);
     }
 
+    // Set when a step is force-accepted at `min_dt` (an explicit method that failed its error
+    // test, or a linearly implicit one that could not form a step at all). The run continues
+    // afterwards, so this is the only trace such a step leaves.
+    let mut min_step_clamped = false;
     let mut stepper = make_stepper::<f64>(u.len(), method);
     // This driver localizes the crossing inside a step, so it always interpolates.
     stepper.set_dense_required(true);
@@ -931,26 +963,32 @@ fn until_threshold_with(
 
     for _step in 0..opts.max_steps {
         if t >= tf - 1e-15 {
-            return ThresholdCrossing::ReachedEnd;
+            return (ThresholdCrossing::ReachedEnd, min_step_clamped);
         }
 
         let dt_eff = dt.min(tf - t);
         let err_norm = stepper.attempt(rhs, u, params, t, dt_eff, opts);
         let usable = stepper.attempt_usable();
         if !usable && dt_eff <= opts.min_dt {
-            return ThresholdCrossing::Failed(format!(
+            min_step_clamped = true;
+            return failed(format!(
                 "the step at t={t:.6} could not be formed even at min_dt \
                  (singular Jacobian system)"
             ));
         }
 
         let accepted = usable && (err_norm <= 1.0 || dt_eff <= opts.min_dt);
+        // Mirrors `OdeSolverStats::record`: a force-accept at `min_dt` whose error test did not
+        // pass (`!(err_norm <= 1.0)`, which also catches a non-finite norm) is a clamp.
+        if accepted && !(err_norm <= 1.0) && dt_eff <= opts.min_dt {
+            min_step_clamped = true;
+        }
         if accepted {
             let y0 = u[monitor];
             let y1 = stepper.u_new()[monitor];
 
             if !y1.is_finite() {
-                return ThresholdCrossing::Failed(format!(
+                return failed(format!(
                     "monitored state {monitor} became non-finite at t={:.6}",
                     t + dt_eff
                 ));
@@ -959,7 +997,7 @@ fn until_threshold_with(
             // only round-off sits below it.
             let mono_tol = scale_tol(opts.abstol, opts.reltol, y0, y1);
             if y1 < y0 - mono_tol {
-                return ThresholdCrossing::Failed(format!(
+                return failed(format!(
                     "monitored state {monitor} decreased ({y0:.6} → {y1:.6}) over \
                      [{t:.6}, {:.6}]: non-monotone accumulator (negative rate / hazard)",
                     t + dt_eff
@@ -979,7 +1017,10 @@ fn until_threshold_with(
                         hi = mid;
                     }
                 }
-                return ThresholdCrossing::Crossed(t + 0.5 * (lo + hi) * dt_eff);
+                return (
+                    ThresholdCrossing::Crossed(t + 0.5 * (lo + hi) * dt_eff),
+                    min_step_clamped,
+                );
             }
 
             t += dt_eff;
@@ -1002,10 +1043,10 @@ fn until_threshold_with(
         dt = (dt_eff * factor.clamp(0.2, 5.0)).max(opts.min_dt);
     }
 
-    ThresholdCrossing::Failed(format!(
+    return failed(format!(
         "step budget ({}) exhausted before reaching t_end={tf:.6} (reached t={t:.6})",
         opts.max_steps
-    ))
+    ));
 }
 
 /// Generic solution point for the [`solve_ode_g`] sensitivity path.
@@ -1542,6 +1583,64 @@ mod tests {
             calls.get() > named_calls,
             "auto spent {} right-hand-side calls against rodas4's {named_calls} — the failed \
              escalation was not retried on the explicit method",
+            calls.get()
+        );
+    }
+
+    /// The quiet half of the event-time guard, and the reason it cannot key on
+    /// [`ThresholdCrossing::Failed`] alone.
+    ///
+    /// The monitored accumulator here is `d/dt(chz) = 1` — exactly linear, independent of the
+    /// stiff state beside it. So when the stiff state cannot be stepped at `min_dt` the driver
+    /// force-accepts, keeps going, and the monitor sails through: finite, monotone, crossing
+    /// the threshold at exactly the right time. The outcome is an ordinary `Crossed` built on a
+    /// trajectory the solver never actually integrated (#959's freeze-pad, on the TTE path),
+    /// and no inspection of the outcome can tell. Counting right-hand-side calls is what makes
+    /// the re-solve observable.
+    #[test]
+    fn until_threshold_retries_an_escalation_that_stalled_but_still_reported_success() {
+        use std::cell::Cell;
+        let calls = Cell::new(0usize);
+        let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
+            calls.set(calls.get() + 1);
+            du[0] = -1.0e4 * (u[0] - 1.0);
+            du[1] = 1.0;
+        };
+        // `min_dt = 1.0` is far above what this system's fast mode admits, so every step is a
+        // force-accepted clamp.
+        let stalling = OdeSolverOptions {
+            initial_dt: 1.0,
+            min_dt: 1.0,
+            ..Default::default()
+        };
+
+        let mut u = [0.0, 0.0];
+        let named = solve_ode_until_threshold(
+            &rhs,
+            &mut u,
+            (0.0, 5.0),
+            &[],
+            &OdeSolverOptions {
+                method: OdeMethod::Rodas4,
+                ..stalling
+            },
+            1,
+            3.0,
+        );
+        assert!(
+            matches!(named, ThresholdCrossing::Crossed(_)),
+            "precondition: the stalled stiff solve must still *report success*, got {named:?}"
+        );
+        let named_calls = calls.get();
+
+        calls.set(0);
+        let mut u = [0.0, 0.0];
+        let auto = solve_ode_until_threshold(&rhs, &mut u, (0.0, 5.0), &[], &stalling, 1, 3.0);
+        assert!(matches!(auto, ThresholdCrossing::Crossed(_)), "{auto:?}");
+        assert!(
+            calls.get() > named_calls,
+            "auto spent {} right-hand-side calls against rodas4's {named_calls} — a stalled \
+             escalation that reported success was accepted instead of being re-solved",
             calls.get()
         );
     }

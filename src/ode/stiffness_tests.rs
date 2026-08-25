@@ -170,8 +170,13 @@ fn auto_picks_the_stiff_method_the_tolerance_calls_for() {
         };
         resolve_method(&rhs, &u, &[], 0.0, &opts)
     };
+    // The band boundary is pinned because it is a *consistency* requirement, not a free
+    // choice: `OdeMethod`'s docs send a user choosing by hand to `rodas5p` at
+    // `ode_reltol <= 1e-9`, and `auto` disagreeing with that would be a gratuitous way for a
+    // probed model and a hand-written control stream to land on different steppers.
     assert_eq!(at(1e-4), OdeMethod::Rodas4, "PK-default tolerance");
-    assert_eq!(at(1e-8), OdeMethod::Rodas5P, "tight tolerance");
+    assert_eq!(at(1e-8), OdeMethod::Rodas4, "still the workhorse band");
+    assert_eq!(at(1e-9), OdeMethod::Rodas5P, "the documented rodas5p cut");
     assert_eq!(at(1e-12), OdeMethod::Rodas5P);
 }
 
