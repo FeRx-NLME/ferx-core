@@ -271,7 +271,11 @@ through the individual parameters the equation reads — so the equation is
 evaluated **per occasion**, and the gradient is seeded on that occasion's `kappa`
 axes. This is what makes a between-treatment-arm variance component
 (BTAV, the arm-level random effect of an MBMA model) estimable here rather than
-frozen at its initial value.
+frozen at its initial value. A
+[sample-size-weighted `kappa`](parameters.qmd) — `kappa K ~ γ² weight = NARM`,
+the usual BTAV declaration — is served on the same path: the weight is applied by
+rewriting the reference as `K / sqrt(NARM)`, which reaches the equation as an
+ordinary individual parameter.
 
 Finite differences are used — correctly, just more slowly, and reported as FD
 rather than claimed as analytic — past the axis caps: more than 24 estimated

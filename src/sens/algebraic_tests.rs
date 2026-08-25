@@ -550,6 +550,48 @@ fn compartment_iov_models_are_not_claimed() {
     assert!(!supported_iov(&model));
 }
 
+/// The MBMA between-treatment-arm effect in full: a **sample-size-weighted** kappa
+/// (#1031, `κ_ik ~ N(0, γ²/N_ik)`) on a compartment-free model. The weight is
+/// applied by rewriting every reference as `KAPPA / sqrt(W)`, so it reaches these
+/// walks as an ordinary — but now covariate-dependent — individual parameter, and
+/// the per-occasion jet has to carry the `1/√W` factor into `∂y/∂κ`.
+#[test]
+fn algebraic_iov_jet_matches_fd_with_a_weighted_kappa() {
+    let src = "[parameters]\n\
+        \x20 theta TVE0(10.0, 0.1, 100.0)\n\
+        \x20 theta TVEMAX(6.0, 0.1, 100.0)\n\
+        \x20 theta TVET50(2.0, 0.01, 100.0)\n\
+        \x20 omega ETA_E0 ~ 0.09\n\
+        \x20 kappa KAPPA_EMAX ~ 2.0 (sd) weight = NARM\n\
+        \x20 sigma PROP ~ 0.04 (sd)\n\n\
+        [individual_parameters]\n\
+        \x20 E0   = TVE0 * exp(ETA_E0)\n\
+        \x20 EMAX = TVEMAX * exp(KAPPA_EMAX)\n\
+        \x20 ET50 = TVET50\n\n\
+        [structural_model]\n\
+        \x20 y = E0 - EMAX * TIME / (ET50 + TIME)\n\n\
+        [error_model]\n\
+        \x20 DV ~ proportional(PROP)\n\n\
+        [covariates]\n\
+        \x20 NARM continuous\n\n\
+        [fit_options]\n\
+        \x20 iov_column = OCC\n";
+    let model = compile(src);
+    assert!(model.is_algebraic() && model.n_kappa == 1);
+    assert!(
+        supported_iov(&model),
+        "a weighted kappa must stay on the analytic path"
+    );
+    // Arm sizes differ between the two occasions, which is the point of the
+    // weighting — equal sizes would make the `1/√W` factor a constant and hide a
+    // wrong per-occasion scaling.
+    let per_obs: Vec<Vec<(&str, f64)>> = (0..6)
+        .map(|i| vec![("NARM", if i < 3 { 400.0 } else { 25.0 })])
+        .collect();
+    let subj = iov_subject(per_obs);
+    check_iov_vs_fd(&model, &subj, &[0.15, 0.30, -0.25]);
+}
+
 /// A compartment model must not be claimed by this provider.
 #[test]
 fn compartment_models_are_not_claimed() {
