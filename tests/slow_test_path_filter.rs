@@ -226,8 +226,13 @@ fn tracked_files(root: &Path) -> Vec<String> {
 /// `.githooks/` — and the only tests that open them are CI guards asserting on that config,
 /// this file included. Reading a workflow to check it is not the same as a fit consuming a
 /// fixture, and pulling `.github/**` into the filter would fire the 5–60 minute suite on
-/// every docs-workflow or Dependabot edit. Fixtures never live in a dot-directory, so this
-/// is a rule about where data lives rather than an exemption for one path.
+/// every docs-workflow or Dependabot edit: measured, 9 of the last 400 first-parent commits
+/// on `main` touch `.github/` for something other than this job's own definition.
+///
+/// That skip is the one judgement call in this file, so it does not stand on judgement:
+/// `dot_rooted_reads_are_only_ci_config` pins it by asserting that the dot-rooted paths the
+/// tests actually reference are confined to `.github/workflows/`. Put a fixture in a
+/// dot-directory and that test fails loudly instead of this harvest skipping it silently.
 fn runtime_input_roots(root: &Path, tracked: &[String]) -> BTreeSet<String> {
     let tracked_roots: BTreeSet<&str> = tracked
         .iter()
@@ -235,22 +240,61 @@ fn runtime_input_roots(root: &Path, tracked: &[String]) -> BTreeSet<String> {
         .collect();
 
     let mut roots = BTreeSet::new();
+    for (_, literal) in referenced_paths(root, tracked) {
+        let Some((head, rest)) = literal.split_once('/') else {
+            continue;
+        };
+        if rest.is_empty() || head.starts_with('.') || !tracked_roots.contains(head) {
+            continue;
+        }
+        roots.insert(head.to_string());
+    }
+    roots
+}
+
+/// Every repo-relative path a test source references, paired with the file referencing it.
+///
+/// Two addressing conventions live side by side in `tests/`, and reading only one of them
+/// loses fixtures:
+///
+/// - a runtime open (`Path::new("data/warfarin.csv")`) is relative to the working directory,
+///   which is the repo root under `cargo test`;
+/// - `include_str!("../data/warfarin.csv")` is relative to the *source file*, and bakes the
+///   fixture into the test binary at compile time — every bit as much an input.
+///
+/// A leading `../` is what distinguishes them: nothing addressed from the repo root needs to
+/// climb out of it. So `../`-prefixed literals are resolved against the source file's
+/// directory and the rest are taken as-is.
+fn referenced_paths(root: &Path, tracked: &[String]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
     for path in tracked
         .iter()
         .filter(|p| p.starts_with("tests/") && p.ends_with(".rs"))
     {
         let src = std::fs::read_to_string(root.join(path)).expect("test source is UTF-8");
+        let dir = path.rsplit_once('/').map_or("", |(head, _)| head);
         for literal in string_literals(&src) {
-            let Some((head, rest)) = literal.split_once('/') else {
-                continue;
-            };
-            if rest.is_empty() || head.starts_with('.') || !tracked_roots.contains(head) {
-                continue;
+            match literal.strip_prefix("../") {
+                // Climb one directory per `../`, then keep what is left.
+                Some(mut rest) => {
+                    let mut base: Vec<&str> = dir.split('/').filter(|s| !s.is_empty()).collect();
+                    while let Some(next) = rest.strip_prefix("../") {
+                        base.pop();
+                        rest = next;
+                    }
+                    base.pop();
+                    let mut resolved = base.join("/");
+                    if !resolved.is_empty() {
+                        resolved.push('/');
+                    }
+                    resolved.push_str(rest);
+                    out.push((path.clone(), resolved));
+                }
+                None => out.push((path.clone(), literal)),
             }
-            roots.insert(head.to_string());
         }
     }
-    roots
+    out
 }
 
 /// Double-quoted literals in Rust source, escapes skipped. Deliberately crude: a false
@@ -407,6 +451,62 @@ fn derived_runtime_roots_are_the_fixture_directories() {
     assert!(
         !roots.iter().any(|r| r.starts_with('.')),
         "a dot-prefixed tooling root leaked into the derived fit inputs: {roots:?}"
+    );
+}
+
+#[test]
+fn dot_rooted_reads_are_only_ci_config() {
+    // `runtime_input_roots` skips dot-prefixed roots, which is safe exactly as long as the
+    // only dot-rooted paths the tests touch are the workflow files the CI guards assert on.
+    // Pin that: a fixture parked under a dot-directory must fail here — loudly, naming the
+    // file — rather than be skipped by the harvest and silently left out of the filter.
+    let root = repo_root();
+    let tracked = tracked_files(&root);
+
+    let stray: Vec<String> = referenced_paths(&root, &tracked)
+        .into_iter()
+        .filter(|(_, literal)| literal.starts_with('.') && literal.contains('/'))
+        .filter(|(_, literal)| !literal.starts_with(".github/workflows/"))
+        .map(|(source, literal)| format!("{source} -> {literal}"))
+        .collect();
+
+    assert!(
+        stray.is_empty(),
+        "these tests reference a dot-rooted path that is not CI config: {stray:?}. \
+         `runtime_input_roots` skips dot-prefixed roots so that `.github/**` does not end up \
+         in the slow-tests filter (it would fire the 5–60 min suite on every Dependabot edit). \
+         If one of these is a real fit input, move it out of the dot-directory or narrow the \
+         skip — do not leave it silently uncovered."
+    );
+}
+
+#[test]
+fn include_str_fixtures_resolve_to_their_repo_relative_path() {
+    // `include_str!` addresses from the source file, so its literals climb out of `tests/`.
+    // Taking them at face value would harvest a root of `..` and lose the fixture; this is
+    // how `tests/frem_warfarin.rs` reaches `data/warfarin.csv` and `tests/tte_smoke.rs`
+    // reaches `examples/pktte_joint.ferx`.
+    let root = repo_root();
+    let tracked = tracked_files(&root);
+    let referenced: BTreeSet<String> = referenced_paths(&root, &tracked)
+        .into_iter()
+        .map(|(_, literal)| literal)
+        .collect();
+
+    for expected in ["data/warfarin.csv", "examples/pktte_joint.ferx"] {
+        assert!(
+            referenced.contains(expected),
+            "`include_str!(\"../{expected}\")` did not resolve to `{expected}` — a \
+             compile-time fixture would be missed by the harvest"
+        );
+    }
+    assert!(
+        !referenced.iter().any(|p| p.starts_with("../")),
+        "an unresolved `../` literal survived resolution: {:?}",
+        referenced
+            .iter()
+            .filter(|p| p.starts_with("../"))
+            .collect::<Vec<_>>()
     );
 }
 
