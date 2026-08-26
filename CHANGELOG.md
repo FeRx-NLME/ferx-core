@@ -19,6 +19,45 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Fixed
+- **`methods = [vi, laplace]` with `n_agq > 1` is no longer rejected (#1017).** `n_agq` is a
+  chain-wide option, so the documented VI readout — `methods = [vi, laplace]`,
+  `agq_eval_only = true`, which turns VI's ELBO lower bound into a real `−2 log L` — carries it
+  legitimately: the grid belongs to the Laplace stage and VI ignores it. The check rejected it
+  for the whole chain, making the recommended path impossible to ask for. It now fires only
+  when no stage consumes the option (a VI-only chain).
+- **A VI fit that stopped at its Monte-Carlo noise floor no longer reports `converged: true`
+  (#1017).** The settling test asks whether the ELBO's remaining drift is distinguishable from
+  noise; at a low `vi_mc_samples` that becomes true while the objective is still falling, so the
+  fit stopped short and certified itself. On warfarin at the default 8 draws it returned
+  `σ = 0.014150` against `0.010565` from both AGQ and FOCEI — 34% high, with the OFV 11.3 units
+  short and every variational covariance ~1.75× too wide. A sign test over the trace tail now
+  separates a real trend from noise (below the amplitude of any single window comparison, which
+  is what makes the failure invisible to the settling test), and a run stopped that way reports
+  `converged: false` with a warning naming `vi_mc_samples` — `32` recovers the reference.
+- **VI's early stopping now requires the per-subject posteriors to have settled, not just the
+  population parameters (#1017).** Either convergence criterion is sufficient, and the
+  parameter-stability one measured only the packed `(θ, Ω, σ)` vector. A chain in which the
+  population coordinates settle first — or in which most are FIXed — could therefore stop and
+  return a still-moving variational posterior as converged, which is the object a VI fit exists
+  to produce. Both halves are now judged on the same window and tolerance.
+- **`block_sigma` correlated residual errors work with `method = vi` (#1017).** The option docs
+  said this configuration falls back to Adam on `σ`, and the code implements that, but the
+  check-time allow-list omitted VI, so every `block_sigma` + VI fit was refused before the
+  fallback could run. VI's data term routes a dense `R` through the same full-FD path FOCE and
+  SAEM use, so it is supported; only the closed-form `σ` maximizer is not, and that declines
+  with a recorded reason as documented.
+- **A VI block overtaken by a later estimating stage now says so (#1017).** On
+  `methods = [vi, focei]` the reported θ/Ω/σ and subject diagnostics come from FOCEI while
+  `vi.eta_means`, `eta_covs`, both ELBO halves and `elbo_tightness_ratio` still describe VI's
+  parameter point. The block is still reported — a trailing `agq_eval_only` / `imp_eval_only`
+  readout does not move the estimates, and the variational covariance is the only per-subject
+  one in the result — but it now carries `superseded_by` (in the API and the fit YAML) naming
+  the stage that moved on, plus a warning.
+- **Subject IDs in the VI posterior YAML are quoted (#1017).** `id: 001` parsed back as the
+  integer `1`, and an ID containing `:` or `#` could change the document's shape or truncate the
+  value — defeating the point of keying the posterior by the original subject ID.
+
 ### Added
 - **Theta level blocks — hundreds of fixed effects from one declaration (#1064).**
   `theta PLACEBO[800](0.0, -10.0, 10.0)` declares 800 thetas sharing one init/bounds triple, read back

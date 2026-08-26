@@ -137,6 +137,48 @@ fn trace_settles_on_a_flat_noisy_tail_but_not_on_a_drifting_one() {
     assert!(!trace_has_settled(&poisoned, 20, 1e-4));
 }
 
+/// The systematic-drift test sees a trend the settling test cannot: one below the
+/// per-window noise it measures against.
+///
+/// This is the noise-floor failure mode — at a low `vi_mc_samples`, `trace_has_settled`
+/// stops the run while the objective is still falling, and a fit reported `converged`
+/// lands short of the reference. The sign test separates the two cases: real drift keeps
+/// its direction, noise alternates.
+#[test]
+fn systematic_drift_is_detected_below_the_settling_test_noise_floor() {
+    // Descent of 0.01/iteration buried in ±5 alternating noise. The window-to-window
+    // difference is ~0.2 against a standard error of several units, so the settling
+    // test correctly calls it settled — and would stop the run.
+    let masked: Vec<f64> = (0..200)
+        .map(|i| 500.0 - 0.01 * i as f64 + if i % 2 == 0 { 5.0 } else { -5.0 })
+        .collect();
+    assert!(
+        trace_has_settled(&masked, 40, 1e-4),
+        "the drift must be below the settling test's noise floor for this test to mean anything"
+    );
+    assert!(trace_still_drifting(&masked, 40));
+
+    // A genuine plateau: same noise, no trend. Must not fire, or every converged VI
+    // fit would be demoted.
+    let plateau: Vec<f64> = (0..200)
+        .map(|i| 500.0 + if i % 2 == 0 { 5.0 } else { -5.0 })
+        .collect();
+    assert!(trace_has_settled(&plateau, 40, 1e-4));
+    assert!(!trace_still_drifting(&plateau, 40));
+
+    // One-sided: a trace drifting *upward* is a different pathology (a diverging fit),
+    // already caught by the objective itself, and is not this warning's business.
+    let rising: Vec<f64> = (0..200).map(|i| 500.0 + 0.01 * i as f64).collect();
+    assert!(!trace_still_drifting(&rising, 40));
+
+    // Degenerate inputs are never "drifting".
+    assert!(!trace_still_drifting(&masked, 0));
+    assert!(!trace_still_drifting(&[1.0, 2.0, 3.0], 40));
+    let mut poisoned = masked.clone();
+    poisoned[199] = f64::NAN;
+    assert!(!trace_still_drifting(&poisoned, 40));
+}
+
 // ---------------------------------------------------------------------------
 // End-to-end behaviour
 // ---------------------------------------------------------------------------
@@ -911,6 +953,36 @@ fn parameter_change_is_relative_with_an_absolute_floor() {
         max_relative_change(&[1.0, -2.0, 3.0], &[1.0, -2.0, 3.0]),
         0.0
     );
+}
+
+/// The stability criterion asks about `φ` as well as `x`, and either one still moving
+/// blocks it.
+///
+/// `x` alone is not enough to certify convergence: it is half the optimization, and on a
+/// chain where the population coordinates settle first — or are nearly all FIXed — a
+/// still-moving per-subject posterior would otherwise be returned as converged, which is
+/// the object a VI fit exists to produce.
+#[test]
+fn stability_requires_both_the_population_vector_and_the_posterior_to_be_still() {
+    let x = [1.0, 2.0];
+    let phi = [0.5, -0.5, 0.25];
+
+    // Both still: settled.
+    assert!(estimates_have_settled(&x, &x, &phi, &phi));
+
+    // `x` still, `φ` moving 10%: not settled. This is the case the criterion missed.
+    let phi_moved = [0.55, -0.5, 0.25];
+    assert!(!estimates_have_settled(&x, &x, &phi, &phi_moved));
+
+    // `φ` still, `x` moving: still not settled (the original behaviour is preserved).
+    let x_moved = [1.1, 2.0];
+    assert!(!estimates_have_settled(&x, &x_moved, &phi, &phi));
+
+    // Movement below the tolerance on both sides counts as settled — the criterion is a
+    // threshold, not an equality test.
+    let x_tiny = [1.0 + 1e-6, 2.0];
+    let phi_tiny = [0.5 + 1e-6, -0.5, 0.25];
+    assert!(estimates_have_settled(&x, &x_tiny, &phi, &phi_tiny));
 }
 
 /// A run whose **parameters** have settled must be reported as converged even when the

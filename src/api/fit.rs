@@ -1179,6 +1179,23 @@ fn fit_inner(
     // is the *recommended* way to finish a VI fit, and reading `vi` off only the
     // final stage would silently discard it exactly when it was used correctly.
     let mut vi_result: Option<crate::types::ViResult> = None;
+    // Which stage produced `vi_result`, so a later *estimating* stage can be recorded on
+    // it. See `ViResult::superseded_by`: the block is kept (a trailing `agq_eval_only`
+    // readout is the recommended way to finish a VI fit) but must not read as though it
+    // described the parameters the fit ends up reporting.
+    let mut vi_stage_idx: Option<usize> = None;
+    // The methods running as pure likelihood evaluators for this fit. Chain-wide, not
+    // per-stage, so it is built once here and read both inside the loop and after it.
+    let eval_only_methods: Vec<EstimationMethod> = {
+        let mut v = Vec::new();
+        if options.imp_eval_only {
+            v.push(EstimationMethod::Imp);
+        }
+        if options.agq_eval_only {
+            v.push(EstimationMethod::Laplace);
+        }
+        v
+    };
     // Per-stage convergence wall time, parallel to `chain`/`method_chain`
     // (#713). Excludes the covariance step, which is timed separately below
     // and only ever runs on the last estimating stage.
@@ -1330,13 +1347,6 @@ fn fit_inner(
         // Run the covariance step (and SIR) only on the last *estimating* stage,
         // so a chain doesn't recompute the expensive FD covariance after every
         // method (#615). See `is_last_estimating_stage` for the eval-only-IMP rule.
-        let mut eval_only_methods: Vec<EstimationMethod> = Vec::new();
-        if options.imp_eval_only {
-            eval_only_methods.push(EstimationMethod::Imp);
-        }
-        if options.agq_eval_only {
-            eval_only_methods.push(EstimationMethod::Laplace);
-        }
         let is_last_estimating = is_last_estimating_stage(&chain, stage_idx, &eval_only_methods);
         if !is_last_estimating {
             stage_opts.run_covariance_step = false;
@@ -1628,8 +1638,8 @@ fn fit_inner(
 
         if stage_result.vi.is_some() {
             vi_result = stage_result.vi.clone();
+            vi_stage_idx = Some(stage_idx);
         }
-
         stage_params = stage_result.params.clone();
         total_iterations += stage_result.n_iterations;
         for w in stage_result
@@ -1704,6 +1714,32 @@ fn fit_inner(
     let mut result = result.expect("method chain must have at least one stage");
     // Overwrite with chain-aware totals
     result.n_iterations = total_iterations;
+
+    // Mark a VI block that a later *estimating* stage has overtaken. The block is kept —
+    // a trailing `agq_eval_only` / `imp_eval_only` readout is how a VI fit is meant to be
+    // finished, and the per-subject variational covariance is the only one in the result —
+    // but on `methods = [vi, focei]` everything on it describes VI's parameter point, not
+    // the one the fit reports. `is_last_estimating_stage` is the same predicate the loop
+    // used, so trailing evaluators do not count as superseding.
+    if let (Some(vi), Some(idx)) = (vi_result.as_mut(), vi_stage_idx) {
+        if !is_last_estimating_stage(&chain, idx, &eval_only_methods) {
+            let by = chain[idx + 1..]
+                .iter()
+                .rposition(|m| !eval_only_methods.contains(m))
+                .map(|off| chain[idx + 1 + off].label().to_string());
+            if let Some(by) = by {
+                vi.superseded_by = Some(by.clone());
+                accumulated_warnings.push(format!(
+                    "VI: the reported theta/Omega/sigma come from the later {by} stage, but \
+                     the vi block (eta_means, eta_covs, ELBO, elbo_tightness_ratio) still \
+                     describes the parameter point VI ended on. Read it there, or run VI as the \
+                     last estimating stage (a trailing agq_eval_only / imp_eval_only readout does \
+                     not move the estimates)."
+                ));
+            }
+        }
+    }
+
     result.warnings = accumulated_warnings;
 
     // Thread efficiency warnings (post-chain, uses n_threads_used captured above).

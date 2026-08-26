@@ -2396,7 +2396,18 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                 .with_block("fit_options"),
             );
         }
-        if options.n_agq > 1 {
+        // `n_agq` is a *chain* option, not a per-stage one, so a chain that pairs VI
+        // with a quadrature stage — the documented `methods = [vi, laplace]`,
+        // `agq_eval_only = true` readout, which turns VI's ELBO lower bound into a real
+        // −2 log L — legitimately carries `n_agq > 1`: the grid belongs to the Laplace
+        // stage, and VI ignores it. Reject only when *no* stage consumes it, i.e. when
+        // the user has set `n_agq` on a VI-only chain and would otherwise believe it did
+        // something. `focei` consumes `n_agq > 1` as the Gauss-Newton-anchored quadrature;
+        // `laplace` consumes it at any `n_agq`.
+        let consumes_n_agq = chain
+            .iter()
+            .any(|&m| matches!(m, EstimationMethod::Laplace | EstimationMethod::FoceI));
+        if options.n_agq > 1 && !consumes_n_agq {
             diags.push(
                 Diagnostic::error(
                     "E_VI_NAGQ_UNSUPPORTED",
@@ -2713,12 +2724,22 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                     | EstimationMethod::Saem
                     | EstimationMethod::Imp
                     | EstimationMethod::Laplace
+                    // VI's data term is `obs_nll_subject_grad`, whose non-IOV path already
+                    // routes a dense `R` through the same full-FD fallback FOCE/SAEM use
+                    // (`fixed_eta_gradient.rs`: `fd_all` when `residual_correlations` is
+                    // non-empty), so the objective and its θ/σ gradient are correct here.
+                    // Only the *closed-form* σ maximizer is unavailable, and
+                    // `closed_form_sigma_support` already declines it with a recorded reason
+                    // and falls back to Adam — which is what the option docs promise.
+                    // block_sigma + IOV is rejected separately
+                    // (`E_BLOCK_SIGMA_IOV_UNSUPPORTED`), so the IOV path is never reached.
+                    | EstimationMethod::Vi
             ) {
                 diags.push(
                     Diagnostic::error(
                         "E_BLOCK_SIGMA_METHOD_UNSUPPORTED",
                         "block_sigma correlated residual errors are currently supported for \
-                         method = foce, focei, saem, imp, agq, and laplace only. The gn / \
+                         method = foce, focei, saem, imp, agq, laplace, and vi only. The gn / \
                          gn_hybrid Gauss-Newton paths still use diagonal residual-error \
                          derivatives.",
                     )

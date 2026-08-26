@@ -134,6 +134,23 @@ fn max_relative_change(a: &[f64], b: &[f64]) -> f64 {
         .fold(0.0f64, f64::max)
 }
 
+/// Whether *both* halves of the optimization have stopped moving between two blocks.
+///
+/// The parameter-stability criterion is sufficient on its own to stop a VI run, so it has
+/// to be asked about everything the run is fitting. `x` — the packed population vector —
+/// is only half of that: `φ`, the variational parameters, is the other half, is never
+/// FIXed, and is what a VI fit is usually *for*. Measuring `x` alone lets a chain in which
+/// the population coordinates settle first (or are nearly all pinned) stop the run while
+/// the per-subject posteriors are still moving, and return them as converged.
+///
+/// Both halves are judged on the same window and the same tolerance. `max_relative_change`
+/// is already a max over coordinates, so the max of the two calls is the same question
+/// asked over the concatenated vector — written as two only because `x` and `φ` are stored
+/// separately.
+fn estimates_have_settled(x: &[f64], prev_x: &[f64], phi: &[f64], prev_phi: &[f64]) -> bool {
+    max_relative_change(x, prev_x).max(max_relative_change(phi, prev_phi)) < PARAM_SETTLE_REL_TOL
+}
+
 /// Whether the parameter-stability criterion means anything for this model.
 ///
 /// [`max_relative_change`] asks whether the population estimates have stopped moving. When every
@@ -153,6 +170,11 @@ fn max_relative_change(a: &[f64], b: &[f64]) -> f64 {
 /// how you read per-subject posteriors at a fixed estimate), so the fix is to recognise the
 /// criterion as vacuous rather than to forbid the configuration. With no free population
 /// coordinate the objective is the only convergence signal there is, and it is used alone.
+///
+/// The criterion now also requires `φ` to have settled, which independently defeats the
+/// all-FIXed case (a moving `φ` resets the counter). This guard is kept as the explicit,
+/// zero-tolerance statement of it: an `x` that cannot move must never *contribute* evidence
+/// of convergence, whatever `φ` happens to be doing on a given window.
 fn param_criterion_applies(template: &ModelParameters) -> bool {
     let fixed = crate::estimation::parameterization::packed_fixed_mask(template);
     let structural = crate::estimation::parameterization::omega_structural_zero_mask(template);
@@ -215,6 +237,64 @@ pub fn trace_has_settled(trace: &[f64], window: usize, rel_tol: f64) -> bool {
 
     let tol = SETTLE_Z * se + rel_tol * (1.0 + m_recent.abs());
     (m_prior - m_recent).abs() <= tol
+}
+
+/// Blocks the trace tail is split into for the systematic-drift test below.
+const DRIFT_BLOCKS: usize = 10;
+
+/// Fraction of consecutive block-to-block steps that must move the same way for the
+/// remaining drift to count as systematic rather than noise.
+const DRIFT_SIGN_FRACTION: f64 = 0.8;
+
+/// Whether the objective is still moving *systematically* despite [`trace_has_settled`].
+///
+/// # Why this exists
+///
+/// `trace_has_settled` stops the run when the drift between two windows is no longer
+/// distinguishable from Monte-Carlo noise. At a low `vi_mc_samples` the noise floor is
+/// high, so that becomes true while real drift remains — the run stops short and reports
+/// `converged: true` at a visibly worse point. Measured on warfarin at the default 8
+/// draws: `σ = 0.014150` against `0.010565` from both AGQ (`n_agq = 9`) and FOCEI, 34 %
+/// high, with an OFV 11.3 units short of the reference. Because per-subject posterior
+/// width scales with `σ²`, every variational covariance reported there was ~1.75× too
+/// wide. Raising the draws resolves it (`32` → −284.6, `128` → −285.4 against AGQ's
+/// −285.977); so does lowering `vi_lr`. Starting from a fitted FOCEI point does not.
+///
+/// # Why a sign test
+///
+/// The failure is *below* the per-window noise the settling test measures, so no single
+/// window comparison can see it — that is the definition of the noise floor. What a
+/// noise-limited stop and a genuine plateau differ in is not the size of each step but
+/// its *sign*: noise alternates, real drift does not. Splitting the tail into
+/// [`DRIFT_BLOCKS`] block means and counting how many consecutive steps move the same
+/// direction extracts a trend far below the amplitude of one step, at no cost — the
+/// trace is already in hand.
+///
+/// Deliberately one-sided and conservative: it fires only when at least
+/// [`DRIFT_SIGN_FRACTION`] of the steps agree, and a fair coin clears that bar on
+/// 9 steps under 5 % of the time. A run that has genuinely plateaued alternates and
+/// does not trip it.
+pub(crate) fn trace_still_drifting(trace: &[f64], window: usize) -> bool {
+    let tail = 2 * window;
+    if window == 0 || trace.len() < tail || tail < DRIFT_BLOCKS * 2 {
+        return false;
+    }
+    let t = &trace[trace.len() - tail..];
+    let per = t.len() / DRIFT_BLOCKS;
+    let means: Vec<f64> = (0..DRIFT_BLOCKS)
+        .map(|b| {
+            let seg = &t[b * per..(b + 1) * per];
+            seg.iter().sum::<f64>() / seg.len() as f64
+        })
+        .collect();
+    if means.iter().any(|m| !m.is_finite()) {
+        return false;
+    }
+    let steps = means.windows(2).map(|w| w[1] - w[0]);
+    let (down, total) = steps.fold((0usize, 0usize), |(d, n), s| {
+        (d + usize::from(s < 0.0), n + 1)
+    });
+    total > 0 && (down as f64) / (total as f64) >= DRIFT_SIGN_FRACTION
 }
 
 /// The `vi_kl = analytic` fallback warning, or `None` when nothing fell back.
@@ -448,6 +528,14 @@ pub fn run_vi(
     let mut prev_block: Option<Vec<f64>> = None;
     let mut consecutive_param_settled = 0usize;
     let mut param_settled = false;
+    // The same block mean over the *variational* parameters, flattened across subjects.
+    // `x` alone is not enough to certify convergence: `φ` is half the optimization, it is
+    // never FIXed, and a population vector that settles first (or is all but pinned) would
+    // otherwise stop a run whose per-subject posteriors are still moving — and those
+    // posteriors are what a VI fit is for. Both must be still for this criterion to fire.
+    let phi_len: usize = (0..n_subjects).map(|i| families[i].n_params()).sum();
+    let mut phi_block_acc = vec![0.0f64; phi_len];
+    let mut prev_phi_block: Option<Vec<f64>> = None;
     let mut avg_x = PolyakAverager::new(x.len());
     let mut avg_phi: Vec<PolyakAverager> = (0..n_subjects)
         .map(|i| PolyakAverager::new(families[i].n_params()))
@@ -602,6 +690,12 @@ pub fn run_vi(
         for (a, v) in block_acc.iter_mut().zip(x.iter()) {
             *a += *v;
         }
+        for (a, v) in phi_block_acc
+            .iter_mut()
+            .zip(phis.iter().flat_map(|p| p.iter()))
+        {
+            *a += *v;
+        }
         block_n += 1;
 
         if settled_at.is_none() && iter < avg_start && (iter + 1) % CONVERGENCE_CHECK_INTERVAL == 0
@@ -616,15 +710,18 @@ pub fn run_vi(
 
             // Parameter stability, on the same cadence and with the same patience.
             let block: Vec<f64> = block_acc.iter().map(|a| a / block_n as f64).collect();
-            if let Some(prev) = prev_block.as_ref() {
-                if max_relative_change(&block, prev) < PARAM_SETTLE_REL_TOL {
+            let phi_block: Vec<f64> = phi_block_acc.iter().map(|a| a / block_n as f64).collect();
+            if let (Some(prev), Some(prev_phi)) = (prev_block.as_ref(), prev_phi_block.as_ref()) {
+                if estimates_have_settled(&block, prev, &phi_block, prev_phi) {
                     consecutive_param_settled += 1;
                 } else {
                     consecutive_param_settled = 0;
                 }
             }
             prev_block = Some(block);
+            prev_phi_block = Some(phi_block);
             block_acc.iter_mut().for_each(|a| *a = 0.0);
+            phi_block_acc.iter_mut().for_each(|a| *a = 0.0);
             block_n = 0;
             // Guarded: with no free population coordinate this criterion is vacuous and must
             // not certify convergence. See `param_criterion_applies`.
@@ -754,10 +851,35 @@ pub fn run_vi(
     // Judged on the run that actually happened, not on the `vi_iters` ceiling — under
     // early stopping those differ, and windowing a 900-iteration trace as though it were
     // 25 000 long would make `trace_has_settled` return `false` for every early stop.
-    let converged = settled_at.is_some()
+    let mut converged = settled_at.is_some()
         || param_settled
         || trace_has_settled(&trace, settle_window(n_iters_run), CONVERGENCE_REL_TOL);
-    if !converged {
+
+    // A stop the noise floor caused rather than the optimum. `trace_has_settled` asks
+    // whether the remaining drift is distinguishable from Monte-Carlo noise; at a low
+    // `vi_mc_samples` the answer turns "no" while the objective is still falling, and the
+    // fit is reported successful well short of the reference (see `trace_still_drifting`).
+    // The parameter criterion is exempt: it fires on a flat direction the objective can
+    // never settle on, which is the case it exists for, and there the trend is real but
+    // irrelevant. A warning either way — the numbers are not wrong, they are unfinished —
+    // but `converged` must not say otherwise.
+    let mut noise_floor_stop = false;
+    if converged && !param_settled && trace_still_drifting(&trace, settle_window(n_iters_run)) {
+        converged = false;
+        noise_floor_stop = true;
+        warnings.push(format!(
+            "VI: the objective stopped because its drift fell below the Monte-Carlo noise \
+             floor at vi_mc_samples = {}, not because it reached the optimum — the ELBO trace \
+             is still falling systematically. Reported converged: false. Raise vi_mc_samples \
+             (32 recovers the FOCEI/AGQ reference on warfarin, where the default 8 leaves sigma \
+             34% high and the OFV 11.3 units short), or lower vi_lr.",
+            options.vi_mc_samples
+        ));
+    }
+    // Skipped when the drift check just demoted `converged`: that warning already says
+    // what happened, and more precisely — "raise vi_iters" is the wrong advice for a run
+    // that is noise-limited rather than budget-limited.
+    if !converged && !noise_floor_stop {
         warnings.push(format!(
             "VI: neither the objective nor the parameter estimates had settled after \
              {n_iters_run} iterations (see vi.elbo_trace). Increase vi_iters, or lower \
@@ -889,6 +1011,9 @@ pub fn run_vi(
         kappa_means,
         n_fd_subjects,
         elbo_tightness_ratio: tightness.ratio(),
+        // Set by `fit_inner`, which is the only place that can see the rest of the chain;
+        // `run_vi` has been handed a blanked per-stage option set and knows nothing of it.
+        superseded_by: None,
     };
 
     Ok(OuterResult {

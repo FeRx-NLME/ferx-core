@@ -2260,6 +2260,12 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         writeln!(f, "  n_fd_subjects: {}", v.n_fd_subjects).map_err(|e| e.to_string())?;
         // Read alongside `converged`, not after it: a flat objective cannot tell a
         // converged fit from a stuck one, and this can. ~1 is ideal.
+        // Emitted only when set, so an ordinary VI fit's YAML is unchanged. When it is
+        // set, everything else under `vi:` describes VI's parameter point rather than the
+        // one this file reports — see `ViResult::superseded_by`.
+        if let Some(ref by) = v.superseded_by {
+            writeln!(f, "  superseded_by: {}", yaml_quote(by)).map_err(|e| e.to_string())?;
+        }
         writeln!(f, "  elbo_tightness_ratio: {:.3}", v.elbo_tightness_ratio)
             .map_err(|e| e.to_string())?;
         writeln!(f, "  elbo_trace:").map_err(|e| e.to_string())?;
@@ -2285,7 +2291,11 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     .get(i)
                     .map(|s| s.id.as_str())
                     .unwrap_or("unknown");
-                writeln!(f, "    - id: {}", id).map_err(|e| e.to_string())?;
+                // Quoted: a subject ID is free-form data — `001` would otherwise parse
+                // back as the integer 1, and `a: b` or `#x` would change the document's
+                // shape or truncate the value, defeating the point of keying by the
+                // original ID.
+                writeln!(f, "    - id: {}", yaml_quote(id)).map_err(|e| e.to_string())?;
                 let means: Vec<String> = mean.iter().map(|m| format!("{:.6}", m)).collect();
                 writeln!(f, "      mean: [{}]", means.join(", ")).map_err(|e| e.to_string())?;
                 // Full covariance, row by row: the off-diagonals are the point of a
@@ -3869,6 +3879,7 @@ mod tests {
             kappa_means: vec![Vec::new(), Vec::new()],
             n_fd_subjects: 0,
             elbo_tightness_ratio: 1.02,
+            superseded_by: None,
         });
 
         let dir = std::env::temp_dir().join(format!("ferx_vi_yaml_{}", std::process::id()));
@@ -3882,9 +3893,9 @@ mod tests {
             out.contains("eta_names: [ETA_CL, ETA_V]"),
             "eta names must be emitted so the vectors below can be read; got:\n{out}"
         );
-        // Keyed by ID, in subject order.
+        // Keyed by ID, in subject order. Quoted, because a subject ID is free-form data.
         assert!(
-            out.contains("- id: subj-A") && out.contains("- id: subj-B"),
+            out.contains("- id: \"subj-A\"") && out.contains("- id: \"subj-B\""),
             "each posterior must carry its subject id; got:\n{out}"
         );
         assert!(
@@ -3900,6 +3911,67 @@ mod tests {
         assert!(
             !out.contains("kappa_means"),
             "a non-IOV fit must not emit an empty kappa_means block; got:\n{out}"
+        );
+    }
+
+    /// Subject IDs that mean something else in YAML must survive the round trip.
+    ///
+    /// The point of keying the posterior by ID is that a row can be matched back to the
+    /// data. An unquoted `001` parses back as the integer `1`, `a: b` changes the
+    /// document's shape, `#x` truncates to nothing, and an embedded quote can make the
+    /// file unparseable — each of which defeats that. The IDs here are all real shapes
+    /// (zero-padded numeric IDs are the norm in NONMEM datasets).
+    #[test]
+    fn vi_posterior_ids_are_quoted_and_escaped() {
+        let ids = ["001", "a: b", "#x", "say \"hi\"", "true"];
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        r.method = EstimationMethod::Vi;
+        r.method_chain = vec![EstimationMethod::Vi];
+        r.eta_names = vec!["ETA_CL".into()];
+        r.subjects = ids.iter().map(|id| sdtab_subject_result(id, 1)).collect();
+        r.vi = Some(ViResult {
+            neg_two_elbo: -1.0,
+            data_term: -2.0,
+            kl_term: 0.5,
+            n_iterations: 10,
+            converged: true,
+            family: "full_rank".into(),
+            n_mc_samples: 8,
+            kl: "analytic".into(),
+            n_kl_fallback_subjects: 0,
+            elbo_trace: vec![1.0],
+            eta_means: ids.iter().map(|_| vec![0.0]).collect(),
+            eta_covs: ids.iter().map(|_| vec![vec![0.01]]).collect(),
+            kappa_means: ids.iter().map(|_| Vec::new()).collect(),
+            n_fd_subjects: 0,
+            elbo_tightness_ratio: 1.0,
+            superseded_by: None,
+        });
+
+        let dir = std::env::temp_dir().join(format!("ferx_vi_ids_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fit.yaml");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml writes");
+        let out = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        for id in ["001", "a: b", "#x", "true"] {
+            assert!(
+                out.contains(&format!("- id: \"{id}\"")),
+                "id {id:?} must be emitted as a quoted YAML string; got:\n{out}"
+            );
+        }
+        assert!(
+            out.contains("- id: \"say \\\"hi\\\"\""),
+            "an embedded quote must be escaped, not left to break the document; got:\n{out}"
+        );
+
+        // Every subject is still present and on its own row: one ID swallowing the next
+        // is the failure mode an unquoted `a: b` would produce.
+        assert_eq!(
+            out.matches("- id: ").count(),
+            ids.len(),
+            "expected one row per subject; got:\n{out}"
         );
     }
 

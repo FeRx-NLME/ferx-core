@@ -914,13 +914,18 @@ fn test_check_model_options_block_sigma_rejects_unsupported_methods() {
         .iter()
         .any(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED"));
 
-    // FOCE, FOCEI, SAEM, IMP, AGQ, and Laplace are all accepted (no method diagnostic).
+    // FOCE, FOCEI, SAEM, IMP, AGQ, Laplace, and VI are all accepted (no method
+    // diagnostic). VI belongs here because its data term is `obs_nll_subject_grad`,
+    // whose non-IOV path routes a dense `R` through the same full-FD fallback the
+    // others use; only the closed-form σ maximizer is unavailable there, and that
+    // falls back to Adam with a recorded reason rather than failing the fit.
     for method in [
         EstimationMethod::Foce,
         EstimationMethod::FoceI,
         EstimationMethod::Saem,
         EstimationMethod::Imp,
         EstimationMethod::Laplace,
+        EstimationMethod::Vi,
     ] {
         let opts = fast_opts(method, Optimizer::Bobyqa, false);
         assert!(
@@ -1083,6 +1088,238 @@ fn test_saem_accepts_block_sigma_cross_endpoint_fit() {
     let result = fit(&model, &population, &model.default_params, &opts)
         .expect("SAEM fit with cross-endpoint block_sigma should succeed");
     assert!(result.ofv.is_finite(), "SAEM OFV must be finite");
+}
+
+/// A VI block that a later *estimating* stage has overtaken says so; one followed only by
+/// an evaluator does not.
+///
+/// `FitResult.vi` survives the rest of a chain on purpose — `methods = [vi, laplace]` with
+/// `agq_eval_only` is the recommended way to turn VI's lower bound into a real `−2 log L`,
+/// and the variational covariance is the only per-subject covariance in the result. But on
+/// `methods = [vi, focei]` the reported θ/Ω/σ and subject diagnostics come from FOCEI while
+/// every number under `vi` still describes VI's parameter point. That is worth reporting,
+/// not worth reporting *silently*.
+#[test]
+fn test_vi_block_is_marked_when_a_later_stage_re_estimates() {
+    use crate::parser::model_parser::parse_model_string;
+    use std::collections::HashMap;
+
+    let model = parse_model_string(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  omega ETA_CL ~ 0.04
+  sigma PROP_ERR ~ 0.04
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+",
+    )
+    .expect("1-cpt IV fixture parses");
+
+    let mut subjects = Vec::new();
+    for (id, dose_amt, obs) in [("1", 100.0, vec![8.0, 6.0]), ("2", 80.0, vec![6.5, 4.9])] {
+        subjects.push(Subject {
+            id: id.into(),
+            doses: vec![DoseEvent::new(0.0, dose_amt, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 2.0],
+            obs_raw_times: Vec::new(),
+            observations: obs,
+            obs_cmts: vec![1, 1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 2],
+            occasions: Vec::new(),
+            obs_l2: Vec::new(),
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        });
+    }
+    let population = Population {
+        subjects,
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+
+    let base = |methods: Vec<EstimationMethod>| {
+        let mut o = fast_opts(EstimationMethod::Vi, Optimizer::Bobyqa, false);
+        o.methods = methods;
+        o.outer_maxiter = 2;
+        o.vi_iters = 5;
+        o.vi_mc_samples = 2;
+        o
+    };
+
+    // VI alone: nothing supersedes it.
+    let solo = fit(&model, &population, &model.default_params, &base(vec![]))
+        .expect("VI-only fit succeeds");
+    assert_eq!(solo.vi.as_ref().expect("VI block").superseded_by, None);
+
+    // A trailing evaluator reads the fit out without moving it, so the VI block still
+    // describes the reported parameters.
+    let mut eval_opts = base(vec![EstimationMethod::Vi, EstimationMethod::Laplace]);
+    eval_opts.agq_eval_only = true;
+    let evaluated = fit(&model, &population, &model.default_params, &eval_opts)
+        .expect("vi + agq_eval_only laplace fit succeeds");
+    assert_eq!(
+        evaluated.vi.as_ref().expect("VI block").superseded_by,
+        None,
+        "an evaluation-only stage must not count as superseding VI"
+    );
+
+    // A later estimating stage does move the parameters, and is named.
+    let chained = fit(
+        &model,
+        &population,
+        &model.default_params,
+        &base(vec![EstimationMethod::Vi, EstimationMethod::FoceI]),
+    )
+    .expect("vi + focei fit succeeds");
+    assert_eq!(
+        chained
+            .vi
+            .as_ref()
+            .expect("VI block")
+            .superseded_by
+            .as_deref(),
+        Some("FOCEI")
+    );
+    assert!(
+        chained
+            .warnings
+            .iter()
+            .any(|w| w.contains("still describes the parameter point VI ended on")),
+        "the staleness must be stated in prose too, got {:?}",
+        chained.warnings
+    );
+}
+
+/// VI must accept a correlated `$SIGMA` block too, and fall back to Adam on `σ` rather
+/// than failing.
+///
+/// Its data term is `obs_nll_subject_grad`, whose non-IOV path routes a dense `R` through
+/// the same full-FD fallback FOCE and SAEM use, so the objective and its θ/σ gradient are
+/// correct here. What a dense `R` does remove is the *closed-form* `σ` maximizer — `σ` is
+/// no longer inside a scalar variance with a stationary point — and `closed_form_sigma_support`
+/// declines it with a reason and steps `σ` by Adam instead. The option docs promise exactly
+/// that fallback, so rejecting the configuration at check time contradicted them.
+#[test]
+fn test_vi_accepts_block_sigma_cross_endpoint_fit() {
+    use crate::parser::model_parser::parse_model_string;
+    use std::collections::HashMap;
+
+    let model = parse_model_string(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  omega ETA_CL ~ 0.04
+  block_sigma (PROP_ERR_UNBOUND, PROP_ERR_TOTAL) = [
+    0.04,
+    0.01, 0.09
+  ]
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = -CL/V * central
+
+[scaling]
+  y[CMT=1] = 2.0 * central / V
+  y[CMT=2] = central / V
+
+[error_model]
+  CMT=1: DV ~ proportional(PROP_ERR_TOTAL)
+  CMT=2: DV ~ proportional(PROP_ERR_UNBOUND)
+",
+    )
+    .expect("cross-endpoint block_sigma ODE model parses");
+
+    // Check time first: this is the guard the docs contradicted.
+    let check_opts = fast_opts(EstimationMethod::Vi, Optimizer::Bobyqa, false);
+    assert!(
+        !super::check_model_options(&model, &check_opts)
+            .iter()
+            .any(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED"),
+        "block_sigma + vi must not be rejected at check time"
+    );
+
+    let mut subjects = Vec::new();
+    for (id, dose_amt, obs) in [
+        ("1", 100.0, vec![17.0, 8.0, 15.0, 7.0]),
+        ("2", 80.0, vec![14.0, 6.8, 12.0, 6.0]),
+    ] {
+        subjects.push(Subject {
+            id: id.into(),
+            doses: vec![DoseEvent::new(0.0, dose_amt, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 1.0, 2.0, 2.0],
+            obs_raw_times: Vec::new(),
+            observations: obs,
+            obs_cmts: vec![1, 2, 1, 2],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 4],
+            occasions: Vec::new(),
+            obs_l2: Vec::new(),
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        });
+    }
+    let population = Population {
+        subjects,
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+
+    let mut opts = fast_opts(EstimationMethod::Vi, Optimizer::Bobyqa, false);
+    opts.vi_iters = 5;
+    opts.vi_mc_samples = 2;
+
+    let result = fit(&model, &population, &model.default_params, &opts)
+        .expect("VI fit with cross-endpoint block_sigma should succeed");
+    let vi = result.vi.as_ref().expect("VI block present");
+    assert!(
+        vi.neg_two_elbo.is_finite(),
+        "dense-R data term must produce a finite -2*ELBO"
+    );
+    // And the promised fallback actually fired, with its reason recorded.
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("vi_sigma_update") && w.contains("Adam")),
+        "expected the closed-form sigma fallback warning, got {:?}",
+        result.warnings
+    );
 }
 
 // Importance sampling must accept a correlated $SIGMA block: the weights use

@@ -4561,6 +4561,23 @@ pub struct ViResult {
     /// parameters cannot distinguish from success. A deep compartment model that
     /// reported `converged: true` at 889 OFV worse than FOCEI scored ~380 here.
     pub elbo_tightness_ratio: f64,
+    /// The label of the later **estimating** stage that moved `(θ, Ω, σ)` after this VI
+    /// stage ran, or `None` when nothing did.
+    ///
+    /// A VI result survives the rest of a chain because `methods = [vi, laplace]` with
+    /// `agq_eval_only` — a pure readout — is the recommended way to finish a VI fit, and
+    /// dropping it there would discard the object exactly when it was produced correctly.
+    /// But `methods = [vi, focei]` re-estimates: the `FitResult`'s θ/Ω/σ and subject
+    /// diagnostics then come from FOCEI, while everything here — `eta_means`, `eta_covs`,
+    /// both ELBO halves and `elbo_tightness_ratio` — still describes the *pre-FOCEI*
+    /// parameter point. That is a legitimate thing to report, but not without saying so.
+    /// Non-`None` means: interpret these numbers at the parameters VI ended on, not at the
+    /// ones the fit reports. A warning on `FitResult.warnings` says the same in prose.
+    ///
+    /// `None` on any chain whose VI stage was the last estimating one, including when
+    /// evaluation-only stages (`imp_eval_only`, `agq_eval_only`) follow it.
+    #[serde(default)]
+    pub superseded_by: Option<String>,
 }
 
 /// Result of a full MCMC Bayesian fit (`EstimationMethod::Bayes`). Surfaced on
