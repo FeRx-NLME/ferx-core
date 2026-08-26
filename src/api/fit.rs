@@ -124,6 +124,31 @@ pub fn fit_from_files(
     Ok(result)
 }
 
+/// Warning for an explicit `optimizer = bobyqa` on a problem too large for it
+/// (#1064), or `None` when the choice is fine.
+///
+/// `auto` switches away from BOBYQA above [`BOBYQA_MAX_DIM`] on its own (see
+/// [`Optimizer::resolve_auto`]); an explicit `bobyqa` is the user's call and is
+/// honoured, but it must not be a silent hour. BOBYQA interpolates a quadratic
+/// over the whole parameter space, so the model it has to build grows
+/// quadratically in the parameter count.
+///
+/// A free function rather than an inline block so both branches are reachable
+/// from a unit test without running a fit with several hundred free parameters.
+pub(crate) fn bobyqa_scale_warning(optimizer: Optimizer, dim: usize) -> Option<String> {
+    if optimizer != Optimizer::Bobyqa || dim <= crate::types::BOBYQA_MAX_DIM {
+        return None;
+    }
+    Some(format!(
+        "optimizer = bobyqa with {dim} free parameters: BOBYQA builds a quadratic \
+         interpolation model over the whole parameter space, which grows \
+         quadratically in the parameter count and is unlikely to make progress at \
+         this size. `optimizer = nlopt_lbfgs` (or the default `auto`, which switches \
+         above {}) costs O(n) finite-difference passes instead.",
+        crate::types::BOBYQA_MAX_DIM
+    ))
+}
+
 /// Perturb initial parameters for multi-start optimisation.
 ///
 /// Start 0 always returns the unmodified params. Starts 1..n multiply each
@@ -641,23 +666,8 @@ pub fn fit(
 
     // Warn once (before the parallel section) that global_search only runs on start 0.
     let mut pre_warnings: Vec<String> = ltbs_warnings;
-    // #1064: `auto` switches away from BOBYQA above `BOBYQA_MAX_DIM` on its own
-    // (see `Optimizer::resolve_auto`); an explicit `optimizer = bobyqa` is the
-    // user's call, but it must not be a silent hour. BOBYQA interpolates a
-    // quadratic over the whole space, so the model it has to build grows
-    // quadratically in the parameter count.
-    {
-        let dim = model.free_packed_dim();
-        if options.optimizer == Optimizer::Bobyqa && dim > crate::types::BOBYQA_MAX_DIM {
-            pre_warnings.push(format!(
-                "optimizer = bobyqa with {dim} free parameters: BOBYQA builds a quadratic \
-                 interpolation model over the whole parameter space, which grows \
-                 quadratically in the parameter count and is unlikely to make progress at \
-                 this size. `optimizer = nlopt_lbfgs` (or the default `auto`, which switches \
-                 above {}) costs O(n) finite-difference passes instead.",
-                crate::types::BOBYQA_MAX_DIM
-            ));
-        }
+    if let Some(w) = bobyqa_scale_warning(options.optimizer, model.free_packed_dim()) {
+        pre_warnings.push(w);
     }
     if options.global_search && n > 1 {
         pre_warnings.push(format!(
@@ -2312,4 +2322,45 @@ fn fit_inner(
     }
 
     Ok(fit_result)
+}
+
+#[cfg(test)]
+mod bobyqa_scale_warning_tests {
+    use super::bobyqa_scale_warning;
+    use crate::types::{Optimizer, BOBYQA_MAX_DIM};
+
+    #[test]
+    fn no_warning_at_or_below_the_threshold() {
+        assert!(bobyqa_scale_warning(Optimizer::Bobyqa, BOBYQA_MAX_DIM).is_none());
+        assert!(bobyqa_scale_warning(Optimizer::Bobyqa, 1).is_none());
+    }
+
+    #[test]
+    fn an_explicit_bobyqa_above_the_threshold_warns() {
+        let w = bobyqa_scale_warning(Optimizer::Bobyqa, BOBYQA_MAX_DIM + 1)
+            .expect("an explicit bobyqa at this size must not be a silent hour");
+        assert!(w.contains("optimizer = bobyqa"), "{w}");
+        assert!(
+            w.contains("nlopt_lbfgs"),
+            "the message must name the way out: {w}"
+        );
+    }
+
+    #[test]
+    fn other_optimizers_are_never_warned_about() {
+        // `auto` resolves itself (see `Optimizer::resolve_auto`); the rest are
+        // gradient-based and cost O(n).
+        for opt in [
+            Optimizer::Auto,
+            Optimizer::NloptLbfgs,
+            Optimizer::Slsqp,
+            Optimizer::Mma,
+            Optimizer::TrustRegion,
+        ] {
+            assert!(
+                bobyqa_scale_warning(opt, BOBYQA_MAX_DIM * 10).is_none(),
+                "{opt:?} must not warn"
+            );
+        }
+    }
 }

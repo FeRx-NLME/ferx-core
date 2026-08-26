@@ -2577,6 +2577,65 @@ mod tests {
     }
 
     #[test]
+    fn block_summary_reports_min_median_max_over_the_sorted_values() {
+        // The median is the lower of the two middle values on an even count —
+        // these are a nuisance block, not a quantity anyone interpolates.
+        assert_eq!(block_summary(&[3.0, -1.0, 2.0]), (-1.0, 2.0, 3.0));
+        assert_eq!(block_summary(&[4.0, 1.0, 3.0, 2.0]), (1.0, 2.0, 4.0));
+        assert_eq!(block_summary(&[7.5]), (7.5, 7.5, 7.5));
+    }
+
+    #[test]
+    fn a_small_block_stays_inline_in_the_theta_table() {
+        // Below `THETA_BLOCK_COMPACT_MIN` the behaviour must be exactly what it
+        // was before level blocks existed: one row per θ, no block section.
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        let n = THETA_BLOCK_COMPACT_MIN - 1;
+        r.theta = (1..=n).map(|i| i as f64).collect();
+        r.theta_names = (1..=n).map(|i| format!("SMALL[L={i}]")).collect();
+        r.theta_fixed = vec![false; n];
+        r.se_theta = None;
+
+        assert!(compact_theta_blocks(&r.theta_names).is_empty());
+        let summary = format_summary(&r);
+        assert!(!summary.contains("THETA BLOCKS"), "{summary}");
+        assert!(summary.contains("SMALL[L=1]"), "{summary}");
+    }
+
+    #[test]
+    fn print_results_renders_the_compact_block_section() {
+        // `print_results` writes to stderr, so this asserts it runs the block
+        // branch without panicking on the slicing rather than on its text —
+        // the YAML and summary paths above cover the wording.
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        let n = THETA_BLOCK_COMPACT_MIN + 2;
+        r.theta = (1..=n).map(|i| i as f64).collect();
+        r.theta_names = (1..=n).map(|i| format!("PLACEBO[L={i}]")).collect();
+        r.theta_fixed = vec![false; n];
+        r.se_theta = Some(vec![0.01; n]);
+        print_results(&r);
+
+        let blocks = compact_theta_blocks(&r.theta_names);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].1.len(), n);
+    }
+
+    #[test]
+    fn two_adjacent_blocks_are_reported_separately() {
+        // Runs are keyed on the name before the bracket, so two blocks sitting
+        // next to each other in the θ vector must not merge into one.
+        let n = THETA_BLOCK_COMPACT_MIN;
+        let mut names: Vec<String> = (1..=n).map(|i| format!("A[L={i}]")).collect();
+        names.extend((1..=n).map(|i| format!("B[L={i}]")));
+        let blocks = compact_theta_blocks(&names);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].0, "A");
+        assert_eq!(blocks[1].0, "B");
+        assert_eq!(blocks[0].1, 0..n);
+        assert_eq!(blocks[1].1, n..2 * n);
+    }
+
+    #[test]
     fn compact_theta_output_reports_free_coefficients_not_levels() {
         let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
         r.theta = (1..=21).map(|i| i as f64).collect();

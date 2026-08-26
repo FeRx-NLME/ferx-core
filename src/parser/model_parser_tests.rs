@@ -19356,3 +19356,258 @@ mod theta_vector_blocks {
         );
     }
 }
+
+// ── #1064: the level-block primitives, branch by branch ────────────────────
+//
+// The declaration surface and the end-to-end binding are covered by
+// `theta_vector_blocks` above and `api::levels`. What is left here are the
+// error and edge branches of the primitives themselves — reachable directly,
+// and several of them not reachable at all through a well-formed model file.
+mod theta_level_primitives {
+    use super::*;
+
+    fn spec(levels: Vec<LevelRule>) -> GatherSpec {
+        GatherSpec {
+            name: "PLACEBO".to_string(),
+            levels,
+        }
+    }
+
+    fn binding(labels: &[&str], groups: &[usize], contrast: LevelContrast) -> LevelBinding {
+        LevelBinding {
+            labels: labels.iter().map(|s| s.to_string()).collect(),
+            groups: groups.to_vec(),
+            contrast,
+        }
+    }
+
+    // ── parse_theta_block_spec ──────────────────────────────────────────────
+
+    #[test]
+    fn a_digits_only_bracket_is_a_level_count() {
+        assert_eq!(
+            parse_theta_block_spec("P", " 12 ").unwrap(),
+            ThetaBlockSpec::Count(12)
+        );
+    }
+
+    #[test]
+    fn a_zero_level_count_is_rejected() {
+        let err = parse_theta_block_spec("P", "0").unwrap_err();
+        assert!(err.contains("at least one level"), "{err}");
+    }
+
+    #[test]
+    fn a_level_count_too_large_for_usize_is_rejected_not_wrapped() {
+        // All-digits but unparseable — the branch that would otherwise panic on
+        // `unwrap` or silently wrap.
+        let huge = "9".repeat(40);
+        let err = parse_theta_block_spec("P", &huge).unwrap_err();
+        assert!(err.contains("bad level count"), "{err}");
+    }
+
+    #[test]
+    fn columns_after_the_contrast_modifier_are_rejected() {
+        let err = parse_theta_block_spec("P", "STUDY, contrast = ref, TIME").unwrap_err();
+        assert!(err.contains("must come before `contrast = ...`"), "{err}");
+    }
+
+    #[test]
+    fn a_repeated_contrast_modifier_is_rejected() {
+        let err =
+            parse_theta_block_spec("P", "STUDY, contrast = ref, contrast = none").unwrap_err();
+        assert!(err.contains("`contrast` given twice"), "{err}");
+    }
+
+    #[test]
+    fn a_column_name_with_punctuation_is_rejected() {
+        let err = parse_theta_block_spec("P", "STUDY-ARM, TIME").unwrap_err();
+        assert!(err.contains("not a valid data column name"), "{err}");
+    }
+
+    #[test]
+    fn empty_entries_between_commas_are_skipped() {
+        // `[STUDY, , TIME]` is sloppy but unambiguous.
+        assert_eq!(
+            parse_theta_block_spec("P", "STUDY, , TIME").unwrap(),
+            ThetaBlockSpec::Columns {
+                columns: vec!["STUDY".to_string(), "TIME".to_string()],
+                contrast: LevelContrast::Auto,
+            }
+        );
+    }
+
+    #[test]
+    fn every_contrast_spelling_parses() {
+        for (token, expected) in [
+            ("auto", LevelContrast::Auto),
+            ("sum_to_zero", LevelContrast::SumToZero),
+            ("sum_to_zero_within", LevelContrast::SumToZeroWithin),
+            ("sum_to_zero_within_group", LevelContrast::SumToZeroWithin),
+            ("ref", LevelContrast::Ref),
+            ("reference", LevelContrast::Ref),
+            ("first", LevelContrast::Ref),
+            ("none", LevelContrast::Unconstrained),
+            ("unconstrained", LevelContrast::Unconstrained),
+            ("  REF  ", LevelContrast::Ref),
+        ] {
+            let parsed =
+                parse_theta_block_spec("P", &format!("STUDY, contrast = {token}")).unwrap();
+            match parsed {
+                ThetaBlockSpec::Columns { contrast, .. } => {
+                    assert_eq!(contrast, expected, "token {token}")
+                }
+                other => panic!("expected a column block for {token}, got {other:?}"),
+            }
+        }
+    }
+
+    // ── build_level_rules ───────────────────────────────────────────────────
+
+    #[test]
+    fn a_binding_whose_labels_and_groups_disagree_is_rejected() {
+        let b = binding(&["a", "b"], &[0], LevelContrast::SumToZero);
+        let err = build_level_rules("P", &b, 0).unwrap_err();
+        assert!(err.contains("2 labels but 1 group ids"), "{err}");
+    }
+
+    #[test]
+    fn a_binding_with_no_levels_is_rejected() {
+        let b = binding(&[], &[], LevelContrast::SumToZero);
+        let err = build_level_rules("P", &b, 0).unwrap_err();
+        assert!(err.contains("no observed level combinations"), "{err}");
+    }
+
+    #[test]
+    fn a_non_contiguous_contrast_group_is_rejected() {
+        // The `NegSum` range is a single slice, so a group that re-opens after
+        // another would silently sum the wrong levels. The binder orders them
+        // correctly; this is the tripwire for any future caller that does not.
+        let b = binding(&["a", "b", "c"], &[0, 1, 0], LevelContrast::SumToZero);
+        let err = build_level_rules("P", &b, 0).unwrap_err();
+        assert!(err.contains("is not contiguous"), "{err}");
+    }
+
+    #[test]
+    fn unconstrained_bindings_estimate_every_level() {
+        let b = binding(&["a", "b", "c"], &[0, 0, 0], LevelContrast::Unconstrained);
+        let (rules, names) = build_level_rules("P", &b, 5).unwrap();
+        assert_eq!(
+            rules,
+            vec![LevelRule::Free(5), LevelRule::Free(6), LevelRule::Free(7)]
+        );
+        assert_eq!(names, vec!["P[a]", "P[b]", "P[c]"]);
+    }
+
+    #[test]
+    fn a_reference_binding_pins_the_first_level_with_an_empty_negsum() {
+        let b = binding(&["a", "b"], &[0, 0], LevelContrast::Ref);
+        let (rules, names) = build_level_rules("P", &b, 3).unwrap();
+        // An empty `NegSum` range evaluates to 0.0 — that is how a reference
+        // level is encoded, rather than as a special rule variant.
+        assert_eq!(rules[0], LevelRule::NegSum(3, 3));
+        assert_eq!(rules[1], LevelRule::Free(3));
+        assert_eq!(names, vec!["P[b]"]);
+    }
+
+    // ── the gather itself ───────────────────────────────────────────────────
+
+    #[test]
+    fn eval_gather_rejects_every_ill_formed_index() {
+        let s = spec(vec![LevelRule::Free(0), LevelRule::Free(1)]);
+        let theta = [1.0, 2.0];
+        for bad in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            0.0,
+            3.0,
+            1.5,
+            -1.0,
+        ] {
+            assert!(
+                eval_gather(&s, &theta, bad).is_nan(),
+                "index {bad} must be NaN, never a silent value"
+            );
+        }
+        assert_eq!(eval_gather(&s, &theta, 1.0), 1.0);
+        assert_eq!(eval_gather(&s, &theta, 2.0), 2.0);
+    }
+
+    #[test]
+    fn eval_gather_rejects_a_rule_pointing_past_the_theta_vector() {
+        // Defensive: a spec built against a longer θ vector than the caller
+        // supplies must not read out of bounds or return a neighbouring value.
+        let s = spec(vec![LevelRule::Free(7)]);
+        assert!(eval_gather(&s, &[1.0], 1.0).is_nan());
+        let s = spec(vec![LevelRule::NegSum(0, 9)]);
+        assert!(eval_gather(&s, &[1.0, 2.0], 1.0).is_nan());
+        let s = spec(vec![LevelRule::NegSum(3, 1)]);
+        assert!(eval_gather(&s, &[1.0, 2.0, 3.0, 4.0], 1.0).is_nan());
+    }
+
+    #[test]
+    fn eval_gather_sums_the_dependent_level() {
+        let s = spec(vec![
+            LevelRule::Free(0),
+            LevelRule::Free(1),
+            LevelRule::NegSum(0, 2),
+        ]);
+        let theta = [0.25, -0.75];
+        assert_eq!(eval_gather(&s, &theta, 3.0), 0.5);
+    }
+
+    #[test]
+    fn the_pknum_gather_matches_the_f64_one_on_every_branch() {
+        // `gather_g` is the copy the analytic-sensitivity path runs. The two
+        // must agree bit for bit or a model's gradient and its prediction come
+        // from different formulas. `f64` is itself a `PkNum`, so this compares
+        // them directly.
+        let cases = vec![
+            spec(vec![LevelRule::Free(0), LevelRule::Free(1)]),
+            spec(vec![LevelRule::Free(0), LevelRule::NegSum(0, 1)]),
+            spec(vec![LevelRule::NegSum(0, 0), LevelRule::Free(0)]),
+            spec(vec![LevelRule::Free(9)]),
+            spec(vec![LevelRule::NegSum(0, 9)]),
+            spec(vec![LevelRule::NegSum(3, 1)]),
+        ];
+        let theta = [0.25, -0.75, 1.5];
+        for s in &cases {
+            for raw in [f64::NAN, f64::INFINITY, -1.0, 0.0, 1.0, 2.0, 3.0, 1.5] {
+                let a = eval_gather(s, &theta, raw);
+                let b = gather_g::<f64>(s, &theta, raw);
+                assert_eq!(
+                    a.is_nan(),
+                    b.is_nan(),
+                    "NaN disagreement on {s:?} at index {raw}"
+                );
+                if !a.is_nan() {
+                    assert_eq!(a, b, "value disagreement on {s:?} at index {raw}");
+                }
+            }
+        }
+    }
+
+    // ── the θ-axis reverse map the differentiator uses ──────────────────────
+
+    #[test]
+    fn axes_for_theta_finds_the_free_and_dependent_levels() {
+        let s = spec(vec![
+            LevelRule::Free(0),
+            LevelRule::Free(1),
+            LevelRule::NegSum(0, 2),
+        ]);
+        // θ_0 is read directly by level 1 and through the contrast by level 3.
+        assert_eq!(s.axes_for_theta(0), (Some(1), Some(3)));
+        assert_eq!(s.axes_for_theta(1), (Some(2), Some(3)));
+        // A θ the block does not touch at all.
+        assert_eq!(s.axes_for_theta(7), (None, None));
+    }
+
+    #[test]
+    fn a_reference_level_contributes_no_dependent_axis() {
+        // Its `NegSum` range is empty, so no θ is read through it.
+        let s = spec(vec![LevelRule::NegSum(0, 0), LevelRule::Free(0)]);
+        assert_eq!(s.axes_for_theta(0), (Some(2), None));
+    }
+}

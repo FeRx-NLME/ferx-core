@@ -713,3 +713,157 @@ mod theta_gather_index_check {
         assert!(check_theta_gather_indices(&plain, &population(&[1.0])).is_empty());
     }
 }
+
+// ── #1064: binder helpers, branch by branch ────────────────────────────────
+mod binder_helpers {
+    use super::super::{cmp_levels, contrast_token, format_level_value, Level};
+    use super::*;
+
+    #[test]
+    fn level_values_render_without_a_trailing_point_zero() {
+        // Study ids and visit numbers are integers almost always, and
+        // `PLACEBO[STUDY=7,TIME=4]` reads better than `STUDY=7.0`.
+        assert_eq!(format_level_value(7.0), "7");
+        assert_eq!(format_level_value(-3.0), "-3");
+        assert_eq!(format_level_value(0.0), "0");
+        // A genuinely fractional level keeps its value rather than truncating
+        // two distinct cells onto one label.
+        assert_eq!(format_level_value(0.5), "0.5");
+        assert_eq!(format_level_value(-1.25), "-1.25");
+        // Past the `abs() < 1e15` guard the integer path would saturate through
+        // `as i64` and collapse every large level onto `i64::MAX`. The fallback
+        // must keep the value instead.
+        assert_ne!(format_level_value(1e300), i64::MAX.to_string());
+        assert_eq!(format_level_value(1e300).parse::<f64>().unwrap(), 1e300);
+    }
+
+    fn level(values: &[f64]) -> Level {
+        Level {
+            values: values.to_vec(),
+        }
+    }
+
+    #[test]
+    fn levels_sort_lexicographically_by_their_tuple() {
+        use std::cmp::Ordering;
+        assert_eq!(
+            cmp_levels(&level(&[1.0, 4.0]), &level(&[1.0, 12.0])),
+            Ordering::Less
+        );
+        assert_eq!(
+            cmp_levels(&level(&[2.0, 1.0]), &level(&[1.0, 99.0])),
+            Ordering::Greater
+        );
+        assert_eq!(
+            cmp_levels(&level(&[1.0, 4.0]), &level(&[1.0, 4.0])),
+            Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn level_ordering_stays_total_under_nan() {
+        // `total_cmp`, not `partial_cmp`: the binding has to be reproducible
+        // run to run even if a column carries a NaN, rather than depending on
+        // the sort's comparison order.
+        use std::cmp::Ordering;
+        let nan = level(&[f64::NAN]);
+        let one = level(&[1.0]);
+        assert_eq!(cmp_levels(&nan, &nan), Ordering::Equal);
+        assert_ne!(cmp_levels(&nan, &one), Ordering::Equal);
+        assert_eq!(cmp_levels(&nan, &one), cmp_levels(&nan, &one));
+    }
+
+    #[test]
+    fn every_contrast_has_a_diagnostic_token() {
+        assert_eq!(contrast_token(LevelContrast::Auto), "auto");
+        assert_eq!(contrast_token(LevelContrast::SumToZero), "sum_to_zero");
+        assert_eq!(
+            contrast_token(LevelContrast::SumToZeroWithin),
+            "sum_to_zero_within"
+        );
+        assert_eq!(contrast_token(LevelContrast::Ref), "ref");
+        assert_eq!(contrast_token(LevelContrast::Unconstrained), "none");
+    }
+
+    #[test]
+    fn a_non_finite_level_column_is_rejected() {
+        let mut pop = population(2, 2);
+        pop.subjects[0]
+            .covariates
+            .insert("STUDY".to_string(), f64::NAN);
+        let err = bind(&no_eta_model(), &mut pop).unwrap_err();
+        assert!(err.contains("non-finite"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn a_population_with_no_observations_is_rejected() {
+        let mut pop = population(2, 2);
+        for s in pop.subjects.iter_mut() {
+            s.obs_times.clear();
+            s.observations.clear();
+            s.obs_cmts.clear();
+            s.cens.clear();
+        }
+        let err = bind(&no_eta_model(), &mut pop).unwrap_err();
+        assert!(
+            err.contains("no observation rows"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn dose_rows_carry_the_level_of_the_most_recent_observation() {
+        // A level is a property of an *observation*, so dose and EVID=2 rows
+        // take the preceding observation's level (the first one when they
+        // precede every observation). This only matters for a model whose
+        // gathered parameter also drives the dosing dynamics.
+        let mut pop = population(1, 3);
+        let subject = &mut pop.subjects[0];
+        // Observations at t = 1, 2, 3; doses at t = 0 (before all) and t = 2.5.
+        subject
+            .doses
+            .push(crate::types::DoseEvent::new(2.5, 50.0, 1, 0.0, false, 0.0));
+        bind(&no_eta_model().replace("[STUDY, TIME]", "[TIME]"), &mut pop).unwrap();
+
+        let subject = &pop.subjects[0];
+        let obs: Vec<f64> = subject
+            .obs_covariates
+            .iter()
+            .map(|m| m["__level_PLACEBO"])
+            .collect();
+        assert_eq!(obs, vec![1.0, 2.0, 3.0], "one level per timepoint");
+        let doses: Vec<f64> = subject
+            .dose_covariates
+            .iter()
+            .map(|m| m["__level_PLACEBO"])
+            .collect();
+        assert_eq!(
+            doses,
+            vec![1.0, 2.0],
+            "t=0 precedes every observation so takes the first level; \
+             t=2.5 takes the t=2 level"
+        );
+    }
+
+    #[test]
+    fn level_map_carries_the_dependent_level_the_theta_vector_omits() {
+        // The dependent contrast level has no θ, so it is absent from
+        // `theta_names` — but the *binding* still has to name it, or a caller
+        // cannot tell an 800-level block from a 799-level one.
+        let mut pop = population(2, 2);
+        let model = bind(&no_eta_model(), &mut pop).unwrap();
+        let map = crate::api::theta_level_map(&model);
+        let labels = &map["PLACEBO"];
+        assert_eq!(labels.len(), 4, "all four observed levels: {labels:?}");
+        assert!(
+            labels.contains(&"STUDY=2,TIME=2".to_string()),
+            "the sum-to-zero level must still be named: {labels:?}"
+        );
+        let named: Vec<&String> = model
+            .theta_names
+            .iter()
+            .filter(|n| n.starts_with("PLACEBO["))
+            .collect();
+        assert_eq!(named.len(), 3, "but only three carry a θ: {named:?}");
+    }
+}
