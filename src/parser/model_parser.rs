@@ -112,6 +112,7 @@ fn has_bare_eta(expr: &Expression) -> bool {
         Expression::UnaryFn(name, _) if name == "exp" => false,
         Expression::BinOp(l, _, r) => has_bare_eta(l) || has_bare_eta(r),
         Expression::UnaryFn(_, arg) => has_bare_eta(arg),
+        Expression::ThetaGather { idx, .. } => has_bare_eta(idx),
         Expression::Power(b, e) => has_bare_eta(b) || has_bare_eta(e),
         _ => false,
     }
@@ -136,6 +137,7 @@ fn extract_eta_indices(expr: &Expression) -> Vec<usize> {
                 walk(r, out);
             }
             Expression::UnaryFn(_, a) => walk(a, out),
+            Expression::ThetaGather { idx, .. } => walk(idx, out),
             Expression::Power(b, e) => {
                 walk(b, out);
                 walk(e, out);
@@ -188,6 +190,7 @@ fn expr_references_any(expr: &Expression, names: &[String]) -> Option<String> {
             }
             Expression::BinOp(l, _, r) => walk(l, names).or_else(|| walk(r, names)),
             Expression::UnaryFn(_, a) => walk(a, names),
+            Expression::ThetaGather { idx, .. } => walk(idx, names),
             Expression::Power(b, e) => walk(b, names).or_else(|| walk(e, names)),
             Expression::Conditional(cond, t, els) => walk_cond(cond, names)
                 .or_else(|| walk(t, names))
@@ -808,6 +811,7 @@ fn expr_uses_mixnum(expr: &Expression) -> bool {
             expr_uses_mixnum(a) || expr_uses_mixnum(b)
         }
         Expression::UnaryFn(_, a) => expr_uses_mixnum(a),
+        Expression::ThetaGather { idx, .. } => expr_uses_mixnum(idx),
         Expression::Conditional(c, t, e) => {
             cond_uses(c) || expr_uses_mixnum(t) || expr_uses_mixnum(e)
         }
@@ -1283,8 +1287,22 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     let param_lines = blocks
         .get("parameters")
         .ok_or("Missing [parameters] block")?;
-    let (thetas, omegas, block_omegas, sigmas, block_sigmas, eta_names_bsv, kappa_info) =
-        parse_parameters(param_lines)?;
+    let (
+        thetas,
+        omegas,
+        block_omegas,
+        sigmas,
+        block_sigmas,
+        eta_names_bsv,
+        kappa_info,
+        vector_theta_decls,
+    ) = parse_parameters(param_lines)?;
+    // Install the vector/factor θ table for the remainder of this parse so a
+    // gather (`PLACEBO[IDX]`) resolves identically in every block that parses
+    // expressions. Dropped at the end of `parse_full_model`, restoring whatever
+    // an enclosing parse had installed (nested parses happen for the absorption
+    // ODE-equivalent source).
+    let _vector_theta_scope = VectorThetaScope::enter(vector_theta_decls.clone());
 
     // ── Optional [covariate_nn NAME] blocks (Phase A M1, behind `--features nn`)
     //
@@ -2625,6 +2643,11 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         kappa_names: kappa_names.clone(),
         indiv_param_names: indiv_var_names.clone(),
         indiv_param_partials,
+        theta_blocks: ThetaBlocks {
+            decls: vector_theta_decls.clone(),
+            uses: VectorThetaScope::uses(),
+            unbound_factors: Vec::new(),
+        },
         default_params,
         omega_init_as_sd,
         sigma_init_as_sd,
@@ -4087,6 +4110,7 @@ fn expr_refs_dv(expr: &Expression) -> bool {
         Expression::Variable(name) if name.eq_ignore_ascii_case("DV") => true,
         Expression::BinOp(l, _, r) => expr_refs_dv(l) || expr_refs_dv(r),
         Expression::UnaryFn(_, arg) => expr_refs_dv(arg),
+        Expression::ThetaGather { idx, .. } => expr_refs_dv(idx),
         Expression::Power(b, e) => expr_refs_dv(b) || expr_refs_dv(e),
         Expression::Conditional(c, t, e) => cond_refs_dv(c) || expr_refs_dv(t) || expr_refs_dv(e),
         _ => false,
@@ -4114,6 +4138,7 @@ fn expr_refs_compartments(expr: &Expression, ode_state_names: &[String]) -> bool
             expr_refs_compartments(l, ode_state_names) || expr_refs_compartments(r, ode_state_names)
         }
         Expression::UnaryFn(_, arg) => expr_refs_compartments(arg, ode_state_names),
+        Expression::ThetaGather { idx, .. } => expr_refs_compartments(idx, ode_state_names),
         Expression::Power(b, e) => {
             expr_refs_compartments(b, ode_state_names) || expr_refs_compartments(e, ode_state_names)
         }
@@ -12127,12 +12152,14 @@ fn parse_parameters(
         Vec<BlockOmegaSpec>,
         Vec<SigmaSpec>,
         Vec<BlockSigmaSpec>,
-        Vec<String>,  // BSV eta names in declaration order
-        ParsedKappas, // IOV kappa specs (diagonal and/or block)
+        Vec<String>,          // BSV eta names in declaration order
+        ParsedKappas,         // IOV kappa specs (diagonal and/or block)
+        Vec<VectorThetaDecl>, // #1064 vector / factor θ blocks
     ),
     String,
 > {
     let mut thetas = Vec::new();
+    let mut vector_thetas: Vec<VectorThetaDecl> = Vec::new();
     let mut omegas = Vec::new();
     let mut block_omegas = Vec::new();
     let mut sigmas = Vec::new();
@@ -12165,8 +12192,15 @@ fn parse_parameters(
     // the bounds sub-group, defaulting to 1e9 when absent.
     // Group 5 captures FIX inside the parens; group 6 captures FIX outside.
     // `fixed` is true when either group is present.
+    //
+    // #1064: an optional `[N]` after the name declares a **vector** of N θ
+    // levels sharing one `(init, lower, upper[, FIX])` triple — the
+    // "replicate all these values for me" form. It expands to N ordinary
+    // thetas named `NAME[1]`…`NAME[N]`; what makes hundreds of them tractable
+    // is that `[individual_parameters]` reads them through a *gather*
+    // (`NAME[IDX_COLUMN]`), which occupies a single `PkParams` slot.
     let theta_re = Regex::new(
-        r"(?i)theta\s+(\w+)\s*\(\s*([0-9eE.+-]+)\s*(?:,\s*([0-9eE.+-]+)(?:\s*,\s*([0-9eE.+-]+))?)?\s*(?:,?\s*(FIX)\b)?\s*\)(?:\s+(FIX)\b)?",
+        r"(?i)theta\s+(\w+)\s*(?:\[\s*(\d+)\s*\])?\s*\(\s*([0-9eE.+-]+)\s*(?:,\s*([0-9eE.+-]+)(?:\s*,\s*([0-9eE.+-]+))?)?\s*(?:,?\s*(FIX)\b)?\s*\)(?:\s+(FIX)\b)?",
     )
     .unwrap();
 
@@ -12242,25 +12276,65 @@ fn parse_parameters(
         let mut weight_consumed = false;
         if let Some(caps) = theta_re.captures(line) {
             let name = caps[1].to_string();
-            let init: f64 = caps[2]
+            let vector_len: Option<usize> = match caps.get(2) {
+                Some(m) => Some(
+                    m.as_str()
+                        .parse()
+                        .map_err(|_| format!("Bad theta vector length: {}", line))?,
+                ),
+                None => None,
+            };
+            let init: f64 = caps[3]
                 .parse()
                 .map_err(|_| format!("Bad theta init: {}", line))?;
             let lower: f64 = caps
-                .get(3)
+                .get(4)
                 .map(|m| m.as_str().parse().unwrap_or(1e-9))
                 .unwrap_or(1e-9);
             let upper: f64 = caps
-                .get(4)
+                .get(5)
                 .map(|m| m.as_str().parse().unwrap_or(1e9))
                 .unwrap_or(1e9);
-            let fixed = caps.get(5).is_some() || caps.get(6).is_some();
-            thetas.push(ThetaSpec {
-                name,
-                init,
-                lower,
-                upper,
-                fixed,
-            });
+            let fixed = caps.get(6).is_some() || caps.get(7).is_some();
+            match vector_len {
+                None => thetas.push(ThetaSpec {
+                    name,
+                    init,
+                    lower,
+                    upper,
+                    fixed,
+                }),
+                Some(n_levels) => {
+                    if n_levels == 0 {
+                        return Err(format!(
+                            "theta {name}[0]: a vector θ must declare at least one level"
+                        ));
+                    }
+                    if vector_thetas.iter().any(|d| d.name == name) {
+                        return Err(format!("theta {name}: declared twice"));
+                    }
+                    let base = thetas.len();
+                    for level in 1..=n_levels {
+                        thetas.push(ThetaSpec {
+                            name: format!("{name}[{level}]"),
+                            init,
+                            lower,
+                            upper,
+                            fixed,
+                        });
+                    }
+                    vector_thetas.push(VectorThetaDecl {
+                        name: name.clone(),
+                        spec: std::sync::Arc::new(GatherSpec {
+                            name,
+                            levels: (0..n_levels)
+                                .map(|i| LevelRule::Free((base + i) as u32))
+                                .collect(),
+                        }),
+                        index_covariate: None,
+                    });
+                }
+            }
         } else if let Some(caps) = block_omega_re.captures(line) {
             let names: Vec<String> = caps[1].split(',').map(|s| s.trim().to_string()).collect();
             let values: Vec<f64> = caps[2]
@@ -12507,6 +12581,7 @@ fn parse_parameters(
             names_ordered: kappa_names_ordered,
             weights: kappa_weights_ordered,
         },
+        vector_thetas,
     ))
 }
 
@@ -14641,6 +14716,262 @@ pub(crate) enum Expression {
         nn_idx: usize,
         output_idx: usize,
     },
+    /// Indexed read out of a vector/factor θ block (#1064): `PLACEBO[PLA_IDX]`,
+    /// or the implicit index of a `factor(...)` block. `idx` evaluates to a
+    /// **1-based** level number; `spec` maps that level onto the estimated θ
+    /// vector (directly, or as the negated sum of a sum-to-zero contrast).
+    ///
+    /// This is a *gather*, not N individual parameters: the whole block
+    /// occupies one `PkParams` slot, which is what makes hundreds of levels
+    /// fit the fixed `[f64; MAX_PK_PARAMS]` layout at all.
+    ThetaGather {
+        spec: std::sync::Arc<GatherSpec>,
+        idx: Box<Expression>,
+    },
+}
+
+/// How one level of a vector/factor θ block maps onto the estimated θ vector.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum LevelRule {
+    /// Estimated directly at this absolute index into the θ vector.
+    Free(u32),
+    /// The negated sum of `θ[start..end]` — the dependent level of a
+    /// sum-to-zero contrast. `start == end` evaluates to `0.0`, which is how a
+    /// reference level is encoded.
+    NegSum(u32, u32),
+}
+
+/// The level → θ mapping of one vector/factor block, shared by every
+/// `Expression::ThetaGather` that reads it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct GatherSpec {
+    /// Block name as written (`PLACEBO`), used in diagnostics.
+    pub(crate) name: String,
+    /// One rule per level, in 1-based level order.
+    pub(crate) levels: Vec<LevelRule>,
+}
+
+impl GatherSpec {
+    /// Reverse map for [`differentiate`]: for absolute θ index `k`, the level
+    /// that reads it directly and the level that reads it through a `NegSum`.
+    /// Both are 1-based level numbers; either may be absent.
+    fn axes_for_theta(&self, k: usize) -> (Option<usize>, Option<usize>) {
+        let mut free = None;
+        let mut dep = None;
+        for (l, rule) in self.levels.iter().enumerate() {
+            match *rule {
+                LevelRule::Free(i) if i as usize == k => free = Some(l + 1),
+                LevelRule::NegSum(a, b) if (a as usize..b as usize).contains(&k) => {
+                    dep = Some(l + 1)
+                }
+                _ => {}
+            }
+        }
+        (free, dep)
+    }
+}
+
+/// Evaluate a gather at a raw (1-based, possibly non-integral) level index.
+///
+/// A non-integral or out-of-range index returns `NaN`, never `0.0`: division by
+/// zero already underflows to `0.0` in this evaluator, so a silent zero here
+/// would be indistinguishable from a legitimately estimated level. The loud
+/// check lives in `api::validation::check_theta_gather_indices`, which walks the
+/// data before the fit starts; this is defence in depth behind it.
+#[inline]
+fn eval_gather(spec: &GatherSpec, theta: &[f64], raw: f64) -> f64 {
+    if !raw.is_finite() {
+        return f64::NAN;
+    }
+    let rounded = raw.round();
+    if (rounded - raw).abs() > 1e-6 {
+        return f64::NAN;
+    }
+    let level = rounded as i64;
+    if level < 1 || level as usize > spec.levels.len() {
+        return f64::NAN;
+    }
+    match spec.levels[level as usize - 1] {
+        LevelRule::Free(i) => theta.get(i as usize).copied().unwrap_or(f64::NAN),
+        LevelRule::NegSum(a, b) => {
+            let (a, b) = (a as usize, b as usize);
+            if b > theta.len() || a > b {
+                return f64::NAN;
+            }
+            -theta[a..b].iter().sum::<f64>()
+        }
+    }
+}
+
+/// One vector/factor θ block declared in `[parameters]` (#1064), as seen by the
+/// expression parser while the rest of the model file is being parsed.
+#[derive(Debug, Clone)]
+pub(crate) struct VectorThetaDecl {
+    pub(crate) name: String,
+    /// Level → θ map shared by every gather that reads this block.
+    pub(crate) spec: std::sync::Arc<GatherSpec>,
+    /// `Some` for a `factor(...)` block: the index is implicit, so a **bare**
+    /// reference gathers on `index_covariate` instead of requiring `[...]`.
+    /// `None` for the explicit `theta NAME[N]` form, where a bare reference is
+    /// an error and the user supplies the index column.
+    pub(crate) index_covariate: Option<String>,
+}
+
+thread_local! {
+    /// Vector/factor θ blocks visible to the expression parser for the duration
+    /// of one `parse_full_model` call.
+    ///
+    /// A thread-local rather than a `ParseCtx` field because `ParseCtx` is
+    /// constructed at ~20 separate sites (`[individual_parameters]`, `[odes]`,
+    /// `[scaling]`, error-model selectors, `[derived]`, …) and a gather must
+    /// parse identically at every one of them; threading a field through would
+    /// leave whichever site was missed silently treating `PLACEBO[I]` as an
+    /// unknown covariate. Parsing is single-threaded within a call, and
+    /// [`VectorThetaScope`] restores the previous table on drop.
+    static VECTOR_THETAS: std::cell::RefCell<Vec<VectorThetaDecl>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// RAII guard installing the active vector-θ table and gather-use log
+/// (panic-safe). Both are restored on drop so a nested parse — the absorption
+/// ODE-equivalent source is compiled inside the primary parse — cannot leak its
+/// blocks into the enclosing model.
+pub(crate) struct VectorThetaScope(Vec<VectorThetaDecl>, Vec<GatherUse>);
+
+impl VectorThetaScope {
+    fn enter(decls: Vec<VectorThetaDecl>) -> Self {
+        VectorThetaScope(
+            VECTOR_THETAS.with(|c| c.replace(decls)),
+            GATHER_USES.with(|c| c.replace(Vec::new())),
+        )
+    }
+
+    /// The gather sites recorded so far in this scope.
+    fn uses() -> Vec<GatherUse> {
+        GATHER_USES.with(|c| c.borrow().clone())
+    }
+}
+
+impl Drop for VectorThetaScope {
+    fn drop(&mut self) {
+        VECTOR_THETAS.with(|c| *c.borrow_mut() = std::mem::take(&mut self.0));
+        GATHER_USES.with(|c| *c.borrow_mut() = std::mem::take(&mut self.1));
+    }
+}
+
+/// One `NAME[COLUMN]` gather site seen while parsing, recorded so the pre-fit
+/// data check can verify every index the data actually carries is a level this
+/// block has. Only gathers whose index is a bare covariate read are recorded —
+/// a computed index (`PLACEBO[2 * K]`) has no single column to walk.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct GatherUse {
+    pub(crate) block: String,
+    pub(crate) index_covariate: String,
+    pub(crate) n_levels: usize,
+}
+
+thread_local! {
+    /// Gather sites recorded during the active parse; see [`GatherUse`].
+    static GATHER_USES: std::cell::RefCell<Vec<GatherUse>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Look up a declared vector/factor θ block by name.
+fn lookup_vector_theta(name: &str) -> Option<VectorThetaDecl> {
+    VECTOR_THETAS.with(|c| c.borrow().iter().find(|d| d.name == name).cloned())
+}
+
+/// Record a `block[column]` gather site for the pre-fit index check.
+fn record_gather_use(block: &str, index_covariate: &str, n_levels: usize) {
+    let use_ = GatherUse {
+        block: block.to_string(),
+        index_covariate: index_covariate.to_string(),
+        n_levels,
+    };
+    GATHER_USES.with(|c| {
+        let mut v = c.borrow_mut();
+        if !v.contains(&use_) {
+            v.push(use_);
+        }
+    });
+}
+
+/// The vector / factor θ blocks a model declares (#1064), carried on
+/// `CompiledModel` so the pre-fit data check and the `fit()` guard can see them.
+///
+/// Inner types reference the parser-private `GatherSpec`, so the fields stay
+/// `pub(crate)`; external callers construct an empty placeholder via
+/// [`ThetaBlocks::empty`], which is all a hand-built `CompiledModel` fixture
+/// needs.
+#[derive(Debug, Clone, Default)]
+pub struct ThetaBlocks {
+    pub(crate) decls: Vec<VectorThetaDecl>,
+    /// `NAME[COLUMN]` sites whose index column the data check should walk.
+    pub(crate) uses: Vec<GatherUse>,
+    /// Names of `factor(...)` blocks that were declared but never bound to
+    /// data. A model carrying any of these cannot be fit — see
+    /// `api::fit::check_factor_blocks_bound`.
+    pub(crate) unbound_factors: Vec<String>,
+}
+
+impl ThetaBlocks {
+    /// An empty placeholder, for `CompiledModel`s built by hand.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Whether the model declares no vector/factor θ block at all — the common
+    /// case, which every consumer short-circuits on.
+    pub fn is_empty(&self) -> bool {
+        self.decls.is_empty() && self.unbound_factors.is_empty()
+    }
+
+    /// Names of `factor(...)` blocks declared but not bound to data.
+    pub fn unbound_factors(&self) -> &[String] {
+        &self.unbound_factors
+    }
+
+    /// `(block, index column, level count)` for every gather whose index is a
+    /// plain data column — what `check_theta_gather_indices` walks.
+    pub fn index_columns(&self) -> impl Iterator<Item = (&str, &str, usize)> {
+        self.uses
+            .iter()
+            .map(|u| (u.block.as_str(), u.index_covariate.as_str(), u.n_levels))
+    }
+}
+
+/// `PkNum` counterpart of [`eval_gather`], used by the analytic-sensitivity
+/// bytecode path. Same level bookkeeping, same `NaN` policy; the difference is
+/// that the gathered θ keeps its dual jet, so `∂f/∂θ_k` through a gather is
+/// exact rather than finite-differenced.
+#[inline]
+fn gather_g<T: crate::sens::num::PkNum>(spec: &GatherSpec, theta: &[T], raw: f64) -> T {
+    let nan = T::from_f64(f64::NAN);
+    if !raw.is_finite() {
+        return nan;
+    }
+    let rounded = raw.round();
+    if (rounded - raw).abs() > 1e-6 {
+        return nan;
+    }
+    let level = rounded as i64;
+    if level < 1 || level as usize > spec.levels.len() {
+        return nan;
+    }
+    match spec.levels[level as usize - 1] {
+        LevelRule::Free(i) => theta.get(i as usize).copied().unwrap_or(nan),
+        LevelRule::NegSum(a, b) => {
+            let (a, b) = (a as usize, b as usize);
+            if b > theta.len() || a > b {
+                return nan;
+            }
+            let mut acc = T::from_f64(0.0);
+            for t in &theta[a..b] {
+                acc = acc + *t;
+            }
+            -acc
+        }
+    }
 }
 
 thread_local! {
@@ -14841,6 +15172,7 @@ fn visit_expr_nodes(expr: &Expression, f: &mut dyn FnMut(&Expression)) {
             visit_expr_nodes(rhs, f);
         }
         Expression::UnaryFn(_, arg) => visit_expr_nodes(arg, f),
+        Expression::ThetaGather { idx, .. } => visit_expr_nodes(idx, f),
         Expression::Power(base, exp) => {
             visit_expr_nodes(base, f);
             visit_expr_nodes(exp, f);
@@ -14868,6 +15200,7 @@ fn visit_expr_nodes_mut(expr: &mut Expression, f: &mut dyn FnMut(&mut Expression
             visit_expr_nodes_mut(rhs, f);
         }
         Expression::UnaryFn(_, arg) => visit_expr_nodes_mut(arg, f),
+        Expression::ThetaGather { idx, .. } => visit_expr_nodes_mut(idx, f),
         Expression::Power(base, exp) => {
             visit_expr_nodes_mut(base, f);
             visit_expr_nodes_mut(exp, f);
@@ -14985,6 +15318,7 @@ fn rewrite_weighted_kappas(
                 walk_expr(r, weights, hit);
             }
             Expression::UnaryFn(_, a) => walk_expr(a, weights, hit),
+            Expression::ThetaGather { idx, .. } => walk_expr(idx, weights, hit),
             Expression::Power(b, e) => {
                 walk_expr(b, weights, hit);
                 walk_expr(e, weights, hit);
@@ -15933,6 +16267,9 @@ fn rewrite_readout_synth(expr: &mut Expression, synth: &[ReadoutSynthParam]) {
                 *expr = Expression::Variable(s.name.clone());
             }
         }
+        // The gathered θ block itself has no synthetic stand-in (#486 desugars
+        // scalar `THETA(i)` only), so only the index expression is rewritten.
+        Expression::ThetaGather { idx, .. } => rewrite_readout_synth(idx, synth),
         Expression::BinOp(l, _, r) => {
             rewrite_readout_synth(l, synth);
             rewrite_readout_synth(r, synth);
@@ -16241,6 +16578,10 @@ fn eval_expr<E: EvalEnv>(
         | Expression::Covariate(_)
         | Expression::VariableIdx(_)
         | Expression::CovariateIdx(_) => env.resolve(expr),
+        Expression::ThetaGather { spec, idx } => {
+            let raw = eval_expr(idx, theta, eta, env, nn_outputs);
+            eval_gather(spec, theta, raw)
+        }
         Expression::BinOp(lhs, op, rhs) => {
             let l = eval_expr(lhs, theta, eta, env, nn_outputs);
             let r = eval_expr(rhs, theta, eta, env, nn_outputs);
@@ -16414,6 +16755,9 @@ enum Op {
     PushVar(u32),
     PushCov(u32),
     PushNnOutput(u32, u32),
+    /// Pops a 1-based level index and pushes the gathered θ value for
+    /// `Bytecode.gathers[i]` (#1064).
+    PushThetaGather(u32),
     Add,
     Sub,
     Mul,
@@ -16501,6 +16845,9 @@ struct Bytecode {
     ops: Vec<Op>,
     constants: Vec<f64>,
     max_stack: usize,
+    /// Level → θ maps for the `Op::PushThetaGather` ops in `ops` (#1064).
+    /// Empty for every expression that contains no vector/factor θ read.
+    gathers: Vec<std::sync::Arc<GatherSpec>>,
 }
 
 impl Bytecode {
@@ -16509,6 +16856,7 @@ impl Bytecode {
             ops: Vec::new(),
             constants: Vec::new(),
             max_stack: 0,
+            gathers: Vec::new(),
         }
     }
     fn push_const(&mut self, v: f64) {
@@ -16588,6 +16936,8 @@ fn scan_stack_depth(ops: &[Op]) -> (i32, i32) {
             | Op::PushVar(_)
             | Op::PushCov(_)
             | Op::PushNnOutput(_, _) => 1,
+            // Pops the level index, pushes the gathered value.
+            Op::PushThetaGather(_) => 0,
             Op::Add
             | Op::Sub
             | Op::Mul
@@ -16675,6 +17025,12 @@ fn compile_expr_into(bc: &mut Bytecode, expr: &Expression) {
         Expression::NnOutput { nn_idx, output_idx } => bc
             .ops
             .push(Op::PushNnOutput(*nn_idx as u32, *output_idx as u32)),
+        Expression::ThetaGather { spec, idx } => {
+            compile_expr_into(bc, idx);
+            let g = bc.gathers.len() as u32;
+            bc.gathers.push(spec.clone());
+            bc.ops.push(Op::PushThetaGather(g));
+        }
         Expression::BinOp(lhs, op, rhs) => {
             compile_expr_into(bc, lhs);
             compile_expr_into(bc, rhs);
@@ -16835,6 +17191,17 @@ fn eval_bytecode(
                         );
                         0.0
                     });
+                push!(v);
+            }
+            Op::PushThetaGather(g) => {
+                let raw = pop!();
+                let v = match bc.gathers.get(g as usize) {
+                    Some(spec) => eval_gather(spec, theta, raw),
+                    None => {
+                        debug_assert!(false, "Op::PushThetaGather {g} out of bounds");
+                        f64::NAN
+                    }
+                };
                 push!(v);
             }
             Op::Add => {
@@ -17059,6 +17426,20 @@ fn eval_bytecode_g<T: crate::sens::num::PkNum>(
                         0.0
                     });
                 push!(k(v));
+            }
+            // The level index is integer-valued data, so its jet is empty and
+            // `.val()` loses nothing; the *gathered* θ keeps its full jet, which
+            // is what makes `∂f/∂θ_k` exact through a gather.
+            Op::PushThetaGather(g) => {
+                let raw = pop!().val();
+                let v = match bc.gathers.get(g as usize) {
+                    Some(spec) => gather_g::<T>(spec, theta, raw),
+                    None => {
+                        debug_assert!(false, "Op::PushThetaGather {g} out of bounds");
+                        k(f64::NAN)
+                    }
+                };
+                push!(v);
             }
             Op::Add => {
                 let b = pop!();
@@ -17452,6 +17833,7 @@ fn expr_reads_slots(e: &Expression, slots: &[usize]) -> bool {
             expr_reads_slots(a, slots) || expr_reads_slots(b, slots)
         }
         Expression::UnaryFn(_, a) => expr_reads_slots(a, slots),
+        Expression::ThetaGather { idx, .. } => expr_reads_slots(idx, slots),
         Expression::Conditional(c, t, f) => {
             cond_reads_slots(c, slots) || expr_reads_slots(t, slots) || expr_reads_slots(f, slots)
         }
@@ -17613,6 +17995,8 @@ fn expr_is_dynamic(e: &Expression, dyn_vars: &[bool]) -> bool {
         Expression::Variable(_) => true,
         Expression::VariableIdx(i) => dyn_vars.get(*i).copied().unwrap_or(false),
         Expression::Literal(_) | Expression::Covariate(_) | Expression::CovariateIdx(_) => false,
+        // Reads θ, so it is dynamic regardless of what the index is.
+        Expression::ThetaGather { .. } => true,
         Expression::BinOp(a, _, b) | Expression::Power(a, b) => {
             expr_is_dynamic(a, dyn_vars) || expr_is_dynamic(b, dyn_vars)
         }
@@ -18636,6 +19020,7 @@ fn resolve_expr_indices(
             resolve_expr_indices(r, var_idx, cov_idx);
         }
         Expression::UnaryFn(_, a) => resolve_expr_indices(a, var_idx, cov_idx),
+        Expression::ThetaGather { idx, .. } => resolve_expr_indices(idx, var_idx, cov_idx),
         Expression::Power(b, e) => {
             resolve_expr_indices(b, var_idx, cov_idx);
             resolve_expr_indices(e, var_idx, cov_idx);
@@ -18806,6 +19191,41 @@ fn differentiate_with_chain(
             }
         }
         Expression::CovariateIdx(_) | Expression::NnOutput { .. } => Expression::Literal(0.0),
+        // A gather is piecewise constant in its index (integer-valued data), so
+        // only the θ axis carries a derivative. For axis `j`, `∂/∂θ_j` is +1 on
+        // the level that reads `θ_j` directly and −1 on the level that reads it
+        // through a sum-to-zero contrast — both selected by the runtime index,
+        // hence the nested conditional rather than a Kronecker constant.
+        Expression::ThetaGather { spec, idx } => match axis {
+            DiffAxis::Theta(j) => {
+                let (free, dep) = spec.axes_for_theta(j);
+                let mut out = Expression::Literal(0.0);
+                if let Some(l) = dep {
+                    out = Expression::Conditional(
+                        Box::new(Condition::Compare(
+                            (**idx).clone(),
+                            CmpOp::Eq,
+                            Expression::Literal(l as f64),
+                        )),
+                        Box::new(Expression::Literal(-1.0)),
+                        Box::new(out),
+                    );
+                }
+                if let Some(l) = free {
+                    out = Expression::Conditional(
+                        Box::new(Condition::Compare(
+                            (**idx).clone(),
+                            CmpOp::Eq,
+                            Expression::Literal(l as f64),
+                        )),
+                        Box::new(Expression::Literal(1.0)),
+                        Box::new(out),
+                    );
+                }
+                out
+            }
+            _ => Expression::Literal(0.0),
+        },
         Expression::Variable(name) | Expression::Covariate(name) => panic!(
             "differentiate: unresolved AST node `{name}` reached the \
              differentiator; resolve_expr_indices must run first",
@@ -18931,6 +19351,10 @@ fn differentiate_with_chain(
 fn simplify_expr(expr: &Expression) -> Expression {
     let is_lit = |e: &Expression, v: f64| matches!(e, Expression::Literal(x) if *x == v);
     match expr {
+        Expression::ThetaGather { spec, idx } => Expression::ThetaGather {
+            spec: spec.clone(),
+            idx: Box::new(simplify_expr(idx)),
+        },
         Expression::BinOp(l, op, r) => {
             let l = simplify_expr(l);
             let r = simplify_expr(r);
@@ -19863,6 +20287,63 @@ fn parse_atom(
                 // identifier-classification chain. The `Dot` token will then
                 // be the next unexpected token; the caller will surface that
                 // as an expression-parse error.
+            }
+
+            // Vector / factor θ block (#1064): `PLACEBO[PLA_IDX]`, or a bare
+            // `PLACEBO` for a `factor(...)` block whose index is implicit.
+            //
+            // Checked before the scalar-θ lookup so a block name can never be
+            // shadowed by a same-named scalar, and before the covariate
+            // fallback so a mistyped subscript is an error rather than a
+            // silently-zero covariate read.
+            if let Some(decl) = lookup_vector_theta(name) {
+                let subscripted = tokens.get(pos + 1) == Some(&Token::LBracket);
+                if subscripted {
+                    let (idx_expr, p) = parse_add_sub(tokens, pos + 2, ctx)?;
+                    if tokens.get(p) != Some(&Token::RBracket) {
+                        return Err(format!(
+                            "`{name}[...]`: missing closing `]` on the level index"
+                        ));
+                    }
+                    // A literal index is resolvable now — fold it to a plain θ
+                    // read so the common `PLACEBO[3]` case costs nothing at
+                    // runtime and reports an out-of-range level at parse time.
+                    if let Expression::Literal(v) = idx_expr {
+                        let n_levels = decl.spec.levels.len();
+                        if v.fract() != 0.0 || v < 1.0 || v as usize > n_levels {
+                            return Err(format!(
+                                "`{name}[{v}]`: level index must be an integer in 1..={n_levels}"
+                            ));
+                        }
+                        if let LevelRule::Free(t) = decl.spec.levels[v as usize - 1] {
+                            return Ok((Expression::Theta(t as usize), p + 1));
+                        }
+                    }
+                    if let Expression::Covariate(col) = &idx_expr {
+                        record_gather_use(name, col, decl.spec.levels.len());
+                    }
+                    return Ok((
+                        Expression::ThetaGather {
+                            spec: decl.spec.clone(),
+                            idx: Box::new(idx_expr),
+                        },
+                        p + 1,
+                    ));
+                }
+                return match &decl.index_covariate {
+                    Some(cov) => Ok((
+                        Expression::ThetaGather {
+                            spec: decl.spec.clone(),
+                            idx: Box::new(Expression::Covariate(cov.clone())),
+                        },
+                        pos + 1,
+                    )),
+                    None => Err(format!(
+                        "`{name}` is a vector of {} θ levels — index it, e.g. \
+                         `{name}[IDX_COLUMN]`",
+                        decl.spec.levels.len()
+                    )),
+                };
             }
 
             // Check if it's a theta

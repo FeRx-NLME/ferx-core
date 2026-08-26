@@ -28,6 +28,7 @@ fn make_compiled_model(with_ode: bool, gradient_method: GradientMethod) -> Compi
         kappa_names: Vec::new(),
         indiv_param_names: vec!["CL".into()],
         indiv_param_partials: IndivParamPartials::empty(),
+        theta_blocks: crate::types::ThetaBlocks::empty(),
         default_params: ModelParameters {
             theta: vec![1.0],
             theta_names: vec!["CL".into()],
@@ -158,6 +159,7 @@ pub(crate) fn tv_cov_iv_model_and_subject() -> (CompiledModel, Subject) {
         eta_names: Vec::new(),
         indiv_param_names: vec!["CL".into(), "V".into()],
         indiv_param_partials: IndivParamPartials::empty(),
+        theta_blocks: crate::types::ThetaBlocks::empty(),
         default_params: params.clone(),
         omega_init_as_sd: Vec::new(),
         sigma_init_as_sd: vec![false],

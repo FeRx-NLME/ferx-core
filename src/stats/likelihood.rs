@@ -2553,6 +2553,7 @@ mod tests {
             kappa_mu_refs: HashMap::new(),
             indiv_param_names: vec!["CL".into(), "V".into()],
             indiv_param_partials: crate::types::IndivParamPartials::empty(),
+            theta_blocks: crate::types::ThetaBlocks::empty(),
             #[cfg(feature = "nn")]
             covariate_nns: Vec::new(),
             scaling: ScalingSpec::None,

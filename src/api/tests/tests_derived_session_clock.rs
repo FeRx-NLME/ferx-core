@@ -36,6 +36,7 @@ fn minimal_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
         eta_names: Vec::new(),
         indiv_param_names: Vec::new(),
         indiv_param_partials: IndivParamPartials::empty(),
+        theta_blocks: crate::types::ThetaBlocks::empty(),
         default_params: ModelParameters {
             theta: Vec::new(),
             theta_names: Vec::new(),

@@ -239,6 +239,7 @@ fn build_warfarin_model() -> CompiledModel {
         kappa_names: Vec::new(),
         indiv_param_names: vec!["CL".into(), "V".into(), "KA".into()],
         indiv_param_partials: crate::types::IndivParamPartials::empty(),
+        theta_blocks: crate::types::ThetaBlocks::empty(),
         #[cfg(feature = "nn")]
         covariate_nns: Vec::new(),
         scaling: ScalingSpec::None,
@@ -372,6 +373,7 @@ fn generate_two_cpt_iv() {
         kappa_names: Vec::new(),
         indiv_param_names: vec!["CL".into(), "V".into(), "Q".into(), "V2".into()],
         indiv_param_partials: crate::types::IndivParamPartials::empty(),
+        theta_blocks: crate::types::ThetaBlocks::empty(),
         #[cfg(feature = "nn")]
         covariate_nns: Vec::new(),
         scaling: ScalingSpec::None,
@@ -509,6 +511,7 @@ fn generate_two_cpt_oral_cov() {
             "KA".into(),
         ],
         indiv_param_partials: crate::types::IndivParamPartials::empty(),
+        theta_blocks: crate::types::ThetaBlocks::empty(),
         #[cfg(feature = "nn")]
         covariate_nns: Vec::new(),
         scaling: ScalingSpec::None,
@@ -704,6 +707,7 @@ fn generate_mm_oral() {
         kappa_names: Vec::new(),
         indiv_param_names: vec!["VMAX".into(), "KM".into(), "V".into(), "KA".into()],
         indiv_param_partials: crate::types::IndivParamPartials::empty(),
+        theta_blocks: crate::types::ThetaBlocks::empty(),
         #[cfg(feature = "nn")]
         covariate_nns: Vec::new(),
         scaling: ScalingSpec::None,

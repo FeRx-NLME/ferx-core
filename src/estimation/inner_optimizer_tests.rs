@@ -1114,6 +1114,7 @@ fn test_frem_jacobian_overrides_fd_with_exact_values() {
         eta_names: vec!["ETA_CL".into(), "ETA_V".into(), "ETA_WT_FREM".into()],
         indiv_param_names: vec!["CL".into(), "V".into(), "COV_WT".into()],
         indiv_param_partials: crate::types::IndivParamPartials::empty(),
+        theta_blocks: crate::types::ThetaBlocks::empty(),
         default_params,
         omega_init_as_sd: vec![false; 3],
         sigma_init_as_sd: vec![false],

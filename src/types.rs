@@ -7,6 +7,7 @@ use std::collections::HashMap;
 // inner `Expression` AST stays parser-private — only `IndivParamPartials::empty`
 // and the `Debug`/`Clone` derives are reachable from outside the crate.
 pub use crate::parser::model_parser::IndivParamPartials;
+pub use crate::parser::model_parser::ThetaBlocks;
 
 /// How a dose's infusion `rate`/`duration` are determined.
 ///
@@ -3016,6 +3017,10 @@ pub struct CompiledModel {
     /// parser-produced partials.
     #[allow(dead_code)] // no runtime consumer after #145; see field doc.
     pub indiv_param_partials: IndivParamPartials,
+    /// Vector / factor θ blocks declared by `[parameters]` (#1064). Empty for
+    /// every model that declares none, which is the overwhelming majority —
+    /// consumers short-circuit on [`ThetaBlocks::is_empty`].
+    pub theta_blocks: ThetaBlocks,
     pub default_params: ModelParameters,
     /// Per-eta flag (parallel to `eta_names` / omega diagonal): `true` when
     /// the user wrote `omega NAME ~ X (sd)` and the parser squared the value.
