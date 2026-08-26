@@ -12036,6 +12036,236 @@ fn test_min_max_arity_diagnostics() {
     );
 }
 
+// ── Three-argument clamp (#1092) ────────────────────────────────────────────
+
+/// Parse a single expression with `X` / `Y` bound to variable slots 0 and 1, so
+/// the bytecode and `Dual2` helpers above can drive whatever the parser built.
+fn parse_indexed_expr(src: &str) -> Expression {
+    let toks = tokenize(src).expect("tokenizes");
+    let defined = vec!["X".to_string(), "Y".to_string()];
+    let ctx = ParseCtx::new(&[], &[], &defined);
+    let (mut expr, p) = parse_add_sub(&toks, 0, ctx).expect("parses");
+    assert_eq!(p, toks.len(), "trailing tokens in `{src}`");
+    let var_idx: HashMap<String, usize> = [("X".to_string(), 0), ("Y".to_string(), 1)]
+        .into_iter()
+        .collect();
+    resolve_expr_indices(&mut expr, &var_idx, &HashMap::new());
+    expr
+}
+
+/// `clamp(x, lo, hi)` is defined as the nested form it replaces, so on every
+/// finite `x` the two must agree — including *on* both bounds, where the branch
+/// taken decides which of two equal values is returned. (`NaN` is the one input
+/// where they deliberately part; see
+/// `clamp_propagates_nan_where_nested_pins_to_lo`.)
+#[test]
+fn clamp_matches_nested_min_max_on_every_finite_x() {
+    let clamped = parse_indexed_expr("clamp(X, 0.01, 0.99)");
+    let nested = parse_indexed_expr("min(max(X, 0.01), 0.99)");
+    let nn: Vec<Vec<f64>> = Vec::new();
+    for x in [-1.0, 0.0, 0.005, 0.01, 0.5, 0.99, 1.0, 2.0] {
+        let vars = [x, 0.0];
+        let a = eval_expression_indexed(&clamped, &[], &[], &[], &vars, &nn);
+        let b = eval_expression_indexed(&nested, &[], &[], &[], &vars, &nn);
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "clamp != min(max(..)) at x = {x}: {a} vs {b}"
+        );
+        assert_eq!(a, x.clamp(0.01, 0.99), "at x = {x}");
+    }
+}
+
+/// The one input where `clamp` and `min(max(..))` part company, pinned so the
+/// divergence stays a decision rather than an accident. `NaN` fails both
+/// `x <= lo` and `x >= hi`, so `clamp` falls through to `x` and propagates it;
+/// the nested form's `max` sees `x >= lo` false and returns the bound, and the
+/// outer `min` keeps it — so a `NaN` readout comes back silently pinned to `lo`.
+/// Propagating is what we want: a `NaN` reaches the OFV, where it is caught.
+#[test]
+fn clamp_propagates_nan_where_nested_pins_to_lo() {
+    let clamped = parse_indexed_expr("clamp(X, 0.01, 0.99)");
+    let nested = parse_indexed_expr("min(max(X, 0.01), 0.99)");
+    let nn: Vec<Vec<f64>> = Vec::new();
+    let vars = [f64::NAN, 0.0];
+    assert!(
+        eval_expression_indexed(&clamped, &[], &[], &[], &vars, &nn).is_nan(),
+        "clamp must propagate a NaN input"
+    );
+    assert_eq!(
+        eval_expression_indexed(&nested, &[], &[], &[], &vars, &nn),
+        0.01,
+        "the nested form pins a NaN to `lo` — the behaviour clamp does not copy"
+    );
+    // The bytecode VM takes the same branches as the AST evaluator.
+    let bc = compile_bytecode(&clamped);
+    let mut stack: Vec<f64> = Vec::new();
+    assert!(
+        eval_bytecode_g::<f64>(&bc, &[], &[], &[], &vars, &nn, &mut stack).is_nan(),
+        "the compiled clamp must propagate a NaN too"
+    );
+}
+
+/// The desugared tree compiles: the bytecode VM and the AST evaluator must agree
+/// bit-for-bit in each of the three regimes and on both bounds.
+#[test]
+fn clamp_bytecode_matches_ast() {
+    let clamped = parse_indexed_expr("clamp(X, 0.01, 0.99)");
+    for x in [-1.0, 0.005, 0.01, 0.5, 0.99, 2.0] {
+        bc_vs_ast(clamped.clone(), &[x, 0.0], &[], &[], &[]);
+    }
+    // Variable bounds are ordinary expressions, not literals-only.
+    let var_bound = parse_indexed_expr("clamp(X, Y, 2 * Y)");
+    for x in [-1.0, 0.5, 1.0, 5.0] {
+        bc_vs_ast(var_bound.clone(), &[x, 0.75], &[], &[], &[]);
+    }
+}
+
+/// Derivatives across both bounds: flat (∂/∂x = 0) outside, pass-through
+/// (∂/∂x = 1) inside, and the bound's own derivative when the bound is a
+/// variable. Checked against central FD of the `f64` evaluator, with the probe
+/// steps kept clear of the kinks.
+#[test]
+fn clamp_dual2_matches_fd_in_every_regime() {
+    let expr = parse_indexed_expr("clamp(X, 0.2, 0.8) * Y");
+    for x in [0.05, 0.5, 0.95] {
+        bc_g_dual2_fd(&expr, x, 1.5, 1e-6, 1e-3);
+    }
+    // A variable lower bound: below it, the value *is* `Y`, so the gradient
+    // moves off `X` and onto `Y`.
+    let var_lo = parse_indexed_expr("clamp(X, Y, 0.9)");
+    bc_g_dual2_fd(&var_lo, 0.1, 0.3, 1e-6, 1e-3);
+    bc_g_dual2_fd(&var_lo, 0.5, 0.3, 1e-6, 1e-3);
+}
+
+/// The convention at the bounds themselves, where FD cannot speak: `x <= lo` and
+/// `x >= hi` take the *bound* branch, so the derivative is 0 on both bounds and 1
+/// strictly between them. Pinned so a later `<`/`<=` edit is a test failure.
+#[test]
+fn clamp_derivative_convention_on_the_bounds() {
+    use crate::sens::dual2::Dual2;
+    let bc = compile_bytecode(&parse_indexed_expr("clamp(X, 0.2, 0.8)"));
+    let nn: Vec<Vec<f64>> = Vec::new();
+    let grad_at = |x: f64| {
+        let vd = [Dual2::<2>::var(x, 0), Dual2::<2>::var(0.0, 1)];
+        let mut s: Vec<Dual2<2>> = Vec::new();
+        eval_bytecode_g::<Dual2<2>>(&bc, &[], &[], &[], &vd, &nn, &mut s).grad[0]
+    };
+    assert_eq!(
+        grad_at(0.2),
+        0.0,
+        "on the lower bound the `lo` branch is taken"
+    );
+    assert_eq!(
+        grad_at(0.8),
+        0.0,
+        "on the upper bound the `hi` branch is taken"
+    );
+    assert_eq!(grad_at(0.5), 1.0, "strictly inside, clamp is the identity");
+    assert_eq!(grad_at(0.1), 0.0, "below the lower bound");
+    assert_eq!(grad_at(0.9), 0.0, "above the upper bound");
+}
+
+/// End to end through a real model: the clamp bites at both bounds and passes
+/// through in between, after index resolution and bytecode compilation.
+#[test]
+fn test_clamp_in_individual_parameters() {
+    let content = r#"
+[parameters]
+  theta TVCL(2.0, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL = clamp(TVCL * WT / 70, 1.0, 3.0)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let parsed = parse_full_model(content).unwrap();
+    let theta = vec![2.0, 10.0];
+    let eta = vec![0.0];
+    let mut covs = HashMap::new();
+
+    let mut cl_at = |wt: f64, covs: &mut HashMap<String, f64>| {
+        covs.insert("WT".to_string(), wt);
+        (parsed.model.pk_param_fn)(&theta, &eta, covs, 0.0).values[0]
+    };
+    assert!(
+        (cl_at(70.0, &mut covs) - 2.0).abs() < 1e-12,
+        "inside: CL = 2"
+    );
+    assert!((cl_at(7.0, &mut covs) - 1.0).abs() < 1e-12, "floor bites");
+    assert!(
+        (cl_at(700.0, &mut covs) - 3.0).abs() < 1e-12,
+        "ceiling bites"
+    );
+}
+
+/// `clamp` with one, two or four arguments must be a hard error naming the
+/// three-argument form. The one-argument case is the trap the feature invites:
+/// an unknown `name(arg)` used to become `UnaryFn`, which every consumer
+/// evaluates as the identity — a no-op that fits, converges and gives wrong
+/// numbers.
+#[test]
+fn test_clamp_arity_diagnostics() {
+    for bad in [
+        "  y = clamp(central)\n",
+        "  y = clamp(central, 0.1)\n",
+        "  y = clamp(central, 0.1, 0.9, 2)\n",
+    ] {
+        let src = analytical_model_with_scaling(Some(bad));
+        let err = parse_model_string(&src)
+            .err()
+            .unwrap_or_else(|| panic!("`{}` must be rejected", bad.trim()));
+        assert!(
+            err.contains("three arguments") && err.contains("clamp(x, lo, hi)"),
+            "expected a clamp arity error for `{}`, got: {}",
+            bad.trim(),
+            err
+        );
+    }
+
+    // The reverse mistake: a third argument to `min`/`max` points at `clamp`
+    // rather than at a bracket bug.
+    let src = analytical_model_with_scaling(Some("  y = min(central, 0.1, 0.9)\n"));
+    let err = parse_model_string(&src).expect_err("three-argument min must be rejected");
+    assert!(
+        err.contains("clamp(x, lo, hi)"),
+        "expected the three-argument min error to name clamp, got: {}",
+        err
+    );
+}
+
+/// `clamp(x, 0.9, 0.1)` would never return `x` at all — quietly handing back
+/// `0.9` below the crossing and `0.1` above it. With both bounds literal that
+/// can only be a typo, so it is a parse error; bounds that
+/// are not both literals are left to run rather than paying an ordering test on
+/// every evaluation.
+#[test]
+fn test_clamp_rejects_inverted_literal_bounds() {
+    let src = analytical_model_with_scaling(Some("  y = clamp(central, 0.9, 0.1)\n"));
+    let err = parse_model_string(&src).expect_err("inverted literal bounds must be rejected");
+    assert!(
+        err.contains("bounds inverted"),
+        "expected the inverted-bounds error, got: {}",
+        err
+    );
+
+    // Equal bounds are a degenerate but well-defined constant, not an error.
+    let src = analytical_model_with_scaling(Some("  y = clamp(central, 0.5, 0.5)\n"));
+    parse_model_string(&src).expect("equal bounds are legal");
+
+    // A non-literal bound is not checked — no runtime ordering test.
+    let src = analytical_model_with_scaling(Some("  y = clamp(central, V, 0.1)\n"));
+    parse_model_string(&src).expect("non-literal bounds parse");
+}
+
 // ── Operator continuation lines (#1030) ─────────────────────────────────────
 
 #[test]
@@ -15024,6 +15254,71 @@ fn parse_derived_two_arg_max_at_statement_top_level() {
     assert_eq!(eval_one("X = min(CL, 2.0)"), 1.0);
     // Still an expression, not a call: trailing operators are honoured.
     assert_eq!(eval_one("X = max(CL, 2.0) * 3"), 6.0);
+}
+
+/// `clamp` has no row-aggregate spelling, so it is unambiguous in `[derived]`:
+/// it means the same thing at statement top level as it does nested one level
+/// in, and it stays an expression that trailing operators continue.
+#[test]
+fn parse_derived_clamp_is_unambiguous() {
+    let (theta, eta, indiv_params, covariates, prev_derived) = make_derived_ctx_simple();
+    let eval_one = |derived: &str| {
+        let src = minimal_model_with_derived(derived);
+        let parsed = parse_full_model(&src).expect("clamp in [derived] parses");
+        let DerivedKind::PerRow { eval } = &parsed.model.derived_exprs[0].kind else {
+            panic!("expected PerRow, got the row aggregate");
+        };
+        let ctx = DerivedContext {
+            theta: &theta,
+            eta: &eta,
+            indiv_params: &indiv_params,
+            covariates: &covariates,
+            ipred: 0.0,
+            pred: 0.0,
+            dv: 0.0,
+            time: 1.0,
+            tafd: 1.0,
+            tad: 1.0,
+            prev_derived: &prev_derived,
+            compartments: &[],
+            compartment_names: &[],
+        };
+        eval(&ctx)
+    };
+    // CL = 1, V = 10.
+    assert_eq!(eval_one("X = clamp(CL, 2.0, 5.0)"), 2.0);
+    assert_eq!(eval_one("X = 1 * clamp(CL, 2.0, 5.0)"), 2.0);
+    assert_eq!(eval_one("X = clamp(V, 2.0, 5.0)"), 5.0);
+    assert_eq!(eval_one("X = clamp(V, 2.0, 50.0)"), 10.0);
+    // Still an expression, not a call: trailing operators are honoured.
+    assert_eq!(eval_one("X = clamp(CL, 2.0, 5.0) * 3"), 6.0);
+}
+
+/// A third argument to a statement-top-level `[derived]` aggregate used to be
+/// dropped in silence — `args[2..]` is never read — so `max(IPRED, TIME > 0, Q)`
+/// computed `max(IPRED, TIME > 0)`. Reject it, and name `clamp` for `min`/`max`,
+/// which is what the extra argument usually means (#1092).
+#[test]
+fn parse_derived_aggregate_rejects_a_third_argument() {
+    for (derived, names_clamp) in [
+        ("CMAX = max(IPRED, TIME > 0, 99)", true),
+        ("CMIN = min(IPRED, TIME > 0, 99)", true),
+        ("TP = tmax(IPRED, TIME > 0, 99)", false),
+    ] {
+        let src = minimal_model_with_derived(derived);
+        let err = parse_full_model(&src)
+            .err()
+            .unwrap_or_else(|| panic!("a third argument must be rejected: `{derived}`"));
+        assert!(
+            err.contains("at most two arguments"),
+            "expected the aggregate arity error for `{derived}`, got: {err}"
+        );
+        assert_eq!(
+            err.contains("clamp(x, lo, hi)"),
+            names_clamp,
+            "only `min`/`max` should point at clamp: `{derived}` gave: {err}"
+        );
+    }
 }
 
 /// A second argument that *is* a comparison keeps meaning the row filter.

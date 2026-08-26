@@ -399,14 +399,16 @@ above), the dose-attribute double-use rejection sees through them, and the
 analytic-sensitivity path is unaffected. The one consequence of inlining is that
 an intermediate used twice is *evaluated* twice — which is exactly what writing
 it out by hand costs. Note that `min` / `max` count as two uses each (see below),
-so a two-sided clamp on a named value expands that value eight times.
+so a two-sided clamp on a named value expands that value four times — or three
+times written as `clamp(x, lo, hi)`.
 
-### `min(a, b)` and `max(a, b)`
+### `min(a, b)`, `max(a, b)` and `clamp(x, lo, hi)`
 
-Two-argument `min` / `max` are available in every expression the DSL parses —
-`[scaling]`, `[individual_parameters]`, `[odes]`, `[derived]`. They desugar to the
-inline conditional (`max(a, b)` → `if (a >= b) a else b`), so they differentiate
-and compile exactly like the hand-written form.
+Two-argument `min` / `max` and three-argument `clamp` are available in every
+expression the DSL parses — `[scaling]`, `[individual_parameters]`, `[odes]`,
+`[derived]`. They desugar to the inline conditional (`max(a, b)` →
+`if (a >= b) a else b`), so they differentiate and compile exactly like the
+hand-written form.
 
 The desugaring puts **both** arguments in the guard *and* in a branch, so each one
 appears twice in the compiled tree, and the duplication multiplies through nesting:
@@ -415,11 +417,32 @@ two places in a readout makes eight. Clamp a *named* value rather than a long
 expression — that is the pairing the block above uses, and it keeps the growth on a
 short leaf instead of on a whole sub-model.
 
+`clamp(x, lo, hi)` is the two-sided bound written as one call, and desugars to the
+same nested conditional the pair does: `if (x <= lo) lo else if (x >= hi) hi else x`.
+On each bound the *bound* is returned, so the derivative there is zero. It puts `x`
+in the tree three times rather than the nested form's four, but the advice above is
+unchanged — clamp a named value, not a long expression. Any arity other than three
+is a parse error, and literal bounds the wrong way round (`clamp(x, 0.9, 0.1)`) are
+rejected rather than silently returning a bound for every `x`; bounds that are not
+both literals are not checked.
+
+`clamp` differs from the nested pair in one place, deliberately: on a `NaN` input.
+`NaN` fails both `x <= lo` and `x >= hi`, so `clamp` falls through to `x` and the
+`NaN` propagates — into the prediction, and from there into the objective
+function, where it is caught. The nested `min(max(x, lo), hi)` instead returns
+`lo`, because `max`'s `x >= lo` is false for `NaN` and the `else` branch is the
+bound. So if you rewrite an existing `min`/`max` pair as `clamp` around a
+quantity that can go `NaN` — a `log` or `sqrt` of something that dips negative
+mid-search, say — that model was being quietly pinned to `lo`, and will now
+surface the `NaN` instead. That is the intended direction: a silently bounded
+`NaN` is a wrong number that fits.
+
 In `[derived]`, `min` / `max` also name the row aggregate (`max(IPRED, TIME > 0)` is
 "the largest `IPRED` over rows where `TIME > 0`"). The two are told apart by the
 second argument: a comparison is a row filter, anything else is the numeric clamp.
 An aggregate cannot be combined into a larger expression — `max(IPRED) * 2` is an
-error, not a scaled maximum.
+error, not a scaled maximum. `clamp` has no aggregate spelling, so it is
+unambiguous there.
 
 ## Runtime behaviour on bad scales
 
