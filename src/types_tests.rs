@@ -2475,6 +2475,48 @@ mod theta_block_scale_guards {
     }
 
     #[test]
+    fn free_packed_dim_ignores_fixed_omega_coordinates() {
+        // The review case for this guard (#1095): 14 fixed diagonal etas plus
+        // two free thetas and one free sigma is *three* free coordinates. The
+        // original formula counted a dense triangular Omega regardless of FIX
+        // flags and returned 108 — enough on its own to flip `optimizer = auto`
+        // and the default covariance estimator on a model that has nothing to do
+        // with level blocks. This is the assertion that would have caught it.
+        let etas: String = (1..=14)
+            .map(|i| format!("  omega ETA_{i} ~ 0.09 FIX\n"))
+            .collect();
+        let sum: Vec<String> = (1..=14).map(|i| format!("ETA_{i}")).collect();
+        let content = format!(
+            r#"
+[parameters]
+  theta TVCL(2.0, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+{etas}  sigma PROP_ERR ~ 0.02
+[individual_parameters]
+  CL = TVCL * exp({})
+  V = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#,
+            sum.join(" + ")
+        );
+        let model = crate::parser::model_parser::parse_full_model(&content)
+            .unwrap()
+            .model;
+        assert_eq!(model.n_eta, 14);
+        assert_eq!(
+            model.free_packed_dim(),
+            3,
+            "two free thetas and one free sigma; every omega coordinate is fixed"
+        );
+        // And therefore neither scale guard fires on it.
+        assert!(model.free_packed_dim() <= BOBYQA_MAX_DIM);
+        assert!(model.free_packed_dim() <= COV_HESSIAN_MAX_DIM);
+    }
+
+    #[test]
     fn auto_keeps_bobyqa_at_ordinary_dimension() {
         // The guard must not disturb the historical `auto` behaviour on the
         // models everything else in this codebase is: `gradient = fd` removes
