@@ -123,6 +123,47 @@ fn an_escalation_that_worked_is_reported_as_info() {
     );
 }
 
+/// A mid-segment switch (#1080 Part C) is reported as a clause on the escalation note, not as
+/// a problem of its own: `auto` deciding late is what the feature is for on a model whose
+/// stiffness only appears after a dose. What the note has to say is that the decision was taken
+/// part-way through, because it changes how the step counters above it read.
+#[test]
+fn a_mid_segment_switch_is_reported_on_the_escalation_note() {
+    let stats = OdeSolverStats {
+        attempted_steps: 400,
+        accepted_steps: 400,
+        auto_stiff_segments: 12,
+        auto_switched_segments: 9,
+        ..Default::default()
+    };
+    let (msg, entry) =
+        ode_solver_diagnostics_warning(&stats, &FitOptions::default()).expect("a note");
+    assert_eq!(entry.severity, WarningSeverity::Info);
+    assert!(msg.contains("9 of them changed stepper"), "{msg}");
+    assert!(msg.contains("ode_auto_switch"), "{msg}");
+    assert_eq!(
+        entry.details.as_ref().unwrap()["auto_switched_segments"],
+        serde_json::json!(9)
+    );
+}
+
+/// …and a fit that switched *and* did not integrate cleanly says both: the switch clause rides
+/// the warning too, so the counters it explains are never presented without it.
+#[test]
+fn a_switch_is_reported_alongside_an_unclean_solve() {
+    let stats = OdeSolverStats {
+        min_step_clamped_steps: 12,
+        auto_stiff_segments: 12,
+        auto_switched_segments: 9,
+        ..Default::default()
+    };
+    let (msg, entry) =
+        ode_solver_diagnostics_warning(&stats, &FitOptions::default()).expect("a warning");
+    assert_eq!(entry.severity, WarningSeverity::Warning);
+    assert!(msg.contains("9 of them changed stepper"), "{msg}");
+    assert_eq!(classify_warning(&msg).category, WarningCode::OdeSolver);
+}
+
 /// A rejected escalation is the actionable one: the probe was right about the stiffness and
 /// wrong about the method, and only the user can pick another.
 #[test]
