@@ -241,7 +241,10 @@ fn check_per_cmt_error_model(model: &CompiledModel, population: &Population) -> 
 /// for one arm — which evaluates the covariate to `0` and silently gives that
 /// row infinite precision. A negative multiplier squares away to the same
 /// variance as its absolute value, so it is never what was meant either.
-fn check_residual_magnitude(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+pub(crate) fn check_residual_magnitude(
+    model: &CompiledModel,
+    population: &Population,
+) -> Vec<Diagnostic> {
     if !model.has_custom_ruv_magnitude() {
         return Vec::new();
     }
@@ -423,6 +426,30 @@ fn check_kappa_weight_variation(model: &CompiledModel, population: &Population) 
 /// column") is wrong rather than merely noisy.
 pub(crate) fn reader_warning_suppressed(model: &CompiledModel, warning: &str) -> bool {
     model.is_algebraic() && warning.starts_with("W_NO_DOSES")
+}
+
+/// The *fatal* model-vs-population checks every `simulate()` entry point owes its
+/// caller (#1083).
+///
+/// `fit()` runs these through [`check_model_data`]; the simulation paths used to
+/// each pick their own subset, and the subsets disagreed. That mattered because a
+/// weight is the one covariate whose failure mode is silent in both directions:
+/// `BinOp::Div` returns `0.0` rather than `inf` when its divisor underflows, so a
+/// missing arm size makes `κ/√W` collapse to *zero* — the arm simply loses its
+/// between-arm variability, with no `NaN` to trip over — and a missing standard
+/// error makes the `weight = <expr>` residual magnitude collapse the additive
+/// loading, so the simulated observation *is* its own IPRED. Both produce plots.
+///
+/// Ordered covariates-first so the first error reported by the existing callers is
+/// unchanged.
+pub(crate) fn check_simulation_data(
+    model: &CompiledModel,
+    population: &Population,
+) -> Vec<Diagnostic> {
+    let mut diags = check_covariates(model, population);
+    diags.extend(check_kappa_weights(model, population));
+    diags.extend(check_residual_magnitude(model, population));
+    diags
 }
 
 /// All data-dependent *fatal* compatibility checks between a compiled model and

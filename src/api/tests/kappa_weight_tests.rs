@@ -222,3 +222,102 @@ fn positive_arm_sizes_pass_on_the_simulate_path() {
         "a positive weight must not be rejected: {out:?}"
     );
 }
+
+// ── The Vec-returning entry points, and the degenerate oracle (#1083) ────────
+//
+// `κ/√W` with `W = 0` does *not* blow up: `BinOp::Div` returns `0.0` when its
+// divisor underflows, so a blank arm-size cell removes the arm's between-arm
+// variability and leaves finite, plottable rows behind. `check_kappa_weights`
+// was therefore the entire defence — and it was absent from `simulate` /
+// `simulate_with_seed`, which return a bare `Vec` and had no check at all.
+
+#[test]
+#[should_panic(expected = "weight `NARM` evaluates to 0")]
+fn the_vec_returning_entry_point_panics_on_a_zero_arm_size() {
+    let model = weighted_kappa_model();
+    let pop = population_with_arm_sizes(&[(1, 200.0), (2, 0.0)]);
+    let _ = crate::api::simulate_with_seed(&model, &pop, &model.default_params, 1, 42);
+}
+
+/// [`population_with_arm_sizes`] plus a bolus at t = 0, so the simulated rows
+/// carry a *non-zero* prediction. Without a dose every IPRED is 0.0 and the two
+/// tests below compare zeros to zeros — passing while measuring nothing.
+fn dosed_population_with_arm_sizes(rows: &[(u32, f64)]) -> Population {
+    let mut pop = population_with_arm_sizes(rows);
+    let subj = &mut pop.subjects[0];
+    subj.doses = vec![crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+    subj.dose_occasions = vec![rows[0].0];
+    subj.dose_covariates = vec![subj.covariates.clone()];
+    pop
+}
+
+/// The degenerate oracle for the weighted-κ simulate path: `weight = NARM` is
+/// applied by desugaring every reference into `KAPPA_CL / sqrt(NARM)`, so a
+/// dataset whose arm sizes are all exactly 1 must simulate **bit-identically** to
+/// the same model with no `weight =` modifier at all. A scaling applied on the
+/// wrong side, or applied twice, disagrees here and nowhere else.
+#[test]
+fn an_arm_size_of_one_simulates_bit_identically_to_an_unweighted_kappa() {
+    let weighted = weighted_kappa_model();
+    let plain = parse_model_string(
+        "[parameters]\n  theta TVCL(0.2)\n  theta TVV(10.0)\n  omega ETA_CL ~ 0.09\n  \
+         kappa KAPPA_CL ~ 2.0 (sd)\n  sigma PROP_ERR ~ 0.04\n[individual_parameters]\n  \
+         CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V  = TVV\n[structural_model]\n  \
+         pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ \
+         proportional(PROP_ERR)\n[fit_options]\n  iov_column = OCC\n",
+    )
+    .expect("parse");
+    let pop = dosed_population_with_arm_sizes(&[(1, 1.0), (2, 1.0), (2, 1.0)]);
+    let opts = crate::api::SimulateOptions {
+        seed: Some(11),
+        ..Default::default()
+    };
+
+    let a = crate::api::simulate_with_options(&weighted, &pop, &weighted.default_params, 1, &opts)
+        .expect("weighted simulates");
+    let b = crate::api::simulate_with_options(&plain, &pop, &plain.default_params, 1, &opts)
+        .expect("unweighted simulates");
+    assert_eq!(a.len(), b.len());
+    assert!(
+        !a.is_empty(),
+        "the oracle is vacuous with no simulated rows"
+    );
+    assert!(
+        a.iter().any(|r| r.ipred.abs() > 1e-9),
+        "the oracle is vacuous if every prediction is zero"
+    );
+    for (x, y) in a.iter().zip(b.iter()) {
+        assert_eq!(
+            x.ipred.to_bits(),
+            y.ipred.to_bits(),
+            "weight = 1 must be bit-identical to no weight at TIME {}",
+            x.time
+        );
+    }
+}
+
+/// …and the weight must actually *reach* the draw. Same seed, so the κ draws are
+/// shared: a larger arm divides κ down, so the arm's individual CL sits closer to
+/// its typical value and the spread of IPRED across occasions shrinks.
+#[test]
+fn a_larger_arm_size_shrinks_the_between_arm_spread() {
+    let model = weighted_kappa_model();
+    let spread = |n: f64| -> f64 {
+        let pop = dosed_population_with_arm_sizes(&[(1, n), (2, n), (3, n)]);
+        let opts = crate::api::SimulateOptions {
+            seed: Some(11),
+            ..Default::default()
+        };
+        let rows = crate::api::simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
+            .expect("simulates");
+        let ipreds: Vec<f64> = rows.iter().map(|r| r.ipred).collect();
+        let hi = ipreds.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let lo = ipreds.iter().cloned().fold(f64::INFINITY, f64::min);
+        hi - lo
+    };
+    let (small_arms, large_arms) = (spread(4.0), spread(400.0));
+    assert!(
+        large_arms < small_arms,
+        "κ ~ N(0, γ²/N): larger arms must vary less, got {small_arms} then {large_arms}"
+    );
+}

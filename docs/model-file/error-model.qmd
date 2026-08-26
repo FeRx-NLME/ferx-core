@@ -351,6 +351,18 @@ The same modifier rides an IOV `kappa` declaration, where it weights the
 `κ ~ N(0, Ω_IOV / N)` — the arm-level random effect of a longitudinal MBMA. See
 [Sample-size-weighted IOV](iov.qmd#sample-size-weighted-iov-weight-).
 
+### Simulating an arm that is not in the data
+
+The weight is a data column. `fit()` always has one — the arm exists, and its
+reported standard error is a column — but a simulated trial frequently does not,
+because the point of simulating one is to propose arms that are not in the data.
+So a `[simulation]` design must state the weight with `covariate WPSE = [...]`,
+and one that omits it is refused rather than defaulted: the modifier scales the
+*additive* loading, so a weight silently read as zero does not blow up — it
+removes the arm's residual noise entirely and the simulated observation equals its
+own prediction. See
+[Covariates in simulation](simulation.qmd#sim-covariates-required).
+
 ## Log-transform-both-sides (LTBS)
 
 For data whose residual error is *multiplicative* (a constant CV across the
