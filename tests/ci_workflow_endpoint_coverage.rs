@@ -11,11 +11,16 @@
 //!
 //! So the invariant is pinned here as a plain set equality:
 //!
-//! > the `--test` names in that job == every `tests/*.rs` mentioning a `survival` or
-//! > `markov` feature cfg.
+//! > the `--test` names in that job == every `tests/*.rs` mentioning a `survival`,
+//! > `markov` or `nn` feature cfg.
 //!
-//! Tier-3 (`slow-tests`-gated) endpoint files are deliberately *inside* the set: without
-//! the `slow-tests` feature their tests stay `#[ignore]`d, so listing them costs one cheap
+//! `nn` is in that set because the job builds `--features ci,markov,nn`: the covariate-NN
+//! surface is compiled out of the base `ci` build exactly like the endpoint families, and
+//! one nn-gated test (`tests/tte_smoke.rs`, #442) needs `survival` *and* `nn` at once — so
+//! there is no separate nn job to own it, and no exemption to carve out here.
+//!
+//! Tier-3 (`slow-tests`-gated) files are deliberately *inside* the set: without the
+//! `slow-tests` feature their tests stay `#[ignore]`d, so listing them costs one cheap
 //! compile each and keeps this a set equality with no exemption rule to get wrong.
 //!
 //! Not feature-gated itself — it must run in the base `--features ci` job, which is the
@@ -28,14 +33,22 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// Every `tests/*.rs` whose source mentions a `survival` or `markov` feature cfg.
+/// The default-off features this job's build turns on, and whose gated test files it
+/// therefore has to list. Kept in one place so `--features ci,markov,nn` in `ci.yml`
+/// and the detector below cannot drift apart. (`survival` is named explicitly even
+/// though `markov = ["survival"]` implies it, because test files gate on either name.)
+const GATED_FEATURES: [&str; 3] = ["survival", "markov", "nn"];
+
+/// Every `tests/*.rs` whose source mentions one of [`GATED_FEATURES`] as a feature cfg.
 ///
 /// Matching on the raw `feature = "…"` string is what makes the set self-maintaining:
-/// any file that compiles endpoint code *must* gate it (it would not build in the base
-/// `ci` job otherwise), and gating means writing that string.
+/// any file that compiles feature-gated code *must* gate it (it would not build in the
+/// base `ci` job otherwise), and gating means writing that string.
 fn endpoint_test_files(tests_dir: &Path) -> BTreeSet<String> {
-    // This file quotes both cfg strings in the matcher below, so it would match itself
-    // and demand a `--test` entry for a test that compiles no endpoint code. `file!()`
+    // Skip self. The matcher below builds its needles with `format!`, so this file does
+    // not currently quote any of them literally — but it used to, and a future edit that
+    // inlines a cfg string here (in a doc comment, say) would make the file match itself
+    // and demand a `--test` entry for a test that compiles no gated code. `file!()`
     // rather than a hard-coded name so a rename cannot silently re-introduce that.
     let self_stem = Path::new(file!())
         .file_stem()
@@ -52,7 +65,10 @@ fn endpoint_test_files(tests_dir: &Path) -> BTreeSet<String> {
             continue;
         }
         let src = std::fs::read_to_string(&path).expect("test file is valid UTF-8");
-        if src.contains(r#"feature = "survival""#) || src.contains(r#"feature = "markov""#) {
+        if GATED_FEATURES
+            .iter()
+            .any(|f| src.contains(&format!(r#"feature = "{f}""#)))
+        {
             let stem = path
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -104,8 +120,8 @@ fn endpoint_coverage_job_lists_every_feature_gated_test_file() {
 
     assert!(
         !expected.is_empty(),
-        "no tests/*.rs mention a survival/markov feature cfg — the detector must be broken, \
-         since the endpoint job would then measure nothing"
+        "no tests/*.rs mention a survival/markov/nn feature cfg — the detector must be \
+         broken, since the endpoint job would then measure nothing"
     );
 
     let missing: Vec<_> = expected.difference(&selected).cloned().collect();
@@ -113,7 +129,7 @@ fn endpoint_coverage_job_lists_every_feature_gated_test_file() {
 
     assert!(
         missing.is_empty(),
-        "these tests/*.rs use a `survival`/`markov` feature cfg but are NOT built by the \
+        "these tests/*.rs use a `survival`/`markov`/`nn` feature cfg but are NOT built by the \
          `Tests + coverage (TTE/CTMM endpoints)` job in .github/workflows/ci.yml: {missing:?}. \
          Their feature-gated lines would read as uncovered in the merged Codecov report. \
          Add `--test <name>` for each to that job's `cargo llvm-cov` invocation."
@@ -121,7 +137,7 @@ fn endpoint_coverage_job_lists_every_feature_gated_test_file() {
     assert!(
         extra.is_empty(),
         "the `Tests + coverage (TTE/CTMM endpoints)` job builds these test binaries, but they \
-         no longer contain a `survival`/`markov` feature cfg: {extra:?}. They are already run \
+         no longer contain a `survival`/`markov`/`nn` feature cfg: {extra:?}. They are already run \
          and measured by `Tests + coverage (core)`, so drop their `--test` flags rather than \
          pay a second instrumented compile."
     );

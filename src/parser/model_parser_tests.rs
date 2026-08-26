@@ -18818,6 +18818,643 @@ fn test_split_weight_modifier_peels_a_kappa_declaration() {
     assert_eq!(w.as_deref(), Some("NARM"));
 }
 
+/// `[covariate_nn]` inputs must count as referenced covariates.
+///
+/// They are named in the block, not in any expression, so no statement walker sees them.
+/// If they are not registered here the model does not treat them as required data
+/// columns, `Population::prune_irrelevant_tv_covariates` discards their trajectories, and
+/// the network silently reads each subject's baseline value for the whole record.
+#[cfg(feature = "nn")]
+#[test]
+fn covariate_nn_inputs_are_registered_as_referenced_covariates() {
+    let model = parse_model_string(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[covariate_nn CLNN]
+  inputs     = [ZCOV, WT]
+  outputs    = [CL]
+  layers     = [3]
+  activation = tanh
+  output     = softplus
+
+[individual_parameters]
+  CL = TVCL * CLNN.CL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+",
+    )
+    .expect("DCM fixture parses");
+
+    for name in ["ZCOV", "WT"] {
+        assert!(
+            model.referenced_covariates.iter().any(|c| c == name),
+            "NN input {name} must be a referenced covariate, got {:?}",
+            model.referenced_covariates
+        );
+    }
+}
+
+/// The regression proper: a network whose input is time-varying must still produce
+/// time-varying predictions **after the fit pipeline has pruned covariates**.
+///
+/// Routing through `prune_irrelevant_tv_covariates` is the whole point. That is the call
+/// `api::fit` makes, and it is where the bug lived: a subject constructed by hand keeps
+/// its `obs_covariates` and predicts correctly whether or not the fix is present, so a
+/// test that skips the prune passes either way and proves nothing. (Verified: without the
+/// fix this test fails only when the prune is included.)
+#[cfg(feature = "nn")]
+#[test]
+fn covariate_nn_reads_time_varying_covariate_values() {
+    use crate::types::{DoseEvent, Subject};
+    use std::collections::HashMap;
+
+    let model = parse_model_string(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[covariate_nn CLNN]
+  inputs     = [ZCOV]
+  outputs    = [CL]
+  layers     = [3]
+  activation = tanh
+  output     = softplus
+
+[individual_parameters]
+  CL = TVCL * CLNN.CL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+",
+    )
+    .expect("DCM fixture parses");
+
+    let times = vec![1.0, 4.0, 8.0, 16.0, 24.0];
+    // `obs_covariates` carries the per-observation snapshot the engine reads.
+    let make = |zcov: &[f64]| -> Subject {
+        let per_obs: Vec<HashMap<String, f64>> = zcov
+            .iter()
+            .map(|&z| HashMap::from([("ZCOV".to_string(), z)]))
+            .collect();
+        Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: times.clone(),
+            obs_raw_times: Vec::new(),
+            observations: vec![1.0; times.len()],
+            obs_cmts: vec![1; times.len()],
+            covariates: HashMap::from([("ZCOV".to_string(), zcov[0])]),
+            dose_covariates: vec![HashMap::from([("ZCOV".to_string(), zcov[0])])],
+            obs_covariates: per_obs,
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; times.len()],
+            occasions: Vec::new(),
+            obs_l2: Vec::new(),
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        }
+    };
+
+    // Same baseline, but one subject's covariate swings hard after the second sample.
+    let mut pop = crate::types::Population {
+        subjects: vec![
+            make(&[-1.0, -1.0, -1.0, -1.0, -1.0]),
+            make(&[-1.0, -1.0, 1.5, 1.5, 1.5]),
+        ],
+        covariate_names: vec!["ZCOV".to_string()],
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+    assert!(
+        pop.subjects[1].has_tv_covariates(),
+        "fixture must present time-varying covariates before pruning"
+    );
+
+    // The step that broke it: covariates the model does not reference are dropped here.
+    pop.prune_irrelevant_tv_covariates(&model.referenced_covariates);
+
+    let constant = &pop.subjects[0];
+    let varying = &pop.subjects[1];
+    let theta = &model.default_params.theta;
+    let mut scratch = crate::pk::EventPkParams::default();
+    let p_const =
+        crate::pk::compute_predictions_with_tv_into(&model, constant, theta, &[0.0], &mut scratch);
+    let p_vary =
+        crate::pk::compute_predictions_with_tv_into(&model, varying, theta, &[0.0], &mut scratch);
+
+    // The first two samples share a covariate value, so they must agree exactly; the
+    // later ones must not, or the network never saw the change.
+    for j in 0..2 {
+        assert!(
+            (p_const[j] - p_vary[j]).abs() < 1e-12,
+            "obs {j} precedes the covariate change and must be identical"
+        );
+    }
+    let diverged = (2..times.len()).any(|j| (p_const[j] - p_vary[j]).abs() > 1e-9);
+    assert!(
+        diverged,
+        "predictions after the covariate change are identical ({p_const:?} vs {p_vary:?}); \
+         the NN is reading a frozen baseline covariate instead of the trajectory"
+    );
+}
+
+/// A `[covariate_nn]` input that the data does not carry must be a hard error, not a
+/// silent zero.
+///
+/// `NamedMlpMapper::forward_raw` zero-fills any input it cannot find, matching the
+/// expression evaluator's `unwrap_or(0.0)`. On the hot path that is the right shape --
+/// it runs per prediction and must not allocate an error -- but it means a typo'd or
+/// unavailable input degenerates the network to a constant with nothing to show for it.
+/// The guard is `check_covariates` at fit time, which only sees NN inputs because they
+/// are registered as referenced covariates.
+///
+/// `TIME` is the case a user is most likely to reach for, wanting a time-varying
+/// parameter. It is a reserved column rather than a covariate, so it is not in the
+/// covariate map and must be rejected like any other absent input.
+#[cfg(feature = "nn")]
+#[test]
+fn covariate_nn_input_missing_from_data_is_rejected() {
+    use crate::types::{DoseEvent, Population, Subject};
+    use std::collections::HashMap;
+
+    let parse = |inputs: &str| {
+        parse_model_string(&format!(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[covariate_nn CLNN]
+  inputs     = [{inputs}]
+  outputs    = [CL]
+  layers     = [3]
+  activation = tanh
+  output     = softplus
+
+[individual_parameters]
+  CL = TVCL * CLNN.CL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"
+        ))
+        .expect("DCM fixture parses")
+    };
+
+    let population = Population {
+        subjects: vec![Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![1.0],
+            obs_cmts: vec![1],
+            covariates: HashMap::from([("WT".to_string(), 70.0)]),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0],
+            occasions: Vec::new(),
+            obs_l2: Vec::new(),
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        }],
+        covariate_names: vec!["WT".to_string()],
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+
+    // A typo'd covariate name.
+    let diags = crate::api::check_covariates(&parse("ZCOV"), &population);
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.code == "E_MISSING_COVARIATE" && d.message.contains("ZCOV")),
+        "an NN input absent from the data must be rejected, got {diags:?}"
+    );
+
+    // `TIME` is not a covariate column, so it must be rejected too rather than
+    // silently zero-filling the network's only input.
+    let diags = crate::api::check_covariates(&parse("TIME"), &population);
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.code == "E_MISSING_COVARIATE" && d.message.contains("TIME")),
+        "`inputs = [TIME]` must be rejected, got {diags:?}"
+    );
+
+    // A present covariate must not be flagged.
+    let diags = crate::api::check_covariates(&parse("WT"), &population);
+    assert!(
+        diags.is_empty(),
+        "a present covariate must pass, got {diags:?}"
+    );
+}
+
+/// `center` / `scale` must reach the network: the forward pass sees `(x - center)/scale`.
+///
+/// Asserted by equivalence rather than by inspecting the mapper's fields — a model
+/// declaring `center`/`scale` must predict identically to one fed the already-normalised
+/// covariate, for the same weights. That pins the transform's direction and its
+/// application point, which reading the stored vectors back would not.
+#[cfg(feature = "nn")]
+#[test]
+fn covariate_nn_center_and_scale_normalize_the_inputs() {
+    use std::collections::HashMap;
+
+    let build = |extra: &str| {
+        parse_model_string(&format!(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[covariate_nn CLNN]
+  inputs     = [WT]
+{extra}  outputs    = [CL]
+  layers     = [3]
+  activation = tanh
+  output     = softplus
+
+[individual_parameters]
+  CL = TVCL * CLNN.CL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"
+        ))
+        .expect("DCM fixture parses")
+    };
+
+    let normalized = build("  center     = [70.0]\n  scale      = [12.0]\n");
+    let raw = build("");
+
+    // Same auto-generated Glorot weights in both (the init is deterministic).
+    let w_norm = &normalized.default_params.theta[2..];
+    let w_raw = &raw.default_params.theta[2..];
+    assert_eq!(
+        w_norm, w_raw,
+        "weight init must be identical across the two fixtures"
+    );
+
+    let nn_norm = &normalized.covariate_nns[0];
+    let nn_raw = &raw.covariate_nns[0];
+
+    // WT = 94 under center 70 / scale 12 is z = 2.0; the un-normalised network must
+    // reproduce it exactly when handed 2.0 directly.
+    let out_norm = nn_norm
+        .mapper
+        .forward_raw(w_norm, &HashMap::from([("WT".to_string(), 94.0)]))
+        .expect("forward");
+    let out_raw = nn_raw
+        .mapper
+        .forward_raw(w_raw, &HashMap::from([("WT".to_string(), 2.0)]))
+        .expect("forward");
+    assert!(
+        (out_norm[0] - out_raw[0]).abs() < 1e-12,
+        "normalised input must equal the pre-normalised one: {out_norm:?} vs {out_raw:?}"
+    );
+
+    // And it must NOT equal the raw network fed the raw value, or nothing happened.
+    let out_unnormalized = nn_raw
+        .mapper
+        .forward_raw(w_raw, &HashMap::from([("WT".to_string(), 94.0)]))
+        .expect("forward");
+    assert!(
+        (out_norm[0] - out_unnormalized[0]).abs() > 1e-9,
+        "declaring center/scale must change the forward pass"
+    );
+}
+
+/// Normalisation is what keeps a `tanh` layer out of saturation.
+///
+/// The motivation for the feature, as a test rather than a claim: at Glorot
+/// initialisation a raw `WT ≈ 70` drives every hidden unit to ±1, so the layer's
+/// derivative collapses and the network is nearly blind to its input. Standardised
+/// inputs leave it responsive. Measured as the spread of the output across the covariate
+/// range — a saturated network barely moves.
+#[cfg(feature = "nn")]
+#[test]
+fn normalization_keeps_the_hidden_layer_responsive() {
+    use std::collections::HashMap;
+
+    let build = |extra: &str| {
+        parse_model_string(&format!(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[covariate_nn CLNN]
+  inputs     = [WT]
+{extra}  outputs    = [CL]
+  layers     = [8]
+  activation = tanh
+  output     = softplus
+
+[individual_parameters]
+  CL = TVCL * CLNN.CL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"
+        ))
+        .expect("DCM fixture parses")
+    };
+
+    // Observed weight range, roughly 45-95 kg.
+    let wts = [45.0, 55.0, 65.0, 75.0, 85.0, 95.0];
+    let spread = |model: &crate::types::CompiledModel| -> f64 {
+        let w = &model.default_params.theta[2..];
+        let outs: Vec<f64> = wts
+            .iter()
+            .map(|&x| {
+                model.covariate_nns[0]
+                    .mapper
+                    .forward_raw(w, &HashMap::from([("WT".to_string(), x)]))
+                    .expect("forward")[0]
+            })
+            .collect();
+        outs.iter().cloned().fold(f64::MIN, f64::max)
+            - outs.iter().cloned().fold(f64::MAX, f64::min)
+    };
+
+    let raw_spread = spread(&build(""));
+    let norm_spread = spread(&build("  center     = [70.0]\n  scale      = [15.0]\n"));
+
+    assert!(
+        norm_spread > 10.0 * raw_spread,
+        "standardising the input must leave the network far more responsive across the \
+         covariate range: raw spread {raw_spread:.3e}, normalised {norm_spread:.3e}"
+    );
+}
+
+/// `scale = 0` is a division by zero and must be rejected at parse time, as must a
+/// length that does not match `inputs`.
+#[cfg(feature = "nn")]
+#[test]
+fn covariate_nn_rejects_invalid_normalization() {
+    let build = |extra: &str| {
+        parse_model_string(&format!(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[covariate_nn CLNN]
+  inputs     = [WT, CRCL]
+{extra}  outputs    = [CL]
+  layers     = [3]
+  activation = tanh
+  output     = softplus
+
+[individual_parameters]
+  CL = TVCL * CLNN.CL * exp(ETA_CL)
+  V  = 10.0
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"
+        ))
+    };
+
+    let err = build("  scale      = [12.0, 0.0]\n").expect_err("zero scale must be rejected");
+    assert!(
+        err.contains("scale") && err.contains("CRCL"),
+        "error must name the offending input: {err}"
+    );
+
+    let err = build("  center     = [70.0]\n").expect_err("short center must be rejected");
+    assert!(
+        err.contains("center") && err.contains("2"),
+        "error must report the expected length: {err}"
+    );
+
+    // The identity is always acceptable and matches an undeclared block.
+    build("  center     = [0.0, 0.0]\n  scale      = [1.0, 1.0]\n")
+        .expect("identity normalisation parses");
+}
+
+// ---------------------------------------------------------------------------
+// [covariate_nn] `init`
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "nn")]
+fn covariate_nn_init_model_src(init_line: &str) -> String {
+    format!(
+        r#"
+[parameters]
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma ADD ~ 0.1
+
+[covariate_nn TYPICAL_PK]
+  inputs = [WT, CRCL]
+  outputs = [CL, V]
+  layers = [4]
+  activation = tanh
+  output = softplus
+{init_line}
+[individual_parameters]
+  CL = TYPICAL_PK.CL * exp(ETA_CL)
+  V  = TYPICAL_PK.V  * exp(ETA_V)
+  KA = 1.0
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ additive(ADD)
+"#
+    )
+}
+
+/// The behaviour `init` exists for: at the model's default parameters the
+/// network emits exactly the declared values, for every subject's covariates.
+///
+/// Checked at two very different covariate vectors, because the whole point of
+/// zeroing the output-layer weight block is that the starting value does not
+/// depend on the inputs. Setting the bias alone would leave a covariate-dependent
+/// `W_L · a_{L-1}` on top, of the same order as the value being set.
+#[cfg(feature = "nn")]
+#[test]
+fn covariate_nn_init_sets_the_starting_outputs_exactly() {
+    use crate::nn::CovariateMapper;
+
+    let model = parse_model_string(&covariate_nn_init_model_src("  init = [1.25, 18.0]\n"))
+        .expect("model with init parses");
+    let theta = model.default_params.theta.clone();
+    let nn = &model.covariate_nns[0];
+    let w = &theta[nn.weights_offset..nn.weights_offset + nn.mapper.n_weights()];
+
+    for (wt, crcl) in [(70.0, 95.0), (45.0, 150.0)] {
+        let cov = HashMap::from([("WT".to_string(), wt), ("CRCL".to_string(), crcl)]);
+        let out = nn.mapper.forward_raw(w, &cov).expect("forward");
+        assert!(
+            (out[0] - 1.25).abs() < 1e-12,
+            "CL init at WT={wt}: got {}, want 1.25",
+            out[0]
+        );
+        assert!(
+            (out[1] - 18.0).abs() < 1e-12,
+            "V init at WT={wt}: got {}, want 18.0",
+            out[1]
+        );
+    }
+}
+
+/// Without `init` the head starts at `softplus(0) = 0.693` for *every* output —
+/// the behaviour that made a DCM's initial volume 0.69 L. Pinned so the
+/// difference `init` makes is visible in the test suite rather than only in a
+/// changelog entry.
+#[cfg(feature = "nn")]
+#[test]
+fn covariate_nn_without_init_starts_every_output_at_softplus_zero() {
+    use crate::nn::CovariateMapper;
+
+    let model = parse_model_string(&covariate_nn_init_model_src("")).expect("model parses");
+    let theta = model.default_params.theta.clone();
+    let nn = &model.covariate_nns[0];
+    let w = &theta[nn.weights_offset..nn.weights_offset + nn.mapper.n_weights()];
+    let cov = HashMap::from([("WT".to_string(), 70.0), ("CRCL".to_string(), 95.0)]);
+    let out = nn.mapper.forward_raw(w, &cov).expect("forward");
+    // Biases are 0 and W_L is Glorot (not zeroed), so the output is near but not
+    // exactly softplus(0); the point is the *scale* — every output lands around
+    // 0.7 no matter what the parameter means.
+    for &v in &out {
+        assert!(
+            (0.2..2.0).contains(&v),
+            "expected an un-initialised head near softplus(0)=0.693, got {v}"
+        );
+    }
+}
+
+/// `init` must not silently accept a value the head cannot emit — a negative
+/// target under `softplus` would otherwise become a NaN bias and poison every
+/// downstream evaluation.
+#[cfg(feature = "nn")]
+#[test]
+fn covariate_nn_init_rejects_values_outside_the_activation_range() {
+    let err = parse_model_string(&covariate_nn_init_model_src("  init = [1.0, -5.0]\n"))
+        .expect_err("a negative softplus target must be rejected");
+    assert!(
+        err.contains("init") && err.contains("softplus"),
+        "error should name the key and the activation: {err}"
+    );
+}
+
+#[cfg(feature = "nn")]
+#[test]
+fn covariate_nn_init_requires_one_entry_per_output() {
+    let err = parse_model_string(&covariate_nn_init_model_src("  init = [1.0]\n"))
+        .expect_err("a short init list must be rejected");
+    assert!(
+        err.contains("one entry per output"),
+        "error should explain the arity: {err}"
+    );
+}
+
+/// `ModelNnGuard::enter_for` must return `None` for a model with no
+/// `[covariate_nn]` blocks — the ambient-outputs slot is left untouched, so the
+/// generic evaluator's `Op::PushNnOutput` arm stays unreachable rather than
+/// reading an empty block.
+///
+/// Deliberately **not** `#[cfg(feature = "nn")]`. There are two `enter_for`
+/// bodies — the real one and a `#[cfg(not(feature = "nn"))]` stub that returns
+/// `None` unconditionally — and only one of them is compiled in any given build.
+/// An ungated test exercises whichever one this build has, so the contract
+/// "a model with no networks declines the guard" is pinned in the base `ci` build
+/// and the `nn` build alike. Gating it would leave the stub untested and let a
+/// future edit give the two bodies different answers.
+#[test]
+fn model_nn_guard_declines_a_model_with_no_networks() {
+    use crate::parser::model_parser::ModelNnGuard;
+    use std::collections::HashMap;
+
+    let src = r#"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma ADD ~ 0.1
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ additive(ADD)
+"#;
+    let model = parse_model_string(src).expect("plain model parses");
+    // `covariate_nns` is itself an `nn`-gated field, so the premise can only be
+    // stated in the `nn` build. In the base build there is no such field and the
+    // premise holds by construction.
+    #[cfg(feature = "nn")]
+    assert!(
+        model.covariate_nns.is_empty(),
+        "the premise is a model with no networks"
+    );
+
+    let cov = HashMap::from([("WT".to_string(), 72.0)]);
+    let guard = ModelNnGuard::enter_for(&model, &model.default_params.theta, &cov);
+    assert!(
+        guard.is_none(),
+        "a model with no [covariate_nn] blocks must not install a guard"
+    );
+}
+
 // ── #811: compartment-free (`$PRED`-equivalent) structural model ─────────────
 
 /// A compartment-free model: `[structural_model]` holds the equation itself, with

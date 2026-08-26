@@ -1199,6 +1199,58 @@ fn collect_assigned_names_in_if(stmt: &Statement) -> std::collections::HashSet<S
     names
 }
 
+thread_local! {
+    /// θ indices referenced by name anywhere in the model being parsed.
+    ///
+    /// Populated by [`record_theta_reference`] at the single point in
+    /// `parse_atom` where an identifier resolves to a θ, so it covers every
+    /// block that parses expressions rather than only the ones a dedicated
+    /// walker remembers to visit.
+    static REFERENCED_THETAS: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// RAII guard for [`REFERENCED_THETAS`], restoring the previous list on drop so
+/// a nested parse (the absorption ODE-equivalent source is compiled inside the
+/// primary parse) cannot leak its references into the enclosing model.
+pub(crate) struct ThetaRefScope(Vec<usize>);
+
+impl ThetaRefScope {
+    fn enter() -> Self {
+        ThetaRefScope(REFERENCED_THETAS.with(|c| c.replace(Vec::new())))
+    }
+
+    /// θ indices referenced so far in this scope.
+    fn recorded() -> Vec<usize> {
+        REFERENCED_THETAS.with(|c| c.borrow().clone())
+    }
+}
+
+impl Drop for ThetaRefScope {
+    fn drop(&mut self) {
+        REFERENCED_THETAS.with(|c| *c.borrow_mut() = std::mem::take(&mut self.0));
+    }
+}
+
+fn record_theta_reference(idx: usize) {
+    REFERENCED_THETAS.with(|c| {
+        let mut v = c.borrow_mut();
+        if !v.contains(&idx) {
+            v.push(idx);
+        }
+    });
+}
+
+/// Warning token marking a model that reads a generated `[covariate_nn]` weight
+/// θ (`W_…` / `B_…`) directly from an expression.
+///
+/// Load-bearing, in the same way `W_ABSORPTION_TWIN_DECLINED` is: it lives in
+/// `CompiledModel::parse_warnings` rather than in a field of its own, because
+/// `CompiledModel` is not `#[non_exhaustive]` and a new public field would be a
+/// breaking change. `estimation::nn_theta_gradient::NnGradPlan::build` reads it
+/// back and declines.
+pub const NN_WEIGHT_DIRECT_REFERENCE_MARKER: &str = "W_NN_WEIGHT_DIRECT_REFERENCE";
+
 /// Parse a model file (.ferx) and return a CompiledModel.
 pub fn parse_model_file(path: &Path) -> Result<CompiledModel, String> {
     let content =
@@ -1425,6 +1477,10 @@ pub fn parse_full_model_bound(
     }
     let indiv_lines: &[String] = indiv_lines_opt.map(Vec::as_slice).unwrap_or(&[]);
 
+    // Track which θ the model's expressions actually read, for the
+    // `[covariate_nn]` direct-reference check further down. Installed before any
+    // block parses so nothing is missed, and restored on drop.
+    let _theta_ref_scope = ThetaRefScope::enter();
     // theta_names is extended below after NN-weight and diffusion thetas are appended
     let mut theta_names: Vec<String> = thetas.iter().map(|t| t.name.clone()).collect();
     #[cfg(feature = "nn")]
@@ -2017,9 +2073,13 @@ pub fn parse_full_model_bound(
     };
 
     // Build pk_param_fn with the extended eta context (BSV + kappa names).
-    // `n_theta_base` is the user-declared θ count — indiv params can only
-    // reference these (NN-weight and diffusion θ are appended later and
-    // aren't visible to user expressions). `n_eta_extended` matches the
+    // `n_theta_base` is the user-declared θ count, which is what the partial
+    // builder differentiates against. NOTE it is *not* the set of θ a user
+    // expression can name: `theta_names` is extended with the generated
+    // `[covariate_nn]` weight names before `[individual_parameters]` parses, so
+    // `CL = TYPICAL_PK.CL * exp(ETA_CL) + B_TYPICAL_PK_2_1` resolves. That is
+    // what `NN_WEIGHT_DIRECT_REFERENCE_MARKER` exists to catch — see the check
+    // near the end of this function. `n_eta_extended` matches the
     // `eta` slice the closure consumes (BSV η + kappa). Both feed the
     // Tier 4a milestone-2 partial-derivative builder.
     let n_eta_extended_for_partials = eta_names.len();
@@ -2842,6 +2902,57 @@ pub fn parse_full_model_bound(
         }
     }
 
+    // #1016: a `[covariate_nn]` weight θ read *directly* by a model expression.
+    //
+    // `theta_names` is extended with the generated `W_…` / `B_…` names before
+    // `[individual_parameters]` parses, so
+    //
+    //     CL = TYPICAL_PK.CL * exp(ETA_CL) + B_TYPICAL_PK_2_1
+    //
+    // is accepted. `estimation::nn_theta_gradient` assembles a whole weight
+    // block's θ-gradient from `n_outputs` finite differences of the output
+    // biases times the pre-activation Jacobian, which is exact *only* under the
+    // invariant that the weights reach the likelihood through the network output
+    // and nothing else. A direct reference breaks it: for a bias the extra term
+    // is folded into `dNLL/dz` and then smeared across the whole block by `jz`;
+    // for a non-bias weight it is dropped entirely, since only biases are
+    // perturbed. Either way SAEM/IMP/VI silently receive a wrong fixed-η θ
+    // gradient.
+    //
+    // Recorded rather than rejected, so the model still fits — it just takes the
+    // per-θ FD path, per the CLAUDE.md rule that a scope gap must route to FD
+    // through a support predicate instead of returning a wrong gradient.
+    #[cfg(feature = "nn")]
+    {
+        let referenced = ThetaRefScope::recorded();
+        let mut offending: Vec<String> = Vec::new();
+        for nn in &model.covariate_nns {
+            let n_w = nn.mapper.mlp().n_weights();
+            let range = nn.weights_offset..nn.weights_offset + n_w;
+            for &idx in &referenced {
+                if range.contains(&idx) {
+                    if let Some(name) = model.theta_names.get(idx) {
+                        offending.push(name.clone());
+                    }
+                }
+            }
+        }
+        if !offending.is_empty() {
+            offending.sort();
+            offending.dedup();
+            model.parse_warnings.push(format!(
+                "{NN_WEIGHT_DIRECT_REFERENCE_MARKER}: the model reads generated \
+                 [covariate_nn] weight parameter(s) {} directly. The analytic \
+                 NN theta-gradient shortcut assumes those weights reach the likelihood only \
+                 through the network output, so it is disabled for this model and every \
+                 theta falls back to finite differences (slower, still correct). Reference \
+                 the network's declared outputs (e.g. `TYPICAL_PK.CL`) instead if you did \
+                 not mean to read a weight.",
+                offending.join(", ")
+            ));
+        }
+    }
+
     // #993, the `[adaptive_dosing]` half. `observe` is compiled through the very
     // same `build_y_output_fn` as a Form-C `y` readout (`compile_observe`), so it
     // sees individual parameters — and it is the *controller's* signal, not a
@@ -3267,6 +3378,28 @@ pub fn parse_full_model_bound(
     // are required data columns, so register them like scaling covariates.
     if !selector_covariates.is_empty() {
         register_referenced_covariates(&mut model.referenced_covariates, selector_covariates);
+    }
+
+    // `[covariate_nn]` inputs are ordinary covariate reads — the mapper looks each name
+    // up in the same per-event `HashMap` every other covariate consumer uses — but they
+    // are named in the block rather than in an expression, so none of the statement
+    // walkers above ever sees them.
+    //
+    // Registering them here is what makes them *time-varying*. Without it the model does
+    // not count them as referenced, `Population::prune_irrelevant_tv_covariates` (called
+    // from `api::fit`) drops their trajectories as irrelevant, the subject stops
+    // reporting `has_tv_covariates()`, and the NN silently reads each subject's baseline
+    // value for the entire record — a covariate that changes over time is simply not
+    // seen, with no error and no warning. Same reasoning as the scaling / error-selector
+    // / initial-condition covariates above.
+    #[cfg(feature = "nn")]
+    {
+        let nn_inputs: Vec<String> = model
+            .covariate_nns
+            .iter()
+            .flat_map(|nn| nn.mapper.input_names().to_vec())
+            .collect();
+        register_referenced_covariates(&mut model.referenced_covariates, nn_inputs);
     }
 
     // ── [initial_conditions] block (issue #521) ──
@@ -9465,7 +9598,16 @@ fn parse_covariate_nn_block(name: &str, lines: &[String]) -> Result<CovariateNnS
     };
 
     // Reject any unknown keys so typos don't silently pass.
-    const KNOWN: &[&str] = &["inputs", "outputs", "layers", "activation", "output"];
+    const KNOWN: &[&str] = &[
+        "inputs",
+        "outputs",
+        "layers",
+        "activation",
+        "output",
+        "center",
+        "scale",
+        "init",
+    ];
     for k in fields.keys() {
         if !KNOWN.contains(&k.as_str()) {
             return Err(format!(
@@ -9477,6 +9619,7 @@ fn parse_covariate_nn_block(name: &str, lines: &[String]) -> Result<CovariateNnS
         }
     }
 
+    let n_inputs = inputs.len();
     let mut layer_sizes = Vec::with_capacity(hidden.len() + 2);
     layer_sizes.push(inputs.len());
     layer_sizes.extend(hidden.iter().copied());
@@ -9484,7 +9627,23 @@ fn parse_covariate_nn_block(name: &str, lines: &[String]) -> Result<CovariateNnS
 
     let mlp = MlpMapper::new(layer_sizes.clone(), hidden_activation, output_activation)
         .map_err(|e| format!("[covariate_nn {}] {}", name, e))?;
+    // Optional per-input normalisation: the network sees `(x - center) / scale`.
+    // Absent keys default to the identity, so an existing model is unchanged. Declared
+    // rather than estimated from the data — see `NamedMlpMapper::input_scale` for why.
+    let take_float_list = |field: &str, default: f64| -> Result<Vec<f64>, String> {
+        let Some(raw) = fields.get(field) else {
+            return Ok(vec![default; n_inputs]);
+        };
+        let parsed = parse_float_array(raw)
+            .map_err(|e| format!("[covariate_nn {}] `{}`: {}", name, field, e))?;
+        Ok(parsed)
+    };
+    let center = take_float_list("center", 0.0)?;
+    let scale = take_float_list("scale", 1.0)?;
+
     let mapper = NamedMlpMapper::new(mlp, inputs, outputs)
+        .map_err(|e| format!("[covariate_nn {}] {}", name, e))?
+        .with_normalization(center, scale)
         .map_err(|e| format!("[covariate_nn {}] {}", name, e))?;
 
     // Auto-generate weight-theta names + Glorot-style deterministic inits.
@@ -9531,6 +9690,59 @@ fn parse_covariate_nn_block(name: &str, lines: &[String]) -> Result<CovariateNnS
         }
     }
     debug_assert_eq!(theta_names.len(), mapper.n_weights());
+
+    // Optional `init = [v_1, …, v_K]`: one starting value per output, on the scale the
+    // network *emits* (a clearance in L/h, a volume in L) rather than on the weight
+    // scale.
+    //
+    // # Why this exists
+    //
+    // Without it every output-layer bias starts at 0, so a `softplus` head starts every
+    // PK parameter at `softplus(0) = 0.693` — whatever the parameter means. On a
+    // 60-subject busulfan-shaped DCM that put the initial volume at 0.69 L against a true
+    // 10 L, the objective started around 1e12, and variational inference descended into a
+    // basin 889 OFV worse than FOCEI's optimum *and reported convergence there*. Declaring
+    // `init = [1.0, 10.0]` moved the same cold-start fit to within 7 OFV of FOCEI. The
+    // network was never the problem; where it started was.
+    //
+    // The realisation is exact, not approximate: the output-layer weight block is zeroed
+    // alongside the bias, so `z_k = b_k` for every subject regardless of covariates and
+    // the initial output is exactly `v_k`. Setting the bias alone would leave
+    // `W_L · a_{L-1}` riding on top — a covariate-dependent offset of the same order as
+    // the value being set, which is most of the problem still unsolved. The zeroed block
+    // is not frozen: it receives gradient immediately (`∂z_k/∂W_L[k,j] = a_{L-1}[j]`, which
+    // is nonzero), and the hidden layers start receiving gradient one step later, once
+    // `W_L` has moved off zero.
+    if let Some(raw) = fields.get("init") {
+        let values =
+            parse_float_array(raw).map_err(|e| format!("[covariate_nn {}] `init`: {}", name, e))?;
+        let n_out = mapper.mlp().n_outputs();
+        if values.len() != n_out {
+            return Err(format!(
+                "[covariate_nn {}] `init` must have one entry per output: expected {}, got {}",
+                name,
+                n_out,
+                values.len()
+            ));
+        }
+        for i in mapper.mlp().output_weight_range() {
+            theta_inits[i] = 0.0;
+        }
+        for (k, &v) in values.iter().enumerate() {
+            let z = output_activation.invert(v).ok_or_else(|| {
+                format!(
+                    "[covariate_nn {}] `init` entry {} is {}, which the `{}` output \
+                     activation cannot produce — it needs {}",
+                    name,
+                    k + 1,
+                    v,
+                    output_activation.as_str(),
+                    output_activation.range_description()
+                )
+            })?;
+            theta_inits[mapper.mlp().output_bias_index(k)] = z;
+        }
+    }
 
     Ok(CovariateNnSpec {
         name: name.to_string(),
@@ -15462,6 +15674,112 @@ pub(crate) fn with_model_time<T>(time: f64, f: impl FnOnce() -> T) -> T {
     f()
 }
 
+thread_local! {
+    /// Ambient `[covariate_nn]` forward outputs for the generic (`PkNum`) statement
+    /// evaluator. See [`ModelNnGuard`].
+    static MODEL_NN_OUTPUTS: std::cell::RefCell<Vec<Vec<f64>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// RAII guard supplying `[covariate_nn]` outputs to
+/// [`eval_statements_g`] for the duration of a scope, mirroring
+/// [`ModelTimeGuard`] for the `TIME` built-in.
+///
+/// # Why a thread-local rather than a parameter
+///
+/// `Op::PushNnOutput` needs the network's forward output, which the `f64`
+/// `pk_param_fn` closure already computes once per call from its captured NN
+/// handles. The generic evaluator has no such closure — it is handed a compiled
+/// [`IndivParamProgram`], which carries statements and layout but no network — so
+/// before this guard existed it evaluated `PushNnOutput` against a hardcoded empty
+/// slice and pushed **0.0**. An NN output silently read as zero is precisely the
+/// class of defect CLAUDE.md's routing rule exists to prevent, and it was reachable
+/// the moment any gate stopped excluding `[covariate_nn]` models from a
+/// program-driven analytic path.
+///
+/// Threading a parameter instead would touch eight recursive call sites in the hot
+/// inner-loop evaluator. `TIME` faced the same choice and resolved it the same way,
+/// so this follows the established seam rather than inventing a second convention.
+///
+/// # What it is *not* for
+///
+/// The outputs are lifted as **constants** on every dual axis. That is exact for
+/// `∂/∂η`: a network reads covariates and weights, never `η`. It is *not* a way to
+/// get `∂/∂θ` for NN weights — those derivatives are zero under this guard, which
+/// is why only η-gradient paths may use it. `∂NLL/∂w` comes from
+/// [`crate::estimation::nn_theta_gradient`] instead.
+pub(crate) struct ModelNnGuard(Vec<Vec<f64>>);
+
+impl ModelNnGuard {
+    /// Install `outputs` for the current thread, restoring the previous value on drop.
+    #[cfg(feature = "nn")]
+    pub(crate) fn enter(outputs: Vec<Vec<f64>>) -> Self {
+        let prev = MODEL_NN_OUTPUTS.with(|cell| cell.replace(outputs));
+        ModelNnGuard(prev)
+    }
+
+    /// Compute and install every `[covariate_nn]` block's forward output at this
+    /// `(theta, covariates)` point, or `None` when the model has no network (in which
+    /// case the evaluator's empty default is already correct and no guard is needed).
+    ///
+    /// Uses `forward_raw`, the same entry point `pk_param_fn` calls, so the value the
+    /// gradient path differentiates around is the value the prediction path produced.
+    ///
+    /// A `forward_raw` failure `panic!`s, exactly as `pk_param_fn` does on the same call.
+    /// It zero-fills an absent covariate, so the only ways it can fail are a mis-sized
+    /// weight slice or an input/layer count mismatch — wiring bugs, not runtime conditions.
+    /// Defaulting the block to `vec![]` instead would make `Op::PushNnOutput` read every
+    /// output as `0.0` in a release build, which is the silent-zero defect this guard
+    /// exists to prevent.
+    #[cfg(feature = "nn")]
+    pub(crate) fn enter_for(
+        model: &crate::types::CompiledModel,
+        theta: &[f64],
+        covariates: &HashMap<String, f64>,
+    ) -> Option<Self> {
+        if model.covariate_nns.is_empty() {
+            return None;
+        }
+        let outputs: Vec<Vec<f64>> = model
+            .covariate_nns
+            .iter()
+            .map(|nn| {
+                let n_w = nn.mapper.mlp().n_weights();
+                let w = &theta[nn.weights_offset..nn.weights_offset + n_w];
+                nn.mapper.forward_raw(w, covariates).expect(
+                    "NN forward_raw failed in ModelNnGuard::enter_for: this indicates a \
+                     wiring bug (wrong weight slice or input/layer count), not a \
+                     recoverable condition",
+                )
+            })
+            .collect();
+        Some(Self::enter(outputs))
+    }
+
+    #[cfg(not(feature = "nn"))]
+    pub(crate) fn enter_for(
+        _model: &crate::types::CompiledModel,
+        _theta: &[f64],
+        _covariates: &HashMap<String, f64>,
+    ) -> Option<Self> {
+        None
+    }
+}
+
+impl Drop for ModelNnGuard {
+    fn drop(&mut self) {
+        MODEL_NN_OUTPUTS.with(|cell| {
+            *cell.borrow_mut() = std::mem::take(&mut self.0);
+        });
+    }
+}
+
+/// Run `f` with the ambient NN outputs borrowed. Empty unless a [`ModelNnGuard`] is
+/// live on this thread.
+fn with_nn_outputs<R>(f: impl FnOnce(&[Vec<f64>]) -> R) -> R {
+    MODEL_NN_OUTPUTS.with(|cell| f(&cell.borrow()))
+}
+
 /// The model-time thread-local `Expression::Time` / `Op::PushTime` resolves
 /// against. `pub(crate)` so a hand-built `OdeReadout::Single` test closure can
 /// observe the same value a compiled readout would (the readout closure signature
@@ -18279,7 +18597,37 @@ fn eval_statements_g<T: crate::sens::num::PkNum>(
     // evaluated and branches still descended, so control flow is identical.
     skip: &[bool],
 ) {
-    let empty_nn: Vec<Vec<f64>> = Vec::new();
+    // `[covariate_nn]` outputs come from the ambient `ModelNnGuard`, not from a
+    // parameter — see that type for why, and for the invariant that they are lifted as
+    // constants (exact for `∂/∂η`, deliberately *not* a route to `∂/∂θ` for NN weights).
+    // Empty when no guard is live, which is correct for every model without a network.
+    //
+    // Resolved **once** here and threaded down the `If` recursion by reference. This walk is
+    // the FOCE inner loop's hot evaluator; re-reading the thread-local — and deep-cloning it
+    // into a fresh `Vec<Vec<f64>>` — once per statement list, i.e. once more per nested branch
+    // body, is pure per-frame overhead. The borrow is held for the whole walk, so no
+    // `ModelNnGuard` may be entered or dropped beneath it; none is (guards are installed by
+    // the sensitivity provider, outside this call).
+    with_nn_outputs(|nn| {
+        eval_statements_g_inner::<T>(stmts, theta, eta, cov, vars, du, bc_stack, skip, nn)
+    })
+}
+
+/// The recursive body of [`eval_statements_g`], with the ambient `[covariate_nn]` outputs
+/// already resolved and borrowed by the caller.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+fn eval_statements_g_inner<T: crate::sens::num::PkNum>(
+    stmts: &[Statement],
+    theta: &[T],
+    eta: &[T],
+    cov: &[f64],
+    vars: &mut [T],
+    du: Option<&mut [T]>,
+    bc_stack: &mut Vec<T>,
+    skip: &[bool],
+    empty_nn: &[Vec<f64>],
+) {
     let mut du_opt = du;
     for s in stmts {
         match s {
@@ -18287,13 +18635,13 @@ fn eval_statements_g<T: crate::sens::num::PkNum>(
                 if skip.get(*idx).copied().unwrap_or(false) {
                     continue;
                 }
-                let v = eval_bytecode_g::<T>(bc, theta, eta, cov, vars, &empty_nn, bc_stack);
+                let v = eval_bytecode_g::<T>(bc, theta, eta, cov, vars, empty_nn, bc_stack);
                 if let Some(slot) = vars.get_mut(*idx) {
                     *slot = v;
                 }
             }
             Statement::DiffEqBc(state_idx, bc) => {
-                let v = eval_bytecode_g::<T>(bc, theta, eta, cov, vars, &empty_nn, bc_stack);
+                let v = eval_bytecode_g::<T>(bc, theta, eta, cov, vars, empty_nn, bc_stack);
                 if let Some(buf) = du_opt.as_deref_mut() {
                     if let Some(slot) = buf.get_mut(*state_idx) {
                         *slot = v;
@@ -18310,9 +18658,9 @@ fn eval_statements_g<T: crate::sens::num::PkNum>(
                 let vars_val: Vec<f64> = vars.iter().map(|v| v.val()).collect();
                 let mut taken = false;
                 for (cond, body) in branches {
-                    if eval_condition_indexed(cond, &theta_val, &eta_val, cov, &vars_val, &empty_nn)
+                    if eval_condition_indexed(cond, &theta_val, &eta_val, cov, &vars_val, empty_nn)
                     {
-                        eval_statements_g::<T>(
+                        eval_statements_g_inner::<T>(
                             body,
                             theta,
                             eta,
@@ -18321,6 +18669,7 @@ fn eval_statements_g<T: crate::sens::num::PkNum>(
                             du_opt.as_deref_mut(),
                             bc_stack,
                             skip,
+                            empty_nn,
                         );
                         taken = true;
                         break;
@@ -18328,7 +18677,7 @@ fn eval_statements_g<T: crate::sens::num::PkNum>(
                 }
                 if !taken {
                     if let Some(eb) = else_body {
-                        eval_statements_g::<T>(
+                        eval_statements_g_inner::<T>(
                             eb,
                             theta,
                             eta,
@@ -18337,6 +18686,7 @@ fn eval_statements_g<T: crate::sens::num::PkNum>(
                             du_opt.as_deref_mut(),
                             bc_stack,
                             skip,
+                            empty_nn,
                         );
                     }
                 }
@@ -20968,6 +21318,11 @@ fn parse_atom(
 
             // Check if it's a theta
             if let Some(idx) = ctx.theta_names.iter().position(|n| n == name) {
+                // Recorded here — the one place a name becomes a θ index — so
+                // the `[covariate_nn]` direct-reference check below sees a
+                // reference from *any* block, not just the one someone
+                // remembered to walk.
+                record_theta_reference(idx);
                 return Ok((Expression::Theta(idx), pos + 1));
             }
 

@@ -52,14 +52,37 @@ jobs:
       - name: cargo check (markov-gated module + tests)
         run: cargo check --tests --no-default-features --features ci,markov
 
-  # Non-Gaussian endpoint families (TTE/survival + categorical + CTMM), which the
-  # default `ci` build compiles out. This ONE job replaces the former separate
-  # `Survival (TTE)` and `Markov (CTMM)` jobs: `markov = ["survival"]` in
-  # Cargo.toml, so a `--features ci,markov` build is a strict superset of a
-  # `--features ci,survival` one — the old survival job compiled and ran nothing
-  # the markov job did not, and its lcov was a subset. Both Codecov flags are
-  # therefore uploaded from this single report (codecov.yml still names `survival`
-  # and `markov` separately in its patch/project statuses).
+      # Same rationale for `nn`, with `slow-tests` folded in for the same reason as
+      # the survival step above: `tests/nn_fit_smoke.rs` and
+      # `tests/nn_fit_convergence.rs` are gated on BOTH `nn` and `slow-tests`, so
+      # their bodies compile in no other per-PR job. One cheap `cargo check`
+      # compile-gates the whole `nn` surface — `src/nn`, the `[covariate_nn]`
+      # parser, the θ-gradient module, and every nn-gated test file — so a broken
+      # signature surfaces here in ~1 min rather than in the instrumented
+      # coverage job (or, worse, only in the nightly slow-tests run).
+      - name: cargo check (nn-gated module + tests)
+        run: cargo check --tests --no-default-features --features ci,nn,slow-tests
+
+  # Every default-off feature surface the `ci` build compiles out: the non-Gaussian
+  # endpoint families (TTE/survival + categorical + CTMM) and the covariate-NN /
+  # DCM stack (`nn`). This ONE job replaces the former separate `Survival (TTE)`
+  # and `Markov (CTMM)` jobs: `markov = ["survival"]` in Cargo.toml, so a
+  # `--features ci,markov` build is a strict superset of a `--features ci,survival`
+  # one — the old survival job compiled and ran nothing the markov job did not, and
+  # its lcov was a subset. All three Codecov flags are uploaded from this single
+  # report (codecov.yml still names `survival`, `markov` and `nn` separately in its
+  # patch/project statuses).
+  #
+  # `nn` rides along here rather than in a job of its own for a reason that is not
+  # just CI minutes: `tests/tte_smoke.rs` holds an nn-gated test
+  # (`event_model_referencing_nn_driven_indiv_param_is_rejected`, #442) inside a
+  # `#![cfg(feature = "survival")]` file, so it compiles only when `survival` AND
+  # `nn` are both on. A standalone `--features ci,nn` job could never measure it,
+  # and the set-equality guard below would have to grow an exemption rule to stay
+  # satisfiable. One combined feature set keeps that guard a plain set equality.
+  #
+  # NOTE: the job's display `name` is deliberately unchanged despite the widened
+  # scope — it is the string branch protection matches on.
   endpoints:
     name: Tests + coverage (TTE/CTMM endpoints)
     runs-on: ubuntu-latest
@@ -87,12 +110,13 @@ jobs:
           tool: cargo-llvm-cov
 
       # All TTE/categorical/CTMM code is behind `#[cfg(feature = "survival")]` or
-      # `#[cfg(feature = "markov")]`, so neither the default `ci` jobs nor the
-      # `fast`/`slow` coverage jobs compile it — Codecov would report those lines
-      # as missed even though they are exercised, and a survival- or markov-only
-      # PR would fail its own patch gate at 0% (#293). This job MEASURES that
-      # surface and uploads it under both flags, which Codecov merges with
-      # `fast`/`slow` by summing hits.
+      # `#[cfg(feature = "markov")]`, and all covariate-NN / DCM code behind
+      # `#[cfg(feature = "nn")]`, so neither the default `ci` jobs nor the
+      # `fast`/`slow` coverage jobs compile any of it — Codecov would report those
+      # lines as missed even though they are exercised, and a survival-, markov- or
+      # nn-only PR would fail its own patch gate at 0% (#293). This job MEASURES
+      # that surface and uploads it under all three flags, which Codecov merges
+      # with `fast`/`slow` by summing hits.
       #
       # Explicit `--test` list instead of `--tests`: the base suite's 122
       # integration binaries are already run — and already measured — by
@@ -100,20 +124,23 @@ jobs:
       # set bought no coverage (Codecov merges flags by summing hits) and cost
       # ~15 min of instrumented compile.
       #
-      # The list is EXACTLY the set of `tests/*.rs` that mention a `survival` or
-      # `markov` cfg, and `tests/ci_workflow_endpoint_coverage.rs` asserts that
-      # equality — so adding a test file that uses either feature without adding
-      # it here fails CI instead of silently reading as uncovered. The two
-      # Tier-3 files (`tte_convergence`, `categorical_convergence`) are in the
-      # list on purpose: without `slow-tests` their tests stay `#[ignore]`d, so
-      # they cost one cheap compile each and keep the invariant a plain set
-      # equality with no exemption rule to get wrong.
+      # The list is EXACTLY the set of `tests/*.rs` that mention a `survival`,
+      # `markov` or `nn` cfg, and `tests/ci_workflow_endpoint_coverage.rs` asserts
+      # that equality — so adding a test file that uses any of those features
+      # without adding it here fails CI instead of silently reading as uncovered.
+      # The Tier-3 files (`tte_convergence`, `categorical_convergence`,
+      # `nn_fit_smoke`, `nn_fit_convergence`) are in the list on purpose: without
+      # `slow-tests` their tests stay `#[ignore]`d, so they cost one cheap compile
+      # each and keep the invariant a plain set equality with no exemption rule to
+      # get wrong.
       #
-      # `--lib` stays because the unit tests for `src/survival`, `src/markov` and
-      # the feature-gated branches of the shared modules live there.
+      # `--lib` stays because the unit tests for `src/survival`, `src/markov`,
+      # `src/nn`, `src/estimation/nn_theta_gradient` and the feature-gated branches
+      # of the shared modules (parser, sens provider, io/output) live there — for
+      # `nn` that is the bulk of the surface.
       - name: Generate TTE/CTMM endpoint coverage report
         run: |
-          cargo llvm-cov --no-fail-fast --no-default-features --features ci,markov --profile ci-fast \
+          cargo llvm-cov --no-fail-fast --no-default-features --features ci,markov,nn --profile ci-fast \
             --lib \
             --test agq \
             --test categorical_convergence \
@@ -121,16 +148,19 @@ jobs:
             --test dose_compartment_routing \
             --test markov_nonmem \
             --test markov_smoke \
+            --test nn_dcm_smoke \
+            --test nn_fit_convergence \
+            --test nn_fit_smoke \
             --test tte_convergence \
             --test tte_smoke \
             --test zero_omega_fit \
             --lcov --output-path lcov.info
 
-      - name: Upload to Codecov (survival + markov flags)
+      - name: Upload to Codecov (survival + markov + nn flags)
         uses: codecov/codecov-action@v7
         with:
           files: lcov.info
-          flags: survival,markov
+          flags: survival,markov,nn
           fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}
 
@@ -146,10 +176,11 @@ jobs:
         with:
           shared-key: ci
       - name: cargo clippy
-        # Include `markov` so the CTMM module is linted too (it is compiled out
-        # of the base `ci` build). `markov = ["survival"]`, so this lints the
-        # whole non-Gaussian endpoint surface.
-        run: cargo clippy --no-default-features --features ci,markov
+        # Include `markov` and `nn` so the CTMM module and the covariate-NN / DCM
+        # stack are linted too (both are compiled out of the base `ci` build).
+        # `markov = ["survival"]`, so this lints the whole non-Gaussian endpoint
+        # surface as well.
+        run: cargo clippy --no-default-features --features ci,markov,nn
 
   fmt:
     name: Format

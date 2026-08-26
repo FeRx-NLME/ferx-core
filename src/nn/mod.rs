@@ -49,6 +49,16 @@ pub enum NnError {
     UnknownPkOutput(String),
     #[error("duplicate output name '{0}'")]
     DuplicateOutput(String),
+    #[error("`{field}` must have one entry per input: expected {expected}, got {actual}")]
+    NormalizationLengthMismatch {
+        field: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+    #[error("`scale` for input '{input}' must be finite and non-zero; got {value}")]
+    InvalidScale { input: String, value: f64 },
+    #[error("`center` for input '{input}' must be finite; got {value}")]
+    InvalidCenter { input: String, value: f64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +126,54 @@ impl Activation {
             Activation::Tanh => x.tanh(),
             Activation::Sigmoid => sigmoid(x),
             Activation::Exp => x.exp(),
+        }
+    }
+
+    /// Solve `f(z) = y` for `z`, or `None` when `y` lies outside the
+    /// activation's range.
+    ///
+    /// Used to turn a declared output value into the output-layer bias that
+    /// produces it (`[covariate_nn] init`). The inverse is exact for every
+    /// activation here, so a declared `init` is realised exactly rather than
+    /// approached.
+    pub fn invert(self, y: f64) -> Option<f64> {
+        if !y.is_finite() {
+            return None;
+        }
+        match self {
+            Activation::Identity => Some(y),
+            // 0 has no unique preimage under ReLU (every z ≤ 0 maps to it), so only
+            // the strictly positive branch is invertible.
+            Activation::Relu => (y > 0.0).then_some(y),
+            Activation::Softplus => {
+                if y <= 0.0 {
+                    None
+                } else if y > 20.0 {
+                    // `apply` returns `x` unchanged past this threshold, so the exact
+                    // inverse of the implemented function is the identity here too.
+                    Some(y)
+                } else {
+                    // `exp_m1` keeps the small-`y` end accurate, where `exp(y) - 1`
+                    // would lose most of its significant digits to cancellation.
+                    Some(y.exp_m1().ln())
+                }
+            }
+            Activation::Tanh => (y.abs() < 1.0).then(|| y.atanh()),
+            Activation::Sigmoid => (y > 0.0 && y < 1.0).then(|| (y / (1.0 - y)).ln()),
+            Activation::Exp => (y > 0.0).then(|| y.ln()),
+        }
+    }
+
+    /// Human-readable description of the activation's range, for error messages
+    /// when [`invert`](Self::invert) declines.
+    pub fn range_description(self) -> &'static str {
+        match self {
+            Activation::Identity => "any finite value",
+            Activation::Relu => "a value > 0",
+            Activation::Softplus => "a value > 0",
+            Activation::Tanh => "a value strictly between -1 and 1",
+            Activation::Sigmoid => "a value strictly between 0 and 1",
+            Activation::Exp => "a value > 0",
         }
     }
 
@@ -255,6 +313,39 @@ impl MlpMapper {
             .expect("layers non-empty by construction")
     }
 
+    /// Index, within the flat weight vector, of the output layer's bias for
+    /// output `k`.
+    ///
+    /// This bias is special: it enters the network only through the single
+    /// pre-activation `z_k`, with `∂z_k/∂b_k = 1` and `∂z_j/∂b_k = 0` for
+    /// `j ≠ k`. That makes it the one coordinate whose finite difference
+    /// recovers `∂·/∂z_k` for free — see
+    /// [`jacobian_preactivation`](Self::jacobian_preactivation).
+    ///
+    /// Panics if `k >= n_outputs()`.
+    pub fn output_bias_index(&self, k: usize) -> usize {
+        let n_out = self.n_outputs();
+        assert!(
+            k < n_out,
+            "output index {k} out of range (n_outputs {n_out})"
+        );
+        let l = self.layers.len() - 1;
+        let n_lm1 = self.layers[l - 1];
+        self.offsets[l - 1] + n_out * n_lm1 + k
+    }
+
+    /// Index range of the output layer's **weight** block (`W_L`, excluding its
+    /// biases) within the flat weight vector.
+    ///
+    /// Zeroing this block makes the output layer's pre-activation equal its bias
+    /// for every input, which is how a declared `[covariate_nn] init` is made
+    /// exact rather than approximate — see the parser's `init` handling.
+    pub fn output_weight_range(&self) -> std::ops::Range<usize> {
+        let l = self.layers.len() - 1;
+        let start = self.offsets[l - 1];
+        start..self.output_bias_index(0)
+    }
+
     /// Forward pass.
     ///
     /// Errors:
@@ -279,6 +370,54 @@ impl MlpMapper {
     /// paper-scale networks. For larger architectures use vector-Jacobian
     /// products instead (deferred to Phase A M3).
     pub fn jacobian(&self, x: &[f64], weights: &[f64]) -> Result<DMatrix<f64>, NnError> {
+        self.jacobian_impl(x, weights, false)
+    }
+
+    /// Jacobian of the output layer's **pre-activations** `z_L` vs the flat
+    /// weight vector, shape `(n_outputs × n_weights)`. Identical to
+    /// [`jacobian`](Self::jacobian) except the backward sweep is seeded at
+    /// `z_L` rather than at `a_L = f(z_L)`, so the output activation's
+    /// derivative is not applied. When `output_activation` is
+    /// [`Activation::Identity`] the two agree exactly.
+    ///
+    /// # Why this variant exists
+    ///
+    /// It is the exact chain-rule bridge used by
+    /// [`crate::estimation::fixed_eta_gradient`] to get `∂NLL/∂w` for every NN
+    /// weight from just `n_outputs` finite-difference evaluations. Because
+    /// `z_k = (W_L a_{L-1} + b_L)_k` depends on the output-layer bias `b_k`
+    /// with `∂z_k/∂b_k = 1` exactly (and `∂z_j/∂b_k = 0` for `j ≠ k`), a
+    /// finite difference of the objective in `b_k` *is* `∂NLL/∂z_k`. Then
+    ///
+    /// ```text
+    /// ∂NLL/∂w_j = Σ_k (∂NLL/∂z_k) · (∂z_k/∂w_j)
+    /// ```
+    ///
+    /// with the second factor read straight off this matrix.
+    ///
+    /// Seeding at `z_L` instead of `a_L` is what keeps that identity
+    /// unconditional. The post-activation form would need a division by
+    /// `f'(z_k)`, which is unusable exactly where it matters — a saturated
+    /// `Softplus`/`Sigmoid` head drives `f'(z_k) → 0`, and the recovered
+    /// derivative would be `0/0` in floating point. Here the factor never
+    /// appears: it cancels analytically between the seed and the chain.
+    pub fn jacobian_preactivation(
+        &self,
+        x: &[f64],
+        weights: &[f64],
+    ) -> Result<DMatrix<f64>, NnError> {
+        self.jacobian_impl(x, weights, true)
+    }
+
+    /// Shared backprop for [`jacobian`](Self::jacobian) and
+    /// [`jacobian_preactivation`](Self::jacobian_preactivation). `preactivation`
+    /// skips the output layer's activation derivative in the seed.
+    fn jacobian_impl(
+        &self,
+        x: &[f64],
+        weights: &[f64],
+        preactivation: bool,
+    ) -> Result<DMatrix<f64>, NnError> {
         self.check_shapes(x, weights)?;
         let (pre, post) = self.forward_cache(x, weights);
 
@@ -302,13 +441,19 @@ impl MlpMapper {
                     self.hidden_activation
                 };
 
-                // dz_l = da_l ⊙ activation'(z_l).
+                // dz_l = da_l ⊙ activation'(z_l). Under `preactivation` the
+                // output layer is seeded directly at z_L, so its activation
+                // derivative is skipped — every deeper layer is unaffected.
                 let z_l = &pre[l - 1]; // pre-activation of layer l (indexed from 1)
-                let dz_l: DVector<f64> = DVector::from_iterator(
-                    self.layers[l],
-                    z_l.iter().map(|&z| activation.derivative(z)),
-                );
-                let dz_l = adjoint.component_mul(&dz_l);
+                let dz_l = if preactivation && is_output_layer {
+                    adjoint.clone()
+                } else {
+                    let d: DVector<f64> = DVector::from_iterator(
+                        self.layers[l],
+                        z_l.iter().map(|&z| activation.derivative(z)),
+                    );
+                    adjoint.component_mul(&d)
+                };
 
                 // grad_W_l[i,j] = dz_l[i] * a_{l-1}[j].
                 // We unflatten into the row-major W block within `jac` row k.
@@ -462,6 +607,30 @@ pub struct NamedMlpMapper {
     /// Indices into `PkParams::values` for each output (one per
     /// `output_names`).
     output_pk_indices: Vec<usize>,
+    /// Per-input location subtracted before the forward pass (`center` in the
+    /// `[covariate_nn]` block). All zeros unless the model declares otherwise.
+    input_center: Vec<f64>,
+    /// Per-input scale divided out after centering (`scale` in the block). All ones
+    /// unless the model declares otherwise; entries are validated non-zero and finite at
+    /// parse time.
+    ///
+    /// # Why this is declared rather than estimated from the data
+    ///
+    /// A network fed raw covariates is badly conditioned: `WT ≈ 70` and `CRCL ≈ 86`
+    /// saturate a `tanh` layer at Glorot initialisation, and the optimizer's only escape
+    /// is to drive the first-layer weights to tiny values while later layers grow to
+    /// compensate. Measured on a two-covariate DCM, unnormalised inputs pushed weights to
+    /// ~1e11 and the residual error to 15× its true value; the same model with
+    /// standardised inputs stayed inside `[-1.3, 1.6]`.
+    ///
+    /// The constants live in the model file, not in fitted state, for two reasons.
+    /// `fit()` takes `&CompiledModel`, so statistics derived from the estimation data
+    /// could not be written back for `predict()` to reuse — and recomputing them on new
+    /// data would silently change the model between fitting and prediction, the classic
+    /// train/serve skew. Declaring them also matches how population PK already writes
+    /// normalisation down (`(WT/70)^0.75` names its reference weight), and keeps the
+    /// model file a complete description of the transform.
+    input_scale: Vec<f64>,
 }
 
 impl NamedMlpMapper {
@@ -500,12 +669,77 @@ impl NamedMlpMapper {
             output_pk_indices.push(idx);
         }
 
+        let n_in = input_names.len();
         Ok(Self {
             mlp,
             input_names,
             output_names,
             output_pk_indices,
+            input_center: vec![0.0; n_in],
+            input_scale: vec![1.0; n_in],
         })
+    }
+
+    /// Attach per-input normalisation: the forward pass sees `(x - center) / scale`.
+    ///
+    /// Lengths must match `inputs`, and every `scale` entry must be finite and non-zero.
+    /// Callers that want centering only (or scaling only) pass the identity for the other.
+    pub fn with_normalization(
+        mut self,
+        center: Vec<f64>,
+        scale: Vec<f64>,
+    ) -> Result<Self, NnError> {
+        let n_in = self.input_names.len();
+        for (label, v) in [("center", &center), ("scale", &scale)] {
+            if v.len() != n_in {
+                return Err(NnError::NormalizationLengthMismatch {
+                    field: label,
+                    expected: n_in,
+                    actual: v.len(),
+                });
+            }
+        }
+        for (i, s) in scale.iter().enumerate() {
+            if !s.is_finite() || *s == 0.0 {
+                return Err(NnError::InvalidScale {
+                    input: self.input_names[i].clone(),
+                    value: *s,
+                });
+            }
+        }
+        // Mirror the `scale` loop rather than reporting a single fabricated key: the user
+        // needs the offending input's real name and the value they actually wrote.
+        for (i, c) in center.iter().enumerate() {
+            if !c.is_finite() {
+                return Err(NnError::InvalidCenter {
+                    input: self.input_names[i].clone(),
+                    value: *c,
+                });
+            }
+        }
+        self.input_center = center;
+        self.input_scale = scale;
+        Ok(self)
+    }
+
+    /// Per-input `center`, in `inputs` order. All-zero unless the model declares
+    /// normalisation. Reported on `NeuralNetworkInfo` because the fitted weights
+    /// are only meaningful alongside the transform they were fitted under.
+    pub fn input_center(&self) -> &[f64] {
+        &self.input_center
+    }
+
+    /// Per-input `scale`, in `inputs` order. All-one unless the model declares
+    /// normalisation. See [`NamedMlpMapper::input_center`].
+    pub fn input_scale(&self) -> &[f64] {
+        &self.input_scale
+    }
+
+    /// `(x - center) / scale` for input `i`. Identity unless the model declares
+    /// normalisation, and cheap enough to apply unconditionally.
+    #[inline]
+    fn normalize(&self, i: usize, x: f64) -> f64 {
+        (x - self.input_center[i]) / self.input_scale[i]
     }
 
     /// Direct access to the underlying MLP (for testing or weight
@@ -535,6 +769,15 @@ impl NamedMlpMapper {
     /// covariate lookups). The remaining error variants — `WeightCountMismatch`
     /// / `InputCountMismatch` — only fire on genuine wiring bugs, so callers
     /// can typically `.expect(...)` the result.
+    ///
+    /// **The zero-fill is not the guard against a bad input name.** Silently
+    /// substituting `0.0` degenerates the network to a constant — a typo'd input, or
+    /// `inputs = [TIME]` (a reserved column, not a covariate), would otherwise produce a
+    /// plausible-looking fit that learned nothing. What prevents that is
+    /// `api::check_covariates` at fit time, which sees `[covariate_nn]` inputs only
+    /// because the parser registers them in `referenced_covariates` — that registration
+    /// exists for this reason as much as for time-varying covariates. Keep the two
+    /// together: dropping the registration re-opens *both* failure modes silently.
     pub fn forward_raw(
         &self,
         weights: &[f64],
@@ -544,15 +787,36 @@ impl NamedMlpMapper {
         self.mlp.forward(&x, weights)
     }
 
+    /// Pre-activation Jacobian `∂z_L/∂weights` at this subject's covariates,
+    /// built with the **same zero-fill input construction as
+    /// [`forward_raw`](Self::forward_raw)**.
+    ///
+    /// The pairing matters: `forward_raw` is what `pk_param_fn` calls on every
+    /// prediction, so a gradient assembled from the strict
+    /// [`CovariateMapper::jacobian`] would be differentiating a slightly
+    /// different function than the one being evaluated whenever a covariate is
+    /// absent. Use this variant anywhere the Jacobian has to agree with the
+    /// production forward pass.
+    pub fn jacobian_preactivation_raw(
+        &self,
+        weights: &[f64],
+        covariates: &HashMap<String, f64>,
+    ) -> Result<DMatrix<f64>, NnError> {
+        let x = self.build_input_vec_zero_fill(covariates);
+        self.mlp.jacobian_preactivation(&x, weights)
+    }
+
     /// Strict variant used by [`CovariateMapper::forward`] / `jacobian`: errors
     /// out with `MissingCovariate` if any input name is absent.
     fn build_input_vec(&self, covariates: &HashMap<String, f64>) -> Result<Vec<f64>, NnError> {
         self.input_names
             .iter()
-            .map(|n| {
+            .enumerate()
+            .map(|(i, n)| {
                 covariates
                     .get(n)
                     .copied()
+                    .map(|x| self.normalize(i, x))
                     .ok_or_else(|| NnError::MissingCovariate(n.clone()))
             })
             .collect()
@@ -563,7 +827,15 @@ impl NamedMlpMapper {
     fn build_input_vec_zero_fill(&self, covariates: &HashMap<String, f64>) -> Vec<f64> {
         self.input_names
             .iter()
-            .map(|n| covariates.get(n).copied().unwrap_or(0.0))
+            .enumerate()
+            .map(|(i, n)| match covariates.get(n).copied() {
+                Some(x) => self.normalize(i, x),
+                // Absent: feed the network the *centered* origin rather than a raw 0.0,
+                // so the fallback does not depend on where the user put `center`. This
+                // path is guarded by `api::check_covariates` regardless (see
+                // `forward_raw`).
+                None => self.normalize(i, self.input_center[i]),
+            })
             .collect()
     }
 }
@@ -683,6 +955,127 @@ mod tests {
         let weights = vec![1.0, -1.0, 2.0, 0.0, 0.0, -3.0, 1.0, 1.0, 1.0, 0.0];
         let y = mlp.forward(&[1.0], &weights).unwrap();
         assert_relative_eq!(y[0], 1.0, epsilon = 1e-12);
+    }
+
+    /// Deterministic, non-degenerate weights for FD comparisons. Small
+    /// magnitudes keep bounded activations in their responsive range so the
+    /// finite differences have clean signal.
+    fn probe_weights(n: usize) -> Vec<f64> {
+        (0..n)
+            .map(|i| 0.1 * (i as f64).sin() + 0.05 * ((i * 7) as f64).cos())
+            .collect()
+    }
+
+    /// Forward pass stopped at the output layer's pre-activation `z_L`, i.e.
+    /// `forward` with the output activation peeled off. Test-side reference
+    /// for what `jacobian_preactivation` claims to differentiate.
+    fn forward_preactivation(mlp: &MlpMapper, x: &[f64], weights: &[f64]) -> Vec<f64> {
+        let (pre, _post) = mlp.forward_cache(x, weights);
+        pre.last()
+            .expect("at least one layer")
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    /// `jacobian_preactivation` must be the central FD of `z_L`, not of the
+    /// activated output. Uses `Softplus` on the output head so the two
+    /// genuinely differ — under `Identity` the test would pass even if the
+    /// `preactivation` flag were ignored.
+    #[test]
+    fn jacobian_preactivation_matches_central_fd_of_z() {
+        let mlp = MlpMapper::new(vec![2, 4, 3], Activation::Tanh, Activation::Softplus).unwrap();
+        let n_w = mlp.n_weights();
+        let weights = probe_weights(n_w);
+        let x = vec![0.3, -0.7];
+
+        let jac = mlp.jacobian_preactivation(&x, &weights).unwrap();
+        assert_eq!(jac.nrows(), 3);
+        assert_eq!(jac.ncols(), n_w);
+
+        let eps = 1e-7;
+        let mut perturbed = weights.clone();
+        for j in 0..n_w {
+            let saved = perturbed[j];
+            perturbed[j] = saved + eps;
+            let z_plus = forward_preactivation(&mlp, &x, &perturbed);
+            perturbed[j] = saved - eps;
+            let z_minus = forward_preactivation(&mlp, &x, &perturbed);
+            perturbed[j] = saved;
+            for i in 0..3 {
+                let fd = (z_plus[i] - z_minus[i]) / (2.0 * eps);
+                assert_relative_eq!(jac[(i, j)], fd, epsilon = 1e-6, max_relative = 1e-5);
+            }
+        }
+    }
+
+    /// Under an identity output head the two Jacobians describe the same
+    /// function, so they must agree exactly — a cheap guard that the shared
+    /// `jacobian_impl` refactor did not perturb the original path.
+    #[test]
+    fn jacobian_preactivation_equals_jacobian_under_identity_head() {
+        let mlp = MlpMapper::new(vec![3, 5, 2], Activation::Tanh, Activation::Identity).unwrap();
+        let weights = probe_weights(mlp.n_weights());
+        let x = vec![0.2, -0.4, 0.9];
+
+        let post = mlp.jacobian(&x, &weights).unwrap();
+        let pre = mlp.jacobian_preactivation(&x, &weights).unwrap();
+        for i in 0..post.nrows() {
+            for j in 0..post.ncols() {
+                assert_relative_eq!(pre[(i, j)], post[(i, j)], epsilon = 1e-15);
+            }
+        }
+    }
+
+    /// The identity the hybrid NN gradient rests on: the output-layer bias
+    /// `b_k` moves `z_k` one-for-one and moves no other output's
+    /// pre-activation at all.
+    #[test]
+    fn output_bias_moves_only_its_own_preactivation() {
+        let mlp = MlpMapper::new(vec![2, 3, 4], Activation::Tanh, Activation::Softplus).unwrap();
+        let weights = probe_weights(mlp.n_weights());
+        let x = vec![0.5, -0.2];
+        let jac = mlp.jacobian_preactivation(&x, &weights).unwrap();
+
+        for k in 0..mlp.n_outputs() {
+            let b_k = mlp.output_bias_index(k);
+            for i in 0..mlp.n_outputs() {
+                let expected = if i == k { 1.0 } else { 0.0 };
+                assert_relative_eq!(jac[(i, b_k)], expected, epsilon = 1e-15);
+            }
+        }
+    }
+
+    /// A saturated `Softplus` head drives the *post*-activation Jacobian's
+    /// bias entry to ~0 while the pre-activation entry stays exactly 1. This
+    /// is the case that makes dividing by `f'(z_k)` unusable and the
+    /// pre-activation seed necessary — not a stylistic preference.
+    #[test]
+    fn saturated_head_kills_post_activation_bias_but_not_preactivation() {
+        let mlp =
+            MlpMapper::new(vec![1, 1, 1], Activation::Identity, Activation::Softplus).unwrap();
+        // W_1 = [1], b_1 = [0], W_2 = [1], b_2 = [-60]. For x = 1: z_2 = -59,
+        // so softplus'(z_2) = sigmoid(-59) ≈ 2e-26.
+        let weights = vec![1.0, 0.0, 1.0, -60.0];
+        let x = vec![1.0];
+
+        let b_k = mlp.output_bias_index(0);
+        let post = mlp.jacobian(&x, &weights).unwrap();
+        let pre = mlp.jacobian_preactivation(&x, &weights).unwrap();
+
+        assert!(
+            post[(0, b_k)].abs() < 1e-20,
+            "expected a saturated post-activation entry, got {}",
+            post[(0, b_k)]
+        );
+        assert_relative_eq!(pre[(0, b_k)], 1.0, epsilon = 1e-15);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn output_bias_index_rejects_out_of_range_output() {
+        let mlp = MlpMapper::new(vec![2, 3, 2], Activation::Tanh, Activation::Identity).unwrap();
+        let _ = mlp.output_bias_index(2);
     }
 
     /// The Jacobian computed analytically must match central FD to high
@@ -938,5 +1331,186 @@ mod tests {
         let cl_indiv = tv_cl * eta_cl.exp();
         assert!(cl_indiv > tv_cl); // positive eta increases CL
         assert_relative_eq!(cl_indiv / tv_cl, eta_cl.exp(), epsilon = 1e-12);
+    }
+
+    /// A rejected `center` or `scale` entry must name the **offending input** and report
+    /// the value the user actually wrote.
+    ///
+    /// The center check used to reuse `InvalidScale` with a hardcoded `input: "center"`
+    /// and a fabricated `NaN`, so `center = [inf, 0]` was reported as a *scale* error, on
+    /// an input named "center", carrying a value that never appeared in the model file —
+    /// three wrong facts in one message.
+    #[test]
+    fn normalization_errors_name_the_offending_input_and_value() {
+        let mapper = || {
+            NamedMlpMapper::new(
+                MlpMapper::new(vec![2, 2, 1], Activation::Tanh, Activation::Identity)
+                    .expect("valid layers"),
+                vec!["WT".to_string(), "CRCL".to_string()],
+                vec!["CL".to_string()],
+            )
+            .expect("valid mapper")
+        };
+
+        // Second input's scale is zero — a division the forward pass cannot survive.
+        match mapper().with_normalization(vec![0.0, 0.0], vec![1.0, 0.0]) {
+            Err(NnError::InvalidScale { input, value }) => {
+                assert_eq!(input, "CRCL");
+                assert_eq!(value, 0.0);
+            }
+            other => panic!("expected InvalidScale on CRCL, got {other:?}"),
+        }
+
+        // Second input's center is non-finite. Distinct variant, real name, real value.
+        match mapper().with_normalization(vec![0.0, f64::INFINITY], vec![1.0, 1.0]) {
+            Err(NnError::InvalidCenter { input, value }) => {
+                assert_eq!(input, "CRCL");
+                assert!(value.is_infinite());
+                assert!(
+                    format!("{}", NnError::InvalidCenter { input, value }).contains("`center`"),
+                    "the message must say which key is at fault"
+                );
+            }
+            other => panic!("expected InvalidCenter on CRCL, got {other:?}"),
+        }
+    }
+
+    /// The transform a network was fitted under is readable back off the mapper, which is
+    /// what lets `NeuralNetworkInfo` report it. Identity by default, so a model that
+    /// declares no normalisation reports vectors that change nothing.
+    #[test]
+    fn normalization_vectors_are_readable_and_default_to_identity() {
+        let base = NamedMlpMapper::new(
+            MlpMapper::new(vec![2, 2, 1], Activation::Tanh, Activation::Identity)
+                .expect("valid layers"),
+            vec!["WT".to_string(), "CRCL".to_string()],
+            vec!["CL".to_string()],
+        )
+        .expect("valid mapper");
+        assert_eq!(base.input_center(), &[0.0, 0.0]);
+        assert_eq!(base.input_scale(), &[1.0, 1.0]);
+
+        let normed = base
+            .with_normalization(vec![70.0, 90.0], vec![15.0, 30.0])
+            .expect("valid normalisation");
+        assert_eq!(normed.input_center(), &[70.0, 90.0]);
+        assert_eq!(normed.input_scale(), &[15.0, 30.0]);
+    }
+}
+
+#[cfg(test)]
+mod invert_tests {
+    use super::*;
+    use approx::assert_relative_eq;
+
+    /// `invert` must be the exact inverse of `apply` across each activation's
+    /// range — including the piecewise branches `apply` uses for numerical
+    /// stability, which are the easy place for an inverse to disagree.
+    #[test]
+    fn invert_round_trips_through_apply() {
+        let cases: &[(Activation, &[f64])] = &[
+            (Activation::Identity, &[-3.0, 0.0, 7.5]),
+            (Activation::Relu, &[0.25, 1.0, 40.0]),
+            // Spans the `y > 20` branch of `apply` and the small-`y` end where
+            // `exp(y) - 1` would lose precision to cancellation.
+            (
+                Activation::Softplus,
+                &[1e-8, 1e-3, 0.693_147, 1.0, 10.0, 25.0, 400.0],
+            ),
+            (Activation::Tanh, &[-0.95, 0.0, 0.5]),
+            (Activation::Sigmoid, &[0.01, 0.5, 0.99]),
+            (Activation::Exp, &[1e-6, 1.0, 500.0]),
+        ];
+        for (act, ys) in cases {
+            for &y in *ys {
+                let z = act
+                    .invert(y)
+                    .unwrap_or_else(|| panic!("{:?} should invert {y}", act));
+                assert_relative_eq!(act.apply(z), y, max_relative = 1e-9);
+            }
+        }
+    }
+
+    /// Out-of-range values must decline rather than return a NaN that would
+    /// silently become a NaN weight.
+    #[test]
+    fn invert_declines_outside_the_range() {
+        assert!(Activation::Softplus.invert(0.0).is_none());
+        assert!(Activation::Softplus.invert(-1.0).is_none());
+        assert!(Activation::Exp.invert(0.0).is_none());
+        assert!(Activation::Relu.invert(0.0).is_none());
+        assert!(Activation::Tanh.invert(1.0).is_none());
+        assert!(Activation::Sigmoid.invert(1.0).is_none());
+        assert!(Activation::Sigmoid.invert(0.0).is_none());
+        assert!(Activation::Identity.invert(f64::NAN).is_none());
+        assert!(Activation::Identity.invert(f64::INFINITY).is_none());
+    }
+
+    /// The range blurb is user-facing error text (`[covariate_nn] init` quotes it
+    /// when a declared output value cannot be inverted), so it has to *describe
+    /// the range `invert` actually enforces*. Pinning the string alone would let
+    /// the two drift apart silently — a widened `invert` with a stale blurb tells
+    /// the user their value is out of range when it is not. So each arm is paired
+    /// with a probe the text excludes, and `invert` must agree by declining it.
+    #[test]
+    fn range_description_describes_the_range_invert_enforces() {
+        let cases = [
+            (Activation::Identity, "any finite value", f64::NAN),
+            (Activation::Relu, "a value > 0", 0.0),
+            (Activation::Softplus, "a value > 0", 0.0),
+            (Activation::Tanh, "a value strictly between -1 and 1", 1.0),
+            (Activation::Sigmoid, "a value strictly between 0 and 1", 1.0),
+            (Activation::Exp, "a value > 0", 0.0),
+        ];
+        for (act, expected, excluded) in cases {
+            assert_eq!(
+                act.range_description(),
+                expected,
+                "{act:?} reports an unexpected range description"
+            );
+            assert!(
+                act.invert(excluded).is_none(),
+                "{act:?} says its range is `{expected}` but inverts the excluded value {excluded}"
+            );
+        }
+    }
+
+    /// The output-layer weight block must be exactly the entries between the
+    /// last layer's start and its first bias — the range `init` zeroes.
+    #[test]
+    fn output_weight_range_covers_the_last_layer_weights_only() {
+        let mlp = MlpMapper::new(vec![2, 4, 3], Activation::Tanh, Activation::Softplus).unwrap();
+        let r = mlp.output_weight_range();
+        assert_eq!(r.len(), 3 * 4, "W_L is n_out x n_hidden");
+        assert_eq!(r.end, mlp.output_bias_index(0));
+        // And it must not overlap any bias.
+        for k in 0..mlp.n_outputs() {
+            assert!(!r.contains(&mlp.output_bias_index(k)));
+        }
+    }
+
+    /// The property `init` exists to provide: with `W_L` zeroed and the biases
+    /// set to `f^{-1}(v)`, the network emits exactly `v` — for *any* input, so
+    /// every subject starts at the same declared value.
+    #[test]
+    fn zeroed_output_weights_make_the_bias_the_whole_output() {
+        let mlp = MlpMapper::new(vec![2, 4, 3], Activation::Tanh, Activation::Softplus).unwrap();
+        let mut w: Vec<f64> = (0..mlp.n_weights())
+            .map(|i| 0.3 * (i as f64).sin())
+            .collect();
+        for i in mlp.output_weight_range() {
+            w[i] = 0.0;
+        }
+        let targets = [0.75f64, 10.0, 3.5];
+        for (k, &v) in targets.iter().enumerate() {
+            w[mlp.output_bias_index(k)] = Activation::Softplus.invert(v).unwrap();
+        }
+        // Two very different input vectors must give the same output.
+        for x in [[0.0, 0.0], [4.0, -9.0]] {
+            let y = mlp.forward(&x, &w).unwrap();
+            for (k, &v) in targets.iter().enumerate() {
+                assert_relative_eq!(y[k], v, max_relative = 1e-12);
+            }
+        }
     }
 }
