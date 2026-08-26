@@ -1250,6 +1250,21 @@ fn register_referenced_covariates(
 
 /// Parse a full model string including all optional blocks.
 pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
+    parse_full_model_bound(content, &FactorBindings::new())
+}
+
+/// [`parse_full_model`] with the observed levels of every `theta NAME ~
+/// factor(...)` block supplied (#1064).
+///
+/// A factor block's level count is a property of the *data*, which the first
+/// parse has not seen — so `api::factor::bind` reads the population, discovers
+/// the observed combinations, and calls this. Re-parsing (milliseconds) is what
+/// lets the compiled closures be built once, with the real θ count, instead of
+/// being rebuilt in place after the fact.
+pub fn parse_full_model_bound(
+    content: &str,
+    factor_bindings: &FactorBindings,
+) -> Result<ParsedModel, String> {
     let mut extracted = extract_blocks(content)?;
     // `ode_template NAME(...)` desugaring (#322 Phase 0b): if [structural_model]
     // uses `ode_template`, rewrite it (and the [odes]/[scaling] blocks) into the
@@ -1296,7 +1311,9 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         eta_names_bsv,
         kappa_info,
         vector_theta_decls,
-    ) = parse_parameters(param_lines)?;
+        mut factor_theta_decls,
+        unbound_factors,
+    ) = parse_parameters(param_lines, factor_bindings)?;
     // Install the vector/factor θ table for the remainder of this parse so a
     // gather (`PLACEBO[IDX]`) resolves identically in every block that parses
     // expressions. Dropped at the end of `parse_full_model`, restoring whatever
@@ -2178,6 +2195,14 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         }
     }
 
+    // #1064: answer the model-side half of the `factor(...)` identifiability
+    // question now that every `[individual_parameters]` statement has parsed —
+    // the binder reads it back off `theta_blocks` to resolve
+    // `FactorContrast::Auto`.
+    for decl in factor_theta_decls.iter_mut() {
+        decl.shares_scale_with_eta = factor_shares_scale_with_eta(&indiv_stmts, &decl.name);
+    }
+
     let (pk_param_fn, referenced_covariates, mut indiv_param_partials, indiv_param_program) =
         build_pk_param_fn(
             indiv_stmts.clone(),
@@ -2646,7 +2671,8 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         theta_blocks: ThetaBlocks {
             decls: vector_theta_decls.clone(),
             uses: VectorThetaScope::uses(),
-            unbound_factors: Vec::new(),
+            factors: factor_theta_decls.clone(),
+            unbound_factors: unbound_factors.clone(),
         },
         default_params,
         omega_init_as_sd,
@@ -2893,6 +2919,22 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     if let Some(ref mix) = model.mixture {
         let mix_covs = mix.logit_covariates.clone();
         register_referenced_covariates(&mut model.referenced_covariates, mix_covs);
+    }
+
+    // #1064: the columns a `factor(...)` block indexes on are read from the data
+    // by `api::factor::bind_factor_thetas`, so they must be in the CSV read set
+    // for the same reason as the mixing covariates above — otherwise a
+    // `[covariates]`-declared model never loads `STUDY` and every row lands in
+    // one level. `TIME` is the record time, not a covariate.
+    {
+        let factor_covs: Vec<String> = model
+            .theta_blocks
+            .factors()
+            .iter()
+            .flat_map(|d| d.columns().iter().cloned())
+            .filter(|c| !c.eq_ignore_ascii_case("TIME"))
+            .collect();
+        register_referenced_covariates(&mut model.referenced_covariates, factor_covs);
     }
 
     // Build FremConfig from fit options when frem_predictions is present.
@@ -12145,6 +12187,7 @@ pub(crate) fn mixing_logp_grad(
 
 fn parse_parameters(
     lines: &[String],
+    factor_bindings: &FactorBindings,
 ) -> Result<
     (
         Vec<ThetaSpec>,
@@ -12155,11 +12198,15 @@ fn parse_parameters(
         Vec<String>,          // BSV eta names in declaration order
         ParsedKappas,         // IOV kappa specs (diagonal and/or block)
         Vec<VectorThetaDecl>, // #1064 vector / factor θ blocks
+        Vec<FactorThetaDecl>, // #1064 `factor(...)` declarations
+        Vec<String>,          // #1064 factor blocks still awaiting data
     ),
     String,
 > {
     let mut thetas = Vec::new();
     let mut vector_thetas: Vec<VectorThetaDecl> = Vec::new();
+    let mut factor_thetas: Vec<FactorThetaDecl> = Vec::new();
+    let mut unbound_factors: Vec<String> = Vec::new();
     let mut omegas = Vec::new();
     let mut block_omegas = Vec::new();
     let mut sigmas = Vec::new();
@@ -12199,6 +12246,18 @@ fn parse_parameters(
     // thetas named `NAME[1]`…`NAME[N]`; what makes hundreds of them tractable
     // is that `[individual_parameters]` reads them through a *gather*
     // (`NAME[IDX_COLUMN]`), which occupies a single `PkParams` slot.
+    // theta NAME ~ factor(COL, ...[, contrast = ...])(init[, lower[, upper]][, FIX])
+    //
+    // The data-driven twin of `theta NAME[N]`: one θ per **observed**
+    // combination of the named columns, discovered when the data is bound, with
+    // the `(init, lower, upper)` triple broadcast to every level. The index is
+    // implicit, so a bare `NAME` in an expression gathers on the synthesized
+    // per-record index column.
+    let factor_re = Regex::new(
+        r"(?i)theta\s+(\w+)\s*~\s*factor\s*\(([^)]*)\)\s*\(\s*([0-9eE.+-]+)\s*(?:,\s*([0-9eE.+-]+)(?:\s*,\s*([0-9eE.+-]+))?)?\s*(?:,?\s*(FIX)\b)?\s*\)(?:\s+(FIX)\b)?",
+    )
+    .unwrap();
+
     let theta_re = Regex::new(
         r"(?i)theta\s+(\w+)\s*(?:\[\s*(\d+)\s*\])?\s*\(\s*([0-9eE.+-]+)\s*(?:,\s*([0-9eE.+-]+)(?:\s*,\s*([0-9eE.+-]+))?)?\s*(?:,?\s*(FIX)\b)?\s*\)(?:\s+(FIX)\b)?",
     )
@@ -12274,7 +12333,109 @@ fn parse_parameters(
             split_weight_modifier(line, "parameters", "a `kappa NAME ~ VALUE` declaration")?;
         let line = &line;
         let mut weight_consumed = false;
-        if let Some(caps) = theta_re.captures(line) {
+        if let Some(caps) = factor_re.captures(line) {
+            let name = caps[1].to_string();
+            let mut columns: Vec<String> = Vec::new();
+            let mut contrast = FactorContrast::Auto;
+            let mut saw_contrast = false;
+            for arg in caps[2].split(',') {
+                let arg = arg.trim();
+                if arg.is_empty() {
+                    continue;
+                }
+                if let Some((key, value)) = arg.split_once('=') {
+                    if !key.trim().eq_ignore_ascii_case("contrast") {
+                        return Err(format!(
+                            "factor(...): unknown modifier `{}`. Only `contrast = ...` is \
+                             accepted alongside the column list.",
+                            key.trim()
+                        ));
+                    }
+                    if saw_contrast {
+                        return Err(format!("theta {name}: `contrast` given twice"));
+                    }
+                    contrast = FactorContrast::parse(value)?;
+                    saw_contrast = true;
+                } else {
+                    if saw_contrast {
+                        return Err(format!(
+                            "theta {name}: factor columns must come before `contrast = ...`"
+                        ));
+                    }
+                    if !arg.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                        return Err(format!(
+                            "factor(...): `{arg}` is not a valid data column name"
+                        ));
+                    }
+                    columns.push(arg.to_string());
+                }
+            }
+            if columns.is_empty() {
+                return Err(format!(
+                    "theta {name} ~ factor(): name at least one data column, \
+                     e.g. factor(STUDY, TIME)"
+                ));
+            }
+            let init: f64 = caps[3]
+                .parse()
+                .map_err(|_| format!("Bad theta init: {}", line))?;
+            let lower: f64 = caps
+                .get(4)
+                .map(|m| m.as_str().parse().unwrap_or(1e-9))
+                .unwrap_or(1e-9);
+            let upper: f64 = caps
+                .get(5)
+                .map(|m| m.as_str().parse().unwrap_or(1e9))
+                .unwrap_or(1e9);
+            let fixed = caps.get(6).is_some() || caps.get(7).is_some();
+            if vector_thetas.iter().any(|d| d.name == name) {
+                return Err(format!("theta {name}: declared twice"));
+            }
+            let index_covariate = factor_index_column(&name);
+            let binding = factor_bindings.get(&name);
+            let levels = match binding {
+                // First parse: the level count is a property of the data. The
+                // block is declared with no levels so expressions still
+                // resolve, and recorded as unbound — `fit()` refuses a model
+                // that reaches it in this state rather than predicting NaN.
+                None => {
+                    unbound_factors.push(name.clone());
+                    Vec::new()
+                }
+                Some(b) => {
+                    let (rules, theta_names) = build_factor_levels(&name, b, thetas.len())?;
+                    for theta_name in theta_names {
+                        thetas.push(ThetaSpec {
+                            name: theta_name,
+                            init,
+                            lower,
+                            upper,
+                            fixed,
+                        });
+                    }
+                    rules
+                }
+            };
+            vector_thetas.push(VectorThetaDecl {
+                name: name.clone(),
+                spec: std::sync::Arc::new(GatherSpec {
+                    name: name.clone(),
+                    levels,
+                }),
+                index_covariate: Some(index_covariate.clone()),
+            });
+            factor_thetas.push(FactorThetaDecl {
+                name,
+                columns,
+                contrast: binding.map(|b| b.contrast).unwrap_or(contrast),
+                init,
+                lower,
+                upper,
+                fixed,
+                shares_scale_with_eta: false,
+                index_covariate,
+            });
+        } else if let Some(caps) = theta_re.captures(line) {
             let name = caps[1].to_string();
             let vector_len: Option<usize> = match caps.get(2) {
                 Some(m) => Some(
@@ -12582,7 +12743,95 @@ fn parse_parameters(
             weights: kappa_weights_ordered,
         },
         vector_thetas,
+        factor_thetas,
+        unbound_factors,
     ))
+}
+
+/// Name of the synthesized per-record index column a `factor(...)` block
+/// gathers on. Double-underscore prefixed so it cannot collide with a real data
+/// column.
+pub(crate) fn factor_index_column(block: &str) -> String {
+    format!("__factor_{block}")
+}
+
+/// Turn a discovered [`FactorBinding`] into the block's level → θ map plus the
+/// θ names to append, starting at absolute index `base`.
+///
+/// Contiguity matters: each contrast group's free θ occupy one range, so the
+/// dependent level of a sum-to-zero group is a single `NegSum` over that range
+/// rather than a scatter.
+fn build_factor_levels(
+    name: &str,
+    binding: &FactorBinding,
+    base: usize,
+) -> Result<(Vec<LevelRule>, Vec<String>), String> {
+    if binding.labels.len() != binding.groups.len() {
+        return Err(format!(
+            "theta {name}: factor binding has {} labels but {} group ids",
+            binding.labels.len(),
+            binding.groups.len()
+        ));
+    }
+    if binding.labels.is_empty() {
+        return Err(format!(
+            "theta {name} ~ factor(...): no observed level combinations in the data"
+        ));
+    }
+    // Levels of a group must be contiguous for the `NegSum` range to be one
+    // slice; the binder orders them that way, and this is the tripwire if a
+    // future caller does not.
+    let mut seen: Vec<usize> = Vec::new();
+    for (i, g) in binding.groups.iter().enumerate() {
+        if seen.last() != Some(g) {
+            if seen.contains(g) {
+                return Err(format!(
+                    "theta {name} ~ factor(...): contrast group {g} is not contiguous \
+                     (level {i} re-opens it)"
+                ));
+            }
+            seen.push(*g);
+        }
+    }
+
+    let n = binding.labels.len();
+    let mut rules = vec![LevelRule::Free(0); n];
+    let mut names = Vec::new();
+    let mut next = base;
+    let mut start = 0usize;
+    while start < n {
+        let group = binding.groups[start];
+        let mut end = start;
+        while end < n && binding.groups[end] == group {
+            end += 1;
+        }
+        // The level within the group that carries no θ of its own, if any.
+        let dependent = match binding.contrast {
+            FactorContrast::Ref => Some(start),
+            FactorContrast::Unconstrained => None,
+            // `Auto` is resolved by the binder before it gets here; a residual
+            // `Auto` stands for the sum-to-zero it defaults to.
+            _ => Some(end - 1),
+        };
+        let free_base = next;
+        for level in start..end {
+            if Some(level) == dependent {
+                continue;
+            }
+            rules[level] = LevelRule::Free(next as u32);
+            names.push(format!("{name}[{}]", binding.labels[level]));
+            next += 1;
+        }
+        if let Some(d) = dependent {
+            rules[d] = match binding.contrast {
+                // A reference level is pinned at 0 — an empty `NegSum` range.
+                FactorContrast::Ref => LevelRule::NegSum(free_base as u32, free_base as u32),
+                _ => LevelRule::NegSum(free_base as u32, next as u32),
+            };
+        }
+        start = end;
+    }
+    Ok((rules, names))
 }
 
 // --- Build omega matrix from diagonal + block specs ---
@@ -14896,6 +15145,112 @@ fn record_gather_use(block: &str, index_covariate: &str, n_levels: usize) {
     });
 }
 
+/// Identifiability convention applied to a `factor(...)` θ block (#1064).
+///
+/// `factor(STUDY, TIME)` alongside an intercept is rank-deficient — the levels
+/// sum to the intercept — and, per @TeunP on #1063, it is rank-deficient
+/// against a **random** effect at the same or a coarser grouping too: a study's
+/// η *is* the mean of that study's own timepoint levels. So the convention is
+/// not optional, and it has to read the variance structure rather than only
+/// scanning for a fixed intercept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FactorContrast {
+    /// Sum-to-zero, with the grouping chosen from the model + data: within the
+    /// factor's leading columns when the block shares an additive scale with a
+    /// random effect and those columns partition the subjects, globally
+    /// otherwise. The default.
+    #[default]
+    Auto,
+    /// Sum-to-zero over every level of the block.
+    SumToZero,
+    /// Sum-to-zero within each combination of the factor's leading columns
+    /// (all but the last). Leaves each group's mean to be carried by that
+    /// group's random effect, which is what an unstructured placebo effect
+    /// under between-study variability intends.
+    SumToZeroWithin,
+    /// The first level of each group is the reference and is held at 0 — the
+    /// regression convention, for when the coefficients are meant to be read.
+    Ref,
+    /// No constraint. Every level is estimated; the caller asserts the model is
+    /// identified some other way (e.g. it declares no intercept).
+    Unconstrained,
+}
+
+impl FactorContrast {
+    /// Parse the `contrast = ...` modifier inside `factor(...)`.
+    fn parse(token: &str) -> Result<Self, String> {
+        match token.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "sum_to_zero" => Ok(Self::SumToZero),
+            "sum_to_zero_within" | "sum_to_zero_within_group" => Ok(Self::SumToZeroWithin),
+            "ref" | "reference" | "first" => Ok(Self::Ref),
+            "none" | "unconstrained" => Ok(Self::Unconstrained),
+            other => Err(format!(
+                "factor(...): unknown `contrast = {other}`. Expected one of \
+                 sum_to_zero, sum_to_zero_within, ref, none."
+            )),
+        }
+    }
+}
+
+/// A `theta NAME ~ factor(COL, ...)` declaration, before its levels are known.
+///
+/// The level count is a property of the *data*, so this is what the first parse
+/// produces; `api::factor::bind` discovers the observed combinations and
+/// re-parses with a [`FactorBinding`] in hand.
+#[derive(Debug, Clone)]
+pub struct FactorThetaDecl {
+    pub(crate) name: String,
+    /// Data columns whose observed combinations define the levels. A column
+    /// named `TIME` is the record time, not a covariate.
+    pub(crate) columns: Vec<String>,
+    pub(crate) contrast: FactorContrast,
+    pub(crate) init: f64,
+    pub(crate) lower: f64,
+    pub(crate) upper: f64,
+    pub(crate) fixed: bool,
+    /// Set by the parse: some `[individual_parameters]` statement reads this
+    /// block *and* a random effect. [`FactorContrast::Auto`] consumes it — it
+    /// is the "is there an η at a grouping coarser than or equal to the
+    /// factor's" question, answered on the model side.
+    pub(crate) shares_scale_with_eta: bool,
+    /// Synthesized per-record index column the implicit gather reads.
+    pub(crate) index_covariate: String,
+}
+
+impl FactorThetaDecl {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+    pub fn contrast(&self) -> FactorContrast {
+        self.contrast
+    }
+    pub fn shares_scale_with_eta(&self) -> bool {
+        self.shares_scale_with_eta
+    }
+    pub fn index_covariate(&self) -> &str {
+        &self.index_covariate
+    }
+}
+
+/// The observed levels of one `factor(...)` block, as discovered from the data.
+#[derive(Debug, Clone, Default)]
+pub struct FactorBinding {
+    /// Level labels in level order, e.g. `STUDY=7,TIME=4`.
+    pub labels: Vec<String>,
+    /// Contrast group per level, parallel to `labels`. Levels of a group are
+    /// contiguous, so each group's free θ occupy a contiguous range.
+    pub groups: Vec<usize>,
+    /// The convention actually applied ([`FactorContrast::Auto`] resolved).
+    pub contrast: FactorContrast,
+}
+
+/// Level bindings by block name, threaded into the second parse.
+pub type FactorBindings = std::collections::HashMap<String, FactorBinding>;
+
 /// The vector / factor θ blocks a model declares (#1064), carried on
 /// `CompiledModel` so the pre-fit data check and the `fit()` guard can see them.
 ///
@@ -14908,9 +15263,12 @@ pub struct ThetaBlocks {
     pub(crate) decls: Vec<VectorThetaDecl>,
     /// `NAME[COLUMN]` sites whose index column the data check should walk.
     pub(crate) uses: Vec<GatherUse>,
+    /// `factor(...)` declarations, in declaration order. Present whether or not
+    /// they are bound; `unbound_factors` says which still need data.
+    pub(crate) factors: Vec<FactorThetaDecl>,
     /// Names of `factor(...)` blocks that were declared but never bound to
     /// data. A model carrying any of these cannot be fit — see
-    /// `api::fit::check_factor_blocks_bound`.
+    /// `api::factor::check_factors_bound`.
     pub(crate) unbound_factors: Vec<String>,
 }
 
@@ -14929,6 +15287,19 @@ impl ThetaBlocks {
     /// Names of `factor(...)` blocks declared but not bound to data.
     pub fn unbound_factors(&self) -> &[String] {
         &self.unbound_factors
+    }
+
+    /// The `factor(...)` declarations, bound or not.
+    pub fn factors(&self) -> &[FactorThetaDecl] {
+        &self.factors
+    }
+
+    /// Level count of a bound block, by name.
+    pub fn level_count(&self, name: &str) -> Option<usize> {
+        self.decls
+            .iter()
+            .find(|d| d.name == name)
+            .map(|d| d.spec.levels.len())
     }
 
     /// `(block, index column, level count)` for every gather whose index is a
@@ -15248,6 +15619,95 @@ fn visit_condition_nodes(cond: &Condition, f: &mut dyn FnMut(&Expression)) {
 /// conditions + bodies of `if` blocks (see `visit_expr_nodes`). Bytecode
 /// variants carry no tree to walk (they only appear after
 /// `resolve_variable_indices`).
+/// Whether some `[individual_parameters]` assignment combines a read of the
+/// `factor(...)` block `block` with a random effect (#1064).
+///
+/// This is the model-side half of "is there an η at a grouping coarser than or
+/// equal to the factor's" — the question @TeunP raised on #1063, and the one a
+/// rank check that only scanned for a fixed intercept would get wrong. The data
+/// side (do the factor's leading columns partition the subjects?) is answered
+/// by the binder; [`FactorContrast::Auto`] needs both.
+///
+/// Taint propagates through intermediate assignments, so the idiomatic
+///
+/// ```text
+///   TVPL = BASE + PLACEBO
+///   PL   = TVPL * exp(ETA_PL)
+/// ```
+///
+/// is recognised as sharing a scale, not just the single-line form. Nested
+/// `if`-branch assignments are walked too. The propagation is a fixpoint over
+/// assignment order, so a forward reference (not legal in this DSL anyway)
+/// cannot be missed by a single pass.
+fn factor_shares_scale_with_eta(stmts: &[Statement], block: &str) -> bool {
+    fn reads_block(e: &Expression, block: &str) -> bool {
+        let mut hit = false;
+        visit_expr_nodes(e, &mut |n| {
+            if let Expression::ThetaGather { spec, .. } = n {
+                hit |= spec.name == block;
+            }
+        });
+        hit
+    }
+    fn reads_eta(e: &Expression) -> bool {
+        let mut hit = false;
+        visit_expr_nodes(e, &mut |n| {
+            hit |= matches!(n, Expression::Eta(_));
+        });
+        hit
+    }
+    fn reads_tainted(e: &Expression, tainted: &[String]) -> bool {
+        let mut hit = false;
+        visit_expr_nodes(e, &mut |n| {
+            if let Expression::Variable(v) = n {
+                hit |= tainted.iter().any(|t| t == v);
+            }
+        });
+        hit
+    }
+    /// Every `(lhs, rhs)` assignment in source order, `if`-branches included.
+    fn assignments<'a>(stmts: &'a [Statement], out: &mut Vec<(&'a str, &'a Expression)>) {
+        for s in stmts {
+            match s {
+                Statement::Assign(n, e) => out.push((n.as_str(), e)),
+                Statement::If {
+                    branches,
+                    else_body,
+                } => {
+                    for (_, body) in branches {
+                        assignments(body, out);
+                    }
+                    if let Some(eb) = else_body {
+                        assignments(eb, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut assigns = Vec::new();
+    assignments(stmts, &mut assigns);
+    let mut tainted: Vec<String> = Vec::new();
+    loop {
+        let before = tainted.len();
+        for (lhs, rhs) in &assigns {
+            let touches_block = reads_block(rhs, block) || reads_tainted(rhs, &tainted);
+            if touches_block {
+                if reads_eta(rhs) {
+                    return true;
+                }
+                if !tainted.iter().any(|t| t == lhs) {
+                    tainted.push((*lhs).to_string());
+                }
+            }
+        }
+        if tainted.len() == before {
+            return false;
+        }
+    }
+}
+
 fn visit_stmt_nodes(stmts: &[Statement], f: &mut dyn FnMut(&Expression)) {
     for s in stmts {
         match s {

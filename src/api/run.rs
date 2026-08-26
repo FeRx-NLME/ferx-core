@@ -163,6 +163,17 @@ pub fn run_model_with_data_inits(
         data_path
     );
 
+    // #1064: a `theta NAME ~ factor(COL, ...)` block declares one θ per observed
+    // combination, so its level count is a property of the data. Bind it now —
+    // this synthesizes the per-record index column on every subject and
+    // re-parses the model with the real θ count — before anything reads
+    // `parsed.model`'s parameter vector.
+    {
+        let model_text = std::fs::read_to_string(model_path)
+            .map_err(|e| format!("Failed to re-read model file for factor binding: {e}"))?;
+        crate::api::bind_factor_thetas(&mut parsed, &model_text, &mut population)?;
+    }
+
     let init_params = build_init_params(&parsed);
     // Sync the resolved gradient method from fit_options onto the model so
     // `resolve_gradient_method` (which reads `model.gradient_method`) honours
@@ -762,6 +773,10 @@ fn undeclared_referenced(model: &CompiledModel, decls: &[CovariateDecl]) -> Vec<
     model
         .referenced_covariates
         .iter()
+        // A `factor(...)` index column (#1064) is synthesized by
+        // `bind_factor_thetas` after the read, never present in the CSV — asking
+        // the reader for it would fail on a column the user never wrote.
+        .filter(|c| !crate::api::factor::is_factor_index_column(c))
         .filter(|c| !decls.iter().any(|d| &d.name == *c))
         .cloned()
         .collect()

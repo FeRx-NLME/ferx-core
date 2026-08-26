@@ -71,8 +71,7 @@ pub fn fit_from_files(
     // Parse the full model so an authoritative `[covariates]` block is visible
     // here (the file's `[fit_options]` are still ignored — the caller's
     // `options` win, preserving historical behaviour).
-    let parsed = crate::parser::model_parser::parse_full_model_file(Path::new(model_path))?;
-    let mut model = parsed.model;
+    let mut parsed = crate::parser::model_parser::parse_full_model_file(Path::new(model_path))?;
     // A `[covariates]` declaration takes precedence over the explicit
     // `covariate_columns` argument; otherwise fall back to the argument (or
     // legacy auto-detect when both are absent).
@@ -80,8 +79,8 @@ pub fn fit_from_files(
     let sel_filter_fit = build_selection_filter_merged(&parsed.fit_options, &opts)?;
     let (data_path, data_path_warning) = resolve_data_path(parsed.data_path.as_deref(), data_path)?;
     let data_path = data_path.as_str();
-    let (population, covariate_table) = read_population_for(
-        &model,
+    let (mut population, covariate_table) = read_population_for(
+        &parsed.model,
         &parsed.covariate_decls,
         data_path,
         covariate_columns,
@@ -89,6 +88,15 @@ pub fn fit_from_files(
         sel_filter_fit.as_ref(),
         &parsed.column_map,
     )?;
+    // #1064: bind `factor(...)` blocks against the data before anything reads
+    // the parameter vector — the level count, and therefore `n_theta`, is a
+    // property of the dataset. Mirrors `run_model_with_data_inits`.
+    {
+        let model_text = std::fs::read_to_string(model_path)
+            .map_err(|e| format!("Failed to re-read model file for factor binding: {e}"))?;
+        crate::api::bind_factor_thetas(&mut parsed, &model_text, &mut population)?;
+    }
+    let mut model = parsed.model;
     model.bloq_method = opts.bloq_method;
     // SDE models have no analytic-sensitivity path — force FD.
     model.gradient_method =
@@ -198,6 +206,19 @@ pub fn fit(
     // is a no-op unless the user pinned `inner_optimizer`.
     crate::estimation::inner_optimizer::set_inner_optimizer(options.inner_optimizer);
     crate::estimation::inner_optimizer::set_ebe_warm_start(options.ebe_warm_start);
+    // #1064: a `theta NAME ~ factor(...)` block has no levels until it is bound
+    // to data. Fitting one unbound would gather out of an empty level table and
+    // predict NaN everywhere; refuse, and name the two ways out.
+    if !model.theta_blocks.unbound_factors().is_empty() {
+        return Err(format!(
+            "`theta {} ~ factor(...)` was never bound to data, so it has no levels. Fit \
+             through a file entry point (`fit_from_files`, `run_model_with_data`, or the \
+             CLI), which binds factor blocks against the dataset — or declare the block \
+             explicitly as `theta {}[N](...)` and index it with your own column.",
+            model.theta_blocks.unbound_factors().join("`, `theta "),
+            model.theta_blocks.unbound_factors()[0],
+        ));
+    }
     // Mixture models (#977). Phase 3 wires the K-fold log-sum-exp FOCE/FOCEI
     // objective via the derivative-free (BOBYQA) outer optimizer. Other
     // estimators, inter-occasion variability, and adaptive-Gauss-Hermite
