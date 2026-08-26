@@ -72,6 +72,53 @@ fn weight_summary(w: &[f64]) -> (f64, f64, f64, f64) {
 }
 
 /// Print NONMEM-style results to stderr
+/// Level count above which a vector / factor θ block (#1064) is reported as its
+/// own compact section instead of one entry per level in the θ table.
+///
+/// A four-level factor reads better inline, exactly as it did before the
+/// feature existed; an unstructured placebo effect with 800 levels would bury
+/// the structural parameters it exists to protect.
+pub(crate) const THETA_BLOCK_COMPACT_MIN: usize = 20;
+
+/// The θ index ranges of the large vector / factor blocks in `names`.
+///
+/// Blocks are recognised from the `NAME[level]` naming the parser assigns, which
+/// is unambiguous: a scalar θ name is `\w+`, so it can never contain a bracket.
+/// Levels of a block are contiguous by construction.
+pub(crate) fn compact_theta_blocks(names: &[String]) -> Vec<(String, std::ops::Range<usize>)> {
+    let block_of = |n: &String| -> Option<String> {
+        n.strip_suffix(']')
+            .and_then(|r| r.split_once('['))
+            .map(|(b, _)| b.to_string())
+    };
+    let mut out: Vec<(String, std::ops::Range<usize>)> = Vec::new();
+    let mut i = 0;
+    while i < names.len() {
+        let Some(block) = block_of(&names[i]) else {
+            i += 1;
+            continue;
+        };
+        let start = i;
+        while i < names.len() && block_of(&names[i]).as_deref() == Some(block.as_str()) {
+            i += 1;
+        }
+        if i - start >= THETA_BLOCK_COMPACT_MIN {
+            out.push((block, start..i));
+        }
+    }
+    out
+}
+
+/// `(min, median, max)` of a slice, for the compact block summary. The median
+/// is the lower of the two middle values on an even count — the levels are a
+/// nuisance block, not a quantity anyone interpolates.
+fn block_summary(values: &[f64]) -> (f64, f64, f64) {
+    let mut sorted: Vec<f64> = values.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let n = sorted.len();
+    (sorted[0], sorted[(n - 1) / 2], sorted[n - 1])
+}
+
 pub fn print_results(result: &FitResult) {
     eprintln!("\n{}", "=".repeat(60));
     eprintln!("NONLINEAR MIXED EFFECTS MODEL ESTIMATION");
@@ -110,6 +157,14 @@ pub fn print_results(result: &FitResult) {
     #[cfg(not(feature = "nn"))]
     let nn_theta_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
+    // #1064: a vector / factor θ block with hundreds of levels is a nuisance
+    // block — the point is what it absorbs, not the individual values. Keep it
+    // out of the main table and summarise it below, so the structural
+    // parameters it exists to protect stay readable.
+    let theta_blocks = compact_theta_blocks(&result.theta_names);
+    let blocked_theta_indices: std::collections::HashSet<usize> =
+        theta_blocks.iter().flat_map(|(_, r)| r.clone()).collect();
+
     // Theta estimates
     eprintln!("\n--- THETA Estimates ---");
     eprintln!(
@@ -118,7 +173,7 @@ pub fn print_results(result: &FitResult) {
     );
     eprintln!("{}", "-".repeat(52));
     for (i, name) in result.theta_names.iter().enumerate() {
-        if nn_theta_indices.contains(&i) {
+        if nn_theta_indices.contains(&i) || blocked_theta_indices.contains(&i) {
             continue;
         }
         let est = result.theta[i];
@@ -141,6 +196,23 @@ pub fn print_results(result: &FitResult) {
             }
         };
         eprintln!("{:<16} {:>12.6} {:>12} {:>10}", label, est, se_str, rse_str);
+    }
+
+    // Compact vector / factor θ block summary (#1064). Per-level estimates stay
+    // in the fit YAML's `theta_blocks:` list and in `result.theta`.
+    if !theta_blocks.is_empty() {
+        eprintln!("\n--- THETA BLOCKS ---");
+        for (block, range) in &theta_blocks {
+            let (mn, med, mx) = block_summary(&result.theta[range.clone()]);
+            eprintln!(
+                "{}  {} levels   min {:.4}  median {:.4}  max {:.4}",
+                block,
+                range.len(),
+                mn,
+                med,
+                mx
+            );
+        }
     }
 
     // Compact NN-weight summary block (Option E). Skipped when no
@@ -630,6 +702,11 @@ pub fn format_summary(result: &FitResult) -> String {
     #[cfg(not(feature = "nn"))]
     let nn_theta_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
+    // #1064: large vector / factor θ blocks get their own compact section.
+    let theta_blocks = compact_theta_blocks(&result.theta_names);
+    let blocked_theta_indices: std::collections::HashSet<usize> =
+        theta_blocks.iter().flat_map(|(_, r)| r.clone()).collect();
+
     // --- THETA ---
     let _ = writeln!(out, "\n--- THETA ---");
     let _ = writeln!(
@@ -638,7 +715,7 @@ pub fn format_summary(result: &FitResult) -> String {
         "Parameter", "Estimate", "SE", "%RSE"
     );
     for (i, name) in result.theta_names.iter().enumerate() {
-        if nn_theta_indices.contains(&i) {
+        if nn_theta_indices.contains(&i) || blocked_theta_indices.contains(&i) {
             continue;
         }
         let est = result.theta[i];
@@ -665,6 +742,21 @@ pub fn format_summary(result: &FitResult) -> String {
             "  {:<16} {:>12.6} {:>12} {:>8}",
             label, est, se_str, rse_str
         );
+    }
+    if !theta_blocks.is_empty() {
+        let _ = writeln!(out, "\n--- THETA BLOCKS ---");
+        for (block, range) in &theta_blocks {
+            let (mn, med, mx) = block_summary(&result.theta[range.clone()]);
+            let _ = writeln!(
+                out,
+                "  {}  {} levels   min {:.4}  median {:.4}  max {:.4}",
+                block,
+                range.len(),
+                mn,
+                med,
+                mx
+            );
+        }
     }
 
     // --- OMEGA ---
@@ -1786,9 +1878,17 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     #[cfg(not(feature = "nn"))]
     let nn_theta_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
+    // #1064: an unstructured-placebo block can carry hundreds of levels. Four
+    // keys each would bury the structural parameters under 3,200 lines of
+    // nuisance, so a large block is emitted below as a one-line-per-level list
+    // under `theta_blocks:` — still every estimate, just not as top-level keys.
+    let theta_blocks = compact_theta_blocks(&result.theta_names);
+    let blocked_theta_indices: std::collections::HashSet<usize> =
+        theta_blocks.iter().flat_map(|(_, r)| r.clone()).collect();
+
     writeln!(f, "\ntheta:").map_err(|e| e.to_string())?;
     for (i, name) in result.theta_names.iter().enumerate() {
-        if nn_theta_indices.contains(&i) {
+        if nn_theta_indices.contains(&i) || blocked_theta_indices.contains(&i) {
             continue;
         }
         let est = result.theta[i];
@@ -1811,6 +1911,42 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     writeln!(f, "    se: ~").map_err(|e| e.to_string())?;
                     writeln!(f, "    rse_pct: ~").map_err(|e| e.to_string())?;
                 }
+            }
+        }
+    }
+
+    if !theta_blocks.is_empty() {
+        writeln!(f, "\ntheta_blocks:").map_err(|e| e.to_string())?;
+        for (block, range) in &theta_blocks {
+            let (mn, med, mx) = block_summary(&result.theta[range.clone()]);
+            writeln!(f, "  {}:", block).map_err(|e| e.to_string())?;
+            writeln!(f, "    n_levels: {}", range.len()).map_err(|e| e.to_string())?;
+            writeln!(f, "    min: {:.6}", mn).map_err(|e| e.to_string())?;
+            writeln!(f, "    median: {:.6}", med).map_err(|e| e.to_string())?;
+            writeln!(f, "    max: {:.6}", mx).map_err(|e| e.to_string())?;
+            writeln!(f, "    levels:").map_err(|e| e.to_string())?;
+            for i in range.clone() {
+                let label = result.theta_names[i]
+                    .strip_prefix(&format!("{block}["))
+                    .and_then(|r| r.strip_suffix(']'))
+                    .unwrap_or(&result.theta_names[i]);
+                let se = result.se_theta.as_ref().map(|v| v[i]);
+                match se {
+                    Some(se) => writeln!(
+                        f,
+                        "      - {{ level: \"{}\", estimate: {:.6}, se: {:.6}, rse_pct: {:.2} }}",
+                        label,
+                        result.theta[i],
+                        se,
+                        rse_pct(result.theta[i], se)
+                    ),
+                    None => writeln!(
+                        f,
+                        "      - {{ level: \"{}\", estimate: {:.6}, se: ~, rse_pct: ~ }}",
+                        label, result.theta[i]
+                    ),
+                }
+                .map_err(|e| e.to_string())?;
             }
         }
     }

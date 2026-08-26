@@ -2401,3 +2401,156 @@ fn call_time_ode_tolerances_reach_the_absorption_twin() {
     assert_eq!(rso.abstol, 1e-13);
     assert_eq!(rso.max_steps, 4242);
 }
+
+// ── #1064: scale guardrails for models with hundreds of θ ──────────────────
+mod theta_block_scale_guards {
+    use crate::io::output::compact_theta_blocks;
+    use crate::types::{Optimizer, BOBYQA_MAX_DIM, COV_HESSIAN_MAX_DIM};
+
+    /// A gather model with `len` levels — an FD-gradient model by construction
+    /// (the analytic provider caps at `MAX_SCALE_AXES` axes).
+    fn wide_model(len: usize) -> crate::types::CompiledModel {
+        let content = format!(
+            r#"
+[parameters]
+  theta TVCL(2.0, 0.001, 10.0)
+  theta PLACEBO[{len}](0.5, -10.0, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02
+[individual_parameters]
+  CL = TVCL + PLACEBO[PLA_IDX]
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+        );
+        crate::parser::model_parser::parse_full_model(&content)
+            .unwrap()
+            .model
+    }
+
+    #[test]
+    fn free_packed_dim_counts_theta_omega_and_sigma() {
+        let model = wide_model(10);
+        // 12 θ + 1 Ω element + 1 σ.
+        assert_eq!(model.free_packed_dim(), 14);
+    }
+
+    #[test]
+    fn auto_keeps_bobyqa_at_ordinary_dimension() {
+        // The guard must not disturb the historical `auto` behaviour on the
+        // models everything else in this codebase is: `gradient = fd` removes
+        // the analytic gradient, so BOBYQA is what `auto` has always picked.
+        let mut model = wide_model(4);
+        model.gradient_method = crate::types::GradientMethod::Fd;
+        assert!(model.free_packed_dim() <= BOBYQA_MAX_DIM);
+        assert_eq!(
+            Optimizer::Auto.resolve_auto(&model, true),
+            Optimizer::Bobyqa,
+            "small models must be unaffected by the scale guard"
+        );
+    }
+
+    #[test]
+    fn auto_still_prefers_the_analytic_gradient_at_ordinary_dimension() {
+        // A small gather model keeps its exact analytic gradient, so `auto`
+        // resolves to the gradient-based optimizer exactly as it would without
+        // the block.
+        let model = wide_model(4);
+        assert_eq!(
+            Optimizer::Auto.resolve_auto(&model, true),
+            Optimizer::NloptLbfgs
+        );
+    }
+
+    #[test]
+    fn auto_refuses_bobyqa_above_the_dimension_threshold() {
+        // BOBYQA interpolates a quadratic over the whole space; at several
+        // hundred θ the interpolation set alone is the whole budget.
+        let model = wide_model(BOBYQA_MAX_DIM + 10);
+        assert!(model.free_packed_dim() > BOBYQA_MAX_DIM);
+        assert_eq!(
+            Optimizer::Auto.resolve_auto(&model, true),
+            Optimizer::NloptLbfgs
+        );
+    }
+
+    #[test]
+    fn an_explicit_optimizer_is_never_overridden_by_the_guard() {
+        let model = wide_model(BOBYQA_MAX_DIM + 10);
+        for opt in [
+            Optimizer::Bobyqa,
+            Optimizer::Slsqp,
+            Optimizer::Mma,
+            Optimizer::TrustRegion,
+        ] {
+            assert_eq!(opt.resolve_auto(&model, true), opt);
+        }
+    }
+
+    #[test]
+    fn a_wide_gather_model_bails_out_of_the_analytic_dual_ladder() {
+        // The `Dual2<M>` dispatch runs `1..=MAX_SCALE_AXES` axes. A
+        // several-hundred-θ block is past the table, and the contract there is
+        // a clean decline — the caller then finite-differences that subject —
+        // never a truncation to the first 24 axes, which would be a wrong
+        // gradient nothing else in the tree could contradict.
+        let model = wide_model(400);
+        let prog = model
+            .indiv_param_partials
+            .indiv_param_program
+            .as_ref()
+            .expect("program");
+        let theta = vec![1.0; model.n_theta];
+        let cov = std::collections::HashMap::from([("PLA_IDX".to_string(), 1.0)]);
+        assert!(crate::sens::ode_provider::param_derivatives_at_cov(
+            prog,
+            &model,
+            &cov,
+            &theta,
+            &[0.0]
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn a_narrow_gather_model_stays_in_analytic_sens_scope() {
+        // The gather itself must not knock a model out of scope — `∂f/∂θ_k`
+        // through it is exact under `Dual2` (pinned against finite differences
+        // in `sens::provider::tests::theta_gather_sens`).
+        let model = wide_model(3);
+        assert!(
+            crate::sens::provider::sens_supported(&model),
+            "a gather is analytically differentiable; only the axis count gates dispatch"
+        );
+    }
+
+    #[test]
+    fn cov_hessian_threshold_is_above_the_bobyqa_one() {
+        // The covariance step is quadratic in n where the optimizer is only
+        // linear, but it runs once — so it tolerates more, not less.
+        assert!(COV_HESSIAN_MAX_DIM > BOBYQA_MAX_DIM);
+    }
+
+    #[test]
+    fn compact_theta_blocks_finds_only_large_contiguous_blocks() {
+        let mut names = vec!["TVCL".to_string()];
+        names.extend((1..=30).map(|i| format!("PLACEBO[{i}]")));
+        names.push("TVV".to_string());
+        // A small block stays inline.
+        names.extend((1..=3).map(|i| format!("SMALL[{i}]")));
+        let blocks = compact_theta_blocks(&names);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].0, "PLACEBO");
+        assert_eq!(blocks[0].1, 1..31);
+    }
+
+    #[test]
+    fn compact_theta_blocks_ignores_a_model_with_no_blocks() {
+        let names = vec!["TVCL".to_string(), "TVV".to_string()];
+        assert!(compact_theta_blocks(&names).is_empty());
+    }
+}

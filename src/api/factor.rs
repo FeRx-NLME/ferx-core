@@ -411,7 +411,7 @@ fn write_index_column(
         }
     }
 
-    if !population.covariate_names.iter().any(|n| *n == column) {
+    if !population.covariate_names.contains(&column) {
         population.covariate_names.push(column);
     }
     Ok(())

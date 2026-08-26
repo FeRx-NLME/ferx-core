@@ -1371,6 +1371,43 @@ pub(crate) fn run_covariance_step_inner(
         eprintln!("{m}");
     }
     let mut warnings = Vec::new();
+    // #1064: at a few hundred free parameters the FD-of-OFV `R` matrix
+    // reconverges every subject's EBEs at each of n(n+1)/2 stencil points —
+    // ~320,000 population objectives at n = 800, which will not finish. Route a
+    // *defaulted* `Hessian` to the cross-product, which needs one pass; honour
+    // an explicit `covariance_method = r` but say what it is about to cost.
+    let scaled_options;
+    let options = {
+        let n = model.free_packed_dim();
+        if n > crate::types::COV_HESSIAN_MAX_DIM
+            && options.covariance_method == CovarianceMethod::Hessian
+        {
+            let stencil = n * (n + 1) / 2;
+            if options.covariance_method_set {
+                warnings.push(format!(
+                    "covariance_method = r with {n} free parameters: the R matrix is a \
+                     finite-difference Hessian that re-converges every subject's EBEs at each \
+                     of {stencil} stencil points. Set `covariance_method = s` (the score \
+                     cross-product, one pass) if this does not finish."
+                ));
+                options
+            } else {
+                warnings.push(format!(
+                    "{n} free parameters: the default covariance step (R = a \
+                     finite-difference Hessian) would need {stencil} re-converged objective \
+                     evaluations, so the score cross-product (`covariance_method = s`) was \
+                     used instead. Set `covariance_method = r` explicitly to force it."
+                ));
+                scaled_options = FitOptions {
+                    covariance_method: CovarianceMethod::CrossProduct,
+                    ..options.clone()
+                };
+                &scaled_options
+            }
+        } else {
+            options
+        }
+    };
     let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
     let cov_timer = std::time::Instant::now();
     let matrix = match compute_covariance(

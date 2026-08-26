@@ -3974,6 +3974,23 @@ impl CompiledModel {
         self.ruv_magnitude.as_ref().is_some_and(|m| m.is_active())
     }
 
+    /// Number of free coordinates the outer optimizer actually searches over:
+    /// unfixed θ, the Cholesky lower triangle of Ω, and unfixed σ (#1064).
+    ///
+    /// An estimate, not the packed vector's exact length — it is used only by
+    /// the scale guards ([`BOBYQA_MAX_DIM`], [`COV_HESSIAN_MAX_DIM`]), where
+    /// being one or two coordinates off across a threshold of 64 or 100 changes
+    /// nothing. What it must get right is the order of magnitude, which a model
+    /// with several hundred factor levels moves by two.
+    pub fn free_packed_dim(&self) -> usize {
+        let p = &self.default_params;
+        let n_theta = p.theta_fixed.iter().filter(|f| !**f).count();
+        let n_eta = self.n_eta + self.n_kappa;
+        let n_omega = n_eta * (n_eta + 1) / 2;
+        let n_sigma = p.sigma_fixed.iter().filter(|f| !**f).count();
+        n_theta + n_omega + n_sigma
+    }
+
     /// Whether any kappa carries a `weight = <expr>` modifier (#1031).
     #[inline]
     pub fn has_weighted_kappa(&self) -> bool {
@@ -5513,6 +5530,14 @@ pub struct FitOptions {
     /// (`S⁻¹`) and [`CovarianceMethod::Sandwich`] (`R⁻¹SR⁻¹`) add the per-subject
     /// score cross-product `S`; currently supported for FOCEI and IOV fits.
     pub covariance_method: CovarianceMethod,
+    /// Whether `covariance_method` was set explicitly rather than left at its
+    /// default. Exists only so the high-dimension routing guard (#1064) can
+    /// tell "the user asked for `MATRIX=R`" from "nobody said anything": at a
+    /// few hundred free parameters the FD-of-OFV `R` matrix reconverges every
+    /// subject's EBEs at each of `n(n+1)/2` stencil points, so a *defaulted*
+    /// `Hessian` routes to the cross-product and an explicit one is honoured
+    /// with a warning about the cost.
+    pub covariance_method_set: bool,
     pub interaction: bool,
     pub verbose: bool,
     /// Outer-loop (population parameter) optimizer. Defaults to
@@ -6022,6 +6047,7 @@ impl Default for FitOptions {
             fd_hessian_step: 1e-2,
             covariance_fallback: CovarianceFallback::None,
             covariance_method: CovarianceMethod::Hessian,
+            covariance_method_set: false,
             analytic_cov_hessian: true,
             interaction: true,
             verbose: true,
@@ -6287,6 +6313,17 @@ impl Optimizer {
         if self != Optimizer::Auto {
             return self;
         }
+        // #1064: BOBYQA builds a quadratic interpolation model of the whole
+        // parameter space. That is the right trade at the handful-of-parameters
+        // scale every other model in this codebase lives at, and hopeless at the
+        // several-hundred an unstructured-placebo MBMA model reaches — the
+        // interpolation set alone is O(n²) points before the first useful step.
+        // Above the threshold `auto` takes the gradient-based optimizer even
+        // though the gradient is finite-difference, because O(n) FD passes beat
+        // O(n²) interpolation.
+        if model.free_packed_dim() > BOBYQA_MAX_DIM {
+            return Optimizer::NloptLbfgs;
+        }
         // Use the single shared predicate so `auto` can never disagree with the
         // outer loop's actual gradient dispatch (#490 review): resolving to a
         // gradient-based optimizer while the loop ran FD would feed it a noisy
@@ -6298,6 +6335,24 @@ impl Optimizer {
         }
     }
 }
+
+/// Free packed dimension above which [`Optimizer::Auto`] refuses BOBYQA (#1064).
+///
+/// BOBYQA's interpolation set grows quadratically in the parameter count, so a
+/// derivative-free quadratic model stops being cheaper than a finite-difference
+/// gradient well before the several-hundred θ an unstructured-placebo MBMA model
+/// declares. 64 is the point past which the derivative-free model, rather than
+/// the objective, dominates the wall clock.
+pub const BOBYQA_MAX_DIM: usize = 64;
+
+/// Free packed dimension above which a *defaulted* `covariance_method = r`
+/// routes to the cross-product (#1064).
+///
+/// The `R` matrix is a finite-difference Hessian of the objective that
+/// reconverges every subject's EBEs at each of `n(n+1)/2` stencil points. At
+/// n = 100 that is ~5,000 reconverged population objectives; at n = 800 it is
+/// ~320,000, which will not finish. The cross-product `S` needs one pass.
+pub const COV_HESSIAN_MAX_DIM: usize = 100;
 
 /// Estimation method
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]

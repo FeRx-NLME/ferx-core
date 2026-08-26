@@ -638,6 +638,24 @@ pub fn fit(
 
     // Warn once (before the parallel section) that global_search only runs on start 0.
     let mut pre_warnings: Vec<String> = ltbs_warnings;
+    // #1064: `auto` switches away from BOBYQA above `BOBYQA_MAX_DIM` on its own
+    // (see `Optimizer::resolve_auto`); an explicit `optimizer = bobyqa` is the
+    // user's call, but it must not be a silent hour. BOBYQA interpolates a
+    // quadratic over the whole space, so the model it has to build grows
+    // quadratically in the parameter count.
+    {
+        let dim = model.free_packed_dim();
+        if options.optimizer == Optimizer::Bobyqa && dim > crate::types::BOBYQA_MAX_DIM {
+            pre_warnings.push(format!(
+                "optimizer = bobyqa with {dim} free parameters: BOBYQA builds a quadratic \
+                 interpolation model over the whole parameter space, which grows \
+                 quadratically in the parameter count and is unlikely to make progress at \
+                 this size. `optimizer = nlopt_lbfgs` (or the default `auto`, which switches \
+                 above {}) costs O(n) finite-difference passes instead.",
+                crate::types::BOBYQA_MAX_DIM
+            ));
+        }
+    }
     if options.global_search && n > 1 {
         pre_warnings.push(format!(
             "global_search = true with n_starts = {n}: CRS2-LM only runs on start 0 \

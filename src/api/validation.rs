@@ -292,6 +292,82 @@ pub(crate) fn check_residual_magnitude(
 /// pays for the other's work — the fatal list and the warning list are built by
 /// different entry points, and folding both into one function meant every fit
 /// walked every observation *and* every dose twice.
+/// Every `NAME[COLUMN]` gather index the data carries must be an integer level
+/// the block actually has (#1064).
+///
+/// This is the loud half of the gather's index policy. The evaluator's half is
+/// `NaN` — deliberately not `0.0`, since `x/0` already underflows to `0.0` here
+/// and a silent zero would be indistinguishable from a legitimately estimated
+/// level — but a NaN prediction reports as a failed fit, not as "your `PLA_IDX`
+/// column is 1-based and you wrote it 0-based". So the data is walked before the
+/// fit starts and the offending value named.
+///
+/// Only gathers whose index is a bare data column are checked; a computed index
+/// (`PLACEBO[2 * K]`) has no single column to walk and falls back to the NaN
+/// guard. At most one diagnostic is raised per (block, subject) — a mis-coded
+/// index column is wrong on every row, and 100k copies of the same finding help
+/// nobody.
+pub(crate) fn check_theta_gather_indices(
+    model: &CompiledModel,
+    population: &Population,
+) -> Vec<Diagnostic> {
+    if model.theta_blocks.is_empty() {
+        return Vec::new();
+    }
+    let mut diags = Vec::new();
+    for (block, column, n_levels) in model.theta_blocks.index_columns() {
+        for subj in &population.subjects {
+            // Observation rows first — a level is a property of an observation —
+            // then dose rows, which read the individual parameters too.
+            let rows = (0..subj.obs_times.len())
+                .map(|j| (subj.obs_times[j], subj.obs_cov(j)))
+                .chain((0..subj.doses.len()).map(|d| (subj.doses[d].time, subj.dose_cov(d))));
+            for (time, cov) in rows {
+                let Some(&raw) = cov.get(column) else {
+                    diags.push(
+                        Diagnostic::error(
+                            "E_THETA_GATHER_INDEX_MISSING",
+                            format!(
+                                "theta `{block}` is indexed by `{column}`, but subject `{}` \
+                                 carries no `{column}` value at TIME {time}. Every record that \
+                                 reads the block needs one.",
+                                subj.id
+                            ),
+                        )
+                        .with_block("individual_parameters"),
+                    );
+                    break;
+                };
+                let level = raw.round();
+                let ok = raw.is_finite()
+                    && (level - raw).abs() <= 1e-6
+                    && level >= 1.0
+                    && level as usize <= n_levels;
+                if !ok {
+                    diags.push(
+                        Diagnostic::error(
+                            "E_THETA_GATHER_INDEX_RANGE",
+                            format!(
+                                "theta `{block}` has {n_levels} levels, but its index column \
+                                 `{column}` is {raw} on subject `{}` at TIME {time}. The index \
+                                 is 1-based and must be a whole number in 1..={n_levels}.",
+                                subj.id
+                            ),
+                        )
+                        .with_block("individual_parameters")
+                        .with_suggestion(format!(
+                            "check that `{column}` is 1-based (not 0-based) and that \
+                             `theta {block}[N]` declares enough levels"
+                        )),
+                    );
+                    break;
+                }
+            }
+        }
+    }
+    diags
+}
+
 pub(crate) fn check_kappa_weights(
     model: &CompiledModel,
     population: &Population,
@@ -448,6 +524,7 @@ pub(crate) fn check_simulation_data(
 ) -> Vec<Diagnostic> {
     let mut diags = check_covariates(model, population);
     diags.extend(check_kappa_weights(model, population));
+    diags.extend(check_theta_gather_indices(model, population));
     diags.extend(check_residual_magnitude(model, population));
     diags
 }
@@ -480,6 +557,7 @@ pub fn check_model_data_rule(
     // surfaced by `check_model_data_warnings` so `fit()` reports it too (this
     // list is consumed error-first by `first_error`).
     diags.extend(check_kappa_weights(model, population));
+    diags.extend(check_theta_gather_indices(model, population));
     diags.extend(check_iov_occasions(model, population, iov_rule));
     diags.extend(check_absorption_dosing(model, population));
     diags.extend(check_modeled_dose_rates(model, population));

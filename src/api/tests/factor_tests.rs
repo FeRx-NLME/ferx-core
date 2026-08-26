@@ -472,3 +472,151 @@ fn eta_sharing_is_detected_through_an_intermediate_assignment() {
     let model = bind(text, &mut pop).unwrap();
     assert_eq!(model.n_theta, 2 + 4, "within-study sum-to-zero");
 }
+
+// ── #1064: the loud half of the gather index policy ─────────────────────────
+mod theta_gather_index_check {
+    use crate::api::validation::check_theta_gather_indices;
+    use crate::types::{DoseEvent, Population, Subject};
+    use std::collections::HashMap;
+
+    fn model(levels: usize) -> crate::types::CompiledModel {
+        let content = format!(
+            r#"
+[parameters]
+  theta TVCL(2.0, 0.001, 10.0)
+  theta PLACEBO[{levels}](0.5, -10.0, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02
+[individual_parameters]
+  CL = TVCL + PLACEBO[PLA_IDX]
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+        );
+        crate::parser::model_parser::parse_full_model(&content)
+            .unwrap()
+            .model
+    }
+
+    /// One subject whose `PLA_IDX` takes each of `indices` in turn.
+    fn population(indices: &[f64]) -> Population {
+        let n = indices.len();
+        let mut covariates = HashMap::new();
+        covariates.insert("PLA_IDX".to_string(), indices[0]);
+        let subject = Subject {
+            id: "1".to_string(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: (1..=n).map(|t| t as f64).collect(),
+            obs_raw_times: Vec::new(),
+            observations: vec![1.0; n],
+            obs_cmts: vec![1; n],
+            covariates: covariates.clone(),
+            dose_covariates: vec![covariates],
+            obs_covariates: indices
+                .iter()
+                .map(|&i| HashMap::from([("PLA_IDX".to_string(), i)]))
+                .collect(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; n],
+            occasions: Vec::new(),
+            obs_l2: Vec::new(),
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: Vec::new(),
+        };
+        Population {
+            subjects: vec![subject],
+            covariate_names: vec!["PLA_IDX".to_string()],
+            dv_column: "DV".to_string(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn valid_indices_produce_no_diagnostic() {
+        let diags = check_theta_gather_indices(&model(4), &population(&[1.0, 2.0, 3.0, 4.0]));
+        assert!(diags.is_empty(), "unexpected: {diags:?}");
+    }
+
+    #[test]
+    fn a_zero_based_index_column_is_caught() {
+        // The single most likely user error, and one the NaN guard alone would
+        // report as "the fit diverged".
+        let diags = check_theta_gather_indices(&model(4), &population(&[0.0, 1.0, 2.0, 3.0]));
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "E_THETA_GATHER_INDEX_RANGE");
+        assert!(diags[0].message.contains("1-based"), "{}", diags[0].message);
+    }
+
+    #[test]
+    fn an_index_past_the_declared_level_count_is_caught() {
+        let diags = check_theta_gather_indices(&model(3), &population(&[1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "E_THETA_GATHER_INDEX_RANGE");
+        assert!(
+            diags[0].message.contains("has 3 levels"),
+            "{}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn a_non_integer_index_is_caught() {
+        let diags = check_theta_gather_indices(&model(4), &population(&[1.0, 2.5, 3.0]));
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "E_THETA_GATHER_INDEX_RANGE");
+    }
+
+    #[test]
+    fn a_missing_index_column_is_caught() {
+        let mut pop = population(&[1.0, 2.0]);
+        for m in pop.subjects[0].obs_covariates.iter_mut() {
+            m.remove("PLA_IDX");
+        }
+        pop.subjects[0].covariates.remove("PLA_IDX");
+        pop.subjects[0].dose_covariates[0].remove("PLA_IDX");
+        let diags = check_theta_gather_indices(&model(4), &pop);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "E_THETA_GATHER_INDEX_MISSING");
+    }
+
+    #[test]
+    fn one_diagnostic_per_subject_not_one_per_row() {
+        // A mis-coded index column is wrong on every row; 100k copies of the
+        // same finding help nobody.
+        let diags = check_theta_gather_indices(&model(2), &population(&[7.0; 50]));
+        assert_eq!(diags.len(), 1);
+    }
+
+    #[test]
+    fn a_model_with_no_blocks_short_circuits() {
+        let plain = crate::parser::model_parser::parse_full_model(
+            r#"
+[parameters]
+  theta TVCL(2.0, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#,
+        )
+        .unwrap()
+        .model;
+        assert!(plain.theta_blocks.is_empty());
+        assert!(check_theta_gather_indices(&plain, &population(&[1.0])).is_empty());
+    }
+}

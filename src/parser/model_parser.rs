@@ -7135,6 +7135,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                     ));
                 }
             };
+            opts.covariance_method_set = true;
         }
         "fd_hessian_step" => opts.fd_hessian_step = parse_pos_finite("fd_hessian_step")?,
         "verbose" => opts.verbose = parse_bool("verbose")?,
@@ -12428,10 +12429,6 @@ fn parse_parameters(
                 name,
                 columns,
                 contrast: binding.map(|b| b.contrast).unwrap_or(contrast),
-                init,
-                lower,
-                upper,
-                fixed,
                 shares_scale_with_eta: false,
                 index_covariate,
             });
@@ -15205,10 +15202,6 @@ pub struct FactorThetaDecl {
     /// named `TIME` is the record time, not a covariate.
     pub(crate) columns: Vec<String>,
     pub(crate) contrast: FactorContrast,
-    pub(crate) init: f64,
-    pub(crate) lower: f64,
-    pub(crate) upper: f64,
-    pub(crate) fixed: bool,
     /// Set by the parse: some `[individual_parameters]` statement reads this
     /// block *and* a random effect. [`FactorContrast::Auto`] consumes it — it
     /// is the "is there an η at a grouping coarser than or equal to the
