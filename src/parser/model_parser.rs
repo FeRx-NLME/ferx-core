@@ -4434,6 +4434,26 @@ fn parse_derived_block(
                              aggregate over rows cannot be combined into a larger expression."
                         ));
                     }
+                    // Only `args[0]` (the value) and `args[1]` (the row filter) are
+                    // read below, so a third argument used to be dropped in silence —
+                    // the same class of bug as the trailing-token drop just above.
+                    // Reject it, and point at what the extra argument usually means:
+                    // a two-sided bound is `clamp`, not a three-argument `min`/`max`
+                    // (#1092). The `parse_atom` path already says this; say it here
+                    // too, since a statement-top-level `min`/`max` in `[derived]`
+                    // never reaches that path.
+                    if args.len() > 2 {
+                        let hint = if fname_lc == "tmax" {
+                            ""
+                        } else {
+                            " — a two-sided bound is `clamp(x, lo, hi)`"
+                        };
+                        return Err(format!(
+                            "[derived] `{name}`: `{fname_lc}(…)` takes at most two arguments (a \
+                             value and an optional row filter), but {} were found{hint}.",
+                            args.len()
+                        ));
+                    }
                     let agg_fn = match fname_lc.as_str() {
                         "max" => AggFunction::Max,
                         "min" => AggFunction::Min,
@@ -19797,7 +19817,8 @@ fn parse_atom(
                             ));
                         }
                         // An inverted *literal* interval can only be a typo: the
-                        // desugaring below would return `lo` for every `x`, quietly.
+                        // desugaring below never returns `x` at all, quietly handing
+                        // back `lo` below the crossing and `hi` above it.
                         // Non-literal bounds are left alone rather than paying an
                         // ordering test on every evaluation of every clamp.
                         if let (Expression::Literal(lo), Expression::Literal(hi)) = (&arg2, &arg3) {
@@ -19813,8 +19834,20 @@ fn parse_atom(
                         //   `clamp(x, lo, hi)` → `if (x <= lo) lo else if (x >= hi) hi else x`
                         // `Expression::Conditional` is already evaluated,
                         // bytecode-compiled, `Dual2`-differentiated and index-resolved
-                        // everywhere in the pipeline, so `clamp` inherits all of it and
-                        // cannot drift from the `min(max(x, lo), hi)` it replaces.
+                        // everywhere in the pipeline, so `clamp` inherits all of it.
+                        // On every *finite* `x` it returns bit-for-bit what the
+                        // `min(max(x, lo), hi)` it replaces returns. The two forms are
+                        // deliberately not identical where no branch test can be true:
+                        // a NaN `x` fails both `<=` and `>=`, so `clamp` falls through
+                        // to `x` and propagates the NaN, while the nested form's `max`
+                        // takes its `else` and pins the result to `lo`. Propagating is
+                        // the wanted behaviour — a NaN readout silently bounded to `lo`
+                        // is a wrong number that survives into the OFV, where a NaN
+                        // does not. The same branch choice puts the derivative at 0
+                        // *on* each bound where the nested form passes 1 through; both
+                        // conventions are pinned in
+                        // `clamp_derivative_convention_on_the_bounds` and
+                        // `clamp_propagates_nan_where_nested_pins_to_lo`.
                         // `x` lands in the tree three times (`lo` and `hi` twice each) —
                         // the same cost as writing the nested form by hand, so clamp a
                         // *named* value rather than a long expression.

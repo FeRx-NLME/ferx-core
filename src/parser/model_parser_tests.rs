@@ -12053,11 +12053,13 @@ fn parse_indexed_expr(src: &str) -> Expression {
     expr
 }
 
-/// `clamp(x, lo, hi)` is defined as the nested form it replaces, so the two must
-/// agree everywhere — including *on* both bounds, where the branch taken decides
-/// which of two equal values is returned.
+/// `clamp(x, lo, hi)` is defined as the nested form it replaces, so on every
+/// finite `x` the two must agree — including *on* both bounds, where the branch
+/// taken decides which of two equal values is returned. (`NaN` is the one input
+/// where they deliberately part; see
+/// `clamp_propagates_nan_where_nested_pins_to_lo`.)
 #[test]
-fn clamp_matches_nested_min_max_everywhere() {
+fn clamp_matches_nested_min_max_on_every_finite_x() {
     let clamped = parse_indexed_expr("clamp(X, 0.01, 0.99)");
     let nested = parse_indexed_expr("min(max(X, 0.01), 0.99)");
     let nn: Vec<Vec<f64>> = Vec::new();
@@ -12072,6 +12074,36 @@ fn clamp_matches_nested_min_max_everywhere() {
         );
         assert_eq!(a, x.clamp(0.01, 0.99), "at x = {x}");
     }
+}
+
+/// The one input where `clamp` and `min(max(..))` part company, pinned so the
+/// divergence stays a decision rather than an accident. `NaN` fails both
+/// `x <= lo` and `x >= hi`, so `clamp` falls through to `x` and propagates it;
+/// the nested form's `max` sees `x >= lo` false and returns the bound, and the
+/// outer `min` keeps it — so a `NaN` readout comes back silently pinned to `lo`.
+/// Propagating is what we want: a `NaN` reaches the OFV, where it is caught.
+#[test]
+fn clamp_propagates_nan_where_nested_pins_to_lo() {
+    let clamped = parse_indexed_expr("clamp(X, 0.01, 0.99)");
+    let nested = parse_indexed_expr("min(max(X, 0.01), 0.99)");
+    let nn: Vec<Vec<f64>> = Vec::new();
+    let vars = [f64::NAN, 0.0];
+    assert!(
+        eval_expression_indexed(&clamped, &[], &[], &[], &vars, &nn).is_nan(),
+        "clamp must propagate a NaN input"
+    );
+    assert_eq!(
+        eval_expression_indexed(&nested, &[], &[], &[], &vars, &nn),
+        0.01,
+        "the nested form pins a NaN to `lo` — the behaviour clamp does not copy"
+    );
+    // The bytecode VM takes the same branches as the AST evaluator.
+    let bc = compile_bytecode(&clamped);
+    let mut stack: Vec<f64> = Vec::new();
+    assert!(
+        eval_bytecode_g::<f64>(&bc, &[], &[], &[], &vars, &nn, &mut stack).is_nan(),
+        "the compiled clamp must propagate a NaN too"
+    );
 }
 
 /// The desugared tree compiles: the bytecode VM and the AST evaluator must agree
@@ -12210,8 +12242,9 @@ fn test_clamp_arity_diagnostics() {
     );
 }
 
-/// `clamp(x, 0.9, 0.1)` would quietly return `0.9` for every `x`. With both
-/// bounds literal that can only be a typo, so it is a parse error; bounds that
+/// `clamp(x, 0.9, 0.1)` would never return `x` at all — quietly handing back
+/// `0.9` below the crossing and `0.1` above it. With both bounds literal that
+/// can only be a typo, so it is a parse error; bounds that
 /// are not both literals are left to run rather than paying an ordering test on
 /// every evaluation.
 #[test]
@@ -15259,6 +15292,33 @@ fn parse_derived_clamp_is_unambiguous() {
     assert_eq!(eval_one("X = clamp(V, 2.0, 50.0)"), 10.0);
     // Still an expression, not a call: trailing operators are honoured.
     assert_eq!(eval_one("X = clamp(CL, 2.0, 5.0) * 3"), 6.0);
+}
+
+/// A third argument to a statement-top-level `[derived]` aggregate used to be
+/// dropped in silence — `args[2..]` is never read — so `max(IPRED, TIME > 0, Q)`
+/// computed `max(IPRED, TIME > 0)`. Reject it, and name `clamp` for `min`/`max`,
+/// which is what the extra argument usually means (#1092).
+#[test]
+fn parse_derived_aggregate_rejects_a_third_argument() {
+    for (derived, names_clamp) in [
+        ("CMAX = max(IPRED, TIME > 0, 99)", true),
+        ("CMIN = min(IPRED, TIME > 0, 99)", true),
+        ("TP = tmax(IPRED, TIME > 0, 99)", false),
+    ] {
+        let src = minimal_model_with_derived(derived);
+        let err = parse_full_model(&src)
+            .err()
+            .unwrap_or_else(|| panic!("a third argument must be rejected: `{derived}`"));
+        assert!(
+            err.contains("at most two arguments"),
+            "expected the aggregate arity error for `{derived}`, got: {err}"
+        );
+        assert_eq!(
+            err.contains("clamp(x, lo, hi)"),
+            names_clamp,
+            "only `min`/`max` should point at clamp: `{derived}` gave: {err}"
+        );
+    }
 }
 
 /// A second argument that *is* a comparison keeps meaning the row filter.

@@ -399,7 +399,7 @@ above), the dose-attribute double-use rejection sees through them, and the
 analytic-sensitivity path is unaffected. The one consequence of inlining is that
 an intermediate used twice is *evaluated* twice — which is exactly what writing
 it out by hand costs. Note that `min` / `max` count as two uses each (see below),
-so a two-sided clamp on a named value expands that value eight times — or three
+so a two-sided clamp on a named value expands that value four times — or three
 times written as `clamp(x, lo, hi)`.
 
 ### `min(a, b)`, `max(a, b)` and `clamp(x, lo, hi)`
@@ -423,8 +423,19 @@ On each bound the *bound* is returned, so the derivative there is zero. It puts 
 in the tree three times rather than the nested form's four, but the advice above is
 unchanged — clamp a named value, not a long expression. Any arity other than three
 is a parse error, and literal bounds the wrong way round (`clamp(x, 0.9, 0.1)`) are
-rejected rather than silently returning `0.9` for every `x`; bounds that are not both
-literals are not checked.
+rejected rather than silently returning a bound for every `x`; bounds that are not
+both literals are not checked.
+
+`clamp` differs from the nested pair in one place, deliberately: on a `NaN` input.
+`NaN` fails both `x <= lo` and `x >= hi`, so `clamp` falls through to `x` and the
+`NaN` propagates — into the prediction, and from there into the objective
+function, where it is caught. The nested `min(max(x, lo), hi)` instead returns
+`lo`, because `max`'s `x >= lo` is false for `NaN` and the `else` branch is the
+bound. So if you rewrite an existing `min`/`max` pair as `clamp` around a
+quantity that can go `NaN` — a `log` or `sqrt` of something that dips negative
+mid-search, say — that model was being quietly pinned to `lo`, and will now
+surface the `NaN` instead. That is the intended direction: a silently bounded
+`NaN` is a wrong number that fits.
 
 In `[derived]`, `min` / `max` also name the row aggregate (`max(IPRED, TIME > 0)` is
 "the largest `IPRED` over rows where `TIME > 0`"). The two are told apart by the
