@@ -115,7 +115,7 @@ applies to a fixture asserted against ferx's own predictor: it agrees with a wro
 answer by construction whenever both paths share the convention under test, so the
 external reference is what has to see both sides. Two engines are not automatically
 two references either — a cross-engine oracle only sees a defect *downstream* of the
-point where the engines part. #1079's kappa = 0 readout was catchable that way because
+point where the engines part. #1079's κ = 0 readout was catchable that way because
 each engine applies the readout itself, but the per-occasion snapshot feeding
 `ALAG`/`F`/`D{n}`/`R{n}` is built in `predict_iov` *before* the `ode_spec` branch, so
 both arms inherit it and an analytic-vs-ODE twin would agree on a wrong one. #1060
