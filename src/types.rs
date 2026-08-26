@@ -7,6 +7,7 @@ use std::collections::HashMap;
 // inner `Expression` AST stays parser-private — only `IndivParamPartials::empty`
 // and the `Debug`/`Clone` derives are reachable from outside the crate.
 pub use crate::parser::model_parser::IndivParamPartials;
+pub use crate::parser::model_parser::ThetaBlocks;
 
 /// How a dose's infusion `rate`/`duration` are determined.
 ///
@@ -3401,6 +3402,15 @@ pub enum GradientMethod {
 }
 
 impl CompiledModel {
+    /// Vector and data-bound θ level blocks declared by `[parameters]`.
+    ///
+    /// This metadata lives behind the existing opaque `indiv_param_partials`
+    /// field so the feature remains compatible with external `CompiledModel`
+    /// struct literals.
+    pub fn theta_blocks(&self) -> &ThetaBlocks {
+        &self.indiv_param_partials.theta_blocks
+    }
+
     /// Returns true when this model uses ODE integration; false for analytical PK.
     pub fn is_ode_based(&self) -> bool {
         self.ode_spec.is_some()
@@ -3968,6 +3978,21 @@ impl CompiledModel {
     #[inline]
     pub fn has_custom_ruv_magnitude(&self) -> bool {
         self.ruv_magnitude.as_ref().is_some_and(|m| m.is_active())
+    }
+
+    /// Exact number of free coordinates the outer optimizer searches over.
+    /// This uses the same packed FIX and structural-zero masks as estimation,
+    /// including diagonal/separate BSV and IOV blocks and mixture overrides.
+    pub fn free_packed_dim(&self) -> usize {
+        let p = &self.default_params;
+        let fixed = crate::estimation::parameterization::packed_fixed_mask(p);
+        let structural = crate::estimation::parameterization::omega_structural_zero_mask(p);
+        debug_assert_eq!(fixed.len(), structural.len());
+        fixed
+            .iter()
+            .zip(structural.iter())
+            .filter(|(is_fixed, is_structural)| !**is_fixed && !**is_structural)
+            .count()
     }
 
     /// Whether any kappa carries a `weight = <expr>` modifier (#1031).
@@ -5520,6 +5545,14 @@ pub struct FitOptions {
     /// (`S⁻¹`) and [`CovarianceMethod::Sandwich`] (`R⁻¹SR⁻¹`) add the per-subject
     /// score cross-product `S`; currently supported for FOCEI and IOV fits.
     pub covariance_method: CovarianceMethod,
+    /// Whether `covariance_method` was set explicitly rather than left at its
+    /// default. Exists only so the high-dimension routing guard (#1064) can
+    /// tell "the user asked for `MATRIX=R`" from "nobody said anything": at a
+    /// few hundred free parameters the FD-of-OFV `R` matrix reconverges every
+    /// subject's EBEs at each of `n(n+1)/2` stencil points, so a *defaulted*
+    /// `Hessian` routes to the cross-product and an explicit one is honoured
+    /// with a warning about the cost.
+    pub covariance_method_set: bool,
     pub interaction: bool,
     pub verbose: bool,
     /// Outer-loop (population parameter) optimizer. Defaults to
@@ -6030,6 +6063,7 @@ impl Default for FitOptions {
             fd_hessian_step: 1e-2,
             covariance_fallback: CovarianceFallback::None,
             covariance_method: CovarianceMethod::Hessian,
+            covariance_method_set: false,
             analytic_cov_hessian: true,
             interaction: true,
             verbose: true,
@@ -6295,6 +6329,17 @@ impl Optimizer {
         if self != Optimizer::Auto {
             return self;
         }
+        // #1064: BOBYQA builds a quadratic interpolation model of the whole
+        // parameter space. That is the right trade at the handful-of-parameters
+        // scale every other model in this codebase lives at, and hopeless at the
+        // several-hundred an unstructured-placebo MBMA model reaches — the
+        // interpolation set alone is O(n²) points before the first useful step.
+        // Above the threshold `auto` takes the gradient-based optimizer even
+        // though the gradient is finite-difference, because O(n) FD passes beat
+        // O(n²) interpolation.
+        if model.free_packed_dim() > BOBYQA_MAX_DIM {
+            return Optimizer::NloptLbfgs;
+        }
         // Use the single shared predicate so `auto` can never disagree with the
         // outer loop's actual gradient dispatch (#490 review): resolving to a
         // gradient-based optimizer while the loop ran FD would feed it a noisy
@@ -6306,6 +6351,24 @@ impl Optimizer {
         }
     }
 }
+
+/// Free packed dimension above which [`Optimizer::Auto`] refuses BOBYQA (#1064).
+///
+/// BOBYQA's interpolation set grows quadratically in the parameter count, so a
+/// derivative-free quadratic model stops being cheaper than a finite-difference
+/// gradient well before the several-hundred θ an unstructured-placebo MBMA model
+/// declares. 64 is the point past which the derivative-free model, rather than
+/// the objective, dominates the wall clock.
+pub const BOBYQA_MAX_DIM: usize = 64;
+
+/// Free packed dimension above which a *defaulted* `covariance_method = r`
+/// routes to the cross-product (#1064).
+///
+/// The `R` matrix is a finite-difference Hessian of the objective that
+/// reconverges every subject's EBEs at each of `n(n+1)/2` stencil points. At
+/// n = 100 that is ~5,000 reconverged population objectives; at n = 800 it is
+/// ~320,000, which will not finish. The cross-product `S` needs one pass.
+pub const COV_HESSIAN_MAX_DIM: usize = 100;
 
 /// Estimation method
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]

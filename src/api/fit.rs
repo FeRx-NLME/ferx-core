@@ -71,8 +71,7 @@ pub fn fit_from_files(
     // Parse the full model so an authoritative `[covariates]` block is visible
     // here (the file's `[fit_options]` are still ignored — the caller's
     // `options` win, preserving historical behaviour).
-    let parsed = crate::parser::model_parser::parse_full_model_file(Path::new(model_path))?;
-    let mut model = parsed.model;
+    let mut parsed = crate::parser::model_parser::parse_full_model_file(Path::new(model_path))?;
     // A `[covariates]` declaration takes precedence over the explicit
     // `covariate_columns` argument; otherwise fall back to the argument (or
     // legacy auto-detect when both are absent).
@@ -80,8 +79,8 @@ pub fn fit_from_files(
     let sel_filter_fit = build_selection_filter_merged(&parsed.fit_options, &opts)?;
     let (data_path, data_path_warning) = resolve_data_path(parsed.data_path.as_deref(), data_path)?;
     let data_path = data_path.as_str();
-    let (population, covariate_table) = read_population_for(
-        &model,
+    let (mut population, covariate_table) = read_population_for(
+        &parsed.model,
         &parsed.covariate_decls,
         data_path,
         covariate_columns,
@@ -89,6 +88,15 @@ pub fn fit_from_files(
         sel_filter_fit.as_ref(),
         &parsed.column_map,
     )?;
+    // #1064: bind level blocks against the data before anything reads
+    // the parameter vector — the level count, and therefore `n_theta`, is a
+    // property of the dataset. Mirrors `run_model_with_data_inits`.
+    {
+        let model_text = std::fs::read_to_string(model_path)
+            .map_err(|e| format!("Failed to re-read model file for level binding: {e}"))?;
+        crate::api::bind_theta_levels(&mut parsed, &model_text, &mut population)?;
+    }
+    let mut model = parsed.model;
     model.bloq_method = opts.bloq_method;
     // SDE models have no analytic-sensitivity path — force FD.
     model.gradient_method =
@@ -114,6 +122,31 @@ pub fn fit_from_files(
     result.data_hash = crate::io::hash::sha256_file(Path::new(data_path)).ok();
     result.model_text = std::fs::read_to_string(model_path).ok();
     Ok(result)
+}
+
+/// Warning for an explicit `optimizer = bobyqa` on a problem too large for it
+/// (#1064), or `None` when the choice is fine.
+///
+/// `auto` switches away from BOBYQA above [`BOBYQA_MAX_DIM`] on its own (see
+/// [`Optimizer::resolve_auto`]); an explicit `bobyqa` is the user's call and is
+/// honoured, but it must not be a silent hour. BOBYQA interpolates a quadratic
+/// over the whole parameter space, so the model it has to build grows
+/// quadratically in the parameter count.
+///
+/// A free function rather than an inline block so both branches are reachable
+/// from a unit test without running a fit with several hundred free parameters.
+pub(crate) fn bobyqa_scale_warning(optimizer: Optimizer, dim: usize) -> Option<String> {
+    if optimizer != Optimizer::Bobyqa || dim <= crate::types::BOBYQA_MAX_DIM {
+        return None;
+    }
+    Some(format!(
+        "optimizer = bobyqa with {dim} free parameters: BOBYQA builds a quadratic \
+         interpolation model over the whole parameter space, which grows \
+         quadratically in the parameter count and is unlikely to make progress at \
+         this size. `optimizer = nlopt_lbfgs` (or the default `auto`, which switches \
+         above {}) costs O(n) finite-difference passes instead.",
+        crate::types::BOBYQA_MAX_DIM
+    ))
 }
 
 /// Perturb initial parameters for multi-start optimisation.
@@ -198,6 +231,22 @@ pub fn fit(
     // is a no-op unless the user pinned `inner_optimizer`.
     crate::estimation::inner_optimizer::set_inner_optimizer(options.inner_optimizer);
     crate::estimation::inner_optimizer::set_ebe_warm_start(options.ebe_warm_start);
+    // #1064: a `theta NAME[...]` block has no levels until it is bound
+    // to data. Fitting one unbound would gather out of an empty level table and
+    // predict NaN everywhere; refuse, and name the two ways out.
+    if !model.theta_blocks().unbound_level_blocks().is_empty() {
+        return Err(format!(
+            "`theta {}[...]` was never bound to data, so it has no levels. Fit \
+             through a file entry point (`fit_from_files`, `run_model_with_data`, or the \
+             CLI), which binds level blocks against the dataset — or declare the block \
+             explicitly as `theta {}[N](...)` and index it with your own column.",
+            model
+                .theta_blocks()
+                .unbound_level_blocks()
+                .join("`, `theta "),
+            model.theta_blocks().unbound_level_blocks()[0],
+        ));
+    }
     // Mixture models (#977). Phase 3 wires the K-fold log-sum-exp FOCE/FOCEI
     // objective via the derivative-free (BOBYQA) outer optimizer. Other
     // estimators, inter-occasion variability, and adaptive-Gauss-Hermite
@@ -617,6 +666,9 @@ pub fn fit(
 
     // Warn once (before the parallel section) that global_search only runs on start 0.
     let mut pre_warnings: Vec<String> = ltbs_warnings;
+    if let Some(w) = bobyqa_scale_warning(options.optimizer, model.free_packed_dim()) {
+        pre_warnings.push(w);
+    }
     if options.global_search && n > 1 {
         pre_warnings.push(format!(
             "global_search = true with n_starts = {n}: CRS2-LM only runs on start 0 \
@@ -2270,4 +2322,45 @@ fn fit_inner(
     }
 
     Ok(fit_result)
+}
+
+#[cfg(test)]
+mod bobyqa_scale_warning_tests {
+    use super::bobyqa_scale_warning;
+    use crate::types::{Optimizer, BOBYQA_MAX_DIM};
+
+    #[test]
+    fn no_warning_at_or_below_the_threshold() {
+        assert!(bobyqa_scale_warning(Optimizer::Bobyqa, BOBYQA_MAX_DIM).is_none());
+        assert!(bobyqa_scale_warning(Optimizer::Bobyqa, 1).is_none());
+    }
+
+    #[test]
+    fn an_explicit_bobyqa_above_the_threshold_warns() {
+        let w = bobyqa_scale_warning(Optimizer::Bobyqa, BOBYQA_MAX_DIM + 1)
+            .expect("an explicit bobyqa at this size must not be a silent hour");
+        assert!(w.contains("optimizer = bobyqa"), "{w}");
+        assert!(
+            w.contains("nlopt_lbfgs"),
+            "the message must name the way out: {w}"
+        );
+    }
+
+    #[test]
+    fn other_optimizers_are_never_warned_about() {
+        // `auto` resolves itself (see `Optimizer::resolve_auto`); the rest are
+        // gradient-based and cost O(n).
+        for opt in [
+            Optimizer::Auto,
+            Optimizer::NloptLbfgs,
+            Optimizer::Slsqp,
+            Optimizer::Mma,
+            Optimizer::TrustRegion,
+        ] {
+            assert!(
+                bobyqa_scale_warning(opt, BOBYQA_MAX_DIM * 10).is_none(),
+                "{opt:?} must not warn"
+            );
+        }
+    }
 }

@@ -292,6 +292,113 @@ pub(crate) fn check_residual_magnitude(
 /// pays for the other's work — the fatal list and the warning list are built by
 /// different entry points, and folding both into one function meant every fit
 /// walked every observation *and* every dose twice.
+/// A `theta NAME[...]` block that was never bound to data has no
+/// levels, so every gather out of it is `NaN` (#1064).
+///
+/// `fit()` refuses such a model up front with its own message; this is the same
+/// guard for the simulate paths, which do not go through `fit()`. Binding
+/// happens in `api::levels::bind_theta_levels`, which every file entry point
+/// calls — an in-memory caller that assembled the `CompiledModel` itself is the
+/// case this catches.
+pub(crate) fn check_unbound_theta_levels(model: &CompiledModel) -> Vec<Diagnostic> {
+    model
+        .theta_blocks()
+        .unbound_level_blocks()
+        .iter()
+        .map(|name| {
+            Diagnostic::error(
+                "E_THETA_LEVELS_UNBOUND",
+                format!(
+                    "`theta {name}[...]` was never bound to data, so it has no \
+                     levels and every value gathered from it is NaN."
+                ),
+            )
+            .with_block("parameters")
+            .with_suggestion(format!(
+                "run through a file entry point, which binds level blocks against the \
+                 dataset or the [simulation] design — or declare the block explicitly as \
+                 `theta {name}[N](...)` and index it with your own column"
+            ))
+        })
+        .collect()
+}
+
+/// Every `NAME[COLUMN]` gather index the data carries must be an integer level
+/// the block actually has (#1064).
+///
+/// This is the loud half of the gather's index policy. The evaluator's half is
+/// `NaN` — deliberately not `0.0`, since `x/0` already underflows to `0.0` here
+/// and a silent zero would be indistinguishable from a legitimately estimated
+/// level — but a NaN prediction reports as a failed fit, not as "your `PLA_IDX`
+/// column is 1-based and you wrote it 0-based". So the data is walked before the
+/// fit starts and the offending value named.
+///
+/// Only gathers whose index is a bare data column are checked; a computed index
+/// (`PLACEBO[2 * K]`) has no single column to walk and falls back to the NaN
+/// guard. At most one diagnostic is raised per (block, subject) — a mis-coded
+/// index column is wrong on every row, and 100k copies of the same finding help
+/// nobody.
+pub(crate) fn check_theta_gather_indices(
+    model: &CompiledModel,
+    population: &Population,
+) -> Vec<Diagnostic> {
+    if model.theta_blocks().is_empty() {
+        return Vec::new();
+    }
+    let mut diags = Vec::new();
+    for (block, column, n_levels) in model.theta_blocks().index_columns() {
+        for subj in &population.subjects {
+            // Observation rows first — a level is a property of an observation —
+            // then dose rows, which read the individual parameters too.
+            let rows = (0..subj.obs_times.len())
+                .map(|j| (subj.obs_times[j], subj.obs_cov(j)))
+                .chain((0..subj.doses.len()).map(|d| (subj.doses[d].time, subj.dose_cov(d))));
+            for (time, cov) in rows {
+                let Some(&raw) = cov.get(column) else {
+                    diags.push(
+                        Diagnostic::error(
+                            "E_THETA_GATHER_INDEX_MISSING",
+                            format!(
+                                "theta `{block}` is indexed by `{column}`, but subject `{}` \
+                                 carries no `{column}` value at TIME {time}. Every record that \
+                                 reads the block needs one.",
+                                subj.id
+                            ),
+                        )
+                        .with_block("individual_parameters"),
+                    );
+                    break;
+                };
+                let level = raw.round();
+                let ok = raw.is_finite()
+                    && (level - raw).abs() <= 1e-6
+                    && level >= 1.0
+                    && level as usize <= n_levels;
+                if !ok {
+                    diags.push(
+                        Diagnostic::error(
+                            "E_THETA_GATHER_INDEX_RANGE",
+                            format!(
+                                "theta `{block}` has {n_levels} levels, but its index column \
+                                 `{column}` is {raw} on subject `{}` at TIME {time}. The index \
+                                 is 1-based and must be a whole number in 1..={n_levels}.",
+                                subj.id
+                            ),
+                        )
+                        .with_block("individual_parameters")
+                        .with_suggestion(format!(
+                            "check that `{column}` is 1-based (not 0-based) and that \
+                             `theta {block}[N]` declares enough levels"
+                        )),
+                    );
+                    break;
+                }
+            }
+        }
+    }
+    diags
+}
+
 pub(crate) fn check_kappa_weights(
     model: &CompiledModel,
     population: &Population,
@@ -446,8 +553,10 @@ pub(crate) fn check_simulation_data(
     model: &CompiledModel,
     population: &Population,
 ) -> Vec<Diagnostic> {
-    let mut diags = check_covariates(model, population);
+    let mut diags = check_unbound_theta_levels(model);
+    diags.extend(check_covariates(model, population));
     diags.extend(check_kappa_weights(model, population));
+    diags.extend(check_theta_gather_indices(model, population));
     diags.extend(check_residual_magnitude(model, population));
     diags
 }
@@ -480,6 +589,7 @@ pub fn check_model_data_rule(
     // surfaced by `check_model_data_warnings` so `fit()` reports it too (this
     // list is consumed error-first by `first_error`).
     diags.extend(check_kappa_weights(model, population));
+    diags.extend(check_theta_gather_indices(model, population));
     diags.extend(check_iov_occasions(model, population, iov_rule));
     diags.extend(check_absorption_dosing(model, population));
     diags.extend(check_modeled_dose_rates(model, population));
@@ -3567,7 +3677,7 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
 
     // 1. Parse. A parse failure is terminal — without an AST there is nothing
     //    further to validate, so return a report carrying just that diagnostic.
-    let parsed = match parse_full_model_file(Path::new(model_path)) {
+    let mut parsed = match parse_full_model_file(Path::new(model_path)) {
         Ok(p) => p,
         Err(e) => {
             let data = data_path.map(|s| s.to_string());
@@ -3652,7 +3762,7 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
             None,
             &parsed.column_map,
         ) {
-            Ok((population, _table)) => {
+            Ok((mut population, _table)) => {
                 // Surface datareader warnings (ADDL missing II, IOV OCC missing)
                 // into the check report so `ferx check` sees the same findings as `fit()`.
                 // Through the shared filter, or the two would disagree on exactly the
@@ -3672,43 +3782,57 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
                     };
                     diags.push(Diagnostic::warning(code, w.clone()));
                 }
-                diags.extend(check_model_data_rule(
-                    &parsed.model,
-                    &population,
-                    &parsed.fit_options.iov_occasion,
-                ));
-                let init_params = parsed.model.default_params.clone();
-                diags.extend(check_model_data_warnings(
-                    &parsed.model,
-                    &population,
-                    &init_params,
-                ));
-                // Surface the structural absorption-closed-form rejects (IOV / SS / CMT≠1 /
-                // infusion / reset) so a clean `ferx check` and a `fit()` agree on transit /
-                // IG models — previously only `fit()` reported these (#776 review, IG #790).
-                // Model-family-specific code so an IG model reads `E_IG_*` not `E_TRANSIT_*`.
-                let is_ig = matches!(parsed.model.pk_model, PkModel::OneCptIg | PkModel::TwoCptIg);
-                if let Some(e) = check_absorption_closed_form_support(&parsed.model, &population) {
-                    let code = if is_ig {
-                        "E_IG_UNSUPPORTED"
-                    } else {
-                        "E_TRANSIT_UNSUPPORTED"
-                    };
-                    diags.push(Diagnostic::error(code, e));
-                }
-                // Twin-less flip-flop is a hard error, not a warning (#776): surface it the
-                // same way `fit()` does, so `ferx check` catches it up front.
-                if let Some(e) = check_absorption_flip_flop_no_twin(
-                    &parsed.model,
-                    &population,
-                    &init_params.theta,
-                ) {
-                    let code = if is_ig {
-                        "E_IG_FLIP_FLOP"
-                    } else {
-                        "E_TRANSIT_FLIP_FLOP"
-                    };
-                    diags.push(Diagnostic::error(code, e));
+                let binding = std::fs::read_to_string(model_path)
+                    .map_err(|e| format!("Failed to re-read model file for level binding: {e}"))
+                    .and_then(|model_text| {
+                        crate::api::bind_theta_levels(&mut parsed, &model_text, &mut population)
+                    });
+                if let Err(e) = binding {
+                    diags.push(
+                        Diagnostic::error("E_THETA_LEVEL_BINDING", e).with_block("parameters"),
+                    );
+                } else {
+                    diags.extend(check_model_data_rule(
+                        &parsed.model,
+                        &population,
+                        &parsed.fit_options.iov_occasion,
+                    ));
+                    let init_params = parsed.model.default_params.clone();
+                    diags.extend(check_model_data_warnings(
+                        &parsed.model,
+                        &population,
+                        &init_params,
+                    ));
+                    // Surface the structural absorption-closed-form rejects (IOV / SS / CMT≠1 /
+                    // infusion / reset) so a clean `ferx check` and a `fit()` agree on transit /
+                    // IG models — previously only `fit()` reported these (#776 review, IG #790).
+                    // Model-family-specific code so an IG model reads `E_IG_*` not `E_TRANSIT_*`.
+                    let is_ig =
+                        matches!(parsed.model.pk_model, PkModel::OneCptIg | PkModel::TwoCptIg);
+                    if let Some(e) =
+                        check_absorption_closed_form_support(&parsed.model, &population)
+                    {
+                        let code = if is_ig {
+                            "E_IG_UNSUPPORTED"
+                        } else {
+                            "E_TRANSIT_UNSUPPORTED"
+                        };
+                        diags.push(Diagnostic::error(code, e));
+                    }
+                    // Twin-less flip-flop is a hard error, not a warning (#776): surface it the
+                    // same way `fit()` does, so `ferx check` catches it up front.
+                    if let Some(e) = check_absorption_flip_flop_no_twin(
+                        &parsed.model,
+                        &population,
+                        &init_params.theta,
+                    ) {
+                        let code = if is_ig {
+                            "E_IG_FLIP_FLOP"
+                        } else {
+                            "E_TRANSIT_FLIP_FLOP"
+                        };
+                        diags.push(Diagnostic::error(code, e));
+                    }
                 }
             }
             Err(e) => {

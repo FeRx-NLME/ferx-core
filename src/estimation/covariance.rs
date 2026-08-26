@@ -1347,6 +1347,52 @@ pub(crate) struct CovStepOutcome {
     pub sir_fallback_proposal: Option<DMatrix<f64>>,
 }
 
+/// Which covariance estimator to actually assemble at `n` free coordinates, and
+/// the warning to record for the choice (#1064).
+///
+/// The `R` matrix is a finite-difference Hessian of the objective that
+/// re-converges every subject's EBEs at each of `n(n+1)/2` stencil points —
+/// ~320,000 re-converged population objectives at `n = 800`, which will not
+/// finish. Above [`COV_HESSIAN_MAX_DIM`] a *defaulted* `Hessian` is therefore
+/// routed to the cross-product, which needs one pass. An explicit
+/// `covariance_method = r` is the user's call and is honoured, but is told what
+/// it is about to cost.
+///
+/// Split out from [`run_covariance_step_inner`] so the three branches are
+/// reachable from a unit test: exercising them through the real covariance step
+/// would mean converging a fit with several hundred free parameters.
+pub(crate) fn scale_routed_covariance_method(
+    n: usize,
+    requested: CovarianceMethod,
+    explicitly_set: bool,
+) -> (CovarianceMethod, Option<String>) {
+    if n <= crate::types::COV_HESSIAN_MAX_DIM || requested != CovarianceMethod::Hessian {
+        return (requested, None);
+    }
+    let stencil = n * (n + 1) / 2;
+    if explicitly_set {
+        (
+            requested,
+            Some(format!(
+                "covariance_method = r with {n} free parameters: the R matrix is a \
+                 finite-difference Hessian that re-converges every subject's EBEs at each \
+                 of {stencil} stencil points. Set `covariance_method = s` (the score \
+                 cross-product, one pass) if this does not finish."
+            )),
+        )
+    } else {
+        (
+            CovarianceMethod::CrossProduct,
+            Some(format!(
+                "{n} free parameters: the default covariance step (R = a \
+                 finite-difference Hessian) would need {stencil} re-converged objective \
+                 evaluations, so the score cross-product (`covariance_method = s`) was \
+                 used instead. Set `covariance_method = r` explicitly to force it."
+            )),
+        )
+    }
+}
+
 /// The covariance step WITHOUT the `run_covariance_step` gate: timer + optional
 /// verbose line + `Success/Unusable/FailedNonPd` match. Contains NO floating-point
 /// arithmetic — it only wraps `compute_covariance`, so it cannot change any numeric
@@ -1371,6 +1417,27 @@ pub(crate) fn run_covariance_step_inner(
         eprintln!("{m}");
     }
     let mut warnings = Vec::new();
+    // #1064: route away from the FD-of-OFV `R` matrix when the problem is too
+    // large for it. The decision is a pure function so it can be unit-tested
+    // without standing up a several-hundred-parameter fit.
+    let scaled_options;
+    let (routed, scale_warning) = scale_routed_covariance_method(
+        model.free_packed_dim(),
+        options.covariance_method,
+        options.covariance_method_set,
+    );
+    if let Some(w) = scale_warning {
+        warnings.push(w);
+    }
+    let options = if routed == options.covariance_method {
+        options
+    } else {
+        scaled_options = FitOptions {
+            covariance_method: routed,
+            ..options.clone()
+        };
+        &scaled_options
+    };
     let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
     let cov_timer = std::time::Instant::now();
     let matrix = match compute_covariance(
@@ -1438,7 +1505,71 @@ mod tests {
     // (they reach the moved symbols via the cross-module import added there). The
     // `run_covariance_step` gate + match is exercised end-to-end by every
     // estimator finalizer's integration/lib tests.
-    use super::{diagnostic_omega, packed_param_label};
+    use super::{diagnostic_omega, packed_param_label, scale_routed_covariance_method};
+    use crate::types::{CovarianceMethod, COV_HESSIAN_MAX_DIM};
+
+    // ── #1064: routing the covariance step away from `R` at scale ───────────
+    //
+    // Exercised here rather than through `run_covariance_step_inner`, which
+    // would need a converged fit with several hundred free parameters.
+
+    #[test]
+    fn ordinary_dimensions_keep_the_requested_covariance_method() {
+        for method in [
+            CovarianceMethod::Hessian,
+            CovarianceMethod::CrossProduct,
+            CovarianceMethod::Sandwich,
+        ] {
+            for explicit in [false, true] {
+                let (routed, warning) =
+                    scale_routed_covariance_method(COV_HESSIAN_MAX_DIM, method, explicit);
+                assert_eq!(routed, method);
+                assert!(
+                    warning.is_none(),
+                    "no warning at the threshold: {warning:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_defaulted_hessian_routes_to_the_cross_product_at_scale() {
+        let n = COV_HESSIAN_MAX_DIM + 1;
+        let (routed, warning) = scale_routed_covariance_method(n, CovarianceMethod::Hessian, false);
+        assert_eq!(routed, CovarianceMethod::CrossProduct);
+        let warning = warning.expect("the substitution must be reported");
+        assert!(warning.contains("score cross-product"), "{warning}");
+        // The stencil count is the whole argument for switching, so it has to
+        // be in the message rather than left for the reader to work out.
+        assert!(
+            warning.contains(&(n * (n + 1) / 2).to_string()),
+            "message must name the stencil size: {warning}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_hessian_is_honoured_at_scale_but_warned_about() {
+        let n = COV_HESSIAN_MAX_DIM + 1;
+        let (routed, warning) = scale_routed_covariance_method(n, CovarianceMethod::Hessian, true);
+        assert_eq!(
+            routed,
+            CovarianceMethod::Hessian,
+            "an explicit `covariance_method = r` is the user's call"
+        );
+        let warning = warning.expect("the cost must still be reported");
+        assert!(warning.contains("covariance_method = r"), "{warning}");
+    }
+
+    #[test]
+    fn a_non_hessian_request_is_never_rerouted() {
+        // `s` and `rsr` already cost one pass; the guard has nothing to say.
+        for method in [CovarianceMethod::CrossProduct, CovarianceMethod::Sandwich] {
+            let (routed, warning) =
+                scale_routed_covariance_method(COV_HESSIAN_MAX_DIM * 8, method, false);
+            assert_eq!(routed, method);
+            assert!(warning.is_none());
+        }
+    }
 
     /// A variance mixture (per-class Ω/Σ overrides) so the packed vector carries
     /// the override tail. Packed order: [TVCL, TVV, MIXL, BWT | ω(ETA_CL) |

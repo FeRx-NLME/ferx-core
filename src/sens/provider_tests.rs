@@ -10963,3 +10963,165 @@ fn weighted_iov_kappa_gradient_is_the_unweighted_one_scaled() {
         assert!(ow.f.is_finite(), "obs {j} must be finite");
     }
 }
+
+// ── #1064: analytic sensitivities through a θ level gather ────────
+//
+// The gather is a new kernel in `eval_bytecode_g` — the `PkNum` bytecode path
+// the `Dual2` sensitivities run on — so it needs its own parity check against
+// central differences of the production `f64` predictor. A wrong gather
+// derivative would compile and run silently: there is no second copy of the
+// formula to disagree with it.
+mod theta_gather_sens {
+    use super::*;
+
+    fn gather_model(levels: usize) -> String {
+        format!(
+            r#"
+[parameters]
+  theta TVCL(10.0, 0.001, 100.0)
+  theta PLACEBO[{levels}](1.0, -10.0, 10.0)
+  theta TVV(50.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  sigma PROP_ERR ~ 0.02
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL) * PLACEBO[PLA_IDX]
+  V  = TVV * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+        )
+    }
+
+    /// A subject whose `PLA_IDX` is a per-observation covariate, so the gather
+    /// selects a different θ at every sample — the shape the feature exists for.
+    fn subject_with_levels(times: &[f64], levels: &[f64]) -> Subject {
+        let n = times.len();
+        let mut s = subject_with_dose(DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0), times);
+        s.covariates.insert("PLA_IDX".to_string(), levels[0]);
+        s.obs_covariates = levels
+            .iter()
+            .map(|&l| HashMap::from([("PLA_IDX".to_string(), l)]))
+            .collect();
+        s.dose_covariates = vec![HashMap::from([("PLA_IDX".to_string(), levels[0])])];
+        assert_eq!(s.obs_covariates.len(), n);
+        s
+    }
+
+    #[test]
+    fn gather_dual_matches_fd_on_a_constant_index() {
+        // Subject-constant index: the plain `Free` rule, no tv machinery.
+        let m = parse_model_string(&gather_model(3)).expect("parse");
+        assert!(
+            sens_supported(&m),
+            "a 6-axis gather model is inside the analytic scope"
+        );
+        let mut s = subject_with_dose(
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            &[0.5, 2.0, 6.0, 12.0, 24.0],
+        );
+        s.covariates.insert("PLA_IDX".to_string(), 2.0);
+        check_full_provider_vs_fd(&m, &s, &[10.0, 0.8, 1.3, 0.7, 50.0], &[0.10, -0.05]);
+    }
+
+    #[test]
+    fn gather_dual_matches_fd_when_the_index_moves_per_observation() {
+        let m = parse_model_string(&gather_model(3)).expect("parse");
+        let s = subject_with_levels(&[0.5, 2.0, 6.0, 12.0, 24.0], &[1.0, 2.0, 3.0, 1.0, 2.0]);
+        assert!(s.has_tv_covariates());
+        check_full_provider_vs_fd(&m, &s, &[10.0, 0.8, 1.3, 0.7, 50.0], &[0.10, -0.05]);
+    }
+
+    #[test]
+    fn a_gather_is_exactly_sparse_in_the_individual_parameter() {
+        // `∂p/∂θ_k` is 1 on the level the row selects and 0 on every other — the
+        // statically-known sparsity that makes hundreds of levels tractable.
+        //
+        // Note the scope: this is sparsity of the *individual parameter*, not of
+        // the prediction. Once a gathered parameter feeds a compartment model,
+        // a later observation depends on the levels that applied before it
+        // through the state, so `∂f_j/∂θ_k` is *not* row-sparse. The
+        // compartment-free (`$PRED`-shaped) MBMA model this feature serves has
+        // no such memory, which is why the design is sparse there.
+        let m = parse_model_string(&gather_model(3)).expect("parse");
+        let prog = m
+            .indiv_param_partials
+            .indiv_param_program
+            .as_ref()
+            .expect("program");
+        let theta = [10.0, 0.8, 1.3, 0.7, 50.0];
+        let eta = [0.10, -0.05];
+        for level in 1..=3usize {
+            let cov = HashMap::from([("PLA_IDX".to_string(), level as f64)]);
+            let pd =
+                crate::sens::ode_provider::param_derivatives_at_cov(prog, &m, &cov, &theta, &eta)
+                    .expect("in scope");
+            // Individual parameter 0 is CL, the one that reads the block.
+            for k in 1..=3usize {
+                let d = pd.dp_dtheta[0][k];
+                if k == level {
+                    assert!(
+                        d.abs() > 1e-9,
+                        "level {level} must depend on its own θ_{k}, got {d}"
+                    );
+                } else {
+                    assert_eq!(
+                        d, 0.0,
+                        "level {level} must not depend on θ_{k}, which it does not read"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_subject_touches_only_the_levels_its_records_read() {
+        // The per-subject sparsity Part B (#1064) will scope the outer gradient
+        // by: a subject that never reads level 3 has an identically zero
+        // gradient in that level's θ, on every one of its observations.
+        let m = parse_model_string(&gather_model(3)).expect("parse");
+        let s = subject_with_levels(&[1.0, 5.0, 20.0], &[1.0, 2.0, 1.0]);
+        let theta = [10.0, 0.8, 1.3, 0.7, 50.0];
+        let sens = subject_sensitivities(&m, &s, &theta, &[0.10, -0.05]).expect("supported");
+        for (j, grad) in sens.obs.iter().enumerate() {
+            assert_eq!(
+                grad.df_dtheta[3], 0.0,
+                "row {j} never reads level 3, so it must carry no gradient in it"
+            );
+            assert!(
+                grad.df_dtheta[1].abs() > 1e-12,
+                "row {j} is downstream of level 1, which it does read"
+            );
+        }
+    }
+
+    #[test]
+    fn a_block_wider_than_the_axis_ladder_bails_to_fd_rather_than_truncating() {
+        // `param_derivatives_at_cov` dispatches `Dual2<M>` over `1..=24` axes.
+        // A several-hundred-θ block is past the table, and the contract is a
+        // clean `None` — the caller then finite-differences that subject. A
+        // silent truncation to the first 24 axes would be a wrong gradient that
+        // nothing else in the tree could contradict.
+        let m = parse_model_string(&gather_model(60)).expect("parse");
+        let prog = m
+            .indiv_param_partials
+            .indiv_param_program
+            .as_ref()
+            .expect("program");
+        let theta = vec![1.0; m.n_theta];
+        let cov = HashMap::from([("PLA_IDX".to_string(), 1.0)]);
+        assert!(
+            crate::sens::ode_provider::param_derivatives_at_cov(
+                prog,
+                &m,
+                &cov,
+                &theta,
+                &[0.0, 0.0]
+            )
+            .is_none(),
+            "past the axis ladder the provider must decline, not truncate"
+        );
+    }
+}

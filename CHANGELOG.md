@@ -20,6 +20,21 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Theta level blocks — hundreds of fixed effects from one declaration (#1064).**
+  `theta PLACEBO[800](0.0, -10.0, 10.0)` declares 800 thetas sharing one init/bounds triple, read back
+  by a *gather* — `PL = PLACEBO[PLA_IDX]`, where `PLA_IDX` is a 1-based data column. The data-driven
+  form `theta PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)` — data columns in the brackets rather than a
+  count — instead declares one theta per **observed**
+  combination of the named columns, discovered when the data is bound, and reports them as
+  `PLACEBO[STUDY=7,TIME=4]`. This is what makes an unstructured placebo effect writable in a
+  model-based meta-analysis — and fittable: the whole block occupies a single parameter slot, so it is
+  not bounded by the fixed individual-parameter layout the way 800 separate parameters would be.
+  A level block is rank-deficient against a fixed intercept *and* against a random effect at the
+  same or a coarser grouping, so a sum-to-zero convention is always applied and its grouping is chosen
+  from both the model and the data; `contrast = sum_to_zero | sum_to_zero_within | ref | none` overrides
+  it, and a choice that leaves a nested group's mean free is refused. An out-of-range or non-integral
+  gather index is reported before the fit starts, naming the column and value. See
+  `docs/model-file/parameters.qmd`.
 - **Three-argument `clamp(x, lo, hi)` in the model DSL (#1092).** Bounding a readout into an
   interval no longer has to be written as the nested `min(max(x, lo), hi)`, whose argument order
   flips between the inner and outer call. Available in every expression the DSL parses
@@ -113,6 +128,19 @@ section of the SDLC for the versioning policy).
   decision changes — the bound only short-circuits the direction it can prove.
 
 ### Changed
+- **`optimizer = auto` no longer picks BOBYQA on high-dimensional problems (#1064).** BOBYQA interpolates
+  a quadratic over the whole parameter space, so its model grows quadratically in the parameter count;
+  above 64 free coordinates `auto` now resolves to `nlopt_lbfgs`, whose finite-difference cost is linear.
+  An explicit `optimizer = bobyqa` is still honoured, now with a warning about the size.
+- **The covariance step routes away from `MATRIX=R` on high-dimensional problems (#1064).** The default
+  `covariance_method = r` re-converges every subject's EBEs at each of `n(n+1)/2` stencil points — around
+  320,000 population objectives at 800 parameters. Above 100 free coordinates a *defaulted* covariance
+  method now uses the score cross-product (one pass) and says so; setting `covariance_method = r`
+  explicitly still forces it, with a warning naming the cost.
+- **Large theta level blocks are reported compactly (#1064).** A block of more than 20 free coefficients
+  leaves the main estimate table for a one-line summary (count, min, median, max) on the console and in
+  the text report. Every independently estimated coefficient is written to the fit YAML under
+  `theta_blocks:`; constrained dependent levels are derived values rather than estimates.
 - **ODE models now choose their own stepper by default (#978).** `ode_method` defaults to `auto`
   instead of `rk45`, so a model that names no stepper is probed per integration segment and runs
   a stiff method on the segments that need one. A model that *does* name a method is unaffected —
