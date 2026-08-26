@@ -8057,14 +8057,13 @@ pub(crate) fn build_y_output_fn(
     // un-desugared (none, in practice) keeps `dual_evaluable` false → FD fallback.
     rewrite_readout_synth(&mut expr, readout_synth);
 
-    // Reject KAPPA_* (IOV) references in a Form C ODE output expression: the
-    // readout is evaluated once per observation with a single eta, so under IOV
-    // it would silently see kappa = 0 (the per-occasion PK *dynamics* are still
-    // correct — they flow through the per-event parameters — but a direct kappa
-    // reference in the readout is not occasion-aware). The `[scaling]` eta scope
-    // is BSV-only, so a kappa name parses as an unresolved identifier here; match
-    // it by name. Fail fast rather than mislead. See issue #107; reference the
-    // occasion-dependent structural parameter (e.g. CL) instead.
+    // Reject KAPPA_* (IOV) references in a Form C output expression: the `[scaling]`
+    // eta scope is BSV-only, so a kappa name parses as an unresolved identifier and
+    // would silently evaluate to 0. Fail fast rather than mislead. See issue #107.
+    // This is a *direct* reference only — a kappa reaching the readout through an
+    // `[individual_parameters]` entry (`BASE = TVBASE * exp(KAPPA_B)`) is fine and
+    // occasion-correct: both engines evaluate the readout per observation with that
+    // observation's occasion parameters (#1079).
     if let Some(name) = expr_references_kappa(&expr, kappa_names) {
         return Err(format!(
             "{context}: Form C output expressions cannot reference the IOV \

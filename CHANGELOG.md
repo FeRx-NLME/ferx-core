@@ -175,6 +175,21 @@ section of the SDLC for the versioning policy).
   with no diagnostic from NONMEM (`nonmem_anchor/dose_attr_double_use_{A,B}.ctl`).
 
 ### Fixed
+- **A closed-form model with IOV and a `[scaling] y = <expr>` readout evaluated the readout's
+  individual parameters at `kappa = 0` — predictions and the objective were silently wrong
+  (#1079).** The readout is the analogue of NONMEM's `$ERROR` and is evaluated per record, so an
+  individual parameter carrying a `kappa` — an additive baseline `BASE = TVBASE * exp(KAPPA_B)`, a
+  second analyte, a bounded transform — must take that record's occasion value. On the analytical
+  (`pk ...`) engine it took the parameter's *typical* value in every occasion instead: the
+  concentration handed to the readout carried the occasion κ, but every parameter the readout
+  itself read did not. On the reproduction in the issue the prediction is off by 12–20 %.
+  **Anyone who fitted such a model should re-run it** — the reported estimates, OFV, and
+  diagnostics were computed from the wrong predictions. The ODE engine was always correct, as was
+  the compartment-free (`[structural_model]`-less) path, and a `y = central / V` readout was
+  unaffected on every engine (the `conc × V` amount reconstruction and the readout's own `/ V`
+  cancel, with or without a κ on `V`) — which is why the natural readout to test could not show
+  it. The analytic sensitivities are re-seeded to match, so FOCE/FOCEI/SAEM gradients now
+  differentiate the corrected prediction.
 - **An estimated lagtime whose lagged dose arrival crossed a time-varying covariate change got a
   silently wrong analytic gradient on ODE models (#1060).** The dose lands at a moving boundary
   `t + ALAG`, and the walk injects the resulting jump as a saltation. The segment ending at that
