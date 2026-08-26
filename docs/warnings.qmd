@@ -87,7 +87,7 @@ Treat `details` as optional: check for its presence rather than assuming it.
 | `inflated_rse` | `threshold_pct`, `parameters` (array of `{parameter, estimate, se, rse_pct}`) |
 | `high_correlation` | `threshold`, `pairs` (array of `{parameter_a, parameter_b, correlation}`) |
 | `flip_flop` | `phase` (`"ebe"`), `model`, `subjects` (array of affected subject IDs) |
-| `ode_solver` | `phase` (`"postfit_predictions"`), `ode_method`, `attempted_steps`, `accepted_steps`, `rejected_steps`, `min_step_clamped_steps`, `auto_stiff_segments`, `auto_stiff_rejected`, `stiff_aborted_segments`, `discarded_clamped_steps`, `kept_clamped_steps` |
+| `ode_solver` | `phase` (`"postfit_predictions"`), `ode_method`, `attempted_steps`, `accepted_steps`, `rejected_steps`, `min_step_clamped_steps`, `stiff_min_step_clamped_steps`, `discarded_clamped_steps`, `kept_clamped_steps`, `auto_stiff_segments`, `auto_switched_segments`, `auto_stiff_rejected`, `stiff_aborted_segments` |
 | `covariance_failed`, `covariance_regularized` | `condition_number`, `min_eigenvalue`, `n_negative_eigenvalues` (each present only when computed — a hard failure with no matrix omits the eigenvalue keys) |
 | `condition_number` | `condition_number` |
 

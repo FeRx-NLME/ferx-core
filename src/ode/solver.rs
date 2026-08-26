@@ -171,9 +171,12 @@ pub enum OdeMethod {
     /// everywhere else. See [`crate::ode::stiffness`] for what is measured, where, and why an
     /// unclassifiable system stays explicit.
     ///
-    /// This is a *starting* decision per integrated segment, not a mid-step switch: the
-    /// method is still fixed for the duration of one segment, so every guarantee the other
-    /// variants carry (dense output, event root-finding, `Dual2` sensitivities) is unchanged.
+    /// This is the *starting* decision for each integrated segment. By default,
+    /// [`OdeSolverOptions::auto_switch`] re-probes periodically and may replace the active
+    /// stepper between accepted steps while retaining the state integrated so far. Disable
+    /// that option to keep the starting method fixed for the duration of the segment. Both
+    /// modes preserve the guarantees the other variants carry (dense output, event
+    /// root-finding, `Dual2` sensitivities).
     ///
     /// **The default.** A model that names no `ode_method` is probed, which is the right
     /// behaviour for the same reason the feature exists: whether a system is stiff is a
