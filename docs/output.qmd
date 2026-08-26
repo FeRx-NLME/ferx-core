@@ -220,7 +220,8 @@ the canonical column order; `rows:` keys match that order. Omega and kappa
 diagonal entries appear as `log_chol_<eta>` — the packed value is `log(L_ii)`
 where `omega = L Lᵀ` (log of the Cholesky diagonal, **not** the variance).
 Off-diagonal Cholesky entries appear as `chol_<eta_row>_<eta_col>` (`L_ij`,
-not log-transformed).
+not log-transformed). See [Packed Parameter
+Space](estimation/parameterization.qmd) for the full layout and bounds.
 
 ### Key Fields
 
