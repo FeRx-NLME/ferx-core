@@ -1081,8 +1081,11 @@ pub fn simulate_adaptive_from_spec(
     let compiled = crate::sim::adaptive_control::compile_adaptive(model, spec)
         .map_err(|e| format!("simulate_adaptive_from_spec: {e}"))?;
     // Parity with `fit()`: model-referenced covariates (e.g. a `Selected` error
-    // model's selector) must be present too, not just the `observe` signal (#658).
-    first_error(&check_covariates(model, population))?;
+    // model's selector) must be present too, not just the `observe` signal (#658) —
+    // and a weighted κ / weighted residual must resolve to a positive weight before
+    // it silently underflows to zero (#1083). Same list every other simulate entry
+    // point runs.
+    first_error(&check_simulation_data(model, population))?;
     // A `Selected` error model keys endpoints by selector branch, not CMT, so the
     // compartment-keyed assay would draw NaN — reject it (see the helper's note, #658).
     reject_selected_error_for_adaptive(model)?;

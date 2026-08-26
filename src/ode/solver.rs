@@ -203,6 +203,27 @@ pub struct OdeSolverOptions {
     /// Stepper to use. Default [`OdeMethod::Rk45`]; see [`OdeMethod`] for when a stiff
     /// method pays and which paths honour it.
     pub method: OdeMethod,
+    /// Give up on a segment once this many of its steps have clamped at `min_dt`, instead of
+    /// grinding on to [`max_steps`](Self::max_steps) (#708, #1080 Part B).
+    ///
+    /// A clamp is the solver saying "I cannot meet tolerance here and am advancing anyway";
+    /// once a segment has produced a handful of them it is stability-limited, and the
+    /// remaining thousands of steps buy nothing but wall time. Aborting freeze-pads the
+    /// segment's tail exactly as the existing unrecoverable-clamp break does — the result is
+    /// no more wrong than the ground-out one, it just costs less — and bumps
+    /// [`OdeSolverStats::stiff_aborted_segments`] so the fit's solver-diagnostics warning can
+    /// say so.
+    ///
+    /// `None` (the default) grinds to `max_steps`, i.e. the pre-#1080 behaviour, bit for bit.
+    /// This is deliberately **not** on by default: an early abort trades a slow-but-eventually-
+    /// integrated segment for a freeze-padded one, which is a change to the objective, not
+    /// only to its cost.
+    ///
+    /// Independent of [`OdeMethod::Auto`]. Under `auto` an escalation that trips the budget is
+    /// discarded by the guard exactly as any other stalled escalation would be (the trigger is
+    /// `min_step_clamped_steps > 0`, which an abort has by construction) and the segment is
+    /// re-solved explicitly.
+    pub stiff_abort_after: Option<u32>,
 }
 
 impl Default for OdeSolverOptions {
@@ -214,6 +235,7 @@ impl Default for OdeSolverOptions {
             initial_dt: 0.1,
             min_dt: 1e-12,
             method: OdeMethod::Auto,
+            stiff_abort_after: None,
         }
     }
 }
@@ -282,6 +304,32 @@ pub struct OdeSolverStats {
     /// probe was right that the system is stiff and wrong that this stiff method could
     /// integrate it; naming `rodas5p` (or `rosenbrock23`) explicitly is the next thing to try.
     pub auto_stiff_rejected: usize,
+    /// Integrations abandoned early because their min-`dt` clamps crossed
+    /// [`OdeSolverOptions::stiff_abort_after`] (#708, #1080 Part B).
+    ///
+    /// Always zero unless that budget is set. A non-zero value means the segment's remaining
+    /// `saveat` points were freeze-padded with the last state rather than integrated — the
+    /// same tail a ground-out stability-limited segment produces, reached sooner. It is the
+    /// counter that distinguishes "this fit was cheap" from "this fit was cheap because it
+    /// stopped integrating", so a fit that sets the budget must read it.
+    ///
+    /// Counts truncated **results**, not truncated attempts: an abort inside an `auto`
+    /// escalation that the guard then discarded is not counted, because the caller received
+    /// the explicit re-solve instead. A segment whose final step clamps but which still
+    /// reaches the end of its span is likewise not counted — nothing was abandoned.
+    pub stiff_aborted_segments: usize,
+    /// Of [`min_step_clamped_steps`](Self::min_step_clamped_steps), the ones taken inside an
+    /// `auto` escalation the guard then **discarded** — work that was really done, on a
+    /// trajectory nobody received.
+    ///
+    /// Exists because the two halves mean different things to a user. A clamp in a *kept*
+    /// solve says part of the returned trajectory was freeze-padded rather than integrated; a
+    /// clamp in a discarded escalation says only that the escalation failed, which
+    /// [`auto_stiff_rejected`](Self::auto_stiff_rejected) already reports and which the
+    /// explicit re-solve then repaired. Since a stall *is* the rejection trigger, every
+    /// rejected escalation contributes clamps here, and a diagnostic that did not separate
+    /// them would tell every such fit its predictions were freeze-padded when they were not.
+    pub discarded_clamped_steps: usize,
 }
 
 impl OdeSolverStats {
@@ -314,6 +362,8 @@ impl OdeSolverStats {
             min_step_clamped_steps,
             auto_stiff_segments,
             auto_stiff_rejected,
+            stiff_aborted_segments,
+            discarded_clamped_steps,
         } = *other;
         self.attempted_steps += attempted_steps;
         self.accepted_steps += accepted_steps;
@@ -321,6 +371,8 @@ impl OdeSolverStats {
         self.min_step_clamped_steps += min_step_clamped_steps;
         self.auto_stiff_segments += auto_stiff_segments;
         self.auto_stiff_rejected += auto_stiff_rejected;
+        self.stiff_aborted_segments += stiff_aborted_segments;
+        self.discarded_clamped_steps += discarded_clamped_steps;
     }
 
     /// Record an attempt that produced no usable step at `min_dt` (a singular Rosenbrock
@@ -646,6 +698,10 @@ fn integrate_dense_g<T: PkNum>(
     let mut interp_results: Vec<SolPointG<T>> = Vec::with_capacity(interp_at.len());
     let mut interp_idx = 0;
     let mut consecutive_min_step_clamps = 0usize;
+    // Clamps produced by *this* driver call. Counted locally rather than read back off
+    // `stats`, because `stats` is optional and the abort budget must behave identically
+    // whether or not the caller asked for counters.
+    let mut min_step_clamps = 0u32;
     stepper.set_dense_required(!interp_at.is_empty());
     let err_exp = stepper.err_exp();
 
@@ -679,6 +735,11 @@ fn integrate_dense_g<T: PkNum>(
         }
 
         let accepted = usable && (err_norm <= 1.0 || dt_eff <= opts.min_dt);
+        // Mirrors `OdeSolverStats::record`'s clamp test, so the abort budget below counts
+        // exactly the steps `min_step_clamped_steps` reports.
+        if accepted && !(err_norm <= 1.0) && dt_eff <= opts.min_dt {
+            min_step_clamps += 1;
+        }
         // Only a force-accept at `min_dt` with a *non-finite* error counts toward the
         // pathological-divergence break (#603 review #4); a finite-but-stiff clamp is left to
         // run rather than freeze-padded into a silently-accepted wrong trajectory.
@@ -722,6 +783,27 @@ fn integrate_dense_g<T: PkNum>(
             } else {
                 consecutive_min_step_clamps = 0;
             }
+        }
+
+        // Stiff-abort budget (#708): a segment that has clamped this many times is
+        // stability-limited, and the rest of its `max_steps` allowance buys wall time, not
+        // accuracy. Stop here and let the tail freeze-pad — the same outcome the unusable-
+        // attempt break above produces, only cheaper to reach. Checked after the accept block
+        // so the clamped step's own `saveat` values are still saved.
+        //
+        // `t < tf` is part of the test, not an optimization: a segment whose *last* step
+        // clamps still reaches `tf` with every `saveat` saved, and breaking out there abandons
+        // nothing. Counting it would report a fully-integrated segment as truncated, which is
+        // the one thing this counter must never do.
+        if t < tf - 1e-15
+            && opts
+                .stiff_abort_after
+                .is_some_and(|budget| min_step_clamps >= budget.max(1))
+        {
+            if let Some(s) = stats.as_deref_mut() {
+                s.stiff_aborted_segments += 1;
+            }
+            break;
         }
         // On reject: (u, t) is unchanged, so the stepper's carried state stays valid.
 
@@ -954,6 +1036,7 @@ fn until_threshold_with(
     // test, or a linearly implicit one that could not form a step at all). The run continues
     // afterwards, so this is the only trace such a step leaves.
     let mut min_step_clamped = false;
+    let mut clamps = 0u32;
     let mut stepper = make_stepper::<f64>(u.len(), method);
     // This driver localizes the crossing inside a step, so it always interpolates.
     stepper.set_dense_required(true);
@@ -982,6 +1065,7 @@ fn until_threshold_with(
         // pass (`!(err_norm <= 1.0)`, which also catches a non-finite norm) is a clamp.
         if accepted && !(err_norm <= 1.0) && dt_eff <= opts.min_dt {
             min_step_clamped = true;
+            clamps += 1;
         }
         if accepted {
             let y0 = u[monitor];
@@ -1026,6 +1110,25 @@ fn until_threshold_with(
             t += dt_eff;
             u.copy_from_slice(stepper.u_new());
             stepper.on_accept();
+        }
+
+        // Stiff-abort budget (#708), in this driver's own shape: a stability-limited crossing
+        // search reports `Failed` rather than freeze-padding, because the outcome here *is*
+        // the answer (an event time, or a censoring) and a padded one would be laundered into
+        // the likelihood as if it had been integrated.
+        //
+        // Checked *after* the accept block for the same reason the dense driver checks after
+        // its saves: a clamped step can still be the step that brackets the crossing, and the
+        // bisection above has already returned it. Giving up on an answer the solver just
+        // found would be a strictly worse outcome than the cost this budget exists to bound.
+        if opts
+            .stiff_abort_after
+            .is_some_and(|budget| clamps >= budget.max(1))
+        {
+            return failed(format!(
+                "aborted at t={t:.6} after {clamps} min-dt clamp(s) \
+                 (ode_stiff_abort_after): the segment is stability-limited"
+            ));
         }
 
         let safety = 0.9;
@@ -1107,6 +1210,102 @@ pub fn solve_ode_g_dense<T: crate::sens::num::PkNum>(
     integrate_resolved_g(rhs, u0, t_span, params, saveat, interp_at, opts, stats)
 }
 
+thread_local! {
+    /// Per-thread collector for [`SolverStatsScope`]. `None` when no scope is active, which
+    /// is every production integration outside the post-fit diagnostic pass.
+    static STATS_SINK: std::cell::Cell<Option<OdeSolverStats>> = const { std::cell::Cell::new(None) };
+}
+
+/// Collect [`OdeSolverStats`] from every integration this thread performs while the scope is
+/// alive, without threading an `&mut` through the prediction dispatchers.
+///
+/// The alternative — an `Option<&mut OdeSolverStats>` parameter carried from the fit down
+/// through `compute_predictions_*`, the event-driven walker, the SS equilibrator and the
+/// modified-release reroute — would touch every prediction path to serve one diagnostic that
+/// production never asks for. A scope instead reads the *ordinary* predictor: the post-fit
+/// pass runs exactly the dispatch a user's model runs, so the counters describe the real
+/// integration rather than a diagnostic re-creation of it (which is what
+/// [`crate::ode::ode_predictions_with_solver_stats`] gives, and why it never acquired a
+/// production caller).
+///
+/// Thread-local and scoped, so a scope opened on the fit thread sees that thread's work only.
+/// Nesting restores the outer scope on drop.
+pub(crate) struct SolverStatsScope {
+    prev: Option<OdeSolverStats>,
+}
+
+impl SolverStatsScope {
+    /// Begin collecting on this thread.
+    pub(crate) fn enter() -> Self {
+        Self {
+            prev: STATS_SINK.with(|c| c.replace(Some(OdeSolverStats::default()))),
+        }
+    }
+
+    /// Counters accumulated since [`enter`](Self::enter).
+    pub(crate) fn collected(&self) -> OdeSolverStats {
+        STATS_SINK.with(|c| c.get()).unwrap_or_default()
+    }
+}
+
+impl Drop for SolverStatsScope {
+    fn drop(&mut self) {
+        STATS_SINK.with(|c| c.set(self.prev));
+    }
+}
+
+/// Whether a [`SolverStatsScope`] is collecting on this thread.
+#[inline]
+fn stats_sink_active() -> bool {
+    STATS_SINK.with(|c| c.get()).is_some()
+}
+
+/// Add one integration's counters to the active scope, if any.
+#[inline]
+fn record_to_stats_sink(stats: &OdeSolverStats) {
+    STATS_SINK.with(|c| {
+        if let Some(mut acc) = c.get() {
+            acc.merge(stats);
+            c.set(Some(acc));
+        }
+    });
+}
+
+/// [`integrate_resolved_g_inner`] with the thread-local [`SolverStatsScope`] tee.
+///
+/// Off the diagnostic path this is one `Cell` read per segment and the same call as before.
+#[allow(clippy::too_many_arguments)]
+fn integrate_resolved_g<T: PkNum>(
+    rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+    u0: &[T],
+    t_span: (f64, f64),
+    params: &[T],
+    saveat: &[f64],
+    interp_at: &[f64],
+    opts: &OdeSolverOptions,
+    stats: Option<&mut OdeSolverStats>,
+) -> (Vec<SolPointG<T>>, Vec<SolPointG<T>>) {
+    if !stats_sink_active() {
+        return integrate_resolved_g_inner(rhs, u0, t_span, params, saveat, interp_at, opts, stats);
+    }
+    let mut local = OdeSolverStats::default();
+    let out = integrate_resolved_g_inner(
+        rhs,
+        u0,
+        t_span,
+        params,
+        saveat,
+        interp_at,
+        opts,
+        Some(&mut local),
+    );
+    record_to_stats_sink(&local);
+    if let Some(s) = stats {
+        s.merge(&local);
+    }
+    out
+}
+
 /// [`integrate_dense_g`] with the method resolved first, and the guard that makes
 /// [`OdeMethod::Auto`] safe to escalate: the one place `auto` turns into a stepper.
 ///
@@ -1126,7 +1325,7 @@ pub fn solve_ode_g_dense<T: crate::sens::num::PkNum>(
 /// they make the same decision on the same segment and the gradient keeps differentiating the
 /// trajectory the predictor reports.
 #[allow(clippy::too_many_arguments)]
-fn integrate_resolved_g<T: PkNum>(
+fn integrate_resolved_g_inner<T: PkNum>(
     rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
     u0: &[T],
     t_span: (f64, f64),
@@ -1186,6 +1385,14 @@ fn integrate_resolved_g<T: PkNum>(
     let usable = !stalled && finite_g(&out.0) && finite_g(&out.1);
     if !usable {
         attempt.auto_stiff_rejected = 1;
+        // The clamps were taken, so they stay in `min_step_clamped_steps`; they are *also*
+        // recorded as discarded, because the trajectory they damaged is about to be thrown
+        // away and re-solved. Without this split every rejected escalation would read, to a
+        // caller, as "the answer you got was freeze-padded" — the opposite of what the guard
+        // just did. For the same reason a budgeted abort inside a discarded attempt is not a
+        // truncated *result*: it truncated an attempt nobody receives, so it is not counted.
+        attempt.discarded_clamped_steps = attempt.min_step_clamped_steps;
+        attempt.stiff_aborted_segments = 0;
     }
     // The stiff attempt's steps stay counted either way — they were taken, and they cost what
     // they cost. A fit that reads slow *and* shows a rejection is paying for both solves.
@@ -1965,6 +2172,326 @@ mod tests {
         assert!(result[0].u[0].is_finite());
     }
 
+    /// #708 / #1080 Part B: with a budget set, the same stability-limited segment stops at the
+    /// budget instead of grinding out its whole `max_steps` allowance.
+    ///
+    /// Shares the forcing and options of
+    /// [`solve_ode_does_not_break_on_finite_stiff_min_step_clamps`] — a segment that clamps on
+    /// every step and runs the full 200 — so the only difference measured is the budget.
+    #[test]
+    fn stiff_abort_after_stops_a_clamping_segment_at_the_budget() {
+        let rhs = |_u: &[f64], _p: &[f64], t: f64, du: &mut [f64]| {
+            du[0] = 1e6 * (t * 1e7).sin();
+        };
+        let base = OdeSolverOptions {
+            initial_dt: 1e-3,
+            min_dt: 1e-3,
+            max_steps: 200,
+            abstol: 1e-12,
+            reltol: 1e-12,
+            ..OdeSolverOptions::default()
+        };
+        let budget = 5;
+        let opts = OdeSolverOptions {
+            stiff_abort_after: Some(budget),
+            ..base
+        };
+        let mut stats = OdeSolverStats::default();
+        let result = solve_ode_with_stats(
+            &rhs,
+            &[1.0],
+            (0.0, 1.0),
+            &[],
+            &[1.0],
+            &opts,
+            Some(&mut stats),
+        );
+
+        assert_eq!(stats.min_step_clamped_steps, budget as usize);
+        assert_eq!(stats.attempted_steps, budget as usize);
+        assert_eq!(stats.stiff_aborted_segments, 1);
+        // The tail is freeze-padded, not dropped: the `saveat` contract holds, and the value
+        // is finite — the same shape the unrecoverable-clamp break already produced.
+        assert_eq!(result.len(), 1);
+        assert!(result[0].u[0].is_finite());
+
+        // …and the un-budgeted run is untouched: full `max_steps`, no abort recorded.
+        let mut ground_out = OdeSolverStats::default();
+        solve_ode_with_stats(
+            &rhs,
+            &[1.0],
+            (0.0, 1.0),
+            &[],
+            &[1.0],
+            &base,
+            Some(&mut ground_out),
+        );
+        assert_eq!(ground_out.attempted_steps, base.max_steps);
+        assert_eq!(ground_out.stiff_aborted_segments, 0);
+    }
+
+    /// A budget wider than the segment's clamp count is a no-op — the abort is a ceiling on
+    /// cost, not a second convergence criterion.
+    #[test]
+    fn stiff_abort_after_above_the_clamp_count_changes_nothing() {
+        let rhs = |_u: &[f64], _p: &[f64], t: f64, du: &mut [f64]| {
+            du[0] = 1e6 * (t * 1e7).sin();
+        };
+        let opts = OdeSolverOptions {
+            initial_dt: 1e-3,
+            min_dt: 1e-3,
+            max_steps: 200,
+            abstol: 1e-12,
+            reltol: 1e-12,
+            stiff_abort_after: Some(10_000),
+            ..OdeSolverOptions::default()
+        };
+        let mut stats = OdeSolverStats::default();
+        solve_ode_with_stats(
+            &rhs,
+            &[1.0],
+            (0.0, 1.0),
+            &[],
+            &[1.0],
+            &opts,
+            Some(&mut stats),
+        );
+        assert_eq!(stats.attempted_steps, opts.max_steps);
+        assert_eq!(stats.stiff_aborted_segments, 0);
+    }
+
+    /// A healthy segment never clamps, so no budget — however small — may touch it.
+    #[test]
+    fn stiff_abort_after_leaves_a_clean_solve_bit_identical() {
+        let k = 0.1;
+        let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| du[0] = -k * u[0];
+        let saveat = [1.0, 5.0, 10.0];
+        let base = OdeSolverOptions::default();
+        let budgeted = OdeSolverOptions {
+            stiff_abort_after: Some(1),
+            ..base
+        };
+        let a = solve_ode(&rhs, &[1.0], (0.0, 10.0), &[], &saveat, &base);
+        let b = solve_ode(&rhs, &[1.0], (0.0, 10.0), &[], &saveat, &budgeted);
+        for (x, y) in a.iter().zip(&b) {
+            assert_eq!(x.u[0].to_bits(), y.u[0].to_bits());
+        }
+    }
+
+    /// The budget must be read from `.val()` like every other driver decision, so the `f64`
+    /// prediction and the `Dual2` sensitivity solve abort on the *same* step — otherwise the
+    /// gradient would differentiate a trajectory the predictor never produced.
+    #[test]
+    fn stiff_abort_after_aborts_identically_on_the_dual_path() {
+        use crate::sens::dual2::Dual2;
+        let opts = OdeSolverOptions {
+            initial_dt: 1e-3,
+            min_dt: 1e-3,
+            max_steps: 200,
+            abstol: 1e-12,
+            reltol: 1e-12,
+            stiff_abort_after: Some(5),
+            ..OdeSolverOptions::default()
+        };
+        let rhs_f64 = |_u: &[f64], _p: &[f64], t: f64, du: &mut [f64]| {
+            du[0] = 1e6 * (t * 1e7).sin();
+        };
+        let rhs_dual = |_u: &[Dual2<1>], _p: &[Dual2<1>], t: f64, du: &mut [Dual2<1>]| {
+            du[0] = Dual2::constant(1e6 * (t * 1e7).sin());
+        };
+        let mut scalar = OdeSolverStats::default();
+        solve_ode_with_stats(
+            &rhs_f64,
+            &[1.0],
+            (0.0, 1.0),
+            &[],
+            &[1.0],
+            &opts,
+            Some(&mut scalar),
+        );
+        let mut dual = OdeSolverStats::default();
+        solve_ode_g_with_stats(
+            &rhs_dual,
+            &[Dual2::<1>::constant(1.0)],
+            (0.0, 1.0),
+            &[],
+            &[1.0],
+            &opts,
+            Some(&mut dual),
+        );
+        assert_eq!(scalar, dual);
+        assert_eq!(dual.stiff_aborted_segments, 1);
+    }
+
+    /// The threshold driver bails with a named `Failed` rather than freeze-padding: its output
+    /// *is* the answer (an event time, or a censoring), so a padded crossing would be laundered
+    /// into the likelihood as though it had been integrated.
+    #[test]
+    fn stiff_abort_after_fails_the_threshold_driver_instead_of_padding() {
+        let rhs = |_u: &[f64], _p: &[f64], t: f64, du: &mut [f64]| {
+            // Monotone (a hazard accumulator) but violently forced, so every step clamps.
+            du[0] = 1e6 * (1.0 + (t * 1e7).sin());
+        };
+        let opts = OdeSolverOptions {
+            initial_dt: 1e-3,
+            min_dt: 1e-3,
+            max_steps: 200,
+            abstol: 1e-12,
+            reltol: 1e-12,
+            method: OdeMethod::Rk45,
+            stiff_abort_after: Some(3),
+            ..OdeSolverOptions::default()
+        };
+        let mut u = [0.0];
+        let outcome =
+            solve_ode_until_threshold(&rhs, &mut u, (0.0, 1.0), &[], &opts, 0, f64::INFINITY);
+        match outcome {
+            ThresholdCrossing::Failed(msg) => {
+                assert!(msg.contains("ode_stiff_abort_after"), "{msg}");
+            }
+            other => panic!("expected an abort, got {other:?}"),
+        }
+    }
+
+    /// The stats scope collects every integration on the thread, nests, and leaves nothing
+    /// behind — it is what the post-fit pass reads instead of threading a sink through every
+    /// predictor (#1080 Part B item 2).
+    #[test]
+    fn the_stats_scope_collects_and_restores() {
+        let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| du[0] = -0.1 * u[0];
+        let opts = OdeSolverOptions::default();
+        let solve = || {
+            solve_ode(&rhs, &[1.0], (0.0, 10.0), &[], &[10.0], &opts);
+        };
+
+        // No scope: nothing is recorded and nothing is left set.
+        solve();
+        assert!(!stats_sink_active());
+
+        let outer = SolverStatsScope::enter();
+        solve();
+        let after_one = outer.collected();
+        assert!(after_one.attempted_steps > 0);
+        {
+            let inner = SolverStatsScope::enter();
+            solve();
+            // The inner scope starts empty rather than inheriting the outer total …
+            assert!(inner.collected().attempted_steps > 0);
+            assert!(inner.collected().attempted_steps < after_one.attempted_steps * 2);
+        }
+        // … and dropping it restores the outer one, whose own total is unchanged by the
+        // integrations that ran while it was shadowed.
+        assert_eq!(outer.collected(), after_one);
+        solve();
+        assert_eq!(
+            outer.collected().attempted_steps,
+            after_one.attempted_steps * 2
+        );
+        drop(outer);
+        assert!(!stats_sink_active());
+    }
+
+    /// A caller that passes its own `&mut OdeSolverStats` keeps getting exactly that, scope or
+    /// no scope: the sink is a tee, not a redirect.
+    #[test]
+    fn the_stats_scope_does_not_steal_a_callers_counters() {
+        let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| du[0] = -0.1 * u[0];
+        let opts = OdeSolverOptions::default();
+        let mut without = OdeSolverStats::default();
+        solve_ode_with_stats(
+            &rhs,
+            &[1.0],
+            (0.0, 10.0),
+            &[],
+            &[10.0],
+            &opts,
+            Some(&mut without),
+        );
+
+        let scope = SolverStatsScope::enter();
+        let mut with = OdeSolverStats::default();
+        solve_ode_with_stats(
+            &rhs,
+            &[1.0],
+            (0.0, 10.0),
+            &[],
+            &[10.0],
+            &opts,
+            Some(&mut with),
+        );
+        assert_eq!(with, without);
+        assert_eq!(scope.collected(), without);
+    }
+
+    /// Review follow-up (#1080): the budget must count *abandoned* segments only. A segment
+    /// whose final step clamps still reaches the end of its span with every `saveat` saved —
+    /// breaking out there abandons nothing, and reporting it as truncated would make the
+    /// counter useless for the one question it exists to answer.
+    #[test]
+    fn a_clamp_on_the_last_step_is_not_an_abort() {
+        // Forcing violent enough to clamp every step, over a span that `min_dt` steps can
+        // still cross: 5 steps of 1e-3 reach `tf`, so the fifth clamp lands exactly on the
+        // end of the segment.
+        let rhs = |_u: &[f64], _p: &[f64], t: f64, du: &mut [f64]| {
+            du[0] = 1e6 * (t * 1e7).sin();
+        };
+        let opts = OdeSolverOptions {
+            initial_dt: 1e-3,
+            min_dt: 1e-3,
+            max_steps: 200,
+            abstol: 1e-12,
+            reltol: 1e-12,
+            stiff_abort_after: Some(5),
+            ..OdeSolverOptions::default()
+        };
+        let mut stats = OdeSolverStats::default();
+        let result = solve_ode_with_stats(
+            &rhs,
+            &[1.0],
+            (0.0, 5e-3),
+            &[],
+            &[5e-3],
+            &opts,
+            Some(&mut stats),
+        );
+
+        assert_eq!(stats.min_step_clamped_steps, 5, "the fixture must clamp");
+        assert_eq!(
+            stats.stiff_aborted_segments, 0,
+            "the segment reached t_end — nothing was abandoned"
+        );
+        assert_eq!(result.len(), 1);
+        assert!(result[0].u[0].is_finite());
+    }
+
+    /// Review follow-up (#1080): a clamped step can still be the step that brackets the
+    /// crossing. The budget bounds cost; throwing away an answer the solver has already found
+    /// is not a cost saving, it is a worse outcome than the one being avoided.
+    #[test]
+    fn the_threshold_driver_keeps_a_crossing_found_on_a_clamped_step() {
+        // Monotone and violently forced, so the first step clamps — and with a threshold this
+        // low, that same first step crosses it.
+        let rhs = |_u: &[f64], _p: &[f64], t: f64, du: &mut [f64]| {
+            du[0] = 1e6 * (1.0 + (t * 1e7).sin());
+        };
+        let opts = OdeSolverOptions {
+            initial_dt: 1e-3,
+            min_dt: 1e-3,
+            max_steps: 200,
+            abstol: 1e-12,
+            reltol: 1e-12,
+            method: OdeMethod::Rk45,
+            stiff_abort_after: Some(1),
+            ..OdeSolverOptions::default()
+        };
+        let mut u = [0.0];
+        match solve_ode_until_threshold(&rhs, &mut u, (0.0, 1.0), &[], &opts, 0, 1.0) {
+            ThresholdCrossing::Crossed(t) => {
+                assert!(t > 0.0 && t <= 1e-3, "crossing outside the first step: {t}");
+            }
+            other => panic!("the crossing must survive the budget, got {other:?}"),
+        }
+    }
     /// Dual path mirrors [`solve_ode_does_not_break_on_finite_stiff_min_step_clamps`].
     #[test]
     fn solve_ode_g_does_not_break_on_finite_stiff_min_step_clamps() {

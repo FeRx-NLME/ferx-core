@@ -1,17 +1,26 @@
 //! Published model-based meta-analysis case study, fitted as a **compartment-free**
 //! structural model (#811).
 //!
-//! Naproxen vs placebo in osteoarthritis — Case Study 1 of Bracis et al.,
-//! *CPT:PSP* 2026;15:e70158: 18 trials, 36 arms, longitudinal WOMAC pain. This is
-//! the model class #811 exists for. There is no PK anywhere in it: the structural
-//! model is an Emax time-course on an aggregate arm mean, with study-level random
-//! effects, and each arm weighted by its reported standard error.
+//! Naproxen vs placebo in osteoarthritis — the longitudinal MBMA of Boucher &
+//! Bennetts, *CPT:PSP* 2018;7:288–297 (Part II of the model-based meta-analysis
+//! tutorial): 18 trials, 36 arms, longitudinal WOMAC pain. This is the model class
+//! #811 exists for. There is no PK anywhere in it: the structural model is an Emax
+//! time-course on an aggregate arm mean, with study-level random effects, and each
+//! arm weighted by its reported standard error.
+//!
+//! The same analysis was later replicated in MonolixSuite by Bracis et al.,
+//! *CPT:PSP* 2026;15:e70158 (Case Study 1), which is where the Monolix column
+//! below comes from. The **data** are Boucher & Bennetts' — see
+//! `data/mbma_naproxen.README.md` and #1085.
 //!
 //! Two things are being asserted, and they are different claims:
 //!
-//! 1. **The published analysis is reproduced.** The estimates match the Monolix
-//!    numbers in the tutorial to three significant figures. A structural model
-//!    that predicted the wrong thing could not.
+//! 1. **The published analysis is reproduced.** Every point estimate is within
+//!    0.01 of the NONMEM column of Boucher & Bennetts Table 2, and the subset
+//!    Bracis et al. report matches their Monolix values to three significant
+//!    figures. A structural model that predicted the wrong thing could not — and
+//!    because Table 2 is the same model fitted in BUGS, NONMEM and `nlme`, this is
+//!    an anchor against three independent engines, not one.
 //! 2. **The compartment-free form is equivalent to the dummy-compartment
 //!    workaround it replaces.** Until #811 this model had to be written as a state
 //!    nobody reads, driven by `d/dt(clock) = 1`, with the real equation hidden in
@@ -30,18 +39,48 @@
 //!
 //! ## Published reference values
 //!
-//! | | ferx (this test) | Monolix (published) |
-//! |---|---|---|
-//! | naproxen effect on Emax | 0.7930 (SE 0.0646) | 0.792 (SE 0.064) |
-//! | ET50, placebo (weeks)   | 0.6901 | 0.698 |
-//! | ET50, naproxen (weeks)  | 0.2132 | 0.216 |
-//! | ω(E0), SD               | 0.6215 | 0.627 |
-//! | ω(Emax), SD             | 0.7387 | 0.763 |
-//! | OFV                     | 261.8149 | — |
+//! Boucher & Bennetts Table 2 fits this model in **three independent engines**.
+//! ferx reproduces every point estimate in it, to within 0.01 absolute of the
+//! NONMEM column (worst observed residual 0.005, on ln(ΔET50_n)):
 //!
-//! ET50 for naproxen is `TVET50 · exp(B_LET50_TRT)`, the published
-//! parameterisation. ferx reports ω as a **variance**; the table is on the SD
-//! scale the tutorial uses.
+//! | Parameter | BUGS | NONMEM | R (`nlme`) | Monolix | ferx (this test) |
+//! |---|---|---|---|---|---|
+//! | E0 (nonflare)          | 5.22 (0.28)  | 5.20 (0.13)  | 5.20 (0.27)  | — | 5.1972 (0.2578) |
+//! | ΔE0 (flare)            | 0.93 (0.33)  | 0.96 (0.25)  | 0.96 (0.32)  | — | 0.9629 (0.3154) |
+//! | Emax_p (nonflare)      | −1.14 (0.41) | −1.16 (0.24) | −1.15 (0.32) | — | 1.1580 (0.3147) |
+//! | ΔEmax_p (flare)        | −0.86 (0.47) | −0.82 (0.09) | −0.82 (0.39) | — | 0.8197 (0.3792) |
+//! | ΔEmax_n (naproxen)     | −0.79 (0.06) | −0.79 (0.09) | −0.79 (0.07) | 0.792 (0.064) | 0.7930 (0.0646) |
+//! | ln(ET50_p)             | −0.40 (0.17) | −0.37 (0.20) | −0.40 (0.17) | — | −0.3709 |
+//! | ln(ΔET50_n)            | −1.24 (0.31) | −1.17 (0.20) | −1.20 (0.29) | — | −1.1747 (0.2712) |
+//! | ET50_p (weeks)         | 0.67 | 0.69 | 0.67 | 0.698 | 0.6901 |
+//! | ET50_n (weeks)         | 0.19 | 0.21 | 0.20 | 0.216 | 0.2132 |
+//! | τ1 (ω E0, SD)          | 0.86 | 0.62 | 0.62 | 0.627 | 0.6215 |
+//! | τ2 (ω Emax, SD)        | 0.71 | 0.74 | 0.74 | 0.763 | 0.7387 |
+//! | OFV                    | — | — | — | — | 261.8149 |
+//!
+//! Two conventions to keep straight when reading that table against the code:
+//!
+//! * **Sign of the Emax family.** Boucher & Bennetts write the model as
+//!   `Y = E0 + Emax·t/(ET50+t)` with `Emax` negative (pain goes down); the shipped
+//!   model writes `y = E0 − EMAX·t/(t+ET50)` with `EMAX` positive. So every
+//!   Emax-family ferx estimate is the negation of the published one. It is a
+//!   parameterisation difference, not a disagreement.
+//! * **ET50 is multiplicative in the log.** ET50 for naproxen is
+//!   `TVET50 · exp(B_LET50_TRT)`, which is what Table 2's `ET50_n` row reports —
+//!   not `ET50_p + ET50_n`, despite the paper's Eq. (4) being written additively.
+//!
+//! ferx reports ω as a **variance**; the table is on the SD scale both papers use.
+//!
+//! **Why only point estimates are pinned against Table 2.** The three engines
+//! agree on the estimates to the last published digit but disagree substantially
+//! on their standard errors — τ1 is 0.86 in BUGS against 0.62 in the other two,
+//! and the SE of ΔEmax_p is 0.47 / 0.09 / 0.39 across BUGS / NONMEM / `nlme`. A
+//! tolerance wide enough to cover that spread would assert nothing. The one SE all
+//! three (plus Monolix) broadly agree on is ΔEmax_n, 0.06–0.09, and that one is
+//! asserted — as the published spread, not against any single column, since ferx's
+//! 0.0646 sits with BUGS and `nlme` rather than with NONMEM.
+//! ferx's SEs are pure `R⁻¹`, which is NONMEM's `MATRIX=R`, not its default
+//! sandwich — another reason not to read the SE columns as a single number.
 
 use ferx_core::parser::model_parser::{parse_full_model, parse_full_model_file};
 use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions};
@@ -50,7 +89,7 @@ use std::path::Path;
 const DATA: &str = "data/mbma_naproxen.csv";
 const MODEL: &str = "examples/mbma_naproxen.ferx";
 
-// Monolix values from the tutorial's `populationParameters.txt`, as quoted in the
+// Monolix values from Bracis et al.'s `populationParameters.txt`, as quoted in the
 // MBMA umbrella issue (#1032).
 const PUB_EMAX_TRT: f64 = 0.792;
 const PUB_EMAX_TRT_SE: f64 = 0.064;
@@ -59,8 +98,31 @@ const PUB_ET50_NAPROXEN: f64 = 0.216;
 const PUB_OMEGA_E0_SD: f64 = 0.627;
 const PUB_OMEGA_EMAX_SD: f64 = 0.763;
 
+// Boucher & Bennetts Table 2, NONMEM column — the primary analysis. Emax-family
+// entries are negated relative to the paper (see the module docs): the paper adds
+// a negative Emax, the shipped model subtracts a positive one.
+const NM_E0: f64 = 5.20;
+const NM_D_E0_FLARE: f64 = 0.96;
+const NM_EMAX_NONFLARE: f64 = 1.16; // paper: −1.16
+const NM_D_EMAX_FLARE: f64 = 0.82; // paper: −0.82
+const NM_D_EMAX_NAPROXEN: f64 = 0.79; // paper: −0.79
+const NM_LN_ET50_PLACEBO: f64 = -0.37;
+const NM_LN_D_ET50_NAPROXEN: f64 = -1.17;
+const NM_ET50_PLACEBO: f64 = 0.69;
+const NM_ET50_NAPROXEN: f64 = 0.21;
+const NM_TAU1: f64 = 0.62;
+const NM_TAU2: f64 = 0.74;
+
+/// Table 2 reports two decimals, so ±0.005 is pure rounding. 0.01 is that plus
+/// headroom, and is tighter than the spread between the paper's own three engines.
+const NM_TOL: f64 = 0.01;
+
 /// Theta order as declared in `examples/mbma_naproxen.ferx`.
+const I_TVE0: usize = 0;
+const I_TVEMAX: usize = 1;
 const I_TVET50: usize = 2;
+const I_B_E0_FLARE: usize = 3;
+const I_B_EMAX_FLARE: usize = 4;
 const I_B_EMAX_TRT: usize = 5;
 const I_B_LET50_TRT: usize = 6;
 
@@ -143,6 +205,59 @@ fn mbma_naproxen_reproduces_the_published_analysis() {
     assert!(
         (omega_emax_sd - PUB_OMEGA_EMAX_SD).abs() / PUB_OMEGA_EMAX_SD < 0.05,
         "omega(Emax) SD: ferx {omega_emax_sd:.4} vs published {PUB_OMEGA_EMAX_SD:.3}"
+    );
+
+    // The primary analysis: every point estimate in Boucher & Bennetts Table 2,
+    // NONMEM column — including the four the Monolix comparison above leaves
+    // unasserted (E0, ΔE0, Emax_p, ΔEmax_p), which is what makes this an anchor
+    // against the whole published parameter vector rather than one headline number.
+    let table2 = [
+        ("E0 (nonflare)", result.theta[I_TVE0], NM_E0),
+        ("ΔE0 (flare)", result.theta[I_B_E0_FLARE], NM_D_E0_FLARE),
+        (
+            "Emax_p (nonflare)",
+            result.theta[I_TVEMAX],
+            NM_EMAX_NONFLARE,
+        ),
+        (
+            "ΔEmax_p (flare)",
+            result.theta[I_B_EMAX_FLARE],
+            NM_D_EMAX_FLARE,
+        ),
+        ("ΔEmax_n", result.theta[I_B_EMAX_TRT], NM_D_EMAX_NAPROXEN),
+        ("ln(ET50_p)", et50_placebo.ln(), NM_LN_ET50_PLACEBO),
+        (
+            "ln(ΔET50_n)",
+            result.theta[I_B_LET50_TRT],
+            NM_LN_D_ET50_NAPROXEN,
+        ),
+        ("ET50_p (weeks)", et50_placebo, NM_ET50_PLACEBO),
+        ("ET50_n (weeks)", et50_naproxen, NM_ET50_NAPROXEN),
+        ("τ1 (ω E0, SD)", omega_e0_sd, NM_TAU1),
+        ("τ2 (ω Emax, SD)", omega_emax_sd, NM_TAU2),
+    ];
+    for (name, ferx, nonmem) in table2 {
+        assert!(
+            (ferx - nonmem).abs() < NM_TOL,
+            "Boucher & Bennetts Table 2, {name}: ferx {ferx:.4} vs NONMEM {nonmem:.2} \
+             (tolerance {NM_TOL})"
+        );
+    }
+
+    // The one SE the paper's three engines broadly agree on, and it is the headline
+    // estimate's: 0.06 (BUGS) / 0.09 (NONMEM) / 0.07 (nlme). Asserted as the
+    // published *spread* rather than against any single column, because ferx's
+    // 0.0646 sits with BUGS and nlme, not with NONMEM — pinning it to the NONMEM
+    // value alone would put the tolerance floor 0.005 below the observed value and
+    // fail on a routine covariance-step wobble, while reporting the wrong engine as
+    // the reference. Widened by 0.005 either side, since the paper reports 2 dp.
+    // The rest of Table 2's SE column is not asserted; see the module docs for why.
+    const SE_PUBLISHED_LO: f64 = 0.06 - 0.005;
+    const SE_PUBLISHED_HI: f64 = 0.09 + 0.005;
+    assert!(
+        (SE_PUBLISHED_LO..=SE_PUBLISHED_HI).contains(&se),
+        "SE of ΔEmax_n: ferx {se:.4} outside the published spread \
+         [{SE_PUBLISHED_LO}, {SE_PUBLISHED_HI}] (BUGS 0.06, NONMEM 0.09, nlme 0.07)"
     );
 }
 

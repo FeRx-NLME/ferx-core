@@ -14,6 +14,7 @@ The optional `[simulation]` block defines a virtual clinical trial design for ge
   seed       = SEED
   times      = [t1, t2, t3, ...]
   horizon    = T          # TTE only — administrative censoring time
+  covariate NAME = VALUE  # or = [v1, v2, ...], one per subject
 ```
 
 | Key | Aliases | Description |
@@ -24,6 +25,7 @@ The optional `[simulation]` block defines a virtual clinical trial design for ge
 | `seed` | | Random seed for reproducible simulations |
 | `times` | | Continuous observation time points (Gaussian endpoints) |
 | `horizon` | | Administrative censoring time for TTE endpoints (finite, `> 0`) |
+| `covariate NAME` | | Value of covariate `NAME` for the simulated subjects — a scalar, or one value per subject (see [Covariates in simulation](#covariates-in-simulation)) |
 
 A block must define **at least one of `times` or `horizon`**, matched to the
 model's endpoints:
@@ -159,6 +161,73 @@ unbounded), which biases the simulated event-time distribution. Supplying
 censors at the planned study end. The same control is available on the library
 API as `SimulateOptions { horizon, .. }`.
 
-## Covariates in Simulation
+## Covariates in simulation
 
-Covariates can be specified per subject in the `[simulation]` block. Currently, the simulated population uses default covariate values (covariates are not randomized).
+A `covariate` statement gives the simulated subjects a covariate value. Write a
+scalar to use the same value for every subject, or a list with one value per
+subject:
+
+```
+[simulation]
+  n_subjects = 3
+  times      = [1, 2, 4, 8]
+  covariate WT   = 70                # every subject weighs 70 kg
+  covariate NARM = [400, 200, 50]    # one arm size per subject
+```
+
+A list must have exactly `n_subjects` entries — a short one is a parse error, not
+a silently recycled or zero-filled tail. The keys are order-independent, so the
+`covariate` line may precede the `n_subjects` it is checked against. When the
+model has a `[covariates]` block, that block is authoritative: a name it does not
+declare is rejected here too.
+
+Values are constant per subject. Time-varying covariates are not expressible in a
+`[simulation]` design; read a dataset with `--data` for those. Covariates are not
+randomised — each subject gets exactly the value the design states.
+
+### A referenced covariate must be supplied {#sim-covariates-required}
+
+If the model references a covariate that the `[simulation]` block does not
+supply, simulation is refused and the message names the covariate and the fix.
+There is no default, and that is deliberate.
+
+This matters most for the two `weight = <expr>` modifiers, both of which read a
+data column:
+
+- `kappa K ~ γ² weight = NARM` ([IOV](iov.qmd)) — an arm-level random effect that
+  scales with the number of subjects behind the arm, `κ ~ N(0, γ²/N)`;
+- `DV ~ additive(S) weight = WPSE` ([error model](error-model.qmd)) — inverse-variance
+  weighting for a trial-level mean with a known standard error.
+
+`fit()` always has a row to read those from: the arm exists, and its size and its
+reported standard error are columns in the dataset. A simulated trial frequently
+does not — the point of simulating one is to invent arms that are *not* in the
+data ("what would a 300-subject arm of this design look like?"), and an arm that
+does not exist yet has no row.
+
+So the arm sizes of a simulated trial are part of the design being evaluated, and
+stating them is the question, not a burden:
+
+```
+[parameters]
+  kappa KAPPA_EMAX ~ 2.0 (sd) weight = NARM
+
+[covariates]
+  NARM continuous
+
+[simulation]
+  n_subjects = 3
+  times      = [1, 2, 4, 8]
+  covariate NARM = [400, 200, 50]
+```
+
+Falling back to a typical value from the fitted data would answer a different
+question than the one asked, and either silent default is worse than an error: a
+weight read as `1` gives a simulated arm the variability of a *single-subject*
+arm, and one read as `0` gives it none at all — `κ/√0` evaluates to zero rather
+than blowing up, and a zeroed residual weight makes the simulated observation
+equal its own prediction. Both produce plausible-looking plots.
+
+If you do want the fitted data's own weights, simulate against that dataset
+(`--data`, or pass the fitted `Population` to `simulate()`) rather than writing a
+synthetic design — then the weights come from the rows they were fitted from.

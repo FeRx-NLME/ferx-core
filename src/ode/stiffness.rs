@@ -156,12 +156,33 @@ const fn stiff_method_for(opts: &OdeSolverOptions) -> OdeMethod {
 /// an error of tens of percent to move a model across the threshold from where the measured
 /// ones sit. Halving the evaluation count is what keeps the probe cheaper than one step of the
 /// solver it is choosing.
+///
+/// **Test-only since #1080 Part B.** [`resolve_method`] no longer calls it: it builds the
+/// Jacobian itself so it can try [`gershgorin_abs_bound`] first and skip the eigensolve on the
+/// segments that cannot possibly be stiff. This stays as the *exact* definition of the
+/// discriminator, and the fast path is tested against it
+/// (`the_gershgorin_fast_path_agrees_with_the_exact_eigensolve`) — which is the only way that
+/// short-circuit is allowed to exist.
+#[cfg(test)]
 pub(crate) fn max_abs_re_eigenvalue<T: PkNum>(
     rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
     u: &[T],
     params: &[T],
     t: f64,
 ) -> Option<f64> {
+    let jac = fd_jacobian(rhs, u, params, t)?;
+    schur_max_abs_re(jac, u.len())
+}
+
+/// One-sided finite-difference Jacobian at `(t, u)`, column-major (`jac[i + j * n]` is
+/// `∂f_i/∂u_j`, the layout `DMatrix` expects). `None` on an empty system or a non-finite
+/// entry — a caller that cannot form the Jacobian must not guess.
+fn fd_jacobian<T: PkNum>(
+    rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+    u: &[T],
+    params: &[T],
+    t: f64,
+) -> Option<Vec<f64>> {
     let n = u.len();
     if n == 0 {
         return None;
@@ -186,17 +207,21 @@ pub(crate) fn max_abs_re_eigenvalue<T: PkNum>(
             if !d.is_finite() {
                 return None;
             }
-            // Column-major: `jac[i + j * n]` is `∂f_i/∂u_j`, the layout `DMatrix` expects.
             jac[i + j * n] = d;
         }
     }
+    Some(jac)
+}
 
-    // `DMatrix::complex_eigenvalues` is *not* usable here: it runs the Schur QR iteration with
-    // `max_niter = 0`, which disables the iteration cap rather than setting it to zero, and
-    // `.unwrap()`s the result — so a matrix it cannot reduce spins inside a fit's worker
-    // thread instead of failing. The probe must be bounded above all else: it is a hint, and a
-    // hint is never worth hanging for. `try_new` with an explicit cap gives back the `None`
-    // this function documents, which the caller reads as "cannot classify → stay explicit".
+/// `max_i |Re λ_i|` of a column-major `n × n` matrix, via a **bounded** Schur decomposition.
+///
+/// `DMatrix::complex_eigenvalues` is *not* usable here: it runs the Schur QR iteration with
+/// `max_niter = 0`, which disables the iteration cap rather than setting it to zero, and
+/// `.unwrap()`s the result — so a matrix it cannot reduce spins inside a fit's worker thread
+/// instead of failing. The probe must be bounded above all else: it is a hint, and a hint is
+/// never worth hanging for. `try_new` with an explicit cap gives back the `None` the callers
+/// read as "cannot classify → stay explicit".
+fn schur_max_abs_re(jac: Vec<f64>, n: usize) -> Option<f64> {
     let m = nalgebra::DMatrix::from_vec(n, n, jac);
     let schur = nalgebra::linalg::Schur::try_new(m, f64::EPSILON, EIGENSOLVE_MAX_ITERATIONS)?;
     let lambda_max = schur
@@ -204,6 +229,24 @@ pub(crate) fn max_abs_re_eigenvalue<T: PkNum>(
         .iter()
         .fold(0.0_f64, |acc, z| acc.max(z.re.abs()));
     lambda_max.is_finite().then_some(lambda_max)
+}
+
+/// Gershgorin's bound on `max_i |λ_i|` — and therefore on `max_i |Re λ_i|` — of a
+/// column-major `n × n` matrix: every eigenvalue lies in some disc centred on a diagonal
+/// entry with radius the sum of that row's off-diagonal magnitudes, so no eigenvalue can
+/// exceed `max_i (|a_ii| + Σ_{j≠i} |a_ij|)`.
+///
+/// This is the probe's cheap sufficient test for *non*-stiffness (#1080 Part B item 3): `O(n²)`
+/// adds against the `O(n³)` Schur iteration and its `DMatrix` allocation, and one-sided —
+/// a bound below the threshold **proves** no eigenvalue reaches it, while a bound above it
+/// proves nothing and the exact eigensolve still has to run. Since the escalation test is
+/// `λ_max ≥ threshold`, that one-sidedness is exactly the direction that can be short-circuited
+/// without changing a single decision.
+fn gershgorin_abs_bound(jac: &[f64], n: usize) -> f64 {
+    (0..n).fold(0.0_f64, |acc, i| {
+        let row = (0..n).fold(0.0_f64, |sum, j| sum + jac[i + j * n].abs());
+        acc.max(row)
+    })
 }
 
 /// Resolve [`OdeMethod::Auto`] against the system this driver is about to integrate; every
@@ -226,7 +269,26 @@ pub(crate) fn resolve_method<T: PkNum>(
     if opts.method != OdeMethod::Auto {
         return opts.method;
     }
-    match max_abs_re_eigenvalue(rhs, u, params, t) {
+    let Some(jac) = fd_jacobian(rhs, u, params, t) else {
+        return OdeMethod::EXPLICIT_FALLBACK;
+    };
+    // Cheap sufficient test first: if Gershgorin's bound on `|λ|max` is already below the
+    // threshold, no eigenvalue can reach it and the eigensolve would only confirm the verdict
+    // this line already gives. Ordinary absorption/elimination segments — the overwhelming
+    // majority of what a fit integrates — exit here, which is what makes the probe cheap
+    // enough to run per segment. Measured on a 3-state binding model
+    // (`measure_probe_cost_against_segment_cost`): the probe on a non-stiff system drops from
+    // 0.56 µs to 0.055 µs, taking `auto`'s overhead over a pinned `rk45` from 33% to 3% on a
+    // bare segment and from 19% to 1.3% on a realistic observation grid. That is #1080 Part B
+    // item 3's answer: per-subject latching would have traded away the per-segment probe —
+    // the only layer that sees the fast-binding family `min_step_clamped_steps` is blind to,
+    // and one whose verdict genuinely varies within a subject (a fast mode carried by
+    // `KON · central` is identically zero before the first dose) — for a saving a sound bound
+    // gets without giving up anything.
+    if gershgorin_abs_bound(&jac, u.len()) < STIFF_RE_LAMBDA_THRESHOLD {
+        return OdeMethod::EXPLICIT_FALLBACK;
+    }
+    match schur_max_abs_re(jac, u.len()) {
         Some(lambda) if lambda >= STIFF_RE_LAMBDA_THRESHOLD => stiff_method_for(opts),
         _ => OdeMethod::EXPLICIT_FALLBACK,
     }

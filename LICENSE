@@ -19,3 +19,25 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+-----------------------------------------------------------------------
+
+Per-file exception: `data/mbma_naproxen.csv`
+
+Everything in this repository is MIT-licensed as above, EXCEPT
+`data/mbma_naproxen.csv`. That test fixture is derived from an open access
+publication licensed CC BY-NC 4.0 (Boucher M, Bennetts M, CPT:PSP
+2018;7:288-297, doi:10.1002/psp4.12299) and carries that licence, not this
+one -- so commercial use of that file is not granted. See
+`data/mbma_naproxen.LICENSE` for the terms and `data/mbma_naproxen.README.md`
+for the provenance. It is test data only: it is never linked into the `ferx`
+binary, and `Cargo.toml` excludes the whole `data/mbma_naproxen.*` group from
+the packaged crate, so the crate published to crates.io carries no CC BY-NC
+file at all.
+
+The two companion files caught by that exclude glob are not the article's and
+are not CC BY-NC: `data/mbma_naproxen.README.md` is repo-authored prose under
+the MIT grant above, and `data/mbma_naproxen.LICENSE` reproduces Creative
+Commons' own licence text, which CC does not license under itself. They are
+excluded from the crate because they are meaningless without the data file,
+not because of their licence.

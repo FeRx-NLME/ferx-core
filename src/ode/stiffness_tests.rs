@@ -316,6 +316,164 @@ fn the_guard_re_solves_an_escalation_that_stalled_at_min_dt() {
     assert_eq!(named_stats.auto_stiff_rejected, 0);
 }
 
+/// `stiff_abort_after` and the `auto` guard compose the way they must: an escalation that
+/// trips the budget is still *discarded* (the guard's trigger is `min_step_clamped_steps > 0`,
+/// which an abort has by construction), so the budget makes the failed escalation cheaper
+/// without making the caller keep its freeze-padded trajectory.
+#[test]
+fn a_budgeted_abort_inside_an_escalation_is_still_rejected_by_the_guard() {
+    // Same blow-up fixture as `the_guard_re_solves_an_escalation_that_stalled_at_min_dt`.
+    let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| du[0] = u[0] * u[0];
+    let mut unbudgeted = OdeSolverStats::default();
+    solve_ode_with_stats(
+        &rhs,
+        &[1.0e6],
+        (0.0, 1.0),
+        &[],
+        &[1.0],
+        &loose(),
+        Some(&mut unbudgeted),
+    );
+
+    let budgeted_opts = OdeSolverOptions {
+        stiff_abort_after: Some(1),
+        ..loose()
+    };
+    let mut budgeted = OdeSolverStats::default();
+    solve_ode_with_stats(
+        &rhs,
+        &[1.0e6],
+        (0.0, 1.0),
+        &[],
+        &[1.0],
+        &budgeted_opts,
+        Some(&mut budgeted),
+    );
+
+    assert_eq!(budgeted.auto_stiff_segments, 1);
+    assert_eq!(
+        budgeted.auto_stiff_rejected, 1,
+        "an aborted escalation is a stalled escalation"
+    );
+    // The abort that is *counted* is the explicit re-solve's: this system blows up under any
+    // method, so the fallback trips the same budget. The discarded escalation's own abort is
+    // deliberately not counted — nobody received that trajectory.
+    assert!(budgeted.stiff_aborted_segments >= 1);
+    assert!(budgeted.discarded_clamped_steps > 0);
+    assert!(
+        budgeted.attempted_steps < unbudgeted.attempted_steps,
+        "the budget must cost fewer steps: {} vs {}",
+        budgeted.attempted_steps,
+        unbudgeted.attempted_steps
+    );
+}
+
+/// The Gershgorin fast path is a *bound*, so it must never sit below the exact `|Re λ|max` —
+/// otherwise it would short-circuit a genuinely stiff segment into the explicit method.
+#[test]
+fn the_gershgorin_bound_never_undercuts_the_exact_spectrum() {
+    // Diagonal (bound is exact), strongly coupled, and a rotation-like block whose
+    // eigenvalues are complex — the shape where a diagonal-only guess would be badly wrong.
+    let cases: Vec<(&str, Box<dyn Fn(&[f64], &[f64], f64, &mut [f64])>, Vec<f64>)> = vec![
+        (
+            "diagonal",
+            Box::new(|u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
+                du[0] = -1.0 * u[0];
+                du[1] = -1000.0 * u[1];
+            }),
+            vec![1.0, 1.0],
+        ),
+        (
+            "coupled",
+            Box::new(|u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
+                du[0] = -2.0 * u[0] + 50.0 * u[1];
+                du[1] = 40.0 * u[0] - 3.0 * u[1];
+            }),
+            vec![1.0, 1.0],
+        ),
+        (
+            "rotation",
+            Box::new(|u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
+                du[0] = -1.0 * u[0] - 80.0 * u[1];
+                du[1] = 80.0 * u[0] - 1.0 * u[1];
+            }),
+            vec![1.0, 1.0],
+        ),
+        (
+            "binding",
+            Box::new(binding_rhs::<f64>(100.0, 1.0)),
+            vec![100.0, 10.0, 0.0],
+        ),
+    ];
+    for (name, rhs, u) in cases {
+        let exact = max_abs_re_eigenvalue(&rhs, &u, &[], 0.0).unwrap();
+        let jac = fd_jacobian(&rhs, &u, &[], 0.0).unwrap();
+        let bound = gershgorin_abs_bound(&jac, u.len());
+        assert!(
+            bound >= exact * (1.0 - 1e-9),
+            "{name}: bound {bound} below exact {exact}"
+        );
+    }
+}
+
+/// …and the fast path must not change a single verdict: across five decades of the binding
+/// rate — the sweep that motivated the probe — `resolve_method` and the exact eigensolve agree
+/// on every segment.
+#[test]
+fn the_gershgorin_fast_path_agrees_with_the_exact_eigensolve() {
+    for kon in [0.001, 0.01, 0.1, 1.0, 10.0, 100.0, 1000.0] {
+        let rhs = binding_rhs::<f64>(kon, 1.0);
+        for u in [[0.0, 10.0, 0.0], [100.0, 10.0, 0.0], [1.0, 0.1, 5.0]] {
+            let opts = loose();
+            let exact = max_abs_re_eigenvalue(&rhs, &u, &[], 0.0).unwrap();
+            let expected = if exact >= STIFF_RE_LAMBDA_THRESHOLD {
+                OdeMethod::Rodas4
+            } else {
+                OdeMethod::EXPLICIT_FALLBACK
+            };
+            assert_eq!(
+                resolve_method(&rhs, &u, &[], 0.0, &opts),
+                expected,
+                "kon={kon} u={u:?} lambda={exact}"
+            );
+        }
+    }
+}
+
+/// Review follow-up (#1080): a discarded escalation's clamps are attributed to the *discarded*
+/// bucket, and a budgeted abort inside one is not reported as a truncated result — the caller
+/// received the explicit re-solve, not the attempt that was abandoned.
+#[test]
+fn a_discarded_escalations_clamps_are_recorded_as_discarded() {
+    let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| du[0] = u[0] * u[0];
+    let opts = OdeSolverOptions {
+        stiff_abort_after: Some(1),
+        ..loose()
+    };
+    let mut stats = OdeSolverStats::default();
+    solve_ode_with_stats(
+        &rhs,
+        &[1.0e6],
+        (0.0, 1.0),
+        &[],
+        &[1.0],
+        &opts,
+        Some(&mut stats),
+    );
+
+    assert_eq!(stats.auto_stiff_rejected, 1);
+    assert!(
+        stats.discarded_clamped_steps > 0,
+        "the rejected escalation's clamps must be attributed to it: {stats:?}"
+    );
+    // Whatever clamps survive the subtraction belong to the explicit re-solve, which is the
+    // trajectory the caller actually received.
+    assert!(
+        stats.min_step_clamped_steps >= stats.discarded_clamped_steps,
+        "{stats:?}"
+    );
+}
+
 #[test]
 fn auto_round_trips_through_the_fit_option_token() {
     assert_eq!(OdeMethod::parse("auto"), Some(OdeMethod::Auto));
@@ -330,4 +488,91 @@ fn auto_round_trips_through_the_fit_option_token() {
 #[test]
 fn the_threshold_constants_are_two_views_of_one_number() {
     assert!((STIFF_TAU_FAST * STIFF_RE_LAMBDA_THRESHOLD - 1.0).abs() < 1e-12);
+}
+
+#[test]
+#[ignore = "measurement harness for #1080 item 3"]
+fn measure_probe_cost_against_segment_cost() {
+    use crate::ode::solve_ode;
+    use std::time::Instant;
+    let rhs = binding_rhs::<f64>(100.0, 1.0);
+    let u = [100.0, 10.0, 0.0];
+    let opts = loose();
+    let n = 200_000;
+    let t0 = Instant::now();
+    for _ in 0..n {
+        std::hint::black_box(resolve_method(&rhs, &u, &[], 0.0, &opts));
+    }
+    let probe = t0.elapsed().as_secs_f64() / n as f64;
+
+    // A typical inter-dose segment: 12 h with one saveat, from the same state.
+    let m = 20_000;
+    let t1 = Instant::now();
+    for _ in 0..m {
+        std::hint::black_box(solve_ode(&rhs, &u, (0.0, 12.0), &[], &[12.0], &opts));
+    }
+    let segment = t1.elapsed().as_secs_f64() / m as f64;
+
+    let explicit = OdeSolverOptions {
+        method: OdeMethod::Rk45,
+        ..Default::default()
+    };
+    let t2 = Instant::now();
+    for _ in 0..m {
+        std::hint::black_box(solve_ode(&rhs, &u, (0.0, 12.0), &[], &[12.0], &explicit));
+    }
+    let segment_pinned = t2.elapsed().as_secs_f64() / m as f64;
+
+    println!(
+        "STIFF  probe {:.3} us | auto segment {:.3} us | pinned rk45 segment {:.3} us | probe share {:.2}%",
+        probe * 1e6,
+        segment * 1e6,
+        segment_pinned * 1e6,
+        100.0 * probe / segment
+    );
+
+    // The case per-subject latching would serve: a benign model, where the probe never
+    // escalates and is therefore pure overhead on every segment.
+    let benign = binding_rhs::<f64>(0.01, 1.0);
+    let t3 = Instant::now();
+    for _ in 0..n {
+        std::hint::black_box(resolve_method(&benign, &u, &[], 0.0, &opts));
+    }
+    let benign_probe = t3.elapsed().as_secs_f64() / n as f64;
+    let t4 = Instant::now();
+    for _ in 0..m {
+        std::hint::black_box(solve_ode(&benign, &u, (0.0, 12.0), &[], &[12.0], &opts));
+    }
+    let benign_auto = t4.elapsed().as_secs_f64() / m as f64;
+    let t5 = Instant::now();
+    for _ in 0..m {
+        std::hint::black_box(solve_ode(&benign, &u, (0.0, 12.0), &[], &[12.0], &explicit));
+    }
+    let benign_pinned = t5.elapsed().as_secs_f64() / m as f64;
+    // …and with a realistic observation grid on the segment, which is what a fit actually
+    // integrates (every `saveat` clamps a step, so the segment does more work per probe).
+    let saveat = [1.0, 2.0, 4.0, 6.0, 8.0, 12.0, 24.0];
+    let t6 = Instant::now();
+    for _ in 0..m {
+        std::hint::black_box(solve_ode(&benign, &u, (0.0, 24.0), &[], &saveat, &opts));
+    }
+    let grid_auto = t6.elapsed().as_secs_f64() / m as f64;
+    let t7 = Instant::now();
+    for _ in 0..m {
+        std::hint::black_box(solve_ode(&benign, &u, (0.0, 24.0), &[], &saveat, &explicit));
+    }
+    let grid_pinned = t7.elapsed().as_secs_f64() / m as f64;
+    println!(
+        "GRID   auto segment {:.3} us | pinned rk45 segment {:.3} us | auto overhead {:.2}%",
+        grid_auto * 1e6,
+        grid_pinned * 1e6,
+        100.0 * (grid_auto - grid_pinned) / grid_pinned
+    );
+    println!(
+        "BENIGN probe {:.3} us | auto segment {:.3} us | pinned rk45 segment {:.3} us | auto overhead {:.2}%",
+        benign_probe * 1e6,
+        benign_auto * 1e6,
+        benign_pinned * 1e6,
+        100.0 * (benign_auto - benign_pinned) / benign_pinned
+    );
 }

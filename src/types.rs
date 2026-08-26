@@ -3517,6 +3517,7 @@ impl CompiledModel {
             ode.solver_opts.abstol = opts.ode_abstol;
             ode.solver_opts.max_steps = opts.ode_max_steps;
             ode.solver_opts.method = opts.ode_method;
+            ode.solver_opts.stiff_abort_after = opts.ode_stiff_abort_after;
         }
         // Also carry the call-time tolerances into the absorption ODE twin (#814). A
         // closed-form transit/IG primary is analytic — the block above is a no-op — but its
@@ -4597,6 +4598,12 @@ pub enum WarningCode {
     /// remaining parameters can be estimated instead of the whole fit dying on an
     /// eval-1 optimizer `Failure` (#826).
     FlatParameter,
+    /// An ODE-solver diagnostic from the post-fit pass (#1080 Part B): steps clamped at the
+    /// minimum step size (a stability-limited, freeze-padded segment), a stiff escalation the
+    /// `auto` guard discarded, or a segment cut short by `ode_stiff_abort_after`. Distinct
+    /// from the optimizer codes — it says the *integration* under the final estimates was not
+    /// clean, whatever the optimizer made of it.
+    OdeSolver,
     /// Unrecognised message — fallback bucket.
     General,
 }
@@ -4635,6 +4642,7 @@ impl WarningCode {
             WarningCode::FlipFlop => "flip_flop",
             WarningCode::AbsorptionTwinDeclined => "absorption_twin_declined",
             WarningCode::FlatParameter => "flat_parameter",
+            WarningCode::OdeSolver => "ode_solver",
             WarningCode::General => "general",
         }
     }
@@ -4726,6 +4734,17 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
             WarningSeverity::Warning,
             WarningCode::AbsorptionTwinDeclined,
         )
+    } else if lower.contains("w_ode_solver_escalation_note") {
+        // #1080 Part B: the informational half — `ode_method = auto` escalated and the stiff
+        // method coped. Its own token, so re-classifying the plain message text recovers the
+        // `Info` severity the emitter used rather than promoting a routine note to a warning.
+        (WarningSeverity::Info, WarningCode::OdeSolver)
+    } else if lower.contains("w_ode_solver_diagnostics") {
+        // #1080 Part B: the post-fit solver-statistics pass. Matched on its `W_` token and
+        // placed with the other token arm, ahead of the prose ones — the message names
+        // methods and quotes counters, and "did not converge" style prose could plausibly be
+        // added to it later without anyone remembering this chain exists.
+        (WarningSeverity::Warning, WarningCode::OdeSolver)
     } else if lower.contains("did not converge")
         || lower.contains("without convergence")
         || lower.contains("no multi-start run converged")
@@ -5449,6 +5468,21 @@ pub struct FitOptions {
     /// integration paths honour them. Copied onto `OdeSpec::solver_opts` via
     /// [`CompiledModel::sync_ode_solver_opts`], alongside the tolerances.
     pub ode_method: crate::ode::OdeMethod,
+    /// Abort an ODE segment once this many of its steps have clamped at the solver's
+    /// minimum step size (`[fit_options] ode_stiff_abort_after`, #708/#1080). Default
+    /// `None` — grind on to [`ode_max_steps`](Self::ode_max_steps), the pre-#1080
+    /// behaviour.
+    ///
+    /// A clamp means the step failed its error test and was accepted anyway because `dt`
+    /// could not shrink further, i.e. the segment is stability-limited rather than
+    /// accuracy-limited. Setting a budget bounds what such a segment costs; the tail it
+    /// did not integrate is freeze-padded with the last state, so this is a
+    /// cost/accuracy trade, not a free win — the fit's ODE-solver warning reports how
+    /// many segments were cut short. Prefer `ode_method = auto` (the default) or a named
+    /// stiff method first; reach for this when a fit is grinding and you want it to say
+    /// so quickly. Copied onto `OdeSpec::solver_opts` via
+    /// [`CompiledModel::sync_ode_solver_opts`].
+    pub ode_stiff_abort_after: Option<u32>,
     pub run_covariance_step: bool,
     /// *Initial* relative step size for the finite-difference Hessian in the
     /// covariance step. The actual step for parameter i is
@@ -5978,6 +6012,7 @@ impl Default for FitOptions {
             ode_abstol: 1e-6,
             ode_max_steps: 10_000,
             ode_method: crate::ode::OdeMethod::Auto,
+            ode_stiff_abort_after: None,
             run_covariance_step: true,
             fd_hessian_step: 1e-2,
             covariance_fallback: CovarianceFallback::None,
@@ -6598,6 +6633,7 @@ pub fn framework_keys() -> &'static [&'static str] {
         "ode_abstol",
         "ode_max_steps",
         "ode_method",
+        "ode_stiff_abort_after",
         // Checkpoint / restart (#755): the periodic resume-point writer is driven
         // by the fit runner independent of the estimation method, so these are
         // framework-level — every method honours them.

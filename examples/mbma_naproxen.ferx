@@ -1,8 +1,14 @@
 # Model-based meta-analysis: naproxen vs placebo in osteoarthritis.
 #
-# The published Case Study 1 of Bracis et al., CPT:PSP 2026;15:e70158 — 18 trials,
-# 36 arms, longitudinal WOMAC pain — written as a compartment-free structural
-# model (issue #811).
+# The published longitudinal MBMA of Boucher M & Bennetts M, "Many Flavors of
+# Model-Based Meta-Analysis: Part II — Modeling Summary Level Longitudinal
+# Responses", CPT:PSP 2018;7:288–297 (doi:10.1002/psp4.12299) — 18 trials, 36 arms,
+# longitudinal WOMAC pain — written as a compartment-free structural model
+# (issue #811). Bracis et al., CPT:PSP 2026;15:e70158, replicate the same analysis
+# in MonolixSuite as their Case Study 1.
+#
+# The data are Boucher & Bennetts' supplementary file and are licensed CC BY-NC 4.0,
+# not MIT — see data/mbma_naproxen.LICENSE.
 #
 # This is the model class the compartment-free form exists for. There is no PK
 # here at all: the structural model is an Emax time-course on an aggregate arm

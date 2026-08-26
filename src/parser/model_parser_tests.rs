@@ -3776,6 +3776,73 @@ fn test_apply_fit_option_ode_method() {
     );
 }
 
+/// `ode_stiff_abort_after` (#708 / #1080 Part B): opt-in, disable-able without deleting the
+/// key, and framework-level so it is not reported as ignored.
+#[test]
+fn test_apply_fit_option_ode_stiff_abort_after() {
+    let mut opts = FitOptions::default();
+    assert_eq!(opts.ode_stiff_abort_after, None, "must be opt-in");
+
+    assert_eq!(
+        apply_fit_option(&mut opts, "ode_stiff_abort_after", "25"),
+        Ok(true)
+    );
+    assert_eq!(opts.ode_stiff_abort_after, Some(25));
+
+    // `0` / `off` / `none` turn the budget back off, so a settings list can disable it
+    // without removing the key.
+    for off in ["0", "off", "none", "false"] {
+        opts.ode_stiff_abort_after = Some(25);
+        assert_eq!(
+            apply_fit_option(&mut opts, "ode_stiff_abort_after", off),
+            Ok(true)
+        );
+        assert_eq!(opts.ode_stiff_abort_after, None, "{off}");
+    }
+
+    assert!(apply_fit_option(&mut opts, "ode_stiff_abort_after", "x").is_err());
+}
+
+/// The budget reaches the integrator the same way the tolerances do — through
+/// `sync_ode_solver_opts` at parse time — so `predict()`, which gets no fit options, honours
+/// it too.
+#[test]
+fn test_ode_stiff_abort_after_reaches_ode_spec() {
+    let src = r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 10.0)
+  theta TVV(10.0, 0.1, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_stiff_abort_after = 40
+"#;
+    let p = parse_full_model(src).unwrap();
+    assert_eq!(
+        p.model
+            .ode_spec
+            .as_ref()
+            .unwrap()
+            .solver_opts
+            .stiff_abort_after,
+        Some(40)
+    );
+    assert!(!p
+        .fit_options
+        .unsupported_keys_warnings()
+        .iter()
+        .any(|w| w.contains("ode_stiff_abort_after")));
+}
+
 #[test]
 fn test_ode_reltol_from_fit_options_reaches_ode_spec() {
     // [fit_options] ODE solver tolerances must be baked onto
@@ -16484,12 +16551,19 @@ fn sim_lines(body: &[&str]) -> Vec<String> {
     body.iter().map(|s| s.to_string()).collect()
 }
 
+/// [`parse_simulation_block`] with no declared covariates — the shape every key
+/// test below wants. The declared-name list only gates `covariate NAME = ...`
+/// (#1083); an empty list means "no `[covariates]` block", which accepts any name.
+fn parse_sim_block(lines: &[String]) -> Result<SimulationSpec, String> {
+    parse_simulation_block(lines, &[])
+}
+
 #[test]
 fn simulation_long_form_keys_apply() {
     // The canonical (and example-file) spellings must actually be honored —
     // the bug was that `n_subjects`/`dose_amt`/`dose_cmt` were silently ignored
     // and fell back to the defaults (10 / 100 / 1).
-    let spec = parse_simulation_block(&sim_lines(&[
+    let spec = parse_sim_block(&sim_lines(&[
         "n_subjects = 7",
         "dose_amt = 50",
         "dose_cmt = 2",
@@ -16509,7 +16583,7 @@ fn simulation_short_form_aliases_apply() {
     // Back-compat: the short `subjects`/`dose`/`cmt` forms (the previously
     // documented spelling) remain valid aliases for the same fields, and the
     // defaults hold for the keys we omit (seed = 42).
-    let spec = parse_simulation_block(&sim_lines(&[
+    let spec = parse_sim_block(&sim_lines(&[
         "subjects = 3",
         "dose = 25",
         "cmt = 4",
@@ -16526,7 +16600,7 @@ fn simulation_short_form_aliases_apply() {
 fn simulation_unknown_key_errors() {
     // A typo (e.g. `n_subject`) must be a hard error, not a silent default —
     // this is the silent-failure class the fix closes.
-    let err = parse_simulation_block(&sim_lines(&[
+    let err = parse_sim_block(&sim_lines(&[
         "n_subject = 5", // typo: missing the trailing 's'
         "times = [1.0]",
     ]))
@@ -16543,7 +16617,7 @@ fn simulation_unknown_key_errors() {
 fn simulation_malformed_line_errors() {
     // A non-blank line with no `=` (e.g. a forgotten `=`) is malformed and must
     // error rather than being silently skipped into the default.
-    let err = parse_simulation_block(&sim_lines(&["n_subjects 5", "times = [1.0]"])).unwrap_err();
+    let err = parse_sim_block(&sim_lines(&["n_subjects 5", "times = [1.0]"])).unwrap_err();
     assert!(
         err.starts_with("[simulation]:") && err.contains("malformed line"),
         "got: {err}"
@@ -16562,7 +16636,7 @@ fn simulation_bad_value_errors_per_key() {
         ("seed = -1", "seed"),          // seed is u64
         ("times = [1.0, oops]", "times"),
     ] {
-        let err = parse_simulation_block(&sim_lines(&[line, "times = [1.0]"])).unwrap_err();
+        let err = parse_sim_block(&sim_lines(&[line, "times = [1.0]"])).unwrap_err();
         assert!(
             err.starts_with("[simulation]:") && err.contains(key),
             "key `{key}` on `{line}` gave: {err}"
@@ -16572,18 +16646,18 @@ fn simulation_bad_value_errors_per_key() {
 
 #[test]
 fn simulation_requires_times() {
-    let err = parse_simulation_block(&sim_lines(&["n_subjects = 5"])).unwrap_err();
+    let err = parse_sim_block(&sim_lines(&["n_subjects = 5"])).unwrap_err();
     assert!(err.contains("times"), "got: {err}");
 }
 
 #[test]
 fn simulation_horizon_parses() {
     // `horizon = <t>` is captured as the administrative censoring window (#522).
-    let spec = parse_simulation_block(&sim_lines(&["horizon = 14", "times = [1.0]"]))
-        .expect("horizon parses");
+    let spec =
+        parse_sim_block(&sim_lines(&["horizon = 14", "times = [1.0]"])).expect("horizon parses");
     assert_eq!(spec.horizon, Some(14.0));
     // Absent ⇒ None (the per-record window path).
-    let spec = parse_simulation_block(&sim_lines(&["times = [1.0]"])).expect("no horizon");
+    let spec = parse_sim_block(&sim_lines(&["times = [1.0]"])).expect("no horizon");
     assert_eq!(spec.horizon, None);
 }
 
@@ -16591,7 +16665,7 @@ fn simulation_horizon_parses() {
 fn simulation_horizon_satisfies_observe_requirement() {
     // A TTE-only design has no continuous `times`; a `horizon` alone is enough
     // to make the block valid (the relaxed times-OR-horizon rule).
-    let spec = parse_simulation_block(&sim_lines(&["n_subjects = 5", "horizon = 14"]))
+    let spec = parse_sim_block(&sim_lines(&["n_subjects = 5", "horizon = 14"]))
         .expect("horizon alone is a valid design");
     assert_eq!(spec.horizon, Some(14.0));
     assert!(spec.obs_times.is_empty());
@@ -16605,7 +16679,7 @@ fn simulation_horizon_rejects_nonpositive_and_nonfinite() {
         "horizon = inf",
         "horizon = nan",
     ] {
-        let err = parse_simulation_block(&sim_lines(&[bad, "times = [1.0]"])).unwrap_err();
+        let err = parse_sim_block(&sim_lines(&[bad, "times = [1.0]"])).unwrap_err();
         assert!(
             err.starts_with("[simulation]:") && err.contains("horizon"),
             "`{bad}` gave: {err}"
@@ -16615,10 +16689,123 @@ fn simulation_horizon_rejects_nonpositive_and_nonfinite() {
 
 #[test]
 fn simulation_horizon_bad_value_errors() {
-    let err = parse_simulation_block(&sim_lines(&["horizon = abc", "times = [1.0]"])).unwrap_err();
+    let err = parse_sim_block(&sim_lines(&["horizon = abc", "times = [1.0]"])).unwrap_err();
     assert!(
         err.starts_with("[simulation]:") && err.contains("horizon"),
         "got: {err}"
+    );
+}
+
+// ── [simulation] per-subject covariates (#1083) ──────────────────────────
+//
+// A simulated trial invents arms that are in no dataset, so the covariates its
+// design turns on — an MBMA arm size behind `weight = NARM`, a reported standard
+// error behind `weight = WPSE` — have no row to be read from and must be stated
+// here. Before #1083 `SimulationSpec::covariates` was a field the parser always
+// wrote empty and nothing ever read.
+
+#[test]
+fn simulation_covariate_list_is_read_per_subject() {
+    let spec = parse_sim_block(&sim_lines(&[
+        "n_subjects = 3",
+        "times = [1.0]",
+        "covariate NARM = [400, 200, 50]",
+    ]))
+    .expect("per-subject covariate list parses");
+    assert_eq!(
+        spec.covariates,
+        vec![("NARM".to_string(), vec![400.0, 200.0, 50.0])]
+    );
+}
+
+#[test]
+fn simulation_covariate_scalar_broadcasts_to_every_subject() {
+    let spec = parse_sim_block(&sim_lines(&[
+        "n_subjects = 4",
+        "times = [1.0]",
+        "covariate WT = 70",
+    ]))
+    .expect("scalar covariate parses");
+    assert_eq!(spec.covariates, vec![("WT".to_string(), vec![70.0; 4])]);
+}
+
+#[test]
+fn simulation_covariate_length_is_checked_regardless_of_key_order() {
+    // `n_subjects` deliberately *follows* the covariate line: the length rule runs
+    // after the whole block is read, so the keys stay order-independent like every
+    // other key in this block.
+    let err = parse_sim_block(&sim_lines(&[
+        "covariate NARM = [400, 200]",
+        "n_subjects = 3",
+        "times = [1.0]",
+    ]))
+    .unwrap_err();
+    assert!(
+        err.starts_with("[simulation]:")
+            && err.contains("NARM")
+            && err.contains("2 value(s)")
+            && err.contains("3 subject(s)"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn simulation_covariate_must_be_declared_when_a_covariates_block_exists() {
+    // The `[covariates]` block is authoritative when present, exactly as it is for
+    // the data readers — a name it never declared is a typo, and one that reached
+    // `Subject` silently would be read by nothing.
+    let declared = vec!["NARM".to_string()];
+    let err = parse_simulation_block(
+        &sim_lines(&["n_subjects = 2", "times = [1.0]", "covariate NARN = 100"]),
+        &declared,
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("NARN") && err.contains("not declared in [covariates]"),
+        "got: {err}"
+    );
+    // …and the correctly-spelled one is accepted against the same list.
+    parse_simulation_block(
+        &sim_lines(&["n_subjects = 2", "times = [1.0]", "covariate NARM = 100"]),
+        &declared,
+    )
+    .expect("a declared covariate is accepted");
+}
+
+#[test]
+fn simulation_covariate_rejects_duplicates_and_bad_values() {
+    let dup = parse_sim_block(&sim_lines(&[
+        "n_subjects = 2",
+        "times = [1.0]",
+        "covariate NARM = 100",
+        "covariate NARM = 50",
+    ]))
+    .unwrap_err();
+    assert!(dup.contains("declared twice"), "got: {dup}");
+
+    let bad = parse_sim_block(&sim_lines(&[
+        "n_subjects = 1",
+        "times = [1.0]",
+        "covariate NARM = many",
+    ]))
+    .unwrap_err();
+    assert!(
+        bad.starts_with("[simulation]:") && bad.contains("NARM"),
+        "got: {bad}"
+    );
+
+    let nameless = parse_sim_block(&sim_lines(&["times = [1.0]", "covariate = 100"])).unwrap_err();
+    assert!(nameless.contains("needs a name"), "got: {nameless}");
+}
+
+#[test]
+fn simulation_covariate_matches_the_word_not_the_prefix() {
+    // `covariates = ...` must stay an unknown key rather than being read as a
+    // covariate named `s` — the arm is keyed on the word, not on `starts_with`.
+    let err = parse_sim_block(&sim_lines(&["times = [1.0]", "covariates = [1, 2]"])).unwrap_err();
+    assert!(
+        err.contains("unknown key `covariates`"),
+        "a prefix match would have accepted this: {err}"
     );
 }
 

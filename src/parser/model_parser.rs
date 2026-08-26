@@ -2675,10 +2675,6 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     };
 
     // ── Optional blocks ──
-    let simulation = blocks
-        .get("simulation")
-        .map(|lines| parse_simulation_block(lines))
-        .transpose()?;
     // Peek the `[covariates]` declarations (parsed for real further down, at the
     // block's own site) purely for name precedence: a declared `T` / `t` is a data
     // column, not the `[odes]` model-time alias, in `[scaling]` and in
@@ -2690,6 +2686,13 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         .and_then(|lines| parse_covariates_block(lines).ok())
         .map(|decls| decls.into_iter().map(|d| d.name).collect())
         .unwrap_or_default();
+    // Parsed after the peek (and still before `[adaptive_dosing]`, so the existing
+    // first-error ordering is unchanged) because `[simulation] covariate NAME = ...`
+    // is validated against the declared names (#1083).
+    let simulation = blocks
+        .get("simulation")
+        .map(|lines| parse_simulation_block(lines, &declared_covariate_names))
+        .transpose()?;
     // Declarative reactive-dosing controller (#391 S2). Parsed and validated here;
     // compiled to a controller and run by the adaptive simulate path in a later slice.
     let adaptive_dosing = blocks
@@ -6014,13 +6017,21 @@ fn prescan_ode_hazards(extracted: &ExtractedBlocks) -> Result<Vec<(usize, String
 
 // ── [simulation] block parser ───────────────────────────────────────────────
 
-fn parse_simulation_block(lines: &[String]) -> Result<SimulationSpec, String> {
+fn parse_simulation_block(
+    lines: &[String],
+    declared_covariate_names: &[String],
+) -> Result<SimulationSpec, String> {
     let mut n_subjects = 10;
     let mut dose_amt = 100.0;
     let mut dose_cmt = 1;
     let mut obs_times = Vec::new();
     let mut seed = 42u64;
     let mut horizon: Option<f64> = None;
+    // `covariate NAME = ...` statements, in declaration order (#1083). Collected
+    // raw and validated after the loop, so the block's keys stay order-independent
+    // — a `covariate` line may precede the `n_subjects` its length is checked
+    // against.
+    let mut covariates: Vec<(String, Vec<f64>)> = Vec::new();
 
     for line in lines {
         let parts: Vec<&str> = line.splitn(2, '=').map(|s| s.trim()).collect();
@@ -6080,7 +6091,91 @@ fn parse_simulation_block(lines: &[String]) -> Result<SimulationSpec, String> {
                 }
                 horizon = Some(t);
             }
+            // Per-subject covariate values (#1083). A simulated trial's design
+            // *is* its covariates — an MBMA arm size (`weight = NARM`) or a
+            // reported within-arm SE (`weight = WPSE`) has no data row to be read
+            // from, because the arm being simulated does not exist yet. Either a
+            // scalar (broadcast to every subject) or one value per subject:
+            //
+            //   covariate NARM = 200               # every arm has 200 subjects
+            //   covariate NARM = [400, 200, 50]    # one per simulated subject
+            //
+            // Matched on the `covariate` *word*, not the prefix, so a future key
+            // that merely starts with it (`covariates = ...`) is still reported as
+            // unknown rather than read as a covariate named `s`.
+            other
+                if other == "covariate"
+                    || other
+                        .strip_prefix("covariate")
+                        .is_some_and(|r| r.starts_with(char::is_whitespace)) =>
+            {
+                let name = other["covariate".len()..].trim();
+                if name.is_empty() {
+                    return Err(
+                        "[simulation]: `covariate` needs a name: `covariate NAME = <value>` \
+                         (or `= [v1, v2, ...]`, one per subject)"
+                            .to_string(),
+                    );
+                }
+                if !is_plain_identifier(name) {
+                    return Err(format!(
+                        "[simulation]: `covariate {name}` is not a valid covariate name — \
+                         expected `covariate NAME = <value>`"
+                    ));
+                }
+                if covariates.iter().any(|(n, _)| n == name) {
+                    return Err(format!(
+                        "[simulation]: covariate `{name}` is declared twice"
+                    ));
+                }
+                // A `[covariates]` block is authoritative when present, exactly as
+                // it is for the data readers: simulating a name the model never
+                // declared is a typo, and one that silently reached `Subject`
+                // would be read by nothing.
+                if !declared_covariate_names.is_empty()
+                    && !declared_covariate_names.iter().any(|n| n == name)
+                {
+                    return Err(format!(
+                        "[simulation]: covariate `{name}` is not declared in [covariates] \
+                         (declared: {})",
+                        declared_covariate_names.join(", ")
+                    ));
+                }
+                let raw = parts[1].trim();
+                let values = if raw.starts_with('[') {
+                    parse_float_array(raw)
+                        .map_err(|e| format!("[simulation]: bad covariate `{name}`: {e}"))?
+                } else {
+                    vec![raw.parse::<f64>().map_err(|_| {
+                        format!("[simulation]: bad covariate `{name}`: {}", line.trim())
+                    })?]
+                };
+                if let Some(bad) = values.iter().find(|v| !v.is_finite()) {
+                    return Err(format!(
+                        "[simulation]: covariate `{name}` has a non-finite value ({bad})"
+                    ));
+                }
+                covariates.push((name.to_string(), values));
+            }
             other => return Err(format!("[simulation]: unknown key `{}`", other)),
+        }
+    }
+    // Length rule, now that `n_subjects` is known regardless of key order: a
+    // scalar broadcasts, a list must name every subject. A short list silently
+    // recycled (or zero-filled) would give the unnamed arms a weight of 0 — which
+    // divides an individual parameter by zero, or collapses a residual variance
+    // onto the floor, with no diagnostic (#1083).
+    for (name, values) in &mut covariates {
+        match values.len() {
+            1 => values.resize(n_subjects, values[0]),
+            n if n == n_subjects => {}
+            n => {
+                return Err(format!(
+                    "[simulation]: covariate `{name}` has {n} value(s) but there are \
+                     {n_subjects} subject(s) — give one value per subject, or a single \
+                     scalar to use for all of them"
+                ))
+            }
         }
     }
     // A synthetic design needs *something* to observe: continuous `times` for a
@@ -6101,7 +6196,7 @@ fn parse_simulation_block(lines: &[String]) -> Result<SimulationSpec, String> {
         obs_times,
         seed,
         horizon,
-        covariates: vec![],
+        covariates,
     })
 }
 
@@ -6926,6 +7021,17 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 return Err("ode_max_steps must be a positive integer".to_string());
             }
             opts.ode_max_steps = v;
+        }
+        // `0` / `off` / `none` disables the budget (back to `ode_max_steps`), so a
+        // settings list can turn it off without deleting the key.
+        "ode_stiff_abort_after" => {
+            opts.ode_stiff_abort_after = match value.to_lowercase().as_str() {
+                "off" | "none" | "false" => None,
+                _ => {
+                    let v = parse_usize("ode_stiff_abort_after")?;
+                    (v > 0).then(|| v.min(u32::MAX as usize) as u32)
+                }
+            };
         }
         "ode_method" => {
             opts.ode_method = crate::ode::OdeMethod::parse(value).ok_or_else(|| {
