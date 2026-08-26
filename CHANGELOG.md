@@ -20,6 +20,14 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Three-argument `clamp(x, lo, hi)` in the model DSL (#1092).** Bounding a readout into an
+  interval no longer has to be written as the nested `min(max(x, lo), hi)`, whose argument order
+  flips between the inner and outer call. Available in every expression the DSL parses
+  (`[individual_parameters]`, `[scaling]`, `[odes]`, `[derived]`); it desugars to the inline
+  conditional, so it differentiates and compiles exactly like the nested form. `clamp` with any
+  arity other than three is a parse error — a one-argument `clamp(x)` would otherwise have been
+  read as the silent identity — and literal bounds given the wrong way round (`clamp(x, 0.9, 0.1)`)
+  are rejected rather than quietly returning `0.9` for every `x`.
 - **`[simulation]` can now state the covariates of the arms it invents (#1083).** `covariate NAME = <value>`
   — a scalar for every subject, or `= [v1, v2, ...]` with one value per subject — gives the synthetic
   subjects a covariate value, which a `[simulation]` design previously had no way to express at all.

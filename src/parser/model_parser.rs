@@ -19773,14 +19773,72 @@ fn parse_atom(
             }
 
             // Check if it's a function call: `name(expr)` — or, for `min` / `max`,
-            // the two-argument `name(a, b)` form (#1030).
+            // the two-argument `name(a, b)` form (#1030), or the three-argument
+            // `clamp(x, lo, hi)` (#1092).
             if pos + 1 < tokens.len() && tokens[pos + 1] == Token::LParen {
                 let func_name = name.to_lowercase();
                 let is_min_max = matches!(func_name.as_str(), "min" | "max");
+                let is_clamp = func_name == "clamp";
                 let (arg, p) = parse_add_sub(tokens, pos + 2, ctx)?;
-                if is_min_max && tokens.get(p) == Some(&Token::Comma) {
+                if (is_min_max || is_clamp) && tokens.get(p) == Some(&Token::Comma) {
                     let (arg2, p) = parse_add_sub(tokens, p + 1, ctx)?;
+                    if is_clamp {
+                        if tokens.get(p) != Some(&Token::Comma) {
+                            return Err(format!(
+                                "`{func_name}` takes exactly three arguments: \
+                                 `clamp(x, lo, hi)`."
+                            ));
+                        }
+                        let (arg3, p) = parse_add_sub(tokens, p + 1, ctx)?;
+                        if tokens.get(p) != Some(&Token::RParen) {
+                            return Err(format!(
+                                "Missing closing parenthesis for function {name} — `{func_name}` \
+                                 takes exactly three arguments, `clamp(x, lo, hi)`."
+                            ));
+                        }
+                        // An inverted *literal* interval can only be a typo: the
+                        // desugaring below would return `lo` for every `x`, quietly.
+                        // Non-literal bounds are left alone rather than paying an
+                        // ordering test on every evaluation of every clamp.
+                        if let (Expression::Literal(lo), Expression::Literal(hi)) = (&arg2, &arg3) {
+                            if lo > hi {
+                                return Err(format!(
+                                    "`clamp(x, {lo}, {hi})` has its bounds inverted — the lower \
+                                     bound must not be above the upper bound."
+                                ));
+                            }
+                        }
+                        // Desugar to nested inline conditionals, exactly as `min` /
+                        // `max` do just below:
+                        //   `clamp(x, lo, hi)` → `if (x <= lo) lo else if (x >= hi) hi else x`
+                        // `Expression::Conditional` is already evaluated,
+                        // bytecode-compiled, `Dual2`-differentiated and index-resolved
+                        // everywhere in the pipeline, so `clamp` inherits all of it and
+                        // cannot drift from the `min(max(x, lo), hi)` it replaces.
+                        // `x` lands in the tree three times (`lo` and `hi` twice each) —
+                        // the same cost as writing the nested form by hand, so clamp a
+                        // *named* value rather than a long expression.
+                        let inner = Expression::Conditional(
+                            Box::new(Condition::Compare(arg.clone(), CmpOp::Ge, arg3.clone())),
+                            Box::new(arg3),
+                            Box::new(arg.clone()),
+                        );
+                        return Ok((
+                            Expression::Conditional(
+                                Box::new(Condition::Compare(arg, CmpOp::Le, arg2.clone())),
+                                Box::new(arg2),
+                                Box::new(inner),
+                            ),
+                            p + 1,
+                        ));
+                    }
                     if tokens.get(p) != Some(&Token::RParen) {
+                        if tokens.get(p) == Some(&Token::Comma) {
+                            return Err(format!(
+                                "function `{name}` takes 2 arguments, but a third `,` was found — \
+                                 a two-sided bound is `clamp(x, lo, hi)`."
+                            ));
+                        }
                         return Err(format!(
                             "Missing closing parenthesis for function {} — `{}` takes exactly \
                              two arguments, `{}(a, b)`.",
@@ -19813,7 +19871,8 @@ fn parse_atom(
                     if tokens.get(p) == Some(&Token::Comma) {
                         return Err(format!(
                             "function `{}` takes 1 argument, but a `,` was found — only \
-                             `min(a, b)` and `max(a, b)` take two.",
+                             `min(a, b)` and `max(a, b)` take two, and `clamp(x, lo, hi)` \
+                             takes three.",
                             name
                         ));
                     }
@@ -19823,6 +19882,15 @@ fn parse_atom(
                     return Err(format!(
                         "`{}` takes exactly two arguments: `{}(a, b)`.",
                         name, func_name
+                    ));
+                }
+                if is_clamp {
+                    // A one-argument `clamp(x)` used to fall through to
+                    // `UnaryFn("clamp", x)`, which every consumer evaluates as the
+                    // identity — a no-op that fits, converges and gives wrong
+                    // numbers (#1092). Reject it by name.
+                    return Err(format!(
+                        "`{func_name}` takes exactly three arguments: `clamp(x, lo, hi)`."
                     ));
                 }
                 return Ok((Expression::UnaryFn(func_name, Box::new(arg)), p + 1));
