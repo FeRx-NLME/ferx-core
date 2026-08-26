@@ -3518,6 +3518,7 @@ impl CompiledModel {
             ode.solver_opts.max_steps = opts.ode_max_steps;
             ode.solver_opts.method = opts.ode_method;
             ode.solver_opts.stiff_abort_after = opts.ode_stiff_abort_after;
+            ode.solver_opts.auto_switch = opts.ode_auto_switch;
         }
         // Also carry the call-time tolerances into the absorption ODE twin (#814). A
         // closed-form transit/IG primary is analytic — the block above is a no-op — but its
@@ -5483,6 +5484,17 @@ pub struct FitOptions {
     /// so quickly. Copied onto `OdeSpec::solver_opts` via
     /// [`CompiledModel::sync_ode_solver_opts`].
     pub ode_stiff_abort_after: Option<u32>,
+    /// Let `ode_method = auto` change stepper **inside** an integration segment, not only at
+    /// its start (`[fit_options] ode_auto_switch`, #1080 Part C). Default `true`; ignored
+    /// under a named `ode_method`, which is pinned.
+    ///
+    /// The a-priori probe reads the Jacobian at the segment's entry state, which is the state
+    /// a binding model looks least stiff at — both factors of `KON · C · R` are zero when the
+    /// dose lands. With this on, the probe is re-read every 25 accepted steps and the stepper
+    /// is swapped in place when the verdict changes, keeping the state integrated so far.
+    /// Setting it to `false` restores one method per segment, chosen at its start. Copied onto
+    /// `OdeSpec::solver_opts` via [`CompiledModel::sync_ode_solver_opts`].
+    pub ode_auto_switch: bool,
     pub run_covariance_step: bool,
     /// *Initial* relative step size for the finite-difference Hessian in the
     /// covariance step. The actual step for parameter i is
@@ -6013,6 +6025,7 @@ impl Default for FitOptions {
             ode_max_steps: 10_000,
             ode_method: crate::ode::OdeMethod::Auto,
             ode_stiff_abort_after: None,
+            ode_auto_switch: true,
             run_covariance_step: true,
             fd_hessian_step: 1e-2,
             covariance_fallback: CovarianceFallback::None,
@@ -6634,6 +6647,7 @@ pub fn framework_keys() -> &'static [&'static str] {
         "ode_max_steps",
         "ode_method",
         "ode_stiff_abort_after",
+        "ode_auto_switch",
         // Checkpoint / restart (#755): the periodic resume-point writer is driven
         // by the fit runner independent of the estimation method, so these are
         // framework-level — every method honours them.

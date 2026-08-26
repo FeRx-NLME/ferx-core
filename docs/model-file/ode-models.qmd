@@ -311,14 +311,16 @@ Both were accepted rather than fixed, because the obvious alternatives are worse
 its first dose, and scaling by the segment length makes a long segment on a benign model read
 stiff. On either of these, name a method.
 
-Two counters record what `auto` did. They sit on the solver-statistics struct alongside the
-step counts, which a fit does not currently print — they are what a diagnostic caller
-(`ode_predictions_with_solver_stats`) and the test suite read:
+Three counters record what `auto` did. They sit on the solver-statistics struct alongside the
+step counts, and ride along in the `ode_solver` warning's `details` payload:
 
-- **auto-stiff segments** — integrations that started on a stiff method because the probe
-  escalated. Always `0` under a named method, so any non-zero value is `auto` at work.
+- **auto-stiff segments** — integrations `auto` put on a stiff method, whether the probe
+  escalated at the segment's start or a mid-segment re-probe did. Always `0` under a named
+  method, so any non-zero value is `auto` at work.
+- **auto-switched segments** — of those, the ones whose stepper changed *part-way through the
+  segment* (see below). One per segment, however many times it changed its mind.
 - **auto-stiff rejections** — escalations whose result was thrown away and re-solved
-  explicitly. A subset of the above, and normally `0`. A non-zero count means the probe was
+  explicitly. A subset of the first, and normally `0`. A non-zero count means the probe was
   right that the system is stiff but the method it picked could not integrate it — try naming
   `rodas5p` or `rosenbrock23` explicitly.
 
@@ -359,6 +361,62 @@ The cost when nothing is stiff is one Jacobian build and one eigensolve per inte
 — the same work a single Rosenbrock step attempt does, against a segment that takes tens to
 thousands of steps. Zero-length segments skip it entirely.
 
+#### When a segment turns stiff halfway through {#mid-segment-switching}
+
+The probe reads the Jacobian at a segment's **entry** state, and for a binding model that is the
+state it looks least stiff at: the fast mode is carried by a term like `KON · C · R`, so it does
+not exist until both drug and target are present. A depot-absorption binding model reads
+`|Re λ|max = 10` when the dose lands — comfortably non-stiff — and `7.6e3` an hour later, once
+drug has been absorbed and target has accumulated.
+
+That gap is not merely slow. Integrated explicitly at default tolerances, the same 24-hour
+segment exhausts `ode_max_steps` and comes back with a **median relative error of 143 %** in the
+central compartment, while `rodas4` integrates it to `7e-8` in 79 steps. And it does so
+*quietly*: the segment produces **zero** minimum-step clamps and a **lower** step-rejection rate
+than the accurate cases, so neither the min-step counter nor a rejection-rate detector can see
+it. Only re-reading the Jacobian can.
+
+So `auto` does exactly that. Every 25 accepted steps it re-runs the probe at the state the
+segment has reached and, if the verdict has changed, **swaps the stepper in place**: the segment
+keeps everything it has integrated so far and carries on with the other method, rather than
+restarting or re-solving. On the model above this takes `auto` from 143 % median error in 10 000
+steps to `7e-8` in 90 — matching the method a user would have had to know to name in advance.
+
+A switch onto a stiff method is guarded exactly like a start-of-segment escalation: if that half
+comes back non-finite or clamps at the minimum step, the segment is discarded and re-solved with
+the explicit stepper, so the worst case stays "the explicit answer, twice the cost". Only clamps
+taken *by the stiff stepper* count towards that test — a segment that clamped explicitly and was
+then rescued by the switch is kept, since discarding it would hand back exactly the explicit
+result the switch had just avoided. The
+event-time path (TTE draws, adaptive dosing) switches on the same rule, where it matters more —
+its output *is* the answer, so a badly integrated span moves the event time rather than one
+prediction.
+
+Being a threshold test, the re-probe is also a **discontinuity** in the objective as a function
+of θ: a segment whose `|Re λ|max` sits near the threshold when the probe fires can switch at θ
+and not at θ+h, and the two trajectories differ by far more than the solver tolerance. The
+start-of-segment probe and the escalation guard have the same property — re-probing adds up to
+eight more decision points per segment. Unlike `ode_stiff_abort_after` this is
+still on by default, because on a segment that actually turns stiff the alternative is not a
+slightly different trajectory but a 143 %-wrong one. If a covariance step returns implausible
+standard errors on a model whose `ode_solver` warning reports mid-segment switches, re-run it
+with `ode_auto_switch = false`, or with a named stiff method (pinned, and so free of both the
+probe and the guard), to see whether the switching is what moved them.
+
+A benign segment stays on its stepper: a segment shorter than 25 accepted steps is never
+re-probed at all, and a longer one pays roughly one probe per 25 steps — a Jacobian build and an
+eigensolve against 25 full steps — and keeps a trajectory bit-identical to the pinned explicit
+one, because the verdict never changes. To go back to one method per segment, chosen at its
+start:
+
+```
+[fit_options]
+  ode_auto_switch = false
+```
+
+Like every other part of `auto`, this is off under a named `ode_method` — a pinned method is
+honoured as asked.
+
 #### Which regime am I in?
 
 This matters, because a stiff solver does **not** speed up a fit that is merely *accurate*-
@@ -383,7 +441,9 @@ at the final estimates and reports what the solver did there as an `ode_solver` 
 (see [Warnings](../warnings.qmd#warning-codes)). It fires when a step clamped at the minimum
 step size, when an `auto` escalation had to be discarded and re-solved explicitly, or when
 `ode_stiff_abort_after` cut a segment short — and, at `Info` severity, when `auto` escalated
-and everything worked, so an escalation is never invisible. Clamps taken inside an escalation
+and everything worked, so an escalation is never invisible. Either way it says how many
+segments changed stepper part-way through, because that changes how the step counts above it
+read: the steps before a switch were taken by a different method than the ones after it. Clamps taken inside an escalation
 the guard *discarded* are reported as part of that rejection rather than as freeze-padding:
 the trajectory they produced was thrown away and re-solved explicitly. A **rejected** escalation is the
 most actionable line ferx prints about the solver: the probe was right that the segment is

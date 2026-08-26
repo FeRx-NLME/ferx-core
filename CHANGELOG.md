@@ -66,6 +66,22 @@ section of the SDLC for the versioning policy).
   reported solver statistics at all, so both the escalation and its rejection were invisible outside
   the test suite. An escalation that simply worked is reported at `Info` severity; anything that did
   not integrate cleanly is a `Warning`. The counters ride along in the warning's `details` payload.
+- **`ode_method = auto` can now change stepper *inside* a segment (#1080).** The stiffness probe reads
+  the Jacobian at each segment's entry state, which is the state a binding model looks least stiff at —
+  both factors of a `KON · C · R` term are zero when a dose lands. A depot-absorption binding model
+  reads `|Re λ|max = 10` on entry and `7.6e3` an hour later; integrated explicitly, that segment
+  exhausts `ode_max_steps` and comes back with a **median relative error of 143 %**, and it does so
+  with **zero** minimum-step clamps and a lower step-rejection rate than the accurate cases, so no
+  step-history counter can see it. `auto` now re-runs the probe every 25 accepted steps and swaps the
+  stepper in place when the verdict changes, keeping the state integrated so far: 143 % error in
+  10 000 steps becomes `7e-8` in 90, matching the method a user would have had to know to name in
+  advance. A mid-segment escalation is guarded exactly like a start-of-segment one (discarded and
+  re-solved explicitly if it comes back non-finite or clamps on the stiff stepper), the event-time
+  path switches on the same rule, and a benign segment stays bit-identical — it is never re-probed
+  at all below 25 accepted steps, and pays about one probe per 25 steps above that. New
+  `ode_auto_switch = false` restores one method per segment, chosen at its start; a named
+  `ode_method` is pinned as before. See
+  [ODE models → When a segment turns stiff halfway through](https://ferx-nlme.github.io/ferx-core/model-file/ode-models.html#mid-segment-switching).
 - **`ode_stiff_abort_after` bounds what a stalled ODE segment costs (#708, #1080).** A segment that is
   stability-limited keeps stepping at the minimum step size until it exhausts `ode_max_steps`;
   setting this key gives up after that many clamped steps instead. Off by default and deliberately

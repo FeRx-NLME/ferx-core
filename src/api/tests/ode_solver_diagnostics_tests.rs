@@ -123,6 +123,76 @@ fn an_escalation_that_worked_is_reported_as_info() {
     );
 }
 
+/// A mid-segment switch (#1080 Part C) is reported as a clause on the escalation note, not as
+/// a problem of its own: `auto` deciding late is what the feature is for on a model whose
+/// stiffness only appears after a dose. What the note has to say is that the decision was taken
+/// part-way through, because it changes how the step counters above it read.
+#[test]
+fn a_mid_segment_switch_is_reported_on_the_escalation_note() {
+    let stats = OdeSolverStats {
+        attempted_steps: 400,
+        accepted_steps: 400,
+        auto_stiff_segments: 12,
+        auto_switched_segments: 9,
+        ..Default::default()
+    };
+    let (msg, entry) =
+        ode_solver_diagnostics_warning(&stats, &FitOptions::default()).expect("a note");
+    assert_eq!(entry.severity, WarningSeverity::Info);
+    // Spelled out in full, not by fragment: a line-continuation left unescaped inside the
+    // clause's literal collapses into a run of indentation that only the whole sentence sees.
+    assert!(
+        msg.contains(
+            "9 of them changed stepper part-way through the segment, because a mid-segment \
+             re-probe disagreed with the verdict the segment started on (ode_auto_switch)."
+        ),
+        "{msg}"
+    );
+    assert!(
+        !msg.contains("  "),
+        "no run of blank space may reach a user: {msg}"
+    );
+    assert_eq!(
+        entry.details.as_ref().unwrap()["auto_switched_segments"],
+        serde_json::json!(9)
+    );
+}
+
+/// …and a fit that switched *and* did not integrate cleanly says both: the switch clause rides
+/// the warning too, so the counters it explains are never presented without it.
+///
+/// It gets its own wording there. The warning's body is a list of clamped steps and abandoned
+/// segments, so the info note's "N of them" would attach to whichever clause happened to come
+/// last and read as "9 of the clamped steps".
+#[test]
+fn a_switch_is_reported_alongside_an_unclean_solve() {
+    let stats = OdeSolverStats {
+        min_step_clamped_steps: 12,
+        auto_stiff_segments: 12,
+        auto_switched_segments: 9,
+        ..Default::default()
+    };
+    let (msg, entry) =
+        ode_solver_diagnostics_warning(&stats, &FitOptions::default()).expect("a warning");
+    assert_eq!(entry.severity, WarningSeverity::Warning);
+    assert!(
+        msg.contains(
+            "9 segment(s) changed stepper part-way through, because a mid-segment re-probe \
+             disagreed with the verdict the segment started on (ode_auto_switch)."
+        ),
+        "{msg}"
+    );
+    assert!(
+        !msg.contains("of them"),
+        "the warning body gives \"of them\" no antecedent: {msg}"
+    );
+    assert!(
+        !msg.contains("  "),
+        "no run of blank space may reach a user: {msg}"
+    );
+    assert_eq!(classify_warning(&msg).category, WarningCode::OdeSolver);
+}
+
 /// A rejected escalation is the actionable one: the probe was right about the stiffness and
 /// wrong about the method, and only the user can pick another.
 #[test]
