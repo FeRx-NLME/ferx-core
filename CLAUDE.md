@@ -113,8 +113,14 @@ covariate on the compartment the dose *lands in* rather than only on downstream 
 an `init(...)` baseline where a first dose would otherwise start from zero. The same
 applies to a fixture asserted against ferx's own predictor: it agrees with a wrong
 answer by construction whenever both paths share the convention under test, so the
-external reference is what has to see both sides. #1060 shipped a green single-dose
-anchor next to a 14.9-OFV multi-dose divergence (#1073) that no fixture could see.
+external reference is what has to see both sides. Two engines are not automatically
+two references either — a cross-engine oracle only sees a defect *downstream* of the
+point where the engines part. #1079's kappa = 0 readout was catchable that way because
+each engine applies the readout itself, but the per-occasion snapshot feeding
+`ALAG`/`F`/`D{n}`/`R{n}` is built in `predict_iov` *before* the `ode_spec` branch, so
+both arms inherit it and an analytic-vs-ODE twin would agree on a wrong one. #1060
+shipped a green single-dose anchor next to a 14.9-OFV multi-dose divergence (#1073)
+that no fixture could see.
 When an anchor does fail, vary **one input at a time** — the pair that differs by a
 single number is what localises the defect (`nonmem_anchor/tvcov_lag_saltation*`).
 
