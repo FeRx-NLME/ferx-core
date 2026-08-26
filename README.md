@@ -182,3 +182,10 @@ preds <- ferx_predict("warfarin.ferx", "warfarin.csv")
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+One exception: the test fixture `data/mbma_naproxen.csv` is derived from a
+CC BY-NC 4.0 publication and carries that licence instead, so **commercial use
+of that file is not granted**. It is test data only — never linked into the
+`ferx` binary, and excluded from the packaged crate along with its README and
+licence companions, so the published crate carries no CC BY-NC file. See
+[`data/mbma_naproxen.LICENSE`](data/mbma_naproxen.LICENSE).

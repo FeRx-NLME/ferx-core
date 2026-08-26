@@ -98,6 +98,21 @@ section of the SDLC for the versioning policy).
   shipping experimental components to every ODE user. The promotion rests on this release's
   validation: a NONMEM FOCEI anchor on the cyclophosphamide model (ferx 3241.708 vs NONMEM
   3241.721) and prediction-equivalence tests across all five methods.
+- **The naproxen MBMA fixture is re-sourced to its primary publication, and is licensed CC BY-NC 4.0
+  rather than MIT (#1085).** `data/mbma_naproxen.csv` was derived from the supplementary material of
+  Bracis et al. (*CPT:PSP* 2026;15:e70158), which is CC BY-NC-**ND** — a licence that forbids
+  distributing an adapted copy at all. The dataset is not theirs: it originates with Boucher &
+  Bennetts, *Many Flavors of Model-Based Meta-Analysis: Part II*, *CPT:PSP* 2018;7:288–297
+  (CC BY-NC, no ND clause), whom that tutorial replicates. The fixture is now derived from the
+  primary source instead, which removes the no-derivatives problem and makes the attribution
+  correct. Everything in the repository stays MIT **except** `data/mbma_naproxen.csv`, which carries
+  CC BY-NC 4.0 — so commercial use of that file is not granted. The exception is recorded in the
+  root `LICENSE`, in `data/mbma_naproxen.LICENSE`, and in the data README, and `Cargo.toml` now
+  excludes the files — together with the slow test that reads them, which would otherwise panic on a
+  missing fixture — so the crate published to crates.io is uniformly MIT. The data itself is
+  unchanged but for one digit: the tutorial's precomputed `WP / WPSE` column stores 7 decimals, and
+  for one of 122 rows that intermediate rounds the sixth decimal down where the primary source's
+  `WP` and `WPSE` round it up. No estimate or OFV moves.
 - **Every line in `[structural_model]` is now checked (#811).** The block was scanned for the first
   `pk NAME(...)` match with an unanchored pattern and every other line was discarded, so
   `zpk one_cpt_iv(cl=CL, v=V)` parsed as a valid one-compartment IV model and a mistyped or stray
@@ -393,7 +408,7 @@ section of the SDLC for the versioning policy).
   relative on every estimate and standard error, and to 5 decimal places on the objective
   (`nonmem_anchor/algebraic_emax.*`). See `examples/emax_timecourse.ferx`, and
   `examples/mbma_naproxen.ferx` for the published model-based meta-analysis case study
-  (Bracis et al., *CPT:PSP* 2026;15:e70158) it reproduces to three significant figures.
+  (Boucher & Bennetts, *CPT:PSP* 2018;7:288–297) it reproduces to three significant figures.
 - **Sample-size-weighted IOV: `weight = <expr>` on a `kappa` declaration (#1031).** The arm-level
   random effect of every longitudinal MBMA — between-treatment-arm variability — is distributed
   `κ_ik ~ N(0, γ²/N_ik)`: a 400-subject arm's mean wanders a quarter as far as a 25-subject arm's.
