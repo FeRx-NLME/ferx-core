@@ -50,7 +50,6 @@ fn tiny_model() -> CompiledModel {
         eta_names: vec!["ETA_CL".into()],
         indiv_param_names: vec!["CL".into(), "V".into()],
         indiv_param_partials: crate::types::IndivParamPartials::empty(),
-        theta_blocks: crate::types::ThetaBlocks::empty(),
         default_params,
         omega_init_as_sd: vec![false],
         sigma_init_as_sd: vec![false],

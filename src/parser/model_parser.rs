@@ -2222,6 +2222,15 @@ pub fn parse_full_model_bound(
     // reads its copy from `indiv_param_partials` (ODE models route to the ODE
     // provider, so the partials copy is unused there — a single parse-time clone).
     indiv_param_partials.indiv_param_program = Some(indiv_param_program.clone());
+    // Keep additive parser metadata inside the existing opaque placeholder.
+    // Adding it directly to public `CompiledModel` would break every external
+    // struct literal.
+    indiv_param_partials.theta_blocks = ThetaBlocks {
+        decls: vector_theta_decls.clone(),
+        uses: VectorThetaScope::uses(),
+        level_blocks: level_block_decls.clone(),
+        unbound_level_blocks: unbound_level_blocks.clone(),
+    };
     if let Some(ode_spec) = ode_spec.as_mut() {
         ode_spec.indiv_param_program = Some(indiv_param_program);
     }
@@ -2668,12 +2677,6 @@ pub fn parse_full_model_bound(
         kappa_names: kappa_names.clone(),
         indiv_param_names: indiv_var_names.clone(),
         indiv_param_partials,
-        theta_blocks: ThetaBlocks {
-            decls: vector_theta_decls.clone(),
-            uses: VectorThetaScope::uses(),
-            level_blocks: level_block_decls.clone(),
-            unbound_level_blocks: unbound_level_blocks.clone(),
-        },
         default_params,
         omega_init_as_sd,
         sigma_init_as_sd,
@@ -2928,7 +2931,7 @@ pub fn parse_full_model_bound(
     // one level. `TIME` is the record time, not a covariate.
     {
         let level_columns: Vec<String> = model
-            .theta_blocks
+            .theta_blocks()
             .level_blocks()
             .iter()
             .flat_map(|d| d.columns().iter().cloned())
@@ -12375,6 +12378,11 @@ fn parse_parameters(
                         ThetaBlockSpec::Columns { columns, contrast } => {
                             let index_covariate = level_index_column(&name);
                             let binding = level_bindings.get(&name);
+                            if let Some(binding) = binding {
+                                validate_constrained_level_init(
+                                    &name, binding, init, lower, upper,
+                                )?;
+                            }
                             let (levels, theta_names) = match binding {
                                 // First parse: the level count is a property of
                                 // the data. Declare the block with no levels so
@@ -12391,6 +12399,7 @@ fn parse_parameters(
                                 name: name.clone(),
                                 columns,
                                 contrast: binding.map(|b| b.contrast).unwrap_or(contrast),
+                                labels: binding.map(|b| b.labels.clone()).unwrap_or_default(),
                                 shares_scale_with_eta: false,
                                 index_covariate: index_covariate.clone(),
                             });
@@ -12832,6 +12841,34 @@ fn build_level_rules(
         start = end;
     }
     Ok((rules, names))
+}
+
+/// Constrained blocks eliminate one level rather than optimizing it. Their
+/// shared initializer can therefore represent every level only at zero; the
+/// declared bounds apply to the remaining free contrast coefficients, not to
+/// the derived negative sum.
+fn validate_constrained_level_init(
+    name: &str,
+    binding: &LevelBinding,
+    init: f64,
+    lower: f64,
+    upper: f64,
+) -> Result<(), String> {
+    if binding.contrast == LevelContrast::Unconstrained {
+        return Ok(());
+    }
+    if init != 0.0 {
+        return Err(format!(
+            "theta {name}[...]: contrast = {} requires init = 0 because the derived level cannot receive a broadcast nonzero initializer",
+            binding.contrast.label()
+        ));
+    }
+    if lower > 0.0 || upper < 0.0 {
+        return Err(format!(
+            "theta {name}[...]: constrained level bounds must include 0 (got {lower}..{upper})"
+        ));
+    }
+    Ok(())
 }
 
 // --- Build omega matrix from diagonal + block specs ---
@@ -15157,7 +15194,7 @@ fn record_gather_use(block: &str, index_covariate: &str, n_levels: usize) {
 pub enum LevelContrast {
     /// Sum-to-zero, with the grouping chosen from the model + data: within the
     /// block's leading columns when the block shares an additive scale with a
-    /// random effect and those columns partition the subjects, globally
+    /// random effect and those columns identify subjects one-to-one, globally
     /// otherwise. The default.
     #[default]
     Auto,
@@ -15187,6 +15224,16 @@ pub enum LevelContrast {
 }
 
 impl LevelContrast {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::SumToZero => "sum_to_zero",
+            Self::SumToZeroWithin => "sum_to_zero_within",
+            Self::Ref => "ref",
+            Self::Unconstrained => "none",
+        }
+    }
+
     /// Parse the `contrast = ...` modifier inside a level block.
     fn parse(token: &str) -> Result<Self, String> {
         match token.trim().to_ascii_lowercase().as_str() {
@@ -15215,6 +15262,8 @@ pub struct LevelBlockDecl {
     /// named `TIME` is the record time, not a covariate.
     pub(crate) columns: Vec<String>,
     pub(crate) contrast: LevelContrast,
+    /// Resolved labels in gather order. Empty until the data-bound reparse.
+    pub(crate) labels: Vec<String>,
     /// Set by the parse: some `[individual_parameters]` statement reads this
     /// block *and* a random effect. [`LevelContrast::Auto`] consumes it — it
     /// is the "is there an η at a grouping coarser than or equal to the
@@ -15233,6 +15282,9 @@ impl LevelBlockDecl {
     }
     pub fn contrast(&self) -> LevelContrast {
         self.contrast
+    }
+    pub fn labels(&self) -> &[String] {
+        &self.labels
     }
     pub fn shares_scale_with_eta(&self) -> bool {
         self.shares_scale_with_eta
@@ -15257,13 +15309,10 @@ pub struct LevelBinding {
 /// Level bindings by block name, threaded into the second parse.
 pub type LevelBindings = std::collections::HashMap<String, LevelBinding>;
 
-/// The θ level blocks a model declares (#1064), carried on
-/// `CompiledModel` so the pre-fit data check and the `fit()` guard can see them.
+/// The θ level blocks a model declares (#1064).
 ///
 /// Inner types reference the parser-private `GatherSpec`, so the fields stay
-/// `pub(crate)`; external callers construct an empty placeholder via
-/// [`ThetaBlocks::empty`], which is all a hand-built `CompiledModel` fixture
-/// needs.
+/// `pub(crate)`; callers inspect the metadata through its accessors.
 #[derive(Debug, Clone, Default)]
 pub struct ThetaBlocks {
     pub(crate) decls: Vec<VectorThetaDecl>,
@@ -19968,6 +20017,8 @@ pub struct IndivParamPartials {
     /// hand-built fixtures and when no `[individual_parameters]` block exists;
     /// the ODE provider reads its own copy from `ode_spec`.
     pub(crate) indiv_param_program: Option<IndivParamProgram>,
+    /// Additive parser metadata kept behind this existing opaque public field.
+    pub(crate) theta_blocks: ThetaBlocks,
 }
 
 impl IndivParamPartials {
@@ -19981,6 +20032,7 @@ impl IndivParamPartials {
             d_d_theta: Vec::new(),
             d_d_eta: Vec::new(),
             indiv_param_program: None,
+            theta_blocks: ThetaBlocks::empty(),
         }
     }
 }
@@ -20078,6 +20130,7 @@ fn build_indiv_param_partials(
         // Attached by the caller (`build_pk_param_fn` site) after the program is
         // compiled; the symbolic-partials builder itself doesn't produce it.
         indiv_param_program: None,
+        theta_blocks: ThetaBlocks::empty(),
     }
 }
 

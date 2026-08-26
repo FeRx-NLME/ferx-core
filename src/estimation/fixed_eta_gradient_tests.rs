@@ -171,7 +171,6 @@ fn obs_nll_subject_grad_iov_matches_fd() {
         eta_names: vec!["ETA_CL".into()],
         indiv_param_names: vec!["CL".into(), "V".into()],
         indiv_param_partials: crate::types::IndivParamPartials::empty(),
-        theta_blocks: crate::types::ThetaBlocks::empty(),
         default_params: ModelParameters {
             theta: vec![5.0, 50.0],
             theta_names: vec!["TVCL".into(), "TVV".into()],

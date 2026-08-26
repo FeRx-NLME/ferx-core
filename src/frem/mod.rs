@@ -1105,7 +1105,6 @@ mod tests {
             kappa_names: Vec::new(),
             indiv_param_names: vec!["CL".into(), "V".into(), "KA".into()],
             indiv_param_partials: IndivParamPartials::empty(),
-            theta_blocks: crate::types::ThetaBlocks::empty(),
             default_params: ModelParameters {
                 theta: vec![0.2, 10.0, 1.5],
                 theta_names: vec!["TVCL".into(), "TVV".into(), "TVKA".into()],

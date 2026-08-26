@@ -81,9 +81,13 @@ column for this form.
 ```
 
 Put **data columns** in the brackets instead of a count and the block declares
-**one theta per observed combination** of them, discovered when the data is
-bound. The `(init, lower, upper)` triple broadcasts to every level, and the
-levels are named after their combination, so estimates report as
+**one level per observed combination** of them, discovered when the data is
+bound. With `contrast = none`, the `(init, lower, upper)` triple broadcasts to
+every level. Constrained forms estimate contrast coefficients and derive one
+level per contrast group, so they require `init = 0`; `FIX` then fixes the
+whole block at zero. Bounds apply to the free coefficients, not to a derived
+negative sum, which can lie outside them. Free coefficients are named after
+their combination, so estimates report as
 `PLACEBO[STUDY=7,TIME=4]`. A column named `TIME` is the record time; anything
 else is a covariate column, which the reader loads automatically.
 
@@ -111,7 +115,7 @@ and it is chosen by looking at both the model and the data:
 
 | Situation | Default |
 |---|---|
-| The parameter reading the block also carries a random effect, **and** the block's leading columns partition the subjects | sum-to-zero **within** each leading-column group |
+| The parameter reading the block also carries a random effect, **and** the block's leading columns identify subjects one-to-one | sum-to-zero **within** each leading-column group |
 | Otherwise | sum-to-zero over **all** levels |
 
 Within-group sum-to-zero leaves each study's `eta` carrying that study's mean and
@@ -179,9 +183,10 @@ this engine is, and switch automatically once a block makes the problem large:
   to the score cross-product (`covariance_method = s`, one pass) with a warning.
   Setting `covariance_method = r` explicitly forces it, and says what it costs.
 
-A block of more than 20 levels also leaves the main estimate table and gets its
-own compact summary (count, min, median, max) on the console, with every
-per-level estimate still written to the fit YAML under `theta_blocks:`.
+A block of more than 20 free coefficients also leaves the main estimate table
+and gets its own compact summary (count, min, median, max) on the console. The
+fit YAML writes every independently estimated coefficient under
+`theta_blocks:`; constrained dependent levels are derived values, not estimates.
 
 Analytic sensitivities pass straight through a gather — `∂f/∂θ_k` is exact under
 the dual-number path — so a *small* level block keeps the analytic gradient.

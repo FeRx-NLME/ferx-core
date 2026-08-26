@@ -2440,6 +2440,41 @@ mod theta_block_scale_guards {
     }
 
     #[test]
+    fn free_packed_dim_matches_separate_packed_masks() {
+        let content = r#"
+[parameters]
+  theta TVCL(2.0, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0) FIX
+  omega ETA_CL ~ 0.09
+  block_omega (ETA_V, ETA_KA) = [0.04, 0.01, 0.16]
+  kappa KAPPA_CL ~ 0.02
+  kappa KAPPA_V ~ 0.03 FIX
+  sigma ADD_ERR ~ 0.1 FIX
+  sigma PROP_ERR ~ 0.02
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ combined(ADD_ERR, PROP_ERR)
+"#;
+        let model = crate::parser::model_parser::parse_full_model(content)
+            .unwrap()
+            .model;
+        let p = &model.default_params;
+        let fixed = crate::estimation::parameterization::packed_fixed_mask(p);
+        let structural = crate::estimation::parameterization::omega_structural_zero_mask(p);
+        let exact = fixed
+            .iter()
+            .zip(&structural)
+            .filter(|(f, z)| !**f && !**z)
+            .count();
+        assert_eq!(model.free_packed_dim(), exact);
+        assert_eq!(exact, 7);
+    }
+
+    #[test]
     fn auto_keeps_bobyqa_at_ordinary_dimension() {
         // The guard must not disturb the historical `auto` behaviour on the
         // models everything else in this codebase is: `gradient = fd` removes

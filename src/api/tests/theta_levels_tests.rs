@@ -115,7 +115,7 @@ fn an_unbound_level_block_declares_no_thetas_and_refuses_to_fit() {
     let parsed = parse_full_model(&mbma_model("")).unwrap();
     assert_eq!(parsed.model.n_theta, 2, "only TVCL and TVV exist yet");
     assert_eq!(
-        parsed.model.theta_blocks.unbound_level_blocks(),
+        parsed.model.theta_blocks().unbound_level_blocks(),
         &["PLACEBO".to_string()]
     );
     let err = crate::api::fit(
@@ -212,6 +212,27 @@ fn an_eta_at_the_leading_grouping_selects_within_group_sum_to_zero() {
             "study {study}'s last level is its own contrast"
         );
     }
+}
+
+#[test]
+fn a_leading_group_shared_by_subjects_uses_global_sum_to_zero() {
+    // Eta is subject-scoped. When two subjects share a STUDY value, neither
+    // subject eta can represent that study's common mean, so STUDY does not
+    // identify the eta grouping and the within-study contrast is invalid.
+    let mut pop = population(4, 3);
+    for (subject, study) in pop.subjects.iter_mut().zip([1.0, 1.0, 2.0, 2.0]) {
+        subject.covariates.insert("STUDY".to_string(), study);
+    }
+    let model = bind(&mbma_model(""), &mut pop).unwrap();
+    // Six observed cells, one global dependent level -> five free coefficients.
+    assert_eq!(model.n_theta, 2 + 5);
+
+    let mut explicit_pop = population(4, 3);
+    for (subject, study) in explicit_pop.subjects.iter_mut().zip([1.0, 1.0, 2.0, 2.0]) {
+        subject.covariates.insert("STUDY".to_string(), study);
+    }
+    bind(&mbma_model("sum_to_zero"), &mut explicit_pop)
+        .expect("global contrast is identified when STUDY is shared");
 }
 
 #[test]
@@ -377,9 +398,46 @@ fn level_map_round_trips_the_labels() {
             "STUDY=1,TIME=1".to_string(),
             "STUDY=1,TIME=2".to_string(),
             "STUDY=2,TIME=1".to_string(),
+            "STUDY=2,TIME=2".to_string(),
         ],
-        "the dependent level carries no θ, so it is not in the map"
+        "the map includes the dependent level even though it carries no free θ"
     );
+}
+
+#[test]
+fn constrained_blocks_reject_unrepresentable_broadcast_initializers() {
+    let mut pop = population(2, 2);
+    let nonzero = no_eta_model().replace(
+        "PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)",
+        "PLACEBO[STUDY, TIME](0.5, -10.0, 10.0)",
+    );
+    let err = bind(&nonzero, &mut pop).unwrap_err();
+    assert!(err.contains("requires init = 0"), "unexpected error: {err}");
+
+    let mut pop = population(2, 2);
+    let excludes_zero = no_eta_model().replace(
+        "PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)",
+        "PLACEBO[STUDY, TIME](0.0, 0.1, 10.0)",
+    );
+    let err = bind(&excludes_zero, &mut pop).unwrap_err();
+    assert!(
+        err.contains("bounds must include 0"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn unconstrained_blocks_keep_broadcast_init_and_fix_semantics() {
+    let text = no_eta_model()
+        .replace("[STUDY, TIME]", "[STUDY, TIME, contrast = none]")
+        .replace(
+            "PLACEBO[STUDY, TIME, contrast = none](0.0, -10.0, 10.0)",
+            "PLACEBO[STUDY, TIME, contrast = none](0.5, -10.0, 10.0, FIX)",
+        );
+    let mut pop = population(2, 2);
+    let model = bind(&text, &mut pop).unwrap();
+    assert_eq!(&model.default_params.theta[1..5], &[0.5; 4]);
+    assert!(model.default_params.theta_fixed[1..5].iter().all(|f| *f));
 }
 
 #[test]
@@ -466,7 +524,11 @@ fn a_digit_only_bracket_is_a_level_count_not_a_column() {
     let indexed = text.replace("CL = TVCL + PLACEBO", "CL = TVCL + PLACEBO[PLA_IDX]");
     let parsed = parse_full_model(&indexed).unwrap();
     assert!(
-        parsed.model.theta_blocks.unbound_level_blocks().is_empty(),
+        parsed
+            .model
+            .theta_blocks()
+            .unbound_level_blocks()
+            .is_empty(),
         "a counted block needs no data binding"
     );
     assert_eq!(parsed.model.n_theta, 2 + 3);
@@ -496,7 +558,7 @@ fn eta_sharing_is_detected_through_an_intermediate_assignment() {
 "#;
     let parsed = parse_full_model(text).unwrap();
     assert!(
-        parsed.model.theta_blocks.level_blocks()[0].shares_scale_with_eta(),
+        parsed.model.theta_blocks().level_blocks()[0].shares_scale_with_eta(),
         "taint must propagate through BASE"
     );
     let mut pop = population(2, 3);
@@ -647,7 +709,7 @@ mod theta_gather_index_check {
         )
         .unwrap()
         .model;
-        assert!(plain.theta_blocks.is_empty());
+        assert!(plain.theta_blocks().is_empty());
         assert!(check_theta_gather_indices(&plain, &population(&[1.0])).is_empty());
     }
 }

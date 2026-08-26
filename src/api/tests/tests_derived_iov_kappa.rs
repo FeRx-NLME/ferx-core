@@ -48,7 +48,6 @@ fn minimal_iov_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
         eta_names: vec!["ETA_CL".into()],
         indiv_param_names: vec!["CL".into()],
         indiv_param_partials: IndivParamPartials::empty(),
-        theta_blocks: crate::types::ThetaBlocks::empty(),
         default_params: ModelParameters {
             theta: Vec::new(),
             theta_names: Vec::new(),

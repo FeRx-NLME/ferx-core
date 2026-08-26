@@ -198,14 +198,14 @@ pub fn print_results(result: &FitResult) {
         eprintln!("{:<16} {:>12.6} {:>12} {:>10}", label, est, se_str, rse_str);
     }
 
-    // Compact θ level block summary (#1064). Per-level estimates stay
-    // in the fit YAML's `theta_blocks:` list and in `result.theta`.
+    // Compact θ level block summary (#1064). Only independently estimated
+    // contrast coefficients live in `FitResult`; dependent levels are derived.
     if !theta_blocks.is_empty() {
         eprintln!("\n--- THETA BLOCKS ---");
         for (block, range) in &theta_blocks {
             let (mn, med, mx) = block_summary(&result.theta[range.clone()]);
             eprintln!(
-                "{}  {} levels   min {:.4}  median {:.4}  max {:.4}",
+                "{}  {} free coefficients   min {:.4}  median {:.4}  max {:.4}",
                 block,
                 range.len(),
                 mn,
@@ -749,7 +749,7 @@ pub fn format_summary(result: &FitResult) -> String {
             let (mn, med, mx) = block_summary(&result.theta[range.clone()]);
             let _ = writeln!(
                 out,
-                "  {}  {} levels   min {:.4}  median {:.4}  max {:.4}",
+                "  {}  {} free coefficients   min {:.4}  median {:.4}  max {:.4}",
                 block,
                 range.len(),
                 mn,
@@ -1878,10 +1878,10 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     #[cfg(not(feature = "nn"))]
     let nn_theta_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
-    // #1064: an unstructured-placebo block can carry hundreds of levels. Four
+    // #1064: an unstructured-placebo block can carry hundreds of coefficients. Four
     // keys each would bury the structural parameters under 3,200 lines of
-    // nuisance, so a large block is emitted below as a one-line-per-level list
-    // under `theta_blocks:` — still every estimate, just not as top-level keys.
+    // nuisance, so a large block is emitted below as a compact coefficient list
+    // under `theta_blocks:` rather than as top-level keys.
     let theta_blocks = compact_theta_blocks(&result.theta_names);
     let blocked_theta_indices: std::collections::HashSet<usize> =
         theta_blocks.iter().flat_map(|(_, r)| r.clone()).collect();
@@ -1920,11 +1920,11 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         for (block, range) in &theta_blocks {
             let (mn, med, mx) = block_summary(&result.theta[range.clone()]);
             writeln!(f, "  {}:", block).map_err(|e| e.to_string())?;
-            writeln!(f, "    n_levels: {}", range.len()).map_err(|e| e.to_string())?;
+            writeln!(f, "    n_free_coefficients: {}", range.len()).map_err(|e| e.to_string())?;
             writeln!(f, "    min: {:.6}", mn).map_err(|e| e.to_string())?;
             writeln!(f, "    median: {:.6}", med).map_err(|e| e.to_string())?;
             writeln!(f, "    max: {:.6}", mx).map_err(|e| e.to_string())?;
-            writeln!(f, "    levels:").map_err(|e| e.to_string())?;
+            writeln!(f, "    coefficients:").map_err(|e| e.to_string())?;
             for i in range.clone() {
                 let label = result.theta_names[i]
                     .strip_prefix(&format!("{block}["))
@@ -1934,7 +1934,7 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                 match se {
                     Some(se) => writeln!(
                         f,
-                        "      - {{ level: \"{}\", estimate: {:.6}, se: {:.6}, rse_pct: {:.2} }}",
+                        "      - {{ label: \"{}\", estimate: {:.6}, se: {:.6}, rse_pct: {:.2} }}",
                         label,
                         result.theta[i],
                         se,
@@ -1942,7 +1942,7 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     ),
                     None => writeln!(
                         f,
-                        "      - {{ level: \"{}\", estimate: {:.6}, se: ~, rse_pct: ~ }}",
+                        "      - {{ label: \"{}\", estimate: {:.6}, se: ~, rse_pct: ~ }}",
                         label, result.theta[i]
                     ),
                 }
@@ -2574,6 +2574,26 @@ mod tests {
         assert!(s.contains("EPS shrinkage: 8.0%"));
         assert!(s.contains("Warnings: 1"));
         assert!(s.contains("heads up"));
+    }
+
+    #[test]
+    fn compact_theta_output_reports_free_coefficients_not_levels() {
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        r.theta = (1..=21).map(|i| i as f64).collect();
+        r.theta_names = (1..=21).map(|i| format!("PLACEBO[L={i}]")).collect();
+        r.theta_fixed = vec![false; 21];
+        r.se_theta = None;
+
+        let summary = format_summary(&r);
+        assert!(summary.contains("PLACEBO  21 free coefficients"));
+        assert!(!summary.contains("PLACEBO  21 levels"));
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        write_estimates_yaml(&r, file.path().to_str().unwrap()).unwrap();
+        let yaml = std::fs::read_to_string(file.path()).unwrap();
+        assert!(yaml.contains("n_free_coefficients: 21"));
+        assert!(yaml.contains("coefficients:"));
+        assert!(!yaml.contains("n_levels:"));
     }
 
     #[test]

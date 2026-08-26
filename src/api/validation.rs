@@ -302,7 +302,7 @@ pub(crate) fn check_residual_magnitude(
 /// case this catches.
 pub(crate) fn check_unbound_theta_levels(model: &CompiledModel) -> Vec<Diagnostic> {
     model
-        .theta_blocks
+        .theta_blocks()
         .unbound_level_blocks()
         .iter()
         .map(|name| {
@@ -342,11 +342,11 @@ pub(crate) fn check_theta_gather_indices(
     model: &CompiledModel,
     population: &Population,
 ) -> Vec<Diagnostic> {
-    if model.theta_blocks.is_empty() {
+    if model.theta_blocks().is_empty() {
         return Vec::new();
     }
     let mut diags = Vec::new();
-    for (block, column, n_levels) in model.theta_blocks.index_columns() {
+    for (block, column, n_levels) in model.theta_blocks().index_columns() {
         for subj in &population.subjects {
             // Observation rows first — a level is a property of an observation —
             // then dose rows, which read the individual parameters too.
@@ -3677,7 +3677,7 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
 
     // 1. Parse. A parse failure is terminal — without an AST there is nothing
     //    further to validate, so return a report carrying just that diagnostic.
-    let parsed = match parse_full_model_file(Path::new(model_path)) {
+    let mut parsed = match parse_full_model_file(Path::new(model_path)) {
         Ok(p) => p,
         Err(e) => {
             let data = data_path.map(|s| s.to_string());
@@ -3762,7 +3762,7 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
             None,
             &parsed.column_map,
         ) {
-            Ok((population, _table)) => {
+            Ok((mut population, _table)) => {
                 // Surface datareader warnings (ADDL missing II, IOV OCC missing)
                 // into the check report so `ferx check` sees the same findings as `fit()`.
                 // Through the shared filter, or the two would disagree on exactly the
@@ -3782,43 +3782,57 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
                     };
                     diags.push(Diagnostic::warning(code, w.clone()));
                 }
-                diags.extend(check_model_data_rule(
-                    &parsed.model,
-                    &population,
-                    &parsed.fit_options.iov_occasion,
-                ));
-                let init_params = parsed.model.default_params.clone();
-                diags.extend(check_model_data_warnings(
-                    &parsed.model,
-                    &population,
-                    &init_params,
-                ));
-                // Surface the structural absorption-closed-form rejects (IOV / SS / CMT≠1 /
-                // infusion / reset) so a clean `ferx check` and a `fit()` agree on transit /
-                // IG models — previously only `fit()` reported these (#776 review, IG #790).
-                // Model-family-specific code so an IG model reads `E_IG_*` not `E_TRANSIT_*`.
-                let is_ig = matches!(parsed.model.pk_model, PkModel::OneCptIg | PkModel::TwoCptIg);
-                if let Some(e) = check_absorption_closed_form_support(&parsed.model, &population) {
-                    let code = if is_ig {
-                        "E_IG_UNSUPPORTED"
-                    } else {
-                        "E_TRANSIT_UNSUPPORTED"
-                    };
-                    diags.push(Diagnostic::error(code, e));
-                }
-                // Twin-less flip-flop is a hard error, not a warning (#776): surface it the
-                // same way `fit()` does, so `ferx check` catches it up front.
-                if let Some(e) = check_absorption_flip_flop_no_twin(
-                    &parsed.model,
-                    &population,
-                    &init_params.theta,
-                ) {
-                    let code = if is_ig {
-                        "E_IG_FLIP_FLOP"
-                    } else {
-                        "E_TRANSIT_FLIP_FLOP"
-                    };
-                    diags.push(Diagnostic::error(code, e));
+                let binding = std::fs::read_to_string(model_path)
+                    .map_err(|e| format!("Failed to re-read model file for level binding: {e}"))
+                    .and_then(|model_text| {
+                        crate::api::bind_theta_levels(&mut parsed, &model_text, &mut population)
+                    });
+                if let Err(e) = binding {
+                    diags.push(
+                        Diagnostic::error("E_THETA_LEVEL_BINDING", e).with_block("parameters"),
+                    );
+                } else {
+                    diags.extend(check_model_data_rule(
+                        &parsed.model,
+                        &population,
+                        &parsed.fit_options.iov_occasion,
+                    ));
+                    let init_params = parsed.model.default_params.clone();
+                    diags.extend(check_model_data_warnings(
+                        &parsed.model,
+                        &population,
+                        &init_params,
+                    ));
+                    // Surface the structural absorption-closed-form rejects (IOV / SS / CMT≠1 /
+                    // infusion / reset) so a clean `ferx check` and a `fit()` agree on transit /
+                    // IG models — previously only `fit()` reported these (#776 review, IG #790).
+                    // Model-family-specific code so an IG model reads `E_IG_*` not `E_TRANSIT_*`.
+                    let is_ig =
+                        matches!(parsed.model.pk_model, PkModel::OneCptIg | PkModel::TwoCptIg);
+                    if let Some(e) =
+                        check_absorption_closed_form_support(&parsed.model, &population)
+                    {
+                        let code = if is_ig {
+                            "E_IG_UNSUPPORTED"
+                        } else {
+                            "E_TRANSIT_UNSUPPORTED"
+                        };
+                        diags.push(Diagnostic::error(code, e));
+                    }
+                    // Twin-less flip-flop is a hard error, not a warning (#776): surface it the
+                    // same way `fit()` does, so `ferx check` catches it up front.
+                    if let Some(e) = check_absorption_flip_flop_no_twin(
+                        &parsed.model,
+                        &population,
+                        &init_params.theta,
+                    ) {
+                        let code = if is_ig {
+                            "E_IG_FLIP_FLOP"
+                        } else {
+                            "E_TRANSIT_FLIP_FLOP"
+                        };
+                        diags.push(Diagnostic::error(code, e));
+                    }
                 }
             }
             Err(e) => {

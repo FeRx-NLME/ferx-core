@@ -3017,10 +3017,6 @@ pub struct CompiledModel {
     /// parser-produced partials.
     #[allow(dead_code)] // no runtime consumer after #145; see field doc.
     pub indiv_param_partials: IndivParamPartials,
-    /// Vector / θ level blocks declared by `[parameters]` (#1064). Empty for
-    /// every model that declares none, which is the overwhelming majority —
-    /// consumers short-circuit on [`ThetaBlocks::is_empty`].
-    pub theta_blocks: ThetaBlocks,
     pub default_params: ModelParameters,
     /// Per-eta flag (parallel to `eta_names` / omega diagonal): `true` when
     /// the user wrote `omega NAME ~ X (sd)` and the parser squared the value.
@@ -3406,6 +3402,15 @@ pub enum GradientMethod {
 }
 
 impl CompiledModel {
+    /// Vector and data-bound θ level blocks declared by `[parameters]`.
+    ///
+    /// This metadata lives behind the existing opaque `indiv_param_partials`
+    /// field so the feature remains compatible with external `CompiledModel`
+    /// struct literals.
+    pub fn theta_blocks(&self) -> &ThetaBlocks {
+        &self.indiv_param_partials.theta_blocks
+    }
+
     /// Returns true when this model uses ODE integration; false for analytical PK.
     pub fn is_ode_based(&self) -> bool {
         self.ode_spec.is_some()
@@ -3974,21 +3979,19 @@ impl CompiledModel {
         self.ruv_magnitude.as_ref().is_some_and(|m| m.is_active())
     }
 
-    /// Number of free coordinates the outer optimizer actually searches over:
-    /// unfixed θ, the Cholesky lower triangle of Ω, and unfixed σ (#1064).
-    ///
-    /// An estimate, not the packed vector's exact length — it is used only by
-    /// the scale guards ([`BOBYQA_MAX_DIM`], [`COV_HESSIAN_MAX_DIM`]), where
-    /// being one or two coordinates off across a threshold of 64 or 100 changes
-    /// nothing. What it must get right is the order of magnitude, which a model
-    /// with several hundred factor levels moves by two.
+    /// Exact number of free coordinates the outer optimizer searches over.
+    /// This uses the same packed FIX and structural-zero masks as estimation,
+    /// including diagonal/separate BSV and IOV blocks and mixture overrides.
     pub fn free_packed_dim(&self) -> usize {
         let p = &self.default_params;
-        let n_theta = p.theta_fixed.iter().filter(|f| !**f).count();
-        let n_eta = self.n_eta + self.n_kappa;
-        let n_omega = n_eta * (n_eta + 1) / 2;
-        let n_sigma = p.sigma_fixed.iter().filter(|f| !**f).count();
-        n_theta + n_omega + n_sigma
+        let fixed = crate::estimation::parameterization::packed_fixed_mask(p);
+        let structural = crate::estimation::parameterization::omega_structural_zero_mask(p);
+        debug_assert_eq!(fixed.len(), structural.len());
+        fixed
+            .iter()
+            .zip(structural.iter())
+            .filter(|(is_fixed, is_structural)| !**is_fixed && !**is_structural)
+            .count()
     }
 
     /// Whether any kappa carries a `weight = <expr>` modifier (#1031).

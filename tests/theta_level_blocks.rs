@@ -7,7 +7,7 @@
 //! and folded back into the model by a re-parse. These tests run that whole
 //! path and stop after a couple of outer iterations (Tier 2 — no convergence).
 
-use ferx_core::run_model_with_data;
+use ferx_core::{run_model_with_data, validate_model_file};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -263,6 +263,46 @@ fn binding_is_deterministic_so_predict_rebuilds_the_same_levels() {
         };
         assert_eq!(idx(a), idx(b), "subject {} index column drifted", a.id);
     }
+}
+
+#[test]
+fn check_binds_level_blocks_before_data_validation() {
+    let (_dir, model_path, data_path) = write_case(&level_block_model(), DATA);
+    let report = validate_model_file(
+        model_path.to_str().unwrap(),
+        Some(data_path.to_str().unwrap()),
+    );
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("__level_PLACEBO")),
+        "the synthesized level index must exist before checks run: {:?}",
+        report.diagnostics
+    );
+    assert!(
+        report.valid,
+        "valid bound model should pass check: {:?}",
+        report.diagnostics
+    );
+}
+
+#[test]
+fn check_reports_level_binding_errors_directly() {
+    let invalid = level_block_model().replace(
+        "PLACEBO[STUDY, TIME](0.0, -5.0, 5.0)",
+        "PLACEBO[STUDY, TIME](0.5, -5.0, 5.0)",
+    );
+    let (_dir, model_path, data_path) = write_case(&invalid, DATA);
+    let report = validate_model_file(
+        model_path.to_str().unwrap(),
+        Some(data_path.to_str().unwrap()),
+    );
+    assert!(!report.valid);
+    assert!(report
+        .diagnostics
+        .iter()
+        .any(|d| { d.code == "E_THETA_LEVEL_BINDING" && d.message.contains("requires init = 0") }));
 }
 
 #[test]

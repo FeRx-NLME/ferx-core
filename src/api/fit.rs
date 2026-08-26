@@ -209,14 +209,17 @@ pub fn fit(
     // #1064: a `theta NAME[...]` block has no levels until it is bound
     // to data. Fitting one unbound would gather out of an empty level table and
     // predict NaN everywhere; refuse, and name the two ways out.
-    if !model.theta_blocks.unbound_level_blocks().is_empty() {
+    if !model.theta_blocks().unbound_level_blocks().is_empty() {
         return Err(format!(
             "`theta {}[...]` was never bound to data, so it has no levels. Fit \
              through a file entry point (`fit_from_files`, `run_model_with_data`, or the \
              CLI), which binds level blocks against the dataset — or declare the block \
              explicitly as `theta {}[N](...)` and index it with your own column.",
-            model.theta_blocks.unbound_level_blocks().join("`, `theta "),
-            model.theta_blocks.unbound_level_blocks()[0],
+            model
+                .theta_blocks()
+                .unbound_level_blocks()
+                .join("`, `theta "),
+            model.theta_blocks().unbound_level_blocks()[0],
         ));
     }
     // Mixture models (#977). Phase 3 wires the K-fold log-sum-exp FOCE/FOCEI

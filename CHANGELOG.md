@@ -111,10 +111,10 @@ section of the SDLC for the versioning policy).
   320,000 population objectives at 800 parameters. Above 100 free coordinates a *defaulted* covariance
   method now uses the score cross-product (one pass) and says so; setting `covariance_method = r`
   explicitly still forces it, with a warning naming the cost.
-- **Large theta level blocks are reported compactly (#1064).** A block of more than 20 levels leaves the main
-  estimate table for a one-line summary (count, min, median, max) on the console and in the text report;
-  every per-level estimate is still written to the fit YAML, as a one-line-per-level `theta_blocks:` list
-  rather than hundreds of top-level keys.
+- **Large theta level blocks are reported compactly (#1064).** A block of more than 20 free coefficients
+  leaves the main estimate table for a one-line summary (count, min, median, max) on the console and in
+  the text report. Every independently estimated coefficient is written to the fit YAML under
+  `theta_blocks:`; constrained dependent levels are derived values rather than estimates.
 - **ODE models now choose their own stepper by default (#978).** `ode_method` defaults to `auto`
   instead of `rk45`, so a model that names no stepper is probed per integration segment and runs
   a stiff method on the segments that need one. A model that *does* name a method is unaffected —

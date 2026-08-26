@@ -18979,7 +18979,7 @@ mod theta_vector_blocks {
         let p = (parsed.model.pk_param_fn)(&theta, &[0.0], &HashMap::new(), 0.0);
         assert!((p.values[0] - 2.3).abs() < 1e-12, "PLACEBO[3] = 0.3");
         // No index column is read, so nothing is recorded for the data check.
-        assert_eq!(parsed.model.theta_blocks.index_columns().count(), 0);
+        assert_eq!(parsed.model.theta_blocks().index_columns().count(), 0);
     }
 
     #[test]
@@ -19045,7 +19045,7 @@ mod theta_vector_blocks {
     #[test]
     fn gather_index_column_is_recorded_for_the_pre_fit_check() {
         let parsed = parse_full_model(&gather_model(4)).unwrap();
-        let uses: Vec<_> = parsed.model.theta_blocks.index_columns().collect();
+        let uses: Vec<_> = parsed.model.theta_blocks().index_columns().collect();
         assert_eq!(uses, vec![("PLACEBO", "PLA_IDX", 4usize)]);
     }
 

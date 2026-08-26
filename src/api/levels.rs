@@ -53,7 +53,7 @@ pub fn bind_theta_levels(
     model_text: &str,
     population: &mut Population,
 ) -> Result<(), String> {
-    let decls: Vec<LevelBlockDecl> = parsed.model.theta_blocks.level_blocks().to_vec();
+    let decls: Vec<LevelBlockDecl> = parsed.model.theta_blocks().level_blocks().to_vec();
     if decls.is_empty() {
         return Ok(());
     }
@@ -184,18 +184,19 @@ fn discover_levels(decl: &LevelBlockDecl, population: &Population) -> Result<Vec
     Ok(levels)
 }
 
-/// Whether the block's leading columns partition the subjects — i.e. every
-/// subject's records share one combination of them.
+/// Whether the block's leading columns identify subjects one-to-one: every
+/// subject's records share one combination, and no two subjects share it.
 ///
 /// This is the data-side half of "is there a random effect at a grouping
 /// coarser than or equal to the block's". η in this engine is per subject, so
-/// if the leading columns partition subjects then a subject-level η sits at (or
-/// inside) the group, and it — not the levels — should carry the group mean.
-fn leading_partitions_subjects(decl: &LevelBlockDecl, population: &Population) -> bool {
+/// only when the leading tuple identifies one subject can that subject's η
+/// carry the corresponding group mean.
+fn leading_identifies_subjects(decl: &LevelBlockDecl, population: &Population) -> bool {
     if decl.columns().len() < 2 {
         return false;
     }
     let leading = &decl.columns()[..decl.columns().len() - 1];
+    let mut subject_keys: Vec<Vec<f64>> = Vec::with_capacity(population.subjects.len());
     for subject in &population.subjects {
         let mut first: Option<Vec<f64>> = None;
         for j in 0..subject.obs_times.len() {
@@ -210,6 +211,11 @@ fn leading_partitions_subjects(decl: &LevelBlockDecl, population: &Population) -
                 Some(_) => return false,
             }
         }
+        let Some(key) = first else { return false };
+        if subject_keys.contains(&key) {
+            return false;
+        }
+        subject_keys.push(key);
     }
     true
 }
@@ -221,7 +227,7 @@ fn resolve_contrast(
     levels: &[Level],
     population: &Population,
 ) -> Result<LevelContrast, String> {
-    let nested = leading_partitions_subjects(decl, population);
+    let nested = leading_identifies_subjects(decl, population);
     let resolved = match decl.contrast() {
         LevelContrast::Auto => {
             if decl.shares_scale_with_eta() && nested {
@@ -417,23 +423,13 @@ fn write_index_column(
     Ok(())
 }
 
-/// Level labels of every bound level block, keyed by block name, so a fit can
-/// record the map and `predict()` / `simulate()` rebuild the identical binding.
+/// Complete level labels of every bound level block, keyed by block name.
+/// Includes dependent contrast levels that have no independently estimated θ.
 pub fn level_map(model: &crate::types::CompiledModel) -> HashMap<String, Vec<String>> {
     let mut out = HashMap::new();
-    for decl in model.theta_blocks.level_blocks() {
-        let prefix = format!("{}[", decl.name());
-        let labels: Vec<String> = model
-            .theta_names
-            .iter()
-            .filter_map(|n| {
-                n.strip_prefix(&prefix)
-                    .and_then(|r| r.strip_suffix(']'))
-                    .map(|s| s.to_string())
-            })
-            .collect();
-        if !labels.is_empty() {
-            out.insert(decl.name().to_string(), labels);
+    for decl in model.theta_blocks().level_blocks() {
+        if !decl.labels().is_empty() {
+            out.insert(decl.name().to_string(), decl.labels().to_vec());
         }
     }
     out
