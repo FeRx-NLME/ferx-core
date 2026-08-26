@@ -1582,6 +1582,14 @@ fn fit_inner(
         .mixture_posteriors
         .as_ref()
         .map(|mp| mp.mixest.clone());
+    //
+    // ODE models run this pass inside a solver-statistics scope (#1080 Part B): it is the one
+    // production sweep that integrates every subject at the final estimates through the
+    // ordinary dispatch, so it is where `min_dt` clamps and `auto`'s escalation/rejection
+    // decisions can be observed without threading a stats sink through every predictor. Costs
+    // one thread-local read per segment on the ODE path and nothing at all elsewhere.
+    let solver_stats_scope =
+        integrates_odes(model).then(crate::ode::solver::SolverStatsScope::enter);
     let mut subjects = compute_subject_results(
         model,
         population,
@@ -1592,6 +1600,9 @@ fn fit_inner(
         options.interaction,
         mixest_classes.as_deref(),
     );
+    let ode_solver_stats = solver_stats_scope
+        .map(|scope| scope.collected())
+        .unwrap_or_default();
 
     // Mixture (#977 Phase 5): thread the converged per-subject posteriors onto
     // each SubjectResult so output.rs can emit the PMIX_1..PMIX_K and MIXEST
@@ -1915,6 +1926,14 @@ fn fit_inner(
     // Imprecisely estimated thetas (high relative standard error) — likewise
     // emitted typed at source with `details` (#781).
     if let Some((msg, entry)) = inflated_rse_warning(&se_theta, &result.params) {
+        warnings.push(msg);
+        native_warnings.push(entry);
+    }
+    // ODE-solver health at the final estimates (#1080 Part B): min-`dt` clamps, `auto`
+    // escalations, and escalations the guard discarded — none of which any production path
+    // reported before. Emitted typed at source, at `Info` severity when the only thing to
+    // report is that `auto` escalated and it worked.
+    if let Some((msg, entry)) = ode_solver_diagnostics_warning(&ode_solver_stats, options) {
         warnings.push(msg);
         native_warnings.push(entry);
     }

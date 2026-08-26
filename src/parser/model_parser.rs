@@ -6927,6 +6927,17 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             }
             opts.ode_max_steps = v;
         }
+        // `0` / `off` / `none` disables the budget (back to `ode_max_steps`), so a
+        // settings list can turn it off without deleting the key.
+        "ode_stiff_abort_after" => {
+            opts.ode_stiff_abort_after = match value.to_lowercase().as_str() {
+                "off" | "none" | "false" => None,
+                _ => {
+                    let v = parse_usize("ode_stiff_abort_after")?;
+                    (v > 0).then(|| v.min(u32::MAX as usize) as u32)
+                }
+            };
+        }
         "ode_method" => {
             opts.ode_method = crate::ode::OdeMethod::parse(value).ok_or_else(|| {
                 format!(
