@@ -1054,40 +1054,46 @@ fn a_stalled_mid_segment_switch_is_discarded_and_re_solved_explicitly() {
 /// A segment that never leaves the explicit stepper is **not** guarded, even when it clamps:
 /// there the fallback is the same solve, so discarding the result would buy a second copy of
 /// it. Pinned by counting steps — a re-solve would roughly double them.
+///
+/// Run with `auto_switch` **on**, and on a system whose verdict the re-probe can never change,
+/// so it exercises the guard's `!ran_stiff ⇒ usable` arm rather than the early return that
+/// turning switching off would take.
 #[test]
 fn an_unswitched_explicit_segment_is_not_re_solved() {
-    // Stiff enough to clamp at `min_dt`, benign enough at the entry state that the probe keeps
-    // the explicit stepper, and — with switching off — unable to change its mind later.
-    let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| du[0] = u[0] * u[0];
-    let opts = OdeSolverOptions {
-        auto_switch: false,
-        ..loose()
-    };
+    // Clamps at `min_dt` on every step (a rotation the coarse floor cannot resolve) while
+    // reading `Re λ = 0` at every state, so no re-probe ever escalates it.
+    let rhs = rotating_rhs::<f64>(200.0);
+    let opts = coarse_min_dt();
+    assert!(opts.auto_switch, "the arm under test needs switching on");
     let pinned = OdeSolverOptions {
         method: OdeMethod::Rk45,
-        ..Default::default()
+        ..coarse_min_dt()
     };
     let mut auto_stats = OdeSolverStats::default();
     solve_ode_with_stats(
         &rhs,
-        &[5.0],
-        (0.0, 0.25),
+        &[1.0, 0.0],
+        (0.0, 1.0),
         &[],
-        &[0.25],
+        &[1.0],
         &opts,
         Some(&mut auto_stats),
     );
     let mut pinned_stats = OdeSolverStats::default();
     solve_ode_with_stats(
         &rhs,
-        &[5.0],
-        (0.0, 0.25),
+        &[1.0, 0.0],
+        (0.0, 1.0),
         &[],
-        &[0.25],
+        &[1.0],
         &pinned,
         Some(&mut pinned_stats),
     );
     assert!(auto_stats.min_step_clamped_steps > 0, "{auto_stats:?}");
+    assert_eq!(
+        auto_stats.auto_switched_segments, 0,
+        "premise: the re-probe must never change its mind here: {auto_stats:?}"
+    );
     assert_eq!(auto_stats.auto_stiff_rejected, 0, "{auto_stats:?}");
     assert_eq!(
         auto_stats.attempted_steps, pinned_stats.attempted_steps,
@@ -1151,4 +1157,260 @@ fn the_switch_happens_at_the_same_step_at_f64_and_at_a_dual() {
             approx::assert_relative_eq!(*x, y.val(), max_relative = 1e-6, epsilon = 1e-9);
         }
     }
+}
+
+// ── The guard scores the *stiff* half of a switched segment, not all of it ───────────────────
+
+/// Coarse `min_dt`, so a step that fails its error test is force-accepted rather than shrunk
+/// into the 1e-12 floor the production default sets. That is what lets the fixtures below
+/// produce min-`dt` clamps on demand, on a chosen stepper, within a handful of steps.
+fn coarse_min_dt() -> OdeSolverOptions {
+    OdeSolverOptions {
+        min_dt: 1e-2,
+        initial_dt: 1e-2,
+        ..loose()
+    }
+}
+
+/// A fast **rotation**: `Re λ = 0` at every state, so the probe reads it as non-stiff however
+/// often it is asked, while the oscillation itself needs a step far below `coarse_min_dt`'s
+/// floor. Every step therefore clamps, on the explicit stepper, with no stiffness anywhere for
+/// a re-probe to find.
+fn rotating_rhs<T: PkNum>(w: f64) -> impl Fn(&[T], &[T], f64, &mut [T]) {
+    move |u: &[T], _p: &[T], _t: f64, du: &mut [T]| {
+        du[0] = u[1] * T::from_f64(w);
+        du[1] = u[0] * T::from_f64(-w);
+    }
+}
+
+/// `[x, y, z]`: the rotation above on `(x, y)` for `t < 1`, then a fast pull of `z` towards 1
+/// — `|Re λ|max = 500`, comfortably stiff, at `λ·min_dt = -5`, which is outside the explicit
+/// stepper's stability region.
+///
+/// So the segment clamps ~100 times on the explicit stepper *before* any switch, escalates at
+/// the first re-probe that lands in the second phase, and is then integrated cleanly. It is the
+/// exact shape the escalation guard must not throw away.
+///
+/// `z` is displaced from its equilibrium by only `1e-6` (accumulated over the first phase),
+/// which is what makes the two halves separable: the stiff stepper meets its error test on a
+/// perturbation that small at the first attempt and never clamps, while the explicit stepper —
+/// whose amplification factor at `hλ = -5` is well above 1 — grows it by orders of magnitude
+/// per step until the trajectory is meaningless. Anything larger would clamp on *both*, and a
+/// stiff half that clamps is a stall the guard is right to discard.
+fn clamps_then_turns_stiff<T: PkNum>() -> impl Fn(&[T], &[T], f64, &mut [T]) {
+    move |u: &[T], _p: &[T], t: f64, du: &mut [T]| {
+        if t < 1.0 {
+            du[0] = u[1] * T::from_f64(200.0);
+            du[1] = u[0] * T::from_f64(-200.0);
+            du[2] = T::from_f64(1e-6);
+        } else {
+            du[0] = T::from_f64(0.0);
+            du[1] = T::from_f64(0.0);
+            du[2] = (T::from_f64(1.0) - u[2]) * T::from_f64(500.0);
+        }
+    }
+}
+
+/// A segment that clamped on the **explicit** stepper and was then rescued by a mid-segment
+/// escalation must be kept. Those clamps are the limit of the method the switch replaced, not
+/// evidence that the stiff method stalled, and discarding on them hands the caller back the
+/// pinned-explicit trajectory the escalation had just avoided.
+#[test]
+fn explicit_clamps_before_a_switch_do_not_discard_the_stiff_half() {
+    let rhs = clamps_then_turns_stiff::<f64>();
+    let u0 = [1.0, 0.0, 1.0];
+
+    let mut stats = OdeSolverStats::default();
+    let got = solve_ode_with_stats(
+        &rhs,
+        &u0,
+        (0.0, 2.0),
+        &[],
+        &[2.0],
+        &coarse_min_dt(),
+        Some(&mut stats),
+    );
+
+    assert_eq!(
+        stats.auto_switched_segments, 1,
+        "premise: the segment must escalate mid-way: {stats:?}"
+    );
+    assert!(
+        stats.min_step_clamped_steps > 0,
+        "premise: the explicit phase must clamp, or the guard has nothing to fire on: {stats:?}"
+    );
+    assert_eq!(
+        stats.stiff_min_step_clamped_steps, 0,
+        "the stiff half integrated cleanly, so nothing here may read as a stall: {stats:?}"
+    );
+    assert_eq!(
+        stats.auto_stiff_rejected, 0,
+        "a rescued segment must not be discarded: {stats:?}"
+    );
+    assert_eq!(
+        stats.discarded_clamped_steps, 0,
+        "nothing was discarded, so no clamp belongs to a discarded trajectory: {stats:?}"
+    );
+
+    // What the discard costs, in the currency that matters: pinned to the explicit stepper this
+    // system is outside the stability region in its second phase, so the re-solve hands back a
+    // diverged trajectory where the switch had produced the right answer.
+    assert!(
+        (got[0].u[2] - 1.0).abs() < 1e-3,
+        "the kept trajectory must be the switched one (z -> 1): {:?}",
+        got[0].u
+    );
+    let pinned = OdeSolverOptions {
+        method: OdeMethod::Rk45,
+        ..coarse_min_dt()
+    };
+    let explicit = crate::ode::solve_ode(&rhs, &u0, (0.0, 2.0), &[], &[2.0], &pinned);
+    assert!(
+        !((explicit[0].u[2] - 1.0).abs() < 1e-3),
+        "premise: the explicit fallback must not already be right ({:?})",
+        explicit[0].u
+    );
+}
+
+/// The event-time driver's copy of the same rule. The discard is worse here than in the dense
+/// path: the crossing search re-runs from the entry state pinned to the explicit stepper, whose
+/// second phase diverges, so a run that *had* found the crossing comes back with a different
+/// answer — or none at all, which is a censoring laundered out of a solve that worked.
+#[test]
+fn explicit_clamps_before_a_switch_do_not_discard_a_crossing() {
+    // `[x, y, z, chz]`: `clamps_then_turns_stiff` plus a hazard accumulator driven by `z`, so
+    // the crossing time depends on the second phase being integrated rather than amplified.
+    let rhs = |u: &[f64], _p: &[f64], t: f64, du: &mut [f64]| {
+        if t < 1.0 {
+            du[0] = 200.0 * u[1];
+            du[1] = -200.0 * u[0];
+            du[2] = 1e-6;
+            du[3] = 0.1;
+        } else {
+            du[0] = 0.0;
+            du[1] = 0.0;
+            du[2] = 500.0 * (1.0 - u[2]);
+            du[3] = 0.1 * u[2];
+        }
+    };
+    let u_entry = [1.0, 0.0, 1.0, 0.0];
+    let threshold = 0.15;
+    let tight = OdeSolverOptions {
+        abstol: 1e-12,
+        reltol: 1e-12,
+        max_steps: 10_000_000,
+        method: OdeMethod::Rodas5P,
+        ..Default::default()
+    };
+
+    let mut u = u_entry;
+    let reference = match crate::ode::solve_ode_until_threshold(
+        &rhs,
+        &mut u,
+        (0.0, 3.0),
+        &[],
+        &tight,
+        3,
+        threshold,
+    ) {
+        crate::ode::solver::ThresholdCrossing::Crossed(t) => t,
+        other => panic!("the reference must cross: {other:?}"),
+    };
+    assert!(
+        reference > 1.0,
+        "premise: the crossing must land after the switch ({reference})"
+    );
+
+    let mut u = u_entry;
+    let crossed = match crate::ode::solve_ode_until_threshold(
+        &rhs,
+        &mut u,
+        (0.0, 3.0),
+        &[],
+        &coarse_min_dt(),
+        3,
+        threshold,
+    ) {
+        crate::ode::solver::ThresholdCrossing::Crossed(t) => t,
+        other => {
+            panic!("the switched run found the crossing; the guard must not undo it: {other:?}")
+        }
+    };
+    assert!(
+        (crossed - reference).abs() < 5e-2,
+        "switched crossing {crossed} vs reference {reference}"
+    );
+
+    // The premise, in this driver's currency: pinned explicit, the same span does not report
+    // this crossing correctly — which is what the discarding guard used to hand back.
+    let pinned = OdeSolverOptions {
+        method: OdeMethod::Rk45,
+        ..coarse_min_dt()
+    };
+    let mut u = u_entry;
+    if let crate::ode::solver::ThresholdCrossing::Crossed(t) =
+        crate::ode::solve_ode_until_threshold(&rhs, &mut u, (0.0, 3.0), &[], &pinned, 3, threshold)
+    {
+        assert!(
+            (t - reference).abs() > 5e-2,
+            "premise: the explicit fallback must not already be right ({t} vs {reference})"
+        );
+    }
+}
+
+/// The abort budget bounds how long *one method* may grind on a segment it cannot step, so a
+/// switch starts it again. Without the reset the stiff half inherits the explicit half's spent
+/// clamps and is abandoned for a stability limit belonging to the stepper it replaced.
+///
+/// Pinned at the exact boundary: the budget is set to the number of clamps the explicit phase
+/// produces, measured rather than assumed. The abort test runs *after* the accept block that
+/// takes the switch, so with the reset the escalation begins on a fresh budget and the segment
+/// finishes; without it the budget is already spent at that same step and the stiff half is
+/// abandoned before taking one.
+#[test]
+fn the_abort_budget_starts_again_when_the_stepper_is_swapped() {
+    let rhs = clamps_then_turns_stiff::<f64>();
+    let u0 = [1.0, 0.0, 1.0];
+    let pinned = OdeSolverOptions {
+        method: OdeMethod::Rk45,
+        ..coarse_min_dt()
+    };
+    // The explicit phase is exactly `[0, 1)`, and the switched run steps it identically, so its
+    // clamp count is the budget the stiff half would inherit.
+    let mut first_phase = OdeSolverStats::default();
+    solve_ode_with_stats(
+        &rhs,
+        &u0,
+        (0.0, 1.0),
+        &[],
+        &[1.0],
+        &pinned,
+        Some(&mut first_phase),
+    );
+    let budget = u32::try_from(first_phase.min_step_clamped_steps).unwrap();
+    assert!(budget > 0, "premise: the explicit phase must clamp");
+
+    let opts = OdeSolverOptions {
+        stiff_abort_after: Some(budget),
+        ..coarse_min_dt()
+    };
+    let mut stats = OdeSolverStats::default();
+    let got = solve_ode_with_stats(&rhs, &u0, (0.0, 2.0), &[], &[2.0], &opts, Some(&mut stats));
+    assert_eq!(
+        stats.auto_switched_segments, 1,
+        "premise: the segment must reach its mid-segment escalation: {stats:?}"
+    );
+    assert_eq!(
+        stats.stiff_aborted_segments, 0,
+        "the stiff half clamped nothing of its own, so nothing may abort it: {stats:?}"
+    );
+    assert_eq!(
+        stats.auto_stiff_rejected, 0,
+        "nor may it be discarded: {stats:?}"
+    );
+    assert!(
+        (got[0].u[2] - 1.0).abs() < 1e-3,
+        "the segment must still be integrated to the end: {:?}",
+        got[0].u
+    );
 }

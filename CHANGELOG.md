@@ -66,8 +66,9 @@ section of the SDLC for the versioning policy).
   stepper in place when the verdict changes, keeping the state integrated so far: 143 % error in
   10 000 steps becomes `7e-8` in 90, matching the method a user would have had to know to name in
   advance. A mid-segment escalation is guarded exactly like a start-of-segment one (discarded and
-  re-solved explicitly if it comes back non-finite or clamps), the event-time path switches on the
-  same rule, and a benign segment finishes before the first re-probe and stays bit-identical. New
+  re-solved explicitly if it comes back non-finite or clamps on the stiff stepper), the event-time
+  path switches on the same rule, and a benign segment stays bit-identical — it is never re-probed
+  at all below 25 accepted steps, and pays about one probe per 25 steps above that. New
   `ode_auto_switch = false` restores one method per segment, chosen at its start; a named
   `ode_method` is pinned as before. See
   [ODE models → When a segment turns stiff halfway through](https://ferx-nlme.github.io/ferx-core/model-file/ode-models.html#mid-segment-switching).

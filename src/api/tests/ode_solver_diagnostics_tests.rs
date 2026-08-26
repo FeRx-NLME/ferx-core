@@ -139,8 +139,19 @@ fn a_mid_segment_switch_is_reported_on_the_escalation_note() {
     let (msg, entry) =
         ode_solver_diagnostics_warning(&stats, &FitOptions::default()).expect("a note");
     assert_eq!(entry.severity, WarningSeverity::Info);
-    assert!(msg.contains("9 of them changed stepper"), "{msg}");
-    assert!(msg.contains("ode_auto_switch"), "{msg}");
+    // Spelled out in full, not by fragment: a line-continuation left unescaped inside the
+    // clause's literal collapses into a run of indentation that only the whole sentence sees.
+    assert!(
+        msg.contains(
+            "9 of them changed stepper part-way through the segment, because a mid-segment \
+             re-probe disagreed with the verdict the segment started on (ode_auto_switch)."
+        ),
+        "{msg}"
+    );
+    assert!(
+        !msg.contains("  "),
+        "no run of blank space may reach a user: {msg}"
+    );
     assert_eq!(
         entry.details.as_ref().unwrap()["auto_switched_segments"],
         serde_json::json!(9)
@@ -149,6 +160,10 @@ fn a_mid_segment_switch_is_reported_on_the_escalation_note() {
 
 /// …and a fit that switched *and* did not integrate cleanly says both: the switch clause rides
 /// the warning too, so the counters it explains are never presented without it.
+///
+/// It gets its own wording there. The warning's body is a list of clamped steps and abandoned
+/// segments, so the info note's "N of them" would attach to whichever clause happened to come
+/// last and read as "9 of the clamped steps".
 #[test]
 fn a_switch_is_reported_alongside_an_unclean_solve() {
     let stats = OdeSolverStats {
@@ -160,7 +175,21 @@ fn a_switch_is_reported_alongside_an_unclean_solve() {
     let (msg, entry) =
         ode_solver_diagnostics_warning(&stats, &FitOptions::default()).expect("a warning");
     assert_eq!(entry.severity, WarningSeverity::Warning);
-    assert!(msg.contains("9 of them changed stepper"), "{msg}");
+    assert!(
+        msg.contains(
+            "9 segment(s) changed stepper part-way through, because a mid-segment re-probe \
+             disagreed with the verdict the segment started on (ode_auto_switch)."
+        ),
+        "{msg}"
+    );
+    assert!(
+        !msg.contains("of them"),
+        "the warning body gives \"of them\" no antecedent: {msg}"
+    );
+    assert!(
+        !msg.contains("  "),
+        "no run of blank space may reach a user: {msg}"
+    );
     assert_eq!(classify_warning(&msg).category, WarningCode::OdeSolver);
 }
 

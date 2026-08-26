@@ -79,9 +79,11 @@ pub(crate) const MAX_CONSECUTIVE_MIN_STEP_CLAMPS: usize = 64;
 ///
 /// * **Cost.** A probe is `n + 1` right-hand-side evaluations plus an `O(n²)` Gershgorin bound
 ///   (the eigensolve only runs when that bound cannot rule stiffness out — #1080 Part B), so
-///   it is a fraction of a step. Amortized over 25 accepted steps it is ~1% of the segment.
-///   A benign segment — the overwhelming majority — takes fewer steps than this and is never
-///   re-probed at all, so the common path pays nothing.
+///   it is a fraction of a step. Amortized over 25 accepted steps it is ~1% of the segment,
+///   which is what a long benign segment pays: it is re-probed, the verdict never changes, and
+///   its trajectory is bit-identical to the pinned one. A segment shorter than 25 accepted
+///   steps — a dosing interval with a handful of saves, the overwhelming majority — is never
+///   re-probed at all and pays nothing.
 /// * **Latency.** A segment that has turned stiff takes hundreds to thousands of steps before
 ///   it exhausts `max_steps`, so 25 steps of delay is noise against the detection it buys.
 pub(crate) const AUTO_SWITCH_PROBE_INTERVAL: usize = 25;
@@ -250,8 +252,13 @@ pub struct OdeSolverOptions {
     ///
     /// Independent of [`OdeMethod::Auto`]. Under `auto` an escalation that trips the budget is
     /// discarded by the guard exactly as any other stalled escalation would be (the trigger is
-    /// `min_step_clamped_steps > 0`, which an abort has by construction) and the segment is
-    /// re-solved explicitly.
+    /// [`OdeSolverStats::stiff_min_step_clamped_steps`]` > 0`, which an abort on a stiff
+    /// stepper has by construction) and the segment is re-solved explicitly.
+    ///
+    /// The budget is per *method*, not per segment: when [`auto_switch`](Self::auto_switch)
+    /// swaps the stepper part-way, the count starts again, because what it bounds is how long
+    /// one method may grind on a segment it cannot step, and the clamps behind the switch
+    /// measured the method that was replaced.
     pub stiff_abort_after: Option<u32>,
     /// Let [`OdeMethod::Auto`] change stepper **inside** a segment, not only at its start
     /// (#1080 Part C). Default `true`; ignored under every named method, which is pinned.
@@ -334,6 +341,17 @@ pub struct OdeSolverStats {
     ///   no `u_new` existed to force-accept and the driver had to stop. The remaining
     ///   `saveat` points are then freeze-padded with the last state — finite, but wrong.
     pub min_step_clamped_steps: usize,
+    /// Of [`min_step_clamped_steps`](Self::min_step_clamped_steps), the ones taken while a
+    /// **stiff** stepper was the active one — i.e. the clamps that are the stiff method's own
+    /// failure to form a step, rather than the explicit method's (#1080 Part C).
+    ///
+    /// The two are the same number for a segment that runs on one method throughout, and only
+    /// diverge once a segment switches stepper part-way ([`OdeSolverOptions::auto_switch`]).
+    /// There they must diverge: the escalation guard discards a stiff attempt *because the
+    /// stiff method stalled*, and a segment that clamped on the explicit stepper before the
+    /// re-probe escalated it has not shown that at all — throwing its result away would
+    /// re-solve it with the very stepper whose clamps triggered the discard.
+    pub stiff_min_step_clamped_steps: usize,
     /// Integrations [`OdeMethod::Auto`] escalated to a stiff method because the a-priori probe
     /// read `|Re λ|max ≥` [`crate::ode::stiffness::STIFF_RE_LAMBDA_THRESHOLD`] — at the
     /// segment's entry state, or at a mid-segment re-probe
@@ -427,6 +445,7 @@ impl OdeSolverStats {
             accepted_steps,
             rejected_steps,
             min_step_clamped_steps,
+            stiff_min_step_clamped_steps,
             auto_stiff_segments,
             auto_switched_segments,
             auto_stiff_rejected,
@@ -437,6 +456,7 @@ impl OdeSolverStats {
         self.accepted_steps += accepted_steps;
         self.rejected_steps += rejected_steps;
         self.min_step_clamped_steps += min_step_clamped_steps;
+        self.stiff_min_step_clamped_steps += stiff_min_step_clamped_steps;
         self.auto_stiff_segments += auto_stiff_segments;
         self.auto_switched_segments += auto_switched_segments;
         self.auto_stiff_rejected += auto_stiff_rejected;
@@ -773,10 +793,18 @@ fn integrate_dense_g<T: PkNum>(
     let mut interp_results: Vec<SolPointG<T>> = Vec::with_capacity(interp_at.len());
     let mut interp_idx = 0;
     let mut consecutive_min_step_clamps = 0usize;
-    // Clamps produced by *this* driver call. Counted locally rather than read back off
-    // `stats`, because `stats` is optional and the abort budget must behave identically
-    // whether or not the caller asked for counters.
+    // Clamps produced by the *currently active* stepper. Counted locally rather than read back
+    // off `stats`, because `stats` is optional and the abort budget must behave identically
+    // whether or not the caller asked for counters — and reset when the stepper is swapped
+    // (below), because the budget bounds how long one method is allowed to grind on a segment
+    // it cannot step. Clamps the explicit stepper took before a re-probe escalated the segment
+    // are that method's stability limit, not the stiff method's, and charging them to the
+    // stiff phase would abort it for a limit belonging to the stepper it just replaced.
     let mut min_step_clamps = 0u32;
+    // Clamps taken while a stiff stepper was active, for `stiff_min_step_clamped_steps`. Not
+    // reset on a switch: it is a per-segment total, and the escalation guard needs to know
+    // whether *any* stiff phase of this segment stalled.
+    let mut stiff_min_step_clamps = 0usize;
     let mut method = method;
     let mut stepper = make_stepper::<T>(n, method);
     stepper.set_dense_required(!interp_at.is_empty());
@@ -818,6 +846,9 @@ fn integrate_dense_g<T: PkNum>(
             if let Some(s) = stats.as_deref_mut() {
                 s.record_min_step_failure();
             }
+            if method != OdeMethod::EXPLICIT_FALLBACK {
+                stiff_min_step_clamps += 1;
+            }
             break;
         }
 
@@ -826,6 +857,9 @@ fn integrate_dense_g<T: PkNum>(
         // exactly the steps `min_step_clamped_steps` reports.
         if accepted && !(err_norm <= 1.0) && dt_eff <= opts.min_dt {
             min_step_clamps += 1;
+            if method != OdeMethod::EXPLICIT_FALLBACK {
+                stiff_min_step_clamps += 1;
+            }
         }
         // Only a force-accept at `min_dt` with a *non-finite* error counts toward the
         // pathological-divergence break (#603 review #4); a finite-but-stiff clamp is left to
@@ -912,6 +946,12 @@ fn integrate_dense_g<T: PkNum>(
                     }
                     escalation_counted |= newly_escalated;
                     switches += 1;
+                    // The new stepper gets the whole abort budget. `stiff_abort_after` bounds
+                    // how long *a method* is allowed to grind on a segment it cannot step, and
+                    // the method just changed; the clamps behind this point measured the one
+                    // that was replaced. Bounded by `MAX_AUTO_SWITCHES_PER_SEGMENT`, so the
+                    // worst case is that many budgets rather than an unbounded reprieve.
+                    min_step_clamps = 0;
                 }
             }
         }
@@ -949,6 +989,11 @@ fn integrate_dense_g<T: PkNum>(
         };
         dt = dt_eff * factor.clamp(0.2, 5.0);
         dt = dt.max(opts.min_dt);
+    }
+
+    // Written once here rather than inside `record`, which cannot see which stepper is active.
+    if let Some(s) = stats.as_deref_mut() {
+        s.stiff_min_step_clamped_steps += stiff_min_step_clamps;
     }
 
     // Fill any remaining saveat / interp times with the last state.
@@ -1123,7 +1168,7 @@ pub fn solve_ode_until_threshold(
     // stepper: there the re-solve *is* the same solve, and repeating it would double the cost
     // of every stability-limited explicit crossing search to return the identical answer.
     if !run.ran_stiff
-        || (!matches!(run.outcome, ThresholdCrossing::Failed(_)) && !run.min_step_clamped)
+        || (!matches!(run.outcome, ThresholdCrossing::Failed(_)) && !run.stiff_min_step_clamped)
     {
         return run.outcome;
     }
@@ -1146,10 +1191,10 @@ pub fn solve_ode_until_threshold(
 /// [`solve_ode_until_threshold`] with the stepper already chosen — the body both the probed
 /// and the re-solved pass run through.
 ///
-/// Reports `(outcome, min_step_clamped)`. The second half is what lets the caller's guard see a
-/// stall: a clamped step here is force-accepted and the run continues, so a stalled solve
-/// returns a perfectly ordinary-looking `Crossed`/`ReachedEnd` that no inspection of the
-/// outcome alone can distinguish from a healthy one.
+/// Reports `(outcome, stiff_min_step_clamped)`. The second half is what lets the caller's
+/// guard see a stall: a clamped step here is force-accepted and the run continues, so a
+/// stalled solve returns a perfectly ordinary-looking `Crossed`/`ReachedEnd` that no
+/// inspection of the outcome alone can distinguish from a healthy one.
 /// Pair a hard failure with the clamp flag. A failure is a failure whether or not the solver
 /// clamped on the way there, so the flag is irrelevant to the caller in this arm — but the
 /// return type is one type, and spelling it out at eight call sites is noise.
@@ -1161,7 +1206,7 @@ pub fn solve_ode_until_threshold(
 fn failed(msg: String, ran_stiff: bool) -> ThresholdRun {
     ThresholdRun {
         outcome: ThresholdCrossing::Failed(msg),
-        min_step_clamped: true,
+        stiff_min_step_clamped: true,
         ran_stiff,
     }
 }
@@ -1169,9 +1214,17 @@ fn failed(msg: String, ran_stiff: bool) -> ThresholdRun {
 /// What one pass of [`until_threshold_with`] produced, for the guard above it.
 struct ThresholdRun {
     outcome: ThresholdCrossing,
-    /// A step was force-accepted at `min_dt`. The run continued afterwards, so this is the
-    /// only trace such a step leaves in an otherwise ordinary-looking outcome.
-    min_step_clamped: bool,
+    /// A step was force-accepted at `min_dt` **while a stiff stepper was active**. The run
+    /// continued afterwards, so this is the only trace such a step leaves in an otherwise
+    /// ordinary-looking outcome.
+    ///
+    /// Scoped to the stiff stepper for the same reason the dense guard's
+    /// [`OdeSolverStats::stiff_min_step_clamped_steps`] is: on a run that switched part-way
+    /// (#1080 Part C), clamps taken by the explicit stepper *before* the escalation are not
+    /// evidence that the stiff method stalled, and re-running such a crossing search with
+    /// pinned explicit would move the event time — or launder a censoring — for a limit
+    /// belonging to the stepper the switch replaced.
+    stiff_min_step_clamped: bool,
     /// A stiff stepper integrated some part of this run — because the segment-start probe
     /// escalated, or because a mid-segment re-probe switched onto one (#1080 Part C).
     ran_stiff: bool,
@@ -1189,9 +1242,9 @@ fn until_threshold_with(
     method: OdeMethod,
 ) -> ThresholdRun {
     let (t0, tf) = t_span;
-    let ended = |outcome, min_step_clamped, ran_stiff| ThresholdRun {
+    let ended = |outcome, stiff_min_step_clamped, ran_stiff| ThresholdRun {
         outcome,
-        min_step_clamped,
+        stiff_min_step_clamped,
         ran_stiff,
     };
 
@@ -1206,9 +1259,11 @@ fn until_threshold_with(
     }
 
     // Set when a step is force-accepted at `min_dt` (an explicit method that failed its error
-    // test, or a linearly implicit one that could not form a step at all). The run continues
-    // afterwards, so this is the only trace such a step leaves.
-    let mut min_step_clamped = false;
+    // test, or a linearly implicit one that could not form a step at all) *on a stiff stepper*.
+    // The run continues afterwards, so this is the only trace such a step leaves.
+    let mut stiff_min_step_clamped = false;
+    // Clamps by the currently active stepper, for the abort budget; reset when the stepper is
+    // swapped, for the reason `integrate_dense_g` gives at its own reset.
     let mut clamps = 0u32;
     let mut method = method;
     let mut stepper = make_stepper::<f64>(u.len(), method);
@@ -1229,14 +1284,17 @@ fn until_threshold_with(
 
     for _step in 0..opts.max_steps {
         if t >= tf - 1e-15 {
-            return ended(ThresholdCrossing::ReachedEnd, min_step_clamped, ran_stiff);
+            return ended(
+                ThresholdCrossing::ReachedEnd,
+                stiff_min_step_clamped,
+                ran_stiff,
+            );
         }
 
         let dt_eff = dt.min(tf - t);
         let err_norm = stepper.attempt(rhs, u, params, t, dt_eff, opts);
         let usable = stepper.attempt_usable();
         if !usable && dt_eff <= opts.min_dt {
-            min_step_clamped = true;
             return failed(
                 format!(
                     "the step at t={t:.6} could not be formed even at min_dt \
@@ -1250,7 +1308,7 @@ fn until_threshold_with(
         // Mirrors `OdeSolverStats::record`: a force-accept at `min_dt` whose error test did not
         // pass (`!(err_norm <= 1.0)`, which also catches a non-finite norm) is a clamp.
         if accepted && !(err_norm <= 1.0) && dt_eff <= opts.min_dt {
-            min_step_clamped = true;
+            stiff_min_step_clamped |= method != OdeMethod::EXPLICIT_FALLBACK;
             clamps += 1;
         }
         if accepted {
@@ -1295,7 +1353,7 @@ fn until_threshold_with(
                 }
                 return ended(
                     ThresholdCrossing::Crossed(t + 0.5 * (lo + hi) * dt_eff),
-                    min_step_clamped,
+                    stiff_min_step_clamped,
                     ran_stiff,
                 );
             }
@@ -1323,6 +1381,8 @@ fn until_threshold_with(
                     err_exp = stepper.err_exp();
                     ran_stiff |= method != OdeMethod::EXPLICIT_FALLBACK;
                     switches += 1;
+                    // Fresh abort budget for the new stepper — see `integrate_dense_g`.
+                    clamps = 0;
                 }
             }
         }
@@ -1610,8 +1670,15 @@ fn integrate_resolved_g_inner<T: PkNum>(
     // solve, not of when the decision was taken. It must *not* cover a segment that never left
     // the explicit stepper: there the fallback and the attempt are the same solve, so
     // discarding a clamped result would only buy a second copy of it.
+    //
+    // The stall test reads the clamps taken **on a stiff stepper**, not every clamp the segment
+    // produced. On a segment that switched part-way those differ, and only the stiff ones are
+    // evidence of the failure this guard repairs: a segment that clamped on the explicit
+    // stepper, was escalated by a re-probe, and then integrated cleanly to the end has just
+    // been rescued by the switch, and discarding it would re-solve it with pinned explicit —
+    // the exact result the escalation avoided.
     let ran_stiff = attempt.auto_stiff_segments > 0;
-    let stalled = attempt.min_step_clamped_steps > 0;
+    let stalled = attempt.stiff_min_step_clamped_steps > 0;
     let usable = !ran_stiff || (!stalled && finite_g(&out.0) && finite_g(&out.1));
     if !usable {
         attempt.auto_stiff_rejected = 1;

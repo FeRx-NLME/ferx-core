@@ -384,14 +384,30 @@ steps to `7e-8` in 90 — matching the method a user would have had to know to n
 
 A switch onto a stiff method is guarded exactly like a start-of-segment escalation: if that half
 comes back non-finite or clamps at the minimum step, the segment is discarded and re-solved with
-the explicit stepper, so the worst case stays "the explicit answer, twice the cost". The
+the explicit stepper, so the worst case stays "the explicit answer, twice the cost". Only clamps
+taken *by the stiff stepper* count towards that test — a segment that clamped explicitly and was
+then rescued by the switch is kept, since discarding it would hand back exactly the explicit
+result the switch had just avoided. The
 event-time path (TTE draws, adaptive dosing) switches on the same rule, where it matters more —
 its output *is* the answer, so a badly integrated span moves the event time rather than one
 prediction.
 
-A benign segment pays nothing: it finishes in fewer than 25 steps, so it is never re-probed, and
-its trajectory is bit-identical to the pinned explicit one. To go back to one method per segment,
-chosen at its start:
+Being a threshold test, the re-probe is also a **discontinuity** in the objective as a function
+of θ: a segment whose `|Re λ|max` sits near the threshold when the probe fires can switch at θ
+and not at θ+h, and the two trajectories differ by far more than the solver tolerance. The
+start-of-segment probe and the escalation guard have the same property — re-probing adds up to
+eight more decision points per segment. Unlike `ode_stiff_abort_after` this is
+still on by default, because on a segment that actually turns stiff the alternative is not a
+slightly different trajectory but a 143 %-wrong one. If a covariance step returns implausible
+standard errors on a model whose `ode_solver` warning reports mid-segment switches, re-run it
+with `ode_auto_switch = false`, or with a named stiff method (pinned, and so free of both the
+probe and the guard), to see whether the switching is what moved them.
+
+A benign segment stays on its stepper: a segment shorter than 25 accepted steps is never
+re-probed at all, and a longer one pays roughly one probe per 25 steps — a Jacobian build and an
+eigensolve against 25 full steps — and keeps a trajectory bit-identical to the pinned explicit
+one, because the verdict never changes. To go back to one method per segment, chosen at its
+start:
 
 ```
 [fit_options]

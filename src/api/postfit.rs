@@ -1463,9 +1463,23 @@ pub(crate) fn ode_solver_diagnostics_warning(
     // thing worth telling the user is that the decision was taken *later*, not that it was
     // taken at all.
     let switched = stats.auto_switched_segments;
-    let switched_clause = if switched > 0 {
+    // Two wordings, because the two messages give the clause a different antecedent. The info
+    // message has just said "escalated N segment(s)", so "N of them" reads correctly there; the
+    // warning message ends on a list of clamped steps and abandoned segments, where "of them"
+    // would attach to whichever clause happened to come last.
+    let switched_info_clause = if switched > 0 {
         format!(
-            " {switched} of them changed stepper part-way through the segment, because a              mid-segment re-probe disagreed with the verdict the segment started on              (ode_auto_switch)."
+            " {switched} of them changed stepper part-way through the segment, because a \
+             mid-segment re-probe disagreed with the verdict the segment started on \
+             (ode_auto_switch)."
+        )
+    } else {
+        String::new()
+    };
+    let switched_warn_clause = if switched > 0 {
+        format!(
+            " {switched} segment(s) changed stepper part-way through, because a mid-segment \
+             re-probe disagreed with the verdict the segment started on (ode_auto_switch)."
         )
     } else {
         String::new()
@@ -1482,6 +1496,7 @@ pub(crate) fn ode_solver_diagnostics_warning(
         "accepted_steps": stats.accepted_steps,
         "rejected_steps": stats.rejected_steps,
         "min_step_clamped_steps": stats.min_step_clamped_steps,
+        "stiff_min_step_clamped_steps": stats.stiff_min_step_clamped_steps,
         "discarded_clamped_steps": stats.discarded_clamped_steps,
         "kept_clamped_steps": clamped,
         "auto_stiff_segments": escalated,
@@ -1496,7 +1511,7 @@ pub(crate) fn ode_solver_diagnostics_warning(
             "{ODE_SOLVER_INFO_TOKEN}: ode_method = auto escalated {escalated} integration \
              segment(s) to a stiff stepper at the final estimates; every other segment used \
              {explicit}, no escalation was rejected, and no step clamped at the minimum step \
-             size.{switched_clause} Informational — set ode_method = {explicit} to pin the \
+             size.{switched_info_clause} Informational — set ode_method = {explicit} to pin the \
              explicit stepper, or name a stiff method to pin the other half.",
             explicit = crate::ode::OdeMethod::EXPLICIT_FALLBACK.as_str(),
         );
@@ -1549,7 +1564,7 @@ pub(crate) fn ode_solver_diagnostics_warning(
          estimates (ode_method = {method}): {body}. Counters are from the post-fit prediction \
          pass over all subjects; consider a different ode_method, a looser ode_reltol / \
          ode_abstol, or checking the parameter estimates that produce these dynamics.\
-         {switched_clause}",
+         {switched_warn_clause}",
         method = options.ode_method.as_str(),
         body = parts.join("; "),
     );
