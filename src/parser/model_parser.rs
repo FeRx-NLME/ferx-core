@@ -4504,6 +4504,26 @@ fn parse_derived_block(
                              aggregate over rows cannot be combined into a larger expression."
                         ));
                     }
+                    // Only `args[0]` (the value) and `args[1]` (the row filter) are
+                    // read below, so a third argument used to be dropped in silence —
+                    // the same class of bug as the trailing-token drop just above.
+                    // Reject it, and point at what the extra argument usually means:
+                    // a two-sided bound is `clamp`, not a three-argument `min`/`max`
+                    // (#1092). The `parse_atom` path already says this; say it here
+                    // too, since a statement-top-level `min`/`max` in `[derived]`
+                    // never reaches that path.
+                    if args.len() > 2 {
+                        let hint = if fname_lc == "tmax" {
+                            ""
+                        } else {
+                            " — a two-sided bound is `clamp(x, lo, hi)`"
+                        };
+                        return Err(format!(
+                            "[derived] `{name}`: `{fname_lc}(…)` takes at most two arguments (a \
+                             value and an optional row filter), but {} were found{hint}.",
+                            args.len()
+                        ));
+                    }
                     let agg_fn = match fname_lc.as_str() {
                         "max" => AggFunction::Max,
                         "min" => AggFunction::Min,
@@ -8234,14 +8254,13 @@ pub(crate) fn build_y_output_fn(
     // un-desugared (none, in practice) keeps `dual_evaluable` false → FD fallback.
     rewrite_readout_synth(&mut expr, readout_synth);
 
-    // Reject KAPPA_* (IOV) references in a Form C ODE output expression: the
-    // readout is evaluated once per observation with a single eta, so under IOV
-    // it would silently see kappa = 0 (the per-occasion PK *dynamics* are still
-    // correct — they flow through the per-event parameters — but a direct kappa
-    // reference in the readout is not occasion-aware). The `[scaling]` eta scope
-    // is BSV-only, so a kappa name parses as an unresolved identifier here; match
-    // it by name. Fail fast rather than mislead. See issue #107; reference the
-    // occasion-dependent structural parameter (e.g. CL) instead.
+    // Reject KAPPA_* (IOV) references in a Form C output expression: the `[scaling]`
+    // eta scope is BSV-only, so a kappa name parses as an unresolved identifier and
+    // would silently evaluate to 0. Fail fast rather than mislead. See issue #107.
+    // This is a *direct* reference only — a kappa reaching the readout through an
+    // `[individual_parameters]` entry (`BASE = TVBASE * exp(KAPPA_B)`) is fine and
+    // occasion-correct: both engines evaluate the readout per observation with that
+    // observation's occasion parameters (#1079).
     if let Some(name) = expr_references_kappa(&expr, kappa_names) {
         return Err(format!(
             "{context}: Form C output expressions cannot reference the IOV \
@@ -20716,14 +20735,85 @@ fn parse_atom(
             }
 
             // Check if it's a function call: `name(expr)` — or, for `min` / `max`,
-            // the two-argument `name(a, b)` form (#1030).
+            // the two-argument `name(a, b)` form (#1030), or the three-argument
+            // `clamp(x, lo, hi)` (#1092).
             if pos + 1 < tokens.len() && tokens[pos + 1] == Token::LParen {
                 let func_name = name.to_lowercase();
                 let is_min_max = matches!(func_name.as_str(), "min" | "max");
+                let is_clamp = func_name == "clamp";
                 let (arg, p) = parse_add_sub(tokens, pos + 2, ctx)?;
-                if is_min_max && tokens.get(p) == Some(&Token::Comma) {
+                if (is_min_max || is_clamp) && tokens.get(p) == Some(&Token::Comma) {
                     let (arg2, p) = parse_add_sub(tokens, p + 1, ctx)?;
+                    if is_clamp {
+                        if tokens.get(p) != Some(&Token::Comma) {
+                            return Err(format!(
+                                "`{func_name}` takes exactly three arguments: \
+                                 `clamp(x, lo, hi)`."
+                            ));
+                        }
+                        let (arg3, p) = parse_add_sub(tokens, p + 1, ctx)?;
+                        if tokens.get(p) != Some(&Token::RParen) {
+                            return Err(format!(
+                                "Missing closing parenthesis for function {name} — `{func_name}` \
+                                 takes exactly three arguments, `clamp(x, lo, hi)`."
+                            ));
+                        }
+                        // An inverted *literal* interval can only be a typo: the
+                        // desugaring below never returns `x` at all, quietly handing
+                        // back `lo` below the crossing and `hi` above it.
+                        // Non-literal bounds are left alone rather than paying an
+                        // ordering test on every evaluation of every clamp.
+                        if let (Expression::Literal(lo), Expression::Literal(hi)) = (&arg2, &arg3) {
+                            if lo > hi {
+                                return Err(format!(
+                                    "`clamp(x, {lo}, {hi})` has its bounds inverted — the lower \
+                                     bound must not be above the upper bound."
+                                ));
+                            }
+                        }
+                        // Desugar to nested inline conditionals, exactly as `min` /
+                        // `max` do just below:
+                        //   `clamp(x, lo, hi)` → `if (x <= lo) lo else if (x >= hi) hi else x`
+                        // `Expression::Conditional` is already evaluated,
+                        // bytecode-compiled, `Dual2`-differentiated and index-resolved
+                        // everywhere in the pipeline, so `clamp` inherits all of it.
+                        // On every *finite* `x` it returns bit-for-bit what the
+                        // `min(max(x, lo), hi)` it replaces returns. The two forms are
+                        // deliberately not identical where no branch test can be true:
+                        // a NaN `x` fails both `<=` and `>=`, so `clamp` falls through
+                        // to `x` and propagates the NaN, while the nested form's `max`
+                        // takes its `else` and pins the result to `lo`. Propagating is
+                        // the wanted behaviour — a NaN readout silently bounded to `lo`
+                        // is a wrong number that survives into the OFV, where a NaN
+                        // does not. The same branch choice puts the derivative at 0
+                        // *on* each bound where the nested form passes 1 through; both
+                        // conventions are pinned in
+                        // `clamp_derivative_convention_on_the_bounds` and
+                        // `clamp_propagates_nan_where_nested_pins_to_lo`.
+                        // `x` lands in the tree three times (`lo` and `hi` twice each) —
+                        // the same cost as writing the nested form by hand, so clamp a
+                        // *named* value rather than a long expression.
+                        let inner = Expression::Conditional(
+                            Box::new(Condition::Compare(arg.clone(), CmpOp::Ge, arg3.clone())),
+                            Box::new(arg3),
+                            Box::new(arg.clone()),
+                        );
+                        return Ok((
+                            Expression::Conditional(
+                                Box::new(Condition::Compare(arg, CmpOp::Le, arg2.clone())),
+                                Box::new(arg2),
+                                Box::new(inner),
+                            ),
+                            p + 1,
+                        ));
+                    }
                     if tokens.get(p) != Some(&Token::RParen) {
+                        if tokens.get(p) == Some(&Token::Comma) {
+                            return Err(format!(
+                                "function `{name}` takes 2 arguments, but a third `,` was found — \
+                                 a two-sided bound is `clamp(x, lo, hi)`."
+                            ));
+                        }
                         return Err(format!(
                             "Missing closing parenthesis for function {} — `{}` takes exactly \
                              two arguments, `{}(a, b)`.",
@@ -20756,7 +20846,8 @@ fn parse_atom(
                     if tokens.get(p) == Some(&Token::Comma) {
                         return Err(format!(
                             "function `{}` takes 1 argument, but a `,` was found — only \
-                             `min(a, b)` and `max(a, b)` take two.",
+                             `min(a, b)` and `max(a, b)` take two, and `clamp(x, lo, hi)` \
+                             takes three.",
                             name
                         ));
                     }
@@ -20766,6 +20857,15 @@ fn parse_atom(
                     return Err(format!(
                         "`{}` takes exactly two arguments: `{}(a, b)`.",
                         name, func_name
+                    ));
+                }
+                if is_clamp {
+                    // A one-argument `clamp(x)` used to fall through to
+                    // `UnaryFn("clamp", x)`, which every consumer evaluates as the
+                    // identity — a no-op that fits, converges and gives wrong
+                    // numbers (#1092). Reject it by name.
+                    return Err(format!(
+                        "`{func_name}` takes exactly three arguments: `clamp(x, lo, hi)`."
                     ));
                 }
                 return Ok((Expression::UnaryFn(func_name, Box::new(arg)), p + 1));

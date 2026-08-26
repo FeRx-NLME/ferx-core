@@ -6402,10 +6402,10 @@ fn iov_provider_matches_fd_of_predict_iov() {
 
 // 1-cpt IV closed-form IOV with a saturable-binding analytic Form C readout
 // `y = C + BMAX·C/(KD + C)`, `C = central/V` (#655). `CL = TVCL·exp(ETA_CL + KAPPA_CL)`
-// carries the occasion κ through the concentration, while production applies the
-// readout with the κ = 0 (BSV-only) PK params (`apply_analytic_readout(..., eta_bsv)`)
-// — so the readout param jet (V, BMAX, KD) is κ-less and only `C` carries κ, exactly
-// the split `run_obs_iov` seeds from `readout_obs`.
+// carries the occasion κ through the concentration; the readout's own params
+// (V, BMAX, KD) happen to be κ-less here, so this model exercises the readout jet
+// without exercising a κ-carrying readout parameter — see
+// `WARFARIN_IOV_KAPPA_BASELINE_READOUT` for that case (#1079).
 const WARFARIN_IOV_BINDING_READOUT: &str = r#"
 [parameters]
   theta TVCL(0.2, 0.001, 10.0)
@@ -6434,9 +6434,9 @@ const WARFARIN_IOV_BINDING_READOUT: &str = r#"
 
 /// **Analytic Form C readout × IOV on the closed-form walk** (#655). The IOV provider
 /// now replaces each observation's concentration jet with `y = <expr>`, seeding the
-/// readout PK params from the κ = 0 (BSV-only) per-obs snapshot while the walk's
-/// concentration carries κ — matching production `predict_iov`'s
-/// `apply_analytic_readout(..., eta_bsv, ...)`. The full provider's value /
+/// readout PK params from that observation's own occasion source — matching
+/// production `predict_iov`'s per-occasion
+/// `apply_analytic_readout(..., [η_bsv, κ_g], ...)` (#1079). The full provider's value /
 /// `∂(stacked-η)` / Hessian / `∂θ` must match FD of `predict_iov` (which applies the
 /// readout), and the non-structural BMAX/KD must be first-class differentiable.
 #[test]
@@ -6483,12 +6483,164 @@ fn iov_form_c_binding_readout_inner_eta_grad_matches_outer() {
     );
 }
 
+// 1-cpt IV closed-form IOV whose Form C readout reads a **κ-carrying** individual
+// parameter: `BASE = TVBASE·exp(KAPPA_B)` enters the readout additively, so it does
+// NOT cancel against the `conc × V` amount reconstruction (#1079). Production
+// evaluates the readout per occasion with `[η_bsv, κ_g]`, so the readout param jet
+// carries κ on group `g`'s stacked block — the walk seeds it from that observation's
+// own event source. Seeding `group = None` (the pre-#1079 κ = 0 convention) would
+// differentiate a *different* function than `predict_iov` computes, which is exactly
+// what this FD parity check catches.
+const WARFARIN_IOV_KAPPA_BASELINE_READOUT: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVBASE(2.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_B ~ 0.04
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV  * exp(ETA_V)
+  BASE = TVBASE * exp(KAPPA_B)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[scaling]
+  y = central / V + BASE
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+
+/// **A κ-carrying Form C readout parameter under IOV (#1079).** The readout's
+/// `BASE` moves with the occasion, so `∂y/∂κ_g` is non-zero *through the readout*
+/// (not only through the concentration). Value / `∂(stacked-η)` / Hessian / `∂θ`
+/// must match FD of `predict_iov`, which since #1079 applies the readout per
+/// occasion — a walk still seeded at κ = 0 differentiates the wrong function and
+/// this check fails on the κ columns.
+#[test]
+fn iov_form_c_kappa_baseline_readout_provider_matches_fd() {
+    let model = parse_model_string(WARFARIN_IOV_KAPPA_BASELINE_READOUT).expect("parse");
+    assert!(
+        iov_analytical_supported(&model),
+        "κ-carrying readout param × closed-form IOV must stay analytic"
+    );
+    let subject = iov_subject();
+    // θ = [TVCL, TVV, TVBASE]; stacked = [η_cl, η_v, κ_g0, κ_g1].
+    let theta = [0.2, 10.0, 2.0];
+    let stacked = [0.12, -0.08, 0.05, -0.10];
+    check_iov_provider_vs_fd(&model, &subject, &theta, &stacked);
+    check_iov_inner_matches_outer(&model, &subject, &theta, &stacked);
+
+    // The readout is the *only* κ path on `BASE`, and the two occasion groups own
+    // disjoint observations, so each observation's κ derivative must land on its own
+    // group's stacked axis (2 = κ_g0, 3 = κ_g1) and nowhere else.
+    let full = subject_sensitivities_iov(&model, &subject, &theta, &stacked).expect("supported");
+    let groups = crate::stats::likelihood::iov_occasion_groups(&subject);
+    for (g, (_occ, obs_indices)) in groups.iter().enumerate() {
+        for &j in obs_indices {
+            let d = &full.obs[j].df_deta;
+            assert!(
+                d[2 + g].abs() > 1e-6,
+                "obs {j} must carry ∂y/∂κ on its own group axis {}",
+                2 + g
+            );
+            assert_eq!(
+                d[2 + (1 - g)],
+                0.0,
+                "obs {j} must not leak κ onto the other occasion's axis"
+            );
+        }
+    }
+}
+
+/// **Cross-engine sensitivity oracle for the κ-carrying readout (#1079).** FD parity
+/// alone cannot catch a readout evaluated at the wrong κ — the analytic path was seeded
+/// to match the (wrong) `f64` path, so both agreed. The ODE engine, which applies the
+/// readout inside the integrator against the per-observation parameter snapshot, is the
+/// independent one: the closed-form walk's value **and** stacked-η gradient must equal
+/// its ODE twin's, occasion κ included.
+#[test]
+fn iov_form_c_kappa_baseline_readout_matches_ode_twin_sens() {
+    const ODE_TWIN: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVBASE(2.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_B ~ 0.04
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV  * exp(ETA_V)
+  BASE = TVBASE * exp(KAPPA_B)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central / V + BASE
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-11
+  ode_abstol = 1e-13
+"#;
+    let cf = parse_model_string(WARFARIN_IOV_KAPPA_BASELINE_READOUT).expect("parse closed-form");
+    let ode = parse_model_string(ODE_TWIN).expect("parse ODE twin");
+    assert!(iov_analytical_supported(&cf));
+    assert!(crate::sens::ode_provider::ode_iov_supported(&ode));
+    let subject = iov_subject();
+    let theta = [0.2, 10.0, 2.0];
+    let stacked = [0.12, -0.08, 0.05, -0.10];
+    let a = subject_sensitivities_iov(&cf, &subject, &theta, &stacked).expect("closed-form");
+    let b = subject_sensitivities_iov(&ode, &subject, &theta, &stacked).expect("ODE twin");
+    assert_eq!(a.obs.len(), b.obs.len());
+    for (oa, ob) in a.obs.iter().zip(b.obs.iter()) {
+        approx::assert_relative_eq!(oa.f, ob.f, max_relative = 1e-6, epsilon = 1e-9);
+        for (x, y) in oa.df_deta.iter().zip(ob.df_deta.iter()) {
+            approx::assert_relative_eq!(x, y, max_relative = 1e-5, epsilon = 1e-8);
+        }
+        for (x, y) in oa.df_dtheta.iter().zip(ob.df_dtheta.iter()) {
+            approx::assert_relative_eq!(x, y, max_relative = 1e-5, epsilon = 1e-8);
+        }
+    }
+}
+
+/// The same κ-carrying readout on a **TV-covariate** subject: a per-row `FREE` flag
+/// gates the baseline in and out, so `build_iov_sources` takes the per-event branch.
+/// The readout params then come from each observation's own per-event source, which
+/// must carry both that row's covariate snapshot and that occasion's κ (#1079).
+#[test]
+fn iov_form_c_kappa_baseline_readout_tvcov_matches_fd() {
+    let model = parse_model_string(&WARFARIN_IOV_KAPPA_BASELINE_READOUT.replace(
+        "  y = central / V + BASE",
+        "  y = central / V + FREE * BASE",
+    ))
+    .expect("parse");
+    let mut subject = iov_subject();
+    subject.obs_covariates = (0..subject.obs_times.len())
+        .map(|j| HashMap::from([("FREE".to_string(), (j % 2) as f64)]))
+        .collect();
+    assert!(subject.has_tv_covariates(), "per-row FREE ⇒ TV-cov subject");
+    assert!(iov_analytical_supported(&model), "still analytic");
+    let theta = [0.2, 10.0, 2.0];
+    let stacked = [0.12, -0.08, 0.05, -0.10];
+    check_iov_provider_vs_fd(&model, &subject, &theta, &stacked);
+    check_iov_inner_matches_outer(&model, &subject, &theta, &stacked);
+}
+
 // As `WARFARIN_IOV_BINDING_READOUT`, but the readout is gated on a **per-row** covariate
 // (`FREE`) — the free-vs-total assay pattern (#650/#655). A per-observation `FREE` flag
 // makes the subject a TV-covariate subject, so `build_iov_sources` takes the per-event
-// branch and builds one κ = 0 readout snapshot per observation (`readout_obs`), each at
-// that observation's covariate — the branch the plain (static-covariate) case above does
-// not exercise.
+// branch and the readout reads one source per observation, each at that observation's
+// covariate — the branch the plain (static-covariate) case above does not exercise.
 const WARFARIN_IOV_BINDING_READOUT_FREE: &str = r#"
 [parameters]
   theta TVCL(0.2, 0.001, 10.0)
@@ -6516,8 +6668,8 @@ const WARFARIN_IOV_BINDING_READOUT_FREE: &str = r#"
 "#;
 
 /// Covariate-gated Form C readout × IOV: the per-row `FREE` flag routes the subject
-/// through the per-event `readout_obs` branch (one κ = 0 snapshot per observation, at
-/// that obs's covariate). Value + all stacked-η/θ first/second derivatives must match
+/// through the per-event source branch (one snapshot per observation, at that obs's
+/// covariate and occasion). Value + all stacked-η/θ first/second derivatives must match
 /// FD of `predict_iov`, and the inner η-gradient must equal the outer η-block.
 #[test]
 fn iov_form_c_readout_tvcov_gated_matches_fd() {

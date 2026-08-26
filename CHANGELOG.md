@@ -35,6 +35,16 @@ section of the SDLC for the versioning policy).
   it, and a choice that leaves a nested group's mean free is refused. An out-of-range or non-integral
   gather index is reported before the fit starts, naming the column and value. See
   `docs/model-file/parameters.qmd`.
+- **Three-argument `clamp(x, lo, hi)` in the model DSL (#1092).** Bounding a readout into an
+  interval no longer has to be written as the nested `min(max(x, lo), hi)`, whose argument order
+  flips between the inner and outer call. Available in every expression the DSL parses
+  (`[individual_parameters]`, `[scaling]`, `[odes]`, `[derived]`); it desugars to the inline
+  conditional, so it differentiates and compiles exactly like the nested form. `clamp` with any
+  arity other than three is a parse error — a one-argument `clamp(x)` would otherwise have been
+  read as the silent identity — and literal bounds given the wrong way round (`clamp(x, 0.9, 0.1)`)
+  are rejected rather than quietly returning a bound for every `x`. One input is deliberately not
+  the nested form: `NaN` fails both bound tests, so `clamp` propagates it into the objective
+  function, where `min(max(x, lo), hi)` would have pinned it to `lo` and let a wrong number fit.
 - **`[simulation]` can now state the covariates of the arms it invents (#1083).** `covariate NAME = <value>`
   — a scalar for every subject, or `= [v1, v2, ...]` with one value per subject — gives the synthetic
   subjects a covariate value, which a `[simulation]` design previously had no way to express at all.
@@ -255,6 +265,26 @@ section of the SDLC for the versioning policy).
   with no diagnostic from NONMEM (`nonmem_anchor/dose_attr_double_use_{A,B}.ctl`).
 
 ### Fixed
+- **A closed-form model with IOV and a `[scaling] y = <expr>` readout evaluated the readout's
+  individual parameters at `kappa = 0` — predictions and the objective were silently wrong
+  (#1079).** The readout is the analogue of NONMEM's `$ERROR` and is evaluated per record, so an
+  individual parameter carrying a `kappa` — an additive baseline `BASE = TVBASE * exp(KAPPA_B)`, a
+  second analyte, a bounded transform — must take that record's occasion value. On the analytical
+  (`pk ...`) engine it took the parameter's *typical* value in every occasion instead: the
+  concentration handed to the readout carried the occasion κ, but every parameter the readout
+  itself read did not. On the reproduction in the issue the prediction is off by 12–20 %.
+  **Anyone who fitted such a model should re-run it** — the reported estimates, OFV, and
+  diagnostics were computed from the wrong predictions. The ODE engine was always correct, as was
+  the compartment-free (`[structural_model]`-less) path, and a `y = central / V` readout was
+  unaffected on every engine (the `conc × V` amount reconstruction and the readout's own `/ V`
+  cancel, with or without a κ on `V`) — which is why the natural readout to test could not show
+  it. The analytic sensitivities are re-seeded to match, so FOCE/FOCEI/SAEM gradients now
+  differentiate the corrected prediction.
+- **A third argument to a `[derived]` row aggregate was dropped in silence (#1092).**
+  `CMAX = max(IPRED, TIME > 0, 99)` computed `max(IPRED, TIME > 0)` — the aggregate form reads only
+  the value and the optional row filter, and never looked at what followed. It is now a parse error
+  that names `clamp(x, lo, hi)`, which is what the extra argument usually means. The same mistake
+  written inside a larger expression was already rejected.
 - **`simulate()` silently removed an arm's residual noise when its `weight = <expr>` column was blank
   or zero (#1083).** `fit()` has rejected a non-positive residual magnitude since #1029, but no
   `simulate()` entry point ran that check — each ran its own subset of the model-vs-data checks and

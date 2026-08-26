@@ -708,35 +708,15 @@ fn apply_readout_jet<T: PkNum>(
     }
 }
 
-/// κ = 0 (BSV-only) readout-parameter snapshots for the analytic IOV walk (#655).
-/// Production's [`crate::pk::apply_analytic_readout`] builds the readout PK params from
-/// `eta_bsv` (no κ) — only the concentration carries the occasion κ — so these snapshots
-/// carry `∂/∂(θ, η_bsv)` and zero `∂/∂κ`. When covariates / `TIME` vary across observations
-/// the snapshot is per-observation; otherwise a single shared snapshot suffices (the readout
-/// param jet is then identical across rows, so a per-obs `Vec` would deep-clone the nested
-/// `CombinedDerivs` `N − 1` times per gradient eval on a hot path — `bsv_amount` already
-/// carries a single snapshot for the same reason).
-enum ReadoutSnapshots {
-    Static((crate::types::PkParams, CombinedDerivs)),
-    PerObs(Vec<(crate::types::PkParams, CombinedDerivs)>),
-}
-
-impl ReadoutSnapshots {
-    /// The κ = 0 readout snapshot for observation `j` (the shared one when `Static`).
-    #[inline]
-    fn at(&self, j: usize) -> &(crate::types::PkParams, CombinedDerivs) {
-        match self {
-            Self::Static(s) => s,
-            Self::PerObs(v) => &v[j],
-        }
-    }
-}
-
 /// Evaluate the analytic Form C readout at one IOV observation (#655) — shared by the outer
-/// (`Dual2`) and inner (`Dual1`) walks so the κ = 0 seeding convention lives in one place.
-/// Seeds the readout PK params from the BSV-only snapshot (`group = None`, so the κ axes are
-/// dropped) via the caller's monomorphized `seed`, then runs the readout jet under this
-/// observation's model time.
+/// (`Dual2`) and inner (`Dual1`) walks so the per-occasion seeding convention lives in one
+/// place. `source` is the observation's own IOV event source `(pk, cd, group)`: the readout
+/// PK params are seeded from it via the caller's monomorphized `seed`, so they carry that
+/// occasion's κ on group `group`'s stacked block — the exact function production evaluates
+/// since #1079 (`predict_iov` applies `apply_analytic_readout` per occasion with
+/// `[η_bsv, κ]`). Seeding `group = None` here instead would differentiate the *wrong*
+/// function: an individual parameter carrying a κ would be frozen at its typical value.
+/// Then runs the readout jet under this observation's model time.
 ///
 /// `conc` **must already be clamped to ≥ 0** — production clamps `conc.max(0.0)` *before* the
 /// readout ([`crate::pk::event_driven`] → [`crate::pk::apply_analytic_readout`]) and returns
@@ -749,7 +729,7 @@ impl ReadoutSnapshots {
 fn eval_readout_at_obs<T: crate::sens::num::PkNum>(
     prog: &crate::parser::model_parser::OdeOutputProgram,
     conc: T,
-    snapshot: &(crate::types::PkParams, CombinedDerivs),
+    source: &(crate::types::PkParams, CombinedDerivs, Option<usize>),
     slot_row: &[Option<usize>; N_PK],
     cov: &std::collections::HashMap<String, f64>,
     obs_time: f64,
@@ -758,11 +738,11 @@ fn eval_readout_at_obs<T: crate::sens::num::PkNum>(
     ro_vars: &mut Vec<T>,
     ro_stack: &mut Vec<T>,
 ) -> T {
-    let (pk_ro, cd_ro) = snapshot;
+    let (pk_ro, cd_ro, group) = source;
     let params: [T; N_PK] = std::array::from_fn(|s| {
         let val = pk_ro.values.get(s).copied().unwrap_or(0.0);
         match slot_row[s] {
-            Some(i) => seed(cd_ro, None, i, val),
+            Some(i) => seed(cd_ro, *group, i, val),
             None => T::from_f64(val),
         }
     });
@@ -1417,8 +1397,9 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
     // walk-capable scope the TV-cov path uses (`readout_tvcov_supported`: a uniform
     // dual-evaluable `Single` readout, no depot reference, no `[initial_conditions]`,
     // no slot past `PK_IDX_V3`). `run_obs_iov` / `run_obs_iov_eta` seed the readout PK
-    // params from the κ = 0 (BSV-only) per-obs snapshot while the walk's concentration
-    // carries κ, matching production `apply_analytic_readout(..., eta_bsv, ...)`. A
+    // params from the observation's own occasion source, so they carry κ just as the
+    // walk's concentration does — matching production's per-occasion
+    // `apply_analytic_readout(..., [η_bsv, κ_g], ...)` (#1079). A
     // readout outside that scope (per-CMT, depot, direct θ/η, slot overflow) declines to
     // FD here so the reported method stays honest — the closed-form IOV twin of
     // `analytical_supported_core`'s `analytic_readout_dual_supported` clause.
@@ -1581,7 +1562,7 @@ pub fn subject_sensitivities_iov(
             model, subject, theta, stacked_eta, &s.sources, &s.dose_src, &s.obs_src,
             &s.pkonly_src, &s.slot_row, s.n_eta, s.n_kappa, s.n_eff, s.n_stacked,
             s.n_theta, s.scale_groups.as_deref(), s.bsv_amount.as_ref(),
-            readout, s.readout_obs.as_ref(),
+            readout,
         )
     )?;
     // LTBS (#486): apply the `ln(f)` jet LAST — after the in-walk scale quotient / Form C
@@ -1629,17 +1610,6 @@ struct IovSources {
     /// carries `∂A₀/∂(θ, η_bsv)` but zero `∂A₀/∂κ`. `None` when the model has no
     /// `[initial_conditions]`.
     bsv_amount: Option<(crate::types::PkParams, CombinedDerivs)>,
-    /// For an analytic Form C readout (`[scaling] y = <expr>`) under IOV (#655): one
-    /// **BSV-only** (`κ = 0`) `(pk, combined-derivs)` snapshot per observation,
-    /// evaluated at that observation's covariate / `TIME` snapshot. Production's
-    /// `apply_analytic_readout` builds the readout PK params (the amount's `V`, plus
-    /// non-structural `BMAX`/`KD`) from `eta_bsv` (no κ) — only the concentration jet
-    /// carries κ — so this snapshot drives the readout param jet with `∂/∂(θ, η_bsv)`
-    /// and zero `∂/∂κ` (seeded `group = None`), while the walk's κ-bearing concentration
-    /// supplies the central amount. `Static` when covariates / `TIME` are subject-static
-    /// (one shared snapshot), `PerObs` otherwise; `None` when the model has no analytic
-    /// readout. See [`ReadoutSnapshots`].
-    readout_obs: Option<ReadoutSnapshots>,
 }
 
 fn build_iov_sources(
@@ -1852,32 +1822,13 @@ fn build_iov_sources(
         Some((pk, cd))
     };
 
-    // Analytic Form C readout param snapshots (#655): one κ = 0 (BSV-only) `(pk, cd)`
-    // per observation, matching production `apply_analytic_readout(..., eta_bsv,
-    // obs_cov(j), obs_time(j))`. Per-event when covariates / `TIME` vary (each obs at its
-    // own snapshot); otherwise one static snapshot reused across observations (the
-    // derivative-program eval is the cost, so clone the shared `cd`). Built only when a
-    // readout is present — such a model is init-free with no `[scaling]` divisor, so
-    // `bsv_amount`/`scale_groups` are `None` and the post-walk transform blocks are inert.
-    let readout_obs = if model.analytic_readout.is_none() {
-        None
-    } else if per_event {
-        let mut v = Vec::with_capacity(subject.obs_times.len());
-        for j in 0..subject.obs_times.len() {
-            let cov = subject.obs_cov(j);
-            let t = subject.obs_times[j];
-            let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov, t);
-            let cd = cd_at(t, &combined_pk_only, cov)?;
-            v.push((pk, cd));
-        }
-        Some(ReadoutSnapshots::PerObs(v))
-    } else {
-        // Subject-static covariates / `TIME`: one shared snapshot, so the walk reads the same
-        // κ = 0 readout params at every observation (no per-obs `CombinedDerivs` clone).
-        let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov_static, 0.0);
-        let cd = cd_at(0.0, &combined_pk_only, cov_static)?;
-        Some(ReadoutSnapshots::Static((pk, cd)))
-    };
+    // Analytic Form C readout param snapshots (#655) need no source of their own: since
+    // #1079 production evaluates the readout with the observation's *own* occasion effect
+    // `[η_bsv, κ]` at the observation's covariate / `TIME` snapshot — which is exactly
+    // `sources[obs_src[j]]`, already built above (per event when covariates / `TIME` vary,
+    // one per occasion group otherwise, matching `apply_analytic_readout`'s own `per_obs`
+    // gate). The walks read it straight from there, so a readout costs no extra
+    // derivative-program eval and cannot drift from the concentration's seeding.
 
     Some(IovSources {
         sources,
@@ -1892,7 +1843,6 @@ fn build_iov_sources(
         n_theta,
         scale_groups,
         bsv_amount,
-        readout_obs,
     })
 }
 
@@ -1938,7 +1888,7 @@ fn subject_eta_grad_iov_analytical(
             model, subject, theta, stacked_eta, &s.sources, &s.dose_src, &s.obs_src,
             &s.pkonly_src, &s.slot_row, s.n_eta, s.n_kappa, s.n_stacked,
             s.scale_groups.as_deref(), s.bsv_amount.as_ref(),
-            readout, s.readout_obs.as_ref(),
+            readout,
         )
     )
 }
@@ -1975,7 +1925,6 @@ fn run_obs_iov<const M: usize>(
     scale_groups: Option<&[(crate::types::PkParams, CombinedDerivs)]>,
     bsv_amount: Option<&(crate::types::PkParams, CombinedDerivs)>,
     readout: Option<&crate::parser::model_parser::OdeOutputProgram>,
-    readout_obs: Option<&ReadoutSnapshots>,
 ) -> Option<SubjectSens> {
     use crate::pk::event_driven::EventSchedule;
     use crate::sens::propagate::{event_driven_sens_with_doses_g, PkDual};
@@ -2129,15 +2078,16 @@ fn run_obs_iov<const M: usize>(
             *c
         };
         // Analytic Form C readout (#655): replace the (clamped) central concentration jet
-        // with `y = <expr>`. The concentration carries the occasion κ (through the walk);
-        // the readout PK params come from the κ = 0 (BSV-only) snapshot (`readout_obs.at(j)`,
-        // seeded `group = None`), matching production `apply_analytic_readout(..., eta_bsv)`.
-        // The readout output is NOT re-clamped (production does not re-clamp it).
-        let c: Dual2<M> = match (readout, readout_obs) {
-            (Some(ro), Some(ro_obs)) => eval_readout_at_obs::<Dual2<M>>(
+        // with `y = <expr>`. The concentration carries the occasion κ (through the walk),
+        // and so do the readout PK params — both are seeded from this observation's own
+        // event source `sources[obs_src[j]]` (`group = Some(g)`), matching production's
+        // per-occasion `apply_analytic_readout(..., [η_bsv, κ_g])` (#1079). The readout
+        // output is NOT re-clamped (production does not re-clamp it).
+        let c: Dual2<M> = match readout {
+            Some(ro) => eval_readout_at_obs::<Dual2<M>>(
                 ro,
                 c_clamped,
-                ro_obs.at(j),
+                &sources[obs_src[j]],
                 slot_row,
                 subject.obs_cov(j),
                 subject.readout_time(j),
@@ -2146,7 +2096,7 @@ fn run_obs_iov<const M: usize>(
                 &mut ro_vars,
                 &mut ro_stack,
             ),
-            _ => c_clamped,
+            None => c_clamped,
         };
         let c = &c;
         let mut df_deta = vec![0.0; n_stacked];
@@ -2322,7 +2272,6 @@ fn run_obs_iov_eta<const N: usize>(
     scale_groups: Option<&[(crate::types::PkParams, CombinedDerivs)]>,
     bsv_amount: Option<&(crate::types::PkParams, CombinedDerivs)>,
     readout: Option<&crate::parser::model_parser::OdeOutputProgram>,
-    readout_obs: Option<&ReadoutSnapshots>,
 ) -> Option<Vec<ObsGrad>> {
     use crate::pk::event_driven::EventSchedule;
     use crate::sens::propagate::{event_driven_sens_with_doses_g, PkDual};
@@ -2436,18 +2385,19 @@ fn run_obs_iov_eta<const N: usize>(
     for (j, c) in conc.iter().enumerate() {
         // Clamp the concentration jet to ≥ 0 BEFORE the readout (production ordering), then
         // apply the Form C readout unclamped — the η-only mirror of the `run_obs_iov` step.
-        // The readout PK params come from the κ = 0 (BSV-only) snapshot (`readout_obs.at(j)`,
-        // `group = None`) while the clamped concentration supplies the κ-bearing central amount.
+        // The readout PK params come from this observation's own occasion source
+        // (`sources[obs_src[j]]`, `group = Some(g)`), so they carry the same κ the clamped
+        // concentration does (#1079).
         let c_clamped: Dual1<N> = if c.value < 0.0 {
             Dual1::<N>::constant(0.0)
         } else {
             *c
         };
-        let c: Dual1<N> = match (readout, readout_obs) {
-            (Some(ro), Some(ro_obs)) => eval_readout_at_obs::<Dual1<N>>(
+        let c: Dual1<N> = match readout {
+            Some(ro) => eval_readout_at_obs::<Dual1<N>>(
                 ro,
                 c_clamped,
-                ro_obs.at(j),
+                &sources[obs_src[j]],
                 slot_row,
                 subject.obs_cov(j),
                 subject.readout_time(j),
@@ -2456,7 +2406,7 @@ fn run_obs_iov_eta<const N: usize>(
                 &mut ro_vars,
                 &mut ro_stack,
             ),
-            _ => c_clamped,
+            None => c_clamped,
         };
         let c = &c;
         let mut df_deta = vec![0.0; n_stacked];

@@ -344,9 +344,10 @@ parameter draws:
 1. **Outer loop** — for each of `n_uncertainty_draws`, draw a population
    parameter set $(\theta_k, \Omega_k, \Sigma_k)$ from the uncertainty
    distribution.
-   - **Asymptotic**: $x_k = \hat{x} + L_\text{cov} z$ in packed log-space
-     (theta, Cholesky-omega, sigma share one packed vector), then unpack —
-     theta, Omega, and Sigma are perturbed coherently from a single MVN draw.
+   - **Asymptotic**: $x_k = \hat{x} + L_\text{cov} z$ in
+     [packed log-space](../estimation/parameterization.qmd) (theta,
+     Cholesky-omega, sigma share one packed vector), then unpack — theta,
+     Omega, and Sigma are perturbed coherently from a single MVN draw.
    - **SIR**: pick a parameter vector at random from
      `FitResult.sir_resamples_packed` (the resampled pool retained from the
      SIR step).
@@ -363,3 +364,55 @@ The resulting `SimulationResult` rows are tagged with both `draw` and `sim`
 so downstream code can compute either marginal bands (over all draws and
 sims) or hierarchical bands (e.g. median across sims within each draw, then
 percentiles across draws).
+
+## What the uncertainty distribution is {#uncertainty-distribution}
+
+**There is no inverse-Wishart draw here.** Ω uncertainty is *not* sampled
+from a conjugate matrix distribution; the inverse-Wishart in ferx belongs to
+the [Bayesian MCMC estimator](../estimation/bayes.qmd), which is a separate
+code path (`estimation/bayes.rs`) and is not used by
+`simulate_with_uncertainty()`.
+
+What actually happens, for `UncertaintyMethod::Asymptotic`:
+
+- The proposal is a plain multivariate normal, and it lives in the
+  [**packed parameter space**](../estimation/parameterization.qmd) — theta
+  (log), the Omega Cholesky factor (log-diagonal), and sigma (log) in one
+  vector. `FitResult.covariance_matrix` is the inverse FD Hessian of the OFV
+  *in that same space*, so it is the natural — and the only dimensionally
+  consistent — place to draw. Its off-diagonal blocks are what makes each
+  draw's θ, Ω and Σ move together instead of independently.
+- Because the Omega segment is $\log L_{ii}$, the implied marginal on an
+  Omega diagonal is roughly **log-normal on the standard-deviation scale**,
+  and every draw yields a positive-definite Ω by construction — no rejection
+  of non-PD matrices needed. Off-diagonal Cholesky entries are drawn on the
+  identity scale.
+- If `covariance_matrix` is not positive-definite, it is symmetrised and
+  eigenvalue-floored before the Cholesky (`regularised_cholesky`). A draw
+  from the regularised factor is slightly wider than the raw covariance in
+  the corrected directions.
+- **FIX'd parameters carry no uncertainty**: any packed index flagged FIX is
+  reset to its fitted value on every draw, so a FIX'd theta, omega, sigma or
+  kappa is identical across all draws. (`compute_bounds()` pins fixed indices
+  with `lower == upper`, so an unpinned continuous draw would otherwise be
+  rejected for every model with a FIX.)
+- A draw that lands outside the packed bounds, or that unpacks to a
+  non-positive theta / sigma / Omega diagonal, is discarded and redrawn, up
+  to `10 × n_uncertainty_draws` attempts in total; exhausting that budget is
+  an `Err`, and usually means an ill-conditioned covariance matrix or an
+  estimate sitting on a bound.
+- If a *valid* draw then fails during simulation (e.g. the drawn parameters
+  make the ODE solver fail), that single draw is skipped with a
+  `uncertainty draw k skipped — …` warning rather than aborting the whole
+  run, so the returned set may contain fewer than `n_uncertainty_draws`
+  distinct draws.
+
+`UncertaintyMethod::Sir` makes none of these distributional assumptions: it
+resamples whole parameter vectors from the SIR pool, so its shape is whatever
+the [SIR](../estimation/sir.qmd) step found. Prefer it when the asymptotic
+normal approximation is suspect (parameters near a bound, a banana-shaped
+likelihood) — at the cost of running SIR with `sir_keep_samples = true` at
+fit time.
+
+Bootstrap (subject resampling + refit) is not implemented; the
+`UncertaintyMethod` enum is deliberately open for it.
