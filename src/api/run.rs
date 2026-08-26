@@ -163,6 +163,17 @@ pub fn run_model_with_data_inits(
         data_path
     );
 
+    // #1064: a `theta NAME[COL, ...]` block declares one θ per observed
+    // combination, so its level count is a property of the data. Bind it now —
+    // this synthesizes the per-record index column on every subject and
+    // re-parses the model with the real θ count — before anything reads
+    // `parsed.model`'s parameter vector.
+    {
+        let model_text = std::fs::read_to_string(model_path)
+            .map_err(|e| format!("Failed to re-read model file for level binding: {e}"))?;
+        crate::api::bind_theta_levels(&mut parsed, &model_text, &mut population)?;
+    }
+
     let init_params = build_init_params(&parsed);
     // Sync the resolved gradient method from fit_options onto the model so
     // `resolve_gradient_method` (which reads `model.gradient_method`) honours
@@ -239,6 +250,81 @@ pub(crate) fn derive_output_occasions(
 
 /// Run a model file with simulated data (from [simulation] block).
 /// Returns (FitResult, Population) so caller can write sdtab.
+/// What [`simulation_design_covariates`] returns: the population's covariate
+/// names, in declaration order, plus one covariate map per synthetic subject.
+pub(crate) type SimulationDesignCovariates = (Vec<String>, Vec<HashMap<String, f64>>);
+
+/// Resolve `[simulation] covariate NAME = ...` into the population's covariate
+/// names plus one covariate map per synthetic subject (#1083).
+///
+/// A simulated trial exists to invent arms that are in no dataset — *"what would
+/// a 300-subject arm of this design look like?"* — so there is no row to read
+/// `NARM` or `WPSE` from, and the covariates the design turns on have to be
+/// stated as part of the design. Requiring them is the convention: an unresolved
+/// weight has no defensible default (a silent `1` gives a simulated arm the
+/// variability of a single-subject arm, a silent `0` gives it none, and
+/// `BinOp::Div` underflows to `0.0` rather than `inf`, so neither shows up as a
+/// `NaN`).
+///
+/// The missing-value report is deliberately *not* the shared `check_covariates`
+/// message: on this path there is no data file, so "not found in data … Available
+/// covariate columns: (none)" reads as a typo report on a column that was never
+/// going to exist, and it names no fix.
+///
+/// Returned in declaration order. The per-subject vector has one entry per
+/// subject; the parser has already broadcast a scalar and checked every list
+/// against `n_subjects`, so a short list cannot reach here.
+///
+/// Subject-level only: `obs_cov` / `dose_cov` fall back to `Subject::covariates`
+/// when the per-record vectors are empty, and a synthetic arm's design covariates
+/// — its size, its reported standard error — are constant over the arm by
+/// construction.
+pub(crate) fn simulation_design_covariates(
+    sim_spec: &SimulationSpec,
+    model: &CompiledModel,
+) -> Result<SimulationDesignCovariates, String> {
+    let names: Vec<String> = sim_spec.covariates.iter().map(|(n, _)| n.clone()).collect();
+
+    let missing: Vec<&str> = model
+        .referenced_covariates
+        .iter()
+        // A a level block index column (#1064) is synthesized per record by
+        // `bind_theta_levels` from the design's own covariates and observation
+        // grid — it is not something the user can state, so demanding it here
+        // would make every level-block model unsimulatable, naming a column with a
+        // reserved `__level_` prefix as the fix.
+        .filter(|name| !crate::api::levels::is_level_index_column(name))
+        .filter(|name| !names.iter().any(|n| n == *name))
+        .map(|s| s.as_str())
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "[simulation]: the model references covariate(s) {} that the simulation design \
+             does not supply. A simulated trial invents arms that are in no dataset, so their \
+             covariates — an arm size behind `weight = N`, a reported standard error behind \
+             `weight = SE`, a body weight — are part of the design and must be stated: add \
+             `covariate {} = <value>` (or `= [v1, ...]`, one per subject) to [simulation].",
+            missing
+                .iter()
+                .map(|n| format!("`{n}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            missing[0],
+        ));
+    }
+
+    let per_subject: Vec<HashMap<String, f64>> = (0..sim_spec.n_subjects)
+        .map(|i| {
+            sim_spec
+                .covariates
+                .iter()
+                .map(|(n, vals)| (n.clone(), vals[i]))
+                .collect()
+        })
+        .collect();
+    Ok((names, per_subject))
+}
+
 pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), String> {
     use crate::parser::model_parser::parse_full_model_file;
     use std::collections::HashMap;
@@ -343,6 +429,16 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
     } else {
         0
     };
+    // Per-subject covariate values from `[simulation] covariate NAME = ...` (#1083).
+    let (sim_covariate_names, sim_subject_covariates) =
+        simulation_design_covariates(&sim_spec, &parsed.model)?;
+    let subject_covariates = |i: usize| -> HashMap<String, f64> {
+        sim_subject_covariates
+            .get(i - 1)
+            .cloned()
+            .unwrap_or_default()
+    };
+
     // Build template population
     let subjects: Vec<Subject> = (1..=sim_spec.n_subjects)
         .map(|i| Subject {
@@ -363,7 +459,7 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
             obs_raw_times: Vec::new(),
             observations: vec![0.0; n_gauss],
             obs_cmts: vec![1; n_gauss],
-            covariates: HashMap::new(),
+            covariates: subject_covariates(i),
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
@@ -416,14 +512,27 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
             obs_records: Vec::new(),
         })
         .collect();
-    let template = Population {
+    let mut template = Population {
         subjects,
-        covariate_names: vec![],
+        covariate_names: sim_covariate_names,
         dv_column: "dv".into(),
         input_columns: vec![],
         exclusions: None,
         warnings: vec![],
     };
+
+    // #1064: bind level blocks against the synthetic design, exactly as
+    // the data path binds them against a dataset — the levels come from the
+    // `[simulation]` covariates and observation grid. Every level gets the
+    // declaration's broadcast init, since the DSL has no way to state per-level
+    // simulation values; a design that needs distinct ones should use the
+    // explicit `theta NAME[N]` form and its own index column.
+    {
+        let model_text = std::fs::read_to_string(model_path)
+            .map_err(|e| format!("Failed to re-read model file for level binding: {e}"))?;
+        crate::api::bind_theta_levels(&mut parsed, &model_text, &mut template)?;
+    }
+    let template = template;
 
     // Simulate
     eprintln!(
@@ -683,6 +792,10 @@ fn undeclared_referenced(model: &CompiledModel, decls: &[CovariateDecl]) -> Vec<
     model
         .referenced_covariates
         .iter()
+        // A a level block index column (#1064) is synthesized by
+        // `bind_theta_levels` after the read, never present in the CSV — asking
+        // the reader for it would fail on a column the user never wrote.
+        .filter(|c| !crate::api::levels::is_level_index_column(c))
         .filter(|c| !decls.iter().any(|d| &d.name == *c))
         .cloned()
         .collect()

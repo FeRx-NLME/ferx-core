@@ -11,6 +11,11 @@ use std::path::Path;
 
 // ── validation subsystem (extracted verbatim; see src/api/validation.rs) ──
 mod validation;
+// `check_covariates` / `check_kappa_weights` / `check_residual_magnitude` are the
+// *parts* of `check_simulation_data` (#1083). Production now calls the bundle, so
+// the parts are re-exported for the unit tests that pin each one's message
+// individually — hence the allow, which would otherwise fire on a non-test build.
+#[allow(unused_imports)]
 pub(crate) use validation::{
     apply_iov_occasion_rule, assert_absorption_closed_form_support,
     assert_absorption_dosing_supported, assert_absorption_flip_flop_no_twin,
@@ -18,6 +23,7 @@ pub(crate) use validation::{
     assert_modeled_doses_supported, check_absorption_closed_form_support, check_absorption_dosing,
     check_absorption_flip_flop_no_twin, check_analytic_readout_support, check_covariates,
     check_dose_compartments, check_kappa_weights, check_modeled_dose_rates,
+    check_residual_magnitude, check_simulation_data,
 };
 #[cfg(feature = "survival")]
 pub(crate) use validation::{
@@ -31,6 +37,7 @@ pub use validation::{
 // ── production submodules (peeled from this file) ──
 mod adaptive;
 mod fit;
+mod levels;
 mod output_columns;
 mod pool;
 mod postfit;
@@ -43,6 +50,7 @@ pub use adaptive::{
     AdaptiveSimulationResult,
 };
 pub use fit::{fit, fit_from_files};
+pub use levels::{bind_theta_levels, level_map as theta_level_map};
 pub use output_columns::tafd_tad_for_subject;
 pub(crate) use output_columns::{compute_extra_output_columns, trapezoid};
 pub use pool::configure_global_thread_pool;
@@ -52,9 +60,9 @@ pub(crate) use postfit::{
     compute_eta_shrinkage, compute_kappa_shrinkage, compute_kappa_shrinkage_by_occ,
     compute_param_corr, compute_subject_results, cov_diagnostics, eps_shrinkage_warning,
     eta_shrinkage_warning, extract_standard_errors, high_correlation_warning, inflated_rse_warning,
-    is_last_estimating_stage, kappa_weight_typicals, keep_gn_zero_eta_warning,
-    probe_nlopt_algorithms, rebuild_warnings_structured, resolve_covariance_status,
-    resolve_sir_fallback, sir_unavailable_warning,
+    integrates_odes, is_last_estimating_stage, kappa_weight_typicals, keep_gn_zero_eta_warning,
+    ode_solver_diagnostics_warning, probe_nlopt_algorithms, rebuild_warnings_structured,
+    resolve_covariance_status, resolve_sir_fallback, sir_unavailable_warning,
 };
 pub use predict::{predict, PredictionResult};
 #[cfg(feature = "survival")]
@@ -174,6 +182,10 @@ mod scaling_undefined_tests;
 #[path = "tests/simulation_template_tests.rs"]
 mod simulation_template_tests;
 
+#[cfg(test)]
+#[path = "tests/simulation_design_covariates_tests.rs"]
+mod simulation_design_covariates_tests;
+
 // ======================================================================
 // Adaptive (state-reactive / feedback) dosing — epic #391, beta.
 //
@@ -220,6 +232,10 @@ mod tests_sir_fallback;
 #[cfg(test)]
 #[path = "tests/tests_param_corr.rs"]
 mod tests_param_corr;
+
+#[cfg(test)]
+#[path = "tests/ode_solver_diagnostics_tests.rs"]
+mod ode_solver_diagnostics_tests;
 
 #[cfg(test)]
 #[path = "tests/simulate_with_uncertainty_tests.rs"]

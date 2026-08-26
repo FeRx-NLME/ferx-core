@@ -514,6 +514,14 @@ pub fn analytical_supported(model: &CompiledModel) -> bool {
 /// [`tvcov_analytical_supported`] — everything except the `TIME`-routing clause, so the
 /// two can compose without recursion (#637 review #1).
 fn analytical_supported_core(model: &CompiledModel) -> bool {
+    // A compartment-free model (#811) carries a *placeholder* `pk_model` that the
+    // `matches!` below would happily admit — and then every walk here would
+    // evaluate a closed form the model does not have, against doses it does not
+    // carry. Decline before the match so the placeholder can never be dispatched
+    // on; such a model is served by `sens::algebraic`, which needs no closed form.
+    if model.is_algebraic() {
+        return false;
+    }
     matches!(
         model.pk_model,
         PkModel::OneCptIv
@@ -700,35 +708,15 @@ fn apply_readout_jet<T: PkNum>(
     }
 }
 
-/// κ = 0 (BSV-only) readout-parameter snapshots for the analytic IOV walk (#655).
-/// Production's [`crate::pk::apply_analytic_readout`] builds the readout PK params from
-/// `eta_bsv` (no κ) — only the concentration carries the occasion κ — so these snapshots
-/// carry `∂/∂(θ, η_bsv)` and zero `∂/∂κ`. When covariates / `TIME` vary across observations
-/// the snapshot is per-observation; otherwise a single shared snapshot suffices (the readout
-/// param jet is then identical across rows, so a per-obs `Vec` would deep-clone the nested
-/// `CombinedDerivs` `N − 1` times per gradient eval on a hot path — `bsv_amount` already
-/// carries a single snapshot for the same reason).
-enum ReadoutSnapshots {
-    Static((crate::types::PkParams, CombinedDerivs)),
-    PerObs(Vec<(crate::types::PkParams, CombinedDerivs)>),
-}
-
-impl ReadoutSnapshots {
-    /// The κ = 0 readout snapshot for observation `j` (the shared one when `Static`).
-    #[inline]
-    fn at(&self, j: usize) -> &(crate::types::PkParams, CombinedDerivs) {
-        match self {
-            Self::Static(s) => s,
-            Self::PerObs(v) => &v[j],
-        }
-    }
-}
-
 /// Evaluate the analytic Form C readout at one IOV observation (#655) — shared by the outer
-/// (`Dual2`) and inner (`Dual1`) walks so the κ = 0 seeding convention lives in one place.
-/// Seeds the readout PK params from the BSV-only snapshot (`group = None`, so the κ axes are
-/// dropped) via the caller's monomorphized `seed`, then runs the readout jet under this
-/// observation's model time.
+/// (`Dual2`) and inner (`Dual1`) walks so the per-occasion seeding convention lives in one
+/// place. `source` is the observation's own IOV event source `(pk, cd, group)`: the readout
+/// PK params are seeded from it via the caller's monomorphized `seed`, so they carry that
+/// occasion's κ on group `group`'s stacked block — the exact function production evaluates
+/// since #1079 (`predict_iov` applies `apply_analytic_readout` per occasion with
+/// `[η_bsv, κ]`). Seeding `group = None` here instead would differentiate the *wrong*
+/// function: an individual parameter carrying a κ would be frozen at its typical value.
+/// Then runs the readout jet under this observation's model time.
 ///
 /// `conc` **must already be clamped to ≥ 0** — production clamps `conc.max(0.0)` *before* the
 /// readout ([`crate::pk::event_driven`] → [`crate::pk::apply_analytic_readout`]) and returns
@@ -741,7 +729,7 @@ impl ReadoutSnapshots {
 fn eval_readout_at_obs<T: crate::sens::num::PkNum>(
     prog: &crate::parser::model_parser::OdeOutputProgram,
     conc: T,
-    snapshot: &(crate::types::PkParams, CombinedDerivs),
+    source: &(crate::types::PkParams, CombinedDerivs, Option<usize>),
     slot_row: &[Option<usize>; N_PK],
     cov: &std::collections::HashMap<String, f64>,
     obs_time: f64,
@@ -750,11 +738,11 @@ fn eval_readout_at_obs<T: crate::sens::num::PkNum>(
     ro_vars: &mut Vec<T>,
     ro_stack: &mut Vec<T>,
 ) -> T {
-    let (pk_ro, cd_ro) = snapshot;
+    let (pk_ro, cd_ro, group) = source;
     let params: [T; N_PK] = std::array::from_fn(|s| {
         let val = pk_ro.values.get(s).copied().unwrap_or(0.0);
         match slot_row[s] {
-            Some(i) => seed(cd_ro, None, i, val),
+            Some(i) => seed(cd_ro, *group, i, val),
             None => T::from_f64(val),
         }
     });
@@ -915,6 +903,9 @@ fn scaling_supported(model: &CompiledModel) -> bool {
 pub fn sens_supported(model: &CompiledModel) -> bool {
     analytical_supported(model)
         || (ODE_SENS_ENABLED && crate::sens::ode_provider::ode_analytical_supported(model))
+        // Compartment-free models (#811) are served by neither: they have no closed
+        // form and no ODE spec, only a readout over the individual-parameter jet.
+        || crate::sens::algebraic::supported(model)
 }
 
 /// Whether the exact analytic **outer** (population) FOCE/FOCEI gradient is
@@ -1183,7 +1174,7 @@ fn resolve_param_derivs(
 /// PK slot → differentiated-row index of a `pd`/`dp_deta` whose rows follow `slots`
 /// order: `out[slots[i]] = Some(i)` for every in-range slot, `None` otherwise.
 /// Hoisted from the five identical `[None; N_PK]` build loops (F4).
-fn seed_dim_from_slots(slots: &[usize]) -> [Option<usize>; N_PK] {
+pub(crate) fn seed_dim_from_slots(slots: &[usize]) -> [Option<usize>; N_PK] {
     let mut seed_dim: [Option<usize>; N_PK] = [None; N_PK];
     for (i, &slot) in slots.iter().enumerate() {
         if slot < N_PK {
@@ -1256,6 +1247,55 @@ pub(crate) fn iov_combined_derivs_dyn(
     )
 }
 
+/// [`CombinedDerivs`] with **only** the `∂p/∂(η_bsv, κ)` block populated, evaluated at
+/// dual width `n_eff` with θ lifted as constants.
+///
+/// The counterpart to [`iov_combined_derivs_dyn`] for the inner η-gradient, which reads
+/// `deta` and nothing else (`run_obs_iov_eta`'s seed closure: "no θ axes"). The remaining
+/// blocks are zero-filled and **must not be consumed** — they are not the derivatives,
+/// they are absent. Only [`iov_analytical_eta_supported`] admits this route.
+///
+/// Two things this buys over the `Dual2<n_theta + n_eff>` builder:
+///
+/// * It serves models whose program cannot seed every `model.n_theta` axis — notably any
+///   `[covariate_nn]` model, whose weight thetas are not referenceable from
+///   `[individual_parameters]`.
+/// * The dual width drops from `n_theta + n_eff` to `n_eff` (3 rather than 21 on the
+///   reference DCM), which is what keeps it inside the `1..=24` dispatch at all.
+///
+/// `[covariate_nn]` outputs are supplied through [`ModelNnGuard`], which lifts them as
+/// constants — exact here, because a network's output does not depend on `η`.
+fn iov_eta_only_derivs_dyn(
+    model: &CompiledModel,
+    prog: &crate::parser::model_parser::IndivParamProgram,
+    n_eff: usize,
+    n_rows: usize,
+    cov: &std::collections::HashMap<String, f64>,
+    theta: &[f64],
+    combined: &[f64],
+) -> Option<CombinedDerivs> {
+    let _nn = crate::parser::model_parser::ModelNnGuard::enter_for(model, theta, cov);
+    const_dispatch!(
+        n_eff;
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24;
+        |M| {
+            let p = prog.eval_param_eta_grad::<M>(theta, combined, cov);
+            if p.len() < n_rows {
+                return None;
+            }
+            let deta: Vec<Vec<f64>> = (0..n_rows)
+                .map(|i| (0..n_eff).map(|c| p[i].grad[c]).collect())
+                .collect();
+            Some(CombinedDerivs {
+                deta,
+                dtheta: vec![Vec::new(); n_rows],
+                d2eta: vec![Vec::new(); n_rows],
+                d2eta_theta: vec![Vec::new(); n_rows],
+            })
+        }
+    )
+}
+
 /// Evaluate the compiled `[individual_parameters]` program over `Dual2<MP>` seeded
 /// on `(θ, combined)` (`combined = [η_bsv, κ]`, `MP = n_theta + n_eff`) and pack
 /// the per-row derivatives in the combined layout.
@@ -1305,6 +1345,31 @@ fn iov_combined_derivs<const MP: usize>(
 /// anything outside falls back to the gradient-free path (matching the rest of the
 /// provider's gating).
 pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
+    iov_analytical_supported_core(model, true)
+}
+
+/// The **η-only** variant of [`iov_analytical_supported`], for the inner EBE
+/// gradient (`subject_eta_grad_iov_analytical` → `run_obs_iov_eta`).
+///
+/// Identical except that it does not require the compiled `[individual_parameters]`
+/// program's θ-axis count to equal `model.n_theta`. That clause is load-bearing for the
+/// *outer* gradient, which seeds θ axes; the η-only walk documents at its seed closure
+/// that it uses "no θ axes" and reads only `CombinedDerivs::deta`, so a θ-axis mismatch
+/// cannot affect its answer.
+///
+/// The distinction is not academic. An auto-generated `[covariate_nn]` weight block
+/// makes `model.n_theta` (base + weights) permanently unequal to the program's θ-axis
+/// count (base only, since `[individual_parameters]` can only reference declared θ by
+/// name). Every DCM therefore failed the combined predicate and sent **every subject**
+/// to finite-difference η-gradients — measured as 60 of 60 on a busulfan-shaped DCM,
+/// correct but far slower than necessary.
+pub(crate) fn iov_analytical_eta_supported(model: &CompiledModel) -> bool {
+    iov_analytical_supported_core(model, false)
+}
+
+/// Shared body. `require_theta_axis` distinguishes the outer predicate from the
+/// η-only one; every other clause applies to both.
+fn iov_analytical_supported_core(model: &CompiledModel, require_theta_axis: bool) -> bool {
     if model.n_kappa == 0 || model.ode_spec.is_some() {
         return false;
     }
@@ -1406,8 +1471,9 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
     // walk-capable scope the TV-cov path uses (`readout_tvcov_supported`: a uniform
     // dual-evaluable `Single` readout, no depot reference, no `[initial_conditions]`,
     // no slot past `PK_IDX_V3`). `run_obs_iov` / `run_obs_iov_eta` seed the readout PK
-    // params from the κ = 0 (BSV-only) per-obs snapshot while the walk's concentration
-    // carries κ, matching production `apply_analytic_readout(..., eta_bsv, ...)`. A
+    // params from the observation's own occasion source, so they carry κ just as the
+    // walk's concentration does — matching production's per-occasion
+    // `apply_analytic_readout(..., [η_bsv, κ_g], ...)` (#1079). A
     // readout outside that scope (per-CMT, depot, direct θ/η, slot overflow) declines to
     // FD here so the reported method stays honest — the closed-form IOV twin of
     // `analytical_supported_core`'s `analytic_readout_dual_supported` clause.
@@ -1419,7 +1485,7 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
     match model.indiv_param_partials.indiv_param_program.as_ref() {
         Some(prog) => {
             prog_covers_required_pk_slots(model, prog)
-                && prog.n_theta_axis() == model.n_theta
+                && (!require_theta_axis || prog.n_theta_axis() == model.n_theta)
                 && prog.n_eta_axis() == n_eff
         }
         None => false,
@@ -1433,6 +1499,29 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
 /// per subject with per-subject reconverged-FD salvage), the IOV analogue of
 /// [`sens_supported`] (#439 ODE IOV).
 pub fn iov_sens_supported(model: &CompiledModel) -> bool {
+    iov_sens_supported_core(model, true)
+}
+
+/// The **η-only** variant of [`iov_sens_supported`], for the inner EBE gradient
+/// (`subject_eta_grad_iov`). Its closed-form arm is [`iov_analytical_eta_supported`]
+/// rather than [`iov_analytical_supported`]; the ODE arms are identical, since
+/// `ode_iov_supported` carries no θ-axis clause to relax.
+///
+/// This is the gate the **inner** loop must consult. `subject_eta_grad_iov_analytical`
+/// admits the η-only scope internally, but every inner-loop caller screens on a model-level
+/// predicate first (`iov_inner_subject_route`, `analytic_iov_inner`,
+/// `inner_reports_analytic_model`, `iov_fd_reason`); pointing those at the strict predicate
+/// left every `[covariate_nn]` DCM subject on finite differences regardless, and let AGQ —
+/// which reaches `analytic_eta_nll_gradient_iov` with no such screen — take a route the
+/// reporting path called FD. Both halves now read the same predicate.
+pub(crate) fn iov_sens_eta_supported(model: &CompiledModel) -> bool {
+    iov_sens_supported_core(model, false)
+}
+
+/// Shared body. `require_theta_axis` selects the outer predicate (`true`, which needs the
+/// program's θ axes to seed `∂p/∂θ`) or the η-only one (`false`); every other clause applies
+/// to both.
+fn iov_sens_supported_core(model: &CompiledModel, require_theta_axis: bool) -> bool {
     // A closed-form transit/IG IOV model is served by its ODE twin (issue #719, routed
     // per-subject by `CompiledModel::effective_for`), so its analytic-IOV outer-gradient scope
     // is the twin's ODE-IOV scope. (The twin is built at parse time, #1008.)
@@ -1441,8 +1530,12 @@ pub fn iov_sens_supported(model: &CompiledModel) -> bool {
             return ODE_SENS_ENABLED && crate::sens::ode_provider::ode_iov_supported(eq.built());
         }
     }
-    iov_analytical_supported(model)
+    iov_analytical_supported_core(model, require_theta_axis)
         || (ODE_SENS_ENABLED && crate::sens::ode_provider::ode_iov_supported(model))
+        // Compartment-free (#811): κ reaches the prediction only through the
+        // individual parameters the readout reads, so its IOV jet is the ordinary
+        // readout jet seeded on the stacked κ axes — no walk, no carryover.
+        || crate::sens::algebraic::supported_iov(model)
 }
 
 /// Light **inner** η-gradient (`∂f/∂(stacked-η)` per observation) for an IOV subject
@@ -1459,6 +1552,11 @@ pub(crate) fn subject_eta_grad_iov(
     // Closed-form transit/IG IOV → its ODE twin (issue #719); no-op otherwise. See
     // `subject_sensitivities_iov`.
     let model = model.effective_for(subject);
+    // Compartment-free (#811) first: `ode_spec` is `None` and `pk_model` is a
+    // placeholder, so the closed-form branch below would misread it.
+    if model.is_algebraic() {
+        return crate::sens::algebraic::subject_eta_grad_iov(model, subject, theta, stacked_eta);
+    }
     if model.ode_spec.is_some() {
         if ODE_SENS_ENABLED {
             return crate::sens::ode_provider::ode_subject_eta_grad_iov(
@@ -1497,6 +1595,18 @@ pub fn subject_sensitivities_iov(
     // this fires only on the model-blind loader that put the TTE rows in `obs_times`.
     if model.ode_spec.is_none() && !crate::pk::subject_feeds_analytical_pk(model, subject) {
         return None;
+    }
+    // Compartment-free (#811): no walk to gate, no dose to route, no `pk_model` to
+    // dispatch on — its κ jet is the readout jet seeded on the stacked axes.
+    // Returned before every closed-form guard below, all of which are about a walk
+    // this model does not take.
+    if model.is_algebraic() {
+        return crate::sens::algebraic::subject_sensitivities_iov(
+            model,
+            subject,
+            theta,
+            stacked_eta,
+        );
     }
     // Cheap, model/subject-only decline before any dual seeding (#822 review #9) — see
     // `subject_sensitivities_tvcov`. Harmless for the ODE-twin branch below: an ODE model has no
@@ -1537,7 +1647,7 @@ pub fn subject_sensitivities_iov(
         .analytic_readout
         .as_ref()
         .and_then(|ar| ar.program.as_ref());
-    let s = build_iov_sources(model, subject, theta, stacked_eta)?;
+    let s = build_iov_sources(model, subject, theta, stacked_eta, false)?;
     // Run the walk over `Dual2<M>` (M = n_theta + n_stacked); the dual width tracks
     // the *unknowns* (n_eta + K·n_kappa + n_theta), not the PK axes, so it stays
     // narrow for many occasions whenever n_kappa < n_diff (the usual κ-on-CL case).
@@ -1549,7 +1659,7 @@ pub fn subject_sensitivities_iov(
             model, subject, theta, stacked_eta, &s.sources, &s.dose_src, &s.obs_src,
             &s.pkonly_src, &s.slot_row, s.n_eta, s.n_kappa, s.n_eff, s.n_stacked,
             s.n_theta, s.scale_groups.as_deref(), s.bsv_amount.as_ref(),
-            readout, s.readout_obs.as_ref(),
+            readout,
         )
     )?;
     // LTBS (#486): apply the `ln(f)` jet LAST — after the in-walk scale quotient / Form C
@@ -1597,17 +1707,6 @@ struct IovSources {
     /// carries `∂A₀/∂(θ, η_bsv)` but zero `∂A₀/∂κ`. `None` when the model has no
     /// `[initial_conditions]`.
     bsv_amount: Option<(crate::types::PkParams, CombinedDerivs)>,
-    /// For an analytic Form C readout (`[scaling] y = <expr>`) under IOV (#655): one
-    /// **BSV-only** (`κ = 0`) `(pk, combined-derivs)` snapshot per observation,
-    /// evaluated at that observation's covariate / `TIME` snapshot. Production's
-    /// `apply_analytic_readout` builds the readout PK params (the amount's `V`, plus
-    /// non-structural `BMAX`/`KD`) from `eta_bsv` (no κ) — only the concentration jet
-    /// carries κ — so this snapshot drives the readout param jet with `∂/∂(θ, η_bsv)`
-    /// and zero `∂/∂κ` (seeded `group = None`), while the walk's κ-bearing concentration
-    /// supplies the central amount. `Static` when covariates / `TIME` are subject-static
-    /// (one shared snapshot), `PerObs` otherwise; `None` when the model has no analytic
-    /// readout. See [`ReadoutSnapshots`].
-    readout_obs: Option<ReadoutSnapshots>,
 }
 
 fn build_iov_sources(
@@ -1615,6 +1714,11 @@ fn build_iov_sources(
     subject: &Subject,
     theta: &[f64],
     stacked_eta: &[f64],
+    // `true` builds the η-only derivative block at dual width `n_eff` (see
+    // `iov_eta_only_derivs_dyn`). Set only by the inner η-gradient, and only when the
+    // full `Dual2<n_theta + n_eff>` route is unavailable — so every model that worked
+    // before this existed takes exactly the path it took before.
+    eta_only: bool,
 ) -> Option<IovSources> {
     // #419: decline a rate-defined infusion under `F ≠ 1` to the FD gradient — the
     // Dual2 walk applies `F` as an inline magnitude scale on the rate
@@ -1684,9 +1788,13 @@ fn build_iov_sources(
     let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
     let cd_at = |time: f64, combined: &[f64], cov: &std::collections::HashMap<String, f64>| {
         let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, time);
-        crate::sens::provider::iov_combined_derivs_dyn(
-            prog, n_theta, n_eff, n_diff, cov, theta, combined,
-        )
+        if eta_only {
+            iov_eta_only_derivs_dyn(model, prog, n_eff, n_diff, cov, theta, combined)
+        } else {
+            crate::sens::provider::iov_combined_derivs_dyn(
+                prog, n_theta, n_eff, n_diff, cov, theta, combined,
+            )
+        }
     };
 
     // Per-event seed sources `(pk, cd, group)`. Each event's derivatives are evaluated
@@ -1820,32 +1928,13 @@ fn build_iov_sources(
         Some((pk, cd))
     };
 
-    // Analytic Form C readout param snapshots (#655): one κ = 0 (BSV-only) `(pk, cd)`
-    // per observation, matching production `apply_analytic_readout(..., eta_bsv,
-    // obs_cov(j), obs_time(j))`. Per-event when covariates / `TIME` vary (each obs at its
-    // own snapshot); otherwise one static snapshot reused across observations (the
-    // derivative-program eval is the cost, so clone the shared `cd`). Built only when a
-    // readout is present — such a model is init-free with no `[scaling]` divisor, so
-    // `bsv_amount`/`scale_groups` are `None` and the post-walk transform blocks are inert.
-    let readout_obs = if model.analytic_readout.is_none() {
-        None
-    } else if per_event {
-        let mut v = Vec::with_capacity(subject.obs_times.len());
-        for j in 0..subject.obs_times.len() {
-            let cov = subject.obs_cov(j);
-            let t = subject.obs_times[j];
-            let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov, t);
-            let cd = cd_at(t, &combined_pk_only, cov)?;
-            v.push((pk, cd));
-        }
-        Some(ReadoutSnapshots::PerObs(v))
-    } else {
-        // Subject-static covariates / `TIME`: one shared snapshot, so the walk reads the same
-        // κ = 0 readout params at every observation (no per-obs `CombinedDerivs` clone).
-        let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov_static, 0.0);
-        let cd = cd_at(0.0, &combined_pk_only, cov_static)?;
-        Some(ReadoutSnapshots::Static((pk, cd)))
-    };
+    // Analytic Form C readout param snapshots (#655) need no source of their own: since
+    // #1079 production evaluates the readout with the observation's *own* occasion effect
+    // `[η_bsv, κ]` at the observation's covariate / `TIME` snapshot — which is exactly
+    // `sources[obs_src[j]]`, already built above (per event when covariates / `TIME` vary,
+    // one per occasion group otherwise, matching `apply_analytic_readout`'s own `per_obs`
+    // gate). The walks read it straight from there, so a readout costs no extra
+    // derivative-program eval and cannot drift from the concentration's seeding.
 
     Some(IovSources {
         sources,
@@ -1860,7 +1949,6 @@ fn build_iov_sources(
         n_theta,
         scale_groups,
         bsv_amount,
-        readout_obs,
     })
 }
 
@@ -1888,7 +1976,10 @@ fn subject_eta_grad_iov_analytical(
     if ss_lagtime_walk_unsupported(model, subject) {
         return None;
     }
-    if !iov_analytical_supported(model) {
+    // The η-only predicate: this walk seeds no θ axes, so the program's θ-axis count is
+    // irrelevant to its answer. Admitting that is what lets a `[covariate_nn]` model off
+    // the finite-difference fallback.
+    if !iov_analytical_eta_supported(model) {
         return None;
     }
     // Analytic Form C readout program (#655); `iov_analytical_supported` has already
@@ -1897,7 +1988,10 @@ fn subject_eta_grad_iov_analytical(
         .analytic_readout
         .as_ref()
         .and_then(|ar| ar.program.as_ref());
-    let s = build_iov_sources(model, subject, theta, stacked_eta)?;
+    // Fall back to the η-only derivative block only when the full route is unavailable,
+    // so every previously-served model keeps its exact prior path and numbers.
+    let eta_only = !iov_analytical_supported(model);
+    let s = build_iov_sources(model, subject, theta, stacked_eta, eta_only)?;
     let n_dim = s.n_stacked;
     const_dispatch!(
         n_dim;
@@ -1906,7 +2000,7 @@ fn subject_eta_grad_iov_analytical(
             model, subject, theta, stacked_eta, &s.sources, &s.dose_src, &s.obs_src,
             &s.pkonly_src, &s.slot_row, s.n_eta, s.n_kappa, s.n_stacked,
             s.scale_groups.as_deref(), s.bsv_amount.as_ref(),
-            readout, s.readout_obs.as_ref(),
+            readout,
         )
     )
 }
@@ -1943,7 +2037,6 @@ fn run_obs_iov<const M: usize>(
     scale_groups: Option<&[(crate::types::PkParams, CombinedDerivs)]>,
     bsv_amount: Option<&(crate::types::PkParams, CombinedDerivs)>,
     readout: Option<&crate::parser::model_parser::OdeOutputProgram>,
-    readout_obs: Option<&ReadoutSnapshots>,
 ) -> Option<SubjectSens> {
     use crate::pk::event_driven::EventSchedule;
     use crate::sens::propagate::{event_driven_sens_with_doses_g, PkDual};
@@ -2097,15 +2190,16 @@ fn run_obs_iov<const M: usize>(
             *c
         };
         // Analytic Form C readout (#655): replace the (clamped) central concentration jet
-        // with `y = <expr>`. The concentration carries the occasion κ (through the walk);
-        // the readout PK params come from the κ = 0 (BSV-only) snapshot (`readout_obs.at(j)`,
-        // seeded `group = None`), matching production `apply_analytic_readout(..., eta_bsv)`.
-        // The readout output is NOT re-clamped (production does not re-clamp it).
-        let c: Dual2<M> = match (readout, readout_obs) {
-            (Some(ro), Some(ro_obs)) => eval_readout_at_obs::<Dual2<M>>(
+        // with `y = <expr>`. The concentration carries the occasion κ (through the walk),
+        // and so do the readout PK params — both are seeded from this observation's own
+        // event source `sources[obs_src[j]]` (`group = Some(g)`), matching production's
+        // per-occasion `apply_analytic_readout(..., [η_bsv, κ_g])` (#1079). The readout
+        // output is NOT re-clamped (production does not re-clamp it).
+        let c: Dual2<M> = match readout {
+            Some(ro) => eval_readout_at_obs::<Dual2<M>>(
                 ro,
                 c_clamped,
-                ro_obs.at(j),
+                &sources[obs_src[j]],
                 slot_row,
                 subject.obs_cov(j),
                 subject.readout_time(j),
@@ -2114,7 +2208,7 @@ fn run_obs_iov<const M: usize>(
                 &mut ro_vars,
                 &mut ro_stack,
             ),
-            _ => c_clamped,
+            None => c_clamped,
         };
         let c = &c;
         let mut df_deta = vec![0.0; n_stacked];
@@ -2290,7 +2384,6 @@ fn run_obs_iov_eta<const N: usize>(
     scale_groups: Option<&[(crate::types::PkParams, CombinedDerivs)]>,
     bsv_amount: Option<&(crate::types::PkParams, CombinedDerivs)>,
     readout: Option<&crate::parser::model_parser::OdeOutputProgram>,
-    readout_obs: Option<&ReadoutSnapshots>,
 ) -> Option<Vec<ObsGrad>> {
     use crate::pk::event_driven::EventSchedule;
     use crate::sens::propagate::{event_driven_sens_with_doses_g, PkDual};
@@ -2404,18 +2497,19 @@ fn run_obs_iov_eta<const N: usize>(
     for (j, c) in conc.iter().enumerate() {
         // Clamp the concentration jet to ≥ 0 BEFORE the readout (production ordering), then
         // apply the Form C readout unclamped — the η-only mirror of the `run_obs_iov` step.
-        // The readout PK params come from the κ = 0 (BSV-only) snapshot (`readout_obs.at(j)`,
-        // `group = None`) while the clamped concentration supplies the κ-bearing central amount.
+        // The readout PK params come from this observation's own occasion source
+        // (`sources[obs_src[j]]`, `group = Some(g)`), so they carry the same κ the clamped
+        // concentration does (#1079).
         let c_clamped: Dual1<N> = if c.value < 0.0 {
             Dual1::<N>::constant(0.0)
         } else {
             *c
         };
-        let c: Dual1<N> = match (readout, readout_obs) {
-            (Some(ro), Some(ro_obs)) => eval_readout_at_obs::<Dual1<N>>(
+        let c: Dual1<N> = match readout {
+            Some(ro) => eval_readout_at_obs::<Dual1<N>>(
                 ro,
                 c_clamped,
-                ro_obs.at(j),
+                &sources[obs_src[j]],
                 slot_row,
                 subject.obs_cov(j),
                 subject.readout_time(j),
@@ -2424,7 +2518,7 @@ fn run_obs_iov_eta<const N: usize>(
                 &mut ro_vars,
                 &mut ro_stack,
             ),
-            _ => c_clamped,
+            None => c_clamped,
         };
         let c = &c;
         let mut df_deta = vec![0.0; n_stacked];
@@ -3864,6 +3958,15 @@ fn subject_eta_grad_impl(
     // takes the ODE-provider branch below (that branch ignores the analytical
     // `cached_schedule`, so a stale one is harmless). Unchanged for every other model (#486).
     let model = crate::pk::effective_model_for_eval(model, subject, theta, eta);
+    // Compartment-free models (#811), before the ODE/analytical split for the same
+    // reason as in `subject_sensitivities_impl` — and so the inner and outer take
+    // the same route, which is the property `subject_eta_grad_tvcov_with_schedule`
+    // exists to protect. Time-varying covariates are ordinary here (a per-row study
+    // or arm covariate), so this must come before the event-walk test below, which
+    // would otherwise claim such a subject for a walk it cannot run.
+    if model.is_algebraic() {
+        return crate::sens::algebraic::subject_eta_grad(model, subject, theta, eta);
+    }
     // ODE models: the light `Dual1` inner η-gradient (#410), gated by the master
     // switch. Out-of-scope ODE subjects decline (→ FD inner), the same per-subject
     // scope the outer provider uses, so inner and outer stay on the same route.
@@ -5134,6 +5237,13 @@ fn subject_sensitivities_impl(
     // routes to its exact ODE `transit()` equivalent, which then takes the ODE-provider
     // branch below; every other model is unchanged (#486).
     let model = crate::pk::effective_model_for_eval(model, subject, theta, eta);
+    // Compartment-free models (#811) first: they have `ode_spec == None` and a
+    // placeholder `pk_model`, so both branches below would misread them — the ODE
+    // test as "analytical", then `analytical_supported` (which declines them
+    // explicitly) as "out of scope", losing an analytic gradient that exists.
+    if model.is_algebraic() {
+        return crate::sens::algebraic::subject_sensitivities(model, subject, theta, eta);
+    }
     // ODE models route to the ODE sensitivity provider (issue #367, Option A;
     // armed in #410) when in its supported scope; out-of-scope ODE subjects return
     // `None` and fall back to the prior path (gradient-free outer, FD inner). The

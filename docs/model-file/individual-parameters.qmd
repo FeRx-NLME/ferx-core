@@ -46,6 +46,7 @@ name from quietly reading as zero and collapsing the formula.
 | `sqrt()` | `sqrt(WT)` |
 | `abs()` | `abs(ETA_CL)` |
 | `min(a, b)`, `max(a, b)` | `max(TVCL * WT / 70, 0.1)` |
+| `clamp(x, lo, hi)` | `clamp(ACR20, 0.01, 0.99)` |
 | Parentheses | `TVCL * (WT/70)^0.75` |
 | Comparisons (in `if` conditions) | `WT > 70`, `SEX == 1`, `AGE != 0` |
 | Logical (in `if` conditions) | `&&` (and), `\|\|` (or), `!` (not) |
@@ -56,6 +57,16 @@ conditional (`max(a, b)` → `if (a >= b) a else b`), so they differentiate and
 compile identically to the hand-written form. A one-argument `max(x)` is a parse
 error rather than the silent identity it used to be
 ([#1030](https://github.com/FeRx-NLME/ferx-core/issues/1030)).
+
+`clamp(x, lo, hi)` takes **exactly three** arguments and is the two-sided bound:
+`clamp(ACR20, 0.01, 0.99)` says what `min(max(ACR20, 0.01), 0.99)` says, without
+the argument order flipping between the inner and outer call. It desugars to the
+same nested conditional — `if (x <= lo) lo else if (x >= hi) hi else x` — so on
+each bound the *bound* is returned and the derivative there is zero. Any other
+arity is a parse error, and literal bounds the wrong way round
+(`clamp(x, 0.9, 0.1)`) are rejected rather than silently returning `0.9` for
+every `x`; bounds that are not both literals are not checked
+([#1092](https://github.com/FeRx-NLME/ferx-core/issues/1092)).
 
 ## Continuation Lines
 

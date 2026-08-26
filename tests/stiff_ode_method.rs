@@ -196,11 +196,19 @@ fn rosenbrock_methods_reproduce_the_brute_force_rk45_trajectory() {
 /// budget cannot reach the end of the span, so its late predictions are materially wrong.
 /// If this ever stops holding, the model is no longer stiff and the comparison above has
 /// quietly stopped testing anything.
+///
+/// `ode_method = rk45` is named rather than left to the default, which is `auto` since #978.
+/// That is not a workaround: the premise being pinned is a statement about RK45, and under the
+/// default this system is exactly the one the probe rescues — which the companion test below
+/// asserts directly.
 #[test]
 fn the_explicit_method_is_stability_limited_on_this_system() {
     let pop = stiff_population();
     let reference = predictions(RK45_REFERENCE_OPTIONS, &pop);
-    let default_budget = predictions("  ode_reltol = 1e-8\n  ode_abstol = 1e-10\n", &pop);
+    let default_budget = predictions(
+        "  ode_method = rk45\n  ode_reltol = 1e-8\n  ode_abstol = 1e-10\n",
+        &pop,
+    );
 
     let (t_last, p_last) = *default_budget.last().unwrap();
     let (_, r_last) = *reference.last().unwrap();
@@ -210,4 +218,26 @@ fn the_explicit_method_is_stability_limited_on_this_system() {
         "RK45 on the default budget landed within 0.1% at t={t_last} (rel {rel:.2e}) — this \
          system is no longer stiff enough for the ode_method comparison to mean anything"
     );
+}
+
+/// The other half of that premise, and the point of making `auto` the default (#978): a model
+/// that names **no** `ode_method` at all now lands on this stiff system, where naming `rk45`
+/// does not. The two tests bracket the change — same model, same tolerances, same step budget,
+/// and the only difference is that nobody had to know the system was stiff.
+#[test]
+fn the_default_rescues_the_system_that_defeats_the_explicit_method() {
+    let pop = stiff_population();
+    let reference = predictions(RK45_REFERENCE_OPTIONS, &pop);
+    let defaulted = predictions("  ode_reltol = 1e-8\n  ode_abstol = 1e-10\n", &pop);
+
+    assert_eq!(defaulted.len(), reference.len());
+    for ((t, p), (_, r)) in defaulted.iter().zip(reference.iter()) {
+        let tol = 1e-9 + 1e-6 * r.abs();
+        assert!(
+            (p - r).abs() <= tol,
+            "default (auto) at t={t:.2}: PRED {p:.9} vs brute-force RK45 reference {r:.9} \
+             (|diff| {:.2e} > tol {tol:.2e})",
+            (p - r).abs()
+        );
+    }
 }

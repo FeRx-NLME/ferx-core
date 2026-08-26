@@ -5425,6 +5425,73 @@ fn lagtime_tvcov_walk_matches_fd_of_production() {
     check_full_provider_vs_fd(&model, &subject, &theta, &eta);
 }
 
+// #1060: the ODE twin of the cell above. The closed-form walk carries the lagged
+// arrival as a dual sub-interval length, so its bolus saltation falls out of the
+// flow to all orders; the ODE walk has an `f64` timeline and must inject the
+// saltation explicitly, which is where the covariate snapshot can be — and was —
+// taken from the wrong side of the moving boundary. Running it through this
+// harness rather than the ODE module's own (2e-3) puts the strict 2e-4 gradient
+// bound on the configuration the issue measured.
+const ONECPT_IV_LAG_TVCOV_ODE: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  theta TVP(0.7, 0.05, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_P  ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * (WT/70)^THETA_WT * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+  LAGTIME = TVP * exp(ETA_P)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[covariates]
+  WT continuous
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+/// #1060 under the strict harness: an ODE model whose lagged arrival lands past a
+/// covariate record must match FD of the production predictor to the same 2e-4 /
+/// 3e-3 bounds every other analytic cell is held to. The dose sits at `t = 1` on
+/// the `WT = 70` row and arrives at `1 + 0.7·e^0.07 ≈ 1.751`, inside the segment
+/// the `t = 2` record (`WT = 76`) governs.
+#[test]
+fn ode_lagtime_tvcov_arrival_crosses_covariate_matches_fd_of_production() {
+    let model = parse_model_string(ONECPT_IV_LAG_TVCOV_ODE).expect("parse ODE lag + tvcov");
+    assert!(model.has_lagtime());
+    let subject = tvcov_subject(
+        vec![DoseEvent::new(1.0, 100.0, 1, 0.0, false, 0.0)],
+        &[70.0],
+        &[0.0, 0.5, 1.5, 2.0, 4.0, 8.0],
+        &[70.0, 72.0, 74.0, 76.0, 80.0, 85.0],
+        Vec::new(),
+        Vec::new(),
+        &[],
+    );
+    assert!(subject.has_tv_covariates());
+    let theta = [10.0, 50.0, 0.75, 0.7];
+    let eta = [0.1, -0.05, 0.07];
+    // Non-vacuity: this must be served analytically, or the harness would be
+    // comparing FD against FD and could never fail.
+    assert!(
+        subject_sensitivities(&model, &subject, &theta, &eta).is_some(),
+        "the configuration is in analytic scope (#486) — a decline here would \
+         make the parity check vacuous"
+    );
+    check_full_provider_vs_fd(&model, &subject, &theta, &eta);
+}
+
 /// The inner (`Dual1`, η-only) twin of the walk must agree with the outer `Dual2` walk on
 /// `∂f/∂η` — the two are separate monomorphizations of the same moving-boundary logic, and
 /// a lag jet threaded into one but not the other would silently split inner/outer scope.
@@ -6335,10 +6402,10 @@ fn iov_provider_matches_fd_of_predict_iov() {
 
 // 1-cpt IV closed-form IOV with a saturable-binding analytic Form C readout
 // `y = C + BMAX·C/(KD + C)`, `C = central/V` (#655). `CL = TVCL·exp(ETA_CL + KAPPA_CL)`
-// carries the occasion κ through the concentration, while production applies the
-// readout with the κ = 0 (BSV-only) PK params (`apply_analytic_readout(..., eta_bsv)`)
-// — so the readout param jet (V, BMAX, KD) is κ-less and only `C` carries κ, exactly
-// the split `run_obs_iov` seeds from `readout_obs`.
+// carries the occasion κ through the concentration; the readout's own params
+// (V, BMAX, KD) happen to be κ-less here, so this model exercises the readout jet
+// without exercising a κ-carrying readout parameter — see
+// `WARFARIN_IOV_KAPPA_BASELINE_READOUT` for that case (#1079).
 const WARFARIN_IOV_BINDING_READOUT: &str = r#"
 [parameters]
   theta TVCL(0.2, 0.001, 10.0)
@@ -6367,9 +6434,9 @@ const WARFARIN_IOV_BINDING_READOUT: &str = r#"
 
 /// **Analytic Form C readout × IOV on the closed-form walk** (#655). The IOV provider
 /// now replaces each observation's concentration jet with `y = <expr>`, seeding the
-/// readout PK params from the κ = 0 (BSV-only) per-obs snapshot while the walk's
-/// concentration carries κ — matching production `predict_iov`'s
-/// `apply_analytic_readout(..., eta_bsv, ...)`. The full provider's value /
+/// readout PK params from that observation's own occasion source — matching
+/// production `predict_iov`'s per-occasion
+/// `apply_analytic_readout(..., [η_bsv, κ_g], ...)` (#1079). The full provider's value /
 /// `∂(stacked-η)` / Hessian / `∂θ` must match FD of `predict_iov` (which applies the
 /// readout), and the non-structural BMAX/KD must be first-class differentiable.
 #[test]
@@ -6416,12 +6483,164 @@ fn iov_form_c_binding_readout_inner_eta_grad_matches_outer() {
     );
 }
 
+// 1-cpt IV closed-form IOV whose Form C readout reads a **κ-carrying** individual
+// parameter: `BASE = TVBASE·exp(KAPPA_B)` enters the readout additively, so it does
+// NOT cancel against the `conc × V` amount reconstruction (#1079). Production
+// evaluates the readout per occasion with `[η_bsv, κ_g]`, so the readout param jet
+// carries κ on group `g`'s stacked block — the walk seeds it from that observation's
+// own event source. Seeding `group = None` (the pre-#1079 κ = 0 convention) would
+// differentiate a *different* function than `predict_iov` computes, which is exactly
+// what this FD parity check catches.
+const WARFARIN_IOV_KAPPA_BASELINE_READOUT: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVBASE(2.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_B ~ 0.04
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV  * exp(ETA_V)
+  BASE = TVBASE * exp(KAPPA_B)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[scaling]
+  y = central / V + BASE
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+
+/// **A κ-carrying Form C readout parameter under IOV (#1079).** The readout's
+/// `BASE` moves with the occasion, so `∂y/∂κ_g` is non-zero *through the readout*
+/// (not only through the concentration). Value / `∂(stacked-η)` / Hessian / `∂θ`
+/// must match FD of `predict_iov`, which since #1079 applies the readout per
+/// occasion — a walk still seeded at κ = 0 differentiates the wrong function and
+/// this check fails on the κ columns.
+#[test]
+fn iov_form_c_kappa_baseline_readout_provider_matches_fd() {
+    let model = parse_model_string(WARFARIN_IOV_KAPPA_BASELINE_READOUT).expect("parse");
+    assert!(
+        iov_analytical_supported(&model),
+        "κ-carrying readout param × closed-form IOV must stay analytic"
+    );
+    let subject = iov_subject();
+    // θ = [TVCL, TVV, TVBASE]; stacked = [η_cl, η_v, κ_g0, κ_g1].
+    let theta = [0.2, 10.0, 2.0];
+    let stacked = [0.12, -0.08, 0.05, -0.10];
+    check_iov_provider_vs_fd(&model, &subject, &theta, &stacked);
+    check_iov_inner_matches_outer(&model, &subject, &theta, &stacked);
+
+    // The readout is the *only* κ path on `BASE`, and the two occasion groups own
+    // disjoint observations, so each observation's κ derivative must land on its own
+    // group's stacked axis (2 = κ_g0, 3 = κ_g1) and nowhere else.
+    let full = subject_sensitivities_iov(&model, &subject, &theta, &stacked).expect("supported");
+    let groups = crate::stats::likelihood::iov_occasion_groups(&subject);
+    for (g, (_occ, obs_indices)) in groups.iter().enumerate() {
+        for &j in obs_indices {
+            let d = &full.obs[j].df_deta;
+            assert!(
+                d[2 + g].abs() > 1e-6,
+                "obs {j} must carry ∂y/∂κ on its own group axis {}",
+                2 + g
+            );
+            assert_eq!(
+                d[2 + (1 - g)],
+                0.0,
+                "obs {j} must not leak κ onto the other occasion's axis"
+            );
+        }
+    }
+}
+
+/// **Cross-engine sensitivity oracle for the κ-carrying readout (#1079).** FD parity
+/// alone cannot catch a readout evaluated at the wrong κ — the analytic path was seeded
+/// to match the (wrong) `f64` path, so both agreed. The ODE engine, which applies the
+/// readout inside the integrator against the per-observation parameter snapshot, is the
+/// independent one: the closed-form walk's value **and** stacked-η gradient must equal
+/// its ODE twin's, occasion κ included.
+#[test]
+fn iov_form_c_kappa_baseline_readout_matches_ode_twin_sens() {
+    const ODE_TWIN: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVBASE(2.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_B ~ 0.04
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV  * exp(ETA_V)
+  BASE = TVBASE * exp(KAPPA_B)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central / V + BASE
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-11
+  ode_abstol = 1e-13
+"#;
+    let cf = parse_model_string(WARFARIN_IOV_KAPPA_BASELINE_READOUT).expect("parse closed-form");
+    let ode = parse_model_string(ODE_TWIN).expect("parse ODE twin");
+    assert!(iov_analytical_supported(&cf));
+    assert!(crate::sens::ode_provider::ode_iov_supported(&ode));
+    let subject = iov_subject();
+    let theta = [0.2, 10.0, 2.0];
+    let stacked = [0.12, -0.08, 0.05, -0.10];
+    let a = subject_sensitivities_iov(&cf, &subject, &theta, &stacked).expect("closed-form");
+    let b = subject_sensitivities_iov(&ode, &subject, &theta, &stacked).expect("ODE twin");
+    assert_eq!(a.obs.len(), b.obs.len());
+    for (oa, ob) in a.obs.iter().zip(b.obs.iter()) {
+        approx::assert_relative_eq!(oa.f, ob.f, max_relative = 1e-6, epsilon = 1e-9);
+        for (x, y) in oa.df_deta.iter().zip(ob.df_deta.iter()) {
+            approx::assert_relative_eq!(x, y, max_relative = 1e-5, epsilon = 1e-8);
+        }
+        for (x, y) in oa.df_dtheta.iter().zip(ob.df_dtheta.iter()) {
+            approx::assert_relative_eq!(x, y, max_relative = 1e-5, epsilon = 1e-8);
+        }
+    }
+}
+
+/// The same κ-carrying readout on a **TV-covariate** subject: a per-row `FREE` flag
+/// gates the baseline in and out, so `build_iov_sources` takes the per-event branch.
+/// The readout params then come from each observation's own per-event source, which
+/// must carry both that row's covariate snapshot and that occasion's κ (#1079).
+#[test]
+fn iov_form_c_kappa_baseline_readout_tvcov_matches_fd() {
+    let model = parse_model_string(&WARFARIN_IOV_KAPPA_BASELINE_READOUT.replace(
+        "  y = central / V + BASE",
+        "  y = central / V + FREE * BASE",
+    ))
+    .expect("parse");
+    let mut subject = iov_subject();
+    subject.obs_covariates = (0..subject.obs_times.len())
+        .map(|j| HashMap::from([("FREE".to_string(), (j % 2) as f64)]))
+        .collect();
+    assert!(subject.has_tv_covariates(), "per-row FREE ⇒ TV-cov subject");
+    assert!(iov_analytical_supported(&model), "still analytic");
+    let theta = [0.2, 10.0, 2.0];
+    let stacked = [0.12, -0.08, 0.05, -0.10];
+    check_iov_provider_vs_fd(&model, &subject, &theta, &stacked);
+    check_iov_inner_matches_outer(&model, &subject, &theta, &stacked);
+}
+
 // As `WARFARIN_IOV_BINDING_READOUT`, but the readout is gated on a **per-row** covariate
 // (`FREE`) — the free-vs-total assay pattern (#650/#655). A per-observation `FREE` flag
 // makes the subject a TV-covariate subject, so `build_iov_sources` takes the per-event
-// branch and builds one κ = 0 readout snapshot per observation (`readout_obs`), each at
-// that observation's covariate — the branch the plain (static-covariate) case above does
-// not exercise.
+// branch and the readout reads one source per observation, each at that observation's
+// covariate — the branch the plain (static-covariate) case above does not exercise.
 const WARFARIN_IOV_BINDING_READOUT_FREE: &str = r#"
 [parameters]
   theta TVCL(0.2, 0.001, 10.0)
@@ -6449,8 +6668,8 @@ const WARFARIN_IOV_BINDING_READOUT_FREE: &str = r#"
 "#;
 
 /// Covariate-gated Form C readout × IOV: the per-row `FREE` flag routes the subject
-/// through the per-event `readout_obs` branch (one κ = 0 snapshot per observation, at
-/// that obs's covariate). Value + all stacked-η/θ first/second derivatives must match
+/// through the per-event source branch (one snapshot per observation, at that obs's
+/// covariate and occasion). Value + all stacked-η/θ first/second derivatives must match
 /// FD of `predict_iov`, and the inner η-gradient must equal the outer η-block.
 #[test]
 fn iov_form_c_readout_tvcov_gated_matches_fd() {
@@ -10742,5 +10961,167 @@ fn weighted_iov_kappa_gradient_is_the_unweighted_one_scaled() {
             );
         }
         assert!(ow.f.is_finite(), "obs {j} must be finite");
+    }
+}
+
+// ── #1064: analytic sensitivities through a θ level gather ────────
+//
+// The gather is a new kernel in `eval_bytecode_g` — the `PkNum` bytecode path
+// the `Dual2` sensitivities run on — so it needs its own parity check against
+// central differences of the production `f64` predictor. A wrong gather
+// derivative would compile and run silently: there is no second copy of the
+// formula to disagree with it.
+mod theta_gather_sens {
+    use super::*;
+
+    fn gather_model(levels: usize) -> String {
+        format!(
+            r#"
+[parameters]
+  theta TVCL(10.0, 0.001, 100.0)
+  theta PLACEBO[{levels}](1.0, -10.0, 10.0)
+  theta TVV(50.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  sigma PROP_ERR ~ 0.02
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL) * PLACEBO[PLA_IDX]
+  V  = TVV * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+        )
+    }
+
+    /// A subject whose `PLA_IDX` is a per-observation covariate, so the gather
+    /// selects a different θ at every sample — the shape the feature exists for.
+    fn subject_with_levels(times: &[f64], levels: &[f64]) -> Subject {
+        let n = times.len();
+        let mut s = subject_with_dose(DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0), times);
+        s.covariates.insert("PLA_IDX".to_string(), levels[0]);
+        s.obs_covariates = levels
+            .iter()
+            .map(|&l| HashMap::from([("PLA_IDX".to_string(), l)]))
+            .collect();
+        s.dose_covariates = vec![HashMap::from([("PLA_IDX".to_string(), levels[0])])];
+        assert_eq!(s.obs_covariates.len(), n);
+        s
+    }
+
+    #[test]
+    fn gather_dual_matches_fd_on_a_constant_index() {
+        // Subject-constant index: the plain `Free` rule, no tv machinery.
+        let m = parse_model_string(&gather_model(3)).expect("parse");
+        assert!(
+            sens_supported(&m),
+            "a 6-axis gather model is inside the analytic scope"
+        );
+        let mut s = subject_with_dose(
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            &[0.5, 2.0, 6.0, 12.0, 24.0],
+        );
+        s.covariates.insert("PLA_IDX".to_string(), 2.0);
+        check_full_provider_vs_fd(&m, &s, &[10.0, 0.8, 1.3, 0.7, 50.0], &[0.10, -0.05]);
+    }
+
+    #[test]
+    fn gather_dual_matches_fd_when_the_index_moves_per_observation() {
+        let m = parse_model_string(&gather_model(3)).expect("parse");
+        let s = subject_with_levels(&[0.5, 2.0, 6.0, 12.0, 24.0], &[1.0, 2.0, 3.0, 1.0, 2.0]);
+        assert!(s.has_tv_covariates());
+        check_full_provider_vs_fd(&m, &s, &[10.0, 0.8, 1.3, 0.7, 50.0], &[0.10, -0.05]);
+    }
+
+    #[test]
+    fn a_gather_is_exactly_sparse_in_the_individual_parameter() {
+        // `∂p/∂θ_k` is 1 on the level the row selects and 0 on every other — the
+        // statically-known sparsity that makes hundreds of levels tractable.
+        //
+        // Note the scope: this is sparsity of the *individual parameter*, not of
+        // the prediction. Once a gathered parameter feeds a compartment model,
+        // a later observation depends on the levels that applied before it
+        // through the state, so `∂f_j/∂θ_k` is *not* row-sparse. The
+        // compartment-free (`$PRED`-shaped) MBMA model this feature serves has
+        // no such memory, which is why the design is sparse there.
+        let m = parse_model_string(&gather_model(3)).expect("parse");
+        let prog = m
+            .indiv_param_partials
+            .indiv_param_program
+            .as_ref()
+            .expect("program");
+        let theta = [10.0, 0.8, 1.3, 0.7, 50.0];
+        let eta = [0.10, -0.05];
+        for level in 1..=3usize {
+            let cov = HashMap::from([("PLA_IDX".to_string(), level as f64)]);
+            let pd =
+                crate::sens::ode_provider::param_derivatives_at_cov(prog, &m, &cov, &theta, &eta)
+                    .expect("in scope");
+            // Individual parameter 0 is CL, the one that reads the block.
+            for k in 1..=3usize {
+                let d = pd.dp_dtheta[0][k];
+                if k == level {
+                    assert!(
+                        d.abs() > 1e-9,
+                        "level {level} must depend on its own θ_{k}, got {d}"
+                    );
+                } else {
+                    assert_eq!(
+                        d, 0.0,
+                        "level {level} must not depend on θ_{k}, which it does not read"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_subject_touches_only_the_levels_its_records_read() {
+        // The per-subject sparsity Part B (#1064) will scope the outer gradient
+        // by: a subject that never reads level 3 has an identically zero
+        // gradient in that level's θ, on every one of its observations.
+        let m = parse_model_string(&gather_model(3)).expect("parse");
+        let s = subject_with_levels(&[1.0, 5.0, 20.0], &[1.0, 2.0, 1.0]);
+        let theta = [10.0, 0.8, 1.3, 0.7, 50.0];
+        let sens = subject_sensitivities(&m, &s, &theta, &[0.10, -0.05]).expect("supported");
+        for (j, grad) in sens.obs.iter().enumerate() {
+            assert_eq!(
+                grad.df_dtheta[3], 0.0,
+                "row {j} never reads level 3, so it must carry no gradient in it"
+            );
+            assert!(
+                grad.df_dtheta[1].abs() > 1e-12,
+                "row {j} is downstream of level 1, which it does read"
+            );
+        }
+    }
+
+    #[test]
+    fn a_block_wider_than_the_axis_ladder_bails_to_fd_rather_than_truncating() {
+        // `param_derivatives_at_cov` dispatches `Dual2<M>` over `1..=24` axes.
+        // A several-hundred-θ block is past the table, and the contract is a
+        // clean `None` — the caller then finite-differences that subject. A
+        // silent truncation to the first 24 axes would be a wrong gradient that
+        // nothing else in the tree could contradict.
+        let m = parse_model_string(&gather_model(60)).expect("parse");
+        let prog = m
+            .indiv_param_partials
+            .indiv_param_program
+            .as_ref()
+            .expect("program");
+        let theta = vec![1.0; m.n_theta];
+        let cov = HashMap::from([("PLA_IDX".to_string(), 1.0)]);
+        assert!(
+            crate::sens::ode_provider::param_derivatives_at_cov(
+                prog,
+                &m,
+                &cov,
+                &theta,
+                &[0.0, 0.0]
+            )
+            .is_none(),
+            "past the axis ladder the provider must decline, not truncate"
+        );
     }
 }

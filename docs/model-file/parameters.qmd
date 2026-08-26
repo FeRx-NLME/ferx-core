@@ -30,6 +30,169 @@ theta TVV(8.1, 0.1, 500.0)
 theta TVKA(1.0, 0.01, 50.0)
 ```
 
+## Theta level blocks
+
+Some models need *hundreds* of fixed effects that share one declaration. The
+motivating case is an **unstructured placebo effect** in a model-based
+meta-analysis: every (study × timepoint) cell gets its own fixed effect, so that
+no parametric placebo time-course can bias the drug-effect estimate. A hundred
+studies at eight timepoints each is 800 thetas, and that is not an unusual size.
+
+Writing 800 `theta` lines is the visible problem. The deeper one is that 800
+*separate individual parameters* do not fit the engine's fixed parameter-slot
+layout at all. Both fall away once you notice that an unstructured effect is
+**indexed**: for any given observation row, exactly one of the 800 thetas is
+active — the one for that row's `(study, time)`. So it is a **gather**: one
+parameter slot, one contiguous block of thetas, one index per record.
+
+### Counted form: `theta NAME[N]`
+
+```
+[parameters]
+  theta PLACEBO[800](0.0, -10.0, 10.0)
+
+[individual_parameters]
+  PL = PLACEBO[PLA_IDX]          # PLA_IDX is a data column, 1-based
+```
+
+`theta NAME[N](...)` declares **N** thetas named `NAME[1]`…`NAME[N]`, all
+sharing the one `(init, lower, upper)` triple — and `FIX`, if given.
+`NAME[COLUMN]` reads the level that record's `COLUMN` selects.
+
+- The index is **1-based**. An index that is missing, non-integral, or outside
+  `1..=N` is rejected before the fit starts, naming the column and the offending
+  value. (A silent `0` would be indistinguishable from a legitimately estimated
+  level, so it is never treated as one.)
+- A **literal** index (`PLACEBO[3]`) is resolved at parse time and costs nothing
+  at runtime; an out-of-range literal is a parse error.
+- A **bare** `PLACEBO` is an error — there is nothing to gather on. Index it.
+
+The R package's `ferx_mbma_data()` is the natural place to build the index
+column for this form.
+
+### Data-driven form: `theta NAME[COL, ...]`
+
+```
+[parameters]
+  theta PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)
+
+[individual_parameters]
+  PL = TVPL + PLACEBO            # the index is implicit
+```
+
+Put **data columns** in the brackets instead of a count and the block declares
+**one level per observed combination** of them, discovered when the data is
+bound. With `contrast = none`, the `(init, lower, upper)` triple broadcasts to
+every level. Constrained forms estimate contrast coefficients and derive one
+level per contrast group, so they require `init = 0`; `FIX` then fixes the
+whole block at zero. Bounds apply to the free coefficients, not to a derived
+negative sum, which can lie outside them. Free coefficients are named after
+their combination, so estimates report as
+`PLACEBO[STUDY=7,TIME=4]`. A column named `TIME` is the record time; anything
+else is a covariate column, which the reader loads automatically.
+
+The two forms cannot be confused: brackets containing only digits are a level
+count, anything else is a column list.
+
+Only combinations the data actually shows become parameters — an unbalanced
+design does not acquire cells nobody measured.
+
+Because the level count is a property of the *dataset*, this form must be run
+through a file entry point (the CLI, `run_model_with_data`, `fit_from_files`, or
+`--simulate`), which reads the data and binds the block. A model handed to the
+in-memory `fit()` without that step is refused rather than silently predicting
+`NaN`; if you need the in-memory path, use the counted `theta NAME[N]` form with
+your own index column.
+
+### Identifiability
+
+`PLACEBO[STUDY, TIME]` alongside an intercept is rank-deficient — the levels sum
+to the intercept. It is *also* rank-deficient against a **random** effect at the
+same or a coarser grouping: a study's `eta` is, by construction, the mean of that
+study's own timepoint levels. That second case is not an edge case; it is the
+model this feature exists to serve. A convention is therefore always applied,
+and it is chosen by looking at both the model and the data:
+
+| Situation | Default |
+|---|---|
+| The parameter reading the block also carries a random effect, **and** the block's leading columns identify subjects one-to-one | sum-to-zero **within** each leading-column group |
+| Otherwise | sum-to-zero over **all** levels |
+
+Within-group sum-to-zero leaves each study's `eta` carrying that study's mean and
+the levels carrying deviations from it, which is what the model intends and what
+makes the two separately interpretable.
+
+Override with `contrast = ...`:
+
+```
+theta PLACEBO[STUDY, TIME, contrast = sum_to_zero](0.0, -10.0, 10.0)
+theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](...)
+theta PLACEBO[STUDY, TIME, contrast = ref](...)   # first level held at 0
+theta PLACEBO[STUDY, TIME, contrast = none](...)  # you assert identifiability
+```
+
+Whichever you pick, one degree of freedom has to go: *L* levels alongside an
+intercept is *L + 1* parameters for *L* cells, and the block and the intercept
+would otherwise slide against each other forever. The conventions differ only in
+*where* it goes.
+
+**`sum_to_zero`** makes the levels deviations *around* the grand mean, which
+stays in the intercept. The levels are symmetric, none is special, and the block
+is better conditioned — right when nobody reads the individual levels, which is
+the unstructured-placebo case.
+
+**`ref`** is dummy coding (R's `contr.treatment`, what `lm(y ~ factor(study))`
+does): one level is pinned at exactly 0 and every other θ is that level's
+*difference from it*, with the intercept absorbing the reference level's own
+value. So `PLACEBO[STUDY=1,TIME=4] = 0.3` reads as "0.3 above study 1's first
+timepoint", not "0.3 above the average". Use it when the coefficients are meant
+to be *read* rather than merely absorbed.
+
+Two limits on `ref` as it stands:
+
+- The reference is always the **first level in sort order** (the smallest
+  column-value tuple). There is no way to name a different one.
+- It is a **single** reference for the whole block, not one per group — only
+  `sum_to_zero_within` splits the levels into contrast groups. So `contrast =
+  ref` on `[STUDY, TIME]` pins one cell globally rather than each study's own
+  first timepoint.
+
+A contrast that would leave a nested group's mean free while a random effect
+also carries it is a hard error, not a warning.
+
+Both conventions are implemented as contrast coding, so the optimizer needs no
+constraint machinery: a group of *L* levels estimates *L − 1* thetas and the
+remaining level is derived (minus the sum of the others under sum-to-zero, or a
+constant 0 under `ref`). A derived level is not a parameter, so it does not
+appear in the estimate table; its value follows from the others.
+
+### Fitting at this scale
+
+Two defaults are tuned for the handful-of-parameters models everything else in
+this engine is, and switch automatically once a block makes the problem large:
+
+- **Optimizer.** `optimizer = auto` picks BOBYQA when no analytic gradient is
+  available. BOBYQA interpolates a quadratic over the whole parameter space, so
+  its model grows quadratically in the parameter count; above 64 free
+  coordinates `auto` takes `nlopt_lbfgs` instead, whose finite-difference cost
+  is linear. An explicit `optimizer = bobyqa` is still honoured, with a warning.
+- **Covariance.** The default `covariance_method = r` builds a
+  finite-difference Hessian that re-converges every subject's EBEs at each of
+  `n(n+1)/2` stencil points — around 320,000 population objectives at 800
+  parameters. Above 100 free coordinates a *defaulted* covariance method routes
+  to the score cross-product (`covariance_method = s`, one pass) with a warning.
+  Setting `covariance_method = r` explicitly forces it, and says what it costs.
+
+A block of more than 20 free coefficients also leaves the main estimate table
+and gets its own compact summary (count, min, median, max) on the console. The
+fit YAML writes every independently estimated coefficient under
+`theta_blocks:`; constrained dependent levels are derived values, not estimates.
+
+Analytic sensitivities pass straight through a gather — `∂f/∂θ_k` is exact under
+the dual-number path — so a *small* level block keeps the analytic gradient.
+Past the engine's 24-axis dual dispatch, a large block falls back to finite
+differences per subject, which is why the guards above matter.
+
 ## Omega (Between-Subject Variability)
 
 ### Diagonal omega

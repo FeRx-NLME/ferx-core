@@ -183,7 +183,11 @@ fn iov_inner_subject_route(
     subject: &Subject,
     theta: &[f64],
 ) -> Option<Vec<crate::sens::provider::ObsGrad>> {
-    if !crate::sens::provider::iov_sens_supported(model)
+    // The **η-only** predicate (#1015): this route asks for `deta` and nothing else, so a
+    // program whose θ-axis count does not match `model.n_theta` (every `[covariate_nn]`
+    // model) is still exactly served. Must stay the same predicate `analytic_iov_inner` and
+    // `inner_reports_analytic_model` use, or the reported route drifts from the taken one.
+    if !crate::sens::provider::iov_sens_eta_supported(model)
         || model.default_params.omega_iov.is_none()
         || analytic_inner_common_bail(model)
         || subject_has_survival_records(subject)
@@ -209,7 +213,7 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
     if subject_has_survival_records(subject) {
         return "survival/TTE observations";
     }
-    if !crate::sens::provider::iov_sens_supported(model) {
+    if !crate::sens::provider::iov_sens_eta_supported(model) {
         return "model outside IOV analytic scope";
     }
     // #814: attribute against the *effective* model for this subject. A closed-form
@@ -621,6 +625,12 @@ pub(crate) fn cacheable_schedule(
 ) -> Option<pk::event_driven::EventSchedule> {
     if (subject.has_tv_covariates() || subject.has_resets())
         && model.ode_spec.is_none()
+        // A compartment-free model (#811) never runs the event-driven walk — the
+        // predictor short-circuits before it — and its `pk_model` is a placeholder,
+        // so a schedule built from it would be a cache for a route nothing takes.
+        // Time-varying covariates are the norm for such models (a per-row study or
+        // arm covariate), so this is the common path, not an edge case.
+        && !model.is_algebraic()
         && pk::event_driven::supports_event_driven(model.pk_model)
         && !model.has_lagtime()
         && !(model.has_bioavailability() && subject.has_rate_defined_infusion())
@@ -1227,7 +1237,7 @@ fn find_ebe_iov(
     // `iov_sens_supported` (`ode_iov_supported` declines `log_transform` independently),
     // not via the bail. Without these guards a joint IOV + TTE / `gradient = fd` fit would
     // converge EBEs against an incomplete gradient.
-    let analytic_iov_inner = crate::sens::provider::iov_sens_supported(model)
+    let analytic_iov_inner = crate::sens::provider::iov_sens_eta_supported(model)
         && omega_iov_ref.is_some()
         && !analytic_inner_common_bail(model)
         && !subject_has_survival_records(subject);
@@ -1832,7 +1842,8 @@ pub(crate) fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool
 ///     branch of [`analytic_inner_grad_supported`] now *delegates* to
 ///     `analytic_inner_common_bail` rather than re-listing it, so the two cannot drift;
 ///   - **IOV** — the stacked-η walk
-///     ([`iov_sens_supported`](crate::sens::provider::iov_sens_supported) + `omega_iov`).
+///     ([`iov_sens_eta_supported`](crate::sens::provider::iov_sens_eta_supported) + `omega_iov`)
+///     — the η-only predicate, matching what the inner route actually gates on.
 ///
 /// **Single source of truth** for both `build_info::gradient_method_inner` (the reported
 /// method) and [`fd_fallback_warning`]'s whole-population-FD guard, so the persisted
@@ -1843,9 +1854,12 @@ pub(crate) fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool
 /// population, by that same warning *because* this predicate reports analytic.
 pub(crate) fn inner_reports_analytic_model(model: &CompiledModel) -> bool {
     analytic_inner_grad_supported_model(model)
+        // Compartment-free (#811): served by neither the closed-form predicate (which
+        // declines the placeholder `pk_model` outright) nor the ODE one (no `ode_spec`).
+        || (crate::sens::algebraic::supported(model) && !analytic_inner_common_bail(model))
         || (crate::sens::provider::ode_inner_grad_supported_model(model)
             && !analytic_inner_common_bail(model))
-        || (crate::sens::provider::iov_sens_supported(model)
+        || (crate::sens::provider::iov_sens_eta_supported(model)
             && model.default_params.omega_iov.is_some()
             && !analytic_inner_common_bail(model))
 }
@@ -1903,6 +1917,15 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
     // left is the prior. (Pinned by `program_less_endpoint_only_ctmm_stays_fd`.)
     if subject.obs_times.is_empty() {
         return !analytic_inner_common_bail(model);
+    }
+    // Compartment-free (#811): its own provider, with a model-level scope and no
+    // per-subject exclusions — there are no doses, no resets and no absorption for a
+    // subject to carry that could put it out of scope, and time-varying covariates
+    // are served (the readout is re-seeded per observation, exactly as production
+    // re-evaluates it). Placed before the ODE and closed-form branches, which would
+    // both misread the placeholder `pk_model`.
+    if model.is_algebraic() {
+        return crate::sens::algebraic::supported(model) && !analytic_inner_common_bail(model);
     }
     // ODE models use the light `Dual1` inner provider (#410) with their own
     // per-subject scope ([`ode_inner_grad_supported`]). The global escape hatches

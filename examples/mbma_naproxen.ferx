@@ -1,0 +1,71 @@
+# Model-based meta-analysis: naproxen vs placebo in osteoarthritis.
+#
+# The published longitudinal MBMA of Boucher M & Bennetts M, "Many Flavors of
+# Model-Based Meta-Analysis: Part II — Modeling Summary Level Longitudinal
+# Responses", CPT:PSP 2018;7:288–297 (doi:10.1002/psp4.12299) — 18 trials, 36 arms,
+# longitudinal WOMAC pain — written as a compartment-free structural model
+# (issue #811). Bracis et al., CPT:PSP 2026;15:e70158, replicate the same analysis
+# in MonolixSuite as their Case Study 1.
+#
+# The data are Boucher & Bennetts' supplementary file and are licensed CC BY-NC 4.0,
+# not MIT — see data/mbma_naproxen.LICENSE.
+#
+# This is the model class the compartment-free form exists for. There is no PK
+# here at all: the structural model is an Emax time-course on an aggregate arm
+# mean, with study-level random effects and each arm weighted by its reported
+# standard error. Before #811 it had to be written as a dummy compartment driven
+# by `d/dt(clock) = 1`, with the real equation hidden in a `[scaling]` readout.
+#
+# The weighting scheme is the published one, and is what makes MBMA MBMA: `DV` is
+# the arm mean divided by its reported SE, the prediction is divided by the same
+# SE, and the residual variance is FIXED to 1 — so each arm enters the likelihood
+# with weight 1/SE², i.e. in proportion to how precisely it was measured.
+#
+# Run:
+#   cargo run --release --bin ferx -- examples/mbma_naproxen.ferx \
+#       --data data/mbma_naproxen.csv
+
+model mbma_naproxen
+
+[parameters]
+  # --- structural: the placebo, non-flare reference arm ---
+  theta TVE0(5.19,    1.0,  20.0)         # baseline WOMAC pain
+  theta TVEMAX(0.88, -5.0,  20.0)         # maximum drop from baseline
+  theta TVET50(0.70,  0.01, 20.0)         # weeks to half-maximal effect
+
+  # --- covariate effects, additive, matching the published model ---
+  theta B_E0_FLARE(0.97,   -10.0, 10.0)   # flare design on E0
+  theta B_EMAX_FLARE(1.10, -10.0, 10.0)   # flare design on Emax
+  theta B_EMAX_TRT(0.79,   -10.0, 10.0)   # naproxen on Emax
+  theta B_LET50_TRT(-1.18, -10.0, 10.0)   # naproxen on log ET50 (< 0 = faster)
+
+  # --- between-study variability, additive on the natural scale as published ---
+  omega ETA_E0   ~ 0.627 (sd)
+  omega ETA_EMAX ~ 0.763 (sd)
+
+  # --- residual FIXED to 1: all the weighting lives in the SE division ---
+  sigma ADD_ERR ~ 1.0 (variance) FIX
+
+[covariates]
+  TRT   categorical
+  FLARE categorical
+  WPSE  continuous
+
+[individual_parameters]
+  E0   = TVE0   + B_E0_FLARE * FLARE + ETA_E0
+  EMAX = TVEMAX + B_EMAX_FLARE * FLARE + B_EMAX_TRT * TRT + ETA_EMAX
+  ET50 = TVET50 * exp(B_LET50_TRT * TRT)
+
+[structural_model]
+  # No compartments: the Emax time-course IS the structural model, and the
+  # SE division is the MBMA weighting, not a unit conversion.
+  EFF = EMAX * TIME / (TIME + ET50)
+  y   = (E0 - EFF) / WPSE
+
+[error_model]
+  DV ~ additive(ADD_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 500
+  covariance = true

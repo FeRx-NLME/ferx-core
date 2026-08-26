@@ -62,6 +62,8 @@ the same data and eta structure but an analytical covariate model.
   layers     = [hidden_1, hidden_2, ...]
   activation = tanh | relu | sigmoid | softplus | exp | identity
   output     = tanh | relu | sigmoid | softplus | exp | identity   # optional, default `identity`
+  center     = [c_1, c_2, ...]   # optional, default all 0
+  scale      = [s_1, s_2, ...]   # optional, default all 1
 ```
 
 | Field         | Required | Meaning                                                           |
@@ -71,6 +73,9 @@ the same data and eta structure but an analytical covariate model.
 | `layers`      | yes      | Hidden layer widths, in order. At least one entry required        |
 | `activation`  | yes      | Hidden-layer element-wise activation                              |
 | `output`      | no       | Output-layer activation. Use `softplus` or `exp` for positive PK params |
+| `center`      | no       | Per-input value subtracted before the forward pass. One entry per input |
+| `scale`       | no       | Per-input divisor applied after centering. One entry per input; must be finite and non-zero |
+| `init`        | no       | Starting value per output, on the parameter's own scale. One entry per output; must be reachable by the output activation. Strongly recommended — see [Start the network at plausible values](#start-the-network-at-plausible-values-init) |
 
 The header form `[covariate_nn NAME]` requires the **NAME** (e.g.
 `TYPICAL_PK`). NAME is the dot-access prefix in `[individual_parameters]`
@@ -78,6 +83,46 @@ expressions (`NAME.CL`, `NAME.V1`, …).
 
 Multiple `[covariate_nn]` blocks per model are permitted; they're keyed
 by NAME and ordered alphabetically when generating theta names.
+
+## Normalize your inputs
+
+The network sees `(x - center) / scale`. Both default to the identity, so an
+existing model is unchanged — but on real covariates you almost always want them
+set.
+
+Raw covariates are badly scaled for a neural net. `WT ≈ 70` or `CRCL ≈ 86` drive
+every `tanh` unit to ±1 at Glorot initialization, where the derivative is ~0 and
+the layer is nearly blind to its input. The optimizer's only route out is to
+shrink the first-layer weights toward zero while later layers grow to compensate,
+which is slow, ill-conditioned, and prone to running away. Measured on a
+two-covariate DCM, unnormalized inputs pushed weights to ~1e11 and left the
+residual error at 15× its true value; the same model with standardized inputs
+kept every weight inside `[-1.3, 1.6]`.
+
+Use the covariate's mean and SD in your dataset, or any round numbers near them —
+the network does not care whether the standardization is exact, only that its
+inputs land in roughly `[-3, 3]`:
+
+```ferx
+[covariate_nn TYPICAL_PK]
+  inputs     = [WT, CRCL]
+  center     = [70, 86]
+  scale      = [12, 23]
+  outputs    = [CL, V1]
+  layers     = [8]
+  activation = tanh
+  output     = softplus
+```
+
+### Why these are declared, not learned from the data
+
+They are constants in the model file rather than statistics computed at fit time,
+which is deliberate. Statistics derived from the estimation data could not be
+carried into `predict()` — recomputing them on a new dataset would silently
+change the model between fitting and prediction, the standard train/serve skew.
+Writing them down keeps the model file a complete description of the transform,
+and matches what population PK already does when it writes `(WT/70)^0.75` and
+names its reference weight.
 
 ## Auto-generated parameters
 
@@ -161,6 +206,100 @@ Full per-weight values remain in `result.theta` at indices
 also exposed on each `FitResult.neural_networks[k]` entry). `ferx-r`
 loaders round-trip them losslessly via `fit.json` inside the `.fitrx`
 archive.
+
+When the model declares [normalization](#normalize-your-inputs),
+the summary carries `center:` and `scale:` alongside the shape, and each
+`FitResult.neural_networks[k]` entry carries `input_center` / `input_scale`
+in `input_names` order. Both are needed to *use* the reported weights: the
+network was fitted against `(x - center) / scale`, so evaluating the same
+weights on raw covariates yields a different network with nothing to signal
+it. Models that declare no normalization report the identity (all-zero
+`center`, all-one `scale`) and the YAML omits the two lines entirely.
+
+The `init` values are deliberately not reported. They set where the
+optimizer *starts*; the fitted weights supersede them, and they say nothing
+about what the converged network computes.
+
+## Start the network at plausible values (`init`)
+
+Declare one starting value per output, on the scale the parameter actually has:
+
+```{.ferx}
+[covariate_nn TYPICAL_PK]
+  inputs  = [WT, CRCL]
+  outputs = [CL, V]
+  layers  = [8, 8]
+  activation = tanh
+  output  = softplus
+  center  = [70, 90]
+  scale   = [15, 30]
+  init    = [1.0, 10.0]        # CL ≈ 1 L/h, V ≈ 10 L at iteration 0
+```
+
+**Do this on every DCM.** Without it, every output-layer bias starts at 0, so a
+`softplus` head starts *every* PK parameter at `softplus(0) = 0.693` — a clearance of
+0.69 L/h and a volume of 0.69 L, whatever the model means by them. The initial
+predictions are then wrong by orders of magnitude and the optimizer starts from a
+correspondingly absurd objective.
+
+That is not a slow start; it changes the answer. On a 60-subject busulfan-shaped DCM,
+identical data and seed:
+
+| start | `−2 log L` | KDEC (true 0.01) | `elbo_tightness_ratio` |
+|---|---|---|---|
+| bare head | 2033.6 | 0.0057 | 306.6 |
+| `init = [1.0, 10.0]` | **1061.0** | **0.0126** | **0.54** |
+
+The bare-head fit reported `converged: true`.
+
+The realisation is exact: the output-layer weight block is zeroed alongside the biases,
+so the network emits exactly `init` for every subject at iteration 0, independent of
+covariates. Those weights are not frozen — they take gradient from the first step, and
+the hidden layers from the second.
+
+Values must be reachable by the output activation (`softplus`/`exp`/`relu` need a
+positive value, `sigmoid` needs one in (0, 1), `tanh` one in (−1, 1)); anything else is
+a parse error rather than a `NaN` weight.
+
+## Weight gradients
+
+Estimators that hold the random effects fixed while differentiating the
+population parameters — SAEM's M-step, importance sampling, and
+variational inference — used to obtain
+`∂NLL/∂θ` by perturbing each `θ` in turn and re-solving the subject.
+For a classical model that is a handful of solves. For a DCM the
+weights *are* `θ`, so a 141-weight network meant 141 solves per subject
+per draw.
+
+The weights are now taken analytically. The network touches the
+likelihood through one narrow channel — its output layer — so its
+influence factors as
+
+$$\frac{\partial \mathrm{NLL}}{\partial w_j} = \sum_k \frac{\partial \mathrm{NLL}}{\partial z_k} \cdot \frac{\partial z_k}{\partial w_j}$$
+
+where $z$ is the output layer's pre-activation. The second factor is
+exact backpropagation, already available and cheap. Only the
+`n_outputs` values of the first factor need the model solved, and they
+come from the output-layer biases: $b_k$ shifts $z_k$ one-for-one and
+leaves every other output alone, so a finite difference in $b_k$ *is*
+$\partial \mathrm{NLL} / \partial z_k$. That is `2 × n_outputs` solves
+— 10 rather than 141 on the model above, taking each difference
+centrally.
+
+Two consequences worth knowing:
+
+- **Accuracy improves more than speed.** Agreement with a central
+  finite difference of the objective goes from ~2e-5 to ~1e-9 relative.
+  Wall-clock on the reference DCM improves ~1.4×, because the `θ` loop
+  was only about 30% of a VI iteration to begin with.
+- **Time-varying NN inputs opt out.** The factorization needs one
+  output vector per subject. If a covariate feeding the network changes
+  within a subject, each event has its own $z$ and the bias difference
+  returns their sum, which cannot be unpicked. Those subjects fall back
+  to the per-`θ` loop — correct, just slower. Covariates that vary but
+  do *not* feed the network are unaffected.
+
+`method = focei` uses a different gradient path and is unchanged.
 
 ## What's not yet wired
 

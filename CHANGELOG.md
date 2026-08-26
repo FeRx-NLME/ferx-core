@@ -20,6 +20,92 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Theta level blocks — hundreds of fixed effects from one declaration (#1064).**
+  `theta PLACEBO[800](0.0, -10.0, 10.0)` declares 800 thetas sharing one init/bounds triple, read back
+  by a *gather* — `PL = PLACEBO[PLA_IDX]`, where `PLA_IDX` is a 1-based data column. The data-driven
+  form `theta PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)` — data columns in the brackets rather than a
+  count — instead declares one theta per **observed**
+  combination of the named columns, discovered when the data is bound, and reports them as
+  `PLACEBO[STUDY=7,TIME=4]`. This is what makes an unstructured placebo effect writable in a
+  model-based meta-analysis — and fittable: the whole block occupies a single parameter slot, so it is
+  not bounded by the fixed individual-parameter layout the way 800 separate parameters would be.
+  A level block is rank-deficient against a fixed intercept *and* against a random effect at the
+  same or a coarser grouping, so a sum-to-zero convention is always applied and its grouping is chosen
+  from both the model and the data; `contrast = sum_to_zero | sum_to_zero_within | ref | none` overrides
+  it, and a choice that leaves a nested group's mean free is refused. An out-of-range or non-integral
+  gather index is reported before the fit starts, naming the column and value. See
+  `docs/model-file/parameters.qmd`.
+- **Three-argument `clamp(x, lo, hi)` in the model DSL (#1092).** Bounding a readout into an
+  interval no longer has to be written as the nested `min(max(x, lo), hi)`, whose argument order
+  flips between the inner and outer call. Available in every expression the DSL parses
+  (`[individual_parameters]`, `[scaling]`, `[odes]`, `[derived]`); it desugars to the inline
+  conditional, so it differentiates and compiles exactly like the nested form. `clamp` with any
+  arity other than three is a parse error — a one-argument `clamp(x)` would otherwise have been
+  read as the silent identity — and literal bounds given the wrong way round (`clamp(x, 0.9, 0.1)`)
+  are rejected rather than quietly returning a bound for every `x`. One input is deliberately not
+  the nested form: `NaN` fails both bound tests, so `clamp` propagates it into the objective
+  function, where `min(max(x, lo), hi)` would have pinned it to `lo` and let a wrong number fit.
+- **`[simulation]` can now state the covariates of the arms it invents (#1083).** `covariate NAME = <value>`
+  — a scalar for every subject, or `= [v1, v2, ...]` with one value per subject — gives the synthetic
+  subjects a covariate value, which a `[simulation]` design previously had no way to express at all.
+  This is what makes trial simulation work for a model-based meta-analysis: `kappa K ~ γ² weight = NARM`
+  and `DV ~ additive(S) weight = WPSE` both read a data column, and the arm a simulation is proposing
+  has no row to read it from. A model that references a covariate the design does not supply is now
+  refused by name, with the fix in the message, rather than reported as a column "not found in data" on
+  a path that has no data file. See `docs/model-file/simulation.qmd`.
+
+- **`ode_method = auto` picks the ODE stepper for you, and is now the default (#978).** An a-priori stiffness probe builds
+  the Jacobian `J = ∂f/∂u` of the `[odes]` right-hand side at the state each integration segment
+  starts from and reads its fastest mode, `max |Re λ(J)|`; a system above `30` per time unit starts
+  on a stiff Rosenbrock method (`rodas4`, or `rodas5p` at `ode_reltol ≤ 1e-8`), everything else stays
+  on the explicit default. Probing **per segment** rather than once per model is what makes it work
+  on binding/TMDD models, whose fast eigenvalue is carried by a term like `KON · central` and so is
+  identically zero at the declared initial condition — the one state at which such a model looks
+  non-stiff — and it re-decides as the optimizer moves θ. An escalation that returns a non-finite
+  trajectory, or that clamps at the minimum step (the freeze-pad failure that produces finite,
+  silently wrong output), is discarded and re-solved explicitly, so the worst case is the explicit
+  answer at twice the cost rather than a corrupted objective; the guard applies to `auto` only, and a
+  named `ode_method` is honoured exactly as before. Measured on ferx-testdata: the stiff cyclophosphamide model
+  converges in 0.7 s at OFV 3241.708 (NONMEM FOCEI: 3241.721) where `rk45` spends 827 s
+  without finishing one optimizer iteration, and a TMDD fit runs 372.4 s → 2.3 s at a
+  fixed iteration budget; nothing changes where nothing is stiff. Two new counters on the solver-statistics struct record what it did — segments escalated, escalations rejected — and the fit reports them through the `ode_solver` warning (#1080). The
+  threshold is a rate and therefore carries the model's time unit (calibrated on the hour-based PK
+  convention), so name a method explicitly on an unusual time scale. See
+  [ODE models → Letting ferx pick the stepper](https://ferx-nlme.github.io/ferx-core/model-file/ode-models.html#letting-ferx-pick-the-stepper-ode_method-auto).
+- **Fits now report what the ODE solver did (#1080).** A new `ode_solver` warning summarises one
+  post-fit prediction pass over every subject: steps that clamped at the minimum step size (a
+  stability-limited segment whose un-integrated tail is freeze-padded with the last state), segments
+  `ode_method = auto` escalated to a stiff method, and — the actionable one — escalations the guard
+  had to discard and re-solve explicitly, which means the stiffness probe was right that the segment
+  is stiff and wrong about which stiff method could integrate it. Until now no production path
+  reported solver statistics at all, so both the escalation and its rejection were invisible outside
+  the test suite. An escalation that simply worked is reported at `Info` severity; anything that did
+  not integrate cleanly is a `Warning`. The counters ride along in the warning's `details` payload.
+- **`ode_method = auto` can now change stepper *inside* a segment (#1080).** The stiffness probe reads
+  the Jacobian at each segment's entry state, which is the state a binding model looks least stiff at —
+  both factors of a `KON · C · R` term are zero when a dose lands. A depot-absorption binding model
+  reads `|Re λ|max = 10` on entry and `7.6e3` an hour later; integrated explicitly, that segment
+  exhausts `ode_max_steps` and comes back with a **median relative error of 143 %**, and it does so
+  with **zero** minimum-step clamps and a lower step-rejection rate than the accurate cases, so no
+  step-history counter can see it. `auto` now re-runs the probe every 25 accepted steps and swaps the
+  stepper in place when the verdict changes, keeping the state integrated so far: 143 % error in
+  10 000 steps becomes `7e-8` in 90, matching the method a user would have had to know to name in
+  advance. A mid-segment escalation is guarded exactly like a start-of-segment one (discarded and
+  re-solved explicitly if it comes back non-finite or clamps on the stiff stepper), the event-time
+  path switches on the same rule, and a benign segment stays bit-identical — it is never re-probed
+  at all below 25 accepted steps, and pays about one probe per 25 steps above that. New
+  `ode_auto_switch = false` restores one method per segment, chosen at its start; a named
+  `ode_method` is pinned as before. See
+  [ODE models → When a segment turns stiff halfway through](https://ferx-nlme.github.io/ferx-core/model-file/ode-models.html#mid-segment-switching).
+- **`ode_stiff_abort_after` bounds what a stalled ODE segment costs (#708, #1080).** A segment that is
+  stability-limited keeps stepping at the minimum step size until it exhausts `ode_max_steps`;
+  setting this key gives up after that many clamped steps instead. Off by default and deliberately
+  so — aborting freeze-pads the segment's remaining output times, and it does so on every
+  likelihood evaluation, which makes the objective discontinuous in θ; a fit whose `ode_solver`
+  warning reports aborts is a diagnosis ("these segments are stability-limited"), not an estimate.
+  It is a way to make a grinding fit say so quickly, not a substitute for choosing a stiff method.
+  On the time-to-event path an abort is reported as a failed segment rather than padded. See
+  [ODE models → Which regime am I in?](https://ferx-nlme.github.io/ferx-core/model-file/ode-models.html#which-regime-am-i-in).
 - **The `init(...)` scope rule is now published by the engine (#994).** `ODE_INIT_SCOPE_BUILTINS` and
   `ODE_INIT_REJECTED_BUILTINS` name the built-ins an `[odes] init(...)` expression may and may not
   reference, so a code generator can source the rule from the same binary it will parse with instead
@@ -30,8 +116,103 @@ section of the SDLC for the versioning policy).
   solver-injected built-ins (the same deliberate rule `[scaling]` follows), so only `TIME` is
   rejected in `[initial_conditions]`. Both surfaces are documented side by side under
   [ODE models → What an `init(...)` expression may reference](https://ferx-nlme.github.io/ferx-core/model-file/ode-models.html#init-scope).
+- **`center` / `scale` on `[covariate_nn]`** — per-input normalization, so the network
+  sees `(x - center) / scale`. Both default to the identity, leaving existing models
+  unchanged. Raw covariates are badly scaled for a neural net: `WT ≈ 70` saturates a
+  `tanh` layer at initialization, where its derivative is ~0 and the layer is nearly
+  blind to its input. On a two-covariate DCM, unnormalized inputs pushed weights to ~1e11
+  and left the residual error 15× too high; the same model with standardized inputs kept
+  every weight inside `[-1.3, 1.6]`. The constants are declared rather than estimated
+  from the data so that `predict()` applies the same transform the fit used — recomputing
+  statistics on new data would silently change the model — and so the model file remains
+  a complete description of the transform, as `(WT/70)^0.75` already is. The fit output
+  records the transform alongside the weights: `FitResult.neural_networks[k]` carries
+  `input_center` / `input_scale`, and the `neural_networks:` YAML block prints `center:` /
+  `scale:` when the model declares them — the reported weights were fitted against
+  `(x - center) / scale`, so a consumer that reconstructs the network needs both.
+
+- **`init` on `[covariate_nn]`** — one starting value per output, on the parameter's own
+  scale (`init = [1.0, 10.0]` for a CL of 1 L/h and a V of 10 L). **Set this on every
+  DCM.** Without it every output-layer bias starts at 0, so a `softplus` head starts
+  *every* PK parameter at `softplus(0) = 0.693` — a 0.69 L volume regardless of what the
+  parameter means — and the fit begins orders of magnitude away from the data. That is not
+  a slow start, it changes the answer: on a 60-subject busulfan-shaped deep compartment
+  model with identical data and seed, the bare head converged to `−2 log L` 2033.6 with the
+  clearance decline understated 43%, and **reported `converged: true`**; declaring
+  `init = [1.0, 10.0]` reached 1061.0 and recovered the decline. The value is realised
+  exactly rather than approximately — the output-layer weight block is zeroed alongside the
+  biases, so the network emits exactly `init` for every subject at iteration 0 whatever its
+  covariates, and those weights take gradient from the first step. Values must be reachable
+  by the output activation, or the model file is rejected rather than producing a `NaN`
+  weight.
+
+### Performance
+- **The `ode_method = auto` probe is ~10× cheaper on models that are not stiff (#1080).** Before
+  running the eigensolve, the probe now checks Gershgorin's bound on the Jacobian's spectrum: a bound
+  below the stiffness threshold *proves* no eigenvalue reaches it, so the segment can keep the
+  explicit stepper without the `O(n³)` decomposition. Ordinary absorption/elimination segments — the
+  overwhelming majority of what a fit integrates — exit there. Measured on a 3-state binding model:
+  the probe drops from 0.56 µs to 0.055 µs per segment, taking `auto`'s overhead over a pinned `rk45`
+  from 33 % to 3 % on a bare segment and from 19 % to 1.3 % on a realistic observation grid. No
+  decision changes — the bound only short-circuits the direction it can prove.
 
 ### Changed
+- **`optimizer = auto` no longer picks BOBYQA on high-dimensional problems (#1064).** BOBYQA interpolates
+  a quadratic over the whole parameter space, so its model grows quadratically in the parameter count;
+  above 64 free coordinates `auto` now resolves to `nlopt_lbfgs`, whose finite-difference cost is linear.
+  An explicit `optimizer = bobyqa` is still honoured, now with a warning about the size.
+- **The covariance step routes away from `MATRIX=R` on high-dimensional problems (#1064).** The default
+  `covariance_method = r` re-converges every subject's EBEs at each of `n(n+1)/2` stencil points — around
+  320,000 population objectives at 800 parameters. Above 100 free coordinates a *defaulted* covariance
+  method now uses the score cross-product (one pass) and says so; setting `covariance_method = r`
+  explicitly still forces it, with a warning naming the cost.
+- **Large theta level blocks are reported compactly (#1064).** A block of more than 20 free coefficients
+  leaves the main estimate table for a one-line summary (count, min, median, max) on the console and in
+  the text report. Every independently estimated coefficient is written to the fit YAML under
+  `theta_blocks:`; constrained dependent levels are derived values rather than estimates.
+- **ODE models now choose their own stepper by default (#978).** `ode_method` defaults to `auto`
+  instead of `rk45`, so a model that names no stepper is probed per integration segment and runs
+  a stiff method on the segments that need one. A model that *does* name a method is unaffected —
+  naming a stepper still pins it exactly, probe and all. Two consequences worth knowing:
+  predictions on a **stiff** model will change, because they are now produced by a different (and
+  better-conditioned) integrator — on the cyclophosphamide model this is the difference between a
+  fit that converges in 0.7 s and one that spends 827 s without finishing an optimizer iteration;
+  and a model that reports its resolved options will show `auto` where it used to show `rk45`.
+  Most non-stiff models keep the explicit stepper and their existing numbers, paying one Jacobian
+  and one eigensolve per segment — the work of a single Rosenbrock step attempt — for the check.
+  Two kinds do not, because the probe reads how *fast* a system's fastest mode is and not how
+  *separated* its modes are: a model on a minute clock (the threshold is a rate, calibrated for
+  hours) and a model whose modes are all equally fast (a transit chain written out in `[odes]`
+  with a large `ktr`). Those escalate without being stiff, which costs time rather than accuracy.
+  Pin `ode_method = rk45` to restore the previous behaviour exactly.
+- **The Rosenbrock steppers are promoted from experimental to beta (#978).** Making `auto` the
+  default puts them on the default path, so leaving them marked experimental would have meant
+  shipping experimental components to every ODE user. The promotion rests on this release's
+  validation: a NONMEM FOCEI anchor on the cyclophosphamide model (ferx 3241.708 vs NONMEM
+  3241.721) and prediction-equivalence tests across all five methods.
+- **The naproxen MBMA fixture is re-sourced to its primary publication, and is licensed CC BY-NC 4.0
+  rather than MIT (#1085).** `data/mbma_naproxen.csv` was derived from the supplementary material of
+  Bracis et al. (*CPT:PSP* 2026;15:e70158), which is CC BY-NC-**ND** — a licence that forbids
+  distributing an adapted copy at all. The dataset is not theirs: it originates with Boucher &
+  Bennetts, *Many Flavors of Model-Based Meta-Analysis: Part II*, *CPT:PSP* 2018;7:288–297
+  (CC BY-NC, no ND clause), whom that tutorial replicates. The fixture is now derived from the
+  primary source instead, which removes the no-derivatives problem and makes the attribution
+  correct. Everything in the repository stays MIT **except** `data/mbma_naproxen.csv`, which carries
+  CC BY-NC 4.0 — so commercial use of that file is not granted. The exception is recorded in the
+  root `LICENSE`, in `data/mbma_naproxen.LICENSE`, and in the data README, and `Cargo.toml` now
+  excludes the files — together with the slow test that reads them, which would otherwise panic on a
+  missing fixture — so the crate published to crates.io is uniformly MIT. The data itself is
+  unchanged but for one digit: the tutorial's precomputed `WP / WPSE` column stores 7 decimals, and
+  for one of 122 rows that intermediate rounds the sixth decimal down where the primary source's
+  `WP` and `WPSE` round it up. No estimate or OFV moves.
+- **Every line in `[structural_model]` is now checked (#811).** The block was scanned for the first
+  `pk NAME(...)` match with an unanchored pattern and every other line was discarded, so
+  `zpk one_cpt_iv(cl=CL, v=V)` parsed as a valid one-compartment IV model and a mistyped or stray
+  line vanished without a word. Each line must now be one of the four accepted forms —
+  `pk NAME(...)`, `ode(states=[...])`, `ode_template NAME(...)`, or an equation line — and anything
+  else, a second disposition line, or a mix of a compartment model with equation lines is a parse
+  error naming the offending line. A model file that relied on the old leniency was already being
+  read as something other than what it said.
 - **A single-endpoint `[error_model]` must now name its sigmas in declaration order (#1001).**
   A one-line `DV ~ ...` error model consumes its sigmas **positionally** from the `[parameters]`
   declaration order. The names written in the arguments were checked for existence and then
@@ -129,6 +310,56 @@ section of the SDLC for the versioning policy).
   with no diagnostic from NONMEM (`nonmem_anchor/dose_attr_double_use_{A,B}.ctl`).
 
 ### Fixed
+- **A closed-form model with IOV and a `[scaling] y = <expr>` readout evaluated the readout's
+  individual parameters at `kappa = 0` — predictions and the objective were silently wrong
+  (#1079).** The readout is the analogue of NONMEM's `$ERROR` and is evaluated per record, so an
+  individual parameter carrying a `kappa` — an additive baseline `BASE = TVBASE * exp(KAPPA_B)`, a
+  second analyte, a bounded transform — must take that record's occasion value. On the analytical
+  (`pk ...`) engine it took the parameter's *typical* value in every occasion instead: the
+  concentration handed to the readout carried the occasion κ, but every parameter the readout
+  itself read did not. On the reproduction in the issue the prediction is off by 12–20 %.
+  **Anyone who fitted such a model should re-run it** — the reported estimates, OFV, and
+  diagnostics were computed from the wrong predictions. The ODE engine was always correct, as was
+  the compartment-free (`[structural_model]`-less) path, and a `y = central / V` readout was
+  unaffected on every engine (the `conc × V` amount reconstruction and the readout's own `/ V`
+  cancel, with or without a κ on `V`) — which is why the natural readout to test could not show
+  it. The analytic sensitivities are re-seeded to match, so FOCE/FOCEI/SAEM gradients now
+  differentiate the corrected prediction.
+- **A third argument to a `[derived]` row aggregate was dropped in silence (#1092).**
+  `CMAX = max(IPRED, TIME > 0, 99)` computed `max(IPRED, TIME > 0)` — the aggregate form reads only
+  the value and the optional row filter, and never looked at what followed. It is now a parse error
+  that names `clamp(x, lo, hi)`, which is what the extra argument usually means. The same mistake
+  written inside a larger expression was already rejected.
+- **`simulate()` silently removed an arm's residual noise when its `weight = <expr>` column was blank
+  or zero (#1083).** `fit()` has rejected a non-positive residual magnitude since #1029, but no
+  `simulate()` entry point ran that check — each ran its own subset of the model-vs-data checks and
+  this one was in none of them. Because the modifier multiplies the *additive* loading, a zero weight
+  did not blow up: it removed that arm's residual variability entirely, and the simulated observation
+  came back equal to its own IPRED — finite, plottable, and wrong. The weighted-kappa check had the
+  same uneven coverage: present on `simulate_with_options*` but absent from `simulate` /
+  `simulate_with_seed` and from the adaptive-dosing path, where `κ/√W` with a zero `W` evaluates to
+  zero rather than to infinity, so the arm quietly lost its between-arm variability with no `NaN` to
+  trip over. Every simulate entry point now runs one shared list of checks; the two that return a
+  bare `Vec` and cannot signal enforce it as a panic, matching the existing IOV precondition.
+
+- **An estimated lagtime whose lagged dose arrival crossed a time-varying covariate change got a
+  silently wrong analytic gradient on ODE models (#1060).** The dose lands at a moving boundary
+  `t + ALAG`, and the walk injects the resulting jump as a saltation. The segment ending at that
+  arrival belongs to the dose record's covariate snapshot and the segment it opens to the next
+  record's, but the injection evaluated *both* sides on the dose record's — so whenever those two
+  records carried different covariates, the post-arrival velocity, its Jacobian and the cross term
+  all used the wrong parameters. Individual predictions were unaffected (the correction is
+  derivative-only) — but the FOCEI objective builds its `h` matrix from this same analytic
+  `∂f/∂η`, so the **reported OFV was wrong too**: on a crossing dataset the objective missed
+  NONMEM 7.6.0 by 7.52 units before the fix and by 5e-6 after it, with every EBE reproduced to
+  the printed digits (`nonmem_anchor/tvcov_lag_saltation.ctl`). Against finite differences of the
+  production predictor the gradient error reached 300× and the Hessian 23×. Fixed with it: the
+  matching defect at a finite-duration **infusion**'s lagged rate-on; concurrently active
+  forcings missing from the boundary velocities, which cost a further ~2% of the second order
+  once the two sides read different snapshots; and a value-only snapshot comparison that let an
+  IOV occasion boundary at the rate-on drop a κ jet, giving `∂²f/∂η_LAG∂κ` the wrong sign.
+  Constant-covariate fits, and any fit whose arrivals do not cross a covariate change, are
+  bit-identical to before.
 - **`TIME` in an `init(...)` expression is now rejected instead of silently reading zero (#994).**
   Both init surfaces — `[odes] init(state) = ...` and the analytical `[initial_conditions]
   init(cmt) = ...` — accepted a bare `TIME` (and `time`), while rejecting `Time`, `T`, `TAFD` and
@@ -279,8 +510,42 @@ section of the SDLC for the versioning policy).
   Sigma is blended with the same `γ_θ` on the same gate: theta and sigma come out of one joint
   NLopt solve, so damping only theta would leave sigma absorbing the misfit the damping just
   stopped theta from fixing.
+- **`[covariate_nn]` inputs were frozen at each subject's baseline value when the
+  covariate varied over time.** The network reads its inputs from the same per-event
+  covariate map every other consumer uses, but its input names are declared in the block
+  rather than in an expression, so nothing registered them as *referenced* covariates.
+  The fit pipeline then pruned their trajectories as irrelevant and the network saw one
+  constant value per subject for the entire record — silently, with no error or warning,
+  so a time-varying covariate simply had no effect on the fit. NN input names are now
+  registered alongside `[scaling]` / error-selector / `[initial_conditions]` covariates.
+  The same registration also closes a second silent failure: a `[covariate_nn]` input the
+  data does not carry — a typo, or `inputs = [TIME]` (a reserved column, not a covariate)
+  — used to be zero-filled, degenerating the network to a constant and producing a
+  plausible-looking fit that had learned nothing. Such an input is now rejected at fit
+  time with `E_MISSING_COVARIATE`, like any other missing covariate.
 
 ### Added
+- **`[structural_model]` accepts a compartment-free model — the `$PRED` equivalent (#811).** A
+  block with no `pk ...` / `ode(...)` line and at least one `NAME = <expr>` line declares its
+  prediction directly, with no compartments underneath: write named intermediates above a final
+  `y = <expr>`, exactly as in `[scaling]`, and reference thetas, etas, individual parameters,
+  `TIME`, and any data column. This is the shape of every model-based meta-analysis structural
+  model (a dose-response or time-course regression, not a PK system), which until now had to be
+  written as a dummy compartment driven by `d/dt(clock) = 1` with the real equation hidden in a
+  `[scaling]` readout. Such a model carries no doses and lays its individual parameters out like an
+  ODE model, so it is not limited to the handful of spare parameter slots an analytical readout
+  draws from. Blocks that presuppose compartments (`[odes]`, `[initial_conditions]`,
+  `[diffusion]`, `[scaling]`) are rejected by name rather than silently ignored. Such a model
+  takes the **analytic** `Dual2` gradient on both the inner and outer loops — with no state to
+  integrate the sensitivity is a chain rule over the individual-parameter program — including
+  under inter-occasion variability, where the equation is evaluated per occasion and the gradient
+  seeded on that occasion's `kappa` axes (what makes a between-treatment-arm variance component
+  estimable rather than frozen). Finite differences remain only past the axis caps, and are
+  reported as such. Anchored against the equivalent NONMEM `$PRED` fit: agreement to ~1e-4
+  relative on every estimate and standard error, and to 5 decimal places on the objective
+  (`nonmem_anchor/algebraic_emax.*`). See `examples/emax_timecourse.ferx`, and
+  `examples/mbma_naproxen.ferx` for the published model-based meta-analysis case study
+  (Boucher & Bennetts, *CPT:PSP* 2018;7:288–297) it reproduces to three significant figures.
 - **Sample-size-weighted IOV: `weight = <expr>` on a `kappa` declaration (#1031).** The arm-level
   random effect of every longitudinal MBMA — between-treatment-arm variability — is distributed
   `κ_ik ~ N(0, γ²/N_ik)`: a 400-subject arm's mean wanders a quarter as far as a 25-subject arm's.
@@ -516,6 +781,39 @@ section of the SDLC for the versioning policy).
   cost at all; wider subjects run up to ~1.5× more work in the outer walk for the padded
   lanes, and the 96-axis cap (past which a subject falls back to finite differences) is
   unchanged (#971).
+- **Deep compartment models with IOV no longer fall back to finite-difference η-gradients.**
+  `[covariate_nn]` weights are auto-generated thetas, so `model.n_theta` (declared +
+  weights) can never equal the compiled `[individual_parameters]` program's θ-axis count
+  (declared only — the program can only reference θ by name). The analytic IOV predicate
+  required them equal, so **every** subject of every DCM+IOV fit took the slow path: 60 of
+  60 on a busulfan-shaped model, correct but roughly twice the necessary runtime. That
+  clause is load-bearing for the outer gradient, which seeds θ axes, but not for the inner
+  η-gradient, whose walk documents that it uses no θ axes and reads only the η block. The
+  two predicates are now separate, and the inner loop's own gates — the ones that decide the
+  route and the ones that report it — read the η-only one, so FOCE/FOCEI, AGQ and the
+  reported `gradient_method_inner` all agree on the route taken. Measured on that fit:
+  336 s → **162 s** (2.07×), with `n_fd_subjects` 60 → 0 and the objective unchanged at
+  1060.99 after an identical 14 625 iterations. Models that already had the analytic path
+  keep it byte-for-byte — the η-only route is taken only where the full one was unavailable.
+
+- **Analytic weight gradients for `[covariate_nn]` models** — the fixed-η θ gradient that
+  SAEM's M-step, IMP and VI share used one perturbed model solve per θ, and on a deep
+  compartment model the network's weights *are* θ. It now takes the network's weights
+  analytically: the NN reaches the likelihood only through its output layer, so
+  `∂NLL/∂w = Σₖ (∂NLL/∂zₖ)·(∂zₖ/∂w)`, where the second factor is exact backpropagation and
+  only the `n_outputs` values of the first need the model solved. Those are obtained from
+  the output-layer biases, which move one output's pre-activation and nothing else. On the
+  reference 141-weight DCM (2 → 8 → 8 → 5) that is 10 solves per subject per draw instead
+  of 141. Because the few remaining differences are now shared by every weight, they are
+  taken *centrally* rather than forward, and agreement with a central finite difference of
+  the objective improves from ~2e-5 to ~1e-9 relative — the weight gradients stop being the
+  least accurate part of a DCM fit. Wall-clock on that model is ~1.4× (42 s → 30 s at a
+  fixed 1500 VI iterations, estimates unchanged); the finite-difference loop was roughly
+  30% of VI's runtime there, so the 14× cut in solves does not carry through to the total.
+  Models whose NN inputs vary within a subject keep the per-θ loop — a single output vector
+  no longer mediates every observation — and models with no `[covariate_nn]` block are
+  untouched.
+
 ### Added
 - **`vi_sigma_update`** — `σ` can now be replaced each iteration by the **exact** ELBO maximizer
   rather than stepped by Adam, the same treatment `Ω` already gets from

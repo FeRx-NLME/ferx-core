@@ -194,11 +194,12 @@ A one-compartment oral model with saturable (Michaelis-Menten) elimination:
 
 ## Solver Details
 
-ferx-core integrates with an adaptive Dormand-Prince RK45 solver by default:
+ferx-core chooses the stepper from the equations by default, and integrates non-stiff systems
+with an adaptive Dormand-Prince RK45:
 
 | Setting | Value |
 |---------|-------|
-| Method | Explicit Runge-Kutta 4(5) |
+| Method | `auto` — explicit Runge-Kutta 4(5), switching to a stiff method where the system calls for one ([below](#letting-ferx-pick-the-stepper-ode_method-auto)) |
 | Absolute tolerance | 1e-6 |
 | Relative tolerance | 1e-4 |
 | Max steps | 10,000 |
@@ -223,11 +224,12 @@ Set `ode_method` in `[fit_options]` to pick a different stepper:
 
 | `ode_method` | Order | Stages | Stiff? | Use for |
 |---|---|---|---|---|
-| `rk45` (default) | 5(4) | 7 | no | the general-purpose choice; fastest at default tolerances |
+| `rk45` | 5(4) | 7 | no | the general-purpose explicit choice; fastest at default tolerances, and what `auto` selects on a non-stiff system |
 | `vern7` (alias `verner7`) | 7(6) | 10 | no | **accuracy**-limited fits at tight tolerances (`ode_reltol` ≤ 1e-8) |
 | `rosenbrock23` (aliases `ros23`, `ode23s`) | 2(3) | 3 | yes | crude tolerances, rough right-hand sides |
 | `rodas4` | 4(3) | 6 | yes | the stiff workhorse at typical tolerances (1e-6 – 1e-9) |
 | `rodas5p` | 5(4) | 8 | yes | stiff systems at tight tolerances (`ode_reltol` ≤ 1e-9) |
+| `auto` (default) | — | — | decides | letting ferx pick between the two families per integration — see [below](#letting-ferx-pick-the-stepper-ode_method-auto) |
 
 Note the two different axes. The Rosenbrock methods buy **stability**; `vern7` buys **order**.
 Which one helps depends on what is capping your step size, and picking the wrong one costs
@@ -244,6 +246,176 @@ A stiff step is more expensive than an explicit one — it builds a finite-diffe
 (`n + 1` extra right-hand-side evaluations) and factorizes an `n × n` matrix once per step —
 so on a non-stiff one- to three-compartment model RK45 remains faster. Switch only when
 stiffness, not accuracy, is what is capping the step size.
+
+#### Letting ferx pick the stepper (`ode_method = auto`)
+
+`auto` is **the default**, so this section describes what happens to a model that says nothing
+about `ode_method` at all. It decides from the model rather than from the data. To opt out and
+pin a stepper, name one:
+
+```
+[fit_options]
+  ode_method = rk45      # or rodas4, rodas5p, rosenbrock23, vern7
+```
+
+Before each integration, ferx builds the Jacobian `J = ∂f/∂u` of your `[odes]` right-hand
+side at the state that integration is about to start from, and reads its eigenvalues. The
+discriminator is the fastest mode,
+
+$$\lambda_{\max} = \max_i |\operatorname{Re} \lambda_i(J)|, \qquad \tau_{\text{fast}} = 1/\lambda_{\max},$$
+
+and a system whose fastest mode decays faster than `1/30` of a time unit
+(`λ_max ≥ 30`) starts on a stiff method — `rodas4`, or `rodas5p` when `ode_reltol ≤ 1e-8`.
+Everything else stays on the explicit default. Naming any other `ode_method` still forces that
+method exactly; `auto` is the only value that decides anything.
+
+Three properties are worth knowing before you rely on it.
+
+**It probes per integration segment, not once per model.** ferx splits a subject's timeline at
+every dose, and the probe runs at the start of each of those segments. That is deliberate:
+in a binding model the fast eigenvalue is carried by a term like `KON · central`, which is
+identically **zero before any drug is present**. A model whose stiffness comes from binding is
+at its least stiff at the declared initial condition, so a single probe there would read it as
+non-stiff and never escalate. Probing per segment sees the post-dose Jacobian, where the
+stiffness actually lives. It also re-decides as the optimizer moves θ, so a fit that walks into
+a stiff region of parameter space switches with it.
+
+**A escalation that fails is caught and undone.** Every stiff method in ferx has been measured
+diverging on *some* model where the explicit family stayed clean, and those failures differ
+between methods — so `auto` treats a bad escalation as an expected outcome, not an impossible
+one. If the stiff solve comes back non-finite, **or** clamps at the minimum step (the
+freeze-pad failure described above — finite output, silently wrong), the result is discarded
+and the segment is re-solved explicitly. That bounds the worst case to "the explicit answer,
+at twice the cost" rather than a corrupted objective function. The guard applies only to
+`auto`: a named method is always honoured as asked. When it fires, the fit says so — see
+[where those counts show up](#which-regime-am-i-in), below.
+
+**Two things the probe cannot see**, both worth knowing now that it is the default. Neither
+makes an answer wrong — the guard bounds that — but both can make a fit slower than pinning a
+method by hand.
+
+*It is a rate, so it carries your model's time unit.* `λ_max ≥ 30` is calibrated for the
+hour-based convention typical of PK models, and the one the default tolerances assume. The same
+model written in days reads 24× smaller and may never trigger; written in minutes it reads 60×
+larger and can escalate wholesale — an oral model with `ka = 0.6/min` puts `λ_max` at 36 with
+nothing stiff in it anywhere.
+
+*It measures speed, not separation.* Stiffness is really a *ratio* — a fast mode alongside a slow
+one — and this reads only the fast end. A system whose modes are all equally fast is not stiff
+and RK45 handles it comfortably, but it reads the same as one that is: a transit chain written
+out in `[odes]` with `ktr = 50` has every eigenvalue at −50 and escalates, paying a Jacobian and
+a matrix factorization per step for nothing.
+
+Both were accepted rather than fixed, because the obvious alternatives are worse: a ratio
+`λ_max/λ_min` is undefined the moment any mode sits at zero, which is every compartment before
+its first dose, and scaling by the segment length makes a long segment on a benign model read
+stiff. On either of these, name a method.
+
+Three counters record what `auto` did. They sit on the solver-statistics struct alongside the
+step counts, and ride along in the `ode_solver` warning's `details` payload:
+
+- **auto-stiff segments** — integrations `auto` put on a stiff method, whether the probe
+  escalated at the segment's start or a mid-segment re-probe did. Always `0` under a named
+  method, so any non-zero value is `auto` at work.
+- **auto-switched segments** — of those, the ones whose stepper changed *part-way through the
+  segment* (see below). One per segment, however many times it changed its mind.
+- **auto-stiff rejections** — escalations whose result was thrown away and re-solved
+  explicitly. A subset of the first, and normally `0`. A non-zero count means the probe was
+  right that the system is stiff but the method it picked could not integrate it — try naming
+  `rodas5p` or `rosenbrock23` explicitly.
+
+Measured on the ferx-testdata ODE library at default tolerances. `λ_max` is the range across
+every integration segment of every subject; the wall-clock columns are FOCEI fits:
+
+| model | `λ_max` across segments | what `auto` starts | `rk45` | `auto` |
+|---|---|---|---|---|
+| cyclophosphamide `run2_final` | 35 – 234 | `rodas4` | 827 s for **one** capped iteration, OFV 3243.83, not converged | **0.7 s to convergence**, OFV 3241.708 |
+| TMDD SAD `cr`, 4-iteration budget | 3.7 – 126 | mixed, per segment | 372.4 s, OFV 5018.5 | **2.3 s**, OFV 4888.4 |
+| TMDD SAD `crib`, 4-iteration budget | 3.7 – 126 | mixed, per segment | 33.1 s, OFV 4885.0 | **2.2 s**, OFV 4893.0 |
+| busulfan, pembrolizumab | 0.1 – 4.6 | `rk45` (no escalation) | — | unchanged |
+
+Read the wall-clock column first and the OFV column second. On the two TMDD rows the solvers sit
+at different points on the optimizer's path after the same number of iterations, so the OFV
+difference there mixes accuracy with how far each got — `crib` lands slightly higher and `cr` 130
+units lower, and neither is a claim about accuracy. The cyclophosphamide row is the like-for-like
+one: `auto` reaches OFV 3241.708 against NONMEM FOCEI's 3241.721 on the same model and data, a
+difference of 0.013, while `rk45` spends 827 seconds without finishing a single iteration.
+
+The cyclophosphamide model is the clear win: it is stiff at every segment, so an explicit method
+is stability-limited throughout. The TMDD models are the more interesting case — stiff on the
+high-dose segments and not on the low-dose ones, which is exactly the situation a single
+per-model choice cannot serve and a per-segment probe can.
+
+**When to pin a method instead.** `auto` is the default because whether a system is stiff is a
+property of the equations, and a user who has to know the answer in advance in order to get a
+tractable fit is being asked the wrong question. Three situations still call for naming one:
+
+- **A model on an unusual time scale**, per the threshold caveat above.
+- **A control stream you intend to publish or archive.** A per-segment decision is reproducible
+  — same model, same data, same parameters, same choice — but it is not readable off the file,
+  and a reviewer cannot tell which stepper produced a number without running it. Naming the
+  method `auto` selected makes the run self-documenting, and costs nothing.
+- **Diagnosing a solver problem.** Pinning removes a variable.
+
+The cost when nothing is stiff is one Jacobian build and one eigensolve per integration segment
+— the same work a single Rosenbrock step attempt does, against a segment that takes tens to
+thousands of steps. Zero-length segments skip it entirely.
+
+#### When a segment turns stiff halfway through {#mid-segment-switching}
+
+The probe reads the Jacobian at a segment's **entry** state, and for a binding model that is the
+state it looks least stiff at: the fast mode is carried by a term like `KON · C · R`, so it does
+not exist until both drug and target are present. A depot-absorption binding model reads
+`|Re λ|max = 10` when the dose lands — comfortably non-stiff — and `7.6e3` an hour later, once
+drug has been absorbed and target has accumulated.
+
+That gap is not merely slow. Integrated explicitly at default tolerances, the same 24-hour
+segment exhausts `ode_max_steps` and comes back with a **median relative error of 143 %** in the
+central compartment, while `rodas4` integrates it to `7e-8` in 79 steps. And it does so
+*quietly*: the segment produces **zero** minimum-step clamps and a **lower** step-rejection rate
+than the accurate cases, so neither the min-step counter nor a rejection-rate detector can see
+it. Only re-reading the Jacobian can.
+
+So `auto` does exactly that. Every 25 accepted steps it re-runs the probe at the state the
+segment has reached and, if the verdict has changed, **swaps the stepper in place**: the segment
+keeps everything it has integrated so far and carries on with the other method, rather than
+restarting or re-solving. On the model above this takes `auto` from 143 % median error in 10 000
+steps to `7e-8` in 90 — matching the method a user would have had to know to name in advance.
+
+A switch onto a stiff method is guarded exactly like a start-of-segment escalation: if that half
+comes back non-finite or clamps at the minimum step, the segment is discarded and re-solved with
+the explicit stepper, so the worst case stays "the explicit answer, twice the cost". Only clamps
+taken *by the stiff stepper* count towards that test — a segment that clamped explicitly and was
+then rescued by the switch is kept, since discarding it would hand back exactly the explicit
+result the switch had just avoided. The
+event-time path (TTE draws, adaptive dosing) switches on the same rule, where it matters more —
+its output *is* the answer, so a badly integrated span moves the event time rather than one
+prediction.
+
+Being a threshold test, the re-probe is also a **discontinuity** in the objective as a function
+of θ: a segment whose `|Re λ|max` sits near the threshold when the probe fires can switch at θ
+and not at θ+h, and the two trajectories differ by far more than the solver tolerance. The
+start-of-segment probe and the escalation guard have the same property — re-probing adds up to
+eight more decision points per segment. Unlike `ode_stiff_abort_after` this is
+still on by default, because on a segment that actually turns stiff the alternative is not a
+slightly different trajectory but a 143 %-wrong one. If a covariance step returns implausible
+standard errors on a model whose `ode_solver` warning reports mid-segment switches, re-run it
+with `ode_auto_switch = false`, or with a named stiff method (pinned, and so free of both the
+probe and the guard), to see whether the switching is what moved them.
+
+A benign segment stays on its stepper: a segment shorter than 25 accepted steps is never
+re-probed at all, and a longer one pays roughly one probe per 25 steps — a Jacobian build and an
+eigensolve against 25 full steps — and keeps a trajectory bit-identical to the pinned explicit
+one, because the verdict never changes. To go back to one method per segment, chosen at its
+start:
+
+```
+[fit_options]
+  ode_auto_switch = false
+```
+
+Like every other part of `auto`, this is off under a named `ode_method` — a pinned method is
+honoured as asked.
 
 #### Which regime am I in?
 
@@ -263,6 +435,47 @@ limited. Run your model and look at the solver's step counts:
 - **Accuracy-limited.** Almost every step is accepted, nothing is min-step clamped, and
   tightening `ode_reltol` is what drives the step count up. A stiff method will not help; what
   helps is a *higher-order* method, or a looser tolerance if the model can afford it.
+
+**Where those counts show up.** After a fit, ferx runs one prediction pass over every subject
+at the final estimates and reports what the solver did there as an `ode_solver` warning
+(see [Warnings](../warnings.qmd#warning-codes)). It fires when a step clamped at the minimum
+step size, when an `auto` escalation had to be discarded and re-solved explicitly, or when
+`ode_stiff_abort_after` cut a segment short — and, at `Info` severity, when `auto` escalated
+and everything worked, so an escalation is never invisible. Either way it says how many
+segments changed stepper part-way through, because that changes how the step counts above it
+read: the steps before a switch were taken by a different method than the ones after it. Clamps taken inside an escalation
+the guard *discarded* are reported as part of that rejection rather than as freeze-padding:
+the trajectory they produced was thrown away and re-solved explicitly. A **rejected** escalation is the
+most actionable line ferx prints about the solver: the probe was right that the segment is
+stiff and wrong about which stiff method could integrate it, which is the case for naming
+`ode_method = rodas5p` (or `rosenbrock23`) by hand. The counters ride along in the warning's
+`details` payload.
+
+**Bounding what a stalled segment costs.** A stability-limited segment keeps stepping at the
+minimum step size until it exhausts `ode_max_steps` — thousands of steps that buy wall time
+rather than accuracy. `ode_stiff_abort_after = N` gives up on a segment after `N` of its steps
+have clamped:
+
+```
+[fit_options]
+  ode_stiff_abort_after = 25
+```
+
+It is off by default, and that is deliberate. Aborting freeze-pads the segment's remaining
+output times with the last state, so it trades a slow-but-eventually-integrated segment for a
+padded one — and it does so on **every likelihood evaluation**, not just the final prediction
+pass. That makes the objective *discontinuous* in θ: a segment that clamps `N-1` times at θ and
+`N` times at a perturbed θ comes back truncated at a different place, which is exactly the kind
+of step the outer optimizer's line search and the covariance step's finite-difference Hessian
+cannot cope with. So read a fit whose `ode_solver` warning reports a non-zero abort count as a
+*diagnosis* — "these segments are stability-limited" — and not as an estimate: fix the grinding
+with a stiff method, then turn the budget back off.
+
+(On the time-to-event path, where the integration returns an event time rather than a
+trajectory, an abort is reported as a failed segment instead of being padded — a padded
+crossing would be laundered into the likelihood as though it had been integrated. A step that
+clamps *and* brackets the crossing still returns its crossing; the budget bounds cost, it does
+not discard an answer the solver already found.)
 
 The Savic transit anchor (`tests/transit_nonmem_anchor.rs`) at NONMEM-equivalent accuracy
 (`ode_reltol = ode_abstol = 1e-9`) is a measured example of the second regime — 97 % of steps

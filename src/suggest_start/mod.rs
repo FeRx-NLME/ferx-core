@@ -377,6 +377,20 @@ fn run_nca(model: &CompiledModel, population: &Population) -> (PopNca, Vec<Strin
         );
         return (empty_pop_nca(), warnings);
     }
+    // A compartment-free model (#811) has no doses, no concentrations and no
+    // CL/V to estimate — non-compartmental analysis is undefined for it, and its
+    // `pk_model` is a placeholder the dispatch below would otherwise read as a
+    // real one-compartment IV model and "estimate" clearances from a
+    // dose-response or time-course curve.
+    if model.is_algebraic() {
+        warnings.push(
+            "inits_from_nca: compartment-free ($PRED-equivalent) model; NCA estimation skipped \
+             (there are no doses or concentrations to analyse, and the parameters are not PK \
+             parameters). Set starting estimates in [parameters], or use the nca_sweep method."
+                .into(),
+        );
+        return (empty_pop_nca(), warnings);
+    }
 
     let per_subject: Vec<SubjectNca> = match model.pk_model {
         PkModel::OneCptOral

@@ -197,6 +197,16 @@ This is the random-effect sibling of the residual
 [`weight = ...`](error-model.qmd#residual-weighting-weight-...) modifier, and the
 two share syntax and validation.
 
+### Simulating an arm that is not in the data
+
+The weight is a data column, and `fit()` always has one — the arm exists, and its
+size is a column. A simulated trial frequently does not: the point of simulating
+one is to propose arms that are *not* in the data. Arm sizes are therefore part of
+a `[simulation]` design and must be stated with `covariate NARM = [...]`; a design
+that omits one is refused rather than defaulted. See
+[Covariates in simulation](simulation.qmd#sim-covariates-required) for why neither
+silent default is safe.
+
 ## Model File Setup
 
 ```
@@ -350,7 +360,7 @@ That draw needs Ω~IOV~ in the parameters you hand to `simulate()`. The model's 
 - **Overlapping-occasion absorption tails use the current occasion's kappa** (built-in input-rate forcings only — `transit()`, `igd()`, `weibull()`, `first_order()`). Each integration segment evaluates its absorption shape parameters (e.g. `MTT`, `MAT`, `KA`) from that segment's occasion snapshot, so if a dose from an earlier occasion is *still absorbing* when a new occasion begins, its remaining input rate is computed with the **new** occasion's parameters. This is exact for pure IIV and whenever the inter-occasion interval exceeds the absorption window (the usual washout case); only genuinely overlapping-occasion absorption tails are approximated. Bioavailability `F`, lagtime, and `zero_order(dur)` windows are read per-dose from each dose's own occasion snapshot and stay occasion-correct even under overlap.
 - **Local-optimizer convergence from a far-off cold start.** Pure FOCEI (SLSQP via the auto-scaling above, or BFGS) reaches the minimum from a *sensible* start, but the IOV variance surface is ill-conditioned and weakly identified, so a *far-off* start (e.g. a residual-error init off by more than ~2×) can still stall. Set a realistic `sigma` init (a too-small one drives early omega inflation). The most robust workflow remains **SAEM**, or a `methods = [saem, focei]` chain (SAEM finds the basin, FOCEI polishes to a strictly better marginal optimum). See `tests/iov_convergence.rs`.
 - **Platform-dependent pure-SLSQP cold-start termination.** Even from the model's cold default start, a *pure* FOCEI/SLSQP fit on `warfarin_iov` reaches a different point on different architectures: macOS arm64 lands at ≈307.8 (the minimum), while Linux x86_64 deterministically stalls at ≈314.7, ~7 OFV units high (issue #160). The descent direction near the minimum comes from a re-converged central-FD gradient whose floating-point summation order differs across architectures, and SLSQP's stagnation guard latches at whichever flat-looking point it reaches first. This affects only an explicit `optimizer = slsqp`; the default **BOBYQA** (derivative-free) and the SAEM→FOCEI chain reach ≈307.8 on both platforms. Prefer them for IOV fits — reserve pure SLSQP for a warm start already in the basin.
-- **ODE Form C output (`[scaling] y = <expr>`) cannot reference `KAPPA_*` directly** under IOV — the readout is evaluated once per observation with a single eta, so a direct kappa reference would see `kappa = 0`. The parser rejects it with a clear error (issue #107); put the occasion dependence in the structural parameters (e.g. `CL`) and reference those in the readout instead. The PK dynamics themselves are always occasion-correct.
+- **Form C output (`[scaling] y = <expr>`) cannot reference `KAPPA_*` directly** under IOV — the `[scaling]` eta scope is between-subject only, so a bare kappa name would resolve to `kappa = 0`. The parser rejects it with a clear error (issue #107); put the occasion dependence in an `[individual_parameters]` entry (e.g. `BASE = TVBASE * exp(KAPPA_B)`, or a structural parameter such as `CL`) and reference *that* in the readout. Such a reference **is** occasion-correct: the readout is evaluated per observation with that observation's occasion κ, on both the ODE and the closed-form engine (fixed in #1079 for the closed-form engine, which previously evaluated the readout's individual parameters at `kappa = 0`). The PK dynamics themselves are always occasion-correct.
 - **Inner-loop and outer gradients come from the exact analytic sensitivity provider** within scope for IOV models — both the analytical 1-/2-/3-compartment models and user-`[odes]` IOV models with a compiled RHS, event-driven dosing, dose-only occasions, and a per-subject stacked axis count up to 96 (see [Inner loop](#inner-loop) and [Outer-loop gradient](#outer-loop-gradient-ebe-re-convergence-for-iov)). Steady-state IOV doses, `iiv_on_ruv`, FREM, an estimated lagtime, and above-cap axis counts still fall back to finite differences (per subject for the outer gradient).
 - The occasion column must contain non-negative integers. Non-integer or negative values are silently treated as missing (`OCC = 0`) and a single summary warning is emitted.
 - Per-kappa shrinkage is not yet computed (see Output note above).

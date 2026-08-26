@@ -1,0 +1,122 @@
+# Packed Parameter Space
+
+Every optimizer, the covariance step, SIR, and simulation-with-uncertainty
+work on a single flat `Vec<f64>` — the **packed parameter vector** — rather
+than on the model's natural $(\theta, \Omega, \Sigma)$ values. This page is
+the canonical description of that vector: its layout, its bounds, and the
+consequences of living in it.
+
+The packing and unpacking live in `estimation/parameterization.rs`
+(`pack_params` / `unpack_params`); they are exact inverses.
+
+## Why transform at all
+
+The natural parameters are constrained: $\theta$ and $\Sigma$ are (usually)
+positive, and $\Omega$ must be symmetric positive-definite. General-purpose
+optimizers want an unconstrained (or box-constrained) real vector. Packing
+maps the constrained parameters onto one such vector, so the constraints hold
+**by construction** on unpacking rather than by rejection:
+
+- a log-packed value can only unpack to a positive number;
+- $\Omega$ is stored by its lower Cholesky factor $L$ and rebuilt as
+  $\Omega = L L^\top$, which is positive semi-definite for any $L$, and
+  positive-definite whenever the diagonal is non-zero — which log-packing the
+  diagonal guarantees.
+
+## Layout
+
+The vector is built in fixed segment order. Later segments are appended, so
+adding IOV or mixture parameters never shifts an existing index.
+
+| Segment | Packed as | Notes |
+|---|---|---|
+| Theta | $\log \theta_i$ when `theta_lower` $\ge 0$; $\theta_i$ itself otherwise | See [Theta: log vs identity](#theta-log-vs-identity) |
+| Omega (BSV) | $\log L_{ii}$ on the diagonal, raw $L_{ij}$ off-diagonal | $\Omega = L L^\top$; a diagonal Ω packs only the diagonal entries |
+| Sigma | $\log \sigma_k$ | |
+| Omega (IOV) | same as BSV Omega | Only when the model has an `[iov]` block |
+| Mixture overrides | $\log$ of the class Cholesky diagonal / $\log$ class $\sigma$ | Only per-class Ω/Σ overrides are packed (#977) |
+
+For a two-eta diagonal model with two thetas and one sigma:
+
+$$
+x = \bigl[\log \theta_1,\ \log \theta_2,\ \log L_{11},\ \log L_{22},\ \log \sigma_1\bigr]
+$$
+
+and for a `block_omega` on the same two etas the Omega segment becomes
+$\bigl[\log L_{11},\ L_{21},\ \log L_{22}\bigr]$ — the off-diagonal is packed
+untransformed, because it is genuinely sign-free.
+
+Note the Omega diagonal is $\log L_{ii}$, i.e. the log of a **standard
+deviation**, not of the variance: $\omega^2_{ii} = \exp(2 x_{ii})$ for a
+diagonal Ω.
+
+### Theta: log vs identity {#theta-log-vs-identity}
+
+A theta is log-packed when its declared lower bound is $\ge 0$ — the usual
+case for CL, V, KA. A **negative** lower bound is the opt-in to identity
+packing, for parameters that must be able to be negative: covariate exponents
+(`(DOSE/100)^γ`, $\gamma \in [-3, 3]$), additive covariate effects, logit-scale
+parameters, and neural-network weights. Log-packing those would clamp them at
+`1e-10` and the optimizer could never reach the true value.
+
+`theta_lower = 0` still log-packs (the `max(1e-10)` floor handles the
+boundary), so declaring a lower bound of exactly zero does not silently change
+the parameterization.
+
+## Bounds
+
+`compute_bounds()` returns a box in packed space:
+
+| Segment | Lower | Upper |
+|---|---|---|
+| Theta (log-packed) | $\log$ `theta_lower` | $\log$ `theta_upper` |
+| Theta (identity-packed) | `theta_lower` | `theta_upper` |
+| Omega / Omega-IOV diagonal | $-6$ | $6$ ($L_{ii} \le e^6 \approx 403$, variance $\approx 1.6\times10^5$ — wide enough for FREM covariate omegas) |
+| Omega / Omega-IOV off-diagonal | $-10$ | $10$ |
+| Sigma | $-8$ ($\approx 3\times10^{-4}$) | $5$ ($\approx 148$) |
+
+**FIX'd parameters are pinned by setting `lower == upper == packed value`.**
+That is how every bound-respecting optimizer (NLopt SLSQP / L-BFGS / MMA, the
+built-in BFGS, the Gauss-Newton step clamp) holds them fixed — there is no
+separate free-subspace vector.
+
+## Where the packed space surfaces
+
+It is not purely internal; it shows up in several user-visible places.
+
+- **Covariance matrix.** `FitResult.covariance_matrix` — and the
+  `covariance_matrix:` block in the fit YAML — is the inverse FD Hessian of
+  the OFV **with respect to the packed vector**, not with respect to
+  $(\theta, \Omega, \Sigma)$. Its `parameters:` list names the packed
+  coordinates: `log_chol_<eta>` for an Omega diagonal, `chol_<i>_<j>` for an
+  off-diagonal. Reported standard errors on the natural scale are obtained
+  from it by the delta method. See [Output Files](../output.qmd).
+- **SIR.** The proposal, the resamples, and the retained
+  `sir_resamples_packed` pool are all in packed space; SIR's bound-collapse
+  diagnostics are phrased in it too. See [SIR](sir.qmd).
+- **Simulation with uncertainty.** Asymptotic draws are MVN **in packed
+  space**, which is what keeps every draw a valid parameter set. See
+  [Simulation](../api/simulation.qmd#uncertainty-distribution).
+- **Parameter scaling.** `parameter_scaling` / `scale_params` rescale packed
+  coordinates, which is why dividing by $|\log V|$ is a poor idea — see
+  [Fit Options](../model-file/fit-options.qmd).
+- **Multi-start.** `start_sigma` perturbs log-packed thetas multiplicatively
+  (`× exp(N(0, start_sigma))`) and identity-packed thetas additively.
+- **Gradients.** The analytic outer gradient is assembled directly in packed
+  coordinates (including the $\times L_{ii}$ chain factor on the log-Cholesky
+  diagonal), which is what analytic-vs-finite-difference parity tests compare.
+
+## Consequences worth knowing
+
+- A symmetric Gaussian step in packed space is **asymmetric** on the natural
+  scale: log-normal for theta, sigma, and the Omega Cholesky diagonal. Uphill
+  moves are wider than downhill ones, and no draw or step can produce a
+  non-positive value.
+- $\Omega$ never has to be checked for positive-definiteness after an
+  optimizer step or an uncertainty draw. It is PD by construction.
+- The number of packed Omega entries depends on the declared structure: a
+  diagonal Ω contributes $n_\eta$ entries, a full block contributes
+  $n_\eta(n_\eta+1)/2$. Structurally-zero off-diagonals are not parameters.
+- Two fits with the same OFV surface but different packing (e.g. a theta
+  re-declared with a negative lower bound) will follow different optimizer
+  trajectories, even though the optimum itself is unchanged.

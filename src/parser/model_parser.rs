@@ -112,6 +112,7 @@ fn has_bare_eta(expr: &Expression) -> bool {
         Expression::UnaryFn(name, _) if name == "exp" => false,
         Expression::BinOp(l, _, r) => has_bare_eta(l) || has_bare_eta(r),
         Expression::UnaryFn(_, arg) => has_bare_eta(arg),
+        Expression::ThetaGather { idx, .. } => has_bare_eta(idx),
         Expression::Power(b, e) => has_bare_eta(b) || has_bare_eta(e),
         _ => false,
     }
@@ -136,6 +137,7 @@ fn extract_eta_indices(expr: &Expression) -> Vec<usize> {
                 walk(r, out);
             }
             Expression::UnaryFn(_, a) => walk(a, out),
+            Expression::ThetaGather { idx, .. } => walk(idx, out),
             Expression::Power(b, e) => {
                 walk(b, out);
                 walk(e, out);
@@ -188,6 +190,7 @@ fn expr_references_any(expr: &Expression, names: &[String]) -> Option<String> {
             }
             Expression::BinOp(l, _, r) => walk(l, names).or_else(|| walk(r, names)),
             Expression::UnaryFn(_, a) => walk(a, names),
+            Expression::ThetaGather { idx, .. } => walk(idx, names),
             Expression::Power(b, e) => walk(b, names).or_else(|| walk(e, names)),
             Expression::Conditional(cond, t, els) => walk_cond(cond, names)
                 .or_else(|| walk(t, names))
@@ -244,6 +247,29 @@ fn analytic_readout_state_names(pk_model: PkModel) -> (Vec<String>, Vec<String>)
         forbidden.push("depot".into());
     }
     (allowed, forbidden)
+}
+
+/// Compartment names rejected in a compartment-free (`$PRED`-equivalent) readout
+/// (#811). The model has no amounts at all, so the whole canonical vocabulary is
+/// forbidden — including `central`, which every other readout scope allows.
+///
+/// Rejecting them by name (rather than letting them fall through to an undefined
+/// identifier, or worse a silent covariate lookup) is what turns "I forgot the
+/// `pk` line" into a diagnostic that says so.
+fn algebraic_forbidden_state_names() -> Vec<String> {
+    [
+        "central",
+        "depot",
+        "peripheral",
+        "periph",
+        "peripheral1",
+        "periph1",
+        "peripheral2",
+        "periph2",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect()
 }
 
 /// All variable names assigned anywhere in the statement tree, in
@@ -785,6 +811,7 @@ fn expr_uses_mixnum(expr: &Expression) -> bool {
             expr_uses_mixnum(a) || expr_uses_mixnum(b)
         }
         Expression::UnaryFn(_, a) => expr_uses_mixnum(a),
+        Expression::ThetaGather { idx, .. } => expr_uses_mixnum(idx),
         Expression::Conditional(c, t, e) => {
             cond_uses(c) || expr_uses_mixnum(t) || expr_uses_mixnum(e)
         }
@@ -1172,6 +1199,58 @@ fn collect_assigned_names_in_if(stmt: &Statement) -> std::collections::HashSet<S
     names
 }
 
+thread_local! {
+    /// θ indices referenced by name anywhere in the model being parsed.
+    ///
+    /// Populated by [`record_theta_reference`] at the single point in
+    /// `parse_atom` where an identifier resolves to a θ, so it covers every
+    /// block that parses expressions rather than only the ones a dedicated
+    /// walker remembers to visit.
+    static REFERENCED_THETAS: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// RAII guard for [`REFERENCED_THETAS`], restoring the previous list on drop so
+/// a nested parse (the absorption ODE-equivalent source is compiled inside the
+/// primary parse) cannot leak its references into the enclosing model.
+pub(crate) struct ThetaRefScope(Vec<usize>);
+
+impl ThetaRefScope {
+    fn enter() -> Self {
+        ThetaRefScope(REFERENCED_THETAS.with(|c| c.replace(Vec::new())))
+    }
+
+    /// θ indices referenced so far in this scope.
+    fn recorded() -> Vec<usize> {
+        REFERENCED_THETAS.with(|c| c.borrow().clone())
+    }
+}
+
+impl Drop for ThetaRefScope {
+    fn drop(&mut self) {
+        REFERENCED_THETAS.with(|c| *c.borrow_mut() = std::mem::take(&mut self.0));
+    }
+}
+
+fn record_theta_reference(idx: usize) {
+    REFERENCED_THETAS.with(|c| {
+        let mut v = c.borrow_mut();
+        if !v.contains(&idx) {
+            v.push(idx);
+        }
+    });
+}
+
+/// Warning token marking a model that reads a generated `[covariate_nn]` weight
+/// θ (`W_…` / `B_…`) directly from an expression.
+///
+/// Load-bearing, in the same way `W_ABSORPTION_TWIN_DECLINED` is: it lives in
+/// `CompiledModel::parse_warnings` rather than in a field of its own, because
+/// `CompiledModel` is not `#[non_exhaustive]` and a new public field would be a
+/// breaking change. `estimation::nn_theta_gradient::NnGradPlan::build` reads it
+/// back and declines.
+pub const NN_WEIGHT_DIRECT_REFERENCE_MARKER: &str = "W_NN_WEIGHT_DIRECT_REFERENCE";
+
 /// Parse a model file (.ferx) and return a CompiledModel.
 pub fn parse_model_file(path: &Path) -> Result<CompiledModel, String> {
     let content =
@@ -1223,6 +1302,21 @@ fn register_referenced_covariates(
 
 /// Parse a full model string including all optional blocks.
 pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
+    parse_full_model_bound(content, &LevelBindings::new())
+}
+
+/// [`parse_full_model`] with the observed levels of every `theta NAME ~
+/// NAME[COL, ...]` block supplied (#1064).
+///
+/// A level block's level count is a property of the *data*, which the first
+/// parse has not seen — so `api::levels::bind` reads the population, discovers
+/// the observed combinations, and calls this. Re-parsing (milliseconds) is what
+/// lets the compiled closures be built once, with the real θ count, instead of
+/// being rebuilt in place after the fact.
+pub fn parse_full_model_bound(
+    content: &str,
+    level_bindings: &LevelBindings,
+) -> Result<ParsedModel, String> {
     let mut extracted = extract_blocks(content)?;
     // `ode_template NAME(...)` desugaring (#322 Phase 0b): if [structural_model]
     // uses `ode_template`, rewrite it (and the [odes]/[scaling] blocks) into the
@@ -1230,6 +1324,14 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // the rest of this function — including ODE detection below — sees a normal
     // ODE model with no special-casing.
     apply_ode_template(&mut extracted)?;
+    // Compartment-free (`$PRED`-equivalent) structural model (#811): if
+    // [structural_model] declares its prediction directly instead of a `pk`/`ode`
+    // disposition, move the equation lines into [scaling] and leave a marker, so
+    // the ordinary Form C readout pipeline takes over from here. Runs after the
+    // `ode_template` rewrite (which this must never see) and before anything else
+    // reads the blocks. Also the single point where every [structural_model] line
+    // is classified, so an unrecognized one errors instead of being dropped.
+    apply_algebraic_structural(&mut extracted)?;
     // Prepare the absorption ODE-equivalent (#486; IG #790): the transit / IG closed forms
     // assume constant parameters over each absorption window, so they cannot serve a subject
     // whose parameters switch mid-profile (a `TIME`-dependent parameter or time-varying
@@ -1252,8 +1354,24 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     let param_lines = blocks
         .get("parameters")
         .ok_or("Missing [parameters] block")?;
-    let (thetas, omegas, block_omegas, sigmas, block_sigmas, eta_names_bsv, kappa_info) =
-        parse_parameters(param_lines)?;
+    let (
+        thetas,
+        omegas,
+        block_omegas,
+        sigmas,
+        block_sigmas,
+        eta_names_bsv,
+        kappa_info,
+        vector_theta_decls,
+        mut level_block_decls,
+        unbound_level_blocks,
+    ) = parse_parameters(param_lines, level_bindings)?;
+    // Install the θ level table for the remainder of this parse so a
+    // gather (`PLACEBO[IDX]`) resolves identically in every block that parses
+    // expressions. Dropped at the end of `parse_full_model`, restoring whatever
+    // an enclosing parse had installed (nested parses happen for the absorption
+    // ODE-equivalent source).
+    let _vector_theta_scope = VectorThetaScope::enter(vector_theta_decls.clone());
 
     // ── Optional [covariate_nn NAME] blocks (Phase A M1, behind `--features nn`)
     //
@@ -1359,6 +1477,10 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     }
     let indiv_lines: &[String] = indiv_lines_opt.map(Vec::as_slice).unwrap_or(&[]);
 
+    // Track which θ the model's expressions actually read, for the
+    // `[covariate_nn]` direct-reference check further down. Installed before any
+    // block parses so nothing is missed, and restored on drop.
+    let _theta_ref_scope = ThetaRefScope::enter();
     // theta_names is extended below after NN-weight and diffusion thetas are appended
     let mut theta_names: Vec<String> = thetas.iter().map(|t| t.name.clone()).collect();
     #[cfg(feature = "nn")]
@@ -1665,6 +1787,21 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         .iter()
         .any(|l| l.starts_with("ode(") || l.starts_with("ode "));
 
+    // Compartment-free (`$PRED`-equivalent) model (#811). `apply_algebraic_structural`
+    // has already moved the equations into the `scaling` block and left the marker,
+    // so from here this is an "analytical" model (`ode_spec == None`) whose readout
+    // happens to reference no compartment amount.
+    let is_algebraic = is_algebraic_structural(struct_lines);
+    // A compartment-free model has no closed form consuming PK slots, so — unlike an
+    // analytical `pk ...` model, whose readout parameters must fit the small spare
+    // region `allocate_readout_extra_slots` owns (at most `0..=PK_IDX_MTT` minus the
+    // structural slots) — it lays its individual parameters out the way an ODE model
+    // does: every parameter gets a slot from the full `MAX_PK_PARAMS` layout via
+    // `ode_param_slots`. That is what lets an MBMA-style model carry dozens of
+    // fixed effects (#811); `build_pk_param_fn` then takes its ODE branch for both,
+    // keyed on the empty `pk_param_map`.
+    let uses_ode_param_layout = is_ode || is_algebraic;
+
     // #486 — desugar a bare θ/η in a Form-C `y = expr` readout into a synthetic
     // individual parameter (`__ferx_ro_th{i} = THETA(i)` / `…eta{k} = ETA(k)`). The
     // readout (rewritten in `parse_scaling_block` below) then references that
@@ -1681,7 +1818,8 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // `pk_model` nor `pk_param_map` exists yet at this point — so the analytical append is
     // deferred to that allocator (still before `build_pk_param_fn`, the real constraint).
     let mut readout_synth_params: Vec<ReadoutSynthParam> = match blocks.get("scaling") {
-        Some(lines) => collect_readout_theta_eta_synth(lines, &theta_names, &eta_names)?,
+        Some(lines) => collect_readout_theta_eta_synth(lines, &theta_names, &eta_names)
+            .map_err(|e| retarget_scaling_diag(is_algebraic, e))?,
         None => Vec::new(),
     };
     // #486 — the `__ferx_ro_` (Form-C readout) and `__ferx_pktime_` (direct `pk(...=TIME)`
@@ -1716,7 +1854,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // the synthetics would overflow, keep the readout on the FD fallback (its prior
     // behaviour) instead of erroring, and note it.
     let mut readout_fd_fallback_note: Option<String> = None;
-    if is_ode {
+    if uses_ode_param_layout {
         if !readout_synth_params.is_empty() {
             let free = ode_free_slot_count(&indiv_var_names);
             if readout_synth_params.len() > free {
@@ -1755,7 +1893,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // reserving PK_IDX_F / PK_IDX_LAGTIME). The RHS evaluator, the parameter
     // writer (`build_pk_param_fn`), and `pk_indices` all share this map.
     // Empty for analytical models, which route through `pk_param_map` instead.
-    let ode_slot_map: Vec<usize> = if is_ode {
+    let ode_slot_map: Vec<usize> = if uses_ode_param_layout {
         ode_param_slots(&indiv_var_names)?
     } else {
         Vec::new()
@@ -1865,7 +2003,11 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         }
         // TTE-only models have no [structural_model] block — supply a no-op placeholder.
         // The PK model is never invoked for pure-TTE subjects (no Gaussian observations).
-        let (pk_model, pk_param_map) = if struct_lines.is_empty() {
+        // A compartment-free model (#811) takes the same placeholder for the same
+        // reason: its prediction comes from the readout alone, and no closed form is
+        // ever evaluated (`CompiledModel::is_algebraic` gates every dispatch that
+        // would otherwise read `pk_model`).
+        let (pk_model, pk_param_map) = if struct_lines.is_empty() || is_algebraic {
             (PkModel::OneCptIv, HashMap::new())
         } else {
             parse_structural_model(struct_lines)?
@@ -1931,9 +2073,13 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     };
 
     // Build pk_param_fn with the extended eta context (BSV + kappa names).
-    // `n_theta_base` is the user-declared θ count — indiv params can only
-    // reference these (NN-weight and diffusion θ are appended later and
-    // aren't visible to user expressions). `n_eta_extended` matches the
+    // `n_theta_base` is the user-declared θ count, which is what the partial
+    // builder differentiates against. NOTE it is *not* the set of θ a user
+    // expression can name: `theta_names` is extended with the generated
+    // `[covariate_nn]` weight names before `[individual_parameters]` parses, so
+    // `CL = TYPICAL_PK.CL * exp(ETA_CL) + B_TYPICAL_PK_2_1` resolves. That is
+    // what `NN_WEIGHT_DIRECT_REFERENCE_MARKER` exists to catch — see the check
+    // near the end of this function. `n_eta_extended` matches the
     // `eta` slice the closure consumes (BSV η + kappa). Both feed the
     // Tier 4a milestone-2 partial-derivative builder.
     let n_eta_extended_for_partials = eta_names.len();
@@ -2075,9 +2221,14 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         &structural_vars,
         &analytical_modeled_slots,
         pk_model,
-        is_ode,
+        // A compartment-free model lays its parameters out like an ODE model
+        // (every one gets a slot from the full layout upstream), so this
+        // allocator — which exists to squeeze readout parameters into an
+        // analytical model's few spare slots — has nothing to do for it (#811).
+        uses_ode_param_layout,
         &readout_synth_params,
-    )?;
+    )
+    .map_err(|e| retarget_scaling_diag(is_algebraic, e))?;
     let readout_extra_slots = readout_alloc.slots;
     // #486: the analytical half of the direct-θ/η readout desugaring. The ODE path appended
     // its synthetics far upstream (its slot map was already known there); the analytical path
@@ -2086,7 +2237,15 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // Dropping the rest keeps `readout_synth_params` in step with the slots that exist, so
     // `parse_scaling_block`'s rewrite only rewrites θ/η it can actually resolve; anything left
     // bare keeps `dual_evaluable = false` and the readout falls back to FD, as before #486.
-    if !is_ode {
+    //
+    // Keyed on `uses_ode_param_layout`, **not** `is_ode`: a compartment-free model (#811) has
+    // `is_ode == false` but appended its synthetics on the ODE-layout path upstream, and the
+    // allocator returns an empty `accepted_synths` for it. Testing `is_ode` here therefore
+    // overwrote `readout_synth_params` with that empty list, so `parse_scaling_block` never
+    // rewrote the bare θ/η — leaving `PushTheta`/`PushEta` in the bytecode,
+    // `dual_evaluable = false`, and the model silently on finite differences behind a warning
+    // that blamed the readout's shape.
+    if !uses_ode_param_layout {
         for s in &readout_alloc.accepted_synths {
             append_readout_synth_param(s, &mut indiv_var_names, &mut indiv_stmts);
         }
@@ -2094,6 +2253,14 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         if let Some(note) = readout_alloc.fd_note {
             readout_fd_fallback_note = Some(note);
         }
+    }
+
+    // #1064: answer the model-side half of the a level block identifiability
+    // question now that every `[individual_parameters]` statement has parsed —
+    // the binder reads it back off `theta_blocks` to resolve
+    // `LevelContrast::Auto`.
+    for decl in level_block_decls.iter_mut() {
+        decl.shares_scale_with_eta = block_shares_scale_with_eta(&indiv_stmts, &decl.name);
     }
 
     let (pk_param_fn, referenced_covariates, mut indiv_param_partials, indiv_param_program) =
@@ -2115,6 +2282,15 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // reads its copy from `indiv_param_partials` (ODE models route to the ODE
     // provider, so the partials copy is unused there — a single parse-time clone).
     indiv_param_partials.indiv_param_program = Some(indiv_param_program.clone());
+    // Keep additive parser metadata inside the existing opaque placeholder.
+    // Adding it directly to public `CompiledModel` would break every external
+    // struct literal.
+    indiv_param_partials.theta_blocks = ThetaBlocks {
+        decls: vector_theta_decls.clone(),
+        uses: VectorThetaScope::uses(),
+        level_blocks: level_block_decls.clone(),
+        unbound_level_blocks: unbound_level_blocks.clone(),
+    };
     if let Some(ode_spec) = ode_spec.as_mut() {
         ode_spec.indiv_param_program = Some(indiv_param_program);
     }
@@ -2611,10 +2787,6 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     };
 
     // ── Optional blocks ──
-    let simulation = blocks
-        .get("simulation")
-        .map(|lines| parse_simulation_block(lines))
-        .transpose()?;
     // Peek the `[covariates]` declarations (parsed for real further down, at the
     // block's own site) purely for name precedence: a declared `T` / `t` is a data
     // column, not the `[odes]` model-time alias, in `[scaling]` and in
@@ -2626,6 +2798,13 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         .and_then(|lines| parse_covariates_block(lines).ok())
         .map(|decls| decls.into_iter().map(|d| d.name).collect())
         .unwrap_or_default();
+    // Parsed after the peek (and still before `[adaptive_dosing]`, so the existing
+    // first-error ordering is unchanged) because `[simulation] covariate NAME = ...`
+    // is validated against the declared names (#1083).
+    let simulation = blocks
+        .get("simulation")
+        .map(|lines| parse_simulation_block(lines, &declared_covariate_names))
+        .transpose()?;
     // Declarative reactive-dosing controller (#391 S2). Parsed and validated here;
     // compiled to a controller and run by the adaptive simulate path in a later slice.
     let adaptive_dosing = blocks
@@ -2723,6 +2902,57 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         }
     }
 
+    // #1016: a `[covariate_nn]` weight θ read *directly* by a model expression.
+    //
+    // `theta_names` is extended with the generated `W_…` / `B_…` names before
+    // `[individual_parameters]` parses, so
+    //
+    //     CL = TYPICAL_PK.CL * exp(ETA_CL) + B_TYPICAL_PK_2_1
+    //
+    // is accepted. `estimation::nn_theta_gradient` assembles a whole weight
+    // block's θ-gradient from `n_outputs` finite differences of the output
+    // biases times the pre-activation Jacobian, which is exact *only* under the
+    // invariant that the weights reach the likelihood through the network output
+    // and nothing else. A direct reference breaks it: for a bias the extra term
+    // is folded into `dNLL/dz` and then smeared across the whole block by `jz`;
+    // for a non-bias weight it is dropped entirely, since only biases are
+    // perturbed. Either way SAEM/IMP/VI silently receive a wrong fixed-η θ
+    // gradient.
+    //
+    // Recorded rather than rejected, so the model still fits — it just takes the
+    // per-θ FD path, per the CLAUDE.md rule that a scope gap must route to FD
+    // through a support predicate instead of returning a wrong gradient.
+    #[cfg(feature = "nn")]
+    {
+        let referenced = ThetaRefScope::recorded();
+        let mut offending: Vec<String> = Vec::new();
+        for nn in &model.covariate_nns {
+            let n_w = nn.mapper.mlp().n_weights();
+            let range = nn.weights_offset..nn.weights_offset + n_w;
+            for &idx in &referenced {
+                if range.contains(&idx) {
+                    if let Some(name) = model.theta_names.get(idx) {
+                        offending.push(name.clone());
+                    }
+                }
+            }
+        }
+        if !offending.is_empty() {
+            offending.sort();
+            offending.dedup();
+            model.parse_warnings.push(format!(
+                "{NN_WEIGHT_DIRECT_REFERENCE_MARKER}: the model reads generated \
+                 [covariate_nn] weight parameter(s) {} directly. The analytic \
+                 NN theta-gradient shortcut assumes those weights reach the likelihood only \
+                 through the network output, so it is disabled for this model and every \
+                 theta falls back to finite differences (slower, still correct). Reference \
+                 the network's declared outputs (e.g. `TYPICAL_PK.CL`) instead if you did \
+                 not mean to read a weight.",
+                offending.join(", ")
+            ));
+        }
+    }
+
     // #993, the `[adaptive_dosing]` half. `observe` is compiled through the very
     // same `build_y_output_fn` as a Form-C `y` readout (`compile_observe`), so it
     // sees individual parameters — and it is the *controller's* signal, not a
@@ -2803,6 +3033,22 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     if let Some(ref mix) = model.mixture {
         let mix_covs = mix.logit_covariates.clone();
         register_referenced_covariates(&mut model.referenced_covariates, mix_covs);
+    }
+
+    // #1064: the columns a level block indexes on are read from the data
+    // by `api::levels::bind_theta_levels`, so they must be in the CSV read set
+    // for the same reason as the mixing covariates above — otherwise a
+    // `[covariates]`-declared model never loads `STUDY` and every row lands in
+    // one level. `TIME` is the record time, not a covariate.
+    {
+        let level_columns: Vec<String> = model
+            .theta_blocks()
+            .level_blocks()
+            .iter()
+            .flat_map(|d| d.columns().iter().cloned())
+            .filter(|c| !c.eq_ignore_ascii_case("TIME"))
+            .collect();
+        register_referenced_covariates(&mut model.referenced_covariates, level_columns);
     }
 
     // Build FremConfig from fit options when frem_predictions is present.
@@ -2924,14 +3170,20 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             &pk_indices_for_scaling,
             &state_names_for_scaling,
             is_ode_model,
+            is_algebraic,
             model.pk_model,
             &model.kappa_names,
             &readout_synth_params,
             volume_indiv_name_for_scaling.as_deref(),
             &declared_covariate_names,
             &mut scaling_parse_warnings,
-        )?;
-        model.parse_warnings.extend(scaling_parse_warnings);
+        )
+        .map_err(|e| retarget_scaling_diag(is_algebraic, e))?;
+        model.parse_warnings.extend(
+            scaling_parse_warnings
+                .into_iter()
+                .map(|w| retarget_scaling_diag(is_algebraic, w)),
+        );
 
         // #993, the `[scaling]` half of the dose-attribute double-use rejection
         // (`[odes]`'s lives in `build_ode_spec`). A readout that divides by `F` gets
@@ -2944,32 +3196,44 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         // The read-set is collected once and serves both engines: the rejection
         // below splits on the engine (ODE via `ode_slot_map`, analytical via the
         // `pk(...)` mapping — #1004), the `D{n}`/`R{n}` recording does not.
-        let mut scaling_reads: std::collections::HashSet<String> = std::collections::HashSet::new();
-        // Named intermediates are inlined first (#1030), so a readout that reaches
-        // `F` through one is caught by the double-use rejection exactly as if it had
-        // been written inline. Scanning the intermediate lines directly instead would
-        // over-report — an intermediate no entry uses is rejected upstream, but one
-        // used by `y` only would still be charged against `obs_scale`.
-        let scaling_intermediates_for_reads = scaling_intermediates(scaling_lines)?;
-        for line in scaling_lines {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
+        //
+        // A compartment-free model (#811) has no doses at all, so there is no dose
+        // attribute to apply twice and no coded `RATE` to record: the whole pass is
+        // inapplicable, and running it would misfire — its ODE-side arm routes by
+        // *name*, and a compartment-free model uses the ODE slot layout, so an
+        // ordinary parameter called `F` would be read as bioavailability.
+        let scaling_reads: std::collections::HashSet<String> = if is_algebraic {
+            std::collections::HashSet::new()
+        } else {
+            let mut scaling_reads: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            // Named intermediates are inlined first (#1030), so a readout that reaches
+            // `F` through one is caught by the double-use rejection exactly as if it had
+            // been written inline. Scanning the intermediate lines directly instead would
+            // over-report — an intermediate no entry uses is rejected upstream, but one
+            // used by `y` only would still be charged against `obs_scale`.
+            let scaling_intermediates_for_reads = scaling_intermediates(scaling_lines)?;
+            for line in scaling_lines {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let (key, value) = split_scaling_entry(trimmed)?;
+                let (base, _cmt) = parse_scaling_key(key)?;
+                if base != "y" && base != "obs_scale" {
+                    continue;
+                }
+                scaling_reads.extend(collect_indiv_param_reads(
+                    value,
+                    &theta_names_for_scaling,
+                    &eta_names_for_scaling,
+                    &indiv_var_names_for_scaling,
+                    &scaling_intermediates_for_reads,
+                    &format!("[scaling] {base}"),
+                )?);
             }
-            let (key, value) = split_scaling_entry(trimmed)?;
-            let (base, _cmt) = parse_scaling_key(key)?;
-            if base != "y" && base != "obs_scale" {
-                continue;
-            }
-            scaling_reads.extend(collect_indiv_param_reads(
-                value,
-                &theta_names_for_scaling,
-                &eta_names_for_scaling,
-                &indiv_var_names_for_scaling,
-                &scaling_intermediates_for_reads,
-                &format!("[scaling] {base}"),
-            )?);
-        }
+            scaling_reads
+        };
 
         // Both engines. The ODE side (#993) keys off `ode_slot_map` — name-based
         // routing is what makes a bare `F` a dose attribute there. The analytical
@@ -2979,7 +3243,9 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         // twice, which is the same silence #993 closed — measured at exactly `F`
         // on the prediction on both ferx and NONMEM's analytical ADVAN2 routine
         // (`S2 = V/F1` with `F1` defined; see the anchor test).
-        if is_ode_model {
+        if is_algebraic {
+            // No doses: nothing to double-apply (see the note on `scaling_reads`).
+        } else if is_ode_model {
             check_dose_attr_double_use(
                 &indiv_var_names_for_scaling,
                 &ode_slot_map,
@@ -3007,12 +3273,14 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         // data-aware check (#993 — see `mark_prediction_path_read`). The ODE RHS half
         // is recorded in `build_ode_spec`; this adds the readout half, which is the
         // *only* prediction path an analytical model has.
-        record_coded_rate_reads(
-            &mut model,
-            &indiv_var_names_for_scaling,
-            &ode_slot_map,
-            &scaling_reads,
-        );
+        if !is_algebraic {
+            record_coded_rate_reads(
+                &mut model,
+                &indiv_var_names_for_scaling,
+                &ode_slot_map,
+                &scaling_reads,
+            );
+        }
 
         // AD compatibility check (Phase 2.5):
         //
@@ -3032,16 +3300,24 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                 // Form C sensitivity program (issue #367); `None` for per-CMT.
                 ode_spec.readout_program = output_program;
             } else {
-                let (state_names, _forbidden) = analytic_readout_state_names(model.pk_model);
+                // A compartment-free model (#811) reconstructs no amounts, so its
+                // `state[]` layout is EMPTY — the marker `CompiledModel::is_algebraic`
+                // reads to tell the two apart, since both have `ode_spec == None`.
+                let state_names = if is_algebraic {
+                    Vec::new()
+                } else {
+                    analytic_readout_state_names(model.pk_model).0
+                };
                 // Warn (not silent) when the readout can't ride the analytic Dual2
                 // provider — it stays correct via FD of the readout-aware predictor,
                 // but the user loses the analytic-gradient speedup (#650). The
                 // dual-evaluable case (indiv-params/covariates only) is served
                 // analytically by the static superposition path.
-                let has_depot_slot = matches!(
-                    model.pk_model,
-                    PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral
-                );
+                let has_depot_slot = !is_algebraic
+                    && matches!(
+                        model.pk_model,
+                        PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral
+                    );
                 let dual_ok = model.analytical_init.is_empty()
                     && matches!(
                         (&new_readout, &output_program),
@@ -3049,15 +3325,22 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                             if p.is_dual_evaluable() && !(has_depot_slot && p.references_state(0))
                     );
                 if !dual_ok {
-                    model.parse_warnings.push(
-                        "[scaling] y: this analytic Form C readout (a per-CMT readout, a \
+                    // Same condition, two homes for the readout: `[scaling]` on a
+                    // compartment model, `[structural_model]` on a compartment-free
+                    // one (#811), where the equation is the model.
+                    let block = if is_algebraic {
+                        "[structural_model]"
+                    } else {
+                        "[scaling]"
+                    };
+                    model.parse_warnings.push(format!(
+                        "{block} y: this readout (a per-CMT readout, a \
                          direct THETA/ETA reference, a neural-network output, or a model with \
                          [initial_conditions]) falls back to finite-difference gradients. The \
                          prediction is exact; only the analytic-gradient speedup is lost. Use \
                          individual-parameter / covariate references in the readout to keep it \
                          analytic. See issue #650."
-                            .to_string(),
-                    );
+                    ));
                 }
                 model.analytic_readout = Some(crate::types::AnalyticReadout {
                     readout: new_readout,
@@ -3071,10 +3354,52 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         model.scaling = scaling;
     }
 
+    // A compartment-free model past the analytic axis cap (#811) routes to finite
+    // differences. That is correct, just slower — but silently slower: nothing else
+    // tells the user, and "my fit got sluggish when I added a covariate effect" is
+    // not a debuggable symptom. Name both numbers so the cause is visible, and say
+    // which direction to move.
+    if is_algebraic {
+        let axes = model.n_theta + model.n_eta + model.n_kappa;
+        let cap = crate::sens::algebraic::MAX_ALGEBRAIC_AXES;
+        if axes > cap {
+            model.parse_warnings.push(format!(
+                "[structural_model]: this model estimates {axes} parameters (theta + eta{}), \
+                 past the {cap}-axis cap of the analytic gradient path, so it falls back to \
+                 finite differences. The fit is correct, only slower. Reduce the number of \
+                 simultaneously estimated parameters, or FIX the ones you are not estimating. \
+                 See issue #811.",
+                if model.n_kappa > 0 { " + kappa" } else { "" },
+            ));
+        }
+    }
+
     // Covariate-selected [error_model] (issue #658): the selector's covariates
     // are required data columns, so register them like scaling covariates.
     if !selector_covariates.is_empty() {
         register_referenced_covariates(&mut model.referenced_covariates, selector_covariates);
+    }
+
+    // `[covariate_nn]` inputs are ordinary covariate reads — the mapper looks each name
+    // up in the same per-event `HashMap` every other covariate consumer uses — but they
+    // are named in the block rather than in an expression, so none of the statement
+    // walkers above ever sees them.
+    //
+    // Registering them here is what makes them *time-varying*. Without it the model does
+    // not count them as referenced, `Population::prune_irrelevant_tv_covariates` (called
+    // from `api::fit`) drops their trajectories as irrelevant, the subject stops
+    // reporting `has_tv_covariates()`, and the NN silently reads each subject's baseline
+    // value for the entire record — a covariate that changes over time is simply not
+    // seen, with no error and no warning. Same reasoning as the scaling / error-selector
+    // / initial-condition covariates above.
+    #[cfg(feature = "nn")]
+    {
+        let nn_inputs: Vec<String> = model
+            .covariate_nns
+            .iter()
+            .flat_map(|nn| nn.mapper.input_names().to_vec())
+            .collect();
+        register_referenced_covariates(&mut model.referenced_covariates, nn_inputs);
     }
 
     // ── [initial_conditions] block (issue #521) ──
@@ -3133,7 +3458,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         //   - Forms A/B post-multiply only the mean prediction; the EKF
         //     `p_obs` variance and the `r_obs` callback both run in the
         //     unscaled observation space. Correct EKF scaling needs to
-        //     thread the factor into both (p_obs scales by 1/K^2; the
+        //     thread the block into both (p_obs scales by 1/K^2; the
         //     residual_variance closure must see the scaled prediction).
         //     That's a wider change than Phase 1 covers — flag and defer.
         let sde_active = model.diffusion_theta_start.is_some();
@@ -3963,6 +4288,7 @@ fn expr_refs_dv(expr: &Expression) -> bool {
         Expression::Variable(name) if name.eq_ignore_ascii_case("DV") => true,
         Expression::BinOp(l, _, r) => expr_refs_dv(l) || expr_refs_dv(r),
         Expression::UnaryFn(_, arg) => expr_refs_dv(arg),
+        Expression::ThetaGather { idx, .. } => expr_refs_dv(idx),
         Expression::Power(b, e) => expr_refs_dv(b) || expr_refs_dv(e),
         Expression::Conditional(c, t, e) => cond_refs_dv(c) || expr_refs_dv(t) || expr_refs_dv(e),
         _ => false,
@@ -3990,6 +4316,7 @@ fn expr_refs_compartments(expr: &Expression, ode_state_names: &[String]) -> bool
             expr_refs_compartments(l, ode_state_names) || expr_refs_compartments(r, ode_state_names)
         }
         Expression::UnaryFn(_, arg) => expr_refs_compartments(arg, ode_state_names),
+        Expression::ThetaGather { idx, .. } => expr_refs_compartments(idx, ode_state_names),
         Expression::Power(b, e) => {
             expr_refs_compartments(b, ode_state_names) || expr_refs_compartments(e, ode_state_names)
         }
@@ -4308,6 +4635,26 @@ fn parse_derived_block(
                         return Err(format!(
                             "[derived] `{name}`: unexpected token(s) after `{fname_lc}(…)` — an \
                              aggregate over rows cannot be combined into a larger expression."
+                        ));
+                    }
+                    // Only `args[0]` (the value) and `args[1]` (the row filter) are
+                    // read below, so a third argument used to be dropped in silence —
+                    // the same class of bug as the trailing-token drop just above.
+                    // Reject it, and point at what the extra argument usually means:
+                    // a two-sided bound is `clamp`, not a three-argument `min`/`max`
+                    // (#1092). The `parse_atom` path already says this; say it here
+                    // too, since a statement-top-level `min`/`max` in `[derived]`
+                    // never reaches that path.
+                    if args.len() > 2 {
+                        let hint = if fname_lc == "tmax" {
+                            ""
+                        } else {
+                            " — a two-sided bound is `clamp(x, lo, hi)`"
+                        };
+                        return Err(format!(
+                            "[derived] `{name}`: `{fname_lc}(…)` takes at most two arguments (a \
+                             value and an optional row filter), but {} were found{hint}.",
+                            args.len()
                         ));
                     }
                     let agg_fn = match fname_lc.as_str() {
@@ -5893,13 +6240,21 @@ fn prescan_ode_hazards(extracted: &ExtractedBlocks) -> Result<Vec<(usize, String
 
 // ── [simulation] block parser ───────────────────────────────────────────────
 
-fn parse_simulation_block(lines: &[String]) -> Result<SimulationSpec, String> {
+fn parse_simulation_block(
+    lines: &[String],
+    declared_covariate_names: &[String],
+) -> Result<SimulationSpec, String> {
     let mut n_subjects = 10;
     let mut dose_amt = 100.0;
     let mut dose_cmt = 1;
     let mut obs_times = Vec::new();
     let mut seed = 42u64;
     let mut horizon: Option<f64> = None;
+    // `covariate NAME = ...` statements, in declaration order (#1083). Collected
+    // raw and validated after the loop, so the block's keys stay order-independent
+    // — a `covariate` line may precede the `n_subjects` its length is checked
+    // against.
+    let mut covariates: Vec<(String, Vec<f64>)> = Vec::new();
 
     for line in lines {
         let parts: Vec<&str> = line.splitn(2, '=').map(|s| s.trim()).collect();
@@ -5959,7 +6314,91 @@ fn parse_simulation_block(lines: &[String]) -> Result<SimulationSpec, String> {
                 }
                 horizon = Some(t);
             }
+            // Per-subject covariate values (#1083). A simulated trial's design
+            // *is* its covariates — an MBMA arm size (`weight = NARM`) or a
+            // reported within-arm SE (`weight = WPSE`) has no data row to be read
+            // from, because the arm being simulated does not exist yet. Either a
+            // scalar (broadcast to every subject) or one value per subject:
+            //
+            //   covariate NARM = 200               # every arm has 200 subjects
+            //   covariate NARM = [400, 200, 50]    # one per simulated subject
+            //
+            // Matched on the `covariate` *word*, not the prefix, so a future key
+            // that merely starts with it (`covariates = ...`) is still reported as
+            // unknown rather than read as a covariate named `s`.
+            other
+                if other == "covariate"
+                    || other
+                        .strip_prefix("covariate")
+                        .is_some_and(|r| r.starts_with(char::is_whitespace)) =>
+            {
+                let name = other["covariate".len()..].trim();
+                if name.is_empty() {
+                    return Err(
+                        "[simulation]: `covariate` needs a name: `covariate NAME = <value>` \
+                         (or `= [v1, v2, ...]`, one per subject)"
+                            .to_string(),
+                    );
+                }
+                if !is_plain_identifier(name) {
+                    return Err(format!(
+                        "[simulation]: `covariate {name}` is not a valid covariate name — \
+                         expected `covariate NAME = <value>`"
+                    ));
+                }
+                if covariates.iter().any(|(n, _)| n == name) {
+                    return Err(format!(
+                        "[simulation]: covariate `{name}` is declared twice"
+                    ));
+                }
+                // A `[covariates]` block is authoritative when present, exactly as
+                // it is for the data readers: simulating a name the model never
+                // declared is a typo, and one that silently reached `Subject`
+                // would be read by nothing.
+                if !declared_covariate_names.is_empty()
+                    && !declared_covariate_names.iter().any(|n| n == name)
+                {
+                    return Err(format!(
+                        "[simulation]: covariate `{name}` is not declared in [covariates] \
+                         (declared: {})",
+                        declared_covariate_names.join(", ")
+                    ));
+                }
+                let raw = parts[1].trim();
+                let values = if raw.starts_with('[') {
+                    parse_float_array(raw)
+                        .map_err(|e| format!("[simulation]: bad covariate `{name}`: {e}"))?
+                } else {
+                    vec![raw.parse::<f64>().map_err(|_| {
+                        format!("[simulation]: bad covariate `{name}`: {}", line.trim())
+                    })?]
+                };
+                if let Some(bad) = values.iter().find(|v| !v.is_finite()) {
+                    return Err(format!(
+                        "[simulation]: covariate `{name}` has a non-finite value ({bad})"
+                    ));
+                }
+                covariates.push((name.to_string(), values));
+            }
             other => return Err(format!("[simulation]: unknown key `{}`", other)),
+        }
+    }
+    // Length rule, now that `n_subjects` is known regardless of key order: a
+    // scalar broadcasts, a list must name every subject. A short list silently
+    // recycled (or zero-filled) would give the unnamed arms a weight of 0 — which
+    // divides an individual parameter by zero, or collapses a residual variance
+    // onto the floor, with no diagnostic (#1083).
+    for (name, values) in &mut covariates {
+        match values.len() {
+            1 => values.resize(n_subjects, values[0]),
+            n if n == n_subjects => {}
+            n => {
+                return Err(format!(
+                    "[simulation]: covariate `{name}` has {n} value(s) but there are \
+                     {n_subjects} subject(s) — give one value per subject, or a single \
+                     scalar to use for all of them"
+                ))
+            }
         }
     }
     // A synthetic design needs *something* to observe: continuous `times` for a
@@ -5980,7 +6419,7 @@ fn parse_simulation_block(lines: &[String]) -> Result<SimulationSpec, String> {
         obs_times,
         seed,
         horizon,
-        covariates: vec![],
+        covariates,
     })
 }
 
@@ -6812,12 +7251,24 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             }
             opts.ode_max_steps = v;
         }
+        // `0` / `off` / `none` disables the budget (back to `ode_max_steps`), so a
+        // settings list can turn it off without deleting the key.
+        "ode_stiff_abort_after" => {
+            opts.ode_stiff_abort_after = match value.to_lowercase().as_str() {
+                "off" | "none" | "false" => None,
+                _ => {
+                    let v = parse_usize("ode_stiff_abort_after")?;
+                    (v > 0).then(|| v.min(u32::MAX as usize) as u32)
+                }
+            };
+        }
+        "ode_auto_switch" => opts.ode_auto_switch = parse_bool("ode_auto_switch")?,
         "ode_method" => {
             opts.ode_method = crate::ode::OdeMethod::parse(value).ok_or_else(|| {
                 format!(
                     "fit option `ode_method`: unknown value `{value}` — expected one of \
-                     rk45, vern7, rosenbrock23, rodas4, rodas5p (aliases: dopri5, verner7, \
-                     ros23, ode23s, rodas5)"
+                     auto, rk45, vern7, rosenbrock23, rodas4, rodas5p (aliases: dopri5, \
+                     verner7, ros23, ode23s, rodas5)"
                 )
             })?;
         }
@@ -6847,6 +7298,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                     ));
                 }
             };
+            opts.covariance_method_set = true;
         }
         "fd_hessian_step" => opts.fd_hessian_step = parse_pos_finite("fd_hessian_step")?,
         "verbose" => opts.verbose = parse_bool("verbose")?,
@@ -7991,14 +8443,43 @@ pub(crate) fn build_y_output_fn(
     // expose those amounts with cross-compartment sensitivity. Empty for ODE
     // callers (any state name is integrated), so this is a no-op there. Point the
     // user at an ODE model, mirroring `[initial_conditions]`'s scope.
-    if let Some(name) = expr_references_any(&expr, forbidden_state_names) {
-        return Err(format!(
-            "{context}: compartment `{name}` is not available in an analytic Form C \
-             readout — the closed forms don't expose a peripheral (or transit/IV depot) \
-             amount with cross-compartment sensitivity. Reference the central compartment \
-             amount (`central`, plus the oral `depot` for first-order oral models), or use \
-             an ODE model with `ode(states=[...])` in [odes]. See issue #650."
-        ));
+    // A name the user **declared** as an individual parameter is not a compartment
+    // reference, whatever it is spelled: the expression parser resolved it to that
+    // parameter (state names take precedence in `defined` above, so anything that
+    // is a real state in scope still resolves to the state and stays rejected).
+    // Without this the rejection fires on a model that never mentioned a
+    // compartment — and its own advice, "define it in [individual_parameters]", is
+    // what the user already did. Compartment-free models (#811) forbid the whole
+    // canonical vocabulary, including `central`, so they meet this first; a
+    // closed-form model can hit it too, with `peripheral` and friends.
+    let declared: std::collections::HashSet<&str> =
+        indiv_var_names.iter().map(String::as_str).collect();
+    let forbidden_in_scope: Vec<String> = forbidden_state_names
+        .iter()
+        .filter(|n| !declared.contains(n.as_str()))
+        .cloned()
+        .collect();
+    if let Some(name) = expr_references_any(&expr, &forbidden_in_scope) {
+        // A compartment-free model (#811) has an EMPTY allowed set, so *every*
+        // compartment name is forbidden — for a different reason than a
+        // peripheral is on a closed form, and with different advice.
+        return Err(if state_names.is_empty() {
+            format!(
+                "{context}: `{name}` is a compartment amount, but this model declares \
+                 no compartments — it computes its prediction directly. Declare a \
+                 compartment model (`pk NAME(...)` or `ode(states=[...])`) if the \
+                 prediction depends on one, or define `{name}` in \
+                 [individual_parameters]. See issue #811."
+            )
+        } else {
+            format!(
+                "{context}: compartment `{name}` is not available in an analytic Form C \
+                 readout — the closed forms don't expose a peripheral (or transit/IV depot) \
+                 amount with cross-compartment sensitivity. Reference the central compartment \
+                 amount (`central`, plus the oral `depot` for first-order oral models), or use \
+                 an ODE model with `ode(states=[...])` in [odes]. See issue #650."
+            )
+        });
     }
     // #486: rewrite the bare θ/η references the parser desugared into synthetic
     // individual parameters (`__ferx_ro_*`, already appended to `indiv_var_names`)
@@ -8008,14 +8489,13 @@ pub(crate) fn build_y_output_fn(
     // un-desugared (none, in practice) keeps `dual_evaluable` false → FD fallback.
     rewrite_readout_synth(&mut expr, readout_synth);
 
-    // Reject KAPPA_* (IOV) references in a Form C ODE output expression: the
-    // readout is evaluated once per observation with a single eta, so under IOV
-    // it would silently see kappa = 0 (the per-occasion PK *dynamics* are still
-    // correct — they flow through the per-event parameters — but a direct kappa
-    // reference in the readout is not occasion-aware). The `[scaling]` eta scope
-    // is BSV-only, so a kappa name parses as an unresolved identifier here; match
-    // it by name. Fail fast rather than mislead. See issue #107; reference the
-    // occasion-dependent structural parameter (e.g. CL) instead.
+    // Reject KAPPA_* (IOV) references in a Form C output expression: the `[scaling]`
+    // eta scope is BSV-only, so a kappa name parses as an unresolved identifier and
+    // would silently evaluate to 0. Fail fast rather than mislead. See issue #107.
+    // This is a *direct* reference only — a kappa reaching the readout through an
+    // `[individual_parameters]` entry (`BASE = TVBASE * exp(KAPPA_B)`) is fine and
+    // occasion-correct: both engines evaluate the readout per observation with that
+    // observation's occasion parameters (#1079).
     if let Some(name) = expr_references_kappa(&expr, kappa_names) {
         return Err(format!(
             "{context}: Form C output expressions cannot reference the IOV \
@@ -8229,6 +8709,10 @@ fn parse_scaling_block(
     pk_indices: &[usize],
     state_names: &[String],
     is_ode: bool,
+    // Compartment-free (`$PRED`-equivalent) model (#811): the readout references no
+    // compartment amount, so it is compiled against an EMPTY state list. Mutually
+    // exclusive with `is_ode` — a compartment-free model has no `ode_spec`.
+    is_algebraic: bool,
     pk_model: PkModel,
     kappa_names: &[String],
     readout_synth: &[ReadoutSynthParam],
@@ -8366,6 +8850,12 @@ fn parse_scaling_block(
                 // oral `depot`) and forbid peripheral / no-closed-form amounts.
                 let (y_state_names, forbidden): (Vec<String>, Vec<String>) = if is_ode {
                     (state_names.to_vec(), Vec::new())
+                } else if is_algebraic {
+                    // Compartment-free (#811): no amounts exist, so the allowed set is
+                    // empty and every compartment-ish name is rejected with a pointer
+                    // at the compartment forms rather than falling through to a
+                    // silent covariate lookup / undefined-identifier error.
+                    (Vec::new(), algebraic_forbidden_state_names())
                 } else {
                     analytic_readout_state_names(pk_model)
                 };
@@ -9209,7 +9699,16 @@ fn parse_covariate_nn_block(name: &str, lines: &[String]) -> Result<CovariateNnS
     };
 
     // Reject any unknown keys so typos don't silently pass.
-    const KNOWN: &[&str] = &["inputs", "outputs", "layers", "activation", "output"];
+    const KNOWN: &[&str] = &[
+        "inputs",
+        "outputs",
+        "layers",
+        "activation",
+        "output",
+        "center",
+        "scale",
+        "init",
+    ];
     for k in fields.keys() {
         if !KNOWN.contains(&k.as_str()) {
             return Err(format!(
@@ -9221,6 +9720,7 @@ fn parse_covariate_nn_block(name: &str, lines: &[String]) -> Result<CovariateNnS
         }
     }
 
+    let n_inputs = inputs.len();
     let mut layer_sizes = Vec::with_capacity(hidden.len() + 2);
     layer_sizes.push(inputs.len());
     layer_sizes.extend(hidden.iter().copied());
@@ -9228,7 +9728,23 @@ fn parse_covariate_nn_block(name: &str, lines: &[String]) -> Result<CovariateNnS
 
     let mlp = MlpMapper::new(layer_sizes.clone(), hidden_activation, output_activation)
         .map_err(|e| format!("[covariate_nn {}] {}", name, e))?;
+    // Optional per-input normalisation: the network sees `(x - center) / scale`.
+    // Absent keys default to the identity, so an existing model is unchanged. Declared
+    // rather than estimated from the data — see `NamedMlpMapper::input_scale` for why.
+    let take_float_list = |field: &str, default: f64| -> Result<Vec<f64>, String> {
+        let Some(raw) = fields.get(field) else {
+            return Ok(vec![default; n_inputs]);
+        };
+        let parsed = parse_float_array(raw)
+            .map_err(|e| format!("[covariate_nn {}] `{}`: {}", name, field, e))?;
+        Ok(parsed)
+    };
+    let center = take_float_list("center", 0.0)?;
+    let scale = take_float_list("scale", 1.0)?;
+
     let mapper = NamedMlpMapper::new(mlp, inputs, outputs)
+        .map_err(|e| format!("[covariate_nn {}] {}", name, e))?
+        .with_normalization(center, scale)
         .map_err(|e| format!("[covariate_nn {}] {}", name, e))?;
 
     // Auto-generate weight-theta names + Glorot-style deterministic inits.
@@ -9275,6 +9791,59 @@ fn parse_covariate_nn_block(name: &str, lines: &[String]) -> Result<CovariateNnS
         }
     }
     debug_assert_eq!(theta_names.len(), mapper.n_weights());
+
+    // Optional `init = [v_1, …, v_K]`: one starting value per output, on the scale the
+    // network *emits* (a clearance in L/h, a volume in L) rather than on the weight
+    // scale.
+    //
+    // # Why this exists
+    //
+    // Without it every output-layer bias starts at 0, so a `softplus` head starts every
+    // PK parameter at `softplus(0) = 0.693` — whatever the parameter means. On a
+    // 60-subject busulfan-shaped DCM that put the initial volume at 0.69 L against a true
+    // 10 L, the objective started around 1e12, and variational inference descended into a
+    // basin 889 OFV worse than FOCEI's optimum *and reported convergence there*. Declaring
+    // `init = [1.0, 10.0]` moved the same cold-start fit to within 7 OFV of FOCEI. The
+    // network was never the problem; where it started was.
+    //
+    // The realisation is exact, not approximate: the output-layer weight block is zeroed
+    // alongside the bias, so `z_k = b_k` for every subject regardless of covariates and
+    // the initial output is exactly `v_k`. Setting the bias alone would leave
+    // `W_L · a_{L-1}` riding on top — a covariate-dependent offset of the same order as
+    // the value being set, which is most of the problem still unsolved. The zeroed block
+    // is not frozen: it receives gradient immediately (`∂z_k/∂W_L[k,j] = a_{L-1}[j]`, which
+    // is nonzero), and the hidden layers start receiving gradient one step later, once
+    // `W_L` has moved off zero.
+    if let Some(raw) = fields.get("init") {
+        let values =
+            parse_float_array(raw).map_err(|e| format!("[covariate_nn {}] `init`: {}", name, e))?;
+        let n_out = mapper.mlp().n_outputs();
+        if values.len() != n_out {
+            return Err(format!(
+                "[covariate_nn {}] `init` must have one entry per output: expected {}, got {}",
+                name,
+                n_out,
+                values.len()
+            ));
+        }
+        for i in mapper.mlp().output_weight_range() {
+            theta_inits[i] = 0.0;
+        }
+        for (k, &v) in values.iter().enumerate() {
+            let z = output_activation.invert(v).ok_or_else(|| {
+                format!(
+                    "[covariate_nn {}] `init` entry {} is {}, which the `{}` output \
+                     activation cannot produce — it needs {}",
+                    name,
+                    k + 1,
+                    v,
+                    output_activation.as_str(),
+                    output_activation.range_description()
+                )
+            })?;
+            theta_inits[mapper.mlp().output_bias_index(k)] = z;
+        }
+    }
 
     Ok(CovariateNnSpec {
         name: name.to_string(),
@@ -11416,6 +11985,13 @@ const CONTINUATION_BLOCKS: &[&str] = &[
     "odes",
     "scaling",
     "derived",
+    // A compartment-free `[structural_model]` (#811) holds the same `NAME = <expr>`
+    // entries `[scaling]` does — including the long bounded-endpoint readouts
+    // continuation lines exist for. Folding here (rather than after the #811
+    // desugaring moves them) keeps one definition of "a line" for every block.
+    // The disposition forms are single-line directives, none of which can begin
+    // with an operator, so this is inert for them.
+    "structural_model",
     // `init(NAME) = <expr>` — line-oriented like `[scaling]`, and every line must
     // start with `init(`, so a line opening with an operator is unreachable here too.
     "initial_conditions",
@@ -11948,6 +12524,7 @@ pub(crate) fn mixing_logp_grad(
 
 fn parse_parameters(
     lines: &[String],
+    level_bindings: &LevelBindings,
 ) -> Result<
     (
         Vec<ThetaSpec>,
@@ -11955,12 +12532,18 @@ fn parse_parameters(
         Vec<BlockOmegaSpec>,
         Vec<SigmaSpec>,
         Vec<BlockSigmaSpec>,
-        Vec<String>,  // BSV eta names in declaration order
-        ParsedKappas, // IOV kappa specs (diagonal and/or block)
+        Vec<String>,          // BSV eta names in declaration order
+        ParsedKappas,         // IOV kappa specs (diagonal and/or block)
+        Vec<VectorThetaDecl>, // #1064 θ level blocks
+        Vec<LevelBlockDecl>,  // #1064 a level block declarations
+        Vec<String>,          // #1064 level blocks still awaiting data
     ),
     String,
 > {
     let mut thetas = Vec::new();
+    let mut vector_thetas: Vec<VectorThetaDecl> = Vec::new();
+    let mut level_block_decls: Vec<LevelBlockDecl> = Vec::new();
+    let mut unbound_level_blocks: Vec<String> = Vec::new();
     let mut omegas = Vec::new();
     let mut block_omegas = Vec::new();
     let mut sigmas = Vec::new();
@@ -11993,8 +12576,23 @@ fn parse_parameters(
     // the bounds sub-group, defaulting to 1e9 when absent.
     // Group 5 captures FIX inside the parens; group 6 captures FIX outside.
     // `fixed` is true when either group is present.
+    //
+    // #1064: an optional `[...]` after the name declares a **vector** of θ
+    // levels sharing one `(init, lower, upper[, FIX])` triple — the
+    // "replicate all these values for me" form. The brackets carry either
+    //
+    //   theta PLACEBO[800](...)          — a literal level count
+    //   theta PLACEBO[STUDY, TIME](...)  — one level per *observed* combination
+    //                                      of those data columns, discovered
+    //                                      when the data is bound
+    //
+    // disambiguated by whether the contents are all digits (a data column name
+    // cannot be). Brackets mean the same thing here as at every reference site
+    // — `PL = PLACEBO[PLA_IDX]` — so declaration and use match. What makes
+    // hundreds of levels tractable is that the reference is a *gather*, which
+    // occupies a single `PkParams` slot rather than one per level.
     let theta_re = Regex::new(
-        r"(?i)theta\s+(\w+)\s*\(\s*([0-9eE.+-]+)\s*(?:,\s*([0-9eE.+-]+)(?:\s*,\s*([0-9eE.+-]+))?)?\s*(?:,?\s*(FIX)\b)?\s*\)(?:\s+(FIX)\b)?",
+        r"(?i)theta\s+(\w+)\s*(?:\[([^\]]*)\])?\s*\(\s*([0-9eE.+-]+)\s*(?:,\s*([0-9eE.+-]+)(?:\s*,\s*([0-9eE.+-]+))?)?\s*(?:,?\s*(FIX)\b)?\s*\)(?:\s+(FIX)\b)?",
     )
     .unwrap();
 
@@ -12070,25 +12668,93 @@ fn parse_parameters(
         let mut weight_consumed = false;
         if let Some(caps) = theta_re.captures(line) {
             let name = caps[1].to_string();
-            let init: f64 = caps[2]
+            let block = match caps.get(2) {
+                Some(m) => Some(parse_theta_block_spec(&name, m.as_str())?),
+                None => None,
+            };
+            let init: f64 = caps[3]
                 .parse()
                 .map_err(|_| format!("Bad theta init: {}", line))?;
             let lower: f64 = caps
-                .get(3)
+                .get(4)
                 .map(|m| m.as_str().parse().unwrap_or(1e-9))
                 .unwrap_or(1e-9);
             let upper: f64 = caps
-                .get(4)
+                .get(5)
                 .map(|m| m.as_str().parse().unwrap_or(1e9))
                 .unwrap_or(1e9);
-            let fixed = caps.get(5).is_some() || caps.get(6).is_some();
-            thetas.push(ThetaSpec {
-                name,
-                init,
-                lower,
-                upper,
-                fixed,
-            });
+            let fixed = caps.get(6).is_some() || caps.get(7).is_some();
+            match block {
+                None => thetas.push(ThetaSpec {
+                    name,
+                    init,
+                    lower,
+                    upper,
+                    fixed,
+                }),
+                Some(spec) => {
+                    if vector_thetas.iter().any(|d| d.name == name) {
+                        return Err(format!("theta {name}: declared twice"));
+                    }
+                    let base = thetas.len();
+                    // Resolve the block to its level → θ map plus the θ names to
+                    // append, then append once. Both bracket forms end here; the
+                    // difference is only where the level list came from.
+                    let (levels, theta_names, index_covariate) = match spec {
+                        ThetaBlockSpec::Count(n_levels) => (
+                            (0..n_levels)
+                                .map(|i| LevelRule::Free((base + i) as u32))
+                                .collect(),
+                            (1..=n_levels).map(|l| format!("{name}[{l}]")).collect(),
+                            None,
+                        ),
+                        ThetaBlockSpec::Columns { columns, contrast } => {
+                            let index_covariate = level_index_column(&name);
+                            let binding = level_bindings.get(&name);
+                            if let Some(binding) = binding {
+                                validate_constrained_level_init(
+                                    &name, binding, init, lower, upper,
+                                )?;
+                            }
+                            let (levels, theta_names) = match binding {
+                                // First parse: the level count is a property of
+                                // the data. Declare the block with no levels so
+                                // expressions still resolve, and record it as
+                                // unbound — `fit()` refuses a model that reaches
+                                // it in this state rather than predicting NaN.
+                                None => {
+                                    unbound_level_blocks.push(name.clone());
+                                    (Vec::new(), Vec::new())
+                                }
+                                Some(b) => build_level_rules(&name, b, base)?,
+                            };
+                            level_block_decls.push(LevelBlockDecl {
+                                name: name.clone(),
+                                columns,
+                                contrast: binding.map(|b| b.contrast).unwrap_or(contrast),
+                                labels: binding.map(|b| b.labels.clone()).unwrap_or_default(),
+                                shares_scale_with_eta: false,
+                                index_covariate: index_covariate.clone(),
+                            });
+                            (levels, theta_names, Some(index_covariate))
+                        }
+                    };
+                    for theta_name in theta_names {
+                        thetas.push(ThetaSpec {
+                            name: theta_name,
+                            init,
+                            lower,
+                            upper,
+                            fixed,
+                        });
+                    }
+                    vector_thetas.push(VectorThetaDecl {
+                        name: name.clone(),
+                        spec: std::sync::Arc::new(GatherSpec { name, levels }),
+                        index_covariate,
+                    });
+                }
+            }
         } else if let Some(caps) = block_omega_re.captures(line) {
             let names: Vec<String> = caps[1].split(',').map(|s| s.trim().to_string()).collect();
             let values: Vec<f64> = caps[2]
@@ -12335,7 +13001,207 @@ fn parse_parameters(
             names_ordered: kappa_names_ordered,
             weights: kappa_weights_ordered,
         },
+        vector_thetas,
+        level_block_decls,
+        unbound_level_blocks,
     ))
+}
+
+/// What the brackets of a `theta NAME[...]` declaration carry (#1064).
+#[derive(Debug, Clone, PartialEq)]
+enum ThetaBlockSpec {
+    /// `theta PLACEBO[800]` — a literal level count, known at parse time.
+    Count(usize),
+    /// `theta PLACEBO[STUDY, TIME]` — one level per *observed* combination of
+    /// these data columns, so the count is known only once data is bound.
+    Columns {
+        columns: Vec<String>,
+        contrast: LevelContrast,
+    },
+}
+
+/// Parse the contents of a `theta NAME[...]` bracket.
+///
+/// All-digits is a level count; anything else is a list of data columns with an
+/// optional trailing `contrast = ...`. The two cannot collide: a data column
+/// name is `\w+` and a bare integer is not a usable column reference anywhere
+/// else in the DSL.
+fn parse_theta_block_spec(name: &str, contents: &str) -> Result<ThetaBlockSpec, String> {
+    let contents = contents.trim();
+    if contents.is_empty() {
+        return Err(format!(
+            "theta {name}[]: the brackets must carry a level count (`{name}[800]`) or the \
+             data columns whose observed combinations define the levels \
+             (`{name}[STUDY, TIME]`)"
+        ));
+    }
+    if contents.chars().all(|c| c.is_ascii_digit()) {
+        let n: usize = contents
+            .parse()
+            .map_err(|_| format!("theta {name}[{contents}]: bad level count"))?;
+        if n == 0 {
+            return Err(format!(
+                "theta {name}[0]: a θ vector must declare at least one level"
+            ));
+        }
+        return Ok(ThetaBlockSpec::Count(n));
+    }
+
+    let mut columns: Vec<String> = Vec::new();
+    let mut contrast = LevelContrast::Auto;
+    let mut saw_contrast = false;
+    for arg in contents.split(',') {
+        let arg = arg.trim();
+        if arg.is_empty() {
+            continue;
+        }
+        if let Some((key, value)) = arg.split_once('=') {
+            if !key.trim().eq_ignore_ascii_case("contrast") {
+                return Err(format!(
+                    "theta {name}[...]: unknown modifier `{}`. Only `contrast = ...` is \
+                     accepted alongside the column list.",
+                    key.trim()
+                ));
+            }
+            if saw_contrast {
+                return Err(format!("theta {name}: `contrast` given twice"));
+            }
+            contrast = LevelContrast::parse(value)?;
+            saw_contrast = true;
+        } else {
+            if saw_contrast {
+                return Err(format!(
+                    "theta {name}: level columns must come before `contrast = ...`"
+                ));
+            }
+            if !arg.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                return Err(format!(
+                    "theta {name}[...]: `{arg}` is not a valid data column name"
+                ));
+            }
+            columns.push(arg.to_string());
+        }
+    }
+    if columns.is_empty() {
+        return Err(format!(
+            "theta {name}[...]: name at least one data column, e.g. `{name}[STUDY, TIME]`"
+        ));
+    }
+    Ok(ThetaBlockSpec::Columns { columns, contrast })
+}
+
+/// Name of the synthesized per-record index column a level block
+/// gathers on. Double-underscore prefixed so it cannot collide with a real data
+/// column.
+pub(crate) fn level_index_column(block: &str) -> String {
+    format!("__level_{block}")
+}
+
+/// Turn a discovered [`LevelBinding`] into the block's level → θ map plus the
+/// θ names to append, starting at absolute index `base`.
+///
+/// Contiguity matters: each contrast group's free θ occupy one range, so the
+/// dependent level of a sum-to-zero group is a single `NegSum` over that range
+/// rather than a scatter.
+fn build_level_rules(
+    name: &str,
+    binding: &LevelBinding,
+    base: usize,
+) -> Result<(Vec<LevelRule>, Vec<String>), String> {
+    if binding.labels.len() != binding.groups.len() {
+        return Err(format!(
+            "theta {name}: level binding has {} labels but {} group ids",
+            binding.labels.len(),
+            binding.groups.len()
+        ));
+    }
+    if binding.labels.is_empty() {
+        return Err(format!(
+            "theta {name}[...]: no observed level combinations in the data"
+        ));
+    }
+    // Levels of a group must be contiguous for the `NegSum` range to be one
+    // slice; the binder orders them that way, and this is the tripwire if a
+    // future caller does not.
+    let mut seen: Vec<usize> = Vec::new();
+    for (i, g) in binding.groups.iter().enumerate() {
+        if seen.last() != Some(g) {
+            if seen.contains(g) {
+                return Err(format!(
+                    "theta {name}[...]: contrast group {g} is not contiguous \
+                     (level {i} re-opens it)"
+                ));
+            }
+            seen.push(*g);
+        }
+    }
+
+    let n = binding.labels.len();
+    let mut rules = vec![LevelRule::Free(0); n];
+    let mut names = Vec::new();
+    let mut next = base;
+    let mut start = 0usize;
+    while start < n {
+        let group = binding.groups[start];
+        let mut end = start;
+        while end < n && binding.groups[end] == group {
+            end += 1;
+        }
+        // The level within the group that carries no θ of its own, if any.
+        let dependent = match binding.contrast {
+            LevelContrast::Ref => Some(start),
+            LevelContrast::Unconstrained => None,
+            // `Auto` is resolved by the binder before it gets here; a residual
+            // `Auto` stands for the sum-to-zero it defaults to.
+            _ => Some(end - 1),
+        };
+        let free_base = next;
+        for level in start..end {
+            if Some(level) == dependent {
+                continue;
+            }
+            rules[level] = LevelRule::Free(next as u32);
+            names.push(format!("{name}[{}]", binding.labels[level]));
+            next += 1;
+        }
+        if let Some(d) = dependent {
+            rules[d] = match binding.contrast {
+                // A reference level is pinned at 0 — an empty `NegSum` range.
+                LevelContrast::Ref => LevelRule::NegSum(free_base as u32, free_base as u32),
+                _ => LevelRule::NegSum(free_base as u32, next as u32),
+            };
+        }
+        start = end;
+    }
+    Ok((rules, names))
+}
+
+/// Constrained blocks eliminate one level rather than optimizing it. Their
+/// shared initializer can therefore represent every level only at zero; the
+/// declared bounds apply to the remaining free contrast coefficients, not to
+/// the derived negative sum.
+fn validate_constrained_level_init(
+    name: &str,
+    binding: &LevelBinding,
+    init: f64,
+    lower: f64,
+    upper: f64,
+) -> Result<(), String> {
+    if binding.contrast == LevelContrast::Unconstrained {
+        return Ok(());
+    }
+    if init != 0.0 {
+        return Err(format!(
+            "theta {name}[...]: contrast = {} requires init = 0 because the derived level cannot receive a broadcast nonzero initializer",
+            binding.contrast.label()
+        ));
+    }
+    if lower > 0.0 || upper < 0.0 {
+        return Err(format!(
+            "theta {name}[...]: constrained level bounds must include 0 (got {lower}..{upper})"
+        ));
+    }
+    Ok(())
 }
 
 // --- Build omega matrix from diagonal + block specs ---
@@ -12634,9 +13500,279 @@ fn parse_role_pairs(params_str: &str, ctx: &str) -> Result<HashMap<String, Strin
     Ok(map)
 }
 
+// ── [structural_model] line classification + the compartment-free form (#811) ──
+
+/// Canonical marker line [`apply_algebraic_structural`] leaves in
+/// `[structural_model]` once it has moved a compartment-free model's equation
+/// lines into the `[scaling]` block.
+///
+/// Carries the reserved `__ferx_` prefix, and a user line that spelled it would
+/// be rejected by [`classify_structural_line`] (it is neither a disposition
+/// directive nor an assignment) before the desugaring ever runs — so the marker
+/// cannot be forged from a model file.
+const ALGEBRAIC_MARKER: &str = "__ferx_algebraic()";
+
+/// One `[structural_model]` line, classified. The block accepts exactly these
+/// four forms; anything else is a parse error (#811).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StructuralLineKind {
+    /// `pk NAME(role=VAR, …)` — analytical closed form.
+    Pk,
+    /// `ode(states=[…])` / `ode(obs_cmt=…, states=[…])` — hand-written ODE system.
+    Ode,
+    /// `ode_template NAME(…)` — rewritten to `ode(...)` by [`apply_ode_template`]
+    /// before this classifier ever sees a block, so it is unreachable in practice;
+    /// kept as a form so the "expected one of" diagnostic can name it.
+    OdeTemplate,
+    /// `NAME = <expr>` / `y[CMT=N] = <expr>` — a compartment-free readout entry or
+    /// one of its named intermediates.
+    Assignment,
+}
+
+/// Which kind of structural model a `[structural_model]` block declares (#811).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StructuralBlockKind {
+    /// A compartment system: `pk ...`, `ode(...)`, or `ode_template ...`.
+    Disposition,
+    /// Compartment-free (`$PRED`-equivalent): assignment lines only, culminating
+    /// in a `y = <expr>` readout.
+    Algebraic,
+}
+
+/// Classify one (trimmed, comment-stripped) `[structural_model]` line.
+///
+/// Every line in the block is classified, and an unrecognized one is an error.
+/// Before #811 the block was scanned for the *first* `pk ...(...)` match with an
+/// unanchored regex and every other line was silently discarded, so `zpk
+/// one_cpt_iv(cl=CL, v=V)` parsed as `one_cpt_iv` and a stray or mistyped line
+/// vanished without a word — the same silent-wrong-model class as #261 / #1028 /
+/// #1040.
+fn classify_structural_line(line: &str) -> Result<StructuralLineKind, String> {
+    if starts_with_keyword(line, 0, "pk") {
+        return Ok(StructuralLineKind::Pk);
+    }
+    // Checked before `ode`: `starts_with_keyword` requires a non-identifier
+    // terminator, so `ode_template …` does not match the `ode` keyword anyway,
+    // but ordering it first keeps that independent of the helper's contract.
+    if starts_with_keyword(line, 0, "ode_template") {
+        return Ok(StructuralLineKind::OdeTemplate);
+    }
+    if starts_with_keyword(line, 0, "ode") {
+        return Ok(StructuralLineKind::Ode);
+    }
+    // The compartment-free form: `NAME = <expr>`, optionally subscripted
+    // `y[CMT=N] = <expr>`. The key must be a bare identifier — `parse_scaling_key`
+    // accepts any text before `[`, so without this check a mistyped disposition
+    // (`zpk one_cpt_iv(cl=CL, v=V)`) would classify as an assignment whose "name"
+    // is `zpk one_cpt_iv(cl`.
+    if let Ok((key, _value)) = split_scaling_entry(line) {
+        if let Ok((base, _cmt)) = parse_scaling_key(key) {
+            if is_plain_identifier(base) {
+                return Ok(StructuralLineKind::Assignment);
+            }
+        }
+    }
+    Err(format!(
+        "[structural_model]: unrecognized line `{line}`. Expected one of: \
+         `pk NAME(role=VAR, ...)` (analytical closed form), `ode(states=[...])` \
+         (ODE system), `ode_template NAME(...)`, or — for a compartment-free \
+         ($PRED-equivalent) model — an assignment `y = <expr>`, optionally \
+         preceded by named intermediates."
+    ))
+}
+
+/// Classify a whole `[structural_model]` block, rejecting mixed and duplicate
+/// declarations (#811).
+fn classify_structural_block(lines: &[String]) -> Result<StructuralBlockKind, String> {
+    let mut disposition: Option<(StructuralLineKind, String)> = None;
+    let mut assignment: Option<String> = None;
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match classify_structural_line(line)? {
+            StructuralLineKind::Assignment => {
+                if assignment.is_none() {
+                    assignment = Some(line.to_string());
+                }
+            }
+            kind => {
+                // A second disposition line used to be silently ignored (the `pk`
+                // scan returned on the first match).
+                if let Some((_, first)) = &disposition {
+                    return Err(format!(
+                        "[structural_model]: more than one structural model declared \
+                         (`{first}` and `{line}`); declare exactly one."
+                    ));
+                }
+                disposition = Some((kind, line.to_string()));
+            }
+        }
+    }
+    match (disposition, assignment) {
+        (Some(_), Some(assign)) => Err(format!(
+            "[structural_model]: cannot mix a compartment model with the \
+             compartment-free assignment form (at `{assign}`). A readout on top of a \
+             compartment model belongs in `[scaling]` as `y = <expr>`; a \
+             compartment-free ($PRED-equivalent) model declares no `pk`/`ode` line \
+             at all."
+        )),
+        (Some(_), None) => Ok(StructuralBlockKind::Disposition),
+        (None, Some(_)) => Ok(StructuralBlockKind::Algebraic),
+        (None, None) => Err("[structural_model] is empty. Declare a compartment model \
+             (`pk NAME(...)` or `ode(states=[...])`), or a compartment-free \
+             ($PRED-equivalent) model as `y = <expr>`."
+            .to_string()),
+    }
+}
+
+/// Desugar a compartment-free (`$PRED`-equivalent) `[structural_model]` into the
+/// existing Form C readout pipeline (#811).
+///
+/// A `[structural_model]` block with no `pk` / `ode` / `ode_template` line and at
+/// least one `NAME = <expr>` line declares its prediction directly, with no
+/// compartments underneath. Rather than compile a third kind of readout, the
+/// equation lines are **moved into the `[scaling]` block** and the structural
+/// block is replaced by [`ALGEBRAIC_MARKER`] — after which the ordinary Form C
+/// path (`parse_scaling_block`, its named intermediates, the θ/η desugaring, the
+/// covariate registration and the `OdeOutputProgram` sensitivity program) takes
+/// over with no special-casing, exactly as [`apply_ode_template`] does for
+/// `ode_template`.
+///
+/// Runs after [`apply_ode_template`], so an `ode_template` line has already been
+/// rewritten to `ode(...)` and is never seen here. A no-op for every compartment
+/// model.
+fn apply_algebraic_structural(extracted: &mut ExtractedBlocks) -> Result<(), String> {
+    let Some(struct_lines) = extracted.unnamed.get("structural_model") else {
+        // TTE-only / endpoint-only models legitimately have no block at all; the
+        // "missing block" diagnostic belongs to `parse_full_model`, which knows
+        // whether an endpoint block makes the omission valid.
+        return Ok(());
+    };
+    if classify_structural_block(struct_lines)? != StructuralBlockKind::Algebraic {
+        return Ok(());
+    }
+
+    // A compartment-free model's `[structural_model]` *is* its readout, so a
+    // `[scaling]` block alongside it would either declare a second `y` or divide
+    // the readout's own output by `obs_scale` — the double-apply #650 already
+    // rejects for an analytical Form C readout. Reject the whole combination
+    // rather than a key at a time: with no compartments there is nothing left for
+    // `[scaling]` to mean.
+    if extracted.unnamed.contains_key("scaling") {
+        return Err(
+            "[scaling] cannot be combined with a compartment-free ($PRED-equivalent) \
+             [structural_model] — that block already declares the prediction. Fold \
+             the scaling into the `y = <expr>` equation (e.g. `y = ... / 1000`)."
+                .to_string(),
+        );
+    }
+
+    // Blocks that only mean something with compartments underneath. Rejected here,
+    // by name, rather than left to be silently ignored downstream (`[odes]` is only
+    // read when `[structural_model]` declares `ode(...)`, so an algebraic model
+    // carrying one would drop it without a word).
+    for (block, why) in [
+        (
+            "odes",
+            "declares derivatives of compartment states, and this model has none",
+        ),
+        (
+            "initial_conditions",
+            "seeds compartment amounts, and this model has none",
+        ),
+        (
+            "diffusion",
+            "adds SDE diffusion to compartment states, and this model has none",
+        ),
+    ] {
+        if extracted.unnamed.contains_key(block) {
+            return Err(format!(
+                "[{block}] cannot be combined with a compartment-free \
+                 ($PRED-equivalent) [structural_model]: it {why}. Declare an ODE \
+                 disposition (`ode(states=[...])`) if the model needs compartments."
+            ));
+        }
+    }
+
+    // The block must actually produce a prediction, and `obs_scale` — the divisive
+    // Form A/B key — has nothing to divide here. Checked up front so the user sees
+    // the real problem instead of the Form C pipeline's downstream wording ("a
+    // binding no entry reads" for a block of intermediates with no `y`).
+    let mut has_y = false;
+    for line in struct_lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (key, _value) = split_scaling_entry(trimmed)?;
+        let (base, _cmt) = parse_scaling_key(key)?;
+        match base {
+            "y" => has_y = true,
+            "obs_scale" => {
+                return Err(
+                    "[structural_model]: `obs_scale` has no meaning in a compartment-free \
+                     ($PRED-equivalent) model — there is no built-in prediction to divide. \
+                     Fold the conversion into the equation (e.g. `y = ... / 1000`)."
+                        .to_string(),
+                )
+            }
+            _ => {}
+        }
+    }
+    if !has_y {
+        return Err(
+            "[structural_model]: a compartment-free ($PRED-equivalent) model must end in \
+             a `y = <expr>` entry — that is the prediction. Lines above it are named \
+             intermediates it can reference."
+                .to_string(),
+        );
+    }
+
+    let equations = extracted
+        .unnamed
+        .remove("structural_model")
+        .expect("guarded by the `get` above");
+    extracted.unnamed.insert(
+        "structural_model".to_string(),
+        vec![ALGEBRAIC_MARKER.to_string()],
+    );
+    extracted.unnamed.insert("scaling".to_string(), equations);
+    Ok(())
+}
+
+/// Whether `[structural_model]` carries the compartment-free marker this parse
+/// left behind (#811). The block is `[ALGEBRAIC_MARKER]` exactly, so an
+/// `is_ode`-style `starts_with` scan is enough.
+fn is_algebraic_structural(struct_lines: &[String]) -> bool {
+    struct_lines.iter().any(|l| l == ALGEBRAIC_MARKER)
+}
+
+/// Retarget a `[scaling]`-worded diagnostic at `[structural_model]` (#811).
+///
+/// A compartment-free model's equations are written in `[structural_model]` but
+/// parsed by the `[scaling]` Form C pipeline after [`apply_algebraic_structural`]
+/// moves them, so every message that pipeline emits names a block the user never
+/// wrote. Rewriting the prefix at the few call sites that feed it those lines
+/// keeps one copy of ~40 diagnostics instead of threading a block label through
+/// all of them. A no-op for a real `[scaling]` block.
+fn retarget_scaling_diag(is_algebraic: bool, msg: String) -> String {
+    if is_algebraic {
+        msg.replace("[scaling]", "[structural_model]")
+    } else {
+        msg
+    }
+}
+
 fn parse_structural_model(lines: &[String]) -> Result<(PkModel, HashMap<String, String>), String> {
     // pk model_name(param=VAR, param=VAR, ...)
-    let pk_re = Regex::new(r"pk\s+(\w+)\(([^)]+)\)").unwrap();
+    //
+    // Anchored at the start of the (already trimmed) line: an unanchored match
+    // read `zpk one_cpt_iv(cl=CL, v=V)` as a valid `one_cpt_iv` declaration
+    // (#811). `classify_structural_line` rejects such a line before this runs;
+    // the anchor keeps the two from drifting.
+    let pk_re = Regex::new(r"^pk\s+(\w+)\(([^)]+)\)\s*$").unwrap();
 
     for line in lines {
         if let Some(caps) = pk_re.captures(line) {
@@ -13206,7 +14342,7 @@ fn parse_error_model(
         // known standard error. It is defined as "divide DV and the prediction
         // by `W`, score on that scale": with `y' = y/W` and `f' = f/W` the
         // natural-scale variance of the residual is `W² · Var(f/W)`, i.e. the
-        // *additive* loading picks up a factor `W` while the proportional
+        // *additive* loading picks up a level block `W` while the proportional
         // loading is untouched (`W · (f/W) = f` — a common scale factor cancels
         // out of a CV). So the modifier desugars exactly into a #484
         // per-observation residual magnitude on the additive slot, reusing that
@@ -14199,6 +15335,402 @@ pub(crate) enum Expression {
         nn_idx: usize,
         output_idx: usize,
     },
+    /// Indexed read out of a θ level block (#1064): `PLACEBO[PLA_IDX]`,
+    /// or the implicit index of a level block. `idx` evaluates to a
+    /// **1-based** level number; `spec` maps that level onto the estimated θ
+    /// vector (directly, or as the negated sum of a sum-to-zero contrast).
+    ///
+    /// This is a *gather*, not N individual parameters: the whole block
+    /// occupies one `PkParams` slot, which is what makes hundreds of levels
+    /// fit the fixed `[f64; MAX_PK_PARAMS]` layout at all.
+    ThetaGather {
+        spec: std::sync::Arc<GatherSpec>,
+        idx: Box<Expression>,
+    },
+}
+
+/// How one level of a θ level block maps onto the estimated θ vector.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum LevelRule {
+    /// Estimated directly at this absolute index into the θ vector.
+    Free(u32),
+    /// The negated sum of `θ[start..end]` — the dependent level of a
+    /// sum-to-zero contrast. `start == end` evaluates to `0.0`, which is how a
+    /// reference level is encoded.
+    NegSum(u32, u32),
+}
+
+/// The level → θ mapping of one vector/level block, shared by every
+/// `Expression::ThetaGather` that reads it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct GatherSpec {
+    /// Block name as written (`PLACEBO`), used in diagnostics.
+    pub(crate) name: String,
+    /// One rule per level, in 1-based level order.
+    pub(crate) levels: Vec<LevelRule>,
+}
+
+impl GatherSpec {
+    /// Reverse map for [`differentiate`]: for absolute θ index `k`, the level
+    /// that reads it directly and the level that reads it through a `NegSum`.
+    /// Both are 1-based level numbers; either may be absent.
+    fn axes_for_theta(&self, k: usize) -> (Option<usize>, Option<usize>) {
+        let mut free = None;
+        let mut dep = None;
+        for (l, rule) in self.levels.iter().enumerate() {
+            match *rule {
+                LevelRule::Free(i) if i as usize == k => free = Some(l + 1),
+                LevelRule::NegSum(a, b) if (a as usize..b as usize).contains(&k) => {
+                    dep = Some(l + 1)
+                }
+                _ => {}
+            }
+        }
+        (free, dep)
+    }
+}
+
+/// Evaluate a gather at a raw (1-based, possibly non-integral) level index.
+///
+/// A non-integral or out-of-range index returns `NaN`, never `0.0`: division by
+/// zero already underflows to `0.0` in this evaluator, so a silent zero here
+/// would be indistinguishable from a legitimately estimated level. The loud
+/// check lives in `api::validation::check_theta_gather_indices`, which walks the
+/// data before the fit starts; this is defence in depth behind it.
+#[inline]
+fn eval_gather(spec: &GatherSpec, theta: &[f64], raw: f64) -> f64 {
+    if !raw.is_finite() {
+        return f64::NAN;
+    }
+    let rounded = raw.round();
+    if (rounded - raw).abs() > 1e-6 {
+        return f64::NAN;
+    }
+    let level = rounded as i64;
+    if level < 1 || level as usize > spec.levels.len() {
+        return f64::NAN;
+    }
+    match spec.levels[level as usize - 1] {
+        LevelRule::Free(i) => theta.get(i as usize).copied().unwrap_or(f64::NAN),
+        LevelRule::NegSum(a, b) => {
+            let (a, b) = (a as usize, b as usize);
+            if b > theta.len() || a > b {
+                return f64::NAN;
+            }
+            -theta[a..b].iter().sum::<f64>()
+        }
+    }
+}
+
+/// One θ level block declared in `[parameters]` (#1064), as seen by the
+/// expression parser while the rest of the model file is being parsed.
+#[derive(Debug, Clone)]
+pub(crate) struct VectorThetaDecl {
+    pub(crate) name: String,
+    /// Level → θ map shared by every gather that reads this block.
+    pub(crate) spec: std::sync::Arc<GatherSpec>,
+    /// `Some` for a level block: the index is implicit, so a **bare**
+    /// reference gathers on `index_covariate` instead of requiring `[...]`.
+    /// `None` for the explicit `theta NAME[N]` form, where a bare reference is
+    /// an error and the user supplies the index column.
+    pub(crate) index_covariate: Option<String>,
+}
+
+thread_local! {
+    /// Vector/θ level blocks visible to the expression parser for the duration
+    /// of one `parse_full_model` call.
+    ///
+    /// A thread-local rather than a `ParseCtx` field because `ParseCtx` is
+    /// constructed at ~20 separate sites (`[individual_parameters]`, `[odes]`,
+    /// `[scaling]`, error-model selectors, `[derived]`, …) and a gather must
+    /// parse identically at every one of them; threading a field through would
+    /// leave whichever site was missed silently treating `PLACEBO[I]` as an
+    /// unknown covariate. Parsing is single-threaded within a call, and
+    /// [`VectorThetaScope`] restores the previous table on drop.
+    static VECTOR_THETAS: std::cell::RefCell<Vec<VectorThetaDecl>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// RAII guard installing the active vector-θ table and gather-use log
+/// (panic-safe). Both are restored on drop so a nested parse — the absorption
+/// ODE-equivalent source is compiled inside the primary parse — cannot leak its
+/// blocks into the enclosing model.
+pub(crate) struct VectorThetaScope(Vec<VectorThetaDecl>, Vec<GatherUse>);
+
+impl VectorThetaScope {
+    fn enter(decls: Vec<VectorThetaDecl>) -> Self {
+        VectorThetaScope(
+            VECTOR_THETAS.with(|c| c.replace(decls)),
+            GATHER_USES.with(|c| c.replace(Vec::new())),
+        )
+    }
+
+    /// The gather sites recorded so far in this scope.
+    fn uses() -> Vec<GatherUse> {
+        GATHER_USES.with(|c| c.borrow().clone())
+    }
+}
+
+impl Drop for VectorThetaScope {
+    fn drop(&mut self) {
+        VECTOR_THETAS.with(|c| *c.borrow_mut() = std::mem::take(&mut self.0));
+        GATHER_USES.with(|c| *c.borrow_mut() = std::mem::take(&mut self.1));
+    }
+}
+
+/// One `NAME[COLUMN]` gather site seen while parsing, recorded so the pre-fit
+/// data check can verify every index the data actually carries is a level this
+/// block has. Only gathers whose index is a bare covariate read are recorded —
+/// a computed index (`PLACEBO[2 * K]`) has no single column to walk.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct GatherUse {
+    pub(crate) block: String,
+    pub(crate) index_covariate: String,
+    pub(crate) n_levels: usize,
+}
+
+thread_local! {
+    /// Gather sites recorded during the active parse; see [`GatherUse`].
+    static GATHER_USES: std::cell::RefCell<Vec<GatherUse>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Look up a declared θ level block by name.
+fn lookup_vector_theta(name: &str) -> Option<VectorThetaDecl> {
+    VECTOR_THETAS.with(|c| c.borrow().iter().find(|d| d.name == name).cloned())
+}
+
+/// Record a `block[column]` gather site for the pre-fit index check.
+fn record_gather_use(block: &str, index_covariate: &str, n_levels: usize) {
+    let use_ = GatherUse {
+        block: block.to_string(),
+        index_covariate: index_covariate.to_string(),
+        n_levels,
+    };
+    GATHER_USES.with(|c| {
+        let mut v = c.borrow_mut();
+        if !v.contains(&use_) {
+            v.push(use_);
+        }
+    });
+}
+
+/// Identifiability convention applied to a a level block θ block (#1064).
+///
+/// `[STUDY, TIME]` alongside an intercept is rank-deficient — the levels
+/// sum to the intercept — and, per @TeunP on #1063, it is rank-deficient
+/// against a **random** effect at the same or a coarser grouping too: a study's
+/// η *is* the mean of that study's own timepoint levels. So the convention is
+/// not optional, and it has to read the variance structure rather than only
+/// scanning for a fixed intercept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LevelContrast {
+    /// Sum-to-zero, with the grouping chosen from the model + data: within the
+    /// block's leading columns when the block shares an additive scale with a
+    /// random effect and those columns identify subjects one-to-one, globally
+    /// otherwise. The default.
+    #[default]
+    Auto,
+    /// Sum-to-zero over every level of the block.
+    SumToZero,
+    /// Sum-to-zero within each combination of the block's leading columns
+    /// (all but the last). Leaves each group's mean to be carried by that
+    /// group's random effect, which is what an unstructured placebo effect
+    /// under between-study variability intends.
+    SumToZeroWithin,
+    /// Dummy coding (R's `contr.treatment`): the block's first level is held at
+    /// exactly 0 and every other θ is that level's *difference from it*, with
+    /// the intercept absorbing the reference level's own value. The regression
+    /// convention, for when the coefficients are meant to be read rather than
+    /// merely absorbed.
+    ///
+    /// Two limits worth knowing. The reference is always the **first level in
+    /// sort order** — the smallest column-value tuple — with no way to name a
+    /// different one. And it is a **single** reference for the whole block, not
+    /// one per group: only [`SumToZeroWithin`](Self::SumToZeroWithin) splits the
+    /// levels into contrast groups, so `contrast = ref` on `[STUDY, TIME]` pins
+    /// one cell globally rather than each study's own first timepoint.
+    Ref,
+    /// No constraint. Every level is estimated; the caller asserts the model is
+    /// identified some other way (e.g. it declares no intercept).
+    Unconstrained,
+}
+
+impl LevelContrast {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::SumToZero => "sum_to_zero",
+            Self::SumToZeroWithin => "sum_to_zero_within",
+            Self::Ref => "ref",
+            Self::Unconstrained => "none",
+        }
+    }
+
+    /// Parse the `contrast = ...` modifier inside a level block.
+    fn parse(token: &str) -> Result<Self, String> {
+        match token.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "sum_to_zero" => Ok(Self::SumToZero),
+            "sum_to_zero_within" | "sum_to_zero_within_group" => Ok(Self::SumToZeroWithin),
+            "ref" | "reference" | "first" => Ok(Self::Ref),
+            "none" | "unconstrained" => Ok(Self::Unconstrained),
+            other => Err(format!(
+                "unknown `contrast = {other}`. Expected one of \
+                 sum_to_zero, sum_to_zero_within, ref, none."
+            )),
+        }
+    }
+}
+
+/// A `theta NAME[COL, ...]` declaration, before its levels are known.
+///
+/// The level count is a property of the *data*, so this is what the first parse
+/// produces; `api::levels::bind` discovers the observed combinations and
+/// re-parses with a [`LevelBinding`] in hand.
+#[derive(Debug, Clone)]
+pub struct LevelBlockDecl {
+    pub(crate) name: String,
+    /// Data columns whose observed combinations define the levels. A column
+    /// named `TIME` is the record time, not a covariate.
+    pub(crate) columns: Vec<String>,
+    pub(crate) contrast: LevelContrast,
+    /// Resolved labels in gather order. Empty until the data-bound reparse.
+    pub(crate) labels: Vec<String>,
+    /// Set by the parse: some `[individual_parameters]` statement reads this
+    /// block *and* a random effect. [`LevelContrast::Auto`] consumes it — it
+    /// is the "is there an η at a grouping coarser than or equal to the
+    /// block's" question, answered on the model side.
+    pub(crate) shares_scale_with_eta: bool,
+    /// Synthesized per-record index column the implicit gather reads.
+    pub(crate) index_covariate: String,
+}
+
+impl LevelBlockDecl {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+    pub fn contrast(&self) -> LevelContrast {
+        self.contrast
+    }
+    pub fn labels(&self) -> &[String] {
+        &self.labels
+    }
+    pub fn shares_scale_with_eta(&self) -> bool {
+        self.shares_scale_with_eta
+    }
+    pub fn index_covariate(&self) -> &str {
+        &self.index_covariate
+    }
+}
+
+/// The observed levels of one level block, as discovered from the data.
+#[derive(Debug, Clone, Default)]
+pub struct LevelBinding {
+    /// Level labels in level order, e.g. `STUDY=7,TIME=4`.
+    pub labels: Vec<String>,
+    /// Contrast group per level, parallel to `labels`. Levels of a group are
+    /// contiguous, so each group's free θ occupy a contiguous range.
+    pub groups: Vec<usize>,
+    /// The convention actually applied ([`LevelContrast::Auto`] resolved).
+    pub contrast: LevelContrast,
+}
+
+/// Level bindings by block name, threaded into the second parse.
+pub type LevelBindings = std::collections::HashMap<String, LevelBinding>;
+
+/// The θ level blocks a model declares (#1064).
+///
+/// Inner types reference the parser-private `GatherSpec`, so the fields stay
+/// `pub(crate)`; callers inspect the metadata through its accessors.
+#[derive(Debug, Clone, Default)]
+pub struct ThetaBlocks {
+    pub(crate) decls: Vec<VectorThetaDecl>,
+    /// `NAME[COLUMN]` sites whose index column the data check should walk.
+    pub(crate) uses: Vec<GatherUse>,
+    /// a level block declarations, in declaration order. Present whether or not
+    /// they are bound; `unbound_level_blocks` says which still need data.
+    pub(crate) level_blocks: Vec<LevelBlockDecl>,
+    /// Names of level blocks that were declared but never bound to
+    /// data. A model carrying any of these cannot be fit — see
+    /// `api::validation::check_unbound_theta_levels`.
+    pub(crate) unbound_level_blocks: Vec<String>,
+}
+
+impl ThetaBlocks {
+    /// An empty placeholder, for `CompiledModel`s built by hand.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Whether the model declares no θ level block at all — the common
+    /// case, which every consumer short-circuits on.
+    pub fn is_empty(&self) -> bool {
+        self.decls.is_empty() && self.unbound_level_blocks.is_empty()
+    }
+
+    /// Names of level blocks declared but not bound to data.
+    pub fn unbound_level_blocks(&self) -> &[String] {
+        &self.unbound_level_blocks
+    }
+
+    /// The a level block declarations, bound or not.
+    pub fn level_blocks(&self) -> &[LevelBlockDecl] {
+        &self.level_blocks
+    }
+
+    /// Level count of a bound block, by name.
+    pub fn level_count(&self, name: &str) -> Option<usize> {
+        self.decls
+            .iter()
+            .find(|d| d.name == name)
+            .map(|d| d.spec.levels.len())
+    }
+
+    /// `(block, index column, level count)` for every gather whose index is a
+    /// plain data column — what `check_theta_gather_indices` walks.
+    pub fn index_columns(&self) -> impl Iterator<Item = (&str, &str, usize)> {
+        self.uses
+            .iter()
+            .map(|u| (u.block.as_str(), u.index_covariate.as_str(), u.n_levels))
+    }
+}
+
+/// `PkNum` counterpart of [`eval_gather`], used by the analytic-sensitivity
+/// bytecode path. Same level bookkeeping, same `NaN` policy; the difference is
+/// that the gathered θ keeps its dual jet, so `∂f/∂θ_k` through a gather is
+/// exact rather than finite-differenced.
+#[inline]
+fn gather_g<T: crate::sens::num::PkNum>(spec: &GatherSpec, theta: &[T], raw: f64) -> T {
+    let nan = T::from_f64(f64::NAN);
+    if !raw.is_finite() {
+        return nan;
+    }
+    let rounded = raw.round();
+    if (rounded - raw).abs() > 1e-6 {
+        return nan;
+    }
+    let level = rounded as i64;
+    if level < 1 || level as usize > spec.levels.len() {
+        return nan;
+    }
+    match spec.levels[level as usize - 1] {
+        LevelRule::Free(i) => theta.get(i as usize).copied().unwrap_or(nan),
+        LevelRule::NegSum(a, b) => {
+            let (a, b) = (a as usize, b as usize);
+            if b > theta.len() || a > b {
+                return nan;
+            }
+            let mut acc = T::from_f64(0.0);
+            for t in &theta[a..b] {
+                acc = acc + *t;
+            }
+            -acc
+        }
+    }
 }
 
 thread_local! {
@@ -14241,6 +15773,112 @@ impl Drop for ModelTimeGuard {
 pub(crate) fn with_model_time<T>(time: f64, f: impl FnOnce() -> T) -> T {
     let _guard = ModelTimeGuard::enter(time);
     f()
+}
+
+thread_local! {
+    /// Ambient `[covariate_nn]` forward outputs for the generic (`PkNum`) statement
+    /// evaluator. See [`ModelNnGuard`].
+    static MODEL_NN_OUTPUTS: std::cell::RefCell<Vec<Vec<f64>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// RAII guard supplying `[covariate_nn]` outputs to
+/// [`eval_statements_g`] for the duration of a scope, mirroring
+/// [`ModelTimeGuard`] for the `TIME` built-in.
+///
+/// # Why a thread-local rather than a parameter
+///
+/// `Op::PushNnOutput` needs the network's forward output, which the `f64`
+/// `pk_param_fn` closure already computes once per call from its captured NN
+/// handles. The generic evaluator has no such closure — it is handed a compiled
+/// [`IndivParamProgram`], which carries statements and layout but no network — so
+/// before this guard existed it evaluated `PushNnOutput` against a hardcoded empty
+/// slice and pushed **0.0**. An NN output silently read as zero is precisely the
+/// class of defect CLAUDE.md's routing rule exists to prevent, and it was reachable
+/// the moment any gate stopped excluding `[covariate_nn]` models from a
+/// program-driven analytic path.
+///
+/// Threading a parameter instead would touch eight recursive call sites in the hot
+/// inner-loop evaluator. `TIME` faced the same choice and resolved it the same way,
+/// so this follows the established seam rather than inventing a second convention.
+///
+/// # What it is *not* for
+///
+/// The outputs are lifted as **constants** on every dual axis. That is exact for
+/// `∂/∂η`: a network reads covariates and weights, never `η`. It is *not* a way to
+/// get `∂/∂θ` for NN weights — those derivatives are zero under this guard, which
+/// is why only η-gradient paths may use it. `∂NLL/∂w` comes from
+/// [`crate::estimation::nn_theta_gradient`] instead.
+pub(crate) struct ModelNnGuard(Vec<Vec<f64>>);
+
+impl ModelNnGuard {
+    /// Install `outputs` for the current thread, restoring the previous value on drop.
+    #[cfg(feature = "nn")]
+    pub(crate) fn enter(outputs: Vec<Vec<f64>>) -> Self {
+        let prev = MODEL_NN_OUTPUTS.with(|cell| cell.replace(outputs));
+        ModelNnGuard(prev)
+    }
+
+    /// Compute and install every `[covariate_nn]` block's forward output at this
+    /// `(theta, covariates)` point, or `None` when the model has no network (in which
+    /// case the evaluator's empty default is already correct and no guard is needed).
+    ///
+    /// Uses `forward_raw`, the same entry point `pk_param_fn` calls, so the value the
+    /// gradient path differentiates around is the value the prediction path produced.
+    ///
+    /// A `forward_raw` failure `panic!`s, exactly as `pk_param_fn` does on the same call.
+    /// It zero-fills an absent covariate, so the only ways it can fail are a mis-sized
+    /// weight slice or an input/layer count mismatch — wiring bugs, not runtime conditions.
+    /// Defaulting the block to `vec![]` instead would make `Op::PushNnOutput` read every
+    /// output as `0.0` in a release build, which is the silent-zero defect this guard
+    /// exists to prevent.
+    #[cfg(feature = "nn")]
+    pub(crate) fn enter_for(
+        model: &crate::types::CompiledModel,
+        theta: &[f64],
+        covariates: &HashMap<String, f64>,
+    ) -> Option<Self> {
+        if model.covariate_nns.is_empty() {
+            return None;
+        }
+        let outputs: Vec<Vec<f64>> = model
+            .covariate_nns
+            .iter()
+            .map(|nn| {
+                let n_w = nn.mapper.mlp().n_weights();
+                let w = &theta[nn.weights_offset..nn.weights_offset + n_w];
+                nn.mapper.forward_raw(w, covariates).expect(
+                    "NN forward_raw failed in ModelNnGuard::enter_for: this indicates a \
+                     wiring bug (wrong weight slice or input/layer count), not a \
+                     recoverable condition",
+                )
+            })
+            .collect();
+        Some(Self::enter(outputs))
+    }
+
+    #[cfg(not(feature = "nn"))]
+    pub(crate) fn enter_for(
+        _model: &crate::types::CompiledModel,
+        _theta: &[f64],
+        _covariates: &HashMap<String, f64>,
+    ) -> Option<Self> {
+        None
+    }
+}
+
+impl Drop for ModelNnGuard {
+    fn drop(&mut self) {
+        MODEL_NN_OUTPUTS.with(|cell| {
+            *cell.borrow_mut() = std::mem::take(&mut self.0);
+        });
+    }
+}
+
+/// Run `f` with the ambient NN outputs borrowed. Empty unless a [`ModelNnGuard`] is
+/// live on this thread.
+fn with_nn_outputs<R>(f: impl FnOnce(&[Vec<f64>]) -> R) -> R {
+    MODEL_NN_OUTPUTS.with(|cell| f(&cell.borrow()))
 }
 
 /// The model-time thread-local `Expression::Time` / `Op::PushTime` resolves
@@ -14399,6 +16037,7 @@ fn visit_expr_nodes(expr: &Expression, f: &mut dyn FnMut(&Expression)) {
             visit_expr_nodes(rhs, f);
         }
         Expression::UnaryFn(_, arg) => visit_expr_nodes(arg, f),
+        Expression::ThetaGather { idx, .. } => visit_expr_nodes(idx, f),
         Expression::Power(base, exp) => {
             visit_expr_nodes(base, f);
             visit_expr_nodes(exp, f);
@@ -14426,6 +16065,7 @@ fn visit_expr_nodes_mut(expr: &mut Expression, f: &mut dyn FnMut(&mut Expression
             visit_expr_nodes_mut(rhs, f);
         }
         Expression::UnaryFn(_, arg) => visit_expr_nodes_mut(arg, f),
+        Expression::ThetaGather { idx, .. } => visit_expr_nodes_mut(idx, f),
         Expression::Power(base, exp) => {
             visit_expr_nodes_mut(base, f);
             visit_expr_nodes_mut(exp, f);
@@ -14473,6 +16113,95 @@ fn visit_condition_nodes(cond: &Condition, f: &mut dyn FnMut(&Expression)) {
 /// conditions + bodies of `if` blocks (see `visit_expr_nodes`). Bytecode
 /// variants carry no tree to walk (they only appear after
 /// `resolve_variable_indices`).
+/// Whether some `[individual_parameters]` assignment combines a read of the
+/// level block `block` with a random effect (#1064).
+///
+/// This is the model-side half of "is there an η at a grouping coarser than or
+/// equal to the block's" — the question @TeunP raised on #1063, and the one a
+/// rank check that only scanned for a fixed intercept would get wrong. The data
+/// side (do the block's leading columns partition the subjects?) is answered
+/// by the binder; [`LevelContrast::Auto`] needs both.
+///
+/// Taint propagates through intermediate assignments, so the idiomatic
+///
+/// ```text
+///   TVPL = BASE + PLACEBO
+///   PL   = TVPL * exp(ETA_PL)
+/// ```
+///
+/// is recognised as sharing a scale, not just the single-line form. Nested
+/// `if`-branch assignments are walked too. The propagation is a fixpoint over
+/// assignment order, so a forward reference (not legal in this DSL anyway)
+/// cannot be missed by a single pass.
+fn block_shares_scale_with_eta(stmts: &[Statement], block: &str) -> bool {
+    fn reads_block(e: &Expression, block: &str) -> bool {
+        let mut hit = false;
+        visit_expr_nodes(e, &mut |n| {
+            if let Expression::ThetaGather { spec, .. } = n {
+                hit |= spec.name == block;
+            }
+        });
+        hit
+    }
+    fn reads_eta(e: &Expression) -> bool {
+        let mut hit = false;
+        visit_expr_nodes(e, &mut |n| {
+            hit |= matches!(n, Expression::Eta(_));
+        });
+        hit
+    }
+    fn reads_tainted(e: &Expression, tainted: &[String]) -> bool {
+        let mut hit = false;
+        visit_expr_nodes(e, &mut |n| {
+            if let Expression::Variable(v) = n {
+                hit |= tainted.iter().any(|t| t == v);
+            }
+        });
+        hit
+    }
+    /// Every `(lhs, rhs)` assignment in source order, `if`-branches included.
+    fn assignments<'a>(stmts: &'a [Statement], out: &mut Vec<(&'a str, &'a Expression)>) {
+        for s in stmts {
+            match s {
+                Statement::Assign(n, e) => out.push((n.as_str(), e)),
+                Statement::If {
+                    branches,
+                    else_body,
+                } => {
+                    for (_, body) in branches {
+                        assignments(body, out);
+                    }
+                    if let Some(eb) = else_body {
+                        assignments(eb, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut assigns = Vec::new();
+    assignments(stmts, &mut assigns);
+    let mut tainted: Vec<String> = Vec::new();
+    loop {
+        let before = tainted.len();
+        for (lhs, rhs) in &assigns {
+            let touches_block = reads_block(rhs, block) || reads_tainted(rhs, &tainted);
+            if touches_block {
+                if reads_eta(rhs) {
+                    return true;
+                }
+                if !tainted.iter().any(|t| t == lhs) {
+                    tainted.push((*lhs).to_string());
+                }
+            }
+        }
+        if tainted.len() == before {
+            return false;
+        }
+    }
+}
+
 fn visit_stmt_nodes(stmts: &[Statement], f: &mut dyn FnMut(&Expression)) {
     for s in stmts {
         match s {
@@ -14543,6 +16272,7 @@ fn rewrite_weighted_kappas(
                 walk_expr(r, weights, hit);
             }
             Expression::UnaryFn(_, a) => walk_expr(a, weights, hit),
+            Expression::ThetaGather { idx, .. } => walk_expr(idx, weights, hit),
             Expression::Power(b, e) => {
                 walk_expr(b, weights, hit);
                 walk_expr(e, weights, hit);
@@ -15277,10 +17007,15 @@ fn allocate_readout_extra_slots(
     structural_vars: &std::collections::HashSet<String>,
     modeled_slots: &[(String, usize)],
     pk_model: PkModel,
-    is_ode: bool,
+    // Whether the model already gave every individual parameter a slot from the
+    // full `MAX_PK_PARAMS` layout via `ode_param_slots` — true for ODE models and
+    // for compartment-free ones (#811). This allocator exists only to squeeze a
+    // readout's parameters into an analytical model's few spare slots, so for
+    // those there is nothing to do.
+    uses_ode_param_layout: bool,
     synth_params: &[ReadoutSynthParam],
 ) -> Result<ReadoutExtraSlots, String> {
-    if is_ode {
+    if uses_ode_param_layout {
         return Ok(ReadoutExtraSlots::default());
     }
     let Some(lines) = scaling_lines else {
@@ -15486,6 +17221,9 @@ fn rewrite_readout_synth(expr: &mut Expression, synth: &[ReadoutSynthParam]) {
                 *expr = Expression::Variable(s.name.clone());
             }
         }
+        // The gathered θ block itself has no synthetic stand-in (#486 desugars
+        // scalar `THETA(i)` only), so only the index expression is rewritten.
+        Expression::ThetaGather { idx, .. } => rewrite_readout_synth(idx, synth),
         Expression::BinOp(l, _, r) => {
             rewrite_readout_synth(l, synth);
             rewrite_readout_synth(r, synth);
@@ -15794,6 +17532,10 @@ fn eval_expr<E: EvalEnv>(
         | Expression::Covariate(_)
         | Expression::VariableIdx(_)
         | Expression::CovariateIdx(_) => env.resolve(expr),
+        Expression::ThetaGather { spec, idx } => {
+            let raw = eval_expr(idx, theta, eta, env, nn_outputs);
+            eval_gather(spec, theta, raw)
+        }
         Expression::BinOp(lhs, op, rhs) => {
             let l = eval_expr(lhs, theta, eta, env, nn_outputs);
             let r = eval_expr(rhs, theta, eta, env, nn_outputs);
@@ -15967,6 +17709,9 @@ enum Op {
     PushVar(u32),
     PushCov(u32),
     PushNnOutput(u32, u32),
+    /// Pops a 1-based level index and pushes the gathered θ value for
+    /// `Bytecode.gathers[i]` (#1064).
+    PushThetaGather(u32),
     Add,
     Sub,
     Mul,
@@ -16054,6 +17799,9 @@ struct Bytecode {
     ops: Vec<Op>,
     constants: Vec<f64>,
     max_stack: usize,
+    /// Level → θ maps for the `Op::PushThetaGather` ops in `ops` (#1064).
+    /// Empty for every expression that contains no θ level read.
+    gathers: Vec<std::sync::Arc<GatherSpec>>,
 }
 
 impl Bytecode {
@@ -16062,6 +17810,7 @@ impl Bytecode {
             ops: Vec::new(),
             constants: Vec::new(),
             max_stack: 0,
+            gathers: Vec::new(),
         }
     }
     fn push_const(&mut self, v: f64) {
@@ -16141,6 +17890,8 @@ fn scan_stack_depth(ops: &[Op]) -> (i32, i32) {
             | Op::PushVar(_)
             | Op::PushCov(_)
             | Op::PushNnOutput(_, _) => 1,
+            // Pops the level index, pushes the gathered value.
+            Op::PushThetaGather(_) => 0,
             Op::Add
             | Op::Sub
             | Op::Mul
@@ -16228,6 +17979,12 @@ fn compile_expr_into(bc: &mut Bytecode, expr: &Expression) {
         Expression::NnOutput { nn_idx, output_idx } => bc
             .ops
             .push(Op::PushNnOutput(*nn_idx as u32, *output_idx as u32)),
+        Expression::ThetaGather { spec, idx } => {
+            compile_expr_into(bc, idx);
+            let g = bc.gathers.len() as u32;
+            bc.gathers.push(spec.clone());
+            bc.ops.push(Op::PushThetaGather(g));
+        }
         Expression::BinOp(lhs, op, rhs) => {
             compile_expr_into(bc, lhs);
             compile_expr_into(bc, rhs);
@@ -16388,6 +18145,17 @@ fn eval_bytecode(
                         );
                         0.0
                     });
+                push!(v);
+            }
+            Op::PushThetaGather(g) => {
+                let raw = pop!();
+                let v = match bc.gathers.get(g as usize) {
+                    Some(spec) => eval_gather(spec, theta, raw),
+                    None => {
+                        debug_assert!(false, "Op::PushThetaGather {g} out of bounds");
+                        f64::NAN
+                    }
+                };
                 push!(v);
             }
             Op::Add => {
@@ -16612,6 +18380,20 @@ fn eval_bytecode_g<T: crate::sens::num::PkNum>(
                         0.0
                     });
                 push!(k(v));
+            }
+            // The level index is integer-valued data, so its jet is empty and
+            // `.val()` loses nothing; the *gathered* θ keeps its full jet, which
+            // is what makes `∂f/∂θ_k` exact through a gather.
+            Op::PushThetaGather(g) => {
+                let raw = pop!().val();
+                let v = match bc.gathers.get(g as usize) {
+                    Some(spec) => gather_g::<T>(spec, theta, raw),
+                    None => {
+                        debug_assert!(false, "Op::PushThetaGather {g} out of bounds");
+                        k(f64::NAN)
+                    }
+                };
+                push!(v);
             }
             Op::Add => {
                 let b = pop!();
@@ -16916,7 +18698,37 @@ fn eval_statements_g<T: crate::sens::num::PkNum>(
     // evaluated and branches still descended, so control flow is identical.
     skip: &[bool],
 ) {
-    let empty_nn: Vec<Vec<f64>> = Vec::new();
+    // `[covariate_nn]` outputs come from the ambient `ModelNnGuard`, not from a
+    // parameter — see that type for why, and for the invariant that they are lifted as
+    // constants (exact for `∂/∂η`, deliberately *not* a route to `∂/∂θ` for NN weights).
+    // Empty when no guard is live, which is correct for every model without a network.
+    //
+    // Resolved **once** here and threaded down the `If` recursion by reference. This walk is
+    // the FOCE inner loop's hot evaluator; re-reading the thread-local — and deep-cloning it
+    // into a fresh `Vec<Vec<f64>>` — once per statement list, i.e. once more per nested branch
+    // body, is pure per-frame overhead. The borrow is held for the whole walk, so no
+    // `ModelNnGuard` may be entered or dropped beneath it; none is (guards are installed by
+    // the sensitivity provider, outside this call).
+    with_nn_outputs(|nn| {
+        eval_statements_g_inner::<T>(stmts, theta, eta, cov, vars, du, bc_stack, skip, nn)
+    })
+}
+
+/// The recursive body of [`eval_statements_g`], with the ambient `[covariate_nn]` outputs
+/// already resolved and borrowed by the caller.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+fn eval_statements_g_inner<T: crate::sens::num::PkNum>(
+    stmts: &[Statement],
+    theta: &[T],
+    eta: &[T],
+    cov: &[f64],
+    vars: &mut [T],
+    du: Option<&mut [T]>,
+    bc_stack: &mut Vec<T>,
+    skip: &[bool],
+    empty_nn: &[Vec<f64>],
+) {
     let mut du_opt = du;
     for s in stmts {
         match s {
@@ -16924,13 +18736,13 @@ fn eval_statements_g<T: crate::sens::num::PkNum>(
                 if skip.get(*idx).copied().unwrap_or(false) {
                     continue;
                 }
-                let v = eval_bytecode_g::<T>(bc, theta, eta, cov, vars, &empty_nn, bc_stack);
+                let v = eval_bytecode_g::<T>(bc, theta, eta, cov, vars, empty_nn, bc_stack);
                 if let Some(slot) = vars.get_mut(*idx) {
                     *slot = v;
                 }
             }
             Statement::DiffEqBc(state_idx, bc) => {
-                let v = eval_bytecode_g::<T>(bc, theta, eta, cov, vars, &empty_nn, bc_stack);
+                let v = eval_bytecode_g::<T>(bc, theta, eta, cov, vars, empty_nn, bc_stack);
                 if let Some(buf) = du_opt.as_deref_mut() {
                     if let Some(slot) = buf.get_mut(*state_idx) {
                         *slot = v;
@@ -16947,9 +18759,9 @@ fn eval_statements_g<T: crate::sens::num::PkNum>(
                 let vars_val: Vec<f64> = vars.iter().map(|v| v.val()).collect();
                 let mut taken = false;
                 for (cond, body) in branches {
-                    if eval_condition_indexed(cond, &theta_val, &eta_val, cov, &vars_val, &empty_nn)
+                    if eval_condition_indexed(cond, &theta_val, &eta_val, cov, &vars_val, empty_nn)
                     {
-                        eval_statements_g::<T>(
+                        eval_statements_g_inner::<T>(
                             body,
                             theta,
                             eta,
@@ -16958,6 +18770,7 @@ fn eval_statements_g<T: crate::sens::num::PkNum>(
                             du_opt.as_deref_mut(),
                             bc_stack,
                             skip,
+                            empty_nn,
                         );
                         taken = true;
                         break;
@@ -16965,7 +18778,7 @@ fn eval_statements_g<T: crate::sens::num::PkNum>(
                 }
                 if !taken {
                     if let Some(eb) = else_body {
-                        eval_statements_g::<T>(
+                        eval_statements_g_inner::<T>(
                             eb,
                             theta,
                             eta,
@@ -16974,6 +18787,7 @@ fn eval_statements_g<T: crate::sens::num::PkNum>(
                             du_opt.as_deref_mut(),
                             bc_stack,
                             skip,
+                            empty_nn,
                         );
                     }
                 }
@@ -17005,6 +18819,7 @@ fn expr_reads_slots(e: &Expression, slots: &[usize]) -> bool {
             expr_reads_slots(a, slots) || expr_reads_slots(b, slots)
         }
         Expression::UnaryFn(_, a) => expr_reads_slots(a, slots),
+        Expression::ThetaGather { idx, .. } => expr_reads_slots(idx, slots),
         Expression::Conditional(c, t, f) => {
             cond_reads_slots(c, slots) || expr_reads_slots(t, slots) || expr_reads_slots(f, slots)
         }
@@ -17166,6 +18981,8 @@ fn expr_is_dynamic(e: &Expression, dyn_vars: &[bool]) -> bool {
         Expression::Variable(_) => true,
         Expression::VariableIdx(i) => dyn_vars.get(*i).copied().unwrap_or(false),
         Expression::Literal(_) | Expression::Covariate(_) | Expression::CovariateIdx(_) => false,
+        // Reads θ, so it is dynamic regardless of what the index is.
+        Expression::ThetaGather { .. } => true,
         Expression::BinOp(a, _, b) | Expression::Power(a, b) => {
             expr_is_dynamic(a, dyn_vars) || expr_is_dynamic(b, dyn_vars)
         }
@@ -18189,6 +20006,7 @@ fn resolve_expr_indices(
             resolve_expr_indices(r, var_idx, cov_idx);
         }
         Expression::UnaryFn(_, a) => resolve_expr_indices(a, var_idx, cov_idx),
+        Expression::ThetaGather { idx, .. } => resolve_expr_indices(idx, var_idx, cov_idx),
         Expression::Power(b, e) => {
             resolve_expr_indices(b, var_idx, cov_idx);
             resolve_expr_indices(e, var_idx, cov_idx);
@@ -18359,6 +20177,41 @@ fn differentiate_with_chain(
             }
         }
         Expression::CovariateIdx(_) | Expression::NnOutput { .. } => Expression::Literal(0.0),
+        // A gather is piecewise constant in its index (integer-valued data), so
+        // only the θ axis carries a derivative. For axis `j`, `∂/∂θ_j` is +1 on
+        // the level that reads `θ_j` directly and −1 on the level that reads it
+        // through a sum-to-zero contrast — both selected by the runtime index,
+        // hence the nested conditional rather than a Kronecker constant.
+        Expression::ThetaGather { spec, idx } => match axis {
+            DiffAxis::Theta(j) => {
+                let (free, dep) = spec.axes_for_theta(j);
+                let mut out = Expression::Literal(0.0);
+                if let Some(l) = dep {
+                    out = Expression::Conditional(
+                        Box::new(Condition::Compare(
+                            (**idx).clone(),
+                            CmpOp::Eq,
+                            Expression::Literal(l as f64),
+                        )),
+                        Box::new(Expression::Literal(-1.0)),
+                        Box::new(out),
+                    );
+                }
+                if let Some(l) = free {
+                    out = Expression::Conditional(
+                        Box::new(Condition::Compare(
+                            (**idx).clone(),
+                            CmpOp::Eq,
+                            Expression::Literal(l as f64),
+                        )),
+                        Box::new(Expression::Literal(1.0)),
+                        Box::new(out),
+                    );
+                }
+                out
+            }
+            _ => Expression::Literal(0.0),
+        },
         Expression::Variable(name) | Expression::Covariate(name) => panic!(
             "differentiate: unresolved AST node `{name}` reached the \
              differentiator; resolve_expr_indices must run first",
@@ -18484,6 +20337,10 @@ fn differentiate_with_chain(
 fn simplify_expr(expr: &Expression) -> Expression {
     let is_lit = |e: &Expression, v: f64| matches!(e, Expression::Literal(x) if *x == v);
     match expr {
+        Expression::ThetaGather { spec, idx } => Expression::ThetaGather {
+            spec: spec.clone(),
+            idx: Box::new(simplify_expr(idx)),
+        },
         Expression::BinOp(l, op, r) => {
             let l = simplify_expr(l);
             let r = simplify_expr(r);
@@ -18631,6 +20488,8 @@ pub struct IndivParamPartials {
     /// hand-built fixtures and when no `[individual_parameters]` block exists;
     /// the ODE provider reads its own copy from `ode_spec`.
     pub(crate) indiv_param_program: Option<IndivParamProgram>,
+    /// Additive parser metadata kept behind this existing opaque public field.
+    pub(crate) theta_blocks: ThetaBlocks,
 }
 
 impl IndivParamPartials {
@@ -18644,6 +20503,7 @@ impl IndivParamPartials {
             d_d_theta: Vec::new(),
             d_d_eta: Vec::new(),
             indiv_param_program: None,
+            theta_blocks: ThetaBlocks::empty(),
         }
     }
 }
@@ -18741,6 +20601,7 @@ fn build_indiv_param_partials(
         // Attached by the caller (`build_pk_param_fn` site) after the program is
         // compiled; the symbolic-partials builder itself doesn't produce it.
         indiv_param_program: None,
+        theta_blocks: ThetaBlocks::empty(),
     }
 }
 
@@ -19326,14 +21187,85 @@ fn parse_atom(
             }
 
             // Check if it's a function call: `name(expr)` — or, for `min` / `max`,
-            // the two-argument `name(a, b)` form (#1030).
+            // the two-argument `name(a, b)` form (#1030), or the three-argument
+            // `clamp(x, lo, hi)` (#1092).
             if pos + 1 < tokens.len() && tokens[pos + 1] == Token::LParen {
                 let func_name = name.to_lowercase();
                 let is_min_max = matches!(func_name.as_str(), "min" | "max");
+                let is_clamp = func_name == "clamp";
                 let (arg, p) = parse_add_sub(tokens, pos + 2, ctx)?;
-                if is_min_max && tokens.get(p) == Some(&Token::Comma) {
+                if (is_min_max || is_clamp) && tokens.get(p) == Some(&Token::Comma) {
                     let (arg2, p) = parse_add_sub(tokens, p + 1, ctx)?;
+                    if is_clamp {
+                        if tokens.get(p) != Some(&Token::Comma) {
+                            return Err(format!(
+                                "`{func_name}` takes exactly three arguments: \
+                                 `clamp(x, lo, hi)`."
+                            ));
+                        }
+                        let (arg3, p) = parse_add_sub(tokens, p + 1, ctx)?;
+                        if tokens.get(p) != Some(&Token::RParen) {
+                            return Err(format!(
+                                "Missing closing parenthesis for function {name} — `{func_name}` \
+                                 takes exactly three arguments, `clamp(x, lo, hi)`."
+                            ));
+                        }
+                        // An inverted *literal* interval can only be a typo: the
+                        // desugaring below never returns `x` at all, quietly handing
+                        // back `lo` below the crossing and `hi` above it.
+                        // Non-literal bounds are left alone rather than paying an
+                        // ordering test on every evaluation of every clamp.
+                        if let (Expression::Literal(lo), Expression::Literal(hi)) = (&arg2, &arg3) {
+                            if lo > hi {
+                                return Err(format!(
+                                    "`clamp(x, {lo}, {hi})` has its bounds inverted — the lower \
+                                     bound must not be above the upper bound."
+                                ));
+                            }
+                        }
+                        // Desugar to nested inline conditionals, exactly as `min` /
+                        // `max` do just below:
+                        //   `clamp(x, lo, hi)` → `if (x <= lo) lo else if (x >= hi) hi else x`
+                        // `Expression::Conditional` is already evaluated,
+                        // bytecode-compiled, `Dual2`-differentiated and index-resolved
+                        // everywhere in the pipeline, so `clamp` inherits all of it.
+                        // On every *finite* `x` it returns bit-for-bit what the
+                        // `min(max(x, lo), hi)` it replaces returns. The two forms are
+                        // deliberately not identical where no branch test can be true:
+                        // a NaN `x` fails both `<=` and `>=`, so `clamp` falls through
+                        // to `x` and propagates the NaN, while the nested form's `max`
+                        // takes its `else` and pins the result to `lo`. Propagating is
+                        // the wanted behaviour — a NaN readout silently bounded to `lo`
+                        // is a wrong number that survives into the OFV, where a NaN
+                        // does not. The same branch choice puts the derivative at 0
+                        // *on* each bound where the nested form passes 1 through; both
+                        // conventions are pinned in
+                        // `clamp_derivative_convention_on_the_bounds` and
+                        // `clamp_propagates_nan_where_nested_pins_to_lo`.
+                        // `x` lands in the tree three times (`lo` and `hi` twice each) —
+                        // the same cost as writing the nested form by hand, so clamp a
+                        // *named* value rather than a long expression.
+                        let inner = Expression::Conditional(
+                            Box::new(Condition::Compare(arg.clone(), CmpOp::Ge, arg3.clone())),
+                            Box::new(arg3),
+                            Box::new(arg.clone()),
+                        );
+                        return Ok((
+                            Expression::Conditional(
+                                Box::new(Condition::Compare(arg, CmpOp::Le, arg2.clone())),
+                                Box::new(arg2),
+                                Box::new(inner),
+                            ),
+                            p + 1,
+                        ));
+                    }
                     if tokens.get(p) != Some(&Token::RParen) {
+                        if tokens.get(p) == Some(&Token::Comma) {
+                            return Err(format!(
+                                "function `{name}` takes 2 arguments, but a third `,` was found — \
+                                 a two-sided bound is `clamp(x, lo, hi)`."
+                            ));
+                        }
                         return Err(format!(
                             "Missing closing parenthesis for function {} — `{}` takes exactly \
                              two arguments, `{}(a, b)`.",
@@ -19366,7 +21298,8 @@ fn parse_atom(
                     if tokens.get(p) == Some(&Token::Comma) {
                         return Err(format!(
                             "function `{}` takes 1 argument, but a `,` was found — only \
-                             `min(a, b)` and `max(a, b)` take two.",
+                             `min(a, b)` and `max(a, b)` take two, and `clamp(x, lo, hi)` \
+                             takes three.",
                             name
                         ));
                     }
@@ -19376,6 +21309,15 @@ fn parse_atom(
                     return Err(format!(
                         "`{}` takes exactly two arguments: `{}(a, b)`.",
                         name, func_name
+                    ));
+                }
+                if is_clamp {
+                    // A one-argument `clamp(x)` used to fall through to
+                    // `UnaryFn("clamp", x)`, which every consumer evaluates as the
+                    // identity — a no-op that fits, converges and gives wrong
+                    // numbers (#1092). Reject it by name.
+                    return Err(format!(
+                        "`{func_name}` takes exactly three arguments: `clamp(x, lo, hi)`."
                     ));
                 }
                 return Ok((Expression::UnaryFn(func_name, Box::new(arg)), p + 1));
@@ -19418,8 +21360,70 @@ fn parse_atom(
                 // as an expression-parse error.
             }
 
+            // Vector / θ level block (#1064): `PLACEBO[PLA_IDX]`, or a bare
+            // `PLACEBO` for a level block whose index is implicit.
+            //
+            // Checked before the scalar-θ lookup so a block name can never be
+            // shadowed by a same-named scalar, and before the covariate
+            // fallback so a mistyped subscript is an error rather than a
+            // silently-zero covariate read.
+            if let Some(decl) = lookup_vector_theta(name) {
+                let subscripted = tokens.get(pos + 1) == Some(&Token::LBracket);
+                if subscripted {
+                    let (idx_expr, p) = parse_add_sub(tokens, pos + 2, ctx)?;
+                    if tokens.get(p) != Some(&Token::RBracket) {
+                        return Err(format!(
+                            "`{name}[...]`: missing closing `]` on the level index"
+                        ));
+                    }
+                    // A literal index is resolvable now — fold it to a plain θ
+                    // read so the common `PLACEBO[3]` case costs nothing at
+                    // runtime and reports an out-of-range level at parse time.
+                    if let Expression::Literal(v) = idx_expr {
+                        let n_levels = decl.spec.levels.len();
+                        if v.fract() != 0.0 || v < 1.0 || v as usize > n_levels {
+                            return Err(format!(
+                                "`{name}[{v}]`: level index must be an integer in 1..={n_levels}"
+                            ));
+                        }
+                        if let LevelRule::Free(t) = decl.spec.levels[v as usize - 1] {
+                            return Ok((Expression::Theta(t as usize), p + 1));
+                        }
+                    }
+                    if let Expression::Covariate(col) = &idx_expr {
+                        record_gather_use(name, col, decl.spec.levels.len());
+                    }
+                    return Ok((
+                        Expression::ThetaGather {
+                            spec: decl.spec.clone(),
+                            idx: Box::new(idx_expr),
+                        },
+                        p + 1,
+                    ));
+                }
+                return match &decl.index_covariate {
+                    Some(cov) => Ok((
+                        Expression::ThetaGather {
+                            spec: decl.spec.clone(),
+                            idx: Box::new(Expression::Covariate(cov.clone())),
+                        },
+                        pos + 1,
+                    )),
+                    None => Err(format!(
+                        "`{name}` is a vector of {} θ levels — index it, e.g. \
+                         `{name}[IDX_COLUMN]`",
+                        decl.spec.levels.len()
+                    )),
+                };
+            }
+
             // Check if it's a theta
             if let Some(idx) = ctx.theta_names.iter().position(|n| n == name) {
+                // Recorded here — the one place a name becomes a θ index — so
+                // the `[covariate_nn]` direct-reference check below sees a
+                // reference from *any* block, not just the one someone
+                // remembered to walk.
+                record_theta_reference(idx);
                 return Ok((Expression::Theta(idx), pos + 1));
             }
 

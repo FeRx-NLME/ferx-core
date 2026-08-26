@@ -45,6 +45,16 @@ fn param_corr_fallback(
 }
 
 /// Summary statistics over an NN's flat weight vector for the compact
+/// Comma-separated `{:.6}` rendering of a float vector, for the
+/// `center:` / `scale:` lines of the `neural_networks:` YAML block.
+#[cfg(feature = "nn")]
+fn fmt_f64_list(v: &[f64]) -> String {
+    v.iter()
+        .map(|x| format!("{:.6}", x))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// `neural_networks:` section in the fit YAML / CLI output. Empty input
 /// yields all zeros (defensive — shouldn't happen in practice because
 /// the parser refuses zero-weight NNs).
@@ -72,6 +82,53 @@ fn weight_summary(w: &[f64]) -> (f64, f64, f64, f64) {
 }
 
 /// Print NONMEM-style results to stderr
+/// Level count above which a θ level block (#1064) is reported as its
+/// own compact section instead of one entry per level in the θ table.
+///
+/// A four-level block reads better inline, exactly as it did before the
+/// feature existed; an unstructured placebo effect with 800 levels would bury
+/// the structural parameters it exists to protect.
+pub(crate) const THETA_BLOCK_COMPACT_MIN: usize = 20;
+
+/// The θ index ranges of the large vector / level blocks in `names`.
+///
+/// Blocks are recognised from the `NAME[level]` naming the parser assigns, which
+/// is unambiguous: a scalar θ name is `\w+`, so it can never contain a bracket.
+/// Levels of a block are contiguous by construction.
+pub(crate) fn compact_theta_blocks(names: &[String]) -> Vec<(String, std::ops::Range<usize>)> {
+    let block_of = |n: &String| -> Option<String> {
+        n.strip_suffix(']')
+            .and_then(|r| r.split_once('['))
+            .map(|(b, _)| b.to_string())
+    };
+    let mut out: Vec<(String, std::ops::Range<usize>)> = Vec::new();
+    let mut i = 0;
+    while i < names.len() {
+        let Some(block) = block_of(&names[i]) else {
+            i += 1;
+            continue;
+        };
+        let start = i;
+        while i < names.len() && block_of(&names[i]).as_deref() == Some(block.as_str()) {
+            i += 1;
+        }
+        if i - start >= THETA_BLOCK_COMPACT_MIN {
+            out.push((block, start..i));
+        }
+    }
+    out
+}
+
+/// `(min, median, max)` of a slice, for the compact block summary. The median
+/// is the lower of the two middle values on an even count — the levels are a
+/// nuisance block, not a quantity anyone interpolates.
+fn block_summary(values: &[f64]) -> (f64, f64, f64) {
+    let mut sorted: Vec<f64> = values.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let n = sorted.len();
+    (sorted[0], sorted[(n - 1) / 2], sorted[n - 1])
+}
+
 pub fn print_results(result: &FitResult) {
     eprintln!("\n{}", "=".repeat(60));
     eprintln!("NONLINEAR MIXED EFFECTS MODEL ESTIMATION");
@@ -110,6 +167,14 @@ pub fn print_results(result: &FitResult) {
     #[cfg(not(feature = "nn"))]
     let nn_theta_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
+    // #1064: a θ level block with hundreds of levels is a nuisance
+    // block — the point is what it absorbs, not the individual values. Keep it
+    // out of the main table and summarise it below, so the structural
+    // parameters it exists to protect stay readable.
+    let theta_blocks = compact_theta_blocks(&result.theta_names);
+    let blocked_theta_indices: std::collections::HashSet<usize> =
+        theta_blocks.iter().flat_map(|(_, r)| r.clone()).collect();
+
     // Theta estimates
     eprintln!("\n--- THETA Estimates ---");
     eprintln!(
@@ -118,7 +183,7 @@ pub fn print_results(result: &FitResult) {
     );
     eprintln!("{}", "-".repeat(52));
     for (i, name) in result.theta_names.iter().enumerate() {
-        if nn_theta_indices.contains(&i) {
+        if nn_theta_indices.contains(&i) || blocked_theta_indices.contains(&i) {
             continue;
         }
         let est = result.theta[i];
@@ -141,6 +206,23 @@ pub fn print_results(result: &FitResult) {
             }
         };
         eprintln!("{:<16} {:>12.6} {:>12} {:>10}", label, est, se_str, rse_str);
+    }
+
+    // Compact θ level block summary (#1064). Only independently estimated
+    // contrast coefficients live in `FitResult`; dependent levels are derived.
+    if !theta_blocks.is_empty() {
+        eprintln!("\n--- THETA BLOCKS ---");
+        for (block, range) in &theta_blocks {
+            let (mn, med, mx) = block_summary(&result.theta[range.clone()]);
+            eprintln!(
+                "{}  {} free coefficients   min {:.4}  median {:.4}  max {:.4}",
+                block,
+                range.len(),
+                mn,
+                med,
+                mx
+            );
+        }
     }
 
     // Compact NN-weight summary block (Option E). Skipped when no
@@ -630,6 +712,11 @@ pub fn format_summary(result: &FitResult) -> String {
     #[cfg(not(feature = "nn"))]
     let nn_theta_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
+    // #1064: large θ level blocks get their own compact section.
+    let theta_blocks = compact_theta_blocks(&result.theta_names);
+    let blocked_theta_indices: std::collections::HashSet<usize> =
+        theta_blocks.iter().flat_map(|(_, r)| r.clone()).collect();
+
     // --- THETA ---
     let _ = writeln!(out, "\n--- THETA ---");
     let _ = writeln!(
@@ -638,7 +725,7 @@ pub fn format_summary(result: &FitResult) -> String {
         "Parameter", "Estimate", "SE", "%RSE"
     );
     for (i, name) in result.theta_names.iter().enumerate() {
-        if nn_theta_indices.contains(&i) {
+        if nn_theta_indices.contains(&i) || blocked_theta_indices.contains(&i) {
             continue;
         }
         let est = result.theta[i];
@@ -665,6 +752,21 @@ pub fn format_summary(result: &FitResult) -> String {
             "  {:<16} {:>12.6} {:>12} {:>8}",
             label, est, se_str, rse_str
         );
+    }
+    if !theta_blocks.is_empty() {
+        let _ = writeln!(out, "\n--- THETA BLOCKS ---");
+        for (block, range) in &theta_blocks {
+            let (mn, med, mx) = block_summary(&result.theta[range.clone()]);
+            let _ = writeln!(
+                out,
+                "  {}  {} free coefficients   min {:.4}  median {:.4}  max {:.4}",
+                block,
+                range.len(),
+                mn,
+                med,
+                mx
+            );
+        }
     }
 
     // --- OMEGA ---
@@ -1786,9 +1888,17 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     #[cfg(not(feature = "nn"))]
     let nn_theta_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
+    // #1064: an unstructured-placebo block can carry hundreds of coefficients. Four
+    // keys each would bury the structural parameters under 3,200 lines of
+    // nuisance, so a large block is emitted below as a compact coefficient list
+    // under `theta_blocks:` rather than as top-level keys.
+    let theta_blocks = compact_theta_blocks(&result.theta_names);
+    let blocked_theta_indices: std::collections::HashSet<usize> =
+        theta_blocks.iter().flat_map(|(_, r)| r.clone()).collect();
+
     writeln!(f, "\ntheta:").map_err(|e| e.to_string())?;
     for (i, name) in result.theta_names.iter().enumerate() {
-        if nn_theta_indices.contains(&i) {
+        if nn_theta_indices.contains(&i) || blocked_theta_indices.contains(&i) {
             continue;
         }
         let est = result.theta[i];
@@ -1811,6 +1921,42 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     writeln!(f, "    se: ~").map_err(|e| e.to_string())?;
                     writeln!(f, "    rse_pct: ~").map_err(|e| e.to_string())?;
                 }
+            }
+        }
+    }
+
+    if !theta_blocks.is_empty() {
+        writeln!(f, "\ntheta_blocks:").map_err(|e| e.to_string())?;
+        for (block, range) in &theta_blocks {
+            let (mn, med, mx) = block_summary(&result.theta[range.clone()]);
+            writeln!(f, "  {}:", block).map_err(|e| e.to_string())?;
+            writeln!(f, "    n_free_coefficients: {}", range.len()).map_err(|e| e.to_string())?;
+            writeln!(f, "    min: {:.6}", mn).map_err(|e| e.to_string())?;
+            writeln!(f, "    median: {:.6}", med).map_err(|e| e.to_string())?;
+            writeln!(f, "    max: {:.6}", mx).map_err(|e| e.to_string())?;
+            writeln!(f, "    coefficients:").map_err(|e| e.to_string())?;
+            for i in range.clone() {
+                let label = result.theta_names[i]
+                    .strip_prefix(&format!("{block}["))
+                    .and_then(|r| r.strip_suffix(']'))
+                    .unwrap_or(&result.theta_names[i]);
+                let se = result.se_theta.as_ref().map(|v| v[i]);
+                match se {
+                    Some(se) => writeln!(
+                        f,
+                        "      - {{ label: \"{}\", estimate: {:.6}, se: {:.6}, rse_pct: {:.2} }}",
+                        label,
+                        result.theta[i],
+                        se,
+                        rse_pct(result.theta[i], se)
+                    ),
+                    None => writeln!(
+                        f,
+                        "      - {{ label: \"{}\", estimate: {:.6}, se: ~, rse_pct: ~ }}",
+                        label, result.theta[i]
+                    ),
+                }
+                .map_err(|e| e.to_string())?;
             }
         }
     }
@@ -1844,6 +1990,17 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
             writeln!(f, "    outputs: [{}]", nn.output_names.join(", "))
                 .map_err(|e| e.to_string())?;
             writeln!(f, "    n_weights: {}", nn.n_weights).map_err(|e| e.to_string())?;
+            // Emitted only when the model actually normalises, so a plain network's
+            // block is byte-identical to before. The reported weights are meaningless
+            // without the `(x − center) / scale` they were fitted under, so a consumer
+            // reconstructing the network from this file must see both vectors.
+            if nn.input_center.iter().any(|c| *c != 0.0) || nn.input_scale.iter().any(|s| *s != 1.0)
+            {
+                writeln!(f, "    center: [{}]", fmt_f64_list(&nn.input_center))
+                    .map_err(|e| e.to_string())?;
+                writeln!(f, "    scale: [{}]", fmt_f64_list(&nn.input_scale))
+                    .map_err(|e| e.to_string())?;
+            }
             // Summary statistics over the trained weight values.
             let w_slice = &result.theta[nn.weights_offset..nn.weights_offset + nn.n_weights];
             let (mn, mx, mean, sd) = weight_summary(w_slice);
@@ -2526,6 +2683,85 @@ mod tests {
     }
 
     #[test]
+    fn block_summary_reports_min_median_max_over_the_sorted_values() {
+        // The median is the lower of the two middle values on an even count —
+        // these are a nuisance block, not a quantity anyone interpolates.
+        assert_eq!(block_summary(&[3.0, -1.0, 2.0]), (-1.0, 2.0, 3.0));
+        assert_eq!(block_summary(&[4.0, 1.0, 3.0, 2.0]), (1.0, 2.0, 4.0));
+        assert_eq!(block_summary(&[7.5]), (7.5, 7.5, 7.5));
+    }
+
+    #[test]
+    fn a_small_block_stays_inline_in_the_theta_table() {
+        // Below `THETA_BLOCK_COMPACT_MIN` the behaviour must be exactly what it
+        // was before level blocks existed: one row per θ, no block section.
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        let n = THETA_BLOCK_COMPACT_MIN - 1;
+        r.theta = (1..=n).map(|i| i as f64).collect();
+        r.theta_names = (1..=n).map(|i| format!("SMALL[L={i}]")).collect();
+        r.theta_fixed = vec![false; n];
+        r.se_theta = None;
+
+        assert!(compact_theta_blocks(&r.theta_names).is_empty());
+        let summary = format_summary(&r);
+        assert!(!summary.contains("THETA BLOCKS"), "{summary}");
+        assert!(summary.contains("SMALL[L=1]"), "{summary}");
+    }
+
+    #[test]
+    fn print_results_renders_the_compact_block_section() {
+        // `print_results` writes to stderr, so this asserts it runs the block
+        // branch without panicking on the slicing rather than on its text —
+        // the YAML and summary paths above cover the wording.
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        let n = THETA_BLOCK_COMPACT_MIN + 2;
+        r.theta = (1..=n).map(|i| i as f64).collect();
+        r.theta_names = (1..=n).map(|i| format!("PLACEBO[L={i}]")).collect();
+        r.theta_fixed = vec![false; n];
+        r.se_theta = Some(vec![0.01; n]);
+        print_results(&r);
+
+        let blocks = compact_theta_blocks(&r.theta_names);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].1.len(), n);
+    }
+
+    #[test]
+    fn two_adjacent_blocks_are_reported_separately() {
+        // Runs are keyed on the name before the bracket, so two blocks sitting
+        // next to each other in the θ vector must not merge into one.
+        let n = THETA_BLOCK_COMPACT_MIN;
+        let mut names: Vec<String> = (1..=n).map(|i| format!("A[L={i}]")).collect();
+        names.extend((1..=n).map(|i| format!("B[L={i}]")));
+        let blocks = compact_theta_blocks(&names);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].0, "A");
+        assert_eq!(blocks[1].0, "B");
+        assert_eq!(blocks[0].1, 0..n);
+        assert_eq!(blocks[1].1, n..2 * n);
+    }
+
+    #[test]
+    fn compact_theta_output_reports_free_coefficients_not_levels() {
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        r.theta = (1..=21).map(|i| i as f64).collect();
+        r.theta_names = (1..=21).map(|i| format!("PLACEBO[L={i}]")).collect();
+        r.theta_fixed = vec![false; 21];
+        r.se_theta = None;
+
+        let summary = format_summary(&r);
+        assert!(summary.contains("PLACEBO  21 free coefficients"));
+        assert!(!summary.contains("PLACEBO  21 levels"));
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        write_estimates_yaml(&r, file.path().to_str().unwrap()).unwrap();
+        let yaml = std::fs::read_to_string(file.path()).unwrap();
+        assert!(yaml.contains("n_free_coefficients: 21"));
+        assert!(yaml.contains("coefficients:"));
+        assert!(!yaml.contains("n_levels:"));
+    }
+
+    #[test]
     fn format_summary_block_omega_shows_correlation() {
         // A correlated (block) omega must surface a `corr(...)` line.
         let mut r = make_sigma_only_result(ErrorModel::Additive, vec![1.0]);
@@ -2624,8 +2860,49 @@ mod tests {
             weights_offset: 1,
             input_names: vec!["WT".to_string(), "CRCL".to_string()],
             output_names: vec!["CL".to_string(), "V".to_string()],
+            input_center: vec![0.0, 0.0],
+            input_scale: vec![1.0, 1.0],
         }];
         base
+    }
+
+    /// The fitted weights are only interpretable alongside the `(x − center) / scale` they
+    /// were fitted under, so a normalised network must report both vectors — and an
+    /// un-normalised one must not grow two identity lines it never needed.
+    #[cfg(feature = "nn")]
+    #[test]
+    fn yaml_reports_nn_normalization_only_when_the_model_declares_it() {
+        let write = |result: &FitResult| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("fit.yaml");
+            write_estimates_yaml(result, path.to_str().unwrap()).expect("yaml write");
+            std::fs::read_to_string(&path).expect("yaml read")
+        };
+
+        // Identity transform (the default): no `center:` / `scale:` lines at all.
+        let plain = write(&make_nn_result());
+        assert!(
+            !plain.contains("    center: ["),
+            "an un-normalised network must not report a center:\n{plain}"
+        );
+        assert!(
+            !plain.contains("    scale: ["),
+            "an un-normalised network must not report a scale:\n{plain}"
+        );
+
+        // Declared normalisation: both vectors, in input order.
+        let mut result = make_nn_result();
+        result.neural_networks[0].input_center = vec![70.0, 90.0];
+        result.neural_networks[0].input_scale = vec![15.0, 30.0];
+        let yaml = write(&result);
+        assert!(
+            yaml.contains("    center: [70.000000, 90.000000]"),
+            "center missing or misformatted:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("    scale: [15.000000, 30.000000]"),
+            "scale missing or misformatted:\n{yaml}"
+        );
     }
 
     #[cfg(feature = "nn")]

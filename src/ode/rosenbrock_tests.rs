@@ -636,6 +636,10 @@ fn rosenbrock_solves_a_stiff_binding_system_that_exhausts_rk45() {
 
     // RK45 on the production budget: stability, not accuracy, caps the step, so it burns the
     // whole budget without reaching t = 24.
+    //
+    // Named explicitly rather than taken from `Default`, which is `auto` since #978 — this
+    // system is stiff enough that the probe escalates it, which is the whole point of `auto`
+    // and the exact opposite of what this test needs to observe.
     let mut rk_stats = OdeSolverStats::default();
     let rk = solve_ode_with_stats(
         &binding_rhs,
@@ -646,6 +650,7 @@ fn rosenbrock_solves_a_stiff_binding_system_that_exhausts_rk45() {
         &OdeSolverOptions {
             abstol: 1e-10,
             reltol: 1e-8,
+            method: OdeMethod::Rk45,
             ..Default::default()
         },
         Some(&mut rk_stats),
@@ -1028,13 +1033,19 @@ fn method_tokens_parse_and_round_trip() {
     assert_eq!(OdeMethod::parse("vern7"), Some(OdeMethod::Vern7));
     assert_eq!(OdeMethod::parse("verner7"), Some(OdeMethod::Vern7));
     assert_eq!(OdeMethod::parse("lsoda"), None);
-    assert_eq!(OdeMethod::default(), OdeMethod::Rk45);
+    assert_eq!(OdeMethod::parse("auto"), Some(OdeMethod::Auto));
+    // The default is the probe (#978); the *fallback* it retreats to is RK45. These were the
+    // same value until `auto` became the default and must not be conflated again — reading
+    // `default()` as "the explicit method" is what would make the guard fall back to `auto`.
+    assert_eq!(OdeMethod::default(), OdeMethod::Auto);
+    assert_eq!(OdeMethod::EXPLICIT_FALLBACK, OdeMethod::Rk45);
     for m in [
         OdeMethod::Rk45,
         OdeMethod::Vern7,
         OdeMethod::Rosenbrock23,
         OdeMethod::Rodas4,
         OdeMethod::Rodas5P,
+        OdeMethod::Auto,
     ] {
         assert_eq!(OdeMethod::parse(m.as_str()), Some(m));
     }
@@ -1174,4 +1185,30 @@ fn vern7_carries_its_end_derivative_across_an_accepted_dense_step() {
         "the accepted step's f_end is the next step's k1, so the second step must not \
          re-evaluate it"
     );
+}
+
+/// The Rosenbrock helpers spell out their non-Rosenbrock arms rather than ending in a
+/// catch-all, so that adding an [`OdeMethod`] fails to compile here instead of routing silently
+/// into this stepper. `Auto` joined those arms in #978 — every driver resolves it to a concrete
+/// method first, so reaching them means a caller bypassed the resolution, and the contract is
+/// that it fails loudly at the boundary rather than integrating something wrong.
+#[test]
+fn the_rosenbrock_stepper_refuses_auto_loudly() {
+    for build in [
+        || {
+            let _ = RosStepper::<f64>::new(1, OdeMethod::Auto);
+        },
+        || {
+            let _ = method_gamma(OdeMethod::Auto);
+        },
+        || {
+            let _ = method_err_exp(OdeMethod::Auto);
+        },
+    ] {
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(build));
+        assert!(
+            caught.is_err(),
+            "a non-Rosenbrock method must not be accepted by the Rosenbrock stepper"
+        );
+    }
 }

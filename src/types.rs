@@ -7,6 +7,7 @@ use std::collections::HashMap;
 // inner `Expression` AST stays parser-private — only `IndivParamPartials::empty`
 // and the `Debug`/`Clone` derives are reachable from outside the crate.
 pub use crate::parser::model_parser::IndivParamPartials;
+pub use crate::parser::model_parser::ThetaBlocks;
 
 /// How a dose's infusion `rate`/`duration` are determined.
 ///
@@ -3401,9 +3402,40 @@ pub enum GradientMethod {
 }
 
 impl CompiledModel {
+    /// Vector and data-bound θ level blocks declared by `[parameters]`.
+    ///
+    /// This metadata lives behind the existing opaque `indiv_param_partials`
+    /// field so the feature remains compatible with external `CompiledModel`
+    /// struct literals.
+    pub fn theta_blocks(&self) -> &ThetaBlocks {
+        &self.indiv_param_partials.theta_blocks
+    }
+
     /// Returns true when this model uses ODE integration; false for analytical PK.
     pub fn is_ode_based(&self) -> bool {
         self.ode_spec.is_some()
+    }
+
+    /// Returns true for a **compartment-free** (`$PRED`-equivalent) model — one
+    /// whose `[structural_model]` declares its prediction as an equation with no
+    /// compartments underneath (issue #811).
+    ///
+    /// Such a model has no ODE spec *and* no closed form: its prediction is the
+    /// readout alone. [`Self::pk_model`] holds a placeholder that must never be
+    /// dispatched on, so every site that reads it — the closed-form predictors,
+    /// the dose/absorption validators, the analytic sensitivity gates, the
+    /// starting-estimate heuristics — branches on this predicate first.
+    ///
+    /// **Derived, not stored**, so the two cannot drift: an
+    /// [`AnalyticReadout`] with an EMPTY `state_names` *is* the marker, and one
+    /// can only be built by the parser (the type is `#[non_exhaustive]` and
+    /// every compartment-bearing readout carries at least `central`).
+    pub fn is_algebraic(&self) -> bool {
+        self.ode_spec.is_none()
+            && self
+                .analytic_readout
+                .as_ref()
+                .is_some_and(|ar| ar.state_names.is_empty())
     }
 
     /// The model that should actually serve `subject`'s predictions / sensitivities.
@@ -3495,6 +3527,8 @@ impl CompiledModel {
             ode.solver_opts.abstol = opts.ode_abstol;
             ode.solver_opts.max_steps = opts.ode_max_steps;
             ode.solver_opts.method = opts.ode_method;
+            ode.solver_opts.stiff_abort_after = opts.ode_stiff_abort_after;
+            ode.solver_opts.auto_switch = opts.ode_auto_switch;
         }
         // Also carry the call-time tolerances into the absorption ODE twin (#814). A
         // closed-form transit/IG primary is analytic — the block above is a no-op — but its
@@ -3946,6 +3980,21 @@ impl CompiledModel {
         self.ruv_magnitude.as_ref().is_some_and(|m| m.is_active())
     }
 
+    /// Exact number of free coordinates the outer optimizer searches over.
+    /// This uses the same packed FIX and structural-zero masks as estimation,
+    /// including diagonal/separate BSV and IOV blocks and mixture overrides.
+    pub fn free_packed_dim(&self) -> usize {
+        let p = &self.default_params;
+        let fixed = crate::estimation::parameterization::packed_fixed_mask(p);
+        let structural = crate::estimation::parameterization::omega_structural_zero_mask(p);
+        debug_assert_eq!(fixed.len(), structural.len());
+        fixed
+            .iter()
+            .zip(structural.iter())
+            .filter(|(is_fixed, is_structural)| !**is_fixed && !**is_structural)
+            .count()
+    }
+
     /// Whether any kappa carries a `weight = <expr>` modifier (#1031).
     #[inline]
     pub fn has_weighted_kappa(&self) -> bool {
@@ -4064,6 +4113,14 @@ impl CompiledModel {
             self.ode_spec.is_none(),
             "analytical_compartment_names called on an ODE model — use ode_spec.state_names instead"
         );
+        // A compartment-free model (#811) has no compartments to name. Its
+        // `pk_model` is a placeholder, so the match below would advertise
+        // `["central"]` — and `[derived]` would then resolve a bare `central` to a
+        // compartment reference that reads NaN forever, instead of reporting it as
+        // the undefined name it is.
+        if self.is_algebraic() {
+            return &[];
+        }
         use std::sync::OnceLock;
         // Exhaustive `match` on `pk_model` so adding an 11th `PkModel` variant is a
         // COMPILE error here (a missing arm), not a runtime index-out-of-bounds on a
@@ -4680,6 +4737,12 @@ pub enum WarningCode {
     /// remaining parameters can be estimated instead of the whole fit dying on an
     /// eval-1 optimizer `Failure` (#826).
     FlatParameter,
+    /// An ODE-solver diagnostic from the post-fit pass (#1080 Part B): steps clamped at the
+    /// minimum step size (a stability-limited, freeze-padded segment), a stiff escalation the
+    /// `auto` guard discarded, or a segment cut short by `ode_stiff_abort_after`. Distinct
+    /// from the optimizer codes — it says the *integration* under the final estimates was not
+    /// clean, whatever the optimizer made of it.
+    OdeSolver,
     /// Unrecognised message — fallback bucket.
     General,
 }
@@ -4718,6 +4781,7 @@ impl WarningCode {
             WarningCode::FlipFlop => "flip_flop",
             WarningCode::AbsorptionTwinDeclined => "absorption_twin_declined",
             WarningCode::FlatParameter => "flat_parameter",
+            WarningCode::OdeSolver => "ode_solver",
             WarningCode::General => "general",
         }
     }
@@ -4809,6 +4873,17 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
             WarningSeverity::Warning,
             WarningCode::AbsorptionTwinDeclined,
         )
+    } else if lower.contains("w_ode_solver_escalation_note") {
+        // #1080 Part B: the informational half — `ode_method = auto` escalated and the stiff
+        // method coped. Its own token, so re-classifying the plain message text recovers the
+        // `Info` severity the emitter used rather than promoting a routine note to a warning.
+        (WarningSeverity::Info, WarningCode::OdeSolver)
+    } else if lower.contains("w_ode_solver_diagnostics") {
+        // #1080 Part B: the post-fit solver-statistics pass. Matched on its `W_` token and
+        // placed with the other token arm, ahead of the prose ones — the message names
+        // methods and quotes counters, and "did not converge" style prose could plausibly be
+        // added to it later without anyone remembering this chain exists.
+        (WarningSeverity::Warning, WarningCode::OdeSolver)
     } else if lower.contains("did not converge")
         || lower.contains("without convergence")
         || lower.contains("no multi-start run converged")
@@ -5420,6 +5495,26 @@ pub struct NeuralNetworkInfo {
     pub input_names: Vec<String>,
     /// PK output names in declaration order.
     pub output_names: Vec<String>,
+    /// Per-input `center`, in `input_names` order (all-zero when the model
+    /// declares no normalisation).
+    ///
+    /// Recorded because the network computes on `(x − center) / scale`, not on
+    /// the raw covariate: without these the reported `weights_offset` slice of
+    /// `theta` cannot be evaluated on new data. Consumers that reconstruct the
+    /// network from the fit output (`ferx-r`'s `.fitrx` round-trip) need both
+    /// vectors. `init` is deliberately **not** recorded — it is a starting value
+    /// for the optimizer, superseded by the fitted weights, and says nothing
+    /// about what the converged network computes.
+    ///
+    /// `serde(default)` so a `.fitrx` bundle written before this field existed still
+    /// deserialises; such a bundle predates `center`/`scale` entirely, so the empty
+    /// vector it yields means "no transform" and should be read as the identity.
+    #[serde(default)]
+    pub input_center: Vec<f64>,
+    /// Per-input `scale`, in `input_names` order (all-one when the model declares
+    /// no normalisation). See [`NeuralNetworkInfo::input_center`].
+    #[serde(default)]
+    pub input_scale: Vec<f64>,
 }
 
 /// How the IOV occasion partition — which data rows belong to which occasion —
@@ -5527,12 +5622,41 @@ pub struct FitOptions {
     /// segments. See [`FitOptions::ode_reltol`].
     pub ode_max_steps: usize,
     /// ODE stepper (`[fit_options] ode_method`). Default
-    /// [`Rk45`](crate::ode::OdeMethod::Rk45) — the explicit Dormand-Prince method every
-    /// existing fit uses. The alternatives (`rosenbrock23`, `rodas4`, `rodas5p`) are
-    /// linearly-implicit stiff methods; see [`crate::ode::OdeMethod`] for when they pay and
-    /// which integration paths honour them. Copied onto `OdeSpec::solver_opts` via
+    /// [`Auto`](crate::ode::OdeMethod::Auto) (#978) — an a-priori Jacobian eigenvalue probe
+    /// picks the stepper per integration segment, keeping the explicit
+    /// [`Rk45`](crate::ode::OdeMethod::Rk45) on everything that is not stability-limited.
+    /// Naming a method pins it and skips the probe; `rk45` reproduces the pre-#978 default
+    /// exactly. The stiff alternatives (`rosenbrock23`, `rodas4`, `rodas5p`) are
+    /// linearly-implicit; see [`crate::ode::OdeMethod`] for when they pay and which
+    /// integration paths honour them. Copied onto `OdeSpec::solver_opts` via
     /// [`CompiledModel::sync_ode_solver_opts`], alongside the tolerances.
     pub ode_method: crate::ode::OdeMethod,
+    /// Abort an ODE segment once this many of its steps have clamped at the solver's
+    /// minimum step size (`[fit_options] ode_stiff_abort_after`, #708/#1080). Default
+    /// `None` — grind on to [`ode_max_steps`](Self::ode_max_steps), the pre-#1080
+    /// behaviour.
+    ///
+    /// A clamp means the step failed its error test and was accepted anyway because `dt`
+    /// could not shrink further, i.e. the segment is stability-limited rather than
+    /// accuracy-limited. Setting a budget bounds what such a segment costs; the tail it
+    /// did not integrate is freeze-padded with the last state, so this is a
+    /// cost/accuracy trade, not a free win — the fit's ODE-solver warning reports how
+    /// many segments were cut short. Prefer `ode_method = auto` (the default) or a named
+    /// stiff method first; reach for this when a fit is grinding and you want it to say
+    /// so quickly. Copied onto `OdeSpec::solver_opts` via
+    /// [`CompiledModel::sync_ode_solver_opts`].
+    pub ode_stiff_abort_after: Option<u32>,
+    /// Let `ode_method = auto` change stepper **inside** an integration segment, not only at
+    /// its start (`[fit_options] ode_auto_switch`, #1080 Part C). Default `true`; ignored
+    /// under a named `ode_method`, which is pinned.
+    ///
+    /// The a-priori probe reads the Jacobian at the segment's entry state, which is the state
+    /// a binding model looks least stiff at — both factors of `KON · C · R` are zero when the
+    /// dose lands. With this on, the probe is re-read every 25 accepted steps and the stepper
+    /// is swapped in place when the verdict changes, keeping the state integrated so far.
+    /// Setting it to `false` restores one method per segment, chosen at its start. Copied onto
+    /// `OdeSpec::solver_opts` via [`CompiledModel::sync_ode_solver_opts`].
+    pub ode_auto_switch: bool,
     pub run_covariance_step: bool,
     /// *Initial* relative step size for the finite-difference Hessian in the
     /// covariance step. The actual step for parameter i is
@@ -5558,6 +5682,14 @@ pub struct FitOptions {
     /// (`S⁻¹`) and [`CovarianceMethod::Sandwich`] (`R⁻¹SR⁻¹`) add the per-subject
     /// score cross-product `S`; currently supported for FOCEI and IOV fits.
     pub covariance_method: CovarianceMethod,
+    /// Whether `covariance_method` was set explicitly rather than left at its
+    /// default. Exists only so the high-dimension routing guard (#1064) can
+    /// tell "the user asked for `MATRIX=R`" from "nobody said anything": at a
+    /// few hundred free parameters the FD-of-OFV `R` matrix reconverges every
+    /// subject's EBEs at each of `n(n+1)/2` stencil points, so a *defaulted*
+    /// `Hessian` routes to the cross-product and an explicit one is honoured
+    /// with a warning about the cost.
+    pub covariance_method_set: bool,
     pub interaction: bool,
     pub verbose: bool,
     /// Outer-loop (population parameter) optimizer. Defaults to
@@ -6148,11 +6280,14 @@ impl Default for FitOptions {
             ode_reltol: 1e-4,
             ode_abstol: 1e-6,
             ode_max_steps: 10_000,
-            ode_method: crate::ode::OdeMethod::Rk45,
+            ode_method: crate::ode::OdeMethod::Auto,
+            ode_stiff_abort_after: None,
+            ode_auto_switch: true,
             run_covariance_step: true,
             fd_hessian_step: 1e-2,
             covariance_fallback: CovarianceFallback::None,
             covariance_method: CovarianceMethod::Hessian,
+            covariance_method_set: false,
             analytic_cov_hessian: true,
             interaction: true,
             verbose: true,
@@ -6430,6 +6565,17 @@ impl Optimizer {
         if self != Optimizer::Auto {
             return self;
         }
+        // #1064: BOBYQA builds a quadratic interpolation model of the whole
+        // parameter space. That is the right trade at the handful-of-parameters
+        // scale every other model in this codebase lives at, and hopeless at the
+        // several-hundred an unstructured-placebo MBMA model reaches — the
+        // interpolation set alone is O(n²) points before the first useful step.
+        // Above the threshold `auto` takes the gradient-based optimizer even
+        // though the gradient is finite-difference, because O(n) FD passes beat
+        // O(n²) interpolation.
+        if model.free_packed_dim() > BOBYQA_MAX_DIM {
+            return Optimizer::NloptLbfgs;
+        }
         // Use the single shared predicate so `auto` can never disagree with the
         // outer loop's actual gradient dispatch (#490 review): resolving to a
         // gradient-based optimizer while the loop ran FD would feed it a noisy
@@ -6441,6 +6587,24 @@ impl Optimizer {
         }
     }
 }
+
+/// Free packed dimension above which [`Optimizer::Auto`] refuses BOBYQA (#1064).
+///
+/// BOBYQA's interpolation set grows quadratically in the parameter count, so a
+/// derivative-free quadratic model stops being cheaper than a finite-difference
+/// gradient well before the several-hundred θ an unstructured-placebo MBMA model
+/// declares. 64 is the point past which the derivative-free model, rather than
+/// the objective, dominates the wall clock.
+pub const BOBYQA_MAX_DIM: usize = 64;
+
+/// Free packed dimension above which a *defaulted* `covariance_method = r`
+/// routes to the cross-product (#1064).
+///
+/// The `R` matrix is a finite-difference Hessian of the objective that
+/// reconverges every subject's EBEs at each of `n(n+1)/2` stencil points. At
+/// n = 100 that is ~5,000 reconverged population objectives; at n = 800 it is
+/// ~320,000, which will not finish. The cross-product `S` needs one pass.
+pub const COV_HESSIAN_MAX_DIM: usize = 100;
 
 /// Estimation method
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -6937,6 +7101,8 @@ pub fn framework_keys() -> &'static [&'static str] {
         "ode_abstol",
         "ode_max_steps",
         "ode_method",
+        "ode_stiff_abort_after",
+        "ode_auto_switch",
         // Checkpoint / restart (#755): the periodic resume-point writer is driven
         // by the fit runner independent of the estimation method, so these are
         // framework-level — every method honours them.

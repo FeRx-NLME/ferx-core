@@ -252,12 +252,12 @@ pub fn apply_analytic_readout(
         return;
     };
     let n_states = ar.state_names.len();
-    if n_states == 0 {
-        return;
-    }
     // Canonical order is `["central"]` (IV) or `["depot", "central"]` (oral), so
     // the central amount lands in the last slot and the depot (if any) in slot 0.
-    let central_slot = n_states - 1;
+    // A compartment-free model (#811) has NO amounts at all: `state[]` is empty,
+    // there is no central concentration to convert, and the readout is evaluated
+    // on `θ`/`η`/individual parameters/covariates/`TIME` alone.
+    let central_slot = n_states.checked_sub(1);
     let need_depot = n_states > 1 && ar.state_names[0] == "depot";
 
     // Re-evaluate the readout's individual parameters per observation whenever a
@@ -300,8 +300,11 @@ pub fn apply_analytic_readout(
             &static_pk
         };
         // Central AMOUNT = concentration × V (concentration already carries the
-        // init impulse and per-event/SS dynamics).
-        state[central_slot] = *pred * pk_i.v();
+        // init impulse and per-event/SS dynamics). No-op for a compartment-free
+        // model, whose `state[]` is empty (#811).
+        if let Some(c) = central_slot {
+            state[c] = *pred * pk_i.v();
+        }
         if let Some(d) = &depot_amts {
             state[0] = d.get(i).copied().unwrap_or(0.0);
         }
@@ -973,7 +976,13 @@ pub fn predict_iov(
         })
         .collect();
 
-    let mut preds = if let Some(ref ode) = model.ode_spec {
+    let mut preds = if model.is_algebraic() {
+        // Compartment-free model (#811): nothing to integrate or superpose. The
+        // κ-dependence, if any, lives entirely in the individual parameters the
+        // readout reads, so it enters at the per-occasion readout pass at the
+        // bottom of this function rather than through a concentration.
+        vec![0.0; subject.obs_times.len()]
+    } else if let Some(ref ode) = model.ode_spec {
         crate::ode::ode_predictions_event_driven(
             ode,
             subject,
@@ -1090,11 +1099,47 @@ pub fn predict_iov(
             }
         }
     }
-    // Analytic Form C readout (#650) under IOV: applied once with the BSV eta
-    // (the readout is BSV-only — a κ reference is rejected at parse). The central
-    // concentration already carries the per-occasion dynamics; the readout maps
-    // it (amount = conc × V) into the observed output. No-op unless set.
-    apply_analytic_readout(model, subject, theta, eta_bsv, &mut preds);
+    // Analytic Form C readout (#650) under IOV: evaluated **per occasion**, with that
+    // occasion's `[η_bsv, κ]` — the same split the `[scaling]` pass above uses. An
+    // individual parameter that carries a κ *is* per-occasion by definition, and the
+    // Form C readout is the analogue of NONMEM's `$ERROR`, evaluated per record with
+    // that record's occasion; the ODE path already does exactly this (the readout runs
+    // inside the integrator on the per-observation parameter snapshot). Evaluating it
+    // once with `eta_bsv` (κ = 0) silently used the *typical* value of every κ-carrying
+    // parameter the readout reads — wrong predictions and a wrong objective (#1079).
+    //
+    // The amount reconstruction stays consistent: `apply_analytic_readout` rebuilds the
+    // central amount as `conc × V`, and this occasion's `V` is the same `V` the
+    // concentration was computed with (`obs_params[j]`), so a `y = central / V` readout
+    // still cancels back to the concentration exactly — which is why that (natural)
+    // readout could not show the bug, with or without a κ on `V`.
+    //
+    // A compartment-free model (#811) has no concentration to carry the per-occasion
+    // dynamic at all, so for it the individual parameters the readout reads are the
+    // *only* place κ can enter; it takes the same loop.
+    if model.analytic_readout.is_some() && n_kappa > 0 && !subject.occasions.is_empty() {
+        // Guarded on `subject.occasions` (not `occ_groups`) for the same reason the
+        // scaling pass is: `iov_occasion_groups` appends dose-only occasions that
+        // own no observation, so a non-empty `occ_groups` does not imply every
+        // observation is labelled. Unlabelled subjects fall through to the shared
+        // κ = 0 call below, which is what the non-IOV path does too.
+        let raw = preds.clone();
+        for (occ_id, obs_indices) in &occ_groups {
+            if obs_indices.is_empty() {
+                continue;
+            }
+            let combined = combined_for(*occ_id);
+            let mut occ_preds = raw.clone();
+            apply_analytic_readout(model, subject, theta, &combined, &mut occ_preds);
+            for &j in obs_indices {
+                preds[j] = occ_preds[j];
+            }
+        }
+    } else {
+        // No readout (the no-op call), no κ (the per-occasion loop would rebuild the
+        // identical `[η_bsv]` vector), or no observation carries an occasion label.
+        apply_analytic_readout(model, subject, theta, eta_bsv, &mut preds);
+    }
     // LTBS log-wrap. The IOV dispatch above is total (ODE or event-driven), so
     // this is the single log-wrap point for the IOV path — predictions are
     // logged exactly once.
@@ -1830,7 +1875,14 @@ pub fn compute_predictions_with_states(
         // TV covariates); states via predict_all_states (superposition only — valid
         // for the no-reset, no-TV case).
         let ipred = compute_predictions_with_tv(model, subject, theta, eta);
-        let states = if !model.analytical_init.is_empty() {
+        let states = if model.is_algebraic() {
+            // A compartment-free model (#811) has no compartments to report. Its
+            // `pk_model` is a placeholder, so the superposition below would happily
+            // reconstruct one-compartment IV amounts — all zero, since there are no
+            // doses — and present them as this model's state. Outer-empty → NaN
+            // compartments, the same convention the reset / TV / IOV cases use.
+            vec![]
+        } else if !model.analytical_init.is_empty() {
             // [initial_conditions] baseline (#521): ipred is init-aware (the
             // closed-form baseline is layered onto the central readout), but the
             // superposition state reconstruction does not yet seed the baseline
@@ -2204,7 +2256,14 @@ pub fn compute_predictions_with_tv_into_with_schedule(
     let has_tv = subject.has_tv_covariates();
     let uses_time = model_uses_time_builtin(model);
 
-    let mut preds = if let Some(ref ode) = model.ode_spec {
+    let mut preds = if model.is_algebraic() {
+        // Compartment-free model (#811): there is no state to integrate and no
+        // closed form to evaluate — the `[structural_model]` readout *is* the
+        // prediction. These zeros are never read: `apply_analytic_readout` builds
+        // an empty `state[]` for such a model (no `central = conc × V` step) and
+        // overwrites every entry with the readout's value.
+        vec![0.0; subject.obs_times.len()]
+    } else if let Some(ref ode) = model.ode_spec {
         // ODE path. Resets (EVID=3/4) need the state-propagating event-driven
         // walker too, even without time-varying covariates — the plain
         // `ode_predictions` loop has no reset event.
@@ -3213,6 +3272,191 @@ mod tests {
         assert_eq!(a.len(), o.len());
         for (av, ov) in a.iter().zip(o.iter()) {
             assert_relative_eq!(av, ov, max_relative = 1e-6, epsilon = 1e-9);
+        }
+    }
+
+    /// Two-occasion IOV subject for the Form C readout cross-engine checks (#1079):
+    /// a dose at t = 0 (occasion 1) and at t = 24 (occasion 2), two samples inside
+    /// each occasion. No washout, so the occasion-2 samples carry occasion-1 drug.
+    fn iov_readout_subject() -> Subject {
+        let obs_times = vec![1.0, 3.0, 25.0, 27.0];
+        let n = obs_times.len();
+        Subject {
+            id: "1".to_string(),
+            doses: vec![bolus_dose(0.0, 100.0), bolus_dose(24.0, 100.0)],
+            obs_times,
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; n],
+            obs_cmts: vec![1; n],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; n],
+            occasions: vec![1, 1, 2, 2],
+            obs_l2: Vec::new(),
+            dose_occasions: vec![1, 2],
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        }
+    }
+
+    /// **Regression (#1079): a Form C readout under IOV must be evaluated with the
+    /// observation's own occasion κ.**
+    ///
+    /// `apply_analytic_readout` builds the readout's individual parameters from a
+    /// `pk_param_fn` snapshot; under IOV `predict_iov` used to call it once with
+    /// `eta_bsv` — the between-subject η with **κ held at 0**. The concentration it
+    /// was handed did carry the occasion's κ (the event-driven walk uses per-occasion
+    /// PK params), but every individual parameter the readout itself read was frozen
+    /// at its typical value, so an additive κ-carrying baseline was silently dropped
+    /// from the prediction and the objective (12–20% on the reproduction below).
+    ///
+    /// The oracle is cross-engine: the hand-written ODE twin applies the same readout
+    /// inside the integrator against the per-observation parameter snapshot, which is
+    /// also NONMEM's per-record `$ERROR` convention. It is the only oracle that
+    /// catches this — a `Dual2`-vs-FD parity test passes against the wrong function,
+    /// because the analytic sensitivity path was seeded to match it (see
+    /// `iov_form_c_kappa_baseline_readout_provider_matches_fd`).
+    ///
+    /// The decomposition is checked too: `y − central/V` must equal `BASE` evaluated
+    /// at *that observation's* κ, which pins the fix to the per-occasion parameter
+    /// snapshot rather than to a compensating error elsewhere.
+    #[test]
+    fn analytic_form_c_iov_readout_uses_occasion_kappa_matching_ode_twin() {
+        use crate::parser::model_parser::parse_model_string;
+        let params = "\
+[parameters]
+  theta TVCL(3.0, 0.01, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  theta TVBASE(2.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_B ~ 0.04
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  BASE = TVBASE * exp(KAPPA_B)
+";
+        let tail = "\
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  iov_column = OCC
+  ode_reltol = 1e-12
+  ode_abstol = 1e-12
+";
+        // Closed-form and its hand-written ODE twin, same `[scaling]` readout.
+        let analytic = parse_model_string(&format!(
+            "{params}[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
+             [scaling]\n  y = central / V + BASE\n{tail}"
+        ))
+        .expect("analytic parses");
+        let ode = parse_model_string(&format!(
+            "{params}[structural_model]\n  ode(states=[central])\n\
+             [odes]\n  d/dt(central) = -(CL / V) * central\n\
+             [scaling]\n  y = central / V + BASE\n{tail}"
+        ))
+        .expect("ode twin parses");
+        // The readout's `V` divisor cancels the `conc × V` amount reconstruction, so
+        // this (natural) readout cannot show the bug — pinned below so the fix does
+        // not break the load-bearing cancellation.
+        let conc_only = parse_model_string(&format!(
+            "{params}[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
+             [scaling]\n  y = central / V\n{tail}"
+        ))
+        .expect("identity readout parses");
+        // Same model with no readout at all — the built-in concentration output.
+        let plain = parse_model_string(&format!(
+            "{params}[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n{tail}"
+        ))
+        .expect("plain parses");
+        assert_eq!(analytic.n_kappa, 1, "one occasion random effect");
+        assert!(analytic.analytic_readout.is_some() && analytic.ode_spec.is_none());
+        assert!(ode.ode_spec.is_some());
+
+        let subj = iov_readout_subject();
+        let theta = [3.0, 20.0, 2.0];
+        let eta_bsv = [0.1];
+        let kappas = vec![vec![0.5], vec![-0.4]];
+
+        let a = predict_iov(&analytic, &subj, &theta, &eta_bsv, &kappas);
+        let o = predict_iov(&ode, &subj, &theta, &eta_bsv, &kappas);
+        assert_eq!(a.len(), subj.obs_times.len());
+        for (j, (av, ov)) in a.iter().zip(o.iter()).enumerate() {
+            assert_relative_eq!(av, ov, max_relative = 1e-8, epsilon = 1e-12);
+            assert!(av.is_finite(), "obs {j} finite");
+        }
+
+        // Decomposition: the readout output minus the concentration is `BASE` at the
+        // observation's own occasion κ (`2·e^0.5` in occasion 1, `2·e^−0.4` in
+        // occasion 2), NOT the typical value `2` the κ = 0 snapshot produced.
+        let c = predict_iov(&plain, &subj, &theta, &eta_bsv, &kappas);
+        let expected_base = [
+            2.0 * 0.5_f64.exp(),
+            2.0 * 0.5_f64.exp(),
+            2.0 * (-0.4_f64).exp(),
+            2.0 * (-0.4_f64).exp(),
+        ];
+        for (j, (av, cv)) in a.iter().zip(c.iter()).enumerate() {
+            assert_relative_eq!(av - cv, expected_base[j], max_relative = 1e-10);
+            assert!(
+                (av - cv - 2.0).abs() > 0.5,
+                "obs {j}: baseline must not collapse to the κ = 0 typical value"
+            );
+        }
+
+        // The `y = central / V` cancellation still holds: the amount is rebuilt as
+        // `conc × V` with the *same* `V` the readout divides by, so the per-occasion
+        // evaluation must not perturb it (the round-trip is exact to rounding).
+        let ident = predict_iov(&conc_only, &subj, &theta, &eta_bsv, &kappas);
+        for (iv, cv) in ident.iter().zip(c.iter()) {
+            assert_relative_eq!(iv, cv, max_relative = 1e-14);
+        }
+    }
+
+    /// The `y = central / V` cancellation with a κ **on `V` itself** (#1079 fix note
+    /// 3). The predictor rebuilds the central amount as `conc × V` and the readout
+    /// divides by the same `V`; both now come from the observation's occasion, so the
+    /// two must still cancel (exactly, up to the multiply/divide round-trip). Reading
+    /// `V` from a κ = 0 snapshot on one side only would break this by `exp(κ)`.
+    #[test]
+    fn analytic_form_c_iov_identity_readout_cancels_kappa_on_v() {
+        use crate::parser::model_parser::parse_model_string;
+        let params = "\
+[parameters]
+  theta TVCL(3.0, 0.01, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_V ~ 0.04
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV * exp(KAPPA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+";
+        let tail = "\
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  iov_column = OCC
+";
+        let ident =
+            parse_model_string(&format!("{params}[scaling]\n  y = central / V\n{tail}")).unwrap();
+        let plain = parse_model_string(&format!("{params}{tail}")).unwrap();
+
+        let subj = iov_readout_subject();
+        let theta = [3.0, 20.0];
+        let eta_bsv = [0.1];
+        let kappas = vec![vec![0.5], vec![-0.4]];
+        let y = predict_iov(&ident, &subj, &theta, &eta_bsv, &kappas);
+        let c = predict_iov(&plain, &subj, &theta, &eta_bsv, &kappas);
+        assert_eq!(y.len(), c.len());
+        for (yv, cv) in y.iter().zip(c.iter()) {
+            assert_relative_eq!(yv, cv, max_relative = 1e-14);
         }
     }
 

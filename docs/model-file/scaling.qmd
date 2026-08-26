@@ -98,6 +98,18 @@ per observation and `TIME` resolves to each row's own time.
 
 ## Form C — explicit output expression
 
+::: {.callout-note}
+## A model with no compartments belongs in `[structural_model]`, not here
+
+Form C is a readout **on top of** a compartment model. If the prediction is an
+equation with no compartments underneath — a dose-response curve, a response
+time-course, a meta-regression — write it directly in `[structural_model]`
+instead; it uses this same grammar, including the named intermediates and
+continuation lines described below. See [Compartment-Free Models](structural-model.qmd#compartment-free-models-the-pred-equivalent).
+A `[scaling]` block alongside such a model is rejected: that block already
+declares the prediction.
+:::
+
 Use when the built-in concentration readout is not the observed quantity —
 e.g. an ODE state is held as an amount and the observation is a concentration,
 or the observation is a nonlinear function of the concentration (a
@@ -387,14 +399,16 @@ above), the dose-attribute double-use rejection sees through them, and the
 analytic-sensitivity path is unaffected. The one consequence of inlining is that
 an intermediate used twice is *evaluated* twice — which is exactly what writing
 it out by hand costs. Note that `min` / `max` count as two uses each (see below),
-so a two-sided clamp on a named value expands that value eight times.
+so a two-sided clamp on a named value expands that value four times — or three
+times written as `clamp(x, lo, hi)`.
 
-### `min(a, b)` and `max(a, b)`
+### `min(a, b)`, `max(a, b)` and `clamp(x, lo, hi)`
 
-Two-argument `min` / `max` are available in every expression the DSL parses —
-`[scaling]`, `[individual_parameters]`, `[odes]`, `[derived]`. They desugar to the
-inline conditional (`max(a, b)` → `if (a >= b) a else b`), so they differentiate
-and compile exactly like the hand-written form.
+Two-argument `min` / `max` and three-argument `clamp` are available in every
+expression the DSL parses — `[scaling]`, `[individual_parameters]`, `[odes]`,
+`[derived]`. They desugar to the inline conditional (`max(a, b)` →
+`if (a >= b) a else b`), so they differentiate and compile exactly like the
+hand-written form.
 
 The desugaring puts **both** arguments in the guard *and* in a branch, so each one
 appears twice in the compiled tree, and the duplication multiplies through nesting:
@@ -403,11 +417,32 @@ two places in a readout makes eight. Clamp a *named* value rather than a long
 expression — that is the pairing the block above uses, and it keeps the growth on a
 short leaf instead of on a whole sub-model.
 
+`clamp(x, lo, hi)` is the two-sided bound written as one call, and desugars to the
+same nested conditional the pair does: `if (x <= lo) lo else if (x >= hi) hi else x`.
+On each bound the *bound* is returned, so the derivative there is zero. It puts `x`
+in the tree three times rather than the nested form's four, but the advice above is
+unchanged — clamp a named value, not a long expression. Any arity other than three
+is a parse error, and literal bounds the wrong way round (`clamp(x, 0.9, 0.1)`) are
+rejected rather than silently returning a bound for every `x`; bounds that are not
+both literals are not checked.
+
+`clamp` differs from the nested pair in one place, deliberately: on a `NaN` input.
+`NaN` fails both `x <= lo` and `x >= hi`, so `clamp` falls through to `x` and the
+`NaN` propagates — into the prediction, and from there into the objective
+function, where it is caught. The nested `min(max(x, lo), hi)` instead returns
+`lo`, because `max`'s `x >= lo` is false for `NaN` and the `else` branch is the
+bound. So if you rewrite an existing `min`/`max` pair as `clamp` around a
+quantity that can go `NaN` — a `log` or `sqrt` of something that dips negative
+mid-search, say — that model was being quietly pinned to `lo`, and will now
+surface the `NaN` instead. That is the intended direction: a silently bounded
+`NaN` is a wrong number that fits.
+
 In `[derived]`, `min` / `max` also name the row aggregate (`max(IPRED, TIME > 0)` is
 "the largest `IPRED` over rows where `TIME > 0`"). The two are told apart by the
 second argument: a comparison is a row filter, anything else is the numeric clamp.
 An aggregate cannot be combined into a larger expression — `max(IPRED) * 2` is an
-error, not a scaled maximum.
+error, not a scaled maximum. `clamp` has no aggregate spelling, so it is
+unambiguous there.
 
 ## Runtime behaviour on bad scales
 
@@ -441,7 +476,7 @@ All `[scaling]` variants on the **analytical PK path** support the default
 | Expression `obs_scale = <expr>` | subject-static analytic | exact FD | See subject-static caveat below. |
 | Per-CMT `obs_scale[CMT=N]` | subject-static analytic | exact FD | One per-observation scale entry per observation, dispatched by `subject.obs_cmts[i]`. |
 | Form C `y[…] = <expr>` (ODE) | exact analytic (in-scope ODE) | exact FD | Since #410/#439 the ODE sensitivity provider differentiates the Form C readout — uniform `y = <expr>` and per-CMT `y[CMT=N] = <expr>` — over `Dual2`/`Dual1` (outer and inner), including **covariate references** in the readout (#540): a covariate threads in as a constant from the per-observation snapshot, so a free→total protein-binding readout gated on a `FREE` flag stays analytic. A θ or η referenced *directly* in the readout (rather than via an `[individual_parameters]` entry) is also analytic since #486 — the parser desugars each bare `THETA(i)`/`ETA(k)` into a hidden individual parameter, so the readout's `∂y/∂θ`/`∂y/∂η` rides the individual-parameter sensitivity chain; only a readout referencing a neural-network output, or other out-of-scope ODE features (input-rate/SDE, unsupported steady-state combinations, …), still falls back to FD. |
-| Form C `y = <expr>` (analytical) | exact analytic | exact FD | Since #650 the analytic sensitivity provider differentiates an analytical Form C readout over `Dual2`/`Dual1` (outer and inner), on the static dose-superposition path, the **time-varying-covariate / oral-infusion event-walk** path, and (since #655) **IOV** subjects (`kappa` declarations) — so a readout gated on a per-row covariate (a free-vs-total `FREE` flag) stays analytic, including under IOV. The readout's central-compartment amount (`concentration × V`), the individual parameters it references — **including non-structural ones** like a binding `BMAX`/`KD`, which get a free differentiable PK slot — and covariates all flow through the exact η/θ chain; under IOV the readout parameters are BSV-only (a `kappa` reference is rejected at parse), so only the concentration carries the occasion κ. A θ or η referenced **directly** in the readout (rather than via an `[individual_parameters]` entry) is analytic too since #486, the same way it is on the ODE path above: the parser desugars each bare reference into a hidden individual parameter, which then draws a free differentiable PK slot like any other non-structural readout parameter. Falls back to FD (with a parse warning; the prediction stays exact) for: a readout referencing the oral **depot** amount, a per-CMT `y[CMT=N]`, a neural-network reference, a `[initial_conditions]` baseline, or a readout whose non-structural parameters — the desugared θ/η included — overflow the free differentiable slots this PK model leaves spare. A model whose readout parameters fit the spare slots but push the *total* differentiated-parameter count past the width the closed-form sensitivity kernels are compiled for likewise falls back to FD, and since #486 it is **reported** as `fd` rather than mislabelled `analytic`. |
+| Form C `y = <expr>` (analytical) | exact analytic | exact FD | Since #650 the analytic sensitivity provider differentiates an analytical Form C readout over `Dual2`/`Dual1` (outer and inner), on the static dose-superposition path, the **time-varying-covariate / oral-infusion event-walk** path, and (since #655) **IOV** subjects (`kappa` declarations) — so a readout gated on a per-row covariate (a free-vs-total `FREE` flag) stays analytic, including under IOV. The readout's central-compartment amount (`concentration × V`), the individual parameters it references — **including non-structural ones** like a binding `BMAX`/`KD`, which get a free differentiable PK slot — and covariates all flow through the exact η/θ chain; under IOV the readout is evaluated **per occasion**, with that observation's `[η, κ]` — so an individual parameter that carries a `kappa` (say an additive baseline `BASE = TVBASE * exp(KAPPA_B)`) takes its occasion value, exactly as NONMEM's per-record `$ERROR` does. (Before #1079 the closed-form path evaluated those parameters at `kappa = 0`; the ODE path was always per-occasion. A readout referencing `KAPPA_*` **directly** is still rejected at parse — put the occasion dependence in an individual parameter and reference that.) A θ or η referenced **directly** in the readout (rather than via an `[individual_parameters]` entry) is analytic too since #486, the same way it is on the ODE path above: the parser desugars each bare reference into a hidden individual parameter, which then draws a free differentiable PK slot like any other non-structural readout parameter. Falls back to FD (with a parse warning; the prediction stays exact) for: a readout referencing the oral **depot** amount, a per-CMT `y[CMT=N]`, a neural-network reference, a `[initial_conditions]` baseline, or a readout whose non-structural parameters — the desugared θ/η included — overflow the free differentiable slots this PK model leaves spare. A model whose readout parameters fit the spare slots but push the *total* differentiated-parameter count past the width the closed-form sensitivity kernels are compiled for likewise falls back to FD, and since #486 it is **reported** as `fd` rather than mislabelled `analytic`. |
 
 **Analytic outer gradient handles expression scaling exactly.** The analytic
 sensitivity provider that drives the gradient-based outer optimizers (`bfgs`,

@@ -13,21 +13,35 @@ on:
   push:
     branches: [main]
     paths:
-      # Re-run when something touches the code that the heavy fits exercise.
-      # `src/ode/solver.rs` is in the list because the EKF in `src/ode/ekf.rs`
-      # uses `solve_ode` from it — a change to the integrator otherwise
-      # wouldn't trigger this workflow until the next scheduled run.
-      - 'src/api.rs'
-      - 'src/estimation/**'
-      - 'src/ode/ekf.rs'
-      - 'src/ode/predictions.rs'
-      - 'src/ode/solver.rs'
-      # The parser compiles every model the heavy fits run, so a change to model
-      # compilation (e.g. the structural-param binding in #261) can shift a fit's
-      # objective or break it outright — including the NONMEM-anchored slow test
-      # in tests/structural_param_nonmem.rs.
-      - 'src/parser/**'
-      - 'src/stats/likelihood.rs'
+      # One rule, no per-module judgement: re-run when a push to `main` touches the code
+      # compiled into this job's test binaries, the data those tests read, or the
+      # definition of the job itself.
+      #
+      # It is deliberately NOT a curated list of "modules that can move a fit". That list
+      # existed and it rotted: `src/api.rs` was named here, the file became `src/api/`, and
+      # the glob went dead — silently, for months, because a stale glob and a live one look
+      # identical in review (#949). Enumerating by module also makes every new module a
+      # silent omission until someone remembers; that is how `src/pk`, `src/survival`,
+      # `examples/` and `nonmem_anchor/` all ended up uncovered.
+      #
+      # Measured over the last 400 first-parent commits on `main`: the original 7-entry
+      # filter fired on 292, a per-module list on 359, and this one on 363. So curating
+      # bought 4 skipped runs in 400 (1% — one of them a `Cargo.lock` bump that should run
+      # anyway) while silently missing 67. That is the trade, and it is not close.
+      #
+      # `tests/slow_test_path_filter.rs` pins this list in both directions: every input the
+      # suite reads must be matched here, and every entry here must match a tracked file.
+      # The input roots it checks against are derived from the tree and from the fixture
+      # paths the tests themselves open — so a new module or fixture directory fails that
+      # test until it is added below, rather than going quietly uncovered.
+      - '.github/workflows/slow-tests.yml'  # the feature set / cargo command this job runs
+      - 'Cargo.lock'                        # a nlopt/nalgebra/rand bump moves fit numbers and RNG streams
+      - 'Cargo.toml'                        # the `ci-test` profile + the `slow-tests` / `survival` features
+      - 'data/**'                           # fixture CSVs the fits read by literal path
+      - 'examples/**'                       # `.ferx` models the anchors load (e.g. the adaptive vanco suite)
+      - 'nonmem_anchor/**'                  # committed NONMEM control streams, data and `.phi` references
+      - 'src/**'                            # everything linked into the fits
+      - 'tests/**'                          # the gated fits themselves + the shared tests/common harness
 
 env:
   CARGO_TERM_COLOR: always

@@ -8,6 +8,7 @@ pub mod impmap;
 pub mod importance_sampling;
 pub mod inner_optimizer;
 pub mod mixture;
+pub(crate) mod nn_theta_gradient;
 pub mod outer_optimizer;
 pub mod parameterization;
 pub mod run_covariance;
