@@ -103,7 +103,7 @@ These run nightly via `slow-tests.yml` and on any push to `main` that touches es
 > added when that tool is available in the environment; its absence does not block the closed-form
 > + reduction validation above.
 
-**A NONMEM anchor must keep every side of the object under test non-degenerate.** A
+**An oracle — NONMEM anchor, ODE twin, or FD parity — must keep every side of the object under test non-degenerate.** A
 single-dose dataset cannot test a dose event's *incoming* side: the state is zero
 before a first arrival, so `g(x⁻) = 0` and any error there cancels rather than
 showing up. Pair every dose-event anchor with a **multi-dose** case whose later dose
