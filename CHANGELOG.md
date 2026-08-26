@@ -80,7 +80,8 @@ section of the SDLC for the versioning policy).
   correct. Everything in the repository stays MIT **except** `data/mbma_naproxen.csv`, which carries
   CC BY-NC 4.0 — so commercial use of that file is not granted. The exception is recorded in the
   root `LICENSE`, in `data/mbma_naproxen.LICENSE`, and in the data README, and `Cargo.toml` now
-  excludes the files so the crate published to crates.io is uniformly MIT. The data itself is
+  excludes the files — together with the slow test that reads them, which would otherwise panic on a
+  missing fixture — so the crate published to crates.io is uniformly MIT. The data itself is
   unchanged but for one digit: the tutorial's precomputed `WP / WPSE` column stores 7 decimals, and
   for one of 122 rows that intermediate rounds the sixth decimal down where the primary source's
   `WP` and `WPSE` round it up. No estimate or OFV moves.

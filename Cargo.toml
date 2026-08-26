@@ -12,8 +12,11 @@ readme = "README.md"
 # the crate published to crates.io free of any CC BY-NC file. The glob also takes
 # its README and licence companions, which are MIT / Creative Commons' own text
 # respectively — they are dropped because they are meaningless without the data,
-# not because of their licence.
-exclude = ["data/mbma_naproxen.*"]
+# not because of their licence. The slow test goes with them for the same reason:
+# it hardcodes the fixture path, so shipping it without the data would turn
+# `cargo test --features slow-tests` on the packaged crate into a panic on a
+# missing file rather than a test that simply is not there.
+exclude = ["data/mbma_naproxen.*", "tests/mbma_naproxen_case_study.rs"]
 
 [[bin]]
 name = "ferx"

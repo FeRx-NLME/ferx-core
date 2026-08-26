@@ -46,7 +46,23 @@ The upstream file is 3,709 bytes, `sha256`
 `c3753cea5dd664c19b32b11117d9baafdef44a81e2808df1582f49e3b69d9190`; the derived
 CSV committed here is `sha256`
 `4370af48bfda41872f4b7f09a44a4a31c72c80582099c58aa67c965c84641ab4`. If a
-re-derivation does not reproduce the second hash, the difference is a finding.
+re-derivation does not reproduce the second hash, the difference is a finding —
+and the script enforces that rather than trusting it: it hashes what it is about
+to write, refuses to write anything on a mismatch, and only proceeds if you pass
+`--allow-new-hash` to say the change is intended. Record the new hash here when
+you do.
+
+Two other checks guard against a re-issued supplementary file that keeps the
+shape but changes what the columns mean. `NFLG` is written into both `ARM` and
+`TRT` without being interpreted, so the script reads the response to confirm the
+flag still means what it is taken to mean: in each study it compares the two arms
+at their last shared time point, and all 18 must — as they do — have `NFLG == 1`
+lower. A recoded flag would otherwise emit an inverted `TRT` and estimate the
+naproxen effect on Emax with the wrong sign. And `WPSE` is checked to be exact at
+the 9 decimals it is written with, since `DV` is computed from the full-precision
+value: a 10th decimal upstream would divide `DV` by a different number than the
+`WPSE` the model divides the prediction by, silently perturbing the `1/WPSE²`
+weighting.
 
 ### A note on Bracis et al.
 
