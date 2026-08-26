@@ -1261,3 +1261,128 @@ fn snapshots_disagreeing_with_the_static_map_decline_the_plan() {
         "agreement on the network's own inputs must be sufficient"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #1016 follow-up: a model that reads a generated weight theta directly
+// ---------------------------------------------------------------------------
+//
+// `theta_names` is extended with the generated `W_…` / `B_…` names *before*
+// `[individual_parameters]` parses, so a model can name one of them. The hybrid
+// factorization is exact only while the weights reach the likelihood through
+// the network output alone, so this must route to the plain per-theta FD loop
+// rather than return a gradient that smears the direct term across the block.
+
+/// The DCM fixture with an output bias added directly to `CL`.
+fn dcm_direct_bias_src() -> String {
+    dcm_model_src().replace(
+        "  CL = TYPICAL_PK.CL * exp(ETA_CL)",
+        "  CL = TYPICAL_PK.CL * exp(ETA_CL) + B_TYPICAL_PK_2_1",
+    )
+}
+
+/// The same, but reading a non-bias weight — the variant where the direct term
+/// is dropped entirely rather than misattributed, because only output biases
+/// are perturbed.
+fn dcm_direct_weight_src() -> String {
+    dcm_model_src().replace(
+        "  CL = TYPICAL_PK.CL * exp(ETA_CL)",
+        "  CL = TYPICAL_PK.CL * exp(ETA_CL) + W_TYPICAL_PK_1_1_1",
+    )
+}
+
+#[test]
+fn a_direct_weight_reference_parses_and_is_recorded() {
+    // The premise of the finding: this really is accepted syntax. If a future
+    // change rejects it at parse time instead, this test is the one that says
+    // so out loud rather than letting the decline path quietly go dead.
+    for src in [dcm_direct_bias_src(), dcm_direct_weight_src()] {
+        let model = parse_model_string(&src).expect("a direct weight reference parses");
+        assert!(
+            model.parse_warnings.iter().any(|w| w
+                .contains(crate::parser::model_parser::NN_WEIGHT_DIRECT_REFERENCE_MARKER)),
+            "the direct reference must be recorded: {:?}",
+            model.parse_warnings
+        );
+    }
+}
+
+#[test]
+fn the_plain_dcm_model_records_no_direct_reference() {
+    // The marker has to discriminate, or it would disable the hybrid for every
+    // NN model and the shortcut would never run at all.
+    let model = parse_model_string(&dcm_model_src()).expect("DCM parses");
+    assert!(
+        !model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains(crate::parser::model_parser::NN_WEIGHT_DIRECT_REFERENCE_MARKER)),
+        "a network read only through its outputs must keep the hybrid: {:?}",
+        model.parse_warnings
+    );
+}
+
+#[test]
+fn nn_grad_plan_declines_a_direct_weight_reference() {
+    for src in [dcm_direct_bias_src(), dcm_direct_weight_src()] {
+        let model = parse_model_string(&src).expect("parses");
+        let subject = static_subject();
+        let theta = probe_theta(&model);
+        let n_theta = theta.len();
+        assert!(
+            NnGradPlan::build(&model, &subject, &theta, n_theta).is_none(),
+            "a direct weight reference must route to the per-theta FD path"
+        );
+    }
+}
+
+/// The regression the finding asked for: with the shortcut declined, the theta
+/// gradient of a model that reads a weight directly matches central finite
+/// differences.
+///
+/// Before the fix the reported probe was `hybrid = -1.597e-1` against
+/// `central = -6.379e-2` — a relative error of 0.6 on `theta[1]`, silently fed
+/// to SAEM/IMP/VI.
+#[test]
+fn a_direct_weight_reference_still_matches_central_fd() {
+    for src in [dcm_direct_bias_src(), dcm_direct_weight_src()] {
+        let model = parse_model_string(&src).expect("parses");
+        let subject = static_subject();
+        let theta = probe_theta(&model);
+        let sigma_values = vec![0.2f64];
+        let eta = vec![0.15f64, -0.1f64];
+        let n_theta = theta.len();
+        let n_sigma = sigma_values.len();
+        let (mask, lo, hi) = unpinned(&model, n_theta + n_sigma);
+
+        let mut scratch = EventPkParams::default();
+        let (_nll, grad) = obs_nll_subject_grad(
+            &model,
+            &subject,
+            &theta,
+            &sigma_values,
+            &eta,
+            &mask,
+            &lo,
+            &hi,
+            n_theta,
+            n_sigma,
+            &mut scratch,
+        );
+        let reference = central_fd_theta_grad(&model, &subject, &theta, &sigma_values, &eta, &mask);
+
+        // Every theta, not just the NN block: the directly-referenced weight is
+        // exactly the coordinate the shortcut got wrong.
+        let peak = reference.iter().map(|g| g.abs()).fold(0.0f64, f64::max);
+        assert!(peak > 0.0, "the probe must carry signal");
+        for i in 0..n_theta {
+            let tol = 1e-4 * peak.max(1.0);
+            assert!(
+                (grad[i] - reference[i]).abs() < tol,
+                "theta[{i}]: got {:.8e}, central FD {:.8e} (abs diff {:.2e} > {tol:.2e})",
+                grad[i],
+                reference[i],
+                (grad[i] - reference[i]).abs()
+            );
+        }
+    }
+}

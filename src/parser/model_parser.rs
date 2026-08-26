@@ -1195,6 +1195,58 @@ fn collect_assigned_names_in_if(stmt: &Statement) -> std::collections::HashSet<S
     names
 }
 
+thread_local! {
+    /// θ indices referenced by name anywhere in the model being parsed.
+    ///
+    /// Populated by [`record_theta_reference`] at the single point in
+    /// `parse_atom` where an identifier resolves to a θ, so it covers every
+    /// block that parses expressions rather than only the ones a dedicated
+    /// walker remembers to visit.
+    static REFERENCED_THETAS: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// RAII guard for [`REFERENCED_THETAS`], restoring the previous list on drop so
+/// a nested parse (the absorption ODE-equivalent source is compiled inside the
+/// primary parse) cannot leak its references into the enclosing model.
+pub(crate) struct ThetaRefScope(Vec<usize>);
+
+impl ThetaRefScope {
+    fn enter() -> Self {
+        ThetaRefScope(REFERENCED_THETAS.with(|c| c.replace(Vec::new())))
+    }
+
+    /// θ indices referenced so far in this scope.
+    fn recorded() -> Vec<usize> {
+        REFERENCED_THETAS.with(|c| c.borrow().clone())
+    }
+}
+
+impl Drop for ThetaRefScope {
+    fn drop(&mut self) {
+        REFERENCED_THETAS.with(|c| *c.borrow_mut() = std::mem::take(&mut self.0));
+    }
+}
+
+fn record_theta_reference(idx: usize) {
+    REFERENCED_THETAS.with(|c| {
+        let mut v = c.borrow_mut();
+        if !v.contains(&idx) {
+            v.push(idx);
+        }
+    });
+}
+
+/// Warning token marking a model that reads a generated `[covariate_nn]` weight
+/// θ (`W_…` / `B_…`) directly from an expression.
+///
+/// Load-bearing, in the same way `W_ABSORPTION_TWIN_DECLINED` is: it lives in
+/// `CompiledModel::parse_warnings` rather than in a field of its own, because
+/// `CompiledModel` is not `#[non_exhaustive]` and a new public field would be a
+/// breaking change. `estimation::nn_theta_gradient::NnGradPlan::build` reads it
+/// back and declines.
+pub const NN_WEIGHT_DIRECT_REFERENCE_MARKER: &str = "W_NN_WEIGHT_DIRECT_REFERENCE";
+
 /// Parse a model file (.ferx) and return a CompiledModel.
 pub fn parse_model_file(path: &Path) -> Result<CompiledModel, String> {
     let content =
@@ -1390,6 +1442,10 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     }
     let indiv_lines: &[String] = indiv_lines_opt.map(Vec::as_slice).unwrap_or(&[]);
 
+    // Track which θ the model's expressions actually read, for the
+    // `[covariate_nn]` direct-reference check further down. Installed before any
+    // block parses so nothing is missed, and restored on drop.
+    let _theta_ref_scope = ThetaRefScope::enter();
     // theta_names is extended below after NN-weight and diffusion thetas are appended
     let mut theta_names: Vec<String> = thetas.iter().map(|t| t.name.clone()).collect();
     #[cfg(feature = "nn")]
@@ -1982,9 +2038,13 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     };
 
     // Build pk_param_fn with the extended eta context (BSV + kappa names).
-    // `n_theta_base` is the user-declared θ count — indiv params can only
-    // reference these (NN-weight and diffusion θ are appended later and
-    // aren't visible to user expressions). `n_eta_extended` matches the
+    // `n_theta_base` is the user-declared θ count, which is what the partial
+    // builder differentiates against. NOTE it is *not* the set of θ a user
+    // expression can name: `theta_names` is extended with the generated
+    // `[covariate_nn]` weight names before `[individual_parameters]` parses, so
+    // `CL = TYPICAL_PK.CL * exp(ETA_CL) + B_TYPICAL_PK_2_1` resolves. That is
+    // what `NN_WEIGHT_DIRECT_REFERENCE_MARKER` exists to catch — see the check
+    // near the end of this function. `n_eta_extended` matches the
     // `eta` slice the closure consumes (BSV η + kappa). Both feed the
     // Tier 4a milestone-2 partial-derivative builder.
     let n_eta_extended_for_partials = eta_names.len();
@@ -2783,6 +2843,57 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                  SAEM/IMP the class typical values are estimated by the numerical M-step \
                  alone, which converges more slowly (#996).",
                 unmatched.join(", ")
+            ));
+        }
+    }
+
+    // #1016: a `[covariate_nn]` weight θ read *directly* by a model expression.
+    //
+    // `theta_names` is extended with the generated `W_…` / `B_…` names before
+    // `[individual_parameters]` parses, so
+    //
+    //     CL = TYPICAL_PK.CL * exp(ETA_CL) + B_TYPICAL_PK_2_1
+    //
+    // is accepted. `estimation::nn_theta_gradient` assembles a whole weight
+    // block's θ-gradient from `n_outputs` finite differences of the output
+    // biases times the pre-activation Jacobian, which is exact *only* under the
+    // invariant that the weights reach the likelihood through the network output
+    // and nothing else. A direct reference breaks it: for a bias the extra term
+    // is folded into `dNLL/dz` and then smeared across the whole block by `jz`;
+    // for a non-bias weight it is dropped entirely, since only biases are
+    // perturbed. Either way SAEM/IMP/VI silently receive a wrong fixed-η θ
+    // gradient.
+    //
+    // Recorded rather than rejected, so the model still fits — it just takes the
+    // per-θ FD path, per the CLAUDE.md rule that a scope gap must route to FD
+    // through a support predicate instead of returning a wrong gradient.
+    #[cfg(feature = "nn")]
+    {
+        let referenced = ThetaRefScope::recorded();
+        let mut offending: Vec<String> = Vec::new();
+        for nn in &model.covariate_nns {
+            let n_w = nn.mapper.mlp().n_weights();
+            let range = nn.weights_offset..nn.weights_offset + n_w;
+            for &idx in &referenced {
+                if range.contains(&idx) {
+                    if let Some(name) = model.theta_names.get(idx) {
+                        offending.push(name.clone());
+                    }
+                }
+            }
+        }
+        if !offending.is_empty() {
+            offending.sort();
+            offending.dedup();
+            model.parse_warnings.push(format!(
+                "{NN_WEIGHT_DIRECT_REFERENCE_MARKER}: the model reads generated \
+                 [covariate_nn] weight parameter(s) {} directly. The analytic \
+                 NN theta-gradient shortcut assumes those weights reach the likelihood only \
+                 through the network output, so it is disabled for this model and every \
+                 theta falls back to finite differences (slower, still correct). Reference \
+                 the network's declared outputs (e.g. `TYPICAL_PK.CL`) instead if you did \
+                 not mean to read a weight.",
+                offending.join(", ")
             ));
         }
     }
@@ -20000,6 +20111,11 @@ fn parse_atom(
 
             // Check if it's a theta
             if let Some(idx) = ctx.theta_names.iter().position(|n| n == name) {
+                // Recorded here — the one place a name becomes a θ index — so
+                // the `[covariate_nn]` direct-reference check below sees a
+                // reference from *any* block, not just the one someone
+                // remembered to walk.
+                record_theta_reference(idx);
                 return Ok((Expression::Theta(idx), pos + 1));
             }
 

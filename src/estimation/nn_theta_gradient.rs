@@ -128,6 +128,18 @@ impl NnGradPlan {
         if model.covariate_nns.is_empty() {
             return None;
         }
+        // #1016: the factorization below is exact only while the weights reach
+        // the likelihood *through the network output*. A model that names a
+        // generated weight θ directly (`... + B_TYPICAL_PK_2_1`) breaks that,
+        // and the parser records it. Decline rather than return a gradient that
+        // smears the direct term across the block (bias) or drops it (weight).
+        if model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains(crate::parser::model_parser::NN_WEIGHT_DIRECT_REFERENCE_MARKER))
+        {
+            return None;
+        }
 
         let mut blocks = Vec::with_capacity(model.covariate_nns.len());
         let mut covered = vec![false; n_theta];
