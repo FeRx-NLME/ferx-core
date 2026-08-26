@@ -506,7 +506,7 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
             obs_records: Vec::new(),
         })
         .collect();
-    let template = Population {
+    let mut template = Population {
         subjects,
         covariate_names: sim_covariate_names,
         dv_column: "dv".into(),
@@ -514,6 +514,19 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
         exclusions: None,
         warnings: vec![],
     };
+
+    // #1064: bind `factor(...)` blocks against the synthetic design, exactly as
+    // the data path binds them against a dataset — the levels come from the
+    // `[simulation]` covariates and observation grid. Every level gets the
+    // declaration's broadcast init, since the DSL has no way to state per-level
+    // simulation values; a design that needs distinct ones should use the
+    // explicit `theta NAME[N]` form and its own index column.
+    {
+        let model_text = std::fs::read_to_string(model_path)
+            .map_err(|e| format!("Failed to re-read model file for factor binding: {e}"))?;
+        crate::api::bind_factor_thetas(&mut parsed, &model_text, &mut template)?;
+    }
+    let template = template;
 
     // Simulate
     eprintln!(
