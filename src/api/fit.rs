@@ -88,13 +88,13 @@ pub fn fit_from_files(
         sel_filter_fit.as_ref(),
         &parsed.column_map,
     )?;
-    // #1064: bind `factor(...)` blocks against the data before anything reads
+    // #1064: bind level blocks against the data before anything reads
     // the parameter vector — the level count, and therefore `n_theta`, is a
     // property of the dataset. Mirrors `run_model_with_data_inits`.
     {
         let model_text = std::fs::read_to_string(model_path)
-            .map_err(|e| format!("Failed to re-read model file for factor binding: {e}"))?;
-        crate::api::bind_factor_thetas(&mut parsed, &model_text, &mut population)?;
+            .map_err(|e| format!("Failed to re-read model file for level binding: {e}"))?;
+        crate::api::bind_theta_levels(&mut parsed, &model_text, &mut population)?;
     }
     let mut model = parsed.model;
     model.bloq_method = opts.bloq_method;
@@ -206,17 +206,17 @@ pub fn fit(
     // is a no-op unless the user pinned `inner_optimizer`.
     crate::estimation::inner_optimizer::set_inner_optimizer(options.inner_optimizer);
     crate::estimation::inner_optimizer::set_ebe_warm_start(options.ebe_warm_start);
-    // #1064: a `theta NAME ~ factor(...)` block has no levels until it is bound
+    // #1064: a `theta NAME[...]` block has no levels until it is bound
     // to data. Fitting one unbound would gather out of an empty level table and
     // predict NaN everywhere; refuse, and name the two ways out.
-    if !model.theta_blocks.unbound_factors().is_empty() {
+    if !model.theta_blocks.unbound_level_blocks().is_empty() {
         return Err(format!(
-            "`theta {} ~ factor(...)` was never bound to data, so it has no levels. Fit \
+            "`theta {}[...]` was never bound to data, so it has no levels. Fit \
              through a file entry point (`fit_from_files`, `run_model_with_data`, or the \
-             CLI), which binds factor blocks against the dataset — or declare the block \
+             CLI), which binds level blocks against the dataset — or declare the block \
              explicitly as `theta {}[N](...)` and index it with your own column.",
-            model.theta_blocks.unbound_factors().join("`, `theta "),
-            model.theta_blocks.unbound_factors()[0],
+            model.theta_blocks.unbound_level_blocks().join("`, `theta "),
+            model.theta_blocks.unbound_level_blocks()[0],
         ));
     }
     // Mixture models (#977). Phase 3 wires the K-fold log-sum-exp FOCE/FOCEI

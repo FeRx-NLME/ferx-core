@@ -292,30 +292,30 @@ pub(crate) fn check_residual_magnitude(
 /// pays for the other's work — the fatal list and the warning list are built by
 /// different entry points, and folding both into one function meant every fit
 /// walked every observation *and* every dose twice.
-/// A `theta NAME ~ factor(...)` block that was never bound to data has no
+/// A `theta NAME[...]` block that was never bound to data has no
 /// levels, so every gather out of it is `NaN` (#1064).
 ///
 /// `fit()` refuses such a model up front with its own message; this is the same
 /// guard for the simulate paths, which do not go through `fit()`. Binding
-/// happens in `api::factor::bind_factor_thetas`, which every file entry point
+/// happens in `api::levels::bind_theta_levels`, which every file entry point
 /// calls — an in-memory caller that assembled the `CompiledModel` itself is the
 /// case this catches.
-pub(crate) fn check_unbound_factor_thetas(model: &CompiledModel) -> Vec<Diagnostic> {
+pub(crate) fn check_unbound_theta_levels(model: &CompiledModel) -> Vec<Diagnostic> {
     model
         .theta_blocks
-        .unbound_factors()
+        .unbound_level_blocks()
         .iter()
         .map(|name| {
             Diagnostic::error(
-                "E_FACTOR_THETA_UNBOUND",
+                "E_THETA_LEVELS_UNBOUND",
                 format!(
-                    "`theta {name} ~ factor(...)` was never bound to data, so it has no \
+                    "`theta {name}[...]` was never bound to data, so it has no \
                      levels and every value gathered from it is NaN."
                 ),
             )
             .with_block("parameters")
             .with_suggestion(format!(
-                "run through a file entry point, which binds factor blocks against the \
+                "run through a file entry point, which binds level blocks against the \
                  dataset or the [simulation] design — or declare the block explicitly as \
                  `theta {name}[N](...)` and index it with your own column"
             ))
@@ -553,7 +553,7 @@ pub(crate) fn check_simulation_data(
     model: &CompiledModel,
     population: &Population,
 ) -> Vec<Diagnostic> {
-    let mut diags = check_unbound_factor_thetas(model);
+    let mut diags = check_unbound_theta_levels(model);
     diags.extend(check_covariates(model, population));
     diags.extend(check_kappa_weights(model, population));
     diags.extend(check_theta_gather_indices(model, population));

@@ -27,14 +27,13 @@ pub mod survival;
 pub mod types;
 
 pub use api::{
-    bind_factor_thetas, check_model_data, check_model_data_warnings, check_model_options,
-    configure_global_thread_pool, factor_level_map, fit, fit_from_files, predict,
-    resolve_data_path, run_from_file, run_model_simulate, run_model_with_data,
-    run_model_with_data_inits, simulate, simulate_adaptive, simulate_adaptive_from_spec,
-    simulate_with_options, simulate_with_options_diag, simulate_with_seed,
-    simulate_with_uncertainty, validate_model_file, AdaptiveSimulateOptions,
-    AdaptiveSimulationResult, PredictionResult, SimulateOptions, SimulateUncertaintyOptions,
-    SimulationOutput, SimulationResult,
+    bind_theta_levels, check_model_data, check_model_data_warnings, check_model_options,
+    configure_global_thread_pool, fit, fit_from_files, predict, resolve_data_path, run_from_file,
+    run_model_simulate, run_model_with_data, run_model_with_data_inits, simulate,
+    simulate_adaptive, simulate_adaptive_from_spec, simulate_with_options,
+    simulate_with_options_diag, simulate_with_seed, simulate_with_uncertainty, theta_level_map,
+    validate_model_file, AdaptiveSimulateOptions, AdaptiveSimulationResult, PredictionResult,
+    SimulateOptions, SimulateUncertaintyOptions, SimulationOutput, SimulationResult,
 };
 pub use cancel::CancelFlag;
 pub use diagnostics::{CheckReport, Diagnostic, Severity};

@@ -10812,7 +10812,7 @@ fn weighted_iov_kappa_gradient_is_the_unweighted_one_scaled() {
     }
 }
 
-// ── #1064: analytic sensitivities through a vector / factor θ gather ────────
+// ── #1064: analytic sensitivities through a θ level gather ────────
 //
 // The gather is a new kernel in `eval_bytecode_g` — the `PkNum` bytecode path
 // the `Dual2` sensitivities run on — so it needs its own parity check against

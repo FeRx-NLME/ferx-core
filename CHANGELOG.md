@@ -20,15 +20,16 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
-- **Theta vectors and `factor(...)` blocks — hundreds of fixed effects from one declaration (#1064).**
+- **Theta level blocks — hundreds of fixed effects from one declaration (#1064).**
   `theta PLACEBO[800](0.0, -10.0, 10.0)` declares 800 thetas sharing one init/bounds triple, read back
   by a *gather* — `PL = PLACEBO[PLA_IDX]`, where `PLA_IDX` is a 1-based data column. The data-driven
-  form `theta PLACEBO ~ factor(STUDY, TIME)(0.0, -10.0, 10.0)` instead declares one theta per **observed**
+  form `theta PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)` — data columns in the brackets rather than a
+  count — instead declares one theta per **observed**
   combination of the named columns, discovered when the data is bound, and reports them as
   `PLACEBO[STUDY=7,TIME=4]`. This is what makes an unstructured placebo effect writable in a
   model-based meta-analysis — and fittable: the whole block occupies a single parameter slot, so it is
   not bounded by the fixed individual-parameter layout the way 800 separate parameters would be.
-  A `factor(...)` block is rank-deficient against a fixed intercept *and* against a random effect at the
+  A level block is rank-deficient against a fixed intercept *and* against a random effect at the
   same or a coarser grouping, so a sum-to-zero convention is always applied and its grouping is chosen
   from both the model and the data; `contrast = sum_to_zero | sum_to_zero_within | ref | none` overrides
   it, and a choice that leaves a nested group's mean free is refused. An out-of-range or non-integral
@@ -110,7 +111,7 @@ section of the SDLC for the versioning policy).
   320,000 population objectives at 800 parameters. Above 100 free coordinates a *defaulted* covariance
   method now uses the score cross-product (one pass) and says so; setting `covariance_method = r`
   explicitly still forces it, with a warning naming the cost.
-- **Large theta blocks are reported compactly (#1064).** A block of more than 20 levels leaves the main
+- **Large theta level blocks are reported compactly (#1064).** A block of more than 20 levels leaves the main
   estimate table for a one-line summary (count, min, median, max) on the console and in the text report;
   every per-level estimate is still written to the fit YAML, as a one-line-per-level `theta_blocks:` list
   rather than hundreds of top-level keys.

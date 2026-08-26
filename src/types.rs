@@ -3017,7 +3017,7 @@ pub struct CompiledModel {
     /// parser-produced partials.
     #[allow(dead_code)] // no runtime consumer after #145; see field doc.
     pub indiv_param_partials: IndivParamPartials,
-    /// Vector / factor θ blocks declared by `[parameters]` (#1064). Empty for
+    /// Vector / θ level blocks declared by `[parameters]` (#1064). Empty for
     /// every model that declares none, which is the overwhelming majority —
     /// consumers short-circuit on [`ThetaBlocks::is_empty`].
     pub theta_blocks: ThetaBlocks,

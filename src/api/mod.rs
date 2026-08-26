@@ -36,8 +36,8 @@ pub use validation::{
 
 // ── production submodules (peeled from this file) ──
 mod adaptive;
-mod factor;
 mod fit;
+mod levels;
 mod output_columns;
 mod pool;
 mod postfit;
@@ -49,8 +49,8 @@ pub use adaptive::{
     simulate_adaptive, simulate_adaptive_from_spec, AdaptiveSimulateOptions,
     AdaptiveSimulationResult,
 };
-pub use factor::{bind_factor_thetas, level_map as factor_level_map};
 pub use fit::{fit, fit_from_files};
+pub use levels::{bind_theta_levels, level_map as theta_level_map};
 pub use output_columns::tafd_tad_for_subject;
 pub(crate) use output_columns::{compute_extra_output_columns, trapezoid};
 pub use pool::configure_global_thread_pool;

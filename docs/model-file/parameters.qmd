@@ -30,7 +30,7 @@ theta TVV(8.1, 0.1, 500.0)
 theta TVKA(1.0, 0.01, 50.0)
 ```
 
-## Theta vectors and factor blocks
+## Theta level blocks
 
 Some models need *hundreds* of fixed effects that share one declaration. The
 motivating case is an **unstructured placebo effect** in a model-based
@@ -45,7 +45,7 @@ layout at all. Both fall away once you notice that an unstructured effect is
 active — the one for that row's `(study, time)`. So it is a **gather**: one
 parameter slot, one contiguous block of thetas, one index per record.
 
-### Explicit form: `theta NAME[N]`
+### Counted form: `theta NAME[N]`
 
 ```
 [parameters]
@@ -70,36 +70,39 @@ sharing the one `(init, lower, upper)` triple — and `FIX`, if given.
 The R package's `ferx_mbma_data()` is the natural place to build the index
 column for this form.
 
-### Data-driven form: `theta NAME ~ factor(...)`
+### Data-driven form: `theta NAME[COL, ...]`
 
 ```
 [parameters]
-  theta PLACEBO ~ factor(STUDY, TIME)(0.0, -10.0, 10.0)
+  theta PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)
 
 [individual_parameters]
   PL = TVPL + PLACEBO            # the index is implicit
 ```
 
-`factor(COL, ...)` declares **one theta per observed combination** of the named
-columns, discovered when the data is bound. The `(init, lower, upper)` triple
-broadcasts to every level, and the levels are named after their combination, so
-estimates report as `PLACEBO[STUDY=7,TIME=4]`. A column named `TIME` is the
-record time; anything else is a covariate column, which the reader loads
-automatically.
+Put **data columns** in the brackets instead of a count and the block declares
+**one theta per observed combination** of them, discovered when the data is
+bound. The `(init, lower, upper)` triple broadcasts to every level, and the
+levels are named after their combination, so estimates report as
+`PLACEBO[STUDY=7,TIME=4]`. A column named `TIME` is the record time; anything
+else is a covariate column, which the reader loads automatically.
+
+The two forms cannot be confused: brackets containing only digits are a level
+count, anything else is a column list.
 
 Only combinations the data actually shows become parameters — an unbalanced
 design does not acquire cells nobody measured.
 
-Because the level count is a property of the *dataset*, a `factor(...)` model
-must be run through a file entry point (the CLI, `run_model_with_data`,
-`fit_from_files`, or `--simulate`), which reads the data and binds the block. A
-model handed to the in-memory `fit()` without that step is refused rather than
-silently predicting `NaN`; if you need the in-memory path, use the explicit
-`theta NAME[N]` form with your own index column.
+Because the level count is a property of the *dataset*, this form must be run
+through a file entry point (the CLI, `run_model_with_data`, `fit_from_files`, or
+`--simulate`), which reads the data and binds the block. A model handed to the
+in-memory `fit()` without that step is refused rather than silently predicting
+`NaN`; if you need the in-memory path, use the counted `theta NAME[N]` form with
+your own index column.
 
 ### Identifiability
 
-`factor(STUDY, TIME)` alongside an intercept is rank-deficient — the levels sum
+`PLACEBO[STUDY, TIME]` alongside an intercept is rank-deficient — the levels sum
 to the intercept. It is *also* rank-deficient against a **random** effect at the
 same or a coarser grouping: a study's `eta` is, by construction, the mean of that
 study's own timepoint levels. That second case is not an edge case; it is the
@@ -108,7 +111,7 @@ and it is chosen by looking at both the model and the data:
 
 | Situation | Default |
 |---|---|
-| The parameter reading the block also carries a random effect, **and** the factor's leading columns partition the subjects | sum-to-zero **within** each leading-column group |
+| The parameter reading the block also carries a random effect, **and** the block's leading columns partition the subjects | sum-to-zero **within** each leading-column group |
 | Otherwise | sum-to-zero over **all** levels |
 
 Within-group sum-to-zero leaves each study's `eta` carrying that study's mean and
@@ -118,21 +121,46 @@ makes the two separately interpretable.
 Override with `contrast = ...`:
 
 ```
-theta PLACEBO ~ factor(STUDY, TIME, contrast = sum_to_zero)(0.0, -10.0, 10.0)
-theta PLACEBO ~ factor(STUDY, TIME, contrast = sum_to_zero_within)(...)
-theta PLACEBO ~ factor(STUDY, TIME, contrast = ref)(...)   # first level held at 0
-theta PLACEBO ~ factor(STUDY, TIME, contrast = none)(...)  # you assert identifiability
+theta PLACEBO[STUDY, TIME, contrast = sum_to_zero](0.0, -10.0, 10.0)
+theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](...)
+theta PLACEBO[STUDY, TIME, contrast = ref](...)   # first level held at 0
+theta PLACEBO[STUDY, TIME, contrast = none](...)  # you assert identifiability
 ```
 
-`contrast = ref` is the regression convention and is what you want when the
-coefficients are meant to be *read* rather than merely absorbed. A contrast that
-would leave a nested group's mean free while a random effect also carries it is
-a hard error, not a warning.
+Whichever you pick, one degree of freedom has to go: *L* levels alongside an
+intercept is *L + 1* parameters for *L* cells, and the block and the intercept
+would otherwise slide against each other forever. The conventions differ only in
+*where* it goes.
 
-Sum-to-zero is implemented as contrast coding: a group of *L* levels estimates
-*L − 1* thetas, and the remaining level evaluates as minus the sum of the others.
-It is not a parameter, so it does not appear in the estimate table; its value is
-recoverable from the others.
+**`sum_to_zero`** makes the levels deviations *around* the grand mean, which
+stays in the intercept. The levels are symmetric, none is special, and the block
+is better conditioned — right when nobody reads the individual levels, which is
+the unstructured-placebo case.
+
+**`ref`** is dummy coding (R's `contr.treatment`, what `lm(y ~ factor(study))`
+does): one level is pinned at exactly 0 and every other θ is that level's
+*difference from it*, with the intercept absorbing the reference level's own
+value. So `PLACEBO[STUDY=1,TIME=4] = 0.3` reads as "0.3 above study 1's first
+timepoint", not "0.3 above the average". Use it when the coefficients are meant
+to be *read* rather than merely absorbed.
+
+Two limits on `ref` as it stands:
+
+- The reference is always the **first level in sort order** (the smallest
+  column-value tuple). There is no way to name a different one.
+- It is a **single** reference for the whole block, not one per group — only
+  `sum_to_zero_within` splits the levels into contrast groups. So `contrast =
+  ref` on `[STUDY, TIME]` pins one cell globally rather than each study's own
+  first timepoint.
+
+A contrast that would leave a nested group's mean free while a random effect
+also carries it is a hard error, not a warning.
+
+Both conventions are implemented as contrast coding, so the optimizer needs no
+constraint machinery: a group of *L* levels estimates *L − 1* thetas and the
+remaining level is derived (minus the sum of the others under sum-to-zero, or a
+constant 0 under `ref`). A derived level is not a parameter, so it does not
+appear in the estimate table; its value follows from the others.
 
 ### Fitting at this scale
 
@@ -156,7 +184,7 @@ own compact summary (count, min, median, max) on the console, with every
 per-level estimate still written to the fit YAML under `theta_blocks:`.
 
 Analytic sensitivities pass straight through a gather — `∂f/∂θ_k` is exact under
-the dual-number path — so a *small* factor block keeps the analytic gradient.
+the dual-number path — so a *small* level block keeps the analytic gradient.
 Past the engine's 24-axis dual dispatch, a large block falls back to finite
 differences per subject, which is why the guards above matter.
 

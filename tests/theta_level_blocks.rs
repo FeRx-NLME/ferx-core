@@ -1,8 +1,8 @@
-//! End-to-end checks for vector / factor θ blocks (#1064).
+//! End-to-end checks for θ level blocks (#1064).
 //!
 //! The declaration syntax, the gather evaluator, the identifiability
 //! conventions, and the scale guards are unit-tested in `src/`. What only the
-//! file entry points can exercise is the *binding*: a `factor(...)` block's
+//! file entry points can exercise is the *binding*: a level block's
 //! level count is a property of the dataset, discovered after the CSV is read
 //! and folded back into the model by a re-parse. These tests run that whole
 //! path and stop after a couple of outer iterations (Tier 2 — no convergence).
@@ -46,14 +46,14 @@ const FIT_OPTIONS: &str = "
   covariance = false
 ";
 
-/// A `factor(STUDY, TIME)` placebo effect with no random effect on the same
+/// A `[STUDY, TIME]` placebo effect with no random effect on the same
 /// scale — global sum-to-zero.
-fn factor_model() -> String {
+fn level_block_model() -> String {
     format!(
         r#"
 [parameters]
   theta TVCL(2.0, 0.001, 20.0)
-  theta PLACEBO ~ factor(STUDY, TIME)(0.0, -5.0, 5.0)
+  theta PLACEBO[STUDY, TIME](0.0, -5.0, 5.0)
   theta TVV(10.0, 0.1, 500.0)
   omega ETA_V ~ 0.04
   sigma PROP_ERR ~ 0.05
@@ -107,8 +107,8 @@ fn write_case(model: &str, data: &str) -> (tempfile::TempDir, PathBuf, PathBuf) 
 }
 
 #[test]
-fn factor_block_binds_against_the_dataset_end_to_end() {
-    let (_dir, model_path, data_path) = write_case(&factor_model(), DATA);
+fn a_level_block_binds_against_the_dataset_end_to_end() {
+    let (_dir, model_path, data_path) = write_case(&level_block_model(), DATA);
     let (result, _pop) = run_model_with_data(
         model_path.to_str().unwrap(),
         Some(data_path.to_str().unwrap()),
@@ -146,7 +146,7 @@ fn a_level_the_data_never_shows_is_not_estimated() {
     // One θ per *observed* combination, not per cell of the full grid: study 2
     // is never sampled at TIME 1, so that cell must not become a parameter with
     // nothing to inform it.
-    let (_dir, model_path, data_path) = write_case(&factor_model(), DATA_SPARSE);
+    let (_dir, model_path, data_path) = write_case(&level_block_model(), DATA_SPARSE);
     let (result, _pop) = run_model_with_data(
         model_path.to_str().unwrap(),
         Some(data_path.to_str().unwrap()),
@@ -207,11 +207,12 @@ fn an_index_past_the_declared_level_count_fails_loudly() {
 }
 
 #[test]
-fn a_factor_model_cannot_be_fit_without_binding() {
+fn a_level_block_model_cannot_be_fit_without_binding() {
     // The in-memory `fit()` entry point never sees the data before the model is
     // compiled, so it must refuse rather than gather out of an empty level
     // table and predict NaN.
-    let parsed = ferx_core::parser::model_parser::parse_full_model(&factor_model()).expect("parse");
+    let parsed =
+        ferx_core::parser::model_parser::parse_full_model(&level_block_model()).expect("parse");
     let population =
         ferx_core::read_nonmem_csv(std::path::Path::new("data/warfarin.csv"), None, None)
             .expect("read warfarin");
@@ -221,7 +222,7 @@ fn a_factor_model_cannot_be_fit_without_binding() {
         &parsed.model.default_params,
         &ferx_core::FitOptions::default(),
     )
-    .expect_err("an unbound factor block must not fit");
+    .expect_err("an unbound level block must not fit");
     assert!(
         err.contains("never bound to data") && err.contains("PLACEBO"),
         "unexpected error: {err}"
@@ -235,13 +236,13 @@ fn binding_is_deterministic_so_predict_rebuilds_the_same_levels() {
     // observed combinations in a fixed sort order. So the round-trip guarantee
     // is that binding the same data twice gives the same map — including the
     // synthesized index column, level for level.
-    let (_dir, model_path, data_path) = write_case(&factor_model(), DATA);
+    let (_dir, model_path, data_path) = write_case(&level_block_model(), DATA);
     let text = std::fs::read_to_string(&model_path).unwrap();
 
     let bind_once = || {
         let mut parsed = ferx_core::parser::model_parser::parse_full_model(&text).expect("parse");
         let mut population = ferx_core::read_nonmem_csv(&data_path, None, None).expect("read");
-        ferx_core::bind_factor_thetas(&mut parsed, &text, &mut population).expect("bind");
+        ferx_core::bind_theta_levels(&mut parsed, &text, &mut population).expect("bind");
         (parsed.model, population)
     };
 
@@ -250,14 +251,14 @@ fn binding_is_deterministic_so_predict_rebuilds_the_same_levels() {
 
     assert_eq!(model_a.theta_names, model_b.theta_names);
     assert_eq!(
-        ferx_core::factor_level_map(&model_a),
-        ferx_core::factor_level_map(&model_b)
+        ferx_core::theta_level_map(&model_a),
+        ferx_core::theta_level_map(&model_b)
     );
     for (a, b) in pop_a.subjects.iter().zip(&pop_b.subjects) {
         let idx = |s: &ferx_core::Subject| -> Vec<f64> {
             s.obs_covariates
                 .iter()
-                .map(|m| m["__factor_PLACEBO"])
+                .map(|m| m["__level_PLACEBO"])
                 .collect()
         };
         assert_eq!(idx(a), idx(b), "subject {} index column drifted", a.id);
@@ -265,12 +266,12 @@ fn binding_is_deterministic_so_predict_rebuilds_the_same_levels() {
 }
 
 #[test]
-fn predict_runs_on_a_bound_factor_model() {
-    let (_dir, model_path, data_path) = write_case(&factor_model(), DATA);
+fn predict_runs_on_a_bound_level_block_model() {
+    let (_dir, model_path, data_path) = write_case(&level_block_model(), DATA);
     let text = std::fs::read_to_string(&model_path).unwrap();
     let mut parsed = ferx_core::parser::model_parser::parse_full_model(&text).expect("parse");
     let mut population = ferx_core::read_nonmem_csv(&data_path, None, None).expect("read");
-    ferx_core::bind_factor_thetas(&mut parsed, &text, &mut population).expect("bind");
+    ferx_core::bind_theta_levels(&mut parsed, &text, &mut population).expect("bind");
 
     let preds = ferx_core::predict(&parsed.model, &population, &parsed.model.default_params);
     assert_eq!(preds.len(), 6, "one prediction per observation");
@@ -284,13 +285,13 @@ fn predict_runs_on_a_bound_factor_model() {
 #[test]
 fn predict_refuses_a_population_that_was_never_bound() {
     // The synthesized index column is a required covariate of the bound model,
-    // so a population read fresh — with no `__factor_*` column — must fail
+    // so a population read fresh — with no `__level_*` column — must fail
     // loudly rather than gather at index 0 and return NaN.
-    let (_dir, model_path, data_path) = write_case(&factor_model(), DATA);
+    let (_dir, model_path, data_path) = write_case(&level_block_model(), DATA);
     let text = std::fs::read_to_string(&model_path).unwrap();
     let mut parsed = ferx_core::parser::model_parser::parse_full_model(&text).expect("parse");
     let mut bound = ferx_core::read_nonmem_csv(&data_path, None, None).expect("read");
-    ferx_core::bind_factor_thetas(&mut parsed, &text, &mut bound).expect("bind");
+    ferx_core::bind_theta_levels(&mut parsed, &text, &mut bound).expect("bind");
 
     let unbound = ferx_core::read_nonmem_csv(&data_path, None, None).expect("read");
     let params = parsed.model.default_params.clone();
@@ -301,12 +302,12 @@ fn predict_refuses_a_population_that_was_never_bound() {
     .is_err();
     assert!(
         panicked,
-        "predict() must refuse a population missing the factor index column"
+        "predict() must refuse a population missing the level index column"
     );
 }
 
 #[test]
-fn a_factor_model_binds_against_a_simulation_design() {
+fn a_level_block_binds_against_a_simulation_design() {
     // `--simulate` has no dataset, so the levels come from the `[simulation]`
     // covariates (#1083) and the observation grid instead. Every level takes
     // the declaration's broadcast init, since the DSL has no way to state
@@ -314,7 +315,7 @@ fn a_factor_model_binds_against_a_simulation_design() {
     let model = r#"
 [parameters]
   theta TVCL(2.0, 0.001, 20.0)
-  theta PLACEBO ~ factor(STUDY, TIME)(0.0, -5.0, 5.0)
+  theta PLACEBO[STUDY, TIME](0.0, -5.0, 5.0)
   theta TVV(10.0, 0.1, 500.0)
   omega ETA_V ~ 0.04
   sigma PROP_ERR ~ 0.05
@@ -348,10 +349,10 @@ fn a_factor_model_binds_against_a_simulation_design() {
     assert_eq!(result.theta_names.len(), 2 + 8, "{:?}", result.theta_names);
     assert_eq!(result.theta_names[1], "PLACEBO[STUDY=1,TIME=1]");
     for subject in &population.subjects {
-        assert!(subject.covariates.contains_key("__factor_PLACEBO"));
+        assert!(subject.covariates.contains_key("__level_PLACEBO"));
         assert!(
             subject.observations.iter().all(|v| v.is_finite()),
-            "a bound factor block must simulate finite observations"
+            "a bound level block must simulate finite observations"
         );
     }
 }

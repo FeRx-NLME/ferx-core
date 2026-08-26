@@ -72,15 +72,15 @@ fn weight_summary(w: &[f64]) -> (f64, f64, f64, f64) {
 }
 
 /// Print NONMEM-style results to stderr
-/// Level count above which a vector / factor θ block (#1064) is reported as its
+/// Level count above which a θ level block (#1064) is reported as its
 /// own compact section instead of one entry per level in the θ table.
 ///
-/// A four-level factor reads better inline, exactly as it did before the
+/// A four-level block reads better inline, exactly as it did before the
 /// feature existed; an unstructured placebo effect with 800 levels would bury
 /// the structural parameters it exists to protect.
 pub(crate) const THETA_BLOCK_COMPACT_MIN: usize = 20;
 
-/// The θ index ranges of the large vector / factor blocks in `names`.
+/// The θ index ranges of the large vector / level blocks in `names`.
 ///
 /// Blocks are recognised from the `NAME[level]` naming the parser assigns, which
 /// is unambiguous: a scalar θ name is `\w+`, so it can never contain a bracket.
@@ -157,7 +157,7 @@ pub fn print_results(result: &FitResult) {
     #[cfg(not(feature = "nn"))]
     let nn_theta_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
-    // #1064: a vector / factor θ block with hundreds of levels is a nuisance
+    // #1064: a θ level block with hundreds of levels is a nuisance
     // block — the point is what it absorbs, not the individual values. Keep it
     // out of the main table and summarise it below, so the structural
     // parameters it exists to protect stay readable.
@@ -198,7 +198,7 @@ pub fn print_results(result: &FitResult) {
         eprintln!("{:<16} {:>12.6} {:>12} {:>10}", label, est, se_str, rse_str);
     }
 
-    // Compact vector / factor θ block summary (#1064). Per-level estimates stay
+    // Compact θ level block summary (#1064). Per-level estimates stay
     // in the fit YAML's `theta_blocks:` list and in `result.theta`.
     if !theta_blocks.is_empty() {
         eprintln!("\n--- THETA BLOCKS ---");
@@ -702,7 +702,7 @@ pub fn format_summary(result: &FitResult) -> String {
     #[cfg(not(feature = "nn"))]
     let nn_theta_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
-    // #1064: large vector / factor θ blocks get their own compact section.
+    // #1064: large θ level blocks get their own compact section.
     let theta_blocks = compact_theta_blocks(&result.theta_names);
     let blocked_theta_indices: std::collections::HashSet<usize> =
         theta_blocks.iter().flat_map(|(_, r)| r.clone()).collect();

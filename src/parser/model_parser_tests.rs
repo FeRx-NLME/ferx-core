@@ -1702,7 +1702,7 @@ fn test_ode_engine_applied_f_lagtime_not_flagged_dead() {
 
 /// Build a 1-compartment ODE model whose only individual parameter besides CL/V is
 /// `name`, read in the `[odes]` RHS as the elimination rate constant. This is the
-/// exact shape of the #993 repro: rename `name` and the fit moves by a factor.
+/// exact shape of the #993 repro: rename `name` and the fit moves by a level block.
 fn dose_attr_rhs_model(name: &str) -> String {
     format!(
         "
@@ -17725,7 +17725,7 @@ fn unknown_gradient_value_does_not_advertise_the_retired_ad_route() {
 //
 // The modifier desugars into a #484 per-observation residual magnitude on the
 // *additive* sigma slot: weighting is defined as "divide DV and the prediction
-// by the weight", so the additive loading picks up a factor `W` and the
+// by the weight", so the additive loading picks up a level block `W` and the
 // proportional loading is untouched (a common scale factor cancels out of a
 // constant-CV error).
 
@@ -18833,7 +18833,7 @@ fn algebraic_structural_model_accepts_a_declared_parameter_named_like_a_compartm
     }
 }
 
-// ── #1064: vector / factor θ blocks ────────────────────────────────────────
+// ── #1064: θ level blocks ────────────────────────────────────────
 //
 // An unstructured placebo effect in an MBMA model gives every (study ×
 // timepoint) cell its own fixed effect — hundreds of θ. What makes that

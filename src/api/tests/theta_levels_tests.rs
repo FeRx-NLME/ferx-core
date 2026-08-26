@@ -1,4 +1,4 @@
-//! `theta NAME ~ factor(COL, ...)` binding (#1064).
+//! `theta NAME[COL, ...]` binding (#1064).
 
 use super::*;
 use crate::parser::model_parser::parse_full_model;
@@ -16,7 +16,7 @@ fn mbma_model(contrast: &str) -> String {
         r#"
 [parameters]
   theta TVCL(2.0, 0.001, 10.0)
-  theta PLACEBO ~ factor(STUDY, TIME{modifier})(0.0, -10.0, 10.0)
+  theta PLACEBO[STUDY, TIME{modifier}](0.0, -10.0, 10.0)
   theta TVV(10.0, 0.1, 500.0)
 
   omega ETA_CL ~ 0.09
@@ -41,7 +41,7 @@ fn no_eta_model() -> String {
     r#"
 [parameters]
   theta TVCL(2.0, 0.001, 10.0)
-  theta PLACEBO ~ factor(STUDY, TIME)(0.0, -10.0, 10.0)
+  theta PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)
   theta TVV(10.0, 0.1, 500.0)
 
   omega ETA_V ~ 0.09
@@ -102,7 +102,7 @@ fn population(n_studies: usize, n_times: usize) -> Population {
 /// Bind `text` against `pop`, returning the re-parsed model.
 fn bind(text: &str, pop: &mut Population) -> Result<CompiledModel, String> {
     let mut parsed = parse_full_model(text)?;
-    crate::api::bind_factor_thetas(&mut parsed, text, pop)?;
+    crate::api::bind_theta_levels(&mut parsed, text, pop)?;
     Ok(parsed.model)
 }
 
@@ -111,11 +111,11 @@ fn theta_names(model: &CompiledModel) -> Vec<String> {
 }
 
 #[test]
-fn unbound_factor_declares_no_thetas_and_refuses_to_fit() {
+fn an_unbound_level_block_declares_no_thetas_and_refuses_to_fit() {
     let parsed = parse_full_model(&mbma_model("")).unwrap();
     assert_eq!(parsed.model.n_theta, 2, "only TVCL and TVV exist yet");
     assert_eq!(
-        parsed.model.theta_blocks.unbound_factors(),
+        parsed.model.theta_blocks.unbound_level_blocks(),
         &["PLACEBO".to_string()]
     );
     let err = crate::api::fit(
@@ -177,7 +177,7 @@ fn sum_to_zero_levels_sum_to_exactly_zero() {
     let mut total = 0.0;
     for level in 1..=6usize {
         let mut covs = HashMap::new();
-        covs.insert("__factor_PLACEBO".to_string(), level as f64);
+        covs.insert("__level_PLACEBO".to_string(), level as f64);
         let p = (model.pk_param_fn)(&theta, &[0.0], &covs, 0.0);
         total += p.values[0] - 2.0;
     }
@@ -188,7 +188,7 @@ fn sum_to_zero_levels_sum_to_exactly_zero() {
     // And the dependent level really is minus the sum of the free ones.
     theta[1] = 5.0;
     let mut covs = HashMap::new();
-    covs.insert("__factor_PLACEBO".to_string(), 6.0);
+    covs.insert("__level_PLACEBO".to_string(), 6.0);
     let p = (model.pk_param_fn)(&theta, &[0.0], &covs, 0.0);
     let free_sum: f64 = theta[1..6].iter().sum();
     assert!((p.values[0] - 2.0 + free_sum).abs() < 1e-12);
@@ -196,7 +196,7 @@ fn sum_to_zero_levels_sum_to_exactly_zero() {
 
 #[test]
 fn an_eta_at_the_leading_grouping_selects_within_group_sum_to_zero() {
-    // `factor(STUDY, TIME)` plus an η on the same additive scale is
+    // `[STUDY, TIME]` plus an η on the same additive scale is
     // over-parameterised globally: that study's η *is* the mean of its own
     // timepoint levels. The default must constrain within study.
     let mut pop = population(3, 4);
@@ -223,7 +223,7 @@ fn within_group_sum_to_zero_sums_to_zero_inside_each_group() {
     let theta = vec![2.0, 0.4, -1.1, 0.9, 0.2, 10.0];
     let placebo = |level: usize| -> f64 {
         let mut covs = HashMap::new();
-        covs.insert("__factor_PLACEBO".to_string(), level as f64);
+        covs.insert("__level_PLACEBO".to_string(), level as f64);
         (model.pk_param_fn)(&theta, &[0.0], &covs, 0.0).values[0] - 2.0
     };
     let study1: f64 = (1..=3).map(placebo).sum();
@@ -263,14 +263,14 @@ fn reference_level_against_a_nested_eta_is_rejected() {
 fn reference_level_pins_the_first_level_of_each_group_at_zero() {
     let mut pop = population(2, 3);
     let model = bind(
-        &no_eta_model().replace("factor(STUDY, TIME)", "factor(STUDY, TIME, contrast = ref)"),
+        &no_eta_model().replace("[STUDY, TIME]", "[STUDY, TIME, contrast = ref]"),
         &mut pop,
     )
     .unwrap();
     assert_eq!(model.n_theta, 2 + 5);
     let theta = vec![2.0, 0.4, -1.1, 0.9, 0.2, 0.3, 10.0];
     let mut covs = HashMap::new();
-    covs.insert("__factor_PLACEBO".to_string(), 1.0);
+    covs.insert("__level_PLACEBO".to_string(), 1.0);
     let p = (model.pk_param_fn)(&theta, &[0.0], &covs, 0.0);
     assert!(
         (p.values[0] - 2.0).abs() < 1e-12,
@@ -285,10 +285,7 @@ fn reference_level_pins_the_first_level_of_each_group_at_zero() {
 fn unconstrained_estimates_every_level() {
     let mut pop = population(2, 3);
     let model = bind(
-        &no_eta_model().replace(
-            "factor(STUDY, TIME)",
-            "factor(STUDY, TIME, contrast = none)",
-        ),
+        &no_eta_model().replace("[STUDY, TIME]", "[STUDY, TIME, contrast = none]"),
         &mut pop,
     )
     .unwrap();
@@ -296,22 +293,19 @@ fn unconstrained_estimates_every_level() {
 }
 
 #[test]
-fn a_single_level_factor_matches_a_plain_theta() {
+fn a_single_level_block_matches_a_plain_theta() {
     // Degenerate oracle: with one level and no constraint, the block is a
     // scalar θ and must behave exactly like one.
     let mut pop = population(1, 1);
     let model = bind(
-        &no_eta_model().replace(
-            "factor(STUDY, TIME)",
-            "factor(STUDY, TIME, contrast = none)",
-        ),
+        &no_eta_model().replace("[STUDY, TIME]", "[STUDY, TIME, contrast = none]"),
         &mut pop,
     )
     .unwrap();
     assert_eq!(model.n_theta, 3);
 
     let plain = parse_full_model(&no_eta_model().replace(
-        "theta PLACEBO ~ factor(STUDY, TIME)(0.0, -10.0, 10.0)",
+        "theta PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)",
         "theta PLACEBO(0.0, -10.0, 10.0)",
     ))
     .unwrap()
@@ -319,17 +313,17 @@ fn a_single_level_factor_matches_a_plain_theta() {
 
     let theta = vec![2.0, 0.375, 10.0];
     let mut covs = HashMap::new();
-    covs.insert("__factor_PLACEBO".to_string(), 1.0);
+    covs.insert("__level_PLACEBO".to_string(), 1.0);
     let a = (model.pk_param_fn)(&theta, &[0.0], &covs, 0.0);
     let b = (plain.pk_param_fn)(&theta, &[0.0], &HashMap::new(), 0.0);
     assert_eq!(
         a.values[0], b.values[0],
-        "a one-level factor must be bit-identical to the scalar it degenerates to"
+        "a one-level block must be bit-identical to the scalar it degenerates to"
     );
 }
 
 #[test]
-fn a_single_level_factor_under_sum_to_zero_is_rejected() {
+fn a_single_level_block_under_sum_to_zero_is_rejected() {
     let mut pop = population(1, 1);
     let err = bind(&no_eta_model(), &mut pop).unwrap_err();
     assert!(err.contains("single level"), "unexpected error: {err}");
@@ -340,26 +334,26 @@ fn the_index_column_is_written_onto_every_subject() {
     let mut pop = population(2, 3);
     bind(&no_eta_model(), &mut pop).unwrap();
     for subject in &pop.subjects {
-        assert!(subject.covariates.contains_key("__factor_PLACEBO"));
+        assert!(subject.covariates.contains_key("__level_PLACEBO"));
         // The level moves with the timepoint, so per-observation snapshots
         // must exist and carry distinct indices.
         assert_eq!(subject.obs_covariates.len(), 3);
         let idx: Vec<f64> = subject
             .obs_covariates
             .iter()
-            .map(|m| m["__factor_PLACEBO"])
+            .map(|m| m["__level_PLACEBO"])
             .collect();
         assert_eq!(idx.len(), 3);
         assert!(idx[0] < idx[1] && idx[1] < idx[2]);
     }
-    assert!(pop.covariate_names.iter().any(|n| n == "__factor_PLACEBO"));
+    assert!(pop.covariate_names.iter().any(|n| n == "__level_PLACEBO"));
 }
 
 #[test]
 fn a_subject_constant_index_does_not_engage_time_varying_machinery() {
     // `factor(STUDY)` alone is constant within a subject, so no per-event
     // snapshots are needed and the model keeps whatever fast path it had.
-    let text = no_eta_model().replace("factor(STUDY, TIME)", "factor(STUDY)");
+    let text = no_eta_model().replace("[STUDY, TIME]", "[STUDY]");
     let mut pop = population(3, 4);
     let model = bind(&text, &mut pop).unwrap();
     assert_eq!(model.n_theta, 2 + 2, "3 studies, global sum-to-zero");
@@ -368,7 +362,7 @@ fn a_subject_constant_index_does_not_engage_time_varying_machinery() {
             !subject.has_tv_covariates(),
             "a subject-constant index must not make the subject time-varying"
         );
-        assert!(subject.covariates.contains_key("__factor_PLACEBO"));
+        assert!(subject.covariates.contains_key("__level_PLACEBO"));
     }
 }
 
@@ -376,7 +370,7 @@ fn a_subject_constant_index_does_not_engage_time_varying_machinery() {
 fn level_map_round_trips_the_labels() {
     let mut pop = population(2, 2);
     let model = bind(&no_eta_model(), &mut pop).unwrap();
-    let map = crate::api::factor_level_map(&model);
+    let map = crate::api::theta_level_map(&model);
     assert_eq!(
         map["PLACEBO"],
         vec![
@@ -389,8 +383,8 @@ fn level_map_round_trips_the_labels() {
 }
 
 #[test]
-fn a_missing_factor_column_is_a_loud_error() {
-    let text = no_eta_model().replace("factor(STUDY, TIME)", "factor(REGION, TIME)");
+fn a_missing_level_column_is_a_loud_error() {
+    let text = no_eta_model().replace("[STUDY, TIME]", "[REGION, TIME]");
     let mut pop = population(2, 2);
     let err = bind(&text, &mut pop).unwrap_err();
     assert!(
@@ -400,7 +394,7 @@ fn a_missing_factor_column_is_a_loud_error() {
 }
 
 #[test]
-fn factor_columns_are_registered_as_required_data_columns() {
+fn level_columns_are_registered_as_required_data_columns() {
     let parsed = parse_full_model(&no_eta_model()).unwrap();
     assert!(
         parsed
@@ -422,24 +416,61 @@ fn factor_columns_are_registered_as_required_data_columns() {
 }
 
 #[test]
-fn factor_declaration_rejects_an_unknown_modifier() {
-    let text = no_eta_model().replace("factor(STUDY, TIME)", "factor(STUDY, TIME, grouping = x)");
+fn a_level_block_rejects_an_unknown_modifier() {
+    let text = no_eta_model().replace("[STUDY, TIME]", "[STUDY, TIME, grouping = x]");
     let err = parse_full_model(&text).err().unwrap();
     assert!(err.contains("unknown modifier"), "got: {err}");
 }
 
 #[test]
-fn factor_declaration_rejects_an_unknown_contrast() {
-    let text = no_eta_model().replace("factor(STUDY, TIME)", "factor(STUDY, TIME, contrast = qq)");
+fn a_level_block_rejects_an_unknown_contrast() {
+    let text = no_eta_model().replace("[STUDY, TIME]", "[STUDY, TIME, contrast = qq]");
     let err = parse_full_model(&text).err().unwrap();
     assert!(err.contains("unknown `contrast = qq`"), "got: {err}");
 }
 
 #[test]
-fn factor_declaration_requires_at_least_one_column() {
-    let text = no_eta_model().replace("factor(STUDY, TIME)", "factor()");
+fn empty_brackets_name_both_forms_in_the_error() {
+    let text = no_eta_model().replace("[STUDY, TIME]", "[]");
+    let err = parse_full_model(&text).err().unwrap();
+    assert!(
+        err.contains("PLACEBO[800]") && err.contains("PLACEBO[STUDY, TIME]"),
+        "the error must show both bracket forms, got: {err}"
+    );
+}
+
+#[test]
+fn a_contrast_modifier_with_no_columns_is_rejected() {
+    let text = no_eta_model().replace("[STUDY, TIME]", "[contrast = ref]");
     let err = parse_full_model(&text).err().unwrap();
     assert!(err.contains("name at least one data column"), "got: {err}");
+}
+
+#[test]
+fn a_digit_only_bracket_is_a_level_count_not_a_column() {
+    // The one place the two bracket forms could collide. A data column named
+    // `800` is not referenceable anywhere else in the DSL either, so digits
+    // always mean a count.
+    let text = no_eta_model().replace("[STUDY, TIME]", "[3]");
+    // The model reads `PLACEBO` bare, which only the column form supports — so
+    // the error itself proves `[3]` parsed as a count of 3 levels rather than
+    // as a column named `3`.
+    let err = parse_full_model(&text).err().unwrap();
+    assert!(
+        err.contains("is a vector of 3 θ levels"),
+        "digits must mean a level count, got: {err}"
+    );
+
+    // And with an explicit index it is an ordinary counted block: three levels,
+    // no data binding needed.
+    let indexed = text.replace("CL = TVCL + PLACEBO", "CL = TVCL + PLACEBO[PLA_IDX]");
+    let parsed = parse_full_model(&indexed).unwrap();
+    assert!(
+        parsed.model.theta_blocks.unbound_level_blocks().is_empty(),
+        "a counted block needs no data binding"
+    );
+    assert_eq!(parsed.model.n_theta, 2 + 3);
+    assert_eq!(parsed.model.theta_names[1], "PLACEBO[1]");
 }
 
 #[test]
@@ -450,7 +481,7 @@ fn eta_sharing_is_detected_through_an_intermediate_assignment() {
     let text = r#"
 [parameters]
   theta TVCL(2.0, 0.001, 10.0)
-  theta PLACEBO ~ factor(STUDY, TIME)(0.0, -10.0, 10.0)
+  theta PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)
   theta TVV(10.0, 0.1, 500.0)
   omega ETA_CL ~ 0.09
   sigma PROP_ERR ~ 0.02
@@ -465,7 +496,7 @@ fn eta_sharing_is_detected_through_an_intermediate_assignment() {
 "#;
     let parsed = parse_full_model(text).unwrap();
     assert!(
-        parsed.model.theta_blocks.factors()[0].shares_scale_with_eta(),
+        parsed.model.theta_blocks.level_blocks()[0].shares_scale_with_eta(),
         "taint must propagate through BASE"
     );
     let mut pop = population(2, 3);

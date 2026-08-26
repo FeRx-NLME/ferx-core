@@ -1,6 +1,6 @@
-//! Binding `theta NAME ~ factor(COL, ...)` blocks to data (#1064).
+//! Binding `theta NAME[COL, ...]` blocks to data (#1064).
 //!
-//! A factor θ block declares *one θ per observed combination* of some data
+//! A θ level block declares *one θ per observed combination* of some data
 //! columns — the unstructured-placebo model of an MBMA analysis, where every
 //! (study × timepoint) cell gets its own fixed effect so no parametric placebo
 //! time-course can bias the drug effect. The level count is therefore a
@@ -9,7 +9,7 @@
 //! This module closes that gap in three steps:
 //!
 //! 1. **Discover** the observed combinations, in a deterministic order.
-//! 2. **Synthesize** a per-record index column (`__factor_NAME`) on every
+//! 2. **Synthesize** a per-record index column (`__level_NAME`) on every
 //!    subject, so the block is read by the ordinary gather machinery and the
 //!    existing time-varying-covariate plumbing carries it — no parallel path.
 //! 3. **Re-parse** the model with the level count known, so the compiled
@@ -22,43 +22,43 @@
 use std::collections::HashMap;
 
 use crate::parser::model_parser::{
-    factor_index_column, parse_full_model_bound, FactorBinding, FactorBindings, FactorContrast,
-    FactorThetaDecl,
+    level_index_column, parse_full_model_bound, LevelBinding, LevelBindings, LevelBlockDecl,
+    LevelContrast,
 };
 use crate::types::{ParsedModel, Population, Subject};
 
-/// The record time, addressable as a factor column even though it is not a
+/// The record time, addressable as a level column even though it is not a
 /// covariate.
 const TIME_COLUMN: &str = "TIME";
 
 /// Synthesized index columns are prefixed so they cannot collide with a real
 /// data column — and so the file readers know not to look for them in the CSV.
-pub(crate) const FACTOR_INDEX_PREFIX: &str = "__factor_";
+pub(crate) const LEVEL_INDEX_PREFIX: &str = "__level_";
 
-/// Whether `name` is a synthesized factor index column rather than a real data
+/// Whether `name` is a synthesized level index column rather than a real data
 /// column. The CSV readers use this to skip it when collecting the columns they
 /// must find in the file.
-pub(crate) fn is_factor_index_column(name: &str) -> bool {
-    name.starts_with(FACTOR_INDEX_PREFIX)
+pub(crate) fn is_level_index_column(name: &str) -> bool {
+    name.starts_with(LEVEL_INDEX_PREFIX)
 }
 
-/// Bind every `factor(...)` block in `parsed` against `population`, mutating
+/// Bind every level block in `parsed` against `population`, mutating
 /// both: the population gains the synthesized index columns, and `parsed.model`
 /// is replaced by a re-parse that knows the level counts.
 ///
 /// A no-op (and no re-parse) for the overwhelming majority of models, which
-/// declare no factor block at all.
-pub fn bind_factor_thetas(
+/// declare no level block at all.
+pub fn bind_theta_levels(
     parsed: &mut ParsedModel,
     model_text: &str,
     population: &mut Population,
 ) -> Result<(), String> {
-    let decls: Vec<FactorThetaDecl> = parsed.model.theta_blocks.factors().to_vec();
+    let decls: Vec<LevelBlockDecl> = parsed.model.theta_blocks.level_blocks().to_vec();
     if decls.is_empty() {
         return Ok(());
     }
 
-    let mut bindings = FactorBindings::new();
+    let mut bindings = LevelBindings::new();
     for decl in &decls {
         let levels = discover_levels(decl, population)?;
         let contrast = resolve_contrast(decl, &levels, population)?;
@@ -66,7 +66,7 @@ pub fn bind_factor_thetas(
         write_index_column(decl, &levels, population)?;
         bindings.insert(
             decl.name().to_string(),
-            FactorBinding {
+            LevelBinding {
                 labels: levels.iter().map(|l| l.label(decl.columns())).collect(),
                 groups,
                 contrast,
@@ -99,7 +99,7 @@ impl Level {
     }
 
     /// The leading columns' values — the sum-to-zero grouping key when the
-    /// factor is nested inside a random effect.
+    /// block is nested inside a random effect.
     fn leading(&self) -> &[f64] {
         &self.values[..self.values.len().saturating_sub(1)]
     }
@@ -128,7 +128,7 @@ fn cmp_levels(a: &Level, b: &Level) -> std::cmp::Ordering {
     std::cmp::Ordering::Equal
 }
 
-/// The value of one factor column on observation row `j` of `subject`.
+/// The value of one level column on observation row `j` of `subject`.
 fn column_value(subject: &Subject, column: &str, j: usize) -> Option<f64> {
     if column.eq_ignore_ascii_case(TIME_COLUMN) {
         return subject.obs_times.get(j).copied();
@@ -143,7 +143,7 @@ fn column_value(subject: &Subject, column: &str, j: usize) -> Option<f64> {
 
 /// The observed level combinations, sorted so each group's levels are
 /// contiguous and the binding is reproducible.
-fn discover_levels(decl: &FactorThetaDecl, population: &Population) -> Result<Vec<Level>, String> {
+fn discover_levels(decl: &LevelBlockDecl, population: &Population) -> Result<Vec<Level>, String> {
     let mut levels: Vec<Level> = Vec::new();
     for subject in &population.subjects {
         for j in 0..subject.obs_times.len() {
@@ -151,7 +151,7 @@ fn discover_levels(decl: &FactorThetaDecl, population: &Population) -> Result<Ve
             for column in decl.columns() {
                 let v = column_value(subject, column, j).ok_or_else(|| {
                     format!(
-                        "theta {} ~ factor(...): column `{column}` is not in the data \
+                        "theta {}[...]: column `{column}` is not in the data \
                          (subject {})",
                         decl.name(),
                         subject.id
@@ -159,7 +159,7 @@ fn discover_levels(decl: &FactorThetaDecl, population: &Population) -> Result<Ve
                 })?;
                 if !v.is_finite() {
                     return Err(format!(
-                        "theta {} ~ factor(...): column `{column}` is non-finite on subject {}",
+                        "theta {}[...]: column `{column}` is non-finite on subject {}",
                         decl.name(),
                         subject.id
                     ));
@@ -174,7 +174,7 @@ fn discover_levels(decl: &FactorThetaDecl, population: &Population) -> Result<Ve
     }
     if levels.is_empty() {
         return Err(format!(
-            "theta {} ~ factor({}): the data carries no observation rows, so the block \
+            "theta {}[{}]: the data carries no observation rows, so the block \
              has no levels",
             decl.name(),
             decl.columns().join(", ")
@@ -184,14 +184,14 @@ fn discover_levels(decl: &FactorThetaDecl, population: &Population) -> Result<Ve
     Ok(levels)
 }
 
-/// Whether the factor's leading columns partition the subjects — i.e. every
+/// Whether the block's leading columns partition the subjects — i.e. every
 /// subject's records share one combination of them.
 ///
 /// This is the data-side half of "is there a random effect at a grouping
-/// coarser than or equal to the factor's". η in this engine is per subject, so
+/// coarser than or equal to the block's". η in this engine is per subject, so
 /// if the leading columns partition subjects then a subject-level η sits at (or
 /// inside) the group, and it — not the levels — should carry the group mean.
-fn leading_partitions_subjects(decl: &FactorThetaDecl, population: &Population) -> bool {
+fn leading_partitions_subjects(decl: &LevelBlockDecl, population: &Population) -> bool {
     if decl.columns().len() < 2 {
         return false;
     }
@@ -214,20 +214,20 @@ fn leading_partitions_subjects(decl: &FactorThetaDecl, population: &Population) 
     true
 }
 
-/// Resolve [`FactorContrast::Auto`], and reject the configurations that are
+/// Resolve [`LevelContrast::Auto`], and reject the configurations that are
 /// still rank-deficient once resolved.
 fn resolve_contrast(
-    decl: &FactorThetaDecl,
+    decl: &LevelBlockDecl,
     levels: &[Level],
     population: &Population,
-) -> Result<FactorContrast, String> {
+) -> Result<LevelContrast, String> {
     let nested = leading_partitions_subjects(decl, population);
     let resolved = match decl.contrast() {
-        FactorContrast::Auto => {
+        LevelContrast::Auto => {
             if decl.shares_scale_with_eta() && nested {
-                FactorContrast::SumToZeroWithin
+                LevelContrast::SumToZeroWithin
             } else {
-                FactorContrast::SumToZero
+                LevelContrast::SumToZero
             }
         }
         other => other,
@@ -243,12 +243,12 @@ fn resolve_contrast(
         && nested
         && matches!(
             resolved,
-            FactorContrast::SumToZero | FactorContrast::Ref | FactorContrast::Unconstrained
+            LevelContrast::SumToZero | LevelContrast::Ref | LevelContrast::Unconstrained
         )
     {
         let leading = decl.columns()[..decl.columns().len() - 1].join(", ");
         return Err(format!(
-            "theta {} ~ factor({}): `contrast = {}` leaves each {leading} group's mean free, \
+            "theta {}[{}]: `contrast = {}` leaves each {leading} group's mean free, \
              but the individual parameter that reads this block also carries a random effect \
              at that grouping — the two are the same quantity, so the model is not identified. \
              Use `contrast = sum_to_zero_within` (the default for this shape), or drop the \
@@ -259,11 +259,11 @@ fn resolve_contrast(
         ));
     }
 
-    if levels.len() == 1 && matches!(resolved, FactorContrast::SumToZero) {
+    if levels.len() == 1 && matches!(resolved, LevelContrast::SumToZero) {
         // A one-level block under sum-to-zero has no free θ at all: the single
         // level is pinned at 0. That is a degenerate model, not a normalization.
         return Err(format!(
-            "theta {} ~ factor({}): the data carries a single level, which sum-to-zero pins \
+            "theta {}[{}]: the data carries a single level, which sum-to-zero pins \
              at 0. Use `contrast = none` if a single constant is what you meant.",
             decl.name(),
             decl.columns().join(", ")
@@ -274,21 +274,21 @@ fn resolve_contrast(
 }
 
 /// The `contrast = ...` token for a resolved convention, for diagnostics.
-fn contrast_token(c: FactorContrast) -> &'static str {
+fn contrast_token(c: LevelContrast) -> &'static str {
     match c {
-        FactorContrast::Auto => "auto",
-        FactorContrast::SumToZero => "sum_to_zero",
-        FactorContrast::SumToZeroWithin => "sum_to_zero_within",
-        FactorContrast::Ref => "ref",
-        FactorContrast::Unconstrained => "none",
+        LevelContrast::Auto => "auto",
+        LevelContrast::SumToZero => "sum_to_zero",
+        LevelContrast::SumToZeroWithin => "sum_to_zero_within",
+        LevelContrast::Ref => "ref",
+        LevelContrast::Unconstrained => "none",
     }
 }
 
 /// Group id per level. Levels are sorted by their full tuple, so grouping by
 /// the leading columns yields contiguous groups — which is what lets each
 /// group's sum-to-zero contrast be a single `NegSum` range.
-fn assign_groups(decl: &FactorThetaDecl, levels: &[Level], contrast: FactorContrast) -> Vec<usize> {
-    let within = matches!(contrast, FactorContrast::SumToZeroWithin) && decl.columns().len() >= 2;
+fn assign_groups(decl: &LevelBlockDecl, levels: &[Level], contrast: LevelContrast) -> Vec<usize> {
+    let within = matches!(contrast, LevelContrast::SumToZeroWithin) && decl.columns().len() >= 2;
     if !within {
         return vec![0; levels.len()];
     }
@@ -317,11 +317,11 @@ fn assign_groups(decl: &FactorThetaDecl, levels: &[Level], contrast: FactorContr
 /// case, where the index moves with the timepoint) the per-event snapshots are
 /// materialised, which is exactly what a genuinely per-record parameter needs.
 fn write_index_column(
-    decl: &FactorThetaDecl,
+    decl: &LevelBlockDecl,
     levels: &[Level],
     population: &mut Population,
 ) -> Result<(), String> {
-    let column = factor_index_column(decl.name());
+    let column = level_index_column(decl.name());
     let index_of = |values: &[f64]| -> Option<f64> {
         levels
             .iter()
@@ -340,7 +340,7 @@ fn write_index_column(
                 .collect();
             let idx = index_of(&values).ok_or_else(|| {
                 format!(
-                    "theta {} ~ factor(...): subject {} row {j} has a level combination that \
+                    "theta {}[...]: subject {} row {j} has a level combination that \
                      was not discovered — the data changed between passes",
                     decl.name(),
                     subject.id
@@ -417,11 +417,11 @@ fn write_index_column(
     Ok(())
 }
 
-/// Level labels of every bound factor block, keyed by block name, so a fit can
+/// Level labels of every bound level block, keyed by block name, so a fit can
 /// record the map and `predict()` / `simulate()` rebuild the identical binding.
 pub fn level_map(model: &crate::types::CompiledModel) -> HashMap<String, Vec<String>> {
     let mut out = HashMap::new();
-    for decl in model.theta_blocks.factors() {
+    for decl in model.theta_blocks.level_blocks() {
         let prefix = format!("{}[", decl.name());
         let labels: Vec<String> = model
             .theta_names
@@ -440,5 +440,5 @@ pub fn level_map(model: &crate::types::CompiledModel) -> HashMap<String, Vec<Str
 }
 
 #[cfg(test)]
-#[path = "tests/factor_tests.rs"]
+#[path = "tests/theta_levels_tests.rs"]
 mod tests;

@@ -163,15 +163,15 @@ pub fn run_model_with_data_inits(
         data_path
     );
 
-    // #1064: a `theta NAME ~ factor(COL, ...)` block declares one θ per observed
+    // #1064: a `theta NAME[COL, ...]` block declares one θ per observed
     // combination, so its level count is a property of the data. Bind it now —
     // this synthesizes the per-record index column on every subject and
     // re-parses the model with the real θ count — before anything reads
     // `parsed.model`'s parameter vector.
     {
         let model_text = std::fs::read_to_string(model_path)
-            .map_err(|e| format!("Failed to re-read model file for factor binding: {e}"))?;
-        crate::api::bind_factor_thetas(&mut parsed, &model_text, &mut population)?;
+            .map_err(|e| format!("Failed to re-read model file for level binding: {e}"))?;
+        crate::api::bind_theta_levels(&mut parsed, &model_text, &mut population)?;
     }
 
     let init_params = build_init_params(&parsed);
@@ -288,12 +288,12 @@ pub(crate) fn simulation_design_covariates(
     let missing: Vec<&str> = model
         .referenced_covariates
         .iter()
-        // A `factor(...)` index column (#1064) is synthesized per record by
-        // `bind_factor_thetas` from the design's own covariates and observation
+        // A a level block index column (#1064) is synthesized per record by
+        // `bind_theta_levels` from the design's own covariates and observation
         // grid — it is not something the user can state, so demanding it here
-        // would make every factor model unsimulatable, naming a column with a
-        // reserved `__factor_` prefix as the fix.
-        .filter(|name| !crate::api::factor::is_factor_index_column(name))
+        // would make every level-block model unsimulatable, naming a column with a
+        // reserved `__level_` prefix as the fix.
+        .filter(|name| !crate::api::levels::is_level_index_column(name))
         .filter(|name| !names.iter().any(|n| n == *name))
         .map(|s| s.as_str())
         .collect();
@@ -521,7 +521,7 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
         warnings: vec![],
     };
 
-    // #1064: bind `factor(...)` blocks against the synthetic design, exactly as
+    // #1064: bind level blocks against the synthetic design, exactly as
     // the data path binds them against a dataset — the levels come from the
     // `[simulation]` covariates and observation grid. Every level gets the
     // declaration's broadcast init, since the DSL has no way to state per-level
@@ -529,8 +529,8 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
     // explicit `theta NAME[N]` form and its own index column.
     {
         let model_text = std::fs::read_to_string(model_path)
-            .map_err(|e| format!("Failed to re-read model file for factor binding: {e}"))?;
-        crate::api::bind_factor_thetas(&mut parsed, &model_text, &mut template)?;
+            .map_err(|e| format!("Failed to re-read model file for level binding: {e}"))?;
+        crate::api::bind_theta_levels(&mut parsed, &model_text, &mut template)?;
     }
     let template = template;
 
@@ -792,10 +792,10 @@ fn undeclared_referenced(model: &CompiledModel, decls: &[CovariateDecl]) -> Vec<
     model
         .referenced_covariates
         .iter()
-        // A `factor(...)` index column (#1064) is synthesized by
-        // `bind_factor_thetas` after the read, never present in the CSV — asking
+        // A a level block index column (#1064) is synthesized by
+        // `bind_theta_levels` after the read, never present in the CSV — asking
         // the reader for it would fail on a column the user never wrote.
-        .filter(|c| !crate::api::factor::is_factor_index_column(c))
+        .filter(|c| !crate::api::levels::is_level_index_column(c))
         .filter(|c| !decls.iter().any(|d| &d.name == *c))
         .cloned()
         .collect()
