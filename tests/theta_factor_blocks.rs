@@ -304,3 +304,54 @@ fn predict_refuses_a_population_that_was_never_bound() {
         "predict() must refuse a population missing the factor index column"
     );
 }
+
+#[test]
+fn a_factor_model_binds_against_a_simulation_design() {
+    // `--simulate` has no dataset, so the levels come from the `[simulation]`
+    // covariates (#1083) and the observation grid instead. Every level takes
+    // the declaration's broadcast init, since the DSL has no way to state
+    // per-level simulation values.
+    let model = r#"
+[parameters]
+  theta TVCL(2.0, 0.001, 20.0)
+  theta PLACEBO ~ factor(STUDY, TIME)(0.0, -5.0, 5.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_V ~ 0.04
+  sigma PROP_ERR ~ 0.05
+
+[individual_parameters]
+  CL = TVCL + PLACEBO
+  V  = TVV * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[simulation]
+  n_subjects = 3
+  dose_amt   = 100
+  dose_cmt   = 1
+  seed       = 7
+  times      = [1, 4, 12]
+  covariate STUDY = [1, 2, 3]
+"#;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let model_path = dir.path().join("sim.ferx");
+    write!(std::fs::File::create(&model_path).unwrap(), "{model}").unwrap();
+
+    let (result, population) =
+        ferx_core::run_model_simulate(model_path.to_str().unwrap()).expect("simulate");
+
+    // 3 studies x 3 timepoints, global sum-to-zero leaves 8 free levels.
+    assert_eq!(result.theta_names.len(), 2 + 8, "{:?}", result.theta_names);
+    assert_eq!(result.theta_names[1], "PLACEBO[STUDY=1,TIME=1]");
+    for subject in &population.subjects {
+        assert!(subject.covariates.contains_key("__factor_PLACEBO"));
+        assert!(
+            subject.observations.iter().all(|v| v.is_finite()),
+            "a bound factor block must simulate finite observations"
+        );
+    }
+}

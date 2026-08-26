@@ -288,6 +288,12 @@ pub(crate) fn simulation_design_covariates(
     let missing: Vec<&str> = model
         .referenced_covariates
         .iter()
+        // A `factor(...)` index column (#1064) is synthesized per record by
+        // `bind_factor_thetas` from the design's own covariates and observation
+        // grid — it is not something the user can state, so demanding it here
+        // would make every factor model unsimulatable, naming a column with a
+        // reserved `__factor_` prefix as the fix.
+        .filter(|name| !crate::api::factor::is_factor_index_column(name))
         .filter(|name| !names.iter().any(|n| n == *name))
         .map(|s| s.as_str())
         .collect();
