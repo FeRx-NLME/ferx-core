@@ -1588,10 +1588,8 @@ fn fit_inner(
     // ordinary dispatch, so it is where `min_dt` clamps and `auto`'s escalation/rejection
     // decisions can be observed without threading a stats sink through every predictor. Costs
     // one thread-local read per segment on the ODE path and nothing at all elsewhere.
-    let solver_stats_scope = model
-        .ode_spec
-        .is_some()
-        .then(crate::ode::solver::SolverStatsScope::enter);
+    let solver_stats_scope =
+        integrates_odes(model).then(crate::ode::solver::SolverStatsScope::enter);
     let mut subjects = compute_subject_results(
         model,
         population,

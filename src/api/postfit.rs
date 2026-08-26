@@ -1397,6 +1397,26 @@ pub(crate) fn absorption_flip_flop_ebe_warning(
 /// [`classify_warning`](crate::types::classify_warning) keys the `ode_solver` code off.
 const ODE_SOLVER_WARNING_TOKEN: &str = "W_ODE_SOLVER_DIAGNOSTICS";
 
+/// The token for the *informational* half — `auto` escalated and it worked.
+///
+/// A separate token rather than a shared one because severity has to survive the round trip:
+/// [`classify_warning`](crate::types::classify_warning) sees only the message text, so a
+/// consumer that re-classifies from `FitResult.warnings` (reading back a `{model}-fit.yaml`,
+/// say) would otherwise promote this note to a `Warning`.
+const ODE_SOLVER_INFO_TOKEN: &str = "W_ODE_SOLVER_ESCALATION_NOTE";
+
+/// Whether a fit integrates an `[odes]` system at all — and therefore whether the post-fit
+/// pass has any solver statistics to collect.
+///
+/// The twin matters: a closed-form transit / inverse-Gaussian model carries no `ode_spec` of
+/// its own, but its time-varying-covariate / `TIME` / IOV / SS subjects integrate the
+/// [`AbsorptionOdeEquivalent`] — which `sync_ode_solver_opts` configures with the same
+/// tolerances and the same `stiff_abort_after` budget. Gating on `ode_spec` alone would let
+/// exactly those rerouted subjects clamp, escalate, or abort with nothing reported.
+pub(crate) fn integrates_odes(model: &CompiledModel) -> bool {
+    model.ode_spec.is_some() || model.absorption_ode_equivalent.is_some()
+}
+
 /// Turn the post-fit pass's [`OdeSolverStats`] into the fit's one ODE-solver warning (#1080
 /// Part B item 2).
 ///
@@ -1426,7 +1446,14 @@ pub(crate) fn ode_solver_diagnostics_warning(
     stats: &crate::ode::OdeSolverStats,
     options: &FitOptions,
 ) -> Option<(String, WarningEntry)> {
-    let clamped = stats.min_step_clamped_steps;
+    // Clamps taken inside escalations the guard discarded describe a trajectory nobody
+    // received — the explicit re-solve replaced it — so they must not drive the freeze-padding
+    // clause below. They are reported through `auto_stiff_rejected` instead. A stall *is* the
+    // rejection trigger, so without this subtraction every rejected escalation would be told
+    // its predictions were padded when the guard had just repaired them.
+    let clamped = stats
+        .min_step_clamped_steps
+        .saturating_sub(stats.discarded_clamped_steps);
     let rejected = stats.auto_stiff_rejected;
     let aborted = stats.stiff_aborted_segments;
     let escalated = stats.auto_stiff_segments;
@@ -1441,7 +1468,9 @@ pub(crate) fn ode_solver_diagnostics_warning(
         "attempted_steps": stats.attempted_steps,
         "accepted_steps": stats.accepted_steps,
         "rejected_steps": stats.rejected_steps,
-        "min_step_clamped_steps": clamped,
+        "min_step_clamped_steps": stats.min_step_clamped_steps,
+        "discarded_clamped_steps": stats.discarded_clamped_steps,
+        "kept_clamped_steps": clamped,
         "auto_stiff_segments": escalated,
         "auto_stiff_rejected": rejected,
         "stiff_aborted_segments": aborted,
@@ -1450,7 +1479,7 @@ pub(crate) fn ode_solver_diagnostics_warning(
     if !unclean {
         // Escalation only: the probe fired, the stiff method coped, nothing was discarded.
         let msg = format!(
-            "{ODE_SOLVER_WARNING_TOKEN}: ode_method = auto escalated {escalated} integration \
+            "{ODE_SOLVER_INFO_TOKEN}: ode_method = auto escalated {escalated} integration \
              segment(s) to a stiff stepper at the final estimates; every other segment used \
              {explicit}, no escalation was rejected, and no step clamped at the minimum step \
              size. Informational — set ode_method = {explicit} to pin the explicit stepper, or \
@@ -1482,9 +1511,12 @@ pub(crate) fn ode_solver_diagnostics_warning(
             "{rejected} of {escalated} stiff escalation(s) chosen by ode_method = auto were \
              discarded as unusable and re-solved with {explicit} — the stiffness probe was \
              right that those segments are stiff and wrong that the stiff method it picked \
-             could integrate them, and the fit paid for both solves; naming ode_method = \
-             rodas5p (or rosenbrock23) explicitly is the next thing to try",
+             could integrate them, and the fit paid for both solves (the {discarded} step(s) \
+             those attempts clamped are not in the count above: the guard replaced the \
+             trajectory they produced); naming ode_method = rodas5p (or rosenbrock23) \
+             explicitly is the next thing to try",
             explicit = crate::ode::OdeMethod::EXPLICIT_FALLBACK.as_str(),
+            discarded = stats.discarded_clamped_steps,
         ));
     }
     if aborted > 0 {

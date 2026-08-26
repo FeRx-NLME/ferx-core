@@ -50,10 +50,11 @@ section of the SDLC for the versioning policy).
 - **`ode_stiff_abort_after` bounds what a stalled ODE segment costs (#708, #1080).** A segment that is
   stability-limited keeps stepping at the minimum step size until it exhausts `ode_max_steps`;
   setting this key gives up after that many clamped steps instead. Off by default and deliberately
-  so — aborting freeze-pads the segment's remaining output times, trading a slow-but-integrated
-  segment for a padded one — so it is a way to make a grinding fit say so quickly, not a substitute
-  for choosing a stiff method. On the time-to-event path an abort is reported as a failed segment
-  rather than padded. See
+  so — aborting freeze-pads the segment's remaining output times, and it does so on every
+  likelihood evaluation, which makes the objective discontinuous in θ; a fit whose `ode_solver`
+  warning reports aborts is a diagnosis ("these segments are stability-limited"), not an estimate.
+  It is a way to make a grinding fit say so quickly, not a substitute for choosing a stiff method.
+  On the time-to-event path an abort is reported as a failed segment rather than padded. See
   [ODE models → Which regime am I in?](https://ferx-nlme.github.io/ferx-core/model-file/ode-models.html#which-regime-am-i-in).
 - **The `init(...)` scope rule is now published by the engine (#994).** `ODE_INIT_SCOPE_BUILTINS` and
   `ODE_INIT_REJECTED_BUILTINS` name the built-ins an `[odes] init(...)` expression may and may not

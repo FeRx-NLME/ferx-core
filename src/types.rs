@@ -4734,6 +4734,11 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
             WarningSeverity::Warning,
             WarningCode::AbsorptionTwinDeclined,
         )
+    } else if lower.contains("w_ode_solver_escalation_note") {
+        // #1080 Part B: the informational half — `ode_method = auto` escalated and the stiff
+        // method coped. Its own token, so re-classifying the plain message text recovers the
+        // `Info` severity the emitter used rather than promoting a routine note to a warning.
+        (WarningSeverity::Info, WarningCode::OdeSolver)
     } else if lower.contains("w_ode_solver_diagnostics") {
         // #1080 Part B: the post-fit solver-statistics pass. Matched on its `W_` token and
         // placed with the other token arm, ahead of the prose ones — the message names

@@ -355,7 +355,11 @@ fn a_budgeted_abort_inside_an_escalation_is_still_rejected_by_the_guard() {
         budgeted.auto_stiff_rejected, 1,
         "an aborted escalation is a stalled escalation"
     );
+    // The abort that is *counted* is the explicit re-solve's: this system blows up under any
+    // method, so the fallback trips the same budget. The discarded escalation's own abort is
+    // deliberately not counted — nobody received that trajectory.
     assert!(budgeted.stiff_aborted_segments >= 1);
+    assert!(budgeted.discarded_clamped_steps > 0);
     assert!(
         budgeted.attempted_steps < unbudgeted.attempted_steps,
         "the budget must cost fewer steps: {} vs {}",
@@ -434,6 +438,40 @@ fn the_gershgorin_fast_path_agrees_with_the_exact_eigensolve() {
             );
         }
     }
+}
+
+/// Review follow-up (#1080): a discarded escalation's clamps are attributed to the *discarded*
+/// bucket, and a budgeted abort inside one is not reported as a truncated result — the caller
+/// received the explicit re-solve, not the attempt that was abandoned.
+#[test]
+fn a_discarded_escalations_clamps_are_recorded_as_discarded() {
+    let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| du[0] = u[0] * u[0];
+    let opts = OdeSolverOptions {
+        stiff_abort_after: Some(1),
+        ..loose()
+    };
+    let mut stats = OdeSolverStats::default();
+    solve_ode_with_stats(
+        &rhs,
+        &[1.0e6],
+        (0.0, 1.0),
+        &[],
+        &[1.0],
+        &opts,
+        Some(&mut stats),
+    );
+
+    assert_eq!(stats.auto_stiff_rejected, 1);
+    assert!(
+        stats.discarded_clamped_steps > 0,
+        "the rejected escalation's clamps must be attributed to it: {stats:?}"
+    );
+    // Whatever clamps survive the subtraction belong to the explicit re-solve, which is the
+    // trajectory the caller actually received.
+    assert!(
+        stats.min_step_clamped_steps >= stats.discarded_clamped_steps,
+        "{stats:?}"
+    );
 }
 
 #[test]

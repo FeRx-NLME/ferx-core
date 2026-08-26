@@ -168,6 +168,101 @@ fn an_abort_names_the_budget_that_caused_it() {
     );
 }
 
+/// Review follow-up (#1080): a rejected escalation must not be reported as freeze-padding. The
+/// guard re-solved the segment explicitly, so the trajectory the caller received was not the
+/// clamped one — and since a stall *is* the rejection trigger, every rejection would otherwise
+/// carry that false claim.
+#[test]
+fn a_rejected_escalations_clamps_do_not_claim_freeze_padding() {
+    let stats = OdeSolverStats {
+        min_step_clamped_steps: 12,
+        discarded_clamped_steps: 12,
+        auto_stiff_segments: 240,
+        auto_stiff_rejected: 3,
+        ..Default::default()
+    };
+    let (msg, entry) =
+        ode_solver_diagnostics_warning(&stats, &FitOptions::default()).expect("a warning");
+    assert!(
+        !msg.contains("clamped at the minimum step size"),
+        "no clamp survived into a returned trajectory: {msg}"
+    );
+    assert!(msg.contains("3 of 240"), "{msg}");
+    assert_eq!(
+        entry.details.as_ref().unwrap()["kept_clamped_steps"],
+        serde_json::json!(0)
+    );
+
+    // …and a clamp in the *kept* solve still is reported, alongside the rejection.
+    let with_kept = OdeSolverStats {
+        min_step_clamped_steps: 14,
+        discarded_clamped_steps: 12,
+        ..stats
+    };
+    let (msg, _) =
+        ode_solver_diagnostics_warning(&with_kept, &FitOptions::default()).expect("a warning");
+    assert!(msg.contains("2 step(s) clamped"), "{msg}");
+}
+
+/// The informational note must re-classify as `Info`, not be promoted to a `Warning`, when a
+/// consumer only has the plain message text (reading back a `{model}-fit.yaml`).
+#[test]
+fn the_escalation_note_keeps_its_severity_through_classification() {
+    let stats = OdeSolverStats {
+        auto_stiff_segments: 7,
+        ..Default::default()
+    };
+    let (msg, entry) =
+        ode_solver_diagnostics_warning(&stats, &FitOptions::default()).expect("a note");
+    assert_eq!(entry.severity, WarningSeverity::Info);
+    let reclassified = classify_warning(&msg);
+    assert_eq!(reclassified.severity, WarningSeverity::Info);
+    assert_eq!(reclassified.category, WarningCode::OdeSolver);
+}
+
+/// The stats scope has to cover the closed-form absorption models too: they carry no
+/// `ode_spec`, but their TV-covariate / `TIME` / IOV / SS subjects integrate the ODE twin,
+/// which `sync_ode_solver_opts` configures with the same solver options.
+#[test]
+fn the_solver_scope_gate_covers_the_absorption_ode_twin() {
+    let ode = two_state_model(1.0);
+    assert!(integrates_odes(&ode));
+
+    let transit = parse_model_string(
+        r#"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(40.0, 1.0, 500.0)
+  theta TVMTT(1.0, 0.01, 24.0)
+  theta TVN(3.0, 0.1, 50.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  MTT = TVMTT
+  NN  = TVN
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NN, mtt=MTT)
+[error_model]
+  DV ~ proportional(PROP)
+"#,
+    )
+    .expect("parse");
+    assert!(
+        transit.ode_spec.is_none(),
+        "the fixture must be the closed form, not an ODE model"
+    );
+    assert!(
+        transit.absorption_ode_equivalent.is_some(),
+        "the fixture must carry a twin"
+    );
+    assert!(
+        integrates_odes(&transit),
+        "a model that integrates only through its twin still has solver statistics"
+    );
+}
+
 // ── end-to-end wiring ────────────────────────────────────────────────────────
 
 /// The wiring test: a stiff ODE model fitted through `fit()` must come back *saying* that
@@ -185,10 +280,7 @@ fn a_stiff_ode_fit_reports_the_solver_decisions() {
         .unwrap();
     assert!(escalated > 0, "the probe should have escalated: {entry:?}");
     assert!(
-        result
-            .warnings
-            .iter()
-            .any(|w| w.contains("W_ODE_SOLVER_DIAGNOSTICS")),
+        result.warnings.iter().any(|w| w.contains("W_ODE_SOLVER_")),
         "the plain-text warnings must carry it too: {:?}",
         result.warnings
     );
