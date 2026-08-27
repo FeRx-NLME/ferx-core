@@ -1,3 +1,7 @@
+---
+pagetitle: "Steady-state doses in ferx"
+---
+
 # Steady-State Doses (SS=1)
 
 > **Maturity: stable** — see [Feature Maturity](../maturity.qmd) for what this means.

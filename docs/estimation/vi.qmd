@@ -136,7 +136,7 @@ All keys go in `[fit_options]`.
 | Key | Default | Meaning |
 |---|---|---|
 | `vi_iters` | 25000 | **Ceiling** on Adam iterations; the fit stops earlier once it has settled — see below |
-| `vi_mc_samples` | 8 | Monte-Carlo draws per subject per iteration. Raise it when the residual error itself matters |
+| `vi_mc_samples` | 32 | Monte-Carlo draws per subject per iteration. Sets the noise floor the settling test measures against, so it decides where the fit stops — see below |
 | `vi_lr` | 0.02 | Adam learning rate |
 | `vi_family` | `full_rank` | `full_rank` or `mean_field` |
 | `vi_omega_update` | `closed_form` | `closed_form` or `adam` |
@@ -218,11 +218,16 @@ fit with [`elbo_tightness_ratio`](#is-the-bound-tight-elbo_tightness_ratio) abov
 a free `Ω`/`σ` coordinate pinned to its internal runaway bound, is therefore reported as
 `converged: false` even if the trace itself settled.
 
-Either criterion is sufficient, which is what makes the second one worth stating carefully: it
-measures the **population** vector, not `q`. If you FIX every population parameter and fit `q`
-alone — a reasonable thing to ask for, since it is how you read per-subject posteriors at a known
-estimate — that test compares a constant against itself and would stop the fit immediately. It is
-disabled in that case, convergence rests on the objective alone, and a warning says so.
+Either criterion is sufficient, so the second one is stated carefully. It measures **both**
+halves of the optimization — the packed population vector *and* `φ`, the per-subject variational
+parameters — because `φ` is what a VI fit is usually for, and a model whose `θ`/`Ω`/`σ` settle
+first would otherwise stop while the posteriors were still moving. Both must be still, on the same
+window and tolerance.
+
+The population half is still disabled outright when every population parameter is FIXed and you are
+fitting `q` alone — a reasonable thing to ask for, since it is how you read per-subject posteriors at
+a known estimate. There the test would compare a constant against itself, so convergence rests on the
+objective alone and a warning says so.
 
 ### How `σ` is updated
 
@@ -244,17 +249,48 @@ structures with no scalar stationary point — combined error, several `σ`, per
 covariate-selected error, correlated residuals, M3 BLOQ, IIV-on-RUV, FREM, or a FIXed `σ` — fall
 back to `adam`, with the reason in `FitResult$warnings`.
 
-**The thing actually worth knowing about `σ` near a good basin.** At the default
-`vi_mc_samples = 8`, a warfarin fit
-returns `σ = 0.011234`–`0.014150` depending on the route where AGQ (`n_agq = 9`) and FOCEI both
-give `0.010565`, and can stop while sitting up to 11.3 OFV short of the
-reference. Since per-subject posterior width scales with `σ²`, a 34% error there makes every
-reported variational covariance about 1.75× too wide. In that case
-`elbo_tightness_ratio ≈ 1`: this is **not** a defect in the `σ` update. Both routes show it,
-and both stop showing it at higher draw counts. It is the convergence rule meeting its own
-noise floor, described next.
+**The thing actually worth knowing about `σ` near a good basin.** At `vi_mc_samples = 8` — the default before this
+was measured — a warfarin fit (`data/warfarin.csv`) returns `σ ≈ 0.0138` where AGQ
+(`n_agq = 9`) and FOCEI both give `0.010565`
+— **31% high**, with the OFV 9.4–9.6 units short of AGQ's `−285.977`. Since per-subject posterior
+width scales with `σ²`, an error that size makes every reported variational covariance about 1.7×
+too wide. This is **not** a defect in the `σ` update: `closed_form` gives `0.013810` and `adam`
+`0.013932` on the same data, and both stop showing it at higher draw counts.
 
-A distant start is different. On the same warfarin model with `TVV = 2` rather than a value near
+**Why the default is 32.** Measured against AGQ's `−285.977`, the OFV
+gap runs **9.6 units at 8 draws, 1.4 at 32, and 0.37 at 128** (`−285.606`), with `σ` +31%, +10% and
++5% respectively. The draw count sets the noise floor the settling test measures against, so too
+few draws do not merely make the fit noisy — they change where it stops.
+
+::: {.callout-warning}
+## At 8 draws this fit could still report `converged: true`
+
+The convergence rule has a drift check that demotes a run stopping at its noise floor while the
+objective is still falling (see [Why there is no convergence
+tolerance](#why-there-is-no-convergence-tolerance)). It does not catch every case here, because
+there are two different failures at 8 draws and it only sees the first:
+
+- **Still descending at the ceiling.** With the default `vi_seed`, the run reaches `vi_iters =
+  25000` still moving and reports `converged: false` — correctly.
+- **Settled at a biased fixed point.** With `vi_seed = 99` and *otherwise default options*, the
+  same fit stops at 17 125 iterations and reports **`converged: true`** at `σ = 0.013761` (+30%)
+  and an OFV of `−276.569`, 9.4 units short. The ELBO trace tail really has plateaued — a sign
+  test over it finds 4 of 9 block steps falling, i.e. noise — so nothing flags it. Raising
+  `vi_iters` to 150 000 produces the same outcome from the default seed (converges at 30 500,
+  `σ = 0.013690`).
+
+`elbo_tightness_ratio` does not catch it either — it read `0.989` on that run, a healthy value,
+because it measures whether `q` matches the posterior *at the current parameters*, and it does.
+
+**This is why the default is 32.** Across the seeds tried at 32 draws, none certified a materially
+wrong fit: the runs that reported `converged: true` landed `σ` +10% with the OFV within 1.4 units,
+and a seed that fell into a bad basin (`σ = 0.079`, OFV `−34`) was correctly reported
+`converged: false`. The failure above is a property of the noise floor, not of a particular seed,
+so on a residual error under ~3% it is still worth checking `σ` against a `method = laplace` or
+`focei` fit rather than reading `converged` alone.
+:::
+
+**A distant start is a different failure.** On the same warfarin model with `TVV = 2` rather than a value near
 the fitted `7.74`, the initial `−2·ELBO` is about `1.5e14`: late-time
 predictions are nearly zero, so `E_q[(y-f)^2/f^2]` is enormous. The closed-form update correctly
 maximizes the ELBO *conditional on that initial q* by sending `σ` to its `exp(5)` runaway bound.
@@ -262,19 +298,11 @@ The resulting residual variance flattens the data gradient before q can move, an
 in that bad basin. More draws, a lower learning rate, and more iterations do not fix this case;
 `elbo_tightness_ratio` is orders of magnitude above 25 and `converged` is reported false.
 
-**`vi_mc_samples = 8` is not enough on this problem.** Warfarin's OFV gap to AGQ runs 11.3 units
-at 8 draws, 1.4 at 32, and 0.55 at 128 (−285.4 against −285.977). The mechanism is the trade the
-convergence rule is deliberately written to make (see [Why there is no convergence
-tolerance](#why-there-is-no-convergence-tolerance)): it stops when the ELBO's drift is no longer
-distinguishable from Monte-Carlo noise, and at 8 draws it becomes indistinguishable while real
-drift remains. So the fit stops short, and `σ` — the coordinate that moves slowest — is left
-furthest from its optimum.
-
 Four consequences worth carrying:
 
-- **If a VI fit lands short but `elbo_tightness_ratio` remains near 1, raise
-  `vi_mc_samples` first.** That is the noise-floor case: more iterations at the same draw count
-  will not resolve the drift.
+- **If a VI fit lands well short of a FOCEI or AGQ fit of the same data, raise `vi_mc_samples`
+  first.** More iterations do not fix the estimate — 150 000 at 8 draws still lands 9.1 units
+  short — and, worse, they let the run settle and certify itself.
 - **If `elbo_tightness_ratio` is above 25, improve the population starting values or use
   FOCEI/SAEM.** More draws do not move q out of a bad basin; this is the failure mode that can
   drive `σ` or `Ω` into an internal bound.
@@ -286,10 +314,10 @@ Four consequences worth carrying:
   likelihood is the target; use the chained VI stage only when its variational posterior is the
   quantity you need.
 
-A healthy `elbo_tightness_ratio` does not by itself prove that the population parameters reached
-the optimum: it read `0.960` at the point 11.3 units short because it measures whether `q`
-matches the posterior *at the current parameters*. The trace-drift check is what demotes that
-noise-limited case; the tightness check demotes the separate bad-basin case above.
+A healthy `elbo_tightness_ratio` does not by itself prove that the population parameters
+reached the optimum: it measures whether `q` matches the posterior *at the current
+parameters*. The trace-drift check is what demotes the noise-limited case; the tightness
+check demotes the separate bad-basin case above.
 
 ### Why the estimate is averaged
 
@@ -388,7 +416,7 @@ a `method = vi` fit also writes them to the fit YAML:
 vi:
   eta_names: [ETA_CL, ETA_V, ETA_KA]
   eta_posterior:
-    - id: 1
+    - id: "1"
       mean: [0.029863, 0.064874, 0.369859]
       cov:
         - [0.00002566, 0.00001221, 0.00001864]
@@ -397,9 +425,11 @@ vi:
 ```
 
 Rows are keyed by **subject ID**, not position, so a posterior can be matched back to the data
-without relying on ordering. The covariance is emitted in full rather than as a diagonal: the
-off-diagonals are the whole point of `vi_family = full_rank`, and a CL/V posterior correlation is
-usually the largest of them. Under IOV each entry also carries a `kappa_means` list, one row per
+without relying on ordering. The ID is emitted as a quoted YAML string, so a zero-padded `001`
+reads back as the string it was in the data rather than as the integer `1`, and an ID containing
+`:` or `#` cannot reshape the document. The covariance is emitted in full rather than as a
+diagonal: the off-diagonals are the whole point of `vi_family = full_rank`, and a CL/V posterior
+correlation is usually the largest of them. Under IOV each entry also carries a `kappa_means` list, one row per
 occasion; a non-IOV fit omits the key entirely.
 
 Two cautions carry over from [Standard errors](#standard-errors). This is the **variational**
@@ -407,6 +437,16 @@ covariance, so it understates the true posterior variance — it is for individu
 and shrinkage, not a route to population standard errors. And it is a converged-`φ` quantity: read
 it alongside `converged` and `elbo_tightness_ratio`, because a stuck optimizer also reports a
 covariance.
+
+**In a chain, check `superseded_by`.** Everything under `vi` — the posteriors, both ELBO halves and
+`elbo_tightness_ratio` — is evaluated at the parameters *VI* ended on. A trailing evaluator
+(`methods = vi, laplace` with `agq_eval_only`, or `methods = vi, imp` with `imp_eval_only`) reads
+the fit out without moving it, so the block still describes the reported estimate and
+`superseded_by` is absent. A later **estimating** stage does move it: on `methods = vi, focei` the
+reported `θ`/`Ω`/`σ` and subject diagnostics come from FOCEI while the `vi` block still describes
+the pre-FOCEI point. The block is kept — it is the only per-subject covariance in the result — but
+it carries `superseded_by: "FOCEI"` and a warning saying so. Read it at VI's parameters, not the
+fit's.
 
 
 ## Is the bound tight? (`elbo_tightness_ratio`)
@@ -685,8 +725,8 @@ At any realistic residual, VI reproduces the quadrature reference on every popul
 and it gets there in a fifth of the iterations. Two practical consequences:
 
 - **`vi_mc_samples` is not the lever.** Going 128 → 512 draws at a 1% residual moves `σ` by 0.8%.
-  Raising the draw count *does* fix the default `vi_mc_samples = 8`, which is 30% high, but not
-  the residual beyond that.
+  Raising the draw count *does* fix the old `vi_mc_samples = 8`, which was 30% high — that is why
+  the default is now 32 — but it does not fix the residual beyond that.
 - **The tell is `q`'s contraction.** VI initialises `q` at the prior `Ω`. At a 1% residual the
   per-subject posterior variance is ~1400× smaller than the prior, and `σ` — coupled to `q`'s
   width, since posterior width scales with `σ²` — settles before `q` finishes contracting. At 10%

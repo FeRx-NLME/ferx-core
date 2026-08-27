@@ -1,3 +1,8 @@
+---
+pagetitle: "NLME fit options in ferx"
+description-meta: "Configure estimation methods, optimizers, convergence, covariance, ODE solvers, simulation, and diagnostics in ferx model files."
+---
+
 # Fit Options
 
 The optional `[fit_options]` block configures the estimation method and optimizer settings.
@@ -264,7 +269,7 @@ Only used when `method = vi`. See the [VI page](../estimation/vi.qmd).
 | Key | Default | Description |
 |-----|---------|-------------|
 | `vi_iters` | `25000` | Adam **ceiling**, not a fixed budget: the run stops early once the objective and the estimates have both stopped moving, so a high ceiling costs an easy fit nothing while leaving head-room for a hard one. Settling is judged on a moving average of the ELBO against the trace's own noise, never on a per-iteration change — the objective is a Monte-Carlo estimate and such a test would stop on noise. `vi$n_iterations` reports what actually ran and `vi$converged` whether it settled; inspect `vi$elbo_trace` when it did not. |
-| `vi_mc_samples` | `8` | Monte-Carlo draws per subject per iteration. This sets the noise floor the settling test measures against, so too few draws stop the fit *early* rather than merely making it noisy: on warfarin at `8`, σ lands 34% above the FOCEI/AGQ value and the OFV 11.3 units short. `32` recovers the reference. When a run stops with drift still visible but `elbo_tightness_ratio` is near 1, ferx reports `converged: false` — raise draws first, or lower `vi_lr`. A ratio above 25 instead signals a bad basin; improve the population starts or use FOCEI/SAEM rather than adding draws. |
+| `vi_mc_samples` | `32` | Monte-Carlo draws per subject per iteration. This sets the noise floor the settling test measures against, so it decides *where the fit stops* rather than merely making it noisy — which is why the default is 32 and not the 8 it was: on `data/warfarin.csv` (~1% residual) 8 draws land σ 31% above the FOCEI/AGQ value with the OFV 9.6 units short, and the run is not reliably flagged (see the [VI page](../estimation/vi.qmd)). `32` closes that to +10% and 1.4, and `128` to +5% and 0.37. Cost is sublinear — a lower noise floor also settles sooner, so 4× the draws cost ~2.3× the wall time. Lower it only after checking σ against a `laplace`/`focei` fit of the same data. An `elbo_tightness_ratio` above 25 instead signals a bad basin rather than a noise floor; improve the population starting values or use FOCEI/SAEM rather than adding draws. |
 | `vi_lr` | `0.02` | Adam learning rate. Lower it if the trace oscillates, or if σ settles above a FOCEI/AGQ fit of the same data. |
 | `vi_family` | `full_rank` | `full_rank` fits a full posterior covariance per subject; `mean_field` fits a diagonal one — `O(d)` rather than `O(d²)` parameters, so preferable once `n_eta` is large, at the cost of a looser bound when the posterior is correlated (for CL/V it usually is). |
 | `vi_omega_update` | `closed_form` | `closed_form` sets Ω to its exact ELBO maximizer each iteration, keeping it out of the stochastic optimization entirely; `adam` steps it by gradient descent, reproducing the published behaviour. Combining `adam` with `vi_kl = mc` leaves Ω with nothing exact behind it and warns (`W_VI_OMEGA_UNANCHORED`). |

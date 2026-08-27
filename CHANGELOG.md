@@ -26,21 +26,44 @@ section of the SDLC for the versioning policy).
   plus `boundary_estimate` for a bound hit. The VI guidance now distinguishes the near-optimum
   Monte-Carlo noise floor (raise `vi_mc_samples`) from a start-dependent bad basin (improve
   population starting values or use FOCEI/SAEM).
+- **`vi_mc_samples` now defaults to 32, not 8 (#1017).** This draw count sets the noise floor
+  VI's settling test measures against, so it decides *where a fit stops* — and therefore what is
+  certified — rather than merely how noisy the trace is. At 8, on `data/warfarin.csv` (~1%
+  proportional residual), `σ` landed 31% above the `0.010565` both AGQ (`n_agq = 9`) and FOCEI
+  give, with the OFV 9.6 units short of AGQ's `−285.977`, and it was not reliably flagged: the
+  drift check only demotes a run still descending when it stops, and at 8 draws the run can
+  instead settle at a biased fixed point where the trace tail has genuinely plateaued and
+  `elbo_tightness_ratio` reads a healthy `0.989` — `vi_seed = 99` with otherwise default options
+  returned `converged: true` at `σ = 0.013761`. At 32, `σ` is +10% with the OFV within 1.4 units
+  and no seed tried certified a materially wrong fit (a bad-basin seed was correctly reported
+  `converged: false`). Cost is sublinear, because a lower noise floor also settles sooner: 4× the
+  draws cost ~2.3× the wall time (3.4 s → 7.7 s on this fit). Set `vi_mc_samples = 8` explicitly
+  to restore the old behaviour, and check `σ` against a `laplace` / `focei` fit if you do.
 - **`methods = [vi, laplace]` with `n_agq > 1` is no longer rejected (#1017).** `n_agq` is a
   chain-wide option, so the documented VI readout — `methods = [vi, laplace]`,
   `agq_eval_only = true`, which turns VI's ELBO lower bound into a real `−2 log L` — carries it
   legitimately: the grid belongs to the Laplace stage and VI ignores it. The check rejected it
   for the whole chain, making the recommended path impossible to ask for. It now fires only
   when no stage consumes the option (a VI-only chain).
-- **A VI fit that stopped at its Monte-Carlo noise floor no longer reports `converged: true`
+- **A VI run that stops while its objective is still falling no longer reports `converged: true`
   (#1017).** The settling test asks whether the ELBO's remaining drift is distinguishable from
-  noise; at a low `vi_mc_samples` that becomes true while the objective is still falling, so the
-  fit stopped short and certified itself. On warfarin at the default 8 draws it returned
-  `σ = 0.014150` against `0.010565` from both AGQ and FOCEI — 34% high, with the OFV 11.3 units
-  short and every variational covariance ~1.75× too wide. A sign test over the trace tail now
-  separates a real trend from noise (below the amplitude of any single window comparison, which
-  is what makes the failure invisible to the settling test), and a run stopped that way reports
-  `converged: false` with a warning naming `vi_mc_samples` — `32` recovers the reference.
+  Monte-Carlo noise; at a low `vi_mc_samples` that can become true while the objective is still
+  descending, so the fit stopped short and certified itself. A sign test over the trace tail now
+  separates a real trend from noise — below the amplitude of any single window comparison, which
+  is what makes such drift invisible to the settling test — and a run stopped that way reports
+  `converged: false` with a warning naming `vi_mc_samples`.
+
+  **The sign test alone did not make the old `vi_mc_samples = 8` safe on a small residual
+  error, which is why the default moved to 32 (see above).** On
+  `data/warfarin.csv` (~1% proportional residual) the default draw count lands `σ ≈ 0.0138`
+  against `0.010565` from both AGQ (`n_agq = 9`) and FOCEI — 31% high, OFV 9.4–9.6 units short of
+  AGQ's `−285.977`, and every variational covariance ~1.7× too wide. The sign test catches this
+  only in the regime where the run is still descending at the `vi_iters` ceiling. It can also
+  settle at a *biased fixed point* of the sampled objective, where the trace tail has genuinely
+  plateaued and no trend test can see anything: with `vi_seed = 99` and otherwise default options
+  the fit stops at 17 125 iterations reporting `converged: true` at `σ = 0.013761`. Raise
+  `vi_mc_samples` (32 → 1.4 OFV, 128 → 0.37) or check `σ` against a `laplace`/`focei` fit when the
+  residual error is under ~3%. See the [VI page](docs/estimation/vi.qmd).
 - **VI's early stopping now requires the per-subject posteriors to have settled, not just the
   population parameters (#1017).** Either convergence criterion is sufficient, and the
   parameter-stability one measured only the packed `(θ, Ω, σ)` vector. A chain in which the
@@ -65,6 +88,12 @@ section of the SDLC for the versioning policy).
   value — defeating the point of keying the posterior by the original subject ID.
 
 ### Added
+- **Correlated-residual fits now retain their fixed `block_sigma` correlations (#1100).**
+  `FitResult.residual_correlations`, JSON, `.fitrx`, and fit YAML now carry the declared
+  correlations, so consumers can reconstruct the sigma-scale residual covariance without re-reading
+  the model source; diagonal-sigma output remains unchanged. The fit YAML's `block_sigma` section
+  reports `correlation_fixed` (always true) separately from `covariance_fixed`, which is true only
+  when both sigma SDs were declared `FIX`.
 - **Theta level blocks — hundreds of fixed effects from one declaration (#1064).**
   `theta PLACEBO[800](0.0, -10.0, 10.0)` declares 800 thetas sharing one init/bounds triple, read back
   by a *gather* — `PL = PLACEBO[PLA_IDX]`, where `PLA_IDX` is a 1-based data column. The data-driven
@@ -202,6 +231,10 @@ section of the SDLC for the versioning policy).
   decision changes — the bound only short-circuits the direction it can prove.
 
 ### Changed
+- **The ferx website and GitHub landing page are easier to discover and share (#1089).**
+  Documentation pages now publish descriptive search and social metadata, canonical URLs, and
+  clearer NLME and population PK/PD summaries while retaining the generated sitemap and crawler
+  instructions.
 - **`optimizer = auto` no longer picks BOBYQA on high-dimensional problems (#1064).** BOBYQA interpolates
   a quadratic over the whole parameter space, so its model grows quadratically in the parameter count;
   above 64 free coordinates `auto` now resolves to `nlopt_lbfgs`, whose finite-difference cost is linear.
@@ -355,6 +388,13 @@ section of the SDLC for the versioning policy).
   with no diagnostic from NONMEM (`nonmem_anchor/dose_attr_double_use_{A,B}.ctl`).
 
 ### Fixed
+- **Hidden parameter guards now produce a fit warning (#1099).** A free Theta at
+  the implicit `1e-10` / `1e9` cap, or an Omega, Omega-IOV, Sigma, or mixture
+  override pinned to an internal packed-space safety limit, emits the typed
+  `parameter_at_runaway_guard` warning. FIX'd coordinates remain excluded;
+  user-declared Theta bounds continue to use the separate `boundary_estimate`
+  warning. Lower hits are identified as collapse toward zero, while upper hits
+  are identified as runaway estimates.
 - **A closed-form model with IOV and a `[scaling] y = <expr>` readout evaluated the readout's
   individual parameters at `kappa = 0` — predictions and the objective were silently wrong
   (#1079).** The readout is the analogue of NONMEM's `$ERROR` and is evaluated per record, so an
@@ -900,19 +940,19 @@ section of the SDLC for the versioning policy).
   so.
 
 ### Changed
-- **`method = vi` needs more Monte-Carlo draws than the default provides.** On warfarin,
-  `vi_mc_samples = 8` (the default) returns `σ = 0.014150` against `0.010565` from both AGQ
-  (`n_agq = 9`) and FOCEI — 34% high — with an OFV 11.3 units short of the reference and
-  `converged: true`. Because per-subject posterior width scales with `σ²`, every variational
-  covariance reported at that point was ~1.75× too wide. The cause is the convergence rule
-  meeting its own noise floor: it stops when the ELBO's drift is no longer distinguishable from
-  Monte-Carlo noise, and at 8 draws it becomes indistinguishable while real drift remains — so
-  the fit stops short and `σ`, the slowest-moving coordinate, is left furthest from its optimum.
-  Raising the draw count resolves it (`32` → −284.6, `128` → −285.4 against AGQ's −285.977), and
-  lowering `vi_lr` does too. Starting from a fitted FOCEI point does **not** help. Documented in
-  `docs/estimation/vi.qmd`; the default is unchanged pending a check against the deep-compartment
-  models it was tuned for. **If a VI fit lands well short of a FOCEI or AGQ fit of the same data,
-  raise `vi_mc_samples` first.**
+- **`method = vi` needs more Monte-Carlo draws than the default provides.** On
+  `data/warfarin.csv` (~1% proportional residual), `vi_mc_samples = 8` (the default) returns
+  `σ ≈ 0.0138` against `0.010565` from both AGQ (`n_agq = 9`) and FOCEI — 31% high — with the OFV
+  9.4–9.6 units short of AGQ's `−285.977`. Because per-subject posterior width scales with `σ²`,
+  every variational covariance reported at that point is ~1.7× too wide. The cause is the
+  convergence rule meeting its own noise floor: it stops when the ELBO's drift is no longer
+  distinguishable from Monte-Carlo noise, and at 8 draws that happens while real drift remains —
+  so the fit stops short and `σ`, the slowest-moving coordinate, is left furthest from its
+  optimum. Raising the draw count resolves it (`32` → −284.55, `128` → −285.61 against AGQ's
+  `−285.977`), and lowering `vi_lr` does too. Starting from a fitted FOCEI point does **not**
+  help. Documented in `docs/estimation/vi.qmd`. The default has since moved from 8 to 32 for this
+  reason (see the entry above). **If a VI fit lands well short of a FOCEI or AGQ fit of the same
+  data, raise `vi_mc_samples` first.**
 
 ### Added
 - **The per-subject variational posterior is now written to the fit YAML.** A `method = vi` fit

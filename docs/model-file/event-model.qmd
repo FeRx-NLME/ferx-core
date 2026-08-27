@@ -1,3 +1,7 @@
+---
+pagetitle: "Time-to-event endpoints"
+---
+
 # Time-to-Event Endpoints (`[event_model]`)
 
 > **Maturity: beta** — see [Feature Maturity](../maturity.qmd) for what this means.

@@ -1,3 +1,7 @@
+---
+pagetitle: "IMPMAP estimation"
+---
+
 # IMPMAP — Importance Sampling assisted by Mode A Posteriori
 
 > **Maturity: beta** — see [Feature Maturity](../maturity.qmd) for what this means.

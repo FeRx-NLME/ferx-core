@@ -1,3 +1,7 @@
+---
+pagetitle: "ODE model with absorption lag time example"
+---
+
 # ODE Model with Absorption Lag Time
 
 This example demonstrates the `LAGTIME` keyword in `[individual_parameters]` for ODE models. The complete model file is [`examples/warfarin_ode_lagtime.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/warfarin_ode_lagtime.ferx).

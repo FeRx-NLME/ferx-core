@@ -1,3 +1,7 @@
+---
+pagetitle: "Outer optimizers for NLME estimation"
+---
+
 # Outer Optimizers
 
 > **Maturity: beta** — see [Feature Maturity](../maturity.qmd) for what this means.

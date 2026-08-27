@@ -2116,6 +2116,48 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         }
     }
 
+    if !result.residual_correlations.is_empty() {
+        writeln!(f, "\nblock_sigma:").map_err(|e| e.to_string())?;
+        for corr in &result.residual_correlations {
+            let name_i = result.sigma_names.get(corr.sigma_i).ok_or_else(|| {
+                format!(
+                    "residual correlation sigma_i index {} is out of bounds",
+                    corr.sigma_i
+                )
+            })?;
+            let name_j = result.sigma_names.get(corr.sigma_j).ok_or_else(|| {
+                format!(
+                    "residual correlation sigma_j index {} is out of bounds",
+                    corr.sigma_j
+                )
+            })?;
+            let sigma_i = result.sigma.get(corr.sigma_i).ok_or_else(|| {
+                format!(
+                    "residual correlation sigma_i index {} has no estimate",
+                    corr.sigma_i
+                )
+            })?;
+            let sigma_j = result.sigma.get(corr.sigma_j).ok_or_else(|| {
+                format!(
+                    "residual correlation sigma_j index {} has no estimate",
+                    corr.sigma_j
+                )
+            })?;
+            // The correlation itself is always fixed by the `block_sigma`
+            // declaration, but the covariance it scales is only fixed when both
+            // sigma SDs were declared `FIX` — a bare `block_sigma (...) = [...]`
+            // estimates the diagonal, so its covariance moves during the fit.
+            let sigma_is_fixed = |i: usize| result.sigma_fixed.get(i).copied().unwrap_or(false);
+            let covariance_fixed = sigma_is_fixed(corr.sigma_i) && sigma_is_fixed(corr.sigma_j);
+            writeln!(f, "  {}__{}:", name_i, name_j).map_err(|e| e.to_string())?;
+            writeln!(f, "    covariance: {:.6}", corr.rho * sigma_i * sigma_j)
+                .map_err(|e| e.to_string())?;
+            writeln!(f, "    covariance_fixed: {}", covariance_fixed).map_err(|e| e.to_string())?;
+            writeln!(f, "    correlation: {:.6}", corr.rho).map_err(|e| e.to_string())?;
+            writeln!(f, "    correlation_fixed: true").map_err(|e| e.to_string())?;
+        }
+    }
+
     // IOV (KAPPA) block
     if let Some(ref iov) = result.omega_iov {
         writeln!(f, "\nomega_iov:").map_err(|e| e.to_string())?;
@@ -2540,6 +2582,7 @@ mod tests {
             omega: DMatrix::zeros(0, 0),
             sigma,
             sigma_names: (0..n).map(|i| format!("EPS_{}", i + 1)).collect(),
+            residual_correlations: Vec::new(),
             error_model,
             covariance_matrix: None,
             se_theta: None,
@@ -3237,6 +3280,7 @@ mod tests {
             omega: DMatrix::zeros(0, 0),
             sigma: vec![0.1],
             sigma_names: vec!["eps".to_string()],
+            residual_correlations: Vec::new(),
             error_model: ErrorModel::Proportional,
             covariance_matrix: None,
             se_theta: None,
@@ -4125,6 +4169,57 @@ mod tests {
             yaml_quote(&r.environment.username)
         )));
         assert!(yaml.contains(&format!("  ferx_version: {}", r.ferx_version)));
+    }
+
+    #[test]
+    fn write_yaml_emits_reconstructible_block_sigma() {
+        // Index order mirrors what `build_residual_correlations` actually
+        // emits: `sigma_i` is the block's *row* name and `sigma_j` its
+        // *column* name, so `block_sigma (PROP_ERR, ADD_ERR)` yields (1, 0)
+        // and the key `ADD_ERR__PROP_ERR`. Pinning (0, 1) would assert an
+        // ordering the parser can never produce, hiding an i/j swap.
+        let mut r = make_sigma_only_result(ErrorModel::Combined, vec![0.2, 1.0]);
+        r.sigma_names = vec!["PROP_ERR".into(), "ADD_ERR".into()];
+        r.sigma_fixed = vec![false, false];
+        r.residual_correlations = vec![crate::types::ResidualCorrelation {
+            sigma_i: 1,
+            sigma_j: 0,
+            rho: 0.5,
+        }];
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+        let yaml = std::fs::read_to_string(&path).expect("yaml read");
+
+        assert!(yaml.contains("\nblock_sigma:"), "{yaml}");
+        assert!(yaml.contains("  ADD_ERR__PROP_ERR:"), "{yaml}");
+        assert!(yaml.contains("    covariance: 0.100000"), "{yaml}");
+        assert!(yaml.contains("    correlation: 0.500000"), "{yaml}");
+        // The correlation is fixed by the declaration; the covariance is not,
+        // because neither sigma SD was declared `FIX`.
+        assert!(yaml.contains("    correlation_fixed: true"), "{yaml}");
+        assert!(yaml.contains("    covariance_fixed: false"), "{yaml}");
+    }
+
+    #[test]
+    fn write_yaml_block_sigma_marks_covariance_fixed_when_sigmas_are_fixed() {
+        // `block_sigma (...) = [...] FIX` marks every sigma in the block fixed,
+        // so the covariance those SDs scale is fixed as well.
+        let mut r = make_sigma_only_result(ErrorModel::Combined, vec![0.2, 1.0]);
+        r.sigma_names = vec!["PROP_ERR".into(), "ADD_ERR".into()];
+        r.sigma_fixed = vec![true, true];
+        r.residual_correlations = vec![crate::types::ResidualCorrelation {
+            sigma_i: 1,
+            sigma_j: 0,
+            rho: 0.5,
+        }];
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+        let yaml = std::fs::read_to_string(&path).expect("yaml read");
+
+        assert!(yaml.contains("    covariance_fixed: true"), "{yaml}");
+        assert!(yaml.contains("    correlation_fixed: true"), "{yaml}");
     }
 
     #[test]

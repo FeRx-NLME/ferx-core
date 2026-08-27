@@ -1,3 +1,7 @@
+---
+pagetitle: "ferx feature maturity"
+---
+
 # Feature Maturity
 
 Not every feature in ferx-core is equally battle-tested. Some — like FOCE/FOCEI

@@ -1,3 +1,7 @@
+---
+pagetitle: "Inter-occasion variability with SAEM example"
+---
+
 # IOV with SAEM
 
 This example extends the inter-occasion variability (IOV) model to use SAEM estimation instead of FOCE. The complete model file is [`examples/warfarin_iov_saem.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/warfarin_iov_saem.ferx).

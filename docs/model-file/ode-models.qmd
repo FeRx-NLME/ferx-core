@@ -1,3 +1,8 @@
+---
+pagetitle: "ODE models for population PK/PD"
+description-meta: "Define and solve custom ordinary differential equation models for nonlinear mixed-effects population PK/PD analysis in ferx."
+---
+
 # ODE Models
 
 > **Maturity: beta** — see [Feature Maturity](../maturity.qmd) for what this means.

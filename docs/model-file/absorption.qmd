@@ -1,3 +1,7 @@
+---
+pagetitle: "Built-in absorption models"
+---
+
 # Built-in Absorption Models
 
 > **Maturity: beta** — see [Feature Maturity](../maturity.qmd) for what this means.

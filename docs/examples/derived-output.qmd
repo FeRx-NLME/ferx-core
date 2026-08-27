@@ -1,3 +1,7 @@
+---
+pagetitle: "Derived columns and output example"
+---
+
 # Derived Columns and Output
 
 This example demonstrates the `[derived]` and `[output]` blocks, which add post-fit computed columns and individual PK parameter columns to the sdtab. The complete model file is [`examples/warfarin_derived.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/warfarin_derived.ferx).

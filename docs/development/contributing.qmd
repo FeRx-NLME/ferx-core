@@ -1,3 +1,7 @@
+---
+pagetitle: "Contributing to FeRx development"
+---
+
 # Contributing to FeRx development
 
 You don't need to be on the core team to move FeRx forward. There are three

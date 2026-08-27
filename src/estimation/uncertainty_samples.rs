@@ -345,6 +345,7 @@ mod tests {
             omega: template.omega.matrix.clone(),
             sigma: template.sigma.values.clone(),
             sigma_names: template.sigma.names.clone(),
+            residual_correlations: Vec::new(),
             error_model: ErrorModel::Proportional,
             covariance_matrix: Some(cov),
             se_theta: None,

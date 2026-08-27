@@ -62,7 +62,8 @@ pub(crate) use postfit::{
     eta_shrinkage_warning, extract_standard_errors, high_correlation_warning, inflated_rse_warning,
     integrates_odes, is_last_estimating_stage, kappa_weight_typicals, keep_gn_zero_eta_warning,
     ode_solver_diagnostics_warning, probe_nlopt_algorithms, rebuild_warnings_structured,
-    resolve_covariance_status, resolve_sir_fallback, sir_unavailable_warning,
+    resolve_covariance_status, resolve_sir_fallback, runaway_guard_warning,
+    sir_unavailable_warning,
 };
 pub use predict::{predict, PredictionResult};
 #[cfg(feature = "survival")]
@@ -96,8 +97,8 @@ pub(crate) use output_columns::build_indiv_map;
 pub(crate) use pool::{cap_default_threads, default_thread_count, FIT_RAYON_STACK_SIZE};
 #[cfg(test)]
 pub(crate) use postfit::{
-    diagnostic_details, high_correlation_pairs, should_run_sir_fallback, theta_boundary_side,
-    DiagStats,
+    diagnostic_details, high_correlation_pairs, packed_guard_side, should_run_sir_fallback,
+    theta_boundary_side, DiagStats,
 };
 #[cfg(all(test, feature = "survival"))]
 pub(crate) use predict::grid_median_from_cumhaz;

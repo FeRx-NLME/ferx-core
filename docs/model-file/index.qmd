@@ -1,3 +1,8 @@
+---
+pagetitle: "ferx model file reference: NLME model syntax"
+description: "Reference for the ferx model DSL, including population parameters, PK/PD structural models, error models, covariates, estimation, and simulation."
+---
+
 # Model File Reference
 
 ferx-core models are defined in `.ferx` files using a declarative DSL. Each file is organized into blocks, each denoted by a `[block_name]` header.
