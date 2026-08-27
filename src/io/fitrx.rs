@@ -235,6 +235,10 @@ struct SigmaWire {
     /// for backward compatibility with .fitrx files from before issue #5.
     #[serde(default)]
     init_as_sd: Vec<bool>,
+    /// Fixed `block_sigma` correlations. Absent in bundles written before
+    /// issue #1100 and omitted for the common diagonal-sigma case.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    residual_correlations: Vec<crate::types::ResidualCorrelation>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -601,6 +605,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
                 .map(|t| sigma_type_to_str(*t).into())
                 .collect(),
             init_as_sd: r.sigma_init_as_sd.clone(),
+            residual_correlations: r.residual_correlations.clone(),
         },
         error_model: error_model_to_str(r.error_model).into(),
         shrinkage_eps: r.shrinkage_eps,
@@ -1614,6 +1619,37 @@ fn validate_parallel_lengths(w: &FitWire) -> Result<(), FitrxError> {
             n_sigma
         ));
     }
+    let mut seen_corr_pairs = std::collections::HashSet::new();
+    for corr in &w.sigma.residual_correlations {
+        if corr.sigma_i >= n_sigma || corr.sigma_j >= n_sigma {
+            return bail(format!(
+                "sigma residual correlation index ({}, {}) is out of bounds for {} sigmas",
+                corr.sigma_i, corr.sigma_j, n_sigma
+            ));
+        }
+        // `|rho| == 1` is rejected alongside `> 1`: a perfectly correlated pair
+        // makes the subject-level `R` exactly singular, which would otherwise
+        // surface as a NaN/Inf OFV on the next evaluation rather than as a
+        // load-time error.
+        if corr.sigma_i == corr.sigma_j || !corr.rho.is_finite() || corr.rho.abs() >= 1.0 {
+            return bail(format!(
+                "invalid sigma residual correlation ({}, {}, rho={})",
+                corr.sigma_i, corr.sigma_j, corr.rho
+            ));
+        }
+        // A repeated (i, j) pair would double-count the cross term in
+        // `cross_observation_covariance` and emit duplicate YAML keys.
+        let pair = (
+            corr.sigma_i.min(corr.sigma_j),
+            corr.sigma_i.max(corr.sigma_j),
+        );
+        if !seen_corr_pairs.insert(pair) {
+            return bail(format!(
+                "duplicate sigma residual correlation for pair ({}, {})",
+                pair.0, pair.1
+            ));
+        }
+    }
     // IOV init_as_sd: same backward-compat rule as omega/sigma. Only validate
     // when an `iov` section is present (otherwise there's no n_kappa to match
     // against).
@@ -1779,6 +1815,7 @@ fn wire_to_fit_result(
         omega,
         sigma: w.sigma.estimates,
         sigma_names: w.sigma.names,
+        residual_correlations: w.sigma.residual_correlations,
         error_model: error_model_from_str(&w.error_model)?,
         covariance_matrix,
         se_theta: w.theta.se,
@@ -2028,6 +2065,7 @@ mod tests {
             omega: DMatrix::from_row_slice(2, 2, &[0.1, 0.0, 0.0, 0.2]),
             sigma: vec![0.05],
             sigma_names: vec!["prop".into()],
+            residual_correlations: Vec::new(),
             error_model: ErrorModel::Proportional,
             covariance_matrix: Some(DMatrix::<f64>::identity(3, 3)),
             se_theta: Some(vec![0.01, 0.02, 0.005]),
@@ -2161,11 +2199,116 @@ mod tests {
         assert_eq!(v1["omega"]["cols"], 2);
         assert_eq!(v1["omega"]["data"], serde_json::json!([0.1, 0.0, 0.0, 0.2]));
         assert_eq!(v1["subjects"][0]["eta"].as_array().unwrap().len(), 2);
+        assert!(
+            v1.get("residual_correlations").is_none(),
+            "diagonal-sigma JSON must remain byte-compatible"
+        );
 
         // Round-trip: unknown `schema_version` is ignored on the way back in.
         let back: FitResult = serde_json::from_value(v1.clone()).unwrap();
         let v2 = back.to_json_value();
         assert_eq!(v1, v2, "JSON round-trip is not idempotent (lossy field?)");
+    }
+
+    #[test]
+    fn json_result_includes_residual_correlations() {
+        let mut fit = minimal_fit_result();
+        fit.sigma.push(1.0);
+        fit.sigma_names.push("add".into());
+        fit.sigma_fixed.push(false);
+        fit.sigma_types.push(SigmaType::Additive);
+        fit.sigma_init_as_sd.push(false);
+        fit.residual_correlations = vec![crate::types::ResidualCorrelation {
+            sigma_i: 1,
+            sigma_j: 0,
+            rho: 0.5,
+        }];
+
+        let value = fit.to_json_value();
+        assert_eq!(
+            value["residual_correlations"],
+            serde_json::json!([{"sigma_i": 1, "sigma_j": 0, "rho": 0.5}])
+        );
+        let restored: FitResult = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.residual_correlations, fit.residual_correlations);
+    }
+
+    #[test]
+    fn fitrx_rejects_invalid_residual_correlations() {
+        let mut fit = minimal_fit_result();
+        fit.sigma.push(1.0);
+        fit.sigma_names.push("add".into());
+        fit.sigma_fixed.push(false);
+        fit.sigma_types.push(SigmaType::Additive);
+        fit.sigma_init_as_sd.push(false);
+        let mut wire = build_fit_wire(&fit);
+
+        for invalid in [
+            crate::types::ResidualCorrelation {
+                sigma_i: 0,
+                sigma_j: 2,
+                rho: 0.5,
+            },
+            crate::types::ResidualCorrelation {
+                sigma_i: 0,
+                sigma_j: 0,
+                rho: 0.5,
+            },
+            crate::types::ResidualCorrelation {
+                sigma_i: 1,
+                sigma_j: 0,
+                rho: 1.5,
+            },
+            // |rho| == 1 is singular, not merely extreme: reject it too.
+            crate::types::ResidualCorrelation {
+                sigma_i: 1,
+                sigma_j: 0,
+                rho: 1.0,
+            },
+            crate::types::ResidualCorrelation {
+                sigma_i: 1,
+                sigma_j: 0,
+                rho: -1.0,
+            },
+            crate::types::ResidualCorrelation {
+                sigma_i: 1,
+                sigma_j: 0,
+                rho: f64::NAN,
+            },
+        ] {
+            wire.sigma.residual_correlations = vec![invalid];
+            assert!(
+                validate_parallel_lengths(&wire).is_err(),
+                "accepted invalid correlation: {invalid:?}"
+            );
+        }
+
+        // The same (i, j) pair twice would double-count the cross term.
+        wire.sigma.residual_correlations = vec![
+            crate::types::ResidualCorrelation {
+                sigma_i: 1,
+                sigma_j: 0,
+                rho: 0.5,
+            },
+            crate::types::ResidualCorrelation {
+                sigma_i: 0,
+                sigma_j: 1,
+                rho: 0.25,
+            },
+        ];
+        let err = validate_parallel_lengths(&wire).unwrap_err();
+        assert!(
+            format!("{err}").contains("duplicate sigma residual correlation"),
+            "got: {err}"
+        );
+
+        // A well-formed single pair still loads.
+        wire.sigma.residual_correlations = vec![crate::types::ResidualCorrelation {
+            sigma_i: 1,
+            sigma_j: 0,
+            rho: 0.5,
+        }];
+        assert!(validate_parallel_lengths(&wire).is_ok());
     }
 
     #[test]
@@ -2258,6 +2401,31 @@ mod tests {
         assert_eq!(loaded.model_source, "model source\n");
         assert!(loaded.population.is_none());
         assert_eq!(loaded.manifest.format_version, FORMAT_VERSION);
+    }
+
+    #[test]
+    fn roundtrip_preserves_residual_correlations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("block-sigma.fitrx");
+        let mut r = minimal_fit_result();
+        r.sigma = vec![0.2, 1.0];
+        r.sigma_names = vec!["PROP_ERR".into(), "ADD_ERR".into()];
+        r.sigma_fixed = vec![true, true];
+        r.sigma_init_as_sd = vec![false, false];
+        r.sigma_types = vec![SigmaType::Proportional, SigmaType::Additive];
+        r.sigma_init = r.sigma.clone();
+        r.se_sigma = None;
+        r.residual_correlations = vec![crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        }];
+
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "model source\n", &path, SaveFitOptions::default()).unwrap();
+
+        let loaded = load_fit(&path).unwrap();
+        assert_eq!(loaded.fit.residual_correlations, r.residual_correlations);
     }
 
     #[test]

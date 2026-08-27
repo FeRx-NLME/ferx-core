@@ -2132,6 +2132,7 @@ fn fit_inner(
         omega: result.params.omega.matrix.clone(),
         sigma: result.params.sigma.values.clone(),
         sigma_names: result.params.sigma.names.clone(),
+        residual_correlations: model.residual_correlations.clone(),
         error_model: model.error_model,
         covariance_matrix: result.covariance_matrix,
         // The optimizer's exact packed vector (FOCE/FOCEI paths), so a later
