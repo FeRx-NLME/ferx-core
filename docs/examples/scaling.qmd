@@ -1,3 +1,7 @@
+---
+pagetitle: "Population PK unit-scaling example"
+---
+
 # Unit Scaling (`[scaling]`)
 
 This example demonstrates the `[scaling]` block with `obs_scale`, which divides every model prediction by a constant before computing residuals. The complete model file is [`examples/warfarin_scaled.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/warfarin_scaled.ferx).

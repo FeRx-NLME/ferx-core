@@ -1,3 +1,7 @@
+---
+pagetitle: "Full Random Effects Modeling (FREM)"
+---
+
 # FREM (Full Random Effects Model)
 
 FREM (Karlsson 2012) is a covariate analysis method that treats covariates as

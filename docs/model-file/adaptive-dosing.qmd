@@ -1,3 +1,7 @@
+---
+pagetitle: "Adaptive feedback dosing"
+---
+
 # Adaptive (Feedback) Dosing
 
 > **Maturity: beta** — see [Feature Maturity](../maturity.qmd) for what this means.

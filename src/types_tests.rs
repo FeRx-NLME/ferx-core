@@ -673,6 +673,14 @@ fn classify_warning_eta_shrinkage_is_word_bounded() {
     );
 }
 
+#[test]
+fn classify_warning_recognizes_internal_runaway_guard() {
+    let warning =
+        classify_warning("Internal optimizer parameter guard reached by estimate(s): PROP_ERR");
+    assert_eq!(warning.category, WarningCode::ParameterAtRunawayGuard);
+    assert_eq!(warning.severity, WarningSeverity::Warning);
+}
+
 /// #778: the `WarningCode` serde token is a public API an agent / the R
 /// wrapper pins against. This snapshot fails loudly if a variant's token
 /// drifts, and asserts `as_str()` and the serde representation agree.
@@ -696,6 +704,7 @@ fn warning_code_tokens_are_stable() {
         (EpsShrinkage, "eps_shrinkage"),
         (EtaShrinkage, "eta_shrinkage"),
         (BoundaryEstimate, "boundary_estimate"),
+        (ParameterAtRunawayGuard, "parameter_at_runaway_guard"),
         (InflatedRse, "inflated_rse"),
         (HighCorrelation, "high_correlation"),
         (DataQuality, "data_quality"),

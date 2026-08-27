@@ -1,3 +1,7 @@
+---
+pagetitle: "Individual parameter model syntax"
+---
+
 # Individual Parameters
 
 > **Maturity: beta** — see [Feature Maturity](../maturity.qmd) for what this means.

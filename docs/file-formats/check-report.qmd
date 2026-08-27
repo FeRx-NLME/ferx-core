@@ -1,3 +1,7 @@
+---
+pagetitle: "ferx check report JSON format"
+---
+
 # Check Report (`ferx check --json`)
 
 `ferx check <model.ferx> [--data <data.csv>] --json` emits a structured JSON

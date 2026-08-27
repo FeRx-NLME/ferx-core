@@ -1,3 +1,8 @@
+---
+pagetitle: "Sampling Importance Resampling (SIR)"
+description-meta: "Estimate nonlinear mixed-effects parameter uncertainty with Sampling Importance Resampling in ferx."
+---
+
 # Sampling Importance Resampling (SIR)
 
 > **Maturity: beta** — see [Feature Maturity](../maturity.qmd) for what this means.

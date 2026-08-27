@@ -1,3 +1,8 @@
+---
+pagetitle: "Population parameters and random effects"
+description-meta: "Define theta fixed effects, omega between-subject variability, kappa inter-occasion variability, and sigma residual error in ferx."
+---
+
 # Parameters
 
 > **Maturity: stable** — see [Feature Maturity](../maturity.qmd) for what this means.

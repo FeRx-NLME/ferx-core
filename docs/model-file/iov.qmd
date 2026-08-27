@@ -1,3 +1,7 @@
+---
+pagetitle: "Inter-occasion variability in ferx"
+---
+
 # Inter-Occasion Variability (IOV)
 
 > **Maturity: stable** — see [Feature Maturity](../maturity.qmd) for what this means.

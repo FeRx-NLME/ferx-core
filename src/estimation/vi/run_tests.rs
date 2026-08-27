@@ -1276,3 +1276,32 @@ fn all_fixed_population_says_convergence_rests_on_the_objective_alone() {
         free.warnings
     );
 }
+
+// ---------------------------------------------------------------------------
+// Defaults
+// ---------------------------------------------------------------------------
+
+/// The default draw count is a correctness setting, not a performance knob, so it is
+/// pinned rather than left to drift.
+///
+/// `vi_mc_samples` sets the noise floor `trace_has_settled` measures against, so it decides
+/// *where a fit stops* and therefore what gets reported as converged. At 8 — the previous
+/// default — warfarin (`data/warfarin.csv`, ~1% proportional residual) returns `σ ≈ 0.0138`
+/// against `0.010565` from both AGQ (`n_agq = 9`) and FOCEI, 31% high with the OFV 9.6 units
+/// short, and the run is *not reliably flagged*: `trace_still_drifting` only demotes a run
+/// still descending when it stops, and at 8 draws it can instead settle at a biased fixed
+/// point where the trace tail has plateaued and `elbo_tightness_ratio` reads a healthy
+/// 0.989. With `vi_seed = 99` and otherwise default options that certified `σ = 0.013761`
+/// at 9.4 OFV units short.
+///
+/// A lower value is a legitimate thing for a *user* to ask for; it must not be what they
+/// get without asking. Anything that lowers this default has to re-run that anchor.
+#[test]
+fn default_mc_samples_is_the_validated_value() {
+    let d = FitOptions::default();
+    assert_eq!(
+        d.vi_mc_samples, 32,
+        "the VI default draw count is anchored against AGQ/FOCEI on warfarin; lowering it \
+         re-opens the certified-wrong-sigma failure (see this test's docs)"
+    );
+}

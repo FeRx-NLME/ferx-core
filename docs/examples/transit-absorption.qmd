@@ -1,3 +1,7 @@
+---
+pagetitle: "Two-compartment transit absorption example"
+---
+
 # Transit Absorption (Two-Compartment)
 
 This example demonstrates a two-compartment model with transit-compartment absorption, written with the built-in [`transit(n, mtt)`](../model-file/absorption.qmd) input-rate shortcut. The complete model file is [`examples/transit_2cpt_shortcut.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/transit_2cpt_shortcut.ferx).

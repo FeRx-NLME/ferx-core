@@ -1,3 +1,7 @@
+---
+pagetitle: "Absorption lag time"
+---
+
 # Lagtime
 
 > **Maturity: stable** — see [Feature Maturity](../maturity.qmd) for what this means.

@@ -1,3 +1,8 @@
+---
+pagetitle: "Install ferx for NLME and population PK/PD modeling"
+description: "Install ferx on Linux, macOS, or Windows; build the Rust NLME engine from source; or install the ferx R package."
+---
+
 # Installation
 
 ferx-core builds with a recent **nightly** Rust toolchain (pinned in
