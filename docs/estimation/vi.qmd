@@ -136,7 +136,7 @@ All keys go in `[fit_options]`.
 | Key | Default | Meaning |
 |---|---|---|
 | `vi_iters` | 25000 | **Ceiling** on Adam iterations; the fit stops earlier once it has settled — see below |
-| `vi_mc_samples` | 8 | Monte-Carlo draws per subject per iteration. Raise it when the residual error itself matters |
+| `vi_mc_samples` | 32 | Monte-Carlo draws per subject per iteration. Sets the noise floor the settling test measures against, so it decides where the fit stops — see below |
 | `vi_lr` | 0.02 | Adam learning rate |
 | `vi_family` | `full_rank` | `full_rank` or `mean_field` |
 | `vi_omega_update` | `closed_form` | `closed_form` or `adam` |
@@ -247,20 +247,21 @@ structures with no scalar stationary point — combined error, several `σ`, per
 covariate-selected error, correlated residuals, M3 BLOQ, IIV-on-RUV, FREM, or a FIXed `σ` — fall
 back to `adam`, with the reason in `FitResult$warnings`.
 
-**The thing actually worth knowing about `σ`.** At the default `vi_mc_samples = 8`, a warfarin fit
-(`data/warfarin.csv`) returns `σ ≈ 0.0138` where AGQ (`n_agq = 9`) and FOCEI both give `0.010565`
+**The thing actually worth knowing about `σ`.** At `vi_mc_samples = 8` — the default before this
+was measured — a warfarin fit (`data/warfarin.csv`) returns `σ ≈ 0.0138` where AGQ
+(`n_agq = 9`) and FOCEI both give `0.010565`
 — **31% high**, with the OFV 9.4–9.6 units short of AGQ's `−285.977`. Since per-subject posterior
 width scales with `σ²`, an error that size makes every reported variational covariance about 1.7×
 too wide. This is **not** a defect in the `σ` update: `closed_form` gives `0.013810` and `adam`
 `0.013932` on the same data, and both stop showing it at higher draw counts.
 
-**`vi_mc_samples = 8` is not enough on this problem.** Measured against AGQ's `−285.977`, the OFV
+**Why the default is 32.** Measured against AGQ's `−285.977`, the OFV
 gap runs **9.6 units at 8 draws, 1.4 at 32, and 0.37 at 128** (`−285.606`), with `σ` +31%, +10% and
 +5% respectively. The draw count sets the noise floor the settling test measures against, so too
 few draws do not merely make the fit noisy — they change where it stops.
 
 ::: {.callout-warning}
-## At 8 draws this fit can still report `converged: true`
+## At 8 draws this fit could still report `converged: true`
 
 The convergence rule has a drift check that demotes a run stopping at its noise floor while the
 objective is still falling (see [Why there is no convergence
@@ -276,11 +277,15 @@ there are two different failures at 8 draws and it only sees the first:
   `vi_iters` to 150 000 produces the same outcome from the default seed (converges at 30 500,
   `σ = 0.013690`).
 
-So on this problem `converged: true` at 8 draws does **not** establish that the fit found the
-optimum, and `elbo_tightness_ratio` does not catch it either — it read `0.989` on that run, a
-healthy value, because it measures whether `q` matches the posterior *at the current parameters*,
-and it does. Check `σ` against a `method = laplace` or `focei` fit whenever the residual error is
-small.
+`elbo_tightness_ratio` does not catch it either — it read `0.989` on that run, a healthy value,
+because it measures whether `q` matches the posterior *at the current parameters*, and it does.
+
+**This is why the default is 32.** Across the seeds tried at 32 draws, none certified a materially
+wrong fit: the runs that reported `converged: true` landed `σ` +10% with the OFV within 1.4 units,
+and a seed that fell into a bad basin (`σ = 0.079`, OFV `−34`) was correctly reported
+`converged: false`. The failure above is a property of the noise floor, not of a particular seed,
+so on a residual error under ~3% it is still worth checking `σ` against a `method = laplace` or
+`focei` fit rather than reading `converged` alone.
 :::
 
 Three consequences worth carrying:
@@ -697,8 +702,8 @@ At any realistic residual, VI reproduces the quadrature reference on every popul
 and it gets there in a fifth of the iterations. Two practical consequences:
 
 - **`vi_mc_samples` is not the lever.** Going 128 → 512 draws at a 1% residual moves `σ` by 0.8%.
-  Raising the draw count *does* fix the default `vi_mc_samples = 8`, which is 30% high, but not
-  the residual beyond that.
+  Raising the draw count *does* fix the old `vi_mc_samples = 8`, which was 30% high — that is why
+  the default is now 32 — but it does not fix the residual beyond that.
 - **The tell is `q`'s contraction.** VI initialises `q` at the prior `Ω`. At a 1% residual the
   per-subject posterior variance is ~1400× smaller than the prior, and `σ` — coupled to `q`'s
   width, since posterior width scales with `σ²` — settles before `q` finishes contracting. At 10%

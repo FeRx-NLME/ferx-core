@@ -20,6 +20,19 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Fixed
+- **`vi_mc_samples` now defaults to 32, not 8 (#1017).** This draw count sets the noise floor
+  VI's settling test measures against, so it decides *where a fit stops* — and therefore what is
+  certified — rather than merely how noisy the trace is. At 8, on `data/warfarin.csv` (~1%
+  proportional residual), `σ` landed 31% above the `0.010565` both AGQ (`n_agq = 9`) and FOCEI
+  give, with the OFV 9.6 units short of AGQ's `−285.977`, and it was not reliably flagged: the
+  drift check only demotes a run still descending when it stops, and at 8 draws the run can
+  instead settle at a biased fixed point where the trace tail has genuinely plateaued and
+  `elbo_tightness_ratio` reads a healthy `0.989` — `vi_seed = 99` with otherwise default options
+  returned `converged: true` at `σ = 0.013761`. At 32, `σ` is +10% with the OFV within 1.4 units
+  and no seed tried certified a materially wrong fit (a bad-basin seed was correctly reported
+  `converged: false`). Cost is sublinear, because a lower noise floor also settles sooner: 4× the
+  draws cost ~2.3× the wall time (3.4 s → 7.7 s on this fit). Set `vi_mc_samples = 8` explicitly
+  to restore the old behaviour, and check `σ` against a `laplace` / `focei` fit if you do.
 - **`methods = [vi, laplace]` with `n_agq > 1` is no longer rejected (#1017).** `n_agq` is a
   chain-wide option, so the documented VI readout — `methods = [vi, laplace]`,
   `agq_eval_only = true`, which turns VI's ELBO lower bound into a real `−2 log L` — carries it
@@ -34,7 +47,8 @@ section of the SDLC for the versioning policy).
   is what makes such drift invisible to the settling test — and a run stopped that way reports
   `converged: false` with a warning naming `vi_mc_samples`.
 
-  **This does not make `vi_mc_samples = 8` safe on a small residual error.** On
+  **The sign test alone did not make the old `vi_mc_samples = 8` safe on a small residual
+  error, which is why the default moved to 32 (see above).** On
   `data/warfarin.csv` (~1% proportional residual) the default draw count lands `σ ≈ 0.0138`
   against `0.010565` from both AGQ (`n_agq = 9`) and FOCEI — 31% high, OFV 9.4–9.6 units short of
   AGQ's `−285.977`, and every variational covariance ~1.7× too wide. The sign test catches this
@@ -926,9 +940,9 @@ section of the SDLC for the versioning policy).
   so the fit stops short and `σ`, the slowest-moving coordinate, is left furthest from its
   optimum. Raising the draw count resolves it (`32` → −284.55, `128` → −285.61 against AGQ's
   `−285.977`), and lowering `vi_lr` does too. Starting from a fitted FOCEI point does **not**
-  help. Documented in `docs/estimation/vi.qmd`; the default is unchanged pending a check against
-  the deep-compartment models it was tuned for. **If a VI fit lands well short of a FOCEI or AGQ
-  fit of the same data, raise `vi_mc_samples` first.**
+  help. Documented in `docs/estimation/vi.qmd`. The default has since moved from 8 to 32 for this
+  reason (see the entry above). **If a VI fit lands well short of a FOCEI or AGQ fit of the same
+  data, raise `vi_mc_samples` first.**
 
 ### Added
 - **The per-subject variational posterior is now written to the fit YAML.** A `method = vi` fit

@@ -5880,7 +5880,7 @@ pub struct FitOptions {
     /// reach the FOCEI minimum — at 1000 it stopped with σ² 159× too large. Early
     /// stopping is what makes a ceiling this high free for the easy cases.
     pub vi_iters: usize,
-    /// Monte-Carlo draws per subject per iteration. Default 8.
+    /// Monte-Carlo draws per subject per iteration. Default 32.
     ///
     /// Janssen et al. use 3, and their supplementary Table 2 reports 1 loses no accuracy
     /// at roughly three times the throughput. Two anchors here disagree, and both fail
@@ -5897,11 +5897,36 @@ pub struct FitOptions {
     /// That is the settling criterion behaving correctly — it asks whether the remaining
     /// drift is distinguishable from noise, and at 3 draws it is not, while the objective
     /// is still moving. Raising the draws lowers the noise floor rather than papering
-    /// over it. The cost is sublinear in practice because the run also settles sooner:
-    /// on the IOV fit, 3 draws took 2.9 s and 8 draws 5.2 s.
+    /// over it.
+    ///
+    /// # Why the default is 32 and not 8
+    ///
+    /// This draw count sets the noise floor the settling test measures against, so it does
+    /// not merely make a fit noisier — it decides *where the fit stops*, and therefore what
+    /// gets certified. Measured on `data/warfarin.csv` (~1% proportional residual) against
+    /// AGQ (`n_agq = 9`: `σ = 0.010565`, OFV `−285.977`) and FOCEI (identical `σ`):
+    ///
+    /// | draws | `σ` | vs AGQ | OFV | gap |
+    /// |---|---|---|---|---|
+    /// | 8 | 0.013810 | +31% | −276.335 | 9.64 |
+    /// | 32 | 0.011657 | +10% | −284.554 | 1.42 |
+    /// | 128 | 0.011115 | +5% | −285.606 | 0.37 |
+    ///
+    /// At 8 the fit is wrong by a margin that matters — and, crucially, *not always
+    /// flagged*: the drift check only demotes a run still descending when it stops, and at
+    /// 8 draws the run can instead settle at a biased fixed point of the sampled objective
+    /// where the trace tail has genuinely plateaued and `elbo_tightness_ratio` reads a
+    /// healthy `0.989`. With `vi_seed = 99` and otherwise default options that returned
+    /// `converged: true` at `σ = 0.013761`, 9.4 OFV units short. A default must not certify
+    /// that. At 32 no seed tried certified a materially wrong fit (`σ` +10% on the three
+    /// that converged; a bad-basin seed was correctly reported `converged: false`).
+    ///
+    /// The cost is sublinear, because a lower noise floor also lets the run settle sooner:
+    /// 4× the draws cost 2.3× the wall time on this fit (3.4 s → 7.7 s).
     ///
     /// Raise it further when the residual error itself matters; `σ` is the parameter that
-    /// keeps improving with more draws long after `θ` and `Ω` have stopped.
+    /// keeps improving with more draws long after `θ` and `Ω` have stopped. Lower it only
+    /// when you have checked `σ` against a `laplace` / `focei` fit of the same data.
     pub vi_mc_samples: usize,
     /// Adam learning rate. Default 0.02. Janssen et al. use 0.1, dropping to 0.01 when
     /// unstable.
@@ -6366,7 +6391,7 @@ impl Default for FitOptions {
             sir_df: 5.0,
             n_agq: 1,
             vi_iters: 25_000,
-            vi_mc_samples: 8,
+            vi_mc_samples: 32,
             vi_lr: 0.02,
             vi_family: ViFamily::default(),
             vi_omega_update: ViOmegaUpdate::default(),
