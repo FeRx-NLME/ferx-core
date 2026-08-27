@@ -1,3 +1,7 @@
+---
+pagetitle: "Population PK/PD simulation design"
+---
+
 # Simulation
 
 > **Maturity: stable** — see [Feature Maturity](../maturity.qmd) for what this means.

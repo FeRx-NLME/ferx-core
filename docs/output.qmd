@@ -1,3 +1,7 @@
+---
+pagetitle: "ferx fit output files and diagnostics"
+---
+
 # Output Files
 
 Each model run produces two output files (plus a third, `{model}-covtab.csv`,

@@ -1,7 +1,6 @@
 ---
 pagetitle: "NONMEM-compatible data format for ferx"
 description: "Prepare NONMEM-compatible CSV data for population PK/PD modeling in ferx, including doses, observations, infusions, steady state, and covariates."
-title-block-style: none
 ---
 
 # Data Format

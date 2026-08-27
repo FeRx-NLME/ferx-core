@@ -1,3 +1,8 @@
+---
+pagetitle: "FOCE and FOCEI estimation"
+description-meta: "Fit nonlinear mixed-effects population PK/PD models with First-Order Conditional Estimation and interaction in ferx."
+---
+
 # FOCE / FOCEI
 
 > **Maturity: stable** — see [Feature Maturity](../maturity.qmd) for what this means.

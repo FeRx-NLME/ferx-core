@@ -1,3 +1,7 @@
+---
+pagetitle: "ferx warnings and diagnostic codes"
+---
+
 # Warnings
 
 A fit collects non-fatal issues into two parallel channels on `FitResult`:

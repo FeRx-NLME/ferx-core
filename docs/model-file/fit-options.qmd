@@ -1,3 +1,8 @@
+---
+pagetitle: "NLME fit options in ferx"
+description-meta: "Configure estimation methods, optimizers, convergence, covariance, ODE solvers, simulation, and diagnostics in ferx model files."
+---
+
 # Fit Options
 
 The optional `[fit_options]` block configures the estimation method and optimizer settings.

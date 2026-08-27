@@ -1,3 +1,7 @@
+---
+pagetitle: "Two-compartment IV population PK example"
+---
+
 # Two-Compartment IV Bolus
 
 This example fits a two-compartment IV bolus model with four random effects.

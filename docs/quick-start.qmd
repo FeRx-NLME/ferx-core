@@ -1,7 +1,6 @@
 ---
 pagetitle: "ferx quick start: Fit a population PK model"
 description: "Fit a one-compartment oral population pharmacokinetic model with FOCEI using ferx and NONMEM-compatible data."
-title-block-style: none
 ---
 
 # Quick Start

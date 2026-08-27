@@ -1,7 +1,6 @@
 ---
 pagetitle: "NLME estimation methods in ferx"
 description: "Compare FOCE, FOCEI, SAEM, Gauss-Newton, importance sampling, SIR, and Bayesian estimation methods for population PK/PD models in ferx."
-title-block-style: none
 ---
 
 # Estimation Methods

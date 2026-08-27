@@ -1,3 +1,7 @@
+---
+pagetitle: "Derived columns in ferx output"
+---
+
 # Derived Columns (`[derived]`)
 
 > **Maturity: beta** — see [Feature Maturity](../maturity.qmd) for what this means.

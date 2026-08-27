@@ -1,3 +1,7 @@
+---
+pagetitle: "One-compartment oral population PK example"
+---
+
 # One-Compartment Oral (Warfarin)
 
 This example fits a one-compartment oral pharmacokinetic model to warfarin concentration data.

@@ -1,7 +1,6 @@
 ---
 pagetitle: "ferx model file reference: NLME model syntax"
 description: "Reference for the ferx model DSL, including population parameters, PK/PD structural models, error models, covariates, estimation, and simulation."
-title-block-style: none
 ---
 
 # Model File Reference

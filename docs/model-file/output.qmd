@@ -1,3 +1,7 @@
+---
+pagetitle: "Custom fit output columns"
+---
+
 # Output Columns (`[output]`)
 
 > **Maturity: beta** — see [Feature Maturity](../maturity.qmd) for what this means.

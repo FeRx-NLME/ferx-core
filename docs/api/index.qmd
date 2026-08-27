@@ -1,7 +1,6 @@
 ---
-pagetitle: "ferx-core Rust API for NLME modeling"
+pagetitle: "Rust API for NLME modeling"
 description: "Embed population PK/PD fitting, prediction, simulation, and ferx model parsing in Rust applications with the ferx-core API."
-title-block-style: none
 ---
 
 # Rust API

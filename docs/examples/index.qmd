@@ -1,7 +1,6 @@
 ---
 pagetitle: "Population PK/PD and NLME modeling examples"
 description: "Worked ferx examples for one- and two-compartment PK, covariates, FOCEI, SAEM, ODE models, inter-occasion variability, and simulation."
-title-block-style: none
 ---
 
 # Examples

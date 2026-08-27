@@ -1,7 +1,6 @@
 ---
 pagetitle: "ferx command-line interface for NLME modeling"
 description: "Use the ferx CLI to validate models, fit population PK/PD data, simulate trials, and inspect NLME results."
-title-block-style: none
 ---
 
 # CLI Reference

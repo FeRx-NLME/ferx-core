@@ -1,3 +1,7 @@
+---
+pagetitle: "Neural networks in ferx models"
+---
+
 # Neural Networks
 
 > **Maturity: experimental** — see [Feature Maturity](../maturity.qmd) for what this means.
