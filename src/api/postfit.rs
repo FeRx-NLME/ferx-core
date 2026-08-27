@@ -1087,6 +1087,76 @@ fn boundary_estimates(params: &ModelParameters) -> Vec<(String, f64, f64, &'stat
     hits
 }
 
+/// A free OMEGA / SIGMA coordinate pinned to one of the internal packed-space
+/// runaway guards. `estimate` is the ordinary reporting-scale value, while the
+/// packed values identify the literal optimizer guard that was reached.
+struct RunawayGuardHit {
+    name: String,
+    estimate: f64,
+    packed_estimate: f64,
+    packed_guard: f64,
+    side: &'static str,
+}
+
+/// Return the exact bound reached by a packed coordinate. Internal guards are
+/// implementation constants, so this deliberately uses equality rather than the
+/// relative proximity threshold used for user-declared THETA bounds: a value
+/// merely near a wide safety rail is still an interior estimate.
+pub(crate) fn packed_guard_side(
+    estimate: f64,
+    lower: f64,
+    upper: f64,
+) -> Option<(&'static str, f64)> {
+    if !estimate.is_finite() || !lower.is_finite() || !upper.is_finite() || lower >= upper {
+        return None;
+    }
+    if estimate == lower {
+        Some(("lower", lower))
+    } else if estimate == upper {
+        Some(("upper", upper))
+    } else {
+        None
+    }
+}
+
+/// Free OMEGA / SIGMA coordinates pinned to their internal packed-space guards.
+///
+/// The walk uses the same packing, bounds, names, and FIX mask as the optimizer.
+/// Starting after THETA includes base OMEGA/SIGMA, OMEGA_IOV, and mixture
+/// overrides without duplicating their layout here.
+fn runaway_guard_estimates(params: &ModelParameters) -> Vec<RunawayGuardHit> {
+    use crate::estimation::parameterization::{
+        compute_bounds, coordinate_names, coordinate_values, pack_params, packed_fixed_mask,
+    };
+
+    let packed = pack_params(params);
+    let bounds = compute_bounds(params);
+    let fixed = packed_fixed_mask(params);
+    let names = coordinate_names(params);
+    let estimates = coordinate_values(params);
+    let end = packed
+        .len()
+        .min(bounds.lower.len())
+        .min(bounds.upper.len())
+        .min(names.len())
+        .min(estimates.len());
+
+    (params.theta.len()..end)
+        .filter(|&i| !fixed.get(i).copied().unwrap_or(false))
+        .filter_map(|i| {
+            packed_guard_side(packed[i], bounds.lower[i], bounds.upper[i]).map(
+                |(side, packed_guard)| RunawayGuardHit {
+                    name: names[i].clone(),
+                    estimate: estimates[i],
+                    packed_estimate: packed[i],
+                    packed_guard,
+                    side,
+                },
+            )
+        })
+        .collect()
+}
+
 /// Construct a fit-end [`WarningEntry`] with the invariant fields every native
 /// emitter shares (`severity: Warning`, `source_method: None`), varying only
 /// `category`, `message`, and `details`.
@@ -1153,6 +1223,47 @@ pub(crate) fn boundary_estimate_warning(
                 })
                 .collect();
             serde_json::json!({ "parameters": params_json })
+        },
+    )
+}
+
+/// Build the warning for OMEGA / SIGMA estimates pinned to an internal
+/// runaway guard, or `None` when every free coordinate is interior.
+pub(crate) fn runaway_guard_warning(params: &ModelParameters) -> Option<(String, WarningEntry)> {
+    list_warning(
+        runaway_guard_estimates(params),
+        WarningCode::ParameterAtRunawayGuard,
+        |hit| {
+            format!(
+                "{} (estimate {:.4}; packed coordinate {:.4} at {} guard)",
+                hit.name, hit.estimate, hit.packed_estimate, hit.side
+            )
+        },
+        |list| {
+            format!(
+                "Internal optimizer runaway guard reached by parameter estimate(s): {list}. \
+                 The fit reached an implementation safety limit rather than an interior \
+                 optimum; do not treat the affected value(s) as reliable estimates. \
+                 Revisit the model, data, initial estimates, or estimation method."
+            )
+        },
+        |hits| {
+            let params_json: Vec<serde_json::Value> = hits
+                .iter()
+                .map(|hit| {
+                    serde_json::json!({
+                        "parameter": hit.name,
+                        "estimate": hit.estimate,
+                        "packed_estimate": hit.packed_estimate,
+                        "packed_guard": hit.packed_guard,
+                        "side": hit.side,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "guard_space": "packed",
+                "parameters": params_json,
+            })
         },
     )
 }

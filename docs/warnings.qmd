@@ -54,6 +54,7 @@ Each `WarningCode` token, what it flags, and a typical response.
 | `eps_shrinkage` | Warning | Residual (EPS) shrinkage high / negative. | Sparse data for the error model — simplify it. |
 | `eta_shrinkage` | Warning | One or more ETA shrinkages exceed ~30%. | Data poorly inform that IIV — consider removing it on the affected parameter(s). |
 | `boundary_estimate` | Warning | One or more THETA estimates are pinned to an optimizer bound. | Non-identifiability or a too-tight bound — inspect; relax the bound or simplify. |
+| `parameter_at_runaway_guard` | Warning | One or more free OMEGA / SIGMA coordinates are pinned to an internal optimizer safety guard. | The affected value is not an interior optimum — do not treat it as a reliable estimate; revisit the model, data, initial estimates, or method. |
 | `inflated_rse` | Warning | One or more THETA estimates have RSE > ~50%. | Imprecisely estimated — often over-parameterization; consider simplifying. |
 | `high_correlation` | Warning | One or more THETA (fixed-effect) pairs have \|correlation\| ≥ 0.95. | Over-parameterization / non-identifiability — fix or remove one of each pair. |
 | `data_quality` | Warning | Dataset issue (missing DV, ADDL/II, non-positive DV, …). | Fix the dataset before trusting the fit. |
@@ -84,6 +85,7 @@ Treat `details` as optional: check for its presence rather than assuming it.
 | `eps_shrinkage` | `eps_shrinkage` (fraction), `eps_shrinkage_pct` |
 | `eta_shrinkage` | `threshold_pct`, `high_shrinkage_etas` (array of `{eta, shrinkage_pct}`) |
 | `boundary_estimate` | `parameters` (array of `{parameter, estimate, bound, side}`) |
+| `parameter_at_runaway_guard` | `guard_space` (`"packed"`), `parameters` (array of `{parameter, estimate, packed_estimate, packed_guard, side}`) |
 | `inflated_rse` | `threshold_pct`, `parameters` (array of `{parameter, estimate, se, rse_pct}`) |
 | `high_correlation` | `threshold`, `pairs` (array of `{parameter_a, parameter_b, correlation}`) |
 | `flip_flop` | `phase` (`"ebe"`), `model`, `subjects` (array of affected subject IDs) |

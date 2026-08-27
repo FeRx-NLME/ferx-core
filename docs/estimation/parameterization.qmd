@@ -80,6 +80,13 @@ That is how every bound-respecting optimizer (NLopt SLSQP / L-BFGS / MMA, the
 built-in BFGS, the Gauss-Newton step clamp) holds them fixed — there is no
 separate free-subspace vector.
 
+The Omega and Sigma limits above are internal runaway guards, not model-file
+bounds. If a free estimate reaches one exactly, the fit emits the structured
+`parameter_at_runaway_guard` warning. FIX'd coordinates are excluded because
+their equal bounds are intentional. The check is made in packed space, so it
+compares directly with the literal guard even though fit output reports Omega
+on the variance/covariance scale and Sigma on its stored SD scale.
+
 ## Where the packed space surfaces
 
 It is not purely internal; it shows up in several user-visible places.

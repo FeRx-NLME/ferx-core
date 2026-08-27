@@ -1141,6 +1141,78 @@ fn boundary_estimate_warning_emits_typed_entry_with_details() {
 }
 
 #[test]
+fn packed_guard_side_requires_an_exact_non_degenerate_hit() {
+    assert_eq!(
+        super::packed_guard_side(-8.0, -8.0, 5.0),
+        Some(("lower", -8.0))
+    );
+    assert_eq!(
+        super::packed_guard_side(5.0, -8.0, 5.0),
+        Some(("upper", 5.0))
+    );
+    assert_eq!(super::packed_guard_side(5.0 - 1e-12, -8.0, 5.0), None);
+    assert_eq!(super::packed_guard_side(1.0, 1.0, 1.0), None);
+    assert_eq!(super::packed_guard_side(f64::NAN, -8.0, 5.0), None);
+}
+
+#[test]
+fn runaway_guard_warning_reports_sigma_and_skips_fixed_or_nearby_values() {
+    use crate::types::WarningCode;
+    let mut params = tiny_model().default_params;
+    params.sigma.values.fill(1.0);
+    params.sigma_fixed = vec![false; params.sigma.values.len()];
+
+    params.sigma.values[0] = 5.0_f64.exp();
+    let (msg, entry) = super::runaway_guard_warning(&params).expect("sigma guard hit");
+    assert!(msg.contains("implementation safety limit"));
+    assert_eq!(entry.category, WarningCode::ParameterAtRunawayGuard);
+    let details = entry.details.as_ref().expect("details");
+    assert_eq!(details["guard_space"], "packed");
+    assert_eq!(details["parameters"][0]["side"], "upper");
+    assert_eq!(details["parameters"][0]["packed_estimate"], 5.0);
+    assert_eq!(details["parameters"][0]["packed_guard"], 5.0);
+
+    // FIX creates lower == upper at this value, but is intentional and excluded.
+    params.sigma_fixed[0] = true;
+    assert!(super::runaway_guard_warning(&params).is_none());
+
+    // A free value arbitrarily near the safety rail is still an interior result.
+    params.sigma_fixed[0] = false;
+    params.sigma.values[0] = (5.0_f64 - 1e-12).exp();
+    assert!(super::runaway_guard_warning(&params).is_none());
+}
+
+#[test]
+fn runaway_guard_warning_reports_omega_cholesky_guard_and_skips_fixed() {
+    use crate::types::{OmegaMatrix, WarningCode};
+    let mut params = tiny_model().default_params;
+    params.sigma.values.fill(1.0);
+    params.sigma_fixed = vec![false; params.sigma.values.len()];
+    params.omega_fixed = vec![false; params.omega.dim()];
+
+    let mut chol = params.omega.chol.clone();
+    chol[(0, 0)] = 6.0_f64.exp();
+    params.omega = OmegaMatrix::from_chol_factor(
+        chol,
+        params.omega.eta_names.clone(),
+        params.omega.diagonal,
+        params.omega.free_mask.clone(),
+    );
+
+    let (_msg, entry) = super::runaway_guard_warning(&params).expect("omega guard hit");
+    assert_eq!(entry.category, WarningCode::ParameterAtRunawayGuard);
+    let hit = &entry.details.as_ref().unwrap()["parameters"][0];
+    assert_eq!(hit["parameter"], params.omega.eta_names[0].as_str());
+    assert_eq!(hit["packed_estimate"], 6.0);
+    assert_eq!(hit["packed_guard"], 6.0);
+    assert_eq!(hit["side"], "upper");
+    assert!((hit["estimate"].as_f64().unwrap() - 12.0_f64.exp()).abs() < 1e-6);
+
+    params.omega_fixed[0] = true;
+    assert!(super::runaway_guard_warning(&params).is_none());
+}
+
+#[test]
 fn inflated_rse_warning_emits_typed_entry_with_details() {
     use crate::types::WarningCode;
     let mut params = tiny_model().default_params;
