@@ -4701,8 +4701,8 @@ pub enum WarningCode {
     /// One or more ETA (random-effect) shrinkages exceed the threshold — the
     /// data poorly inform those individual random effects.
     EtaShrinkage,
-    /// One or more THETA estimates are pinned to an optimizer bound — a sign of
-    /// non-identifiability or a too-tight bound.
+    /// One or more parameter estimates are pinned to an optimizer bound — a sign of
+    /// non-identifiability, a too-tight declared theta bound, or an Ω/σ runaway.
     BoundaryEstimate,
     /// One or more THETA estimates have a large relative standard error — poorly
     /// estimated / imprecise parameters.

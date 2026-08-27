@@ -20,6 +20,12 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Fixed
+- **VI no longer labels a runaway bad-basin fit as converged (#1097).** A settled fit with
+  `elbo_tightness_ratio > 25`, or with a free Ω/σ coordinate pinned to an internal runaway
+  bound, now reports `converged: false` and emits a machine-readable `convergence` warning
+  plus `boundary_estimate` for a bound hit. The VI guidance now distinguishes the near-optimum
+  Monte-Carlo noise floor (raise `vi_mc_samples`) from a start-dependent bad basin (improve
+  population starting values or use FOCEI/SAEM).
 - **`methods = [vi, laplace]` with `n_agq > 1` is no longer rejected (#1017).** `n_agq` is a
   chain-wide option, so the documented VI readout — `methods = [vi, laplace]`,
   `agq_eval_only = true`, which turns VI's ELBO lower bound into a real `−2 log L` — carries it

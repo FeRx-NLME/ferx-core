@@ -210,11 +210,13 @@ The objective is a Monte-Carlo estimate, so a per-iteration improvement test wou
 noise rather than on convergence. VI instead treats `vi_iters` as a **ceiling** and stops
 once the remaining drift is indistinguishable from that noise, judged on a moving average of
 the trace together with the stability of the parameters themselves. `n_iterations` reports
-what actually ran and `converged` whether it had in fact settled.
+what actually ran. Settling supplies the provisional `converged` result; the fit-end health
+checks described below can still reject it.
 
-Settling is not the same as landing somewhere good — a stuck optimizer also stops moving.
-Read [`elbo_tightness_ratio`](#is-the-bound-tight-elbo_tightness_ratio) alongside
-`converged`.
+Settling is not the same as landing somewhere good — a stuck optimizer also stops moving. A
+fit with [`elbo_tightness_ratio`](#is-the-bound-tight-elbo_tightness_ratio) above 25, or with
+a free `Ω`/`σ` coordinate pinned to its internal runaway bound, is therefore reported as
+`converged: false` even if the trace itself settled.
 
 Either criterion is sufficient, which is what makes the second one worth stating carefully: it
 measures the **population** vector, not `q`. If you FIX every population parameter and fit `q`
@@ -242,13 +244,23 @@ structures with no scalar stationary point — combined error, several `σ`, per
 covariate-selected error, correlated residuals, M3 BLOQ, IIV-on-RUV, FREM, or a FIXed `σ` — fall
 back to `adam`, with the reason in `FitResult$warnings`.
 
-**The thing actually worth knowing about `σ`.** At the default `vi_mc_samples = 8`, a warfarin fit
+**The thing actually worth knowing about `σ` near a good basin.** At the default
+`vi_mc_samples = 8`, a warfarin fit
 returns `σ = 0.011234`–`0.014150` depending on the route where AGQ (`n_agq = 9`) and FOCEI both
-give `0.010565`, and reports `converged: true` while sitting up to 11.3 OFV short of the
+give `0.010565`, and can stop while sitting up to 11.3 OFV short of the
 reference. Since per-subject posterior width scales with `σ²`, a 34% error there makes every
-reported variational covariance about 1.75× too wide. This is **not** a defect in the `σ` update —
-both routes show it, and both stop showing it at higher draw counts. It is the convergence rule
-meeting its own noise floor, described next.
+reported variational covariance about 1.75× too wide. In that case
+`elbo_tightness_ratio ≈ 1`: this is **not** a defect in the `σ` update. Both routes show it,
+and both stop showing it at higher draw counts. It is the convergence rule meeting its own
+noise floor, described next.
+
+A distant start is different. On the same warfarin model with `TVV = 2` rather than a value near
+the fitted `7.74`, the initial `−2·ELBO` is about `1.5e14`: late-time
+predictions are nearly zero, so `E_q[(y-f)^2/f^2]` is enormous. The closed-form update correctly
+maximizes the ELBO *conditional on that initial q* by sending `σ` to its `exp(5)` runaway bound.
+The resulting residual variance flattens the data gradient before q can move, and the fit settles
+in that bad basin. More draws, a lower learning rate, and more iterations do not fix this case;
+`elbo_tightness_ratio` is orders of magnitude above 25 and `converged` is reported false.
 
 **`vi_mc_samples = 8` is not enough on this problem.** Warfarin's OFV gap to AGQ runs 11.3 units
 at 8 draws, 1.4 at 32, and 0.55 at 128 (−285.4 against −285.977). The mechanism is the trade the
@@ -258,23 +270,26 @@ distinguishable from Monte-Carlo noise, and at 8 draws it becomes indistinguisha
 drift remains. So the fit stops short, and `σ` — the coordinate that moves slowest — is left
 furthest from its optimum.
 
-Three consequences worth carrying:
+Four consequences worth carrying:
 
-- **If a VI fit lands well short of a FOCEI or AGQ fit of the same data, raise `vi_mc_samples`
-  first.** More iterations will not help; the rule has already decided more epochs at this noise
-  level cannot resolve the drift, and it is right.
+- **If a VI fit lands short but `elbo_tightness_ratio` remains near 1, raise
+  `vi_mc_samples` first.** That is the noise-floor case: more iterations at the same draw count
+  will not resolve the drift.
+- **If `elbo_tightness_ratio` is above 25, improve the population starting values or use
+  FOCEI/SAEM.** More draws do not move q out of a bad basin; this is the failure mode that can
+  drive `σ` or `Ω` into an internal bound.
 - Lowering `vi_lr` also works (`0.002` reaches −285.9 at 8 draws), but it is tuning where the
-  draw count is the principled knob.
-- **Chaining `[focei, vi]` does not help.** Starting from the fitted FOCEI point, the fit still
-  ends at `σ ≈ 0.0141`: `σ` legitimately rises early, because FOCEI's value is not the ELBO's
-  conditional optimum given a `q` that starts at the prior, and the run stops before it comes back
-  down. So a bad `σ` here is not a bad-basin problem and a warm start is not the remedy.
+  draw count is the principled knob **inside a good basin**.
+- Chaining `[focei, vi]` can place VI in a usable basin, but it is not a polishing step. On this
+  example VI moves the fitted FOCEI point from `−285.977` to about `−276.7` at 8 draws because q
+  starts at the prior and `σ` rises before returning. Keep the FOCEI result if the marginal
+  likelihood is the target; use the chained VI stage only when its variational posterior is the
+  quantity you need.
 
-`converged: true` therefore means the drift became unresolvable at the current noise level, not
-that the optimizer found the optimum. Read it with `elbo_tightness_ratio` — and note that ratio
-does **not** catch this case either: it read `0.960`, a healthy value, at the point 11.3 units
-short, because it measures whether `q` matches the posterior *at the current parameters* and `q`
-did.
+A healthy `elbo_tightness_ratio` does not by itself prove that the population parameters reached
+the optimum: it read `0.960` at the point 11.3 units short because it measures whether `q`
+matches the posterior *at the current parameters*. The trace-drift check is what demotes that
+noise-limited case; the tightness check demotes the separate bad-basin case above.
 
 ### Why the estimate is averaged
 
@@ -295,7 +310,9 @@ initial estimates — no random initialization.
 Declared bounds are respected. `theta TVCL(0.13, 0.001, 10.0)` constrains a VI fit exactly as
 it constrains a FOCE/FOCEI or SAEM fit: Adam is unconstrained, so each step is followed by a
 projection back into the box, and `Ω`/`σ` pick up the same runaway guards the other estimators
-get. A `θ` that ends up pinned against a bound raises the usual boundary warning.
+get. A `θ` that ends up pinned against a bound raises the usual boundary warning. A free `Ω` or
+`σ` at one of ferx's internal runaway bounds is stronger evidence: VI emits the stable
+`boundary_estimate` warning code and reports `converged: false`.
 
 Bounds are enforced in the same transformed space the optimizer works in (log for a
 sign-constrained `θ`), so a reported estimate sitting *on* a bound can differ from the declared
@@ -394,23 +411,25 @@ covariance.
 
 ## Is the bound tight? (`elbo_tightness_ratio`)
 
-`converged` answers "did the objective stop moving", which a stuck optimizer satisfies
-just as well as a successful one. Read `FitResult$vi$elbo_tightness_ratio` alongside it.
+`elbo_tightness_ratio` checks whether a settled objective is trustworthy. A stuck optimizer can
+stop moving just as well as a successful one, so a ratio above 25 overrides that settling result
+and makes `converged: false`.
 
 The data term is `E_q[−log p(y|η)]`. Evaluated at the variational means it is
 `−log p(y|μ)`, and the gap between them is `≈ ½ tr(H·S)` — which is `d/2` per subject
 when `q` has the posterior's curvature. The ratio is the measured gap over that
 expectation, so **≈ 1 is ideal** and single digits are unremarkable on a nonlinear model.
-Above 25 the fit emits a warning naming the likely cause.
+Above 25 the fit emits a convergence-coded warning naming the likely cause.
 
 This is what distinguishes a converged fit from a stuck one without running a second
-estimator. On a deep compartment model started badly it read **306.6** while the fit
-reported `converged: true` at 973 OFV worse than the same model started sensibly;
-started sensibly it read **0.54**.
+estimator. On a deep compartment model started badly it read **306.6** at 973 OFV worse than
+the same model started sensibly and is now reported `converged: false`; started sensibly it
+read **0.54**.
 
-If it fires: start from better values (`init` on a `[covariate_nn]` block, see
+If it fires: start from better population values (`init` on a `[covariate_nn]` block, see
 [`[covariate_nn]`](../model-file/covariate-nn.qmd#start-the-network-at-plausible-values-init)),
-or chain `method = [focei, vi]` to begin VI from a fitted point.
+or use FOCEI/SAEM to locate a suitable basin. Raising `vi_mc_samples` is the remedy only when
+the ratio is already near 1.
 
 ## Reading `Ω` from a deep compartment model {#dcm-omega}
 

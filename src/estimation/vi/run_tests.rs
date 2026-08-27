@@ -137,6 +137,84 @@ fn trace_settles_on_a_flat_noisy_tail_but_not_on_a_drifting_one() {
     assert!(!trace_has_settled(&poisoned, 20, 1e-4));
 }
 
+#[test]
+fn variability_bounds_ignore_theta_and_fixed_slots_but_flag_free_sigma() {
+    let (_model, _population, mut params) = fixture();
+    let bounds = compute_bounds(&params);
+    let mut x = pack_params(&params);
+
+    // A user-declared theta bound has its own post-fit diagnostic and is not a VI
+    // runaway-guard failure.
+    x[0] = bounds.upper[0];
+    assert!(variability_bound_hits(&x, &params, &bounds.lower, &bounds.upper).is_empty());
+
+    let sigma_slot = PackedLayout::new(&params).sigma_start();
+    x[sigma_slot] = bounds.upper[sigma_slot];
+    let hits = variability_bound_hits(&x, &params, &bounds.lower, &bounds.upper);
+    assert_eq!(hits, vec![("PROP_ERR".to_string(), "upper")]);
+
+    // A FIXed sigma has lower == upper intentionally and must never invalidate the fit.
+    params.sigma_fixed[0] = true;
+    assert!(variability_bound_hits(&x, &params, &bounds.lower, &bounds.upper).is_empty());
+}
+
+#[test]
+fn implausible_tightness_and_variability_bounds_override_settling() {
+    let healthy = ElboTightness {
+        excess: 15.0,
+        expected: 15.0,
+    };
+    let mut warnings = Vec::new();
+    assert!(apply_convergence_health_gates(
+        true,
+        healthy,
+        &[],
+        &mut warnings
+    ));
+    assert!(warnings.is_empty());
+
+    let implausible = ElboTightness {
+        excess: 150_000.0,
+        expected: 15.0,
+    };
+    assert!(!apply_convergence_health_gates(
+        true,
+        implausible,
+        &[],
+        &mut warnings
+    ));
+    assert!(warnings
+        .last()
+        .unwrap()
+        .contains("Reported converged: false"));
+    assert_eq!(
+        crate::types::classify_warning(warnings.last().unwrap()).category,
+        crate::types::WarningCode::Convergence
+    );
+
+    warnings.clear();
+    let hits = vec![("PROP_ERR".to_string(), "upper")];
+    assert!(!apply_convergence_health_gates(
+        true,
+        healthy,
+        &hits,
+        &mut warnings
+    ));
+    assert_eq!(
+        warnings.len(),
+        2,
+        "boundary and convergence need separate codes"
+    );
+    assert_eq!(
+        crate::types::classify_warning(&warnings[0]).category,
+        crate::types::WarningCode::BoundaryEstimate
+    );
+    assert_eq!(
+        crate::types::classify_warning(&warnings[1]).category,
+        crate::types::WarningCode::Convergence
+    );
+}
+
 /// The systematic-drift test sees a trend the settling test cannot: one below the
 /// per-window noise it measures against.
 ///

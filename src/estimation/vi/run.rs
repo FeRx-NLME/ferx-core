@@ -33,7 +33,8 @@ use nalgebra::DVector;
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::outer_optimizer::{pop_nll, OuterResult};
 use crate::estimation::parameterization::{
-    clamp_to_bounds, compute_bounds, compute_mu_k, pack_params, unpack_params,
+    clamp_to_bounds, compute_bounds, compute_mu_k, coordinate_names, omega_structural_zero_mask,
+    pack_params, packed_fixed_mask, unpack_params,
 };
 use crate::types::{
     CompiledModel, FitOptions, ModelParameters, Population, ViFamily, ViFinalOfv, ViOmegaUpdate,
@@ -43,7 +44,7 @@ use crate::types::{
 use super::adam::{averaging_start, AdamConfig, AdamState, PolyakAverager};
 use super::elbo::{
     closed_form_omega, closed_form_sigma, closed_form_sigma_support, population_neg_elbo,
-    stacked_prior, unsupported_data_term_reason, ElboConfig, Families, PackedLayout,
+    stacked_prior, unsupported_data_term_reason, ElboConfig, ElboTightness, Families, PackedLayout,
 };
 use super::family::{FullRank, MeanField, VariationalFamily};
 
@@ -179,6 +180,113 @@ fn param_criterion_applies(template: &ModelParameters) -> bool {
     let fixed = crate::estimation::parameterization::packed_fixed_mask(template);
     let structural = crate::estimation::parameterization::omega_structural_zero_mask(template);
     fixed.iter().zip(structural.iter()).any(|(&f, &z)| !f && !z)
+}
+
+/// Fraction of an internal packed-coordinate range that counts as pinned to a bound.
+///
+/// These are not user-declared theta bounds: they are the broad Ω/σ runaway guards in
+/// `compute_bounds`. Reaching one is therefore an optimizer-health failure, not a valid
+/// constrained optimum. The tolerance matches the ordinary theta boundary diagnostic.
+const VARIABILITY_BOUND_REL_TOL: f64 = 1e-3;
+
+/// Free Ω/σ coordinates at (or outside) their internal runaway bounds.
+///
+/// Theta coordinates are deliberately excluded: their bounds are part of the user's model and
+/// already have the ordinary boundary warning. FIXed and structural-zero variability slots are
+/// excluded because their immobility is intentional.
+fn variability_bound_hits(
+    x: &[f64],
+    template: &ModelParameters,
+    lower: &[f64],
+    upper: &[f64],
+) -> Vec<(String, &'static str)> {
+    let fixed = packed_fixed_mask(template);
+    let structural = omega_structural_zero_mask(template);
+    let names = coordinate_names(template);
+    let start = template.theta.len();
+    let end = x
+        .len()
+        .min(lower.len())
+        .min(upper.len())
+        .min(fixed.len())
+        .min(structural.len())
+        .min(names.len());
+
+    (start..end)
+        .filter_map(|i| {
+            if fixed[i] || structural[i] {
+                return None;
+            }
+            let range = upper[i] - lower[i];
+            if !x[i].is_finite() || !range.is_finite() || range <= 0.0 {
+                return None;
+            }
+            let tol = VARIABILITY_BOUND_REL_TOL * range;
+            let side = if x[i] <= lower[i] + tol {
+                "lower"
+            } else if x[i] >= upper[i] - tol {
+                "upper"
+            } else {
+                return None;
+            };
+            Some((names[i].clone(), side))
+        })
+        .collect()
+}
+
+/// Apply fit-end health checks that are stronger than a noisy-trace settling test.
+///
+/// A flat trace only says the stochastic optimizer stopped moving. An implausibly loose bound
+/// or a variability coordinate welded to an internal runaway guard proves that the returned
+/// point is not a trustworthy optimum, so either condition must override that provisional
+/// convergence flag.
+fn apply_convergence_health_gates(
+    mut converged: bool,
+    tightness: ElboTightness,
+    bound_hits: &[(String, &'static str)],
+    warnings: &mut Vec<String>,
+) -> bool {
+    let bad_tightness = tightness.is_implausible();
+    if bad_tightness {
+        converged = false;
+        warnings.push(format!(
+            "VI did not converge to a trustworthy solution: the data term sits {:.0}x further \
+             above its value at the variational means than a posterior-shaped q would put it \
+             ({:.3e} against an expected {:.3e}). This indicates a bad basin, not a \
+             Monte-Carlo noise-floor stop; increasing vi_mc_samples or adding iterations is \
+             unlikely to repair it. Re-run from better population starting values or use \
+             FOCEI/SAEM to locate a suitable basin. Reported converged: false.",
+            tightness.ratio(),
+            tightness.excess,
+            tightness.expected
+        ));
+    }
+
+    if !bound_hits.is_empty() {
+        converged = false;
+        let list = bound_hits
+            .iter()
+            .map(|(name, side)| format!("{name} ({side})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        warnings.push(format!(
+            "VI variability parameter estimate(s) pinned to an internal optimizer bound: \
+             {list}. These Ω/σ bounds are runaway guards, so the estimate is not a valid \
+             converged solution."
+        ));
+        // Keep a separate convergence-coded warning: the boundary message is deliberately
+        // classified as `boundary_estimate`, while programmatic consumers also need the
+        // `convergence` code when tightness itself did not already emit one.
+        if !bad_tightness {
+            warnings.push(
+                "VI did not converge: an Ω or σ estimate reached an internal runaway bound. \
+                 Reported converged: false."
+                    .to_string(),
+            );
+        }
+    }
+
+    converged
 }
 
 /// Whether the tail of the objective trace has stopped moving.
@@ -778,6 +886,9 @@ pub fn run_vi(
         }
     }
     restore_fixed(&mut final_params, init_params);
+    let packed_final = pack_params(&final_params);
+    let bound_hits =
+        variability_bound_hits(&packed_final, init_params, &bounds.lower, &bounds.upper);
 
     // Re-evaluate at the averaged point with more draws: this number is reported,
     // so it should carry less Monte-Carlo noise than a training iteration.
@@ -909,20 +1020,7 @@ pub fn run_vi(
         &eta_means,
         &kappa_means,
     );
-    if tightness.is_implausible() {
-        warnings.push(format!(
-            "VI: the ELBO is not a usable bound at this estimate — the data term sits \
-             {:.0}x further above its value at the variational means than a posterior-shaped \
-             q would put it ({:.3e} against an expected {:.3e}). The optimizer has almost \
-             certainly settled in a bad basin: `converged` reflects a flat objective, not a \
-             good one. Re-run from better starting values (for a [covariate_nn] model, \
-             declare `init` so the network starts at plausible parameter values), or chain \
-             `method = [focei, vi]` to start VI from a fitted point.",
-            tightness.ratio(),
-            tightness.excess,
-            tightness.expected
-        ));
-    }
+    converged = apply_convergence_health_gates(converged, tightness, &bound_hits, &mut warnings);
 
     // The ELBO is a lower bound, so it is never reported as the OFV. See
     // `ViFinalOfv` for why, and for how to obtain a real marginal likelihood.
@@ -968,7 +1066,6 @@ pub fn run_vi(
     // on `options.run_covariance_step`, which `fit_inner` clears on every
     // non-terminal stage of a chain — so a `methods = vi, focei` run pays for it
     // once, at the end.
-    let packed_final = pack_params(&final_params);
     let cov_out = crate::estimation::covariance::run_covariance_step(
         &packed_final,
         &final_params,
