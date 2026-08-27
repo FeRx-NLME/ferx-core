@@ -285,19 +285,20 @@ non-stiff and never escalate. Probing per segment sees the post-dose Jacobian, w
 stiffness actually lives. It also re-decides as the optimizer moves θ, so a fit that walks into
 a stiff region of parameter space switches with it.
 
-**A escalation that fails is caught and undone.** Every stiff method in ferx has been measured
+**An escalation that fails is caught and undone.** Every stiff method in ferx has been measured
 diverging on *some* model where the explicit family stayed clean, and those failures differ
 between methods — so `auto` treats a bad escalation as an expected outcome, not an impossible
 one. If the stiff solve comes back non-finite, **or** clamps at the minimum step (the
 freeze-pad failure described above — finite output, silently wrong), the result is discarded
-and the segment is re-solved explicitly. That bounds the worst case to "the explicit answer,
-at twice the cost" rather than a corrupted objective function. The guard applies only to
-`auto`: a named method is always honoured as asked. When it fires, the fit says so — see
+and the segment is re-solved explicitly. When the fallback integrates cleanly, that bounds the
+result to "the explicit answer, at twice the cost" rather than a corrupted objective function.
+If it also fails, `auto_fallback_failed` reports that neither attempt produced a usable
+trajectory. The guard applies only to `auto`: a named method is always honoured as asked. When it fires, the fit says so — see
 [where those counts show up](#which-regime-am-i-in), below.
 
-**Two things the probe cannot see**, both worth knowing now that it is the default. Neither
-makes an answer wrong — the guard bounds that — but both can make a fit slower than pinning a
-method by hand.
+**Two things the probe cannot see**, both worth knowing now that it is the default. When the
+fallback completes, neither makes the answer worse than the explicit result, but both can make a
+fit slower than pinning a method by hand.
 
 *It is a rate, so it carries your model's time unit.* `λ_max ≥ 30` is calibrated for the
 hour-based convention typical of PK models, and the one the default tolerances assume. The same
@@ -328,6 +329,33 @@ step counts, and ride along in the `ode_solver` warning's `details` payload:
   explicitly. A subset of the first, and normally `0`. A non-zero count means the probe was
   right that the system is stiff but the method it picked could not integrate it — try naming
   `rodas5p` or `rosenbrock23` explicitly.
+
+Three more counters close the guard's last ambiguity. Unlike the three above, the first two are
+recorded under *every* `ode_method`, not just `auto` — an `rk45` fit that runs out of steps shows
+them too.
+
+- **unfinished segments** — attempts that stopped before their requested end and freeze-padded
+  the remaining output times with the last state.
+- **discarded unfinished segments** — the subset belonging to stiff attempts the guard threw
+  away, so the difference (`kept_unfinished_segments`) is the number of unfinished trajectories
+  the caller actually received.
+- **auto-fallback failures** — rejected escalations whose explicit re-solve *also* stopped early
+  or returned non-finite output. There is no clean trajectory left for the guard to return, so
+  it deterministically keeps the explicit fallback but reports that **both attempts failed**. Do
+  not treat a fit with a non-zero value here as a usable result; pin another stiff method and
+  check the tolerances and parameter estimates.
+
+`kept_unfinished_segments` is a roll-up, not a disjoint category: a segment abandoned by
+`ode_stiff_abort_after`, and one that stopped because it could not form a step at the minimum
+step size, are unfinished segments too. Do not add it to `stiff_aborted_segments` — the
+`ode_solver` warning subtracts the abandoned ones before reporting the rest, so its clauses
+partition the damaged segments rather than counting them twice. What is left after that
+subtraction is dominated by segments that exhausted `ode_max_steps`.
+
+All six counters are floors rather than totals. They cover the segment solves only, so
+escalations and failures on the event-time path — the threshold solver that drives time-to-event
+and adaptive-dosing models — are not in them. A zero is not by itself proof that every
+integration in the fit was clean.
 
 Measured on the ferx-testdata ODE library at default tolerances. `λ_max` is the range across
 every integration segment of every subject; the wall-clock columns are FOCEI fits:
@@ -389,7 +417,10 @@ steps to `7e-8` in 90 — matching the method a user would have had to know to n
 
 A switch onto a stiff method is guarded exactly like a start-of-segment escalation: if that half
 comes back non-finite or clamps at the minimum step, the segment is discarded and re-solved with
-the explicit stepper, so the worst case stays "the explicit answer, twice the cost". Only clamps
+the explicit stepper. If that fallback also stops early or returns non-finite output, the solver
+keeps it rather than guessing at a third method, but reports `auto_fallback_failed` in the
+`ode_solver` warning; the old "explicit answer, twice the cost" bound holds only when that counter
+is zero. Only clamps
 taken *by the stiff stepper* count towards that test — a segment that clamped explicitly and was
 then rescued by the switch is kept, since discarding it would hand back exactly the explicit
 result the switch had just avoided. The
@@ -444,7 +475,8 @@ limited. Run your model and look at the solver's step counts:
 **Where those counts show up.** After a fit, ferx runs one prediction pass over every subject
 at the final estimates and reports what the solver did there as an `ode_solver` warning
 (see [Warnings](../warnings.qmd#warning-codes)). It fires when a step clamped at the minimum
-step size, when an `auto` escalation had to be discarded and re-solved explicitly, or when
+step size, when a returned segment stopped before its requested end, when an `auto` escalation
+had to be discarded and re-solved explicitly, when that explicit fallback also failed, or when
 `ode_stiff_abort_after` cut a segment short — and, at `Info` severity, when `auto` escalated
 and everything worked, so an escalation is never invisible. Either way it says how many
 segments changed stepper part-way through, because that changes how the step counts above it

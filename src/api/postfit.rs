@@ -1611,9 +1611,10 @@ pub(crate) fn integrates_odes(model: &CompiledModel) -> bool {
 ///
 /// Two severities, because the two things being reported are not the same kind of event:
 ///
-/// * **Warning** — a step clamped at `min_dt`, an escalation was discarded, or a segment was
-///   cut short by `ode_stiff_abort_after`. Each of those means part of some subject's
-///   trajectory was freeze-padded or re-solved, i.e. the integration was not clean.
+/// * **Warning** — a step clamped at `min_dt`, an escalation was discarded, its explicit
+///   fallback also failed, a segment ended before its requested horizon, or a segment was cut
+///   short by `ode_stiff_abort_after`. Each means part of some subject's trajectory was
+///   freeze-padded or re-solved, i.e. the integration was not clean.
 /// * **Info** — `auto` escalated and everything worked. Routine on a stiff model (the TMDD
 ///   `cr` testdata escalates 240 of 580 segments) and not a problem, but it *is* a decision
 ///   the user never asked for and could not otherwise see.
@@ -1637,7 +1638,22 @@ pub(crate) fn ode_solver_diagnostics_warning(
         .min_step_clamped_steps
         .saturating_sub(stats.discarded_clamped_steps);
     let rejected = stats.auto_stiff_rejected;
+    let fallback_failed = stats.auto_fallback_failed;
+    // Like clamps, an unfinished stiff attempt that the guard discarded did not reach the
+    // caller. Only the explicit fallback (or a named/kept method) belongs in the returned-
+    // trajectory clause.
+    let unfinished_kept = stats
+        .unfinished_segments
+        .saturating_sub(stats.discarded_unfinished_segments);
     let aborted = stats.stiff_aborted_segments;
+    // `unfinished_kept` is a roll-up: a segment abandoned by `ode_stiff_abort_after` stops
+    // while `t < tf`, so it is *also* an unfinished segment, and the abort clause below already
+    // reports it with the budget that caused it. Report only the remainder here, so the clauses
+    // partition the damaged segments instead of counting the aborted ones twice — a reader who
+    // adds them up must get the number of segments, not double it. (The clamp clause counts
+    // *steps*, so it cannot collide with a segment count the same way; its own segment-level
+    // overlap is described in the wording below.)
+    let unfinished_other = unfinished_kept.saturating_sub(aborted);
     let escalated = stats.auto_stiff_segments;
     // Segments whose stepper changed part-way through (#1080 Part C). Reported as a clause on
     // the escalation note rather than as a warning of its own: a mid-segment switch is `auto`
@@ -1666,7 +1682,8 @@ pub(crate) fn ode_solver_diagnostics_warning(
     } else {
         String::new()
     };
-    let unclean = clamped > 0 || rejected > 0 || aborted > 0;
+    let unclean =
+        clamped > 0 || rejected > 0 || fallback_failed > 0 || unfinished_kept > 0 || aborted > 0;
     if !unclean && escalated == 0 {
         return None;
     }
@@ -1684,6 +1701,10 @@ pub(crate) fn ode_solver_diagnostics_warning(
         "auto_stiff_segments": escalated,
         "auto_switched_segments": stats.auto_switched_segments,
         "auto_stiff_rejected": rejected,
+        "auto_fallback_failed": fallback_failed,
+        "unfinished_segments": stats.unfinished_segments,
+        "discarded_unfinished_segments": stats.discarded_unfinished_segments,
+        "kept_unfinished_segments": unfinished_kept,
         "stiff_aborted_segments": aborted,
     }));
 
@@ -1728,6 +1749,27 @@ pub(crate) fn ode_solver_diagnostics_warning(
              explicitly is the next thing to try",
             explicit = crate::ode::OdeMethod::EXPLICIT_FALLBACK.as_str(),
             discarded = stats.discarded_clamped_steps,
+        ));
+    }
+    if fallback_failed > 0 {
+        // Deliberately self-contained rather than "N of those explicit re-solves": the clause
+        // it would lean on is the `rejected` one, and `parts` is joined in whatever order the
+        // counters happen to be non-zero.
+        parts.push(format!(
+            "{fallback_failed} segment(s) had both attempts fail — the discarded stiff \
+             escalation and the {explicit} re-solve that replaced it were both unusable, so no \
+             clean trajectory existed and the returned result is the unfinished or non-finite \
+             {explicit} fallback",
+            explicit = crate::ode::OdeMethod::EXPLICIT_FALLBACK.as_str(),
+        ));
+    }
+    if unfinished_other > 0 {
+        parts.push(format!(
+            "{unfinished_other} returned segment(s) stopped before their requested end time and \
+             freeze-padded the remaining output times with the last state — they exhausted \
+             ode_max_steps, or could not form a step at the minimum step size; segments \
+             abandoned by ode_stiff_abort_after are counted in their own clause instead of \
+             this one"
         ));
     }
     if aborted > 0 {

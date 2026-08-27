@@ -215,6 +215,90 @@ fn a_rejected_escalation_is_a_warning_that_names_the_next_thing_to_try() {
     assert_eq!(classify_warning(&msg).category, WarningCode::OdeSolver);
 }
 
+/// The guard cannot repair a segment when its explicit re-solve fails too. This is more severe
+/// than an ordinary rejected escalation: the caller received the failed fallback because there
+/// is no third solve, and the warning must say that plainly (#1080 review follow-up).
+#[test]
+fn a_failed_explicit_fallback_reports_that_both_attempts_failed() {
+    let stats = OdeSolverStats {
+        auto_stiff_segments: 3,
+        auto_stiff_rejected: 1,
+        auto_fallback_failed: 1,
+        unfinished_segments: 2,
+        discarded_unfinished_segments: 1,
+        ..Default::default()
+    };
+    let (msg, entry) =
+        ode_solver_diagnostics_warning(&stats, &FitOptions::default()).expect("a warning");
+    assert_eq!(entry.severity, WarningSeverity::Warning);
+    assert!(msg.contains("1 segment(s) had both attempts fail"), "{msg}");
+    // Self-contained: the clause must not lean on the `rejected` clause happening to precede it.
+    assert!(!msg.contains("of those explicit re-solves"), "{msg}");
+    assert!(msg.contains("1 returned segment(s) stopped"), "{msg}");
+    let details = entry.details.as_ref().unwrap();
+    assert_eq!(details["auto_fallback_failed"], serde_json::json!(1));
+    assert_eq!(details["kept_unfinished_segments"], serde_json::json!(1));
+}
+
+#[test]
+fn an_unfinished_named_solve_is_warned_without_an_auto_rejection() {
+    let stats = OdeSolverStats {
+        attempted_steps: 10,
+        accepted_steps: 10,
+        unfinished_segments: 1,
+        ..Default::default()
+    };
+    let opts = FitOptions {
+        ode_method: crate::ode::OdeMethod::Rk45,
+        ..Default::default()
+    };
+    let (msg, entry) = ode_solver_diagnostics_warning(&stats, &opts).expect("a warning");
+    assert_eq!(entry.severity, WarningSeverity::Warning);
+    assert!(msg.contains("1 returned segment(s) stopped"), "{msg}");
+    assert!(!msg.contains("stiff escalation"), "{msg}");
+}
+
+/// `stiff_aborted_segments` is a subset of `unfinished_segments` by construction — the budgeted
+/// abort only fires while `t < tf`. The warning's clauses must partition the damaged segments,
+/// so a reader who adds them up gets the number of segments rather than twice it (#1080 review).
+#[test]
+fn an_abandoned_segment_is_not_also_reported_as_an_unfinished_one() {
+    let stats = OdeSolverStats {
+        unfinished_segments: 3,
+        stiff_aborted_segments: 3,
+        ..Default::default()
+    };
+    let opts = FitOptions {
+        ode_stiff_abort_after: Some(5),
+        ..Default::default()
+    };
+    let (msg, entry) = ode_solver_diagnostics_warning(&stats, &opts).expect("a warning");
+    assert!(msg.contains("3 segment(s) were abandoned early"), "{msg}");
+    assert!(
+        !msg.contains("returned segment(s) stopped"),
+        "the abort clause already reports all three: {msg}"
+    );
+    // The raw roll-up stays in the payload; the docs say it is not disjoint from the abort count.
+    let details = entry.details.as_ref().unwrap();
+    assert_eq!(details["kept_unfinished_segments"], serde_json::json!(3));
+    assert_eq!(details["stiff_aborted_segments"], serde_json::json!(3));
+}
+
+/// One unfinished segment beyond the abandoned ones still earns its own clause, and names the
+/// causes an abort clause would not explain.
+#[test]
+fn an_unfinished_segment_beyond_the_abandoned_ones_is_still_reported() {
+    let stats = OdeSolverStats {
+        unfinished_segments: 3,
+        stiff_aborted_segments: 2,
+        ..Default::default()
+    };
+    let (msg, _) =
+        ode_solver_diagnostics_warning(&stats, &FitOptions::default()).expect("a warning");
+    assert!(msg.contains("1 returned segment(s) stopped"), "{msg}");
+    assert!(msg.contains("ode_max_steps"), "{msg}");
+}
+
 #[test]
 fn an_abort_names_the_budget_that_caused_it() {
     let stats = OdeSolverStats {

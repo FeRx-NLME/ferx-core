@@ -377,12 +377,86 @@ fn a_budgeted_abort_inside_an_escalation_is_still_rejected_by_the_guard() {
     // deliberately not counted — nobody received that trajectory.
     assert!(budgeted.stiff_aborted_segments >= 1);
     assert!(budgeted.discarded_clamped_steps > 0);
+    assert_eq!(
+        budgeted.auto_fallback_failed, 1,
+        "the explicit re-solve trips the same abort, so both attempts failed: {budgeted:?}"
+    );
+    assert_eq!(budgeted.unfinished_segments, 2, "one attempt per method");
+    assert_eq!(
+        budgeted.discarded_unfinished_segments, 1,
+        "only the stiff attempt was discarded; the explicit unfinished result was returned"
+    );
     assert!(
         budgeted.attempted_steps < unbudgeted.attempted_steps,
         "the budget must cost fewer steps: {} vs {}",
         budgeted.attempted_steps,
         unbudgeted.attempted_steps
     );
+}
+
+/// The third way an escalation fails, and the one no clamp or non-finite test can see: a stiff
+/// method that exhausts `max_steps` without ever reaching `min_dt` returns a finite,
+/// freeze-padded, partially-integrated trajectory with every other counter at zero. Before the
+/// guard was widened this was returned unguarded and was indistinguishable from an unfinished
+/// *explicit* solve, whose remedy is the opposite one (#1080 review).
+#[test]
+fn the_guard_re_solves_an_escalation_that_ran_out_of_steps_without_clamping() {
+    let rhs = diagonal_rhs::<f64>(&[-1.0e4, -0.5]);
+    let starved = OdeSolverOptions {
+        max_steps: 2,
+        ..loose()
+    };
+    let mut stats = OdeSolverStats::default();
+    let sol = solve_ode_with_stats(
+        &rhs,
+        &[1.0, 1.0],
+        (0.0, 5.0),
+        &[],
+        &[5.0],
+        &starved,
+        Some(&mut stats),
+    );
+
+    assert_eq!(stats.auto_stiff_segments, 1, "{stats:?}");
+    assert_eq!(
+        stats.min_step_clamped_steps, 0,
+        "the point of the fixture is that nothing clamped: {stats:?}"
+    );
+    assert_eq!(
+        stats.auto_stiff_rejected, 1,
+        "an attempt that never reached tf is not a usable escalation: {stats:?}"
+    );
+    assert_eq!(
+        stats.auto_fallback_failed, 1,
+        "the explicit re-solve is starved of steps too, so both attempts failed: {stats:?}"
+    );
+    assert_eq!(stats.unfinished_segments, 2, "one attempt per method");
+    assert_eq!(
+        stats.discarded_unfinished_segments, 1,
+        "only the stiff attempt was discarded"
+    );
+    assert_eq!(sol.len(), 1, "the saveat contract remains freeze-padded");
+}
+
+/// The widened test must not reject an escalation that simply *worked*: a stiff attempt that
+/// reaches the end of its segment is kept, however hard it had to work to get there.
+#[test]
+fn a_finished_escalation_is_not_rejected_by_the_unfinished_test() {
+    let rhs = diagonal_rhs::<f64>(&[-1.0e4, -0.5]);
+    let mut stats = OdeSolverStats::default();
+    solve_ode_with_stats(
+        &rhs,
+        &[1.0, 1.0],
+        (0.0, 5.0),
+        &[],
+        &[5.0],
+        &loose(),
+        Some(&mut stats),
+    );
+    assert_eq!(stats.auto_stiff_segments, 1, "{stats:?}");
+    assert_eq!(stats.unfinished_segments, 0, "{stats:?}");
+    assert_eq!(stats.auto_stiff_rejected, 0, "{stats:?}");
+    assert_eq!(stats.auto_fallback_failed, 0, "{stats:?}");
 }
 
 /// The Gershgorin fast path is a *bound*, so it must never sit below the exact `|Re λ|max` —

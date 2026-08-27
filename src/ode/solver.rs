@@ -392,6 +392,36 @@ pub struct OdeSolverStats {
     /// probe was right that the system is stiff and wrong that this stiff method could
     /// integrate it; naming `rodas5p` (or `rosenbrock23`) explicitly is the next thing to try.
     pub auto_stiff_rejected: usize,
+    /// Rejected [`OdeMethod::Auto`] escalations whose pinned-explicit re-solve also failed:
+    /// it either stopped before the end of the segment or returned a non-finite saved state.
+    ///
+    /// A subset of [`auto_stiff_rejected`](Self::auto_stiff_rejected). The guard has no third
+    /// method to return in this case, so the caller still receives the explicit result; this
+    /// counter is the honest "both attempts failed" signal that makes that otherwise-silent
+    /// outcome visible in the fit's `ode_solver` warning (#1080).
+    ///
+    /// Like every other `auto` counter it is a floor, not a total: [`solve_ode_until_threshold`]
+    /// takes no stats, so a failure on the event-time path (TTE / adaptive dosing) is not
+    /// counted here and a zero is not by itself proof that every solve in the fit was clean.
+    pub auto_fallback_failed: usize,
+    /// Integration attempts that stopped before reaching the end of their segment and
+    /// freeze-padded the remaining output times with the last state.
+    ///
+    /// This counts attempts, including stiff attempts the `auto` guard later discarded.
+    /// Subtract [`discarded_unfinished_segments`](Self::discarded_unfinished_segments) to
+    /// obtain the number of unfinished trajectories the caller actually received.
+    ///
+    /// A roll-up, not a disjoint category. Every segment counted by
+    /// [`stiff_aborted_segments`](Self::stiff_aborted_segments) is by construction also counted
+    /// here (the budgeted abort only fires while `t < tf`), as is every segment that stopped
+    /// because its stepper could not form a step at `min_dt`. Do not add this to those
+    /// counters; the fit's `ode_solver` warning subtracts the abandoned ones before reporting
+    /// the rest, so its clauses stay disjoint. What is left over after that subtraction is
+    /// dominated by segments that exhausted [`OdeSolverOptions::max_steps`].
+    ///
+    /// It is a floor, not a total: [`solve_ode_until_threshold`] takes no stats, so segments
+    /// integrated on the event-time path (TTE / adaptive dosing) are not counted here.
+    pub unfinished_segments: usize,
     /// Integrations abandoned early because their min-`dt` clamps crossed
     /// [`OdeSolverOptions::stiff_abort_after`] (#708, #1080 Part B).
     ///
@@ -418,6 +448,9 @@ pub struct OdeSolverStats {
     /// rejected escalation contributes clamps here, and a diagnostic that did not separate
     /// them would tell every such fit its predictions were freeze-padded when they were not.
     pub discarded_clamped_steps: usize,
+    /// Of [`unfinished_segments`](Self::unfinished_segments), the attempts discarded by the
+    /// `auto` escalation guard before it re-solved the segment explicitly.
+    pub discarded_unfinished_segments: usize,
 }
 
 impl OdeSolverStats {
@@ -452,8 +485,11 @@ impl OdeSolverStats {
             auto_stiff_segments,
             auto_switched_segments,
             auto_stiff_rejected,
+            auto_fallback_failed,
+            unfinished_segments,
             stiff_aborted_segments,
             discarded_clamped_steps,
+            discarded_unfinished_segments,
         } = *other;
         self.attempted_steps += attempted_steps;
         self.accepted_steps += accepted_steps;
@@ -463,8 +499,11 @@ impl OdeSolverStats {
         self.auto_stiff_segments += auto_stiff_segments;
         self.auto_switched_segments += auto_switched_segments;
         self.auto_stiff_rejected += auto_stiff_rejected;
+        self.auto_fallback_failed += auto_fallback_failed;
+        self.unfinished_segments += unfinished_segments;
         self.stiff_aborted_segments += stiff_aborted_segments;
         self.discarded_clamped_steps += discarded_clamped_steps;
+        self.discarded_unfinished_segments += discarded_unfinished_segments;
     }
 
     /// Record an attempt that produced no usable step at `min_dt` (a singular Rosenbrock
@@ -997,6 +1036,9 @@ fn integrate_dense_g<T: PkNum>(
     // Written once here rather than inside `record`, which cannot see which stepper is active.
     if let Some(s) = stats.as_deref_mut() {
         s.stiff_min_step_clamped_steps += stiff_min_step_clamps;
+        if t < tf - 1e-15 {
+            s.unfinished_segments += 1;
+        }
     }
 
     // Fill any remaining saveat / interp times with the last state.
@@ -1597,8 +1639,9 @@ fn integrate_resolved_g<T: PkNum>(
 /// explicit family stayed clean (#978), and those failures are disjoint across methods — so a
 /// failed escalation is a known, recoverable outcome rather than an impossible one. When one
 /// happens the segment is re-solved with the explicit default and *that* result is what the
-/// caller gets, which bounds `auto`'s worst case to "the explicit answer, twice the cost"
-/// instead of a corrupted objective.
+/// caller gets. When that fallback finishes cleanly, this bounds `auto` to "the explicit
+/// answer, twice the cost"; when it does not, [`OdeSolverStats::auto_fallback_failed`] exposes
+/// that both attempts failed instead of presenting the retry as a successful repair.
 ///
 /// The guard is scoped to escalations. A named `ode_method` is honoured exactly as before,
 /// failed result included: a user who asked for `rodas4` gets `rodas4`, and a fixed method that
@@ -1680,9 +1723,17 @@ fn integrate_resolved_g_inner<T: PkNum>(
     // stepper, was escalated by a re-probe, and then integrated cleanly to the end has just
     // been rescued by the switch, and discarding it would re-solve it with pinned explicit —
     // the exact result the escalation avoided.
+    //
+    // A third failure shape, and the one neither test above can see (#1080 review): a stiff
+    // method can exhaust `max_steps` without ever reaching `min_dt`, which returns a finite,
+    // freeze-padded, partially-integrated trajectory with every other counter at zero. Reject
+    // it like the other two. Left unguarded it was indistinguishable from an unfinished
+    // *explicit* solve, whose remedy is the opposite one — raise `max_steps` or loosen the
+    // tolerances, rather than name a different stiff method.
     let ran_stiff = attempt.auto_stiff_segments > 0;
     let stalled = attempt.stiff_min_step_clamped_steps > 0;
-    let usable = !ran_stiff || (!stalled && finite_g(&out.0) && finite_g(&out.1));
+    let unfinished = attempt.unfinished_segments > 0;
+    let usable = !ran_stiff || (!stalled && !unfinished && finite_g(&out.0) && finite_g(&out.1));
     if !usable {
         attempt.auto_stiff_rejected = 1;
         // The clamps were taken, so they stay in `min_step_clamped_steps`; they are *also*
@@ -1692,6 +1743,7 @@ fn integrate_resolved_g_inner<T: PkNum>(
         // just did. For the same reason a budgeted abort inside a discarded attempt is not a
         // truncated *result*: it truncated an attempt nobody receives, so it is not counted.
         attempt.discarded_clamped_steps = attempt.min_step_clamped_steps;
+        attempt.discarded_unfinished_segments = attempt.unfinished_segments;
         attempt.stiff_aborted_segments = 0;
     }
     // The stiff attempt's steps stay counted either way — they were taken, and they cost what
@@ -1702,7 +1754,33 @@ fn integrate_resolved_g_inner<T: PkNum>(
     if usable {
         return out;
     }
-    run(OdeMethod::EXPLICIT_FALLBACK, &pinned_explicit, stats)
+    // Score the explicit re-solve separately too. Returning the rejected stiff attempt is no
+    // better when this one fails, and a third solve would only guess at another method, so the
+    // explicit result remains the deterministic fallback — but it must not be returned as if
+    // the guard repaired the segment. `auto_fallback_failed` is the production-visible "both
+    // attempts failed" signal requested in #1080.
+    //
+    // The two attempts are scored on deliberately different criteria. The stiff attempt is
+    // rejected on *any* stiff `min_dt` clamp, because its clamps are recorded as discarded and
+    // would otherwise leave no trace a caller could read; the fallback is scored on the
+    // returned trajectory only (unfinished, or non-finite), because its clamps are kept and
+    // reported directly through `min_step_clamped_steps` / `kept_clamped_steps`. A fallback
+    // that clamps its way to `tf` is the ordinary stability-limited outcome that clause already
+    // describes, not a second failure to re-report here.
+    let mut fallback = OdeSolverStats::default();
+    let fallback_out = run(
+        OdeMethod::EXPLICIT_FALLBACK,
+        &pinned_explicit,
+        Some(&mut fallback),
+    );
+    if fallback.unfinished_segments > 0 || !finite_g(&fallback_out.0) || !finite_g(&fallback_out.1)
+    {
+        fallback.auto_fallback_failed = 1;
+    }
+    if let Some(s) = stats.as_deref_mut() {
+        s.merge(&fallback);
+    }
+    fallback_out
 }
 
 /// Whether every saved state is finite, reading values only (`T = Dual2` decides identically
@@ -2330,6 +2408,36 @@ mod tests {
         assert!(stats.accepted_steps > 0, "stats = {stats:?}");
         assert!(stats.rejected_steps > 0, "stats = {stats:?}");
         assert_eq!(stats.min_step_clamped_steps, 0);
+    }
+
+    /// A segment can exhaust `max_steps` without ever touching `min_dt` — the fast-binding
+    /// failure shape recorded in #1080. The freeze-padded tail must have its own signal rather
+    /// than presenting the same stats as a completed solve.
+    #[test]
+    fn solve_ode_with_stats_counts_an_unfinished_segment_without_clamps() {
+        let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| du[0] = -u[0];
+        let opts = OdeSolverOptions {
+            max_steps: 1,
+            initial_dt: 0.1,
+            method: OdeMethod::Rk45,
+            ..OdeSolverOptions::default()
+        };
+        let mut stats = OdeSolverStats::default();
+        let result = solve_ode_with_stats(
+            &rhs,
+            &[1.0],
+            (0.0, 1.0),
+            &[],
+            &[1.0],
+            &opts,
+            Some(&mut stats),
+        );
+
+        assert_eq!(stats.attempted_steps, 1);
+        assert_eq!(stats.min_step_clamped_steps, 0);
+        assert_eq!(stats.unfinished_segments, 1);
+        assert_eq!(stats.discarded_unfinished_segments, 0);
+        assert_eq!(result.len(), 1, "the saveat contract remains freeze-padded");
     }
 
     #[test]
