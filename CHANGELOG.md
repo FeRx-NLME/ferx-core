@@ -316,6 +316,13 @@ section of the SDLC for the versioning policy).
   with no diagnostic from NONMEM (`nonmem_anchor/dose_attr_double_use_{A,B}.ctl`).
 
 ### Fixed
+- **Hidden parameter guards now produce a fit warning (#1099).** A free Theta at
+  the implicit `1e-10` / `1e9` cap, or an Omega, Omega-IOV, Sigma, or mixture
+  override pinned to an internal packed-space safety limit, emits the typed
+  `parameter_at_runaway_guard` warning. FIX'd coordinates remain excluded;
+  user-declared Theta bounds continue to use the separate `boundary_estimate`
+  warning. Lower hits are identified as collapse toward zero, while upper hits
+  are identified as runaway estimates.
 - **A closed-form model with IOV and a `[scaling] y = <expr>` readout evaluated the readout's
   individual parameters at `kappa = 0` — predictions and the objective were silently wrong
   (#1079).** The readout is the analogue of NONMEM's `$ERROR` and is evaluated per record, so an

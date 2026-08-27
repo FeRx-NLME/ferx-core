@@ -4574,6 +4574,11 @@ pub enum WarningCode {
     /// One or more THETA estimates are pinned to an optimizer bound — a sign of
     /// non-identifiability or a too-tight bound.
     BoundaryEstimate,
+    /// One or more optimizer coordinates are pinned to an internal guard: an
+    /// implicit THETA cap or an OMEGA / SIGMA safety limit. Unlike a declared
+    /// THETA bound, this is an implementation constraint, so the affected fit
+    /// result is not an interior optimum.
+    ParameterAtRunawayGuard,
     /// One or more THETA estimates have a large relative standard error — poorly
     /// estimated / imprecise parameters.
     InflatedRse,
@@ -4654,6 +4659,7 @@ impl WarningCode {
             WarningCode::EpsShrinkage => "eps_shrinkage",
             WarningCode::EtaShrinkage => "eta_shrinkage",
             WarningCode::BoundaryEstimate => "boundary_estimate",
+            WarningCode::ParameterAtRunawayGuard => "parameter_at_runaway_guard",
             WarningCode::InflatedRse => "inflated_rse",
             WarningCode::HighCorrelation => "high_correlation",
             WarningCode::DataQuality => "data_quality",
@@ -4845,6 +4851,11 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
     } else if lower.starts_with("eta shrinkage") || lower.contains(" eta shrinkage") {
         // Word-boundary match so "beta shrinkage" (or similar) does not collide.
         (WarningSeverity::Warning, WarningCode::EtaShrinkage)
+    } else if lower.contains("internal optimizer parameter guard") {
+        (
+            WarningSeverity::Warning,
+            WarningCode::ParameterAtRunawayGuard,
+        )
     } else if lower.contains("optimizer bound") {
         // Distinctive phrase; the eps-shrinkage message's "sigma at a bound" is
         // matched earlier and never reaches here.
