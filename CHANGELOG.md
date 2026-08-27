@@ -69,8 +69,9 @@ section of the SDLC for the versioning policy).
   identically zero at the declared initial condition — the one state at which such a model looks
   non-stiff — and it re-decides as the optimizer moves θ. An escalation that returns a non-finite
   trajectory, or that clamps at the minimum step (the freeze-pad failure that produces finite,
-  silently wrong output), is discarded and re-solved explicitly, so the worst case is the explicit
-  answer at twice the cost rather than a corrupted objective; the guard applies to `auto` only, and a
+  silently wrong output), is discarded and re-solved explicitly; if that fallback also fails, the
+  solver reports that both attempts were unusable rather than presenting the retry as a successful
+  repair. The guard applies to `auto` only, and a
   named `ode_method` is honoured exactly as before. Measured on ferx-testdata: the stiff cyclophosphamide model
   converges in 0.7 s at OFV 3241.708 (NONMEM FOCEI: 3241.721) where `rk45` spends 827 s
   without finishing one optimizer iteration, and a TMDD fit runs 372.4 s → 2.3 s at a
@@ -316,6 +317,11 @@ section of the SDLC for the versioning policy).
   with no diagnostic from NONMEM (`nonmem_anchor/dose_attr_double_use_{A,B}.ctl`).
 
 ### Fixed
+- **A failed `ode_method = auto` fallback is no longer reported as a successful repair
+  (#1080).** When the stiff attempt is rejected and its pinned-`rk45` re-solve also stops before
+  the segment end or returns non-finite output, the `ode_solver` warning now says that both
+  attempts failed. Solver statistics also distinguish unfinished attempts discarded by the guard
+  from unfinished trajectories actually returned to the caller.
 - **Hidden parameter guards now produce a fit warning (#1099).** A free Theta at
   the implicit `1e-10` / `1e9` cap, or an Omega, Omega-IOV, Sigma, or mixture
   override pinned to an internal packed-space safety limit, emits the typed

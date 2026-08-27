@@ -377,6 +377,15 @@ fn a_budgeted_abort_inside_an_escalation_is_still_rejected_by_the_guard() {
     // deliberately not counted — nobody received that trajectory.
     assert!(budgeted.stiff_aborted_segments >= 1);
     assert!(budgeted.discarded_clamped_steps > 0);
+    assert_eq!(
+        budgeted.auto_fallback_failed, 1,
+        "the explicit re-solve trips the same abort, so both attempts failed: {budgeted:?}"
+    );
+    assert_eq!(budgeted.unfinished_segments, 2, "one attempt per method");
+    assert_eq!(
+        budgeted.discarded_unfinished_segments, 1,
+        "only the stiff attempt was discarded; the explicit unfinished result was returned"
+    );
     assert!(
         budgeted.attempted_steps < unbudgeted.attempted_steps,
         "the budget must cost fewer steps: {} vs {}",
