@@ -11444,7 +11444,6 @@ struct SigmaSpec {
 struct BlockSigmaSpec {
     names: Vec<String>,
     lower_triangle: Vec<f64>,
-    fixed: bool,
 }
 
 /// Diagonal inter-occasion variability (kappa) specification.
@@ -12732,7 +12731,6 @@ fn parse_parameters(
             block_sigmas.push(BlockSigmaSpec {
                 names,
                 lower_triangle: values,
-                fixed,
             });
         } else if let Some(caps) = block_kappa_re.captures(line) {
             let names: Vec<String> = caps[1].split(',').map(|s| s.trim().to_string()).collect();
@@ -13294,7 +13292,6 @@ fn build_residual_correlations(
                 pos += 1;
             }
         }
-        let _fixed = block.fixed;
     }
     Ok(out)
 }

@@ -129,6 +129,8 @@ pub struct FitResult {
     pub theta_names: Vec<String>,
     pub omega: DMatrix<f64>,
     pub sigma: Vec<f64>,
+    pub sigma_names: Vec<String>,
+    pub residual_correlations: Vec<ResidualCorrelation>,
     pub covariance_matrix: Option<DMatrix<f64>>,
     pub se_theta: Option<Vec<f64>>,
     pub se_omega: Option<Vec<f64>>,
@@ -142,6 +144,12 @@ pub struct FitResult {
     pub warnings: Vec<String>,
 }
 ```
+
+For a model declared with `block_sigma`, `residual_correlations` contains the
+fixed off-diagonal correlations used by the fit. Together with the fitted
+sigma SDs, each residual covariance is reconstructible as
+`rho * sigma[sigma_i] * sigma[sigma_j]`. The field is empty for diagonal
+residual-error models.
 
 ## SubjectResult
 

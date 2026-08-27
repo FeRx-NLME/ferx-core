@@ -20,6 +20,10 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Correlated-residual fits now retain their fixed `block_sigma` correlations (#1100).**
+  `FitResult.residual_correlations`, JSON, `.fitrx`, and fit YAML now carry the declared
+  correlations, so consumers can reconstruct the fitted residual covariance without re-reading
+  the model source; diagonal-sigma output remains unchanged.
 - **Theta level blocks — hundreds of fixed effects from one declaration (#1064).**
   `theta PLACEBO[800](0.0, -10.0, 10.0)` declares 800 thetas sharing one init/bounds triple, read back
   by a *gather* — `PL = PLACEBO[PLA_IDX]`, where `PLA_IDX` is a 1-based data column. The data-driven

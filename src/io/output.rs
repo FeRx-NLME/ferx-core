@@ -2116,6 +2116,41 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         }
     }
 
+    if !result.residual_correlations.is_empty() {
+        writeln!(f, "\nblock_sigma:").map_err(|e| e.to_string())?;
+        for corr in &result.residual_correlations {
+            let name_i = result.sigma_names.get(corr.sigma_i).ok_or_else(|| {
+                format!(
+                    "residual correlation sigma_i index {} is out of bounds",
+                    corr.sigma_i
+                )
+            })?;
+            let name_j = result.sigma_names.get(corr.sigma_j).ok_or_else(|| {
+                format!(
+                    "residual correlation sigma_j index {} is out of bounds",
+                    corr.sigma_j
+                )
+            })?;
+            let sigma_i = result.sigma.get(corr.sigma_i).ok_or_else(|| {
+                format!(
+                    "residual correlation sigma_i index {} has no estimate",
+                    corr.sigma_i
+                )
+            })?;
+            let sigma_j = result.sigma.get(corr.sigma_j).ok_or_else(|| {
+                format!(
+                    "residual correlation sigma_j index {} has no estimate",
+                    corr.sigma_j
+                )
+            })?;
+            writeln!(f, "  {}__{}:", name_i, name_j).map_err(|e| e.to_string())?;
+            writeln!(f, "    covariance: {:.6}", corr.rho * sigma_i * sigma_j)
+                .map_err(|e| e.to_string())?;
+            writeln!(f, "    correlation: {:.6}", corr.rho).map_err(|e| e.to_string())?;
+            writeln!(f, "    fixed: true").map_err(|e| e.to_string())?;
+        }
+    }
+
     // IOV (KAPPA) block
     if let Some(ref iov) = result.omega_iov {
         writeln!(f, "\nomega_iov:").map_err(|e| e.to_string())?;
@@ -2446,6 +2481,7 @@ mod tests {
             omega: DMatrix::zeros(0, 0),
             sigma,
             sigma_names: (0..n).map(|i| format!("EPS_{}", i + 1)).collect(),
+            residual_correlations: Vec::new(),
             error_model,
             covariance_matrix: None,
             se_theta: None,
@@ -3142,6 +3178,7 @@ mod tests {
             omega: DMatrix::zeros(0, 0),
             sigma: vec![0.1],
             sigma_names: vec!["eps".to_string()],
+            residual_correlations: Vec::new(),
             error_model: ErrorModel::Proportional,
             covariance_matrix: None,
             se_theta: None,
@@ -3877,6 +3914,27 @@ mod tests {
             yaml_quote(&r.environment.username)
         )));
         assert!(yaml.contains(&format!("  ferx_version: {}", r.ferx_version)));
+    }
+
+    #[test]
+    fn write_yaml_emits_reconstructible_block_sigma() {
+        let mut r = make_sigma_only_result(ErrorModel::Combined, vec![0.2, 1.0]);
+        r.sigma_names = vec!["PROP_ERR".into(), "ADD_ERR".into()];
+        r.residual_correlations = vec![crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        }];
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+        let yaml = std::fs::read_to_string(&path).expect("yaml read");
+
+        assert!(yaml.contains("\nblock_sigma:"), "{yaml}");
+        assert!(yaml.contains("  PROP_ERR__ADD_ERR:"), "{yaml}");
+        assert!(yaml.contains("    covariance: 0.100000"), "{yaml}");
+        assert!(yaml.contains("    correlation: 0.500000"), "{yaml}");
+        assert!(yaml.contains("    fixed: true"), "{yaml}");
     }
 
     #[test]

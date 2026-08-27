@@ -1456,7 +1456,7 @@ pub struct SigmaVector {
 /// at runtime is `rho * sigma_i * sigma_j`, so the existing positive SD
 /// parameterization remains unchanged while off-diagonal residual covariance is
 /// carried into subject-level R matrices.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq)]
 pub struct ResidualCorrelation {
     pub sigma_i: usize,
     pub sigma_j: usize,
@@ -4932,6 +4932,13 @@ pub struct FitResult {
     pub sigma: Vec<f64>,
     /// Names of the sigma parameters, parallel to `sigma`.
     pub sigma_names: Vec<String>,
+    /// Residual-error correlations in force for this fit, copied from the model.
+    ///
+    /// These correlations are fixed by the `block_sigma` declaration rather
+    /// than estimated. Together with `sigma`, they make the fitted residual
+    /// covariance reconstructible as `rho * sigma[i] * sigma[j]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub residual_correlations: Vec<ResidualCorrelation>,
     /// Residual error model (additive, proportional, combined).
     ///
     /// For multi-endpoint (per-CMT) models this is only the *representative*
