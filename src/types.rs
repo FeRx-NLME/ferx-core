@@ -1456,7 +1456,7 @@ pub struct SigmaVector {
 /// at runtime is `rho * sigma_i * sigma_j`, so the existing positive SD
 /// parameterization remains unchanged while off-diagonal residual covariance is
 /// carried into subject-level R matrices.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq)]
 pub struct ResidualCorrelation {
     pub sigma_i: usize,
     pub sigma_j: usize,
@@ -4704,6 +4704,11 @@ pub enum WarningCode {
     /// One or more THETA estimates are pinned to an optimizer bound — a sign of
     /// non-identifiability or a too-tight bound.
     BoundaryEstimate,
+    /// One or more optimizer coordinates are pinned to an internal guard: an
+    /// implicit THETA cap or an OMEGA / SIGMA safety limit. Unlike a declared
+    /// THETA bound, this is an implementation constraint, so the affected fit
+    /// result is not an interior optimum.
+    ParameterAtRunawayGuard,
     /// One or more THETA estimates have a large relative standard error — poorly
     /// estimated / imprecise parameters.
     InflatedRse,
@@ -4784,6 +4789,7 @@ impl WarningCode {
             WarningCode::EpsShrinkage => "eps_shrinkage",
             WarningCode::EtaShrinkage => "eta_shrinkage",
             WarningCode::BoundaryEstimate => "boundary_estimate",
+            WarningCode::ParameterAtRunawayGuard => "parameter_at_runaway_guard",
             WarningCode::InflatedRse => "inflated_rse",
             WarningCode::HighCorrelation => "high_correlation",
             WarningCode::DataQuality => "data_quality",
@@ -4975,6 +4981,11 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
     } else if lower.starts_with("eta shrinkage") || lower.contains(" eta shrinkage") {
         // Word-boundary match so "beta shrinkage" (or similar) does not collide.
         (WarningSeverity::Warning, WarningCode::EtaShrinkage)
+    } else if lower.contains("internal optimizer parameter guard") {
+        (
+            WarningSeverity::Warning,
+            WarningCode::ParameterAtRunawayGuard,
+        )
     } else if lower.contains("optimizer bound") {
         // Distinctive phrase; the eps-shrinkage message's "sigma at a bound" is
         // matched earlier and never reaches here.
@@ -5062,6 +5073,13 @@ pub struct FitResult {
     pub sigma: Vec<f64>,
     /// Names of the sigma parameters, parallel to `sigma`.
     pub sigma_names: Vec<String>,
+    /// Residual-error correlations in force for this fit, copied from the model.
+    ///
+    /// These correlations are fixed by the `block_sigma` declaration rather
+    /// than estimated. Together with `sigma`, they make the fitted residual
+    /// covariance reconstructible as `rho * sigma[i] * sigma[j]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub residual_correlations: Vec<ResidualCorrelation>,
     /// Residual error model (additive, proportional, combined).
     ///
     /// For multi-endpoint (per-CMT) models this is only the *representative*

@@ -2117,6 +2117,13 @@ fn fit_inner(
         warnings.push(msg);
         native_warnings.push(entry);
     }
+    // Parameter estimates pinned to hidden packed-space implementation guards.
+    // This is distinct from a user-declared theta bound: the affected result
+    // reached an implementation safety limit (#1099).
+    if let Some((msg, entry)) = runaway_guard_warning(&result.params) {
+        warnings.push(msg);
+        native_warnings.push(entry);
+    }
     // Imprecisely estimated thetas (high relative standard error) — likewise
     // emitted typed at source with `details` (#781).
     if let Some((msg, entry)) = inflated_rse_warning(&se_theta, &result.params) {
@@ -2268,6 +2275,7 @@ fn fit_inner(
         omega: result.params.omega.matrix.clone(),
         sigma: result.params.sigma.values.clone(),
         sigma_names: result.params.sigma.names.clone(),
+        residual_correlations: model.residual_correlations.clone(),
         error_model: model.error_model,
         covariance_matrix: result.covariance_matrix,
         // The optimizer's exact packed vector (FOCE/FOCEI paths), so a later

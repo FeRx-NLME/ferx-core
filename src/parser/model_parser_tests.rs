@@ -5630,10 +5630,9 @@ fn test_parse_block_sigma_builds_sigmas_and_correlation() {
 #[test]
 fn test_parse_block_sigma_fix_marks_sigmas_fixed() {
     let lines = vec!["block_sigma (PROP, ADD) = [0.04, 0.10, 1.0] FIX".to_string()];
-    let (_, _, _, sigmas, block_sigmas, _, _, _, _, _) =
+    let (_, _, _, sigmas, _, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert!(sigmas.iter().all(|s| s.fixed));
-    assert!(block_sigmas[0].fixed);
 }
 
 #[test]
@@ -5670,7 +5669,6 @@ fn test_build_residual_correlations_zero_diagonal_errs() {
     let block = BlockSigmaSpec {
         names: vec!["A".to_string(), "B".to_string()],
         lower_triangle: vec![0.0, 0.1, 1.0],
-        fixed: true,
     };
     let names = vec!["A".to_string(), "B".to_string()];
     let err = build_residual_correlations(&[block], &names).unwrap_err();
@@ -5683,11 +5681,26 @@ fn test_build_residual_correlations_invalid_rho_errs() {
     let block = BlockSigmaSpec {
         names: vec!["A".to_string(), "B".to_string()],
         lower_triangle: vec![0.04, 0.10, 0.04],
-        fixed: true,
     };
     let names = vec!["A".to_string(), "B".to_string()];
     let err = build_residual_correlations(&[block], &names).unwrap_err();
     assert!(err.contains("invalid correlation"), "got: {err}");
+}
+
+#[test]
+fn test_build_residual_correlations_unit_rho_errs() {
+    // cov 0.04 with both variances 0.04 implies rho = 1 exactly, which makes
+    // the residual covariance matrix singular: reject it at parse time rather
+    // than let it surface as a NaN/Inf OFV mid-fit.
+    for cov in [0.04_f64, -0.04_f64] {
+        let block = BlockSigmaSpec {
+            names: vec!["A".to_string(), "B".to_string()],
+            lower_triangle: vec![0.04, cov, 0.04],
+        };
+        let names = vec!["A".to_string(), "B".to_string()];
+        let err = build_residual_correlations(&[block], &names).unwrap_err();
+        assert!(err.contains("|rho| < 1"), "got: {err}");
+    }
 }
 
 #[test]
@@ -5696,7 +5709,6 @@ fn test_build_residual_correlations_unknown_name_errs() {
     let block = BlockSigmaSpec {
         names: vec!["X".to_string(), "Y".to_string()],
         lower_triangle: vec![1.0, 0.5, 1.0],
-        fixed: true,
     };
     let names = vec!["A".to_string(), "B".to_string()];
     let err = build_residual_correlations(&[block], &names).unwrap_err();
@@ -5709,7 +5721,6 @@ fn test_build_residual_correlations_zero_covariance_omitted() {
     let block = BlockSigmaSpec {
         names: vec!["A".to_string(), "B".to_string()],
         lower_triangle: vec![0.04, 0.0, 1.0],
-        fixed: true,
     };
     let names = vec!["A".to_string(), "B".to_string()];
     let corrs = build_residual_correlations(&[block], &names).unwrap();
