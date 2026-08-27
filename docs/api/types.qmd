@@ -147,9 +147,18 @@ pub struct FitResult {
 
 For a model declared with `block_sigma`, `residual_correlations` contains the
 fixed off-diagonal correlations used by the fit. Together with the fitted
-sigma SDs, each residual covariance is reconstructible as
-`rho * sigma[sigma_i] * sigma[sigma_j]`. The field is empty for diagonal
+sigma SDs they reconstruct the **sigma-scale** covariance
+`Cov(EPS_i, EPS_j) = rho * sigma[sigma_i] * sigma[sigma_j]` — the same quantity
+NONMEM reports in a `$SIGMA BLOCK`. The field is empty for diagonal
 residual-error models.
+
+Note that this is *not* the entry of a subject's residual covariance matrix
+`R`. Each observation applies its own sigma *loadings* first, so the `R` term
+pairing observations `j` and `k` is `c_j * c_k * rho * sigma_i * sigma_j`,
+where `c` is `1` for an additive component and the individual prediction `f`
+for a proportional one. A consumer rebuilding `R` for, say, a paired
+total/unbound model must include the `f_total * f_unbound` factor; see
+[Error models](../model-file/error-model.qmd) for the full formula.
 
 ## SubjectResult
 

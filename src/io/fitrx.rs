@@ -1619,6 +1619,7 @@ fn validate_parallel_lengths(w: &FitWire) -> Result<(), FitrxError> {
             n_sigma
         ));
     }
+    let mut seen_corr_pairs = std::collections::HashSet::new();
     for corr in &w.sigma.residual_correlations {
         if corr.sigma_i >= n_sigma || corr.sigma_j >= n_sigma {
             return bail(format!(
@@ -1626,10 +1627,26 @@ fn validate_parallel_lengths(w: &FitWire) -> Result<(), FitrxError> {
                 corr.sigma_i, corr.sigma_j, n_sigma
             ));
         }
-        if corr.sigma_i == corr.sigma_j || !corr.rho.is_finite() || corr.rho.abs() > 1.0 {
+        // `|rho| == 1` is rejected alongside `> 1`: a perfectly correlated pair
+        // makes the subject-level `R` exactly singular, which would otherwise
+        // surface as a NaN/Inf OFV on the next evaluation rather than as a
+        // load-time error.
+        if corr.sigma_i == corr.sigma_j || !corr.rho.is_finite() || corr.rho.abs() >= 1.0 {
             return bail(format!(
                 "invalid sigma residual correlation ({}, {}, rho={})",
                 corr.sigma_i, corr.sigma_j, corr.rho
+            ));
+        }
+        // A repeated (i, j) pair would double-count the cross term in
+        // `cross_observation_covariance` and emit duplicate YAML keys.
+        let pair = (
+            corr.sigma_i.min(corr.sigma_j),
+            corr.sigma_i.max(corr.sigma_j),
+        );
+        if !seen_corr_pairs.insert(pair) {
+            return bail(format!(
+                "duplicate sigma residual correlation for pair ({}, {})",
+                pair.0, pair.1
             ));
         }
     }
@@ -2242,10 +2259,56 @@ mod tests {
                 sigma_j: 0,
                 rho: 1.5,
             },
+            // |rho| == 1 is singular, not merely extreme: reject it too.
+            crate::types::ResidualCorrelation {
+                sigma_i: 1,
+                sigma_j: 0,
+                rho: 1.0,
+            },
+            crate::types::ResidualCorrelation {
+                sigma_i: 1,
+                sigma_j: 0,
+                rho: -1.0,
+            },
+            crate::types::ResidualCorrelation {
+                sigma_i: 1,
+                sigma_j: 0,
+                rho: f64::NAN,
+            },
         ] {
             wire.sigma.residual_correlations = vec![invalid];
-            assert!(validate_parallel_lengths(&wire).is_err());
+            assert!(
+                validate_parallel_lengths(&wire).is_err(),
+                "accepted invalid correlation: {invalid:?}"
+            );
         }
+
+        // The same (i, j) pair twice would double-count the cross term.
+        wire.sigma.residual_correlations = vec![
+            crate::types::ResidualCorrelation {
+                sigma_i: 1,
+                sigma_j: 0,
+                rho: 0.5,
+            },
+            crate::types::ResidualCorrelation {
+                sigma_i: 0,
+                sigma_j: 1,
+                rho: 0.25,
+            },
+        ];
+        let err = validate_parallel_lengths(&wire).unwrap_err();
+        assert!(
+            format!("{err}").contains("duplicate sigma residual correlation"),
+            "got: {err}"
+        );
+
+        // A well-formed single pair still loads.
+        wire.sigma.residual_correlations = vec![crate::types::ResidualCorrelation {
+            sigma_i: 1,
+            sigma_j: 0,
+            rho: 0.5,
+        }];
+        assert!(validate_parallel_lengths(&wire).is_ok());
     }
 
     #[test]

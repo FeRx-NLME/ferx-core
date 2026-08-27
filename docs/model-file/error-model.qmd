@@ -701,7 +701,27 @@ identical exclusion in the likelihood) and stay independent.
 The fixed correlations are copied to `FitResult.residual_correlations`, so the
 residual covariance assumed by a fit remains available without re-reading the
 model source. The human-readable fit YAML also emits a `block_sigma` section
-with each named pair's fitted covariance and declared correlation.
+with each named pair's covariance and declared correlation:
+
+```yaml
+block_sigma:
+  ADD_ERR__PROP_ERR:
+    covariance: 0.100000
+    covariance_fixed: false
+    correlation: 0.500000
+    correlation_fixed: true
+```
+
+`covariance` is the **sigma-scale** covariance `rho * sigma_i * sigma_j`, the
+same quantity NONMEM prints for a `$SIGMA BLOCK` — not an entry of a subject's
+residual covariance matrix `R`. Each observation applies its own sigma loadings
+first, so the `R` term is `c_j * c_k * rho * sigma_i * sigma_j` with `c = 1`
+for an additive component and `c = f` (the individual prediction) for a
+proportional one — the `f_total * f_unbound * Cov(EPS_total, EPS_unbound)` form
+above. `correlation_fixed` is always `true` (the off-diagonal is converted to a
+fixed correlation); `covariance_fixed` is `true` only when both sigma SDs in
+the pair were declared `FIX`, since otherwise the SDs — and hence the
+covariance — moved during estimation.
 
 Under `method = focei` the off-diagonal covariance enters the interaction
 correction as well as the data term: the Almquist 2015 conditional Hessian

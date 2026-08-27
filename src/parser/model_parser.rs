@@ -13264,10 +13264,18 @@ fn build_residual_correlations(
                             block.names[row], block.names[col]
                         ));
                     }
-                    let rho = value / (vi.sqrt() * vj.sqrt());
-                    if !(rho.is_finite() && (-1.0..=1.0).contains(&rho)) {
+                    // Compare on the covariance scale with a single sqrt:
+                    // `sqrt(vi) * sqrt(vj)` rounds `cov == sqrt(vi·vj)` down to
+                    // rho = 0.999...8, which would slip past a `|rho| < 1` test.
+                    let max_abs_cov = (vi * vj).sqrt();
+                    let rho = value / max_abs_cov;
+                    // `|rho| == 1` is rejected alongside `> 1`: a perfectly
+                    // correlated pair makes the subject-level `R` exactly
+                    // singular, which would otherwise surface as a NaN/Inf OFV
+                    // mid-fit rather than as a parse-time error.
+                    if !(max_abs_cov.is_finite() && value.abs() < max_abs_cov) {
                         return Err(format!(
-                            "block_sigma covariance between '{}' and '{}' implies invalid correlation {}",
+                            "block_sigma covariance between '{}' and '{}' implies invalid correlation {} (must satisfy |rho| < 1)",
                             block.names[row], block.names[col], rho
                         ));
                     }

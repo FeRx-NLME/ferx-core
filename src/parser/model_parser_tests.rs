@@ -5688,6 +5688,22 @@ fn test_build_residual_correlations_invalid_rho_errs() {
 }
 
 #[test]
+fn test_build_residual_correlations_unit_rho_errs() {
+    // cov 0.04 with both variances 0.04 implies rho = 1 exactly, which makes
+    // the residual covariance matrix singular: reject it at parse time rather
+    // than let it surface as a NaN/Inf OFV mid-fit.
+    for cov in [0.04_f64, -0.04_f64] {
+        let block = BlockSigmaSpec {
+            names: vec!["A".to_string(), "B".to_string()],
+            lower_triangle: vec![0.04, cov, 0.04],
+        };
+        let names = vec!["A".to_string(), "B".to_string()];
+        let err = build_residual_correlations(&[block], &names).unwrap_err();
+        assert!(err.contains("|rho| < 1"), "got: {err}");
+    }
+}
+
+#[test]
 fn test_build_residual_correlations_unknown_name_errs() {
     // Valid covariance, but the block names are absent from `sigma_names`.
     let block = BlockSigmaSpec {
