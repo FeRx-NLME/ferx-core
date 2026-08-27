@@ -20,6 +20,11 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Fixed
+- **VI's bad-basin detector now reports `converged: false` (#1098).** An implausibly loose
+  final ELBO already identified a fit trapped far from a usable variational approximation, but
+  the result still exposed `converged: true` to programmatic consumers. Such fits are now demoted,
+  omit the misleading "increase `vi_iters`" warning, and carry the critical structured warning
+  code `vi_bad_basin`.
 - **`methods = [vi, laplace]` with `n_agq > 1` is no longer rejected (#1017).** `n_agq` is a
   chain-wide option, so the documented VI readout — `methods = [vi, laplace]`,
   `agq_eval_only = true`, which turns VI's ELBO lower bound into a real `−2 log L` — carries it
