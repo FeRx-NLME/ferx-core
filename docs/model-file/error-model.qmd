@@ -1,3 +1,8 @@
+---
+pagetitle: "Residual error models in ferx"
+description-meta: "Specify additive, proportional, combined, log-scale, censored, and multi-endpoint residual error models for population PK/PD analysis."
+---
+
 # Error Model
 
 > **Maturity: stable** — see [Feature Maturity](../maturity.qmd) for what this means.

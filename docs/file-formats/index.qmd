@@ -1,3 +1,7 @@
+---
+pagetitle: "ferx output and interchange file formats"
+---
+
 # File Formats
 
 Reference for the binary and structured output formats produced and consumed by ferx-core.

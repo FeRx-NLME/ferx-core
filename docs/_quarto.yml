@@ -6,9 +6,12 @@ brand: _brand.yml
 
 website:
   title: "ferx-core"
-  description: "Rust nonlinear mixed effects modeling engine for ferx"
+  description: "Open-source nonlinear mixed-effects modeling for population PK/PD and pharmacometrics"
   favicon: assets/ferx-favicon.svg
   site-url: https://ferx-nlme.github.io/ferx-core/
+  open-graph:
+    locale: en_US
+  twitter-card: true
   repo-url: https://github.com/FeRx-NLME/ferx-core
   repo-actions: [edit, issue]
 
@@ -153,6 +156,7 @@ website:
 
 format:
   html:
+    canonical-url: true
     theme:
       light: [cosmo, assets/ferx.scss]
       dark: [cosmo, assets/ferx-dark.scss]

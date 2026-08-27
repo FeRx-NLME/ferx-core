@@ -1,3 +1,7 @@
+---
+pagetitle: "FREM covariate analysis example"
+---
+
 # FREM (Covariate Analysis)
 
 This example demonstrates FREM covariate analysis using the warfarin

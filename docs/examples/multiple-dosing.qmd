@@ -1,3 +1,7 @@
+---
+pagetitle: "Multiple dosing with ADDL example"
+---
+
 # Multiple Dosing (ADDL Column)
 
 This example shows how the `ADDL` and `II` dataset columns are used to represent multiple-dose designs without repeating every dose row. The complete model file is [`examples/warfarin_addl.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/warfarin_addl.ferx).

@@ -1,3 +1,7 @@
+---
+pagetitle: "Adaptive Gaussian Quadrature (AGQ)"
+---
+
 # AGQ — Adaptive Gaussian Quadrature
 
 > **Maturity: beta** — see [Feature Maturity](../maturity.qmd) for what this means.

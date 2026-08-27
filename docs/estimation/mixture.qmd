@@ -1,3 +1,8 @@
+---
+pagetitle: "Mixture models in ferx"
+description-meta: "Fit latent subpopulation mixture models with FOCEI, SAEM, and Bayesian methods in the ferx NLME engine."
+---
+
 # Mixture Models
 
 > **Maturity: experimental** — see [Feature Maturity](../maturity.qmd) for what this means.

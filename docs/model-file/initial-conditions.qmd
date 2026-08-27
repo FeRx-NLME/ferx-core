@@ -1,3 +1,7 @@
+---
+pagetitle: "ODE initial conditions"
+---
+
 # Initial Conditions
 
 > **Maturity: beta** — see [Feature Maturity](../maturity.qmd) for what this means.

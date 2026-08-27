@@ -1,3 +1,7 @@
+---
+pagetitle: "LOQ-censored observations in ferx"
+---
+
 # LOQ-Censored Observations
 
 > **Maturity: beta** — see [Feature Maturity](../maturity.qmd) for what this means.

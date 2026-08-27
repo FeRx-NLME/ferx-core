@@ -1,3 +1,7 @@
+---
+pagetitle: "Population PK covariate model example"
+---
+
 # Covariate Model
 
 This example demonstrates a two-compartment oral model with body weight (WT) and creatinine clearance (CRCL) as covariates on clearance.

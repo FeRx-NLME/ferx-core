@@ -1,3 +1,8 @@
+---
+pagetitle: "Importance Sampling (IMP) for NLME models"
+description-meta: "Use importance sampling in ferx to estimate or evaluate the marginal likelihood of nonlinear mixed-effects population PK/PD models."
+---
+
 # Importance Sampling (IMP)
 
 > **Maturity: beta** — see [Feature Maturity](../maturity.qmd) for what this means.

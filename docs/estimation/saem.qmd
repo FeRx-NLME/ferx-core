@@ -1,3 +1,8 @@
+---
+pagetitle: "SAEM estimation for population PK/PD"
+description-meta: "Fit complex nonlinear mixed-effects population PK/PD models with Stochastic Approximation Expectation-Maximization in ferx."
+---
+
 # SAEM
 
 > **Maturity: beta** — see [Feature Maturity](../maturity.qmd) for what this means.

@@ -1,3 +1,7 @@
+---
+pagetitle: "Packed NLME parameter space"
+---
+
 # Packed Parameter Space
 
 Every optimizer, the covariance step, SIR, and simulation-with-uncertainty

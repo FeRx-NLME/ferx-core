@@ -1,3 +1,8 @@
+---
+pagetitle: "Time-to-event models in ferx"
+description-meta: "Fit parametric, censored, competing-risk, repeated-event, and joint PK time-to-event models with FOCEI or SAEM in ferx."
+---
+
 # Time-to-Event (TTE) Models
 
 > **Maturity: beta** — see [Feature Maturity](../maturity.qmd) for what this means.
