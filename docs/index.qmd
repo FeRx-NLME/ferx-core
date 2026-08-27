@@ -10,8 +10,6 @@ population pharmacokinetic and pharmacodynamic (**PopPK/PD**) analysis. Its
 high-performance Rust engine supports established pharmacometric methods and
 NONMEM-compatible data through a command-line interface, Rust API, and
 [R package](https://ferx-nlme.github.io/ferx-book/).
-It provides a fully open-source alternative for workflows familiar to users of
-NONMEM, Monolix, and Pumas.
 
 [Install ferx](installation.qmd) or [run your first PopPK model](quick-start.qmd).
 
