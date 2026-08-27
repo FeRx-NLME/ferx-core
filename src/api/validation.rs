@@ -2344,13 +2344,22 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     // `chain.contains`. An unconverged pure-GN run at n_eta = 0 additionally
     // pushes a post-fit warning (`gauss_newton.rs`), under the same rule, since
     // `Converged: NO` is the state that actually predicts the bad answer.
+    // `eval_only` mirrors `fit()`'s construction: the methods running as pure
+    // likelihood evaluators for this fit, which therefore cede "last estimating
+    // stage" to the estimator before them. `laplace` joins `imp` here because
+    // `agq_eval_only` makes it an evaluator the same way `imp_eval_only` does.
+    let mut eval_only: Vec<EstimationMethod> = Vec::new();
+    if options.imp_eval_only {
+        eval_only.push(EstimationMethod::Imp);
+    }
+    if options.agq_eval_only {
+        eval_only.push(EstimationMethod::Laplace);
+    }
     if model.n_eta == 0
         && chain
             .iter()
             .rposition(|&m| m == EstimationMethod::FoceGn)
-            .is_some_and(|idx| {
-                crate::api::is_last_estimating_stage(&chain, idx, options.imp_eval_only)
-            })
+            .is_some_and(|idx| crate::api::is_last_estimating_stage(&chain, idx, &eval_only))
     {
         diags.push(
             Diagnostic::warning(
@@ -2364,6 +2373,77 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
             )
             .with_block("fit_options"),
         );
+    }
+
+    // VI's scope limits are about the *objective*, not the gradient: its data term
+    // is the fixed-η observation NLL, which omits non-Gaussian endpoint rows and
+    // has no κ channel. Both would be silently wrong rather than merely slow, so
+    // they are refused up front rather than caught at run time.
+    if chain.iter().any(|&m| m == EstimationMethod::Vi) {
+        if let Some(reason) = crate::estimation::vi::unsupported_data_term_reason(model) {
+            diags.push(
+                Diagnostic::error("E_VI_MODEL_UNSUPPORTED", &reason).with_block("fit_options"),
+            );
+        }
+        if model.is_sde() {
+            diags.push(
+                Diagnostic::error(
+                    "E_VI_MODEL_UNSUPPORTED",
+                    "method = vi is not compatible with a [diffusion] block: the EKF \
+                     likelihood is not the fixed-eta observation NLL that VI's data term \
+                     evaluates. Use method = foce or method = focei.",
+                )
+                .with_block("fit_options"),
+            );
+        }
+        // `n_agq` is a *chain* option, not a per-stage one, so a chain that pairs VI
+        // with a quadrature stage — the documented `methods = [vi, laplace]`,
+        // `agq_eval_only = true` readout, which turns VI's ELBO lower bound into a real
+        // −2 log L — legitimately carries `n_agq > 1`: the grid belongs to the Laplace
+        // stage, and VI ignores it. Reject only when *no* stage consumes it, i.e. when
+        // the user has set `n_agq` on a VI-only chain and would otherwise believe it did
+        // something. `focei` consumes `n_agq > 1` as the Gauss-Newton-anchored quadrature;
+        // `laplace` consumes it at any `n_agq`.
+        let consumes_n_agq = chain
+            .iter()
+            .any(|&m| matches!(m, EstimationMethod::Laplace | EstimationMethod::FoceI));
+        if options.n_agq > 1 && !consumes_n_agq {
+            diags.push(
+                Diagnostic::error(
+                    "E_VI_NAGQ_UNSUPPORTED",
+                    "n_agq applies to method = laplace / focei quadrature, not to method = vi, \
+                     which integrates over its variational posterior rather than a \
+                     Gauss-Hermite grid. Remove n_agq, or chain `methods = vi, laplace`.",
+                )
+                .with_block("fit_options"),
+            );
+        }
+        // `vi_kl = mc` + `vi_omega_update = adam` is the *only* combination in which
+        // nothing anchors Ω: the closed form is gone, and the gradient replacing it is
+        // now sampled rather than exact. Each option alone is fine — with `adam` under
+        // the analytic KL, ∂KL/∂Ω is exact; with `mc` under the closed form, Ω never
+        // enters the stochastic optimization at all. Together they reproduce precisely
+        // the setup whose Ω instability Janssen et al. report (their Fig. 3), so it is
+        // worth saying so rather than letting a user rediscover it. A warning and not
+        // an error: reproducing the published behaviour is a legitimate thing to ask
+        // for, and it is the reason both options exist.
+        if options.vi_kl == crate::types::ViKl::Mc
+            && options.vi_omega_update == crate::types::ViOmegaUpdate::Adam
+        {
+            diags.push(
+                Diagnostic::warning(
+                    "W_VI_OMEGA_UNANCHORED",
+                    "vi_kl = mc with vi_omega_update = adam leaves Omega driven entirely by a \
+                     Monte-Carlo gradient: the closed-form maximizer is disabled and the \
+                     gradient that replaces it is now sampled rather than exact. This is the \
+                     configuration Janssen et al. (2024) report Omega fluctuating badly in. \
+                     Expect a noisy Omega trace and possible non-convergence. Keep \
+                     vi_omega_update = closed_form (still exact in expectation under a sampled \
+                     KL), or raise vi_mc_samples substantially.",
+                )
+                .with_block("fit_options"),
+            );
+        }
     }
 
     // SDE ([diffusion]) is incompatible with SAEM, with the Gauss-Newton
@@ -2644,12 +2724,22 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                     | EstimationMethod::Saem
                     | EstimationMethod::Imp
                     | EstimationMethod::Laplace
+                    // VI's data term is `obs_nll_subject_grad`, whose non-IOV path already
+                    // routes a dense `R` through the same full-FD fallback FOCE/SAEM use
+                    // (`fixed_eta_gradient.rs`: `fd_all` when `residual_correlations` is
+                    // non-empty), so the objective and its θ/σ gradient are correct here.
+                    // Only the *closed-form* σ maximizer is unavailable, and
+                    // `closed_form_sigma_support` already declines it with a recorded reason
+                    // and falls back to Adam — which is what the option docs promise.
+                    // block_sigma + IOV is rejected separately
+                    // (`E_BLOCK_SIGMA_IOV_UNSUPPORTED`), so the IOV path is never reached.
+                    | EstimationMethod::Vi
             ) {
                 diags.push(
                     Diagnostic::error(
                         "E_BLOCK_SIGMA_METHOD_UNSUPPORTED",
                         "block_sigma correlated residual errors are currently supported for \
-                         method = foce, focei, saem, imp, agq, and laplace only. The gn / \
+                         method = foce, focei, saem, imp, agq, laplace, and vi only. The gn / \
                          gn_hybrid Gauss-Newton paths still use diagonal residual-error \
                          derivatives.",
                     )
@@ -2761,6 +2851,34 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                      populated with a log-likelihood computed at parameters that the following \
                      stage then overwrites. Move `imp` to the end, or drop `imp_eval_only` to run \
                      it as an estimator.",
+                )
+                .with_block("fit_options"),
+            );
+        }
+    }
+
+    // `agq_eval_only` turns a `laplace` stage into a likelihood *evaluator* rather than an
+    // estimator, so the same terminal-stage rule as `imp_eval_only` applies: an evaluator
+    // mid-chain would report a `−2 log L` computed at parameters the next stage overwrites.
+    if options.agq_eval_only {
+        if !chain.contains(&EstimationMethod::Laplace) {
+            diags.push(
+                Diagnostic::error(
+                    "E_AGQ_EVAL_ONLY",
+                    "`agq_eval_only = true` requires a `laplace` stage — it is what evaluates \
+                     the adaptive-quadrature marginal likelihood. Add `laplace` to `methods` \
+                     (e.g. `methods = vi, laplace`), or drop `agq_eval_only`.",
+                )
+                .with_block("fit_options"),
+            );
+        } else if chain.last().copied() != Some(EstimationMethod::Laplace) {
+            diags.push(
+                Diagnostic::error(
+                    "E_AGQ_EVAL_ONLY",
+                    "method `laplace` with `agq_eval_only = true` must be the final stage of \
+                     the chain — placing the evaluator mid-chain would report a `−2 log L` \
+                     computed at parameters that the following stage then overwrites. Move \
+                     `laplace` to the end, or drop `agq_eval_only` to run it as an estimator.",
                 )
                 .with_block("fit_options"),
             );
@@ -3433,6 +3551,10 @@ mod residual_magnitude_tests;
 #[cfg(test)]
 #[path = "tests/kappa_weight_tests.rs"]
 mod kappa_weight_tests;
+
+#[cfg(test)]
+#[path = "tests/vi_option_tests.rs"]
+mod vi_option_tests;
 
 /// Feature-presence (data-independent) *warning*-level checks for experimental
 /// features (issue #175). Stochastic differential equations and neural-network

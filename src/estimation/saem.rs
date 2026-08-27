@@ -3563,6 +3563,7 @@ pub fn run_saem(
         cond_dist,
         packed_estimate: None,
         mixture_posteriors,
+        vi: None,
     })
 }
 

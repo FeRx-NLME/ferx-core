@@ -1,0 +1,58 @@
+# VI on the mixed omega with a MEAN-FIELD q -- the diagonal-covariance arm.
+#
+# The claim under test, from docs/estimation/vi.qmd (line ~151): mean_field costs "a looser
+# bound whenever the true posterior is correlated, which for CL/V it almost always is". That
+# rests on theory alone today, and section 4.9 makes `emvi` the external check because the two
+# families match by name (`viFamily = "meanField"`).
+#
+# Everything but `vi_family` is identical to vi_block_closed_form.ferx, deliberately -- the
+# correlated (ETA_CL, ETA_V) block is the whole point, since on a diagonal Omega the two
+# families have nothing to disagree about (family_tests.rs:499 pins them as exactly equal
+# there).
+#
+# WHAT THIS ARM CAN AND CANNOT SHOW. Measured 2026-08-20, this arm converges to a sigma 14.5%
+# below the full_rank arm's (0.011863 vs 0.013878), which moves its Laplace OFV by 8 units.
+# The two -2*ELBO values therefore sit at DIFFERENT (theta, Omega, sigma), and the ELBO is a
+# bound on -2 log L at whatever parameter vector it was evaluated. So the difference between
+# the arms is a mixture of the family effect and the parameter difference, and it does NOT
+# isolate bound looseness. Reported here as a directional observation only.
+#
+# Isolating the family effect needs both q families evaluated at ONE parameter vector, which
+# no CLI option reaches today -- it is a Tier-1 unit test over elbo_agq_bound.rs, in the shape
+# family_tests.rs already uses (it loops the families over a fixed fixture). That test, not
+# this arm, is what would actually close the vi.qmd claim.
+#
+# elbo_tightness_ratio is NOT the measure to read for looseness either: it is excess over
+# Sum(d_i/2), a health diagnostic (elbo.rs:1067) whose denominator is d=3 for both families.
+[parameters]
+  theta TVCL(0.13, 0.001, 10.0)
+  theta TVV(8.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+
+  block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]
+  omega ETA_KA ~ 0.30
+
+  sigma PROP_ERR ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method = vi
+  vi_family = mean_field
+  # 128 draws, not the default 8. The convergence rule stops when the ELBO's drift falls below
+  # its own Monte-Carlo noise floor, and at 8 draws it does so while real drift remains: on this
+  # model that left the fit 9.4 OFV short of AGQ. More draws, not more iterations, is the lever
+  # (docs/estimation/vi.qmd, "How sigma is updated"). A comparison run must be converged or it
+  # measures the stopping rule rather than the estimator.
+  vi_mc_samples = 128
+  vi_omega_update = closed_form
+  vi_final_ofv = laplace

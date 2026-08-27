@@ -22,3 +22,4 @@ pub mod sir;
 pub mod trace;
 pub mod trust_region;
 pub mod uncertainty_samples;
+pub mod vi;

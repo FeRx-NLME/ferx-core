@@ -1,0 +1,44 @@
+# VI on the mixed omega, Omega stepped by ADAM -- one of the two routes whose structural-zero
+# preservation this arm checks externally (VI_VALIDATION.md 4.9).
+#
+# The claim under test, from docs/estimation/vi.qmd: in a mixed Omega the undeclared
+# off-diagonals are held "at exactly zero rather than letting them pick up sampling
+# correlation", for BOTH vi_omega_update routes. Internally that is pinned by
+# run_tests.rs::mixed_omega_keeps_its_structural_zeros_through_a_fit; nlmixr2 `emvi` is the
+# only external implementation that estimates a block Omega at all (`fbvi` errors on one),
+# so it is the only outside check that exists.
+#
+# Read Omega(KA,CL) / Omega(KA,V) off the fit YAML by ABSENCE: io/output.rs emits an
+# `ETA_x__ETA_y:` entry for every pair with |cov| > 1e-15, so no entry means the slot held.
+[parameters]
+  theta TVCL(0.13, 0.001, 10.0)
+  theta TVV(8.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+
+  block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]
+  omega ETA_KA ~ 0.30
+
+  sigma PROP_ERR ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method = vi
+  vi_family = full_rank
+  # 128 draws, not the default 8. The convergence rule stops when the ELBO's drift falls below
+  # its own Monte-Carlo noise floor, and at 8 draws it does so while real drift remains: on this
+  # model that left the fit 9.4 OFV short of AGQ. More draws, not more iterations, is the lever
+  # (docs/estimation/vi.qmd, "How sigma is updated"). A comparison run must be converged or it
+  # measures the stopping rule rather than the estimator.
+  vi_mc_samples = 128
+  vi_omega_update = adam
+  vi_final_ofv = laplace

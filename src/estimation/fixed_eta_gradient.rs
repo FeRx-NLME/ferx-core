@@ -75,10 +75,13 @@ pub(crate) fn obs_nll_subject_into_iov(
     let err_keys = model.error_spec.obs_keys(subject);
     let mut total_nll = 0.0_f64;
     for j in 0..subject.observations.len() {
-        // Floors protect log(0) in the M-step objective. individual_nll_iov
-        // (the E-step evaluator) does not floor — see obs_nll_subject_grad_iov
-        // for why the asymmetry is intentional.
-        let f = preds[j].max(1e-12);
+        // The *variance* floor protects log(0) in the M-step objective. The
+        // prediction goes through `floor_prediction`, which is a no-op under LTBS:
+        // there `f` is log(c) and legitimately negative, and flooring it silently
+        // fabricated a residual — the M-step and the E-step evaluator
+        // (individual_nll_iov, which never floored) then disagreed on the same
+        // model. They now agree on both scales.
+        let f = model.floor_prediction(preds[j]);
         let v = match frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x) {
             Some(vv) => vv.max(1e-12),
             None => (model.residual_variance_at_scaled(
@@ -239,7 +242,7 @@ pub(crate) fn obs_nll_subject_grad_iov(
 
     for j in 0..n_obs {
         let cmt = err_keys[j];
-        let f = preds[j].max(1e-12);
+        let f = model.floor_prediction(preds[j]);
         let mult_j = ruv_mult.as_ref().map(|m| m[j].as_slice());
         let frem_vj = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
         let s = if frem_vj.is_some() { 1.0 } else { ruv_scale };
@@ -495,7 +498,7 @@ pub(crate) fn obs_nll_subject_grad(
 
     for j in 0..n_obs {
         let cmt = err_keys[j];
-        let f = preds_base[j].max(1e-12);
+        let f = model.floor_prediction(preds_base[j]);
         let mult_j = ruv_mult.as_ref().map(|m| m[j].as_slice());
         let frem_vj = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
         let s = if frem_vj.is_some() { 1.0 } else { ruv_scale };
@@ -600,7 +603,7 @@ pub(crate) fn obs_nll_subject_grad(
         }
         let g: f64 = (0..n_obs)
             .map(|j| {
-                let f = preds_base[j].max(1e-12);
+                let f = model.floor_prediction(preds_base[j]);
                 let v = variances[j];
                 let resid = residuals[j];
                 // ratio = d(V_j)/d(log sigma_k); zero unless sigma_k enters

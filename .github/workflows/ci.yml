@@ -153,6 +153,7 @@ jobs:
             --test nn_fit_smoke \
             --test tte_convergence \
             --test tte_smoke \
+            --test vi_dcm_omega_recovery \
             --test zero_omega_fit \
             --lcov --output-path lcov.info
 

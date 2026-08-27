@@ -826,6 +826,7 @@ pub fn optimize_trust_region(
         // step bit-for-bit instead of re-decomposing `omega` (#816 follow-up).
         packed_estimate: Some(best_x.clone()),
         mixture_posteriors: None,
+        vi: None,
     }
 }
 

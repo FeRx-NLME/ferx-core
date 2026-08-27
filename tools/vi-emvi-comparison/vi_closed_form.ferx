@@ -1,0 +1,33 @@
+[parameters]
+  theta TVCL(0.13, 0.001, 10.0)
+  theta TVV(8.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+
+  sigma PROP_ERR ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method = vi
+  vi_family = full_rank
+  # 128 draws, not the default 8. The convergence rule stops when the ELBO's drift falls below
+  # its own Monte-Carlo noise floor, and at 8 draws it does so while real drift remains: on this
+  # model that left the fit 9.4 OFV short of AGQ. More draws, not more iterations, is the lever
+  # (docs/estimation/vi.qmd, "How sigma is updated"). A comparison run must be converged or it
+  # measures the stopping rule rather than the estimator.
+  vi_mc_samples = 128
+  vi_omega_update = closed_form
+  vi_final_ofv = laplace

@@ -19,6 +19,68 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Fixed
+- **`vi_mc_samples` now defaults to 32, not 8 (#1017).** This draw count sets the noise floor
+  VI's settling test measures against, so it decides *where a fit stops* — and therefore what is
+  certified — rather than merely how noisy the trace is. At 8, on `data/warfarin.csv` (~1%
+  proportional residual), `σ` landed 31% above the `0.010565` both AGQ (`n_agq = 9`) and FOCEI
+  give, with the OFV 9.6 units short of AGQ's `−285.977`, and it was not reliably flagged: the
+  drift check only demotes a run still descending when it stops, and at 8 draws the run can
+  instead settle at a biased fixed point where the trace tail has genuinely plateaued and
+  `elbo_tightness_ratio` reads a healthy `0.989` — `vi_seed = 99` with otherwise default options
+  returned `converged: true` at `σ = 0.013761`. At 32, `σ` is +10% with the OFV within 1.4 units
+  and no seed tried certified a materially wrong fit (a bad-basin seed was correctly reported
+  `converged: false`). Cost is sublinear, because a lower noise floor also settles sooner: 4× the
+  draws cost ~2.3× the wall time (3.4 s → 7.7 s on this fit). Set `vi_mc_samples = 8` explicitly
+  to restore the old behaviour, and check `σ` against a `laplace` / `focei` fit if you do.
+- **`methods = [vi, laplace]` with `n_agq > 1` is no longer rejected (#1017).** `n_agq` is a
+  chain-wide option, so the documented VI readout — `methods = [vi, laplace]`,
+  `agq_eval_only = true`, which turns VI's ELBO lower bound into a real `−2 log L` — carries it
+  legitimately: the grid belongs to the Laplace stage and VI ignores it. The check rejected it
+  for the whole chain, making the recommended path impossible to ask for. It now fires only
+  when no stage consumes the option (a VI-only chain).
+- **A VI run that stops while its objective is still falling no longer reports `converged: true`
+  (#1017).** The settling test asks whether the ELBO's remaining drift is distinguishable from
+  Monte-Carlo noise; at a low `vi_mc_samples` that can become true while the objective is still
+  descending, so the fit stopped short and certified itself. A sign test over the trace tail now
+  separates a real trend from noise — below the amplitude of any single window comparison, which
+  is what makes such drift invisible to the settling test — and a run stopped that way reports
+  `converged: false` with a warning naming `vi_mc_samples`.
+
+  **The sign test alone did not make the old `vi_mc_samples = 8` safe on a small residual
+  error, which is why the default moved to 32 (see above).** On
+  `data/warfarin.csv` (~1% proportional residual) the default draw count lands `σ ≈ 0.0138`
+  against `0.010565` from both AGQ (`n_agq = 9`) and FOCEI — 31% high, OFV 9.4–9.6 units short of
+  AGQ's `−285.977`, and every variational covariance ~1.7× too wide. The sign test catches this
+  only in the regime where the run is still descending at the `vi_iters` ceiling. It can also
+  settle at a *biased fixed point* of the sampled objective, where the trace tail has genuinely
+  plateaued and no trend test can see anything: with `vi_seed = 99` and otherwise default options
+  the fit stops at 17 125 iterations reporting `converged: true` at `σ = 0.013761`. Raise
+  `vi_mc_samples` (32 → 1.4 OFV, 128 → 0.37) or check `σ` against a `laplace`/`focei` fit when the
+  residual error is under ~3%. See the [VI page](docs/estimation/vi.qmd).
+- **VI's early stopping now requires the per-subject posteriors to have settled, not just the
+  population parameters (#1017).** Either convergence criterion is sufficient, and the
+  parameter-stability one measured only the packed `(θ, Ω, σ)` vector. A chain in which the
+  population coordinates settle first — or in which most are FIXed — could therefore stop and
+  return a still-moving variational posterior as converged, which is the object a VI fit exists
+  to produce. Both halves are now judged on the same window and tolerance.
+- **`block_sigma` correlated residual errors work with `method = vi` (#1017).** The option docs
+  said this configuration falls back to Adam on `σ`, and the code implements that, but the
+  check-time allow-list omitted VI, so every `block_sigma` + VI fit was refused before the
+  fallback could run. VI's data term routes a dense `R` through the same full-FD path FOCE and
+  SAEM use, so it is supported; only the closed-form `σ` maximizer is not, and that declines
+  with a recorded reason as documented.
+- **A VI block overtaken by a later estimating stage now says so (#1017).** On
+  `methods = [vi, focei]` the reported θ/Ω/σ and subject diagnostics come from FOCEI while
+  `vi.eta_means`, `eta_covs`, both ELBO halves and `elbo_tightness_ratio` still describe VI's
+  parameter point. The block is still reported — a trailing `agq_eval_only` / `imp_eval_only`
+  readout does not move the estimates, and the variational covariance is the only per-subject
+  one in the result — but it now carries `superseded_by` (in the API and the fit YAML) naming
+  the stage that moved on, plus a warning.
+- **Subject IDs in the VI posterior YAML are quoted (#1017).** `id: 001` parsed back as the
+  integer `1`, and an ID containing `:` or `#` could change the document's shape or truncate the
+  value — defeating the point of keying the posterior by the original subject ID.
+
 ### Added
 - **Correlated-residual fits now retain their fixed `block_sigma` correlations (#1100).**
   `FitResult.residual_correlations`, JSON, `.fitrx`, and fit YAML now carry the declared
@@ -831,6 +893,78 @@ section of the SDLC for the versioning policy).
   no longer mediates every observation — and models with no `[covariate_nn]` block are
   untouched.
 
+### Added
+- **`vi_sigma_update`** — `σ` can now be replaced each iteration by the **exact** ELBO maximizer
+  rather than stepped by Adam, the same treatment `Ω` already gets from
+  `vi_omega_update = closed_form`. For a single proportional or additive `σ`, stationarity of the
+  data term gives `σ*² = (1/n_obs) · Σ E_q[(y − f(η))²/f(η)²]`, and the same identity expresses
+  that sum in terms of the `σ` gradient the ELBO already computes, so the update costs nothing.
+  `closed_form` is the default; `adam` restores the previous behaviour. Error structures with no
+  scalar stationary point (combined error, several `σ`, per-endpoint or covariate-selected error,
+  correlated residuals, M3 BLOQ, IIV-on-RUV, FREM, or a FIXed `σ`) fall back to Adam with the
+  reason recorded in `FitResult$warnings`.
+
+  **What this does and does not buy.** It makes `σ` exact given `q` and removes it from the
+  stochastic trajectory, so `σ` no longer carries its own `vi_lr` sensitivity. It is *not* what
+  closes the warfarin gap below — at `vi_mc_samples = 128` the two routes agree to 0.3 OFV, and
+  Adam is marginally ahead. Adopted for exactness and consistency with `Ω`, not for a measured
+  improvement at converged settings.
+
+### Changed
+- **The documented size of VI's posterior-variance understatement is now measured rather than
+  cited.** `docs/estimation/vi.qmd` presented "on the order of 20–25%" as a general figure; it is
+  the number for deep compartment models. Measured against per-subject NUTS at a fixed population
+  estimate, ferx's variational posterior matches the exact posterior to **0.2%** in variance on
+  warfarin (means to `2×10⁻⁵`), and to 4% when thinned to two observations a subject. The Laplace
+  covariance matches NUTS to 0.1% on the same fits, so the true posterior is Gaussian there and a
+  Gaussian `q` has nothing to get wrong. The page now reports the measurements and scopes the
+  citation to the regime it came from.
+
+### Fixed
+- **`method = vi` no longer reports `converged: true` after ~500 iterations when every population
+  parameter is FIXed.** Fitting `q` alone at a pinned `(θ, Ω, σ)` — how you read per-subject
+  posteriors at a known estimate — is a legitimate request, but VI's parameter-stability
+  convergence test was comparing a vector that cannot move against itself, reporting "settled" at
+  its first opportunity and stopping the run. Since either convergence criterion is sufficient,
+  that overrode the objective test, which had correctly reported "still moving". On warfarin with
+  everything FIXed at a known-good estimate the fit stopped after 500 iterations with
+  `elbo_tightness_ratio: 78` (implausible above 25) and `−2·ELBO = +2026`, on a model that reaches
+  `−283` once `φ` converges; it now runs 6250 iterations to `−282.6` with a ratio of `1.4`. When no
+  population coordinate is free, convergence is judged on the objective alone and a warning says
+  so.
+
+### Changed
+- **`method = vi` needs more Monte-Carlo draws than the default provides.** On
+  `data/warfarin.csv` (~1% proportional residual), `vi_mc_samples = 8` (the default) returns
+  `σ ≈ 0.0138` against `0.010565` from both AGQ (`n_agq = 9`) and FOCEI — 31% high — with the OFV
+  9.4–9.6 units short of AGQ's `−285.977`. Because per-subject posterior width scales with `σ²`,
+  every variational covariance reported at that point is ~1.7× too wide. The cause is the
+  convergence rule meeting its own noise floor: it stops when the ELBO's drift is no longer
+  distinguishable from Monte-Carlo noise, and at 8 draws that happens while real drift remains —
+  so the fit stops short and `σ`, the slowest-moving coordinate, is left furthest from its
+  optimum. Raising the draw count resolves it (`32` → −284.55, `128` → −285.61 against AGQ's
+  `−285.977`), and lowering `vi_lr` does too. Starting from a fitted FOCEI point does **not**
+  help. Documented in `docs/estimation/vi.qmd`. The default has since moved from 8 to 32 for this
+  reason (see the entry above). **If a VI fit lands well short of a FOCEI or AGQ fit of the same
+  data, raise `vi_mc_samples` first.**
+
+### Added
+- **The per-subject variational posterior is now written to the fit YAML.** A `method = vi` fit
+  emits an `eta_posterior` block under `vi:`, keyed by subject ID, carrying each subject's
+  variational mean and its **full** covariance (plus per-occasion `kappa` means under IOV).
+  Previously `FitResult$vi$eta_means` / `eta_covs` were reachable only from the Rust and R APIs,
+  so the CLI could not support any per-subject comparison. Note the covariance is the
+  *variational* one, which understates the true posterior variance — see
+  `docs/estimation/vi.qmd`.
+- **`agq_eval_only`** — a `laplace` stage can now *evaluate* the adaptive-Gauss-Hermite
+  marginal likelihood at the parameters it is handed instead of estimating, reporting it as
+  `ofv` and leaving `θ`/`Ω`/`σ` untouched. It must be the final stage. This is the
+  deterministic counterpart to `imp_eval_only`: `method = vi, laplace` with
+  `agq_eval_only = true` turns a VI fit's ELBO — which is only a lower bound — into a real
+  `−2 log L` that carries no Monte-Carlo error, so two runs agree bit for bit. See
+  `docs/model-file/fit-options.qmd`.
+
+
 ### Fixed
 - **`optimizer = trust_region` no longer reports `Converged: YES` when it merely ran out of
   iterations (#1000).** The underlying solver has no convergence criterion of its own, so
@@ -1028,10 +1162,80 @@ section of the SDLC for the versioning policy).
   the warning now points at the covariance-step message that carries the actual cause,
   and a Bayesian fit is told that posterior credible intervals replace the
   Hessian-based covariance — instead of both being sent to an option that is already on.
+- **`FitResult$vi$elbo_tightness_ratio` says whether the reported bound is usable**, which
+  `converged` cannot: a stuck optimizer produces a flat objective and stable parameters
+  just like a successful one. The data term's excess over its value at the variational
+  means is `≈ d/2` per subject when `q` has the posterior's curvature, so the ratio of
+  measured to expected is ~1 for a healthy fit; above 25 the fit warns and names the likely
+  fix. A deep compartment model started badly scored 306.6 while reporting
+  `converged: true`; the same model with `init` declared scored 0.54.
+
+  **`FitResult$vi$elbo_tightness_ratio` says whether the reported bound is usable**, which
+  `converged` cannot: a stuck optimizer produces a flat objective and stable parameters
+  just like a successful one. The data term's excess over its value at the variational
+  means is `≈ d/2` per subject when `q` has the posterior's curvature, so the ratio of
+  measured to expected is ~1 for a healthy fit; above 25 the fit warns and names the likely
+  fix. A deep compartment model started badly scored 306.6 while reporting
+  `converged: true`; the same model with `init` declared scored 0.54.
+
 
 ## [0.3.0] - 2026-08-07
 
 ### Added
+- **Variational inference (`[fit_options] method = vi`)** — a third way to marginalize the
+  random effects, alongside profiling them out at their mode (FOCE/Laplace) and sampling them
+  (SAEM/IMP). VI fits a tractable posterior `q(η)` per subject and optimizes its parameters
+  jointly with θ/Ω/Σ by maximizing the evidence lower bound, with no inner loop. It suits
+  models whose fixed-effects part is highly flexible (deep compartment models), cases where
+  FOCE's inner optimization is unstable, and anyone who wants a per-subject posterior
+  *covariance* without paying for a Hessian — VI produces one as a by-product, reported on
+  `FitResult$vi`. Following Janssen et al. (2024), with two departures: the KL term is taken
+  in closed form rather than by Monte Carlo, and Ω is then updated by its exact maximizer
+  rather than by gradient descent, which removes the Ω instability that paper reports.
+  VI stops as soon as the objective has settled rather than always burning `vi_iters`
+  iterations: `vi_iters` is a **ceiling** (default 25000), and settling is judged by testing
+  whether the remaining drift is distinguishable from Monte-Carlo noise. Defaults were set
+  against the NONMEM FOCEI warfarin reference (`tests/nonmem/warfarin_imp.lst`), which the
+  previous defaults missed badly — θ and Ω are now within ~1% of NONMEM out of the box.
+  `vi_lr` defaults to 0.02 (was 0.05): at 0.05 the σ trajectory is non-monotone in iteration
+  count. Note that the residual-error estimate is the one parameter limited by Monte-Carlo
+  noise rather than by iterations. `vi_mc_samples` defaults to 8 (was 3, the value Janssen
+  et al. use): at 3 draws warfarin's σ² lands ~220% high, and an IOV recovery fit returns
+  `TVCL` 0.85 against a true 1.0 while reporting `converged: true` — both failing as a
+  quiet stop at a worse point rather than as an obvious error. At 8 draws the IOV fit is
+  indistinguishable from SAEM and FOCEI on every parameter. Raise it further when the
+  residual error itself matters: σ keeps improving with more draws (~72% high at 8, ~39%
+  at 16, ~20% at 32 on warfarin) long after θ and Ω have stopped moving.
+  Tunable via `vi_iters`, `vi_mc_samples`, `vi_lr`, `vi_family`, `vi_omega_update`,
+  `vi_avg_last`, `vi_eta_grad`, `vi_kl` and `vi_seed`. `vi_kl = mc` selects the
+  Monte-Carlo KL — unbiased but noisier, what a variational family with no closed-form KL
+  requires, and a cross-check of the analytic one. Declared parameter bounds
+  (`theta TVCL(0.13, 0.001, 10.0)`), `block_omega` structure and `FIX` all behave as they do for
+  the other estimators, and standard errors come from the ordinary covariance step run at the VI
+  estimate, so `covariance_status` / `se_theta` are populated as usual. **Note that the ELBO is
+  a lower bound, not a
+  likelihood:** `ofv` is `NaN` by default rather than being filled with a number that is not
+  comparable to a FOCE/SAEM OFV. Set `vi_final_ofv = laplace`, or chain `methods = vi, imp`
+  with `imp_eval_only = true`, to evaluate a genuine marginal likelihood at the VI estimate.
+  **IOV is supported**: the variational posterior covers the stacked `[η, κ₁ … κ_K]`
+  jointly against a block-diagonal prior `Ω ⊕ Ω_iov^{⊗K}`, `Ω_iov` gets its own
+  closed-form maximizer pooled over every occasion of every subject, and per-occasion `κ`
+  means are reported on `FitResult$vi$kappa_means`. IOV composes with a **time-varying
+  clearance** (the busulfan shape) from either the `TIME` built-in or a time-varying
+  covariate — a pairing worth stating explicitly because the two effects are confusable:
+  both make clearance differ between early and late records. Read `Ω_iov` from a VI fit
+  with one caveat: variational posteriors understate posterior variance and `Ω_iov` is a
+  mean of `S + μμᵀ` over occasions, so it leans low (about 24% low on a simulated
+  60-subject, 4-occasion recovery where `θ` landed within 2%); confirm it with SAEM or
+  FOCEI if it is the parameter you care about. Non-Gaussian endpoints
+  (TTE / categorical) are still unsupported and are refused with an actionable message.
+  **`FitResult$vi$elbo_tightness_ratio` says whether the reported bound is usable**, which
+  `converged` cannot: a stuck optimizer produces a flat objective and stable parameters
+  just like a successful one. The data term's excess over its value at the variational
+  means is `≈ d/2` per subject when `q` has the posterior's curvature, so the ratio of
+  measured to expected is ~1 for a healthy fit; above 25 the fit warns and names the likely
+  fix. A deep compartment model started badly scored 306.6 while reporting
+  `converged: true`; the same model with `init` declared scored 0.54.
 - **New ODE steppers via `[fit_options] ode_method`,** on two independent axes. For
   **stability**: the linearly implicit Rosenbrock methods `rosenbrock23` (order 2, aliases
   `ros23`/`ode23s`), `rodas4` (order 4) and `rodas5p` (order 5). These are stable at the step size the tolerance needs on **stiff**
@@ -1171,6 +1375,16 @@ section of the SDLC for the versioning policy).
   for any external code that constructs or exhaustively destructures these variants.
 
 ### Fixed
+- **LTBS models scored a different objective under SAEM / IMP / VI than under FOCE.** The
+  fixed-η observation likelihood applied a `max(1e-12)` positivity floor to the
+  prediction — correct for a concentration, wrong for `log(concentration)`, which is
+  legitimately negative for any concentration below one unit (ng/mL data, late samples, a
+  high-clearance subject). Affected observations had their residual computed against ~0
+  instead of the true negative log-prediction, inflating it silently. FOCE/Laplace/AGQ
+  never applied the floor and were unaffected, so this showed up as SAEM/IMP/VI
+  disagreeing with FOCE on the same model. The floor now stands down under LTBS, where
+  positivity is already enforced on the natural scale before the log is taken.
+
 - **Gradient-path-dependent FOCE/FOCEI objective on proportional-error models with a
   near-zero prediction** (#958). The residual-variance floor (`MIN_VARIANCE`, which clamps
   `(f·σ)²` so a vanishing prediction cannot produce a zero variance) was applied to the

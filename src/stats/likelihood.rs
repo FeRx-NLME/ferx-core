@@ -759,7 +759,11 @@ pub(crate) fn obs_nll_subject_from_preds(
             // covariate prediction up to 1e-12 fabricates a huge residual and, on the
             // Rao-Blackwellised path, breaks the `obs_nll(η_c=d) ≈ const` assumption
             // (#406). Ordinary PK rows keep the positivity clamp.
-            let f = if frem_var.is_some() { f } else { f.max(1e-12) };
+            let f = if frem_var.is_some() {
+                f
+            } else {
+                model.floor_prediction(f)
+            };
             let v = match frem_var {
                 Some(vv) => vv.max(1e-12),
                 None => (model.residual_variance_at_scaled(

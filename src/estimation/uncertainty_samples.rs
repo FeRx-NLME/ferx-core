@@ -372,6 +372,7 @@ mod tests {
             importance_sampling: None,
             impmap_trace: None,
             bayes: None,
+            vi: None,
             omega_iov: None,
             kappa_names: vec![],
             kappa_fixed: vec![],

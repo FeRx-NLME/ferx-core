@@ -1101,10 +1101,14 @@ fn fit_inner(
     for d in check_model_data_warnings(model, population, init_params) {
         accumulated_warnings.push(d.message);
     }
-    // Warning-severity *option* diagnostics (e.g. W_GN_NO_RANDOM_EFFECTS, #1006).
-    // `first_error` above consumes only errors, so without this a warning added to
-    // `check_model_options` is reported by `ferx check` and silently dropped by
-    // `fit()` — the same treatment `check_model_data_warnings` gets, one line up.
+    // Warning-severity *option* diagnostics (e.g. W_GN_NO_RANDOM_EFFECTS, #1006):
+    // the findings worth saying but not worth refusing, since an option *combination*
+    // may well have been chosen deliberately. `first_error` above consumes only
+    // errors, so without this a warning added to `check_model_options` is reported by
+    // `ferx check` and silently dropped by `fit()` — the same treatment
+    // `check_model_data_warnings` gets, one line up. Reuses the `option_diags` already
+    // computed for `first_error`; re-calling `check_model_options` here would emit
+    // every one of these twice.
     for d in option_diags.iter().filter(|d| !d.is_error()) {
         accumulated_warnings.push(d.message.clone());
     }
@@ -1171,6 +1175,27 @@ fn fit_inner(
 
     let mut total_iterations: usize = 0;
     let mut is_result: Option<ImportanceSamplingResult> = None;
+    // A VI stage's result must survive later stages of a chain: `methods = vi, imp`
+    // is the *recommended* way to finish a VI fit, and reading `vi` off only the
+    // final stage would silently discard it exactly when it was used correctly.
+    let mut vi_result: Option<crate::types::ViResult> = None;
+    // Which stage produced `vi_result`, so a later *estimating* stage can be recorded on
+    // it. See `ViResult::superseded_by`: the block is kept (a trailing `agq_eval_only`
+    // readout is the recommended way to finish a VI fit) but must not read as though it
+    // described the parameters the fit ends up reporting.
+    let mut vi_stage_idx: Option<usize> = None;
+    // The methods running as pure likelihood evaluators for this fit. Chain-wide, not
+    // per-stage, so it is built once here and read both inside the loop and after it.
+    let eval_only_methods: Vec<EstimationMethod> = {
+        let mut v = Vec::new();
+        if options.imp_eval_only {
+            v.push(EstimationMethod::Imp);
+        }
+        if options.agq_eval_only {
+            v.push(EstimationMethod::Laplace);
+        }
+        v
+    };
     // Per-stage convergence wall time, parallel to `chain`/`method_chain`
     // (#713). Excludes the covariance step, which is timed separately below
     // and only ever runs on the last estimating stage.
@@ -1322,7 +1347,7 @@ fn fit_inner(
         // Run the covariance step (and SIR) only on the last *estimating* stage,
         // so a chain doesn't recompute the expensive FD covariance after every
         // method (#615). See `is_last_estimating_stage` for the eval-only-IMP rule.
-        let is_last_estimating = is_last_estimating_stage(&chain, stage_idx, options.imp_eval_only);
+        let is_last_estimating = is_last_estimating_stage(&chain, stage_idx, &eval_only_methods);
         if !is_last_estimating {
             stage_opts.run_covariance_step = false;
             stage_opts.sir = false;
@@ -1342,6 +1367,83 @@ fn fit_inner(
                 n_stages,
                 method.label()
             );
+        }
+
+        // AGQ evaluation-only stage (`agq_eval_only`): not an estimator. Reconverges the
+        // EBEs at the incoming parameters, evaluates the adaptive-Gauss–Hermite marginal
+        // there, and overwrites only the reported OFV — the preceding stage's parameters,
+        // EBEs and Hessians stay canonical.
+        //
+        // The EBEs are recomputed rather than reused because adaptive quadrature centres its
+        // grid on the conditional mode and scales it by the posterior Hessian; a mode carried
+        // over from a method that never converged one (VI reports variational means, not
+        // modes) would put the grid in the wrong place. Deterministic throughout, which is
+        // the whole point relative to `methods = ..., imp` with `imp_eval_only`.
+        if method == EstimationMethod::Laplace && stage_opts.agq_eval_only {
+            let n_nodes = stage_opts.agq_nodes().unwrap_or(1);
+            let mu_k = crate::estimation::parameterization::compute_mu_k(
+                model,
+                &stage_params.theta,
+                stage_opts.mu_referencing,
+            );
+            let (eta_hats, h_matrices, _stats, kappas) =
+                crate::estimation::inner_optimizer::run_inner_loop_warm(
+                    model,
+                    population,
+                    &stage_params,
+                    stage_opts.inner_maxiter,
+                    stage_opts.inner_tol,
+                    result.as_ref().map(|r| r.eta_hats.as_slice()),
+                    Some(&mu_k),
+                    stage_opts.min_obs_for_convergence_check as usize,
+                    stage_opts.inner_restarts,
+                );
+            let nll = crate::estimation::agq::agq_population_nll(
+                model,
+                population,
+                &stage_params,
+                &eta_hats,
+                &kappas,
+                n_nodes,
+                stage_opts.hessian_anchor(),
+            );
+            let ofv = 2.0 * nll;
+            match result.as_mut() {
+                // Chained: keep the estimator's parameters and replace only the OFV, so the
+                // reported objective is the quadrature marginal at the point it reached.
+                Some(prev) => prev.ofv = ofv,
+                // Standalone: there is nothing to preserve, so this becomes the canonical
+                // result at the (unchanged) initial parameters.
+                None => {
+                    result = Some(crate::estimation::outer_optimizer::OuterResult {
+                        params: stage_params.clone(),
+                        ofv,
+                        converged: true,
+                        n_iterations: 0,
+                        eta_hats,
+                        h_matrices,
+                        kappas,
+                        covariance_matrix: None,
+                        covariance_wall_time_secs: 0.0,
+                        warnings: Vec::new(),
+                        saem_mu_ref_m_step_evals_saved: None,
+                        saem_n_subjects_hmc: None,
+                        ebe_convergence_warnings: 0,
+                        max_unconverged_subjects: 0,
+                        total_ebe_fallbacks: 0,
+                        final_gradient: None,
+                        sir_fallback_proposal: None,
+                        impmap_trace: None,
+                        bayes: None,
+                        cond_dist: None,
+                        packed_estimate: None,
+                        vi: None,
+                        mixture_posteriors: None,
+                    });
+                }
+            }
+            method_wall_times_secs.push(stage_start.elapsed().as_secs_f64());
+            continue;
         }
 
         // IMP evaluation-only stage (`imp_eval_only`, NONMEM `IMP EONLY=1`): not an
@@ -1405,6 +1507,7 @@ fn fit_inner(
                     cond_dist: None,
                     packed_estimate: None,
                     mixture_posteriors: None,
+                    vi: None,
                 });
             }
             let prev = result.as_ref().expect(
@@ -1522,6 +1625,9 @@ fn fit_inner(
             EstimationMethod::Bayes => {
                 crate::estimation::bayes::run_bayes(model, population, &stage_params, &stage_opts)?
             }
+            EstimationMethod::Vi => {
+                crate::estimation::vi::run_vi(model, population, &stage_params, &stage_opts)?
+            }
             _ => optimize_population(model, population, &stage_params, &stage_opts),
         };
 
@@ -1530,6 +1636,10 @@ fn fit_inner(
             .push((stage_start.elapsed().as_secs_f64() - stage_cov_secs).max(0.0));
         covariance_wall_time_secs += stage_cov_secs;
 
+        if stage_result.vi.is_some() {
+            vi_result = stage_result.vi.clone();
+            vi_stage_idx = Some(stage_idx);
+        }
         stage_params = stage_result.params.clone();
         total_iterations += stage_result.n_iterations;
         for w in stage_result
@@ -1604,6 +1714,32 @@ fn fit_inner(
     let mut result = result.expect("method chain must have at least one stage");
     // Overwrite with chain-aware totals
     result.n_iterations = total_iterations;
+
+    // Mark a VI block that a later *estimating* stage has overtaken. The block is kept —
+    // a trailing `agq_eval_only` / `imp_eval_only` readout is how a VI fit is meant to be
+    // finished, and the per-subject variational covariance is the only one in the result —
+    // but on `methods = [vi, focei]` everything on it describes VI's parameter point, not
+    // the one the fit reports. `is_last_estimating_stage` is the same predicate the loop
+    // used, so trailing evaluators do not count as superseding.
+    if let (Some(vi), Some(idx)) = (vi_result.as_mut(), vi_stage_idx) {
+        if !is_last_estimating_stage(&chain, idx, &eval_only_methods) {
+            let by = chain[idx + 1..]
+                .iter()
+                .rposition(|m| !eval_only_methods.contains(m))
+                .map(|off| chain[idx + 1 + off].label().to_string());
+            if let Some(by) = by {
+                vi.superseded_by = Some(by.clone());
+                accumulated_warnings.push(format!(
+                    "VI: the reported theta/Omega/sigma come from the later {by} stage, but \
+                     the vi block (eta_means, eta_covs, ELBO, elbo_tightness_ratio) still \
+                     describes the parameter point VI ended on. Read it there, or run VI as the \
+                     last estimating stage (a trailing agq_eval_only / imp_eval_only readout does \
+                     not move the estimates)."
+                ));
+            }
+        }
+    }
+
     result.warnings = accumulated_warnings;
 
     // Thread efficiency warnings (post-chain, uses n_threads_used captured above).
@@ -2186,6 +2322,7 @@ fn fit_inner(
         importance_sampling: is_result,
         impmap_trace: result.impmap_trace.clone(),
         bayes: result.bayes.clone(),
+        vi: vi_result.clone(),
         omega_iov: result.params.omega_iov.as_ref().map(|m| m.matrix.clone()),
         kappa_names: model.kappa_names.clone(),
         kappa_fixed: result.params.kappa_fixed.clone(),

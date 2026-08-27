@@ -96,6 +96,10 @@ pub struct OuterResult {
     /// Per-subject mixture posteriors from the final mixture eval. `Some` only for
     /// a converged `[mixture]` fit (#977); `None` for every non-mixture path.
     pub mixture_posteriors: Option<MixturePosteriors>,
+    /// Variational-inference result from a `method = vi` run. `Some` only for
+    /// `EstimationMethod::Vi`; carried here so the chain dispatch lifts it onto
+    /// `FitResult.vi` through the same generic path `bayes` uses.
+    pub vi: Option<crate::types::ViResult>,
 }
 
 /// Run the outer optimization loop (population parameter estimation).
@@ -500,6 +504,7 @@ fn evaluate_at_initial_params(
         // init omega just as it does for a converged fit (#816 follow-up).
         packed_estimate: Some(x.clone()),
         mixture_posteriors,
+        vi: None,
         params,
         ofv,
         converged: false,
@@ -2249,6 +2254,7 @@ fn optimize_nlopt_once(
         // follow-up): reused by `run_covariance` to avoid re-decomposing omega.
         packed_estimate: Some(x0.clone()),
         mixture_posteriors: final_mixture_posteriors,
+        vi: None,
     };
     (result, left_init)
 }
@@ -2646,6 +2652,7 @@ fn optimize_bfgs(
         // follow-up): reused by `run_covariance` to avoid re-decomposing omega.
         packed_estimate: Some(x_final.clone()),
         mixture_posteriors: None,
+        vi: None,
         params: final_params,
         ofv: final_ofv,
         converged,

@@ -1573,6 +1573,7 @@ pub fn run_bayes(
         cond_dist: None,
         packed_estimate: None,
         mixture_posteriors,
+        vi: None,
     })
 }
 
