@@ -320,8 +320,12 @@ section of the SDLC for the versioning policy).
 - **A failed `ode_method = auto` fallback is no longer reported as a successful repair
   (#1080).** When the stiff attempt is rejected and its pinned-`rk45` re-solve also stops before
   the segment end or returns non-finite output, the `ode_solver` warning now says that both
-  attempts failed. Solver statistics also distinguish unfinished attempts discarded by the guard
-  from unfinished trajectories actually returned to the caller.
+  attempts failed. The escalation guard also rejects a stiff attempt that stopped before the end
+  of its segment — a method that exhausts `ode_max_steps` without ever reaching the minimum step
+  size used to return its freeze-padded trajectory with every failure counter at zero. Solver
+  statistics distinguish unfinished attempts discarded by the guard from unfinished trajectories
+  actually returned to the caller, and the warning's clauses no longer double-count a segment
+  that `ode_stiff_abort_after` abandoned.
 - **Hidden parameter guards now produce a fit warning (#1099).** A free Theta at
   the implicit `1e-10` / `1e9` cap, or an Omega, Omega-IOV, Sigma, or mixture
   override pinned to an internal packed-space safety limit, emits the typed

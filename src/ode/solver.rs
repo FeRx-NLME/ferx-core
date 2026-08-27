@@ -399,6 +399,10 @@ pub struct OdeSolverStats {
     /// method to return in this case, so the caller still receives the explicit result; this
     /// counter is the honest "both attempts failed" signal that makes that otherwise-silent
     /// outcome visible in the fit's `ode_solver` warning (#1080).
+    ///
+    /// Like every other `auto` counter it is a floor, not a total: [`solve_ode_until_threshold`]
+    /// takes no stats, so a failure on the event-time path (TTE / adaptive dosing) is not
+    /// counted here and a zero is not by itself proof that every solve in the fit was clean.
     pub auto_fallback_failed: usize,
     /// Integration attempts that stopped before reaching the end of their segment and
     /// freeze-padded the remaining output times with the last state.
@@ -406,6 +410,17 @@ pub struct OdeSolverStats {
     /// This counts attempts, including stiff attempts the `auto` guard later discarded.
     /// Subtract [`discarded_unfinished_segments`](Self::discarded_unfinished_segments) to
     /// obtain the number of unfinished trajectories the caller actually received.
+    ///
+    /// A roll-up, not a disjoint category. Every segment counted by
+    /// [`stiff_aborted_segments`](Self::stiff_aborted_segments) is by construction also counted
+    /// here (the budgeted abort only fires while `t < tf`), as is every segment that stopped
+    /// because its stepper could not form a step at `min_dt`. Do not add this to those
+    /// counters; the fit's `ode_solver` warning subtracts the abandoned ones before reporting
+    /// the rest, so its clauses stay disjoint. What is left over after that subtraction is
+    /// dominated by segments that exhausted [`OdeSolverOptions::max_steps`].
+    ///
+    /// It is a floor, not a total: [`solve_ode_until_threshold`] takes no stats, so segments
+    /// integrated on the event-time path (TTE / adaptive dosing) are not counted here.
     pub unfinished_segments: usize,
     /// Integrations abandoned early because their min-`dt` clamps crossed
     /// [`OdeSolverOptions::stiff_abort_after`] (#708, #1080 Part B).
@@ -1708,9 +1723,17 @@ fn integrate_resolved_g_inner<T: PkNum>(
     // stepper, was escalated by a re-probe, and then integrated cleanly to the end has just
     // been rescued by the switch, and discarding it would re-solve it with pinned explicit —
     // the exact result the escalation avoided.
+    //
+    // A third failure shape, and the one neither test above can see (#1080 review): a stiff
+    // method can exhaust `max_steps` without ever reaching `min_dt`, which returns a finite,
+    // freeze-padded, partially-integrated trajectory with every other counter at zero. Reject
+    // it like the other two. Left unguarded it was indistinguishable from an unfinished
+    // *explicit* solve, whose remedy is the opposite one — raise `max_steps` or loosen the
+    // tolerances, rather than name a different stiff method.
     let ran_stiff = attempt.auto_stiff_segments > 0;
     let stalled = attempt.stiff_min_step_clamped_steps > 0;
-    let usable = !ran_stiff || (!stalled && finite_g(&out.0) && finite_g(&out.1));
+    let unfinished = attempt.unfinished_segments > 0;
+    let usable = !ran_stiff || (!stalled && !unfinished && finite_g(&out.0) && finite_g(&out.1));
     if !usable {
         attempt.auto_stiff_rejected = 1;
         // The clamps were taken, so they stay in `min_step_clamped_steps`; they are *also*
@@ -1736,6 +1759,14 @@ fn integrate_resolved_g_inner<T: PkNum>(
     // explicit result remains the deterministic fallback — but it must not be returned as if
     // the guard repaired the segment. `auto_fallback_failed` is the production-visible "both
     // attempts failed" signal requested in #1080.
+    //
+    // The two attempts are scored on deliberately different criteria. The stiff attempt is
+    // rejected on *any* stiff `min_dt` clamp, because its clamps are recorded as discarded and
+    // would otherwise leave no trace a caller could read; the fallback is scored on the
+    // returned trajectory only (unfinished, or non-finite), because its clamps are kept and
+    // reported directly through `min_step_clamped_steps` / `kept_clamped_steps`. A fallback
+    // that clamps its way to `tf` is the ordinary stability-limited outcome that clause already
+    // describes, not a second failure to re-report here.
     let mut fallback = OdeSolverStats::default();
     let fallback_out = run(
         OdeMethod::EXPLICIT_FALLBACK,

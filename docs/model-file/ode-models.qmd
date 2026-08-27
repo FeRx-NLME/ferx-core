@@ -325,14 +325,32 @@ step counts, and ride along in the `ode_solver` warning's `details` payload:
   right that the system is stiff but the method it picked could not integrate it — try naming
   `rodas5p` or `rosenbrock23` explicitly.
 
-Two failure counters close the guard's last ambiguity. **Unfinished segments** are attempts that
-stopped before their requested end and freeze-padded the remaining output times;
-**discarded unfinished segments** are the subset belonging to stiff attempts the guard threw away,
-so their difference is the number of unfinished trajectories the caller actually received. If the
-explicit re-solve also stops early or returns non-finite output, `auto_fallback_failed` increments:
-there is no clean trajectory for the guard to return, so it deterministically keeps the explicit
-fallback but reports that **both attempts failed**. Do not treat a fit with a non-zero value as a
-usable result; pin another stiff method and check the tolerances and parameter estimates.
+Three more counters close the guard's last ambiguity. Unlike the three above, the first two are
+recorded under *every* `ode_method`, not just `auto` — an `rk45` fit that runs out of steps shows
+them too.
+
+- **unfinished segments** — attempts that stopped before their requested end and freeze-padded
+  the remaining output times with the last state.
+- **discarded unfinished segments** — the subset belonging to stiff attempts the guard threw
+  away, so the difference (`kept_unfinished_segments`) is the number of unfinished trajectories
+  the caller actually received.
+- **auto-fallback failures** — rejected escalations whose explicit re-solve *also* stopped early
+  or returned non-finite output. There is no clean trajectory left for the guard to return, so
+  it deterministically keeps the explicit fallback but reports that **both attempts failed**. Do
+  not treat a fit with a non-zero value here as a usable result; pin another stiff method and
+  check the tolerances and parameter estimates.
+
+`kept_unfinished_segments` is a roll-up, not a disjoint category: a segment abandoned by
+`ode_stiff_abort_after`, and one that stopped because it could not form a step at the minimum
+step size, are unfinished segments too. Do not add it to `stiff_aborted_segments` — the
+`ode_solver` warning subtracts the abandoned ones before reporting the rest, so its clauses
+partition the damaged segments rather than counting them twice. What is left after that
+subtraction is dominated by segments that exhausted `ode_max_steps`.
+
+All six counters are floors rather than totals. They cover the segment solves only, so
+escalations and failures on the event-time path — the threshold solver that drives time-to-event
+and adaptive-dosing models — are not in them. A zero is not by itself proof that every
+integration in the fit was clean.
 
 Measured on the ferx-testdata ODE library at default tolerances. `λ_max` is the range across
 every integration segment of every subject; the wall-clock columns are FOCEI fits:
