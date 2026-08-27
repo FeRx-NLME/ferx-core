@@ -675,9 +675,8 @@ fn classify_warning_eta_shrinkage_is_word_bounded() {
 
 #[test]
 fn classify_warning_recognizes_internal_runaway_guard() {
-    let warning = classify_warning(
-        "Internal optimizer runaway guard reached by parameter estimate(s): PROP_ERR",
-    );
+    let warning =
+        classify_warning("Internal optimizer parameter guard reached by estimate(s): PROP_ERR");
     assert_eq!(warning.category, WarningCode::ParameterAtRunawayGuard);
     assert_eq!(warning.severity, WarningSeverity::Warning);
 }

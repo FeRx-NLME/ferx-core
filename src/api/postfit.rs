@@ -1076,6 +1076,23 @@ fn boundary_estimates(params: &ModelParameters) -> Vec<(String, f64, f64, &'stat
         if let Some((side, bound)) =
             theta_boundary_side(est, params.theta_lower[i], params.theta_upper[i])
         {
+            // A log-packed theta whose declared range reaches past ferx's
+            // 1e-10 / 1e9 implementation caps did not hit a user bound. Route
+            // an actual cap hit to `parameter_at_runaway_guard` instead, where
+            // the remediation does not tell the user to relax a bound they
+            // never declared (or cannot relax past the internal cap).
+            if theta_guard_is_internal(params, i, side) {
+                // Internal theta guards exist only on the log-packed path.
+                let packed_est = est.max(1e-10).ln();
+                let packed_bound = if side == "lower" {
+                    params.theta_lower[i].max(1e-10).ln()
+                } else {
+                    params.theta_upper[i].min(1e9).ln()
+                };
+                if packed_guard_eq(packed_est, packed_bound) {
+                    continue;
+                }
+            }
             let name = params
                 .theta_names
                 .get(i)
@@ -1087,9 +1104,23 @@ fn boundary_estimates(params: &ModelParameters) -> Vec<(String, f64, f64, &'stat
     hits
 }
 
-/// A free OMEGA / SIGMA coordinate pinned to one of the internal packed-space
-/// runaway guards. `estimate` is the ordinary reporting-scale value, while the
-/// packed values identify the literal optimizer guard that was reached.
+/// Whether a THETA bound reported by `compute_bounds` is an implementation cap
+/// rather than the user's effective declared limit.
+fn theta_guard_is_internal(params: &ModelParameters, i: usize, side: &str) -> bool {
+    use crate::estimation::parameterization::theta_packs_log;
+    let lower = params.theta_lower.get(i).copied().unwrap_or(f64::NAN);
+    let upper = params.theta_upper.get(i).copied().unwrap_or(f64::NAN);
+    theta_packs_log(lower)
+        && match side {
+            "lower" => lower <= 1e-10,
+            "upper" => upper >= 1e9,
+            _ => false,
+        }
+}
+
+/// A free parameter coordinate pinned to one of the internal packed-space
+/// guards. `estimate` is the ordinary reporting-scale value, while the packed
+/// values identify the literal optimizer guard that was reached.
 struct RunawayGuardHit {
     name: String,
     estimate: f64,
@@ -1098,10 +1129,20 @@ struct RunawayGuardHit {
     side: &'static str,
 }
 
-/// Return the exact bound reached by a packed coordinate. Internal guards are
-/// implementation constants, so this deliberately uses equality rather than the
-/// relative proximity threshold used for user-declared THETA bounds: a value
-/// merely near a wide safety rail is still an interior estimate.
+/// Tiny packed-space tolerance for an optimizer guard hit. The optimizer may
+/// clamp exactly in scaled space, then recover the packed coordinate through
+/// `(bound / scale) * scale`; that round-trip can land a few ULPs off the literal
+/// guard. This tolerance admits that arithmetic noise without treating a value
+/// merely near a wide safety rail as a hit.
+const INTERNAL_GUARD_REL_TOL: f64 = 4.0 * f64::EPSILON;
+
+fn packed_guard_eq(estimate: f64, guard: f64) -> bool {
+    estimate == guard || (estimate - guard).abs() <= INTERNAL_GUARD_REL_TOL * guard.abs().max(1.0)
+}
+
+/// Return the bound reached by a packed coordinate, allowing only the few ULPs
+/// introduced by optimizer scaling/unscaling. Degenerate or non-finite bounds
+/// are never internal guard hits.
 pub(crate) fn packed_guard_side(
     estimate: f64,
     lower: f64,
@@ -1110,20 +1151,21 @@ pub(crate) fn packed_guard_side(
     if !estimate.is_finite() || !lower.is_finite() || !upper.is_finite() || lower >= upper {
         return None;
     }
-    if estimate == lower {
+    if packed_guard_eq(estimate, lower) {
         Some(("lower", lower))
-    } else if estimate == upper {
+    } else if packed_guard_eq(estimate, upper) {
         Some(("upper", upper))
     } else {
         None
     }
 }
 
-/// Free OMEGA / SIGMA coordinates pinned to their internal packed-space guards.
+/// Free coordinates pinned to internal packed-space guards.
 ///
 /// The walk uses the same packing, bounds, names, and FIX mask as the optimizer.
-/// Starting after THETA includes base OMEGA/SIGMA, OMEGA_IOV, and mixture
-/// overrides without duplicating their layout here.
+/// THETA coordinates are included only where `compute_bounds` substituted its
+/// hidden 1e-10 / 1e9 cap for the declared range; every later coordinate is an
+/// internal OMEGA/SIGMA, OMEGA_IOV, or mixture guard.
 fn runaway_guard_estimates(params: &ModelParameters) -> Vec<RunawayGuardHit> {
     use crate::estimation::parameterization::{
         compute_bounds, coordinate_names, coordinate_values, pack_params, packed_fixed_mask,
@@ -1141,16 +1183,21 @@ fn runaway_guard_estimates(params: &ModelParameters) -> Vec<RunawayGuardHit> {
         .min(names.len())
         .min(estimates.len());
 
-    (params.theta.len()..end)
+    (0..end)
         .filter(|&i| !fixed.get(i).copied().unwrap_or(false))
         .filter_map(|i| {
-            packed_guard_side(packed[i], bounds.lower[i], bounds.upper[i]).map(
-                |(side, packed_guard)| RunawayGuardHit {
-                    name: names[i].clone(),
-                    estimate: estimates[i],
-                    packed_estimate: packed[i],
-                    packed_guard,
-                    side,
+            packed_guard_side(packed[i], bounds.lower[i], bounds.upper[i]).and_then(
+                |(side, packed_guard)| {
+                    if i < params.theta.len() && !theta_guard_is_internal(params, i, side) {
+                        return None;
+                    }
+                    Some(RunawayGuardHit {
+                        name: names[i].clone(),
+                        estimate: estimates[i],
+                        packed_estimate: packed[i],
+                        packed_guard,
+                        side,
+                    })
                 },
             )
         })
@@ -1227,45 +1274,67 @@ pub(crate) fn boundary_estimate_warning(
     )
 }
 
-/// Build the warning for OMEGA / SIGMA estimates pinned to an internal
+/// Build the warning for parameter estimates pinned to an internal
 /// runaway guard, or `None` when every free coordinate is interior.
 pub(crate) fn runaway_guard_warning(params: &ModelParameters) -> Option<(String, WarningEntry)> {
-    list_warning(
-        runaway_guard_estimates(params),
-        WarningCode::ParameterAtRunawayGuard,
-        |hit| {
+    let hits = runaway_guard_estimates(params);
+    if hits.is_empty() {
+        return None;
+    }
+    let list = hits
+        .iter()
+        .map(|hit| {
             format!(
                 "{} (estimate {:.4}; packed coordinate {:.4} at {} guard)",
                 hit.name, hit.estimate, hit.packed_estimate, hit.side
             )
-        },
-        |list| {
-            format!(
-                "Internal optimizer runaway guard reached by parameter estimate(s): {list}. \
-                 The fit reached an implementation safety limit rather than an interior \
-                 optimum; do not treat the affected value(s) as reliable estimates. \
-                 Revisit the model, data, initial estimates, or estimation method."
-            )
-        },
-        |hits| {
-            let params_json: Vec<serde_json::Value> = hits
-                .iter()
-                .map(|hit| {
-                    serde_json::json!({
-                        "parameter": hit.name,
-                        "estimate": hit.estimate,
-                        "packed_estimate": hit.packed_estimate,
-                        "packed_guard": hit.packed_guard,
-                        "side": hit.side,
-                    })
-                })
-                .collect();
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let has_lower = hits.iter().any(|hit| hit.side == "lower");
+    let has_upper = hits.iter().any(|hit| hit.side == "upper");
+    let guidance = match (has_lower, has_upper) {
+        (true, false) => {
+            "The affected parameter(s) collapsed toward zero at an implementation floor \
+             rather than reaching an interior optimum; consider removing or simplifying \
+             the unsupported parameter, random effect, or error component."
+        }
+        (false, true) => {
+            "The affected parameter(s) ran to an implementation ceiling rather than \
+             reaching an interior optimum; do not treat the value(s) as reliable estimates. \
+             Revisit the model, data, initial estimates, or estimation method."
+        }
+        (true, true) => {
+            "Lower-guard hits indicate parameters collapsing toward zero; consider removing \
+             or simplifying those unsupported components. Upper-guard hits indicate runaway \
+             estimates; revisit the model, data, initial estimates, or estimation method."
+        }
+        (false, false) => unreachable!("every guard hit has a lower or upper side"),
+    };
+    let msg =
+        format!("Internal optimizer parameter guard reached by estimate(s): {list}. {guidance}");
+    let params_json: Vec<serde_json::Value> = hits
+        .iter()
+        .map(|hit| {
             serde_json::json!({
-                "guard_space": "packed",
-                "parameters": params_json,
+                "parameter": hit.name,
+                "estimate": hit.estimate,
+                "packed_estimate": hit.packed_estimate,
+                "packed_guard": hit.packed_guard,
+                "side": hit.side,
             })
-        },
-    )
+        })
+        .collect();
+    let details = serde_json::json!({
+        "guard_space": "packed",
+        "parameters": params_json,
+    });
+    let entry = warning_entry(
+        WarningCode::ParameterAtRunawayGuard,
+        msg.clone(),
+        Some(details),
+    );
+    Some((msg, entry))
 }
 
 /// Relative-standard-error threshold (percent) above which a free THETA is

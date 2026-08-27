@@ -1981,7 +1981,7 @@ fn fit_inner(
         warnings.push(msg);
         native_warnings.push(entry);
     }
-    // OMEGA / SIGMA estimates pinned to hidden packed-space runaway guards.
+    // Parameter estimates pinned to hidden packed-space implementation guards.
     // This is distinct from a user-declared theta bound: the affected result
     // reached an implementation safety limit (#1099).
     if let Some((msg, entry)) = runaway_guard_warning(&result.params) {

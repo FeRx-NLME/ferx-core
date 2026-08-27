@@ -54,7 +54,7 @@ Each `WarningCode` token, what it flags, and a typical response.
 | `eps_shrinkage` | Warning | Residual (EPS) shrinkage high / negative. | Sparse data for the error model — simplify it. |
 | `eta_shrinkage` | Warning | One or more ETA shrinkages exceed ~30%. | Data poorly inform that IIV — consider removing it on the affected parameter(s). |
 | `boundary_estimate` | Warning | One or more THETA estimates are pinned to an optimizer bound. | Non-identifiability or a too-tight bound — inspect; relax the bound or simplify. |
-| `parameter_at_runaway_guard` | Warning | One or more free OMEGA / SIGMA coordinates are pinned to an internal optimizer safety guard. | The affected value is not an interior optimum — do not treat it as a reliable estimate; revisit the model, data, initial estimates, or method. |
+| `parameter_at_runaway_guard` | Warning | One or more free coordinates are pinned to a hidden optimizer guard: an implicit THETA cap or an OMEGA / SIGMA safety rail. | A lower hit means the component collapsed toward zero — consider removing or simplifying it. An upper hit is a runaway estimate — revisit the model, data, initial estimates, or method. |
 | `inflated_rse` | Warning | One or more THETA estimates have RSE > ~50%. | Imprecisely estimated — often over-parameterization; consider simplifying. |
 | `high_correlation` | Warning | One or more THETA (fixed-effect) pairs have \|correlation\| ≥ 0.95. | Over-parameterization / non-identifiability — fix or remove one of each pair. |
 | `data_quality` | Warning | Dataset issue (missing DV, ADDL/II, non-positive DV, …). | Fix the dataset before trusting the fit. |

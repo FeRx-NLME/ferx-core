@@ -4574,10 +4574,10 @@ pub enum WarningCode {
     /// One or more THETA estimates are pinned to an optimizer bound — a sign of
     /// non-identifiability or a too-tight bound.
     BoundaryEstimate,
-    /// One or more OMEGA / SIGMA optimizer coordinates are pinned to an internal
-    /// runaway guard. Unlike a THETA bound, this is an implementation safety
-    /// limit rather than a user-declared constraint, so the affected fit result
-    /// is not an interior optimum.
+    /// One or more optimizer coordinates are pinned to an internal guard: an
+    /// implicit THETA cap or an OMEGA / SIGMA safety limit. Unlike a declared
+    /// THETA bound, this is an implementation constraint, so the affected fit
+    /// result is not an interior optimum.
     ParameterAtRunawayGuard,
     /// One or more THETA estimates have a large relative standard error — poorly
     /// estimated / imprecise parameters.
@@ -4851,7 +4851,7 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
     } else if lower.starts_with("eta shrinkage") || lower.contains(" eta shrinkage") {
         // Word-boundary match so "beta shrinkage" (or similar) does not collide.
         (WarningSeverity::Warning, WarningCode::EtaShrinkage)
-    } else if lower.contains("internal optimizer runaway guard") {
+    } else if lower.contains("internal optimizer parameter guard") {
         (
             WarningSeverity::Warning,
             WarningCode::ParameterAtRunawayGuard,
