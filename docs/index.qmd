@@ -1,6 +1,27 @@
-# Introduction
+---
+pagetitle: "ferx: Open-source NLME modeling for pharmacometrics"
+description: "Use ferx for open-source nonlinear mixed-effects modeling, population PK/PD analysis, FOCEI, SAEM, simulation, and NONMEM-compatible workflows."
+title-block-style: none
+keywords:
+  - nonlinear mixed-effects modeling
+  - NLME
+  - population pharmacokinetics
+  - population PK/PD
+  - pharmacometrics
+  - FOCEI
+  - SAEM
+  - NONMEM alternative
+---
 
-ferx-core is a high-performance Nonlinear Mixed Effects (NLME) modeling engine written in Rust. It is designed for population pharmacokinetic (PopPK) analysis, implementing the same statistical methodology as established tools like NONMEM, Monolix, and Pumas.
+# Open-source NLME modeling for pharmacometrics
+
+ferx is an open-source **nonlinear mixed-effects (NLME) modeling** platform for
+population pharmacokinetic and pharmacodynamic (**PopPK/PD**) analysis. Its
+high-performance Rust engine supports established pharmacometric methods and
+NONMEM-compatible data through a command-line interface, Rust API, and
+[R package](https://ferx-nlme.github.io/ferx-book/).
+
+[Install ferx](installation.qmd) or [run your first PopPK model](quick-start.qmd).
 
 ## Key Features
 

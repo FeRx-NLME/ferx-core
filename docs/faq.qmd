@@ -1,3 +1,9 @@
+---
+pagetitle: "ferx NLME modeling FAQ"
+description: "Answers about ferx population PK/PD modeling, NONMEM and nlmixr2 compatibility, FOCEI, optimizers, data handling, and model syntax."
+title-block-style: none
+---
+
 # Frequently Asked Questions
 
 ## Do I need to use MU-referencing in my model definitions, like in NONMEM / nlmixr2?

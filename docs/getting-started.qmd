@@ -1,3 +1,9 @@
+---
+pagetitle: "Getting started with ferx NLME modeling"
+description: "Install ferx and run your first nonlinear mixed-effects population PK model with the Rust CLI or R package."
+title-block-style: none
+---
+
 # Getting Started
 
 This section covers installing ferx-core and running your first model.

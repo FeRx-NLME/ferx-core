@@ -1,3 +1,9 @@
+---
+pagetitle: "ferx-core Rust API for NLME modeling"
+description: "Embed population PK/PD fitting, prediction, simulation, and ferx model parsing in Rust applications with the ferx-core API."
+title-block-style: none
+---
+
 # Rust API
 
 ferx-core can be used as a Rust library for embedding population PK estimation in your own applications.

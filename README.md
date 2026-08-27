@@ -7,7 +7,12 @@
 [![CodeFactor](https://www.codefactor.io/repository/github/ferx-nlme/ferx-core/badge)](https://www.codefactor.io/repository/github/ferx-nlme/ferx-core)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A high-performance Nonlinear Mixed Effects (NLME) modeling engine for population pharmacokinetics, written in Rust. Implements FOCEI and SAEM estimation with analytical PK solutions and ODE solvers.
+[Website](https://ferx-nlme.github.io/) · [Documentation](https://ferx-nlme.github.io/ferx-core/) · [R package](https://github.com/FeRx-NLME/ferx-r) · [Examples](https://ferx-nlme.github.io/ferx-core/examples/)
+
+ferx-core is an open-source, high-performance nonlinear mixed-effects (NLME)
+modeling engine for population pharmacokinetic and pharmacodynamic (PopPK/PD)
+analysis. Written in Rust, it implements FOCE/FOCEI, SAEM, importance sampling,
+analytical PK solutions, and ODE models for pharmacometric workflows.
 
 Additional features:
 - PK-PD and multi-analyte modeling

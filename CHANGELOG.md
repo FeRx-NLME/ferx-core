@@ -163,6 +163,10 @@ section of the SDLC for the versioning policy).
   decision changes — the bound only short-circuits the direction it can prove.
 
 ### Changed
+- **The ferx website and GitHub landing page are easier to discover and share (#1089).**
+  Documentation pages now publish descriptive search and social metadata, canonical URLs, and
+  clearer NLME and population PK/PD summaries while retaining the generated sitemap and crawler
+  instructions.
 - **`optimizer = auto` no longer picks BOBYQA on high-dimensional problems (#1064).** BOBYQA interpolates
   a quadratic over the whole parameter space, so its model grows quadratically in the parameter count;
   above 64 free coordinates `auto` now resolves to `nlopt_lbfgs`, whose finite-difference cost is linear.
