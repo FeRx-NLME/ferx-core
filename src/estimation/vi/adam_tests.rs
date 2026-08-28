@@ -55,6 +55,8 @@ fn three_steps_match_hand_computed_trace() {
         beta1: 0.9,
         beta2: 0.999,
         eps: 1e-8,
+        // Off: this trace is pinned to the bare Kingma & Ba update.
+        grad_clip: 0.0,
     };
     let g = 2.0_f64;
 
@@ -171,4 +173,156 @@ fn averaging_start_picks_the_tail_window() {
     assert_eq!(averaging_start(1, None), 0);
     assert_eq!(averaging_start(3, Some(0)), 2);
     assert_eq!(averaging_start(0, None), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Gradient clipping (#1097)
+// ---------------------------------------------------------------------------
+
+/// The clip is a pure rescale: it caps the length and leaves the direction alone.
+#[test]
+fn grad_clip_scale_caps_norm_and_preserves_direction() {
+    // 3-4-5 triangle: ‖g‖ = 5.
+    let g = [3.0, 4.0];
+
+    // Inside the ball, and exactly on it, are both untouched.
+    assert_eq!(grad_clip_scale(&g, 10.0), 1.0);
+    assert_eq!(grad_clip_scale(&g, 5.0), 1.0);
+
+    // Outside: scaled to exactly the clip length.
+    let s = grad_clip_scale(&g, 1.0);
+    let clipped = [g[0] * s, g[1] * s];
+    let norm = (clipped[0] * clipped[0] + clipped[1] * clipped[1]).sqrt();
+    assert!((norm - 1.0).abs() < 1e-12, "norm {norm} should be the clip");
+
+    // Direction preserved: the ratio between components is unchanged. This is the
+    // property a per-coordinate `clamp` would destroy, which is why the clip is on
+    // the norm.
+    assert!((clipped[0] / clipped[1] - g[0] / g[1]).abs() < 1e-12);
+}
+
+/// `0` (and any non-positive value) disables clipping, however large the gradient.
+#[test]
+fn grad_clip_scale_disabled_is_identity() {
+    let g = [1e14, -3e13];
+    assert_eq!(grad_clip_scale(&g, 0.0), 1.0);
+    assert_eq!(grad_clip_scale(&g, -1.0), 1.0);
+}
+
+/// A non-finite coordinate must not drive the norm to infinity and thereby scale
+/// every *other* coordinate to zero. `step` already treats such entries as zero;
+/// the norm has to agree, or one overflowing subject silences the whole vector.
+#[test]
+fn grad_clip_scale_ignores_non_finite_coordinates() {
+    let g = [3.0, f64::NAN, 4.0, f64::INFINITY];
+    // Norm is taken over the finite entries only: ‖(3,4)‖ = 5.
+    let s = grad_clip_scale(&g, 1.0);
+    assert!((s - 0.2).abs() < 1e-12, "expected 1/5, got {s}");
+
+    // An all-non-finite gradient has norm 0, so nothing is rescaled.
+    assert_eq!(grad_clip_scale(&[f64::NAN, f64::INFINITY], 1.0), 1.0);
+    // A genuinely zero gradient likewise.
+    assert_eq!(grad_clip_scale(&[0.0, 0.0], 1.0), 1.0);
+}
+
+/// The defect the clip exists for: one catastrophic gradient inflates `v` so far
+/// that every later step is numerically zero, and `v` only decays at `beta2` per
+/// iteration. Unclipped, a `1e14` spike freezes the optimizer; clipped, the same
+/// spike leaves the following steps at their ordinary size.
+///
+/// Measured over the *steady state* rather than from the spike onwards, because `m`
+/// is poisoned as well. Both moments are inflated at first, their ratio is O(1), and
+/// the optimizer still moves. The freeze sets in only once `m` has decayed to the
+/// scale of the ordinary gradients while `v` has not — and the two decay at very
+/// different rates: `m` sheds the eleven orders of magnitude between `1e14` and `1e3`
+/// in `ln(1e11)/ln(1/0.9) ≈ 240` iterations, whereas `v` needs
+/// `ln(1e22)/ln(1/0.999) ≈ 5e4` to shed twenty-two. That asymmetry is the bug, so the
+/// measurement window opens after `m` has settled and well before `v` has.
+#[test]
+fn grad_clip_prevents_second_moment_poisoning() {
+    // A spike, then ordinary gradients of the size a healthy fit produces.
+    let spike = 1e14;
+    let ordinary = 1e3;
+    const WARMUP: usize = 300;
+    const MEASURED: usize = 100;
+
+    let run = |clip: f64| -> f64 {
+        let cfg = AdamConfig {
+            lr: 0.02,
+            grad_clip: clip,
+            ..Default::default()
+        };
+        let mut st = AdamState::new(1);
+        let mut x = [0.0f64];
+        st.step(&mut x, &[spike], &cfg);
+        for _ in 0..WARMUP {
+            st.step(&mut x, &[ordinary], &cfg);
+        }
+        let settled = x[0];
+        // Still far short of the ~28 000 iterations an unclipped `v` needs to decay
+        // back to the scale of these gradients.
+        for _ in 0..MEASURED {
+            st.step(&mut x, &[ordinary], &cfg);
+        }
+        (x[0] - settled).abs()
+    };
+
+    let frozen = run(0.0);
+    let clipped = run(1e4);
+
+    // Unclipped the optimizer is inert: `√v̂ ≈ 2.7e12` against gradients of `1e3` gives
+    // steps of ~7e-12, so 100 iterations move it by ~7e-10.
+    assert!(
+        frozen < 1e-6,
+        "expected the unclipped optimizer to be frozen, moved {frozen}"
+    );
+    // Clipped it takes ordinary Adam steps — approaching `lr` per iteration once the
+    // gradient sign is consistent, so ~2 over this window.
+    assert!(
+        clipped > 0.1,
+        "expected the clipped optimizer to move freely, moved {clipped}"
+    );
+    // The point of the fix, stated as a ratio: orders of magnitude, not a nudge.
+    assert!(
+        clipped / frozen > 1e6,
+        "clipped {clipped} vs frozen {frozen}"
+    );
+}
+
+/// Clipping is asymptotically a no-op: Adam is scale-invariant in steady state, so a
+/// clip that binds uniformly on every iteration leaves the trajectory alone. This is
+/// why the threshold is not a sensitive tuning parameter, and why models that already
+/// converged are unaffected by turning it on.
+#[test]
+fn grad_clip_is_a_no_op_when_it_binds_uniformly() {
+    let grads = [[2.0, -1.0], [3.0, -2.0], [1.0, -0.5], [2.5, -1.5]];
+
+    let run = |clip: f64| -> [f64; 2] {
+        let cfg = AdamConfig {
+            lr: 0.02,
+            grad_clip: clip,
+            ..Default::default()
+        };
+        let mut st = AdamState::new(2);
+        let mut x = [0.0f64; 2];
+        for g in grads.iter() {
+            st.step(&mut x, g, &cfg);
+        }
+        x
+    };
+
+    // A clip small enough to bind on every iteration rescales each gradient, and Adam's
+    // `m̂/√v̂` is invariant to a per-iteration rescale only in the limit — over a handful
+    // of steps the bias corrections leave a small difference, so this asserts closeness
+    // rather than equality.
+    let unclipped = run(0.0);
+    let clipped = run(0.5);
+    for k in 0..2 {
+        assert!(
+            (unclipped[k] - clipped[k]).abs() < 5e-3,
+            "coord {k}: {} vs {}",
+            unclipped[k],
+            clipped[k]
+        );
+    }
 }

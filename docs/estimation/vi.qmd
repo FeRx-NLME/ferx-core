@@ -138,6 +138,7 @@ All keys go in `[fit_options]`.
 | `vi_iters` | 25000 | **Ceiling** on Adam iterations; the fit stops earlier once it has settled — see below |
 | `vi_mc_samples` | 32 | Monte-Carlo draws per subject per iteration. Sets the noise floor the settling test measures against, so it decides where the fit stops — see below |
 | `vi_lr` | 0.02 | Adam learning rate |
+| `vi_grad_clip` | 1e4 | Global-L2 gradient clip on the Adam steps; `0` disables it. Keeps one catastrophic gradient from freezing the optimizer — see below |
 | `vi_family` | `full_rank` | `full_rank` or `mean_field` |
 | `vi_omega_update` | `closed_form` | `closed_form` or `adam` |
 | `vi_sigma_update` | `closed_form` | `closed_form` or `adam` |
@@ -292,7 +293,12 @@ Three consequences worth carrying:
 
 - **If a VI fit lands well short of a FOCEI or AGQ fit of the same data, raise `vi_mc_samples`
   first.** More iterations do not fix the estimate — 150 000 at 8 draws still lands 9.1 units
-  short — and, worse, they let the run settle and certify itself.
+  short — and, worse, they let the run settle and certify itself. This is the right knob for the
+  failure *described here*: a fit whose `q` is in the correct basin and whose bound is tight
+  (`elbo_tightness_ratio` near 1), limited only by Monte-Carlo noise. It is the wrong knob for a
+  fit reporting a tightness ratio in the hundreds or thousands — there `q` is nowhere near the
+  posterior, more draws do not help, and the thing to check is
+  [gradient clipping](#grad-clip).
 - Lowering `vi_lr` also works (`0.002` reaches −285.9 at 8 draws), but it is tuning where the
   draw count is the principled knob.
 - **Chaining `[focei, vi]` does not help.** Starting from the fitted FOCEI point, the fit still
@@ -341,6 +347,88 @@ gets no gradient at those coordinates. Cross-checked externally — nlmixr2 7.0'
 holds the same two slots at exactly zero on the same declaration, under both variational
 families, while estimating the declared block. A `FIX`ed random effect likewise keeps its whole declared
 row and column of `Ω`, not just its own variance.
+
+## Gradient clipping, and the freeze it prevents {#grad-clip}
+
+`vi_grad_clip` bounds the length of the gradient vector before each Adam step. If
+`‖g‖₂` exceeds it, the whole vector is rescaled to that length; the direction is
+untouched. It defaults to `1e4` and `0` turns it off.
+
+This looks like a nuisance parameter and is not. Without it, VI on warfarin from the
+initial estimates in `ferx-testdata/warfarin_pk` — `TVCL 0.3, TVV 2, TVKA 1.0,
+σ 0.01`, an ordinary distance from the optimum, and the same values NONMEM's control
+stream uses — did not converge slowly. It froze.
+
+### The mechanism
+
+Adam does not use the raw gradient. It keeps a running mean `m` and a running mean of
+*squares* `v`, and steps by `lr · m̂ / √v̂`. The two have very different memories:
+`beta1 = 0.9` forgets in ~10 iterations, `beta2 = 0.999` in ~1000.
+
+At `TVV = 2` the model predicts almost nothing at late times, and a proportional error
+model turns that into `(y−f)²/(σf)²`. Iteration 0 evaluates at `−2·ELBO = 1.5e14`. That
+gradient enters `v`, leaving `v ≈ 1e25` and `√v̂ ≈ 1e12`. Once the fit recovers and
+ordinary gradients are ~`1e3`, the step is `lr·1e3/1e12 ≈ 1e-9·lr` — zero for practical
+purposes — and `v` sheds those twelve orders of magnitude only at `0.999` per iteration,
+which takes tens of thousands of them.
+
+So the optimizer stops moving. And because a frozen trace is a flat trace, the settling
+rule then fires at the earliest iteration it is allowed to, and the fit reports itself
+converged.
+
+::: {.callout-important}
+## What that looked like
+
+Warfarin, `ferx-testdata` initial estimates, against the NONMEM FOCEI run in that folder
+(`nm/run1_focei.lst`) started from the same values:
+
+| | TVCL | TVV | TVKA | σ | objective |
+|---|---|---|---|---|---|
+| VI, `vi_grad_clip = 0` | 0.2431 | 2.4750 | 0.7939 | **148.41** | `−2·ELBO` 3.6e7 |
+| VI, `vi_grad_clip = 1e4` | 0.132693 | 7.73787 | 0.81100 | 0.01162 | `−2·ELBO` −284.61 |
+| NONMEM FOCEI | 0.132695 | 7.73770 | 0.810795 | 0.010565 | OFV −286.004 |
+
+`σ = 148.413159` is exactly `exp(5)`, ferx's internal runaway guard — the fit ran to an
+implementation ceiling. It stopped after 1500 iterations of a 25 000 ceiling. NONMEM
+converges from these values in under a second.
+:::
+
+Two things this was *not*, both worth stating because both were checked:
+
+- **Not a bad basin.** Profiling `−2·ELBO` against `TVV` with everything else held fixed
+  is monotone from 2 to 20. There is no local minimum near 2.47; the optimizer was
+  walking away from a downhill direction.
+- **Not `σ`.** The closed-form `σ` update is the exact conditional maximizer given `q`,
+  and it was behaving correctly — a `q` that predicts near-zero concentrations really
+  does imply an enormous proportional `σ`. Pinning `σ` at the FOCEI value still left
+  `TVV` at 2.83 after 25 000 iterations. `σ` at its bound was the symptom.
+
+### Why the threshold barely matters
+
+Adam is scale-invariant in steady state: multiplying every gradient by a constant leaves
+`m̂/√v̂` unchanged. A clip that binds uniformly therefore does not move the trajectory,
+and clipping only bites during the transient, where it compresses the *ratio* between a
+catastrophic gradient and an ordinary one. On warfarin every setting from `1` to `1e5`
+recovers the reference and only `0` fails. Models that already converged are unchanged —
+`propofol_schnider` and `vancomycin_uvm` agree to seven significant figures with the clip
+on, and settle in 13–30% fewer iterations.
+
+There is correspondingly little reason to tune this. Lower it only if a trace oscillates
+violently; raising it has no observed benefit.
+
+::: {.callout-note collapse="true"}
+## Why clipping the norm, and why not an adaptive threshold
+
+Clipping each coordinate independently (`clamp(-c, c)`) shortens the largest components
+relative to the rest, which points the step somewhere the gradient does not. Clipping the
+norm is a uniform rescale and preserves direction exactly.
+
+The obvious refinement — set the threshold from a percentile of the gradient's own recent
+history, as in AutoClip — does not work here, and measurably makes things worse (it left
+`−2·ELBO` at 2.4e9 on this fit). The early history *is* the pathology: when the first ten
+gradients are all ~`1e14`, a self-referential threshold sits at `1e14` and nothing is ever
+clipped. Breaking the freeze requires an external scale, even a crude one.
+:::
 
 ## Standard errors
 

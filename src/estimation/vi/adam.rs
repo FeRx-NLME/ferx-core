@@ -30,6 +30,13 @@ pub struct AdamConfig {
     pub beta2: f64,
     /// Denominator floor, guarding division by a zero second moment.
     pub eps: f64,
+    /// Global-L2 gradient clip. `0.0` disables clipping.
+    ///
+    /// When `‖g‖₂` exceeds this, the whole vector is rescaled to length
+    /// `grad_clip`. The *direction* is untouched — only the magnitude is capped,
+    /// so clipping never redirects the step, it only refuses to take a violent
+    /// one. See [`AdamState::step`] for why that matters here.
+    pub grad_clip: f64,
 }
 
 impl Default for AdamConfig {
@@ -39,7 +46,34 @@ impl Default for AdamConfig {
             beta1: 0.9,
             beta2: 0.999,
             eps: 1e-8,
+            grad_clip: 0.0,
         }
+    }
+}
+
+/// Factor that rescales `grad` to length `clip`, or `1.0` when no clipping applies.
+///
+/// Returns `1.0` for a disabled clip (`clip <= 0`), for a gradient already inside the
+/// ball, and for a zero or non-finite norm — in every one of those cases the caller
+/// should use the gradient exactly as given.
+///
+/// Split out from [`AdamState::step`] so the geometry (direction preserved, length
+/// capped) is testable without an optimizer around it.
+pub fn grad_clip_scale(grad: &[f64], clip: f64) -> f64 {
+    // Disabled by a non-positive threshold; also short-circuits a NaN or infinite one,
+    // for which "never clip" is the only sensible reading.
+    if !clip.is_finite() || clip <= 0.0 {
+        return 1.0;
+    }
+    let norm = grad
+        .iter()
+        .map(|g| if g.is_finite() { g * g } else { 0.0 })
+        .sum::<f64>()
+        .sqrt();
+    if norm.is_finite() && norm > clip {
+        clip / norm
+    } else {
+        1.0
     }
 }
 
@@ -85,6 +119,36 @@ impl AdamState {
     /// every subsequent step for that coordinate would produce `NaN`. Skipping
     /// the update leaves the coordinate where it was, which is recoverable.
     /// Callers that need to know this happened should check their own gradient.
+    ///
+    /// # Why the gradient is clipped
+    ///
+    /// A finite but enormous gradient does not need to be `NaN` to disable the
+    /// optimizer, because `v` is an average of *squares* with a long memory. At the
+    /// default `beta2 = 0.999`, one gradient of `1e14` leaves
+    /// `v ≈ 0.001·(1e14)² = 1e25`, so `√v̂ ≈ 1e12`. Once the fit recovers and ordinary
+    /// gradients are `~1e3`, the step is `lr·1e3/1e12 ≈ 1e-9·lr` — zero for practical
+    /// purposes — and `v` sheds those twelve orders of magnitude only at `0.999` per
+    /// iteration, i.e. over ~28 000 steps. The optimizer is frozen, and because a frozen
+    /// trace is a flat trace, the early-stopping rule then certifies it as converged.
+    ///
+    /// VI reaches gradients like that routinely from ordinary starting values: under a
+    /// proportional error model a prediction near zero makes `(y−f)²/(σf)²` explode. On
+    /// warfarin from the `ferx-testdata` initial estimates, iteration 0 evaluates at
+    /// `−2·ELBO = 1.5e14` and the fit then sits at `σ = exp(5)` — its runaway bound —
+    /// reporting estimates ~1594 objective units short of FOCEI (#1097).
+    ///
+    /// Clipping bounds `‖g‖₂`, hence bounds `v` by `grad_clip²`, so the ratio between a
+    /// catastrophic gradient and an ordinary one can never grow large enough to stall the
+    /// step. It is close to a no-op once a fit is healthy: Adam is scale-invariant in
+    /// steady state (scaling every gradient by `k` leaves `m̂/√v̂` unchanged), so a clip
+    /// that binds uniformly does not move the trajectory. That is why the threshold is not
+    /// sensitive — on warfarin every value from `1` to `1e5` recovers the FOCEI estimates
+    /// and only `0` fails — and why two models that already converged are unchanged to
+    /// seven significant figures with clipping on.
+    ///
+    /// Clipping the *norm* rather than each coordinate is deliberate: a per-coordinate
+    /// `clamp` shortens the largest components relative to the rest and so points the step
+    /// somewhere the gradient does not.
     pub fn step(&mut self, x: &mut [f64], grad: &[f64], cfg: &AdamConfig) {
         debug_assert_eq!(x.len(), self.m.len());
         debug_assert_eq!(grad.len(), self.m.len());
@@ -95,8 +159,18 @@ impl AdamState {
         let bc1 = 1.0 - cfg.beta1.powi(self.t as i32);
         let bc2 = 1.0 - cfg.beta2.powi(self.t as i32);
 
+        // Uniform rescale factor, applied inline below so no copy of `grad` is made.
+        // Non-finite entries are excluded from the norm for the same reason `step`
+        // treats them as zero: one overflowing subject must not silence every other
+        // coordinate by driving the norm to infinity.
+        let scale = grad_clip_scale(grad, cfg.grad_clip);
+
         for i in 0..x.len() {
-            let g = if grad[i].is_finite() { grad[i] } else { 0.0 };
+            let g = if grad[i].is_finite() {
+                grad[i] * scale
+            } else {
+                0.0
+            };
             self.m[i] = cfg.beta1 * self.m[i] + (1.0 - cfg.beta1) * g;
             self.v[i] = cfg.beta2 * self.v[i] + (1.0 - cfg.beta2) * g * g;
             let m_hat = self.m[i] / bc1;
