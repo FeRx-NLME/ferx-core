@@ -326,3 +326,84 @@ fn grad_clip_is_a_no_op_when_it_binds_uniformly() {
         );
     }
 }
+
+/// A large-but-finite gradient must still be clipped, not silently waved through.
+///
+/// Regression for the review finding on #1112: computing the norm as `Σ g²` overflows
+/// to infinity once any `|g| > √f64::MAX ≈ 1.3e154`, or once enough merely large
+/// coordinates accumulate. An infinite norm failed the finiteness check, so the scale
+/// came back `1.0` and clipping was *disabled exactly where it was most needed* —
+/// `step` then squared the same unscaled value into `v = inf` and froze that coordinate
+/// permanently. The whole point of the clip is to stop a huge gradient from poisoning
+/// `v`, so it must not have an input range where it stops working.
+#[test]
+fn grad_clip_scale_survives_gradients_that_overflow_a_naive_norm() {
+    // `f64::MAX² = inf`. The naive `Σ g²` returns `inf` here and clips nothing.
+    for g in [
+        vec![f64::MAX, 1.0],
+        vec![f64::MAX, f64::MAX],
+        vec![1e200, -1e200, 1e200],
+        // Individually fine to square, but the sum overflows.
+        vec![1e160; 8],
+        vec![-f64::MAX, 0.0, f64::NAN],
+    ] {
+        let clip = 1e4;
+        let s = grad_clip_scale(&g, clip);
+
+        assert!(
+            s.is_finite() && s > 0.0,
+            "scale for {g:?} must be finite and non-zero, got {s}"
+        );
+        assert!(s < 1.0, "a gradient this large must actually be clipped");
+
+        // The clipped vector is finite, and its norm is the clip. Computed the scaled
+        // way here too, since the whole point is that the naive form cannot represent it.
+        let clipped: Vec<f64> = g
+            .iter()
+            .map(|x| if x.is_finite() { x * s } else { 0.0 })
+            .collect();
+        assert!(
+            clipped.iter().all(|x| x.is_finite()),
+            "clipped {clipped:?} must be finite"
+        );
+        let norm = clipped.iter().map(|x| x * x).sum::<f64>().sqrt();
+        assert!(
+            (norm - clip).abs() / clip < 1e-9,
+            "clipped norm {norm} should be the clip {clip} for {g:?}"
+        );
+
+        // And `step` — the consumer that was freezing — keeps `v` finite, so the
+        // coordinate is still alive on the next iteration.
+        let cfg = AdamConfig {
+            lr: 0.02,
+            grad_clip: clip,
+            ..Default::default()
+        };
+        let mut st = AdamState::new(g.len());
+        let mut x = vec![0.0; g.len()];
+        st.step(&mut x, &g, &cfg);
+        st.step(&mut x, &vec![1.0; g.len()], &cfg);
+        assert!(
+            x.iter().all(|v| v.is_finite()),
+            "step produced non-finite x {x:?} for {g:?}"
+        );
+        assert!(
+            x.iter().any(|v| *v != 0.0),
+            "step did not move at all for {g:?} — the coordinate is frozen"
+        );
+    }
+}
+
+/// Very small gradients must not underflow the scaled norm into a spurious clip.
+///
+/// The mirror of the overflow case: `Σ g²` flushes to zero for `|g| < √f64::MIN_POSITIVE`,
+/// which would report a zero norm. The scaled form factors out the magnitude, so a tiny
+/// gradient is correctly seen as far inside the clip ball and left alone.
+#[test]
+fn grad_clip_scale_survives_gradients_that_underflow_a_naive_norm() {
+    assert_eq!(grad_clip_scale(&[1e-200, -1e-200], 1e4), 1.0);
+    assert_eq!(grad_clip_scale(&[f64::MIN_POSITIVE, 0.0], 1e4), 1.0);
+    // A tiny clip against a tiny gradient still clips, and stays finite.
+    let s = grad_clip_scale(&[1e-200, 0.0], 1e-250);
+    assert!(s.is_finite() && s > 0.0 && s < 1.0, "got {s}");
+}

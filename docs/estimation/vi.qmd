@@ -411,7 +411,7 @@ and clipping only bites during the transient, where it compresses the *ratio* be
 catastrophic gradient and an ordinary one. On warfarin every setting from `1` to `1e5`
 recovers the reference and only `0` fails. Models that already converged are unchanged —
 `propofol_schnider` and `vancomycin_uvm` agree to seven significant figures with the clip
-on, and settle in 13–30% fewer iterations.
+on, and settle in the same number of iterations (2500 and 2000 respectively).
 
 There is correspondingly little reason to tune this. Lower it only if a trace oscillates
 violently; raising it has no observed benefit.

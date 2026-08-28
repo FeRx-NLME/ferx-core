@@ -54,24 +54,70 @@ impl Default for AdamConfig {
 /// Factor that rescales `grad` to length `clip`, or `1.0` when no clipping applies.
 ///
 /// Returns `1.0` for a disabled clip (`clip <= 0`), for a gradient already inside the
-/// ball, and for a zero or non-finite norm — in every one of those cases the caller
-/// should use the gradient exactly as given.
+/// ball, and for an all-zero or all-non-finite gradient — in every one of those cases
+/// the caller should use the gradient exactly as given.
 ///
 /// Split out from [`AdamState::step`] so the geometry (direction preserved, length
 /// capped) is testable without an optimizer around it.
+///
+/// # Why the norm is computed scaled
+///
+/// The obvious `Σ g²` overflows to infinity for a gradient that is large but perfectly
+/// finite — a single `|g| > √f64::MAX ≈ 1.3e154`, or enough merely large coordinates,
+/// is enough. An infinite norm would then fail the finiteness check and disable
+/// clipping, and `step` would go on to square the same unscaled value into `v = inf`,
+/// freezing that coordinate for the rest of the fit. That is precisely the failure this
+/// function exists to prevent, so it must not have an input range where it silently
+/// stops working.
+///
+/// Hence the BLAS `dnrm2` formulation: factor out the largest magnitude and accumulate
+/// `Σ (g/max)²`, which lies in `[1, n]` by construction. The full norm `max · r` is
+/// never formed — it is the quantity that would overflow — so the comparison and the
+/// scale are both arranged to divide instead of multiply.
 pub fn grad_clip_scale(grad: &[f64], clip: f64) -> f64 {
     // Disabled by a non-positive threshold; also short-circuits a NaN or infinite one,
     // for which "never clip" is the only sensible reading.
     if !clip.is_finite() || clip <= 0.0 {
         return 1.0;
     }
-    let norm = grad
+
+    // Largest finite magnitude. Non-finite entries are skipped for the same reason
+    // `step` treats them as zero: one overflowing subject must not silence every other
+    // coordinate by driving the norm to infinity.
+    let max = grad
         .iter()
-        .map(|g| if g.is_finite() { g * g } else { 0.0 })
+        .filter(|g| g.is_finite())
+        .fold(0.0f64, |m, g| m.max(g.abs()));
+    if max == 0.0 {
+        // All zero, or nothing finite: no direction to preserve and nothing to cap.
+        return 1.0;
+    }
+
+    // `r = ‖g‖ / max`, in `[1, √n]` — the coordinate attaining `max` contributes
+    // exactly 1, so `r` is never below it and the divisions below are safe.
+    let r = grad
+        .iter()
+        .map(|g| {
+            if g.is_finite() {
+                let t = g / max;
+                t * t
+            } else {
+                0.0
+            }
+        })
         .sum::<f64>()
         .sqrt();
-    if norm.is_finite() && norm > clip {
-        clip / norm
+    if r.is_nan() || r < 1.0 {
+        // Unreachable given the above, but a non-finite `r` must never become a scale.
+        return 1.0;
+    }
+
+    // Clip when `‖g‖ > clip`, i.e. `max · r > clip`, tested as `max > clip / r` so the
+    // product is never formed. `clip / r <= clip`, so the threshold is always finite.
+    let threshold = clip / r;
+    if max > threshold {
+        // `= clip / ‖g‖`, evaluated as `(clip / r) / max` for the same reason.
+        threshold / max
     } else {
         1.0
     }
