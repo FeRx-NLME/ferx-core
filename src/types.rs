@@ -4684,6 +4684,9 @@ pub enum WarningCode {
     ConditionNumber,
     /// Optimizer-health issue (trust-radius collapse, degeneracy).
     OptimizerHealth,
+    /// VI's final ELBO tightness diagnostic found that a flat objective represents
+    /// a bad basin rather than a usable variational approximation.
+    ViBadBasin,
     /// Residual (IWRES) autocorrelation — Durbin–Watson out of range.
     DwAutocorrelation,
     /// ETA distribution departs from normality (Shapiro–Wilk).
@@ -4780,6 +4783,7 @@ impl WarningCode {
             WarningCode::CovarianceRegularized => "covariance_regularized",
             WarningCode::ConditionNumber => "condition_number",
             WarningCode::OptimizerHealth => "optimizer_health",
+            WarningCode::ViBadBasin => "vi_bad_basin",
             WarningCode::DwAutocorrelation => "dw_autocorrelation",
             WarningCode::EtaNormality => "eta_normality",
             WarningCode::Experimental => "experimental",
@@ -4879,7 +4883,12 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
     // rewrite instead of a one-line edit. Scoped to this statement rather than
     // the whole fn so a future duplicated arm in another chain still lints.
     #[allow(clippy::if_same_then_else)]
-    let (severity, category) = if lower.contains("w_absorption_twin_declined") {
+    let (severity, category) = if lower.contains("w_vi_bad_basin") {
+        // #1098: VI's final bound-quality check demotes `converged`; keep this
+        // distinct from a budget-limited convergence failure so programmatic
+        // consumers can choose new starts or a chained initializer.
+        (WarningSeverity::Critical, WarningCode::ViBadBasin)
+    } else if lower.contains("w_absorption_twin_declined") {
         // #1008: the analytic absorption model kept no ODE twin. Not an estimation problem —
         // the fit that follows is a pure closed form — but the model has silently lost the
         // reroute, so it is worth its own code rather than the `general` bucket.

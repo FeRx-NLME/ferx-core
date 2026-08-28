@@ -20,6 +20,11 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Fixed
+- **VI's bad-basin detector now reports `converged: false` (#1098).** An implausibly loose
+  final ELBO already identified a fit trapped far from a usable variational approximation, but
+  the result still exposed `converged: true` to programmatic consumers. Such fits are now demoted,
+  omit the misleading "increase `vi_iters`" warning, and carry the critical structured warning
+  code `vi_bad_basin`.
 - **`vi_mc_samples` now defaults to 32, not 8 (#1017).** This draw count sets the noise floor
   VI's settling test measures against, so it decides *where a fit stops* — and therefore what is
   certified — rather than merely how noisy the trace is. At 8, on `data/warfarin.csv` (~1%

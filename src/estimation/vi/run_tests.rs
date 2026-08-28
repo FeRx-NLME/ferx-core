@@ -179,6 +179,50 @@ fn systematic_drift_is_detected_below_the_settling_test_noise_floor() {
     assert!(!trace_still_drifting(&poisoned, 40));
 }
 
+/// #1098: an implausibly loose ELBO is evidence that a flat trace is a bad basin,
+/// not successful convergence. It must also suppress the generic iteration-budget
+/// advice, which does not address this failure mode.
+#[test]
+fn bad_basin_guard_demotes_convergence_and_uses_its_own_warning() {
+    let tightness = super::ElboTightness {
+        excess: 260.0,
+        expected: 10.0,
+    };
+    let mut converged = true;
+
+    let warning = super::bad_basin_warning(&mut converged, &tightness)
+        .expect("a ratio above the implausibility threshold must warn");
+
+    assert!(!converged, "a detected bad basin is not convergence");
+    assert!(warning.starts_with("W_VI_BAD_BASIN:"));
+    assert!(warning.contains("Reported converged: false"));
+    assert!(!warning.contains("`converged` reflects a flat objective"));
+    assert!(
+        !super::needs_iteration_budget_warning(converged, false, true),
+        "bad-basin guidance must replace the generic increase-vi_iters warning"
+    );
+
+    let structured = crate::types::classify_warning(&warning);
+    assert_eq!(structured.category, crate::types::WarningCode::ViBadBasin);
+    assert_eq!(structured.severity, crate::types::WarningSeverity::Critical);
+}
+
+/// A healthy ELBO must leave convergence untouched, and an ordinary exhausted run
+/// still gets the iteration-budget warning.
+#[test]
+fn healthy_tightness_does_not_change_convergence_reporting() {
+    let tightness = super::ElboTightness {
+        excess: 10.0,
+        expected: 10.0,
+    };
+    let mut converged = true;
+
+    assert!(super::bad_basin_warning(&mut converged, &tightness).is_none());
+    assert!(converged);
+    assert!(super::needs_iteration_budget_warning(false, false, false));
+    assert!(!super::needs_iteration_budget_warning(false, true, false));
+}
+
 // ---------------------------------------------------------------------------
 // End-to-end behaviour
 // ---------------------------------------------------------------------------

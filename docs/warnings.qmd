@@ -49,6 +49,7 @@ Each `WarningCode` token, what it flags, and a typical response.
 | `covariance_step` | Info | Covariance-step informational note (e.g. evaluation cost). | None. |
 | `condition_number` | Critical | Ill-conditioned covariance / high condition number. | Over-parameterized — drop a random effect or covariate. |
 | `optimizer_health` | Warning | Trust-radius collapse / degeneracy. | Try a different optimizer or re-scale parameters. |
+| `vi_bad_basin` | Critical | VI's final ELBO tightness check found that a flat objective is an unusable variational bound, not convergence. | Reject the fit; use better starting values or initialize VI from a fitted point with `method = [focei, vi]`. |
 | `dw_autocorrelation` | Warning | IWRES autocorrelation (Durbin–Watson out of range). | Revisit the residual-error / structural model. |
 | `eta_normality` | Warning | ETA departs from normality. | Consider a mixture or transform. |
 | `experimental` | Warning | An experimental feature (SDE, neural-network) was used. | Treat results with caution; validate. |
