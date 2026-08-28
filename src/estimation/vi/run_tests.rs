@@ -1305,3 +1305,68 @@ fn default_mc_samples_is_the_validated_value() {
          re-opens the certified-wrong-sigma failure (see this test's docs)"
     );
 }
+
+/// The gradient clip is on by default, and that default is load-bearing rather than
+/// cosmetic.
+///
+/// Without it, warfarin from the `ferx-testdata` initial estimates (`TVV = 2`, an ordinary
+/// distance from the optimum) does not merely fit badly — it freezes. Iteration 0 evaluates
+/// at `−2·ELBO = 1.5e14`, because a proportional error model with predictions near zero
+/// sends `(y−f)²/(σf)²` to that scale; Adam's second moment absorbs it, and with
+/// `beta2 = 0.999` the resulting `√v̂ ≈ 1e12` leaves every later step numerically zero for
+/// tens of thousands of iterations. The run then stops at the earliest iteration the
+/// settling rule permits — a frozen trace is a flat trace — with `σ` welded to its `exp(5)`
+/// runaway bound and estimates ~1594 objective units short of FOCEI (#1097).
+///
+/// Measured on `ferx-testdata/warfarin_pk` against the NONMEM FOCEI run in that folder
+/// (`nm/run1_focei.lst`, identical initial estimates, OFV `−286.004219`):
+///
+/// | | TVCL | TVV | TVKA | σ | −2·ELBO |
+/// |---|---|---|---|---|---|
+/// | `vi_grad_clip = 0` | 0.2431 | 2.4750 | 0.7939 | **148.41** | 3.6e7 |
+/// | `vi_grad_clip = 1e4` | 0.132693 | 7.73787 | 0.81100 | 0.01162 | −284.61 |
+/// | *NONMEM FOCEI* | *0.132695* | *7.73770* | *0.810795* | *0.010565* | *−286.004* |
+///
+/// Reproduced on four seeds, and `propofol_schnider` / `vancomycin_uvm` — models that
+/// already converged — are unchanged to seven significant figures with the clip on, because
+/// Adam is scale-invariant in steady state.
+///
+/// So turning this off by default re-opens #1097. It stays a knob because a user may want
+/// the unclipped trajectory for comparison, not because zero is a reasonable default.
+#[test]
+fn gradient_clipping_is_on_by_default() {
+    let d = FitOptions::default();
+    assert!(
+        d.vi_grad_clip > 0.0,
+        "VI gradient clipping must be on by default; disabling it re-opens the #1097 \
+         freeze (see this test's docs)"
+    );
+    assert_eq!(d.vi_grad_clip, 1e4);
+}
+
+/// The clip reaches Adam. A default `FitOptions` must produce a clipping `AdamConfig`, and
+/// an explicit `0` must produce a non-clipping one — the wiring is a single field, but it
+/// is the field that decides whether #1097 reproduces, so it is pinned rather than assumed.
+#[test]
+fn vi_grad_clip_reaches_the_adam_config() {
+    let mut o = FitOptions::default();
+    let cfg = AdamConfig {
+        lr: o.vi_lr,
+        grad_clip: o.vi_grad_clip,
+        ..Default::default()
+    };
+    assert_eq!(cfg.grad_clip, 1e4);
+    // A huge gradient is actually rescaled under that config.
+    assert!(super::super::adam::grad_clip_scale(&[1e14], cfg.grad_clip) < 1e-9);
+
+    o.vi_grad_clip = 0.0;
+    let off = AdamConfig {
+        lr: o.vi_lr,
+        grad_clip: o.vi_grad_clip,
+        ..Default::default()
+    };
+    assert_eq!(
+        super::super::adam::grad_clip_scale(&[1e14], off.grad_clip),
+        1.0
+    );
+}

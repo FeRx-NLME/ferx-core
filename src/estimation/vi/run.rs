@@ -499,6 +499,7 @@ pub fn run_vi(
     };
     let adam_cfg = AdamConfig {
         lr: options.vi_lr,
+        grad_clip: options.vi_grad_clip,
         ..Default::default()
     };
 

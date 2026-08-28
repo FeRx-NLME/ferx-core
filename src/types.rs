@@ -5946,6 +5946,27 @@ pub struct FitOptions {
     /// iteration one on the same data (σ 0.031 vs 0.022). That disappears at 0.02 and
     /// below, which is why the default sits here rather than at the paper's value.
     pub vi_lr: f64,
+    /// Global-L2 gradient clip for the Adam steps. Default `1e4`; `0` disables it.
+    ///
+    /// Each iteration, if the gradient vector is longer than this it is rescaled to this
+    /// length, keeping its direction. The point is not to shorten the step — Adam
+    /// normalizes the step size anyway — but to bound Adam's second moment `v`, which
+    /// averages *squared* gradients with a ~1000-iteration memory at `beta2 = 0.999`. One
+    /// catastrophic gradient otherwise inflates `v` by so many orders of magnitude that
+    /// every subsequent step is numerically zero for the rest of the run.
+    ///
+    /// VI meets such gradients from ordinary starting values: under proportional error a
+    /// prediction near zero sends `(y−f)²/(σf)²` to ~`1e14`. Without clipping, warfarin
+    /// from the `ferx-testdata` initial estimates freezes and reports `σ` welded to its
+    /// `exp(5)` runaway bound, ~1594 objective units short of FOCEI (#1097); with it, the
+    /// same fit reproduces the NONMEM FOCEI estimates to five significant figures.
+    ///
+    /// The value is deliberately not a sensitive tuning knob — on warfarin every setting
+    /// from `1` to `1e5` recovers the reference and only `0` fails — because clipping is
+    /// asymptotically a no-op: Adam is scale-invariant in steady state, so a clip that
+    /// binds uniformly leaves the trajectory unchanged. Lower it only if a fit's trace
+    /// oscillates violently; there is little reason to raise it.
+    pub vi_grad_clip: f64,
     /// Variational family. Default [`ViFamily::FullRank`].
     pub vi_family: ViFamily,
     /// How `Ω` is updated. Default [`ViOmegaUpdate::ClosedForm`].
@@ -6402,6 +6423,7 @@ impl Default for FitOptions {
             vi_iters: 25_000,
             vi_mc_samples: 32,
             vi_lr: 0.02,
+            vi_grad_clip: 1e4,
             vi_family: ViFamily::default(),
             vi_omega_update: ViOmegaUpdate::default(),
             vi_sigma_update: ViSigmaUpdate::default(),
@@ -7341,6 +7363,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "vi_iters",
             "vi_mc_samples",
             "vi_lr",
+            "vi_grad_clip",
             "vi_family",
             "vi_omega_update",
             "vi_sigma_update",

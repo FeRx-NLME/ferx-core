@@ -20308,3 +20308,27 @@ mod theta_level_primitives {
         assert_eq!(s.axes_for_theta(0), (Some(2), None));
     }
 }
+
+/// `vi_grad_clip` parses, accepts `0` as "disabled", and rejects a negative threshold.
+///
+/// `0` has to stay legal: it is how a user asks for the unclipped Adam trajectory, which
+/// is the pre-#1097 behaviour and occasionally worth reproducing for comparison. A
+/// negative clip has no meaning — `grad_clip_scale` would treat it as disabled — so it is
+/// rejected at parse time rather than silently reinterpreted.
+#[test]
+fn test_apply_fit_option_vi_grad_clip() {
+    let mut opts = FitOptions::default();
+    assert_eq!(opts.vi_grad_clip, 1e4, "default clip");
+
+    assert_eq!(apply_fit_option(&mut opts, "vi_grad_clip", "250"), Ok(true));
+    assert_eq!(opts.vi_grad_clip, 250.0);
+
+    // Explicitly disabled.
+    assert_eq!(apply_fit_option(&mut opts, "vi_grad_clip", "0"), Ok(true));
+    assert_eq!(opts.vi_grad_clip, 0.0);
+
+    // Rejected, and a failed apply leaves the previous value alone.
+    assert!(apply_fit_option(&mut opts, "vi_grad_clip", "-1").is_err());
+    assert!(apply_fit_option(&mut opts, "vi_grad_clip", "nope").is_err());
+    assert_eq!(opts.vi_grad_clip, 0.0);
+}
