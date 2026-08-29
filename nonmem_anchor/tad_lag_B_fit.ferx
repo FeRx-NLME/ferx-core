@@ -4,7 +4,13 @@
 # effect on any prediction. It is present only because ferx routes a subject to
 # the event-driven predictor when a covariate column actually varies within the
 # subject; the plain (dense) predictor returns NaN for a TAD-reading RHS under a
-# lagtime (#1110). With a zero exponent every per-event covariate snapshot is
+# lagtime (#1110).
+#
+# NOTE (#1124): no longer required — #1124 routes a model-time-reading RHS to the
+# event-driven predictor directly. WT is kept only so this passing anchor is not
+# perturbed; do not copy the trick into a new anchor (see mr_tad_fit.ferx).
+#
+# With a zero exponent every per-event covariate snapshot is
 # identical, so this anchor does not exercise the TV-covariate snapshot
 # convention and cannot be invalidated by #1073.
 

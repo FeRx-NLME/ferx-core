@@ -27,7 +27,12 @@
 //!
 //! ferx routes a subject to its event-driven predictor only when a covariate column
 //! actually varies within the subject; the plain (dense) predictor returns `NaN` for
-//! a `TAD`-reading RHS under a lagtime (#1110, a separate pre-existing defect). `WT`
+//! a `TAD`-reading RHS under a lagtime (#1110, a separate pre-existing defect —
+//! **fixed since #1124**, which routes any model-time-reading RHS to the
+//! event-driven predictor directly, so this `WT` trick is no longer required. It
+//! is kept only so a passing anchor is not perturbed: removing it drops `THETA(5)`
+//! and needs a fresh NONMEM run and a new committed OFV. Do not copy it into a new
+//! anchor — `mr_tad.ctl` has no `WT` column). `WT`
 //! varies here purely to force that routing, and its exponent is fixed at `0` in
 //! **both** engines, so `(WT/70)^0 == 1` exactly and `WT` cannot change any
 //! prediction. That also means every per-event covariate snapshot is identical, so
