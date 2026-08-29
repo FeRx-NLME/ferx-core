@@ -19,6 +19,40 @@ pub(crate) fn model_uses_time_builtin(model: &CompiledModel) -> bool {
     crate::parser::model_parser::compiled_model_uses_time_builtin(model)
 }
 
+/// Does this model depend on model time *anywhere* — the individual-parameter
+/// program (as [`model_uses_time_builtin`] alone reports) **or** the `[odes]`
+/// right-hand side itself?
+///
+/// The routing guards that pick between the event-driven predictor, the
+/// modified-release closed form, and the plain dense integration used to ask
+/// only the first question. An `[odes]` RHS reading `TAD`/`TAFD`/`T`/`TIME` is
+/// just as non-autonomous, and neither of the two static paths can represent it:
+///
+///   - the **closed form** identifies the disposition by probing the RHS at two
+///     times with `tad` pinned to `0.0`, so a `TAD` term is invisible to it and
+///     was silently dropped from the predictions — 8× wrong at 12 h (#1124);
+///   - the **dense** predictor starts its first segment at the dose *record*
+///     rather than the arrival, so under a lagtime its `TAD` anchor has no
+///     qualifying dose and it returns `NaN` for every observation (#1110).
+///
+/// Routing these models to the event-driven predictor — which places doses on
+/// its timeline at `d.time + lag`, so `TAD` anchors correctly — is what both
+/// defects have in common, and it is the path the NONMEM `TAD`-in-`$DES` anchors
+/// (`nonmem_anchor/tad_lag_{A,B}`) already validate.
+///
+/// Widening this predicate never changes a model that was already correct: a
+/// bare-`TAFD` RHS with no lagtime moves from the dense path to the event-driven
+/// one and agrees to `6e-13`.
+#[inline]
+pub(crate) fn model_uses_time_anywhere(model: &CompiledModel) -> bool {
+    model_uses_time_builtin(model)
+        || model.ode_spec.as_ref().is_some_and(|s| {
+            s.rhs_program
+                .as_ref()
+                .is_some_and(|p| p.uses_time_vars() || p.reads_time_builtin())
+        })
+}
+
 #[inline]
 fn pk_params_at_time(
     model: &CompiledModel,
@@ -1838,7 +1872,7 @@ pub fn compute_predictions_with_states(
     // superposition path, which has no valid states for those subjects and would otherwise
     // return NaN. Matches the IPRED routing in `compute_predictions_with_tv` (#486).
     let model = effective_model_for_eval(model, subject, theta, eta);
-    let uses_time = model_uses_time_builtin(model);
+    let uses_time = model_uses_time_anywhere(model);
     if let Some(ref ode) = model.ode_spec {
         // ODE path: both ipred and states come from a single ODE integration.
         // TV-covariate and reset subjects need the event-driven path (which also
@@ -2254,7 +2288,7 @@ pub fn compute_predictions_with_tv_into_with_schedule(
     // harmless); every other model is unchanged (#486).
     let model = effective_model_for_eval(model, subject, theta, eta);
     let has_tv = subject.has_tv_covariates();
-    let uses_time = model_uses_time_builtin(model);
+    let uses_time = model_uses_time_anywhere(model);
 
     let mut preds = if model.is_algebraic() {
         // Compartment-free model (#811): there is no state to integrate and no
@@ -2287,11 +2321,24 @@ pub fn compute_predictions_with_tv_into_with_schedule(
             // parameter snapshot cannot represent a time-varying disposition — a
             // `TIME`-dependent parameter is invisible to `identify_disposition`'s
             // fixed-`p` Jacobian probe, so the branch guard, not that probe, is what
-            // excludes it. `mr_predictions` returns `None` (→ the `ode_predictions`
-            // twin below) for anything else outside scope (IOV, SS / infusion doses,
-            // flip-flop, non-linear / non-canonical disposition); the admitted result
-            // reduces to that twin to solver tolerance
-            // (`modified_release::tests::reduces_to_ode_*`).
+            // excludes it — and since #1124 that guard is `model_uses_time_anywhere`,
+            // which also excludes a model-time-reading `[odes]` RHS (the probe is
+            // equally blind to `TAD`, and to anything inside an untaken `if` branch).
+            // `mr_predictions` returns `None` (→ the `ode_predictions` twin below) for
+            // anything else outside scope (IOV, SS / infusion doses, flip-flop,
+            // non-linear / non-canonical disposition).
+            //
+            // The admitted result reduces to that twin to solver tolerance. Note what
+            // that claim is worth *here*: this branch sits before the twin, so
+            // production and the closed form are the same code and comparing them
+            // agrees by construction — the `mr_vs_prod` difference is exactly `0.0`,
+            // and #1124's 8× error was invisible from this side for that reason. The
+            // reduction is only ever established elsewhere: by
+            // `modified_release::tests::reduces_to_ode_*` on the fixture zoo, by
+            // `mr_matches_the_states_entry_point` across the two production entry points
+            // (`compute_predictions_with_states` deliberately has *no* MR branch —
+            // do not add one, it is the independent side of that check), and at
+            // runtime in debug builds by `modified_release::verify_against_ode_twin`.
             mr
         } else {
             let pk = pk_params_at_time(model, theta, eta, &subject.covariates, 0.0);

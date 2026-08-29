@@ -19,3 +19,6 @@ rustc-ice-*.txt
 # Built documentation output — generated and deployed by CI (.github/workflows/docs.yml)
 docs/_site/
 bench_*.csv
+
+# Python bytecode from the nonmem_anchor reference scripts
+__pycache__/

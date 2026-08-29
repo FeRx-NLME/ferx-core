@@ -213,6 +213,40 @@ with an adaptive Dormand-Prince RK45:
 
 The solver automatically adapts step sizes based on local error estimates.
 
+### A right-hand side that reads model time is always integrated {#non-autonomous-rhs}
+
+For some models ferx skips integration entirely. A static multi-route absorption model with a
+linear one- or two-compartment disposition — parallel or mixed `first_order` / `transit` /
+`igd` / `zero_order` pathways — is evaluated as a superposition of closed-form single-route
+solutions, which is exact and much faster than stepping the system.
+
+That shortcut needs the disposition to be **time-invariant**, so it does not apply to a
+right-hand side that reads `TIME`, `T`/`t`, `TAFD`, or `TAD` — including one that reads them
+only inside an `if` condition:
+
+```
+[odes]
+  # non-autonomous: integrated, never served by the closed form
+  d/dt(central) = FZO1*first_order(ka=KA) + FZO*zero_order(dur=DUR)
+                  - CL/V*central*(1.0 + 0.3*TAD)
+```
+
+Such models take the event-driven ODE path, which places each dose on its timeline at its
+(possibly lagged) arrival so `TAD` anchors correctly. There is nothing to configure; the cost
+is that these models integrate rather than evaluate in closed form.
+
+::: {.callout-warning}
+## Affects results from ferx 0.3.0 and earlier
+
+Until [#1124](https://github.com/FeRx-NLME/ferx-core/issues/1124) a `TAD`-reading right-hand
+side was admitted by the closed-form path, which never evaluates the right-hand side at all —
+so the `TAD` term was **dropped from the predictions**, silently and with no warning. If you
+have results from an earlier version for a model whose `[odes]` block reads `TAD`, re-run
+them: the reported concentrations were those of the same model with the term deleted (8× the
+correct value by 12 h on the reference case). Models that do not read model time in `[odes]`
+are unaffected.
+:::
+
 ### Stiff systems
 
 An explicit method like RK45 is *stability*-limited on a stiff system: it keeps shrinking

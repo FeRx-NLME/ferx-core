@@ -20,6 +20,24 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Fixed
+- **An `[odes]` RHS that reads `TAD` is no longer silently dropped from the predictions
+  (#1124).** A model whose right-hand side read the time-after-dose built-in — for example
+  `- CL/V*central*(1 + 0.3*TAD)` on a mixed `first_order` + `zero_order` absorption model —
+  was served by the closed-form modified-release fast path, which never evaluates that
+  right-hand side. The `TAD` term was **absent** from the predictions, not approximated:
+  output was bit-identical to the same model with the term deleted, reaching 8× the correct
+  concentration by 12 h, with no error, no warning, and `converged: true`. Because the value
+  is wrong, the error reached `IPRED`, the OFV, residuals, and every downstream diagnostic.
+  Such models now integrate on the event-driven ODE path, which evaluates the right-hand side
+  as written. The same routing covers `TAFD`, `T`/`t`, and `TIME`, including when read only
+  from inside an `if` condition (measured 40% error, all four spellings) — the closed form's
+  time-invariance probe samples two times and could not see any of them. Models that do not
+  read model time are unaffected and keep the fast path.
+- **An `[odes]` RHS that reads `TAD` together with a lagtime no longer returns `NaN`
+  predictions (#1110).** The dense predictor anchored `TAD` on doses that had already
+  arrived, and under a lagtime none has at the first segment's start, so every prediction
+  came back `NaN`. These models now take the event-driven predictor, whose timeline starts at
+  the lagged arrival. (What `TAD` should mean *before* the first arrival remains open.)
 - **VI no longer freezes from ordinary starting values (#1097).** Adam's gradients are now
   clipped to a global L2 norm, controlled by the new `vi_grad_clip` fit option (default `1e4`;
   `0` restores the old behaviour). Under a proportional error model a prediction near zero

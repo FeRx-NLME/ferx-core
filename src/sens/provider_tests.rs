@@ -11125,3 +11125,82 @@ mod theta_gather_sens {
         );
     }
 }
+
+/// `MR_MIXED_1CPT` with a `TAD` factor on the elimination term — the shape the
+/// closed form used to admit and serve without ever evaluating that term (#1124).
+const MR_MIXED_1CPT_TAD: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVFZO(0.4, 0.05, 0.95)
+  theta TVKA(1.5, 0.05, 24.0)
+  theta TVDUR(2.0, 0.1, 12.0)
+  theta TVLAG(1.0, 0.001, 6.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV * exp(ETA_V)
+  FZO = TVFZO
+  FZO1 = 1 - TVFZO
+  KA = TVKA
+  DUR = TVDUR
+  LAG = TVLAG
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = FZO1*first_order(ka=KA, lag=LAG) + FZO*zero_order(dur=DUR) - CL/V*central*(1.0 + 0.3*TAD)
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+/// #1124 on the **gradient** side. `mr_scope` now declines a `TAD`-reading RHS,
+/// so the jet comes from the ODE provider instead of the closed form; that jet
+/// must agree with finite differences of the production predictor.
+///
+/// This is the parity check CLAUDE.md requires whenever an analytic sensitivity
+/// route changes. It is also the assertion the closed form could not have
+/// satisfied: it dropped the `TAD` term from the value *and* from every
+/// derivative, so it agreed with FD **of itself** while disagreeing with FD of
+/// what production now predicts.
+///
+/// Two doses, so `TAD` genuinely re-anchors partway through the record interval —
+/// under a single dose `TAD == TAFD` and the term this test exists for is
+/// indistinguishable from one that was never broken.
+#[test]
+fn tad_reading_mr_shaped_model_takes_a_route_that_matches_fd() {
+    let model = parse_model_string(MR_MIXED_1CPT_TAD).expect("parse");
+    // Sample times deliberately avoid `LAG = 1.0`, `DUR = 2.0`, and the second
+    // dose's arrival at `6 + LAG`. On a moving dose boundary the analytic
+    // derivative is one-sided by design while a central difference averages
+    // across the kink, so the two disagree there for reasons that have nothing to
+    // do with this fix (see `docs/estimation/foce.qmd`, "Sampling exactly on a
+    // moving dose boundary") — measured 2× on `df_dtheta` with `t = 1.0` and
+    // `t = 2.0` in the list, on the *unmodified* fixture too.
+    let mut subject = oral_subject(&[0.4, 0.9, 1.7, 2.6, 3.4, 7.3, 11.1]);
+    subject
+        .doses
+        .push(DoseEvent::new(6.0, 100.0, 1, 0.0, false, 0.0));
+    let theta = [5.0, 50.0, 0.4, 1.5, 2.0, 1.0];
+    let eta = [0.1, -0.05];
+
+    // The premise: the fast path must have stepped aside, on all three entries.
+    assert!(
+        crate::pk::modified_release::mr_subject_sensitivities(&model, &subject, &theta, &eta)
+            .is_none(),
+        "the closed form must decline a `TAD`-reading RHS"
+    );
+    assert!(
+        crate::pk::modified_release::mr_subject_eta_grad(&model, &subject, &theta, &eta).is_none()
+    );
+    assert!(crate::pk::modified_release::mr_predictions(&model, &subject, &theta, &eta).is_none());
+
+    check_full_provider_vs_fd(&model, &subject, &theta, &eta);
+}
