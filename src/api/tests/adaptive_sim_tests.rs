@@ -1302,6 +1302,77 @@ fn adaptive_base_infusion_ending_between_records_matches_static_predict() {
 }
 
 #[test]
+fn adaptive_locf_carry_does_not_advance_past_a_non_record_break() {
+    // Since #1073 the reactive walk resolves a segment FORWARD — a break that is not a
+    // data record takes the next record ahead. The LOCF carry must NOT follow it there.
+    //
+    // `last_pk` is the covariate a controller sees: it feeds the decision-time readout
+    // and fixes the bioavailability of any dose injected at that decision. Advancing it
+    // from the segment's own (forward-looking) snapshot would let a decision at a
+    // non-record instant read a covariate that has not been recorded yet — the walk
+    // reaching into its own future. So the carry advances only at an actual record
+    // (`records.at(t_end)`), which is also what keeps a dose arrival, an infusion end,
+    // a zero-order cutoff and an EVID=3/4 reset from disturbing it at all.
+    //
+    // Fixture: `F` reads `CRCL`, which steps 100 -> 50 at the `t = 24` record. The
+    // second decision is at `t = 12` — deliberately NOT a record — so its dose's `F`
+    // comes through `last_pk`. LOCF gives `CRCL = 100` (the `t = 0` record) and
+    // `F = 0.8`; leaking the forward resolution gives `CRCL = 50` and `F = 0.4`, a
+    // factor of two in the delivered dose that shows up at every later observation.
+    //
+    // Non-IOV on purpose: under IOV `last_pk` is overwritten by `decision_pk[g]` at the
+    // top of a decision break, which would mask the leak.
+    let model = parse_model_string(ODE_TV_F).expect("parse TV-F ODE model");
+    let obs = vec![0.0, 24.0, 48.0];
+    let mut s = subj("1", obs.clone(), vec![]);
+    s.covariates = HashMap::from([("CRCL".to_string(), 100.0)]);
+    s.obs_covariates = vec![
+        HashMap::from([("CRCL".to_string(), 100.0)]),
+        HashMap::from([("CRCL".to_string(), 50.0)]),
+        HashMap::from([("CRCL".to_string(), 50.0)]),
+    ];
+    let mut pop = population(vec![s]);
+    pop.covariate_names = vec!["CRCL".to_string()];
+
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(13),
+        // t=12 is not an observation, so the decision there is a non-record break.
+        decision_times: vec![0.0, 12.0],
+        ..Default::default()
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        .expect("TV-F subject with an off-record decision runs");
+    assert_eq!(res.ledger.len(), 2, "a 100-unit bolus at each decision");
+
+    // Both doses land under the LOCF covariate CRCL = 100, so both deliver
+    // F * 100 = 0.8 * 100 = 80 units. The leak would make the second deliver 40.
+    for (i, e) in res.ledger.iter().enumerate() {
+        assert!(
+            (e.f_applied - 0.8).abs() < 1e-12,
+            "dose {i} at t={}: F = {} (LOCF CRCL = 100 gives 0.8; the forward leak \
+             gives 0.4)",
+            e.time,
+            e.f_applied
+        );
+    }
+
+    // And the trajectory, so the assertion is not only about bookkeeping. k = CL/V =
+    // 0.1/h; 80 units at t=0 decay to t=12, 80 more land there, and the sum decays to
+    // t=24 and t=48.
+    let k: f64 = 5.0 / 50.0;
+    let a12 = 80.0 * (-12.0 * k).exp() + 80.0;
+    let expect = [80.0, a12 * (-12.0 * k).exp(), a12 * (-36.0 * k).exp()];
+    for (traj, want) in res.trajectories.iter().zip(expect.iter()) {
+        assert!(
+            (traj.ipred - want).abs() <= 8.0 * (1e-6 + 1e-4 * want),
+            "t={}: IPRED {} != closed form {want}",
+            traj.time,
+            traj.ipred
+        );
+    }
+}
+
+#[test]
 fn adaptive_base_dose_f_under_tv_covariate_matches_closed_form() {
     // #930: the base dose's bioavailability F is resolved from ITS OWN covariate snapshot, not
     // the t=0 baseline — the crux of base × TV. F = TVF·CRCL/100 with CL/V constant. A 1000-unit

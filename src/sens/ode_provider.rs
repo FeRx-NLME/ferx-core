@@ -5346,12 +5346,16 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                                 // segment this arrival opens (#1060 review #3 — the bolus
                                 // branch below has always split them this way).
                                 // Since #1073 `last_dose_eff` is SEEDED to the subject's
-                                // first arrival, so at any `K_DOSE` it is already finite and
-                                // this guard never fires — the `t_event` arm is dead, and
-                                // was a no-op even before: at the first arrival the seed IS
-                                // `t_event`. Kept, with the assert, so that reverting the
-                                // seed to `NEG_INFINITY` fails loudly in tests instead of
-                                // silently injecting `TAD = NaN` into the velocity here.
+                                // first arrival, so at any `K_DOSE` with a finite arrival it
+                                // is already finite and this guard never fires — the
+                                // `t_event` arm is dead, and was a no-op even before: at the
+                                // first arrival the seed IS `t_event`. Kept, with the assert,
+                                // so that reverting the seed to `NEG_INFINITY` fails loudly
+                                // in tests instead of silently injecting `TAD = NaN` into the
+                                // velocity here. The assert is conditioned on `t_event` being
+                                // finite because the seed is a `min` over the arrivals and
+                                // `f64::min` ignores `NaN`: an optimizer excursion into a NaN
+                                // lagtime must degrade, not panic a debug-build fit.
                                 //
                                 // That anchor is deliberately untested: it is observable only
                                 // through a `TAD`-referencing RHS, and #1070 (TAD lifted as an
@@ -5363,9 +5367,9 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                                 // `last_dose_eff_ed`) — and becomes measurable when #1070
                                 // lands.
                                 debug_assert!(
-                                    last_dose_eff.is_finite(),
+                                    last_dose_eff.is_finite() || !t_event.is_finite(),
                                     "last_dose_eff is seeded to the first arrival (#1073), so \
-                                     it must be finite at a dose event"
+                                     it must be finite wherever this arrival is"
                                 );
                                 let pre_anchor = if last_dose_eff.is_finite() {
                                     last_dose_eff
@@ -5469,9 +5473,9 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                         // `TAD = NaN` into `g_minus` for a `TAD`-referencing RHS (#472
                         // review #3).
                         debug_assert!(
-                            last_dose_eff.is_finite(),
+                            last_dose_eff.is_finite() || !t_event.is_finite(),
                             "last_dose_eff is seeded to the first arrival (#1073), so it \
-                             must be finite at a dose event"
+                             must be finite wherever this arrival is"
                         );
                         let pre_anchor = if last_dose_eff.is_finite() {
                             last_dose_eff

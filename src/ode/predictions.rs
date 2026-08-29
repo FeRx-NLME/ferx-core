@@ -2693,6 +2693,14 @@ fn segment_pk_at(
 ///
 /// Empty on the constant-covariate path, where every segment reads the same frozen
 /// snapshot and the resolution is a no-op.
+/// Which per-event vector a resolved record indexes into.
+#[derive(Clone, Copy)]
+enum AdaptiveRecord {
+    Dose(usize),
+    PkOnly(usize),
+    Obs(usize),
+}
+
 #[derive(Default)]
 struct AdaptiveRecordIndex {
     /// Every record time, sorted ascending and deduped — the lookahead's search space.
@@ -2738,6 +2746,24 @@ impl AdaptiveRecordIndex {
     /// caller keeps the last record that ran — the trailing rule the static engines
     /// share through [`crate::dosing::governing_record_indices`].
     ///
+    /// The record sitting **exactly** at `t`, if any, as an index into the matching
+    /// `event_pk` vector. `None` at a break that is not a record — a dose arrival, an
+    /// infusion end, a zero-order cutoff, a decision, a reset.
+    ///
+    /// Production's tie-break order at a shared instant is `DoseRecord < PkOnly < Obs`
+    /// (`ode_predictions_event_driven`'s `kind_order`), and the segment arriving there
+    /// terminates at the first of them.
+    fn at(&self, t: f64) -> Option<AdaptiveRecord> {
+        let bits = t.to_bits();
+        if let Some(&k) = self.dose.get(&bits) {
+            return Some(AdaptiveRecord::Dose(k));
+        }
+        if let Some(&m) = self.pk_only.get(&bits) {
+            return Some(AdaptiveRecord::PkOnly(m));
+        }
+        self.obs.get(&bits).copied().map(AdaptiveRecord::Obs)
+    }
+
     /// Observation, EVID=2 and decision times are bit-identical to their break times —
     /// the `#700` survival guard fails loudly otherwise — so the search needs no
     /// tolerance.
@@ -2758,6 +2784,22 @@ impl AdaptiveRecordIndex {
 }
 
 /// PK governing the segment ENDING at `t_end` on the per-event adaptive walk (#1073).
+///
+/// **An EVID=3/4 reset needs no special case here**, unlike the `Kind::Reset => last_pk`
+/// arm every other engine carries. Two independent reasons, and it is worth writing them
+/// down because the asymmetry looks like an omission:
+///
+///   * The segment ending at a reset is **discarded** — the reset zeros the state at the
+///     next break, before any readout — so whichever record governs it cannot reach a
+///     prediction. (`ode_predictions_event_driven` skips the propagation outright for
+///     exactly this reason; the explicit arm there is documentation, not arithmetic.)
+///   * A reset does not disturb the LOCF carry, because the caller advances `last_pk`
+///     from `records.at(t_end)` — an actual record — rather than from this function's
+///     result. That is the property that *would* have leaked, and it is pinned there.
+///
+/// NONMEM does run `$PK` at an EVID=3/4 row, so ferx's treatment of a reset as a
+/// non-parameter-source is a latent divergence of the same family as #1073 — deliberately
+/// left alone rather than half-fixed here, and tracked separately.
 ///
 /// This is the reactive twin of the static engines' end-of-interval resolution, and it
 /// is what makes the **degenerate oracle** hold: a controller re-emitting a fixed
@@ -2780,20 +2822,14 @@ fn governing_segment_pk_at(
     let Some(t) = records.governing(t_end) else {
         return last_pk;
     };
-    let bits = t.to_bits();
-    // Production's rank at a shared instant is `DoseRecord < PkOnly < Obs`
-    // (`ode_predictions_event_driven`'s `kind_order`), and the segment arriving there
-    // terminates at the first of them.
-    if let Some(&k) = records.dose.get(&bits) {
-        return event_pk.dose[k];
+    match records.at(t) {
+        Some(AdaptiveRecord::Dose(k)) => event_pk.dose[k],
+        Some(AdaptiveRecord::PkOnly(m)) => event_pk.pk_only[m],
+        Some(AdaptiveRecord::Obs(j)) => event_pk.obs[j],
+        // `governing` only ever returns a time drawn from the record grid, so this is
+        // unreachable; `last_pk` keeps it a carry rather than a panic.
+        None => last_pk,
     }
-    if let Some(&m) = records.pk_only.get(&bits) {
-        return event_pk.pk_only[m];
-    }
-    if let Some(&j) = records.obs.get(&bits) {
-        return event_pk.obs[j];
-    }
-    last_pk
 }
 
 /// Occasion twin of [`governing_segment_pk_at`] (#701): the same record, so the eta
@@ -2809,17 +2845,12 @@ fn governing_segment_occ_at(
     let Some(t) = records.governing(t_end) else {
         return last_occ;
     };
-    let bits = t.to_bits();
-    if let Some(&k) = records.dose.get(&bits) {
-        return dose_occ.get(k).copied().flatten();
+    match records.at(t) {
+        Some(AdaptiveRecord::Dose(k)) => dose_occ.get(k).copied().flatten(),
+        Some(AdaptiveRecord::PkOnly(m)) => pk_only_occ.get(m).copied().flatten(),
+        Some(AdaptiveRecord::Obs(j)) => obs_occ.get(j).copied().flatten(),
+        None => last_occ,
     }
-    if let Some(&m) = records.pk_only.get(&bits) {
-        return pk_only_occ.get(m).copied().flatten();
-    }
-    if let Some(&j) = records.obs.get(&bits) {
-        return obs_occ.get(j).copied().flatten();
-    }
-    last_occ
 }
 
 /// PK snapshot to seed the per-event (time-varying) adaptive walk from: the
@@ -3970,14 +4001,28 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 &[],
             );
 
-            // Advance the LOCF carry: after integrating into `t_end`, the record
-            // there (if any) is the most-recent PK. `segment_pk_at` returns `last_pk`
-            // unchanged for a non-record break, so this is a no-op in that case.
-            // `last_occ` advances in lockstep (#701) so the next non-record segment
-            // reads this occasion's κ.
+            // Advance the LOCF carry: after integrating into `t_end`, the record there
+            // — **if `t_end` is one** — is the most-recent PK. `last_occ` advances in
+            // lockstep (#701) so the next non-record segment reads this occasion's κ.
+            //
+            // It must be `records.at(t_end)`, NOT `seg_pk`. Since #1073 the segment
+            // resolution looks FORWARD at a non-record break, so assigning `seg_pk`
+            // here would move the carry onto a record the walk has not reached yet —
+            // and `readout_pk`, which is deliberately LOCF precisely so a controller
+            // cannot read a covariate that has not been recorded, would then read the
+            // future. It is also what keeps a break that is not a parameter source (a
+            // dose arrival, an infusion end, a zero-order cutoff, a decision, an
+            // EVID=3/4 reset) from disturbing the carry at all — matching every other
+            // engine, where only a record updates `last_pk` / `last_params`.
             if tv {
-                last_pk = seg_pk;
-                last_occ = seg_occ;
+                if let (Some(rec), Some(ev)) = (records.at(t_end), event_pk) {
+                    last_pk = match rec {
+                        AdaptiveRecord::Dose(k) => ev.dose[k],
+                        AdaptiveRecord::PkOnly(m) => ev.pk_only[m],
+                        AdaptiveRecord::Obs(j) => ev.obs[j],
+                    };
+                    last_occ = seg_occ;
+                }
             }
         }
 
@@ -4413,8 +4458,19 @@ fn adaptive_frozen_replay_tv(
                 &[],
             );
 
-            last_pk = seg_pk;
-            last_occ = seg_occ;
+            // Advance the LOCF carry only at an actual record — the identical rule the
+            // driver uses, and for the identical reason: since #1073 `seg_pk` looks
+            // FORWARD at a non-record break, so carrying it would move `last_pk` onto a
+            // record this walk has not reached. The two must agree here or the replay
+            // stops being bit-aligned with the run it is verifying.
+            if let Some(rec) = records.at(t_end) {
+                last_pk = match rec {
+                    AdaptiveRecord::Dose(k) => event_pk.dose[k],
+                    AdaptiveRecord::PkOnly(m) => event_pk.pk_only[m],
+                    AdaptiveRecord::Obs(j) => event_pk.obs[j],
+                };
+                last_occ = seg_occ;
+            }
         }
     }
 
