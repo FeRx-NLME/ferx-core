@@ -271,6 +271,37 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
     if ode.rhs_program.is_none() {
         return false;
     }
+    // #1070: a RHS that reads `TAD` under an estimated lagtime routes to FD on BOTH loops.
+    // `eval_rhs_anchored` computes `tad = t − last_dose_eff` in `f64` and `eval_rhs_g` writes
+    // it into the variable table as a constant, but `last_dose_eff` IS the dose's lagged
+    // arrival (`d.time + lag`) — so `∂TAD/∂lag = −1` never enters the dual chain and the
+    // gradient on the lag axis is silently wrong wherever the trajectory is integrated, not
+    // only at a boundary. Measured against FD of `compute_predictions_with_tv`: 2.8 % at the
+    // first observation growing to 70 % by `t = 8`, while every non-lag axis stays exact to
+    // 1e-8 and the *value* is exact to 1e-16 — a pure gradient defect, which is why nothing
+    // caught it. NONMEM-anchored: FD restores agreement to 3e-4 OFV where the analytic route
+    // is 0.176 off (`nonmem_anchor/tad_lag_*`).
+    //
+    // Deliberately keyed on `TAD` alone and on `has_lagtime()` alone:
+    //   - `TIME`/`TAFD` do not move with the lag (`TAFD` anchors at the unlagged
+    //     `min(d.time)` in both engines) — measured exact, so `uses_time_vars` would
+    //     over-decline. Hence the narrower `uses_dose_anchored_time_vars`.
+    //   - a per-route absorption lag never anchors TAD (`last_dose_eff` is written only in
+    //     the `K_DOSE` arm, from the *compartment* lag), so `has_route_absorption_lag()` is
+    //     correctly absent here.
+    //   - the decline is model-level, not η-conditional: `Dual2` seeds every θ, so a lagtime
+    //     built from θ alone with no IIV still has a wrong outer θ-gradient (measured 70 %).
+    // Conservative in one known direction: a *literal* lagtime carries no jet and is exact
+    // (measured), but `has_lagtime()` cannot see that, so such models take a correct-but-
+    // slower FD route until #1070's real fix (dual `tad`) lands.
+    if model.has_lagtime()
+        && ode
+            .rhs_program
+            .as_ref()
+            .is_some_and(|p| p.uses_dose_anchored_time_vars())
+    {
+        return false;
+    }
     // A `TIME`-built-in structural parameter is served ONLY via the event-driven TV walk
     // (`ode_subject_supported` declines it so it can't take the static superposition path).
     // A `TIME`-built-in model routes to the event-driven walk (`integrate_tvcov_g`), which now
@@ -810,6 +841,21 @@ pub fn ode_iov_supported(model: &CompiledModel) -> bool {
         return false;
     };
     if ode.rhs_program.is_none() {
+        return false;
+    }
+    // #1070: same TAD-under-lagtime decline as `ode_analytical_supported`. Repeated rather
+    // than delegated because this gate is deliberately *parallel* to that one (see the doc
+    // comment above) and never calls it — so a clause added only there would leave the IOV
+    // walk silently wrong. Measured on the IOV walk specifically: with κ on the lagtime,
+    // `∂f/∂κ` is 47 % wrong on the first occasion group and 89 % on the second against FD of
+    // `predict_iov`, while `∂f/∂η_CL` stays exact — and the walk returned `Some`, i.e. it
+    // claimed the model rather than declining it.
+    if model.has_lagtime()
+        && ode
+            .rhs_program
+            .as_ref()
+            .is_some_and(|p| p.uses_dose_anchored_time_vars())
+    {
         return false;
     }
     // M3 BLOQ is analytic on the ODE IOV path (#486, mirroring closed-form #580/#591).
