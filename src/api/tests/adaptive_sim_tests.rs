@@ -1236,6 +1236,72 @@ fn adaptive_base_loading_under_tv_covariate_matches_closed_form() {
 }
 
 #[test]
+fn adaptive_base_infusion_ending_between_records_matches_static_predict() {
+    // Degenerate oracle for the #1073 record convention on the REACTIVE walk: a
+    // holding controller over a pre-scheduled base infusion must reproduce the static
+    // engine (`predict()`, which routes here to `ode_predictions_event_driven`) on the
+    // same realized regimen.
+    //
+    // The geometry is the one #1073 moved. A 1000-unit infusion at rate 200 runs
+    // `[0, 5]`, so its window **end** falls strictly between the `t = 0` record
+    // (CRCL = 100) and the `t = 6` record (CRCL = 50). An infusion end is not a data
+    // record: it subdivides the interval the `t = 6` record terminates, and both
+    // pieces run on that record's snapshot (k = 0.05/h). Resolving the `(0, 5]` piece
+    // to the *previous* record instead — the LOCF carry-forward — integrates it at
+    // k = 0.1/h.
+    //
+    // The model is eta-invariant, so the adaptive IPRED equals the eta=0 static PRED.
+    // The default-on frozen-replay verifier also runs, but it cannot see this: the
+    // driver and `adaptive_frozen_replay_tv` share the same segment resolution, so they
+    // agree with each other whichever record they pick. Only the static engine is an
+    // independent reference.
+    let model = parse_model_string(ODE_TV_COV).expect("parse TV-cov ODE model");
+    let obs = vec![0.0, 6.0, 12.0];
+    let cov = vec![
+        HashMap::from([("CRCL".to_string(), 100.0)]),
+        HashMap::from([("CRCL".to_string(), 50.0)]),
+        HashMap::from([("CRCL".to_string(), 50.0)]),
+    ];
+    // amt 1000 @ rate 200 -> a 5 h window, ending between the t=0 and t=6 records.
+    let dose = DoseEvent::new(0.0, 1000.0, 1, 200.0, false, 0.0);
+
+    let mut s = subj("1", obs.clone(), vec![dose.clone()]);
+    s.covariates = HashMap::from([("CRCL".to_string(), 100.0)]);
+    s.obs_covariates = cov.clone();
+    let mut pop = population(vec![s]);
+    pop.covariate_names = vec!["CRCL".to_string()];
+
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(11),
+        decision_times: vec![0.0, 6.0, 12.0],
+        ..Default::default()
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, hold_all, &opts)
+        .expect("base infusion x TV covariate runs");
+    assert!(res.ledger.is_empty(), "the controller holds throughout");
+
+    // Static reference: the identical subject through `predict()`.
+    let mut s2 = subj("1", obs.clone(), vec![dose]);
+    s2.covariates = HashMap::from([("CRCL".to_string(), 100.0)]);
+    s2.obs_covariates = cov;
+    let mut static_pop = population(vec![s2]);
+    static_pop.covariate_names = vec!["CRCL".to_string()];
+    let preds = predict(&model, &static_pop, &model.default_params);
+
+    assert_eq!(res.trajectories.len(), preds.len());
+    for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
+        assert!(
+            (traj.ipred - pred.pred).abs() <= 1e-6 + 1e-6 * pred.pred.abs(),
+            "t={}: adaptive IPRED {} != static predict {} - the reactive walk resolved \
+             the infusion-end segment to a different record than production (#1073)",
+            traj.time,
+            traj.ipred,
+            pred.pred
+        );
+    }
+}
+
+#[test]
 fn adaptive_base_dose_f_under_tv_covariate_matches_closed_form() {
     // #930: the base dose's bioavailability F is resolved from ITS OWN covariate snapshot, not
     // the t=0 baseline — the crux of base × TV. F = TVF·CRCL/100 with CL/V constant. A 1000-unit

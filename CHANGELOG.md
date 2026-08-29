@@ -51,7 +51,18 @@ section of the SDLC for the versioning policy).
   time-varying covariates or IOV, and for any ODE model whose infusion or zero-order window ends
   between records under a changing covariate; re-run affected analyses rather than comparing
   estimates across the change. Fixed in all four engines — both production predictors and both
-  analytic-sensitivity twins — so FOCE/FOCEI, SAEM, VI and the HMC sampler move together.
+  analytic-sensitivity twins — so FOCE/FOCEI, SAEM, VI and the HMC sampler move together,
+  and in the reactive adaptive-dosing walk (#391), where a base infusion whose window ended
+  between two records under a changing covariate was **11 %** off the static engine.
+- **`TAD` is finite before a lagged first dose arrives (#1073).** An `[odes]` RHS reading the
+  `TAD` builtin previously saw `NaN` for any step between the first dose row and that dose
+  landing, which multiplies into the compartment state and turns an otherwise finite fit into
+  the `1e20` objective sentinel. `TAD` there is now measured from the subject's first arrival —
+  negative in that window, reaching `0` when the dose lands — and depends only on the dosing,
+  so adding an observation inside the window cannot move a later prediction. Both ODE
+  predictors agree, so two subjects of the same model no longer behave differently depending on
+  whether they carry an `EVID=3/4` row. A subject with no doses at all still reads `NaN`. What
+  `TAD` *should* mean before a dose has arrived remains open (#1110).
 - **`vi_mc_samples` now defaults to 32, not 8 (#1017).** This draw count sets the noise floor
   VI's settling test measures against, so it decides *where a fit stops* — and therefore what is
   certified — rather than merely how noisy the trace is. At 8, on `data/warfarin.csv` (~1%

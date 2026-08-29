@@ -259,12 +259,25 @@ impl EventSchedule {
 
         let mut bounds_per_interval = Vec::with_capacity(events.len().saturating_sub(1));
         for w in events.windows(2) {
-            bounds_per_interval.push(compute_propagation_bounds(
-                w[0].time,
-                w[1].time,
-                doses,
-                &stored_lagtimes,
-            ));
+            // Zero-length intervals get no bounds. Both walks skip them (`ev.time >
+            // cur_t`, and `cur_t` always equals the previous event's time), so these
+            // are never read — while building them anyway costs an O(n_doses) scan
+            // plus an alloc, a sort and a dedup *each*. Since #1073 every dose
+            // contributes a `DoseRecord → Dose` pair that is zero-length whenever
+            // `ALAG = 0`, which made schedule construction O(n_doses²) rather than the
+            // O(events) the walk itself is. An empty `Vec` allocates nothing, and its
+            // `windows(2)` is empty — so were it ever read it would correctly
+            // propagate a zero-length interval by leaving the state untouched.
+            if w[1].time > w[0].time {
+                bounds_per_interval.push(compute_propagation_bounds(
+                    w[0].time,
+                    w[1].time,
+                    doses,
+                    &stored_lagtimes,
+                ));
+            } else {
+                bounds_per_interval.push(Vec::new());
+            }
         }
 
         Self {
@@ -296,7 +309,7 @@ fn kind_order(k: EventKind) -> u8 {
 /// NONMEM does run `$PK` at an EVID=3/4 row, which is a latent divergence of the
 /// same family, tracked separately rather than half-fixed here.
 #[inline]
-fn is_record(k: EventKind) -> bool {
+pub(crate) fn is_record(k: EventKind) -> bool {
     matches!(
         k,
         EventKind::DoseRecord | EventKind::PkOnly | EventKind::Obs
@@ -752,24 +765,19 @@ fn event_driven_predictions_with_schedule_impl(
     // Parameters for the interval ENDING at each event (#1073). A record supplies
     // its own; a non-record — the lagged dose arrival — supplies none and takes
     // the next record's, because it only subdivides the interval that record
-    // terminates. Resolved in one backward scan, since the answer for a
-    // non-record lies ahead of it in the walk. `None` means no record follows,
-    // in which case the interval carries no observation and the params are unused.
-    let next_record_pk: Vec<Option<PkParams>> = {
-        let mut acc = vec![None; schedule.events.len()];
-        let mut seen: Option<PkParams> = None;
-        for i in (0..schedule.events.len()).rev() {
-            let ev = schedule.events[i];
-            if is_record(ev.kind) {
-                seen = Some(match ev.kind {
-                    EventKind::DoseRecord => pk_at_dose[ev.orig_idx],
-                    EventKind::PkOnly => pk_at_pk_only[ev.orig_idx],
-                    _ => pk_at_obs[ev.orig_idx],
-                });
-            }
-            acc[i] = seen;
+    // terminates. Resolved by the shared [`crate::dosing::governing_record_indices`]
+    // rule, the same one the other three engines call, so the resolution cannot
+    // drift between them.
+    let governing_record = crate::dosing::governing_record_indices(schedule.events.len(), |i| {
+        is_record(schedule.events[i].kind)
+    });
+    let record_pk_at = |q: usize| -> PkParams {
+        let ev = schedule.events[q];
+        match ev.kind {
+            EventKind::DoseRecord => pk_at_dose[ev.orig_idx],
+            EventKind::PkOnly => pk_at_pk_only[ev.orig_idx],
+            _ => pk_at_obs[ev.orig_idx],
         }
-        acc
     };
 
     for (i, ev) in schedule.events.iter().enumerate() {
@@ -790,9 +798,13 @@ fn event_driven_predictions_with_schedule_impl(
         // record` semantic (end-of-interval / current-record convention). For a
         // record that is the event itself; for the lagged dose arrival it is the
         // next record ahead (#1073). For the first event the propagation has
-        // dt = 0 and `pk_now` is unused.
-        let pk_now =
-            next_record_pk[i].unwrap_or_else(|| pk_for(*ev, pk_at_dose, pk_at_obs, pk_at_pk_only));
+        // dt = 0 and `pk_now` is unused. `None` only for a subject with no record
+        // anywhere in the walk — which has no observation, so the early return
+        // above has already fired.
+        let pk_now = governing_record[i].map_or_else(
+            || pk_for(*ev, pk_at_dose, pk_at_obs, pk_at_pk_only),
+            &record_pk_at,
+        );
 
         if ev.time > cur_t {
             // The interval (events[i-1], events[i]) — its bounds were
@@ -1568,6 +1580,135 @@ mod tests {
                 assert_relative_eq!(l, u, max_relative = 1e-9);
             }
         }
+    }
+
+    // ── The record convention (#1073) ─────────────────────────────────────
+    //
+    // The ODE walk's twin of these lives in `ode/predictions_tests.rs`. Both
+    // production engines carry the same rule and both must be pinned: the ODE half
+    // is what the issue was filed against, but the closed-form half was found to have
+    // the same defect on reading the code, and it is the engine `fit()` uses for every
+    // analytic model.
+
+    /// Time-varying `CL` snapshot per record.
+    fn ed_lagged_fixture(
+        lag: f64,
+        cl_dose_row: f64,
+        cl_last_obs: f64,
+    ) -> (Subject, Vec<PkParams>, Vec<PkParams>) {
+        // t=0   bolus 1000, no lag        (CL = CL_A)
+        // t=5   obs                       (CL = CL_A)
+        // t=6   dose row, bolus 500, lag  (CL = cl_dose_row)
+        // t=10  obs                       (CL = cl_last_obs)
+        let doses = vec![
+            DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(6.0, 500.0, 1, 0.0, false, 0.0),
+        ];
+        let subj = make_subject(doses, vec![5.0, 10.0]);
+        let (cl_a, v) = (20.0, 100.0);
+        let mut pk_dose_0 = pk_one(cl_a, v);
+        let mut pk_dose_1 = pk_one(cl_dose_row, v);
+        pk_dose_0.values[crate::types::PK_IDX_LAGTIME] = 0.0;
+        pk_dose_1.values[crate::types::PK_IDX_LAGTIME] = lag;
+        let pk_obs = vec![pk_one(cl_a, v), pk_one(cl_last_obs, v)];
+        (subj, vec![pk_dose_0, pk_dose_1], pk_obs)
+    }
+
+    #[test]
+    fn ed_lagged_arrival_segment_runs_on_the_next_record_not_the_dose_row() {
+        // #1073 on the CLOSED-FORM walk. The `(dose row, arrival]` segment is bounded
+        // by the t=8 observation, not by the t=6 dose row: an arrival is a state jump,
+        // not a `$PK` evaluation, so it supplies no parameters and merely subdivides
+        // the interval the t=8 record terminates.
+        //
+        //   (0, 5]  CL_A   (5, 6]  CL_A (the dose row)   (6, 9]  CL_C   (9, 10]  CL_C
+        //
+        // Asserted through a hand-computed closed form on the SEGMENT's parameters, not
+        // through an aggregated objective: an OFV moves for either half of the fix and
+        // isolates neither.
+        let (v, cl_a, cl_c) = (100.0, 20.0, 5.0);
+        let (ka, kc) = (cl_a / v, cl_c / v);
+        let (subj, pk_dose, pk_obs) = ed_lagged_fixture(3.0, cl_a, cl_c);
+
+        let preds = event_driven_predictions(PkModel::OneCptIv, &subj, &pk_dose, &pk_obs, &[]);
+
+        let a6 = 1000.0 * (-6.0 * ka).exp();
+        let a9_minus = a6 * (-3.0 * kc).exp();
+        let expected = (a9_minus + 500.0) * (-kc).exp() / v;
+        // The pre-#1073 reading: the dose row's snapshot stretched to the arrival.
+        let stale = (a6 * (-3.0 * ka).exp() + 500.0) * (-kc).exp() / v;
+
+        assert_relative_eq!(preds[1], expected, max_relative = 1e-12);
+        assert!(
+            (expected - stale).abs() > 0.5,
+            "the fixture must separate the two conventions: {expected} vs {stale}"
+        );
+    }
+
+    #[test]
+    fn ed_a_zero_lagtime_dose_still_takes_its_own_row_for_the_incoming_segment() {
+        // The mutation the other direction. With `ALAG = 0` the dose record and the
+        // arrival coincide, and skipping the `DoseRecord` push as an "optimisation"
+        // would send the segment ENDING at t=6 looking forward past the dose to the
+        // t=8 record — because since #1073 the arrival is no longer a parameter source.
+        // Here the dose row carries CL_A and the next record CL_C, so the two differ.
+        let (v, cl_a, cl_c) = (100.0, 20.0, 5.0);
+        let (ka, kc) = (cl_a / v, cl_c / v);
+        let (subj, pk_dose, pk_obs) = ed_lagged_fixture(0.0, cl_a, cl_c);
+
+        let preds = event_driven_predictions(PkModel::OneCptIv, &subj, &pk_dose, &pk_obs, &[]);
+
+        // (0, 6] on the dose row's CL_A, then (6, 10] on the t=10 record's CL_C.
+        let a6 = 1000.0 * (-6.0 * ka).exp();
+        let expected = (a6 + 500.0) * (-4.0 * kc).exp() / v;
+        // Dropping the dose record: (0, 10] would all run on CL_C.
+        let stale = (1000.0 * (-6.0 * kc).exp() + 500.0) * (-4.0 * kc).exp() / v;
+
+        assert_relative_eq!(preds[1], expected, max_relative = 1e-12);
+        assert!(
+            (expected - stale).abs() > 0.5,
+            "the fixture must separate the two conventions: {expected} vs {stale}"
+        );
+    }
+
+    #[test]
+    fn ed_a_record_inside_the_dose_to_arrival_window_does_not_move_the_prediction() {
+        // The invariance half, and the stronger of the two: inserting an extra record
+        // inside `[dose row, arrival]` that carries the SAME covariate as the record
+        // already governing that interval must change nothing. It holds for a reason
+        // rather than by arithmetic coincidence, so it survives a fix that happens to
+        // land on the value above. NONMEM 7.6.0 is invariant here; ferx was not
+        // (`tvcov_lag_saltation_nonmem_anchor`, anchor C).
+        let (v, cl_a, cl_c) = (100.0, 20.0, 5.0);
+        let (subj, pk_dose, pk_obs) = ed_lagged_fixture(3.0, cl_a, cl_c);
+        let base = event_driven_predictions(PkModel::OneCptIv, &subj, &pk_dose, &pk_obs, &[]);
+
+        // Same subject with an extra EVID=2 record at t=7.5 — inside `(6, 9]` — that
+        // carries the covariate of the record already governing the interval (CL_C).
+        let mut subj_extra = subj.clone();
+        subj_extra.pk_only_times = vec![7.5];
+        let pk_only = vec![pk_one(cl_c, v)];
+        let extra =
+            event_driven_predictions(PkModel::OneCptIv, &subj_extra, &pk_dose, &pk_obs, &pk_only);
+
+        assert_relative_eq!(extra[1], base[1], max_relative = 1e-12);
+        // And the guard that the fixture is live at all: an extra record carrying a
+        // DIFFERENT covariate must move it, or the invariance above is vacuous.
+        let pk_only_other = vec![pk_one(cl_a, v)];
+        let moved = event_driven_predictions(
+            PkModel::OneCptIv,
+            &subj_extra,
+            &pk_dose,
+            &pk_obs,
+            &pk_only_other,
+        );
+        assert!(
+            (moved[1] - base[1]).abs() > 1e-3,
+            "fixture is inert: a differing covariate on the inserted record changed \
+             nothing ({} vs {})",
+            moved[1],
+            base[1]
+        );
     }
 
     // ── System resets (EVID=3 / EVID=4) ───────────────────────────────────

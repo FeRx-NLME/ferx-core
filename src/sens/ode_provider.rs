@@ -4794,8 +4794,15 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     // that segment exist for every lagged first dose, not just when a record fell inside
     // the pre-arrival window. The seed is one value per subject, so — unlike anchoring at
     // the segment start — it cannot make the answer depend on the sampling mesh, and
-    // `max` at each arrival leaves every later segment's anchor unchanged. A dose-free
-    // subject keeps `NEG_INFINITY`: `TAD` has no referent there.
+    // `max` at each arrival leaves every later segment's anchor unchanged.
+    //
+    // A dose-free subject gets **NaN**, not `NEG_INFINITY` — matching production's
+    // `first_arrival_ed.unwrap_or(f64::NAN)` and `tad_anchor`. `NEG_INFINITY` would
+    // make `TAD = +∞` here while the value path predicts `TAD = NaN`, so the twin
+    // would differentiate a different function than the one predicted — invisible to
+    // `Dual2`-vs-FD parity, which perturbs this walk's own value path and moves both
+    // sides together. Reachable for a placebo arm or a baseline-only subject in a
+    // joint model.
     let mut last_dose_eff = subject
         .doses
         .iter()
@@ -4803,7 +4810,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
         .map(|(k, d)| d.time + lag_val(k))
         .fold(f64::INFINITY, f64::min);
     if !last_dose_eff.is_finite() {
-        last_dose_eff = f64::NEG_INFINITY;
+        last_dose_eff = f64::NAN;
     }
 
     // Most-recent EVID 3/4 reset time (`NEG_INFINITY` until the first reset). Infusions
@@ -4836,17 +4843,12 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     // record would differentiate a different function than the one predicted, and
     // `Dual2`-vs-FD parity could not see it: FD perturbs the twin's own value path, so
     // both sides would move together and agree on the wrong answer.
-    let next_record_params: Vec<Option<usize>> = {
-        let mut acc = vec![None; tl.len()];
-        let mut seen: Option<usize> = None;
-        for q in (0..tl.len()).rev() {
-            if matches!(tl[q].1, K_DOSE_REC | K_SS_SEED | K_PKONLY | K_OBS) {
-                seen = Some(q);
-            }
-            acc[q] = seen;
-        }
-        acc
-    };
+    // Resolved by the shared [`crate::dosing::governing_record_indices`] rule — the
+    // same call production makes — so the twin's segmentation cannot drift from the
+    // value path's, including in the trailing tail past the final record.
+    let next_record_params = crate::dosing::governing_record_indices(tl.len(), |q| {
+        matches!(tl[q].1, K_DOSE_REC | K_SS_SEED | K_PKONLY | K_OBS)
+    });
     let params_at = |q: usize| -> &[T] {
         match tl[q].1 {
             // `K_SS_SEED` shares `pk_at_dose[idx]` with its dose's own `K_DOSE_REC` at
@@ -5006,14 +5008,18 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
         }
         if kind == K_DOSE {
             let d = &subject.doses[idx];
-            // #1060: the covariate snapshot of the segment this event *opens*. The
-            // segment ending here uses the dose row's own snapshot (the `params`
-            // binding above, NONMEM end-of-interval); the one starting here uses
-            // the next real record's. Under an estimated lagtime this instant is a
-            // moving boundary, so the field discontinuity across it is part of the
-            // saltation — the bolus arrival, a lagged infusion's rate-on and a
-            // built-in absorption forcing's onset (#880) all need the post side
-            // evaluated here rather than on the dose row.
+            // #1060: the covariate snapshot of the segment this event *opens*. Since
+            // #1073 the segment *ending* here runs on the record that TERMINATES it —
+            // the `params` binding above, which is the next record ahead, NOT the dose
+            // row (the arrival is not a parameter source, and restoring
+            // `&pk_at_dose[idx]` here would put the pre-#1073 stretch back into the
+            // gradient alone, where the value anchors stay green and `Dual2`-vs-FD
+            // parity cannot see it). The segment *starting* here uses the next real
+            // record's snapshot. Under an estimated lagtime this instant is a moving
+            // boundary, so the field discontinuity across it is part of the saltation —
+            // the bolus arrival, a lagged infusion's rate-on and a built-in absorption
+            // forcing's onset (#880) all need the post side evaluated here rather than
+            // on the dose row.
             //
             // Bound as a closure, not a value: only an estimated lagtime makes this
             // instant a *moving* boundary, and only the three saltation arms below
@@ -5293,8 +5299,13 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                                 // `TAD`-referencing RHS must see that, not the TAD = 0 of the
                                 // segment this arrival opens (#1060 review #3 — the bolus
                                 // branch below has always split them this way).
-                                // `NEG_INFINITY` before any dose would make TAD NaN and
-                                // poison the velocity, so fall back to `t_event` there.
+                                // Since #1073 `last_dose_eff` is SEEDED to the subject's
+                                // first arrival, so at any `K_DOSE` it is already finite and
+                                // this guard never fires — the `t_event` arm is dead, and
+                                // was a no-op even before: at the first arrival the seed IS
+                                // `t_event`. Kept, with the assert, so that reverting the
+                                // seed to `NEG_INFINITY` fails loudly in tests instead of
+                                // silently injecting `TAD = NaN` into the velocity here.
                                 //
                                 // That anchor is deliberately untested: it is observable only
                                 // through a `TAD`-referencing RHS, and #1070 (TAD lifted as an
@@ -5305,6 +5316,11 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                                 // recent arrival `≤ cur_t` (`predictions.rs`
                                 // `last_dose_eff_ed`) — and becomes measurable when #1070
                                 // lands.
+                                debug_assert!(
+                                    last_dose_eff.is_finite(),
+                                    "last_dose_eff is seeded to the first arrival (#1073), so \
+                                     it must be finite at a dose event"
+                                );
                                 let pre_anchor = if last_dose_eff.is_finite() {
                                     last_dose_eff
                                 } else {
@@ -5398,11 +5414,19 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                         let lag = dose_params[dose_lag_slot[idx]];
                         let dlag = jet_only(lag);
                         // TAD anchor for the *pre*-dose velocity `g(x⁻)`: the most recent
-                        // earlier dose. On the first dose `last_dose_eff` is `NEG_INFINITY`,
-                        // which `eval_rhs_anchored` turns into `TAD = NaN` — fine for a
-                        // TAD-independent RHS (the comment's `g(x⁻)=0`), but it poisons the
-                        // saltation for an RHS that references the `TAD` builtin. Fall back
-                        // to `t_event` (TAD=0) so `g_minus` stays finite (#472 review #3).
+                        // earlier dose. Since #1073 `last_dose_eff` is SEEDED to the
+                        // subject's first arrival, so at any `K_DOSE` it is already finite
+                        // and this guard never fires — and at the first arrival the seed
+                        // equals `t_event`, so it was a no-op before that too. Kept, with
+                        // the assert, so reverting the seed to `NEG_INFINITY` fails loudly
+                        // in tests rather than letting `eval_rhs_anchored` inject
+                        // `TAD = NaN` into `g_minus` for a `TAD`-referencing RHS (#472
+                        // review #3).
+                        debug_assert!(
+                            last_dose_eff.is_finite(),
+                            "last_dose_eff is seeded to the first arrival (#1073), so it \
+                             must be finite at a dose event"
+                        );
                         let pre_anchor = if last_dose_eff.is_finite() {
                             last_dose_eff
                         } else {
@@ -5577,13 +5601,14 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                 // the pre-onset `last_params` (which `prepared_forcings` here is built from) nor
                 // the dose record's snapshot. Under a TV covariate crossing the route onset those
                 // diverge (a several-percent gradient error), exactly as at the shared `K_DOSE`
-                // onset. The dose **mass** `F·amt` stays fixed at dose time (mass-exact). Fall
-                // back to the dose snapshot if no later record carries params (the onset then
-                // feeds no observed segment anyway).
-                // As at the arrival above: the dose row is no longer a parameter source
-                // past its own record (#1073), so a route onset with no record ahead of it
-                // falls back to the most recent record, matching the segment resolution.
-                let _ = dose_idx;
+                // onset. The dose **mass** `F·amt` stays fixed at dose time (mass-exact).
+                //
+                // With no later record the fallback is `last_params` — the most recent record —
+                // NOT the dose snapshot: since #1073 the dose row is no longer a parameter
+                // source past its own record. That is also what the segment resolution's own
+                // trailing-tail rule returns (`governing_record_indices`), so both sides of a
+                // trailing boundary carry the same field and the saltation correctly vanishes:
+                // nothing follows to change it.
                 let onset_params: &[T] = post_snapshot(p, t_event).unwrap_or(last_params);
                 let prep_onset = prep_for(onset_params);
                 let prep = &prep_onset[fi];

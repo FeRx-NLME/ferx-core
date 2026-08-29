@@ -7370,16 +7370,28 @@ fn an_infusion_end_between_records_runs_on_the_terminating_record() {
 }
 
 #[test]
-fn a_non_record_event_past_the_final_record_falls_back_to_the_previous_one() {
+fn a_non_record_event_past_the_final_record_does_not_poison_the_walk() {
     // Trap: the forward lookahead is undefined past the last record. An infusion
-    // whose end falls after the final observation has no terminating record, so
-    // the segment must reuse the most recent one rather than panic or read a
-    // default-initialised snapshot.
+    // whose end falls after the final observation has no terminating record, so the
+    // walk must not panic, read a default-initialised snapshot, or emit NaN.
     //
     //   t=0  bolus (CL=20)   t=5 obs (CL=20)   t=6 infusion 50 @ 100 -> ends 6.5
-    //   final observation at t=6.2, i.e. BEFORE the infusion end.
+    //   observations at t=5 and t=6.2, both BEFORE the infusion end.
+    //
+    // Deliberately NOT an assertion about *which* record the trailing segment picks:
+    // that choice is unobservable through predictions, because a segment ending after
+    // the final record precedes no observation by construction. The rule itself —
+    // "keep the last record that ran" — is pinned where it is observable, on the
+    // resolver, by `dosing::tests::governing_record_indices_*`; what matters here is
+    // that all four engines take it from that one helper. Do not "strengthen" this by
+    // asserting a number that no fallback can move.
+    //
+    // The *observable* half of the lookahead is made non-degenerate: the two records
+    // carry different `CL`, so the `(5, 6]` and `(6, 6.2]` segments are resolved to
+    // genuinely different snapshots and the exact value below still pins them.
     let ode = one_cpt_ode_spec_tight();
-    let (v, cl_a) = (100.0, 20.0);
+    let (v, cl_a, cl_c) = (100.0, 20.0, 5.0);
+    let (ka, kc) = (cl_a / v, cl_c / v);
 
     let doses = vec![
         DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0),
@@ -7387,7 +7399,7 @@ fn a_non_record_event_past_the_final_record_falls_back_to_the_previous_one() {
     ];
     let subj = make_subject(doses, vec![5.0, 6.2]);
     let pk_dose = vec![pk_one(cl_a, v), pk_one(cl_a, v)];
-    let pk_obs = vec![pk_one(cl_a, v), pk_one(cl_a, v)];
+    let pk_obs = vec![pk_one(cl_a, v), pk_one(cl_c, v)];
 
     let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[]);
     assert!(
@@ -7395,12 +7407,18 @@ fn a_non_record_event_past_the_final_record_falls_back_to_the_previous_one() {
         "trailing non-record events must not produce NaN or a zeroed snapshot: {preds:?}"
     );
 
-    // With every snapshot equal the answer is exact: bolus decay to t=6, then
-    // 0.2 h of infusion at rate 100.
-    let k = cl_a / v;
-    let a6 = 1000.0 * (-6.0 * k).exp();
-    let expected = (a6 * (-0.2 * k).exp() + (100.0 / k) * (1.0 - (-0.2 * k).exp()));
+    // (0, 5] and (5, 6] on CL_A (the t=5 obs, then the t=6 dose record); (6, 6.2] on
+    // CL_C (the t=6.2 obs), with the infusion delivering rate=100 throughout it.
+    let a6 = 1000.0 * (-6.0 * ka).exp();
+    let expected = a6 * (-0.2 * kc).exp() + (100.0 / kc) * (1.0 - (-0.2 * kc).exp());
     assert_relative_eq!(preds[1], expected, epsilon = 1e-6, max_relative = 1e-6);
+
+    // The previous-record reading of the final segment, so the fixture is live.
+    let stale = a6 * (-0.2 * ka).exp() + (100.0 / ka) * (1.0 - (-0.2 * ka).exp());
+    assert!(
+        (expected - stale).abs() > 1.0,
+        "the fixture must separate the two conventions: {expected} vs {stale}"
+    );
 }
 
 /// 1-cpt IV whose RHS reads the `TAD` builtin, so a NaN time-since-dose anchor
