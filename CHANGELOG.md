@@ -36,6 +36,19 @@ section of the SDLC for the versioning policy).
   the result still exposed `converged: true` to programmatic consumers. Such fits are now demoted,
   omit the misleading "increase `vi_iters`" warning, and carry the critical structured warning
   code `vi_bad_basin`.
+- **An `[odes]` RHS that reads `TAD` under an estimated lagtime now routes to finite
+  differences instead of returning a wrong analytic gradient (#1070).** `TAD` is handed to the
+  ODE right-hand side as a plain constant, but its anchor *is* the dose's lagged arrival
+  (`t_dose + ALAG`), so the `∂TAD/∂ALAG = −1` term was silently missing from the analytic
+  η/θ gradient — everywhere the trajectory is integrated, not just at a dose event. Predictions
+  were unaffected, so nothing failed visibly; but FOCEI builds its `h` matrix from that same
+  gradient, so the error reached the reported OFV. Measured against finite differences of the
+  production predictor, the lag axis was 2.8% wrong at the first observation and 70% wrong by
+  `t = 8`, while every other axis stayed exact. Against NONMEM 7.6.0 the analytic route was
+  0.176 OFV off; the FD route agrees to 0.0003 (`nonmem_anchor/tad_lag_*`). Affected models are
+  now correct but slower, on both the outer and inner loops and under IOV; the fit reports
+  `gradient_method_inner = finite differences`. Models reading `TAD` **without** a lagtime, or
+  reading `TAFD` **with** one, are unaffected and keep the analytic route.
 - **`vi_mc_samples` now defaults to 32, not 8 (#1017).** This draw count sets the noise floor
   VI's settling test measures against, so it decides *where a fit stops* — and therefore what is
   certified — rather than merely how noisy the trace is. At 8, on `data/warfarin.csv` (~1%

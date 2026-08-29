@@ -8289,3 +8289,306 @@ fn ode_provider_matches_fd_under_the_auto_stiff_switch() {
     check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
     check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
 }
+
+// ---------------------------------------------------------------------------
+// #1070 — a `TAD`-reading ODE RHS under an estimated lagtime must route to FD.
+//
+// `eval_rhs_anchored` computes `tad = t − last_dose_eff` in `f64` and
+// `eval_rhs_g` writes it into the variable table as a constant. But
+// `last_dose_eff` IS the dose's lagged arrival, so `∂TAD/∂lag = −1` never
+// enters the dual chain: the gradient on the lag axis is wrong everywhere the
+// trajectory is integrated, not only at a boundary. The value stays exact, so
+// only a gradient-vs-FD check can see it.
+//
+// The gate is keyed on `TAD` alone and on `has_lagtime()` alone. The tests
+// below pin every edge of that choice — the declines AND, just as importantly,
+// the neighbours that must STAY analytic, so a later widening of the gate
+// fails loudly instead of quietly costing every TAD model its analytic path.
+// ---------------------------------------------------------------------------
+
+/// 1-cpt IV whose RHS reads a time built-in, with a configurable lagtime
+/// expression. `{TIMEVAR}` / `{LAG}` are substituted per test.
+fn tad_gate_model(time_var: &str, lag_expr: &str) -> CompiledModel {
+    let lag_line = if lag_expr.is_empty() {
+        String::new()
+    } else {
+        format!("  LAGTIME = {lag_expr}\n")
+    };
+    let src = format!(
+        r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  theta THETA_WT(0.75, 0.01, 5.0)
+  theta TVLAG(0.75, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_LAG ~ 0.05
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL = TVCL * (WT / 70)^THETA_WT * exp(ETA_CL)
+  V  = TVV
+{lag_line}[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central * (1.0 + 0.3 * {time_var})
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_method = rk45
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#
+    );
+    parse_model_string(&src).expect("parse")
+}
+
+/// Bolus at t=0 plus a 1 h infusion at t=1, observations all strictly after the
+/// first lagged arrival (~0.80) so `TAD` is never NaN — see #1110, which makes
+/// any record *before* the first arrival poison the trajectory.
+fn tad_gate_subject() -> Subject {
+    let mut s = bolus_subject(&[0.9, 1.5, 2.0, 4.0, 8.0]);
+    let mut inf = DoseEvent::new(1.0, 60.0, 1, 0.0, false, 0.0);
+    inf.duration = 1.0;
+    inf.rate = 60.0;
+    s.doses.push(inf);
+    let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+    s.dose_covariates = vec![wt(60.0), wt(65.0)];
+    s.obs_covariates = vec![wt(60.0), wt(70.0), wt(75.0), wt(80.0), wt(90.0)];
+    s
+}
+
+/// The defect itself: with the gate removed this model is admitted as analytic
+/// and its `∂f/∂η_LAG` is 2.8 %–70 % wrong against FD of the production
+/// predictor, growing with `t`, while every other axis is exact to 1e-8 and the
+/// value is exact to 1e-16. Pinned as a *routing* assertion because the wrong
+/// gradient is what the gate exists to prevent being returned.
+#[test]
+fn ode_tad_rhs_with_estimated_lagtime_routes_to_fd() {
+    let model = tad_gate_model("TAD", "TVLAG * exp(ETA_LAG)");
+    let subject = tad_gate_subject();
+    assert!(model.has_lagtime());
+    assert!(
+        model
+            .ode_spec
+            .as_ref()
+            .and_then(|o| o.rhs_program.as_ref())
+            .is_some_and(|p| p.uses_dose_anchored_time_vars()),
+        "precondition: the RHS must actually read TAD"
+    );
+    assert!(
+        !ode_analytical_supported(&model),
+        "#1070: TAD-reading RHS + estimated lagtime must decline to FD"
+    );
+    assert!(
+        !ode_tvcov_supported(&model, &subject),
+        "the event-driven gate must decline it too (it calls the model gate)"
+    );
+    assert!(
+        !crate::sens::provider::ode_inner_grad_supported_model(&model),
+        "inner EBE gradient must decline in lockstep — never an FD outer with an analytic inner"
+    );
+    assert!(
+        ode_subject_sensitivities(&model, &subject, &[1.0, 20.0, 0.75, 0.75], &[0.1, 0.07])
+            .is_none(),
+        "the outer provider must return None rather than a wrong gradient"
+    );
+}
+
+/// The lagtime carries NO IIV — only θ. `Dual2` seeds every θ, so the outer
+/// θ-gradient on the lag axis is still wrong (measured 70 %) even though no η
+/// touches the lag. This is why the gate is model-level rather than conditional
+/// on the lag carrying a random effect.
+#[test]
+fn ode_tad_rhs_with_theta_only_lagtime_routes_to_fd() {
+    let model = tad_gate_model("TAD", "TVLAG");
+    assert!(model.has_lagtime());
+    assert!(
+        !ode_analytical_supported(&model),
+        "#1070: a θ-only lagtime still moves TAD, so the outer θ-gradient is wrong"
+    );
+}
+
+/// **Neighbour that must stay analytic.** `TAFD` anchors at the *unlagged*
+/// `min(d.time)` in both the walk and the production predictor, so it carries no
+/// lag jet — measured exact on every axis. Keying the gate on the existing
+/// `uses_time_vars` (which unions `TIME`/`TAFD`/`TAD`) would decline this model
+/// for no reason; this test is what makes that regression loud.
+#[test]
+fn ode_tafd_rhs_with_estimated_lagtime_stays_analytic() {
+    let model = tad_gate_model("TAFD", "TVLAG * exp(ETA_LAG)");
+    let subject = tad_gate_subject();
+    assert!(model.has_lagtime());
+    assert!(
+        !model
+            .ode_spec
+            .as_ref()
+            .and_then(|o| o.rhs_program.as_ref())
+            .is_some_and(|p| p.uses_dose_anchored_time_vars()),
+        "TAFD must NOT set the dose-anchored flag — only TAD does"
+    );
+    assert!(
+        ode_tvcov_supported(&model, &subject),
+        "TAFD + lagtime is exact and must keep its analytic route"
+    );
+    // And it really is exact — the gate's premise, not just its wiring.
+    check_vs_production(&model, &subject, &[1.0, 20.0, 0.75, 0.75], &[0.1, 0.07]);
+}
+
+/// **Neighbour that must stay analytic.** A `TAD`-reading RHS with no lagtime
+/// anchors at the dose time itself, which carries no jet. Guards the other half
+/// of the conjunction: keying the gate on `uses_dose_anchored_time_vars()` alone
+/// would decline every TAD model in the codebase.
+#[test]
+fn ode_tad_rhs_without_lagtime_stays_analytic() {
+    let model = tad_gate_model("TAD", "");
+    let subject = tad_gate_subject();
+    assert!(!model.has_lagtime());
+    assert!(
+        ode_tvcov_supported(&model, &subject),
+        "TAD without a lagtime is exact and must keep its analytic route"
+    );
+    check_vs_production(&model, &subject, &[1.0, 20.0, 0.75, 0.75], &[0.1, 0.07]);
+}
+
+/// **Neighbour that must stay analytic**, on the *static* superposition walk
+/// rather than the event-driven one — the matrix cell that had no coverage at
+/// all. A subject with no TV covariates and no lagtime takes `integrate_g`,
+/// whose TAD anchor is a per-segment fold over unlagged `d.time`.
+#[test]
+fn ode_tad_rhs_without_lagtime_static_walk_stays_analytic() {
+    let model = tad_gate_model("TAD", "");
+    assert!(!model.has_lagtime());
+    let subject = bolus_subject_wt(&[1.0, 2.0, 4.0, 8.0], 70.0);
+    assert!(!subject.has_tv_covariates(), "static-walk subject");
+    assert!(
+        ode_analytical_supported(&model),
+        "TAD with no lagtime must stay analytic on the static walk too"
+    );
+    assert!(ode_subject_supported(&model, &subject));
+}
+
+/// A per-route absorption lag (`fn(..., lag=L)`) never anchors TAD — the walk
+/// writes `last_dose_eff` only in its `K_DOSE` arm, from the *compartment* lag,
+/// and production's `tad_anchor` reads `dose_lagtimes` for the same reason. So
+/// `has_route_absorption_lag()` is deliberately absent from the gate, and a pure
+/// route lag must keep its analytic route.
+#[test]
+fn ode_tad_rhs_with_route_lag_only_stays_analytic() {
+    const ROUTE_LAG_TAD: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  theta TVKA(1.2, 0.01, 50.0)
+  theta TVRLAG(0.4, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+  RLAG = TVRLAG
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA, lag=RLAG) - (CL/V) * central * (1.0 + 0.3 * TAD)
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_method = rk45
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+    let model = parse_model_string(ROUTE_LAG_TAD).expect("parse");
+    assert!(
+        model.has_route_absorption_lag(),
+        "precondition: model carries a per-route lag"
+    );
+    assert!(
+        !model.has_lagtime(),
+        "precondition: and NO compartment lagtime — the thing that anchors TAD"
+    );
+    assert!(
+        ode_analytical_supported(&model),
+        "a pure route lag does not move the TAD anchor, so it must stay analytic"
+    );
+}
+
+/// Steady state keeps its own, broader decline: SS breaks the cycle recurrence
+/// for ANY non-autonomous RHS, including a `TIME`-only one that #1070's narrower
+/// flag does not set. Regression guard that the new flag did not replace the old.
+#[test]
+fn ode_ss_time_only_rhs_still_routes_to_fd() {
+    // `T`, not `TIME`: a bare `TIME` in an `[odes]` RHS compiles to `Op::PushTime`
+    // (the model-time thread-local), not to a `PushVar(time_slot)`, so
+    // `stmts_read_slots` — and therefore `uses_time_vars` — does not see it. `T`
+    // is the alias that does resolve to the slot.
+    let model = tad_gate_model("T", "");
+    let prog = model
+        .ode_spec
+        .as_ref()
+        .and_then(|o| o.rhs_program.as_ref())
+        .expect("rhs program");
+    assert!(prog.uses_time_vars(), "`T` sets the broad flag");
+    assert!(
+        !prog.uses_dose_anchored_time_vars(),
+        "`T` must NOT set the narrow dose-anchored flag"
+    );
+    let mut ss = bolus_subject_wt(&[1.0, 2.0, 4.0], 70.0);
+    ss.doses[0].ss = true;
+    ss.doses[0].ii = 8.0;
+    assert!(
+        !ode_tvcov_supported(&model, &ss),
+        "SS + a time-dependent RHS must still decline (the broad uses_time_vars gate)"
+    );
+}
+
+/// **The route the user is actually told about.** Every other #1070 test asserts
+/// the low-level gate (`ode_analytical_supported` / `ode_iov_supported`), but the
+/// *reported* `gradient_method_outer` comes from
+/// `analytic_outer_gradient_for_interaction`, and the outer FOCE/FOCEI dispatch
+/// from `sens_supported` — neither of which any other test pins. The θ-only-lag
+/// probe measured the **outer** θ axis 70% wrong, so this is the axis the fix
+/// exists for; without this test a refactor could restore the outer analytic
+/// route while every gate test stayed green.
+///
+/// Asserted in both directions: the two declining shapes AND the two neighbours
+/// that must keep the analytic outer route, so a widened gate is equally loud.
+#[test]
+fn tad_lagtime_gate_flips_the_outer_gradient_route() {
+    for (time_var, lag_expr) in [
+        ("TAD", "TVLAG * exp(ETA_LAG)"),
+        ("TAD", "TVLAG"), // θ-only lag: Dual2 seeds every θ, so still wrong
+    ] {
+        let model = tad_gate_model(time_var, lag_expr);
+        assert!(
+            !crate::sens::provider::sens_supported(&model),
+            "#1070: outer gradient must decline for {time_var} + `{lag_expr}`"
+        );
+        for interaction in [false, true] {
+            assert!(
+                !crate::sens::provider::analytic_outer_gradient_for_interaction(
+                    &model,
+                    interaction
+                ),
+                "#1070: reported outer method must be FD for {time_var} + `{lag_expr}` \
+                 (interaction = {interaction})"
+            );
+        }
+    }
+    // Neighbours: the outer route must stay analytic, or the gate has widened.
+    for (time_var, lag_expr) in [("TAD", ""), ("TAFD", "TVLAG * exp(ETA_LAG)")] {
+        let model = tad_gate_model(time_var, lag_expr);
+        assert!(
+            crate::sens::provider::sens_supported(&model),
+            "#1070: {time_var} + `{lag_expr}` is exact and must keep the analytic outer route"
+        );
+        assert!(
+            crate::sens::provider::analytic_outer_gradient_for_interaction(&model, true),
+            "#1070: {time_var} + `{lag_expr}` must still report an analytic outer gradient"
+        );
+    }
+}
