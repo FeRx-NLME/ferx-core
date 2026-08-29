@@ -8545,3 +8545,50 @@ fn ode_ss_time_only_rhs_still_routes_to_fd() {
         "SS + a time-dependent RHS must still decline (the broad uses_time_vars gate)"
     );
 }
+
+/// **The route the user is actually told about.** Every other #1070 test asserts
+/// the low-level gate (`ode_analytical_supported` / `ode_iov_supported`), but the
+/// *reported* `gradient_method_outer` comes from
+/// `analytic_outer_gradient_for_interaction`, and the outer FOCE/FOCEI dispatch
+/// from `sens_supported` — neither of which any other test pins. The θ-only-lag
+/// probe measured the **outer** θ axis 70% wrong, so this is the axis the fix
+/// exists for; without this test a refactor could restore the outer analytic
+/// route while every gate test stayed green.
+///
+/// Asserted in both directions: the two declining shapes AND the two neighbours
+/// that must keep the analytic outer route, so a widened gate is equally loud.
+#[test]
+fn tad_lagtime_gate_flips_the_outer_gradient_route() {
+    for (time_var, lag_expr) in [
+        ("TAD", "TVLAG * exp(ETA_LAG)"),
+        ("TAD", "TVLAG"), // θ-only lag: Dual2 seeds every θ, so still wrong
+    ] {
+        let model = tad_gate_model(time_var, lag_expr);
+        assert!(
+            !crate::sens::provider::sens_supported(&model),
+            "#1070: outer gradient must decline for {time_var} + `{lag_expr}`"
+        );
+        for interaction in [false, true] {
+            assert!(
+                !crate::sens::provider::analytic_outer_gradient_for_interaction(
+                    &model,
+                    interaction
+                ),
+                "#1070: reported outer method must be FD for {time_var} + `{lag_expr}` \
+                 (interaction = {interaction})"
+            );
+        }
+    }
+    // Neighbours: the outer route must stay analytic, or the gate has widened.
+    for (time_var, lag_expr) in [("TAD", ""), ("TAFD", "TVLAG * exp(ETA_LAG)")] {
+        let model = tad_gate_model(time_var, lag_expr);
+        assert!(
+            crate::sens::provider::sens_supported(&model),
+            "#1070: {time_var} + `{lag_expr}` is exact and must keep the analytic outer route"
+        );
+        assert!(
+            crate::sens::provider::analytic_outer_gradient_for_interaction(&model, true),
+            "#1070: {time_var} + `{lag_expr}` must still report an analytic outer gradient"
+        );
+    }
+}
