@@ -1,0 +1,39 @@
+$PROBLEM #1073 E2 - rate-defined infusion + ALAG1; window end falls between records across a WT change
+$INPUT ID TIME DV AMT RATE EVID CMT MDV WT
+$DATA dose_form_lag_infusion.csv IGNORE=@
+
+$SUBROUTINE ADVAN13 TOL=9
+
+$MODEL
+  COMP=(CENTRAL,DEFDOSE,DEFOBS)
+
+$PK
+  CL    = THETA(1)*(WT/70)**THETA(3)*EXP(ETA(1))
+  V     = THETA(2)*EXP(ETA(2))
+  ALAG1 = THETA(4)*EXP(ETA(3))
+  S1    = V
+
+$DES
+  DADT(1) = -(CL/V)*A(1)
+
+$ERROR
+  IPRED = F
+  Y     = IPRED*(1+EPS(1))
+
+$THETA
+  (0, 10.0)  ; 1 TVCL
+  (0, 50.0)  ; 2 TVV
+  (0, 0.75)  ; 3 WTEXP_CL
+  (0, 0.7)   ; 4 TVP lagtime
+
+$OMEGA
+  0.09  ; ETA_CL
+  0.09  ; ETA_V
+  0.04  ; ETA_LAG
+
+$SIGMA
+  0.0025 ; PROP variance (sd 0.05)
+
+$ESTIMATION METHOD=1 INTERACTION MAXEVAL=0 POSTHOC PRINT=1 NOABORT
+$TABLE ID TIME WT DV IPRED CL V ALAG1 ETA1 ETA2 ETA3
+       ONEHEADER NOPRINT FILE=dose_form_lag_infusion.tab

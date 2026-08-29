@@ -518,3 +518,58 @@ Control file and data: `tests/nonmem/oral_depot_d1.ctl` / `.csv`.
 ferx matches NONMEM to the 5 significant figures tabulated (the
 `analytical_oral_depot_modeled_duration_matches_nonmem` regression test asserts
 this).
+
+## Which record's covariates govern a lagged dose, like NONMEM's `$PK` timing?
+
+The record that **terminates** the interval — never the dose row, and never the
+row before it.
+
+NONMEM evaluates `$PK` at every data record and then lets `ADVAN` propagate *to*
+that record, so the advance over `(recordᵢ, recordᵢ₊₁]` uses **`recordᵢ₊₁`'s**
+covariates. A lagged dose arrival at `t + ALAG` is not a data record: it changes
+the compartment state, but no `$PK` runs there. It therefore lands *inside*
+whichever record interval contains it, and the whole of that interval — both
+sides of the arrival — runs on the covariates of the record that ends it.
+
+The same holds for every other event that is not a data row: an infusion's end,
+a `zero_order(dur)` window's cutoff, a per-route absorption onset.
+
+### Worked example
+
+```text
+TIME   EVID  AMT   WT
+   5      0    .   150     observation
+   6      1  100   150     dose,  ALAG1 = 0.7  ->  arrives at 6.7
+   7      0    .    75     observation
+```
+
+| interval | governed by | `WT` |
+|---|---|---|
+| `(5, 6]`  | the `t = 6` dose record | 150 |
+| `(6, 7]`  | the `t = 7` observation | **75** |
+
+The arrival at 6.7 sits inside `(6, 7]`, so it is propagated at `WT = 75` on
+**both** sides. The dose row's `WT = 150` governs the advance *into* `t = 6` and
+nothing after it — though it still supplies the dose's own attributes (`F`,
+`ALAG`, `D`/`R`, and the steady-state equilibration), which are properties of that
+record rather than of the interval.
+
+::: {.callout-note}
+## Changed in #1073
+
+Before that fix ferx broke the timeline only at the arrival, so the dose row's
+snapshot was stretched forward to `6.7` and `(6, 6.7]` ran at `WT = 150`. On the
+committed anchor this was worth **14.89 OFV** against NONMEM 7.6.0. If you are
+comparing a fit across that change, expect estimates to move for any model
+combining a lagtime with time-varying covariates or IOV — re-run rather than
+diffing.
+:::
+
+### A useful invariant
+
+Inserting an extra record inside `[dose row, arrival]` that carries the *same*
+covariate values as the record already governing the interval must not change any
+prediction. That is true in NONMEM, and it is now true in ferx — the
+`a_record_inside_the_dose_to_arrival_window_does_not_move_the_prediction`
+regression test asserts it. If you are ever unsure which convention a tool uses,
+that null test tells you without needing a reference implementation.

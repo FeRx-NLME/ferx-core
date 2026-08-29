@@ -20,6 +20,22 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Fixed
+- **A lagged dose's covariate snapshot no longer stretches to its arrival (#1073).** With a
+  lagtime, ferx broke the integration timeline only at the arrival `t + ALAG`, never at the dose
+  row's own time, so the dose row's covariate / IOV snapshot governed everything up to the
+  arrival. NONMEM evaluates `$PK` at every data record and then advances *to* that record, so the
+  interval containing a lagged arrival belongs to the record that **terminates** it. On the
+  committed multi-dose anchor this was worth **14.89 OFV** (ferx `−474.660106` vs NONMEM
+  `−459.772592`); it is now `~1e-5`. Applying the same rule to the other non-record boundaries —
+  an infusion end, a zero-order absorption cutoff, a per-route onset falling strictly between two
+  records — fixed a second divergence of the same family in the ODE engine, measured at **4.2 %**
+  on the predictions after the boundary and **23.5 OFV** on a dedicated NONMEM probe. The
+  closed-form engine already had that one right, so the two production engines now agree where
+  they used to differ. **This moves converged fits** for any model combining a lagtime with
+  time-varying covariates or IOV, and for any ODE model whose infusion or zero-order window ends
+  between records under a changing covariate; re-run affected analyses rather than comparing
+  estimates across the change. Fixed in all four engines — both production predictors and both
+  analytic-sensitivity twins — so FOCE/FOCEI, SAEM, VI and the HMC sampler move together.
 - **`vi_mc_samples` now defaults to 32, not 8 (#1017).** This draw count sets the noise floor
   VI's settling test measures against, so it decides *where a fit stops* — and therefore what is
   certified — rather than merely how noisy the trace is. At 8, on `data/warfarin.csv` (~1%

@@ -76,6 +76,14 @@ pub fn profile_report() {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventKind {
+    /// The dose *row* at `d.time` — a NONMEM record, so `$PK` runs here and this
+    /// is where the dose's parameters enter the walk. The compartment jump
+    /// happens later, at the lagged arrival ([`EventKind::Dose`]); with no
+    /// lagtime the two coincide and `DoseRecord` sorts first (#1073).
+    DoseRecord,
+    /// The lagged dose *arrival* at `d.time + ALAG` — a state jump, and **not** a
+    /// NONMEM record: it supplies no parameters, and the interval it sits inside
+    /// runs on the record that terminates that interval.
     Dose,
     Obs,
     /// EVID=2 "other event" — typically a covariate-change marker.
@@ -193,9 +201,21 @@ impl EventSchedule {
         };
 
         let mut events: Vec<Event> = Vec::with_capacity(
-            subject.doses.len() + subject.obs_times.len() + subject.pk_only_times.len(),
+            2 * subject.doses.len() + subject.obs_times.len() + subject.pk_only_times.len(),
         );
         for (k, d) in doses.iter().enumerate() {
+            // The dose row and its lagged arrival are two separate events (#1073).
+            // The row is the record `$PK` runs at, so it terminates the interval
+            // that ends at `d.time`; the arrival only jumps the state, and the
+            // interval containing it belongs to the next record. Pushed
+            // unconditionally — with `ALAG = 0` the arrival is no longer a
+            // parameter source, so dropping the record would send the segment
+            // ending at `d.time` looking forward past the dose instead.
+            events.push(Event {
+                time: d.time,
+                kind: EventKind::DoseRecord,
+                orig_idx: k,
+            });
             events.push(Event {
                 time: d.time + get_lag(k),
                 kind: EventKind::Dose,
@@ -261,10 +281,26 @@ fn kind_order(k: EventKind) -> u8 {
         // Reset sorts first so an EVID=4 (reset + dose) zeros the state
         // before its own dose lands at the same time.
         EventKind::Reset => 0,
-        EventKind::Dose => 1,
-        EventKind::PkOnly => 2,
-        EventKind::Obs => 3,
+        EventKind::DoseRecord => 1,
+        EventKind::Dose => 2,
+        EventKind::PkOnly => 3,
+        EventKind::Obs => 4,
     }
+}
+
+/// Whether an event is a NONMEM **data record** — one `$PK` runs at, and so a
+/// source of parameters for the interval it terminates (#1073).
+///
+/// A lagged dose *arrival* is not one (its [`EventKind::DoseRecord`] is).
+/// `Reset` is excluded because the walk handles it before the parameter lookup;
+/// NONMEM does run `$PK` at an EVID=3/4 row, which is a latent divergence of the
+/// same family, tracked separately rather than half-fixed here.
+#[inline]
+fn is_record(k: EventKind) -> bool {
+    matches!(
+        k,
+        EventKind::DoseRecord | EventKind::PkOnly | EventKind::Obs
+    )
 }
 
 /// Sub-interval boundaries inside `(t_from, t_to)` at which the active
@@ -713,6 +749,29 @@ fn event_driven_predictions_with_schedule_impl(
     // change is a cache miss that recomputes transparently.
     let mut eigen = crate::sens::propagate::EigenCacheG::default();
 
+    // Parameters for the interval ENDING at each event (#1073). A record supplies
+    // its own; a non-record — the lagged dose arrival — supplies none and takes
+    // the next record's, because it only subdivides the interval that record
+    // terminates. Resolved in one backward scan, since the answer for a
+    // non-record lies ahead of it in the walk. `None` means no record follows,
+    // in which case the interval carries no observation and the params are unused.
+    let next_record_pk: Vec<Option<PkParams>> = {
+        let mut acc = vec![None; schedule.events.len()];
+        let mut seen: Option<PkParams> = None;
+        for i in (0..schedule.events.len()).rev() {
+            let ev = schedule.events[i];
+            if is_record(ev.kind) {
+                seen = Some(match ev.kind {
+                    EventKind::DoseRecord => pk_at_dose[ev.orig_idx],
+                    EventKind::PkOnly => pk_at_pk_only[ev.orig_idx],
+                    _ => pk_at_obs[ev.orig_idx],
+                });
+            }
+            acc[i] = seen;
+        }
+        acc
+    };
+
     for (i, ev) in schedule.events.iter().enumerate() {
         // EVID=3 / EVID=4 reset: zero every compartment. Any drug carried
         // by the interval ending here would just be discarded, so skip the
@@ -725,12 +784,15 @@ fn event_driven_predictions_with_schedule_impl(
             continue;
         }
 
-        // PK params for the propagation [events[i-1], events[i]] are the
-        // params evaluated AT events[i] — matches NONMEM's `$PK runs at
-        // every record then ADVAN propagates to that record` semantic
-        // (end-of-interval / current-record convention). For the first
-        // event the propagation has dt = 0 and `pk_now` is unused.
-        let pk_now = pk_for(*ev, pk_at_dose, pk_at_obs, pk_at_pk_only);
+        // PK params for the propagation [events[i-1], events[i]] are the params
+        // evaluated at the RECORD that terminates that interval — matches
+        // NONMEM's `$PK runs at every record then ADVAN propagates to that
+        // record` semantic (end-of-interval / current-record convention). For a
+        // record that is the event itself; for the lagged dose arrival it is the
+        // next record ahead (#1073). For the first event the propagation has
+        // dt = 0 and `pk_now` is unused.
+        let pk_now =
+            next_record_pk[i].unwrap_or_else(|| pk_for(*ev, pk_at_dose, pk_at_obs, pk_at_pk_only));
 
         if ev.time > cur_t {
             // The interval (events[i-1], events[i]) — its bounds were
@@ -750,15 +812,24 @@ fn event_driven_predictions_with_schedule_impl(
         }
 
         match ev.kind {
+            EventKind::DoseRecord => {
+                // The dose row: a record, so `$PK` ran here and the interval
+                // ending at it took this snapshot above. No state change — that
+                // is the lagged arrival's job (#1073).
+            }
             EventKind::Dose => {
                 let d = &eff_doses[ev.orig_idx];
+                // Dose *attributes* belong to the dose row, so they read that
+                // row's own snapshot and never `pk_now`, which after #1073 is the
+                // next record's. Before the split the two were the same object.
+                let dose_pk = pk_at_dose[ev.orig_idx];
                 // Steady-state (SS=1): reset state and load with the SS
                 // amount from the infinite-past pulse train before the SS
                 // dose's own pulse is applied through the normal flow.
                 // See `equilibrate_ss_state_event_driven` for the per-cycle
                 // scheme. Mirrors `ode/predictions.rs::ode_predictions_*`.
                 if d.ss && d.ii > 0.0 {
-                    state = equilibrate_ss_state_event_driven(pk_model, &pk_now, d);
+                    state = equilibrate_ss_state_event_driven(pk_model, &dose_pk, d);
                 }
                 if d.rate <= 0.0 {
                     // Bolus: instantaneous amount jump in dose's compartment.
@@ -774,7 +845,7 @@ fn event_driven_predictions_with_schedule_impl(
                     // high-dose subjects came out F× too small.
                     let cmt_idx = d.cmt_idx();
                     if cmt_idx < n_states {
-                        state[cmt_idx] += pk_now.bioavailable_amount(d.amt);
+                        state[cmt_idx] += dose_pk.bioavailable_amount(d.amt);
                     } else {
                         // Unreachable from a validated call: `check_dose_compartments`
                         // (#375) rejects `cmt > n_states` up front — as an `Err` from
@@ -869,7 +940,7 @@ fn pk_for(
     pk_at_pk_only: &[PkParams],
 ) -> PkParams {
     match ev.kind {
-        EventKind::Dose => pk_at_dose[ev.orig_idx],
+        EventKind::DoseRecord | EventKind::Dose => pk_at_dose[ev.orig_idx],
         EventKind::Obs => pk_at_obs[ev.orig_idx],
         EventKind::PkOnly => pk_at_pk_only[ev.orig_idx],
         // Resets are handled by the caller before `pk_for`; they carry no
@@ -2510,17 +2581,25 @@ mod tests {
     fn event_schedule_orders_events_dose_before_obs_at_same_time() {
         // Same-time tie-break: dose should run before observation so the obs
         // sees post-dose state. EventSchedule.events must reflect that order.
+        //
+        // Since #1073 each dose contributes two events — the record at `d.time`
+        // and the arrival at `d.time + ALAG`, coincident here with no lagtime.
+        // The record sorts first so its parameters are in force before the dose
+        // lands, and both still precede a co-timed observation.
         let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
         let obs_times = vec![0.0, 1.0]; // first obs at t=0, same as dose
         let subj = make_subject(doses, obs_times);
         let schedule = EventSchedule::for_subject(&subj, PkModel::OneCptIv, &subj.doses, &[]);
 
-        assert_eq!(schedule.events.len(), 3);
-        assert!(matches!(schedule.events[0].kind, EventKind::Dose));
-        assert!(matches!(schedule.events[1].kind, EventKind::Obs));
+        assert_eq!(schedule.events.len(), 4);
+        assert!(matches!(schedule.events[0].kind, EventKind::DoseRecord));
+        assert_eq!(schedule.events[0].time, 0.0);
+        assert!(matches!(schedule.events[1].kind, EventKind::Dose));
         assert_eq!(schedule.events[1].time, 0.0);
         assert!(matches!(schedule.events[2].kind, EventKind::Obs));
-        assert_eq!(schedule.events[2].time, 1.0);
+        assert_eq!(schedule.events[2].time, 0.0);
+        assert!(matches!(schedule.events[3].kind, EventKind::Obs));
+        assert_eq!(schedule.events[3].time, 1.0);
     }
 
     #[test]
@@ -2532,9 +2611,11 @@ mod tests {
         let subj = make_subject(doses, obs_times);
         let schedule = EventSchedule::for_subject(&subj, PkModel::OneCptIv, &subj.doses, &[]);
 
-        // Two events (dose at 0, obs at 10) → one interval (0, 10).
-        assert_eq!(schedule.bounds_per_interval.len(), 1);
-        let bounds = &schedule.bounds_per_interval[0];
+        // Three events since #1073 — the dose record and its arrival, both at
+        // t=0 with no lagtime, then the obs at 10 — so two intervals: the
+        // zero-length (0, 0] between the pair, and the real (0, 10].
+        assert_eq!(schedule.bounds_per_interval.len(), 2);
+        let bounds = &schedule.bounds_per_interval[1];
         // Bounds must include the interval endpoints AND the infusion stop.
         // (Infusion start at t=0 is exactly at t_from, so the > t_from + eps
         // guard inside compute_propagation_bounds keeps it out — that's

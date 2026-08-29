@@ -761,11 +761,43 @@ fn pk_for_g<T: PkNum>(
     pk_at_pk_only: &[PkDual<T>],
 ) -> PkDual<T> {
     match ev.kind {
-        EventKind::Dose => pk_at_dose[ev.orig_idx],
+        EventKind::DoseRecord | EventKind::Dose => pk_at_dose[ev.orig_idx],
         EventKind::Obs => pk_at_obs[ev.orig_idx],
         EventKind::PkOnly => pk_at_pk_only[ev.orig_idx],
         EventKind::Reset => unreachable!("Reset carries no PK params"),
     }
+}
+
+/// Parameters for the interval ENDING at each event, the dual mirror of the value
+/// walk's resolution in `pk::event_driven` (#1073).
+///
+/// A record supplies its own snapshot; the lagged dose *arrival* supplies none and
+/// takes the next record's, because it only subdivides the interval that record
+/// terminates. This must track the value walk exactly or the analytic `∂f/∂η`
+/// would be the derivative of a different function than the one predicted — a
+/// disagreement `Dual2`-vs-FD parity cannot see, since both sides would move
+/// together.
+fn next_record_pk_g<T: PkNum>(
+    events: &[Event],
+    pk_at_dose: &[PkDual<T>],
+    pk_at_obs: &[PkDual<T>],
+    pk_at_pk_only: &[PkDual<T>],
+) -> Vec<Option<PkDual<T>>> {
+    let mut acc = vec![None; events.len()];
+    let mut seen: Option<PkDual<T>> = None;
+    for i in (0..events.len()).rev() {
+        let ev = events[i];
+        match ev.kind {
+            EventKind::DoseRecord => seen = Some(pk_at_dose[ev.orig_idx]),
+            EventKind::PkOnly => seen = Some(pk_at_pk_only[ev.orig_idx]),
+            EventKind::Obs => seen = Some(pk_at_obs[ev.orig_idx]),
+            // Not records: the arrival is a state jump, and a reset is handled
+            // before the parameter lookup.
+            EventKind::Dose | EventKind::Reset => {}
+        }
+        acc[i] = seen;
+    }
+    acc
 }
 
 /// Propagate the dual state across pre-built sub-event bounds, applying any active
@@ -1360,6 +1392,8 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
     let mut cur_t = schedule.events[0].time;
     let mut reset_floor = f64::NEG_INFINITY;
 
+    let next_record_pk = next_record_pk_g(&schedule.events, pk_at_dose, pk_at_obs, pk_at_pk_only);
+
     for (i, ev) in schedule.events.iter().enumerate() {
         if ev.kind == EventKind::Reset {
             state.iter_mut().for_each(|s| *s = T::from_f64(0.0));
@@ -1367,7 +1401,10 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
             reset_floor = ev.time;
             continue;
         }
-        let pk_now = pk_for_g(*ev, pk_at_dose, pk_at_obs, pk_at_pk_only);
+        // The record terminating this interval — itself for a record, the next one
+        // ahead for a lagged arrival (#1073). Mirrors the value walk exactly.
+        let pk_now = next_record_pk[i]
+            .unwrap_or_else(|| pk_for_g(*ev, pk_at_dose, pk_at_obs, pk_at_pk_only));
 
         if ev.time > cur_t {
             let bounds = &schedule.bounds_per_interval[i - 1];
@@ -1386,19 +1423,27 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
         }
 
         match ev.kind {
+            EventKind::DoseRecord => {
+                // The dose row: a record, so the interval ending here took its
+                // snapshot above. State jumps at the arrival, not here (#1073).
+            }
             EventKind::Dose => {
                 let d = &eff_doses[ev.orig_idx];
+                // Dose attributes belong to the dose row, so `F` and the SS
+                // equilibration read that row's snapshot — never `pk_now`, which
+                // after #1073 is the next record's (#1073).
+                let dose_pk = pk_at_dose[ev.orig_idx];
                 if d.ss && d.ii > 0.0 {
                     // #486: forward this dose's modeled-window dual (if any) so the SS
                     // equilibration threads `∂D`/`∂R` into the trough, matching the current
                     // pulse handled by the main walk. `None` for a fixed infusion / bolus.
                     let inf = dose_inf_dual.get(ev.orig_idx).copied().flatten();
-                    state = equilibrate_ss_g(pk_model, &pk_now, d, inf);
+                    state = equilibrate_ss_g(pk_model, &dose_pk, d, inf);
                 }
                 if d.rate <= 0.0 {
                     let cmt_idx = d.cmt_idx();
                     if cmt_idx < n_states {
-                        state[cmt_idx] = state[cmt_idx] + pk_now.f * T::from_f64(d.amt);
+                        state[cmt_idx] = state[cmt_idx] + dose_pk.f * T::from_f64(d.amt);
                     } else {
                         // Unreachable from a validated call — `check_dose_compartments`
                         // (#375) rejects `cmt > n_states` up front. Kept as a defensive

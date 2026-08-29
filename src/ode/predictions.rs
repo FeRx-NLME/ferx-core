@@ -4463,15 +4463,24 @@ pub fn ode_predictions_event_driven(
     }
 
     // Build merged event timeline. Tie-break at the same time:
-    //   dose < pk-only < obs < infusion-end
+    //   dose-record < dose-arrival < pk-only < obs < infusion-end
     // — matches the analytical event-driven path for dose/pk-only/obs.
     // Infusion-end sorts last so an obs at the same time as the end of
     // an infusion is recorded with the infusion still contributing
     // (state is continuous; the ordering only affects which segments
     // include the rate in their active set on the next iteration).
-    #[derive(Clone, Copy)]
+    //
+    // `DoseRecord` and `Dose` are the two halves of one dose (#1073): the NONMEM
+    // *record* sits at `d.time` and is where `$PK` runs, while the state jump
+    // happens at the lagged arrival `d.time + ALAG`. With no lagtime they
+    // coincide and `DoseRecord` sorts first, so the parameters are in force
+    // before the dose lands — bit-identical to the single-event form this
+    // replaced. `Dose` keeps its rank ahead of `Obs` so an observation landing
+    // exactly on an arrival still reads the post-dose state.
+    #[derive(Clone, Copy, PartialEq, Eq)]
     enum Kind {
         Reset,
+        DoseRecord,
         Dose,
         PkOnly,
         Obs,
@@ -4482,15 +4491,27 @@ pub fn ode_predictions_event_driven(
             // Reset sorts first so EVID=4 (reset + dose) zeros the state
             // before its own dose lands at the same time.
             Kind::Reset => 0,
-            Kind::Dose => 1,
-            Kind::PkOnly => 2,
-            Kind::Obs => 3,
-            Kind::InfusionEnd => 4,
+            Kind::DoseRecord => 1,
+            Kind::Dose => 2,
+            Kind::PkOnly => 3,
+            Kind::Obs => 4,
+            Kind::InfusionEnd => 5,
         }
+    }
+    /// Whether a timeline entry is a NONMEM **data record** — an event `$PK` runs
+    /// at, and therefore a source of segment parameters (#1073).
+    ///
+    /// A lagged dose *arrival* is not one (its `DoseRecord` at `d.time` is), and
+    /// neither is an infusion end, a zero-order cutoff, or a per-route onset.
+    /// `Reset` is excluded to preserve its existing `last_pk` treatment; NONMEM
+    /// does run `$PK` at an EVID=3/4 row, so that is a latent divergence of the
+    /// same family, tracked separately rather than half-fixed here.
+    fn is_record(k: Kind) -> bool {
+        matches!(k, Kind::DoseRecord | Kind::PkOnly | Kind::Obs)
     }
     let n_infusion_ends = subject.doses.iter().filter(|d| is_real_infusion(d)).count();
     let mut timeline: Vec<(f64, Kind, usize)> = Vec::with_capacity(
-        subject.doses.len()
+        2 * subject.doses.len()
             + n_obs
             + subject.pk_only_times.len()
             + subject.reset_times.len()
@@ -4515,8 +4536,30 @@ pub fn ode_predictions_event_driven(
         .zip(pk_at_dose.iter())
         .map(|(d, p)| ode.dose_attr_map.f_bio(d.cmt_raw(), &p.values))
         .collect();
+    // Earliest lagged arrival in the subject — the TAD anchor for any segment that
+    // runs before ANY dose has arrived. One value per subject, so it cannot depend on
+    // where records happen to fall; see the fallback's own note below for why that
+    // matters. `None` for a dose-free subject, where TAD has no referent at all.
+    let first_arrival_ed: Option<f64> = subject
+        .doses
+        .iter()
+        .enumerate()
+        .map(|(k, d)| d.time + dose_lagtimes[k])
+        .fold(None, |acc: Option<f64>, t| {
+            Some(acc.map_or(t, |a| a.min(t)))
+        });
     for (k, d) in subject.doses.iter().enumerate() {
         let lag = dose_lagtimes[k];
+        // The dose *record* at its own time — always pushed, lagtime or not
+        // (#1073). NONMEM runs `$PK` at the dose row and ADVANs to it, so the
+        // dose row's snapshot governs the segment that ENDS there and nothing
+        // after it; the interval from here to the lagged arrival belongs to the
+        // next record. Skipping this push when `lag == 0` would be wrong in the
+        // opposite direction — the arrival is not a parameter source any more, so
+        // without the record the segment ending at `d.time` would look forward
+        // past the dose to the following record. The zero-length segment that
+        // results when `lag == 0` costs nothing (`if t_event > cur_t`).
+        timeline.push((d.time, Kind::DoseRecord, k));
         timeline.push((d.time + lag, Kind::Dose, k));
         if is_real_infusion(d) {
             // F-scaled infusion end (#419): rate-defined -> F·duration window.
@@ -4570,6 +4613,43 @@ pub fn ode_predictions_event_driven(
         zero_order_dur_and_frac_for_dose(ode, d, &pk_at_dose[k].values)
     });
 
+    // Parameters for the segment ENDING at each timeline entry (#1073).
+    //
+    // NONMEM evaluates `$PK` at every record and then ADVANs *to* that record, so
+    // a segment is governed by the record that TERMINATES it. An entry that is not
+    // a record — a lagged dose arrival, an infusion end, a zero-order cutoff, a
+    // per-route onset — supplies no parameters of its own: it merely subdivides
+    // the interval its enclosing record terminates, and every piece of that
+    // interval runs on that record's snapshot.
+    //
+    // Resolved here in one backward scan rather than at the point of use, because
+    // the answer for a non-record lies *ahead* of it in the walk. `None` means no
+    // record follows (a trailing arrival or infusion end past the final
+    // observation); the loop falls back to `last_pk` there, the only snapshot that
+    // exists.
+    //
+    // Reusing `last_pk` for these — the previous record — is what this replaced,
+    // and it is wrong by exactly one record: measured against NONMEM 7.6.0 it puts
+    // a 4.2 % error on the predictions after an infusion end that falls between
+    // two records under a changing covariate, and 14.9 OFV on a lagged second
+    // dose whose arrival crosses one.
+    let next_record_pk: Vec<Option<PkParams>> = {
+        let mut acc = vec![None; timeline.len()];
+        let mut seen: Option<PkParams> = None;
+        for i in (0..timeline.len()).rev() {
+            let (_, kind, idx) = timeline[i];
+            if is_record(kind) {
+                seen = Some(match kind {
+                    Kind::DoseRecord => pk_at_dose[idx],
+                    Kind::PkOnly => pk_at_pk_only[idx],
+                    _ => pk_at_obs[idx],
+                });
+            }
+            acc[i] = seen;
+        }
+        acc
+    };
+
     let mut cur_t = timeline[0].0;
     // Most-recent NONMEM record's PK params, used to integrate segments
     // ending at an infusion-end (which is not a record and carries no PK).
@@ -4582,17 +4662,20 @@ pub fn ode_predictions_event_driven(
     // first reset. Infusions started before it are no longer active.
     let mut reset_floor = f64::NEG_INFINITY;
 
-    for &(t_event, kind, idx) in &timeline {
-        // PK params for the segment [cur_t, t_event] are evaluated AT
-        // t_event (NONMEM end-of-interval / current-record convention —
-        // `$PK runs at every record, then ADVAN propagates to it`).
-        // Infusion-end is not a record: reuse the previous segment's PK.
-        // Reset is not a record either: it just zeros the state below.
+    for (i, &(t_event, kind, idx)) in timeline.iter().enumerate() {
+        // PK params for the segment [cur_t, t_event] are evaluated AT the record
+        // that TERMINATES the interval (NONMEM end-of-interval / current-record
+        // convention — `$PK runs at every record, then ADVAN propagates to it`).
+        // For a record that is itself; for a non-record it is the next record
+        // ahead (#1073), which `next_record_pk` resolved above.
         let pk_now: PkParams = match kind {
-            Kind::Dose => pk_at_dose[idx],
-            Kind::Obs => pk_at_obs[idx],
-            Kind::PkOnly => pk_at_pk_only[idx],
-            Kind::InfusionEnd | Kind::Reset => last_pk,
+            // A reset zeros the state below and, in ferx, is not treated as a
+            // parameter source: the segment ending at it reuses the previous
+            // record. NONMEM does run `$PK` at an EVID=3/4 row, so this is a
+            // latent divergence of the same family as #1073 — left as-is here
+            // deliberately rather than half-fixed, and tracked separately.
+            Kind::Reset => last_pk,
+            _ => next_record_pk[i].unwrap_or(last_pk),
         };
 
         if t_event > cur_t {
@@ -4617,12 +4700,39 @@ pub fn ode_predictions_event_driven(
                     }
                 })
                 .fold(f64::NEG_INFINITY, f64::max);
-            // Store NaN when no effective prior dose exists (fold stays at NEG_INFINITY)
-            // so the ODE RHS injects NaN for TAD rather than +∞ (t - NEG_INFINITY).
+            // No dose has arrived yet, so the fold stayed at NEG_INFINITY and `t - anchor`
+            // would be `+∞`. Anchor at the subject's FIRST arrival instead — `TAD` is then
+            // negative before the dose lands and continuous through it, which is simply
+            // `TAD(t) = t − τ` extended backwards.
+            //
+            // Before #1073 this branch was reachable only when a record fell inside the
+            // pre-arrival window; splitting the dose row off from its arrival opens a real
+            // `(d.time, arrival]` segment ahead of every lagged first dose. Two properties
+            // are load-bearing there, and both were learned the hard way:
+            //
+            //   * **Finite.** A NaN anchor multiplies into the state (`0.0 * NaN = NaN`)
+            //     and poisons every later prediction of any `[odes]` RHS reading `TAD`,
+            //     turning a finite fit into the 1e20 objective sentinel.
+            //   * **Segment-invariant.** The anchor is recomputed per segment, so anchoring
+            //     at `cur_t` restarts `TAD` at zero at each record inside the pre-arrival
+            //     window — a sawtooth whose shape depends on the sampling mesh, not on the
+            //     model. Measured: two subjects identical but for one extra observation in
+            //     that window diverged by 4.2e-4 at *every* later time, the error injected
+            //     once and then carried multiplicatively. A prediction must not move
+            //     because someone took an extra sample.
+            //
+            // The value is immaterial wherever the pre-arrival state is zero — every model
+            // without an `init(...)` baseline — but `init` state does decay across that
+            // window, so there it is live. What `TAD` *means* before a dose has arrived is
+            // #1110's to settle; this only guarantees it is finite and mesh-independent in
+            // the meantime, and the dense predictor answers NaN there independently of this
+            // walk.
             let last_dose_eff_ed = if last_dose_eff_ed.is_finite() {
                 last_dose_eff_ed
             } else {
-                f64::NAN
+                // Dose-free subject: `TAD` has no referent, and NaN is the pre-existing
+                // answer for that case.
+                first_arrival_ed.unwrap_or(f64::NAN)
             };
             let mut ext_params_ed = [f64::NAN; crate::types::MAX_PK_PARAMS + 2];
             ext_params_ed[..crate::types::MAX_PK_PARAMS]
@@ -4679,14 +4789,25 @@ pub fn ode_predictions_event_driven(
         }
 
         match kind {
+            Kind::DoseRecord => {
+                // The dose row itself: a NONMEM record, so `$PK` ran here and this
+                // snapshot becomes current. No state change — that happens at the
+                // lagged arrival below (#1073).
+                last_pk = pk_now;
+            }
             Kind::Dose => {
                 let d = &subject.doses[idx];
+                // Dose *attributes* are properties of the dose row, so they read
+                // that row's own snapshot (`pk_at_dose[idx]`) and never `pk_now`,
+                // which after #1073 is the NEXT record's. Before the split the two
+                // were the same object and the distinction did not show.
+                let dose_pk = &pk_at_dose[idx];
                 // Steady-state (SS=1) dose: reset state and load with the
                 // SS amount from the infinite-past pulse train before the
                 // SS dose's own pulse is applied below. See
                 // `equilibrate_ss_state` for the per-cycle scheme.
                 if d.ss && d.ii > 0.0 {
-                    u = equilibrate_ss_state(ode, &pk_now.values, d, &opts);
+                    u = equilibrate_ss_state(ode, &dose_pk.values, d, &opts);
                 }
                 // Boluses: add amt to state. Infusions: no instantaneous
                 // change — handled via the wrapped RHS for segments inside
@@ -4696,11 +4817,12 @@ pub fn ode_predictions_event_driven(
                 if !is_real_infusion(d) && !input_rate_consumes_cmt(ode, d.cmt_raw()) {
                     let cmt_idx = d.cmt_idx();
                     if cmt_idx < n {
-                        // Bioavailability resolved per dose compartment (`Fn`).
-                        u[cmt_idx] += ode.dose_attr_map.f_bio(d.cmt_raw(), &pk_now.values) * d.amt;
+                        // Bioavailability resolved per dose compartment (`Fn`),
+                        // precomputed from `pk_at_dose` alongside the lagtimes.
+                        u[cmt_idx] += dose_f_bio[idx] * d.amt;
                     }
                 }
-                last_pk = pk_now;
+                // The arrival is not a record: it must NOT become `last_pk`.
             }
             Kind::Obs => {
                 let cmt = subject.obs_cmts.get(idx).copied().unwrap_or(0);
