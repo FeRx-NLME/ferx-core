@@ -29,6 +29,36 @@
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::{fit, predict, read_nonmem_csv, simulate_with_options_diag, SimulateOptions};
 
+/// Serializes every test in this binary that runs an `SS=1` model (#1113).
+///
+/// The #867 SS-equilibration non-convergence warning is collected in a
+/// **process-global** sink (`dosing::ss_nonconvergence_sink`) because the capped
+/// pulse train runs deep inside the rayon-parallelised per-subject prediction walk
+/// and its numeric signatures carry no warning channel. Each draining `api`
+/// entrypoint brackets its own run — `clear` on entry, `take` on exit — which is
+/// correct for one top-level operation at a time, but cargo runs the tests in a
+/// binary as **threads of one process**. So a warning written by one test's fit can
+/// land inside another test's clear→take window and be drained by it.
+///
+/// That is exactly what made `simulate_stays_silent_for_benign_nonlinear_ss_absorption`
+/// flap in the nightly: `fit_on_ss_absorption_converges` (slow-gated, so it only
+/// runs there) writes ~100 warnings over its lifetime — legitimately, since the
+/// outer optimizer probes `CL → 0`, where the pulse train genuinely stops
+/// contracting — and the benign test, whose own simulate produces none, drained one
+/// of them and failed on a message about a model it never ran.
+///
+/// The lock is taken by *every* test here, writers included: a reader-only guard
+/// would not keep a writer out of the reader's window. Poisoning is ignored
+/// (`into_inner`) so one failing test reports its own failure instead of cascading
+/// the rest into panics.
+static SS_WARN_SINK_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn ss_sink_guard() -> std::sync::MutexGuard<'static, ()> {
+    SS_WARN_SINK_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 // `first_order(ka)` appears in central directly (its R_in is the appearance rate of an
 // ADVAN2 depot→central first-order absorption), and the readout `y = central/V` matches
 // NONMEM's `S2 = V` concentration. Thetas are FIXed at the NONMEM values.
@@ -66,6 +96,8 @@ const SS_FIRST_ORDER_MODEL: &str = r#"
 
 #[test]
 fn predict_matches_nonmem_ss_first_order_absorption() {
+    // Serialize against the other SS tests in this binary (#1113).
+    let _sink_guard = ss_sink_guard();
     let parsed = parse_full_model(SS_FIRST_ORDER_MODEL).expect("model parses");
     let model = parsed.model;
 
@@ -119,6 +151,8 @@ fn predict_matches_nonmem_ss_first_order_absorption() {
     ignore = "slow: analytic FOCEI to convergence on an SS-absorption model; opt in with --features slow-tests"
 )]
 fn fit_on_ss_absorption_converges() {
+    // Serialize against the other SS tests in this binary (#1113).
+    let _sink_guard = ss_sink_guard();
     let src = SS_FIRST_ORDER_MODEL.replace("omega ETA_CL ~ 0.0", "omega ETA_CL ~ 0.05");
     let parsed = parse_full_model(&src).expect("model parses");
     let model = parsed.model;
@@ -236,6 +270,8 @@ const SS_MM_MODEL: &str = r#"
 
 #[test]
 fn predict_matches_nonmem_mm_ss_absorption() {
+    // Serialize against the other SS tests in this binary (#1113).
+    let _sink_guard = ss_sink_guard();
     let parsed = parse_full_model(SS_MM_MODEL).expect("model parses");
     let model = parsed.model;
     let population =
@@ -270,6 +306,8 @@ fn predict_matches_nonmem_mm_ss_absorption() {
 
 #[test]
 fn simulate_surfaces_ss_nonconvergence_warning_when_no_steady_state() {
+    // Serialize against the other SS tests in this binary (#1113).
+    let _sink_guard = ss_sink_guard();
     let parsed = parse_full_model(SS_MM_NO_STEADY_STATE_MODEL).expect("model parses");
     let model = parsed.model;
     let population = read_nonmem_csv(std::path::Path::new("data/ss_first_order.csv"), None, None)
@@ -306,6 +344,8 @@ fn simulate_surfaces_ss_nonconvergence_warning_when_no_steady_state() {
 /// covariance is off to keep it quick.
 #[test]
 fn fit_surfaces_ss_nonconvergence_warning_for_over_capacity_dosing() {
+    // Serialize against the other SS tests in this binary (#1113).
+    let _sink_guard = ss_sink_guard();
     let parsed = parse_full_model(SS_MM_NO_STEADY_STATE_MODEL).expect("model parses");
     let model = parsed.model;
     let population = read_nonmem_csv(std::path::Path::new("data/ss_first_order.csv"), None, None)
@@ -335,6 +375,8 @@ fn fit_surfaces_ss_nonconvergence_warning_for_over_capacity_dosing() {
 /// solver-noise jitter (the `rho ≥ 1` noise-floor short-circuit).
 #[test]
 fn simulate_stays_silent_for_benign_nonlinear_ss_absorption() {
+    // Serialize against the other SS tests in this binary (#1113).
+    let _sink_guard = ss_sink_guard();
     let src = SS_MM_NO_STEADY_STATE_MODEL.replace(
         "theta TVVMAX(10.0, 1.0, 100.0)",
         "theta TVVMAX(500.0, 1.0, 5000.0)",

@@ -694,6 +694,7 @@ fn warning_code_tokens_are_stable() {
         (CovarianceRegularized, "covariance_regularized"),
         (ConditionNumber, "condition_number"),
         (OptimizerHealth, "optimizer_health"),
+        (ViBadBasin, "vi_bad_basin"),
         (DwAutocorrelation, "dw_autocorrelation"),
         (EtaNormality, "eta_normality"),
         (Experimental, "experimental"),

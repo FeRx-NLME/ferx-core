@@ -44,7 +44,7 @@
 //! objective comparable at all. The bound itself (`−2·ELBO`) is never compared
 //! with an OFV across engines; that is the mistake the whole document is about.
 
-use ferx_core::parser::model_parser::parse_model_file;
+use ferx_core::parser::model_parser::{parse_model_file, parse_model_string};
 use ferx_core::{
     fit, read_nonmem_csv, CompiledModel, EstimationMethod, FitOptions, Population, ViFinalOfv,
 };
@@ -255,5 +255,113 @@ fn ferx_vi_matches_nonmem_focei_on_warfarin() {
         v.neg_two_elbo >= NM_OFV - 1e-6,
         "−2·ELBO = {:.3} is BELOW NONMEM's FOCEI OFV {NM_OFV:.3}, so it is not a bound",
         v.neg_two_elbo
+    );
+}
+
+/// Regression for #1097: VI from the `ferx-testdata` initial estimates, which are
+/// further from the optimum than `examples/warfarin.ferx` but entirely ordinary.
+///
+/// This is the same data (`data/warfarin.csv` is byte-identical to
+/// `ferx-testdata/warfarin_pk/data/warfarin.csv`) and the same NONMEM reference — that
+/// folder's own `nm/run1_focei.lst` runs FOCEI from *these* initial estimates and reaches
+/// `TVCL 1.32695e-1, TVV 7.73770, TVKA 8.10795e-1, σ² 1.11621e-4, OFV −286.004219`, i.e.
+/// the column already pinned at the top of this file. NONMEM converges from here in under
+/// a second; before the gradient clip, ferx VI did not converge from here at all.
+///
+/// # What used to happen
+///
+/// Iteration 0 evaluates at `−2·ELBO = 1.5e14`: `TVV = 2` makes late predictions ~0, and a
+/// proportional error model turns that into `(y−f)²/(σf)²` at that scale. Adam's second
+/// moment absorbs the resulting gradient, and at `beta2 = 0.999` the `√v̂ ≈ 1e12` it leaves
+/// behind makes every later step numerically zero for tens of thousands of iterations. The
+/// run then stopped at iteration 1500 of a 25 000 ceiling — a frozen trace is a flat trace,
+/// so the settling rule fired at the earliest opportunity — reporting `σ = 148.41`, which
+/// is `exp(5)`, its internal runaway bound, with `−2·ELBO = 3.6e7` and `TVV = 2.475`.
+///
+/// The failure was not a bad basin: profiling `−2·ELBO` against `TVV` with everything else
+/// fixed is monotone from 2 to 20, so the optimizer was walking away from a downhill
+/// direction rather than sitting in a local minimum. Nor was it `σ`: pinning `σ` at the
+/// FOCEI value still left `TVV` at 2.83 after 25 000 iterations.
+///
+/// # Why this test is worth its runtime
+///
+/// It is the only assertion that exercises the interaction the unit tests cannot: a real
+/// ELBO gradient large enough to poison `v`, produced by the actual predictor and residual
+/// model rather than by a hand-written spike. `grad_clip_prevents_second_moment_poisoning`
+/// pins the mechanism on synthetic gradients; this pins that the mechanism was the one
+/// actually blocking this fit.
+///
+/// Tolerances match the existing VI arm, except `σ`, which lands ~10% high here (0.0116
+/// against 0.010565) — the Monte-Carlo floor of §4.11a, the same effect that arm documents,
+/// not residue from the far start.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: full warfarin VI convergence fit; opt in with --features slow-tests"
+)]
+fn ferx_vi_recovers_nonmem_from_the_testdata_start() {
+    // The `ferx-testdata/warfarin_pk/ferx/run1_focei.ferx` parameter block verbatim, which
+    // is also what `nm/run1_focei.mod` declares in `$THETA`/`$OMEGA`/`$SIGMA`.
+    let model = parse_model_string(
+        r"
+[parameters]
+  theta TVCL(0.3, 0.001, 10.0)
+  theta TVV(2, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+
+  omega ETA_CL ~ 0.1
+  omega ETA_V  ~ 0.1
+  omega ETA_KA ~ 0.1
+
+  sigma PROP_ERR ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+",
+    )
+    .expect("testdata warfarin model must parse");
+    let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+        .expect("warfarin data must load");
+
+    let opts = FitOptions {
+        method: EstimationMethod::Vi,
+        vi_final_ofv: ViFinalOfv::Laplace,
+        run_covariance_step: false,
+        ..FitOptions::default()
+    };
+    let f = fit(&model, &population, &model.default_params, &opts).expect("VI fit runs");
+
+    // The headline: `σ` is nowhere near its `exp(5)` runaway bound. Asserted separately
+    // from the tolerance below so a regression reports the actual failure mode rather than
+    // a percentage.
+    assert!(
+        f.sigma[0] < 1.0,
+        "sigma = {:.4} — a proportional SD above 1 means the fit ran to its internal \
+         guard, which is the #1097 freeze",
+        f.sigma[0]
+    );
+    assert!(
+        f.converged,
+        "VI should converge from the testdata start once gradients are clipped"
+    );
+
+    assert_matches_nonmem(
+        "ferx VI (testdata start)",
+        &f.theta,
+        &omega_diag(&f.omega),
+        f.sigma[0],
+        f.ofv,
+        0.01,
+        0.05,
+        0.15,
+        3.0,
     );
 }

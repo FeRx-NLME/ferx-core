@@ -7398,6 +7398,13 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             }
             opts.vi_lr = v;
         }
+        "vi_grad_clip" => {
+            let v = parse_f64("vi_grad_clip")?;
+            if !(v >= 0.0) {
+                return Err(format!("vi_grad_clip must be >= 0 (0 disables), got {v}"));
+            }
+            opts.vi_grad_clip = v;
+        }
         "vi_family" => {
             opts.vi_family = match value.trim().to_lowercase().as_str() {
                 "full_rank" | "fullrank" => crate::types::ViFamily::FullRank,
