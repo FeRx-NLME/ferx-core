@@ -4842,13 +4842,19 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     // the segment start — it cannot make the answer depend on the sampling mesh, and
     // `max` at each arrival leaves every later segment's anchor unchanged.
     //
-    // A dose-free subject gets **NaN**, not `NEG_INFINITY` — matching production's
-    // `first_arrival_ed.unwrap_or(f64::NAN)` and `tad_anchor`. `NEG_INFINITY` would
-    // make `TAD = +∞` here while the value path predicts `TAD = NaN`, so the twin
-    // would differentiate a different function than the one predicted — invisible to
-    // `Dual2`-vs-FD parity, which perturbs this walk's own value path and moves both
-    // sides together. Reachable for a placebo arm or a baseline-only subject in a
-    // joint model.
+    // A dose-free subject gets `NaN`, matching the literal production writes
+    // (`first_arrival_ed.unwrap_or(f64::NAN)`, and `tad_anchor`'s dose-free return).
+    //
+    // This is a **readability** alignment, not a behaviour change, and the distinction
+    // is worth recording so nobody re-derives it: `NEG_INFINITY` would have been
+    // equivalent. Every consumer of `last_dose_eff` gates on `is_finite()` — which is
+    // false for `NaN` and for `NEG_INFINITY` alike — so `eval_rhs_anchored` injects
+    // `TAD = NaN` either way, both saltation guards take their fallback either way, and
+    // the `max` at an arrival is unreachable without a dose (and returns `t_event` for
+    // both regardless, since `f64::max` ignores `NaN`). A review round flagged this as a
+    // twin-vs-production divergence; it is not one. Writing the same literal as
+    // production is still worth doing — it means a future reader comparing the two
+    // sites does not have to redo this analysis to see they agree.
     let mut last_dose_eff = subject
         .doses
         .iter()
