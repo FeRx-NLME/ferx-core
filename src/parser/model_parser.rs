@@ -11260,6 +11260,10 @@ fn build_ode_spec(
     // (issue #367) before the f64 closure moves `stmts_owned`. Same statements,
     // same var layout — evaluated over a dual type by `eval_rhs_g`.
     let uses_time_vars = stmts_read_slots(&stmts_owned, &[time_slot, tafd_slot, tad_slot]);
+    // `TAD` alone, not the union above: it is the only anchor that moves with an estimated
+    // lagtime (#1070). Kept as a second, narrower flag rather than replacing `uses_time_vars`
+    // — the SS gate must stay broad, since a `TIME`-only RHS still breaks the SS cycle.
+    let uses_dose_anchored_time_vars = stmts_read_slots(&stmts_owned, &[tad_slot]);
     let rhs_program = OdeRhsProgram {
         stmts: stmts_owned.clone(),
         n_vars_total,
@@ -11270,6 +11274,7 @@ fn build_ode_spec(
         tad_slot,
         macheps_slot,
         uses_time_vars,
+        uses_dose_anchored_time_vars,
     };
 
     let rhs: Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync> =
@@ -18885,12 +18890,28 @@ pub struct OdeRhsProgram {
     /// pulse train, so the SS dual equilibration's cycle recurrence breaks for such an RHS;
     /// the gate routes SS subjects on a non-autonomous RHS to FD (#473 review #1).
     uses_time_vars: bool,
+    /// True when the RHS reads `TAD` — the one time anchor that is **dose-anchored**, and
+    /// therefore the one that moves with an estimated lagtime. Deliberately narrower than
+    /// [`uses_time_vars`](Self::uses_time_vars): `TIME` is the integrator clock and `TAFD`
+    /// anchors at the *unlagged* `min(d.time)` in both engines, so neither carries a lag
+    /// jet — measured exact, #1070 probe 2a. `TAD` anchors at the **lagged arrival**
+    /// (`last_dose_eff`), so `∂TAD/∂lag = −1`, which the `f64` lifting in `eval_rhs_g`
+    /// drops (#1070).
+    uses_dose_anchored_time_vars: bool,
 }
 
 impl OdeRhsProgram {
     /// See [`OdeRhsProgram::uses_time_vars`]. `true` ⇒ a steady-state dose must route to FD.
     pub(crate) fn uses_time_vars(&self) -> bool {
         self.uses_time_vars
+    }
+
+    /// See [`OdeRhsProgram::uses_dose_anchored_time_vars`]. `true` **and** an estimated
+    /// lagtime ⇒ the analytic sensitivity walks must route to FD (#1070): `TAD` is injected
+    /// as an `f64` constant, so the `∂TAD/∂lag = −1` term never enters the dual chain and
+    /// the η/θ gradient on the lag axis is silently wrong (measured 2.8 %–70 %).
+    pub(crate) fn uses_dose_anchored_time_vars(&self) -> bool {
+        self.uses_dose_anchored_time_vars
     }
 
     /// Evaluate `du = f(u, p, t)` over a dual type, generic over [`PkNum`]
