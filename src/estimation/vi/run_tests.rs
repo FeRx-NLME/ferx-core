@@ -179,6 +179,50 @@ fn systematic_drift_is_detected_below_the_settling_test_noise_floor() {
     assert!(!trace_still_drifting(&poisoned, 40));
 }
 
+/// #1098: an implausibly loose ELBO is evidence that a flat trace is a bad basin,
+/// not successful convergence. It must also suppress the generic iteration-budget
+/// advice, which does not address this failure mode.
+#[test]
+fn bad_basin_guard_demotes_convergence_and_uses_its_own_warning() {
+    let tightness = super::ElboTightness {
+        excess: 260.0,
+        expected: 10.0,
+    };
+    let mut converged = true;
+
+    let warning = super::bad_basin_warning(&mut converged, &tightness)
+        .expect("a ratio above the implausibility threshold must warn");
+
+    assert!(!converged, "a detected bad basin is not convergence");
+    assert!(warning.starts_with("W_VI_BAD_BASIN:"));
+    assert!(warning.contains("Reported converged: false"));
+    assert!(!warning.contains("`converged` reflects a flat objective"));
+    assert!(
+        !super::needs_iteration_budget_warning(converged, false, true),
+        "bad-basin guidance must replace the generic increase-vi_iters warning"
+    );
+
+    let structured = crate::types::classify_warning(&warning);
+    assert_eq!(structured.category, crate::types::WarningCode::ViBadBasin);
+    assert_eq!(structured.severity, crate::types::WarningSeverity::Critical);
+}
+
+/// A healthy ELBO must leave convergence untouched, and an ordinary exhausted run
+/// still gets the iteration-budget warning.
+#[test]
+fn healthy_tightness_does_not_change_convergence_reporting() {
+    let tightness = super::ElboTightness {
+        excess: 10.0,
+        expected: 10.0,
+    };
+    let mut converged = true;
+
+    assert!(super::bad_basin_warning(&mut converged, &tightness).is_none());
+    assert!(converged);
+    assert!(super::needs_iteration_budget_warning(false, false, false));
+    assert!(!super::needs_iteration_budget_warning(false, true, false));
+}
+
 // ---------------------------------------------------------------------------
 // End-to-end behaviour
 // ---------------------------------------------------------------------------
@@ -1259,5 +1303,70 @@ fn default_mc_samples_is_the_validated_value() {
         d.vi_mc_samples, 32,
         "the VI default draw count is anchored against AGQ/FOCEI on warfarin; lowering it \
          re-opens the certified-wrong-sigma failure (see this test's docs)"
+    );
+}
+
+/// The gradient clip is on by default, and that default is load-bearing rather than
+/// cosmetic.
+///
+/// Without it, warfarin from the `ferx-testdata` initial estimates (`TVV = 2`, an ordinary
+/// distance from the optimum) does not merely fit badly — it freezes. Iteration 0 evaluates
+/// at `−2·ELBO = 1.5e14`, because a proportional error model with predictions near zero
+/// sends `(y−f)²/(σf)²` to that scale; Adam's second moment absorbs it, and with
+/// `beta2 = 0.999` the resulting `√v̂ ≈ 1e12` leaves every later step numerically zero for
+/// tens of thousands of iterations. The run then stops at the earliest iteration the
+/// settling rule permits — a frozen trace is a flat trace — with `σ` welded to its `exp(5)`
+/// runaway bound and estimates ~1594 objective units short of FOCEI (#1097).
+///
+/// Measured on `ferx-testdata/warfarin_pk` against the NONMEM FOCEI run in that folder
+/// (`nm/run1_focei.lst`, identical initial estimates, OFV `−286.004219`):
+///
+/// | | TVCL | TVV | TVKA | σ | −2·ELBO |
+/// |---|---|---|---|---|---|
+/// | `vi_grad_clip = 0` | 0.2431 | 2.4750 | 0.7939 | **148.41** | 3.6e7 |
+/// | `vi_grad_clip = 1e4` | 0.132693 | 7.73787 | 0.81100 | 0.01162 | −284.61 |
+/// | *NONMEM FOCEI* | *0.132695* | *7.73770* | *0.810795* | *0.010565* | *−286.004* |
+///
+/// Reproduced on four seeds, and `propofol_schnider` / `vancomycin_uvm` — models that
+/// already converged — are unchanged to seven significant figures with the clip on, because
+/// Adam is scale-invariant in steady state.
+///
+/// So turning this off by default re-opens #1097. It stays a knob because a user may want
+/// the unclipped trajectory for comparison, not because zero is a reasonable default.
+#[test]
+fn gradient_clipping_is_on_by_default() {
+    let d = FitOptions::default();
+    assert!(
+        d.vi_grad_clip > 0.0,
+        "VI gradient clipping must be on by default; disabling it re-opens the #1097 \
+         freeze (see this test's docs)"
+    );
+    assert_eq!(d.vi_grad_clip, 1e4);
+}
+
+/// The clip reaches Adam. A default `FitOptions` must produce a clipping `AdamConfig`, and
+/// an explicit `0` must produce a non-clipping one — the wiring is a single field, but it
+/// is the field that decides whether #1097 reproduces, so it is pinned rather than assumed.
+#[test]
+fn vi_grad_clip_reaches_the_adam_config() {
+    let mut o = FitOptions::default();
+    let cfg = AdamConfig {
+        lr: o.vi_lr,
+        grad_clip: o.vi_grad_clip,
+        ..Default::default()
+    };
+    assert_eq!(cfg.grad_clip, 1e4);
+    // A huge gradient is actually rescaled under that config.
+    assert!(super::super::adam::grad_clip_scale(&[1e14], cfg.grad_clip) < 1e-9);
+
+    o.vi_grad_clip = 0.0;
+    let off = AdamConfig {
+        lr: o.vi_lr,
+        grad_clip: o.vi_grad_clip,
+        ..Default::default()
+    };
+    assert_eq!(
+        super::super::adam::grad_clip_scale(&[1e14], off.grad_clip),
+        1.0
     );
 }

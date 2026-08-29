@@ -20,6 +20,22 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Fixed
+- **VI no longer freezes from ordinary starting values (#1097).** Adam's gradients are now
+  clipped to a global L2 norm, controlled by the new `vi_grad_clip` fit option (default `1e4`;
+  `0` restores the old behaviour). Under a proportional error model a prediction near zero
+  makes the ELBO gradient enormous, and Adam's second moment — an average of *squares* with a
+  ~1000-iteration memory — absorbed it and left every subsequent step numerically zero for tens
+  of thousands of iterations. The frozen trace then read as settled, so the run stopped early and
+  reported `σ` welded to its internal `exp(5)` guard. On warfarin from the `ferx-testdata`
+  initial estimates this cost ~1594 objective units against FOCEI; the same fit now reproduces
+  the NONMEM FOCEI estimates (`TVCL 0.13269`, `TVV 7.7379`, `σ 0.0116`) with no warm start.
+  Fits that already converged are unaffected — clipping is asymptotically a no-op because Adam
+  is scale-invariant in steady state.
+- **VI's bad-basin detector now reports `converged: false` (#1098).** An implausibly loose
+  final ELBO already identified a fit trapped far from a usable variational approximation, but
+  the result still exposed `converged: true` to programmatic consumers. Such fits are now demoted,
+  omit the misleading "increase `vi_iters`" warning, and carry the critical structured warning
+  code `vi_bad_basin`.
 - **A lagged dose's covariate snapshot no longer stretches to its arrival (#1073).** With a
   lagtime, ferx broke the integration timeline only at the arrival `t + ALAG`, never at the dose
   row's own time, so the dose row's covariate / IOV snapshot governed everything up to the

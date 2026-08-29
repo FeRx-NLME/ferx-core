@@ -43,7 +43,7 @@ use crate::types::{
 use super::adam::{averaging_start, AdamConfig, AdamState, PolyakAverager};
 use super::elbo::{
     closed_form_omega, closed_form_sigma, closed_form_sigma_support, population_neg_elbo,
-    stacked_prior, unsupported_data_term_reason, ElboConfig, Families, PackedLayout,
+    stacked_prior, unsupported_data_term_reason, ElboConfig, ElboTightness, Families, PackedLayout,
 };
 use super::family::{FullRank, MeanField, VariationalFamily};
 
@@ -319,6 +319,40 @@ pub(crate) fn kl_fallback_warning(
     })
 }
 
+/// Demote a fit whose final ELBO diagnostic says the optimizer stopped in a bad basin.
+///
+/// Kept separate from [`ElboTightness::is_implausible`] because that method diagnoses the
+/// bound, while this one owns the user-visible consequence: a flat objective in the wrong
+/// basin is not convergence.
+fn bad_basin_warning(converged: &mut bool, tightness: &ElboTightness) -> Option<String> {
+    if !tightness.is_implausible() {
+        return None;
+    }
+
+    *converged = false;
+    Some(format!(
+        "W_VI_BAD_BASIN: VI: the ELBO is not a usable bound at this estimate — the data term \
+         sits {:.0}x further above its value at the variational means than a posterior-shaped \
+         q would put it ({:.3e} against an expected {:.3e}). The optimizer has almost \
+         certainly settled in a bad basin. Reported converged: false. Re-run from better \
+         starting values (for a [covariate_nn] model, declare `init` so the network starts at \
+         plausible parameter values), or chain `method = [focei, vi]` to start VI from a \
+         fitted point.",
+        tightness.ratio(),
+        tightness.excess,
+        tightness.expected
+    ))
+}
+
+/// Whether a generic iteration-budget warning adds information after quality checks.
+fn needs_iteration_budget_warning(
+    converged: bool,
+    noise_floor_stop: bool,
+    bad_basin_stop: bool,
+) -> bool {
+    !converged && !noise_floor_stop && !bad_basin_stop
+}
+
 fn build_family(kind: ViFamily, d: usize) -> Box<dyn VariationalFamily> {
     match kind {
         ViFamily::FullRank => Box::new(FullRank::new(d)),
@@ -465,6 +499,7 @@ pub fn run_vi(
     };
     let adam_cfg = AdamConfig {
         lr: options.vi_lr,
+        grad_clip: options.vi_grad_clip,
         ..Default::default()
     };
 
@@ -876,10 +911,29 @@ pub fn run_vi(
             options.vi_mc_samples
         ));
     }
-    // Skipped when the drift check just demoted `converged`: that warning already says
-    // what happened, and more precisely — "raise vi_iters" is the wrong advice for a run
-    // that is noise-limited rather than budget-limited.
-    if !converged && !noise_floor_stop {
+    // Is the bound we are about to report actually tight? A stuck optimizer produces a
+    // flat trace and stable parameters — indistinguishable, to the convergence test, from
+    // a converged one. This is the check that tells them apart, and it is the difference
+    // between reporting a bad fit as successful and saying so.
+    let tightness = super::elbo::elbo_tightness(
+        model,
+        population,
+        &final_params,
+        final_eval.data_term,
+        &eta_means,
+        &kappa_means,
+    );
+    let bad_basin_stop = if let Some(warning) = bad_basin_warning(&mut converged, &tightness) {
+        warnings.push(warning);
+        true
+    } else {
+        false
+    };
+
+    // Skipped when either quality check just demoted `converged`: those warnings already
+    // say what happened, and more precisely — "increase vi_iters" is wrong advice for a
+    // noise-limited stop or a fit trapped in a bad basin.
+    if needs_iteration_budget_warning(converged, noise_floor_stop, bad_basin_stop) {
         warnings.push(format!(
             "VI: neither the objective nor the parameter estimates had settled after \
              {n_iters_run} iterations (see vi.elbo_trace). Increase vi_iters, or lower \
@@ -895,33 +949,6 @@ pub fn run_vi(
     }
     if let Some(w) = kl_fallback_warning(n_kl_fallback_subjects, n_subjects, families[0].label()) {
         warnings.push(w);
-    }
-
-    // Is the bound we are about to report actually tight? A stuck optimizer produces a
-    // flat trace and stable parameters — indistinguishable, to the convergence test, from
-    // a converged one. This is the check that tells them apart, and it is the difference
-    // between reporting a bad fit as successful and saying so.
-    let tightness = super::elbo::elbo_tightness(
-        model,
-        population,
-        &final_params,
-        final_eval.data_term,
-        &eta_means,
-        &kappa_means,
-    );
-    if tightness.is_implausible() {
-        warnings.push(format!(
-            "VI: the ELBO is not a usable bound at this estimate — the data term sits \
-             {:.0}x further above its value at the variational means than a posterior-shaped \
-             q would put it ({:.3e} against an expected {:.3e}). The optimizer has almost \
-             certainly settled in a bad basin: `converged` reflects a flat objective, not a \
-             good one. Re-run from better starting values (for a [covariate_nn] model, \
-             declare `init` so the network starts at plausible parameter values), or chain \
-             `method = [focei, vi]` to start VI from a fitted point.",
-            tightness.ratio(),
-            tightness.excess,
-            tightness.expected
-        ));
     }
 
     // The ELBO is a lower bound, so it is never reported as the OFV. See
