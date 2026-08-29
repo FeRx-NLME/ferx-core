@@ -329,6 +329,17 @@ fn compute_propagation_bounds(
             if end > t_from + 1e-15 && end < t_to - 1e-15 {
                 bounds.push(end);
             }
+            // The previous cycle's infusion of a seeded SS dose (#1121) runs on
+            // `[d.time, residual_end]`, which is a sub-interval boundary just
+            // like the dose's own window edges — `propagate_with_bounds` decides
+            // the rate from each sub-interval's midpoint, so an unsplit interval
+            // straddling `residual_end` would take the rate for all of it or
+            // none. `doses` are the `F`-reshaped `eff_doses`, so `f_bio = 1`.
+            if let Some(residual_end) = crate::dosing::ss_residual_infusion_end(d, lag, 1.0) {
+                if residual_end > t_from + 1e-15 && residual_end < t_to - 1e-15 {
+                    bounds.push(residual_end);
+                }
+            }
         }
     }
     bounds.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -523,9 +534,6 @@ fn ss_state_at_phase_event_driven(
     phase: f64,
 ) -> Vec<f64> {
     let mut state = equilibrate_ss_state_event_driven(pk_model, pk, dose);
-    if phase <= 0.0 {
-        return state;
-    }
     let (n_states, _) = state_layout(pk_model);
     let cmt_idx = dose.cmt_idx();
     if cmt_idx >= n_states {
@@ -533,6 +541,18 @@ fn ss_state_at_phase_event_driven(
     }
 
     let is_inf = dose.rate > 0.0 && dose.duration > 0.0 && dose.duration.is_finite();
+    if phase <= 0.0 {
+        // Phase 0 is the instant *after* the pulse — the clamp
+        // `crate::dosing::ss_seed_phase` hands back for `lag ≥ II`. A bolus is
+        // already in the compartment; an infusion has delivered nothing yet and
+        // is carried by the caller's residual window. Mirrors the ODE twin
+        // (`ode::predictions::ss_state_at_phase`).
+        if !is_inf {
+            state[cmt_idx] += pk.bioavailable_amount(dose.amt);
+        }
+        return state;
+    }
+
     let mut eigen = crate::sens::propagate::EigenCacheG::default();
     if is_inf {
         let t_inf = dose.duration;
@@ -822,7 +842,7 @@ fn event_driven_predictions_with_schedule_impl(
                 // then ADVANs to the lagged arrival under the record governing that
                 // interval. Phase `II − lag` is where the previous cycle's pulse has
                 // decayed to by the record time. The predicate is the ODE walk's own
-                // (`ode::predictions::ss_seeded_at_record`), shared so the two
+                // (`dosing::ss_seeded_at_record`), shared so the two
                 // production engines cannot seed on different sets of doses — they
                 // were measured 7.665 OFV apart on `nonmem_anchor/dose_form_lag_ss`
                 // before this, having both equilibrated at the arrival instead.
@@ -832,12 +852,12 @@ fn event_driven_predictions_with_schedule_impl(
                     .get(ev.orig_idx)
                     .copied()
                     .unwrap_or(0.0);
-                if crate::ode::predictions::ss_seeded_at_record(d, lag) {
+                if crate::dosing::ss_seeded_at_record(d, lag) {
                     state = ss_state_at_phase_event_driven(
                         pk_model,
                         &pk_at_dose[ev.orig_idx],
                         d,
-                        d.ii - lag,
+                        crate::dosing::ss_seed_phase(d, lag),
                     );
                 }
             }
@@ -861,7 +881,7 @@ fn event_driven_predictions_with_schedule_impl(
                     .get(ev.orig_idx)
                     .copied()
                     .unwrap_or(0.0);
-                if d.ss && d.ii > 0.0 && !crate::ode::predictions::ss_seeded_at_record(d, lag) {
+                if d.ss && d.ii > 0.0 && !crate::dosing::ss_seeded_at_record(d, lag) {
                     state = equilibrate_ss_state_event_driven(pk_model, &dose_pk, d);
                 }
                 if d.rate <= 0.0 {
@@ -1002,11 +1022,20 @@ fn propagate_with_bounds(
             let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
             let t_start = d.time + lag;
             let t_end = t_start + d.duration;
+            // A seeded SS dose whose *previous* cycle is still infusing at the
+            // dose record keeps delivering across the pre-arrival window (#1121),
+            // on `[d.time, residual_end]` — a window that belongs to no
+            // `DoseEvent`, so it is tested here rather than by the arrival window
+            // below. Its own reset floor is the *record*, not the arrival: an
+            // EVID=3/4 inside the pre-arrival window zeros the seeded state, and
+            // a rate that survived it would refill what the reset just emptied.
+            let residual = crate::dosing::ss_residual_infusion_end(d, lag, 1.0)
+                .is_some_and(|end| d.time >= reset_floor && d.time <= mid && end >= mid);
             // Infusions that started before the last reset are turned off.
-            if t_start < reset_floor {
+            if t_start < reset_floor && !residual {
                 continue;
             }
-            if d.rate > 0.0 && d.duration > 0.0 && t_start <= mid && t_end >= mid {
+            if residual || (d.rate > 0.0 && d.duration > 0.0 && t_start <= mid && t_end >= mid) {
                 let r = d.rate;
                 match pk_model.topology().dose_channel(d.cmt_raw()) {
                     Some(Channel::Central) => rate_central += r,

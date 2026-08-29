@@ -9451,13 +9451,43 @@ fn ode_iov_ss_lagtime_provider_matches_fd_of_predict_iov() {
     let theta = [0.2, 10.0, 0.5];
     let stacked = [0.12, -0.08, 0.05, -0.10];
     // Non-degeneracy: the two extra samples must genuinely precede their arrivals, or
-    // this reverts to the post-arrival-only test it replaces.
-    let lag = theta[2];
-    assert!(
-        subject.obs_times[0] < subject.doses[0].time + lag
-            && subject.obs_times[4] < subject.doses[1].time + lag,
-        "the pre-arrival samples must fall strictly inside [t_dose, t_dose + ALAG)"
-    );
+    // this reverts to the post-arrival-only test it replaces — silently, since every
+    // assertion below still passes on post-arrival samples.
+    //
+    // Resolve each dose's lagtime the way `predict_iov` does — from the model's own
+    // parameter function at that dose's occasion — rather than reading `theta[2]`.
+    // `LAGTIME = TVLAG` today, so the two agree; the point is that they keep agreeing
+    // if it ever gains an η or a κ, which is exactly when a hard-coded θ index would
+    // start comparing against a number the walk does not use.
+    let occ_groups = crate::stats::likelihood::iov_occasion_groups(&subject);
+    let lag_of_dose = |d: usize| -> f64 {
+        let occ = subject.dose_occasions[d];
+        let k = occ_groups
+            .iter()
+            .position(|(id, _)| *id == occ)
+            .expect("every dose occasion is an IOV group");
+        let mut combined = stacked[..model.n_eta].to_vec();
+        combined.extend_from_slice(&stacked[model.n_eta + k * model.n_kappa..][..model.n_kappa]);
+        (model.pk_param_fn)(
+            &theta,
+            &combined,
+            &subject.covariates,
+            subject.doses[d].time,
+        )
+        .lagtime()
+    };
+    for (d, obs_idx) in [(0usize, 0usize), (1, 4)] {
+        let arrival = subject.doses[d].time + lag_of_dose(d);
+        assert!(
+            subject.obs_times[obs_idx] >= subject.doses[d].time
+                && subject.obs_times[obs_idx] < arrival,
+            "sample {} (t = {}) must fall strictly inside dose {d}'s pre-arrival window \
+             [{}, {arrival})",
+            obs_idx,
+            subject.obs_times[obs_idx],
+            subject.doses[d].time
+        );
+    }
     assert!(
         crate::sens::ode_provider::ode_subject_sensitivities_iov(
             &model, &subject, &theta, &stacked,

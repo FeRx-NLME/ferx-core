@@ -6391,7 +6391,7 @@ fn ode_tvcov_gate_scope() {
     let mut inf = tv.clone();
     inf.doses[0].duration = 1.0;
     inf.doses[0].rate = inf.doses[0].amt;
-    assert!(crate::ode::predictions::is_real_infusion(&inf.doses[0]));
+    assert!(crate::dosing::is_real_infusion(&inf.doses[0]));
     assert!(ode_tvcov_supported(&model, &inf));
     // TV-cov + EVID 3/4 reset → now supported (state zeroed at the reset).
     let mut rst = tv.clone();
@@ -8297,6 +8297,38 @@ fn ode_provider_matches_fd_under_the_auto_stiff_switch() {
 /// the dose *lands in*, so without it the pre-arrival window's depot leg would be
 /// covariate-inert and the fixture would probe only the central compartment —
 /// exactly the degeneracy the repo's anchor rules warn about.
+// 1-cpt IV **infusion** at steady state with an estimated lagtime and a
+// time-varying covariate on CL. Sized so `II − ALAG < T_inf`: the previous
+// cycle's infusion is still running at the dose record (#1121).
+const ONECPT_IV_LAG_SS_INF_TVCOV_ODE: &str = r#"
+[parameters]
+  theta TVCL(1.0,  0.01, 100.0)
+  theta TVV(10.0,  1.0, 500.0)
+  theta TVLAG(8.0, 0.01, 20.0)
+  theta WTEXP(0.75, 0.01, 2.0)
+  omega ETA_CL  ~ 0.1
+  omega ETA_LAG ~ 0.04
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL    = TVCL * (WT/70)^WTEXP * exp(ETA_CL)
+  V     = TVV
+  ALAG1 = TVLAG * exp(ETA_LAG)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[covariates]
+  WT continuous
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
 const ONECPT_ORAL_LAG_SS_TVCOV_ODE: &str = r#"
 [parameters]
   theta TVCL(1.0,  0.01, 100.0)
@@ -8362,7 +8394,7 @@ fn ode_provider_ss_lagtime_tvcov_matches_production() {
     let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
     // θ = [TVCL, TVV, TVKA, TVLAG, WTEXP]; η = [ETA_CL, ETA_LAG] → ALAG ≈ 0.526.
     let theta = [1.0, 10.0, 1.0, 0.5, 0.75];
-    let eta = [0.12, 0.05];
+    let eta = [0.12_f64, 0.05];
 
     // Obs at 0.3 sits INSIDE the pre-arrival window; 0.8 just past the arrival;
     // the rest span the remainder of the cycle and into the next.
@@ -8391,6 +8423,128 @@ fn ode_provider_ss_lagtime_tvcov_matches_production() {
         "SS + lagtime + TV covariates must take the analytic event-driven walk, \
          not the FD fallback — otherwise this compares FD against itself"
     );
+
+    check_vs_production(&model, &subject, &theta, &eta);
+    check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    check_hessian_vs_fd_of_grad(&model, &subject, &theta, &eta);
+}
+
+/// An **SS infusion** whose lagtime pushes the seed phase inside its own window,
+/// under time-varying covariates (#1121 review).
+///
+/// `ode_provider_ss_lagtime_infusion_matches_production` covers the infusion seed
+/// with *flat* covariates, and there the two `ss_seeded_at_record`-scoped terms
+/// this walk carries — the bolus saltation's `g⁻` and the infusion's hand-injected
+/// `−δlag` jet — cancel exactly. A flat test therefore pins the cancellation
+/// rather than either term, so the scoping change needed a cell where they do not
+/// cancel.
+///
+/// It is also the only twin test where `II − ALAG < T_inf`, so the previous
+/// cycle's infusion is still running at the dose record and the walk has to carry
+/// a rate-off boundary (`K_SS_INF_END`) that belongs to no dose event — one that
+/// moves with `lag` and with the window length exactly as the real infusion end
+/// does, and therefore needs its own saltation, not just its own break.
+///
+/// `check_vs_production` asserts `obs.f` as well as the derivatives, so this is
+/// simultaneously the value-coupling guard for the residual window and the
+/// `Dual2`-vs-FD parity check for its moving edge.
+#[test]
+fn ode_provider_ss_lagtime_infusion_tvcov_matches_production() {
+    let model =
+        parse_model_string(ONECPT_IV_LAG_SS_INF_TVCOV_ODE).expect("parse IV lag SS inf TV ODE");
+    let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+    // θ = [TVCL, TVV, TVLAG, WTEXP]; η = [ETA_CL, ETA_LAG] → ALAG ≈ 8.4.
+    let theta = [1.0, 10.0, 8.0, 0.75];
+    let eta = [0.12_f64, 0.05];
+
+    // AMT 100 at RATE 25 => T_inf = 4 against II = 12, so the seed phase
+    // `II − ALAG ≈ 3.6` falls INSIDE the window and the previous cycle's infusion
+    // runs on into the pre-arrival window.
+    let mut subject = bolus_subject(&[0.2, 1.0, 4.0, 8.0, 9.5, 13.0]);
+    subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 25.0, true, 12.0)];
+    subject.dose_covariates = vec![wt(70.0)];
+    subject.obs_covariates = vec![
+        wt(70.0),
+        wt(140.0),
+        wt(140.0),
+        wt(150.0),
+        wt(150.0),
+        wt(75.0),
+    ];
+
+    // Preconditions, asserted rather than assumed. The third is the one this
+    // fixture exists for: without it the previous cycle has already finished at
+    // the record and the residual window is empty, leaving the new code unrun.
+    assert!(subject.doses[0].ss && subject.doses[0].ii > 0.0);
+    assert!(subject.doses[0].is_infusion() && model.has_lagtime());
+    let lag = theta[2] * eta[1].exp();
+    let t_inf = subject.doses[0].duration;
+    let phase = crate::dosing::ss_seed_phase(&subject.doses[0], lag);
+    assert!(
+        phase < t_inf,
+        "the seed phase ({phase}) must fall inside the infusion window ({t_inf}), or \
+         the previous cycle has finished at the record and this tests nothing new"
+    );
+    assert!(
+        subject.obs_times[0] < lag,
+        "the first sample must sit inside the pre-arrival window"
+    );
+    assert!(subject.has_tv_covariates());
+    assert!(
+        ode_tvcov_supported(&model, &subject),
+        "SS + lagtime + infusion + TV covariates must take the analytic walk"
+    );
+
+    check_vs_production(&model, &subject, &theta, &eta);
+    check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    check_hessian_vs_fd_of_grad(&model, &subject, &theta, &eta);
+}
+
+/// An **EVID=3 reset between a seeded SS dose's record and its lagged arrival**
+/// (#1121 review).
+///
+/// With the arrival-side re-equilibration gone, a reset inside the pre-arrival
+/// window is newly observable: it zeroes the seeded steady-state load, and the
+/// arrival then applies only `F·AMT` where it used to restore a full trough. That
+/// reading is the one consistent with the convention — the steady state is loaded
+/// at the record, so a later reset wipes it exactly as it wipes any other state —
+/// but it is a behaviour change, and nothing covered it.
+///
+/// Deliberately an oral **bolus**, not the infusion fixture above. The infusion
+/// form of this geometry trips a *separate*, pre-existing defect in the twin: an
+/// `EVID=3` reset placed before a lagged infusion's arrival changes `∂f/∂η_LAG`
+/// even when the reset is a physical no-op (the state is already zero). Measured
+/// at `−12.53` against an FD reference of `+7.14`, with flat covariates and a
+/// non-steady-state dose, so it is neither this issue's nor time-varying
+/// covariates'; tracked separately. Using a bolus here keeps this test measuring
+/// the thing it was written for instead of inheriting that failure.
+#[test]
+fn ode_provider_ss_lagtime_reset_inside_the_pre_arrival_window_matches_production() {
+    let model = parse_model_string(ONECPT_ORAL_LAG_SS_TVCOV_ODE).expect("parse oral lag SS TV ODE");
+    let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+    // θ = [TVCL, TVV, TVKA, TVLAG, WTEXP]; η = [ETA_CL, ETA_LAG] → ALAG ≈ 0.526.
+    let theta = [1.0, 10.0, 1.0, 0.5, 0.75];
+    let eta = [0.12_f64, 0.05];
+
+    let mut subject = bolus_subject(&[0.2, 1.0, 4.0, 11.0]);
+    subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)];
+    subject.reset_times = vec![0.35];
+    subject.dose_covariates = vec![wt(70.0)];
+    subject.obs_covariates = vec![wt(70.0), wt(140.0), wt(150.0), wt(75.0)];
+
+    let lag = theta[3] * eta[1].exp();
+    assert!(
+        subject.reset_times[0] > subject.doses[0].time && subject.reset_times[0] < lag,
+        "the reset ({}) must fall strictly between the dose record (0) and its arrival ({lag})",
+        subject.reset_times[0]
+    );
+    assert!(
+        subject.obs_times[0] < subject.reset_times[0],
+        "one sample must precede the reset, so the seeded state is read before it is wiped"
+    );
+    assert!(subject.doses[0].ss && subject.doses[0].ii > 0.0);
+    assert!(subject.has_tv_covariates());
+    assert!(ode_tvcov_supported(&model, &subject));
 
     check_vs_production(&model, &subject, &theta, &eta);
     check_inner_outer_eta_parity(&model, &subject, &theta, &eta);

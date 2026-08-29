@@ -7634,28 +7634,29 @@ fn ss_state_at_phase_matches_nonmem_at_the_dose_record() {
     );
 }
 
-/// **Which steady-state doses get the record-time seed (#1121).**
+/// **Which steady-state doses get the record-time seed, and at what phase (#1121).**
 ///
-/// The predicate is shared by four walks — the two production engines and their
-/// two dual twins — so its boundaries are worth pinning directly rather than
-/// inferring them from whichever walk a later test happens to exercise. A seed and
-/// an arrival-time equilibration must be exactly complementary: both firing loads
-/// the trough twice, neither firing leaves the compartments empty.
+/// The predicate and the phase are shared by five paths — the two production
+/// walks, their two dual twins, and the dense/superposition static paths — so
+/// their boundaries are worth pinning directly rather than inferring them from
+/// whichever path a later test happens to exercise. A seed and an arrival-time
+/// equilibration must be exactly complementary: both firing loads the trough
+/// twice, neither firing leaves the compartments empty.
 ///
-/// The two exclusions are deliberate, not oversights:
+/// `lag == 0` is the one exclusion, and it is deliberate: record and arrival are
+/// the same instant, so there is nothing to propagate, and routing it through
+/// `ss_state_at_phase(…, II)` would integrate a full extra cycle and move every
+/// existing non-lagged SS result by solver error.
 ///
-///   * `lag == 0` — record and arrival are the same instant, so there is nothing
-///     to propagate, and routing it through `ss_state_at_phase(…, II)` would
-///     integrate a full extra cycle and move every existing non-lagged SS result
-///     by solver error.
-///   * `lag >= II` — phase `II − lag` is not a phase. Seeding there would hand the
-///     walk the bare trough and then flow it forward across one or more whole
-///     dosing cycles whose pulses were never applied, which is silently *low*
-///     rather than obviously broken. ferx does not attempt it; nothing upstream
-///     rejects such a model either, so its predictions are unvalidated rather than
-///     supported — see `docs/model-file/lagtime.qmd`.
+/// `lag >= II` **is** seeded, at a phase CLAMPED to zero rather than wrapped into
+/// `[0, II)`. That is NONMEM 7.6.0's convention, measured rather than assumed
+/// (`nonmem_anchor/results/ss_lag_ge_ii.tab`), and it is the only continuous
+/// choice: `ALAG` is routinely estimated, so a phase that jumped by a factor
+/// `e^{−k·II}` as the outer optimizer walked the lagtime across `II` would put a
+/// step in the objective. `ss_lag_ge_ii_pre_arrival_matches_nonmem` pins the
+/// resulting *prediction*; this pins the arithmetic it comes from.
 #[test]
-fn ss_record_seed_declines_a_zero_lag_and_a_full_interval_lag() {
+fn ss_record_seed_declines_a_zero_lag_only() {
     let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
 
     assert!(
@@ -7663,21 +7664,32 @@ fn ss_record_seed_declines_a_zero_lag_and_a_full_interval_lag() {
         "an ordinary lagged SS dose"
     );
     assert!(
-        ss_seeded_at_record(&dose, 11.999),
-        "just inside a full interval still has a positive phase"
-    );
-    assert!(
         !ss_seeded_at_record(&dose, 0.0),
         "no lag: record and arrival coincide, so the arrival equilibrates as before"
     );
-    assert!(
-        !ss_seeded_at_record(&dose, 12.0),
-        "a lag of exactly II leaves phase 0 — not a pre-arrival tail"
+    for lag in [12.0, 20.0] {
+        assert!(
+            ss_seeded_at_record(&dose, lag),
+            "a lag of a full interval or more is still seeded — at a clamped phase"
+        );
+    }
+
+    // The phase itself: `II − lag` while that is positive, then pinned at 0.
+    assert_relative_eq!(ss_seed_phase(&dose, 0.7), 11.3, max_relative = 1e-12);
+    assert_relative_eq!(ss_seed_phase(&dose, 11.999), 0.001, max_relative = 1e-9);
+    assert_eq!(ss_seed_phase(&dose, 12.0), 0.0);
+    assert_eq!(
+        ss_seed_phase(&dose, 20.0),
+        0.0,
+        "clamped, NOT wrapped to 4.0"
     );
-    assert!(
-        !ss_seeded_at_record(&dose, 20.0),
-        "a lag beyond II would skip whole cycles of the pulse train"
-    );
+
+    // Complementarity of the *arrival-side* shortcut: the paths that re-equilibrate
+    // at the arrival rather than propagating there are exact only while the flowed
+    // state is the trough, which is exactly `lag <= II`.
+    assert!(ss_arrival_is_trough(&dose, 0.7));
+    assert!(ss_arrival_is_trough(&dose, 12.0));
+    assert!(!ss_arrival_is_trough(&dose, 12.001));
 
     // A non-SS dose is never seeded however it is lagged, and an SS record with no
     // dosing interval is not a steady state at all.
@@ -7685,4 +7697,64 @@ fn ss_record_seed_declines_a_zero_lag_and_a_full_interval_lag() {
     assert!(!ss_seeded_at_record(&plain, 0.7));
     let ss_no_ii = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 0.0);
     assert!(!ss_seeded_at_record(&ss_no_ii, 0.7));
+}
+
+/// **The previous cycle's infusion when it is still running at the dose record
+/// (#1121).**
+///
+/// `ss_state_at_phase` hands back a state with the infusion mid-flight whenever
+/// the seed phase falls inside the window; the walk must then carry `+rate` for
+/// the rest of it. The window is what every engine breaks and gates on, so pin
+/// its edge here rather than only through a prediction.
+///
+/// Measured against NONMEM 7.6.0 (`nonmem_anchor/results/ss_lag_infusion.tab`):
+/// with `II = 12`, `T_inf = 6`, `ALAG1 = 8`, the concentration *rises* off the
+/// record and turns over at exactly `t = 2 = 8 − 12 + 6`.
+#[test]
+fn ss_residual_infusion_window_ends_where_the_previous_cycle_does() {
+    // AMT 600 at RATE 100 => `DoseEvent::new` derives T_inf = 6, against II = 12.
+    let inf = DoseEvent::new(0.0, 600.0, 1, 100.0, true, 12.0);
+    assert_relative_eq!(inf.duration, 6.0, max_relative = 1e-12);
+
+    // lag <= II − T_inf: the previous cycle finished before the record.
+    assert_eq!(ss_residual_infusion_end(&inf, 0.2, 1.0), None);
+    assert_eq!(
+        ss_residual_infusion_end(&inf, 6.0, 1.0),
+        None,
+        "phase == T_inf"
+    );
+
+    // lag > II − T_inf: it is still running, and stops at `d.time + (T_inf − phase)`.
+    let end = ss_residual_infusion_end(&inf, 8.0, 1.0).expect("still running at the record");
+    assert_relative_eq!(end, 2.0, max_relative = 1e-12);
+    // Continuous at the boundary rather than switching on with a finite window.
+    let just_past = ss_residual_infusion_end(&inf, 6.0 + 1e-9, 1.0).expect("just inside");
+    assert!(just_past > 0.0 && just_past < 1e-8);
+    // Under the phase clamp, `lag >= II` puts the whole window on the record.
+    assert_relative_eq!(
+        ss_residual_infusion_end(&inf, 14.0, 1.0).expect("clamped phase 0"),
+        6.0,
+        max_relative = 1e-12
+    );
+
+    // A bolus has no window however it is lagged, and neither does an unseeded dose.
+    let bolus = DoseEvent::new(0.0, 600.0, 1, 0.0, true, 12.0);
+    assert_eq!(ss_residual_infusion_end(&bolus, 8.0, 1.0), None);
+    assert_eq!(
+        ss_residual_infusion_end(&inf, 0.0, 1.0),
+        None,
+        "lag 0 is not seeded"
+    );
+
+    // `F` reshapes a rate-defined window (#419), so the residual edge moves with it —
+    // and the caller must pass the same `f_bio` it built the dose's own window from.
+    // At F = 0.5 the window is only 3 h, so a phase of 4 is already past its end and
+    // there is no residual at all: the same lag that HAS one at F = 1 does not here.
+    assert_eq!(ss_residual_infusion_end(&inf, 8.0, 0.5), None);
+    // At F = 0.9 the window is 5.4 h, so a phase of 4 is still inside it.
+    assert_relative_eq!(
+        ss_residual_infusion_end(&inf, 8.0, 0.9).expect("F·T_inf = 5.4 > phase 4"),
+        1.4,
+        max_relative = 1e-12
+    );
 }

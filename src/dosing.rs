@@ -19,7 +19,7 @@
 //!   declines, shared by the analytical, ODE, and sensitivity SS loops so their
 //!   troughs can't drift apart.
 
-use crate::types::Subject;
+use crate::types::{DoseEvent, Subject};
 use std::borrow::Cow;
 
 /// Resolve any modeled-`RATE` doses (#324, e.g. `RATE=-2` → modeled duration
@@ -645,4 +645,138 @@ mod ss_warn_tests {
         assert_eq!(ss_abs_increment(&[1.0, 2.0], &[1.0, 0.0]), 2.0);
         assert_eq!(ss_abs_increment(&[5.0], &[5.0]), 0.0);
     }
+}
+
+/// `is_infusion()` only checks `rate > 0`, but a degenerate row with
+/// `rate > 0 && amt <= 0` (or NaN) yields `duration = amt/rate <= 0`
+/// (or NaN). Treating those as infusions would push an infusion-end
+/// break that sorts before the dose itself, and NaN would panic the
+/// break-time sort. Such rows fall back to the bolus branch instead
+/// (a zero/negative bolus update — visible, not silently dropped).
+pub(crate) fn is_real_infusion(d: &DoseEvent) -> bool {
+    // Tripwire (#324): every ODE entrypoint resolves modeled-RATE doses to
+    // `Fixed` (via `resolve_subject_doses*`) before any infusion logic runs, so
+    // a non-`Fixed` dose here means a path forgot to resolve — panic in debug /
+    // tests rather than silently mis-handling it (an unresolved modeled dose has
+    // `duration == 0`, so it would quietly degrade to a bolus).
+    debug_assert!(d.is_fixed(), "is_real_infusion: unresolved modeled dose");
+    d.is_infusion() && d.duration > 0.0 && d.duration.is_finite()
+}
+
+// ---------------------------------------------------------------------------
+// Where a lagged steady-state dose loads, and what the previous cycle leaves
+// running across the dose record (#1121).
+// ---------------------------------------------------------------------------
+
+/// Whether this steady-state dose's periodic state is loaded at its dose
+/// **record** and flowed forward to the lagged arrival (#1121), rather than
+/// equilibrated at the arrival itself.
+///
+/// NONMEM runs `$PK` at the dose row, loads the steady-state compartments there,
+/// and then ADVANs to the lagged arrival under the record that *terminates* that
+/// interval. Equilibrating at the arrival instead computes the trough throughout
+/// under the dose row's snapshot. The two agree exactly under flat covariates —
+/// a full-cycle propagation from phase `II − lag` returns to the trough — which
+/// is why the difference stayed invisible until a covariate changed inside the
+/// pre-arrival window.
+///
+/// `lag == 0` is excluded deliberately: record and arrival are the same instant,
+/// so there is nothing to propagate, and routing it through
+/// `ss_state_at_phase(…, II)` would integrate a full extra cycle and move every
+/// existing non-lagged SS result by solver error, for no gain.
+///
+/// Every call site reads this predicate rather than re-deriving the condition, so
+/// the seed and the arrival-side equilibration cannot drift into overlapping
+/// (double-load) or disjoint (no-load) coverage — and the analytic twin
+/// (`sens::ode_provider::integrate_tvcov_g`) shares it too, so its `K_SS_SEED`
+/// timeline break fires on exactly the doses production seeds. A twin that seeded
+/// on a wider or narrower set would disagree with production in *value*, which is
+/// the one thing the `check_vs_production` parity tests cannot forgive.
+pub(crate) fn ss_seeded_at_record(dose: &DoseEvent, lag: f64) -> bool {
+    dose.ss && dose.ii > 0.0 && lag > 0.0
+}
+
+/// Cycle phase the dose **record** sits at, for a steady-state dose seeded there.
+///
+/// The pulse preceding the record landed at `dose.time − ss_seed_phase(…)`, so a
+/// lagtime shorter than one interval puts it at `dose.time + lag − II` and the
+/// record reads the previous cycle's tail at phase `II − lag`.
+///
+/// # `lag ≥ II` clamps rather than wraps — measured, not assumed
+///
+/// A lagtime of a full interval or more has no phase `II − lag`. NONMEM 7.6.0
+/// **clamps** it to zero: the pulse lands on the record itself, so the record
+/// carries the steady-state *peak* (`nonmem_anchor/results/ss_lag_ge_ii.tab`,
+/// where an `ALAG1 = 15`, `II = 12` bolus reads `PRED(0) = 13.197 =
+/// (D/V)/(1 − e^{−k·II})`, the post-pulse peak, and decays from there with no
+/// intervening pulse before the real arrival at `t = 15`). It does **not** wrap
+/// the phase into `[0, II)`: wrapping would put `PRED(0)` at `2.1815` instead.
+///
+/// Clamping is also the only continuous choice, which matters because `ALAG` is
+/// routinely *estimated*: as `lag → II⁻` the phase tends to `0⁺` (the pulse has
+/// just landed) and at `lag = II` it is `0` (the pulse lands here), so nothing
+/// jumps as the outer optimizer walks a lagtime across the interval. Wrapping
+/// would step the whole pre-arrival window by a factor of `e^{−k·II}` at that
+/// crossing.
+pub(crate) fn ss_seed_phase(dose: &DoseEvent, lag: f64) -> f64 {
+    (dose.ii - lag).max(0.0)
+}
+
+/// End time of the previous cycle's infusion when it is **still running at the
+/// dose record** of a seeded steady-state dose — `None` when it has already
+/// finished (the ordinary case) or the dose is not an infusion.
+///
+/// The pulse before the record is at `dose.time − p` for `p = ss_seed_phase(…)`,
+/// so its infusion occupies `[dose.time − p, dose.time − p + T_inf]` and crosses
+/// the record whenever `p < T_inf`, i.e. `lag > II − T_inf`. The pre-arrival
+/// window must then carry `+rate` on `[dose.time, dose.time + (T_inf − p)]`:
+/// `ss_state_at_phase` hands back a state with the infusion mid-flight, and a
+/// walk that forgot the rate would silently resume the decay early.
+///
+/// Confirmed against NONMEM 7.6.0 (`nonmem_anchor/results/ss_lag_infusion.tab`):
+/// with `II = 12`, `T_inf = 6`, `ALAG1 = 8` the concentration *rises* from
+/// `6.5468` at the record to `6.8754` at `t = 0.5` and turns over at exactly
+/// `t = 2 = 8 − 12 + 6`.
+///
+/// Like every other infusion edge the window is `F`-reshaped (#419), so callers
+/// pass the same `f_bio` they used to build the dose's own window and the two
+/// edges cannot drift apart.
+///
+/// # `lag ≥ II` with an infusion is ferx's answer, not NONMEM's
+///
+/// Under the [`ss_seed_phase`] clamp this returns `dose.time + T_inf` — the
+/// previous cycle's infusion starting on the record, which is what the clamped
+/// phase means and is mass-balanced. NONMEM instead delivers `T_inf + (lag − II)`
+/// hours of drug for that geometry (measured: an `AMT = 600`, `RATE = 100`,
+/// `II = 12`, `ALAG1 = 14` dose infuses over `[0, 8]`, i.e. 800 mg), which is not
+/// a physical reading of a 600 mg dose. ferx does not reproduce it; see
+/// `docs/model-file/lagtime.qmd`.
+pub(crate) fn ss_residual_infusion_end(dose: &DoseEvent, lag: f64, f_bio: f64) -> Option<f64> {
+    if !ss_seeded_at_record(dose, lag) || !is_real_infusion(dose) {
+        return None;
+    }
+    let (_, t_inf) = dose.bioavailable_infusion(f_bio);
+    let phase = ss_seed_phase(dose, lag);
+    (phase < t_inf).then(|| dose.time + (t_inf - phase))
+}
+
+/// Whether flowing a seeded steady-state dose from its record to its lagged
+/// arrival lands back on the periodic **trough** — so a path that re-equilibrates
+/// at the arrival instead of propagating there gets the same number.
+///
+/// The seed sits at phase [`ss_seed_phase`] and the arrival is `lag` later, so
+/// the flowed phase is `(II − lag) + lag = II ≡ 0⁻`, the trough, for every
+/// `lag ≤ II`. Past that the clamp pins the seed at phase 0 and the arrival lands
+/// at phase `lag > II` — strictly further down the same decay than the trough —
+/// so re-equilibrating there silently *raises* the state back to a full cycle's
+/// accumulation. Measured at **+4.3 %** on an `ALAG1 = 15`, `II = 12` bolus at
+/// `t = 26` (`nonmem_anchor/results/ss_lag_ge_ii`), on the two paths that take
+/// the shortcut: the dense ODE predictor and the analytical superposition. Both
+/// event-driven walks propagate and were already right.
+///
+/// The paths that re-equilibrate keep doing so while this holds, deliberately:
+/// integrating a full extra cycle instead would move every existing SS+lagtime
+/// result by solver error for no gain.
+pub(crate) fn ss_arrival_is_trough(dose: &DoseEvent, lag: f64) -> bool {
+    lag <= dose.ii
 }

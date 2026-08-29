@@ -482,6 +482,14 @@ fn ferx_population_predictions_match_nonmem_inside_a_steady_state_pre_arrival_wi
 ///
 /// The rate-off-crossing branch of `ss_state_at_phase` under a varying covariate,
 /// checked point by point rather than only through an objective.
+///
+/// Note what it does **not** reach. `AMT 100 / RATE 100` makes `T_inf = 1` against
+/// `II = 12` and `ALAG1 ≈ 0.7`, so the seed phase is `11.3` and only the
+/// `phase > T_inf` arm is ever taken — the previous cycle has long finished by the
+/// dose record. The other arm, where the previous cycle is *still infusing* and its
+/// residual rate has to be carried past the record, is covered by
+/// `tests/ss_lagtime_edge_nonmem_anchor.rs`, whose geometry puts `T_inf` at half
+/// the interval.
 #[test]
 fn ferx_population_predictions_match_nonmem_for_a_lagged_steady_state_infusion() {
     assert_pred_matches_nonmem(
@@ -529,6 +537,42 @@ fn ferx_population_predictions_match_nonmem_for_an_unlagged_ss_dose_under_tv_cov
         "dose_form_lag_oral_nolag_fit.ferx",
         "dose_form_lag_ss.csv",
         "results/dose_form_lag_ss_nolag.tab",
+        1e-4,
+    );
+}
+
+/// **The closed-form walk against NONMEM directly, ungated.**
+///
+/// Every pointwise check above runs the `[odes]` model, so the whole of
+/// `pk/event_driven.rs`'s steady-state handling — a *different* engine that had a
+/// *different* defect (a post-hoc pass over `preds` that never touched the running
+/// state) and needed a *different* fix — was reachable on a PR only through the
+/// pre-existing flat-covariate unit tests. The
+/// `..._engines_agree_on_a_lagged_steady_state_dose_...` test below does cover it,
+/// but it is `slow-tests`-gated and therefore never runs on a PR.
+///
+/// This is the same EBE-free oracle the rest of the file uses, pointed at the
+/// closed-form twin: `dose_form_lag_oral_cf_fit.ferx` is the same system as
+/// `dose_form_lag_oral_fit.ferx`, so NONMEM's `PRED` column anchors it directly
+/// rather than transitively.
+#[test]
+fn ferx_population_predictions_match_nonmem_for_a_lagged_ss_dose_on_the_closed_form_walk() {
+    assert_pred_matches_nonmem(
+        "dose_form_lag_oral_cf_fit.ferx",
+        "dose_form_lag_ss.csv",
+        "results/dose_form_lag_ss.tab",
+        1e-4,
+    );
+}
+
+/// The closed-form walk read *inside* the pre-arrival window (E3P), where the
+/// deleted overlay used to write its answers.
+#[test]
+fn ferx_population_predictions_match_nonmem_inside_a_pre_arrival_window_on_the_closed_form_walk() {
+    assert_pred_matches_nonmem(
+        "dose_form_lag_oral_cf_fit.ferx",
+        "dose_form_lag_ss_prearrival.csv",
+        "results/dose_form_lag_ss_prearrival.tab",
         1e-4,
     );
 }

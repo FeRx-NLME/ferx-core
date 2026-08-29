@@ -4094,9 +4094,6 @@ fn ss_state_at_phase_g<T: crate::sens::num::PkNum>(
 ) -> Vec<T> {
     let mut u = trough;
     let phase_val = phase.val();
-    if phase_val <= 0.0 {
-        return u;
-    }
     // CMT is 1-based, and `CMT=0` is NONMEM's *default dose compartment* — state index 0 —
     // not a malformed value. `saturating_sub(1)` is therefore the correct mapping, matching
     // `equilibrate_ss_state_g` and the f64 path (#899). This previously no-op'd on the
@@ -4105,6 +4102,16 @@ fn ss_state_at_phase_g<T: crate::sens::num::PkNum>(
     // engine into line, so the no-op was the silent drop rather than the guard against one.
     let cmt_idx = dose.cmt_idx();
     if cmt_idx >= n_states {
+        return u;
+    }
+    if phase_val <= 0.0 {
+        // Phase 0 is the instant *after* the pulse — what `crate::dosing::ss_seed_phase`
+        // clamps to for `lag ≥ II`. A bolus is already in the compartment; an infusion has
+        // delivered nothing yet and is carried by the caller's residual window. The clamp
+        // is jet-free (see the `K_SS_SEED` handler), so there is no `extend_flow` term.
+        if inf.is_none() {
+            u[cmt_idx] = u[cmt_idx] + f_bio * T::from_f64(dose.amt);
+        }
         return u;
     }
     let vars_cell: RefCell<Vec<T>> = RefCell::new(Vec::new());
@@ -4295,7 +4302,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     // but is unresolved here so `is_real_infusion`'s `is_fixed` tripwire would fire — gate on
     // `!is_fixed()` first. A fixed dose defers to the production `is_real_infusion`.
     let is_inf = |d: &crate::types::DoseEvent| -> bool {
-        !d.is_fixed() || crate::ode::predictions::is_real_infusion(d)
+        !d.is_fixed() || crate::dosing::is_real_infusion(d)
     };
     // Mode-aware bioavailability for infusions (#419). A duration-defined infusion
     // (`RATE=-2` / `D{cmt}`) scales its *rate* by `F` over a fixed window; a rate-defined
@@ -4367,6 +4374,29 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             .collect()
     };
     let inf_window_len = |k: usize| -> f64 { inf_eff[k].1.val() };
+    // #1121: the previous cycle's infusion of a seeded SS dose runs `[d.time, d.time +
+    // (T_inf − phase)]` — a window belonging to no `DoseEvent`, so the ordinary
+    // `infusion_spans_segment` test (which starts at the *arrival*) cannot see it. Its reset
+    // floor is the dose RECORD, since that is where the seeded state is loaded.
+    let ss_residual_spans_segment = |k: usize,
+                                     d: &crate::types::DoseEvent,
+                                     seg_start: f64,
+                                     seg_end: f64,
+                                     reset_floor: f64|
+     -> bool {
+        if !crate::dosing::ss_seeded_at_record(d, lag_val(k)) {
+            return false;
+        }
+        let phase = crate::dosing::ss_seed_phase(d, lag_val(k));
+        phase < inf_window_len(k)
+            && infusion_spans_segment(
+                d.time,
+                inf_window_len(k) - phase,
+                seg_start,
+                seg_end,
+                reset_floor,
+            )
+    };
 
     // Built-in absorption input-rate forcing (#486): `dose_lagtimes_dual[k]` feeds
     // `add_prepared_input_rate_forcing`'s `tad` computation with the dual lag (see
@@ -4472,6 +4502,15 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     // observation exactly at the window end reads the constant rate still on, matching the
     // static walk and production's `active_zero_order_inputs` full-containment convention.
     const K_ZO_END: u8 = 8;
+    // End of the *previous* cycle's infusion for a seeded SS dose (#1121). Shares
+    // `K_INF_END`'s handler — it is a rate-off at a boundary that moves with `lag` and the
+    // window length in exactly the same way — but needs its own **value**, because the two
+    // differ in where their window STARTS (the dose record, not the arrival) and that is
+    // what the reset guard compares. Giving it the same discriminant as `K_INF_END`, which
+    // is how this first landed, silently made every real infusion end take the record-time
+    // guard as well. Sorts last among the rate-offs; they are independent jets on the
+    // state, so their order among themselves does not matter.
+    const K_SS_INF_END: u8 = 9;
     // Capacity includes one `K_INF_END` slot per infusion (each dose adds its window-end
     // event below) and one `K_SS_SEED` slot per lagged SS dose, matching production's
     // timeline reservation. `n_infusion_ends` was computed once above (and reused for
@@ -4480,7 +4519,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
         .doses
         .iter()
         .enumerate()
-        .filter(|(k, d)| is_ss_dose(d) && lag_val(*k) > 0.0)
+        .filter(|(k, d)| crate::dosing::ss_seeded_at_record(d, lag_val(*k)))
         .count();
     // #859: per-route absorption onset events. Each forcing carrying its own `lag=`
     // (`lag_slot`) switches on at `d.time + lag_cmt + lag_route`, past the dose's `K_DOSE`
@@ -4529,6 +4568,19 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             // the modeled `D`/`F·amt/R` for a modeled dose, #530).
             tl.push((d.time + lag_val(k) + inf_window_len(k), K_INF_END, k));
         }
+        // #1121: when the seed phase falls inside the infusion window the previous cycle
+        // is still delivering at the record and stops inside the pre-arrival window.
+        // Production breaks there (`ss_residual_infusion_end`); so must this walk, or a
+        // segment straddling the edge takes the rate for all of it or none. Built from
+        // THIS walk's own `inf_window_len` rather than by calling production's helper, for
+        // the same reason `K_INF_END` above is: the two must break at the same instant, and
+        // the window length is where a modeled `D`/`R` (#530) or `F` (#419) enters.
+        if crate::dosing::ss_seeded_at_record(d, lag_val(k)) && is_inf(d) {
+            let phase = crate::dosing::ss_seed_phase(d, lag_val(k));
+            if phase < inf_window_len(k) {
+                tl.push((d.time + (inf_window_len(k) - phase), K_SS_INF_END, k));
+            }
+        }
         // SS + estimated lagtime (#486): the dose arrives at `d.time + lag`, so observations
         // in the pre-arrival window `[d.time, d.time + lag)` must read the *previous*
         // interval's steady-state tail, not the (empty) running state. Break at the raw
@@ -4542,7 +4594,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
         // and `check_vs_production` asserts `obs.f` as well as the derivatives. It excludes
         // a zero lag (record and arrival coincide) and a lag of a full interval or more
         // (phase `II − lag` is not a phase) — see `ss_seeded_at_record`.
-        if crate::ode::predictions::ss_seeded_at_record(d, lag_val(k)) {
+        if crate::dosing::ss_seeded_at_record(d, lag_val(k)) {
             tl.push((d.time, K_SS_SEED, k));
         }
     }
@@ -4925,7 +4977,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                             cur_t,
                             t_event,
                             reset_floor,
-                        )
+                        ) || ss_residual_spans_segment(*k, d, cur_t, t_event, reset_floor)
                     })
                     // Effective forcing `inf_eff[k].0` (mode-aware: `F·rate` for a
                     // duration-defined infusion, held `rate` for a rate-defined one) (#419).
@@ -5049,7 +5101,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             // *is* the trough, so the twin agreed with production while both disagreed
             // with NONMEM. `ss_seeded_at_record` is production's own predicate, shared so
             // the two cannot seed on different sets.
-            if is_ss_dose(d) && !crate::ode::predictions::ss_seeded_at_record(d, lag_val(idx)) {
+            if is_ss_dose(d) && !crate::dosing::ss_seeded_at_record(d, lag_val(idx)) {
                 // SS into a built-in absorption compartment (#835): the dose drives the
                 // kernel `R_in`, not an instantaneous bolus, so equilibrate through the dual
                 // fixed point (linear) / pulse-train (nonlinear), carrying `∂u_ss/∂(θ,η[,κ])`.
@@ -5211,8 +5263,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                         if has_lagtime {
                             let lag = pk_at_dose[idx][dose_lag_slot[idx]];
                             let dlag = jet_only(lag);
-                            if is_ss_dose(d)
-                                && !crate::ode::predictions::ss_seeded_at_record(d, lag_val(idx))
+                            if is_ss_dose(d) && !crate::dosing::ss_seeded_at_record(d, lag_val(idx))
                             {
                                 let bare_rhs = |us: &[T], ps: &[T], t: f64, du: &mut [T]| {
                                     eval_rhs_anchored::<T>(
@@ -5455,8 +5506,8 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                         // flat zero at `tad ≤ 0`, so a co-onsetting one is already absent
                         // from both sides.
                         let u_minus = u.clone();
-                        let trough_loaded_here = is_ss_dose(d)
-                            && !crate::ode::predictions::ss_seeded_at_record(d, lag_val(idx));
+                        let trough_loaded_here =
+                            is_ss_dose(d) && !crate::dosing::ss_seeded_at_record(d, lag_val(idx));
                         let g_minus = if trough_loaded_here {
                             vec![T::from_f64(0.0); n_states]
                         } else {
@@ -5683,7 +5734,16 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             // through the walk's ordinary integration.
             let d = &subject.doses[idx];
             let lag = pk_at_dose[idx][dose_lag_slot[idx]];
-            let phase = T::from_f64(d.ii) - lag;
+            // `crate::dosing::ss_seed_phase` in dual form. The clamp is on the VALUE, and
+            // it kills the jet with it: past `lag = II` the phase is pinned at 0 for every
+            // nearby lag, so `∂phase/∂lag = 0` there. Taking `T::from_f64(d.ii) - lag`
+            // unconditionally would keep a jet the clamped value does not have, and the
+            // Dual2-vs-FD parity tests would see a derivative the predictor cannot produce.
+            let phase = if crate::dosing::ss_seed_phase(d, lag.val()) > 0.0 {
+                T::from_f64(d.ii) - lag
+            } else {
+                T::from_f64(0.0)
+            };
             let inf = ss_inf(d, idx);
             // The only SS equilibration this dose runs: since #1121 its `K_DOSE` event keeps
             // the state the walk flowed there rather than re-loading a trough, so there is no
@@ -5713,7 +5773,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                 &mut d1_stack,
             );
             last_params = &pk_at_dose[idx];
-        } else if kind == K_INF_END {
+        } else if kind == K_INF_END || kind == K_SS_INF_END {
             // Infusion window end: the rate turns off (the next segment's `active_inf`
             // excludes it). Not a record — no state change, no `last_params` update. The
             // window end `t+lag+t_inf` is a moving boundary: it shifts with `lag` (any
@@ -5738,8 +5798,18 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             // `saturating_sub`: `CMT=0` is the default dose compartment, state index 0 (#899).
             // The former `d.cmt >= 1` gate dropped this saltation term for such a dose — again
             // a wrong gradient rather than a visibly zero value.
+            // `K_SS_INF_END` closes the *previous* cycle's window, which opened at the
+            // dose record rather than at the arrival — so that, not the arrival, is what the
+            // reset test must compare (#1121). The shift `δ` is the same either way: the
+            // residual end is `d.time + T_inf − II + lag`, so it moves with `lag` and with
+            // the window length exactly as the real end at `d.time + lag + T_inf` does.
+            let window_start = if kind == K_SS_INF_END {
+                d.time
+            } else {
+                d.time + lag_val(idx)
+            };
             if (has_lagtime || is_rate_defined || is_modeled)
-                && d.time + lag_val(idx) >= reset_floor
+                && window_start >= reset_floor
                 && d.cmt_idx() < n_states
             {
                 let cmt = d.cmt_idx();
@@ -6152,10 +6222,7 @@ fn integrate_g<T: crate::sens::num::PkNum>(
     // Skip the per-segment active-infusion scan/alloc entirely for the common bolus-only /
     // oral subject (no infusion → empty active set every segment) — mirrors the
     // `integrate_tvcov_g` short-circuit (#472 review round 2 #7).
-    let has_any_infusion = subject
-        .doses
-        .iter()
-        .any(crate::ode::predictions::is_real_infusion);
+    let has_any_infusion = subject.doses.iter().any(crate::dosing::is_real_infusion);
 
     // Most-recent EVID 3/4 reset time (`NEG_INFINITY` until the first reset). An infusion
     // whose window *straddles* a reset must stop contributing afterward — the reset zeroed
