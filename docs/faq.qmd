@@ -573,3 +573,37 @@ prediction. That is true in NONMEM, and it is now true in ferx — the
 `a_record_inside_the_dose_to_arrival_window_does_not_move_the_prediction`
 regression test asserts it. If you are ever unsure which convention a tool uses,
 that null test tells you without needing a reference implementation.
+
+### What about a steady-state dose with a lagtime?
+
+Same rule, one extra step. `SS = 1` says "assume the patient has already been on
+this regimen forever", so the compartments are *loaded* rather than propagated
+into — and they are loaded at the **dose record**, not at the lagged arrival.
+
+The state at the record time is the periodic solution at phase `II − ALAG`: the
+previous cycle's pulse landed at `t + ALAG − II`, so by `t` it has been decaying
+for `II − ALAG`. From there the ordinary rule takes over — the walk advances to
+the arrival under the record that terminates that interval — and the arrival
+applies only the dose's own pulse.
+
+Two things follow that are easy to get wrong:
+
+* The **equilibration** uses the dose row's own covariates, because the steady
+  state is a property of that record (like `F` and `ALAG`). The **propagation**
+  from the record to the arrival does not — it follows the interval rule above.
+* Observations falling between the dose row and the lagged arrival read that
+  decaying tail, not zero and not the trough.
+
+::: {.callout-note}
+## Changed in #1121
+
+ferx previously equilibrated at the *arrival*, computing the trough throughout
+under the dose row's covariates. Under flat covariates that is the same number —
+propagating from phase `II − ALAG` for `ALAG` hours returns exactly to the trough
+— so this only ever showed up when a covariate changed inside the pre-arrival
+window. On the committed anchor it was worth **7.67 OFV** against NONMEM 7.6.0,
+from a per-point error of about 2 %. Fits without both ingredients are unaffected.
+
+The same change gives the IOV predictor a pre-arrival state, where it previously
+returned zero for any observation between an `SS` dose's record and its arrival.
+:::

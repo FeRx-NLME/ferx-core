@@ -8289,3 +8289,110 @@ fn ode_provider_matches_fd_under_the_auto_stiff_switch() {
     check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
     check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
 }
+
+/// `nonmem_anchor/dose_form_lag_oral_fit.ferx` in miniature: oral `depot → central`,
+/// `WT` allometric on **both** `CL` and `KA`, and an `ALAG1` carrying its own η.
+///
+/// `WT` is deliberately on `KA` as well as on `CL`. `KA` governs the compartment
+/// the dose *lands in*, so without it the pre-arrival window's depot leg would be
+/// covariate-inert and the fixture would probe only the central compartment —
+/// exactly the degeneracy the repo's anchor rules warn about.
+const ONECPT_ORAL_LAG_SS_TVCOV_ODE: &str = r#"
+[parameters]
+  theta TVCL(1.0,  0.01, 100.0)
+  theta TVV(10.0,  1.0, 500.0)
+  theta TVKA(1.0,  0.01, 50.0)
+  theta TVLAG(0.5, 0.01, 5.0)
+  theta WTEXP(0.75, 0.01, 2.0)
+  omega ETA_CL  ~ 0.1
+  omega ETA_LAG ~ 0.04
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL    = TVCL * (WT/70)^WTEXP * exp(ETA_CL)
+  V     = TVV
+  KA    = TVKA * (WT/70)^WTEXP
+  ALAG1 = TVLAG * exp(ETA_LAG)
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+[covariates]
+  WT continuous
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+/// **SS × estimated lagtime × time-varying covariates — the cell that had no test
+/// (#1121).**
+///
+/// `ode_provider_ss_lagtime_matches_production` covers SS × lagtime with *flat*
+/// covariates; `ode_provider_ss_tvcov_matches_production` covers SS × TV
+/// covariates with *no* lagtime. Their intersection — where the pre-arrival window
+/// `[t_dose, t_dose + ALAG)` straddles a covariate change — was uncovered, and it
+/// is precisely where production and the dual walk both used to load the periodic
+/// trough *at the arrival* under the dose row's snapshot instead of seeding it at
+/// the dose record and flowing it forward.
+///
+/// **Read this before trusting it as a regression test.** Before #1121 both sides
+/// carried that defect, so this passed while both were wrong; after the joint fix
+/// it passes because both are right. It is therefore a **coupling guard, not an
+/// oracle** — its job is to go red the moment production and the twin are fixed
+/// out of step, which is the one failure a value-vs-value comparison between two
+/// implementations of the same wrong idea can actually detect. The oracle for the
+/// behaviour itself is NONMEM: `tests/dose_form_lag_nonmem_anchor.rs` (pointwise
+/// `PRED`) and `ss_state_at_phase_matches_nonmem_at_the_dose_record` (the seed
+/// alone).
+///
+/// Mutation-tested when it was added. Restoring the twin's `K_DOSE` trough
+/// overwrite with production left fixed turns this red **on `obs.f`** — the value
+/// assertion — while the flat-covariate `ode_provider_ss_lagtime{,_infusion}_…`
+/// tests go red only on their derivative blocks. That split is the whole reason
+/// this cell exists: a value divergence between the two walks is invisible until
+/// a covariate changes inside the pre-arrival window.
+#[test]
+fn ode_provider_ss_lagtime_tvcov_matches_production() {
+    let model = parse_model_string(ONECPT_ORAL_LAG_SS_TVCOV_ODE).expect("parse oral lag SS TV ODE");
+    let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+    // θ = [TVCL, TVV, TVKA, TVLAG, WTEXP]; η = [ETA_CL, ETA_LAG] → ALAG ≈ 0.526.
+    let theta = [1.0, 10.0, 1.0, 0.5, 0.75];
+    let eta = [0.12, 0.05];
+
+    // Obs at 0.3 sits INSIDE the pre-arrival window; 0.8 just past the arrival;
+    // the rest span the remainder of the cycle and into the next.
+    let mut subject = bolus_subject(&[0.3, 0.8, 2.0, 5.0, 11.0, 13.0]);
+    subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)];
+    // The SS record carries WT = 70; every later record carries 140 or more. The
+    // window `(0, ALAG]` is therefore seeded under 70 and propagated under 140 —
+    // a 2× contrast on both CL and KA.
+    subject.dose_covariates = vec![wt(70.0)];
+    subject.obs_covariates = vec![
+        wt(140.0),
+        wt(140.0),
+        wt(140.0),
+        wt(150.0),
+        wt(150.0),
+        wt(75.0),
+    ];
+
+    // Preconditions, asserted rather than assumed — this fixture is worth nothing
+    // unless all three ingredients are simultaneously live.
+    assert!(subject.doses[0].ss && subject.doses[0].ii > 0.0);
+    assert!(model.has_lagtime());
+    assert!(subject.has_tv_covariates());
+    assert!(
+        ode_tvcov_supported(&model, &subject),
+        "SS + lagtime + TV covariates must take the analytic event-driven walk, \
+         not the FD fallback — otherwise this compares FD against itself"
+    );
+
+    check_vs_production(&model, &subject, &theta, &eta);
+    check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    check_hessian_vs_fd_of_grad(&model, &subject, &theta, &eta);
+}

@@ -5548,11 +5548,17 @@ fn lagtime_with_fixed_infusion_matches_fd_of_production() {
     check_full_provider_vs_fd(&model, &subject, &theta, &eta);
 }
 
-/// **SS × lagtime still declines to FD**, per-subject. Production overlays the pre-arrival
-/// steady-state tail for observations in `[t, t + ALAG)` (`ss_state_at_phase_event_driven`)
-/// and the dual walk has no twin of that overlay, so serving it would disagree with
-/// production in *value*, not just in derivative. Deliberately a hard decline, not an
-/// approximation — a lagged non-SS subject on the same model stays analytic.
+/// **SS × lagtime still declines to FD**, per-subject. Production loads the periodic
+/// trough at the dose *record*, at phase `II − ALAG`, and lets the walk carry it to the
+/// lagged arrival (#1121, `ss_state_at_phase_event_driven` at `EventKind::DoseRecord`);
+/// the closed-form dual walk has no twin of that seed and still equilibrates at the
+/// arrival, so serving this would disagree with production in *value*, not just in
+/// derivative. Deliberately a hard decline, not an approximation — a lagged non-SS
+/// subject on the same model stays analytic.
+///
+/// The decline predates #1121 and survives it: before, production patched the
+/// pre-arrival *predictions* in a post-hoc pass the dual had no twin for; now it seeds
+/// the *state* and the dual has no twin for that. Same gap, different construct.
 #[test]
 fn lagtime_with_ss_dose_declines_to_fd() {
     let model = parse_model_string(ONECPT_ORAL_LAG_TVCOV).expect("parse lag + tvcov");
@@ -5570,7 +5576,7 @@ fn lagtime_with_ss_dose_declines_to_fd() {
     let eta = [0.12, -0.08, 0.15, 0.10];
     assert!(
         subject_sensitivities(&model, &ss, &theta, &eta).is_none(),
-        "SS + lagtime on the walk must decline to FD (no dual twin of the SS pre-arrival overlay)"
+        "SS + lagtime on the walk must decline to FD (no dual twin of the SS record-time seed)"
     );
     assert!(
         subject_eta_grad(&model, &ss, &theta, &eta).is_none(),
@@ -9404,14 +9410,22 @@ fn ode_iov_lagtime_provider_matches_fd_of_predict_iov() {
 
 /// **IOV × steady-state × estimated lagtime is now analytic (#486, PR3 sub-case (a)).**
 /// Each occasion's SS dose gets its own `K_SS_SEED` pre-arrival seed (phase `II − lag`,
-/// `ss_state_at_phase_g` seeded with that occasion's κ) — validated against the dense
-/// (non-event-driven) predictor for this exact combination in
-/// `ode_provider_ss_lagtime_matches_production`/`..._infusion_...` (including an
-/// observation strictly inside the pre-arrival window). `predict_iov`, this test's
-/// oracle, has no such seed of its own (a pre-existing, orthogonal gap — it would read
-/// zero for a pre-arrival observation regardless of gate/gradient correctness), so this
-/// test uses the default `iov_subject()` times (post-arrival only) to isolate the SS
-/// dose's own event-time saltation under IOV.
+/// `ss_state_at_phase_g` seeded with that occasion's κ).
+///
+/// The oracle is FD of `predict_iov`, and `check_iov_provider_vs_fd` asserts the
+/// **value** (`obs.f`) as well as the derivatives — which is what makes the two
+/// pre-arrival samples below load-bearing. Until #1121, `predict_iov` had no seed of
+/// its own: it routes to `ode_predictions_event_driven`, which equilibrated the trough
+/// *at the lagged arrival* and so read ≈ 0 for any observation before it, while the
+/// dual walk seeded the previous cycle's tail. The two therefore disagreed in value in
+/// that window, and this test was written to dodge it by sampling post-arrival only.
+///
+/// Fixing production's walk closes that gap for the IOV path as a side effect — the
+/// same `Kind::DoseRecord` seed serves per-occasion snapshots unchanged — so the dodge
+/// is removed. `0.3` and `24.3` sit inside occasion 1's and occasion 2's pre-arrival
+/// windows respectively (`ALAG ≈ 0.5` at `TVLAG = 0.5`), which makes this the direct
+/// evidence that the IOV gap is closed rather than assumed to be: it fails before the
+/// production fix and passes after.
 #[test]
 fn ode_iov_ss_lagtime_provider_matches_fd_of_predict_iov() {
     let model = parse_model_string(WARFARIN_IOV_LAG_ODE).expect("parse ODE IOV+lag");
@@ -9424,9 +9438,26 @@ fn ode_iov_ss_lagtime_provider_matches_fd_of_predict_iov() {
         DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0),
         DoseEvent::new(24.0, 100.0, 1, 0.0, true, 12.0),
     ];
+    // One pre-arrival sample per occasion, prepended to that occasion's block so the
+    // occasion vector stays sorted alongside `obs_times`.
+    subject.obs_times = vec![0.3, 1.0, 6.0, 12.0, 24.3, 25.0, 30.0, 36.0];
+    subject.occasions = vec![1, 1, 1, 1, 2, 2, 2, 2];
+    let n = subject.obs_times.len();
+    subject.observations = vec![1.0; n];
+    subject.obs_cmts = vec![1; n];
+    subject.cens = vec![0; n];
+
     assert!(subject.doses[0].ss && subject.doses[0].ii > 0.0);
     let theta = [0.2, 10.0, 0.5];
     let stacked = [0.12, -0.08, 0.05, -0.10];
+    // Non-degeneracy: the two extra samples must genuinely precede their arrivals, or
+    // this reverts to the post-arrival-only test it replaces.
+    let lag = theta[2];
+    assert!(
+        subject.obs_times[0] < subject.doses[0].time + lag
+            && subject.obs_times[4] < subject.doses[1].time + lag,
+        "the pre-arrival samples must fall strictly inside [t_dose, t_dose + ALAG)"
+    );
     assert!(
         crate::sens::ode_provider::ode_subject_sensitivities_iov(
             &model, &subject, &theta, &stacked,

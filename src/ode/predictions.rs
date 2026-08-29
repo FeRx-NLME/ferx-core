@@ -893,6 +893,41 @@ fn ss_state_at_phase(
     u
 }
 
+/// Whether this steady-state dose's periodic trough is seeded at its dose
+/// **record** and flowed forward to the lagged arrival (#1121), rather than
+/// equilibrated at the arrival itself.
+///
+/// NONMEM runs `$PK` at the dose row, loads the steady-state compartments there,
+/// and then ADVANs to the lagged arrival under the record that *terminates* that
+/// interval. Equilibrating at the arrival instead computes the trough throughout
+/// under the dose row's snapshot. The two agree exactly under flat covariates —
+/// a full-cycle propagation from phase `II − lag` returns to the trough — which
+/// is why the difference stayed invisible until a covariate changed inside the
+/// pre-arrival window.
+///
+/// The two excluded cases both keep the arrival-side equilibration deliberately:
+///
+///   * `lag == 0` — record and arrival are the same instant, so there is nothing
+///     to propagate. Routing it through `ss_state_at_phase(…, II)` would
+///     integrate a full extra cycle and move every existing non-lagged SS result
+///     by solver error, for no gain.
+///   * `lag >= II` — phase `II − lag` is not a phase. `ss_state_at_phase` returns
+///     the bare trough for a non-positive phase, and flowing *that* forward by
+///     more than one dosing interval would silently skip the intervening pulses
+///     of the train. Nothing upstream rejects such a dose today; that gap is
+///     tracked separately rather than half-answered here.
+///
+/// Every call site reads this predicate rather than re-deriving the condition, so
+/// the seed and the equilibration cannot drift into overlapping (double-load) or
+/// disjoint (no-load) coverage — and the analytic twin
+/// (`sens::ode_provider::integrate_tvcov_g`) shares it too, so its `K_SS_SEED`
+/// timeline break fires on exactly the doses production seeds. A twin that seeded
+/// on a wider or narrower set would disagree with production in *value*, which is
+/// the one thing the `check_vs_production` parity tests cannot forgive.
+pub(crate) fn ss_seeded_at_record(dose: &DoseEvent, lag: f64) -> bool {
+    dose.ss && dose.ii > 0.0 && lag > 0.0 && lag < dose.ii
+}
+
 /// Returns `(cmt_idx_0based, rate)` for every infusion that is active
 /// throughout the closed segment `[t_start, t_end]`. By construction of the
 /// break-time list (every infusion start and end is a break time), each
@@ -4794,6 +4829,33 @@ pub fn ode_predictions_event_driven(
                 // snapshot becomes current. No state change — that happens at the
                 // lagged arrival below (#1073).
                 last_pk = pk_now;
+                // …with one exception: a *steady-state* dose carrying a lagtime
+                // loads its compartments HERE, at the record, not at the arrival
+                // (#1121). NONMEM runs `$PK` at the dose row, fills the
+                // compartments with the periodic solution, and then ADVANs to the
+                // lagged arrival under the record that terminates that interval.
+                // Equilibrating at the arrival instead — which is what this walk
+                // did — computes the trough throughout under the dose row's
+                // snapshot, so the pre-arrival window gets the wrong elimination
+                // whenever a covariate changes inside it.
+                //
+                // Phase `II − lag` is where the *previous* cycle's pulse (at
+                // `d.time + lag − II`) has decayed to by the record time. The
+                // snapshot is the dose row's own, never `pk_now`: like `F`, `ALAG`
+                // and `D{n}`, the steady state is a property of the record that
+                // declares it, and `pk_now` is the *next* record's after #1073.
+                // From here the walk's ordinary integration carries the state to
+                // the arrival, where only the pulse is applied.
+                let d = &subject.doses[idx];
+                if ss_seeded_at_record(d, dose_lagtimes[idx]) {
+                    u = ss_state_at_phase(
+                        ode,
+                        &pk_at_dose[idx].values,
+                        d,
+                        d.ii - dose_lagtimes[idx],
+                        &opts,
+                    );
+                }
             }
             Kind::Dose => {
                 let d = &subject.doses[idx];
@@ -4806,7 +4868,12 @@ pub fn ode_predictions_event_driven(
                 // SS amount from the infinite-past pulse train before the
                 // SS dose's own pulse is applied below. See
                 // `equilibrate_ss_state` for the per-cycle scheme.
-                if d.ss && d.ii > 0.0 {
+                //
+                // Skipped when the trough was already seeded at the dose record
+                // and flowed here (#1121) — re-equilibrating would discard that
+                // propagation and restore the defect. The two branches read the
+                // same predicate, so they cannot both fire or both skip.
+                if d.ss && d.ii > 0.0 && !ss_seeded_at_record(d, dose_lagtimes[idx]) {
                     u = equilibrate_ss_state(ode, &dose_pk.values, d, &opts);
                 }
                 // Boluses: add amt to state. Infusions: no instantaneous

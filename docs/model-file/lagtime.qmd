@@ -173,5 +173,18 @@ intended; prefer using only one of the two names per model.
   time `t` equals the un-lagged SS curve evaluated at `t - lagtime`,
   i.e. `C_ss(t, L) = C_ss(t - L, 0)`. See
   [Steady-State Doses](steady-state.qmd) for the full SS=1 reference.
+- With **time-varying covariates**, the identity above stops being the
+  whole story, because the two sides are then evaluated under different
+  parameters. ferx loads the periodic solution at the dose **record**
+  (phase `II - lagtime`, under the dose row's own covariates) and
+  advances from there to the arrival under the record governing that
+  interval — matching NONMEM. It does not compute the trough *at* the
+  arrival; doing so was worth 7.67 OFV on the committed anchor (#1121).
+  See [the FAQ](../faq.qmd) for the worked timing rule.
+- A `lagtime` of a **full dosing interval or longer** (`lagtime >= II`)
+  on a steady-state dose has no well-defined pre-arrival phase — the
+  window would span whole cycles whose pulses are not accounted for —
+  and ferx does not attempt one. Nothing rejects such a model today, so
+  treat it as unvalidated rather than supported.
 
 See `examples/oral_with_lagtime.ferx` for a runnable model.

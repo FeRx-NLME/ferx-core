@@ -816,6 +816,30 @@ fn event_driven_predictions_with_schedule_impl(
                 // The dose row: a record, so `$PK` ran here and the interval
                 // ending at it took this snapshot above. No state change — that
                 // is the lagged arrival's job (#1073).
+                //
+                // Except for a *steady-state* dose carrying a lagtime (#1121):
+                // NONMEM loads the periodic compartments HERE, at the record, and
+                // then ADVANs to the lagged arrival under the record governing that
+                // interval. Phase `II − lag` is where the previous cycle's pulse has
+                // decayed to by the record time. The predicate is the ODE walk's own
+                // (`ode::predictions::ss_seeded_at_record`), shared so the two
+                // production engines cannot seed on different sets of doses — they
+                // were measured 7.665 OFV apart on `nonmem_anchor/dose_form_lag_ss`
+                // before this, having both equilibrated at the arrival instead.
+                let d = &eff_doses[ev.orig_idx];
+                let lag = schedule
+                    .dose_lagtimes
+                    .get(ev.orig_idx)
+                    .copied()
+                    .unwrap_or(0.0);
+                if crate::ode::predictions::ss_seeded_at_record(d, lag) {
+                    state = ss_state_at_phase_event_driven(
+                        pk_model,
+                        &pk_at_dose[ev.orig_idx],
+                        d,
+                        d.ii - lag,
+                    );
+                }
             }
             EventKind::Dose => {
                 let d = &eff_doses[ev.orig_idx];
@@ -828,7 +852,16 @@ fn event_driven_predictions_with_schedule_impl(
                 // dose's own pulse is applied through the normal flow.
                 // See `equilibrate_ss_state_event_driven` for the per-cycle
                 // scheme. Mirrors `ode/predictions.rs::ode_predictions_*`.
-                if d.ss && d.ii > 0.0 {
+                //
+                // Skipped when the trough was already loaded at this dose's record
+                // and flowed here (#1121); re-equilibrating would discard that
+                // propagation and put the trough at the arrival instead.
+                let lag = schedule
+                    .dose_lagtimes
+                    .get(ev.orig_idx)
+                    .copied()
+                    .unwrap_or(0.0);
+                if d.ss && d.ii > 0.0 && !crate::ode::predictions::ss_seeded_at_record(d, lag) {
                     state = equilibrate_ss_state_event_driven(pk_model, &dose_pk, d);
                 }
                 if d.rate <= 0.0 {
@@ -888,46 +921,19 @@ fn event_driven_predictions_with_schedule_impl(
         }
     }
 
-    // SS + lagtime: previous-interval steady-state tail (issue #15). The
-    // walk above seeds the SS state only at the lagged dose event, so
-    // observations between the dose record time and the lagged arrival are
-    // left at the empty initial state (≈0). At steady state they carry the
-    // tail of the prior pulse; recompute them from the SS phase. Matches the
-    // analytical (`predict_concentration`) and ODE (`ss_state_at_phase`)
-    // paths, verified against NONMEM ALAG1 + SS=1.
-    for (k, d) in eff_doses.iter().enumerate() {
-        let lag = schedule.dose_lagtimes.get(k).copied().unwrap_or(0.0);
-        if !(d.ss && d.ii > 0.0 && lag > 0.0) {
-            continue;
-        }
-        let t_eff = d.time + lag;
-        // Reconstruct the steady-state amount with the *dose-record* PK
-        // snapshot and read out concentration with the *observation* V —
-        // the same split the main walk uses (it equilibrates the SS dose
-        // with `pk_now = pk_at_dose[k]` and divides by `pk_at_obs[j].v()`
-        // at the obs event). Keeping the dose-time snapshot here is what
-        // makes the pre-arrival branch continuous with the main walk at
-        // t_eff: the steady-state profile is defined by the SS-record
-        // params, and a full-interval propagation from that equilibrium
-        // returns exactly to the trough. Equilibrating with obs-time params
-        // instead would break that continuity under time-varying covariates.
-        // (For pre-lag samples — within `lag` of the record — the two
-        // snapshots are effectively equal anyway.)
-        let pk_dose = pk_at_dose[k];
-        for (j, &t_obs) in subject.obs_times.iter().enumerate() {
-            if t_obs >= d.time - 1e-12 && t_obs < t_eff - 1e-12 {
-                // Phase of the previous pulse (at t_eff − II) at t_obs.
-                let phase = t_obs - t_eff + d.ii;
-                let st = ss_state_at_phase_event_driven(pk_model, &pk_dose, d, phase);
-                let v = pk_at_obs[j].v();
-                preds[j] = if v > 0.0 {
-                    (st[central_slot] / v).max(0.0)
-                } else {
-                    0.0
-                };
-            }
-        }
-    }
+    // (Issue #15's post-hoc pre-arrival overlay lived here until #1121. The walk
+    // used to load the steady state only at the *lagged arrival*, leaving every
+    // observation between the dose record and that arrival reading the empty
+    // initial state — so those predictions were recomputed afterwards from the SS
+    // phase and written over `preds`. Two things were wrong with that. It patched
+    // the *predictions* and never the running *state*, so the walk carried on from
+    // an unseeded trajectory; and it evaluated the whole pre-arrival decay under
+    // the dose row's snapshot, where NONMEM advances under the record terminating
+    // each sub-interval. Both are fixed at the source now: the trough is loaded at
+    // the `DoseRecord` event and the ordinary walk carries it, so pre-arrival
+    // observations are read off a real state by the normal `EventKind::Obs` arm and
+    // need no overlay. The overlay was also what kept SS × lagtime off the
+    // closed-form dual walk — see `sens::provider::ss_lagtime_walk_unsupported`.)
 
     preds
 }
@@ -2987,9 +2993,12 @@ mod tests {
         // V=80, ALAG1=2.0, single SS=1 II=12 AMT=1000 IV bolus. Control file
         // + dataset in tests/ss_lagtime_nonmem.rs.
         //
-        // t=0.5,1.0,1.5 (< ALAG1=2.0) exercise the previous-interval tail
-        // recomputed by `ss_state_at_phase_event_driven`; the plain walk
-        // leaves them at ≈0.
+        // t=0.5,1.0,1.5 (< ALAG1=2.0) exercise the previous interval's
+        // steady-state tail. Since #1121 the walk *carries* that tail — the
+        // trough is loaded at the dose record via `ss_state_at_phase_event_driven`
+        // and flowed forward — rather than the predictions being recomputed
+        // afterwards by an overlay. These times therefore also guard that the
+        // seed did not move: without it they read ≈ 0.
         let cl = 5.0;
         let v = 80.0;
         let amt = 1000.0;

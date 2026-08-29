@@ -20,6 +20,17 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Fixed
+- **A steady-state dose with a lagtime is now seeded at the dose record, not equilibrated at the
+  arrival (#1121).** Under time-varying covariates an `SS=1` dose carrying an `ALAG` had its
+  periodic trough computed *at the lagged arrival*, entirely under the dose row's covariate
+  values. NONMEM loads the trough at the dose **record** (phase `II − ALAG`) and advances to the
+  arrival under the record governing that interval, so ferx applied too little elimination across
+  the pre-arrival window and ran high for the rest of the cycle. On an eight-subject anchor
+  (`nonmem_anchor/dose_form_lag_ss`) this was worth **7.67 objective units**; predictions are now
+  within 1e-4 of NONMEM 7.6.0 point by point. Flat-covariate fits are unaffected — the two
+  constructions agree exactly when nothing changes inside the window, which is why this went
+  unnoticed. The same fix gives the IOV predictor a pre-arrival state, where it previously read
+  zero for any observation between an `SS` dose's record and its lagged arrival.
 - **VI no longer freezes from ordinary starting values (#1097).** Adam's gradients are now
   clipped to a global L2 norm, controlled by the new `vi_grad_clip` fit option (default `1e4`;
   `0` restores the old behaviour). Under a proportional error model a prediction near zero

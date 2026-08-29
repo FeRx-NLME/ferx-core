@@ -7529,3 +7529,160 @@ fn the_pre_arrival_tad_anchor_does_not_depend_on_the_sampling_mesh() {
         "fixture must keep live init state inside the pre-arrival window: {coarse:?}"
     );
 }
+
+/// The `dose_form_lag_ss` anchor's `[odes]`: oral `depot → central`, reading
+/// `CL`/`V`/`KA` from the PK snapshot. Mirrors the `$DES` in
+/// `nonmem_anchor/dose_form_lag_ss.ctl` term for term.
+fn oral_depot_central_ode_spec() -> OdeSpec {
+    OdeSpec {
+        rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+            let cl = p[crate::types::PK_IDX_CL];
+            let v = p[crate::types::PK_IDX_V];
+            let ka = p[crate::types::PK_IDX_KA];
+            dy[0] = -ka * y[0];
+            dy[1] = ka * y[0] - if v > 0.0 { cl / v } else { 0.0 } * y[1];
+        }),
+        n_states: 2,
+        state_names: vec!["depot".into(), "central".into()],
+        readout: OdeReadout::ObsCmt(1),
+        diffusion_var: Vec::new(),
+        solver_opts: OdeSolverOptions {
+            abstol: 1e-12,
+            reltol: 1e-10,
+            ..OdeSolverOptions::default()
+        },
+        input_rate: Vec::new(),
+        rhs_program: None,
+        readout_program: None,
+        indiv_param_program: None,
+        dose_attr_map: Default::default(),
+        init_fn: None,
+    }
+}
+
+/// **#1121 — the SS + lagtime pre-arrival seed, pinned against NONMEM directly.**
+///
+/// `nonmem_anchor/results/dose_form_lag_ss.tab` tabulates `PRED` — the η = 0
+/// population prediction — at the SS dose *record itself* (`TIME = 0`, an
+/// `MDV = 1` row): `2.8687E-01`. Nothing downstream has happened at that instant:
+/// the lagged pulse has not arrived and no propagation has run, so that number is
+/// `A(central)/V` for the periodic trough at phase `II − ALAG`, evaluated under
+/// the dose row's own covariates (`WT = 70`, giving `CL = 10`, `KA = 1`). It is a
+/// readout of `ss_state_at_phase(…, II − lag)` and of nothing else.
+///
+/// Confirmed independently of *both* codebases by hand, from the 1-cpt oral
+/// steady-state closed form:
+///
+/// ```text
+///   A2(τ) = F·D·KA/(KA−ke)·[ e^(−ke·τ)/(1−e^(−ke·II)) − e^(−KA·τ)/(1−e^(−KA·II)) ]
+///   ke = 0.2, KA = 1, II = 12, τ = II − ALAG = 11.3, D = 100, F = 1
+///         = 125·(0.1147595 − 0.0000124) = 14.34339   →   /V = 0.2868678
+/// ```
+///
+/// against NONMEM's `0.28687` — agreement to six significant figures, which is
+/// all the five-digit `$TABLE` format can express.
+///
+/// Why this is worth a test of its own, separate from the pointwise `PRED`
+/// comparison in `tests/dose_form_lag_nonmem_anchor.rs`: that one cannot reach
+/// `t = 0` at all, because the row is `MDV = 1` and `predict()` returns nothing
+/// for it. So the seed — the single quantity #1121 is about — is only ever
+/// observable there *through* the propagation and the bolus. Isolating it means a
+/// failure here says "the phase or the snapshot is wrong" and a failure there
+/// says "the propagation is", instead of one ambiguous red.
+#[test]
+fn ss_state_at_phase_matches_nonmem_at_the_dose_record() {
+    // η = 0 at the anchor's initial estimates, evaluated at the dose row's own
+    // WT = 70: CL = 10·(70/70)^0.75, V = 50, KA = 1·(70/70)^0.75, ALAG1 = 0.7.
+    let (cl, v, ka, lag, ii, amt) = (10.0, 50.0, 1.0, 0.7, 12.0, 100.0);
+    let mut pk = pk_one(cl, v);
+    pk.values[crate::types::PK_IDX_KA] = ka;
+    pk.values[crate::types::PK_IDX_LAGTIME] = lag;
+
+    let ode = oral_depot_central_ode_spec();
+    // CMT = 1 (1-based) is the depot — the compartment the dose lands in.
+    let dose = DoseEvent::new(0.0, amt, 1, 0.0, true, ii);
+    assert!(dose.ss && dose.ii > 0.0, "precondition: this is an SS dose");
+
+    let u = ss_state_at_phase(&ode, &pk.values, &dose, ii - lag, &ode.solver_opts);
+
+    // `PRED` at `TIME = 0`, `nonmem_anchor/results/dose_form_lag_ss.tab`.
+    const NM_PRED_AT_RECORD: f64 = 2.8687e-01;
+    assert_relative_eq!(u[1] / v, NM_PRED_AT_RECORD, max_relative = 1e-4);
+
+    // Non-degeneracy: the depot leg must be live too, or this pins only the
+    // central compartment and a wrong `KA` inside the seed would slip through.
+    // NONMEM tabulates no depot amount, but the same steady-state algebra gives it
+    // in closed form — the prior pulse's undecayed remainder at phase `II − lag`:
+    //
+    //     A1(τ) = F·D·e^(−KA·τ)/(1 − e^(−KA·II))
+    //           = 100·e^(−11.3)/(1 − e^(−12)) = 1.23730e-3
+    //
+    // Tiny in absolute terms, but pinned rather than merely bounded: a loose
+    // `> 0` would pass for any `KA`, which is the whole point of checking it.
+    assert_relative_eq!(u[0], 1.237_30e-3, max_relative = 1e-6);
+
+    // And the seed must genuinely differ from the bare trough, or the whole
+    // distinction #1121 rests on is untested by this fixture: at phase `II` the
+    // pulse has decayed a further `lag`, so the trough is strictly lower.
+    let trough = equilibrate_ss_state(&ode, &pk.values, &dose, &ode.solver_opts);
+    assert!(
+        trough[1] < u[1] * 0.95,
+        "phase II−lag must be materially above the phase-II trough \
+         (seed {}, trough {}) — otherwise this fixture cannot tell the two apart",
+        u[1],
+        trough[1]
+    );
+}
+
+/// **Which steady-state doses get the record-time seed (#1121).**
+///
+/// The predicate is shared by four walks — the two production engines and their
+/// two dual twins — so its boundaries are worth pinning directly rather than
+/// inferring them from whichever walk a later test happens to exercise. A seed and
+/// an arrival-time equilibration must be exactly complementary: both firing loads
+/// the trough twice, neither firing leaves the compartments empty.
+///
+/// The two exclusions are deliberate, not oversights:
+///
+///   * `lag == 0` — record and arrival are the same instant, so there is nothing
+///     to propagate, and routing it through `ss_state_at_phase(…, II)` would
+///     integrate a full extra cycle and move every existing non-lagged SS result
+///     by solver error.
+///   * `lag >= II` — phase `II − lag` is not a phase. Seeding there would hand the
+///     walk the bare trough and then flow it forward across one or more whole
+///     dosing cycles whose pulses were never applied, which is silently *low*
+///     rather than obviously broken. ferx does not attempt it; nothing upstream
+///     rejects such a model either, so its predictions are unvalidated rather than
+///     supported — see `docs/model-file/lagtime.qmd`.
+#[test]
+fn ss_record_seed_declines_a_zero_lag_and_a_full_interval_lag() {
+    let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
+
+    assert!(
+        ss_seeded_at_record(&dose, 0.7),
+        "an ordinary lagged SS dose"
+    );
+    assert!(
+        ss_seeded_at_record(&dose, 11.999),
+        "just inside a full interval still has a positive phase"
+    );
+    assert!(
+        !ss_seeded_at_record(&dose, 0.0),
+        "no lag: record and arrival coincide, so the arrival equilibrates as before"
+    );
+    assert!(
+        !ss_seeded_at_record(&dose, 12.0),
+        "a lag of exactly II leaves phase 0 — not a pre-arrival tail"
+    );
+    assert!(
+        !ss_seeded_at_record(&dose, 20.0),
+        "a lag beyond II would skip whole cycles of the pulse train"
+    );
+
+    // A non-SS dose is never seeded however it is lagged, and an SS record with no
+    // dosing interval is not a steady state at all.
+    let plain = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
+    assert!(!ss_seeded_at_record(&plain, 0.7));
+    let ss_no_ii = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 0.0);
+    assert!(!ss_seeded_at_record(&ss_no_ii, 0.7));
+}
