@@ -76,6 +76,26 @@ contributor:
 7. **Finish the [Definition-of-done checklist](sdlc.qmd#12-definition-of-done)**
    before marking it ready.
 
+### If the `Public API baseline` job goes red
+
+The repo is a cargo workspace — the `ferx-core` library at the root, with
+`ferx-tools` (multi-fit tooling) and `ferx-cli` (the `ferx` binary) on top — and
+`api/ferx-core-public-api.txt` is a committed snapshot of everything `ferx-core`
+exposes. CI diffs it, so *any* new `pub` item fails that job until the baseline
+is updated in the same PR. That is deliberate: it makes each widening one
+reviewable line instead of something buried in a large change.
+
+If the change is intended:
+
+```bash
+tools/update-public-api.sh   # regenerate, then commit the result
+```
+
+and say in the PR description which caller needs each added item and why the
+existing surface does not suffice. Do not reach for `#[doc(hidden)]` — it hides
+the item from the baseline, so a test rejects it outright. See
+[SDLC §8.7](sdlc.qmd#87-the-public-api-gate).
+
 **Good first contributions:** add a NONMEM-comparison test for a model we don't
 cover yet, improve a docs page, or fix a reproducible bug with a regression
 test. Small, well-tested PRs are the easiest to merge. Large or experimental

@@ -1,0 +1,18 @@
+[package]
+name = "ferx-tools"
+version = "0.3.0"
+edition = "2021"
+description = "Model-development tooling on top of ferx-core: bootstrap, covariate search, cross-validation"
+license = "MIT"
+authors = ["Ron Keizer", "Teun Post", "Hidde van de Beek"]
+repository = "https://github.com/FeRx-NLME/ferx-core"
+
+[dependencies]
+# `default-features = false` is load-bearing, not tidiness: without it a
+# member-scoped or `--workspace` command resolves `ferx-core` to
+# `(<requested features>, default)` — a DIFFERENT unit from the root steps'
+# `--no-default-features`, so CI recompiles all of `ferx-core` a second time
+# instead of linking the rlib it just built, and `--no-default-features` is
+# silently defeated for `ferx-core` everywhere (harmless only while
+# `default = []`; `survival` is slated to become default-on).
+ferx-core = { path = "../..", version = "0.3.0", default-features = false }

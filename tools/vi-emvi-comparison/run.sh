@@ -71,7 +71,7 @@ Rscript tools/vi-emvi-comparison/emvi-compare.R
 # LTO, whose whole-program link dominates the wall clock for a one-off run like this.
 echo
 echo "=== ferx: FOCEI + VI (diagonal omega, both omega routes; then mixed omega) ==="
-cargo build --profile ci-fast --bin ferx
+cargo build --profile ci-fast -p ferx-cli
 # agq_ref first: it is the arbiter the rest are read against, and it is the cheapest arm.
 MODELS="agq_ref warfarin_cmp vi_adam vi_closed_form"
 # Part 2 (VI_VALIDATION.md 4.9): the mixed-omega arms. FERX_VI_DIAG_ONLY=1 skips them when

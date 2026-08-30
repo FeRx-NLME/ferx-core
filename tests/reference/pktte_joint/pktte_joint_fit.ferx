@@ -5,7 +5,7 @@
 # event on CMT 3), so ferx / NONMEM / nlmixr2 all fit the identical model + data.
 #
 # Run:
-#   cargo run --release --features survival -- \
+#   cargo run --release -p ferx-cli --features ferx-core/survival -- \
 #     tests/reference/pktte_joint/pktte_joint_fit.ferx \
 #     --data tests/reference/pktte_joint/pktte_joint.csv
 

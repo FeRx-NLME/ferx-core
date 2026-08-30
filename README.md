@@ -27,14 +27,14 @@ Additional features:
 ## Quick Start
 
 ```bash
-# Build
-cargo build --release
+# Build (the repo is a cargo workspace; the `ferx` binary lives in `ferx-cli`)
+cargo build --release --workspace
 
 # Fit a model
-cargo run --release --bin ferx -- examples/warfarin.ferx --data data/warfarin.csv
+cargo run --release -p ferx-cli -- examples/warfarin.ferx --data data/warfarin.csv
 
 # Fit with simulated data (uses [simulation] block)
-cargo run --release --bin ferx -- examples/warfarin.ferx --simulate
+cargo run --release -p ferx-cli -- examples/warfarin.ferx --simulate
 ```
 
 Output files: `{model}-fit.yaml` (parameter estimates) and `{model}-sdtab.csv` (per-subject diagnostics).

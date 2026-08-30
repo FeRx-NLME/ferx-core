@@ -22,7 +22,7 @@
 # twin; a model carrying a `lagtime=`/`f=` mapping has no twin and is rejected.
 #
 # Self-contained: run it with no data file
-#   cargo run --release -- examples/one_cpt_ig.ferx --simulate
+#   cargo run --release -p ferx-cli -- examples/one_cpt_ig.ferx --simulate
 # True simulation parameters: TVCL=5, TVV=50, TVMAT=2, TVCV2=0.3,
 #   omega_CL=omega_V=0.09, sigma_prop=0.15.
 

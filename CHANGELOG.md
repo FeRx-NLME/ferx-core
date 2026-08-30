@@ -19,6 +19,28 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Changed
+- **The repo is now a cargo workspace, and the `ferx` binary moved into a `ferx-cli` package
+  (#1114).** The installed binary is unchanged — still `ferx`, same arguments, same output — but
+  building it from a source checkout now needs the workspace or the package named:
+  `cargo build --release --workspace` (or `-p ferx-cli`), and `cargo run --release -p ferx-cli --
+  model.ferx --data data.csv`. A bare `cargo build --release` at the root now builds the
+  `ferx-core` *library* only. Feature flags belong to `ferx-core`, so workspace-wide commands
+  write them package-qualified (`--features ferx-core/ci`). Consumers of the `ferx-core` crate —
+  including the ferx-r wrapper, which patches the repo root — are unaffected: the root package is
+  still `ferx-core`.
+
+### Added
+- **A CI-enforced public-API baseline for `ferx-core` (#1114).** `api/ferx-core-public-api.txt` is
+  a committed snapshot of the crate's public surface; a CI job regenerates and diffs it, so any
+  widening of the API fails until the baseline is updated in the same PR. Regenerate with
+  `tools/update-public-api.sh`. This doubles as semver protection for the crates.io release and
+  for ferx-r. `#[doc(hidden)] pub` is banned, because `cargo public-api` omits such items and the
+  attribute would otherwise be a silent bypass of the gate.
+- **A `ferx-tools` crate (#1114)** — the future home of multi-fit tooling (bootstrap, stepwise
+  covariate modelling, model search, cross-validation). Currently a placeholder; it can only reach
+  `ferx-core` through the same public API the R wrapper uses.
+
 ### Fixed
 - **A steady-state dose with a lagtime is now seeded at the dose record, not equilibrated at the
   arrival (#1121).** Under time-varying covariates an `SS=1` dose carrying an `ALAG` had its

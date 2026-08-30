@@ -27,7 +27,7 @@ Full NONMEM record (control-stream corrections, covariance, diagnostics): `nonme
 (nlmixr2 estimates are on the natural scale: `CL = exp(lcl)`, etc. NONMEM prop. sd = √σ²,
 σ² = 0.00844 → 0.0919.)
 
-‡ ferx FOCEI (`cargo run --release --features survival -- pktte_joint_fit.ferx --data
+‡ ferx FOCEI (`cargo run --release -p ferx-cli --features ferx-core/survival -- pktte_joint_fit.ferx --data
 pktte_joint.csv`): MINIMIZATION SUCCESSFUL, covariance step successful. ferx uses NONMEM's OFV
 convention (drops `N·log(2π)`), so its OFV (624.65) sits next to NONMEM's (626.65), not
 nlmixr2's −2LL — see the OFV note below. SEs/RSEs: CL 2.8%, V 1.2%, KA 2.0%, ω²(CL) 14%; **H0
@@ -88,7 +88,7 @@ honest). Diagnostics: ETABAR p = 0.60, η-shrinkage 4.0%, ε-shrinkage 11.8%.
 Rscript simulate.R                       # -> pktte_joint.csv (deterministic, seed 20260628)
 Rscript nlmixr2.R                        # nlmixr2 FOCEI / BOBYQA
 nmfe76 nonmem.ctl nonmem.lst             # NONMEM (licensed)
-cargo run --release --features survival -- pktte_joint_fit.ferx --data pktte_joint.csv
+cargo run --release -p ferx-cli --features ferx-core/survival -- pktte_joint_fit.ferx --data pktte_joint.csv
 ```
 
 Toolchain notes:

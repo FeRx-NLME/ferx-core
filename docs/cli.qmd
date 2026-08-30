@@ -256,9 +256,10 @@ ferx examples/warfarin.ferx --simulate
 ## Building
 
 ```bash
-# Build the ferx binary
-cargo build --release
+# Build the ferx binary. The repo is a cargo workspace and the root package is
+# the ferx-core library, so the binary's package has to be in scope.
+cargo build --release -p ferx-cli
 
 # Run directly via cargo
-cargo run --release --bin ferx -- model.ferx --data data.csv
+cargo run --release -p ferx-cli -- model.ferx --data data.csv
 ```

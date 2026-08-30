@@ -6,7 +6,7 @@
 # and of any dose-response or response-versus-time regression.
 #
 # Run:
-#   cargo run --release --bin ferx -- examples/emax_timecourse.ferx \
+#   cargo run --release -p ferx-cli -- examples/emax_timecourse.ferx \
 #       --data data/emax_timecourse.csv
 #
 # The dataset carries no AMT column — a compartment-free model has nothing to
