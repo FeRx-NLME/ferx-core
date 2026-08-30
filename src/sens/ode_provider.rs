@@ -271,37 +271,6 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
     if ode.rhs_program.is_none() {
         return false;
     }
-    // #1070: a RHS that reads `TAD` under an estimated lagtime routes to FD on BOTH loops.
-    // `eval_rhs_anchored` computes `tad = t − last_dose_eff` in `f64` and `eval_rhs_g` writes
-    // it into the variable table as a constant, but `last_dose_eff` IS the dose's lagged
-    // arrival (`d.time + lag`) — so `∂TAD/∂lag = −1` never enters the dual chain and the
-    // gradient on the lag axis is silently wrong wherever the trajectory is integrated, not
-    // only at a boundary. Measured against FD of `compute_predictions_with_tv`: 2.8 % at the
-    // first observation growing to 70 % by `t = 8`, while every non-lag axis stays exact to
-    // 1e-8 and the *value* is exact to 1e-16 — a pure gradient defect, which is why nothing
-    // caught it. NONMEM-anchored: FD restores agreement to 3e-4 OFV where the analytic route
-    // is 0.176 off (`nonmem_anchor/tad_lag_*`).
-    //
-    // Deliberately keyed on `TAD` alone and on `has_lagtime()` alone:
-    //   - `TIME`/`TAFD` do not move with the lag (`TAFD` anchors at the unlagged
-    //     `min(d.time)` in both engines) — measured exact, so `uses_time_vars` would
-    //     over-decline. Hence the narrower `uses_dose_anchored_time_vars`.
-    //   - a per-route absorption lag never anchors TAD (`last_dose_eff` is written only in
-    //     the `K_DOSE` arm, from the *compartment* lag), so `has_route_absorption_lag()` is
-    //     correctly absent here.
-    //   - the decline is model-level, not η-conditional: `Dual2` seeds every θ, so a lagtime
-    //     built from θ alone with no IIV still has a wrong outer θ-gradient (measured 70 %).
-    // Conservative in one known direction: a *literal* lagtime carries no jet and is exact
-    // (measured), but `has_lagtime()` cannot see that, so such models take a correct-but-
-    // slower FD route until #1070's real fix (dual `tad`) lands.
-    if model.has_lagtime()
-        && ode
-            .rhs_program
-            .as_ref()
-            .is_some_and(|p| p.uses_dose_anchored_time_vars())
-    {
-        return false;
-    }
     // A `TIME`-built-in structural parameter is served ONLY via the event-driven TV walk
     // (`ode_subject_supported` declines it so it can't take the static superposition path).
     // A `TIME`-built-in model routes to the event-driven walk (`integrate_tvcov_g`), which now
@@ -841,21 +810,6 @@ pub fn ode_iov_supported(model: &CompiledModel) -> bool {
         return false;
     };
     if ode.rhs_program.is_none() {
-        return false;
-    }
-    // #1070: same TAD-under-lagtime decline as `ode_analytical_supported`. Repeated rather
-    // than delegated because this gate is deliberately *parallel* to that one (see the doc
-    // comment above) and never calls it — so a clause added only there would leave the IOV
-    // walk silently wrong. Measured on the IOV walk specifically: with κ on the lagtime,
-    // `∂f/∂κ` is 47 % wrong on the first occasion group and 89 % on the second against FD of
-    // `predict_iov`, while `∂f/∂η_CL` stays exact — and the walk returned `Some`, i.e. it
-    // claimed the model rather than declining it.
-    if model.has_lagtime()
-        && ode
-            .rhs_program
-            .as_ref()
-            .is_some_and(|p| p.uses_dose_anchored_time_vars())
-    {
         return false;
     }
     // M3 BLOQ is analytic on the ODE IOV path (#486, mirroring closed-form #580/#591).
@@ -3368,10 +3322,36 @@ fn run_subject_tvcov_eta<const N: usize>(
     Some(out)
 }
 
+/// The later of two (lagged) arrivals, carrying the winner's **jet** — the dual analogue of
+/// production's `f64::max` fold in `tad_anchor` (`ode/predictions.rs`).
+///
+/// The TAD anchor is `max` over arrivals, and a `max` of two differentiable functions has a
+/// kink where they cross: at an exact tie the derivative is one-sided, and either one-sided
+/// value is a valid subgradient. This keeps the **incumbent** — the dose already processed,
+/// i.e. the earlier one in timeline order — matching what production's `max` returns for the
+/// value (they are equal there) and making the choice deterministic rather than dependent on
+/// float comparison order. Two doses arriving at the identical instant with *different* lag
+/// slots is the only case that can observe it, and the value is the same either way (#1070).
+///
+/// NaN handling mirrors `f64::max`, which *ignores* a NaN operand: a bare
+/// `candidate > incumbent` comparison is false against a NaN incumbent and would keep it,
+/// silently poisoning every later segment. Unreachable today — the incumbent is NaN only for
+/// a dose-free subject, which reaches no `K_DOSE` event — but that is precisely the kind of
+/// invariant that rots, so it is handled here rather than argued about at the call site.
+#[inline]
+fn later_arrival<T: crate::sens::num::PkNum>(incumbent: T, candidate: T) -> T {
+    if incumbent.val().is_nan() || candidate.val() > incumbent.val() {
+        candidate
+    } else {
+        incumbent
+    }
+}
+
 /// Evaluate the ODE RHS at `t` with the time-after-first-dose / time-after-last-dose
-/// anchors lifted as parameter-independent constants — the shared inner of the
-/// static ([`integrate_g`]) and TV-cov ([`integrate_tvcov_g`]) walk RHS closures, so
-/// the anchor-and-evaluate body is written once (#449 review #11). The static walk's
+/// anchors resolved — the shared inner of the static ([`integrate_g`]) and TV-cov
+/// ([`integrate_tvcov_g`]) walk RHS closures, so the anchor-and-evaluate body is
+/// written once (#449 review #11). `TAFD` is a parameter-independent constant;
+/// `TAD` is **not**, and takes its anchor as a dual (#1070 — see below). The static walk's
 /// infusion rate forcing is applied by its caller after this returns (the TV-cov
 /// subset is bolus-only, so it has none).
 #[inline]
@@ -3382,7 +3362,7 @@ fn eval_rhs_anchored<T: crate::sens::num::PkNum>(
     ps: &[T],
     t: f64,
     first_dose_time: f64,
-    last_dose_eff: f64,
+    last_dose_eff: T,
     du: &mut [T],
     vars: &mut Vec<T>,
     stack: &mut Vec<T>,
@@ -3392,16 +3372,33 @@ fn eval_rhs_anchored<T: crate::sens::num::PkNum>(
     } else {
         f64::NAN
     };
-    let tad = if last_dose_eff.is_finite() {
-        t - last_dose_eff
+    // `TAD = t − (lagged arrival)`. The arrival carries the lagtime's jet, so `TAD` is a
+    // *dual*, not a lifted constant: `∂TAD/∂lag = −1`, and dropping it was #1070. `t` is the
+    // integrator clock — a parameter-independent constant — so the whole jet comes from
+    // `last_dose_eff`. `TAFD` anchors at the unlagged first dose *record* in both engines,
+    // so it stays a constant (measured exact, #1070 probe 2a).
+    let tad = if last_dose_eff.val().is_finite() {
+        T::from_f64(t) - last_dose_eff
     } else {
-        f64::NAN
+        T::from_f64(f64::NAN)
     };
     program.eval_rhs_g::<T>(us, ps, t, tafd, tad, du, vars, stack);
 }
 
 /// Exact `J·g` (the time-derivative of the velocity, `ẍ = dẋ/dt`) at a state, **value
-/// only**, with no finite differences: one directional RHS evaluation over `Dual1<1>`
+/// only**, with no finite differences. `anchor` is an `f64` for the same reason: the result is
+/// a `Vec<f64>`, so no jet of it can be read at all — the `δlag²` coefficient is lifted whole.
+///
+/// That is a scope boundary, not a proof of correctness. This returns `J·g` — the **state**
+/// Jacobian contracted with the velocity — but `ẍ = ∂f/∂t + J·f`, and a RHS reading
+/// `TIME`/`TAFD`/`TAD` is non-autonomous, so its explicit time partial is a real missing term
+/// in the `δlag²` coefficient. That is **#1075**, not #1070: it is second-order only, it
+/// pre-dates the dual `tad`, and #1070 improved it (`∂²f/∂η_ALAG²` 6.4e-1 → 2.2e-1 on
+/// `ode_tad_rhs_with_estimated_lagtime_is_analytic_and_exact`'s fixture) without closing it.
+/// Seeding the anchor here with `−1` — so `TAD = t − anchor` carries `+1` on the same `ε`
+/// axis as the state seed, making this return `J·g + ∂f/∂TAD` — recovers part of the gap
+/// (2.2e-1 → 1.5e-1) and not all of it, so it needs #1075's full derivation rather than that
+/// one-line patch. Details of the current computation: one directional RHS evaluation over `Dual1<1>`
 /// whose state seed is `x.val` with tangent `g.val` (so `∂RHS/∂ε|_{x+εg} = J·g`). The
 /// parameters are held constant (we want the state-Jacobian only). Used by the
 /// estimated-lagtime corrections, where `ẍ` enters only through `δlag²` (value 0, zero
@@ -3434,7 +3431,7 @@ fn jdotg_value<T: crate::sens::num::PkNum>(
         params_d1,
         t,
         first_dose_time,
-        anchor,
+        Dual1::constant(anchor),
         &mut out,
         d1_vars,
         d1_stack,
@@ -3688,7 +3685,7 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
             ps,
             t,
             0.0,
-            0.0,
+            T::from_f64(0.0),
             du,
             &mut vars_cell.borrow_mut(),
             &mut stack_cell.borrow_mut(),
@@ -3954,7 +3951,7 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::PkNum>(
             ps,
             t,
             0.0,
-            0.0,
+            T::from_f64(0.0),
             du,
             &mut vars_cell.borrow_mut(),
             &mut stack_cell.borrow_mut(),
@@ -4162,7 +4159,7 @@ fn ss_state_at_phase_g<T: crate::sens::num::PkNum>(
             ps,
             t,
             0.0,
-            0.0,
+            T::from_f64(0.0),
             du,
             &mut vars_cell.borrow_mut(),
             &mut stack_cell.borrow_mut(),
@@ -4325,6 +4322,12 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     };
     // Value-only counterpart of `lag_dual`, for callers that only need `lag.val()`.
     let lag_val = |k: usize| -> f64 { lag_dual(k).val() };
+    // Dose `k`'s (lagged) arrival as a **dual** — the TAD anchor it establishes for every
+    // later segment. `d.time` is a data constant, so the whole jet is the lagtime's, giving
+    // `∂TAD/∂lag = −1` inside `eval_rhs_anchored`. Value-identical to the `K_DOSE` timeline
+    // entry (`d.time + lag_val(k)`), which is what makes it substitutable for `t_event` at a
+    // dose boundary (#1070).
+    let arrival_dual = |k: usize| -> T { T::from_f64(subject.doses[k].time) + lag_dual(k) };
 
     // #530: per-dose modeled rate/duration slot (empty when every dose is fixed). A modeled
     // dose is unresolved in `subject.doses` (`rate`/`duration == 0`), so its effective
@@ -4693,7 +4696,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                              side_params: &[T],
                              side_prep: &[PreparedInputRate<T>],
                              t_ev: f64,
-                             last_dose: f64,
+                             last_dose: T,
                              r_floor: f64,
                              strict: bool|
      -> Vec<T> {
@@ -4850,19 +4853,29 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     // equivalent. Every consumer of `last_dose_eff` gates on `is_finite()` — which is
     // false for `NaN` and for `NEG_INFINITY` alike — so `eval_rhs_anchored` injects
     // `TAD = NaN` either way, both saltation guards take their fallback either way, and
-    // the `max` at an arrival is unreachable without a dose (and returns `t_event` for
-    // both regardless, since `f64::max` ignores `NaN`). A review round flagged this as a
-    // twin-vs-production divergence; it is not one. Writing the same literal as
+    // the fold at an arrival is unreachable without a dose (and `later_arrival` mirrors
+    // `f64::max` in ignoring a NaN incumbent, so it returns the arrival for both
+    // regardless). A review round flagged this as a twin-vs-production divergence; it is
+    // not one. Writing the same literal as
     // production is still worth doing — it means a future reader comparing the two
     // sites does not have to redo this analysis to see they agree.
-    let mut last_dose_eff = subject
-        .doses
-        .iter()
-        .enumerate()
-        .map(|(k, d)| d.time + lag_val(k))
-        .fold(f64::INFINITY, f64::min);
-    if !last_dose_eff.is_finite() {
-        last_dose_eff = f64::NAN;
+    //
+    // #1070: the anchor is a **dual**, not a lifted `f64`. The arrival `d.time + lag`
+    // moves with the lagtime, so `TAD = t − arrival` carries `∂TAD/∂lag = −1`; lifting it
+    // as a constant dropped that term from every `∂f/∂η` of a `TAD`-reading RHS (measured
+    // 66 % on the `η_LAG` axis, 68 % on `TVLAG`). The seed is the *first* arrival, so it
+    // carries the jet of whichever dose arrives first — `d.time` is a data constant and
+    // the whole jet comes from `lag_dual(k)`.
+    let mut last_dose_eff = T::from_f64(f64::NAN);
+    {
+        let mut earliest = f64::INFINITY;
+        for (k, d) in subject.doses.iter().enumerate() {
+            let arrival = d.time + lag_val(k);
+            if arrival < earliest {
+                earliest = arrival;
+                last_dose_eff = T::from_f64(d.time) + lag_dual(k);
+            }
+        }
     }
 
     // Most-recent EVID 3/4 reset time (`NEG_INFINITY` until the first reset). Infusions
@@ -5276,7 +5289,14 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                                         ps,
                                         t,
                                         first_dose_time,
-                                        t_event,
+                                        // Constant, deliberately: an SS dose whose RHS reads
+                                        // `TAD` declines to FD through the broad
+                                        // `uses_time_vars` SS gate, so no `TAD` jet is
+                                        // observable here — and the SS anchor's own wrap
+                                        // convention inside the pre-arrival window is
+                                        // unresolved (#1126). Lifting a jet we cannot
+                                        // validate would be worse than lifting none.
+                                        T::from_f64(t_event),
                                         du,
                                         &mut vars_cell.borrow_mut(),
                                         &mut stack_cell.borrow_mut(),
@@ -5363,24 +5383,25 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                                 // `f64::min` ignores `NaN`: an optimizer excursion into a NaN
                                 // lagtime must degrade, not panic a debug-build fit.
                                 //
-                                // That anchor is deliberately untested: it is observable only
-                                // through a `TAD`-referencing RHS, and #1070 (TAD lifted as an
-                                // f64 constant, dropping `∂TAD/∂lag = −1`) already makes every
-                                // such gradient wrong by 1.5–64% under an estimated lagtime,
-                                // swamping it. It is right by construction — production
-                                // integrates the segment ending here anchored at the most
-                                // recent arrival `≤ cur_t` (`predictions.rs`
-                                // `last_dose_eff_ed`) — and becomes measurable when #1070
-                                // lands.
+                                // That anchor used to be unmeasurable: it is observable only
+                                // through a `TAD`-referencing RHS, and while #1070 lifted
+                                // `TAD` as an f64 constant every such gradient was wrong on
+                                // the lag axis anyway, swamping it. #1070 has landed, so it
+                                // is measured now rather than argued from construction — the
+                                // parity fixtures in this module's tests exercise exactly this
+                                // geometry (a lagged arrival with residual drug present), and
+                                // it agrees with production, which integrates the segment
+                                // ending here anchored at the most recent arrival `≤ cur_t`
+                                // (`predictions.rs` `last_dose_eff_ed`).
                                 debug_assert!(
-                                    last_dose_eff.is_finite() || !t_event.is_finite(),
+                                    last_dose_eff.val().is_finite() || !t_event.is_finite(),
                                     "last_dose_eff is seeded to the first arrival (#1073), so \
                                      it must be finite wherever this arrival is"
                                 );
-                                let pre_anchor = if last_dose_eff.is_finite() {
+                                let pre_anchor = if last_dose_eff.val().is_finite() {
                                     last_dose_eff
                                 } else {
-                                    t_event
+                                    T::from_f64(t_event)
                                 };
                                 // Pre side of the rate-on boundary: the field of the
                                 // segment ENDING at the arrival, which since #1073 is the
@@ -5403,7 +5424,10 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                                     post_params,
                                     &prep_post,
                                     t_event,
-                                    t_event,
+                                    // Post side of the arrival: THIS dose becomes the TAD anchor, and it moves
+                                    // with its own lagtime — the same dual the segment it opens integrates
+                                    // under. Value-identical to `t_event` (#1070).
+                                    arrival_dual(idx),
                                     reset_floor,
                                     true,
                                 );
@@ -5420,7 +5444,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                                     dlag,
                                     t_event,
                                     first_dose_time,
-                                    pre_anchor,
+                                    pre_anchor.val(),
                                     t_event,
                                     &mut d1_vars,
                                     &mut d1_stack,
@@ -5479,14 +5503,14 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                         // `TAD = NaN` into `g_minus` for a `TAD`-referencing RHS (#472
                         // review #3).
                         debug_assert!(
-                            last_dose_eff.is_finite() || !t_event.is_finite(),
+                            last_dose_eff.val().is_finite() || !t_event.is_finite(),
                             "last_dose_eff is seeded to the first arrival (#1073), so it \
                              must be finite wherever this arrival is"
                         );
-                        let pre_anchor = if last_dose_eff.is_finite() {
+                        let pre_anchor = if last_dose_eff.val().is_finite() {
                             last_dose_eff
                         } else {
-                            t_event
+                            T::from_f64(t_event)
                         };
                         // `x⁻` = the pre-bolus running state. For a plain dose this is the
                         // continuing residual trajectory, and `g(x⁻)` is its own velocity —
@@ -5553,7 +5577,10 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                             post_params,
                             post_prep,
                             t_event,
-                            t_event,
+                            // Post side of the arrival: THIS dose becomes the TAD anchor, and it moves
+                            // with its own lagtime — the same dual the segment it opens integrates
+                            // under. Value-identical to `t_event` (#1070).
+                            arrival_dual(idx),
                             reset_floor,
                             true,
                         );
@@ -5583,7 +5610,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                             &pre_d1,
                             t_event,
                             first_dose_time,
-                            pre_anchor,
+                            pre_anchor.val(),
                             &mut d1_vars,
                             &mut d1_stack,
                         );
@@ -5626,7 +5653,17 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             }
             // This dose now anchors TAD for every later segment, at its lagged arrival
             // `d.time + lag_val(idx)` (= `t_event` for a dose), matching production.
-            last_dose_eff = last_dose_eff.max(t_event);
+            // `arrival_dual` is substituted for `t_event` at this boundary's post-side
+            // velocities too, which is only sound because the two agree on the value. Every
+            // `K_DOSE` timeline entry is built as `d.time + lag_val(k)` (an SS dose's extra
+            // break is a separate `K_SS_SEED` at the raw record time), so this holds by
+            // construction — pinned rather than assumed.
+            debug_assert_eq!(
+                arrival_dual(idx).val(),
+                t_event,
+                "the dual arrival must equal the K_DOSE timeline entry it replaces"
+            );
+            last_dose_eff = later_arrival(last_dose_eff, arrival_dual(idx));
             // The arrival is NOT a record: it must not become `last_params` (#1073). Its
             // dose row already did, at the `K_DOSE_REC` branch below.
         } else if kind == K_ROUTE_ONSET {
@@ -5694,8 +5731,12 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                 // (lagged) arrival (`last_dose_eff`), so a TAD-referencing RHS Jacobian sees the
                 // same `TAD` it uses throughout the segment ending here. Fall back to `t_event`
                 // before any dose has anchored TAD (mirrors the `K_DOSE` bolus-saltation guard).
-                let anchor = if last_dose_eff.is_finite() {
-                    last_dose_eff
+                // Value only: `inject_rate_saltation` uses this anchor solely for
+                // `jdotg_value`, whose `Vec<f64>` result is lifted whole into the `δlag²`
+                // coefficient, so no jet of it can be read (#1070). See `jdotg_value` for why
+                // that coefficient is nonetheless incomplete for a non-autonomous RHS (#1075).
+                let anchor = if last_dose_eff.val().is_finite() {
+                    last_dose_eff.val()
                 } else {
                     t_event
                 };
@@ -5829,7 +5870,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                         pre_params,
                         t_event,
                         first_dose_time,
-                        last_dose_eff,
+                        last_dose_eff.val(),
                         &mut d1_vars,
                         &mut d1_stack,
                     );
@@ -5868,8 +5909,8 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                         t_event,
                         first_dose_time,
                         // No dose lands here, so both segments share the TAD anchor.
-                        last_dose_eff,
-                        last_dose_eff,
+                        last_dose_eff.val(),
+                        last_dose_eff.val(),
                         &mut d1_vars,
                         &mut d1_stack,
                     );
@@ -5972,7 +6013,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                                 pre_params,
                                 t_event,
                                 first_dose_time,
-                                last_dose_eff,
+                                last_dose_eff.val(),
                                 &mut d1_vars,
                                 &mut d1_stack,
                             );
@@ -6016,8 +6057,8 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                             t_event,
                             first_dose_time,
                             // No dose lands here, so both segments share the TAD anchor.
-                            last_dose_eff,
-                            last_dose_eff,
+                            last_dose_eff.val(),
+                            last_dose_eff.val(),
                             &mut d1_vars,
                             &mut d1_stack,
                         );
@@ -6378,7 +6419,10 @@ fn integrate_g<T: crate::sens::num::PkNum>(
                 ps,
                 t,
                 first_dose_time,
-                last_dose_eff,
+                // Zero jet by construction: the static walk folds the *unlagged* dose
+                // times and `ode_subject_supported` declines an estimated lagtime
+                // outright, so #1070's `∂TAD/∂lag` term is absent here, not dropped.
+                T::from_f64(last_dose_eff),
                 du,
                 &mut vars_cell.borrow_mut(),
                 &mut stack_cell.borrow_mut(),

@@ -3,25 +3,34 @@
 //!
 //! ## What is being anchored
 //!
-//! `eval_rhs_anchored` computes `tad = t − last_dose_eff` in `f64` and `eval_rhs_g`
-//! writes it into the RHS variable table as a constant. But `last_dose_eff` **is**
-//! the dose's lagged arrival (`d.time + lag`), so `∂TAD/∂lag = −1` never enters the
-//! dual chain: the analytic η/θ gradient on the lag axis is wrong everywhere the
-//! trajectory is integrated, not merely at an event boundary. The *value* stays
-//! exact, which is why no prediction test ever caught it.
+//! `eval_rhs_anchored` used to compute `tad = t − last_dose_eff` in `f64`, and
+//! `eval_rhs_g` wrote it into the RHS variable table as a constant. But
+//! `last_dose_eff` **is** the dose's lagged arrival (`d.time + lag`), so
+//! `∂TAD/∂lag = −1` never entered the dual chain: the analytic η/θ gradient on the
+//! lag axis was wrong everywhere the trajectory is integrated, not merely at an
+//! event boundary. The *value* stayed exact, which is why no prediction test ever
+//! caught it. `tad` is now threaded as a dual, so the term is carried.
 //!
 //! Since FOCEI builds its `h` matrix from that same analytic `∂f/∂η`
-//! (`inner_optimizer.rs`), the error lands in the **reported OFV** — so it is
-//! NONMEM-anchorable, and that is what these tests do. #1070's interim fix routes
-//! the cell to FD; these anchors are the acceptance criterion for that routing.
+//! (`inner_optimizer.rs`), the error landed in the **reported OFV** — so it is
+//! NONMEM-anchorable, and that is what these tests do. They were first committed as
+//! the acceptance criterion for #1070's interim FD routing; they are now the
+//! acceptance criterion for the analytic route itself, which is the stronger claim
+//! (FD was only ever *avoiding* the wrong chain — this asserts the chain is right).
 //!
-//! Measured on `tad_lag_A` at the shared parameter point:
+//! Measured at the shared parameter point:
 //!
-//! | route | OFV | Δ vs NONMEM |
-//! |---|---|---|
-//! | NONMEM | −271.990 | — |
-//! | ferx, analytic gradient (pre-fix) | −272.1658 | 0.176 |
-//! | ferx, FD gradient (post-fix) | −271.9897 | **0.0003** |
+//! | route | `tad_lag_A` | Δ | `tad_lag_B` | Δ |
+//! |---|---|---|---|---|
+//! | NONMEM | −271.990 | — | −169.317 | — |
+//! | ferx analytic, `tad` lifted as `f64` | −272.1658 | 0.176 | −169.4240 | 0.107 |
+//! | ferx FD (the interim #1070 route) | −271.9897 | 0.0003 | −169.3480 | 0.032 |
+//! | **ferx analytic, `tad` threaded as a dual** | **−271.99037** | **0.0004** | **−169.34856** | **0.032** |
+//!
+//! The analytic route now reproduces the FD route to the digits printed here, which
+//! is the point: the two independent gradient paths agree, and both agree with
+//! NONMEM. The residual 0.032 on `B` belongs to the NONMEM control stream (see the
+//! `MTIME` discussion below), not to either ferx route.
 //!
 //! ## Why `WT` is in the data with a FIXED-zero exponent
 //!
@@ -114,7 +123,12 @@ const MODEL: &str = r"
 ";
 
 fn run_anchor(data: &str, nonmem_ofv: f64) {
-    const OFV_TOLERANCE: f64 = 0.5;
+    // Tight enough to reject the pre-#1070 analytic route, which was 0.176 OFV off on
+    // anchor A and 0.107 off on anchor B. The residual 0.032 on B is the NONMEM control
+    // stream's own MTIME construction, not ferx: against an independent stdlib-RK4
+    // reference ferx matches to 8.5e-6 while the control stream's table print resolves to
+    // 3.3e-5 (see the module docs above). Anchor A carries no MTIME and agrees to 3.7e-4.
+    const OFV_TOLERANCE: f64 = 0.06;
 
     let model = parse_full_model(MODEL)
         .expect("TAD + lagtime model must parse")
@@ -141,12 +155,16 @@ fn run_anchor(data: &str, nonmem_ofv: f64) {
     // The gate must actually be what produced this number. Without this the test
     // would still pass if the analytic route were restored and happened to land
     // inside the tolerance on some future dataset.
+    // The analytic route must actually be what produced this number. Without this the
+    // test would still pass if the dual `tad` were reverted and the model fell back to
+    // finite differences — FD is also right here, so only the reported route separates
+    // "the analytic chain carries the lagtime term" from "something quietly stopped
+    // claiming the model" (#1070).
     assert!(
-        {
-            let m = res.gradient_method_inner.to_lowercase();
-            m.contains("fd") || m.contains("finite")
-        },
-        "#1070: a TAD-reading RHS under an estimated lagtime must route to FD, \
+        res.gradient_method_inner
+            .to_lowercase()
+            .contains("analytic"),
+        "#1070: a TAD-reading RHS under an estimated lagtime must be served analytically, \
          but the inner gradient reports `{}`",
         res.gradient_method_inner
     );
