@@ -766,7 +766,7 @@ mod tests {
     #[test]
     fn digamma_known_values() {
         // ψ(1) = −γ, ψ(2) = 1 − γ, ψ(½) = −γ − 2 ln 2.
-        let gamma = 0.577_215_664_901_532_9; // Euler–Mascheroni
+        let gamma = std::f64::consts::EULER_GAMMA;
         let ln2 = std::f64::consts::LN_2;
         assert_relative_eq!(digamma(1.0), -gamma, max_relative = 1e-10);
         assert_relative_eq!(digamma(2.0), 1.0 - gamma, max_relative = 1e-10);
