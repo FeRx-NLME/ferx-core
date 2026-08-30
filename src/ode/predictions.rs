@@ -1634,9 +1634,24 @@ fn clamp_negative_predictions(readout: &OdeReadout, predictions: &mut [f64]) {
 
 /// TAD anchor for `ext_params[MAX_PK_PARAMS + 1]`: the last effective dose time at
 /// or before `t_start`, SS-aware (`rem_euclid` wraps the elapsed time back into
-/// `[0, II)` so TAD stays within one dosing interval). Returns NaN when no
-/// effective prior dose exists, so the ODE RHS injects NaN for TAD (matching the
-/// sdtab convention) rather than `+∞`.
+/// `[0, II)` so TAD stays within one dosing interval).
+///
+/// Before any dose has arrived — the window a lagged first dose opens — it falls
+/// back to the subject's **earliest lagged arrival**, exactly as the event-driven
+/// walk does (`ode_predictions_event_driven`'s `first_arrival_ed`). The two
+/// production ODE predictors are selected per subject on `has_resets()`, so a
+/// divergence here would make two subjects of the same model and the same data
+/// shape behave differently: one finite, its neighbour NaN — and a NaN anchor
+/// multiplies into the state (`0.0 * NaN`) and poisons every prediction of an
+/// `[odes]` RHS reading `TAD`, turning a finite fit into the 1e20 sentinel.
+///
+/// One value per subject, so — unlike anchoring at `t_start` — it cannot make the
+/// answer depend on where records happen to fall. What `TAD` *means* before a dose
+/// has arrived is #1110's to settle; this only guarantees it is finite and
+/// mesh-independent, and identical across both predictors, meanwhile.
+///
+/// Returns NaN only for a **dose-free** subject, where `TAD` has no referent at all
+/// (the pre-existing answer, and the sdtab convention, for that case).
 #[inline]
 fn tad_anchor(subject: &Subject, dose_lagtimes: &[f64], t_start: f64) -> f64 {
     let last_dose_eff = subject
@@ -1655,7 +1670,19 @@ fn tad_anchor(subject: &Subject, dose_lagtimes: &[f64], t_start: f64) -> f64 {
         })
         .fold(f64::NEG_INFINITY, f64::max);
     if last_dose_eff.is_finite() {
-        last_dose_eff
+        return last_dose_eff;
+    }
+    // No dose has arrived yet. `fold` over an empty dose list leaves `+∞`, which is
+    // the dose-free case and must read NaN rather than propagate as an infinite
+    // anchor.
+    let first_arrival = subject
+        .doses
+        .iter()
+        .enumerate()
+        .map(|(i, d)| d.time + dose_lagtimes[i])
+        .fold(f64::INFINITY, f64::min);
+    if first_arrival.is_finite() {
+        first_arrival
     } else {
         f64::NAN
     }
@@ -2660,6 +2687,172 @@ fn segment_pk_at(
     last_pk
 }
 
+/// The records that can govern a segment on the per-event (time-varying) adaptive
+/// walk: dose rows, EVID=2 pk-only rows, and observations, indexed by time bits and
+/// listed in one sorted `times` vector for the lookahead.
+///
+/// Empty on the constant-covariate path, where every segment reads the same frozen
+/// snapshot and the resolution is a no-op.
+/// Which per-event vector a resolved record indexes into.
+#[derive(Clone, Copy)]
+enum AdaptiveRecord {
+    Dose(usize),
+    PkOnly(usize),
+    Obs(usize),
+}
+
+#[derive(Default)]
+struct AdaptiveRecordIndex {
+    /// Every record time, sorted ascending and deduped — the lookahead's search space.
+    times: Vec<f64>,
+    /// Time bits -> index into `event_pk.dose` (base doses only; a controller-injected
+    /// dose is not a data record and supplies no parameters).
+    dose: HashMap<u64, usize>,
+    /// Time bits -> index into `event_pk.pk_only`.
+    pk_only: HashMap<u64, usize>,
+    /// Time bits -> first index into `event_pk.obs` at that instant.
+    obs: HashMap<u64, usize>,
+}
+
+impl AdaptiveRecordIndex {
+    /// Build from the driver's record grid. `dose_times` is the **base** regimen only.
+    fn new(dose_times: &[f64], pk_only_times: &[f64], obs_times: &[f64]) -> Self {
+        let mut idx = AdaptiveRecordIndex::default();
+        for (k, &t) in dose_times.iter().enumerate() {
+            idx.dose.entry(t.to_bits()).or_insert(k);
+            idx.times.push(t);
+        }
+        for (m, &t) in pk_only_times.iter().enumerate() {
+            idx.pk_only.entry(t.to_bits()).or_insert(m);
+            idx.times.push(t);
+        }
+        for (j, &t) in obs_times.iter().enumerate() {
+            idx.obs.entry(t.to_bits()).or_insert(j);
+            idx.times.push(t);
+        }
+        idx.times
+            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        idx.times.dedup_by(|a, b| a.to_bits() == b.to_bits());
+        idx
+    }
+
+    /// The record that GOVERNS the segment ending at `t_end` (#1073): `t_end` itself
+    /// when a record sits there, otherwise the **next record ahead** — a boundary that
+    /// is not a data record (a lagged dose arrival, an infusion end, a zero-order
+    /// cutoff, a per-route onset, a decision break) supplies no parameters and merely
+    /// subdivides the interval that record terminates.
+    ///
+    /// `None` past the final record: nothing ahead terminates the segment, so the
+    /// caller keeps the last record that ran — the trailing rule the static engines
+    /// share through [`crate::dosing::governing_record_indices`].
+    ///
+    /// The record sitting **exactly** at `t`, if any, as an index into the matching
+    /// `event_pk` vector. `None` at a break that is not a record — a dose arrival, an
+    /// infusion end, a zero-order cutoff, a decision, a reset.
+    ///
+    /// Production's tie-break order at a shared instant is `DoseRecord < PkOnly < Obs`
+    /// (`ode_predictions_event_driven`'s `kind_order`), and the segment arriving there
+    /// terminates at the first of them.
+    fn at(&self, t: f64) -> Option<AdaptiveRecord> {
+        let bits = t.to_bits();
+        if let Some(&k) = self.dose.get(&bits) {
+            return Some(AdaptiveRecord::Dose(k));
+        }
+        if let Some(&m) = self.pk_only.get(&bits) {
+            return Some(AdaptiveRecord::PkOnly(m));
+        }
+        self.obs.get(&bits).copied().map(AdaptiveRecord::Obs)
+    }
+
+    /// Observation, EVID=2 and decision times are bit-identical to their break times —
+    /// the `#700` survival guard fails loudly otherwise — so the search needs no
+    /// tolerance.
+    ///
+    /// Base **dose** rows are deliberately not added to that guard, because their
+    /// commonest collision is legitimate: a dose row co-timed with an observation. The
+    /// reader nudges such an observation one ULP earlier to carry file order, and
+    /// `break_times`' 1e-15 dedup then merges the pair onto the observation. The
+    /// segment ending at that break resolves to the observation here — which is exactly
+    /// what production does, since its timeline has the same `Obs`-then-`DoseRecord`
+    /// order and the interval between them integrates nothing. A guard would reject
+    /// ordinary datasets to protect a sub-ULP case that is already correct.
+    fn governing(&self, t_end: f64) -> Option<f64> {
+        self.times
+            .get(self.times.partition_point(|&r| r < t_end))
+            .copied()
+    }
+}
+
+/// PK governing the segment ENDING at `t_end` on the per-event adaptive walk (#1073).
+///
+/// **An EVID=3/4 reset needs no special case here**, unlike the `Kind::Reset => last_pk`
+/// arm every other engine carries. Two independent reasons, and it is worth writing them
+/// down because the asymmetry looks like an omission:
+///
+///   * The segment ending at a reset is **discarded** — the reset zeros the state at the
+///     next break, before any readout — so whichever record governs it cannot reach a
+///     prediction. (`ode_predictions_event_driven` skips the propagation outright for
+///     exactly this reason; the explicit arm there is documentation, not arithmetic.)
+///   * A reset does not disturb the LOCF carry, because the caller advances `last_pk`
+///     from `records.at(t_end)` — an actual record — rather than from this function's
+///     result. That is the property that *would* have leaked, and it is pinned there.
+///
+/// NONMEM does run `$PK` at an EVID=3/4 row, so ferx's treatment of a reset as a
+/// non-parameter-source is a latent divergence of the same family as #1073 — deliberately
+/// left alone rather than half-fixed here, and tracked separately.
+///
+/// This is the reactive twin of the static engines' end-of-interval resolution, and it
+/// is what makes the **degenerate oracle** hold: a controller re-emitting a fixed
+/// regimen must equal `simulate()` on that regimen, and `simulate()` routes to
+/// `ode_predictions_event_driven`, which governs each segment by the record that
+/// terminates it. Carrying the previous record forward here instead was measured at
+/// **11 %** on an infusion window ending between two records under a changing
+/// covariate.
+///
+/// Note this is *not* [`segment_pk_at`]: that one answers "the PK **at** this instant"
+/// for a decision-time readout and an injected dose's F, where the LOCF carry-forward
+/// is the causally correct answer — a controller cannot read a covariate that has not
+/// been recorded yet.
+fn governing_segment_pk_at(
+    t_end: f64,
+    records: &AdaptiveRecordIndex,
+    event_pk: &crate::pk::EventPkParams,
+    last_pk: PkParams,
+) -> PkParams {
+    let Some(t) = records.governing(t_end) else {
+        return last_pk;
+    };
+    match records.at(t) {
+        Some(AdaptiveRecord::Dose(k)) => event_pk.dose[k],
+        Some(AdaptiveRecord::PkOnly(m)) => event_pk.pk_only[m],
+        Some(AdaptiveRecord::Obs(j)) => event_pk.obs[j],
+        // `governing` only ever returns a time drawn from the record grid, so this is
+        // unreachable; `last_pk` keeps it a carry rather than a panic.
+        None => last_pk,
+    }
+}
+
+/// Occasion twin of [`governing_segment_pk_at`] (#701): the same record, so the eta
+/// threaded into the segment carries the same occasion's κ as its PK snapshot.
+fn governing_segment_occ_at(
+    t_end: f64,
+    records: &AdaptiveRecordIndex,
+    dose_occ: &[Option<usize>],
+    pk_only_occ: &[Option<usize>],
+    obs_occ: &[Option<usize>],
+    last_occ: Option<usize>,
+) -> Option<usize> {
+    let Some(t) = records.governing(t_end) else {
+        return last_occ;
+    };
+    match records.at(t) {
+        Some(AdaptiveRecord::Dose(k)) => dose_occ.get(k).copied().flatten(),
+        Some(AdaptiveRecord::PkOnly(m)) => pk_only_occ.get(m).copied().flatten(),
+        Some(AdaptiveRecord::Obs(j)) => obs_occ.get(j).copied().flatten(),
+        None => last_occ,
+    }
+}
+
 /// PK snapshot to seed the per-event (time-varying) adaptive walk from: the
 /// earliest obs / pk-only record's snapshot, mirroring
 /// [`ode_predictions_event_driven`]'s init so a covariate-dependent
@@ -3126,6 +3319,28 @@ pub(crate) fn ode_predictions_adaptive_impl(
         (Vec::new(), Vec::new())
     };
 
+    // #1073: the records that can govern a segment on this walk — base dose rows,
+    // EVID=2 pk-only rows and observations — plus a sorted time list for the lookahead.
+    // Empty on the constant path, where the resolution is a no-op.
+    let records = if tv {
+        let base_dose_times: Vec<f64> = shadow.doses.iter().take(n_base).map(|d| d.time).collect();
+        AdaptiveRecordIndex::new(&base_dose_times, &subject.pk_only_times, &shadow.obs_times)
+    } else {
+        AdaptiveRecordIndex::default()
+    };
+    // Per-base-dose occasion (#701), the dose-row twin of `obs_occ` / `pk_only_occ`, so
+    // a segment governed by a dose row threads that row's κ. Empty on the non-IOV path.
+    let dose_occ: Vec<Option<usize>> = if iov {
+        shadow
+            .doses
+            .iter()
+            .take(n_base)
+            .map(|d| crate::pk::occasion_of(decision_times, d.time))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     // Decision time -> 0-based index, for the in-loop hook.
     let mut decision_index_of: HashMap<u64, usize> = HashMap::new();
     for (i, &t) in decision_times.iter().enumerate() {
@@ -3193,6 +3408,19 @@ pub(crate) fn ode_predictions_adaptive_impl(
             &base_f_bio,
             pk_params_flat,
         );
+        // #1073: a base dose's own **record** is a parameter source — NONMEM runs `$PK`
+        // at the dose row and ADVANs to it — so the segment ending there must end there.
+        // `collect_dose_break_times` emits only the lag-shifted *arrival* (plus the SS
+        // record-time seed), which coincides with the row exactly when `ALAG = 0`; under
+        // a lagtime the row needs its own break. Gated on `tv` because only there can two
+        // records carry different parameters: on the constant path every snapshot is
+        // `pk_params_flat`, so an extra break would change the segmentation without
+        // changing the answer, and the byte-identical constant-path canaries would move
+        // for nothing. The replay (`adaptive_frozen_replay_tv`) already breaks at every
+        // `d.time`.
+        if tv {
+            break_times.extend(shadow.doses.iter().take(n_base).map(|d| d.time));
+        }
     }
     break_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
@@ -3712,26 +3940,27 @@ pub(crate) fn ode_predictions_adaptive_impl(
         if k + 1 < break_times.len() {
             let t_end = break_times[k + 1];
 
-            // PK governing the segment `(t_start, t_end]`: the record at `t_end`
-            // (NONMEM end-of-interval convention) or the LOCF carry-forward on the TV
-            // path (#700), the frozen snapshot otherwise. On the TV path it is written
+            // PK governing the segment `(t_start, t_end]`: the record that TERMINATES
+            // it (NONMEM end-of-interval convention) — `t_end` itself when a record sits
+            // there, else the next record ahead (#1073) — on the TV path (#700), the
+            // frozen snapshot otherwise. On the TV path it is written
             // into `ext_params`'s PK slots (leaving the TAFD/TAD anchors intact) for
             // the ODE RHS and passed through as the readout PK for any observation
             // `integrate_segment` records internally.
             let seg_pk = match event_pk {
-                Some(ev) => segment_pk_at(t_end, &obs_map, &pk_only_map, ev, last_pk),
+                Some(ev) => governing_segment_pk_at(t_end, &records, ev, last_pk),
                 None => PkParams::default(),
             };
             // Occasion governing this segment (#701) — the twin of `seg_pk`'s
-            // end-of-interval / LOCF resolution, so the eta threaded into
-            // `integrate_segment` carries the same occasion's κ as `seg_pk`.
+            // end-of-interval resolution, so the eta threaded into `integrate_segment`
+            // carries the same occasion's κ as `seg_pk`.
             let seg_occ = if iov {
-                segment_occ_at(
+                governing_segment_occ_at(
                     t_end,
-                    &obs_map,
-                    &obs_occ,
-                    &pk_only_map,
+                    &records,
+                    &dose_occ,
                     &pk_only_occ,
+                    &obs_occ,
                     last_occ,
                 )
             } else {
@@ -3772,14 +4001,28 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 &[],
             );
 
-            // Advance the LOCF carry: after integrating into `t_end`, the record
-            // there (if any) is the most-recent PK. `segment_pk_at` returns `last_pk`
-            // unchanged for a non-record break, so this is a no-op in that case.
-            // `last_occ` advances in lockstep (#701) so the next non-record segment
-            // reads this occasion's κ.
+            // Advance the LOCF carry: after integrating into `t_end`, the record there
+            // — **if `t_end` is one** — is the most-recent PK. `last_occ` advances in
+            // lockstep (#701) so the next non-record segment reads this occasion's κ.
+            //
+            // It must be `records.at(t_end)`, NOT `seg_pk`. Since #1073 the segment
+            // resolution looks FORWARD at a non-record break, so assigning `seg_pk`
+            // here would move the carry onto a record the walk has not reached yet —
+            // and `readout_pk`, which is deliberately LOCF precisely so a controller
+            // cannot read a covariate that has not been recorded, would then read the
+            // future. It is also what keeps a break that is not a parameter source (a
+            // dose arrival, an infusion end, a zero-order cutoff, a decision, an
+            // EVID=3/4 reset) from disturbing the carry at all — matching every other
+            // engine, where only a record updates `last_pk` / `last_params`.
             if tv {
-                last_pk = seg_pk;
-                last_occ = seg_occ;
+                if let (Some(rec), Some(ev)) = (records.at(t_end), event_pk) {
+                    last_pk = match rec {
+                        AdaptiveRecord::Dose(k) => ev.dose[k],
+                        AdaptiveRecord::PkOnly(m) => ev.pk_only[m],
+                        AdaptiveRecord::Obs(j) => ev.obs[j],
+                    };
+                    last_occ = seg_occ;
+                }
             }
         }
 
@@ -4013,6 +4256,24 @@ fn adaptive_frozen_replay_tv(
     } else {
         (Vec::new(), Vec::new())
     };
+    // #1073: the records that can govern a segment, mirroring the driver's index.
+    // `event_pk.dose` covers the **base** regimen only — `subject.doses` here is the
+    // base doses followed by the ledger's controller doses, and a controller dose is
+    // not a data record, so it supplies no parameters. `break_times` above already
+    // breaks at every `d.time`, so every dose row is reachable as a segment end.
+    let n_base = event_pk.dose.len().min(subject.doses.len());
+    let base_dose_times: Vec<f64> = subject.doses.iter().take(n_base).map(|d| d.time).collect();
+    let records =
+        AdaptiveRecordIndex::new(&base_dose_times, &subject.pk_only_times, &subject.obs_times);
+    let dose_occ: Vec<Option<usize>> = if iov {
+        base_dose_times
+            .iter()
+            .map(|&t| crate::pk::occasion_of(extra_breaks, t))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let mut decision_index_of: HashMap<u64, usize> = HashMap::new();
     if iov {
         for (i, &t) in extra_breaks.iter().enumerate() {
@@ -4155,18 +4416,20 @@ fn adaptive_frozen_replay_tv(
         // no successor — its dose + observation were applied above.
         if k + 1 < break_times.len() {
             let t_end = break_times[k + 1];
-            // Segment PK = record at t_end (NONMEM end-of-interval) or LOCF carry —
-            // the identical `segment_pk_at` the driver used.
-            let seg_pk = segment_pk_at(t_end, &obs_map, &pk_only_map, event_pk, last_pk);
+            // Segment PK = the record that TERMINATES `(t_start, t_end]` — itself when
+            // a record sits at `t_end`, else the next record ahead (#1073) — via the
+            // identical `governing_segment_pk_at` the driver used, so the two stay
+            // bit-aligned.
+            let seg_pk = governing_segment_pk_at(t_end, &records, event_pk, last_pk);
             // Occasion twin of `seg_pk` (#701), so the threaded eta carries the same
-            // occasion's κ — the identical `segment_occ_at` the driver used.
+            // occasion's κ — the identical resolution the driver used.
             let seg_occ = if iov {
-                segment_occ_at(
+                governing_segment_occ_at(
                     t_end,
-                    &obs_map,
-                    &obs_occ,
-                    &pk_only_map,
+                    &records,
+                    &dose_occ,
                     &pk_only_occ,
+                    &obs_occ,
                     last_occ,
                 )
             } else {
@@ -4195,8 +4458,19 @@ fn adaptive_frozen_replay_tv(
                 &[],
             );
 
-            last_pk = seg_pk;
-            last_occ = seg_occ;
+            // Advance the LOCF carry only at an actual record — the identical rule the
+            // driver uses, and for the identical reason: since #1073 `seg_pk` looks
+            // FORWARD at a non-record break, so carrying it would move `last_pk` onto a
+            // record this walk has not reached. The two must agree here or the replay
+            // stops being bit-aligned with the run it is verifying.
+            if let Some(rec) = records.at(t_end) {
+                last_pk = match rec {
+                    AdaptiveRecord::Dose(k) => event_pk.dose[k],
+                    AdaptiveRecord::PkOnly(m) => event_pk.pk_only[m],
+                    AdaptiveRecord::Obs(j) => event_pk.obs[j],
+                };
+                last_occ = seg_occ;
+            }
         }
     }
 
@@ -4463,15 +4737,27 @@ pub fn ode_predictions_event_driven(
     }
 
     // Build merged event timeline. Tie-break at the same time:
-    //   dose < pk-only < obs < infusion-end
+    //   dose-record < dose-arrival < pk-only < obs < infusion-end
     // — matches the analytical event-driven path for dose/pk-only/obs.
     // Infusion-end sorts last so an obs at the same time as the end of
     // an infusion is recorded with the infusion still contributing
     // (state is continuous; the ordering only affects which segments
     // include the rate in their active set on the next iteration).
+    //
+    // `DoseRecord` and `Dose` are the two halves of one dose (#1073): the NONMEM
+    // *record* sits at `d.time` and is where `$PK` runs, while the state jump
+    // happens at the lagged arrival `d.time + ALAG`. With no lagtime they
+    // coincide and `DoseRecord` sorts first, so the parameters are in force
+    // before the dose lands — bit-identical to the single-event form this
+    // replaced. `Dose` keeps its rank ahead of `Obs` so an observation landing
+    // exactly on an arrival still reads the post-dose state.
+    // No `PartialEq`/`Eq`: every classification goes through `is_record` (or a
+    // `matches!`), so there is no `==` that could bypass the predicate and drift
+    // from it when a variant is added.
     #[derive(Clone, Copy)]
     enum Kind {
         Reset,
+        DoseRecord,
         Dose,
         PkOnly,
         Obs,
@@ -4482,15 +4768,27 @@ pub fn ode_predictions_event_driven(
             // Reset sorts first so EVID=4 (reset + dose) zeros the state
             // before its own dose lands at the same time.
             Kind::Reset => 0,
-            Kind::Dose => 1,
-            Kind::PkOnly => 2,
-            Kind::Obs => 3,
-            Kind::InfusionEnd => 4,
+            Kind::DoseRecord => 1,
+            Kind::Dose => 2,
+            Kind::PkOnly => 3,
+            Kind::Obs => 4,
+            Kind::InfusionEnd => 5,
         }
+    }
+    /// Whether a timeline entry is a NONMEM **data record** — an event `$PK` runs
+    /// at, and therefore a source of segment parameters (#1073).
+    ///
+    /// A lagged dose *arrival* is not one (its `DoseRecord` at `d.time` is), and
+    /// neither is an infusion end, a zero-order cutoff, or a per-route onset.
+    /// `Reset` is excluded to preserve its existing `last_pk` treatment; NONMEM
+    /// does run `$PK` at an EVID=3/4 row, so that is a latent divergence of the
+    /// same family, tracked separately rather than half-fixed here.
+    fn is_record(k: Kind) -> bool {
+        matches!(k, Kind::DoseRecord | Kind::PkOnly | Kind::Obs)
     }
     let n_infusion_ends = subject.doses.iter().filter(|d| is_real_infusion(d)).count();
     let mut timeline: Vec<(f64, Kind, usize)> = Vec::with_capacity(
-        subject.doses.len()
+        2 * subject.doses.len()
             + n_obs
             + subject.pk_only_times.len()
             + subject.reset_times.len()
@@ -4515,8 +4813,30 @@ pub fn ode_predictions_event_driven(
         .zip(pk_at_dose.iter())
         .map(|(d, p)| ode.dose_attr_map.f_bio(d.cmt_raw(), &p.values))
         .collect();
+    // Earliest lagged arrival in the subject — the TAD anchor for any segment that
+    // runs before ANY dose has arrived. One value per subject, so it cannot depend on
+    // where records happen to fall; see the fallback's own note below for why that
+    // matters. `None` for a dose-free subject, where TAD has no referent at all.
+    let first_arrival_ed: Option<f64> = subject
+        .doses
+        .iter()
+        .enumerate()
+        .map(|(k, d)| d.time + dose_lagtimes[k])
+        .fold(None, |acc: Option<f64>, t| {
+            Some(acc.map_or(t, |a| a.min(t)))
+        });
     for (k, d) in subject.doses.iter().enumerate() {
         let lag = dose_lagtimes[k];
+        // The dose *record* at its own time — always pushed, lagtime or not
+        // (#1073). NONMEM runs `$PK` at the dose row and ADVANs to it, so the
+        // dose row's snapshot governs the segment that ENDS there and nothing
+        // after it; the interval from here to the lagged arrival belongs to the
+        // next record. Skipping this push when `lag == 0` would be wrong in the
+        // opposite direction — the arrival is not a parameter source any more, so
+        // without the record the segment ending at `d.time` would look forward
+        // past the dose to the following record. The zero-length segment that
+        // results when `lag == 0` costs nothing (`if t_event > cur_t`).
+        timeline.push((d.time, Kind::DoseRecord, k));
         timeline.push((d.time + lag, Kind::Dose, k));
         if is_real_infusion(d) {
             // F-scaled infusion end (#419): rate-defined -> F·duration window.
@@ -4570,6 +4890,36 @@ pub fn ode_predictions_event_driven(
         zero_order_dur_and_frac_for_dose(ode, d, &pk_at_dose[k].values)
     });
 
+    // Parameters for the segment ENDING at each timeline entry (#1073).
+    //
+    // NONMEM evaluates `$PK` at every record and then ADVANs *to* that record, so
+    // a segment is governed by the record that TERMINATES it. An entry that is not
+    // a record — a lagged dose arrival, an infusion end, a zero-order cutoff, a
+    // per-route onset — supplies no parameters of its own: it merely subdivides
+    // the interval its enclosing record terminates, and every piece of that
+    // interval runs on that record's snapshot.
+    //
+    // Resolved by the shared [`crate::dosing::governing_record_indices`] rule rather
+    // than at the point of use, because the answer for a non-record lies *ahead* of
+    // it in the walk. All four engines call that one helper so the resolution — and
+    // in particular its trailing-tail rule — cannot drift between them.
+    //
+    // Reusing `last_pk` for these — the previous record — is what this replaced,
+    // and it is wrong by exactly one record: measured against NONMEM 7.6.0 it puts
+    // a 4.2 % error on the predictions after an infusion end that falls between
+    // two records under a changing covariate, and 14.9 OFV on a lagged second
+    // dose whose arrival crosses one.
+    let governing_record =
+        crate::dosing::governing_record_indices(timeline.len(), |i| is_record(timeline[i].1));
+    let record_pk_at = |q: usize| -> PkParams {
+        let (_, kind, idx) = timeline[q];
+        match kind {
+            Kind::DoseRecord => pk_at_dose[idx],
+            Kind::PkOnly => pk_at_pk_only[idx],
+            _ => pk_at_obs[idx],
+        }
+    };
+
     let mut cur_t = timeline[0].0;
     // Most-recent NONMEM record's PK params, used to integrate segments
     // ending at an infusion-end (which is not a record and carries no PK).
@@ -4582,17 +4932,23 @@ pub fn ode_predictions_event_driven(
     // first reset. Infusions started before it are no longer active.
     let mut reset_floor = f64::NEG_INFINITY;
 
-    for &(t_event, kind, idx) in &timeline {
-        // PK params for the segment [cur_t, t_event] are evaluated AT
-        // t_event (NONMEM end-of-interval / current-record convention —
-        // `$PK runs at every record, then ADVAN propagates to it`).
-        // Infusion-end is not a record: reuse the previous segment's PK.
-        // Reset is not a record either: it just zeros the state below.
+    for (i, &(t_event, kind, idx)) in timeline.iter().enumerate() {
+        // PK params for the segment [cur_t, t_event] are evaluated AT the record
+        // that TERMINATES the interval (NONMEM end-of-interval / current-record
+        // convention — `$PK runs at every record, then ADVAN propagates to it`).
+        // For a record that is itself; for a non-record it is the next record
+        // ahead (#1073), which `governing_record` resolved above.
         let pk_now: PkParams = match kind {
-            Kind::Dose => pk_at_dose[idx],
-            Kind::Obs => pk_at_obs[idx],
-            Kind::PkOnly => pk_at_pk_only[idx],
-            Kind::InfusionEnd | Kind::Reset => last_pk,
+            // A reset zeros the state below and, in ferx, is not treated as a
+            // parameter source: the segment ending at it reuses the previous
+            // record. NONMEM does run `$PK` at an EVID=3/4 row, so this is a
+            // latent divergence of the same family as #1073 — left as-is here
+            // deliberately rather than half-fixed, and tracked separately.
+            Kind::Reset => last_pk,
+            // `None` only for a subject with no record anywhere in its timeline,
+            // which produces no prediction; `last_pk` is the only snapshot that
+            // exists there.
+            _ => governing_record[i].map_or(last_pk, &record_pk_at),
         };
 
         if t_event > cur_t {
@@ -4617,12 +4973,39 @@ pub fn ode_predictions_event_driven(
                     }
                 })
                 .fold(f64::NEG_INFINITY, f64::max);
-            // Store NaN when no effective prior dose exists (fold stays at NEG_INFINITY)
-            // so the ODE RHS injects NaN for TAD rather than +∞ (t - NEG_INFINITY).
+            // No dose has arrived yet, so the fold stayed at NEG_INFINITY and `t - anchor`
+            // would be `+∞`. Anchor at the subject's FIRST arrival instead — `TAD` is then
+            // negative before the dose lands and continuous through it, which is simply
+            // `TAD(t) = t − τ` extended backwards.
+            //
+            // Before #1073 this branch was reachable only when a record fell inside the
+            // pre-arrival window; splitting the dose row off from its arrival opens a real
+            // `(d.time, arrival]` segment ahead of every lagged first dose. Two properties
+            // are load-bearing there, and both were learned the hard way:
+            //
+            //   * **Finite.** A NaN anchor multiplies into the state (`0.0 * NaN = NaN`)
+            //     and poisons every later prediction of any `[odes]` RHS reading `TAD`,
+            //     turning a finite fit into the 1e20 objective sentinel.
+            //   * **Segment-invariant.** The anchor is recomputed per segment, so anchoring
+            //     at `cur_t` restarts `TAD` at zero at each record inside the pre-arrival
+            //     window — a sawtooth whose shape depends on the sampling mesh, not on the
+            //     model. Measured: two subjects identical but for one extra observation in
+            //     that window diverged by 4.2e-4 at *every* later time, the error injected
+            //     once and then carried multiplicatively. A prediction must not move
+            //     because someone took an extra sample.
+            //
+            // The value is immaterial wherever the pre-arrival state is zero — every model
+            // without an `init(...)` baseline — but `init` state does decay across that
+            // window, so there it is live. What `TAD` *means* before a dose has arrived is
+            // #1110's to settle; this only guarantees it is finite and mesh-independent in
+            // the meantime, and the dense predictor answers NaN there independently of this
+            // walk.
             let last_dose_eff_ed = if last_dose_eff_ed.is_finite() {
                 last_dose_eff_ed
             } else {
-                f64::NAN
+                // Dose-free subject: `TAD` has no referent, and NaN is the pre-existing
+                // answer for that case.
+                first_arrival_ed.unwrap_or(f64::NAN)
             };
             let mut ext_params_ed = [f64::NAN; crate::types::MAX_PK_PARAMS + 2];
             ext_params_ed[..crate::types::MAX_PK_PARAMS]
@@ -4679,14 +5062,25 @@ pub fn ode_predictions_event_driven(
         }
 
         match kind {
+            Kind::DoseRecord => {
+                // The dose row itself: a NONMEM record, so `$PK` ran here and this
+                // snapshot becomes current. No state change — that happens at the
+                // lagged arrival below (#1073).
+                last_pk = pk_now;
+            }
             Kind::Dose => {
                 let d = &subject.doses[idx];
+                // Dose *attributes* are properties of the dose row, so they read
+                // that row's own snapshot (`pk_at_dose[idx]`) and never `pk_now`,
+                // which after #1073 is the NEXT record's. Before the split the two
+                // were the same object and the distinction did not show.
+                let dose_pk = &pk_at_dose[idx];
                 // Steady-state (SS=1) dose: reset state and load with the
                 // SS amount from the infinite-past pulse train before the
                 // SS dose's own pulse is applied below. See
                 // `equilibrate_ss_state` for the per-cycle scheme.
                 if d.ss && d.ii > 0.0 {
-                    u = equilibrate_ss_state(ode, &pk_now.values, d, &opts);
+                    u = equilibrate_ss_state(ode, &dose_pk.values, d, &opts);
                 }
                 // Boluses: add amt to state. Infusions: no instantaneous
                 // change — handled via the wrapped RHS for segments inside
@@ -4696,11 +5090,12 @@ pub fn ode_predictions_event_driven(
                 if !is_real_infusion(d) && !input_rate_consumes_cmt(ode, d.cmt_raw()) {
                     let cmt_idx = d.cmt_idx();
                     if cmt_idx < n {
-                        // Bioavailability resolved per dose compartment (`Fn`).
-                        u[cmt_idx] += ode.dose_attr_map.f_bio(d.cmt_raw(), &pk_now.values) * d.amt;
+                        // Bioavailability resolved per dose compartment (`Fn`),
+                        // precomputed from `pk_at_dose` alongside the lagtimes.
+                        u[cmt_idx] += dose_f_bio[idx] * d.amt;
                     }
                 }
-                last_pk = pk_now;
+                // The arrival is not a record: it must NOT become `last_pk`.
             }
             Kind::Obs => {
                 let cmt = subject.obs_cmts.get(idx).copied().unwrap_or(0);

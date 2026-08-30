@@ -5968,6 +5968,95 @@ fn ode_provider_lagtime_tvcov_arrival_straddles_frozen_infusion_matches_producti
     check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
 }
 
+/// #1073 on the ODE **twin**: an infusion window whose end falls strictly between two
+/// records, under a covariate that changes across it, plus a lagged arrival in the same
+/// subject.
+///
+/// This is the oracle `Dual2`-vs-FD parity cannot supply for these lines.
+/// `check_vs_production` compares the twin's own **value path** against
+/// `compute_predictions_with_tv` — an independent engine — before it compares
+/// derivatives against FD *of that engine*. FD parity alone perturbs the twin's own
+/// value path, so a twin that resolved a segment to a different record than production
+/// moves both sides together and agrees on the wrong answer.
+///
+/// What it covers that no other committed fixture does:
+///
+///   * `next_record_params` — the segment resolution itself, on both the arrival and
+///     the rate-off.
+///   * the `pre_params` at `K_INF_END`, which #1073 changed from `last_params` (the
+///     *previous* record) to the enclosing one. That was the half measured at 4.2 % on
+///     the predictions and 23.5 OFV against NONMEM 7.6.0.
+///   * `post_snapshot`'s scan continuing *past* a non-record rather than stopping at
+///     one, and the retirement of its co-timed-sibling-dose exception.
+///
+/// Records sit at 0, 0.5, 1.5, 2, 4, 8 with `WT` stepping 70 → 140 at `t = 2`. Both
+/// doses go into `central`, so both ride `ALAG1 ≈ 0.751`, and **two** non-record
+/// boundaries stack inside the single `(1.5, 2]` record interval:
+///
+/// ```text
+///   1.5  obs (WT 70)  │  1.751 bolus arrival  │  1.901 infusion end  │  2.0 obs (WT 140)
+/// ```
+///
+/// Every piece of that interval runs on the `t = 2` record. Two things follow, and the
+/// geometry is built so that each is separately observable:
+///
+///   * the **pre**-side of the rate-off is the enclosing record (`WT = 140`), not the
+///     previous one (`WT = 70`) it used to reuse — the half measured at 4.2 % on the
+///     predictions and 23.5 OFV against NONMEM 7.6.0;
+///   * `post_snapshot` at the arrival must **continue past** the infusion end — a
+///     non-record supplies no parameters — and return the `t = 2` record. Stopping at
+///     the first non-record instead falls back to the `t = 1.5` record, a different
+///     field.
+///
+/// Two properties of the fixture are load-bearing and each was learned by a mutation
+/// that initially survived:
+///
+///   * The infusion must ride the same `ALAG1` as the bolus. A frozen window (into
+///     `periph`, which `ALAG1` does not lag) makes the rate-off a fixed boundary, its
+///     `d_off` jet zero, and the whole saltation inert.
+///   * A second non-record must sit between the arrival and the next record. With the
+///     arrival's successor already being a record, `post_snapshot` returns it whether
+///     or not it can skip past a non-record.
+#[test]
+fn ode_provider_stacked_non_record_boundaries_under_tvcov_match_production() {
+    let model = parse_model_string(ONECPT_IV_LAG_STRADDLE_INF_ODE).expect("parse");
+    let mut subject = straddling_forcing_subject();
+    // 115 units at rate 100 -> a 1.15 h window into `central`, lagged by ALAG1, so its
+    // END moves with the lagtime and lands at ≈1.901 — after the bolus arrival and
+    // still strictly before the t=2 record.
+    subject.doses = vec![
+        DoseEvent::new(0.0, 115.0, 1, 100.0, false, 0.0),
+        DoseEvent::new(1.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    assert!(subject.has_tv_covariates());
+    assert!(ode_tvcov_supported(&model, &subject), "must stay analytic");
+    let theta = vec![10.0, 50.0, 0.75, 0.7, 0.4];
+    let eta: Vec<f64> = vec![0.1, -0.05, 0.07];
+
+    // The geometry, asserted rather than assumed: arrival then infusion end, both
+    // strictly inside `(1.5, 2]`, and the two records bracketing them carrying
+    // different `WT` — without which the conventions agree by construction.
+    let lag = theta[3] * eta[2].exp();
+    let arrival = 1.0 + lag;
+    let inf_end = lag + 115.0 / 100.0;
+    assert!(
+        1.5 + 1e-3 < arrival && arrival < inf_end - 1e-3 && inf_end < 2.0 - 1e-3,
+        "need 1.5 < arrival ({arrival}) < infusion end ({inf_end}) < 2.0, so a \
+         non-record sits between the arrival and the next record"
+    );
+    let wt_at = |j: usize| subject.obs_covariates[j]["WT"];
+    assert!(
+        (wt_at(2) - wt_at(3)).abs() > 1.0,
+        "the records bracketing both boundaries must carry different WT ({} vs {})",
+        wt_at(2),
+        wt_at(3)
+    );
+
+    check_vs_production(&model, &subject, &theta, &eta);
+    check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
+}
+
 /// Twin of the fixture above with a **co-moving** straddling forcing, and the reason the
 /// membership rule is "straddles", not "is frozen".
 ///
@@ -8345,8 +8434,12 @@ fn tad_gate_model(time_var: &str, lag_expr: &str) -> CompiledModel {
 }
 
 /// Bolus at t=0 plus a 1 h infusion at t=1, observations all strictly after the
-/// first lagged arrival (~0.80) so `TAD` is never NaN — see #1110, which makes
-/// any record *before* the first arrival poison the trajectory.
+/// first lagged arrival (~0.80). That was originally required because a record before
+/// the first arrival poisoned the trajectory with `TAD = NaN`; #1073 anchors the
+/// pre-arrival window at the subject's first arrival in both ODE predictors and both
+/// twins, so it is now finite there. The geometry is kept: this fixture is about the
+/// #1070 gate, and moving a record into that window would make it about #1110's
+/// semantics instead.
 fn tad_gate_subject() -> Subject {
     let mut s = bolus_subject(&[0.9, 1.5, 2.0, 4.0, 8.0]);
     let mut inf = DoseEvent::new(1.0, 60.0, 1, 0.0, false, 0.0);
