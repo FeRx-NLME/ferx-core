@@ -173,5 +173,40 @@ intended; prefer using only one of the two names per model.
   time `t` equals the un-lagged SS curve evaluated at `t - lagtime`,
   i.e. `C_ss(t, L) = C_ss(t - L, 0)`. See
   [Steady-State Doses](steady-state.qmd) for the full SS=1 reference.
+- With **time-varying covariates**, the identity above stops being the
+  whole story, because the two sides are then evaluated under different
+  parameters. ferx loads the periodic solution at the dose **record**
+  (phase `II - lagtime`, under the dose row's own covariates) and
+  advances from there to the arrival under the record governing that
+  interval — matching NONMEM. It does not compute the trough *at* the
+  arrival; doing so was worth 7.67 OFV on the committed anchor (#1121).
+  See [the FAQ](../faq.qmd) for the worked timing rule.
+- A `lagtime` of a **full dosing interval or longer** (`lagtime >= II`)
+  on a steady-state dose is supported, and follows NONMEM: the cycle
+  phase at the record is **clamped** to zero rather than wrapped into
+  `[0, II)`, so the record carries the steady-state *peak* and decays from
+  there, with no intervening pulse before the real arrival. Verified
+  against NONMEM 7.6.0 (`nonmem_anchor/ss_lag_ge_ii.ctl`); wrapping the
+  phase instead would put the whole pre-arrival window a factor
+  `exp(-k*II)` low.
+
+  Clamping is also the only *continuous* choice, which matters when
+  `lagtime` is estimated: nothing in the objective steps as the optimiser
+  walks a lagtime across the dosing interval.
+- A steady-state **infusion** whose lagtime is a full interval or longer
+  is the one corner where ferx and NONMEM disagree. ferx starts the
+  previous cycle's infusion at the dose record (what the clamped phase
+  means) and so delivers exactly `AMT`. NONMEM instead infuses for
+  `T_inf + (lagtime - II)` hours — 8 h at `RATE = 100` for an `AMT = 600`
+  dose, i.e. 800 mg — which is not a mass-balanced reading of the dose, so
+  ferx does not reproduce it. Every ferx engine agrees with every other
+  here; only NONMEM differs.
+- A steady-state **infusion** whose lagtime exceeds `II - T_inf` (so the
+  previous cycle is still running when the dose record arrives) is
+  supported: that residual rate keeps flowing past the record and stops at
+  `record + (T_inf - phase)`, exactly as NONMEM does
+  (`nonmem_anchor/ss_lag_infusion.ctl`). Before ferx 0.3 the rate was
+  dropped at the record, which read ~4 % low across the whole pre-arrival
+  window.
 
 See `examples/oral_with_lagtime.ferx` for a runnable model.

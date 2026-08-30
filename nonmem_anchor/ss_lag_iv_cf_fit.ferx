@@ -1,0 +1,39 @@
+# Closed-form twin of `ss_lag_iv_fit.ferx` (#1121 review).
+#
+# Same thetas, same omegas, same sigma, same covariate relations, same ALAG1 —
+# expressed as an analytical `one_cpt_iv` instead of an `[odes]` single state.
+# The two are the same system, so on the same dataset they must produce the same
+# predictions to solver tolerance.
+#
+# That is what makes this file an anchor rather than a duplicate. The `[odes]`
+# model is externally anchored to NONMEM 7.6.0, so agreement between the two
+# transfers that anchor to the closed-form engines — which have their own SS +
+# lagtime handling (`pk/event_driven.rs` for a time-varying subject, the
+# superposition in `pk/mod.rs` for a flat one) that no NONMEM run reaches
+# directly.
+#
+# No `[scaling]` block: the closed form returns a concentration already, where
+# the ODE model reads out an amount and divides by V via `obs_scale`.
+
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta WTEXP(0.75, 0.01, 2.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.0025
+[individual_parameters]
+  CL    = TVCL * (WT/70)^WTEXP * exp(ETA_CL)
+  V     = TVV * exp(ETA_V)
+  LAG   = LG
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V, lagtime=LAG)
+[covariates]
+  WT continuous
+  LG continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  maxiter = 0
+  covariance = false

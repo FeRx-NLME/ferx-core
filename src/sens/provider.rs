@@ -2793,12 +2793,21 @@ fn modeled_dose_analytic_gate(model: &CompiledModel, subject: &Subject) -> bool 
 /// True when this subject combines a **steady-state dose with a lagtime** on the event walk,
 /// which the dual walk does not serve yet (#486).
 ///
-/// Production overlays the pre-arrival SS tail for observations falling in `[t, t + ALAG)` —
-/// it recomputes them from `pk::event_driven::ss_state_at_phase_event_driven` *after* the
-/// walk — and `event_driven_sens_with_doses_g` has no dual twin of that overlay. Without it
-/// the walk disagrees with production in **value**, not merely in derivative, so this is a
-/// hard decline to FD rather than an approximation. (The CF *static* superposition path does
-/// serve SS × lagtime, via `lagged_elapsed`'s pre-arrival wrap — only the walk is affected.)
+/// Production loads a lagged SS dose's periodic trough at the dose **record** and lets the
+/// walk carry it to the lagged arrival (#1121, `EventKind::DoseRecord` in
+/// `pk::event_driven`); `event_driven_sens_with_doses_g` has no dual twin of that seed — it
+/// still equilibrates at the arrival, with no pre-arrival state at all. So the dual walk
+/// disagrees with production in **value**, not merely in derivative, and this stays a hard
+/// decline to FD rather than an approximation.
+///
+/// Before #1121 the same decline was justified by a different construct: production patched
+/// the pre-arrival *predictions* after the walk rather than seeding its state. That overlay is
+/// gone, and with it the reason the gate was worded around a post-hoc pass — but the gap it
+/// stood for is the same one, so the gate is unchanged. Giving `propagate_g` a `K_SS_SEED`
+/// analogue would let it be lifted; that is tracked separately, not smuggled in here.
+///
+/// (The CF *static* superposition path does serve SS × lagtime, via `lagged_elapsed`'s
+/// pre-arrival wrap — only the walk is affected.)
 fn ss_lagtime_walk_unsupported(model: &CompiledModel, subject: &Subject) -> bool {
     model.has_lagtime() && subject.doses.iter().any(|d| d.ss)
 }

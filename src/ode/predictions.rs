@@ -39,22 +39,6 @@ pub(crate) const INFUSION_EPS: f64 = 1e-12;
 /// [`INFUSION_EPS`] and the dose-time match used by these loops.
 const RESET_MATCH_TOL: f64 = 1e-12;
 
-/// `is_infusion()` only checks `rate > 0`, but a degenerate row with
-/// `rate > 0 && amt <= 0` (or NaN) yields `duration = amt/rate <= 0`
-/// (or NaN). Treating those as infusions would push an infusion-end
-/// break that sorts before the dose itself, and NaN would panic the
-/// break-time sort. Such rows fall back to the bolus branch instead
-/// (a zero/negative bolus update — visible, not silently dropped).
-pub(crate) fn is_real_infusion(d: &DoseEvent) -> bool {
-    // Tripwire (#324): every ODE entrypoint resolves modeled-RATE doses to
-    // `Fixed` (via `resolve_subject_doses*`) before any infusion logic runs, so
-    // a non-`Fixed` dose here means a path forgot to resolve — panic in debug /
-    // tests rather than silently mis-handling it (an unresolved modeled dose has
-    // `duration == 0`, so it would quietly degrade to a bolus).
-    debug_assert!(d.is_fixed(), "is_real_infusion: unresolved modeled dose");
-    d.is_infusion() && d.duration > 0.0 && d.duration.is_finite()
-}
-
 // Dose resolution + SS-equilibration primitives moved to `crate::dosing` (a neutral
 // leaf module) so pk/sens/api don't depend upward on ode/. A PRIVATE import (NOT a
 // `pub(crate) use` re-export) so these do not leak back out as `crate::ode::…` — the
@@ -64,8 +48,10 @@ pub(crate) fn is_real_infusion(d: &DoseEvent) -> bool {
 // `last_ss_equilibration_cycles`, `with_full_ss_equilibration`) are referenced directly
 // as `crate::dosing::…` by the tests, so they are not imported here.
 use crate::dosing::{
-    note_ss_nonconvergence_if_capped, record_ss_equilibration_cycles, resolve_subject_doses,
-    resolve_subject_doses_with, SsStopTracker, SS_EQUILIBRATION_CYCLES,
+    is_real_infusion, note_ss_nonconvergence_if_capped, record_ss_equilibration_cycles,
+    resolve_subject_doses, resolve_subject_doses_with, ss_arrival_is_trough,
+    ss_residual_infusion_end, ss_seed_phase, ss_seeded_at_record, SsStopTracker,
+    SS_EQUILIBRATION_CYCLES,
 };
 
 /// Relative floor for truncating the steady-state **input-rate periodic sum** (#719). An
@@ -829,10 +815,19 @@ fn equilibrate_ss_state(
 /// pulse. Without this seed those samples would read the (empty) initial
 /// state. See [`ode_predictions`] for placement and issue #15.
 ///
-/// For SS infusions this assumes `phase ≥ dose.duration` (the prior
-/// infusion has finished by `phase`), i.e. `lagtime ≤ II − dose.duration`
-/// — the realistic regime; overlapping infusions (`T_inf > II`) are already
-/// rejected upstream.
+/// `phase == 0` is the instant *after* the pulse — a bolus is already in the
+/// compartment and an infusion has delivered nothing yet — which is what the
+/// [`crate::dosing::ss_seed_phase`] clamp hands back for `lagtime ≥ II`.
+/// Returning the bare (pre-pulse) trough there would be off by a whole cycle of
+/// decay; NONMEM reads the peak. Note the asymmetry is only apparent: `phase`
+/// runs over `[0, II]` where `0` is post-pulse and `II ≡ 0⁻` is pre-pulse.
+///
+/// For an SS **infusion** with `phase < T_inf` the prior infusion has not
+/// finished by `phase`, so the returned state is mid-flight and the caller must
+/// carry `+rate` forward for another `T_inf − phase` — see
+/// [`crate::dosing::ss_residual_infusion_end`], which is where that window and
+/// this one are kept consistent. (Overlapping infusions, `T_inf > II`, are
+/// rejected upstream.)
 fn ss_state_at_phase(
     ode: &crate::ode::OdeSpec,
     pk_params_flat: &[f64],
@@ -841,9 +836,6 @@ fn ss_state_at_phase(
     opts: &OdeSolverOptions,
 ) -> Vec<f64> {
     let mut u = equilibrate_ss_state(ode, pk_params_flat, dose, opts);
-    if phase <= 0.0 {
-        return u;
-    }
     let cmt_idx = dose.cmt_idx();
     if cmt_idx >= u.len() {
         return u;
@@ -851,6 +843,14 @@ fn ss_state_at_phase(
     // Bioavailability scales the amount entering the dosing compartment,
     // resolved per dose compartment (`Fn`; see `equilibrate_ss_state`).
     let f_bio = ode.dose_attr_map.f_bio(dose.cmt_raw(), pk_params_flat);
+    if phase <= 0.0 {
+        // Post-pulse, pre-flow. An infusion delivers over time and so has
+        // nothing to add here; the caller's residual window carries it.
+        if !is_real_infusion(dose) {
+            u[cmt_idx] += f_bio * dose.amt;
+        }
+        return u;
+    }
 
     if is_real_infusion(dose) {
         // Mode-aware bioavailability (#419): see `equilibrate_ss_state`.
@@ -944,10 +944,23 @@ pub(crate) fn active_infusions(
                 && start <= t_start + INFUSION_EPS
                 && end >= t_end - INFUSION_EPS
             {
-                Some((d.cmt_idx(), rate_eff))
-            } else {
-                None
+                return Some((d.cmt_idx(), rate_eff));
             }
+            // A seeded steady-state infusion (#1121) whose *previous* cycle is
+            // still running at the dose record keeps delivering across the
+            // pre-arrival window, on `[d.time, ss_residual_infusion_end]`. That
+            // window belongs to no `DoseEvent` — it is the tail of the periodic
+            // fiction `ss_state_at_phase` handed back mid-flight — so it is
+            // admitted here rather than by the `start`/`end` test above, which
+            // only knows about the dose's own arrival. Reset-aware on the record
+            // time for the same reason the real window is: an EVID=3/4 between
+            // the record and the arrival zeros the seeded state, and a rate that
+            // survived it would refill a compartment the reset just emptied.
+            let residual_end = ss_residual_infusion_end(d, lag, f_bio)?;
+            (d.time >= reset_floor
+                && d.time <= t_start + INFUSION_EPS
+                && residual_end >= t_end - INFUSION_EPS)
+                .then_some((d.cmt_idx(), rate_eff))
         })
         .collect()
 }
@@ -2218,8 +2231,14 @@ fn collect_dose_break_times(
         }
         // SS + lagtime: break at the dose *record* time too, so we can seed the
         // previous-interval steady-state tail there before the lagged pulse arrives.
-        if lag > 0.0 && dose.ss && dose.ii > 0.0 {
+        if ss_seeded_at_record(dose, lag) {
             break_times.push(dose.time);
+        }
+        // End of the *previous* cycle's infusion when it is still running at the
+        // dose record of a seeded SS dose (#1121) — a segment boundary for the
+        // same reason the real infusion end is one.
+        if let Some(residual_end) = ss_residual_infusion_end(dose, lag, dose_f_bio[i]) {
+            break_times.push(residual_end);
         }
     }
     // Per-route absorption lag (`fn(..., lag=L)`): a route with its own lag switches
@@ -2258,12 +2277,12 @@ fn reseed_prescheduled_states_at(
     // empty initial state. Phase II−lagtime is where the prior pulse has decayed to.
     for (i, dose) in doses.iter().enumerate() {
         let lag = dose_lagtimes[i];
-        if lag > 0.0 && dose.ss && dose.ii > 0.0 && (dose.time - t_start).abs() < 1e-12 {
+        if ss_seeded_at_record(dose, lag) && (dose.time - t_start).abs() < 1e-12 {
             u.copy_from_slice(&ss_state_at_phase(
                 ode,
                 pk_params_flat,
                 dose,
-                dose.ii - lag,
+                ss_seed_phase(dose, lag),
                 opts,
             ));
         }
@@ -2272,7 +2291,10 @@ fn reseed_prescheduled_states_at(
         if (dose.time + dose_lagtimes[i] - t_start).abs() >= 1e-12 {
             continue;
         }
-        if dose.ss && dose.ii > 0.0 {
+        // Re-equilibrating at the arrival is a shortcut for propagating the seed
+        // there, and it is exact only while the flowed state IS the trough
+        // (#1121). Past `lag = II` it is not, and the shortcut reads ~4 % high.
+        if dose.ss && dose.ii > 0.0 && ss_arrival_is_trough(dose, dose_lagtimes[i]) {
             u.copy_from_slice(&equilibrate_ss_state(ode, pk_params_flat, dose, opts));
         }
     }
@@ -4843,6 +4865,14 @@ pub fn ode_predictions_event_driven(
             let (_, dur_eff) = d.bioavailable_infusion(dose_f_bio[k]);
             timeline.push((d.time + lag + dur_eff, Kind::InfusionEnd, k));
         }
+        // End of the *previous* cycle's infusion for a seeded SS dose (#1121),
+        // when it is still running at the dose record. Same no-op `InfusionEnd`
+        // break an ordinary infusion end gets, and for the same reason: without
+        // it a segment could straddle the edge and `active_infusions`'
+        // full-containment test would drop the rate over the whole segment.
+        if let Some(residual_end) = ss_residual_infusion_end(d, lag, dose_f_bio[k]) {
+            timeline.push((residual_end, Kind::InfusionEnd, k));
+        }
         // Zero-order absorption cutoff (#504): a dose feeding a `zero_order(dur)`
         // compartment delivers a constant rate over `(0, dur]`, so break at the
         // window end `d.time+lag_cmt+lag_route+dur` exactly like an infusion end (no
@@ -5067,6 +5097,33 @@ pub fn ode_predictions_event_driven(
                 // snapshot becomes current. No state change — that happens at the
                 // lagged arrival below (#1073).
                 last_pk = pk_now;
+                // …with one exception: a *steady-state* dose carrying a lagtime
+                // loads its compartments HERE, at the record, not at the arrival
+                // (#1121). NONMEM runs `$PK` at the dose row, fills the
+                // compartments with the periodic solution, and then ADVANs to the
+                // lagged arrival under the record that terminates that interval.
+                // Equilibrating at the arrival instead — which is what this walk
+                // did — computes the trough throughout under the dose row's
+                // snapshot, so the pre-arrival window gets the wrong elimination
+                // whenever a covariate changes inside it.
+                //
+                // Phase `II − lag` is where the *previous* cycle's pulse (at
+                // `d.time + lag − II`) has decayed to by the record time. The
+                // snapshot is the dose row's own, never `pk_now`: like `F`, `ALAG`
+                // and `D{n}`, the steady state is a property of the record that
+                // declares it, and `pk_now` is the *next* record's after #1073.
+                // From here the walk's ordinary integration carries the state to
+                // the arrival, where only the pulse is applied.
+                let d = &subject.doses[idx];
+                if ss_seeded_at_record(d, dose_lagtimes[idx]) {
+                    u = ss_state_at_phase(
+                        ode,
+                        &pk_at_dose[idx].values,
+                        d,
+                        ss_seed_phase(d, dose_lagtimes[idx]),
+                        &opts,
+                    );
+                }
             }
             Kind::Dose => {
                 let d = &subject.doses[idx];
@@ -5079,7 +5136,12 @@ pub fn ode_predictions_event_driven(
                 // SS amount from the infinite-past pulse train before the
                 // SS dose's own pulse is applied below. See
                 // `equilibrate_ss_state` for the per-cycle scheme.
-                if d.ss && d.ii > 0.0 {
+                //
+                // Skipped when the trough was already seeded at the dose record
+                // and flowed here (#1121) — re-equilibrating would discard that
+                // propagation and restore the defect. The two branches read the
+                // same predicate, so they cannot both fire or both skip.
+                if d.ss && d.ii > 0.0 && !ss_seeded_at_record(d, dose_lagtimes[idx]) {
                     u = equilibrate_ss_state(ode, &dose_pk.values, d, &opts);
                 }
                 // Boluses: add amt to state. Infusions: no instantaneous
@@ -5345,8 +5407,14 @@ pub fn ode_predictions_with_states(
             let (_, dur_eff) = dose.bioavailable_infusion(dose_f_bio[i]);
             break_times.push(dose.time + lag + dur_eff);
         }
-        if lag > 0.0 && dose.ss && dose.ii > 0.0 {
+        if ss_seeded_at_record(dose, lag) {
             break_times.push(dose.time);
+        }
+        // End of the *previous* cycle's infusion when it is still running at the
+        // dose record of a seeded SS dose (#1121) — a segment boundary for the
+        // same reason the real infusion end is one.
+        if let Some(residual_end) = ss_residual_infusion_end(dose, lag, dose_f_bio[i]) {
+            break_times.push(residual_end);
         }
     }
     // Zero-order windows for this subject (#504): the dense paths have a single
@@ -5371,8 +5439,17 @@ pub fn ode_predictions_with_states(
         // the separate pre-pass in `ode_predictions` (lines 479-485).
         for (i, dose) in subject.doses.iter().enumerate() {
             let lag = dose_lagtimes[i];
-            if lag > 0.0 && dose.ss && dose.ii > 0.0 && (dose.time - t_start).abs() < 1e-12 {
-                u = ss_state_at_phase(ode, pk_params_flat, dose, dose.ii - lag, &opts);
+            if ss_seeded_at_record(dose, lag) && (dose.time - t_start).abs() < 1e-12 {
+                u = ss_state_at_phase(ode, pk_params_flat, dose, ss_seed_phase(dose, lag), &opts);
+                if let Some(residual_end) = ss_residual_infusion_end(dose, lag, dose_f_bio[i]) {
+                    // The previous cycle's infusion is still running at the record
+                    // and stops inside the pre-arrival window (#1121). Registered
+                    // like any other window so `gated_infusions` injects `+rate`
+                    // over exactly `[dose.time, residual_end]`; without it the walk
+                    // resumes the decay early and the whole window reads low.
+                    active_infusions.retain(|(_, _, e)| *e > t_start + 1e-12);
+                    active_infusions.push((i, dose.time, residual_end));
+                }
             }
         }
 
@@ -5381,9 +5458,12 @@ pub fn ode_predictions_with_states(
             let t_eff = dose.time + dose_lagtimes[dose_idx];
             if (t_eff - t_start).abs() < 1e-10 {
                 let f = dose_f_bio[dose_idx];
-                if dose.ss && dose.ii > 0.0 {
+                if dose.ss && dose.ii > 0.0 && ss_arrival_is_trough(dose, dose_lagtimes[dose_idx]) {
                     // Lagged arrival: pre-lag seeding was already done above;
-                    // here we apply the full equilibrated state.
+                    // here we apply the full equilibrated state — sound only
+                    // because the propagated state at the arrival is the trough
+                    // (#1121). Past `lag = II` it is not, so the seed flows here
+                    // instead of being overwritten.
                     u = equilibrate_ss_state(ode, pk_params_flat, dose, &opts);
                 }
                 if !is_real_infusion(dose) {
@@ -5608,8 +5688,14 @@ fn build_segment_break_times(
             let (_, dur_eff) = dose.bioavailable_infusion(dose_f_bio[i]);
             break_times.push(dose.time + lag + dur_eff);
         }
-        if lag > 0.0 && dose.ss && dose.ii > 0.0 {
+        if ss_seeded_at_record(dose, lag) {
             break_times.push(dose.time);
+        }
+        // End of the *previous* cycle's infusion when it is still running at the
+        // dose record of a seeded SS dose (#1121) — a segment boundary for the
+        // same reason the real infusion end is one.
+        if let Some(residual_end) = ss_residual_infusion_end(dose, lag, dose_f_bio[i]) {
+            break_times.push(residual_end);
         }
     }
     // EVID=3/4 resets must be break-points so the re-seed happens at the exact boundary.
@@ -5670,8 +5756,17 @@ fn apply_segment_boundary(
     // seed the previous interval's steady-state tail, mirroring ode_predictions.
     for (i, dose) in subject.doses.iter().enumerate() {
         let lag = dose_lagtimes[i];
-        if lag > 0.0 && dose.ss && dose.ii > 0.0 && (dose.time - t_start).abs() < 1e-12 {
-            *u = ss_state_at_phase(ode, pk_params_flat, dose, dose.ii - lag, opts);
+        if ss_seeded_at_record(dose, lag) && (dose.time - t_start).abs() < 1e-12 {
+            *u = ss_state_at_phase(ode, pk_params_flat, dose, ss_seed_phase(dose, lag), opts);
+            if let Some(residual_end) = ss_residual_infusion_end(dose, lag, dose_f_bio[i]) {
+                // The previous cycle's infusion is still running at the record
+                // and stops inside the pre-arrival window (#1121). Registered
+                // like any other window so `gated_infusions` injects `+rate`
+                // over exactly `[dose.time, residual_end]`; without it the walk
+                // resumes the decay early and the whole window reads low.
+                active_infusions.retain(|(_, _, e)| *e > t_start + 1e-12);
+                active_infusions.push((i, dose.time, residual_end));
+            }
         }
     }
 
@@ -5679,8 +5774,10 @@ fn apply_segment_boundary(
         let t_eff = dose.time + dose_lagtimes[dose_idx];
         if (t_eff - t_start).abs() < 1e-10 {
             let f = dose_f_bio[dose_idx];
-            if dose.ss && dose.ii > 0.0 {
-                // Lagged arrival: pre-lag seeding already done above.
+            if dose.ss && dose.ii > 0.0 && ss_arrival_is_trough(dose, dose_lagtimes[dose_idx]) {
+                // Lagged arrival: pre-lag seeding already done above. The
+                // overwrite is exact only while the flowed state is the trough
+                // (#1121); past `lag = II` the seed flows here instead.
                 *u = equilibrate_ss_state(ode, pk_params_flat, dose, opts);
             }
             if !is_real_infusion(dose) {

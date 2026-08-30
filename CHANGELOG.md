@@ -20,6 +20,36 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Fixed
+- **A steady-state dose with a lagtime is now seeded at the dose record, not equilibrated at the
+  arrival (#1121).** Under time-varying covariates an `SS=1` dose carrying an `ALAG` had its
+  periodic trough computed *at the lagged arrival*, entirely under the dose row's covariate
+  values. NONMEM loads the trough at the dose **record** (phase `II − ALAG`) and advances to the
+  arrival under the record governing that interval, so ferx applied too little elimination across
+  the pre-arrival window and ran high for the rest of the cycle. On an eight-subject anchor
+  (`nonmem_anchor/dose_form_lag_ss`) this was worth **7.67 objective units**; predictions are now
+  within 1e-4 of NONMEM 7.6.0 point by point. Flat-covariate fits are unaffected — the two
+  constructions agree exactly when nothing changes inside the window, which is why this went
+  unnoticed. The same fix gives the IOV predictor a pre-arrival state, where it previously read
+  zero for any observation between an `SS` dose's record and its lagged arrival.
+- **A steady-state infusion whose previous cycle is still running at the dose record keeps
+  delivering (#1121).** When `ALAG > II − T_inf` the pulse before the record is recent enough that
+  its infusion has not finished, so the rate flows on past the record and stops at
+  `record + (T_inf − phase)`. That window belongs to no dose row, and every engine dropped it —
+  reading about **4 %** low across the whole pre-arrival window and, since the two production
+  engines and the dense predictor disagreed about it, giving the same model different answers
+  depending only on whether the subject happened to carry a time-varying covariate. Now carried
+  explicitly and matched against NONMEM 7.6.0 (`nonmem_anchor/ss_lag_infusion`).
+- **A lagtime of a full dosing interval or longer on a steady-state dose is now supported
+  (#1121).** `ALAG >= II` has no phase `II − ALAG`; ferx now clamps it to zero, matching NONMEM —
+  the pulse lands on the dose record, so the record carries the steady-state peak and decays from
+  there. Previously the event-driven walks returned exactly `0` for the whole pre-arrival window
+  (under a proportional error model, a very loud failure), while the static predictors wrapped the
+  phase into `[0, II)` and then re-equilibrated at an arrival that is no longer the periodic
+  trough, running about 4 % high after it. Clamping is also continuous in `ALAG`, so an
+  *estimated* lagtime no longer steps the objective as the optimiser walks it across the interval.
+  One corner is a deliberate divergence: for an `ALAG >= II` **infusion** NONMEM delivers
+  `T_inf + (ALAG − II)` hours of drug rather than the dose's own `T_inf`, which is not
+  mass-balanced; ferx does not reproduce it. See `docs/model-file/lagtime.qmd`.
 - **VI no longer freezes from ordinary starting values (#1097).** Adam's gradients are now
   clipped to a global L2 norm, controlled by the new `vi_grad_clip` fit option (default `1e4`;
   `0` restores the old behaviour). Under a proportional error model a prediction near zero
