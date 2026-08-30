@@ -8,7 +8,7 @@
 # [scaling]. Runs on data/mixed_oral.csv (every record on CMT 1), the ferx-keyed
 # copy of nonmem_anchor/mixed_oral.csv.
 #
-#   cargo run --release -- nonmem_anchor/mixed_zero_first_fit.ferx \
+#   cargo run --release -p ferx-cli -- nonmem_anchor/mixed_zero_first_fit.ferx \
 #     --data data/mixed_oral.csv
 #
 # The dataset is simulated FROM this mixed model (same truths), so this is a matched

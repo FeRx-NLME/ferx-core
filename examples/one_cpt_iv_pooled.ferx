@@ -17,7 +17,7 @@
 # TVCL 4.8408, TVV 52.834, PROP_ERR 0.12898 (sd). Standard errors match NONMEM's
 # default `$COVARIANCE` under `covariance_method = rsr`; ferx's default is `r`.
 #
-# Run: cargo run --release -- examples/one_cpt_iv_pooled.ferx --data data/one_cpt_iv.csv
+# Run: cargo run --release -p ferx-cli -- examples/one_cpt_iv_pooled.ferx --data data/one_cpt_iv.csv
 
 [parameters]
   theta TVCL(4.0,  0.1, 100.0)
