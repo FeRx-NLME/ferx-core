@@ -120,9 +120,10 @@ Concretely, for `init(central) = 10*WT` with `WT` stepping 70 → 140 at the res
 the compartment restarts at `1400`, not `700`. Anchored against NONMEM 7.6.0 in
 `nonmem_anchor/reset_init_snapshot_{A,B,C,D}.ctl`.
 
-One gap remains: an **analytical** (closed-form) model using `[initial_conditions]`
-drops its baseline at the first reset and never re-deposits it, where NONMEM
-re-applies `A_0`. Use an `[odes]` model if you need a baseline that survives a reset.
+One gap remains (#1135): an **analytical** (closed-form) model using
+`[initial_conditions]` drops its baseline at the first reset and never re-deposits it,
+where NONMEM re-applies `A_0`. Use an `[odes]` model if you need a baseline that
+survives a reset.
 :::
 
 ## Covariate table

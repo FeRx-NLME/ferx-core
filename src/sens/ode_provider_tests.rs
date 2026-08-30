@@ -4998,8 +4998,9 @@ fn ode_tvcov_init_compositions_are_analytic() {
         "init + finite infusion is analytic (#486)"
     );
 
-    // + EVID 3/4 reset → analytic (#486): the K_RESET branch re-seeds init at the
-    // reset-event snapshot (matching production's `initial_state(&last_pk.values)`).
+    // + EVID 3/4 reset → analytic (#486): the K_RESET branch re-seeds init at the reset
+    // ROW's own snapshot, matching production's `initial_state(&pk_at_reset[idx].values)`
+    // (#1133).
     let mut s = tvcov_subject();
     s.reset_times = vec![4.0];
     assert!(
@@ -5431,6 +5432,36 @@ fn ode_provider_init_reset_dose_at_zero_matches_production() {
     check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
 }
 
+// IOV twin of `ONECPT_IV_INIT_WTV_ODE`: the same WT-on-`V` init baseline, plus a per-occasion
+// κ on `V`, so the reset re-seed's snapshot depends on both the covariate row and the occasion
+// convention (#1133).
+const ONECPT_IV_INIT_WTV_ODE_IOV: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  theta TVBASE(500.0, 10.0, 5000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.09
+  kappa KAPPA_V ~ 0.04
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV * (WT / 70) * exp(ETA_V + KAPPA_V)
+  BASE = TVBASE
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = BASE / V
+  d/dt(central)  = -CL/V * central
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-11
+  ode_abstol = 1e-13
+"#;
+
 /// **`init(...)` re-seeded at a MID-TIMELINE reset whose own `WT` differs from every
 /// neighbouring record** (#1133). The two existing reset twins above cannot see which
 /// snapshot the re-seed reads, and it is worth writing down why, because each looks like
@@ -5477,6 +5508,76 @@ fn ode_provider_init_reset_midtimeline_reads_the_reset_rows_snapshot() {
     check_vs_production(&model, &subject, &theta, &eta);
     check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
     check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+}
+
+/// **IOV × time-varying covariates × a reset that re-seeds `init(...)`** (#1133).
+///
+/// The twin above covers the non-IOV TV-cov walk. This one takes the *other* seeding
+/// route — `seed_iov_events`' per-event branch, which fires for an IOV subject with TV
+/// covariates — where the reset row's snapshot is built through the occasion-less
+/// (`seed_pk_only_cov`) path, mirroring `predict_iov`: the reader stores no `OCC` for a
+/// reset row, so κ = 0 there on both sides.
+///
+/// `WT` sits on `V`, and `init(central) = BASE/V`, so the reset row's `WT = 40` — shared
+/// with no neighbouring record (the one before carries 90, the one after 150) — is
+/// observable in the value and in `∂/∂(θ, stacked-η)`. `predict_iov` is the oracle, so a
+/// twin that seeded from a different row fails the value comparison first.
+#[test]
+fn ode_provider_iov_tvcov_reset_reads_the_reset_rows_snapshot() {
+    let model = parse_model_string(ONECPT_IV_INIT_WTV_ODE_IOV).expect("parse");
+    assert_eq!(model.n_kappa, 1);
+    let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+    let mut subj = bolus_subject(&[1.0, 2.0, 4.0, 8.0]);
+    subj.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+    subj.dose_covariates = vec![wt(60.0)];
+    subj.obs_covariates = vec![wt(70.0), wt(90.0), wt(150.0), wt(150.0)];
+    subj.covariates = wt(60.0);
+    subj.dose_occasions = vec![1];
+    subj.occasions = vec![1, 1, 2, 2];
+    subj.reset_times = vec![3.0];
+    subj.reset_covariates = vec![wt(40.0)];
+    assert!(subj.has_tv_covariates());
+    let groups = crate::stats::likelihood::iov_occasion_groups(&subj);
+    assert_eq!(groups.len(), 2);
+
+    let theta = vec![1.0, 20.0, 500.0];
+    let stacked = vec![0.1, -0.05, 0.0, 0.0];
+    let sens = ode_subject_sensitivities_iov(&model, &subj, &theta, &stacked).expect("analytic");
+    let pred = |st: &[f64], j: usize| -> f64 {
+        let eta_bsv = st[..model.n_eta].to_vec();
+        let kappas: Vec<Vec<f64>> = (0..groups.len())
+            .map(|g| {
+                st[model.n_eta + g * model.n_kappa..model.n_eta + (g + 1) * model.n_kappa].to_vec()
+            })
+            .collect();
+        crate::pk::predict_iov(&model, &subj, &theta, &eta_bsv, &kappas)[j]
+    };
+    // Value parity first: this is what a stale reset snapshot breaks.
+    for (j, o) in sens.obs.iter().enumerate() {
+        approx::assert_relative_eq!(o.f, pred(&stacked, j), max_relative = 1e-8, epsilon = 1e-10);
+    }
+    // Then the jets, against FD of the same production predictor.
+    let h = 1e-6;
+    for (j, o) in sens.obs.iter().enumerate() {
+        for k in 0..stacked.len() {
+            let mut sp = stacked.clone();
+            sp[k] += h;
+            let mut sm = stacked.clone();
+            sm[k] -= h;
+            let g = (pred(&sp, j) - pred(&sm, j)) / (2.0 * h);
+            approx::assert_relative_eq!(o.df_deta[k], g, max_relative = 2e-3, epsilon = 1e-6);
+        }
+    }
+    // Non-degeneracy: the post-reset observations must actually carry the reset row's
+    // baseline. `init = BASE/V` with `V = 20*(40/70)*exp(-0.05)` gives ~46.1 at t=3,
+    // decaying at `CL/V`; the previous record (`WT = 90`) would put it near 20.5 and the
+    // next (`WT = 150`) near 12.3, so a wide band still separates all three.
+    let t4 = sens.obs[2].f;
+    assert!(
+        (30.0..70.0).contains(&t4),
+        "post-reset prediction {t4:.4} is not the reset row's baseline: the previous \
+         record's snapshot lands near 20 and the next record's near 12"
+    );
 }
 
 /// **Estimated lagtime × time-varying covariates.** A 1-cpt oral ODE with a WT

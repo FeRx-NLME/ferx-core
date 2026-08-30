@@ -29,7 +29,7 @@ section of the SDLC for the versioning policy).
   analytic-sensitivity twin that supplies the FOCE/FOCEI gradient, the adaptive-dosing driver,
   and its frozen-schedule replay verifier), so fitted parameters, `predict()`, and
   `simulate_adaptive()` all move. Datasets with time-constant covariates, and models without an
-  `init(...)` seed, are unaffected. Note the remaining gap: an **analytical** model using
+  `init(...)` seed, are unaffected. Note the remaining gap (#1135): an **analytical** model using
   `[initial_conditions]` still drops its baseline at the first reset instead of re-depositing it.
 - **VI no longer freezes from ordinary starting values (#1097).** Adam's gradients are now
   clipped to a global L2 norm, controlled by the new `vi_grad_clip` fit option (default `1e4`;

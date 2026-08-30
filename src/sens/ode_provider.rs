@@ -759,10 +759,12 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     // it; `init` only affects the pre-SS-dose segments, which the walk carries via `init_state`
     // (validated by `ode_provider_tvcov_init_ss_matches_production`).
     // An EVID 3/4 **reset** also composes with `init` (#486): production re-applies
-    // `init(&last_pk.values)` at each reset, and the `K_RESET` branch of `integrate_tvcov_g`
-    // now mirrors that by re-seeding the state from the reset-event snapshot (via the shared
+    // `init(&pk_at_reset[idx].values)` at each reset — the reset ROW's own snapshot, since an
+    // EVID=3/4 row is a data record (#1133) — and the `K_RESET` branch of `integrate_tvcov_g`
+    // mirrors that by re-seeding the state from `pk_at_reset[idx]` (via the shared
     // `init_taylor_seed_at`, carrying `∂init/∂(θ,η)` at that snapshot) instead of zeroing —
-    // validated by `ode_provider_tvcov_init_reset_matches_production`.
+    // validated by `ode_provider_init_reset_midtimeline_reads_the_reset_rows_snapshot`, whose
+    // covariate moves at the reset row so the snapshot is observable.
     // With A–F all composing, `init(...)` is fully analytic on the non-IOV event-driven walk;
     // no per-feature FD clause remains here (IOV is gated separately in `ode_iov_supported`).
     // #530: modeled-`RATE`/duration doses are resolved from their PK slot as a live jet
@@ -1606,7 +1608,8 @@ fn tvcov_init_state<T: crate::sens::num::PkNum>(
 /// strict `t < best_t`, so at an exact tie the earliest-considered snapshot wins — dose over
 /// obs over pk-only, identical to production's `consider`. `None` when the subject has no
 /// records. Shared by [`tvcov_init_state`] (the initial `init` seed) and the event-driven
-/// walk's `last_params` seed (the reset re-seed's snapshot, #486 review) so the two can't drift.
+/// walk's `last_params` seed (#486 review) so the two can't drift. Since #1133 the reset
+/// re-seed does NOT read `last_params` — it reads the reset row's own `pk_at_reset[idx]`.
 fn first_record_pk<'a, T: crate::sens::num::PkNum>(
     subject: &Subject,
     pk_at_dose: &'a [Vec<T>],
@@ -1640,9 +1643,9 @@ fn first_record_pk<'a, T: crate::sens::num::PkNum>(
 /// snapshot `snap` (already seeded on `(θ, η[, κ])`), as a second-order Taylor of `init` in the
 /// PK params about `snap.val()`. Shared by [`tvcov_init_state`] (which selects the first-record
 /// snapshot, production's `init_pk`) and the event-driven walk's **EVID 3/4 reset** re-seed
-/// (which uses the reset-event snapshot — production's `last_pk`, #486): production re-applies
-/// `init(&last_pk.values)` at each reset, so the dual walk must rebuild the seed from the params
-/// in effect there, not carry the one subject-level jet.
+/// (which uses the reset ROW's own snapshot — production's `pk_at_reset[idx]`, #486 / #1133):
+/// production re-applies `init(...)` at each reset from the `$PK` that runs at that row, so the
+/// dual walk must rebuild the seed from those params, not carry the one subject-level jet.
 ///
 /// The `∂init/∂p` derivatives come from the shared [`init_fd_derivs`] stencil. Each delta
 /// `(p_i − p̄_i)` has value 0 and carries the snapshot's θ/η[/κ] jet, so `T`'s own product rule
@@ -4918,12 +4921,12 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     // infusion-end (neither carries a PK record — mirrors production's `last_pk`). Seeded with
     // the **first-record** snapshot (production's `init_pk`, dose-preferred on ties), not an
     // arbitrary array-first slice: a reset that is itself the first event (an EVID=4 reset+dose
-    // at `t = 0`) re-seeds `init` from `last_params` here (`init_taylor_seed_at` in the
-    // `K_RESET` branch), and production re-applies `init(&last_pk.values)` with
-    // `last_pk = init_pk.unwrap_or_default()` there — so the snapshot must match production's
-    // `init_pk`, or the reset re-seed (hence its gradient) diverges for that edge case
-    // (#486 review — Copilot). For every later reset `last_params` is overwritten by the most
-    // recent record, exactly as production updates `last_pk` (#486).
+    // at `t = 0`) is the one case where the two could diverge on the seed, and since #1133 the
+    // `K_RESET` branch reads `pk_at_reset[idx]` — the reset row's own snapshot — on both sides,
+    // so `last_params` no longer feeds the re-seed at all. It still seeds the walk's carry, and
+    // is still taken from `first_record_pk` (production's `init_pk`, dose-preferred on ties)
+    // rather than an arbitrary array-first slice (#486 review — Copilot). For every later
+    // record `last_params` is overwritten, exactly as production updates `last_pk` (#486).
     let mut last_params: &[T] =
         first_record_pk::<T>(subject, pk_at_dose, pk_at_obs, pk_at_pk_only).unwrap_or(&[]);
 
