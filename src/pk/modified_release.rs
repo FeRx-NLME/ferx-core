@@ -2286,10 +2286,10 @@ mod tests {
 
     /// The plain **dense** ODE driver: a second engine, not the one production
     /// takes. It walks one timeline from the first record and anchors `TAD` on
-    /// doses that have already arrived, so for a model with **no lagtime** it is
-    /// an independent reference for the same quantity. (Under a lagtime it is not
-    /// — it returns `NaN` for every observation, which is #1110; use
-    /// [`event_twin`] there and say so.)
+    /// doses that have already arrived, so it is an independent reference for the
+    /// same quantity. Since #1073 that holds under a lagtime too — it used to
+    /// return `NaN` for every observation there (#1110), which is why the callers
+    /// below that predate it use [`event_twin`] instead and say so.
     fn dense_twin(
         model: &crate::types::CompiledModel,
         subject: &crate::types::Subject,
@@ -2540,10 +2540,12 @@ mod tests {
         // The finite/positive assert above is the load-bearing half — that is the
         // #1110 symptom. The twin check below pins the *route* only: production is
         // the event-driven walk for this model, so this difference is exactly
-        // `0.0` by construction and its tolerance is never exercised. The dense
-        // engine cannot serve as the independent side here — under a lagtime it is
-        // the very thing that returns `NaN` — so the independent references for
-        // this cell are the NONMEM `tad_lag_{A,B}` anchors, not this assert.
+        // `0.0` by construction and its tolerance is never exercised. Kept as a
+        // route pin rather than swapped for `dense_twin`, because the dense engine
+        // is what #1110 broke on this exact shape; the independent references for
+        // this cell are the NONMEM `tad_lag_{A,B}` anchors, and — since #1073 gave
+        // the dense path a pre-arrival anchor — the engine comparison in
+        // `model_uses_time_anywhere`'s table (5.8e-12 under a lagtime).
         let twin = event_twin(&model, &subject, &theta, &eta);
         for (i, (&a, &b)) in prod.iter().zip(&twin).enumerate() {
             assert!(
@@ -2553,29 +2555,33 @@ mod tests {
         }
     }
 
-    /// The half of #1110 this fix does **not** reach, pinned so the CHANGELOG's
-    /// scoping stays honest and a later change to `tad_anchor` is visible here.
+    /// A pre-arrival observation on a `TAD`-reading RHS: finite, and it must not
+    /// perturb anything after it.
     ///
-    /// An observation recorded before the first dose *arrives* has no `TAD`:
-    /// `tad_anchor` finds no qualifying dose and returns `NaN`, which the RHS
-    /// multiplies into the state and which then poisons every later observation.
-    /// Measured one variable at a time — the lagtime is **not** the trigger:
+    /// This was the open half of #1110 until #1073 landed. `tad_anchor` returns
+    /// `NaN` when no effective prior dose exists — right for the sdtab column,
+    /// wrong as an RHS input, because it multiplied into the state and lost that
+    /// row *and every later one*. Measured on this branch before merging #1073,
+    /// one variable at a time, and note the lagtime was never the trigger:
     ///
-    /// | case                                    | result                  |
-    /// |-----------------------------------------|-------------------------|
-    /// | lag 0.5, obs 2/4/8/24 (all post-arrival)| finite                  |
-    /// | lag 0.5, obs 0.4 added                  | `[0.0, NaN, NaN, …]`    |
-    /// | lag 0.3, same obs list (0.4 now post)   | finite                  |
-    /// | **no lagtime**, dose at 1.0, obs at 0.4 | `[0.0, NaN, NaN, …]`    |
-    /// | autonomous RHS, lag 0.5, obs at 0.4     | finite                  |
+    /// | case | before #1073 | now |
+    /// |---|---|---|
+    /// | lag 0.5, obs 2/4/8/24 (all post-arrival) | finite | finite |
+    /// | lag 0.5, obs at 0.4 added | `[0.0, NaN, NaN, ...]` | finite |
+    /// | **no lagtime**, dose at 1.0, obs at 0.4 | `[0.0, NaN, NaN, ...]` | finite |
+    /// | autonomous RHS, lag 0.5, obs at 0.4 | finite | finite |
     ///
-    /// Pre-existing and unchanged by the routing fix: the dense predictor this
-    /// model used to take produces the identical `[0.0, NaN, …]`. What `TAD`
-    /// should mean before the first arrival is the open half of #1110; this test
-    /// asserts today's behaviour, not that it is right.
+    /// Both ODE predictors now anchor the pre-arrival window at the subject's
+    /// first arrival. A pre-dose baseline sample is a common design, so this is
+    /// worth a regression test of its own rather than resting on #1073's.
+    ///
+    /// The assertion that carries the weight is the **bit-identity** below: adding
+    /// a row before the first dose must not move any later prediction. A
+    /// finite-and-positive check alone would pass on a subtly perturbed
+    /// trajectory.
     #[test]
-    fn a_pre_arrival_observation_still_nans_a_tad_reading_rhs() {
-        // No lagtime at all — the trigger is the pre-arrival window, not the lag.
+    fn a_pre_arrival_observation_does_not_disturb_a_tad_reading_rhs() {
+        // No lagtime at all — the trigger was the pre-arrival window, not the lag.
         let src = r#"
 [parameters]
   theta TVCL(1.0, 0.001, 100.0)
@@ -2606,26 +2612,29 @@ mod tests {
                 DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
             ]
         };
-        // Control: every observation after the first arrival — finite, and the
-        // routing fix is what makes it so.
         let after = mk_subject(doses(), vec![2.0, 4.0, 8.0, 24.0]);
-        let ok = crate::pk::compute_predictions_with_tv(&model, &after, &theta, &eta);
+        let base = crate::pk::compute_predictions_with_tv(&model, &after, &theta, &eta);
         assert!(
-            ok.iter().all(|p| p.is_finite() && *p > 0.0),
-            "post-arrival observations must be finite, got {ok:?}"
+            base.iter().all(|p| p.is_finite() && *p > 0.0),
+            "post-arrival observations must be finite, got {base:?}"
         );
-        // Add one observation before the dose at t = 1.0. Everything after it is
-        // lost too — the `NaN` is carried in the state, not confined to that row.
+        // Add one observation before the dose at t = 1.0.
         let before = mk_subject(doses(), vec![0.4, 2.0, 4.0, 8.0, 24.0]);
-        let bad = crate::pk::compute_predictions_with_tv(&model, &before, &theta, &eta);
-        assert!(
-            bad[1..].iter().all(|p| p.is_nan()),
-            "known gap (#1110): one pre-arrival observation should still poison every \
-             later one — if this now passes, the pre-arrival `TAD` convention was \
-             decided and the CHANGELOG / docs must say so. Got {bad:?}"
+        let with_pre = crate::pk::compute_predictions_with_tv(&model, &before, &theta, &eta);
+        assert_eq!(
+            with_pre[0], 0.0,
+            "a pre-arrival observation carries no drug, got {with_pre:?}"
         );
-        // …and the dense predictor agrees, which is what makes it pre-existing
-        // rather than something the reroute introduced.
+        for (i, (&a, &b)) in with_pre[1..].iter().zip(&base).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "obs {i}: adding a pre-arrival row moved a later prediction, \
+                 {a} vs {b} without it"
+            );
+        }
+        // …and the dense predictor agrees, so the two engines answer the
+        // pre-arrival window the same way (they did not before #1073).
         let spec = model.ode_spec.as_ref().unwrap();
         let dense = crate::ode::ode_predictions(
             spec,
@@ -2634,11 +2643,12 @@ mod tests {
             &eta,
             &before,
         );
-        assert!(
-            dense[1..].iter().all(|p| p.is_nan()),
-            "the dense predictor this model used to take must show the same gap, \
-             got {dense:?}"
-        );
+        for (i, (&a, &b)) in with_pre.iter().zip(&dense).enumerate() {
+            assert!(
+                a.is_finite() && b.is_finite() && (a - b).abs() < 1e-8 * (1.0 + b.abs()),
+                "obs {i}: event-driven {a} vs dense {b}"
+            );
+        }
     }
 
     /// The routing widening also moves models that were **already correct** — a

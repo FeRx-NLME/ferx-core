@@ -19,7 +19,7 @@
 //!   declines, shared by the analytical, ODE, and sensitivity SS loops so their
 //!   troughs can't drift apart.
 
-use crate::types::Subject;
+use crate::types::{DoseEvent, Subject};
 use std::borrow::Cow;
 
 /// Resolve any modeled-`RATE` doses (#324, e.g. `RATE=-2` → modeled duration
@@ -76,6 +76,67 @@ pub(crate) fn resolve_subject_doses<'a>(
 ) -> Cow<'a, Subject> {
     resolve_subject_doses_with(subject, attr_map, |_| params)
 }
+
+/// For each slot of an ordered event timeline, the index of the **record that
+/// governs the segment ending there** (#1073).
+///
+/// NONMEM evaluates `$PK` at every data record and then advances *to* that record,
+/// so an interval is governed by the record that **terminates** it. Anything that is
+/// not a record — a lagged dose arrival, an infusion end, a zero-order cutoff, a
+/// per-route onset — supplies no parameters: it merely subdivides the interval its
+/// enclosing record terminates, and every piece of that interval runs on that
+/// record's snapshot.
+///
+/// `is_record(i)` reports whether timeline slot `i` is a record; the caller owns the
+/// mapping from a returned index back to its own snapshot type (`PkParams`,
+/// `PkDual<T>`, or a `&[T]` slice), which is why this resolves *indices* rather than
+/// values — materialising a `PkDual<Dual2<N>>` per event would put ~4.7 KB × n_events
+/// of copying on the FOCEI gradient hot path.
+///
+/// Two rules, and both must be identical in every engine — the four walks
+/// (`ode::predictions`, `pk::event_driven`, `sens::propagate`, `sens::ode_provider`)
+/// integrate the same subject, so a difference here is a silent cross-engine
+/// divergence that `Dual2`-vs-FD parity cannot see (FD perturbs a twin's own value
+/// path, so both sides move together):
+///
+/// 1. A record resolves to **itself**, and a non-record to the **next record ahead**
+///    (one backward scan — the answer for a non-record lies ahead of it in the walk).
+/// 2. Past the final record there is nothing ahead to terminate the segment, so it
+///    keeps the **last record that ran** (a forward fill). Not observable through
+///    predictions today — no observation follows such a boundary — but the four walks
+///    previously split two-and-two between the last record and the dose row here, and
+///    that becomes live the moment a trailing record, a reset, or a second pass reads
+///    the state.
+///
+/// Returns `None` in every slot only when the timeline contains no record at all — a
+/// subject with no observation, no EVID=2 row and no dose, which produces no
+/// prediction.
+pub(crate) fn governing_record_indices(
+    n_events: usize,
+    is_record: impl Fn(usize) -> bool,
+) -> Vec<Option<usize>> {
+    let mut acc: Vec<Option<usize>> = vec![None; n_events];
+    // Rule 1: backward scan. `seen` is set *before* `acc[i]` is written, so a record
+    // resolves to itself rather than to its successor.
+    let mut seen: Option<usize> = None;
+    for i in (0..n_events).rev() {
+        if is_record(i) {
+            seen = Some(i);
+        }
+        acc[i] = seen;
+    }
+    // Rule 2: forward fill the trailing tail (the only slots the backward scan left
+    // `None`, since every slot at or before the final record saw it).
+    let mut last: Option<usize> = None;
+    for slot in acc.iter_mut() {
+        match *slot {
+            Some(q) => last = Some(q),
+            None => *slot = last,
+        }
+    }
+    acc
+}
+
 /// Number of dosing cycles to simulate when pre-equilibrating an SS=1
 /// dose. With a typical t₁/₂/II ratio under 2 (the common clinical range)
 /// this is comfortably past saturation — each additional cycle adds
@@ -644,5 +705,197 @@ mod ss_warn_tests {
         assert_eq!(ss_max_magnitude(&[-3.0, 1.0]), 3.0);
         assert_eq!(ss_abs_increment(&[1.0, 2.0], &[1.0, 0.0]), 2.0);
         assert_eq!(ss_abs_increment(&[5.0], &[5.0]), 0.0);
+    }
+}
+
+/// `is_infusion()` only checks `rate > 0`, but a degenerate row with
+/// `rate > 0 && amt <= 0` (or NaN) yields `duration = amt/rate <= 0`
+/// (or NaN). Treating those as infusions would push an infusion-end
+/// break that sorts before the dose itself, and NaN would panic the
+/// break-time sort. Such rows fall back to the bolus branch instead
+/// (a zero/negative bolus update — visible, not silently dropped).
+pub(crate) fn is_real_infusion(d: &DoseEvent) -> bool {
+    // Tripwire (#324): every ODE entrypoint resolves modeled-RATE doses to
+    // `Fixed` (via `resolve_subject_doses*`) before any infusion logic runs, so
+    // a non-`Fixed` dose here means a path forgot to resolve — panic in debug /
+    // tests rather than silently mis-handling it (an unresolved modeled dose has
+    // `duration == 0`, so it would quietly degrade to a bolus).
+    debug_assert!(d.is_fixed(), "is_real_infusion: unresolved modeled dose");
+    d.is_infusion() && d.duration > 0.0 && d.duration.is_finite()
+}
+
+// ---------------------------------------------------------------------------
+// Where a lagged steady-state dose loads, and what the previous cycle leaves
+// running across the dose record (#1121).
+// ---------------------------------------------------------------------------
+
+/// Whether this steady-state dose's periodic state is loaded at its dose
+/// **record** and flowed forward to the lagged arrival (#1121), rather than
+/// equilibrated at the arrival itself.
+///
+/// NONMEM runs `$PK` at the dose row, loads the steady-state compartments there,
+/// and then ADVANs to the lagged arrival under the record that *terminates* that
+/// interval. Equilibrating at the arrival instead computes the trough throughout
+/// under the dose row's snapshot. The two agree exactly under flat covariates —
+/// a full-cycle propagation from phase `II − lag` returns to the trough — which
+/// is why the difference stayed invisible until a covariate changed inside the
+/// pre-arrival window.
+///
+/// `lag == 0` is excluded deliberately: record and arrival are the same instant,
+/// so there is nothing to propagate, and routing it through
+/// `ss_state_at_phase(…, II)` would integrate a full extra cycle and move every
+/// existing non-lagged SS result by solver error, for no gain.
+///
+/// Every call site reads this predicate rather than re-deriving the condition, so
+/// the seed and the arrival-side equilibration cannot drift into overlapping
+/// (double-load) or disjoint (no-load) coverage — and the analytic twin
+/// (`sens::ode_provider::integrate_tvcov_g`) shares it too, so its `K_SS_SEED`
+/// timeline break fires on exactly the doses production seeds. A twin that seeded
+/// on a wider or narrower set would disagree with production in *value*, which is
+/// the one thing the `check_vs_production` parity tests cannot forgive.
+pub(crate) fn ss_seeded_at_record(dose: &DoseEvent, lag: f64) -> bool {
+    dose.ss && dose.ii > 0.0 && lag > 0.0
+}
+
+/// Cycle phase the dose **record** sits at, for a steady-state dose seeded there.
+///
+/// The pulse preceding the record landed at `dose.time − ss_seed_phase(…)`, so a
+/// lagtime shorter than one interval puts it at `dose.time + lag − II` and the
+/// record reads the previous cycle's tail at phase `II − lag`.
+///
+/// # `lag ≥ II` clamps rather than wraps — measured, not assumed
+///
+/// A lagtime of a full interval or more has no phase `II − lag`. NONMEM 7.6.0
+/// **clamps** it to zero: the pulse lands on the record itself, so the record
+/// carries the steady-state *peak* (`nonmem_anchor/results/ss_lag_ge_ii.tab`,
+/// where an `ALAG1 = 15`, `II = 12` bolus reads `PRED(0) = 13.197 =
+/// (D/V)/(1 − e^{−k·II})`, the post-pulse peak, and decays from there with no
+/// intervening pulse before the real arrival at `t = 15`). It does **not** wrap
+/// the phase into `[0, II)`: wrapping would put `PRED(0)` at `2.1815` instead.
+///
+/// Clamping is also the only continuous choice, which matters because `ALAG` is
+/// routinely *estimated*: as `lag → II⁻` the phase tends to `0⁺` (the pulse has
+/// just landed) and at `lag = II` it is `0` (the pulse lands here), so nothing
+/// jumps as the outer optimizer walks a lagtime across the interval. Wrapping
+/// would step the whole pre-arrival window by a factor of `e^{−k·II}` at that
+/// crossing.
+pub(crate) fn ss_seed_phase(dose: &DoseEvent, lag: f64) -> f64 {
+    (dose.ii - lag).max(0.0)
+}
+
+/// End time of the previous cycle's infusion when it is **still running at the
+/// dose record** of a seeded steady-state dose — `None` when it has already
+/// finished (the ordinary case) or the dose is not an infusion.
+///
+/// The pulse before the record is at `dose.time − p` for `p = ss_seed_phase(…)`,
+/// so its infusion occupies `[dose.time − p, dose.time − p + T_inf]` and crosses
+/// the record whenever `p < T_inf`, i.e. `lag > II − T_inf`. The pre-arrival
+/// window must then carry `+rate` on `[dose.time, dose.time + (T_inf − p)]`:
+/// `ss_state_at_phase` hands back a state with the infusion mid-flight, and a
+/// walk that forgot the rate would silently resume the decay early.
+///
+/// Confirmed against NONMEM 7.6.0 (`nonmem_anchor/results/ss_lag_infusion.tab`):
+/// with `II = 12`, `T_inf = 6`, `ALAG1 = 8` the concentration *rises* from
+/// `6.5468` at the record to `6.8754` at `t = 0.5` and turns over at exactly
+/// `t = 2 = 8 − 12 + 6`.
+///
+/// Like every other infusion edge the window is `F`-reshaped (#419), so callers
+/// pass the same `f_bio` they used to build the dose's own window and the two
+/// edges cannot drift apart.
+///
+/// # `lag ≥ II` with an infusion is ferx's answer, not NONMEM's
+///
+/// Under the [`ss_seed_phase`] clamp this returns `dose.time + T_inf` — the
+/// previous cycle's infusion starting on the record, which is what the clamped
+/// phase means and is mass-balanced. NONMEM instead delivers `T_inf + (lag − II)`
+/// hours of drug for that geometry (measured: an `AMT = 600`, `RATE = 100`,
+/// `II = 12`, `ALAG1 = 14` dose infuses over `[0, 8]`, i.e. 800 mg), which is not
+/// a physical reading of a 600 mg dose. ferx does not reproduce it; see
+/// `docs/model-file/lagtime.qmd`.
+pub(crate) fn ss_residual_infusion_end(dose: &DoseEvent, lag: f64, f_bio: f64) -> Option<f64> {
+    if !ss_seeded_at_record(dose, lag) || !is_real_infusion(dose) {
+        return None;
+    }
+    let (_, t_inf) = dose.bioavailable_infusion(f_bio);
+    let phase = ss_seed_phase(dose, lag);
+    (phase < t_inf).then(|| dose.time + (t_inf - phase))
+}
+
+/// Whether flowing a seeded steady-state dose from its record to its lagged
+/// arrival lands back on the periodic **trough** — so a path that re-equilibrates
+/// at the arrival instead of propagating there gets the same number.
+///
+/// The seed sits at phase [`ss_seed_phase`] and the arrival is `lag` later, so
+/// the flowed phase is `(II − lag) + lag = II ≡ 0⁻`, the trough, for every
+/// `lag ≤ II`. Past that the clamp pins the seed at phase 0 and the arrival lands
+/// at phase `lag > II` — strictly further down the same decay than the trough —
+/// so re-equilibrating there silently *raises* the state back to a full cycle's
+/// accumulation. Measured at **+4.3 %** on an `ALAG1 = 15`, `II = 12` bolus at
+/// `t = 26` (`nonmem_anchor/results/ss_lag_ge_ii`), on the two paths that take
+/// the shortcut: the dense ODE predictor and the analytical superposition. Both
+/// event-driven walks propagate and were already right.
+///
+/// The paths that re-equilibrate keep doing so while this holds, deliberately:
+/// integrating a full extra cycle instead would move every existing SS+lagtime
+/// result by solver error for no gain.
+pub(crate) fn ss_arrival_is_trough(dose: &DoseEvent, lag: f64) -> bool {
+    lag <= dose.ii
+}
+
+#[cfg(test)]
+mod governing_record_tests {
+    use super::governing_record_indices;
+
+    /// `true` at every index in `records`.
+    fn idx(n: usize, records: &[usize]) -> Vec<Option<usize>> {
+        governing_record_indices(n, |i| records.contains(&i))
+    }
+
+    #[test]
+    fn a_record_governs_itself_and_a_non_record_takes_the_next_record_ahead() {
+        // slots:   0=DoseRecord  1=Dose(arrival)  2=Obs  3=InfusionEnd  4=Obs
+        let got = idx(5, &[0, 2, 4]);
+        assert_eq!(
+            got,
+            vec![Some(0), Some(2), Some(2), Some(4), Some(4)],
+            "a record resolves to itself; a non-record to the next record ahead"
+        );
+    }
+
+    #[test]
+    fn the_trailing_tail_keeps_the_last_record_that_ran() {
+        // Two non-records after the final record: nothing ahead terminates their
+        // segments, so both keep the last record. This is the rule the four engines
+        // used to split two-and-two on — `ode/predictions` and `sens/ode_provider`
+        // took the previous record, `pk/event_driven` and `sens/propagate` took the
+        // dose row — and it is why the resolution lives here rather than four times
+        // over. It is not observable through predictions (no observation follows such
+        // a boundary), which is exactly why it needs pinning at the resolver.
+        let got = idx(5, &[0, 2]);
+        assert_eq!(got, vec![Some(0), Some(2), Some(2), Some(2), Some(2)]);
+    }
+
+    #[test]
+    fn a_timeline_with_no_record_at_all_resolves_to_none_everywhere() {
+        // A subject with no observation, no EVID=2 row and no dose row produces no
+        // prediction; the callers fall back to their own seed snapshot there.
+        assert_eq!(idx(3, &[]), vec![None, None, None]);
+        assert_eq!(idx(0, &[]), Vec::<Option<usize>>::new());
+    }
+
+    #[test]
+    fn adjacent_records_each_govern_their_own_slot() {
+        // Co-timed records land as adjacent slots (the sort is stable and the
+        // zero-length segment between them is skipped by the walk). Each must resolve
+        // to itself, not to its neighbour — otherwise the segment arriving at a shared
+        // instant would read the wrong one of the two.
+        assert_eq!(idx(3, &[0, 1, 2]), vec![Some(0), Some(1), Some(2)]);
+    }
+
+    #[test]
+    fn a_leading_non_record_takes_the_first_record_ahead() {
+        // A dose arrival before any observation still runs on the record that
+        // terminates its interval.
+        assert_eq!(idx(3, &[2]), vec![Some(2), Some(2), Some(2)]);
     }
 }

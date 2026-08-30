@@ -7178,3 +7178,722 @@ fn ss_input_rate_linear_disposition_uses_fixed_point() {
     );
     assert!(preds.iter().all(|p| p.is_finite() && *p >= 0.0));
 }
+
+// ---------------------------------------------------------------------------
+// #1073 — which record's parameters govern each segment.
+//
+// NONMEM runs `$PK` at every data record and then ADVANs *to* that record, so a
+// segment is governed by the record that TERMINATES it. Events that are not
+// records — a lagged dose arrival, an infusion end, a zero-order cutoff, a
+// per-route onset — subdivide the interval their enclosing record terminates and
+// carry no parameters of their own.
+//
+// These assert the *segment parameters* through a hand-computed closed form
+// rather than an aggregated objective: an OFV moves for either half of the fix
+// and isolates neither. Each geometry gives a different clearance to the interval
+// under test than to its neighbours, so a segment taking the wrong record's
+// snapshot lands on a different number, not merely a different digit.
+// ---------------------------------------------------------------------------
+
+/// 1-cpt IV with a bare lagtime on the dose row's own snapshot.
+fn pk_one_lagged(cl: f64, v: f64, lag: f64) -> PkParams {
+    let mut p = pk_one(cl, v);
+    p.values[crate::types::PK_IDX_LAGTIME] = lag;
+    p
+}
+
+/// `one_cpt_ode_spec` at tolerances tight enough for the hand-computed closed
+/// forms below to be a genuine oracle rather than a two-digit sanity check: the
+/// default `1e-6`/`1e-8` leaves ~2e-6 of relative solver error, which is larger
+/// than several of the quantities under test deserve. `Rk45` is pinned so the
+/// `auto` stepper probe cannot silently change what these assert.
+fn one_cpt_ode_spec_tight() -> OdeSpec {
+    let mut ode = one_cpt_ode_spec();
+    ode.solver_opts.reltol = 1e-12;
+    ode.solver_opts.abstol = 1e-14;
+    ode.solver_opts.method = crate::ode::OdeMethod::Rk45;
+    ode
+}
+
+#[test]
+fn lagged_arrival_segment_runs_on_the_next_record_not_the_dose_row() {
+    // Two doses so the arrival lands with residual drug present: a single dose
+    // cannot test this at all, because the state is zero before a first arrival
+    // and the interval `[dose record, arrival]` propagates nothing.
+    //
+    //   t=0   dose (CL=20)      t=5  obs (CL=20)
+    //   t=10  dose row (CL=20, ALAG=2)  ->  arrival at t=12
+    //   t=20  obs (CL=5)
+    //
+    // `(10, 12]` is terminated by the t=20 observation, so it runs at CL=5. The
+    // dose row's CL=20 governs the advance INTO t=10 and nothing after it.
+    let ode = one_cpt_ode_spec_tight();
+    let (v, cl_a, cl_b) = (100.0, 20.0, 5.0);
+    let (ka, kb) = (cl_a / v, cl_b / v);
+
+    let doses = vec![
+        DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(10.0, 1000.0, 1, 0.0, false, 0.0),
+    ];
+    let subj = make_subject(doses, vec![5.0, 20.0]);
+    let pk_dose = vec![pk_one_lagged(cl_a, v, 0.0), pk_one_lagged(cl_a, v, 2.0)];
+    let pk_obs = vec![pk_one(cl_a, v), pk_one(cl_b, v)];
+
+    let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[]);
+
+    // (0,10] at CL=20; (10,12] at CL=5 (the t=20 record); bolus; (12,20] at CL=5.
+    let a12 = 1000.0 * (-10.0 * ka).exp() * (-2.0 * kb).exp();
+    let expected = (a12 + 1000.0) * (-8.0 * kb).exp();
+    // What stretching the dose row's snapshot to the arrival would have given.
+    let stale = (1000.0 * (-12.0 * ka).exp() + 1000.0) * (-8.0 * kb).exp();
+
+    assert_relative_eq!(preds[1], expected, epsilon = 1e-7, max_relative = 1e-7);
+    assert!(
+        (expected - stale).abs() > 20.0,
+        "the fixture must separate the two conventions: {expected} vs {stale}"
+    );
+}
+
+#[test]
+fn a_dose_record_governs_the_advance_into_its_own_time() {
+    // The other half of the fix, and the only geometry that isolates it: a dose
+    // row co-timed with an observation carrying a DIFFERENT snapshot. The dose
+    // record sorts first, so it — not the observation — terminates the incoming
+    // segment. (`io::datareader` nudges a co-timed observation one ULP earlier
+    // when the dose comes later in the file, which is how the opposite file order
+    // reaches the opposite answer; here the times are equal, i.e. dose-first.)
+    //
+    //   t=0   dose (CL=20)              t=5  obs (CL=20)
+    //   t=10  dose row (CL=5, ALAG=2)  +  obs (CL=40)   -> arrival at t=12
+    //   t=20  obs (CL=40)
+    let ode = one_cpt_ode_spec_tight();
+    let (v, cl_a, cl_dose, cl_obs) = (100.0, 20.0, 5.0, 40.0);
+    let (ka, k_dose) = (cl_a / v, cl_dose / v);
+
+    let doses = vec![
+        DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(10.0, 1000.0, 1, 0.0, false, 0.0),
+    ];
+    let subj = make_subject(doses, vec![5.0, 10.0, 20.0]);
+    let pk_dose = vec![pk_one_lagged(cl_a, v, 0.0), pk_one_lagged(cl_dose, v, 2.0)];
+    let pk_obs = vec![pk_one(cl_a, v), pk_one(cl_obs, v), pk_one(cl_obs, v)];
+
+    let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[]);
+
+    // (0,5] and (5,10] at CL=20 and CL=5 respectively — the second terminated by
+    // the DOSE record, not the co-timed observation.
+    let expected = 1000.0 * (-5.0 * ka).exp() * (-5.0 * k_dose).exp();
+    let stale = 1000.0 * (-5.0 * ka).exp() * (-5.0 * cl_obs / v).exp();
+
+    assert_relative_eq!(preds[1], expected, epsilon = 1e-7, max_relative = 1e-7);
+    assert!(
+        (expected - stale).abs() > 50.0,
+        "the fixture must separate the two conventions: {expected} vs {stale}"
+    );
+}
+
+#[test]
+fn a_zero_lagtime_dose_still_takes_its_own_row_for_the_incoming_segment() {
+    // Trap: with `ALAG = 0` the dose row IS the record terminating the incoming
+    // interval, so `(5, 10]` must take the dose row's snapshot. Skipping the
+    // dose-record break when the lagtime is zero — the obvious "optimisation" —
+    // is wrong in the opposite direction: the arrival is no longer a parameter
+    // source, so the segment would look forward past the dose to the t=20 record.
+    let ode = one_cpt_ode_spec_tight();
+    let (v, cl_a, cl_dose, cl_late) = (100.0, 20.0, 5.0, 40.0);
+    let (ka, k_dose, k_late) = (cl_a / v, cl_dose / v, cl_late / v);
+
+    let doses = vec![
+        DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(10.0, 1000.0, 1, 0.0, false, 0.0),
+    ];
+    let subj = make_subject(doses, vec![5.0, 20.0]);
+    let pk_dose = vec![pk_one(cl_a, v), pk_one(cl_dose, v)]; // both unlagged
+    let pk_obs = vec![pk_one(cl_a, v), pk_one(cl_late, v)];
+
+    let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[]);
+
+    let a10 = 1000.0 * (-5.0 * ka).exp() * (-5.0 * k_dose).exp();
+    let expected = (a10 + 1000.0) * (-10.0 * k_late).exp();
+    // Looking forward past the dose row would run (5,10] at the t=20 record's CL.
+    let stale =
+        (1000.0 * (-5.0 * ka).exp() * (-5.0 * k_late).exp() + 1000.0) * (-10.0 * k_late).exp();
+
+    assert_relative_eq!(preds[1], expected, epsilon = 1e-7, max_relative = 1e-7);
+    assert!(
+        (expected - stale).abs() > 2.0,
+        "the fixture must separate the two conventions: {expected} vs {stale}"
+    );
+}
+
+#[test]
+fn an_infusion_end_between_records_runs_on_the_terminating_record() {
+    // The same rule at the other non-record kind. An infusion end is a rate
+    // change, not a `$PK` evaluation, so the whole record interval containing it
+    // runs on that interval's terminating record — measured against NONMEM 7.6.0,
+    // which puts a 4.2 % prediction error on the previous-record reading this
+    // replaced. The closed-form engine (`pk/event_driven.rs`) already treats
+    // infusion edges as sub-interval bounds, so this also brings the two
+    // production engines into agreement.
+    //
+    //   t=0   bolus (CL=20)        t=5  obs (CL=20)
+    //   t=6   infusion 50 @ rate 100 (CL=20)  -> ends at t=6.5, no record there
+    //   t=7   obs (CL=5)
+    let ode = one_cpt_ode_spec_tight();
+    let (v, cl_a, cl_c) = (100.0, 20.0, 5.0);
+    let (ka, kc) = (cl_a / v, cl_c / v);
+
+    let doses = vec![
+        DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(6.0, 50.0, 1, 100.0, false, 0.0),
+    ];
+    let subj = make_subject(doses, vec![5.0, 7.0]);
+    let pk_dose = vec![pk_one(cl_a, v), pk_one(cl_a, v)];
+    let pk_obs = vec![pk_one(cl_a, v), pk_one(cl_c, v)];
+
+    let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[]);
+
+    // (0,6] at CL=20; (6, 6.5] and (6.5, 7] both at CL=5 (the t=7 record), the
+    // infusion delivering rate=100 over the first of the two.
+    let a6 = 1000.0 * (-6.0 * ka).exp();
+    let a65 = a6 * (-0.5 * kc).exp() + (100.0 / kc) * (1.0 - (-0.5 * kc).exp());
+    let expected = a65 * (-0.5 * kc).exp();
+    // The previous-record reading: (6, 6.5] at CL=20.
+    let stale_a65 = a6 * (-0.5 * ka).exp() + (100.0 / ka) * (1.0 - (-0.5 * ka).exp());
+    let stale = stale_a65 * (-0.5 * kc).exp();
+
+    assert_relative_eq!(preds[1], expected, epsilon = 1e-6, max_relative = 1e-6);
+    assert!(
+        (expected - stale).abs() > 1.0,
+        "the fixture must separate the two conventions: {expected} vs {stale}"
+    );
+}
+
+/// The adaptive walk's PK and occasion resolvers must land on the **same record**.
+///
+/// `seg_pk` is written into the RHS parameter slots and `seg_occ` picks the `eta`
+/// (`[η_bsv | κ_g]`) threaded alongside it. `event_pk.obs[j]` already embeds occasion
+/// `j`'s κ in its PK values, so if the two resolvers disagree the segment integrates PK
+/// carrying one window's κ against an `eta` carrying another's — incoherent whichever
+/// window is "right", and invisible to any prediction test that does not put a record
+/// and a non-record break in different decision windows.
+///
+/// This is asserted at the resolvers rather than through a simulation because the
+/// occasion half is otherwise unpinned: reverting `governing_segment_occ_at` to the
+/// pre-#1073 LOCF `segment_occ_at` passes all 220 adaptive tests.
+///
+/// Geometry: records at `t = 0` and `t = 30`, a non-record break at `t = 24`, and
+/// decisions at 0 and 24 — so `t = 24` opens a new occasion window while the record
+/// that *terminates* its interval (`t = 30`) sits in that later window and the LOCF
+/// carry still holds the earlier one. Every resolution below is therefore a genuine
+/// three-way choice.
+#[test]
+fn the_adaptive_segment_pk_and_occasion_resolve_to_the_same_record() {
+    use super::{governing_segment_occ_at, governing_segment_pk_at, AdaptiveRecordIndex};
+
+    let obs_times = [0.0_f64, 30.0];
+    let records = AdaptiveRecordIndex::new(&[], &[], &obs_times);
+
+    // Distinct PK per record so the resolved snapshot is identifiable, and occasions
+    // that differ across them (window 0 at t=0, window 1 at t=30).
+    let event_pk = crate::pk::EventPkParams {
+        dose: vec![],
+        obs: vec![pk_one(11.0, 100.0), pk_one(22.0, 100.0)],
+        pk_only: vec![],
+    };
+    let obs_occ = [Some(0_usize), Some(1_usize)];
+    // The LOCF carry the walk holds when it reaches the t=24 break: the earlier window.
+    let (last_pk, last_occ) = (pk_one(99.0, 100.0), Some(0_usize));
+
+    for &t_end in &[24.0_f64, 30.0] {
+        let pk = governing_segment_pk_at(t_end, &records, &event_pk, last_pk);
+        let occ = governing_segment_occ_at(t_end, &records, &[], &[], &obs_occ, last_occ);
+        // Both must resolve to the t=30 record: for `t_end = 30` it is the record
+        // itself, and for the non-record break at 24 it is the record that terminates
+        // the interval containing it.
+        assert_eq!(
+            pk.values[crate::types::PK_IDX_CL],
+            22.0,
+            "t_end={t_end}: segment PK must come from the t=30 record"
+        );
+        assert_eq!(
+            occ,
+            Some(1),
+            "t_end={t_end}: segment occasion must come from the SAME record as its PK; \
+             Some(0) means the occasion fell back to the LOCF carry while the PK looked \
+             ahead, so the segment would integrate one window's kappa against another's eta"
+        );
+    }
+
+    // Past the final record both fall back, and they must fall back together.
+    let pk = governing_segment_pk_at(31.0, &records, &event_pk, last_pk);
+    let occ = governing_segment_occ_at(31.0, &records, &[], &[], &obs_occ, last_occ);
+    assert_eq!(pk.values[crate::types::PK_IDX_CL], 99.0);
+    assert_eq!(occ, last_occ);
+}
+
+#[test]
+fn a_non_record_event_past_the_final_record_does_not_poison_the_walk() {
+    // Trap: the forward lookahead is undefined past the last record. An infusion
+    // whose end falls after the final observation has no terminating record, so the
+    // walk must not panic, read a default-initialised snapshot, or emit NaN.
+    //
+    //   t=0  bolus (CL=20)   t=5 obs (CL=20)   t=6 infusion 50 @ 100 -> ends 6.5
+    //   observations at t=5 and t=6.2, both BEFORE the infusion end.
+    //
+    // Deliberately NOT an assertion about *which* record the trailing segment picks:
+    // that choice is unobservable through predictions, because a segment ending after
+    // the final record precedes no observation by construction. The rule itself —
+    // "keep the last record that ran" — is pinned where it is observable, on the
+    // resolver, by `dosing::tests::governing_record_indices_*`; what matters here is
+    // that all four engines take it from that one helper. Do not "strengthen" this by
+    // asserting a number that no fallback can move.
+    //
+    // The *observable* half of the lookahead is made non-degenerate: the two records
+    // carry different `CL`, so the `(5, 6]` and `(6, 6.2]` segments are resolved to
+    // genuinely different snapshots and the exact value below still pins them.
+    let ode = one_cpt_ode_spec_tight();
+    let (v, cl_a, cl_c) = (100.0, 20.0, 5.0);
+    let (ka, kc) = (cl_a / v, cl_c / v);
+
+    let doses = vec![
+        DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(6.0, 50.0, 1, 100.0, false, 0.0),
+    ];
+    let subj = make_subject(doses, vec![5.0, 6.2]);
+    let pk_dose = vec![pk_one(cl_a, v), pk_one(cl_a, v)];
+    let pk_obs = vec![pk_one(cl_a, v), pk_one(cl_c, v)];
+
+    let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[]);
+    assert!(
+        preds.iter().all(|p| p.is_finite() && *p > 0.0),
+        "trailing non-record events must not produce NaN or a zeroed snapshot: {preds:?}"
+    );
+
+    // (0, 5] and (5, 6] on CL_A (the t=5 obs, then the t=6 dose record); (6, 6.2] on
+    // CL_C (the t=6.2 obs), with the infusion delivering rate=100 throughout it.
+    let a6 = 1000.0 * (-6.0 * ka).exp();
+    let expected = a6 * (-0.2 * kc).exp() + (100.0 / kc) * (1.0 - (-0.2 * kc).exp());
+    assert_relative_eq!(preds[1], expected, epsilon = 1e-6, max_relative = 1e-6);
+
+    // The previous-record reading of the final segment, so the fixture is live.
+    let stale = a6 * (-0.2 * ka).exp() + (100.0 / ka) * (1.0 - (-0.2 * ka).exp());
+    assert!(
+        (expected - stale).abs() > 1.0,
+        "the fixture must separate the two conventions: {expected} vs {stale}"
+    );
+}
+
+/// 1-cpt IV whose RHS reads the `TAD` builtin, so a NaN time-since-dose anchor
+/// propagates into the state instead of staying inert.
+fn one_cpt_tad_ode_spec() -> OdeSpec {
+    let mut ode = OdeSpec {
+        rhs: Box::new(|y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
+            let cl = p[crate::types::PK_IDX_CL];
+            let v = p[crate::types::PK_IDX_V];
+            let ke = if v > 0.0 { cl / v } else { 0.0 };
+            // `ext_params[MAX_PK_PARAMS + 1]` is the TAD anchor; the RHS reads
+            // `TAD = t − anchor` exactly as the compiled programs do.
+            let tad = t - p[crate::types::MAX_PK_PARAMS + 1];
+            dy[0] = -ke * y[0] * (1.0 + 0.3 * tad);
+        }),
+        n_states: 1,
+        state_names: vec!["central".into()],
+        readout: OdeReadout::ObsCmt(0),
+        diffusion_var: Vec::new(),
+        solver_opts: OdeSolverOptions::default(),
+        input_rate: Vec::new(),
+        rhs_program: None,
+        readout_program: None,
+        indiv_param_program: None,
+        dose_attr_map: Default::default(),
+        init_fn: None,
+    };
+    ode.solver_opts.method = crate::ode::OdeMethod::Rk45;
+    ode.solver_opts.reltol = 1e-12;
+    ode.solver_opts.abstol = 1e-14;
+    ode
+}
+
+#[test]
+fn a_tad_reading_rhs_survives_the_pre_arrival_segment_of_a_lagged_first_dose() {
+    // #1073 opened a real `(d.time, arrival]` segment ahead of every lagged dose.
+    // For a FIRST dose no dose has arrived when that segment integrates, so the
+    // TAD anchor has nothing to point at. Answering NaN there multiplies into the
+    // state (`0.0 * NaN = NaN`) and poisons every later prediction — turning a
+    // finite fit into the 1e20 objective sentinel. The anchor must stay finite.
+    //
+    // The pre-arrival state is zero here, so the anchor's *value* cannot change
+    // the trajectory: the assertion is the closed form for a plain lagged bolus,
+    // where TAD is measured from the arrival over the whole observed range.
+    let ode = one_cpt_tad_ode_spec();
+    let (v, cl, lag) = (100.0, 20.0, 0.5);
+
+    let doses = vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)];
+    let subj = make_subject(doses, vec![2.0, 4.0, 8.0]);
+    let pk_dose = vec![pk_one_lagged(cl, v, lag)];
+    let pk_obs = vec![pk_one(cl, v); 3];
+
+    let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[]);
+    assert!(
+        preds.iter().all(|p| p.is_finite()),
+        "a NaN TAD anchor in the pre-arrival segment poisoned the trajectory: {preds:?}"
+    );
+
+    // `dA/dt = -k·A·(1 + 0.3·(t − τ))` with `τ = 0.5` integrates to
+    // `A(t) = A(τ)·exp(−k[(t−τ) + 0.15(t−τ)²])`.
+    let k = cl / v;
+    for (j, &t) in [2.0_f64, 4.0, 8.0].iter().enumerate() {
+        let tad = t - lag;
+        let expected = 1000.0 * (-k * (tad + 0.15 * tad * tad)).exp();
+        assert_relative_eq!(preds[j], expected, epsilon = 1e-6, max_relative = 1e-5);
+    }
+}
+
+#[test]
+fn both_production_ode_predictors_agree_on_tad_before_the_first_arrival() {
+    // `compute_predictions_ode` picks between the two production ODE predictors on
+    // `subject.has_resets()` (`pk/mod.rs`). So if they answer `TAD` differently in the
+    // pre-arrival window, two subjects of the SAME model and the SAME data shape behave
+    // differently — one finite, its neighbour carrying an EVID=3/4 row poisoned into the
+    // `1e20` objective sentinel, or the reverse. That split is not a tolerance question;
+    // it is a user-visible fork, and it is what this pins.
+    //
+    // Both are called directly on one reset-free subject, so the comparison is of the
+    // predictors and nothing else. The observation at `t = 0.2` sits inside the
+    // `(dose row, arrival]` window that #1073 opened; the two after it check that
+    // agreeing in the window did not cost agreement outside it.
+    let ode = one_cpt_tad_ode_spec();
+    let (v, cl, lag) = (100.0, 20.0, 0.5);
+
+    let doses = vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)];
+    let subj = make_subject(doses, vec![0.2, 2.0, 4.0]);
+    let pk_lagged = pk_one_lagged(cl, v, lag);
+
+    let dense = ode_predictions(&ode, &pk_lagged.values, &[], &[], &subj);
+    let walk = ode_predictions_event_driven(
+        &ode,
+        &subj,
+        &[],
+        &[],
+        &[pk_lagged],
+        &vec![pk_lagged; 3],
+        &[],
+    );
+
+    assert!(
+        dense.iter().all(|p| p.is_finite()),
+        "the dense predictor answered NaN for a TAD-reading RHS in the pre-arrival \
+         window, poisoning the trajectory: {dense:?}"
+    );
+    assert!(
+        walk.iter().all(|p| p.is_finite()),
+        "the event-driven walk answered NaN in the pre-arrival window: {walk:?}"
+    );
+    for (j, (d, w)) in dense.iter().zip(walk.iter()).enumerate() {
+        assert_relative_eq!(d, w, epsilon = 1e-6, max_relative = 1e-5);
+        let _ = j;
+    }
+
+    // And the value, so this is not merely "the two agree on something". Before the
+    // arrival the compartment is empty; after it,
+    // `dA/dt = -k·A·(1 + 0.3·(t − τ))` integrates to
+    // `A(t) = A(τ)·exp(−k[(t−τ) + 0.15(t−τ)²])`.
+    let k = cl / v;
+    assert_relative_eq!(dense[0], 0.0, epsilon = 1e-9);
+    for (j, &t) in [2.0_f64, 4.0].iter().enumerate() {
+        let tad = t - lag;
+        let expected = 1000.0 * (-k * (tad + 0.15 * tad * tad)).exp();
+        assert_relative_eq!(dense[j + 1], expected, epsilon = 1e-6, max_relative = 1e-5);
+    }
+}
+
+#[test]
+fn the_pre_arrival_tad_anchor_does_not_depend_on_the_sampling_mesh() {
+    // The anchor is recomputed per segment, so a fallback that keys off the segment
+    // START restarts `TAD` at zero at every record inside the pre-arrival window —
+    // a sawtooth whose shape is set by where samples happen to fall. It has to key
+    // off something invariant: the subject's first arrival.
+    //
+    // `init(central)` is what makes this observable. Without it the pre-arrival state
+    // is zero, so no anchor can change the trajectory; with it the baseline decays
+    // across the window under a `TAD`-reading RHS and the anchor is live.
+    //
+    // Two physically identical subjects — same dose, same lagtime, same baseline —
+    // differing ONLY by one extra observation at t=1, inside the pre-arrival window
+    // `(0, 1.5)`. Every shared observation must agree exactly. Measured before the
+    // fix: they diverged by 4.2e-4 at t=2, t=4 AND t=8 — the same relative offset at
+    // every later time, injected once inside the window and then carried
+    // multiplicatively.
+    let mut ode = one_cpt_tad_ode_spec();
+    ode.init_fn = Some(Box::new(|p: &[f64]| {
+        // Baseline is the (otherwise unused) KA slot, so the spec's CL/V keep their
+        // meaning in the RHS.
+        vec![p[crate::types::PK_IDX_KA]]
+    }));
+
+    let (v, cl, lag, base) = (100.0, 20.0, 1.5, 70.0);
+    let pk = {
+        let mut p = pk_one_lagged(cl, v, lag);
+        p.values[crate::types::PK_IDX_KA] = base;
+        p
+    };
+
+    let run = |obs: Vec<f64>| -> Vec<f64> {
+        let doses = vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)];
+        let subj = make_subject(doses, obs.clone());
+        let pk_dose = vec![pk];
+        let pk_obs = vec![pk; obs.len()];
+        ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[])
+    };
+
+    let coarse = run(vec![0.5, 2.0, 4.0, 8.0]);
+    let fine = run(vec![0.5, 1.0, 2.0, 4.0, 8.0]);
+    assert!(
+        coarse.iter().chain(fine.iter()).all(|p| p.is_finite()),
+        "a non-finite TAD anchor poisoned the pre-arrival window: {coarse:?} / {fine:?}"
+    );
+
+    // Shared times: coarse[0] ↔ fine[0] (t=0.5), then coarse[1..] ↔ fine[2..].
+    assert_relative_eq!(coarse[0], fine[0], epsilon = 1e-12, max_relative = 1e-12);
+    for (c, f) in coarse[1..].iter().zip(fine[2..].iter()) {
+        assert_relative_eq!(*c, *f, epsilon = 1e-12, max_relative = 1e-12);
+    }
+    // Guard the guard: the sample at t=0.5 sits INSIDE the pre-arrival window, and it
+    // must show the baseline genuinely decaying — strictly below `base`, strictly
+    // above zero. Without that the agreement above would hold for a trajectory the
+    // anchor cannot reach, and the test would pass for the wrong reason.
+    assert!(
+        coarse[0] > 1e-3 && coarse[0] < base,
+        "fixture must keep live init state inside the pre-arrival window: {coarse:?}"
+    );
+}
+
+/// The `dose_form_lag_ss` anchor's `[odes]`: oral `depot → central`, reading
+/// `CL`/`V`/`KA` from the PK snapshot. Mirrors the `$DES` in
+/// `nonmem_anchor/dose_form_lag_ss.ctl` term for term.
+fn oral_depot_central_ode_spec() -> OdeSpec {
+    OdeSpec {
+        rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+            let cl = p[crate::types::PK_IDX_CL];
+            let v = p[crate::types::PK_IDX_V];
+            let ka = p[crate::types::PK_IDX_KA];
+            dy[0] = -ka * y[0];
+            dy[1] = ka * y[0] - if v > 0.0 { cl / v } else { 0.0 } * y[1];
+        }),
+        n_states: 2,
+        state_names: vec!["depot".into(), "central".into()],
+        readout: OdeReadout::ObsCmt(1),
+        diffusion_var: Vec::new(),
+        solver_opts: OdeSolverOptions {
+            abstol: 1e-12,
+            reltol: 1e-10,
+            ..OdeSolverOptions::default()
+        },
+        input_rate: Vec::new(),
+        rhs_program: None,
+        readout_program: None,
+        indiv_param_program: None,
+        dose_attr_map: Default::default(),
+        init_fn: None,
+    }
+}
+
+/// **#1121 — the SS + lagtime pre-arrival seed, pinned against NONMEM directly.**
+///
+/// `nonmem_anchor/results/dose_form_lag_ss.tab` tabulates `PRED` — the η = 0
+/// population prediction — at the SS dose *record itself* (`TIME = 0`, an
+/// `MDV = 1` row): `2.8687E-01`. Nothing downstream has happened at that instant:
+/// the lagged pulse has not arrived and no propagation has run, so that number is
+/// `A(central)/V` for the periodic trough at phase `II − ALAG`, evaluated under
+/// the dose row's own covariates (`WT = 70`, giving `CL = 10`, `KA = 1`). It is a
+/// readout of `ss_state_at_phase(…, II − lag)` and of nothing else.
+///
+/// Confirmed independently of *both* codebases by hand, from the 1-cpt oral
+/// steady-state closed form:
+///
+/// ```text
+///   A2(τ) = F·D·KA/(KA−ke)·[ e^(−ke·τ)/(1−e^(−ke·II)) − e^(−KA·τ)/(1−e^(−KA·II)) ]
+///   ke = 0.2, KA = 1, II = 12, τ = II − ALAG = 11.3, D = 100, F = 1
+///         = 125·(0.1147595 − 0.0000124) = 14.34339   →   /V = 0.2868678
+/// ```
+///
+/// against NONMEM's `0.28687` — agreement to six significant figures, which is
+/// all the five-digit `$TABLE` format can express.
+///
+/// Why this is worth a test of its own, separate from the pointwise `PRED`
+/// comparison in `tests/dose_form_lag_nonmem_anchor.rs`: that one cannot reach
+/// `t = 0` at all, because the row is `MDV = 1` and `predict()` returns nothing
+/// for it. So the seed — the single quantity #1121 is about — is only ever
+/// observable there *through* the propagation and the bolus. Isolating it means a
+/// failure here says "the phase or the snapshot is wrong" and a failure there
+/// says "the propagation is", instead of one ambiguous red.
+#[test]
+fn ss_state_at_phase_matches_nonmem_at_the_dose_record() {
+    // η = 0 at the anchor's initial estimates, evaluated at the dose row's own
+    // WT = 70: CL = 10·(70/70)^0.75, V = 50, KA = 1·(70/70)^0.75, ALAG1 = 0.7.
+    let (cl, v, ka, lag, ii, amt) = (10.0, 50.0, 1.0, 0.7, 12.0, 100.0);
+    let mut pk = pk_one(cl, v);
+    pk.values[crate::types::PK_IDX_KA] = ka;
+    pk.values[crate::types::PK_IDX_LAGTIME] = lag;
+
+    let ode = oral_depot_central_ode_spec();
+    // CMT = 1 (1-based) is the depot — the compartment the dose lands in.
+    let dose = DoseEvent::new(0.0, amt, 1, 0.0, true, ii);
+    assert!(dose.ss && dose.ii > 0.0, "precondition: this is an SS dose");
+
+    let u = ss_state_at_phase(&ode, &pk.values, &dose, ii - lag, &ode.solver_opts);
+
+    // `PRED` at `TIME = 0`, `nonmem_anchor/results/dose_form_lag_ss.tab`.
+    const NM_PRED_AT_RECORD: f64 = 2.8687e-01;
+    assert_relative_eq!(u[1] / v, NM_PRED_AT_RECORD, max_relative = 1e-4);
+
+    // Non-degeneracy: the depot leg must be live too, or this pins only the
+    // central compartment and a wrong `KA` inside the seed would slip through.
+    // NONMEM tabulates no depot amount, but the same steady-state algebra gives it
+    // in closed form — the prior pulse's undecayed remainder at phase `II − lag`:
+    //
+    //     A1(τ) = F·D·e^(−KA·τ)/(1 − e^(−KA·II))
+    //           = 100·e^(−11.3)/(1 − e^(−12)) = 1.23730e-3
+    //
+    // Tiny in absolute terms, but pinned rather than merely bounded: a loose
+    // `> 0` would pass for any `KA`, which is the whole point of checking it.
+    assert_relative_eq!(u[0], 1.237_30e-3, max_relative = 1e-6);
+
+    // And the seed must genuinely differ from the bare trough, or the whole
+    // distinction #1121 rests on is untested by this fixture: at phase `II` the
+    // pulse has decayed a further `lag`, so the trough is strictly lower.
+    let trough = equilibrate_ss_state(&ode, &pk.values, &dose, &ode.solver_opts);
+    assert!(
+        trough[1] < u[1] * 0.95,
+        "phase II−lag must be materially above the phase-II trough \
+         (seed {}, trough {}) — otherwise this fixture cannot tell the two apart",
+        u[1],
+        trough[1]
+    );
+}
+
+/// **Which steady-state doses get the record-time seed, and at what phase (#1121).**
+///
+/// The predicate and the phase are shared by five paths — the two production
+/// walks, their two dual twins, and the dense/superposition static paths — so
+/// their boundaries are worth pinning directly rather than inferring them from
+/// whichever path a later test happens to exercise. A seed and an arrival-time
+/// equilibration must be exactly complementary: both firing loads the trough
+/// twice, neither firing leaves the compartments empty.
+///
+/// `lag == 0` is the one exclusion, and it is deliberate: record and arrival are
+/// the same instant, so there is nothing to propagate, and routing it through
+/// `ss_state_at_phase(…, II)` would integrate a full extra cycle and move every
+/// existing non-lagged SS result by solver error.
+///
+/// `lag >= II` **is** seeded, at a phase CLAMPED to zero rather than wrapped into
+/// `[0, II)`. That is NONMEM 7.6.0's convention, measured rather than assumed
+/// (`nonmem_anchor/results/ss_lag_ge_ii.tab`), and it is the only continuous
+/// choice: `ALAG` is routinely estimated, so a phase that jumped by a factor
+/// `e^{−k·II}` as the outer optimizer walked the lagtime across `II` would put a
+/// step in the objective. `ss_lag_ge_ii_pre_arrival_matches_nonmem` pins the
+/// resulting *prediction*; this pins the arithmetic it comes from.
+#[test]
+fn ss_record_seed_declines_a_zero_lag_only() {
+    let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
+
+    assert!(
+        ss_seeded_at_record(&dose, 0.7),
+        "an ordinary lagged SS dose"
+    );
+    assert!(
+        !ss_seeded_at_record(&dose, 0.0),
+        "no lag: record and arrival coincide, so the arrival equilibrates as before"
+    );
+    for lag in [12.0, 20.0] {
+        assert!(
+            ss_seeded_at_record(&dose, lag),
+            "a lag of a full interval or more is still seeded — at a clamped phase"
+        );
+    }
+
+    // The phase itself: `II − lag` while that is positive, then pinned at 0.
+    assert_relative_eq!(ss_seed_phase(&dose, 0.7), 11.3, max_relative = 1e-12);
+    assert_relative_eq!(ss_seed_phase(&dose, 11.999), 0.001, max_relative = 1e-9);
+    assert_eq!(ss_seed_phase(&dose, 12.0), 0.0);
+    assert_eq!(
+        ss_seed_phase(&dose, 20.0),
+        0.0,
+        "clamped, NOT wrapped to 4.0"
+    );
+
+    // Complementarity of the *arrival-side* shortcut: the paths that re-equilibrate
+    // at the arrival rather than propagating there are exact only while the flowed
+    // state is the trough, which is exactly `lag <= II`.
+    assert!(ss_arrival_is_trough(&dose, 0.7));
+    assert!(ss_arrival_is_trough(&dose, 12.0));
+    assert!(!ss_arrival_is_trough(&dose, 12.001));
+
+    // A non-SS dose is never seeded however it is lagged, and an SS record with no
+    // dosing interval is not a steady state at all.
+    let plain = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
+    assert!(!ss_seeded_at_record(&plain, 0.7));
+    let ss_no_ii = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 0.0);
+    assert!(!ss_seeded_at_record(&ss_no_ii, 0.7));
+}
+
+/// **The previous cycle's infusion when it is still running at the dose record
+/// (#1121).**
+///
+/// `ss_state_at_phase` hands back a state with the infusion mid-flight whenever
+/// the seed phase falls inside the window; the walk must then carry `+rate` for
+/// the rest of it. The window is what every engine breaks and gates on, so pin
+/// its edge here rather than only through a prediction.
+///
+/// Measured against NONMEM 7.6.0 (`nonmem_anchor/results/ss_lag_infusion.tab`):
+/// with `II = 12`, `T_inf = 6`, `ALAG1 = 8`, the concentration *rises* off the
+/// record and turns over at exactly `t = 2 = 8 − 12 + 6`.
+#[test]
+fn ss_residual_infusion_window_ends_where_the_previous_cycle_does() {
+    // AMT 600 at RATE 100 => `DoseEvent::new` derives T_inf = 6, against II = 12.
+    let inf = DoseEvent::new(0.0, 600.0, 1, 100.0, true, 12.0);
+    assert_relative_eq!(inf.duration, 6.0, max_relative = 1e-12);
+
+    // lag <= II − T_inf: the previous cycle finished before the record.
+    assert_eq!(ss_residual_infusion_end(&inf, 0.2, 1.0), None);
+    assert_eq!(
+        ss_residual_infusion_end(&inf, 6.0, 1.0),
+        None,
+        "phase == T_inf"
+    );
+
+    // lag > II − T_inf: it is still running, and stops at `d.time + (T_inf − phase)`.
+    let end = ss_residual_infusion_end(&inf, 8.0, 1.0).expect("still running at the record");
+    assert_relative_eq!(end, 2.0, max_relative = 1e-12);
+    // Continuous at the boundary rather than switching on with a finite window.
+    let just_past = ss_residual_infusion_end(&inf, 6.0 + 1e-9, 1.0).expect("just inside");
+    assert!(just_past > 0.0 && just_past < 1e-8);
+    // Under the phase clamp, `lag >= II` puts the whole window on the record.
+    assert_relative_eq!(
+        ss_residual_infusion_end(&inf, 14.0, 1.0).expect("clamped phase 0"),
+        6.0,
+        max_relative = 1e-12
+    );
+
+    // A bolus has no window however it is lagged, and neither does an unseeded dose.
+    let bolus = DoseEvent::new(0.0, 600.0, 1, 0.0, true, 12.0);
+    assert_eq!(ss_residual_infusion_end(&bolus, 8.0, 1.0), None);
+    assert_eq!(
+        ss_residual_infusion_end(&inf, 0.0, 1.0),
+        None,
+        "lag 0 is not seeded"
+    );
+
+    // `F` reshapes a rate-defined window (#419), so the residual edge moves with it —
+    // and the caller must pass the same `f_bio` it built the dose's own window from.
+    // At F = 0.5 the window is only 3 h, so a phase of 4 is already past its end and
+    // there is no residual at all: the same lag that HAS one at F = 1 does not here.
+    assert_eq!(ss_residual_infusion_end(&inf, 8.0, 0.5), None);
+    // At F = 0.9 the window is 5.4 h, so a phase of 4 is still inside it.
+    assert_relative_eq!(
+        ss_residual_infusion_end(&inf, 8.0, 0.9).expect("F·T_inf = 5.4 > phase 4"),
+        1.4,
+        max_relative = 1e-12
+    );
+}

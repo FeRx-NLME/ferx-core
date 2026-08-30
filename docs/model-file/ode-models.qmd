@@ -54,6 +54,26 @@ Expressions can reference:
   that aren't assigned in the firing branch this step receive a derivative
   of `0`.
 
+### `TAD` before the first dose arrives
+
+`TAD` is time since the most recent dose *arrival* — the dose record's time plus
+its `ALAG`. Under a lagtime a subject therefore has a window between the first
+dose row and that dose landing, and any observation or integrator step inside it
+precedes every arrival. There `TAD` reads relative to the subject's **first
+arrival**, so it is negative in that window and reaches `0` when the dose lands.
+
+Before ferx 0.3 this window read `NaN` instead, which multiplied into the
+compartment state and turned any fit of an `[odes]` RHS referencing `TAD` into
+the `1e20` objective sentinel. The value is now finite, and it depends only on
+the subject's dosing — not on where observations happen to fall — so adding a
+sample inside that window cannot move a later prediction. What `TAD` *should*
+mean before a dose has arrived is still open
+([#1110](https://github.com/FeRx-NLME/ferx-core/issues/1110)); a model that reads
+`TAD` in that window should guard it explicitly rather than rely on the sign.
+
+A subject with **no** doses at all still reads `NaN` — `TAD` has no referent
+there — matching the sdtab column.
+
 Every name in an ODE expression must resolve to a declared state, an individual
 parameter, an intermediate variable assigned earlier in the block, or one of the
 reserved builtins `TIME`/`TAFD`/`TAD`/`MACHEPS`. A name that matches none of

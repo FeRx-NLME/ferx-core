@@ -34,14 +34,45 @@ section of the SDLC for the versioning policy).
   time-invariance probe samples two times and could not see any of them. Models that do not
   read model time are unaffected and keep the fast path.
 - **An `[odes]` RHS that reads `TAD` together with a lagtime no longer returns `NaN`
-  predictions, for observations after the first dose arrives (#1110).** The dense predictor
-  anchored `TAD` on doses that had already arrived, and under a lagtime none has at the first
-  segment's start, so every prediction came back `NaN`. These models now take the event-driven
-  predictor, whose timeline starts at the lagged arrival. Two parts of #1110 stay open and are
-  **not** fixed here: an observation recorded *before* the first dose arrives still returns
-  `NaN` for that observation and every later one, on both predictors and with or without a
-  lagtime (`TAD` is undefined there, and the `NaN` propagates through the solve); and the
-  variance path used by `[diffusion]` / EKF models still reaches the dense predictor (#1131).
+  predictions (#1110).** The dense predictor anchored `TAD` on doses that had already arrived,
+  and under a lagtime none has at the first segment's start, so every prediction came back
+  `NaN`. These models now take the event-driven predictor, whose timeline starts at the lagged
+  arrival. (#1073, released alongside this, independently gives the dense predictor a
+  pre-arrival anchor, so the two engines now agree to 6e-12 on such a model rather than one of
+  them being unusable.) One part of #1110 stays open and is **not** fixed here: the variance
+  path used by `[diffusion]` / EKF models still reaches the dense predictor with empty
+  parameter slices, returning `p_obs = NaN` and `ipred = 0` for any `TAD`-reading right-hand
+  side, with or without a lagtime (#1131).
+- **A steady-state dose with a lagtime is now seeded at the dose record, not equilibrated at the
+  arrival (#1121).** Under time-varying covariates an `SS=1` dose carrying an `ALAG` had its
+  periodic trough computed *at the lagged arrival*, entirely under the dose row's covariate
+  values. NONMEM loads the trough at the dose **record** (phase `II − ALAG`) and advances to the
+  arrival under the record governing that interval, so ferx applied too little elimination across
+  the pre-arrival window and ran high for the rest of the cycle. On an eight-subject anchor
+  (`nonmem_anchor/dose_form_lag_ss`) this was worth **7.67 objective units**; predictions are now
+  within 1e-4 of NONMEM 7.6.0 point by point. Flat-covariate fits are unaffected — the two
+  constructions agree exactly when nothing changes inside the window, which is why this went
+  unnoticed. The same fix gives the IOV predictor a pre-arrival state, where it previously read
+  zero for any observation between an `SS` dose's record and its lagged arrival.
+- **A steady-state infusion whose previous cycle is still running at the dose record keeps
+  delivering (#1121).** When `ALAG > II − T_inf` the pulse before the record is recent enough that
+  its infusion has not finished, so the rate flows on past the record and stops at
+  `record + (T_inf − phase)`. That window belongs to no dose row, and every engine dropped it —
+  reading about **4 %** low across the whole pre-arrival window and, since the two production
+  engines and the dense predictor disagreed about it, giving the same model different answers
+  depending only on whether the subject happened to carry a time-varying covariate. Now carried
+  explicitly and matched against NONMEM 7.6.0 (`nonmem_anchor/ss_lag_infusion`).
+- **A lagtime of a full dosing interval or longer on a steady-state dose is now supported
+  (#1121).** `ALAG >= II` has no phase `II − ALAG`; ferx now clamps it to zero, matching NONMEM —
+  the pulse lands on the dose record, so the record carries the steady-state peak and decays from
+  there. Previously the event-driven walks returned exactly `0` for the whole pre-arrival window
+  (under a proportional error model, a very loud failure), while the static predictors wrapped the
+  phase into `[0, II)` and then re-equilibrated at an arrival that is no longer the periodic
+  trough, running about 4 % high after it. Clamping is also continuous in `ALAG`, so an
+  *estimated* lagtime no longer steps the objective as the optimiser walks it across the interval.
+  One corner is a deliberate divergence: for an `ALAG >= II` **infusion** NONMEM delivers
+  `T_inf + (ALAG − II)` hours of drug rather than the dose's own `T_inf`, which is not
+  mass-balanced; ferx does not reproduce it. See `docs/model-file/lagtime.qmd`.
 - **VI no longer freezes from ordinary starting values (#1097).** Adam's gradients are now
   clipped to a global L2 norm, controlled by the new `vi_grad_clip` fit option (default `1e4`;
   `0` restores the old behaviour). Under a proportional error model a prediction near zero
@@ -71,6 +102,33 @@ section of the SDLC for the versioning policy).
   now correct but slower, on both the outer and inner loops and under IOV; the fit reports
   `gradient_method_inner = finite differences`. Models reading `TAD` **without** a lagtime, or
   reading `TAFD` **with** one, are unaffected and keep the analytic route.
+- **A lagged dose's covariate snapshot no longer stretches to its arrival (#1073).** With a
+  lagtime, ferx broke the integration timeline only at the arrival `t + ALAG`, never at the dose
+  row's own time, so the dose row's covariate / IOV snapshot governed everything up to the
+  arrival. NONMEM evaluates `$PK` at every data record and then advances *to* that record, so the
+  interval containing a lagged arrival belongs to the record that **terminates** it. On the
+  committed multi-dose anchor this was worth **14.89 OFV** (ferx `−474.660106` vs NONMEM
+  `−459.772592`); it is now `~1e-5`. Applying the same rule to the other non-record boundaries —
+  an infusion end, a zero-order absorption cutoff, a per-route onset falling strictly between two
+  records — fixed a second divergence of the same family in the ODE engine, measured at **4.2 %**
+  on the predictions after the boundary and **23.5 OFV** on a dedicated NONMEM probe. The
+  closed-form engine already had that one right, so the two production engines now agree where
+  they used to differ. **This moves converged fits** for any model combining a lagtime with
+  time-varying covariates or IOV, and for any ODE model whose infusion or zero-order window ends
+  between records under a changing covariate; re-run affected analyses rather than comparing
+  estimates across the change. Fixed in all four engines — both production predictors and both
+  analytic-sensitivity twins — so FOCE/FOCEI, SAEM, VI and the HMC sampler move together,
+  and in the reactive adaptive-dosing walk (#391), where a base infusion whose window ended
+  between two records under a changing covariate was **11 %** off the static engine.
+- **`TAD` is finite before a lagged first dose arrives (#1073).** An `[odes]` RHS reading the
+  `TAD` builtin previously saw `NaN` for any step between the first dose row and that dose
+  landing, which multiplies into the compartment state and turns an otherwise finite fit into
+  the `1e20` objective sentinel. `TAD` there is now measured from the subject's first arrival —
+  negative in that window, reaching `0` when the dose lands — and depends only on the dosing,
+  so adding an observation inside the window cannot move a later prediction. Both ODE
+  predictors agree, so two subjects of the same model no longer behave differently depending on
+  whether they carry an `EVID=3/4` row. A subject with no doses at all still reads `NaN`. What
+  `TAD` *should* mean before a dose has arrived remains open (#1110).
 - **`vi_mc_samples` now defaults to 32, not 8 (#1017).** This draw count sets the noise floor
   VI's settling test measures against, so it decides *where a fit stops* — and therefore what is
   certified — rather than merely how noisy the trace is. At 8, on `data/warfarin.csv` (~1%

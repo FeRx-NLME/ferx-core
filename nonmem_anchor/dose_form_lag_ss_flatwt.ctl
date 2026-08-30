@@ -1,0 +1,44 @@
+$PROBLEM #1073 E3a CONTROL - SS + ALAG1, FLAT WT (isolates the lagtime from the covariate)
+$INPUT ID TIME DV AMT EVID CMT MDV WT SS II
+$DATA dose_form_lag_ss_flatwt.csv IGNORE=@
+
+$SUBROUTINE ADVAN13 TOL=9
+
+$MODEL
+  COMP=(DEPOT,DEFDOSE)
+  COMP=(CENTRAL,DEFOBS)
+
+$PK
+  CL    = THETA(1)*(WT/70)**THETA(4)*EXP(ETA(1))
+  V     = THETA(2)*EXP(ETA(2))
+  KA    = THETA(3)*(WT/70)**THETA(5)
+  ALAG1 = THETA(6)*EXP(ETA(3))
+  S2    = V
+
+$DES
+  DADT(1) = -KA*A(1)
+  DADT(2) =  KA*A(1) - (CL/V)*A(2)
+
+$ERROR
+  IPRED = F
+  Y     = IPRED*(1+EPS(1))
+
+$THETA
+  (0, 10.0)  ; 1 TVCL
+  (0, 50.0)  ; 2 TVV
+  (0, 1.0)   ; 3 TVKA
+  (0, 0.75)  ; 4 WTEXP_CL
+  (0, 0.75)  ; 5 WTEXP_KA
+  (0, 0.7)   ; 6 TVP lagtime
+
+$OMEGA
+  0.09  ; ETA_CL
+  0.09  ; ETA_V
+  0.04  ; ETA_LAG
+
+$SIGMA
+  0.0025 ; PROP variance (sd 0.05)
+
+$ESTIMATION METHOD=1 INTERACTION MAXEVAL=0 POSTHOC PRINT=1 NOABORT
+$TABLE ID TIME WT DV IPRED CL V KA ALAG1 ETA1 ETA2 ETA3
+       ONEHEADER NOPRINT FILE=dose_form_lag_ss_flatwt.tab

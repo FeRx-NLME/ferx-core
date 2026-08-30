@@ -31,9 +31,12 @@ pub(crate) fn model_uses_time_builtin(model: &CompiledModel) -> bool {
 ///   - the **closed form** identifies the disposition by probing the RHS at two
 ///     times with `tad` pinned to `0.0`, so a `TAD` term is invisible to it and
 ///     was silently dropped from the predictions — 8× wrong at 12 h (#1124);
-///   - the **dense** predictor starts its first segment at the dose *record*
-///     rather than the arrival, so under a lagtime its `TAD` anchor has no
-///     qualifying dose and it returns `NaN` for every observation (#1110).
+///   - the **dense** predictor started its first segment at the dose *record*
+///     rather than the arrival, so under a lagtime its `TAD` anchor had no
+///     qualifying dose and it returned `NaN` for every observation (#1110).
+///     #1073 has since given it a pre-arrival anchor, so that path is finite
+///     too; the reroute stands on the closed-form defect above, and on keeping
+///     one engine answering a non-autonomous RHS rather than two.
 ///
 /// Routing these models to the event-driven predictor — which places doses on
 /// its timeline at `d.time + lag`, so `TAD` anchors correctly — is what both
@@ -50,17 +53,20 @@ pub(crate) fn model_uses_time_builtin(model: &CompiledModel) -> bool {
 /// |---|---|
 /// | bare `TAFD` RHS, no lagtime, plain bolus | `6e-13` |
 /// | `init(central) = BASE` + `TAFD` RHS | `4.8e-11` |
+/// | `TAD` RHS **under a lagtime**, obs post-arrival | `5.8e-12` |
+/// | …same, `lag = 3.0` (a larger anchor shift) | `5.3e-12` |
 ///
-/// Two cases where the two engines are **not** comparable, so no agreement is
-/// claimed for them:
+/// The lagtime rows are only measurable since #1073: before it the dense path
+/// returned `NaN` for every observation on such a model — that being #1110, the
+/// defect this reroute exists to route around — so there was nothing to compare
+/// against. #1073 gave the dense predictor the same pre-arrival anchor, and the
+/// two engines now agree.
 ///
-///   - **under a lagtime** the dense path returns `NaN` for every observation
-///     (that is #1110, the defect being routed around), so there is nothing to
-///     compare against;
-///   - **a steady-state dose** on a non-autonomous RHS is wrong on *both*
-///     engines — `NaN` for `TAD`/`TAFD` (even at a zero coefficient) and 17%
-///     off an explicit 40-cycle pulse train for `T`/`TIME`. Rerouting neither
-///     causes nor cures that; see `SS_NONAUTONOMOUS_ISSUE`.
+/// One case where the two are still **not** comparable, so no agreement is
+/// claimed for it: **a steady-state dose** on a non-autonomous RHS is wrong on
+/// *both* engines — `NaN` for `TAD`/`TAFD` (even at a zero coefficient) and 17%
+/// off an explicit 40-cycle pulse train for `T`/`TIME`. Rerouting neither causes
+/// nor cures that; see `SS_NONAUTONOMOUS_ISSUE`.
 ///
 /// Regression tests: `rerouting_a_bare_tafd_rhs_does_not_move_the_predictions`
 /// and `rerouting_an_init_seeded_rhs_does_not_move_the_predictions`.
@@ -1218,11 +1224,13 @@ pub fn predict_iov(
 /// train extends infinitely into the past, so an observation between the
 /// dose *record* time and the lagged dose arrival
 /// (`dose.time ≤ t < dose.time + lagtime`) still sees the tail of the
-/// *previous* interval — the most recent pulse landed at `t_eff − II`. We
-/// recover it by wrapping the (negative) elapsed time into `[0, II)` and
-/// evaluating the SS closed form there. This matches NONMEM `ALAG1` +
-/// `SS=1` (verified against NONMEM 7.5 to 5 significant figures). Without
-/// the wrap these early samples would read 0, which is wrong at steady
+/// *previous* interval — the most recent pulse landed at
+/// `dose.time − crate::dosing::ss_seed_phase(dose, lagtime)`, which is
+/// `t_eff − II` for the ordinary `lagtime < II`. We evaluate the SS closed
+/// form at the elapsed time from that pulse. This matches NONMEM `ALAG1` +
+/// `SS=1` (verified against NONMEM 7.5 to 5 significant figures, and against
+/// 7.6.0 for the `lagtime ≥ II` clamp; `nonmem_anchor/results/ss_lag_ge_ii`).
+/// Without it these early samples would read 0, which is wrong at steady
 /// state.
 pub fn predict_concentration(
     pk_model: PkModel,
@@ -1236,19 +1244,49 @@ pub fn predict_concentration(
         let t_eff = dose.time + lagtime;
         if t_eff <= t {
             let tau = t - t_eff;
-            conc += single_dose_concentration(pk_model, dose, tau, pk_params);
+            if dose.ss && dose.ii > 0.0 && !crate::dosing::ss_arrival_is_trough(dose, lagtime) {
+                // `C_ss(t − t_eff)` treats the arrival as the train's own pulse,
+                // landing on the trough. That is an identity while the seed flows
+                // to the trough by the arrival (`ss_arrival_is_trough`) — writing
+                // `C_ss(τ) = C_ss(τ + II) + C_single(τ)` shows the two forms are
+                // the same expression — but past `lag = II` the accumulated state
+                // has decayed for `lag > II` rather than exactly one interval, and
+                // the collapsed form reads ~4 % high (#1121).
+                //
+                // Split it: the tail whose last pulse is at `dose.time − phase`,
+                // plus the ONE real dose that actually arrives at `t_eff`. The
+                // branch is deliberate rather than unifying on the split form —
+                // the two are algebraically equal for `lag ≤ II`, not bitwise, and
+                // every existing SS result is pinned to the collapsed form.
+                conc += single_dose_concentration(
+                    pk_model,
+                    dose,
+                    t - dose.time + crate::dosing::ss_seed_phase(dose, lagtime),
+                    pk_params,
+                );
+                let mut arrival = dose.clone();
+                arrival.ss = false;
+                conc += single_dose_concentration(pk_model, &arrival, tau, pk_params);
+            } else {
+                conc += single_dose_concentration(pk_model, dose, tau, pk_params);
+            }
         } else if dose.ss && dose.ii > 0.0 && t >= dose.time {
             // Pre-arrival steady-state tail (see the doc comment). Only for
             // observations at/after the dose *record* time: SS=1 establishes
             // steady state *at* the record, so a record cannot contribute to
             // times before itself (an SS dose later in the timeline must not
-            // leak into earlier observations). Wrap the negative elapsed time
-            // `t - t_eff` up into `[0, II)` by adding whole intervals — one
-            // suffices for a physical lagtime < II, but the ceil keeps it
-            // correct for any value.
-            let raw = t - t_eff;
-            let n = (-raw / dose.ii).ceil();
-            let tau = raw + n * dose.ii;
+            // leak into earlier observations).
+            //
+            // The pulse preceding the record is at `dose.time − p` for the shared
+            // seed phase `p = max(II − lagtime, 0)`, so the elapsed time to read
+            // the SS closed form at is `t − (dose.time − p)`. For the ordinary
+            // `lagtime < II` that is the old "add one interval" wrap. For
+            // `lagtime ≥ II` it CLAMPS rather than wrapping the phase into
+            // `[0, II)` — measured against NONMEM 7.6.0, which puts the pulse on
+            // the record itself there (`crate::dosing::ss_seed_phase`). Wrapping
+            // put this whole window a factor `e^{−k·II}` low and made the readout
+            // jump discontinuously as an *estimated* lagtime crossed `II`.
+            let tau = t - dose.time + crate::dosing::ss_seed_phase(dose, lagtime);
             if tau >= 0.0 {
                 conc += single_dose_concentration(pk_model, dose, tau, pk_params);
             }

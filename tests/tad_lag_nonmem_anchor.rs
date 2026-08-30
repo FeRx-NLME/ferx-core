@@ -26,18 +26,26 @@
 //! ## Why `WT` is in the data with a FIXED-zero exponent
 //!
 //! ferx routes a subject to its event-driven predictor only when a covariate column
-//! actually varies within the subject; the plain (dense) predictor returns `NaN` for
-//! a `TAD`-reading RHS under a lagtime (#1110, a separate pre-existing defect —
-//! **fixed since #1124**, which routes any model-time-reading RHS to the
-//! event-driven predictor directly, so this `WT` trick is no longer required. It
-//! is kept only so a passing anchor is not perturbed: removing it drops `THETA(5)`
-//! and needs a fresh NONMEM run and a new committed OFV. Do not copy it into a new
-//! anchor — `mr_tad.ctl` has no `WT` column). `WT`
-//! varies here purely to force that routing, and its exponent is fixed at `0` in
-//! **both** engines, so `(WT/70)^0 == 1` exactly and `WT` cannot change any
-//! prediction. That also means every per-event covariate snapshot is identical, so
-//! this anchor does not exercise the time-varying-covariate snapshot convention and
-//! is unaffected by #1073's change to where the timeline breaks.
+//! actually varies within the subject. `WT` varies here purely to force that routing,
+//! and its exponent is fixed at `0` in **both** engines, so `(WT/70)^0 == 1` exactly
+//! and `WT` cannot change any prediction. That also means every per-event covariate
+//! snapshot is identical, so this anchor does not exercise the time-varying-covariate
+//! snapshot convention and is unaffected by #1073's change to where the timeline
+//! breaks.
+//!
+//! The routing was originally needed because the plain (dense) predictor answered
+//! `NaN` for a `TAD`-reading RHS under a lagtime. **#1073 fixed that** — both ODE
+//! predictors now anchor the pre-arrival window at the subject's first arrival, so
+//! the dense path is finite too and this anchor would hold on either route. The
+//! forcing is kept as belt-and-braces: it pins the engine the measurement was made
+//! on, and re-running it after a routing change is a deliberate act rather than an
+//! accident. #1110 still owns what `TAD` *means* in that window.
+//!
+//! **#1124** then made the forcing redundant a second way: a model-time-reading
+//! `[odes]` RHS now routes to the event-driven predictor on the predicate itself,
+//! with no covariate needed. Removing `WT` would drop `THETA(5)` and needs a fresh
+//! NONMEM run and a new committed OFV, so it stays here — but do not copy the trick
+//! into a new anchor; `mr_tad.ctl` has no `WT` column.
 //!
 //! ## Why the control streams look the way they do
 //!
@@ -61,7 +69,10 @@
 //!
 //! - `simulate_tad_lag_data.py` — deterministic generator (pure stdlib, seeds
 //!   20260828 / 20260829), 12 subjects. First observation at `t = 2`, chosen so no
-//!   record precedes the first arrival for any subject (see #1110).
+//!   record precedes the first arrival for any subject (see #1110). That also keeps
+//!   the anchor independent of the pre-arrival `TAD` value #1073 settled: the
+//!   integrator does traverse `(0, ALAG]`, but the compartment is empty there, so the
+//!   `TAD` term multiplies zero.
 //! - `tad_lag_A.ctl` / `tad_lag_B.ctl` — single-dose and two-dose controls;
 //!   outputs in `results/tad_lag_{A,B}.{ext,lst}`.
 //! - `tad_lag_{A,B}_fit.ferx` — the matching ferx models.
