@@ -20,6 +20,17 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Fixed
+- **An EVID=3/4 reset now re-seeds `[odes] init(...)` from the reset row's own covariates
+  (#1133).** A reset row is a NONMEM data record — `$PK` runs at it — but ferx restarted the
+  episode using the *previous* record's covariate snapshot, so a covariate-driven
+  `init(state) = <expr>` began the new episode on a stale value. With `init(central) = 10*WT`
+  and `WT` stepping 70 → 140 at the reset, every post-reset prediction was a factor of two out
+  against NONMEM 7.6.0. Fixed in all four affected engines (the dense ODE predictor, the
+  analytic-sensitivity twin that supplies the FOCE/FOCEI gradient, the adaptive-dosing driver,
+  and its frozen-schedule replay verifier), so fitted parameters, `predict()`, and
+  `simulate_adaptive()` all move. Datasets with time-constant covariates, and models without an
+  `init(...)` seed, are unaffected. Note the remaining gap: an **analytical** model using
+  `[initial_conditions]` still drops its baseline at the first reset instead of re-depositing it.
 - **VI no longer freezes from ordinary starting values (#1097).** Adam's gradients are now
   clipped to a global L2 norm, controlled by the new `vi_grad_clip` fit option (default `1e4`;
   `0` restores the old behaviour). Under a proportional error model a prediction near zero

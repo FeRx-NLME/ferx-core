@@ -1539,6 +1539,7 @@ fn parse_subject(
     // compartment amount at `time`; EVID=4 additionally records a dose
     // (handled in the `evid == 1 || evid == 4` arm below).
     let mut reset_times: Vec<f64> = Vec::new();
+    let mut reset_covariates: Vec<HashMap<String, f64>> = Vec::new();
 
     // Reset-delimited occasion segmentation. NONMEM processes records
     // sequentially, so an EVID=3/4 reset whose TIME restarts at/below the
@@ -1728,6 +1729,16 @@ fn parse_subject(
         // EVID=4 captures both the reset and its dose.
         if evid == 3 || evid == 4 {
             reset_times.push(time);
+            // A reset row is a data record: NONMEM runs `$PK` at it, so an
+            // `[odes] init(...)` re-seeded here is evaluated with THIS row's
+            // covariates (#1133). `locf_state` was refreshed from this row at the
+            // top of the loop, so it is already the reset row's own snapshot.
+            // Skipped without TV covariates, exactly like `pk_only_covariates`:
+            // every snapshot is then the subject-static map and `reset_cov`'s
+            // fallback returns it.
+            if any_tv {
+                reset_covariates.push(locf_state.clone());
+            }
         }
 
         if evid == 3 {
@@ -2121,8 +2132,21 @@ fn parse_subject(
     };
 
     // Reset events are recorded in row order, which is usually time order;
-    // sort defensively so the event-driven propagators see them in order.
-    reset_times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // sort defensively so the event-driven propagators see them in order. The
+    // covariate snapshots ride the same permutation (#1133) — sorting the times
+    // alone would silently pair each reset with another reset's `$PK` row.
+    {
+        let mut rperm: Vec<usize> = (0..reset_times.len()).collect();
+        rperm.sort_by(|&a, &b| {
+            reset_times[a]
+                .partial_cmp(&reset_times[b])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        reset_times = rperm.iter().map(|&i| reset_times[i]).collect();
+        if any_tv {
+            reset_covariates = rperm.iter().map(|&i| reset_covariates[i].clone()).collect();
+        }
+    }
 
     // ── Honor NONMEM record order for a same-TIME observation/dose ──────────
     // NONMEM processes data records in file order: an observation listed BEFORE
@@ -2191,6 +2215,7 @@ fn parse_subject(
             pk_only_times,
             pk_only_covariates,
             reset_times,
+            reset_covariates,
             cens,
             occasions,
             obs_l2,

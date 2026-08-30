@@ -916,6 +916,15 @@ pub struct Subject {
     /// state-propagating path. Resets break dose superposition, so a subject
     /// with any reset is forced onto the event-driven analytical / ODE path.
     pub reset_times: Vec<f64>,
+    /// Per-EVID-3/4 covariate snapshot (LOCF), parallel to `reset_times`.
+    /// Empty when no TV covariates.
+    ///
+    /// A reset row is a NONMEM data record — `$PK` runs at it — so this is the
+    /// snapshot that re-seeds `[odes] init(...)` when the reset restarts the
+    /// episode (#1133). Populated only when the subject has TV covariates; with
+    /// constant covariates `reset_cov` falls back to the subject-static map and
+    /// every convention agrees.
+    pub reset_covariates: Vec<HashMap<String, f64>>,
     /// Censoring flag per observation (0 = quantified, 1 = below LLOQ, -1 = above ULOQ).
     /// On censored rows, `observations[j]` holds the corresponding LOQ limit.
     pub cens: Vec<i8>,
@@ -1081,6 +1090,16 @@ impl Subject {
     /// subject-static map.
     pub fn pk_only_cov(&self, m: usize) -> &HashMap<String, f64> {
         self.pk_only_covariates.get(m).unwrap_or(&self.covariates)
+    }
+
+    /// Covariate snapshot at EVID=3/4 row index `r`. Same fallback as the others —
+    /// for time-constant covariates this returns the subject-static map.
+    ///
+    /// An EVID=3/4 row **is** a NONMEM data record: `$PK` runs at it, so an
+    /// `[odes] init(state) = <expr>` re-seeded at the reset is evaluated with *this*
+    /// row's values, not the preceding record's (#1133).
+    pub fn reset_cov(&self, r: usize) -> &HashMap<String, f64> {
+        self.reset_covariates.get(r).unwrap_or(&self.covariates)
     }
 
     /// Names of covariates whose value **varies within this subject**, i.e. is

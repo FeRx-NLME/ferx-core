@@ -47,6 +47,7 @@ fn make_subject(doses: Vec<DoseEvent>, obs_times: Vec<f64>) -> Subject {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; n_obs],
         occasions: Vec::new(),
         obs_l2: Vec::new(),
@@ -882,6 +883,7 @@ fn adaptive_tv_frozen_replay_readout_time_matches_the_driver() {
         dose: Vec::new(),
         obs: obs_pk.clone(),
         pk_only: Vec::new(),
+        reset: Vec::new(),
     };
     let decisions = [0.0, 24.0, 48.0];
     let mut decide = |_ctx: &ControllerCtx| ControllerDecision {
@@ -950,6 +952,7 @@ fn adaptive_tv_covariate_controller_matches_static_event_driven() {
         dose: Vec::new(),
         obs: obs_pk.clone(),
         pk_only: Vec::new(),
+        reset: Vec::new(),
     };
 
     let mut decide = |_ctx: &ControllerCtx| ControllerDecision {
@@ -989,6 +992,7 @@ fn adaptive_tv_covariate_controller_matches_static_event_driven() {
         &obs_pk, // pk_at_dose: dose k coincides with obs k
         &obs_pk, // pk_at_obs
         &[],     // pk_at_pk_only
+        &[],
     );
 
     assert_eq!(run.predictions.len(), static_preds.len());
@@ -1045,6 +1049,7 @@ fn adaptive_tv_frozen_replay_is_bit_exact() {
         dose: Vec::new(),
         obs: obs_pk.clone(),
         pk_only: Vec::new(),
+        reset: Vec::new(),
     };
     let decisions = [0.0, 12.0, 24.0, 48.0, 72.0];
     let monitors = [MonitorSpec::new("A", 1, ObserveMode::Ipred)];
@@ -1148,6 +1153,7 @@ fn earliest_record_pk_seeds_earliest_else_fallback() {
         dose: Vec::new(),
         obs: vec![pk_one(1.0, 10.0), pk_one(2.0, 10.0)],
         pk_only: vec![pk_one(9.0, 10.0)],
+        reset: Vec::new(),
     };
     // obs at 24 & 48, pk-only at 6 (earliest) → seed = pk_only[0] (CL=9).
     let mut s = make_subject(vec![], vec![24.0, 48.0]);
@@ -1221,6 +1227,7 @@ fn adaptive_tv_decision_between_records_reads_locf_covariate() {
         dose: Vec::new(),
         obs: vec![pk_one(1.0, 10.0); 3],
         pk_only: Vec::new(),
+        reset: Vec::new(),
     };
     // `observe` reads the covariate WT directly (the case that regresses).
     let obs_fn: OdeOutputFn = Box::new(
@@ -1290,6 +1297,7 @@ fn adaptive_tv_break_collision_within_tolerance_is_rejected() {
         dose: Vec::new(),
         obs: vec![pk_one(1.0, 10.0); 2],
         pk_only: Vec::new(),
+        reset: Vec::new(),
     };
     let mut decide = |_ctx: &ControllerCtx| ControllerDecision {
         actions: vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }],
@@ -1341,6 +1349,7 @@ fn adaptive_tv_pk_only_records_drive_per_event_pk() {
             dose: Vec::new(),
             obs: vec![pk_one(1.0, v), pk_one(1.0, v)],
             pk_only: vec![pk_one(pk_only_cl, v)],
+            reset: Vec::new(),
         };
         let mut decide = |_ctx: &ControllerCtx| ControllerDecision {
             actions: vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }],
@@ -1409,6 +1418,7 @@ fn adaptive_iov_controller_matches_static_event_driven() {
         dose: Vec::new(),
         obs: occ_pk.clone(),
         pk_only: Vec::new(),
+        reset: Vec::new(),
     };
     // decision_pk[g] = occasion g's PK; eta_occ activates the IOV path (the plain
     // ODE reads PK from the params array, so the eta *values* are immaterial here —
@@ -1452,6 +1462,7 @@ fn adaptive_iov_controller_matches_static_event_driven() {
         &occ_pk, // pk_at_dose: dose g coincides with occasion g
         &occ_pk, // pk_at_obs
         &[],
+        &[],
     );
 
     assert_eq!(run.predictions.len(), static_preds.len());
@@ -1468,6 +1479,7 @@ fn adaptive_iov_controller_matches_static_event_driven() {
         dose: Vec::new(),
         obs: frozen_pk.clone(),
         pk_only: Vec::new(),
+        reset: Vec::new(),
     };
     let frozen_eta: Vec<Vec<f64>> = vec![Vec::new(); times.len()];
     let mut decide2 = |_ctx: &ControllerCtx| ControllerDecision {
@@ -1517,6 +1529,7 @@ fn adaptive_iov_frozen_replay_is_bit_exact() {
         dose: Vec::new(),
         obs: vec![occ_pk[0], occ_pk[2], occ_pk[3], occ_pk[4]],
         pk_only: Vec::new(),
+        reset: Vec::new(),
     };
     let decision_pk = occ_pk.clone();
     let eta_occ: Vec<Vec<f64>> = vec![Vec::new(); decisions.len()];
@@ -1623,6 +1636,7 @@ fn adaptive_iov_threads_occasion_eta_into_readout() {
         dose: Vec::new(),
         obs: occ_pk.clone(),
         pk_only: Vec::new(),
+        reset: Vec::new(),
     };
     let decision_pk = occ_pk.clone();
     // Distinct κ per occasion in eta[1]; eta[0] is a dummy η_bsv.
@@ -3936,6 +3950,7 @@ fn ode_predictions_event_driven_apply_per_compartment_bioavailability_and_lag() 
         &dose_pk,
         &obs_pk,
         &[],
+        &[],
     );
     assert!((c1[0] - 50.0).abs() < 1e-9, "cmt1 @t=1: {}", c1[0]);
     assert!((c1[1] - 50.0).abs() < 1e-9, "cmt1 @t=10: {}", c1[1]);
@@ -3948,6 +3963,7 @@ fn ode_predictions_event_driven_apply_per_compartment_bioavailability_and_lag() 
         &[],
         &dose_pk,
         &obs_pk,
+        &[],
         &[],
     );
     assert!(c2[0].abs() < 1e-9, "cmt2 pre-lag: {}", c2[0]);
@@ -3965,7 +3981,7 @@ fn event_driven_ss_dose_predictions_finite() {
     let subj = make_subject(doses, vec![6.0, 18.0]);
     let dose_pk = vec![pk; subj.doses.len()];
     let obs_pk = vec![pk; subj.obs_times.len()];
-    let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &dose_pk, &obs_pk, &[]);
+    let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &dose_pk, &obs_pk, &[], &[]);
     assert!(
         preds.iter().all(|p| p.is_finite()),
         "SS preds finite: {preds:?}"
@@ -4820,7 +4836,9 @@ fn transit_forcing_respects_reset_floor() {
     subj.reset_times = vec![1.0];
     let dose_pk = vec![pk; subj.doses.len()];
     let obs_pk = vec![pk; subj.obs_times.len()];
-    let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &dose_pk, &obs_pk, &[]);
+    let reset_pk = vec![pk; subj.reset_times.len()];
+    let preds =
+        ode_predictions_event_driven(&ode, &subj, &[], &[], &dose_pk, &obs_pk, &[], &reset_pk);
     assert!(
         preds[0].abs() < 1e-6,
         "pre-reset dose R_in leaked past the reset: got {}",
@@ -5218,8 +5236,10 @@ fn ode_init_state_then_dose_and_reset_reapplies_init() {
     subj.reset_times = vec![5.0];
     let pk_dose = vec![pk; subj.doses.len()];
     let pk_obs = vec![pk; obs_times.len()];
+    let pk_reset = vec![pk; subj.reset_times.len()];
 
-    let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[]);
+    let preds =
+        ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[], &pk_reset);
     // t=0: init(5) + bolus(20) = 25.
     assert_relative_eq!(preds[0], 25.0, epsilon = 1e-6);
     // t=5: reset re-applies init → 5 (a zeroing reset would give 0).
@@ -5240,7 +5260,7 @@ fn ode_init_uses_chronologically_first_record_not_first_dose() {
     let pk_dose = vec![pk_kin_kout(100.0, 2.0)]; // baseline 50 (must NOT be used)
     let pk_obs = vec![pk_kin_kout(10.0, 2.0)]; // baseline 5 (first record)
 
-    let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[]);
+    let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[], &[]);
     assert_relative_eq!(preds[0], 5.0, epsilon = 1e-9);
 }
 
@@ -5259,8 +5279,10 @@ fn ode_init_reapplied_when_reset_is_first_event() {
     let pk = pk_kin_kout(10.0, 2.0); // baseline 5
     let pk_dose = vec![pk];
     let pk_obs = vec![pk];
+    let pk_reset = vec![pk];
 
-    let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[]);
+    let preds =
+        ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[], &pk_reset);
     // Re-applied baseline (5) + bolus (20) = 25. A zero-param re-seed would
     // give 0 + 20 = 20.
     assert_relative_eq!(preds[0], 25.0, epsilon = 1e-6);
@@ -5278,8 +5300,10 @@ fn ode_event_driven_reset_evid3_zeros_state() {
     let pk = pk_one(10.0, 100.0);
     let pk_dose = vec![pk; subj.doses.len()];
     let pk_obs = vec![pk; obs_times.len()];
+    let pk_reset = vec![pk; subj.reset_times.len()];
 
-    let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[]);
+    let preds =
+        ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[], &pk_reset);
     assert!(preds[0] > 0.0, "pre-reset obs should be positive");
     assert_relative_eq!(preds[1], 0.0, epsilon = 1e-6);
     assert_relative_eq!(preds[2], 0.0, epsilon = 1e-6);
@@ -5299,8 +5323,10 @@ fn ode_event_driven_reset_evid4_matches_fresh_dose() {
     let pk = pk_one(8.0, 50.0);
     let pk_dose = vec![pk; subj.doses.len()];
     let pk_obs = vec![pk; obs_times.len()];
+    let pk_reset = vec![pk; subj.reset_times.len()];
 
-    let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[]);
+    let preds =
+        ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[], &pk_reset);
 
     // Reference: lone 500 mg dose at t=10 through the same ODE path.
     let fresh = make_subject(
@@ -5309,8 +5335,16 @@ fn ode_event_driven_reset_evid4_matches_fresh_dose() {
     );
     let fresh_pk_dose = vec![pk; fresh.doses.len()];
     let fresh_pk_obs = vec![pk; obs_times.len()];
-    let expected =
-        ode_predictions_event_driven(&ode, &fresh, &[], &[], &fresh_pk_dose, &fresh_pk_obs, &[]);
+    let expected = ode_predictions_event_driven(
+        &ode,
+        &fresh,
+        &[],
+        &[],
+        &fresh_pk_dose,
+        &fresh_pk_obs,
+        &[],
+        &[],
+    );
     for (a, e) in preds.iter().zip(expected.iter()) {
         assert_relative_eq!(*a, *e, epsilon = 1e-6, max_relative = 1e-6);
     }
@@ -5333,7 +5367,8 @@ fn ode_event_driven_matches_constant_path_when_pk_constant() {
     let ode = one_cpt_ode_spec();
 
     let baseline = ode_predictions(&ode, &pk.values, &[], &[], &subj);
-    let event_driven = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[]);
+    let event_driven =
+        ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[], &[]);
     assert_eq!(baseline.len(), event_driven.len());
     for (b, e) in baseline.iter().zip(event_driven.iter()) {
         // ODE solver tolerance is ~1e-4 relative — a tighter equality
@@ -5362,7 +5397,7 @@ fn ode_event_driven_picks_up_changing_cl() {
     let pk_obs = vec![pk_low, pk_high];
     let ode = one_cpt_ode_spec();
 
-    let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[]);
+    let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[], &[]);
 
     // [0, 5] uses pk_low (pk at obs1): A(5) = 1000 * exp(-0.05*5) ≈ 778.80
     let a5 = 1000.0 * (-0.05f64 * 5.0).exp();
@@ -5449,7 +5484,8 @@ fn ode_event_driven_infusion_matches_constant_pk_path() {
     let ode = one_cpt_ode_spec();
 
     let baseline = ode_predictions(&ode, &pk.values, &[], &[], &subj);
-    let event_driven = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[]);
+    let event_driven =
+        ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[], &[]);
     assert_eq!(baseline.len(), event_driven.len());
     for (b, e) in baseline.iter().zip(event_driven.iter()) {
         assert_relative_eq!(*b, *e, epsilon = 1e-3, max_relative = 1e-4);
@@ -5491,7 +5527,7 @@ fn ode_event_driven_form_c_uses_observation_covariates() {
         HashMap::from([("FREE".to_string(), 1.0)]),
     ];
     let pk = pk_one(0.0, 1.0);
-    let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &[pk], &[pk, pk], &[]);
+    let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &[pk], &[pk, pk], &[], &[]);
 
     assert_relative_eq!(preds[0], 0.0, epsilon = 1e-12);
     assert_relative_eq!(preds[1], 10.0, epsilon = 1e-12);
@@ -6404,7 +6440,8 @@ fn form_c_single_readout_keeps_negative_predictions_on_all_drivers() {
     let (with_states, _) = ode_predictions_with_states(&ode, &pk.values, &[], &[], &subj);
     let dose_pk = vec![pk; subj.doses.len()];
     let obs_pk = vec![pk; subj.obs_times.len()];
-    let event_driven = ode_predictions_event_driven(&ode, &subj, &[], &[], &dose_pk, &obs_pk, &[]);
+    let event_driven =
+        ode_predictions_event_driven(&ode, &subj, &[], &[], &dose_pk, &obs_pk, &[], &[]);
 
     for (name, preds) in [
         ("dense", &dense),
@@ -6459,9 +6496,9 @@ fn ode_applies_f_bio_to_bolus_dose() {
     let pk_dose_half = vec![pk_half; subj.doses.len()];
     let pk_obs_half = vec![pk_half; obs_times.len()];
     let ed_full =
-        ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose_full, &pk_obs_full, &[]);
+        ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose_full, &pk_obs_full, &[], &[]);
     let ed_half =
-        ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose_half, &pk_obs_half, &[]);
+        ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose_half, &pk_obs_half, &[], &[]);
     for (f, h) in ed_full.iter().zip(ed_half.iter()) {
         assert_relative_eq!(*h, 0.5 * *f, epsilon = 1e-9, max_relative = 1e-6);
     }
@@ -7239,7 +7276,7 @@ fn lagged_arrival_segment_runs_on_the_next_record_not_the_dose_row() {
     let pk_dose = vec![pk_one_lagged(cl_a, v, 0.0), pk_one_lagged(cl_a, v, 2.0)];
     let pk_obs = vec![pk_one(cl_a, v), pk_one(cl_b, v)];
 
-    let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[]);
+    let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[], &[]);
 
     // (0,10] at CL=20; (10,12] at CL=5 (the t=20 record); bolus; (12,20] at CL=5.
     let a12 = 1000.0 * (-10.0 * ka).exp() * (-2.0 * kb).exp();
@@ -7278,7 +7315,7 @@ fn a_dose_record_governs_the_advance_into_its_own_time() {
     let pk_dose = vec![pk_one_lagged(cl_a, v, 0.0), pk_one_lagged(cl_dose, v, 2.0)];
     let pk_obs = vec![pk_one(cl_a, v), pk_one(cl_obs, v), pk_one(cl_obs, v)];
 
-    let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[]);
+    let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[], &[]);
 
     // (0,5] and (5,10] at CL=20 and CL=5 respectively — the second terminated by
     // the DOSE record, not the co-timed observation.
@@ -7311,7 +7348,7 @@ fn a_zero_lagtime_dose_still_takes_its_own_row_for_the_incoming_segment() {
     let pk_dose = vec![pk_one(cl_a, v), pk_one(cl_dose, v)]; // both unlagged
     let pk_obs = vec![pk_one(cl_a, v), pk_one(cl_late, v)];
 
-    let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[]);
+    let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[], &[]);
 
     let a10 = 1000.0 * (-5.0 * ka).exp() * (-5.0 * k_dose).exp();
     let expected = (a10 + 1000.0) * (-10.0 * k_late).exp();
@@ -7351,7 +7388,7 @@ fn an_infusion_end_between_records_runs_on_the_terminating_record() {
     let pk_dose = vec![pk_one(cl_a, v), pk_one(cl_a, v)];
     let pk_obs = vec![pk_one(cl_a, v), pk_one(cl_c, v)];
 
-    let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[]);
+    let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[], &[]);
 
     // (0,6] at CL=20; (6, 6.5] and (6.5, 7] both at CL=5 (the t=7 record), the
     // infusion delivering rate=100 over the first of the two.
@@ -7400,6 +7437,7 @@ fn the_adaptive_segment_pk_and_occasion_resolve_to_the_same_record() {
         dose: vec![],
         obs: vec![pk_one(11.0, 100.0), pk_one(22.0, 100.0)],
         pk_only: vec![],
+        reset: Vec::new(),
     };
     let obs_occ = [Some(0_usize), Some(1_usize)];
     // The LOCF carry the walk holds when it reaches the t=24 break: the earlier window.
@@ -7464,7 +7502,7 @@ fn a_non_record_event_past_the_final_record_does_not_poison_the_walk() {
     let pk_dose = vec![pk_one(cl_a, v), pk_one(cl_a, v)];
     let pk_obs = vec![pk_one(cl_a, v), pk_one(cl_c, v)];
 
-    let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[]);
+    let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[], &[]);
     assert!(
         preds.iter().all(|p| p.is_finite() && *p > 0.0),
         "trailing non-record events must not produce NaN or a zeroed snapshot: {preds:?}"
@@ -7534,7 +7572,7 @@ fn a_tad_reading_rhs_survives_the_pre_arrival_segment_of_a_lagged_first_dose() {
     let pk_dose = vec![pk_one_lagged(cl, v, lag)];
     let pk_obs = vec![pk_one(cl, v); 3];
 
-    let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[]);
+    let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[], &[]);
     assert!(
         preds.iter().all(|p| p.is_finite()),
         "a NaN TAD anchor in the pre-arrival segment poisoned the trajectory: {preds:?}"
@@ -7578,6 +7616,7 @@ fn both_production_ode_predictors_agree_on_tad_before_the_first_arrival() {
         &[],
         &[pk_lagged],
         &vec![pk_lagged; 3],
+        &[],
         &[],
     );
 
@@ -7644,7 +7683,7 @@ fn the_pre_arrival_tad_anchor_does_not_depend_on_the_sampling_mesh() {
         let subj = make_subject(doses, obs.clone());
         let pk_dose = vec![pk];
         let pk_obs = vec![pk; obs.len()];
-        ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[])
+        ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[], &[])
     };
 
     let coarse = run(vec![0.5, 2.0, 4.0, 8.0]);

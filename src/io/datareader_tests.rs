@@ -1517,6 +1517,55 @@ fn test_evid2_rows_skipped_when_no_tv_covariates() {
 }
 
 #[test]
+fn test_reset_rows_captured_with_their_own_covariates() {
+    // #1133: an EVID=3/4 row is a data record — `$PK` runs at it — so its own covariate
+    // values must be captured, not just the reset time. Two resets, each carrying a `CR`
+    // that differs from both its predecessor and its successor, so a snapshot taken one
+    // row early or one row late is visible in the assertion rather than coincidentally
+    // equal.
+    let csv = "ID,TIME,DV,EVID,MDV,AMT,CR\n\
+                   1,0,.,1,1,100,1.0\n\
+                   1,2,5.0,0,0,.,1.0\n\
+                   1,4,.,3,1,0,2.5\n\
+                   1,6,5.0,0,0,.,4.0\n\
+                   1,8,.,4,1,50,7.5\n\
+                   1,10,5.0,0,0,.,9.0\n";
+    let f = write_csv(csv);
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+    let subj = &pop.subjects[0];
+
+    assert_eq!(subj.reset_times, vec![4.0, 8.0]);
+    assert_eq!(subj.reset_covariates.len(), 2);
+    // Parallel to `reset_times`, so the accessor pairs each reset with its own row.
+    assert_eq!(subj.reset_cov(0)["CR"], 2.5);
+    assert_eq!(subj.reset_cov(1)["CR"], 7.5);
+    // EVID=4 also records its dose; that dose row's snapshot is the same row's values.
+    assert_eq!(subj.doses.len(), 2);
+    assert_eq!(subj.doses[1].time, 8.0);
+    assert_eq!(subj.dose_covariates[1]["CR"], 7.5);
+}
+
+#[test]
+fn test_reset_covariates_skipped_when_no_tv_covariates() {
+    // Mirrors `test_evid2_rows_skipped_when_no_tv_covariates`: with time-constant
+    // covariates every snapshot is the subject-static map, so the reader builds none and
+    // `reset_cov` falls back to it. Locks in that the allocation is skipped and that the
+    // fallback — not an empty map — is what consumers see.
+    let csv = "ID,TIME,DV,EVID,MDV,AMT,WT\n\
+                   1,0,.,1,1,100,70\n\
+                   1,4,.,3,1,0,70\n\
+                   1,10,5.0,0,0,.,70\n";
+    let f = write_csv(csv);
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+    let subj = &pop.subjects[0];
+
+    assert!(!subj.has_tv_covariates());
+    assert_eq!(subj.reset_times, vec![4.0]);
+    assert!(subj.reset_covariates.is_empty());
+    assert_eq!(subj.reset_cov(0)["WT"], 70.0);
+}
+
+#[test]
 fn test_missing_dv_obs_skipped_and_warned() {
     // Issue #258: an EVID=0 row with a missing DV and no MDV=1 must be
     // skipped (not scored as DV=0), and a single W_MISSING_DV warning fires.

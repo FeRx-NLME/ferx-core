@@ -586,6 +586,11 @@ pub struct EventPkParams {
     /// `subject.pk_only_times`. Empty when the subject has no
     /// pk-only events (typical for non-TV-cov data).
     pub pk_only: Vec<PkParams>,
+    /// PK params at each EVID=3/4 reset time, parallel to `subject.reset_times`.
+    /// A reset row is a data record — `$PK` runs at it — so this is the snapshot
+    /// that re-seeds `[odes] init(...)` when the reset restarts the episode
+    /// (#1133). Empty when the subject has no resets.
+    pub reset: Vec<PkParams>,
 }
 
 impl EventPkParams {
@@ -598,6 +603,7 @@ impl EventPkParams {
             dose: Vec::with_capacity(subject.doses.len()),
             obs: Vec::with_capacity(subject.obs_times.len()),
             pk_only: Vec::with_capacity(subject.pk_only_times.len()),
+            reset: Vec::with_capacity(subject.reset_times.len()),
         }
     }
 }
@@ -659,6 +665,7 @@ pub fn compute_event_pk_params_into(
     out.dose.clear();
     out.obs.clear();
     out.pk_only.clear();
+    out.reset.clear();
 
     if subject_needs_per_event_pk(model, subject) {
         for k in 0..subject.doses.len() {
@@ -688,6 +695,18 @@ pub fn compute_event_pk_params_into(
                 subject.pk_only_times[m],
             ));
         }
+        // EVID=3/4 rows are data records too (#1133): `$PK` runs at them, and the
+        // resulting snapshot is what re-seeds `[odes] init(...)` when the reset
+        // restarts the episode.
+        for r in 0..subject.reset_times.len() {
+            out.reset.push(pk_params_at_time(
+                model,
+                theta,
+                eta,
+                subject.reset_cov(r),
+                subject.reset_times[r],
+            ));
+        }
     } else {
         // Reached only when the subject carries no time-varying covariates (on
         // dose/obs *or* pk-only rows) and the model uses no `TIME` built-in, so a
@@ -699,6 +718,11 @@ pub fn compute_event_pk_params_into(
         }
         for _ in 0..subject.obs_times.len() {
             out.obs.push(p);
+        }
+        // Filled even on this branch: a reset-carrying subject with constant
+        // covariates still needs a seed snapshot, and `p` is exact for it.
+        for _ in 0..subject.reset_times.len() {
+            out.reset.push(p);
         }
     }
 }
@@ -825,6 +849,19 @@ pub(crate) fn compute_event_pk_params_iov(
             theta,
             eta_at(t),
             subject.pk_only_cov(m),
+            t,
+        ));
+    }
+    // EVID=3/4 rows are records (#1133): the reset re-seeds `[odes] init(...)` from the
+    // reset row's own `$PK`, which here means its own covariate snapshot under the κ of
+    // the decision window active at the reset — the same rule every other record follows.
+    for r in 0..subject.reset_times.len() {
+        let t = subject.reset_times[r];
+        out.reset.push(pk_params_at_time(
+            model,
+            theta,
+            eta_at(t),
+            subject.reset_cov(r),
             t,
         ));
     }
@@ -975,6 +1012,22 @@ pub fn predict_iov(
             )
         })
         .collect();
+    // EVID=3/4 rows: the reset row's own covariate snapshot (#1133), under the same
+    // "no occasion label" convention EVID=2 rows take above. The reader stores no
+    // `OCC` for a reset row, so κ = 0 here; that is a separate gap from the covariate
+    // one this fix closes, and it only surfaces for a model that is IOV *and* has an
+    // `[odes] init(...)` reading an occasion-dependent parameter.
+    let reset_params: Vec<PkParams> = (0..subject.reset_times.len())
+        .map(|r| {
+            pk_params_at_time(
+                model,
+                theta,
+                &pk_only_combined,
+                subject.reset_cov(r),
+                subject.reset_times[r],
+            )
+        })
+        .collect();
 
     let mut preds = if model.is_algebraic() {
         // Compartment-free model (#811): nothing to integrate or superpose. The
@@ -991,6 +1044,7 @@ pub fn predict_iov(
             &dose_params,
             &obs_params,
             &pk_only_params,
+            &reset_params,
         )
     } else if event_driven::supports_event_driven(model.pk_model) {
         // Resolve modeled-`RATE` doses (#324/#394) using each dose's per-occasion
@@ -1857,6 +1911,7 @@ pub fn compute_predictions_with_states(
                     &scratch.dose,
                     &scratch.obs,
                     &scratch.pk_only,
+                    &scratch.reset,
                 )
             } else {
                 // Single-pass: one ODE integration yields both ipred and states.
@@ -2121,6 +2176,7 @@ pub fn compute_predictions_ode(
         let pk_dose = vec![pk; subject.doses.len()];
         let pk_obs = vec![pk; subject.obs_times.len()];
         let pk_pk_only = vec![pk; subject.pk_only_times.len()];
+        let pk_reset = vec![pk; subject.reset_times.len()];
         return crate::ode::ode_predictions_event_driven(
             ode_spec,
             subject,
@@ -2129,6 +2185,7 @@ pub fn compute_predictions_ode(
             &pk_dose,
             &pk_obs,
             &pk_pk_only,
+            &pk_reset,
         );
     }
     crate::ode::ode_predictions(ode_spec, pk_params_flat, theta, eta, subject)
@@ -2277,6 +2334,7 @@ pub fn compute_predictions_with_tv_into_with_schedule(
                 &scratch.dose,
                 &scratch.obs,
                 &scratch.pk_only,
+                &scratch.reset,
             )
         } else if let Some(mr) = modified_release::mr_predictions(model, subject, theta, eta) {
             // Closed-form modified-release fast path (#860): a *static* multi-route
@@ -2591,6 +2649,85 @@ mod tests {
         assert_relative_eq!(c_single, c_two, epsilon = 1e-12);
     }
 
+    /// #1133 on the adaptive (decision-window) IOV materialiser: a reset row is a record,
+    /// so its snapshot is *its own covariates* under the κ of the decision window active at
+    /// its time — the pairing every other record gets.
+    ///
+    /// The numbers are chosen so each candidate convention lands somewhere different. With
+    /// `CL = TVCL·(WT/100)·exp(ETA_CL + KAPPA_CL)`, decisions at 0 and 24, and resets at
+    /// `t = 5` (window 0, κ = 0) and `t = 30` (window 1, κ = ln 2):
+    ///
+    /// | reset | own row | previous record | next record |
+    /// |---|---|---|---|
+    /// | `t = 5`  | **0.5** (WT 50) | 1.0 (WT 100) | 0.1 (WT 10) |
+    /// | `t = 30` | **1.6** (WT 80, κ = ln 2) | 2.0 (WT 100) | 0.2 (WT 10) |
+    ///
+    /// and taking the baseline κ instead of the window's would give 0.8 for the second. No
+    /// single wrong rule reproduces both cells.
+    #[test]
+    fn iov_event_pk_seeds_each_reset_from_its_own_row_and_window() {
+        use crate::parser::model_parser::parse_model_string;
+        let model = parse_model_string(
+            "
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.0
+  kappa KAPPA_CL ~ 0.0
+  sigma PROP ~ 0.01
+[individual_parameters]
+  CL = TVCL * (WT / 100.0) * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP)
+",
+        )
+        .expect("fixture parses");
+
+        let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+        let subj = Subject {
+            id: "1".to_string(),
+            doses: Vec::new(),
+            obs_times: vec![1.0, 40.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; 2],
+            obs_cmts: vec![1; 2],
+            covariates: wt(100.0),
+            dose_covariates: Vec::new(),
+            obs_covariates: vec![wt(100.0), wt(10.0)],
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: vec![5.0, 30.0],
+            // Each reset row carries a `WT` shared with no neighbouring record, so reading
+            // one row early or late shows up in the assertions below.
+            reset_covariates: vec![wt(50.0), wt(80.0)],
+            cens: vec![0; 2],
+            occasions: Vec::new(),
+            obs_l2: Vec::new(),
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        };
+
+        let theta = model.default_params.theta.clone();
+        let eta_baseline = vec![0.0, 0.0]; // [ETA_CL, KAPPA_CL], κ = 0
+        let eta_occ = vec![
+            vec![0.0, 0.0],                    // window 0 (decision at t=0): κ = 0
+            vec![0.0, std::f64::consts::LN_2], // window 1 (decision at t=24): κ = ln 2
+        ];
+        let decisions = vec![0.0, 24.0];
+        let ev =
+            compute_event_pk_params_iov(&model, &subj, &theta, &eta_baseline, &eta_occ, &decisions);
+
+        assert_eq!(ev.reset.len(), 2, "one snapshot per reset row");
+        assert_relative_eq!(ev.reset[0].values[0], 0.5, epsilon = 1e-12);
+        assert_relative_eq!(ev.reset[1].values[0], 1.6, epsilon = 1e-12);
+    }
+
     #[test]
     fn compute_predictions_routes_reset_subject_to_event_driven() {
         // A subject with a reset (EVID=3) must NOT use superposition:
@@ -2609,6 +2746,7 @@ mod tests {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: vec![5.0],
+            reset_covariates: Vec::new(),
             cens: vec![0; 2],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
@@ -2664,6 +2802,7 @@ mod tests {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0; n_obs],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
@@ -2857,6 +2996,7 @@ mod tests {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0; 4],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
@@ -3294,6 +3434,7 @@ mod tests {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0; n],
             occasions: vec![1, 1, 2, 2],
             obs_l2: Vec::new(),
@@ -3953,6 +4094,7 @@ mod tests {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0; n_obs],
             occasions: Vec::new(),
             obs_l2: Vec::new(),

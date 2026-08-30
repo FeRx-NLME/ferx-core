@@ -187,6 +187,7 @@ fn design() -> Population {
                 pk_only_times: Vec::new(),
                 pk_only_covariates: Vec::new(),
                 reset_times: Vec::new(),
+                reset_covariates: Vec::new(),
                 cens: vec![0; n_obs],
                 occasions,
                 obs_l2: Vec::new(),

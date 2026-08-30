@@ -74,6 +74,7 @@ fn bolus_subject(times: &[f64]) -> Subject {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1; n],
         obs_l2: Vec::new(),
@@ -5418,6 +5419,54 @@ fn ode_provider_init_reset_dose_at_zero_matches_production() {
     subject.obs_covariates = vec![wt(90.0), wt(90.0), wt(90.0)]; // obs: WT=90
     subject.covariates = wt(60.0);
     subject.reset_times = vec![0.0]; // EVID=4 reset+dose at t=0 → reset is the first event
+    assert!(subject.has_tv_covariates());
+    assert!(
+        ode_tvcov_supported(&model, &subject),
+        "init + reset must be analytic (#486)"
+    );
+    let theta = vec![1.0, 20.0, 500.0];
+    let eta = vec![0.1, -0.05];
+    check_vs_production(&model, &subject, &theta, &eta);
+    check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
+    check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+}
+
+/// **`init(...)` re-seeded at a MID-TIMELINE reset whose own `WT` differs from every
+/// neighbouring record** (#1133). The two existing reset twins above cannot see which
+/// snapshot the re-seed reads, and it is worth writing down why, because each looks like
+/// it should:
+///
+/// * `ode_provider_tvcov_init_reset_matches_production` is TV-cov and has a mid-timeline
+///   reset, but its model is `V = TVV * exp(ETA_V)` — `WT` sits on `CL` only, so
+///   `init = BASE/V` is covariate-free and every candidate snapshot seeds the same number.
+/// * `ode_provider_init_reset_dose_at_zero_matches_production` *does* put `WT` on `V`, but
+///   its reset is the first timeline event, where the reset row, `init_pk` and the dose@0
+///   snapshot are all `WT = 60` — three conventions, one value.
+///
+/// This subject breaks both degeneracies at once: `WT` is on `V` (so the seed moves with
+/// it) and the reset sits at `t = 3` carrying `WT = 40`, between an obs at `WT = 90` and
+/// an obs at `WT = 150`. Production seeds from the reset row's own snapshot; a twin still
+/// carrying `last_params` would seed from the `WT = 90` obs and disagree in `f` — and,
+/// because `∂init/∂(θ,η)` is evaluated at the same snapshot, in the gradient too.
+///
+/// `check_vs_production` is the oracle that bites here: it FDs the production predictor,
+/// so a twin that mirrors a stale arm fails on the value comparison before the derivative
+/// one. (The reverse — both sides sharing a wrong convention — is the blind spot CLAUDE.md
+/// records, and it is why the value path itself is anchored against NONMEM in
+/// `tests/reset_init_snapshot_nonmem_anchor.rs` rather than against this twin.)
+#[test]
+fn ode_provider_init_reset_midtimeline_reads_the_reset_rows_snapshot() {
+    let model = parse_model_string(ONECPT_IV_INIT_WTV_ODE).expect("parse");
+    let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+    let mut subject = bolus_subject(&[1.0, 2.0, 4.0, 8.0]);
+    subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+    subject.dose_covariates = vec![wt(60.0)];
+    // The record before the reset is the t=2 obs (WT=90); the one after is t=4 (WT=150).
+    // The reset row itself carries neither.
+    subject.obs_covariates = vec![wt(70.0), wt(90.0), wt(150.0), wt(150.0)];
+    subject.covariates = wt(60.0);
+    subject.reset_times = vec![3.0];
+    subject.reset_covariates = vec![wt(40.0)];
     assert!(subject.has_tv_covariates());
     assert!(
         ode_tvcov_supported(&model, &subject),

@@ -465,6 +465,7 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0; n_gauss],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
