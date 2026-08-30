@@ -181,7 +181,14 @@ jobs:
         # stack are linted too (both are compiled out of the base `ci` build).
         # `markov = ["survival"]`, so this lints the whole non-Gaussian endpoint
         # surface as well.
-        run: cargo clippy --no-default-features --features ci,markov,nn
+        #
+        # `--all-targets` so test code is linted too. Without it the default target
+        # selection covers only the lib and the bins, and roughly a third of this
+        # repo — every `#[cfg(test)]` module, every sibling `*_tests.rs`, and all of
+        # `tests/` — got no lint coverage at all. That gap was not theoretical: it
+        # was hiding 5 `approx_constant` ERRORS (`error`, not `warning`) that the
+        # default invocation exits 0 on.
+        run: cargo clippy --no-default-features --features ci,markov,nn --all-targets
 
   fmt:
     name: Format
