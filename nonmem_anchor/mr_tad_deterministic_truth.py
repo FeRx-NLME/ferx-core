@@ -72,8 +72,18 @@ def main():
         worst = max(worst, rel)
         print(f"{t:8.2f} {a:12.6f} {b:12.6f} {rel:10.2e}")
     print(f"\nworst relative deviation: {worst:.3e}")
-    # The table prints 6 significant figures, so agreement is bounded below by
-    # table precision, not by either integrator.
+    # `$TABLE` prints **5** significant figures (`1.6245E+00`, `2.6623E+00`,
+    # `1.1448E+00`, ...), so agreement is bounded below by table precision, not by
+    # either integrator. At `IPRED = 1.1448` that is +/-5e-5 absolute, i.e. 2.3e-5
+    # in the `|a-b| / (1 + |b|)` metric used above; the measured worst deviation is
+    # 1.749e-05 at t = 11.50, under that bound. (#1130 review, which re-ran this
+    # script independently. The comment said 6 figures until then.)
+    #
+    # One thing that could have faked that number, and does not: `tad(t)` admits a
+    # dose with `d <= t + 1e-12`, so the RK4 `k4` stage at a segment's right
+    # endpoint can pick up the *post*-dose anchor. Re-run with a strict per-segment
+    # anchor instead, the trajectory moves by 1.7e-13 — eight orders under the
+    # print precision above. Recorded so nobody re-derives it.
     sys.exit(0 if worst < 1e-4 else 1)
 
 
