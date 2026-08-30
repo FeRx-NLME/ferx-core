@@ -266,12 +266,15 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
         // them would misattribute an SS bail to a later reason). #590 review. A
         // steady-state rate-defined infusion under `F ≠ 1`, and steady-state combined
         // with an estimated lagtime, are both analytic now (#486).
+        // `reads_model_time`, mirroring `ode_iov_subject_supported` exactly: asking the
+        // bare `uses_time_vars` here would misattribute a bare-`TIME` SS bail to a later
+        // reason once that gate declines it (#1124).
         if has_ss
             && eff
                 .ode_spec
                 .as_ref()
                 .and_then(|o| o.rhs_program.as_ref())
-                .is_some_and(|p| p.uses_time_vars())
+                .is_some_and(|p| p.reads_model_time())
         {
             return "steady-state dose + time-dependent ODE RHS";
         }

@@ -20332,3 +20332,198 @@ fn test_apply_fit_option_vi_grad_clip() {
     assert!(apply_fit_option(&mut opts, "vi_grad_clip", "nope").is_err());
     assert_eq!(opts.vi_grad_clip, 0.0);
 }
+
+/// Every *reachable* arm of the [`stmts_read_time_builtin`] walk, driven through
+/// the parser.
+///
+/// A wrong `false` from any arm is a **silently dropped term with no
+/// diagnostic** — the exact #1124 failure mode — because `reads_model_time` is
+/// what keeps a non-autonomous RHS off the closed form and off the SS
+/// equilibration. `mr_scope_declines_every_model_time_spelling` exercises two
+/// arms (`Op::PushTime` in a bytecode statement, and `Condition::Compare`); the
+/// rest were reachable only by inspection until this test.
+///
+/// **Where the `Expression::*` arms live.** `resolve_variable_indices` lowers
+/// *every* `Assign` / `AssignIdx` / `DiffEq` / `DiffEqIdx` in a resolved RHS to
+/// `AssignBc` / `DiffEqBc`, so in an `OdeRhsProgram` those four statement arms
+/// are unreachable and a statement's expression is only ever walked as bytecode
+/// (the `Op::PushTime` arm). `expr_reads_time_builtin` is therefore reached
+/// **only through `if` conditions**, which keep their `Condition`/`Expression`
+/// trees. Putting `exp(…TIME…)` in a `d/dt(...)` looks like it covers
+/// `Expression::UnaryFn` and does not — it compiles to bytecode. Every
+/// expression case below is inside a condition for that reason; a first draft of
+/// this test had them in the derivative and the `UnaryFn` mutation survived.
+///
+/// `Expression::ThetaGather` is not covered: it is produced only by a levelled
+/// theta reference (`NAME[idx]`), which has no route into an `[odes]` condition,
+/// so there is no parseable model that reaches that arm here. Its recursion into
+/// `idx` is written for the shared shape of the walk.
+///
+/// Each case is asserted in both directions against a `TIME`-free twin of the
+/// same shape, so an arm that returns a blanket `true` fails just as loudly as
+/// one that returns a blanket `false`.
+#[test]
+fn every_arm_of_the_time_builtin_walk_sees_time() {
+    fn prog_reads_time(rhs: &str) -> bool {
+        let src = format!(
+            r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVKA(1.0, 0.05, 24.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  KA = TVKA
+[structural_model]
+  ode(states=[central])
+[odes]
+{rhs}
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+        );
+        parse_model_string(&src)
+            .unwrap_or_else(|e| panic!("model must parse: {e}\n{src}"))
+            .ode_spec
+            .as_ref()
+            .and_then(|o| o.rhs_program.as_ref())
+            .expect("rhs program")
+            .reads_time_builtin()
+    }
+
+    // (arm exercised, RHS that reads TIME, the same RHS with TIME removed)
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "Expression::Time via a plain assignment",
+            "  KE = TIME\n  d/dt(central) = first_order(ka=KA) - (CL/V)*central*(1.0 + 0.01*KE)",
+            "  KE = 6.0\n  d/dt(central) = first_order(ka=KA) - (CL/V)*central*(1.0 + 0.01*KE)",
+        ),
+        (
+            "Expression::Time directly in the DiffEq",
+            "  d/dt(central) = first_order(ka=KA) - (CL/V)*central*(1.0 + 0.01*TIME)",
+            "  d/dt(central) = first_order(ka=KA) - (CL/V)*central*(1.0 + 0.01*6.0)",
+        ),
+        (
+            "Op::PushTime under a call in a bytecode statement",
+            "  d/dt(central) = first_order(ka=KA) - (CL/V)*central*exp(-0.01*TIME)",
+            "  d/dt(central) = first_order(ka=KA) - (CL/V)*central*exp(-0.01*6.0)",
+        ),
+        (
+            "Expression::UnaryFn (in a condition)",
+            "  KE = CL/V\n  if (exp(0.1*TIME) > 2.0) { KE = 3.0*CL/V }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+            "  KE = CL/V\n  if (exp(0.1*KA) > 2.0) { KE = 3.0*CL/V }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+        ),
+        (
+            "Expression::Power, base (in a condition)",
+            "  KE = CL/V\n  if (TIME^2.0 > 4.0) { KE = 3.0*CL/V }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+            "  KE = CL/V\n  if (KA^2.0 > 4.0) { KE = 3.0*CL/V }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+        ),
+        (
+            "Expression::Power, exponent (in a condition)",
+            "  KE = CL/V\n  if (2.0^TIME > 4.0) { KE = 3.0*CL/V }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+            "  KE = CL/V\n  if (2.0^KA > 4.0) { KE = 3.0*CL/V }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+        ),
+        (
+            "Expression::Binary under a UnaryFn (in a condition)",
+            "  KE = CL/V\n  if (log(TIME + 1.0) > 1.0) { KE = 3.0*CL/V }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+            "  KE = CL/V\n  if (log(KA + 1.0) > 1.0) { KE = 3.0*CL/V }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+        ),
+        (
+            "Condition::Compare",
+            "  KE = CL/V\n  if (TIME > 6.0) { KE = 3.0*CL/V }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+            "  KE = CL/V\n  if (KA > 6.0) { KE = 3.0*CL/V }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+        ),
+        (
+            "Condition::And",
+            "  KE = CL/V\n  if (TIME > 6.0 && KA > 0.5) { KE = 3.0*CL/V }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+            "  KE = CL/V\n  if (CL > 6.0 && KA > 0.5) { KE = 3.0*CL/V }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+        ),
+        (
+            "Condition::Or",
+            "  KE = CL/V\n  if (KA > 99.0 || TIME > 6.0) { KE = 3.0*CL/V }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+            "  KE = CL/V\n  if (KA > 99.0 || CL > 6.0) { KE = 3.0*CL/V }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+        ),
+        (
+            "Condition::Not",
+            "  KE = CL/V\n  if (!(TIME > 6.0)) { KE = 3.0*CL/V }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+            "  KE = CL/V\n  if (!(KA > 6.0)) { KE = 3.0*CL/V }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+        ),
+        (
+            "statements inside a taken branch body",
+            "  KE = CL/V\n  if (KA > 0.5) { KE = CL/V*(1.0 + 0.01*TIME) }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+            "  KE = CL/V\n  if (KA > 0.5) { KE = CL/V*(1.0 + 0.01*6.0) }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+        ),
+        (
+            "statements inside an else body",
+            "  KE = CL/V\n  if (KA > 99.0) { KE = 2.0*CL/V } else { KE = CL/V*(1.0 + 0.01*TIME) }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+            "  KE = CL/V\n  if (KA > 99.0) { KE = 2.0*CL/V } else { KE = CL/V*(1.0 + 0.01*6.0) }\n  d/dt(central) = first_order(ka=KA) - KE*central",
+        ),
+    ];
+
+    for (arm, with_time, without_time) in cases {
+        assert!(
+            prog_reads_time(with_time),
+            "`{arm}`: the walk missed a `TIME` read — this RHS would be admitted as \
+             time-invariant and its term silently dropped (#1124)"
+        );
+        assert!(
+            !prog_reads_time(without_time),
+            "`{arm}`: the walk reported a `TIME` read in an RHS that has none — the \
+             positive case above proves nothing if the arm answers `true` blindly"
+        );
+    }
+}
+
+/// `TIME` and the slot-backed spellings are covered by **disjoint** flags, and
+/// only [`OdeRhsProgram::reads_model_time`] sees both. Pinned structurally so a
+/// caller pairing them by hand cannot drift back into #1124's gap.
+#[test]
+fn reads_model_time_covers_every_spelling_and_the_flags_are_disjoint() {
+    fn flags(term: &str) -> (bool, bool, bool) {
+        let src = format!(
+            r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V)*central{term}
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+        );
+        let m = parse_model_string(&src).expect("parse");
+        let p = m
+            .ode_spec
+            .as_ref()
+            .and_then(|o| o.rhs_program.as_ref())
+            .expect("rhs program");
+        (
+            p.uses_time_vars(),
+            p.reads_time_builtin(),
+            p.reads_model_time(),
+        )
+    }
+
+    // `TIME` sets ONLY the built-in flag; the slot-backed names set ONLY the
+    // broad flag. Neither flag alone covers all four — that disjointness is the
+    // whole reason `reads_model_time` exists.
+    assert_eq!(flags("*(1.0 + 0.01*TIME)"), (false, true, true), "TIME");
+    assert_eq!(flags("*(1.0 + 0.01*T)"), (true, false, true), "T");
+    assert_eq!(flags("*(1.0 + 0.01*TAFD)"), (true, false, true), "TAFD");
+    assert_eq!(flags("*(1.0 + 0.01*TAD)"), (true, false, true), "TAD");
+    assert_eq!(flags(""), (false, false, false), "autonomous control");
+}

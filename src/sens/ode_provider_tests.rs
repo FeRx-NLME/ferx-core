@@ -8518,7 +8518,7 @@ fn ode_tad_rhs_with_route_lag_only_stays_analytic() {
 }
 
 /// Steady state keeps its own, broader decline: SS breaks the cycle recurrence
-/// for ANY non-autonomous RHS, including a `TIME`-only one that #1070's narrower
+/// for ANY non-autonomous RHS, including a `T`-only one that #1070's narrower
 /// flag does not set. Regression guard that the new flag did not replace the old.
 #[test]
 fn ode_ss_time_only_rhs_still_routes_to_fd() {
@@ -8526,6 +8526,12 @@ fn ode_ss_time_only_rhs_still_routes_to_fd() {
     // (the model-time thread-local), not to a `PushVar(time_slot)`, so
     // `stmts_read_slots` — and therefore `uses_time_vars` — does not see it. `T`
     // is the alias that does resolve to the slot.
+    //
+    // Until #1124 that choice was a **workaround**, not a simplification: the
+    // gate asked `uses_time_vars` alone, so the `TIME` spelling of the same
+    // quantity reached the SS equilibration while `T` declined. The gate now asks
+    // `reads_model_time`; `ode_ss_bare_time_builtin_rhs_routes_to_fd` covers the
+    // spelling this test cannot.
     let model = tad_gate_model("T", "");
     let prog = model
         .ode_spec
@@ -8543,6 +8549,70 @@ fn ode_ss_time_only_rhs_still_routes_to_fd() {
     assert!(
         !ode_tvcov_supported(&model, &ss),
         "SS + a time-dependent RHS must still decline (the broad uses_time_vars gate)"
+    );
+}
+
+/// The spelling `ode_ss_time_only_rhs_still_routes_to_fd` works around: a **bare
+/// `TIME`** built-in in the RHS.
+///
+/// `uses_time_vars` is structurally blind to it (`Op::PushTime`, not a
+/// `PushVar(time_slot)`), so until #1124 this exact model reached
+/// `equilibrate_ss_state_g` while the identical model spelled `T` declined —
+/// the gate's own doc said to pair the two flags and this caller did not.
+///
+/// What the gate does and does not buy, measured against an explicit 40-cycle
+/// pulse train (the oracle with no SS machinery in it at all):
+///
+/// | RHS term      | SS=1 value | vs. pulse train |
+/// |---------------|------------|-----------------|
+/// | autonomous    | 10.027269  | `7.6e-9`        |
+/// | `0.003*T`     | 9.545089   | **17% wrong**   |
+/// | `0.003*TIME`  | 9.545089   | **17% wrong**   |
+/// | `0.03*TAD`    | `NaN`      | —               |
+/// | `0.0*TAD`     | `NaN`      | —               |
+///
+/// So this gate closes an asymmetry in the **gradient** route only: `T` was
+/// already declining and its value is wrong anyway. Declining is still right —
+/// an analytic jet of a wrong value is worse than an FD one — but the value
+/// defect is separate and is not fixed here (`SS_NONAUTONOMOUS_ISSUE`).
+#[test]
+fn ode_ss_bare_time_builtin_rhs_routes_to_fd() {
+    let model = tad_gate_model("TIME", "");
+    let prog = model
+        .ode_spec
+        .as_ref()
+        .and_then(|o| o.rhs_program.as_ref())
+        .expect("rhs program");
+    assert!(
+        !prog.uses_time_vars(),
+        "precondition: a bare `TIME` must NOT set the slot-backed flag — if it \
+         does, this test no longer covers the spelling it exists for"
+    );
+    assert!(prog.reads_time_builtin(), "`TIME` sets the built-in flag");
+    assert!(prog.reads_model_time(), "and the paired predicate sees it");
+
+    let mut ss = bolus_subject_wt(&[1.0, 2.0, 4.0], 70.0);
+    ss.doses[0].ss = true;
+    ss.doses[0].ii = 8.0;
+    assert!(
+        !ode_tvcov_supported(&model, &ss),
+        "SS + a bare-`TIME` RHS must decline to FD, exactly as the `T` spelling does"
+    );
+    // The non-SS neighbour must be unaffected: this gate is about steady state,
+    // not about `TIME`, so widening it must not sweep up an ordinary subject. Use
+    // a TV-covariate subject, which reaches `ode_tvcov_supported`'s trigger list
+    // on its own — a plain bolus subject returns `false` here for the unrelated
+    // reason that it has no trigger at all and takes the *static* dual walk, which
+    // would make this a vacuous assert.
+    let plain = tad_gate_subject();
+    assert!(
+        !plain.has_periodic_ss_dose() && plain.has_tv_covariates(),
+        "precondition: the neighbour has no SS dose but does have a TV-cov trigger"
+    );
+    assert!(
+        ode_tvcov_supported(&model, &plain),
+        "a non-SS subject on the same `TIME`-reading model must keep the event-driven \
+         dual walk — the SS clause must not sweep it up"
     );
 }
 

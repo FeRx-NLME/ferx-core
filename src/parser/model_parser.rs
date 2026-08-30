@@ -18986,11 +18986,39 @@ impl OdeRhsProgram {
         self.uses_dose_anchored_time_vars
     }
 
-    /// See [`OdeRhsProgram::reads_time_builtin`]. Pair it with
-    /// [`Self::uses_time_vars`] to test for model-time dependence of *any*
-    /// spelling; neither alone is sufficient.
+    /// See [`OdeRhsProgram::reads_time_builtin`]. Almost every caller wants
+    /// [`Self::reads_model_time`] instead: neither this flag nor
+    /// [`Self::uses_time_vars`] alone covers all four spellings, and pairing them
+    /// by hand at each call site is how #1124's gap survived (`ode_tvcov_supported`
+    /// paired them; the SS gate did not, and its own test worked *around* the gap
+    /// by spelling the term `T`).
     pub(crate) fn reads_time_builtin(&self) -> bool {
         self.reads_time_builtin
+    }
+
+    /// **The RHS is non-autonomous**: it reads model time under any of its four
+    /// spellings — `TAD`, `TAFD`, `T`/`t` (slot-backed, via
+    /// [`Self::uses_time_vars`]) or the bare `TIME` built-in (via
+    /// [`Self::reads_time_builtin`]), including from inside an `if` condition.
+    ///
+    /// The single predicate every "is this system time-invariant?" gate should
+    /// ask. The two underlying flags are disjoint by construction — `TIME`
+    /// compiles to `Op::PushTime` (the model-time thread-local) rather than a
+    /// `PushVar(time_slot)`, so `stmts_read_slots` structurally cannot see it —
+    /// and asking only one of them admits a non-autonomous model as
+    /// time-invariant. That is #1124: the closed-form fast path dropped the term
+    /// from the predictions outright (8× wrong by 12 h).
+    ///
+    /// Keep the two flags separate where the *distinction* is the point:
+    /// [`Self::uses_dose_anchored_time_vars`] is deliberately narrower (`TAD`
+    /// only, the sole anchor that moves with an estimated lagtime, #1070).
+    ///
+    /// Composed from the two accessors rather than the two fields so neither
+    /// reads as dead code once this becomes their only production caller — a
+    /// `#[allow(dead_code)]` there would hide the real thing it is meant to
+    /// signal, that a gate stopped asking one of them.
+    pub(crate) fn reads_model_time(&self) -> bool {
+        self.uses_time_vars() || self.reads_time_builtin()
     }
 
     /// Evaluate `du = f(u, p, t)` over a dual type, generic over [`PkNum`]

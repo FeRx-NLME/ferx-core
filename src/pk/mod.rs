@@ -40,17 +40,37 @@ pub(crate) fn model_uses_time_builtin(model: &CompiledModel) -> bool {
 /// defects have in common, and it is the path the NONMEM `TAD`-in-`$DES` anchors
 /// (`nonmem_anchor/tad_lag_{A,B}`) already validate.
 ///
-/// Widening this predicate never changes a model that was already correct: a
-/// bare-`TAFD` RHS with no lagtime moves from the dense path to the event-driven
-/// one and agrees to `6e-13`.
+/// **What the reroute is measured to preserve.** The predicate also moves models
+/// the closed form declined for reasons of its own — `init(...)`, a
+/// `dose_attr_map`, steady-state or infusion doses — off the *dense* path, which
+/// they were on before. Measured, dense vs event-driven, worst relative
+/// difference over the observations:
+///
+/// | model | measured |
+/// |---|---|
+/// | bare `TAFD` RHS, no lagtime, plain bolus | `6e-13` |
+/// | `init(central) = BASE` + `TAFD` RHS | `4.8e-11` |
+///
+/// Two cases where the two engines are **not** comparable, so no agreement is
+/// claimed for them:
+///
+///   - **under a lagtime** the dense path returns `NaN` for every observation
+///     (that is #1110, the defect being routed around), so there is nothing to
+///     compare against;
+///   - **a steady-state dose** on a non-autonomous RHS is wrong on *both*
+///     engines — `NaN` for `TAD`/`TAFD` (even at a zero coefficient) and 17%
+///     off an explicit 40-cycle pulse train for `T`/`TIME`. Rerouting neither
+///     causes nor cures that; see `SS_NONAUTONOMOUS_ISSUE`.
+///
+/// Regression tests: `rerouting_a_bare_tafd_rhs_does_not_move_the_predictions`
+/// and `rerouting_an_init_seeded_rhs_does_not_move_the_predictions`.
 #[inline]
 pub(crate) fn model_uses_time_anywhere(model: &CompiledModel) -> bool {
     model_uses_time_builtin(model)
-        || model.ode_spec.as_ref().is_some_and(|s| {
-            s.rhs_program
-                .as_ref()
-                .is_some_and(|p| p.uses_time_vars() || p.reads_time_builtin())
-        })
+        || model
+            .ode_spec
+            .as_ref()
+            .is_some_and(|s| s.rhs_program.as_ref().is_some_and(|p| p.reads_model_time()))
 }
 
 #[inline]

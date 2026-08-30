@@ -34,10 +34,14 @@ section of the SDLC for the versioning policy).
   time-invariance probe samples two times and could not see any of them. Models that do not
   read model time are unaffected and keep the fast path.
 - **An `[odes]` RHS that reads `TAD` together with a lagtime no longer returns `NaN`
-  predictions (#1110).** The dense predictor anchored `TAD` on doses that had already
-  arrived, and under a lagtime none has at the first segment's start, so every prediction
-  came back `NaN`. These models now take the event-driven predictor, whose timeline starts at
-  the lagged arrival. (What `TAD` should mean *before* the first arrival remains open.)
+  predictions, for observations after the first dose arrives (#1110).** The dense predictor
+  anchored `TAD` on doses that had already arrived, and under a lagtime none has at the first
+  segment's start, so every prediction came back `NaN`. These models now take the event-driven
+  predictor, whose timeline starts at the lagged arrival. Two parts of #1110 stay open and are
+  **not** fixed here: an observation recorded *before* the first dose arrives still returns
+  `NaN` for that observation and every later one, on both predictors and with or without a
+  lagtime (`TAD` is undefined there, and the `NaN` propagates through the solve); and the
+  variance path used by `[diffusion]` / EKF models still reaches the dense predictor (#1131).
 - **VI no longer freezes from ordinary starting values (#1097).** Adam's gradients are now
   clipped to a global L2 norm, controlled by the new `vi_grad_clip` fit option (default `1e4`;
   `0` restores the old behaviour). Under a proportional error model a prediction near zero

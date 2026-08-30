@@ -68,6 +68,7 @@
 //! - `data/tad_lag_{A,B}.csv` — the same CSVs (dose `CMT=1`, obs `CMT=1`, so no
 //!   re-keying is needed between engines).
 
+use ferx_core::ode::OdeMethod;
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions};
 use std::path::Path;
@@ -123,8 +124,12 @@ fn run_anchor(data: &str, nonmem_ofv: f64) {
         outer_maxiter: 0,
         run_covariance_step: false,
         verbose: false,
-        // NONMEM-equivalent ODE accuracy; pin the stepper so a later
-        // `ode_method = auto` probe change cannot move a regression anchor.
+        // NONMEM-equivalent ODE accuracy, and the stepper actually pinned:
+        // `FitOptions::default()` is `OdeMethod::Auto`, so without this line a
+        // change to the stiffness probe could move the anchor, and the committed
+        // companion (`nonmem_anchor/*_fit.ferx`, which sets `ode_method = rk45`)
+        // and this test would disagree at birth with nothing to catch it.
+        ode_method: OdeMethod::Rk45,
         ode_reltol: 1e-9,
         ode_abstol: 1e-11,
         inner_tol: 1e-6,

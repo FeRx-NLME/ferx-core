@@ -652,6 +652,36 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     // A `TIME`-built-in structural parameter is per-event dynamic (the switch fires at
     // event times), so it routes through the event-driven walk even with no TV
     // covariates — mirroring the closed-form `subject_sensitivities_tvcov` (#486).
+    //
+    // Deliberately the **narrow** predicate, not `reads_model_time`. This clause asks
+    // whether the *PK parameters* move between events, which is what makes the static
+    // superposition walk's single snapshot wrong; a non-autonomous `[odes]` RHS is a
+    // different question and the static walk handles it. #1124 review asked whether
+    // widening the value-path routing (`pk::model_uses_time_anywhere`) without widening
+    // this one re-creates a value/gradient engine split. Measured against central FD of
+    // the production predictor, worst relative error over all observations, two bolus
+    // doses, `reltol = 1e-10`:
+    //
+    // | RHS                     | value    | `∂f/∂η`  | `∂f/∂θ`  |
+    // |-------------------------|----------|----------|----------|
+    // | `0.3*TAD`               | 8.9e-12  | 1.5e-9   | 3.0e-10  |
+    // | `0.03*TIME`             | 1.0e-12  | 6.4e-10  | 5.0e-11  |
+    // | `if (TIME > 3) {…}`     | 7.0e-9   | 4.6e-3   | 4.8e-4   |
+    //
+    // The `if` row is FD noise, not a defect: the RHS is discontinuous at `t = 3`, so
+    // the adaptive stepper places steps differently either side and the *value* is only
+    // good to ~1e-8. Refining `h` makes it worse and tightening `reltol` makes it better
+    // — the signature of `eps_value / h`, not of a wrong jet. Swept at `reltol = 1e-10`:
+    // `h = 1e-3 → 1.5e-6`, `1e-5 → 3.3e-5`, `1e-7 → 2.7e-2`; at `reltol = 1e-12` the
+    // same points are `1.2e-7`, `5.0e-6`, `5.4e-4`. The smooth-`TIME` control stays at
+    // ~1e-9 across the whole sweep.
+    //
+    // So the split is real in structure and empty in effect: for the subjects that reach
+    // it, the static walk anchors `TAD`/`TIME` the same way the event-driven one does.
+    // The conditions under which the two walks genuinely diverge — a lagtime, TV
+    // covariates, SS, resets, a modeled dose — are all already in the trigger list
+    // below, so such a subject never lands on the static walk in the first place.
+    // Widen this only with a case that measures a divergence.
     let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
     // A per-route absorption lag (`fn(..., lag=L)`, #859) makes each route's onset a moving
     // boundary (`t_dose + lag_cmt + lag_route`) with its own rate-on saltation — the same
@@ -806,7 +836,26 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     // time, anchor 0), so a time/TAD-dependent RHS breaks the steady-state cycle recurrence —
     // the dual walk's monotonic TAD diverges from production's per-interval anchor, giving a
     // wrong prediction *and* gradient (#473 review #1, verified vs the production predictor).
-    if has_ss && ode.rhs_program.as_ref().is_some_and(|p| p.uses_time_vars()) {
+    //
+    // `reads_model_time`, not the bare `uses_time_vars` this gate asked until #1124: a bare
+    // `TIME` in the RHS compiles to `Op::PushTime`, which `uses_time_vars` structurally cannot
+    // see, so that spelling reached `equilibrate_ss_state_g` while `T` — the same quantity —
+    // declined. The gap was known: this gate's own regression test
+    // (`ode_ss_time_only_rhs_still_routes_to_fd`) spells the term `T` *to work around it*.
+    //
+    // The gate is about the analytic-vs-FD **gradient** route. It does not make SS + a
+    // non-autonomous RHS correct: measured against an explicit 40-cycle pulse train, the
+    // production *value* is 17% wrong for `T` and `TIME` alike, and `NaN` for `TAD`/`TAFD`
+    // even when the term's coefficient is zero. That is a separate defect —
+    // `SS_NONAUTONOMOUS_ISSUE` is a placeholder for its issue number, kept
+    // greppable until the issue is filed; the other three sites use the same
+    // token (`pk/mod.rs`, `pk/modified_release.rs`, `ode_provider_tests.rs`).
+    if has_ss
+        && ode
+            .rhs_program
+            .as_ref()
+            .is_some_and(|p| p.reads_model_time())
+    {
         return false;
     }
     // EVID 3/4 resets and finite-duration infusions ARE handled (resets zero the state;
@@ -2574,13 +2623,14 @@ fn ode_iov_subject_supported(
     // regardless of outer/IOV dispatch.
     // SS combined with a non-autonomous RHS (reads `TIME`/`TAFD`/`TAD`) → FD: the SS
     // equilibration assumes a time-invariant pulse train, so the cycle recurrence breaks
-    // (mirrors `ode_tvcov_supported`, #473 review #1).
+    // (mirrors `ode_tvcov_supported`, #473 review #1). `reads_model_time` so the bare-`TIME`
+    // spelling is covered too (#1124) — see the note at the `ode_tvcov_supported` gate.
     if has_ss
         && model
             .ode_spec
             .as_ref()
             .and_then(|o| o.rhs_program.as_ref())
-            .is_some_and(|p| p.uses_time_vars())
+            .is_some_and(|p| p.reads_model_time())
     {
         return None;
     }
