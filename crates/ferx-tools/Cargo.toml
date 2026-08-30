@@ -1,0 +1,11 @@
+[package]
+name = "ferx-tools"
+version = "0.3.0"
+edition = "2021"
+description = "Model-development tooling on top of ferx-core: bootstrap, covariate search, cross-validation"
+license = "MIT"
+authors = ["Ron Keizer", "Teun Post", "Hidde van de Beek"]
+repository = "https://github.com/FeRx-NLME/ferx-core"
+
+[dependencies]
+ferx-core = { path = "../..", version = "0.3.0" }

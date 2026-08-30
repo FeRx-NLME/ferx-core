@@ -199,7 +199,7 @@ fn main() {
             }
 
             // SAEM conditional-distribution outputs (only when the pass ran).
-            for msg in ferx_core::io::output::write_conddist_outputs(&fit_result, &model_name) {
+            for msg in ferx_core::io::output::write_conddist_outputs(&fit_result, model_name) {
                 eprintln!("{}", msg);
             }
 
@@ -786,8 +786,13 @@ mod tests {
     // the coverage and pins the documented exit-code contract: 0 = valid,
     // 1 = errors found, 2 = usage / bad arguments.
 
-    const VALID_MODEL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/one_cpt_iv.ferx");
-    const VALID_DATA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/data/one_cpt_iv.csv");
+    // `CARGO_MANIFEST_DIR` is `crates/ferx-cli`, so the repo-root fixtures
+    // (`examples/`, `data/`) are two levels up (#1114).
+    const VALID_MODEL: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/one_cpt_iv.ferx"
+    );
+    const VALID_DATA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/one_cpt_iv.csv");
 
     #[test]
     fn run_check_usage_errors_return_2() {
@@ -854,7 +859,8 @@ mod tests {
 
     // ── run_summary: in-process coverage of the `summary` subcommand ──────────
 
-    const WARFARIN_MODEL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/warfarin.ferx");
+    const WARFARIN_MODEL: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/warfarin.ferx");
 
     #[test]
     fn run_summary_usage_errors_return_2() {

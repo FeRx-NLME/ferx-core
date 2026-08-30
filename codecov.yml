@@ -94,6 +94,26 @@ coverage:
           - markov
           - nn
 
+# Workspace components (#1114). Flags stay as they are — the members are measured
+# by the SAME `--workspace` instrumented run as `ferx-core`, so they ride the
+# `fast` flag and need no flag of their own. Components are the path-based view
+# on top: they let the split be read per layer (is the CLI covered? are the
+# tools?) without changing what any status gates on.
+component_management:
+  individual_components:
+    - component_id: ferx_core
+      name: ferx-core (engine)
+      paths:
+        - src/**
+    - component_id: ferx_tools
+      name: ferx-tools (multi-fit tooling)
+      paths:
+        - crates/ferx-tools/**
+    - component_id: ferx_cli
+      name: ferx-cli (ferx binary)
+      paths:
+        - crates/ferx-cli/**
+
 flag_management:
   default_rules:
     carryforward: true
@@ -130,9 +150,11 @@ comment:
 #       its role (would be even at 100%), not to pad the number.
 #
 # Deliberately NOT ignored:
-#   src/bin/run_model.rs      -> the `ferx` CLI (arg parsing, dispatch, error
+#   crates/ferx-cli/**        -> the `ferx` CLI (arg parsing, dispatch, error
 #       exits) is user-facing logic -> refactored into a lib run() and
-#       unit-tested, not excluded (#286).
+#       unit-tested, not excluded (#286). It lived at `src/bin/run_model.rs`
+#       until #1114 moved the binary into its own workspace package; the
+#       `--workspace` coverage run keeps it measured across that move.
 #
 ignore:
   - "tests/**"

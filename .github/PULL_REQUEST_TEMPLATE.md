@@ -27,7 +27,7 @@
 ## Breaking changes
 - [ ] `.ferx` model file format (add migration note below)
 - [ ] `FitResult` / sdtab fields changed (ferx parses these — link ferx PR above)
-- [ ] Public Rust API (`api.rs` / `types.rs`)
+- [ ] Public Rust API (`api/`, `types.rs`) — regenerate `api/ferx-core-public-api.txt` with `tools/update-public-api.sh` and say which caller needs each added item
 - [ ] None
 
 <details>
@@ -105,9 +105,9 @@
 - [ ] New estimator, DSL feature, or fit option → relevant book chapter updated or PR opened
 
 ### Example execution (run locally before marking ready for review)
-- [ ] Rebuilt ferx-core: `cargo build --release`
+- [ ] Rebuilt ferx-core: `cargo build --release --workspace`
 - [ ] Rebuilt ferx-r against updated ferx-core: `cd ../ferx-r && R CMD INSTALL .`
-- [ ] All affected `examples/*.ferx` run cleanly via CLI: `cargo run --release -- examples/<model>.ferx --data data/<data>.csv`
+- [ ] All affected `examples/*.ferx` run cleanly via CLI: `cargo run --release -p ferx-cli -- examples/<model>.ferx --data data/<data>.csv`
 - [ ] All affected ferx-site example `.qmd` pages render cleanly: `quarto render examples/<page>.qmd`
 - [ ] All affected ferx-book chapters render cleanly: `quarto render chapters/<chapter>.qmd`
 - [ ] No example execution step needed (internal refactor / docs-only / no user-visible change)

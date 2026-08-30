@@ -291,7 +291,7 @@ single-dose model. SS is a property of the **dataset**:
 Combine with the SS=1 dataset above and run:
 
 ```
-cargo run --release -- examples/ss_oral_q24.ferx --data data/ss_oral_q24.csv
+cargo run --release -p ferx-cli -- examples/ss_oral_q24.ferx --data data/ss_oral_q24.csv
 ```
 
 A runnable example pair ships in the repository at

@@ -1,0 +1,23 @@
+[package]
+name = "ferx-cli"
+version = "0.3.0"
+edition = "2021"
+description = "Command-line interface for the ferx NLME modeling engine"
+license = "MIT"
+authors = ["Ron Keizer", "Teun Post", "Hidde van de Beek"]
+repository = "https://github.com/FeRx-NLME/ferx-core"
+
+# The installed binary keeps the name `ferx` — the package rename is invisible
+# to users. It lives here rather than in the `ferx-core` package because it will
+# grow `ferx-tools` subcommands (bootstrap, SCM), and `ferx-tools` depends on
+# `ferx-core`; a binary in `ferx-core` that called into tools would be a cycle.
+[[bin]]
+name = "ferx"
+path = "src/main.rs"
+
+[dependencies]
+ferx-core = { path = "../..", version = "0.3.0" }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

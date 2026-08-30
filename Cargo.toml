@@ -1,3 +1,25 @@
+# The repo root is BOTH the `ferx-core` package and the workspace root. That is
+# deliberate and load-bearing: `ferx-r/src/rust/.cargo/config.toml` patches
+# `ferx-core = { path = "../../../ferx-core" }` — the repo root — so moving the
+# package under `crates/` would break every local ferx-r build, and break it
+# *silently* (the patch stops applying and ferx-r quietly builds `main` instead
+# of your branch). See #1114.
+#
+# Boundary rule: `ferx-core` = one model, one dataset, one fit. `ferx-tools` =
+# many fits, resampling, model-space search. Statistical kernels stay in core;
+# orchestration of repeated fits lives in tools. `ferx-core` never depends on
+# either member (A1); the public-API baseline in `api/ferx-core-public-api.txt`
+# is what keeps the boundary honest (A2).
+[workspace]
+members = ["crates/ferx-tools", "crates/ferx-cli"]
+# Required to PRESERVE existing behaviour, not to change it: a standalone
+# edition-2021 package gets resolver v2 implicitly, but inside a workspace the
+# root package's edition no longer implies it — cargo would warn and fall back
+# to v1, quietly changing how dev-/build-dependency features unify into the
+# `ferx-core` build. Naming v2 keeps `ferx-core` resolving exactly as it did
+# before the split.
+resolver = "2"
+
 [package]
 name = "ferx-core"
 version = "0.3.0"
@@ -16,11 +38,15 @@ readme = "README.md"
 # it hardcodes the fixture path, so shipping it without the data would turn
 # `cargo test --features slow-tests` on the packaged crate into a panic on a
 # missing file rather than a test that simply is not there.
-exclude = ["data/mbma_naproxen.*", "tests/mbma_naproxen_case_study.rs"]
-
-[[bin]]
-name = "ferx"
-path = "src/bin/run_model.rs"
+#
+# `api/` is the CI-enforced public-API baseline (#1114) — a 388 KB rustdoc-derived
+# snapshot that is repo infrastructure, not crate content, so it is kept out of
+# the published tarball too.
+exclude = [
+  "data/mbma_naproxen.*",
+  "tests/mbma_naproxen_case_study.rs",
+  "api/*",
+]
 
 [features]
 default = []

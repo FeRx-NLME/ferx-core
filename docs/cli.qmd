@@ -260,5 +260,5 @@ ferx examples/warfarin.ferx --simulate
 cargo build --release
 
 # Run directly via cargo
-cargo run --release --bin ferx -- model.ferx --data data.csv
+cargo run --release -p ferx-cli -- model.ferx --data data.csv
 ```
