@@ -3327,11 +3327,15 @@ fn run_subject_tvcov_eta<const N: usize>(
 ///
 /// The TAD anchor is `max` over arrivals, and a `max` of two differentiable functions has a
 /// kink where they cross: at an exact tie the derivative is one-sided, and either one-sided
-/// value is a valid subgradient. This keeps the **incumbent** — the dose already processed,
-/// i.e. the earlier one in timeline order — matching what production's `max` returns for the
-/// value (they are equal there) and making the choice deterministic rather than dependent on
-/// float comparison order. Two doses arriving at the identical instant with *different* lag
-/// slots is the only case that can observe it, and the value is the same either way (#1070).
+/// value is a valid subgradient. This keeps the **incumbent**, which resolves concretely: the
+/// timeline is sorted on `(time, kind)` by a *stable* `sort_by`, and `K_DOSE` entries are
+/// pushed in `subject.doses` order, so co-timed arrivals fire in ascending dose index and the
+/// incumbent is the lower-indexed dose. Production's `max` returns the same *value* (they are
+/// equal at a tie) and carries no jet to disagree about, so this is a free choice — pinned
+/// here so it is deterministic rather than dependent on float comparison order.
+///
+/// Only two doses arriving at the identical instant through *different* lag slots can observe
+/// it, since a single slot gives both arrivals the same jet as well as the same value (#1070).
 ///
 /// NaN handling mirrors `f64::max`, which *ignores* a NaN operand: a bare
 /// `candidate > incumbent` comparison is false against a NaN incumbent and would keep it,
