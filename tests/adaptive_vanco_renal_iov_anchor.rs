@@ -13,10 +13,12 @@
 //!     1.7.2, feeds the SAME declining CRCL trajectory AND ferx's exact per-occasion κ
 //!     (reconstructed from the seeded substream — identical to the #701 anchor's, as
 //!     the κ stream is model-independent), replays ferx's realized dose ladder, and
-//!     records the pre-dose trough at each decision. Each day is two segments — the
-//!     infusion on THIS occasion's (CRCL_g, κ_g), the decay on the NEXT occasion's
-//!     (CRCL_{g+1}, κ_{g+1}) — the end-of-interval convention ferx's per-segment PK
-//!     uses, now with BOTH effects composed into the piecewise-constant CL.
+//!     records the pre-dose trough at each decision. Each day is two segments (the
+//!     split is needed for the infusion *rate*), both on the NEXT occasion's
+//!     (CRCL_{g+1}, κ_{g+1}): the infusion end is not a data record, so the obs at
+//!     `t_{g+1}` governs the whole day — the end-of-interval convention ferx's
+//!     per-segment PK uses (#1073), now with BOTH effects composed into the
+//!     piecewise-constant CL.
 //!   - `expected.md` is the frozen mrgsolve ladder. Regenerate with
 //!     `Rscript vanco_renal_iov_mrgsolve.R`.
 //!
@@ -57,19 +59,19 @@ const CRCL: [f64; 14] = [
 /// bit-for-bit.
 const REF_LADDER: [(f64, f64, f64); 14] = [
     (0.0, 0.000000, 625.000000),
-    (24.0, 2.556064, 781.250000),
-    (48.0, 3.239114, 976.562500),
-    (72.0, 3.175663, 1220.703125),
-    (96.0, 6.413905, 1525.878906),
-    (120.0, 13.302792, 1525.878906),
-    (144.0, 10.762650, 1525.878906),
-    (168.0, 16.631220, 1144.409180),
-    (192.0, 12.316018, 1144.409180),
-    (216.0, 16.342389, 858.306885),
-    (240.0, 15.479172, 643.730164),
-    (264.0, 15.727982, 482.797623),
-    (288.0, 15.334823, 362.098217),
-    (312.0, 13.346793, 362.098217),
+    (24.0, 2.583322, 781.250000),
+    (48.0, 3.227217, 976.562500),
+    (72.0, 3.153547, 1220.703125),
+    (96.0, 6.492767, 1525.878906),
+    (120.0, 13.486416, 1525.878906),
+    (144.0, 10.672210, 1525.878906),
+    (168.0, 16.841537, 1144.409180),
+    (192.0, 12.255352, 1144.409180),
+    (216.0, 16.535773, 858.306885),
+    (240.0, 15.543945, 643.730164),
+    (264.0, 15.862112, 482.797623),
+    (288.0, 15.456498, 362.098217),
+    (312.0, 13.403205, 362.098217),
 ];
 
 /// Cross-solver trough tolerance (mg/L). ferx (RK45) vs mrgsolve (LSODA) integrate
