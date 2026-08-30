@@ -12,9 +12,10 @@
 //!     vancomycin, once-daily 1-h infusion, `CL = TVCL·exp(η + κ)`) in mrgsolve
 //!     1.7.2, **injects ferx's exact per-occasion κ** (reconstructed from the seeded
 //!     substream), replays ferx's realized dose ladder, and records the pre-dose
-//!     trough at each decision. Each day is integrated as two segments — the
-//!     infusion on THIS occasion's CL, the decay on the NEXT occasion's CL
-//!     (end-of-interval convention ferx's per-segment IOV PK uses).
+//!     trough at each decision. Each day is integrated as two segments (the split
+//!     is needed for the infusion *rate*), both on the NEXT occasion's CL: the
+//!     infusion end is not a data record, so the obs at `t_{g+1}` governs the whole
+//!     day — the end-of-interval convention ferx's per-segment IOV PK uses (#1073).
 //!   - `expected.md` is the frozen mrgsolve ladder (κ, CL, trough, dose per
 //!     decision). Regenerate with `Rscript vanco_iov_mrgsolve.R`.
 //!
@@ -63,27 +64,28 @@ const ANCHOR_SEED: u64 = 20260708;
 /// titration), so ferx reproduces them bit-for-bit.
 const REF_LADDER: [(f64, f64, f64); 14] = [
     (0.0, 0.000000, 625.000000),
-    (24.0, 2.960637, 781.250000),
-    (48.0, 3.697443, 976.562500),
-    (72.0, 3.174336, 1220.703125),
-    (96.0, 5.578850, 1525.878906),
-    (120.0, 10.761070, 1525.878906),
-    (144.0, 5.932958, 1907.348633),
-    (168.0, 11.376082, 1907.348633),
-    (192.0, 6.447514, 2384.185791),
-    (216.0, 13.606025, 2384.185791),
-    (240.0, 12.646158, 2384.185791),
-    (264.0, 16.481410, 1788.139343),
-    (288.0, 16.646880, 1341.104507),
-    (312.0, 12.439516, 1341.104507),
+    (24.0, 2.984437, 781.250000),
+    (48.0, 3.677836, 976.562500),
+    (72.0, 3.139722, 1220.703125),
+    (96.0, 5.628443, 1525.878906),
+    (120.0, 10.884727, 1525.878906),
+    (144.0, 5.820004, 1907.348633),
+    (168.0, 11.531568, 1907.348633),
+    (192.0, 6.338297, 2384.185791),
+    (216.0, 13.820478, 2384.185791),
+    (240.0, 12.610967, 2384.185791),
+    (264.0, 16.604240, 1788.139343),
+    (288.0, 16.747015, 1341.104507),
+    (312.0, 12.418945, 1341.104507),
 ];
 
 /// Cross-solver trough tolerance (mg/L). ferx (RK45) vs mrgsolve (LSODA) integrate
 /// the SAME piecewise-constant per-occasion-CL system, so the observed gap is tiny
 /// (max ~5e-4 over the horizon). `2e-3` is a safe but meaningful guard — a
 /// trajectory mismatch from a broken occasion → CL hand-off (e.g. the wrong
-/// occasion's κ on a segment, which the two other plausible conventions produce)
-/// would blow past it by 1–3 orders of magnitude.
+/// occasion's κ on a segment) would blow past it by 1–3 orders of magnitude. The
+/// pre-#1073 convention, which ran the infusion window on occasion `g` instead of
+/// `g+1`, misses by ~2.4e-2 — 12× this tolerance.
 const SIGNAL_TOL: f64 = 2e-3;
 
 /// The realized dose ladder is exact f64 (the mrgsolve `expected.md` doses are

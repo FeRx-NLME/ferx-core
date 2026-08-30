@@ -768,36 +768,29 @@ fn pk_for_g<T: PkNum>(
     }
 }
 
-/// Parameters for the interval ENDING at each event, the dual mirror of the value
-/// walk's resolution in `pk::event_driven` (#1073).
+/// Snapshot of the record at event slot `q` — the dual mirror of the value walk's
+/// `record_pk_at` in `pk::event_driven` (#1073). Only ever called on a slot the
+/// shared [`crate::dosing::governing_record_indices`] resolution returned, i.e. a
+/// record.
 ///
-/// A record supplies its own snapshot; the lagged dose *arrival* supplies none and
-/// takes the next record's, because it only subdivides the interval that record
-/// terminates. This must track the value walk exactly or the analytic `∂f/∂η`
-/// would be the derivative of a different function than the one predicted — a
-/// disagreement `Dual2`-vs-FD parity cannot see, since both sides would move
-/// together.
-fn next_record_pk_g<T: PkNum>(
-    events: &[Event],
+/// Kept as an index → snapshot resolver rather than a materialised
+/// `Vec<Option<PkDual<T>>>`: `PkDual<Dual2<N>>` is `8 × (1 + N + N²)` f64, ~4.7 KB
+/// at `N = 8`, so a per-event vector would put ~190 KB of copying per subject on the
+/// FOCEI inner-loop gradient path — and `cacheable_schedule` refuses lagtime models,
+/// so the schedule (and this resolution) is rebuilt on every call for exactly the
+/// models #1073 is about.
+#[inline]
+fn record_pk_at_g<T: PkNum>(
+    ev: Event,
     pk_at_dose: &[PkDual<T>],
     pk_at_obs: &[PkDual<T>],
     pk_at_pk_only: &[PkDual<T>],
-) -> Vec<Option<PkDual<T>>> {
-    let mut acc = vec![None; events.len()];
-    let mut seen: Option<PkDual<T>> = None;
-    for i in (0..events.len()).rev() {
-        let ev = events[i];
-        match ev.kind {
-            EventKind::DoseRecord => seen = Some(pk_at_dose[ev.orig_idx]),
-            EventKind::PkOnly => seen = Some(pk_at_pk_only[ev.orig_idx]),
-            EventKind::Obs => seen = Some(pk_at_obs[ev.orig_idx]),
-            // Not records: the arrival is a state jump, and a reset is handled
-            // before the parameter lookup.
-            EventKind::Dose | EventKind::Reset => {}
-        }
-        acc[i] = seen;
+) -> PkDual<T> {
+    match ev.kind {
+        EventKind::DoseRecord => pk_at_dose[ev.orig_idx],
+        EventKind::PkOnly => pk_at_pk_only[ev.orig_idx],
+        _ => pk_at_obs[ev.orig_idx],
     }
-    acc
 }
 
 /// Propagate the dual state across pre-built sub-event bounds, applying any active
@@ -1392,7 +1385,15 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
     let mut cur_t = schedule.events[0].time;
     let mut reset_floor = f64::NEG_INFINITY;
 
-    let next_record_pk = next_record_pk_g(&schedule.events, pk_at_dose, pk_at_obs, pk_at_pk_only);
+    // Same resolution as the value walk, from the same shared helper: a record
+    // governs itself, a non-record takes the next record ahead, and the trailing
+    // tail keeps the last record. This must track the value walk exactly or the
+    // analytic `∂f/∂η` would be the derivative of a different function than the one
+    // predicted — a disagreement `Dual2`-vs-FD parity cannot see, since FD perturbs
+    // this walk's own value path and both sides would move together.
+    let governing_record = crate::dosing::governing_record_indices(schedule.events.len(), |i| {
+        crate::pk::event_driven::is_record(schedule.events[i].kind)
+    });
 
     for (i, ev) in schedule.events.iter().enumerate() {
         if ev.kind == EventKind::Reset {
@@ -1403,8 +1404,12 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
         }
         // The record terminating this interval — itself for a record, the next one
         // ahead for a lagged arrival (#1073). Mirrors the value walk exactly.
-        let pk_now = next_record_pk[i]
-            .unwrap_or_else(|| pk_for_g(*ev, pk_at_dose, pk_at_obs, pk_at_pk_only));
+        // `None` only for a subject with no record anywhere in the walk, which the
+        // `n_obs == 0` early return above has already handled.
+        let pk_now = governing_record[i].map_or_else(
+            || pk_for_g(*ev, pk_at_dose, pk_at_obs, pk_at_pk_only),
+            |q| record_pk_at_g(schedule.events[q], pk_at_dose, pk_at_obs, pk_at_pk_only),
+        );
 
         if ev.time > cur_t {
             let bounds = &schedule.bounds_per_interval[i - 1];
@@ -1616,6 +1621,114 @@ mod tests {
             approx::assert_relative_eq!(s_g[0], s_p[0], max_relative = 1e-12);
             approx::assert_relative_eq!(s_g[1], s_p[1], max_relative = 1e-12);
         }
+    }
+
+    // ── The record convention in the twin (#1073) ─────────────────────────
+
+    /// A `PkDual` whose `cl` carries the seed jet, everything else constant.
+    fn pk_dual_cl_var(cl: f64, v: f64, seed: bool) -> PkDual<Dual2<1>> {
+        PkDual {
+            cl: if seed {
+                Dual2::var(cl, 0)
+            } else {
+                Dual2::constant(cl)
+            },
+            v: Dual2::constant(v),
+            q: Dual2::constant(0.0),
+            v2: Dual2::constant(0.0),
+            ka: Dual2::constant(0.0),
+            q3: Dual2::constant(0.0),
+            v3: Dual2::constant(0.0),
+            f: Dual2::constant(1.0),
+        }
+    }
+
+    /// The dual walk's VALUE path must equal the production closed-form walk exactly,
+    /// and its `∂f/∂CL` must equal a central finite difference **of production**, on a
+    /// subject whose lagged arrival crosses a time-varying covariate (#1073).
+    ///
+    /// This is the oracle `Dual2`-vs-FD parity cannot supply. FD parity perturbs the
+    /// twin's *own* value path, so if the twin resolved a segment to a different record
+    /// than production does, both its value and its derivative move together and agree
+    /// on the wrong answer. Only production is an independent reference — and here it
+    /// is one on both counts: the value pins the resolution, and differentiating
+    /// w.r.t. the LAST record's `CL` pins *which* record the `(dose row, arrival]`
+    /// segment resolved to (a twin still reading the dose row would report a
+    /// materially smaller sensitivity, because that segment's decay would no longer
+    /// depend on `CL_C` at all).
+    #[test]
+    fn dual_walk_value_and_grad_match_production_across_a_lagged_arrival() {
+        use crate::pk::event_driven::EventSchedule;
+        use crate::types::{DoseEvent, PK_IDX_LAGTIME};
+
+        let (v, cl_a, cl_c, lag) = (100.0, 20.0, 5.0, 3.0);
+        //   t=0  bolus 1000 (CL_A)   t=5 obs (CL_A)
+        //   t=6  dose row, bolus 500, ALAG=3 -> arrival at t=9   t=10 obs (CL_C)
+        // The `(6, 9]` segment is governed by the t=10 record, not the t=6 dose row.
+        let doses = vec![
+            DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(6.0, 500.0, 1, 0.0, false, 0.0),
+        ];
+        let subject = crate::types::Subject {
+            id: "1".into(),
+            doses: doses.clone(),
+            obs_times: vec![5.0, 10.0],
+            observations: vec![0.0; 2],
+            obs_cmts: vec![1; 2],
+            cens: vec![0; 2],
+            ..Default::default()
+        };
+
+        let production = |cl_c: f64| -> Vec<f64> {
+            let mut pk_d0 = pk_of(cl_a, v, 0.0);
+            let mut pk_d1 = pk_of(cl_a, v, 0.0);
+            pk_d0.values[PK_IDX_LAGTIME] = 0.0;
+            pk_d1.values[PK_IDX_LAGTIME] = lag;
+            let pk_dose = vec![pk_d0, pk_d1];
+            let pk_obs = vec![pk_of(cl_a, v, 0.0), pk_of(cl_c, v, 0.0)];
+            event_driven_predictions(PkModel::OneCptIv, &subject, &pk_dose, &pk_obs, &[])
+        };
+
+        let lagtimes = vec![0.0, lag];
+        let schedule = EventSchedule::for_subject(&subject, PkModel::OneCptIv, &doses, &lagtimes);
+        let pk_at_dose = vec![
+            pk_dual_cl_var(cl_a, v, false),
+            pk_dual_cl_var(cl_a, v, false),
+        ];
+        // Only the LAST record's CL carries the seed jet.
+        let pk_at_obs = vec![
+            pk_dual_cl_var(cl_a, v, false),
+            pk_dual_cl_var(cl_c, v, true),
+        ];
+        let dual: Vec<Dual2<1>> = event_driven_sens_with_doses_g(
+            PkModel::OneCptIv,
+            &subject,
+            &schedule,
+            &doses,
+            &[Dual2::constant(0.0), Dual2::constant(lag)],
+            &[],
+            &pk_at_dose,
+            &pk_at_obs,
+            &[],
+        );
+
+        let prod = production(cl_c);
+        for (j, (d, p)) in dual.iter().zip(prod.iter()).enumerate() {
+            approx::assert_relative_eq!(d.value, *p, max_relative = 1e-12);
+            let _ = j;
+        }
+
+        // `∂f/∂CL_C` at the last observation vs a central FD of production.
+        let h = 1e-6 * (1.0 + cl_c.abs());
+        let fd = (production(cl_c + h)[1] - production(cl_c - h)[1]) / (2.0 * h);
+        approx::assert_relative_eq!(dual[1].grad[0], fd, max_relative = 1e-6, epsilon = 1e-12);
+
+        // Non-degeneracy: the sensitivity must be materially nonzero, or "matches FD"
+        // would be the trivial 0 == 0 and a twin reading the wrong record would pass.
+        assert!(
+            fd.abs() > 1e-3,
+            "fixture is inert: d f / d CL_C = {fd} at the last observation"
+        );
     }
 
     /// Central FD grad + 4-point Hessian of a 2-arg `f64` closure.

@@ -76,6 +76,67 @@ pub(crate) fn resolve_subject_doses<'a>(
 ) -> Cow<'a, Subject> {
     resolve_subject_doses_with(subject, attr_map, |_| params)
 }
+
+/// For each slot of an ordered event timeline, the index of the **record that
+/// governs the segment ending there** (#1073).
+///
+/// NONMEM evaluates `$PK` at every data record and then advances *to* that record,
+/// so an interval is governed by the record that **terminates** it. Anything that is
+/// not a record — a lagged dose arrival, an infusion end, a zero-order cutoff, a
+/// per-route onset — supplies no parameters: it merely subdivides the interval its
+/// enclosing record terminates, and every piece of that interval runs on that
+/// record's snapshot.
+///
+/// `is_record(i)` reports whether timeline slot `i` is a record; the caller owns the
+/// mapping from a returned index back to its own snapshot type (`PkParams`,
+/// `PkDual<T>`, or a `&[T]` slice), which is why this resolves *indices* rather than
+/// values — materialising a `PkDual<Dual2<N>>` per event would put ~4.7 KB × n_events
+/// of copying on the FOCEI gradient hot path.
+///
+/// Two rules, and both must be identical in every engine — the four walks
+/// (`ode::predictions`, `pk::event_driven`, `sens::propagate`, `sens::ode_provider`)
+/// integrate the same subject, so a difference here is a silent cross-engine
+/// divergence that `Dual2`-vs-FD parity cannot see (FD perturbs a twin's own value
+/// path, so both sides move together):
+///
+/// 1. A record resolves to **itself**, and a non-record to the **next record ahead**
+///    (one backward scan — the answer for a non-record lies ahead of it in the walk).
+/// 2. Past the final record there is nothing ahead to terminate the segment, so it
+///    keeps the **last record that ran** (a forward fill). Not observable through
+///    predictions today — no observation follows such a boundary — but the four walks
+///    previously split two-and-two between the last record and the dose row here, and
+///    that becomes live the moment a trailing record, a reset, or a second pass reads
+///    the state.
+///
+/// Returns `None` in every slot only when the timeline contains no record at all — a
+/// subject with no observation, no EVID=2 row and no dose, which produces no
+/// prediction.
+pub(crate) fn governing_record_indices(
+    n_events: usize,
+    is_record: impl Fn(usize) -> bool,
+) -> Vec<Option<usize>> {
+    let mut acc: Vec<Option<usize>> = vec![None; n_events];
+    // Rule 1: backward scan. `seen` is set *before* `acc[i]` is written, so a record
+    // resolves to itself rather than to its successor.
+    let mut seen: Option<usize> = None;
+    for i in (0..n_events).rev() {
+        if is_record(i) {
+            seen = Some(i);
+        }
+        acc[i] = seen;
+    }
+    // Rule 2: forward fill the trailing tail (the only slots the backward scan left
+    // `None`, since every slot at or before the final record saw it).
+    let mut last: Option<usize> = None;
+    for slot in acc.iter_mut() {
+        match *slot {
+            Some(q) => last = Some(q),
+            None => *slot = last,
+        }
+    }
+    acc
+}
+
 /// Number of dosing cycles to simulate when pre-equilibrating an SS=1
 /// dose. With a typical t₁/₂/II ratio under 2 (the common clinical range)
 /// this is comfortably past saturation — each additional cycle adds
@@ -779,4 +840,62 @@ pub(crate) fn ss_residual_infusion_end(dose: &DoseEvent, lag: f64, f_bio: f64) -
 /// result by solver error for no gain.
 pub(crate) fn ss_arrival_is_trough(dose: &DoseEvent, lag: f64) -> bool {
     lag <= dose.ii
+}
+
+#[cfg(test)]
+mod governing_record_tests {
+    use super::governing_record_indices;
+
+    /// `true` at every index in `records`.
+    fn idx(n: usize, records: &[usize]) -> Vec<Option<usize>> {
+        governing_record_indices(n, |i| records.contains(&i))
+    }
+
+    #[test]
+    fn a_record_governs_itself_and_a_non_record_takes_the_next_record_ahead() {
+        // slots:   0=DoseRecord  1=Dose(arrival)  2=Obs  3=InfusionEnd  4=Obs
+        let got = idx(5, &[0, 2, 4]);
+        assert_eq!(
+            got,
+            vec![Some(0), Some(2), Some(2), Some(4), Some(4)],
+            "a record resolves to itself; a non-record to the next record ahead"
+        );
+    }
+
+    #[test]
+    fn the_trailing_tail_keeps_the_last_record_that_ran() {
+        // Two non-records after the final record: nothing ahead terminates their
+        // segments, so both keep the last record. This is the rule the four engines
+        // used to split two-and-two on — `ode/predictions` and `sens/ode_provider`
+        // took the previous record, `pk/event_driven` and `sens/propagate` took the
+        // dose row — and it is why the resolution lives here rather than four times
+        // over. It is not observable through predictions (no observation follows such
+        // a boundary), which is exactly why it needs pinning at the resolver.
+        let got = idx(5, &[0, 2]);
+        assert_eq!(got, vec![Some(0), Some(2), Some(2), Some(2), Some(2)]);
+    }
+
+    #[test]
+    fn a_timeline_with_no_record_at_all_resolves_to_none_everywhere() {
+        // A subject with no observation, no EVID=2 row and no dose row produces no
+        // prediction; the callers fall back to their own seed snapshot there.
+        assert_eq!(idx(3, &[]), vec![None, None, None]);
+        assert_eq!(idx(0, &[]), Vec::<Option<usize>>::new());
+    }
+
+    #[test]
+    fn adjacent_records_each_govern_their_own_slot() {
+        // Co-timed records land as adjacent slots (the sort is stable and the
+        // zero-length segment between them is skipped by the walk). Each must resolve
+        // to itself, not to its neighbour — otherwise the segment arriving at a shared
+        // instant would read the wrong one of the two.
+        assert_eq!(idx(3, &[0, 1, 2]), vec![Some(0), Some(1), Some(2)]);
+    }
+
+    #[test]
+    fn a_leading_non_record_takes_the_first_record_ahead() {
+        // A dose arrival before any observation still runs on the record that
+        // terminates its interval.
+        assert_eq!(idx(3, &[2]), vec![Some(2), Some(2), Some(2)]);
+    }
 }

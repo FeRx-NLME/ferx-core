@@ -213,6 +213,24 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
     if subject_has_survival_records(subject) {
         return "survival/TTE observations";
     }
+    // #1070: name this cause before the generic scope catch-all below. The #1070 decline
+    // lives in `ode_iov_supported`, which `iov_sens_eta_supported` calls — so without this
+    // clause a TAD-under-lagtime model reports the uninformative "model outside IOV analytic
+    // scope" instead of the actual reason. Attributed against the *effective* model for the
+    // same reason the ODE block below is (#814): a closed-form transit/IG + IOV subject
+    // evaluates on its ODE twin, and it is that twin's RHS which reads `TAD`.
+    {
+        let eff = model.effective_for(subject);
+        if eff.has_lagtime()
+            && eff
+                .ode_spec
+                .as_ref()
+                .and_then(|o| o.rhs_program.as_ref())
+                .is_some_and(|p| p.uses_dose_anchored_time_vars())
+        {
+            return "TAD-dependent ODE RHS + estimated lagtime";
+        }
+    }
     if !crate::sens::provider::iov_sens_eta_supported(model) {
         return "model outside IOV analytic scope";
     }

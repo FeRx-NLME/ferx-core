@@ -7369,17 +7369,92 @@ fn an_infusion_end_between_records_runs_on_the_terminating_record() {
     );
 }
 
+/// The adaptive walk's PK and occasion resolvers must land on the **same record**.
+///
+/// `seg_pk` is written into the RHS parameter slots and `seg_occ` picks the `eta`
+/// (`[η_bsv | κ_g]`) threaded alongside it. `event_pk.obs[j]` already embeds occasion
+/// `j`'s κ in its PK values, so if the two resolvers disagree the segment integrates PK
+/// carrying one window's κ against an `eta` carrying another's — incoherent whichever
+/// window is "right", and invisible to any prediction test that does not put a record
+/// and a non-record break in different decision windows.
+///
+/// This is asserted at the resolvers rather than through a simulation because the
+/// occasion half is otherwise unpinned: reverting `governing_segment_occ_at` to the
+/// pre-#1073 LOCF `segment_occ_at` passes all 220 adaptive tests.
+///
+/// Geometry: records at `t = 0` and `t = 30`, a non-record break at `t = 24`, and
+/// decisions at 0 and 24 — so `t = 24` opens a new occasion window while the record
+/// that *terminates* its interval (`t = 30`) sits in that later window and the LOCF
+/// carry still holds the earlier one. Every resolution below is therefore a genuine
+/// three-way choice.
 #[test]
-fn a_non_record_event_past_the_final_record_falls_back_to_the_previous_one() {
+fn the_adaptive_segment_pk_and_occasion_resolve_to_the_same_record() {
+    use super::{governing_segment_occ_at, governing_segment_pk_at, AdaptiveRecordIndex};
+
+    let obs_times = [0.0_f64, 30.0];
+    let records = AdaptiveRecordIndex::new(&[], &[], &obs_times);
+
+    // Distinct PK per record so the resolved snapshot is identifiable, and occasions
+    // that differ across them (window 0 at t=0, window 1 at t=30).
+    let event_pk = crate::pk::EventPkParams {
+        dose: vec![],
+        obs: vec![pk_one(11.0, 100.0), pk_one(22.0, 100.0)],
+        pk_only: vec![],
+    };
+    let obs_occ = [Some(0_usize), Some(1_usize)];
+    // The LOCF carry the walk holds when it reaches the t=24 break: the earlier window.
+    let (last_pk, last_occ) = (pk_one(99.0, 100.0), Some(0_usize));
+
+    for &t_end in &[24.0_f64, 30.0] {
+        let pk = governing_segment_pk_at(t_end, &records, &event_pk, last_pk);
+        let occ = governing_segment_occ_at(t_end, &records, &[], &[], &obs_occ, last_occ);
+        // Both must resolve to the t=30 record: for `t_end = 30` it is the record
+        // itself, and for the non-record break at 24 it is the record that terminates
+        // the interval containing it.
+        assert_eq!(
+            pk.values[crate::types::PK_IDX_CL],
+            22.0,
+            "t_end={t_end}: segment PK must come from the t=30 record"
+        );
+        assert_eq!(
+            occ,
+            Some(1),
+            "t_end={t_end}: segment occasion must come from the SAME record as its PK; \
+             Some(0) means the occasion fell back to the LOCF carry while the PK looked \
+             ahead, so the segment would integrate one window's kappa against another's eta"
+        );
+    }
+
+    // Past the final record both fall back, and they must fall back together.
+    let pk = governing_segment_pk_at(31.0, &records, &event_pk, last_pk);
+    let occ = governing_segment_occ_at(31.0, &records, &[], &[], &obs_occ, last_occ);
+    assert_eq!(pk.values[crate::types::PK_IDX_CL], 99.0);
+    assert_eq!(occ, last_occ);
+}
+
+#[test]
+fn a_non_record_event_past_the_final_record_does_not_poison_the_walk() {
     // Trap: the forward lookahead is undefined past the last record. An infusion
-    // whose end falls after the final observation has no terminating record, so
-    // the segment must reuse the most recent one rather than panic or read a
-    // default-initialised snapshot.
+    // whose end falls after the final observation has no terminating record, so the
+    // walk must not panic, read a default-initialised snapshot, or emit NaN.
     //
     //   t=0  bolus (CL=20)   t=5 obs (CL=20)   t=6 infusion 50 @ 100 -> ends 6.5
-    //   final observation at t=6.2, i.e. BEFORE the infusion end.
+    //   observations at t=5 and t=6.2, both BEFORE the infusion end.
+    //
+    // Deliberately NOT an assertion about *which* record the trailing segment picks:
+    // that choice is unobservable through predictions, because a segment ending after
+    // the final record precedes no observation by construction. The rule itself —
+    // "keep the last record that ran" — is pinned where it is observable, on the
+    // resolver, by `dosing::tests::governing_record_indices_*`; what matters here is
+    // that all four engines take it from that one helper. Do not "strengthen" this by
+    // asserting a number that no fallback can move.
+    //
+    // The *observable* half of the lookahead is made non-degenerate: the two records
+    // carry different `CL`, so the `(5, 6]` and `(6, 6.2]` segments are resolved to
+    // genuinely different snapshots and the exact value below still pins them.
     let ode = one_cpt_ode_spec_tight();
-    let (v, cl_a) = (100.0, 20.0);
+    let (v, cl_a, cl_c) = (100.0, 20.0, 5.0);
+    let (ka, kc) = (cl_a / v, cl_c / v);
 
     let doses = vec![
         DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0),
@@ -7387,7 +7462,7 @@ fn a_non_record_event_past_the_final_record_falls_back_to_the_previous_one() {
     ];
     let subj = make_subject(doses, vec![5.0, 6.2]);
     let pk_dose = vec![pk_one(cl_a, v), pk_one(cl_a, v)];
-    let pk_obs = vec![pk_one(cl_a, v), pk_one(cl_a, v)];
+    let pk_obs = vec![pk_one(cl_a, v), pk_one(cl_c, v)];
 
     let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[]);
     assert!(
@@ -7395,12 +7470,18 @@ fn a_non_record_event_past_the_final_record_falls_back_to_the_previous_one() {
         "trailing non-record events must not produce NaN or a zeroed snapshot: {preds:?}"
     );
 
-    // With every snapshot equal the answer is exact: bolus decay to t=6, then
-    // 0.2 h of infusion at rate 100.
-    let k = cl_a / v;
-    let a6 = 1000.0 * (-6.0 * k).exp();
-    let expected = (a6 * (-0.2 * k).exp() + (100.0 / k) * (1.0 - (-0.2 * k).exp()));
+    // (0, 5] and (5, 6] on CL_A (the t=5 obs, then the t=6 dose record); (6, 6.2] on
+    // CL_C (the t=6.2 obs), with the infusion delivering rate=100 throughout it.
+    let a6 = 1000.0 * (-6.0 * ka).exp();
+    let expected = a6 * (-0.2 * kc).exp() + (100.0 / kc) * (1.0 - (-0.2 * kc).exp());
     assert_relative_eq!(preds[1], expected, epsilon = 1e-6, max_relative = 1e-6);
+
+    // The previous-record reading of the final segment, so the fixture is live.
+    let stale = a6 * (-0.2 * ka).exp() + (100.0 / ka) * (1.0 - (-0.2 * ka).exp());
+    assert!(
+        (expected - stale).abs() > 1.0,
+        "the fixture must separate the two conventions: {expected} vs {stale}"
+    );
 }
 
 /// 1-cpt IV whose RHS reads the `TAD` builtin, so a NaN time-since-dose anchor
@@ -7466,6 +7547,64 @@ fn a_tad_reading_rhs_survives_the_pre_arrival_segment_of_a_lagged_first_dose() {
         let tad = t - lag;
         let expected = 1000.0 * (-k * (tad + 0.15 * tad * tad)).exp();
         assert_relative_eq!(preds[j], expected, epsilon = 1e-6, max_relative = 1e-5);
+    }
+}
+
+#[test]
+fn both_production_ode_predictors_agree_on_tad_before_the_first_arrival() {
+    // `compute_predictions_ode` picks between the two production ODE predictors on
+    // `subject.has_resets()` (`pk/mod.rs`). So if they answer `TAD` differently in the
+    // pre-arrival window, two subjects of the SAME model and the SAME data shape behave
+    // differently — one finite, its neighbour carrying an EVID=3/4 row poisoned into the
+    // `1e20` objective sentinel, or the reverse. That split is not a tolerance question;
+    // it is a user-visible fork, and it is what this pins.
+    //
+    // Both are called directly on one reset-free subject, so the comparison is of the
+    // predictors and nothing else. The observation at `t = 0.2` sits inside the
+    // `(dose row, arrival]` window that #1073 opened; the two after it check that
+    // agreeing in the window did not cost agreement outside it.
+    let ode = one_cpt_tad_ode_spec();
+    let (v, cl, lag) = (100.0, 20.0, 0.5);
+
+    let doses = vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)];
+    let subj = make_subject(doses, vec![0.2, 2.0, 4.0]);
+    let pk_lagged = pk_one_lagged(cl, v, lag);
+
+    let dense = ode_predictions(&ode, &pk_lagged.values, &[], &[], &subj);
+    let walk = ode_predictions_event_driven(
+        &ode,
+        &subj,
+        &[],
+        &[],
+        &[pk_lagged],
+        &vec![pk_lagged; 3],
+        &[],
+    );
+
+    assert!(
+        dense.iter().all(|p| p.is_finite()),
+        "the dense predictor answered NaN for a TAD-reading RHS in the pre-arrival \
+         window, poisoning the trajectory: {dense:?}"
+    );
+    assert!(
+        walk.iter().all(|p| p.is_finite()),
+        "the event-driven walk answered NaN in the pre-arrival window: {walk:?}"
+    );
+    for (j, (d, w)) in dense.iter().zip(walk.iter()).enumerate() {
+        assert_relative_eq!(d, w, epsilon = 1e-6, max_relative = 1e-5);
+        let _ = j;
+    }
+
+    // And the value, so this is not merely "the two agree on something". Before the
+    // arrival the compartment is empty; after it,
+    // `dA/dt = -k·A·(1 + 0.3·(t − τ))` integrates to
+    // `A(t) = A(τ)·exp(−k[(t−τ) + 0.15(t−τ)²])`.
+    let k = cl / v;
+    assert_relative_eq!(dense[0], 0.0, epsilon = 1e-9);
+    for (j, &t) in [2.0_f64, 4.0].iter().enumerate() {
+        let tad = t - lag;
+        let expected = 1000.0 * (-k * (tad + 0.15 * tad * tad)).exp();
+        assert_relative_eq!(dense[j + 1], expected, epsilon = 1e-6, max_relative = 1e-5);
     }
 }
 
