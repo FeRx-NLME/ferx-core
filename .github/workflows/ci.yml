@@ -220,12 +220,20 @@ jobs:
     # and is READ from it here rather than repeated, so the two cannot drift.
     steps:
       - uses: actions/checkout@v7
+      # The workflow-level `RUSTUP_TOOLCHAIN: nightly` (top of this file) would
+      # otherwise override the pin for every later step: rustup auto-installs
+      # from that env var, so the job would silently pull a SECOND, unpinned
+      # nightly, and `rust-cache` keys `ci-public-api` off `rustc -vV` — which
+      # then changes daily, so the restore never hits and this job does a cold
+      # rustdoc build of `ferx-core` on every run. Exporting the pinned date to
+      # `$GITHUB_ENV` here (before the cache step) makes the pin actually stick.
       - name: Install the nightly pinned by tools/update-public-api.sh
         run: |
           toolchain=$(grep -oE 'nightly-[0-9]{4}-[0-9]{2}-[0-9]{2}' tools/update-public-api.sh | head -1)
           test -n "$toolchain" || { echo "no pinned nightly found in tools/update-public-api.sh"; exit 1; }
           echo "pinned toolchain: $toolchain"
           rustup toolchain install "$toolchain" --profile minimal
+          echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
         with:
           # rustdoc JSON build; own key so it does not churn the `ci` cache.

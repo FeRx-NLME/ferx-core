@@ -39,10 +39,13 @@ mod tests {
     fn core_version_is_reported_through_the_public_api() {
         let v = core_version();
         assert!(!v.is_empty(), "ferx-core reported an empty version");
-        // `x.y.z` — enough to catch a wire-up that returns some unrelated string.
-        assert_eq!(
-            v.split('.').count(),
-            3,
+        // A leading numeric major component is enough to catch a wire-up that
+        // returns some unrelated string. Deliberately NOT `split('.').count() == 3`:
+        // a SemVer pre-release or build metadata (`0.4.0-rc.1`) yields four
+        // components and would fail for a reason unrelated to what this guards.
+        let major = v.split('.').next().unwrap_or("");
+        assert!(
+            !major.is_empty() && major.bytes().all(|b| b.is_ascii_digit()),
             "unexpected ferx-core version shape: {v}"
         );
     }

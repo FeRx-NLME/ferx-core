@@ -143,7 +143,10 @@ comment:
   require_changes: true
 
 # Ignore policy: scope by what the code IS, never by how red it is.
-#   tests/**, build.rs        -> don't measure coverage OF test/build code.
+#   tests/**, crates/*/tests/**, build.rs
+#                             -> don't measure coverage OF test/build code.
+#       The member entry is separate because `tests/**` is root-anchored and
+#       does not reach `crates/ferx-cli/tests/` after the #1114 move.
 #   src/bin/generate_data.rs  -> maintainer tool that writes example-data
 #       fixtures; not library, not the user-facing CLI. Guarded at the right
 #       altitude by the e2e smoke test in tests/cli_binaries.rs. Ignorable on
@@ -158,6 +161,7 @@ comment:
 #
 ignore:
   - "tests/**"
+  - "crates/*/tests/**"
   - "**/build.rs"
   - "src/bin/generate_data.rs"
   - "src/bin/pktte_sim_anchor.rs"
