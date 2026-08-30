@@ -7707,3 +7707,232 @@ fn the_pre_arrival_tad_anchor_does_not_depend_on_the_sampling_mesh() {
         "fixture must keep live init state inside the pre-arrival window: {coarse:?}"
     );
 }
+
+/// The `dose_form_lag_ss` anchor's `[odes]`: oral `depot → central`, reading
+/// `CL`/`V`/`KA` from the PK snapshot. Mirrors the `$DES` in
+/// `nonmem_anchor/dose_form_lag_ss.ctl` term for term.
+fn oral_depot_central_ode_spec() -> OdeSpec {
+    OdeSpec {
+        rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+            let cl = p[crate::types::PK_IDX_CL];
+            let v = p[crate::types::PK_IDX_V];
+            let ka = p[crate::types::PK_IDX_KA];
+            dy[0] = -ka * y[0];
+            dy[1] = ka * y[0] - if v > 0.0 { cl / v } else { 0.0 } * y[1];
+        }),
+        n_states: 2,
+        state_names: vec!["depot".into(), "central".into()],
+        readout: OdeReadout::ObsCmt(1),
+        diffusion_var: Vec::new(),
+        solver_opts: OdeSolverOptions {
+            abstol: 1e-12,
+            reltol: 1e-10,
+            ..OdeSolverOptions::default()
+        },
+        input_rate: Vec::new(),
+        rhs_program: None,
+        readout_program: None,
+        indiv_param_program: None,
+        dose_attr_map: Default::default(),
+        init_fn: None,
+    }
+}
+
+/// **#1121 — the SS + lagtime pre-arrival seed, pinned against NONMEM directly.**
+///
+/// `nonmem_anchor/results/dose_form_lag_ss.tab` tabulates `PRED` — the η = 0
+/// population prediction — at the SS dose *record itself* (`TIME = 0`, an
+/// `MDV = 1` row): `2.8687E-01`. Nothing downstream has happened at that instant:
+/// the lagged pulse has not arrived and no propagation has run, so that number is
+/// `A(central)/V` for the periodic trough at phase `II − ALAG`, evaluated under
+/// the dose row's own covariates (`WT = 70`, giving `CL = 10`, `KA = 1`). It is a
+/// readout of `ss_state_at_phase(…, II − lag)` and of nothing else.
+///
+/// Confirmed independently of *both* codebases by hand, from the 1-cpt oral
+/// steady-state closed form:
+///
+/// ```text
+///   A2(τ) = F·D·KA/(KA−ke)·[ e^(−ke·τ)/(1−e^(−ke·II)) − e^(−KA·τ)/(1−e^(−KA·II)) ]
+///   ke = 0.2, KA = 1, II = 12, τ = II − ALAG = 11.3, D = 100, F = 1
+///         = 125·(0.1147595 − 0.0000124) = 14.34339   →   /V = 0.2868678
+/// ```
+///
+/// against NONMEM's `0.28687` — agreement to six significant figures, which is
+/// all the five-digit `$TABLE` format can express.
+///
+/// Why this is worth a test of its own, separate from the pointwise `PRED`
+/// comparison in `tests/dose_form_lag_nonmem_anchor.rs`: that one cannot reach
+/// `t = 0` at all, because the row is `MDV = 1` and `predict()` returns nothing
+/// for it. So the seed — the single quantity #1121 is about — is only ever
+/// observable there *through* the propagation and the bolus. Isolating it means a
+/// failure here says "the phase or the snapshot is wrong" and a failure there
+/// says "the propagation is", instead of one ambiguous red.
+#[test]
+fn ss_state_at_phase_matches_nonmem_at_the_dose_record() {
+    // η = 0 at the anchor's initial estimates, evaluated at the dose row's own
+    // WT = 70: CL = 10·(70/70)^0.75, V = 50, KA = 1·(70/70)^0.75, ALAG1 = 0.7.
+    let (cl, v, ka, lag, ii, amt) = (10.0, 50.0, 1.0, 0.7, 12.0, 100.0);
+    let mut pk = pk_one(cl, v);
+    pk.values[crate::types::PK_IDX_KA] = ka;
+    pk.values[crate::types::PK_IDX_LAGTIME] = lag;
+
+    let ode = oral_depot_central_ode_spec();
+    // CMT = 1 (1-based) is the depot — the compartment the dose lands in.
+    let dose = DoseEvent::new(0.0, amt, 1, 0.0, true, ii);
+    assert!(dose.ss && dose.ii > 0.0, "precondition: this is an SS dose");
+
+    let u = ss_state_at_phase(&ode, &pk.values, &dose, ii - lag, &ode.solver_opts);
+
+    // `PRED` at `TIME = 0`, `nonmem_anchor/results/dose_form_lag_ss.tab`.
+    const NM_PRED_AT_RECORD: f64 = 2.8687e-01;
+    assert_relative_eq!(u[1] / v, NM_PRED_AT_RECORD, max_relative = 1e-4);
+
+    // Non-degeneracy: the depot leg must be live too, or this pins only the
+    // central compartment and a wrong `KA` inside the seed would slip through.
+    // NONMEM tabulates no depot amount, but the same steady-state algebra gives it
+    // in closed form — the prior pulse's undecayed remainder at phase `II − lag`:
+    //
+    //     A1(τ) = F·D·e^(−KA·τ)/(1 − e^(−KA·II))
+    //           = 100·e^(−11.3)/(1 − e^(−12)) = 1.23730e-3
+    //
+    // Tiny in absolute terms, but pinned rather than merely bounded: a loose
+    // `> 0` would pass for any `KA`, which is the whole point of checking it.
+    assert_relative_eq!(u[0], 1.237_30e-3, max_relative = 1e-6);
+
+    // And the seed must genuinely differ from the bare trough, or the whole
+    // distinction #1121 rests on is untested by this fixture: at phase `II` the
+    // pulse has decayed a further `lag`, so the trough is strictly lower.
+    let trough = equilibrate_ss_state(&ode, &pk.values, &dose, &ode.solver_opts);
+    assert!(
+        trough[1] < u[1] * 0.95,
+        "phase II−lag must be materially above the phase-II trough \
+         (seed {}, trough {}) — otherwise this fixture cannot tell the two apart",
+        u[1],
+        trough[1]
+    );
+}
+
+/// **Which steady-state doses get the record-time seed, and at what phase (#1121).**
+///
+/// The predicate and the phase are shared by five paths — the two production
+/// walks, their two dual twins, and the dense/superposition static paths — so
+/// their boundaries are worth pinning directly rather than inferring them from
+/// whichever path a later test happens to exercise. A seed and an arrival-time
+/// equilibration must be exactly complementary: both firing loads the trough
+/// twice, neither firing leaves the compartments empty.
+///
+/// `lag == 0` is the one exclusion, and it is deliberate: record and arrival are
+/// the same instant, so there is nothing to propagate, and routing it through
+/// `ss_state_at_phase(…, II)` would integrate a full extra cycle and move every
+/// existing non-lagged SS result by solver error.
+///
+/// `lag >= II` **is** seeded, at a phase CLAMPED to zero rather than wrapped into
+/// `[0, II)`. That is NONMEM 7.6.0's convention, measured rather than assumed
+/// (`nonmem_anchor/results/ss_lag_ge_ii.tab`), and it is the only continuous
+/// choice: `ALAG` is routinely estimated, so a phase that jumped by a factor
+/// `e^{−k·II}` as the outer optimizer walked the lagtime across `II` would put a
+/// step in the objective. `ss_lag_ge_ii_pre_arrival_matches_nonmem` pins the
+/// resulting *prediction*; this pins the arithmetic it comes from.
+#[test]
+fn ss_record_seed_declines_a_zero_lag_only() {
+    let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
+
+    assert!(
+        ss_seeded_at_record(&dose, 0.7),
+        "an ordinary lagged SS dose"
+    );
+    assert!(
+        !ss_seeded_at_record(&dose, 0.0),
+        "no lag: record and arrival coincide, so the arrival equilibrates as before"
+    );
+    for lag in [12.0, 20.0] {
+        assert!(
+            ss_seeded_at_record(&dose, lag),
+            "a lag of a full interval or more is still seeded — at a clamped phase"
+        );
+    }
+
+    // The phase itself: `II − lag` while that is positive, then pinned at 0.
+    assert_relative_eq!(ss_seed_phase(&dose, 0.7), 11.3, max_relative = 1e-12);
+    assert_relative_eq!(ss_seed_phase(&dose, 11.999), 0.001, max_relative = 1e-9);
+    assert_eq!(ss_seed_phase(&dose, 12.0), 0.0);
+    assert_eq!(
+        ss_seed_phase(&dose, 20.0),
+        0.0,
+        "clamped, NOT wrapped to 4.0"
+    );
+
+    // Complementarity of the *arrival-side* shortcut: the paths that re-equilibrate
+    // at the arrival rather than propagating there are exact only while the flowed
+    // state is the trough, which is exactly `lag <= II`.
+    assert!(ss_arrival_is_trough(&dose, 0.7));
+    assert!(ss_arrival_is_trough(&dose, 12.0));
+    assert!(!ss_arrival_is_trough(&dose, 12.001));
+
+    // A non-SS dose is never seeded however it is lagged, and an SS record with no
+    // dosing interval is not a steady state at all.
+    let plain = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
+    assert!(!ss_seeded_at_record(&plain, 0.7));
+    let ss_no_ii = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 0.0);
+    assert!(!ss_seeded_at_record(&ss_no_ii, 0.7));
+}
+
+/// **The previous cycle's infusion when it is still running at the dose record
+/// (#1121).**
+///
+/// `ss_state_at_phase` hands back a state with the infusion mid-flight whenever
+/// the seed phase falls inside the window; the walk must then carry `+rate` for
+/// the rest of it. The window is what every engine breaks and gates on, so pin
+/// its edge here rather than only through a prediction.
+///
+/// Measured against NONMEM 7.6.0 (`nonmem_anchor/results/ss_lag_infusion.tab`):
+/// with `II = 12`, `T_inf = 6`, `ALAG1 = 8`, the concentration *rises* off the
+/// record and turns over at exactly `t = 2 = 8 − 12 + 6`.
+#[test]
+fn ss_residual_infusion_window_ends_where_the_previous_cycle_does() {
+    // AMT 600 at RATE 100 => `DoseEvent::new` derives T_inf = 6, against II = 12.
+    let inf = DoseEvent::new(0.0, 600.0, 1, 100.0, true, 12.0);
+    assert_relative_eq!(inf.duration, 6.0, max_relative = 1e-12);
+
+    // lag <= II − T_inf: the previous cycle finished before the record.
+    assert_eq!(ss_residual_infusion_end(&inf, 0.2, 1.0), None);
+    assert_eq!(
+        ss_residual_infusion_end(&inf, 6.0, 1.0),
+        None,
+        "phase == T_inf"
+    );
+
+    // lag > II − T_inf: it is still running, and stops at `d.time + (T_inf − phase)`.
+    let end = ss_residual_infusion_end(&inf, 8.0, 1.0).expect("still running at the record");
+    assert_relative_eq!(end, 2.0, max_relative = 1e-12);
+    // Continuous at the boundary rather than switching on with a finite window.
+    let just_past = ss_residual_infusion_end(&inf, 6.0 + 1e-9, 1.0).expect("just inside");
+    assert!(just_past > 0.0 && just_past < 1e-8);
+    // Under the phase clamp, `lag >= II` puts the whole window on the record.
+    assert_relative_eq!(
+        ss_residual_infusion_end(&inf, 14.0, 1.0).expect("clamped phase 0"),
+        6.0,
+        max_relative = 1e-12
+    );
+
+    // A bolus has no window however it is lagged, and neither does an unseeded dose.
+    let bolus = DoseEvent::new(0.0, 600.0, 1, 0.0, true, 12.0);
+    assert_eq!(ss_residual_infusion_end(&bolus, 8.0, 1.0), None);
+    assert_eq!(
+        ss_residual_infusion_end(&inf, 0.0, 1.0),
+        None,
+        "lag 0 is not seeded"
+    );
+
+    // `F` reshapes a rate-defined window (#419), so the residual edge moves with it —
+    // and the caller must pass the same `f_bio` it built the dose's own window from.
+    // At F = 0.5 the window is only 3 h, so a phase of 4 is already past its end and
+    // there is no residual at all: the same lag that HAS one at F = 1 does not here.
+    assert_eq!(ss_residual_infusion_end(&inf, 8.0, 0.5), None);
+    // At F = 0.9 the window is 5.4 h, so a phase of 4 is still inside it.
+    assert_relative_eq!(
+        ss_residual_infusion_end(&inf, 8.0, 0.9).expect("F·T_inf = 5.4 > phase 4"),
+        1.4,
+        max_relative = 1e-12
+    );
+}

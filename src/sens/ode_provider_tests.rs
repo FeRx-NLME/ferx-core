@@ -6630,7 +6630,7 @@ fn ode_tvcov_gate_scope() {
     let mut inf = tv.clone();
     inf.doses[0].duration = 1.0;
     inf.doses[0].rate = inf.doses[0].amt;
-    assert!(crate::ode::predictions::is_real_infusion(&inf.doses[0]));
+    assert!(crate::dosing::is_real_infusion(&inf.doses[0]));
     assert!(ode_tvcov_supported(&model, &inf));
     // TV-cov + EVID 3/4 reset → now supported (state zeroed at the reset).
     let mut rst = tv.clone();
@@ -8527,6 +8527,260 @@ fn ode_provider_matches_fd_under_the_auto_stiff_switch() {
     check_vs_production(&model, &subject, &theta, &eta);
     check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
     check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
+}
+
+// 1-cpt IV **infusion** at steady state with an estimated lagtime and a
+// time-varying covariate on CL. Sized so `II − ALAG < T_inf`: the previous
+// cycle's infusion is still running at the dose record (#1121).
+const ONECPT_IV_LAG_SS_INF_TVCOV_ODE: &str = r#"
+[parameters]
+  theta TVCL(1.0,  0.01, 100.0)
+  theta TVV(10.0,  1.0, 500.0)
+  theta TVLAG(8.0, 0.01, 20.0)
+  theta WTEXP(0.75, 0.01, 2.0)
+  omega ETA_CL  ~ 0.1
+  omega ETA_LAG ~ 0.04
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL    = TVCL * (WT/70)^WTEXP * exp(ETA_CL)
+  V     = TVV
+  ALAG1 = TVLAG * exp(ETA_LAG)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[covariates]
+  WT continuous
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+const ONECPT_ORAL_LAG_SS_TVCOV_ODE: &str = r#"
+[parameters]
+  theta TVCL(1.0,  0.01, 100.0)
+  theta TVV(10.0,  1.0, 500.0)
+  theta TVKA(1.0,  0.01, 50.0)
+  theta TVLAG(0.5, 0.01, 5.0)
+  theta WTEXP(0.75, 0.01, 2.0)
+  omega ETA_CL  ~ 0.1
+  omega ETA_LAG ~ 0.04
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL    = TVCL * (WT/70)^WTEXP * exp(ETA_CL)
+  V     = TVV
+  KA    = TVKA * (WT/70)^WTEXP
+  ALAG1 = TVLAG * exp(ETA_LAG)
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+[covariates]
+  WT continuous
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+/// **SS × estimated lagtime × time-varying covariates — the cell that had no test
+/// (#1121).**
+///
+/// `ode_provider_ss_lagtime_matches_production` covers SS × lagtime with *flat*
+/// covariates; `ode_provider_ss_tvcov_matches_production` covers SS × TV
+/// covariates with *no* lagtime. Their intersection — where the pre-arrival window
+/// `[t_dose, t_dose + ALAG)` straddles a covariate change — was uncovered, and it
+/// is precisely where production and the dual walk both used to load the periodic
+/// trough *at the arrival* under the dose row's snapshot instead of seeding it at
+/// the dose record and flowing it forward.
+///
+/// **Read this before trusting it as a regression test.** Before #1121 both sides
+/// carried that defect, so this passed while both were wrong; after the joint fix
+/// it passes because both are right. It is therefore a **coupling guard, not an
+/// oracle** — its job is to go red the moment production and the twin are fixed
+/// out of step, which is the one failure a value-vs-value comparison between two
+/// implementations of the same wrong idea can actually detect. The oracle for the
+/// behaviour itself is NONMEM: `tests/dose_form_lag_nonmem_anchor.rs` (pointwise
+/// `PRED`) and `ss_state_at_phase_matches_nonmem_at_the_dose_record` (the seed
+/// alone).
+///
+/// Mutation-tested when it was added. Restoring the twin's `K_DOSE` trough
+/// overwrite with production left fixed turns this red **on `obs.f`** — the value
+/// assertion — while the flat-covariate `ode_provider_ss_lagtime{,_infusion}_…`
+/// tests go red only on their derivative blocks. That split is the whole reason
+/// this cell exists: a value divergence between the two walks is invisible until
+/// a covariate changes inside the pre-arrival window.
+#[test]
+fn ode_provider_ss_lagtime_tvcov_matches_production() {
+    let model = parse_model_string(ONECPT_ORAL_LAG_SS_TVCOV_ODE).expect("parse oral lag SS TV ODE");
+    let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+    // θ = [TVCL, TVV, TVKA, TVLAG, WTEXP]; η = [ETA_CL, ETA_LAG] → ALAG ≈ 0.526.
+    let theta = [1.0, 10.0, 1.0, 0.5, 0.75];
+    let eta = [0.12_f64, 0.05];
+
+    // Obs at 0.3 sits INSIDE the pre-arrival window; 0.8 just past the arrival;
+    // the rest span the remainder of the cycle and into the next.
+    let mut subject = bolus_subject(&[0.3, 0.8, 2.0, 5.0, 11.0, 13.0]);
+    subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)];
+    // The SS record carries WT = 70; every later record carries 140 or more. The
+    // window `(0, ALAG]` is therefore seeded under 70 and propagated under 140 —
+    // a 2× contrast on both CL and KA.
+    subject.dose_covariates = vec![wt(70.0)];
+    subject.obs_covariates = vec![
+        wt(140.0),
+        wt(140.0),
+        wt(140.0),
+        wt(150.0),
+        wt(150.0),
+        wt(75.0),
+    ];
+
+    // Preconditions, asserted rather than assumed — this fixture is worth nothing
+    // unless all three ingredients are simultaneously live.
+    assert!(subject.doses[0].ss && subject.doses[0].ii > 0.0);
+    assert!(model.has_lagtime());
+    assert!(subject.has_tv_covariates());
+    assert!(
+        ode_tvcov_supported(&model, &subject),
+        "SS + lagtime + TV covariates must take the analytic event-driven walk, \
+         not the FD fallback — otherwise this compares FD against itself"
+    );
+
+    check_vs_production(&model, &subject, &theta, &eta);
+    check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    check_hessian_vs_fd_of_grad(&model, &subject, &theta, &eta);
+}
+
+/// An **SS infusion** whose lagtime pushes the seed phase inside its own window,
+/// under time-varying covariates (#1121 review).
+///
+/// `ode_provider_ss_lagtime_infusion_matches_production` covers the infusion seed
+/// with *flat* covariates, and there the two `ss_seeded_at_record`-scoped terms
+/// this walk carries — the bolus saltation's `g⁻` and the infusion's hand-injected
+/// `−δlag` jet — cancel exactly. A flat test therefore pins the cancellation
+/// rather than either term, so the scoping change needed a cell where they do not
+/// cancel.
+///
+/// It is also the only twin test where `II − ALAG < T_inf`, so the previous
+/// cycle's infusion is still running at the dose record and the walk has to carry
+/// a rate-off boundary (`K_SS_INF_END`) that belongs to no dose event — one that
+/// moves with `lag` and with the window length exactly as the real infusion end
+/// does, and therefore needs its own saltation, not just its own break.
+///
+/// `check_vs_production` asserts `obs.f` as well as the derivatives, so this is
+/// simultaneously the value-coupling guard for the residual window and the
+/// `Dual2`-vs-FD parity check for its moving edge.
+#[test]
+fn ode_provider_ss_lagtime_infusion_tvcov_matches_production() {
+    let model =
+        parse_model_string(ONECPT_IV_LAG_SS_INF_TVCOV_ODE).expect("parse IV lag SS inf TV ODE");
+    let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+    // θ = [TVCL, TVV, TVLAG, WTEXP]; η = [ETA_CL, ETA_LAG] → ALAG ≈ 8.4.
+    let theta = [1.0, 10.0, 8.0, 0.75];
+    let eta = [0.12_f64, 0.05];
+
+    // AMT 100 at RATE 25 => T_inf = 4 against II = 12, so the seed phase
+    // `II − ALAG ≈ 3.6` falls INSIDE the window and the previous cycle's infusion
+    // runs on into the pre-arrival window.
+    let mut subject = bolus_subject(&[0.2, 1.0, 4.0, 8.0, 9.5, 13.0]);
+    subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 25.0, true, 12.0)];
+    subject.dose_covariates = vec![wt(70.0)];
+    subject.obs_covariates = vec![
+        wt(70.0),
+        wt(140.0),
+        wt(140.0),
+        wt(150.0),
+        wt(150.0),
+        wt(75.0),
+    ];
+
+    // Preconditions, asserted rather than assumed. The third is the one this
+    // fixture exists for: without it the previous cycle has already finished at
+    // the record and the residual window is empty, leaving the new code unrun.
+    assert!(subject.doses[0].ss && subject.doses[0].ii > 0.0);
+    assert!(subject.doses[0].is_infusion() && model.has_lagtime());
+    let lag = theta[2] * eta[1].exp();
+    let t_inf = subject.doses[0].duration;
+    let phase = crate::dosing::ss_seed_phase(&subject.doses[0], lag);
+    assert!(
+        phase < t_inf,
+        "the seed phase ({phase}) must fall inside the infusion window ({t_inf}), or \
+         the previous cycle has finished at the record and this tests nothing new"
+    );
+    assert!(
+        subject.obs_times[0] < lag,
+        "the first sample must sit inside the pre-arrival window"
+    );
+    assert!(subject.has_tv_covariates());
+    assert!(
+        ode_tvcov_supported(&model, &subject),
+        "SS + lagtime + infusion + TV covariates must take the analytic walk"
+    );
+
+    check_vs_production(&model, &subject, &theta, &eta);
+    check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    check_hessian_vs_fd_of_grad(&model, &subject, &theta, &eta);
+}
+
+/// An **EVID=3 reset between a seeded SS dose's record and its lagged arrival**
+/// (#1121 review).
+///
+/// With the arrival-side re-equilibration gone, a reset inside the pre-arrival
+/// window is newly observable: it zeroes the seeded steady-state load, and the
+/// arrival then applies only `F·AMT` where it used to restore a full trough. That
+/// reading is the one consistent with the convention — the steady state is loaded
+/// at the record, so a later reset wipes it exactly as it wipes any other state —
+/// but it is a behaviour change, and nothing covered it.
+///
+/// Deliberately an oral **bolus**, not the infusion fixture above. The infusion
+/// form of this geometry trips a *separate*, pre-existing defect in the twin: an
+/// `EVID=3` reset placed before a lagged infusion's arrival changes `∂f/∂η_LAG`
+/// even when the reset is a physical no-op (the state is already zero). Measured
+/// at `−12.53` against an FD reference of `+7.14`, with flat covariates and a
+/// non-steady-state dose, so it is neither this issue's nor time-varying
+/// covariates'; tracked separately. Using a bolus here keeps this test measuring
+/// the thing it was written for instead of inheriting that failure.
+#[test]
+fn ode_provider_ss_lagtime_reset_inside_the_pre_arrival_window_matches_production() {
+    let model = parse_model_string(ONECPT_ORAL_LAG_SS_TVCOV_ODE).expect("parse oral lag SS TV ODE");
+    let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+    // θ = [TVCL, TVV, TVKA, TVLAG, WTEXP]; η = [ETA_CL, ETA_LAG] → ALAG ≈ 0.526.
+    let theta = [1.0, 10.0, 1.0, 0.5, 0.75];
+    let eta = [0.12_f64, 0.05];
+
+    let mut subject = bolus_subject(&[0.2, 1.0, 4.0, 11.0]);
+    subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)];
+    subject.reset_times = vec![0.35];
+    subject.dose_covariates = vec![wt(70.0)];
+    subject.obs_covariates = vec![wt(70.0), wt(140.0), wt(150.0), wt(75.0)];
+
+    let lag = theta[3] * eta[1].exp();
+    assert!(
+        subject.reset_times[0] > subject.doses[0].time && subject.reset_times[0] < lag,
+        "the reset ({}) must fall strictly between the dose record (0) and its arrival ({lag})",
+        subject.reset_times[0]
+    );
+    assert!(
+        subject.obs_times[0] < subject.reset_times[0],
+        "one sample must precede the reset, so the seeded state is read before it is wiped"
+    );
+    assert!(subject.doses[0].ss && subject.doses[0].ii > 0.0);
+    assert!(subject.has_tv_covariates());
+    assert!(ode_tvcov_supported(&model, &subject));
+
+    check_vs_production(&model, &subject, &theta, &eta);
+    check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    check_hessian_vs_fd_of_grad(&model, &subject, &theta, &eta);
 }
 
 // ---------------------------------------------------------------------------

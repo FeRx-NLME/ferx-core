@@ -17,7 +17,8 @@
 //! Only P[obs_cmt, obs_cmt] is returned per observation — the caller adds it
 //! to the residual variance to form V_total.
 
-use crate::ode::predictions::{active_infusions, is_real_infusion};
+use crate::dosing::is_real_infusion;
+use crate::ode::predictions::active_infusions;
 use crate::ode::solver::{solve_ode, OdeSolverOptions};
 use crate::types::DoseEvent;
 use nalgebra::{DMatrix, DVector};
