@@ -20,7 +20,7 @@
 //!   (`pk/event_driven.rs`) zeroes every compartment unconditionally and has no `init(...)`
 //!   concept, so there is no second implementation to disagree.
 //!
-//! # The four control streams
+//! # The control streams
 //!
 //! `ADVAN13 TOL=9`, one compartment, every `$THETA` `FIX`, `$OMEGA 0 FIX`, `MAXEVAL=0`.
 //! `CL = 5` and `V = 50` are plain thetas — **`WT` reaches the prediction only through**
@@ -36,6 +36,8 @@
 //! | B | `reset_init_snapshot_flat.csv`  |  70 |  70 |  56.99027970108172 |
 //! | C | `reset_init_snapshot_split.csv` | 140 | **200** | 115.73262077584336 |
 //! | D | `reset_init_snapshot_evid4.csv` | 140 (EVID=4, +100 mg) | 200 | 128.80319627590555 |
+//! | E | `reset_init_snapshot_multi.csv` | **two** resets: 140 at t=8, 200 at t=12 | — | 234.84197355103731 |
+//! | F | `reset_init_snapshot.csv` + `$OMEGA 0.09` on an η inside `A_0` | 140 | 140 | 71.223755303866326 |
 //!
 //! # Measured (`nonmem_anchor/results/reset_init_snapshot_*.tab`)
 //!
@@ -69,6 +71,27 @@
 //! two agree. C is the one dataset that separates them, and it is why the fix resolves the
 //! reset row's *own* covariates rather than reusing `governing_record`, which would have
 //! passed A and B and failed only here.
+//!
+//! # Arms E and F: what A–D still could not see
+//!
+//! **E — two resets.** Every one of A–D has exactly one reset, so `pk_at_reset[idx]` is
+//! always `pk_at_reset[0]` and the per-reset index is unpinned: replacing `[idx]` with
+//! `[0]` in either engine passes all of them. E carries a second reset at `t = 12` with
+//! `WT = 200`, so the two seeds are 1400 and 2000 and the engines must index them apart —
+//! `IPRED(13) = 36.193497` against the first reset's snapshot's `25.335448`.
+//!
+//! **F — the objective, not just the prediction.** A–E are `$OMEGA 0 FIX` with an η-free
+//! `A_0`, so they pin the *value* path only; a defect confined to the `Dual2` reset seed
+//! (`init_taylor_seed_at` at the `K_RESET` branch) would be caught by nothing outside the
+//! repo. F puts `ETA(1)` inside `A_0` under `$OMEGA 0.09` and reads `#OBJV` with `POSTHOC`.
+//! The FOCEI `h` matrix is the analytic Jacobian, so a wrong `∂init/∂η` at the reset moves
+//! the EBE and therefore the objective — which makes the sensitivity path externally
+//! anchorable rather than only twin-checked. That the EBE genuinely moves is visible in
+//! NONMEM's own table: `IPRED(0) = 10.328` against `PRED(0) = 14.0`.
+//!
+//! Raw NONMEM output for all six arms is committed under
+//! `nonmem_anchor/results/reset_init_snapshot_{A,B,C,D,E,F}.tab`, so every constant below
+//! is auditable against the file it came from.
 //!
 //! Tier 2: `predict` at fixed parameters, no convergence loop, so no `slow-tests` gate.
 //! This is deliberate — #1132 records that the slow tier never runs on a PR.
@@ -134,6 +157,21 @@ const NM_D: &[(f64, f64)] = &[
     (16.0, 1.347_986_890_0e1),
 ];
 
+/// NONMEM `IPRED` for arm E, the two-reset dataset. The second reset at `t = 12` seeds
+/// `2000/50 = 40.0`; had the engine reused the FIRST reset's snapshot it would seed 28.0
+/// and read `25.335448` at `t = 13` instead of `36.193497`.
+const NM_E: &[(f64, f64)] = &[
+    (0.0, 1.400_000_000_0e1),
+    (1.0, 1.266_772_384_0e1),
+    (2.0, 1.146_223_052_1e1),
+    (6.0, 9.320_824_388_2e0),
+    (9.0, 2.533_544_769_1e1),
+    (10.0, 2.292_446_106_2e1),
+    (13.0, 3.619_349_670_8e1),
+    (14.0, 3.274_923_010_0e1),
+    (16.0, 2.681_280_182_3e1),
+];
+
 /// Relative tolerance against the NONMEM table. The two solvers are independent
 /// implementations at `TOL=9` / `reltol 1e-10`, so this is a numerical-agreement band,
 /// not a convention band: the defect under test is a factor of **two** at every
@@ -191,10 +229,11 @@ fn the_reset_seed_ignores_the_record_after_it() {
 
 #[test]
 fn split_and_natural_datasets_agree_prediction_for_prediction() {
-    // The invariance form of the test above, asserted directly between the two ferx
-    // runs. This is the stronger half: it would still fail a fix that landed on A's
-    // numbers by arithmetic coincidence while letting the following record leak into
-    // the seed.
+    // The invariance form of the test above, asserted directly between the two ferx runs.
+    // Given the two `assert_matches_nonmem` neighbours this is implied rather than
+    // independent — it earns its place on tolerance, not logic: `1e-9` absolute is ~2500x
+    // tighter than `REL_TOL` at these magnitudes, so a sub-threshold leak of the following
+    // record into the seed shows up here first.
     let a = ferx_preds("reset_init_snapshot.csv");
     let c = ferx_preds("reset_init_snapshot_split.csv");
     assert_eq!(
@@ -209,6 +248,47 @@ fn split_and_natural_datasets_agree_prediction_for_prediction() {
              ({pa:.10} vs {pc:.10}); NONMEM gives the same value for both."
         );
     }
+}
+
+/// ferx FOCEI OFV at the same fixed thetas NONMEM evaluated (`maxiter = 0`, covariance
+/// off — both set in `reset_init_snapshot_ofv.ferx`), on one subject with eight
+/// observations. Cheap enough to stay Tier 2.
+fn ferx_ofv(data: &str) -> f64 {
+    let (result, _pop) = ferx_core::run_model_with_data(
+        &anchor("reset_init_snapshot_ofv.ferx"),
+        Some(&anchor(data)),
+    )
+    .expect("the OFV anchor model and dataset load and evaluate");
+    result.ofv
+}
+
+/// `nonmem_anchor/results/reset_init_snapshot_F.tab` / its `.ext`.
+const NM_OBJV_F: f64 = 71.223_755_303_866_326;
+
+#[test]
+fn the_objective_matches_nonmem_with_an_eta_inside_the_reset_seed() {
+    // F. Every other arm is `$OMEGA 0 FIX`, so they pin the value path and leave the
+    // `Dual2` reset seed anchored only by an in-repo twin. Here `ETA_BASE` sits inside
+    // `init(central)`, so the EBE search reads `∂init/∂η` evaluated at the reset row's
+    // snapshot and a wrong one moves the objective.
+    //
+    // The repo's standard anchor tolerance, half an OFV unit. Seeding from the previous
+    // record instead (`WT = 70` rather than 140) halves the post-reset baseline and moves
+    // this by far more than that.
+    let ofv = ferx_ofv("reset_init_snapshot.csv");
+    let delta = (ofv - NM_OBJV_F).abs();
+    assert!(
+        delta < 0.5,
+        "OFV anchor: ferx {ofv:.6} vs NONMEM {NM_OBJV_F:.6} (Δ {delta:.3e})"
+    );
+}
+
+#[test]
+fn each_reset_seeds_from_its_own_row() {
+    // E: two resets, `WT` 140 then 200. This is the arm that pins the per-reset *index* —
+    // with a single reset everywhere else, `pk_at_reset[idx]` and `pk_at_reset[0]` are the
+    // same expression and the plumbing is unverified.
+    assert_matches_nonmem("reset_init_snapshot_multi.csv", NM_E);
 }
 
 #[test]

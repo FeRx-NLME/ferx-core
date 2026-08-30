@@ -643,7 +643,55 @@ pub fn compute_event_pk_params(
 pub(crate) fn subject_needs_per_event_pk(model: &CompiledModel, subject: &Subject) -> bool {
     subject.has_tv_covariates()
         || !subject.pk_only_covariates.is_empty()
+        // EVID=3/4 rows carry their own snapshot too (#1133). The reader gates all four
+        // snapshot vectors on the same `any_tv`, so this cannot fire alone on a
+        // reader-produced subject — but a hand-assembled one (FREM, the R glue, a test)
+        // can populate `reset_covariates` without the others, and without this clause it
+        // would drop to the constant branch and re-seed from the t=0 baseline.
+        || !subject.reset_covariates.is_empty()
         || model_uses_time_builtin(model)
+}
+
+/// The occasion label to evaluate an EVID=3/4 **reset row's** `$PK` under, on the
+/// `OCC`-column IOV path (#1133).
+///
+/// The reader stores no `OCC` for a reset row, so there is no exact answer available;
+/// what there *is* is a no-regression one. Before #1133 the reset re-seeded from
+/// `last_pk` — the most recent record processed, which under the timeline's
+/// `Reset < DoseRecord < PkOnly < Obs` tie-break is the last record **strictly before**
+/// the reset — and that snapshot carried its own occasion's κ. Returning that same
+/// occasion keeps the covariate fix from also moving κ, which a plain `κ = 0` does not:
+/// on a model with κ on a parameter the seed reads, zeroing it shifts the whole
+/// post-reset trajectory by `exp(κ)`.
+///
+/// For a reset that is the subject's first event nothing precedes it, and the old code
+/// seeded `last_pk` from `init_pk` — the *earliest* record — so that is the fallback here.
+/// `None` for a subject with no records at all, where the caller's κ = 0 default is the
+/// only snapshot that exists.
+///
+/// Reading the `OCC` column on reset rows would make this exact rather than
+/// no-regression; that is tracked separately.
+pub(crate) fn reset_row_occasion(subject: &Subject, t_reset: f64) -> Option<u32> {
+    let occ_of_dose = |k: usize| subject.dose_occasions.get(k).copied();
+    let occ_of_obs = |j: usize| subject.occasions.get(j).copied();
+    let mut best_before: Option<(f64, u32)> = None;
+    let mut earliest: Option<(f64, u32)> = None;
+    let mut consider = |t: f64, occ: Option<u32>| {
+        let Some(occ) = occ else { return };
+        if earliest.is_none_or(|(bt, _)| t < bt) {
+            earliest = Some((t, occ));
+        }
+        if t < t_reset && best_before.is_none_or(|(bt, _)| t > bt) {
+            best_before = Some((t, occ));
+        }
+    };
+    for (k, d) in subject.doses.iter().enumerate() {
+        consider(d.time, occ_of_dose(k));
+    }
+    for (j, &t) in subject.obs_times.iter().enumerate() {
+        consider(t, occ_of_obs(j));
+    }
+    best_before.or(earliest).map(|(_, occ)| occ)
 }
 
 /// Same as [`compute_event_pk_params`] but writes into a caller-owned
@@ -1012,22 +1060,6 @@ pub fn predict_iov(
             )
         })
         .collect();
-    // EVID=3/4 rows: the reset row's own covariate snapshot (#1133), under the same
-    // "no occasion label" convention EVID=2 rows take above. The reader stores no
-    // `OCC` for a reset row, so κ = 0 here; that is a separate gap from the covariate
-    // one this fix closes, and it only surfaces for a model that is IOV *and* has an
-    // `[odes] init(...)` reading an occasion-dependent parameter.
-    let reset_params: Vec<PkParams> = (0..subject.reset_times.len())
-        .map(|r| {
-            pk_params_at_time(
-                model,
-                theta,
-                &pk_only_combined,
-                subject.reset_cov(r),
-                subject.reset_times[r],
-            )
-        })
-        .collect();
 
     let mut preds = if model.is_algebraic() {
         // Compartment-free model (#811): nothing to integrate or superpose. The
@@ -1036,6 +1068,26 @@ pub fn predict_iov(
         // bottom of this function rather than through a concentration.
         vec![0.0; subject.obs_times.len()]
     } else if let Some(ref ode) = model.ode_spec {
+        // EVID=3/4 rows: the reset row's own covariate snapshot (#1133), under the occasion
+        // that snapshot used to carry. The reader stores no `OCC` for a reset row, so the κ
+        // comes from [`reset_row_occasion`] — the record `last_pk` would have held there —
+        // rather than from `pk_only_combined`. Using the EVID=2 κ = 0 convention here would
+        // have traded the covariate error for a κ error: on a model with κ on a parameter
+        // the seed reads, it moves the whole post-reset trajectory by `exp(κ)`.
+        //
+        // Built inside this arm because only the ODE engine re-seeds `init(...)`; the
+        // algebraic and closed-form arms never read it, and `pk_params_at_time` runs the
+        // full individual-parameter program once per reset per eta evaluation.
+        let reset_params: Vec<PkParams> = (0..subject.reset_times.len())
+            .map(|r| {
+                let t = subject.reset_times[r];
+                let combined = match reset_row_occasion(subject, t) {
+                    Some(occ) => combined_for(occ),
+                    None => pk_only_combined.clone(),
+                };
+                pk_params_at_time(model, theta, &combined, subject.reset_cov(r), t)
+            })
+            .collect();
         crate::ode::ode_predictions_event_driven(
             ode,
             subject,

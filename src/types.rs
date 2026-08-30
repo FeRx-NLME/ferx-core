@@ -1095,6 +1095,12 @@ impl Subject {
     /// Covariate snapshot at EVID=3/4 row index `r`. Same fallback as the others —
     /// for time-constant covariates this returns the subject-static map.
     ///
+    /// The reader's invariant is `reset_covariates.len() ∈ {0, reset_times.len()}`, empty
+    /// exactly when the subject has no time-varying covariate, so the fallback is only ever
+    /// taken on a subject where it is also the right answer. An in-memory `Subject` that
+    /// sets `reset_times` without `reset_covariates` gets the subject-static map — which is
+    /// what most fixtures want, and why this is a fallback rather than an index.
+    ///
     /// An EVID=3/4 row **is** a NONMEM data record: `$PK` runs at it, so an
     /// `[odes] init(state) = <expr>` re-seeded at the reset is evaluated with *this*
     /// row's values, not the preceding record's (#1133).
@@ -1123,7 +1129,11 @@ impl Subject {
             .obs_covariates
             .iter()
             .chain(self.dose_covariates.iter())
-            .chain(self.pk_only_covariates.iter());
+            .chain(self.pk_only_covariates.iter())
+            // EVID=3/4 rows too (#1133): a reset row's `$PK` seeds `[odes] init(...)`, so a
+            // covariate that steps only on a reset row is load-bearing and must be reported
+            // as varying — the same reason `pk_only_covariates` is chained here.
+            .chain(self.reset_covariates.iter());
         for snap in snapshots {
             for (name, &val) in snap {
                 match first_seen.get(name.as_str()) {
@@ -1216,6 +1226,7 @@ impl Population {
             if subj.dose_covariates.is_empty()
                 && subj.obs_covariates.is_empty()
                 && subj.pk_only_covariates.is_empty()
+                && subj.reset_covariates.is_empty()
             {
                 continue; // already on the fast path
             }
@@ -1227,6 +1238,12 @@ impl Population {
                     .iter()
                     .chain(subj.obs_covariates.iter())
                     .chain(subj.pk_only_covariates.iter())
+                    // EVID=3/4 rows are records (#1133): a covariate that differs from the
+                    // subject-static baseline ONLY on a reset row still changes the
+                    // `[odes] init(...)` re-seed, so pruning on the other three alone would
+                    // clear the snapshots, drop the subject to the constant fast path, and
+                    // silently restore the pre-#1133 answer for exactly that dataset.
+                    .chain(subj.reset_covariates.iter())
                 {
                     if snap.get(cov).copied() != base {
                         any_relevant_tv = true;
@@ -1238,6 +1255,13 @@ impl Population {
                 subj.dose_covariates.clear();
                 subj.obs_covariates.clear();
                 subj.pk_only_covariates.clear();
+                // Cleared together with the rest, or the subject would be left in a state no
+                // reader produces — empty dose/obs snapshots (so `has_tv_covariates()` is
+                // false and `compute_event_pk_params_into` takes the constant branch) while
+                // `reset_cov(r)` still returns a per-row map that `predict_iov` and the
+                // sensitivity seeders read directly. FOCEI and IMP would then re-seed the
+                // same subject from different covariates.
+                subj.reset_covariates.clear();
                 pruned += 1;
             }
         }

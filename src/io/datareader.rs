@@ -2131,11 +2131,14 @@ fn parse_subject(
         Vec::new()
     };
 
-    // Reset events are recorded in row order, which is usually time order;
-    // sort defensively so the event-driven propagators see them in order. The
-    // covariate snapshots ride the same permutation (#1133) — sorting the times
-    // alone would silently pair each reset with another reset's `$PK` row.
-    {
+    // Reset events are recorded in row order. The occasion shift above already forces
+    // every reset past `max_eff_time`, so `reset_times` leaves the row loop strictly
+    // ascending and this permutation is the identity today — it is kept because the
+    // covariate snapshots must ride whatever permutation the sort produces (#1133):
+    // sorting the times alone would silently pair each reset with another reset's `$PK`
+    // row if that invariant ever changed. Skipped outright while the order already holds,
+    // so the common path does not deep-clone one `HashMap` per reset for nothing.
+    if !reset_times.windows(2).all(|w| w[0] <= w[1]) {
         let mut rperm: Vec<usize> = (0..reset_times.len()).collect();
         rperm.sort_by(|&a, &b| {
             reset_times[a]

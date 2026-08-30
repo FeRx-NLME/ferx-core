@@ -5236,14 +5236,41 @@ fn ode_init_state_then_dose_and_reset_reapplies_init() {
     subj.reset_times = vec![5.0];
     let pk_dose = vec![pk; subj.doses.len()];
     let pk_obs = vec![pk; obs_times.len()];
-    let pk_reset = vec![pk; subj.reset_times.len()];
+    // The reset row's OWN snapshot, deliberately different from every other record's
+    // (#1133): `KIN = 40` gives baseline 20, against the dose/obs rows' 5. A uniform
+    // `vec![pk; …]` here would make `pk_at_reset[idx]` bit-identical to `last_pk` and the
+    // assertion below could not tell the two conventions apart — which is exactly how this
+    // test passed before the fix.
+    let pk_reset = vec![pk_kin_kout(40.0, 2.0)]; // baseline 20
 
     let preds =
         ode_predictions_event_driven(&ode, &subj, &[], &[], &pk_dose, &pk_obs, &[], &pk_reset);
     // t=0: init(5) + bolus(20) = 25.
     assert_relative_eq!(preds[0], 25.0, epsilon = 1e-6);
-    // t=5: reset re-applies init → 5 (a zeroing reset would give 0).
-    assert_relative_eq!(preds[1], 5.0, epsilon = 1e-6);
+    // t=5: the reset re-applies init at the RESET ROW's snapshot → 20. A zeroing reset
+    // gives 0; carrying the previous record forward (the pre-#1133 bug) gives 5.
+    assert_relative_eq!(preds[1], 20.0, epsilon = 1e-6);
+}
+
+#[test]
+fn ode_reset_reseeds_each_reset_from_its_own_snapshot() {
+    // #1133, the per-reset index. Every other reset test in the repo has exactly ONE
+    // reset, so `pk_at_reset[idx]` is always `pk_at_reset[0]` and swapping one for the
+    // other passes the whole suite. Two resets with different baselines separate them.
+    let ode = turnover_ode_spec_with_init();
+    let pk = pk_kin_kout(10.0, 2.0); // baseline 5
+    let obs_times = vec![0.0, 5.0, 9.0];
+    let mut subj = make_subject(Vec::new(), obs_times.clone());
+    subj.reset_times = vec![5.0, 9.0];
+    let pk_obs = vec![pk; obs_times.len()];
+    // Reset 0 -> baseline 20, reset 1 -> baseline 35.
+    let pk_reset = vec![pk_kin_kout(40.0, 2.0), pk_kin_kout(70.0, 2.0)];
+
+    let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &[], &pk_obs, &[], &pk_reset);
+    assert_relative_eq!(preds[0], 5.0, epsilon = 1e-6);
+    // Indexing `pk_at_reset[0]` for both would read 20.0 here.
+    assert_relative_eq!(preds[1], 20.0, epsilon = 1e-6);
+    assert_relative_eq!(preds[2], 35.0, epsilon = 1e-6);
 }
 
 #[test]

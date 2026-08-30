@@ -132,6 +132,9 @@ const ODE_TV_INIT: &str = r#"
   y = central
 [error_model]
   DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
 "#;
 
 // 1-cpt IV ODE whose RHS reads TAFD (time after first dose). The extra

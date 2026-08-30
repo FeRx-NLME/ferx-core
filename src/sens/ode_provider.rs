@@ -2786,6 +2786,12 @@ pub(crate) fn build_iov_scale_jets<T: crate::sens::num::PkNum>(
 fn iov_walk_per_event(model: &CompiledModel, subject: &Subject) -> bool {
     subject.has_tv_covariates()
         || !subject.pk_only_covariates.is_empty()
+        // EVID=3/4 snapshots (#1133), mirroring production's `subject_needs_per_event_pk`.
+        // Without this clause a subject carrying only `reset_covariates` takes the static
+        // branch here while `predict_iov` reads `reset_cov(r)` unconditionally, so the twin
+        // would differentiate `init(...)` at the subject-static covariates while the value
+        // path predicts at the reset row's — a divergence `Dual2`-vs-FD cannot see.
+        || !subject.reset_covariates.is_empty()
         || crate::parser::model_parser::compiled_model_uses_time_builtin(model)
 }
 
@@ -2851,7 +2857,8 @@ fn run_subject_iov<const M: usize>(
     // EVID=2 pk-only events carry no occasion → κ held at 0 (single-sourced with the
     // closed-form provider, #598 review). Built lazily inside the closure so the common
     // IOV subject with no EVID=2 records pays no allocation — the closure is only invoked
-    // when `seed_iov_events` actually has pk-only records to seed.
+    // when `seed_iov_events` actually has pk-only records to seed, or (#1133) when a reset
+    // row's occasion cannot be resolved from any record, which is a record-free subject.
     let seed_pk_only_cov = |cov: &std::collections::HashMap<String, f64>,
                             time: f64|
      -> Option<Vec<Dual2<M>>> {
@@ -3034,13 +3041,24 @@ fn seed_iov_events<T: Clone>(
         let pk_at_pk_only = (0..subject.pk_only_times.len())
             .map(|m| seed_pk_only_cov(subject.pk_only_cov(m), subject.pk_only_times[m]))
             .collect::<Option<_>>()?;
-        // EVID=3/4 reset rows (#1133): the reset row's own covariate snapshot, seeded
-        // through the *pk-only* (occasion-less, κ = 0) path — the reader stores no `OCC`
-        // for a reset row, exactly as it stores none for an EVID=2 row, and production's
-        // `predict_iov` makes the same choice. Mirroring it here is what keeps the twin
-        // differentiating the function the value path evaluates.
+        // EVID=3/4 reset rows (#1133): the reset row's own covariate snapshot, under the
+        // occasion [`crate::pk::reset_row_occasion`] resolves — the record `last_pk` held
+        // there before #1133, so the covariate fix does not also move κ. This must match
+        // production's `predict_iov` exactly: a twin that seeded the reset under a
+        // different κ would differentiate a different function than the one predicted, and
+        // `Dual2`-vs-FD parity could not see it (FD perturbs the twin's own value path).
+        // Falls back to the occasion-less seeder only when the subject has no record to
+        // take an occasion from, which is `predict_iov`'s fallback too.
         let pk_at_reset = (0..subject.reset_times.len())
-            .map(|r| seed_pk_only_cov(subject.reset_cov(r), subject.reset_times[r]))
+            .map(|r| {
+                let t = subject.reset_times[r];
+                match crate::pk::reset_row_occasion(subject, t)
+                    .and_then(|occ| occ_to_k.get(&occ).copied())
+                {
+                    Some(g) => seed_group_cov(g, subject.reset_cov(r), t),
+                    None => seed_pk_only_cov(subject.reset_cov(r), t),
+                }
+            })
             .collect::<Option<_>>()?;
         Some((pk_at_dose, pk_at_obs, pk_at_pk_only, pk_at_reset))
     } else {
@@ -3064,27 +3082,26 @@ fn seed_iov_events<T: Clone>(
         let pk_at_obs = (0..subject.obs_times.len())
             .map(|j| Some(group_dual[*occ_to_k.get(&subject.occasions.get(j).copied()?)?].clone()))
             .collect::<Option<_>>()?;
-        // Static branch: covariates do not move, so `static_cov` IS every EVID=2 row's and
-        // every reset row's own snapshot, and each candidate convention agrees (#1133). One
-        // seed serves both — `seed_pk_only_cov` is deterministic in its arguments, so
-        // sharing the result is exactly a re-seed, and the `Dual2` evaluation is not free.
-        let occless_seed = if subject.pk_only_times.is_empty() && subject.reset_times.is_empty() {
-            None
+        let pk_at_pk_only = if subject.pk_only_times.is_empty() {
+            Vec::new()
         } else {
-            Some(seed_pk_only_cov(static_cov, 0.0)?)
+            let seeded = seed_pk_only_cov(static_cov, 0.0)?;
+            vec![seeded; subject.pk_only_times.len()]
         };
-        let pk_at_pk_only = match &occless_seed {
-            Some(s) if !subject.pk_only_times.is_empty() => {
-                vec![s.clone(); subject.pk_only_times.len()]
-            }
-            _ => Vec::new(),
-        };
-        let pk_at_reset = match &occless_seed {
-            Some(s) if !subject.reset_times.is_empty() => {
-                vec![s.clone(); subject.reset_times.len()]
-            }
-            _ => Vec::new(),
-        };
+        // Static branch, EVID=3/4 rows (#1133): covariates do not move, so `static_cov` IS
+        // the reset row's own snapshot and the covariate question is vacuous — but κ is
+        // not. Read it from `group_dual` at the occasion [`crate::pk::reset_row_occasion`]
+        // resolves, exactly as the dose and obs vectors above do, so this branch matches
+        // `predict_iov`. Deliberately NOT routed through `seed_pk_only_cov`: that would
+        // both zero κ and make a fallible call on a path that previously could not make one
+        // (an IOV subject with resets and no EVID=2 rows would newly be able to decline to
+        // FD).
+        let pk_at_reset = (0..subject.reset_times.len())
+            .map(|r| {
+                let occ = crate::pk::reset_row_occasion(subject, subject.reset_times[r])?;
+                Some(group_dual[*occ_to_k.get(&occ)?].clone())
+            })
+            .collect::<Option<_>>()?;
         Some((pk_at_dose, pk_at_obs, pk_at_pk_only, pk_at_reset))
     }
 }
@@ -4345,7 +4362,9 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     let mut states: Vec<Vec<T>> = vec![vec![T::from_f64(0.0); n_states]; n_obs];
 
     debug_assert_eq!(pk_at_pk_only.len(), subject.pk_only_times.len());
-    debug_assert_eq!(pk_at_reset.len(), subject.reset_times.len());
+    // Hard, not `debug_`: `pk_at_reset[idx]` at the `K_RESET` branch is a release-live
+    // index, and its production twin (`ode_predictions_event_driven`) asserts always (#1133).
+    assert_eq!(pk_at_reset.len(), subject.reset_times.len());
 
     // Per-dose lagtime: dose `k` arrives at `d.time + lag_val(k)`, with its lag read from
     // `pk_at_dose[k][dose_lag_slot[k]]` — the bare `PK_IDX_LAGTIME` slot or, for a
