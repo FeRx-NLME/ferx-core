@@ -66,7 +66,7 @@ pub(crate) fn model_uses_time_builtin(model: &CompiledModel) -> bool {
 /// claimed for it: **a steady-state dose** on a non-autonomous RHS is wrong on
 /// *both* engines — `NaN` for `TAD`/`TAFD` (even at a zero coefficient) and 17%
 /// off an explicit 40-cycle pulse train for `T`/`TIME`. Rerouting neither causes
-/// nor cures that; see `SS_NONAUTONOMOUS_ISSUE`.
+/// nor cures that; see #1139.
 ///
 /// Regression tests: `rerouting_a_bare_tafd_rhs_does_not_move_the_predictions`
 /// and `rerouting_an_init_seeded_rhs_does_not_move_the_predictions`.

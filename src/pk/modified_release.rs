@@ -2715,7 +2715,7 @@ mod tests {
     /// both engines are wrong there — `NaN` for `TAD`/`TAFD` even at a zero
     /// coefficient, and 17% off an explicit 40-cycle pulse train for `T`/`TIME` —
     /// so an engine-vs-engine assert would pin agreement on a wrong answer. See
-    /// `SS_NONAUTONOMOUS_ISSUE`; the routing neither causes nor cures it.
+    /// #1139; the routing neither causes nor cures it.
     #[test]
     fn rerouting_an_init_seeded_rhs_does_not_move_the_predictions() {
         let src = r#"

@@ -8921,7 +8921,7 @@ fn ode_ss_time_only_rhs_still_routes_to_fd() {
 /// So this gate closes an asymmetry in the **gradient** route only: `T` was
 /// already declining and its value is wrong anyway. Declining is still right —
 /// an analytic jet of a wrong value is worse than an FD one — but the value
-/// defect is separate and is not fixed here (`SS_NONAUTONOMOUS_ISSUE`).
+/// defect is separate and is not fixed here (#1139).
 #[test]
 fn ode_ss_bare_time_builtin_rhs_routes_to_fd() {
     let model = tad_gate_model("TIME", "");
