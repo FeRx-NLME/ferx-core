@@ -11297,7 +11297,30 @@ fn tad_reading_mr_shaped_model_takes_a_route_that_matches_fd() {
 /// asserted here.
 #[test]
 fn a_pre_arrival_observation_does_not_nan_the_analytic_sensitivities() {
-    let src = MR_MIXED_1CPT_TAD.replace("first_order(ka=KA, lag=LAG)", "first_order(ka=KA)");
+    // `init(central) = BASE` is load-bearing, not decoration. Without it both
+    // forcings are zero before the first dose and `central` is identically zero
+    // there, so `(1.0 + 0.3*TAD)` multiplies zero and every quantity
+    // `check_full_provider_vs_fd` compares at the pre-arrival observation is
+    // `0.0` vs `0.0`. That is CLAUDE.md's `g(x-) = 0` trap verbatim: the test
+    // would still catch a *NaN* anchor (NaN * 0 is NaN) but not a *wrong* finite
+    // one. Seeding a baseline makes the incoming side a real quantity, so a
+    // mis-anchored `TAD` moves the prediction and FD sees it. Same device as
+    // `modified_release::tests::rerouting_an_init_seeded_rhs_does_not_move_the_predictions`.
+    //
+    // `TVBASE` is appended *after* `TVLAG` so the existing θ indices are
+    // unchanged and the shared fixture's `theta` ordering still holds.
+    let src = MR_MIXED_1CPT_TAD
+        .replace("first_order(ka=KA, lag=LAG)", "first_order(ka=KA)")
+        .replace(
+            "  omega ETA_CL ~ 0.09",
+            "  theta TVBASE(30.0, 0.1, 500.0)\n  omega ETA_CL ~ 0.09",
+        )
+        .replace("  LAG = TVLAG", "  LAG = TVLAG\n  BASE = TVBASE")
+        .replace("[odes]\n", "[odes]\n  init(central) = BASE\n");
+    assert!(
+        src.contains("init(central) = BASE") && src.contains("theta TVBASE"),
+        "the init-seed derivation must have applied"
+    );
     // Same guard as the sibling below: a respelled fixture would make this
     // `.replace` a no-op, the route lag would become the trigger in
     // `ode_tvcov_supported`, and the test would pass via a trigger that predates
@@ -11321,11 +11344,22 @@ fn a_pre_arrival_observation_does_not_nan_the_analytic_sensitivities() {
         subject.obs_times[0] < subject.doses[0].time,
         "precondition: the first observation must precede the first dose"
     );
-    let theta = [5.0, 50.0, 0.4, 1.5, 2.0, 1.0];
+    // Seventh entry is `TVBASE`, appended after `TVLAG` by the derivation above.
+    let theta = [5.0, 50.0, 0.4, 1.5, 2.0, 1.0, 30.0];
     let eta = [0.1, -0.05];
 
     let sens = subject_sensitivities(&model, &subject, &theta, &eta)
         .expect("the analytic route must serve this subject");
+    // The whole point of the `init` seed: the pre-arrival observation must carry a
+    // *non-zero* prediction, or the parity check below compares 0.0 to 0.0 and
+    // cannot distinguish a correct anchor from a wrong one.
+    assert!(
+        sens.obs[0].f.abs() > 1e-6,
+        "obs 0 is at t={} (pre-arrival) and must be non-degenerate, got f={} — \
+         without a live incoming side this test only catches a NaN anchor",
+        subject.obs_times[0],
+        sens.obs[0].f
+    );
     for (i, o) in sens.obs.iter().enumerate() {
         assert!(o.f.is_finite(), "obs {i}: f is {}", o.f);
         assert!(

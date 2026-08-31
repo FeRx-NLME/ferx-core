@@ -1522,6 +1522,52 @@ mod tests {
             out.iter().all(|p| p.is_finite()),
             "reset route returned {out:?}"
         );
+
+        // Route 3 — the **analytical** event-driven walker, which carries its own
+        // copy of the same three asserts (`pk/event_driven.rs`) and which the
+        // CHANGELOG claims was affected. Routes 1 and 2 are both `ode(...)` models,
+        // so without this arm that claim rests on the shared materialiser fix alone.
+        //
+        // Reached via `compute_predictions_with_tv_into_with_schedule`'s third
+        // branch: `has_resets() && supports_event_driven(pk_model)` with
+        // `ode_spec == None`. For such a model `model_uses_time_anywhere` degenerates
+        // to `model_uses_time_builtin`, so the subject stays parameter-static and
+        // takes the arm the fix repaired.
+        const ANALYTICAL_SRC: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(20.0, 0.001, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let analytical = crate::parser::model_parser::parse_model_string(ANALYTICAL_SRC).unwrap();
+        assert!(
+            analytical.ode_spec.is_none(),
+            "route 3 must be the analytical engine, not an ODE model"
+        );
+        let mut s = base(&analytical);
+        s.reset_times = vec![4.0];
+        // A second dose after the reset, so the later record lands with drug
+        // present rather than on a zero state (CLAUDE.md's non-degeneracy rule).
+        s.doses.push(DoseEvent::new(5.0, 100.0, 1, 0.0, false, 0.0));
+        let out = crate::pk::compute_predictions_with_tv(&analytical, &s, &theta, &eta);
+        assert_eq!(out.len(), s.obs_times.len());
+        assert!(
+            out.iter().all(|p| p.is_finite()),
+            "analytical route returned {out:?}"
+        );
+        assert!(
+            out.last().is_some_and(|p| *p > 0.0),
+            "the post-reset observation must see the second dose, else the arm is \
+             degenerate and would pass on an all-zero state: {out:?}"
+        );
     }
 
     fn assert_reduces_to_ode(model_src: &str, theta: &[f64], eta: &[f64], doses: Vec<DoseEvent>) {
