@@ -305,7 +305,7 @@ pub fn recover_disp_params_g<T: PkNum>(
 
     let probe = |u: &[T], vars: &mut Vec<T>, stack: &mut Vec<T>| -> Vec<T> {
         let mut du = vec![T::from_f64(0.0); n];
-        prog.eval_rhs_g::<T>(u, p, 0.0, 0.0, 0.0, &mut du, vars, stack);
+        prog.eval_rhs_g::<T>(u, p, 0.0, 0.0, T::from_f64(0.0), &mut du, vars, stack);
         du
     };
 
@@ -2561,8 +2561,8 @@ mod tests {
 
         // Read directly in the derivative. Only `TAD` was wrongly admitted before
         // the fix — the other three already failed the two-time probe — but all
-        // four are pinned so a future narrowing of this gate (to
-        // `uses_dose_anchored_time_vars`, say) cannot quietly reopen them.
+        // four are pinned so a future narrowing of this gate (to a `TAD`-only
+        // flag, say) cannot quietly reopen them.
         // `TAFD - TAD` is here because it is what breaks if the probe is "fixed"
         // by passing a varying `tad`: the two anchors cancel to a constant.
         for factor in [
