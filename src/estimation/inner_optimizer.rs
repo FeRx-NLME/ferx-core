@@ -463,7 +463,7 @@ pub struct EbeResult {
     /// `iov_occasion_groups`).
     pub kappas: Vec<DVector<f64>>,
     /// True when the subject was hard-rejected at its inner start (a pathological
-    /// ODE+IOV warm-start NLL — see [`reject_ode_iov_inner_start`]). The returned
+    /// ODE+IOV warm-start NLL — see `reject_ode_iov_inner_start`). The returned
     /// `eta`/`h_matrix` are then a degenerate placeholder (off-mode η, zero H), so the
     /// outer loop must reject the whole trial rather than fold them into an accepted
     /// OFV. Unlike plain non-convergence this forces rejection regardless of

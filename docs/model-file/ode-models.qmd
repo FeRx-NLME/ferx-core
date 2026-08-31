@@ -224,7 +224,7 @@ with an adaptive Dormand-Prince RK45:
 
 | Setting | Value |
 |---------|-------|
-| Method | `auto` — explicit Runge-Kutta 4(5), switching to a stiff method where the system calls for one ([below](#letting-ferx-pick-the-stepper-ode_method-auto)) |
+| Method | `auto` — explicit Runge-Kutta 4(5), switching to a stiff method where the system calls for one ([below](#letting-ferx-pick-the-stepper-ode_method--auto)) |
 | Absolute tolerance | 1e-6 |
 | Relative tolerance | 1e-4 |
 | Max steps | 10,000 |
@@ -298,7 +298,7 @@ Set `ode_method` in `[fit_options]` to pick a different stepper:
 | `rosenbrock23` (aliases `ros23`, `ode23s`) | 2(3) | 3 | yes | crude tolerances, rough right-hand sides |
 | `rodas4` | 4(3) | 6 | yes | the stiff workhorse at typical tolerances (1e-6 – 1e-9) |
 | `rodas5p` | 5(4) | 8 | yes | stiff systems at tight tolerances (`ode_reltol` ≤ 1e-9) |
-| `auto` (default) | — | — | decides | letting ferx pick between the two families per integration — see [below](#letting-ferx-pick-the-stepper-ode_method-auto) |
+| `auto` (default) | — | — | decides | letting ferx pick between the two families per integration — see [below](#letting-ferx-pick-the-stepper-ode_method--auto) |
 
 Note the two different axes. The Rosenbrock methods buy **stability**; `vern7` buys **order**.
 Which one helps depends on what is capping your step size, and picking the wrong one costs
@@ -316,7 +316,7 @@ A stiff step is more expensive than an explicit one — it builds a finite-diffe
 so on a non-stiff one- to three-compartment model RK45 remains faster. Switch only when
 stiffness, not accuracy, is what is capping the step size.
 
-#### Letting ferx pick the stepper (`ode_method = auto`)
+### Letting ferx pick the stepper (`ode_method = auto`) {#letting-ferx-pick-the-stepper-ode_method--auto}
 
 `auto` is **the default**, so this section describes what happens to a model that says nothing
 about `ode_method` at all. It decides from the model rather than from the data. To opt out and
@@ -340,7 +340,9 @@ method exactly; `auto` is the only value that decides anything.
 
 Three properties are worth knowing before you rely on it.
 
-**It probes per integration segment, not once per model.** ferx splits a subject's timeline at
+#### It probes per integration segment {#auto-probes-per-segment}
+
+ferx splits a subject's timeline at
 every dose, and the probe runs at the start of each of those segments. That is deliberate:
 in a binding model the fast eigenvalue is carried by a term like `KON · central`, which is
 identically **zero before any drug is present**. A model whose stiffness comes from binding is
@@ -349,7 +351,9 @@ non-stiff and never escalate. Probing per segment sees the post-dose Jacobian, w
 stiffness actually lives. It also re-decides as the optimizer moves θ, so a fit that walks into
 a stiff region of parameter space switches with it.
 
-**An escalation that fails is caught and undone.** Every stiff method in ferx has been measured
+#### A failed escalation is caught and undone {#auto-escalation-guard}
+
+Every stiff method in ferx has been measured
 diverging on *some* model where the explicit family stayed clean, and those failures differ
 between methods — so `auto` treats a bad escalation as an expected outcome, not an impossible
 one. If the stiff solve comes back non-finite, **or** clamps at the minimum step (the
@@ -360,7 +364,9 @@ If it also fails, `auto_fallback_failed` reports that neither attempt produced a
 trajectory. The guard applies only to `auto`: a named method is always honoured as asked. When it fires, the fit says so — see
 [where those counts show up](#which-regime-am-i-in), below.
 
-**Two things the probe cannot see**, both worth knowing now that it is the default. When the
+#### What the probe cannot see {#auto-probe-blind-spots}
+
+Two things, both worth knowing now that `auto` is the default. When the
 fallback completes, neither makes the answer worse than the explicit result, but both can make a
 fit slower than pinning a method by hand.
 
@@ -380,6 +386,8 @@ Both were accepted rather than fixed, because the obvious alternatives are worse
 `λ_max/λ_min` is undefined the moment any mode sits at zero, which is every compartment before
 its first dose, and scaling by the segment length makes a long segment on a benign model read
 stiff. On either of these, name a method.
+
+#### What `auto` did: the six counters {#auto-stepper-counters}
 
 Three counters record what `auto` did. They sit on the solver-statistics struct alongside the
 step counts, and ride along in the `ode_solver` warning's `details` payload:
@@ -421,6 +429,8 @@ escalations and failures on the event-time path — the threshold solver that dr
 and adaptive-dosing models — are not in them. A zero is not by itself proof that every
 integration in the fit was clean.
 
+#### Measured impact {#auto-stepper-benchmark}
+
 Measured on the ferx-testdata ODE library at default tolerances. `λ_max` is the range across
 every integration segment of every subject; the wall-clock columns are FOCEI fits:
 
@@ -443,7 +453,9 @@ is stability-limited throughout. The TMDD models are the more interesting case �
 high-dose segments and not on the low-dose ones, which is exactly the situation a single
 per-model choice cannot serve and a per-segment probe can.
 
-**When to pin a method instead.** `auto` is the default because whether a system is stiff is a
+#### When to pin a method instead {#when-to-pin-a-method}
+
+`auto` is the default because whether a system is stiff is a
 property of the equations, and a user who has to know the answer in advance in order to get a
 tractable fit is being asked the wrong question. Three situations still call for naming one:
 
@@ -458,7 +470,7 @@ The cost when nothing is stiff is one Jacobian build and one eigensolve per inte
 — the same work a single Rosenbrock step attempt does, against a segment that takes tens to
 thousands of steps. Zero-length segments skip it entirely.
 
-#### When a segment turns stiff halfway through {#mid-segment-switching}
+### When a segment turns stiff halfway through {#mid-segment-switching}
 
 The probe reads the Jacobian at a segment's **entry** state, and for a binding model that is the
 state it looks least stiff at: the fast mode is carried by a term like `KON · C · R`, so it does
@@ -517,7 +529,7 @@ start:
 Like every other part of `auto`, this is off under a named `ode_method` — a pinned method is
 honoured as asked.
 
-#### Which regime am I in?
+### Which regime am I in? {#which-regime-am-i-in}
 
 This matters, because a stiff solver does **not** speed up a fit that is merely *accurate*-
 limited. Run your model and look at the solver's step counts:

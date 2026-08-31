@@ -38,7 +38,7 @@
 //!
 //! 1. They estimate the whole ELBO by Monte Carlo, including the `log p(η)` and
 //!    `log q` terms. We take the KL analytically (above). `vi_kl = mc` selects
-//!    their estimator — see [`elbo::mc_kl_draw`] — which is what a variational
+//!    their estimator — see `elbo::mc_kl_draw` — which is what a variational
 //!    family with no closed-form KL will need, and a way to cross-check the
 //!    analytic one.
 //! 2. Consequently `Ω` need not be stepped by the optimizer at all — under the

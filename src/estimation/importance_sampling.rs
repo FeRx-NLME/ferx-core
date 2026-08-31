@@ -487,14 +487,14 @@ pub(crate) const MIX_ESS_PMIX_FLOOR: f64 = 1e-3;
 ///
 /// Mirrors [`run_importance_sampling`] but forms the marginal over the latent
 /// class the same way FOCEI does: for each subject and each class `k`, run the
-/// class-`k` MAP inner solve (under a [`MixtureClassGuard`], so `MIXNUM` resolves
+/// class-`k` MAP inner solve (under a `MixtureClassGuard`, so `MIXNUM` resolves
 /// to `k`), importance-sample the class-conditional marginal `L_ik`, then combine
 ///
 /// ```text
 ///   L_i = Σ_k p_ik · L_ik,   −2·log L = −2 Σ_i log Σ_k p_ik L_ik
 /// ```
 ///
-/// via [`combine_subject`]. This is the true marginal likelihood a chained
+/// via [`crate::estimation::mixture::combine_subject`]. This is the true marginal likelihood a chained
 /// `[saem, imp]` / `[focei, imp]` fit reports for a mixture. The per-class solves
 /// run inside each subject's rayon task (the guard is entered per class on the
 /// worker thread), so subject-level parallelism is preserved while the

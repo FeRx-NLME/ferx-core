@@ -4,7 +4,7 @@ use nalgebra::DMatrix;
 const MIN_VARIANCE: f64 = 1e-12;
 
 /// Compute residual variance for a single observation
-/// sigma_values: [sigma1] for additive/proportional, [sigma1, sigma2] for combined
+/// sigma_values: `[sigma1]` for additive/proportional, `[sigma1, sigma2]` for combined
 pub fn residual_variance(error_model: ErrorModel, f_pred: f64, sigma_values: &[f64]) -> f64 {
     let v = match error_model {
         ErrorModel::Additive => {
@@ -102,12 +102,12 @@ impl ErrorSpec {
     }
 
     /// `∂(sigma loading coefficient)/∂f` for each slot an observation loads on,
-    /// parallel in shape to [`sigma_loadings`].
+    /// parallel in shape to [`ErrorSpec::sigma_loadings`](crate::types::ErrorSpec::sigma_loadings).
     ///
     /// Every loading coefficient is affine in the prediction `f`: the
     /// proportional slot loads `f` (slope `1`), the additive slot loads the
     /// constant `1` (slope `0`). Returning the slopes with the *same slot
-    /// presence* as [`sigma_loadings`] lets the dense-`R` derivative
+    /// presence* as [`ErrorSpec::sigma_loadings`](crate::types::ErrorSpec::sigma_loadings) lets the dense-`R` derivative
     /// ([`crate::stats::residual_error::compute_dr_df_matrices`]) reuse the exact
     /// bilinear cross-covariance assembly with the value loadings replaced by
     /// these slopes — the off-diagonal `R` is linear in each observation's
@@ -1094,7 +1094,7 @@ pub(crate) fn r_matrix_maybe_scaled(
 /// * diagonal: `∂R_mm/∂f_m` — the `f`-derivative of `variance_at_scaled`,
 ///   including any within-observation `block_sigma` cross term;
 /// * off-diagonal `(m,k)` in the same residual block: `∂R_mk/∂f_m`, which —
-///   because [`cross_observation_covariance`] is bilinear in the two
+///   because `cross_observation_covariance` is bilinear in the two
 ///   observations' loadings — is exactly that cross-covariance evaluated with
 ///   observation `m`'s *slope* loadings ([`ErrorSpec::sigma_loading_slopes`])
 ///   in place of its value loadings.
@@ -1231,12 +1231,12 @@ fn diag_self_deriv(
 ///   `∂²R_mm/∂f_m²` — the second `f`-derivative of `variance_at_scaled`. With
 ///   `c_s` the value loading, `c_s' = slope_s`, `c_s'' = 0`, the within-obs
 ///   `block_sigma` cross term `2 ρ σ_i σ_j c_i c_j` differentiates twice to
-///   `4 ρ σ_i σ_j c_i' c_j'` (see [`diag_self_second_deriv`]). The off-diagonal
+///   `4 ρ σ_i σ_j c_i' c_j'` (see `diag_self_second_deriv`). The off-diagonal
 ///   entries of `R` have `∂²R_mk/∂f_m² = cross(c_m'', c_k) = 0`, so they do not
 ///   appear here.
 /// * `d2r[m][k]` for `m ≠ k` in the same residual block has nonzero entries at
 ///   `(m, k)` and `(k, m)`: `∂²R_mk/∂f_m∂f_k`. Because
-///   [`cross_observation_covariance`] is bilinear in the two observations'
+///   `cross_observation_covariance` is bilinear in the two observations'
 ///   loadings, this mixed partial is exactly that cross-covariance evaluated
 ///   with *both* observations' slope loadings — `cross(slope_m, slope_k)`.
 ///

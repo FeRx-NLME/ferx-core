@@ -11,7 +11,7 @@
 //! ```
 //!
 //! The generic [`super::three_cpt`] path solves the cubic trigonometrically
-//! (`acos`/`cos`) and lets [`Dual2`](super::dual2::Dual2) carry the derivatives
+//! (`acos`/`cos`) and lets [`Dual2`] carry the derivatives
 //! through that transcendental solve. Here we instead obtain the root
 //! first/second derivatives in **closed form** by implicit differentiation of
 //! `p(λ)=0`. Differentiating once w.r.t. parameter `i`:

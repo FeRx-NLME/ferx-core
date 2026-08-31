@@ -104,13 +104,15 @@ with structurally-zero entries (cross-block off-diagonals, standalone-vs-block o
 
 **Burn-in.** This M-step is suppressed for the first `omega_burnin` iterations (default 20, clamped to `n_exploration`): Ω is held at its starting value while the MH chain warms up. The MH proposal scale is $\delta_i \cdot \mathrm{chol}(\Omega)$, so Ω and the sampler are coupled. On sparse data (few observations per subject) a cold-start chain (η = 0, only `n_mh_steps` proposals) produces a tiny $(1/N) \sum_i \eta_i \eta_i^T$; with $\gamma_1 = 1$ the M-step would install that as Ω on iteration 1, shrinking the proposal, which keeps the chain near zero — a self-reinforcing collapse that dumps between-subject variability into the residual error. The SA statistic $S_2$ is still refreshed each burn-in iteration (at the damped rate $\gamma_k^\Omega$, so it is a running average of the warming chain), so the first Ω update after burn-in reflects the warmed-up chain rather than the cold-start spread. Set `omega_burnin = 0` to disable the burn-in; note that the damped Ω step above now also guards this cold-start collapse on its own (it is a strict generalisation — continuous rather than for the first `omega_burnin` iterations only), so disabling the burn-in no longer reproduces the collapse by itself.
 
-### 4. M-Step for Theta and Sigma (Optimization)
+### 4. M-Step for Theta and Sigma (Optimization) {#4-m-step-for-theta-and-sigma-optimization}
 
 Minimize the conditional observation negative log-likelihood with ETAs held fixed:
 
 $$
 \sum_{i=1}^{N} \sum_{j=1}^{n_i} \left[ \frac{1}{2} \log V_{ij} + \frac{1}{2} \frac{(y_{ij} - f_{ij})^2}{V_{ij}} \right]
 $$
+
+#### Closed-form EM update for mu-referenced thetas {#saem-mstep-closed-form}
 
 When `mu_referencing = true` (the default), ferx detects lognormal parameters from the `[individual_parameters]` block and applies the **closed-form EM update** for those thetas instead of running NLopt:
 
@@ -122,9 +124,16 @@ where $\overline{\eta_j} = (1/N) \sum_i \eta_{i,j}$ is the empirical mean of the
 
 NLopt still runs for any remaining thetas (non-mu-referenced) and for sigma — the closed-form-updated thetas are pinned at their new values for the NLopt call.
 
+#### The NLopt M-step (BOBYQA) {#saem-mstep-bobyqa}
+
 The NLopt M-step uses **BOBYQA** (derivative-free trust-region with quadratic interpolation). The earlier gradient-based SLSQP path was found to lock onto one side of the Emax-Hill identifiability ridge on the dense-Emax PKPD benchmark (under-estimating EMAX by ~40% at virtually identical OFV); BOBYQA's quadratic trust-region exploration lands much closer to truth and ~40% faster on that benchmark (no FD-gradient eval per parameter), while remaining numerically equivalent (ΔOFV < 0.1) on simpler PK-only models.
 
 When `mu_referencing = false`, the full NLopt M-step runs for all thetas as before.
+
+#### Thetas the closed-form update cannot reach {#saem-mstep-no-closed-form}
+
+Two model shapes leave a theta on the numerical M-step. The first is slower; the second
+can bias the estimate outright.
 
 ::: {.callout-warning}
 ## Non-mu-referenced parameters slow SAEM convergence
@@ -199,7 +208,7 @@ ETA" would be false for them:
   states in its own warning; repeating "add an ETA" on top of that would be both
   false and contradictory.
 
-### What SAEM does about it now
+### Damping the numerical M-step (`mstep_damping`) {#what-saem-does-about-it-now}
 
 The numerical θ/σ M-step result is blended in as a Robbins-Monro step
 `θ ← θ + γ_θ·(θ* − θ)` rather than assigned outright, with `γ_θ` capped at

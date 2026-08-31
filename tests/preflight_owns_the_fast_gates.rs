@@ -166,7 +166,12 @@ fn listed_commands(group: &str) -> Vec<String> {
 fn the_fast_gate_jobs_delegate_to_preflight_and_never_inline_cargo() {
     let yml = ci_yml();
 
-    for (job, group) in [("check", "check"), ("clippy", "clippy"), ("fmt", "fmt")] {
+    for (job, group) in [
+        ("check", "check"),
+        ("clippy", "clippy"),
+        ("fmt", "fmt"),
+        ("rustdoc", "rustdoc"),
+    ] {
         let body = job_body(&yml, job);
         let cmds = run_commands(&body);
         assert!(
@@ -236,7 +241,10 @@ fn a_failing_gate_fails_the_script_from_every_position() {
     let root = repo_root();
     let (counter, path) = fake_cargo_on_path("failure-path");
 
-    for group in ["fmt", "check", "clippy"] {
+    // Every group whose commands are `cargo` invocations, so the fake below intercepts
+    // them. `public-api` shells out to `tools/update-public-api.sh` instead and is covered
+    // by `the_failure_diagnostic_names_the_group_that_actually_failed`.
+    for group in ["fmt", "check", "clippy", "rustdoc"] {
         let listed = listed_commands(group);
         assert!(
             !listed.is_empty(),
@@ -474,6 +482,33 @@ fn load_bearing_flags_and_feature_coverage_survive_in_the_command_list() {
         fmt.join("\n  ")
     );
 
+    // `cargo doc` exits 0 on link warnings. `-Dwarnings` is the ENTIRE gate: drop it and
+    // both commands stay in the list, still build docs, still take ~8s — and pass over a
+    // tree with 146 broken links. That is the neutered-gate shape this test exists for.
+    let docs = listed_commands("rustdoc");
+    for cmd in &docs {
+        assert!(
+            cmd.contains("RUSTDOCFLAGS=-Dwarnings"),
+            "a docs command does not deny warnings, so rustdoc exits 0 and the gate \
+             passes on any number of broken links:\n  {cmd}"
+        );
+        // Set via `env` in the argument vector rather than a `VAR=x run ...` prefix.
+        // A prefix reaches rustdoc too, but `run` echoes `$*` and a prefix is not in it,
+        // so `--list` would advertise a bare `cargo doc` that does NOT fail on warnings.
+        assert!(
+            cmd.starts_with("env "),
+            "the docs command sets RUSTDOCFLAGS outside its argument vector, so \
+             `--list` prints a command that behaves differently when pasted:\n  {cmd}"
+        );
+    }
+    assert!(
+        docs.iter().any(|c| c.contains("-p ferx-tools")),
+        "no docs command covers the workspace members, so `ferx-tools` and `ferx-cli` \
+         doc comments are gated by nothing — a root `cargo doc` documents only the root \
+         package (#1114).\n  {}",
+        docs.join("\n  ")
+    );
+
     // Union of every `--features` value in the check group.
     let check = listed_commands("check");
     let mut features: Vec<String> = Vec::new();
@@ -543,10 +578,12 @@ fn preflight_is_executable_and_lists_every_group() {
     // commands are actually *enforced* is
     // `a_failing_gate_fails_the_script_from_every_position`; `--list` executes nothing and
     // can never show it.
-    let expected: [(&str, usize); 4] = [
+    let expected: [(&str, usize); 6] = [
         ("fmt", 1),        // cargo fmt --all -- --check
         ("check", 5),      // ci · ci,survival,slow-tests · ci,markov · ci,nn,slow-tests · members
         ("clippy", 2),     // ferx-core --all-targets · members
+        ("rustdoc", 2),    // ferx-core rustdoc · members
+        ("docs", 2),       // cargo test -p docs-lint · cargo clippy -p docs-lint
         ("public-api", 1), // tools/update-public-api.sh --check
     ];
 
@@ -657,4 +694,38 @@ fn preflight_help_lists_every_group_and_works_from_any_cwd() {
              know to run it:\n{stdout}"
         );
     }
+}
+
+/// A crate-level `#![allow(rustdoc::...)]` is a neutered gate the command list cannot see.
+///
+/// The `rustdoc` group can carry `-Dwarnings` on every line, run on every PR, and still pass
+/// over a tree whose rendered HTML is full of `[<code>foo</code>]` — because the lint that
+/// would have fired was switched off inside the crate. `private_intra_doc_links` is the
+/// one that matters here: rustdoc drops a link to a `pub(crate)` item and leaves the
+/// markdown brackets in the public page, exactly the defect the gate exists to catch. An
+/// `allow` also silences every FUTURE such link, so the class leaves the gate permanently
+/// rather than for one PR.
+///
+/// Rustdoc lints are therefore fixed at the link, not at the crate root: an internal target
+/// becomes inline code, a public target gets a resolvable path. A per-item `#[allow]` is out
+/// of scope for this test — it is visible in review at the place it applies; a crate-level
+/// one is a single line thousands of lines from anything it affects.
+#[test]
+fn no_crate_level_allow_switches_a_rustdoc_lint_off() {
+    let lib = std::fs::read_to_string(repo_root().join("src/lib.rs")).expect("read src/lib.rs");
+    let offenders: Vec<&str> = lib
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| l.starts_with("#!["))
+        .filter(|l| l.contains("allow") && l.contains("rustdoc::"))
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "src/lib.rs switches a rustdoc lint off crate-wide. The `rustdoc` group then still \
+         runs, still denies warnings, and still passes while the public HTML renders the \
+         unresolved links with their brackets intact — and it does so for every link added \
+         after this line, not just today's. Fix the links instead: inline code for an \
+         internal target, a resolvable path for a public one.\n  {}",
+        offenders.join("\n  ")
+    );
 }

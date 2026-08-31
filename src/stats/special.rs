@@ -187,7 +187,7 @@ pub fn normal_cdf_g<T: PkNum>(z: T) -> T {
 /// instead of the true `O(1)` value). Because `Φ(z) = ½·erfc(−z/√2)` here evaluates
 /// the lower tail as the direct `Q(½, z²/2)`, `ln Φ` needs **no** Mills asymptotic —
 /// it stays accurate (and its `φ/Φ` jet exact) until `Φ` itself underflows below
-/// [`MIN_PROB`], where it clamps flat to avoid `−∞` contaminating the likelihood.
+/// `MIN_PROB`, where it clamps flat to avoid `−∞` contaminating the likelihood.
 pub fn log_normal_cdf_g<T: PkNum>(z: T) -> T {
     let p = normal_cdf_g(z);
     if p.val() < MIN_PROB {
@@ -213,7 +213,7 @@ pub fn inv_mills(z: f64) -> f64 {
 /// upper tail). Returns the **signed** `(h, z, m)` where, with `σ = sign(cens)`
 /// (`+1` for left, `−1` for right):
 /// `z = σ·(y − f)/√v` is the tail argument the objective scores
-/// (`−logΦ(z)`, matching [`m3_logcdf`](crate::stats::likelihood::m3_logcdf)),
+/// (`−logΦ(z)`, matching `m3_logcdf`),
 /// `h = φ(z)/Φ(z)` ([`inv_mills`]), and the signed
 /// `m = σ·[1/√v + (y − f)·dv_df / (2·v^{3/2})]`.
 ///
@@ -376,7 +376,7 @@ pub fn ln_gamma(x: f64) -> f64 {
 }
 
 /// Digamma ψ(x) = d/dx ln Γ(x) — the exact analytic derivative of [`ln_gamma`]'s
-/// Lanczos form (same [`LANCZOS_COEF`] / [`LANCZOS_G`]), so a finite difference of
+/// Lanczos form (same `LANCZOS_COEF` / `LANCZOS_G`), so a finite difference of
 /// `ln_gamma` and `digamma` agree to ~1e-12 (an independent ψ approximation would
 /// not). The first-order `Dual2` rule for `ln Γ` on the transit absorption
 /// sensitivity path (#430). Reflection mirrors `ln_gamma`:
@@ -470,14 +470,14 @@ pub fn regularized_gamma_p<T: PkNum>(a: T, x: T) -> T {
 /// Regularized **upper** incomplete gamma `Q(a, x) = 1 − P(a, x) = Γ(a, x)/Γ(a)` —
 /// the complement of [`regularized_gamma_p`], computed **without** the `1 − P`
 /// cancellation in the upper tail (`x ≥ a + 1`): there `Q` is the continued
-/// fraction [`gamma_q_cf`] *directly*, so it keeps full precision where `P → 1` and
+/// fraction `gamma_q_cf` *directly*, so it keeps full precision where `P → 1` and
 /// `1 − P` would collapse to `0` (e.g. `erfc` far in its tail — the regime the IG
 /// closed form's second `Φ` term evaluates, #790). For `x < a + 1` the series side
 /// is well-conditioned, so `Q = 1 − P_series`. `x ≤ 0 ⇒ Q = 1`.
 ///
 /// Generic over [`PkNum`] with the same exact 1st/2nd-order dual jets as
-/// [`regularized_gamma_p`] (it shares the very same [`gamma_p_series`] /
-/// [`gamma_q_cf`] iterations), so `Q + P = 1` holds for the values **and** their
+/// [`regularized_gamma_p`] (it shares the very same `gamma_p_series` /
+/// `gamma_q_cf` iterations), so `Q + P = 1` holds for the values **and** their
 /// derivatives cancel to zero.
 pub fn regularized_gamma_q<T: PkNum>(a: T, x: T) -> T {
     if x.val() <= 0.0 {
