@@ -270,6 +270,10 @@ fn a_mixture_model_is_refused() {
     let err = reject_mixture_model(&mixture).unwrap_err();
     assert!(err.contains("relabelling"), "{err}");
     assert!(err.contains("mixture"), "{err}");
+    // #1145 closed this as decided, not deferred, so the message must name the
+    // method that does work rather than read as a missing feature.
+    assert!(err.contains("will not"), "{err}");
+    assert!(err.contains("SIR"), "{err}");
 }
 
 // ── the ID guard ────────────────────────────────────────────────────────────

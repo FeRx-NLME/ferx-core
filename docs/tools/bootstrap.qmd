@@ -86,14 +86,26 @@ there is **empty when core reports no standard error for that coordinate** — a
 reported", never zero.
 
 ::: {.callout-warning}
-## Mixture models are not supported
+## Mixture models cannot be bootstrapped — use SIR
 
 A `[mixture]` model's classes are identified only up to relabelling: replicate *k*'s
-"class 1" need not be the original fit's class 1, so averaging estimates across
-replicates would mix two different things and produce an interval that is meaningless
-rather than merely noisy. Bootstrapping a mixture needs a relabelling rule, and this
-tool does not have one, so it refuses the run rather than reporting a plausible-looking
-table.
+"class 1" need not be the original fit's class 1. Averaging estimates across replicates
+without resolving that mixes two different things, inflating the standard error toward
+the **between-class separation** — a property of the model, not a sampling uncertainty —
+while every replicate converges and the table looks entirely reasonable. The error grows
+with how well separated the classes are, so it is worst exactly when the mixture is best
+identified and most likely to be believed.
+
+Relabelling rules exist and would work most of the time. That is the wrong standard for
+the artefact a reader trusts *instead of* redoing the analysis, so `ferx bootstrap`
+refuses a mixture model rather than reporting a plausible-looking table. This is a
+settled decision, not a missing feature.
+
+For parameter uncertainty on a mixture model, use [SIR](../estimation/sir.qmd)
+(`sir = true`). SIR never re-optimises — it samples around the maximum-likelihood
+estimates and reweights by the likelihood — so there is no second basin to fall into and
+no labelling to resolve. The covariance step is likewise well defined at a single fit's
+fixed labelling.
 :::
 
 ::: {.callout-warning}

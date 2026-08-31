@@ -2811,17 +2811,18 @@ impl AdaptiveRecordIndex {
 /// arm every other engine carries. Two independent reasons, and it is worth writing them
 /// down because the asymmetry looks like an omission:
 ///
-///   * The segment ending at a reset is **discarded** — the reset zeros the state at the
+///   * The segment ending at a reset is **discarded** — the reset re-seeds the state at the
 ///     next break, before any readout — so whichever record governs it cannot reach a
-///     prediction. (`ode_predictions_event_driven` skips the propagation outright for
-///     exactly this reason; the explicit arm there is documentation, not arithmetic.)
+///     prediction. (`ode_predictions_event_driven` keeps an explicit `Kind::Reset` arm for
+///     the same reason: the value it produces never leaves the loop.)
 ///   * A reset does not disturb the LOCF carry, because the caller advances `last_pk`
 ///     from `records.at(t_end)` — an actual record — rather than from this function's
 ///     result. That is the property that *would* have leaked, and it is pinned there.
 ///
-/// NONMEM does run `$PK` at an EVID=3/4 row, so ferx's treatment of a reset as a
-/// non-parameter-source is a latent divergence of the same family as #1073 — deliberately
-/// left alone rather than half-fixed here, and tracked separately.
+/// NONMEM does run `$PK` at an EVID=3/4 row, and since #1133 ferx honours that where it is
+/// observable — the `init(...)` re-seed reads the reset row's own snapshot, from
+/// `event_pk.reset[r]`, in this engine as in every other. What stays out of *this* function
+/// is only the governing-record resolution for the discarded segment.
 ///
 /// This is the reactive twin of the static engines' end-of-interval resolution, and it
 /// is what makes the **degenerate oracle** hold: a controller re-emitting a fixed
@@ -2938,6 +2939,18 @@ pub(crate) fn locf_decision_cov<'a>(
             }
         }
     }
+    // EVID=3/4 rows are deliberately NOT scanned here, even though they are records and
+    // their covariates are now stored (#1133). This function must mirror `segment_pk_at`,
+    // which resolves the decision-time PK from `AdaptiveRecordIndex` — a dose/pk-only/obs
+    // index that carries no resets. Teaching only this half would hand the controller the
+    // post-reset covariate against pre-reset PK parameters, and `verify_adaptive_snapshots`
+    // could not catch it because it re-derives `dcov` through this very helper.
+    //
+    // Making both reset-aware is the right end state, but it means adding resets to the
+    // `at` lookup WITHOUT adding them to `governing` (which must stay aligned with the
+    // dense engine's `is_record`, where a reset is excluded) — a change wider than the
+    // init-seed fix, and tracked separately. Until then a decision landing after a reset
+    // with no intervening record reads the pre-reset covariates, consistently on both.
     best.map(|(_, c)| c).unwrap_or(baseline)
 }
 
@@ -3570,15 +3583,44 @@ pub(crate) fn ode_predictions_adaptive_impl(
         // recorded, so a reset sorts ahead of a dose or obs at the same instant —
         // the ordering `ode_predictions_event_driven` uses (Reset < Dose < Obs).
         // Runs regardless of `stopped`, so a reset after a `Stop` still zeros the
-        // state for later observations. `pk_readout` is the LOCF PK there (the
-        // frozen snapshot on the constant path), so a covariate-dependent init is
-        // seeded correctly. No-op for a reset-free subject.
-        if subject
+        // state for later observations. No-op for a reset-free subject.
+        //
+        // The seed reads the RESET ROW'S OWN snapshot (`event_pk.reset[r]`), not the
+        // decision-time LOCF carry (#1133): an EVID=3/4 row is a NONMEM data record, so
+        // `$PK` runs at it and a covariate-driven `init(...)` restarts on that row's
+        // covariates. This is deliberately *not* `pk_readout` — that one is LOCF because a
+        // controller must not read a covariate no record has reported yet, which is a
+        // statement about the decision hook, not about the state the reset restores. Falls
+        // back to `pk_readout` only when no snapshot exists (the constant path, where
+        // `event_pk` is `None` and every candidate agrees).
+        if let Some(r) = subject
             .reset_times
             .iter()
-            .any(|&rt| (rt - t_start).abs() < RESET_MATCH_TOL)
+            // `rposition`, not `position`: if two reset rows ever land within
+            // `RESET_MATCH_TOL` of each other, the dense engine pushes one timeline entry
+            // per reset and applies them in order, so the LAST one's seed is the state that
+            // survives. Matching that here keeps the adaptive driver, its replay and
+            // `predict()` on one answer rather than splitting the degenerate oracle (#1133).
+            .rposition(|&rt| (rt - t_start).abs() < RESET_MATCH_TOL)
         {
-            u = ode.initial_state(pk_readout);
+            // `tv` is `event_pk.is_some()`, so this is the constant path (`pk_readout` is
+            // the frozen `pk_params_flat`, where every candidate snapshot agrees) or the
+            // per-event one. The index is asserted rather than defaulted: a short `reset`
+            // vector would silently restore the pre-#1133 LOCF carry, which is the defect
+            // itself, and `ode_predictions_event_driven` fails loudly on the same
+            // condition.
+            let seed_pk: &[f64] = match event_pk {
+                Some(ev) => {
+                    assert_eq!(
+                        ev.reset.len(),
+                        subject.reset_times.len(),
+                        "event_pk.reset must be parallel to subject.reset_times (#1133)"
+                    );
+                    &ev.reset[r].values
+                }
+                None => pk_readout,
+            };
+            u = ode.initial_state(seed_pk);
             reset_floor = t_start;
         }
 
@@ -4379,16 +4421,33 @@ fn adaptive_frozen_replay_tv(
         }
 
         // System reset (EVID=3) at t_start (#716): zero the state (or re-seed
-        // `init(state)=expr` at the LOCF PK — the occasion snapshot just set above when
-        // the reset coincides with a decision) and record the reset floor — before the
-        // boluses and observation below, matching the driver's Reset < Dose < Obs
-        // ordering. No-op for a reset-free subject.
-        if subject
+        // `init(state)=expr`) and record the reset floor — before the boluses and
+        // observation below, matching the driver's Reset < Dose < Obs ordering. No-op for
+        // a reset-free subject.
+        //
+        // The seed reads the reset ROW's own snapshot (#1133), the same source the driver
+        // uses, so the replay stays bit-aligned with it. Falls back to the LOCF carry only
+        // when no reset snapshot exists.
+        if let Some(r) = subject
             .reset_times
             .iter()
-            .any(|&rt| (rt - t_start).abs() < RESET_MATCH_TOL)
+            // `rposition`, not `position`: if two reset rows ever land within
+            // `RESET_MATCH_TOL` of each other, the dense engine pushes one timeline entry
+            // per reset and applies them in order, so the LAST one's seed is the state that
+            // survives. Matching that here keeps the adaptive driver, its replay and
+            // `predict()` on one answer rather than splitting the degenerate oracle (#1133).
+            .rposition(|&rt| (rt - t_start).abs() < RESET_MATCH_TOL)
         {
-            u = ode.initial_state(&last_pk.values);
+            // Indexed, not defaulted — see the driver's matching assert. The two used to
+            // fall back to *different* quantities (`pk_readout` there, `last_pk` here), so
+            // a length bug would have split the driver from the verifier that exists to
+            // check it.
+            assert_eq!(
+                event_pk.reset.len(),
+                subject.reset_times.len(),
+                "event_pk.reset must be parallel to subject.reset_times (#1133)"
+            );
+            u = ode.initial_state(&event_pk.reset[r].values);
             reset_floor = t_start;
         }
 
@@ -4689,10 +4748,12 @@ pub fn ode_predictions_event_driven(
     pk_at_dose: &[PkParams],
     pk_at_obs: &[PkParams],
     pk_at_pk_only: &[PkParams],
+    pk_at_reset: &[PkParams],
 ) -> Vec<f64> {
     assert_eq!(pk_at_dose.len(), subject.doses.len());
     assert_eq!(pk_at_obs.len(), subject.obs_times.len());
     assert_eq!(pk_at_pk_only.len(), subject.pk_only_times.len());
+    assert_eq!(pk_at_reset.len(), subject.reset_times.len());
 
     // Resolve modeled-RATE doses to concrete (`Fixed`) doses once (#324), each
     // with its own per-dose PK snapshot `pk_at_dose[k]` (this is the event-driven
@@ -4802,9 +4863,14 @@ pub fn ode_predictions_event_driven(
     ///
     /// A lagged dose *arrival* is not one (its `DoseRecord` at `d.time` is), and
     /// neither is an infusion end, a zero-order cutoff, or a per-route onset.
-    /// `Reset` is excluded to preserve its existing `last_pk` treatment; NONMEM
-    /// does run `$PK` at an EVID=3/4 row, so that is a latent divergence of the
-    /// same family, tracked separately rather than half-fixed here.
+    ///
+    /// `Reset` is a real record — NONMEM runs `$PK` at an EVID=3/4 row — but it is
+    /// excluded here because this predicate answers "which record governs the
+    /// segment *terminating* at index i", and a reset terminates nothing
+    /// observable: the state it would hand on is overwritten by the re-seed.
+    /// Admitting it would only change which snapshot the discarded segment ran
+    /// on. Where the reset row's `$PK` genuinely matters — the `init(...)`
+    /// re-seed — it is read directly from `pk_at_reset` (#1133).
     fn is_record(k: Kind) -> bool {
         matches!(k, Kind::DoseRecord | Kind::PkOnly | Kind::Obs)
     }
@@ -4946,6 +5012,11 @@ pub fn ode_predictions_event_driven(
         match kind {
             Kind::DoseRecord => pk_at_dose[idx],
             Kind::PkOnly => pk_at_pk_only[idx],
+            // Unreachable while `is_record` excludes `Reset`, and spelled out anyway so the
+            // two cannot drift: admitting `Reset` there without this arm would send a reset
+            // index into `pk_at_obs` — a wrong snapshot, or a panic when the subject has
+            // more resets than observations (#1133).
+            Kind::Reset => pk_at_reset[idx],
             _ => pk_at_obs[idx],
         }
     };
@@ -4969,11 +5040,14 @@ pub fn ode_predictions_event_driven(
         // For a record that is itself; for a non-record it is the next record
         // ahead (#1073), which `governing_record` resolved above.
         let pk_now: PkParams = match kind {
-            // A reset zeros the state below and, in ferx, is not treated as a
-            // parameter source: the segment ending at it reuses the previous
-            // record. NONMEM does run `$PK` at an EVID=3/4 row, so this is a
-            // latent divergence of the same family as #1073 — left as-is here
-            // deliberately rather than half-fixed, and tracked separately.
+            // The segment ending at a reset is DISCARDED — the reset arm below
+            // overwrites `u` before any readout — so whichever record governs it
+            // cannot reach a prediction, and `last_pk` here is arithmetic that
+            // never leaves the loop. The reset's own snapshot does matter, but
+            // only to the re-seed, which reads `pk_at_reset[idx]` directly
+            // (#1133). Keeping this arm explicit stops the reset falling into the
+            // `_` branch and taking the *next* record ahead, which would be the
+            // wrong answer if this value ever became observable.
             Kind::Reset => last_pk,
             // `None` only for a subject with no record anywhere in its timeline,
             // which produces no prediction; `last_pk` is the only snapshot that
@@ -5201,12 +5275,24 @@ pub fn ode_predictions_event_driven(
                 // `init(state) = expr` return to their initial value; all
                 // others go to zero (a reset starts a fresh episode from
                 // baseline). With no init declared this zeros everything.
-                // Evaluate init with the params in effect at the reset
-                // (`last_pk`). For EVID=4 the dose at this same time follows
-                // (Reset sorts before Dose), so it lands on the re-seeded
-                // state. Record the reset time so infusions started earlier
-                // stop contributing.
-                u = ode.initial_state(&last_pk.values);
+                //
+                // The seed is evaluated at the RESET ROW'S OWN snapshot
+                // (`pk_at_reset[idx]`), not the previous record's (#1133). An
+                // EVID=3/4 row is a NONMEM data record: `$PK` runs at it, so a
+                // covariate-driven `init(...)` restarts the episode on this
+                // row's covariates. Measured against NONMEM 7.6.0
+                // (`nonmem_anchor/reset_init_snapshot_*.ctl`): carrying the
+                // previous record forward put the whole post-reset trajectory a
+                // factor of two out on a `WT` that doubles at the reset. It is
+                // also not the *next* record ahead — the resolution #1073 uses
+                // for a non-record boundary — which anchor C separates by giving
+                // the following record a third `WT` and getting NONMEM's arm-A
+                // answer back unchanged.
+                //
+                // For EVID=4 the dose at this same time follows (Reset sorts
+                // before Dose), so it lands on the re-seeded state. Record the
+                // reset time so infusions started earlier stop contributing.
+                u = ode.initial_state(&pk_at_reset[idx].values);
                 reset_floor = t_event;
             }
         }
@@ -5620,6 +5706,7 @@ pub fn ode_predictions_event_driven_with_states(
     pk_at_dose: &[PkParams],
     pk_at_obs: &[PkParams],
     pk_at_pk_only: &[PkParams],
+    pk_at_reset: &[PkParams],
 ) -> (Vec<f64>, Vec<Vec<f64>>) {
     // Re-use the standard path to get ipred, then do a second pass to
     // extract states. The event-driven function is already complex enough
@@ -5633,6 +5720,7 @@ pub fn ode_predictions_event_driven_with_states(
         pk_at_dose,
         pk_at_obs,
         pk_at_pk_only,
+        pk_at_reset,
     );
 
     // Second pass: extract the full ODE state at each obs time via
