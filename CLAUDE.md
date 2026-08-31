@@ -94,6 +94,34 @@ After cloning, activate the shared pre-commit hook (blocks commits that fail `ru
 git config core.hooksPath .githooks
 ```
 
+## Before you push: `tools/preflight.sh`
+
+**A green test suite is not a green build.** The CI feature sets are *not nested*:
+`cargo test --features ci,survival` compiles neither the `nn`-gated nor the
+`slow-tests`-gated source, so a file behind those cfgs can be broken while the
+entire suite passes. On #1133 exactly that happened — one struct literal in
+`src/estimation/nn_theta_gradient_tests.rs` turned three CI jobs red after a
+local run of 158 binaries / 4634 tests reported clean.
+
+So run the fast gates before pushing:
+
+```bash
+tools/preflight.sh            # fmt, the 5 cargo check feature sets, clippy, public-API
+tools/preflight.sh check      # just the check matrix, for a tight edit loop
+tools/preflight.sh --list     # show the commands without running them
+```
+
+`.github/workflows/ci.yml` invokes this same script for its `Check`, `Clippy`
+and `Format` jobs, so the local gate and the CI gate cannot drift — the same
+contract `tools/update-public-api.sh` uses for the API baseline, and pinned by
+`tests/preflight_owns_the_fast_gates.rs`. **Add a new gate to the script, not to
+the workflow.** On failure it names the CI job that would have gone red.
+
+Two traps it exists to cover: clippy runs `--all-targets` (without it, every
+`#[cfg(test)]` module and all of `tests/` goes unlinted — #1023), and the
+workspace members need **package-qualified** features (`ferx-core/ci`, not `ci`,
+which fails outright — #1114).
+
 ## Build & Run Commands
 
 ```bash
