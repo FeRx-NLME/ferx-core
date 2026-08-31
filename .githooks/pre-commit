@@ -10,5 +10,15 @@ git diff --cached --name-only | grep -q '\.rs$' || exit 0
 # the hook, the local gate and CI cannot disagree about what "formatted" means.
 # Repeating `cargo fmt` here is how they drifted before: the hook pinned `--all`
 # while nothing guaranteed CI did.
+#
+# The fallback is not defensive padding. `core.hooksPath` points at the hooks in
+# the WORKING TREE, so this file runs against whatever commit is checked out —
+# including one from before #1157, where `tools/preflight.sh` does not exist. A
+# bare `exec` there fails every commit with a raw "No such file or directory".
+# Fall back to the command the script would have run.
 root=$(git rev-parse --show-toplevel) || exit 1
-exec "$root/tools/preflight.sh" fmt
+if [ -x "$root/tools/preflight.sh" ]; then
+  exec "$root/tools/preflight.sh" fmt
+fi
+echo "pre-commit: no tools/preflight.sh on this checkout — running cargo fmt directly" >&2
+exec cargo fmt --all -- --check

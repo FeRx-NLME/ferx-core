@@ -119,7 +119,16 @@ die() {
   echo "────────────────────────────────────────────────────────────────────────────" >&2
   echo "preflight FAILED in group '$CURRENT_GROUP'." >&2
   echo "  command:  $*" >&2
-  echo "  CI job:   $CI_JOB — this is what would have gone red on the PR." >&2
+  # The driver blanks CI_JOB before each group, so an empty one here means the
+  # group function never set it — say so rather than name a job that is not the
+  # one that would go red. Before the driver blanked it, a group that forgot the
+  # assignment silently inherited the PREVIOUS group's job name, which is a
+  # diagnostic that confidently points at the wrong place.
+  if [ -n "$CI_JOB" ]; then
+    echo "  CI job:   $CI_JOB — this is what would have gone red on the PR." >&2
+  else
+    echo "  CI job:   (group '$CURRENT_GROUP' sets no CI_JOB — fix that in the script)" >&2
+  fi
   echo "────────────────────────────────────────────────────────────────────────────" >&2
   exit 1
 }
@@ -259,6 +268,9 @@ fi
 
 for g in "${SELECTED[@]}"; do
   CURRENT_GROUP="$g"
+  # Blank per group: see `die`. Leaving the previous group's value in place makes
+  # a forgotten assignment invisible instead of loud.
+  CI_JOB=""
   echo
   echo "══ $g ═══════════════════════════════════════════════════════════════════"
   # A plain command, deliberately: no `||` here, so nothing suspends `errexit`

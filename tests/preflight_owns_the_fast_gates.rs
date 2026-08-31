@@ -192,13 +192,22 @@ fn the_fast_gate_jobs_delegate_to_preflight_and_never_inline_cargo() {
         // gate into decoration without touching the command list, so neither is visible
         // to the assertions above. If a conditional is ever genuinely wanted here, that
         // is a deliberate edit to this test.
-        for masking in ["continue-on-error", "if:"] {
-            assert!(
-                !body.contains(masking),
-                "job `{job}` uses `{masking}` — a fast gate that can skip itself or report \
-                 green while failing is not a gate (#1157). Job body:\n{body}"
-            );
-        }
+        //
+        // Line-anchored rather than `body.contains("if:")`: a comment or a shell line
+        // that merely mentions the string would false-positive, and a tripwire that
+        // cries wolf gets deleted rather than fixed. A YAML key is the first token on
+        // its line, optionally after a `- `.
+        let masking: Vec<&str> = body
+            .lines()
+            .map(|l| l.trim_start().trim_start_matches("- ").trim_start())
+            .filter(|l| l.starts_with("if:") || l.starts_with("continue-on-error:"))
+            .collect();
+        assert!(
+            masking.is_empty(),
+            "job `{job}` can skip itself or pass while red — a fast gate that does either \
+             is not a gate (#1157):\n  {}",
+            masking.join("\n  ")
+        );
 
         // (2) it must actually call its own group.
         let want = format!("tools/preflight.sh {group}");
@@ -225,16 +234,7 @@ fn the_fast_gate_jobs_delegate_to_preflight_and_never_inline_cargo() {
 #[test]
 fn a_failing_gate_fails_the_script_from_every_position() {
     let root = repo_root();
-    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("preflight-failure-path");
-    std::fs::create_dir_all(&tmp).expect("create temp dir");
-    let counter = tmp.join("count");
-    write_fake_cargo(&tmp);
-
-    let path = format!(
-        "{}:{}",
-        tmp.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
+    let (counter, path) = fake_cargo_on_path("failure-path");
 
     for group in ["fmt", "check", "clippy"] {
         let listed = listed_commands(group);
@@ -287,6 +287,72 @@ fn a_failing_gate_fails_the_script_from_every_position() {
             );
         }
     }
+}
+
+/// Install the fake `cargo` in its own directory and return `(counter file, PATH)`.
+///
+/// Each caller gets its own directory so the invocation counter cannot be shared —
+/// integration tests in one binary run on parallel threads.
+fn fake_cargo_on_path(slot: &str) -> (PathBuf, String) {
+    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("preflight-{slot}"));
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+    write_fake_cargo(&tmp);
+    let path = format!(
+        "{}:{}",
+        tmp.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    (tmp.join("count"), path)
+}
+
+/// The failure diagnostic must name the group that actually failed, and its CI job.
+///
+/// Only a MULTI-group run can see this. `CI_JOB` is a script-global assigned at the top
+/// of each `group_*` function, so a group that forgets the assignment inherits the
+/// previous group's value and the diagnostic then points confidently at the wrong
+/// workflow job — worse than no diagnostic, because it sends you to a green log. The
+/// per-position test above runs one group per process, where a stale value is
+/// unreachable by construction.
+#[test]
+fn the_failure_diagnostic_names_the_group_that_actually_failed() {
+    let (counter, path) = fake_cargo_on_path("group-attribution");
+    let _ = std::fs::remove_file(&counter);
+
+    // `fmt` is one command, so invocation 2 is the first command of `check`: fmt has
+    // already passed, and the run is inside the second group when it dies.
+    let out = Command::new("bash")
+        .arg(preflight())
+        .arg("fmt")
+        .arg("check")
+        .current_dir(repo_root())
+        .env("PATH", &path)
+        .env("FAKE_CARGO_COUNT", &counter)
+        .env("FAKE_CARGO_FAIL_AT", "2")
+        .output()
+        .expect("run tools/preflight.sh fmt check");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "exited 0 with a failing command\n{stderr}"
+    );
+    assert!(
+        stderr.contains("group 'check'"),
+        "the failure happened in `check` but the diagnostic does not say so:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Check"),
+        "the diagnostic does not name the `Check` CI job:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Format"),
+        "the diagnostic blames `Format`, the group that PASSED — a stale CI_JOB sends \
+         the reader to a green log:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("sets no CI_JOB"),
+        "the `check` group set no CI_JOB at all:\n{stderr}"
+    );
 }
 
 /// A `cargo` that succeeds until its `FAKE_CARGO_FAIL_AT`-th invocation.
@@ -429,6 +495,29 @@ fn preflight_is_executable_and_lists_every_group() {
         ("clippy", 2),     // ferx-core --all-targets · members
         ("public-api", 1), // tools/update-public-api.sh --check
     ];
+
+    // Every group `--list` actually walks must have an entry above. The loop below
+    // iterates `expected`, not the groups, so without this a fifth group added to
+    // `ALL_GROUPS` would get no count tripwire at all — it would simply never be
+    // looked at, which is the silent-shrinkage failure one level up.
+    let walked: Vec<&str> = stdout
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("══ "))
+        .filter_map(|l| l.split_whitespace().next())
+        .collect();
+    for g in &walked {
+        assert!(
+            expected.iter().any(|(e, _)| e == g),
+            "group `{g}` runs but has no expected command count in this test — add one, \
+             or it is gated by nothing.\ngroups walked: {walked:?}"
+        );
+    }
+    assert_eq!(
+        walked.len(),
+        expected.len(),
+        "`--list` walked {walked:?} but this test expects {} group(s)",
+        expected.len()
+    );
 
     for (group, want) in expected {
         let banner = format!("══ {group} ");
