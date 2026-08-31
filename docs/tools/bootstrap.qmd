@@ -202,7 +202,7 @@ answers. PsN's user guide treats them as one recovery section; ferx splits them 
 |---|---|
 | too many samples were filtered out | `--summarize` — nothing needs refitting, only the exclusion criteria change |
 | the process was killed, the machine crashed, the job hit a wall clock | `--resume` — refit only the samples that never finished |
-| some samples failed for a reason you have since fixed | `--resume --retry-failed` |
+| some samples failed for a transient reason (out of memory, full disk) that has since gone away | `--resume --retry-failed` |
 
 ```bash
 # The run dies at sample 137 of 200.

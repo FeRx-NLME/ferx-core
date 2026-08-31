@@ -167,6 +167,77 @@ fn reopening_rewrites_the_kept_rows_over_a_damaged_file() {
     // And the file is well-formed again: every row is full width.
     assert!(raw.iter().all(|r| r.len() == raw[0].len()), "{raw:?}");
     assert_eq!(read(&dir.path().join("included_keys1.csv")).len(), 2);
+    // The rewrite went through temp siblings; none of them are left behind.
+    for name in [
+        "raw_results.csv",
+        "included_individuals1.csv",
+        "included_keys1.csv",
+        "sample_keys1.csv",
+    ] {
+        let part = dir.path().join(format!("{name}.part"));
+        assert!(!part.exists(), "{} left behind", part.display());
+    }
+}
+
+/// The headers have to reach disk when the journal is opened, not when the
+/// first replicate finishes. A run killed during the base fit — often the
+/// longest single fit — would otherwise leave a `raw_results.csv` that exists
+/// but is empty, which `--resume` rejects as a malformed header instead of
+/// reporting that there is nothing to resume.
+#[test]
+fn the_headers_reach_disk_before_the_first_append() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    // Read while the journal is still open: dropping it would flush, so a
+    // test that closes it first cannot see the difference.
+    let journal = open(dir.path(), &[], &[]);
+
+    let raw = read(&dir.path().join("raw_results.csv"));
+    assert_eq!(raw.len(), 1, "header on disk already: {raw:?}");
+    assert_eq!(raw[0][0], "sample");
+    assert_eq!(
+        read(&dir.path().join("sample_keys1.csv")),
+        vec![subject_ids()]
+    );
+
+    journal.into_result().expect("no write error");
+}
+
+/// The rewrite must never be the only copy of the recovery data. When it fails
+/// part-way through, the interrupted run's artefacts are still on disk exactly
+/// as they were — the swap into place happens only once every file is complete.
+#[test]
+fn a_failed_reopen_leaves_the_previous_files_intact() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let raw_path = dir.path().join("raw_results.csv");
+    let journal = open(dir.path(), &[], &[]);
+    for i in [1usize, 2] {
+        journal.append(&replicate(i), Some(&draw(i)));
+    }
+    journal.into_result().expect("no write error");
+    let before = std::fs::read_to_string(&raw_path).expect("read");
+
+    // A directory in the way of the third file's temp sibling: the rewrite
+    // fails there, with the first two already written.
+    std::fs::create_dir(dir.path().join("included_keys1.csv.part")).expect("mkdir");
+
+    let err = Journal::create(
+        dir.path(),
+        &names(),
+        &subject_ids(),
+        None,
+        &[replicate(1), replicate(2)],
+        &[draw(1), draw(2)],
+        &BootstrapOptions::default(),
+    )
+    .map(|_| ())
+    .expect_err("the rewrite fails");
+    assert!(err.contains("included_keys1.csv.part"), "{err}");
+
+    assert_eq!(std::fs::read_to_string(&raw_path).expect("read"), before);
+    assert!(
+        !dir.path().join("raw_results.csv.part").exists(),
+        "the temp siblings are cleaned up"
+    );
 }
 
 /// `--keep-covariance` and `--dofv` widen the row. The journal has to use the

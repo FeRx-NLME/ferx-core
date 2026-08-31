@@ -67,6 +67,22 @@ fn truncate(path: &Path) -> Result<(), String> {
         .map_err(|e| format!("cannot create `{}`: {e}", path.display()))
 }
 
+/// The temp sibling a per-replicate file is rewritten through. It sits in the
+/// same directory, so the `rename` that swaps it in is atomic.
+fn part_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".part");
+    path.with_file_name(name)
+}
+
+/// Best-effort cleanup of the temp siblings after a failed rewrite. A leftover
+/// `.part` file is harmless — the next `create` truncates it — but noisy.
+fn remove_parts(paths: &[PathBuf; 4]) {
+    for path in paths {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 pub fn raw_results_path(dir: &Path) -> PathBuf {
     dir.join("raw_results.csv")
 }
@@ -85,6 +101,11 @@ impl Journal {
     /// straight onto a file whose last line was cut mid-field would splice the
     /// fragment and the new row into one corrupt record.
     ///
+    /// The rewrite goes through `.part` siblings that are renamed into place
+    /// only once they are complete, so the live files are never the only copy
+    /// of the recovery data: a failure or a kill part-way through leaves the
+    /// interrupted run's artefacts exactly as they were.
+    ///
     /// `draws` must cover every index in `kept` — it always does, because the
     /// draws are recomputed for `1..=samples` before anything is fitted.
     #[allow(clippy::too_many_arguments)]
@@ -100,20 +121,74 @@ impl Journal {
         std::fs::create_dir_all(dir)
             .map_err(|e| format!("cannot create bootstrap directory `{}`: {e}", dir.display()))?;
 
-        let raw_path = raw_results_path(dir);
-        let individuals_path = dir.join("included_individuals1.csv");
-        let keys_path = dir.join("included_keys1.csv");
-        let sample_keys_path = dir.join("sample_keys1.csv");
-        for path in [&raw_path, &individuals_path, &keys_path, &sample_keys_path] {
+        let final_paths = [
+            raw_results_path(dir),
+            dir.join("included_individuals1.csv"),
+            dir.join("included_keys1.csv"),
+            dir.join("sample_keys1.csv"),
+        ];
+        let temp_paths = [
+            part_path(&final_paths[0]),
+            part_path(&final_paths[1]),
+            part_path(&final_paths[2]),
+            part_path(&final_paths[3]),
+        ];
+
+        let journal = match Journal::seed(
+            &temp_paths,
+            parameter_names,
+            subject_ids,
+            kept_original,
+            kept,
+            draws,
+            options,
+        ) {
+            Ok(journal) => journal,
+            Err(e) => {
+                remove_parts(&temp_paths);
+                return Err(e);
+            }
+        };
+
+        for (temp, final_path) in temp_paths.iter().zip(final_paths.iter()) {
+            if let Err(e) = std::fs::rename(temp, final_path) {
+                remove_parts(&temp_paths);
+                return Err(format!(
+                    "cannot move `{}` into place at `{}`: {e}",
+                    temp.display(),
+                    final_path.display()
+                ));
+            }
+        }
+        Ok(journal)
+    }
+
+    /// Write the headers and the reused rows into `paths` — the temp siblings
+    /// [`Journal::create`] renames into place once they are complete.
+    ///
+    /// The returned journal's handles are the ones opened here: a `rename`
+    /// follows the inode, not the name, so they keep appending to the same
+    /// files after the swap and never have to be reopened.
+    #[allow(clippy::too_many_arguments)]
+    fn seed(
+        paths: &[PathBuf; 4],
+        parameter_names: &[String],
+        subject_ids: &[String],
+        kept_original: Option<&ReplicateResult>,
+        kept: &[ReplicateResult],
+        draws: &[Replicate],
+        options: &BootstrapOptions,
+    ) -> Result<Journal, String> {
+        for path in paths {
             truncate(path)?;
         }
 
         let journal = Journal {
             files: Mutex::new(Files {
-                raw: append_writer(&raw_path)?,
-                included_individuals: append_writer(&individuals_path)?,
-                included_keys: append_writer(&keys_path)?,
-                sample_keys: append_writer(&sample_keys_path)?,
+                raw: append_writer(&paths[0])?,
+                included_individuals: append_writer(&paths[1])?,
+                included_keys: append_writer(&paths[2])?,
+                sample_keys: append_writer(&paths[3])?,
             }),
             error: Mutex::new(None),
             n_params: parameter_names.len(),
@@ -127,13 +202,21 @@ impl Journal {
             files
                 .raw
                 .write_record(&header)
-                .map_err(|e| format!("cannot write `{}`: {e}", raw_path.display()))?;
+                .map_err(|e| format!("cannot write `{}`: {e}", paths[0].display()))?;
             // `sample_keys1.csv` is the only per-replicate file with a header:
             // one column per original subject.
             files
                 .sample_keys
                 .write_record(subject_ids)
-                .map_err(|e| format!("cannot write `{}`: {e}", sample_keys_path.display()))?;
+                .map_err(|e| format!("cannot write `{}`: {e}", paths[3].display()))?;
+            // Flush the headers here rather than leaving them to the first
+            // `append`. A run killed during the base fit — often the longest
+            // single fit — would otherwise leave a `raw_results.csv` that exists
+            // but is empty, which `--resume` rejects as a malformed header
+            // instead of reporting that there is nothing to resume.
+            for flush in [files.raw.flush(), files.sample_keys.flush()] {
+                flush.map_err(|e| format!("cannot flush the bootstrap journal: {e}"))?;
+            }
         }
 
         if let Some(original) = kept_original {
