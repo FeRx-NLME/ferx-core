@@ -722,16 +722,63 @@ fn resuming_a_directory_with_no_run_in_it_is_refused() {
     assert!(err.contains("bootstrap_run.json"), "{err}");
 }
 
-/// With `--no-run-base-model` the stored base fit is not part of this run, so
-/// carrying it forward would reintroduce a `sample = 0` row the user asked not
-/// to have.
+/// Changing where the replicates *start* is the subtle mismatch, and the one
+/// that would otherwise pass every other check.
+///
+/// Interrupt a default run and resume it with `--no-update-inits`: every reused
+/// replicate was started from the base fit, every refitted one starts from the
+/// model file's estimates. Both halves are valid fits; the file holding them is
+/// a bootstrap of neither, and nothing about it looks wrong.
 #[test]
-fn a_resume_without_the_base_model_drops_the_stored_base_fit() {
+fn a_resume_that_moves_the_replicate_starting_point_is_refused() {
     let dir = tempfile::tempdir().expect("temp dir");
     let mut options = resume_options(dir.path());
     interrupted_run(dir.path(), 2, &options);
+
+    options.update_inits = false;
+    let err = load_resumable(dir.path(), &resume_manifest(&options), &options).unwrap_err();
+    assert!(err.contains("--update-inits"), "{err}");
+
+    // And the inverse: a run started from the model file, resumed asking for
+    // the base fit's estimates.
+    let other = tempfile::tempdir().expect("temp dir");
+    let mut options = resume_options(other.path());
+    options.update_inits = false;
+    interrupted_run(other.path(), 2, &options);
+
+    options.update_inits = true;
+    let err = load_resumable(other.path(), &resume_manifest(&options), &options).unwrap_err();
+    assert!(err.contains("--update-inits"), "{err}");
+}
+
+/// `--no-run-base-model` moves the starting point too — and changes whether a
+/// `sample = 0` row belongs in the file at all — so it is pinned in its own
+/// right rather than left to the initialization-mode check.
+#[test]
+fn a_resume_that_adds_or_drops_the_base_model_is_refused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut options = resume_options(dir.path());
+    interrupted_run(dir.path(), 2, &options);
+
     options.run_base_model = false;
     options.update_inits = false;
+    let err = load_resumable(dir.path(), &resume_manifest(&options), &options).unwrap_err();
+    assert!(err.contains("--run-base-model"), "{err}");
+}
+
+/// When the directory really was written without a base model, a stored
+/// `sample = 0` row is not carried forward — it would reappear as a row the
+/// caller asked not to have. The manifest refuses that transition first, so this
+/// covers a library caller that built its own manifest.
+#[test]
+fn a_run_without_a_base_model_drops_a_stored_base_fit() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let options = BootstrapOptions {
+        run_base_model: false,
+        update_inits: false,
+        ..resume_options(dir.path())
+    };
+    interrupted_run(dir.path(), 2, &options);
 
     let (original, kept) =
         load_resumable(dir.path(), &resume_manifest(&options), &options).expect("resume loads");

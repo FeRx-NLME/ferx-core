@@ -914,9 +914,11 @@ fn load_resumable(
     }
     kept.sort_by_key(|r| r.index);
 
-    // With `--no-run-base-model` the stored base fit is not part of this run,
-    // so it is not carried forward — and must not be, or it would reappear as a
-    // `sample = 0` row the user asked not to have.
+    // With `run_base_model = false` the stored base fit is not part of this run,
+    // so it is not carried forward — it would reappear as a `sample = 0` row the
+    // caller asked not to have. Through the CLI the manifest refuses that
+    // transition before reaching here (it also changes where every replicate
+    // starts); this covers a library caller that built its own manifest.
     let original = original
         .filter(|_| options.run_base_model)
         .filter(|r| keep(r));

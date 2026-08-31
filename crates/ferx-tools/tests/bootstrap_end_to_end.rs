@@ -444,6 +444,45 @@ fn resuming_a_directory_from_a_different_seed_is_refused() {
     assert!(err.contains("--seed"), "{err}");
 }
 
+/// The mismatch that passes every other check: interrupt a default run and
+/// resume it with `--no-update-inits`, and the reused replicates were started
+/// from the base fit while the refitted ones start from the model file. Both
+/// halves are valid fits, the file holding them is a bootstrap of neither, and
+/// nothing about it looks wrong.
+#[test]
+fn resuming_with_a_different_replicate_starting_point_is_refused() {
+    let mut p = prepared();
+    p.parsed.fit_options.outer_maxiter = 1;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    run_bootstrap(&p, &resume_options(dir.path())).expect("the first pass");
+
+    let err = run_bootstrap(
+        &p,
+        &BootstrapOptions {
+            resume: true,
+            update_inits: false,
+            ..resume_options(dir.path())
+        },
+    )
+    .expect_err("changing where the replicates start must refuse the resume");
+    assert!(err.contains("--update-inits"), "{err}");
+
+    // `--no-run-base-model` moves the starting point too, and changes whether a
+    // `sample = 0` row belongs in the file at all.
+    let err = run_bootstrap(
+        &p,
+        &BootstrapOptions {
+            resume: true,
+            run_base_model: false,
+            update_inits: false,
+            ..resume_options(dir.path())
+        },
+    )
+    .expect_err("dropping the base model must refuse the resume");
+    assert!(err.contains("--run-base-model"), "{err}");
+}
+
 /// A fresh run writes its manifest before the first fit, so a process killed at
 /// any point leaves a directory the next `--resume` can check itself against.
 #[test]

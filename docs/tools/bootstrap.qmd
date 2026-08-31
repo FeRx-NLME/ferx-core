@@ -236,9 +236,10 @@ does not touch it. Change your mind about those with `--summarize`.
 ### Resuming the wrong directory is refused
 
 Every run writes `bootstrap_run.json` beside its CSVs, recording the seed, sample count,
-sample size, stratification column, `--keep-covariance` / `--dofv`, the parameter names,
-and SHA-256 hashes of the model file and the dataset. A `--resume` whose options or inputs
-disagree is refused, naming the field that differs:
+sample size, stratification column, `--keep-covariance` / `--dofv`, what the replicates
+were started from (`--update-inits` / `--run-base-model`), the parameter names, and SHA-256
+hashes of the model file and the dataset. A `--resume` whose options or inputs disagree is
+refused, naming the field that differs:
 
 ```
 --resume: `run12-bootstrap` was created with --seed 1, but this run asks for 42.
@@ -249,6 +250,12 @@ Use a fresh --directory, or drop the conflicting option.
 Without that check the resumed file would carry one model's estimates under another
 model's column names — a corruption nothing downstream could detect, because the file
 would still parse and the statistics would still compute.
+
+The subtlest case the check covers is `--update-inits`. Interrupt a default run and resume
+it with `--no-update-inits`, and every reused replicate was started from the base fit while
+every refitted one starts from the model file's estimates. Both halves are perfectly good
+fits; the file holding them is a bootstrap of neither. So the starting point is pinned like
+everything else, and changing it means a fresh `--directory`.
 
 A run killed mid-write leaves a partial trailing row. It is dropped and that one sample
 refitted; only the tail is treated this way, and a malformed row anywhere else is an

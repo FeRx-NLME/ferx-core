@@ -64,8 +64,10 @@ section of the SDLC for the versioning policy).
   statistically, which is what PsN's shared, order-dependent RNG can offer. A replicate whose fit
   *errored* is carried forward by default, as in PsN; `--retry-failed` refits those instead, for a
   failure that was a transient resource problem. Every run now writes `bootstrap_run.json`
-  recording its seed, options and the hashes of the model and data files, and a `--resume` whose
-  inputs or options disagree is refused, naming the field. A trailing row cut off by a hard kill is
+  recording its seed, options — including what the replicates were started from, so a resume
+  cannot mix replicates begun at the base fit with replicates begun at the model file's
+  estimates — and the hashes of the model and data files; a `--resume` whose inputs or options
+  disagree is refused, naming the field. A trailing row cut off by a hard kill is
   dropped and that sample refitted. `raw_results.csv` now carries full round-trip precision rather
   than ten fixed decimals, because a resumed run's replicates start from the base-fit estimates read
   back out of it; the statistics files are unchanged. See `docs/tools/bootstrap.qmd`.

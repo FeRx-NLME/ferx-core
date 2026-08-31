@@ -33,6 +33,34 @@ fn the_manifest_records_the_run_inputs() {
     assert_eq!(m.model_hash.as_deref(), Some("model-hash"));
     assert_eq!(m.parameter_names, names());
     assert!(!m.keep_covariance && !m.dofv);
+    assert!(m.run_base_model);
+    assert_eq!(m.replicate_inits, "base_fit");
+}
+
+/// The recorded mode is the *effective* one, not the raw `update_inits` flag.
+///
+/// `update_inits` does nothing without a base fit, so a caller that sets it
+/// alongside `run_base_model = false` is asking for the model file's estimates
+/// just as plainly as one that left it off. Comparing the raw flags would refuse
+/// a resume that changes nothing.
+#[test]
+fn the_recorded_initialization_mode_is_the_effective_one() {
+    let base = |run_base_model, update_inits| BootstrapOptions {
+        run_base_model,
+        update_inits,
+        ..BootstrapOptions::default()
+    };
+    assert_eq!(describe_replicate_inits(&base(true, true)), "base_fit");
+    assert_eq!(describe_replicate_inits(&base(true, false)), "model_file");
+    assert_eq!(describe_replicate_inits(&base(false, false)), "model_file");
+    // `update_inits` with nothing to take inits from resolves to the model file,
+    // and so must not differ from the flag being off.
+    assert_eq!(describe_replicate_inits(&base(false, true)), "model_file");
+
+    let manifest_of = |o| RunManifest::new(&o, None, None, &names());
+    assert!(manifest_of(base(false, true))
+        .check_compatible(&manifest_of(base(false, false)), Path::new("run"))
+        .is_ok());
 }
 
 #[test]
@@ -107,6 +135,20 @@ fn each_differing_field_refuses_the_resume_by_name() {
             "--stratify-on",
             RunManifest {
                 stratify_on: Some("STUD".to_string()),
+                ..disk.clone()
+            },
+        ),
+        (
+            "--run-base-model",
+            RunManifest {
+                run_base_model: false,
+                ..disk.clone()
+            },
+        ),
+        (
+            "--update-inits",
+            RunManifest {
+                replicate_inits: "model_file".to_string(),
                 ..disk.clone()
             },
         ),

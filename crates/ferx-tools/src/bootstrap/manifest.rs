@@ -24,6 +24,11 @@ pub struct RunManifest {
     /// [`SampleSize`] rendered as a stable string — see [`describe_sample_size`].
     pub sample_size: String,
     pub stratify_on: Option<String>,
+    /// Whether a `sample = 0` base-model row is part of this run.
+    pub run_base_model: bool,
+    /// What every replicate's fit is started from — see
+    /// [`describe_replicate_inits`].
+    pub replicate_inits: String,
     /// SHA-256 of the model file, as `ferx_core::PreparedRun` computed it.
     pub model_hash: Option<String>,
     /// SHA-256 of the dataset.
@@ -54,6 +59,30 @@ pub fn describe_sample_size(size: &SampleSize) -> String {
     }
 }
 
+/// What every replicate's fit is started from: `"base_fit"` or `"model_file"`.
+///
+/// Recorded as the one *effective* mode rather than as the two flags that
+/// produce it, because that is what `run_bootstrap` actually branches on:
+///
+/// ```text
+/// let replicate_init = match (&original, options.update_inits) {
+///     (Some(base), true) => params_from_estimates(template, &base.estimates),
+///     _ => template.clone(),
+/// };
+/// ```
+///
+/// `update_inits` has no effect without a base fit, so a caller that sets it
+/// alongside `run_base_model = false` is asking for the model file's estimates
+/// just as plainly as one that left it off — refusing *that* resume would be
+/// refusing a no-op. Comparing the two raw flags would do exactly that.
+pub fn describe_replicate_inits(options: &BootstrapOptions) -> &'static str {
+    if options.run_base_model && options.update_inits {
+        "base_fit"
+    } else {
+        "model_file"
+    }
+}
+
 impl RunManifest {
     /// The manifest describing the run `options` is about to perform.
     pub fn new(
@@ -67,6 +96,8 @@ impl RunManifest {
             samples: options.samples,
             sample_size: describe_sample_size(&options.sample_size),
             stratify_on: options.stratify_on.clone(),
+            run_base_model: options.run_base_model,
+            replicate_inits: describe_replicate_inits(options).to_string(),
             model_hash,
             data_hash,
             keep_covariance: options.keep_covariance,
@@ -138,6 +169,31 @@ impl RunManifest {
                 "--stratify-on",
                 show(&disk.stratify_on),
                 show(&self.stratify_on),
+            );
+        }
+        // The initialization mode is the subtle one, and the reason it is
+        // pinned rather than tolerated: interrupt a default run and resume it
+        // with `--no-update-inits` and every reused replicate was started from
+        // the base fit while every refitted one starts from the model file's
+        // estimates. Both halves are valid fits; the file holding them is not a
+        // bootstrap of either, and nothing about it looks wrong.
+        if self.run_base_model != disk.run_base_model {
+            let show = |v: bool| if v { "on" } else { "off" };
+            return refuse(
+                "--run-base-model",
+                show(disk.run_base_model).to_string(),
+                show(self.run_base_model).to_string(),
+            );
+        }
+        if self.replicate_inits != disk.replicate_inits {
+            let show = |v: &str| match v {
+                "base_fit" => "the base fit's estimates (--update-inits)".to_string(),
+                _ => "the model file's estimates (--no-update-inits)".to_string(),
+            };
+            return refuse(
+                "replicates started from",
+                show(&disk.replicate_inits),
+                show(&self.replicate_inits),
             );
         }
         if self.keep_covariance != disk.keep_covariance {
