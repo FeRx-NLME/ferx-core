@@ -8948,9 +8948,13 @@ fn ode_ss_bare_time_builtin_rhs_routes_to_fd() {
     // The non-SS neighbour must be unaffected: this gate is about steady state,
     // not about `TIME`, so widening it must not sweep up an ordinary subject. Use
     // a TV-covariate subject, which reaches `ode_tvcov_supported`'s trigger list
-    // on its own — a plain bolus subject returns `false` here for the unrelated
-    // reason that it has no trigger at all and takes the *static* dual walk, which
-    // would make this a vacuous assert.
+    // through a trigger that is *independent of the model-time clause* — so the
+    // assert stays sharp no matter what that clause is set to. (It used to be the
+    // only way to make this non-vacuous at all: the trigger list asked the narrow
+    // predicate, so a plain bolus subject on this model had no trigger and took
+    // the static dual walk. The list asks the wide predicate now, so a plain bolus
+    // subject would also pass — but via the very clause under test, which is
+    // exactly the circularity the TV-cov subject avoids.)
     let plain = tad_gate_subject();
     assert!(
         !plain.has_periodic_ss_dose() && plain.has_tv_covariates(),
@@ -8960,6 +8964,54 @@ fn ode_ss_bare_time_builtin_rhs_routes_to_fd() {
         ode_tvcov_supported(&model, &plain),
         "a non-SS subject on the same `TIME`-reading model must keep the event-driven \
          dual walk — the SS clause must not sweep it up"
+    );
+}
+
+/// A pre-arrival observation on a model-time-reading RHS must take the
+/// **event-driven** dual walk, not the static one.
+///
+/// The static walk resolves `TAD`'s anchor as
+/// `doses.filter(|dt| dt <= t_start).fold(NEG_INFINITY, f64::max)`, so a segment
+/// starting before the first dose leaves it at `-inf`, and `eval_rhs_anchored`
+/// turns a missing/non-finite anchor into `TAD = NaN` — poisoning every
+/// `∂f/∂θ` and `∂f/∂η` for the subject. The event-driven walk seeds the same
+/// variable at the first arrival instead (that is #1073's pre-arrival anchor,
+/// which the static walk never received).
+///
+/// Nothing forces the routing on its own: with the model-time clause narrow, a
+/// plain bolus subject on this model had no trigger at all and fell to the
+/// static walk, so the `NaN` was reachable. This asserts the clause that now
+/// keeps it away — and the preconditions below make the assert non-vacuous by
+/// ruling out every *other* trigger, so it can only be passing for the reason
+/// it claims.
+#[test]
+fn a_pre_arrival_observation_on_a_tad_rhs_takes_the_event_driven_walk() {
+    let model = tad_gate_model("TAD", "");
+    let mut subject = bolus_subject_wt(&[0.4, 2.0, 4.0], 70.0);
+    // Move the dose after the first observation: that observation is now
+    // pre-arrival, which is the window with no qualifying dose.
+    subject.doses[0].time = 1.0;
+    assert!(
+        subject.obs_times[0] < subject.doses[0].time,
+        "precondition: the first observation must precede the first dose"
+    );
+    // No other trigger — otherwise this passes for an unrelated reason.
+    assert!(
+        !subject.has_tv_covariates()
+            && !subject.has_resets()
+            && !subject.has_periodic_ss_dose()
+            && !model.has_lagtime()
+            && !model.has_route_absorption_lag(),
+        "precondition: the model-time clause must be the only trigger in play"
+    );
+    assert!(
+        ode_analytical_supported(&model),
+        "precondition: the analytic ODE route must be available at all"
+    );
+    assert!(
+        ode_tvcov_supported(&model, &subject),
+        "a model-time-reading RHS must take the event-driven dual walk; on the \
+         static walk the pre-arrival segment has no dose anchor and `TAD` is NaN"
     );
 }
 

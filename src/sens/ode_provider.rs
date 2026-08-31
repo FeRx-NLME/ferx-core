@@ -653,36 +653,32 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     // event times), so it routes through the event-driven walk even with no TV
     // covariates — mirroring the closed-form `subject_sensitivities_tvcov` (#486).
     //
-    // Deliberately the **narrow** predicate, not `reads_model_time`. This clause asks
-    // whether the *PK parameters* move between events, which is what makes the static
-    // superposition walk's single snapshot wrong; a non-autonomous `[odes]` RHS is a
-    // different question and the static walk handles it. #1124 review asked whether
-    // widening the value-path routing (`pk::model_uses_time_anywhere`) without widening
-    // this one re-creates a value/gradient engine split. Measured against central FD of
-    // the production predictor, worst relative error over all observations, two bolus
-    // doses, `reltol = 1e-10`:
+    // The **wide** predicate, matching the value path's routing
+    // (`pk::model_uses_time_anywhere`). A non-autonomous `[odes]` RHS is as much a
+    // reason to take the event-driven walk as a per-event PK parameter is: production
+    // integrates such a model on `ode_predictions_event_driven`, so evaluating its
+    // gradient on the static superposition walk puts the value and the jet on two
+    // engines that break the timeline at different points.
     //
-    // | RHS                     | value    | `∂f/∂η`  | `∂f/∂θ`  |
-    // |-------------------------|----------|----------|----------|
-    // | `0.3*TAD`               | 8.9e-12  | 1.5e-9   | 3.0e-10  |
-    // | `0.03*TIME`             | 1.0e-12  | 6.4e-10  | 5.0e-11  |
-    // | `if (TIME > 3) {…}`     | 7.0e-9   | 4.6e-3   | 4.8e-4   |
+    // This clause was deliberately left narrow when the value path was widened, on the
+    // argument that the two walks anchor `TAD`/`TIME` identically for every subject that
+    // can reach the static walk — every genuinely divergent condition (a lagtime, TV
+    // covariates, SS, a modeled dose) being in the trigger list already. Measured
+    // against central FD of the production predictor at `reltol = 1e-10`, two bolus
+    // doses, that held: `0.3*TAD` agreed to 1.5e-9 on `∂f/∂η`, `0.03*TIME` to 6.4e-10.
     //
-    // The `if` row is FD noise, not a defect: the RHS is discontinuous at `t = 3`, so
-    // the adaptive stepper places steps differently either side and the *value* is only
-    // good to ~1e-8. Refining `h` makes it worse and tightening `reltol` makes it better
-    // — the signature of `eps_value / h`, not of a wrong jet. Swept at `reltol = 1e-10`:
-    // `h = 1e-3 → 1.5e-6`, `1e-5 → 3.3e-5`, `1e-7 → 2.7e-2`; at `reltol = 1e-12` the
-    // same points are `1.2e-7`, `5.0e-6`, `5.4e-4`. The smooth-`TIME` control stays at
-    // ~1e-9 across the whole sweep.
+    // The argument had a hole and the measurement did not cover it: **`subject.has_resets()`
+    // is not in the trigger list**, while it *is* in the value path's condition
+    // (`pk/mod.rs`). An EVID 3/4 reset subject with no TV covariates, no lagtime, no SS
+    // and fixed doses therefore had its value integrated event-driven and its gradient
+    // taken on the static walk, which re-anchors `TAD` differently across the reset. The
+    // two-bolus fixtures behind the table above contain no reset, so nothing measured it.
     //
-    // So the split is real in structure and empty in effect: for the subjects that reach
-    // it, the static walk anchors `TAD`/`TIME` the same way the event-driven one does.
-    // The conditions under which the two walks genuinely diverge — a lagtime, TV
-    // covariates, SS, resets, a modeled dose — are all already in the trigger list
-    // below, so such a subject never lands on the static walk in the first place.
-    // Widen this only with a case that measures a divergence.
-    let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
+    // Widening here closes that without needing a reset-specific clause: any subject on a
+    // non-autonomous RHS now takes the same walk its value does. The cost is that a
+    // `TAD`-reading model with no other trigger moves from the static jet to the
+    // event-driven one — the more general walk, and the one the value path already uses.
+    let uses_time = crate::pk::model_uses_time_anywhere(model);
     // A per-route absorption lag (`fn(..., lag=L)`, #859) makes each route's onset a moving
     // boundary (`t_dose + lag_cmt + lag_route`) with its own rate-on saltation — the same
     // event-time-shift family as a compartment lagtime — so it forces the event-driven walk

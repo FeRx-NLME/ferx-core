@@ -700,13 +700,40 @@ pub(crate) fn mr_scope<'a>(
 /// parameter-dependent `route_flips` domain check. Keyed on `(spec, subject)`
 /// alone the gate would validate only the **first** `(θ, η)` a fit visits — the
 /// initial estimates, where models are best behaved — and never re-check a closed
-/// form degrading toward a `ka ≈ ke` or `α ≈ β` confluence as the optimiser walks.
+/// form degrading toward an `α ≈ β` confluence as the optimiser walks.
 ///
 /// Bucketing on `round(10 · log₁₀ p)` re-verifies whenever any disposition
 /// parameter moves by more than ~26% (a decade split into ten), which is far
 /// finer than the drift that turns a well-conditioned closed form marginal, while
 /// still collapsing the thousands of near-identical evaluations within one
 /// optimiser step.
+///
+/// **What the bucket does not cover**, so nobody relies on it for more than it is:
+///
+///   - **Absorption.** [`DispParams`] carries only `cl`, `v` and an optional
+///     `(q, v2)`. `ka`, per-route `lag`, `F`, `FR`, and the transit/IG shape
+///     parameters live in `pk.values`, are read by `route_flips` and
+///     `mr_observable_g`, and are **not** in the key. A fit with θ-only
+///     disposition and estimated absorption keeps one bucket throughout, so the
+///     gate runs once — including across a `ka ≈ ke` confluence, which is why
+///     that example is no longer named above as something the bucket catches.
+///   - **The `OdeSpec` address.** Reusing a freed spec's address is not rare: a
+///     parse → use → drop loop (a bootstrap, a VPC, repeated `ferx_fit` calls)
+///     hands out the same address repeatedly, measured 8/8 in a probe. Two models
+///     differing only in an unkeyed parameter then share a key exactly.
+///   - **`solver_opts.reltol`.** `verify_tol` is derived from it, but
+///     `sync_ode_solver_opts` mutates it in place on the same spec, so a second
+///     fit at a *tighter* tolerance hits the memo and is never re-checked at the
+///     stricter bound.
+///   - **The subject's schedule.** Only `subject.id` is keyed, not the doses or
+///     observation times, so a single-dose verdict is reused for a multi-dose
+///     regimen on the same id — the case CLAUDE.md's non-degeneracy rule says
+///     must always be checked, and the one superposition most needs checked.
+///
+/// The gate is also `#[cfg(debug_assertions)]`, and every profile CI builds tests
+/// with inherits `release`, so none of this runs in CI or in a user's fit — that
+/// is the already-tracked #344. Treat the gate as a local development aid, not as
+/// the reason admitting a closed form is safe.
 #[cfg(debug_assertions)]
 type MrVerifyKey = (usize, String, Vec<i32>);
 
@@ -1405,6 +1432,96 @@ mod tests {
             fremtype: Vec::new(),
             obs_records: vec![],
         }
+    }
+
+    /// An EVID=2 record must not abort a *parameter-static* subject on either
+    /// route into the event-driven walker.
+    ///
+    /// End-to-end companion to
+    /// `pk::tests::event_pk_params_fills_pk_only_on_the_parameter_static_arm`,
+    /// which pins the materializer itself. Both arms below reach
+    /// `ode_predictions_event_driven`'s unconditional
+    /// `assert_eq!(pk_at_pk_only.len(), subject.pk_only_times.len())` — an
+    /// `assert_eq!`, so a release build aborts the fit.
+    ///
+    /// The two routes are deliberately separated because only one of them is
+    /// #1124's: the **reset** arm has an autonomous RHS, so
+    /// `model_uses_time_anywhere` is `false` there and it reproduces on `main`
+    /// unchanged. Asserting that here is what stops the pair being read as a
+    /// regression this PR introduced — the PR widened the door, it did not build
+    /// the hole.
+    #[test]
+    fn an_evid2_record_does_not_abort_a_parameter_static_subject() {
+        let model_src = |elim: &str| {
+            format!(
+                r#"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(20.0, 0.001, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central{elim}
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP)
+"#
+            )
+        };
+        let theta = [1.0, 20.0];
+        let eta = [0.0];
+        let base = |model: &crate::types::CompiledModel| {
+            let mut s = mk_subject(
+                vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                vec![1.0, 2.0, 6.0],
+            );
+            // What `prune_irrelevant_tv_covariates` leaves for a dataset with
+            // EVID=2 rows and a varying but model-unreferenced column: the times
+            // survive, the snapshots are cleared.
+            s.pk_only_times = vec![3.0];
+            s.pk_only_covariates = Vec::new();
+            assert!(
+                !crate::pk::subject_needs_per_event_pk(model, &s),
+                "fixture must be parameter-static, else it takes the per-event arm \
+                 and proves nothing"
+            );
+            s
+        };
+
+        // Route 1 — model time in the RHS (#1124's widened predicate).
+        let tad = crate::parser::model_parser::parse_model_string(&model_src(" * (1.0 + 0.3*TAD)"))
+            .unwrap();
+        assert!(crate::pk::model_uses_time_anywhere(&tad));
+        let s = base(&tad);
+        let out = crate::pk::compute_predictions_with_tv(&tad, &s, &theta, &eta);
+        assert_eq!(out.len(), s.obs_times.len());
+        assert!(
+            out.iter().all(|p| p.is_finite() && *p > 0.0),
+            "TAD route returned {out:?}"
+        );
+
+        // Route 2 — an EVID 3/4 reset on an AUTONOMOUS RHS. `model_uses_time_anywhere`
+        // is false here, so this arm is independent of #1124 and reproduces on main.
+        let plain = crate::parser::model_parser::parse_model_string(&model_src("")).unwrap();
+        assert!(
+            !crate::pk::model_uses_time_anywhere(&plain),
+            "the reset arm must not depend on the model-time predicate"
+        );
+        let mut s = base(&plain);
+        s.reset_times = vec![4.0];
+        assert!(s.has_resets());
+        let out = crate::pk::compute_predictions_with_tv(&plain, &s, &theta, &eta);
+        assert_eq!(out.len(), s.obs_times.len());
+        assert!(
+            out.iter().all(|p| p.is_finite()),
+            "reset route returned {out:?}"
+        );
     }
 
     fn assert_reduces_to_ode(model_src: &str, theta: &[f64], eta: &[f64], doses: Vec<DoseEvent>) {

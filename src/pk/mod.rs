@@ -70,6 +70,37 @@ pub(crate) fn model_uses_time_builtin(model: &CompiledModel) -> bool {
 ///
 /// Regression tests: `rerouting_a_bare_tafd_rhs_does_not_move_the_predictions`
 /// and `rerouting_an_init_seeded_rhs_does_not_move_the_predictions`.
+///
+/// **What the reroute costs, and why it is still whole-class.** The predicate is
+/// deliberately not narrowed to the MR-eligible shape (`!spec.input_rate.
+/// is_empty()`), even though that is the only shape #1124 itself could reach — a
+/// model with no built-in forcing was declined by `mr_scope` anyway and was
+/// already on the *dense* path. Measured, `ci-fast`, 2-state `[odes]`, two doses
+/// over 24 h at `reltol = 1e-8`, dense vs event-driven:
+///
+/// | observations | ratio |
+/// |---|---|
+/// | 8  | 1.04× |
+/// | 16 | 1.15× |
+/// | 32 | 1.38× |
+///
+/// It grows with observation density because the dense driver breaks only at
+/// dose/reset boundaries and reads observations through `saveat`, while the
+/// event-driven walk calls `solve_ode` once per record and each call restarts the
+/// step-size history. (For the MR-shaped cell the fix is actually about, the cost
+/// is far larger and unavoidable — ~40×, closed form to integration.)
+///
+/// That is paid to keep **one** engine answering a non-autonomous RHS. Both
+/// engines are correct here since #1073, but they are correct *differently*: they
+/// break the timeline at different points, so value, gradient, and the `[derived]`
+/// grid would agree only to solver tolerance and would drift apart under a
+/// lagtime. Splitting the class by `input_rate` re-creates exactly the
+/// value-vs-gradient and value-vs-`[derived]` engine splits that the gates in
+/// `stats/likelihood.rs`, `api/output_columns.rs` and `sens/ode_provider.rs` each
+/// had to be widened to close. Revisit with a measurement on a dense-sampling
+/// design if the ratio starts to matter; the predicate itself is not a hot-loop
+/// cost (both flags are resolved once in `build_ode_spec` at parse time, and this
+/// is `#[inline]` over three `bool` reads).
 #[inline]
 pub(crate) fn model_uses_time_anywhere(model: &CompiledModel) -> bool {
     model_uses_time_builtin(model)
@@ -753,12 +784,29 @@ pub fn compute_event_pk_params_into(
         // dose/obs *or* pk-only rows) and the model uses no `TIME` built-in, so a
         // single snapshot (t=0) is exact for every event.
         let p = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
-        // pk_only stays empty — see EventPkParams docstring.
+        // Every event row gets the snapshot — `pk_only` included. This arm decides
+        // only whether the snapshots *differ* between events, never how many there
+        // are: `ode_predictions_event_driven` asserts all three lengths against the
+        // subject unconditionally (`ode/predictions.rs`), so a short `pk_only` here
+        // is a length mismatch, not an optimisation.
+        //
+        // It used to be left empty, which aborted the run (`assert_eq!`, so in
+        // release too) for any subject reaching the event-driven walker on a
+        // *parameter-static* model. Two routes get there: `subject.has_resets()`
+        // — reachable since EVID 3/4 resets were wired to that walker — and, since
+        // #1124, an `[odes]` RHS that reads model time. Both need only a dataset
+        // carrying EVID=2 rows, because `prune_irrelevant_tv_covariates` clears
+        // `pk_only_covariates` while leaving `pk_only_times` populated, which is
+        // exactly the state that makes `subject_needs_per_event_pk` false with
+        // `pk_only_times` non-empty.
         for _ in 0..subject.doses.len() {
             out.dose.push(p);
         }
         for _ in 0..subject.obs_times.len() {
             out.obs.push(p);
+        }
+        for _ in 0..subject.pk_only_times.len() {
+            out.pk_only.push(p);
         }
     }
 }
@@ -2879,6 +2927,54 @@ mod tests {
         assert_eq!(ev.obs.len(), 3);
         // CL = theta * CR = 10 * 2 = 20 everywhere.
         for p in ev.dose.iter().chain(ev.obs.iter()) {
+            assert_relative_eq!(p.cl(), 20.0, epsilon = 1e-12);
+        }
+    }
+
+    /// The parameter-static arm must still emit one `pk_only` snapshot per
+    /// EVID=2 record.
+    ///
+    /// Both event-driven walkers — the ODE one (`ode/predictions.rs`) and the
+    /// analytical one (`pk/event_driven.rs`) — open with the same three
+    /// unconditional length asserts, so a short `pk_only` aborts the run rather
+    /// than degrading. It is `assert_eq!`, not `debug_assert_eq!`, so release
+    /// builds abort too.
+    ///
+    /// This arm used to leave `pk_only` empty while filling `dose` and `obs`,
+    /// which made the triple structurally inconsistent. It is reachable whenever
+    /// a *parameter-static* subject is routed to an event-driven walker, and two
+    /// routes do that: `subject.has_resets()` (since EVID 3/4 resets were wired
+    /// there — so this predates #1124) and, since #1124, an `[odes]` RHS that
+    /// reads model time. Both need only a dataset with EVID=2 rows, because
+    /// `prune_irrelevant_tv_covariates` clears `pk_only_covariates` while leaving
+    /// `pk_only_times` populated — precisely the state where
+    /// `subject_needs_per_event_pk` is false and `pk_only_times` is not.
+    #[test]
+    fn event_pk_params_fills_pk_only_on_the_parameter_static_arm() {
+        let mut covs = HashMap::new();
+        covs.insert("CR".to_string(), 2.0);
+        let mut subj = make_subject_with_tv(covs, Vec::new(), Vec::new(), 2, 3);
+        // An EVID=2 row that survived covariate pruning: a time, but no snapshot.
+        subj.pk_only_times = vec![0.5, 2.5];
+        subj.pk_only_covariates = Vec::new();
+        let model = cl_from_cr_model();
+        // Precondition: this is the static arm, not the per-event one. Without
+        // this the test would still pass via the `if` branch and prove nothing.
+        assert!(
+            !subject_needs_per_event_pk(&model, &subj),
+            "fixture must exercise the parameter-static arm"
+        );
+        let ev = compute_event_pk_params(&model, &subj, &[10.0], &[]);
+        assert_eq!(ev.dose.len(), subj.doses.len());
+        assert_eq!(ev.obs.len(), subj.obs_times.len());
+        assert_eq!(
+            ev.pk_only.len(),
+            subj.pk_only_times.len(),
+            "pk_only must carry one snapshot per EVID=2 record; both event-driven \
+             walkers assert this length unconditionally"
+        );
+        // CL = theta * CR = 10 * 2 = 20 on every row, pk_only included.
+        for p in ev.dose.iter().chain(&ev.obs).chain(&ev.pk_only) {
             assert_relative_eq!(p.cl(), 20.0, epsilon = 1e-12);
         }
     }

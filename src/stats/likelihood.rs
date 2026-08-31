@@ -234,15 +234,23 @@ fn try_joint_pktte_shared_solve(
     // The share computes the Gaussian predictions via `ode_predictions_and_chz`, i.e.
     // the plain no-TV `ode_predictions` with a single t=0 PK snapshot. It is only
     // equivalent when the standalone prediction path (`compute_predictions_with_tv_*`)
-    // takes that same snapshot route. Reject every case it routes elsewhere: a `TIME`
-    // built-in (`compiled_model_uses_time_builtin`) or time-varying covariates send it
-    // through the per-event `ode_predictions_event_driven` (pk/mod.rs); EVID-3/4 resets
-    // also need the event-driven walker; SDE adds EKF process noise; FREM rewrites the
+    // takes that same snapshot route. Reject every case it routes elsewhere: model time
+    // (`pk::model_uses_time_anywhere`) or time-varying covariates send it through the
+    // per-event `ode_predictions_event_driven` (pk/mod.rs); EVID-3/4 resets also need the
+    // event-driven walker; SDE adds EKF process noise; FREM rewrites the
     // pseudo-observation predictions. Each keeps the established two-solve fallback.
+    //
+    // The model-time clause must be the **wide** predicate, matching the routing site
+    // this mirrors (`pk/mod.rs`). Asking the narrow `compiled_model_uses_time_builtin`
+    // inspects only the individual-parameter program, so an `[odes]` RHS reading
+    // `TAD`/`TAFD`/`T`/`TIME` stayed admitted here after #1124 rerouted the standalone
+    // path — leaving the objective's Gaussian term on the dense engine while the
+    // reported IPRED came from the event-driven one, which is exactly the split the
+    // stated contract above exists to prevent.
     if subject.obs_records.is_empty()
         || subject.has_tv_covariates()
         || subject.has_resets()
-        || crate::parser::model_parser::compiled_model_uses_time_builtin(model)
+        || crate::pk::model_uses_time_anywhere(model)
         || model.is_sde()
         || subject.fremtype.iter().any(|&f| f > 0)
     {
