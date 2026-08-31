@@ -84,6 +84,22 @@ section of the SDLC for the versioning policy).
   is a `[mixture]` model — its classes are identified only up to relabelling, so averaging across
   replicates would mix them; use SIR for uncertainty on a mixture model instead (#1145).
   See `docs/tools/bootstrap.qmd`.
+- **`ferx bootstrap --resume` — pick an interrupted run back up (#1143).** The per-replicate files
+  (`raw_results.csv`, `included_individuals1.csv`, `included_keys1.csv`, `sample_keys1.csv`) are now
+  written as each replicate finishes rather than once at the end, so a run killed part-way leaves
+  everything it had already completed. `--resume` refits only the samples the directory does not
+  hold, and reuses the base fit rather than repeating it. Because each draw comes from the seed and
+  the replicate's own index, a resumed run reproduces the uninterrupted one exactly — not merely
+  statistically, which is what PsN's shared, order-dependent RNG can offer. A replicate whose fit
+  *errored* is carried forward by default, as in PsN; `--retry-failed` refits those instead, for a
+  failure that was a transient resource problem. Every run now writes `bootstrap_run.json`
+  recording its seed, options — including what the replicates were started from, so a resume
+  cannot mix replicates begun at the base fit with replicates begun at the model file's
+  estimates — and the hashes of the model and data files; a `--resume` whose inputs or options
+  disagree is refused, naming the field. A trailing row cut off by a hard kill is
+  dropped and that sample refitted. `raw_results.csv` now carries full round-trip precision rather
+  than ten fixed decimals, because a resumed run's replicates start from the base-fit estimates read
+  back out of it; the statistics files are unchanged. See `docs/tools/bootstrap.qmd`.
 - **`prepare_run` / `prepare_run_with_inits` (#1140)** — public "load a model and its dataset, but
   do not fit" entry points returning a `PreparedRun`. `run_model_with_data` is now implemented on
   top of them, so a tool and the CLI cannot diverge in how a model is loaded.
