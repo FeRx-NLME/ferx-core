@@ -1,3 +1,5 @@
+mod bootstrap_cmd;
+
 use ferx_core::NcaInit;
 use std::env;
 use std::time::Instant;
@@ -9,6 +11,8 @@ Usage: ferx <model.ferx> --data <data.csv> [--threads N|auto] [--output <run.fit
        ferx <model.ferx> --simulate          [--threads N|auto] [--output <run.fitrx>]
        ferx check <model.ferx> [--data <data.csv>] [--json]
        ferx summary <run.fitrx> [<run2.fitrx> ...]
+       ferx bootstrap <model.ferx> [--data <data.csv>] [--samples N] [--seed N]
+                      [--stratify-on COL] [--threads N]   (see `ferx bootstrap --help`)
 
 Fits a NLME model and writes sdtab.csv with residuals.
 Data must be in NONMEM format (ID, TIME, DV, EVID, AMT, CMT, ...)
@@ -89,6 +93,14 @@ fn main() {
     // basic run info to stdout. Dispatch before the fit/simulate path.
     if args.get(1).map(String::as_str) == Some("summary") {
         std::process::exit(run_summary(&args));
+    }
+
+    // `ferx bootstrap ...` (#1140) is the first `ferx-tools` subcommand: many
+    // fits over resampled data. Dispatched here for the same reason as the two
+    // above — the fit/simulate path below is untouched, and a plain
+    // `ferx model.ferx` still means what it always did.
+    if args.get(1).map(String::as_str) == Some("bootstrap") {
+        std::process::exit(bootstrap_cmd::run(&args));
     }
 
     if args.len() < 2 {

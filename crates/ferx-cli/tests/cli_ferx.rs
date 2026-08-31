@@ -306,3 +306,82 @@ fn fit_with_missing_files_errors() {
         "expected an Error: message on stderr"
     );
 }
+
+// ── ferx bootstrap (#1140) ───────────────────────────────────────────────────
+
+#[test]
+fn bootstrap_help_lists_the_psn_options() {
+    let out = ferx()
+        .args(["bootstrap", "--help"])
+        .output()
+        .expect("run ferx bootstrap --help");
+    assert!(out.status.success(), "--help should exit 0");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    for flag in [
+        "--samples",
+        "--seed",
+        "--stratify-on",
+        "--sample-size",
+        "--update-inits",
+        "--keep-covariance",
+        "--dofv",
+        "--summarize",
+    ] {
+        assert!(stdout.contains(flag), "help does not mention {flag}");
+    }
+}
+
+#[test]
+fn bootstrap_without_a_model_is_a_usage_error() {
+    let out = ferx()
+        .args(["bootstrap"])
+        .output()
+        .expect("run ferx bootstrap");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Usage: ferx bootstrap"));
+}
+
+#[test]
+fn bootstrap_summarize_needs_a_directory() {
+    let out = ferx()
+        .args(["bootstrap", "--summarize"])
+        .output()
+        .expect("run ferx bootstrap --summarize");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--directory"));
+}
+
+#[test]
+fn bootstrap_rejects_a_covstep_filter_without_the_covariance_step() {
+    // The filter reads a diagnostic that only exists when the step ran, so
+    // accepting it silently would drop a filter the user asked for.
+    let out = ferx()
+        .args([
+            "bootstrap",
+            "examples/one_cpt_iv.ferx",
+            "--data",
+            "data/one_cpt_iv.csv",
+            "--samples",
+            "1",
+            "--skip-covariance-step-terminated",
+        ])
+        .output()
+        .expect("run ferx bootstrap");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--keep-covariance"),
+        "the error should name the way out"
+    );
+}
+
+/// The top-level dispatcher must not have stolen the ordinary fit path: a model
+/// file whose name happens to start with a subcommand-looking word is still a
+/// model file, and `ferx <model>` is unchanged.
+#[test]
+fn the_bootstrap_subcommand_does_not_shadow_a_plain_fit() {
+    let out = ferx()
+        .args(["check", "examples/one_cpt_iv.ferx"])
+        .output()
+        .expect("run ferx check");
+    assert!(out.status.success());
+}

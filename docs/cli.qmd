@@ -14,7 +14,9 @@ ferx <model.ferx> --data <data.csv> [--output <run.fitrx>] [--include-data] [--i
 ferx <model.ferx> --simulate          [--output <run.fitrx>]
 ferx check <model.ferx> [--data <data.csv>] [--json]
 ferx summary <run.fitrx> [<run2.fitrx> ...]
-ferx --help                    # or -h; also: ferx check --help, ferx summary --help
+ferx bootstrap <model.ferx> [--data <data.csv>] [--samples N] [--seed N] [--stratify-on COL]
+ferx --help                    # or -h; also: ferx check --help, ferx summary --help,
+                               # ferx bootstrap --help
 ```
 
 ## Commands
@@ -34,6 +36,23 @@ ferx model.ferx --simulate
 ```
 
 Parses the model file, generates simulated data from the `[simulation]` block, and fits the model to the simulated data. Requires a `[simulation]` block in the model file.
+
+### Bootstrap (`bootstrap`)
+
+```bash
+ferx bootstrap model.ferx --data data.csv --samples 200 --seed 12345 --threads 8
+```
+
+Resamples subjects with replacement, refits the model to each replicate dataset,
+and reports bias, standard errors and confidence intervals from the spread of the
+estimates — the non-parametric case bootstrap, at `PsN::bootstrap` feature parity.
+Writes PsN-named CSV artefacts to `{model}-bootstrap/`.
+
+Unlike a fit, this is a *tool*: it lives in the `ferx-tools` crate and calls the
+estimation engine many times without changing it. See
+[Bootstrap](tools/bootstrap.qmd) for the options, the stratification rules, the
+confidence-interval estimator, and a worked comparison against the covariance
+step's standard errors.
 
 ### Validate without Fitting (`check`)
 

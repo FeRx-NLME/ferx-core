@@ -1,0 +1,264 @@
+---
+pagetitle: "Bootstrap"
+description-meta: "Non-parametric case bootstrap in ferx: resample subjects, refit, and report bias, standard errors and confidence intervals — at PsN::bootstrap feature parity."
+---
+
+# Bootstrap
+
+> **Maturity: beta** — see [Feature Maturity](../maturity.qmd) for what this means.
+
+The non-parametric **case bootstrap** estimates parameter uncertainty by resampling
+subjects with replacement, refitting the model to each replicate dataset, and reading
+bias, standard errors and confidence intervals off the spread of the estimates.
+
+It lives in `ferx-tools`, not in the estimation engine: a bootstrap is many fits of one
+model, which is precisely the [workspace boundary rule](../development/index.qmd)
+— *if it calls `fit()` more than once, it is a tool.* Nothing about the likelihood, the
+optimizer or the diagnostics changes; only the data each fit sees.
+
+```bash
+ferx bootstrap warfarin.ferx --data warfarin.csv --samples 200 --seed 12345 --threads 8
+```
+
+## Why bootstrap instead of the covariance step
+
+ferx's standard errors are the pure `R⁻¹` matrix — the same thing NONMEM reports under
+`$COVARIANCE MATRIX=R`. They are *asymptotic*: they assume the log-likelihood is locally
+quadratic and that the sampling distribution of every parameter is normal. That
+assumption is symmetric by construction, so an `R⁻¹` interval is always centred on the
+estimate and always the same width on both sides.
+
+The bootstrap assumes none of that. It also keeps working when the covariance step fails
+or returns a non-positive-definite matrix, which is common exactly where uncertainty
+matters most.
+
+Here is the shipped `examples/warfarin.ferx` fit both ways — 200 samples, seed 12345:
+
+| parameter | estimate | SE (`R⁻¹`) | SE (bootstrap) | 95% percentile CI | 95% normal CI |
+|---|---:|---:|---:|---|---|
+| `TVCL`                 | 0.1330  | 0.0066 | 0.0081 | 0.1185 – 0.1506  | 0.1171 – 0.1488 |
+| `TVV`                  | 7.7307  | 0.2341 | 0.2444 | 7.237 – 8.127    | 7.252 – 8.210 |
+| `TVKA`                 | 0.7252  | 0.1245 | 0.1405 | 0.4675 – 1.0641  | 0.4499 – 1.0006 |
+| `OMEGA(ETA_CL,ETA_CL)` | 0.02859 | 0.0128 | 0.0105 | 0.0063 – 0.0474  | 0.0081 – 0.0491 |
+| `OMEGA(ETA_V,ETA_V)`   | 0.00958 | 0.0043 | 0.0037 | 0.0016 – 0.0158  | 0.0023 – 0.0169 |
+| `OMEGA(ETA_KA,ETA_KA)` | 0.34896 | 0.1608 | 0.2034 | 0.1092 – 0.8622  | **−0.0498** – 0.7477 |
+| `PROP_ERR`             | 0.01075 | 0.0009 | 0.0010 | 0.00885 – 0.01259| 0.00879 – 0.01271 |
+
+Most parameters agree closely, which is the expected — and reassuring — result. The last
+`OMEGA` is the interesting row, and it is the argument for the whole tool:
+
+- its bootstrap standard error is **26% larger** than the asymptotic one;
+- its bootstrap distribution is strongly **right-skewed** (0.109 – 0.862 around 0.349),
+  which no symmetric interval can express;
+- and the normal-approximation interval reaches **below zero** — an impossible value for
+  a variance. The percentile interval cannot, because every endpoint it reports is an
+  estimate that some replicate actually produced.
+
+That is the diagnostic: where the two intervals agree, the asymptotic standard errors are
+fine; where they disagree, believe the bootstrap.
+
+## What is resampled
+
+**Whole subjects.** For each ID, every record is either in or out of a replicate — never
+split. This is what keeps the case bootstrap valid for a hierarchical model.
+
+A subject drawn more than once enters the fit as **independent individuals**: that is the
+point of sampling with replacement, and it means the copies must carry distinct
+identifiers. ferx keeps the original ID and appends `#2`, `#3`, … so a diagnostic can
+still be traced back. (PsN does the same thing by renumbering IDs while writing the
+replicate data file.)
+
+::: {.callout-warning}
+## A model that reads `ID` as a covariate cannot be bootstrapped
+
+Because the duplicate copies are necessarily renamed, a model whose predictions depend on
+the subject identifier would silently see different values than it did in the base fit.
+ferx refuses such a run with an error naming the fix. PsN documents the same hazard as a
+known bug and leaves it to the user to notice.
+:::
+
+## Reproducibility
+
+Each replicate's draw is derived from the master `--seed` **and its own index**, so the
+resampled datasets depend only on `--seed`, `--samples`, `--sample-size` and the strata.
+They do not depend on `--threads`, on the order replicates happen to finish in, or on
+whether the base model was fitted first.
+
+::: {.callout-note}
+## This is a deliberate departure from PsN
+
+The PsN bootstrap user guide documents the opposite as a known wart: *"the results of two
+runs will be different even if the seed is the same if the lst-file of the base model is
+present at the start of one run but not the other"*, because running the base model
+advances one shared random-number generator. Deriving per replicate removes that coupling,
+and makes the draw stream something a test can pin.
+:::
+
+## Stratified resampling
+
+If the dataset mixes populations — the classic case is 10 subjects with rich profiles and
+90 with sparse steady-state samples — resample *within* each group so that every replicate
+keeps the same composition:
+
+```bash
+ferx bootstrap run12.ferx --data d.csv --stratify-on STUDY
+```
+
+The stratification column is read straight from the dataset, so it does not have to be a
+covariate the model declares, and its values may be non-numeric group labels. It **must
+take exactly one value per subject**; if it does not, the run stops and names the
+offending subject, because an individual that belongs to two strata cannot be resampled
+from either.
+
+By default each stratum contributes as many subjects as it has. `--sample-size` changes
+that in one of two ways:
+
+```bash
+# One number: strata are allocated in proportion to their size (rounded).
+ferx bootstrap run12.ferx --stratify-on STUDY --sample-size 50
+
+# Explicit per stratum — PsN's syntax. Every stratum must be listed.
+ferx bootstrap run12.ferx --stratify-on STUDY --sample-size "1001=>12,1002=>24,1003=>10"
+```
+
+With proportional allocation the rounded per-stratum counts need not sum exactly to the
+requested total; in the default case (sample size = number of subjects) they always do.
+
+## Which replicates count
+
+A replicate whose fit did not converge, or whose estimate landed on a bound, is not a draw
+from the sampling distribution of a converged fit — including it biases the interval. Two
+filters are therefore **on by default**, matching PsN:
+
+| filter | default | drops replicates where… |
+|---|---|---|
+| `--no-skip-minimization-terminated`  | on  | the fit did not converge |
+| `--no-skip-estimate-near-boundary`   | on  | an estimate sits on a bound |
+| `--skip-covariance-step-terminated`  | off | the covariance step failed |
+| `--skip-with-covstep-warnings`       | off | the covariance step warned |
+
+The two covariance filters read a diagnostic that only exists when the covariance step
+actually ran, and replicate fits skip it by default (it is most of the cost, and the
+bootstrap standard error comes from the spread of the estimates, not from any
+per-replicate `R⁻¹`). Combining them without `--keep-covariance` is an error rather than a
+silent no-op.
+
+Filters are applied **when the statistics are computed**, not when a replicate finishes.
+That is what makes it possible to change your mind afterwards:
+
+```bash
+ferx bootstrap --summarize --directory run12-bootstrap --no-skip-minimization-terminated
+```
+
+`--summarize` re-reads `raw_results.csv` — which carries each replicate's diagnostics
+alongside its estimates — and rewrites the statistics. It refits nothing.
+
+## Confidence intervals
+
+Percentile intervals use PsN's estimator, the weighted average at `x₍ₙ₊₁₎ₚ`:
+
+```
+n = number of samples + 1
+p = percentile / 100
+i = integer part of n·p
+f = decimal part of n·p
+percentile = (1−f)·xᵢ + f·xᵢ₊₁
+```
+
+A tail can only be reported when there is an order statistic at or below it — i.e. when
+`(n+1)·p ≥ 1`. That single condition reproduces every minimum PsN tabulates:
+
+| interval | samples needed |
+|---|---:|
+| 5% – 95%      | 19 |
+| 2.5% – 97.5%  | 39 |
+| 0.5% – 99.5%  | 199 |
+| 0.05% – 99.95%| 1999 |
+
+Below the threshold the percentile interval is left empty rather than extrapolated past
+the smallest observation, and only the normal-approximation interval
+(`estimate ± z·SE_bootstrap`) is reported. PsN's rule of thumb — and the default — is
+**200 samples** for standard errors.
+
+## Δofv
+
+`--dofv` evaluates each replicate's parameter vector on the **original** dataset with no
+estimation (`outer_maxiter = 0`, exactly NONMEM's `MAXEVAL=0`) and reports
+`ofv_bootstrap − ofv_original` in `delta_ofv.csv`.
+
+Every value is necessarily positive: the original fit's parameters minimise the objective
+on the original data, so any other vector scores worse. The useful comparison is against a
+χ² distribution with degrees of freedom equal to the number of estimated parameters
+(written to `bootstrap_diagnostics.csv` as `chi_square_df`). In theory the bootstrap Δofv
+distribution should sit **at or below** that reference; if it does not, the bootstrap is
+not describing the uncertainty well and another method — [SIR](../estimation/sir.qmd) —
+is the better choice.
+
+## Output files
+
+Written to `--directory` (default `{model}-bootstrap`). Names follow PsN so existing
+scripts and habits transfer.
+
+| file | contents |
+|---|---|
+| `raw_results.csv`            | one row per fit, **first row the original dataset**; estimates, OFV and termination diagnostics |
+| `bootstrap_results.csv`      | one row per parameter: original, mean, bias, standard error, median, percentile CI, normal CI |
+| `bootstrap_diagnostics.csv`  | run counts, exclusion tallies, and the mean of each per-replicate diagnostic |
+| `included_individuals1.csv`  | per replicate, the subject IDs drawn (repeats included), in dataset order |
+| `included_keys1.csv`         | per replicate, the internal 1..N ordinals of those subjects |
+| `sample_keys1.csv`           | per replicate, one count per original subject: how many times it was drawn |
+| `all_individuals1.csv`       | every subject of the original dataset, in original order |
+| `delta_ofv.csv`              | `--dofv` only |
+
+Row *j* refers to the same replicate in `raw_results`, `included_individuals`,
+`included_keys` and `sample_keys`, as in PsN.
+
+Two files depart from PsN's layout on purpose. `bootstrap_results.csv` is **tidy** — one
+row per parameter — rather than PsN's stacked blocks of statistics, and the run-level
+diagnostics live in their own file instead of as a second block inside the results file. A
+single CSV carrying two different header shapes cannot be read by a data frame, which
+defeats the point of writing it.
+
+## Options
+
+| option | default | meaning |
+|---|---|---|
+| `--samples N`        | 200 | number of bootstrap datasets |
+| `--seed N`           | 1   | master seed |
+| `--threads N`        | all cores | replicates fitted concurrently (each fit uses one thread) |
+| `--sample-size M`    | dataset size | subjects per replicate, or a per-stratum map |
+| `--stratify-on COL`  | —   | resample within strata from a dataset column |
+| `--directory DIR`    | `{model}-bootstrap` | where the CSVs go |
+| `--ci LEVEL`         | 95  | two-sided confidence level, percent |
+| `--no-update-inits`  | —   | start replicates from the model file's inits instead of the base fit's estimates |
+| `--no-run-base-model`| —   | skip the fit on the original data (disables bias, the normal CI, `--update-inits` and `--dofv`) |
+| `--keep-covariance`  | off | run the covariance step for every replicate |
+| `--dofv`             | off | compute Δofv against the original dataset |
+| `--summarize`        | off | recompute statistics from an existing run directory |
+
+Options in the PsN guide with no ferx analogue — `-allow_ignore_id`, `-copy_data`,
+`-mceta`, `-rplots`, `-clean` — are NONMEM run-directory plumbing and are not implemented.
+`-bca` (bias-corrected accelerated intervals, which need an additional jackknife pass) is
+not implemented yet.
+
+## Library API
+
+```rust
+use ferx_core::prepare_run;
+use ferx_tools::bootstrap::{run_bootstrap, BootstrapOptions};
+
+let prepared = prepare_run("warfarin.ferx", Some("warfarin.csv"))?;
+let result = run_bootstrap(
+    &prepared,
+    &BootstrapOptions { samples: 200, seed: 12345, ..Default::default() },
+)?;
+
+for p in &result.summary.parameters {
+    println!("{}: {:.4} (SE {:.4})", p.name, p.mean, p.standard_error);
+}
+```
+
+`prepare_run` is the "load a model and its data, but do not fit" entry point: it resolves
+the data path against the model's `[data]` block, applies `[data_selection]`, reads the
+population and binds any `theta NAME[...]` level blocks — everything `ferx model.ferx`
+does up to the fit itself.
