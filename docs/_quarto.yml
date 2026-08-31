@@ -167,7 +167,7 @@ format:
       dark: [cosmo, assets/ferx-dark.scss]
     css: styles.css
     toc: true
-    toc-depth: 3
+    toc-depth: 4
     number-sections: false
     code-link: true
     code-copy: true

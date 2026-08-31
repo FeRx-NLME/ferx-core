@@ -35,6 +35,14 @@ section of the SDLC for the versioning policy).
   on every row was fitted at `WT = 0`, indistinguishable from a genuine zero, and `present(WT)`
   reported it as present. The reader now stores `NaN` and warns, naming the covariate and the
   affected subjects, so the gap is either guarded with `present(...)`, imputed, or fails loudly.
+- **The five largest documentation sections are split into addressable subsections (#1162).**
+  `[fit_options]`'s 36 shared keys are grouped into seven tables (run control, outer optimizer,
+  inner loop, covariance, ODE tolerances, ODE stepper, data handling); FOCE's gradient-route
+  section leads with the decision and moves the scope history into named sections plus an FD
+  fallback table; SAEM's theta/sigma M-step, `ode_method = auto`, and the check-report code table
+  are likewise subdivided. Every previous anchor still resolves, several broken in-page links are
+  repaired, and the site's `toc-depth` is raised to 4 so the new subsections appear in the
+  on-page table of contents.
 
 ### Added
 - **A `present(COV)` condition for covariates that may be missing (#1111).** A missing covariate
