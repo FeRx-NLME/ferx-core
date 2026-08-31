@@ -37,7 +37,9 @@ for arg in "$@"; do
   case "$arg" in
     --list) LIST_ONLY=1 ;;
     -h|--help)
-      sed -n '2,9p' "${BASH_SOURCE[0]}" | sed 's/^#\s\?//'
+      # POSIX class, not `\s`: BSD sed (macOS, where most of us edit) does not
+      # understand `\s` and would silently leave every `#` in place.
+      sed -n '3,8p' "${BASH_SOURCE[0]}" | sed 's/^#[[:space:]]\{0,1\}//'
       echo
       echo "Groups: fmt, check, clippy, public-api (default: all four, in that order)"
       exit 0

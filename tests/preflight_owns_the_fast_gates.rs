@@ -190,3 +190,53 @@ fn preflight_is_executable_and_lists_every_group() {
         "`--list` should execute nothing:\n{stdout}"
     );
 }
+
+/// `--help` extracts its usage block from the script's own header by LINE NUMBER, which
+/// silently prints the wrong lines if that header ever grows or shrinks. Rather than make
+/// the extraction clever, pin the output.
+///
+/// This also covers a portability trap the first version walked into: the strip was
+/// `s/^#\s\?//`, and BSD sed (macOS, where most of us edit) does not understand `\s` — so
+/// every `#` survived locally while the same line worked in CI. A local/CI split inside the
+/// tool whose entire purpose is removing local/CI splits.
+#[test]
+fn preflight_help_renders_its_usage_block() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let out = std::process::Command::new("bash")
+        .arg(root.join("tools").join("preflight.sh"))
+        .arg("--help")
+        .current_dir(&root)
+        .output()
+        .expect("run tools/preflight.sh --help");
+    assert!(
+        out.status.success(),
+        "`--help` exited {:?}",
+        out.status.code()
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    for want in [
+        "Run the fast CI gates locally",
+        "tools/preflight.sh check",
+        "tools/preflight.sh --list",
+        "Groups: fmt, check, clippy, public-api",
+    ] {
+        assert!(
+            stdout.contains(want),
+            "`--help` is missing {want:?} — the header line range in the `-h|--help` arm \
+             has probably drifted:\n{stdout}"
+        );
+    }
+    // No line may still START with `#`. Checking for `#` anywhere would be wrong: the usage
+    // lines carry legitimate inline comments (`tools/preflight.sh check  # just the …`).
+    let leftover: Vec<&str> = stdout
+        .lines()
+        .filter(|l| l.trim_start().starts_with('#'))
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "`--help` left comment markers at line start — the sed strip is not working (BSD \
+         sed does not support `\\s`):\n  {}",
+        leftover.join("\n  ")
+    );
+}
