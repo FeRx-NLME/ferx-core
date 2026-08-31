@@ -5,4 +5,6 @@
 # Skip the check when no .rs files are staged (e.g. docs-only commits).
 git diff --cached --name-only | grep -q '\.rs$' || exit 0
 
-cargo +nightly fmt --check
+# `--all`: the repo is a workspace (#1114), and without it `cargo fmt` checks
+# only the root `ferx-core` package, silently skipping `crates/`.
+cargo +nightly fmt --all --check

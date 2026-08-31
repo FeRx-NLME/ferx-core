@@ -106,7 +106,7 @@ nmfe75 freijer_ig.ctl    freijer_ig.lst
 ferx — Savic transit (needs the #343 branch, where `transit()` exists):
 
 ```bash
-cargo run --release -- nonmem_anchor/transit_savic_fit.ferx \
+cargo run --release -p ferx-cli -- nonmem_anchor/transit_savic_fit.ferx \
   --data nonmem_anchor/transit_oral.csv
 # -> transit_savic_fit-fit.yaml (OFV + theta/omega/sigma + SEs)
 ```

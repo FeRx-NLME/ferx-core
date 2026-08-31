@@ -258,6 +258,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
+name = "ferx-cli"
+version = "0.3.0"
+dependencies = [
+ "ferx-core",
+ "ferx-tools",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "ferx-core"
 version = "0.3.0"
 dependencies = [
@@ -278,6 +288,18 @@ dependencies = [
  "tempfile",
  "thiserror",
  "zip",
+]
+
+[[package]]
+name = "ferx-tools"
+version = "0.3.0"
+dependencies = [
+ "csv",
+ "ferx-core",
+ "nalgebra",
+ "rand 0.10.2",
+ "rayon",
+ "tempfile",
 ]
 
 [[package]]

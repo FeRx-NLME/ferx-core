@@ -4,7 +4,7 @@
 # Weibull input rate weibull(td, beta); concentration = central / V via [scaling].
 # Runs on the shared re-keyed dataset data/igd_oral.csv (every record on CMT 1).
 #
-#   cargo run --release -- nonmem_anchor/weibull_absorption_fit.ferx \
+#   cargo run --release -p ferx-cli -- nonmem_anchor/weibull_absorption_fit.ferx \
 #     --data data/igd_oral.csv
 #
 # Cross-check the resulting OFV/THETA against the NONMEM run

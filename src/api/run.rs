@@ -123,15 +123,63 @@ pub fn run_model_with_data(
     run_model_with_data_inits(model_path, data_path, None)
 }
 
-/// Like [`run_model_with_data`], but lets the caller (e.g. the CLI's
-/// `--inits-from-nca` flag) override the model file's `inits_from_nca` fit
-/// option. When `inits_override` is `None` the model-file value is used as-is;
-/// when `Some(method)` it forces that NCA strategy regardless of the file.
-pub fn run_model_with_data_inits(
+/// A model file and its dataset, parsed and read but **not yet fitted** — every
+/// input [`fit`] needs, assembled by [`prepare_run`].
+///
+/// Getting from a `.ferx` file to a fittable state is not one call: the data
+/// path has to be resolved against the model's own `[data]` block, the
+/// `[data_selection]` filter compiled, the population read through the model's
+/// covariate declarations and column map, `theta NAME[...]` level blocks bound
+/// against the data (which re-parses the model with the real θ count, #1064),
+/// and the initial [`ModelParameters`] built from the parsed model. A caller
+/// that wants any of that *without* fitting — a tool running many fits over
+/// resampled data, an R caller inspecting or `predict()`ing a model — previously
+/// had to run a fit to get there.
+///
+/// The fields are the entrypoint's own intermediate state, made public rather
+/// than reconstructed: [`run_model_with_data_inits`] is implemented on top of
+/// this, so there is one code path and a tool cannot silently diverge from what
+/// the CLI does.
+pub struct PreparedRun {
+    /// The parsed model, with `theta NAME[...]` blocks bound to the data and
+    /// `gradient_method` resolved onto `parsed.model`.
+    pub parsed: ParsedModel,
+    /// The dataset, filtered by `[data_selection]` and carrying any level-index
+    /// columns synthesized during binding.
+    pub population: Population,
+    /// Initial parameter estimates from the model file, ready to pass to [`fit`].
+    pub init_params: ModelParameters,
+    /// The covariate table, when the model declares covariates.
+    pub covariate_table: Option<CovariateTable>,
+    /// The dataset actually read, after resolving `data_path` against `[data]`.
+    pub data_path: String,
+    /// Set when an explicit `data_path` overrode the model's `[data] path`.
+    pub data_path_warning: Option<String>,
+    /// SHA-256 of the model file, `None` if it could not be hashed.
+    pub model_hash: Option<String>,
+    /// SHA-256 of the dataset, `None` if it could not be hashed.
+    pub data_hash: Option<String>,
+}
+
+/// Parse a model file and read its dataset, stopping short of the fit.
+///
+/// See [`PreparedRun`]. `data_path` is `None` to rely on the model's `[data]`
+/// block; when both are given the argument wins and
+/// [`PreparedRun::data_path_warning`] records it.
+///
+/// Unlike [`run_model_with_data`] this is **quiet** — it prints nothing — because
+/// its caller may be running it hundreds of times.
+pub fn prepare_run(model_path: &str, data_path: Option<&str>) -> Result<PreparedRun, String> {
+    prepare_run_with_inits(model_path, data_path, None)
+}
+
+/// [`prepare_run`] with the CLI's `--inits-from-nca` override, which has to be
+/// applied before `build_init_params` reads the parsed model.
+pub fn prepare_run_with_inits(
     model_path: &str,
     data_path: Option<&str>,
     inits_override: Option<crate::suggest_start::NcaInit>,
-) -> Result<(FitResult, Population), String> {
+) -> Result<PreparedRun, String> {
     use crate::parser::model_parser::parse_full_model_file;
 
     let mut parsed = parse_full_model_file(Path::new(model_path))?;
@@ -140,28 +188,19 @@ pub fn run_model_with_data_inits(
         parsed.fit_options.inits_from_nca = Some(method);
     }
 
-    eprintln!("Model: {}", parsed.model.name);
-
     let (data_path, data_path_warning) = resolve_data_path(parsed.data_path.as_deref(), data_path)?;
-    let data_path = data_path.as_str();
 
     let iov_col = parsed.fit_options.iov_column.as_deref();
     let sel_filter = build_selection_filter(&parsed.fit_options)?;
     let (mut population, covariate_table) = read_population_for(
         &parsed.model,
         &parsed.covariate_decls,
-        data_path,
+        &data_path,
         None,
         iov_col,
         sel_filter.as_ref(),
         &parsed.column_map,
     )?;
-    eprintln!(
-        "Data:  {} subjects, {} observations from {}",
-        population.subjects.len(),
-        population.n_obs(),
-        data_path
-    );
 
     // #1064: a `theta NAME[COL, ...]` block declares one θ per observed
     // combination, so its level count is a property of the data. Bind it now —
@@ -191,7 +230,50 @@ pub fn run_model_with_data_inits(
     // stamping below — so we still hash each file only once. Errors are
     // non-fatal: a missing hash just disables the resume/integrity checks.
     let model_hash = crate::io::hash::sha256_file(Path::new(model_path)).ok();
-    let data_hash = crate::io::hash::sha256_file(Path::new(data_path)).ok();
+    let data_hash = crate::io::hash::sha256_file(Path::new(&data_path)).ok();
+
+    Ok(PreparedRun {
+        parsed,
+        population,
+        init_params,
+        covariate_table,
+        data_path,
+        data_path_warning,
+        model_hash,
+        data_hash,
+    })
+}
+
+/// Like [`run_model_with_data`], but lets the caller (e.g. the CLI's
+/// `--inits-from-nca` flag) override the model file's `inits_from_nca` fit
+/// option. When `inits_override` is `None` the model-file value is used as-is;
+/// when `Some(method)` it forces that NCA strategy regardless of the file.
+pub fn run_model_with_data_inits(
+    model_path: &str,
+    data_path: Option<&str>,
+    inits_override: Option<crate::suggest_start::NcaInit>,
+) -> Result<(FitResult, Population), String> {
+    let PreparedRun {
+        mut parsed,
+        mut population,
+        init_params,
+        covariate_table,
+        data_path,
+        data_path_warning,
+        model_hash,
+        data_hash,
+    } = prepare_run_with_inits(model_path, data_path, inits_override)?;
+    let data_path = data_path.as_str();
+
+    // Printed here rather than in `prepare_run`, which is used by tools running
+    // hundreds of fits and must stay silent.
+    eprintln!("Model: {}", parsed.model.name);
+    eprintln!(
+        "Data:  {} subjects, {} observations from {}",
+        population.subjects.len(),
+        population.n_obs(),
+        data_path
+    );
 
     // Checkpoint / restart (#755): write `{model_stem}.tmp` next to the CLI
     // outputs and resume from it on a re-run of the same model + data. Disabled

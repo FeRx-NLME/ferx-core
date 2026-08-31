@@ -26,7 +26,7 @@ trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$STATE"
 
 BIN="$REPO/target/ci-fast/ferx"
-[ -x "$BIN" ] || { echo "build first: cargo build --profile ci-fast --bin ferx" >&2; exit 1; }
+[ -x "$BIN" ] || { echo "build first: cargo build --profile ci-fast -p ferx-cli" >&2; exit 1; }
 
 cat > "$WORK/sim.ferx" <<'FERX'
 [parameters]

@@ -11,7 +11,7 @@
 # Reference (simulated): TVSCALE = 20 h, TVSHAPE = 1.5, omega(ETA_SCALE) = 0.04.
 # Administrative censoring at t = 60 h.  Simulated dataset: data/tte_weibull.csv
 #
-# Run:  cargo run --release -- examples/tte_weibull.ferx --data data/tte_weibull.csv
+# Run:  cargo run --release -p ferx-cli -- examples/tte_weibull.ferx --data data/tte_weibull.csv
 #
 # Note: [structural_model], [error_model], and [individual_parameters] are
 # omitted — all three are optional when [event_model] is the sole endpoint.
