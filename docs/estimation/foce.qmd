@@ -299,7 +299,7 @@ let fit_with_cov = run_covariance(&fit, None, None, &opts)?;
 
 A covariance step that runs but cannot produce a usable matrix (a non-positive-definite or structurally-unusable FD Hessian) is **not** an error: the returned fit reports `covariance_status = Failed` with a diagnostic in `warnings`, mirroring the inline `fit()` behaviour. `Err` is reserved for input problems — a missing or hash-mismatched model/dataset, a dimension mismatch, or an IOV model supplied without its population.
 
-The second and third arguments (`Option<&CompiledModel>` / `Option<&Population>`) behave exactly as for `run_sir`: `Some(...)` is used as-is (caller owns verification), `None` re-reads from `fit.model_path` / `fit.data_path` with SHA-256 integrity checks that refuse stale source. See [Caller-supplied vs. re-read inputs](sir.qmd#caller-supplied-vs-re-read-inputs).
+The second and third arguments (`Option<&CompiledModel>` / `Option<&Population>`) behave exactly as for `run_sir`: `Some(...)` is used as-is (caller owns verification), `None` re-reads from `fit.model_path` / `fit.data_path` with SHA-256 integrity checks that refuse stale source. See [Caller-supplied vs. re-read inputs](sir.qmd#caller-supplied-vs.-re-read-inputs).
 
 ### Hessian regularization
 

@@ -275,6 +275,29 @@ jobs:
         # `.githooks/pre-commit` uses the same flag.
         run: cargo fmt --all -- --check
 
+  docs-lint:
+    name: Docs lint
+    runs-on: ubuntu-latest
+    # Deliberately on `ci.yml` and not on `docs.yml`: that workflow only runs on
+    # a push to `main`, which is too late to block a bad page. `docs-lint`
+    # depends on nothing and never links `ferx-core`, so this job is seconds of
+    # compile, not minutes (#1163).
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install stable toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: docs-lint
+
+      # Unit tests (the pandoc id algorithm) plus the corpus check over
+      # `docs/**/*.qmd`, in one step.
+      - name: cargo test -p docs-lint
+        run: cargo test -p docs-lint
+
   coverage:
     name: Tests + coverage (full, slow-tests)
     runs-on: ubuntu-latest

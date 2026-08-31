@@ -14,7 +14,7 @@ Agile): small changes flow continuously to `main`, releases are tags, and the
 loop repeats. The scarcest planning/feasibility input is often not engineering
 time but **AI token budget** — treat it as first-class when scoping and
 sequencing work (a heavy multi-agent review or a large refactor is a *cost* to
-plan for, see [§4](#4-the-development-workflow-with-ai)).
+plan for, see [§4](#the-development-workflow-with-ai)).
 
 > **Scope.** This covers governance, the issue→PR→merge→release flow, the
 > git model, cross-repo synchronization, the testing pyramid, NONMEM
@@ -38,7 +38,7 @@ lowers — the bar we hold ourselves to.
 
 - **High quality bar, especially for core numerics.** Aim *higher* than
   comparable tools on testing and validation. Every numerical result must be
-  reproducible and validated (see [§7](#7-gold-standard-validation)).
+  reproducible and validated (see [§7](#gold-standard-validation)).
 - **Match dev speed to risk.** Fast iteration is welcome for simple,
   non-core features and fixes. **Deliberately slow down** for anything that
   touches estimation, likelihood, PK/ODE math, or the `.ferx`/DSL surface.
@@ -105,14 +105,14 @@ owning intent, design, and final judgment. The standard loop:
    discover the design in the diff. Simple, non-core changes can skip straight
    to implementation.
 3. **Have CC implement the issue and open the PR.** Fill every section of the
-   [PR template](#6-pull-requests) — including the cross-repo dependency table.
+   [PR template](#pull-requests) — including the cross-repo dependency table.
 4. **For large / complex PRs — especially with numerical consequences — run
    the multi-agent review** (`/code-review` / "ultrareview", at medium or high 
    effort with up to ~9 agents),
    then have CC fix what it finds. This is token-expensive: if the budget is
    tight, schedule it overnight or hand it to someone with budget.
 5. **Produce a NONMEM comparison** of the fit (see
-   [§7](#7-gold-standard-validation)). Wire it into the test suite at the right tier:
+   [§7](#gold-standard-validation)). Wire it into the test suite at the right tier:
    a real convergence fit → **slow tests**; a simulation or quick numeric
    check → **regular tests**.
 6. *(Optional, for complex issues)* have **Copilot** review afterward as a
@@ -140,7 +140,7 @@ owning intent, design, and final judgment. The standard loop:
 
 - New feature/fix work is **branched off `main`**.
 - When done (reviewed, tested, in sync), the branch is **merged into `main`**.
-- A **release is a tag on `main`** (e.g. `v0.3.0`); see [§9](#9-releases).
+- A **release is a tag on `main`** (e.g. `v0.3.0`); see [§9](#releases).
 
 ```
 main ──●──●──●──●──●──▶   tag v0.3.0
@@ -151,7 +151,7 @@ main ──●──●──●──●──●──▶   tag v0.3.0
 
 **Trade-off we accept:** `main` is always newest but is *not guaranteed
 release-stable* between tags. We mitigate this with the CI gates in
-[§8](#8-cicd-and-quality-gates) and by treating tagged releases — not arbitrary
+[§8](#cicd-and-quality-gates) and by treating tagged releases — not arbitrary
 `main` commits — as what we point users at.
 
 > This is intentionally the simplest model. If instability on `main` becomes a
@@ -200,9 +200,9 @@ how FeRx is built:
 
 - **Cross-repo dependency table** — record the matching ferx-r (or ferx-core)
   PR and whether it must merge *before / after / together*. If a sibling PR is
-  required but not yet open, mark the PR **Draft**. See [§10](#10-cross-repo-synchronization).
+  required but not yet open, mark the PR **Draft**. See [§10](#cross-repo-synchronization).
 - **Numerical validation** — reference values vs NONMEM / nlmixr2 / a prior
-  ferx commit (see [§7](#7-gold-standard-validation)).
+  ferx commit (see [§7](#gold-standard-validation)).
 - **Breaking changes** — `.ferx` format, `FitResult`/sdtab fields, or public
   Rust API. sdtab/`FitResult` changes are parsed by ferx-r → link the R PR.
 - **Tests**, **Docs**, **Example**, and the **example-execution checklist**
@@ -277,7 +277,7 @@ after each major feature) and not yet on GitHub — a known gap to formalize.
 
 `R-CMD-check.yaml` and `test-coverage.yaml`. **ferx-r CI builds ferx-core from
 the commit pinned in `ferx-r/src/rust/Cargo.lock`** — not from latest `main`.
-See [§10](#10-cross-repo-synchronization).
+See [§10](#cross-repo-synchronization).
 
 ### 8.4 Code-quality thresholds
 
@@ -306,7 +306,11 @@ brand assets and styling as the main ferx site in `../ferx-nlme.github.io`.
   `estimation/*.qmd` (estimator behaviour), `faq.qmd` (NONMEM / nlmixr2
   comparisons).
 - On the R side, the `roxygen2`-generated `man/*.Rd` files **are** the docs —
-  regenerate and commit them (see [§6](#6-pull-requests)).
+  regenerate and commit them (see [§6](#pull-requests)).
+- **`cargo test -p docs-lint` gates the structure** — section size, heading
+  levels, duplicate anchors and dead internal links. It runs on every PR as the
+  `Docs lint` job; the rules and how to fix each one are on the
+  [Docs linter](docs-lint.qmd) page.
 
 Render locally with `quarto render docs` before marking documentation-heavy PRs
 ready for review.
@@ -429,7 +433,7 @@ A bare `cargo update` unpins the patch and CI fails with
 - [ ] Regenerate the public-API baseline in the same PR
       (`tools/update-public-api.sh`) and state which caller needs each added
       item — the `Public API baseline` job fails until you do. See
-      [§8.7](#87-the-public-api-gate).
+      [§8.7](#the-public-api-gate).
 - [ ] Open the matching ferx-r PR and record it in the PR cross-repo table.
 - [ ] Bump `Cargo.lock` in ferx-r via `update-ferx-core-lock.sh`.
 - [ ] Confirm the R package compiles against the new ferx-core.
@@ -477,7 +481,7 @@ reports, parity questions, and follow-up fixes.
 **Bug triage.** User-reported problems land as GitHub Issues (see
 [Contributing](contributing.qmd)) and are labelled and prioritized in the Project
 view. Reproduce first; a confirmed bug gets a **failing regression test before
-the fix** (see [§8](#8-cicd-and-quality-gates)). Correctness bugs in the core
+the fix** (see [§8](#cicd-and-quality-gates)). Correctness bugs in the core
 numerics outrank cosmetic issues.
 
 **Patch / hotfix releases.** Trunk-based keeps `main` as the newest code, which
@@ -486,20 +490,20 @@ is the easy case: an urgent fix branches off `main`, merges, and ships as a
 shouldn't go out yet, cherry-pick the fix onto the **latest release tag** on a
 short-lived `release/vX.Y` branch and tag the patch from there — this is the
 explicit answer to trunk-based's "`main` isn't always release-stable"
-trade-off ([§5](#5-git-workflow)). A cross-repo fix must keep ferx-core ↔ ferx-r
-in sync ([§10](#10-cross-repo-synchronization)).
+trade-off ([§5](#git-workflow)). A cross-repo fix must keep ferx-core ↔ ferx-r
+in sync ([§10](#cross-repo-synchronization)).
 
 **Deprecation & breaking changes.** Avoid silent breaks. A breaking change to
 the `.ferx` format, the public API, or sdtab / `FitResult` fields must be
 flagged in the PR template's *Breaking changes* section, carry **migration
-notes**, bump the version ([§9](#9-releases)), and be announced in the release
+notes**, bump the version ([§9](#releases)), and be announced in the release
 notes / `NEWS.md`. Where practical, **deprecate with a warning for one release**
 before removing.
 
 **Supported versions & support channel.** We support the **latest release** and
 encourage users to upgrade; old release lines aren't maintained unless a
 security fix demands it. User-facing support is via **GitHub Issues**; internal
-coordination via Google Chat ([§3](#3-communication)).
+coordination via Google Chat ([§3](#communication)).
 
 ---
 
@@ -519,7 +523,7 @@ posture: push these checks into CI rather than bolt them on later.
   `github-actions` update PRs for ferx-core. *(ferx-r: still to add.)*
 - Pin the nightly toolchain (`rust-toolchain.toml`) and bump it deliberately;
   a toolchain roll should not silently change numerical behaviour
-  ([§8](#8-cicd-and-quality-gates)).
+  ([§8](#cicd-and-quality-gates)).
 
 **Native / unsafe code.** Review any `unsafe` and the **extendr FFI boundary**
 (`src/rust/src/lib.rs` in ferx-r) with extra care — a memory-safety bug there

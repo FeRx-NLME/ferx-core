@@ -1,0 +1,105 @@
+---
+pagetitle: "Docs linter — structural rules for the ferx documentation"
+description-meta: "The four structural rules the ferx docs linter enforces: section size, heading levels, duplicate anchors, and dead internal links."
+---
+
+# Docs linter
+
+These pages are written to be read top-to-bottom, but they are *addressed* a
+section at a time — by the site's own anchor links, and by anything that
+retrieves one chunk rather than a whole page. `docs-lint` enforces four rules
+that keep that usable. It runs on every pull request (the `Docs lint` job in
+`ci.yml`).
+
+```bash
+cargo run -p docs-lint          # report violations, exit 1 if any
+cargo test -p docs-lint         # what CI runs: unit tests + the corpus check
+```
+
+The linter reads `.qmd` source only — no Quarto render, no network, no
+dependencies.
+
+## The rules
+
+| Rule | Check |
+|------|-------|
+| R1 | a section with no subsections stays under 5,000 characters |
+| R2 | never skip a heading level |
+| R3 | no two headings on a page may generate the same id |
+| R4 | internal links must resolve, including the `#anchor` |
+
+### R1 — section size
+
+A section with nothing beneath it is a terminal payload: it is read, or linked
+to, whole. Five thousand characters is roughly 2,000 tokens, but *characters*
+are the rule — it is what the linter counts, so it needs no tokenizer.
+
+**The fix is always subdivision, never deletion.** A long section split under
+subheadings costs nothing: each subheading becomes its own address, and not one
+word has to go. The limit applies to every independently-addressable chunk — a
+terminal section, the prose above a page's first heading, and the prose a parent
+section keeps above its own first subheading.
+
+Sections that predate the linter are listed in `docs/.lint-baseline`, which is
+**shrink-only**: a new violation fails, a baselined section that grew fails, and
+a section that no longer violates fails as a stale entry, so fixing one forces
+its line out of the file. Regenerate with `cargo run -p docs-lint --
+--update-baseline` — and only to *record a shrink*, never to excuse a new
+violation.
+
+### R2 — heading levels
+
+`#` → `###` with no `##` between makes the page's tree structurally wrong: the
+`###` attaches to the wrong parent, so a reader is told a section lives
+somewhere it does not.
+
+### R3 — duplicate anchors
+
+Addresses come from heading text, so a repeated heading produces `#syntax`,
+`#syntax-1`, `#syntax-2` — and the suffix depends on document order, so it moves
+when a section is inserted above it. The check is on the *generated id*, not the
+visible text: repeating a heading under a different parent is fine as long as
+the ids differ.
+
+Fix it by making the titles distinct (`### Syntax — Weibull`, which reads better
+anyway) or with an explicit `{#id}` if the wording has to stay.
+
+### R4 — internal links
+
+Every relative link must resolve, and so must its `#anchor`. See
+[How an id is generated](#how-an-id-is-generated) before hand-writing one.
+
+## How an id is generated
+
+The linter reproduces pandoc's algorithm, which Quarto uses:
+
+1. an explicit `{#id}` on the heading wins;
+2. otherwise: inline markup is stripped, every character that is not
+   alphanumeric, `_`, `-` or `.` is **deleted** (not replaced), runs of
+   whitespace become a single `-`, the result is lowercased, and everything
+   before the first letter is dropped;
+3. a repeat of an id already used on the page gets `-1`, `-2`, … in document
+   order.
+
+Three consequences catch people out — all three were live bugs on the site
+before the linter existed:
+
+| Heading | Id | Trap |
+|---------|----|------|
+| `## 3. Communication` | `#communication` | the number is dropped, so `#3-communication` is dead |
+| `## A — b` | `#a-b` | the em-dash is deleted and the spaces around it collapse to **one** hyphen |
+| `` ## Modeled duration (`D{n}`) `` | `#modeled-duration-dn` | braces are deleted without leaving a separator |
+| `## Caller-supplied vs. re-read inputs` | `#caller-supplied-vs.-re-read-inputs` | a `.` is kept |
+
+## Silencing a rule
+
+For a chunk that genuinely cannot be split, put a comment on the line above its
+heading and say why:
+
+```markdown
+<!-- lint-disable R1 -->  <!-- one generated table; splitting it desyncs the codes -->
+## Error codes
+```
+
+This should stay rare. A section that is hard to split is usually a section that
+is hard to read.

@@ -1,0 +1,23 @@
+# R1 baseline — oversized sections that predate the docs linter (#1163).
+#
+# Format: `R1 <characters> <docs/page.qmd::section-id>`
+#
+# SHRINK-ONLY. A new violation fails CI, a baselined section that grew fails CI,
+# and a section that no longer violates fails CI as a stale entry — remove its
+# line in the PR that splits it. Regenerate with:
+#
+#     cargo run -p docs-lint -- --update-baseline
+R1 22536 docs/estimation/foce.qmd::gradient-route-analytic-vs-fd
+R1 5271 docs/estimation/foce.qmd::how-the-hessian-is-built
+R1 5802 docs/estimation/saem.qmd::what-saem-does-about-it-now
+R1 5239 docs/estimation/tte.qmd::competing-risks-cause-specific-hazards
+R1 8695 docs/file-formats/check-report.qmd::error-warning-codes
+R1 7642 docs/model-file/adaptive-dosing.qmd::current-scope-and-limits
+R1 6006 docs/model-file/error-model.qmd::covariate-selected-error-models-ifelse
+R1 7367 docs/model-file/error-model.qmd::examples
+R1 28394 docs/model-file/fit-options.qmd::general-options
+R1 5127 docs/model-file/fit-options.qmd::vi-specific-options
+R1 9448 docs/model-file/ode-models.qmd::letting-ferx-pick-the-stepper-ode_method-auto
+R1 5756 docs/model-file/ode-models.qmd::which-regime-am-i-in
+R1 5746 docs/model-file/scaling.qmd::interaction-with-gradients
+R1 7391 docs/warnings.qmd::warning-codes
