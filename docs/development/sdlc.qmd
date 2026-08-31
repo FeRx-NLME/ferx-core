@@ -311,6 +311,9 @@ brand assets and styling as the main ferx site in `../ferx-nlme.github.io`.
   levels, duplicate anchors and dead internal links. It runs on every PR as the
   `Docs lint` job; the rules and how to fix each one are on the
   [Docs linter](docs-lint.qmd) page.
+- **Keep rationale and validation in their own subsection**, so a usage section
+  is not also a wall of background — see [Writing a docs
+  page](contributing.qmd#writing-a-docs-page).
 
 Render locally with `quarto render docs` before marking documentation-heavy PRs
 ready for review.

@@ -40,6 +40,12 @@ word has to go. The limit applies to every independently-addressable chunk — a
 terminal section, the prose above a page's first heading, and the prose a parent
 section keeps above its own first subheading.
 
+Where to cut is usually obvious once you look for it: an oversized section is
+typically a usage explanation welded to its justification, and lifting the
+justification out under `### Rationale` or `### Validation` fixes both the size
+and the addressability. See [Writing a docs
+page](contributing.qmd#writing-a-docs-page).
+
 Sections that predate the linter are listed in `docs/.lint-baseline`, which is
 **shrink-only**: a new violation fails, a baselined section that grew fails, and
 a section that no longer violates fails as a stale entry, so fixing one forces
