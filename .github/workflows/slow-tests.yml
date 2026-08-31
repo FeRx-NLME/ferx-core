@@ -29,6 +29,15 @@ on:
       # bought 4 skipped runs in 400 (1% — one of them a `Cargo.lock` bump that should run
       # anyway) while silently missing 67. That is the trade, and it is not close.
       #
+      # `tools/**` was added for #1157: `tools/preflight.sh` is executed by CI itself, and
+      # naming it in a test's assertion message is enough for the harvest below to derive
+      # `tools` as an input root. Measured before adding it, the same way the numbers above
+      # were: over the last 400 first-parent commits on `main`, 3 touch `tools/` and **0**
+      # would newly fire this workflow — every one of the three also touched `src/` or
+      # `tests/`, so they already did. Cost of covering it: zero runs. The alternative was to
+      # keep re-shaping test prose so it does not look like a path, which is fragile and
+      # buys nothing measurable.
+      #
       # `tests/slow_test_path_filter.rs` pins this list in both directions: every input the
       # suite reads must be matched here, and every entry here must match a tracked file.
       # The input roots it checks against are derived from the tree and from the fixture
@@ -42,6 +51,7 @@ on:
       - 'nonmem_anchor/**'                  # committed NONMEM control streams, data and `.phi` references
       - 'src/**'                            # everything linked into the fits
       - 'tests/**'                          # the gated fits themselves + the shared tests/common harness
+      - 'tools/**'                          # scripts CI itself executes (preflight, the API baseline)
 
 env:
   CARGO_TERM_COLOR: always

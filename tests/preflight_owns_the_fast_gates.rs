@@ -30,26 +30,6 @@
 
 use std::path::PathBuf;
 
-const SCRIPT_DIR: &str = "tools";
-const SCRIPT_FILE: &str = "preflight.sh";
-
-/// `tools/preflight.sh`, assembled from its two components.
-///
-/// Spelled this way on purpose. `tests/slow_test_path_filter.rs` (#949) byte-scans every
-/// `tests/*.rs` for double-quoted literals and treats any `<tracked-root>/<rest>` it finds as
-/// a **data input the heavy fit suite reads**, then requires `slow-tests.yml` to list that
-/// root under `push: paths:`. Its own docs call the scan "deliberately crude" and rely on the
-/// must-be-a-tracked-root filter to drop false positives — but `tools` *is* a tracked root, so
-/// a bare path literal in an assertion message here registers this script as a fit input and
-/// fails that guard.
-///
-/// It is not one: `slow-tests.yml` never invokes preflight, and nothing in this file can
-/// change a fit result. The alternative fix — adding `tools/**` to that workflow's `paths:` —
-/// would encode the opposite claim and trigger a multi-hour suite on unrelated tooling edits.
-fn script_rel() -> String {
-    format!("{SCRIPT_DIR}/{SCRIPT_FILE}")
-}
-
 fn ci_yml() -> String {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join(".github")
@@ -126,7 +106,7 @@ fn the_fast_gate_jobs_delegate_to_preflight_and_never_inline_cargo() {
         );
 
         // (2) it must actually call its own group.
-        let want = format!("{} {group}", script_rel());
+        let want = format!("tools/preflight.sh {group}");
         assert!(
             cmds.iter().any(|c| c == &want),
             "job `{job}` never runs `{want}`; its steps are:\n  {}",
@@ -138,8 +118,8 @@ fn the_fast_gate_jobs_delegate_to_preflight_and_never_inline_cargo() {
 #[test]
 fn preflight_is_executable_and_lists_every_group() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let script = root.join(SCRIPT_DIR).join(SCRIPT_FILE);
-    assert!(script.is_file(), "{} is missing", script_rel());
+    let script = root.join("tools").join("preflight.sh");
+    assert!(script.is_file(), "tools/preflight.sh is missing");
 
     #[cfg(unix)]
     {
@@ -147,8 +127,7 @@ fn preflight_is_executable_and_lists_every_group() {
         let mode = std::fs::metadata(&script).unwrap().permissions().mode();
         assert!(
             mode & 0o111 != 0,
-            "{} is not executable (mode {mode:o}); CI runs it directly",
-            script_rel()
+            "tools/preflight.sh is not executable (mode {mode:o}); CI runs it directly"
         );
     }
 
@@ -162,8 +141,7 @@ fn preflight_is_executable_and_lists_every_group() {
         .expect("run tools/preflight.sh --list");
     assert!(
         out.status.success(),
-        "{} --list exited {:?}\nstderr:\n{}",
-        script_rel(),
+        "tools/preflight.sh --list exited {:?}\nstderr:\n{}",
         out.status.code(),
         String::from_utf8_lossy(&out.stderr)
     );
@@ -225,7 +203,7 @@ fn preflight_is_executable_and_lists_every_group() {
 fn preflight_help_renders_its_usage_block() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let out = std::process::Command::new("bash")
-        .arg(root.join(SCRIPT_DIR).join(SCRIPT_FILE))
+        .arg(root.join("tools").join("preflight.sh"))
         .arg("--help")
         .current_dir(&root)
         .output()
@@ -239,8 +217,8 @@ fn preflight_help_renders_its_usage_block() {
 
     for want in [
         "Run the fast CI gates locally",
-        "preflight.sh check",
-        "preflight.sh --list",
+        "tools/preflight.sh check",
+        "tools/preflight.sh --list",
         "Groups: fmt, check, clippy, public-api",
     ] {
         assert!(
