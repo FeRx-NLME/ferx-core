@@ -222,10 +222,14 @@ fn is_broken_ferx_invocation(line: &str) -> bool {
             .is_some_and(|(_, rest)| !rest.starts_with('-') && !rest.starts_with('_'));
     // A run that passes arguments through `--` but never selects a package.
     // `--bin <other>` excuses it: that is one of the bins still in core.
-    let unscoped_run = line.contains(" -- ")
-        && !line.contains(cli_pkg.as_str())
-        && !line.contains("-p ferx-core")
-        && !line.contains("--bin ");
+    //
+    // Any explicit `-p <pkg>` / `--package <pkg>` excuses it too, and the check
+    // is on the *form* rather than on a list of package names: the workspace
+    // gained `docs-lint` (#1163), whose `cargo run -p docs-lint -- --check` is
+    // correct precisely because it selects its package. Enumerating the members
+    // here would make every new one a false positive on its first commit.
+    let selects_a_package = line.contains("-p ") || line.contains("--package ");
+    let unscoped_run = line.contains(" -- ") && !selects_a_package && !line.contains("--bin ");
     // Feature flags belong to `ferx-core`, so a member-scoped command has to
     // qualify them.
     let unqualified_feature = line.contains(cli_pkg.as_str())
@@ -306,6 +310,15 @@ fn invocation_classifier_excuses_the_explicit_form() {
     assert!(!is_broken_ferx_invocation(&format!(
         "{run} --bin generate_data -- out.csv"
     )));
+    // Another workspace member, selected explicitly: correct for the same
+    // reason `-p ferx-cli` is, and the guard must not read "not the CLI" as
+    // "no package" (#1163).
+    assert!(!is_broken_ferx_invocation(
+        "cargo run -p docs-lint -- --check"
+    ));
+    assert!(!is_broken_ferx_invocation(
+        "cargo run --package docs-lint -- --update-baseline"
+    ));
     // Features qualified for a member-scoped build.
     assert!(!is_broken_ferx_invocation(&format!(
         "{build} {pkg} --features ferx-core/ci"
