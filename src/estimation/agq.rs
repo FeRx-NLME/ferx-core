@@ -47,7 +47,7 @@
 //!
 //! `H` is the Hessian of the *true* integrand, obtained by central differences of
 //! `individual_nll`. It is deliberately **not**
-//! [`crate::estimation::importance_sampling::compute_posterior_hessian`], which builds the
+//! `crate::estimation::importance_sampling::compute_posterior_hessian`, which builds the
 //! Gauss-Newton form `Ω⁻¹ + JᵀR⁻¹J`: that carries no curvature at all from TTE or
 //! categorical endpoints, i.e. it is blind on exactly the models AGQ is here to serve, and
 //! would scale their grids by `Ω` alone. Note the grid scaling only affects *accuracy at
@@ -579,7 +579,7 @@ fn agq_nodes_and_terms(
 }
 
 /// Population AGQ objective: `Σ_i agq_subject_nll_i`. The outer loop doubles this into an
-/// OFV, exactly as it does [`crate::estimation::outer_optimizer::pop_nll`].
+/// OFV, exactly as it does `crate::estimation::outer_optimizer::pop_nll`.
 ///
 /// Parallel over subjects (the grid sweep stays serial *within* a subject, matching
 /// importance sampling), then reduced **serially in subject order** — a rayon `.sum()`
@@ -736,17 +736,17 @@ pub fn analytic_score_supported(model: &CompiledModel) -> bool {
 ///
 /// * the fixed-η score is analytic where the provider reaches
 ///   ([`analytic_score_supported`]) and finite-differenced *at fixed η* otherwise
-///   ([`accumulate_fixed_b_packed_gradient_fd`]) — the latter is correct for any likelihood
+///   (`accumulate_fixed_b_packed_gradient_fd`) — the latter is correct for any likelihood
 ///   ferx can evaluate, including TTE and categorical; and
 /// * `dη̂/dx` comes from the implicit-function theorem (`−H⁻¹·∂²nll/∂η∂x`), analytic where the
-///   provider reaches and finite-differenced otherwise ([`eta_dx`]).
+///   provider reaches and finite-differenced otherwise (`eta_dx`).
 ///
 /// Crucially **neither path re-solves the inner loop**, which is the cost that makes
 /// `reconverged_fd_gradient` expensive. Letting the models AGQ exists for — non-Gaussian
 /// endpoints, which are precisely the ones outside the `Dual2` provider — fall back to that
 /// gradient would have made the headline use case the slow one.
 ///
-/// **Node-count independent.** With [`grid_response_correction`] supplying the `∂Φ/∂H·dH/dx`
+/// **Node-count independent.** With `grid_response_correction` supplying the `∂Φ/∂H·dH/dx`
 /// term, the gradient is the exact total derivative at every `n_agq`, `n_agq = 1` included
 /// (where that term is exactly `½·d log|H|/dx`, the Laplace log-determinant).
 pub fn analytic_gradient_available(model: &CompiledModel) -> bool {

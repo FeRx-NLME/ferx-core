@@ -339,7 +339,7 @@ pub struct AdaptiveRun {
 /// One row per `(subject, draw, sim)` — the same key as the trajectory, ledger,
 /// and decision-log rows in [`crate::AdaptiveSimulationResult`], so a metrics row
 /// joins to exactly the run it summarizes. Every field is computed by
-/// [`compute_subject_metrics`] from that run's realized dose ledger and decision
+/// `compute_subject_metrics` from that run's realized dose ledger and decision
 /// log **alone** — no re-integration — so each number is a direct, auditable
 /// function of the recorded artifacts (the same "reproduce it from the artifacts"
 /// contract as the decision log).
@@ -353,7 +353,7 @@ pub struct AdaptiveRun {
 ///
 /// `#[non_exhaustive]`: new outcome metrics (#391 S2.x) land additively without a
 /// breaking change. Within `ferx-core` it is still constructed normally (only
-/// [`compute_subject_metrics`] builds it); the attribute forces downstream crates
+/// `compute_subject_metrics` builds it); the attribute forces downstream crates
 /// (`ferx-r`) to read fields rather than rely on an exhaustive struct literal.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
@@ -792,7 +792,7 @@ impl AdaptiveDosingSpec {
     /// The struct is `pub` with `pub` fields, so a programmatically-built spec can
     /// reach the controller without going through the parser. The parser calls
     /// this on the spec it assembles, and
-    /// [`compile_adaptive`](crate::sim::adaptive_control::compile_adaptive) calls
+    /// `compile_adaptive` calls
     /// it again as the safety net for hand-built specs — so neither path can drive
     /// the controller with a contradiction (a `Level` step without a `levels`
     /// ladder, a `start_dose` outside `dose_bounds`, a rung outside `dose_bounds`,

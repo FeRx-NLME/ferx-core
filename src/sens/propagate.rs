@@ -24,7 +24,7 @@ use crate::types::{DoseEvent, PkModel, Subject};
 
 /// 1-cpt IV/central propagator: evolve `state[0]` (central amount) over `dt` with
 /// a constant input `rate` into the central compartment. Mirror of
-/// [`crate::pk::event_driven::propagate_one_cpt`].
+/// `crate::pk::event_driven::propagate_one_cpt`.
 pub fn propagate_one_cpt_g<T: PkNum>(state: &mut [T], dt: T, cl: T, v: T, rate: T) {
     if v.val() <= 0.0 || cl.val() <= 0.0 {
         // Degenerate params: skip (the outer optimizer sees a poor OFV and steps
@@ -41,7 +41,7 @@ pub fn propagate_one_cpt_g<T: PkNum>(state: &mut [T], dt: T, cl: T, v: T, rate: 
 /// zero-order input into central (depot-bypass infusion, RATE>0 into cmt 2);
 /// `rate_depot` is a constant zero-order input into the depot (RATE>0 into cmt 1,
 /// #400). Both are added by linear superposition and are `0` for bolus dosing.
-/// Mirror of [`crate::pk::event_driven::propagate_one_cpt_oral`], including the
+/// Mirror of `crate::pk::event_driven::propagate_one_cpt_oral`, including the
 /// `ka ≈ ke` L'Hôpital limit.
 pub fn propagate_one_cpt_oral_g<T: PkNum>(
     state: &mut [T],

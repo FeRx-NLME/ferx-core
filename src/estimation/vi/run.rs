@@ -20,7 +20,7 @@
 //! `vi_iters` is a **ceiling, not a budget**. The objective is a Monte-Carlo estimate,
 //! so a per-iteration improvement test would stop on noise; the run therefore stops on
 //! the same windowed moving-average predicate ([`trace_has_settled`]) that decides the
-//! reported `converged` flag, checked every [`CONVERGENCE_CHECK_INTERVAL`] iterations.
+//! reported `converged` flag, checked every `CONVERGENCE_CHECK_INTERVAL` iterations.
 //! Tying both to one predicate means "ran to completion" and "reported converged"
 //! cannot disagree.
 //!

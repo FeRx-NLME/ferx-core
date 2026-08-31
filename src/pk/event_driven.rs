@@ -93,7 +93,7 @@ pub enum EventKind {
     PkOnly,
     /// EVID=3 / EVID=4 system reset — zeros every compartment amount.
     /// For EVID=4 a `Dose` event is scheduled at the same time; the
-    /// `Reset < Dose` tie-break (see [`kind_order`]) makes the reset run
+    /// `Reset < Dose` tie-break (see `kind_order`) makes the reset run
     /// first so the dose lands in a freshly emptied system.
     Reset,
 }
@@ -168,7 +168,7 @@ impl EventSchedule {
     ///
     /// `doses` is the per-dose `(rate, duration)` the schedule's infusion break
     /// times are built from. Pass the **bioavailability-adjusted** doses (see
-    /// [`DoseEvent::with_bioavailable_infusion`], #419) so the infusion-end break
+    /// `DoseEvent::with_bioavailable_infusion`, #419) so the infusion-end break
     /// at `start + duration` reflects `F`'s reshaping of a rate-defined window;
     /// pass `&subject.doses` when `F` is `1`/absent or cannot reshape a window (the
     /// cached fast path only caches in that case). Must be parallel to

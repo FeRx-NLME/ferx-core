@@ -464,7 +464,7 @@ pub fn validate_ctmm_states(
 /// in file order (the NONMEM convention is time-ordered input, but nothing enforces
 /// it). An out-of-order pair would make [`ctmm_data_term`] return
 /// [`MarkovError::TimeDecreased`](crate::markov::MarkovError::TimeDecreased), which
-/// [`ctmm_endpoint_nll`] maps to the [`SUBJECT_SENTINEL_NLL`] backstop — silently
+/// `ctmm_endpoint_nll` maps to the `SUBJECT_SENTINEL_NLL` backstop — silently
 /// collapsing that subject's entire likelihood to `1e20` and biasing the population
 /// fit with no diagnostic. Rejecting up front converts that silent corruption into a
 /// clear error, mirroring [`validate_ctmm_states`]. Only `DiscreteState` rows on

@@ -37,7 +37,7 @@ pub(crate) fn theta_packs_log(theta_lower: f64) -> bool {
 ///          log(sigma_1), ..., log(sigma_m)]
 ///
 /// Theta packing depends on whether the user's `theta_lower[i]` allows
-/// negatives — see [`theta_packs_log`].
+/// negatives — see `theta_packs_log`.
 pub fn pack_params(params: &ModelParameters) -> Vec<f64> {
     let mut v = Vec::new();
 

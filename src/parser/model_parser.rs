@@ -16661,7 +16661,7 @@ pub(crate) fn compiled_model_uses_time_builtin(model: &CompiledModel) -> bool {
 /// `[initial_conditions] init(cmt) = ...` surface parses with `ParseCtx::new`,
 /// where an unresolved identifier is an `Expression::Covariate` rather than an
 /// `Expression::Variable` — so `MACHEPS` there is an ordinary (and therefore
-/// required) data column, not machine epsilon, which only [`MapEnv::resolve`]'s
+/// required) data column, not machine epsilon, which only `MapEnv::resolve`'s
 /// `Variable` arm supplies. `MIXNUM` is the one entry that does carry over: it
 /// parses to its own `Expression::MixNum` node and resolves through
 /// `current_mixture_class()` on both surfaces.
@@ -16676,7 +16676,7 @@ pub const ODE_INIT_SCOPE_BUILTINS: &[&str] = &["MACHEPS", "MIXNUM"];
 /// reference. Every one of them is a time-since-something clock, and an initial
 /// condition is evaluated at the time origin, so each would read a constant 0
 /// and silently flatten the expression (issue #994). `TIME` is rejected by an
-/// AST-node guard ([`expr_references_time_node`] — a bare `TIME` parses to a
+/// AST-node guard (`expr_references_time_node` — a bare `TIME` parses to a
 /// dedicated `Expression::Time` node, not a variable, which is how it evaded the
 /// undefined-name check); `T`, `TAFD` and `TAD` are ordinary identifiers in an
 /// `[odes]` init RHS and are caught by the undefined-name check around it.
@@ -20692,7 +20692,7 @@ fn simplify_expr(expr: &Expression) -> Expression {
 // for them.
 
 /// Precomputed symbolic partials of `[individual_parameters]` assignments,
-/// produced by [`build_indiv_param_partials`]. Stored on
+/// produced by `build_indiv_param_partials`. Stored on
 /// [`CompiledModel`] as a primitive for any
 /// future analytical-η-gradient path. The originally-planned consumers —
 /// Tier 4a milestones 3-5 (augmented ODE RHS, Form C readout sensitivities,

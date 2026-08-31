@@ -366,7 +366,7 @@ pub fn two_cpt_ig_g<T: PkNum>(
 /// `1/(2·MAT·CV²)`; since `α ≥ β`, guarding `α < 1/(2·MAT·CV²)` suffices. Outside it —
 /// invalid params, confluent eigenvalues, or the flip-flop `α ≥ 1/(2·MAT·CV²)` — this
 /// returns `0.0` (the sibling closed forms' invalid-parameter convention), with the
-/// NaN-safe `!(α < abscissa)` form of [`ig_2cpt_domain_ok`].
+/// NaN-safe `!(α < abscissa)` form of `ig_2cpt_domain_ok`.
 #[allow(clippy::too_many_arguments)]
 pub fn two_cpt_ig_amt_g<T: PkNum>(
     amt: T,

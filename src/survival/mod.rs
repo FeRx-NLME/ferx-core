@@ -1061,7 +1061,7 @@ fn simulate_rtte_stream<R: rand::Rng>(
 ///   cause CMT is emitted, giving the cause-specific layout the data reader expects.
 ///
 /// `horizon` (`[simulation] horizon`, #522), when `Some(h)`, **overrides** the
-/// per-record [`observation_window`] for every cause: `h` becomes the shared
+/// per-record `observation_window` for every cause: `h` becomes the shared
 /// administrative censoring window regardless of each record's `event_type`. This
 /// is what a competing-risks VPC needs — re-simulating event-bearing data
 /// (`Exact` records, which on their own draw unbounded) then censors at the

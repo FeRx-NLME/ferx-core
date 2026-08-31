@@ -694,3 +694,37 @@ fn preflight_help_lists_every_group_and_works_from_any_cwd() {
         );
     }
 }
+
+/// A crate-level `#![allow(rustdoc::...)]` is a neutered gate the command list cannot see.
+///
+/// The `docs` group can carry `-Dwarnings` on every line, run on every PR, and still pass
+/// over a tree whose rendered HTML is full of `[<code>foo</code>]` — because the lint that
+/// would have fired was switched off inside the crate. `private_intra_doc_links` is the
+/// one that matters here: rustdoc drops a link to a `pub(crate)` item and leaves the
+/// markdown brackets in the public page, exactly the defect the gate exists to catch. An
+/// `allow` also silences every FUTURE such link, so the class leaves the gate permanently
+/// rather than for one PR.
+///
+/// Rustdoc lints are therefore fixed at the link, not at the crate root: an internal target
+/// becomes inline code, a public target gets a resolvable path. A per-item `#[allow]` is out
+/// of scope for this test — it is visible in review at the place it applies; a crate-level
+/// one is a single line thousands of lines from anything it affects.
+#[test]
+fn no_crate_level_allow_switches_a_rustdoc_lint_off() {
+    let lib = std::fs::read_to_string(repo_root().join("src/lib.rs")).expect("read src/lib.rs");
+    let offenders: Vec<&str> = lib
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| l.starts_with("#!["))
+        .filter(|l| l.contains("allow") && l.contains("rustdoc::"))
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "src/lib.rs switches a rustdoc lint off crate-wide. The `docs` group then still \
+         runs, still denies warnings, and still passes while the public HTML renders the \
+         unresolved links with their brackets intact — and it does so for every link added \
+         after this line, not just today's. Fix the links instead: inline code for an \
+         internal target, a resolvable path for a public one.\n  {}",
+        offenders.join("\n  ")
+    );
+}

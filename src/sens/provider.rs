@@ -494,7 +494,7 @@ enum ExKind {
 /// routed through the per-event event-driven `Dual2` walk
 /// ([`subject_sensitivities_tvcov`]) rather than dose superposition, which can't
 /// express a mid-decay parameter switch. The routing (`uses_time_builtin`) is in
-/// [`subject_sensitivities_impl`] / [`subject_eta_grad_impl`] (#486 / #610).
+/// `subject_sensitivities_impl` / `subject_eta_grad_impl` (#486 / #610).
 pub fn analytical_supported(model: &CompiledModel) -> bool {
     // A `TIME` model does NOT use the static dose-superposition path — its subjects
     // route through the per-event event-driven walk. So being model-level "analytic"
@@ -1579,7 +1579,7 @@ pub(crate) fn subject_eta_grad_iov(
 /// PK parameters are seeded on their own `Dual2` axis block; the event-driven walk
 /// carries the dual amounts across occasion boundaries (exact carryover), and the
 /// `run_obs`-style two-level chain maps `∂conc/∂pk` back to the stacked η and θ
-/// through each group's [`CombinedDerivs`].
+/// through each group's `CombinedDerivs`.
 pub fn subject_sensitivities_iov(
     model: &CompiledModel,
     subject: &Subject,
@@ -2658,7 +2658,7 @@ fn run_obs_iov_eta<const N: usize>(
 /// compiled individual-parameter program with `(θ, η)` axis counts matching the
 /// model, so each event's `∂p/∂(θ, η)` (+ second order) can be evaluated at *that
 /// event's* covariate snapshot via
-/// [`pd_from_program`](crate::sens::ode_provider::pd_from_program).
+/// `pd_from_program`.
 pub fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
     // `analytical_supported_core` (not `analytical_supported`) so a `TIME` model doesn't
     // recurse: `analytical_supported` calls back here for the `uses_time_builtin` case

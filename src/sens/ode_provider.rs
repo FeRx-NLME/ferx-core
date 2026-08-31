@@ -10,7 +10,7 @@
 //! `∂²u/∂p²` through the integration with **value-based step control**. The
 //! readout then yields `∂f/∂p, ∂²f/∂p²` per observation, which feed the η/θ chain
 //! via the **general** individual-parameter derivatives `∂p/∂η, ∂p/∂θ` (FD of
-//! `pk_param_fn` — see [`param_derivatives`]; no log-normal assumption).
+//! `pk_param_fn` — see `param_derivatives`; no log-normal assumption).
 //!
 //! **Supported:** single-endpoint `ObsCmt`, uniform Form C (`y = central/V1`), or
 //! per-CMT Form C (`y[CMT=N] = <expr>` — each endpoint differentiated over the dual,
@@ -26,7 +26,7 @@
 //! **LTBS** (`log(DV) ~ …`) output transforms; all five built-in input-rate
 //! forcings (igd/transit/weibull/first_order/zero_order, #430/#468/#530);
 //! **estimated lagtime** (incl. compartment-indexed `ALAG{cmt}`) for every forcing
-//! except `weibull()`; up to [`MAX_ODE_SENS_DIM`] individual parameters. Both the full
+//! except `weibull()`; up to `MAX_ODE_SENS_DIM` individual parameters. Both the full
 //! `Dual2` **outer** gradient and a light `Dual1` **inner** η-gradient
 //! ([`ode_subject_eta_grad`]) are served (#410). On the event-driven walk these compose
 //! with **time-varying covariates**, **steady-state dosing** (dual SS-equilibration), and
@@ -257,7 +257,7 @@ pub(crate) fn ode_scaling_supported(model: &CompiledModel) -> bool {
 /// True when [`ode_subject_sensitivities`] can serve this model: an ODE model
 /// with a compiled RHS program, single `ObsCmt` readout, no built-in absorption,
 /// no `init(...)`, no IOV/SDE, no output transform, and an individual-parameter
-/// count within [`MAX_ODE_SENS_DIM`]. Per-subject gates (bolus-only doses, no TV
+/// count within `MAX_ODE_SENS_DIM`. Per-subject gates (bolus-only doses, no TV
 /// covariates/resets) are checked in [`ode_subject_sensitivities`].
 pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
     // A `TIME`-built-in structural parameter is served analytically on the ODE path
@@ -2626,7 +2626,7 @@ pub fn ode_subject_sensitivities_iov(
 }
 
 /// Light **inner** η-gradient (`Dual1<N>`, `N = n_stacked = n_eta + K·n_kappa`) for an
-/// ODE IOV subject — the IOV counterpart of [`run_subject_tvcov_eta`] and the inner
+/// ODE IOV subject — the IOV counterpart of `run_subject_tvcov_eta` and the inner
 /// sibling of [`ode_subject_sensitivities_iov`]. Returns `∂f/∂(stacked-η)` per
 /// observation (no θ block, no Hessian), or `None` outside the matched IOV scope. The
 /// caller (`analytic_eta_nll_gradient_iov`) assembles the conditional-NLL gradient over

@@ -14,7 +14,7 @@
 //! empirical Bayes estimate. Because the class-specific typical values are
 //! selected by the reserved `MIXNUM` index inside `[individual_parameters]`, and
 //! `MIXNUM` resolves from a thread-local, each class's inner solve + NLL is run
-//! under a [`MixtureClassGuard`]. The per-class loop is **serial** on purpose: a
+//! under a `MixtureClassGuard`. The per-class loop is **serial** on purpose: a
 //! thread-local set on the outer thread would not reach the rayon workers the
 //! standard inner loop uses, so the mixture path drives `find_ebe` itself.
 //!

@@ -16,9 +16,9 @@
 //! The steady-state forms add a geometric SS factor that is a transcendental
 //! function of the single disposition rate `k = CL/V` (and, for oral, also of
 //! `ka`). Rather than hand-differentiate those, we evaluate the `k`-dependence
-//! over a **1-D second-order jet** [`Jet<1>`](super::jet::Jet) (value + `d/dk` +
+//! over a **1-D second-order jet** `Jet<1>` (value + `d/dk` +
 //! `d²/dk²`) and then
-//! chain `k(CL,V)` to the `[CL,V]` derivatives in closed form via [`chain1`].
+//! chain `k(CL,V)` to the `[CL,V]` derivatives in closed form via `chain1`.
 //! This stays scalar/cheap (a 1-D jet, not the `O(N²)` `Dual2<N>`) while letting
 //! the jet carry the messy `k`-calculus — so a kernel only transcribes the
 //! algebraic shape.
