@@ -109,6 +109,34 @@ const ODE_TV_COV: &str = r#"
   DV ~ proportional(PROP)
 "#;
 
+// Time-varying covariate reaching the prediction ONLY through an `init(...)` seed
+// (#1133). `CL`/`V` are plain thetas, so `CRCL` moves nothing but the baseline the
+// system starts (and restarts) from — which makes the snapshot an EVID=3 reset re-seeds
+// with directly observable in the trajectory instead of tangled with disposition.
+const ODE_TV_INIT: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL   = TVCL
+  V    = TVV
+  BASE = CRCL * 10.0
+[structural_model]
+  ode(states=[central])
+[odes]
+  init(central)  = BASE
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
 // 1-cpt IV ODE whose RHS reads TAFD (time after first dose). The extra
 // `-1e-3·TAFD·central` decay makes the trajectory depend on the TAFD anchor, so a stale
 // anchor (e.g. earliest *base* dose instead of the true global earliest) integrates
@@ -278,10 +306,12 @@ fn subj(id: &str, obs_times: Vec<f64>, doses: Vec<DoseEvent>) -> Subject {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1u32; n],
         obs_l2: Vec::new(),
         dose_occasions: vec![1u32; n_dose],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -426,6 +456,97 @@ fn adaptive_reset_matches_static_predict() {
             traj.time
         );
     }
+}
+
+/// #1133 — the adaptive driver's reset re-seed must read the reset ROW's own covariate
+/// snapshot, not the decision-time LOCF carry.
+///
+/// `adaptive_reset_matches_static_predict` above cannot see this: `ODE_NO_IIV` has no
+/// `init(...)` and no covariate, so every candidate snapshot seeds the same zeros. Here
+/// `init(central) = CRCL*10` and `CRCL` steps 100 → 40 exactly at the reset row, between
+/// records carrying 100 and 25 — so the previous record, the reset row, and the next
+/// record give three different baselines (1000 / 400 / 250).
+///
+/// Two oracles run at once, and they are independent:
+///
+///   * the **degenerate oracle** — the same realized regimen scored by `predict()`, which
+///     routes a reset subject to `ode_predictions_event_driven` (the engine anchored
+///     against NONMEM in `tests/reset_init_snapshot_nonmem_anchor.rs`);
+///   * the **frozen-replay verifier**, on by default, which rebuilds the subject from the
+///     realized dose ledger and walks it through `adaptive_frozen_replay_tv`. Its `Ok` is
+///     part of this assertion, so the driver and the replay must agree with *each other*
+///     as well as with the static engine — three engines, one convention.
+#[test]
+fn adaptive_reset_reseeds_init_from_the_reset_rows_covariates() {
+    let model = parse_model_string(ODE_TV_INIT).expect("parse TV-init ODE model");
+    let decisions = vec![0.0, 24.0, 48.0];
+    let obs = vec![6.0, 30.0, 42.0, 54.0];
+    let reset_at = 36.0;
+    let crcl = |v: f64| HashMap::from([("CRCL".to_string(), v)]);
+
+    // Records: obs at 6 and 30 carry CRCL=100; the reset row at 36 carries 40; the obs at
+    // 42 and 54 carry 25. Only the middle one may reach the re-seed.
+    let with_cov = |mut s: Subject| -> Subject {
+        s.covariates = crcl(100.0);
+        s.obs_covariates = vec![crcl(100.0), crcl(100.0), crcl(25.0), crcl(25.0)];
+        s.dose_covariates = s.doses.iter().map(|_| crcl(100.0)).collect();
+        s.reset_times = vec![reset_at];
+        s.reset_covariates = vec![crcl(40.0)];
+        s
+    };
+
+    let base = with_cov(subj("1", obs.clone(), vec![]));
+    assert!(
+        base.has_tv_covariates(),
+        "the subject must take the TV path"
+    );
+    let pop = population(vec![base]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(7),
+        decision_times: decisions.clone(),
+        ..Default::default() // verify = true
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        .expect("adaptive sim runs and passes the frozen-replay verifier");
+    assert_eq!(res.ledger.len(), 3, "a bolus at every decision");
+
+    let static_doses: Vec<DoseEvent> = decisions
+        .iter()
+        .map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
+        .collect();
+    let static_pop = population(vec![with_cov(subj("1", obs.clone(), static_doses))]);
+    let preds = predict(&model, &static_pop, &model.default_params);
+
+    assert_eq!(res.trajectories.len(), obs.len());
+    for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
+        assert!(
+            (traj.ipred - pred.pred).abs() <= 1e-6 + 1e-4 * pred.pred.abs(),
+            "adaptive IPRED {} != static predict {} at t={}: the reset re-seed read a \
+             different covariate snapshot than the static engine (#1133)",
+            traj.ipred,
+            pred.pred,
+            traj.time
+        );
+    }
+
+    // Non-degeneracy: the post-reset observation must actually carry the reset row's
+    // baseline. At t=42, six hours after the reset, the seed 400 has decayed by
+    // exp(-0.1*6) = 0.5488 to ~219.5 — while the previous record's snapshot would give
+    // ~548.8 and the next record's ~137.2. Assert the band that admits only 400.
+    let t42 = res
+        .trajectories
+        .iter()
+        .find(|t| (t.time - 42.0).abs() < 1e-9)
+        .expect("an observation at t=42");
+    let expected = 400.0 * (-(5.0 / 50.0) * 6.0f64).exp();
+    assert!(
+        (t42.ipred - expected).abs() < 1e-3,
+        "post-reset IPRED {} is not the reset row's baseline decayed ({expected:.4}); \
+         the previous record's snapshot would give {:.4} and the next record's {:.4}",
+        t42.ipred,
+        expected * 2.5,
+        expected * 0.625
+    );
 }
 
 #[test]

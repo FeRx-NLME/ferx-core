@@ -2033,10 +2033,12 @@ mod tests {
                 pk_only_times: vec![],
                 pk_only_covariates: vec![],
                 reset_times: vec![],
+                reset_covariates: Vec::new(),
                 cens: vec![0; n_obs_each],
                 occasions: vec![],
                 obs_l2: Vec::new(),
                 dose_occasions: vec![],
+                reset_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
             });
