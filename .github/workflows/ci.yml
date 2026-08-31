@@ -236,9 +236,11 @@ jobs:
           shared-key: docs-lint
 
       # Unit tests (the pandoc id algorithm) plus the corpus check over
-      # `docs/**/*.qmd`, in one step.
-      - name: cargo test -p docs-lint
-        run: cargo test -p docs-lint
+      # `docs/**/*.qmd`, in one step — through `tools/preflight.sh` for the same
+      # reason as `Check` / `Clippy` / `Format` (#1157): the local gate and the
+      # CI gate are one list, so they cannot drift.
+      - name: cargo test -p docs-lint (via tools/preflight.sh)
+        run: tools/preflight.sh docs
 
   coverage:
     name: Tests + coverage (full, slow-tests)
