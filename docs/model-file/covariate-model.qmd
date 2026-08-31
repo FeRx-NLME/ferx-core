@@ -252,11 +252,22 @@ the covariate effect would be silently dropped under `method = saem`.
 
 When the RHS is **not** a top-level product — a sum, a logit transform, a
 mixture branch — there is no unambiguous place for the factor, and that is a
-hard error rather than a guess. Wire it by hand instead:
+hard error rather than a guess. Every factor of the product has to be a plain
+multiplicative term, so `CL = TVCL * exp(ETA_CL) + BASE_CL` is rejected too: the
+factor would otherwise scale the first addend alone. Wire it by hand instead:
 
 ```
 [individual_parameters]
   CL = TVCL * COV_CL * exp(ETA_CL)   # COV_CL = the factor, placed where you want it
+```
+
+An η reached through an intermediate still counts as η-bearing, so the factor
+lands in front of it:
+
+```
+CLI = exp(ETA_CL)
+CL  = TVCL * CLI
+  →  CL = TVCL * (if (present(WT)) (WT / 70)^THETA_CL_WT else 1.0) * CLI
 ```
 
 ::: {.callout-note}
@@ -278,6 +289,19 @@ A missing covariate is `NaN`, so `present(...)` is false and the factor is
 exactly `1.0`. This is not belt-and-braces: division by a missing value
 **underflows to `0.0`** in ferx rather than producing an infinity, so an
 unguarded factor would zero the parameter silently instead of failing loudly.
+
+For this to hold on real data, "missing" has to survive the reader. A covariate
+column that exists but carries no value for a subject — every cell `.` — is read
+as `NaN` for that subject rather than being dropped from its covariate map,
+because a dropped key resolves to the map's `0.0` default and would be
+indistinguishable from a genuine zero. The reader also warns, naming the
+covariate and the subjects:
+
+```
+covariate CRCL has no value for 3 of 32 subjects (12, 17, 25); it evaluates to
+NaN for them. Impute the column, exclude the subjects, or guard the relation
+with `present(CRCL)`.
+```
 
 `present(...)` is an ordinary condition available anywhere in
 [`[individual_parameters]`](individual-parameters.qmd), not something this block
@@ -313,9 +337,13 @@ All of these are errors, not warnings:
 - `categorical` on a covariate declared `continuous`, or a continuous form on a
   categorical one
 - `categorical` on a covariate with no `levels` and no `levels = auto`
+- `categorical` on a covariate with only one level — there is no contrast to
+  estimate, so the relation spends no θ
 - a reference level outside the declared levels
 - an unknown form or keyword argument (with a did-you-mean)
-- a right-hand side that is not a top-level product
+- `fix` on `none` or `expr(...)`, which declare no θ for it to pin
+- a right-hand side that is not a top-level product, including a product that is
+  one addend of a sum
 - a symbolic statistic still unresolved when the model reaches a fit
 
 ## Example

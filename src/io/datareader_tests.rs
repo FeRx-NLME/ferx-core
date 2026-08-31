@@ -127,6 +127,35 @@ fn declared_covariate_column_missing_is_rejected() {
 }
 
 #[test]
+fn a_wholly_missing_covariate_reads_as_nan_not_zero() {
+    // The column exists (so `check_covariates` passes) but subject 2 has `.`
+    // in every row. Leaving the key absent made it resolve to the covariate
+    // map's `0.0` default at every evaluation site, so `(WT/70)^0.75` silently
+    // contributed `0` for that subject — and `present(WT)`, which is `!is_nan`,
+    // read it as present. `NaN` is what makes both of those correct.
+    let f = write_csv(
+        "ID,TIME,DV,EVID,AMT,WT\n\
+         1,0,.,1,100,70\n\
+         1,1,5.0,0,.,70\n\
+         2,0,.,1,100,.\n\
+         2,1,4.0,0,.,.\n",
+    );
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+    assert_eq!(pop.subjects[0].covariates["WT"], 70.0);
+    assert!(
+        pop.subjects[1].covariates["WT"].is_nan(),
+        "a subject with no finite value must not read as 0.0"
+    );
+    assert!(
+        pop.warnings
+            .iter()
+            .any(|w| w.contains("covariate WT has no value for 1 of 2 subjects")),
+        "the gap must be reported: {:?}",
+        pop.warnings
+    );
+}
+
+#[test]
 fn declared_covariate_non_numeric_value_is_rejected() {
     // A declared covariate must be numerically coded; a text value is a hard
     // error rather than a silent 0.0 that would bias the fit.

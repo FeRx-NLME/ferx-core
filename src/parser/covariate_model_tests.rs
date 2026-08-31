@@ -276,6 +276,53 @@ fn a_non_product_right_hand_side_is_a_hard_error() {
 }
 
 #[test]
+fn a_sum_that_also_carries_a_product_is_a_hard_error() {
+    // `split_top_level(rhs, '*')` returns two parts here, so a guard that only
+    // looked at the whole RHS when it had *no* top-level `*` skipped this shape
+    // entirely — and the factor was multiplied into the first addend alone,
+    // leaving `TVV` uncovered. Every part has to be a plain factor.
+    let text = model_with("  WT continuous", "  CL ~ WT power(center = 70)")
+        .replace("CL = TVCL * exp(ETA_CL)", "CL = TVCL * exp(ETA_CL) + TVV");
+    let e = parse_err(&text);
+    assert!(e.contains("not a top-level product"), "{e}");
+    assert!(e.contains("COV_CL"), "{e}");
+}
+
+#[test]
+fn a_conditional_factor_in_a_product_is_a_hard_error() {
+    // `if (...) a else b * TVCL` parses as one product whose first part is a
+    // conditional: appending the covariate factor would attach it to the `else`
+    // branch, not to the parameter.
+    let text = model_with("  WT continuous", "  CL ~ WT power(center = 70)").replace(
+        "CL = TVCL * exp(ETA_CL)",
+        "CL = if (TVV > 1) 1.2 else 1.0 * TVCL * exp(ETA_CL)",
+    );
+    let e = parse_err(&text);
+    assert!(e.contains("not a top-level product"), "{e}");
+}
+
+#[test]
+fn an_eta_reached_through_an_intermediate_still_takes_the_factor_first() {
+    // `first_random` classifies a factor by the η/κ *names* it mentions, so
+    // `CLI` would look η-free and the factor would land after it — the #619
+    // placement, silently. The transitive closure over block-local assignments
+    // is what keeps it in the non-η group.
+    let text = model_with("  WT continuous", "  CL ~ WT power(center = 70)").replace(
+        "CL = TVCL * exp(ETA_CL)",
+        "CLI = exp(ETA_CL)\n  CL = TVCL * CLI",
+    );
+    let s = parse_full_model(&text)
+        .expect("model should parse")
+        .model
+        .covariate_model
+        .expect("recorded");
+    assert_eq!(
+        cl_line(&s),
+        "CL = TVCL * (if (present(WT)) (WT / 70)^THETA_CL_WT else 1.0) * CLI"
+    );
+}
+
+#[test]
 fn a_log_transformed_right_hand_side_is_a_hard_error() {
     let text = model_with("  WT continuous", "  CL ~ WT power(center = 70)")
         .replace("CL = TVCL * exp(ETA_CL)", "CL = exp(TVCL + ETA_CL)");
@@ -438,6 +485,30 @@ fn auto_levels_leave_the_relation_unresolved() {
     );
     assert_eq!(s.unresolved().len(), 1);
     assert!(s.generated_thetas.is_empty());
+}
+
+#[test]
+fn a_single_level_categorical_says_it_has_no_contrast() {
+    // One level spends zero θ, which `needs_data()` would otherwise read as
+    // *unresolved* — sending the user to `--data`, which can never help.
+    let e = err(
+        "  SEX categorical(levels = [1])",
+        "  CL ~ SEX categorical(ref = 1)",
+    );
+    assert!(e.contains("has nothing to estimate"), "{e}");
+    assert!(e.contains("`SEX` has 1 level (1)"), "{e}");
+    assert!(
+        !e.contains("needs data-derived statistics"),
+        "must not be reported as unresolved: {e}"
+    );
+}
+
+#[test]
+fn fix_on_a_form_that_declares_no_theta_is_an_error() {
+    // `none` spends no θ, so `apply_fix` would run over an empty list: the
+    // argument would be accepted and then do nothing.
+    let e = err("  WT continuous", "  CL ~ WT none(fix = 0.5)");
+    assert!(e.contains("takes no `fix`"), "{e}");
 }
 
 #[test]

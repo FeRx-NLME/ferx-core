@@ -78,7 +78,14 @@ value in a declared covariate is a hard error rather than a silent coercion to
 covariate value fails to parse, is dropped, and the covariate evaluates to `0.0`
 in the model, preserving prior behaviour.)
 
-Missing values (blank, `.`, `NA`) are permitted and recorded as missing.
+Missing values (blank, `.`, `NA`) are permitted and recorded as missing. Within a
+subject they are carried forward from the last record that had one (see
+[Time-varying covariates](#time-varying-covariates)). A subject with **no** value
+anywhere in the column — every cell `.` — has the covariate recorded as `NaN`
+rather than dropped, so it cannot be mistaken for a genuine zero, and the reader
+warns naming the covariate and the subjects. Guard such a relation with
+`present(COV)`, impute the column, or exclude the subjects; unguarded, the
+covariate expression evaluates to `NaN` for them and the fit fails.
 
 `ferx check` reads through the same covariate-aware path the fit uses, so a
 declared column that is absent (`E_MISSING_COVARIATE`) or non-numeric

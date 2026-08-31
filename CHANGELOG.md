@@ -29,6 +29,12 @@ section of the SDLC for the versioning policy).
   write them package-qualified (`--features ferx-core/ci`). Consumers of the `ferx-core` crate —
   including the ferx-r wrapper, which patches the repo root — are unaffected: the root package is
   still `ferx-core`.
+- **A covariate column with no value for a subject now reads as `NaN`, not as a dropped key
+  (#1111).** Previously the key was simply absent from that subject's covariate map, and every
+  evaluation site resolves an absent covariate to `0.0` — so a subject whose `WT` column was `.`
+  on every row was fitted at `WT = 0`, indistinguishable from a genuine zero, and `present(WT)`
+  reported it as present. The reader now stores `NaN` and warns, naming the covariate and the
+  affected subjects, so the gap is either guarded with `present(...)`, imputed, or fails loudly.
 
 ### Added
 - **A `present(COV)` condition for covariates that may be missing (#1111).** A missing covariate

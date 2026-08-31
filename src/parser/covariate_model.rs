@@ -164,8 +164,11 @@ pub(crate) fn apply_covariate_model(
             None => factors.push((rel.parameter.clone(), vec![factor])),
         }
     }
+    // Classify factors against the η/κ names *plus* every intermediate that
+    // reads one, so a factor is not mistaken for η-free (see below).
+    let random_bearing = random_bearing_names(individual_parameters, ctx.eta_kappa_names);
     for (param, fs) in &factors {
-        insert_factors(individual_parameters, param, fs, ctx.eta_kappa_names)?;
+        insert_factors(individual_parameters, param, fs, &random_bearing)?;
     }
 
     Ok(CovariateModelSpec {
@@ -459,7 +462,10 @@ fn center_argument(
 ) -> Result<Option<CovariateStat>, String> {
     let (keyword, default) = match form {
         CovariateForm::None | CovariateForm::Expr(_) => {
-            for key in ["center", "breakpoint", "ref"] {
+            // `fix` joins the centring keys here: both forms declare no θ, so
+            // `none(fix = 0.5)` would parse, set `rel.fix`, and then have
+            // `apply_fix` run over an empty θ list — no effect, no diagnostic.
+            for key in ["center", "breakpoint", "ref", "fix"] {
                 if kwargs.contains_key(key) {
                     return Err(format!(
                         "[covariate_model]: `{}` takes no `{key}`",
@@ -588,6 +594,27 @@ fn build_thetas(
         return Ok(Vec::new());
     }
     let expected = expected_theta_count(rel, decl, summary)?;
+    if expected == 0 && rel.form.is_categorical() {
+        // Levels are known (declared, or discovered for `levels = auto`) and
+        // there is exactly one, so there is no contrast to estimate. Without
+        // this the relation would carry no θ, `needs_data()` would read that as
+        // *unresolved*, and the user would be told to supply `--data` — which
+        // can never help.
+        let levels = levels_of(decl, summary).unwrap_or_default();
+        return Err(format!(
+            "[covariate_model]: `{} ~ {} categorical(...)` has nothing to estimate — `{}` has \
+             {} level{} ({}), and a categorical relation spends one θ per *non-reference* level. \
+             Declare the levels the data actually carries (`{} categorical(levels = [...])` in \
+             [covariates]), or drop the relation.",
+            rel.parameter,
+            rel.covariate,
+            decl.name,
+            levels.len(),
+            if levels.len() == 1 { "" } else { "s" },
+            join_levels(&levels),
+            decl.name,
+        ));
+    }
     if expected == 0 {
         if let Some(explicit) = explicit {
             return Err(format!(
@@ -895,6 +922,49 @@ fn relation_factor(rel: &CovariateRelation) -> Option<String> {
     Some(format!("(if (present({cov})) {inner} else 1.0)"))
 }
 
+/// `eta_kappa`, plus every top-level `[individual_parameters]` variable whose
+/// definition transitively reads one.
+///
+/// [`insert_factors`] classifies a factor by the *names* it mentions, so an η
+/// reached through an intermediate —
+///
+/// ```text
+/// CLI = exp(ETA_CL)
+/// CL  = TVCL * CLI
+/// ```
+///
+/// — would otherwise look η-free, and the covariate factor would be appended
+/// *after* `CLI`: the placement #619 is about, silently rather than as the
+/// `COV_<PARAM>` hard error. Adding `CLI` to the set puts the factor back in the
+/// non-η group.
+///
+/// Iterated to a fixed point rather than taken in source order, since an
+/// `if { ... }` block can reassign a name after its first definition.
+fn random_bearing_names(lines: &[String], eta_kappa: &HashSet<String>) -> HashSet<String> {
+    let mut set = eta_kappa.clone();
+    loop {
+        let mut grew = false;
+        for line in lines {
+            let text = strip_comment(line);
+            let Some(name) = assignment_target(text) else {
+                continue;
+            };
+            if set.contains(&name) {
+                continue;
+            }
+            let rhs = text.split_once('=').map(|(_, r)| r).unwrap_or("");
+            if mentions_any(rhs, &set) {
+                set.insert(name);
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    set
+}
+
 /// Multiply `factors` into `param`'s right-hand side, immediately before the
 /// first η/κ-bearing top-level factor.
 fn insert_factors(
@@ -913,8 +983,13 @@ fn insert_factors(
     let rhs = rhs.trim();
 
     let parts = split_top_level(rhs, '*');
-    let non_product = parts.len() == 1 && !is_simple_factor(rhs);
-    if non_product || parts.iter().any(|p| p.trim().is_empty()) {
+    // *Every* factor has to be a plain multiplicative term, not just the whole
+    // RHS when it happens to carry no top-level `*`. Checking only the latter
+    // let `CL = TVCL * exp(ETA_CL) + BASE_CL` through — `split_top_level` returns
+    // two parts there, so the sum guard was skipped and the covariate factor was
+    // multiplied into the first addend alone. `is_simple_factor` rejects an empty
+    // part too, which covers a trailing/doubled `*`.
+    if parts.iter().any(|p| !is_simple_factor(p)) {
         return Err(non_product_error(param, rhs));
     }
     let first_random = parts
@@ -1107,6 +1182,19 @@ fn fmt(v: f64) -> String {
         format!("{}", v as i64)
     } else {
         format!("{v}")
+    }
+}
+
+/// Covariate levels as they would be written in a `levels = [...]` clause.
+fn join_levels(levels: &[f64]) -> String {
+    if levels.is_empty() {
+        "none".to_string()
+    } else {
+        levels
+            .iter()
+            .map(|v| fmt(*v))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
