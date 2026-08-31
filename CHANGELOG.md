@@ -35,6 +35,22 @@ section of the SDLC for the versioning policy).
   on every row was fitted at `WT = 0`, indistinguishable from a genuine zero, and `present(WT)`
   reported it as present. The reader now stores `NaN` and warns, naming the covariate and the
   affected subjects, so the gap is either guarded with `present(...)`, imputed, or fails loudly.
+- **The five largest documentation sections are split into addressable subsections (#1162).**
+  `[fit_options]`'s 36 shared keys are grouped into seven tables (run control, outer optimizer,
+  inner loop, covariance, ODE tolerances, ODE stepper, data handling); FOCE's gradient-route
+  section leads with the decision and moves the scope history into named sections plus an FD
+  fallback table; SAEM's theta/sigma M-step, `ode_method = auto`, and the check-report code table
+  are likewise subdivided. The three heaviest `[fit_options]` key descriptions are cut to what
+  choosing the key needs, with the detail deep-linked into the pages that already carry it —
+  `ODE stepper selection` 909 → 367 words, `Inner loop (EBE)` 769 → 365, `VI-Specific Options`
+  747 → 378. Every previous anchor still resolves, eight already-broken in-page links are
+  repaired, and the site's `toc-depth` is raised to 4 so the new subsections appear in the
+  on-page table of contents.
+- **The docs content column is wider, and wide tables no longer run under the "On this page"
+  TOC (#1162).** `grid.body-width` goes from Quarto's 800px default to 1000px (a 749px → 895px
+  content column at 1512px wide), and the desktop table rule now actually contains an oversized
+  table: it set `display: table` with `overflow-x: auto`, which is inert, so a table wider than
+  the column drew over the margin TOC instead of scrolling inside itself.
 
 ### Added
 - **A `present(COV)` condition for covariates that may be missing (#1111).** A missing covariate
