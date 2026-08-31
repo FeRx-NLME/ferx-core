@@ -31,48 +31,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci
-      - name: cargo check
-        run: cargo check --tests --no-default-features --features ci
-
-      # `tests/tte_convergence.rs` is gated on BOTH `survival` and `slow-tests`, and
-      # no other per-PR job sets both — so those Tier-3 TTE tests are compiled in
-      # *neither*. Without this step a renamed public API or changed `FitResult`
-      # field would land green and only break the nightly slow-tests run, decoupled
-      # from the offending PR. Compile-only (`cargo check`, no run — the tests
-      # themselves stay nightly per the tier rules), so it is cheap.
-      # (#441 review finding #3.)
-      - name: cargo check (survival + slow-tests gated tests)
-        run: cargo check --tests --no-default-features --features ci,survival,slow-tests
-
-      # This step is also what COMPILE-GATES the whole feature-gated surface. The
-      # `Tests + coverage (TTE/CTMM endpoints)` job below deliberately builds only
-      # the handful of endpoint test binaries, so a break in any *other* test file
-      # under `--features ci,markov` (which implies `survival`) is caught here, in
-      # ~1 min, instead of by an 18-min instrumented build.
-      - name: cargo check (markov-gated module + tests)
-        run: cargo check --tests --no-default-features --features ci,markov
-
-      # Same rationale for `nn`, with `slow-tests` folded in for the same reason as
-      # the survival step above: `tests/nn_fit_smoke.rs` and
-      # `tests/nn_fit_convergence.rs` are gated on BOTH `nn` and `slow-tests`, so
-      # their bodies compile in no other per-PR job. One cheap `cargo check`
-      # compile-gates the whole `nn` surface — `src/nn`, the `[covariate_nn]`
-      # parser, the θ-gradient module, and every nn-gated test file — so a broken
-      # signature surfaces here in ~1 min rather than in the instrumented
-      # coverage job (or, worse, only in the nightly slow-tests run).
-      - name: cargo check (nn-gated module + tests)
-        run: cargo check --tests --no-default-features --features ci,nn,slow-tests
-
-      # The workspace members (#1114). `-p` rather than `--workspace` so the
-      # `ferx-core` targets above are not rebuilt, and the feature is written
-      # package-qualified (`ferx-core/ci`) because `ci` is a feature of
-      # `ferx-core`, not of the members — a bare `--features ci` here fails with
-      # "none of the selected packages contains this feature". Qualified this
-      # way it resolves to the SAME feature set as the steps above, so the
-      # members link the already-built rlib instead of triggering a second
-      # `ferx-core` compile under a different feature hash.
-      - name: cargo check (ferx-tools + ferx-cli)
-        run: cargo check -p ferx-tools -p ferx-cli --tests --no-default-features --features ferx-core/ci
+      # The five `cargo check` feature sets live in `tools/preflight.sh` (#1157),
+      # which a developer runs before pushing. CI executes that same script rather
+      # than restating the commands, so the local gate and the CI gate cannot drift
+      # — the same contract `tools/update-public-api.sh` uses for the API baseline.
+      # The script prints each command as it runs, so a failing line is still
+      # identifiable in this log; its comments carry the per-feature-set rationale.
+      - name: cargo check (5 feature sets, via tools/preflight.sh)
+        run: tools/preflight.sh check
 
   # Every default-off feature surface the `ci` build compiles out: the non-Gaussian
   # endpoint families (TTE/survival + categorical + CTMM) and the covariate-NN /
@@ -187,32 +153,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci
-      - name: cargo clippy
-        # Include `markov` and `nn` so the CTMM module and the covariate-NN / DCM
-        # stack are linted too (both are compiled out of the base `ci` build).
-        # `markov = ["survival"]`, so this lints the whole non-Gaussian endpoint
-        # surface as well.
-        #
-        # `--all-targets` so test code is linted too. Without it the default target
-        # selection covers only the lib and the bins, and roughly a third of this
-        # repo — every `#[cfg(test)]` module, every sibling `*_tests.rs`, and all of
-        # `tests/` — got no lint coverage at all. That gap was not theoretical: it
-        # was hiding 6 `approx_constant` ERRORS (`error`, not `warning`) that the
-        # default invocation exits 0 on.
-        #
-        # Note this job installs a FRESH nightly on every run, so its lint set is
-        # newer than a developer's local toolchain unless they have updated
-        # recently. One of those 6 (`EULER_GAMMA`, `src/stats/special.rs`) is
-        # invisible to a three-month-old clippy — verify locally with an up-to-date
-        # `rustup update nightly`, or this job is the first thing that sees it.
-        run: cargo clippy --no-default-features --features ci,markov,nn --all-targets
-
-      # Same package-qualified-feature trick as the `Check` job, so the members
-      # reuse the `ferx-core` build the step above just produced. `--tests` here
-      # (unlike above) because the members' test code is a meaningful share of
-      # their line count while they are still small.
-      - name: cargo clippy (ferx-tools + ferx-cli)
-        run: cargo clippy -p ferx-tools -p ferx-cli --tests --no-default-features --features ferx-core/ci,ferx-core/markov,ferx-core/nn
+      # Both clippy invocations (ferx-core with `--all-targets`, then the members
+      # with package-qualified features) live in `tools/preflight.sh` (#1157). See
+      # the note in the `check` job above for why CI calls the script.
+      - name: cargo clippy (ferx-core + members, via tools/preflight.sh)
+        run: tools/preflight.sh clippy
 
   # A2 of #1114 — the enforcement that keeps the ferx-core/ferx-tools boundary
   # from becoming paperwork. `ferx-tools` can only touch `pub` items, so the way
@@ -269,11 +214,8 @@ jobs:
       - name: Install nightly toolchain
         run: rustup toolchain install nightly --profile minimal -c rustfmt
 
-      - name: cargo fmt
-        # `--all`: without it `cargo fmt` formats only the root package, so
-        # `crates/ferx-tools` and `crates/ferx-cli` would go unchecked (#1114).
-        # `.githooks/pre-commit` uses the same flag.
-        run: cargo fmt --all -- --check
+      - name: cargo fmt (via tools/preflight.sh)
+        run: tools/preflight.sh fmt
 
   docs-lint:
     name: Docs lint

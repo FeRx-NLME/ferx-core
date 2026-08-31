@@ -494,3 +494,93 @@ fn binding_preserves_a_level_block_binding_made_first() {
         Some(70.0)
     );
 }
+
+// ── `ferx check` (`validate_model_file`) ───────────────────────────────────
+
+/// The model text written to a `.ferx` temp file, for the entry points that
+/// take a path rather than a string.
+fn temp_model(src: &str) -> tempfile::NamedTempFile {
+    use std::io::Write;
+    let mut f = tempfile::Builder::new()
+        .suffix(".ferx")
+        .tempfile()
+        .expect("create temp model");
+    f.write_all(src.as_bytes()).expect("write temp model");
+    f.flush().expect("flush temp model");
+    f
+}
+
+#[test]
+fn check_without_data_warns_that_the_statistics_are_still_unbound() {
+    // `center = median` cannot be resolved from the file alone, so the relation
+    // is parsed and recorded but not desugared. Without a dataset that is not an
+    // error — the model is fine, just not buildable yet — but it has to be said:
+    // the desugared echo is suppressed in this state, and a silent "no errors"
+    // on a model whose covariate effects are all still pending reads as "there
+    // are none".
+    let text = model("  WT continuous", "  CL ~ WT power(center = median)");
+    let f = temp_model(&text);
+    let report = crate::api::validate_model_file(f.path().to_str().expect("utf-8 temp path"), None);
+
+    let hit = report
+        .diagnostics
+        .iter()
+        .find(|d| d.code == "W_COVSTAT_UNBOUND")
+        .unwrap_or_else(|| {
+            panic!(
+                "unbound statistics must be reported: {:?}",
+                report.diagnostics
+            )
+        });
+    assert_eq!(hit.severity, crate::Severity::Warning);
+    assert!(hit.message.contains("`CL ~ WT`"), "{}", hit.message);
+    assert!(
+        hit.suggestion
+            .as_deref()
+            .is_some_and(|s| s.contains("--data")),
+        "the suggestion must point at re-running with data: {:?}",
+        hit.suggestion
+    );
+    // A warning does not invalidate the report …
+    assert!(report.valid, "an unbound statistic is not a rejection");
+    // … but the echo stays empty: those lines are the block *without* the
+    // pending covariate effect, so printing them would state the opposite of
+    // the truth.
+    assert!(
+        report.desugared_individual_parameters.is_empty(),
+        "{:?}",
+        report.desugared_individual_parameters
+    );
+}
+
+#[test]
+fn check_with_data_binds_the_statistics_and_echoes_the_desugared_block() {
+    // The same path with a dataset: `bind_covariate_stats` runs, nothing is left
+    // unresolved, and the report carries the expression that was actually built
+    // — the text to diff against a NONMEM control stream.
+    let report = crate::api::validate_model_file(
+        "examples/two_cpt_oral_covmodel.ferx",
+        Some("data/two_cpt_oral_cov.csv"),
+    );
+    assert!(report.valid, "{:?}", report.diagnostics);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "W_COVSTAT_UNBOUND" || d.code == "E_COVSTAT_UNRESOLVED"),
+        "statistics must be bound once data is supplied: {:?}",
+        report.diagnostics
+    );
+    let cl = report
+        .desugared_individual_parameters
+        .iter()
+        .find(|l| l.trim_start().starts_with("CL "))
+        .unwrap_or_else(|| {
+            panic!(
+                "the desugared block must be echoed: {:?}",
+                report.desugared_individual_parameters
+            )
+        });
+    assert!(cl.contains("present(WT)"), "{cl}");
+    assert!(cl.contains("^THETA_CL_WT"), "{cl}");
+}

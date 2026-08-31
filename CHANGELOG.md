@@ -182,19 +182,34 @@ section of the SDLC for the versioning policy).
   the result still exposed `converged: true` to programmatic consumers. Such fits are now demoted,
   omit the misleading "increase `vi_iters`" warning, and carry the critical structured warning
   code `vi_bad_basin`.
-- **An `[odes]` RHS that reads `TAD` under an estimated lagtime now routes to finite
-  differences instead of returning a wrong analytic gradient (#1070).** `TAD` is handed to the
-  ODE right-hand side as a plain constant, but its anchor *is* the dose's lagged arrival
-  (`t_dose + ALAG`), so the `∂TAD/∂ALAG = −1` term was silently missing from the analytic
-  η/θ gradient — everywhere the trajectory is integrated, not just at a dose event. Predictions
-  were unaffected, so nothing failed visibly; but FOCEI builds its `h` matrix from that same
-  gradient, so the error reached the reported OFV. Measured against finite differences of the
-  production predictor, the lag axis was 2.8% wrong at the first observation and 70% wrong by
-  `t = 8`, while every other axis stayed exact. Against NONMEM 7.6.0 the analytic route was
-  0.176 OFV off; the FD route agrees to 0.0003 (`nonmem_anchor/tad_lag_*`). Affected models are
-  now correct but slower, on both the outer and inner loops and under IOV; the fit reports
-  `gradient_method_inner = finite differences`. Models reading `TAD` **without** a lagtime, or
-  reading `TAFD` **with** one, are unaffected and keep the analytic route.
+- **The analytic gradient of an `[odes]` RHS that reads `TAD` under an estimated lagtime is now
+  correct (#1070).** `TAD` was handed to the ODE right-hand side as a plain constant, but its
+  anchor *is* the dose's lagged arrival (`t_dose + ALAG`), so the `∂TAD/∂ALAG = −1` term was
+  silently missing from the analytic η/θ gradient — everywhere the trajectory is integrated, not
+  just at a dose event. Predictions were unaffected, so nothing failed visibly; but FOCEI builds
+  its `h` matrix from that same gradient, so the error reached the reported OFV. Measured
+  against finite differences of the production predictor, the worst axis was 66% wrong
+  (`∂f/∂η_ALAG`) and 68% wrong (`∂f/∂θ_ALAG`); against NONMEM 7.6.0 the objective was 0.176 off
+  on a single-dose anchor and 0.107 on a two-dose one. `TAD` is now threaded through the
+  sensitivity walks as a dual, so those become 0.0004 and 0.032 — the same values the finite-
+  difference route gives (`nonmem_anchor/tad_lag_*`). Affected models keep the fast analytic
+  route on both loops and under IOV, including when the lagtime carries inter-occasion
+  variability. Predictions are bit-identical to before. Models reading `TAD` **without** a
+  lagtime, or reading `TAFD` **with** one, were always exact and are untouched. `TAD` combined
+  with a **steady-state** dose still routes to finite differences, under the separate
+  non-autonomous-RHS rule.
+
+  Two consequences worth knowing before you re-run an affected model. First, `gradient_method =
+  auto` resolves this model class to **L-BFGS** where it previously chose BOBYQA, because the
+  choice keys on whether an analytic outer gradient is available — so the optimizer changes as
+  well as the gradient. Set `optimizer = bobyqa` to keep the previous behaviour. Second, the
+  second-order block `∂²f/∂η_ALAG²` is improved but **not** exact (6.4e-1 wrong before, 2.2e-1
+  after); it does not affect the objective value, but it does feed the analytic outer gradient
+  and the covariance step, so standard errors and the optimizer's search direction on these
+  models carry that residual until #1075 lands. The `TAD` value in the window **before the first
+  dose arrives** is differentiated consistently with whatever convention the predictor uses, but
+  that convention itself is still open (#1110) and is not anchored against NONMEM — NONMEM has
+  no `TAD` built-in in `$DES`, so there is nothing external to anchor it to.
 - **A lagged dose's covariate snapshot no longer stretches to its arrival (#1073).** With a
   lagtime, ferx broke the integration timeline only at the arrival `t + ALAG`, never at the dose
   row's own time, so the dose row's covariate / IOV snapshot governed everything up to the
