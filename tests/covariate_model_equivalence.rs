@@ -19,7 +19,7 @@ use std::path::Path;
 
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::types::FitOptions;
-use ferx_core::{fit, predict, read_nonmem_csv};
+use ferx_core::{fit, fit_from_files, predict, read_nonmem_csv};
 
 const DATA: &str = "data/two_cpt_oral_cov.csv";
 
@@ -183,6 +183,45 @@ fn the_relation_table_is_echoed_on_the_fit_result() {
             assert_eq!(theta.estimate, result.theta[idx]);
         }
     }
+}
+
+/// `fit_from_files` must bind the data-derived statistics itself.
+///
+/// `assert_covariate_model_bound`'s error text names this entry point as one
+/// that binds them, so a `center = median` model launched through it has to
+/// run rather than fail `E_COVSTAT_UNRESOLVED` (#1111 review).
+#[test]
+fn fit_from_files_binds_symbolic_covariate_statistics() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("symbolic.ferx");
+    // Symbolic centres throughout: nothing here is resolvable from the file.
+    let text = declarative()
+        .replace("power(center = 70)", "power(center = median)")
+        .replace("power(center = 100)", "power(center = median)");
+    std::fs::write(&path, &text).expect("write model file");
+
+    let opts = FitOptions {
+        outer_maxiter: 2,
+        ..FitOptions::default()
+    };
+    let result = fit_from_files(
+        path.to_str().expect("utf-8 path"),
+        Some(DATA),
+        None,
+        Some(opts),
+    )
+    .expect("fit_from_files must bind `center = median` rather than reject it");
+
+    // Non-degeneracy: the centres actually came from the data, so they are
+    // neither absent nor the literals the file no longer states.
+    let wt = result
+        .covariate_relations
+        .iter()
+        .find(|r| r.covariate == "WT")
+        .expect("the WT relation is echoed");
+    let center = wt.center.expect("a bound relation reports its centre");
+    assert!(center.is_finite() && center > 0.0, "center = {center}");
+    assert_eq!(wt.center_source.as_deref(), Some("median"));
 }
 
 /// The same pair, fit to convergence: identical estimates and identical

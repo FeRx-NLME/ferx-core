@@ -1605,6 +1605,12 @@ pub struct CovariateRelationEstimate {
     pub center_source: Option<String>,
     /// …and the value it resolved to.
     pub center: Option<f64>,
+    /// The body of an `expr("...")` relation — the expression that actually
+    /// multiplied into the parameter. `None` for every other form, whose
+    /// factor is determined by `form` + `center` + `thetas`. Without it `form:
+    /// "expr"` says a hand-written factor ran but not which one, which is not
+    /// enough for a caller to reproduce or report the model.
+    pub expression: Option<String>,
     pub thetas: Vec<CovariateThetaEstimate>,
 }
 
@@ -1616,6 +1622,11 @@ pub struct CovariateThetaEstimate {
     /// `None` when no covariance step ran, or when the θ is `FIX`ed.
     pub se: Option<f64>,
     pub fixed: bool,
+    /// For a `categorical` relation, the level this θ contrasts against the
+    /// reference — carried over from [`CovariateTheta::level`]. `None` for
+    /// every other form. Without it a caller with explicitly named θ cannot
+    /// say which estimate belongs to which level without re-parsing the model.
+    pub level: Option<f64>,
 }
 
 /// A single row of the [`CovariateTable`], echoing one input dataset record.

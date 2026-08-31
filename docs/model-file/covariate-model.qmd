@@ -107,9 +107,25 @@ The **default inits and bounds are PsN's, verbatim**:
 | `power` | `0.001` | `−100` | `1e6` |
 
 The linear bounds are not cosmetic: `θ ∈ [1/(c−max), 1/(c−min)]` is exactly what
-keeps `1 + θ·(COV − c)` positive over the observed covariate range. A covariate
-that does not vary around its centre makes both bounds infinite, and is rejected
-with a message rather than given a θ the optimiser cannot move.
+keeps `1 + θ·(COV − c)` positive over the observed covariate range.
+
+Those bounds only exist, and only come back ordered, when the centre lies
+**strictly inside** the observed range, so the linear family requires it:
+
+- a covariate that does not vary around its centre makes both bounds infinite;
+- a centre *outside* the range makes both the same sign, which would emit
+  `lower > upper` (centre `100` over a `50..90` range gives `(0.1, 0.02)`).
+
+Both are rejected with a message rather than given a θ the optimiser cannot
+move. State the θ yourself (`=> NAME(init, lower, upper)`) if you really want a
+centre outside the data.
+
+Two forms **divide** by the centre, so it also has to be usable as a divisor —
+this engine underflows `x/0` to `0` rather than raising, so an unusable centre
+would silently flatten the covariate factor instead of failing. `power` needs a
+positive centre (a negative base is `NaN` for a non-integer θ) and
+`linear_relative` a non-zero one; both are checked when the model is parsed.
+`linear` and `exponential` subtract, and accept any finite centre.
 
 What PsN calls `[test_relations]`, `valid_states`, `included_relations` and
 `p_forward` is **search configuration, not model**. It belongs in an SCM harness
@@ -161,7 +177,11 @@ number; `ref` accepts a level literal or `mode`; `[covariates]` accepts
 Statistics are computed **one value per subject** (PsN's weighting — a subject
 with forty samples must not drag the median toward their own weight); a
 time-varying covariate contributes each distinct value it takes within the
-subject.
+subject, counting **every** record — observations, doses, `EVID=2` covariate
+change markers and `EVID=3/4` resets alike. A value the evaluator reads is a
+value the summary sees, so the default bounds always cover the range the fit
+actually evaluates over, and `levels = auto` cannot miss a level that only
+appears on a dose row.
 
 **Recommendation: literals for a final model, symbolic for an automated
 search.** A literal centre is reproducible from the file alone. A symbolic one
@@ -178,7 +198,26 @@ covariate_model:
       - name: "THETA_CL_WT"
         estimate: 0.712431
         se: 0.083120
+  - parameter: "CL"
+    covariate: "SEX"
+    form: "categorical"
+    center: 0  # resolved from mode
+    thetas:
+      - name: "THETA_CL_SEX_1"
+        estimate: 0.184220
+        se: 0.061400
+        level: 1          # which level this contrast belongs to
+  - parameter: "V"
+    covariate: "WT"
+    form: "expr"
+    expression: "1 + 0.1 * WT"   # the hand-written factor, verbatim
+    thetas: []                   # `none` and `expr` generate no θ
 ```
+
+The table is meant to be read by a program: a categorical θ names its `level`,
+an `expr` relation carries the `expression` that actually ran, and a relation
+with no θ emits an empty *sequence* (`thetas: []`), never a bare key — so
+`thetas` always deserializes as a list.
 
 A symbolic statistic can only be resolved once a dataset has been seen. Fits
 launched from a data file (`ferx <model> --data …`, `fit_from_files`, `ferx
@@ -186,6 +225,15 @@ check --data`) bind it automatically. Driving the API directly, call
 `bind_covariate_stats(&mut parsed, model_text, &population)` before `fit`.
 Reaching a fit with one still unbound is a hard error
 (`E_COVSTAT_UNRESOLVED`) — never a quiet fit with the covariate effect missing.
+
+## Declared levels are exhaustive
+
+A `categorical` factor is an `if (COV == l₁) 1 + θ₁ else … else 1` chain whose
+trailing `1` *is* the reference level's factor, so an undeclared code would be
+modelled as the reference with nothing in the output to say so. A value in the
+data that is not one of the relation's declared levels is therefore refused
+before the fit starts (`E_COV_LEVEL_UNKNOWN`). List every level, use
+`categorical(levels = auto)` to read them off the data, or filter the rows out.
 
 ## Where the factor is inserted
 

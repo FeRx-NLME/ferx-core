@@ -2369,6 +2369,7 @@ pub struct ferx_core::types::CovariateRelationEstimate
 pub ferx_core::types::CovariateRelationEstimate::center: core::option::Option<f64>
 pub ferx_core::types::CovariateRelationEstimate::center_source: core::option::Option<alloc::string::String>
 pub ferx_core::types::CovariateRelationEstimate::covariate: alloc::string::String
+pub ferx_core::types::CovariateRelationEstimate::expression: core::option::Option<alloc::string::String>
 pub ferx_core::types::CovariateRelationEstimate::form: alloc::string::String
 pub ferx_core::types::CovariateRelationEstimate::parameter: alloc::string::String
 pub ferx_core::types::CovariateRelationEstimate::thetas: alloc::vec::Vec<ferx_core::CovariateThetaEstimate>
@@ -2400,6 +2401,7 @@ pub ferx_core::types::CovariateTheta::upper: f64
 pub struct ferx_core::types::CovariateThetaEstimate
 pub ferx_core::types::CovariateThetaEstimate::estimate: f64
 pub ferx_core::types::CovariateThetaEstimate::fixed: bool
+pub ferx_core::types::CovariateThetaEstimate::level: core::option::Option<f64>
 pub ferx_core::types::CovariateThetaEstimate::name: alloc::string::String
 pub ferx_core::types::CovariateThetaEstimate::se: core::option::Option<f64>
 pub struct ferx_core::types::DerivedContext<'a>
@@ -3660,6 +3662,7 @@ pub struct ferx_core::CovariateRelationEstimate
 pub ferx_core::CovariateRelationEstimate::center: core::option::Option<f64>
 pub ferx_core::CovariateRelationEstimate::center_source: core::option::Option<alloc::string::String>
 pub ferx_core::CovariateRelationEstimate::covariate: alloc::string::String
+pub ferx_core::CovariateRelationEstimate::expression: core::option::Option<alloc::string::String>
 pub ferx_core::CovariateRelationEstimate::form: alloc::string::String
 pub ferx_core::CovariateRelationEstimate::parameter: alloc::string::String
 pub ferx_core::CovariateRelationEstimate::thetas: alloc::vec::Vec<ferx_core::CovariateThetaEstimate>
@@ -3691,6 +3694,7 @@ pub ferx_core::CovariateTheta::upper: f64
 pub struct ferx_core::CovariateThetaEstimate
 pub ferx_core::CovariateThetaEstimate::estimate: f64
 pub ferx_core::CovariateThetaEstimate::fixed: bool
+pub ferx_core::CovariateThetaEstimate::level: core::option::Option<f64>
 pub ferx_core::CovariateThetaEstimate::name: alloc::string::String
 pub ferx_core::CovariateThetaEstimate::se: core::option::Option<f64>
 pub struct ferx_core::DecisionLogEntry

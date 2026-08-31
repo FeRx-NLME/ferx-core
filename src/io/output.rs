@@ -2038,7 +2038,17 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                 }
                 .map_err(|e| e.to_string())?;
             }
-            writeln!(f, "    thetas:").map_err(|e| e.to_string())?;
+            if let Some(expr) = &rel.expression {
+                writeln!(f, "    expression: {}", yaml_quote(expr)).map_err(|e| e.to_string())?;
+            }
+            // `none` and `expr` generate no θ. A bare `thetas:` key parses as
+            // `null`, not as an empty list, which disagrees with the `Vec`
+            // field on `FitResult` — emit the explicit empty sequence.
+            if rel.thetas.is_empty() {
+                writeln!(f, "    thetas: []").map_err(|e| e.to_string())?;
+            } else {
+                writeln!(f, "    thetas:").map_err(|e| e.to_string())?;
+            }
             for theta in &rel.thetas {
                 writeln!(f, "      - name: {}", yaml_quote(&theta.name))
                     .map_err(|e| e.to_string())?;
@@ -2051,6 +2061,9 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                 .map_err(|e| e.to_string())?;
                 if theta.fixed {
                     writeln!(f, "        fixed: true").map_err(|e| e.to_string())?;
+                }
+                if let Some(level) = theta.level {
+                    writeln!(f, "        level: {level}").map_err(|e| e.to_string())?;
                 }
             }
         }
@@ -4216,6 +4229,60 @@ mod tests {
             yaml_quote(&r.environment.username)
         )));
         assert!(yaml.contains(&format!("  ferx_version: {}", r.ferx_version)));
+    }
+
+    /// The `[covariate_model]` echo has to be readable as YAML *and* agree
+    /// with the `Vec` fields on `FitResult` (#1111 review).
+    ///
+    /// A relation with no θ — `none`, `expr` — emitted a bare `thetas:`, which
+    /// YAML reads as `null` rather than as an empty sequence, so a consumer
+    /// deserializing into `Vec<CovariateThetaEstimate>` failed on exactly the
+    /// relations the block generates nothing for. The categorical level and
+    /// the `expr` body are the other two pieces a caller cannot otherwise
+    /// recover without re-parsing the model file.
+    #[test]
+    fn write_yaml_covariate_model_keeps_levels_expression_and_empty_theta_list() {
+        let mut r = comprehensive_result();
+        r.covariate_relations = vec![
+            CovariateRelationEstimate {
+                parameter: "CL".to_string(),
+                covariate: "SEX".to_string(),
+                form: "categorical".to_string(),
+                center_source: Some("mode".to_string()),
+                center: Some(0.0),
+                expression: None,
+                thetas: vec![CovariateThetaEstimate {
+                    name: "THETA_CL_SEX_1".to_string(),
+                    estimate: 0.25,
+                    se: Some(0.05),
+                    fixed: false,
+                    level: Some(1.0),
+                }],
+            },
+            CovariateRelationEstimate {
+                parameter: "V".to_string(),
+                covariate: "WT".to_string(),
+                form: "expr".to_string(),
+                center_source: None,
+                center: None,
+                expression: Some("1 + 0.1 * WT".to_string()),
+                thetas: Vec::new(),
+            },
+        ];
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+        let yaml = std::fs::read_to_string(&path).expect("yaml read");
+
+        assert!(yaml.contains("\ncovariate_model:"), "{yaml}");
+        // The categorical θ names its level…
+        assert!(yaml.contains("        level: 1"), "{yaml}");
+        // …the `expr` relation carries the expression that actually ran…
+        assert!(yaml.contains("    expression: \"1 + 0.1 * WT\""), "{yaml}");
+        // …and its empty θ list is an empty *sequence*, not `null`.
+        assert!(yaml.contains("    thetas: []"), "{yaml}");
+        // (A relation that does generate θ still opens a block sequence.)
+        assert!(yaml.contains("    thetas:\n      - name:"), "{yaml}");
     }
 
     #[test]

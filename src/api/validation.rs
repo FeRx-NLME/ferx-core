@@ -555,6 +555,7 @@ pub(crate) fn check_simulation_data(
 ) -> Vec<Diagnostic> {
     let mut diags = check_unbound_theta_levels(model);
     diags.extend(check_covariate_model_bound(model));
+    diags.extend(check_covariate_levels(model, population));
     diags.extend(check_covariates(model, population));
     diags.extend(check_kappa_weights(model, population));
     diags.extend(check_theta_gather_indices(model, population));
@@ -583,6 +584,7 @@ pub fn check_model_data_rule(
 ) -> Vec<Diagnostic> {
     let mut diags = check_finite_observations(population);
     diags.extend(check_covariate_model_bound(model));
+    diags.extend(check_covariate_levels(model, population));
     diags.extend(check_covariates(model, population));
     diags.extend(check_per_cmt_scaling(model, population));
     diags.extend(check_per_cmt_error_model(model, population));
@@ -1532,6 +1534,64 @@ fn check_covariate_model_bound(model: &CompiledModel) -> Vec<Diagnostic> {
             vec![Diagnostic::error("E_COVSTAT_UNRESOLVED", msg).with_block("covariate_model")]
         }
     }
+}
+
+/// Reject a categorical `[covariate_model]` relation whose data carries a value
+/// outside its declared level set (#1111).
+///
+/// The generated factor is an `if (COV == l1) 1 + θ1 else if (COV == l2) … else 1`
+/// chain: the trailing `1` is the *reference* level's factor, so an unlisted
+/// code — a new site, a typo, a level that only shows up on dose records — is
+/// silently modelled as the reference rather than flagged. That changes the
+/// fitted model with nothing in the output to say so, which is exactly the
+/// class of silent-covariate-drop this block exists to prevent.
+fn check_covariate_levels(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+    let Some(spec) = model.covariate_model.as_ref() else {
+        return Vec::new();
+    };
+    let mut diags = Vec::new();
+    for rel in &spec.relations {
+        if !rel.form.is_categorical() {
+            continue;
+        }
+        // Declared levels = the reference (`ref = …`) plus one θ per contrast.
+        let mut declared: Vec<f64> = rel.thetas.iter().filter_map(|t| t.level).collect();
+        let Some(reference) = rel.resolved_center else {
+            // Still unbound — `check_covariate_model_bound` reports that.
+            continue;
+        };
+        declared.push(reference);
+        let mut unknown: Vec<f64> = Vec::new();
+        for subject in &population.subjects {
+            for v in crate::api::covariate_stats::subject_covariate_values(subject, &rel.covariate)
+            {
+                if !declared.contains(&v) && !unknown.contains(&v) {
+                    unknown.push(v);
+                }
+            }
+        }
+        if unknown.is_empty() {
+            continue;
+        }
+        unknown.sort_by(f64::total_cmp);
+        declared.sort_by(f64::total_cmp);
+        diags.push(
+            Diagnostic::error(
+                "E_COV_LEVEL_UNKNOWN",
+                format!(
+                    "[covariate_model]: `{} ~ {} categorical(...)` declares levels {declared:?} \
+                     (reference {reference}), but `{}` also takes {unknown:?} in the data. An \
+                     undeclared value takes the same factor as the reference level, so the fit \
+                     would silently model it as reference. List every level \
+                     (`{} categorical(levels = [...])`), use `levels = auto` to read them off \
+                     the data, or filter the rows out.",
+                    rel.parameter, rel.covariate, rel.covariate, rel.covariate
+                ),
+            )
+            .with_block("covariate_model"),
+        );
+    }
+    diags
 }
 
 /// The `predict()`/`simulate()` counterpart of [`check_covariate_model_bound`].

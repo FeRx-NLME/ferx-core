@@ -46,7 +46,15 @@ section of the SDLC for the versioning policy).
   `center`/`breakpoint`/`ref` accept a literal or a data-derived statistic (`median`, `mean`,
   `min`, `max`, `mode`), and `[covariates]` gains `categorical(levels = [0, 1])` /
   `levels = auto`. The relations are echoed on `FitResult.covariate_relations` and in the fit
-  YAML, and `ferx check` prints the desugared block. Each relation owns its own θ (as in `scm`);
+  YAML — each θ naming the categorical `level` it contrasts, each `expr(…)` relation carrying
+  the expression that ran, and a relation with no θ emitting `thetas: []` rather than a bare key.
+  Statistics summarise every event record (observations, doses, `EVID=2` markers, `EVID=3/4`
+  resets), so the default bounds cover the range the fit evaluates over. Centres that would break
+  their own form are refused up front: outside the observed range for the linear family (whose
+  default bounds would come back reversed), non-positive for `power`, zero for `linear_relative`;
+  so is a categorical value the block never declared, which would otherwise be modelled silently
+  as the reference level (`E_COV_LEVEL_UNKNOWN`). `ferx check` prints the desugared block. Each
+  relation owns its own θ (as in `scm`);
   a θ shared across relations is still written classically. Relations are line-oriented and
   independent,
   so a covariate search rewrites this one block instead of doing surgery on an expression. See

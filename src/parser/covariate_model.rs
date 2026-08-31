@@ -294,6 +294,9 @@ fn parse_relation_line(
         Some(stat) => summary.map(|s| s.value_of(stat)),
         None => None,
     };
+    if let Some(c) = resolved_center {
+        check_center_domain(&form, c, param, covariate)?;
+    }
 
     let mut rel = CovariateRelation {
         parameter: param.to_string(),
@@ -312,6 +315,44 @@ fn parse_relation_line(
     };
     rel.thetas = build_thetas(&rel, decl, summary, explicit.as_deref())?;
     Ok(rel)
+}
+
+/// Reject a centring constant the relation's own algebra cannot use.
+///
+/// `power` and `linear_relative` divide by the centre, and division by a zero
+/// (or missing) value **underflows to `0.0`** in this engine rather than
+/// blowing up — a `center = 0` would silently turn the whole covariate factor
+/// into `0` or `1`. A negative centre in `power` sends a positive covariate
+/// through `(negative)^θ`, which is `NaN` for a non-integer θ. Both are caught
+/// here, at parse time, rather than at the first evaluation.
+fn check_center_domain(
+    form: &CovariateForm,
+    center: f64,
+    param: &str,
+    covariate: &str,
+) -> Result<(), String> {
+    let bad = |why: &str| {
+        Err(format!(
+            "[covariate_model]: `{param} ~ {covariate} {}` resolves its centre to {center}, {why}",
+            form.label()
+        ))
+    };
+    if !center.is_finite() {
+        return bad("which is not a finite number. State it as a literal (`center = 70`).");
+    }
+    match form {
+        CovariateForm::Power if center <= 0.0 => bad(
+            "but `power` evaluates `(COV / centre)^θ` — a zero centre divides to `0` (this \
+             engine underflows rather than raising) and a negative one makes the base negative, \
+             which is `NaN` for a non-integer θ. Use a positive centre.",
+        ),
+        CovariateForm::LinearRelative if center == 0.0 => bad(
+            "but `linear_relative` evaluates `1 + θ·(COV / centre − 1)` — dividing by zero \
+             underflows to `0` here, so the relation would silently contribute `1 − θ` for \
+             every subject. Use a non-zero centre, or `linear`, which subtracts instead.",
+        ),
+        _ => Ok(()),
+    }
 }
 
 /// `power(center = median)` → the form and its keyword arguments.
@@ -638,12 +679,18 @@ fn linear_family_thetas(
 ) -> Result<Vec<CovariateTheta>, String> {
     let below = center - summary.min;
     let above = center - summary.max;
-    if below == 0.0 || above == 0.0 {
+    // The default bounds only order themselves when the centre sits *strictly
+    // inside* the observed range: `below > 0 > above` puts `1/above` below
+    // `1/below`. A constant covariate makes one of them infinite; a centre
+    // outside the range makes both the same sign, which emits `lower > upper`
+    // (e.g. centre 100 over a 50..90 range → `(0.1, 0.02)`).
+    if !(below > 0.0 && above < 0.0) {
         return Err(format!(
-            "[covariate_model]: `{} ~ {} {}` needs a covariate that varies around its centre \
-             ({center}), but `{}` spans [{}, {}] in the data — the PsN default bounds \
-             1/(centre − min) and 1/(centre − max) are infinite there. State the θ explicitly \
-             with `=> NAME(init, lower, upper)`, or drop the relation.",
+            "[covariate_model]: `{} ~ {} {}` needs its centre ({center}) to lie strictly inside \
+             the observed range of `{}`, which spans [{}, {}] in the data — the PsN default \
+             bounds 1/(centre − min) and 1/(centre − max) are only ordered (and only keep the \
+             covariate factor positive) there. State the θ explicitly with \
+             `=> NAME(init, lower, upper)`, or drop the relation.",
             rel.parameter,
             rel.covariate,
             rel.form.label(),
@@ -681,15 +728,30 @@ fn linear_family_thetas(
                 level: None,
             },
         ],
-        _ => vec![CovariateTheta {
-            name: base,
-            init: scale * 0.001 / below,
-            lower: scale * 1.0 / above,
-            upper: scale / below,
-            fixed: false,
-            level: None,
-        }],
+        _ => {
+            // Scaling by a negative centre (`linear_relative` on a covariate
+            // that straddles zero) reverses the interval, so re-order rather
+            // than emit `lower > upper`.
+            let (lower, upper) = ordered(scale * 1.0 / above, scale / below);
+            vec![CovariateTheta {
+                name: base,
+                init: scale * 0.001 / below,
+                lower,
+                upper,
+                fixed: false,
+                level: None,
+            }]
+        }
     })
+}
+
+/// `(min, max)` of two bounds — a negative `linear_relative` centre flips them.
+fn ordered(a: f64, b: f64) -> (f64, f64) {
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
+    }
 }
 
 /// How many θ a relation generates, or an error when the answer is unknowable

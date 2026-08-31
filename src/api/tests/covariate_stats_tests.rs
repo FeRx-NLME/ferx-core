@@ -53,17 +53,8 @@ fn population(name: &str, values: &[f64]) -> Population {
                 observations: vec![1.0],
                 obs_cmts: vec![1],
                 covariates,
-                dose_covariates: Vec::new(),
-                obs_covariates: Vec::new(),
-                pk_only_times: Vec::new(),
-                pk_only_covariates: Vec::new(),
-                reset_times: Vec::new(),
                 cens: vec![0],
-                occasions: Vec::new(),
-                obs_l2: Vec::new(),
-                dose_occasions: Vec::new(),
-                fremtype: Vec::new(),
-                obs_records: Vec::new(),
+                ..Default::default()
             }
         })
         .collect();
@@ -226,12 +217,171 @@ fn hockey_bounds_follow_the_psn_table() {
     assert!((thetas[1].upper - 1e6).abs() < 1e-9);
 }
 
+/// A covariate value carried on a non-observation record still reaches the
+/// evaluator, so it has to reach the summary (#1111 review).
+///
+/// Snapshots live on four vectors — observations, doses (EVID=1), covariate
+/// change markers (EVID=2) and resets (EVID=3/4). Summarising only the first
+/// two sources understates the spread, which is what the default θ bounds and
+/// `levels = auto` are built from.
+#[test]
+fn every_event_snapshot_feeds_the_summary_not_only_the_observations() {
+    for source in ["dose", "pk_only", "reset"] {
+        let text = model("  WT continuous", "  CL ~ WT power(center = max)");
+        // Two subjects at 50 and 60 by the static fallback; the largest value
+        // in the dataset, 90, exists *only* on the event record under test.
+        let mut pop = population("WT", &[50.0, 60.0]);
+        let extreme = HashMap::from([("WT".to_string(), 90.0)]);
+        let s = &mut pop.subjects[0];
+        match source {
+            "dose" => s.dose_covariates = vec![extreme],
+            "pk_only" => {
+                s.pk_only_times = vec![0.5];
+                s.pk_only_covariates = vec![extreme];
+            }
+            _ => {
+                s.reset_times = vec![0.5];
+                s.reset_covariates = vec![extreme];
+            }
+        }
+        let bound = bind(&text, &pop).expect("binding should succeed");
+        let rel = &bound.covariate_model.as_ref().unwrap().relations[0];
+        assert_eq!(
+            rel.resolved_center,
+            Some(90.0),
+            "`max` must see the {source} snapshot"
+        );
+    }
+}
+
+/// A centre outside the observed range emits `lower > upper` under the PsN
+/// default bounds (`center = 100` over 50..90 gives `(0.1, 0.02)`), so it is
+/// rejected rather than handed to the optimiser (#1111 review).
+#[test]
+fn a_centre_outside_the_observed_range_is_rejected() {
+    let text = model("  WT continuous", "  CL ~ WT linear(center = 100)");
+    let pop = population("WT", &[50.0, 70.0, 90.0]);
+    let e = bind(&text, &pop).expect_err("an out-of-range centre has no ordered default bounds");
+    assert!(e.contains("lie strictly inside"), "{e}");
+}
+
+/// `power` and `linear_relative` divide by the centre, and division by zero
+/// underflows to `0.0` in this engine — the covariate factor would collapse
+/// silently. Both are rejected at parse time (#1111 review).
+#[test]
+fn a_centre_the_form_divides_by_must_be_usable() {
+    for (form, needle) in [
+        ("power(center = 0)", "positive centre"),
+        ("power(center = -70)", "positive centre"),
+        ("linear_relative(center = 0)", "non-zero centre"),
+    ] {
+        let text = model("  WT continuous", &format!("  CL ~ WT {form}"));
+        let e = parse_full_model(&text)
+            .err()
+            .unwrap_or_else(|| panic!("`{form}` must be rejected"));
+        assert!(e.contains(needle), "{form}: {e}");
+    }
+    // …while `linear`, which subtracts, is untouched by the same centre.
+    let text = model("  WT continuous", "  CL ~ WT linear(center = 0)");
+    let pop = population("WT", &[-10.0, 0.0, 10.0]);
+    bind(&text, &pop).expect("`linear` may centre on zero");
+}
+
+/// `linear_relative` scales its bounds by the centre, so a negative centre
+/// reverses them. They must come back ordered (#1111 review).
+#[test]
+fn a_negative_relative_centre_still_emits_ordered_bounds() {
+    let text = model(
+        "  TEMP continuous",
+        "  CL ~ TEMP linear_relative(center = -5)",
+    );
+    let pop = population("TEMP", &[-10.0, -5.0, 10.0]);
+    let bound = bind(&text, &pop).expect("binding should succeed");
+    let theta = &bound.covariate_model.as_ref().unwrap().relations[0].thetas[0];
+    assert!(
+        theta.lower < theta.upper,
+        "lower {} must be below upper {}",
+        theta.lower,
+        theta.upper
+    );
+    assert!(
+        theta.init > theta.lower && theta.init < theta.upper,
+        "init {} must lie inside ({}, {})",
+        theta.init,
+        theta.lower,
+        theta.upper
+    );
+}
+
+/// A categorical value the block never declared takes the same factor as the
+/// reference level — the fit would silently model it as reference. The data
+/// check refuses it (#1111 review).
+#[test]
+fn a_categorical_value_outside_the_declared_levels_is_rejected() {
+    let text = model(
+        "  SEX categorical(levels = [0, 1])",
+        "  CL ~ SEX categorical(ref = 0)",
+    );
+    let parsed = parse_full_model(&text).expect("model should parse");
+
+    // Declared levels only: clean.
+    let clean = population("SEX", &[0.0, 1.0, 0.0]);
+    assert!(
+        crate::api::check_model_data(&parsed.model, &clean)
+            .iter()
+            .all(|d| d.code != "E_COV_LEVEL_UNKNOWN"),
+        "a dataset inside the declared levels must pass"
+    );
+
+    // A third code in the data — the silent-reference case.
+    let dirty = population("SEX", &[0.0, 1.0, 2.0]);
+    let diags = crate::api::check_model_data(&parsed.model, &dirty);
+    let hit = diags
+        .iter()
+        .find(|d| d.code == "E_COV_LEVEL_UNKNOWN")
+        .unwrap_or_else(|| panic!("{diags:?}"));
+    assert!(hit.message.contains("2.0"), "{}", hit.message);
+}
+
+/// The echoed relation table has to be machine-readable on its own: which
+/// level each categorical θ belongs to, and the body of an `expr(...)`
+/// relation, are otherwise recoverable only by re-parsing the model file
+/// (#1111 review).
+#[test]
+fn the_echoed_relation_table_keeps_level_and_expression() {
+    let text = model(
+        "  SEX categorical(levels = [0, 1])",
+        "  CL ~ SEX categorical(ref = 0)\n  V ~ SEX expr(\"1 + 0.1 * SEX\")",
+    );
+    let parsed = parse_full_model(&text).expect("model should parse");
+    let names = parsed.model.theta_names.clone();
+    let theta = parsed.model.default_params.theta.clone();
+    let fixed = vec![false; theta.len()];
+    let rels =
+        crate::api::covariate_relation_estimates(&parsed.model, &names, &theta, None, &fixed);
+
+    let cat = rels
+        .iter()
+        .find(|r| r.form == "categorical")
+        .expect("the categorical relation is echoed");
+    assert_eq!(cat.thetas.len(), 1, "one contrast against the reference");
+    assert_eq!(cat.thetas[0].level, Some(1.0));
+    assert_eq!(cat.expression, None);
+
+    let expr = rels
+        .iter()
+        .find(|r| r.form == "expr")
+        .expect("the expr relation is echoed");
+    assert_eq!(expr.expression.as_deref(), Some("1 + 0.1 * SEX"));
+    assert!(expr.thetas.is_empty());
+}
+
 #[test]
 fn a_constant_covariate_is_rejected_rather_than_given_infinite_bounds() {
     let text = model("  WT continuous", "  CL ~ WT linear(center = median)");
     let pop = population("WT", &[70.0, 70.0, 70.0]);
     let e = bind(&text, &pop).expect_err("a constant covariate has no spread to bound against");
-    assert!(e.contains("varies around its centre"), "{e}");
+    assert!(e.contains("lie strictly inside"), "{e}");
 }
 
 #[test]

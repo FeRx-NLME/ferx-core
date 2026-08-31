@@ -29,7 +29,7 @@ use std::collections::HashSet;
 
 use crate::parser::covariate_model::CovariateStatBindings;
 use crate::parser::model_parser::parse_full_model_with;
-use crate::types::{CompiledModel, CovariateSummary, ParsedModel, Population};
+use crate::types::{CompiledModel, CovariateSummary, ParsedModel, Population, Subject};
 
 /// Resolve every symbolic statistic in `parsed`'s `[covariate_model]` block
 /// against `population`, re-parsing the model so the desugared expressions
@@ -110,23 +110,17 @@ pub fn assert_covariate_model_bound(model: &CompiledModel) -> Result<(), String>
 /// not drag the median toward their own weight. A time-varying covariate
 /// contributes each distinct value it takes within the subject, so a weight that
 /// changes across an admission is not collapsed to its first record.
+///
+/// **Every** event snapshot counts, not only the observation ones: a covariate
+/// change carried on a dose (EVID=1), a covariate-change marker (EVID=2) or a
+/// reset (EVID=3/4) is read by the event-driven evaluator, so a value the model
+/// actually evaluates at must not be missing from `min`/`max` (which become
+/// default θ bounds) or from `levels = auto` (where an omitted level silently
+/// collapses to the reference factor).
 fn summarize(name: &str, population: &Population) -> Result<CovariateSummary, String> {
     let mut values: Vec<f64> = Vec::with_capacity(population.subjects.len());
     for subject in &population.subjects {
-        let mut seen: Vec<f64> = Vec::new();
-        if let Some(v) = subject.covariates.get(name) {
-            if v.is_finite() {
-                seen.push(*v);
-            }
-        }
-        for snapshot in &subject.obs_covariates {
-            if let Some(v) = snapshot.get(name) {
-                if v.is_finite() && !seen.contains(v) {
-                    seen.push(*v);
-                }
-            }
-        }
-        values.extend(seen);
+        values.extend(subject_covariate_values(subject, name));
     }
     if values.is_empty() {
         return Err(format!(
@@ -149,6 +143,37 @@ fn summarize(name: &str, population: &Population) -> Result<CovariateSummary, St
         mode: mode_of(&values),
         levels: distinct(&values),
     })
+}
+
+/// Every distinct finite value `name` takes within one subject, in first-seen
+/// order: the subject-static fallback, then each observation, dose, EVID=2
+/// covariate-change marker and EVID=3/4 reset snapshot.
+///
+/// Shared with [`crate::api::validation`]'s categorical-level check, so the
+/// values a summary is built from and the values a declared level set is
+/// checked against are, by construction, the same set.
+pub(crate) fn subject_covariate_values(subject: &Subject, name: &str) -> Vec<f64> {
+    let mut seen: Vec<f64> = Vec::new();
+    let mut push = |v: f64| {
+        if v.is_finite() && !seen.contains(&v) {
+            seen.push(v);
+        }
+    };
+    if let Some(v) = subject.covariates.get(name) {
+        push(*v);
+    }
+    for snapshot in subject
+        .obs_covariates
+        .iter()
+        .chain(&subject.dose_covariates)
+        .chain(&subject.pk_only_covariates)
+        .chain(&subject.reset_covariates)
+    {
+        if let Some(v) = snapshot.get(name) {
+            push(*v);
+        }
+    }
+    seen
 }
 
 /// The most common value in a sorted slice. Ties break toward the smaller

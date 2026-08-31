@@ -101,6 +101,11 @@ pub fn fit_from_files(
         let model_text = std::fs::read_to_string(model_path)
             .map_err(|e| format!("Failed to re-read model file for level binding: {e}"))?;
         crate::api::bind_theta_levels(&mut parsed, &model_text, &mut population)?;
+        // #1111: resolve any symbolic `[covariate_model]` statistic
+        // (`center = median`, `ref = mode`, `levels = auto`) against the same
+        // dataset. `assert_covariate_model_bound` names this entry point as one
+        // that binds them, so it has to actually do it.
+        crate::api::bind_covariate_stats(&mut parsed, &model_text, &population)?;
     }
     let mut model = parsed.model;
     model.bloq_method = opts.bloq_method;

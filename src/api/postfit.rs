@@ -1269,6 +1269,10 @@ pub(crate) fn covariate_relation_estimates(
             form: rel.form.label().to_string(),
             center_source: rel.center.map(|c| c.label()),
             center: rel.resolved_center,
+            expression: match &rel.form {
+                crate::types::CovariateForm::Expr(text) => Some(text.clone()),
+                _ => None,
+            },
             thetas: rel
                 .thetas
                 .iter()
@@ -1286,6 +1290,7 @@ pub(crate) fn covariate_relation_estimates(
                             idx.and_then(|i| se_theta.and_then(|se| se.get(i).copied()))
                         },
                         fixed,
+                        level: t.level,
                     }
                 })
                 .collect(),
