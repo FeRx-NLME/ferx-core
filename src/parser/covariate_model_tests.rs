@@ -598,3 +598,126 @@ fn a_kappa_bearing_factor_counts_as_a_random_effect_factor() {
         "CL = TVCL * (if (present(WT)) (WT / 70)^THETA_CL_WT else 1.0) * exp(ETA_CL) * exp(KAPPA_CL)"
     );
 }
+
+// ── Malformed lines: one assert per diagnostic ─────────────────────────────
+//
+// These are the messages a user actually meets when a hand-written or
+// search-generated block is wrong, so each is pinned on the phrase that makes
+// it actionable rather than on the whole string.
+
+#[test]
+fn a_line_without_a_tilde_names_the_expected_shape() {
+    let e = err("  WT continuous", "  CL WT power(center = 70)");
+    assert!(e.contains("expected `PARAM ~ COV form(...)`"), "{e}");
+}
+
+#[test]
+fn a_line_with_no_parameter_before_the_tilde_is_an_error() {
+    let e = err("  WT continuous", "  ~ WT power(center = 70)");
+    assert!(e.contains("missing parameter name"), "{e}");
+}
+
+#[test]
+fn a_relation_that_states_no_form_lists_the_forms() {
+    let e = err("  WT continuous", "  CL ~ WT");
+    assert!(e.contains("states no form"), "{e}");
+    assert!(e.contains("linear_relative"), "{e}");
+}
+
+#[test]
+fn two_relations_generating_the_same_theta_name_is_an_error() {
+    // Each relation owns its θ; sharing one would couple two lines and defeat
+    // the point of a line-oriented block.
+    let e = err(
+        "  WT continuous\n  CRCL continuous",
+        "  CL ~ WT power(center = 70) => SHARED(0.75, -10, 10)\n\
+         \x20 CL ~ CRCL power(center = 100) => SHARED(0.75, -10, 10)",
+    );
+    assert!(e.contains("both generate the θ `SHARED`"), "{e}");
+}
+
+#[test]
+fn an_unbalanced_form_parenthesis_is_an_error() {
+    let e = err("  WT continuous", "  CL ~ WT power(center = 70");
+    assert!(e.contains("unbalanced parentheses"), "{e}");
+}
+
+#[test]
+fn an_unquoted_or_empty_expr_is_an_error() {
+    let e = err("  WT continuous", "  CL ~ WT expr((WT/70)^0.75)");
+    assert!(e.contains("takes a quoted expression"), "{e}");
+
+    let e = err("  WT continuous", "  CL ~ WT expr(\"  \")");
+    assert!(e.contains("states no expression"), "{e}");
+}
+
+#[test]
+fn a_keyword_argument_without_a_value_is_an_error() {
+    let e = err("  WT continuous", "  CL ~ WT power(median)");
+    assert!(e.contains("takes `key = value` arguments"), "{e}");
+}
+
+#[test]
+fn a_centring_value_that_is_neither_a_number_nor_a_statistic_is_an_error() {
+    let e = err("  WT continuous", "  CL ~ WT power(center = middling)");
+    assert!(e.contains("neither a number nor one of"), "{e}");
+}
+
+#[test]
+fn a_repeated_keyword_argument_is_an_error() {
+    let e = err(
+        "  WT continuous",
+        "  CL ~ WT power(center = 70, center = 80)",
+    );
+    assert!(e.contains("is given more than once"), "{e}");
+}
+
+#[test]
+fn a_symbolic_fix_value_is_an_error() {
+    // `fix` pins θ at a number; a data-derived statistic is not one.
+    let e = err(
+        "  WT continuous",
+        "  CL ~ WT power(center = 70, fix = median)",
+    );
+    assert!(e.contains("`fix` takes a number"), "{e}");
+}
+
+#[test]
+fn min_and_max_accept_their_long_spellings() {
+    // `minimum`/`maximum` are the spellings PsN users reach for; both resolve
+    // to the same statistic as the short form.
+    let s = spec("  WT continuous", "  CL ~ WT linear(center = minimum)");
+    assert_eq!(s.relations[0].center, Some(CovariateStat::Min));
+    let s = spec("  WT continuous", "  CL ~ WT linear(center = maximum)");
+    assert_eq!(s.relations[0].center, Some(CovariateStat::Max));
+}
+
+#[test]
+fn a_non_finite_literal_centre_is_an_error() {
+    let e = err("  WT continuous", "  CL ~ WT power(center = inf)");
+    assert!(e.contains("not a finite number"), "{e}");
+}
+
+#[test]
+fn a_malformed_theta_clause_is_an_error() {
+    let e = err(
+        "  WT continuous",
+        "  CL ~ WT power(center = 70) => THETA_WT",
+    );
+    assert!(e.contains("expected `=> NAME(init, lower, upper)`"), "{e}");
+
+    let e = err(
+        "  WT continuous",
+        "  CL ~ WT power(center = 70) => T(0.75, low, 10)",
+    );
+    assert!(e.contains("`low` is not a number"), "{e}");
+
+    let e = err(
+        "  WT continuous",
+        "  CL ~ WT power(center = 70) => T(0.75, -10)",
+    );
+    assert!(e.contains("needs exactly (init, lower, upper)"), "{e}");
+
+    let e = err("  WT continuous", "  CL ~ WT power(center = 70) => ");
+    assert!(e.contains("empty `=>` clause"), "{e}");
+}
