@@ -38,7 +38,7 @@ use std::time::Instant;
 /// Predict concentrations for a population using given parameters (no random effects).
 ///
 /// Data-reader warnings (e.g. missing II for ADDL doses) are not echoed here;
-/// callers that obtained `population` via `read_nonmem_csv` should inspect
+/// callers that obtained `population` via [`crate::read_nonmem_csv`] should inspect
 /// `population.warnings` before calling this function.
 ///
 /// **Gaussian rows only.** Non-Gaussian endpoints keep their own entry points, because

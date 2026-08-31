@@ -1079,7 +1079,7 @@ impl Subject {
     /// This is the user clock, and it is the convention every other per-record
     /// object already uses — sdtab/covtab `TIME`, `predict()`/`simulate()` `TIME`,
     /// `[derived]` integral windows, and the custom residual-magnitude model
-    /// (`ModelParameters::ruv_obs_mult`, documented as "matching what NONMEM's
+    /// ([`CompiledModel::ruv_obs_mult`], documented as "matching what NONMEM's
     /// `$ERROR` sees"). A `[scaling]` Form C readout is the `$ERROR` twin — it is
     /// anchored against NONMEM's `$ERROR` in
     /// `tests/scaling_time_readout_nonmem_anchor.rs` — so it reads the same clock
@@ -2627,7 +2627,7 @@ pub struct AnalyticalInit {
     /// The same `A₀` expression compiled to a `Dual2`-differentiable program
     /// (issue #524), so the analytic FOCE/FOCEI provider can differentiate the
     /// init impulse `A₀ · kernel(t, pk)` exactly instead of falling back to
-    /// finite differences. Reuses `ScaleDerivProgram` — the init amount has the
+    /// finite differences. Reuses [`crate::parser::model_parser::ScaleDerivProgram`] — the init amount has the
     /// same `(θ, η, individual-param, covariate)` shape as an `obs_scale`
     /// expression. `None` only for hand-constructed inits with no parsed
     /// expression (those keep the FD fallback).
@@ -3881,7 +3881,7 @@ impl CompiledModel {
     }
 
     /// Copy the configured ODE solver tolerances from `opts` onto this model's
-    /// `OdeSpec` (no-op for the `OdeSpec` of an analytical model). Call this once
+    /// [`OdeSpec`](crate::ode::predictions::OdeSpec) (no-op for the `OdeSpec` of an analytical model). Call this once
     /// after the model file's `[fit_options]` and any call-time `settings` overrides
     /// have been merged into `opts`, so the integrator uses the requested accuracy.
     /// The parser calls it at parse time, so `.ferx` `[fit_options]` and any
@@ -3897,7 +3897,7 @@ impl CompiledModel {
     /// full no-op.
     ///
     /// Note: [`fit`](crate::fit) takes `&CompiledModel` and does **not** call
-    /// this. The integrator reads `OdeSpec::solver_opts`, never
+    /// this. The integrator reads [`OdeSpec::solver_opts`](crate::ode::predictions::OdeSpec::solver_opts), never
     /// `FitOptions::ode_reltol` directly, so a caller that merges call-time
     /// `settings` into its own `FitOptions` (as the R wrapper's `ferx_fit`
     /// does) must re-apply this on an owned model *before* `fit` for those
@@ -5784,7 +5784,7 @@ pub struct FitResult {
     /// Echo of the declared covariate columns from the input dataset (ID, TIME,
     /// EVID + one column per declared covariate, one row per input record).
     /// `Some` only when the model has a `[covariates]` block AND the fit was
-    /// launched from a data file; `None` for the in-memory `fit` entry point
+    /// launched from a data file; `None` for the in-memory [`crate::fit`] entry point
     /// (which has no raw rows) or when no `[covariates]` block is declared.
     /// Missing values are `f64::NAN`. See [`CovariateTable`].
     pub covariate_table: Option<CovariateTable>,
@@ -5804,7 +5804,7 @@ pub struct FitResult {
     pub exclusions: Option<ExclusionSummary>,
     /// The optimizer's **exact** final packed parameter vector (log-theta,
     /// Cholesky-omega lower triangle, log-sigma, over the free parameters), lifted
-    /// from `OuterResult::packed_estimate`. Lets `run_covariance` reproduce the
+    /// from [`OuterResult::packed_estimate`](crate::estimation::outer_optimizer::OuterResult::packed_estimate). Lets [`crate::run_covariance`] reproduce the
     /// inline covariance step's FD-Hessian bit-for-bit by reusing this exact
     /// Cholesky factor instead of re-decomposing `omega` (which is not the
     /// round-trip inverse of the stored `L·Lᵀ`; the FD Hessian amplifies the
@@ -6622,7 +6622,7 @@ pub struct FitOptions {
     /// opt-in for experimentation.
     pub scale_params: bool,
     /// Parameter-scaling strategy for the outer optimizer. When non-`None` this
-    /// supersedes `scale_params`: `Rescale2` (nlmixr2-style bound-half-width
+    /// supersedes [`FitOptions::scale_params`]: `Rescale2` (nlmixr2-style bound-half-width
     /// normalisation) is the recommended setting for gradient-based optimizers
     /// and substantially improves cold-start convergence (see
     /// [`ParameterScaling`]). **Default: `Auto`** — applies `Rescale2` to the

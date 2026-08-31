@@ -102,12 +102,12 @@ impl ErrorSpec {
     }
 
     /// `∂(sigma loading coefficient)/∂f` for each slot an observation loads on,
-    /// parallel in shape to `sigma_loadings`.
+    /// parallel in shape to [`ErrorSpec::sigma_loadings`](crate::types::ErrorSpec::sigma_loadings).
     ///
     /// Every loading coefficient is affine in the prediction `f`: the
     /// proportional slot loads `f` (slope `1`), the additive slot loads the
     /// constant `1` (slope `0`). Returning the slopes with the *same slot
-    /// presence* as `sigma_loadings` lets the dense-`R` derivative
+    /// presence* as [`ErrorSpec::sigma_loadings`](crate::types::ErrorSpec::sigma_loadings) lets the dense-`R` derivative
     /// ([`crate::stats::residual_error::compute_dr_df_matrices`]) reuse the exact
     /// bilinear cross-covariance assembly with the value loadings replaced by
     /// these slopes — the off-diagonal `R` is linear in each observation's

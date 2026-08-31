@@ -494,7 +494,7 @@ pub(crate) const MIX_ESS_PMIX_FLOOR: f64 = 1e-3;
 ///   L_i = Σ_k p_ik · L_ik,   −2·log L = −2 Σ_i log Σ_k p_ik L_ik
 /// ```
 ///
-/// via `combine_subject`. This is the true marginal likelihood a chained
+/// via [`crate::estimation::mixture::combine_subject`]. This is the true marginal likelihood a chained
 /// `[saem, imp]` / `[focei, imp]` fit reports for a mixture. The per-class solves
 /// run inside each subject's rayon task (the guard is entered per class on the
 /// worker thread), so subject-level parallelism is preserved while the

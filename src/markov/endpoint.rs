@@ -143,7 +143,7 @@ fn ctmm_endpoint_nll(
 /// `Q` is rebuilt over `Dual1` with θ and η seeded
 /// (`CtmmGeneratorProgram::eval_generator_duals`), giving an exact `∂Q/∂(θ,η)`; the η
 /// columns are then chained through the Van Loan Fréchet derivative of `expm` by
-/// `ctmm_data_term_grad`. Returns `(value, ∂/∂η)` with the gradient at the **same 1×
+/// [`crate::markov::ctmm_data_term_grad`]. Returns `(value, ∂/∂η)` with the gradient at the **same 1×
 /// scale as the value** — the caller applies the objective's factor.
 ///
 /// `None` — caller falls back to FD for this point — when *any* CTMM endpoint on the
