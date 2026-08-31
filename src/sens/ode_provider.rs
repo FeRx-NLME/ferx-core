@@ -667,17 +667,32 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     // against central FD of the production predictor at `reltol = 1e-10`, two bolus
     // doses, that held: `0.3*TAD` agreed to 1.5e-9 on `∂f/∂η`, `0.03*TIME` to 6.4e-10.
     //
-    // The argument had a hole and the measurement did not cover it: **`subject.has_resets()`
-    // is not in the trigger list**, while it *is* in the value path's condition
-    // (`pk/mod.rs`). An EVID 3/4 reset subject with no TV covariates, no lagtime, no SS
-    // and fixed doses therefore had its value integrated event-driven and its gradient
-    // taken on the static walk, which re-anchors `TAD` differently across the reset. The
-    // two-bolus fixtures behind the table above contain no reset, so nothing measured it.
+    // The hole is the **pre-arrival window**, and the table above could not see it because
+    // every fixture behind it observes only after the first dose. `integrate_g` resolves
+    // `TAD`'s anchor as `doses.filter(|dt| dt <= t_start).fold(NEG_INFINITY, f64::max)`, so
+    // a segment starting before the first dose leaves it at `-inf` and the RHS is evaluated
+    // with `TAD = NaN`. Measured with this gate on the narrow predicate, two doses at 1 and
+    // 6 with an observation at 0.4: `f = [0.0, NaN, NaN, NaN, NaN, NaN]`, 10 non-finite
+    // `∂f/∂η` and 30 non-finite `∂f/∂θ`. The provider returns `Some`, so those `NaN`s reach
+    // the FOCEI objective instead of falling back to FD. The event-driven walk seeds the
+    // same variable at the first arrival (#1073's pre-arrival anchor, which the static walk
+    // never received), and the same fixture then comes back fully finite and FD-parity
+    // clean. Pinned by `a_pre_arrival_observation_does_not_nan_the_analytic_sensitivities`.
     //
-    // Widening here closes that without needing a reset-specific clause: any subject on a
-    // non-autonomous RHS now takes the same walk its value does. The cost is that a
-    // `TAD`-reading model with no other trigger moves from the static jet to the
-    // event-driven one — the more general walk, and the one the value path already uses.
+    // One thing this clause is **not** justified by, recorded because it was the first
+    // reason given and it does not survive measurement: `subject.has_resets()` is absent
+    // from the trigger list while present in the value path's condition, which looked like
+    // the same class of split. It is not — a reset + `TAD` subject on the static walk
+    // passes `check_full_provider_vs_fd`, so that walk re-anchors `TAD` across a reset
+    // correctly. Widening still subsumes the reset case, but the reset case was never the
+    // defect.
+    //
+    // The cost is that a `TAD`-reading model with no other trigger moves from the static
+    // jet to the event-driven one — the more general walk, and the one the value path
+    // already uses. For a subject whose observations all follow the first dose that is pure
+    // engine consistency: measured on such a fixture, the static walk's jet is FD-parity
+    // clean too (`tad_reading_model_without_a_lagtime_takes_a_route_that_matches_fd` passes
+    // under either predicate).
     let uses_time = crate::pk::model_uses_time_anywhere(model);
     // A per-route absorption lag (`fn(..., lag=L)`, #859) makes each route's onset a moving
     // boundary (`t_dose + lag_cmt + lag_route`) with its own rate-on saltation — the same
