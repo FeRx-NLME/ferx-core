@@ -288,15 +288,16 @@ fn raw_results_round_trip_finds_the_se_columns() {
         ..BootstrapOptions::default()
     };
     let mut written = result();
-    written.replicates[0].standard_errors = Some(vec![0.1, 0.2]);
+    written.replicates[0].standard_errors = Some(vec![Some(0.1), None]);
     write_raw_results(&path, &written, &options).expect("write");
 
     let (names, _, replicates) = read_raw_results(&path).expect("read");
     // The parameter block must stop at `se_`, not swallow it.
     assert_eq!(names, vec!["CL", "V"]);
     let se = replicates[0].standard_errors.as_ref().expect("se columns");
-    assert!((se[0] - 0.1).abs() < 1e-9);
-    assert!((se[1] - 0.2).abs() < 1e-9);
+    assert!((se[0].expect("CL has an SE") - 0.1).abs() < 1e-9);
+    // A coordinate core reports no SE for round-trips as absent, not as 0.
+    assert_eq!(se[1], None);
 }
 
 #[test]

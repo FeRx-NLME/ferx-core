@@ -612,6 +612,40 @@ mod tests {
     }
 
     #[test]
+    fn an_invalid_confidence_level_is_an_error_not_a_crash() {
+        // `--summarize --ci 100` used to walk past every check and hit an
+        // assertion inside the statistics, killing the process with 101.
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            dir.path().join("raw_results.csv"),
+            "sample,minimization_successful,estimate_near_boundary,covariance_step_successful,\
+             covariance_step_warnings,ofv,seconds,CL,error\n1,1,0,0,0,10,0.1,1.0,\n",
+        )
+        .expect("write");
+        assert_eq!(
+            run(&args(&[
+                "--summarize",
+                "--directory",
+                dir.path().to_str().unwrap(),
+                "--ci",
+                "100"
+            ])),
+            1
+        );
+        // And on the fresh-run path, before anything is fitted.
+        assert_eq!(
+            run(&args(&[
+                &repo_path("examples/warfarin.ferx"),
+                "--data",
+                &repo_path("data/warfarin.csv"),
+                "--ci",
+                "0"
+            ])),
+            1
+        );
+    }
+
+    #[test]
     fn a_run_whose_every_sample_is_excluded_exits_one() {
         // `--sample-size 1` fits single-subject replicates, which cannot
         // identify the between-subject variances and so land on a boundary —

@@ -204,7 +204,15 @@ pub fn summarize(
     }
 
     let alpha = (100.0 - options.confidence_level) / 2.0;
-    let z = normal_quantile(1.0 - alpha / 100.0);
+    // `normal_quantile` asserts its domain, and this is a `pub` function: a
+    // caller that skipped [`BootstrapOptions::validate`] must get a table with
+    // no normal-approximation interval, not a panic out of a library.
+    // The same open interval `BootstrapOptions::validate` enforces — a level of
+    // exactly 0 or 100 is not merely out of the assertion's domain, it names a
+    // zero-width or infinite interval.
+    let z = (options.confidence_level > 0.0 && options.confidence_level < 100.0)
+        .then(|| normal_quantile(1.0 - alpha / 100.0))
+        .filter(|z| z.is_finite());
 
     let mut parameters = Vec::with_capacity(names.len());
     for (j, name) in names.iter().enumerate() {
@@ -246,9 +254,10 @@ pub fn summarize(
             standard_error: sd,
             median,
             ci_percentile,
-            ci_standard_error: orig
-                .filter(|_| sd.is_finite())
-                .map(|o| (o - z * sd, o + z * sd)),
+            ci_standard_error: match (orig, z) {
+                (Some(o), Some(z)) if sd.is_finite() => Some((o - z * sd, o + z * sd)),
+                _ => None,
+            },
         });
     }
 

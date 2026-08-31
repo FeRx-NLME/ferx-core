@@ -273,6 +273,35 @@ fn excluded_replicates_do_not_enter_the_statistics() {
 }
 
 #[test]
+fn an_out_of_range_confidence_level_drops_the_interval_rather_than_panicking() {
+    // `summarize` is a `pub` function, and `normal_quantile` asserts its domain.
+    // A caller that skipped `BootstrapOptions::validate` must get a table with
+    // no normal-approximation interval, not a panic out of a library.
+    let names = vec!["CL".to_string()];
+    let original = replicate(0, vec![10.0]);
+    let replicates: Vec<ReplicateResult> = (1..=3)
+        .map(|i| replicate(i, vec![9.0 + i as f64]))
+        .collect();
+
+    for level in [100.0, 0.0, -3.0, 250.0] {
+        let s = summarize(
+            &names,
+            Some(&original),
+            &replicates,
+            &BootstrapOptions {
+                confidence_level: level,
+                ..BootstrapOptions::default()
+            },
+        );
+        let p = &s.parameters[0];
+        assert_eq!(p.ci_standard_error, None, "level {level}");
+        // Everything that does not depend on the level is still computed.
+        assert!(p.mean.is_finite(), "level {level}");
+        assert!(p.standard_error.is_finite(), "level {level}");
+    }
+}
+
+#[test]
 fn a_run_with_no_base_fit_reports_no_bias() {
     let names = vec!["CL".to_string()];
     let replicates: Vec<ReplicateResult> = (1..=3).map(|i| replicate(i, vec![i as f64])).collect();

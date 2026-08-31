@@ -521,7 +521,13 @@ fn keep_covariance_populates_the_per_replicate_standard_errors() {
         .as_ref()
         .expect("covariance step ran, so SEs exist");
     assert_eq!(se.len(), with_cov.parameter_names.len());
-    assert!(se.iter().all(|v| v.is_finite() && *v >= 0.0), "{se:?}");
+    // Warfarin has a diagonal Omega and no IOV, so core reports an SE for every
+    // coordinate — none of them may be absent here.
+    assert!(
+        se.iter()
+            .all(|v| v.is_some_and(|v| v.is_finite() && v >= 0.0)),
+        "{se:?}"
+    );
 }
 
 #[test]
@@ -581,6 +587,155 @@ fn a_run_whose_samples_all_terminate_reports_nothing_included() {
     assert_eq!(result.summary.n_included, 0);
     assert!(!result.summary.excluded_by.is_empty());
     assert!(result.summary.parameters.iter().all(|p| p.mean.is_nan()));
+}
+
+// ── IOV and block Omega ─────────────────────────────────────────────────────
+
+const IOV_MODEL: &str = "../../examples/warfarin_iov.ferx";
+const IOV_DATA: &str = "../../data/warfarin_iov.csv";
+const BLOCK_MODEL: &str = "../../examples/warfarin_block_omega.ferx";
+
+#[test]
+fn an_iov_model_carries_its_kappa_through_the_whole_flat_vector() {
+    // Regression for the first review finding: `parameter_names` /
+    // `flatten_estimates` stopped after theta, BSV Omega and sigma, so KAPPA got
+    // no bootstrap SE or CI, `--update-inits` did not carry the base fit's
+    // KAPPA, and `--dofv` evaluated a parameter vector that was not the
+    // replicate's. All three failures were silent — the run succeeded and simply
+    // did not mention the parameter.
+    let mut p = prepare_run(IOV_MODEL, Some(IOV_DATA)).expect("IOV model + data load");
+    p.parsed.fit_options.outer_maxiter = 2;
+
+    assert!(
+        p.init_params.omega_iov.is_some(),
+        "the fixture stopped being an IOV model"
+    );
+
+    let names = ferx_tools::bootstrap::parameter_names(&p.init_params);
+    assert!(
+        names.iter().any(|n| n == "OMEGA_IOV(KAPPA_CL,KAPPA_CL)"),
+        "KAPPA is missing from the parameter vector: {names:?}"
+    );
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let result = run_bootstrap(
+        &p,
+        &BootstrapOptions {
+            samples: 2,
+            seed: 3,
+            threads: Some(1),
+            dofv: true,
+            skip_minimization_terminated: false,
+            skip_estimate_near_boundary: false,
+            directory: Some(dir.path().to_path_buf()),
+            ..BootstrapOptions::default()
+        },
+    )
+    .expect("IOV bootstrap");
+
+    let kappa = result
+        .parameter_names
+        .iter()
+        .position(|n| n == "OMEGA_IOV(KAPPA_CL,KAPPA_CL)")
+        .expect("KAPPA is a bootstrap parameter");
+
+    // It is estimated, summarised, and written out — not merely named.
+    for r in &result.replicates {
+        assert!(
+            r.estimates[kappa].is_finite() && r.estimates[kappa] > 0.0,
+            "replicate {} has no KAPPA estimate",
+            r.index
+        );
+    }
+    let summary = &result.summary.parameters[kappa];
+    assert_eq!(summary.name, "OMEGA_IOV(KAPPA_CL,KAPPA_CL)");
+    assert!(summary.mean.is_finite());
+    assert!(summary.bias.is_some(), "bias needs the base fit's KAPPA");
+
+    let header = std::fs::read_to_string(dir.path().join("raw_results.csv")).expect("raw_results");
+    assert!(header.lines().next().unwrap().contains("OMEGA_IOV"));
+
+    // `--update-inits` must hand the replicates the base fit's KAPPA, not the
+    // model file's starting value.
+    let base = result.original.as_ref().expect("base fit");
+    let rebuilt = params_from_estimates(&p.init_params, &base.estimates);
+    let rebuilt_kappa = rebuilt
+        .omega_iov
+        .as_ref()
+        .expect("the rebuild keeps the IOV block")
+        .matrix[(0, 0)];
+    assert!(
+        (rebuilt_kappa - base.estimates[kappa]).abs() < 1e-12,
+        "the round trip lost KAPPA: {rebuilt_kappa} vs {}",
+        base.estimates[kappa]
+    );
+}
+
+#[test]
+fn a_block_omega_lines_its_standard_errors_up_with_its_names() {
+    // Regression for the third review finding. `FitResult::se_omega` is the
+    // *column-major* lower triangle and carries structural zeros; the flat
+    // vector here is row-major and omits them. Concatenating the two produced a
+    // longer vector than there are names, so from the block's third element on
+    // every SE was labelled with someone else's parameter and the sigma SE was
+    // pushed off the end entirely.
+    //
+    // `warfarin_block_omega.ferx` is the case that shows it: a 2x2 block over
+    // (ETA_CL, ETA_V) plus a standalone ETA_KA, so the lower triangle has six
+    // slots of which two are structural zeros.
+    let mut p = prepare_run(BLOCK_MODEL, Some(DATA)).expect("block-omega model loads");
+    p.parsed.fit_options.outer_maxiter = 2;
+
+    let names = ferx_tools::bootstrap::parameter_names(&p.init_params);
+    let omega_names: Vec<&String> = names.iter().filter(|n| n.starts_with("OMEGA(")).collect();
+    assert_eq!(
+        omega_names,
+        vec![
+            "OMEGA(ETA_CL,ETA_CL)",
+            "OMEGA(ETA_V,ETA_CL)",
+            "OMEGA(ETA_V,ETA_V)",
+            "OMEGA(ETA_KA,ETA_KA)",
+        ],
+        "the free lower triangle must skip the two structural zeros"
+    );
+
+    let result = run_bootstrap(
+        &p,
+        &BootstrapOptions {
+            samples: 1,
+            seed: 2,
+            threads: Some(1),
+            keep_covariance: true,
+            skip_minimization_terminated: false,
+            skip_estimate_near_boundary: false,
+            directory: None,
+            ..BootstrapOptions::default()
+        },
+    )
+    .expect("block-omega bootstrap");
+
+    let base = result.original.as_ref().expect("base fit");
+    let se = base
+        .standard_errors
+        .as_ref()
+        .expect("the base fit runs its covariance step");
+
+    // The decisive check: one SE per name. The old concatenation produced ten
+    // entries against eight names on exactly this model.
+    assert_eq!(
+        se.len(),
+        result.parameter_names.len(),
+        "SE vector length {} does not match {} parameters",
+        se.len(),
+        result.parameter_names.len()
+    );
+    assert_eq!(se.len(), base.estimates.len());
+    // And every one of them is a real, reported SE — no structural-zero slot
+    // leaked in, and the sigma SE is still on the end rather than shifted off it.
+    for (name, value) in result.parameter_names.iter().zip(se) {
+        let v = value.unwrap_or_else(|| panic!("no SE reported for {name}"));
+        assert!(v.is_finite() && v >= 0.0, "{name} has SE {v}");
+    }
 }
 
 #[test]

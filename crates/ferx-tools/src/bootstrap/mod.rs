@@ -78,6 +78,51 @@ pub struct BootstrapOptions {
     pub confidence_level: f64,
 }
 
+impl BootstrapOptions {
+    /// Checks that hold wherever these options are used — including
+    /// [`resummarize`], which reaches the same statistics without going through
+    /// [`run_bootstrap`].
+    ///
+    /// Splitting validation out is not symmetry for its own sake: before it
+    /// existed, `--summarize --ci 100` walked past every check and hit the
+    /// `normal_quantile` assertion, exiting 101 instead of reporting a bad
+    /// argument.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.samples == 0 {
+            return Err("--samples must be at least 1".to_string());
+        }
+        if !(self.confidence_level > 0.0 && self.confidence_level < 100.0) {
+            return Err(format!(
+                "--ci must be a confidence level in (0, 100), got {}",
+                self.confidence_level
+            ));
+        }
+        Ok(())
+    }
+
+    /// Checks that only apply to a fresh run.
+    ///
+    /// The covariance filters read a diagnostic that only exists when the step
+    /// actually ran, so asking for one without `--keep-covariance` would drop a
+    /// filter the user requested without saying so. Deliberately *not* part of
+    /// [`Self::validate`]: under `--summarize` the diagnostics are already in
+    /// `raw_results.csv`, so filtering on them is exactly the point and needs no
+    /// covariance step now.
+    fn validate_for_run(&self) -> Result<(), String> {
+        if !self.keep_covariance
+            && (self.skip_covariance_step_terminated || self.skip_with_covstep_warnings)
+        {
+            return Err(
+                "--skip-covariance-step-terminated / --skip-with-covstep-warnings filter on the \
+                 covariance step, which is off for replicate fits by default. Add \
+                 --keep-covariance (slower) or drop the filter."
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
 impl Default for BootstrapOptions {
     fn default() -> Self {
         BootstrapOptions {
@@ -112,8 +157,11 @@ pub struct ReplicateResult {
     pub index: usize,
     /// The flat parameter vector — see [`flatten_estimates`].
     pub estimates: Vec<f64>,
-    /// Per-replicate standard errors, present only with `keep_covariance`.
-    pub standard_errors: Option<Vec<f64>>,
+    /// Per-replicate standard errors, aligned with [`Self::estimates`] and
+    /// present only when the covariance step ran. An individual entry is `None`
+    /// where core reports no SE for that coordinate — an IOV *covariance*, for
+    /// instance, since `se_kappa` carries only the diagonal variances.
+    pub standard_errors: Option<Vec<Option<f64>>>,
     pub ofv: f64,
     pub converged: bool,
     pub estimate_near_boundary: bool,
@@ -148,77 +196,203 @@ pub struct BootstrapResult {
 
 // ── flat parameter vector ───────────────────────────────────────────────────
 
-/// Names for the flat parameter vector: every theta, then the free lower
-/// triangle of Omega, then every sigma.
+/// One entry of the flat parameter vector.
+///
+/// Every consumer of the flat vector — names, estimates, standard errors, the
+/// rebuild into [`ModelParameters`], the estimated-parameter count — is derived
+/// from [`coordinates`] rather than re-deriving its own traversal. That is not
+/// tidiness: five hand-written loops over "theta, then the free lower triangle,
+/// then sigma" is five chances to drift, and a drift here is silent. Two of
+/// them had already drifted before this enum existed — the parameter count
+/// missed a block Omega's off-diagonals, and the standard errors were read in a
+/// different order from the names they were written under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Coord {
+    Theta(usize),
+    /// Between-subject Omega, lower triangle, `i >= j`.
+    Omega(usize, usize),
+    Sigma(usize),
+    /// Inter-occasion Omega (kappa), lower triangle, `i >= j`.
+    OmegaIov(usize, usize),
+}
+
+/// The flat parameter vector's coordinates, in order.
+///
+/// Theta, then the free lower triangle of the between-subject Omega, then
+/// sigma, then the free lower triangle of the IOV Omega. The IOV block goes
+/// last so that a model without IOV produces exactly the columns it did before
+/// IOV was carried at all.
+fn coordinates(template: &ModelParameters) -> Vec<Coord> {
+    let mut out: Vec<Coord> = (0..template.theta.len()).map(Coord::Theta).collect();
+    for i in 0..template.omega.dim() {
+        for j in 0..=i {
+            if template.omega.free_mask[(i, j)] {
+                out.push(Coord::Omega(i, j));
+            }
+        }
+    }
+    out.extend((0..template.sigma.values.len()).map(Coord::Sigma));
+    if let Some(iov) = &template.omega_iov {
+        for i in 0..iov.dim() {
+            for j in 0..=i {
+                if iov.free_mask[(i, j)] {
+                    out.push(Coord::OmegaIov(i, j));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Whether this coordinate is held fixed, and so is not an estimated parameter.
+///
+/// The `*_fixed` flags are per-eta / per-kappa, not per-covariance-element, so a
+/// block off-diagonal counts as fixed exactly when either of its two etas is.
+fn is_fixed(template: &ModelParameters, coord: Coord) -> bool {
+    let flag = |flags: &[bool], i: usize| flags.get(i).copied().unwrap_or(false);
+    match coord {
+        Coord::Theta(i) => flag(&template.theta_fixed, i),
+        Coord::Omega(i, j) => flag(&template.omega_fixed, i) || flag(&template.omega_fixed, j),
+        Coord::Sigma(i) => flag(&template.sigma_fixed, i),
+        Coord::OmegaIov(i, j) => flag(&template.kappa_fixed, i) || flag(&template.kappa_fixed, j),
+    }
+}
+
+/// Names for the flat parameter vector.
 ///
 /// Omega entries are named by their etas — `OMEGA(CL,CL)` — rather than by
 /// PsN's positional `OMEGA(1,1)`. The file is ferx's own, and a positional index
 /// silently means something different the moment an eta is added.
 pub fn parameter_names(template: &ModelParameters) -> Vec<String> {
-    let mut names = template.theta_names.clone();
     let eta = &template.omega.eta_names;
-    for i in 0..template.omega.dim() {
-        for j in 0..=i {
-            if template.omega.free_mask[(i, j)] {
-                names.push(format!("OMEGA({},{})", eta[i], eta[j]));
-            }
-        }
-    }
-    names.extend(template.sigma.names.iter().cloned());
-    names
+    let kappa = template
+        .omega_iov
+        .as_ref()
+        .map(|iov| iov.eta_names.clone())
+        .unwrap_or_default();
+    coordinates(template)
+        .into_iter()
+        .map(|c| match c {
+            Coord::Theta(i) => template.theta_names[i].clone(),
+            Coord::Omega(i, j) => format!("OMEGA({},{})", eta[i], eta[j]),
+            Coord::Sigma(i) => template.sigma.names[i].clone(),
+            Coord::OmegaIov(i, j) => format!("OMEGA_IOV({},{})", kappa[i], kappa[j]),
+        })
+        .collect()
 }
 
 /// Flatten a fitted model into the vector [`parameter_names`] labels.
 ///
 /// `template` supplies the structure — which Omega entries are free parameters
-/// rather than structural zeros — because a [`FitResult`] carries the matrix but
-/// not the mask.
+/// rather than structural zeros — because a [`FitResult`] carries the matrices
+/// but not their masks.
 pub fn flatten_estimates(template: &ModelParameters, result: &FitResult) -> Vec<f64> {
-    let mut v = result.theta.clone();
-    for i in 0..template.omega.dim() {
-        for j in 0..=i {
-            if template.omega.free_mask[(i, j)] {
-                v.push(result.omega[(i, j)]);
-            }
-        }
-    }
-    v.extend(result.sigma.iter().copied());
-    v
+    coordinates(template)
+        .into_iter()
+        .map(|c| match c {
+            Coord::Theta(i) => result.theta[i],
+            Coord::Omega(i, j) => result.omega[(i, j)],
+            Coord::Sigma(i) => result.sigma[i],
+            // A fitted IOV Omega is always present when the model declares one;
+            // fall back to the template so a caller cannot get a wrong number
+            // in the unreachable case.
+            Coord::OmegaIov(i, j) => result
+                .omega_iov
+                .as_ref()
+                .map(|m| m[(i, j)])
+                .or_else(|| template.omega_iov.as_ref().map(|m| m.matrix[(i, j)]))
+                .unwrap_or(f64::NAN),
+        })
+        .collect()
+}
+
+/// The per-replicate standard errors, in the *same order as the names*.
+///
+/// Each one is looked up by its `(i, j)` coordinate rather than read off a
+/// parallel vector, because the packed layouts differ: `FitResult::se_omega` is
+/// the **column-major** lower triangle for a block Omega and carries structural
+/// zeros, whereas the flat vector here is row-major and omits them. Zipping the
+/// two would mislabel every block-Omega SE from the third element on, and shift
+/// the sigma SEs as well. [`ferx_core::omega_se_at`] owns that indexing.
+///
+/// `None` for the whole vector when the covariance step did not run — which is
+/// the default, and why the bootstrap standard error is the spread of the
+/// estimates rather than an average of these. `None` for an individual entry
+/// where core does not report an SE: `se_kappa` carries only the IOV diagonal
+/// variances, so an IOV covariance has no reported SE at all.
+fn flat_standard_errors(
+    template: &ModelParameters,
+    result: &FitResult,
+) -> Option<Vec<Option<f64>>> {
+    result.se_theta.as_ref()?;
+    let n_eta = template.omega.dim();
+    Some(
+        coordinates(template)
+            .into_iter()
+            .map(|c| match c {
+                Coord::Theta(i) => result.se_theta.as_ref().and_then(|v| v.get(i).copied()),
+                Coord::Omega(i, j) => ferx_core::omega_se_at(&result.se_omega, n_eta, i, j),
+                Coord::Sigma(i) => result.se_sigma.as_ref().and_then(|v| v.get(i).copied()),
+                // Core reports one SE per IOV *variance*; off-diagonal IOV
+                // covariances have none.
+                Coord::OmegaIov(i, j) if i == j => {
+                    result.se_kappa.as_ref().and_then(|v| v.get(i).copied())
+                }
+                Coord::OmegaIov(_, _) => None,
+            })
+            .collect(),
+    )
 }
 
 /// Inverse of [`flatten_estimates`]: rebuild [`ModelParameters`] from a flat
 /// vector, keeping every structural property of the template (bounds, fixed
-/// flags, block structure, IOV Omega, mixture).
+/// flags, block structure, IOV mask).
 ///
 /// This is what `--update-inits` and `--dofv` both need — and going through the
 /// flat vector rather than the `FitResult` means both work equally well from a
 /// stored `raw_results.csv`.
 pub fn params_from_estimates(template: &ModelParameters, flat: &[f64]) -> ModelParameters {
-    let n_theta = template.theta.len();
     let mut params = template.clone();
-    params.theta = flat[..n_theta].to_vec();
+    let mut omega = template.omega.matrix.clone();
+    let mut omega_iov = template.omega_iov.as_ref().map(|m| m.matrix.clone());
+    let mut sigma = template.sigma.values.clone();
 
-    let dim = template.omega.dim();
-    let mut m = template.omega.matrix.clone();
-    let mut k = n_theta;
-    for i in 0..dim {
-        for j in 0..=i {
-            if template.omega.free_mask[(i, j)] {
-                m[(i, j)] = flat[k];
-                m[(j, i)] = flat[k];
-                k += 1;
+    for (k, coord) in coordinates(template).into_iter().enumerate() {
+        let Some(&value) = flat.get(k) else { break };
+        match coord {
+            Coord::Theta(i) => params.theta[i] = value,
+            Coord::Omega(i, j) => {
+                omega[(i, j)] = value;
+                omega[(j, i)] = value;
+            }
+            Coord::Sigma(i) => sigma[i] = value,
+            Coord::OmegaIov(i, j) => {
+                if let Some(m) = omega_iov.as_mut() {
+                    m[(i, j)] = value;
+                    m[(j, i)] = value;
+                }
             }
         }
     }
+
     params.omega = OmegaMatrix::from_matrix_with_mask(
-        m,
+        omega,
         template.omega.eta_names.clone(),
         template.omega.diagonal,
         template.omega.free_mask.clone(),
     );
     params.sigma = SigmaVector {
-        values: flat[k..].to_vec(),
+        values: sigma,
         names: template.sigma.names.clone(),
+    };
+    params.omega_iov = match (omega_iov, &template.omega_iov) {
+        (Some(m), Some(t)) => Some(OmegaMatrix::from_matrix_with_mask(
+            m,
+            t.eta_names.clone(),
+            t.diagonal,
+            t.free_mask.clone(),
+        )),
+        _ => None,
     };
     params
 }
@@ -336,19 +510,6 @@ fn replicate_options(base: &FitOptions, keep_covariance: bool) -> FitOptions {
     o
 }
 
-/// The per-replicate standard errors, flattened in [`parameter_names`] order.
-///
-/// `None` when the covariance step did not run — which is the default, and why
-/// the bootstrap standard error is the spread of the estimates rather than an
-/// average of these.
-fn flat_standard_errors(result: &FitResult) -> Option<Vec<f64>> {
-    let theta = result.se_theta.as_ref()?;
-    let mut se = theta.clone();
-    se.extend(result.se_omega.clone().unwrap_or_default());
-    se.extend(result.se_sigma.clone().unwrap_or_default());
-    Some(se)
-}
-
 fn diagnostics_from(result: &FitResult) -> (bool, bool, bool) {
     let near_boundary = result
         .warnings_structured
@@ -375,6 +536,32 @@ fn diagnostics_from(result: &FitResult) -> (bool, bool, bool) {
 /// covariate would silently see different values than it did in the base fit.
 /// PsN documents the same hazard as a known bug — "model code that relies on ID
 /// numbers will lead to errors" — and leaves it to the user. Fail instead.
+/// Refuse a mixture model.
+///
+/// Two reasons, and the first is not a plumbing gap. A mixture model's classes
+/// are identified only up to relabelling, so replicate *k*'s "class 1" need not
+/// be the original fit's class 1; averaging estimates across replicates without
+/// resolving that label switching produces a bias-and-interval table that is
+/// meaningless rather than merely noisy. Second, `MixtureParams` carries
+/// per-class Omega/Sigma overrides in their own packed block, which the flat
+/// vector here does not represent — so `--update-inits` and `--dofv` would
+/// silently drop them.
+///
+/// Refusing is the honest answer until the relabelling question is settled.
+fn reject_mixture_model(params: &ModelParameters) -> Result<(), String> {
+    if params.mixture.is_some() {
+        return Err(
+            "the bootstrap does not support mixture models ([mixture] block). A mixture's \
+             classes are identified only up to relabelling, so a replicate's class 1 need \
+             not be the original fit's class 1, and averaging estimates across replicates \
+             would mix them. Bootstrapping a mixture needs a relabelling rule this tool \
+             does not have."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn reject_id_dependent_model(model: &CompiledModel) -> Result<(), String> {
     reject_id_dependent(&model.referenced_covariates)
 }
@@ -401,25 +588,9 @@ pub fn run_bootstrap(
     options: &BootstrapOptions,
 ) -> Result<BootstrapResult, String> {
     reject_id_dependent_model(&prepared.parsed.model)?;
-    if options.samples == 0 {
-        return Err("--samples must be at least 1".to_string());
-    }
-    if !(0.0..100.0).contains(&options.confidence_level) || options.confidence_level <= 0.0 {
-        return Err("--ci must be a confidence level in (0, 100)".to_string());
-    }
-    // Both covariance-step filters read a diagnostic that only exists when the
-    // step actually ran. Silently ignoring them would drop a filter the user
-    // asked for without saying so.
-    if !options.keep_covariance
-        && (options.skip_covariance_step_terminated || options.skip_with_covstep_warnings)
-    {
-        return Err(
-            "--skip-covariance-step-terminated / --skip-with-covstep-warnings filter on the \
-             covariance step, which is off for replicate fits by default. Add \
-             --keep-covariance (slower) or drop the filter."
-                .to_string(),
-        );
-    }
+    reject_mixture_model(&prepared.init_params)?;
+    options.validate()?;
+    options.validate_for_run()?;
 
     let template = &prepared.init_params;
     let names = parameter_names(template);
@@ -465,7 +636,7 @@ pub fn run_bootstrap(
         Some(ReplicateResult {
             index: 0,
             estimates: flatten_estimates(template, &result),
-            standard_errors: flat_standard_errors(&result),
+            standard_errors: flat_standard_errors(template, &result),
             ofv: result.ofv,
             converged: result.converged,
             estimate_near_boundary: near_boundary,
@@ -508,7 +679,7 @@ pub fn run_bootstrap(
                 ReplicateResult {
                     index: replicate.index,
                     estimates: flatten_estimates(template, &result),
-                    standard_errors: flat_standard_errors(&result),
+                    standard_errors: flat_standard_errors(template, &result),
                     ofv: result.ofv,
                     converged: result.converged,
                     estimate_near_boundary: near_boundary,
@@ -588,6 +759,7 @@ pub fn resummarize(
     directory: &std::path::Path,
     options: &BootstrapOptions,
 ) -> Result<BootstrapSummary, String> {
+    options.validate()?;
     let raw = directory.join("raw_results.csv");
     if !raw.exists() {
         return Err(format!(
@@ -667,10 +839,16 @@ fn compute_delta_ofv(
 /// Non-fixed parameters — the chi-square degrees of freedom for the Δofv
 /// reference distribution.
 fn count_estimated(template: &ModelParameters) -> usize {
-    let theta = template.theta_fixed.iter().filter(|f| !**f).count();
-    let omega = template.omega_fixed.iter().filter(|f| !**f).count();
-    let sigma = template.sigma_fixed.iter().filter(|f| !**f).count();
-    theta + omega + sigma
+    // Counted over the flat vector's own coordinates, not over the `*_fixed`
+    // flag vectors. Those are per-eta, so counting them misses a block Omega's
+    // off-diagonals entirely: a free 2x2 block is three estimated parameters and
+    // two flags. Getting this wrong writes a chi-square reference with too few
+    // degrees of freedom, which makes the Δofv distribution look better than it
+    // is — the one direction a diagnostic must never fail in.
+    coordinates(template)
+        .into_iter()
+        .filter(|c| !is_fixed(template, *c))
+        .count()
 }
 
 #[cfg(test)]

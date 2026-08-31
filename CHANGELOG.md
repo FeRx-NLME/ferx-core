@@ -49,8 +49,12 @@ section of the SDLC for the versioning policy).
   recompute results under different filters without refitting. Writes PsN-named CSV artefacts
   (`raw_results.csv`, `bootstrap_results.csv`, `included_individuals1.csv`, `sample_keys1.csv`, …).
   Unlike PsN, the drawn datasets depend only on the seed and the design — never on the thread
-  count, the completion order, or whether the base model was fitted first. A model that reads `ID`
-  as a covariate is refused rather than silently mis-fitted. See `docs/tools/bootstrap.qmd`.
+  count, the completion order, or whether the base model was fitted first. Bootstrapped parameters
+  are every estimated theta, Omega (free lower triangle), sigma, and IOV Omega, so a `kappa` model
+  gets bootstrap SEs and CIs for its inter-occasion variance and `--update-inits` / `--dofv` carry
+  it too. A model that reads `ID` as a covariate is refused rather than silently mis-fitted, and so
+  is a `[mixture]` model — its classes are identified only up to relabelling, so averaging across
+  replicates would mix them. See `docs/tools/bootstrap.qmd`.
 - **`prepare_run` / `prepare_run_with_inits` (#1140)** — public "load a model and its dataset, but
   do not fit" entry points returning a `PreparedRun`. `run_model_with_data` is now implemented on
   top of them, so a tool and the CLI cannot diverge in how a model is loaded.

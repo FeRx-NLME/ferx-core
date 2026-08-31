@@ -39,6 +39,20 @@ fn template(diagonal: bool) -> ModelParameters {
     }
 }
 
+/// [`template`] with a diagonal Omega plus a one-kappa IOV block.
+fn template_with_iov() -> ModelParameters {
+    let mut t = template(true);
+    let iov = DMatrix::from_element(1, 1, 0.01);
+    t.omega_iov = Some(OmegaMatrix::from_matrix_with_mask(
+        iov,
+        vec!["KAPPA_CL".to_string()],
+        true,
+        DMatrix::from_element(1, 1, true),
+    ));
+    t.kappa_fixed = vec![false];
+    t
+}
+
 #[test]
 fn parameter_names_cover_theta_free_omega_and_sigma() {
     let names = parameter_names(&template(false));
@@ -129,6 +143,133 @@ fn estimated_parameter_count_skips_fixed_entries() {
     t.theta_fixed[1] = true;
     t.sigma_fixed[0] = true;
     assert_eq!(count_estimated(&t), 1 + 2);
+}
+
+#[test]
+fn the_estimated_count_matches_the_parameter_vector_for_a_block_omega() {
+    // Regression for the second review finding: `count_estimated` used to count
+    // the `omega_fixed` flags, which are per *eta*, so a free 2x2 block scored 2
+    // where the parameter vector has 3. That understates the chi-square degrees
+    // of freedom for `--dofv`, which makes the Δofv distribution look better
+    // than it is — the one direction a diagnostic must not fail in.
+    let t = template(false);
+    assert_eq!(parameter_names(&t).len(), 6, "2 theta + 3 omega + 1 sigma");
+    assert_eq!(
+        count_estimated(&t),
+        parameter_names(&t).len(),
+        "with nothing fixed, every coordinate is an estimated parameter"
+    );
+
+    // Fixing an eta removes its variance *and* its covariances, since the flags
+    // are per-eta and a covariance needs both of its etas free.
+    let mut fixed = t.clone();
+    fixed.omega_fixed[1] = true;
+    assert_eq!(count_estimated(&fixed), 6 - 2);
+}
+
+#[test]
+fn an_iov_block_is_part_of_the_parameter_vector() {
+    let t = template_with_iov();
+    let names = parameter_names(&t);
+    assert_eq!(
+        names,
+        vec![
+            "CL",
+            "V",
+            "OMEGA(ETA_CL,ETA_CL)",
+            "OMEGA(ETA_V,ETA_V)",
+            "PROP",
+            "OMEGA_IOV(KAPPA_CL,KAPPA_CL)",
+        ],
+        "the IOV block goes last, so a model without one keeps its old columns"
+    );
+    assert_eq!(count_estimated(&t), names.len());
+
+    // A fixed kappa drops out of the count but keeps its column.
+    let mut fixed = t.clone();
+    fixed.kappa_fixed[0] = true;
+    assert_eq!(parameter_names(&fixed).len(), names.len());
+    assert_eq!(count_estimated(&fixed), names.len() - 1);
+}
+
+#[test]
+fn the_iov_variance_round_trips() {
+    let t = template_with_iov();
+    let flat = vec![3.0, 4.0, 0.25, 0.36, 0.01, 0.07];
+    let params = params_from_estimates(&t, &flat);
+    let iov = params.omega_iov.as_ref().expect("the IOV block survives");
+    assert_eq!(iov.matrix[(0, 0)], 0.07);
+    assert_eq!(iov.eta_names, vec!["KAPPA_CL"]);
+    // And the rest is untouched by the extra coordinate.
+    assert_eq!(params.theta, vec![3.0, 4.0]);
+    assert_eq!(params.sigma.values, vec![0.01]);
+}
+
+#[test]
+fn every_view_of_the_flat_vector_has_the_same_length() {
+    // The invariant the `Coord` enum exists to hold: names, the estimated count
+    // and the rebuild all walk one traversal, so they cannot disagree about how
+    // many parameters there are or what order they are in.
+    for t in [template(true), template(false), template_with_iov()] {
+        let names = parameter_names(&t);
+        assert_eq!(count_estimated(&t), names.len());
+
+        // Scaled from the template's own values rather than made up: an
+        // arbitrary vector can describe a non-positive-definite Omega, which
+        // `OmegaMatrix::from_matrix_with_mask` repairs — correctly — by moving
+        // the diagonal, and the round trip would then not be an identity for a
+        // reason that has nothing to do with the traversal being tested.
+        // Scaling a PD matrix by a positive constant keeps it PD.
+        let flat: Vec<f64> = coordinates(&t)
+            .into_iter()
+            .map(|c| {
+                1.5 * match c {
+                    Coord::Theta(i) => t.theta[i],
+                    Coord::Omega(i, j) => t.omega.matrix[(i, j)],
+                    Coord::Sigma(i) => t.sigma.values[i],
+                    Coord::OmegaIov(i, j) => t.omega_iov.as_ref().unwrap().matrix[(i, j)],
+                }
+            })
+            .collect();
+        let rebuilt = params_from_estimates(&t, &flat);
+        assert_eq!(parameter_names(&rebuilt), names);
+        // Re-flattening the rebuild returns the vector it was built from.
+        let coords = coordinates(&rebuilt);
+        assert_eq!(coords.len(), names.len());
+        let back: Vec<f64> = coords
+            .into_iter()
+            .map(|c| match c {
+                Coord::Theta(i) => rebuilt.theta[i],
+                Coord::Omega(i, j) => rebuilt.omega.matrix[(i, j)],
+                Coord::Sigma(i) => rebuilt.sigma.values[i],
+                Coord::OmegaIov(i, j) => rebuilt.omega_iov.as_ref().unwrap().matrix[(i, j)],
+            })
+            .collect();
+        assert_eq!(back, flat);
+    }
+}
+
+// ── mixture models ──────────────────────────────────────────────────────────
+
+#[test]
+fn a_mixture_model_is_refused() {
+    // Not a plumbing gap: a mixture's classes are identified only up to
+    // relabelling, so averaging estimates across replicates would mix them.
+    let plain = template(true);
+    assert!(reject_mixture_model(&plain).is_ok());
+
+    let mut mixture = template(true);
+    mixture.mixture = Some(ferx_core::MixtureParams {
+        omega: vec![plain.omega.clone(), plain.omega.clone()],
+        sigma: vec![plain.sigma.clone(), plain.sigma.clone()],
+        omega_override_addr: Vec::new(),
+        omega_override_fixed: Vec::new(),
+        sigma_override_addr: Vec::new(),
+        sigma_override_fixed: Vec::new(),
+    });
+    let err = reject_mixture_model(&mixture).unwrap_err();
+    assert!(err.contains("relabelling"), "{err}");
+    assert!(err.contains("mixture"), "{err}");
 }
 
 // ── the ID guard ────────────────────────────────────────────────────────────
@@ -337,4 +478,59 @@ fn resummarize_needs_an_existing_run_directory() {
     let dir = tempfile::tempdir().expect("temp dir");
     let err = resummarize(dir.path(), &BootstrapOptions::default()).unwrap_err();
     assert!(err.contains("raw_results.csv"), "{err}");
+}
+
+#[test]
+fn resummarize_validates_its_options_instead_of_panicking() {
+    // Regression for the fourth review finding. `run_bootstrap` checked the
+    // confidence level; `resummarize` went straight to `summarize`, so
+    // `--summarize --ci 100` reached `normal_quantile`'s assertion and the
+    // process died with 101 instead of reporting a bad argument.
+    let dir = tempfile::tempdir().expect("temp dir");
+    stored_run(dir.path());
+
+    for level in [100.0, 0.0, -1.0, 137.0] {
+        let err = resummarize(
+            dir.path(),
+            &BootstrapOptions {
+                confidence_level: level,
+                ..BootstrapOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("--ci"), "level {level}: {err}");
+    }
+
+    // Checked before the directory is read, so a bad option is reported even
+    // when there is nothing to summarize.
+    let empty = tempfile::tempdir().expect("temp dir");
+    let err = resummarize(
+        empty.path(),
+        &BootstrapOptions {
+            confidence_level: 100.0,
+            ..BootstrapOptions::default()
+        },
+    )
+    .unwrap_err();
+    assert!(err.contains("--ci"), "{err}");
+}
+
+#[test]
+fn the_covstep_filters_are_allowed_when_re_summarizing() {
+    // The rule that a covstep filter needs `--keep-covariance` applies to a
+    // fresh run, where the step would have to actually run. Under `--summarize`
+    // the diagnostics are already in `raw_results.csv`, so filtering on them is
+    // the entire point and requires no covariance step now.
+    let dir = tempfile::tempdir().expect("temp dir");
+    stored_run(dir.path());
+    let options = BootstrapOptions {
+        skip_covariance_step_terminated: true,
+        ..BootstrapOptions::default()
+    };
+    assert!(options.validate().is_ok());
+    assert!(
+        options.validate_for_run().is_err(),
+        "a fresh run must refuse it"
+    );
+    assert!(resummarize(dir.path(), &options).is_ok());
 }

@@ -110,7 +110,8 @@ pub fn write_raw_results(
                 row.push(opt(r
                     .standard_errors
                     .as_ref()
-                    .and_then(|s| s.get(j).copied())));
+                    .and_then(|s| s.get(j).copied())
+                    .flatten()));
             }
         }
         if options.dofv {
@@ -379,8 +380,16 @@ pub fn read_raw_results(
         let result = super::ReplicateResult {
             index,
             estimates,
-            standard_errors: se_start
-                .map(|start| (0..n_params).map(|j| num(&row, start + j)).collect()),
+            standard_errors: se_start.map(|start| {
+                // An empty cell means core reported no SE for that coordinate
+                // (an IOV covariance, say). It is not a zero and not a NaN, and
+                // it must come back as `None` so the column stays aligned with
+                // the names it was written under.
+                (0..n_params)
+                    .map(|j| num(&row, start + j))
+                    .map(|v| v.is_finite().then_some(v))
+                    .collect()
+            }),
             ofv: num(&row, 5),
             converged: flag(&row, 1),
             estimate_near_boundary: flag(&row, 2),

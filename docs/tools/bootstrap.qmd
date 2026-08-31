@@ -68,6 +68,34 @@ identifiers. ferx keeps the original ID and appends `#2`, `#3`, … so a diagnos
 still be traced back. (PsN does the same thing by renumbering IDs while writing the
 replicate data file.)
 
+## Which parameters are bootstrapped
+
+Every estimated population parameter: each theta, the free lower triangle of the
+between-subject Omega, each sigma, and — when the model declares `kappa` — the free
+lower triangle of the inter-occasion Omega, reported as `OMEGA_IOV(KAPPA_CL,KAPPA_CL)`
+and so on. Structural zeros (an off-diagonal between two etas that are not in the same
+`block_omega`) are not parameters and are not reported.
+
+The same vector is what `--update-inits` hands to the replicates and what `--dofv`
+evaluates, so a model's IOV variance is started from the base fit's estimate and
+evaluated at the replicate's, exactly like every other parameter.
+
+With `--keep-covariance`, each parameter also gets a per-replicate `se_` column. A cell
+there is **empty when core reports no standard error for that coordinate** — an IOV
+*covariance*, for instance, since only the IOV variances have one. Empty means "not
+reported", never zero.
+
+::: {.callout-warning}
+## Mixture models are not supported
+
+A `[mixture]` model's classes are identified only up to relabelling: replicate *k*'s
+"class 1" need not be the original fit's class 1, so averaging estimates across
+replicates would mix two different things and produce an interval that is meaningless
+rather than merely noisy. Bootstrapping a mixture needs a relabelling rule, and this
+tool does not have one, so it refuses the run rather than reporting a plausible-looking
+table.
+:::
+
 ::: {.callout-warning}
 ## A model that reads `ID` as a covariate cannot be bootstrapped
 
@@ -189,7 +217,8 @@ estimation (`outer_maxiter = 0`, exactly NONMEM's `MAXEVAL=0`) and reports
 Every value is necessarily positive: the original fit's parameters minimise the objective
 on the original data, so any other vector scores worse. The useful comparison is against a
 χ² distribution with degrees of freedom equal to the number of estimated parameters
-(written to `bootstrap_diagnostics.csv` as `chi_square_df`). In theory the bootstrap Δofv
+(written to `bootstrap_diagnostics.csv` as `chi_square_df`, counted over the free
+parameter coordinates — so a free 2x2 `block_omega` contributes three, not two). In theory the bootstrap Δofv
 distribution should sit **at or below** that reference; if it does not, the bootstrap is
 not describing the uncertainty well and another method — [SIR](../estimation/sir.qmd) —
 is the better choice.
@@ -201,7 +230,7 @@ scripts and habits transfer.
 
 | file | contents |
 |---|---|
-| `raw_results.csv`            | one row per fit, **first row the original dataset**; estimates, OFV and termination diagnostics |
+| `raw_results.csv`            | one row per fit, **first row the original dataset**; estimates, OFV and termination diagnostics (plus `se_` columns under `--keep-covariance`) |
 | `bootstrap_results.csv`      | one row per parameter: original, mean, bias, standard error, median, percentile CI, normal CI |
 | `bootstrap_diagnostics.csv`  | run counts, exclusion tallies, and the mean of each per-replicate diagnostic |
 | `included_individuals1.csv`  | per replicate, the subject IDs drawn (repeats included), in dataset order |
