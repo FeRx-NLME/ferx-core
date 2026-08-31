@@ -65,11 +65,22 @@ section of the SDLC for the versioning policy).
   Any subject routed to the event-driven walker while its PK parameters are constant — an
   `EVID=3/4` reset, or (since the change above) an `[odes]` right-hand side that reads model
   time — had its per-event parameter snapshots built with the `EVID=2` rows omitted, and the
-  walker asserts one snapshot per record. The run aborted with an assertion failure rather
-  than a diagnostic, in release builds as well as debug. Reaching it needed only a dataset
+  walker asserts one snapshot per record. The run failed on an assertion rather than
+  returning a diagnostic, in release builds as well as debug (the assertion is
+  `assert_eq!`, not `debug_assert_eq!`; it unwinds, so from R it surfaces as an opaque
+  error rather than a message naming the subject). Reaching it needed only a dataset
   carrying `EVID=2` rows alongside a varying column the model does not reference, because the
   irrelevant-covariate pruning clears those rows' covariate snapshots while keeping their
   times. Both the ODE and the analytical event-driven engines were affected.
+- **A pre-arrival observation on a model-time-reading `[odes]` RHS no longer puts `NaN`
+  into the FOCEI objective (#1124 review).** A subject observed before its first dose — a
+  baseline sample — took the static superposition walk for its analytic sensitivities, and
+  that walk resolves `TAD`'s anchor by a fold over doses at or before the segment start,
+  leaving it at `-inf` and evaluating the right-hand side with `TAD = NaN`. The provider
+  still reported success, so the `NaN` gradient reached the optimiser instead of falling
+  back to finite differences. Such subjects now take the event-driven walk, which seeds the
+  anchor at the first arrival. Affected fits change their reported `gradient_method` and
+  objective.
 - **Steady-state (`SS=1`) dosing on a model-time-reading `[odes]` RHS now takes finite
   differences on both loops (#1124).** The three gates that decline the analytic jet for this
   combination asked a predicate that could not see the bare `TIME` spelling, so a

@@ -653,11 +653,18 @@ pub fn validate_per_cmt_scaling(model: &CompiledModel, subjects: &[Subject]) -> 
 
 /// Per-event PK parameter snapshots for one subject.
 ///
-/// When the subject has no time-varying covariates, all entries in `dose`
-/// and `obs` are equal (the single subject-static evaluation). The fast
-/// superposition path detects this case via `subject.has_tv_covariates()`
-/// and evaluates `pk_param_fn` only once instead of materialising the
-/// vectors — see [`compute_event_pk_params`] for details.
+/// When the subject has no time-varying covariates, all entries in `dose`,
+/// `obs` **and `pk_only`** are equal (the single subject-static evaluation).
+/// The fast superposition path detects this case via
+/// `subject.has_tv_covariates()` and evaluates `pk_param_fn` only once
+/// instead of materialising the vectors — see [`compute_event_pk_params`]
+/// for details.
+///
+/// All three are filled on **both** arms. The static arm used to leave
+/// `pk_only` empty, which aborted the fit at the walkers' unconditional
+/// `assert_eq!(pk_at_pk_only.len(), subject.pk_only_times.len())` for any
+/// subject whose `pk_only_times` survived covariate pruning (#1124 review).
+/// Read the field docs below as invariants, not as descriptions.
 ///
 /// # Reusing across calls
 ///
@@ -674,8 +681,9 @@ pub struct EventPkParams {
     /// PK params at each observation event time, parallel to `subject.obs_times`.
     pub obs: Vec<PkParams>,
     /// PK params at each EVID=2 event time, parallel to
-    /// `subject.pk_only_times`. Empty when the subject has no
-    /// pk-only events (typical for non-TV-cov data).
+    /// `subject.pk_only_times`. Empty **only** when the subject has no
+    /// pk-only events (typical for non-TV-cov data) — never short, and
+    /// never empty merely because the subject is parameter-static.
     pub pk_only: Vec<PkParams>,
 }
 

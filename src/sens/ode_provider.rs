@@ -487,6 +487,30 @@ pub(crate) fn ode_subject_supported(model: &CompiledModel, subject: &Subject) ->
     // is per-event dynamic for the same reason a TV covariate is, so the static walk
     // cannot serve it — decline here (it routes to the event-driven TV walk via
     // `ode_tvcov_supported`, or to FD if that also declines) (#486).
+    //
+    // The model-time clause here stays **narrow**, deliberately, and does *not* mirror
+    // `ode_tvcov_supported`'s wide one. Recorded at length because widening it looks
+    // obviously right and is wrong.
+    //
+    // The static superposition walk serves a `TAD`-reading RHS *exactly* whenever every
+    // observation follows a dose: `integrate_g`'s anchor is a per-segment fold over
+    // unlagged `d.time`, which is the same quantity production folds.
+    // `ode_tad_rhs_without_lagtime_static_walk_stays_analytic` asserts precisely that, and
+    // widening this clause turns it red — such models would lose an exact analytic route
+    // and fall to FD for nothing.
+    //
+    // The pre-arrival window is the case that genuinely breaks the static walk (no dose at
+    // or before the segment start leaves the fold at `-inf`, so the RHS sees `TAD = NaN`).
+    // That is a *subject*-level property, not a model-level one, and it is already closed
+    // upstream: `ode_tvcov_supported` now admits every model-time model, so the dispatcher
+    // routes them to the event-driven walk and never consults this gate for them.
+    //
+    // A narrower clause keyed on the pre-arrival window was considered and is not needed
+    // for the same reason: the only way to reach here with a model-time model is for
+    // `ode_tvcov_supported` to decline for some *other* cause, and every such cause
+    // (notably `n_theta + n_eta > MAX_ODE_AXES`) is independently declined by
+    // `ode_analytical_supported` above — verified by building a padded 30 θ + 2 η fixture
+    // that could not reach this clause.
     if !ode_analytical_supported(model)
         || subject.has_tv_covariates()
         || crate::parser::model_parser::compiled_model_uses_time_builtin(model)
@@ -690,9 +714,17 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     // The cost is that a `TAD`-reading model with no other trigger moves from the static
     // jet to the event-driven one — the more general walk, and the one the value path
     // already uses. For a subject whose observations all follow the first dose that is pure
-    // engine consistency: measured on such a fixture, the static walk's jet is FD-parity
-    // clean too (`tad_reading_model_without_a_lagtime_takes_a_route_that_matches_fd` passes
-    // under either predicate).
+    // engine consistency rather than a correctness fix: the static walk's `last_dose_eff`
+    // fold is well-defined once a dose has landed, so its jet is FD-parity clean there too.
+    //
+    // That statement is about the *fold*, not about any test: no committed test measures
+    // the static walk on this fixture, because
+    // `tad_reading_model_without_a_lagtime_takes_a_route_that_matches_fd` asserts
+    // `ode_tvcov_supported` as a precondition and so panics under the narrow predicate
+    // rather than exercising the static walk. Establishing it would take a test that
+    // calls `integrate_g` directly. Recorded this way because an earlier revision of this
+    // comment claimed that test "passes under either predicate" — it cannot, and that was
+    // the same assert-without-measuring the rest of this comment exists to correct.
     let uses_time = crate::pk::model_uses_time_anywhere(model);
     // A per-route absorption lag (`fn(..., lag=L)`, #859) makes each route's onset a moving
     // boundary (`t_dose + lag_cmt + lag_route`) with its own rate-on saltation — the same

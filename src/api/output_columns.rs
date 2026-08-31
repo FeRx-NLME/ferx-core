@@ -599,25 +599,40 @@ pub(crate) fn compute_extra_output_columns(
                                 // consistent with per-obs compartment_states being empty
                                 // for IOV subjects. W_DERIVED_CMT_IOV_UNSUPPORTED explains why.
                                 vec![]
-                            } else if crate::pk::model_uses_time_anywhere(model) {
-                                // Model time anywhere: a single fixed PK snapshot
-                                // (grid_cov at one time) cannot represent parameters that
-                                // vary along the grid, while ipred honours each event's
-                                // time via the event-driven path. Return empty so every
-                                // grid point evaluates to NaN — the same convention as
-                                // IOV/TV/reset above, and consistent with
-                                // compute_predictions_with_states (#610).
+                            } else if crate::parser::model_parser::compiled_model_uses_time_builtin(
+                                model,
+                            ) {
+                                // TIME built-in in the individual parameters: a single
+                                // fixed PK snapshot (grid_cov at one time) cannot
+                                // represent parameters that vary along the grid, while
+                                // ipred honours each event's time via the event-driven
+                                // path. Return empty so every grid point evaluates to
+                                // NaN — the same convention as IOV/TV/reset above.
                                 //
-                                // The **wide** predicate, matching the function this
-                                // names as its mirror. Asking the narrow
-                                // `compiled_model_uses_time_builtin` covers only the
-                                // individual-parameter program, so after #1124 rerouted
-                                // `compute_predictions_with_states`, an `[odes]` RHS
-                                // reading `TAD`/`TAFD`/`T`/`TIME` fell through to the
-                                // dense arm below and reported a `[derived]` integral
-                                // computed on a different engine than its own IPRED —
-                                // silently, instead of taking the NaN convention this
-                                // arm exists to apply.
+                                // **Deliberately the narrow predicate.** The condition
+                                // this arm needs is "the PK *snapshot* is not valid
+                                // across the grid", which is a property of
+                                // `pk_param_fn` — exactly what the narrow predicate
+                                // asks. An `[odes]` RHS that reads `TAD`/`TAFD`/`T`/
+                                // `TIME` does *not* make `pk_param_fn` time-dependent:
+                                // the clock it reads is the solver's, and the dense
+                                // driver sets its own per-segment `TAD` anchor
+                                // (`integrate_segment`, with #1073's finite
+                                // first-arrival fallback). For such a model the `t=0`
+                                // snapshot is exact and the dense arm below returns a
+                                // correct number, so widening to
+                                // `pk::model_uses_time_anywhere` here would replace it
+                                // with an all-NaN column.
+                                //
+                                // Nor is `compute_predictions_with_states` a precedent
+                                // for widening: its ODE branch has two arms and *both*
+                                // return populated states — `uses_time` routes to
+                                // `ode_predictions_event_driven_with_states`, which
+                                // still computes states via `ode_dense_solve_states`.
+                                // The `vec![]` convention lives only in its analytical
+                                // branch. Widening here would make a `[derived]`
+                                // integral NaN while the adjacent per-obs
+                                // `compartments[i]` column stayed finite.
                                 vec![]
                             } else if let Some(ref ode) = model.ode_spec {
                                 // Time-independent params: one snapshot (t=0) is exact

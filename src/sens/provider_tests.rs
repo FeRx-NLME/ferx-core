@@ -11287,12 +11287,25 @@ fn tad_reading_mr_shaped_model_takes_a_route_that_matches_fd() {
 /// Note what this test is *not* pinning. The widening was first justified by the
 /// reset case — `subject.has_resets()` being absent from the trigger list while
 /// present in the value path's condition. That turned out not to be measurable:
-/// a reset + `TAD` subject on the static walk passes `check_full_provider_vs_fd`,
-/// so the static walk re-anchors `TAD` across a reset correctly. The pre-arrival
-/// window is the case that genuinely breaks, and it is the one asserted here.
+/// a reset + `TAD` subject on the static walk passes `check_full_provider_vs_fd`.
+/// The reason is *not* that the static walk re-anchors `TAD` across a reset —
+/// neither walk does. Both fold over dose times only (`ode_provider.rs`'s
+/// `filter(|dt| dt <= t_start)` and `predictions.rs`'s fold over `d.time + lag`),
+/// and neither consults `reset_floor`, which is tracked but unused for this. They
+/// agree because both ignore the reset, so the parity check cannot see it. The
+/// pre-arrival window is the case that genuinely breaks, and it is the one
+/// asserted here.
 #[test]
 fn a_pre_arrival_observation_does_not_nan_the_analytic_sensitivities() {
     let src = MR_MIXED_1CPT_TAD.replace("first_order(ka=KA, lag=LAG)", "first_order(ka=KA)");
+    // Same guard as the sibling below: a respelled fixture would make this
+    // `.replace` a no-op, the route lag would become the trigger in
+    // `ode_tvcov_supported`, and the test would pass via a trigger that predates
+    // the widening while pinning nothing about the pre-arrival window.
+    assert!(
+        !src.contains("lag=LAG"),
+        "the derivation must actually have removed the route lag"
+    );
     let model = parse_model_string(&src).expect("parse");
     // Doses at 1.0 and 6.0 with the first observation at 0.4 — inside the
     // pre-arrival window, where no dose qualifies as the `TAD` anchor.
@@ -11333,14 +11346,19 @@ fn a_pre_arrival_observation_does_not_nan_the_analytic_sensitivities() {
 /// The same parity check for a `TAD`-reading model with **no lagtime** — the
 /// class the `ode_tvcov_supported` widening actually moves.
 ///
-/// The test above does not cover it: its fixture carries
-/// `first_order(ka=KA, lag=LAG)`, and a per-route absorption lag is its own entry
-/// in `ode_tvcov_supported`'s trigger list, so that subject took the event-driven
-/// dual walk before the widening as well. Strip the lag and the only remaining
-/// trigger is the model-time clause itself, which is what changed — such a
-/// subject used to fall through to the *static* superposition walk
-/// (`integrate_g`) for its jet while production integrated the value
+/// `tad_reading_mr_shaped_model_takes_a_route_that_matches_fd` does not cover it:
+/// that fixture carries `first_order(ka=KA, lag=LAG)`, and a per-route absorption
+/// lag is its own entry in `ode_tvcov_supported`'s trigger list, so that subject
+/// took the event-driven dual walk before the widening as well. Strip the lag and
+/// the only remaining trigger is the model-time clause itself, which is what
+/// changed — such a subject used to fall through to the *static* superposition
+/// walk (`integrate_g`) for its jet while production integrated the value
 /// event-driven.
+///
+/// (Not the test immediately above: that one strips the same lag in its own first
+/// statement. It differs from this one only in dose schedule — it observes inside
+/// the pre-arrival window, this one entirely after the first dose — so the two are
+/// complementary, not duplicates, and neither is redundant with the other.)
 ///
 /// CLAUDE.md requires a `Dual2`-vs-FD parity test for any change to an analytic
 /// sensitivity route, and this is the route that changed. The preconditions
@@ -11377,6 +11395,25 @@ fn tad_reading_model_without_a_lagtime_takes_a_route_that_matches_fd() {
         !subject.has_tv_covariates() && !subject.has_resets() && !subject.has_periodic_ss_dose(),
         "fixture subject must carry no trigger of its own"
     );
+    // Enumerating the trigger list by hand is how a precondition set drifts: this
+    // block once claimed to rule out "every other trigger" while asserting five of
+    // seven (`has_modeled_dose` and `has_rate_defined_under_f` were missing). Ask
+    // the gate itself instead — build the twin with the model-time clause removed
+    // and require it to decline. That is one assertion, and it cannot go stale when
+    // a trigger is added.
+    {
+        let autonomous = parse_model_string(&src.replace("*(1.0 + 0.3*TAD)", "")).expect("parse");
+        assert!(
+            !crate::pk::model_uses_time_anywhere(&autonomous),
+            "the twin must actually be autonomous, or it proves nothing"
+        );
+        assert!(
+            !crate::sens::ode_provider::ode_tvcov_supported(&autonomous, &subject),
+            "with model time removed the subject must fall out of the event-driven \
+             walk — otherwise some *other* trigger is carrying this fixture and the \
+             assertions below are not about the model-time clause"
+        );
+    }
     assert!(
         crate::pk::model_uses_time_anywhere(&model),
         "…and it must read model time, which is the clause under test"
