@@ -1,7 +1,7 @@
 //! Option B (explicit symbolic derivatives) for the 1-cpt analytical solutions.
 //!
 //! Where [`super::one_cpt`] obtains `f`, `∂f/∂pk`, `∂²f/∂pk²` by evaluating the
-//! closed form over [`Dual2`](super::dual2::Dual2) (generic forward 2nd-order,
+//! closed form over [`Dual2`] (generic forward 2nd-order,
 //! `O(N²)` per op), this module writes the derivatives out by hand in scalar
 //! `f64`. It computes only the entries that exist — no width padding, no dual
 //! bookkeeping — so it is the speed ceiling for the per-observation sensitivity

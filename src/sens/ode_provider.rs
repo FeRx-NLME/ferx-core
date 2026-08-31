@@ -6,7 +6,7 @@
 //! `N` individual parameters: the compiled RHS program
 //! ([`OdeRhsProgram`](crate::parser::model_parser::OdeRhsProgram)) is evaluated
 //! over the dual numbers by the generic bytecode VM, and the generic RK45
-//! ([`solve_ode_g`](crate::ode::solver::solve_ode_g)) propagates `∂u/∂p` and
+//! ([`solve_ode_g`]) propagates `∂u/∂p` and
 //! `∂²u/∂p²` through the integration with **value-based step control**. The
 //! readout then yields `∂f/∂p, ∂²f/∂p²` per observation, which feed the η/θ chain
 //! via the **general** individual-parameter derivatives `∂p/∂η, ∂p/∂θ` (FD of
@@ -1139,7 +1139,7 @@ pub fn ode_subject_sensitivities(
 }
 
 /// Largest IIV-bearing-parameter count (`na`) for which the mixed-order dual
-/// ([`DualMixed`](crate::sens::dual_mixed::DualMixed)) is monomorphised. Subjects
+/// ([`DualMixed`]) is monomorphised. Subjects
 /// whose model has more than this many IIV-bearing individual parameters fall back
 /// to the full `Dual2` path — correct, just not accelerated. Bounds the `(na, n)`
 /// monomorphisation count; raise it only if models with many IIV parameters become

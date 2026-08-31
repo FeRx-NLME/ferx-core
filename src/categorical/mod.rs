@@ -272,7 +272,7 @@ pub(crate) fn discrete_subject_nll(
 }
 
 /// Draw a simulated outcome for every binary record of every `Binary` endpoint, pushing
-/// one [`SimOutcome::Category`] row per record (Slice 1b, §8.8.2).
+/// one `SimOutcome::Category` row per record (Slice 1b, §8.8.2).
 ///
 /// Binary is the *easy* row of the per-endpoint simulation table: it fits the **fixed
 /// observation grid**, so — unlike TTE/RTTE/CTMM — there is no horizon, no event

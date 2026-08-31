@@ -38,7 +38,7 @@ use std::time::Instant;
 /// Simulate observations from a model with given parameters (random seed).
 ///
 /// Data-reader warnings (e.g. missing II for ADDL doses) are not echoed here;
-/// callers that obtained `population` via [`read_nonmem_csv`] should inspect
+/// callers that obtained `population` via `read_nonmem_csv` should inspect
 /// `population.warnings` before calling this function.
 pub fn simulate(
     model: &CompiledModel,

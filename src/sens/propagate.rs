@@ -191,7 +191,7 @@ pub fn propagate_two_cpt_core_g<T: PkNum>(
 }
 
 /// 2-cpt IV/central propagator computing its eigendata inline. Generic mirror of
-/// [`crate::pk::event_driven::propagate_two_cpt`]; the cached walk path computes
+/// `crate::pk::event_driven::propagate_two_cpt`; the cached walk path computes
 /// eigendata once via [`two_cpt_eigen_g`] and calls [`propagate_two_cpt_core_g`].
 #[allow(clippy::too_many_arguments)]
 pub fn propagate_two_cpt_g<T: PkNum>(
@@ -214,7 +214,7 @@ pub fn propagate_two_cpt_g<T: PkNum>(
 /// cmt 2); `rate_depot` is a constant zero-order input into the depot (RATE>0 into
 /// cmt 1, #400). Both are added by linear superposition and are `0` for bolus
 /// dosing. Generic mirror of
-/// [`crate::pk::event_driven::propagate_two_cpt_oral`].
+/// `crate::pk::event_driven::propagate_two_cpt_oral`.
 /// 2-cpt oral propagation from **precomputed** eigendata — the single source of the
 /// 2-cpt oral eigenmode + forced-response formula. `ka` is absorption; `rate_central`
 /// / `rate_depot` are the #350/#400 infusion inputs.
@@ -486,7 +486,7 @@ pub fn propagate_three_cpt_core_g<T: PkNum>(
 }
 
 /// 3-cpt IV propagator computing its eigendata inline (the dual-walk wrapper).
-/// Generic mirror of [`crate::pk::event_driven::propagate_three_cpt`].
+/// Generic mirror of `crate::pk::event_driven::propagate_three_cpt`.
 #[allow(clippy::too_many_arguments)]
 pub fn propagate_three_cpt_g<T: PkNum>(
     state: &mut [T],
@@ -511,7 +511,7 @@ pub fn propagate_three_cpt_g<T: PkNum>(
 /// cmt 2); `rate_depot` is a constant zero-order input into the depot (RATE>0 into
 /// cmt 1, #400). Both are added by linear superposition and are `0` for bolus
 /// dosing. Generic mirror of
-/// [`crate::pk::event_driven::propagate_three_cpt_oral`].
+/// `crate::pk::event_driven::propagate_three_cpt_oral`.
 /// 3-cpt oral propagation from **precomputed** eigendata — the single source of the
 /// 3-cpt oral eigenmode + depot forced-response formula.
 pub fn propagate_three_cpt_oral_core_g<T: PkNum>(

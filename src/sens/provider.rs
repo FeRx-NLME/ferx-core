@@ -7,14 +7,14 @@
 //!   * `∂f/∂η`, `∂²f/∂η²`,
 //!   * `∂f/∂θ`, `∂²f/∂η∂θ`
 //!
-//! built by seeding the PK parameters as [`Dual2`](super::dual2::Dual2) variables
+//! built by seeding the PK parameters as [`Dual2`] variables
 //! through the closed-form PK solution (exact `∂f/∂pk`, `∂²f/∂pk²`) and then
 //! applying the **closed-form η/θ chain rule**: the model exposes the relation
 //! `pk_i = tv_i·exp(Σ_k sel[i,k]·η_k)`, so
 //!
 //!   * `∂pk_i/∂η_k        = pk_i · sel[i,k]`,
 //!   * `∂²pk_i/∂η_k∂η_l   = pk_i · sel[i,k] · sel[i,l]`,
-//!   * `∂pk_i/∂θ_m        = pk_i · ρ[i,m]`,        ρ[i,m] = (∂tv_i/∂θ_m)/tv_i,
+//!   * `∂pk_i/∂θ_m        = pk_i · ρ[i,m]`,        `ρ[i,m] = (∂tv_i/∂θ_m)/tv_i`,
 //!   * `∂²pk_i/∂η_k∂θ_m   = pk_i · sel[i,k] · ρ[i,m]`,
 //!
 //! with `∂tv_i/∂θ_m` from a finite difference of the runtime `tv_fn` closure

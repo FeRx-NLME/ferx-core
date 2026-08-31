@@ -19324,7 +19324,7 @@ pub(crate) const MAX_CTMM_AXES: usize = 24;
 /// Compiled, **dual-evaluable** `[markov_model]` transition intensities — the CTMM
 /// analogue of [`IndivParamProgram`] (#759).
 ///
-/// The f64 [`GeneratorFn`](crate::types::GeneratorFn) tree-walks `Expression`s and can
+/// The f64 [`GeneratorFn`] tree-walks `Expression`s and can
 /// only ever produce `Q` itself, which is why the CTMM likelihood has been finite-
 /// differenced end-to-end (perturb η, rebuild `Q`, redo an `expm` per observation gap).
 /// This snapshot carries the same intensities in *resolved* form — the shared
@@ -20693,7 +20693,7 @@ fn simplify_expr(expr: &Expression) -> Expression {
 
 /// Precomputed symbolic partials of `[individual_parameters]` assignments,
 /// produced by [`build_indiv_param_partials`]. Stored on
-/// [`CompiledModel`](crate::types::CompiledModel) as a primitive for any
+/// [`CompiledModel`] as a primitive for any
 /// future analytical-η-gradient path. The originally-planned consumers —
 /// Tier 4a milestones 3-5 (augmented ODE RHS, Form C readout sensitivities,
 /// `gradient = sens` estimator wiring) — were reverted in #145; the

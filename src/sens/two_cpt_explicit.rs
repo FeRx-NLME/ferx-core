@@ -14,8 +14,8 @@
 //! ```
 //!
 //! and propagate the coefficient/exponential assembly with a small second-order
-//! [`Jet`](super::jet::Jet). Seeds are `[CL, V1, Q, V2]` (plus `KA, F` on axes
-//! 4,5 for oral). Validated against [`Dual2`](super::dual2::Dual2) to ~1e-8; the
+//! [`Jet`]. Seeds are `[CL, V1, Q, V2]` (plus `KA, F` on axes
+//! 4,5 for oral). Validated against [`Dual2`] to ~1e-8; the
 //! near-degenerate (`Δ≈0`) and `ka≈α/β` L'Hôpital cases fall back to the dual
 //! path.
 

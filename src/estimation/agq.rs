@@ -22,7 +22,7 @@
 //! 1. **`n_agq = 1` is exactly Laplace.** The one-point rule is `z = 0`, `w = √π`, so the
 //!    sum collapses to `(2π)^(d/2) · |H|^(−1/2) · exp(l_i(η̂))` — the Laplace approximation,
 //!    term for term. This is not an approximation of an approximation; it is an identity,
-//!    and [`tests::one_node_agq_equals_laplace`] pins it.
+//!    and `tests::one_node_agq_equals_laplace` pins it.
 //! 2. **No Gaussian-residual assumption.** `l_i` is evaluated through
 //!    [`individual_nll_into_with_schedule`], the model's *actual* likelihood — so
 //!    time-to-event and categorical endpoints are integrated as faithfully as Gaussian

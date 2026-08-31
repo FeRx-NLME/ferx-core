@@ -1,6 +1,6 @@
 //! Vocabulary for state-reactive ("adaptive" / feedback) dosing simulation (#391).
 //!
-//! The *types* the reactive driver ([`crate::ode::predictions::ode_predictions_adaptive`])
+//! The *types* the reactive driver (`crate::ode::predictions::ode_predictions_adaptive`)
 //! and the public [`crate::api::simulate_adaptive`] entry point are built on. The
 //! shapes here are deliberately the public API surface:
 //!
