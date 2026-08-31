@@ -76,7 +76,7 @@ section of the SDLC for the versioning policy).
   NONMEM in `nonmem_anchor/reset_init_snapshot_J.ctl` (42.0 under the reset row's occasion against
   14.0 under the preceding record's). Note the remaining gaps: an **analytical** model using
   `[initial_conditions]` still drops its baseline at the first reset instead of re-depositing it
-  (#1135), and an adaptive controller's decision-time covariate LOCF still skips reset rows (#1148).
+  (#1135), a reset row whose occasion carries no kappa group falls back to kappa = 0 inconsistently across engines (#1153), and an adaptive controller's decision-time covariate LOCF still skips reset rows (#1148).
 - **A steady-state dose with a lagtime is now seeded at the dose record, not equilibrated at the
   arrival (#1121).** Under time-varying covariates an `SS=1` dose carrying an `ALAG` had its
   periodic trough computed *at the lagged arrival*, entirely under the dose row's covariate
