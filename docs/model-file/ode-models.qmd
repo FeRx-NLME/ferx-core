@@ -277,6 +277,49 @@ concentration by 12 h, and each of the four spellings read from an untaken `if` 
 wrong by 4.0e-1 relative. Models that do not mention model time in `[odes]` are unaffected.
 :::
 
+### A right-hand side that is nonlinear in the state is always integrated {#nonlinear-rhs}
+
+The same shortcut also needs the disposition to be **linear in the compartment amounts**, so
+it does not apply to a right-hand side where a state multiplies another state, or where a
+branch tests one:
+
+```
+[odes]
+  # nonlinear: integrated, never served by the closed form
+  d/dt(central) = first_order(ka=KA) - CL/V*central - Q/V*central + Q/V2*periph
+                  - KON*central*periph          # target binding (TMDD)
+  d/dt(periph)  = Q/V*central - Q/V2*periph
+```
+
+```
+[odes]
+  # state-triggered branch: also integrated
+  if (central > 10.0) { KE = 3.0*CL/V } else { KE = CL/V }
+  d/dt(central) = first_order(ka=KA) - KE*central
+```
+
+Saturable elimination (`- VMAX*central/(KM + central)`) has always been integrated for the
+same reason. As with model time, there is nothing to configure — the only consequence is
+that these models step the system rather than evaluating a closed form. If they are also
+stiff, see [Stiff systems](#stiff-systems) below.
+
+::: {.callout-warning}
+## Nonlinear disposition: affects results from ferx 0.3.0 and earlier
+
+Until [#1149](https://github.com/FeRx-NLME/ferx-core/issues/1149) ferx established linearity
+by evaluating the right-hand side one compartment at a time, with every *other* amount held
+at zero. A term that only switches on away from those points was therefore invisible:
+`KON*central*periph` is exactly zero whenever either amount is zero, and a threshold above
+the probe's amplitude was never crossed. Such a model was admitted to the closed-form path,
+which does not evaluate the right-hand side at all, so the term was **dropped from the
+predictions** — the same silent failure as the model-time case above, and with no time
+variable involved.
+
+Re-run any earlier result whose `[odes]` block multiplies two compartment amounts together,
+or branches on one. A right-hand side that is linear in the amounts is unaffected, including
+one whose *coefficients* are arbitrary functions of `θ`, `η`, and covariates.
+:::
+
 ### Stiff systems
 
 An explicit method like RK45 is *stability*-limited on a stiff system: it keeps shrinking

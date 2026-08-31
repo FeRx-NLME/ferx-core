@@ -127,6 +127,19 @@ section of the SDLC for the versioning policy).
   top of them, so a tool and the CLI cannot diverge in how a model is loaded.
 
 ### Fixed
+- **An `[odes]` right-hand side that is nonlinear in the compartment amounts is no longer
+  served by the closed-form fast path (#1149).** Linearity was established by evaluating the
+  right-hand side one compartment at a time with every other amount held at zero, so a term
+  that only switches on away from those points was invisible to it: a product of two amounts
+  (`- KON*central*periph`, the target-binding/TMDD shape) is exactly zero whenever either is
+  zero, and a branch testing an amount (`if (central > 10)`) was never entered, because the
+  largest amount probed was 2. Such models were admitted to the closed form, which does not
+  evaluate the right-hand side at all, so the term was **dropped from the predictions** —
+  the same silent failure as #1124, with no time variable involved. Identification now also
+  checks the right-hand side against the recovered linear system away from the axes, across
+  six decades of amount. Models that are linear in the amounts are unaffected and keep the
+  fast path, including those whose coefficients are arbitrary functions of `θ`, `η`, and
+  covariates.
 - **An `EVID=2` record no longer aborts a fit on a parameter-static subject (#1124 review).**
   Any subject routed to the event-driven walker while its PK parameters are constant — an
   `EVID=3/4` reset, or (since the change above) an `[odes]` right-hand side that reads model
