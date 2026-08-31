@@ -48,10 +48,22 @@ section of the SDLC for the versioning policy).
   sensitivity walks as a dual, so those become 0.0004 and 0.032 — the same values the finite-
   difference route gives (`nonmem_anchor/tad_lag_*`). Affected models keep the fast analytic
   route on both loops and under IOV, including when the lagtime carries inter-occasion
-  variability, and including the window before the first dose arrives. Predictions are
-  bit-identical to before. Models reading `TAD` **without** a lagtime, or reading `TAFD`
-  **with** one, were always exact and are untouched. `TAD` combined with a **steady-state**
-  dose still routes to finite differences, under the separate non-autonomous-RHS rule.
+  variability. Predictions are bit-identical to before. Models reading `TAD` **without** a
+  lagtime, or reading `TAFD` **with** one, were always exact and are untouched. `TAD` combined
+  with a **steady-state** dose still routes to finite differences, under the separate
+  non-autonomous-RHS rule.
+
+  Two consequences worth knowing before you re-run an affected model. First, `gradient_method =
+  auto` resolves this model class to **L-BFGS** where it previously chose BOBYQA, because the
+  choice keys on whether an analytic outer gradient is available — so the optimizer changes as
+  well as the gradient. Set `optimizer = bobyqa` to keep the previous behaviour. Second, the
+  second-order block `∂²f/∂η_ALAG²` is improved but **not** exact (6.4e-1 wrong before, 2.2e-1
+  after); it does not affect the objective value, but it does feed the analytic outer gradient
+  and the covariance step, so standard errors and the optimizer's search direction on these
+  models carry that residual until #1075 lands. The `TAD` value in the window **before the first
+  dose arrives** is differentiated consistently with whatever convention the predictor uses, but
+  that convention itself is still open (#1110) and is not anchored against NONMEM — NONMEM has
+  no `TAD` built-in in `$DES`, so there is nothing external to anchor it to.
 - **A lagged dose's covariate snapshot no longer stretches to its arrival (#1073).** With a
   lagtime, ferx broke the integration timeline only at the arrival `t + ALAG`, never at the dose
   row's own time, so the dose row's covariate / IOV snapshot governed everything up to the

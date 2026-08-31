@@ -3334,14 +3334,24 @@ fn run_subject_tvcov_eta<const N: usize>(
 /// equal at a tie) and carries no jet to disagree about, so this is a free choice — pinned
 /// here so it is deterministic rather than dependent on float comparison order.
 ///
-/// Only two doses arriving at the identical instant through *different* lag slots can observe
-/// it, since a single slot gives both arrivals the same jet as well as the same value (#1070).
+/// The tie is NOT confined to two distinct `ALAG{n}` slots. `lag_dual(k)` reads a **per-dose**
+/// snapshot (`pk_at_dose[k]`, seeded in that dose's own occasion group under IOV), so two doses
+/// sharing one `LAGTIME` still carry different lag *values and jets* whenever the lag depends
+/// on a time-varying covariate, on `TIME`, or on a per-occasion κ. An ordinary single-lagtime
+/// model can therefore reach it — doses at `t = 0` and `t = 1` with a covariate-dependent lag
+/// of 1.5 and 0.5 arrive together (#1070).
+///
+/// Because of that, the caller must not let this choice diverge from the anchor it hands the
+/// boundary velocities: the `K_DOSE` arm folds ONCE at the top and uses the result for both,
+/// so the post side of a saltation and the segment it opens always differentiate the same
+/// arrival.
 ///
 /// NaN handling mirrors `f64::max`, which *ignores* a NaN operand: a bare
 /// `candidate > incumbent` comparison is false against a NaN incumbent and would keep it,
-/// silently poisoning every later segment. Unreachable today — the incumbent is NaN only for
-/// a dose-free subject, which reaches no `K_DOSE` event — but that is precisely the kind of
-/// invariant that rots, so it is handled here rather than argued about at the call site.
+/// silently poisoning every later segment. This is reachable, not defensive — a subject whose
+/// every lag evaluates to NaN (an optimizer excursion into `(θ − 2)^0.5` at `θ < 2`) leaves the
+/// seed NaN *and* still fires `K_DOSE` events. Production's `first_arrival_ed` fold behaves the
+/// same way, so matching it here is what keeps the two engines agreeing under an excursion.
 #[inline]
 fn later_arrival<T: crate::sens::num::PkNum>(incumbent: T, candidate: T) -> T {
     if incumbent.val().is_nan() || candidate.val() > incumbent.val() {
@@ -4850,17 +4860,16 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     // `max` at each arrival leaves every later segment's anchor unchanged.
     //
     // A dose-free subject gets `NaN`, matching the literal production writes
-    // (`first_arrival_ed.unwrap_or(f64::NAN)`, and `tad_anchor`'s dose-free return).
+    // (`first_arrival_ed.unwrap_or(f64::NAN)`, and `tad_anchor`'s dose-free return). A subject
+    // whose every lag is NaN also keeps the `NaN` seed, since `arrival < earliest` is false for
+    // a NaN candidate — again matching production, whose `f64::min` fold skips NaN identically.
     //
-    // This is a **readability** alignment, not a behaviour change, and the distinction
-    // is worth recording so nobody re-derives it: `NEG_INFINITY` would have been
-    // equivalent. Every consumer of `last_dose_eff` gates on `is_finite()` — which is
-    // false for `NaN` and for `NEG_INFINITY` alike — so `eval_rhs_anchored` injects
-    // `TAD = NaN` either way, both saltation guards take their fallback either way, and
-    // the fold at an arrival is unreachable without a dose (and `later_arrival` mirrors
-    // `f64::max` in ignoring a NaN incumbent, so it returns the arrival for both
-    // regardless). A review round flagged this as a twin-vs-production divergence; it is
-    // not one. Writing the same literal as
+    // The choice of literal is a **readability** alignment, not a behaviour change:
+    // `NEG_INFINITY` would have been equivalent, because every consumer gates on
+    // `.val().is_finite()`, which is false for `NaN` and `NEG_INFINITY` alike. So
+    // `eval_rhs_anchored` injects `TAD = NaN` either way and both saltation guards take their
+    // fallback either way. A review round flagged this as a twin-vs-production divergence; it
+    // is not one. Writing the same literal as
     // production is still worth doing — it means a future reader comparing the two
     // sites does not have to redo this analysis to see they agree.
     //
@@ -5077,6 +5086,31 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
         }
         if kind == K_DOSE {
             let d = &subject.doses[idx];
+            // The anchor this arrival establishes, computed ONCE and used by every consumer in
+            // this arm: the post side of the saltation below, and the segment the arrival opens.
+            //
+            // Both must differentiate the SAME anchor. Handing the post-side velocities
+            // `arrival_dual(idx)` while folding the incumbent into `last_dose_eff` would, at two
+            // arrivals that coincide exactly, build `g⁺` from this dose's lag jet and then
+            // integrate the segment it opens under the other dose's — a first-order
+            // inconsistency, not a subgradient choice. Folding first and using the result for
+            // both makes them agree by construction, and is identical outside a tie (#1070).
+            let post_anchor = later_arrival(last_dose_eff, arrival_dual(idx));
+            // The post-side anchor is substituted for `t_event` in the velocities below, which
+            // is sound only because they agree on the value. Every `K_DOSE` timeline entry is
+            // built as `d.time + lag_val(k)` (an SS dose's extra break is a separate
+            // `K_SS_SEED` at the raw record time), so this holds by construction.
+            //
+            // NaN-tolerant deliberately, matching the two `debug_assert!`s below and
+            // `later_arrival`'s own NaN handling: a lagtime expression can be stepped into its
+            // NaN domain by the outer optimizer (`(θ − 2)^0.5` at θ < 2), and such an excursion
+            // must degrade to a NaN objective the optimizer rejects, not abort a debug-build
+            // fit. A bare `debug_assert_eq!` cannot express that — `NaN != NaN`, so it fails on
+            // exactly the input it is meant to tolerate.
+            debug_assert!(
+                post_anchor.val() == t_event || !t_event.is_finite(),
+                "the dual arrival must equal the K_DOSE timeline entry it replaces"
+            );
             // #1060: the covariate snapshot of the segment this event *opens*. Since
             // #1073 the segment *ending* here runs on the record that TERMINATES it —
             // the `params` binding above, which is the next record ahead, NOT the dose
@@ -5428,10 +5462,9 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                                     post_params,
                                     &prep_post,
                                     t_event,
-                                    // Post side of the arrival: THIS dose becomes the TAD anchor, and it moves
-                                    // with its own lagtime — the same dual the segment it opens integrates
-                                    // under. Value-identical to `t_event` (#1070).
-                                    arrival_dual(idx),
+                                    // Post side: the anchor hoisted at the top of this arm — the
+                                    // same dual the segment this arrival opens integrates under.
+                                    post_anchor,
                                     reset_floor,
                                     true,
                                 );
@@ -5581,10 +5614,9 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                             post_params,
                             post_prep,
                             t_event,
-                            // Post side of the arrival: THIS dose becomes the TAD anchor, and it moves
-                            // with its own lagtime — the same dual the segment it opens integrates
-                            // under. Value-identical to `t_event` (#1070).
-                            arrival_dual(idx),
+                            // Post side: the anchor hoisted at the top of this arm — the same
+                            // dual the segment this arrival opens integrates under.
+                            post_anchor,
                             reset_floor,
                             true,
                         );
@@ -5656,18 +5688,10 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                 }
             }
             // This dose now anchors TAD for every later segment, at its lagged arrival
-            // `d.time + lag_val(idx)` (= `t_event` for a dose), matching production.
-            // `arrival_dual` is substituted for `t_event` at this boundary's post-side
-            // velocities too, which is only sound because the two agree on the value. Every
-            // `K_DOSE` timeline entry is built as `d.time + lag_val(k)` (an SS dose's extra
-            // break is a separate `K_SS_SEED` at the raw record time), so this holds by
-            // construction — pinned rather than assumed.
-            debug_assert_eq!(
-                arrival_dual(idx).val(),
-                t_event,
-                "the dual arrival must equal the K_DOSE timeline entry it replaces"
-            );
-            last_dose_eff = later_arrival(last_dose_eff, arrival_dual(idx));
+            // `d.time + lag_val(idx)` (= `t_event` for a dose), matching production. Already
+            // folded at the top of this arm and consumed by the post-side velocities above, so
+            // the boundary and the segment it opens cannot disagree.
+            last_dose_eff = post_anchor;
             // The arrival is NOT a record: it must not become `last_params` (#1073). Its
             // dose row already did, at the `K_DOSE_REC` branch below.
         } else if kind == K_ROUTE_ONSET {
@@ -6423,9 +6447,19 @@ fn integrate_g<T: crate::sens::num::PkNum>(
                 ps,
                 t,
                 first_dose_time,
-                // Zero jet by construction: the static walk folds the *unlagged* dose
-                // times and `ode_subject_supported` declines an estimated lagtime
-                // outright, so #1070's `∂TAD/∂lag` term is absent here, not dropped.
+                // Zero jet by construction: this walk folds the *unlagged* dose times and
+                // `ode_subject_supported` declines an estimated lagtime outright, so #1070's
+                // `∂TAD/∂lag` term is absent here rather than dropped.
+                //
+                // That is a statement about the JET only. The VALUE is a separate, open
+                // defect: the fold above leaves `NEG_INFINITY` before the first dose and
+                // never falls back, so this injects `TAD = NaN` and `0.0 * NaN` poisons the
+                // whole trajectory — while production's `tad_anchor` has fallen back to the
+                // subject's first arrival since #1073. Measured on a lag-free, TV-cov-free
+                // `TAD`-reading model with a pre-dose record: this walk returns
+                // `[70.0, NaN, NaN, NaN]` where production returns
+                // `[70.0, 69.072, 157.027, 131.576]`. Tracked separately; do NOT read this
+                // comment as blessing the anchor.
                 T::from_f64(last_dose_eff),
                 du,
                 &mut vars_cell.borrow_mut(),

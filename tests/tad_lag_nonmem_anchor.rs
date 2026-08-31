@@ -122,14 +122,18 @@ const MODEL: &str = r"
   DV ~ proportional(PROP)
 ";
 
-fn run_anchor(data: &str, nonmem_ofv: f64) {
-    // Tight enough to reject the pre-#1070 analytic route, which was 0.176 OFV off on
-    // anchor A and 0.107 off on anchor B. The residual 0.032 on B is the NONMEM control
-    // stream's own MTIME construction, not ferx: against an independent stdlib-RK4
-    // reference ferx matches to 8.5e-6 while the control stream's table print resolves to
-    // 3.3e-5 (see the module docs above). Anchor A carries no MTIME and agrees to 3.7e-4.
-    const OFV_TOLERANCE: f64 = 0.06;
-
+/// `tolerance` is per anchor, deliberately, because the two have margins three orders apart
+/// and a shared constant would be set by the looser one.
+///
+/// Anchor A carries no `MTIME` and agrees to 3.7e-4, so it can be pinned tightly and is what
+/// actually discriminates the analytic chain from the broken one (the pre-#1070 route was
+/// 0.176 off here). Anchor B's residual 0.032 is a *systematic* offset belonging to the NONMEM
+/// control stream's `MTIME` construction, not to ferx — against an independent stdlib-RK4
+/// reference ferx matches to 8.5e-6 while the control stream's table print resolves to 3.3e-5
+/// (see the module docs). Pinning B within 2x of a known systematic offset would make it
+/// brittle to any unrelated stepper or `inner_tol` change, so it gets its own, looser bound
+/// that still rejects its own pre-#1070 delta of 0.107.
+fn run_anchor(data: &str, nonmem_ofv: f64, tolerance: f64) {
     let model = parse_full_model(MODEL)
         .expect("TAD + lagtime model must parse")
         .model;
@@ -152,9 +156,6 @@ fn run_anchor(data: &str, nonmem_ofv: f64) {
 
     let res = fit(&model, &pop, &model.default_params, &opts).expect("fit must evaluate");
 
-    // The gate must actually be what produced this number. Without this the test
-    // would still pass if the analytic route were restored and happened to land
-    // inside the tolerance on some future dataset.
     // The analytic route must actually be what produced this number. Without this the
     // test would still pass if the dual `tad` were reverted and the model fell back to
     // finite differences — FD is also right here, so only the reported route separates
@@ -169,14 +170,35 @@ fn run_anchor(data: &str, nonmem_ofv: f64) {
         res.gradient_method_inner
     );
 
+    // ...and the per-subject route, which the line above CANNOT see. The two directions are
+    // not symmetric: `gradient_method_inner` is a model-level union
+    // (`inner_reports_analytic_model`), so the assertion this replaced — "must be FD" — was
+    // sound, because a model-level FD report implies FD for every subject. "Must be analytic"
+    // is not: any per-subject decline reaching these 12 subjects would send the fit to FD,
+    // which is also right here (see the table above), so the OFV assertion would still pass
+    // while the model-level string still read "analytic" and this anchor quietly stopped
+    // exercising the analytic chain at all. The FD-fallback warning IS per-subject.
+    let fd_fallbacks: Vec<&String> = res
+        .warnings
+        .iter()
+        .filter(|w| {
+            let l = w.to_lowercase();
+            l.contains("finite difference") || l.contains("fd fallback") || l.contains("falls back")
+        })
+        .collect();
+    assert!(
+        fd_fallbacks.is_empty(),
+        "#1070: no subject may fall back to finite differences, but the fit warned: {fd_fallbacks:?}"
+    );
+
     assert!(
         res.ofv.is_finite(),
         "OFV must be finite (a NaN here means #1110 has regressed into this cell)"
     );
     let delta = (res.ofv - nonmem_ofv).abs();
     assert!(
-        delta < OFV_TOLERANCE,
-        "ferx OFV {} vs NONMEM {nonmem_ofv} — delta {delta} exceeds {OFV_TOLERANCE}",
+        delta < tolerance,
+        "ferx OFV {} vs NONMEM {nonmem_ofv} — delta {delta} exceeds {tolerance}",
         res.ofv
     );
 }
@@ -190,7 +212,8 @@ fn run_anchor(data: &str, nonmem_ofv: f64) {
     ignore = "slow + NONMEM-anchored TAD×lagtime (#1070) acceptance: opt in with --features slow-tests"
 )]
 fn tad_lag_single_dose_matches_nonmem() {
-    run_anchor("data/tad_lag_A.csv", -271.990);
+    // A has no `MTIME`; 1e-3 still rejects its pre-#1070 delta of 0.176 by 100x.
+    run_anchor("data/tad_lag_A.csv", -271.990, 1e-3);
 }
 
 /// Two doses, so the `TAD` anchor **switches** at the second arrival — a distinct
@@ -202,5 +225,7 @@ fn tad_lag_single_dose_matches_nonmem() {
     ignore = "slow + NONMEM-anchored TAD×lagtime (#1070) acceptance: opt in with --features slow-tests"
 )]
 fn tad_lag_two_dose_matches_nonmem() {
-    run_anchor("data/tad_lag_B.csv", -169.317);
+    // B carries the control stream's systematic 0.032; 0.06 rejects its pre-#1070
+    // delta of 0.107 while leaving room for unrelated numerical drift.
+    run_anchor("data/tad_lag_B.csv", -169.317, 0.06);
 }

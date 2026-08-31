@@ -8380,19 +8380,25 @@ fn ode_provider_matches_fd_under_the_auto_stiff_switch() {
 }
 
 // ---------------------------------------------------------------------------
-// #1070 — a `TAD`-reading ODE RHS under an estimated lagtime must route to FD.
+// #1070 — `TAD` is threaded through the sensitivity walks as a **dual**.
 //
-// `eval_rhs_anchored` computes `tad = t − last_dose_eff` in `f64` and
-// `eval_rhs_g` writes it into the variable table as a constant. But
-// `last_dose_eff` IS the dose's lagged arrival, so `∂TAD/∂lag = −1` never
-// enters the dual chain: the gradient on the lag axis is wrong everywhere the
-// trajectory is integrated, not only at a boundary. The value stays exact, so
-// only a gradient-vs-FD check can see it.
+// `TAD`'s anchor IS the dose's lagged arrival, so `∂TAD/∂lag = −1` belongs in
+// the dual chain. While `eval_rhs_anchored` lifted it as an `f64` constant that
+// term was missing everywhere the trajectory is integrated, not only at a
+// boundary — and the value stayed exact, so only a gradient-vs-FD check could
+// see it. An interim fix routed the whole cell to FD; the term is now carried
+// and that detour is gone.
 //
-// The gate is keyed on `TAD` alone and on `has_lagtime()` alone. The tests
-// below pin every edge of that choice — the declines AND, just as importantly,
-// the neighbours that must STAY analytic, so a later widening of the gate
-// fails loudly instead of quietly costing every TAD model its analytic path.
+// The tests below pin BOTH directions. The four shapes that carry the term
+// (η-lag, θ-only lag, per-compartment `ALAG{n}`, IOV κ-on-lag) assert first-order
+// exactness against FD of the production predictor. The neighbours that never
+// carried it — `TAFD`, a `TAD` RHS with no lagtime, a pure route lag — assert
+// they still take the analytic route, so a later over-widening of scope fails
+// loudly. `TAD` + steady state remains FD under the separate non-autonomous-RHS
+// rule and is pinned by `ode_provider_ss_tad_dependent_rhs_routes_to_fd`.
+//
+// Second order is NOT asserted here; see
+// `ode_tad_rhs_with_estimated_lagtime_is_analytic_and_exact` for why (#1075).
 // ---------------------------------------------------------------------------
 
 /// 1-cpt IV whose RHS reads a time built-in, with a configurable lagtime
@@ -8436,8 +8442,13 @@ fn tad_gate_model(time_var: &str, lag_expr: &str) -> CompiledModel {
 /// Bolus at t=0 plus a 1 h infusion at t=1, observations all strictly after the
 /// first lagged arrival (~0.80). That was originally required because a record before
 /// the first arrival poisoned the trajectory with `TAD = NaN`; #1073 anchors the
-/// pre-arrival window at the subject's first arrival in both ODE predictors and both
-/// twins, so it is now finite there. The geometry is kept: this fixture is about the
+/// pre-arrival window at the subject's first arrival in both ODE predictors and in the
+/// event-driven twin, so it is finite there.
+///
+/// NOT in the static twin: `integrate_g` still folds into `NEG_INFINITY` with no fallback
+/// and injects `TAD = NaN` before the first dose (measured; see #1110). That walk is
+/// unreachable for THIS fixture — `ode_subject_supported` declines `has_lagtime()` — which
+/// is exactly why no `TAD` fixture in this file has ever exercised it. The geometry is kept: this fixture is about the
 /// #1070 gate, and moving a record into that window would make it about #1110's
 /// semantics instead.
 fn tad_gate_subject() -> Subject {
@@ -8649,9 +8660,12 @@ fn ode_tad_rhs_with_route_lag_only_stays_analytic() {
     );
 }
 
-/// Steady state keeps its own, broader decline: SS breaks the cycle recurrence
-/// for ANY non-autonomous RHS, including a `TIME`-only one that #1070's narrower
-/// flag does not set. Regression guard that the new flag did not replace the old.
+/// Steady state keeps its own, broader decline: SS breaks the cycle recurrence for
+/// ANY non-autonomous RHS, `TIME`-only ones included. That gate is `uses_time_vars`
+/// (the union of `TIME`/`TAFD`/`TAD`), and it is what still routes `TAD` + SS to FD
+/// now that #1070's narrower, TAD-only predicate has been deleted along with the
+/// interim gate it served. Regression guard that removing the narrow one left the
+/// broad one intact.
 #[test]
 fn ode_ss_time_only_rhs_still_routes_to_fd() {
     // `T`, not `TIME`: a bare `TIME` in an `[odes]` RHS compiles to `Op::PushTime`
@@ -8717,9 +8731,11 @@ const PER_CMT_ALAG_TAD_ODE: &str = r#"
 /// the lag from a single slot, or that kept the incumbent arrival's jet past the second
 /// arrival, would be exact on every other fixture in this file and wrong here.
 ///
-/// Arrivals are ≈0.42 (depot dose at `t = 0`, `ALAG1`) and ≈1.94 (central dose at `t = 1`,
-/// `ALAG2`), and the observations straddle both — with the second dose landing while the
-/// first is still visible, so its arrival has live state on the incoming side.
+/// Arrivals are ≈0.4205 (depot dose at `t = 0`, `ALAG1 = 0.4·e^{0.05}`) and ≈1.8476 (central
+/// dose at `t = 1`, `ALAG2 = 0.9·e^{−0.06}`), and the observations straddle both — with the
+/// second dose landing while the first is still visible, so its arrival has live state on the
+/// incoming side. Both sit strictly inside a record interval, which the test re-derives and
+/// asserts rather than trusting these numbers.
 #[test]
 fn ode_tad_rhs_per_compartment_lags_anchor_on_their_own_axes() {
     let model = parse_model_string(PER_CMT_ALAG_TAD_ODE).expect("parse");
@@ -8771,6 +8787,82 @@ fn ode_tad_rhs_per_compartment_lags_anchor_on_their_own_axes() {
     // `ode_tad_rhs_with_estimated_lagtime_is_analytic_and_exact`: the `δlag²` coefficient
     // treats the RHS as autonomous, which a `TAD`-reading one is not. Pre-dates #1070 and
     // is tracked as #1075.
+}
+
+/// **A NaN lagtime must degrade, not abort.** The outer optimizer can step a lagtime
+/// expression into its NaN domain — `(TVLAG - 2.0)^0.5` at `TVLAG < 2` is the shortest
+/// example — and `integrate_tvcov_g` states the requirement explicitly: such an excursion
+/// "must degrade, not panic a debug-build fit". Both pre-existing `debug_assert!`s in that
+/// function are written NaN-tolerantly for exactly this reason.
+///
+/// The anchor `debug_assert` added with the dual `tad` was originally a `debug_assert_eq!`,
+/// which cannot express that: `NaN != NaN`, so it failed on precisely the input it was meant
+/// to tolerate. Reproduced as `assertion 'left == right' failed / left: NaN / right: NaN`
+/// before the fix. Debug builds are what `cargo test` produces, and `[profile.ci-test]`
+/// inherits `release`, so CI could never have caught this — hence a test rather than a
+/// reliance on the suite.
+#[test]
+fn ode_tad_rhs_nan_lagtime_degrades_rather_than_panicking() {
+    const NAN_LAG: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  theta THETA_WT(0.0, -1.0, 5.0)
+  theta TVLAG(3.0, 0.1, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_LAG ~ 0.02
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL = TVCL * (WT / 70)^THETA_WT * exp(ETA_CL)
+  V  = TVV
+  LAGTIME = (TVLAG - 2.0)^0.5 * exp(ETA_LAG)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central * (1.0 + 0.3 * TAD)
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_method = rk45
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+    let model = parse_model_string(NAN_LAG).expect("parse");
+    let mut subject = bolus_subject(&[1.0, 2.0, 4.0, 8.0]);
+    let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+    subject.dose_covariates = vec![wt(60.0)];
+    subject.obs_covariates = vec![wt(60.0), wt(65.0), wt(70.0), wt(75.0)];
+
+    // Control: a real lagtime resolves and the walk serves the subject normally.
+    let ok = ode_subject_sensitivities(&model, &subject, &[1.0, 20.0, 0.0, 3.0], &[0.1, 0.07])
+        .expect("a resolvable lagtime must still be served");
+    assert!(
+        ok.obs.iter().all(|o| o.f.is_finite()),
+        "control arm must be finite, got {:?}",
+        ok.obs.iter().map(|o| o.f).collect::<Vec<_>>()
+    );
+
+    // The excursion: `TVLAG = 1.0` makes the lag `sqrt(-1)`. Non-vacuity — assert the model
+    // really does produce a NaN lag here, or the test would pass without exercising anything.
+    let theta_nan = [1.0, 20.0, 0.0, 1.0];
+    let pk = (model.pk_param_fn)(&theta_nan, &[0.1, 0.07], &subject.covariates, 0.0);
+    assert!(
+        pk.values[crate::types::PK_IDX_LAGTIME].is_nan(),
+        "fixture must produce a NaN lagtime, got {}",
+        pk.values[crate::types::PK_IDX_LAGTIME]
+    );
+
+    // Must not panic. Whether it declines or returns non-finite values is the optimizer's
+    // problem to reject; aborting the process is not an option.
+    let out = ode_subject_sensitivities(&model, &subject, &theta_nan, &[0.1, 0.07]);
+    if let Some(v) = out {
+        assert!(
+            v.obs.iter().any(|o| !o.f.is_finite()),
+            "a NaN lagtime should not yield a finite trajectory"
+        );
+    }
 }
 
 /// **The route the user is actually told about.** Every other #1070 test asserts
@@ -8873,6 +8965,25 @@ fn ode_iov_kappa_on_lagtime_tad_rhs_matches_fd_of_predict_iov() {
     let theta = vec![10.0, 50.0, 0.7];
     let stacked = vec![0.1, 0.07, 0.03, -0.02];
     let sens = ode_subject_sensitivities_iov(&model, &subj, &theta, &stacked).expect("analytic");
+    // The INNER EBE route as well as the outer. These are separate walks — `run_subject_iov`
+    // over `Dual2` and `run_subject_iov_eta` over `Dual1` — and the test deleted along with the
+    // interim gate was the only thing asserting the inner one for this cell. Without this, a
+    // change that silently dropped the IOV inner back to FD leaves every test green; that is
+    // the outer/inner asymmetry the non-IOV fixture guards with `ode_inner_grad_supported_model`.
+    let inner = ode_subject_eta_grad_iov(&model, &subj, &theta, &stacked)
+        .expect("#1070: the IOV inner EBE gradient must be analytic too");
+    assert_eq!(inner.len(), sens.obs.len());
+    for (a, b) in sens.obs.iter().zip(inner.iter()) {
+        approx::assert_relative_eq!(a.f, b.f, max_relative = 1e-12, epsilon = 1e-12);
+        for k in 0..stacked.len() {
+            approx::assert_relative_eq!(
+                a.df_deta[k],
+                b.df_deta[k],
+                max_relative = 1e-9,
+                epsilon = 1e-12
+            );
+        }
+    }
     let pred = |st: &[f64], j: usize| -> f64 {
         let eta_bsv = st[..model.n_eta].to_vec();
         let kappas: Vec<Vec<f64>> = (0..groups.len())
@@ -8914,7 +9025,7 @@ const PREARRIVAL_INIT_TAD: &str = r#"
 [parameters]
   theta TVCL(1.0, 0.1, 10.0)
   theta TVV(20.0, 1.0, 200.0)
-  theta THETA_WT(0.0, -1.0, 5.0)
+  theta THETA_WT(0.0, -5.0, 5.0) FIX
   theta TVLAG(0.5, 0.01, 5.0)
   omega ETA_CL ~ 0.09
   omega ETA_LAG ~ 0.02
@@ -8948,9 +9059,15 @@ const PREARRIVAL_INIT_TAD: &str = r#"
 /// So the fixture is built to make it live on both counts: `init(central) = 70` gives the
 /// pre-arrival window real state (it decays 70 → 68.80 across the two records at `t = 0.20`
 /// and `t = 0.35`, both strictly before the arrival at ≈0.536), and the dose then lands
-/// (68.80 → 163.57), so the anchor genuinely switches mid-subject. `THETA_WT` is fixed at
-/// zero so the time-varying `WT` is inert — it only routes the subject to the event-driven
-/// predictor, without making this a covariate test.
+/// (68.80 → 163.57), so the anchor genuinely switches mid-subject.
+///
+/// `THETA_WT` is `FIX` at zero, so `(WT/70)^0 == 1` exactly and the time-varying `WT` cannot
+/// move any prediction or contribute a `∂f/∂θ` column — this is not a covariate test. Note
+/// what `WT` does *not* do: it is **not** what selects the event-driven walk. A lagtime alone
+/// does that, because `ode_subject_supported` declines `has_lagtime()` outright, so the static
+/// walk is unreachable for this model with or without the covariate. That distinction matters
+/// — believing a TV covariate was needed to reach the event-driven walk is what left
+/// `integrate_g` with no `TAD` coverage at all.
 ///
 /// Mutation guard: seeding `last_dose_eff` from `T::from_f64(d.time + lag_val(k))` — the
 /// value-only first arrival, leaving every later `K_DOSE` update dual — makes `∂f/∂η_LAG`
@@ -8985,6 +9102,20 @@ fn ode_tad_rhs_prearrival_window_carries_the_lagtime_jet() {
         sens.obs[2].f > 2.0 * sens.obs[1].f,
         "the dose must land, or the anchor never switches"
     );
+    // Non-vacuity on the AXIS under test, not just on the state. The seed's jet is observable
+    // only at the two pre-arrival records; from the arrival onward the anchor is the ordinary
+    // `K_DOSE` fold, which is dual either way. Without this, a change that pushed the
+    // pre-arrival contribution under `check_vs_production`'s tolerance would leave the fixture
+    // green with the later records carrying the pass.
+    for j in 0..2 {
+        assert!(
+            sens.obs[j].df_deta[1].abs() > 1e-2,
+            "eta_LAG must move the pre-arrival record at t = {}, got {:.3e} - the seed's jet \
+             would otherwise be untested",
+            subject.obs_times[j],
+            sens.obs[j].df_deta[1]
+        );
+    }
 
     check_vs_production(&model, &subject, &theta, &eta);
     check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
