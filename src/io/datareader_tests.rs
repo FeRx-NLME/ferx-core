@@ -1566,6 +1566,61 @@ fn test_reset_covariates_skipped_when_no_tv_covariates() {
 }
 
 #[test]
+fn test_reset_rows_capture_their_own_occasion() {
+    // #1133: an EVID=3/4 row is a data record, so NONMEM runs `$PK` at it under THAT
+    // row's `OCC` — measured in `nonmem_anchor/reset_init_snapshot_J.ctl`, where a reset
+    // carrying `OCC = 2` between `OCC = 1` records seeds `A_0` under occasion 2 (42.0)
+    // and not under the preceding record's occasion 1 (14.0).
+    //
+    // The reset row's `OCC` differs from BOTH its predecessor (1) and its successor (3),
+    // so a snapshot taken one row early or one row late is visible here rather than
+    // coincidentally equal — the same non-degeneracy the covariate test above uses. The
+    // second reset repeats an occasion already seen, which is the ordinary case.
+    let csv = "ID,TIME,DV,EVID,MDV,AMT,OCC\n\
+                   1,0,.,1,1,100,1\n\
+                   1,2,5.0,0,0,.,1\n\
+                   1,4,.,3,1,0,2\n\
+                   1,6,5.0,0,0,.,3\n\
+                   1,8,.,4,1,50,3\n\
+                   1,10,5.0,0,0,.,3\n";
+    let f = write_csv(csv);
+    let pop = read_nonmem_csv(f.path(), None, Some("OCC")).unwrap();
+    let subj = &pop.subjects[0];
+
+    assert_eq!(subj.reset_times, vec![4.0, 8.0]);
+    // Parallel to `reset_times`, and each reset carries its OWN row's label.
+    assert_eq!(subj.reset_occasions, vec![2, 3]);
+    // The neighbours differ, so this is not the predecessor's or the successor's value:
+    // the record before the first reset is OCC=1 and the one after is OCC=3.
+    assert_eq!(subj.occasions[0], 1);
+    assert_eq!(subj.occasions[1], 3);
+    // EVID=4 records its dose from the same row, so the two labels agree there.
+    assert_eq!(subj.dose_occasions.len(), 2);
+    assert_eq!(subj.dose_occasions[1], 3);
+}
+
+#[test]
+fn test_reset_occasions_skipped_without_an_iov_column() {
+    // Gated exactly like `occasions` / `dose_occasions`: with no `iov_column` the reader
+    // stores no occasion labels at all, and `reset_occasions` must be empty rather than a
+    // vector of zeros — `pk::reset_row_occasion` distinguishes "no label stored" (fall
+    // back to the neighbour scan) from "label is 0" by emptiness, so a zero-filled vector
+    // would silently pin every reset to occasion 0.
+    let csv = "ID,TIME,DV,EVID,MDV,AMT,OCC\n\
+                   1,0,.,1,1,100,1\n\
+                   1,4,.,3,1,0,2\n\
+                   1,10,5.0,0,0,.,3\n";
+    let f = write_csv(csv);
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+    let subj = &pop.subjects[0];
+
+    assert_eq!(subj.reset_times, vec![4.0]);
+    assert!(subj.reset_occasions.is_empty());
+    assert!(subj.occasions.is_empty());
+    assert!(subj.dose_occasions.is_empty());
+}
+
+#[test]
 fn test_missing_dv_obs_skipped_and_warned() {
     // Issue #258: an EVID=0 row with a missing DV and no MDV=1 must be
     // skipped (not scored as DV=0), and a single W_MISSING_DV warning fires.
