@@ -96,6 +96,51 @@ existing surface does not suffice. Do not reach for `#[doc(hidden)]` — it hide
 the item from the baseline, so a test rejects it outright. See
 [SDLC §8.7](sdlc.qmd#the-public-api-gate).
 
+## Writing a docs page {#writing-a-docs-page}
+
+These pages are read by people and retrieved a section at a time by anything
+else — the site's own anchor links, and agents that pull one chunk rather than a
+whole page. [R1](docs-lint.qmd#r1-section-size) enforces the size of such a
+chunk; this section is the convention that makes staying under it easy, and
+makes the result worth retrieving.
+
+### Keep rationale and validation in their own subsection
+
+Most oversized sections are a usage explanation and its justification welded
+together, so a heading that reads like a how-to serves background instead —
+implementation reasoning, NONMEM comparisons, benchmark tables. Give the
+justification its own subheading. Nothing moves off the page; it just becomes
+separately addressable, so a reader who wants the answer can skip it and one who
+wants the reasoning can link straight to it.
+
+**Use the standard names.** `### Rationale` for why a design or a default is
+what it is, `### Validation` (or `### Validation against NONMEM`) for the parity
+evidence required by [Gold-standard
+validation](sdlc.qmd#gold-standard-validation). Skipping and finding both work
+by matching the heading, so *Background*, *Notes*, *Design* and *History* defeat
+the point.
+
+**Leave the verdict behind.** Rationale is sometimes the answer — a reader
+deciding whether to override a default needs the outcome even if they skip the
+derivation. Keep the conclusion and any scope caveats in the usage section, and
+link down for the reasoning:
+
+> Analytic for the combinations listed below; everything else falls back to FD.
+> See `[Rationale](#rationale-gradient-route)`.
+
+**A rationale subsection is not exempt from R1.** Split it when it grows, the
+same as anything else — otherwise the wall of prose has only been relocated
+under a heading nobody trims.
+
+### Two things the linter cannot see
+
+- **`toc-depth` is 3** (`docs/_quarto.yml`). A subsection added under an `###`
+  lands at `####` and drops out of the on-page TOC, which loses half the benefit
+  of splitting. Promote the parent to `##`, or raise `toc-depth` for that page.
+- **Whether the split is by concern.** Six subheadings that each mean something
+  ("Covariance / standard errors", "ODE solver") make a page navigable; six that
+  say "Part 1 … Part 6" satisfy R1 and help nobody.
+
 **Good first contributions:** add a NONMEM-comparison test for a model we don't
 cover yet, improve a docs page, or fix a reproducible bug with a regression
 test. Small, well-tested PRs are the easiest to merge. Large or experimental
