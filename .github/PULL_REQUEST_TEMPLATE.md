@@ -90,7 +90,9 @@
 - [ ] No user-visible change
 
 ## Checklist
-- [ ] `cargo clippy` clean
+- [ ] `tools/preflight.sh` green — fmt, the 5 `cargo check` feature sets, clippy
+      (`--all-targets`), public-API baseline. A green `cargo test` is not a green
+      build: the feature sets are not nested (#1133, #1157)
 - [ ] Functions on the `Dual2` sensitivity path (`sens/`, `pk/` `*_g<T: PkNum>`) stay differentiable (if touching gradient-reachable code)
 - [ ] `Cargo.toml` version bumped if breaking
 

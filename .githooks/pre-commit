@@ -5,6 +5,10 @@
 # Skip the check when no .rs files are staged (e.g. docs-only commits).
 git diff --cached --name-only | grep -q '\.rs$' || exit 0
 
-# `--all`: the repo is a workspace (#1114), and without it `cargo fmt` checks
-# only the root `ferx-core` package, silently skipping `crates/`.
-cargo +nightly fmt --all --check
+# Delegate rather than repeat the command. `tools/preflight.sh` is the single
+# owner of the fast gates (#1157) and CI's `Format` job runs this same group, so
+# the hook, the local gate and CI cannot disagree about what "formatted" means.
+# Repeating `cargo fmt` here is how they drifted before: the hook pinned `--all`
+# while nothing guaranteed CI did.
+root=$(git rev-parse --show-toplevel) || exit 1
+exec "$root/tools/preflight.sh" fmt
