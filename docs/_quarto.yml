@@ -101,6 +101,9 @@ website:
           - estimation/categorical.qmd
           - estimation/ctmm.qmd
           - estimation/mixture.qmd
+      - text: "Tools"
+        contents:
+          - tools/bootstrap.qmd
       - text: "Data Format"
         href: data-format.qmd
       - text: "CLI Reference"

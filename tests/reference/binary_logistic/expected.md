@@ -19,7 +19,7 @@ reproduce base-R `glm` and NONMEM `F_FLAG=1` exactly.
   reproduce: copy `data/binary_logistic.csv` next to `binlog.ctl`, then
   `nmfe76 binlog.ctl binlog.lst`. Final estimates in `binlog.ext` (`ITERATION
   -1000000000`); OFV `213.59547683`.
-- **ferx**: `cargo run --bin ferx --features survival -- examples/binary_logistic.ferx
+- **ferx**: `cargo run -p ferx-cli --features ferx-core/survival -- examples/binary_logistic.ferx
   --data data/binary_logistic.csv`; guarded by `tests/categorical_convergence.rs`.
 
 NONMEM and glm agree to 6 sig figs (both exact ML / IRLS). ferx's OFV matches to 5

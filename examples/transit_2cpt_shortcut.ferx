@@ -23,7 +23,7 @@
 #   2  peripheral -- (amount, mg)
 #
 # Self-contained: the [simulation] block below lets you run it with no data file
-#   cargo run --release -- examples/transit_2cpt_shortcut.ferx --simulate
+#   cargo run --release -p ferx-cli -- examples/transit_2cpt_shortcut.ferx --simulate
 # which simulates a 100 mg oral dose record on CMT=1 (delivered over time by the
 # transit() forcing, not as a bolus), observed as concentration, and
 # fits it back. True simulation parameters: TVCL=5, TVV1=50, TVQ=10, TVV2=100,

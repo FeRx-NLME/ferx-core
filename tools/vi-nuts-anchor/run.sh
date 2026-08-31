@@ -39,7 +39,7 @@ fi
 # the same theta/Omega/sigma and the comparison is about q alone. Needs many draws -- the point
 # is to measure the approximation, not the optimizer.
 echo "=== ferx: variational q at the AGQ estimate ==="
-cargo build --profile ci-fast --bin ferx
+cargo build --profile ci-fast -p ferx-cli
 ( cd "$RESULTS" && "$REPO/target/ci-fast/ferx" "$Q_MODEL" --data "$DATA" | tail -n 12 )
 
 echo

@@ -28,6 +28,64 @@ When a change here matters to a downstream consumer, tell them the two-step and 
 
 When working on a feature branch or any branch other than `main`, always use `EnterWorktree` at the start of the session. This prevents uncommitted WIP from one session contaminating another session on a different branch (a real problem when two chats share the same checkout directory).
 
+## Workspace layout and the public-API boundary
+
+The repo is a cargo **workspace** whose root package is `ferx-core` itself:
+
+```
+ferx-core/                       # repo root = ferx-core package + workspace root
+├─ Cargo.toml                    # [package] ferx-core + [workspace] members
+├─ src/                          # the engine
+├─ api/ferx-core-public-api.txt  # public-API baseline, diffed in CI
+└─ crates/
+   ├─ ferx-tools/                # depends on ferx-core
+   └─ ferx-cli/                  # depends on ferx-core; [[bin]] name = "ferx"
+```
+
+**The root package must stay `ferx-core`.** `ferx-r/src/rust/.cargo/config.toml`
+patches `ferx-core = { path = "../../../ferx-core" }` — the repo *root*. Moving
+the package under `crates/` breaks every local ferx-r build, and breaks it
+*silently*: the patch stops applying and ferx-r quietly builds `main` instead of
+your branch.
+
+**Boundary rule.** `ferx-core` = one model, one dataset, one fit. `ferx-tools` =
+many fits, resampling, model-space search. If it calls `fit()` more than once, it
+is a tool. Statistical kernels (npde, CWRES, shrinkage, covariance/SE, SIR, FREM,
+VPC statistics) stay in core; orchestration of repeated fits goes to `ferx-tools`.
+`ferx-cli` is thin — argument parsing, printing, exit codes, no numerical or
+orchestration logic. The dependency is strictly one-way: `ferx-core` never
+depends on either member (pinned by `tests/public_api_boundary.rs`).
+
+**Widening the public API is a design step, not paperwork.** `api/ferx-core-public-api.txt`
+is a committed `cargo public-api` snapshot; the `Public API baseline` CI job
+regenerates and diffs it, so any new `pub` item fails CI until the baseline is
+updated **in the same PR**. When a change genuinely needs a wider surface:
+
+```bash
+tools/update-public-api.sh          # regenerate the baseline
+tools/update-public-api.sh --check  # what CI runs
+```
+
+and say in the PR description which tool needs each added item and why the
+existing surface does not suffice. Two rules make this stick:
+
+- **No `#[doc(hidden)] pub` escape hatch.** `cargo public-api` omits
+  `#[doc(hidden)]` items entirely, so the attribute is a *working bypass* of the
+  gate — which is why `tests/public_api_boundary.rs` bans it outright. An item is
+  either public API (documented, in the baseline, usable from ferx-r) or it stays
+  `pub(crate)` and the caller does without.
+- **The ferx-r reachability test.** Anything `ferx-tools` needs must also be
+  reachable from ferx-r, which consumes `ferx-core` as an ordinary external
+  crate. An API that only makes sense "because we're in the same workspace" is
+  the wrong API.
+
+**Feature flags belong to `ferx-core`, not to the members**, so a workspace-wide
+or member-scoped command has to write them package-qualified — `--features
+ferx-core/ci`, not `--features ci` (which fails with "none of the selected
+packages contains this feature"). Qualifying them also keeps the members linking
+the `ferx-core` rlib the other CI steps just built, instead of forcing a second
+compile under a different feature hash.
+
 ## First-time setup
 
 After cloning, activate the shared pre-commit hook (blocks commits that fail `rustfmt`):
@@ -39,17 +97,19 @@ git config core.hooksPath .githooks
 ## Build & Run Commands
 
 ```bash
-# Build (debug)
+# Build the library (debug)
 cargo build
 
-# Build (release, with fat LTO)
-cargo build --release
+# Build everything, including the `ferx` binary (release, with fat LTO).
+# The repo is a workspace: the root package is the `ferx-core` LIBRARY and no
+# longer carries a binary, so a bare `cargo build --release` produces no `ferx`.
+cargo build --release --workspace          # or: -p ferx-cli
 
 # Run CLI with data file
-cargo run --release -- examples/warfarin.ferx --data data/warfarin.csv
+cargo run --release -p ferx-cli -- examples/warfarin.ferx --data data/warfarin.csv
 
 # Run CLI with simulated data
-cargo run --release -- examples/warfarin.ferx --simulate
+cargo run --release -p ferx-cli -- examples/warfarin.ferx --simulate
 
 # Check compilation without building
 cargo check

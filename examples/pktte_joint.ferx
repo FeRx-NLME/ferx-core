@@ -8,7 +8,7 @@
 # PK is observed on CMT 2 (central); the event is on CMT 3, so Gaussian and TTE rows
 # route unambiguously. fit(), predict_survival(), and simulate() (drug-driven
 # event-time sampling, given a [simulation] horizon) all work. Run with:
-#   cargo run --release -- examples/pktte_joint.ferx --data data/pktte_joint.csv
+#   cargo run --release -p ferx-cli -- examples/pktte_joint.ferx --data data/pktte_joint.csv
 
 [parameters]
   theta TVCL(1.0, 0.01, 100.0)

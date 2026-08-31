@@ -22,7 +22,7 @@
 # omega(ETA_GAMMA) = 0.04. Administrative censoring at t = 80 h (42/50 events).
 # Simulated dataset: data/tte_gompertz.csv
 #
-# Run:  cargo run --release -- examples/tte_gompertz.ferx --data data/tte_gompertz.csv
+# Run:  cargo run --release -p ferx-cli -- examples/tte_gompertz.ferx --data data/tte_gompertz.csv
 #
 # Note: [structural_model], [error_model], and [individual_parameters] are
 # omitted — all three are optional when [event_model] is the sole endpoint.

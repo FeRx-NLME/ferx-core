@@ -29,10 +29,10 @@ With `n_starts = 8` and `start_sigma = 0.5`:
 
 ```bash
 # Simulate data first
-cargo run --release -- examples/mm_multistart.ferx --simulate
+cargo run --release -p ferx-cli -- examples/mm_multistart.ferx --simulate
 
 # Fit with multi-start
-cargo run --release -- examples/mm_multistart.ferx --data mm_multistart-sim.csv
+cargo run --release -p ferx-cli -- examples/mm_multistart.ferx --data mm_multistart-sim.csv
 ```
 
 ## When to use multi-start

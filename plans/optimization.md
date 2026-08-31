@@ -298,7 +298,7 @@ in `saem.rs` (line 174) and `likelihood.rs` (line 6).
 
 ### Test
 Run `cargo test --lib` — all tests must pass.
-Run: `cargo run --release -- examples/warfarin.ferx --data data/warfarin.csv`
+Run: `cargo run --release -p ferx-cli -- examples/warfarin.ferx --data data/warfarin.csv`
 with `method = gn`. OFV must match the baseline exactly. Parallelism must not
 change the result.
 
@@ -1728,7 +1728,7 @@ All standard errors must agree within 1% relative.
 
 Benchmark wall-clock time for the same four examples, before and after:
 ```bash
-time cargo run --release -- examples/warfarin.ferx --data data/warfarin.csv
+time cargo run --release -p ferx-cli -- examples/warfarin.ferx --data data/warfarin.csv
 ```
 Record times in a benchmark table committed to `docs/src/benchmarks.md`.
 Expected improvement: 3–10× on FOCE/FOCEI models with ODE structure,

@@ -3,7 +3,7 @@
 # block, so it fits the external NONMEM-anchor dataset. Requires the #343 branch
 # (worktree-issue-322-phase0-transit), where transit() is implemented.
 #
-#   cargo run --release -- nonmem_anchor/transit_savic_fit.ferx --data nonmem_anchor/transit_oral.csv
+#   cargo run --release -p ferx-cli -- nonmem_anchor/transit_savic_fit.ferx --data nonmem_anchor/transit_oral.csv
 #
 # Compare the resulting {model}-fit.yaml OFV + theta estimates against NONMEM's
 # savic_transit.ctl run (see README.md).

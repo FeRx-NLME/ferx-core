@@ -19,7 +19,7 @@
 #   observation y   — concentration (mg/L) = central / V, via the [scaling] block
 #
 # Self-contained: run it with no data file
-#   cargo run --release -- examples/igd_inverse_gaussian.ferx --simulate
+#   cargo run --release -p ferx-cli -- examples/igd_inverse_gaussian.ferx --simulate
 # which simulates an oral 100 mg dose into CMT=1, observed as concentration, and
 # fits it back. True simulation parameters: TVCL=5, TVV=50, TVMAT=2, TVCV2=0.3,
 #   omega_CL=omega_V=0.09, sigma_prop=0.15.
