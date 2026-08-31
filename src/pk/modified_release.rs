@@ -859,35 +859,40 @@ fn verify_against_ode_twin(
         return;
     }
     let release = || MR_TWIN_VERIFIED.with(|seen| seen.borrow_mut().remove(&key));
+    /// A twin looser than this cannot out-resolve `verify_tol`, so it is not an oracle.
+    const MR_TWIN_MAX_RELTOL: f64 = 1e-8;
+    /// Companion bound on the absolute floor, which is what actually bit (#1124 review).
+    const MR_TWIN_MAX_ABSTOL: f64 = 1e-10;
     let verify_tol = (500.0 * s.spec.solver_opts.reltol).max(1e-4);
-    let (twin, twin_states) =
-        crate::ode::ode_predictions_with_states(s.spec, &s.pk.values, theta, eta, subject);
+    let twin = crate::ode::ode_predictions(s.spec, &s.pk.values, theta, eta, subject);
     if twin.len() != mr.len() {
         release();
         return;
     }
-    // The integrator controls its local error as `abstol + reltol·|y|`, so the twin's own
-    // relative accuracy is `abstol/|y| + reltol`. It can only arbitrate a disagreement it is
-    // itself more accurate than, which needs `abstol/|y| < verify_tol` — i.e. the state must
-    // stay above `abstol / verify_tol`. Below that the twin is tolerance noise and asserting
-    // against it measures the solver, not the closed form.
+    // Only a twin tight enough to out-resolve `verify_tol` may arbitrate. The integrator
+    // controls its local error as `abstol + reltol·|y|`, so its relative accuracy is
+    // `abstol/|y| + reltol`: once the trajectory decays toward `abstol`, the twin has no
+    // significant digits left and asserting against it measures the solver, not the closed
+    // form. `abstol` is a bound on the STATE while this compares the readout, so there is no
+    // sound per-observation conversion here — decline the whole comparison instead.
     //
-    // Measured, not assumed: on `nonmem_anchor/per_route_lag`, an inner-loop excursion to
-    // `V = 5.2e-8` decays `central` to 1.3e-6 by t = 24 — the order of this spec's own
-    // `abstol` (1e-6, with `reltol` 1e-4). The twin answered 29.48 where the closed form
-    // answered 24.574829; the exact Bateman superposition for those parameters is
-    // 24.574829, so the twin was the wrong one by 20% and the old check fired on it.
-    let noise_floor = s.spec.solver_opts.abstol / verify_tol;
+    // Measured, not assumed: on `nonmem_anchor/per_route_lag` (whose spec keeps the default
+    // `reltol = 1e-4`, `abstol = 1e-6`) an inner-loop excursion to `V = 5.2e-8` decays
+    // `central` to 1.3e-6 by t = 24. The twin answered 29.484 where the closed form answered
+    // 24.574829 — and the exact Bateman superposition for those parameters is 24.574829, so
+    // the twin was 20% wrong and this check aborted a correct fit in debug.
+    //
+    // The models this check exists to guard (`reduces_to_ode_*`) pin `1e-10`/`1e-12`
+    // deliberately, so they still verify.
+    if s.spec.solver_opts.reltol > MR_TWIN_MAX_RELTOL
+        || s.spec.solver_opts.abstol > MR_TWIN_MAX_ABSTOL
+    {
+        release();
+        return;
+    }
     let mut compared = 0usize;
     for (i, (&a, &b)) in mr.iter().zip(&twin).enumerate() {
         if !b.is_finite() {
-            continue;
-        }
-        let state_scale = twin_states
-            .get(i)
-            .map(|u| u.iter().fold(0.0f64, |m, v| m.max(v.abs())))
-            .unwrap_or(0.0);
-        if !(state_scale > noise_floor) {
             continue;
         }
         compared += 1;
