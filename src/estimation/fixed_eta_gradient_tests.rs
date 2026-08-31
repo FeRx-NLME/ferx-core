@@ -40,6 +40,7 @@ fn obs_nll_subject_grad_matches_obs_nll_sum_fd() {
         occasions: vec![],
         obs_l2: Vec::new(),
         dose_occasions: vec![],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -251,6 +252,7 @@ fn obs_nll_subject_grad_iov_matches_fd() {
         occasions: vec![1, 1, 1, 2, 2, 2],
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: Vec::new(),
     };
@@ -394,6 +396,7 @@ fn obs_nll_subject_grad_per_cmt_matches_fd() {
         occasions: vec![],
         obs_l2: Vec::new(),
         dose_occasions: vec![],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -537,6 +540,7 @@ fn obs_nll_subject_grad_block_sigma_cross_endpoint_matches_fd() {
         occasions: Vec::new(),
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };

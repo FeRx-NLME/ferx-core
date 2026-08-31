@@ -117,10 +117,13 @@ above — numerically equivalent, and still allocation-free.
   residual baseline. What happens next differs by engine, and only one of the two matches
   NONMEM today:
   - On an **`[odes]`** model the reset re-applies `init(state) = <expr>`, evaluated at the
-    **reset row's own covariates** — `$PK` runs at that row, so a covariate-driven baseline
+    **reset row's own data items** — `$PK` runs at that row, so a covariate-driven baseline
     restarts on that row's values, not the preceding record's and not the following one's
-    (#1133). Anchored against NONMEM 7.6.0 in
-    `nonmem_anchor/reset_init_snapshot_{A,B,C,D,E,F}.ctl`.
+    (#1133). With an `iov_column` this covers the row's `OCC` too: a reset that opens a new
+    occasion re-seeds under that occasion's κ. Anchored against NONMEM 7.6.0 in
+    `nonmem_anchor/reset_init_snapshot_{A,B,C,D,E,F,G,H,J}.ctl` — including a reset that is the
+    subject's first event (H), a reset with a separate dose row at the same time (G), and the
+    occasion question in isolation (J).
   - On an **analytical** model with `[initial_conditions]` nothing re-deposits the
     baseline, so observations at or after the first reset carry no baseline contribution.
     NONMEM re-applies `A_0` there too, so this is a known divergence (#1135) — use an

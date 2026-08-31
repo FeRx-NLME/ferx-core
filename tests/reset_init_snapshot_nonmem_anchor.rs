@@ -38,6 +38,9 @@
 //! | D | `reset_init_snapshot_evid4.csv` | 140 (EVID=4, +100 mg) | 200 | 128.80319627590555 |
 //! | E | `reset_init_snapshot_multi.csv` | **two** resets: 140 at t=8, 200 at t=12 | — | 234.84197355103731 |
 //! | F | `reset_init_snapshot.csv` + `$OMEGA 0.09` on an η inside `A_0` | 140 | 140 | 71.223755303866326 |
+//! | G | `reset_init_snapshot_codose.csv` | 140, with a **separate** dose row at the same time carrying 90 | 90 | 128.80319627590555 |
+//! | H | `reset_init_snapshot_first.csv` | 140, and the reset is the subject's **first event** | 70 | 135.12319830791392 |
+//! | J | `reset_init_snapshot_occ.csv` | `WT` flat; the reset row carries **`OCC = 2`** between `OCC = 1` records | — | 135.11165705456989 |
 //!
 //! # Measured (`nonmem_anchor/results/reset_init_snapshot_*.tab`)
 //!
@@ -89,9 +92,42 @@
 //! anchorable rather than only twin-checked. That the EBE genuinely moves is visible in
 //! NONMEM's own table: `IPRED(0) = 10.328` against `PRED(0) = 14.0`.
 //!
-//! Raw NONMEM output for all six arms is committed under
-//! `nonmem_anchor/results/reset_init_snapshot_{A,B,C,D,E,F}.tab`, so every constant below
-//! is auditable against the file it came from.
+//! # Arms G, H and J: three more degeneracies
+//!
+//! **G — the reset row against a co-timed dose row.** In arm D the reset and its dose are
+//! one EVID=4 row, so `reset_cov(r)` and `dose_cov(k)` are the same map and seeding from
+//! either passes. G splits them: a standalone EVID=3 at `t = 8` carrying `WT = 140`, then a
+//! separate EVID=1 at the same time carrying `WT = 90`. NONMEM seeds `28.0` and the dose
+//! then lands on it for `30.0`; reading the dose row's snapshot would give `18.0`/`20.0`.
+//!
+//! **H — the reset as the subject's first event.** No record precedes it, so any rule
+//! phrased as "the record before" has nothing to resolve. The reset at `t = 0` carries
+//! `WT = 140` and the co-timed observation carries `70`: NONMEM reads `28.0`, so even here
+//! it is the reset row's own values and not the following record's.
+//!
+//! **J — which OCCASION `$PK` runs under at the reset row.** This one changed the
+//! implementation. `WT` is flat at 70 so nothing but the `OCC` column moves: the reset row
+//! carries `OCC = 2` between `OCC = 1` records, and `A_0` reads a THETA-selected occasion
+//! multiplier (not an η, so the answer is deterministic and needs no EBE). NONMEM reads
+//! **42.0** at `t = 8` — `(10·70·3)/50`, occasion **2**, the reset row's own — against
+//! `14.0` for the preceding record's occasion 1. ferx therefore stores the reset row's
+//! `OCC` (`Subject::reset_occasions`) rather than inferring the occasion from a neighbour;
+//! the neighbour scan survives only as the fallback for an in-memory subject that carries
+//! no `OCC` at all.
+//!
+//! One honest limit on J's ferx side: an `OCC` column reaches a ferx model either as an
+//! ordinary covariate or as the IOV occasion label, and those are different code paths.
+//! The twin here (`reset_init_snapshot_occ.ferx`) takes the covariate one, because κ is
+//! estimated and cannot be fixed to a discriminating value from a model file. The occasion
+//! -label path — `Subject::reset_occasions` feeding `pk::reset_row_occasion` — is pinned in
+//! `pk::tests::iov_reset_takes_its_own_rows_occasion`, which drives `predict_iov` with
+//! explicit κ. J anchors the RULE against NONMEM; that test anchors ferx's second route to
+//! it.
+//!
+//! Raw NONMEM output for every arm is committed under `nonmem_anchor/results/` — the
+//! `.tab` for the `IPRED` constants below and the `.ext` for the `#OBJV` values in the
+//! table above — so every number here is auditable against the file it came from without a
+//! NONMEM licence.
 //!
 //! Tier 2: `predict` at fixed parameters, no convergence loop, so no `slow-tests` gate.
 //! This is deliberate — #1132 records that the slow tier never runs on a PR.
@@ -109,10 +145,15 @@ fn anchor(name: &str) -> String {
 /// `$OMEGA 0 FIX` on the NONMEM side and `omega ETA_CL ~ 0.0` here make `PRED`
 /// and `IPRED` the same number, so this reads against either column.
 fn ferx_preds(data: &str) -> Vec<(f64, f64)> {
-    let parsed = ferx_core::parser::model_parser::parse_full_model_file(Path::new(&anchor(
-        "reset_init_snapshot_fit.ferx",
-    )))
-    .expect("the anchor model parses");
+    ferx_preds_with("reset_init_snapshot_fit.ferx", data)
+}
+
+/// As [`ferx_preds`], but against a named model — arm J needs its own twin, which reads
+/// the `OCC` column.
+fn ferx_preds_with(model_file: &str, data: &str) -> Vec<(f64, f64)> {
+    let parsed =
+        ferx_core::parser::model_parser::parse_full_model_file(Path::new(&anchor(model_file)))
+            .expect("the anchor model parses");
     let pop = ferx_core::read_nonmem_csv(Path::new(&anchor(data)), None, None)
         .expect("the anchor dataset loads");
     ferx_core::predict(&parsed.model, &pop, &parsed.model.default_params)
@@ -172,6 +213,40 @@ const NM_E: &[(f64, f64)] = &[
     (16.0, 2.681_280_182_3e1),
 ];
 
+/// NONMEM `IPRED` for arm G. The `t = 8` rows are both `MDV = 1` (the reset and the
+/// separate dose), so ferx emits no prediction there; `t = 9` onward carries the seed.
+const NM_G: &[(f64, f64)] = &[
+    (0.0, 1.400_000_000_0e1),
+    (1.0, 1.266_772_384_0e1),
+    (2.0, 1.146_223_052_1e1),
+    (6.0, 9.320_824_388_2e0),
+    (9.0, 2.714_512_252_6e1),
+    (10.0, 2.456_192_256_7e1),
+    (12.0, 2.010_960_135_8e1),
+    (16.0, 1.347_986_890_0e1),
+];
+
+/// NONMEM `IPRED` for arm H, where the reset is the subject's first event. The `t = 0`
+/// observation sits after the reset row and reads the seed directly: `28.0`, the reset
+/// row's `WT = 140`, not its own `WT = 70`.
+const NM_H: &[(f64, f64)] = &[
+    (0.0, 2.800_000_000_0e1),
+    (1.0, 2.533_544_768_0e1),
+    (2.0, 2.292_446_104_2e1),
+    (6.0, 1.700_418_727_1e1),
+    (10.0, 1.139_824_758_5e1),
+];
+
+/// NONMEM `IPRED` for arm J: `WT` flat, the occasion is the only thing that moves.
+const NM_J: &[(f64, f64)] = &[
+    (0.0, 1.400_000_000_0e1),
+    (2.0, 1.146_223_053_6e1),
+    (6.0, 9.320_824_398_0e0),
+    (9.0, 3.800_317_153_7e1),
+    (12.0, 2.815_344_191_3e1),
+    (16.0, 1.887_181_646_8e1),
+];
+
 /// Relative tolerance against the NONMEM table. The two solvers are independent
 /// implementations at `TOL=9` / `reltol 1e-10`, so this is a numerical-agreement band,
 /// not a convention band: the defect under test is a factor of **two** at every
@@ -179,7 +254,11 @@ const NM_E: &[(f64, f64)] = &[
 const REL_TOL: f64 = 1e-7;
 
 fn assert_matches_nonmem(data: &str, expected: &[(f64, f64)]) {
-    let got = ferx_preds(data);
+    assert_matches_nonmem_with("reset_init_snapshot_fit.ferx", data, expected);
+}
+
+fn assert_matches_nonmem_with(model_file: &str, data: &str, expected: &[(f64, f64)]) {
+    let got = ferx_preds_with(model_file, data);
     assert_eq!(
         got.len(),
         expected.len(),
@@ -280,6 +359,37 @@ fn the_objective_matches_nonmem_with_an_eta_inside_the_reset_seed() {
     assert!(
         delta < 0.5,
         "OFV anchor: ferx {ofv:.6} vs NONMEM {NM_OBJV_F:.6} (Δ {delta:.3e})"
+    );
+}
+
+#[test]
+fn a_co_timed_dose_row_does_not_supply_the_reset_seed() {
+    // G. Arm D cannot separate these — its reset and dose are one EVID=4 row, so the two
+    // snapshots are the same map. Here they are two rows at `t = 8` with `WT` 140 and 90.
+    assert_matches_nonmem("reset_init_snapshot_codose.csv", NM_G);
+}
+
+#[test]
+fn a_reset_that_is_the_first_event_still_uses_its_own_row() {
+    // H. Nothing precedes the reset, so any "the record before" rule has nothing to
+    // resolve; NONMEM still reads the reset row's own `WT = 140` (28.0) rather than the
+    // co-timed observation's 70 (14.0).
+    assert_matches_nonmem("reset_init_snapshot_first.csv", NM_H);
+}
+
+#[test]
+fn the_reset_row_supplies_its_own_occasion() {
+    // J, and the arm that changed the implementation. `WT` is flat, so the ONLY thing that
+    // differs across the reset is the `OCC` column: the reset row carries occasion 2 while
+    // every record before it carries occasion 1. NONMEM seeds under occasion 2.
+    //
+    // Before this measurement ferx inferred the reset's occasion from the preceding record
+    // — a choice made to avoid regressing κ, never against evidence. It reads 14.0 here,
+    // a factor of three out.
+    assert_matches_nonmem_with(
+        "reset_init_snapshot_occ.ferx",
+        "reset_init_snapshot_occ.csv",
+        NM_J,
     );
 }
 

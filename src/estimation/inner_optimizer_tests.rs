@@ -193,6 +193,7 @@ fn in_scope_ode_reports_and_takes_the_analytic_inner_route() {
         occasions: Vec::new(),
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -273,6 +274,7 @@ fn fd_fallback_warning_fires_for_all_fd_in_scope_ode_population() {
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         }
@@ -395,6 +397,7 @@ fn find_ebe_uses_fd_h_matrix_when_inner_gradient_forced_fd() {
         occasions: Vec::new(),
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -522,6 +525,7 @@ fn analytic_inner_gradient_ode_init_theta_sqrt_matches_fd() {
         occasions: vec![1; n],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -591,6 +595,7 @@ fn analytic_inner_gradient_iiv_on_ruv_m3_matches_fd() {
         occasions: vec![1; 6],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -712,6 +717,7 @@ fn analytic_inner_gradient_m3_iiv_on_ruv_matches_fd_on_ode() {
         occasions: vec![1; 6],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -1186,6 +1192,7 @@ fn test_frem_jacobian_overrides_fd_with_exact_values() {
         occasions: Vec::new(),
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: vec![0, 0, 100], // last obs is FREM
         obs_records: vec![],
     };
@@ -1311,6 +1318,7 @@ fn inner_restarts_bit_identical_on_wellidentified_subject() {
         occasions: Vec::new(),
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -1425,6 +1433,7 @@ fn fd_inner_ebe_runaway_on_floored_row_is_recovered() {
         occasions: vec![1; n],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };

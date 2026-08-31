@@ -48,6 +48,7 @@ pub fn subject(
         occasions: vec![],
         obs_l2: Vec::new(),
         dose_occasions: vec![],
+        reset_occasions: vec![],
         fremtype: vec![],
         obs_records: vec![],
     }

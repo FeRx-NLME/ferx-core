@@ -2167,6 +2167,7 @@ mod tests {
                 occasions: vec![1, 1, 1],
                 obs_l2: Vec::new(),
                 dose_occasions: vec![1],
+                reset_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
             })
@@ -3503,6 +3504,7 @@ mod tests {
             occasions: vec![1, 1, 1, 2, 2, 2],
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };

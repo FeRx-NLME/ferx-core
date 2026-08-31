@@ -1005,6 +1005,7 @@ fn oral_subject(times: &[f64]) -> Subject {
         occasions: vec![1; n],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -1605,6 +1606,7 @@ fn subject_with_dose(dose: DoseEvent, times: &[f64]) -> Subject {
         occasions: vec![1; n],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -2401,6 +2403,7 @@ fn provider_ss_into_plain_cmt_with_inert_absorption_matches_fd() {
         cens: vec![0; n],
         occasions: vec![1; n],
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
         obs_l2: Vec::new(),
@@ -2863,6 +2866,7 @@ fn subject_with_doses_and_resets(
         occasions: vec![1; n],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -4735,6 +4739,7 @@ fn ode_lagtime_full_sens_matches_analytical_twin() {
         occasions: vec![1; n],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -5348,6 +5353,7 @@ fn tvcov_subject(
         occasions: vec![1; n],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -6137,6 +6143,7 @@ fn iov_subject() -> Subject {
         occasions,
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -7549,6 +7556,7 @@ fn ode_iov_above_legacy_axis_cap_body() {
         occasions,
         obs_l2: Vec::new(),
         dose_occasions: (1..=n_occ as u32).collect(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -7628,6 +7636,7 @@ fn fit_rayon_stack_handles_pna_scale_ode_iov_gradient() {
         occasions,
         obs_l2: Vec::new(),
         dose_occasions: (1..=n_occ as u32).collect(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -10236,6 +10245,7 @@ fn iov_reset_subject() -> Subject {
         occasions,
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -10529,6 +10539,7 @@ fn iov_tvcov_subject(pk_only: bool) -> Subject {
         occasions,
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }

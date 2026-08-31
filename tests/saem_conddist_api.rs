@@ -55,6 +55,7 @@ fn template_population(n: usize) -> Population {
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: vec![],
             fremtype: Vec::new(),
             obs_records: vec![],
         })

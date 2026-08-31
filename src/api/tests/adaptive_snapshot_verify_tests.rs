@@ -74,6 +74,7 @@ fn tv_subject() -> Subject {
         occasions: vec![1, 1],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -465,6 +466,7 @@ fn wired_into_a_real_reactive_tvcov_iov_run() {
         occasions: vec![1; decisions.len()],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };

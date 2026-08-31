@@ -117,8 +117,9 @@ segment is parameterised by the record that *terminates* it, and a lagged arriva
 infusion end or a zero-order cutoff is not a record at all.
 
 Concretely, for `init(central) = 10*WT` with `WT` stepping 70 → 140 at the reset row,
-the compartment restarts at `1400`, not `700`. Anchored against NONMEM 7.6.0 in
-`nonmem_anchor/reset_init_snapshot_{A,B,C,D}.ctl`.
+the compartment restarts at `1400`, not `700`. The same holds for the row's `OCC` under an
+`iov_column`: a reset that opens a new occasion re-seeds under that occasion's κ. Anchored
+against NONMEM 7.6.0 in `nonmem_anchor/reset_init_snapshot_{A,B,C,D,E,F,G,H,J}.ctl`.
 
 One gap remains (#1135): an **analytical** (closed-form) model using
 `[initial_conditions]` drops its baseline at the first reset and never re-deposits it,

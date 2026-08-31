@@ -1540,6 +1540,7 @@ fn parse_subject(
     // (handled in the `evid == 1 || evid == 4` arm below).
     let mut reset_times: Vec<f64> = Vec::new();
     let mut reset_covariates: Vec<HashMap<String, f64>> = Vec::new();
+    let mut reset_occasions: Vec<u32> = Vec::new();
 
     // Reset-delimited occasion segmentation. NONMEM processes records
     // sequentially, so an EVID=3/4 reset whose TIME restarts at/below the
@@ -1738,6 +1739,12 @@ fn parse_subject(
             // fallback returns it.
             if any_tv {
                 reset_covariates.push(locf_state.clone());
+            }
+            // The reset row's own `OCC` (#1133). NONMEM runs `$PK` at this row, so this is
+            // the occasion its `A_0` re-seed is evaluated under — not the neighbouring
+            // records'. Gated exactly like `occasions`/`dose_occasions`.
+            if occ_col.is_some() {
+                reset_occasions.push(occ);
             }
         }
 
@@ -2149,6 +2156,9 @@ fn parse_subject(
         if any_tv {
             reset_covariates = rperm.iter().map(|&i| reset_covariates[i].clone()).collect();
         }
+        if occ_col.is_some() {
+            reset_occasions = rperm.iter().map(|&i| reset_occasions[i]).collect();
+        }
     }
 
     // ── Honor NONMEM record order for a same-TIME observation/dose ──────────
@@ -2219,6 +2229,7 @@ fn parse_subject(
             pk_only_covariates,
             reset_times,
             reset_covariates,
+            reset_occasions,
             cens,
             occasions,
             obs_l2,

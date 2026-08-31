@@ -79,6 +79,7 @@ fn bolus_subject(times: &[f64]) -> Subject {
         occasions: vec![1; n],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -5527,6 +5528,49 @@ fn ode_provider_init_reset_midtimeline_reads_the_reset_rows_snapshot() {
              only from {a:.4} to {b:.4}: the walk is not reading that row's snapshot"
         );
     }
+}
+
+/// **Two resets on the sensitivity walk** (#1133). Anchor arm E pins the per-reset index
+/// on the *value* engine, but it runs through `predict`, never through
+/// `ode_subject_sensitivities` — so the twin's own `tl.push((rt, K_RESET, r))` and
+/// `pk_at_reset[idx]` were still only ever evaluated at index 0, and reverting either to a
+/// constant `0` passed the whole unit suite.
+///
+/// The two reset rows carry `WT = 40` and `WT = 160`, which no neighbouring record shares,
+/// so indexing them apart is observable in `f` and in `∂f/∂(θ,η)` alike.
+#[test]
+fn ode_provider_reset_seeds_are_indexed_per_reset() {
+    let model = parse_model_string(ONECPT_IV_INIT_WTV_ODE).expect("parse");
+    let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+    let mut subject = bolus_subject(&[1.0, 2.0, 4.0, 8.0]);
+    subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+    subject.dose_covariates = vec![wt(60.0)];
+    subject.obs_covariates = vec![wt(70.0), wt(90.0), wt(150.0), wt(150.0)];
+    subject.covariates = wt(60.0);
+    subject.reset_times = vec![3.0, 6.0];
+    subject.reset_covariates = vec![wt(40.0), wt(160.0)];
+    assert!(subject.has_tv_covariates());
+    assert!(ode_tvcov_supported(&model, &subject));
+    let theta = vec![1.0, 20.0, 500.0];
+    let eta = vec![0.1, -0.05];
+    check_vs_production(&model, &subject, &theta, &eta);
+    check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+
+    // Perturb only the SECOND reset's row. The `t = 8` observation follows it, so it must
+    // move; a walk indexing `pk_at_reset[0]` for both resets would be unmoved.
+    let base = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("supported");
+    let mut perturbed = subject.clone();
+    perturbed.reset_covariates = vec![wt(40.0), wt(45.0)];
+    let got = ode_subject_sensitivities(&model, &perturbed, &theta, &eta).expect("supported");
+    let (a, b) = (base.obs[3].f, got.obs[3].f);
+    assert!(
+        (a - b).abs() > 0.05 * a.abs(),
+        "changing only the SECOND reset row's WT moved the post-reset prediction merely \
+         from {a:.4} to {b:.4}: the walk is reading one reset's snapshot for both"
+    );
+    // And the first reset still governs its own episode: the `t = 4` observation sits
+    // between the two resets, so perturbing reset 1 must leave it alone.
+    approx::assert_relative_eq!(base.obs[2].f, got.obs[2].f, max_relative = 1e-12);
 }
 
 /// **IOV × time-varying covariates × a reset that re-seeds `init(...)`** (#1133).

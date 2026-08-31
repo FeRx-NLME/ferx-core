@@ -108,6 +108,7 @@ fn simulate_subjects(
                 occasions: Vec::new(),
                 obs_l2: Vec::new(),
                 dose_occasions: Vec::new(),
+                reset_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
             }
@@ -565,6 +566,7 @@ fn generate_two_cpt_oral_cov() {
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         })

@@ -658,8 +658,18 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     // event-time-shift family as a compartment lagtime — so it forces the event-driven walk
     // even when the subject has no TV covariates and no compartment lagtime.
     let has_route_lag = model.has_route_absorption_lag();
+    // A subject carrying per-reset covariate snapshots is per-event too (#1133), even when
+    // `has_tv_covariates()` is false — which a hand-assembled subject (FREM, the R glue, a
+    // fixture) can be. Production's `subject_needs_per_event_pk` admits it and seeds
+    // `init(...)` from the reset row's map; declining here would route it to the STATIC
+    // dual walk, which re-seeds from one subject-static snapshot. That is a wrong analytic
+    // gradient rather than an FD fallback, and `Dual2`-vs-FD parity cannot see it because
+    // FD perturbs the twin's own value path. Mirrors the clause in
+    // `subject_needs_per_event_pk` and `iov_walk_per_event`.
+    let has_reset_snapshots = !subject.reset_covariates.is_empty();
     if !ode_analytical_supported(model)
         || !(subject.has_tv_covariates()
+            || has_reset_snapshots
             || model.has_lagtime()
             || has_route_lag
             || has_ss
@@ -3052,7 +3062,7 @@ fn seed_iov_events<T: Clone>(
         let pk_at_reset = (0..subject.reset_times.len())
             .map(|r| {
                 let t = subject.reset_times[r];
-                match crate::pk::reset_row_occasion(subject, t)
+                match crate::pk::reset_row_occasion(subject, r)
                     .and_then(|occ| occ_to_k.get(&occ).copied())
                 {
                     Some(g) => seed_group_cov(g, subject.reset_cov(r), t),
@@ -3098,7 +3108,7 @@ fn seed_iov_events<T: Clone>(
         // FD).
         let pk_at_reset = (0..subject.reset_times.len())
             .map(|r| {
-                let occ = crate::pk::reset_row_occasion(subject, subject.reset_times[r])?;
+                let occ = crate::pk::reset_row_occasion(subject, r)?;
                 Some(group_dual[*occ_to_k.get(&occ)?].clone())
             })
             .collect::<Option<_>>()?;

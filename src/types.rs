@@ -943,6 +943,15 @@ pub struct Subject {
     /// Occasion index per dose event (parallel to `doses`).
     /// Empty when no IOV column is present in the data.
     pub dose_occasions: Vec<u32>,
+    /// Occasion index per EVID=3/4 reset row (parallel to `reset_times`).
+    /// Empty when no IOV column is present in the data.
+    ///
+    /// A reset row is a data record, so NONMEM runs `$PK` at it under **that row's own**
+    /// `OCC` — measured in `nonmem_anchor/reset_init_snapshot_J.ctl`, where a reset row
+    /// carrying `OCC = 2` between `OCC = 1` records seeds `A_0` under occasion 2's
+    /// multiplier (42.0, against 14.0 for the preceding record's). Without this the
+    /// occasion has to be guessed from a neighbouring record (#1133).
+    pub reset_occasions: Vec<u32>,
     /// FREM observation type per observation (parallel to `obs_times`).
     /// 0 = PK observation, 100/200/300/... = covariate observation.
     /// Empty when FREMTYPE column is absent from the data.

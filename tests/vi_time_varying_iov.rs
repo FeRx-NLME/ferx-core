@@ -192,6 +192,7 @@ fn design() -> Population {
                 occasions,
                 obs_l2: Vec::new(),
                 dose_occasions,
+                reset_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
             }

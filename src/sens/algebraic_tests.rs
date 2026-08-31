@@ -69,6 +69,7 @@ fn subject(covariates: Vec<(&str, f64)>, obs_covariates: Vec<Vec<(&str, f64)>>) 
         occasions: vec![],
         obs_l2: Vec::new(),
         dose_occasions: vec![],
+        reset_occasions: Vec::new(),
         fremtype: vec![],
         obs_records: vec![],
     }

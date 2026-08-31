@@ -2343,6 +2343,7 @@ mod tests {
             occasions: vec![1, 1, 1],
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             // 3rd row is a FREM covariate pseudo-observation.
             fremtype: vec![0, 0, 5],
             obs_records: vec![],
@@ -2679,6 +2680,7 @@ mod tests {
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype,
             obs_records: Vec::new(),
         }
@@ -2899,6 +2901,7 @@ mod tests {
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: vec![0, 0, 100],
             obs_records: vec![],
         };

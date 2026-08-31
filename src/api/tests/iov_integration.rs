@@ -130,6 +130,7 @@ fn make_iov_population() -> Population {
             occasions: occasions.clone(),
             obs_l2: Vec::new(),
             dose_occasions: dose_occ.clone(),
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         })
@@ -1066,6 +1067,7 @@ fn test_saem_accepts_block_sigma_cross_endpoint_fit() {
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         });
@@ -1147,6 +1149,7 @@ fn test_vi_block_is_marked_when_a_later_stage_re_estimates() {
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         });
@@ -1291,6 +1294,7 @@ fn test_vi_accepts_block_sigma_cross_endpoint_fit() {
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         });
@@ -1390,6 +1394,7 @@ fn test_imp_accepts_block_sigma_cross_endpoint() {
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         });
@@ -1478,6 +1483,7 @@ fn test_saem_block_sigma_ofv_matches_foce() {
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         });
@@ -1574,6 +1580,7 @@ fn test_focei_block_sigma_ofv_finite_and_applies_interaction() {
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         });
@@ -1671,6 +1678,7 @@ fn block_sigma_selected_model_and_population() -> (CompiledModel, Population) {
         occasions: vec![1, 1],
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -2019,6 +2027,7 @@ fn analytical_oral_depot_infusion_with_compartments_derived_emits_warning() {
         occasions: Vec::new(),
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };

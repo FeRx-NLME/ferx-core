@@ -2939,18 +2939,18 @@ pub(crate) fn locf_decision_cov<'a>(
             }
         }
     }
-    // EVID=3/4 rows are records too (#1133), so a decision landing after a reset with no
-    // intervening obs/EVID=2 row must read the reset row's covariates rather than the
-    // pre-reset ones. Same strict `>` as the EVID=2 loop: an obs record at the same time
-    // keeps priority, matching the timeline's `Reset < Obs` ordering, where the obs is the
-    // later record and therefore the one in force.
-    for (r, &rt) in subject.reset_times.iter().enumerate() {
-        if rt <= t + 1e-12 && best.map_or(true, |(bt, _)| rt > bt) {
-            if let Some(cov) = subject.reset_covariates.get(r) {
-                best = Some((rt, cov));
-            }
-        }
-    }
+    // EVID=3/4 rows are deliberately NOT scanned here, even though they are records and
+    // their covariates are now stored (#1133). This function must mirror `segment_pk_at`,
+    // which resolves the decision-time PK from `AdaptiveRecordIndex` — a dose/pk-only/obs
+    // index that carries no resets. Teaching only this half would hand the controller the
+    // post-reset covariate against pre-reset PK parameters, and `verify_adaptive_snapshots`
+    // could not catch it because it re-derives `dcov` through this very helper.
+    //
+    // Making both reset-aware is the right end state, but it means adding resets to the
+    // `at` lookup WITHOUT adding them to `governing` (which must stay aligned with the
+    // dense engine's `is_record`, where a reset is excluded) — a change wider than the
+    // init-seed fix, and tracked separately. Until then a decision landing after a reset
+    // with no intervening record reads the pre-reset covariates, consistently on both.
     best.map(|(_, c)| c).unwrap_or(baseline)
 }
 

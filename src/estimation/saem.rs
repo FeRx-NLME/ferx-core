@@ -4739,6 +4739,7 @@ mod tests {
             occasions: vec![],
             obs_l2: Vec::new(),
             dose_occasions: vec![],
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };
@@ -4856,6 +4857,7 @@ mod tests {
             occasions: vec![],
             obs_l2: Vec::new(),
             dose_occasions: vec![],
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };
@@ -4958,6 +4960,7 @@ mod tests {
             occasions: vec![1u32, 1, 2, 2],
             obs_l2: Vec::new(),
             dose_occasions: vec![1u32],
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };
@@ -5073,6 +5076,7 @@ mod tests {
             occasions: vec![],
             obs_l2: Vec::new(),
             dose_occasions: vec![],
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };
@@ -5416,6 +5420,7 @@ mod tests {
             occasions: vec![],
             obs_l2: Vec::new(),
             dose_occasions: vec![],
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         }

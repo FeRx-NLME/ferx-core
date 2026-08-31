@@ -2419,6 +2419,7 @@ fn tv_cov_population() -> crate::types::Population {
             occasions: vec![1],
             obs_l2: Vec::new(),
             dose_occasions: vec![1],
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         }],
@@ -9121,6 +9122,7 @@ fn test_selected_error_block_sigma_cross_branch_covariance() {
         occasions: vec![1, 1],
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -9191,6 +9193,7 @@ fn test_selected_error_obs_keys_dispatch() {
         occasions: vec![1, 1],
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -18945,6 +18948,7 @@ fn covariate_nn_reads_time_varying_covariate_values() {
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         }
@@ -19063,6 +19067,7 @@ fn covariate_nn_input_missing_from_data_is_rejected() {
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         }],

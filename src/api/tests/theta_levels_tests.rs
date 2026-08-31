@@ -85,6 +85,7 @@ fn population(n_studies: usize, n_times: usize) -> Population {
                 occasions: Vec::new(),
                 obs_l2: Vec::new(),
                 dose_occasions: Vec::new(),
+                reset_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: Vec::new(),
             }
@@ -622,6 +623,7 @@ mod theta_gather_index_check {
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: Vec::new(),
         };

@@ -29,8 +29,13 @@ section of the SDLC for the versioning policy).
   analytic-sensitivity twin that supplies the FOCE/FOCEI gradient, the adaptive-dosing driver,
   and its frozen-schedule replay verifier), so fitted parameters, `predict()`, and
   `simulate_adaptive()` all move. Datasets with time-constant covariates, and models without an
-  `init(...)` seed, are unaffected. Note the remaining gap (#1135): an **analytical** model using
-  `[initial_conditions]` still drops its baseline at the first reset instead of re-depositing it.
+  `init(...)` seed, are unaffected. The same rule applies to the reset row's **occasion**: with an
+  `iov_column`, `$PK` at the reset runs under that row's own `OCC`, so a reset that opens a new
+  occasion re-seeds under the new occasion's κ rather than the previous record's — measured against
+  NONMEM in `nonmem_anchor/reset_init_snapshot_J.ctl` (42.0 under the reset row's occasion against
+  14.0 under the preceding record's). Note the remaining gaps: an **analytical** model using
+  `[initial_conditions]` still drops its baseline at the first reset instead of re-depositing it
+  (#1135), and an adaptive controller's decision-time covariate LOCF still skips reset rows (#1148).
 - **A steady-state dose with a lagtime is now seeded at the dose record, not equilibrated at the
   arrival (#1121).** Under time-varying covariates an `SS=1` dose carrying an `ALAG` had its
   periodic trough computed *at the lagged arrival*, entirely under the dose row's covariate

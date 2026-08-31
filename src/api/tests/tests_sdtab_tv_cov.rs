@@ -150,6 +150,7 @@ fn test_sdtab_ipred_honours_tv_covariates() {
         occasions: vec![1, 1, 1],
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -318,6 +319,7 @@ fn test_sdtab_iwres_uses_block_sigma_correlation() {
         occasions: vec![1],
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -479,6 +481,7 @@ fn test_simulate_honours_tv_covariates() {
         occasions: vec![1, 1, 1],
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
