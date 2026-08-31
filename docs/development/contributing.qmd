@@ -7,7 +7,7 @@ pagetitle: "Contributing to FeRx development"
 You don't need to be on the core team to move FeRx forward. There are three
 ways to contribute, in increasing order of involvement — pick whichever fits
 your time and expertise. **All three start or end as a GitHub Issue or PR**, so
-the work stays visible to everyone (see [Communication](sdlc.qmd#3-communication)).
+the work stays visible to everyone (see [Communication](sdlc.qmd#communication)).
 
 For the full process behind any of this, see the
 [Development Lifecycle (SDLC)](sdlc.qmd).
@@ -17,7 +17,7 @@ For the full process behind any of this, see the
 The single most valuable thing most users can do is **run FeRx on real models
 and data and report where it disagrees** with NONMEM / Monolix / nlmixr2 — or
 where it is slow, unclear, or crashes. Parity with established tools is our top
-priority (see [Gold-standard validation](sdlc.qmd#7-gold-standard-validation)),
+priority (see [Gold-standard validation](sdlc.qmd#gold-standard-validation)),
 so a concrete, reproducible mismatch is gold.
 
 - Install per the [Installation](../installation.qmd) page, then run your model
@@ -31,7 +31,7 @@ so a concrete, reproducible mismatch is gold.
 ## Open an Issue
 
 Issues are where all work starts (see [the development
-workflow](sdlc.qmd#4-the-development-workflow-with-ai)): bug reports, parity
+workflow](sdlc.qmd#the-development-workflow-with-ai)): bug reports, parity
 gaps, feature requests, and docs problems all belong here.
 
 How to write a good one:
@@ -44,7 +44,7 @@ How to write a good one:
 - **Feature:** state **Why, How, and the design choices**, and who benefits.
   Expect push-back or deferral if it serves a niche of one — see the
   "Christmas tree" guardrail in [Philosophy and quality
-  bar](sdlc.qmd#1-philosophy-and-quality-bar).
+  bar](sdlc.qmd#philosophy-and-quality-bar).
 - Add it to the GitHub **Project view** so the team has visibility and can
   triage it.
 
@@ -54,26 +54,26 @@ contribution on its own.
 ## Open a Pull Request
 
 Ready to write code or docs? The full process is in the
-[SDLC](sdlc.qmd#4-the-development-workflow-with-ai); the short version for a
+[SDLC](sdlc.qmd#the-development-workflow-with-ai); the short version for a
 contributor:
 
 1. **Claim the work.** Comment on the Issue you want to take (or open one
    first) so effort isn't duplicated.
 2. **Branch off the latest `main`** (trunk-based — see [Git
-   workflow](sdlc.qmd#5-git-workflow)); keep it focused on one issue.
+   workflow](sdlc.qmd#git-workflow)); keep it focused on one issue.
 3. **Test it.** Add a test at the right tier (see the [testing
-   pyramid](sdlc.qmd#8-cicd-and-quality-gates)); for anything numerical add a
+   pyramid](sdlc.qmd#cicd-and-quality-gates)); for anything numerical add a
    NONMEM comparison ([Gold-standard
-   validation](sdlc.qmd#7-gold-standard-validation)). Every feature needs a
+   validation](sdlc.qmd#gold-standard-validation)). Every feature needs a
    test; every bug fix needs a regression test that fails without it.
 4. **Keep both sides in sync.** ferx-core ↔ ferx-r ([Cross-repo
-   synchronization](sdlc.qmd#10-cross-repo-synchronization)) and docs updated;
+   synchronization](sdlc.qmd#cross-repo-synchronization)) and docs updated;
    on the R side, regenerate `man/` and keep `R/*.R` ASCII-only (see [Pull
-   requests](sdlc.qmd#6-pull-requests)).
+   requests](sdlc.qmd#pull-requests)).
 5. **Fill every section of the PR template**, including the cross-repo table.
 6. **Expect review.** Run `/code-review` on large/numerical PRs; anything
    touching design, the DSL, or estimation also gets a human core-team review.
-7. **Finish the [Definition-of-done checklist](sdlc.qmd#12-definition-of-done)**
+7. **Finish the [Definition-of-done checklist](sdlc.qmd#definition-of-done)**
    before marking it ready.
 
 ### If the `Public API baseline` job goes red
@@ -94,7 +94,7 @@ tools/update-public-api.sh   # regenerate, then commit the result
 and say in the PR description which caller needs each added item and why the
 existing surface does not suffice. Do not reach for `#[doc(hidden)]` — it hides
 the item from the baseline, so a test rejects it outright. See
-[SDLC §8.7](sdlc.qmd#87-the-public-api-gate).
+[SDLC §8.7](sdlc.qmd#the-public-api-gate).
 
 **Good first contributions:** add a NONMEM-comparison test for a model we don't
 cover yet, improve a docs page, or fix a reproducible bug with a regression

@@ -354,7 +354,7 @@ The same modifier rides an IOV `kappa` declaration, where it weights the
 *random effect* rather than the residual:
 `kappa KAPPA_EMAX ~ 2.0 (sd) weight = NARM` declares
 `κ ~ N(0, Ω_IOV / N)` — the arm-level random effect of a longitudinal MBMA. See
-[Sample-size-weighted IOV](iov.qmd#sample-size-weighted-iov-weight-).
+[Sample-size-weighted IOV](iov.qmd#sample-size-weighted-iov-weight-...).
 
 ### Simulating an arm that is not in the data
 

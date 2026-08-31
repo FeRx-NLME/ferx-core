@@ -4,7 +4,7 @@ All notable changes to **ferx-core** are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
-(see the [Releases](https://ferx-nlme.github.io/ferx-core/development/sdlc.html#9-releases)
+(see the [Releases](https://ferx-nlme.github.io/ferx-core/development/sdlc.html#releases)
 section of the SDLC for the versioning policy).
 
 <!--
@@ -127,6 +127,15 @@ section of the SDLC for the versioning policy).
   top of them, so a tool and the CLI cannot diverge in how a model is loaded.
 
 ### Fixed
+- **41 dead links and 11 duplicate anchors in the documentation (#1163).** Every internal
+  documentation link now resolves, anchor included: numbered headings (`## 3. Communication` is
+  addressed as `#communication`, not `#3-communication`), anchors hand-written with a double
+  hyphen where the generated id has one, and links pointing at sections that never existed.
+  Repeated headings on a page — four sections called "Syntax" on the absorption page, addressed
+  as `#syntax`, `#syntax-1`, `#syntax-2`, `#syntax-3` — were given distinct titles, so some
+  anchors on the published site changed. A new `docs-lint` check keeps all four properties true
+  on every PR; see the [Docs linter](https://ferx-nlme.github.io/ferx-core/development/docs-lint.html)
+  page.
 - **An EVID=3/4 reset now re-seeds `[odes] init(...)` from the reset row's own covariates
   (#1133).** A reset row is a NONMEM data record — `$PK` runs at it — but ferx restarted the
   episode using the *previous* record's covariate snapshot, so a covariate-driven

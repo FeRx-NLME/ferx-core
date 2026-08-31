@@ -208,7 +208,7 @@ ETA" would be false for them:
   states in its own warning; repeating "add an ETA" on top of that would be both
   false and contradictory.
 
-#### Damping the numerical M-step (`mstep_damping`) {#what-saem-does-about-it-now}
+### Damping the numerical M-step (`mstep_damping`) {#what-saem-does-about-it-now}
 
 The numerical θ/σ M-step result is blended in as a Robbins-Monro step
 `θ ← θ + γ_θ·(θ* − θ)` rather than assigned outright, with `γ_θ` capped at

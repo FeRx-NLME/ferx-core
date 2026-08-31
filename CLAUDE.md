@@ -39,8 +39,14 @@ ferx-core/                       # repo root = ferx-core package + workspace roo
 ├─ api/ferx-core-public-api.txt  # public-API baseline, diffed in CI
 └─ crates/
    ├─ ferx-tools/                # depends on ferx-core
-   └─ ferx-cli/                  # depends on ferx-core; [[bin]] name = "ferx"
+   ├─ ferx-cli/                  # depends on ferx-core; [[bin]] name = "ferx"
+   └─ docs-lint/                 # dev tooling; depends on NOTHING (see Documentation)
 ```
+
+`docs-lint` sits outside the layering above: it is a structural linter for
+`docs/**/*.qmd`, it depends on no crate in the workspace (not even `ferx-core`),
+and nothing may depend on it. Keeping it dependency-free is what lets its CI job
+be seconds of compile instead of landing on the `ferx-core` compile path (#969).
 
 **The root package must stay `ferx-core`.** `ferx-r/src/rust/.cargo/config.toml`
 patches `ferx-core = { path = "../../../ferx-core" }` — the repo *root*. Moving
@@ -106,13 +112,13 @@ local run of 158 binaries / 4634 tests reported clean.
 So run the fast gates before pushing:
 
 ```bash
-tools/preflight.sh            # fmt, the 5 cargo check feature sets, clippy, public-API
+tools/preflight.sh            # fmt, the 5 cargo check feature sets, clippy, docs, public-API
 tools/preflight.sh check      # just the check matrix, for a tight edit loop
 tools/preflight.sh --list     # show the commands without running them
 ```
 
-`.github/workflows/ci.yml` invokes this same script for its `Check`, `Clippy`
-and `Format` jobs, and `.githooks/pre-commit` calls its `fmt` group, so the
+`.github/workflows/ci.yml` invokes this same script for its `Check`, `Clippy`,
+`Format` and `Docs lint` jobs, and `.githooks/pre-commit` calls its `fmt` group, so the
 local gate, the hook and the CI gate cannot drift — the same contract
 `tools/update-public-api.sh` uses for the API baseline. **Add a new gate to the
 script, not to the workflow**; groups are enumerated once, in the `ALL_GROUPS`
@@ -120,7 +126,11 @@ array. On failure it names the CI job that would have gone red.
 
 It does **not** cover the test jobs. `cargo check --tests` compiles the test
 targets and runs nothing, so `Tests + coverage (core)` can still go red after a
-green preflight. This gates compilation and lint, not behaviour.
+green preflight. This gates compilation and lint, not behaviour. The one
+exception is the `docs` group, which *runs* `cargo test -p docs-lint`: that
+crate's gate is its test run — a filesystem walk over `docs/`, not a fit — and
+it also carries `cargo clippy -p docs-lint`, since the `clippy` group is scoped
+to `ferx-core` and its two library members and would leave it unlinted.
 
 Two traps it exists to cover: clippy runs `--all-targets` (without it, every
 `#[cfg(test)]` module and all of `tests/` goes unlinted — #1023), and the
@@ -246,6 +256,44 @@ Any user-visible feature (new fit option, new estimator, new file-format directi
 - `docs/model-file/individual-parameters.qmd` for DSL syntax.
 - `docs/estimation/*.qmd` for estimator-specific behaviour.
 - `docs/faq.qmd` for user-facing explanations / comparisons to NONMEM / nlmixr2.
+
+### The docs are linted at PR time — `crates/docs-lint` (#1163)
+
+`docs/**/*.qmd` has a structural gate that runs on every PR (the `Docs lint` CI
+job, via `tools/preflight.sh docs`). Run it yourself after editing a page:
+
+```bash
+cargo run -p docs-lint -- --check          # what CI runs
+cargo run -p docs-lint -- --update-baseline
+```
+
+Four rules, all structural — it checks *shape*, never prose:
+
+| | Rule |
+|---|---|
+| R1 | a section with no subsections stays under 5,000 characters (~2,000 tokens), so a retrieval hit returns a usable chunk |
+| R2 | never skip a heading level (an `h1` followed by an `h3` attaches to the wrong parent) |
+| R3 | no two headings on a page may generate the same id |
+| R4 | internal links must resolve, **including the `#anchor`** |
+
+Two things to know before you fight it:
+
+- **R4 knows what pandoc actually generates**, which is rarely what a hand-written
+  anchor assumes. `## 3. Communication` is `#communication` — the number is
+  dropped. `## A — b` is `#a-b`, a *single* hyphen, because the em-dash is
+  deleted and the spaces around it collapse. `` ## Modeled duration (`D{n}`) ``
+  is `#modeled-duration-dn`. The algorithm and its traps live in
+  `docs/development/docs-lint.qmd` and in `crates/docs-lint/src/slug.rs`; read
+  one of them before hand-writing an anchor.
+- **R1 has a baseline** (`docs/.lint-baseline`) holding the pages that were
+  already too long when the gate landed. It is a ratchet: an entry may shrink,
+  never grow, and an entry naming a section that no longer exists is itself a
+  failure. Do not add new entries — split the section instead. For a chunk that
+  genuinely cannot be split, put `<!-- lint-disable R1 -->` on the line above its
+  heading **with a reason**, and keep that rare.
+
+`docs-lint` depends on nothing, so it compiles in seconds and never touches the
+`ferx-core` build cache. Keep it that way.
 
 ## Architecture
 

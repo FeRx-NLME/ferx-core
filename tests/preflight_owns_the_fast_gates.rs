@@ -543,10 +543,11 @@ fn preflight_is_executable_and_lists_every_group() {
     // commands are actually *enforced* is
     // `a_failing_gate_fails_the_script_from_every_position`; `--list` executes nothing and
     // can never show it.
-    let expected: [(&str, usize); 4] = [
+    let expected: [(&str, usize); 5] = [
         ("fmt", 1),        // cargo fmt --all -- --check
         ("check", 5),      // ci · ci,survival,slow-tests · ci,markov · ci,nn,slow-tests · members
         ("clippy", 2),     // ferx-core --all-targets · members
+        ("docs", 2),       // cargo test -p docs-lint · cargo clippy -p docs-lint
         ("public-api", 1), // tools/update-public-api.sh --check
     ];
 

@@ -217,6 +217,33 @@ jobs:
       - name: cargo fmt (via tools/preflight.sh)
         run: tools/preflight.sh fmt
 
+  docs-lint:
+    name: Docs lint
+    runs-on: ubuntu-latest
+    # Deliberately on `ci.yml` and not on `docs.yml`: that workflow only runs on
+    # a push to `main`, which is too late to block a bad page. `docs-lint`
+    # depends on nothing and never links `ferx-core`, so this job is seconds of
+    # compile, not minutes (#1163).
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install stable toolchain
+        # `-c clippy`: the `docs` group lints `docs-lint` itself, which no other
+        # job covers — the `Clippy` job is scoped to ferx-core and its members.
+        run: rustup toolchain install stable --profile minimal -c clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: docs-lint
+
+      # Unit tests (the pandoc id algorithm) plus the corpus check over
+      # `docs/**/*.qmd`, in one step — through `tools/preflight.sh` for the same
+      # reason as `Check` / `Clippy` / `Format` (#1157): the local gate and the
+      # CI gate are one list, so they cannot drift.
+      - name: cargo test -p docs-lint (via tools/preflight.sh)
+        run: tools/preflight.sh docs
+
   coverage:
     name: Tests + coverage (full, slow-tests)
     runs-on: ubuntu-latest
