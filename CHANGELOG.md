@@ -61,6 +61,22 @@ section of the SDLC for the versioning policy).
   top of them, so a tool and the CLI cannot diverge in how a model is loaded.
 
 ### Fixed
+- **An EVID=3/4 reset now re-seeds `[odes] init(...)` from the reset row's own covariates
+  (#1133).** A reset row is a NONMEM data record — `$PK` runs at it — but ferx restarted the
+  episode using the *previous* record's covariate snapshot, so a covariate-driven
+  `init(state) = <expr>` began the new episode on a stale value. With `init(central) = 10*WT`
+  and `WT` stepping 70 → 140 at the reset, every post-reset prediction was a factor of two out
+  against NONMEM 7.6.0. Fixed in all four affected engines (the dense ODE predictor, the
+  analytic-sensitivity twin that supplies the FOCE/FOCEI gradient, the adaptive-dosing driver,
+  and its frozen-schedule replay verifier), so fitted parameters, `predict()`, and
+  `simulate_adaptive()` all move. Datasets with time-constant covariates, and models without an
+  `init(...)` seed, are unaffected. The same rule applies to the reset row's **occasion**: with an
+  `iov_column`, `$PK` at the reset runs under that row's own `OCC`, so a reset that opens a new
+  occasion re-seeds under the new occasion's κ rather than the previous record's — measured against
+  NONMEM in `nonmem_anchor/reset_init_snapshot_J.ctl` (42.0 under the reset row's occasion against
+  14.0 under the preceding record's). Note the remaining gaps: an **analytical** model using
+  `[initial_conditions]` still drops its baseline at the first reset instead of re-depositing it
+  (#1135), a reset row whose occasion carries no kappa group falls back to kappa = 0 inconsistently across engines (#1153), and an adaptive controller's decision-time covariate LOCF still skips reset rows (#1148).
 - **A steady-state dose with a lagtime is now seeded at the dose record, not equilibrated at the
   arrival (#1121).** Under time-varying covariates an `SS=1` dose carrying an `ALAG` had its
   periodic trough computed *at the lagged arrival*, entirely under the dose row's covariate

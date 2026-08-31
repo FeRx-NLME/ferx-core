@@ -684,6 +684,7 @@ mod tests {
             occasions: vec![],
             obs_l2: Vec::new(),
             dose_occasions: vec![],
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
             covariates: HashMap::new(),
@@ -692,6 +693,7 @@ mod tests {
             pk_only_times: vec![],
             pk_only_covariates: vec![],
             reset_times: vec![],
+            reset_covariates: Vec::new(),
         };
 
         let (t, c) = first_dose_obs(&subject);

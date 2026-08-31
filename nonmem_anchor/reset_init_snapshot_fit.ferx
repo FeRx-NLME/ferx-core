@@ -1,0 +1,32 @@
+# ferx twin of nonmem_anchor/reset_init_snapshot_{A,B,C}.ctl (#1133).
+#
+# `WT` reaches the prediction ONLY through the `init(central)` seed — `CL` and `V`
+# are plain thetas — so any divergence from NONMEM here is the reset re-seed's
+# snapshot and nothing else.
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVBASE(10.0, 0.0, 1e15)
+  omega ETA_CL ~ 0.0
+  sigma PROP ~ 0.01
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  BASE = TVBASE * WT
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central)  = BASE
+  d/dt(central)  = -(CL/V) * central
+[covariates]
+  WT continuous
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  method = focei
+  maxiter = 0
+  covariance = false
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12

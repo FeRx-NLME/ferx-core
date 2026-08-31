@@ -658,8 +658,18 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     // event-time-shift family as a compartment lagtime — so it forces the event-driven walk
     // even when the subject has no TV covariates and no compartment lagtime.
     let has_route_lag = model.has_route_absorption_lag();
+    // A subject carrying per-reset covariate snapshots is per-event too (#1133), even when
+    // `has_tv_covariates()` is false — which a hand-assembled subject (FREM, the R glue, a
+    // fixture) can be. Production's `subject_needs_per_event_pk` admits it and seeds
+    // `init(...)` from the reset row's map; declining here would route it to the STATIC
+    // dual walk, which re-seeds from one subject-static snapshot. That is a wrong analytic
+    // gradient rather than an FD fallback, and `Dual2`-vs-FD parity cannot see it because
+    // FD perturbs the twin's own value path. Mirrors the clause in
+    // `subject_needs_per_event_pk` and `iov_walk_per_event`.
+    let has_reset_snapshots = !subject.reset_covariates.is_empty();
     if !ode_analytical_supported(model)
         || !(subject.has_tv_covariates()
+            || has_reset_snapshots
             || model.has_lagtime()
             || has_route_lag
             || has_ss
@@ -759,10 +769,12 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     // it; `init` only affects the pre-SS-dose segments, which the walk carries via `init_state`
     // (validated by `ode_provider_tvcov_init_ss_matches_production`).
     // An EVID 3/4 **reset** also composes with `init` (#486): production re-applies
-    // `init(&last_pk.values)` at each reset, and the `K_RESET` branch of `integrate_tvcov_g`
-    // now mirrors that by re-seeding the state from the reset-event snapshot (via the shared
+    // `init(&pk_at_reset[idx].values)` at each reset — the reset ROW's own snapshot, since an
+    // EVID=3/4 row is a data record (#1133) — and the `K_RESET` branch of `integrate_tvcov_g`
+    // mirrors that by re-seeding the state from `pk_at_reset[idx]` (via the shared
     // `init_taylor_seed_at`, carrying `∂init/∂(θ,η)` at that snapshot) instead of zeroing —
-    // validated by `ode_provider_tvcov_init_reset_matches_production`.
+    // validated by `ode_provider_init_reset_midtimeline_reads_the_reset_rows_snapshot`, whose
+    // covariate moves at the reset row so the snapshot is observable.
     // With A–F all composing, `init(...)` is fully analytic on the non-IOV event-driven walk;
     // no per-feature FD clause remains here (IOV is gated separately in `ode_iov_supported`).
     // #530: modeled-`RATE`/duration doses are resolved from their PK slot as a live jet
@@ -1606,7 +1618,8 @@ fn tvcov_init_state<T: crate::sens::num::PkNum>(
 /// strict `t < best_t`, so at an exact tie the earliest-considered snapshot wins — dose over
 /// obs over pk-only, identical to production's `consider`. `None` when the subject has no
 /// records. Shared by [`tvcov_init_state`] (the initial `init` seed) and the event-driven
-/// walk's `last_params` seed (the reset re-seed's snapshot, #486 review) so the two can't drift.
+/// walk's `last_params` seed (#486 review) so the two can't drift. Since #1133 the reset
+/// re-seed does NOT read `last_params` — it reads the reset row's own `pk_at_reset[idx]`.
 fn first_record_pk<'a, T: crate::sens::num::PkNum>(
     subject: &Subject,
     pk_at_dose: &'a [Vec<T>],
@@ -1640,9 +1653,9 @@ fn first_record_pk<'a, T: crate::sens::num::PkNum>(
 /// snapshot `snap` (already seeded on `(θ, η[, κ])`), as a second-order Taylor of `init` in the
 /// PK params about `snap.val()`. Shared by [`tvcov_init_state`] (which selects the first-record
 /// snapshot, production's `init_pk`) and the event-driven walk's **EVID 3/4 reset** re-seed
-/// (which uses the reset-event snapshot — production's `last_pk`, #486): production re-applies
-/// `init(&last_pk.values)` at each reset, so the dual walk must rebuild the seed from the params
-/// in effect there, not carry the one subject-level jet.
+/// (which uses the reset ROW's own snapshot — production's `pk_at_reset[idx]`, #486 / #1133):
+/// production re-applies `init(...)` at each reset from the `$PK` that runs at that row, so the
+/// dual walk must rebuild the seed from those params, not carry the one subject-level jet.
 ///
 /// The `∂init/∂p` derivatives come from the shared [`init_fd_derivs`] stencil. Each delta
 /// `(p_i − p̄_i)` has value 0 and carries the snapshot's θ/η[/κ] jet, so `T`'s own product rule
@@ -2285,6 +2298,7 @@ fn integrate_tvcov_readout<T: crate::sens::num::PkNum>(
     pk_at_dose: &[Vec<T>],
     pk_at_obs: &[Vec<T>],
     pk_at_pk_only: &[Vec<T>],
+    pk_at_reset: &[Vec<T>],
 ) -> Vec<T> {
     // `ode_tvcov_supported` (checked by both TV-cov entry points before reaching
     // here) calls `ode_analytical_supported`, which declines a model whose `ode_spec`
@@ -2374,6 +2388,7 @@ fn integrate_tvcov_readout<T: crate::sens::num::PkNum>(
         pk_at_dose,
         pk_at_obs,
         pk_at_pk_only,
+        pk_at_reset,
         &f_bio_at_dose,
         &init_state,
         &model.pk_indices,
@@ -2426,7 +2441,7 @@ fn seed_tvcov_snapshots<T: Clone>(
     subject: &Subject,
     key_time: bool,
     mut seed: impl FnMut(&std::collections::HashMap<String, f64>, f64) -> Option<Vec<T>>,
-) -> Option<(Vec<Vec<T>>, Vec<Vec<T>>, Vec<Vec<T>>)> {
+) -> Option<(Vec<Vec<T>>, Vec<Vec<T>>, Vec<Vec<T>>, Vec<Vec<T>>)> {
     use std::collections::HashMap;
     // Canonical, hashable key for a covariate snapshot. `f64` is neither `Hash` nor
     // `Eq`, so key on `to_bits` (name-sorted); `to_bits` is total, so `NaN` keys are
@@ -2462,7 +2477,14 @@ fn seed_tvcov_snapshots<T: Clone>(
     let pk_at_pk_only: Vec<Vec<T>> = (0..subject.pk_only_times.len())
         .map(|m| seed_for(subject.pk_only_cov(m), subject.pk_only_times[m]))
         .collect::<Option<_>>()?;
-    Some((pk_at_dose, pk_at_obs, pk_at_pk_only))
+    // EVID=3/4 rows are records too (#1133): the reset re-seeds `init(...)` from the reset
+    // row's own snapshot, so the twin needs that snapshot's jet — `∂init/∂(θ,η)` is
+    // evaluated at whichever snapshot the value path used, and mirroring a stale one
+    // differentiates a different function than the one predicted.
+    let pk_at_reset: Vec<Vec<T>> = (0..subject.reset_times.len())
+        .map(|r| seed_for(subject.reset_cov(r), subject.reset_times[r]))
+        .collect::<Option<_>>()?;
+    Some((pk_at_dose, pk_at_obs, pk_at_pk_only, pk_at_reset))
 }
 
 /// Time-varying-covariate outer (`Dual2<M>`, `M = n_theta + n_eta`) sensitivities
@@ -2485,7 +2507,7 @@ fn run_subject_tvcov<const M: usize>(
     // covariates but different times don't share a (time-dependent) seed (#486).
     // `seed_pk_dual2` is infallible, so wrap it in `Some`; the `?` never fires here.
     let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
-    let (pk_at_dose, pk_at_obs, pk_at_pk_only) =
+    let (pk_at_dose, pk_at_obs, pk_at_pk_only, pk_at_reset) =
         seed_tvcov_snapshots::<Dual2<M>>(subject, uses_time, |cov, time| {
             Some(seed_pk_dual2::<M>(model, prog, theta, eta, cov, time))
         })?;
@@ -2496,6 +2518,7 @@ fn run_subject_tvcov<const M: usize>(
         &pk_at_dose,
         &pk_at_obs,
         &pk_at_pk_only,
+        &pk_at_reset,
     );
 
     let mut out = Vec::with_capacity(preds.len());
@@ -2773,6 +2796,12 @@ pub(crate) fn build_iov_scale_jets<T: crate::sens::num::PkNum>(
 fn iov_walk_per_event(model: &CompiledModel, subject: &Subject) -> bool {
     subject.has_tv_covariates()
         || !subject.pk_only_covariates.is_empty()
+        // EVID=3/4 snapshots (#1133), mirroring production's `subject_needs_per_event_pk`.
+        // Without this clause a subject carrying only `reset_covariates` takes the static
+        // branch here while `predict_iov` reads `reset_cov(r)` unconditionally, so the twin
+        // would differentiate `init(...)` at the subject-static covariates while the value
+        // path predicts at the reset row's — a divergence `Dual2`-vs-FD cannot see.
+        || !subject.reset_covariates.is_empty()
         || crate::parser::model_parser::compiled_model_uses_time_builtin(model)
 }
 
@@ -2838,7 +2867,8 @@ fn run_subject_iov<const M: usize>(
     // EVID=2 pk-only events carry no occasion → κ held at 0 (single-sourced with the
     // closed-form provider, #598 review). Built lazily inside the closure so the common
     // IOV subject with no EVID=2 records pays no allocation — the closure is only invoked
-    // when `seed_iov_events` actually has pk-only records to seed.
+    // when `seed_iov_events` actually has pk-only records to seed, or (#1133) when a reset
+    // row's occasion cannot be resolved from any record, which is a record-free subject.
     let seed_pk_only_cov = |cov: &std::collections::HashMap<String, f64>,
                             time: f64|
      -> Option<Vec<Dual2<M>>> {
@@ -2881,7 +2911,7 @@ fn run_subject_iov<const M: usize>(
         Some(build_all_groups()?)
     };
 
-    let (pk_at_dose, pk_at_obs, pk_at_pk_only) = seed_iov_events::<Dual2<M>>(
+    let (pk_at_dose, pk_at_obs, pk_at_pk_only, pk_at_reset) = seed_iov_events::<Dual2<M>>(
         subject,
         &occ_to_k,
         k_groups,
@@ -2924,6 +2954,7 @@ fn run_subject_iov<const M: usize>(
         &pk_at_dose,
         &pk_at_obs,
         &pk_at_pk_only,
+        &pk_at_reset,
     );
 
     // Read `∂f/∂(θ, stacked-η)` (+ 2nd order) off the dual — the negative-readout clamp
@@ -2998,7 +3029,7 @@ fn seed_iov_events<T: Clone>(
         f64,
     ) -> Option<Vec<T>>,
     mut seed_pk_only_cov: impl FnMut(&std::collections::HashMap<String, f64>, f64) -> Option<Vec<T>>,
-) -> Option<(Vec<Vec<T>>, Vec<Vec<T>>, Vec<Vec<T>>)> {
+) -> Option<(Vec<Vec<T>>, Vec<Vec<T>>, Vec<Vec<T>>, Vec<Vec<T>>)> {
     // `per_event`: seed each event at its own (occasion, covariate snapshot, time)
     // rather than sharing one source per occasion group. True for TV covariates,
     // EVID=2 covariate breakpoints, OR a `TIME`-built-in structural parameter (the
@@ -3020,7 +3051,26 @@ fn seed_iov_events<T: Clone>(
         let pk_at_pk_only = (0..subject.pk_only_times.len())
             .map(|m| seed_pk_only_cov(subject.pk_only_cov(m), subject.pk_only_times[m]))
             .collect::<Option<_>>()?;
-        Some((pk_at_dose, pk_at_obs, pk_at_pk_only))
+        // EVID=3/4 reset rows (#1133): the reset row's own covariate snapshot, under the
+        // occasion [`crate::pk::reset_row_occasion`] resolves — the record `last_pk` held
+        // there before #1133, so the covariate fix does not also move κ. This must match
+        // production's `predict_iov` exactly: a twin that seeded the reset under a
+        // different κ would differentiate a different function than the one predicted, and
+        // `Dual2`-vs-FD parity could not see it (FD perturbs the twin's own value path).
+        // Falls back to the occasion-less seeder only when the subject has no record to
+        // take an occasion from, which is `predict_iov`'s fallback too.
+        let pk_at_reset = (0..subject.reset_times.len())
+            .map(|r| {
+                let t = subject.reset_times[r];
+                match crate::pk::reset_row_occasion(subject, r)
+                    .and_then(|occ| occ_to_k.get(&occ).copied())
+                {
+                    Some(g) => seed_group_cov(g, subject.reset_cov(r), t),
+                    None => seed_pk_only_cov(subject.reset_cov(r), t),
+                }
+            })
+            .collect::<Option<_>>()?;
+        Some((pk_at_dose, pk_at_obs, pk_at_pk_only, pk_at_reset))
     } else {
         // Reuse the caller's per-group seeding when supplied (the scale path already built
         // it), else build it here. Same source either way (#575 review — no double seed).
@@ -3048,7 +3098,21 @@ fn seed_iov_events<T: Clone>(
             let seeded = seed_pk_only_cov(static_cov, 0.0)?;
             vec![seeded; subject.pk_only_times.len()]
         };
-        Some((pk_at_dose, pk_at_obs, pk_at_pk_only))
+        // Static branch, EVID=3/4 rows (#1133): covariates do not move, so `static_cov` IS
+        // the reset row's own snapshot and the covariate question is vacuous — but κ is
+        // not. Read it from `group_dual` at the occasion [`crate::pk::reset_row_occasion`]
+        // resolves, exactly as the dose and obs vectors above do, so this branch matches
+        // `predict_iov`. Deliberately NOT routed through `seed_pk_only_cov`: that would
+        // both zero κ and make a fallible call on a path that previously could not make one
+        // (an IOV subject with resets and no EVID=2 rows would newly be able to decline to
+        // FD).
+        let pk_at_reset = (0..subject.reset_times.len())
+            .map(|r| {
+                let occ = crate::pk::reset_row_occasion(subject, r)?;
+                Some(group_dual[*occ_to_k.get(&occ)?].clone())
+            })
+            .collect::<Option<_>>()?;
+        Some((pk_at_dose, pk_at_obs, pk_at_pk_only, pk_at_reset))
     }
 }
 
@@ -3181,7 +3245,7 @@ fn run_subject_iov_eta<const N: usize>(
         Some(build_all_groups()?)
     };
 
-    let (pk_at_dose, pk_at_obs, pk_at_pk_only) = seed_iov_events::<Dual1<N>>(
+    let (pk_at_dose, pk_at_obs, pk_at_pk_only, pk_at_reset) = seed_iov_events::<Dual1<N>>(
         subject,
         &occ_to_k,
         k_groups,
@@ -3222,6 +3286,7 @@ fn run_subject_iov_eta<const N: usize>(
         &pk_at_dose,
         &pk_at_obs,
         &pk_at_pk_only,
+        &pk_at_reset,
     );
 
     let mut out = Vec::with_capacity(preds.len());
@@ -3331,7 +3396,7 @@ fn run_subject_tvcov_eta<const N: usize>(
 
     // Dedup identical covariate snapshots via the shared helper (#451 re-review #8).
     let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
-    let (pk_at_dose, pk_at_obs, pk_at_pk_only) =
+    let (pk_at_dose, pk_at_obs, pk_at_pk_only, pk_at_reset) =
         seed_tvcov_snapshots::<Dual1<N>>(subject, uses_time, |cov, time| {
             seed_pk_dual1::<N>(model, prog, theta, eta, cov, time)
         })?;
@@ -3342,6 +3407,7 @@ fn run_subject_tvcov_eta<const N: usize>(
         &pk_at_dose,
         &pk_at_obs,
         &pk_at_pk_only,
+        &pk_at_reset,
     );
 
     let mut out = Vec::with_capacity(preds.len());
@@ -4288,6 +4354,10 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     pk_at_dose: &[Vec<T>],
     pk_at_obs: &[Vec<T>],
     pk_at_pk_only: &[Vec<T>],
+    // Reset-row snapshots (#1133), parallel to `subject.reset_times`. Read only by the
+    // `K_RESET` branch, where the `init(...)` re-seed must use the reset ROW's own `$PK`
+    // — the same snapshot production's `pk_at_reset[idx]` uses.
+    pk_at_reset: &[Vec<T>],
     f_bio_at_dose: &[T],
     init_state: &[T],
     // Differentiated PK slots, for re-seeding `init(...)` at an EVID 3/4 reset (#486). Only
@@ -4302,6 +4372,9 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     let mut states: Vec<Vec<T>> = vec![vec![T::from_f64(0.0); n_states]; n_obs];
 
     debug_assert_eq!(pk_at_pk_only.len(), subject.pk_only_times.len());
+    // Hard, not `debug_`: `pk_at_reset[idx]` at the `K_RESET` branch is a release-live
+    // index, and its production twin (`ode_predictions_event_driven`) asserts always (#1133).
+    assert_eq!(pk_at_reset.len(), subject.reset_times.len());
 
     // Per-dose lagtime: dose `k` arrives at `d.time + lag_val(k)`, with its lag read from
     // `pk_at_dose[k][dose_lag_slot[k]]` — the bare `PK_IDX_LAGTIME` slot or, for a
@@ -4600,8 +4673,8 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             + zero_windows.len()
             + route_onsets.len(),
     );
-    for &rt in &subject.reset_times {
-        tl.push((rt, K_RESET, 0));
+    for (r, &rt) in subject.reset_times.iter().enumerate() {
+        tl.push((rt, K_RESET, r));
     }
     for (k, d) in subject.doses.iter().enumerate() {
         // The dose row itself (#1073) — unconditional, mirroring production. With no
@@ -4932,12 +5005,12 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     // infusion-end (neither carries a PK record — mirrors production's `last_pk`). Seeded with
     // the **first-record** snapshot (production's `init_pk`, dose-preferred on ties), not an
     // arbitrary array-first slice: a reset that is itself the first event (an EVID=4 reset+dose
-    // at `t = 0`) re-seeds `init` from `last_params` here (`init_taylor_seed_at` in the
-    // `K_RESET` branch), and production re-applies `init(&last_pk.values)` with
-    // `last_pk = init_pk.unwrap_or_default()` there — so the snapshot must match production's
-    // `init_pk`, or the reset re-seed (hence its gradient) diverges for that edge case
-    // (#486 review — Copilot). For every later reset `last_params` is overwritten by the most
-    // recent record, exactly as production updates `last_pk` (#486).
+    // at `t = 0`) is the one case where the two could diverge on the seed, and since #1133 the
+    // `K_RESET` branch reads `pk_at_reset[idx]` — the reset row's own snapshot — on both sides,
+    // so `last_params` no longer feeds the re-seed at all. It still seeds the walk's carry, and
+    // is still taken from `first_record_pk` (production's `init_pk`, dose-preferred on ties)
+    // rather than an arbitrary array-first slice (#486 review — Copilot). For every later
+    // record `last_params` is overwritten, exactly as production updates `last_pk` (#486).
     let mut last_params: &[T] =
         first_record_pk::<T>(subject, pk_at_dose, pk_at_obs, pk_at_pk_only).unwrap_or(&[]);
 
@@ -6119,20 +6192,34 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             }
         } else {
             // EVID 3/4 reset. Production re-applies the initial conditions here —
-            // `u = ode.initial_state(&last_pk.values)` — which restores each `init(...)`
-            // compartment to its value evaluated with the params in effect at the reset
-            // (`last_pk`) and zeros every compartment without an `init`. Mirror that on the dual
-            // walk (#486): with an `init(...)` present, re-seed the state from the reset-event
-            // snapshot via the shared Taylor seed — `params` is `last_params` for a `K_RESET`
-            // event (the `_` arm of the segment-params match), i.e. the most-recent record's PK,
-            // matching production's `last_pk` — so the post-reset jet carries the correct
-            // `∂init/∂(θ,η)` at *that* snapshot rather than the subject-level first-record seed.
-            // With no `init(...)` the seed's `base`/derivatives are all zero, so this reduces to
-            // the previous "zero every compartment" behaviour (byte-identical). For EVID=4 the
-            // same-time dose sorts after the reset (`K_RESET < K_DOSE`), so it lands on the
-            // re-seeded state.
+            // `u = ode.initial_state(&pk_at_reset[idx].values)` — which restores each
+            // `init(...)` compartment to its value evaluated at the RESET ROW'S OWN `$PK`
+            // snapshot and zeros every compartment without an `init`. Mirror that on the dual
+            // walk (#486): with an `init(...)` present, re-seed the state via the shared Taylor
+            // seed at `pk_at_reset[idx]` — the same jet source production reads — so the
+            // post-reset state carries `∂init/∂(θ,η)` at the snapshot the value path actually
+            // used. With no `init(...)` the seed's `base`/derivatives are all zero, so this
+            // reduces to the previous "zero every compartment" behaviour (byte-identical). For
+            // EVID=4 the same-time dose sorts after the reset (`K_RESET < K_DOSE`), so it lands
+            // on the re-seeded state.
+            //
+            // This deliberately does NOT use `params` (which is `last_params` for a `K_RESET`
+            // event): before #1133 both engines read the previous record, and `Dual2`-vs-FD
+            // parity could not tell — FD perturbs this same walk's value path, so a shared
+            // wrong convention moves both sides together. The oracle that separates them is
+            // `check_vs_production`, which FDs the *production* predictor
+            // (`ode_provider_init_reset_midtimeline_reads_the_reset_rows_snapshot`), and
+            // beneath that the NONMEM anchor in
+            // `tests/reset_init_snapshot_nonmem_anchor.rs`.
             match ode.init_fn.as_ref() {
-                Some(f) => u = init_taylor_seed_at::<T>(f.as_ref(), params, pk_indices, n_states),
+                Some(f) => {
+                    u = init_taylor_seed_at::<T>(
+                        f.as_ref(),
+                        &pk_at_reset[idx],
+                        pk_indices,
+                        n_states,
+                    )
+                }
                 None => {
                     for x in u.iter_mut() {
                         *x = T::from_f64(0.0);
