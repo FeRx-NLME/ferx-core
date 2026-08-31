@@ -63,6 +63,17 @@ jobs:
       - name: cargo check (nn-gated module + tests)
         run: cargo check --tests --no-default-features --features ci,nn,slow-tests
 
+      # The workspace members (#1114). `-p` rather than `--workspace` so the
+      # `ferx-core` targets above are not rebuilt, and the feature is written
+      # package-qualified (`ferx-core/ci`) because `ci` is a feature of
+      # `ferx-core`, not of the members — a bare `--features ci` here fails with
+      # "none of the selected packages contains this feature". Qualified this
+      # way it resolves to the SAME feature set as the steps above, so the
+      # members link the already-built rlib instead of triggering a second
+      # `ferx-core` compile under a different feature hash.
+      - name: cargo check (ferx-tools + ferx-cli)
+        run: cargo check -p ferx-tools -p ferx-cli --tests --no-default-features --features ferx-core/ci
+
   # Every default-off feature surface the `ci` build compiles out: the non-Gaussian
   # endpoint families (TTE/survival + categorical + CTMM) and the covariate-NN /
   # DCM stack (`nn`). This ONE job replaces the former separate `Survival (TTE)`
@@ -181,7 +192,74 @@ jobs:
         # stack are linted too (both are compiled out of the base `ci` build).
         # `markov = ["survival"]`, so this lints the whole non-Gaussian endpoint
         # surface as well.
-        run: cargo clippy --no-default-features --features ci,markov,nn
+        #
+        # `--all-targets` so test code is linted too. Without it the default target
+        # selection covers only the lib and the bins, and roughly a third of this
+        # repo — every `#[cfg(test)]` module, every sibling `*_tests.rs`, and all of
+        # `tests/` — got no lint coverage at all. That gap was not theoretical: it
+        # was hiding 6 `approx_constant` ERRORS (`error`, not `warning`) that the
+        # default invocation exits 0 on.
+        #
+        # Note this job installs a FRESH nightly on every run, so its lint set is
+        # newer than a developer's local toolchain unless they have updated
+        # recently. One of those 6 (`EULER_GAMMA`, `src/stats/special.rs`) is
+        # invisible to a three-month-old clippy — verify locally with an up-to-date
+        # `rustup update nightly`, or this job is the first thing that sees it.
+        run: cargo clippy --no-default-features --features ci,markov,nn --all-targets
+
+      # Same package-qualified-feature trick as the `Check` job, so the members
+      # reuse the `ferx-core` build the step above just produced. `--tests` here
+      # (unlike above) because the members' test code is a meaningful share of
+      # their line count while they are still small.
+      - name: cargo clippy (ferx-tools + ferx-cli)
+        run: cargo clippy -p ferx-tools -p ferx-cli --tests --no-default-features --features ferx-core/ci,ferx-core/markov,ferx-core/nn
+
+  # A2 of #1114 — the enforcement that keeps the ferx-core/ferx-tools boundary
+  # from becoming paperwork. `ferx-tools` can only touch `pub` items, so the way
+  # the boundary rots is `ferx-core` growing an ad-hoc `pub` in the same PR that
+  # needs it. Diffing a committed surface snapshot turns every widening into one
+  # explicit reviewable line. Doubles as semver protection for the crates.io
+  # release and for ferx-r.
+  #
+  # The script owns the pinned nightly, the pinned `cargo-public-api` version and
+  # the feature set, and CI runs that same script — so the generating command
+  # cannot drift from the verifying one.
+  public-api:
+    name: Public API baseline
+    runs-on: ubuntu-latest
+    # `rust-toolchain.toml` says a bare `nightly`, but the output is
+    # rustdoc-JSON-derived and moves with rustdoc, so an unpinned nightly would
+    # produce red diffs unrelated to any PR. The pinned date lives in the script
+    # and is READ from it here rather than repeated, so the two cannot drift.
+    steps:
+      - uses: actions/checkout@v7
+      # The workflow-level `RUSTUP_TOOLCHAIN: nightly` (top of this file) would
+      # otherwise override the pin for every later step: rustup auto-installs
+      # from that env var, so the job would silently pull a SECOND, unpinned
+      # nightly, and `rust-cache` keys `ci-public-api` off `rustc -vV` — which
+      # then changes daily, so the restore never hits and this job does a cold
+      # rustdoc build of `ferx-core` on every run. Exporting the pinned date to
+      # `$GITHUB_ENV` here (before the cache step) makes the pin actually stick.
+      - name: Install the nightly pinned by tools/update-public-api.sh
+        run: |
+          toolchain=$(grep -oE 'nightly-[0-9]{4}-[0-9]{2}-[0-9]{2}' tools/update-public-api.sh | head -1)
+          test -n "$toolchain" || { echo "no pinned nightly found in tools/update-public-api.sh"; exit 1; }
+          echo "pinned toolchain: $toolchain"
+          rustup toolchain install "$toolchain" --profile minimal
+          echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # rustdoc JSON build; own key so it does not churn the `ci` cache.
+          shared-key: ci-public-api
+      # The version is pinned in the script too; if these ever diverge the
+      # script reinstalls its own pin rather than silently using the wrong one
+      # (slower, but never a wrong baseline).
+      - name: Install cargo-public-api
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-public-api@0.51.0
+      - name: Diff the public API against the committed baseline
+        run: tools/update-public-api.sh --check
 
   fmt:
     name: Format
@@ -192,7 +270,10 @@ jobs:
         run: rustup toolchain install nightly --profile minimal -c rustfmt
 
       - name: cargo fmt
-        run: cargo fmt -- --check
+        # `--all`: without it `cargo fmt` formats only the root package, so
+        # `crates/ferx-tools` and `crates/ferx-cli` would go unchecked (#1114).
+        # `.githooks/pre-commit` uses the same flag.
+        run: cargo fmt --all -- --check
 
   coverage:
     name: Tests + coverage (full, slow-tests)
@@ -288,7 +369,21 @@ jobs:
         # fits here tolerate the ThinLTO-off fit slowdown that the nightly
         # `coverage`/`slow-tests` jobs avoid by staying on `ci-test`. `--tests`
         # so the integration tests both run and count (same rationale as nightly).
-        run: cargo llvm-cov --tests --no-fail-fast --no-default-features --features ci --profile ci-fast --lcov --output-path lcov.info
+        #
+        # `--workspace` + package-qualified `ferx-core/ci` (#1114): the `ferx`
+        # CLI moved from `src/bin/run_model.rs` into `crates/ferx-cli`, and its
+        # ~960 lines were measured here before the move. Root-package scoping
+        # (verified: `cargo llvm-cov` does NOT go workspace-wide on its own in a
+        # root-package workspace — an unqualified run emits 102 `SF:` records,
+        # none under `crates/`) would have dropped them from the `fast` report,
+        # lowering project coverage for a pure file move AND failing the patch
+        # gate at 0% for any later crates/-only PR — the same trap #293
+        # documents for the feature-gated surface. `--workspace` keeps the
+        # measurement continuous and runs the members' tests in the SAME
+        # instrumented build, so no third cache key and no second `ferx-core`
+        # compile. The bare `--features ci` has to become `ferx-core/ci` because
+        # `ci` is not a feature of the members.
+        run: cargo llvm-cov --workspace --tests --no-fail-fast --no-default-features --features ferx-core/ci --profile ci-fast --lcov --output-path lcov.info
 
       - name: Upload to Codecov (fast flag)
         uses: codecov/codecov-action@v7

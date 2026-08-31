@@ -22,7 +22,7 @@
 #   CMT=2  central  — concentration (mg/L); C = amount / V1
 #
 # Self-contained: run with no data file
-#   cargo run --release -- examples/transit_ode_template.ferx --simulate
+#   cargo run --release -p ferx-cli -- examples/transit_ode_template.ferx --simulate
 
 [parameters]
   theta TVCL(5.0,   0.1, 100.0)   # typical clearance (L/h)

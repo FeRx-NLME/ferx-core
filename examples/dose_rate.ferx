@@ -16,7 +16,7 @@
 # See docs/data-format.qmd ("NONMEM coded RATE values") and the FAQ.
 #
 # Run:
-#   cargo run --release -- examples/dose_rate.ferx --data data/dose_rate.csv
+#   cargo run --release -p ferx-cli -- examples/dose_rate.ferx --data data/dose_rate.csv
 
 [parameters]
   theta TVCL(5.0,  0.1, 100.0)

@@ -22,11 +22,13 @@
 ### Build commands
 
 ```bash
-# Debug build
+# Debug build (library only)
 cargo build
 
-# Release build (with fat LTO)
-cargo build --release
+# Release build (with fat LTO). The repo is a workspace and the root package is
+# the ferx-core LIBRARY, so `--workspace` (or `-p ferx-cli`) is what produces
+# the `ferx` binary — a bare `cargo build --release` does not.
+cargo build --release --workspace
 
 # Compilation check (no artifact output)
 cargo check
@@ -39,10 +41,10 @@ cargo clippy
 
 ```bash
 # Fit a model to data
-cargo run --release -- examples/warfarin.ferx --data data/warfarin.csv
+cargo run --release -p ferx-cli -- examples/warfarin.ferx --data data/warfarin.csv
 
 # Simulate from a model
-cargo run --release -- examples/warfarin.ferx --simulate
+cargo run --release -p ferx-cli -- examples/warfarin.ferx --simulate
 ```
 
 ## 3. Branching Strategy
@@ -167,11 +169,12 @@ A GitHub Actions CI pipeline runs on every push to `main` and on pull requests (
 
 | Job | Command | Purpose |
 |-----|---------|---------|
-| **Check** | `cargo check --tests` (×3: `ci`, `ci,survival,slow-tests`, `ci,markov`) | Fast compilation verification of every feature combo, including the ones no per-PR test job builds |
-| **Tests + coverage (core)** | `cargo llvm-cov --tests --features ci` | Runs the Tier-1/2 suite and produces the per-PR patch-coverage report (`fast` flag) |
+| **Check** | `cargo check --tests` (×4: `ci`, `ci,survival,slow-tests`, `ci,markov`, `ci,nn,slow-tests`), plus `-p ferx-tools -p ferx-cli` | Fast compilation verification of every feature combo, including the ones no per-PR test job builds, and of the workspace members |
+| **Tests + coverage (core)** | `cargo llvm-cov --workspace --tests --features ferx-core/ci` | Runs the Tier-1/2 suite — core *and* the `ferx-tools` / `ferx-cli` members — and produces the per-PR patch-coverage report (`fast` flag) |
 | **Tests + coverage (TTE/CTMM endpoints)** | `cargo llvm-cov --lib --test <each endpoint test file> --features ci,markov` | Runs and measures the feature-gated TTE / categorical / CTMM code the base build compiles out (`survival` + `markov` flags) |
 | **Clippy** | `cargo clippy -- -D warnings` | Lint with warnings-as-errors |
-| **Format** | `cargo fmt -- --check` | Enforce consistent formatting |
+| **Format** | `cargo fmt --all -- --check` | Enforce consistent formatting (`--all`: the workspace members too) |
+| **Public API baseline** | `tools/update-public-api.sh --check` | Diff `ferx-core`'s public surface against `api/ferx-core-public-api.txt`; any widening fails until the baseline is regenerated in the same PR (#1114) |
 
 There is deliberately **no** separate uninstrumented `Test` job, and no separate
 `Survival` job: the former was a strict subset of `Tests + coverage (core)`
@@ -185,8 +188,18 @@ asserts it equals exactly the set of `tests/*.rs` that mention a `survival` or
 `markov` cfg, so the file count above is deliberately left unstated — read the
 list off `ci.yml`, and add to it when you add an endpoint test.
 
+Feature flags belong to the `ferx-core` package, so any command scoped to a
+member or to the whole workspace has to write them package-qualified
+(`--features ferx-core/ci`); a bare `--features ci` fails with *"none of the
+selected packages contains this feature"*. Qualifying them also keeps the
+members linking the `ferx-core` rlib the previous step just built rather than
+forcing a second compile under a different feature hash.
+
 `rust-toolchain.toml` pins a stock nightly, and `Check`, `Clippy` and `Format`
-use it. The three coverage jobs deliberately override to **stable** via
+use it. `Public API baseline` overrides to a *dated* nightly (via the same
+`RUSTUP_TOOLCHAIN` mechanism) because its output is rustdoc-derived and would
+otherwise drift nightly-to-nightly; the pin lives in
+`tools/update-public-api.sh` and the workflow reads it from there. The three coverage jobs deliberately override to **stable** via
 `RUSTUP_TOOLCHAIN` — the crate has no nightly-only code, and stable's rustc
 version holds for ~6 weeks against nightly's daily bump, which keeps their
 instrumented build cache (keyed on rustc version) warm instead of cold-rebuilding

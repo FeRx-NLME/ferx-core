@@ -1,0 +1,40 @@
+# `[odes]` model for the two #1121-review anchors: `ss_lag_infusion*` (an SS
+# infusion whose PREVIOUS cycle is still running at the dose record) and
+# `ss_lag_ge_ii*` (an SS bolus whose lagtime is a full interval or more).
+#
+# One-compartment IV, ADVAN13 twin. The lagtime comes from a data column `LG`
+# rather than a theta so one dataset can carry several lag regimes side by side —
+# the control and the case under test are then the same model, the same theta and
+# the same solver, differing in one number.
+#
+# `ss_lag_iv_cf_fit.ferx` is the closed-form twin of this file.
+
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta WTEXP(0.75, 0.01, 2.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.0025
+[individual_parameters]
+  CL    = TVCL * (WT/70)^WTEXP * exp(ETA_CL)
+  V     = TVV * exp(ETA_V)
+  ALAG1 = LG
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[covariates]
+  WT continuous
+  LG continuous
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  maxiter = 0
+  covariance = false
+  ode_method = rk45
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12

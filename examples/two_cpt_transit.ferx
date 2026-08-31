@@ -31,7 +31,7 @@
 #   CMT=3  peripheral
 #
 # Self-contained: the [simulation] block below lets you run it with no data file
-#   cargo run --release -- examples/two_cpt_transit.ferx --simulate
+#   cargo run --release -p ferx-cli -- examples/two_cpt_transit.ferx --simulate
 # which simulates an oral 100 mg dose into CMT=1, observed as concentration, and
 # fits it back. True simulation parameters: TVCL=5, TVV1=50, TVQ=10, TVV2=100,
 #   TVMTT=1.0, TVN=3, omega_CL=omega_V1=0.09, sigma_prop=0.15.

@@ -19,7 +19,7 @@
 # could only ever read 0. The parser rejects that and points here.
 #
 # Run:
-#   cargo run --release -- examples/scaling_time_readout.ferx --simulate
+#   cargo run --release -p ferx-cli -- examples/scaling_time_readout.ferx --simulate
 #
 # Simulate-and-refit recovers both halves of the readout (30 subjects, seed 1):
 #

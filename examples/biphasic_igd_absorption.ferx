@@ -19,7 +19,7 @@
 #   observation y   — concentration (mg/L) = central / V, via the [scaling] block
 #
 # Self-contained: run it with no data file
-#   cargo run --release -- examples/biphasic_igd_absorption.ferx --simulate
+#   cargo run --release -p ferx-cli -- examples/biphasic_igd_absorption.ferx --simulate
 # which simulates an oral 100 mg dose into CMT=1, observed as concentration, and
 # fits it back. True simulation parameters: TVCL=5, TVV=50, TVFR1=0.6,
 #   TVMAT1=0.5, TVMAT2=4.0, TVCV2_1=0.2, TVCV2_2=0.5, omega_CL=omega_V=0.09,

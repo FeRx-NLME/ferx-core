@@ -299,7 +299,7 @@ quoted reason since there is no build failure to quote.)
 is a complete self-contained analytic transit model:
 
 ```bash
-cargo run --release -- examples/one_cpt_transit.ferx --simulate
+cargo run --release -p ferx-cli -- examples/one_cpt_transit.ferx --simulate
 ```
 
 ## Two-compartment analytic transit — `pk two_cpt_transit(cl, v1, q, v2, n, mtt)`
@@ -335,7 +335,7 @@ reroutes to the twin (#719); an infusion likewise reroutes (gap 2), while resets
 is a complete self-contained example:
 
 ```bash
-cargo run --release -- examples/two_cpt_transit.ferx --simulate
+cargo run --release -p ferx-cli -- examples/two_cpt_transit.ferx --simulate
 ```
 
 ## Analytic inverse-Gaussian — `pk one_cpt_ig(cl, v, mat, cv2)` / `pk two_cpt_ig(...)`
@@ -406,7 +406,7 @@ ODE-solver tolerance, and a uniform `pk`-line interface matching the transit mod
 is a complete self-contained analytic IG model:
 
 ```bash
-cargo run --release -- examples/one_cpt_ig.ferx --simulate
+cargo run --release -p ferx-cli -- examples/one_cpt_ig.ferx --simulate
 ```
 
 ## Worked example
@@ -416,7 +416,7 @@ is a complete one-compartment oral model with built-in transit absorption. Run
 it on simulated data:
 
 ```bash
-cargo run --release -- examples/transit_savic.ferx --simulate
+cargo run --release -p ferx-cli -- examples/transit_savic.ferx --simulate
 ```
 
 For comparison,
@@ -500,7 +500,7 @@ is a complete one-compartment oral model with inverse-Gaussian absorption. Run i
 on simulated data:
 
 ```bash
-cargo run --release -- examples/igd_inverse_gaussian.ferx --simulate
+cargo run --release -p ferx-cli -- examples/igd_inverse_gaussian.ferx --simulate
 ```
 
 ### Biphasic (parallel) absorption
@@ -545,7 +545,7 @@ Rules for the fraction multiplier:
 is a complete biphasic model; run it on simulated data:
 
 ```bash
-cargo run --release -- examples/biphasic_igd_absorption.ferx --simulate
+cargo run --release -p ferx-cli -- examples/biphasic_igd_absorption.ferx --simulate
 ```
 
 ## Weibull absorption — `weibull(td, beta)`
@@ -638,7 +638,7 @@ is a complete one-compartment oral model with Weibull absorption. Run it on
 simulated data:
 
 ```bash
-cargo run --release -- examples/weibull_absorption.ferx --simulate
+cargo run --release -p ferx-cli -- examples/weibull_absorption.ferx --simulate
 ```
 
 ## Zero-order absorption — `zero_order(dur)`
@@ -770,8 +770,8 @@ is a one-compartment model with zero-order input, and
 is the sequential (zero-then-first-order) variant. Run either on simulated data:
 
 ```bash
-cargo run --release -- examples/zero_order_absorption.ferx --simulate
-cargo run --release -- examples/sequential_absorption.ferx --simulate
+cargo run --release -p ferx-cli -- examples/zero_order_absorption.ferx --simulate
+cargo run --release -p ferx-cli -- examples/sequential_absorption.ferx --simulate
 ```
 
 ## Parallel / mixed absorption — `first_order(ka)` {#parallel-mixed}
@@ -945,8 +945,8 @@ and
 are self-contained; run either on simulated data:
 
 ```bash
-cargo run --release -- examples/parallel_absorption.ferx --simulate
-cargo run --release -- examples/mixed_absorption.ferx --simulate
+cargo run --release -p ferx-cli -- examples/parallel_absorption.ferx --simulate
+cargo run --release -p ferx-cli -- examples/mixed_absorption.ferx --simulate
 ```
 
 The value path is anchored by an **in-engine superposition oracle**

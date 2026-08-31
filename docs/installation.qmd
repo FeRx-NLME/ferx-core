@@ -68,7 +68,10 @@ and is convenient if you already use a Unix workflow.
 git clone https://github.com/FeRx-NLME/ferx-core
 cd ferx-core
 
-cargo build --release
+# The repo is a cargo workspace: the root package is the `ferx-core` library
+# and the `ferx` binary lives in the `ferx-cli` package, so build the workspace
+# (a bare `cargo build --release` builds the library only).
+cargo build --release --workspace
 # Binary at target/release/ferx
 ```
 
@@ -81,7 +84,7 @@ not a hang.
 
 ```bash
 # Debug build (faster compile, slower runtime)
-cargo build
+cargo build --workspace
 
 # Quick type-check without building
 cargo check
@@ -93,13 +96,20 @@ cargo clippy
 cargo build --release --no-default-features --features ci
 ```
 
+Feature flags belong to the `ferx-core` package, so when building the whole
+workspace they need to be written package-qualified:
+
+```bash
+cargo build --release --workspace --no-default-features --features ferx-core/ci
+```
+
 The `ci` feature is a no-op kept for compatibility with existing
 `--features ci` invocations; it does not change behaviour.
 
 ### Verify the build
 
 ```bash
-cargo run --release --bin ferx -- examples/warfarin.ferx --data data/warfarin.csv
+cargo run --release -p ferx-cli -- examples/warfarin.ferx --data data/warfarin.csv
 ```
 
 This should print a successful model fit with parameter estimates.

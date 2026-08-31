@@ -32,7 +32,7 @@
 #   observation y   — concentration (mg/L) = central / V, via the [scaling] block
 #
 # Self-contained: run it with no data file
-#   cargo run --release -- examples/per_route_lag_absorption.ferx --simulate
+#   cargo run --release -p ferx-cli -- examples/per_route_lag_absorption.ferx --simulate
 # which simulates an oral 100 mg dose into CMT=1, observed as concentration, and
 # fits it back. True simulation parameters: TVCL=5, TVV=50, TVFR1=0.5 (IR fraction),
 #   TVKA1=1.2 (IR), TVKA2=0.8 (DR), TVLAG2=3.0 (DR gastric delay),

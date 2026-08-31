@@ -47,7 +47,7 @@ FOCEI loop runs exactly as it does for an analytical model. This is the
 Behind the `nn` cargo feature (off by default). Build with:
 
 ```sh
-cargo build --release --features nn
+cargo build --release -p ferx-cli --features ferx-core/nn
 ```
 
 A full runnable example lives at [`examples/warfarin_dcm.ferx`][ex] —

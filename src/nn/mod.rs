@@ -1412,10 +1412,15 @@ mod invert_tests {
             (Activation::Identity, &[-3.0, 0.0, 7.5]),
             (Activation::Relu, &[0.25, 1.0, 40.0]),
             // Spans the `y > 20` branch of `apply` and the small-`y` end where
-            // `exp(y) - 1` would lose precision to cancellation.
+            // `exp(y) - 1` would lose precision to cancellation. `LN_2` is the
+            // deliberate middle point: `softplus(0) = ln 2`, so it is the one input
+            // whose inverse is exactly `0`. Spelled as the constant rather than a
+            // truncated `0.693_147` so it lands on that zero exactly (and so clippy's
+            // `approx_constant` does not have to be silenced for a value that really
+            // is ln 2).
             (
                 Activation::Softplus,
-                &[1e-8, 1e-3, 0.693_147, 1.0, 10.0, 25.0, 400.0],
+                &[1e-8, 1e-3, std::f64::consts::LN_2, 1.0, 10.0, 25.0, 400.0],
             ),
             (Activation::Tanh, &[-0.95, 0.0, 0.5]),
             (Activation::Sigmoid, &[0.01, 0.5, 0.99]),

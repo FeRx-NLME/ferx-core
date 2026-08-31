@@ -22,7 +22,7 @@
 # with weight 1/SE², i.e. in proportion to how precisely it was measured.
 #
 # Run:
-#   cargo run --release --bin ferx -- examples/mbma_naproxen.ferx \
+#   cargo run --release -p ferx-cli -- examples/mbma_naproxen.ferx \
 #       --data data/mbma_naproxen.csv
 
 model mbma_naproxen
