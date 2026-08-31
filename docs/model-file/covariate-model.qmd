@@ -116,6 +116,42 @@ What PsN calls `[test_relations]`, `valid_states`, `included_relations` and
 that reads the relation table and rewrites these lines; the block does not try
 to express the search.
 
+## One θ per relation
+
+Each relation declares its own θ. Two relations cannot **share** one, so the
+common hand-written idiom — a single allometric exponent estimated jointly on
+`CL` and `V` — has no spelling in this block:
+
+```
+# Not expressible: both lines would have to own the same θ.
+CL ~ WT power(center = 70) => THETA_WT(0.75, 0.1, 1.5)
+V  ~ WT power(center = 70) => THETA_WT(0.75, 0.1, 1.5)   # error: duplicate θ
+```
+
+This follows PsN, whose `scm` also gives every (parameter, covariate) relation
+its own θ, and it is what keeps a relation a self-contained line — sharing would
+couple two lines, and a search could no longer drop one without reasoning about
+the other.
+
+Write a shared exponent classically instead; a θ declared in `[parameters]` can
+appear in as many `[individual_parameters]` expressions as you like, and a model
+may mix the two styles:
+
+```
+[parameters]
+  theta THETA_WT(0.75, 0.1, 1.5)
+
+[individual_parameters]
+  CL = TVCL * (WT/70)^THETA_WT * exp(ETA_CL)
+  V  = TVV  * (WT/70)^THETA_WT * exp(ETA_V)
+
+[covariate_model]
+  CL ~ CRCL power(center = median)   # the un-shared effects stay declarative
+```
+
+(A *fixed* exponent shared by convention — 0.75 on clearances, 1 on volumes —
+needs no sharing at all: write `fix = 0.75` on each relation.)
+
 ## Data-derived statistics
 
 `center` / `breakpoint` accept `median`, `mean`, `min`, `max` or a literal
@@ -159,7 +195,7 @@ first η/κ-bearing factor:
 
 ```
 CL = TVCL * exp(ETA_CL)
-  →  CL = TVCL * (if (WT == WT) (WT / 70)^THETA_CL_WT else 1.0) * exp(ETA_CL)
+  →  CL = TVCL * (if (present(WT)) (WT / 70)^THETA_CL_WT else 1.0) * exp(ETA_CL)
 ```
 
 Appending at the end of the expression would be numerically identical but would
@@ -187,13 +223,18 @@ is actually estimated when using SAEM.
 Every generated factor is wrapped in a neutral guard:
 
 ```
-(if (WT == WT) (WT / 70)^THETA_CL_WT else 1.0)
+(if (present(WT)) (WT / 70)^THETA_CL_WT else 1.0)
 ```
 
-`NaN == NaN` is false, so a missing covariate contributes a factor of exactly
-`1.0`. This is not belt-and-braces: division by a missing value **underflows to
-`0.0`** in ferx rather than producing an infinity, so an unguarded factor would
-zero the parameter silently instead of failing loudly.
+A missing covariate is `NaN`, so `present(...)` is false and the factor is
+exactly `1.0`. This is not belt-and-braces: division by a missing value
+**underflows to `0.0`** in ferx rather than producing an infinity, so an
+unguarded factor would zero the parameter silently instead of failing loudly.
+
+`present(...)` is an ordinary condition available anywhere in
+[`[individual_parameters]`](individual-parameters.qmd), not something this block
+invented for itself — see
+[Conditional Logic](individual-parameters.qmd#conditional-logic-if-else).
 
 ## Seeing what was built
 
@@ -204,8 +245,8 @@ are on `CheckReport.desugared_individual_parameters` in `--json`:
 $ ferx check examples/two_cpt_oral_covmodel.ferx
 
 [individual_parameters] as built from [covariate_model]:
-  CL = TVCL * (if (WT == WT) (WT / 70)^THETA_CL_WT else 1.0) * (if (CRCL == CRCL) (CRCL / 100)^THETA_CL_CRCL else 1.0) * exp(ETA_CL)
-  V1 = TVV1 * (if (WT == WT) (WT / 70)^THETA_V1_WT else 1.0) * exp(ETA_V1)
+  CL = TVCL * (if (present(WT)) (WT / 70)^THETA_CL_WT else 1.0) * (if (present(CRCL)) (CRCL / 100)^THETA_CL_CRCL else 1.0) * exp(ETA_CL)
+  V1 = TVV1 * (if (present(WT)) (WT / 70)^THETA_V1_WT else 1.0) * exp(ETA_V1)
   ...
 ```
 

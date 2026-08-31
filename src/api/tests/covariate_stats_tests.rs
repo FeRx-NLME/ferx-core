@@ -105,7 +105,7 @@ fn a_symbolic_median_resolves_to_the_data_median() {
     let bound = bind(&text, &pop).expect("binding should succeed");
     assert_eq!(
         cl_line(&bound),
-        "CL = TVCL * (if (WT == WT) (WT / 70)^THETA_CL_WT else 1.0) * exp(ETA_CL)"
+        "CL = TVCL * (if (present(WT)) (WT / 70)^THETA_CL_WT else 1.0) * exp(ETA_CL)"
     );
     let rel = &bound.covariate_model.as_ref().unwrap().relations[0];
     assert_eq!(rel.resolved_center, Some(70.0));

@@ -162,6 +162,7 @@ fn extract_eta_indices(expr: &Expression) -> Vec<usize> {
                 walk_eta_in_condition(r, out);
             }
             Condition::Not(c) => walk_eta_in_condition(c, out),
+            Condition::Present(e) => walk(e, out),
         }
     }
     walk(expr, &mut out);
@@ -206,6 +207,7 @@ fn expr_references_any(expr: &Expression, names: &[String]) -> Option<String> {
                 walk_cond(l, names).or_else(|| walk_cond(r, names))
             }
             Condition::Not(c) => walk_cond(c, names),
+            Condition::Present(e) => walk(e, names),
         }
     }
     walk(expr, names)
@@ -804,6 +806,7 @@ fn expr_uses_mixnum(expr: &Expression) -> bool {
             Condition::Compare(a, _, b) => expr_uses_mixnum(a) || expr_uses_mixnum(b),
             Condition::And(a, b) | Condition::Or(a, b) => cond_uses(a) || cond_uses(b),
             Condition::Not(a) => cond_uses(a),
+            Condition::Present(a) => expr_uses_mixnum(a),
         }
     }
     match expr {
@@ -4338,6 +4341,7 @@ fn cond_refs_dv(cond: &Condition) -> bool {
         Condition::Compare(l, _, r) => expr_refs_dv(l) || expr_refs_dv(r),
         Condition::And(l, r) | Condition::Or(l, r) => cond_refs_dv(l) || cond_refs_dv(r),
         Condition::Not(c) => cond_refs_dv(c),
+        Condition::Present(e) => expr_refs_dv(e),
     }
 }
 
@@ -4376,6 +4380,7 @@ fn cond_refs_compartments(cond: &Condition, ode_state_names: &[String]) -> bool 
             cond_refs_compartments(l, ode_state_names) || cond_refs_compartments(r, ode_state_names)
         }
         Condition::Not(c) => cond_refs_compartments(c, ode_state_names),
+        Condition::Present(e) => expr_refs_compartments(e, ode_state_names),
     }
 }
 
@@ -4921,10 +4926,7 @@ fn apply_covariate_model_block(
 
     // Both blocks are rewritten, so take ownership of each and put it back —
     // the alternative is two simultaneous mutable borrows of the same map.
-    let mut parameters = extracted
-        .unnamed
-        .remove("parameters")
-        .unwrap_or_else(Vec::new);
+    let mut parameters = extracted.unnamed.remove("parameters").unwrap_or_default();
     let mut individual_parameters = extracted
         .unnamed
         .remove("individual_parameters")
@@ -16140,6 +16142,21 @@ pub(crate) enum Condition {
     And(Box<Condition>, Box<Condition>),
     Or(Box<Condition>, Box<Condition>),
     Not(Box<Condition>),
+    /// `present(COV)` — true when the value is not missing (#1111).
+    ///
+    /// A missing covariate is `NaN`, and NaN compares false against everything
+    /// including itself, so the test is spelled `!v.is_nan()`. It exists
+    /// because the alternative spelling — `COV == COV` — is correct but
+    /// unreadable, and it is what every `[covariate_model]` factor is guarded
+    /// with, so it appears in generated model text a user has to audit against
+    /// a NONMEM control stream.
+    ///
+    /// Deliberately a *condition*, not an expression-level function: it asks a
+    /// yes/no question about data, and as a function returning 0.0/1.0 it would
+    /// invite arithmetic (`CL = TVCL * present(WT)`) whose meaning is a
+    /// silently-zeroed parameter — exactly the failure the guard exists to
+    /// prevent.
+    Present(Expression),
 }
 
 /// A statement in a model block. Supports plain assignments, derivative
@@ -16301,6 +16318,7 @@ fn visit_condition_nodes_mut(cond: &mut Condition, f: &mut dyn FnMut(&mut Expres
             visit_condition_nodes_mut(r, f);
         }
         Condition::Not(c) => visit_condition_nodes_mut(c, f),
+        Condition::Present(e) => visit_expr_nodes_mut(e, f),
     }
 }
 
@@ -16316,6 +16334,7 @@ fn visit_condition_nodes(cond: &Condition, f: &mut dyn FnMut(&Expression)) {
             visit_condition_nodes(r, f);
         }
         Condition::Not(c) => visit_condition_nodes(c, f),
+        Condition::Present(e) => visit_expr_nodes(e, f),
     }
 }
 
@@ -16510,6 +16529,7 @@ fn rewrite_weighted_kappas(
                 walk_cond(r, weights, hit);
             }
             Condition::Not(c) => walk_cond(c, weights, hit),
+            Condition::Present(e) => walk_expr(e, weights, hit),
         }
     }
     let mut hit: HashSet<usize> = HashSet::new();
@@ -17471,6 +17491,7 @@ fn rewrite_readout_synth_cond(cond: &mut Condition, synth: &[ReadoutSynthParam])
             rewrite_readout_synth_cond(r, synth);
         }
         Condition::Not(c) => rewrite_readout_synth_cond(c, synth),
+        Condition::Present(e) => rewrite_readout_synth(e, synth),
     }
 }
 
@@ -17850,6 +17871,11 @@ fn eval_cond<E: EvalEnv>(
             eval_cond(l, theta, eta, env, nn_outputs) || eval_cond(r, theta, eta, env, nn_outputs)
         }
         Condition::Not(c) => !eval_cond(c, theta, eta, env, nn_outputs),
+        // A missing covariate is `NaN`; everything else is present. Spelled
+        // `!is_nan` rather than `is_finite` so it means exactly what the
+        // `COV == COV` idiom it replaces meant — an infinity is a value, not a
+        // gap in the data.
+        Condition::Present(e) => !eval_expr(e, theta, eta, env, nn_outputs).is_nan(),
     }
 }
 
@@ -17943,6 +17969,10 @@ enum Op {
     LogicAnd,
     LogicOr,
     LogicNot,
+    /// `present(x)` (#1111): pops a value, pushes 1.0 unless it is `NaN`.
+    /// Unary in stack terms, and an indicator — its derivative is identically
+    /// zero, which is why the `Dual` evaluator pushes a constant.
+    IsPresent,
     JumpIfFalse(u32), // pops top; jumps to bytecode index if value == 0.0
     Jump(u32),
     Mod,   // rem_euclid (binary)
@@ -18123,6 +18153,7 @@ fn scan_stack_depth(ops: &[Op]) -> (i32, i32) {
             | Op::InvLogit
             | Op::Logit
             | Op::LogicNot
+            | Op::IsPresent
             | Op::Floor
             | Op::Ceil
             | Op::Round => 0,
@@ -18277,6 +18308,10 @@ fn compile_condition_into(bc: &mut Bytecode, cond: &Condition) {
         Condition::Not(c) => {
             compile_condition_into(bc, c);
             bc.ops.push(Op::LogicNot);
+        }
+        Condition::Present(e) => {
+            compile_expr_into(bc, e);
+            bc.ops.push(Op::IsPresent);
         }
     }
 }
@@ -18490,6 +18525,10 @@ fn eval_bytecode(
             Op::LogicNot => {
                 let v = pop!();
                 push!(if v == 0.0 { 1.0 } else { 0.0 });
+            }
+            Op::IsPresent => {
+                let v = pop!();
+                push!(if v.is_nan() { 0.0 } else { 1.0 });
             }
             Op::JumpIfFalse(target) => {
                 let v = pop!();
@@ -18736,6 +18775,10 @@ fn eval_bytecode_g<T: crate::sens::num::PkNum>(
             Op::LogicNot => {
                 let v = pop!();
                 push!(k(if v.val() == 0.0 { 1.0 } else { 0.0 }));
+            }
+            Op::IsPresent => {
+                let v = pop!();
+                push!(k(if v.val().is_nan() { 0.0 } else { 1.0 }));
             }
             Op::JumpIfFalse(target) => {
                 let v = pop!();
@@ -19044,6 +19087,7 @@ fn cond_reads_slots(c: &Condition, slots: &[usize]) -> bool {
             cond_reads_slots(a, slots) || cond_reads_slots(b, slots)
         }
         Condition::Not(a) => cond_reads_slots(a, slots),
+        Condition::Present(e) => expr_reads_slots(e, slots),
     }
 }
 
@@ -19227,6 +19271,7 @@ fn cond_is_dynamic(c: &Condition, dyn_vars: &[bool]) -> bool {
         Condition::And(a, b) | Condition::Or(a, b) => {
             cond_is_dynamic(a, dyn_vars) || cond_is_dynamic(b, dyn_vars)
         }
+        Condition::Present(e) => expr_is_dynamic(e, dyn_vars),
         Condition::Not(c) => cond_is_dynamic(c, dyn_vars),
     }
 }
@@ -20268,6 +20313,7 @@ fn resolve_condition_indices(
             resolve_condition_indices(r, var_idx, cov_idx);
         }
         Condition::Not(c) => resolve_condition_indices(c, var_idx, cov_idx),
+        Condition::Present(e) => resolve_expr_indices(e, var_idx, cov_idx),
     }
 }
 
@@ -21747,6 +21793,26 @@ fn parse_cond_atom(
             return Err("Missing closing `)` in condition".to_string());
         }
         return Ok((inner, p + 1));
+    }
+
+    // `present(EXPR)` (#1111) — a data-presence predicate, not a comparison.
+    // Matched before `parse_add_sub` so the name is only special in condition
+    // position followed by `(`; a covariate that happens to be called
+    // `present` still reads normally everywhere else, including in a
+    // comparison (`present > 0`).
+    if let (Some(Token::Ident(name)), Some(Token::LParen)) = (tokens.get(pos), tokens.get(pos + 1))
+    {
+        if name.eq_ignore_ascii_case("present") {
+            let (inner, p) = parse_add_sub(tokens, pos + 2, ctx)?;
+            if tokens.get(p) != Some(&Token::RParen) {
+                return Err(
+                    "Missing closing `)` in `present(...)` — it takes exactly one value, \
+                     e.g. `present(WT)`"
+                        .to_string(),
+                );
+            }
+            return Ok((Condition::Present(inner), p + 1));
+        }
     }
 
     // comparison: expr <cmpop> expr

@@ -42,6 +42,21 @@
 //! state in a separate table), so it is also the closer translation for someone
 //! coming from `scm`.
 //!
+//! # One θ per relation
+//!
+//! A relation owns the θ it declares, and two relations cannot share one — so
+//! the common hand-written idiom of a *single* allometric exponent estimated
+//! jointly on `CL` and `V` has no spelling here (`examples/two_cpt_oral_cov.ferx`
+//! is exactly that model). This follows PsN, whose `scm` likewise gives every
+//! (parameter, covariate) relation its own θ, and it is what keeps a relation a
+//! self-contained line: sharing would couple two lines, and a search could no
+//! longer drop one without reasoning about the other.
+//!
+//! The workaround is the classical block, which this one does not replace: a θ
+//! declared in `[parameters]` can appear in as many `[individual_parameters]`
+//! expressions as the modeller likes. A model can also mix the two — declare
+//! the shared exponent classically and the rest here.
+//!
 //! # Where the sugar is removed
 //!
 //! Here, on the block *text*, before any block is read — alongside
@@ -70,8 +85,12 @@
 //! A missing covariate is `NaN` in the covariate table, and division here
 //! underflows to `0.0` rather than `inf`, so an unguarded `(WT/70)^θ` on a
 //! missing row would yield a silent `0` instead of a loud `NaN`. Every
-//! generated factor is therefore wrapped in `if (COV == COV) <factor> else 1.0`
-//! — the evaluator compares with IEEE `==`, so `NaN` takes the neutral branch.
+//! generated factor is therefore wrapped in
+//! `if (present(COV)) <factor> else 1.0`, using the `present(...)` predicate
+//! the DSL grew for exactly this. The equivalent spelling `COV == COV` works
+//! too — `NaN` compares false against itself — but this text is what a user
+//! reads back out of `ferx check` and diffs against a NONMEM control stream,
+//! so it says what it means.
 
 use std::collections::{HashMap, HashSet};
 
@@ -189,8 +208,12 @@ fn parse_relations(
         for theta in &rel.thetas {
             if !seen_theta.insert(theta.name.clone()) {
                 return Err(format!(
-                    "[covariate_model]: two relations both generate the θ `{}` — name one of \
-                     them explicitly with `=> NAME(init, lower, upper)`",
+                    "[covariate_model]: two relations both generate the θ `{}`. Each relation \
+                     owns its own θ — the block cannot share one across relations (a shared \
+                     allometric exponent on CL and V, say). Give them distinct names with \
+                     `=> NAME(init, lower, upper)`, or write the shared-θ factor classically \
+                     in [individual_parameters], where one θ can appear in as many \
+                     expressions as you like.",
                     theta.name
                 ));
             }
@@ -804,10 +827,10 @@ fn relation_factor(rel: &CovariateRelation) -> Option<String> {
             expr
         }
     };
-    // `NaN == NaN` is false, so a missing covariate takes the neutral branch —
-    // without this the relation would silently contribute `0` (division by a
-    // missing value underflows to zero here, it does not blow up).
-    Some(format!("(if ({cov} == {cov}) {inner} else 1.0)"))
+    // A missing covariate takes the neutral branch — without this the relation
+    // would silently contribute `0` (division by a missing value underflows to
+    // zero here, it does not blow up).
+    Some(format!("(if (present({cov})) {inner} else 1.0)"))
 }
 
 /// Multiply `factors` into `param`'s right-hand side, immediately before the

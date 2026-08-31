@@ -20342,3 +20342,140 @@ fn test_apply_fit_option_vi_grad_clip() {
     assert!(apply_fit_option(&mut opts, "vi_grad_clip", "nope").is_err());
     assert_eq!(opts.vi_grad_clip, 0.0);
 }
+
+// ── `present(COV)` — the data-presence predicate (#1111) ────────────────────
+//
+// A missing covariate is `NaN`, and `x/NaN` underflows to `0.0` in this engine
+// rather than blowing up, so a model that reads a covariate which may be
+// missing needs a guard or it silently zeroes a parameter. `COV == COV` says
+// that (NaN compares false against itself) but reads like a typo; `present(COV)`
+// is the same test, spelled. It is the guard `[covariate_model]` generates, so
+// it appears in text users audit against NONMEM.
+
+/// A one-compartment model whose `CL` is guarded by `cond`.
+fn present_model(cond: &str) -> String {
+    format!(
+        r#"
+[parameters]
+  theta TVCL(2.0, 0.1, 100.0)
+  theta TVV(10.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL = TVCL * (if ({cond}) (WT / 70) else 1.0)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[covariates]
+  WT continuous
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+    )
+}
+
+/// `CL` at the given `WT`, through the production parameter closure — so this
+/// exercises the compiled bytecode path the fit uses, not just the AST walker.
+fn cl_at(cond: &str, wt: f64) -> f64 {
+    let parsed = parse_full_model(&present_model(cond)).expect("model should parse");
+    let mut covariates = HashMap::new();
+    covariates.insert("WT".to_string(), wt);
+    (parsed.model.pk_param_fn)(&[2.0, 10.0], &[0.0], &covariates, 0.0).values[0]
+}
+
+#[test]
+fn present_is_true_for_a_value_and_false_for_a_missing_one() {
+    // WT = 140 → factor 2; WT missing → the neutral branch, NOT 0.
+    assert_eq!(cl_at("present(WT)", 140.0), 4.0);
+    assert_eq!(cl_at("present(WT)", f64::NAN), 2.0);
+}
+
+#[test]
+fn present_means_exactly_what_the_self_comparison_idiom_meant() {
+    // `present(COV)` replaced `COV == COV` in generated model text, so the two
+    // must agree everywhere — including on infinity, which is a value, not a
+    // gap in the data. (`is_finite` would have differed here.)
+    for wt in [140.0, 0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert_eq!(
+            cl_at("present(WT)", wt),
+            cl_at("WT == WT", wt),
+            "present(WT) and WT == WT disagree at WT = {wt}"
+        );
+    }
+}
+
+/// As [`cl_at`], but with a *constant* then-branch — so a branch taken while
+/// `WT` is missing yields a number rather than propagating the `NaN` the test
+/// is not about.
+fn cl_at_const(cond: &str, wt: f64) -> f64 {
+    let src = present_model(cond).replace("(WT / 70)", "3.0");
+    let parsed = parse_full_model(&src).expect("model should parse");
+    let mut covariates = HashMap::new();
+    covariates.insert("WT".to_string(), wt);
+    (parsed.model.pk_param_fn)(&[2.0, 10.0], &[0.0], &covariates, 0.0).values[0]
+}
+
+#[test]
+fn present_negates_and_combines_like_any_other_condition() {
+    // `!present(...)` selects the other branch …
+    assert_eq!(cl_at_const("!present(WT)", 140.0), 2.0);
+    assert_eq!(cl_at_const("!present(WT)", f64::NAN), 6.0);
+    // … and it composes with `&&`, so a guard can carry a real test alongside
+    // the presence check — and short-circuits, so the comparison against a
+    // missing value never decides the branch on its own.
+    assert_eq!(cl_at_const("present(WT) && WT > 100", 140.0), 6.0);
+    assert_eq!(cl_at_const("present(WT) && WT > 100", 50.0), 2.0);
+    assert_eq!(cl_at_const("present(WT) && WT > 100", f64::NAN), 2.0);
+}
+
+#[test]
+fn present_accepts_an_expression_not_only_a_bare_name() {
+    // The argument is an ordinary expression, so a derived quantity can be
+    // tested for missingness too — `WT * 2` is NaN exactly when `WT` is.
+    assert_eq!(cl_at("present(WT * 2)", 140.0), 4.0);
+    assert_eq!(cl_at("present(WT * 2)", f64::NAN), 2.0);
+}
+
+#[test]
+fn present_is_only_special_in_condition_position() {
+    // A covariate that happens to be named `present` is not shadowed: the
+    // predicate is recognised only as `present(` at the head of a condition.
+    let src = r#"
+[parameters]
+  theta TVCL(2.0, 0.1, 100.0)
+  theta TVV(10.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL = TVCL * (if (present > 0) 2.0 else 1.0)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let parsed = parse_full_model(src).expect("a covariate called `present` still parses");
+    let mut covariates = HashMap::new();
+    covariates.insert("present".to_string(), 1.0);
+    let cl = (parsed.model.pk_param_fn)(&[2.0, 10.0], &[0.0], &covariates, 0.0).values[0];
+    assert_eq!(cl, 4.0);
+}
+
+#[test]
+fn an_unclosed_present_is_a_parse_error() {
+    let src = present_model("present(WT").replace("else 1.0)", "else 1.0)");
+    let e = parse_full_model(&src)
+        .map(|_| ())
+        .expect_err("unbalanced `present(` must not parse");
+    assert!(
+        e.to_lowercase().contains("present") || e.contains(')'),
+        "{e}"
+    );
+}

@@ -31,6 +31,12 @@ section of the SDLC for the versioning policy).
   still `ferx-core`.
 
 ### Added
+- **A `present(COV)` condition for covariates that may be missing (#1111).** A missing covariate
+  value is `NaN`, and division by it underflows to `0.0` here rather than erroring, so an
+  unguarded `(CRCL/100)^THETA` silently zeroes the parameter on a row with no `CRCL`.
+  `if (present(CRCL)) ... else 1.0` says the guard plainly; the equivalent `CRCL == CRCL` idiom
+  still works. Usable anywhere a condition is (`!present(X)`, `present(X) && X > 100`), and it is
+  what `[covariate_model]` wraps every generated factor in.
 - **A `[covariate_model]` block: covariate–parameter relationships declared as data (#1111).**
   `CL ~ WT power(center = median)` desugars into exactly the classical
   `[individual_parameters]` expression — with the theta declaration, the centering constant and a
@@ -40,7 +46,9 @@ section of the SDLC for the versioning policy).
   `center`/`breakpoint`/`ref` accept a literal or a data-derived statistic (`median`, `mean`,
   `min`, `max`, `mode`), and `[covariates]` gains `categorical(levels = [0, 1])` /
   `levels = auto`. The relations are echoed on `FitResult.covariate_relations` and in the fit
-  YAML, and `ferx check` prints the desugared block. Relations are line-oriented and independent,
+  YAML, and `ferx check` prints the desugared block. Each relation owns its own θ (as in `scm`);
+  a θ shared across relations is still written classically. Relations are line-oriented and
+  independent,
   so a covariate search rewrites this one block instead of doing surgery on an expression. See
   `docs/model-file/covariate-model.qmd`.
 - **A CI-enforced public-API baseline for `ferx-core` (#1114).** `api/ferx-core-public-api.txt` is

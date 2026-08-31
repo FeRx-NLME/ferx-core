@@ -73,7 +73,7 @@ fn power_generates_the_classical_allometric_factor() {
     let s = spec("  WT continuous", "  CL ~ WT power(center = 70)");
     assert_eq!(
         cl_line(&s),
-        "CL = TVCL * (if (WT == WT) (WT / 70)^THETA_CL_WT else 1.0) * exp(ETA_CL)"
+        "CL = TVCL * (if (present(WT)) (WT / 70)^THETA_CL_WT else 1.0) * exp(ETA_CL)"
     );
     assert_eq!(
         s.generated_thetas,
@@ -86,7 +86,7 @@ fn exponential_generates_an_exp_of_the_centred_covariate() {
     let s = spec("  WT continuous", "  CL ~ WT exponential(center = 70)");
     assert_eq!(
         cl_line(&s),
-        "CL = TVCL * (if (WT == WT) exp(THETA_CL_WT * (WT - 70)) else 1.0) * exp(ETA_CL)"
+        "CL = TVCL * (if (present(WT)) exp(THETA_CL_WT * (WT - 70)) else 1.0) * exp(ETA_CL)"
     );
 }
 
@@ -109,7 +109,7 @@ fn hockey_generates_two_slopes_around_the_breakpoint() {
     );
     assert_eq!(
         cl_line(&s),
-        "CL = TVCL * (if (WT == WT) (if (WT <= 70) 1 + T_LO * (WT - 70) else 1 + T_HI * (WT - 70)) \
+        "CL = TVCL * (if (present(WT)) (if (WT <= 70) 1 + T_LO * (WT - 70) else 1 + T_HI * (WT - 70)) \
          else 1.0) * exp(ETA_CL)"
     );
 }
@@ -122,7 +122,7 @@ fn categorical_contrasts_every_non_reference_level() {
     );
     assert_eq!(
         cl_line(&s),
-        "CL = TVCL * (if (SEX == SEX) (if (SEX == 1) 1 + THETA_CL_SEX_1 else \
+        "CL = TVCL * (if (present(SEX)) (if (SEX == 1) 1 + THETA_CL_SEX_1 else \
          if (SEX == 2) 1 + THETA_CL_SEX_2 else 1) else 1.0) * exp(ETA_CL)"
     );
     // PsN's categorical θ is null at zero, so the bounds straddle it.
@@ -150,7 +150,7 @@ fn expr_is_emitted_verbatim() {
     let s = spec("  WT continuous", "  CL ~ WT expr(\"(WT/70)^0.75\")");
     assert_eq!(
         cl_line(&s),
-        "CL = TVCL * (if (WT == WT) ((WT/70)^0.75) else 1.0) * exp(ETA_CL)"
+        "CL = TVCL * (if (present(WT)) ((WT/70)^0.75) else 1.0) * exp(ETA_CL)"
     );
     assert!(s.generated_thetas.is_empty());
 }
@@ -163,7 +163,7 @@ fn linear_relative_is_dimensionless_in_theta() {
     );
     assert_eq!(
         cl_line(&s),
-        "CL = TVCL * (if (WT == WT) (1 + T * (WT / 70 - 1)) else 1.0) * exp(ETA_CL)"
+        "CL = TVCL * (if (present(WT)) (1 + T * (WT / 70 - 1)) else 1.0) * exp(ETA_CL)"
     );
 }
 
@@ -226,7 +226,7 @@ fn the_factor_lands_before_the_first_eta_bearing_factor() {
     // mu-reference detector reads (#619).
     let s = spec("  WT continuous", "  CL ~ WT power(center = 70)");
     let line = cl_line(&s);
-    let factor = line.find("(if (WT == WT)").expect("factor is present");
+    let factor = line.find("(if (present(WT))").expect("factor is present");
     let eta = line.find("exp(ETA_CL)").expect("η factor is present");
     assert!(
         factor < eta,
@@ -246,7 +246,7 @@ fn a_parameter_with_no_eta_takes_the_factor_at_the_end() {
         .to_string();
     assert_eq!(
         v,
-        "V  = TVV * (if (WT == WT) (WT / 70)^THETA_V_WT else 1.0)"
+        "V  = TVV * (if (present(WT)) (WT / 70)^THETA_V_WT else 1.0)"
     );
 }
 
@@ -258,8 +258,8 @@ fn several_relations_on_one_parameter_all_land_in_the_non_eta_group() {
     );
     assert_eq!(
         cl_line(&s),
-        "CL = TVCL * (if (WT == WT) (WT / 70)^THETA_CL_WT else 1.0) * \
-         (if (CRCL == CRCL) (CRCL / 100)^THETA_CL_CRCL else 1.0) * exp(ETA_CL)"
+        "CL = TVCL * (if (present(WT)) (WT / 70)^THETA_CL_WT else 1.0) * \
+         (if (present(CRCL)) (CRCL / 100)^THETA_CL_CRCL else 1.0) * exp(ETA_CL)"
     );
 }
 
@@ -485,7 +485,7 @@ fn a_commented_assignment_desugars_on_its_expression_alone() {
         .expect("recorded");
     assert_eq!(
         cl_line(&s),
-        "CL = TVCL * (if (WT == WT) (WT / 70)^THETA_CL_WT else 1.0) * exp(ETA_CL)"
+        "CL = TVCL * (if (present(WT)) (WT / 70)^THETA_CL_WT else 1.0) * exp(ETA_CL)"
     );
 }
 
@@ -524,6 +524,6 @@ fn a_kappa_bearing_factor_counts_as_a_random_effect_factor() {
         .expect("recorded");
     assert_eq!(
         cl_line(&s),
-        "CL = TVCL * (if (WT == WT) (WT / 70)^THETA_CL_WT else 1.0) * exp(ETA_CL) * exp(KAPPA_CL)"
+        "CL = TVCL * (if (present(WT)) (WT / 70)^THETA_CL_WT else 1.0) * exp(ETA_CL) * exp(KAPPA_CL)"
     );
 }
