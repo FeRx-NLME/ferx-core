@@ -29,10 +29,13 @@ use ferx_core::{
 };
 use rayon::prelude::*;
 
+pub mod journal;
+pub mod manifest;
 pub mod output;
 pub mod resample;
 pub mod summary;
 
+pub use manifest::RunManifest;
 pub use resample::{Replicate, SampleSize, Strata};
 pub use summary::{BootstrapSummary, ParameterSummary};
 
@@ -72,10 +75,25 @@ pub struct BootstrapOptions {
     /// *original* dataset with no estimation (`outer_maxiter = 0`, NONMEM
     /// `MAXEVAL=0`) and subtract the original fit's OFV.
     pub dofv: bool,
-    /// Where the CSV artefacts are written. `None` writes nothing.
+    /// Where the CSV artefacts are written. `None` writes nothing, and also
+    /// disables the incremental journal that `resume` reads.
     pub directory: Option<PathBuf>,
     /// Two-sided confidence level, in percent.
     pub confidence_level: f64,
+    /// Continue an interrupted run in `directory`, refitting only the sample
+    /// indices its `raw_results.csv` does not already carry (#1143).
+    ///
+    /// Sound because a replicate's draw is a pure function of `(seed, index)`,
+    /// so a reused replicate is bit-for-bit the one a fresh run would produce.
+    pub resume: bool,
+    /// With `resume`, refit the replicates whose recorded fit *errored* instead
+    /// of carrying the failure forward.
+    ///
+    /// Off by default, matching PsN: a fit that failed usually fails again, and
+    /// paying for it a second time to reach the same place is worse than the
+    /// alternative. Turn it on when the failure was a transient resource
+    /// problem — an out-of-memory kill, a full disk — rather than the model.
+    pub retry_failed: bool,
 }
 
 impl BootstrapOptions {
@@ -119,6 +137,20 @@ impl BootstrapOptions {
                     .to_string(),
             );
         }
+        if self.resume && self.directory.is_none() {
+            return Err(
+                "--resume continues the run in a directory, so it needs --directory naming one \
+                 that an earlier run wrote."
+                    .to_string(),
+            );
+        }
+        if self.retry_failed && !self.resume {
+            return Err(
+                "--retry-failed re-fits replicates that a previous run recorded as failed, so it \
+                 only means anything together with --resume."
+                    .to_string(),
+            );
+        }
         Ok(())
     }
 }
@@ -141,6 +173,8 @@ impl Default for BootstrapOptions {
             dofv: false,
             directory: None,
             confidence_level: 95.0,
+            resume: false,
+            retry_failed: false,
         }
     }
 }
@@ -192,6 +226,9 @@ pub struct BootstrapResult {
     /// Chi-square reference degrees of freedom for the Δofv plot: the number of
     /// estimated (non-fixed) parameters.
     pub n_estimated_parameters: usize,
+    /// How many replicates `--resume` took from the run directory instead of
+    /// refitting. Zero for a fresh run.
+    pub n_reused: usize,
 }
 
 // ── flat parameter vector ───────────────────────────────────────────────────
@@ -615,39 +652,98 @@ pub fn run_bootstrap(
         return Err("the resampling allocation draws 0 subjects".to_string());
     }
 
+    // ── the draws ───────────────────────────────────────────────────────────
+    // Computed before anything is fitted, because `--resume` needs the draw of
+    // every replicate it *reuses* in order to rewrite the three draw files. It
+    // can have them without a single fit having happened: a draw is a pure
+    // function of `(seed, index)`.
+    let draws: Vec<Replicate> = (1..=options.samples)
+        .map(|i| resample::draw(&strata, &allocation, options.seed, i))
+        .collect();
+
+    // ── resume ──────────────────────────────────────────────────────────────
+    let manifest = RunManifest::new(
+        options,
+        prepared.model_hash.clone(),
+        prepared.data_hash.clone(),
+        &names,
+    );
+    let (reused_original, reused) = if options.resume {
+        let dir = options
+            .directory
+            .as_ref()
+            .expect("validate_for_run rejects --resume without --directory");
+        load_resumable(dir, &manifest, options)?
+    } else {
+        (None, Vec::new())
+    };
+    let n_reused = reused.len();
+    let already_done: std::collections::HashSet<usize> = reused.iter().map(|r| r.index).collect();
+
+    // ── the incremental journal ─────────────────────────────────────────────
+    // Opened before the first fit so that a kill at any point from here on
+    // leaves a directory the next `--resume` can read.
+    let journal = match &options.directory {
+        Some(dir) => {
+            let j = journal::Journal::create(
+                dir,
+                &names,
+                &subject_ids,
+                reused_original.as_ref(),
+                &reused,
+                &draws,
+                options,
+            )?;
+            manifest.write(&journal::manifest_path(dir))?;
+            Some(j)
+        }
+        None => None,
+    };
+
     // ── the base fit ────────────────────────────────────────────────────────
     let base_options = replicate_options(&prepared.parsed.fit_options, options.keep_covariance);
-    let original = if options.run_base_model {
-        let started = Instant::now();
-        let result = fit(
-            &prepared.parsed.model,
-            &prepared.population,
-            template,
-            // The base fit keeps the model file's own covariance setting: it is
-            // the run whose `R⁻¹` standard errors the bootstrap is being
-            // compared against.
-            &{
-                let mut o = base_options.clone();
-                o.run_covariance_step = prepared.parsed.fit_options.run_covariance_step;
-                o
-            },
-        )?;
-        let (near_boundary, cov_ok, cov_warn) = diagnostics_from(&result);
-        Some(ReplicateResult {
-            index: 0,
-            estimates: flatten_estimates(template, &result),
-            standard_errors: flat_standard_errors(template, &result),
-            ofv: result.ofv,
-            converged: result.converged,
-            estimate_near_boundary: near_boundary,
-            covariance_step_successful: cov_ok,
-            covariance_step_warnings: cov_warn,
-            seconds: started.elapsed().as_secs_f64(),
-            error: None,
-            delta_ofv: None,
-        })
-    } else {
-        None
+    let original = match reused_original {
+        // A resumed run must **not** refit the base model. `--update-inits`
+        // starts every replicate from its estimates, and a second fit can land
+        // on a slightly different optimum — so refitting it would start the new
+        // replicates from a different point than the ones already on disk, and
+        // the resumed run would no longer equal the uninterrupted one.
+        Some(base) => Some(base),
+        None if options.run_base_model => {
+            let started = Instant::now();
+            let result = fit(
+                &prepared.parsed.model,
+                &prepared.population,
+                template,
+                // The base fit keeps the model file's own covariance setting: it
+                // is the run whose `R⁻¹` standard errors the bootstrap is being
+                // compared against.
+                &{
+                    let mut o = base_options.clone();
+                    o.run_covariance_step = prepared.parsed.fit_options.run_covariance_step;
+                    o
+                },
+            )?;
+            let (near_boundary, cov_ok, cov_warn) = diagnostics_from(&result);
+            let base = ReplicateResult {
+                index: 0,
+                estimates: flatten_estimates(template, &result),
+                standard_errors: flat_standard_errors(template, &result),
+                ofv: result.ofv,
+                converged: result.converged,
+                estimate_near_boundary: near_boundary,
+                covariance_step_successful: cov_ok,
+                covariance_step_warnings: cov_warn,
+                seconds: started.elapsed().as_secs_f64(),
+                error: None,
+                delta_ofv: None,
+            };
+            if let Some(j) = &journal {
+                j.append(&base, None);
+            }
+            Some(base)
+        }
+        None => None,
     };
 
     // `--update-inits` starts every replicate from the base fit's estimates —
@@ -659,10 +755,6 @@ pub fn run_bootstrap(
     };
 
     // ── the replicates ──────────────────────────────────────────────────────
-    let draws: Vec<Replicate> = (1..=options.samples)
-        .map(|i| resample::draw(&strata, &allocation, options.seed, i))
-        .collect();
-
     let run_one = |replicate: &Replicate| -> ReplicateResult {
         let population = resample::build_population(&prepared.population, replicate);
         let started = Instant::now();
@@ -673,7 +765,7 @@ pub fn run_bootstrap(
             &base_options,
         );
         let seconds = started.elapsed().as_secs_f64();
-        match outcome {
+        let result = match outcome {
             Ok(result) => {
                 let (near_boundary, cov_ok, cov_warn) = diagnostics_from(&result);
                 ReplicateResult {
@@ -703,18 +795,37 @@ pub fn run_bootstrap(
                 error: Some(e),
                 delta_ofv: None,
             },
+        };
+        if let Some(j) = &journal {
+            j.append(&result, Some(replicate));
         }
+        result
     };
+
+    let todo: Vec<Replicate> = draws
+        .iter()
+        .filter(|d| !already_done.contains(&d.index))
+        .cloned()
+        .collect();
 
     let mut replicates = match options.threads {
         Some(n) if n > 1 => rayon::ThreadPoolBuilder::new()
             .num_threads(n)
             .build()
             .map_err(|e| format!("failed to build the bootstrap thread pool: {e}"))?
-            .install(|| draws.par_iter().map(run_one).collect::<Vec<_>>()),
-        Some(_) => draws.iter().map(run_one).collect(),
-        None => draws.par_iter().map(run_one).collect(),
+            .install(|| todo.par_iter().map(run_one).collect::<Vec<_>>()),
+        Some(_) => todo.iter().map(run_one).collect(),
+        None => todo.par_iter().map(run_one).collect(),
     };
+
+    // The journal's handles must be closed before `write_all` truncates the
+    // same paths below, and this is where a write failure inside the parallel
+    // loop surfaces.
+    if let Some(j) = journal {
+        j.into_result()?;
+    }
+
+    replicates.extend(reused);
     replicates.sort_by_key(|r| r.index);
 
     // ── Δofv ────────────────────────────────────────────────────────────────
@@ -737,12 +848,79 @@ pub fn run_bootstrap(
         subject_ids,
         summary,
         n_estimated_parameters,
+        n_reused,
     };
 
+    // Rewrites what the journal appended, this time in index order. A completed
+    // run's artefacts are therefore byte-identical however its replicates were
+    // scheduled — and identical to an uninterrupted run's, which is what makes
+    // `--resume` assertable rather than merely plausible.
     if let Some(dir) = &options.directory {
         output::write_all(dir, &result, options)?;
     }
     Ok(result)
+}
+
+/// Read an interrupted run's completed replicates back out of its directory.
+///
+/// Returns `(original, replicates)` — what may be reused rather than refitted.
+/// Anything dropped here is simply refitted, so the read errs towards dropping:
+/// the only unsafe outcome is *keeping* a row that does not belong to this run,
+/// which is what [`RunManifest::check_compatible`] rules out.
+fn load_resumable(
+    dir: &std::path::Path,
+    manifest: &RunManifest,
+    options: &BootstrapOptions,
+) -> Result<(Option<ReplicateResult>, Vec<ReplicateResult>), String> {
+    let raw = journal::raw_results_path(dir);
+    if !raw.exists() {
+        return Err(format!(
+            "--resume continues an interrupted run, but `{}` has no raw_results.csv. Drop \
+             --resume to start the run from sample 1.",
+            raw.display()
+        ));
+    }
+    let on_disk = RunManifest::read(&journal::manifest_path(dir))?;
+    manifest.check_compatible(&on_disk, dir)?;
+
+    let (file_names, original, replicates) = output::read_raw_results(&raw)?;
+    if file_names != manifest.parameter_names {
+        return Err(format!(
+            "--resume: the columns of `{}` are {:?}, but this model's parameters are {:?}. The \
+             directory belongs to a different run.",
+            raw.display(),
+            file_names,
+            manifest.parameter_names
+        ));
+    }
+
+    // A recorded failure is kept by default — PsN's answer, and the right one
+    // when the failure is deterministic, which it usually is. `--retry-failed`
+    // is for the case where it was not: an out-of-memory kill, a full disk.
+    let keep = |r: &ReplicateResult| !(options.retry_failed && r.error.is_some());
+
+    let mut seen = std::collections::HashSet::new();
+    let mut kept = Vec::new();
+    for r in replicates {
+        // Out-of-range indices cannot happen while `--samples` is pinned by the
+        // manifest, but a hand-edited file must not inject a replicate that no
+        // draw corresponds to.
+        if r.index == 0 || r.index > options.samples || !keep(&r) {
+            continue;
+        }
+        if seen.insert(r.index) {
+            kept.push(r);
+        }
+    }
+    kept.sort_by_key(|r| r.index);
+
+    // With `--no-run-base-model` the stored base fit is not part of this run,
+    // so it is not carried forward — and must not be, or it would reappear as a
+    // `sample = 0` row the user asked not to have.
+    let original = original
+        .filter(|_| options.run_base_model)
+        .filter(|r| keep(r));
+    Ok((original, kept))
 }
 
 /// Recompute the summary of a finished run from its `raw_results.csv`, under a
@@ -769,6 +947,7 @@ pub fn resummarize(
         ));
     }
     let (names, original, replicates) = output::read_raw_results(&raw)?;
+    let replicate_count = replicates.len();
     let summary = summary::summarize(&names, original.as_ref(), &replicates, options);
     let result = BootstrapResult {
         parameter_names: names,
@@ -789,6 +968,9 @@ pub fn resummarize(
             "chi_square_df",
         )
         .unwrap_or(0.0) as usize,
+        // `--summarize` refits nothing, so every replicate it reports is one an
+        // earlier run produced.
+        n_reused: replicate_count,
     };
     output::write_bootstrap_results(&directory.join("bootstrap_results.csv"), &result)?;
     output::write_diagnostics(&directory.join("bootstrap_diagnostics.csv"), &result)?;

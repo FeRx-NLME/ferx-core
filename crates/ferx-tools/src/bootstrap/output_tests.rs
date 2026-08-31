@@ -55,6 +55,7 @@ fn result() -> BootstrapResult {
             diagnostic_means: vec![("minimization_successful".to_string(), 0.5)],
         },
         n_estimated_parameters: 3,
+        n_reused: 0,
     }
 }
 
@@ -363,4 +364,90 @@ fn a_diagnostic_can_be_read_back_by_name() {
     assert_eq!(read_diagnostic(&path, "chi_square_df"), Some(3.0));
     assert_eq!(read_diagnostic(&path, "not_a_statistic"), None);
     assert_eq!(read_diagnostic(&dir.path().join("absent.csv"), "x"), None);
+}
+
+// ── recovering a file a hard kill cut in half (#1143) ───────────────────────
+
+/// Write a well-formed `raw_results.csv` and hand back its path and text.
+fn written_raw_results(dir: &std::path::Path) -> (std::path::PathBuf, String) {
+    let path = dir.join("raw_results.csv");
+    write_raw_results(&path, &result(), &BootstrapOptions::default()).expect("write");
+    let text = std::fs::read_to_string(&path).expect("read");
+    (path, text)
+}
+
+/// The core of `--resume`'s recovery: a run killed mid-write leaves a partial
+/// trailing row, and that row must be *dropped* rather than turned into an
+/// error — the sample is simply refitted. Keeping it would be the unsafe
+/// outcome, because a half-parsed row would enter the statistics.
+#[test]
+fn a_trailing_row_cut_mid_field_is_dropped_not_fatal() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (path, text) = written_raw_results(dir.path());
+    // Chop the final row partway through a value.
+    std::fs::write(&path, &text[..text.len() - 8]).expect("truncate");
+
+    let (_, original, replicates) = read_raw_results(&path).expect("a truncated tail is tolerated");
+    assert!(original.is_some(), "the earlier rows survive");
+    assert_eq!(replicates.len(), 1, "only the cut row is lost");
+    assert_eq!(replicates[0].index, 1);
+}
+
+/// A row can also be cut on a field boundary, leaving a short-but-parseable
+/// record. The column count is what catches that one.
+#[test]
+fn a_trailing_row_cut_on_a_field_boundary_is_dropped() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (path, text) = written_raw_results(dir.path());
+    let mut lines: Vec<&str> = text.lines().collect();
+    lines.pop();
+    std::fs::write(&path, format!("{}\n2,1,0,0,0,102.0\n", lines.join("\n"))).expect("truncate");
+
+    let (_, _, replicates) = read_raw_results(&path).expect("a short tail is tolerated");
+    assert_eq!(replicates.len(), 1);
+    assert_eq!(replicates[0].index, 1);
+}
+
+/// A complete-looking final row with no trailing newline is still a partial
+/// write — the writer terminates every record it finished. Dropping it costs
+/// one refit; keeping it risks a truncated number read as a real estimate.
+#[test]
+fn a_final_row_with_no_trailing_newline_is_dropped() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (path, text) = written_raw_results(dir.path());
+    std::fs::write(&path, text.trim_end_matches('\n')).expect("strip the newline");
+
+    let (_, _, replicates) = read_raw_results(&path).expect("read");
+    assert_eq!(replicates.len(), 1, "the unterminated row is dropped");
+}
+
+/// The tolerance is for the *tail* only. A short row in the middle is real
+/// corruption — silently dropping it would change the statistics without
+/// saying so, which is exactly what `--summarize` must not do.
+#[test]
+fn a_short_row_in_the_middle_is_an_error() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (path, text) = written_raw_results(dir.path());
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    lines.insert(2, "9,1,0".to_string());
+    std::fs::write(&path, lines.join("\n") + "\n").expect("write");
+
+    let err = read_raw_results(&path).expect_err("mid-file corruption must be reported");
+    assert!(err.contains("malformed row"), "{err}");
+    assert!(err.contains("columns"), "{err}");
+}
+
+/// A file holding nothing but its header is what a run killed before its first
+/// fit leaves behind. It must read as "no replicates", not as an error.
+#[test]
+fn a_header_only_file_reads_as_an_empty_run() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (path, text) = written_raw_results(dir.path());
+    let header = text.lines().next().expect("a header");
+    std::fs::write(&path, format!("{header}\n")).expect("write");
+
+    let (names, original, replicates) = read_raw_results(&path).expect("read");
+    assert_eq!(names, result().parameter_names);
+    assert!(original.is_none());
+    assert!(replicates.is_empty());
 }

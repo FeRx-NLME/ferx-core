@@ -273,6 +273,199 @@ fn the_drawn_datasets_do_not_depend_on_the_thread_count() {
     assert_eq!(indices, vec![1, 2, 3, 4]);
 }
 
+// ── --resume (#1143) ────────────────────────────────────────────────────────
+
+/// A run directory's `raw_results.csv`, with the wall-clock column removed.
+///
+/// `seconds` is the one cell that legitimately differs between two runs of the
+/// same fit, so it is dropped rather than compared; everything else — estimates,
+/// OFV, every termination diagnostic — must match exactly.
+fn raw_results_without_timings(dir: &Path) -> Vec<Vec<String>> {
+    let mut rows: Vec<Vec<String>> = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .from_path(dir.join("raw_results.csv"))
+        .expect("raw_results.csv is readable")
+        .records()
+        .map(|r| r.expect("record").iter().map(str::to_string).collect())
+        .collect();
+    let seconds = rows[0]
+        .iter()
+        .position(|h| h == "seconds")
+        .expect("a seconds column");
+    for row in rows.iter_mut() {
+        row.remove(seconds);
+    }
+    rows
+}
+
+fn resume_options(dir: &Path) -> BootstrapOptions {
+    BootstrapOptions {
+        samples: 3,
+        seed: 42,
+        threads: Some(1),
+        directory: Some(dir.to_path_buf()),
+        ..BootstrapOptions::default()
+    }
+}
+
+/// The whole claim of #1143: a resumed run is the uninterrupted one, not merely
+/// something statistically like it.
+///
+/// It is assertable rather than approximate because a replicate's draw is a pure
+/// function of `(seed, index)` — replicate 3 of the resumed run is fitted on
+/// exactly the dataset replicate 3 of the uninterrupted run saw, from exactly
+/// the same starting estimates, because the base fit is reused rather than
+/// repeated. PsN cannot make the same promise: its guide documents one shared,
+/// order-dependent RNG.
+#[test]
+fn a_resumed_run_equals_an_uninterrupted_one() {
+    let mut p = prepared();
+    // Tier 2: a handful of outer iterations, no convergence loop.
+    p.parsed.fit_options.outer_maxiter = 2;
+
+    let whole_dir = tempfile::tempdir().expect("temp dir");
+    let uninterrupted =
+        run_bootstrap(&p, &resume_options(whole_dir.path())).expect("the uninterrupted run");
+    assert_eq!(uninterrupted.n_reused, 0);
+
+    // Now the same run, killed after the base fit and sample 1: chop
+    // raw_results.csv back to those rows, exactly as an interrupted process
+    // would have left it.
+    let part_dir = tempfile::tempdir().expect("temp dir");
+    run_bootstrap(&p, &resume_options(part_dir.path())).expect("the first pass");
+    let raw = part_dir.path().join("raw_results.csv");
+    let text = std::fs::read_to_string(&raw).expect("read");
+    let kept: Vec<&str> = text.lines().take(3).collect();
+    std::fs::write(&raw, kept.join("\n") + "\n").expect("truncate");
+
+    let resumed = run_bootstrap(
+        &p,
+        &BootstrapOptions {
+            resume: true,
+            ..resume_options(part_dir.path())
+        },
+    )
+    .expect("the resumed run");
+
+    assert_eq!(resumed.n_reused, 1, "sample 1 was already on disk");
+    assert_eq!(resumed.replicates.len(), 3);
+    assert_eq!(
+        raw_results_without_timings(part_dir.path()),
+        raw_results_without_timings(whole_dir.path()),
+        "a resumed run must reproduce the uninterrupted run's raw_results.csv"
+    );
+
+    // The three per-replicate draw files are rewritten in index order too, so
+    // they are byte-identical — #1141's row-order guarantee survives a resume.
+    for name in [
+        "included_individuals1.csv",
+        "included_keys1.csv",
+        "sample_keys1.csv",
+    ] {
+        assert_eq!(
+            std::fs::read(part_dir.path().join(name)).expect(name),
+            std::fs::read(whole_dir.path().join(name)).expect(name),
+            "{name} differs after a resume"
+        );
+    }
+}
+
+/// A hard kill lands mid-write, not on a row boundary. The partial row is
+/// dropped and its sample refitted — the alternative, erroring out, would make
+/// `--resume` useless in exactly the case it exists for.
+#[test]
+fn a_run_cut_mid_row_resumes_by_refitting_that_sample() {
+    let mut p = prepared();
+    p.parsed.fit_options.outer_maxiter = 2;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    run_bootstrap(&p, &resume_options(dir.path())).expect("the first pass");
+    let raw = dir.path().join("raw_results.csv");
+    let text = std::fs::read_to_string(&raw).expect("read");
+    // Cut the last row partway through a field.
+    std::fs::write(&raw, &text[..text.len() - 12]).expect("truncate");
+
+    let resumed = run_bootstrap(
+        &p,
+        &BootstrapOptions {
+            resume: true,
+            ..resume_options(dir.path())
+        },
+    )
+    .expect("a truncated tail must not be fatal");
+
+    assert_eq!(resumed.n_reused, 2, "only the cut sample is refitted");
+    assert_eq!(resumed.replicates.len(), 3);
+    assert!(resumed.replicates.iter().all(|r| r.error.is_none()));
+}
+
+/// Resuming a finished run refits nothing and rewrites the summary — the
+/// "nothing to do" case, which must be a no-op rather than an error.
+#[test]
+fn resuming_a_complete_run_refits_nothing() {
+    let mut p = prepared();
+    p.parsed.fit_options.outer_maxiter = 2;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let first = run_bootstrap(&p, &resume_options(dir.path())).expect("the first pass");
+    let resumed = run_bootstrap(
+        &p,
+        &BootstrapOptions {
+            resume: true,
+            ..resume_options(dir.path())
+        },
+    )
+    .expect("resuming a complete run");
+
+    assert_eq!(resumed.n_reused, 3);
+    assert_eq!(resumed.summary.n_included, first.summary.n_included);
+    assert!(dir.path().join("bootstrap_results.csv").exists());
+}
+
+/// The guard against the silent corruption: resuming into a directory another
+/// run wrote would label one model's estimates with another's parameter names.
+#[test]
+fn resuming_a_directory_from_a_different_seed_is_refused() {
+    let mut p = prepared();
+    p.parsed.fit_options.outer_maxiter = 1;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    run_bootstrap(&p, &resume_options(dir.path())).expect("the first pass");
+
+    let err = run_bootstrap(
+        &p,
+        &BootstrapOptions {
+            resume: true,
+            seed: 4242,
+            ..resume_options(dir.path())
+        },
+    )
+    .expect_err("a different seed must refuse the resume");
+    assert!(err.contains("--seed"), "{err}");
+}
+
+/// A fresh run writes its manifest before the first fit, so a process killed at
+/// any point leaves a directory the next `--resume` can check itself against.
+#[test]
+fn a_run_records_what_it_was_created_from() {
+    let mut p = prepared();
+    p.parsed.fit_options.outer_maxiter = 1;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    run_bootstrap(&p, &resume_options(dir.path())).expect("bootstrap runs");
+
+    let manifest = ferx_tools::bootstrap::RunManifest::read(&dir.path().join("bootstrap_run.json"))
+        .expect("the manifest is written");
+    assert_eq!(manifest.seed, 42);
+    assert_eq!(manifest.samples, 3);
+    assert_eq!(manifest.sample_size, "original");
+    assert_eq!(manifest.parameter_names.len(), 7);
+    assert!(
+        manifest.model_hash.is_some() && manifest.data_hash.is_some(),
+        "the model and data hashes come from prepare_run"
+    );
+}
+
 /// The shipped warfarin dataset carries no grouping column, so write a copy with
 /// one: `STUDY` alternates by ID, and is constant within each subject.
 ///

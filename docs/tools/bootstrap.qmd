@@ -181,6 +181,92 @@ ferx bootstrap --summarize --directory run12-bootstrap --no-skip-minimization-te
 `--summarize` re-reads `raw_results.csv` — which carries each replicate's diagnostics
 alongside its estimates — and rewrites the statistics. It refits nothing.
 
+## Recovering an interrupted run
+
+A 200-sample bootstrap is hours of fitting, and the two ways it goes wrong need different
+answers. PsN's user guide treats them as one recovery section; ferx splits them by flag.
+
+| what happened | what to do |
+|---|---|
+| too many samples were filtered out | `--summarize` — nothing needs refitting, only the exclusion criteria change |
+| the process was killed, the machine crashed, the job hit a wall clock | `--resume` — refit only the samples that never finished |
+| some samples failed for a reason you have since fixed | `--resume --retry-failed` |
+
+```bash
+# The run dies at sample 137 of 200.
+ferx bootstrap run12.ferx --data data.csv --samples 200 --directory run12-bootstrap
+
+# Pick it up. Samples 1..136 are read back; 137..200 are fitted.
+ferx bootstrap run12.ferx --data data.csv --samples 200 --directory run12-bootstrap --resume
+```
+
+The per-replicate files are written **as each replicate finishes**, not at the end, so a
+run killed at any point leaves everything it had already completed.
+
+### A resumed run is the uninterrupted run
+
+Not "statistically equivalent" — identical. Each replicate's draw comes from the master
+seed and its own index, so replicate 137 of the resumed run is fitted on exactly the
+dataset replicate 137 of the uninterrupted run would have seen, from exactly the same
+starting estimates: the base model is **reused rather than refitted**, because
+`--update-inits` starts every replicate from its results and a second base fit could land
+somewhere marginally different. `raw_results.csv` comes out identical either way, wall
+clock aside, and that is asserted as a test rather than assumed.
+
+PsN cannot promise this. Its guide documents one shared, order-dependent random-number
+generator, so a resumed PsN run draws a different set of datasets than an uninterrupted
+one would have.
+
+### Failed replicates are kept unless you say otherwise
+
+A replicate whose fit *errored* is recorded with the error text and, by default, carried
+forward on a resume rather than refitted. This is PsN's answer — its recovery instructions
+have you delete the run files you want redone — and it is the right default because a fit
+that failed on this dataset usually fails again, and paying for it a second time reaches
+the same place.
+
+`--retry-failed` inverts that. Use it when the failure was a transient resource problem —
+an out-of-memory kill, a full disk, a lost network mount — rather than the model.
+
+Note that an errored replicate is not the same thing as a *filtered* one. A replicate that
+merely failed to converge fitted fine, is in `raw_results.csv` with
+`minimization_successful = 0`, and is dropped by a filter at summary time; `--retry-failed`
+does not touch it. Change your mind about those with `--summarize`.
+
+### Resuming the wrong directory is refused
+
+Every run writes `bootstrap_run.json` beside its CSVs, recording the seed, sample count,
+sample size, stratification column, `--keep-covariance` / `--dofv`, the parameter names,
+and SHA-256 hashes of the model file and the dataset. A `--resume` whose options or inputs
+disagree is refused, naming the field that differs:
+
+```
+--resume: `run12-bootstrap` was created with --seed 1, but this run asks for 42.
+Resuming would mix two different runs' replicates into one raw_results.csv.
+Use a fresh --directory, or drop the conflicting option.
+```
+
+Without that check the resumed file would carry one model's estimates under another
+model's column names — a corruption nothing downstream could detect, because the file
+would still parse and the statistics would still compute.
+
+A run killed mid-write leaves a partial trailing row. It is dropped and that one sample
+refitted; only the tail is treated this way, and a malformed row anywhere else is an
+error, because silently dropping a row in the middle would change the statistics without
+saying so.
+
+::: {.callout-note}
+## `raw_results.csv` is written at full precision
+
+Its numbers are printed as the shortest decimal that reads back to the same bits, rather
+than rounded to a fixed number of places, because the file is the run's checkpoint: a
+resumed run starts its replicates from the base fit's estimates *as read back from it*.
+Rounding would perturb that starting point and the resumed run would only match the
+uninterrupted one to about 1e-9. The statistics files (`bootstrap_results.csv`,
+`bootstrap_diagnostics.csv`) keep their fixed ten decimals — nothing is ever fitted from
+those.
+:::
+
 ## Confidence intervals
 
 Percentile intervals use PsN's estimator, the weighted average at `x₍ₙ₊₁₎ₚ`:
@@ -238,9 +324,16 @@ scripts and habits transfer.
 | `sample_keys1.csv`           | per replicate, one count per original subject: how many times it was drawn |
 | `all_individuals1.csv`       | every subject of the original dataset, in original order |
 | `delta_ofv.csv`              | `--dofv` only |
+| `bootstrap_run.json`         | the seed, options and input hashes the directory was created with — what `--resume` checks itself against |
 
 Row *j* refers to the same replicate in `raw_results`, `included_individuals`,
 `included_keys` and `sample_keys`, as in PsN.
+
+The first four are written **incrementally**, one row per replicate as it finishes, so an
+interrupted run leaves what it had already done; the rest are written once at the end. A
+completed run's files are always in sample order regardless of how its replicates were
+scheduled, or whether it was resumed. Starting a fresh run into a directory that already
+holds one overwrites it — add `--resume` to continue it instead.
 
 Two files depart from PsN's layout on purpose. `bootstrap_results.csv` is **tidy** — one
 row per parameter — rather than PsN's stacked blocks of statistics, and the run-level
@@ -264,6 +357,8 @@ defeats the point of writing it.
 | `--keep-covariance`  | off | run the covariance step for every replicate |
 | `--dofv`             | off | compute Δofv against the original dataset |
 | `--summarize`        | off | recompute statistics from an existing run directory |
+| `--resume`           | off | continue an interrupted run in `--directory`, refitting only the samples it does not already hold |
+| `--retry-failed`     | off | with `--resume`, also refit the samples recorded as failed |
 
 Options in the PsN guide with no ferx analogue — `-allow_ignore_id`, `-copy_data`,
 `-mceta`, `-rplots`, `-clean` — are NONMEM run-directory plumbing and are not implemented.

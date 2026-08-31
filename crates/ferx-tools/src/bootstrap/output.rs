@@ -14,7 +14,7 @@
 
 use std::path::Path;
 
-use super::{BootstrapOptions, BootstrapResult};
+use super::{BootstrapOptions, BootstrapResult, Replicate, ReplicateResult};
 
 fn fmt(v: f64) -> String {
     if v.is_finite() {
@@ -26,6 +26,43 @@ fn fmt(v: f64) -> String {
 
 fn opt(v: Option<f64>) -> String {
     v.map(fmt).unwrap_or_default()
+}
+
+/// Full round-trip precision, for `raw_results.csv` only.
+///
+/// Not a presentation choice. Since #1143 that file is the run's *checkpoint*: a
+/// resumed run starts every replicate from the base fit's estimates **as read
+/// back from it**, and recomputes `--dofv` from the replicates' own. Rounding to
+/// a fixed ten decimals perturbs those inputs in the eleventh digit, and a fit
+/// started from a perturbed point lands somewhere slightly different — so
+/// "a resume equals an uninterrupted run" would hold to about 1e-9 rather than
+/// exactly, which is not a guarantee a test can pin.
+///
+/// Rust's default `{}` for `f64` prints the shortest decimal that parses back to
+/// the same bits, so the file stays readable as well as lossless. The statistics
+/// files keep [`fmt`]'s fixed ten decimals: nothing is ever fitted from those.
+fn fmt_exact(v: f64) -> String {
+    if v.is_finite() {
+        format!("{v}")
+    } else {
+        String::new()
+    }
+}
+
+fn opt_exact(v: Option<f64>) -> String {
+    v.map(fmt_exact).unwrap_or_default()
+}
+
+/// Flatten a fit error into a single line.
+///
+/// Not cosmetic. The journal ([`super::journal`]) is recovered after a hard kill
+/// by dropping an incomplete trailing *record*, and `error` is the one free-text
+/// column: a message carrying a newline would be written as a quoted multi-line
+/// field, and a kill landing inside it leaves a fragment that is far harder to
+/// tell apart from a complete row. Keeping every row exactly one line keeps the
+/// recovery rule simple enough to be right.
+fn one_line(s: &str) -> String {
+    s.replace(['\n', '\r'], " ")
 }
 
 /// Write every artefact into `dir`, creating it if needed.
@@ -70,6 +107,26 @@ pub fn write_raw_results(
     options: &BootstrapOptions,
 ) -> Result<(), String> {
     let mut w = writer(path)?;
+    w.write_record(raw_results_header(&result.parameter_names, options))
+        .map_err(|e| format!("cannot write `{}`: {e}", path.display()))?;
+
+    let n_params = result.parameter_names.len();
+    let rows = result.original.iter().chain(result.replicates.iter());
+    for r in rows {
+        w.write_record(raw_results_row(r, n_params, options))
+            .map_err(|e| format!("cannot write `{}`: {e}", path.display()))?;
+    }
+    finish(w, path)
+}
+
+/// The header of `raw_results.csv`.
+///
+/// Shared with [`super::journal`] rather than duplicated: the incremental
+/// journal appends rows to the same file this function heads, so a divergence
+/// between the two would put the columns out of step with their names — the one
+/// corruption `read_raw_results` cannot detect, because the file would still
+/// parse.
+pub(crate) fn raw_results_header(names: &[String], options: &BootstrapOptions) -> Vec<String> {
     let mut header = vec![
         "sample".to_string(),
         "minimization_successful".to_string(),
@@ -79,49 +136,68 @@ pub fn write_raw_results(
         "ofv".to_string(),
         "seconds".to_string(),
     ];
-    header.extend(result.parameter_names.iter().cloned());
+    header.extend(names.iter().cloned());
     if options.keep_covariance {
-        header.extend(result.parameter_names.iter().map(|n| format!("se_{n}")));
+        header.extend(names.iter().map(|n| format!("se_{n}")));
     }
     if options.dofv {
         header.push("delta_ofv".to_string());
     }
     header.push("error".to_string());
-    w.write_record(&header)
-        .map_err(|e| format!("cannot write `{}`: {e}", path.display()))?;
+    header
+}
 
-    let n_params = result.parameter_names.len();
-    let rows = result.original.iter().chain(result.replicates.iter());
-    for r in rows {
-        let mut row = vec![
-            r.index.to_string(),
-            (r.converged as u8).to_string(),
-            (r.estimate_near_boundary as u8).to_string(),
-            (r.covariance_step_successful as u8).to_string(),
-            (r.covariance_step_warnings as u8).to_string(),
-            fmt(r.ofv),
-            format!("{:.3}", r.seconds),
-        ];
+/// One `raw_results.csv` row. See [`raw_results_header`] for why it is shared.
+pub(crate) fn raw_results_row(
+    r: &ReplicateResult,
+    n_params: usize,
+    options: &BootstrapOptions,
+) -> Vec<String> {
+    let mut row = vec![
+        r.index.to_string(),
+        (r.converged as u8).to_string(),
+        (r.estimate_near_boundary as u8).to_string(),
+        (r.covariance_step_successful as u8).to_string(),
+        (r.covariance_step_warnings as u8).to_string(),
+        fmt_exact(r.ofv),
+        format!("{:.3}", r.seconds),
+    ];
+    for j in 0..n_params {
+        row.push(opt_exact(r.estimates.get(j).copied()));
+    }
+    if options.keep_covariance {
         for j in 0..n_params {
-            row.push(opt(r.estimates.get(j).copied()));
-        }
-        if options.keep_covariance {
-            for j in 0..n_params {
-                row.push(opt(r
-                    .standard_errors
+            row.push(opt_exact(
+                r.standard_errors
                     .as_ref()
                     .and_then(|s| s.get(j).copied())
-                    .flatten()));
-            }
+                    .flatten(),
+            ));
         }
-        if options.dofv {
-            row.push(opt(r.delta_ofv));
-        }
-        row.push(r.error.clone().unwrap_or_default());
-        w.write_record(&row)
-            .map_err(|e| format!("cannot write `{}`: {e}", path.display()))?;
     }
-    finish(w, path)
+    if options.dofv {
+        row.push(opt_exact(r.delta_ofv));
+    }
+    row.push(r.error.as_deref().map(one_line).unwrap_or_default());
+    row
+}
+
+/// One `included_individuals1.csv` row: the original subject IDs drawn.
+pub(crate) fn included_individuals_row(draw: &Replicate, subject_ids: &[String]) -> Vec<String> {
+    draw.keys.iter().map(|&k| subject_ids[k].clone()).collect()
+}
+
+/// One `included_keys1.csv` row: the internal 1..N ordinals drawn.
+pub(crate) fn included_keys_row(draw: &Replicate) -> Vec<String> {
+    draw.keys.iter().map(|&k| (k + 1).to_string()).collect()
+}
+
+/// One `sample_keys1.csv` row: how many times each original subject was drawn.
+pub(crate) fn sample_keys_row(draw: &Replicate, n_subjects: usize) -> Vec<String> {
+    draw.counts(n_subjects)
+        .iter()
+        .map(|c| c.to_string())
+        .collect()
 }
 
 /// The statistics table: one row per parameter.
@@ -217,12 +293,7 @@ pub fn write_all_individuals(path: &Path, result: &BootstrapResult) -> Result<()
 pub fn write_included_individuals(path: &Path, result: &BootstrapResult) -> Result<(), String> {
     let mut w = writer(path)?;
     for draw in &result.draws {
-        let row: Vec<String> = draw
-            .keys
-            .iter()
-            .map(|&k| result.subject_ids[k].clone())
-            .collect();
-        w.write_record(&row)
+        w.write_record(included_individuals_row(draw, &result.subject_ids))
             .map_err(|e| format!("cannot write `{}`: {e}", path.display()))?;
     }
     finish(w, path)
@@ -232,8 +303,7 @@ pub fn write_included_individuals(path: &Path, result: &BootstrapResult) -> Resu
 pub fn write_included_keys(path: &Path, result: &BootstrapResult) -> Result<(), String> {
     let mut w = writer(path)?;
     for draw in &result.draws {
-        let row: Vec<String> = draw.keys.iter().map(|&k| (k + 1).to_string()).collect();
-        w.write_record(&row)
+        w.write_record(included_keys_row(draw))
             .map_err(|e| format!("cannot write `{}`: {e}", path.display()))?;
     }
     finish(w, path)
@@ -247,8 +317,7 @@ pub fn write_sample_keys(path: &Path, result: &BootstrapResult) -> Result<(), St
     w.write_record(result.subject_ids.iter())
         .map_err(|e| format!("cannot write `{}`: {e}", path.display()))?;
     for draw in &result.draws {
-        let row: Vec<String> = draw.counts(n).iter().map(|c| c.to_string()).collect();
-        w.write_record(&row)
+        w.write_record(sample_keys_row(draw, n))
             .map_err(|e| format!("cannot write `{}`: {e}", path.display()))?;
     }
     finish(w, path)
@@ -291,6 +360,13 @@ pub fn read_diagnostic(path: &Path, key: &str) -> Option<f64> {
 /// finished run under different settings without refitting anything. PsN
 /// supports the same move for the same reason.
 ///
+/// Since #1143 the file is also written *incrementally*, so a run killed
+/// mid-write leaves a partial trailing row. That row — and only that row — is
+/// dropped rather than treated as an error: a dropped replicate is simply
+/// refitted by `--resume`, whereas a *kept* partial row would silently enter the
+/// statistics. A short or unparseable row anywhere but at the end is real
+/// corruption and is still an error.
+///
 /// Returns `(parameter_names, original, replicates)`; `original` is the
 /// `sample = 0` row when the base model was run.
 #[allow(clippy::type_complexity)]
@@ -304,8 +380,13 @@ pub fn read_raw_results(
     ),
     String,
 > {
-    let mut reader = csv::Reader::from_path(path)
+    let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read `{}`: {e}", path.display()))?;
+    // `flexible` so a truncated row arrives as a short record to be inspected
+    // below, instead of aborting the whole read with `UnequalLengths`.
+    let mut reader = csv::ReaderBuilder::new()
+        .flexible(true)
+        .from_reader(text.as_bytes());
     let header: Vec<String> = reader
         .headers()
         .map_err(|e| format!("cannot read the header of `{}`: {e}", path.display()))?
@@ -360,10 +441,38 @@ pub fn read_raw_results(
         matches!(row.get(i).map(str::trim), Some("1") | Some("true"))
     };
 
+    // Read every record first: whether a bad one may be dropped depends on
+    // whether anything follows it, which a streaming loop cannot know.
+    let raw: Vec<Result<csv::StringRecord, csv::Error>> = reader.records().collect();
+    let last = raw.len().saturating_sub(1);
+    // A file whose final byte is not a newline was cut mid-record: the writer
+    // terminates every record it finished, so the trailing row is a partial
+    // write even when it happens to carry a full set of columns.
+    let tail_incomplete = !text.ends_with('\n');
+    let mut rows: Vec<csv::StringRecord> = Vec::with_capacity(raw.len());
+    for (i, record) in raw.into_iter().enumerate() {
+        let is_tail = i == last;
+        match record {
+            Ok(row) if row.len() == header.len() && !(is_tail && tail_incomplete) => rows.push(row),
+            // Short, unparseable, or unterminated — but last. Drop it; the
+            // sample is simply refitted.
+            Ok(_) | Err(_) if is_tail => {}
+            Ok(row) => {
+                return Err(format!(
+                    "malformed row in `{}`: row {} has {} columns, expected {}",
+                    path.display(),
+                    i + 2,
+                    row.len(),
+                    header.len()
+                ))
+            }
+            Err(e) => return Err(format!("malformed row in `{}`: {e}", path.display())),
+        }
+    }
+
     let mut original = None;
     let mut replicates = Vec::new();
-    for record in reader.records() {
-        let row = record.map_err(|e| format!("malformed row in `{}`: {e}", path.display()))?;
+    for row in rows {
         let index = row
             .get(0)
             .and_then(|s| s.trim().parse::<usize>().ok())
