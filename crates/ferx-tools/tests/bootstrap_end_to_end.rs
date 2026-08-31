@@ -384,3 +384,237 @@ fn a_missing_model_file_is_an_error_not_a_panic() {
     assert!(prepare_run("does-not-exist.ferx", Some(DATA)).is_err());
     assert!(Path::new(MODEL).exists(), "the fixture moved");
 }
+
+// ── option validation ───────────────────────────────────────────────────────
+
+/// A prepared run capped at one outer iteration, for the option-validation
+/// checks below. Most of them reject before any fit happens.
+fn quick() -> PreparedRun {
+    let mut p = prepared();
+    p.parsed.fit_options.outer_maxiter = 1;
+    p
+}
+
+fn err_of(options: BootstrapOptions) -> String {
+    match run_bootstrap(&quick(), &options) {
+        Ok(_) => panic!("expected an error"),
+        Err(e) => e,
+    }
+}
+
+#[test]
+fn zero_samples_is_refused() {
+    let err = err_of(BootstrapOptions {
+        samples: 0,
+        directory: None,
+        ..BootstrapOptions::default()
+    });
+    assert!(err.contains("--samples"), "{err}");
+}
+
+#[test]
+fn a_confidence_level_outside_zero_to_a_hundred_is_refused() {
+    for level in [0.0, 100.0, 150.0, -5.0] {
+        let err = err_of(BootstrapOptions {
+            confidence_level: level,
+            samples: 1,
+            directory: None,
+            ..BootstrapOptions::default()
+        });
+        assert!(err.contains("--ci"), "level {level}: {err}");
+    }
+}
+
+#[test]
+fn a_covstep_filter_without_the_covariance_step_is_refused() {
+    // The filter reads a diagnostic that only exists when the step ran. Silently
+    // ignoring it would drop a filter the user asked for.
+    for options in [
+        BootstrapOptions {
+            skip_covariance_step_terminated: true,
+            ..BootstrapOptions::default()
+        },
+        BootstrapOptions {
+            skip_with_covstep_warnings: true,
+            ..BootstrapOptions::default()
+        },
+    ] {
+        let err = err_of(BootstrapOptions {
+            samples: 1,
+            directory: None,
+            ..options
+        });
+        assert!(err.contains("--keep-covariance"), "{err}");
+    }
+}
+
+#[test]
+fn an_allocation_that_draws_nothing_is_refused() {
+    let err = err_of(BootstrapOptions {
+        samples: 1,
+        sample_size: SampleSize::Total(0),
+        directory: None,
+        ..BootstrapOptions::default()
+    });
+    assert!(err.contains("0 subjects"), "{err}");
+}
+
+#[test]
+fn a_missing_stratification_column_stops_the_run() {
+    let err = err_of(BootstrapOptions {
+        samples: 1,
+        stratify_on: Some("NO_SUCH_COLUMN".to_string()),
+        directory: None,
+        ..BootstrapOptions::default()
+    });
+    assert!(err.contains("NO_SUCH_COLUMN"), "{err}");
+}
+
+#[test]
+fn dofv_without_a_base_fit_is_refused() {
+    // Δofv is measured against the original fit's OFV; there is no reference
+    // without it.
+    let err = err_of(BootstrapOptions {
+        samples: 1,
+        dofv: true,
+        run_base_model: false,
+        directory: None,
+        ..BootstrapOptions::default()
+    });
+    assert!(err.contains("--no-run-base-model"), "{err}");
+}
+
+// ── the optional paths ──────────────────────────────────────────────────────
+
+#[test]
+fn keep_covariance_populates_the_per_replicate_standard_errors() {
+    let mut p = prepared();
+    p.parsed.fit_options.outer_maxiter = 1;
+
+    let plain = run_bootstrap(
+        &p,
+        &BootstrapOptions {
+            samples: 1,
+            threads: Some(1),
+            run_base_model: false,
+            directory: None,
+            ..BootstrapOptions::default()
+        },
+    )
+    .expect("bootstrap");
+    assert!(plain.replicates[0].standard_errors.is_none());
+
+    let with_cov = run_bootstrap(
+        &p,
+        &BootstrapOptions {
+            samples: 1,
+            threads: Some(1),
+            keep_covariance: true,
+            run_base_model: false,
+            directory: None,
+            ..BootstrapOptions::default()
+        },
+    )
+    .expect("bootstrap with covariance");
+    let se = with_cov.replicates[0]
+        .standard_errors
+        .as_ref()
+        .expect("covariance step ran, so SEs exist");
+    assert_eq!(se.len(), with_cov.parameter_names.len());
+    assert!(se.iter().all(|v| v.is_finite() && *v >= 0.0), "{se:?}");
+}
+
+#[test]
+fn no_run_base_model_leaves_bias_and_the_normal_interval_undefined() {
+    let mut p = prepared();
+    p.parsed.fit_options.outer_maxiter = 1;
+    let result = run_bootstrap(
+        &p,
+        &BootstrapOptions {
+            samples: 2,
+            threads: Some(1),
+            run_base_model: false,
+            directory: None,
+            // These fits are capped at one outer iteration, so none of them
+            // converges. Keeping the default filter on would exclude every
+            // sample and leave the statistics NaN — correct behaviour, but it
+            // would make this test vacuous about the thing it is checking.
+            skip_minimization_terminated: false,
+            skip_estimate_near_boundary: false,
+            ..BootstrapOptions::default()
+        },
+    )
+    .expect("bootstrap");
+
+    assert!(result.original.is_none());
+    assert_eq!(result.summary.n_included, 2);
+    for p in &result.summary.parameters {
+        assert!(p.original.is_none());
+        assert!(p.bias.is_none(), "bias needs a reference fit");
+        assert!(p.ci_standard_error.is_none());
+        // The bootstrap's own statistics are still there.
+        assert!(p.mean.is_finite());
+    }
+}
+
+#[test]
+fn a_run_whose_samples_all_terminate_reports_nothing_included() {
+    // The complement of the test above, and the reason the CLI exits non-zero
+    // on it: with the default filters and fits that cannot converge, every
+    // sample is excluded and there is no interval to report. That must show up
+    // as `n_included == 0` rather than as a plausible-looking table.
+    let mut p = prepared();
+    p.parsed.fit_options.outer_maxiter = 1;
+    let result = run_bootstrap(
+        &p,
+        &BootstrapOptions {
+            samples: 2,
+            threads: Some(1),
+            run_base_model: false,
+            directory: None,
+            ..BootstrapOptions::default()
+        },
+    )
+    .expect("bootstrap");
+
+    assert_eq!(result.summary.n_completed, 2, "the fits themselves ran");
+    assert_eq!(result.summary.n_included, 0);
+    assert!(!result.summary.excluded_by.is_empty());
+    assert!(result.summary.parameters.iter().all(|p| p.mean.is_nan()));
+}
+
+#[test]
+fn dofv_is_non_negative_and_written_out() {
+    // Evaluating any other parameter vector on the original data must score
+    // worse than the original fit's own optimum, so every Δofv is ≥ 0. That is
+    // the cheapest real check on the whole evaluation path.
+    let mut p = prepared();
+    p.parsed.fit_options.outer_maxiter = 2;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let result = run_bootstrap(
+        &p,
+        &BootstrapOptions {
+            samples: 2,
+            seed: 9,
+            threads: Some(1),
+            dofv: true,
+            directory: Some(dir.path().to_path_buf()),
+            ..BootstrapOptions::default()
+        },
+    )
+    .expect("bootstrap with dofv");
+
+    for r in &result.replicates {
+        let delta = r.delta_ofv.expect("every completed replicate has a Δofv");
+        assert!(
+            delta >= -1e-6,
+            "replicate {} has a negative Δofv ({delta}), which would mean the base fit \
+             was not at its own optimum",
+            r.index
+        );
+    }
+    let written = std::fs::read_to_string(dir.path().join("delta_ofv.csv")).expect("delta_ofv.csv");
+    assert!(written.starts_with("sample,delta_ofv"));
+    assert_eq!(written.lines().count(), 3, "header + one row per replicate");
+}

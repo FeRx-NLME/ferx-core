@@ -326,6 +326,35 @@ fn a_failed_replicate_round_trips_as_failed() {
 }
 
 #[test]
+fn an_unwritable_directory_is_an_error_not_a_panic() {
+    // A bootstrap that cannot write its results has still done the expensive
+    // part, so it must report the failure rather than unwrap into a panic and
+    // lose 200 fits.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let blocked = dir.path().join("results");
+    std::fs::write(&blocked, "not a directory").expect("write");
+
+    let err = write_all(&blocked, &result(), &BootstrapOptions::default()).unwrap_err();
+    assert!(err.contains("bootstrap directory"), "{err}");
+
+    // And a writer pointed at a path inside that non-directory.
+    let err = write_raw_results(
+        &blocked.join("raw_results.csv"),
+        &result(),
+        &BootstrapOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("cannot write"), "{err}");
+}
+
+#[test]
+fn reading_a_missing_raw_results_file_is_an_error() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let err = read_raw_results(&dir.path().join("absent.csv")).unwrap_err();
+    assert!(err.contains("cannot read"), "{err}");
+}
+
+#[test]
 fn a_diagnostic_can_be_read_back_by_name() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("bootstrap_diagnostics.csv");

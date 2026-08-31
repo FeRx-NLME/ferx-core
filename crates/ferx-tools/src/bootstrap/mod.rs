@@ -336,6 +336,19 @@ fn replicate_options(base: &FitOptions, keep_covariance: bool) -> FitOptions {
     o
 }
 
+/// The per-replicate standard errors, flattened in [`parameter_names`] order.
+///
+/// `None` when the covariance step did not run — which is the default, and why
+/// the bootstrap standard error is the spread of the estimates rather than an
+/// average of these.
+fn flat_standard_errors(result: &FitResult) -> Option<Vec<f64>> {
+    let theta = result.se_theta.as_ref()?;
+    let mut se = theta.clone();
+    se.extend(result.se_omega.clone().unwrap_or_default());
+    se.extend(result.se_sigma.clone().unwrap_or_default());
+    Some(se)
+}
+
 fn diagnostics_from(result: &FitResult) -> (bool, bool, bool) {
     let near_boundary = result
         .warnings_structured
@@ -452,12 +465,7 @@ pub fn run_bootstrap(
         Some(ReplicateResult {
             index: 0,
             estimates: flatten_estimates(template, &result),
-            standard_errors: result.se_theta.as_ref().map(|_| {
-                let mut se = result.se_theta.clone().unwrap_or_default();
-                se.extend(result.se_omega.clone().unwrap_or_default());
-                se.extend(result.se_sigma.clone().unwrap_or_default());
-                se
-            }),
+            standard_errors: flat_standard_errors(&result),
             ofv: result.ofv,
             converged: result.converged,
             estimate_near_boundary: near_boundary,
@@ -500,16 +508,7 @@ pub fn run_bootstrap(
                 ReplicateResult {
                     index: replicate.index,
                     estimates: flatten_estimates(template, &result),
-                    standard_errors: if options.keep_covariance {
-                        result.se_theta.as_ref().map(|_| {
-                            let mut se = result.se_theta.clone().unwrap_or_default();
-                            se.extend(result.se_omega.clone().unwrap_or_default());
-                            se.extend(result.se_sigma.clone().unwrap_or_default());
-                            se
-                        })
-                    } else {
-                        None
-                    },
+                    standard_errors: flat_standard_errors(&result),
                     ofv: result.ofv,
                     converged: result.converged,
                     estimate_near_boundary: near_boundary,

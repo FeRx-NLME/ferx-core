@@ -164,7 +164,10 @@ fn run_summarize(args: &[String]) -> Result<i32, String> {
         "Re-summarized {dir}: {} of {} completed samples included",
         summary.n_included, summary.n_completed
     );
-    print_table(&summary.parameters, summary.confidence_level);
+    print!(
+        "{}",
+        render_table(&summary.parameters, summary.confidence_level)
+    );
     Ok(0)
 }
 
@@ -201,7 +204,7 @@ fn run_bootstrap_command(args: &[String], model_path: &str) -> Result<i32, Strin
         result.replicates.len(),
         started.elapsed().as_secs_f64()
     );
-    report(&result, &options);
+    print!("{}", report(&result, &options));
 
     // A run whose samples nearly all failed produced no usable interval, and
     // saying so in the exit code keeps it from passing silently in a pipeline.
@@ -212,32 +215,37 @@ fn run_bootstrap_command(args: &[String], model_path: &str) -> Result<i32, Strin
     Ok(0)
 }
 
-fn report(result: &BootstrapResult, options: &BootstrapOptions) {
+/// Render the whole report. Built as a `String` rather than printed line by line
+/// so the layout is testable in-process — the CLI's own integration tests run
+/// the binary as a subprocess, which is the right way to check exit codes and
+/// the wrong way to check what a table looks like.
+fn report(result: &BootstrapResult, options: &BootstrapOptions) -> String {
     let s = &result.summary;
-    println!(
-        "\n{} of {} samples completed; {} included in the statistics",
+    let mut out = format!(
+        "\n{} of {} samples completed; {} included in the statistics\n",
         s.n_completed,
         result.replicates.len(),
         s.n_included
     );
     for (reason, n) in &s.excluded_by {
-        println!("  excluded {n}: {reason}");
+        out.push_str(&format!("  excluded {n}: {reason}\n"));
     }
-    print_table(&s.parameters, s.confidence_level);
+    out.push_str(&render_table(&s.parameters, s.confidence_level));
 
-    if s.parameters.iter().all(|p| p.ci_percentile.is_none()) {
-        println!(
+    if !s.parameters.is_empty() && s.parameters.iter().all(|p| p.ci_percentile.is_none()) {
+        out.push_str(&format!(
             "\nNote: {} samples cannot resolve a {}% percentile interval; only the \
-             normal-approximation interval is shown. PsN's rule of thumb is 200 samples.",
+             normal-approximation interval is shown. PsN's rule of thumb is 200 samples.\n",
             s.n_included, s.confidence_level
-        );
+        ));
     }
     if let Some(dir) = &options.directory {
-        println!("\nWrote bootstrap results to {}", dir.display());
+        out.push_str(&format!("\nWrote bootstrap results to {}\n", dir.display()));
     }
+    out
 }
 
-fn print_table(parameters: &[ferx_tools::bootstrap::ParameterSummary], level: f64) {
+fn render_table(parameters: &[ferx_tools::bootstrap::ParameterSummary], level: f64) -> String {
     let cell = |v: Option<f64>| match v {
         Some(v) if v.is_finite() => format!("{v:>12.5}"),
         _ => format!("{:>12}", "-"),
@@ -248,8 +256,8 @@ fn print_table(parameters: &[ferx_tools::bootstrap::ParameterSummary], level: f6
         .max()
         .unwrap_or(9)
         .max(9);
-    println!(
-        "\n{:<width$} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
+    let mut out = format!(
+        "\n{:<width$} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}\n",
         "parameter",
         "original",
         "mean",
@@ -266,8 +274,8 @@ fn print_table(parameters: &[ferx_tools::bootstrap::ParameterSummary], level: f6
             Some((lo, hi)) => (Some(lo), Some(hi)),
             None => (None, None),
         };
-        println!(
-            "{:<width$} {} {} {} {} {} {}",
+        out.push_str(&format!(
+            "{:<width$} {} {} {} {} {} {}\n",
             p.name,
             cell(p.original),
             cell(Some(p.mean)),
@@ -275,8 +283,9 @@ fn print_table(parameters: &[ferx_tools::bootstrap::ParameterSummary], level: f6
             cell(Some(p.standard_error)),
             cell(lo),
             cell(hi),
-        );
+        ));
     }
+    out
 }
 
 #[cfg(test)]
@@ -391,5 +400,253 @@ mod tests {
     fn the_directory_defaults_to_the_model_stem() {
         let o = parse_options(&args(&["runs/warfarin.ferx"]), Some("runs/warfarin.ferx")).unwrap();
         assert_eq!(o.directory, Some(PathBuf::from("warfarin-bootstrap")));
+    }
+
+    // ── rendering ───────────────────────────────────────────────────────────
+
+    use ferx_tools::bootstrap::ParameterSummary;
+
+    fn parameter(name: &str, ci_percentile: Option<(f64, f64)>) -> ParameterSummary {
+        ParameterSummary {
+            name: name.to_string(),
+            original: Some(1.0),
+            mean: 1.5,
+            bias: Some(0.5),
+            standard_error: 0.25,
+            median: 1.4,
+            ci_percentile,
+            ci_standard_error: Some((0.5, 2.5)),
+        }
+    }
+
+    #[test]
+    fn the_table_is_column_aligned_and_widens_for_long_names() {
+        let table = render_table(
+            &[
+                parameter("CL", Some((1.1, 1.9))),
+                parameter("OMEGA(ETA_CL,ETA_CL)", Some((1.1, 1.9))),
+            ],
+            95.0,
+        );
+        let lines: Vec<&str> = table.lines().filter(|l| !l.is_empty()).collect();
+        assert!(lines[0].starts_with("parameter"));
+        assert!(lines[0].contains("95% lo") && lines[0].contains("95% hi"));
+        // Every row is the same width, including the one that set it.
+        let widths: Vec<usize> = lines.iter().map(|l| l.len()).collect();
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "ragged table: {widths:?}"
+        );
+        assert!(lines[2].starts_with("OMEGA(ETA_CL,ETA_CL)"));
+    }
+
+    #[test]
+    fn the_table_falls_back_to_the_normal_interval_when_there_is_no_percentile_one() {
+        // Too few samples to resolve the tail: show the normal-approximation
+        // interval rather than an empty column.
+        let table = render_table(&[parameter("CL", None)], 95.0);
+        let row = table.lines().nth(2).expect("a data row");
+        assert!(row.contains("0.50000") && row.contains("2.50000"), "{row}");
+
+        let with_percentile = render_table(&[parameter("CL", Some((1.1, 1.9)))], 95.0);
+        let row = with_percentile.lines().nth(2).expect("a data row");
+        assert!(row.contains("1.10000") && row.contains("1.90000"), "{row}");
+    }
+
+    #[test]
+    fn a_missing_value_renders_as_a_dash_not_a_nan() {
+        let mut p = parameter("CL", None);
+        p.original = None;
+        p.bias = None;
+        p.ci_standard_error = None;
+        let table = render_table(&[p], 95.0);
+        let row = table.lines().nth(2).expect("a data row");
+        assert!(!row.to_lowercase().contains("nan"), "{row}");
+        assert!(row.contains('-'), "{row}");
+    }
+
+    #[test]
+    fn the_ci_level_is_reflected_in_the_header() {
+        let table = render_table(&[parameter("CL", Some((1.1, 1.9)))], 90.0);
+        assert!(table.contains("90% lo"), "{table}");
+    }
+
+    fn summary_of(
+        parameters: Vec<ParameterSummary>,
+        excluded: Vec<(String, usize)>,
+    ) -> BootstrapResult {
+        BootstrapResult {
+            parameter_names: parameters.iter().map(|p| p.name.clone()).collect(),
+            original: None,
+            replicates: Vec::new(),
+            draws: Vec::new(),
+            subject_ids: Vec::new(),
+            summary: ferx_tools::bootstrap::BootstrapSummary {
+                n_completed: 4,
+                n_included: 3,
+                excluded_by: excluded,
+                confidence_level: 95.0,
+                diagnostic_means: Vec::new(),
+                parameters,
+            },
+            n_estimated_parameters: 2,
+        }
+    }
+
+    #[test]
+    fn the_report_names_the_exclusions_and_the_output_directory() {
+        let result = summary_of(
+            vec![parameter("CL", Some((1.1, 1.9)))],
+            vec![("minimization terminated".to_string(), 1)],
+        );
+        let options = BootstrapOptions {
+            directory: Some(PathBuf::from("out")),
+            ..BootstrapOptions::default()
+        };
+        let text = report(&result, &options);
+        assert!(
+            text.contains("4 of 0 samples completed; 3 included"),
+            "{text}"
+        );
+        assert!(
+            text.contains("excluded 1: minimization terminated"),
+            "{text}"
+        );
+        assert!(text.contains("Wrote bootstrap results to out"), "{text}");
+        // A resolvable percentile interval means no "too few samples" note.
+        assert!(!text.contains("cannot resolve"), "{text}");
+    }
+
+    #[test]
+    fn the_report_says_when_there_were_too_few_samples_for_a_percentile_interval() {
+        let result = summary_of(vec![parameter("CL", None)], Vec::new());
+        let text = report(
+            &result,
+            &BootstrapOptions {
+                directory: None,
+                ..BootstrapOptions::default()
+            },
+        );
+        assert!(
+            text.contains("cannot resolve a 95% percentile interval"),
+            "{text}"
+        );
+        assert!(!text.contains("Wrote bootstrap results"), "{text}");
+    }
+
+    // ── dispatch ────────────────────────────────────────────────────────────
+
+    fn repo_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
+
+    fn repo_path(rel: &str) -> String {
+        repo_root().join(rel).to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn help_exits_zero_and_a_missing_model_exits_one() {
+        assert_eq!(run(&args(&["--help"])), 0);
+        assert_eq!(run(&args(&["-h"])), 0);
+        // No positional at all, and a leading flag that is not a model path.
+        assert_eq!(run(&args(&[])), 1);
+        assert_eq!(run(&args(&["--samples", "5"])), 1);
+    }
+
+    #[test]
+    fn a_failure_to_load_the_model_exits_one() {
+        assert_eq!(run(&args(&["definitely-not-a-model.ferx"])), 1);
+    }
+
+    #[test]
+    fn summarize_without_a_directory_exits_one() {
+        assert_eq!(run(&args(&["--summarize"])), 1);
+        // A directory that exists but holds no raw_results.csv.
+        let dir = tempfile::tempdir().expect("temp dir");
+        assert_eq!(
+            run(&args(&[
+                "--summarize",
+                "--directory",
+                dir.path().to_str().unwrap()
+            ])),
+            1
+        );
+    }
+
+    /// One real end-to-end pass through `run`, on the smallest useful model.
+    ///
+    /// Kept to a single sample and a single outer iteration is not possible from
+    /// the command line, so this is warfarin (10 subjects) at `--samples 1`:
+    /// two fits, well under a second in release and a couple in debug. It is
+    /// what covers the load → fit → report → exit-code path that the subprocess
+    /// tests in `tests/cli_ferx.rs` exercise but cannot measure.
+    #[test]
+    fn a_real_run_writes_its_directory_and_exits_zero() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let code = run(&args(&[
+            &repo_path("examples/warfarin.ferx"),
+            "--data",
+            &repo_path("data/warfarin.csv"),
+            "--samples",
+            "1",
+            "--seed",
+            "5",
+            "--threads",
+            "1",
+            "--directory",
+            dir.path().to_str().unwrap(),
+        ]));
+        assert_eq!(code, 0);
+        assert!(dir.path().join("raw_results.csv").exists());
+        assert!(dir.path().join("bootstrap_results.csv").exists());
+
+        // And `--summarize` over what it just wrote.
+        assert_eq!(
+            run(&args(&[
+                "--summarize",
+                "--directory",
+                dir.path().to_str().unwrap()
+            ])),
+            0
+        );
+    }
+
+    #[test]
+    fn a_run_whose_every_sample_is_excluded_exits_one() {
+        // `--sample-size 1` fits single-subject replicates, which cannot
+        // identify the between-subject variances and so land on a boundary —
+        // the default filters then drop every sample. Exiting 0 there would let
+        // a pipeline treat an empty result as a successful bootstrap.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let code = run(&args(&[
+            &repo_path("examples/warfarin.ferx"),
+            "--data",
+            &repo_path("data/warfarin.csv"),
+            "--samples",
+            "1",
+            "--sample-size",
+            "1",
+            "--seed",
+            "5",
+            "--threads",
+            "1",
+            "--directory",
+            dir.path().to_str().unwrap(),
+        ]));
+        // Either outcome is legitimate for a degenerate replicate; what must not
+        // happen is a zero exit with nothing included.
+        let raw = std::fs::read_to_string(dir.path().join("bootstrap_diagnostics.csv"))
+            .expect("diagnostics written");
+        let included: f64 = raw
+            .lines()
+            .find(|l| l.starts_with("samples_included,"))
+            .and_then(|l| l.split(',').nth(1))
+            .and_then(|v| v.trim().parse().ok())
+            .expect("samples_included row");
+        if included == 0.0 {
+            assert_eq!(code, 1, "an empty bootstrap must not exit 0");
+        } else {
+            assert_eq!(code, 0);
+        }
     }
 }
