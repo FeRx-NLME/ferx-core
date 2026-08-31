@@ -872,8 +872,8 @@ pub fn ferx_core::ode::predictions::ode_dense_solve_states(ode: &ferx_core::ode:
 pub fn ferx_core::ode::predictions::ode_predictions(ode: &ferx_core::ode::OdeSpec, pk_params_flat: &[f64], theta: &[f64], eta: &[f64], subject: &ferx_core::Subject) -> alloc::vec::Vec<f64>
 pub fn ferx_core::ode::predictions::ode_predictions_ekf(ode: &ferx_core::ode::OdeSpec, pk_params_flat: &[f64], subject: &ferx_core::Subject, r_obs_fn: impl core::ops::function::Fn(f64) -> f64) -> (alloc::vec::Vec<f64>, alloc::vec::Vec<f64>)
 pub fn ferx_core::ode::predictions::ode_predictions_ekf_with_diffusion(ode: &ferx_core::ode::OdeSpec, pk_params_flat: &[f64], subject: &ferx_core::Subject, diffusion_var: &[f64], r_obs_fn: impl core::ops::function::Fn(f64) -> f64) -> (alloc::vec::Vec<f64>, alloc::vec::Vec<f64>)
-pub fn ferx_core::ode::predictions::ode_predictions_event_driven(ode: &ferx_core::ode::OdeSpec, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64], pk_at_dose: &[ferx_core::PkParams], pk_at_obs: &[ferx_core::PkParams], pk_at_pk_only: &[ferx_core::PkParams]) -> alloc::vec::Vec<f64>
-pub fn ferx_core::ode::predictions::ode_predictions_event_driven_with_states(ode: &ferx_core::ode::OdeSpec, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64], pk_at_dose: &[ferx_core::PkParams], pk_at_obs: &[ferx_core::PkParams], pk_at_pk_only: &[ferx_core::PkParams]) -> (alloc::vec::Vec<f64>, alloc::vec::Vec<alloc::vec::Vec<f64>>)
+pub fn ferx_core::ode::predictions::ode_predictions_event_driven(ode: &ferx_core::ode::OdeSpec, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64], pk_at_dose: &[ferx_core::PkParams], pk_at_obs: &[ferx_core::PkParams], pk_at_pk_only: &[ferx_core::PkParams], pk_at_reset: &[ferx_core::PkParams]) -> alloc::vec::Vec<f64>
+pub fn ferx_core::ode::predictions::ode_predictions_event_driven_with_states(ode: &ferx_core::ode::OdeSpec, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64], pk_at_dose: &[ferx_core::PkParams], pk_at_obs: &[ferx_core::PkParams], pk_at_pk_only: &[ferx_core::PkParams], pk_at_reset: &[ferx_core::PkParams]) -> (alloc::vec::Vec<f64>, alloc::vec::Vec<alloc::vec::Vec<f64>>)
 pub fn ferx_core::ode::predictions::ode_predictions_with_solver_stats(ode: &ferx_core::ode::OdeSpec, pk_params_flat: &[f64], theta: &[f64], eta: &[f64], subject: &ferx_core::Subject) -> (alloc::vec::Vec<f64>, ferx_core::ode::OdeSolverStats)
 pub fn ferx_core::ode::predictions::ode_predictions_with_states(ode: &ferx_core::ode::OdeSpec, pk_params_flat: &[f64], theta: &[f64], eta: &[f64], subject: &ferx_core::Subject) -> (alloc::vec::Vec<f64>, alloc::vec::Vec<alloc::vec::Vec<f64>>)
 pub type ferx_core::ode::predictions::OdeOutputFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &[f64], &[f64], &[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>) -> f64 + core::marker::Send + core::marker::Sync)>
@@ -1015,8 +1015,8 @@ pub fn ferx_core::ode::ode_dense_solve_states(ode: &ferx_core::ode::OdeSpec, pk_
 pub fn ferx_core::ode::ode_predictions(ode: &ferx_core::ode::OdeSpec, pk_params_flat: &[f64], theta: &[f64], eta: &[f64], subject: &ferx_core::Subject) -> alloc::vec::Vec<f64>
 pub fn ferx_core::ode::ode_predictions_ekf(ode: &ferx_core::ode::OdeSpec, pk_params_flat: &[f64], subject: &ferx_core::Subject, r_obs_fn: impl core::ops::function::Fn(f64) -> f64) -> (alloc::vec::Vec<f64>, alloc::vec::Vec<f64>)
 pub fn ferx_core::ode::ode_predictions_ekf_with_diffusion(ode: &ferx_core::ode::OdeSpec, pk_params_flat: &[f64], subject: &ferx_core::Subject, diffusion_var: &[f64], r_obs_fn: impl core::ops::function::Fn(f64) -> f64) -> (alloc::vec::Vec<f64>, alloc::vec::Vec<f64>)
-pub fn ferx_core::ode::ode_predictions_event_driven(ode: &ferx_core::ode::OdeSpec, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64], pk_at_dose: &[ferx_core::PkParams], pk_at_obs: &[ferx_core::PkParams], pk_at_pk_only: &[ferx_core::PkParams]) -> alloc::vec::Vec<f64>
-pub fn ferx_core::ode::ode_predictions_event_driven_with_states(ode: &ferx_core::ode::OdeSpec, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64], pk_at_dose: &[ferx_core::PkParams], pk_at_obs: &[ferx_core::PkParams], pk_at_pk_only: &[ferx_core::PkParams]) -> (alloc::vec::Vec<f64>, alloc::vec::Vec<alloc::vec::Vec<f64>>)
+pub fn ferx_core::ode::ode_predictions_event_driven(ode: &ferx_core::ode::OdeSpec, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64], pk_at_dose: &[ferx_core::PkParams], pk_at_obs: &[ferx_core::PkParams], pk_at_pk_only: &[ferx_core::PkParams], pk_at_reset: &[ferx_core::PkParams]) -> alloc::vec::Vec<f64>
+pub fn ferx_core::ode::ode_predictions_event_driven_with_states(ode: &ferx_core::ode::OdeSpec, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64], pk_at_dose: &[ferx_core::PkParams], pk_at_obs: &[ferx_core::PkParams], pk_at_pk_only: &[ferx_core::PkParams], pk_at_reset: &[ferx_core::PkParams]) -> (alloc::vec::Vec<f64>, alloc::vec::Vec<alloc::vec::Vec<f64>>)
 pub fn ferx_core::ode::ode_predictions_with_solver_stats(ode: &ferx_core::ode::OdeSpec, pk_params_flat: &[f64], theta: &[f64], eta: &[f64], subject: &ferx_core::Subject) -> (alloc::vec::Vec<f64>, ferx_core::ode::OdeSolverStats)
 pub fn ferx_core::ode::ode_predictions_with_states(ode: &ferx_core::ode::OdeSpec, pk_params_flat: &[f64], theta: &[f64], eta: &[f64], subject: &ferx_core::Subject) -> (alloc::vec::Vec<f64>, alloc::vec::Vec<alloc::vec::Vec<f64>>)
 pub fn ferx_core::ode::solve_ode(rhs: &dyn core::ops::function::Fn(&[f64], &[f64], f64, &mut [f64]), u0: &[f64], t_span: (f64, f64), params: &[f64], saveat: &[f64], opts: &ferx_core::ode::OdeSolverOptions) -> alloc::vec::Vec<ferx_core::ode::SolPoint>
@@ -1221,6 +1221,7 @@ pub struct ferx_core::pk::EventPkParams
 pub ferx_core::pk::EventPkParams::dose: alloc::vec::Vec<ferx_core::PkParams>
 pub ferx_core::pk::EventPkParams::obs: alloc::vec::Vec<ferx_core::PkParams>
 pub ferx_core::pk::EventPkParams::pk_only: alloc::vec::Vec<ferx_core::PkParams>
+pub ferx_core::pk::EventPkParams::reset: alloc::vec::Vec<ferx_core::PkParams>
 impl ferx_core::pk::EventPkParams
 pub fn ferx_core::pk::EventPkParams::with_capacity_for(subject: &ferx_core::Subject) -> Self
 pub fn ferx_core::pk::add_analytical_init(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64], preds: &mut [f64])
@@ -2839,6 +2840,8 @@ pub ferx_core::types::Subject::observations: alloc::vec::Vec<f64>
 pub ferx_core::types::Subject::occasions: alloc::vec::Vec<u32>
 pub ferx_core::types::Subject::pk_only_covariates: alloc::vec::Vec<std::collections::hash::map::HashMap<alloc::string::String, f64>>
 pub ferx_core::types::Subject::pk_only_times: alloc::vec::Vec<f64>
+pub ferx_core::types::Subject::reset_covariates: alloc::vec::Vec<std::collections::hash::map::HashMap<alloc::string::String, f64>>
+pub ferx_core::types::Subject::reset_occasions: alloc::vec::Vec<u32>
 pub ferx_core::types::Subject::reset_times: alloc::vec::Vec<f64>
 impl ferx_core::Subject
 pub fn ferx_core::Subject::all_doses_fixed(&self) -> bool
@@ -2853,6 +2856,7 @@ pub fn ferx_core::Subject::obs_cov(&self, j: usize) -> &std::collections::hash::
 pub fn ferx_core::Subject::occasion_first_dose_time(&self, obs_time: f64) -> f64
 pub fn ferx_core::Subject::pk_only_cov(&self, m: usize) -> &std::collections::hash::map::HashMap<alloc::string::String, f64>
 pub fn ferx_core::Subject::readout_time(&self, j: usize) -> f64
+pub fn ferx_core::Subject::reset_cov(&self, r: usize) -> &std::collections::hash::map::HashMap<alloc::string::String, f64>
 pub fn ferx_core::Subject::time_varying_covariate_names(&self) -> alloc::vec::Vec<alloc::string::String>
 pub struct ferx_core::types::SubjectResult
 pub ferx_core::types::SubjectResult::cens: alloc::vec::Vec<i8>
@@ -4153,6 +4157,8 @@ pub ferx_core::Subject::observations: alloc::vec::Vec<f64>
 pub ferx_core::Subject::occasions: alloc::vec::Vec<u32>
 pub ferx_core::Subject::pk_only_covariates: alloc::vec::Vec<std::collections::hash::map::HashMap<alloc::string::String, f64>>
 pub ferx_core::Subject::pk_only_times: alloc::vec::Vec<f64>
+pub ferx_core::Subject::reset_covariates: alloc::vec::Vec<std::collections::hash::map::HashMap<alloc::string::String, f64>>
+pub ferx_core::Subject::reset_occasions: alloc::vec::Vec<u32>
 pub ferx_core::Subject::reset_times: alloc::vec::Vec<f64>
 impl ferx_core::Subject
 pub fn ferx_core::Subject::all_doses_fixed(&self) -> bool
@@ -4167,6 +4173,7 @@ pub fn ferx_core::Subject::obs_cov(&self, j: usize) -> &std::collections::hash::
 pub fn ferx_core::Subject::occasion_first_dose_time(&self, obs_time: f64) -> f64
 pub fn ferx_core::Subject::pk_only_cov(&self, m: usize) -> &std::collections::hash::map::HashMap<alloc::string::String, f64>
 pub fn ferx_core::Subject::readout_time(&self, j: usize) -> f64
+pub fn ferx_core::Subject::reset_cov(&self, r: usize) -> &std::collections::hash::map::HashMap<alloc::string::String, f64>
 pub fn ferx_core::Subject::time_varying_covariate_names(&self) -> alloc::vec::Vec<alloc::string::String>
 pub struct ferx_core::SubjectResult
 pub ferx_core::SubjectResult::cens: alloc::vec::Vec<i8>
