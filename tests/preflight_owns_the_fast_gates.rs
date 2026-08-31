@@ -355,6 +355,59 @@ fn the_failure_diagnostic_names_the_group_that_actually_failed() {
     );
 }
 
+/// The gates must run on the channel CI runs, not on whatever rustup resolves.
+///
+/// `rust-toolchain.toml` says `nightly`, but it is not the last word: an inherited
+/// `RUSTUP_TOOLCHAIN`, or a `rustup override` on this directory or any parent, beats it.
+/// Measured in this repo, `RUSTUP_TOOLCHAIN=stable cargo fmt --version` reports
+/// `rustfmt 1.9.0-stable` where a plain `cargo fmt --version` reports `1.10.0-nightly`.
+/// A developer with a stable override would get a quietly laxer clippy — whole lint
+/// groups are nightly-only — which is the local/CI split this whole script exists to
+/// remove. `ci.yml` pins the channel at workflow level; the script has to as well.
+#[test]
+fn the_gates_run_on_ci_s_toolchain_unless_the_caller_says_otherwise() {
+    let (counter, path) = fake_cargo_on_path("toolchain");
+
+    // Nothing set, and a `rustup override` may well be in force: must still be nightly.
+    let _ = std::fs::remove_file(&counter);
+    let out = Command::new("bash")
+        .arg(preflight())
+        .arg("check")
+        .current_dir(repo_root())
+        .env("PATH", &path)
+        .env("FAKE_CARGO_COUNT", &counter)
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .output()
+        .expect("run tools/preflight.sh check");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "all commands passed but the script failed:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("RUSTUP_TOOLCHAIN=nightly"),
+        "the gates did not run on nightly, so a local `rustup override` would silently \
+         check something CI never checks:\n{stdout}"
+    );
+
+    // A deliberate choice by the caller still wins — this is a default, not a clamp.
+    let _ = std::fs::remove_file(&counter);
+    let out = Command::new("bash")
+        .arg(preflight())
+        .arg("check")
+        .current_dir(repo_root())
+        .env("PATH", &path)
+        .env("FAKE_CARGO_COUNT", &counter)
+        .env("RUSTUP_TOOLCHAIN", "some-pinned-toolchain")
+        .output()
+        .expect("run tools/preflight.sh check");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("RUSTUP_TOOLCHAIN=some-pinned-toolchain"),
+        "the script overrode a toolchain the caller set deliberately:\n{stdout}"
+    );
+}
+
 /// A `cargo` that succeeds until its `FAKE_CARGO_FAIL_AT`-th invocation.
 ///
 /// Counting invocations rather than matching arguments keeps the harness independent of
@@ -369,6 +422,7 @@ n=$(cat "$FAKE_CARGO_COUNT" 2>/dev/null || echo 0)
 n=$((n + 1))
 echo "$n" > "$FAKE_CARGO_COUNT"
 echo "fake cargo invocation #$n: $*"
+echo "fake cargo saw RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN-<unset>}"
 if [ "$n" = "$FAKE_CARGO_FAIL_AT" ]; then
   echo "error[E0063]: simulated failure on invocation $n" >&2
   exit 101

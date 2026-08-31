@@ -36,6 +36,20 @@ script_path="${BASH_SOURCE[0]}"
 repo_root="$(cd "$(dirname "$script_path")/.." && pwd)"
 cd "$repo_root"
 
+# Mirror `ci.yml`'s workflow-level `RUSTUP_TOOLCHAIN: nightly`.
+#
+# `rust-toolchain.toml` says `nightly`, but it is NOT the last word: an inherited
+# `RUSTUP_TOOLCHAIN`, or a `rustup override` on this directory or any parent,
+# both beat it. Measured in this repo — `RUSTUP_TOOLCHAIN=stable cargo fmt
+# --version` reports `rustfmt 1.9.0-stable` where a plain `cargo fmt --version`
+# reports `1.10.0-nightly`. Running the fast gates on a channel CI never uses is
+# the exact local/CI split this script exists to remove, and clippy is where it
+# bites: whole lint groups are nightly-only, so a stable run is quietly laxer.
+#
+# `:-` so a caller who sets it deliberately (bisecting a toolchain regression,
+# say) still wins.
+export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-nightly}"
+
 # ── The group list ──────────────────────────────────────────────────────────
 # The ONE place groups are enumerated. Argument validation, the default
 # selection, `--help` and the driver all read this array, so adding a group is

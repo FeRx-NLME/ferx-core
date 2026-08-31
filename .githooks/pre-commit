@@ -21,4 +21,7 @@ if [ -x "$root/tools/preflight.sh" ]; then
   exec "$root/tools/preflight.sh" fmt
 fi
 echo "pre-commit: no tools/preflight.sh on this checkout — running cargo fmt directly" >&2
-exec cargo fmt --all -- --check
+# `+nightly` explicitly: this arm runs on checkouts where preflight.sh does not
+# exist, so nothing else pins the channel here. It is what this hook did before
+# it delegated.
+exec cargo +nightly fmt --all -- --check
