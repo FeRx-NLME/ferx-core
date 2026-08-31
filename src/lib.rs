@@ -1,3 +1,24 @@
+// 91 doc comments link to `pub(crate)` items — internal cross-references between
+// the engine's own helpers (`pop_nll`, `eta_dx`, `build_fit_pool`, ...). rustdoc
+// warns on each because they cannot resolve in a public-API doc build.
+//
+// They are allowed rather than rewritten because the two doc consumers want
+// opposite things. Under `--document-private-items` — and in rust-analyzer
+// hover, which indexes private items — they resolve and are navigable, which is
+// exactly what an internal cross-reference is for. In a public build the target
+// is not documented at all, so the link renders with its brackets intact.
+//
+// Nothing publishes this crate's rustdoc today: `ferx-core` is not on crates.io
+// and there is no docs.rs page, so only the first consumer exists and the links
+// are doing their job. This `allow` therefore keeps them AND lets the rustdoc
+// gate in `tools/preflight.sh` run from zero.
+//
+// The trade reverses the day the crate is published. Deleting this line restores
+// all 91 warnings; the cleanup that answers them is scoped in the publishing
+// issue. Note the lint is narrow — genuinely broken links are
+// `rustdoc::broken_intra_doc_links` and stay gated.
+#![allow(rustdoc::private_intra_doc_links)]
+
 pub mod api;
 pub mod build_info;
 pub mod cancel;
