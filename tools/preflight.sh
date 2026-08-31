@@ -60,7 +60,7 @@ export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-nightly}"
 # current user's numeric group IDs, and it wins. The first draft used it and
 # every group name silently became a GID — `unknown group 'check' — expected one
 # of: 20 12 61 ...`.
-ALL_GROUPS=(fmt check clippy docs public-api)
+ALL_GROUPS=(fmt check clippy rustdoc docs public-api)
 
 usage() {
   cat <<EOF
@@ -75,7 +75,8 @@ Groups: ${ALL_GROUPS[*]}  (default: all of them, in that order)
 
 NOT covered: the test jobs. \`cargo check --tests\` COMPILES the test targets
 but runs nothing, so \`Tests + coverage (core)\` can still go red after a green
-preflight. This gates compilation and lint, not behaviour.
+preflight. This gates compilation and lint, not behaviour. (The one exception is
+\`docs\`, whose gate IS its test run — a filesystem walk over \`docs/\`, not a fit.)
 EOF
 }
 
@@ -252,7 +253,24 @@ group_clippy() {
 }
 
 group_docs() {
-  CI_JOB="Docs"
+  CI_JOB="Docs lint"
+  # The structural gate on `docs/**/*.qmd` (#1163): section size, heading levels,
+  # duplicate anchors, dead internal links. `docs-lint` depends on nothing — not
+  # even `ferx-core` — so this group is a seconds-long compile and never touches
+  # the cache the other groups warm.
+  #
+  # This is the one group that also RUNS its tests rather than only compiling
+  # them: the corpus check IS the gate, and it is a filesystem walk, not a fit.
+  run cargo test -p docs-lint
+
+  # `docs-lint` is outside the `Clippy` group's package list (which is scoped to
+  # `ferx-core` and its two members), so without this line the crate would be
+  # linted by nothing. Cheap: the compile above already warmed it.
+  run cargo clippy -p docs-lint --all-targets
+}
+
+group_rustdoc() {
+  CI_JOB="Rustdoc"
   # `env RUSTDOCFLAGS=...` rather than a `RUSTDOCFLAGS=... run cargo ...` prefix.
   # Both reach rustdoc — bash exports an assignment prefix into the function and
   # on to the child — but `run` echoes `$*`, and the prefix form is not part of

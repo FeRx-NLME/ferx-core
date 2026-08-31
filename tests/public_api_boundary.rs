@@ -222,10 +222,21 @@ fn is_broken_ferx_invocation(line: &str) -> bool {
             .is_some_and(|(_, rest)| !rest.starts_with('-') && !rest.starts_with('_'));
     // A run that passes arguments through `--` but never selects a package.
     // `--bin <other>` excuses it: that is one of the bins still in core.
-    let unscoped_run = line.contains(" -- ")
-        && !line.contains(cli_pkg.as_str())
-        && !line.contains("-p ferx-core")
-        && !line.contains("--bin ");
+    //
+    // Any explicit `-p <pkg>` / `--package <pkg>` excuses it too, and the check
+    // is on the *form* rather than on a list of package names: the workspace
+    // gained `docs-lint` (#1163), whose `cargo run -p docs-lint -- --check` is
+    // correct precisely because it selects its package. Enumerating the members
+    // here would make every new one a false positive on its first commit.
+    //
+    // Only the CARGO arguments count. Everything after the `--` separator goes
+    // to the program, so a `run --release -- model.ferx -p 8` — where the `-p`
+    // is the *model's* flag, not cargo's — selects no package and stays an
+    // offender. (Spelled without the leading verb so this line is not itself
+    // scanned as one, the same reason the needles below use `format!`.)
+    let cargo_args = line.split(" -- ").next().unwrap_or(line);
+    let selects_a_package = cargo_args.contains("-p ") || cargo_args.contains("--package ");
+    let unscoped_run = line.contains(" -- ") && !selects_a_package && !line.contains("--bin ");
     // Feature flags belong to `ferx-core`, so a member-scoped command has to
     // qualify them.
     let unqualified_feature = line.contains(cli_pkg.as_str())
@@ -305,6 +316,24 @@ fn invocation_classifier_excuses_the_explicit_form() {
     // A bin that genuinely stayed in `ferx-core`.
     assert!(!is_broken_ferx_invocation(&format!(
         "{run} --bin generate_data -- out.csv"
+    )));
+    // Another workspace member, selected explicitly: correct for the same
+    // reason `-p ferx-cli` is, and the guard must not read "not the CLI" as
+    // "no package" (#1163).
+    assert!(!is_broken_ferx_invocation(
+        "cargo run -p docs-lint -- --check"
+    ));
+    assert!(!is_broken_ferx_invocation(
+        "cargo run --package docs-lint -- --update-baseline"
+    ));
+    // A `-p` that belongs to the PROGRAM, not to cargo, selects no package and
+    // must stay flagged — otherwise the excusal above swallows exactly the
+    // invocation shape this guard exists to catch (#1114).
+    assert!(is_broken_ferx_invocation(&format!(
+        "{run} -- model.ferx -p 8"
+    )));
+    assert!(is_broken_ferx_invocation(&format!(
+        "{run} -- model.ferx --package foo"
     )));
     // Features qualified for a member-scoped build.
     assert!(!is_broken_ferx_invocation(&format!(

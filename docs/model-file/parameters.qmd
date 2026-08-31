@@ -363,7 +363,7 @@ omega ETA_KA ~ 0.40
 
 This estimates a 3x3 omega where ETA_CL and ETA_V are correlated (2x2 block), but ETA_KA is uncorrelated with both.
 
-### Declaration order
+### Declaration order — omegas
 
 The order of `omega` and `block_omega` lines in the `[parameters]` block determines the ETA indexing throughout the model: in the omega matrix and all output. For example:
 
@@ -445,7 +445,7 @@ kappa KAPPA_KA ~ 0.10
 
 A name may not appear in both `kappa` and `block_kappa` — this is a parse error.
 
-### Declaration order
+### Declaration order — kappas
 
 Kappa declaration order determines the IOV omega matrix layout and the kappa column order in output. Kappas follow all BSV etas in the internal indexing: if a model has 3 BSV etas and 2 kappas, the kappas sit at indices 4 and 5.
 

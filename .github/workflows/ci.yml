@@ -166,8 +166,8 @@ jobs:
   # regardless of whether this crate is ever published.
   #
   # Cheap: ~8s cold on a warm `target/`, ~0.3s when nothing changed.
-  docs:
-    name: Docs
+  rustdoc:
+    name: Rustdoc
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -182,7 +182,7 @@ jobs:
       # `tools/preflight.sh` (#1157). See the note in the `check` job above for
       # why CI calls the script rather than inlining the commands.
       - name: cargo doc (ferx-core + members, via tools/preflight.sh)
-        run: tools/preflight.sh docs
+        run: tools/preflight.sh rustdoc
 
   # A2 of #1114 — the enforcement that keeps the ferx-core/ferx-tools boundary
   # from becoming paperwork. `ferx-tools` can only touch `pub` items, so the way
@@ -241,6 +241,33 @@ jobs:
 
       - name: cargo fmt (via tools/preflight.sh)
         run: tools/preflight.sh fmt
+
+  docs-lint:
+    name: Docs lint
+    runs-on: ubuntu-latest
+    # Deliberately on `ci.yml` and not on `docs.yml`: that workflow only runs on
+    # a push to `main`, which is too late to block a bad page. `docs-lint`
+    # depends on nothing and never links `ferx-core`, so this job is seconds of
+    # compile, not minutes (#1163).
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install stable toolchain
+        # `-c clippy`: the `docs` group lints `docs-lint` itself, which no other
+        # job covers — the `Clippy` job is scoped to ferx-core and its members.
+        run: rustup toolchain install stable --profile minimal -c clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: docs-lint
+
+      # Unit tests (the pandoc id algorithm) plus the corpus check over
+      # `docs/**/*.qmd`, in one step — through `tools/preflight.sh` for the same
+      # reason as `Check` / `Clippy` / `Format` (#1157): the local gate and the
+      # CI gate are one list, so they cannot drift.
+      - name: cargo test -p docs-lint (via tools/preflight.sh)
+        run: tools/preflight.sh docs
 
   coverage:
     name: Tests + coverage (full, slow-tests)

@@ -170,7 +170,7 @@ fn the_fast_gate_jobs_delegate_to_preflight_and_never_inline_cargo() {
         ("check", "check"),
         ("clippy", "clippy"),
         ("fmt", "fmt"),
-        ("docs", "docs"),
+        ("rustdoc", "rustdoc"),
     ] {
         let body = job_body(&yml, job);
         let cmds = run_commands(&body);
@@ -244,7 +244,7 @@ fn a_failing_gate_fails_the_script_from_every_position() {
     // Every group whose commands are `cargo` invocations, so the fake below intercepts
     // them. `public-api` shells out to `tools/update-public-api.sh` instead and is covered
     // by `the_failure_diagnostic_names_the_group_that_actually_failed`.
-    for group in ["fmt", "check", "clippy", "docs"] {
+    for group in ["fmt", "check", "clippy", "rustdoc"] {
         let listed = listed_commands(group);
         assert!(
             !listed.is_empty(),
@@ -485,7 +485,7 @@ fn load_bearing_flags_and_feature_coverage_survive_in_the_command_list() {
     // `cargo doc` exits 0 on link warnings. `-Dwarnings` is the ENTIRE gate: drop it and
     // both commands stay in the list, still build docs, still take ~8s — and pass over a
     // tree with 146 broken links. That is the neutered-gate shape this test exists for.
-    let docs = listed_commands("docs");
+    let docs = listed_commands("rustdoc");
     for cmd in &docs {
         assert!(
             cmd.contains("RUSTDOCFLAGS=-Dwarnings"),
@@ -578,11 +578,12 @@ fn preflight_is_executable_and_lists_every_group() {
     // commands are actually *enforced* is
     // `a_failing_gate_fails_the_script_from_every_position`; `--list` executes nothing and
     // can never show it.
-    let expected: [(&str, usize); 5] = [
+    let expected: [(&str, usize); 6] = [
         ("fmt", 1),        // cargo fmt --all -- --check
         ("check", 5),      // ci · ci,survival,slow-tests · ci,markov · ci,nn,slow-tests · members
         ("clippy", 2),     // ferx-core --all-targets · members
-        ("docs", 2),       // ferx-core rustdoc · members
+        ("rustdoc", 2),    // ferx-core rustdoc · members
+        ("docs", 2),       // cargo test -p docs-lint · cargo clippy -p docs-lint
         ("public-api", 1), // tools/update-public-api.sh --check
     ];
 
@@ -697,7 +698,7 @@ fn preflight_help_lists_every_group_and_works_from_any_cwd() {
 
 /// A crate-level `#![allow(rustdoc::...)]` is a neutered gate the command list cannot see.
 ///
-/// The `docs` group can carry `-Dwarnings` on every line, run on every PR, and still pass
+/// The `rustdoc` group can carry `-Dwarnings` on every line, run on every PR, and still pass
 /// over a tree whose rendered HTML is full of `[<code>foo</code>]` — because the lint that
 /// would have fired was switched off inside the crate. `private_intra_doc_links` is the
 /// one that matters here: rustdoc drops a link to a `pub(crate)` item and leaves the
@@ -720,7 +721,7 @@ fn no_crate_level_allow_switches_a_rustdoc_lint_off() {
         .collect();
     assert!(
         offenders.is_empty(),
-        "src/lib.rs switches a rustdoc lint off crate-wide. The `docs` group then still \
+        "src/lib.rs switches a rustdoc lint off crate-wide. The `rustdoc` group then still \
          runs, still denies warnings, and still passes while the public HTML renders the \
          unresolved links with their brackets intact — and it does so for every link added \
          after this line, not just today's. Fix the links instead: inline code for an \
