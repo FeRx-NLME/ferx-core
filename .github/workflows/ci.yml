@@ -159,6 +159,31 @@ jobs:
       - name: cargo clippy (ferx-core + members, via tools/preflight.sh)
         run: tools/preflight.sh clippy
 
+  # `cargo doc` exits 0 on link warnings, so nothing caught them until this job:
+  # the tree had accumulated 146 across three classes. An unresolved intra-doc
+  # link is not a silent no-op — it renders with its brackets intact, in rendered
+  # HTML and in rust-analyzer hover alike, so they are visible defects today
+  # regardless of whether this crate is ever published.
+  #
+  # Cheap: ~8s cold on a warm `target/`, ~0.3s when nothing changed.
+  rustdoc:
+    name: Rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install nightly toolchain
+        run: rustup toolchain install nightly --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+      # Both rustdoc invocations (ferx-core, then the members) and the
+      # `RUSTDOCFLAGS=-Dwarnings` that makes them a gate at all live in
+      # `tools/preflight.sh` (#1157). See the note in the `check` job above for
+      # why CI calls the script rather than inlining the commands.
+      - name: cargo doc (ferx-core + members, via tools/preflight.sh)
+        run: tools/preflight.sh rustdoc
+
   # A2 of #1114 — the enforcement that keeps the ferx-core/ferx-tools boundary
   # from becoming paperwork. `ferx-tools` can only touch `pub` items, so the way
   # the boundary rots is `ferx-core` growing an ad-hoc `pub` in the same PR that

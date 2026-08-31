@@ -79,13 +79,13 @@ static GLOBAL_THREADS_EXPLICIT: std::sync::atomic::AtomicBool =
 /// Explicitly size the process-wide Rayon pool and mark it as user-chosen. Intended for a
 /// CLI binary sizing its one process-wide pool from `--threads N` before the first fit;
 /// library callers that want a pinned thread count for a single fit should use
-/// `FitOptions::threads` instead, which scopes a fit-local pool via [`build_fit_pool`].
+/// `FitOptions::threads` instead, which scopes a fit-local pool via `build_fit_pool`.
 ///
 /// `n_threads` must be positive — a caller wanting the engine's own default should simply
 /// not call this at all, rather than pass `0` (which Rayon would otherwise silently treat
 /// as "pick automatically", masking the caller's intent). The explicit-override flag is
 /// only set once `build_global` actually succeeds, so a failed call (e.g. the global pool
-/// was already initialized elsewhere) leaves [`default_fit_pool`] applying the #707 cap
+/// was already initialized elsewhere) leaves `default_fit_pool` applying the #707 cap
 /// rather than incorrectly deferring to whatever the ambient pool happens to be.
 pub fn configure_global_thread_pool(n_threads: usize) -> Result<(), String> {
     if n_threads == 0 {

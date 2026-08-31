@@ -112,13 +112,13 @@ local run of 158 binaries / 4634 tests reported clean.
 So run the fast gates before pushing:
 
 ```bash
-tools/preflight.sh            # fmt, the 5 cargo check feature sets, clippy, docs, public-API
+tools/preflight.sh            # fmt, the 5 cargo check feature sets, clippy, rustdoc, docs, public-API
 tools/preflight.sh check      # just the check matrix, for a tight edit loop
 tools/preflight.sh --list     # show the commands without running them
 ```
 
 `.github/workflows/ci.yml` invokes this same script for its `Check`, `Clippy`,
-`Format` and `Docs lint` jobs, and `.githooks/pre-commit` calls its `fmt` group, so the
+`Format`, `Rustdoc` and `Docs lint` jobs, and `.githooks/pre-commit` calls its `fmt` group, so the
 local gate, the hook and the CI gate cannot drift — the same contract
 `tools/update-public-api.sh` uses for the API baseline. **Add a new gate to the
 script, not to the workflow**; groups are enumerated once, in the `ALL_GROUPS`
@@ -131,6 +131,17 @@ exception is the `docs` group, which *runs* `cargo test -p docs-lint`: that
 crate's gate is its test run — a filesystem walk over `docs/`, not a fit — and
 it also carries `cargo clippy -p docs-lint`, since the `clippy` group is scoped
 to `ferx-core` and its two library members and would leave it unlinted.
+
+`rustdoc` and `docs` are two different gates and the names are easy to swap.
+`rustdoc` denies rustdoc's own warnings on `src/**` doc comments — an intra-doc
+link that does not resolve, or that resolves to a `pub(crate)` item, renders in
+the HTML with its markdown brackets intact (`[<code>name</code>]`) and in
+rust-analyzer hover the same way. Fix those at the link: inline code for an
+internal target, a resolvable path (`[`crate::run_covariance`]`) for a public
+one. Never with a crate-level `#![allow(rustdoc::...)]` in `src/lib.rs` — that
+switches the lint off for every future link too, and
+`tests/preflight_owns_the_fast_gates.rs` fails if one appears. `docs` is the
+structural linter on `docs/**/*.qmd` described below.
 
 Two traps it exists to cover: clippy runs `--all-targets` (without it, every
 `#[cfg(test)]` module and all of `tests/` goes unlinted — #1023), and the

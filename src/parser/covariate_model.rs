@@ -60,7 +60,7 @@
 //! # Where the sugar is removed
 //!
 //! Here, on the block *text*, before any block is read — alongside
-//! [`super::model_parser::apply_ode_template`]'s and `apply_algebraic_structural`'s
+//! `super::model_parser::apply_ode_template`'s and `apply_algebraic_structural`'s
 //! source rewrites. Everything downstream (expression compilation, `Dual2`
 //! sensitivities, the SAEM mu-reference detector, `covtab`, SE reporting) then
 //! sees an ordinary classical model, and the generated θ are ordinary θ that

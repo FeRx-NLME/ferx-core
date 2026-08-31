@@ -138,7 +138,7 @@ pub fn median_survival(family: HazardFamily, params: &[f64]) -> f64 {
     }
 }
 
-/// Mean survival time E[T] = ∫₀^∞ S(t) dt.
+/// Mean survival time `E[T]` = ∫₀^∞ S(t) dt.
 ///
 /// Uses the analytic form `1 / (λ · exp(loghr))` for the Exponential family and
 /// the midpoint rule (2 000 steps to 40 × median) for Weibull and Gompertz.

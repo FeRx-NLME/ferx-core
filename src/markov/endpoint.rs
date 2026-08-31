@@ -5,7 +5,7 @@
 //! know about (§8.7 of `plans/tte-survival-markov.md`):
 //!
 //! - **build the generator** `Q(θ, η, cov)` from the endpoint's
-//!   [`GeneratorFn`](crate::types::GeneratorFn) (the `[markov_model] transition`
+//!   [`GeneratorFn`] (the `[markov_model] transition`
 //!   intensities, diagonal filled row-sum-zero), once per subject
 //!   (time-homogeneous — a drug-driven `Q(t)` is Phase 6);
 //! - **collect the observations** — map each subject
@@ -141,9 +141,9 @@ fn ctmm_endpoint_nll(
 /// the whole matrix-exponential likelihood (#759).
 ///
 /// `Q` is rebuilt over `Dual1` with θ and η seeded
-/// ([`CtmmGeneratorProgram::eval_generator_duals`]), giving an exact `∂Q/∂(θ,η)`; the η
+/// (`CtmmGeneratorProgram::eval_generator_duals`), giving an exact `∂Q/∂(θ,η)`; the η
 /// columns are then chained through the Van Loan Fréchet derivative of `expm` by
-/// [`ctmm_data_term_grad`]. Returns `(value, ∂/∂η)` with the gradient at the **same 1×
+/// [`crate::markov::ctmm_data_term_grad`]. Returns `(value, ∂/∂η)` with the gradient at the **same 1×
 /// scale as the value** — the caller applies the objective's factor.
 ///
 /// `None` — caller falls back to FD for this point — when *any* CTMM endpoint on the
@@ -464,7 +464,7 @@ pub fn validate_ctmm_states(
 /// in file order (the NONMEM convention is time-ordered input, but nothing enforces
 /// it). An out-of-order pair would make [`ctmm_data_term`] return
 /// [`MarkovError::TimeDecreased`](crate::markov::MarkovError::TimeDecreased), which
-/// [`ctmm_endpoint_nll`] maps to the [`SUBJECT_SENTINEL_NLL`] backstop — silently
+/// `ctmm_endpoint_nll` maps to the `SUBJECT_SENTINEL_NLL` backstop — silently
 /// collapsing that subject's entire likelihood to `1e20` and biasing the population
 /// fit with no diagnostic. Rejecting up front converts that silent corruption into a
 /// clear error, mirroring [`validate_ctmm_states`]. Only `DiscreteState` rows on

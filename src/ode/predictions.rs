@@ -1813,7 +1813,7 @@ pub struct OdeSpec {
     /// `OdeSolverOptions::default()` (reltol 1e-4 / abstol 1e-6); overridden
     /// from the model's `[fit_options]` (`ode_reltol` / `ode_abstol` /
     /// `ode_max_steps`) and call-time `settings` via
-    /// [`CompiledModel::sync_ode_solver_opts`]. Carried on the spec so every
+    /// [`crate::types::CompiledModel::sync_ode_solver_opts`]. Carried on the spec so every
     /// integration entry point (`ode_predictions*`, EKF) uses the configured
     /// accuracy without threading options through each call.
     pub solver_opts: OdeSolverOptions,
@@ -1869,7 +1869,7 @@ impl OdeSpec {
     /// gates (`ode_analytical_supported`'s subject variants), the IOV gate
     /// (`ode_iov_supported`), the event-driven walk (`integrate_tvcov_g`), the
     /// initial-point diagnostics (`api::check_absorption_dosing`), and
-    /// [`crate::types::CompiledModel::has_route_absorption_lag`] — so the "does this
+    /// `crate::types::CompiledModel::has_route_absorption_lag` — so the "does this
     /// model have a route lag?" test cannot drift between them.
     pub fn has_route_lag(&self) -> bool {
         self.input_rate.iter().any(|f| f.lag_slot.is_some())

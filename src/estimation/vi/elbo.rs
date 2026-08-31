@@ -8,7 +8,7 @@
 //! ```
 //!
 //! Under `vi_kl = mc` the second term is estimated from the same draws instead, as
-//! `E_q[log q(η) − log p(η|Ω)]` — see [`mc_kl_draw`], and note that its `φ` gradient
+//! `E_q[log q(η) − log p(η|Ω)]` — see `mc_kl_draw`, and note that its `φ` gradient
 //! is then a path derivative rather than the derivative of the reported value.
 //!
 //! Everything here works with **`−ELBO`**, so the quantity is a thing to
@@ -17,7 +17,7 @@
 //!
 //! # The additive constant
 //!
-//! The data term is [`obs_nll_subject_grad`]'s NLL, which — like `individual_nll`,
+//! The data term is `obs_nll_subject_grad`'s NLL, which — like `individual_nll`,
 //! FOCE's objective, and NONMEM's OFV — omits the `½·n_obs·log 2π` constant. The
 //! KL term is exact. So `2·(−ELBO)` is on the same footing as the OFVs reported
 //! elsewhere in `ferx-core`: comparable *between VI fits of the same data*, and
@@ -307,7 +307,7 @@ pub struct ElboEval {
     /// `∂(−ELBO)/∂φᵢ`, one entry per subject.
     ///
     /// Under `vi_kl = mc` this is the **path-derivative** gradient, which is not the
-    /// finite difference of [`Self::neg_elbo`] — see [`mc_kl_draw`].
+    /// finite difference of [`Self::neg_elbo`] — see `mc_kl_draw`.
     pub grad_phi: Vec<Vec<f64>>,
     /// Subjects whose `∂/∂η` came from finite differences this evaluation.
     pub n_fd_subjects: usize,
