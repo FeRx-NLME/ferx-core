@@ -16,3 +16,10 @@ repository = "https://github.com/FeRx-NLME/ferx-core"
 # silently defeated for `ferx-core` everywhere (harmless only while
 # `default = []`; `survival` is slated to become default-on).
 ferx-core = { path = "../..", version = "0.3.0", default-features = false }
+csv = "1.3"
+rand = "0.10"
+rayon = "1.10"
+
+[dev-dependencies]
+nalgebra = "0.35"
+tempfile = "3"

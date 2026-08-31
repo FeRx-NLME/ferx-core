@@ -17,6 +17,15 @@ pub struct ferx_core::api::PredictionResult
 pub ferx_core::api::PredictionResult::id: alloc::string::String
 pub ferx_core::api::PredictionResult::pred: f64
 pub ferx_core::api::PredictionResult::time: f64
+pub struct ferx_core::api::PreparedRun
+pub ferx_core::api::PreparedRun::covariate_table: core::option::Option<ferx_core::CovariateTable>
+pub ferx_core::api::PreparedRun::data_hash: core::option::Option<alloc::string::String>
+pub ferx_core::api::PreparedRun::data_path: alloc::string::String
+pub ferx_core::api::PreparedRun::data_path_warning: core::option::Option<alloc::string::String>
+pub ferx_core::api::PreparedRun::init_params: ferx_core::ModelParameters
+pub ferx_core::api::PreparedRun::model_hash: core::option::Option<alloc::string::String>
+pub ferx_core::api::PreparedRun::parsed: ferx_core::ParsedModel
+pub ferx_core::api::PreparedRun::population: ferx_core::Population
 pub struct ferx_core::api::SimulateOptions
 pub ferx_core::api::SimulateOptions::horizon: core::option::Option<f64>
 pub ferx_core::api::SimulateOptions::match_method: core::option::Option<ferx_core::propensity_match::MatchMethod>
@@ -60,6 +69,8 @@ pub fn ferx_core::api::fit_from_files(model_path: &str, data_path: core::option:
 pub fn ferx_core::api::predict(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters) -> alloc::vec::Vec<ferx_core::PredictionResult>
 pub fn ferx_core::api::predict_categorical(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters) -> alloc::vec::Vec<ferx_core::EndpointPredictionResult>
 pub fn ferx_core::api::predict_survival(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, time_grid: &[f64]) -> alloc::vec::Vec<ferx_core::SurvivalPredictionResult>
+pub fn ferx_core::api::prepare_run(model_path: &str, data_path: core::option::Option<&str>) -> core::result::Result<ferx_core::PreparedRun, alloc::string::String>
+pub fn ferx_core::api::prepare_run_with_inits(model_path: &str, data_path: core::option::Option<&str>, inits_override: core::option::Option<ferx_core::suggest_start::NcaInit>) -> core::result::Result<ferx_core::PreparedRun, alloc::string::String>
 pub fn ferx_core::api::read_population_for(model: &ferx_core::CompiledModel, covariate_decls: &core::option::Option<alloc::vec::Vec<ferx_core::CovariateDecl>>, data_path: &str, fallback_columns: core::option::Option<&[&str]>, iov_column: core::option::Option<&str>, filter: core::option::Option<&ferx_core::io::datareader::SelectionFilter>, column_map: &[(alloc::string::String, alloc::string::String)]) -> core::result::Result<(ferx_core::Population, core::option::Option<ferx_core::CovariateTable>), alloc::string::String>
 pub fn ferx_core::api::read_population_for_simulation(model: &ferx_core::CompiledModel, covariate_decls: &core::option::Option<alloc::vec::Vec<ferx_core::CovariateDecl>>, data_path: &str, fallback_columns: core::option::Option<&[&str]>, iov_column: core::option::Option<&str>, filter: core::option::Option<&ferx_core::io::datareader::SelectionFilter>, column_map: &[(alloc::string::String, alloc::string::String)]) -> core::result::Result<(ferx_core::Population, core::option::Option<ferx_core::CovariateTable>), alloc::string::String>
 pub fn ferx_core::api::resolve_data_path(model_data_path: core::option::Option<&str>, external_data_path: core::option::Option<&str>) -> core::result::Result<(alloc::string::String, core::option::Option<alloc::string::String>), alloc::string::String>
@@ -4070,6 +4081,15 @@ pub struct ferx_core::PredictionResult
 pub ferx_core::PredictionResult::id: alloc::string::String
 pub ferx_core::PredictionResult::pred: f64
 pub ferx_core::PredictionResult::time: f64
+pub struct ferx_core::PreparedRun
+pub ferx_core::PreparedRun::covariate_table: core::option::Option<ferx_core::CovariateTable>
+pub ferx_core::PreparedRun::data_hash: core::option::Option<alloc::string::String>
+pub ferx_core::PreparedRun::data_path: alloc::string::String
+pub ferx_core::PreparedRun::data_path_warning: core::option::Option<alloc::string::String>
+pub ferx_core::PreparedRun::init_params: ferx_core::ModelParameters
+pub ferx_core::PreparedRun::model_hash: core::option::Option<alloc::string::String>
+pub ferx_core::PreparedRun::parsed: ferx_core::ParsedModel
+pub ferx_core::PreparedRun::population: ferx_core::Population
 pub struct ferx_core::ResidualCorrelation
 pub ferx_core::ResidualCorrelation::rho: f64
 pub ferx_core::ResidualCorrelation::sigma_i: usize
@@ -4249,6 +4269,8 @@ pub fn ferx_core::predict(model: &ferx_core::CompiledModel, population: &ferx_co
 pub fn ferx_core::predict_categorical(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters) -> alloc::vec::Vec<ferx_core::EndpointPredictionResult>
 pub fn ferx_core::predict_survival(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, time_grid: &[f64]) -> alloc::vec::Vec<ferx_core::SurvivalPredictionResult>
 pub fn ferx_core::prepare_frem(model_path: &std::path::Path, data_path: &std::path::Path, covariates: &[alloc::string::String], categorical_covariates: core::option::Option<&[alloc::string::String]>, output_model_path: core::option::Option<&std::path::Path>, output_data_path: core::option::Option<&std::path::Path>, missing_value: core::option::Option<f64>, fit_init: core::option::Option<&ferx_core::frem::FremFitInit>) -> core::result::Result<ferx_core::frem::FremPrepareResult, alloc::string::String>
+pub fn ferx_core::prepare_run(model_path: &str, data_path: core::option::Option<&str>) -> core::result::Result<ferx_core::PreparedRun, alloc::string::String>
+pub fn ferx_core::prepare_run_with_inits(model_path: &str, data_path: core::option::Option<&str>, inits_override: core::option::Option<ferx_core::suggest_start::NcaInit>) -> core::result::Result<ferx_core::PreparedRun, alloc::string::String>
 pub fn ferx_core::read_nonmem_csv(path: &std::path::Path, covariate_columns: core::option::Option<&[&str]>, iov_column: core::option::Option<&str>) -> core::result::Result<ferx_core::Population, alloc::string::String>
 pub fn ferx_core::read_nonmem_csv_with_covariates(path: &std::path::Path, decls: &[ferx_core::CovariateDecl], extra_columns: &[alloc::string::String], iov_column: core::option::Option<&str>) -> core::result::Result<(ferx_core::Population, ferx_core::CovariateTable), alloc::string::String>
 pub fn ferx_core::resolve_data_path(model_data_path: core::option::Option<&str>, external_data_path: core::option::Option<&str>) -> core::result::Result<(alloc::string::String, core::option::Option<alloc::string::String>), alloc::string::String>

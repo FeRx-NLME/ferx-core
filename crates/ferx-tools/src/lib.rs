@@ -17,9 +17,10 @@
 //! `api/ferx-core-public-api.txt` is the CI-enforced record of every item that
 //! crossed the line (A2).
 //!
-//! This crate is currently a placeholder: the workspace mechanics and the API
-//! gate land first (#1114 P1), the tools themselves after the prerequisite API
-//! gaps G1 (thread-pool control) and G2 (quiet inner fits) are closed.
+//! First inhabitant: [`bootstrap`] (#1140), the non-parametric case bootstrap
+//! at `PsN::bootstrap` feature parity. It is the boundary rule made concrete —
+//! 200+ calls to [`ferx_core::fit`] over resampled data, and no numerics of its
+//! own.
 
 /// The `ferx-core` version this build of `ferx-tools` links against.
 ///
@@ -50,3 +51,5 @@ mod tests {
         );
     }
 }
+
+pub mod bootstrap;

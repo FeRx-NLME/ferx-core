@@ -37,9 +37,27 @@ section of the SDLC for the versioning policy).
   `tools/update-public-api.sh`. This doubles as semver protection for the crates.io release and
   for ferx-r. `#[doc(hidden)] pub` is banned, because `cargo public-api` omits such items and the
   attribute would otherwise be a silent bypass of the gate.
-- **A `ferx-tools` crate (#1114)** — the future home of multi-fit tooling (bootstrap, stepwise
-  covariate modelling, model search, cross-validation). Currently a placeholder; it can only reach
-  `ferx-core` through the same public API the R wrapper uses.
+- **A `ferx-tools` crate (#1114)** — the home of multi-fit tooling (bootstrap, stepwise
+  covariate modelling, model search, cross-validation). It can only reach `ferx-core` through the
+  same public API the R wrapper uses.
+- **`ferx bootstrap` — the non-parametric case bootstrap (#1140).** Resamples subjects with
+  replacement, refits the model to each replicate, and reports bias, standard errors and
+  confidence intervals from the spread of the estimates, at `PsN::bootstrap` feature parity:
+  `--samples`, `--seed`, `--threads`, `--sample-size` (including PsN's per-stratum
+  `"1001=>12,1002=>24"` form), `--stratify-on`, `--update-inits`, `--run-base-model`,
+  `--keep-covariance`, the four `--skip-*` exclusion filters, `--dofv`, and `--summarize` to
+  recompute results under different filters without refitting. Writes PsN-named CSV artefacts
+  (`raw_results.csv`, `bootstrap_results.csv`, `included_individuals1.csv`, `sample_keys1.csv`, …).
+  Unlike PsN, the drawn datasets depend only on the seed and the design — never on the thread
+  count, the completion order, or whether the base model was fitted first. Bootstrapped parameters
+  are every estimated theta, Omega (free lower triangle), sigma, and IOV Omega, so a `kappa` model
+  gets bootstrap SEs and CIs for its inter-occasion variance and `--update-inits` / `--dofv` carry
+  it too. A model that reads `ID` as a covariate is refused rather than silently mis-fitted, and so
+  is a `[mixture]` model — its classes are identified only up to relabelling, so averaging across
+  replicates would mix them. See `docs/tools/bootstrap.qmd`.
+- **`prepare_run` / `prepare_run_with_inits` (#1140)** — public "load a model and its dataset, but
+  do not fit" entry points returning a `PreparedRun`. `run_model_with_data` is now implemented on
+  top of them, so a tool and the CLI cannot diverge in how a model is loaded.
 
 ### Fixed
 - **A steady-state dose with a lagtime is now seeded at the dose record, not equilibrated at the

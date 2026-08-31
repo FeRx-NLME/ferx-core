@@ -262,6 +262,7 @@ name = "ferx-cli"
 version = "0.3.0"
 dependencies = [
  "ferx-core",
+ "ferx-tools",
  "serde_json",
  "tempfile",
 ]
@@ -293,7 +294,12 @@ dependencies = [
 name = "ferx-tools"
 version = "0.3.0"
 dependencies = [
+ "csv",
  "ferx-core",
+ "nalgebra",
+ "rand 0.10.2",
+ "rayon",
+ "tempfile",
 ]
 
 [[package]]
