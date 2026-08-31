@@ -2593,12 +2593,17 @@ mod tests {
         }
     }
 
-    /// All three closed-form entry points share `mr_scope`, so none of them may
-    /// serve a model the ODE gate has already declined. The spelling matters: an
-    /// *indexed* `ALAG1` populates `dose_attr_map`, which `mr_scope` rejects for
-    /// an unrelated reason, so it cannot demonstrate this. A bare `ALAG` leaves
-    /// that map empty and reaches the closed form — which is how the fast path
-    /// bypassed #1070's FD gate and served a jet the gate exists to refuse.
+    /// All four closed-form entry points share `mr_scope`, so none may serve a
+    /// `TAD`-reading `[odes]` RHS the closed form cannot evaluate (#1124). The
+    /// spelling matters: an *indexed* `ALAG1` populates `dose_attr_map`, which
+    /// `mr_scope` rejects for an unrelated reason, so it cannot demonstrate this.
+    /// A bare `ALAG` leaves that map empty and reaches the closed form — which is
+    /// how the fast path originally bypassed #1070's FD gate.
+    ///
+    /// That bypass framing is now historical: #1136 deleted the FD gate in favour
+    /// of a real dual, so there is no upstream decline left to inherit and
+    /// `mr_scope` must refuse this model on `model_uses_time_anywhere` alone. Both
+    /// premises are asserted below so the test cannot pass for the old reason.
     #[test]
     fn mr_declines_what_the_ode_analytic_gate_declines() {
         let src = r#"
@@ -2644,9 +2649,18 @@ mod tests {
             "a bare `ALAG` must leave `dose_attr_map` empty — otherwise `mr_scope` \
              declines for that reason and the gate bypass is not exercised"
         );
+        // The ODE gate now *admits* this model: #1136 replaced #1070's FD gate with
+        // a real `∂TAD/∂ALAG = −1` dual, so `TAD` + an estimated lagtime is analytic
+        // there. That makes this case sharper than when it was written — the closed
+        // form must decline on its own predicate, with no upstream gate behind it.
         assert!(
-            !crate::sens::ode_provider::ode_analytical_supported(&model),
-            "the #1070 gate must decline this model"
+            crate::sens::ode_provider::ode_analytical_supported(&model),
+            "premise: post-#1136 the ODE path serves this model, so the decline below \
+             cannot be inherited from it"
+        );
+        assert!(
+            crate::pk::model_uses_time_anywhere(&model),
+            "premise: the RHS reads `TAD`, which is the predicate #1124 made `mr_scope` ask"
         );
 
         assert!(mr_scope(&model, &subject, &theta, &eta).is_none());
