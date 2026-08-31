@@ -9120,3 +9120,120 @@ fn ode_tad_rhs_prearrival_window_carries_the_lagtime_jet() {
     check_vs_production(&model, &subject, &theta, &eta);
     check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
 }
+
+/// **Two arrivals that coincide bit-exactly.** `ALAG1 = 1.5` on a dose at `t = 0` and
+/// `ALAG2 = 0.5` on a dose at `t = 1`; at `η = 0` the exponentials are exactly `1.0`, so both
+/// arrivals are exactly `1.5` — a genuine tie, and the test asserts the bit equality rather
+/// than trusting the arithmetic. Both lags carry a live jet (`∂lag/∂η` = 1.5 and 0.5).
+///
+/// A tie is a kink in the `max` that defines the TAD anchor, so FD parity cannot referee it:
+/// a central difference there averages two one-sided derivatives. What CAN be pinned is that
+/// the analytic answer equals **one** of the one-sided limits rather than a mixture of both —
+/// and specifically the one whose event ordering the walk actually uses. The timeline is
+/// sorted `(time, kind)` by a stable `sort_by` with `K_DOSE` pushed in dose order, so co-timed
+/// arrivals fire in ascending index: the `δ⁻` configuration, in which the lower-indexed dose
+/// arrives first.
+///
+/// This is second-order only. The boundary velocities' jets multiply a `δlag` whose *value*
+/// is zero, so they cannot reach `df_deta` at all — measuring first order here shows nothing
+/// (both tie-break rules give identical `df_deta`), which is why this test reads the
+/// `η`-lag block of `d2f_deta2`.
+///
+/// Mutation guard: flipping `later_arrival`'s comparison to `>` (keep the incumbent) moves the
+/// tie to `max|tie − δ⁻| = 1.5e0` and `max|tie − δ⁺| = 8.0e-1` — matching neither limit.
+#[test]
+fn ode_tad_rhs_co_timed_arrivals_resolve_to_one_sided_limit() {
+    fn model_for(tvlag1: f64) -> CompiledModel {
+        let src = format!(
+            r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 200.0)
+  theta TVKA(1.2, 0.01, 50.0)
+  theta TVLAG1({tvlag1:.17}, 0.01, 5.0)
+  theta TVLAG2(0.5, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_L1 ~ 0.04
+  omega ETA_L2 ~ 0.04
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+  ALAG1 = TVLAG1 * exp(ETA_L1)
+  ALAG2 = TVLAG2 * exp(ETA_L2)
+[structural_model]
+  ode(states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central * (1.0 + 0.3 * TAD)
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_method = rk45
+  ode_reltol = 1e-11
+  ode_abstol = 1e-13
+"#
+        );
+        parse_model_string(&src).expect("parse")
+    }
+
+    let mut subject = bolus_subject(&[0.5, 2.0, 3.0, 5.0, 8.0]);
+    subject.doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(1.0, 60.0, 2, 0.0, false, 0.0),
+    ];
+    let eta = [0.05, 0.0, 0.0];
+
+    // The tie must be exact, or this test is about two nearby arrivals and proves nothing.
+    assert_eq!(
+        (0.0f64 + 1.5).to_bits(),
+        (1.0f64 + 0.5).to_bits(),
+        "fixture must produce a bit-exact tie"
+    );
+
+    // The eta-lag block of the second-order jet: [L1,L1], [L1,L2], [L2,L2].
+    let hess = |tvlag1: f64| -> Vec<[f64; 3]> {
+        let m = model_for(tvlag1);
+        let th = [1.0, 10.0, 1.2, tvlag1, 0.5];
+        let s = ode_subject_sensitivities(&m, &subject, &th, &eta).expect("analytic");
+        s.obs
+            .iter()
+            .map(|o| [o.d2f_deta2[4], o.d2f_deta2[5], o.d2f_deta2[8]])
+            .collect()
+    };
+
+    let d = 1e-6;
+    let at_tie = hess(1.5);
+    let plus = hess(1.5 + d); // arrival0 > arrival1: dose 0 arrives last
+    let minus = hess(1.5 - d); // arrival0 < arrival1: dose 1 arrives last (the sort's ordering)
+
+    let dist = |a: &[[f64; 3]], b: &[[f64; 3]]| -> f64 {
+        a.iter()
+            .zip(b.iter())
+            .flat_map(|(x, y)| x.iter().zip(y.iter()).map(|(p, q)| (p - q).abs()))
+            .fold(0.0_f64, f64::max)
+    };
+    let to_minus = dist(&at_tie, &minus);
+    let to_plus = dist(&at_tie, &plus);
+
+    // Non-vacuity: the two limits must actually differ, or "matches one of them" is empty.
+    assert!(
+        dist(&plus, &minus) > 1e-2,
+        "the two one-sided limits are indistinguishable ({:.3e}) - the fixture would pass \
+         vacuously",
+        dist(&plus, &minus)
+    );
+    assert!(
+        to_minus < 1e-3,
+        "the tie must resolve to the one-sided limit whose event ordering the stable sort \
+         reproduces, but max|tie - delta-| = {to_minus:.3e}"
+    );
+    assert!(
+        to_plus > 1e-2,
+        "sanity: the tie should NOT also match the other limit, but max|tie - delta+| = \
+         {to_plus:.3e}"
+    );
+}

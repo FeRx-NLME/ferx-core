@@ -3326,13 +3326,35 @@ fn run_subject_tvcov_eta<const N: usize>(
 /// production's `f64::max` fold in `tad_anchor` (`ode/predictions.rs`).
 ///
 /// The TAD anchor is `max` over arrivals, and a `max` of two differentiable functions has a
-/// kink where they cross: at an exact tie the derivative is one-sided, and either one-sided
-/// value is a valid subgradient. This keeps the **incumbent**, which resolves concretely: the
-/// timeline is sorted on `(time, kind)` by a *stable* `sort_by`, and `K_DOSE` entries are
-/// pushed in `subject.doses` order, so co-timed arrivals fire in ascending dose index and the
-/// incumbent is the lower-indexed dose. Production's `max` returns the same *value* (they are
-/// equal at a tie) and carries no jet to disagree about, so this is a free choice — pinned
-/// here so it is deterministic rather than dependent on float comparison order.
+/// kink where they cross. At an exact tie this keeps the **candidate** — the dose being
+/// processed — and that is NOT a free choice, which is the whole point of this comment.
+///
+/// It looks free: production's `max` returns the same *value* at a tie and carries no jet to
+/// disagree about, so either one-sided derivative reads like a valid subgradient. But the walk
+/// has already committed to one of the two configurations before it gets here. The timeline is
+/// sorted on `(time, kind)` by a *stable* `sort_by` with `K_DOSE` entries pushed in
+/// `subject.doses` order, so co-timed arrivals fire in ascending dose index — which is exactly
+/// the event ordering of the perturbed problem in which the *lower*-indexed dose arrives
+/// first. In that configuration the anchor ends as the last-processed dose's. Keeping the
+/// incumbent instead produces a Hessian matching **neither** one-sided limit.
+///
+/// Measured, on two doses whose lagged arrivals coincide bit-exactly (`ALAG1 = 1.5` on a dose
+/// at `t = 0`, `ALAG2 = 0.5` on a dose at `t = 1`, both `η = 0`), comparing the `η`-lag block
+/// of `d2f_deta2` at the tie against the two one-sided limits at `±1e-6`:
+///
+/// | tie-break | `max|tie − δ⁻|` | `max|tie − δ⁺|` |
+/// |---|---|---|
+/// | keep candidate (`>=`, this code) | **6.6e-5** | 1.3e0 |
+/// | keep incumbent (`>`) | 1.5e0 | 8.0e-1 |
+///
+/// `δ⁻` is the limit whose event ordering the stable sort reproduces, and only the candidate
+/// rule lands on it. The incumbent rule sits between the two — a mixture that is not the
+/// derivative of any single consistent perturbation. Pinned by
+/// `ode_tad_rhs_co_timed_arrivals_resolve_to_one_sided_limit`.
+///
+/// A consequence worth stating because it makes the surrounding code simpler to reason about:
+/// the timeline is sorted ascending, so at a `K_DOSE` the candidate always wins and this
+/// reduces to "the arriving dose becomes the anchor".
 ///
 /// The tie is NOT confined to two distinct `ALAG{n}` slots. `lag_dual(k)` reads a **per-dose**
 /// snapshot (`pk_at_dose[k]`, seeded in that dose's own occasion group under IOV), so two doses
@@ -3354,7 +3376,7 @@ fn run_subject_tvcov_eta<const N: usize>(
 /// same way, so matching it here is what keeps the two engines agreeing under an excursion.
 #[inline]
 fn later_arrival<T: crate::sens::num::PkNum>(incumbent: T, candidate: T) -> T {
-    if incumbent.val().is_nan() || candidate.val() > incumbent.val() {
+    if incumbent.val().is_nan() || candidate.val() >= incumbent.val() {
         candidate
     } else {
         incumbent
@@ -5462,8 +5484,11 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                                     post_params,
                                     &prep_post,
                                     t_event,
-                                    // Post side: the anchor hoisted at the top of this arm — the
-                                    // same dual the segment this arrival opens integrates under.
+                                    // Post side: the anchor folded at the top of this arm.
+                                    // Identical to `arrival_dual(idx)` in every reachable case
+                                    // (the timeline is sorted ascending, so the candidate always
+                                    // wins); folded once so there is a single expression of
+                                    // "the anchor this arrival establishes".
                                     post_anchor,
                                     reset_floor,
                                     true,
@@ -5614,8 +5639,8 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
                             post_params,
                             post_prep,
                             t_event,
-                            // Post side: the anchor hoisted at the top of this arm — the same
-                            // dual the segment this arrival opens integrates under.
+                            // Post side: the anchor folded at the top of this arm (see the
+                            // infusion arm above).
                             post_anchor,
                             reset_floor,
                             true,
