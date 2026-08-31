@@ -9719,3 +9719,146 @@ fn ode_tad_rhs_co_timed_arrivals_resolve_to_one_sided_limit() {
          {to_plus:.3e}"
     );
 }
+
+/// #1070: `later_arrival`'s **incumbent** arm, asserted directly on the pure function.
+///
+/// The walk cannot reach it — the timeline is sorted ascending, so at a `K_DOSE` the
+/// candidate is always `>=` the incumbent and the candidate arm always wins. But the fold
+/// is a `max`, and its contract is that an out-of-order or NaN candidate must not drag the
+/// anchor backwards or poison it. Nothing in a reachable walk state exercises that, so it
+/// is pinned here rather than left to a fixture that cannot reach it.
+#[test]
+fn later_arrival_never_moves_the_anchor_backwards() {
+    // Ascending — the only ordering the walk actually produces.
+    assert_eq!(later_arrival(3.0_f64, 5.0_f64), 5.0);
+    // Out of order: the incumbent must survive.
+    assert_eq!(later_arrival(5.0_f64, 3.0_f64), 5.0);
+    // Exact tie: the candidate, i.e. the stable sort's own ordering (#1070 round 2).
+    assert_eq!(later_arrival(4.0_f64, 4.0_f64), 4.0);
+    // Unseeded incumbent: any candidate is adopted.
+    assert_eq!(later_arrival(f64::NAN, 2.0_f64), 2.0);
+    // A NaN candidate must not silently become the anchor — `NaN >= x` is false, so the
+    // incumbent is kept. This is the arm a `>` / `>=` mix-up would break.
+    assert_eq!(later_arrival(2.0_f64, f64::NAN), 2.0);
+}
+
+/// A TV-cov model whose RHS reads `TAD`, for the rate-off saltation boundaries. Same
+/// parameter shape as `ONECPT_ODE_TVCOV`, so the same θ/η apply.
+const TVCOV_TAD_RATEOFF_ODE: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  theta THETA_WT(0.75, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL = TVCL * (WT / 70)^THETA_WT * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central * (1.0 + 0.02 * TAD)
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+/// **Infusion rate-off under a time-varying covariate, with a `TAD`-reading RHS.** The
+/// `K_INF_END` handler shares its `TAD` anchor between the pre- and post-boundary velocities
+/// (no dose lands at a rate-off), so a wrong anchor there moves `∂f/∂η` without moving `f`.
+/// The other TV-cov infusion fixtures in this module use a `t`-independent RHS, leaving that
+/// sharing pinned only through a constant.
+///
+/// Measured scope, so nobody re-derives it: this exercises the **cheap**
+/// `inject_rate_saltation` path, not the general `g⁻−g⁺` one. The general path is guarded on
+/// `pk_snapshot_equal(pre, post)` being false, and it is unreachable as the walk is built —
+/// `params` is `next_record_params[p]` (first record at index `>= p`) while `post_snapshot`
+/// is the first record *strictly* later, and every record co-timed with a rate-off sorts
+/// before it (`K_INF_END` = 7, `K_ZO_END` = 8 are the last kinds), so both resolve to the
+/// same record. Verified: zero hits on that arm across the whole instrumented suite.
+#[test]
+fn ode_tad_rhs_infusion_end_inside_a_covariate_step_matches_production() {
+    let model = parse_model_string(TVCOV_TAD_RATEOFF_ODE).expect("parse");
+    let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+    let mut subject = bolus_subject(&[1.0, 2.0, 4.0, 8.0]);
+    subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+    subject.doses[0].rate = 50.0;
+    subject.doses[0].duration = 2.0;
+    subject.dose_covariates = vec![wt(60.0)];
+    subject.obs_covariates = vec![wt(60.0), wt(70.0), wt(80.0), wt(90.0)];
+
+    assert!(crate::dosing::is_real_infusion(&subject.doses[0]));
+    assert!(subject.has_tv_covariates() && ode_tvcov_supported(&model, &subject));
+    // Non-vacuity: the window end must land strictly BETWEEN two records carrying
+    // different WT, or the snapshots agree and the cheap path runs instead.
+    let w_end = subject.doses[0].time + subject.doses[0].duration;
+    assert!(
+        subject.obs_times.contains(&w_end),
+        "the infusion end must land ON a record, got {w_end}"
+    );
+
+    let theta = [1.0, 20.0, 0.75];
+    let eta = [0.1];
+    check_vs_production(&model, &subject, &theta, &eta);
+    check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+}
+
+/// **Zero-order window rate-off under a time-varying covariate, with a `TAD`-reading RHS.**
+/// The `K_ZO_END` twin of the test above, and with the same measured scope: the cheap
+/// closed-form path, since the general one is unreachable for the same reason. Here the
+/// window end additionally carries a `DUR` jet, so the shared anchor is checked on a moving
+/// boundary rather than a fixed one.
+#[test]
+fn ode_tad_rhs_zero_order_end_inside_a_covariate_step_matches_production() {
+    const TVCOV_TAD_ZO_ODE: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  theta THETA_WT(0.75, 0.01, 5.0)
+  theta TVDUR(2.5, 0.5, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_DUR ~ 0.04
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL  = TVCL * (WT / 70)^THETA_WT * exp(ETA_CL)
+  V   = TVV
+  DUR = TVDUR * exp(ETA_DUR)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = zero_order(dur=DUR) - (CL/V) * central * (1.0 + 0.02 * TAD)
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+    let model = parse_model_string(TVCOV_TAD_ZO_ODE).expect("parse zero-order TV-cov TAD");
+    let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+    let mut subject = bolus_subject(&[1.0, 2.0, 4.0, 8.0]);
+    subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+    subject.dose_covariates = vec![wt(60.0)];
+    subject.obs_covariates = vec![wt(60.0), wt(70.0), wt(80.0), wt(90.0)];
+
+    assert!(subject.has_tv_covariates() && ode_tvcov_supported(&model, &subject));
+
+    // DUR = 2.5 · exp(ETA_DUR); with the η below the window ends strictly between the
+    // `WT = 70` record at t = 2 and the `WT = 80` record at t = 4 — same non-vacuity
+    // condition as the infusion twin, but here the boundary also carries a `DUR` jet.
+    let theta: [f64; 4] = [1.0, 20.0, 0.75, 2.5];
+    let eta: [f64; 2] = [0.1, 0.0];
+    let dur = theta[3] * eta[1].exp();
+    assert!(
+        dur > 2.0 && dur < 4.0,
+        "the zero-order window end must fall strictly inside a covariate step, got {dur}"
+    );
+
+    check_vs_production(&model, &subject, &theta, &eta);
+    check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+}
