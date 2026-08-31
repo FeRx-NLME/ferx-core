@@ -566,6 +566,51 @@ fn diagnostics_from(result: &FitResult) -> (bool, bool, bool) {
     (near_boundary, cov_ok, cov_warnings)
 }
 
+/// Refuse a mixture model. **Settled, not pending** — see #1145.
+///
+/// A mixture's classes are identified only up to relabelling, so replicate *k*'s
+/// "class 1" need not be the original fit's class 1. Averaging estimates across
+/// replicates without resolving that label switching inflates the standard error
+/// toward the *between-class separation*, which is a property of the model and
+/// not a sampling uncertainty — and it does so while every replicate converges
+/// and the table looks entirely reasonable. The error grows with how well
+/// separated the classes are, i.e. it is worst exactly when the mixture is best
+/// identified and therefore most likely to be believed.
+///
+/// Relabelling rules exist (ordering on a canonical statistic; matching each
+/// replicate's per-subject `mixest` assignments against the base fit's) and would
+/// work most of the time. #1145 closed on the judgement that "most of the time"
+/// is the wrong standard for the artefact a reader trusts *instead of* redoing
+/// the analysis, and that each rule adds a knob whose setting silently changes
+/// the answer.
+///
+/// The alternative offered in the message is [SIR], which never re-optimises —
+/// it samples around the ML estimates and reweights by the likelihood — so there
+/// is no second basin to fall into and no labelling to resolve. The covariance
+/// step is likewise well defined at a single fit's fixed labelling.
+///
+/// Consequence for this module: `MixtureParams`' per-class Omega/Sigma overrides
+/// are deliberately *not* represented in [`coordinates`]. There is no longer a
+/// reason to add them.
+///
+/// [SIR]: https://ferx-nlme.github.io/ferx-core/estimation/sir.html
+fn reject_mixture_model(params: &ModelParameters) -> Result<(), String> {
+    if params.mixture.is_some() {
+        return Err(
+            "the bootstrap does not support mixture models ([mixture] block), and will not: \
+             a mixture's classes are identified only up to relabelling, so a replicate's \
+             class 1 need not be the original fit's class 1, and averaging estimates across \
+             replicates mixes them — inflating the standard error toward the between-class \
+             separation while every replicate converges and the table looks reasonable. \
+             For parameter uncertainty on a mixture model use SIR (`sir = true`), which \
+             reweights samples around the estimates instead of re-fitting and so cannot \
+             switch labels."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Refuse a model whose predictions depend on the subject identifier.
 ///
 /// Resampling with replacement necessarily renames the duplicate copies of a
@@ -573,32 +618,6 @@ fn diagnostics_from(result: &FitResult) -> (bool, bool, bool) {
 /// covariate would silently see different values than it did in the base fit.
 /// PsN documents the same hazard as a known bug — "model code that relies on ID
 /// numbers will lead to errors" — and leaves it to the user. Fail instead.
-/// Refuse a mixture model.
-///
-/// Two reasons, and the first is not a plumbing gap. A mixture model's classes
-/// are identified only up to relabelling, so replicate *k*'s "class 1" need not
-/// be the original fit's class 1; averaging estimates across replicates without
-/// resolving that label switching produces a bias-and-interval table that is
-/// meaningless rather than merely noisy. Second, `MixtureParams` carries
-/// per-class Omega/Sigma overrides in their own packed block, which the flat
-/// vector here does not represent — so `--update-inits` and `--dofv` would
-/// silently drop them.
-///
-/// Refusing is the honest answer until the relabelling question is settled.
-fn reject_mixture_model(params: &ModelParameters) -> Result<(), String> {
-    if params.mixture.is_some() {
-        return Err(
-            "the bootstrap does not support mixture models ([mixture] block). A mixture's \
-             classes are identified only up to relabelling, so a replicate's class 1 need \
-             not be the original fit's class 1, and averaging estimates across replicates \
-             would mix them. Bootstrapping a mixture needs a relabelling rule this tool \
-             does not have."
-                .to_string(),
-        );
-    }
-    Ok(())
-}
-
 fn reject_id_dependent_model(model: &CompiledModel) -> Result<(), String> {
     reject_id_dependent(&model.referenced_covariates)
 }

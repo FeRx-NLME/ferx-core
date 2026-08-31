@@ -116,10 +116,12 @@ fn two_session_subject() -> Subject {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: vec![5.0], // boundary at shifted t=5
+        reset_covariates: Vec::new(),
         cens: vec![0; 6],
         occasions: vec![1, 1, 1, 2, 2, 2],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -359,10 +361,12 @@ fn derived_integral_single_session_unchanged() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; 3],
         occasions: vec![1, 1, 1],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
