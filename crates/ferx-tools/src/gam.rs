@@ -775,4 +775,121 @@ mod tests {
         assert!(aic_null.is_nan());
         assert!(scores.is_empty());
     }
+
+    // ── Xpose4 anchor ─────────────────────────────────────────────────────────
+    //
+    // Gold-standard reference values computed in R with gam::gam() + ns(),
+    // which is the statistical engine xpose4::xpose.gam() uses internally
+    // (xpose4 defaults: smoother3=ns,arg3=df=2; smoother4=ns,arg4=df=3;
+    // steppit=FALSE for independent screening).
+    //
+    // Because gam::gam(y ~ ns(x, df=k)) with Gaussian family and our
+    // ols_aic formula produce identical ΔAIC (the constant n(1+ln2π) cancels),
+    // the reference values below are bit-for-bit reproducible from R.
+    //
+    // Anchor data (n=60, seed=20240101):
+    //   ETA_CL ~ 0.40*(WT−70)/70 + N(0, 0.15²)  → WT ranks #1
+    //   ETA_V  ~ 0.35*(SEX−0.5) + N(0, 0.20²)   → SEX ranks #1
+    //   CRCL   ~ noise covariate (no true effect)
+    //
+    // R script: docs/gam_anchor_reference/gen_anchor.R
+    #[test]
+    fn xpose4_anchor_delta_aic_matches_reference() {
+        // Parse the anchor EBE CSV (generated with R set.seed(20240101)).
+        const CSV: &str = include_str!("../tests/data/gam_anchor_ebes.csv");
+
+        let mut lines = CSV.lines();
+        // R's write.csv quotes all field names; strip the surrounding quotes.
+        let header: Vec<String> = lines
+            .next()
+            .unwrap()
+            .split(',')
+            .map(|s| s.trim_matches('"').to_string())
+            .collect();
+        let col = |name: &str| header.iter().position(|h| h == name).unwrap();
+
+        let (ic, iv, iwt, icrcl, isex) = (
+            col("ETA_CL"),
+            col("ETA_V"),
+            col("WT"),
+            col("CRCL"),
+            col("SEX"),
+        );
+
+        let (mut eta_cl, mut eta_v, mut wt, mut crcl, mut sex) =
+            (vec![], vec![], vec![], vec![], vec![]);
+        for line in lines {
+            let c: Vec<&str> = line.split(',').collect();
+            let p = |i: usize| c[i].parse::<f64>().unwrap();
+            eta_cl.push(p(ic));
+            eta_v.push(p(iv));
+            wt.push(p(iwt));
+            crcl.push(p(icrcl));
+            sex.push(p(isex));
+        }
+
+        let opts = GamOptions::default();
+
+        // Reference Δ AIC from R gam::gam (= xpose4 defaults, steppit=FALSE).
+        // Tolerance 1e-4 (R parity check shows max |diff| = 2.7e-5 on real data).
+        let tol = 1e-4_f64;
+
+        // ── ETA_CL ────────────────────────────────────────────────────────────
+        let covs_cl: &[(&str, &[f64], CovariateKind)] = &[
+            ("WT", wt.as_slice(), CovariateKind::Continuous),
+            ("CRCL", crcl.as_slice(), CovariateKind::Continuous),
+            ("SEX", sex.as_slice(), CovariateKind::Categorical),
+        ];
+        let (_, scores_cl) = screen_eta_raw(&eta_cl, covs_cl, &opts);
+
+        let find = |scores: &Vec<CovariateScore>, name: &str| {
+            scores
+                .iter()
+                .find(|s| s.covariate == name)
+                .unwrap()
+                .delta_aic
+        };
+
+        assert!(
+            (find(&scores_cl, "WT") - 1.882_144).abs() < tol,
+            "ETA_CL × WT: got {:.6}",
+            find(&scores_cl, "WT")
+        );
+        assert!(
+            (find(&scores_cl, "CRCL") - -0.525_482).abs() < tol,
+            "ETA_CL × CRCL: got {:.6}",
+            find(&scores_cl, "CRCL")
+        );
+        assert!(
+            (find(&scores_cl, "SEX") - -1.383_530).abs() < tol,
+            "ETA_CL × SEX: got {:.6}",
+            find(&scores_cl, "SEX")
+        );
+        assert_eq!(scores_cl[0].covariate, "WT", "WT must rank #1 for ETA_CL");
+
+        // ── ETA_V ─────────────────────────────────────────────────────────────
+        let covs_v: &[(&str, &[f64], CovariateKind)] = &[
+            ("WT", wt.as_slice(), CovariateKind::Continuous),
+            ("CRCL", crcl.as_slice(), CovariateKind::Continuous),
+            ("SEX", sex.as_slice(), CovariateKind::Categorical),
+        ];
+        let (_, scores_v) = screen_eta_raw(&eta_v, covs_v, &opts);
+
+        assert!(
+            (find(&scores_v, "WT") - -1.655_242).abs() < tol,
+            "ETA_V × WT: got {:.6}",
+            find(&scores_v, "WT")
+        );
+        assert!(
+            (find(&scores_v, "CRCL") - -1.491_354).abs() < tol,
+            "ETA_V × CRCL: got {:.6}",
+            find(&scores_v, "CRCL")
+        );
+        assert!(
+            (find(&scores_v, "SEX") - 22.295_612).abs() < tol,
+            "ETA_V × SEX: got {:.6}",
+            find(&scores_v, "SEX")
+        );
+        assert_eq!(scores_v[0].covariate, "SEX", "SEX must rank #1 for ETA_V");
+    }
 }
