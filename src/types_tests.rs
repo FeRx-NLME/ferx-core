@@ -2418,6 +2418,88 @@ fn call_time_ode_tolerances_reach_the_absorption_twin() {
     assert_eq!(rso.max_steps, 4242);
 }
 
+// ── #1111: the `[covariate_model]` data types ──────────────────────────────
+
+/// Every `label()` spelling is what the fit YAML and the block text both use,
+/// so a renamed arm silently changes a written file and the text a user has to
+/// type back. Pinned as data, one assert per variant.
+#[test]
+fn covariate_form_labels_are_the_block_spellings() {
+    let cases = [
+        (CovariateForm::None, "none"),
+        (CovariateForm::Linear, "linear"),
+        (CovariateForm::LinearRelative, "linear_relative"),
+        (CovariateForm::Exponential, "exponential"),
+        (CovariateForm::Power, "power"),
+        (CovariateForm::Hockey, "hockey"),
+        (CovariateForm::Categorical, "categorical"),
+        (CovariateForm::Expr("(WT/70)^0.75".into()), "expr"),
+    ];
+    for (form, label) in &cases {
+        assert_eq!(&form.label(), label);
+    }
+    // Only `categorical` reads a categorical column; the check against the
+    // `[covariates]` declaration is keyed on this.
+    assert!(CovariateForm::Categorical.is_categorical());
+    assert!(!CovariateForm::Power.is_categorical());
+    assert!(!CovariateForm::Expr("1".into()).is_categorical());
+}
+
+#[test]
+fn covariate_stat_labels_and_literals_round_trip() {
+    let cases = [
+        (CovariateStat::Median, "median"),
+        (CovariateStat::Mean, "mean"),
+        (CovariateStat::Min, "min"),
+        (CovariateStat::Max, "max"),
+        (CovariateStat::Mode, "mode"),
+    ];
+    for (stat, label) in &cases {
+        assert_eq!(&stat.label(), label);
+        // A symbolic statistic is not a literal — that is what defers the
+        // relation until a population has been summarised.
+        assert_eq!(stat.literal(), None);
+    }
+    assert_eq!(CovariateStat::Literal(70.0).label(), "70");
+    assert_eq!(CovariateStat::Literal(70.0).literal(), Some(70.0));
+}
+
+#[test]
+fn a_covariate_summary_resolves_every_statistic_it_names() {
+    let summary = CovariateSummary {
+        median: 70.0,
+        mean: 72.5,
+        min: 50.0,
+        max: 95.0,
+        mode: 70.0,
+        levels: vec![50.0, 70.0, 95.0],
+    };
+    assert_eq!(summary.value_of(CovariateStat::Median), 70.0);
+    assert_eq!(summary.value_of(CovariateStat::Mean), 72.5);
+    assert_eq!(summary.value_of(CovariateStat::Min), 50.0);
+    assert_eq!(summary.value_of(CovariateStat::Max), 95.0);
+    assert_eq!(summary.value_of(CovariateStat::Mode), 70.0);
+    // A literal ignores the summary entirely, so a bound model and a
+    // file-literal one build the same expression.
+    assert_eq!(summary.value_of(CovariateStat::Literal(1.5)), 1.5);
+}
+
+#[test]
+fn declared_levels_are_readable_and_auto_is_not() {
+    assert_eq!(
+        CovariateLevels::Declared(vec![0.0, 1.0]).declared(),
+        Some(&[0.0, 1.0][..])
+    );
+    // `auto` has no levels until a population has been seen — that `None` is
+    // what leaves the relation unresolved rather than generating zero θ.
+    assert_eq!(CovariateLevels::Auto.declared(), None);
+    // The pre-`levels` shape of every `[covariates]` line.
+    let decl = CovariateDecl::new("WT", CovariateKind::Continuous);
+    assert_eq!(decl.name, "WT");
+    assert_eq!(decl.kind, CovariateKind::Continuous);
+    assert_eq!(decl.levels, None);
+}
+
 // ── #1064: scale guardrails for models with hundreds of θ ──────────────────
 mod theta_block_scale_guards {
     use crate::io::output::compact_theta_blocks;

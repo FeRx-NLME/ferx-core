@@ -275,7 +275,7 @@ pub fn recover_disp_params_g<T: PkNum>(
 
     let probe = |u: &[T], vars: &mut Vec<T>, stack: &mut Vec<T>| -> Vec<T> {
         let mut du = vec![T::from_f64(0.0); n];
-        prog.eval_rhs_g::<T>(u, p, 0.0, 0.0, 0.0, &mut du, vars, stack);
+        prog.eval_rhs_g::<T>(u, p, 0.0, 0.0, T::from_f64(0.0), &mut du, vars, stack);
         du
     };
 
