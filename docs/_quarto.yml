@@ -60,6 +60,7 @@ website:
           - model-file/iov.qmd
           - model-file/individual-parameters.qmd
           - model-file/covariates.qmd
+          - model-file/covariate-model.qmd
           - model-file/structural-model.qmd
           - model-file/lagtime.qmd
           - model-file/steady-state.qmd

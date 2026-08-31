@@ -31,6 +31,18 @@ section of the SDLC for the versioning policy).
   still `ferx-core`.
 
 ### Added
+- **A `[covariate_model]` block: covariate–parameter relationships declared as data (#1111).**
+  `CL ~ WT power(center = median)` desugars into exactly the classical
+  `[individual_parameters]` expression — with the theta declaration, the centering constant and a
+  missing-value guard filled in — so the OFV and estimates are identical to writing it by hand.
+  All five PsN `scm` states are expressible (`none`, `linear`, `hockey`, `exponential`, `power`,
+  plus `categorical` and an `expr("…")` escape hatch) with PsN's default inits and bounds;
+  `center`/`breakpoint`/`ref` accept a literal or a data-derived statistic (`median`, `mean`,
+  `min`, `max`, `mode`), and `[covariates]` gains `categorical(levels = [0, 1])` /
+  `levels = auto`. The relations are echoed on `FitResult.covariate_relations` and in the fit
+  YAML, and `ferx check` prints the desugared block. Relations are line-oriented and independent,
+  so a covariate search rewrites this one block instead of doing surgery on an expression. See
+  `docs/model-file/covariate-model.qmd`.
 - **A CI-enforced public-API baseline for `ferx-core` (#1114).** `api/ferx-core-public-api.txt` is
   a committed snapshot of the crate's public surface; a CI job regenerates and diffs it, so any
   widening of the API fails until the baseline is updated in the same PR. Regenerate with

@@ -1,0 +1,238 @@
+---
+pagetitle: "Declarative covariate models in ferx"
+description-meta: "Declare covariate-parameter relationships as data with the [covariate_model] block — PsN scm parity, data-derived centering, and a machine-readable relation table."
+---
+
+# Covariate model
+
+> **Maturity: experimental** — see [Feature Maturity](../maturity.qmd) for what this means.
+
+The optional `[covariate_model]` block declares covariate–parameter
+relationships as **structured data** instead of as free-text expressions inside
+[`[individual_parameters]`](individual-parameters.qmd).
+
+It is **sugar**: each relation is rewritten into exactly the classical
+expression you would have written by hand, before anything else reads the
+model. Same OFV, same estimates, same gradients — the classical form stays
+fully supported and nothing about it changes.
+
+```
+[covariates]
+  WT   continuous
+  CRCL continuous
+  SEX  categorical(levels = [0, 1])
+
+[covariate_model]
+  CL ~ WT   power(center = median)
+  CL ~ CRCL linear(center = 100)
+  V  ~ WT   power(center = 70, fix = 0.75)
+  CL ~ SEX  categorical(ref = mode)
+```
+
+## Why declare them this way
+
+Writing the factor out by hand is fine for one model. It is the wrong shape for
+a machine writing a hundred:
+
+- **One line per relation, no cross-line dependencies.** A covariate search
+  (PsN `scm`, `ferx_cov_screen()`, an agent) adds or drops a relation with a
+  pure line insert/delete, and rewrites this block only — the rest of the file
+  is invariant.
+- **Nothing to hand-write.** The centering constant, the θ declaration with
+  sensible bounds, and the missing-data guard all come from the form.
+- **The relations come back on the result.** `FitResult.covariate_relations`
+  (and a `covariate_model:` section in the fit YAML) states what covariate model
+  ran, what each centring statistic resolved to, and each θ's estimate and SE —
+  so downstream tooling never parses a `.ferx` file to find out.
+
+If you are writing one model by hand and prefer to see the expression, keep
+writing it classically. Both are first-class.
+
+## Grammar
+
+```
+PARAM ~ COV form(kwargs) [=> THETA_NAME(init, lower, upper)[, ...]]
+```
+
+- `PARAM` — a top-level `[individual_parameters]` name.
+- `COV` — a column declared in [`[covariates]`](covariates.qmd). Unlike the
+  lenient classical path, which warns about an undeclared covariate and reads it
+  anyway, **the declaration is required here**: the form and the levels are read
+  off it, so guessing would make the generated θ vector depend on the dataset.
+- `=> …` — optional. Left out, the θ is named `THETA_<PARAM>_<COV>` (with
+  `_LO`/`_HI` for `hockey` and `_<LEVEL>` for `categorical`) and takes the
+  form's default init and bounds. A `theta` of that name already declared in
+  `[parameters]` takes precedence and is used as declared.
+
+`fix = v` on any form pins the θ at `v` and declares it `FIX`.
+
+## Forms
+
+| form | factor | notes |
+|---|---|---|
+| `none` | `1` | declares no θ, changes no expression |
+| `linear(center=c)` | `1 + θ·(COV − c)` | θ carries the reciprocal of the covariate's units |
+| `linear_relative(center=c)` | `1 + θ·(COV/c − 1)` | dimensionless θ; exact reparameterization of `linear` (θ_rel = c·θ_abs) |
+| `exponential(center=c)` | `exp(θ·(COV − c))` | |
+| `power(center=c)` | `(COV/c)^θ` | the classical allometric factor |
+| `hockey(breakpoint=b)` | `1 + θ_lo·(COV − b)` below `b`, `1 + θ_hi·(COV − b)` above | **two** θ |
+| `categorical(ref=r)` | `1 + θ_k` at each non-reference level, `1` at `r` | one θ per non-reference level |
+| `expr("…")` | verbatim | escape hatch |
+
+`none` exists so a search can record "tested, rejected" in the file and have the
+generated model round-trip through the parser unchanged.
+
+### Coming from PsN `scm`
+
+Every `scm` state is expressible:
+
+| PsN state | PsN code | ferx form |
+|---|---|---|
+| 1 `none` | `PARCOV = 1` | `none` |
+| 2 `linear` (continuous) | `1 + THETA(1)*(COV - median)` | `linear(center = median)` |
+| 2 `linear` (categorical) | `IF(COV.EQ.mode) PARCOV=1; ELSE PARCOV = 1 + THETA(1)` | `categorical(ref = mode)` |
+| 3 `hockey-stick` | two slopes, breakpoint at median | `hockey(breakpoint = median)` |
+| 4 `exponential` | `EXP(THETA(1)*(COV - median))` | `exponential(center = median)` |
+| 5 `power` | `(COV/median)**THETA(1)` | `power(center = median)` |
+| arbitrary `[code]` | NONMEM verbatim | `expr("…")` |
+
+The **default inits and bounds are PsN's, verbatim**:
+
+| form | init | lower | upper |
+|---|---|---|---|
+| `linear` | `0.001/(c−min)` | `1/(c−max)` | `1/(c−min)` |
+| `categorical` | `−0.001` | `−1` | `5` |
+| `hockey` (θ_lo, θ_hi) | `0.001/(c−min)`, `0.001/(c−max)` | `−1e6`, `1/(c−max)` | `1/(c−min)`, `1e6` |
+| `exponential` | `0.001` | `−100` | `1e6` |
+| `power` | `0.001` | `−100` | `1e6` |
+
+The linear bounds are not cosmetic: `θ ∈ [1/(c−max), 1/(c−min)]` is exactly what
+keeps `1 + θ·(COV − c)` positive over the observed covariate range. A covariate
+that does not vary around its centre makes both bounds infinite, and is rejected
+with a message rather than given a θ the optimiser cannot move.
+
+What PsN calls `[test_relations]`, `valid_states`, `included_relations` and
+`p_forward` is **search configuration, not model**. It belongs in an SCM harness
+that reads the relation table and rewrites these lines; the block does not try
+to express the search.
+
+## Data-derived statistics
+
+`center` / `breakpoint` accept `median`, `mean`, `min`, `max` or a literal
+number; `ref` accepts a level literal or `mode`; `[covariates]` accepts
+`categorical(levels = auto)`.
+
+Statistics are computed **one value per subject** (PsN's weighting — a subject
+with forty samples must not drag the median toward their own weight); a
+time-varying covariate contributes each distinct value it takes within the
+subject.
+
+**Recommendation: literals for a final model, symbolic for an automated
+search.** A literal centre is reproducible from the file alone. A symbolic one
+keeps a generated covariate model portable across datasets — and the value it
+resolved to is written into the fit YAML, so the run stays reproducible:
+
+```yaml
+covariate_model:
+  - parameter: "CL"
+    covariate: "WT"
+    form: "power"
+    center: 70.2  # resolved from median
+    thetas:
+      - name: "THETA_CL_WT"
+        estimate: 0.712431
+        se: 0.083120
+```
+
+A symbolic statistic can only be resolved once a dataset has been seen. Fits
+launched from a data file (`ferx <model> --data …`, `fit_from_files`, `ferx
+check --data`) bind it automatically. Driving the API directly, call
+`bind_covariate_stats(&mut parsed, model_text, &population)` before `fit`.
+Reaching a fit with one still unbound is a hard error
+(`E_COVSTAT_UNRESOLVED`) — never a quiet fit with the covariate effect missing.
+
+## Where the factor is inserted
+
+The parameter's right-hand side is split into top-level product factors, and the
+covariate factors are multiplied into the **non-η half**, immediately before the
+first η/κ-bearing factor:
+
+```
+CL = TVCL * exp(ETA_CL)
+  →  CL = TVCL * (if (WT == WT) (WT / 70)^THETA_CL_WT else 1.0) * exp(ETA_CL)
+```
+
+Appending at the end of the expression would be numerically identical but would
+take the typical value out of the shape the SAEM mu-reference detector reads, and
+the covariate effect would be silently dropped under `method = saem`.
+
+When the RHS is **not** a top-level product — a sum, a logit transform, a
+mixture branch — there is no unambiguous place for the factor, and that is a
+hard error rather than a guess. Wire it by hand instead:
+
+```
+[individual_parameters]
+  CL = TVCL * COV_CL * exp(ETA_CL)   # COV_CL = the factor, placed where you want it
+```
+
+::: {.callout-note}
+`categorical` builds a conditional factor, which is not log-linear in one θ. As
+with a hand-written conditional, that is outside the SAEM mu-reference detector's
+scope — prefer FOCEI for a categorical covariate effect, or check that the effect
+is actually estimated when using SAEM.
+:::
+
+## Missing covariate values
+
+Every generated factor is wrapped in a neutral guard:
+
+```
+(if (WT == WT) (WT / 70)^THETA_CL_WT else 1.0)
+```
+
+`NaN == NaN` is false, so a missing covariate contributes a factor of exactly
+`1.0`. This is not belt-and-braces: division by a missing value **underflows to
+`0.0`** in ferx rather than producing an infinity, so an unguarded factor would
+zero the parameter silently instead of failing loudly.
+
+## Seeing what was built
+
+`ferx check` prints the desugared `[individual_parameters]`, and the same lines
+are on `CheckReport.desugared_individual_parameters` in `--json`:
+
+```
+$ ferx check examples/two_cpt_oral_covmodel.ferx
+
+[individual_parameters] as built from [covariate_model]:
+  CL = TVCL * (if (WT == WT) (WT / 70)^THETA_CL_WT else 1.0) * (if (CRCL == CRCL) (CRCL / 100)^THETA_CL_CRCL else 1.0) * exp(ETA_CL)
+  V1 = TVV1 * (if (WT == WT) (WT / 70)^THETA_V1_WT else 1.0) * exp(ETA_V1)
+  ...
+```
+
+A declaratively stated covariate model is otherwise unauditable — nothing in the
+file spells out the resolved constant, the guard, or where the factor landed.
+This is the text to compare against a NONMEM control stream.
+
+## Validation
+
+All of these are errors, not warnings:
+
+- a covariate not declared in `[covariates]`
+- a `PARAM` that is not a top-level `[individual_parameters]` name
+- a duplicate `(PARAM, COV)` pair, or two relations generating the same θ name
+- an explicit `=> NAME(...)` whose name is already declared in `[parameters]`
+- `categorical` on a covariate declared `continuous`, or a continuous form on a
+  categorical one
+- `categorical` on a covariate with no `levels` and no `levels = auto`
+- a reference level outside the declared levels
+- an unknown form or keyword argument (with a did-you-mean)
+- a right-hand side that is not a top-level product
+- a symbolic statistic still unresolved when the model reaches a fit
+
+## Example
+
+See `examples/two_cpt_oral_covmodel.ferx`, which is
+`examples/two_cpt_oral_cov.ferx` restated with the block. The two are checked
+against each other in `tests/covariate_model_equivalence.rs`: bit-identical
+predictions at a fixed parameter vector, and a bit-identical OFV from the same
+start.

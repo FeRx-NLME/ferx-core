@@ -190,6 +190,7 @@ fn build_warfarin_model() -> CompiledModel {
         },
     );
     CompiledModel {
+        covariate_model: None,
         name: "warfarin".into(),
         pk_model: PkModel::OneCptOral,
         error_model: ErrorModel::Proportional,
@@ -324,6 +325,7 @@ fn generate_two_cpt_iv() {
         },
     );
     let model = CompiledModel {
+        covariate_model: None,
         name: "two_cpt_iv".into(),
         pk_model: PkModel::TwoCptIv,
         error_model: ErrorModel::Proportional,
@@ -455,6 +457,7 @@ fn generate_two_cpt_oral_cov() {
         },
     );
     let model = CompiledModel {
+        covariate_model: None,
         name: "two_cpt_oral_cov".into(),
         pk_model: PkModel::TwoCptOral,
         error_model: ErrorModel::Proportional,
@@ -661,6 +664,7 @@ fn generate_mm_oral() {
         dose_attr_map: Default::default(),
     };
     let model = CompiledModel {
+        covariate_model: None,
         name: "mm_oral".into(),
         pk_model: PkModel::OneCptOral,
         error_model: ErrorModel::Proportional,

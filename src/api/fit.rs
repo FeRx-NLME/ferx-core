@@ -2272,6 +2272,9 @@ fn fit_inner(
 
     let mut fit_result = FitResult {
         restored_from_checkpoint: false,
+        // #1111: the `[covariate_model]` echo, joined to the θ this fit
+        // estimated. Filled in just below, once `fit_result` owns the θ vector.
+        covariate_relations: Vec::new(),
         method: final_method,
         method_chain: chain.clone(),
         method_wall_times_secs,
@@ -2482,6 +2485,17 @@ fn fit_inner(
         fit_result.warnings.push(msg);
         fit_result.warnings_structured.push(entry);
     }
+
+    // The `[covariate_model]` echo (#1111): the relations as declared, joined to
+    // the θ this fit estimated and their standard errors. Built here rather than
+    // in the literal above because it reads the assembled θ vector.
+    fit_result.covariate_relations = crate::api::covariate_relation_estimates(
+        model,
+        &fit_result.theta_names,
+        &fit_result.theta,
+        fit_result.se_theta.as_ref(),
+        &fit_result.theta_fixed,
+    );
 
     Ok(fit_result)
 }

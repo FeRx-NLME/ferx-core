@@ -42,6 +42,17 @@ The built-ins `TIME` and `time` are not covariates and should not be declared
 here; they are always available in `[individual_parameters]` expressions and as
 direct `pk(...=TIME)` / `pk(...=time)` mappings.
 
+## Declaring covariate *effects*
+
+This block declares which columns *are* covariates. To state how one acts on a
+parameter, either write the factor into
+[`[individual_parameters]`](individual-parameters.qmd) yourself, or declare the
+relation in [`[covariate_model]`](covariate-model.qmd) and let ferx build the
+expression — one line per relation, with PsN `scm`-parity forms and defaults.
+A categorical covariate used by a `[covariate_model]` relation must declare its
+levels here (`SEX categorical(levels = [0, 1])`, or `levels = auto` to read them
+off the data).
+
 ## Semantics
 
 - **Optional & backward-compatible.** When the block is absent, behaviour is

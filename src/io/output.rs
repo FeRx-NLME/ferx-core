@@ -2013,6 +2013,49 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     }
 
     let n_eta = result.omega.nrows();
+    // #1111: the `[covariate_model]` relation table — what covariate model ran,
+    // what each symbolic centring statistic resolved to, and each generated θ
+    // with its estimate and SE. Emitted so a covariate search reads the run's
+    // covariate model back from the fit output instead of re-parsing the model
+    // file. Absent for the models that declare no such block.
+    if !result.covariate_relations.is_empty() {
+        writeln!(f, "\ncovariate_model:").map_err(|e| e.to_string())?;
+        for rel in &result.covariate_relations {
+            writeln!(f, "  - parameter: {}", yaml_quote(&rel.parameter))
+                .map_err(|e| e.to_string())?;
+            writeln!(f, "    covariate: {}", yaml_quote(&rel.covariate))
+                .map_err(|e| e.to_string())?;
+            writeln!(f, "    form: {}", yaml_quote(&rel.form)).map_err(|e| e.to_string())?;
+            if let Some(center) = rel.center {
+                // Both forms: the value the expression was built with, and the
+                // statistic it was written as — a run launched symbolically is
+                // reproducible only if the output says which median it landed on.
+                match rel.center_source.as_deref() {
+                    Some(src) if src != format!("{center}") => {
+                        writeln!(f, "    center: {center}  # resolved from {src}")
+                    }
+                    _ => writeln!(f, "    center: {center}"),
+                }
+                .map_err(|e| e.to_string())?;
+            }
+            writeln!(f, "    thetas:").map_err(|e| e.to_string())?;
+            for theta in &rel.thetas {
+                writeln!(f, "      - name: {}", yaml_quote(&theta.name))
+                    .map_err(|e| e.to_string())?;
+                writeln!(f, "        estimate: {:.6}", theta.estimate)
+                    .map_err(|e| e.to_string())?;
+                match theta.se {
+                    Some(se) => writeln!(f, "        se: {se:.6}"),
+                    None => writeln!(f, "        se: null"),
+                }
+                .map_err(|e| e.to_string())?;
+                if theta.fixed {
+                    writeln!(f, "        fixed: true").map_err(|e| e.to_string())?;
+                }
+            }
+        }
+    }
+
     writeln!(f, "\nomega:").map_err(|e| e.to_string())?;
     for i in 0..n_eta {
         let var = result.omega[(i, i)];
@@ -2567,6 +2610,7 @@ mod tests {
         let sigma_types = error_model.sigma_types();
         let n = sigma.len();
         FitResult {
+            covariate_relations: Vec::new(),
             restored_from_checkpoint: false,
             method: EstimationMethod::Foce,
             method_chain: vec![EstimationMethod::Foce],
@@ -3267,6 +3311,7 @@ mod tests {
     fn minimal_sdtab_result(subjects: Vec<SubjectResult>) -> FitResult {
         let sigma_types = ErrorModel::Proportional.sigma_types();
         FitResult {
+            covariate_relations: Vec::new(),
             restored_from_checkpoint: false,
             method: EstimationMethod::Foce,
             method_chain: vec![EstimationMethod::Foce],

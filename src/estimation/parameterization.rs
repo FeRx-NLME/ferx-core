@@ -1260,6 +1260,7 @@ mod tests {
             mixture: None,
         };
         CompiledModel {
+            covariate_model: None,
             name: "test".into(),
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,

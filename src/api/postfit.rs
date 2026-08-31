@@ -1243,6 +1243,56 @@ fn list_warning<H>(
     Some((msg, entry))
 }
 
+/// The `[covariate_model]` relation table echoed on [`FitResult`] (#1111),
+/// with each relation's θ estimate and standard error joined on.
+///
+/// This is what an SCM harness or an agent reads back after a fit: the
+/// covariate model that ran, the constants it resolved to, and the effect
+/// sizes. Without it the caller would have to re-derive which θ belongs to
+/// which relation by parsing θ names — exactly the string surgery this block
+/// exists to remove.
+pub(crate) fn covariate_relation_estimates(
+    model: &crate::types::CompiledModel,
+    theta_names: &[String],
+    theta: &[f64],
+    se_theta: Option<&Vec<f64>>,
+    theta_fixed: &[bool],
+) -> Vec<crate::types::CovariateRelationEstimate> {
+    let Some(spec) = model.covariate_model.as_ref() else {
+        return Vec::new();
+    };
+    spec.relations
+        .iter()
+        .map(|rel| crate::types::CovariateRelationEstimate {
+            parameter: rel.parameter.clone(),
+            covariate: rel.covariate.clone(),
+            form: rel.form.label().to_string(),
+            center_source: rel.center.map(|c| c.label()),
+            center: rel.resolved_center,
+            thetas: rel
+                .thetas
+                .iter()
+                .map(|t| {
+                    let idx = theta_names.iter().position(|n| *n == t.name);
+                    let fixed = idx.is_some_and(|i| theta_fixed.get(i).copied().unwrap_or(false));
+                    crate::types::CovariateThetaEstimate {
+                        name: t.name.clone(),
+                        estimate: idx.and_then(|i| theta.get(i).copied()).unwrap_or(t.init),
+                        // A FIXed θ has no standard error to report, and a fit
+                        // with no covariance step has none for any θ.
+                        se: if fixed {
+                            None
+                        } else {
+                            idx.and_then(|i| se_theta.and_then(|se| se.get(i).copied()))
+                        },
+                        fixed,
+                    }
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 /// Build the human message + native structured entry (with `details`) for
 /// theta estimates pinned to an optimizer bound, or `None` when none are.
 pub(crate) fn boundary_estimate_warning(

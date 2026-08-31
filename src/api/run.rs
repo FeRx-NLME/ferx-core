@@ -211,6 +211,11 @@ pub fn prepare_run_with_inits(
         let model_text = std::fs::read_to_string(model_path)
             .map_err(|e| format!("Failed to re-read model file for level binding: {e}"))?;
         crate::api::bind_theta_levels(&mut parsed, &model_text, &mut population)?;
+        // #1111: and resolve any symbolic `[covariate_model]` statistic
+        // (`center = median`, `ref = mode`, `levels = auto`) against the same
+        // dataset, which likewise re-parses so the desugared expression carries
+        // the resolved constant.
+        crate::api::bind_covariate_stats(&mut parsed, &model_text, &population)?;
     }
 
     let init_params = build_init_params(&parsed);
@@ -615,6 +620,9 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
         let model_text = std::fs::read_to_string(model_path)
             .map_err(|e| format!("Failed to re-read model file for level binding: {e}"))?;
         crate::api::bind_theta_levels(&mut parsed, &model_text, &mut template)?;
+        // #1111: the simulation design is the dataset here, so a symbolic
+        // covariate statistic resolves against the simulated covariates.
+        crate::api::bind_covariate_stats(&mut parsed, &model_text, &template)?;
     }
     let template = template;
 

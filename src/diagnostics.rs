@@ -53,6 +53,8 @@
 //! | `W_OUTPUT_DUPLICATE`      | a name in `[output]` is already in the mandatory sdtab minimum |
 //! | `W_ADDL_MISSING_II`       | ADDL > 0 on a dose row but II is zero or missing; additional doses not expanded |
 //! | `W_MISSING_DV`            | EVID=0 observation row with a missing DV and no MDV=1; skipped rather than scored as DV=0 |
+//! | `E_COVSTAT_UNRESOLVED`    | a `[covariate_model]` relation still needs data-derived statistics (`center = median`, `levels = auto`, or a form whose default bounds come from the data) |
+//! | `W_COVSTAT_UNBOUND`       | the same, reported without a `--data` file — the model is fine, it just cannot be built until a dataset is supplied |
 
 use serde::Serialize;
 
@@ -149,6 +151,16 @@ pub struct CheckReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<String>,
     pub diagnostics: Vec<Diagnostic>,
+    /// The `[individual_parameters]` block as the `[covariate_model]` desugar
+    /// rewrote it (#1111), one line per assignment. Empty for a model that
+    /// declares no such block.
+    ///
+    /// `ferx check` prints this so the expression the block actually built is
+    /// visible — a covariate model stated declaratively is otherwise
+    /// unauditable against NONMEM, since nothing in the file spells out the
+    /// centring constant, the missing-value guard or where the factor landed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub desugared_individual_parameters: Vec<String>,
 }
 
 impl CheckReport {
@@ -165,6 +177,7 @@ impl CheckReport {
             model: model.into(),
             data,
             diagnostics,
+            desugared_individual_parameters: Vec::new(),
         }
     }
 

@@ -320,6 +320,12 @@ For example, in `CL = TVCL * (WT/70)^0.75 * exp(ETA_CL)`:
 - `ETA_CL` matches an omega parameter
 - `WT` matches neither, so it is treated as a covariate column
 
+A covariate factor like the one above can also be declared as data in
+[`[covariate_model]`](covariate-model.qmd) — `CL ~ WT power(center = 70)` —
+which desugars into exactly this expression, with the theta declaration, the
+PsN `scm` default bounds and a missing-value guard filled in. That form is worth
+reaching for when a covariate search or an agent will be rewriting the model.
+
 ### Forgetting an omega declaration
 
 Because unmatched names fall through to covariates, deleting an `omega` line while

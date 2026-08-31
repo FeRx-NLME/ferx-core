@@ -117,6 +117,7 @@ fn declared_covariate_column_missing_is_rejected() {
     // error (a silently-vanished covariate would evaluate to nothing).
     let f = write_csv("ID,TIME,DV,EVID,AMT\n1,0,.,1,100\n1,1,5.0,0,.\n");
     let decls = vec![CovariateDecl {
+        levels: None,
         name: "WT".to_string(),
         kind: CovariateKind::Continuous,
     }];
@@ -131,6 +132,7 @@ fn declared_covariate_non_numeric_value_is_rejected() {
     // error rather than a silent 0.0 that would bias the fit.
     let f = write_csv("ID,TIME,DV,EVID,AMT,WT\n1,0,.,1,100,heavy\n1,1,5.0,0,.,heavy\n");
     let decls = vec![CovariateDecl {
+        levels: None,
         name: "WT".to_string(),
         kind: CovariateKind::Continuous,
     }];
@@ -311,6 +313,7 @@ fn no_evid_inference_mirrored_in_covariate_table() {
                    1,1,5.0,.,0,70\n";
     let f = write_csv(csv);
     let decls = vec![CovariateDecl {
+        levels: None,
         name: "WT".to_string(),
         kind: CovariateKind::Continuous,
     }];
@@ -708,6 +711,7 @@ fn test_filter_on_undeclared_covariate_via_declared_path() {
                    4,1,3.5,0,.,1,85,2\n";
     let f = write_csv(csv);
     let decls = vec![CovariateDecl {
+        levels: None,
         name: "WT".to_string(),
         kind: CovariateKind::Continuous,
     }];
@@ -1804,6 +1808,7 @@ fn test_missing_dv_and_amt_not_dosed_warnings_coexist() {
 
 fn decl(name: &str, kind: CovariateKind) -> CovariateDecl {
     CovariateDecl {
+        levels: None,
         name: name.to_string(),
         kind,
     }
@@ -2181,6 +2186,7 @@ fn tte_aware_readers_route_through_gaussian_path_with_empty_tte_cmts() {
     // actually pulled into the read union, so the assertion fails if the
     // merge regresses.
     let decls = vec![CovariateDecl {
+        levels: None,
         name: "WT".to_string(),
         kind: CovariateKind::Continuous,
     }];

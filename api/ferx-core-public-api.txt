@@ -57,6 +57,8 @@ pub ferx_core::api::SurvivalPredictionResult::median_survival: f64
 pub ferx_core::api::SurvivalPredictionResult::survival: f64
 pub ferx_core::api::SurvivalPredictionResult::survival_all: f64
 pub ferx_core::api::SurvivalPredictionResult::time: f64
+pub fn ferx_core::api::assert_covariate_model_bound(model: &ferx_core::CompiledModel) -> core::result::Result<(), alloc::string::String>
+pub fn ferx_core::api::bind_covariate_stats(parsed: &mut ferx_core::ParsedModel, model_text: &str, population: &ferx_core::Population) -> core::result::Result<(), alloc::string::String>
 pub fn ferx_core::api::bind_theta_levels(parsed: &mut ferx_core::ParsedModel, model_text: &str, population: &mut ferx_core::Population) -> core::result::Result<(), alloc::string::String>
 pub fn ferx_core::api::check_experimental_features(model: &ferx_core::CompiledModel) -> alloc::vec::Vec<ferx_core::diagnostics::Diagnostic>
 pub fn ferx_core::api::check_model_data(model: &ferx_core::CompiledModel, population: &ferx_core::Population) -> alloc::vec::Vec<ferx_core::diagnostics::Diagnostic>
@@ -123,6 +125,7 @@ pub ferx_core::diagnostics::Severity::Error
 pub ferx_core::diagnostics::Severity::Warning
 pub struct ferx_core::diagnostics::CheckReport
 pub ferx_core::diagnostics::CheckReport::data: core::option::Option<alloc::string::String>
+pub ferx_core::diagnostics::CheckReport::desugared_individual_parameters: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::diagnostics::CheckReport::diagnostics: alloc::vec::Vec<ferx_core::diagnostics::Diagnostic>
 pub ferx_core::diagnostics::CheckReport::model: alloc::string::String
 pub ferx_core::diagnostics::CheckReport::valid: bool
@@ -1028,6 +1031,8 @@ pub fn ferx_core::ode::solve_ode_with_stats(rhs: &dyn core::ops::function::Fn(&[
 pub type ferx_core::ode::OdeOutputFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &[f64], &[f64], &[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>) -> f64 + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::ode::OdeRhsFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &[f64], f64, &mut [f64]) + core::marker::Send + core::marker::Sync)>
 pub mod ferx_core::parser
+pub mod ferx_core::parser::covariate_model
+pub type ferx_core::parser::covariate_model::CovariateStatBindings = std::collections::hash::map::HashMap<alloc::string::String, ferx_core::CovariateSummary>
 pub mod ferx_core::parser::model_parser
 pub enum ferx_core::parser::model_parser::LevelContrast
 pub ferx_core::parser::model_parser::LevelContrast::Auto
@@ -1054,6 +1059,9 @@ pub fn ferx_core::parser::model_parser::LevelBlockDecl::name(&self) -> &str
 pub fn ferx_core::parser::model_parser::LevelBlockDecl::shares_scale_with_eta(&self) -> bool
 pub struct ferx_core::parser::model_parser::OdeOutputProgram
 pub struct ferx_core::parser::model_parser::OdeRhsProgram
+pub struct ferx_core::parser::model_parser::ParseBindings
+pub ferx_core::parser::model_parser::ParseBindings::covariate_stats: ferx_core::parser::covariate_model::CovariateStatBindings
+pub ferx_core::parser::model_parser::ParseBindings::levels: ferx_core::parser::model_parser::LevelBindings
 pub struct ferx_core::parser::model_parser::RuvMagDerivProgram
 pub struct ferx_core::parser::model_parser::ScaleDerivProgram
 pub struct ferx_core::parser::model_parser::ThetaBlocks
@@ -1072,6 +1080,7 @@ pub fn ferx_core::parser::model_parser::known_block_names() -> alloc::vec::Vec<&
 pub fn ferx_core::parser::model_parser::parse_full_model(content: &str) -> core::result::Result<ferx_core::ParsedModel, alloc::string::String>
 pub fn ferx_core::parser::model_parser::parse_full_model_bound(content: &str, level_bindings: &ferx_core::parser::model_parser::LevelBindings) -> core::result::Result<ferx_core::ParsedModel, alloc::string::String>
 pub fn ferx_core::parser::model_parser::parse_full_model_file(path: &std::path::Path) -> core::result::Result<ferx_core::ParsedModel, alloc::string::String>
+pub fn ferx_core::parser::model_parser::parse_full_model_with(content: &str, bindings: &ferx_core::parser::model_parser::ParseBindings) -> core::result::Result<ferx_core::ParsedModel, alloc::string::String>
 pub fn ferx_core::parser::model_parser::parse_model_file(path: &std::path::Path) -> core::result::Result<ferx_core::CompiledModel, alloc::string::String>
 pub fn ferx_core::parser::model_parser::parse_model_string(content: &str) -> core::result::Result<ferx_core::CompiledModel, alloc::string::String>
 pub type ferx_core::parser::model_parser::LevelBindings = std::collections::hash::map::HashMap<alloc::string::String, ferx_core::parser::model_parser::LevelBinding>
@@ -1876,11 +1885,38 @@ pub ferx_core::types::CovarianceStatus::Computed
 pub ferx_core::types::CovarianceStatus::Failed
 pub ferx_core::types::CovarianceStatus::NotRequested
 pub ferx_core::types::CovarianceStatus::SirFallback
+pub enum ferx_core::types::CovariateForm
+pub ferx_core::types::CovariateForm::Categorical
+pub ferx_core::types::CovariateForm::Exponential
+pub ferx_core::types::CovariateForm::Expr(alloc::string::String)
+pub ferx_core::types::CovariateForm::Hockey
+pub ferx_core::types::CovariateForm::Linear
+pub ferx_core::types::CovariateForm::LinearRelative
+pub ferx_core::types::CovariateForm::None
+pub ferx_core::types::CovariateForm::Power
+impl ferx_core::CovariateForm
+pub fn ferx_core::CovariateForm::is_categorical(&self) -> bool
+pub fn ferx_core::CovariateForm::label(&self) -> &'static str
 pub enum ferx_core::types::CovariateKind
 pub ferx_core::types::CovariateKind::Categorical
 pub ferx_core::types::CovariateKind::Continuous
 impl ferx_core::CovariateKind
 pub fn ferx_core::CovariateKind::label(&self) -> &'static str
+pub enum ferx_core::types::CovariateLevels
+pub ferx_core::types::CovariateLevels::Auto
+pub ferx_core::types::CovariateLevels::Declared(alloc::vec::Vec<f64>)
+impl ferx_core::CovariateLevels
+pub fn ferx_core::CovariateLevels::declared(&self) -> core::option::Option<&[f64]>
+pub enum ferx_core::types::CovariateStat
+pub ferx_core::types::CovariateStat::Literal(f64)
+pub ferx_core::types::CovariateStat::Max
+pub ferx_core::types::CovariateStat::Mean
+pub ferx_core::types::CovariateStat::Median
+pub ferx_core::types::CovariateStat::Min
+pub ferx_core::types::CovariateStat::Mode
+impl ferx_core::CovariateStat
+pub fn ferx_core::CovariateStat::label(&self) -> alloc::string::String
+pub fn ferx_core::CovariateStat::literal(&self) -> core::option::Option<f64>
 pub enum ferx_core::types::DerivedKind
 pub ferx_core::types::DerivedKind::Aggregate
 pub ferx_core::types::DerivedKind::Aggregate::filter: core::option::Option<ferx_core::DerivedFilterFn>
@@ -2215,6 +2251,7 @@ pub ferx_core::types::CompiledModel::absorption_ode_equivalent: core::option::Op
 pub ferx_core::types::CompiledModel::analytic_readout: core::option::Option<ferx_core::AnalyticReadout>
 pub ferx_core::types::CompiledModel::analytical_init: alloc::vec::Vec<ferx_core::AnalyticalInit>
 pub ferx_core::types::CompiledModel::bloq_method: ferx_core::BloqMethod
+pub ferx_core::types::CompiledModel::covariate_model: core::option::Option<ferx_core::CovariateModelSpec>
 pub ferx_core::types::CompiledModel::covariate_nns: alloc::vec::Vec<ferx_core::nn::CovariateNn>
 pub ferx_core::types::CompiledModel::default_params: ferx_core::ModelParameters
 pub ferx_core::types::CompiledModel::derived_exprs: alloc::vec::Vec<ferx_core::DerivedExprSpec>
@@ -2307,16 +2344,64 @@ pub ferx_core::types::CondDist::samples: alloc::vec::Vec<alloc::vec::Vec<alloc::
 pub ferx_core::types::CondDist::shrinkage: alloc::vec::Vec<f64>
 pub struct ferx_core::types::CovariateDecl
 pub ferx_core::types::CovariateDecl::kind: ferx_core::CovariateKind
+pub ferx_core::types::CovariateDecl::levels: core::option::Option<ferx_core::CovariateLevels>
 pub ferx_core::types::CovariateDecl::name: alloc::string::String
+impl ferx_core::CovariateDecl
+pub fn ferx_core::CovariateDecl::new(name: impl core::convert::Into<alloc::string::String>, kind: ferx_core::CovariateKind) -> Self
+pub struct ferx_core::types::CovariateModelSpec
+pub ferx_core::types::CovariateModelSpec::desugared_individual_parameters: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::types::CovariateModelSpec::generated_thetas: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::types::CovariateModelSpec::relations: alloc::vec::Vec<ferx_core::CovariateRelation>
+impl ferx_core::CovariateModelSpec
+pub fn ferx_core::CovariateModelSpec::unresolved(&self) -> alloc::vec::Vec<&ferx_core::CovariateRelation>
+pub struct ferx_core::types::CovariateRelation
+pub ferx_core::types::CovariateRelation::center: core::option::Option<ferx_core::CovariateStat>
+pub ferx_core::types::CovariateRelation::covariate: alloc::string::String
+pub ferx_core::types::CovariateRelation::fix: core::option::Option<f64>
+pub ferx_core::types::CovariateRelation::form: ferx_core::CovariateForm
+pub ferx_core::types::CovariateRelation::parameter: alloc::string::String
+pub ferx_core::types::CovariateRelation::resolved_center: core::option::Option<f64>
+pub ferx_core::types::CovariateRelation::source_line: alloc::string::String
+pub ferx_core::types::CovariateRelation::thetas: alloc::vec::Vec<ferx_core::CovariateTheta>
+impl ferx_core::CovariateRelation
+pub fn ferx_core::CovariateRelation::needs_data(&self) -> bool
+pub struct ferx_core::types::CovariateRelationEstimate
+pub ferx_core::types::CovariateRelationEstimate::center: core::option::Option<f64>
+pub ferx_core::types::CovariateRelationEstimate::center_source: core::option::Option<alloc::string::String>
+pub ferx_core::types::CovariateRelationEstimate::covariate: alloc::string::String
+pub ferx_core::types::CovariateRelationEstimate::form: alloc::string::String
+pub ferx_core::types::CovariateRelationEstimate::parameter: alloc::string::String
+pub ferx_core::types::CovariateRelationEstimate::thetas: alloc::vec::Vec<ferx_core::CovariateThetaEstimate>
 pub struct ferx_core::types::CovariateRow
 pub ferx_core::types::CovariateRow::evid: u32
 pub ferx_core::types::CovariateRow::id: alloc::string::String
 pub ferx_core::types::CovariateRow::time: f64
 pub ferx_core::types::CovariateRow::values: alloc::vec::Vec<f64>
+pub struct ferx_core::types::CovariateSummary
+pub ferx_core::types::CovariateSummary::levels: alloc::vec::Vec<f64>
+pub ferx_core::types::CovariateSummary::max: f64
+pub ferx_core::types::CovariateSummary::mean: f64
+pub ferx_core::types::CovariateSummary::median: f64
+pub ferx_core::types::CovariateSummary::min: f64
+pub ferx_core::types::CovariateSummary::mode: f64
+impl ferx_core::CovariateSummary
+pub fn ferx_core::CovariateSummary::value_of(&self, stat: ferx_core::CovariateStat) -> f64
 pub struct ferx_core::types::CovariateTable
 pub ferx_core::types::CovariateTable::kinds: alloc::vec::Vec<ferx_core::CovariateKind>
 pub ferx_core::types::CovariateTable::names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::CovariateTable::rows: alloc::vec::Vec<ferx_core::CovariateRow>
+pub struct ferx_core::types::CovariateTheta
+pub ferx_core::types::CovariateTheta::fixed: bool
+pub ferx_core::types::CovariateTheta::init: f64
+pub ferx_core::types::CovariateTheta::level: core::option::Option<f64>
+pub ferx_core::types::CovariateTheta::lower: f64
+pub ferx_core::types::CovariateTheta::name: alloc::string::String
+pub ferx_core::types::CovariateTheta::upper: f64
+pub struct ferx_core::types::CovariateThetaEstimate
+pub ferx_core::types::CovariateThetaEstimate::estimate: f64
+pub ferx_core::types::CovariateThetaEstimate::fixed: bool
+pub ferx_core::types::CovariateThetaEstimate::name: alloc::string::String
+pub ferx_core::types::CovariateThetaEstimate::se: core::option::Option<f64>
 pub struct ferx_core::types::DerivedContext<'a>
 pub ferx_core::types::DerivedContext::compartment_names: &'a [alloc::string::String]
 pub ferx_core::types::DerivedContext::compartments: &'a [f64]
@@ -2545,6 +2630,7 @@ pub ferx_core::types::FitResult::covariance_n_evals_estimated: core::option::Opt
 pub ferx_core::types::FitResult::covariance_status: ferx_core::CovarianceStatus
 pub ferx_core::types::FitResult::covariance_wall_time_secs: f64
 pub ferx_core::types::FitResult::covariate_names: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::types::FitResult::covariate_relations: alloc::vec::Vec<ferx_core::CovariateRelationEstimate>
 pub ferx_core::types::FitResult::covariate_table: core::option::Option<ferx_core::CovariateTable>
 pub ferx_core::types::FitResult::data_hash: core::option::Option<alloc::string::String>
 pub ferx_core::types::FitResult::data_path: core::option::Option<alloc::string::String>
@@ -2749,6 +2835,7 @@ pub fn ferx_core::OmegaMatrix::from_matrix(m: nalgebra::base::alias::DMatrix<f64
 pub fn ferx_core::OmegaMatrix::from_matrix_with_mask(m: nalgebra::base::alias::DMatrix<f64>, names: alloc::vec::Vec<alloc::string::String>, diagonal: bool, free_mask: nalgebra::base::alias::DMatrix<bool>) -> Self
 pub struct ferx_core::types::ParsedModel
 pub ferx_core::types::ParsedModel::adaptive_dosing: core::option::Option<ferx_core::sim::adaptive::AdaptiveDosingSpec>
+pub ferx_core::types::ParsedModel::bindings: ferx_core::parser::model_parser::ParseBindings
 pub ferx_core::types::ParsedModel::block_lines: std::collections::hash::map::HashMap<alloc::string::String, usize>
 pub ferx_core::types::ParsedModel::column_map: alloc::vec::Vec<(alloc::string::String, alloc::string::String)>
 pub ferx_core::types::ParsedModel::covariate_decls: core::option::Option<alloc::vec::Vec<ferx_core::CovariateDecl>>
@@ -2976,11 +3063,38 @@ pub ferx_core::CovarianceStatus::Computed
 pub ferx_core::CovarianceStatus::Failed
 pub ferx_core::CovarianceStatus::NotRequested
 pub ferx_core::CovarianceStatus::SirFallback
+pub enum ferx_core::CovariateForm
+pub ferx_core::CovariateForm::Categorical
+pub ferx_core::CovariateForm::Exponential
+pub ferx_core::CovariateForm::Expr(alloc::string::String)
+pub ferx_core::CovariateForm::Hockey
+pub ferx_core::CovariateForm::Linear
+pub ferx_core::CovariateForm::LinearRelative
+pub ferx_core::CovariateForm::None
+pub ferx_core::CovariateForm::Power
+impl ferx_core::CovariateForm
+pub fn ferx_core::CovariateForm::is_categorical(&self) -> bool
+pub fn ferx_core::CovariateForm::label(&self) -> &'static str
 pub enum ferx_core::CovariateKind
 pub ferx_core::CovariateKind::Categorical
 pub ferx_core::CovariateKind::Continuous
 impl ferx_core::CovariateKind
 pub fn ferx_core::CovariateKind::label(&self) -> &'static str
+pub enum ferx_core::CovariateLevels
+pub ferx_core::CovariateLevels::Auto
+pub ferx_core::CovariateLevels::Declared(alloc::vec::Vec<f64>)
+impl ferx_core::CovariateLevels
+pub fn ferx_core::CovariateLevels::declared(&self) -> core::option::Option<&[f64]>
+pub enum ferx_core::CovariateStat
+pub ferx_core::CovariateStat::Literal(f64)
+pub ferx_core::CovariateStat::Max
+pub ferx_core::CovariateStat::Mean
+pub ferx_core::CovariateStat::Median
+pub ferx_core::CovariateStat::Min
+pub ferx_core::CovariateStat::Mode
+impl ferx_core::CovariateStat
+pub fn ferx_core::CovariateStat::label(&self) -> alloc::string::String
+pub fn ferx_core::CovariateStat::literal(&self) -> core::option::Option<f64>
 pub enum ferx_core::DecisionOutcome
 pub ferx_core::DecisionOutcome::Dosed
 pub ferx_core::DecisionOutcome::Dosed::n: usize
@@ -3406,6 +3520,7 @@ pub fn ferx_core::cancel::CancelFlag::is_cancelled(&self) -> bool
 pub fn ferx_core::cancel::CancelFlag::new() -> Self
 pub struct ferx_core::CheckReport
 pub ferx_core::CheckReport::data: core::option::Option<alloc::string::String>
+pub ferx_core::CheckReport::desugared_individual_parameters: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::CheckReport::diagnostics: alloc::vec::Vec<ferx_core::diagnostics::Diagnostic>
 pub ferx_core::CheckReport::model: alloc::string::String
 pub ferx_core::CheckReport::valid: bool
@@ -3418,6 +3533,7 @@ pub ferx_core::CompiledModel::absorption_ode_equivalent: core::option::Option<fe
 pub ferx_core::CompiledModel::analytic_readout: core::option::Option<ferx_core::AnalyticReadout>
 pub ferx_core::CompiledModel::analytical_init: alloc::vec::Vec<ferx_core::AnalyticalInit>
 pub ferx_core::CompiledModel::bloq_method: ferx_core::BloqMethod
+pub ferx_core::CompiledModel::covariate_model: core::option::Option<ferx_core::CovariateModelSpec>
 pub ferx_core::CompiledModel::covariate_nns: alloc::vec::Vec<ferx_core::nn::CovariateNn>
 pub ferx_core::CompiledModel::default_params: ferx_core::ModelParameters
 pub ferx_core::CompiledModel::derived_exprs: alloc::vec::Vec<ferx_core::DerivedExprSpec>
@@ -3519,16 +3635,64 @@ impl ferx_core::sim::adaptive::ControllerCtx<'_>
 pub fn ferx_core::sim::adaptive::ControllerCtx<'_>::signal(&self, name: &str) -> core::option::Option<f64>
 pub struct ferx_core::CovariateDecl
 pub ferx_core::CovariateDecl::kind: ferx_core::CovariateKind
+pub ferx_core::CovariateDecl::levels: core::option::Option<ferx_core::CovariateLevels>
 pub ferx_core::CovariateDecl::name: alloc::string::String
+impl ferx_core::CovariateDecl
+pub fn ferx_core::CovariateDecl::new(name: impl core::convert::Into<alloc::string::String>, kind: ferx_core::CovariateKind) -> Self
+pub struct ferx_core::CovariateModelSpec
+pub ferx_core::CovariateModelSpec::desugared_individual_parameters: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::CovariateModelSpec::generated_thetas: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::CovariateModelSpec::relations: alloc::vec::Vec<ferx_core::CovariateRelation>
+impl ferx_core::CovariateModelSpec
+pub fn ferx_core::CovariateModelSpec::unresolved(&self) -> alloc::vec::Vec<&ferx_core::CovariateRelation>
+pub struct ferx_core::CovariateRelation
+pub ferx_core::CovariateRelation::center: core::option::Option<ferx_core::CovariateStat>
+pub ferx_core::CovariateRelation::covariate: alloc::string::String
+pub ferx_core::CovariateRelation::fix: core::option::Option<f64>
+pub ferx_core::CovariateRelation::form: ferx_core::CovariateForm
+pub ferx_core::CovariateRelation::parameter: alloc::string::String
+pub ferx_core::CovariateRelation::resolved_center: core::option::Option<f64>
+pub ferx_core::CovariateRelation::source_line: alloc::string::String
+pub ferx_core::CovariateRelation::thetas: alloc::vec::Vec<ferx_core::CovariateTheta>
+impl ferx_core::CovariateRelation
+pub fn ferx_core::CovariateRelation::needs_data(&self) -> bool
+pub struct ferx_core::CovariateRelationEstimate
+pub ferx_core::CovariateRelationEstimate::center: core::option::Option<f64>
+pub ferx_core::CovariateRelationEstimate::center_source: core::option::Option<alloc::string::String>
+pub ferx_core::CovariateRelationEstimate::covariate: alloc::string::String
+pub ferx_core::CovariateRelationEstimate::form: alloc::string::String
+pub ferx_core::CovariateRelationEstimate::parameter: alloc::string::String
+pub ferx_core::CovariateRelationEstimate::thetas: alloc::vec::Vec<ferx_core::CovariateThetaEstimate>
 pub struct ferx_core::CovariateRow
 pub ferx_core::CovariateRow::evid: u32
 pub ferx_core::CovariateRow::id: alloc::string::String
 pub ferx_core::CovariateRow::time: f64
 pub ferx_core::CovariateRow::values: alloc::vec::Vec<f64>
+pub struct ferx_core::CovariateSummary
+pub ferx_core::CovariateSummary::levels: alloc::vec::Vec<f64>
+pub ferx_core::CovariateSummary::max: f64
+pub ferx_core::CovariateSummary::mean: f64
+pub ferx_core::CovariateSummary::median: f64
+pub ferx_core::CovariateSummary::min: f64
+pub ferx_core::CovariateSummary::mode: f64
+impl ferx_core::CovariateSummary
+pub fn ferx_core::CovariateSummary::value_of(&self, stat: ferx_core::CovariateStat) -> f64
 pub struct ferx_core::CovariateTable
 pub ferx_core::CovariateTable::kinds: alloc::vec::Vec<ferx_core::CovariateKind>
 pub ferx_core::CovariateTable::names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::CovariateTable::rows: alloc::vec::Vec<ferx_core::CovariateRow>
+pub struct ferx_core::CovariateTheta
+pub ferx_core::CovariateTheta::fixed: bool
+pub ferx_core::CovariateTheta::init: f64
+pub ferx_core::CovariateTheta::level: core::option::Option<f64>
+pub ferx_core::CovariateTheta::lower: f64
+pub ferx_core::CovariateTheta::name: alloc::string::String
+pub ferx_core::CovariateTheta::upper: f64
+pub struct ferx_core::CovariateThetaEstimate
+pub ferx_core::CovariateThetaEstimate::estimate: f64
+pub ferx_core::CovariateThetaEstimate::fixed: bool
+pub ferx_core::CovariateThetaEstimate::name: alloc::string::String
+pub ferx_core::CovariateThetaEstimate::se: core::option::Option<f64>
 pub struct ferx_core::DecisionLogEntry
 pub ferx_core::DecisionLogEntry::decision_idx: usize
 pub ferx_core::DecisionLogEntry::draw: usize
@@ -3801,6 +3965,7 @@ pub ferx_core::FitResult::covariance_n_evals_estimated: core::option::Option<usi
 pub ferx_core::FitResult::covariance_status: ferx_core::CovarianceStatus
 pub ferx_core::FitResult::covariance_wall_time_secs: f64
 pub ferx_core::FitResult::covariate_names: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::FitResult::covariate_relations: alloc::vec::Vec<ferx_core::CovariateRelationEstimate>
 pub ferx_core::FitResult::covariate_table: core::option::Option<ferx_core::CovariateTable>
 pub ferx_core::FitResult::data_hash: core::option::Option<alloc::string::String>
 pub ferx_core::FitResult::data_path: core::option::Option<alloc::string::String>
@@ -4033,6 +4198,7 @@ pub fn ferx_core::OmegaMatrix::from_matrix(m: nalgebra::base::alias::DMatrix<f64
 pub fn ferx_core::OmegaMatrix::from_matrix_with_mask(m: nalgebra::base::alias::DMatrix<f64>, names: alloc::vec::Vec<alloc::string::String>, diagonal: bool, free_mask: nalgebra::base::alias::DMatrix<bool>) -> Self
 pub struct ferx_core::ParsedModel
 pub ferx_core::ParsedModel::adaptive_dosing: core::option::Option<ferx_core::sim::adaptive::AdaptiveDosingSpec>
+pub ferx_core::ParsedModel::bindings: ferx_core::parser::model_parser::ParseBindings
 pub ferx_core::ParsedModel::block_lines: std::collections::hash::map::HashMap<alloc::string::String, usize>
 pub ferx_core::ParsedModel::column_map: alloc::vec::Vec<(alloc::string::String, alloc::string::String)>
 pub ferx_core::ParsedModel::covariate_decls: core::option::Option<alloc::vec::Vec<ferx_core::CovariateDecl>>

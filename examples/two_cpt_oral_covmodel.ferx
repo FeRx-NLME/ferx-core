@@ -1,0 +1,68 @@
+# Two-compartment oral PK model, covariate effects stated declaratively.
+#
+# The same model as `two_cpt_oral_cov.ferx`, whose [individual_parameters]
+# block writes each covariate factor out by hand. Here the relations are
+# declared as data in [covariate_model] and desugared into exactly that
+# expression before anything else reads the model — same OFV, same estimates.
+#
+# Why state them this way: a covariate search (PsN scm, ferx_cov_screen(), an
+# agent) rewrites this one block and nothing else. The lines are independent,
+# so adding or dropping a relation is a line insert/delete rather than a regex
+# over an arbitrary expression — and the relations come back on the fit result
+# as a table, so the search never parses this file to learn what was run.
+#
+# `ferx check examples/two_cpt_oral_covmodel.ferx` prints the desugared
+# [individual_parameters] block, which is what to compare against NONMEM.
+
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV1(40.0, 1.0, 500.0)
+  theta TVQ(8.0, 0.1, 100.0)
+  theta TVV2(80.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+
+  omega ETA_CL ~ 0.15
+  omega ETA_V1 ~ 0.15
+  omega ETA_Q  ~ 0.08
+  omega ETA_V2 ~ 0.08
+  omega ETA_KA ~ 0.20
+
+  sigma PROP_ERR ~ 0.04 (sd)
+
+# No covariate factors here — they are multiplied in by the desugar, into the
+# non-eta half of each product.
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ  * exp(ETA_Q)
+  V2 = TVV2 * exp(ETA_V2)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+
+[covariates]
+  WT   continuous
+  CRCL continuous
+
+# One relation per line. `center` may be a literal (as here — reproducible from
+# this file alone, which is what a final model wants) or a data-derived
+# statistic (`median`, `mean`, `min`, `max`; `mode` for a reference level),
+# which is what an automated search wants. A symbolic centre is resolved
+# against the dataset and written back into the fit YAML.
+#
+# Each relation declares its own theta. Left implicit, the name is
+# THETA_<PARAM>_<COV> and the init/bounds are PsN's scm defaults for the form;
+# `=> NAME(init, lower, upper)` states them instead.
+[covariate_model]
+  CL ~ WT   power(center = 70)  => THETA_CL_WT(0.6, 0.01, 5.0)
+  CL ~ CRCL power(center = 100) => THETA_CL_CRCL(0.3, 0.01, 5.0)
+  V1 ~ WT   power(center = 70)  => THETA_V1_WT(0.6, 0.01, 5.0)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 500
+  covariance = true

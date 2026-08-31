@@ -1,3 +1,4 @@
+use crate::parser::covariate_model::CovariateStatBindings;
 use crate::sim::adaptive::{
     validate_increasing_finite, AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute, AdaptiveRule,
     Comparison, DoseStep,
@@ -1302,7 +1303,7 @@ fn register_referenced_covariates(
 
 /// Parse a full model string including all optional blocks.
 pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
-    parse_full_model_bound(content, &LevelBindings::new())
+    parse_full_model_with(content, &ParseBindings::default())
 }
 
 /// [`parse_full_model`] with the observed levels of every `theta NAME ~
@@ -1317,6 +1318,35 @@ pub fn parse_full_model_bound(
     content: &str,
     level_bindings: &LevelBindings,
 ) -> Result<ParsedModel, String> {
+    parse_full_model_with(
+        content,
+        &ParseBindings {
+            levels: level_bindings.clone(),
+            covariate_stats: CovariateStatBindings::new(),
+        },
+    )
+}
+
+/// Everything a re-parse must be told that only the *data* knows.
+///
+/// Two independent things are bound this way — level-block level counts (#1064)
+/// and `[covariate_model]` statistics (#1111) — and a model may declare both,
+/// so they travel together: binding one must not drop the other's bindings on
+/// the floor when it re-parses.
+#[derive(Debug, Clone, Default)]
+pub struct ParseBindings {
+    /// Observed levels of each `theta NAME[COL, ...]` block.
+    pub levels: LevelBindings,
+    /// Covariate summary statistics, for symbolic `center = median` and friends.
+    pub covariate_stats: CovariateStatBindings,
+}
+
+/// [`parse_full_model`] with every data-derived binding supplied.
+pub fn parse_full_model_with(
+    content: &str,
+    bindings: &ParseBindings,
+) -> Result<ParsedModel, String> {
+    let level_bindings = &bindings.levels;
     let mut extracted = extract_blocks(content)?;
     // `ode_template NAME(...)` desugaring (#322 Phase 0b): if [structural_model]
     // uses `ode_template`, rewrite it (and the [odes]/[scaling] blocks) into the
@@ -1342,6 +1372,12 @@ pub fn parse_full_model_bound(
     // to this fallback. Non-absorption / out-of-scope forms yield `None`. (The equivalent is
     // a normal ODE model with no `pk one_cpt_transit`/`pk one_cpt_ig`/…, so compiling it does
     // not re-enter this branch.)
+    // `[covariate_model]` desugaring (#1111): rewrite the declared relations into
+    // ordinary `[individual_parameters]` expressions and `theta` declarations, so
+    // everything below — including the absorption twin reconstructed on the next
+    // line, which re-emits these very blocks — sees a plain classical model. A
+    // twin built from un-desugared text would silently carry no covariate effect.
+    let covariate_model = apply_covariate_model_block(&mut extracted, bindings)?;
     let absorption_ode_equivalent_src: Option<String> =
         absorption_ode_equivalent_source(&extracted);
     // Keep the historical `blocks` binding for unnamed blocks so the rest of
@@ -2723,6 +2759,7 @@ pub fn parse_full_model_bound(
 
     let model = CompiledModel {
         name,
+        covariate_model,
         pk_model,
         error_model,
         error_spec,
@@ -4041,6 +4078,7 @@ pub fn parse_full_model_bound(
         column_map: data_column_map,
         covariate_decls,
         block_lines: extracted.block_lines.clone(),
+        bindings: bindings.clone(),
     })
 }
 
@@ -4740,11 +4778,91 @@ fn parse_covariate_kind(token: &str) -> Option<CovariateKind> {
     }
 }
 
+/// A `[covariates]` type token, with the optional `(levels = ...)` suffix a
+/// categorical covariate may carry (#1111).
+///
+/// `Ok(None)` means the token names no known type — the callers already have a
+/// form-specific "unknown covariate type" message and keep raising it. `Err` is
+/// a *recognised* type whose `levels` clause is malformed, which must not be
+/// reported as an unknown type.
+fn parse_covariate_type_token(
+    token: &str,
+) -> Result<Option<(CovariateKind, Option<CovariateLevels>)>, String> {
+    let token = token.trim();
+    let Some(open) = token.find('(') else {
+        return Ok(parse_covariate_kind(token).map(|k| (k, None)));
+    };
+    let (head, rest) = token.split_at(open);
+    let Some(kind) = parse_covariate_kind(head) else {
+        return Ok(None);
+    };
+    let body = rest
+        .strip_prefix('(')
+        .and_then(|r| r.strip_suffix(')'))
+        .ok_or_else(|| format!("[covariates]: unbalanced parentheses in '{token}'"))?;
+    let levels = parse_covariate_levels_clause(body, head.trim())?;
+    if kind == CovariateKind::Continuous {
+        return Err(format!(
+            "[covariates]: `levels` is only meaningful for a categorical covariate, \
+             but '{}' is declared continuous",
+            head.trim()
+        ));
+    }
+    Ok(Some((kind, Some(levels))))
+}
+
+/// The inside of `categorical(...)`: `levels = [0, 1]` or `levels = auto`.
+fn parse_covariate_levels_clause(body: &str, type_token: &str) -> Result<CovariateLevels, String> {
+    let body = body.trim();
+    let value = body
+        .strip_prefix("levels")
+        .map(str::trim_start)
+        .and_then(|r| r.strip_prefix('='))
+        .ok_or_else(|| {
+            format!(
+                "[covariates]: `{type_token}(...)` takes only `levels = [..]` or \
+                 `levels = auto`, got `{body}`"
+            )
+        })?
+        .trim();
+    if value.eq_ignore_ascii_case("auto") {
+        return Ok(CovariateLevels::Auto);
+    }
+    let inner = value
+        .strip_prefix('[')
+        .and_then(|r| r.strip_suffix(']'))
+        .ok_or_else(|| {
+            format!("[covariates]: expected `levels = [0, 1]` or `levels = auto`, got `{value}`")
+        })?;
+    let mut levels = Vec::new();
+    for tok in inner.split(',') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        let v: f64 = tok.parse().map_err(|_| {
+            format!(
+                "[covariates]: level '{tok}' is not a number (levels must be \
+                 numerically coded, as covariate values are)"
+            )
+        })?;
+        if levels.contains(&v) {
+            return Err(format!("[covariates]: level {v} is listed more than once"));
+        }
+        levels.push(v);
+    }
+    if levels.is_empty() {
+        return Err("[covariates]: `levels = []` declares no levels".to_string());
+    }
+    Ok(CovariateLevels::Declared(levels))
+}
+
 fn push_covariate_decl(
     decls: &mut Vec<CovariateDecl>,
     seen: &mut std::collections::HashSet<String>,
     name: &str,
     kind: CovariateKind,
+    levels: Option<CovariateLevels>,
 ) -> Result<(), String> {
     let name = name.trim();
     if name.is_empty() {
@@ -4760,8 +4878,78 @@ fn push_covariate_decl(
     decls.push(CovariateDecl {
         name: name.to_string(),
         kind,
+        levels,
     });
     Ok(())
+}
+
+/// Desugar the optional `[covariate_model]` block (#1111), rewriting
+/// `[parameters]` and `[individual_parameters]` in place.
+///
+/// Returns `None` when the block is absent — the overwhelming majority of
+/// models, which pay nothing for the feature.
+///
+/// `[parameters]` is parsed **twice** when the block is present: once here, to
+/// learn the η/κ names the insertion-point partition needs and the θ names an
+/// auto-generated name may defer to, and once for real below, after this
+/// rewrite has appended the generated `theta` lines. Parsing is pure and costs
+/// microseconds; the alternative — re-deriving η/κ names by scanning the block
+/// text — would duplicate knowledge that already has exactly one owner.
+fn apply_covariate_model_block(
+    extracted: &mut ExtractedBlocks,
+    bindings: &ParseBindings,
+) -> Result<Option<crate::types::CovariateModelSpec>, String> {
+    let Some(block_lines) = extracted.unnamed.get("covariate_model").cloned() else {
+        return Ok(None);
+    };
+    let param_lines = extracted
+        .unnamed
+        .get("parameters")
+        .ok_or("Missing [parameters] block")?
+        .clone();
+    let (thetas, _, _, _, _, eta_names, kappa_info, _, _, _) =
+        parse_parameters(&param_lines, &bindings.levels)?;
+    let mut eta_kappa_names: std::collections::HashSet<String> = eta_names.into_iter().collect();
+    eta_kappa_names.extend(kappa_info.names_ordered.iter().cloned());
+    let declared_thetas: std::collections::HashSet<String> =
+        thetas.into_iter().map(|t| t.name).collect();
+
+    let decls = match extracted.unnamed.get("covariates") {
+        Some(lines) => parse_covariates_block(lines)?,
+        None => Vec::new(),
+    };
+
+    // Both blocks are rewritten, so take ownership of each and put it back —
+    // the alternative is two simultaneous mutable borrows of the same map.
+    let mut parameters = extracted
+        .unnamed
+        .remove("parameters")
+        .unwrap_or_else(Vec::new);
+    let mut individual_parameters = extracted
+        .unnamed
+        .remove("individual_parameters")
+        .ok_or("[covariate_model] needs an [individual_parameters] block to desugar into")?;
+
+    let ctx = crate::parser::covariate_model::CovariateModelContext {
+        decls: &decls,
+        eta_kappa_names: &eta_kappa_names,
+        declared_thetas: &declared_thetas,
+        stats: &bindings.covariate_stats,
+    };
+    let spec = crate::parser::covariate_model::apply_covariate_model(
+        &block_lines,
+        &mut parameters,
+        &mut individual_parameters,
+        &ctx,
+    )?;
+
+    extracted
+        .unnamed
+        .insert("parameters".to_string(), parameters);
+    extracted
+        .unnamed
+        .insert("individual_parameters".to_string(), individual_parameters);
+    Ok(Some(spec))
 }
 
 /// Parse the optional `[covariates]` block into ordered declarations.
@@ -4784,7 +4972,7 @@ fn parse_covariates_block(lines: &[String]) -> Result<Vec<CovariateDecl>, String
         if let Some(colon) = line.find(':') {
             // `TYPE: NAME, NAME, ...`
             let (ty_str, rest) = line.split_at(colon);
-            let kind = parse_covariate_kind(ty_str).ok_or_else(|| {
+            let (kind, levels) = parse_covariate_type_token(ty_str)?.ok_or_else(|| {
                 format!(
                     "[covariates]: unknown covariate type '{}' (expected continuous/cont or \
                      categorical/cat)",
@@ -4796,7 +4984,7 @@ fn parse_covariates_block(lines: &[String]) -> Result<Vec<CovariateDecl>, String
             for name in names.split(',') {
                 let name = name.trim();
                 if !name.is_empty() {
-                    push_covariate_decl(&mut decls, &mut seen, name, kind)?;
+                    push_covariate_decl(&mut decls, &mut seen, name, kind, levels.clone())?;
                     any = true;
                 }
             }
@@ -4808,22 +4996,26 @@ fn parse_covariates_block(lines: &[String]) -> Result<Vec<CovariateDecl>, String
             }
         } else {
             // `NAME TYPE`
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() != 2 {
+            // `WT continuous`, or `SEX categorical(levels = [0, 1])` — the
+            // levels clause may carry spaces, so everything after the name is
+            // the type token.
+            let mut parts = line.splitn(2, char::is_whitespace);
+            let (Some(name), Some(ty_str)) = (parts.next(), parts.next()) else {
                 return Err(format!(
                     "[covariates]: expected `NAME TYPE` (e.g. `WT continuous`) or \
                      `TYPE: NAME, ...`, got '{}'",
                     line
                 ));
-            }
-            let kind = parse_covariate_kind(parts[1]).ok_or_else(|| {
+            };
+            let (kind, levels) = parse_covariate_type_token(ty_str)?.ok_or_else(|| {
                 format!(
                     "[covariates]: unknown covariate type '{}' for '{}' (expected continuous/cont \
                      or categorical/cat)",
-                    parts[1], parts[0]
+                    ty_str.trim(),
+                    name
                 )
             })?;
-            push_covariate_decl(&mut decls, &mut seen, parts[0], kind)?;
+            push_covariate_decl(&mut decls, &mut seen, name, kind, levels)?;
         }
     }
 
@@ -11622,6 +11814,7 @@ enum BlockForm {
 const BLOCK_REGISTRY: &[(&str, BlockForm, Option<&str>)] = &[
     ("adaptive_dosing", BlockForm::Unnamed, None),
     ("binary_model", BlockForm::Either, Some("survival")),
+    ("covariate_model", BlockForm::Unnamed, None),
     ("covariate_nn", BlockForm::Named, None),
     ("covariates", BlockForm::Unnamed, None),
     ("data", BlockForm::Unnamed, None),

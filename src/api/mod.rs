@@ -36,6 +36,7 @@ pub use validation::{
 
 // ── production submodules (peeled from this file) ──
 mod adaptive;
+mod covariate_stats;
 mod fit;
 mod levels;
 mod output_columns;
@@ -49,6 +50,7 @@ pub use adaptive::{
     simulate_adaptive, simulate_adaptive_from_spec, AdaptiveSimulateOptions,
     AdaptiveSimulationResult,
 };
+pub use covariate_stats::{assert_covariate_model_bound, bind_covariate_stats};
 pub use fit::{fit, fit_from_files};
 pub use levels::{bind_theta_levels, level_map as theta_level_map};
 pub use output_columns::tafd_tad_for_subject;
@@ -58,12 +60,12 @@ pub(crate) use pool::{build_fit_pool, default_fit_pool};
 pub(crate) use postfit::{
     absorption_flip_flop_ebe_warning, boundary_estimate_warning, compute_eps_shrinkage,
     compute_eta_shrinkage, compute_kappa_shrinkage, compute_kappa_shrinkage_by_occ,
-    compute_param_corr, compute_subject_results, cov_diagnostics, eps_shrinkage_warning,
-    eta_shrinkage_warning, extract_standard_errors, high_correlation_warning, inflated_rse_warning,
-    integrates_odes, is_last_estimating_stage, kappa_weight_typicals, keep_gn_zero_eta_warning,
-    ode_solver_diagnostics_warning, probe_nlopt_algorithms, rebuild_warnings_structured,
-    resolve_covariance_status, resolve_sir_fallback, runaway_guard_warning,
-    sir_unavailable_warning,
+    compute_param_corr, compute_subject_results, cov_diagnostics, covariate_relation_estimates,
+    eps_shrinkage_warning, eta_shrinkage_warning, extract_standard_errors,
+    high_correlation_warning, inflated_rse_warning, integrates_odes, is_last_estimating_stage,
+    kappa_weight_typicals, keep_gn_zero_eta_warning, ode_solver_diagnostics_warning,
+    probe_nlopt_algorithms, rebuild_warnings_structured, resolve_covariance_status,
+    resolve_sir_fallback, runaway_guard_warning, sir_unavailable_warning,
 };
 pub use predict::{predict, PredictionResult};
 #[cfg(feature = "survival")]

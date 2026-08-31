@@ -1093,6 +1093,7 @@ mod tests {
 
     fn make_test_model() -> CompiledModel {
         CompiledModel {
+            covariate_model: None,
             has_conditional_eta_params: false,
             name: "test".into(),
             pk_model: PkModel::OneCptOral,
@@ -1848,6 +1849,7 @@ mod tests {
 
     fn decl(name: &str, kind: CovariateKind) -> CovariateDecl {
         CovariateDecl {
+            levels: None,
             name: name.to_string(),
             kind,
         }
