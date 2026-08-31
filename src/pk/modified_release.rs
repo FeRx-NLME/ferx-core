@@ -860,14 +860,34 @@ fn verify_against_ode_twin(
     }
     let release = || MR_TWIN_VERIFIED.with(|seen| seen.borrow_mut().remove(&key));
     let verify_tol = (500.0 * s.spec.solver_opts.reltol).max(1e-4);
-    let twin = crate::ode::ode_predictions(s.spec, &s.pk.values, theta, eta, subject);
+    let (twin, twin_states) =
+        crate::ode::ode_predictions_with_states(s.spec, &s.pk.values, theta, eta, subject);
     if twin.len() != mr.len() {
         release();
         return;
     }
+    // The integrator controls its local error as `abstol + reltol·|y|`, so the twin's own
+    // relative accuracy is `abstol/|y| + reltol`. It can only arbitrate a disagreement it is
+    // itself more accurate than, which needs `abstol/|y| < verify_tol` — i.e. the state must
+    // stay above `abstol / verify_tol`. Below that the twin is tolerance noise and asserting
+    // against it measures the solver, not the closed form.
+    //
+    // Measured, not assumed: on `nonmem_anchor/per_route_lag`, an inner-loop excursion to
+    // `V = 5.2e-8` decays `central` to 1.3e-6 by t = 24 — the order of this spec's own
+    // `abstol` (1e-6, with `reltol` 1e-4). The twin answered 29.48 where the closed form
+    // answered 24.574829; the exact Bateman superposition for those parameters is
+    // 24.574829, so the twin was the wrong one by 20% and the old check fired on it.
+    let noise_floor = s.spec.solver_opts.abstol / verify_tol;
     let mut compared = 0usize;
     for (i, (&a, &b)) in mr.iter().zip(&twin).enumerate() {
         if !b.is_finite() {
+            continue;
+        }
+        let state_scale = twin_states
+            .get(i)
+            .map(|u| u.iter().fold(0.0f64, |m, v| m.max(v.abs())))
+            .unwrap_or(0.0);
+        if !(state_scale > noise_floor) {
             continue;
         }
         compared += 1;
@@ -1436,27 +1456,11 @@ mod tests {
         }
     }
 
-    /// An EVID=2 record must not abort a *parameter-static* subject on either
-    /// route into the event-driven walker.
-    ///
-    /// End-to-end companion to
-    /// `pk::tests::event_pk_params_fills_pk_only_on_the_parameter_static_arm`,
-    /// which pins the materializer itself. Both arms below reach
-    /// `ode_predictions_event_driven`'s unconditional
-    /// `assert_eq!(pk_at_pk_only.len(), subject.pk_only_times.len())` — an
-    /// `assert_eq!`, so a release build aborts the fit.
-    ///
-    /// The two routes are deliberately separated because only one of them is
-    /// #1124's: the **reset** arm has an autonomous RHS, so
-    /// `model_uses_time_anywhere` is `false` there and it reproduces on `main`
-    /// unchanged. Asserting that here is what stops the pair being read as a
-    /// regression this PR introduced — the PR widened the door, it did not build
-    /// the hole.
-    #[test]
-    fn an_evid2_record_does_not_abort_a_parameter_static_subject() {
-        let model_src = |elim: &str| {
-            format!(
-                r#"
+    /// The `[odes]` source for the EVID=2 abort routes: an autonomous one-compartment
+    /// elimination, with `elim` appended so a caller can make the RHS read model time.
+    fn evid2_model_src(elim: &str) -> String {
+        format!(
+            r#"
 [parameters]
   theta TVCL(1.0, 0.001, 100.0)
   theta TVV(20.0, 0.001, 500.0)
@@ -1474,67 +1478,97 @@ mod tests {
 [error_model]
   DV ~ proportional(PROP)
 "#
-            )
-        };
-        let theta = [1.0, 20.0];
-        let eta = [0.0];
-        let base = |model: &crate::types::CompiledModel| {
-            let mut s = mk_subject(
-                vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-                vec![1.0, 2.0, 6.0],
-            );
-            // What `prune_irrelevant_tv_covariates` leaves for a dataset with
-            // EVID=2 rows and a varying but model-unreferenced column: the times
-            // survive, the snapshots are cleared.
-            s.pk_only_times = vec![3.0];
-            s.pk_only_covariates = Vec::new();
-            assert!(
-                !crate::pk::subject_needs_per_event_pk(model, &s),
-                "fixture must be parameter-static, else it takes the per-event arm \
-                 and proves nothing"
-            );
-            s
-        };
+        )
+    }
 
-        // Route 1 — model time in the RHS (#1124's widened predicate).
-        let tad = crate::parser::model_parser::parse_model_string(&model_src(" * (1.0 + 0.3*TAD)"))
-            .unwrap();
+    /// A subject shaped exactly as `prune_irrelevant_tv_covariates` leaves one that
+    /// carries EVID=2 rows alongside a varying but model-unreferenced column: the
+    /// times survive, the snapshots are cleared. Asserts the fixture really is
+    /// parameter-static, else it takes the per-event arm and proves nothing.
+    fn evid2_static_subject(model: &crate::types::CompiledModel) -> crate::types::Subject {
+        let mut s = mk_subject(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            vec![1.0, 2.0, 6.0],
+        );
+        s.pk_only_times = vec![3.0];
+        s.pk_only_covariates = Vec::new();
+        assert!(
+            !crate::pk::subject_needs_per_event_pk(model, &s),
+            "fixture must be parameter-static, else it takes the per-event arm \
+             and proves nothing"
+        );
+        s
+    }
+
+    const EVID2_THETA: [f64; 2] = [1.0, 20.0];
+    const EVID2_ETA: [f64; 1] = [0.0];
+
+    /// An EVID=2 record must not abort a *parameter-static* subject on any route
+    /// into an event-driven walker.
+    ///
+    /// End-to-end companion to
+    /// `pk::tests::event_pk_params_fills_pk_only_on_the_parameter_static_arm`,
+    /// which pins the materializer itself. These arms reach
+    /// `ode_predictions_event_driven`'s unconditional
+    /// `assert_eq!(pk_at_pk_only.len(), subject.pk_only_times.len())` — an
+    /// `assert_eq!`, so a release build aborts the fit.
+    ///
+    /// **Deliberately three tests, not three arms of one function.** Sequential arms
+    /// are unreachable once an earlier one panics, so dropping the materialiser's
+    /// `pk_only` fill killed the combined test without ever showing that the reset or
+    /// analytical route was covered — indistinguishable from route 1 failing alone.
+    /// Split, each route fails only for its own reason.
+    ///
+    /// Route 1 — model time in the RHS, which is #1124's widened predicate.
+    #[test]
+    fn an_evid2_record_does_not_abort_a_model_time_subject() {
+        let tad =
+            crate::parser::model_parser::parse_model_string(&evid2_model_src(" * (1.0 + 0.3*TAD)"))
+                .unwrap();
         assert!(crate::pk::model_uses_time_anywhere(&tad));
-        let s = base(&tad);
-        let out = crate::pk::compute_predictions_with_tv(&tad, &s, &theta, &eta);
+        let s = evid2_static_subject(&tad);
+        let out = crate::pk::compute_predictions_with_tv(&tad, &s, &EVID2_THETA, &EVID2_ETA);
         assert_eq!(out.len(), s.obs_times.len());
         assert!(
             out.iter().all(|p| p.is_finite() && *p > 0.0),
             "TAD route returned {out:?}"
         );
+    }
 
-        // Route 2 — an EVID 3/4 reset on an AUTONOMOUS RHS. `model_uses_time_anywhere`
-        // is false here, so this arm is independent of #1124 and reproduces on main.
-        let plain = crate::parser::model_parser::parse_model_string(&model_src("")).unwrap();
+    /// Route 2 — an EVID 3/4 reset on an AUTONOMOUS RHS. `model_uses_time_anywhere`
+    /// is false here, so this arm is independent of #1124 and reproduces on `main`
+    /// unchanged. Asserting that is what stops the set being read as a regression
+    /// this PR introduced — the PR widened the door, it did not build the hole.
+    #[test]
+    fn an_evid2_record_does_not_abort_a_reset_subject_on_an_autonomous_rhs() {
+        let plain = crate::parser::model_parser::parse_model_string(&evid2_model_src("")).unwrap();
         assert!(
             !crate::pk::model_uses_time_anywhere(&plain),
             "the reset arm must not depend on the model-time predicate"
         );
-        let mut s = base(&plain);
+        let mut s = evid2_static_subject(&plain);
         s.reset_times = vec![4.0];
         assert!(s.has_resets());
-        let out = crate::pk::compute_predictions_with_tv(&plain, &s, &theta, &eta);
+        let out = crate::pk::compute_predictions_with_tv(&plain, &s, &EVID2_THETA, &EVID2_ETA);
         assert_eq!(out.len(), s.obs_times.len());
         assert!(
             out.iter().all(|p| p.is_finite()),
             "reset route returned {out:?}"
         );
+    }
 
-        // Route 3 — the **analytical** event-driven walker, which carries its own
-        // copy of the same three asserts (`pk/event_driven.rs`) and which the
-        // CHANGELOG claims was affected. Routes 1 and 2 are both `ode(...)` models,
-        // so without this arm that claim rests on the shared materialiser fix alone.
-        //
-        // Reached via `compute_predictions_with_tv_into_with_schedule`'s third
-        // branch: `has_resets() && supports_event_driven(pk_model)` with
-        // `ode_spec == None`. For such a model `model_uses_time_anywhere` degenerates
-        // to `model_uses_time_builtin`, so the subject stays parameter-static and
-        // takes the arm the fix repaired.
+    /// Route 3 — the **analytical** event-driven walker, which carries its own copy
+    /// of the same length asserts (`pk/event_driven.rs`) and which the CHANGELOG
+    /// claims was affected. Routes 1 and 2 are both `ode(...)` models, so without
+    /// this arm that claim rests on the shared materialiser fix alone.
+    ///
+    /// Reached via `compute_predictions_with_tv_into_with_schedule`'s third branch:
+    /// `has_resets() && supports_event_driven(pk_model)` with `ode_spec == None`.
+    /// For such a model `model_uses_time_anywhere` degenerates to
+    /// `model_uses_time_builtin`, so the subject stays parameter-static and takes
+    /// the arm the fix repaired.
+    #[test]
+    fn an_evid2_record_does_not_abort_the_analytical_event_driven_walker() {
         const ANALYTICAL_SRC: &str = r#"
 [parameters]
   theta TVCL(1.0, 0.001, 100.0)
@@ -1554,12 +1588,12 @@ mod tests {
             analytical.ode_spec.is_none(),
             "route 3 must be the analytical engine, not an ODE model"
         );
-        let mut s = base(&analytical);
+        let mut s = evid2_static_subject(&analytical);
         s.reset_times = vec![4.0];
         // A second dose after the reset, so the later record lands with drug
         // present rather than on a zero state (CLAUDE.md's non-degeneracy rule).
         s.doses.push(DoseEvent::new(5.0, 100.0, 1, 0.0, false, 0.0));
-        let out = crate::pk::compute_predictions_with_tv(&analytical, &s, &theta, &eta);
+        let out = crate::pk::compute_predictions_with_tv(&analytical, &s, &EVID2_THETA, &EVID2_ETA);
         assert_eq!(out.len(), s.obs_times.len());
         assert!(
             out.iter().all(|p| p.is_finite()),
@@ -1719,6 +1753,70 @@ mod tests {
             &[5.0, 50.0, 0.5, 1.2, 0.8, 3.0],
             &[0.0],
             vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        );
+    }
+
+    /// `verify_mr_twin` must not judge the closed form against a twin that has run out
+    /// of significant digits. The inner loop legitimately visits extreme η, and once the
+    /// trajectory decays to the order of the spec's `abstol` the integrator's answer is
+    /// tolerance noise — so a check keyed only on `reltol` calls the *exact* closed form
+    /// wrong.
+    ///
+    /// These are the real parameters from an inner-loop excursion on
+    /// `nonmem_anchor/per_route_lag` (`V = 5.2e-8`, `central` down to 1.3e-6 by t = 24,
+    /// against `abstol = 1e-6`). The twin answered 29.48; the closed form answered
+    /// 24.574829, and the exact Bateman superposition
+    /// `Σ FRₖ·kernel(kaₖ, t − lagₖ) / V` evaluates to 24.574829 — the twin was the wrong
+    /// one, by 20%. Before the noise-floor gate this aborted the whole fit in debug.
+    ///
+    /// Asserts the value too, not just the absence of a panic: a gate that skipped every
+    /// observation would also stop the panic while making the check vacuous.
+    #[test]
+    fn mr_twin_check_ignores_a_twin_that_decayed_into_its_own_abstol() {
+        // Default solver tolerances, not `REDUCE_1CPT_LAG`'s pinned `1e-10`/`1e-12`: the
+        // whole point is a twin loose enough for `abstol` to reach the decayed state, which
+        // is what a user's model has. A first draft kept the tight ones and passed with the
+        // gate disabled.
+        let src = REDUCE_1CPT_LAG
+            .replace("  ode_reltol = 1e-10\n", "")
+            .replace("  ode_abstol = 1e-12\n", "");
+        assert!(
+            !src.contains("ode_reltol") && !src.contains("ode_abstol"),
+            "the tolerance lines must actually be stripped, else this test cannot reproduce"
+        );
+        let model = crate::parser::model_parser::parse_model_string(&src).unwrap();
+        // The excursion's realized `CL`/`V` exactly as the probe recorded them. Set through
+        // θ rather than η because `REDUCE_1CPT_LAG` carries no `ETA_V`, so an η-only route
+        // leaves `V` at 49.2 and the state never reaches `abstol` — a first draft did that
+        // and passed with the gate disabled, i.e. proved nothing.
+        let theta = [
+            1.1197394031099207e-7,
+            5.219077731731729e-8,
+            0.500693,
+            1.22062,
+            0.811426,
+            3.07375,
+        ];
+        let eta = [0.0];
+        let subject = mk_subject(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            vec![
+                0.25, 0.5, 1.0, 1.5, 2.0, 2.9, 3.1, 3.5, 4.0, 5.0, 6.0, 8.0, 12.0, 16.0, 24.0,
+            ],
+        );
+        let out = mr_predictions(&model, &subject, &theta, &eta).expect("MR-supported");
+        assert_eq!(out.len(), subject.obs_times.len());
+        assert!(
+            out.iter().all(|p| p.is_finite()),
+            "decayed-tail predictions must stay finite: {out:?}"
+        );
+        // The exact `Σ FRₖ·(kaₖ/(kaₖ−ke))·(e^{−ke·t'} − e^{−kaₖ·t'}) · D / V` at t = 24 for
+        // these parameters, computed independently of ferx. Pins the closed form as the
+        // correct side of the disagreement — the twin's 29.48 is 20% high.
+        let last = *out.last().unwrap();
+        assert!(
+            (last - 24.574829).abs() < 1e-5,
+            "closed form at t=24 should be the exact 24.574829, got {last}"
         );
     }
 
