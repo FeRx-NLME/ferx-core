@@ -464,6 +464,16 @@ fn print_check_human(report: &ferx_core::CheckReport) {
             println!("    help: {}", s);
         }
     }
+    // #1111: a `[covariate_model]` block is sugar over `[individual_parameters]`,
+    // so show what it built. Without this the modeller cannot check the
+    // generated expression against a NONMEM control stream.
+    if !report.desugared_individual_parameters.is_empty() {
+        println!("\n[individual_parameters] as built from [covariate_model]:");
+        for line in &report.desugared_individual_parameters {
+            println!("  {}", line.trim());
+        }
+        println!();
+    }
     if report.valid {
         println!(
             "ok: {} — no errors ({} warning(s))",

@@ -47,6 +47,7 @@ fn test_sdtab_ipred_honours_tv_covariates() {
         mixture: None,
     };
     let model = CompiledModel {
+        covariate_model: None,
         name: "tv_cov_sdtab_regression".into(),
         pk_model: PkModel::OneCptIv,
         error_model: ErrorModel::Proportional,
@@ -390,6 +391,7 @@ fn test_simulate_honours_tv_covariates() {
         mixture: None,
     };
     let model = CompiledModel {
+        covariate_model: None,
         name: "tv_cov_sim_regression".into(),
         pk_model: PkModel::OneCptIv,
         error_model: ErrorModel::Proportional,

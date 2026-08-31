@@ -1121,6 +1121,29 @@ fn read_nonmem_csv_impl(
     // `cov_names` is already existing-only, so this is a no-op there.)
     let existing_cov_names: Vec<String> = cov_indices.iter().map(|(n, _)| n.clone()).collect();
 
+    // A covariate column that exists but carries no finite value for some
+    // subjects is stored as `NaN` (see the per-subject reader). Report it once
+    // per covariate: without a `present(COV)` guard those subjects evaluate the
+    // covariate expression to `NaN`, and the fit will fail on them.
+    let mut population_warnings = population_warnings;
+    for name in &existing_cov_names {
+        let missing: Vec<&str> = subjects
+            .iter()
+            .filter(|s| s.covariates.get(name).is_some_and(|v| v.is_nan()))
+            .map(|s| s.id.as_str())
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+        population_warnings.push(format!(
+            "covariate {name} has no value for {} of {} subjects ({}{});              it evaluates to NaN for them. Impute the column, exclude the subjects, or guard              the relation with `present({name})`.",
+            missing.len(),
+            subjects.len(),
+            missing.iter().take(5).cloned().collect::<Vec<_>>().join(", "),
+            if missing.len() > 5 { ", ..." } else { "" },
+        ));
+    }
+
     Ok((
         Population {
             subjects,
@@ -1479,15 +1502,27 @@ fn parse_subject(
     // does not yet read per-event snapshots).
     let mut covariates: HashMap<String, f64> = HashMap::new();
     for (name, idx) in cov_indices {
+        let mut found = false;
         for row in rows {
             if let Some(val_str) = row.get(*idx) {
                 if let Ok(val) = val_str.parse::<f64>() {
                     if val.is_finite() {
                         covariates.insert(name.clone(), val);
+                        found = true;
                         break;
                     }
                 }
             }
+        }
+        // The column exists but this subject has no finite value in it. Record
+        // that as `NaN` rather than leaving the key absent: an absent key
+        // resolves to the covariate map's `0.0` default at every evaluation
+        // site, so the gap would be indistinguishable from a genuine zero and
+        // e.g. `(WT/70)^0.75` would silently contribute `0` for that subject
+        // (division underflows here, it does not blow up). `NaN` is what
+        // `present(COV)` reads, and it propagates loudly everywhere else.
+        if !found {
+            covariates.insert(name.clone(), f64::NAN);
         }
     }
 

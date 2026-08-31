@@ -27,6 +27,7 @@ fn make_iov_model() -> CompiledModel {
         mixture: None,
     };
     CompiledModel {
+        covariate_model: None,
         name: "iov_test".into(),
         pk_model: PkModel::OneCptIv,
         error_model: ErrorModel::Proportional,

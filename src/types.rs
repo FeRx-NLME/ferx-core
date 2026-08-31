@@ -1304,11 +1304,329 @@ impl CovariateKind {
 /// modeller declares as a covariate, tagged continuous or categorical. This is
 /// a declaration of *availability* — it does not imply the covariate is used in
 /// the structural model.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CovariateDecl {
     /// Column name, case-sensitive, matching the CSV header.
     pub name: String,
     pub kind: CovariateKind,
+    /// Declared levels of a categorical covariate — `SEX categorical(levels =
+    /// [0, 1])`. `None` for a continuous covariate, and for a categorical one
+    /// declared without levels (legal on its own; only a `[covariate_model]`
+    /// `categorical(...)` relation needs them).
+    #[serde(default)]
+    pub levels: Option<CovariateLevels>,
+}
+
+/// Where the levels of a categorical covariate come from.
+///
+/// Expanding `categorical(ref = …)` into one θ per non-reference level needs
+/// the level set *at parse time*, so silently reading it off the dataset would
+/// make the generated θ vector — its length, its names, its order — a property
+/// of the data rather than of the model file. [`CovariateLevels::Auto`] is the
+/// opt-in to exactly that, and like a symbolic centering statistic it leaves
+/// the relation unresolved until [`crate::api::bind_covariate_stats`] has seen
+/// the population.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CovariateLevels {
+    /// `levels = [0, 1]` — stated in the file, in the order written.
+    Declared(Vec<f64>),
+    /// `levels = auto` — discovered from the data, ascending.
+    Auto,
+}
+
+impl CovariateLevels {
+    /// The declared levels, or `None` for `auto` (not yet resolved).
+    pub fn declared(&self) -> Option<&[f64]> {
+        match self {
+            CovariateLevels::Declared(v) => Some(v),
+            CovariateLevels::Auto => None,
+        }
+    }
+}
+
+impl CovariateDecl {
+    /// A declaration with no levels — the shape every `[covariates]` line had
+    /// before `levels = [...]` existed.
+    pub fn new(name: impl Into<String>, kind: CovariateKind) -> Self {
+        CovariateDecl {
+            name: name.into(),
+            kind,
+            levels: None,
+        }
+    }
+}
+
+// ── `[covariate_model]` — declarative covariate relationships (#1111) ───────
+
+/// The functional form of one `[covariate_model]` relation.
+///
+/// The five non-`Expr` continuous/categorical forms are the five PsN `scm`
+/// states, so a model translated from an `scm` run has a form here for every
+/// state it can be in:
+///
+/// | PsN state | ferx form |
+/// |---|---|
+/// | 1 `none` | [`CovariateForm::None`] |
+/// | 2 `linear` (continuous) | [`CovariateForm::Linear`] |
+/// | 2 `linear` (categorical) | [`CovariateForm::Categorical`] |
+/// | 3 `hockey-stick` | [`CovariateForm::Hockey`] |
+/// | 4 `exponential` | [`CovariateForm::Exponential`] |
+/// | 5 `power` | [`CovariateForm::Power`] |
+/// | arbitrary `[code]` | [`CovariateForm::Expr`] |
+///
+/// [`CovariateForm::LinearRelative`] has no PsN state number: it is an exact
+/// reparameterization of `Linear` (`θ_rel = c·θ_abs`) that makes θ
+/// dimensionless, so the two give the same OFV on the same data and differ only
+/// in the scale θ and its SE are reported on.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CovariateForm {
+    /// Factor `1`. Declares no θ and changes no expression — the point is that
+    /// a search can write "tested, rejected" into the file and have the
+    /// generated model round-trip through the parser unchanged.
+    None,
+    /// `1 + θ·(COV − c)`. θ carries the reciprocal of the covariate's units.
+    Linear,
+    /// `1 + θ·(COV/c − 1)`. Dimensionless θ; ferx extension.
+    LinearRelative,
+    /// `exp(θ·(COV − c))`.
+    Exponential,
+    /// `(COV/c)^θ`.
+    Power,
+    /// `COV <= b ? 1 + θ_lo·(COV − b) : 1 + θ_hi·(COV − b)` — two θ, so the
+    /// relation→θ map is one-to-many from the start rather than retrofitted.
+    Hockey,
+    /// `1 + θ_k` at each non-reference level, `1` at the reference level.
+    Categorical,
+    /// Verbatim ferx expression, the equivalent of PsN's `[code]` escape hatch.
+    /// The string is the expression source with the surrounding quotes removed.
+    Expr(String),
+}
+
+impl CovariateForm {
+    /// The spelling used in the `[covariate_model]` block and in output.
+    pub fn label(&self) -> &'static str {
+        match self {
+            CovariateForm::None => "none",
+            CovariateForm::Linear => "linear",
+            CovariateForm::LinearRelative => "linear_relative",
+            CovariateForm::Exponential => "exponential",
+            CovariateForm::Power => "power",
+            CovariateForm::Hockey => "hockey",
+            CovariateForm::Categorical => "categorical",
+            CovariateForm::Expr(_) => "expr",
+        }
+    }
+
+    /// Whether the form reads a categorical covariate. Cross-checked against
+    /// the `[covariates]` declaration, so `categorical` on a column declared
+    /// `continuous` (or a continuous form on a categorical column) is rejected
+    /// rather than silently producing a factor keyed on a level that does not
+    /// exist.
+    pub fn is_categorical(&self) -> bool {
+        matches!(self, CovariateForm::Categorical)
+    }
+}
+
+/// The centering / breakpoint / reference constant of a relation, either a
+/// literal or a statistic to be read off the dataset.
+///
+/// Requiring a literal would make every generated covariate model
+/// dataset-specific, which defeats the automation this block exists for; so
+/// PsN's data-derived statistics are spelled out symbolically here and resolved
+/// by [`crate::api::bind_covariate_stats`]. Recommendation for users: literals
+/// for a final model (reproducible from the file alone), symbolic for an
+/// automated search.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CovariateStat {
+    Literal(f64),
+    Median,
+    Mean,
+    Min,
+    Max,
+    /// The most common level — PsN's reference category for `categorical`.
+    Mode,
+}
+
+impl CovariateStat {
+    /// The spelling used in the block, for the echo of the *source* form
+    /// alongside the resolved value.
+    pub fn label(&self) -> String {
+        match self {
+            CovariateStat::Literal(v) => format!("{v}"),
+            CovariateStat::Median => "median".into(),
+            CovariateStat::Mean => "mean".into(),
+            CovariateStat::Min => "min".into(),
+            CovariateStat::Max => "max".into(),
+            CovariateStat::Mode => "mode".into(),
+        }
+    }
+
+    /// The literal value, when the statistic is one.
+    pub fn literal(&self) -> Option<f64> {
+        match self {
+            CovariateStat::Literal(v) => Some(*v),
+            _ => None,
+        }
+    }
+}
+
+/// One θ generated by a relation, with the init and bounds it is declared with.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CovariateTheta {
+    /// `THETA_<PARAM>_<COV>`, with `_LO`/`_HI` for `hockey` and `_<LEVEL>` for
+    /// `categorical` — or the name given explicitly after `=>`.
+    pub name: String,
+    pub init: f64,
+    pub lower: f64,
+    pub upper: f64,
+    /// `true` when the relation carried `fix = v`; the θ is declared `FIX` at
+    /// `init` and not estimated.
+    pub fixed: bool,
+    /// For `categorical`, the level this θ contrasts against the reference.
+    pub level: Option<f64>,
+}
+
+/// One line of the `[covariate_model]` block, as structured data.
+///
+/// This is the machine-readable surface an SCM harness or an agent consumes: it
+/// states what covariate model was run without anyone having to parse the
+/// `.ferx` file. Relations are line-oriented and independent, so adding or
+/// dropping one is a pure line insert/delete.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CovariateRelation {
+    /// The `[individual_parameters]` name the factor multiplies into, e.g. `CL`.
+    pub parameter: String,
+    /// The `[covariates]` column, e.g. `WT`.
+    pub covariate: String,
+    pub form: CovariateForm,
+    /// `center = …` / `breakpoint = …` / `ref = …`, as written. `None` for
+    /// `none` and `expr(...)`, which take no constant.
+    pub center: Option<CovariateStat>,
+    /// The value `center` resolved to. Equal to the literal when one was
+    /// written; filled from the data by [`crate::api::bind_covariate_stats`]
+    /// when the statistic was symbolic; `None` while still unresolved.
+    pub resolved_center: Option<f64>,
+    /// `fix = v`, when given.
+    pub fix: Option<f64>,
+    /// The θ this relation declares: one for the single-slope forms, two for
+    /// `hockey`, one per non-reference level for `categorical`, none for `none`
+    /// and `expr(...)`. Empty while the relation is unresolved.
+    pub thetas: Vec<CovariateTheta>,
+    /// The block line verbatim, for the echo and for error messages.
+    pub source_line: String,
+}
+
+impl CovariateRelation {
+    /// Whether this relation still needs data-derived statistics before it can
+    /// be desugared — a symbolic `center`/`ref`, or a form whose PsN default
+    /// bounds are functions of the covariate's median/min/max.
+    ///
+    /// An unresolved relation is **not** desugared into the expression, and
+    /// every entry point rejects a model that still carries one, so it can
+    /// never silently fit without the covariate effect it declares.
+    pub fn needs_data(&self) -> bool {
+        // `none` declares nothing and `expr(...)` is verbatim: neither has a
+        // constant to resolve or a default bound to derive, so neither can be
+        // held up by the absence of a dataset.
+        if matches!(self.form, CovariateForm::None | CovariateForm::Expr(_)) {
+            return false;
+        }
+        (self.center.is_some() && self.resolved_center.is_none()) || self.thetas.is_empty()
+    }
+}
+
+/// The parsed, desugared `[covariate_model]` block.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CovariateModelSpec {
+    pub relations: Vec<CovariateRelation>,
+    /// The `[individual_parameters]` lines as they were rewritten — what
+    /// `ferx check` and `ferx_model_show()` print, so the expression actually
+    /// built is auditable against NONMEM.
+    pub desugared_individual_parameters: Vec<String>,
+    /// The `theta NAME(init, lower, upper)` lines appended to `[parameters]`.
+    pub generated_thetas: Vec<String>,
+}
+
+impl CovariateModelSpec {
+    /// The relations that could not be desugared for want of data-derived
+    /// statistics. Non-empty means the model must be run through
+    /// [`crate::api::bind_covariate_stats`] before it can fit.
+    pub fn unresolved(&self) -> Vec<&CovariateRelation> {
+        self.relations.iter().filter(|r| r.needs_data()).collect()
+    }
+}
+
+/// Summary statistics of one covariate over a dataset — what a symbolic
+/// `center = median` / `ref = mode` / `levels = auto` resolves against (#1111).
+///
+/// Computed over **one value per subject** for a subject-static covariate, and
+/// over every distinct value a subject takes for a time-varying one, matching
+/// PsN's per-individual weighting: a subject with 40 samples must not drag the
+/// median toward their own weight.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CovariateSummary {
+    pub median: f64,
+    pub mean: f64,
+    pub min: f64,
+    pub max: f64,
+    /// The most common value — the reference level of a `categorical` relation.
+    /// Ties break toward the smaller value, so the choice is reproducible.
+    pub mode: f64,
+    /// Distinct observed values, ascending — what `levels = auto` resolves to.
+    pub levels: Vec<f64>,
+}
+
+impl CovariateSummary {
+    /// The statistic `stat` names, or the literal it carries.
+    pub fn value_of(&self, stat: CovariateStat) -> f64 {
+        match stat {
+            CovariateStat::Literal(v) => v,
+            CovariateStat::Median => self.median,
+            CovariateStat::Mean => self.mean,
+            CovariateStat::Min => self.min,
+            CovariateStat::Max => self.max,
+            CovariateStat::Mode => self.mode,
+        }
+    }
+}
+
+/// One relation echoed on [`FitResult`], with the estimate and SE of each θ it
+/// generated — the table a covariate search reads back after a fit.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CovariateRelationEstimate {
+    pub parameter: String,
+    pub covariate: String,
+    /// [`CovariateForm::label`] of the relation's form.
+    pub form: String,
+    /// `center`/`breakpoint`/`ref` as written (`"median"`, `"70"`).
+    pub center_source: Option<String>,
+    /// …and the value it resolved to.
+    pub center: Option<f64>,
+    /// The body of an `expr("...")` relation — the expression that actually
+    /// multiplied into the parameter. `None` for every other form, whose
+    /// factor is determined by `form` + `center` + `thetas`. Without it `form:
+    /// "expr"` says a hand-written factor ran but not which one, which is not
+    /// enough for a caller to reproduce or report the model.
+    pub expression: Option<String>,
+    pub thetas: Vec<CovariateThetaEstimate>,
+}
+
+/// One θ of a [`CovariateRelationEstimate`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CovariateThetaEstimate {
+    pub name: String,
+    pub estimate: f64,
+    /// `None` when no covariance step ran, or when the θ is `FIX`ed.
+    pub se: Option<f64>,
+    pub fixed: bool,
+    /// For a `categorical` relation, the level this θ contrasts against the
+    /// reference — carried over from [`CovariateTheta::level`]. `None` for
+    /// every other form. Without it a caller with explicitly named θ cannot
+    /// say which estimate belongs to which level without re-parsing the model.
+    pub level: Option<f64>,
 }
 
 /// A single row of the [`CovariateTable`], echoing one input dataset record.
@@ -3176,6 +3494,17 @@ pub struct CompiledModel {
     /// columns before a fit so that a missing/misspelt covariate fails loudly
     /// instead of silently evaluating to zero.
     pub referenced_covariates: Vec<String>,
+    /// The parsed, desugared `[covariate_model]` block (#1111). `None` when the
+    /// block is absent — every model written before this block existed, and
+    /// every model that states its covariate effects classically inside
+    /// `[individual_parameters]`.
+    ///
+    /// The block is *sugar*: it is rewritten into ordinary
+    /// `[individual_parameters]` expressions and `theta` declarations before
+    /// anything else reads the model, so nothing downstream of the parser
+    /// special-cases it. This field is the structured echo of what was written
+    /// — the surface a covariate search reads instead of the `.ferx` text.
+    pub covariate_model: Option<CovariateModelSpec>,
     /// Mirror of [`FitOptions::gradient_method`] so the inner loop can
     /// dispatch at runtime without threading the options struct through
     /// every call site. Set by [`fit_from_files`](crate::fit_from_files)
@@ -5459,6 +5788,16 @@ pub struct FitResult {
     /// (which has no raw rows) or when no `[covariates]` block is declared.
     /// Missing values are `f64::NAN`. See [`CovariateTable`].
     pub covariate_table: Option<CovariateTable>,
+    /// Echo of the `[covariate_model]` relations with the estimate and SE of
+    /// each θ they generated (#1111). Empty when the model declares no
+    /// `[covariate_model]` block.
+    ///
+    /// This is what an SCM harness or an agent reads back after a fit — the
+    /// covariate model that ran, its resolved centering constants, and the
+    /// effect sizes — so it never has to regex the model file or join θ names
+    /// back to relations itself.
+    #[serde(default)]
+    pub covariate_relations: Vec<CovariateRelationEstimate>,
     /// Record-level exclusion statistics; `Some` when `[data_selection]` rules
     /// were active during the fit (or the caller supplied `ignore`/`accept`
     /// expressions).  `None` means no filtering was requested.
@@ -7484,6 +7823,13 @@ pub struct ParsedModel {
     /// `ferx check` to attach a block-level location to diagnostics. Empty when
     /// a model is constructed programmatically rather than parsed from text.
     pub block_lines: std::collections::HashMap<String, usize>,
+    /// The data-derived bindings this parse was given (#1064 level counts,
+    /// #1111 covariate statistics).
+    ///
+    /// Carried on the result so that a *second* binder — the two run in
+    /// sequence on a model that declares both — re-parses with the first one's
+    /// bindings still in hand instead of silently dropping them.
+    pub bindings: crate::parser::model_parser::ParseBindings,
 }
 
 /// Factories that build minimal `CompiledModel` instances for unit tests.

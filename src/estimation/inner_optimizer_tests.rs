@@ -1103,6 +1103,7 @@ fn test_frem_jacobian_overrides_fd_with_exact_values() {
         mixture: None,
     };
     let model = CompiledModel {
+        covariate_model: None,
         has_conditional_eta_params: false,
         name: "frem_jac_test".into(),
         pk_model: PkModel::OneCptIv,

@@ -101,6 +101,11 @@ pub fn fit_from_files(
         let model_text = std::fs::read_to_string(model_path)
             .map_err(|e| format!("Failed to re-read model file for level binding: {e}"))?;
         crate::api::bind_theta_levels(&mut parsed, &model_text, &mut population)?;
+        // #1111: resolve any symbolic `[covariate_model]` statistic
+        // (`center = median`, `ref = mode`, `levels = auto`) against the same
+        // dataset. `assert_covariate_model_bound` names this entry point as one
+        // that binds them, so it has to actually do it.
+        crate::api::bind_covariate_stats(&mut parsed, &model_text, &population)?;
     }
     let mut model = parsed.model;
     model.bloq_method = opts.bloq_method;
@@ -2272,6 +2277,9 @@ fn fit_inner(
 
     let mut fit_result = FitResult {
         restored_from_checkpoint: false,
+        // #1111: the `[covariate_model]` echo, joined to the θ this fit
+        // estimated. Filled in just below, once `fit_result` owns the θ vector.
+        covariate_relations: Vec::new(),
         method: final_method,
         method_chain: chain.clone(),
         method_wall_times_secs,
@@ -2482,6 +2490,17 @@ fn fit_inner(
         fit_result.warnings.push(msg);
         fit_result.warnings_structured.push(entry);
     }
+
+    // The `[covariate_model]` echo (#1111): the relations as declared, joined to
+    // the θ this fit estimated and their standard errors. Built here rather than
+    // in the literal above because it reads the assembled θ vector.
+    fit_result.covariate_relations = crate::api::covariate_relation_estimates(
+        model,
+        &fit_result.theta_names,
+        &fit_result.theta,
+        fit_result.se_theta.as_ref(),
+        &fit_result.theta_fixed,
+    );
 
     Ok(fit_result)
 }

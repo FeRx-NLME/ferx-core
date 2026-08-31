@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 
 use crate::parser::model_parser::{
-    level_index_column, parse_full_model_bound, LevelBinding, LevelBindings, LevelBlockDecl,
+    level_index_column, parse_full_model_with, LevelBinding, LevelBindings, LevelBlockDecl,
     LevelContrast,
 };
 use crate::types::{ParsedModel, Population, Subject};
@@ -75,7 +75,12 @@ pub fn bind_theta_levels(
     }
 
     let model_name = parsed.model.name.clone();
-    let rebound = parse_full_model_bound(model_text, &bindings)?;
+    // Re-parse with *every* binding this model has been given, not just the
+    // level ones: a model that also declares `[covariate_model]` statistics
+    // (#1111) may have had those bound already, and re-parsing with the level
+    // bindings alone would drop them.
+    parsed.bindings.levels = bindings;
+    let rebound = parse_full_model_with(model_text, &parsed.bindings)?;
     parsed.model = rebound.model;
     parsed.model.name = model_name;
     Ok(())

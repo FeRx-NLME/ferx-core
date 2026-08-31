@@ -2498,6 +2498,7 @@ mod tests {
 
     fn make_model() -> CompiledModel {
         CompiledModel {
+            covariate_model: None,
             name: "test".into(),
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,

@@ -29,8 +29,42 @@ section of the SDLC for the versioning policy).
   write them package-qualified (`--features ferx-core/ci`). Consumers of the `ferx-core` crate —
   including the ferx-r wrapper, which patches the repo root — are unaffected: the root package is
   still `ferx-core`.
+- **A covariate column with no value for a subject now reads as `NaN`, not as a dropped key
+  (#1111).** Previously the key was simply absent from that subject's covariate map, and every
+  evaluation site resolves an absent covariate to `0.0` — so a subject whose `WT` column was `.`
+  on every row was fitted at `WT = 0`, indistinguishable from a genuine zero, and `present(WT)`
+  reported it as present. The reader now stores `NaN` and warns, naming the covariate and the
+  affected subjects, so the gap is either guarded with `present(...)`, imputed, or fails loudly.
 
 ### Added
+- **A `present(COV)` condition for covariates that may be missing (#1111).** A missing covariate
+  value is `NaN`, and division by it underflows to `0.0` here rather than erroring, so an
+  unguarded `(CRCL/100)^THETA` silently zeroes the parameter on a row with no `CRCL`.
+  `if (present(CRCL)) ... else 1.0` says the guard plainly; the equivalent `CRCL == CRCL` idiom
+  still works. Usable anywhere a condition is (`!present(X)`, `present(X) && X > 100`), and it is
+  what `[covariate_model]` wraps every generated factor in.
+- **A `[covariate_model]` block: covariate–parameter relationships declared as data (#1111).**
+  `CL ~ WT power(center = median)` desugars into exactly the classical
+  `[individual_parameters]` expression — with the theta declaration, the centering constant and a
+  missing-value guard filled in — so the OFV and estimates are identical to writing it by hand.
+  All five PsN `scm` states are expressible (`none`, `linear`, `hockey`, `exponential`, `power`,
+  plus `categorical` and an `expr("…")` escape hatch) with PsN's default inits and bounds;
+  `center`/`breakpoint`/`ref` accept a literal or a data-derived statistic (`median`, `mean`,
+  `min`, `max`, `mode`), and `[covariates]` gains `categorical(levels = [0, 1])` /
+  `levels = auto`. The relations are echoed on `FitResult.covariate_relations` and in the fit
+  YAML — each θ naming the categorical `level` it contrasts, each `expr(…)` relation carrying
+  the expression that ran, and a relation with no θ emitting `thetas: []` rather than a bare key.
+  Statistics summarise every event record (observations, doses, `EVID=2` markers, `EVID=3/4`
+  resets), so the default bounds cover the range the fit evaluates over. Centres that would break
+  their own form are refused up front: outside the observed range for the linear family (whose
+  default bounds would come back reversed), non-positive for `power`, zero for `linear_relative`;
+  so is a categorical value the block never declared, which would otherwise be modelled silently
+  as the reference level (`E_COV_LEVEL_UNKNOWN`). `ferx check` prints the desugared block. Each
+  relation owns its own θ (as in `scm`);
+  a θ shared across relations is still written classically. Relations are line-oriented and
+  independent,
+  so a covariate search rewrites this one block instead of doing surgery on an expression. See
+  `docs/model-file/covariate-model.qmd`.
 - **A CI-enforced public-API baseline for `ferx-core` (#1114).** `api/ferx-core-public-api.txt` is
   a committed snapshot of the crate's public surface; a CI job regenerates and diffs it, so any
   widening of the API fails until the baseline is updated in the same PR. Regenerate with

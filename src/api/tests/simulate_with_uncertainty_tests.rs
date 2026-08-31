@@ -28,6 +28,7 @@ fn tiny_model() -> CompiledModel {
         mixture: None,
     };
     CompiledModel {
+        covariate_model: None,
         name: "uncertainty_smoke".into(),
         pk_model: PkModel::OneCptIv,
         error_model: ErrorModel::Proportional,
@@ -390,6 +391,7 @@ fn synthetic_fit(template: &ModelParameters) -> FitResult {
     let n_packed = crate::estimation::parameterization::packed_len(template);
     let cov = DMatrix::identity(n_packed, n_packed) * 0.01;
     FitResult {
+        covariate_relations: Vec::new(),
         restored_from_checkpoint: false,
         method: EstimationMethod::FoceI,
         method_chain: vec![EstimationMethod::FoceI],

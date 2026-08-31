@@ -3016,6 +3016,7 @@ mod tests {
             PkModel, ScalingSpec, SigmaVector,
         };
         CompiledModel {
+            covariate_model: None,
             name: "cl_from_cr".into(),
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Additive,
