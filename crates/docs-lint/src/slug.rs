@@ -7,11 +7,13 @@
 //!
 //! The algorithm, verified against `docs/_site/**/*.html` (`data-anchor-id`):
 //!
-//! 1. An explicit `{#id}` attribute on the heading wins outright.
-//! 2. Otherwise: strip inline markup (code spans, emphasis, link syntax), then
-//!    **delete** — not replace — every character that is not alphanumeric,
-//!    `_`, `-` or `.`; map runs of whitespace to a single `-`; lowercase; drop
-//!    everything before the first letter.
+//! 1. An explicit `{#id}` attribute on the heading wins outright, and is
+//!    emitted verbatim — step (3) never renames it.
+//! 2. Otherwise: strip inline markup (code spans, emphasis, link syntax, raw
+//!    HTML), then **delete** — not replace — every character that is not
+//!    alphanumeric, `_`, `-` or `.`; map runs of whitespace to a single `-`;
+//!    lowercase; drop everything before the first letter, falling back to
+//!    `section` if that leaves nothing.
 //! 3. A repeat of an id already used on the page gets `-1`, `-2`, … in
 //!    document order.
 //!
@@ -82,6 +84,31 @@ fn strip_inline_markup(text: &str) -> String {
                 }
             }
             '`' | '*' => i += 1,
+            '_' => {
+                // `_` is BOTH an emphasis delimiter and a legal identifier
+                // character. Pandoc resolves it by position: intra-word it is
+                // literal (`ode_method` → `ode_method`), at a word boundary it
+                // is emphasis (`_Important_` → `important`).
+                let intra_word = i > 0
+                    && chars[i - 1].is_alphanumeric()
+                    && chars.get(i + 1).is_some_and(|c| c.is_alphanumeric());
+                if intra_word {
+                    out.push('_');
+                }
+                i += 1;
+            }
+            '<' if chars
+                .get(i + 1)
+                .is_some_and(|c| c.is_ascii_alphabetic() || *c == '/')
+                && chars[i..].contains(&'>') =>
+            {
+                // Raw inline HTML (`<br>`, `<span class="x">`): pandoc builds
+                // the identifier from the rendered text, not from the tag.
+                while chars[i] != '>' {
+                    i += 1;
+                }
+                i += 1;
+            }
             c => {
                 out.push(c);
                 i += 1;
@@ -114,10 +141,13 @@ pub fn slug(heading_text: &str) -> String {
     }
     let joined = kept.split_whitespace().collect::<Vec<_>>().join("-");
 
-    // Drop everything up to the first letter.
+    // Drop everything up to the first letter. Pandoc substitutes `section`
+    // when that leaves nothing, so `## 123` is addressed as `#section` — an
+    // empty id here would report a healthy `#section` link as dead and make
+    // two letterless headings collide on the empty string.
     match joined.char_indices().find(|(_, c)| c.is_alphabetic()) {
         Some((start, _)) => joined[start..].to_string(),
-        None => String::new(),
+        None => "section".to_string(),
     }
 }
 
@@ -136,6 +166,13 @@ impl IdAssigner {
     /// Returns `(assigned_id, base_id)`. They differ exactly when the base id
     /// had already been used on this page — which is what R3 reports.
     pub fn assign(&mut self, heading_text: &str) -> (String, String) {
+        // An explicit `{#id}` is emitted verbatim: pandoc never appends `-1` to
+        // an id the author wrote. Recording it still matters, so a *later*
+        // auto-generated id that collides with it is suffixed.
+        if let (_, Some(id)) = split_attributes(heading_text) {
+            *self.seen.entry(id.clone()).or_insert(0) += 1;
+            return (id.clone(), id);
+        }
         let base = slug(heading_text);
         let n = self.seen.entry(base.clone()).or_insert(0);
         let assigned = if *n == 0 {
@@ -224,8 +261,51 @@ mod tests {
     }
 
     #[test]
-    fn heading_with_no_letters_yields_an_empty_id() {
-        assert_eq!(slug("123 456"), "");
+    fn underscore_emphasis_is_stripped_but_intra_word_underscores_survive() {
+        assert_eq!(slug("_Important_ notes"), "important-notes");
+        assert_eq!(slug("Zero-order (`zero_order`)"), "zero-order-zero_order");
+        assert_eq!(slug("A _b_ c_d e"), "a-b-c_d-e");
+    }
+
+    #[test]
+    fn raw_inline_html_contributes_no_tag_text() {
+        assert_eq!(slug("Line<br>break"), "linebreak");
+        assert_eq!(
+            slug("<span class=\"x\">Tagged</span> title"),
+            "tagged-title"
+        );
+        // A bare `<` that is not a tag is deleted like any other punctuation,
+        // and must not swallow the text after it.
+        assert_eq!(slug("When x < y holds"), "when-x-y-holds");
+    }
+
+    #[test]
+    fn heading_with_no_letters_is_addressed_as_section() {
+        // Pandoc's substitute for an empty identifier.
+        assert_eq!(slug("123 456"), "section");
+    }
+
+    #[test]
+    fn an_explicit_id_is_never_suffixed() {
+        let mut ids = IdAssigner::new();
+        // Pandoc emits an author-written id verbatim, and a LATER auto id that
+        // collides with it is the one that gets the suffix.
+        assert_eq!(ids.assign("Syntax"), ("syntax".into(), "syntax".into()));
+        assert_eq!(
+            ids.assign("Anything {#syntax}"),
+            ("syntax".into(), "syntax".into())
+        );
+        assert_eq!(ids.assign("Syntax"), ("syntax-2".into(), "syntax".into()));
+    }
+
+    #[test]
+    fn an_auto_id_colliding_with_an_earlier_explicit_one_is_suffixed() {
+        let mut ids = IdAssigner::new();
+        assert_eq!(
+            ids.assign("Anything {#syntax}"),
+            ("syntax".into(), "syntax".into())
+        );
+        assert_eq!(ids.assign("Syntax"), ("syntax-1".into(), "syntax".into()));
     }
 
     #[test]

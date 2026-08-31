@@ -262,6 +262,11 @@ group_docs() {
   # This is the one group that also RUNS its tests rather than only compiling
   # them: the corpus check IS the gate, and it is a filesystem walk, not a fit.
   run cargo test -p docs-lint
+
+  # `docs-lint` is outside the `Clippy` group's package list (which is scoped to
+  # `ferx-core` and its two members), so without this line the crate would be
+  # linted by nothing. Cheap: the compile above already warmed it.
+  run cargo clippy -p docs-lint --all-targets
 }
 
 group_public_api() {

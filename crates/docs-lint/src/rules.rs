@@ -244,7 +244,11 @@ pub fn check_links(
         };
 
         let key = if path_part.is_empty() {
-            doc.path.clone()
+            // `ids_by_file` is keyed on the NORMALIZED path, so this side has to
+            // normalize too. Keying on the raw path made every same-page
+            // `#anchor` check silently pass whenever the docs directory was
+            // given with a `.` or `..` component (`docs-lint ./docs`).
+            normalize(&doc.path)
         } else {
             let mut candidate = normalize(&dir.join(path_part));
             // Quarto links are written against the source tree, but a link may
@@ -437,9 +441,11 @@ mod tests {
     }
 
     fn check_anchors(docs: &[Doc], root: &Path) -> Vec<Violation> {
+        // Keyed exactly as `lint()` keys it, so the helper cannot pass on a
+        // corpus the real entry point would fail.
         let ids: HashMap<PathBuf, HashSet<String>> = docs
             .iter()
-            .map(|d| (d.path.clone(), d.ids.clone()))
+            .map(|d| (normalize(&d.path), d.ids.clone()))
             .collect();
         docs.iter()
             .flat_map(|d| check_links(d, root, &ids))
@@ -503,6 +509,23 @@ mod tests {
         let v = check_anchors(&docs, &root);
         assert_eq!(v.len(), 1);
         assert!(v[0].message.contains("does not exist"));
+    }
+
+    #[test]
+    fn same_page_anchors_are_still_checked_when_the_path_is_unnormalized() {
+        // `docs-lint ./docs` reaches every page as `/root/./docs/x.qmd`. The
+        // lookup key has to be normalized on BOTH sides or the same-page branch
+        // misses `ids_by_file` entirely and every `#anchor` silently passes.
+        let doc = parse_str(
+            "[a](#no-such-thing)\n\n## Real one\n",
+            Path::new("/root/./docs/x.qmd"),
+            Path::new("/root"),
+        );
+        let docs = [doc];
+        let v = lint(&docs, Path::new("/root"), &Config::default());
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].rule, Rule::R4);
+        assert!(v[0].message.contains("#no-such-thing"));
     }
 
     #[test]

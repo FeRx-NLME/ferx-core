@@ -547,7 +547,7 @@ fn preflight_is_executable_and_lists_every_group() {
         ("fmt", 1),        // cargo fmt --all -- --check
         ("check", 5),      // ci · ci,survival,slow-tests · ci,markov · ci,nn,slow-tests · members
         ("clippy", 2),     // ferx-core --all-targets · members
-        ("docs", 1),       // cargo test -p docs-lint
+        ("docs", 2),       // cargo test -p docs-lint · cargo clippy -p docs-lint
         ("public-api", 1), // tools/update-public-api.sh --check
     ];
 

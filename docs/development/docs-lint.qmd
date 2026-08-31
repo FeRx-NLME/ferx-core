@@ -73,15 +73,17 @@ Every relative link must resolve, and so must its `#anchor`. See
 
 The linter reproduces pandoc's algorithm, which Quarto uses:
 
-1. an explicit `{#id}` on the heading wins;
+1. an explicit `{#id}` on the heading wins, and is used **verbatim** — step 3
+   never renames it;
 2. otherwise: inline markup is stripped, every character that is not
    alphanumeric, `_`, `-` or `.` is **deleted** (not replaced), runs of
    whitespace become a single `-`, the result is lowercased, and everything
-   before the first letter is dropped;
+   before the first letter is dropped (falling back to `section` if that leaves
+   nothing);
 3. a repeat of an id already used on the page gets `-1`, `-2`, … in document
    order.
 
-Three consequences catch people out — all three were live bugs on the site
+Four consequences catch people out — the first three were live bugs on the site
 before the linter existed:
 
 | Heading | Id | Trap |

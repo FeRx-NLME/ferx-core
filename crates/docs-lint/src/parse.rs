@@ -48,10 +48,25 @@ pub struct Doc {
     pub ids: HashSet<String>,
 }
 
-/// True for a line that opens or closes a ``` / ~~~ code fence.
-fn is_code_fence(line: &str) -> bool {
+/// The marker character, run length, and "nothing follows the run" flag of a
+/// code fence line (a run of `` ` `` or `~`), if the line is one.
+///
+/// The run length matters: a fence closes only on a run of the *same* marker
+/// at least as long as the opener's. Toggling on any fence line makes a nested
+/// fence — a four-backtick block quoting a three-backtick one, which is how
+/// these docs show markdown — flip parity and expose its own contents to the
+/// parser.
+fn fence_marker(line: &str) -> Option<(char, usize, bool)> {
     let t = line.trim_start();
-    t.starts_with("```") || t.starts_with("~~~")
+    let c = t.chars().next()?;
+    if c != '`' && c != '~' {
+        return None;
+    }
+    let n = t.chars().take_while(|&x| x == c).count();
+    if n < 3 {
+        return None;
+    }
+    Some((c, n, t.chars().skip(n).all(char::is_whitespace)))
 }
 
 /// Strip inline code spans so a link inside backticks is not treated as a link.
@@ -164,17 +179,27 @@ pub fn parse_str(text: &str, path: &Path, root: &Path) -> Doc {
     let mut headings = Vec::new();
     let mut links = Vec::new();
     let mut all_ids = HashSet::new();
-    let mut in_fence = false;
+    // The open fence's marker and run length, while we are inside one.
+    let mut fence: Option<(char, usize)> = None;
     let mut pending_disable: HashSet<String> = HashSet::new();
 
     while i < lines.len() {
         let line = &lines[i];
-        if is_code_fence(line) {
-            in_fence = !in_fence;
+        if let Some((c, n, bare)) = fence_marker(line) {
+            match fence {
+                // Only a bare run of the same marker, at least as long as the
+                // opener, closes the block. Anything else is its content.
+                Some((open_c, open_n)) => {
+                    if c == open_c && n >= open_n && bare {
+                        fence = None;
+                    }
+                }
+                None => fence = Some((c, n)),
+            }
             i += 1;
             continue;
         }
-        if in_fence {
+        if fence.is_some() {
             i += 1;
             continue;
         }
@@ -186,7 +211,11 @@ pub fn parse_str(text: &str, path: &Path, root: &Path) -> Doc {
         }
 
         let trimmed = line.trim_start();
-        if trimmed.starts_with('#') {
+        // Four or more columns of indent is an indented code block, not a
+        // heading — pandoc allows at most three. Without the guard a `#`
+        // comment inside such a block reads as a heading of its own depth and
+        // R2 reports a level jump that does not exist.
+        if line.len() - trimmed.len() < 4 && trimmed.starts_with('#') {
             let level = trimmed.chars().take_while(|c| *c == '#').count();
             let rest = &trimmed[level..];
             // `#hashtag` is not a heading; `#| label:` is a code-cell option.
@@ -284,6 +313,31 @@ mod tests {
         let d = doc("# Real\n\n```bash\n# a shell comment\n```\n\n## Also real\n");
         let texts: Vec<_> = d.headings.iter().map(|h| h.text.as_str()).collect();
         assert_eq!(texts, ["Real", "Also real"]);
+    }
+
+    #[test]
+    fn a_nested_fence_does_not_flip_fence_parity() {
+        // The standard way to show markdown in the docs: a four-backtick block
+        // quoting a three-backtick one. Toggling on every fence line would end
+        // the outer block early and parse its content as live markdown.
+        let d = doc("## S\n\n````markdown\n## S\n\n```bash\necho hi\n```\n````\n\n## T\n");
+        let texts: Vec<_> = d.headings.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(texts, ["S", "T"]);
+    }
+
+    #[test]
+    fn a_fence_closes_only_on_its_own_marker() {
+        // `~~~` inside a ``` block is content, not the closing delimiter.
+        let d = doc("```\n~~~\n# not a heading\n~~~\n```\n\n## Real\n");
+        let texts: Vec<_> = d.headings.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(texts, ["Real"]);
+    }
+
+    #[test]
+    fn hashes_in_an_indented_code_block_are_not_headings() {
+        let d = doc("# Top\n\n    ##### deep comment in code\n\n## Real\n");
+        let levels: Vec<_> = d.headings.iter().map(|h| h.level).collect();
+        assert_eq!(levels, [1, 2]);
     }
 
     #[test]
