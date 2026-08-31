@@ -846,9 +846,8 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     // The gate is about the analytic-vs-FD **gradient** route. It does not make SS + a
     // non-autonomous RHS correct: measured against an explicit 40-cycle pulse train, the
     // production *value* is 17% wrong for `T` and `TIME` alike, and `NaN` for `TAD`/`TAFD`
-    // even when the term's coefficient is zero. That is a separate defect (#1139),
-    // measured against an explicit pulse train there; the same note is at
-    // `pk/mod.rs`, `pk/modified_release.rs`, and `ode_provider_tests.rs`.
+    // even when the term's coefficient is zero. That is a separate defect (#1139); the
+    // same note is at `pk/mod.rs`, `pk/modified_release.rs`, and `ode_provider_tests.rs`.
     if has_ss
         && ode
             .rhs_program
