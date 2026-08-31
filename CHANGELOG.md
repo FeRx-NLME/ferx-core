@@ -37,6 +37,11 @@ section of the SDLC for the versioning policy).
   affected subjects, so the gap is either guarded with `present(...)`, imputed, or fails loudly.
 
 ### Added
+- **`ferx_tools::gam::gam_screen()`: GAM-based covariate pre-screening (#1114).** For each
+  ETA × covariate pair, fits `η_i ~ f(cov_i)` (linear, natural cubic spline, or one-hot
+  categorical) and ranks covariates by AIC improvement over the null model. High-ΔAIC
+  covariates are then prioritised in an SCM. This is the Rust equivalent of Xpose4's
+  `xpose.gam()`. Shrinkage > 30% triggers a warning. Requires `ferx-tools`.
 - **A `present(COV)` condition for covariates that may be missing (#1111).** A missing covariate
   value is `NaN`, and division by it underflows to `0.0` here rather than erroring, so an
   unguarded `(CRCL/100)^THETA` silently zeroes the parameter on a row with no `CRCL`.
