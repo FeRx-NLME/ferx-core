@@ -74,10 +74,12 @@ fn bolus_subject(times: &[f64]) -> Subject {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1; n],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -4997,8 +4999,9 @@ fn ode_tvcov_init_compositions_are_analytic() {
         "init + finite infusion is analytic (#486)"
     );
 
-    // + EVID 3/4 reset → analytic (#486): the K_RESET branch re-seeds init at the
-    // reset-event snapshot (matching production's `initial_state(&last_pk.values)`).
+    // + EVID 3/4 reset → analytic (#486): the K_RESET branch re-seeds init at the reset
+    // ROW's own snapshot, matching production's `initial_state(&pk_at_reset[idx].values)`
+    // (#1133).
     let mut s = tvcov_subject();
     s.reset_times = vec![4.0];
     assert!(
@@ -5402,8 +5405,11 @@ const ONECPT_IV_INIT_WTV_ODE: &str = r#"
 /// **`init(...)` + EVID=4 reset+dose at `t = 0` (the reset is the first timeline event)**
 /// (#486 review — Copilot). Production re-applies `init(&last_pk.values)` at the reset with
 /// `last_pk = init_pk` (the first-record snapshot, dose-preferred on ties). The walk seeds
-/// `last_params` from the *same* `first_record_pk` selection, so the reset re-seed reads the
-/// dose@0 snapshot — not an arbitrary array-first obs slice. Here `init = BASE/V` and `V`
+/// `last_params` from the *same* `first_record_pk` selection. Since #1133 the re-seed reads
+/// `pk_at_reset[idx]` on both sides instead, and this subject leaves `reset_covariates`
+/// empty, so `reset_cov(0)` falls back to `subject.covariates` (`WT = 60`) — the same value
+/// the dose@0 snapshot carries, which is why this arm still passes and why it is degenerate
+/// for the snapshot question (see the mid-timeline twin below). Here `init = BASE/V` and `V`
 /// depends on WT, and the dose@0 covariate (WT=60) differs from the observations' (WT=90),
 /// so a wrong snapshot at the re-seed would shift the baseline and its `∂/∂(θ,η)`. Validated
 /// against FD of the production predictor, plus inner/outer parity. (Before the fix
@@ -5428,6 +5434,228 @@ fn ode_provider_init_reset_dose_at_zero_matches_production() {
     check_vs_production(&model, &subject, &theta, &eta);
     check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
     check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+}
+
+// IOV twin of `ONECPT_IV_INIT_WTV_ODE`: the same WT-on-`V` init baseline, plus a per-occasion
+// κ on `V`, so the reset re-seed's snapshot depends on both the covariate row and the occasion
+// convention (#1133).
+const ONECPT_IV_INIT_WTV_ODE_IOV: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(20.0, 1.0, 200.0)
+  theta TVBASE(500.0, 10.0, 5000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.09
+  kappa KAPPA_V ~ 0.04
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV * (WT / 70) * exp(ETA_V + KAPPA_V)
+  BASE = TVBASE
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = BASE / V
+  d/dt(central)  = -CL/V * central
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-11
+  ode_abstol = 1e-13
+"#;
+
+/// **`init(...)` re-seeded at a MID-TIMELINE reset whose own `WT` differs from every
+/// neighbouring record** (#1133). The two existing reset twins above cannot see which
+/// snapshot the re-seed reads, and it is worth writing down why, because each looks like
+/// it should:
+///
+/// * `ode_provider_tvcov_init_reset_matches_production` is TV-cov and has a mid-timeline
+///   reset, but its model is `V = TVV * exp(ETA_V)` — `WT` sits on `CL` only, so
+///   `init = BASE/V` is covariate-free and every candidate snapshot seeds the same number.
+/// * `ode_provider_init_reset_dose_at_zero_matches_production` *does* put `WT` on `V`, but
+///   its reset is the first timeline event, where the reset row, `init_pk` and the dose@0
+///   snapshot are all `WT = 60` — three conventions, one value.
+///
+/// This subject breaks both degeneracies at once: `WT` is on `V` (so the seed moves with
+/// it) and the reset sits at `t = 3` carrying `WT = 40`, between an obs at `WT = 90` and
+/// an obs at `WT = 150`. Production seeds from the reset row's own snapshot; a twin still
+/// carrying `last_params` would seed from the `WT = 90` obs and disagree in `f` — and,
+/// because `∂init/∂(θ,η)` is evaluated at the same snapshot, in the gradient too.
+///
+/// `check_vs_production` is the oracle that bites here: it FDs the production predictor,
+/// so a twin that mirrors a stale arm fails on the value comparison before the derivative
+/// one. (The reverse — both sides sharing a wrong convention — is the blind spot CLAUDE.md
+/// records, and it is why the value path itself is anchored against NONMEM in
+/// `tests/reset_init_snapshot_nonmem_anchor.rs` rather than against this twin.)
+#[test]
+fn ode_provider_init_reset_midtimeline_reads_the_reset_rows_snapshot() {
+    let model = parse_model_string(ONECPT_IV_INIT_WTV_ODE).expect("parse");
+    let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+    let mut subject = bolus_subject(&[1.0, 2.0, 4.0, 8.0]);
+    subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+    subject.dose_covariates = vec![wt(60.0)];
+    // The record before the reset is the t=2 obs (WT=90); the one after is t=4 (WT=150).
+    // The reset row itself carries neither.
+    subject.obs_covariates = vec![wt(70.0), wt(90.0), wt(150.0), wt(150.0)];
+    subject.covariates = wt(60.0);
+    subject.reset_times = vec![3.0];
+    subject.reset_covariates = vec![wt(40.0)];
+    assert!(subject.has_tv_covariates());
+    assert!(
+        ode_tvcov_supported(&model, &subject),
+        "init + reset must be analytic (#486)"
+    );
+    let theta = vec![1.0, 20.0, 500.0];
+    let eta = vec![0.1, -0.05];
+    check_vs_production(&model, &subject, &theta, &eta);
+    check_hessian_vs_production_fd(&model, &subject, &theta, &eta);
+    check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+    // The three checks above are twin-vs-production, so they cannot see the two engines
+    // agreeing on a wrong snapshot. Pin WHICH map is read without re-deriving the closed
+    // form: moving only `reset_covariates` must move the post-reset prediction, and a walk
+    // still reading any neighbouring record would be unmoved.
+    let base = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("supported");
+    for rival in [90.0, 150.0, 60.0] {
+        let mut perturbed = subject.clone();
+        perturbed.reset_covariates = vec![wt(rival)];
+        let got = ode_subject_sensitivities(&model, &perturbed, &theta, &eta).expect("supported");
+        let (a, b) = (base.obs[2].f, got.obs[2].f);
+        assert!(
+            (a - b).abs() > 0.05 * a.abs(),
+            "changing the reset row's WT from 40 to {rival} moved the post-reset prediction \
+             only from {a:.4} to {b:.4}: the walk is not reading that row's snapshot"
+        );
+    }
+}
+
+/// **Two resets on the sensitivity walk** (#1133). Anchor arm E pins the per-reset index
+/// on the *value* engine, but it runs through `predict`, never through
+/// `ode_subject_sensitivities` — so the twin's own `tl.push((rt, K_RESET, r))` and
+/// `pk_at_reset[idx]` were still only ever evaluated at index 0, and reverting either to a
+/// constant `0` passed the whole unit suite.
+///
+/// The two reset rows carry `WT = 40` and `WT = 160`, which no neighbouring record shares,
+/// so indexing them apart is observable in `f` and in `∂f/∂(θ,η)` alike.
+#[test]
+fn ode_provider_reset_seeds_are_indexed_per_reset() {
+    let model = parse_model_string(ONECPT_IV_INIT_WTV_ODE).expect("parse");
+    let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+    let mut subject = bolus_subject(&[1.0, 2.0, 4.0, 8.0]);
+    subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+    subject.dose_covariates = vec![wt(60.0)];
+    subject.obs_covariates = vec![wt(70.0), wt(90.0), wt(150.0), wt(150.0)];
+    subject.covariates = wt(60.0);
+    subject.reset_times = vec![3.0, 6.0];
+    subject.reset_covariates = vec![wt(40.0), wt(160.0)];
+    assert!(subject.has_tv_covariates());
+    assert!(ode_tvcov_supported(&model, &subject));
+    let theta = vec![1.0, 20.0, 500.0];
+    let eta = vec![0.1, -0.05];
+    check_vs_production(&model, &subject, &theta, &eta);
+    check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
+
+    // Perturb only the SECOND reset's row. The `t = 8` observation follows it, so it must
+    // move; a walk indexing `pk_at_reset[0]` for both resets would be unmoved.
+    let base = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("supported");
+    let mut perturbed = subject.clone();
+    perturbed.reset_covariates = vec![wt(40.0), wt(45.0)];
+    let got = ode_subject_sensitivities(&model, &perturbed, &theta, &eta).expect("supported");
+    let (a, b) = (base.obs[3].f, got.obs[3].f);
+    assert!(
+        (a - b).abs() > 0.05 * a.abs(),
+        "changing only the SECOND reset row's WT moved the post-reset prediction merely \
+         from {a:.4} to {b:.4}: the walk is reading one reset's snapshot for both"
+    );
+    // And the first reset still governs its own episode: the `t = 4` observation sits
+    // between the two resets, so perturbing reset 1 must leave it alone.
+    approx::assert_relative_eq!(base.obs[2].f, got.obs[2].f, max_relative = 1e-12);
+}
+
+/// **IOV × time-varying covariates × a reset that re-seeds `init(...)`** (#1133).
+///
+/// The twin above covers the non-IOV TV-cov walk. This one takes the *other* seeding
+/// route — `seed_iov_events`' per-event branch, which fires for an IOV subject with TV
+/// covariates — where the reset row's snapshot is built through the occasion-less
+/// (`seed_pk_only_cov`) path, mirroring `predict_iov`: the reader stores no `OCC` for a
+/// reset row, so κ = 0 there on both sides.
+///
+/// `WT` sits on `V`, and `init(central) = BASE/V`, so the reset row's `WT = 40` — shared
+/// with no neighbouring record (the one before carries 90, the one after 150) — is
+/// observable in the value and in `∂/∂(θ, stacked-η)`. `predict_iov` is the oracle, so a
+/// twin that seeded from a different row fails the value comparison first.
+#[test]
+fn ode_provider_iov_tvcov_reset_reads_the_reset_rows_snapshot() {
+    let model = parse_model_string(ONECPT_IV_INIT_WTV_ODE_IOV).expect("parse");
+    assert_eq!(model.n_kappa, 1);
+    let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+    let mut subj = bolus_subject(&[1.0, 2.0, 4.0, 8.0]);
+    subj.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+    subj.dose_covariates = vec![wt(60.0)];
+    subj.obs_covariates = vec![wt(70.0), wt(90.0), wt(150.0), wt(150.0)];
+    subj.covariates = wt(60.0);
+    subj.dose_occasions = vec![1];
+    subj.occasions = vec![1, 1, 2, 2];
+    subj.reset_times = vec![3.0];
+    subj.reset_covariates = vec![wt(40.0)];
+    assert!(subj.has_tv_covariates());
+    let groups = crate::stats::likelihood::iov_occasion_groups(&subj);
+    assert_eq!(groups.len(), 2);
+
+    let theta = vec![1.0, 20.0, 500.0];
+    // NON-ZERO κ, and different per occasion. With κ ≡ 0 the two occasions are numerically
+    // identical, so the value comparison below is blind to *which* κ the reset seed uses —
+    // and the κ convention is exactly what `reset_row_occasion` decides (#1133).
+    let stacked = vec![0.1, -0.05, 0.15, -0.20];
+    let sens = ode_subject_sensitivities_iov(&model, &subj, &theta, &stacked).expect("analytic");
+    let pred = |st: &[f64], j: usize| -> f64 {
+        let eta_bsv = st[..model.n_eta].to_vec();
+        let kappas: Vec<Vec<f64>> = (0..groups.len())
+            .map(|g| {
+                st[model.n_eta + g * model.n_kappa..model.n_eta + (g + 1) * model.n_kappa].to_vec()
+            })
+            .collect();
+        crate::pk::predict_iov(&model, &subj, &theta, &eta_bsv, &kappas)[j]
+    };
+    // Value parity first: this is what a stale reset snapshot breaks.
+    for (j, o) in sens.obs.iter().enumerate() {
+        approx::assert_relative_eq!(o.f, pred(&stacked, j), max_relative = 1e-8, epsilon = 1e-10);
+    }
+    // Then the jets, against FD of the same production predictor.
+    let h = 1e-6;
+    for (j, o) in sens.obs.iter().enumerate() {
+        for k in 0..stacked.len() {
+            let mut sp = stacked.clone();
+            sp[k] += h;
+            let mut sm = stacked.clone();
+            sm[k] -= h;
+            let g = (pred(&sp, j) - pred(&sm, j)) / (2.0 * h);
+            approx::assert_relative_eq!(o.df_deta[k], g, max_relative = 2e-3, epsilon = 1e-6);
+        }
+    }
+    // Non-degeneracy without re-deriving the closed form: moving ONLY the reset row's
+    // covariates must move the post-reset prediction. This also covers the subject-static
+    // fallback (`WT = 60`) — if `reset_covariates` ever stopped being populated,
+    // `reset_cov` would silently return `subject.covariates` on BOTH sides of the twin
+    // oracle and every parity assertion above would still pass.
+    let t4 = sens.obs[2].f;
+    for (label, rival) in [
+        ("previous record", 90.0),
+        ("next record", 150.0),
+        ("subject-static", 60.0),
+    ] {
+        let mut perturbed = subj.clone();
+        perturbed.reset_covariates = vec![wt(rival)];
+        let got =
+            ode_subject_sensitivities_iov(&model, &perturbed, &theta, &stacked).expect("analytic");
+        assert!(
+            (t4 - got.obs[2].f).abs() > 0.05 * t4.abs(),
+            "setting the reset row's WT to the {label} value ({rival}) moved the post-reset \
+             prediction only from {t4:.4} to {:.4}: the walk is not reading that row",
+            got.obs[2].f
+        );
+    }
 }
 
 /// **Estimated lagtime × time-varying covariates.** A 1-cpt oral ODE with a WT

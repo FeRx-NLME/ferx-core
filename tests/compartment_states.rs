@@ -2418,8 +2418,9 @@ fn ode_with_scaling_ipred_is_correctly_scaled() {
 /// clock it reads belongs to the solver, and the dense driver sets its own
 /// per-segment `TAD` anchor — so the `t=0` snapshot stays exact and the dense arm
 /// below returns a correct number. Widening replaced that number with NaN for
-/// every subject, silently: no warning is emitted for this arm (unlike every
-/// sibling arm, which names a `W_DERIVED_*`), and the adjacent per-obs
+/// every subject, silently: no warning is emitted for this arm (unlike the
+/// IOV / TV / reset / init / oral-depot siblings, each of which names a
+/// `W_DERIVED_*` — the `is_algebraic` arm names none either), and the per-obs
 /// `compartments[i]` column stayed finite because `compute_predictions_with_states`
 /// routes `uses_time` to `ode_predictions_event_driven_with_states`, which still
 /// computes states via `ode_dense_solve_states`.

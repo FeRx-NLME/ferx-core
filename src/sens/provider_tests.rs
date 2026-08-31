@@ -1000,10 +1000,12 @@ fn oral_subject(times: &[f64]) -> Subject {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1; n],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -1599,10 +1601,12 @@ fn subject_with_dose(dose: DoseEvent, times: &[f64]) -> Subject {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1; n],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -2395,9 +2399,11 @@ fn provider_ss_into_plain_cmt_with_inert_absorption_matches_fd() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1; n],
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
         obs_l2: Vec::new(),
@@ -2855,10 +2861,12 @@ fn subject_with_doses_and_resets(
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times,
+        reset_covariates: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1; n],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -4726,10 +4734,12 @@ fn ode_lagtime_full_sens_matches_analytical_twin() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1; n],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -5338,10 +5348,12 @@ fn tvcov_subject(
         pk_only_times,
         pk_only_covariates: pk_only_wts.iter().map(|&w| wt_map(w)).collect(),
         reset_times,
+        reset_covariates: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1; n],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -6126,10 +6138,12 @@ fn iov_subject() -> Subject {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; n],
         occasions,
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -7537,10 +7551,12 @@ fn ode_iov_above_legacy_axis_cap_body() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; n],
         occasions,
         obs_l2: Vec::new(),
         dose_occasions: (1..=n_occ as u32).collect(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -7615,10 +7631,12 @@ fn fit_rayon_stack_handles_pna_scale_ode_iov_gradient() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; n],
         occasions,
         obs_l2: Vec::new(),
         dose_occasions: (1..=n_occ as u32).collect(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -10222,10 +10240,12 @@ fn iov_reset_subject() -> Subject {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: vec![24.0],
+        reset_covariates: Vec::new(),
         cens: vec![0; n],
         occasions,
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -10514,10 +10534,12 @@ fn iov_tvcov_subject(pk_only: bool) -> Subject {
         pk_only_times,
         pk_only_covariates,
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; n],
         occasions,
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -11278,11 +11300,17 @@ fn tad_reading_mr_shaped_model_takes_a_route_that_matches_fd() {
 /// received. Production's *value* has been finite since #1073; the analytic
 /// gradient had not caught up.
 ///
-/// Measured on this fixture with the gate asking the narrow predicate, so the
-/// subject fell to the static walk: `f = [0.0, NaN, NaN, NaN, NaN, NaN]`, with
-/// 10 non-finite `∂f/∂η` and 30 non-finite `∂f/∂θ` entries. The provider returns
-/// `Some`, so those `NaN`s flow straight into the FOCEI objective rather than
-/// falling back to finite differences.
+/// Measured with the gate asking the narrow predicate, so the subject fell to the
+/// static walk: `f = [0.0, NaN, NaN, NaN, NaN, NaN]`, with 10 non-finite `∂f/∂η`
+/// and 30 non-finite `∂f/∂θ` entries. The provider returns `Some`, so those
+/// `NaN`s flow straight into the FOCEI objective rather than falling back to
+/// finite differences.
+///
+/// That measurement was taken on the fixture *before* the `init(central) = BASE`
+/// seed below, which is why `f[0]` reads `0.0` rather than a baseline value: with
+/// no seed the pre-arrival state was identically zero. The seed changes that entry
+/// and nothing else about the defect — the `NaN`s came from the anchor, not from
+/// the zero. See the seed's own comment for why it is load-bearing.
 ///
 /// Note what this test is *not* pinning. The widening was first justified by the
 /// reset case — `subject.has_resets()` being absent from the trigger list while

@@ -1121,6 +1121,29 @@ fn read_nonmem_csv_impl(
     // `cov_names` is already existing-only, so this is a no-op there.)
     let existing_cov_names: Vec<String> = cov_indices.iter().map(|(n, _)| n.clone()).collect();
 
+    // A covariate column that exists but carries no finite value for some
+    // subjects is stored as `NaN` (see the per-subject reader). Report it once
+    // per covariate: without a `present(COV)` guard those subjects evaluate the
+    // covariate expression to `NaN`, and the fit will fail on them.
+    let mut population_warnings = population_warnings;
+    for name in &existing_cov_names {
+        let missing: Vec<&str> = subjects
+            .iter()
+            .filter(|s| s.covariates.get(name).is_some_and(|v| v.is_nan()))
+            .map(|s| s.id.as_str())
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+        population_warnings.push(format!(
+            "covariate {name} has no value for {} of {} subjects ({}{});              it evaluates to NaN for them. Impute the column, exclude the subjects, or guard              the relation with `present({name})`.",
+            missing.len(),
+            subjects.len(),
+            missing.iter().take(5).cloned().collect::<Vec<_>>().join(", "),
+            if missing.len() > 5 { ", ..." } else { "" },
+        ));
+    }
+
     Ok((
         Population {
             subjects,
@@ -1479,15 +1502,27 @@ fn parse_subject(
     // does not yet read per-event snapshots).
     let mut covariates: HashMap<String, f64> = HashMap::new();
     for (name, idx) in cov_indices {
+        let mut found = false;
         for row in rows {
             if let Some(val_str) = row.get(*idx) {
                 if let Ok(val) = val_str.parse::<f64>() {
                     if val.is_finite() {
                         covariates.insert(name.clone(), val);
+                        found = true;
                         break;
                     }
                 }
             }
+        }
+        // The column exists but this subject has no finite value in it. Record
+        // that as `NaN` rather than leaving the key absent: an absent key
+        // resolves to the covariate map's `0.0` default at every evaluation
+        // site, so the gap would be indistinguishable from a genuine zero and
+        // e.g. `(WT/70)^0.75` would silently contribute `0` for that subject
+        // (division underflows here, it does not blow up). `NaN` is what
+        // `present(COV)` reads, and it propagates loudly everywhere else.
+        if !found {
+            covariates.insert(name.clone(), f64::NAN);
         }
     }
 
@@ -1539,6 +1574,8 @@ fn parse_subject(
     // compartment amount at `time`; EVID=4 additionally records a dose
     // (handled in the `evid == 1 || evid == 4` arm below).
     let mut reset_times: Vec<f64> = Vec::new();
+    let mut reset_covariates: Vec<HashMap<String, f64>> = Vec::new();
+    let mut reset_occasions: Vec<u32> = Vec::new();
 
     // Reset-delimited occasion segmentation. NONMEM processes records
     // sequentially, so an EVID=3/4 reset whose TIME restarts at/below the
@@ -1728,6 +1765,22 @@ fn parse_subject(
         // EVID=4 captures both the reset and its dose.
         if evid == 3 || evid == 4 {
             reset_times.push(time);
+            // A reset row is a data record: NONMEM runs `$PK` at it, so an
+            // `[odes] init(...)` re-seeded here is evaluated with THIS row's
+            // covariates (#1133). `locf_state` was refreshed from this row at the
+            // top of the loop, so it is already the reset row's own snapshot.
+            // Skipped without TV covariates, exactly like `pk_only_covariates`:
+            // every snapshot is then the subject-static map and `reset_cov`'s
+            // fallback returns it.
+            if any_tv {
+                reset_covariates.push(locf_state.clone());
+            }
+            // The reset row's own `OCC` (#1133). NONMEM runs `$PK` at this row, so this is
+            // the occasion its `A_0` re-seed is evaluated under — not the neighbouring
+            // records'. Gated exactly like `occasions`/`dose_occasions`.
+            if occ_col.is_some() {
+                reset_occasions.push(occ);
+            }
         }
 
         if evid == 3 {
@@ -2120,9 +2173,28 @@ fn parse_subject(
         Vec::new()
     };
 
-    // Reset events are recorded in row order, which is usually time order;
-    // sort defensively so the event-driven propagators see them in order.
-    reset_times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // Reset events are recorded in row order. The occasion shift above already forces
+    // every reset past `max_eff_time`, so `reset_times` leaves the row loop strictly
+    // ascending and this permutation is the identity today — it is kept because the
+    // covariate snapshots must ride whatever permutation the sort produces (#1133):
+    // sorting the times alone would silently pair each reset with another reset's `$PK`
+    // row if that invariant ever changed. Skipped outright while the order already holds,
+    // so the common path does not deep-clone one `HashMap` per reset for nothing.
+    if !reset_times.windows(2).all(|w| w[0] <= w[1]) {
+        let mut rperm: Vec<usize> = (0..reset_times.len()).collect();
+        rperm.sort_by(|&a, &b| {
+            reset_times[a]
+                .partial_cmp(&reset_times[b])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        reset_times = rperm.iter().map(|&i| reset_times[i]).collect();
+        if any_tv {
+            reset_covariates = rperm.iter().map(|&i| reset_covariates[i].clone()).collect();
+        }
+        if occ_col.is_some() {
+            reset_occasions = rperm.iter().map(|&i| reset_occasions[i]).collect();
+        }
+    }
 
     // ── Honor NONMEM record order for a same-TIME observation/dose ──────────
     // NONMEM processes data records in file order: an observation listed BEFORE
@@ -2191,6 +2263,8 @@ fn parse_subject(
             pk_only_times,
             pk_only_covariates,
             reset_times,
+            reset_covariates,
+            reset_occasions,
             cens,
             occasions,
             obs_l2,

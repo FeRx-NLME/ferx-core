@@ -42,6 +42,17 @@ The built-ins `TIME` and `time` are not covariates and should not be declared
 here; they are always available in `[individual_parameters]` expressions and as
 direct `pk(...=TIME)` / `pk(...=time)` mappings.
 
+## Declaring covariate *effects*
+
+This block declares which columns *are* covariates. To state how one acts on a
+parameter, either write the factor into
+[`[individual_parameters]`](individual-parameters.qmd) yourself, or declare the
+relation in [`[covariate_model]`](covariate-model.qmd) and let ferx build the
+expression — one line per relation, with PsN `scm`-parity forms and defaults.
+A categorical covariate used by a `[covariate_model]` relation must declare its
+levels here (`SEX categorical(levels = [0, 1])`, or `levels = auto` to read them
+off the data).
+
 ## Semantics
 
 - **Optional & backward-compatible.** When the block is absent, behaviour is
@@ -67,7 +78,14 @@ value in a declared covariate is a hard error rather than a silent coercion to
 covariate value fails to parse, is dropped, and the covariate evaluates to `0.0`
 in the model, preserving prior behaviour.)
 
-Missing values (blank, `.`, `NA`) are permitted and recorded as missing.
+Missing values (blank, `.`, `NA`) are permitted and recorded as missing. Within a
+subject they are carried forward from the last record that had one (see
+[Time-varying covariates](#time-varying-covariates)). A subject with **no** value
+anywhere in the column — every cell `.` — has the covariate recorded as `NaN`
+rather than dropped, so it cannot be mistaken for a genuine zero, and the reader
+warns naming the covariate and the subjects. Guard such a relation with
+`present(COV)`, impute the column, or exclude the subjects; unguarded, the
+covariate expression evaluates to `NaN` for them and the fit fails.
 
 `ferx check` reads through the same covariate-aware path the fit uses, so a
 declared column that is absent (`E_MISSING_COVARIATE`) or non-numeric
@@ -101,11 +119,31 @@ with time-varying covariates now also stays analytic when combined with an
 **expression-based output scaling** (`obs_scale = <expr>`, applied as a
 subject-static post-walk quotient), an **`EVID=2` covariate-only breakpoint**, or
 **`init(...)` initial conditions** (seeded at the subject's first-record covariate
-snapshot, all since #486). Time-varying covariates with **dose lagtime** on the
-closed-form analytical models still fall back to the finite-difference gradient, as
-does an ODE model that combines `init(...)` with an **EVID 3/4 reset** (production
-re-seeds `init` at the reset-event snapshot). (See
-[FOCE/FOCEI](../estimation/foce.qmd) for the optimizer/gradient interaction.)
+snapshot, all since #486) — including when `init(...)` is combined with an
+**EVID 3/4 reset**. Time-varying covariates with **dose lagtime** on the
+closed-form analytical models still fall back to the finite-difference gradient.
+(See [FOCE/FOCEI](../estimation/foce.qmd) for the optimizer/gradient interaction.)
+
+::: {.callout-note}
+## Which record's covariates re-seed `init(...)` at a reset
+
+An EVID=3/4 row is a **data record**: NONMEM runs `$PK` at it and then ADVANs to it.
+So when a reset restarts the episode, a covariate-driven `init(state) = <expr>` is
+evaluated with **that row's own covariate values** — not the preceding record's, and
+not the next record's (since #1133). The same rule governs every other boundary: a
+segment is parameterised by the record that *terminates* it, and a lagged arrival, an
+infusion end or a zero-order cutoff is not a record at all.
+
+Concretely, for `init(central) = 10*WT` with `WT` stepping 70 → 140 at the reset row,
+the compartment restarts at `1400`, not `700`. The same holds for the row's `OCC` under an
+`iov_column`: a reset that opens a new occasion re-seeds under that occasion's κ. Anchored
+against NONMEM 7.6.0 in `nonmem_anchor/reset_init_snapshot_{A,B,C,D,E,F,G,H,J}.ctl`.
+
+One gap remains (#1135): an **analytical** (closed-form) model using
+`[initial_conditions]` drops its baseline at the first reset and never re-deposits it,
+where NONMEM re-applies `A_0`. Use an `[odes]` model if you need a baseline that
+survives a reset.
+:::
 
 ## Covariate table
 

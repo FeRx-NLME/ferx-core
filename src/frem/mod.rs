@@ -1044,10 +1044,12 @@ mod tests {
                 pk_only_times: Vec::new(),
                 pk_only_covariates: Vec::new(),
                 reset_times: Vec::new(),
+                reset_covariates: Vec::new(),
                 cens: vec![0, 0, 0],
                 occasions: Vec::new(),
                 obs_l2: Vec::new(),
                 dose_occasions: Vec::new(),
+                reset_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: Vec::new(),
             },
@@ -1069,10 +1071,12 @@ mod tests {
                 pk_only_times: Vec::new(),
                 pk_only_covariates: Vec::new(),
                 reset_times: Vec::new(),
+                reset_covariates: Vec::new(),
                 cens: vec![0, 0],
                 occasions: Vec::new(),
                 obs_l2: Vec::new(),
                 dose_occasions: Vec::new(),
+                reset_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: Vec::new(),
             },
@@ -1089,6 +1093,7 @@ mod tests {
 
     fn make_test_model() -> CompiledModel {
         CompiledModel {
+            covariate_model: None,
             has_conditional_eta_params: false,
             name: "test".into(),
             pk_model: PkModel::OneCptOral,
@@ -1844,6 +1849,7 @@ mod tests {
 
     fn decl(name: &str, kind: CovariateKind) -> CovariateDecl {
         CovariateDecl {
+            levels: None,
             name: name.to_string(),
             kind,
         }
@@ -1993,10 +1999,12 @@ mod tests {
                 pk_only_times: Vec::new(),
                 pk_only_covariates: Vec::new(),
                 reset_times: Vec::new(),
+                reset_covariates: Vec::new(),
                 cens: vec![0],
                 occasions: Vec::new(),
                 obs_l2: Vec::new(),
                 dose_occasions: Vec::new(),
+                reset_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: Vec::new(),
             });
@@ -2156,10 +2164,12 @@ mod tests {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: Vec::new(),
         });

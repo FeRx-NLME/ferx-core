@@ -967,6 +967,7 @@ fn make_model() -> CompiledModel {
         mixture: None,
     };
     CompiledModel {
+        covariate_model: None,
         name: "outer_test".into(),
         pk_model: PkModel::OneCptIv,
         error_model: ErrorModel::Proportional,
@@ -1046,10 +1047,12 @@ fn make_population(n_subj: usize) -> Population {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0, 0, 0],
             occasions: vec![1, 1, 1],
             obs_l2: Vec::new(),
             dose_occasions: vec![1],
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         })
@@ -1264,6 +1267,7 @@ fn test_outer_ad_gradient_block_omega() {
         mixture: None,
     };
     let model = CompiledModel {
+        covariate_model: None,
         name: "block_test".into(),
         pk_model: PkModel::OneCptIv,
         error_model: ErrorModel::Proportional,
@@ -1741,6 +1745,7 @@ fn test_compute_covariance_iov_runs_and_is_pd() {
         mixture: None,
     };
     let model = CompiledModel {
+        covariate_model: None,
         frem_config: None,
         residual_error_eta: None,
         analytical_init: Vec::new(),
@@ -1820,10 +1825,12 @@ fn test_compute_covariance_iov_runs_and_is_pd() {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
             obs_l2: Vec::new(),
             dose_occasions: vec![1],
+            reset_occasions: Vec::new(),
             obs_records: vec![],
         })
         .collect();

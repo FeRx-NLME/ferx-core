@@ -2338,10 +2338,12 @@ mod tests {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0; 3],
             occasions: vec![1, 1, 1],
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             // 3rd row is a FREM covariate pseudo-observation.
             fremtype: vec![0, 0, 5],
             obs_records: vec![],
@@ -2673,10 +2675,12 @@ mod tests {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: Vec::new(),
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype,
             obs_records: Vec::new(),
         }
@@ -2798,6 +2802,7 @@ mod tests {
             mixture: None,
         };
         CompiledModel {
+            covariate_model: None,
             has_conditional_eta_params: false,
             name: "frem_rb_iscale_test".into(),
             pk_model: PkModel::OneCptIv,
@@ -2892,10 +2897,12 @@ mod tests {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0, 0, 0],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: vec![0, 0, 100],
             obs_records: vec![],
         };

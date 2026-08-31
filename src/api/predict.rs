@@ -61,6 +61,11 @@ pub fn predict(
     // the model (notably `[scaling]`, #1028) silently collapsed the prediction. `fit()`
     // and `simulate()` already refuse this; match them here.
     assert_covariates_present(model, population);
+    // …and that no `[covariate_model]` relation is still waiting on the
+    // data-derived statistics that build it (#1111): an unresolved relation
+    // simply is not in the compiled expression, and a dropped covariate effect
+    // is invisible in a prediction.
+    crate::api::validation::assert_covariate_model_bound(model);
     // …and that every dose names a compartment the analytical engine can route
     // it into, so an unroutable infusion errors here with subject/time context
     // instead of panicking deep inside the event-driven walk (#375).

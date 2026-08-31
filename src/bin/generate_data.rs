@@ -103,10 +103,12 @@ fn simulate_subjects(
                 pk_only_times: Vec::new(),
                 pk_only_covariates: Vec::new(),
                 reset_times: Vec::new(),
+                reset_covariates: Vec::new(),
                 cens: vec![0; obs_times.len()],
                 occasions: Vec::new(),
                 obs_l2: Vec::new(),
                 dose_occasions: Vec::new(),
+                reset_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
             }
@@ -188,6 +190,7 @@ fn build_warfarin_model() -> CompiledModel {
         },
     );
     CompiledModel {
+        covariate_model: None,
         name: "warfarin".into(),
         pk_model: PkModel::OneCptOral,
         error_model: ErrorModel::Proportional,
@@ -322,6 +325,7 @@ fn generate_two_cpt_iv() {
         },
     );
     let model = CompiledModel {
+        covariate_model: None,
         name: "two_cpt_iv".into(),
         pk_model: PkModel::TwoCptIv,
         error_model: ErrorModel::Proportional,
@@ -453,6 +457,7 @@ fn generate_two_cpt_oral_cov() {
         },
     );
     let model = CompiledModel {
+        covariate_model: None,
         name: "two_cpt_oral_cov".into(),
         pk_model: PkModel::TwoCptOral,
         error_model: ErrorModel::Proportional,
@@ -559,10 +564,12 @@ fn generate_two_cpt_oral_cov() {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0; obs_times.len()],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         })
@@ -657,6 +664,7 @@ fn generate_mm_oral() {
         dose_attr_map: Default::default(),
     };
     let model = CompiledModel {
+        covariate_model: None,
         name: "mm_oral".into(),
         pk_model: PkModel::OneCptOral,
         error_model: ErrorModel::Proportional,

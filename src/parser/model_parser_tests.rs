@@ -2414,10 +2414,12 @@ fn tv_cov_population() -> crate::types::Population {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0],
             occasions: vec![1],
             obs_l2: Vec::new(),
             dose_occasions: vec![1],
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         }],
@@ -9115,10 +9117,12 @@ fn test_selected_error_block_sigma_cross_branch_covariance() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0, 0],
         occasions: vec![1, 1],
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -9184,10 +9188,12 @@ fn test_selected_error_obs_keys_dispatch() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0, 0],
         occasions: vec![1, 1],
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -18937,10 +18943,12 @@ fn covariate_nn_reads_time_varying_covariate_values() {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0; times.len()],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         }
@@ -19054,10 +19062,12 @@ fn covariate_nn_input_missing_from_data_is_rejected() {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         }],
@@ -20479,6 +20489,71 @@ fn every_arm_of_the_time_builtin_walk_sees_time() {
     }
 }
 
+// ── `present(COV)` — the data-presence predicate (#1111) ────────────────────
+//
+// A missing covariate is `NaN`, and `x/NaN` underflows to `0.0` in this engine
+// rather than blowing up, so a model that reads a covariate which may be
+// missing needs a guard or it silently zeroes a parameter. `COV == COV` says
+// that (NaN compares false against itself) but reads like a typo; `present(COV)`
+// is the same test, spelled. It is the guard `[covariate_model]` generates, so
+// it appears in text users audit against NONMEM.
+
+/// A one-compartment model whose `CL` is guarded by `cond`.
+fn present_model(cond: &str) -> String {
+    format!(
+        r#"
+[parameters]
+  theta TVCL(2.0, 0.1, 100.0)
+  theta TVV(10.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL = TVCL * (if ({cond}) (WT / 70) else 1.0)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[covariates]
+  WT continuous
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+    )
+}
+
+/// `CL` at the given `WT`, through the production parameter closure — so this
+/// exercises the compiled bytecode path the fit uses, not just the AST walker.
+fn cl_at(cond: &str, wt: f64) -> f64 {
+    let parsed = parse_full_model(&present_model(cond)).expect("model should parse");
+    let mut covariates = HashMap::new();
+    covariates.insert("WT".to_string(), wt);
+    (parsed.model.pk_param_fn)(&[2.0, 10.0], &[0.0], &covariates, 0.0).values[0]
+}
+
+#[test]
+fn present_is_true_for_a_value_and_false_for_a_missing_one() {
+    // WT = 140 → factor 2; WT missing → the neutral branch, NOT 0.
+    assert_eq!(cl_at("present(WT)", 140.0), 4.0);
+    assert_eq!(cl_at("present(WT)", f64::NAN), 2.0);
+}
+
+#[test]
+fn present_means_exactly_what_the_self_comparison_idiom_meant() {
+    // `present(COV)` replaced `COV == COV` in generated model text, so the two
+    // must agree everywhere — including on infinity, which is a value, not a
+    // gap in the data. (`is_finite` would have differed here.)
+    for wt in [140.0, 0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert_eq!(
+            cl_at("present(WT)", wt),
+            cl_at("WT == WT", wt),
+            "present(WT) and WT == WT disagree at WT = {wt}"
+        );
+    }
+}
+
 /// `TIME` and the slot-backed spellings are covered by **disjoint** flags, and
 /// only [`OdeRhsProgram::reads_model_time`] sees both. Pinned structurally so a
 /// caller pairing them by hand cannot drift back into #1124's gap.
@@ -20526,4 +20601,76 @@ fn reads_model_time_covers_every_spelling_and_the_flags_are_disjoint() {
     assert_eq!(flags("*(1.0 + 0.01*TAFD)"), (true, false, true), "TAFD");
     assert_eq!(flags("*(1.0 + 0.01*TAD)"), (true, false, true), "TAD");
     assert_eq!(flags(""), (false, false, false), "autonomous control");
+}
+
+/// As [`cl_at`], but with a *constant* then-branch — so a branch taken while
+/// `WT` is missing yields a number rather than propagating the `NaN` the test
+/// is not about.
+fn cl_at_const(cond: &str, wt: f64) -> f64 {
+    let src = present_model(cond).replace("(WT / 70)", "3.0");
+    let parsed = parse_full_model(&src).expect("model should parse");
+    let mut covariates = HashMap::new();
+    covariates.insert("WT".to_string(), wt);
+    (parsed.model.pk_param_fn)(&[2.0, 10.0], &[0.0], &covariates, 0.0).values[0]
+}
+
+#[test]
+fn present_negates_and_combines_like_any_other_condition() {
+    // `!present(...)` selects the other branch …
+    assert_eq!(cl_at_const("!present(WT)", 140.0), 2.0);
+    assert_eq!(cl_at_const("!present(WT)", f64::NAN), 6.0);
+    // … and it composes with `&&`, so a guard can carry a real test alongside
+    // the presence check — and short-circuits, so the comparison against a
+    // missing value never decides the branch on its own.
+    assert_eq!(cl_at_const("present(WT) && WT > 100", 140.0), 6.0);
+    assert_eq!(cl_at_const("present(WT) && WT > 100", 50.0), 2.0);
+    assert_eq!(cl_at_const("present(WT) && WT > 100", f64::NAN), 2.0);
+}
+
+#[test]
+fn present_accepts_an_expression_not_only_a_bare_name() {
+    // The argument is an ordinary expression, so a derived quantity can be
+    // tested for missingness too — `WT * 2` is NaN exactly when `WT` is.
+    assert_eq!(cl_at("present(WT * 2)", 140.0), 4.0);
+    assert_eq!(cl_at("present(WT * 2)", f64::NAN), 2.0);
+}
+
+#[test]
+fn present_is_only_special_in_condition_position() {
+    // A covariate that happens to be named `present` is not shadowed: the
+    // predicate is recognised only as `present(` at the head of a condition.
+    let src = r#"
+[parameters]
+  theta TVCL(2.0, 0.1, 100.0)
+  theta TVV(10.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL = TVCL * (if (present > 0) 2.0 else 1.0)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let parsed = parse_full_model(src).expect("a covariate called `present` still parses");
+    let mut covariates = HashMap::new();
+    covariates.insert("present".to_string(), 1.0);
+    let cl = (parsed.model.pk_param_fn)(&[2.0, 10.0], &[0.0], &covariates, 0.0).values[0];
+    assert_eq!(cl, 4.0);
+}
+
+#[test]
+fn an_unclosed_present_is_a_parse_error() {
+    let src = present_model("present(WT").replace("else 1.0)", "else 1.0)");
+    let e = parse_full_model(&src)
+        .map(|_| ())
+        .expect_err("unbalanced `present(` must not parse");
+    assert!(
+        e.to_lowercase().contains("present") || e.contains(')'),
+        "{e}"
+    );
 }

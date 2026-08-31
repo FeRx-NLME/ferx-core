@@ -554,6 +554,8 @@ pub(crate) fn check_simulation_data(
     population: &Population,
 ) -> Vec<Diagnostic> {
     let mut diags = check_unbound_theta_levels(model);
+    diags.extend(check_covariate_model_bound(model));
+    diags.extend(check_covariate_levels(model, population));
     diags.extend(check_covariates(model, population));
     diags.extend(check_kappa_weights(model, population));
     diags.extend(check_theta_gather_indices(model, population));
@@ -581,6 +583,8 @@ pub fn check_model_data_rule(
     iov_rule: &IovOccasionRule,
 ) -> Vec<Diagnostic> {
     let mut diags = check_finite_observations(population);
+    diags.extend(check_covariate_model_bound(model));
+    diags.extend(check_covariate_levels(model, population));
     diags.extend(check_covariates(model, population));
     diags.extend(check_per_cmt_scaling(model, population));
     diags.extend(check_per_cmt_error_model(model, population));
@@ -1517,6 +1521,87 @@ pub(crate) fn assert_modeled_doses_supported(model: &CompiledModel, population: 
 /// default — so `y[CMT=1] = A * TOTALLY_UNDEFINED_NAME` returned an all-zero
 /// structural prediction with no diagnostic. This closes that gap so `predict()`
 /// fails as loudly as `fit()` does, on the same message.
+/// A `[covariate_model]` relation stated with a symbolic statistic (#1111) is
+/// only buildable once a dataset has been summarised. Reaching a fit with one
+/// still unresolved means the covariate effect is simply *absent* from the
+/// compiled expression — and a missing covariate divides to `0.0` rather than
+/// `inf` in this engine, so nothing further down would have complained. Fail
+/// here instead, exactly as `check_unbound_theta_levels` does for #1064.
+fn check_covariate_model_bound(model: &CompiledModel) -> Vec<Diagnostic> {
+    match crate::api::assert_covariate_model_bound(model) {
+        Ok(()) => Vec::new(),
+        Err(msg) => {
+            vec![Diagnostic::error("E_COVSTAT_UNRESOLVED", msg).with_block("covariate_model")]
+        }
+    }
+}
+
+/// Reject a categorical `[covariate_model]` relation whose data carries a value
+/// outside its declared level set (#1111).
+///
+/// The generated factor is an `if (COV == l1) 1 + θ1 else if (COV == l2) … else 1`
+/// chain: the trailing `1` is the *reference* level's factor, so an unlisted
+/// code — a new site, a typo, a level that only shows up on dose records — is
+/// silently modelled as the reference rather than flagged. That changes the
+/// fitted model with nothing in the output to say so, which is exactly the
+/// class of silent-covariate-drop this block exists to prevent.
+fn check_covariate_levels(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+    let Some(spec) = model.covariate_model.as_ref() else {
+        return Vec::new();
+    };
+    let mut diags = Vec::new();
+    for rel in &spec.relations {
+        if !rel.form.is_categorical() {
+            continue;
+        }
+        // Declared levels = the reference (`ref = …`) plus one θ per contrast.
+        let mut declared: Vec<f64> = rel.thetas.iter().filter_map(|t| t.level).collect();
+        let Some(reference) = rel.resolved_center else {
+            // Still unbound — `check_covariate_model_bound` reports that.
+            continue;
+        };
+        declared.push(reference);
+        let mut unknown: Vec<f64> = Vec::new();
+        for subject in &population.subjects {
+            for v in crate::api::covariate_stats::subject_covariate_values(subject, &rel.covariate)
+            {
+                if !declared.contains(&v) && !unknown.contains(&v) {
+                    unknown.push(v);
+                }
+            }
+        }
+        if unknown.is_empty() {
+            continue;
+        }
+        unknown.sort_by(f64::total_cmp);
+        declared.sort_by(f64::total_cmp);
+        diags.push(
+            Diagnostic::error(
+                "E_COV_LEVEL_UNKNOWN",
+                format!(
+                    "[covariate_model]: `{} ~ {} categorical(...)` declares levels {declared:?} \
+                     (reference {reference}), but `{}` also takes {unknown:?} in the data. An \
+                     undeclared value takes the same factor as the reference level, so the fit \
+                     would silently model it as reference. List every level \
+                     (`{} categorical(levels = [...])`), use `levels = auto` to read them off \
+                     the data, or filter the rows out.",
+                    rel.parameter, rel.covariate, rel.covariate, rel.covariate
+                ),
+            )
+            .with_block("covariate_model"),
+        );
+    }
+    diags
+}
+
+/// The `predict()`/`simulate()` counterpart of [`check_covariate_model_bound`].
+pub(crate) fn assert_covariate_model_bound(model: &CompiledModel) {
+    panic_if_unsupported(
+        crate::api::assert_covariate_model_bound(model).err(),
+        "a [covariate_model] whose data-derived statistics were never bound",
+    );
+}
+
 pub(crate) fn assert_covariates_present(model: &CompiledModel, population: &Population) {
     panic_if_unsupported(
         first_error(&check_covariates(model, population)).err(),
@@ -3868,6 +3953,42 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
         }
     }
 
+    // 2e. `[covariate_model]` relations that need data-derived statistics
+    //     (#1111), *without* a dataset. With data present this is an
+    //     `E_COVSTAT_UNRESOLVED` error from `check_covariate_model_bound` —
+    //     the binding should have happened and did not. Without one, the model
+    //     is perfectly fine and simply not buildable yet, so it can only be a
+    //     warning. It must still be said: the desugared echo below is
+    //     suppressed in this state, and a silent "no errors" on a model whose
+    //     covariate effects are all still pending reads as "there are none".
+    if data_path.is_none() {
+        if let Some(spec) = parsed.model.covariate_model.as_ref() {
+            let pending: Vec<String> = spec
+                .unresolved()
+                .iter()
+                .map(|r| format!("`{} ~ {}`", r.parameter, r.covariate))
+                .collect();
+            if !pending.is_empty() {
+                diags.push(
+                    Diagnostic::warning(
+                        "W_COVSTAT_UNBOUND",
+                        format!(
+                            "[covariate_model]: {} still need data-derived statistics, so the \
+                             expression they build cannot be shown or fitted yet",
+                            pending.join(", ")
+                        ),
+                    )
+                    .with_block("covariate_model")
+                    .with_suggestion(
+                        "re-run with --data to resolve them, or state the centring constants \
+                         as literals and the θ explicitly (`=> NAME(init, lower, upper)`)"
+                            .to_string(),
+                    ),
+                );
+            }
+        }
+    }
+
     // 3. Data-dependent checks (only when a dataset is supplied). Read through
     //    the same covariate-aware chokepoint the fit uses, so `ferx check` and
     //    `fit()` apply identical covariate validation (declared columns present
@@ -3907,7 +4028,8 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
                 let binding = std::fs::read_to_string(model_path)
                     .map_err(|e| format!("Failed to re-read model file for level binding: {e}"))
                     .and_then(|model_text| {
-                        crate::api::bind_theta_levels(&mut parsed, &model_text, &mut population)
+                        crate::api::bind_theta_levels(&mut parsed, &model_text, &mut population)?;
+                        crate::api::bind_covariate_stats(&mut parsed, &model_text, &population)
                     });
                 if let Err(e) = binding {
                     diags.push(
@@ -3974,7 +4096,23 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
         }
     }
 
-    CheckReport::new(model_name, data, diags)
+    let mut report = CheckReport::new(model_name, data, diags);
+    // #1111: echo the expression the `[covariate_model]` block actually built.
+    // A declarative covariate model is otherwise unauditable — nothing in the
+    // file states the resolved centring constant, the missing-value guard, or
+    // where in the product the factor landed.
+    // Suppressed while any relation is still unresolved: those lines are the
+    // block *without* the pending covariate effects, so printing them under
+    // "as built from [covariate_model]" would state the opposite of the truth.
+    // `W_COVSTAT_UNBOUND` (or `E_COVSTAT_UNRESOLVED`, with data) says so.
+    if let Some(spec) = parsed.model.covariate_model.as_ref() {
+        if spec.unresolved().is_empty() {
+            report
+                .desugared_individual_parameters
+                .clone_from(&spec.desugared_individual_parameters);
+        }
+    }
+    report
 }
 
 /// Validate `model.output_columns` against known quantities, emitting

@@ -29,8 +29,42 @@ section of the SDLC for the versioning policy).
   write them package-qualified (`--features ferx-core/ci`). Consumers of the `ferx-core` crate —
   including the ferx-r wrapper, which patches the repo root — are unaffected: the root package is
   still `ferx-core`.
+- **A covariate column with no value for a subject now reads as `NaN`, not as a dropped key
+  (#1111).** Previously the key was simply absent from that subject's covariate map, and every
+  evaluation site resolves an absent covariate to `0.0` — so a subject whose `WT` column was `.`
+  on every row was fitted at `WT = 0`, indistinguishable from a genuine zero, and `present(WT)`
+  reported it as present. The reader now stores `NaN` and warns, naming the covariate and the
+  affected subjects, so the gap is either guarded with `present(...)`, imputed, or fails loudly.
 
 ### Added
+- **A `present(COV)` condition for covariates that may be missing (#1111).** A missing covariate
+  value is `NaN`, and division by it underflows to `0.0` here rather than erroring, so an
+  unguarded `(CRCL/100)^THETA` silently zeroes the parameter on a row with no `CRCL`.
+  `if (present(CRCL)) ... else 1.0` says the guard plainly; the equivalent `CRCL == CRCL` idiom
+  still works. Usable anywhere a condition is (`!present(X)`, `present(X) && X > 100`), and it is
+  what `[covariate_model]` wraps every generated factor in.
+- **A `[covariate_model]` block: covariate–parameter relationships declared as data (#1111).**
+  `CL ~ WT power(center = median)` desugars into exactly the classical
+  `[individual_parameters]` expression — with the theta declaration, the centering constant and a
+  missing-value guard filled in — so the OFV and estimates are identical to writing it by hand.
+  All five PsN `scm` states are expressible (`none`, `linear`, `hockey`, `exponential`, `power`,
+  plus `categorical` and an `expr("…")` escape hatch) with PsN's default inits and bounds;
+  `center`/`breakpoint`/`ref` accept a literal or a data-derived statistic (`median`, `mean`,
+  `min`, `max`, `mode`), and `[covariates]` gains `categorical(levels = [0, 1])` /
+  `levels = auto`. The relations are echoed on `FitResult.covariate_relations` and in the fit
+  YAML — each θ naming the categorical `level` it contrasts, each `expr(…)` relation carrying
+  the expression that ran, and a relation with no θ emitting `thetas: []` rather than a bare key.
+  Statistics summarise every event record (observations, doses, `EVID=2` markers, `EVID=3/4`
+  resets), so the default bounds cover the range the fit evaluates over. Centres that would break
+  their own form are refused up front: outside the observed range for the linear family (whose
+  default bounds would come back reversed), non-positive for `power`, zero for `linear_relative`;
+  so is a categorical value the block never declared, which would otherwise be modelled silently
+  as the reference level (`E_COV_LEVEL_UNKNOWN`). `ferx check` prints the desugared block. Each
+  relation owns its own θ (as in `scm`);
+  a θ shared across relations is still written classically. Relations are line-oriented and
+  independent,
+  so a covariate search rewrites this one block instead of doing surgery on an expression. See
+  `docs/model-file/covariate-model.qmd`.
 - **A CI-enforced public-API baseline for `ferx-core` (#1114).** `api/ferx-core-public-api.txt` is
   a committed snapshot of the crate's public surface; a CI job regenerates and diffs it, so any
   widening of the API fails until the baseline is updated in the same PR. Regenerate with
@@ -56,6 +90,22 @@ section of the SDLC for the versioning policy).
   is a `[mixture]` model — its classes are identified only up to relabelling, so averaging across
   replicates would mix them; use SIR for uncertainty on a mixture model instead (#1145).
   See `docs/tools/bootstrap.qmd`.
+- **`ferx bootstrap --resume` — pick an interrupted run back up (#1143).** The per-replicate files
+  (`raw_results.csv`, `included_individuals1.csv`, `included_keys1.csv`, `sample_keys1.csv`) are now
+  written as each replicate finishes rather than once at the end, so a run killed part-way leaves
+  everything it had already completed. `--resume` refits only the samples the directory does not
+  hold, and reuses the base fit rather than repeating it. Because each draw comes from the seed and
+  the replicate's own index, a resumed run reproduces the uninterrupted one exactly — not merely
+  statistically, which is what PsN's shared, order-dependent RNG can offer. A replicate whose fit
+  *errored* is carried forward by default, as in PsN; `--retry-failed` refits those instead, for a
+  failure that was a transient resource problem. Every run now writes `bootstrap_run.json`
+  recording its seed, options — including what the replicates were started from, so a resume
+  cannot mix replicates begun at the base fit with replicates begun at the model file's
+  estimates — and the hashes of the model and data files; a `--resume` whose inputs or options
+  disagree is refused, naming the field. A trailing row cut off by a hard kill is
+  dropped and that sample refitted. `raw_results.csv` now carries full round-trip precision rather
+  than ten fixed decimals, because a resumed run's replicates start from the base-fit estimates read
+  back out of it; the statistics files are unchanged. See `docs/tools/bootstrap.qmd`.
 - **`prepare_run` / `prepare_run_with_inits` (#1140)** — public "load a model and its dataset, but
   do not fit" entry points returning a `PreparedRun`. `run_model_with_data` is now implemented on
   top of them, so a tool and the CLI cannot diverge in how a model is loaded.
@@ -112,6 +162,22 @@ section of the SDLC for the versioning policy).
   path used by `[diffusion]` / EKF models still reaches the dense predictor with empty
   parameter slices, returning `p_obs = NaN` and `ipred = 0` for any `TAD`-reading right-hand
   side, with or without a lagtime (#1131).
+- **An EVID=3/4 reset now re-seeds `[odes] init(...)` from the reset row's own covariates
+  (#1133).** A reset row is a NONMEM data record — `$PK` runs at it — but ferx restarted the
+  episode using the *previous* record's covariate snapshot, so a covariate-driven
+  `init(state) = <expr>` began the new episode on a stale value. With `init(central) = 10*WT`
+  and `WT` stepping 70 → 140 at the reset, every post-reset prediction was a factor of two out
+  against NONMEM 7.6.0. Fixed in all four affected engines (the dense ODE predictor, the
+  analytic-sensitivity twin that supplies the FOCE/FOCEI gradient, the adaptive-dosing driver,
+  and its frozen-schedule replay verifier), so fitted parameters, `predict()`, and
+  `simulate_adaptive()` all move. Datasets with time-constant covariates, and models without an
+  `init(...)` seed, are unaffected. The same rule applies to the reset row's **occasion**: with an
+  `iov_column`, `$PK` at the reset runs under that row's own `OCC`, so a reset that opens a new
+  occasion re-seeds under the new occasion's κ rather than the previous record's — measured against
+  NONMEM in `nonmem_anchor/reset_init_snapshot_J.ctl` (42.0 under the reset row's occasion against
+  14.0 under the preceding record's). Note the remaining gaps: an **analytical** model using
+  `[initial_conditions]` still drops its baseline at the first reset instead of re-depositing it
+  (#1135), a reset row whose occasion carries no kappa group falls back to kappa = 0 inconsistently across engines (#1153), and an adaptive controller's decision-time covariate LOCF still skips reset rows (#1148).
 - **A steady-state dose with a lagtime is now seeded at the dose record, not equilibrated at the
   arrival (#1121).** Under time-varying covariates an `SS=1` dose carrying an `ALAG` had its
   periodic trough computed *at the lagged arrival*, entirely under the dose row's covariate

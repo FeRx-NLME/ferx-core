@@ -1802,6 +1802,7 @@ fn wire_to_fit_result(
 
     Ok(FitResult {
         restored_from_checkpoint: true,
+        covariate_relations: Vec::new(),
         method,
         method_chain,
         method_wall_times_secs: w.method_wall_times_secs,
@@ -2033,10 +2034,12 @@ mod tests {
                 pk_only_times: vec![],
                 pk_only_covariates: vec![],
                 reset_times: vec![],
+                reset_covariates: Vec::new(),
                 cens: vec![0; n_obs_each],
                 occasions: vec![],
                 obs_l2: Vec::new(),
                 dose_occasions: vec![],
+                reset_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
             });
@@ -2054,6 +2057,7 @@ mod tests {
     fn minimal_fit_result() -> FitResult {
         let n_eta = 2;
         FitResult {
+            covariate_relations: Vec::new(),
             restored_from_checkpoint: false,
             method: EstimationMethod::FoceI,
             method_chain: vec![EstimationMethod::FoceI],

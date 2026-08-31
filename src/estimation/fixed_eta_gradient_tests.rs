@@ -35,10 +35,12 @@ fn obs_nll_subject_grad_matches_obs_nll_sum_fd() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0, 0, 0],
         occasions: vec![],
         obs_l2: Vec::new(),
         dose_occasions: vec![],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -148,6 +150,7 @@ fn obs_nll_subject_grad_iov_matches_fd() {
 
     // Minimal IOV model: CL = TVCL·exp(ETA_CL + KAPPA_CL), V = TVV.
     let model = CompiledModel {
+        covariate_model: None,
         name: "iov_grad_test".into(),
         pk_model: PkModel::OneCptIv,
         error_model: ErrorModel::Proportional,
@@ -245,10 +248,12 @@ fn obs_nll_subject_grad_iov_matches_fd() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; 6],
         occasions: vec![1, 1, 1, 2, 2, 2],
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: Vec::new(),
     };
@@ -387,10 +392,12 @@ fn obs_nll_subject_grad_per_cmt_matches_fd() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; 6],
         occasions: vec![],
         obs_l2: Vec::new(),
         dose_occasions: vec![],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -529,10 +536,12 @@ fn obs_nll_subject_grad_block_sigma_cross_endpoint_matches_fd() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; 4],
         occasions: Vec::new(),
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };

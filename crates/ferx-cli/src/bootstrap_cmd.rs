@@ -48,6 +48,12 @@ estimates. Resampling is always over whole subjects.
 
   --summarize          recompute the statistics from an existing run directory's
                        raw_results.csv under different filters. Refits nothing.
+  --resume             continue an interrupted run in --directory, refitting only
+                       the samples its raw_results.csv does not already hold. The
+                       options and the model and data files must match the ones
+                       the directory was created with.
+  --retry-failed       with --resume, also refit the samples recorded as failed
+                       (default: keep the recorded failure, as PsN does)
 ";
 
 fn flag(args: &[String], name: &str) -> bool {
@@ -97,6 +103,8 @@ pub fn parse_options(
     o.run_base_model = !flag(args, "--no-run-base-model");
     o.keep_covariance = flag(args, "--keep-covariance");
     o.dofv = flag(args, "--dofv");
+    o.resume = flag(args, "--resume");
+    o.retry_failed = flag(args, "--retry-failed");
 
     o.skip_minimization_terminated = !flag(args, "--no-skip-minimization-terminated");
     o.skip_estimate_near_boundary = !flag(args, "--no-skip-estimate-near-boundary");
@@ -197,12 +205,27 @@ fn run_bootstrap_command(args: &[String], model_path: &str) -> Result<i32, Strin
             .unwrap_or_default()
     );
 
+    if options.resume {
+        eprintln!(
+            "Resuming the run in {}",
+            options
+                .directory
+                .as_ref()
+                .map(|d| d.display().to_string())
+                .unwrap_or_default()
+        );
+    }
+
     let started = std::time::Instant::now();
     let result = run_bootstrap(&prepared, &options)?;
     eprintln!(
-        "Fitted {} replicates in {:.1}s",
-        result.replicates.len(),
-        started.elapsed().as_secs_f64()
+        "Fitted {} replicates in {:.1}s{}",
+        result.replicates.len() - result.n_reused,
+        started.elapsed().as_secs_f64(),
+        match result.n_reused {
+            0 => String::new(),
+            n => format!("; reused {n} already on disk"),
+        }
     );
     print!("{}", report(&result, &options));
 
@@ -341,6 +364,18 @@ mod tests {
         assert_eq!(o.directory, Some(PathBuf::from("boot")));
         assert!(o.dofv);
         assert!(o.keep_covariance);
+        assert!(!o.resume && !o.retry_failed);
+    }
+
+    #[test]
+    fn the_recovery_flags_are_parsed() {
+        let o = parse_options(
+            &args(&["m.ferx", "--resume", "--retry-failed"]),
+            Some("m.ferx"),
+        )
+        .unwrap();
+        assert!(o.resume);
+        assert!(o.retry_failed);
     }
 
     #[test]
@@ -490,6 +525,7 @@ mod tests {
                 parameters,
             },
             n_estimated_parameters: 2,
+            n_reused: 0,
         }
     }
 
@@ -608,6 +644,57 @@ mod tests {
                 dir.path().to_str().unwrap()
             ])),
             0
+        );
+    }
+
+    /// `--resume` end to end through the CLI, including the "nothing to do"
+    /// case: resuming a finished run must be a no-op that exits 0, not an error.
+    #[test]
+    fn resume_runs_through_the_cli_and_records_its_manifest() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let base = |extra: &[&str]| {
+            let mut v = vec![
+                repo_path("examples/warfarin.ferx"),
+                "--data".to_string(),
+                repo_path("data/warfarin.csv"),
+                "--samples".to_string(),
+                "1".to_string(),
+                "--seed".to_string(),
+                "5".to_string(),
+                "--threads".to_string(),
+                "1".to_string(),
+                "--directory".to_string(),
+                dir.path().to_str().unwrap().to_string(),
+            ];
+            v.extend(extra.iter().map(|s| s.to_string()));
+            let mut all = vec!["ferx".to_string(), "bootstrap".to_string()];
+            all.extend(v);
+            all
+        };
+
+        assert_eq!(run(&base(&[])), 0);
+        assert!(dir.path().join("bootstrap_run.json").exists());
+        assert_eq!(run(&base(&["--resume"])), 0);
+
+        // A resume whose options contradict the directory is refused.
+        let mut mismatched = base(&["--resume"]);
+        let seed = mismatched.iter().position(|a| a == "--seed").unwrap();
+        mismatched[seed + 1] = "9999".to_string();
+        assert_eq!(run(&mismatched), 1);
+    }
+
+    #[test]
+    fn retry_failed_without_resume_exits_one() {
+        // It re-fits replicates a previous run recorded, so on its own it can
+        // only mean the user expected a resume they did not ask for.
+        assert_eq!(
+            run(&args(&[
+                &repo_path("examples/warfarin.ferx"),
+                "--data",
+                &repo_path("data/warfarin.csv"),
+                "--retry-failed",
+            ])),
+            1
         );
     }
 

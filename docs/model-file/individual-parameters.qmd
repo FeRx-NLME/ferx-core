@@ -51,6 +51,7 @@ name from quietly reading as zero and collapsing the formula.
 | `abs()` | `abs(ETA_CL)` |
 | `min(a, b)`, `max(a, b)` | `max(TVCL * WT / 70, 0.1)` |
 | `clamp(x, lo, hi)` | `clamp(ACR20, 0.01, 0.99)` |
+| `present(x)` (condition only) | `if (present(WT)) (WT/70)^0.75 else 1.0` |
 | Parentheses | `TVCL * (WT/70)^0.75` |
 | Comparisons (in `if` conditions) | `WT > 70`, `SEX == 1`, `AGE != 0` |
 | Logical (in `if` conditions) | `&&` (and), `\|\|` (or), `!` (not) |
@@ -131,6 +132,35 @@ operators (`<`, `<=`, `>`, `>=`, `==`, `!=`) and logical operators (`&&`,
 
 The inline form produces a value and can appear anywhere an expression is
 allowed. Both `then` and `else` branches are required.
+
+### `present(...)` — guarding a covariate that may be missing
+
+A missing covariate value (blank, `.`, `NA` in the data) is carried as `NaN`.
+`present(X)` is true whenever `X` is not missing:
+
+```
+[individual_parameters]
+  CL = TVCL * (if (present(CRCL)) (CRCL / 100)^THETA_CRCL else 1.0) * exp(ETA_CL)
+```
+
+Guard any covariate that can be missing. Without the guard the factor above
+evaluates to `0` on a row with no `CRCL` — **not** to an error or a `NaN` you
+would notice — because division by a missing value underflows to zero here. The
+parameter is silently zeroed for that subject.
+
+`present(...)` takes any expression (`present(WT * 2)`), negates (`!present(WT)`)
+and combines (`present(WT) && WT > 100`) like any other condition. It is
+equivalent to the older idiom `X == X`, which works for the same reason (`NaN`
+compares false against itself) but reads like a typo.
+
+It is a *condition*, not a value-returning function, so `TVCL * present(WT)` is
+not valid — deliberately: as arithmetic it would produce exactly the silently
+zeroed parameter the guard exists to prevent. A covariate column actually named
+`present` is unaffected; the name is only special immediately followed by `(`
+at the head of a condition.
+
+The [`[covariate_model]`](covariate-model.qmd) block emits this guard around
+every factor it generates.
 
 ### Time-dependent parameters
 
@@ -319,6 +349,12 @@ For example, in `CL = TVCL * (WT/70)^0.75 * exp(ETA_CL)`:
 - `TVCL` matches a theta parameter
 - `ETA_CL` matches an omega parameter
 - `WT` matches neither, so it is treated as a covariate column
+
+A covariate factor like the one above can also be declared as data in
+[`[covariate_model]`](covariate-model.qmd) — `CL ~ WT power(center = 70)` —
+which desugars into exactly this expression, with the theta declaration, the
+PsN `scm` default bounds and a missing-value guard filled in. That form is worth
+reaching for when a covariate search or an agent will be rewriting the model.
 
 ### Forgetting an omega declaration
 

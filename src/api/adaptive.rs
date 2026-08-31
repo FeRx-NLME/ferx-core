@@ -1014,6 +1014,29 @@ fn check_event_pk_records(
             ));
         }
     }
+    // EVID=3/4 rows (#1133). This one is exactly the case the guard exists for: the driver
+    // and the frozen-replay verifier BOTH read `event_pk.reset[r]` to re-seed
+    // `[odes] init(...)`, so a wrong covariate or κ in the builder is applied identically on
+    // both sides and the replay reports bit-equality on a wrong trajectory.
+    if got.reset.len() != subject.reset_times.len() {
+        return Err(format!(
+            "event_pk.reset has {} entr(ies) but the subject has {} EVID=3/4 record(s) (#1133)",
+            got.reset.len(),
+            subject.reset_times.len()
+        ));
+    }
+    for r in 0..subject.reset_times.len() {
+        let t = subject.reset_times[r];
+        let want = (model.pk_param_fn)(theta, eta_at(t), subject.reset_cov(r), t);
+        if !pk_bits_eq(&want, &got.reset[r]) {
+            return Err(format!(
+                "event_pk.reset[{r}] (EVID=3/4 record at t={t}) diverges from an independent \
+                 re-derivation — a wrong reset-row covariate or occasion κ, which the driver \
+                 and the frozen-schedule replay would both apply and neither could catch \
+                 (#748/#1133)"
+            ));
+        }
+    }
     Ok(())
 }
 

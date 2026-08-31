@@ -435,6 +435,7 @@ fn stored_run(dir: &std::path::Path) {
         subject_ids: Vec::new(),
         summary,
         n_estimated_parameters: 7,
+        n_reused: 0,
     };
     output::write_all(dir, &result, &options).expect("write");
 }
@@ -537,4 +538,272 @@ fn the_covstep_filters_are_allowed_when_re_summarizing() {
         "a fresh run must refuse it"
     );
     assert!(resummarize(dir.path(), &options).is_ok());
+}
+
+// ── --resume (#1143) ────────────────────────────────────────────────────────
+
+fn resume_options(dir: &std::path::Path) -> BootstrapOptions {
+    BootstrapOptions {
+        samples: 4,
+        resume: true,
+        directory: Some(dir.to_path_buf()),
+        ..BootstrapOptions::default()
+    }
+}
+
+fn resume_manifest(options: &BootstrapOptions) -> RunManifest {
+    RunManifest::new(
+        options,
+        Some("model".to_string()),
+        Some("data".to_string()),
+        &["CL".to_string()],
+    )
+}
+
+/// A directory as an interrupted run would have left it: samples `1..=through`
+/// recorded, the rest never fitted.
+fn interrupted_run(dir: &std::path::Path, through: usize, options: &BootstrapOptions) {
+    let one = |index: usize, estimate: f64| ReplicateResult {
+        index,
+        estimates: vec![estimate],
+        standard_errors: None,
+        ofv: 100.0 + index as f64,
+        converged: true,
+        estimate_near_boundary: false,
+        covariance_step_successful: false,
+        covariance_step_warnings: false,
+        seconds: 0.1,
+        error: None,
+        delta_ofv: None,
+    };
+    let replicates: Vec<ReplicateResult> = (1..=through).map(|i| one(i, 10.0 + i as f64)).collect();
+    let names = vec!["CL".to_string()];
+    let summary = summary::summarize(&names, None, &replicates, options);
+    let result = BootstrapResult {
+        parameter_names: names,
+        original: Some(one(0, 9.0)),
+        replicates,
+        draws: Vec::new(),
+        subject_ids: Vec::new(),
+        summary,
+        n_estimated_parameters: 1,
+        n_reused: 0,
+    };
+    std::fs::create_dir_all(dir).expect("dir");
+    output::write_raw_results(&dir.join("raw_results.csv"), &result, options).expect("write");
+    resume_manifest(options)
+        .write(&journal::manifest_path(dir))
+        .expect("write manifest");
+}
+
+#[test]
+fn resume_reuses_the_completed_samples_and_the_base_fit() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let options = resume_options(dir.path());
+    interrupted_run(dir.path(), 2, &options);
+
+    let (original, kept) =
+        load_resumable(dir.path(), &resume_manifest(&options), &options).expect("resume loads");
+    assert_eq!(
+        kept.iter().map(|r| r.index).collect::<Vec<_>>(),
+        vec![1, 2],
+        "samples 3 and 4 were never fitted and must be refitted"
+    );
+    // The base fit is reused rather than repeated: `--update-inits` starts every
+    // replicate from its estimates, so refitting it would start the new
+    // replicates from a different point than the ones already on disk did.
+    let original = original.expect("the sample=0 row is reused");
+    assert!((original.estimates[0] - 9.0).abs() < 1e-9);
+}
+
+#[test]
+fn resume_into_a_complete_run_refits_nothing() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let options = resume_options(dir.path());
+    interrupted_run(dir.path(), 4, &options);
+
+    let (_, kept) =
+        load_resumable(dir.path(), &resume_manifest(&options), &options).expect("resume loads");
+    assert_eq!(kept.len(), 4, "every sample is already on disk");
+}
+
+/// A recorded failure is kept by default — PsN's answer, and the right one when
+/// the failure is deterministic. `--retry-failed` is the other half of the
+/// choice, for a failure that was a transient resource problem instead.
+#[test]
+fn a_failed_replicate_is_kept_by_default_and_refitted_with_retry_failed() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut options = resume_options(dir.path());
+    interrupted_run(dir.path(), 3, &options);
+
+    // Mark sample 2 as failed, the way `run_one` records a `fit` error.
+    let path = dir.path().join("raw_results.csv");
+    let text = std::fs::read_to_string(&path).expect("read");
+    let patched: Vec<String> = text
+        .lines()
+        .map(|l| {
+            if l.starts_with("2,") {
+                format!("{l}the optimizer diverged")
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    std::fs::write(&path, patched.join("\n") + "\n").expect("write");
+
+    let (_, kept) =
+        load_resumable(dir.path(), &resume_manifest(&options), &options).expect("resume loads");
+    assert_eq!(
+        kept.iter().map(|r| r.index).collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "the failure is carried forward, not refitted"
+    );
+    assert!(kept[1].error.is_some());
+
+    options.retry_failed = true;
+    let (_, kept) =
+        load_resumable(dir.path(), &resume_manifest(&options), &options).expect("resume loads");
+    assert_eq!(
+        kept.iter().map(|r| r.index).collect::<Vec<_>>(),
+        vec![1, 3],
+        "--retry-failed drops the failure so the sample is refitted"
+    );
+}
+
+/// Resuming into a directory another run wrote would label one model's
+/// estimates with another model's parameter names — a corruption nothing
+/// downstream could detect, because the file would still parse.
+#[test]
+fn resuming_a_mismatched_directory_is_refused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let options = resume_options(dir.path());
+    interrupted_run(dir.path(), 2, &options);
+
+    let asked_for = RunManifest {
+        seed: 999,
+        ..resume_manifest(&options)
+    };
+    let err = load_resumable(dir.path(), &asked_for, &options).unwrap_err();
+    assert!(err.contains("--seed"), "{err}");
+}
+
+/// The columns of `raw_results.csv` are checked against the manifest as well,
+/// so a hand-edited or foreign file is caught even when neither input could be
+/// hashed.
+#[test]
+fn resuming_a_directory_whose_columns_disagree_is_refused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let options = resume_options(dir.path());
+    interrupted_run(dir.path(), 2, &options);
+    let path = dir.path().join("raw_results.csv");
+    let text = std::fs::read_to_string(&path).expect("read");
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    lines[0] = lines[0].replace("CL,error", "CL,V,error");
+    // Every row must stay full width, or the tail tolerance would fire first.
+    for line in lines.iter_mut().skip(1) {
+        let mut fields: Vec<&str> = line.split(',').collect();
+        fields.insert(fields.len() - 1, "1.0");
+        *line = fields.join(",");
+    }
+    std::fs::write(&path, lines.join("\n") + "\n").expect("write");
+
+    let err = load_resumable(dir.path(), &resume_manifest(&options), &options).unwrap_err();
+    assert!(err.contains("different run"), "{err}");
+}
+
+#[test]
+fn resuming_a_directory_with_no_run_in_it_is_refused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let options = resume_options(dir.path());
+    let err = load_resumable(dir.path(), &resume_manifest(&options), &options).unwrap_err();
+    assert!(err.contains("raw_results.csv"), "{err}");
+
+    // A raw_results.csv with no manifest beside it is equally unusable: there is
+    // nothing to check the directory against.
+    interrupted_run(dir.path(), 1, &options);
+    std::fs::remove_file(journal::manifest_path(dir.path())).expect("remove");
+    let err = load_resumable(dir.path(), &resume_manifest(&options), &options).unwrap_err();
+    assert!(err.contains("bootstrap_run.json"), "{err}");
+}
+
+/// Changing where the replicates *start* is the subtle mismatch, and the one
+/// that would otherwise pass every other check.
+///
+/// Interrupt a default run and resume it with `--no-update-inits`: every reused
+/// replicate was started from the base fit, every refitted one starts from the
+/// model file's estimates. Both halves are valid fits; the file holding them is
+/// a bootstrap of neither, and nothing about it looks wrong.
+#[test]
+fn a_resume_that_moves_the_replicate_starting_point_is_refused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut options = resume_options(dir.path());
+    interrupted_run(dir.path(), 2, &options);
+
+    options.update_inits = false;
+    let err = load_resumable(dir.path(), &resume_manifest(&options), &options).unwrap_err();
+    assert!(err.contains("--update-inits"), "{err}");
+
+    // And the inverse: a run started from the model file, resumed asking for
+    // the base fit's estimates.
+    let other = tempfile::tempdir().expect("temp dir");
+    let mut options = resume_options(other.path());
+    options.update_inits = false;
+    interrupted_run(other.path(), 2, &options);
+
+    options.update_inits = true;
+    let err = load_resumable(other.path(), &resume_manifest(&options), &options).unwrap_err();
+    assert!(err.contains("--update-inits"), "{err}");
+}
+
+/// `--no-run-base-model` moves the starting point too — and changes whether a
+/// `sample = 0` row belongs in the file at all — so it is pinned in its own
+/// right rather than left to the initialization-mode check.
+#[test]
+fn a_resume_that_adds_or_drops_the_base_model_is_refused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut options = resume_options(dir.path());
+    interrupted_run(dir.path(), 2, &options);
+
+    options.run_base_model = false;
+    options.update_inits = false;
+    let err = load_resumable(dir.path(), &resume_manifest(&options), &options).unwrap_err();
+    assert!(err.contains("--run-base-model"), "{err}");
+}
+
+/// When the directory really was written without a base model, a stored
+/// `sample = 0` row is not carried forward — it would reappear as a row the
+/// caller asked not to have. The manifest refuses that transition first, so this
+/// covers a library caller that built its own manifest.
+#[test]
+fn a_run_without_a_base_model_drops_a_stored_base_fit() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let options = BootstrapOptions {
+        run_base_model: false,
+        update_inits: false,
+        ..resume_options(dir.path())
+    };
+    interrupted_run(dir.path(), 2, &options);
+
+    let (original, kept) =
+        load_resumable(dir.path(), &resume_manifest(&options), &options).expect("resume loads");
+    assert!(original.is_none());
+    assert_eq!(kept.len(), 2);
+}
+
+#[test]
+fn resume_needs_a_directory_and_retry_failed_needs_resume() {
+    let bare = BootstrapOptions {
+        resume: true,
+        ..BootstrapOptions::default()
+    };
+    let err = bare.validate_for_run().unwrap_err();
+    assert!(err.contains("--directory"), "{err}");
+
+    let dangling = BootstrapOptions {
+        retry_failed: true,
+        directory: Some(std::path::PathBuf::from("run")),
+        ..BootstrapOptions::default()
+    };
+    let err = dangling.validate_for_run().unwrap_err();
+    assert!(err.contains("--resume"), "{err}");
 }

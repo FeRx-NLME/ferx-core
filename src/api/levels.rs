@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 
 use crate::parser::model_parser::{
-    level_index_column, parse_full_model_bound, LevelBinding, LevelBindings, LevelBlockDecl,
+    level_index_column, parse_full_model_with, LevelBinding, LevelBindings, LevelBlockDecl,
     LevelContrast,
 };
 use crate::types::{ParsedModel, Population, Subject};
@@ -75,7 +75,12 @@ pub fn bind_theta_levels(
     }
 
     let model_name = parsed.model.name.clone();
-    let rebound = parse_full_model_bound(model_text, &bindings)?;
+    // Re-parse with *every* binding this model has been given, not just the
+    // level ones: a model that also declares `[covariate_model]` statistics
+    // (#1111) may have had those bound already, and re-parsing with the level
+    // bindings alone would drop them.
+    parsed.bindings.levels = bindings;
+    let rebound = parse_full_model_with(model_text, &parsed.bindings)?;
     parsed.model = rebound.model;
     parsed.model.name = model_name;
     Ok(())
@@ -370,6 +375,12 @@ fn write_index_column(
             for m in subject.pk_only_covariates.iter_mut() {
                 m.insert(column.clone(), first);
             }
+            // EVID=3/4 rows too (#1133): their snapshot feeds the `[odes] init(...)`
+            // re-seed, so a missing column there reads as `0.0` at the reset while every
+            // other record sees the real 1-based index.
+            for m in subject.reset_covariates.iter_mut() {
+                m.insert(column.clone(), first);
+            }
             continue;
         }
 
@@ -385,6 +396,9 @@ fn write_index_column(
         if subject.pk_only_covariates.is_empty() {
             subject.pk_only_covariates =
                 vec![subject.covariates.clone(); subject.pk_only_times.len()];
+        }
+        if subject.reset_covariates.is_empty() {
+            subject.reset_covariates = vec![subject.covariates.clone(); subject.reset_times.len()];
         }
         for (j, m) in subject.obs_covariates.iter_mut().enumerate() {
             m.insert(column.clone(), obs_index.get(j).copied().unwrap_or(first));
@@ -413,6 +427,13 @@ fn write_index_column(
         let pk_only_times = subject.pk_only_times.clone();
         for (i, m) in subject.pk_only_covariates.iter_mut().enumerate() {
             let t = pk_only_times.get(i).copied().unwrap_or(0.0);
+            m.insert(column.clone(), locf(t));
+        }
+        // Reset rows take the same LOCF-of-observations rule as dose and EVID=2 rows
+        // (#1133); the level is a property of an observation either way.
+        let reset_times = subject.reset_times.clone();
+        for (i, m) in subject.reset_covariates.iter_mut().enumerate() {
+            let t = reset_times.get(i).copied().unwrap_or(0.0);
             m.insert(column.clone(), locf(t));
         }
     }

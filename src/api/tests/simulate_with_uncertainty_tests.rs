@@ -28,6 +28,7 @@ fn tiny_model() -> CompiledModel {
         mixture: None,
     };
     CompiledModel {
+        covariate_model: None,
         name: "uncertainty_smoke".into(),
         pk_model: PkModel::OneCptIv,
         error_model: ErrorModel::Proportional,
@@ -192,10 +193,12 @@ fn tte_cov_snapshot_pop(id: &str, snaps: Vec<HashMap<String, f64>>) -> Populatio
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; n],
         occasions: Vec::new(),
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: Vec::new(),
     };
@@ -360,10 +363,12 @@ fn tiny_population() -> Population {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0, 0, 0],
             occasions: vec![1, 1, 1],
             obs_l2: Vec::new(),
             dose_occasions: vec![1],
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         })
@@ -386,6 +391,7 @@ fn synthetic_fit(template: &ModelParameters) -> FitResult {
     let n_packed = crate::estimation::parameterization::packed_len(template);
     let cov = DMatrix::identity(n_packed, n_packed) * 0.01;
     FitResult {
+        covariate_relations: Vec::new(),
         restored_from_checkpoint: false,
         method: EstimationMethod::FoceI,
         method_chain: vec![EstimationMethod::FoceI],

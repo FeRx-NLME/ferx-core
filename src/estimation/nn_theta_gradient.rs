@@ -283,7 +283,11 @@ fn static_nn_input_map<'a>(
         .obs_covariates
         .iter()
         .chain(subject.dose_covariates.iter())
-        .chain(subject.pk_only_covariates.iter());
+        .chain(subject.pk_only_covariates.iter())
+        // EVID=3/4 rows are a covariate source too (#1133): a covariate that steps only on
+        // a reset row still reaches the NN through `reset_cov(r)`, so calling the input map
+        // static because the other three agree would take the θ-gradient at the wrong map.
+        .chain(subject.reset_covariates.iter());
 
     let mut representative = base;
     let mut seen_snapshot = false;

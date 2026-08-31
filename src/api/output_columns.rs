@@ -616,9 +616,12 @@ pub(crate) fn compute_extra_output_columns(
                                 // asks. An `[odes]` RHS that reads `TAD`/`TAFD`/`T`/
                                 // `TIME` does *not* make `pk_param_fn` time-dependent:
                                 // the clock it reads is the solver's, and the dense
-                                // driver sets its own per-segment `TAD` anchor
-                                // (`integrate_segment`, with #1073's finite
-                                // first-arrival fallback). For such a model the `t=0`
+                                // driver sets its own `TAD` anchor at every segment
+                                // boundary — `apply_segment_boundary` calling
+                                // `tad_anchor`, which carries #1073's finite
+                                // first-arrival fallback. (Not `integrate_segment`:
+                                // that is the *event-driven* engine's, and the dense
+                                // driver never calls it.) For such a model the `t=0`
                                 // snapshot is exact and the dense arm below returns a
                                 // correct number, so widening to
                                 // `pk::model_uses_time_anywhere` here would replace it

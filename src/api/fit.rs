@@ -101,6 +101,11 @@ pub fn fit_from_files(
         let model_text = std::fs::read_to_string(model_path)
             .map_err(|e| format!("Failed to re-read model file for level binding: {e}"))?;
         crate::api::bind_theta_levels(&mut parsed, &model_text, &mut population)?;
+        // #1111: resolve any symbolic `[covariate_model]` statistic
+        // (`center = median`, `ref = mode`, `levels = auto`) against the same
+        // dataset. `assert_covariate_model_bound` names this entry point as one
+        // that binds them, so it has to actually do it.
+        crate::api::bind_covariate_stats(&mut parsed, &model_text, &population)?;
     }
     let mut model = parsed.model;
     model.bloq_method = opts.bloq_method;
@@ -552,6 +557,10 @@ pub fn fit(
             !s.dose_covariates.is_empty()
                 || !s.obs_covariates.is_empty()
                 || !s.pk_only_covariates.is_empty()
+                // EVID=3/4 snapshots count too (#1133) — `prune_irrelevant_tv_covariates`
+                // now scans and clears them, so a subject whose only populated vector is
+                // `reset_covariates` must reach it rather than being gated out here.
+                || !s.reset_covariates.is_empty()
         });
         if needs_prune || needs_dv_log || derive_occ {
             let mut p = population.clone();
@@ -1919,6 +1928,13 @@ fn fit_inner(
         // grid-integral path also returns NaN for affected sessions.
         // ODE models with resets are handled correctly (ode_dense_solve_states applies
         // the reset as a break-point); this warning is analytical-only.
+        //
+        // One nuance for a TV-covariate ODE subject, already inside
+        // W_DERIVED_CMT_TV_ODE's scope above: that state pass is frozen at the
+        // first-observation snapshot throughout, so an `[odes] init(...)` re-seeded at a
+        // reset uses that snapshot rather than the reset row's own, while `ipred` uses the
+        // reset row's (#1133). Self-consistent within the pass and covered by the warning,
+        // but it means the two can differ by the covariate ratio at the reset.
         if model.ode_spec.is_none() && population.subjects.iter().any(|s| s.has_resets()) {
             warnings.push(
                 "W_DERIVED_CMT_RESET_ANALYTICAL: analytical model with EVID=3/4 \
@@ -2261,6 +2277,9 @@ fn fit_inner(
 
     let mut fit_result = FitResult {
         restored_from_checkpoint: false,
+        // #1111: the `[covariate_model]` echo, joined to the θ this fit
+        // estimated. Filled in just below, once `fit_result` owns the θ vector.
+        covariate_relations: Vec::new(),
         method: final_method,
         method_chain: chain.clone(),
         method_wall_times_secs,
@@ -2471,6 +2490,17 @@ fn fit_inner(
         fit_result.warnings.push(msg);
         fit_result.warnings_structured.push(entry);
     }
+
+    // The `[covariate_model]` echo (#1111): the relations as declared, joined to
+    // the θ this fit estimated and their standard errors. Built here rather than
+    // in the literal above because it reads the assembled θ vector.
+    fit_result.covariate_relations = crate::api::covariate_relation_estimates(
+        model,
+        &fit_result.theta_names,
+        &fit_result.theta,
+        fit_result.se_theta.as_ref(),
+        &fit_result.theta_fixed,
+    );
 
     Ok(fit_result)
 }

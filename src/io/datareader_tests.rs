@@ -117,6 +117,7 @@ fn declared_covariate_column_missing_is_rejected() {
     // error (a silently-vanished covariate would evaluate to nothing).
     let f = write_csv("ID,TIME,DV,EVID,AMT\n1,0,.,1,100\n1,1,5.0,0,.\n");
     let decls = vec![CovariateDecl {
+        levels: None,
         name: "WT".to_string(),
         kind: CovariateKind::Continuous,
     }];
@@ -126,11 +127,41 @@ fn declared_covariate_column_missing_is_rejected() {
 }
 
 #[test]
+fn a_wholly_missing_covariate_reads_as_nan_not_zero() {
+    // The column exists (so `check_covariates` passes) but subject 2 has `.`
+    // in every row. Leaving the key absent made it resolve to the covariate
+    // map's `0.0` default at every evaluation site, so `(WT/70)^0.75` silently
+    // contributed `0` for that subject — and `present(WT)`, which is `!is_nan`,
+    // read it as present. `NaN` is what makes both of those correct.
+    let f = write_csv(
+        "ID,TIME,DV,EVID,AMT,WT\n\
+         1,0,.,1,100,70\n\
+         1,1,5.0,0,.,70\n\
+         2,0,.,1,100,.\n\
+         2,1,4.0,0,.,.\n",
+    );
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+    assert_eq!(pop.subjects[0].covariates["WT"], 70.0);
+    assert!(
+        pop.subjects[1].covariates["WT"].is_nan(),
+        "a subject with no finite value must not read as 0.0"
+    );
+    assert!(
+        pop.warnings
+            .iter()
+            .any(|w| w.contains("covariate WT has no value for 1 of 2 subjects")),
+        "the gap must be reported: {:?}",
+        pop.warnings
+    );
+}
+
+#[test]
 fn declared_covariate_non_numeric_value_is_rejected() {
     // A declared covariate must be numerically coded; a text value is a hard
     // error rather than a silent 0.0 that would bias the fit.
     let f = write_csv("ID,TIME,DV,EVID,AMT,WT\n1,0,.,1,100,heavy\n1,1,5.0,0,.,heavy\n");
     let decls = vec![CovariateDecl {
+        levels: None,
         name: "WT".to_string(),
         kind: CovariateKind::Continuous,
     }];
@@ -311,6 +342,7 @@ fn no_evid_inference_mirrored_in_covariate_table() {
                    1,1,5.0,.,0,70\n";
     let f = write_csv(csv);
     let decls = vec![CovariateDecl {
+        levels: None,
         name: "WT".to_string(),
         kind: CovariateKind::Continuous,
     }];
@@ -708,6 +740,7 @@ fn test_filter_on_undeclared_covariate_via_declared_path() {
                    4,1,3.5,0,.,1,85,2\n";
     let f = write_csv(csv);
     let decls = vec![CovariateDecl {
+        levels: None,
         name: "WT".to_string(),
         kind: CovariateKind::Continuous,
     }];
@@ -1517,6 +1550,110 @@ fn test_evid2_rows_skipped_when_no_tv_covariates() {
 }
 
 #[test]
+fn test_reset_rows_captured_with_their_own_covariates() {
+    // #1133: an EVID=3/4 row is a data record — `$PK` runs at it — so its own covariate
+    // values must be captured, not just the reset time. Two resets, each carrying a `CR`
+    // that differs from both its predecessor and its successor, so a snapshot taken one
+    // row early or one row late is visible in the assertion rather than coincidentally
+    // equal.
+    let csv = "ID,TIME,DV,EVID,MDV,AMT,CR\n\
+                   1,0,.,1,1,100,1.0\n\
+                   1,2,5.0,0,0,.,1.0\n\
+                   1,4,.,3,1,0,2.5\n\
+                   1,6,5.0,0,0,.,4.0\n\
+                   1,8,.,4,1,50,7.5\n\
+                   1,10,5.0,0,0,.,9.0\n";
+    let f = write_csv(csv);
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+    let subj = &pop.subjects[0];
+
+    assert_eq!(subj.reset_times, vec![4.0, 8.0]);
+    assert_eq!(subj.reset_covariates.len(), 2);
+    // Parallel to `reset_times`, so the accessor pairs each reset with its own row.
+    assert_eq!(subj.reset_cov(0)["CR"], 2.5);
+    assert_eq!(subj.reset_cov(1)["CR"], 7.5);
+    // EVID=4 also records its dose; that dose row's snapshot is the same row's values.
+    assert_eq!(subj.doses.len(), 2);
+    assert_eq!(subj.doses[1].time, 8.0);
+    assert_eq!(subj.dose_covariates[1]["CR"], 7.5);
+}
+
+#[test]
+fn test_reset_covariates_skipped_when_no_tv_covariates() {
+    // Mirrors `test_evid2_rows_skipped_when_no_tv_covariates`: with time-constant
+    // covariates every snapshot is the subject-static map, so the reader builds none and
+    // `reset_cov` falls back to it. Locks in that the allocation is skipped and that the
+    // fallback — not an empty map — is what consumers see.
+    let csv = "ID,TIME,DV,EVID,MDV,AMT,WT\n\
+                   1,0,.,1,1,100,70\n\
+                   1,4,.,3,1,0,70\n\
+                   1,10,5.0,0,0,.,70\n";
+    let f = write_csv(csv);
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+    let subj = &pop.subjects[0];
+
+    assert!(!subj.has_tv_covariates());
+    assert_eq!(subj.reset_times, vec![4.0]);
+    assert!(subj.reset_covariates.is_empty());
+    assert_eq!(subj.reset_cov(0)["WT"], 70.0);
+}
+
+#[test]
+fn test_reset_rows_capture_their_own_occasion() {
+    // #1133: an EVID=3/4 row is a data record, so NONMEM runs `$PK` at it under THAT
+    // row's `OCC` — measured in `nonmem_anchor/reset_init_snapshot_J.ctl`, where a reset
+    // carrying `OCC = 2` between `OCC = 1` records seeds `A_0` under occasion 2 (42.0)
+    // and not under the preceding record's occasion 1 (14.0).
+    //
+    // The reset row's `OCC` differs from BOTH its predecessor (1) and its successor (3),
+    // so a snapshot taken one row early or one row late is visible here rather than
+    // coincidentally equal — the same non-degeneracy the covariate test above uses. The
+    // second reset repeats an occasion already seen, which is the ordinary case.
+    let csv = "ID,TIME,DV,EVID,MDV,AMT,OCC\n\
+                   1,0,.,1,1,100,1\n\
+                   1,2,5.0,0,0,.,1\n\
+                   1,4,.,3,1,0,2\n\
+                   1,6,5.0,0,0,.,3\n\
+                   1,8,.,4,1,50,3\n\
+                   1,10,5.0,0,0,.,3\n";
+    let f = write_csv(csv);
+    let pop = read_nonmem_csv(f.path(), None, Some("OCC")).unwrap();
+    let subj = &pop.subjects[0];
+
+    assert_eq!(subj.reset_times, vec![4.0, 8.0]);
+    // Parallel to `reset_times`, and each reset carries its OWN row's label.
+    assert_eq!(subj.reset_occasions, vec![2, 3]);
+    // The neighbours differ, so this is not the predecessor's or the successor's value:
+    // the record before the first reset is OCC=1 and the one after is OCC=3.
+    assert_eq!(subj.occasions[0], 1);
+    assert_eq!(subj.occasions[1], 3);
+    // EVID=4 records its dose from the same row, so the two labels agree there.
+    assert_eq!(subj.dose_occasions.len(), 2);
+    assert_eq!(subj.dose_occasions[1], 3);
+}
+
+#[test]
+fn test_reset_occasions_skipped_without_an_iov_column() {
+    // Gated exactly like `occasions` / `dose_occasions`: with no `iov_column` the reader
+    // stores no occasion labels at all, and `reset_occasions` must be empty rather than a
+    // vector of zeros — `pk::reset_row_occasion` distinguishes "no label stored" (fall
+    // back to the neighbour scan) from "label is 0" by emptiness, so a zero-filled vector
+    // would silently pin every reset to occasion 0.
+    let csv = "ID,TIME,DV,EVID,MDV,AMT,OCC\n\
+                   1,0,.,1,1,100,1\n\
+                   1,4,.,3,1,0,2\n\
+                   1,10,5.0,0,0,.,3\n";
+    let f = write_csv(csv);
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+    let subj = &pop.subjects[0];
+
+    assert_eq!(subj.reset_times, vec![4.0]);
+    assert!(subj.reset_occasions.is_empty());
+    assert!(subj.occasions.is_empty());
+    assert!(subj.dose_occasions.is_empty());
+}
+
+#[test]
 fn test_missing_dv_obs_skipped_and_warned() {
     // Issue #258: an EVID=0 row with a missing DV and no MDV=1 must be
     // skipped (not scored as DV=0), and a single W_MISSING_DV warning fires.
@@ -1700,6 +1837,7 @@ fn test_missing_dv_and_amt_not_dosed_warnings_coexist() {
 
 fn decl(name: &str, kind: CovariateKind) -> CovariateDecl {
     CovariateDecl {
+        levels: None,
         name: name.to_string(),
         kind,
     }
@@ -2077,6 +2215,7 @@ fn tte_aware_readers_route_through_gaussian_path_with_empty_tte_cmts() {
     // actually pulled into the read union, so the assertion fails if the
     // merge regresses.
     let decls = vec![CovariateDecl {
+        levels: None,
         name: "WT".to_string(),
         kind: CovariateKind::Continuous,
     }];

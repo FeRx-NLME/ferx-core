@@ -413,10 +413,12 @@ fn covariate_table_built_from_declarations() {
     use ferx_core::{read_nonmem_csv_with_covariates, CovariateDecl, CovariateKind};
     let decls = vec![
         CovariateDecl {
+            levels: None,
             name: "WT".into(),
             kind: CovariateKind::Continuous,
         },
         CovariateDecl {
+            levels: None,
             name: "CRCL".into(),
             kind: CovariateKind::Continuous,
         },
