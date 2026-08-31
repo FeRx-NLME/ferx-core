@@ -111,10 +111,10 @@ above.
 | LTBS × IOV | ODE | both | LTBS is applied in PK-parameter space *before* the η/θ/κ chain, so production's scale-then-log order cannot be rebuilt post-walk |
 | η-dependent `obs_scale` × LTBS | ODE | both | as above |
 | M3 BLOQ + IOV + `iiv_on_ruv` (the triple) | ODE | both | the only surviving M3 × IOV gap |
-| `input_rate` forcing + SDE `[diffusion]` | both | both | |
+| `input_rate` forcing + SDE `[diffusion]` | both | both | — |
 | `weibull` + estimated lagtime | both | both | the onset can diverge for shape `β < 1` |
-| `RATE=-1` infusion under `F ≠ 1` | both | both | |
-| SS + non-autonomous RHS (reads `TIME`/`TAFD`/`TAD`) | ODE | both | |
+| `RATE=-1` infusion under `F ≠ 1` | both | both | — |
+| SS + non-autonomous RHS (reads `TIME`/`TAFD`/`TAD`) | ODE | both | — |
 | `TAD` built-in + estimated lagtime | ODE | both | `∂TAD/∂ALAG = −1` is missing from the analytic chain (#1070) — see below |
 | observation / reset / covariate change exactly on a lagged arrival | closed-form | both | the walk resolves one dual position per break time |
 | model wider than the size caps (`θ + η` > 24 ODE / > 32 closed-form event walk) | both | both | too wide to monomorphise |

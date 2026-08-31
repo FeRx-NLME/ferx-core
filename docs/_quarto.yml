@@ -169,6 +169,11 @@ format:
     toc: true
     toc-depth: 4
     number-sections: false
+    grid:
+      sidebar-width: 250px
+      body-width: 1000px
+      margin-width: 250px
+      gutter-width: 1.5rem
     code-link: true
     code-copy: true
     code-overflow: wrap
