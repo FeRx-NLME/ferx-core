@@ -892,4 +892,104 @@ mod tests {
         );
         assert_eq!(scores_v[0].covariate, "SEX", "SEX must rank #1 for ETA_V");
     }
+
+    // ── Speed benchmark ───────────────────────────────────────────────────────
+    //
+    // Ignored by default; run with:
+    //   cargo test -p ferx-tools --lib --release -- gam_speed --ignored --nocapture
+    //
+    // Exercises a large synthetic dataset: 2 000 subjects, 8 ETAs, 15 covariates
+    // (120 covariates × 3 forms = 360 OLS fits per run).  Runs sequential and
+    // parallel (rayon over ETAs) so you can see the parallelism gain.
+    #[test]
+    #[ignore = "speed benchmark — run with: cargo test -p ferx-tools --lib --release -- gam_speed --ignored --nocapture"]
+    fn gam_speed_large_dataset() {
+        use std::time::Instant;
+
+        const N: usize = 2_000;
+        const N_ETAS: usize = 8;
+        const N_COVS: usize = 15;
+
+        // Deterministic synthetic ETAs (no RNG dependency).
+        // Pattern: sine waves with incommensurable frequencies per ETA.
+        let eta_data: Vec<Vec<f64>> = (0..N_ETAS)
+            .map(|e| {
+                (0..N)
+                    .map(|i| ((i as f64 * (e as f64 * 0.7 + 1.1)) * 0.003_141).sin() * 0.35)
+                    .collect()
+            })
+            .collect();
+
+        // Covariates: 3 categorical (c % 5 == 0) + 12 continuous.
+        let cov_data: Vec<(String, Vec<f64>, CovariateKind)> = (0..N_COVS)
+            .map(|c| {
+                if c % 5 == 0 {
+                    let vals: Vec<f64> = (0..N)
+                        .map(|i| if (i + c * 3) % 2 == 0 { 0.0 } else { 1.0 })
+                        .collect();
+                    (format!("COV_{c:02}"), vals, CovariateKind::Categorical)
+                } else {
+                    // Continuous: mix of range, centre and scale for realism.
+                    let centre = 30.0 + c as f64 * 5.0;
+                    let vals: Vec<f64> = (0..N)
+                        .map(|i| {
+                            centre + ((i as f64 * (c as f64 * 0.4 + 0.9)) * 0.002_718).cos() * 20.0
+                        })
+                        .collect();
+                    (format!("COV_{c:02}"), vals, CovariateKind::Continuous)
+                }
+            })
+            .collect();
+
+        let cov_refs: Vec<(&str, &[f64], CovariateKind)> = cov_data
+            .iter()
+            .map(|(n, v, k)| (n.as_str(), v.as_slice(), *k))
+            .collect();
+
+        let opts = GamOptions::default();
+        let total_pairs = N_ETAS * N_COVS;
+
+        // ── Sequential (one ETA after another, single thread) ─────────────────
+        // Warm-up.
+        for e in 0..N_ETAS {
+            let _ = screen_eta_raw(&eta_data[e], &cov_refs, &opts);
+        }
+        let t0 = Instant::now();
+        let n_seq_runs = 5;
+        for _ in 0..n_seq_runs {
+            for e in 0..N_ETAS {
+                let _ = screen_eta_raw(&eta_data[e], &cov_refs, &opts);
+            }
+        }
+        let seq_ms = t0.elapsed().as_secs_f64() * 1000.0 / n_seq_runs as f64;
+
+        // ── Parallel (rayon par_iter over ETAs, mirrors gam_screen internals) ──
+        // Warm-up.
+        (0..N_ETAS).into_par_iter().for_each(|e| {
+            let _ = screen_eta_raw(&eta_data[e], &cov_refs, &opts);
+        });
+        let t1 = Instant::now();
+        let n_par_runs = 20;
+        for _ in 0..n_par_runs {
+            (0..N_ETAS).into_par_iter().for_each(|e| {
+                let _ = screen_eta_raw(&eta_data[e], &cov_refs, &opts);
+            });
+        }
+        let par_ms = t1.elapsed().as_secs_f64() * 1000.0 / n_par_runs as f64;
+
+        println!(
+            "\n╔══ GAM speed benchmark ══════════════════════════════════╗\n\
+             ║  dataset  : {N} subjects, {N_ETAS} ETAs, {N_COVS} covariates\n\
+             ║  OLS fits : {total_pairs} pairs × 3 forms = {} per run\n\
+             ╠══ sequential ═══════════════════════════════════════════╣\n\
+             ║  {seq_ms:.2} ms/run   ({:.3} ms/pair)\n\
+             ╠══ parallel (rayon over ETAs) ═══════════════════════════╣\n\
+             ║  {par_ms:.2} ms/run   ({:.3} ms/pair)   speedup {:.1}×\n\
+             ╚═════════════════════════════════════════════════════════╝",
+            total_pairs * 3,
+            seq_ms / total_pairs as f64,
+            par_ms / total_pairs as f64,
+            seq_ms / par_ms,
+        );
+    }
 }
