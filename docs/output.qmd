@@ -31,7 +31,7 @@ Different quantities live in different outputs — this table is the fastest way
 
 A CSV file with per-observation diagnostics, one row per observation per subject.
 
-### Columns
+### Columns — sdtab
 
 | Column | Description |
 |--------|-------------|
@@ -66,7 +66,7 @@ $$
 $$
 where $f_0 = f(\hat{\eta}) - H\hat{\eta}$ is the linearized population prediction and $\tilde{R} = H\Omega H^T + R$ is the conditional variance.
 
-### Example
+### Example — sdtab
 
 ```csv
 ID,TIME,DV,PRED,IPRED,CWRES,IWRES,EBE_OFV,N_OBS,TAFD,TAD
@@ -82,7 +82,7 @@ columns with **one row per input dataset record**, including dose and other-even
 rows. Missing values are written as empty cells. It is also available
 programmatically as `FitResult::covariate_table`.
 
-### Columns
+### Columns — covtab
 
 | Column | Description |
 |--------|-------------|
@@ -91,7 +91,7 @@ programmatically as `FitResult::covariate_table`.
 | `EVID` | Event ID of the source row (0=obs, 1=dose, 2=other, 3=reset, 4=reset+dose) |
 | *declared covariates* | One column per covariate in the `[covariates]` block, in declaration order |
 
-### Example
+### Example — covtab
 
 ```csv
 ID,TIME,EVID,WT,CRCL
