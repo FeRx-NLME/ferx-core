@@ -54,7 +54,8 @@ section of the SDLC for the versioning policy).
   gets bootstrap SEs and CIs for its inter-occasion variance and `--update-inits` / `--dofv` carry
   it too. A model that reads `ID` as a covariate is refused rather than silently mis-fitted, and so
   is a `[mixture]` model — its classes are identified only up to relabelling, so averaging across
-  replicates would mix them. See `docs/tools/bootstrap.qmd`.
+  replicates would mix them; use SIR for uncertainty on a mixture model instead (#1145).
+  See `docs/tools/bootstrap.qmd`.
 - **`prepare_run` / `prepare_run_with_inits` (#1140)** — public "load a model and its dataset, but
   do not fit" entry points returning a `PreparedRun`. `run_model_with_data` is now implemented on
   top of them, so a tool and the CLI cannot diverge in how a model is loaded.
