@@ -112,15 +112,30 @@ tools/preflight.sh --list     # show the commands without running them
 ```
 
 `.github/workflows/ci.yml` invokes this same script for its `Check`, `Clippy`
-and `Format` jobs, so the local gate and the CI gate cannot drift — the same
-contract `tools/update-public-api.sh` uses for the API baseline, and pinned by
-`tests/preflight_owns_the_fast_gates.rs`. **Add a new gate to the script, not to
-the workflow.** On failure it names the CI job that would have gone red.
+and `Format` jobs, and `.githooks/pre-commit` calls its `fmt` group, so the
+local gate, the hook and the CI gate cannot drift — the same contract
+`tools/update-public-api.sh` uses for the API baseline. **Add a new gate to the
+script, not to the workflow**; groups are enumerated once, in the `ALL_GROUPS`
+array. On failure it names the CI job that would have gone red.
+
+It does **not** cover the test jobs. `cargo check --tests` compiles the test
+targets and runs nothing, so `Tests + coverage (core)` can still go red after a
+green preflight. This gates compilation and lint, not behaviour.
 
 Two traps it exists to cover: clippy runs `--all-targets` (without it, every
 `#[cfg(test)]` module and all of `tests/` goes unlinted — #1023), and the
 workspace members need **package-qualified** features (`ferx-core/ci`, not `ci`,
 which fails outright — #1114).
+
+`tests/preflight_owns_the_fast_gates.rs` pins the whole arrangement, and the
+invariant worth knowing when editing the script is that **`run` exits rather
+than returns** on failure. That is not style. The first version returned a
+status through a group function and a `case … esac || { …; exit 1; }`, and bash
+suspends `errexit` for every command of an AND-OR list but the last — then
+carries that suspension into the called function's whole body. Four of the five
+`cargo check` lines could fail with the script printing `preflight OK` and
+exiting 0. The guard now fails each command position in turn behind a fake
+`cargo` and asserts a non-zero exit, so a gate that stops gating is a red test.
 
 ## Build & Run Commands
 

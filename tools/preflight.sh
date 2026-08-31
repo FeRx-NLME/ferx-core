@@ -1,11 +1,7 @@
 #!/usr/bin/env bash
 #
 # Run the fast CI gates locally, so "green on my machine" means what CI means.
-#
-#   tools/preflight.sh              # every fast gate, cheapest first
-#   tools/preflight.sh check        # just the cargo check matrix (tight edit loop)
-#   tools/preflight.sh fmt clippy   # any subset, in the order you name them
-#   tools/preflight.sh --list       # print the commands without running them
+# `--help` prints usage; this header is the why.
 #
 # This is #1157. `.github/workflows/ci.yml` invokes THIS SCRIPT for its `Check`,
 # `Clippy` and `Format` jobs, which is the entire point: a script that merely
@@ -23,35 +19,85 @@
 #     error[E0063]: missing fields `reset_covariates` and `reset_occasions`
 #                   in initializer of `types::Subject`
 #
-# The whole matrix is compile-only or near it, so it costs a couple of minutes
-# warm — far less than a push/wait/diagnose cycle.
+# Cost: the matrix is compile-only or near it, so warm it is fast — measured on a
+# warm `target/` here, the full default run was 34s (fmt 13 · check 8 · clippy 2 ·
+# public-api 15), and that was with two other cargo jobs competing for the lock.
+# Cold it is a dependency build like any other; run `check` alone while iterating.
+#
+# If you ever time this and get minutes for the same work, check for a concurrent
+# cargo FIRST. Cargo serialises on a per-`target/` lock, and a build running in a
+# sibling worktree blocks this one behind a single line of output — that is not
+# preflight being slow, and it inflated an early measurement of this script
+# several-fold. `CARGO_TARGET_DIR` isolates it if you need a clean number.
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Resolved BEFORE the `cd`, so `--help` and the group table work from any cwd.
+script_path="${BASH_SOURCE[0]}"
+repo_root="$(cd "$(dirname "$script_path")/.." && pwd)"
 cd "$repo_root"
+
+# ── The group list ──────────────────────────────────────────────────────────
+# The ONE place groups are enumerated. Argument validation, the default
+# selection, `--help` and the driver all read this array, so adding a group is
+# one entry here plus its `group_<name>` function — and a mismatch between the
+# two is a startup error, not a group that silently never runs.
+#
+# NOT named `GROUPS`: bash maintains a special array of that name holding the
+# current user's numeric group IDs, and it wins. The first draft used it and
+# every group name silently became a GID — `unknown group 'check' — expected one
+# of: 20 12 61 ...`.
+ALL_GROUPS=(fmt check clippy public-api)
+
+usage() {
+  cat <<EOF
+Run the fast CI gates locally, so "green on my machine" means what CI means.
+
+  tools/preflight.sh              every fast gate, cheapest first
+  tools/preflight.sh check        just the cargo check matrix (tight edit loop)
+  tools/preflight.sh fmt clippy   any subset, in the order you name them
+  tools/preflight.sh --list       print the commands without running them
+
+Groups: ${ALL_GROUPS[*]}  (default: all of them, in that order)
+
+NOT covered: the test jobs. \`cargo check --tests\` COMPILES the test targets
+but runs nothing, so \`Tests + coverage (core)\` can still go red after a green
+preflight. This gates compilation and lint, not behaviour.
+EOF
+}
+
+is_group() {
+  local candidate="$1" g
+  for g in "${ALL_GROUPS[@]}"; do
+    if [ "$g" = "$candidate" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
 
 LIST_ONLY=0
 SELECTED=()
 
 for arg in "$@"; do
   case "$arg" in
-    --list) LIST_ONLY=1 ;;
-    -h|--help)
-      # POSIX class, not `\s`: BSD sed (macOS, where most of us edit) does not
-      # understand `\s` and would silently leave every `#` in place.
-      sed -n '3,8p' "${BASH_SOURCE[0]}" | sed 's/^#[[:space:]]\{0,1\}//'
-      echo
-      echo "Groups: fmt, check, clippy, public-api (default: all four, in that order)"
+    --list)
+      LIST_ONLY=1
+      ;;
+    -h | --help)
+      usage
       exit 0
       ;;
-    fmt|check|clippy|public-api) SELECTED+=("$arg") ;;
     -*)
       echo "preflight: unknown flag '$arg' (try --help)" >&2
       exit 2
       ;;
     *)
-      echo "preflight: unknown group '$arg' — expected one of: fmt check clippy public-api" >&2
-      exit 2
+      if is_group "$arg"; then
+        SELECTED+=("$arg")
+      else
+        echo "preflight: unknown group '$arg' — expected one of: ${ALL_GROUPS[*]}" >&2
+        exit 2
+      fi
       ;;
   esac
 done
@@ -59,34 +105,48 @@ done
 # Cheapest first, so a formatting slip fails in seconds rather than after a
 # full compile. CI calls one group per job, so this order only affects local runs.
 if [ ${#SELECTED[@]} -eq 0 ]; then
-  SELECTED=(fmt check clippy public-api)
+  SELECTED=("${ALL_GROUPS[@]}")
 fi
 
 # ── Plumbing ────────────────────────────────────────────────────────────────
 # `CI_JOB` names the workflow job a failure would have shown up in, so the error
 # teaches the local-command → CI-job mapping instead of just failing.
 CI_JOB=""
-FAILED_CMD=""
+CURRENT_GROUP=""
 
+die() {
+  echo >&2
+  echo "────────────────────────────────────────────────────────────────────────────" >&2
+  echo "preflight FAILED in group '$CURRENT_GROUP'." >&2
+  echo "  command:  $*" >&2
+  echo "  CI job:   $CI_JOB — this is what would have gone red on the PR." >&2
+  echo "────────────────────────────────────────────────────────────────────────────" >&2
+  exit 1
+}
+
+# `run` NEVER returns to its caller on failure — it exits the script.
+#
+# That is load-bearing, not style. The first version of this file returned a
+# status and left the caller to propagate it, through a group function, through
+# a `case ... esac || { ...; exit 1; }` in the driver. Bash suspends `errexit`
+# for every command of an AND-OR list but the last, and propagates that
+# suspension into the whole body of a function called in that context — so the
+# `return 1` stopped nothing, each group reported its LAST command's status, and
+# four of the five `cargo check` lines (including `ci,nn,slow-tests`, the one
+# that would have caught #1133) could fail with the script printing
+# "preflight OK" and exiting 0. Exiting from here deletes the propagation path
+# instead of fixing one link in it: there is no caller left that can drop the
+# status, whatever `errexit` is doing at the call site.
+#
+# `tests/preflight_owns_the_fast_gates.rs` pins this by failing each command
+# position in turn behind a fake `cargo` and asserting a non-zero exit.
 run() {
   echo
   echo "  \$ $*"
   if [ "$LIST_ONLY" -eq 1 ]; then
     return 0
   fi
-  if ! "$@"; then
-    FAILED_CMD="$*"
-    return 1
-  fi
-}
-
-on_failure() {
-  echo >&2
-  echo "────────────────────────────────────────────────────────────────────────────" >&2
-  echo "preflight FAILED in group '$CURRENT_GROUP'." >&2
-  echo "  command:  $FAILED_CMD" >&2
-  echo "  CI job:   $CI_JOB — this is what would have gone red on the PR." >&2
-  echo "────────────────────────────────────────────────────────────────────────────" >&2
+  "$@" || die "$*"
 }
 
 # ── Groups ──────────────────────────────────────────────────────────────────
@@ -95,7 +155,11 @@ group_fmt() {
   CI_JOB="Format"
   # `--all`: without it `cargo fmt` touches only the root package, so
   # `crates/ferx-tools` and `crates/ferx-cli` go unchecked (#1114).
-  # `.githooks/pre-commit` uses the same flag.
+  #
+  # No `+nightly`: `rust-toolchain.toml` pins the channel locally and the
+  # workflow exports `RUSTUP_TOOLCHAIN: nightly`. `.githooks/pre-commit` calls
+  # THIS group rather than repeating the command, so the hook, the local gate
+  # and CI are one owner.
   run cargo fmt --all -- --check
 }
 
@@ -166,13 +230,28 @@ group_clippy() {
 
 group_public_api() {
   CI_JOB="Public API baseline"
-  # Owns its own pinned nightly and pinned `cargo-public-api`, and self-installs the
-  # latter. Regenerate with `tools/update-public-api.sh` (no `--check`) when a
-  # widening is intended, and say in the PR which tool needs each added item.
+  # Owns its own pinned nightly and pinned `cargo-public-api`, and self-installs
+  # both — so the FIRST run of this group downloads a toolchain and builds
+  # rustdoc JSON from cold. For a tight edit loop name the groups you want
+  # (`tools/preflight.sh check clippy`); this one is in the default set because
+  # forgetting it is how a widened surface reaches the PR.
+  #
+  # Regenerate with `tools/update-public-api.sh` (no `--check`) when a widening
+  # is intended, and say in the PR which tool needs each added item.
   run tools/update-public-api.sh --check
 }
 
 # ── Drive ───────────────────────────────────────────────────────────────────
+
+# A group named in `ALL_GROUPS` with no `group_<name>` function would print its
+# banner and silently run nothing. Fail at startup instead, before any compile.
+for g in "${ALL_GROUPS[@]}"; do
+  fn="group_${g//-/_}"
+  if ! declare -F "$fn" >/dev/null; then
+    echo "preflight: internal error: group '$g' has no $fn function" >&2
+    exit 3
+  fi
+done
 
 if [ "$LIST_ONLY" -eq 1 ]; then
   echo "preflight would run (in order):"
@@ -182,12 +261,10 @@ for g in "${SELECTED[@]}"; do
   CURRENT_GROUP="$g"
   echo
   echo "══ $g ═══════════════════════════════════════════════════════════════════"
-  case "$g" in
-    fmt)        group_fmt ;;
-    check)      group_check ;;
-    clippy)     group_clippy ;;
-    public-api) group_public_api ;;
-  esac || { on_failure; exit 1; }
+  # A plain command, deliberately: no `||` here, so nothing suspends `errexit`
+  # for the function body. `run` exits on failure anyway; this keeps the driver
+  # from re-introducing the swallow if that ever changes.
+  "group_${g//-/_}"
 done
 
 echo
@@ -195,7 +272,7 @@ if [ "$LIST_ONLY" -eq 1 ]; then
   echo "(--list: nothing was executed)"
 else
   echo "preflight OK — ${SELECTED[*]}"
-  if [ ${#SELECTED[@]} -lt 4 ]; then
+  if [ ${#SELECTED[@]} -lt ${#ALL_GROUPS[@]} ]; then
     echo "note: this was a SUBSET. A full run is 'tools/preflight.sh' with no arguments."
   fi
 fi

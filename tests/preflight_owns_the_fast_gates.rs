@@ -1,7 +1,8 @@
 //! Guard: the `Check`, `Clippy` and `Format` jobs in `.github/workflows/ci.yml` must run
-//! their cargo commands **through `tools/preflight.sh`**, never inline (#1157).
+//! their cargo commands **through `tools/preflight.sh`**, and that script must actually
+//! fail when a gate fails (#1157).
 //!
-//! The point of that script is not documentation — it is that CI executes the same list a
+//! The point of the script is not documentation — it is that CI executes the same list a
 //! developer runs before pushing, so "green locally" and "green in CI" cannot mean
 //! different things. A script that only *describes* the commands drifts the first time
 //! somebody edits the workflow, and drifts silently: the local gate keeps passing while
@@ -10,31 +11,51 @@
 //! `--features ci,nn,slow-tests` had been failing to compile for an entire commit,
 //! because the local run and the CI run were not the same set.
 //!
-//! Two invariants, both plain assertions on the workflow text:
+//! Three invariants:
 //!
-//!  1. Those three jobs contain **no inline `run: cargo …` step**. Adding one is exactly
-//!     how the two lists diverge, and it is the easy thing to do when adding a gate.
+//!  1. Those three jobs contain **no inline `run: cargo …` step**, and neither skip
+//!     themselves (`if:`) nor tolerate failure (`continue-on-error`). Each is a way for
+//!     the two lists to diverge, or for a red gate to report green.
 //!  2. Each of them **does** invoke `tools/preflight.sh <group>` with its own group.
+//!  3. A failing command makes the script exit non-zero **from every position in the
+//!     list**, not just the last one.
+//!
+//! (3) is not hypothetical. The first version of the script returned a status from `run`
+//! and propagated it through a group function and a `case … esac || { …; exit 1; }` —
+//! and bash suspends `errexit` for every command of an AND-OR list but the last, then
+//! carries that suspension into the body of any function called there. So the `return 1`
+//! stopped nothing, each group reported its *last* command's status, and four of the five
+//! `cargo check` lines could fail with the script printing "preflight OK" and exiting 0.
+//! The two tests that existed at the time both passed: they only ever ran `--list` and
+//! `--help`, neither of which executes a gate. A gate nobody has watched fail is not a
+//! gate.
 //!
 //! Deliberately NOT asserted: that the script's command list matches some second copy
 //! here. There is no second copy — the script is the only list, which is the whole design.
-//! What this test pins is that the workflow keeps *delegating* to it.
+//! What these tests pin is that the workflow keeps *delegating* to it and that the script
+//! keeps *enforcing* it.
 //!
-//! The `public-api` job is out of scope: it needs a pinned dated nightly and a pinned
-//! `cargo-public-api` installed as separate workflow steps, so it calls
+//! The `public-api` job is out of scope for (1) and (2): it needs a pinned dated nightly
+//! and a pinned `cargo-public-api` installed as separate workflow steps, so it calls
 //! `tools/update-public-api.sh --check` directly. `preflight.sh public-api` runs that same
 //! script, so a developer's full local run still covers it.
 //!
-//! Not feature-gated — it must run in the base `--features ci` job, the one job guaranteed
-//! to build on every PR.
+//! Not feature-gated, so it runs in `Tests + coverage (core)` — the per-PR job that
+//! executes the Tier-1/2 suite under `--features ferx-core/ci`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn preflight() -> PathBuf {
+    repo_root().join("tools").join("preflight.sh")
+}
 
 fn ci_yml() -> String {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join(".github")
-        .join("workflows")
-        .join("ci.yml");
+    let p = repo_root().join(".github").join("workflows").join("ci.yml");
     std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
 }
 
@@ -71,10 +92,72 @@ fn job_body(yml: &str, name: &str) -> String {
     rest[..end].to_string()
 }
 
-/// Every `run:` command in a job body, one entry per step.
+/// Every shell command a job body runs.
+///
+/// Handles both `run: <cmd>` and the block form
+///
+/// ```yaml
+/// run: |
+///   cargo check --features ci
+/// ```
+///
+/// The block form matters: it is the natural way to add a second command to a step, so a
+/// scanner that only understood the inline form would wave through exactly the edit this
+/// test exists to reject. Each line of a block counts as a command — a coarse split, but
+/// it errs toward inspecting more text, which is the safe direction here.
 fn run_commands(body: &str) -> Vec<String> {
-    body.lines()
-        .filter_map(|l| l.trim_start().strip_prefix("run: "))
+    let mut out = Vec::new();
+    let mut lines = body.lines().peekable();
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix("run:") else {
+            continue;
+        };
+        let indent = line.len() - trimmed.len();
+        let rest = rest.trim();
+        // `|`, `>`, and their chomping variants (`|-`, `>+`, …) all open a block scalar.
+        let is_block = matches!(rest.chars().next(), Some('|' | '>'))
+            && rest[1..]
+                .chars()
+                .all(|c| matches!(c, '-' | '+' | '0'..='9'));
+        if is_block {
+            while let Some(next) = lines.peek() {
+                if next.trim().is_empty() {
+                    lines.next();
+                    continue;
+                }
+                let nt = next.trim_start();
+                if next.len() - nt.len() <= indent {
+                    break;
+                }
+                out.push(nt.to_string());
+                lines.next();
+            }
+        } else if !rest.is_empty() {
+            out.push(rest.to_string());
+        }
+    }
+    out
+}
+
+/// The commands `preflight.sh <group> --list` says it would run, in order.
+fn listed_commands(group: &str) -> Vec<String> {
+    let out = Command::new("bash")
+        .arg(preflight())
+        .arg(group)
+        .arg("--list")
+        .current_dir(repo_root())
+        .output()
+        .expect("run tools/preflight.sh --list");
+    assert!(
+        out.status.success(),
+        "`preflight.sh {group} --list` exited {:?}\nstderr:\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.trim_start().strip_prefix("$ "))
         .map(|c| c.trim().to_string())
         .collect()
 }
@@ -91,7 +174,7 @@ fn the_fast_gate_jobs_delegate_to_preflight_and_never_inline_cargo() {
             "job `{job}` has no `run:` steps at all — did the job-splitting heuristic break?"
         );
 
-        // (1) no inline cargo — that is how the two lists diverge.
+        // (1a) no inline cargo — that is how the two lists diverge.
         let inline: Vec<&String> = cmds.iter().filter(|c| c.starts_with("cargo ")).collect();
         assert!(
             inline.is_empty(),
@@ -105,6 +188,18 @@ fn the_fast_gate_jobs_delegate_to_preflight_and_never_inline_cargo() {
                 .join("\n  ")
         );
 
+        // (1b) the job must not be able to skip itself or pass while red. Both turn the
+        // gate into decoration without touching the command list, so neither is visible
+        // to the assertions above. If a conditional is ever genuinely wanted here, that
+        // is a deliberate edit to this test.
+        for masking in ["continue-on-error", "if:"] {
+            assert!(
+                !body.contains(masking),
+                "job `{job}` uses `{masking}` — a fast gate that can skip itself or report \
+                 green while failing is not a gate (#1157). Job body:\n{body}"
+            );
+        }
+
         // (2) it must actually call its own group.
         let want = format!("tools/preflight.sh {group}");
         assert!(
@@ -115,10 +210,182 @@ fn the_fast_gate_jobs_delegate_to_preflight_and_never_inline_cargo() {
     }
 }
 
+/// The invariant that makes the script a gate rather than a log: **a failing command at
+/// any position exits non-zero**.
+///
+/// Every `cargo`-driven position is failed in turn behind a fake `cargo` on `PATH`, so
+/// this costs milliseconds and no compile. The positions come from `--list`, not from a
+/// table here, so adding a sixth `cargo check` feature set is covered the moment it is
+/// added — there is nothing to remember to update.
+///
+/// `public-api` is the one group not exercised: its command is `tools/update-public-api.sh
+/// --check`, invoked by path rather than through `PATH`, and shimming it would mean
+/// letting the real script hunt for a pinned toolchain. It runs through the same `run`
+/// helper as all eight positions below, which is what is under test.
+#[test]
+fn a_failing_gate_fails_the_script_from_every_position() {
+    let root = repo_root();
+    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("preflight-failure-path");
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+    let counter = tmp.join("count");
+    write_fake_cargo(&tmp);
+
+    let path = format!(
+        "{}:{}",
+        tmp.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    for group in ["fmt", "check", "clippy"] {
+        let listed = listed_commands(group);
+        assert!(
+            !listed.is_empty(),
+            "group `{group}` lists no commands — nothing to fail"
+        );
+
+        for (idx, cmd) in listed.iter().enumerate() {
+            let nth = idx + 1;
+            let _ = std::fs::remove_file(&counter);
+            let out = Command::new("bash")
+                .arg(preflight())
+                .arg(group)
+                .current_dir(&root)
+                .env("PATH", &path)
+                .env("FAKE_CARGO_COUNT", &counter)
+                .env("FAKE_CARGO_FAIL_AT", nth.to_string())
+                .output()
+                .expect("run tools/preflight.sh");
+
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let ctx = format!("--- stdout ---\n{stdout}--- stderr ---\n{stderr}");
+
+            assert!(
+                !out.status.success(),
+                "`preflight.sh {group}` exited 0 with command {nth} of {} FAILING \
+                 (`{cmd}`).\nA gate that reports green while a command failed is worse than \
+                 no gate: CI runs this same script, so the job goes green too.\n{ctx}",
+                listed.len()
+            );
+            assert!(
+                !stdout.contains("preflight OK"),
+                "`preflight.sh {group}` printed its success banner although command {nth} \
+                 (`{cmd}`) failed.\n{ctx}"
+            );
+            // It must stop AT the failing command and name it, not merely exit non-zero
+            // for some later reason.
+            assert!(
+                stderr.contains("preflight FAILED in group"),
+                "`preflight.sh {group}` exited non-zero for command {nth} (`{cmd}`) but \
+                 printed no failure diagnostic — it may have died for an unrelated \
+                 reason.\n{ctx}"
+            );
+            assert!(
+                stderr.contains(cmd.as_str()),
+                "`preflight.sh {group}` failed, but its diagnostic does not name the \
+                 command that failed (`{cmd}`) — it stopped somewhere else.\n{ctx}"
+            );
+        }
+    }
+}
+
+/// A `cargo` that succeeds until its `FAKE_CARGO_FAIL_AT`-th invocation.
+///
+/// Counting invocations rather than matching arguments keeps the harness independent of
+/// what the commands actually say, so it does not become a second copy of the list.
+fn write_fake_cargo(dir: &Path) {
+    let path = dir.join("cargo");
+    std::fs::write(
+        &path,
+        r#"#!/bin/sh
+# Test double for `cargo` (tests/preflight_owns_the_fast_gates.rs). Not used by any build.
+n=$(cat "$FAKE_CARGO_COUNT" 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" > "$FAKE_CARGO_COUNT"
+echo "fake cargo invocation #$n: $*"
+if [ "$n" = "$FAKE_CARGO_FAIL_AT" ]; then
+  echo "error[E0063]: simulated failure on invocation $n" >&2
+  exit 101
+fi
+exit 0
+"#,
+    )
+    .expect("write fake cargo");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake cargo");
+    }
+}
+
+/// The counts in `preflight_is_executable_and_lists_every_group` see a gate DELETED. They
+/// do not see one NEUTERED — a command that stays in the list while quietly checking less.
+/// Every mutation below is a one-token edit that leaves the count at its expected value:
+///
+///  * dropping `--all-targets` from clippy leaves lib and bins linted and roughly a third
+///    of the repo — every `#[cfg(test)]` module, every sibling `*_tests.rs`, all of
+///    `tests/` — unlinted. That gap hid 6 `approx_constant` ERRORS (#1023).
+///  * dropping `--all` from `cargo fmt` formats only the root package, silently skipping
+///    `crates/ferx-tools` and `crates/ferx-cli` (#1114).
+///  * narrowing a `--features` set drops a whole cfg-gated surface out of the compile.
+///    `ci,nn,slow-tests` becoming `ci` is exactly #1133 with the gate still present.
+///
+/// The feature check is deliberately a **union over the whole group**, not a per-line
+/// assertion: it pins that the matrix still compiles each gated surface without caring how
+/// the lines are arranged, so splitting or merging feature sets stays a free refactor.
+#[test]
+fn load_bearing_flags_and_feature_coverage_survive_in_the_command_list() {
+    let clippy = listed_commands("clippy");
+    assert!(
+        clippy.iter().any(|c| c.contains("--all-targets")),
+        "no clippy command passes `--all-targets`. Without it every `#[cfg(test)]` module, \
+         every sibling `*_tests.rs` and all of `tests/` go unlinted — the gap that hid 6 \
+         `approx_constant` errors in #1023.\n  {}",
+        clippy.join("\n  ")
+    );
+
+    let fmt = listed_commands("fmt");
+    assert!(
+        fmt.iter().any(|c| c.contains(" --all")),
+        "no fmt command passes `--all`; the workspace members would go unformatted \
+         (#1114).\n  {}",
+        fmt.join("\n  ")
+    );
+
+    // Union of every `--features` value in the check group.
+    let check = listed_commands("check");
+    let mut features: Vec<String> = Vec::new();
+    for cmd in &check {
+        let mut parts = cmd.split_whitespace();
+        while let Some(p) = parts.next() {
+            if p == "--features" {
+                if let Some(list) = parts.next() {
+                    for f in list.split(',') {
+                        // Members take their features package-qualified (`ferx-core/ci`).
+                        let f = f.rsplit('/').next().unwrap_or(f);
+                        features.push(f.to_string());
+                    }
+                }
+            }
+        }
+    }
+    for want in ["ci", "survival", "slow-tests", "markov", "nn"] {
+        assert!(
+            features.iter().any(|f| f == want),
+            "the `check` group compiles nothing under `{want}`, so every source and test \
+             file behind that cfg is unchecked on this PR. #1133 is what that looks like: \
+             one struct literal in an `nn`-gated file turned three CI jobs red after a \
+             local run of 4634 tests reported clean.\nfeature sets seen: {features:?}\n  {}",
+            check.join("\n  ")
+        );
+    }
+}
+
 #[test]
 fn preflight_is_executable_and_lists_every_group() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let script = root.join("tools").join("preflight.sh");
+    let script = preflight();
     assert!(script.is_file(), "tools/preflight.sh is missing");
 
     #[cfg(unix)]
@@ -131,12 +398,10 @@ fn preflight_is_executable_and_lists_every_group() {
         );
     }
 
-    // `--list` prints the commands without executing them, so this stays a fast unit-tier
-    // check rather than a compile.
-    let out = std::process::Command::new("bash")
+    let out = Command::new("bash")
         .arg(&script)
         .arg("--list")
-        .current_dir(&root)
+        .current_dir(repo_root())
         .output()
         .expect("run tools/preflight.sh --list");
     assert!(
@@ -148,15 +413,16 @@ fn preflight_is_executable_and_lists_every_group() {
     let stdout = String::from_utf8_lossy(&out.stdout);
 
     // Per group: the banner is NOT evidence the group ran. The driver loop prints it
-    // before dispatching, so a group whose `case` arm was gutted to `:` still shows a
-    // header and exits 0 — CI would run `preflight.sh clippy`, lint nothing, and pass.
-    // That mutation survived the first draft of this test. So count the commands each
-    // group actually emits, which is the only thing that distinguishes "ran" from
-    // "silently did nothing".
+    // before dispatching, so a group whose dispatch was gutted still shows a header and
+    // exits 0 — CI would run `preflight.sh clippy`, lint nothing, and pass. That mutation
+    // survived the first draft of this test. So count the commands each group emits.
     //
     // The counts are a tripwire against silent SHRINKAGE, not a second copy of the
     // command list — deleting a `cargo check` feature set has to be a deliberate edit
-    // here too, and lowering a number is a reviewable line in the diff.
+    // here too, and lowering a number is a reviewable line in the diff. Whether those
+    // commands are actually *enforced* is
+    // `a_failing_gate_fails_the_script_from_every_position`; `--list` executes nothing and
+    // can never show it.
     let expected: [(&str, usize); 4] = [
         ("fmt", 1),        // cargo fmt --all -- --check
         ("check", 5),      // ci · ci,survival,slow-tests · ci,markov · ci,nn,slow-tests · members
@@ -191,27 +457,26 @@ fn preflight_is_executable_and_lists_every_group() {
     );
 }
 
-/// `--help` extracts its usage block from the script's own header by LINE NUMBER, which
-/// silently prints the wrong lines if that header ever grows or shrinks. Rather than make
-/// the extraction clever, pin the output.
-///
-/// This also covers a portability trap the first version walked into: the strip was
-/// `s/^#\s\?//`, and BSD sed (macOS, where most of us edit) does not understand `\s` — so
-/// every `#` survived locally while the same line worked in CI. A local/CI split inside the
-/// tool whose entire purpose is removing local/CI splits.
+/// `--help` is the only place a developer learns which groups exist, so it must not be
+/// able to fall behind the group list — and it must work from any directory, since the
+/// natural way to reach it is an absolute path out of a stale shell.
 #[test]
-fn preflight_help_renders_its_usage_block() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let out = std::process::Command::new("bash")
-        .arg(root.join("tools").join("preflight.sh"))
+fn preflight_help_lists_every_group_and_works_from_any_cwd() {
+    // Deliberately NOT `current_dir(repo_root())`: an earlier version read its usage text
+    // out of its own source with `sed -n '3,8p' "${BASH_SOURCE[0]}"` *after* `cd`-ing to
+    // the repo root, so a relative invocation from elsewhere resolved the path against
+    // the wrong directory and printed nothing.
+    let out = Command::new("bash")
+        .arg(preflight())
         .arg("--help")
-        .current_dir(&root)
+        .current_dir(std::env::temp_dir())
         .output()
         .expect("run tools/preflight.sh --help");
     assert!(
         out.status.success(),
-        "`--help` exited {:?}",
-        out.status.code()
+        "`--help` exited {:?}\nstderr:\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
 
@@ -219,24 +484,34 @@ fn preflight_help_renders_its_usage_block() {
         "Run the fast CI gates locally",
         "tools/preflight.sh check",
         "tools/preflight.sh --list",
-        "Groups: fmt, check, clippy, public-api",
     ] {
         assert!(
             stdout.contains(want),
-            "`--help` is missing {want:?} — the header line range in the `-h|--help` arm \
-             has probably drifted:\n{stdout}"
+            "`--help` is missing {want:?}:\n{stdout}"
         );
     }
-    // No line may still START with `#`. Checking for `#` anywhere would be wrong: the usage
-    // lines carry legitimate inline comments (`tools/preflight.sh check  # just the …`).
-    let leftover: Vec<&str> = stdout
+
+    // Every group the script will actually dispatch has to be documented. Naming them
+    // from the `--list` banners rather than from a literal here means a new group cannot
+    // be added without `--help` growing it too.
+    let full = Command::new("bash")
+        .arg(preflight())
+        .arg("--list")
+        .current_dir(repo_root())
+        .output()
+        .expect("run tools/preflight.sh --list");
+    let groups: Vec<String> = String::from_utf8_lossy(&full.stdout)
         .lines()
-        .filter(|l| l.trim_start().starts_with('#'))
+        .filter_map(|l| l.trim().strip_prefix("══ "))
+        .filter_map(|l| l.split_whitespace().next())
+        .map(str::to_string)
         .collect();
-    assert!(
-        leftover.is_empty(),
-        "`--help` left comment markers at line start — the sed strip is not working (BSD \
-         sed does not support `\\s`):\n  {}",
-        leftover.join("\n  ")
-    );
+    assert!(!groups.is_empty(), "no group banners in `--list` output");
+    for g in &groups {
+        assert!(
+            stdout.contains(g.as_str()),
+            "`--help` never mentions the `{g}` group, so a developer reading it would not \
+             know to run it:\n{stdout}"
+        );
+    }
 }
