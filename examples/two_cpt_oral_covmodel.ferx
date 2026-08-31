@@ -66,3 +66,9 @@
   method     = focei
   maxiter    = 500
   covariance = true
+  # Derivative-free outer optimizer. The gradient-based default does not leave
+  # the initial estimates on this start — an init stall of the #751 family, and
+  # nothing to do with [covariate_model]: the hand-written model this block
+  # desugars to stalls identically at the same OFV. BOBYQA converges to
+  # OFV -1199.02, below the -1168.48 of the classical `two_cpt_oral_cov.ferx`.
+  optimizer  = bobyqa
