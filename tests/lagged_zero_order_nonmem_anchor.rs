@@ -42,10 +42,16 @@ use ferx_core::pk::{compute_predictions_with_states, compute_predictions_with_tv
 use ferx_core::types::CompiledModel;
 use ferx_core::{read_nonmem_csv, Population};
 use std::collections::HashMap;
-use std::path::Path;
 
-fn anchor(name: &str) -> String {
-    format!("nonmem_anchor/{name}")
+fn anchor(name: &str) -> std::path::PathBuf {
+    // `CARGO_MANIFEST_DIR`, not a relative path: the four sibling anchor suites
+    // (`dose_form_lag`, `ss_lagtime_edge`, `reset_init_snapshot`,
+    // `tvcov_lag_saltation`) all resolve this way, and a bare relative path only
+    // works while the runner happens to set cwd to the package root.
+    let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.push("nonmem_anchor");
+    p.push(name);
+    p
 }
 
 /// The committed ferx twin of `lagged_zo.ctl` — same θ, all fixed, `maxiter = 0`,
@@ -60,8 +66,7 @@ fn anchor_model() -> (CompiledModel, ferx_core::FitOptions) {
 /// The ferx-keyed twin of `lagged_zo_nm.csv` (no `RATE` column — ferx reads the
 /// duration off the model's `zero_order(dur=…)`).
 fn anchor_population() -> Population {
-    read_nonmem_csv(Path::new(&anchor("lagged_zo.csv")), None, None)
-        .expect("the anchor dataset is committed")
+    read_nonmem_csv(&anchor("lagged_zo.csv"), None, None).expect("the anchor dataset is committed")
 }
 
 /// `(ID, TIME) → column` from `results/lagged_zo.tab`.
@@ -120,9 +125,10 @@ fn assert_matches_table(
     tol: f64,
     what: &str,
 ) {
-    assert!(
-        got.len() >= 100,
-        "{what}: expected the full 12 × 10 record set, got {}",
+    assert_eq!(
+        got.len(),
+        120,
+        "{what}: expected the full 12 subjects × 10 observations, got {}",
         got.len()
     );
     let peak = got.iter().fold(0.0f64, |m, r| m.max(r.2.abs()));
@@ -270,9 +276,12 @@ fn dense_solve_states_matches_the_nonmem_pred_column() {
 fn the_anchor_discriminates_a_dropped_zero_order_window() {
     let table = nonmem_column("PRED");
     let obs: Vec<f64> = table.values().copied().filter(|v| v.abs() > 0.0).collect();
-    assert!(
-        obs.len() >= 100,
-        "the PRED column must carry the 120 observation records, found {}",
+    // 132 = 12 subjects × (10 observations + the t=12 dose row, whose PRED is
+    // non-zero). Only the 12 t=0 rows are exactly 0.0 and are filtered out above.
+    assert_eq!(
+        obs.len(),
+        132,
+        "the PRED column must carry every non-zero record, found {}",
         obs.len()
     );
     let smallest = obs.iter().fold(f64::INFINITY, |m, v| m.min(v.abs()));
@@ -288,9 +297,14 @@ fn the_anchor_discriminates_a_dropped_zero_order_window() {
 /// against NONMEM's. Slow-gated because it runs a fit; the η = 0 checks above are
 /// what run on a PR.
 ///
-/// The tolerance is looser than `TABLE_TOL` because the two inner optimizers stop
-/// at slightly different η̂ — the point of this test is the *sdtab column* being
-/// populated and near NONMEM's, which the η = 0 tests above pin exactly.
+/// The tolerance is 1e-3, measured rather than assumed: the worst relative deviation
+/// across all 120 records is **4.736e-5** (ID 9, t = 13.8: ferx 1.031448846 against
+/// NONMEM's `1.0314`, i.e. the table's own print precision), and ferx's η̂ agrees with
+/// `results/lagged_zo.phi` to ~6 significant figures (ID 1: 0.019148458 vs
+/// `1.91485E-02`). An earlier draft used 3e-2 and blamed "different η̂"; that was
+/// wrong on both counts and left the only end-to-end `fit()`-against-NONMEM check
+/// unable to see a 1 % IPRED regression. 1e-3 keeps ~20× headroom over the measured
+/// error while staying 1000× under the defect this anchors (a relative 1).
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
@@ -317,8 +331,5 @@ fn sdtab_ipred_matches_nonmem_posthoc() {
             rows.push((sr.id.clone(), *t, ip));
         }
     }
-    // 3 % — NONMEM's and ferx's inner optimizers stop at slightly different η̂ on a
-    // 12-subject, 10-observation-per-subject dataset under a 15 % proportional error
-    // model. Still 30× under the defect (a relative 1 at every record).
-    assert_matches_table(&rows, &table, 3e-2, "sdtab IPRED vs NONMEM POSTHOC IPRED");
+    assert_matches_table(&rows, &table, 1e-3, "sdtab IPRED vs NONMEM POSTHOC IPRED");
 }

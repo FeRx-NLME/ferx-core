@@ -4654,9 +4654,13 @@ fn zo_windows_for(
 #[test]
 fn zero_order_window_edges_rate_and_cutoff_break() {
     // A dose at t=2 into the zero-order compartment, lag 0.5, dur 4 ⇒ a window
-    // [2.5, 6.5] with rate F·amt/dur = 100/4 = 25, and a cutoff break at 6.5. A
+    // [2.5, 6.5] with rate F·amt/dur = 100/4 = 25, and breaks at **both** edges. A
     // dose into a *different* compartment, and a zero-amount dose, contribute no
     // window (so no break).
+    //
+    // Both edges because `active_zero_order_inputs`' containment test is two-sided
+    // (#1171): pinning only the cutoff is what let two builders segment a lagged
+    // window's start away and drop the rate entirely.
     let ode = zero_order_accumulator_spec(); // cmt 0 ≡ 1-based CMT 1
     let pk = pk_zero_order_vec(4.0, 1.0);
     let doses = vec![
@@ -4669,7 +4673,7 @@ fn zero_order_window_edges_rate_and_cutoff_break() {
 
     let mut breaks = Vec::new();
     push_zero_order_break_times(&mut breaks, &windows);
-    assert_eq!(breaks, vec![6.5]);
+    assert_eq!(breaks, vec![2.5, 6.5]);
 }
 
 #[test]
@@ -7991,10 +7995,10 @@ fn route_lagged_zero_order_doses() -> Vec<DoseEvent> {
 /// Exact accumulated mass for [`route_lagged_zero_order_accumulator_spec`]: each
 /// dose contributes a clamped linear ramp over `[t_dose + lag, t_dose + lag + dur]`.
 /// Independent of every ODE engine — the oracle, not a second implementation.
-fn route_lagged_zero_order_truth(t: f64, dur: f64, lag: f64, amt: f64) -> f64 {
-    [0.0f64, 12.0]
+fn route_lagged_zero_order_truth(t: f64, dur: f64, lag: f64) -> f64 {
+    route_lagged_zero_order_doses()
         .iter()
-        .map(|&t0| amt * ((t - t0 - lag) / dur).clamp(0.0, 1.0))
+        .map(|d| d.amt * ((t - d.time - lag) / dur).clamp(0.0, 1.0))
         .sum()
 }
 
@@ -8073,7 +8077,7 @@ fn route_lagged_zero_order_reaches_every_dense_engine() {
     let subject = make_subject(route_lagged_zero_order_doses(), obs.clone());
     let want: Vec<f64> = obs
         .iter()
-        .map(|&t| route_lagged_zero_order_truth(t, DUR, LAG, AMT))
+        .map(|&t| route_lagged_zero_order_truth(t, DUR, LAG))
         .collect();
     assert!(
         want.iter().any(|&m| m > 1.0 && m < AMT - 1.0),
@@ -8082,6 +8086,9 @@ fn route_lagged_zero_order_reaches_every_dense_engine() {
     );
 
     let check = |got: &[f64], what: &str| {
+        // `zip` stops at the shorter side, so without this a short or empty result —
+        // the #1171 signature itself — would make every assertion below vacuous.
+        assert_eq!(got.len(), want.len(), "{what}: wrong number of values");
         for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
             assert!(
                 (g - w).abs() <= 1e-6 * (1.0 + w.abs()),
@@ -8106,4 +8113,81 @@ fn route_lagged_zero_order_reaches_every_dense_engine() {
         &dense.iter().map(|u| u[0]).collect::<Vec<_>>(),
         "ode_dense_solve_states",
     );
+}
+
+/// The route-onset break must reach both dense builders for a **smooth** lagged
+/// kernel too — the half of #1171's fix that `push_zero_order_break_times`' own
+/// `w_start` push does *not* cover.
+///
+/// This is the discriminating case. Every other fixture here uses `zero_order`,
+/// whose onset coincides exactly with `w_start`, so all of them stay green if the
+/// route-onset push is deleted and the window pusher is left to bracket the start.
+/// A `first_order(ka=KA, lag=L)` route produces **no `ZeroOrderWindow` at all**, so
+/// its onset has no other source — delete
+/// [`push_route_lag_break_times`](super::push_route_lag_break_times) from either
+/// builder and this test is the one that fails.
+///
+/// It is not a mere nicety either: `first_order`'s kernel is `dose·ka·exp(-ka·tad)`
+/// with a hard `0` for `tad <= 0`, i.e. a **step** at the onset, and
+/// `sens/ode_provider.rs` emits `K_ROUTE_ONSET` for every lagged kind pinned
+/// bit-identical to this break (#859).
+///
+/// The compartment lag is **non-zero** on purpose. The onset is
+/// `d.time + lag_cmt + lag_route`; with `dose_lagtimes` all-zero — as every other
+/// fixture here has it — that middle term is degenerate, and passing an empty slice
+/// instead would be bit-identical.
+#[test]
+fn route_lagged_first_order_onset_reaches_both_dense_builders() {
+    const LAG_CMT: f64 = 2.0;
+    const LAG_ROUTE: f64 = 1.5;
+    // `first_order` on cmt 0 with `ka` at slot PK_IDX_KA and the route lag at slot 6.
+    let mut ode = zero_order_accumulator_spec();
+    ode.input_rate = vec![InputRateForcing {
+        cmt: 0,
+        kind: InputRateKind::FirstOrder,
+        arg_slots: vec![crate::types::PK_IDX_KA],
+        frac_slot: None,
+        lag_slot: Some(6),
+    }];
+    let mut pk = vec![0.0; crate::types::MAX_PK_PARAMS];
+    pk[crate::types::PK_IDX_KA] = 1.2;
+    pk[crate::types::PK_IDX_F] = 1.0;
+    pk[6] = LAG_ROUTE;
+
+    let doses = route_lagged_zero_order_doses();
+    // A LIVE compartment lag, not zeros: the onset is `d.time + lag_cmt + lag_route`,
+    // and with `dose_lagtimes` all-zero that middle term is degenerate — dropping the
+    // slice entirely would be bit-identical and no assertion could tell.
+    let lags = vec![LAG_CMT; doses.len()];
+    let f_bio = vec![1.0; doses.len()];
+    let subject = make_subject(doses, vec![24.0]);
+
+    // Non-degeneracy: a smooth route yields no zero-order window, so the window
+    // pusher contributes nothing and the onset can only come from the route-lag push.
+    let windows = zo_windows_for(&ode, &subject.doses, &lags, &pk);
+    assert!(
+        windows.is_empty(),
+        "a first_order route must produce no ZeroOrderWindow, else this fixture \
+         cannot discriminate the route-onset push from the window pusher"
+    );
+
+    let breaks = build_segment_break_times(&ode, &pk, &subject, &lags, &f_bio, &windows, 24.0);
+    for want in [LAG_CMT + LAG_ROUTE, 12.0 + LAG_CMT + LAG_ROUTE] {
+        assert!(
+            breaks.iter().any(|&t| (t - want).abs() < 1e-12),
+            "build_segment_break_times dropped the first_order route onset at {want}: \
+             {breaks:?}"
+        );
+    }
+
+    // …and the prediction builder, which always had it, must agree.
+    let mut from_predictions = Vec::new();
+    collect_dose_break_times(&mut from_predictions, &ode, &subject, &lags, &f_bio, &pk);
+    for want in [LAG_CMT + LAG_ROUTE, 12.0 + LAG_CMT + LAG_ROUTE] {
+        assert!(
+            from_predictions.iter().any(|&t| (t - want).abs() < 1e-12),
+            "collect_dose_break_times dropped the first_order route onset at {want}: \
+             {from_predictions:?}"
+        );
+    }
 }

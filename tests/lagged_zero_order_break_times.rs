@@ -236,8 +236,13 @@ fn tv_covariate_subject_states_match_the_plain_subject() {
     let eta = vec![0.0, 0.0];
 
     let plain = lagged_zo_subject();
+    // The routing predicate is `has_tv_covariates() || has_resets() || uses_time`
+    // (`pk/mod.rs`), so assert every disjunct the fixture controls — otherwise a
+    // regression that makes the plain subject *also* take the event-driven branch
+    // (e.g. `model_uses_time_anywhere` over-firing, #1166) would silently turn this
+    // into `ode_dense_solve_states` compared with itself.
     assert!(
-        !plain.has_tv_covariates(),
+        !plain.has_tv_covariates() && !plain.has_resets(),
         "the reference subject must take the plain (non-event-driven) branch"
     );
     let (_, want) = compute_predictions_with_states(&model, &plain, theta, &eta);
@@ -366,6 +371,7 @@ fn derived_grid_integral_over_a_lagged_zero_order_compartment() {
         ferx_core::fit(&model, &pop, &model.default_params, &opts).expect("fit must not error");
     let sr = &result.subjects[0];
 
+    let theta = &model.default_params.theta;
     let auc = sr
         .extra_columns
         .iter()
@@ -381,14 +387,23 @@ fn derived_grid_integral_over_a_lagged_zero_order_compartment() {
         .first()
         .expect("central");
     // The elimination rate is the *individual* one — `fit` runs the inner loop even at
-    // `maxiter = 0`, so `CL`/`V` carry η̂. Read it back from the reported η rather than
-    // from the typical values.
-    let theta = &model.default_params.theta;
-    let (cl, v) = (theta[0] * sr.eta[0].exp(), theta[1] * sr.eta[1].exp());
+    // `maxiter = 0`, so `CL`/`V` carry η̂. Resolve them through the model at the
+    // reported η rather than indexing `theta`/`eta` positionally: the slot lookup
+    // survives a reordering of `[parameters]`, and a positional read would silently
+    // produce a wrong reference instead of failing.
+    let pk = compute_event_pk_params(&model, &pop.subjects[0], theta, sr.eta.as_slice()).obs[0];
+    let (cl, v) = (
+        pk.values[ferx_core::types::PK_IDX_CL],
+        pk.values[ferx_core::types::PK_IDX_V],
+    );
     let want = (200.0 - a_end) / (cl / v);
     let rel = (auc - want).abs() / want;
+    // 1e-6, measured: the realised error is 6.500e-9 (AUC 1637.9486314 against the
+    // mass-balance reference 1637.9486420). An earlier draft used 5e-4, which left
+    // the only quantitative check on the `[derived]` grid path blind to a 0.05 %
+    // mis-delivery; 1e-6 still keeps ~150× headroom over the trapezoid error.
     assert!(
-        rel < 5e-4,
+        rel < 1e-6,
         "[derived] grid AUC {auc} vs the mass-balance reference {want} (rel {rel:.3e})"
     );
 }
@@ -446,8 +461,6 @@ fn joint_pk_tte_hazard_sees_the_lagged_zero_order_route() {
 [error_model]
   DV ~ proportional(PROP_ERR)
 
-[simulation]
-  horizon = 24
 
 [fit_options]
   method     = focei
@@ -460,11 +473,7 @@ fn joint_pk_tte_hazard_sees_the_lagged_zero_order_route() {
     // The PK twin — same disposition, no hazard — supplies the reference C(t) from
     // the objective path, which the NONMEM anchor pins.
     let pk_model = parse_model_string(LAGGED_ZO).expect("PK twin must parse");
-    let pk_subject = {
-        let mut s = lagged_zo_subject();
-        s.obs_times = OBS_T.to_vec();
-        s
-    };
+    let pk_subject = lagged_zo_subject();
     let conc = compute_predictions_with_tv(
         &pk_model,
         &pk_subject,
