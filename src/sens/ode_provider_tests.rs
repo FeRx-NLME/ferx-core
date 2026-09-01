@@ -9143,17 +9143,23 @@ fn ode_tad_rhs_with_route_lag_only_stays_analytic() {
 }
 
 /// Steady state keeps its own, broader decline: SS breaks the cycle recurrence for
-/// ANY non-autonomous RHS, `TIME`-only ones included. That gate is `uses_time_vars`
-/// (the union of `TIME`/`TAFD`/`TAD`), and it is what still routes `TAD` + SS to FD
-/// now that #1070's narrower, TAD-only predicate has been deleted along with the
-/// interim gate it served. Regression guard that removing the narrow one left the
-/// broad one intact.
+/// ANY non-autonomous RHS, `TIME`-only ones included. It is what still routes `TAD`
+/// + SS to FD now that #1070's narrower, TAD-only predicate has been deleted along
+/// with the interim gate it served. Regression guard that removing the narrow one
+/// left the broad one intact — and that it stayed broad when #1124 widened it from
+/// `uses_time_vars` to `reads_model_time` (the union plus the bare `TIME` built-in).
 #[test]
 fn ode_ss_time_only_rhs_still_routes_to_fd() {
     // `T`, not `TIME`: a bare `TIME` in an `[odes]` RHS compiles to `Op::PushTime`
     // (the model-time thread-local), not to a `PushVar(time_slot)`, so
     // `stmts_read_slots` — and therefore `uses_time_vars` — does not see it. `T`
     // is the alias that does resolve to the slot.
+    //
+    // Until #1124 that choice was a **workaround**, not a simplification: the
+    // gate asked `uses_time_vars` alone, so the `TIME` spelling of the same
+    // quantity reached the SS equilibration while `T` declined. The gate now asks
+    // `reads_model_time`; `ode_ss_bare_time_builtin_rhs_routes_to_fd` covers the
+    // spelling this test cannot.
     let model = tad_gate_model("T", "");
     let prog = model
         .ode_spec
@@ -9167,6 +9173,122 @@ fn ode_ss_time_only_rhs_still_routes_to_fd() {
     assert!(
         !ode_tvcov_supported(&model, &ss),
         "SS + a time-dependent RHS must still decline (the broad uses_time_vars gate)"
+    );
+}
+
+/// The spelling `ode_ss_time_only_rhs_still_routes_to_fd` works around: a **bare
+/// `TIME`** built-in in the RHS.
+///
+/// `uses_time_vars` is structurally blind to it (`Op::PushTime`, not a
+/// `PushVar(time_slot)`), so until #1124 this exact model reached
+/// `equilibrate_ss_state_g` while the identical model spelled `T` declined —
+/// the gate's own doc said to pair the two flags and this caller did not.
+///
+/// What the gate does and does not buy, measured against an explicit 40-cycle
+/// pulse train (the oracle with no SS machinery in it at all):
+///
+/// | RHS term      | SS=1 value | vs. pulse train |
+/// |---------------|------------|-----------------|
+/// | autonomous    | 10.027269  | `7.6e-9`        |
+/// | `0.003*T`     | 9.545089   | **17% wrong**   |
+/// | `0.003*TIME`  | 9.545089   | **17% wrong**   |
+/// | `0.03*TAD`    | `NaN`      | —               |
+/// | `0.0*TAD`     | `NaN`      | —               |
+///
+/// So this gate closes an asymmetry in the **gradient** route only: `T` was
+/// already declining and its value is wrong anyway. Declining is still right —
+/// an analytic jet of a wrong value is worse than an FD one — but the value
+/// defect is separate and is not fixed here (#1139).
+#[test]
+fn ode_ss_bare_time_builtin_rhs_routes_to_fd() {
+    let model = tad_gate_model("TIME", "");
+    let prog = model
+        .ode_spec
+        .as_ref()
+        .and_then(|o| o.rhs_program.as_ref())
+        .expect("rhs program");
+    assert!(
+        !prog.uses_time_vars(),
+        "precondition: a bare `TIME` must NOT set the slot-backed flag — if it \
+         does, this test no longer covers the spelling it exists for"
+    );
+    assert!(prog.reads_time_builtin(), "`TIME` sets the built-in flag");
+    assert!(prog.reads_model_time(), "and the paired predicate sees it");
+
+    let mut ss = bolus_subject_wt(&[1.0, 2.0, 4.0], 70.0);
+    ss.doses[0].ss = true;
+    ss.doses[0].ii = 8.0;
+    assert!(
+        !ode_tvcov_supported(&model, &ss),
+        "SS + a bare-`TIME` RHS must decline to FD, exactly as the `T` spelling does"
+    );
+    // The non-SS neighbour must be unaffected: this gate is about steady state,
+    // not about `TIME`, so widening it must not sweep up an ordinary subject. Use
+    // a TV-covariate subject, which reaches `ode_tvcov_supported`'s trigger list
+    // through a trigger that is *independent of the model-time clause* — so the
+    // assert stays sharp no matter what that clause is set to. (It used to be the
+    // only way to make this non-vacuous at all: the trigger list asked the narrow
+    // predicate, so a plain bolus subject on this model had no trigger and took
+    // the static dual walk. The list asks the wide predicate now, so a plain bolus
+    // subject would also pass — but via the very clause under test, which is
+    // exactly the circularity the TV-cov subject avoids.)
+    let plain = tad_gate_subject();
+    assert!(
+        !plain.has_periodic_ss_dose() && plain.has_tv_covariates(),
+        "precondition: the neighbour has no SS dose but does have a TV-cov trigger"
+    );
+    assert!(
+        ode_tvcov_supported(&model, &plain),
+        "a non-SS subject on the same `TIME`-reading model must keep the event-driven \
+         dual walk — the SS clause must not sweep it up"
+    );
+}
+
+/// A pre-arrival observation on a model-time-reading RHS must take the
+/// **event-driven** dual walk, not the static one.
+///
+/// The static walk resolves `TAD`'s anchor as
+/// `doses.filter(|dt| dt <= t_start).fold(NEG_INFINITY, f64::max)`, so a segment
+/// starting before the first dose leaves it at `-inf`, and `eval_rhs_anchored`
+/// turns a missing/non-finite anchor into `TAD = NaN` — poisoning every
+/// `∂f/∂θ` and `∂f/∂η` for the subject. The event-driven walk seeds the same
+/// variable at the first arrival instead (that is #1073's pre-arrival anchor,
+/// which the static walk never received).
+///
+/// Nothing forces the routing on its own: with the model-time clause narrow, a
+/// plain bolus subject on this model had no trigger at all and fell to the
+/// static walk, so the `NaN` was reachable. This asserts the clause that now
+/// keeps it away — and the preconditions below make the assert non-vacuous by
+/// ruling out every *other* trigger, so it can only be passing for the reason
+/// it claims.
+#[test]
+fn a_pre_arrival_observation_on_a_tad_rhs_takes_the_event_driven_walk() {
+    let model = tad_gate_model("TAD", "");
+    let mut subject = bolus_subject_wt(&[0.4, 2.0, 4.0], 70.0);
+    // Move the dose after the first observation: that observation is now
+    // pre-arrival, which is the window with no qualifying dose.
+    subject.doses[0].time = 1.0;
+    assert!(
+        subject.obs_times[0] < subject.doses[0].time,
+        "precondition: the first observation must precede the first dose"
+    );
+    // No other trigger — otherwise this passes for an unrelated reason.
+    assert!(
+        !subject.has_tv_covariates()
+            && !subject.has_resets()
+            && !subject.has_periodic_ss_dose()
+            && !model.has_lagtime()
+            && !model.has_route_absorption_lag(),
+        "precondition: the model-time clause must be the only trigger in play"
+    );
+    assert!(
+        ode_analytical_supported(&model),
+        "precondition: the analytic ODE route must be available at all"
+    );
+    assert!(
+        ode_tvcov_supported(&model, &subject),
+        "a model-time-reading RHS must take the event-driven dual walk; on the \
+         static walk the pre-arrival segment has no dose anchor and `TAD` is NaN"
     );
 }
 

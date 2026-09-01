@@ -456,6 +456,42 @@ pub(crate) fn ode_subject_supported(model: &CompiledModel, subject: &Subject) ->
     // is per-event dynamic for the same reason a TV covariate is, so the static walk
     // cannot serve it — decline here (it routes to the event-driven TV walk via
     // `ode_tvcov_supported`, or to FD if that also declines) (#486).
+    //
+    // The model-time clause here stays **narrow**, deliberately, and does *not* mirror
+    // `ode_tvcov_supported`'s wide one. Recorded at length because widening it looks
+    // obviously right and is wrong.
+    //
+    // The static superposition walk serves a `TAD`-reading RHS whenever every observation
+    // follows a dose: `integrate_g`'s anchor is a per-segment fold over unlagged `d.time`,
+    // the same quantity production folds. Widening this clause turns
+    // `ode_tad_rhs_without_lagtime_static_walk_stays_analytic` red — such models would
+    // lose an analytic route and fall to FD for nothing.
+    //
+    // Precisely what that test does and does not establish: it asserts two booleans
+    // (`ode_analytical_supported` and `ode_subject_supported`), so it pins the *wiring*.
+    // It does not call `check_vs_production`, unlike both its siblings, so it does not
+    // measure exactness on the static walk. No committed test does — see the note at
+    // `ode_tvcov_supported` below, which says the same thing about the same walk.
+    //
+    // The pre-arrival window is the case that genuinely breaks the static walk (no dose at
+    // or before the segment start leaves the fold at `-inf`, so the RHS sees `TAD = NaN`).
+    // That is a *subject*-level property, not a model-level one, and it is already closed
+    // upstream: `ode_tvcov_supported` now admits every model-time model, so the dispatcher
+    // routes them to the event-driven walk and never consults this gate for them.
+    //
+    // A narrower clause keyed on the pre-arrival window was considered and is not needed —
+    // but NOT for the reason a first draft of this comment gave. That draft said every
+    // `ode_tvcov_supported` decline cause is "independently declined by
+    // `ode_analytical_supported` above". Four of its seven are not, because they are
+    // subject-level and that predicate takes only a model:
+    // `has_infusion_into_input_rate`, `ss_absorption_out_of_scope`, the absent modeled-dose
+    // slot, and `has_ss && reads_model_time`. The conclusion holds, through *this*
+    // function's own later clauses instead — `has_infusion_into_input_rate`,
+    // `has_periodic_ss_dose()` and `!all_doses_fixed()`. Those sit BELOW the model-time
+    // clause, so the guarantee is positional: making any of them analytic on the static
+    // walk (the file is full of "#486: SS now composes" notes, so this is live pressure)
+    // reopens the pre-arrival `NaN`. If you relax one, add the pre-arrival clause here.
+    // The padded 30 θ + 2 η fixture confirmed only the axis-cap cause, not the other six.
     if !ode_analytical_supported(model)
         || subject.has_tv_covariates()
         || crate::parser::model_parser::compiled_model_uses_time_builtin(model)
@@ -621,7 +657,60 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     // A `TIME`-built-in structural parameter is per-event dynamic (the switch fires at
     // event times), so it routes through the event-driven walk even with no TV
     // covariates — mirroring the closed-form `subject_sensitivities_tvcov` (#486).
-    let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
+    //
+    // The **wide** predicate, matching the value path's routing
+    // (`pk::model_uses_time_anywhere`). A non-autonomous `[odes]` RHS is as much a
+    // reason to take the event-driven walk as a per-event PK parameter is: production
+    // integrates such a model on `ode_predictions_event_driven`, so evaluating its
+    // gradient on the static superposition walk puts the value and the jet on two
+    // engines that break the timeline at different points.
+    //
+    // This clause was deliberately left narrow when the value path was widened, on the
+    // argument that the two walks anchor `TAD`/`TIME` identically for every subject that
+    // can reach the static walk — every genuinely divergent condition (a lagtime, TV
+    // covariates, SS, a modeled dose) being in the trigger list already. Measured
+    // against central FD of the production predictor at `reltol = 1e-10`, two bolus
+    // doses, that held: `0.3*TAD` agreed to 1.5e-9 on `∂f/∂η`, `0.03*TIME` to 6.4e-10.
+    //
+    // The hole is the **pre-arrival window**, and the table above could not see it because
+    // every fixture behind it observes only after the first dose. `integrate_g` resolves
+    // `TAD`'s anchor as `doses.filter(|dt| dt <= t_start).fold(NEG_INFINITY, f64::max)`, so
+    // a segment starting before the first dose leaves it at `-inf` and the RHS is evaluated
+    // with `TAD = NaN`. Measured with this gate on the narrow predicate, two doses at 1 and
+    // 6 with an observation at 0.4: `f = [0.0, NaN, NaN, NaN, NaN, NaN]`, 10 non-finite
+    // `∂f/∂η` and 30 non-finite `∂f/∂θ`. The provider returns `Some`, so those `NaN`s reach
+    // the FOCEI objective instead of falling back to FD. The event-driven walk seeds the
+    // same variable at the first arrival (#1073's pre-arrival anchor, which the static walk
+    // never received), and the same fixture then comes back fully finite and FD-parity
+    // clean. Pinned by `a_pre_arrival_observation_does_not_nan_the_analytic_sensitivities`.
+    //
+    // One thing this clause is **not** justified by, recorded because it was the first
+    // reason given and it does not survive measurement: `subject.has_resets()` is absent
+    // from the trigger list while present in the value path's condition, which looked like
+    // the same class of split. It is not — a reset + `TAD` subject on the static walk
+    // passes `check_full_provider_vs_fd`. The reason is *not* that the static walk
+    // re-anchors `TAD` across a reset: **neither walk re-anchors**. Both fold over dose
+    // times only (this file's `filter(|dt| dt <= t_start)` fold, and `predictions.rs`'s
+    // `tad_anchor` fold over `d.time + lag`), and neither consults `reset_floor`, which
+    // is tracked but unused for this. They agree because both ignore the reset, so a
+    // parity check between them structurally cannot see it. Widening still subsumes the
+    // reset case, but the reset case was never the defect.
+    //
+    // The cost is that a `TAD`-reading model with no other trigger moves from the static
+    // jet to the event-driven one — the more general walk, and the one the value path
+    // already uses. For a subject whose observations all follow the first dose that is pure
+    // engine consistency rather than a correctness fix: the static walk's `last_dose_eff`
+    // fold is well-defined once a dose has landed, so its jet is FD-parity clean there too.
+    //
+    // That statement is about the *fold*, not about any test: no committed test measures
+    // the static walk on this fixture, because
+    // `tad_reading_model_without_a_lagtime_takes_a_route_that_matches_fd` asserts
+    // `ode_tvcov_supported` as a precondition and so panics under the narrow predicate
+    // rather than exercising the static walk. Establishing it would take a test that
+    // calls `integrate_g` directly. Recorded this way because an earlier revision of this
+    // comment claimed that test "passes under either predicate" — it cannot, and that was
+    // the same assert-without-measuring the rest of this comment exists to correct.
+    let uses_time = crate::pk::model_uses_time_anywhere(model);
     // A per-route absorption lag (`fn(..., lag=L)`, #859) makes each route's onset a moving
     // boundary (`t_dose + lag_cmt + lag_route`) with its own rate-on saltation — the same
     // event-time-shift family as a compartment lagtime — so it forces the event-driven walk
@@ -787,7 +876,24 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     // time, anchor 0), so a time/TAD-dependent RHS breaks the steady-state cycle recurrence —
     // the dual walk's monotonic TAD diverges from production's per-interval anchor, giving a
     // wrong prediction *and* gradient (#473 review #1, verified vs the production predictor).
-    if has_ss && ode.rhs_program.as_ref().is_some_and(|p| p.uses_time_vars()) {
+    //
+    // `reads_model_time`, not the bare `uses_time_vars` this gate asked until #1124: a bare
+    // `TIME` in the RHS compiles to `Op::PushTime`, which `uses_time_vars` structurally cannot
+    // see, so that spelling reached `equilibrate_ss_state_g` while `T` — the same quantity —
+    // declined. The gap was known: this gate's own regression test
+    // (`ode_ss_time_only_rhs_still_routes_to_fd`) spells the term `T` *to work around it*.
+    //
+    // The gate is about the analytic-vs-FD **gradient** route. It does not make SS + a
+    // non-autonomous RHS correct: measured against an explicit 40-cycle pulse train, the
+    // production *value* is 17% wrong for `T` and `TIME` alike, and `NaN` for `TAD`/`TAFD`
+    // even when the term's coefficient is zero. That is a separate defect (#1139); the
+    // same note is at `pk/mod.rs`, `pk/modified_release.rs`, and `ode_provider_tests.rs`.
+    if has_ss
+        && ode
+            .rhs_program
+            .as_ref()
+            .is_some_and(|p| p.reads_model_time())
+    {
         return false;
     }
     // EVID 3/4 resets and finite-duration infusions ARE handled (resets zero the state;
@@ -2551,13 +2657,14 @@ fn ode_iov_subject_supported(
     // regardless of outer/IOV dispatch.
     // SS combined with a non-autonomous RHS (reads `TIME`/`TAFD`/`TAD`) → FD: the SS
     // equilibration assumes a time-invariant pulse train, so the cycle recurrence breaks
-    // (mirrors `ode_tvcov_supported`, #473 review #1).
+    // (mirrors `ode_tvcov_supported`, #473 review #1). `reads_model_time` so the bare-`TIME`
+    // spelling is covered too (#1124) — see the note at the `ode_tvcov_supported` gate.
     if has_ss
         && model
             .ode_spec
             .as_ref()
             .and_then(|o| o.rhs_program.as_ref())
-            .is_some_and(|p| p.uses_time_vars())
+            .is_some_and(|p| p.reads_model_time())
     {
         return None;
     }

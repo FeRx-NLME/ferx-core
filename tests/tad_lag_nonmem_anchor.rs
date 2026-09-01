@@ -50,6 +50,12 @@
 //! on, and re-running it after a routing change is a deliberate act rather than an
 //! accident. #1110 still owns what `TAD` *means* in that window.
 //!
+//! **#1124** then made the forcing redundant a second way: a model-time-reading
+//! `[odes]` RHS now routes to the event-driven predictor on the predicate itself,
+//! with no covariate needed. Removing `WT` would drop `THETA(5)` and needs a fresh
+//! NONMEM run and a new committed OFV, so it stays here — but do not copy the trick
+//! into a new anchor; `mr_tad.ctl` has no `WT` column.
+//!
 //! ## Why the control streams look the way they do
 //!
 //! NONMEM has no `TAD` built-in in `$DES`, so the anchor is carried explicitly. Two
@@ -82,6 +88,7 @@
 //! - `data/tad_lag_{A,B}.csv` — the same CSVs (dose `CMT=1`, obs `CMT=1`, so no
 //!   re-keying is needed between engines).
 
+use ferx_core::ode::OdeMethod;
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions};
 use std::path::Path;
@@ -146,8 +153,12 @@ fn run_anchor(data: &str, nonmem_ofv: f64, tolerance: f64) {
         outer_maxiter: 0,
         run_covariance_step: false,
         verbose: false,
-        // NONMEM-equivalent ODE accuracy; pin the stepper so a later
-        // `ode_method = auto` probe change cannot move a regression anchor.
+        // NONMEM-equivalent ODE accuracy, and the stepper actually pinned:
+        // `FitOptions::default()` is `OdeMethod::Auto`, so without this line a
+        // change to the stiffness probe could move the anchor, and the committed
+        // companion (`nonmem_anchor/*_fit.ferx`, which sets `ode_method = rk45`)
+        // and this test would disagree at birth with nothing to catch it.
+        ode_method: OdeMethod::Rk45,
         ode_reltol: 1e-9,
         ode_abstol: 1e-11,
         inner_tol: 1e-6,

@@ -127,6 +127,57 @@ section of the SDLC for the versioning policy).
   top of them, so a tool and the CLI cannot diverge in how a model is loaded.
 
 ### Fixed
+- **An `EVID=2` record no longer aborts a fit on a parameter-static subject (#1124 review).**
+  Any subject routed to the event-driven walker while its PK parameters are constant — an
+  `EVID=3/4` reset, or (since the change above) an `[odes]` right-hand side that reads model
+  time — had its per-event parameter snapshots built with the `EVID=2` rows omitted, and the
+  walker asserts one snapshot per record. The run failed on an assertion rather than
+  returning a diagnostic, in release builds as well as debug (the assertion is
+  `assert_eq!`, not `debug_assert_eq!`; it unwinds, so from R it surfaces as an opaque
+  error rather than a message naming the subject). Reaching it needed only a dataset
+  carrying `EVID=2` rows alongside a varying column the model does not reference, because the
+  irrelevant-covariate pruning clears those rows' covariate snapshots while keeping their
+  times. Both the ODE and the analytical event-driven engines were affected.
+- **A pre-arrival observation on a model-time-reading `[odes]` RHS no longer puts `NaN`
+  into the FOCEI objective (#1124 review).** A subject observed before its first dose — a
+  baseline sample — took the static superposition walk for its analytic sensitivities, and
+  that walk resolves `TAD`'s anchor by a fold over doses at or before the segment start,
+  leaving it at `-inf` and evaluating the right-hand side with `TAD = NaN`. The provider
+  still reported success, so the `NaN` gradient reached the optimiser instead of falling
+  back to finite differences. Such subjects now take the event-driven walk, which seeds the
+  anchor at the first arrival. Affected fits change their reported `gradient_method` and
+  objective.
+- **Steady-state (`SS=1`) dosing on a model-time-reading `[odes]` RHS now takes finite
+  differences on both loops (#1124).** The three gates that decline the analytic jet for this
+  combination asked a predicate that could not see the bare `TIME` spelling, so a
+  `TIME`-reading right-hand side reached the analytic steady-state equilibration while the
+  identical model written with `T` correctly declined. Affected fits report a different
+  `gradient_method` and a correspondingly different objective. This changes only which
+  gradient is used; the steady-state *value* for such a model is wrong on every engine and is
+  tracked separately in #1139.
+- **An `[odes]` RHS that reads `TAD` is no longer silently dropped from the predictions
+  (#1124).** A model whose right-hand side read the time-after-dose built-in — for example
+  `- CL/V*central*(1 + 0.3*TAD)` on a mixed `first_order` + `zero_order` absorption model —
+  was served by the closed-form modified-release fast path, which never evaluates that
+  right-hand side. The `TAD` term was **absent** from the predictions, not approximated:
+  output was bit-identical to the same model with the term deleted, reaching 8× the correct
+  concentration by 12 h, with no error, no warning, and `converged: true`. Because the value
+  is wrong, the error reached `IPRED`, the OFV, residuals, and every downstream diagnostic.
+  Such models now integrate on the event-driven ODE path, which evaluates the right-hand side
+  as written. The same routing covers `TAFD`, `T`/`t`, and `TIME`, including when read only
+  from inside an `if` condition (measured 40% error, all four spellings) — the closed form's
+  time-invariance probe samples two times and could not see any of them. Models that do not
+  read model time are unaffected and keep the fast path.
+- **An `[odes]` RHS that reads `TAD` together with a lagtime no longer returns `NaN`
+  predictions (#1110).** The dense predictor anchored `TAD` on doses that had already arrived,
+  and under a lagtime none has at the first segment's start, so every prediction came back
+  `NaN`. These models now take the event-driven predictor, whose timeline starts at the lagged
+  arrival. (#1073, released alongside this, independently gives the dense predictor a
+  pre-arrival anchor, so the two engines now agree to 6e-12 on such a model rather than one of
+  them being unusable.) One part of #1110 stays open and is **not** fixed here: the variance
+  path used by `[diffusion]` / EKF models still reaches the dense predictor with empty
+  parameter slices, returning `p_obs = NaN` and `ipred = 0` for any `TAD`-reading right-hand
+  side, with or without a lagtime (#1131).
 - **41 dead links and 11 duplicate anchors in the documentation (#1163).** Every internal
   documentation link now resolves, anchor included: numbered headings (`## 3. Communication` is
   addressed as `#communication`, not `#3-communication`), anchors hand-written with a double
