@@ -129,6 +129,7 @@ jobs:
             --test nn_dcm_smoke \
             --test nn_fit_convergence \
             --test nn_fit_smoke \
+            --test nn_regularization \
             --test pktte_tdep_nonmem_anchor \
             --test tte_convergence \
             --test tte_smoke \

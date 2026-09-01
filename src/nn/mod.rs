@@ -1043,7 +1043,7 @@ pub struct CovariateNn {
 /// A marginal partial-dependence grid for the smoothness/curvature penalty.
 ///
 /// For each NN input in turn, the input is swept across its observed range in
-/// **z-scored** space (uniform step [`NN_SMOOTH_GRID_STEP_Z`]) while every other
+/// **z-scored** space (uniform step `NN_SMOOTH_GRID_STEP_Z`) while every other
 /// input is held at its median. Each interior node contributes a triple of
 /// **raw** input vectors `(x−h, x, x+h)` at which the penalty finite-differences
 /// the 2nd derivative `C = f(x+h) − 2·f(x) + f(x−h)`. The grid mirrors the
@@ -1884,9 +1884,13 @@ mod invert_tests {
             }
         }
     }
+}
 
-    // -----------------------------------------------------------------
-    // Regularization: L2 (weight-decay) + smoothness (curvature)
+#[cfg(test)]
+mod regularization_tests {
+    use super::*;
+    use approx::assert_relative_eq;
+
     // -----------------------------------------------------------------
 
     /// Deterministic non-trivial weights, small magnitudes so tanh stays in a

@@ -809,12 +809,20 @@ pub struct ferx_core::nn::CovariateNn
 pub ferx_core::nn::CovariateNn::mapper: ferx_core::nn::NamedMlpMapper
 pub ferx_core::nn::CovariateNn::name: alloc::string::String
 pub ferx_core::nn::CovariateNn::weights_offset: usize
+pub struct ferx_core::nn::CurvatureGrid
+impl ferx_core::nn::CurvatureGrid
+pub fn ferx_core::nn::CurvatureGrid::build(input_values: &[alloc::vec::Vec<f64>], step_z: f64) -> Self
+pub fn ferx_core::nn::CurvatureGrid::is_empty(&self) -> bool
 pub struct ferx_core::nn::MlpMapper
 impl ferx_core::nn::MlpMapper
+pub fn ferx_core::nn::MlpMapper::curvature_penalty(&self, weights: &[f64], grid: &ferx_core::nn::CurvatureGrid, lambda: f64) -> (f64, alloc::vec::Vec<f64>)
+pub fn ferx_core::nn::MlpMapper::curvature_penalty_value(&self, weights: &[f64], grid: &ferx_core::nn::CurvatureGrid, lambda: f64) -> f64
 pub fn ferx_core::nn::MlpMapper::forward(&self, x: &[f64], weights: &[f64]) -> core::result::Result<alloc::vec::Vec<f64>, ferx_core::nn::NnError>
 pub fn ferx_core::nn::MlpMapper::hidden_activation(&self) -> ferx_core::nn::Activation
 pub fn ferx_core::nn::MlpMapper::jacobian(&self, x: &[f64], weights: &[f64]) -> core::result::Result<nalgebra::base::alias::DMatrix<f64>, ferx_core::nn::NnError>
 pub fn ferx_core::nn::MlpMapper::jacobian_preactivation(&self, x: &[f64], weights: &[f64]) -> core::result::Result<nalgebra::base::alias::DMatrix<f64>, ferx_core::nn::NnError>
+pub fn ferx_core::nn::MlpMapper::l2_weight_penalty(&self, weights: &[f64], lambda: f64) -> (f64, alloc::vec::Vec<f64>)
+pub fn ferx_core::nn::MlpMapper::l2_weight_penalty_value(&self, weights: &[f64], lambda: f64) -> f64
 pub fn ferx_core::nn::MlpMapper::layer_sizes(&self) -> &[usize]
 pub fn ferx_core::nn::MlpMapper::n_inputs(&self) -> usize
 pub fn ferx_core::nn::MlpMapper::n_outputs(&self) -> usize
@@ -823,6 +831,7 @@ pub fn ferx_core::nn::MlpMapper::new(layers: alloc::vec::Vec<usize>, hidden_acti
 pub fn ferx_core::nn::MlpMapper::output_activation(&self) -> ferx_core::nn::Activation
 pub fn ferx_core::nn::MlpMapper::output_bias_index(&self, k: usize) -> usize
 pub fn ferx_core::nn::MlpMapper::output_weight_range(&self) -> core::ops::range::Range<usize>
+pub fn ferx_core::nn::MlpMapper::weight_param_indices(&self) -> alloc::vec::Vec<usize>
 pub struct ferx_core::nn::NamedMlpMapper
 impl ferx_core::nn::NamedMlpMapper
 pub fn ferx_core::nn::NamedMlpMapper::forward_raw(&self, weights: &[f64], covariates: &std::collections::hash::map::HashMap<alloc::string::String, f64>) -> core::result::Result<alloc::vec::Vec<f64>, ferx_core::nn::NnError>
@@ -839,6 +848,12 @@ pub fn ferx_core::nn::NamedMlpMapper::jacobian(&self, weights: &[f64], covariate
 pub fn ferx_core::nn::NamedMlpMapper::n_outputs(&self) -> usize
 pub fn ferx_core::nn::NamedMlpMapper::n_weights(&self) -> usize
 pub fn ferx_core::nn::NamedMlpMapper::output_names(&self) -> &[alloc::string::String]
+pub struct ferx_core::nn::NnRegularizer
+impl ferx_core::nn::NnRegularizer
+pub fn ferx_core::nn::NnRegularizer::add_packed_gradient(&self, theta: &[f64], grad: &mut [f64])
+pub fn ferx_core::nn::NnRegularizer::build(model: &ferx_core::CompiledModel, population: &ferx_core::Population, options: &ferx_core::FitOptions) -> Self
+pub fn ferx_core::nn::NnRegularizer::is_active(&self) -> bool
+pub fn ferx_core::nn::NnRegularizer::penalty_value(&self, theta: &[f64]) -> f64
 pub trait ferx_core::nn::CovariateMapper: core::marker::Send + core::marker::Sync
 pub fn ferx_core::nn::CovariateMapper::forward(&self, weights: &[f64], covariates: &std::collections::hash::map::HashMap<alloc::string::String, f64>, out: &mut ferx_core::PkParams) -> core::result::Result<(), ferx_core::nn::NnError>
 pub fn ferx_core::nn::CovariateMapper::jacobian(&self, weights: &[f64], covariates: &std::collections::hash::map::HashMap<alloc::string::String, f64>) -> core::result::Result<nalgebra::base::alias::DMatrix<f64>, ferx_core::nn::NnError>
@@ -2575,6 +2590,8 @@ pub ferx_core::types::FitOptions::mu_referencing: bool
 pub ferx_core::types::FitOptions::multi_start_seed: core::option::Option<u64>
 pub ferx_core::types::FitOptions::n_agq: usize
 pub ferx_core::types::FitOptions::n_starts: usize
+pub ferx_core::types::FitOptions::nn_l2_lambda: f64
+pub ferx_core::types::FitOptions::nn_smooth_lambda: f64
 pub ferx_core::types::FitOptions::npde_nsim: usize
 pub ferx_core::types::FitOptions::npde_seed: core::option::Option<u64>
 pub ferx_core::types::FitOptions::ode_abstol: f64
@@ -3913,6 +3930,8 @@ pub ferx_core::FitOptions::mu_referencing: bool
 pub ferx_core::FitOptions::multi_start_seed: core::option::Option<u64>
 pub ferx_core::FitOptions::n_agq: usize
 pub ferx_core::FitOptions::n_starts: usize
+pub ferx_core::FitOptions::nn_l2_lambda: f64
+pub ferx_core::FitOptions::nn_smooth_lambda: f64
 pub ferx_core::FitOptions::npde_nsim: usize
 pub ferx_core::FitOptions::npde_seed: core::option::Option<u64>
 pub ferx_core::FitOptions::ode_abstol: f64
