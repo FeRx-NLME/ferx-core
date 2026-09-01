@@ -1,4 +1,5 @@
 mod bootstrap_cmd;
+mod gam_cmd;
 
 use ferx_core::NcaInit;
 use std::env;
@@ -13,6 +14,8 @@ Usage: ferx <model.ferx> --data <data.csv> [--threads N|auto] [--output <run.fit
        ferx summary <run.fitrx> [<run2.fitrx> ...]
        ferx bootstrap <model.ferx> [--data <data.csv>] [--samples N] [--seed N]
                       [--stratify-on COL] [--threads N]   (see `ferx bootstrap --help`)
+       ferx gam      <model.ferx>  --data <data.csv> [--output gam.csv] [--threads N]
+                                                         (see `ferx gam --help`)
 
 Fits a NLME model and writes sdtab.csv with residuals.
 Data must be in NONMEM format (ID, TIME, DV, EVID, AMT, CMT, ...)
@@ -101,6 +104,10 @@ fn main() {
     // `ferx model.ferx` still means what it always did.
     if args.get(1).map(String::as_str) == Some("bootstrap") {
         std::process::exit(bootstrap_cmd::run(&args));
+    }
+
+    if args.get(1).map(String::as_str) == Some("gam") {
+        std::process::exit(gam_cmd::run(&args));
     }
 
     if args.len() < 2 {

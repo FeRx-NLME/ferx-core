@@ -235,6 +235,42 @@ pub fn gam_screen(fit: &FitResult, pop: &Population, opts: &GamOptions) -> GamRe
     }
 }
 
+// ── CSV output ────────────────────────────────────────────────────────────────
+
+/// Write a [`GamResult`] to a CSV file at `path`.
+///
+/// The CSV has columns: `eta_name,covariate,delta_aic,best_form,aic,aic_null,r_squared,shrinkage`.
+pub fn write_gam_csv(result: &GamResult, path: &str) -> Result<(), String> {
+    use std::fmt::Write as FmtWrite;
+    use std::fs;
+
+    let mut buf =
+        String::from("eta_name,covariate,delta_aic,best_form,aic,aic_null,r_squared,shrinkage\n");
+    for eta in &result.eta_results {
+        for s in &eta.covariate_scores {
+            let form = match &s.best_form {
+                CovariateForm::Linear => "Linear".to_string(),
+                CovariateForm::Spline { df } => format!("Spline(df={df})"),
+                CovariateForm::Categorical => "Categorical".to_string(),
+            };
+            writeln!(
+                buf,
+                "{},{},{:.6},{},{:.6},{:.6},{:.6},{:.6}",
+                eta.eta_name,
+                s.covariate,
+                s.delta_aic,
+                form,
+                s.aic,
+                eta.aic_null,
+                s.r_squared,
+                eta.shrinkage,
+            )
+            .unwrap();
+        }
+    }
+    fs::write(path, buf).map_err(|e| format!("cannot write {path}: {e}"))
+}
+
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 /// Determine the kind of a covariate: prefer the `[covariates]`-block
