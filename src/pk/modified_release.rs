@@ -777,7 +777,34 @@ thread_local! {
     /// covers the same reduction unconditionally.
     static MR_TWIN_VERIFIED: std::cell::RefCell<std::collections::HashSet<MrVerifyKey>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
+
+    /// How many distinct parameter buckets have already been verified for each
+    /// `(spec, subject)`. The dedupe set above bounds repeats of the *same* bucket;
+    /// this bounds the number of *different* ones, which is what actually runs away.
+    ///
+    /// A fit walks θ and the per-subject η continuously, so `disp_bucket` (0.1-decade
+    /// bins on CL/V/Q/V2) yields a fresh key every time the inner loop nudges a
+    /// subject across a bin edge — and each fresh key costs a full extra
+    /// `ode_predictions`. Measured on `dose_form_lag_nonmem_anchor` (17 full FOCEI
+    /// fits): **574.7 s with the gate off, still unfinished past 4600 s with it
+    /// unbudgeted** — an ≥8× penalty that the earlier `--lib` measurement in the
+    /// dedupe-set doc could not see, because those tests evaluate at fixed
+    /// parameters instead of fitting.
+    ///
+    /// The gate is a *structural* check — does this admitted closed form reduce to
+    /// its own ODE twin — and structure does not change with the parameter regime.
+    /// Sampling a few regimes per subject keeps the regime coverage the bucket was
+    /// added for; sampling every regime a fit visits buys nothing and costs a solve
+    /// each time.
+    static MR_TWIN_BUDGET: std::cell::RefCell<
+        std::collections::HashMap<(usize, String), u32>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
+
+/// Distinct parameter buckets verified per `(spec, subject)` before the gate stops
+/// spending solves on that subject.
+#[cfg(debug_assertions)]
+const MR_TWIN_BUDGET_PER_SUBJECT: u32 = 4;
 
 /// Runtime verify-gate (#1124): re-validate an admitted closed form against its
 /// own integrated `OdeSpec` twin, in debug builds only.
@@ -859,16 +886,23 @@ fn verify_against_ode_twin(
         return;
     }
     let release = || MR_TWIN_VERIFIED.with(|seen| seen.borrow_mut().remove(&key));
+    // Budget check before anything expensive: a new bucket is only worth a solve
+    // while this subject still has budget left.
+    let budget_key = (key.0, key.1.clone());
+    let spent = MR_TWIN_BUDGET.with(|b| {
+        let mut b = b.borrow_mut();
+        let n = b.entry(budget_key).or_insert(0);
+        *n += 1;
+        *n
+    });
+    if spent > MR_TWIN_BUDGET_PER_SUBJECT {
+        return;
+    }
     /// A twin looser than this cannot out-resolve `verify_tol`, so it is not an oracle.
     const MR_TWIN_MAX_RELTOL: f64 = 1e-8;
     /// Companion bound on the absolute floor, which is what actually bit (#1124 review).
     const MR_TWIN_MAX_ABSTOL: f64 = 1e-10;
     let verify_tol = (500.0 * s.spec.solver_opts.reltol).max(1e-4);
-    let twin = crate::ode::ode_predictions(s.spec, &s.pk.values, theta, eta, subject);
-    if twin.len() != mr.len() {
-        release();
-        return;
-    }
     // Only a twin tight enough to out-resolve `verify_tol` may arbitrate. The integrator
     // controls its local error as `abstol + reltol·|y|`, so its relative accuracy is
     // `abstol/|y| + reltol`: once the trajectory decays toward `abstol`, the twin has no
@@ -887,6 +921,11 @@ fn verify_against_ode_twin(
     if s.spec.solver_opts.reltol > MR_TWIN_MAX_RELTOL
         || s.spec.solver_opts.abstol > MR_TWIN_MAX_ABSTOL
     {
+        release();
+        return;
+    }
+    let twin = crate::ode::ode_predictions(s.spec, &s.pk.values, theta, eta, subject);
+    if twin.len() != mr.len() {
         release();
         return;
     }
