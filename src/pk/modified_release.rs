@@ -1757,6 +1757,121 @@ mod tests {
         );
     }
 
+    /// An off-axis probe that returns **NaN** must decline, not slip through (#1149).
+    ///
+    /// This is the one branch of the off-axis residual that the three decline tests
+    /// above cannot reach — they all produce finite probes. It matters for a reason
+    /// the neighbouring `du0` guard already states at the top of this function: a
+    /// bare `>` comparison lets NaN pass, because `NaN > TOL` is **false**. So
+    /// without the `is_finite` check the residual below would compute
+    /// `(NaN - au).abs() > tol` → `false` and **admit** the model, serving NaN
+    /// predictions from the fast path.
+    ///
+    /// Note the asymmetry, which decides how this test has to be written: for
+    /// ±`Inf` the residual check declines on its own (`inf > tol` is true), so an
+    /// `Inf` fixture would cover the line while proving nothing. The fixture must
+    /// produce NaN, and the test asserts that it does.
+    ///
+    /// The model is exactly linear on every on-axis sample — `u = 0`, `eᵢ`, `2eᵢ`,
+    /// at both probe times — so it passes `du0`, homogeneity and time-invariance,
+    /// and is declined *only* at the off-axis ladder's top rung.
+    ///
+    /// **Getting a NaN out of this DSL takes work, and that is worth recording.**
+    /// The evaluator is deliberately hardened (`model_parser.rs`): `BinOp::Div`
+    /// returns `0.0` when `|denominator| < 1e-30`, `log`/`ln` clamp with
+    /// `v.max(1e-30)`, and `sqrt` clamps with `v.max(0.0)`. None of the usual
+    /// routes produce NaN. What is *not* clamped is `exp`, which overflows to
+    /// `+inf` above ~709 — so `exp(central) - exp(central)`, identically `0.0`
+    /// while `exp` is finite, becomes `inf - inf = NaN` once it is not.
+    ///
+    /// It has to sit behind the state branch rather than in the RHS directly. Left
+    /// bare, `exp(100)` is `2.7e43`, which *absorbs* the `-CL/V*central` term in
+    /// floating point: the probe at scale `1e2` returns `0.0` instead of `-5`, and
+    /// the model is declined by the residual comparison one rung early, never
+    /// reaching the guard under test. Gated above `1e5`, the first three rungs are
+    /// untouched and the top rung is NaN.
+    #[test]
+    fn declines_an_off_axis_probe_that_returns_nan() {
+        let src = |branch: &str| {
+            format!(
+                r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(20.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  KA  = TVKA
+[structural_model]
+  ode(states=[central])
+[odes]
+{branch}  d/dt(central) = first_order(ka=KA) - CL/V*central + EXTRA
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+            )
+        };
+        let theta = [1.0, 20.0, 1.5];
+        let eta = [0.0];
+
+        // Control: no branch, so the disposition is an ordinary linear 1-cpt and
+        // must still be admitted. Without this the decline below would not pin the
+        // NaN branch as the cause.
+        let control =
+            crate::parser::model_parser::parse_model_string(&src("  EXTRA = 0.0\n")).unwrap();
+        let cspec = control.ode_spec.as_ref().expect("ode model");
+        let cp = flat_params(&control, &theta, &eta);
+        assert!(
+            identify_disposition(cspec, &cp, 1.0).is_some(),
+            "precondition: the unbranched control must stay admitted"
+        );
+
+        // The branch fires only above 1e5, i.e. only at the ladder's top rung
+        // (`OFF_AXIS_PROBE_SCALES` = 1, 1e2, 1e4, 1e6).
+        let nan_src = src(
+            "  if (central > 1.0e5) {\n    EXTRA = exp(central) - exp(central)\n  } else {\n    EXTRA = 0.0\n  }\n",
+        );
+        let bad = crate::parser::model_parser::parse_model_string(&nan_src).unwrap();
+        let bspec = bad.ode_spec.as_ref().expect("ode model");
+        let bp = flat_params(&bad, &theta, &eta);
+
+        // Non-vacuity 1: every on-axis sample is finite AND matches the control, so
+        // the model reaches the off-axis loop rather than being declined earlier.
+        for u in [vec![0.0], vec![1.0], vec![2.0]] {
+            let f_bad = probe_rhs_f64(bspec, &u, &bp, 1.0).expect("probe");
+            let f_ctl = probe_rhs_f64(cspec, &u, &cp, 1.0).expect("probe");
+            assert!(
+                f_bad[0].is_finite(),
+                "on-axis probe at {u:?} must be finite, got {f_bad:?}"
+            );
+            assert!(
+                (f_bad[0] - f_ctl[0]).abs() < LINEARITY_TOL,
+                "on-axis probe at {u:?} must be bit-comparable to the control: \
+                 {f_bad:?} vs {f_ctl:?}"
+            );
+        }
+
+        // Non-vacuity 2: the top rung really is NaN, not Inf. An Inf probe would be
+        // declined by the residual comparison below the guard, so this test would
+        // pass with the guard removed and prove nothing.
+        let top = probe_rhs_f64(bspec, &[1.0e6], &bp, 1.0).expect("probe");
+        assert!(
+            top[0].is_nan(),
+            "the top rung must be NaN — Inf is caught by the residual check instead \
+             and would make this test vacuous: got {top:?}"
+        );
+
+        assert!(
+            identify_disposition(bspec, &bp, 1.0).is_none(),
+            "an off-axis probe returning NaN must be declined"
+        );
+    }
+
     // ── Layer 3 (the anchor): the admitted closed form must reduce to its own
     //    integrated OdeSpec twin, to solver tolerance. This is what ties the
     //    fast path to the (NONMEM-anchored) ODE path. Tight solver tol so the
