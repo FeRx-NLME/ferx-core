@@ -7964,3 +7964,146 @@ fn ss_residual_infusion_window_ends_where_the_previous_cycle_does() {
         max_relative = 1e-12
     );
 }
+
+// ── #1171: the route-onset break must reach every break-time builder ─────────
+
+/// [`zero_order_accumulator_spec`] with a **per-route lag** at free slot 6 — the
+/// #1171 fixture. `dy = 0`, so the compartment holds exactly the delivered mass and
+/// the truth at any `t` is a clamped ramp, computable in closed form without an
+/// integrator (see [`route_lagged_zero_order_truth`]).
+fn route_lagged_zero_order_accumulator_spec() -> OdeSpec {
+    let mut ode = zero_order_accumulator_spec();
+    ode.input_rate[0].lag_slot = Some(6);
+    ode
+}
+
+/// Two 100 mg doses at `t = 0` and `t = 12` into the zero-order route. The second
+/// window opens with the first dose's mass already in the compartment, so the
+/// *incoming* side of the later window is live — a single-dose fixture would leave
+/// `g(x⁻) = 0` there and could not tell a dropped window from a correct one.
+fn route_lagged_zero_order_doses() -> Vec<DoseEvent> {
+    vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+    ]
+}
+
+/// Exact accumulated mass for [`route_lagged_zero_order_accumulator_spec`]: each
+/// dose contributes a clamped linear ramp over `[t_dose + lag, t_dose + lag + dur]`.
+/// Independent of every ODE engine — the oracle, not a second implementation.
+fn route_lagged_zero_order_truth(t: f64, dur: f64, lag: f64, amt: f64) -> f64 {
+    [0.0f64, 12.0]
+        .iter()
+        .map(|&t0| amt * ((t - t0 - lag) / dur).clamp(0.0, 1.0))
+        .sum()
+}
+
+/// The two break-time builders that segment a dense solve must agree on a
+/// route-lagged subject. `build_segment_break_times` (the dense/simulate engines)
+/// omitted [`push_route_lag_break_times`] while `collect_dose_break_times` (the
+/// prediction engines) had it — #1171. `ode_predictions_with_states`' inline builder
+/// has no unit-callable entry point; it is pinned end-to-end by
+/// `route_lagged_zero_order_reaches_every_dense_engine` below.
+#[test]
+fn route_lagged_zero_order_break_builders_agree() {
+    const DUR: f64 = 2.0;
+    const LAG: f64 = 1.5;
+    let ode = route_lagged_zero_order_accumulator_spec();
+    let mut pk = pk_zero_order_vec(DUR, 1.0);
+    pk[6] = LAG;
+    let doses = route_lagged_zero_order_doses();
+    let lags = vec![0.0; doses.len()];
+    let f_bio = vec![1.0; doses.len()];
+    let subject = make_subject(doses, vec![24.0]);
+    let windows = zo_windows_for(&ode, &subject.doses, &lags, &pk);
+
+    let normalize = |mut v: Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
+        v
+    };
+    // The dense builder additionally brackets the timeline with the integration
+    // start and the terminal, so add both to the prediction side before comparing.
+    let mut from_predictions = vec![subject_integration_start(&subject), 24.0];
+    collect_dose_break_times(&mut from_predictions, &ode, &subject, &lags, &f_bio, &pk);
+    let from_predictions = normalize(from_predictions);
+
+    let from_dense = build_segment_break_times(&ode, &pk, &subject, &lags, &f_bio, &windows, 24.0);
+
+    assert_eq!(
+        from_predictions, from_dense,
+        "the dense builder must segment a route-lagged subject exactly as the \
+         prediction builder does"
+    );
+    // Non-degeneracy: both windows' onsets are actually in the list, so the
+    // comparison above is not two empty vectors agreeing.
+    for want in [LAG, LAG + DUR, 12.0 + LAG, 12.0 + LAG + DUR] {
+        assert!(
+            from_predictions.iter().any(|&t| (t - want).abs() < 1e-12),
+            "break at {want} missing from {from_predictions:?}"
+        );
+    }
+}
+
+/// End-to-end #1171: all three dense engines must deliver the lagged zero-order
+/// mass, checked against the closed-form ramp rather than against each other.
+///
+/// - `ode_predictions` (the objective's engine) was always correct.
+/// - `ode_predictions_with_states` (sdtab IPRED + compartment states) uses its own
+///   inline break-time builder — the near-copy the `KEEP-IN-SYNC` note on it warns
+///   about, and the copy that drifted.
+/// - `ode_dense_solve_states` (sdtab states under TV covariates, the joint PK-TTE
+///   hazard, the Markov endpoint NLL, the adaptive AUC signal, `[derived]` grid
+///   integrals) goes through `build_segment_break_times`.
+///
+/// Sample times straddle each window on both sides and sit *inside* the first one,
+/// where the truth is a strict partial (`(t − 1.5)/2 · 100`) that neither an
+/// all-delivered nor an all-dropped window can produce.
+#[test]
+fn route_lagged_zero_order_reaches_every_dense_engine() {
+    const DUR: f64 = 2.0;
+    const LAG: f64 = 1.5;
+    const AMT: f64 = 100.0;
+    let ode = route_lagged_zero_order_accumulator_spec();
+    let mut pk = pk_zero_order_vec(DUR, 1.0);
+    pk[6] = LAG;
+    // 1.0 pre-onset, 2.3/3.1 inside and just past the first window, 11.5 the trough,
+    // 13.8/15.0 inside and just past the second, 24.0 the tail.
+    let obs = vec![1.0, 2.3, 3.1, 4.2, 11.5, 12.4, 13.8, 15.0, 18.0, 24.0];
+    let subject = make_subject(route_lagged_zero_order_doses(), obs.clone());
+    let want: Vec<f64> = obs
+        .iter()
+        .map(|&t| route_lagged_zero_order_truth(t, DUR, LAG, AMT))
+        .collect();
+    assert!(
+        want.iter().any(|&m| m > 1.0 && m < AMT - 1.0),
+        "the oracle must include a partially-delivered window, else a dropped \
+         window is indistinguishable from a completed one"
+    );
+
+    let check = |got: &[f64], what: &str| {
+        for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+            assert!(
+                (g - w).abs() <= 1e-6 * (1.0 + w.abs()),
+                "{what}: t={} gives {g}, want {w}",
+                obs[i]
+            );
+        }
+    };
+
+    let preds = ode_predictions(&ode, &pk, &[], &[], &subject);
+    check(&preds, "ode_predictions");
+
+    let (states_ipred, states) = ode_predictions_with_states(&ode, &pk, &[], &[], &subject);
+    check(&states_ipred, "ode_predictions_with_states ipred");
+    check(
+        &states.iter().map(|u| u[0]).collect::<Vec<_>>(),
+        "ode_predictions_with_states states",
+    );
+
+    let dense = ode_dense_solve_states(&ode, &pk, &[], &[], &subject, &obs);
+    check(
+        &dense.iter().map(|u| u[0]).collect::<Vec<_>>(),
+        "ode_dense_solve_states",
+    );
+}

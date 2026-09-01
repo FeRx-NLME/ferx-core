@@ -5444,6 +5444,12 @@ pub fn ode_predictions_ekf(
 /// `ode_predictions` **must be mirrored here**. Search for the parallel line in
 /// `ode_predictions` and apply the same change.
 ///
+/// This note is not enough on its own: the inline break-time builder below drifted
+/// from `collect_dose_break_times` anyway, losing the per-route absorption onset
+/// and with it every lagged `zero_order` window (#1171). The end-to-end guard is
+/// `ode::predictions::tests::route_lagged_zero_order_reaches_every_dense_engine`,
+/// which checks all three dense engines against a closed-form ramp.
+///
 /// # Precondition
 ///
 /// The caller **must not** pass a subject that has EVID=3/4 resets
@@ -5503,6 +5509,14 @@ pub fn ode_predictions_with_states(
             break_times.push(residual_end);
         }
     }
+    // Per-route absorption lag (`fn(..., lag=L)`): a route with its own lag switches
+    // on past the dose's compartment-lag break, so add a break at each route onset —
+    // the same call `collect_dose_break_times` makes (#1171). Without it a lagged
+    // `zero_order` window's start is unbracketed and `active_zero_order_inputs`'
+    // full-containment test drops the constant rate for the whole segment.
+    push_route_lag_break_times(&mut break_times, ode, subject, &dose_lagtimes, |f| {
+        f.route_lag(pk_params_flat)
+    });
     // Zero-order windows for this subject (#504): the dense paths have a single
     // PK snapshot, so the per-dose `dur`/`F`/`lag` come from `pk_params_flat`.
     // Break at each window end so segments align with the cutoff, and reuse the
@@ -5751,13 +5765,20 @@ pub fn ode_predictions_event_driven_with_states(
 
 /// Build the sorted, deduped dose-segment break times for a subject — the points
 /// where the integrator must stop and re-apply boundary events (dose pulses, lags,
-/// infusion ends, SS-record seeds, EVID-3/4 resets, zero-order windows). `terminal`
-/// is the final break: the last `saveat` for the dense solve, or the horizon for
-/// the event-time search. Shared by [`ode_dense_solve_states`] and
-/// [`ode_solve_until_chz_threshold`] so the two segment the timeline identically
-/// (a divergence here would make a simulated event time inconsistent with the
-/// fitted hazard).
+/// infusion ends, SS-record seeds, EVID-3/4 resets, per-route absorption onsets,
+/// zero-order windows). `terminal` is the final break: the last `saveat` for the
+/// dense solve, or the horizon for the event-time search. Shared by
+/// [`ode_dense_solve_states`] and [`ode_solve_until_chz_threshold`] so the two
+/// segment the timeline identically (a divergence here would make a simulated event
+/// time inconsistent with the fitted hazard).
+///
+/// It must also agree with [`collect_dose_break_times`], the prediction engines'
+/// builder — `ode::predictions::tests::route_lagged_zero_order_break_builders_agree`
+/// asserts that on a route-lagged subject, after this one silently lost the
+/// route-onset break (#1171).
 fn build_segment_break_times(
+    ode: &OdeSpec,
+    pk_params_flat: &[f64],
     subject: &Subject,
     dose_lagtimes: &[f64],
     dose_f_bio: &[f64],
@@ -5790,6 +5811,14 @@ fn build_segment_break_times(
     for &rt in &subject.reset_times {
         break_times.push(rt);
     }
+    // Per-route absorption lag (`fn(..., lag=L)`): a route with its own lag switches
+    // on past the dose's compartment-lag break, so add a break at each route onset —
+    // the same call `collect_dose_break_times` makes (#1171). Without it a lagged
+    // `zero_order` window's start is unbracketed and `active_zero_order_inputs`'
+    // full-containment test drops the constant rate for the whole segment.
+    push_route_lag_break_times(&mut break_times, ode, subject, dose_lagtimes, |f| {
+        f.route_lag(pk_params_flat)
+    });
     push_zero_order_break_times(&mut break_times, zo_windows);
     break_times.push(terminal);
     break_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -5975,8 +6004,15 @@ pub fn ode_dense_solve_states(
     let zo_windows = zero_order_windows(&subject.doses, &dose_lagtimes, &dose_f_bio, |_, d| {
         zero_order_dur_and_frac_for_dose(ode, d, pk_params_flat)
     });
-    let break_times =
-        build_segment_break_times(subject, &dose_lagtimes, &dose_f_bio, &zo_windows, t_last);
+    let break_times = build_segment_break_times(
+        ode,
+        pk_params_flat,
+        subject,
+        &dose_lagtimes,
+        &dose_f_bio,
+        &zo_windows,
+        t_last,
+    );
 
     let mut active_infusions: Vec<(usize, f64, f64)> = Vec::new();
 
@@ -6191,8 +6227,15 @@ pub(crate) fn ode_solve_until_chz_threshold(
     let zo_windows = zero_order_windows(&subject.doses, &dose_lagtimes, &dose_f_bio, |_, d| {
         zero_order_dur_and_frac_for_dose(ode, d, pk_params_flat)
     });
-    let mut break_times =
-        build_segment_break_times(subject, &dose_lagtimes, &dose_f_bio, &zo_windows, horizon);
+    let mut break_times = build_segment_break_times(
+        ode,
+        pk_params_flat,
+        subject,
+        &dose_lagtimes,
+        &dose_f_bio,
+        &zo_windows,
+        horizon,
+    );
     break_times.retain(|&t| t <= horizon + 1e-15);
 
     let mut active_infusions: Vec<(usize, f64, f64)> = Vec::new();

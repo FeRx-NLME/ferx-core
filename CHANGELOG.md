@@ -127,6 +127,22 @@ section of the SDLC for the versioning policy).
   top of them, so a tool and the CLI cannot diverge in how a model is loaded.
 
 ### Fixed
+- **A lagged `zero_order` absorption route is no longer dropped by the ODE engines that serve
+  diagnostics, the joint PK-TTE hazard and `simulate()` (#1171).** `zero_order(dur=D, lag=L)`
+  is delivered as a per-segment constant rate, admitted only when the segment sits fully inside
+  the window `[t_dose + L, t_dose + L + D]`, so the integrator has to break its timeline at the
+  route's onset. Two of the four break-time builders pushed only the window's *end*, leaving the
+  start unbracketed — the rate was then dropped for the whole window, and a model whose only
+  input is a lagged `zero_order` read **exactly zero everywhere** on those paths. Affected:
+  the sdtab `IPRED` and compartment-state columns (and the `IWRES`/`CWRES`/`[derived]` values
+  computed from them), `[derived]` grid integrals, the **joint PK-TTE** cumulative hazard and
+  its contribution to the objective — which collapsed to the drug-free baseline `H0·t`,
+  removing the entire drug effect — the Markov/CTMM endpoint likelihood, the adaptive-dosing
+  window AUC signal, and `simulate()` event times, where a subject who should have had an event
+  was administratively censored. A **pure-Gaussian** fit's OFV and `predict()` are unaffected:
+  their predictor already carried the onset break, which is why no existing test caught this.
+  Anchored against a new NONMEM `ADVAN13` run (`nonmem_anchor/lagged_zo.ctl`, `D1`+`ALAG1` with
+  `RATE=-2`), which the fixed paths now match to the `$TABLE` print precision.
 - **An `[odes]` right-hand side that is nonlinear in the compartment amounts is no longer
   served by the closed-form fast path (#1149).** Linearity was established by evaluating the
   right-hand side one compartment at a time with every other amount held at zero, so a term
