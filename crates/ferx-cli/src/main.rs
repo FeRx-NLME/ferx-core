@@ -1,6 +1,8 @@
 mod bootstrap_cmd;
 mod gam_cmd;
 
+use ferx_tools::gam::{gam_screen, write_gam_csv, GamOptions};
+
 use ferx_core::NcaInit;
 use std::env;
 use std::time::Instant;
@@ -14,7 +16,7 @@ Usage: ferx <model.ferx> --data <data.csv> [--threads N|auto] [--output <run.fit
        ferx summary <run.fitrx> [<run2.fitrx> ...]
        ferx bootstrap <model.ferx> [--data <data.csv>] [--samples N] [--seed N]
                       [--stratify-on COL] [--threads N]   (see `ferx bootstrap --help`)
-       ferx gam      <model.ferx>  --data <data.csv> [--output gam.csv] [--threads N]
+       ferx gam      <model.ferx>  --data <data.csv> [--csv gam.csv] [--threads N]
                                                          (see `ferx gam --help`)
 
 Fits a NLME model and writes sdtab.csv with residuals.
@@ -37,6 +39,9 @@ Data must be in NONMEM format (ID, TIME, DV, EVID, AMT, CMT, ...)
 --inits-from-nca[=METHOD]  derive NCA-based starting values before fitting,
                overriding the model file. METHOD is nca, nca_sweep (default),
                or nca_ebe; a bare --inits-from-nca means nca_sweep.
+
+--gam          run GAM covariate pre-screening after fitting and write
+               {model}-gam.csv  (same as `ferx gam` but in one step)
 
 --clean        ignore any resume checkpoint ({model}.tmp) and start fresh.
                By default a run periodically checkpoints and, if interrupted,
@@ -266,6 +271,20 @@ fn main() {
                 ) {
                     Ok(()) => eprintln!("Fit bundle written to {}", out),
                     Err(e) => eprintln!("Warning: failed to write fit bundle: {}", e),
+                }
+            }
+
+            // --gam: run GAM covariate pre-screening after fitting and write CSV.
+            if args.iter().any(|a| a == "--gam") {
+                let gam_opts = GamOptions::default();
+                let gam = gam_screen(&fit_result, &population, &gam_opts);
+                for w in &gam.warnings {
+                    eprintln!("GAM Warning: {w}");
+                }
+                let gam_path = format!("{}-gam.csv", model_name);
+                match write_gam_csv(&gam, &gam_path) {
+                    Ok(()) => eprintln!("GAM results written to {}", gam_path),
+                    Err(e) => eprintln!("Warning: failed to write GAM results: {}", e),
                 }
             }
 
