@@ -20,6 +20,20 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Changed
+- **The four documentation sections the callout blind spot had been hiding are split into
+  addressable subsections (#1190).** ODE models' *Which regime am I in?* gains **Where the step
+  counts show up**, **Bounding what a stalled segment costs**, **Measured: an accuracy-limited
+  fit** and **Every feature works with every method**; the analytic transit closed form gains
+  **Scope (first version)** and **The flip-flop regime**; VI's *How `σ` is updated* gains **Why
+  the default is 32 draws** and **If a VI fit lands short**; adaptive dosing's *Keys* gains
+  **Writing an `observe` expression**. Nothing was deleted and every existing anchor still
+  resolves — the R1 baseline is one entry shorter than before this PR, not longer.
+- **`tools/render-docs.sh` renders the docs site; prefer it to a bare `quarto render docs`
+  (#1190).** Quarto's project input discovery skips any path containing a hidden (dot-prefixed)
+  directory component, so from a worktree under `.claude/worktrees/<name>/` a plain
+  `quarto render docs` discovers zero inputs: it writes `robots.txt` and `sitemap.xml`, renders no
+  page, warns about nothing and exits 0. The script stages `docs/` outside the dot directory when
+  it has to, and fails loudly on a zero-page render.
 - **The repo is now a cargo workspace, and the `ferx` binary moved into a `ferx-cli` package
   (#1114).** The installed binary is unchanged — still `ferx`, same arguments, same output — but
   building it from a source checkout now needs the workspace or the package named:
@@ -132,7 +146,8 @@ section of the SDLC for the versioning policy).
   rendered page gets neither a section nor an anchor from it — but `docs-lint` counted all 37 of
   them across 15 pages as real headings. That chopped each callout's body into chunks R1 never
   measured whole (three oversized sections were hidden, and one baselined section was reported at
-  5,756 characters when it is 7,331), and registered ids R3 and R4 treated as addressable. A
+  5,756 characters when it is 7,331 — all four are now split, see below), and registered ids R3
+  and R4 treated as addressable. A
   heading *later* inside a callout is still a real section. Slug generation is fixed alongside it:
   inside a code span `<op>` is literal text, not an HTML tag, so
   `` ## Rules — `when signal <op> <value>` `` addresses as `#rules-when-signal-op-value` and no

@@ -96,10 +96,12 @@ fn section_ids(html: &str) -> Vec<String> {
 /// Opt-in cross-check of the id algorithm against a real Quarto render.
 ///
 /// `docs/_site/` is generated and git-ignored, so this cannot run in CI and
-/// must not fail a developer with a stale render. Refresh with `quarto render
-/// docs`, then:
+/// must not fail a developer with a stale render. Refresh it with
+/// `tools/render-docs.sh` — not a bare `quarto render docs`, which silently
+/// renders nothing from a worktree under a dot directory (#1190) — then:
 ///
 /// ```text
+/// tools/render-docs.sh
 /// DOCS_LINT_VERIFY_RENDER=1 cargo test -p docs-lint -- --ignored
 /// ```
 #[test]

@@ -229,7 +229,9 @@ absorption with `ka = 1/MTT`.
 it (the flip-flop regime) ferx routes the model to its ODE twin automatically — see
 the flip-flop note below.
 
-**Scope (first version).** This analytic model supports single and multiple
+### Scope (first version)
+
+This analytic model supports single and multiple
 **bolus** doses into the depot (`CMT=1`), bioavailability, lag time, and a `central`
 initial amount. A model whose disposition switches mid-profile — a **time-varying
 covariate** or a `TIME`-dependent structural parameter — or that carries
@@ -250,6 +252,8 @@ non-depot (`CMT≠1`) dose, and a `depot` initial amount are still rejected** wi
 message — use the `transit()` ODE forcing above for those. The two paths agree to ODE-solver
 tolerance (`tests/transit_analytic_equivalence.rs`), so the forcing model is the
 drop-in choice when you need a feature the closed form does not yet cover.
+
+### The flip-flop regime
 
 When the disposition rate reaches or exceeds the transit rate `KTR = (n+1)/mtt`
 (the **flip-flop** regime — a slow-absorption depot whose absorption rate-limits a

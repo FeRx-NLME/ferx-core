@@ -61,6 +61,10 @@ with the run, never with a fitted model's parameters.
 | `with_assay_error` | signal¹ | Titrate on the **noised measurement** of a model output (named by `assay_cmt`) instead of a latent expression (default `false`). The signal's value comes from that output's `[scaling]` readout and its σ from that output's `[error_model]`, so the two are always on the same scale — there is no re-typed `observe` expression to mis-scale. Mutually exclusive with `observe`. |
 | `assay_cmt` | | The 1-based compartment of the model output measured under `with_assay_error` — its `[scaling]` readout is the signal value and its `[error_model]` σ the noise. **Required** with `with_assay_error`. |
 
+¹ **The signal source is exactly one of `observe` (a latent expression, un-noised) or `with_assay_error = true` + `assay_cmt` (a noised model output).** Setting both, or neither, is a parse error. Titrating on a *measured* quantity uses the model's own output (so its value and σ can never disagree on scale); titrating on a *derived latent* quantity (effect-site, a ratio — anything with no error model) uses `observe`.
+
+#### Writing an `observe` expression
+
 ::: {.callout-important}
 ## `observe` must not read a dose attribute
 
@@ -95,8 +99,6 @@ one model can never read the column in one block and the clock in the other. Whe
 `T` does fold into the built-in, the warning is reported at parse time — `observe`
 itself is compiled at simulate time, where there is no warnings channel. See
 [Scaling](scaling.qmd#if-your-dataset-has-a-column-named-t).
-
-¹ **The signal source is exactly one of `observe` (a latent expression, un-noised) or `with_assay_error = true` + `assay_cmt` (a noised model output).** Setting both, or neither, is a parse error. Titrating on a *measured* quantity uses the model's own output (so its value and σ can never disagree on scale); titrating on a *derived latent* quantity (effect-site, a ratio — anything with no error model) uses `observe`.
 
 ### Rules — `when signal <op> <value> : <action>`
 
