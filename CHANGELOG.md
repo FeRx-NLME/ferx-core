@@ -127,6 +127,18 @@ section of the SDLC for the versioning policy).
   top of them, so a tool and the CLI cannot diverge in how a model is loaded.
 
 ### Fixed
+- **The docs linter no longer reads a Quarto callout title as a section boundary (#1190).**
+  Pandoc lifts the heading that opens a `::: {.callout-*}` block into the callout header, so the
+  rendered page gets neither a section nor an anchor from it — but `docs-lint` counted all 37 of
+  them across 15 pages as real headings. That chopped each callout's body into chunks R1 never
+  measured whole (three oversized sections were hidden, and one baselined section was reported at
+  5,756 characters when it is 7,331), and registered ids R3 and R4 treated as addressable. A
+  heading *later* inside a callout is still a real section. Slug generation is fixed alongside it:
+  inside a code span `<op>` is literal text, not an HTML tag, so
+  `` ## Rules — `when signal <op> <value>` `` addresses as `#rules-when-signal-op-value` and no
+  longer truncates at the first placeholder. Checked against a full `quarto render` of all 86
+  pages, in both directions — every heading the parser computes is a section on the site, and
+  every section on the site is one the parser computes.
 - **An `[odes]` right-hand side that is nonlinear in the compartment amounts is no longer
   served by the closed-form fast path (#1149).** Linearity was established by evaluating the
   right-hand side one compartment at a time with every other amount held at zero, so a term

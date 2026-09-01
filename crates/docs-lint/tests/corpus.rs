@@ -76,6 +76,23 @@ fn baseline_entries_all_name_a_live_section() {
     }
 }
 
+/// Every `<section id="…" class="levelN">` the render emits — one per heading
+/// pandoc turned into a section, at any level. Quarto's other `<section>`s
+/// (`footnotes`, the appendix) carry a different class and are not headings the
+/// parser is meant to reproduce.
+fn section_ids(html: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (i, m) in html.match_indices("<section id=\"") {
+        let rest = &html[i + m.len()..];
+        let Some(end) = rest.find('"') else { continue };
+        let (id, after) = rest.split_at(end);
+        if after[1..].trim_start().starts_with("class=\"level") {
+            out.push(id.to_string());
+        }
+    }
+    out
+}
+
 /// Opt-in cross-check of the id algorithm against a real Quarto render.
 ///
 /// `docs/_site/` is generated and git-ignored, so this cannot run in CI and
@@ -115,29 +132,41 @@ fn computed_ids_match_the_rendered_site() {
                 continue;
             }
         }
-        let ids = rendered
-            .match_indices("data-anchor-id=\"")
-            .map(|(i, m)| {
-                let rest = &rendered[i + m.len()..];
-                rest[..rest.find('"').unwrap_or(0)].to_string()
-            })
-            .collect::<Vec<_>>();
+        // `<section id="x" class="levelN">` rather than `data-anchor-id`:
+        // Quarto only anchors headings down to h3, so the narrower marker made
+        // every deeper section read as a mismatch, and left the site's *whole*
+        // section list unavailable for the reverse direction below.
+        let ids = section_ids(&rendered);
         if ids.is_empty() {
             continue;
         }
         for h in &doc.headings {
-            // The page title (h1) is not rendered as an anchored heading.
+            // The page title (h1) is not rendered as a section of its own.
             if h.level == 1 {
                 continue;
             }
             if !ids.contains(&h.id) {
                 mismatches.push(format!(
-                    "{}:{}: computed `{}` for \"{}\" is not in {}",
+                    "{}:{}: computed `{}` for \"{}\" is not a section in {}",
                     doc.rel,
                     h.line,
                     h.id,
                     h.text,
                     html.display()
+                ));
+            }
+            checked += 1;
+        }
+        // The other direction. Without it the parser passes by dropping
+        // headings: skipping *every* heading in a callout, rather than only the
+        // first, would delete real anchored sections and nothing would notice
+        // (#1190).
+        let computed: Vec<&str> = doc.headings.iter().map(|h| h.id.as_str()).collect();
+        for id in &ids {
+            if !computed.contains(&id.as_str()) {
+                mismatches.push(format!(
+                    "{}: the render has section `{id}` that the parser never computed",
+                    doc.rel
                 ));
             }
             checked += 1;

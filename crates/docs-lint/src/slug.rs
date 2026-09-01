@@ -55,6 +55,8 @@ fn strip_inline_markup(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let chars: Vec<char> = text.chars().collect();
     let mut i = 0;
+    // Inside a `` ` `` span, where pandoc parses no further inline markup.
+    let mut in_code = false;
     while i < chars.len() {
         match chars[i] {
             '[' => {
@@ -83,7 +85,11 @@ fn strip_inline_markup(text: &str) -> String {
                     i += 1; // consume the closing delimiter
                 }
             }
-            '`' | '*' => i += 1,
+            '`' => {
+                in_code = !in_code;
+                i += 1;
+            }
+            '*' => i += 1,
             '_' => {
                 // `_` is BOTH an emphasis delimiter and a legal identifier
                 // character. Pandoc resolves it by position: intra-word it is
@@ -97,13 +103,17 @@ fn strip_inline_markup(text: &str) -> String {
                 }
                 i += 1;
             }
-            '<' if chars
-                .get(i + 1)
-                .is_some_and(|c| c.is_ascii_alphabetic() || *c == '/')
+            '<' if !in_code
+                && chars
+                    .get(i + 1)
+                    .is_some_and(|c| c.is_ascii_alphabetic() || *c == '/')
                 && chars[i..].contains(&'>') =>
             {
                 // Raw inline HTML (`<br>`, `<span class="x">`): pandoc builds
                 // the identifier from the rendered text, not from the tag.
+                // Inside a code span there is no inline HTML to build from —
+                // `` `when signal <op> <value>` `` is literal text, and reading
+                // its placeholders as tags dropped them from the identifier.
                 while chars[i] != '>' {
                     i += 1;
                 }
@@ -277,6 +287,20 @@ mod tests {
         // A bare `<` that is not a tag is deleted like any other punctuation,
         // and must not swallow the text after it.
         assert_eq!(slug("When x < y holds"), "when-x-y-holds");
+    }
+
+    #[test]
+    fn angle_brackets_inside_code_are_text_not_tags() {
+        // Pandoc parses no inline HTML inside a code span, so the placeholders
+        // stay in the identifier. `docs/model-file/adaptive-dosing.qmd` renders
+        // this heading as `#rules-when-signal-op-value-action`; reading `<op>`
+        // as a tag truncated it to `#rules-when-signal`.
+        assert_eq!(
+            slug("Rules — `when signal <op> <value> : <action>`"),
+            "rules-when-signal-op-value-action"
+        );
+        // Still a tag outside the span.
+        assert_eq!(slug("`a<b>c` and <br> d"), "abc-and-d");
     }
 
     #[test]

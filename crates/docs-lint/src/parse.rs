@@ -3,8 +3,9 @@
 //!
 //! This is deliberately not a Markdown parser. It only has to see the things
 //! the four rules in [`crate::rules`] are about, and it has to see them the way
-//! pandoc does — a `#` inside a code fence is not a heading, and a link inside
-//! one is not a link.
+//! pandoc does — a `#` inside a code fence is not a heading, a link inside one
+//! is not a link, and the heading opening a callout is that callout's *title*,
+//! not a section (#1190).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -67,6 +68,46 @@ fn fence_marker(line: &str) -> Option<(char, usize, bool)> {
         return None;
     }
     Some((c, n, t.chars().skip(n).all(char::is_whitespace)))
+}
+
+/// The colon run length and the attribute text of a fenced-div line (`:::`), if
+/// the line is one. A run with nothing after it closes the innermost open div.
+fn div_marker(line: &str) -> Option<(usize, String)> {
+    let t = line.trim_start();
+    if !t.starts_with(':') {
+        return None;
+    }
+    let n = t.chars().take_while(|&c| c == ':').count();
+    if n < 3 {
+        return None;
+    }
+    Some((n, t[n..].trim().to_string()))
+}
+
+/// Whether a div's attribute text opens a Quarto callout. Both spellings occur
+/// in these docs: `::: {.callout-note}` and the bare `::: callout-note`.
+fn opens_callout(attrs: &str) -> bool {
+    attrs.contains(".callout-")
+        || attrs
+            .split_whitespace()
+            .next()
+            .is_some_and(|w| w.starts_with("callout-"))
+}
+
+/// One open fenced div.
+struct DivFrame {
+    callout: bool,
+    /// No block-level content has been seen inside this div yet, so a heading
+    /// here is the callout title pandoc lifts out of the document.
+    awaiting_first_block: bool,
+}
+
+/// Record that block-level content was seen inside the innermost open div, so a
+/// heading after it is an ordinary heading rather than a callout title.
+fn mark_content(divs: &mut [DivFrame]) {
+    if let Some(f) = divs.last_mut() {
+        f.awaiting_first_block = false;
+    }
 }
 
 /// Strip inline code spans so a link inside backticks is not treated as a link.
@@ -181,6 +222,8 @@ pub fn parse_str(text: &str, path: &Path, root: &Path) -> Doc {
     let mut all_ids = HashSet::new();
     // The open fence's marker and run length, while we are inside one.
     let mut fence: Option<(char, usize)> = None;
+    // Open fenced divs, innermost last.
+    let mut divs: Vec<DivFrame> = Vec::new();
     let mut pending_disable: HashSet<String> = HashSet::new();
 
     while i < lines.len() {
@@ -194,7 +237,10 @@ pub fn parse_str(text: &str, path: &Path, root: &Path) -> Doc {
                         fence = None;
                     }
                 }
-                None => fence = Some((c, n)),
+                None => {
+                    mark_content(&mut divs);
+                    fence = Some((c, n));
+                }
             }
             i += 1;
             continue;
@@ -210,6 +256,26 @@ pub fn parse_str(text: &str, path: &Path, root: &Path) -> Doc {
             continue;
         }
 
+        // A fenced div. Its own `{#id}` still counts as a page id, but the line
+        // is not content — what matters is the frame it opens or closes.
+        if let Some((_, attrs)) = div_marker(line) {
+            if attrs.is_empty() {
+                divs.pop();
+            } else {
+                mark_content(&mut divs);
+                divs.push(DivFrame {
+                    callout: opens_callout(&attrs),
+                    awaiting_first_block: true,
+                });
+            }
+            pending_disable.clear();
+            for id in explicit_ids_in_line(line) {
+                all_ids.insert(id);
+            }
+            i += 1;
+            continue;
+        }
+
         let trimmed = line.trim_start();
         // Four or more columns of indent is an indented code block, not a
         // heading — pandoc allows at most three. Without the guard a `#`
@@ -220,6 +286,24 @@ pub fn parse_str(text: &str, path: &Path, root: &Path) -> Doc {
             let rest = &trimmed[level..];
             // `#hashtag` is not a heading; `#| label:` is a code-cell option.
             if level <= 6 && rest.starts_with(' ') {
+                // The first block inside a callout is its title: pandoc lifts
+                // it into the callout header, so the rendered page gets neither
+                // a section nor an anchor from it. Counting it as a heading
+                // chops the callout body into chunks R1 never measures whole,
+                // and registers an id R3 and R4 then treat as real (#1190). A
+                // *later* heading inside the same callout is a real section —
+                // `docs/estimation/saem.qmd` has one — so this is the first
+                // block, not any heading in a callout.
+                if divs
+                    .last()
+                    .is_some_and(|f| f.callout && f.awaiting_first_block)
+                {
+                    mark_content(&mut divs);
+                    pending_disable.clear();
+                    i += 1;
+                    continue;
+                }
+                mark_content(&mut divs);
                 let raw = rest.trim();
                 let (id, base_id) = ids.assign(raw);
                 // Report the visible title, not the `{#id}` attribute block.
@@ -239,6 +323,7 @@ pub fn parse_str(text: &str, path: &Path, root: &Path) -> Doc {
         }
 
         if !trimmed.is_empty() {
+            mark_content(&mut divs);
             pending_disable.clear();
         }
         for id in explicit_ids_in_line(line) {
@@ -364,6 +449,92 @@ mod tests {
     fn explicit_div_ids_count_as_page_ids() {
         let d = doc("::: {#tip-warm-start .callout-note}\nhi\n:::\n");
         assert!(d.ids.contains("tip-warm-start"));
+    }
+
+    #[test]
+    fn a_callouts_first_heading_is_its_title_not_a_section() {
+        // Pandoc lifts it into the callout header: no section, no anchor. The
+        // body it opens belongs to the section above (#1190).
+        let d = doc("## Real\n\n::: {.callout-note}\n## Title\n\nbody\n:::\n\n## After\n");
+        let texts: Vec<_> = d.headings.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(texts, ["Real", "After"]);
+        assert!(!d.ids.contains("title"));
+    }
+
+    #[test]
+    fn the_bare_class_spelling_opens_a_callout_too() {
+        let d = doc("::: callout-note\n## Title\n:::\n");
+        assert!(d.headings.is_empty());
+    }
+
+    #[test]
+    fn a_later_heading_inside_a_callout_is_a_real_section() {
+        // `docs/estimation/saem.qmd` does exactly this: a long
+        // `.callout-important` whose title is an `h2` and which then carries a
+        // real, explicitly anchored `h3`. Dropping every heading in a callout
+        // would delete a section the site really renders.
+        let d =
+            doc("::: {.callout-important}\n## Title\n\nbody\n\n### Deep {#kept}\n\nmore\n:::\n");
+        let texts: Vec<_> = d.headings.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(texts, ["Deep"]);
+        assert_eq!(d.headings[0].id, "kept");
+    }
+
+    #[test]
+    fn a_heading_after_prose_in_a_callout_is_not_the_title() {
+        // The title is the callout's *first block*, which is what pandoc keys
+        // on. Prose first means the callout gets its default title and the
+        // heading stays a section.
+        let d = doc("::: {.callout-note}\nprose first\n\n## Not a title\n:::\n");
+        let texts: Vec<_> = d.headings.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(texts, ["Not a title"]);
+    }
+
+    #[test]
+    fn a_heading_after_a_code_block_in_a_callout_is_not_the_title() {
+        let d = doc("::: {.callout-note}\n```bash\nls\n```\n\n## Not a title\n:::\n");
+        let texts: Vec<_> = d.headings.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(texts, ["Not a title"]);
+    }
+
+    #[test]
+    fn a_heading_in_a_plain_div_is_a_real_section() {
+        // Only callouts lift their first heading; an ordinary div does not.
+        let d = doc("::: {.panel-tabset}\n## Tab\n:::\n");
+        let texts: Vec<_> = d.headings.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(texts, ["Tab"]);
+    }
+
+    #[test]
+    fn a_callout_only_swallows_its_own_first_heading() {
+        // After the div closes, the next heading is a section again.
+        let d = doc("::: {.callout-note}\n## Title\n:::\n\n## After\n\n::: {.callout-tip}\n## Title2\n:::\n\n## Last\n");
+        let texts: Vec<_> = d.headings.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(texts, ["After", "Last"]);
+    }
+
+    #[test]
+    fn a_colon_run_inside_a_code_fence_does_not_open_a_div() {
+        let d = doc("````markdown\n::: {.callout-note}\n````\n\n## Real\n");
+        let texts: Vec<_> = d.headings.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(texts, ["Real"]);
+    }
+
+    #[test]
+    fn a_nested_div_does_not_make_its_parents_heading_a_title() {
+        let d = doc("::: {.callout-note}\n::: {.inner}\ncontent\n:::\n\n## Not a title\n:::\n");
+        let texts: Vec<_> = d.headings.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(texts, ["Not a title"]);
+    }
+
+    #[test]
+    fn a_callout_title_claims_no_id_so_a_real_heading_keeps_the_undisambiguated_one() {
+        // If the title consumed the slug, the real section below would render
+        // as `#dup-1` and every link written to `#dup` would break.
+        let d = doc("::: {.callout-note}\n## Dup\n:::\n\n## Dup\n");
+        assert_eq!(d.headings.len(), 1);
+        assert_eq!(d.headings[0].id, "dup");
+        assert_eq!(d.headings[0].base_id, "dup");
     }
 
     #[test]

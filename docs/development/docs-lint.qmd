@@ -75,6 +75,31 @@ anyway) or with an explicit `{#id}` if the wording has to stay.
 Every relative link must resolve, and so must its `#anchor`. See
 [How an id is generated](#how-an-id-is-generated) before hand-writing one.
 
+### Callout titles are not sections
+
+The heading that opens a callout is that callout's **title**. Pandoc lifts it
+into the callout header, so the rendered page gets neither a `<section>` nor an
+anchor from it:
+
+```markdown
+::: {.callout-note}
+## Warm starts                 <- the callout's title: no section, no #anchor
+
+body text                      <- belongs to the section *above* the callout
+
+### Cold starts                <- not first: a real section, with an #anchor
+:::
+```
+
+The linter follows that rule, so a callout's body counts toward the section it
+sits in — R1 measures the whole thing — and `#warm-starts` is a dead anchor R4
+will reject. What makes a heading a title is being the callout's **first
+block**: put prose above it and the callout gets its default title while the
+heading stays an ordinary section.
+
+Only callouts do this. A heading opening any other div (`.panel-tabset`, a plain
+`::: {#id}`) is an ordinary heading.
+
 ## How an id is generated
 
 The linter reproduces pandoc's algorithm, which Quarto uses:
@@ -98,6 +123,7 @@ before the linter existed:
 | `## A — b` | `#a-b` | the em-dash is deleted and the spaces around it collapse to **one** hyphen |
 | `` ## Modeled duration (`D{n}`) `` | `#modeled-duration-dn` | braces are deleted without leaving a separator |
 | `## Caller-supplied vs. re-read inputs` | `#caller-supplied-vs.-re-read-inputs` | a `.` is kept |
+| `` ## Rules — `when x <op> <v>` `` | `#rules-when-x-op-v` | inside a code span `<op>` is text, not an HTML tag, so it stays in the id |
 
 ## Silencing a rule
 

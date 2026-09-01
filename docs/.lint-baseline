@@ -10,9 +10,12 @@
 R1 5271 docs/estimation/foce.qmd::how-the-hessian-is-built
 R1 5802 docs/estimation/saem.qmd::what-saem-does-about-it-now
 R1 5239 docs/estimation/tte.qmd::competing-risks-cause-specific-hazards
+R1 5190 docs/estimation/vi.qmd::how-σ-is-updated
+R1 6389 docs/model-file/absorption.qmd::analytic-closed-form-pk-one_cpt_transitcl-v-n-mtt
 R1 7642 docs/model-file/adaptive-dosing.qmd::current-scope-and-limits
+R1 5250 docs/model-file/adaptive-dosing.qmd::keys
 R1 6006 docs/model-file/error-model.qmd::covariate-selected-error-models-ifelse
 R1 7367 docs/model-file/error-model.qmd::examples
-R1 5756 docs/model-file/ode-models.qmd::which-regime-am-i-in
+R1 7331 docs/model-file/ode-models.qmd::which-regime-am-i-in
 R1 5746 docs/model-file/scaling.qmd::interaction-with-gradients
 R1 7391 docs/warnings.qmd::warning-codes
