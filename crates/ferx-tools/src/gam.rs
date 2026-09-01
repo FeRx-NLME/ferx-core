@@ -235,6 +235,72 @@ pub fn gam_screen(fit: &FitResult, pop: &Population, opts: &GamOptions) -> GamRe
     }
 }
 
+/// Low-level GAM screening that accepts pre-aggregated, aligned per-subject
+/// data as plain slices.
+///
+/// Use this when constructing a [`FitResult`] / [`Population`] pair is
+/// inconvenient — for example from R or Python bindings where the data has
+/// already been collated on the host-language side.
+///
+/// ## Alignment contract
+///
+/// All per-subject slices (`eta_cols[i]`, `cov_cols[j]`) must have the same
+/// length (one entry per subject, same subject order). `f64::NAN` marks a
+/// missing value; subjects with a NaN ETA are excluded from that ETA's
+/// regressions; subjects with a NaN covariate are excluded from that
+/// covariate's regression.
+///
+/// - `eta_names`, `eta_cols`, and `shrinkage` must all have length `n_eta`.
+/// - `cov_names`, `cov_cols`, and `cov_kinds` must all have length `n_cov`.
+pub fn gam_screen_raw(
+    eta_names: &[&str],
+    eta_cols: &[&[f64]],
+    shrinkage: &[f64],
+    cov_names: &[&str],
+    cov_cols: &[&[f64]],
+    cov_kinds: &[CovariateKind],
+    opts: &GamOptions,
+) -> GamResult {
+    let cov_refs: Vec<(&str, &[f64], CovariateKind)> = cov_names
+        .iter()
+        .zip(cov_cols.iter())
+        .zip(cov_kinds.iter())
+        .map(|((&name, &vals), &kind)| (name, vals, kind))
+        .collect();
+
+    let results_and_warnings: Vec<(EtaGamResult, Vec<String>)> = eta_names
+        .par_iter()
+        .zip(eta_cols.par_iter())
+        .zip(shrinkage.par_iter())
+        .map(|((&eta_name, &eta_vals), &shrink)| {
+            let mut eta_warnings = Vec::new();
+            if let Some(w) = shrinkage_warning(eta_name, shrink, opts.shrinkage_warn_threshold) {
+                eta_warnings.push(w);
+            }
+            let (aic_null, covariate_scores) = screen_eta_raw(eta_vals, &cov_refs, opts);
+            let result = EtaGamResult {
+                eta_name: eta_name.to_string(),
+                shrinkage: shrink,
+                aic_null,
+                covariate_scores,
+            };
+            (result, eta_warnings)
+        })
+        .collect();
+
+    let mut eta_results = Vec::with_capacity(results_and_warnings.len());
+    let mut warnings = Vec::new();
+    for (result, w) in results_and_warnings {
+        warnings.extend(w);
+        eta_results.push(result);
+    }
+
+    GamResult {
+        eta_results,
+        warnings,
+    }
+}
+
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 /// Determine the kind of a covariate: prefer the `[covariates]`-block
