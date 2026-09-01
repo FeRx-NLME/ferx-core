@@ -707,10 +707,21 @@ term (there is no separate `sequential` keyword):
   infusion as a zero-order source feeding the kernel); a `[diffusion]` block
   (SDE/EKF) into the input-rate compartment is still rejected with a clear error.
 
-The hard cutoff at `tad = dur` is handled exactly: ferx breaks the integration
-timeline at the window end and delivers the input as a per-segment constant (the
-way an infusion is injected), so the absorbed mass is exact — not smeared across
-the step.
+The window is handled exactly: ferx breaks the integration timeline at **both**
+edges — the onset `t_dose + lagtime` and the cutoff `t_dose + lagtime + dur` — and
+delivers the input as a per-segment constant (the way an infusion is injected), so
+the absorbed mass is exact, not smeared across the step.
+
+Both edges matter, because a segment receives the constant rate only if it lies
+*entirely* inside the window. Bracketing only the cutoff leaves the segment
+straddling the onset failing that test, which drops the rate for the **whole**
+window rather than mis-resolving one step. Until [#1171] that was the behaviour on
+the engines serving sdtab, `[derived]` grid integrals, the joint PK-TTE hazard and
+`simulate()` whenever the route carried its own `lag=`: a model whose only input was
+a lagged `zero_order` reported exactly `0.0` at every observation, while the
+objective — which segments on a different code path — was correct throughout.
+
+  [#1171]: https://github.com/FeRx-NLME/ferx-core/issues/1171
 
 ::: {.callout-note}
 ## Sensitivity of `zero_order(dur)` is analytic (#530)
