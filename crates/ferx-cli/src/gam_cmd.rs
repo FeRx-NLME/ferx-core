@@ -132,6 +132,18 @@ fn check_unknown_flags(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Returns `true` when `--no-fit` (outer_maxiter=0) is safe for this method.
+///
+/// The `outer_maxiter == 0` short-circuit lives in `optimize_population`
+/// (the `_ =>` arm in `api/fit.rs`).  SAEM / IMP / IMPMAP / Bayes / VI each
+/// dispatch to their own runner before reaching that arm, so setting
+/// `outer_maxiter = 0` has no effect and a full estimation run would proceed
+/// silently.  Reject `--no-fit` early for any such method.
+fn no_fit_supported(m: ferx_core::EstimationMethod) -> bool {
+    use ferx_core::EstimationMethod::*;
+    !matches!(m, Saem | Imp | Impmap | Bayes | Vi)
+}
+
 /// Entry point for `ferx gam ...`; returns the process exit code.
 pub fn run(args: &[String]) -> i32 {
     // Help is recognised anywhere in the argument list.
@@ -222,6 +234,26 @@ fn run_gam(args: &[String]) -> Result<i32, String> {
         prepared.parsed.fit_options.run_covariance_step = false;
         if no_fit {
             // NONMEM MAXEVAL=0 equivalent: compute EBEs at initial params only.
+            // Guard: the outer_maxiter=0 short-circuit only applies to methods
+            // that go through optimize_population (FOCE, Laplace, GN, …).
+            // SAEM / IMP / IMPMAP / Bayes / VI dispatch to their own runners
+            // and would silently run a full estimation.
+            let effective: Vec<ferx_core::EstimationMethod> =
+                if prepared.parsed.fit_options.methods.is_empty() {
+                    vec![prepared.parsed.fit_options.method]
+                } else {
+                    prepared.parsed.fit_options.methods.clone()
+                };
+            if let Some(bad) = effective.into_iter().find(|m| !no_fit_supported(*m)) {
+                return Err(format!(
+                    "--no-fit is not supported with method '{}': \
+                     outer_maxiter=0 only short-circuits the FOCE/BFGS \
+                     outer loop; SAEM, IMP, IMPMAP, Bayes, and VI have \
+                     their own runners and would run a full estimation. \
+                     Run the fit first and use --from-fit instead.",
+                    bad.label()
+                ));
+            }
             prepared.parsed.fit_options.outer_maxiter = 0;
         }
 
@@ -476,5 +508,27 @@ mod tests {
     #[test]
     fn value_rejects_missing_value() {
         assert!(value(&args(&["m.ferx", "--csv"]), "--csv").is_err());
+    }
+
+    // ── no_fit_supported ──────────────────────────────────────────────────────
+
+    #[test]
+    fn no_fit_supported_allows_foce_variants() {
+        use ferx_core::EstimationMethod::*;
+        assert!(no_fit_supported(Foce));
+        assert!(no_fit_supported(FoceI));
+        assert!(no_fit_supported(FoceGn));
+        assert!(no_fit_supported(FoceGnHybrid));
+        assert!(no_fit_supported(Laplace));
+    }
+
+    #[test]
+    fn no_fit_supported_rejects_own_runner_methods() {
+        use ferx_core::EstimationMethod::*;
+        assert!(!no_fit_supported(Saem));
+        assert!(!no_fit_supported(Imp));
+        assert!(!no_fit_supported(Impmap));
+        assert!(!no_fit_supported(Bayes));
+        assert!(!no_fit_supported(Vi));
     }
 }
