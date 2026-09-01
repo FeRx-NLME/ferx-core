@@ -113,6 +113,22 @@ const LINEARITY_TOL: f64 = 1e-7;
 /// two-compartment `k12`/`k21` pair from a one-way depot→central drain).
 const COUPLING_EPS: f64 = 1e-9;
 
+/// State amplitudes for [`identify_disposition`]'s off-axis residual check
+/// (#1149). Spans six decades because a state-triggered branch fires at whatever
+/// amount the model author wrote, and identification has no subject to derive a
+/// dose scale from. A genuinely linear RHS satisfies `f(u) = A·u` at every
+/// amplitude, so each extra rung costs one RHS evaluation and cannot cause a
+/// false decline.
+///
+/// Cost, stated rather than waved at: identification goes from `3n + 1` RHS
+/// evaluations to `3n + 5` — 7 to 11 for a two-compartment model, ~57% more
+/// probing. [`MrDisposition`]'s own doc already calls that probing a
+/// second-order cost (the fast path avoids ODE integration entirely) and notes
+/// it repeats on every value/gradient evaluation because the result is not yet
+/// memoised; this makes that pending memoisation worth a little more, and
+/// changes nothing about its correctness.
+const OFF_AXIS_PROBE_SCALES: [f64; 4] = [1.0, 1e2, 1e4, 1e6];
+
 /// Probe the forcing-free disposition RHS `du = f(u, p, t)` in `f64` at state
 /// `u`. Returns `None` when the spec has no compiled RHS program (hand-built
 /// specs / out of analytic scope). The forcings are applied by a separate
@@ -212,6 +228,66 @@ pub fn identify_disposition(spec: &OdeSpec, p: &[f64], t: f64) -> Option<MrDispo
                 return None; // time-varying
             }
             jac[i][j] = ei[j];
+        }
+    }
+
+    // **Off-axis residual.** Everything above probes one state at a time — every
+    // sample has all *other* states at zero — so the axes fix `A` but say nothing
+    // about terms that only switch on away from them. Two classes slip through,
+    // and both reproduce #1124's shape (a term silently absent from the
+    // predictions, no error, `converged: true`) with no time variable anywhere,
+    // so `mr_scope`'s model-time gate cannot see them either:
+    //
+    //   - a **product of two distinct states** — `- KON*central*periph`, the
+    //     TMDD/binding shape — is *exactly* zero at `0`, `eᵢ` and `2eᵢ`, so
+    //     `f(0) ≈ 0` passes, `f(2eᵢ) = 2f(eᵢ)` passes, the sign and
+    //     mass-conservation patterns pass, and a clean 2-cpt is identified with
+    //     the binding term dropped;
+    //   - a branch on the **state** — `if (central > 10) { KE = 3*CL/V }` — is
+    //     never entered, because the largest state any probe above reaches is
+    //     `2.0`.
+    //
+    // Two things catch them, and they are separate — for a one-compartment model
+    // there is only one axis, so "off-axis" is vacuous there and it is purely the
+    // amplitude that does the work:
+    //
+    //   - **mixed states** (`n ≥ 2`, every amount non-zero at once) reach the
+    //     state-product class, which no single-axis sample can;
+    //   - **amplitude** reaches anything whose behaviour changes with the amount
+    //     — a state threshold, or saturation. That is the whole mechanism at
+    //     `n = 1`, and it is what declines a Michaelis–Menten elimination whose
+    //     `KM` is large enough to look linear at amounts of 1–2.
+    //
+    // Both fall out of one question the axis probes never ask: does `f` actually
+    // equal `A·u` away from where `A` was measured? `f(0) ≈ 0` is already established,
+    // so a genuinely linear disposition satisfies `f(u) = A·u` at every `u`, and
+    // the residual is exact to rounding — this compares two evaluations of the
+    // same RHS, with no integration in it, so `LINEARITY_TOL` governs it exactly
+    // as it governs the on-axis `f(2eᵢ) = 2f(eᵢ)` check. Nothing here is
+    // calibrated against solver error; do not confuse it with
+    // `verify_against_ode_twin`'s tolerance, which compares two *integrations*
+    // and must scale with `reltol`.
+    //
+    // The ladder spans six decades because a state-triggered threshold sits at
+    // whatever amount the model author wrote, and this function has no subject
+    // and so no dose scale to derive it from. A truly linear RHS passes at every
+    // amplitude, so extra rungs cost four RHS evaluations and no false declines;
+    // the per-state multipliers are distinct so a term antisymmetric in two
+    // states cannot cancel itself. Declining is the safe direction: it routes the
+    // model to the ODE engine, which is slower and correct.
+    for &scale in &OFF_AXIS_PROBE_SCALES {
+        let u: Vec<f64> = (0..n).map(|i| scale * (1.0 + 0.5 * i as f64)).collect();
+        let f_u = probe_rhs_f64(spec, &u, p, t)?;
+        for j in 0..n {
+            // (A·u)_j = Σ_i jac[i][j]·u_i — `jac[i]` is the response to `eᵢ`, i.e.
+            // column `i` of `A`, so the sum runs over the *first* index.
+            let au: f64 = (0..n).map(|i| jac[i][j] * u[i]).sum();
+            if !f_u[j].is_finite() {
+                return None; // NaN/Inf probe — see the `du0` guard above
+            }
+            if (f_u[j] - au).abs() > LINEARITY_TOL * (1.0 + au.abs()) {
+                return None; // nonlinear or state-switched away from the axes
+            }
         }
     }
 
@@ -1465,6 +1541,334 @@ mod tests {
         assert!(
             identify_disposition(spec, &p, 1.0).is_none(),
             "MM elimination must be declined (nonlinear)"
+        );
+    }
+
+    /// Saturable elimination with a **`KM` far above the probe amplitude** must
+    /// be declined (#1149).
+    ///
+    /// `declines_nonlinear_michaelis_menten` above uses `KM = 5`, which is
+    /// nonlinear enough to fail the on-axis `f(2eᵢ) = 2f(eᵢ)` check outright. The
+    /// interesting case is the one that *passes* it: for `KM = 1e5` the on-axis
+    /// residual is `2·VMAX/((KM+1)(KM+2)) ≈ 2e-9`, comfortably inside
+    /// `LINEARITY_TOL`, because at amounts of 1–2 the model genuinely is linear.
+    /// It is saturated at the amounts a real dose produces, and nothing on the
+    /// axes can see that.
+    ///
+    /// This is why the ladder spans decades rather than adding one off-axis
+    /// point: whether a model is "nonlinear" is a question about the amounts it
+    /// actually reaches, and identification has no dose to scale to. Note the
+    /// unit-dependence this removes — the same model written in ng instead of mg
+    /// has a `KM` a million times larger, so before this it flipped from declined
+    /// to admitted on a change of units alone.
+    #[test]
+    fn declines_saturable_elimination_that_is_linear_at_the_axis_amplitudes() {
+        let src = r#"
+[parameters]
+  theta TVVMAX(10.0, 0.01, 1000.0)
+  theta TVKM(100000.0, 1.0, 1e9)
+  theta TVV(20.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 100.0)
+  omega ETA_V ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  VMAX = TVVMAX
+  KM = TVKM
+  V = TVV * exp(ETA_V)
+  KA = TVKA
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA) - VMAX*central/(KM + central)
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let model = crate::parser::model_parser::parse_model_string(src).unwrap();
+        let spec = model.ode_spec.as_ref().expect("ode model");
+        let theta = [10.0, 1.0e5, 20.0, 1.5];
+        let eta = [0.0];
+        let p = flat_params(&model, &theta, &eta);
+
+        // Non-vacuity: the on-axis homogeneity check must actually pass here,
+        // otherwise this is just another copy of the KM = 5 test.
+        let e1 = probe_rhs_f64(spec, &[1.0], &p, 1.0).expect("probe");
+        let two_e1 = probe_rhs_f64(spec, &[2.0], &p, 1.0).expect("probe");
+        let on_axis_residual = (two_e1[0] - 2.0 * e1[0]).abs();
+        assert!(
+            on_axis_residual <= LINEARITY_TOL * (1.0 + two_e1[0].abs()),
+            "precondition: this model must LOOK linear on the axes (residual \
+             {on_axis_residual:e}), else the off-axis ladder is not what declines it"
+        );
+        assert!(
+            identify_disposition(spec, &p, 1.0).is_none(),
+            "saturable elimination must be declined even when it is linear at \
+             amounts of 1-2"
+        );
+    }
+
+    /// A 2-cpt model with a **binding term that is a product of two distinct
+    /// states** must be declined (#1149).
+    ///
+    /// This is the class the axis probes structurally cannot see:
+    /// `KON*central*periph` is *exactly* zero at `u = 0`, `eᵢ` and `2eᵢ`, so
+    /// every on-axis check passes — `f(0) ≈ 0`, `f(2eᵢ) = 2f(eᵢ)`, both
+    /// couplings above `COUPLING_EPS`, the mass-conservation and sign patterns —
+    /// and a clean canonical 2-cpt used to be identified with the binding term
+    /// dropped from the predictions entirely. That is #1124's failure shape with
+    /// no time variable in it, so `mr_scope`'s model-time gate never applied.
+    ///
+    /// The paired control is what makes this non-vacuous: the identical model
+    /// with `KON = 0` must still be **admitted**, so the test pins the term and
+    /// not merely the model's shape.
+    #[test]
+    fn declines_a_bilinear_binding_term_but_keeps_its_linear_control() {
+        let src = |kon: &str| {
+            format!(
+                r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(20.0, 0.1, 500.0)
+  theta TVQ(0.5, 0.01, 100.0)
+  theta TVV2(30.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  Q  = TVQ
+  V2 = TVV2
+  KA = TVKA
+[structural_model]
+  ode(states=[central, periph])
+[odes]
+  d/dt(central) = first_order(ka=KA) - (CL/V)*central - (Q/V)*central + (Q/V2)*periph - {kon}*central*periph
+  d/dt(periph)  = (Q/V)*central - (Q/V2)*periph
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+            )
+        };
+        let theta = [1.0, 20.0, 0.5, 30.0, 1.5];
+        let eta = [0.0];
+
+        let control = crate::parser::model_parser::parse_model_string(&src("0.0")).unwrap();
+        let cspec = control.ode_spec.as_ref().expect("ode model");
+        let cp = flat_params(&control, &theta, &eta);
+        assert!(
+            identify_disposition(cspec, &cp, 1.0).is_some(),
+            "precondition: with KON = 0 this is an ordinary linear 2-cpt and must \
+             still be admitted — otherwise the decline below proves nothing about \
+             the binding term"
+        );
+
+        let bound = crate::parser::model_parser::parse_model_string(&src("0.002")).unwrap();
+        let bspec = bound.ode_spec.as_ref().expect("ode model");
+        let bp = flat_params(&bound, &theta, &eta);
+        // The term really is invisible on the axes: assert that, so a future
+        // change that made it visible there would surface here rather than
+        // silently turning this into a test of something else.
+        let on_axis_probe = probe_rhs_f64(bspec, &[1.0, 0.0], &bp, 1.0).expect("probe");
+        let control_probe = probe_rhs_f64(cspec, &[1.0, 0.0], &cp, 1.0).expect("probe");
+        assert_eq!(
+            on_axis_probe[0].to_bits(),
+            control_probe[0].to_bits(),
+            "the binding term must be exactly invisible at u = e_central — that \
+             is why the axis probes cannot decide it"
+        );
+        assert!(
+            identify_disposition(bspec, &bp, 1.0).is_none(),
+            "a bilinear central*periph term must be declined"
+        );
+    }
+
+    /// A branch on the **state** must be declined (#1149).
+    ///
+    /// The largest state any axis probe reaches is `2.0`, so a threshold above
+    /// that is never entered and the `else` arm is identified as if it were the
+    /// whole model — here a 1-cpt with `ke = CL/V`, under-predicting elimination
+    /// threefold over the whole range above the threshold.
+    ///
+    /// Note `mr_scope_declines_every_model_time_spelling` already exercises this
+    /// exact branch shape, but only with a *time* variable inside it; the state
+    /// version was a one-token edit away from the tests we shipped.
+    #[test]
+    fn declines_a_state_triggered_branch_but_keeps_its_unbranched_control() {
+        let src = |cond: &str| {
+            format!(
+                r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(20.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+[structural_model]
+  ode(states=[central])
+[odes]
+{cond}  d/dt(central) = first_order(ka=KA) - KE*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+            )
+        };
+        let theta = [1.0, 20.0, 1.5];
+        let eta = [0.0];
+
+        let control =
+            crate::parser::model_parser::parse_model_string(&src("  KE = CL/V\n")).unwrap();
+        let cspec = control.ode_spec.as_ref().expect("ode model");
+        let cp = flat_params(&control, &theta, &eta);
+        assert!(
+            identify_disposition(cspec, &cp, 1.0).is_some(),
+            "precondition: the unbranched model must still be admitted"
+        );
+
+        let branched = crate::parser::model_parser::parse_model_string(&src(
+            "  if (central > 10.0) {\n    KE = 3.0*CL/V\n  } else {\n    KE = CL/V\n  }\n",
+        ))
+        .unwrap();
+        let bspec = branched.ode_spec.as_ref().expect("ode model");
+        let bp = flat_params(&branched, &theta, &eta);
+        // Non-vacuity: every on-axis probe takes the `else` arm, so on the axes
+        // the branched model is bit-identical to the control.
+        for u in [vec![1.0], vec![2.0]] {
+            let b = probe_rhs_f64(bspec, &u, &bp, 1.0).expect("probe");
+            let c = probe_rhs_f64(cspec, &u, &cp, 1.0).expect("probe");
+            assert_eq!(
+                b[0].to_bits(),
+                c[0].to_bits(),
+                "at u = {u:?} the branch must be untaken, matching the control"
+            );
+        }
+        assert!(
+            identify_disposition(bspec, &bp, 1.0).is_none(),
+            "a state-triggered branch must be declined"
+        );
+    }
+
+    /// An off-axis probe that returns **NaN** must decline, not slip through (#1149).
+    ///
+    /// This is the one branch of the off-axis residual that the three decline tests
+    /// above cannot reach — they all produce finite probes. It matters for a reason
+    /// the neighbouring `du0` guard already states at the top of this function: a
+    /// bare `>` comparison lets NaN pass, because `NaN > TOL` is **false**. So
+    /// without the `is_finite` check the residual below would compute
+    /// `(NaN - au).abs() > tol` → `false` and **admit** the model, serving NaN
+    /// predictions from the fast path.
+    ///
+    /// Note the asymmetry, which decides how this test has to be written: for
+    /// ±`Inf` the residual check declines on its own (`inf > tol` is true), so an
+    /// `Inf` fixture would cover the line while proving nothing. The fixture must
+    /// produce NaN, and the test asserts that it does.
+    ///
+    /// The model is exactly linear on every on-axis sample — `u = 0`, `eᵢ`, `2eᵢ`,
+    /// at both probe times — so it passes `du0`, homogeneity and time-invariance,
+    /// and is declined *only* at the off-axis ladder's top rung.
+    ///
+    /// **Getting a NaN out of this DSL takes work, and that is worth recording.**
+    /// The evaluator is deliberately hardened (`model_parser.rs`): `BinOp::Div`
+    /// returns `0.0` when `|denominator| < 1e-30`, `log`/`ln` clamp with
+    /// `v.max(1e-30)`, and `sqrt` clamps with `v.max(0.0)`. None of the usual
+    /// routes produce NaN. What is *not* clamped is `exp`, which overflows to
+    /// `+inf` above ~709 — so `exp(central) - exp(central)`, identically `0.0`
+    /// while `exp` is finite, becomes `inf - inf = NaN` once it is not.
+    ///
+    /// It has to sit behind the state branch rather than in the RHS directly. Left
+    /// bare, `exp(100)` is `2.7e43`, which *absorbs* the `-CL/V*central` term in
+    /// floating point: the probe at scale `1e2` returns `0.0` instead of `-5`, and
+    /// the model is declined by the residual comparison one rung early, never
+    /// reaching the guard under test. Gated above `1e5`, the first three rungs are
+    /// untouched and the top rung is NaN.
+    #[test]
+    fn declines_an_off_axis_probe_that_returns_nan() {
+        let src = |branch: &str| {
+            format!(
+                r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(20.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  KA  = TVKA
+[structural_model]
+  ode(states=[central])
+[odes]
+{branch}  d/dt(central) = first_order(ka=KA) - CL/V*central + EXTRA
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+            )
+        };
+        let theta = [1.0, 20.0, 1.5];
+        let eta = [0.0];
+
+        // Control: no branch, so the disposition is an ordinary linear 1-cpt and
+        // must still be admitted. Without this the decline below would not pin the
+        // NaN branch as the cause.
+        let control =
+            crate::parser::model_parser::parse_model_string(&src("  EXTRA = 0.0\n")).unwrap();
+        let cspec = control.ode_spec.as_ref().expect("ode model");
+        let cp = flat_params(&control, &theta, &eta);
+        assert!(
+            identify_disposition(cspec, &cp, 1.0).is_some(),
+            "precondition: the unbranched control must stay admitted"
+        );
+
+        // The branch fires only above 1e5, i.e. only at the ladder's top rung
+        // (`OFF_AXIS_PROBE_SCALES` = 1, 1e2, 1e4, 1e6).
+        let nan_src = src(
+            "  if (central > 1.0e5) {\n    EXTRA = exp(central) - exp(central)\n  } else {\n    EXTRA = 0.0\n  }\n",
+        );
+        let bad = crate::parser::model_parser::parse_model_string(&nan_src).unwrap();
+        let bspec = bad.ode_spec.as_ref().expect("ode model");
+        let bp = flat_params(&bad, &theta, &eta);
+
+        // Non-vacuity 1: every on-axis sample is finite AND matches the control, so
+        // the model reaches the off-axis loop rather than being declined earlier.
+        for u in [vec![0.0], vec![1.0], vec![2.0]] {
+            let f_bad = probe_rhs_f64(bspec, &u, &bp, 1.0).expect("probe");
+            let f_ctl = probe_rhs_f64(cspec, &u, &cp, 1.0).expect("probe");
+            assert!(
+                f_bad[0].is_finite(),
+                "on-axis probe at {u:?} must be finite, got {f_bad:?}"
+            );
+            assert!(
+                (f_bad[0] - f_ctl[0]).abs() < LINEARITY_TOL,
+                "on-axis probe at {u:?} must be bit-comparable to the control: \
+                 {f_bad:?} vs {f_ctl:?}"
+            );
+        }
+
+        // Non-vacuity 2: the top rung really is NaN, not Inf. An Inf probe would be
+        // declined by the residual comparison below the guard, so this test would
+        // pass with the guard removed and prove nothing.
+        let top = probe_rhs_f64(bspec, &[1.0e6], &bp, 1.0).expect("probe");
+        assert!(
+            top[0].is_nan(),
+            "the top rung must be NaN — Inf is caught by the residual check instead \
+             and would make this test vacuous: got {top:?}"
+        );
+
+        assert!(
+            identify_disposition(bspec, &bp, 1.0).is_none(),
+            "an off-axis probe returning NaN must be declined"
         );
     }
 
