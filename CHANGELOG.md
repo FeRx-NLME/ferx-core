@@ -53,6 +53,15 @@ section of the SDLC for the versioning policy).
   the column drew over the margin TOC instead of scrolling inside itself.
 
 ### Added
+- **`PoolPlan` and `FitOptions::quiet()`: the two knobs a tool needs to run many fits (#1115).**
+  `PoolPlan::from_budget(total_threads, n_units)` splits a thread budget between the replicate
+  level and `fit()`'s own per-subject level (outer level first, so a 200-replicate bootstrap on
+  8 threads is 8 single-threaded fits at a time), `apply_to()` pins the inner fit, and
+  `install()` builds the outer Rayon pool with ferx's 32 MiB worker stack
+  (`FIT_RAYON_STACK_SIZE`) — a pool built by hand inherits the platform-default 2 MiB stack and
+  overflows on wide ODE+IOV analytic-gradient models. `FitOptions::default().quiet()` turns off
+  the per-iteration console output; every non-fatal message stays reachable on
+  `FitResult::warnings`.
 - **A `present(COV)` condition for covariates that may be missing (#1111).** A missing covariate
   value is `NaN`, and division by it underflows to `0.0` here rather than erroring, so an
   unguarded `(CRCL/100)^THETA` silently zeroes the parameter on a row with no `CRCL`.

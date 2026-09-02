@@ -921,9 +921,13 @@ fn fit_inner(
         // coordinate. The coordinate structure (and hence the names) is fixed
         // across a method chain, so the template's names serve every stage.
         let coord_names = crate::estimation::parameterization::coordinate_names(init_params);
+        // The failure is non-fatal, so it follows the warning convention and
+        // goes into `FitResult.warnings` rather than straight to stderr — the
+        // only two prints on the fit path that were not behind `verbose`
+        // (#1115). The success line is informational and stays gated.
         if let Err(e) = crate::estimation::trace::init(path.clone(), &coord_names) {
-            eprintln!("[ferx] warning: could not open trace file {}: {}", path, e);
-        } else {
+            pre_run_warnings.push(format!("could not open trace file {}: {}", path, e));
+        } else if options.verbose {
             eprintln!("[ferx] optimizer trace → {}", path);
         }
     }
