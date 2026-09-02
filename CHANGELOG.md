@@ -19,6 +19,15 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Added
+
+- **A cancellable bootstrap (#1161).** `BootstrapOptions::cancel` takes a `CancelFlag`; setting
+  it from another thread stops a long `ferx_tools::bootstrap` run at the next replicate boundary
+  and returns the new `BootstrapError::Cancelled`, so a caller reports an abort as an abort
+  rather than as "every remaining replicate failed". Replicates the cancel unwound are dropped
+  rather than journaled as failures, so `--resume` refits them; everything already finished stays
+  on disk and resumes into exactly the run that was cancelled.
+
 ## [0.3.1] - 2026-09-02
 
 ### Added

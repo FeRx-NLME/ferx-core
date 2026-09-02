@@ -25,8 +25,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use ferx_core::{
-    fit, CompiledModel, FitOptions, FitResult, ModelParameters, OmegaMatrix, Population,
-    PreparedRun, SigmaVector, WarningCode,
+    fit, CancelFlag, CompiledModel, FitOptions, FitResult, ModelParameters, OmegaMatrix,
+    Population, PreparedRun, SigmaVector, WarningCode,
 };
 use rayon::prelude::*;
 
@@ -124,6 +124,65 @@ impl Drop for FinishGuard<'_> {
     }
 }
 
+/// Why a bootstrap run ended early.
+///
+/// A cancelled run is not a failed one, and the distinction is not cosmetic
+/// (#1161). Cancellation reaches the replicates as the same [`CancelFlag`] an
+/// ordinary fit polls, so every in-flight fit unwinds with an `Err` of its own;
+/// without a cancelled outcome of its own the run would report an abort as
+/// "every remaining replicate failed", which is both wrong and the one thing a
+/// caller most needs to be able to tell apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootstrapError {
+    /// The [`BootstrapOptions::cancel`] flag was set while the run was in
+    /// flight, so the run stopped at the next replicate boundary.
+    ///
+    /// Whatever had already been fitted is on disk in the run directory - the
+    /// journal flushes each replicate as it lands - so `resume` picks the run
+    /// up where the cancel stopped it, refitting only what never completed.
+    Cancelled,
+    /// Anything else, carrying the message a caller should show.
+    Failed(String),
+}
+
+impl BootstrapError {
+    /// Whether the run stopped because its cancel flag was set.
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, BootstrapError::Cancelled)
+    }
+}
+
+impl std::fmt::Display for BootstrapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BootstrapError::Cancelled => f.write_str("the bootstrap was cancelled"),
+            BootstrapError::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for BootstrapError {}
+
+impl From<String> for BootstrapError {
+    fn from(message: String) -> Self {
+        BootstrapError::Failed(message)
+    }
+}
+
+impl From<&str> for BootstrapError {
+    fn from(message: &str) -> Self {
+        BootstrapError::Failed(message.to_string())
+    }
+}
+
+/// So a caller whose own error type is a `String` - the CLI, the R glue - keeps
+/// working through `?` and loses only the distinction it was not using.
+impl From<BootstrapError> for String {
+    fn from(error: BootstrapError) -> String {
+        error.to_string()
+    }
+}
+
 /// Everything the bootstrap needs beyond the model and data themselves.
 ///
 /// Defaults mirror PsN's, including the two skip filters that are on by default
@@ -179,6 +238,19 @@ pub struct BootstrapOptions {
     /// alternative. Turn it on when the failure was a transient resource
     /// problem — an out-of-memory kill, a full disk — rather than the model.
     pub retry_failed: bool,
+    /// Cooperative cancellation for the whole run (#1161).
+    ///
+    /// Set from another thread, this stops the run at the next replicate
+    /// boundary and returns [`BootstrapError::Cancelled`]. It is also cloned
+    /// into every replicate's [`FitOptions`], so a fit already in flight
+    /// unwinds instead of running to completion first.
+    ///
+    /// The flag lives here rather than only on the model's own `FitOptions`
+    /// because reaching through `prepared.parsed.fit_options` to set it depends
+    /// on the replicate options happening to clone the field — an
+    /// implementation detail of this module. A flag set there is still
+    /// honoured; this one simply takes precedence.
+    pub cancel: Option<CancelFlag>,
 }
 
 impl BootstrapOptions {
@@ -260,6 +332,7 @@ impl Default for BootstrapOptions {
             confidence_level: 95.0,
             resume: false,
             retry_failed: false,
+            cancel: None,
         }
     }
 }
@@ -621,7 +694,16 @@ pub fn strata_from_csv(
 ///   *same* `{model}.tmp`, so they would restore each other's state;
 /// * **no SIR** — a per-replicate uncertainty step inside an uncertainty
 ///   analysis is pure cost.
-fn replicate_options(base: &FitOptions, keep_covariance: bool) -> FitOptions {
+///
+/// `cancel` is the run's one effective flag (see [`effective_cancel`]) and is
+/// installed unconditionally, so a `BootstrapOptions::cancel` overrides
+/// whatever the model file's own `FitOptions` carried and a run without one is
+/// left exactly as it was.
+fn replicate_options(
+    base: &FitOptions,
+    keep_covariance: bool,
+    cancel: &Option<CancelFlag>,
+) -> FitOptions {
     let mut o = base.clone();
     o.verbose = false;
     o.threads = Some(1);
@@ -629,7 +711,23 @@ fn replicate_options(base: &FitOptions, keep_covariance: bool) -> FitOptions {
     o.checkpoint = false;
     o.checkpoint_path = None;
     o.sir = false;
+    o.cancel = cancel.clone();
     o
+}
+
+/// The flag this run polls: [`BootstrapOptions::cancel`] when the caller set
+/// one, otherwise whatever the model's own [`FitOptions`] carried.
+///
+/// The `FitOptions` path is not a fallback for tidiness' sake — it is what
+/// callers had before this field existed, since the replicate options are a
+/// clone of the base ones, and dropping it would silently stop honouring a flag
+/// that used to work.
+fn effective_cancel(options: &BootstrapOptions, base: &FitOptions) -> Option<CancelFlag> {
+    options.cancel.clone().or_else(|| base.cancel.clone())
+}
+
+fn is_cancelled(flag: &Option<CancelFlag>) -> bool {
+    flag.as_ref().is_some_and(|f| f.is_cancelled())
 }
 
 fn diagnostics_from(result: &FitResult) -> (bool, bool, bool) {
@@ -727,7 +825,7 @@ fn reject_id_dependent(referenced: &[String]) -> Result<(), String> {
 pub fn run_bootstrap(
     prepared: &PreparedRun,
     options: &BootstrapOptions,
-) -> Result<BootstrapResult, String> {
+) -> Result<BootstrapResult, BootstrapError> {
     run_bootstrap_with_progress(prepared, options, None)
 }
 
@@ -742,11 +840,19 @@ pub fn run_bootstrap(
 /// replicate — never in a hot loop, since a replicate is a whole fit — so it
 /// may do real work (redraw a bar, call back into R). It must not panic: a
 /// panic crosses the `par_iter` boundary and takes the run with it.
+/// # Cancellation
+///
+/// Setting [`BootstrapOptions::cancel`] from another thread ends the run at the
+/// next replicate boundary with [`BootstrapError::Cancelled`], leaving the
+/// replicates that had already finished in the run directory for `resume`. A
+/// replicate that was mid-fit when the flag was set is dropped rather than
+/// recorded: its `Err` cannot be told apart from a genuine failure, and a
+/// failure is what `resume` declines to refit.
 pub fn run_bootstrap_with_progress(
     prepared: &PreparedRun,
     options: &BootstrapOptions,
     progress: Option<ProgressFn<'_>>,
-) -> Result<BootstrapResult, String> {
+) -> Result<BootstrapResult, BootstrapError> {
     let emit = |event: BootstrapEvent| {
         if let Some(sink) = progress {
             sink(event);
@@ -756,6 +862,14 @@ pub fn run_bootstrap_with_progress(
     reject_mixture_model(&prepared.init_params)?;
     options.validate()?;
     options.validate_for_run()?;
+
+    let cancel = effective_cancel(options, &prepared.parsed.fit_options);
+    // Checked before the journal is opened, not after: opening it rewrites the
+    // four per-replicate files, and a run that was cancelled before it started
+    // must not be what truncates the previous run's artefacts.
+    if is_cancelled(&cancel) {
+        return Err(BootstrapError::Cancelled);
+    }
 
     let template = &prepared.init_params;
     let names = parameter_names(template);
@@ -777,7 +891,7 @@ pub fn run_bootstrap_with_progress(
     };
     let allocation = strata.allocation(&options.sample_size)?;
     if allocation.iter().all(|(_, n)| *n == 0) {
-        return Err("the resampling allocation draws 0 subjects".to_string());
+        return Err("the resampling allocation draws 0 subjects".into());
     }
 
     // ── the draws ───────────────────────────────────────────────────────────
@@ -843,7 +957,11 @@ pub fn run_bootstrap_with_progress(
     };
 
     // ── the base fit ────────────────────────────────────────────────────────
-    let base_options = replicate_options(&prepared.parsed.fit_options, options.keep_covariance);
+    let base_options = replicate_options(
+        &prepared.parsed.fit_options,
+        options.keep_covariance,
+        &cancel,
+    );
     let original = match reused_original {
         // A resumed run must **not** refit the base model. `--update-inits`
         // starts every replicate from its estimates, and a second fit can land
@@ -897,9 +1015,23 @@ pub fn run_bootstrap_with_progress(
         _ => template.clone(),
     };
 
+    // A cancel during the base fit leaves nothing to resample from — the base
+    // fit is where `--update-inits` starts every replicate — so the run ends
+    // here rather than fitting 200 replicates from the model file's inits.
+    if is_cancelled(&cancel) {
+        return Err(BootstrapError::Cancelled);
+    }
+
     // ── the replicates ──────────────────────────────────────────────────────
     let n_completed = AtomicUsize::new(0);
-    let run_one = |replicate: &Replicate| -> ReplicateResult {
+    let run_one = |replicate: &Replicate| -> Option<ReplicateResult> {
+        // Where a cancelled run stops *scheduling*. Without this the loop still
+        // walks every remaining draw: each one enters `fit`, immediately
+        // observes the same flag, and returns an error — pointless work, and a
+        // long confusing pause before the abort surfaces.
+        if is_cancelled(&cancel) {
+            return None;
+        }
         let population = resample::build_population(&prepared.population, replicate);
         let started = Instant::now();
         let outcome = fit(
@@ -926,6 +1058,12 @@ pub fn run_bootstrap_with_progress(
                     delta_ofv: None,
                 }
             }
+            // A fit that failed while the flag was set cannot be told apart
+            // from one the flag itself unwound, so it is dropped rather than
+            // journaled. Recording it would leave `--resume` a failed row,
+            // which it carries forward instead of refitting by default — the
+            // cancelled replicate would then never be fitted at all.
+            Err(_) if is_cancelled(&cancel) => return None,
             Err(e) => ReplicateResult {
                 index: replicate.index,
                 estimates: Vec::new(),
@@ -951,7 +1089,7 @@ pub fn run_bootstrap_with_progress(
             completed: n_completed.fetch_add(1, Ordering::Relaxed) + 1,
             total: n_todo,
         });
-        result
+        Some(result)
     };
 
     let todo: Vec<Replicate> = draws
@@ -965,9 +1103,9 @@ pub fn run_bootstrap_with_progress(
             .num_threads(n)
             .build()
             .map_err(|e| format!("failed to build the bootstrap thread pool: {e}"))?
-            .install(|| todo.par_iter().map(run_one).collect::<Vec<_>>()),
-        Some(_) => todo.iter().map(run_one).collect(),
-        None => todo.par_iter().map(run_one).collect(),
+            .install(|| todo.par_iter().filter_map(run_one).collect::<Vec<_>>()),
+        Some(_) => todo.iter().filter_map(run_one).collect(),
+        None => todo.par_iter().filter_map(run_one).collect(),
     };
 
     // The journal's handles must be closed before `write_all` truncates the
@@ -975,6 +1113,13 @@ pub fn run_bootstrap_with_progress(
     // loop surfaces.
     if let Some(j) = journal {
         j.into_result()?;
+    }
+
+    // After the journal is closed, so a cancelled run's directory is complete
+    // and resumable, and before the summary, which over a truncated set of
+    // replicates would be an interval nobody asked for.
+    if is_cancelled(&cancel) {
+        return Err(BootstrapError::Cancelled);
     }
 
     replicates.extend(reused);
@@ -993,7 +1138,14 @@ pub fn run_bootstrap_with_progress(
             &base_options,
             &mut replicates,
             progress,
+            &cancel,
         )?;
+        // The Δofv sweep is a second pass over every replicate, so it is its own
+        // cancellation point: the estimates are already journaled, and finishing
+        // the run would write a `delta_ofv` column that is mostly empty.
+        if is_cancelled(&cancel) {
+            return Err(BootstrapError::Cancelled);
+        }
     }
     finish.finish();
 
@@ -1155,6 +1307,7 @@ fn compute_delta_ofv(
     base_options: &FitOptions,
     replicates: &mut [ReplicateResult],
     progress: Option<ProgressFn<'_>>,
+    cancel: &Option<CancelFlag>,
 ) -> Result<(), String> {
     let mut eval = base_options.clone();
     eval.outer_maxiter = 0;
@@ -1165,7 +1318,7 @@ fn compute_delta_ofv(
     let deltas: Vec<(usize, Option<f64>)> = replicates
         .par_iter()
         .map(|r| {
-            let out = if r.error.is_some() || r.estimates.is_empty() {
+            let out = if is_cancelled(cancel) || r.error.is_some() || r.estimates.is_empty() {
                 (r.index, None)
             } else {
                 let params = params_from_estimates(template, &r.estimates);

@@ -12,10 +12,10 @@
 
 use std::path::Path;
 
-use ferx_core::{fit, prepare_run, FitOptions, PreparedRun};
+use ferx_core::{fit, prepare_run, CancelFlag, FitOptions, PreparedRun};
 use ferx_tools::bootstrap::{
-    flatten_estimates, params_from_estimates, resample, run_bootstrap, BootstrapOptions, Replicate,
-    SampleSize,
+    flatten_estimates, params_from_estimates, resample, run_bootstrap, run_bootstrap_with_progress,
+    BootstrapError, BootstrapEvent, BootstrapOptions, Replicate, SampleSize,
 };
 
 const MODEL: &str = "../../examples/warfarin.ferx";
@@ -441,7 +441,7 @@ fn resuming_a_directory_from_a_different_seed_is_refused() {
         },
     )
     .expect_err("a different seed must refuse the resume");
-    assert!(err.contains("--seed"), "{err}");
+    assert!(err.to_string().contains("--seed"), "{err}");
 }
 
 /// The mismatch that passes every other check: interrupt a default run and
@@ -466,7 +466,7 @@ fn resuming_with_a_different_replicate_starting_point_is_refused() {
         },
     )
     .expect_err("changing where the replicates start must refuse the resume");
-    assert!(err.contains("--update-inits"), "{err}");
+    assert!(err.to_string().contains("--update-inits"), "{err}");
 
     // `--no-run-base-model` moves the starting point too, and changes whether a
     // `sample = 0` row belongs in the file at all.
@@ -480,7 +480,244 @@ fn resuming_with_a_different_replicate_starting_point_is_refused() {
         },
     )
     .expect_err("dropping the base model must refuse the resume");
-    assert!(err.contains("--run-base-model"), "{err}");
+    assert!(err.to_string().contains("--run-base-model"), "{err}");
+}
+
+// ── cancellation (#1161) ────────────────────────────────────────────────────
+
+/// A run cancelled before it starts must not touch the directory it was aimed
+/// at.
+///
+/// Opening the journal rewrites the four per-replicate files, so the check that
+/// makes this pass is the one *before* the journal is opened. Get the order
+/// wrong and cancelling a mistyped command destroys the artefacts of the run
+/// that is already there — the run the user would otherwise have resumed.
+#[test]
+fn a_run_cancelled_before_it_starts_leaves_the_directory_untouched() {
+    let mut p = prepared();
+    p.parsed.fit_options.outer_maxiter = 2;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    run_bootstrap(&p, &resume_options(dir.path())).expect("a completed run to protect");
+    let before = raw_results_without_timings(dir.path());
+
+    let flag = CancelFlag::new();
+    flag.cancel();
+    let err = run_bootstrap(
+        &p,
+        &BootstrapOptions {
+            cancel: Some(flag),
+            ..resume_options(dir.path())
+        },
+    )
+    .expect_err("a pre-cancelled run must not report success");
+    assert_eq!(err, BootstrapError::Cancelled);
+
+    assert_eq!(
+        raw_results_without_timings(dir.path()),
+        before,
+        "the cancelled run truncated the artefacts of the run already in the directory"
+    );
+}
+
+/// The whole point of #1161: a cancelled run stops fitting, says it was
+/// cancelled rather than that everything failed, and leaves a directory that
+/// resumes into exactly the run that was interrupted.
+#[test]
+fn a_cancelled_run_stops_scheduling_and_resumes_into_the_uninterrupted_run() {
+    let mut p = prepared();
+    p.parsed.fit_options.outer_maxiter = 2;
+
+    let whole_dir = tempfile::tempdir().expect("temp dir");
+    run_bootstrap(&p, &resume_options(whole_dir.path())).expect("the uninterrupted run");
+
+    // Cancel from the progress sink, the moment the first replicate lands. On
+    // one thread that is a hard boundary: replicate 1 is journaled, replicates
+    // 2 and 3 are never fitted.
+    let part_dir = tempfile::tempdir().expect("temp dir");
+    let flag = CancelFlag::new();
+    let sink = |event: BootstrapEvent| {
+        if matches!(event, BootstrapEvent::ReplicateDone { .. }) {
+            flag.cancel();
+        }
+    };
+    let err = run_bootstrap_with_progress(
+        &p,
+        &BootstrapOptions {
+            cancel: Some(flag.clone()),
+            ..resume_options(part_dir.path())
+        },
+        Some(&sink),
+    )
+    .expect_err("a cancelled run must not report success");
+    assert_eq!(
+        err,
+        BootstrapError::Cancelled,
+        "a cancelled run reported as a failure: {err}"
+    );
+
+    // Header, the base fit, and exactly one replicate. The two draws that were
+    // never fitted are absent rather than recorded as failures — recorded, a
+    // resume would carry them forward instead of fitting them.
+    let rows = raw_results_without_timings(part_dir.path());
+    assert_eq!(
+        rows.len(),
+        3,
+        "expected header + base + 1 replicate, got {} rows",
+        rows.len()
+    );
+
+    let resumed = run_bootstrap(
+        &p,
+        &BootstrapOptions {
+            resume: true,
+            ..resume_options(part_dir.path())
+        },
+    )
+    .expect("the cancelled run resumes");
+    assert_eq!(
+        resumed.n_reused, 1,
+        "the resume should reuse the single replicate the cancelled run finished"
+    );
+    assert!(
+        resumed.replicates.iter().all(|r| r.error.is_none()),
+        "a cancelled replicate was carried forward as a failed one"
+    );
+    assert_eq!(
+        raw_results_without_timings(part_dir.path()),
+        raw_results_without_timings(whole_dir.path()),
+        "a cancelled-and-resumed run is not the uninterrupted run"
+    );
+}
+
+/// The same on a thread pool, where a cancel lands while other replicates are
+/// mid-fit.
+///
+/// Those fits unwind with an `Err` of their own, which is indistinguishable
+/// from a genuine failure — so the property asserted here is that none of them
+/// reaches the journal. A recorded failure is one `--resume` carries forward
+/// rather than refits, which would quietly cost the run a replicate.
+#[test]
+fn replicates_unwound_by_a_cancel_are_never_recorded_as_failures() {
+    let mut p = prepared();
+    p.parsed.fit_options.outer_maxiter = 2;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let flag = CancelFlag::new();
+    let sink = |event: BootstrapEvent| {
+        if matches!(event, BootstrapEvent::ReplicateDone { .. }) {
+            flag.cancel();
+        }
+    };
+    let err = run_bootstrap_with_progress(
+        &p,
+        &BootstrapOptions {
+            samples: 6,
+            threads: Some(4),
+            cancel: Some(flag.clone()),
+            ..resume_options(dir.path())
+        },
+        Some(&sink),
+    )
+    .expect_err("a cancelled run must not report success");
+    assert_eq!(err, BootstrapError::Cancelled);
+
+    let rows = raw_results_without_timings(dir.path());
+    let error_at = rows[0]
+        .iter()
+        .position(|h| h == "error")
+        .expect("an error column");
+    for row in rows.iter().skip(1) {
+        assert_eq!(
+            row[error_at], "",
+            "a replicate the cancel unwound was journaled as a failure: {row:?}"
+        );
+    }
+
+    // Deliberately no assertion on *how many* replicates got through. On a pool
+    // that is a timing property, not a contract: every fit already past the
+    // entry check when the flag is set runs to completion, and the flag itself
+    // is a relaxed atomic, so a loaded machine can let the whole run finish
+    // before the first completion is observed. Asserting a bound here failed
+    // roughly one run in three under load. Where stopping *is* a contract is on
+    // one thread, and
+    // `a_cancelled_run_stops_scheduling_and_resumes_into_the_uninterrupted_run`
+    // pins it there, exactly.
+}
+
+/// A cancel that lands before the first replicate stops the run without fitting
+/// one — the check between the base fit and the replicate loop.
+///
+/// Unlike the mid-loop case this is exact on any number of threads: the flag is
+/// read on the thread that is about to build the pool, so there is no in-flight
+/// fit to finish and nothing racing the read.
+#[test]
+fn a_cancel_between_the_base_fit_and_the_replicates_fits_no_replicate() {
+    let mut p = prepared();
+    p.parsed.fit_options.outer_maxiter = 2;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let flag = CancelFlag::new();
+    let sink = |event: BootstrapEvent| {
+        if matches!(event, BootstrapEvent::BaseFitDone) {
+            flag.cancel();
+        }
+    };
+    let err = run_bootstrap_with_progress(
+        &p,
+        &BootstrapOptions {
+            samples: 6,
+            threads: Some(4),
+            cancel: Some(flag.clone()),
+            ..resume_options(dir.path())
+        },
+        Some(&sink),
+    )
+    .expect_err("a cancelled run must not report success");
+    assert_eq!(err, BootstrapError::Cancelled);
+
+    // Header and the base fit, and nothing else: the run never reached a
+    // replicate. The base fit is still journaled, so a resume reuses it rather
+    // than refitting it — which is what keeps the resumed run identical.
+    assert_eq!(
+        raw_results_without_timings(dir.path()).len(),
+        2,
+        "a replicate was fitted after the run was cancelled"
+    );
+}
+
+/// The Δofv sweep is a second pass over every replicate that roughly doubles
+/// the run time, so it is its own cancellation point rather than a stretch of
+/// the run that ignores the flag.
+#[test]
+fn a_cancel_during_the_delta_ofv_sweep_ends_the_run() {
+    let mut p = prepared();
+    p.parsed.fit_options.outer_maxiter = 2;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let flag = CancelFlag::new();
+    let sink = |event: BootstrapEvent| {
+        if matches!(event, BootstrapEvent::DeltaOfvDone { .. }) {
+            flag.cancel();
+        }
+    };
+    let err = run_bootstrap_with_progress(
+        &p,
+        &BootstrapOptions {
+            samples: 2,
+            dofv: true,
+            cancel: Some(flag.clone()),
+            ..resume_options(dir.path())
+        },
+        Some(&sink),
+    )
+    .expect_err("a cancel during the Δofv sweep must not report success");
+    assert_eq!(err, BootstrapError::Cancelled);
+
+    // The fits themselves finished, so the replicates are on disk and resumable
+    // - it is the Δofv column that the cancelled run does not get to write.
+    assert!(!dir.path().join("delta_ofv.csv").exists());
+    assert_eq!(raw_results_without_timings(dir.path()).len(), 4);
 }
 
 /// A fresh run writes its manifest before the first fit, so a process killed at
@@ -630,7 +867,7 @@ fn quick() -> PreparedRun {
 fn err_of(options: BootstrapOptions) -> String {
     match run_bootstrap(&quick(), &options) {
         Ok(_) => panic!("expected an error"),
-        Err(e) => e,
+        Err(e) => e.to_string(),
     }
 }
 

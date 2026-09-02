@@ -439,3 +439,49 @@ for p in &result.summary.parameters {
 the data path against the model's `[data]` block, applies `[data_selection]`, reads the
 population and binds any `theta NAME[...]` level blocks — everything `ferx model.ferx`
 does up to the fit itself.
+
+## Cancelling a run
+
+A 200-sample bootstrap is minutes to hours of fitting behind one call, so a library caller
+gets a cooperative abort: `BootstrapOptions::cancel` takes a `CancelFlag`, and setting it
+from another thread ends the run at the next replicate boundary.
+
+```rust
+use ferx_core::CancelFlag;
+use ferx_tools::bootstrap::{run_bootstrap, BootstrapError, BootstrapOptions};
+
+let flag = CancelFlag::new();
+let options = BootstrapOptions { cancel: Some(flag.clone()), ..Default::default() };
+
+// … from another thread, on a Ctrl-C or a user's "stop" button:
+flag.cancel();
+
+match run_bootstrap(&prepared, &options) {
+    Ok(result) => report(result),
+    Err(BootstrapError::Cancelled) => eprintln!("stopped; --resume picks it up"),
+    Err(e) => eprintln!("Error: {e}"),
+}
+```
+
+Three things follow from where the flag is checked.
+
+**A cancelled run is not a failed one.** The flag also reaches every replicate's own fit,
+so a replicate that was mid-fit unwinds with an error of its own rather than running to
+completion. Those are dropped, never written to `raw_results.csv` — a recorded failure is
+one that [a resume carries forward](#recovering-an-interrupted-run) instead of refitting,
+which would silently cost the run a replicate. What the flag stops is *scheduling*: the
+draws that had not started are not fitted at all.
+
+**Everything already finished is on disk.** The journal flushes each replicate as it
+lands, so a cancelled run leaves the same directory an interrupted one does, and `--resume`
+continues it into exactly the run that was cancelled. The statistics files are the
+exception: a cancelled run does not write an interval over a truncated set of replicates.
+
+**A cancel before the run starts is a no-op on the directory.** The flag is read before
+the journal is opened, and opening it rewrites the per-replicate files — so cancelling a
+mistyped command cannot destroy the artefacts of the run that is already there.
+
+`ferx bootstrap` does not install a signal handler yet, so the CLI has nothing to set the
+flag from; on the R side, `ferx_bootstrap()` currently runs the bootstrap on the R main
+thread and so cannot poll for an interrupt either. Both are tracked separately — this is
+the engine half.
