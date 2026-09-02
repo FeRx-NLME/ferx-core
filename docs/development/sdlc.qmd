@@ -315,8 +315,14 @@ brand assets and styling as the main ferx site in `../ferx-nlme.github.io`.
   is not also a wall of background — see [Writing a docs
   page](contributing.qmd#writing-a-docs-page).
 
-Render locally with `quarto render docs` before marking documentation-heavy PRs
-ready for review.
+Render locally with `tools/render-docs.sh` before marking documentation-heavy PRs
+ready for review. Prefer it to a bare `quarto render docs`: Quarto's project
+input discovery skips any path with a **hidden** (dot-prefixed) directory
+component, so in a worktree under `.claude/worktrees/<name>/` — which
+`CLAUDE.md` asks for on any branch that is not `main` — `quarto render docs`
+finds *zero* inputs. It writes `robots.txt` and `sitemap.xml`, renders not one
+page, prints no warning and **exits 0**. The script stages `docs/` outside the
+dot directory in that case, and fails loudly if a render produces no pages.
 
 ### 8.6 Build portability (stock nightly)
 
