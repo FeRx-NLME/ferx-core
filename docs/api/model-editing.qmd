@@ -1,0 +1,155 @@
+---
+pagetitle: "Editing ferx models programmatically"
+---
+
+# Model editing
+
+`ferx_core::edit` turns a `.ferx` file into something a program can *change*.
+Parsing has always gone one way — text in, `CompiledModel` out — which is
+enough to fit a model and rank it, but not to write the next one. Every
+model-space search (stepwise covariate selection, structural-model search,
+IIV/IOV search) is `generate candidate → fit → rank`, and this module is the
+generate step.
+
+## The shape of it
+
+```rust
+use ferx_core::edit::{ModelText, ModelEdit, IivForm};
+
+let mut text = ModelText::parse(&std::fs::read_to_string("parent.ferx")?)?;
+text.apply(ModelEdit::DropIiv { param: "KA".into() })?;
+text.apply(ModelEdit::SeedInits(&parent_fit))?;
+let candidate = text.render();
+```
+
+`ModelText` holds the source, not a syntax tree. An unedited round-trip is
+**byte-identical** — comments, alignment, blank lines, CRLF and a missing final
+newline all survive — which is what makes the surgery safe to trust: anything
+an edit does not deliberately touch is provably unchanged, so a mistake shows
+up as a visible diff instead of a silent rewrite of the rest of the file. Every
+model in `examples/**` is pinned against that property in
+`tests/model_text_roundtrip.rs`.
+
+An edit that cannot be applied returns `Err` and leaves the text untouched, so
+a search loop can propose, be refused, and move on.
+
+## Edits
+
+| Variant | What it writes |
+|---|---|
+| `SetStructural(StructuralSpec)` | the `pk NAME(...)` line, plus the coupled θ/η/expression additions and deletions across `[parameters]` and `[individual_parameters]` |
+| `AddCovariateRelation(Relation)` | one `[covariate_model]` line, creating the block if absent |
+| `DropCovariateRelation { param, cov }` | removes that line and any θ it orphans |
+| `AddIiv { param, form }` | the `exp(ETA_P)` factor and its `omega` declaration |
+| `DropIiv { param }` | removes both |
+| `SetOmegaBlock(names)` | replaces the named diagonal `omega` declarations with one `block_omega` |
+| `SetErrorModel(ErrorSpecText)` | the `[error_model]` statement, reconciling σ declarations |
+| `SeedInits(&FitResult)` | new initial estimates for every θ/ω/σ the fit names |
+| `SetFitOption { key, value }` | one `[fit_options]` key |
+
+### Structural swaps are coupled edits
+
+`two_cpt_oral` → `one_cpt_oral` is not one line. Dropping `q=Q, v2=V2` from the
+`pk` line orphans `Q` and `V2` in `[individual_parameters]`, which orphans
+`TVQ`, `TVV2`, `ETA_Q` and `ETA_V2` in `[parameters]` — and the parser rejects
+a model that computes a parameter it never uses. `SetStructural` therefore
+prunes to a fixed point after rewriting the line, following textual
+reachability from the blocks that *consume* parameters.
+
+Widening is the other direction, and the engine will not guess for you: a
+binding that names an `[individual_parameters]` value the model does not have
+must arrive with its init, bounds and (optionally) its η in
+`StructuralSpec::new_parameters`. A search widening a model has to choose those
+numbers, and choosing them per candidate — visibly — beats an internal default
+table nobody can see or override.
+
+```rust
+ModelEdit::SetStructural(StructuralSpec {
+    template: "two_cpt_oral".into(),
+    bindings: vec![
+        ("cl".into(), "CL".into()),
+        ("v1".into(), "V".into()),
+        ("q".into(), "Q".into()),
+        ("v2".into(), "V2".into()),
+        ("ka".into(), "KA".into()),
+    ],
+    new_parameters: vec![
+        NewParameter { name: "Q".into(), theta: "TVQ".into(),
+                       init: 8.0, lower: 0.1, upper: 100.0, iiv: None },
+        NewParameter { name: "V2".into(), theta: "TVV2".into(),
+                       init: 80.0, lower: 1.0, upper: 500.0,
+                       iiv: Some(("ETA_V2".into(), 0.08)) },
+    ],
+})
+```
+
+### η surgery needs canonical form
+
+Adding or removing an η is expression editing, not line editing, and there is
+no safe way to pattern-match an arbitrary right-hand side. A parameter a search
+may vary must therefore be written in the canonical product form
+
+```text
+CL = TVCL * exp(ETA_CL)
+```
+
+Anything else is a hard error naming the parameter and quoting its expression —
+never a silent wrong edit. This is the same posture `[covariate_model]` takes
+on a non-product right-hand side, so it is a rule you have already met.
+
+```text
+ferx-core::edit: `CL = TVCL * (1 + ETA_CL) + 0.5` is not in the canonical form
+`CL = TVP * exp(ETA_CL)`, so its η cannot be removed by rewriting the line.
+```
+
+The same applies to `block_omega`: an η that has been blocked with another
+cannot be removed by line surgery, because the block's lower triangle is not
+addressable one η at a time. Redeclare the block first.
+
+### Seeding initial estimates
+
+`SeedInits` is what Pharmpy calls `update_inits` between search steps: it walks
+`[parameters]` and rewrites each initial value from the parent fit. It keys on
+`theta_names` / `eta_names` / `sigma_names`, never on position — a candidate's
+parameter vector is a *different* vector from its parent's, so a positional
+copy would put `TVKA`'s estimate on `TVV`. Names the fit does not mention are
+left alone, and names the model does not declare are ignored.
+
+Three details it gets right so you do not have to:
+
+- a `FIX`ed parameter is a statement about the model, not an estimate to carry
+  over, and is skipped;
+- each declaration is rewritten **on the scale it was written in** — a
+  variance-scale `omega` gets the variance, an `(sd)` one gets its square root;
+- a `block_omega` is refilled from the fitted submatrix, off-diagonals
+  included.
+
+## Candidate identity
+
+`canonical_hash()` is a stable 32-byte identity for the model the text
+describes — a cache key for "have I already fitted this?".
+
+```rust
+let key = text.canonical_hash();
+```
+
+It is **stable** under comments, indentation, blank lines, line endings and
+spacing inside an expression, so re-emitting a model with different formatting
+still hits the cache. It **changes** for any token-level edit. Two things it
+deliberately does not normalise: line order, since reordering `[parameters]`
+reorders the θ vector and is therefore a different model; and the spelling of
+numbers, since `0.15` and `1.5e-1` hashing apart costs one redundant fit
+whereas parsing every literal to compare them risks a false cache *hit*, which
+costs correctness.
+
+`canonical_form()` returns the normalised text the hash digests. Diff two of
+them when you want to know why two candidates were not the same.
+
+## What it does not do
+
+`ModelText::parse` is a *structural* parse: it finds block headers and nothing
+else. It does not compile the model, which is what lets a model needing
+data-derived bindings (`center = median`, `levels = auto`) round-trip and edit
+like any other. Compile the result of `render()` with
+[`parse_full_model`](parsing.qmd) when you want the candidate checked — a
+search should do this before spending a fit on it.
