@@ -88,6 +88,28 @@ say — `gam_screen_raw` takes plain slices instead of a `FitResult` /
 shortest input, because a silently short column produces a plausible-looking
 ranking of the wrong subjects.
 
+## From the command line
+
+`ferx gam` is the same screen as a subcommand:
+
+```bash
+ferx gam model.ferx --data data.csv          # fit, then screen
+ferx gam model.ferx --data data.csv --no-fit # EBEs at the initial estimates
+ferx gam --from-fit run.fitrx                # reuse a saved fit
+```
+
+It writes `{model}-gam.csv` alongside the printed table (`--csv PATH` to
+redirect it, `--no-csv` to suppress it). The CSV columns are `eta_name`,
+`covariate`, `delta_aic`, `best_form`, `aic`, `aic_null`, `r_squared` and
+`shrinkage`; a non-finite value — the shrinkage of a degenerate Ω, say — is
+written as an empty field so the column still reads as numeric in R and pandas.
+
+`--from-fit` pairs the bundle's ETAs with the covariates by subject position, so
+when the bundle carries no embedded population and the dataset comes from
+`--data`, the two subject lists are compared by ID and a mismatch is refused
+rather than screened. See the [CLI reference](../cli.qmd#gam-covariate-screening-gam)
+for the full flag list.
+
 ## Reading the output
 
 The result is a *shortlist*, not a model. A high ΔAIC says the covariate is

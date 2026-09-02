@@ -393,6 +393,74 @@ pub fn gam_screen_raw(
     }
 }
 
+// ── CSV output ────────────────────────────────────────────────────────────────
+
+/// Quote a text field for CSV output when it contains a delimiter, a quote, or
+/// a newline.
+///
+/// `eta_name` and `covariate` come from user model and data text, so neither is
+/// guaranteed to be delimiter-free — a covariate named `WT,KG` would otherwise
+/// shift every column to its right and silently misalign the whole file.
+fn csv_field(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// Format a number for CSV output, writing a non-finite value as an empty field.
+///
+/// `shrinkage` is `f64::NAN` whenever the fit carries no usable shrinkage for an
+/// eta (a degenerate omega, or an eta absent from the fit). Rust formats that as
+/// `NaN`, which R's `read.csv` and pandas both read as text, turning the whole
+/// column into strings. An empty field is the missing-value spelling both
+/// already understand.
+fn csv_num(v: f64) -> String {
+    if v.is_finite() {
+        format!("{v:.6}")
+    } else {
+        String::new()
+    }
+}
+
+/// Write a [`GamResult`] to a CSV file at `path`.
+///
+/// The CSV has columns: `eta_name,covariate,delta_aic,best_form,aic,aic_null,r_squared,shrinkage`.
+/// Text fields are quoted when they need it and non-finite numbers are written
+/// as empty fields, so the result parses as numeric in R and pandas without
+/// `na.strings` handling.
+pub fn write_gam_csv(result: &GamResult, path: &str) -> Result<(), String> {
+    use std::fmt::Write as FmtWrite;
+    use std::fs;
+
+    let mut buf =
+        String::from("eta_name,covariate,delta_aic,best_form,aic,aic_null,r_squared,shrinkage\n");
+    for eta in &result.eta_results {
+        for s in &eta.covariate_scores {
+            let form = match &s.best_form {
+                CovariateForm::Linear => "Linear".to_string(),
+                CovariateForm::Spline { df } => format!("Spline(df={df})"),
+                CovariateForm::Categorical => "Categorical".to_string(),
+            };
+            writeln!(
+                buf,
+                "{},{},{},{},{},{},{},{}",
+                csv_field(&eta.eta_name),
+                csv_field(&s.covariate),
+                csv_num(s.delta_aic),
+                csv_field(&form),
+                csv_num(s.aic),
+                csv_num(eta.aic_null),
+                csv_num(s.r_squared),
+                csv_num(eta.shrinkage),
+            )
+            .expect("writing to a String cannot fail");
+        }
+    }
+    fs::write(path, buf).map_err(|e| format!("cannot write {path}: {e}"))
+}
+
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 /// Determine the kind of a covariate: prefer the `[covariates]`-block
@@ -932,6 +1000,86 @@ pub(crate) fn categorical_design(x: &[f64], levels: &[f64]) -> DMatrix<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── CSV output ───────────────────────────────────────────────────────────
+
+    fn one_row_result(eta_name: &str, covariate: &str, shrinkage: f64) -> GamResult {
+        GamResult {
+            eta_results: vec![EtaGamResult {
+                eta_name: eta_name.to_string(),
+                shrinkage,
+                aic_null: 10.0,
+                covariate_scores: vec![CovariateScore {
+                    covariate: covariate.to_string(),
+                    delta_aic: 1.5,
+                    best_form: CovariateForm::Linear,
+                    aic: 8.5,
+                    r_squared: 0.25,
+                }],
+            }],
+            warnings: vec![],
+        }
+    }
+
+    fn write_to_temp(result: &GamResult) -> String {
+        let dir = std::env::temp_dir().join(format!(
+            "ferx-gam-csv-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir(&dir).expect("temp dir");
+        let path = dir.join("out.csv");
+        write_gam_csv(result, path.to_str().unwrap()).expect("write csv");
+        let text = std::fs::read_to_string(&path).expect("read csv");
+        let _ = std::fs::remove_dir_all(&dir);
+        text
+    }
+
+    #[test]
+    fn csv_field_quotes_only_what_needs_it() {
+        assert_eq!(csv_field("WT"), "WT");
+        assert_eq!(csv_field("WT,KG"), "\"WT,KG\"");
+        assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+        assert_eq!(csv_field("two\nlines"), "\"two\nlines\"");
+    }
+
+    #[test]
+    fn a_covariate_name_with_a_comma_does_not_shift_the_columns() {
+        // Unquoted, `WT,KG` would split into two fields and push every value one
+        // column to the right for that row.
+        let text = write_to_temp(&one_row_result("CL", "WT,KG", 0.1));
+        let row = text.lines().nth(1).expect("a data row");
+        assert!(row.contains("\"WT,KG\""), "{row}");
+
+        let header_cols = text.lines().next().unwrap().split(',').count();
+        // The quoted field contributes one comma of its own, so a naive split
+        // sees exactly one extra column — and nothing more.
+        assert_eq!(row.split(',').count(), header_cols + 1);
+    }
+
+    #[test]
+    fn csv_num_writes_non_finite_as_an_empty_field() {
+        assert_eq!(csv_num(1.5), "1.500000");
+        assert_eq!(csv_num(f64::NAN), "");
+        assert_eq!(csv_num(f64::INFINITY), "");
+        assert_eq!(csv_num(f64::NEG_INFINITY), "");
+    }
+
+    #[test]
+    fn a_nan_shrinkage_is_written_as_an_empty_field_not_the_text_nan() {
+        // A degenerate omega gives NaN shrinkage; `NaN` in the column makes R and
+        // pandas read the whole column as text.
+        let text = write_to_temp(&one_row_result("CL", "WT", f64::NAN));
+        let row = text.lines().nth(1).expect("a data row");
+        assert!(!row.contains("NaN"), "{row}");
+        assert!(
+            row.ends_with(','),
+            "shrinkage should be an empty field: {row}"
+        );
+    }
 
     // ── ns_basis ─────────────────────────────────────────────────────────────
 
