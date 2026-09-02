@@ -20,7 +20,7 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
-- **Optional regularization for the covariate NN (`[covariate_nn]` / DCM)** via two
+- **Optional regularization for the covariate NN (`[covariate_nn]` / DCM) (#1215).** Via two
   new `[fit_options]` keys, `nn_l2` and `nn_smooth` (both non-negative, default `0.0` =
   off — a strict no-op that keeps existing fits byte-identical). `nn_l2` adds L2
   weight-decay (`Σ wᵢ²`, weight matrices only, biases free); `nn_smooth` penalizes the
