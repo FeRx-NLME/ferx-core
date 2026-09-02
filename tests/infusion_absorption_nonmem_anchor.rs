@@ -106,6 +106,95 @@ fn predict_matches_nonmem_infusion_into_first_order_absorption() {
     }
 }
 
+/// The same NONMEM `PRED` column, driven through the **gated** engines instead of
+/// `ode_predictions`.
+///
+/// `ode_predictions_with_states` (sdtab IPRED + compartment states) and
+/// `ode_dense_solve_states` (the joint PK-TTE cumulative hazard, the CTMM NLL, `[derived]`
+/// grids) resolve their infusions through `gated_infusions`, which — unlike its
+/// `active_infusions` twin — carried no input-rate suppression (#1187). The dose was
+/// therefore delivered twice: once by the convolved `R_in_inf`, and again as a plain
+/// `+rate` injected straight into the compartment, bypassing the kernel. Measured against
+/// this NONMEM column, deleting the suppression reads **1.52394 vs 0.30468 at t=1 — 5.00×**,
+/// while `predict_matches_nonmem_infusion_into_first_order_absorption` and
+/// `fit_on_infusion_absorption_runs` in this same file both stay green: they route through
+/// `ode_predictions`, i.e. the `active_infusions` side that always had the guard. That is
+/// exactly why the original anchor could not see this.
+///
+/// The two engines return different quantities and the anchor treats them as such:
+/// `ode_predictions_with_states` returns the **readout**, so `[scaling] y = central / V`
+/// is already applied and it compares to NONMEM (`S2 = V`) directly;
+/// `ode_dense_solve_states` returns raw compartment **amounts**, so state 0 is divided by
+/// `V` here. Measured, not assumed — comparing the readout as if it were an amount is
+/// off by exactly `V`.
+#[test]
+fn gated_engines_match_nonmem_infusion_into_first_order_absorption() {
+    let parsed = parse_full_model(INF_FIRST_ORDER_MODEL).expect("model parses");
+    let model = parsed.model;
+
+    let population = read_nonmem_csv(std::path::Path::new("data/inf_first_order.csv"), None, None)
+        .expect("dataset loads");
+    let subject = population.subjects.first().expect("one subject");
+    assert!(
+        subject.doses.iter().any(|d| d.is_infusion()),
+        "dataset should contain an infusion (RATE>0) dose"
+    );
+
+    let ode = model
+        .ode_spec
+        .as_ref()
+        .expect("model compiles to an ODE spec");
+    let theta = &model.default_params.theta;
+    let eta = [0.0_f64]; // population prediction, matching the `predict()` anchor above
+    let pk = (model.pk_param_fn)(theta, &eta, &subject.covariates, 0.0);
+    let v = pk.values[ferx_core::PK_IDX_V];
+    assert!(
+        v > 0.0,
+        "V must be positive to form the concentration readout"
+    );
+
+    let (with_states_pred, _states) =
+        ferx_core::ode::ode_predictions_with_states(ode, &pk.values, theta, &eta, subject);
+    let dense = ferx_core::ode::ode_dense_solve_states(
+        ode,
+        &pk.values,
+        theta,
+        &eta,
+        subject,
+        &subject.obs_times,
+    );
+
+    // NONMEM 7.6.0 PRED (S2 = V), keyed by observation time — the same table as above.
+    let nonmem: &[(f64, f64)] = &[
+        (1.0, 0.30468),
+        (2.0, 1.0071),
+        (4.0, 2.8772),
+        (6.0, 3.8508),
+        (10.0, 3.6059),
+    ];
+    assert_eq!(subject.obs_times.len(), nonmem.len());
+    assert_eq!(with_states_pred.len(), nonmem.len());
+    assert_eq!(dense.len(), nonmem.len());
+
+    for (i, &(t, expected)) in nonmem.iter().enumerate() {
+        assert!(
+            (subject.obs_times[i] - t).abs() < 1e-9,
+            "observation time {} != expected {t}",
+            subject.obs_times[i]
+        );
+        for (engine, got) in [
+            ("ode_predictions_with_states", with_states_pred[i]),
+            ("ode_dense_solve_states", dense[i][0] / v),
+        ] {
+            let rel = (got - expected).abs() / expected;
+            assert!(
+                rel < 1e-4,
+                "t={t}: {engine} {got:.5} vs NONMEM {expected:.5} (rel err {rel:.2e})"
+            );
+        }
+    }
+}
+
 /// End-to-end `fit()` on an infusion-into-absorption model: the finite-difference sensitivity
 /// path (infusion × input-rate is declined at the analytic gates, #719 gap 2) must converge to a
 /// sensible objective. Unlike the SS case, an infusion prediction is cheap (no equilibration), so

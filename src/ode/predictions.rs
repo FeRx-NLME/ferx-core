@@ -929,7 +929,7 @@ pub(crate) fn active_infusions(
             // `R_in_inf` (`add_prepared_input_rate_forcing`), NOT injected directly. Suppress the
             // plain `+rate` here so the mass is not double-counted. (`input_rate` is empty on the
             // EKF path and on models with no built-in absorption, so this is then a no-op.)
-            if input_rate.iter().any(|f| f.cmt == d.cmt_idx()) {
+            if forcing_consumes_cmt(input_rate, d.cmt_idx()) {
                 return None;
             }
             let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
@@ -1116,19 +1116,37 @@ fn zero_order_dur_and_lag_for_dose(
         .map(|(dur, _, route_lag)| (dur, route_lag))
 }
 
+/// Does any forcing in `input_rate` feed the **0-based** state `cmt`?
+///
+/// The single spelling of the input-rate membership rule. Every consumer — the bolus
+/// suppression ([`input_rate_consumes_cmt`]) and both infusion resolvers
+/// ([`active_infusions`], [`gated_infusions`]) — asks this one question, because a dose
+/// into such a compartment is delivered by `R_in` over time and its instantaneous
+/// contribution must be suppressed exactly once. #1187 was this rule existing twice and
+/// the copies disagreeing; #1196 tracks folding the remaining duplication.
+///
+/// Takes the **slice**, not an [`OdeSpec`], so a caller that applies no forcing can pass
+/// `&[]` and keep its plain contribution (see [`active_infusions`]' EKF caller).
+#[inline]
+pub(crate) fn forcing_consumes_cmt(
+    input_rate: &[crate::pk::absorption::InputRateForcing],
+    cmt: usize,
+) -> bool {
+    input_rate.iter().any(|f| f.cmt == cmt)
+}
+
 /// True if a built-in absorption input-rate forcing (transit/etc.) feeds the
 /// compartment `cmt_1based` (the data file's 1-based CMT). A dose into such a
 /// compartment delivers its mass via `R_in(tad)` integrated over time
 /// (`∫R_in dt = F·amt`), so its instantaneous **bolus must be suppressed** to
 /// avoid double-counting the dose — the dose feeds the input-rate function, not
 /// the state directly (see `plans/absorption-models.md`).
+///
+/// The spec-reading form of [`forcing_consumes_cmt`], for callers that always apply the
+/// model's own forcings.
 #[inline]
 pub(crate) fn input_rate_consumes_cmt(ode: &OdeSpec, cmt_1based: usize) -> bool {
-    !ode.input_rate.is_empty()
-        && ode
-            .input_rate
-            .iter()
-            .any(|f| f.cmt == cmt_1based.saturating_sub(1))
+    forcing_consumes_cmt(&ode.input_rate, cmt_1based.saturating_sub(1))
 }
 
 /// Push the hard-cutoff break times — each window's end `w_end` — for the
@@ -1215,7 +1233,26 @@ enum InfusionInput {
 /// branch injects. Doses with `CMT=0` (no compartment) or a compartment beyond
 /// the state vector are dropped — the same guard the dense paths applied per RHS
 /// evaluation before the seam, lifted out to once per segment.
+///
+/// **The `InfusionInput::Spanning` twin of [`active_infusions`], and it must drop
+/// exactly what that drops.** Both feed the same `wrap_rhs_with_forcings` seam, which
+/// adds the resolved `+rate` *alongside* `add_prepared_input_rate_forcing`'s convolved
+/// `R_in_inf`. So an infusion into a built-in absorption compartment has to be
+/// suppressed here for the same reason it is suppressed there — omitting it delivered
+/// the mass twice on every gated engine (#1187: exactly `2·F·amt` in the accumulator,
+/// and up to 214× in a readout, because the stray `+rate` lands in the compartment
+/// *directly* instead of feeding the kernel).
+///
+/// `input_rate` is the forcing slice the caller will **actually apply**, which need not be
+/// the spec's. Both call sites here pass `&ode.input_rate`, because that is what their own
+/// `prepare_input_rates(ode, …)` builds `prepared` from — the suppression and the
+/// replacement therefore cover the same compartments by construction. Taking the slice
+/// rather than reading the spec through [`input_rate_consumes_cmt`] is what keeps that
+/// true: a caller that applies no forcing passes `&[]` and keeps its plain `+rate`, as
+/// [`active_infusions`]' EKF caller does, and hard-wiring the spec would suppress a rate
+/// nothing replaces.
 fn gated_infusions(
+    input_rate: &[crate::pk::absorption::InputRateForcing],
     active: &[(usize, f64, f64)],
     doses: &[DoseEvent],
     dose_f_bio: &[f64],
@@ -1238,6 +1275,14 @@ fn gated_infusions(
             }
             let cmt = dose.cmt_idx();
             if cmt >= n_states {
+                return None;
+            }
+            // Infusion into a built-in absorption compartment (#719 gap 2): the dose is a
+            // zero-order source *feeding the kernel*, delivered through the convolved input
+            // rate `R_in_inf` (`add_prepared_input_rate_forcing`), NOT injected directly.
+            // Suppress the plain `+rate` here so the mass is not double-counted (#1187) —
+            // the same drop `active_infusions` applies to the `Spanning` arm.
+            if forcing_consumes_cmt(input_rate, cmt) {
                 return None;
             }
             // Mode-aware bioavailability rate (#419); the `(t_start_inf, t_end_inf)`
@@ -5665,7 +5710,13 @@ pub fn ode_predictions_with_states(
         active_infusions.retain(|(_, _, e)| *e > t_start + 1e-12);
         // Resolve each active infusion to (cmt_idx, F·rate, t_start, t_end) for
         // the time-gated injection inside the seam (CMT=0 / out-of-range dropped).
-        let gated = gated_infusions(&active_infusions, &subject.doses, &dose_f_bio, n);
+        let gated = gated_infusions(
+            &ode.input_rate,
+            &active_infusions,
+            &subject.doses,
+            &dose_f_bio,
+            n,
+        );
         // Zero-order absorption windows covering this segment (#504): constant
         // `F·amt/dur` injected alongside the gated infusions (empty otherwise).
         let zero_order = active_zero_order_inputs(&zo_windows, t_start, t_end, f64::NEG_INFINITY);
@@ -5954,7 +6005,13 @@ fn apply_segment_boundary(
     active_infusions.retain(|(_, _, e)| *e > t_start + 1e-12);
     // Resolve to (cmt_idx, F·rate, t_start, t_end) for the seam's time-gated
     // injection (CMT=0 / out-of-range dropped).
-    let gated = gated_infusions(active_infusions, &subject.doses, dose_f_bio, n);
+    let gated = gated_infusions(
+        &ode.input_rate,
+        active_infusions,
+        &subject.doses,
+        dose_f_bio,
+        n,
+    );
 
     // Doses delivered before the most recent reset (EVID=3/4) at or before this
     // segment are off for the input-rate forcing — mirroring how the reset clears
