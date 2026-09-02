@@ -2150,7 +2150,15 @@ fn fit_inner(
     // Parameter estimates pinned to hidden packed-space implementation guards.
     // This is distinct from a user-declared theta bound: the affected result
     // reached an implementation safety limit (#1099).
-    if let Some((msg, entry)) = runaway_guard_warning(&result.params) {
+    //
+    // An upper-guard hit also demotes `converged` (#1118). Unlike a declared
+    // THETA bound — where a boundary hit can be a valid constrained optimum — an
+    // internal ceiling cannot be, so the flag would otherwise hand a programmatic
+    // consumer a point that is by construction not an interior optimum.
+    // `result.params` holds the *final* stage's estimates, so a chained
+    // `methods = vi, focei` is gated on its last stage, like `run_covariance_step`.
+    let mut converged = result.converged;
+    if let Some((msg, entry)) = runaway_guard_warning(&mut converged, &result.params) {
         warnings.push(msg);
         native_warnings.push(entry);
     }
@@ -2298,7 +2306,7 @@ fn fit_inner(
         method_chain: chain.clone(),
         method_wall_times_secs,
         covariance_wall_time_secs,
-        converged: result.converged,
+        converged,
         ofv,
         aic,
         bic,

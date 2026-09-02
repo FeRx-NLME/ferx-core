@@ -683,6 +683,23 @@ fn classify_warning_recognizes_internal_runaway_guard() {
         classify_warning("Internal optimizer parameter guard reached by estimate(s): PROP_ERR");
     assert_eq!(warning.category, WarningCode::ParameterAtRunawayGuard);
     assert_eq!(warning.severity, WarningSeverity::Warning);
+
+    // #1118: the side is carried in each listed hit, and an upper hit — the one
+    // that demotes `converged` — classifies Critical even when the entry reaches
+    // this path as a flat string (a spliced multi-start warning, say) instead of
+    // the native typed entry.
+    let upper = classify_warning(
+        "Internal optimizer parameter guard reached by estimate(s): PROP_ERR \
+         (estimate 148.4132; packed coordinate 5.0000 at upper guard).",
+    );
+    assert_eq!(upper.category, WarningCode::ParameterAtRunawayGuard);
+    assert_eq!(upper.severity, WarningSeverity::Critical);
+
+    let lower = classify_warning(
+        "Internal optimizer parameter guard reached by estimate(s): PROP_ERR \
+         (estimate 0.0003; packed coordinate -8.0000 at lower guard).",
+    );
+    assert_eq!(lower.severity, WarningSeverity::Warning);
 }
 
 /// #778: the `WarningCode` serde token is a public API an agent / the R

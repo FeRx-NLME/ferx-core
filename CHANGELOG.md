@@ -19,6 +19,17 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Fixed
+- **A fit whose estimate ran to an internal safety rail no longer reports `converged: true`
+  (#1118).** ferx caps a few packed coordinates internally (an implicit THETA cap, the OMEGA /
+  SIGMA runaway rails); unlike a THETA bound you declared, one of those cannot be a valid
+  constrained optimum. When a free estimate ends pinned to an *upper* internal guard the fit is
+  now reported as not converged and the `parameter_at_runaway_guard` warning is raised to
+  `Critical`, so a script or agent keying off the boolean stops accepting a point that is by
+  construction not an interior optimum. A *lower*-guard hit (a variance collapsing toward zero)
+  is unchanged: it stays a `Warning` and leaves `converged` alone, because that is usually an
+  unsupported component to remove rather than a numerical runaway.
+
 ## [0.3.1] - 2026-09-02
 
 ### Added

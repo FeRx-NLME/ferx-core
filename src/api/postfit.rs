@@ -1214,8 +1214,18 @@ fn warning_entry(
     message: String,
     details: Option<serde_json::Value>,
 ) -> WarningEntry {
+    warning_entry_with_severity(WarningSeverity::Warning, category, message, details)
+}
+
+/// [`warning_entry`] for the emitters whose severity depends on what they found.
+fn warning_entry_with_severity(
+    severity: WarningSeverity,
+    category: WarningCode,
+    message: String,
+    details: Option<serde_json::Value>,
+) -> WarningEntry {
     WarningEntry {
-        severity: WarningSeverity::Warning,
+        severity,
         category,
         message,
         source_method: None,
@@ -1333,7 +1343,19 @@ pub(crate) fn boundary_estimate_warning(
 
 /// Build the warning for parameter estimates pinned to an internal
 /// runaway guard, or `None` when every free coordinate is interior.
-pub(crate) fn runaway_guard_warning(params: &ModelParameters) -> Option<(String, WarningEntry)> {
+///
+/// An *upper*-guard hit also demotes `converged` and reports at `Critical`
+/// (#1118): the coordinate stopped at an implementation ceiling, so the point is
+/// by construction not an interior optimum and a consumer keying off the boolean
+/// must not keep it. A *lower*-guard hit stays a plain `Warning` and leaves
+/// `converged` alone — a variance collapsing to the floor is usually a genuinely
+/// unsupported component for the user to remove rather than a numerical runaway,
+/// so demoting there would be noise. This mirrors `vi::run::bad_basin_warning`,
+/// which owns the same consequence for the final ELBO check.
+pub(crate) fn runaway_guard_warning(
+    converged: &mut bool,
+    params: &ModelParameters,
+) -> Option<(String, WarningEntry)> {
     let hits = runaway_guard_estimates(params);
     if hits.is_empty() {
         return None;
@@ -1350,6 +1372,11 @@ pub(crate) fn runaway_guard_warning(params: &ModelParameters) -> Option<(String,
         .join(", ");
     let has_lower = hits.iter().any(|hit| hit.side == "lower");
     let has_upper = hits.iter().any(|hit| hit.side == "upper");
+    // An estimate held at an implementation ceiling is not a solution of the
+    // problem the user posed, whatever the outer optimizer's stop rule reported.
+    if has_upper {
+        *converged = false;
+    }
     let guidance = match (has_lower, has_upper) {
         (true, false) => {
             "The affected parameter(s) collapsed toward zero at an implementation floor \
@@ -1359,12 +1386,14 @@ pub(crate) fn runaway_guard_warning(params: &ModelParameters) -> Option<(String,
         (false, true) => {
             "The affected parameter(s) ran to an implementation ceiling rather than \
              reaching an interior optimum; do not treat the value(s) as reliable estimates. \
-             Revisit the model, data, initial estimates, or estimation method."
+             Reported converged: false. Revisit the model, data, initial estimates, or \
+             estimation method."
         }
         (true, true) => {
             "Lower-guard hits indicate parameters collapsing toward zero; consider removing \
              or simplifying those unsupported components. Upper-guard hits indicate runaway \
-             estimates; revisit the model, data, initial estimates, or estimation method."
+             estimates and are reported converged: false; revisit the model, data, initial \
+             estimates, or estimation method."
         }
         (false, false) => unreachable!("every guard hit has a lower or upper side"),
     };
@@ -1386,7 +1415,12 @@ pub(crate) fn runaway_guard_warning(params: &ModelParameters) -> Option<(String,
         "guard_space": "packed",
         "parameters": params_json,
     });
-    let entry = warning_entry(
+    let entry = warning_entry_with_severity(
+        if has_upper {
+            WarningSeverity::Critical
+        } else {
+            WarningSeverity::Warning
+        },
         WarningCode::ParameterAtRunawayGuard,
         msg.clone(),
         Some(details),
