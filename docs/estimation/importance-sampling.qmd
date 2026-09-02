@@ -24,7 +24,7 @@ at the **fixed** input parameters without estimating them.
 > estimator by default. If you used `method = imp` (or `[focei, imp]`) purely to
 > *score* a fit, add `imp_eval_only = true` to keep the old behaviour.
 
-### Mapping to NONMEM
+## Mapping to NONMEM
 
 | ferx | NONMEM |
 |------|--------|

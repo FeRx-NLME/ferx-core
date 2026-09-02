@@ -27,6 +27,13 @@ $DATA tad_lag_B.csv IGNORE=@
 ; exponent is zero, every per-event covariate snapshot is identical, so this
 ; anchor does not exercise the time-varying-covariate snapshot convention and
 ; cannot be invalidated by ferx #1073's change to where the timeline breaks.
+;
+; NOTE (ferx #1124): this WT workaround is NO LONGER REQUIRED. #1124 routes any
+; model-time-reading RHS to the event-driven predictor directly, so a TAD-reading
+; model reaches it without needing a varying covariate to force the routing. WT is
+; kept here only so a passing anchor is not perturbed -- removing it drops
+; THETA(5) and would need a fresh NONMEM run and a new committed OFV. Do NOT copy
+; this trick into a new anchor; see mr_tad.ctl, which has no WT column.
 $SUBROUTINES ADVAN13 TOL=9
 $MODEL COMP=(CENTRAL,DEFDOSE)
 $PK

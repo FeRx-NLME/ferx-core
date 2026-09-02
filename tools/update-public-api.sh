@@ -49,6 +49,32 @@ SIMPLIFY="-sss"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 baseline="$repo_root/api/ferx-core-public-api.txt"
 
+# Validate the argument BEFORE doing any work. The check/write choice below is a
+# bare `if --check ... else write`, so without this any unrecognised argument —
+# `--chek`, `-check`, `check` — falls into the write arm and OVERWRITES the
+# committed baseline with whatever the current tree exposes. That is the one
+# outcome this gate exists to prevent, reached by a typo, and it looks like a
+# pass: the script prints "wrote ..." and exits 0.
+usage() {
+  echo "usage: tools/update-public-api.sh [--check]"
+  echo "  (no argument) regenerate $baseline"
+  echo "  --check       diff against it; non-zero on drift (what CI runs)"
+}
+
+case "${1:-}" in
+  "" | --check) ;;
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  *)
+    usage >&2
+    echo "refusing to run with unknown argument '$1' — writing the baseline by" >&2
+    echo "accident would silently accept whatever the tree currently exposes." >&2
+    exit 2
+    ;;
+esac
+
 if ! cargo public-api --version 2>/dev/null | grep -q "$PUBLIC_API_VERSION"; then
   echo "installing cargo-public-api $PUBLIC_API_VERSION ..." >&2
   cargo install cargo-public-api --locked --version "$PUBLIC_API_VERSION"

@@ -1038,10 +1038,13 @@ fn zero_order_windows(
 /// Delivering it as a per-segment constant — like an infusion — sidesteps that: a
 /// window is included **only if it fully contains the segment** (`w_start ≤ t_start`
 /// and `w_end ≥ t_end`), so the post-cutoff segment (whose right end is past
-/// `w_end`) is correctly excluded. The break-time list splits at `w_end` (see
-/// [`push_zero_order_break_times`]) so every segment is fully inside or outside each
-/// window — the invariant this test relies on, exactly as [`active_infusions`]
-/// relies on it for infusion windows. `reset_floor` turns off windows opened before
+/// `w_end`) is correctly excluded. The break-time list splits at **both** `w_start`
+/// and `w_end` (see [`push_zero_order_break_times`]) so every segment is fully inside
+/// or outside each window — the invariant this test relies on, exactly as
+/// [`active_infusions`] relies on it for infusion windows. Both edges matter and the
+/// filter is two-sided: bracketing only `w_end` leaves the segment straddling
+/// `w_start` failing containment, which drops the rate for the entire window rather
+/// than mis-resolving an edge (#1171). `reset_floor` turns off windows opened before
 /// the most recent reset (EVID=3/4).
 fn active_zero_order_inputs(
     windows: &[ZeroOrderWindow],
@@ -1133,17 +1136,33 @@ pub(crate) fn input_rate_consumes_cmt(ode: &OdeSpec, cmt_1based: usize) -> bool 
 /// list.
 ///
 /// A zero-order input delivers a constant rate over `[w_start, w_end]` then stops —
-/// a step discontinuity at `w_end` that the smooth densities (transit/igd/weibull)
-/// don't have. Without a break there, the adaptive RK45 steps across the cutoff and
-/// mis-resolves the absorbed mass, so the timeline must break at `w_end` for every
-/// zero-order window — exactly mirroring the infusion-end break. Because the break
-/// reads `w_end` from the same [`ZeroOrderWindow`] the per-segment filter uses
-/// ([`active_zero_order_inputs`]), the segment edge and the containment boundary
-/// can't drift apart. Doses turned off by a later reset still get a harmless extra
-/// break (over-segmentation only). No-op for the common model with no zero-order
-/// window.
+/// step discontinuities at *both* edges that the smooth densities (transit/igd/weibull)
+/// don't have. Without a break there, the adaptive RK45 steps across the edge and
+/// mis-resolves the absorbed mass, so the timeline must break at both for every
+/// zero-order window — `w_end` mirroring the infusion-end break, `w_start` mirroring
+/// the infusion start.
+///
+/// **Both edges, because [`active_zero_order_inputs`] tests both.** Its filter is
+/// `w_start <= t_start && w_end >= t_end`, so a segment straddling an unbracketed
+/// `w_start` fails full containment and the constant rate is dropped for the *whole*
+/// window — #1171, where two builders pushed only `w_end` and a model whose sole
+/// input was a lagged `zero_order` read exactly `0.0` everywhere. Emitting both from
+/// the same [`ZeroOrderWindow`] the filter reads is what makes the segment edges and
+/// the containment boundary unable to drift apart; pushing one of the two made that
+/// claim false for every caller that did not *also* remember
+/// [`push_route_lag_break_times`]. Keep it that way: a new break-time builder must
+/// get correct zero-order segmentation from this call alone.
+///
+/// `w_start` is a no-op for an unlagged route (it coincides with the dose's own
+/// `d.time + lag_cmt` break and dedups away). Doses turned off by a later reset still
+/// get a harmless extra break (over-segmentation only). No-op for the common model
+/// with no zero-order window.
 fn push_zero_order_break_times(break_times: &mut Vec<f64>, windows: &[ZeroOrderWindow]) {
-    break_times.extend(windows.iter().map(|&(_, _, _, w_end)| w_end));
+    break_times.extend(
+        windows
+            .iter()
+            .flat_map(|&(_, _, w_start, w_end)| [w_start, w_end]),
+    );
 }
 
 /// Push a break at every per-route absorption onset `d.time + lag_cmt + lag_route`
@@ -1813,7 +1832,7 @@ pub struct OdeSpec {
     /// `OdeSolverOptions::default()` (reltol 1e-4 / abstol 1e-6); overridden
     /// from the model's `[fit_options]` (`ode_reltol` / `ode_abstol` /
     /// `ode_max_steps`) and call-time `settings` via
-    /// [`CompiledModel::sync_ode_solver_opts`]. Carried on the spec so every
+    /// [`crate::types::CompiledModel::sync_ode_solver_opts`]. Carried on the spec so every
     /// integration entry point (`ode_predictions*`, EKF) uses the configured
     /// accuracy without threading options through each call.
     pub solver_opts: OdeSolverOptions,
@@ -1869,7 +1888,7 @@ impl OdeSpec {
     /// gates (`ode_analytical_supported`'s subject variants), the IOV gate
     /// (`ode_iov_supported`), the event-driven walk (`integrate_tvcov_g`), the
     /// initial-point diagnostics (`api::check_absorption_dosing`), and
-    /// [`crate::types::CompiledModel::has_route_absorption_lag`] — so the "does this
+    /// `crate::types::CompiledModel::has_route_absorption_lag` — so the "does this
     /// model have a route lag?" test cannot drift between them.
     pub fn has_route_lag(&self) -> bool {
         self.input_rate.iter().any(|f| f.lag_slot.is_some())
@@ -5444,6 +5463,12 @@ pub fn ode_predictions_ekf(
 /// `ode_predictions` **must be mirrored here**. Search for the parallel line in
 /// `ode_predictions` and apply the same change.
 ///
+/// This note is not enough on its own: the inline break-time builder below drifted
+/// from `collect_dose_break_times` anyway, losing the per-route absorption onset
+/// and with it every lagged `zero_order` window (#1171). The end-to-end guard is
+/// `ode::predictions::tests::route_lagged_zero_order_reaches_every_dense_engine`,
+/// which checks all three dense engines against a closed-form ramp.
+///
 /// # Precondition
 ///
 /// The caller **must not** pass a subject that has EVID=3/4 resets
@@ -5503,6 +5528,16 @@ pub fn ode_predictions_with_states(
             break_times.push(residual_end);
         }
     }
+    // Per-route absorption onset (`fn(..., lag=L)`), the same call
+    // `collect_dose_break_times` makes (#1171). Zero-order no longer depends on this —
+    // `push_zero_order_break_times` brackets its own `w_start` — but the *smooth*
+    // kernels still do: `first_order` is `dose·ka·exp(-ka·tad)` with a hard `0` for
+    // `tad <= 0`, i.e. a step at the onset, and `weibull` (β < 1) and `transit` (n = 0)
+    // likewise. `sens/ode_provider.rs` emits `K_ROUTE_ONSET` for every lagged kind and
+    // is pinned bit-identical to this break (#859), so it stays unconditional.
+    push_route_lag_break_times(&mut break_times, ode, subject, &dose_lagtimes, |f| {
+        f.route_lag(pk_params_flat)
+    });
     // Zero-order windows for this subject (#504): the dense paths have a single
     // PK snapshot, so the per-dose `dur`/`F`/`lag` come from `pk_params_flat`.
     // Break at each window end so segments align with the cutoff, and reuse the
@@ -5751,13 +5786,24 @@ pub fn ode_predictions_event_driven_with_states(
 
 /// Build the sorted, deduped dose-segment break times for a subject — the points
 /// where the integrator must stop and re-apply boundary events (dose pulses, lags,
-/// infusion ends, SS-record seeds, EVID-3/4 resets, zero-order windows). `terminal`
-/// is the final break: the last `saveat` for the dense solve, or the horizon for
-/// the event-time search. Shared by [`ode_dense_solve_states`] and
-/// [`ode_solve_until_chz_threshold`] so the two segment the timeline identically
-/// (a divergence here would make a simulated event time inconsistent with the
-/// fitted hazard).
+/// infusion ends, SS-record seeds, EVID-3/4 resets, per-route absorption onsets,
+/// zero-order windows). `terminal` is the final break: the last `saveat` for the
+/// dense solve, or the horizon for the event-time search. Shared by
+/// [`ode_dense_solve_states`] and [`ode_solve_until_chz_threshold`] so the two
+/// segment the timeline identically (a divergence here would make a simulated event
+/// time inconsistent with the fitted hazard).
+///
+/// On the breaks the two share — dose arrivals, infusion ends, SS seeds, route
+/// onsets, zero-order edges — it must agree with [`collect_dose_break_times`], the
+/// prediction engines' builder; `route_lagged_zero_order_break_builders_agree`
+/// asserts that on a route-lagged subject, after this one silently lost the
+/// route-onset break (#1171). The lists are **not** equal in general: this one also
+/// seeds `subject_integration_start`, pushes `subject.reset_times` and appends
+/// `terminal`. Those three are this builder's own, and the reset push in particular
+/// is load-bearing (#1133) — do not delete it to "restore agreement".
 fn build_segment_break_times(
+    ode: &OdeSpec,
+    pk_params_flat: &[f64],
     subject: &Subject,
     dose_lagtimes: &[f64],
     dose_f_bio: &[f64],
@@ -5790,6 +5836,16 @@ fn build_segment_break_times(
     for &rt in &subject.reset_times {
         break_times.push(rt);
     }
+    // Per-route absorption onset (`fn(..., lag=L)`), the same call
+    // `collect_dose_break_times` makes (#1171). Zero-order no longer depends on this —
+    // `push_zero_order_break_times` brackets its own `w_start` — but the *smooth*
+    // kernels still do: `first_order` is `dose·ka·exp(-ka·tad)` with a hard `0` for
+    // `tad <= 0`, i.e. a step at the onset, and `weibull` (β < 1) and `transit` (n = 0)
+    // likewise. `sens/ode_provider.rs` emits `K_ROUTE_ONSET` for every lagged kind and
+    // is pinned bit-identical to this break (#859), so it stays unconditional.
+    push_route_lag_break_times(&mut break_times, ode, subject, dose_lagtimes, |f| {
+        f.route_lag(pk_params_flat)
+    });
     push_zero_order_break_times(&mut break_times, zo_windows);
     break_times.push(terminal);
     break_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -5975,8 +6031,15 @@ pub fn ode_dense_solve_states(
     let zo_windows = zero_order_windows(&subject.doses, &dose_lagtimes, &dose_f_bio, |_, d| {
         zero_order_dur_and_frac_for_dose(ode, d, pk_params_flat)
     });
-    let break_times =
-        build_segment_break_times(subject, &dose_lagtimes, &dose_f_bio, &zo_windows, t_last);
+    let break_times = build_segment_break_times(
+        ode,
+        pk_params_flat,
+        subject,
+        &dose_lagtimes,
+        &dose_f_bio,
+        &zo_windows,
+        t_last,
+    );
 
     let mut active_infusions: Vec<(usize, f64, f64)> = Vec::new();
 
@@ -6191,8 +6254,15 @@ pub(crate) fn ode_solve_until_chz_threshold(
     let zo_windows = zero_order_windows(&subject.doses, &dose_lagtimes, &dose_f_bio, |_, d| {
         zero_order_dur_and_frac_for_dose(ode, d, pk_params_flat)
     });
-    let mut break_times =
-        build_segment_break_times(subject, &dose_lagtimes, &dose_f_bio, &zo_windows, horizon);
+    let mut break_times = build_segment_break_times(
+        ode,
+        pk_params_flat,
+        subject,
+        &dose_lagtimes,
+        &dose_f_bio,
+        &zo_windows,
+        horizon,
+    );
     break_times.retain(|&t| t <= horizon + 1e-15);
 
     let mut active_infusions: Vec<(usize, f64, f64)> = Vec::new();

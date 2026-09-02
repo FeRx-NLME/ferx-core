@@ -213,24 +213,6 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
     if subject_has_survival_records(subject) {
         return "survival/TTE observations";
     }
-    // #1070: name this cause before the generic scope catch-all below. The #1070 decline
-    // lives in `ode_iov_supported`, which `iov_sens_eta_supported` calls — so without this
-    // clause a TAD-under-lagtime model reports the uninformative "model outside IOV analytic
-    // scope" instead of the actual reason. Attributed against the *effective* model for the
-    // same reason the ODE block below is (#814): a closed-form transit/IG + IOV subject
-    // evaluates on its ODE twin, and it is that twin's RHS which reads `TAD`.
-    {
-        let eff = model.effective_for(subject);
-        if eff.has_lagtime()
-            && eff
-                .ode_spec
-                .as_ref()
-                .and_then(|o| o.rhs_program.as_ref())
-                .is_some_and(|p| p.uses_dose_anchored_time_vars())
-        {
-            return "TAD-dependent ODE RHS + estimated lagtime";
-        }
-    }
     if !crate::sens::provider::iov_sens_eta_supported(model) {
         return "model outside IOV analytic scope";
     }
@@ -266,12 +248,15 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
         // them would misattribute an SS bail to a later reason). #590 review. A
         // steady-state rate-defined infusion under `F ≠ 1`, and steady-state combined
         // with an estimated lagtime, are both analytic now (#486).
+        // `reads_model_time`, mirroring `ode_iov_subject_supported` exactly: asking the
+        // bare `uses_time_vars` here would misattribute a bare-`TIME` SS bail to a later
+        // reason once that gate declines it (#1124).
         if has_ss
             && eff
                 .ode_spec
                 .as_ref()
                 .and_then(|o| o.rhs_program.as_ref())
-                .is_some_and(|p| p.uses_time_vars())
+                .is_some_and(|p| p.reads_model_time())
         {
             return "steady-state dose + time-dependent ODE RHS";
         }
@@ -478,7 +463,7 @@ pub struct EbeResult {
     /// `iov_occasion_groups`).
     pub kappas: Vec<DVector<f64>>,
     /// True when the subject was hard-rejected at its inner start (a pathological
-    /// ODE+IOV warm-start NLL — see [`reject_ode_iov_inner_start`]). The returned
+    /// ODE+IOV warm-start NLL — see `reject_ode_iov_inner_start`). The returned
     /// `eta`/`h_matrix` are then a degenerate placeholder (off-mode η, zero H), so the
     /// outer loop must reject the whole trial rather than fold them into an accepted
     /// OFV. Unlike plain non-convergence this forces rejection regardless of

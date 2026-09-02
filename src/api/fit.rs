@@ -667,12 +667,14 @@ pub fn fit(
     }
 
     // Multi-start: run n_starts fits in parallel, return the lowest-OFV converged result.
-    // `threads` controls per-subject parallelism inside a single-start fit; in multi-start
-    // mode the shared fit pool handles both levels (outer start × inner per-subject), so we
-    // do not narrow it to `threads` here — that would cap the combined fan-out below the
-    // available cores. Running one shared pool (rather than a fresh ThreadPool per start
-    // inside the outer into_par_iter()) also avoids spawning n_starts independent pools that
-    // all compete on the same CPUs, causing oversubscription.
+    // One pool serves both levels (outer start × inner per-subject) — a fresh ThreadPool per
+    // start inside the outer into_par_iter() would spawn n_starts independent pools all
+    // competing on the same CPUs. Which pool that is follows the same rule as the
+    // single-start arm above: a pinned positive `threads` is an upper bound on the worker
+    // threads this `fit()` call uses, so it is honored here too. It has to be — a tool that
+    // pins `threads` from a `PoolPlan` and also sets `n_starts > 1` would otherwise get its
+    // replicate-level pool *and* the full-width shared pool underneath every replicate
+    // (#1115). Unpinned, the shared big-stack pool handles both levels as before.
     let base_seed: u64 = options.multi_start_seed.unwrap_or(42);
     let base_saem_seed: u64 = options.saem_seed.unwrap_or(12345);
     let base_bayes_seed: u64 = options.bayes_seed.unwrap_or(12345);
@@ -723,11 +725,15 @@ pub fn fit(
             .collect()
     };
 
-    // Run the start fan-out on the shared big-stack pool; fall back to the ambient pool
-    // only if its one-time build failed.
-    let results: Vec<(usize, Result<FitResult, String>)> = match default_fit_pool() {
-        Some(pool) => pool.install(par_starts),
-        None => par_starts(),
+    // Run the start fan-out on the pinned fit-scoped pool when `threads` is set, else on the
+    // shared big-stack pool; fall back to the ambient pool only if that one-time build failed.
+    let results: Vec<(usize, Result<FitResult, String>)> = match options.threads.filter(|&n| n > 0)
+    {
+        Some(n) => build_fit_pool(n)?.install(par_starts),
+        None => match default_fit_pool() {
+            Some(pool) => pool.install(par_starts),
+            None => par_starts(),
+        },
     };
 
     // Pick the best start (see `multistart_prefers` for the ranking).
@@ -921,10 +927,18 @@ fn fit_inner(
         // coordinate. The coordinate structure (and hence the names) is fixed
         // across a method chain, so the template's names serve every stage.
         let coord_names = crate::estimation::parameterization::coordinate_names(init_params);
+        // Both outcomes follow the warning convention and go into
+        // `FitResult.warnings` rather than straight to stderr — these were the
+        // only two prints on the fit path that were not behind `verbose`
+        // (#1115). The success line has to be a warning rather than a gated
+        // `eprintln!`: the filename embeds the pid and a timestamp, so a quiet
+        // caller that asked for a trace would otherwise have no way to learn
+        // where it was written. A verbose run still sees both, via the
+        // `pre_run_warnings` dump below.
         if let Err(e) = crate::estimation::trace::init(path.clone(), &coord_names) {
-            eprintln!("[ferx] warning: could not open trace file {}: {}", path, e);
+            pre_run_warnings.push(format!("could not open trace file {}: {}", path, e));
         } else {
-            eprintln!("[ferx] optimizer trace → {}", path);
+            pre_run_warnings.push(format!("optimizer trace written to {}", path));
         }
     }
 

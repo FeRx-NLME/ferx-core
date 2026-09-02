@@ -63,7 +63,7 @@
 //!
 //! # Where it is evaluated
 //!
-//! [`resolve_method`] is called by each driver on **that call's own initial state**, not once
+//! `resolve_method` is called by each driver on **that call's own initial state**, not once
 //! per subject on the declared `init(...)` condition. That matters, and is not a detail: for
 //! any model whose stiffness is carried by a binding term (`KON · C · R`), the fast eigenvalue
 //! is identically zero before any drug is present, so the declared initial condition is the
@@ -95,7 +95,7 @@
 use crate::ode::solver::{OdeMethod, OdeSolverOptions};
 use crate::sens::num::PkNum;
 
-/// `|Re λ|max` at or above which [`resolve_method`] calls a segment stiff.
+/// `|Re λ|max` at or above which `resolve_method` calls a segment stiff.
 ///
 /// Calibrated on the ferx-testdata ODE library (see the module docs). It sits well above the
 /// rates ordinary absorption/elimination produce — the non-stiff models there top out at 4.6,

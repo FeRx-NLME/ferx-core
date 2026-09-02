@@ -105,6 +105,7 @@ website:
       - text: "Tools"
         contents:
           - tools/bootstrap.qmd
+          - tools/gam-screening.qmd
       - text: "Data Format"
         href: data-format.qmd
       - text: "CLI Reference"
@@ -152,6 +153,7 @@ website:
         contents:
           - development/contributing.qmd
           - development/sdlc.qmd
+          - development/docs-lint.qmd
 
   page-footer:
     background: light
@@ -167,8 +169,13 @@ format:
       dark: [cosmo, assets/ferx-dark.scss]
     css: styles.css
     toc: true
-    toc-depth: 3
+    toc-depth: 4
     number-sections: false
+    grid:
+      sidebar-width: 250px
+      body-width: 1000px
+      margin-width: 250px
+      gutter-width: 1.5rem
     code-link: true
     code-copy: true
     code-overflow: wrap

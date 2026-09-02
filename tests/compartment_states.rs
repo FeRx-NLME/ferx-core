@@ -2403,3 +2403,99 @@ fn ode_with_scaling_ipred_is_correctly_scaled() {
         }
     }
 }
+
+/// A `[derived] integral(compartments[..])` on an `[odes]` RHS that reads model
+/// time must produce a **finite** column, not NaN.
+///
+/// Guards the predicate choice at the `[derived]` grid gate in
+/// `api/output_columns.rs`. That arm returns `vec![]` — every grid point NaN —
+/// for cases where a single `t=0` PK snapshot cannot represent parameters that
+/// vary along the grid, and it asks `compiled_model_uses_time_builtin`, i.e.
+/// whether the **individual-parameter program** reads `TIME`.
+///
+/// It must NOT be widened to `pk::model_uses_time_anywhere`. An `[odes]` RHS that
+/// reads `TAD`/`TAFD`/`T`/`TIME` does not make `pk_param_fn` time-dependent — the
+/// clock it reads belongs to the solver, and the dense driver sets its own
+/// per-segment `TAD` anchor — so the `t=0` snapshot stays exact and the dense arm
+/// below returns a correct number. Widening replaced that number with NaN for
+/// every subject, silently: no warning is emitted for this arm (unlike the
+/// IOV / TV / reset / init / oral-depot siblings, each of which names a
+/// `W_DERIVED_*` — the `is_algebraic` arm names none either), and the per-obs
+/// `compartments[i]` column stayed finite because `compute_predictions_with_states`
+/// routes `uses_time` to `ode_predictions_event_driven_with_states`, which still
+/// computes states via `ode_dense_solve_states`.
+///
+/// Tier 2: `maxiter = 2`, no convergence.
+#[test]
+fn derived_integral_on_a_model_time_ode_rhs_is_finite() {
+    const MODEL: &str = "
+[parameters]
+  theta CL(1.0, 0, 100)
+  theta V(10.0, 0, 1000)
+  omega ETA_CL ~ 0.09
+  sigma PROP   ~ 0.01
+
+[individual_parameters]
+  CL = CL * exp(ETA_CL)
+  V  = V
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central * (1.0 + 0.3*TAD)
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[derived]
+  AUC_C0 = integral(compartments[0], from=0, to=24, step=1.0)
+
+[fit_options]
+  method   = focei
+  maxiter  = 2
+  gradient = fd
+";
+    let model = parse_model_string(MODEL).expect("model must parse");
+
+    // The fixture is deliberately built so the two predicates disagree: the
+    // `[individual_parameters]` block reads no time built-in at all (so the narrow
+    // predicate is false), while the `[odes]` RHS reads `TAD` (so the wide one is
+    // true). That is what makes this test able to distinguish them. The predicates
+    // themselves are `pub(crate)`, so the discrimination is pinned by the model
+    // source above rather than by an assertion here; the unit-level counterpart
+    // that *can* assert it is
+    // `stats::likelihood::tests::joint_pktte_share_rejects_model_time_in_the_odes_rhs`.
+
+    let pop = simple_iv_population();
+    let mut opts = FitOptions::default();
+    opts.verbose = false;
+    let result = fit(&model, &pop, &model.default_params, &opts).expect("short fit must not error");
+
+    for sr in &result.subjects {
+        let col = sr
+            .extra_columns
+            .iter()
+            .find(|(n, _)| n == "AUC_C0")
+            .unwrap_or_else(|| panic!("AUC_C0 missing for subject {}", sr.id));
+        assert!(!col.1.is_empty(), "AUC_C0 empty for subject {}", sr.id);
+        for &v in &col.1 {
+            assert!(
+                v.is_finite(),
+                "AUC_C0 is {v} for subject {} — the `[derived]` grid gate took the \
+                 NaN arm for a model whose PK snapshot is time-independent",
+                sr.id
+            );
+        }
+        // …and non-trivial: an all-zero column would satisfy `is_finite` while
+        // still meaning the grid never saw the compartment.
+        assert!(
+            col.1.iter().any(|&v| v > 0.0),
+            "AUC_C0 is all non-positive for subject {} — finite but vacuous",
+            sr.id
+        );
+    }
+}

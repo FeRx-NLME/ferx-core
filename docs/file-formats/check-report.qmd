@@ -54,6 +54,20 @@ Optional fields are omitted entirely when absent (not emitted as `null`).
 
 ## Error / warning codes
 
+Grouped by what the finding is about. Codes are stable; new ones may be added over time.
+Treat an unrecognised code as a generic finding of its given `severity`.
+
+- [Model-file structure](#codes-model-file-structure)
+- [Parameters and random effects](#codes-parameters-and-random-effects)
+- [Method and optimizer compatibility](#codes-method-and-optimizer-compatibility)
+- [Data and dosing](#codes-data-and-dosing)
+- [Scaling, output and derived columns](#codes-scaling-output-and-derived)
+- [Experimental and degraded paths](#codes-experimental-and-degraded)
+
+### Model-file structure {#codes-model-file-structure}
+
+The file could not be read as a ferx model at all, or names a block ferx does not have.
+
 | Code | Severity | Meaning |
 |------|----------|---------|
 | `E_PARSE` | error | The model file failed to parse (catch-all for parser errors). |
@@ -63,42 +77,74 @@ Optional fields are omitted entirely when absent (not emitted as `null`).
 | `E_BLOCK_INSTANCE_NAME` | error | A `[block NAME]` instance name is given for a block that takes none (e.g. `[fit_options DOSE]`), or omitted for one that requires it (`[covariate_nn NAME]`). |
 | `E_BLOCK_FEATURE_DISABLED` | error | A recognised block needs a cargo feature this binary was not built with — `[event_model]` / `[binary_model]` need `--features survival`, `[markov_model]` needs `--features markov`. (`[covariate_nn]` has its own `E_NN_FEATURE_DISABLED`.) |
 | `E_NN_FEATURE_DISABLED` | error | A `[covariate_nn]` block requires building with `--features nn`. |
-| `E_MISSING_COVARIATE` | error | The model references a covariate not present in the data (case-sensitive). |
+
+### Parameters and random effects {#codes-parameters-and-random-effects}
+
+A theta, eta, kappa or sigma the model uses is not declared, is declared in the wrong order, or has no data to bind to.
+
+| Code | Severity | Meaning |
+|------|----------|---------|
 | `E_ETA_NOT_DECLARED` | error | An unresolved identifier reads as a random effect (`ETA…` / `KAPPA…`) but no `omega` / `kappa` declaration defines it, and the data carries no such column. Usually a deleted `omega` line whose `exp(ETA_…)` term was left behind. |
 | `W_ETA_NOT_DECLARED` | warning | As `E_ETA_NOT_DECLARED`, but reported without `--data`, where ferx cannot yet know whether the dataset supplies the column. |
+| `E_SIGMA_ORDER_MISMATCH` | error | A single-endpoint `[error_model]` names its sigmas in an order other than the `[parameters]` declaration order. These sigmas are consumed *positionally*, so the written names must match the declared order. Fix by reordering the `sigma` **declarations** (permuting a `block_sigma`'s lower triangle with them) — reordering the *arguments* also parses but swaps the proportional and additive roles, i.e. changes the model. See [#1001](https://github.com/FeRx-NLME/ferx-core/issues/1001) and [Error model](../model-file/error-model.qmd#sigma-order). |
+| `E_IOV_MISSING_OCC` | error | Model declares kappa (IOV) parameters but no occasion labels were found in the dataset. Set `iov_column` in `[fit_options]`. |
+| `W_IOV_OCC_MISSING` | warning | Some rows in the IOV occasion column had missing or unparseable values; those rows were assigned occasion=0. |
+
+### Method and optimizer compatibility {#codes-method-and-optimizer-compatibility}
+
+The chosen estimation method or optimizer cannot serve this model.
+
+| Code | Severity | Meaning |
+|------|----------|---------|
 | `E_SAEM_NO_RANDOM_EFFECTS` | error | `method = saem` (anywhere in a method chain) on a model with no random effects (`n_eta = 0`). SAEM is an EM over the random effects; use `foce` / `focei` / `laplace`. |
 | `E_METHOD_NO_RANDOM_EFFECTS` | error | `method = imp`, `impmap` or `bayes` (anywhere in a method chain) on a model with no random effects (`n_eta = 0`). Each integrates over the random effects, so with none declared the marginal collapses to the observation likelihood; use `foce` / `focei` / `laplace`. See [#1007](https://github.com/FeRx-NLME/ferx-core/issues/1007). |
 | `W_GN_NO_RANDOM_EFFECTS` | warning | `method = gn` as the last estimating stage on a model with no random effects (`n_eta = 0`). Pure Gauss-Newton is start-sensitive there — with no inner EBE loop the BHHH step can collapse far from the optimum. Prefer `gn_hybrid` or `focei`. Not reported when a later stage re-optimises the GN result (`gn_hybrid`, or a `methods = [gn, focei]` chain). See [#1006](https://github.com/FeRx-NLME/ferx-core/issues/1006). |
-| `E_PER_CMT_SCALING` | error | An observed compartment lacks a per-CMT scaling entry. |
-| `E_PER_CMT_ERROR_MODEL` | error | An observed compartment lacks a per-CMT `[error_model]` entry. |
-| `E_DATA` | error | The `--data` file could not be read or parsed. |
-| `E_SDE_INCOMPATIBLE` | error | An SDE (`[diffusion]`) model used with an incompatible method (`saem`, `gn`, `gn_hybrid`) or gradient setting. |
 | `E_IMP_CHAIN` | error | `imp` is mis-placed in a method chain — repeated, or (with `imp_eval_only = true`) not the terminal stage. The estimating `imp` may sit anywhere; an evaluation-only `imp` must be terminal. |
 | `E_OPTIMIZER_IOV` | error | `optimizer = trust_region` used with an IOV model (`n_kappa > 0`). |
 | `E_OPTIMIZER_AGQ` | error | `optimizer = trust_region` used with a quadrature stage (`method = laplace`, or `method = focei` with `n_agq > 1`). The trust region scores the quadrature objective but its gradient is the FOCE/Laplace closed form, so it would converge to the FOCE optimum while reporting quadrature OFVs. |
-| `E_DOSE_ATTR_DOUBLE_USE` | error | A dose attribute the engine applies at the dose event is *also* read by the model, so its value is applied twice. Bioavailability and lag are caught at parse time on **both** engines (message names `[odes]`, `[scaling]` or `[adaptive_dosing]`) — on ODE models via the name (`F`, `LAGTIME`/`ALAG`, `F{n}`/`ALAG{n}`/`LAGTIME{n}`), on analytical models via the `pk(..., f=…)` / `lagtime=…` mapping, where the remedy is to drop the mapping rather than rename. `D{n}`/`R{n}` are reported only when a coded `RATE=-2`/`-1` dose in the data lands on them. **Initial conditions are exempt on both engines** — `[odes] init(state) = …` and `[initial_conditions]` seed the state with the raw value and never consult a dose attribute, so a seed that reads one applies it exactly once ([#1046](https://github.com/FeRx-NLME/ferx-core/issues/1046)). See [#993](https://github.com/FeRx-NLME/ferx-core/issues/993) and [#1004](https://github.com/FeRx-NLME/ferx-core/issues/1004). |
-| `E_SIGMA_ORDER_MISMATCH` | error | A single-endpoint `[error_model]` names its sigmas in an order other than the `[parameters]` declaration order. These sigmas are consumed *positionally*, so the written names must match the declared order. Fix by reordering the `sigma` **declarations** (permuting a `block_sigma`'s lower triangle with them) — reordering the *arguments* also parses but swaps the proportional and additive roles, i.e. changes the model. See [#1001](https://github.com/FeRx-NLME/ferx-core/issues/1001) and [Error model](../model-file/error-model.qmd#sigma-order). |
+| `E_SDE_INCOMPATIBLE` | error | An SDE (`[diffusion]`) model used with an incompatible method (`saem`, `gn`, `gn_hybrid`) or gradient setting. |
+
+### Data and dosing {#codes-data-and-dosing}
+
+The dataset could not be read, or a dose / observation record is inconsistent with what the model expects.
+
+| Code | Severity | Meaning |
+|------|----------|---------|
+| `E_DATA` | error | The `--data` file could not be read or parsed. |
+| `E_MISSING_COVARIATE` | error | The model references a covariate not present in the data (case-sensitive). |
+| `E_NONFINITE_DV` | error | A subject carries a non-finite (`NaN`/`Inf`) observation. Usually a population read by `read_population_for_simulation()` — a simulation input — passed to `fit()`. |
+| `W_MISSING_DV` | warning | One or more `EVID=0` rows had a missing `DV` (`.`/`NA`/blank) but were not marked `MDV=1`; they were skipped rather than scored as `DV=0`. |
+| `W_DESIGN_DV` | warning | Simulation reader only: one or more `EVID=0` rows had a missing `DV` and were kept as design points to simulate at, so the dataset contributes more rows than a fit of the same file would. |
+| `W_ADDL_MISSING_II` | warning | ADDL > 0 on a dose row but II is zero or missing; additional doses were not expanded. |
 | `W_STEADY_STATE_II` | warning | SS=1 doses with missing / non-positive `II` (treated as non-SS). |
 | `W_STEADY_STATE_INFUSION` | warning | SS=1 infusion with `T_inf > II` (overlapping pulses; SS skipped). |
-| `W_SDE_RESET` | warning | EVID=3/4 resets under an SDE `[diffusion]` model are not honoured. |
-| `W_EXPERIMENTAL_SDE` | warning | The model uses stochastic differential equations (`[diffusion]`), an [experimental](../maturity.qmd) feature. |
-| `W_EXPERIMENTAL_NN` | warning | The model uses neural-network components (`[covariate_nn]`), an [experimental](../maturity.qmd) feature. |
+| `E_DOSE_ATTR_DOUBLE_USE` | error | A dose attribute the engine applies at the dose event is *also* read by the model, so its value is applied twice. Bioavailability and lag are caught at parse time on **both** engines (message names `[odes]`, `[scaling]` or `[adaptive_dosing]`) — on ODE models via the name (`F`, `LAGTIME`/`ALAG`, `F{n}`/`ALAG{n}`/`LAGTIME{n}`), on analytical models via the `pk(..., f=…)` / `lagtime=…` mapping, where the remedy is to drop the mapping rather than rename. `D{n}`/`R{n}` are reported only when a coded `RATE=-2`/`-1` dose in the data lands on them. **Initial conditions are exempt on both engines** — `[odes] init(state) = …` and `[initial_conditions]` seed the state with the raw value and never consult a dose attribute, so a seed that reads one applies it exactly once ([#1046](https://github.com/FeRx-NLME/ferx-core/issues/1046)). See [#993](https://github.com/FeRx-NLME/ferx-core/issues/993) and [#1004](https://github.com/FeRx-NLME/ferx-core/issues/1004). |
 | `W_NEGATIVE_LAGTIME` | warning | Lag time is negative at the initial typical-value point. |
+
+### Scaling, output and derived columns {#codes-scaling-output-and-derived}
+
+An observed compartment is missing a scaling or error-model entry, or an `[output]` / `[derived]` name does not resolve.
+
+| Code | Severity | Meaning |
+|------|----------|---------|
+| `E_PER_CMT_SCALING` | error | An observed compartment lacks a per-CMT scaling entry. |
+| `E_PER_CMT_ERROR_MODEL` | error | An observed compartment lacks a per-CMT `[error_model]` entry. |
 | `E_DERIVED_NAME_CONFLICT` | error | A `[derived]` name clashes with a built-in sdtab column, theta, eta, or individual-parameter name. |
 | `W_DERIVED_COVARIATE_SHADOW` | warning | A `[derived]` name shadows a covariate (allowed but may be confusing). |
 | `W_DERIVED_STEP_IGNORED` | warning | `step=` given for a DV-based integral (ignored; DV integrals always use observation times). |
-| `W_ABSORPTION_TWIN_DECLINED` | warning | An analytic transit / inverse-Gaussian model's ODE twin could not be built, so the model stays closed-form with no ODE fallback. Subjects needing the fallback (time-varying covariates, a `TIME`-dependent parameter, IOV, SS or infusion doses, the flip-flop regime) are then rejected with an explicit error. The message carries the twin parser's own reason — most often an individual parameter named after a twin state (`CENTRAL`, `PERIPH`). See [#1008](https://github.com/FeRx-NLME/ferx-core/issues/1008). |
 | `E_OUTPUT_UNKNOWN_COLUMN` | error | A name in `[output]` is not recognised as a covariate, individual parameter, or derived expression. |
 | `W_OUTPUT_DUPLICATE` | warning | A name in `[output]` is already written to sdtab automatically (e.g. `TAFD`, `TAD`, an eta name). |
-| `W_ADDL_MISSING_II` | warning | ADDL > 0 on a dose row but II is zero or missing; additional doses were not expanded. |
-| `W_IOV_OCC_MISSING` | warning | Some rows in the IOV occasion column had missing or unparseable values; those rows were assigned occasion=0. |
-| `W_MISSING_DV` | warning | One or more `EVID=0` rows had a missing `DV` (`.`/`NA`/blank) but were not marked `MDV=1`; they were skipped rather than scored as `DV=0`. |
-| `W_DESIGN_DV` | warning | Simulation reader only: one or more `EVID=0` rows had a missing `DV` and were kept as design points to simulate at, so the dataset contributes more rows than a fit of the same file would. |
-| `E_NONFINITE_DV` | error | A subject carries a non-finite (`NaN`/`Inf`) observation. Usually a population read by `read_population_for_simulation()` — a simulation input — passed to `fit()`. |
-| `E_IOV_MISSING_OCC` | error | Model declares kappa (IOV) parameters but no occasion labels were found in the dataset. Set `iov_column` in `[fit_options]`. |
 
-Codes are stable; new ones may be added over time. Treat an unrecognised code
-as a generic finding of its given `severity`.
+### Experimental and degraded paths {#codes-experimental-and-degraded}
+
+The model runs, but on a path that is experimental or that quietly drops a capability.
+
+| Code | Severity | Meaning |
+|------|----------|---------|
+| `W_EXPERIMENTAL_SDE` | warning | The model uses stochastic differential equations (`[diffusion]`), an [experimental](../maturity.qmd) feature. |
+| `W_EXPERIMENTAL_NN` | warning | The model uses neural-network components (`[covariate_nn]`), an [experimental](../maturity.qmd) feature. |
+| `W_SDE_RESET` | warning | EVID=3/4 resets under an SDE `[diffusion]` model are not honoured. |
+| `W_ABSORPTION_TWIN_DECLINED` | warning | An analytic transit / inverse-Gaussian model's ODE twin could not be built, so the model stays closed-form with no ODE fallback. Subjects needing the fallback (time-varying covariates, a `TIME`-dependent parameter, IOV, SS or infusion doses, the flip-flop regime) are then rejected with an explicit error. The message carries the twin parser's own reason — most often an individual parameter named after a twin state (`CENTRAL`, `PERIPH`). See [#1008](https://github.com/FeRx-NLME/ferx-core/issues/1008). |
 
 ## Line-number caveat
 

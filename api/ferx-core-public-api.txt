@@ -13,6 +13,18 @@ pub ferx_core::api::AdaptiveSimulationResult::decisions: alloc::vec::Vec<ferx_co
 pub ferx_core::api::AdaptiveSimulationResult::ledger: alloc::vec::Vec<ferx_core::sim::adaptive::DoseLedgerEntry>
 pub ferx_core::api::AdaptiveSimulationResult::metrics: alloc::vec::Vec<ferx_core::sim::adaptive::AdaptiveSubjectMetrics>
 pub ferx_core::api::AdaptiveSimulationResult::trajectories: alloc::vec::Vec<ferx_core::SimulationResult>
+pub struct ferx_core::api::PoolPlan
+impl ferx_core::PoolPlan
+pub fn ferx_core::PoolPlan::apply_to(&self, options: &mut ferx_core::FitOptions)
+pub fn ferx_core::PoolPlan::from_budget(total_threads: usize, n_units: usize) -> Self
+pub fn ferx_core::PoolPlan::install<R, OP>(&self, op: OP) -> core::result::Result<R, alloc::string::String> where OP: core::ops::function::FnOnce() -> R + core::marker::Send, R: core::marker::Send
+pub fn ferx_core::PoolPlan::new(replicates: usize, threads_per_fit: usize) -> Self
+pub fn ferx_core::PoolPlan::replicates(&self) -> usize
+pub fn ferx_core::PoolPlan::threads_per_fit(&self) -> usize
+pub fn ferx_core::PoolPlan::total_threads(&self) -> usize
+pub fn ferx_core::PoolPlan::worker_stack_size(&self) -> usize
+impl core::default::Default for ferx_core::PoolPlan
+pub fn ferx_core::PoolPlan::default() -> Self
 pub struct ferx_core::api::PredictionResult
 pub ferx_core::api::PredictionResult::id: alloc::string::String
 pub ferx_core::api::PredictionResult::pred: f64
@@ -57,6 +69,7 @@ pub ferx_core::api::SurvivalPredictionResult::median_survival: f64
 pub ferx_core::api::SurvivalPredictionResult::survival: f64
 pub ferx_core::api::SurvivalPredictionResult::survival_all: f64
 pub ferx_core::api::SurvivalPredictionResult::time: f64
+pub const ferx_core::api::FIT_RAYON_STACK_SIZE: usize
 pub fn ferx_core::api::assert_covariate_model_bound(model: &ferx_core::CompiledModel) -> core::result::Result<(), alloc::string::String>
 pub fn ferx_core::api::bind_covariate_stats(parsed: &mut ferx_core::ParsedModel, model_text: &str, population: &ferx_core::Population) -> core::result::Result<(), alloc::string::String>
 pub fn ferx_core::api::bind_theta_levels(parsed: &mut ferx_core::ParsedModel, model_text: &str, population: &mut ferx_core::Population) -> core::result::Result<(), alloc::string::String>
@@ -2615,6 +2628,7 @@ pub fn ferx_core::FitOptions::effective_inner_tol(&self, ltbs_closed_form: bool)
 pub fn ferx_core::FitOptions::hessian_anchor(&self) -> ferx_core::HessianAnchor
 pub fn ferx_core::FitOptions::method_chain(&self) -> alloc::vec::Vec<ferx_core::EstimationMethod>
 pub fn ferx_core::FitOptions::method_default_warning(&self) -> core::option::Option<alloc::string::String>
+pub fn ferx_core::FitOptions::quiet(self) -> Self
 pub fn ferx_core::FitOptions::unsupported_keys_warnings(&self) -> alloc::vec::Vec<alloc::string::String>
 impl core::default::Default for ferx_core::FitOptions
 pub fn ferx_core::FitOptions::default() -> Self
@@ -3952,6 +3966,7 @@ pub fn ferx_core::FitOptions::effective_inner_tol(&self, ltbs_closed_form: bool)
 pub fn ferx_core::FitOptions::hessian_anchor(&self) -> ferx_core::HessianAnchor
 pub fn ferx_core::FitOptions::method_chain(&self) -> alloc::vec::Vec<ferx_core::EstimationMethod>
 pub fn ferx_core::FitOptions::method_default_warning(&self) -> core::option::Option<alloc::string::String>
+pub fn ferx_core::FitOptions::quiet(self) -> Self
 pub fn ferx_core::FitOptions::unsupported_keys_warnings(&self) -> alloc::vec::Vec<alloc::string::String>
 impl core::default::Default for ferx_core::FitOptions
 pub fn ferx_core::FitOptions::default() -> Self
@@ -4230,6 +4245,18 @@ pub fn ferx_core::PkParams::v2(&self) -> f64
 pub fn ferx_core::PkParams::v3(&self) -> f64
 impl core::default::Default for ferx_core::PkParams
 pub fn ferx_core::PkParams::default() -> Self
+pub struct ferx_core::PoolPlan
+impl ferx_core::PoolPlan
+pub fn ferx_core::PoolPlan::apply_to(&self, options: &mut ferx_core::FitOptions)
+pub fn ferx_core::PoolPlan::from_budget(total_threads: usize, n_units: usize) -> Self
+pub fn ferx_core::PoolPlan::install<R, OP>(&self, op: OP) -> core::result::Result<R, alloc::string::String> where OP: core::ops::function::FnOnce() -> R + core::marker::Send, R: core::marker::Send
+pub fn ferx_core::PoolPlan::new(replicates: usize, threads_per_fit: usize) -> Self
+pub fn ferx_core::PoolPlan::replicates(&self) -> usize
+pub fn ferx_core::PoolPlan::threads_per_fit(&self) -> usize
+pub fn ferx_core::PoolPlan::total_threads(&self) -> usize
+pub fn ferx_core::PoolPlan::worker_stack_size(&self) -> usize
+impl core::default::Default for ferx_core::PoolPlan
+pub fn ferx_core::PoolPlan::default() -> Self
 pub struct ferx_core::Population
 pub ferx_core::Population::covariate_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::Population::dv_column: alloc::string::String
@@ -4410,6 +4437,7 @@ pub ferx_core::WarningEntry::severity: ferx_core::WarningSeverity
 pub ferx_core::WarningEntry::source_method: core::option::Option<alloc::string::String>
 pub const ferx_core::BOBYQA_MAX_DIM: usize
 pub const ferx_core::COV_HESSIAN_MAX_DIM: usize
+pub const ferx_core::FIT_RAYON_STACK_SIZE: usize
 pub const ferx_core::MAX_PK_PARAMS: usize
 pub const ferx_core::ODE_INIT_REJECTED_BUILTINS: &[&str]
 pub const ferx_core::ODE_INIT_SCOPE_BUILTINS: &[&str]

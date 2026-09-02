@@ -19,6 +19,97 @@ pub(crate) fn model_uses_time_builtin(model: &CompiledModel) -> bool {
     crate::parser::model_parser::compiled_model_uses_time_builtin(model)
 }
 
+/// Does this model depend on model time *anywhere* — the individual-parameter
+/// program (as [`model_uses_time_builtin`] alone reports) **or** the `[odes]`
+/// right-hand side itself?
+///
+/// The routing guards that pick between the event-driven predictor, the
+/// modified-release closed form, and the plain dense integration used to ask
+/// only the first question. An `[odes]` RHS reading `TAD`/`TAFD`/`T`/`TIME` is
+/// just as non-autonomous, and neither of the two static paths can represent it:
+///
+///   - the **closed form** identifies the disposition by probing the RHS at two
+///     times with `tad` pinned to `0.0`, so a `TAD` term is invisible to it and
+///     was silently dropped from the predictions — 8× wrong at 12 h (#1124);
+///   - the **dense** predictor started its first segment at the dose *record*
+///     rather than the arrival, so under a lagtime its `TAD` anchor had no
+///     qualifying dose and it returned `NaN` for every observation (#1110).
+///     #1073 has since given it a pre-arrival anchor, so that path is finite
+///     too; the reroute stands on the closed-form defect above, and on keeping
+///     one engine answering a non-autonomous RHS rather than two.
+///
+/// Routing these models to the event-driven predictor — which places doses on
+/// its timeline at `d.time + lag`, so `TAD` anchors correctly — is what both
+/// defects have in common, and it is the path the NONMEM `TAD`-in-`$DES` anchors
+/// (`nonmem_anchor/tad_lag_{A,B}`) already validate.
+///
+/// **What the reroute is measured to preserve.** The predicate also moves models
+/// the closed form declined for reasons of its own — `init(...)`, a
+/// `dose_attr_map`, steady-state or infusion doses — off the *dense* path, which
+/// they were on before. Measured, dense vs event-driven, worst relative
+/// difference over the observations:
+///
+/// | model | measured |
+/// |---|---|
+/// | bare `TAFD` RHS, no lagtime, plain bolus | `6e-13` |
+/// | `init(central) = BASE` + `TAFD` RHS | `4.8e-11` |
+/// | `TAD` RHS **under a lagtime**, obs post-arrival | `5.8e-12` |
+/// | …same, `lag = 3.0` (a larger anchor shift) | `5.3e-12` |
+///
+/// The lagtime rows are only measurable since #1073: before it the dense path
+/// returned `NaN` for every observation on such a model — that being #1110, the
+/// defect this reroute exists to route around — so there was nothing to compare
+/// against. #1073 gave the dense predictor the same pre-arrival anchor, and the
+/// two engines now agree.
+///
+/// One case where the two are still **not** comparable, so no agreement is
+/// claimed for it: **a steady-state dose** on a non-autonomous RHS is wrong on
+/// *both* engines — `NaN` for `TAD`/`TAFD` (even at a zero coefficient) and 17%
+/// off an explicit 40-cycle pulse train for `T`/`TIME`. Rerouting neither causes
+/// nor cures that; see #1139.
+///
+/// Regression tests: `rerouting_a_bare_tafd_rhs_does_not_move_the_predictions`
+/// and `rerouting_an_init_seeded_rhs_does_not_move_the_predictions`.
+///
+/// **What the reroute costs, and why it is still whole-class.** The predicate is
+/// deliberately not narrowed to the MR-eligible shape (`!spec.input_rate.
+/// is_empty()`), even though that is the only shape #1124 itself could reach — a
+/// model with no built-in forcing was declined by `mr_scope` anyway and was
+/// already on the *dense* path. Measured, `ci-fast`, 2-state `[odes]`, two doses
+/// over 24 h at `reltol = 1e-8`, dense vs event-driven:
+///
+/// | observations | ratio |
+/// |---|---|
+/// | 8  | 1.04× |
+/// | 16 | 1.15× |
+/// | 32 | 1.38× |
+///
+/// It grows with observation density because the dense driver breaks only at
+/// dose/reset boundaries and reads observations through `saveat`, while the
+/// event-driven walk calls `solve_ode` once per record and each call restarts the
+/// step-size history. (For the MR-shaped cell the fix is actually about, the cost
+/// is far larger and unavoidable — ~40×, closed form to integration.)
+///
+/// That is paid to keep **one** engine answering a non-autonomous RHS. Both
+/// engines are correct here since #1073, but they are correct *differently*: they
+/// break the timeline at different points, so value, gradient, and the `[derived]`
+/// grid would agree only to solver tolerance and would drift apart under a
+/// lagtime. Splitting the class by `input_rate` re-creates exactly the
+/// value-vs-gradient and value-vs-`[derived]` engine splits that the gates in
+/// `stats/likelihood.rs`, `api/output_columns.rs` and `sens/ode_provider.rs` each
+/// had to be widened to close. Revisit with a measurement on a dense-sampling
+/// design if the ratio starts to matter; the predicate itself is not a hot-loop
+/// cost (both flags are resolved once in `build_ode_spec` at parse time, and this
+/// is `#[inline]` over three `bool` reads).
+#[inline]
+pub(crate) fn model_uses_time_anywhere(model: &CompiledModel) -> bool {
+    model_uses_time_builtin(model)
+        || model
+            .ode_spec
+            .as_ref()
+            .is_some_and(|s| s.rhs_program.as_ref().is_some_and(|p| p.reads_model_time()))
+}
+
 #[inline]
 fn pk_params_at_time(
     model: &CompiledModel,
@@ -562,11 +653,22 @@ pub fn validate_per_cmt_scaling(model: &CompiledModel, subjects: &[Subject]) -> 
 
 /// Per-event PK parameter snapshots for one subject.
 ///
-/// When the subject has no time-varying covariates, all entries in `dose`
-/// and `obs` are equal (the single subject-static evaluation). The fast
-/// superposition path detects this case via `subject.has_tv_covariates()`
-/// and evaluates `pk_param_fn` only once instead of materialising the
-/// vectors — see [`compute_event_pk_params`] for details.
+/// When the subject has no time-varying covariates, all entries in `dose`,
+/// `obs`, `pk_only` **and `reset`** are equal (the single subject-static
+/// evaluation). The fast superposition path detects this case via
+/// `subject.has_tv_covariates()` and evaluates `pk_param_fn` only once
+/// instead of materialising the vectors — see [`compute_event_pk_params`]
+/// for details.
+///
+/// **All four are filled on both arms**, and each field's doc below is an
+/// invariant rather than a description. Two of them were fixed independently
+/// after the same defect: the static arm left `pk_only` empty, which failed the
+/// walkers' unconditional
+/// `assert_eq!(pk_at_pk_only.len(), subject.pk_only_times.len())` for any
+/// subject whose `pk_only_times` survived covariate pruning (#1124 review), and
+/// it left `reset` empty, which cost a reset its `init(...)` re-seed (#1133).
+/// A vector that some arm leaves short is the failure mode this type attracts —
+/// when adding a field, fill it on **both** arms.
 ///
 /// # Reusing across calls
 ///
@@ -583,8 +685,9 @@ pub struct EventPkParams {
     /// PK params at each observation event time, parallel to `subject.obs_times`.
     pub obs: Vec<PkParams>,
     /// PK params at each EVID=2 event time, parallel to
-    /// `subject.pk_only_times`. Empty when the subject has no
-    /// pk-only events (typical for non-TV-cov data).
+    /// `subject.pk_only_times`. Empty **only** when the subject has no
+    /// pk-only events (typical for non-TV-cov data) — never short, and
+    /// never empty merely because the subject is parameter-static.
     pub pk_only: Vec<PkParams>,
     /// PK params at each EVID=3/4 reset time, parallel to `subject.reset_times`.
     /// A reset row is a data record — `$PK` runs at it — so this is the snapshot
@@ -777,12 +880,31 @@ pub fn compute_event_pk_params_into(
         // dose/obs *or* pk-only rows) and the model uses no `TIME` built-in, so a
         // single snapshot (t=0) is exact for every event.
         let p = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
-        // pk_only stays empty — see EventPkParams docstring.
+        // Every event row gets the snapshot — `pk_only` included. This arm decides
+        // only whether the snapshots *differ* between events, never how many there
+        // are: `ode_predictions_event_driven` asserts every length against the
+        // subject unconditionally (`ode/predictions.rs` — four of them since #1133
+        // added `reset`; the analytical twin in `pk/event_driven.rs` still asserts
+        // three, because it has no reset snapshot to check), so a short `pk_only`
+        // here is a length mismatch, not an optimisation.
+        //
+        // It used to be left empty, which failed the run (`assert_eq!`, so in
+        // release too) for any subject reaching the event-driven walker on a
+        // *parameter-static* model. Two routes get there: `subject.has_resets()`
+        // — reachable since EVID 3/4 resets were wired to that walker — and, since
+        // #1124, an `[odes]` RHS that reads model time. Both need only a dataset
+        // carrying EVID=2 rows, because `prune_irrelevant_tv_covariates` clears
+        // `pk_only_covariates` while leaving `pk_only_times` populated, which is
+        // exactly the state that makes `subject_needs_per_event_pk` false with
+        // `pk_only_times` non-empty.
         for _ in 0..subject.doses.len() {
             out.dose.push(p);
         }
         for _ in 0..subject.obs_times.len() {
             out.obs.push(p);
+        }
+        for _ in 0..subject.pk_only_times.len() {
+            out.pk_only.push(p);
         }
         // Filled even on this branch: a reset-carrying subject with constant
         // covariates still needs a seed snapshot, and `p` is exact for it.
@@ -1993,7 +2115,7 @@ pub fn compute_predictions_with_states(
     // superposition path, which has no valid states for those subjects and would otherwise
     // return NaN. Matches the IPRED routing in `compute_predictions_with_tv` (#486).
     let model = effective_model_for_eval(model, subject, theta, eta);
-    let uses_time = model_uses_time_builtin(model);
+    let uses_time = model_uses_time_anywhere(model);
     if let Some(ref ode) = model.ode_spec {
         // ODE path: both ipred and states come from a single ODE integration.
         // TV-covariate and reset subjects need the event-driven path (which also
@@ -2412,7 +2534,7 @@ pub fn compute_predictions_with_tv_into_with_schedule(
     // harmless); every other model is unchanged (#486).
     let model = effective_model_for_eval(model, subject, theta, eta);
     let has_tv = subject.has_tv_covariates();
-    let uses_time = model_uses_time_builtin(model);
+    let uses_time = model_uses_time_anywhere(model);
 
     let mut preds = if model.is_algebraic() {
         // Compartment-free model (#811): there is no state to integrate and no
@@ -2446,11 +2568,24 @@ pub fn compute_predictions_with_tv_into_with_schedule(
             // parameter snapshot cannot represent a time-varying disposition — a
             // `TIME`-dependent parameter is invisible to `identify_disposition`'s
             // fixed-`p` Jacobian probe, so the branch guard, not that probe, is what
-            // excludes it. `mr_predictions` returns `None` (→ the `ode_predictions`
-            // twin below) for anything else outside scope (IOV, SS / infusion doses,
-            // flip-flop, non-linear / non-canonical disposition); the admitted result
-            // reduces to that twin to solver tolerance
-            // (`modified_release::tests::reduces_to_ode_*`).
+            // excludes it — and since #1124 that guard is `model_uses_time_anywhere`,
+            // which also excludes a model-time-reading `[odes]` RHS (the probe is
+            // equally blind to `TAD`, and to anything inside an untaken `if` branch).
+            // `mr_predictions` returns `None` (→ the `ode_predictions` twin below) for
+            // anything else outside scope (IOV, SS / infusion doses, flip-flop,
+            // non-linear / non-canonical disposition).
+            //
+            // The admitted result reduces to that twin to solver tolerance. Note what
+            // that claim is worth *here*: this branch sits before the twin, so
+            // production and the closed form are the same code and comparing them
+            // agrees by construction — the `mr_vs_prod` difference is exactly `0.0`,
+            // and #1124's 8× error was invisible from this side for that reason. The
+            // reduction is only ever established elsewhere: by
+            // `modified_release::tests::reduces_to_ode_*` on the fixture zoo, by
+            // `mr_matches_the_states_entry_point` across the two production entry points
+            // (`compute_predictions_with_states` deliberately has *no* MR branch —
+            // do not add one, it is the independent side of that check), and at
+            // runtime in debug builds by `modified_release::verify_against_ode_twin`.
             mr
         } else {
             let pk = pk_params_at_time(model, theta, eta, &subject.covariates, 0.0);
@@ -3109,6 +3244,54 @@ mod tests {
         assert_eq!(ev.obs.len(), 3);
         // CL = theta * CR = 10 * 2 = 20 everywhere.
         for p in ev.dose.iter().chain(ev.obs.iter()) {
+            assert_relative_eq!(p.cl(), 20.0, epsilon = 1e-12);
+        }
+    }
+
+    /// The parameter-static arm must still emit one `pk_only` snapshot per
+    /// EVID=2 record.
+    ///
+    /// Both event-driven walkers — the ODE one (`ode/predictions.rs`) and the
+    /// analytical one (`pk/event_driven.rs`) — open with the same three
+    /// unconditional length asserts, so a short `pk_only` aborts the run rather
+    /// than degrading. It is `assert_eq!`, not `debug_assert_eq!`, so release
+    /// builds abort too.
+    ///
+    /// This arm used to leave `pk_only` empty while filling `dose` and `obs`,
+    /// which made the triple structurally inconsistent. It is reachable whenever
+    /// a *parameter-static* subject is routed to an event-driven walker, and two
+    /// routes do that: `subject.has_resets()` (since EVID 3/4 resets were wired
+    /// there — so this predates #1124) and, since #1124, an `[odes]` RHS that
+    /// reads model time. Both need only a dataset with EVID=2 rows, because
+    /// `prune_irrelevant_tv_covariates` clears `pk_only_covariates` while leaving
+    /// `pk_only_times` populated — precisely the state where
+    /// `subject_needs_per_event_pk` is false and `pk_only_times` is not.
+    #[test]
+    fn event_pk_params_fills_pk_only_on_the_parameter_static_arm() {
+        let mut covs = HashMap::new();
+        covs.insert("CR".to_string(), 2.0);
+        let mut subj = make_subject_with_tv(covs, Vec::new(), Vec::new(), 2, 3);
+        // An EVID=2 row that survived covariate pruning: a time, but no snapshot.
+        subj.pk_only_times = vec![0.5, 2.5];
+        subj.pk_only_covariates = Vec::new();
+        let model = cl_from_cr_model();
+        // Precondition: this is the static arm, not the per-event one. Without
+        // this the test would still pass via the `if` branch and prove nothing.
+        assert!(
+            !subject_needs_per_event_pk(&model, &subj),
+            "fixture must exercise the parameter-static arm"
+        );
+        let ev = compute_event_pk_params(&model, &subj, &[10.0], &[]);
+        assert_eq!(ev.dose.len(), subj.doses.len());
+        assert_eq!(ev.obs.len(), subj.obs_times.len());
+        assert_eq!(
+            ev.pk_only.len(),
+            subj.pk_only_times.len(),
+            "pk_only must carry one snapshot per EVID=2 record; both event-driven \
+             walkers assert this length unconditionally"
+        );
+        // CL = theta * CR = 10 * 2 = 20 on every row, pk_only included.
+        for p in ev.dose.iter().chain(&ev.obs).chain(&ev.pk_only) {
             assert_relative_eq!(p.cl(), 20.0, epsilon = 1e-12);
         }
     }

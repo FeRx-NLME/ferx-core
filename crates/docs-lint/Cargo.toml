@@ -1,0 +1,25 @@
+# Dev tooling, not engine code. This crate is a workspace member for the tests
+# and the gates, NOT part of the
+# ferx-core / ferx-tools / ferx-cli layering: it depends on nothing, and nothing
+# may depend on it. `cargo fmt --all` covers it; its `cargo test` and its
+# `cargo clippy` are BOTH in `tools/preflight.sh`'s `docs` group, because the
+# `clippy` group is scoped to ferx-core and its two members and would leave this
+# crate unlinted. Keep it dependency-free — it has to build in seconds so the
+# `docs-lint` CI job never lands on the ferx-core compile path (#969).
+[package]
+name = "docs-lint"
+version = "0.1.0"
+edition = "2021"
+description = "Structural linter for the Quarto docs under docs/ (#1163)"
+license = "MIT"
+publish = false
+
+[dependencies]
+
+[lib]
+name = "docs_lint"
+path = "src/lib.rs"
+
+[[bin]]
+name = "docs-lint"
+path = "src/main.rs"

@@ -1,24 +1,24 @@
-//! Adaptive ODE integration: the [`Stepper`] abstraction, the explicit Dormand-Prince RK45
+//! Adaptive ODE integration: the `Stepper` abstraction, the explicit Dormand-Prince RK45
 //! stepper (the default method), and the drivers every consumer integrates through.
 //!
 //! RK45 is the same family as Julia's `Tsit5()` — a 5th-order explicit Runge-Kutta method with
 //! an embedded 4th-order error estimate for adaptive step control, optimized here for PK ODE
 //! systems (2–20 states, smooth dynamics). The stiff [`OdeMethod`] alternatives live in
-//! [`super::rosenbrock`].
+//! `super::rosenbrock`.
 //!
 //! # Shape of the module
 //!
-//! A **method** implements [`Stepper`]: attempt a step, score it, and evaluate its own
+//! A **method** implements `Stepper`: attempt a step, score it, and evaluate its own
 //! continuous extension inside it. A **driver** owns everything else — the step-size
 //! controller, the `saveat` contract, the `min_dt` force-accept, the divergence break, soft
 //! sampling, event root-finding, statistics — and is written once, generically, over both the
 //! stepper and the state scalar `T: PkNum`.
 //!
 //! That split is what keeps the methods at parity: a consumer written against a driver gets
-//! every method, and a method implementing [`Stepper`] gets every consumer. The two live
-//! drivers are [`integrate_dense_g`] (saves + in-step reads; behind [`solve_ode`],
-//! [`solve_ode_dense`] and [`solve_ode_g`]) and [`solve_ode_until_threshold`] (event-time
-//! root-finding). [`make_stepper`] is the single place a method name selects an implementation.
+//! every method, and a method implementing `Stepper` gets every consumer. The two live
+//! drivers are `integrate_dense_g` (saves + in-step reads; behind [`solve_ode`],
+//! `solve_ode_dense` and [`solve_ode_g`]) and [`solve_ode_until_threshold`] (event-time
+//! root-finding). `make_stepper` is the single place a method name selects an implementation.
 
 use crate::sens::num::PkNum;
 
@@ -135,9 +135,9 @@ pub type OdeRhsFn = Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync>;
 ///
 /// Honoured by every `saveat` integration — predictions, the FOCE/FOCEI objective,
 /// steady-state equilibration and the analytic-sensitivity walk — dispatched centrally in
-/// [`solve_ode_dense`] (the sole owner of the f64 stepping loop) and [`solve_ode_g`].
+/// `solve_ode_dense` (the sole owner of the f64 stepping loop) and [`solve_ode_g`].
 ///
-/// Every method is a full peer: each implements [`Stepper`] — including its own continuous
+/// Every method is a full peer: each implements `Stepper` — including its own continuous
 /// extension — and every consumer is written once against that trait. Dense `saveat` saves,
 /// in-step soft sampling (joint PK-TTE cumulative hazard, CTMM occupancy, adaptive-dosing
 /// monitors), event-time root-finding and the analytic-sensitivity path therefore work for
@@ -163,7 +163,7 @@ pub enum OdeMethod {
     /// for a fit that is accuracy-limited rather than stability-limited, where step count
     /// scales as `tol^(−1/p)` and order is what pays. Worth it at tight tolerances
     /// (`ode_reltol ≤ 1e-8`); at loose ones RK45's cheaper steps win. See
-    /// [`crate::ode::explicit_rk`].
+    /// `crate::ode::explicit_rk`.
     Vern7,
     /// Pick the stepper from the system itself: an a-priori Jacobian eigenvalue probe reads
     /// `|Re λ|max` at each integration's own initial state and starts a stiff method only
@@ -276,7 +276,7 @@ pub struct OdeSolverOptions {
     /// it. Re-probing the Jacobian is not.
     ///
     /// So the trigger is the same discriminator the starting decision uses, re-read every
-    /// [`AUTO_SWITCH_PROBE_INTERVAL`] accepted steps, and the switch happens in place: the
+    /// `AUTO_SWITCH_PROBE_INTERVAL` accepted steps, and the switch happens in place: the
     /// segment keeps the state it has integrated so far and carries on with the other stepper,
     /// rather than restarting or re-solving. Setting this to `false` restores the pre-#1080
     /// Part C behaviour — one method per segment, chosen at its start.
@@ -1519,8 +1519,8 @@ pub fn solve_ode_g_with_stats<T: crate::sens::num::PkNum>(
 }
 
 /// [`solve_ode_g`] with dense soft-sampling — the sensitivity-carrying twin of
-/// [`solve_ode_dense`]. Available for every method because the interpolation comes from the
-/// [`Stepper`], so an analytic-gradient consumer that needs an in-step readout (a hazard state
+/// `solve_ode_dense`. Available for every method because the interpolation comes from the
+/// `Stepper`, so an analytic-gradient consumer that needs an in-step readout (a hazard state
 /// at an event time, say) has one to call.
 #[allow(clippy::too_many_arguments)]
 pub fn solve_ode_g_dense<T: crate::sens::num::PkNum>(

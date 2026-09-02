@@ -383,7 +383,7 @@ impl MlpMapper {
     /// # Why this variant exists
     ///
     /// It is the exact chain-rule bridge used by
-    /// [`crate::estimation::fixed_eta_gradient`] to get `∂NLL/∂w` for every NN
+    /// `crate::estimation::fixed_eta_gradient` to get `∂NLL/∂w` for every NN
     /// weight from just `n_outputs` finite-difference evaluations. Because
     /// `z_k = (W_L a_{L-1} + b_L)_k` depends on the output-layer bias `b_k`
     /// with `∂z_k/∂b_k = 1` exactly (and `∂z_j/∂b_k = 0` for `j ≠ k`), a

@@ -57,6 +57,36 @@ const BASE_MODEL: &str = r#"
 
 const DATA: &str = "../../data/two_cpt_oral_cov.csv";
 
+/// Number of uninformative covariates injected alongside WT and CRCL.
+///
+/// The dataset carries exactly two covariate columns, so a "WT and CRCL rank
+/// top-2" assertion against it alone is vacuous — they are the *only* two
+/// candidates, and the assertion holds however the screen ranks them. Decoys
+/// give the ranking something to be wrong about.
+const N_DECOYS: usize = 4;
+
+/// Add `N_DECOYS` deterministic, structurally unrelated covariates to every
+/// subject.
+///
+/// The values are a fixed function of the subject's position and the decoy
+/// index — reproducible run to run, and carrying no information about the
+/// simulated CL, so a correct screen must rank every one of them below WT and
+/// CRCL.
+fn inject_decoy_covariates(pop: &mut ferx_core::Population) {
+    for (i, subject) in pop.subjects.iter_mut().enumerate() {
+        for d in 0..N_DECOYS {
+            let phase = (d as f64 + 1.0) * 0.7;
+            let value = 50.0 + ((i as f64 * phase + 0.31).sin() * 12.0);
+            subject
+                .covariates
+                .insert(format!("DECOY_{d}"), (value * 1e6).round() / 1e6);
+        }
+    }
+    for d in 0..N_DECOYS {
+        pop.covariate_names.push(format!("DECOY_{d}"));
+    }
+}
+
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
@@ -94,6 +124,10 @@ fn gam_ranks_wt_and_crcl_for_eta_cl() {
         "base model should converge; OFV = {}",
         fit_result.ofv
     );
+
+    // Screen WT and CRCL against decoys that carry no signal, so the ranking
+    // assertions below can actually fail.
+    inject_decoy_covariates(&mut p.population);
 
     // Run GAM screening with default options.
     let gam = gam_screen(&fit_result, &p.population, &GamOptions::default());
@@ -133,8 +167,16 @@ fn gam_ranks_wt_and_crcl_for_eta_cl() {
         "CRCL should be screened for ETA_CL; got {cov_names:?}"
     );
 
-    // WT and CRCL must rank in the top-2 for ETA_CL.
-    // (The dataset was generated with both effects on CL.)
+    // Every decoy must be screened too, otherwise the comparison below is
+    // between WT/CRCL and nothing.
+    assert_eq!(
+        eta_cl.covariate_scores.len(),
+        2 + N_DECOYS,
+        "all covariates should be screened; got {cov_names:?}"
+    );
+
+    // WT and CRCL must be *the* top two for ETA_CL — the dataset was generated
+    // with both effects on CL, and the decoys have none.
     let top2: Vec<&str> = eta_cl
         .covariate_scores
         .iter()
@@ -142,17 +184,39 @@ fn gam_ranks_wt_and_crcl_for_eta_cl() {
         .map(|s| s.covariate.as_str())
         .collect();
     assert!(
-        top2.contains(&"WT") || top2.contains(&"CRCL"),
-        "WT or CRCL should rank in top-2 for ETA_CL; top-2: {top2:?}"
+        top2.contains(&"WT") && top2.contains(&"CRCL"),
+        "WT and CRCL should be the top-2 for ETA_CL, ahead of {N_DECOYS} decoys; \
+         full ranking: {:?}",
+        eta_cl
+            .covariate_scores
+            .iter()
+            .map(|s| (s.covariate.as_str(), s.delta_aic))
+            .collect::<Vec<_>>()
     );
 
-    // At least one should show a positive ΔAIC (informative covariate).
-    let max_delta: f64 = eta_cl
-        .covariate_scores
-        .iter()
-        .filter(|s| s.covariate == "WT" || s.covariate == "CRCL")
-        .map(|s| s.delta_aic)
+    // And they must be ahead of the decoys by a real margin, not a tie-break.
+    let delta = |name: &str| {
+        eta_cl
+            .covariate_scores
+            .iter()
+            .find(|s| s.covariate == name)
+            .unwrap_or_else(|| panic!("{name} should be screened"))
+            .delta_aic
+    };
+    let best_decoy: f64 = (0..N_DECOYS)
+        .map(|d| delta(&format!("DECOY_{d}")))
         .fold(f64::NEG_INFINITY, f64::max);
+    for name in ["WT", "CRCL"] {
+        assert!(
+            delta(name) > best_decoy + 1.0,
+            "{name} (Δ AIC = {:.2}) should beat the best decoy \
+             (Δ AIC = {best_decoy:.2}) by more than 1",
+            delta(name)
+        );
+    }
+
+    // At least one should show a clearly positive ΔAIC (informative covariate).
+    let max_delta = delta("WT").max(delta("CRCL"));
     assert!(
         max_delta > 1.0,
         "WT or CRCL should have Δ AIC > 1 for ETA_CL; got max Δ AIC = {max_delta:.2}"

@@ -67,14 +67,15 @@ cargo run --release -p ferx-cli -- examples/warfarin.ferx --simulate
 ### Current practices
 
 - **Linting**: `cargo clippy` for Rust idiom and correctness checks.
-- **Compilation checks**: `cargo check` for fast feedback during development.
+- **Compilation checks**: `tools/preflight.sh check` — the five `cargo check` feature
+  sets CI runs, in one command (#1157). The sets are not nested, so a single
+  `cargo check` proves much less than it looks like it does.
 - **Formatting**: Rust default formatting via `rustfmt` (no custom configuration).
 - **Code review**: Pull requests on GitHub before merging to `main`.
 
 ### Recommendations
 
 - Add `rustfmt.toml` if the team wants to codify style preferences beyond defaults.
-- Enforce `cargo clippy -- -D warnings` to treat warnings as errors in CI.
 - Consider `cargo-audit` for dependency vulnerability scanning.
 
 ## 5. Testing & Validation
@@ -169,11 +170,11 @@ A GitHub Actions CI pipeline runs on every push to `main` and on pull requests (
 
 | Job | Command | Purpose |
 |-----|---------|---------|
-| **Check** | `cargo check --tests` (×4: `ci`, `ci,survival,slow-tests`, `ci,markov`, `ci,nn,slow-tests`), plus `-p ferx-tools -p ferx-cli` | Fast compilation verification of every feature combo, including the ones no per-PR test job builds, and of the workspace members |
+| **Check** | `tools/preflight.sh check` | The five `cargo check` feature sets — `ci`, `ci,survival,slow-tests`, `ci,markov`, `ci,nn,slow-tests`, and the workspace members under `ferx-core/ci`. Covers every feature combo, including the ones no per-PR test job builds (#1157) |
 | **Tests + coverage (core)** | `cargo llvm-cov --workspace --tests --features ferx-core/ci` | Runs the Tier-1/2 suite — core *and* the `ferx-tools` / `ferx-cli` members — and produces the per-PR patch-coverage report (`fast` flag) |
 | **Tests + coverage (TTE/CTMM endpoints)** | `cargo llvm-cov --lib --test <each endpoint test file> --features ci,markov` | Runs and measures the feature-gated TTE / categorical / CTMM code the base build compiles out (`survival` + `markov` flags) |
-| **Clippy** | `cargo clippy -- -D warnings` | Lint with warnings-as-errors |
-| **Format** | `cargo fmt --all -- --check` | Enforce consistent formatting (`--all`: the workspace members too) |
+| **Clippy** | `tools/preflight.sh clippy` | Lint `ferx-core` under `ci,markov,nn` with `--all-targets` (without it a third of the repo — every `#[cfg(test)]` module and all of `tests/` — goes unlinted, #1023), then the workspace members |
+| **Format** | `tools/preflight.sh fmt` | Enforce consistent formatting (`--all`: the workspace members too). `.githooks/pre-commit` runs this same group |
 | **Public API baseline** | `tools/update-public-api.sh --check` | Diff `ferx-core`'s public surface against `api/ferx-core-public-api.txt`; any widening fails until the baseline is regenerated in the same PR (#1114) |
 
 There is deliberately **no** separate uninstrumented `Test` job, and no separate

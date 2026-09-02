@@ -33,8 +33,9 @@ pub use api::{
     run_model_with_data, run_model_with_data_inits, simulate, simulate_adaptive,
     simulate_adaptive_from_spec, simulate_with_options, simulate_with_options_diag,
     simulate_with_seed, simulate_with_uncertainty, theta_level_map, validate_model_file,
-    AdaptiveSimulateOptions, AdaptiveSimulationResult, PredictionResult, PreparedRun,
+    AdaptiveSimulateOptions, AdaptiveSimulationResult, PoolPlan, PredictionResult, PreparedRun,
     SimulateOptions, SimulateUncertaintyOptions, SimulationOutput, SimulationResult,
+    FIT_RAYON_STACK_SIZE,
 };
 pub use cancel::CancelFlag;
 pub use diagnostics::{CheckReport, Diagnostic, Severity};

@@ -11461,10 +11461,7 @@ fn build_ode_spec(
     // (issue #367) before the f64 closure moves `stmts_owned`. Same statements,
     // same var layout — evaluated over a dual type by `eval_rhs_g`.
     let uses_time_vars = stmts_read_slots(&stmts_owned, &[time_slot, tafd_slot, tad_slot]);
-    // `TAD` alone, not the union above: it is the only anchor that moves with an estimated
-    // lagtime (#1070). Kept as a second, narrower flag rather than replacing `uses_time_vars`
-    // — the SS gate must stay broad, since a `TIME`-only RHS still breaks the SS cycle.
-    let uses_dose_anchored_time_vars = stmts_read_slots(&stmts_owned, &[tad_slot]);
+    let rhs_reads_time_builtin = stmts_read_time_builtin(&stmts_owned);
     let rhs_program = OdeRhsProgram {
         stmts: stmts_owned.clone(),
         n_vars_total,
@@ -11475,7 +11472,7 @@ fn build_ode_spec(
         tad_slot,
         macheps_slot,
         uses_time_vars,
-        uses_dose_anchored_time_vars,
+        reads_time_builtin: rhs_reads_time_builtin,
     };
 
     let rhs: Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync> =
@@ -16666,7 +16663,7 @@ pub(crate) fn compiled_model_uses_time_builtin(model: &CompiledModel) -> bool {
 /// `[initial_conditions] init(cmt) = ...` surface parses with `ParseCtx::new`,
 /// where an unresolved identifier is an `Expression::Covariate` rather than an
 /// `Expression::Variable` — so `MACHEPS` there is an ordinary (and therefore
-/// required) data column, not machine epsilon, which only [`MapEnv::resolve`]'s
+/// required) data column, not machine epsilon, which only `MapEnv::resolve`'s
 /// `Variable` arm supplies. `MIXNUM` is the one entry that does carry over: it
 /// parses to its own `Expression::MixNum` node and resolves through
 /// `current_mixture_class()` on both surfaces.
@@ -16681,7 +16678,7 @@ pub const ODE_INIT_SCOPE_BUILTINS: &[&str] = &["MACHEPS", "MIXNUM"];
 /// reference. Every one of them is a time-since-something clock, and an initial
 /// condition is evaluated at the time origin, so each would read a constant 0
 /// and silently flatten the expression (issue #994). `TIME` is rejected by an
-/// AST-node guard ([`expr_references_time_node`] — a bare `TIME` parses to a
+/// AST-node guard (`expr_references_time_node` — a bare `TIME` parses to a
 /// dedicated `Expression::Time` node, not a variable, which is how it evaded the
 /// undefined-name check); `T`, `TAFD` and `TAD` are ordinary identifiers in an
 /// `[odes]` init RHS and are caught by the undefined-name check around it.
@@ -19118,6 +19115,72 @@ fn stmts_read_slots(stmts: &[Statement], slots: &[usize]) -> bool {
     })
 }
 
+/// Whether an expression reads the bare `TIME` built-in.
+///
+/// `TIME` is **not** a variable slot: it resolves to `Op::PushTime` /
+/// [`Expression::Time`], read from the model-time thread-local at evaluation
+/// (only the `T`/`t` aliases use `time_slot`). So [`stmts_read_slots`] —
+/// and therefore [`OdeRhsProgram::uses_time_vars`] — structurally cannot see it,
+/// and reports `false` for a `TIME`-reading RHS. Callers that must reject *any*
+/// model-time dependence need this walk as well (#1124).
+fn expr_reads_time_builtin(e: &Expression) -> bool {
+    match e {
+        Expression::Time => true,
+        Expression::BinOp(a, _, b) | Expression::Power(a, b) => {
+            expr_reads_time_builtin(a) || expr_reads_time_builtin(b)
+        }
+        Expression::UnaryFn(_, a) => expr_reads_time_builtin(a),
+        Expression::ThetaGather { idx, .. } => expr_reads_time_builtin(idx),
+        Expression::Conditional(c, t, f) => {
+            cond_reads_time_builtin(c) || expr_reads_time_builtin(t) || expr_reads_time_builtin(f)
+        }
+        _ => false,
+    }
+}
+
+fn cond_reads_time_builtin(c: &Condition) -> bool {
+    match c {
+        Condition::Compare(a, _, b) => expr_reads_time_builtin(a) || expr_reads_time_builtin(b),
+        Condition::And(a, b) | Condition::Or(a, b) => {
+            cond_reads_time_builtin(a) || cond_reads_time_builtin(b)
+        }
+        Condition::Not(a) => cond_reads_time_builtin(a),
+        // `present(X)` (#1111) wraps an arbitrary expression, so recurse rather
+        // than answering `false`. `present(TIME)` is degenerate but parses, and a
+        // wrong `false` here is #1124's exact failure mode: the RHS gets admitted
+        // as time-invariant and its term is silently dropped from the predictions.
+        // Deliberately no wildcard arm in this match — a future `Condition`
+        // variant must break the build here rather than default to "reads no
+        // time", which is the answer that loses data.
+        Condition::Present(e) => expr_reads_time_builtin(e),
+    }
+}
+
+/// [`expr_reads_time_builtin`] over a whole RHS body — bytecode ops, plain
+/// expressions, and `if` conditions / branch bodies alike. A condition is as
+/// load-bearing as an assignment here: `if (TIME > 6) { … }` makes the system
+/// non-autonomous even though no statement outside the branch mentions `TIME`.
+fn stmts_read_time_builtin(stmts: &[Statement]) -> bool {
+    stmts.iter().any(|s| match s {
+        Statement::AssignBc(_, bc) | Statement::DiffEqBc(_, bc) => {
+            bc.ops.iter().any(|op| matches!(op, Op::PushTime))
+        }
+        Statement::Assign(_, e)
+        | Statement::AssignIdx(_, e)
+        | Statement::DiffEq(_, e)
+        | Statement::DiffEqIdx(_, e) => expr_reads_time_builtin(e),
+        Statement::If {
+            branches,
+            else_body,
+        } => {
+            branches
+                .iter()
+                .any(|(c, b)| cond_reads_time_builtin(c) || stmts_read_time_builtin(b))
+                || else_body.as_deref().is_some_and(stmts_read_time_builtin)
+        }
+    })
+}
+
 pub struct OdeRhsProgram {
     stmts: Vec<Statement>,
     n_vars_total: usize,
@@ -19134,14 +19197,11 @@ pub struct OdeRhsProgram {
     /// pulse train, so the SS dual equilibration's cycle recurrence breaks for such an RHS;
     /// the gate routes SS subjects on a non-autonomous RHS to FD (#473 review #1).
     uses_time_vars: bool,
-    /// True when the RHS reads `TAD` — the one time anchor that is **dose-anchored**, and
-    /// therefore the one that moves with an estimated lagtime. Deliberately narrower than
-    /// [`uses_time_vars`](Self::uses_time_vars): `TIME` is the integrator clock and `TAFD`
-    /// anchors at the *unlagged* `min(d.time)` in both engines, so neither carries a lag
-    /// jet — measured exact, #1070 probe 2a. `TAD` anchors at the **lagged arrival**
-    /// (`last_dose_eff`), so `∂TAD/∂lag = −1`, which the `f64` lifting in `eval_rhs_g`
-    /// drops (#1070).
-    uses_dose_anchored_time_vars: bool,
+    /// Does the RHS read the bare `TIME` built-in? Disjoint from
+    /// [`Self::uses_time_vars`], which covers the slot-backed `T`/`t`/`TAFD`/`TAD`
+    /// and is `false` for a `TIME`-only RHS — see [`stmts_read_time_builtin`]
+    /// (#1124).
+    reads_time_builtin: bool,
 }
 
 impl OdeRhsProgram {
@@ -19150,12 +19210,35 @@ impl OdeRhsProgram {
         self.uses_time_vars
     }
 
-    /// See [`OdeRhsProgram::uses_dose_anchored_time_vars`]. `true` **and** an estimated
-    /// lagtime ⇒ the analytic sensitivity walks must route to FD (#1070): `TAD` is injected
-    /// as an `f64` constant, so the `∂TAD/∂lag = −1` term never enters the dual chain and
-    /// the η/θ gradient on the lag axis is silently wrong (measured 2.8 %–70 %).
-    pub(crate) fn uses_dose_anchored_time_vars(&self) -> bool {
-        self.uses_dose_anchored_time_vars
+    /// See [`OdeRhsProgram::reads_time_builtin`]. Almost every caller wants
+    /// [`Self::reads_model_time`] instead: neither this flag nor
+    /// [`Self::uses_time_vars`] alone covers all four spellings, and pairing them
+    /// by hand at each call site is how #1124's gap survived (`ode_tvcov_supported`
+    /// paired them; the SS gate did not, and its own test worked *around* the gap
+    /// by spelling the term `T`).
+    pub(crate) fn reads_time_builtin(&self) -> bool {
+        self.reads_time_builtin
+    }
+
+    /// **The RHS is non-autonomous**: it reads model time under any of its four
+    /// spellings — `TAD`, `TAFD`, `T`/`t` (slot-backed, via
+    /// [`Self::uses_time_vars`]) or the bare `TIME` built-in (via
+    /// [`Self::reads_time_builtin`]), including from inside an `if` condition.
+    ///
+    /// The single predicate every "is this system time-invariant?" gate should
+    /// ask. The two underlying flags are disjoint by construction — `TIME`
+    /// compiles to `Op::PushTime` (the model-time thread-local) rather than a
+    /// `PushVar(time_slot)`, so `stmts_read_slots` structurally cannot see it —
+    /// and asking only one of them admits a non-autonomous model as
+    /// time-invariant. That is #1124: the closed-form fast path dropped the term
+    /// from the predictions outright (8× wrong by 12 h).
+    ///
+    /// Composed from the two accessors rather than the two fields so neither
+    /// reads as dead code once this becomes their only production caller — a
+    /// `#[allow(dead_code)]` there would hide the real thing it is meant to
+    /// signal, that a gate stopped asking one of them.
+    pub(crate) fn reads_model_time(&self) -> bool {
+        self.uses_time_vars() || self.reads_time_builtin()
     }
 
     /// Evaluate `du = f(u, p, t)` over a dual type, generic over [`PkNum`]
@@ -19163,8 +19246,10 @@ impl OdeRhsProgram {
     /// gradient). `u` is the current state; `params` is the flat PK-parameter vector
     /// with the differentiated slots already seeded as dual variables (so individual
     /// parameter `i`, read from `params[indiv_to_params_slot[i]]`, carries its
-    /// derivative); `tafd`/`tad` are the time-after-first/last-dose anchors
-    /// (constants w.r.t. the parameters, lifted as such). `vars`/`stack` are
+    /// derivative); `tafd` is the time-after-first-dose anchor, a constant w.r.t. the
+    /// parameters because it anchors at the *unlagged* first dose record, while `tad`
+    /// is a **dual** — its anchor is the dose's lagged arrival, so it carries
+    /// `∂TAD/∂lag = −1` (#1070). `vars`/`stack` are
     /// caller-owned scratch reused across RK stages. Writes `du` (length
     /// `state_count`). Mirrors the f64 binding in the `rhs` closure
     /// statement-for-statement (issue #410, inner η-gradient).
@@ -19175,7 +19260,7 @@ impl OdeRhsProgram {
         params: &[T],
         t: f64,
         tafd: f64,
-        tad: f64,
+        tad: T,
         du: &mut [T],
         vars: &mut Vec<T>,
         stack: &mut Vec<T>,
@@ -19197,7 +19282,7 @@ impl OdeRhsProgram {
             *d = T::from_f64(tafd);
         }
         if let Some(d) = vars.get_mut(self.tad_slot) {
-            *d = T::from_f64(tad);
+            *d = tad;
         }
         if let Some(d) = vars.get_mut(self.macheps_slot) {
             *d = T::from_f64(f64::EPSILON);
@@ -19343,7 +19428,7 @@ pub(crate) const MAX_CTMM_AXES: usize = 24;
 /// Compiled, **dual-evaluable** `[markov_model]` transition intensities — the CTMM
 /// analogue of [`IndivParamProgram`] (#759).
 ///
-/// The f64 [`GeneratorFn`](crate::types::GeneratorFn) tree-walks `Expression`s and can
+/// The f64 [`GeneratorFn`] tree-walks `Expression`s and can
 /// only ever produce `Q` itself, which is why the CTMM likelihood has been finite-
 /// differenced end-to-end (perturb η, rebuild `Q`, redo an `expm` per observation gap).
 /// This snapshot carries the same intensities in *resolved* form — the shared
@@ -20711,8 +20796,8 @@ fn simplify_expr(expr: &Expression) -> Expression {
 // for them.
 
 /// Precomputed symbolic partials of `[individual_parameters]` assignments,
-/// produced by [`build_indiv_param_partials`]. Stored on
-/// [`CompiledModel`](crate::types::CompiledModel) as a primitive for any
+/// produced by `build_indiv_param_partials`. Stored on
+/// [`CompiledModel`] as a primitive for any
 /// future analytical-η-gradient path. The originally-planned consumers —
 /// Tier 4a milestones 3-5 (augmented ODE RHS, Form C readout sensitivities,
 /// `gradient = sens` estimator wiring) — were reverted in #145; the
