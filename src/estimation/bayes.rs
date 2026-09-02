@@ -221,7 +221,16 @@ fn subject_nll(
             let _g = MixtureClassGuard::enter(c + 1);
             *slot = if kappas.is_empty() {
                 individual_nll_into_with_schedule(
-                    model, subject, theta, eta, omega, sigma, scratch, schedule,
+                    model,
+                    subject,
+                    theta,
+                    eta,
+                    omega,
+                    sigma,
+                    // Bayes holds the `block_sigma` off-diagonals fixed (#847).
+                    &model.residual_correlations,
+                    scratch,
+                    schedule,
                 )
             } else {
                 individual_nll_iov(model, subject, theta, eta, kappas, omega, omega_iov, sigma)
@@ -232,7 +241,15 @@ fn subject_nll(
     }
     if kappas.is_empty() {
         individual_nll_into_with_schedule(
-            model, subject, theta, eta, omega, sigma, scratch, schedule,
+            model,
+            subject,
+            theta,
+            eta,
+            omega,
+            sigma,
+            &model.residual_correlations,
+            scratch,
+            schedule,
         )
     } else {
         individual_nll_iov(model, subject, theta, eta, kappas, omega, omega_iov, sigma)
@@ -2345,6 +2362,7 @@ mod tests {
                 &eta,
                 &params.omega,
                 &params.sigma.values,
+                &params.residual_correlations,
                 &mut scratch,
                 None,
             );

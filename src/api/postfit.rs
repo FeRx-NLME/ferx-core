@@ -666,7 +666,8 @@ pub(crate) fn compute_subject_results(
                 model.error_spec.obs_keys(subject).as_ref(),
                 &model.error_spec,
                 &params.sigma.values,
-                &model.residual_correlations,
+                // The fitted correlations, not the declaration (#847).
+                &params.residual_correlations,
                 ruv_mult.as_deref(),
             );
             // IIV on residual error (#409): the individual residual SD is scaled
@@ -700,7 +701,7 @@ pub(crate) fn compute_subject_results(
                 &params.omega,
                 &params.sigma.values,
                 &model.error_spec,
-                &model.residual_correlations,
+                &params.residual_correlations,
                 frem_r_override.as_deref(),
                 model.residual_error_eta,
                 ruv_mult.as_deref(),
@@ -733,6 +734,7 @@ pub(crate) fn compute_subject_results(
                     h,
                     &params.omega,
                     &params.sigma.values,
+                    &params.residual_correlations,
                     interaction,
                 )
             };

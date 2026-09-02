@@ -391,6 +391,7 @@ fn marginal_nll_foce_at(
         &h_matrix,
         &params.omega,
         &params.sigma.values,
+        &params.residual_correlations,
         false,
     )
 }
@@ -888,6 +889,7 @@ fn marginal_nll_dense_at(
         &h,
         &params.omega,
         &params.sigma.values,
+        &params.residual_correlations,
         true,
     )
 }
@@ -2110,6 +2112,7 @@ fn mixed_gradient_with_out_of_scope_subject_matches_fd() {
                 &ebe.h_matrix,
                 &p.omega,
                 &p.sigma.values,
+                &p.residual_correlations,
                 true,
             )
         }

@@ -268,6 +268,9 @@ impl Stack {
                 b,
                 &params.omega,
                 &params.sigma.values,
+                // AGQ holds the `block_sigma` off-diagonals at their declared
+                // value (#847); `params` carries exactly that.
+                &params.residual_correlations,
                 scratch,
                 schedule,
             );
@@ -1319,6 +1322,8 @@ fn node_nll_gradient(
             b,
             &params.omega,
             &params.sigma.values,
+            // AGQ holds ρ at the declaration; `params` carries it (#847).
+            &params.residual_correlations,
             schedule,
             mult,
         )
@@ -1998,6 +2003,7 @@ mod tests {
                     e,
                     &params.omega,
                     &params.sigma.values,
+                    &params.residual_correlations,
                     s,
                     None,
                 )

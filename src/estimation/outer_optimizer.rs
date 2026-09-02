@@ -778,6 +778,10 @@ pub(crate) fn pop_nll(
         h_matrices,
         &params.omega,
         &params.sigma.values,
+        // Live `block_sigma` off-diagonals (#847): this is the objective the
+        // outer optimizer minimises, so it has to be scored at the ρ the
+        // optimizer is currently proposing.
+        &params.residual_correlations,
         interaction,
     )
 }
@@ -2822,6 +2826,7 @@ fn subject_reconverged_fd_gradient(
             &ebe.h_matrix,
             &params.omega,
             &params.sigma.values,
+            &params.residual_correlations,
             options.interaction,
         )
     };

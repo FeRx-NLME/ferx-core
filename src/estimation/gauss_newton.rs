@@ -2047,7 +2047,10 @@ fn subject_nll_at(
         eta_hat,
         h_matrix,
         &params.omega,
+        // `block_sigma` + Gauss-Newton is rejected up front
+        // (`E_BLOCK_SIGMA_METHOD_UNSUPPORTED`), so these are always empty (#847).
         &params.sigma.values,
+        &params.residual_correlations,
         options.interaction,
     )
 }
