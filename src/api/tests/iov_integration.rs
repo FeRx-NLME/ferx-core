@@ -1784,11 +1784,17 @@ fn test_simulate_zero_rho_matches_diagonal_draw_path() {
 #[test]
 fn test_simulate_singular_rho_one_does_not_panic() {
     let (mut model, population) = block_sigma_selected_model_and_population();
-    model.residual_correlations = vec![crate::types::ResidualCorrelation {
+    let singular = vec![crate::types::ResidualCorrelation {
         sigma_i: 0,
         sigma_j: 1,
         rho: 1.0,
     }];
+    // `simulate` draws from the **parameter vector's** correlations since #847
+    // (so a VPC of an estimated `block_sigma` reproduces the fitted rho), so the
+    // singular value has to be set there; the model copy is kept in step because
+    // the two must agree for every other consumer.
+    model.residual_correlations = singular.clone();
+    model.default_params.residual_correlations = singular;
 
     let n_sim = 20_000;
     let results = simulate_with_seed(&model, &population, &model.default_params, n_sim, 11);

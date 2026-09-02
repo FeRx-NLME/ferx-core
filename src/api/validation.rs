@@ -2833,6 +2833,40 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                 break;
             }
         }
+        // #847: only FOCE/FOCEI estimate the `block_sigma` off-diagonal. A chain
+        // that runs one of those *before* a stage that cannot — SAEM, IMP,
+        // IMPMAP, AGQ, Laplace, VI — hands that stage a rho it has no channel to
+        // read: `fit()` forwards the fitted `ModelParameters` to the next stage,
+        // but those estimators' data term (`obs_nll_subject_*`) sources rho from
+        // the frozen `CompiledModel`, so they would silently score the
+        // *declared* correlation while reporting the estimated one. Refuse the
+        // configuration rather than mis-score it. `FIX` makes the two agree by
+        // construction, and a non-estimating stage placed *first* is fine — rho
+        // has not moved yet.
+        let estimates_rho =
+            |m: &EstimationMethod| matches!(m, EstimationMethod::Foce | EstimationMethod::FoceI);
+        let rho_fixed = &model.default_params.residual_correlation_fixed;
+        let free_rho = rho_fixed.iter().any(|&f| !f) || rho_fixed.is_empty();
+        if free_rho {
+            if let Some(first) = chain.iter().position(estimates_rho) {
+                if let Some(later) = chain.iter().skip(first + 1).find(|m| !estimates_rho(m)) {
+                    diags.push(
+                        Diagnostic::error(
+                            "E_BLOCK_SIGMA_CHAIN_UNSUPPORTED",
+                            format!(
+                                "method = {:?} follows an estimator that estimates the \
+                                 block_sigma off-diagonal, but it cannot read the estimated \
+                                 correlation and would score the declared one instead. Add FIX \
+                                 to the block_sigma declaration to hold the correlation for the \
+                                 whole chain, put the non-estimating stage first, or drop it.",
+                                later
+                            ),
+                        )
+                        .with_block("fit_options"),
+                    );
+                }
+            }
+        }
         if matches!(model.bloq_method, BloqMethod::M3) {
             diags.push(
                 Diagnostic::error(

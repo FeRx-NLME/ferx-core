@@ -1,5 +1,5 @@
 use ferx_core::parser::model_parser::parse_model_string;
-use ferx_core::{fit, read_nonmem_csv, FitOptions};
+use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions};
 use std::path::Path;
 
 const MODEL: &str = "\
@@ -103,4 +103,55 @@ fn fit_result_marks_a_fixed_block_sigma_correlation_pinned() {
     let rho_idx = mask.len() - 1;
     assert!(mask[rho_idx]);
     assert_eq!(bounds.lower[rho_idx], bounds.upper[rho_idx]);
+}
+
+/// #847: only FOCE/FOCEI estimate the `block_sigma` off-diagonal, and the method
+/// chain forwards fitted parameters to the next stage. A stage that cannot read
+/// the estimated rho would score the *declared* one while the result reported the
+/// estimate, so the configuration is refused rather than mis-scored.
+#[test]
+fn block_sigma_chain_after_focei_is_rejected() {
+    let src = MODEL.replace("1.00] FIX", "1.00]");
+    let model = parse_model_string(&src).expect("free block_sigma model must parse");
+    let options = FitOptions {
+        methods: vec![EstimationMethod::FoceI, EstimationMethod::Imp],
+        ..FitOptions::default()
+    };
+    let diags = ferx_core::check_model_options(&model, &options);
+    let hit = diags
+        .iter()
+        .find(|d| d.code == "E_BLOCK_SIGMA_CHAIN_UNSUPPORTED")
+        .expect("a rho-estimating stage followed by IMP must be rejected");
+    assert!(hit.message.contains("FIX"), "{}", hit.message);
+}
+
+/// The same chain is fine when the block is `FIX`ed — rho never moves, so every
+/// stage scores the declaration and the reported value agrees with it (#847).
+#[test]
+fn block_sigma_chain_after_focei_is_allowed_when_fixed() {
+    let model = parse_model_string(MODEL).expect("block_sigma model must parse");
+    let options = FitOptions {
+        methods: vec![EstimationMethod::FoceI, EstimationMethod::Imp],
+        ..FitOptions::default()
+    };
+    let diags = ferx_core::check_model_options(&model, &options);
+    assert!(!diags
+        .iter()
+        .any(|d| d.code == "E_BLOCK_SIGMA_CHAIN_UNSUPPORTED"));
+}
+
+/// A non-estimating stage placed **first** is fine: rho has not moved yet, so it
+/// scores the declaration, which is still the live value (#847).
+#[test]
+fn block_sigma_chain_before_focei_is_allowed() {
+    let src = MODEL.replace("1.00] FIX", "1.00]");
+    let model = parse_model_string(&src).expect("free block_sigma model must parse");
+    let options = FitOptions {
+        methods: vec![EstimationMethod::Saem, EstimationMethod::FoceI],
+        ..FitOptions::default()
+    };
+    let diags = ferx_core::check_model_options(&model, &options);
+    assert!(!diags
+        .iter()
+        .any(|d| d.code == "E_BLOCK_SIGMA_CHAIN_UNSUPPORTED"));
 }

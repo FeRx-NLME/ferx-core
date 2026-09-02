@@ -393,7 +393,15 @@ fn fd_eta_data_grad(
             let (eta, kappas) = split_stacked(zz, n_eta, n_kappa, k_occasions);
             obs_nll_subject_into_iov(model, subject, theta, sigma, eta, &kappas, scratch)
         } else {
-            obs_nll_subject_into(model, subject, theta, sigma, zz, scratch)
+            obs_nll_subject_into(
+                model,
+                subject,
+                theta,
+                sigma,
+                &model.residual_correlations,
+                zz,
+                scratch,
+            )
         }
     };
     let mut g = vec![0.0; z.len()];
@@ -1304,6 +1312,7 @@ pub(crate) fn elbo_tightness(
                 subject,
                 &params.theta,
                 &params.sigma.values,
+                &params.residual_correlations,
                 eta,
                 &mut scratch,
             )

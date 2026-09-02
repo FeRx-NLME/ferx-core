@@ -2453,7 +2453,15 @@ fn theta_sigma_weighted_mstep(
                     if *w == 0.0 {
                         continue;
                     }
-                    s += w * obs_nll_subject_into(model, subject, &th, &sg, eta, scratch);
+                    s += w * obs_nll_subject_into(
+                        model,
+                        subject,
+                        &th,
+                        &sg,
+                        &model.residual_correlations,
+                        eta,
+                        scratch,
+                    );
                 }
                 s
             })
@@ -2563,7 +2571,15 @@ fn theta_sigma_weighted_mstep_mixture(
                         if *w == 0.0 {
                             continue;
                         }
-                        sc += w * obs_nll_subject_into(model, subject, &th, &sg, eta, scratch);
+                        sc += w * obs_nll_subject_into(
+                            model,
+                            subject,
+                            &th,
+                            &sg,
+                            &model.residual_correlations,
+                            eta,
+                            scratch,
+                        );
                     }
                     s += p * sc;
                 }

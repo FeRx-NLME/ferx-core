@@ -1828,6 +1828,7 @@ mod tests {
             &subj,
             &theta,
             &sigma,
+            &model.residual_correlations,
             &eta,
             &mut scratch,
         );

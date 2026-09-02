@@ -411,8 +411,15 @@ pub(crate) fn obs_nll_subject_grad(
         // perturbation — only θ perturbations need a fresh solve (#557).
         let preds_base =
             crate::pk::compute_predictions_with_tv_into(model, subject, theta, eta, pk_scratch);
-        let nll_base =
-            obs_nll_subject_from_preds(model, subject, &preds_base, theta, sigma_values, eta);
+        let nll_base = obs_nll_subject_from_preds(
+            model,
+            subject,
+            &preds_base,
+            theta,
+            sigma_values,
+            &model.residual_correlations,
+            eta,
+        );
         let mut grad = vec![0.0f64; n];
         let h = 1e-5;
         let nn_plan = NnGradPlan::build(model, subject, theta, n_theta);
@@ -420,8 +427,15 @@ pub(crate) fn obs_nll_subject_grad(
             let mut theta_p = theta.to_vec();
             let delta = sign * h * (1.0 + theta[i].abs());
             theta_p[i] += delta;
-            let nll_p =
-                obs_nll_subject_into(model, subject, &theta_p, sigma_values, eta, pk_scratch);
+            let nll_p = obs_nll_subject_into(
+                model,
+                subject,
+                &theta_p,
+                sigma_values,
+                &model.residual_correlations,
+                eta,
+                pk_scratch,
+            );
             (nll_p - nll_base) / delta
         };
 
@@ -444,8 +458,15 @@ pub(crate) fn obs_nll_subject_grad(
                 let mut sigma_p = sigma_values.to_vec();
                 let delta = h * (1.0 + sigma_values[k].abs());
                 sigma_p[k] += delta;
-                let nll_p =
-                    obs_nll_subject_from_preds(model, subject, &preds_base, theta, &sigma_p, eta);
+                let nll_p = obs_nll_subject_from_preds(
+                    model,
+                    subject,
+                    &preds_base,
+                    theta,
+                    &sigma_p,
+                    &model.residual_correlations,
+                    eta,
+                );
                 // log-packing for sigma: d/d(log_sigma_k) = sigma_k * d/d(sigma_k)
                 grad[i] = sigma_values[k] * (nll_p - nll_base) / delta;
             }

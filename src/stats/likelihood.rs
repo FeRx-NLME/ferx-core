@@ -703,16 +703,32 @@ fn dense_residual_data_term(
 ///
 /// Under M3, censored rows contribute the matching normal-tail likelihood
 /// instead of the Gaussian residual term.
+/// `residual_correlations` carries the **live** `block_sigma` off-diagonals
+/// alongside the live `sigma_values` (#847). Reading them off `model` instead
+/// would be wrong for any estimator that inherits a fitted rho from an earlier
+/// chain stage — `method = [focei, imp]` hands IMP the FOCEI estimate, so a
+/// declaration-sourced R would score a different likelihood than the one just
+/// optimized.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn obs_nll_subject_into(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     sigma_values: &[f64],
+    residual_correlations: &[ResidualCorrelation],
     eta: &[f64],
     pk_scratch: &mut pk::EventPkParams,
 ) -> f64 {
     let preds = pk::compute_predictions_with_tv_into(model, subject, theta, eta, pk_scratch);
-    obs_nll_subject_from_preds(model, subject, &preds, theta, sigma_values, eta)
+    obs_nll_subject_from_preds(
+        model,
+        subject,
+        &preds,
+        theta,
+        sigma_values,
+        residual_correlations,
+        eta,
+    )
 }
 
 /// Observation-only NLL from *precomputed* predictions.
@@ -722,12 +738,14 @@ pub(crate) fn obs_nll_subject_into(
 /// loop reuse one ODE solve across all σ perturbations instead of re-solving per
 /// element (#557). `theta` is only consumed by the TTE hazard term.
 #[cfg_attr(not(feature = "survival"), allow(unused_variables))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn obs_nll_subject_from_preds(
     model: &CompiledModel,
     subject: &Subject,
     preds: &[f64],
     theta: &[f64],
     sigma_values: &[f64],
+    residual_correlations: &[ResidualCorrelation],
     eta: &[f64],
 ) -> f64 {
     let m3 = matches!(model.bloq_method, BloqMethod::M3);
@@ -743,7 +761,7 @@ pub(crate) fn obs_nll_subject_from_preds(
     let err_keys = model.error_spec.obs_keys(subject);
     let mut nll = 0.0;
     let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
-    if !model.residual_correlations.is_empty() && !m3 && !has_frem_rows {
+    if !residual_correlations.is_empty() && !m3 && !has_frem_rows {
         // block_sigma + SDE is rejected up front (E_BLOCK_SIGMA_SDE_UNSUPPORTED)
         // for the SAEM M-step, so no EKF process noise enters here.
         match dense_residual_data_term(
@@ -751,9 +769,7 @@ pub(crate) fn obs_nll_subject_from_preds(
             subject,
             preds,
             sigma_values,
-            // SAEM / IS / VI reach this term and none of them estimates ρ (#847),
-            // so the declaration is the live value here.
-            &model.residual_correlations,
+            residual_correlations,
             ruv_scale,
             &[],
             ruv_mult.as_deref(),
@@ -2658,9 +2674,10 @@ mod tests {
         let sigma = vec![0.2, 0.3];
         let mut scratch = pk::EventPkParams::default();
 
-        let dense = obs_nll_subject_into(&model, &subj, &theta, &sigma, &eta, &mut scratch);
+        let corr = model.residual_correlations.clone();
+        let dense = obs_nll_subject_into(&model, &subj, &theta, &sigma, &corr, &eta, &mut scratch);
         model.residual_correlations.clear();
-        let diagonal = obs_nll_subject_into(&model, &subj, &theta, &sigma, &eta, &mut scratch);
+        let diagonal = obs_nll_subject_into(&model, &subj, &theta, &sigma, &[], &eta, &mut scratch);
 
         assert!(dense.is_finite());
         assert!(diagonal.is_finite());
@@ -2787,9 +2804,16 @@ mod tests {
         let eta = [0.0];
 
         let nll_weighted =
-            obs_nll_subject_from_preds(&weighted, &natural, &f, &theta, &sigma, &eta);
-        let nll_hand =
-            obs_nll_subject_from_preds(&plain, &prescaled, &scaled_preds, &theta, &sigma, &eta);
+            obs_nll_subject_from_preds(&weighted, &natural, &f, &theta, &sigma, &[], &eta);
+        let nll_hand = obs_nll_subject_from_preds(
+            &plain,
+            &prescaled,
+            &scaled_preds,
+            &theta,
+            &sigma,
+            &[],
+            &eta,
+        );
         let jacobian: f64 = w.iter().map(|wi| wi.ln()).sum();
 
         approx::assert_relative_eq!(nll_weighted, nll_hand + jacobian, epsilon = 1e-12);
@@ -3617,9 +3641,9 @@ mod tests {
         let eta = vec![0.4];
         let mut scratch = pk::EventPkParams::with_capacity_for(&subj);
 
-        let base = obs_nll_subject_into(&model, &subj, &theta, &sigma, &eta, &mut scratch);
+        let base = obs_nll_subject_into(&model, &subj, &theta, &sigma, &[], &eta, &mut scratch);
         model.residual_error_eta = Some(0);
-        let scaled = obs_nll_subject_into(&model, &subj, &theta, &sigma, &eta, &mut scratch);
+        let scaled = obs_nll_subject_into(&model, &subj, &theta, &sigma, &[], &eta, &mut scratch);
 
         let s = (2.0_f64 * 0.4).exp();
         let preds = pk::compute_predictions_with_tv(&model, &subj, &theta, &eta);
@@ -3778,8 +3802,15 @@ mod tests {
 
         // (2) SAEM M-step: obs_nll_subject_from_preds (Gaussian preds supplied).
         let preds = vec![30.0_f64; n_obs];
-        let saem =
-            obs_nll_subject_from_preds(&model, &subject, &preds, &p.theta, &p.sigma.values, &eta);
+        let saem = obs_nll_subject_from_preds(
+            &model,
+            &subject,
+            &preds,
+            &p.theta,
+            &p.sigma.values,
+            &p.residual_correlations,
+            &eta,
+        );
         assert!(
             saem.is_finite(),
             "SAEM M-step joint NLL must be finite; got {saem}"

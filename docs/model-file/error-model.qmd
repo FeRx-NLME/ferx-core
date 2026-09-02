@@ -728,6 +728,16 @@ under `method = foce` / `method = focei` (the EKF variance is added to the dense
 `R`) but are rejected under `method = saem`, whose M-step data term does not yet
 include the process-noise inflation.
 
+An **estimated** correlation additionally restricts method *chains*. Only `foce`
+and `focei` estimate the off-diagonal; the other supported estimators read it
+from the model declaration. Because each chain stage starts from the previous
+stage's estimates, a chain that runs `foce`/`focei` **before** a non-estimating
+stage would leave that stage scoring the declared correlation while the fit
+reported the estimated one, so it is rejected with
+`E_BLOCK_SIGMA_CHAIN_UNSUPPORTED`. `method = [saem, focei]` is fine (the
+correlation has not moved when SAEM runs); `method = [focei, imp]` is not, unless
+the block carries `FIX`.
+
 `simulate()` draws the full residual vector for each subject's paired
 observations (same subject time and occasion) from the dense covariance `R`
 built by `compute_r_matrix_with_correlations` — the same matrix FOCE/FOCEI/SAEM/

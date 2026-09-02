@@ -466,6 +466,7 @@ fn ltbs_data_term_is_quadratic_below_unit_predictions() {
                 &subj,
                 &template.theta,
                 &template.sigma.values,
+                &template.residual_correlations,
                 &[e],
                 &mut scratch,
             )
@@ -871,6 +872,7 @@ fn fixed_eta_nll_agrees_with_the_conditional_mode_objective_under_ltbs() {
             &subj,
             &template.theta,
             &template.sigma.values,
+            &template.residual_correlations,
             &[eta],
             &mut scratch,
         );

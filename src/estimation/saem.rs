@@ -914,7 +914,15 @@ pub(crate) fn obs_nll_sum(
         .par_iter()
         .enumerate()
         .map_init(EventPkParams::default, |scratch, (i, subject)| {
-            obs_nll_subject_into(model, subject, theta, sigma_values, &etas[i], scratch)
+            obs_nll_subject_into(
+                model,
+                subject,
+                theta,
+                sigma_values,
+                &model.residual_correlations,
+                &etas[i],
+                scratch,
+            )
         })
         .collect();
     per_subj.iter().sum()
@@ -974,7 +982,15 @@ fn obs_nll_sum_mix(
             let _g = crate::parser::model_parser::MixtureClassGuard::enter(c + 1);
             let sub_sg = class_sigma_subst(sigma_values, &mix.class_sigma_over[c]);
             let sg_i: &[f64] = sub_sg.as_deref().unwrap_or(sigma_values);
-            obs_nll_subject_into(model, subject, theta, sg_i, &etas[i], scratch)
+            obs_nll_subject_into(
+                model,
+                subject,
+                theta,
+                sg_i,
+                &model.residual_correlations,
+                &etas[i],
+                scratch,
+            )
         })
         .collect();
     per_subj.iter().sum()

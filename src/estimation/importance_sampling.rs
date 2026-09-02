@@ -843,7 +843,15 @@ fn subject_is_estimate(
             }
         }
 
-        let obs_nll = obs_nll_subject_into(model, subject, theta, sigma, &eta_sample, scratch);
+        let obs_nll = obs_nll_subject_into(
+            model,
+            subject,
+            theta,
+            sigma,
+            &model.residual_correlations,
+            &eta_sample,
+            scratch,
+        );
         let log_p_y = -obs_nll;
 
         // log p(η | θ): multivariate-normal quadratic form `η' Ω⁻¹ η`,
@@ -1218,7 +1226,15 @@ pub(crate) fn subject_is_draws_frem_rb(
             full_eta[i] = d[b];
         }
 
-        let obs_nll = obs_nll_subject_into(model, subject, theta, sigma, &full_eta, scratch);
+        let obs_nll = obs_nll_subject_into(
+            model,
+            subject,
+            theta,
+            sigma,
+            &model.residual_correlations,
+            &full_eta,
+            scratch,
+        );
         let log_p_y = -(obs_nll - cov_obs_const); // PK-only obs log-likelihood
 
         // Conditional prior log N(η_p; μ, P_pp): (η_p−μ)' P_pp (η_p−μ).
@@ -1443,7 +1459,15 @@ pub(crate) fn subject_is_draws(
             }
         }
 
-        let obs_nll = obs_nll_subject_into(model, subject, theta, sigma, &eta_sample, scratch);
+        let obs_nll = obs_nll_subject_into(
+            model,
+            subject,
+            theta,
+            sigma,
+            &model.residual_correlations,
+            &eta_sample,
+            scratch,
+        );
         let log_p_y = -obs_nll;
 
         let mut quad_form = 0.0_f64;

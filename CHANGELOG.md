@@ -34,7 +34,10 @@ section of the SDLC for the versioning policy).
   `(-1, 1)` and the residual covariance can never go singular from the correlation alone, and
   it rides the exact analytic FOCE/FOCEI outer gradient rather than falling back to finite
   differences. Estimators that do not estimate it (SAEM, IMP/IMPMAP, Bayes, AGQ, VI) continue
-  to hold it at the declaration.
+  to hold it at the declaration. Because a method chain starts each stage from the previous
+  stage's estimates, a chain that runs `foce`/`focei` before a stage that cannot read the
+  estimated correlation is now rejected with `E_BLOCK_SIGMA_CHAIN_UNSUPPORTED` rather than
+  silently scoring the declared value — `[saem, focei]` is fine, `[focei, imp]` needs `FIX`.
 
 ### Added
 - **Fitted `block_sigma` correlations are reported with their fixedness and standard error
@@ -46,6 +49,10 @@ section of the SDLC for the versioning policy).
   marked fixed, which is what it meant at the time.
 
 ### Fixed
+- **`simulate()` drew correlated residuals at the declared `block_sigma` correlation (#847).**
+  The dense residual `R` it samples from used the live sigmas but the model's declared
+  correlation, so a VPC or posterior-predictive check of a fit with an estimated off-diagonal
+  would not reproduce the correlation the fit reported. It now uses the parameter vector's.
 - **`block_sigma` residual derivatives were built at the declared correlation, not the live
   one (#847).** The outer-gradient assembly (`corr_residual_diag` /
   `corr_residual_rd_at_sigma`) and the inner eta-gradient read the correlations off the frozen
