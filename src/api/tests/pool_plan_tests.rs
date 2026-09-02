@@ -90,6 +90,33 @@ fn the_outer_pool_declares_the_ferx_worker_stack() {
     }
 }
 
+const PROBE: usize = 4 * 1024 * 1024;
+
+/// Touch a frame larger than the platform-default thread stack, and return a
+/// value derived from both of its ends so it cannot be optimised away.
+///
+/// `#[inline(never)]` is load-bearing, not decoration. Rayon's `install` goes
+/// through `Registry::in_worker`, which is `#[inline]` and branches on whether
+/// the calling thread is already a pool worker — the "already a worker" arm
+/// calls `op()` **directly, on the caller's stack**. At the release-level
+/// optimisation the CI profiles use (`ci-fast` inherits `release`), that arm
+/// inlines into this test's own frame, and LLVM hoists the resulting 4 MiB
+/// `alloca` to the frame's entry block, where it is reserved unconditionally
+/// even though the branch is never taken at runtime. The test harness gives each
+/// test thread the std default stack, so the *caller* overflowed before `install`
+/// ever reached a worker — a green debug build and an aborted optimised one, with
+/// nothing wrong with the pool. Behind a call that cannot be inlined, the frame
+/// is only ever built by whoever actually runs the probe: the pool worker.
+#[inline(never)]
+fn touch_a_frame_larger_than_the_default_stack() -> usize {
+    let mut frame = [0u8; PROBE];
+    // Write both ends so the pages are actually committed.
+    frame[0] = 1;
+    frame[PROBE - 1] = 2;
+    std::hint::black_box(&frame);
+    frame[0] as usize + frame[PROBE - 1] as usize
+}
+
 #[test]
 fn the_outer_pool_really_has_more_than_the_default_stack() {
     // The declared size above is only a promise; this is the observation. A
@@ -97,7 +124,8 @@ fn the_outer_pool_really_has_more_than_the_default_stack() {
     // (2 MiB on the platforms ferx runs on), so touching a 4 MiB frame inside
     // `install` overflows unless the plan applied `FIT_RAYON_STACK_SIZE`.
     // `install` runs `op` on a pool worker, so this is the worker's stack, not
-    // the caller's.
+    // the caller's — provided the probe stays behind the `#[inline(never)]`
+    // boundary above, which is what keeps that sentence true under optimisation.
     //
     // A regression here fails loudly but bluntly: a stack overflow aborts the
     // process rather than unwinding, so the whole test binary dies and its other
@@ -105,17 +133,8 @@ fn the_outer_pool_really_has_more_than_the_default_stack() {
     // in the test above is the graceful half of the pair, and it is what names
     // the cause; this one is the observation that the declaration is real, and
     // there is no way to observe it without risking the overflow.
-    const PROBE: usize = 4 * 1024 * 1024;
     let sum = PoolPlan::new(2, 1)
-        .install(|| {
-            let mut frame = [0u8; PROBE];
-            // Write both ends so the pages are actually committed and the array
-            // cannot be optimised away.
-            frame[0] = 1;
-            frame[PROBE - 1] = 2;
-            std::hint::black_box(&frame);
-            frame[0] as usize + frame[PROBE - 1] as usize
-        })
+        .install(touch_a_frame_larger_than_the_default_stack)
         .expect("outer pool");
     assert_eq!(sum, 3);
 }
