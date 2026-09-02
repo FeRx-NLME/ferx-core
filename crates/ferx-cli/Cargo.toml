@@ -6,6 +6,8 @@ description = "Command-line interface for the ferx NLME modeling engine"
 license = "MIT"
 authors = ["Ron Keizer", "Teun Post", "Hidde van de Beek"]
 repository = "https://github.com/FeRx-NLME/ferx-core"
+keywords = ["nlme", "pharmacometrics", "pharmacokinetics", "population-pk", "cli"]
+categories = ["command-line-utilities", "science", "simulation"]
 
 # The installed binary keeps the name `ferx` — the package rename is invisible
 # to users. It lives here rather than in the `ferx-core` package because it will

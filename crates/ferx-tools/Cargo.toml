@@ -6,6 +6,8 @@ description = "Model-development tooling on top of ferx-core: bootstrap, covaria
 license = "MIT"
 authors = ["Ron Keizer", "Teun Post", "Hidde van de Beek"]
 repository = "https://github.com/FeRx-NLME/ferx-core"
+keywords = ["nlme", "pharmacometrics", "bootstrap", "covariate-search", "cross-validation"]
+categories = ["science", "mathematics", "simulation"]
 
 [dependencies]
 # `default-features = false` is load-bearing, not tidiness: without it a

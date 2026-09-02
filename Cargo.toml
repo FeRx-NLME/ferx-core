@@ -31,6 +31,8 @@ description = "Nonlinear Mixed Effects modeling engine with FOCE/FOCEI estimatio
 license = "MIT"
 authors = ["Ron Keizer", "Teun Post", "Hidde van de Beek"]
 repository = "https://github.com/FeRx-NLME/ferx-core"
+keywords = ["nlme", "pharmacometrics", "pharmacokinetics", "foce", "ode"]
+categories = ["science", "mathematics", "simulation"]
 readme = "README.md"
 # `data/mbma_naproxen.csv` is CC BY-NC 4.0, not MIT (see the root LICENSE and
 # data/mbma_naproxen.LICENSE). It is a slow-test fixture, so excluding it keeps

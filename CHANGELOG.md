@@ -33,6 +33,9 @@ section of the SDLC for the versioning policy).
   fit with the `--gam` flag. See [GAM covariate screening](https://ferx-nlme.github.io/ferx-core/tools/gam-screening.html).
 
 ### Changed
+- **The three published crates now carry `keywords` and `categories` (#1170).** Registry metadata
+  only -- no code change. It is what covers discoverability on crates.io, which is why claiming
+  the `ferx-nlme` name was judged unnecessary in #1170.
 - **`FitOptions::threads` now also caps a multi-start fit (#1115).** A pinned positive `threads`
   was honored only when `n_starts <= 1`; with several starts the fan-out ran on the full-width
   shared pool regardless, so a tool that pinned one thread per fit from a `PoolPlan` and asked
