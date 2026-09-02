@@ -79,6 +79,19 @@ pub fn fitted_params_from_result(
             names: fit_result.sigma_names.clone(),
         },
         sigma_fixed: fit_result.sigma_fixed.clone(),
+        // Prefer the fit's own `block_sigma` correlations (#847) — they are the
+        // estimated values — and fall back to the model declaration for a
+        // FitResult written before the field existed.
+        residual_correlations: if fit_result.residual_correlations.is_empty() {
+            template.residual_correlations.clone()
+        } else {
+            fit_result.residual_correlations.clone()
+        },
+        residual_correlation_fixed: if fit_result.residual_correlation_fixed.is_empty() {
+            template.residual_correlation_fixed.clone()
+        } else {
+            fit_result.residual_correlation_fixed.clone()
+        },
         omega_iov,
         kappa_fixed: fit_result.kappa_fixed.clone(),
         mixture: None,
@@ -307,6 +320,8 @@ mod tests {
         let omega_matrix = DMatrix::from_diagonal(&DVector::from_vec(vec![0.04]));
         let omega = OmegaMatrix::from_matrix(omega_matrix, vec!["eta_CL".to_string()], true);
         ModelParameters {
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             theta: vec![1.0, 5.0],
             theta_names: vec!["CL".to_string(), "V".to_string()],
             theta_lower: vec![1e-3, 1e-3],
@@ -330,6 +345,8 @@ mod tests {
     /// are filled with sensible defaults.
     fn fit_with_cov(template: &ModelParameters, cov: DMatrix<f64>) -> FitResult {
         FitResult {
+            residual_correlation_fixed: Vec::new(),
+            se_residual_correlations: None,
             covariate_relations: Vec::new(),
             restored_from_checkpoint: false,
             method: crate::types::EstimationMethod::FoceI,

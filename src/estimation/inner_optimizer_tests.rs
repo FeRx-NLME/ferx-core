@@ -1086,6 +1086,8 @@ fn test_frem_jacobian_overrides_fd_with_exact_values() {
         vec!["ETA_CL".into(), "ETA_V".into(), "ETA_WT_FREM".into()],
     );
     let default_params = crate::types::ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![10.0, 100.0, 90.0],
         theta_names: vec!["TVCL".into(), "TVV".into(), "TV_WT".into()],
         theta_lower: vec![0.01, 1.0, 0.0],

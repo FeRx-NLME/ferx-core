@@ -2623,6 +2623,8 @@ mod tests {
         let sigma_types = error_model.sigma_types();
         let n = sigma.len();
         FitResult {
+            residual_correlation_fixed: Vec::new(),
+            se_residual_correlations: None,
             covariate_relations: Vec::new(),
             restored_from_checkpoint: false,
             method: EstimationMethod::Foce,
@@ -3324,6 +3326,8 @@ mod tests {
     fn minimal_sdtab_result(subjects: Vec<SubjectResult>) -> FitResult {
         let sigma_types = ErrorModel::Proportional.sigma_types();
         FitResult {
+            residual_correlation_fixed: Vec::new(),
+            se_residual_correlations: None,
             covariate_relations: Vec::new(),
             restored_from_checkpoint: false,
             method: EstimationMethod::Foce,

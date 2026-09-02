@@ -1458,6 +1458,11 @@ fn saem_state_to_params(
             names: init_params.sigma.names.clone(),
         },
         sigma_fixed: init_params.sigma_fixed.clone(),
+        // SAEM does not update the `block_sigma` off-diagonals (#847); carry them
+        // through so a chained estimator (e.g. `[saem, foce]`) and the result
+        // snapshot both keep the declared residual covariance structure.
+        residual_correlations: init_params.residual_correlations.clone(),
+        residual_correlation_fixed: init_params.residual_correlation_fixed.clone(),
         omega_iov: if n_kappa > 0 {
             // Use from_matrix_with_mask so the structural free_mask is preserved
             // when this snapshot is handed to a chained estimator (e.g.

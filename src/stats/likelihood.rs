@@ -2526,6 +2526,8 @@ mod tests {
             theta_names: vec!["TVCL".into(), "TVV".into()],
             eta_names: vec!["ETA_CL".into()],
             default_params: crate::types::ModelParameters {
+                residual_correlations: Vec::new(),
+                residual_correlation_fixed: Vec::new(),
                 theta: vec![5.0, 50.0],
                 theta_names: vec!["TVCL".into(), "TVV".into()],
                 theta_lower: vec![0.01, 1.0],

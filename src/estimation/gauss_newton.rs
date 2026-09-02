@@ -2066,6 +2066,8 @@ mod tests {
     fn make_model() -> CompiledModel {
         let omega = OmegaMatrix::from_diagonal(&[0.04], vec!["ETA_CL".into()]);
         let default_params = ModelParameters {
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             theta: vec![5.0, 50.0],
             theta_names: vec!["TVCL".into(), "TVV".into()],
             theta_lower: vec![0.1, 5.0],
@@ -3114,6 +3116,8 @@ mod tests {
             OmegaMatrix::from_matrix(omega_matrix, vec!["ETA_CL".into(), "ETA_V".into()], false);
 
         let default_params = ModelParameters {
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             theta: vec![5.0, 50.0],
             theta_names: vec!["TVCL".into(), "TVV".into()],
             theta_lower: vec![0.1, 5.0],
@@ -3405,6 +3409,8 @@ mod tests {
         let omega = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
         let omega_iov = OmegaMatrix::from_diagonal(&[0.04], vec!["KAPPA_CL".into()]);
         let default_params = ModelParameters {
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             theta: vec![5.0, 50.0],
             theta_names: vec!["TVCL".into(), "TVV".into()],
             theta_lower: vec![0.01, 1.0],

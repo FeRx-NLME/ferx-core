@@ -8,6 +8,8 @@ use nalgebra::DMatrix;
 fn make_template(omega_iov: Option<OmegaMatrix>, kappa_fixed: Vec<bool>) -> ModelParameters {
     let omega = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
     ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0],
         theta_names: vec!["TVCL".into()],
         theta_lower: vec![0.1],
@@ -40,6 +42,8 @@ fn test_se_omega_block_n3_full_lower_triangle() {
     mat[(2, 2)] = 0.16;
     let omega = OmegaMatrix::from_matrix(mat, vec!["E1".into(), "E2".into(), "E3".into()], false);
     let template = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0],
         theta_names: vec!["TVCL".into()],
         theta_lower: vec![0.1],
@@ -103,6 +107,8 @@ fn test_se_omega_block_offdiag_positive() {
     mat[(1, 0)] = 0.02;
     let omega = OmegaMatrix::from_matrix(mat, vec!["E1".into(), "E2".into()], false);
     let template = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0],
         theta_names: vec!["TVCL".into()],
         theta_lower: vec![0.1],
@@ -142,6 +148,8 @@ fn test_se_omega_block_offdiag_positive() {
 fn test_se_omega_diagonal_unchanged() {
     let omega = OmegaMatrix::from_diagonal(&[0.04, 0.09], vec!["E1".into(), "E2".into()]);
     let template = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0],
         theta_names: vec!["TVCL".into()],
         theta_lower: vec![0.1],
@@ -179,6 +187,8 @@ fn test_se_theta_respects_packing_scale() {
     // theta[1] = BETA, lower -10 < 0   → identity-packed (can be negative)
     let omega = OmegaMatrix::from_diagonal(&[0.04], vec!["E1".into()]);
     let template = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![2.0, 0.25],
         theta_names: vec!["TVCL".into(), "BETA".into()],
         theta_lower: vec![0.1, -10.0],

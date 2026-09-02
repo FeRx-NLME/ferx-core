@@ -824,6 +824,11 @@ fn run_mcem(
                 names: init_params.sigma.names.clone(),
             },
             sigma_fixed: init_params.sigma_fixed.clone(),
+            // IMP/IMPMAP does not update the `block_sigma` off-diagonals
+            // (#847); carry them so the sampled residual `R` keeps its
+            // declared correlation structure.
+            residual_correlations: init_params.residual_correlations.clone(),
+            residual_correlation_fixed: init_params.residual_correlation_fixed.clone(),
             omega_iov: None,
             kappa_fixed: init_params.kappa_fixed.clone(),
             mixture: None,
@@ -1307,6 +1312,11 @@ fn run_mcem(
             names: init_params.sigma.names.clone(),
         },
         sigma_fixed: init_params.sigma_fixed.clone(),
+        // IMP/IMPMAP does not update the `block_sigma` off-diagonals
+        // (#847); carry them so the sampled residual `R` keeps its
+        // declared correlation structure.
+        residual_correlations: init_params.residual_correlations.clone(),
+        residual_correlation_fixed: init_params.residual_correlation_fixed.clone(),
         omega_iov: None,
         kappa_fixed: init_params.kappa_fixed.clone(),
         mixture: None,
@@ -1892,6 +1902,11 @@ fn run_mcem_mixture(
                 names: init_params.sigma.names.clone(),
             },
             sigma_fixed: init_params.sigma_fixed.clone(),
+            // IMP/IMPMAP does not update the `block_sigma` off-diagonals
+            // (#847); carry them so the sampled residual `R` keeps its
+            // declared correlation structure.
+            residual_correlations: init_params.residual_correlations.clone(),
+            residual_correlation_fixed: init_params.residual_correlation_fixed.clone(),
             omega_iov: None,
             kappa_fixed: init_params.kappa_fixed.clone(),
             mixture: None,
@@ -2282,6 +2297,11 @@ fn run_mcem_mixture(
             names: init_params.sigma.names.clone(),
         },
         sigma_fixed: init_params.sigma_fixed.clone(),
+        // IMP/IMPMAP does not update the `block_sigma` off-diagonals
+        // (#847); carry them so the sampled residual `R` keeps its
+        // declared correlation structure.
+        residual_correlations: init_params.residual_correlations.clone(),
+        residual_correlation_fixed: init_params.residual_correlation_fixed.clone(),
         omega_iov: None,
         kappa_fixed: init_params.kappa_fixed.clone(),
         mixture: final_mixture,
