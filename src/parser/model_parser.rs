@@ -11501,6 +11501,15 @@ fn build_ode_spec(
     // only `Op::PushVar`, so the injected lines' own *writes* to these slots do
     // not trip it. A `[scaling]` readout may still read `__chz_*`: a readout
     // cannot feed back, and it is pinned as allowed.
+    //
+    // This walks the WHOLE program, so it also rejects a *self-exciting* hazard
+    // (`hazard = f(__chz)`), which is self-coupling within the accumulator's own
+    // row and leaves the PK block autonomous — i.e. stricter than the narrow flag
+    // below actually requires. Deliberate: no oracle exists for that model family
+    // on any of the paths that consume the hazard state (the shared solve reads
+    // `H` back by Hermite interpolation, and `h` off the derivative), and shipping
+    // it on "returns a finite number" is how the neighbouring defects got in.
+    // Narrowing this to `pk_stmts` is #1208, and needs an anchor first.
     if !chz_state_slots.is_empty() && stmts_read_slots(&stmts_owned, chz_state_slots) {
         let names: Vec<&str> = chz_state_slots
             .iter()

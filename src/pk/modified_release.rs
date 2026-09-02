@@ -3086,6 +3086,77 @@ mod tests {
         );
     }
 
+    /// **Invariant tripwire, not a regression test**: a joint PK-TTE model must
+    /// never reach the closed form, and since #1166 nothing in `mr_scope` itself
+    /// enforces that.
+    ///
+    /// Before #1166 the model-time decline above did it as a side effect — a
+    /// time-dependent hazard made `model_uses_time_anywhere` true. That predicate
+    /// now asks the PK block only, so the decline rests entirely on
+    /// `identify_disposition`. Its `n_states > 2` bail covers a joint model with
+    /// two or more PK states, but **not** this one: a single PK state plus the
+    /// injected `d/dt(__chz_2)` accumulator is exactly two, so it reaches the
+    /// behavioural probe. It is declined there because the accumulator makes the
+    /// disposition **triangular** — the hazard row reads the central state, and
+    /// nothing returns from it — which is not a disposition the closed form
+    /// recognises.
+    ///
+    /// That is an emergent property of the probe's sign/linearity checks, not a
+    /// stated rule, so it can be relaxed by someone working on `identify_disposition`
+    /// who has no reason to think about joint models. This test is the tripwire: if
+    /// it goes red, the closed form has started admitting a system it was never
+    /// meant to serve, and `mr_scope` needs an explicit
+    /// `HazardSpec::OdeAccumulated` decline.
+    ///
+    /// Deliberately **not** shipped as that guard today: a guard whose test no
+    /// mutation can kill is dead code that reads as protection. Whether to enforce
+    /// the invariant rather than pin it is #1209. The hazard is linear in the state
+    /// and zero at zero on purpose — a constant baseline would be declined by the
+    /// "no autonomous term" probe instead, and the test would not be about the
+    /// accumulator at all.
+    #[test]
+    #[cfg(feature = "survival")]
+    fn a_joint_pk_tte_model_never_reaches_the_closed_form() {
+        let subject = tad_subject();
+        let eta = [0.0];
+
+        // Control: without the `[event_model]` this exact model IS served by the
+        // closed form, so the decline below cannot be passing for a trivial reason.
+        let control = crate::parser::model_parser::parse_model_string(&tad_model("", "")).unwrap();
+        assert!(
+            mr_scope(&control, &subject, &TAD_THETA, &eta).is_some(),
+            "the control (no [event_model]) must stay in scope"
+        );
+
+        let joint_src = tad_model("", "").replace(
+            "[scaling]",
+            "[event_model]\n  cmt    = 2\n  hazard = 0.01 * (central / V)\n\n[scaling]",
+        );
+        let joint = crate::parser::model_parser::parse_model_string(&joint_src).unwrap();
+        let spec = joint.ode_spec.as_ref().expect("ode spec");
+        assert_eq!(
+            spec.n_states, 2,
+            "one PK state + the accumulator — exactly the count `identify_disposition`'s \
+             `n_states > 2` bail does NOT catch"
+        );
+        // The precondition #1166 changed: the routing predicate no longer declines
+        // this model, so `identify_disposition` is the only remaining gate.
+        assert!(
+            !crate::pk::model_uses_time_anywhere(&joint),
+            "since #1166 the predicate reads the PK block only, so it admits this model"
+        );
+        let p = (joint.pk_param_fn)(&TAD_THETA, &eta, &std::collections::HashMap::new(), 0.0);
+        assert!(
+            identify_disposition(spec, &p.values, 0.0).is_none(),
+            "the gate that actually declines a joint model has stopped declining it — \
+             `mr_scope` now needs an explicit `HazardSpec::OdeAccumulated` guard (#1166)"
+        );
+        assert!(
+            mr_scope(&joint, &subject, &TAD_THETA, &eta).is_none(),
+            "a model carrying an ODE-accumulated hazard must never reach the closed form"
+        );
+    }
+
     /// `mr_scope` must decline model time in **every** spelling, including from
     /// inside an `if` condition. The behavioural probe in `identify_disposition`
     /// samples two times with `tad` pinned, so it sees none of these: bare `TAD`

@@ -135,7 +135,9 @@ pub(crate) fn model_uses_time_builtin(model: &CompiledModel) -> bool {
 /// the accumulator makes the disposition triangular — the hazard row reads the
 /// state but nothing returns from it — and that is not a disposition the closed
 /// form recognises. So the exposure is closed, by a different gate than the one
-/// that used to close it. Re-measure before relaxing that gate's sign checks.
+/// that used to close it. The invariant is pinned by
+/// `pk::modified_release::tests::a_joint_pk_tte_model_never_reaches_the_closed_form`
+/// rather than enforced; whether to enforce it is #1209.
 #[inline]
 pub(crate) fn model_uses_time_anywhere(model: &CompiledModel) -> bool {
     model_uses_time_builtin(model)

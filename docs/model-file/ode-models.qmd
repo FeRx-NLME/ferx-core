@@ -280,6 +280,13 @@ The accumulator is not part of the dynamics it accumulates over, and `H(0) = 0` 
 definition. A `[scaling]` readout may read it — a readout cannot feed back — which is how
 you would report `H(t)` alongside the predictions.
 
+That covers one case more than it strictly must. A **self-exciting** hazard —
+`hazard = f(__chz_<cmt>)`, where the risk rises with hazard already accrued — only couples the
+accumulator to itself and leaves the PK block autonomous, so it is rejected for want of
+evidence rather than because it is known to be wrong: no reference run anchors that model
+family on any of the paths that read the hazard state. Tracked in
+[#1208](https://github.com/FeRx-NLME/ferx-core/issues/1208).
+
 One case is declined more often than it strictly must be: an intermediate that reads time and
 is used *only* by the hazard (`TT = TIME` … `hazard = f(TT)`) still marks the block
 non-autonomous. Write the time term in the `hazard =` expression itself to avoid it.
