@@ -234,15 +234,23 @@ fn try_joint_pktte_shared_solve(
     // The share computes the Gaussian predictions via `ode_predictions_and_chz`, i.e.
     // the plain no-TV `ode_predictions` with a single t=0 PK snapshot. It is only
     // equivalent when the standalone prediction path (`compute_predictions_with_tv_*`)
-    // takes that same snapshot route. Reject every case it routes elsewhere: a `TIME`
-    // built-in (`compiled_model_uses_time_builtin`) or time-varying covariates send it
-    // through the per-event `ode_predictions_event_driven` (pk/mod.rs); EVID-3/4 resets
-    // also need the event-driven walker; SDE adds EKF process noise; FREM rewrites the
+    // takes that same snapshot route. Reject every case it routes elsewhere: model time
+    // (`pk::model_uses_time_anywhere`) or time-varying covariates send it through the
+    // per-event `ode_predictions_event_driven` (pk/mod.rs); EVID-3/4 resets also need the
+    // event-driven walker; SDE adds EKF process noise; FREM rewrites the
     // pseudo-observation predictions. Each keeps the established two-solve fallback.
+    //
+    // The model-time clause must be the **wide** predicate, matching the routing site
+    // this mirrors (`pk/mod.rs`). Asking the narrow `compiled_model_uses_time_builtin`
+    // inspects only the individual-parameter program, so an `[odes]` RHS reading
+    // `TAD`/`TAFD`/`T`/`TIME` stayed admitted here after #1124 rerouted the standalone
+    // path — leaving the objective's Gaussian term on the dense engine while the
+    // reported IPRED came from the event-driven one, which is exactly the split the
+    // stated contract above exists to prevent.
     if subject.obs_records.is_empty()
         || subject.has_tv_covariates()
         || subject.has_resets()
-        || crate::parser::model_parser::compiled_model_uses_time_builtin(model)
+        || crate::pk::model_uses_time_anywhere(model)
         || model.is_sde()
         || subject.fremtype.iter().any(|&f| f > 0)
     {
@@ -3883,6 +3891,114 @@ mod tests {
             "a TIME-using joint PK-TTE model must not take the #570 shared-solve path"
         );
         // The fallback still yields a finite NLL (and η still moves it).
+        let nll = individual_nll(
+            &model,
+            &subject,
+            &p.theta,
+            &[0.0],
+            &p.omega,
+            &p.sigma.values,
+        );
+        let moved = individual_nll(
+            &model,
+            &subject,
+            &p.theta,
+            &[0.3],
+            &p.omega,
+            &p.sigma.values,
+        );
+        assert!(
+            nll.is_finite() && moved.is_finite() && (nll - moved).abs() > 1e-9,
+            "fallback joint NLL must be finite and η-sensitive (nll={nll}, moved={moved})"
+        );
+    }
+
+    /// The same rejection, for model time read in the **`[odes]` RHS** rather than
+    /// in `[individual_parameters]`.
+    ///
+    /// The sibling above cannot pin this: its fixture puts `TIME` in an individual
+    /// parameter, where the narrow `compiled_model_uses_time_builtin` and the wide
+    /// `pk::model_uses_time_anywhere` both return `true`, so it passes under either
+    /// and the choice of predicate is invisible to it. Here only the wide one fires,
+    /// which is the whole difference — and reverting the gate to the narrow
+    /// predicate left the entire suite green before this test existed.
+    ///
+    /// Why the rejection is required: the shared solve (#570) computes the Gaussian
+    /// predictions from the plain no-TV `ode_predictions` with a single `t=0` PK
+    /// snapshot, so it is only equivalent when the standalone prediction path takes
+    /// that same route. Since #1124 an `[odes]` RHS reading model time routes to the
+    /// event-driven walker instead, so admitting the share here would leave the
+    /// objective's Gaussian term on the dense engine while the reported IPRED came
+    /// from the event-driven one.
+    #[test]
+    #[cfg(feature = "survival")]
+    fn joint_pktte_share_rejects_model_time_in_the_odes_rhs() {
+        use crate::parser::model_parser::parse_model_string;
+        use crate::types::{EventType, ObsRecord};
+
+        // Same shape as the sibling, but the time dependence lives in the RHS and
+        // the individual parameters are entirely time-independent. The hazard is
+        // deliberately time-independent too: the injected `d/dt(__chz_n)` line is
+        // part of `stmts_owned`, so a `TIME`-reading hazard would trip the wide
+        // predicate on its own and the test would no longer be about the PK RHS.
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  theta TVH0(0.01, 1e-5, 10.0)
+  theta TVBETA(0.5, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  KA   = TVKA
+  H0   = TVH0
+  BETA = TVBETA
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central * (1.0 + 0.3*TAD)
+[event_model]
+  cmt    = 2
+  hazard = H0 * exp(BETA * (central / V))
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+";
+        let model = parse_model_string(src).expect("TAD-in-RHS joint PK-TTE model must parse");
+
+        // The discriminating preconditions. Without these the test would pass for
+        // a model on which the two predicates agree, and would not pin the gate's
+        // choice of predicate at all.
+        assert!(
+            !crate::parser::model_parser::compiled_model_uses_time_builtin(&model),
+            "the narrow predicate must NOT fire — the individual parameters are \
+             time-independent"
+        );
+        assert!(
+            crate::pk::model_uses_time_anywhere(&model),
+            "…while the wide one must, via the `[odes]` RHS"
+        );
+
+        let mut subject = make_simple_subject();
+        subject.obs_records = vec![ObsRecord::Event {
+            time: 5.0,
+            event_type: EventType::Exact,
+            entry_time: 0.0,
+            cmt: 2,
+        }];
+        let p = &model.default_params;
+
+        assert!(
+            try_joint_pktte_shared_solve(&model, &subject, &p.theta, &[0.0]).is_none(),
+            "a joint PK-TTE model whose `[odes]` RHS reads model time must not take \
+             the #570 shared-solve path"
+        );
+        // …and the two-solve fallback still produces a finite, η-sensitive NLL.
         let nll = individual_nll(
             &model,
             &subject,

@@ -39,8 +39,14 @@ ferx-core/                       # repo root = ferx-core package + workspace roo
 ├─ api/ferx-core-public-api.txt  # public-API baseline, diffed in CI
 └─ crates/
    ├─ ferx-tools/                # depends on ferx-core
-   └─ ferx-cli/                  # depends on ferx-core; [[bin]] name = "ferx"
+   ├─ ferx-cli/                  # depends on ferx-core; [[bin]] name = "ferx"
+   └─ docs-lint/                 # dev tooling; depends on NOTHING (see Documentation)
 ```
+
+`docs-lint` sits outside the layering above: it is a structural linter for
+`docs/**/*.qmd`, it depends on no crate in the workspace (not even `ferx-core`),
+and nothing may depend on it. Keeping it dependency-free is what lets its CI job
+be seconds of compile instead of landing on the `ferx-core` compile path (#969).
 
 **The root package must stay `ferx-core`.** `ferx-r/src/rust/.cargo/config.toml`
 patches `ferx-core = { path = "../../../ferx-core" }` — the repo *root*. Moving
@@ -93,6 +99,64 @@ After cloning, activate the shared pre-commit hook (blocks commits that fail `ru
 ```bash
 git config core.hooksPath .githooks
 ```
+
+## Before you push: `tools/preflight.sh`
+
+**A green test suite is not a green build.** The CI feature sets are *not nested*:
+`cargo test --features ci,survival` compiles neither the `nn`-gated nor the
+`slow-tests`-gated source, so a file behind those cfgs can be broken while the
+entire suite passes. On #1133 exactly that happened — one struct literal in
+`src/estimation/nn_theta_gradient_tests.rs` turned three CI jobs red after a
+local run of 158 binaries / 4634 tests reported clean.
+
+So run the fast gates before pushing:
+
+```bash
+tools/preflight.sh            # fmt, the 5 cargo check feature sets, clippy, rustdoc, docs, public-API
+tools/preflight.sh check      # just the check matrix, for a tight edit loop
+tools/preflight.sh --list     # show the commands without running them
+```
+
+`.github/workflows/ci.yml` invokes this same script for its `Check`, `Clippy`,
+`Format`, `Rustdoc` and `Docs lint` jobs, and `.githooks/pre-commit` calls its `fmt` group, so the
+local gate, the hook and the CI gate cannot drift — the same contract
+`tools/update-public-api.sh` uses for the API baseline. **Add a new gate to the
+script, not to the workflow**; groups are enumerated once, in the `ALL_GROUPS`
+array. On failure it names the CI job that would have gone red.
+
+It does **not** cover the test jobs. `cargo check --tests` compiles the test
+targets and runs nothing, so `Tests + coverage (core)` can still go red after a
+green preflight. This gates compilation and lint, not behaviour. The one
+exception is the `docs` group, which *runs* `cargo test -p docs-lint`: that
+crate's gate is its test run — a filesystem walk over `docs/`, not a fit — and
+it also carries `cargo clippy -p docs-lint`, since the `clippy` group is scoped
+to `ferx-core` and its two library members and would leave it unlinted.
+
+`rustdoc` and `docs` are two different gates and the names are easy to swap.
+`rustdoc` denies rustdoc's own warnings on `src/**` doc comments — an intra-doc
+link that does not resolve, or that resolves to a `pub(crate)` item, renders in
+the HTML with its markdown brackets intact (`[<code>name</code>]`) and in
+rust-analyzer hover the same way. Fix those at the link: inline code for an
+internal target, a resolvable path (`[`crate::run_covariance`]`) for a public
+one. Never with a crate-level `#![allow(rustdoc::...)]` in `src/lib.rs` — that
+switches the lint off for every future link too, and
+`tests/preflight_owns_the_fast_gates.rs` fails if one appears. `docs` is the
+structural linter on `docs/**/*.qmd` described below.
+
+Two traps it exists to cover: clippy runs `--all-targets` (without it, every
+`#[cfg(test)]` module and all of `tests/` goes unlinted — #1023), and the
+workspace members need **package-qualified** features (`ferx-core/ci`, not `ci`,
+which fails outright — #1114).
+
+`tests/preflight_owns_the_fast_gates.rs` pins the whole arrangement, and the
+invariant worth knowing when editing the script is that **`run` exits rather
+than returns** on failure. That is not style. The first version returned a
+status through a group function and a `case … esac || { …; exit 1; }`, and bash
+suspends `errexit` for every command of an AND-OR list but the last — then
+carries that suspension into the called function's whole body. Four of the five
+`cargo check` lines could fail with the script printing `preflight OK` and
+exiting 0. The guard now fails each command position in turn behind a fake
+`cargo` and asserts a non-zero exit, so a gate that stops gating is a red test.
 
 ## Build & Run Commands
 
@@ -203,6 +267,44 @@ Any user-visible feature (new fit option, new estimator, new file-format directi
 - `docs/model-file/individual-parameters.qmd` for DSL syntax.
 - `docs/estimation/*.qmd` for estimator-specific behaviour.
 - `docs/faq.qmd` for user-facing explanations / comparisons to NONMEM / nlmixr2.
+
+### The docs are linted at PR time — `crates/docs-lint` (#1163)
+
+`docs/**/*.qmd` has a structural gate that runs on every PR (the `Docs lint` CI
+job, via `tools/preflight.sh docs`). Run it yourself after editing a page:
+
+```bash
+cargo run -p docs-lint -- --check          # what CI runs
+cargo run -p docs-lint -- --update-baseline
+```
+
+Four rules, all structural — it checks *shape*, never prose:
+
+| | Rule |
+|---|---|
+| R1 | a section with no subsections stays under 5,000 characters (~2,000 tokens), so a retrieval hit returns a usable chunk |
+| R2 | never skip a heading level (an `h1` followed by an `h3` attaches to the wrong parent) |
+| R3 | no two headings on a page may generate the same id |
+| R4 | internal links must resolve, **including the `#anchor`** |
+
+Two things to know before you fight it:
+
+- **R4 knows what pandoc actually generates**, which is rarely what a hand-written
+  anchor assumes. `## 3. Communication` is `#communication` — the number is
+  dropped. `## A — b` is `#a-b`, a *single* hyphen, because the em-dash is
+  deleted and the spaces around it collapse. `` ## Modeled duration (`D{n}`) ``
+  is `#modeled-duration-dn`. The algorithm and its traps live in
+  `docs/development/docs-lint.qmd` and in `crates/docs-lint/src/slug.rs`; read
+  one of them before hand-writing an anchor.
+- **R1 has a baseline** (`docs/.lint-baseline`) holding the pages that were
+  already too long when the gate landed. It is a ratchet: an entry may shrink,
+  never grow, and an entry naming a section that no longer exists is itself a
+  failure. Do not add new entries — split the section instead. For a chunk that
+  genuinely cannot be split, put `<!-- lint-disable R1 -->` on the line above its
+  heading **with a reason**, and keep that rare.
+
+`docs-lint` depends on nothing, so it compiles in seconds and never touches the
+`ferx-core` build cache. Keep it that way.
 
 ## Architecture
 

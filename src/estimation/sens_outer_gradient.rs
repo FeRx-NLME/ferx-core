@@ -2611,7 +2611,7 @@ pub fn subject_eta_dx_iov(
 /// `foce_subject_nll_iov(interaction = false)` builds (the stacked analogue of the
 /// non-IOV `subject_packed_gradient_foce`). `quant` maps an SB-local row to its
 /// original obs index. The marginal contributions are shared via
-/// [`censored_marginal_foce_grad`].
+/// `censored_marginal_foce_grad`.
 pub fn subject_packed_gradient_foce_iov(
     model: &CompiledModel,
     subject: &Subject,

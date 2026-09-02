@@ -248,6 +248,8 @@ structures with no scalar stationary point — combined error, several `σ`, per
 covariate-selected error, correlated residuals, M3 BLOQ, IIV-on-RUV, FREM, or a FIXed `σ` — fall
 back to `adam`, with the reason in `FitResult$warnings`.
 
+#### Why the default is 32 draws
+
 **The thing actually worth knowing about `σ`.** At `vi_mc_samples = 8` — the default before this
 was measured — a warfarin fit (`data/warfarin.csv`) returns `σ ≈ 0.0138` where AGQ
 (`n_agq = 9`) and FOCEI both give `0.010565`
@@ -256,7 +258,7 @@ width scales with `σ²`, an error that size makes every reported variational co
 too wide. This is **not** a defect in the `σ` update: `closed_form` gives `0.013810` and `adam`
 `0.013932` on the same data, and both stop showing it at higher draw counts.
 
-**Why the default is 32.** Measured against AGQ's `−285.977`, the OFV
+**The gap by draw count.** Measured against AGQ's `−285.977`, the OFV
 gap runs **9.6 units at 8 draws, 1.4 at 32, and 0.37 at 128** (`−285.606`), with `σ` +31%, +10% and
 +5% respectively. The draw count sets the noise floor the settling test measures against, so too
 few draws do not merely make the fit noisy — they change where it stops.
@@ -288,6 +290,8 @@ and a seed that fell into a bad basin (`σ = 0.079`, OFV `−34`) was correctly 
 so on a residual error under ~3% it is still worth checking `σ` against a `method = laplace` or
 `focei` fit rather than reading `converged` alone.
 :::
+
+#### If a VI fit lands short
 
 Three consequences worth carrying:
 

@@ -4,7 +4,7 @@ All notable changes to **ferx-core** are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
-(see the [Releases](https://ferx-nlme.github.io/ferx-core/development/sdlc.html#9-releases)
+(see the [Releases](https://ferx-nlme.github.io/ferx-core/development/sdlc.html#releases)
 section of the SDLC for the versioning policy).
 
 <!--
@@ -20,6 +20,27 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Changed
+- **`FitOptions::threads` now also caps a multi-start fit (#1115).** A pinned positive `threads`
+  was honored only when `n_starts <= 1`; with several starts the fan-out ran on the full-width
+  shared pool regardless, so a tool that pinned one thread per fit from a `PoolPlan` and asked
+  for multiple starts got its replicate-level pool *and* a full-width pool underneath every
+  replicate. The pin is now an upper bound on the whole `fit()` call. A multi-start fit that
+  pins `threads` below the core count is correspondingly slower than before, and unpinned
+  multi-start fits are unchanged.
+- **The four documentation sections the callout blind spot had been hiding are split into
+  addressable subsections (#1190).** ODE models' *Which regime am I in?* gains **Where the step
+  counts show up**, **Bounding what a stalled segment costs**, **Measured: an accuracy-limited
+  fit** and **Every feature works with every method**; the analytic transit closed form gains
+  **Scope (first version)** and **The flip-flop regime**; VI's *How `σ` is updated* gains **Why
+  the default is 32 draws** and **If a VI fit lands short**; adaptive dosing's *Keys* gains
+  **Writing an `observe` expression**. Nothing was deleted and every existing anchor still
+  resolves — the R1 baseline is one entry shorter than before this PR, not longer.
+- **`tools/render-docs.sh` renders the docs site; prefer it to a bare `quarto render docs`
+  (#1190).** Quarto's project input discovery skips any path containing a hidden (dot-prefixed)
+  directory component, so from a worktree under `.claude/worktrees/<name>/` a plain
+  `quarto render docs` discovers zero inputs: it writes `robots.txt` and `sitemap.xml`, renders no
+  page, warns about nothing and exits 0. The script stages `docs/` outside the dot directory when
+  it has to, and fails loudly on a zero-page render.
 - **The repo is now a cargo workspace, and the `ferx` binary moved into a `ferx-cli` package
   (#1114).** The installed binary is unchanged — still `ferx`, same arguments, same output — but
   building it from a source checkout now needs the workspace or the package named:
@@ -35,6 +56,22 @@ section of the SDLC for the versioning policy).
   on every row was fitted at `WT = 0`, indistinguishable from a genuine zero, and `present(WT)`
   reported it as present. The reader now stores `NaN` and warns, naming the covariate and the
   affected subjects, so the gap is either guarded with `present(...)`, imputed, or fails loudly.
+- **The five largest documentation sections are split into addressable subsections (#1162).**
+  `[fit_options]`'s 36 shared keys are grouped into seven tables (run control, outer optimizer,
+  inner loop, covariance, ODE tolerances, ODE stepper, data handling); FOCE's gradient-route
+  section leads with the decision and moves the scope history into named sections plus an FD
+  fallback table; SAEM's theta/sigma M-step, `ode_method = auto`, and the check-report code table
+  are likewise subdivided. The three heaviest `[fit_options]` key descriptions are cut to what
+  choosing the key needs, with the detail deep-linked into the pages that already carry it —
+  `ODE stepper selection` 909 → 367 words, `Inner loop (EBE)` 769 → 365, `VI-Specific Options`
+  747 → 378. Every previous anchor still resolves, eight already-broken in-page links are
+  repaired, and the site's `toc-depth` is raised to 4 so the new subsections appear in the
+  on-page table of contents.
+- **The docs content column is wider, and wide tables no longer run under the "On this page"
+  TOC (#1162).** `grid.body-width` goes from Quarto's 800px default to 1000px (a 749px → 895px
+  content column at 1512px wide), and the desktop table rule now actually contains an oversized
+  table: it set `display: table` with `overflow-x: auto`, which is inert, so a table wider than
+  the column drew over the margin TOC instead of scrolling inside itself.
 
 ### Added
 - **`ferx_tools::gam::gam_screen()`: GAM-based covariate pre-screening (#1114).** For each
@@ -51,6 +88,16 @@ section of the SDLC for the versioning policy).
   fewer than three usable subjects. Shrinkage above 30% warns, and so does an ETA whose
   shrinkage the fit did not report at all. `gam_screen_raw()` panics on a length mismatch
   instead of truncating to the shortest input.
+- **`PoolPlan` and `FitOptions::quiet()`: the two knobs a tool needs to run many fits (#1115).**
+  `PoolPlan::from_budget(total_threads, n_units)` splits a thread budget between the replicate
+  level and `fit()`'s own per-subject level (outer level first, so a 200-replicate bootstrap on
+  8 threads is 8 single-threaded fits at a time), `apply_to()` pins the inner fit, and
+  `install()` builds the outer Rayon pool with ferx's 32 MiB worker stack
+  (`FIT_RAYON_STACK_SIZE`) — a pool built by hand inherits the platform-default 2 MiB stack and
+  overflows on wide ODE+IOV analytic-gradient models. `FitOptions::default().quiet()` turns off
+  the per-iteration console output; every non-fatal message stays reachable on
+  `FitResult::warnings`, the optimizer-trace filename now included (it embeds a pid and a
+  timestamp, so a quiet caller could not otherwise learn where the trace went).
 - **A `present(COV)` condition for covariates that may be missing (#1111).** A missing covariate
   value is `NaN`, and division by it underflows to `0.0` here rather than erroring, so an
   unguarded `(CRCL/100)^THETA` silently zeroes the parameter on a row with no `CRCL`.
@@ -125,6 +172,113 @@ section of the SDLC for the versioning policy).
   top of them, so a tool and the CLI cannot diverge in how a model is loaded.
 
 ### Fixed
+- **The docs linter no longer reads a Quarto callout title as a section boundary (#1190).**
+  Pandoc lifts the heading that opens a `::: {.callout-*}` block into the callout header, so the
+  rendered page gets neither a section nor an anchor from it — but `docs-lint` counted all 37 of
+  them across 15 pages as real headings. That chopped each callout's body into chunks R1 never
+  measured whole (three oversized sections were hidden, and one baselined section was reported at
+  5,756 characters when it is 7,331 — all four are now split, see below), and registered ids R3
+  and R4 treated as addressable. A
+  heading *later* inside a callout is still a real section. Slug generation is fixed alongside it:
+  inside a code span `<op>` is literal text, not an HTML tag, so
+  `` ## Rules — `when signal <op> <value>` `` addresses as `#rules-when-signal-op-value` and no
+  longer truncates at the first placeholder. Checked against a full `quarto render` of all 86
+  pages, in both directions — every heading the parser computes is a section on the site, and
+  every section on the site is one the parser computes.
+- **A lagged `zero_order` absorption route is no longer dropped by the ODE engines that serve
+  diagnostics, the joint PK-TTE hazard and `simulate()` (#1171).** `zero_order(dur=D, lag=L)`
+  is delivered as a per-segment constant rate, admitted only when the segment sits fully inside
+  the window `[t_dose + L, t_dose + L + D]`, so the integrator has to break its timeline at the
+  window's onset as well as its end. The shared helper pushed only the *end*, leaving the start
+  unbracketed on the two builders that did not separately bracket the route onset — the rate was
+  then dropped for the whole window, and a model whose only input is a lagged `zero_order` read
+  **exactly zero everywhere** on those paths. The helper now emits both edges, so the timeline
+  and the containment test can no longer disagree in any builder. Affected:
+  the sdtab `IPRED` and compartment-state columns (and the `IWRES`/`CWRES`/`[derived]` values
+  computed from them), `[derived]` grid integrals, the **joint PK-TTE** cumulative hazard and
+  its contribution to the objective — which collapsed to the drug-free baseline `H0·t`,
+  removing the entire drug effect — the Markov/CTMM endpoint likelihood, the adaptive-dosing
+  window AUC signal, and `simulate()` event times, where a subject who should have had an event
+  was administratively censored. A **pure-Gaussian** fit's OFV and `predict()` are unaffected:
+  their predictor already carried the onset break, which is why no existing test caught this.
+  Anchored against a new NONMEM `ADVAN13` run (`nonmem_anchor/lagged_zo.ctl`, `D1`+`ALAG1` with
+  `RATE=-2`), which the fixed paths now match to the `$TABLE` print precision. The onset break is
+  also restored for a lagged **`first_order`**/`transit`/`weibull` route on those engines, whose
+  kernels step at the onset rather than losing the window; those move within solver tolerance
+  rather than from zero, so no fit result changes materially.
+- **An `[odes]` right-hand side that is nonlinear in the compartment amounts is no longer
+  served by the closed-form fast path (#1149).** Linearity was established by evaluating the
+  right-hand side one compartment at a time with every other amount held at zero, so a term
+  that only switches on away from those points was invisible to it: a product of two amounts
+  (`- KON*central*periph`, the target-binding/TMDD shape) is exactly zero whenever either is
+  zero, and a branch testing an amount (`if (central > 10)`) was never entered, because the
+  largest amount probed was 2. Such models were admitted to the closed form, which does not
+  evaluate the right-hand side at all, so the term was **dropped from the predictions** —
+  the same silent failure as #1124, with no time variable involved. Identification now also
+  checks the right-hand side against the recovered linear system away from the axes, across
+  six decades of amount. Models that are linear in the amounts are unaffected and keep the
+  fast path, including those whose coefficients are arbitrary functions of `θ`, `η`, and
+  covariates.
+- **An `EVID=2` record no longer aborts a fit on a parameter-static subject (#1124 review).**
+  Any subject routed to the event-driven walker while its PK parameters are constant — an
+  `EVID=3/4` reset, or (since the change above) an `[odes]` right-hand side that reads model
+  time — had its per-event parameter snapshots built with the `EVID=2` rows omitted, and the
+  walker asserts one snapshot per record. The run failed on an assertion rather than
+  returning a diagnostic, in release builds as well as debug (the assertion is
+  `assert_eq!`, not `debug_assert_eq!`; it unwinds, so from R it surfaces as an opaque
+  error rather than a message naming the subject). Reaching it needed only a dataset
+  carrying `EVID=2` rows alongside a varying column the model does not reference, because the
+  irrelevant-covariate pruning clears those rows' covariate snapshots while keeping their
+  times. Both the ODE and the analytical event-driven engines were affected.
+- **A pre-arrival observation on a model-time-reading `[odes]` RHS no longer puts `NaN`
+  into the FOCEI objective (#1124 review).** A subject observed before its first dose — a
+  baseline sample — took the static superposition walk for its analytic sensitivities, and
+  that walk resolves `TAD`'s anchor by a fold over doses at or before the segment start,
+  leaving it at `-inf` and evaluating the right-hand side with `TAD = NaN`. The provider
+  still reported success, so the `NaN` gradient reached the optimiser instead of falling
+  back to finite differences. Such subjects now take the event-driven walk, which seeds the
+  anchor at the first arrival. Affected fits change their reported `gradient_method` and
+  objective.
+- **Steady-state (`SS=1`) dosing on a model-time-reading `[odes]` RHS now takes finite
+  differences on both loops (#1124).** The three gates that decline the analytic jet for this
+  combination asked a predicate that could not see the bare `TIME` spelling, so a
+  `TIME`-reading right-hand side reached the analytic steady-state equilibration while the
+  identical model written with `T` correctly declined. Affected fits report a different
+  `gradient_method` and a correspondingly different objective. This changes only which
+  gradient is used; the steady-state *value* for such a model is wrong on every engine and is
+  tracked separately in #1139.
+- **An `[odes]` RHS that reads `TAD` is no longer silently dropped from the predictions
+  (#1124).** A model whose right-hand side read the time-after-dose built-in — for example
+  `- CL/V*central*(1 + 0.3*TAD)` on a mixed `first_order` + `zero_order` absorption model —
+  was served by the closed-form modified-release fast path, which never evaluates that
+  right-hand side. The `TAD` term was **absent** from the predictions, not approximated:
+  output was bit-identical to the same model with the term deleted, reaching 8× the correct
+  concentration by 12 h, with no error, no warning, and `converged: true`. Because the value
+  is wrong, the error reached `IPRED`, the OFV, residuals, and every downstream diagnostic.
+  Such models now integrate on the event-driven ODE path, which evaluates the right-hand side
+  as written. The same routing covers `TAFD`, `T`/`t`, and `TIME`, including when read only
+  from inside an `if` condition (measured 40% error, all four spellings) — the closed form's
+  time-invariance probe samples two times and could not see any of them. Models that do not
+  read model time are unaffected and keep the fast path.
+- **An `[odes]` RHS that reads `TAD` together with a lagtime no longer returns `NaN`
+  predictions (#1110).** The dense predictor anchored `TAD` on doses that had already arrived,
+  and under a lagtime none has at the first segment's start, so every prediction came back
+  `NaN`. These models now take the event-driven predictor, whose timeline starts at the lagged
+  arrival. (#1073, released alongside this, independently gives the dense predictor a
+  pre-arrival anchor, so the two engines now agree to 6e-12 on such a model rather than one of
+  them being unusable.) One part of #1110 stays open and is **not** fixed here: the variance
+  path used by `[diffusion]` / EKF models still reaches the dense predictor with empty
+  parameter slices, returning `p_obs = NaN` and `ipred = 0` for any `TAD`-reading right-hand
+  side, with or without a lagtime (#1131).
+- **41 dead links and 11 duplicate anchors in the documentation (#1163).** Every internal
+  documentation link now resolves, anchor included: numbered headings (`## 3. Communication` is
+  addressed as `#communication`, not `#3-communication`), anchors hand-written with a double
+  hyphen where the generated id has one, and links pointing at sections that never existed.
+  Repeated headings on a page — four sections called "Syntax" on the absorption page, addressed
+  as `#syntax`, `#syntax-1`, `#syntax-2`, `#syntax-3` — were given distinct titles, so some
+  anchors on the published site changed. A new `docs-lint` check keeps all four properties true
+  on every PR; see the [Docs linter](https://ferx-nlme.github.io/ferx-core/development/docs-lint.html)
+  page.
 - **An EVID=3/4 reset now re-seeds `[odes] init(...)` from the reset row's own covariates
   (#1133).** A reset row is a NONMEM data record — `$PK` runs at it — but ferx restarted the
   episode using the *previous* record's covariate snapshot, so a covariate-driven
@@ -187,19 +341,34 @@ section of the SDLC for the versioning policy).
   the result still exposed `converged: true` to programmatic consumers. Such fits are now demoted,
   omit the misleading "increase `vi_iters`" warning, and carry the critical structured warning
   code `vi_bad_basin`.
-- **An `[odes]` RHS that reads `TAD` under an estimated lagtime now routes to finite
-  differences instead of returning a wrong analytic gradient (#1070).** `TAD` is handed to the
-  ODE right-hand side as a plain constant, but its anchor *is* the dose's lagged arrival
-  (`t_dose + ALAG`), so the `∂TAD/∂ALAG = −1` term was silently missing from the analytic
-  η/θ gradient — everywhere the trajectory is integrated, not just at a dose event. Predictions
-  were unaffected, so nothing failed visibly; but FOCEI builds its `h` matrix from that same
-  gradient, so the error reached the reported OFV. Measured against finite differences of the
-  production predictor, the lag axis was 2.8% wrong at the first observation and 70% wrong by
-  `t = 8`, while every other axis stayed exact. Against NONMEM 7.6.0 the analytic route was
-  0.176 OFV off; the FD route agrees to 0.0003 (`nonmem_anchor/tad_lag_*`). Affected models are
-  now correct but slower, on both the outer and inner loops and under IOV; the fit reports
-  `gradient_method_inner = finite differences`. Models reading `TAD` **without** a lagtime, or
-  reading `TAFD` **with** one, are unaffected and keep the analytic route.
+- **The analytic gradient of an `[odes]` RHS that reads `TAD` under an estimated lagtime is now
+  correct (#1070).** `TAD` was handed to the ODE right-hand side as a plain constant, but its
+  anchor *is* the dose's lagged arrival (`t_dose + ALAG`), so the `∂TAD/∂ALAG = −1` term was
+  silently missing from the analytic η/θ gradient — everywhere the trajectory is integrated, not
+  just at a dose event. Predictions were unaffected, so nothing failed visibly; but FOCEI builds
+  its `h` matrix from that same gradient, so the error reached the reported OFV. Measured
+  against finite differences of the production predictor, the worst axis was 66% wrong
+  (`∂f/∂η_ALAG`) and 68% wrong (`∂f/∂θ_ALAG`); against NONMEM 7.6.0 the objective was 0.176 off
+  on a single-dose anchor and 0.107 on a two-dose one. `TAD` is now threaded through the
+  sensitivity walks as a dual, so those become 0.0004 and 0.032 — the same values the finite-
+  difference route gives (`nonmem_anchor/tad_lag_*`). Affected models keep the fast analytic
+  route on both loops and under IOV, including when the lagtime carries inter-occasion
+  variability. Predictions are bit-identical to before. Models reading `TAD` **without** a
+  lagtime, or reading `TAFD` **with** one, were always exact and are untouched. `TAD` combined
+  with a **steady-state** dose still routes to finite differences, under the separate
+  non-autonomous-RHS rule.
+
+  Two consequences worth knowing before you re-run an affected model. First, `gradient_method =
+  auto` resolves this model class to **L-BFGS** where it previously chose BOBYQA, because the
+  choice keys on whether an analytic outer gradient is available — so the optimizer changes as
+  well as the gradient. Set `optimizer = bobyqa` to keep the previous behaviour. Second, the
+  second-order block `∂²f/∂η_ALAG²` is improved but **not** exact (6.4e-1 wrong before, 2.2e-1
+  after); it does not affect the objective value, but it does feed the analytic outer gradient
+  and the covariance step, so standard errors and the optimizer's search direction on these
+  models carry that residual until #1075 lands. The `TAD` value in the window **before the first
+  dose arrives** is differentiated consistently with whatever convention the predictor uses, but
+  that convention itself is still open (#1110) and is not anchored against NONMEM — NONMEM has
+  no `TAD` built-in in `$DES`, so there is nothing external to anchor it to.
 - **A lagged dose's covariate snapshot no longer stretches to its arrival (#1073).** With a
   lagtime, ferx broke the integration timeline only at the arrival `t + ALAG`, never at the dose
   row's own time, so the dose row's covariate / IOV snapshot governed everything up to the

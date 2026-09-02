@@ -39,7 +39,7 @@ the transit rate constant. The input integrates to the full dose
 to a first-order (Bateman) input with rate `1/MTT`. Because `n` is continuous,
 the absorption *shape* itself is an estimable parameter.
 
-### Syntax
+### Syntax — transit
 
 Add `transit(...)` to the right-hand side of the depot compartment's ODE:
 
@@ -229,7 +229,9 @@ absorption with `ka = 1/MTT`.
 it (the flip-flop regime) ferx routes the model to its ODE twin automatically — see
 the flip-flop note below.
 
-**Scope (first version).** This analytic model supports single and multiple
+### Scope (first version)
+
+This analytic model supports single and multiple
 **bolus** doses into the depot (`CMT=1`), bioavailability, lag time, and a `central`
 initial amount. A model whose disposition switches mid-profile — a **time-varying
 covariate** or a `TIME`-dependent structural parameter — or that carries
@@ -250,6 +252,8 @@ non-depot (`CMT≠1`) dose, and a `depot` initial amount are still rejected** wi
 message — use the `transit()` ODE forcing above for those. The two paths agree to ODE-solver
 tolerance (`tests/transit_analytic_equivalence.rs`), so the forcing model is the
 drop-in choice when you need a feature the closed form does not yet cover.
+
+### The flip-flop regime
 
 When the disposition rate reaches or exceeds the transit rate `KTR = (n+1)/mtt`
 (the **flip-flop** regime — a slow-absorption depot whose absorption rate-limits a
@@ -409,7 +413,7 @@ is a complete self-contained analytic IG model:
 cargo run --release -p ferx-cli -- examples/one_cpt_ig.ferx --simulate
 ```
 
-## Worked example
+## Worked example — analytic transit
 
 [`examples/transit_savic.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/transit_savic.ferx)
 is a complete one-compartment oral model with built-in transit absorption. Run
@@ -443,7 +447,7 @@ with mean absorption time `MAT` (the distribution mean μ) and relative dispersi
 integrates to the full dose (`∫₀^∞ R_in dt = F·Dose`) and `R_in = 0` for
 `tad ≤ 0`; the essential singularity at `tad → 0` is finite (`R_in → 0`).
 
-### Syntax
+### Syntax — inverse-Gaussian
 
 Add `igd(...)` to the **central** compartment's ODE. Because the input rate
 carries mass (not concentration), write the central state as an **amount** and
@@ -476,13 +480,13 @@ convention:
   feed a compartment — see [Biphasic (parallel) absorption](#biphasic-parallel-absorption)
   below for the Freijer sum-of-two.
 
-### Shared behaviour
+### Shared behaviour — inverse-Gaussian
 
 `igd` reuses the same dose machinery as `transit`, so the rules are identical:
 
 - **Dose routing** — the dose feeds `igd` over time and is **not** also added as
   a bolus; the dose record targets the `igd` compartment (here `central`). See
-  [Dose routing](#dose-routing--the-dose-feeds-the-function-not-a-bolus) above.
+  [Dose routing](#dose-routing-the-dose-feeds-the-function-not-a-bolus) above.
 - **Bioavailability `F`, lagtime, multiple-dose superposition, and IOV** behave
   exactly as for `transit`. Do not multiply `igd(...)` by `F`.
 - **Parameter domains** `mat > 0`, `cv2 > 0` are validated at typical values
@@ -493,7 +497,7 @@ convention:
   infusion as a zero-order source feeding the kernel); a `[diffusion]` block
   (SDE/EKF) into the input-rate compartment is still rejected with a clear error.
 
-### Worked example
+### Worked example — inverse-Gaussian
 
 [`examples/igd_inverse_gaussian.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/igd_inverse_gaussian.ferx)
 is a complete one-compartment oral model with inverse-Gaussian absorption. Run it
@@ -578,7 +582,7 @@ For `beta < 1` the rate diverges as `tad → 0⁺`, but the spike is integrable
 `∫R_in = F·Dose` holds) — the value is *not* capped, and the adaptive ODE solver
 resolves it with small steps.
 
-### Syntax
+### Syntax — Weibull
 
 Add `weibull(...)` to the **central** compartment's ODE, writing the state as an
 **amount** and converting to concentration in `[scaling]` (the same convention as
@@ -607,7 +611,7 @@ Add `weibull(...)` to the **central** compartment's ODE, writing the state as an
   input-rate term: it may appear **once** per `d/dt` line and must not be scaled,
   negated, or parenthesised.
 
-### Shared behaviour
+### Shared behaviour — Weibull
 
 `weibull` reuses the same dose machinery as `transit`/`igd`:
 
@@ -631,7 +635,7 @@ analytical `pk` (see the error rule below). Because the forcing is evaluated ove
 gradients — this generic input-rate forcing is the *only* exact-gradient route for
 Weibull (it has no Phase-3 closed form to fall back on).
 
-### Worked example
+### Worked example — Weibull
 
 [`examples/weibull_absorption.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/weibull_absorption.ferx)
 is a complete one-compartment oral model with Weibull absorption. Run it on
@@ -655,7 +659,7 @@ for `tad ≤ 0` and `tad > dur`. This is the same constant-rate input as a NONME
 modeled-duration infusion (`RATE=−2` / `D1`, #324), exposed as an `[odes]`
 input-rate function so it can drive any compartment.
 
-### Syntax
+### Syntax — zero-order
 
 `zero_order` takes a **single** named argument `dur`. Add it to the compartment
 the dose feeds — central directly, or a depot for a *sequential* (zero-then-first-order)
@@ -691,9 +695,11 @@ term (there is no separate `sequential` keyword):
   of a `mixed` model — see [Parallel / mixed absorption](#parallel-mixed) below.
   At most **one** `zero_order(...)` term may feed a given compartment.
 
-### Shared behaviour
+### Shared behaviour — zero-order
 
-`zero_order` reuses the same dose machinery as `transit`/`igd`/`weibull`:
+`zero_order` reuses the same dose machinery as `transit`/`igd`/`weibull`.
+
+#### Dose handling
 
 - **Dose routing** — the dose feeds `zero_order` over its window and is **not**
   also added as a bolus; the depot/central state stays an amount.
@@ -707,10 +713,25 @@ term (there is no separate `sequential` keyword):
   infusion as a zero-order source feeding the kernel); a `[diffusion]` block
   (SDE/EKF) into the input-rate compartment is still rejected with a clear error.
 
-The hard cutoff at `tad = dur` is handled exactly: ferx breaks the integration
-timeline at the window end and delivers the input as a per-segment constant (the
-way an infusion is injected), so the absorbed mass is exact — not smeared across
-the step.
+#### The window is bracketed at both edges
+
+The window is handled exactly: ferx breaks the integration timeline at **both**
+edges — the onset `t_dose + lagtime` and the cutoff `t_dose + lagtime + dur` — and
+delivers the input as a per-segment constant (the way an infusion is injected), so
+the absorbed mass is exact, not smeared across the step.
+
+Both edges matter, because a segment receives the constant rate only if it lies
+*entirely* inside the window. Bracketing only the cutoff leaves the segment
+straddling the onset failing that test, which drops the rate for the **whole**
+window rather than mis-resolving one step. Until [#1171] that was the behaviour on
+the engines serving sdtab, `[derived]` grid integrals, the joint PK-TTE hazard and
+`simulate()` whenever the route carried its own `lag=`: a model whose only input was
+a lagged `zero_order` reported exactly `0.0` at every observation, while the
+objective — which segments on a different code path — was correct throughout.
+
+  [#1171]: https://github.com/FeRx-NLME/ferx-core/issues/1171
+
+#### Analytic sensitivity across the moving boundary
 
 ::: {.callout-note}
 ## Sensitivity of `zero_order(dur)` is analytic (#530)
@@ -762,7 +783,7 @@ diverge for shape `β < 1` (an integrable spike, not a finite jump), so no close
 saltation exists there.
 :::
 
-### Worked examples
+### Worked examples — zero-order sensitivity
 
 [`examples/zero_order_absorption.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/zero_order_absorption.ferx)
 is a one-compartment model with zero-order input, and
@@ -937,7 +958,7 @@ analytic under IOV too (#486); the only holdouts are `weibull` + lagtime and any
 combined with a **steady-state** dose (the dual SS equilibration does not spread the
 forcing over the cycle).
 
-### Worked examples
+### Worked examples — analytic gradients
 
 [`examples/parallel_absorption.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/parallel_absorption.ferx)
 and

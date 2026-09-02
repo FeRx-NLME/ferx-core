@@ -55,8 +55,8 @@ pub use fit::{fit, fit_from_files};
 pub use levels::{bind_theta_levels, level_map as theta_level_map};
 pub use output_columns::tafd_tad_for_subject;
 pub(crate) use output_columns::{compute_extra_output_columns, trapezoid};
-pub use pool::configure_global_thread_pool;
 pub(crate) use pool::{build_fit_pool, default_fit_pool};
+pub use pool::{configure_global_thread_pool, PoolPlan, FIT_RAYON_STACK_SIZE};
 pub(crate) use postfit::{
     absorption_flip_flop_ebe_warning, boundary_estimate_warning, compute_eps_shrinkage,
     compute_eta_shrinkage, compute_kappa_shrinkage, compute_kappa_shrinkage_by_occ,
@@ -97,7 +97,7 @@ pub(crate) use fit::{
 #[cfg(test)]
 pub(crate) use output_columns::build_indiv_map;
 #[cfg(test)]
-pub(crate) use pool::{cap_default_threads, default_thread_count, FIT_RAYON_STACK_SIZE};
+pub(crate) use pool::{cap_default_threads, default_thread_count, effective_default_threads};
 #[cfg(test)]
 pub(crate) use postfit::{
     diagnostic_details, high_correlation_pairs, packed_guard_side, should_run_sir_fallback,
@@ -169,6 +169,10 @@ mod multistart_prefers_tests;
 #[cfg(test)]
 #[path = "tests/build_indiv_map_tests.rs"]
 mod build_indiv_map_tests;
+
+#[cfg(test)]
+#[path = "tests/quiet_fit_tests.rs"]
+mod quiet_fit_tests;
 
 #[cfg(test)]
 #[path = "tests/tests.rs"]

@@ -85,7 +85,7 @@ fn paths_equivalent(a: &str, b: &str) -> bool {
 ///
 /// - Neither given → `Err` (nothing to fit against).
 /// - Only one given → that one, no warning.
-/// - Both given and equal (see [`paths_equivalent`]) → the shared path, no
+/// - Both given and equal (see `paths_equivalent`) → the shared path, no
 ///   warning.
 /// - Both given and different → `external_path` wins; a warning is returned
 ///   (not printed — see "Warning and Error Conventions" in CLAUDE.md) for the

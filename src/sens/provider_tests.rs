@@ -11208,3 +11208,282 @@ mod theta_gather_sens {
         );
     }
 }
+
+/// `MR_MIXED_1CPT` with a `TAD` factor on the elimination term — the shape the
+/// closed form used to admit and serve without ever evaluating that term (#1124).
+const MR_MIXED_1CPT_TAD: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVFZO(0.4, 0.05, 0.95)
+  theta TVKA(1.5, 0.05, 24.0)
+  theta TVDUR(2.0, 0.1, 12.0)
+  theta TVLAG(1.0, 0.001, 6.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV * exp(ETA_V)
+  FZO = TVFZO
+  FZO1 = 1 - TVFZO
+  KA = TVKA
+  DUR = TVDUR
+  LAG = TVLAG
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = FZO1*first_order(ka=KA, lag=LAG) + FZO*zero_order(dur=DUR) - CL/V*central*(1.0 + 0.3*TAD)
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+/// #1124 on the **gradient** side. `mr_scope` now declines a `TAD`-reading RHS,
+/// so the jet comes from the ODE provider instead of the closed form; that jet
+/// must agree with finite differences of the production predictor.
+///
+/// This is the parity check CLAUDE.md requires whenever an analytic sensitivity
+/// route changes. It is also the assertion the closed form could not have
+/// satisfied: it dropped the `TAD` term from the value *and* from every
+/// derivative, so it agreed with FD **of itself** while disagreeing with FD of
+/// what production now predicts.
+///
+/// Two doses, so `TAD` genuinely re-anchors partway through the record interval —
+/// under a single dose `TAD == TAFD` and the term this test exists for is
+/// indistinguishable from one that was never broken.
+#[test]
+fn tad_reading_mr_shaped_model_takes_a_route_that_matches_fd() {
+    let model = parse_model_string(MR_MIXED_1CPT_TAD).expect("parse");
+    // Sample times deliberately avoid `LAG = 1.0`, `DUR = 2.0`, and the second
+    // dose's arrival at `6 + LAG`. On a moving dose boundary the analytic
+    // derivative is one-sided by design while a central difference averages
+    // across the kink, so the two disagree there for reasons that have nothing to
+    // do with this fix (see `docs/estimation/foce.qmd`, "Sampling exactly on a
+    // moving dose boundary") — measured 2× on `df_dtheta` with `t = 1.0` and
+    // `t = 2.0` in the list, on the *unmodified* fixture too.
+    let mut subject = oral_subject(&[0.4, 0.9, 1.7, 2.6, 3.4, 7.3, 11.1]);
+    subject
+        .doses
+        .push(DoseEvent::new(6.0, 100.0, 1, 0.0, false, 0.0));
+    let theta = [5.0, 50.0, 0.4, 1.5, 2.0, 1.0];
+    let eta = [0.1, -0.05];
+
+    // The premise: the fast path must have stepped aside, on all three entries.
+    assert!(
+        crate::pk::modified_release::mr_subject_sensitivities(&model, &subject, &theta, &eta)
+            .is_none(),
+        "the closed form must decline a `TAD`-reading RHS"
+    );
+    assert!(
+        crate::pk::modified_release::mr_subject_eta_grad(&model, &subject, &theta, &eta).is_none()
+    );
+    assert!(crate::pk::modified_release::mr_predictions(&model, &subject, &theta, &eta).is_none());
+
+    check_full_provider_vs_fd(&model, &subject, &theta, &eta);
+}
+
+/// A **pre-arrival observation** on a `TAD`-reading RHS must not produce `NaN`
+/// sensitivities. This is what the `ode_tvcov_supported` widening is actually
+/// for.
+///
+/// The static superposition walk resolves `TAD`'s anchor as
+/// `doses.filter(|dt| dt <= t_start).fold(NEG_INFINITY, f64::max)`, so a segment
+/// beginning before the first dose leaves it at `-inf` and the RHS is evaluated
+/// with `TAD = NaN`. The event-driven walk seeds the same variable at the first
+/// arrival instead — #1073's pre-arrival anchor, which the static walk never
+/// received. Production's *value* has been finite since #1073; the analytic
+/// gradient had not caught up.
+///
+/// Measured with the gate asking the narrow predicate, so the subject fell to the
+/// static walk: `f = [0.0, NaN, NaN, NaN, NaN, NaN]`, with 10 non-finite `∂f/∂η`
+/// and 30 non-finite `∂f/∂θ` entries. The provider returns `Some`, so those
+/// `NaN`s flow straight into the FOCEI objective rather than falling back to
+/// finite differences.
+///
+/// That measurement was taken on the fixture *before* the `init(central) = BASE`
+/// seed below, which is why `f[0]` reads `0.0` rather than a baseline value: with
+/// no seed the pre-arrival state was identically zero. The seed changes that entry
+/// and nothing else about the defect — the `NaN`s came from the anchor, not from
+/// the zero. See the seed's own comment for why it is load-bearing.
+///
+/// Note what this test is *not* pinning. The widening was first justified by the
+/// reset case — `subject.has_resets()` being absent from the trigger list while
+/// present in the value path's condition. That turned out not to be measurable:
+/// a reset + `TAD` subject on the static walk passes `check_full_provider_vs_fd`.
+/// The reason is *not* that the static walk re-anchors `TAD` across a reset —
+/// neither walk does. Both fold over dose times only (`ode_provider.rs`'s
+/// `filter(|dt| dt <= t_start)` and `predictions.rs`'s fold over `d.time + lag`),
+/// and neither consults `reset_floor`, which is tracked but unused for this. They
+/// agree because both ignore the reset, so the parity check cannot see it. The
+/// pre-arrival window is the case that genuinely breaks, and it is the one
+/// asserted here.
+#[test]
+fn a_pre_arrival_observation_does_not_nan_the_analytic_sensitivities() {
+    // `init(central) = BASE` is load-bearing, not decoration. Without it both
+    // forcings are zero before the first dose and `central` is identically zero
+    // there, so `(1.0 + 0.3*TAD)` multiplies zero and every quantity
+    // `check_full_provider_vs_fd` compares at the pre-arrival observation is
+    // `0.0` vs `0.0`. That is CLAUDE.md's `g(x-) = 0` trap verbatim: the test
+    // would still catch a *NaN* anchor (NaN * 0 is NaN) but not a *wrong* finite
+    // one. Seeding a baseline makes the incoming side a real quantity, so a
+    // mis-anchored `TAD` moves the prediction and FD sees it. Same device as
+    // `modified_release::tests::rerouting_an_init_seeded_rhs_does_not_move_the_predictions`.
+    //
+    // `TVBASE` is appended *after* `TVLAG` so the existing θ indices are
+    // unchanged and the shared fixture's `theta` ordering still holds.
+    let src = MR_MIXED_1CPT_TAD
+        .replace("first_order(ka=KA, lag=LAG)", "first_order(ka=KA)")
+        .replace(
+            "  omega ETA_CL ~ 0.09",
+            "  theta TVBASE(30.0, 0.1, 500.0)\n  omega ETA_CL ~ 0.09",
+        )
+        .replace("  LAG = TVLAG", "  LAG = TVLAG\n  BASE = TVBASE")
+        .replace("[odes]\n", "[odes]\n  init(central) = BASE\n");
+    assert!(
+        src.contains("init(central) = BASE") && src.contains("theta TVBASE"),
+        "the init-seed derivation must have applied"
+    );
+    // Same guard as the sibling below: a respelled fixture would make this
+    // `.replace` a no-op, the route lag would become the trigger in
+    // `ode_tvcov_supported`, and the test would pass via a trigger that predates
+    // the widening while pinning nothing about the pre-arrival window.
+    assert!(
+        !src.contains("lag=LAG"),
+        "the derivation must actually have removed the route lag"
+    );
+    let model = parse_model_string(&src).expect("parse");
+    // Doses at 1.0 and 6.0 with the first observation at 0.4 — inside the
+    // pre-arrival window, where no dose qualifies as the `TAD` anchor.
+    let subject = subject_with_doses_and_resets(
+        vec![
+            DoseEvent::new(1.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(6.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &[0.4, 1.7, 2.6, 3.4, 7.3, 11.1],
+        Vec::new(),
+    );
+    assert!(
+        subject.obs_times[0] < subject.doses[0].time,
+        "precondition: the first observation must precede the first dose"
+    );
+    // Seventh entry is `TVBASE`, appended after `TVLAG` by the derivation above.
+    let theta = [5.0, 50.0, 0.4, 1.5, 2.0, 1.0, 30.0];
+    let eta = [0.1, -0.05];
+
+    let sens = subject_sensitivities(&model, &subject, &theta, &eta)
+        .expect("the analytic route must serve this subject");
+    // The whole point of the `init` seed: the pre-arrival observation must carry a
+    // *non-zero* prediction, or the parity check below compares 0.0 to 0.0 and
+    // cannot distinguish a correct anchor from a wrong one.
+    assert!(
+        sens.obs[0].f.abs() > 1e-6,
+        "obs 0 is at t={} (pre-arrival) and must be non-degenerate, got f={} — \
+         without a live incoming side this test only catches a NaN anchor",
+        subject.obs_times[0],
+        sens.obs[0].f
+    );
+    for (i, o) in sens.obs.iter().enumerate() {
+        assert!(o.f.is_finite(), "obs {i}: f is {}", o.f);
+        assert!(
+            o.df_deta.iter().all(|x| x.is_finite()),
+            "obs {i}: non-finite df/deta {:?}",
+            o.df_deta
+        );
+        assert!(
+            o.df_dtheta.iter().all(|x| x.is_finite()),
+            "obs {i}: non-finite df/dtheta {:?}",
+            o.df_dtheta
+        );
+    }
+    // …and the jet is not merely finite but right.
+    check_full_provider_vs_fd(&model, &subject, &theta, &eta);
+}
+
+/// The same parity check for a `TAD`-reading model with **no lagtime** — the
+/// class the `ode_tvcov_supported` widening actually moves.
+///
+/// `tad_reading_mr_shaped_model_takes_a_route_that_matches_fd` does not cover it:
+/// that fixture carries `first_order(ka=KA, lag=LAG)`, and a per-route absorption
+/// lag is its own entry in `ode_tvcov_supported`'s trigger list, so that subject
+/// took the event-driven dual walk before the widening as well. Strip the lag and
+/// the only remaining trigger is the model-time clause itself, which is what
+/// changed — such a subject used to fall through to the *static* superposition
+/// walk (`integrate_g`) for its jet while production integrated the value
+/// event-driven.
+///
+/// (Not the test immediately above: that one strips the same lag in its own first
+/// statement. It differs from this one only in dose schedule — it observes inside
+/// the pre-arrival window, this one entirely after the first dose — so the two are
+/// complementary, not duplicates, and neither is redundant with the other.)
+///
+/// CLAUDE.md requires a `Dual2`-vs-FD parity test for any change to an analytic
+/// sensitivity route, and this is the route that changed. The preconditions
+/// assert the fixture really is trigger-free apart from model time, so the test
+/// cannot quietly become a second copy of the one above.
+#[test]
+fn tad_reading_model_without_a_lagtime_takes_a_route_that_matches_fd() {
+    // Derived from the fixture above by removing the per-route lag, so the two
+    // cannot drift apart on anything else.
+    let src = MR_MIXED_1CPT_TAD.replace("first_order(ka=KA, lag=LAG)", "first_order(ka=KA)");
+    assert!(
+        !src.contains("lag=LAG"),
+        "the derivation must actually have removed the route lag"
+    );
+    let model = parse_model_string(&src).expect("parse");
+
+    let mut subject = oral_subject(&[0.4, 0.9, 1.7, 2.6, 3.4, 7.3, 11.1]);
+    // Two doses, so `TAD` genuinely re-anchors partway through the record
+    // interval — under a single dose `TAD == TAFD`.
+    subject
+        .doses
+        .push(DoseEvent::new(6.0, 100.0, 1, 0.0, false, 0.0));
+    let theta = [5.0, 50.0, 0.4, 1.5, 2.0, 1.0];
+    let eta = [0.1, -0.05];
+
+    // Preconditions: model time must be the *only* reason this subject reaches
+    // the event-driven walk. Without these the test would pass via a trigger that
+    // predates the widening and prove nothing about it.
+    assert!(
+        !model.has_lagtime() && !model.has_route_absorption_lag(),
+        "fixture must carry no lagtime of either kind"
+    );
+    assert!(
+        !subject.has_tv_covariates() && !subject.has_resets() && !subject.has_periodic_ss_dose(),
+        "fixture subject must carry no trigger of its own"
+    );
+    // Enumerating the trigger list by hand is how a precondition set drifts: this
+    // block once claimed to rule out "every other trigger" while asserting five of
+    // seven (`has_modeled_dose` and `has_rate_defined_under_f` were missing). Ask
+    // the gate itself instead — build the twin with the model-time clause removed
+    // and require it to decline. That is one assertion, and it cannot go stale when
+    // a trigger is added.
+    {
+        let autonomous = parse_model_string(&src.replace("*(1.0 + 0.3*TAD)", "")).expect("parse");
+        assert!(
+            !crate::pk::model_uses_time_anywhere(&autonomous),
+            "the twin must actually be autonomous, or it proves nothing"
+        );
+        assert!(
+            !crate::sens::ode_provider::ode_tvcov_supported(&autonomous, &subject),
+            "with model time removed the subject must fall out of the event-driven \
+             walk — otherwise some *other* trigger is carrying this fixture and the \
+             assertions below are not about the model-time clause"
+        );
+    }
+    assert!(
+        crate::pk::model_uses_time_anywhere(&model),
+        "…and it must read model time, which is the clause under test"
+    );
+    assert!(
+        crate::sens::ode_provider::ode_tvcov_supported(&model, &subject),
+        "so the subject must take the event-driven dual walk"
+    );
+
+    check_full_provider_vs_fd(&model, &subject, &theta, &eta);
+}

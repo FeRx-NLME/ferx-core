@@ -37,7 +37,7 @@ pub(crate) fn theta_packs_log(theta_lower: f64) -> bool {
 ///          log(sigma_1), ..., log(sigma_m)]
 ///
 /// Theta packing depends on whether the user's `theta_lower[i]` allows
-/// negatives — see [`theta_packs_log`].
+/// negatives — see `theta_packs_log`.
 pub fn pack_params(params: &ModelParameters) -> Vec<f64> {
     let mut v = Vec::new();
 
@@ -240,7 +240,7 @@ pub fn unpack_params(v: &[f64], template: &ModelParameters) -> ModelParameters {
 /// entries are held fixed. Layout mirrors [`pack_params`]:
 ///
 /// - Theta: `template.theta_fixed[i]`.
-/// - Omega Cholesky L[i,j] is fixed iff either `omega_fixed[i]` or
+/// - Omega Cholesky `L[i,j]` is fixed iff either `omega_fixed[i]` or
 ///   `omega_fixed[j]` is set. Pinning the whole row and column of a FIX-ed
 ///   eta keeps that eta uncorrelated with any other random effect (its
 ///   initial off-diagonals are zero for a diagonal declaration, or its block
@@ -565,9 +565,9 @@ pub fn get_eta_init(n_eta: usize, warm_start: Option<&[f64]>, mu_refs: Option<&[
 
 /// Compute the mu_k shift vector from current theta for mu-referenced ETAs.
 ///
-/// For each ETA that has a detected mu-reference, mu[i] = log(theta) or theta
+/// For each ETA that has a detected mu-reference, `mu[i]` = log(theta) or theta
 /// depending on whether the relationship is log-transformed.  ETAs without a
-/// mu-reference get mu[i] = 0 (no shift), preserving the standard behaviour.
+/// mu-reference get `mu[i]` = 0 (no shift), preserving the standard behaviour.
 /// When `enabled` is false, returns a zero vector (disables mu-referencing).
 pub fn compute_mu_k(model: &CompiledModel, theta: &[f64], enabled: bool) -> Vec<f64> {
     if !enabled {

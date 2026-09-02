@@ -29,6 +29,22 @@ on:
       # bought 4 skipped runs in 400 (1% — one of them a `Cargo.lock` bump that should run
       # anyway) while silently missing 67. That is the trade, and it is not close.
       #
+      # `tools/**` (#1157). Two reasons, and the first is the substantive one: `tools/`
+      # holds inputs the gated fits are tied to — `tools/vi-emvi-comparison/*.ferx` are the
+      # harness models the VI/EMVI anchors mirror, and `make-wide-residual-data.sh`
+      # generates the dataset `tests/nonmem/warfarin_10pct.ctl` is built from, so editing
+      # either can move a nightly anchor with nothing under `src/` or `tests/` changed.
+      # Second, `tests/preflight_owns_the_fast_gates.rs` names `tools/preflight.sh` in its
+      # assertions, which is enough for the harvest below to derive `tools` as an input
+      # root — so the guard test requires this entry either way.
+      #
+      # Measured before adding it, the same way the numbers above were: over the last 400
+      # first-parent commits on `main`, 3 touch `tools/` and **0** would newly fire this
+      # workflow — all three also touched `src/` or `tests/`. Read that as an upper bound on
+      # what it cost *then*, not as a forecast: #1157 makes `tools/preflight.sh` the place
+      # new gates are added, so tools-only commits should get MORE common, not less. The
+      # measurement says the entry was free to add; the reasons above are why it stays.
+      #
       # `tests/slow_test_path_filter.rs` pins this list in both directions: every input the
       # suite reads must be matched here, and every entry here must match a tracked file.
       # The input roots it checks against are derived from the tree and from the fixture
@@ -42,6 +58,7 @@ on:
       - 'nonmem_anchor/**'                  # committed NONMEM control streams, data and `.phi` references
       - 'src/**'                            # everything linked into the fits
       - 'tests/**'                          # the gated fits themselves + the shared tests/common harness
+      - 'tools/**'                          # scripts CI itself executes (preflight, the API baseline)
 
 env:
   CARGO_TERM_COLOR: always
