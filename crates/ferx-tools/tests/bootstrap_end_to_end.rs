@@ -590,6 +590,58 @@ fn a_cancelled_run_stops_scheduling_and_resumes_into_the_uninterrupted_run() {
     );
 }
 
+/// A cancel that lands *during* the base fit is a cancellation, not a failure.
+///
+/// The gap the first round of this change left open. `fit` reports a cancelled
+/// fit with an ordinary `Err("cancelled by user")`, so a bare `?` on the base
+/// fit made the run return `Failed("cancelled by user")` — `is_cancelled()`
+/// false — and the check between the base fit and the replicates was never
+/// reached. That is the worst place to lose the distinction: the base fit is
+/// the longest single fit in the run, and with `--update-inits` it is the one
+/// a user waits through.
+///
+/// `BootstrapEvent::Started` is emitted before the base fit begins, and `fit`
+/// polls the flag at the top of its method chain, so this is exact rather than
+/// a race.
+#[test]
+fn a_cancel_during_the_base_fit_is_a_cancellation_not_a_failure() {
+    let mut p = prepared();
+    p.parsed.fit_options.outer_maxiter = 2;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let flag = CancelFlag::new();
+    let sink = |event: BootstrapEvent| {
+        if matches!(event, BootstrapEvent::Started { .. }) {
+            flag.cancel();
+        }
+    };
+    let err = run_bootstrap_with_progress(
+        &p,
+        &BootstrapOptions {
+            cancel: Some(flag.clone()),
+            ..resume_options(dir.path())
+        },
+        Some(&sink),
+    )
+    .expect_err("a run cancelled during its base fit must not report success");
+    assert_eq!(
+        err,
+        BootstrapError::Cancelled,
+        "a cancel during the base fit was reported as a failure: {err}"
+    );
+    assert!(
+        err.is_cancelled(),
+        "the caller cannot tell the abort apart from a failed base fit"
+    );
+
+    // Header only: the base fit never produced a row, and no replicate ran.
+    assert_eq!(
+        raw_results_without_timings(dir.path()).len(),
+        1,
+        "something was fitted after the run was cancelled"
+    );
+}
+
 /// The same on a thread pool, where a cancel lands while other replicates are
 /// mid-fit.
 ///

@@ -481,6 +481,39 @@ fn a_cancellation_is_not_a_failure() {
     );
 }
 
+#[test]
+fn an_error_raised_under_a_set_flag_is_a_cancellation() {
+    // `fit` reports a cancelled fit as an ordinary `Err("cancelled by user")`,
+    // so the classifier is what keeps a bare `?` around a fit from turning the
+    // whole point of #1161 back into "the base fit failed".
+    let flag = CancelFlag::new();
+    let cancel = Some(flag.clone());
+
+    assert_eq!(
+        cancel_aware("cancelled by user".to_string(), &cancel),
+        BootstrapError::Failed("cancelled by user".to_string()),
+        "an error before the flag is set is a failure, whatever it says"
+    );
+
+    flag.cancel();
+    assert_eq!(
+        cancel_aware("cancelled by user".to_string(), &cancel),
+        BootstrapError::Cancelled
+    );
+    // A genuine failure racing the cancel is attributed to the cancel — the
+    // same call `run_one` makes when it drops rather than journals one.
+    assert_eq!(
+        cancel_aware("the model file is nonsense".to_string(), &cancel),
+        BootstrapError::Cancelled
+    );
+
+    // No flag at all: every error is what it says it is.
+    assert_eq!(
+        cancel_aware("boom".to_string(), &None),
+        BootstrapError::Failed("boom".to_string())
+    );
+}
+
 // ── --summarize ─────────────────────────────────────────────────────────────
 
 fn stored_run(dir: &std::path::Path) {

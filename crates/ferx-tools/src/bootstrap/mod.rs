@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+use ferx_core::cancel::is_cancelled;
 use ferx_core::{
     fit, CancelFlag, CompiledModel, FitOptions, FitResult, ModelParameters, OmegaMatrix,
     Population, PreparedRun, SigmaVector, WarningCode,
@@ -132,7 +133,11 @@ impl Drop for FinishGuard<'_> {
 /// without a cancelled outcome of its own the run would report an abort as
 /// "every remaining replicate failed", which is both wrong and the one thing a
 /// caller most needs to be able to tell apart.
+///
+/// `#[non_exhaustive]`: an out-of-workspace caller matches on `Cancelled` and a
+/// catch-all, so a variant added later is not a source break for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BootstrapError {
     /// The [`BootstrapOptions::cancel`] flag was set while the run was in
     /// flight, so the run stopped at the next replicate boundary.
@@ -248,8 +253,13 @@ pub struct BootstrapOptions {
     /// The flag lives here rather than only on the model's own `FitOptions`
     /// because reaching through `prepared.parsed.fit_options` to set it depends
     /// on the replicate options happening to clone the field — an
-    /// implementation detail of this module. A flag set there is still
-    /// honoured; this one simply takes precedence.
+    /// implementation detail of this module.
+    ///
+    /// A flag set there is still honoured **when this one is `None`**. When
+    /// both are set only this one is polled: the run's replicate options
+    /// install one flag, so the two cannot be OR-ed, and a caller that passed a
+    /// flag to the tool should not be cancelled by whatever the model file
+    /// happened to carry. Set one or the other, not both.
     pub cancel: Option<CancelFlag>,
 }
 
@@ -726,8 +736,34 @@ fn effective_cancel(options: &BootstrapOptions, base: &FitOptions) -> Option<Can
     options.cancel.clone().or_else(|| base.cancel.clone())
 }
 
-fn is_cancelled(flag: &Option<CancelFlag>) -> bool {
-    flag.as_ref().is_some_and(|f| f.is_cancelled())
+/// Classify a `String` error raised by something that runs a fit, given the
+/// run's flag.
+///
+/// `fit` reports a cancelled fit as an ordinary `Err("cancelled by user")`, and
+/// every `?` in this module funnels a `String` into
+/// [`BootstrapError::Failed`] — so a bare `?` around a fit turns the one
+/// outcome #1161 exists to make distinguishable back into a failure. The base
+/// fit is where that bites: it is the longest single fit in the run, the one a
+/// user is most likely to be sitting through when they cancel, and it happens
+/// *before* the flag is next polled.
+///
+/// A genuine failure racing a cancel is attributed to the cancel. The two are
+/// indistinguishable at this point — the same reason `run_one` drops such a
+/// replicate rather than journaling it — and of the two readings the cancelled
+/// one is what the caller asked for.
+///
+/// **The rule this encodes: any `?` on something that runs a fit goes through
+/// here.** It is deliberately not applied to the whole function body, because
+/// the checks *above* the first cancellation point — `validate`,
+/// `validate_for_run`, the allocation — must keep reporting themselves. A run
+/// with `--samples 0` and a pre-set flag is a misconfigured run, not a
+/// cancelled one, and saying "cancelled" would hide the typo.
+fn cancel_aware(error: String, cancel: &Option<CancelFlag>) -> BootstrapError {
+    if is_cancelled(cancel) {
+        BootstrapError::Cancelled
+    } else {
+        BootstrapError::Failed(error)
+    }
 }
 
 fn diagnostics_from(result: &FitResult) -> (bool, bool, bool) {
@@ -983,7 +1019,10 @@ pub fn run_bootstrap_with_progress(
                     o.run_covariance_step = prepared.parsed.fit_options.run_covariance_step;
                     o
                 },
-            )?;
+            )
+            // Not a bare `?`: `fit` signals a cancelled fit with an ordinary
+            // `Err`, and the flag is not polled again until after this call.
+            .map_err(|e| cancel_aware(e, &cancel))?;
             let (near_boundary, cov_ok, cov_warn) = diagnostics_from(&result);
             let base = ReplicateResult {
                 index: 0,
@@ -1019,6 +1058,14 @@ pub fn run_bootstrap_with_progress(
     // fit is where `--update-inits` starts every replicate — so the run ends
     // here rather than fitting 200 replicates from the model file's inits.
     if is_cancelled(&cancel) {
+        // Closed on this path too. `into_result` is the only place a journal
+        // write failure surfaces, and the row it would have swallowed is the
+        // base fit's — the one a resume reuses instead of refitting. Reporting
+        // a full disk beats returning `Cancelled` over a directory that
+        // `--resume` will then read short a row.
+        if let Some(j) = journal {
+            j.into_result()?;
+        }
         return Err(BootstrapError::Cancelled);
     }
 
