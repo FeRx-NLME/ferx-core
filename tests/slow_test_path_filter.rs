@@ -267,10 +267,14 @@ fn runtime_input_roots(root: &Path, tracked: &[String]) -> BTreeSet<String> {
 /// directory and the rest are taken as-is.
 fn referenced_paths(root: &Path, tracked: &[String]) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    for path in tracked
-        .iter()
-        .filter(|p| p.starts_with("tests/") && p.ends_with(".rs"))
-    {
+    let member_test_dirs: Vec<String> = built_members(root)
+        .into_iter()
+        .map(|m| format!("{m}/tests/"))
+        .collect();
+    for path in tracked.iter().filter(|p| {
+        p.ends_with(".rs")
+            && (p.starts_with("tests/") || member_test_dirs.iter().any(|d| p.starts_with(d)))
+    }) {
         let src = std::fs::read_to_string(root.join(path)).expect("test source is UTF-8");
         let dir = path.rsplit_once('/').map_or("", |(head, _)| head);
         for literal in string_literals(&src) {
@@ -324,26 +328,130 @@ fn string_literals(src: &str) -> Vec<String> {
     out
 }
 
+/// The package name a member manifest declares, for matching against `--exclude`.
+fn member_package_name(root: &Path, member: &str) -> Option<String> {
+    let manifest = std::fs::read_to_string(root.join(member).join("Cargo.toml")).ok()?;
+    manifest
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("name") && l.contains('='))
+        .and_then(|l| string_literals(l).into_iter().next())
+}
+
+/// Packages the slow job's cargo command excludes from `--workspace`.
+///
+/// Read out of the workflow rather than listed here, so an exclusion added or dropped
+/// moves this guard's expectations with it in the same commit.
+fn excluded_packages(workflow: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut tokens = workflow.split_whitespace().peekable();
+    while let Some(tok) = tokens.next() {
+        match tok.strip_prefix("--exclude=") {
+            Some(name) => {
+                out.insert(name.to_string());
+            }
+            None if tok == "--exclude" => {
+                if let Some(name) = tokens.next() {
+                    out.insert(name.to_string());
+                }
+            }
+            None => {}
+        }
+    }
+    out
+}
+
+/// The member directories `cargo test --workspace [--exclude ...]` actually compiles.
+///
+/// This is the set whose sources, tests and manifests are inputs of the slow job — and,
+/// equally, the set whose test sources are worth harvesting fixture paths from. An
+/// excluded member's fixtures are not this job's inputs, and pulling them in would widen
+/// the push filter to directories a docs- or tooling-only crate happens to read.
+fn built_members(root: &Path) -> BTreeSet<String> {
+    let workflow = std::fs::read_to_string(root.join(WORKFLOW)).unwrap_or_default();
+    let excluded = excluded_packages(&workflow);
+    workspace_members(root)
+        .into_iter()
+        .filter(|m| member_package_name(root, m).is_none_or(|name| !excluded.contains(&name)))
+        .collect()
+}
+
+/// The workspace members, read out of the root manifest's `[workspace] members` list.
+///
+/// Derived rather than listed for the same reason the input roots are: a member added to
+/// the workspace is compiled by the slow job's `--workspace` command from that moment on,
+/// and a guard that mirrored a hand-written list would agree with a filter that had gone
+/// stale. Entries are directory paths relative to the root (`crates/ferx-tools`).
+fn workspace_members(root: &Path) -> BTreeSet<String> {
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("root Cargo.toml");
+    let mut out = BTreeSet::new();
+    let mut in_members = false;
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if in_members {
+            if trimmed.starts_with(']') {
+                break;
+            }
+            for literal in string_literals(trimmed) {
+                // Skip a glob member (`crates/*`): the concrete directories under it are
+                // what the caller needs, and those come from the tracked-file walk.
+                if !literal.contains('*') && !literal.is_empty() {
+                    out.insert(literal.trim_end_matches('/').to_string());
+                }
+            }
+        } else if trimmed.starts_with("members") && trimmed.contains('[') {
+            in_members = true;
+            // A single-line `members = ["a", "b"]` both opens and closes here.
+            if trimmed.contains(']') {
+                for literal in string_literals(trimmed) {
+                    if !literal.contains('*') && !literal.is_empty() {
+                        out.insert(literal.trim_end_matches('/').to_string());
+                    }
+                }
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// Every tracked file the slow job compiles, reads, or is configured by.
 ///
-/// Compile inputs are mechanical (`cargo test` builds `src/` and `tests/`, configured by
-/// the manifest and the lock); runtime inputs are derived; the workflow is included because
-/// changing its feature set or cargo invocation changes what runs.
+/// Compile inputs are mechanical (`cargo test --workspace` builds the root package's `src/`
+/// and `tests/` *and* every member's, configured by each manifest and the shared lock);
+/// runtime inputs are derived; the workflow is included because changing its feature set or
+/// cargo invocation changes what runs.
 fn required_inputs(root: &Path, tracked: &[String]) -> Vec<String> {
-    let mut dir_roots: BTreeSet<String> = ["src".to_string(), "tests".to_string()]
+    // Directory prefixes, not top-level roots: a member's sources live two levels down
+    // (`crates/ferx-tools/src/`), and matching on the head alone would pull in the whole of
+    // `crates/` for a root the job does not build (a future docs-only crate, say).
+    let mut dir_prefixes: BTreeSet<String> = ["src/".to_string(), "tests/".to_string()]
         .into_iter()
         .collect();
-    dir_roots.extend(runtime_input_roots(root, tracked));
+    dir_prefixes.extend(
+        runtime_input_roots(root, tracked)
+            .into_iter()
+            .map(|r| format!("{r}/")),
+    );
 
-    let files: BTreeSet<&str> = ["Cargo.toml", "Cargo.lock", WORKFLOW].into_iter().collect();
+    let mut files: BTreeSet<String> = ["Cargo.toml", "Cargo.lock", WORKFLOW]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+    // `--workspace` makes each built member's sources, tests and manifest compile inputs of
+    // this job exactly as the root package's are. An `--exclude`d member is not built, so
+    // it is not an input — and must not drag the directories its own tests read into the
+    // push filter.
+    for member in built_members(root) {
+        dir_prefixes.insert(format!("{member}/src/"));
+        dir_prefixes.insert(format!("{member}/tests/"));
+        files.insert(format!("{member}/Cargo.toml"));
+    }
 
     tracked
         .iter()
-        .filter(|p| {
-            files.contains(p.as_str())
-                || p.split_once('/')
-                    .is_some_and(|(head, _)| dir_roots.contains(head))
-        })
+        .filter(|p| files.contains(p.as_str()) || dir_prefixes.iter().any(|pre| p.starts_with(pre)))
         .cloned()
         .collect()
 }
@@ -375,6 +483,34 @@ fn slow_test_filter_covers_every_input_the_heavy_fits_read() {
             required.iter().any(|p| p.starts_with(expected_root)),
             "no required input under `{expected_root}` — the derivation stopped seeing a root \
              the heavy fits demonstrably read"
+        );
+    }
+
+    // The job runs `--workspace`, so every member's sources, tests and manifest are compile
+    // inputs. Assert the derivation found them: without this the members could drop out of
+    // `required` and the coverage assertion below would pass vacuously for `crates/`.
+    let members = built_members(&root);
+    assert!(
+        !members.is_empty(),
+        "parsed no built `[workspace] members` out of the root Cargo.toml — fix this parser \
+         rather than deleting the check: an empty parse silently stops guarding every member"
+    );
+    assert!(
+        !workspace_members(&root).is_empty(),
+        "parsed no `[workspace] members` at all — the manifest parser broke"
+    );
+    for member in &members {
+        assert!(
+            required
+                .iter()
+                .any(|p| p.starts_with(&format!("{member}/src/"))),
+            "no required input under `{member}/src/` — `cargo test --workspace` compiles it, \
+             so a push touching only that member must re-run the slow suite"
+        );
+        assert!(
+            required.contains(&format!("{member}/Cargo.toml")),
+            "`{member}/Cargo.toml` is not a required input, but it selects that member's \
+             features and dependencies for the slow job"
         );
     }
 

@@ -126,11 +126,43 @@ identical in a ranking, so every skip says which happened:
 | fewer than 3 subjects with both an EBE and a value | nothing to regress |
 | constant over the screened subjects | carries no information |
 | categorical with one distinct level | the same degenerate case |
-| categorical with as many levels as subjects | saturated: RSS → 0 would win the ranking on arithmetic alone, not on signal |
+| categorical spending more than `n/2` parameters | see [High-cardinality labels](#high-cardinality-labels) |
 | singular design | no candidate form could be fitted |
 | column length ≠ subject count | the caller's data is misaligned |
 
+An ETA is refused outright — no scores at all — when its EBEs are constant
+across subjects, which happens for a fixed random effect or one the data never
+identified. Every model then fits perfectly, every AIC is `−∞`, and every ΔAIC
+would be `−∞ − (−∞)`.
+
 Always read the warnings before trusting an empty or short ranking.
+
+### High-cardinality labels
+
+A categorical covariate must leave at least as many residual degrees of freedom
+as it spends parameters — `n ≥ 2p`, so roughly half the subjects. Anything
+above that is skipped, with a warning.
+
+This is not fussiness. For a label with `k` levels over `n` subjects and no real
+relation to the ETA, `E[RSS/RSS₀] ≈ (n−k)/(n−1)`, so
+
+$$\Delta\text{AIC} \approx n \ln\!\frac{n-1}{n-k} - 2(k-1)$$
+
+which is comfortably negative for small `k`, crosses zero near `k ≈ 0.8n`, and
+reaches **+474** at `k = n − 1, n = 100`. A SITE or STUDY identifier declared
+`categorical` would rank far above every covariate carrying real signal — the
+model's freedom to interpolate outruns the `2p` penalty long before the design
+is saturated. Requiring only one residual degree of freedom (`k < n`) leaves
+that entire band open.
+
+Nothing useful is lost below the threshold: in the discarded band, a label with
+genuine signal is better represented by the covariate that explains it than by
+the identifier, and a label without signal scores negative wherever plain AIC
+still works, so it would rank last either way.
+
+The rule is a guard, not a change to the score. AICc would handle the same
+problem more smoothly, but it would shift every ΔAIC by ~0.1 and break the R /
+xpose4 parity this module is validated against.
 
 ## Validation
 

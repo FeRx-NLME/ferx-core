@@ -488,6 +488,25 @@ pub(crate) fn screen_eta_raw(
         return (f64::NAN, vec![], warnings);
     }
 
+    // A constant EBE column — a fixed random effect, or one the data never
+    // identified — makes RSS zero for *every* model including the null, so both
+    // AICs are −∞ and every ΔAIC is `−∞ − (−∞)` = NaN. A NaN compares equal to
+    // nothing, so `partial_cmp` falls back to `Equal` and the score lands in the
+    // ranking looking like a number. Refuse the ETA outright instead.
+    let mean_eta = valid_eta.mean();
+    let sst_eta = valid_eta
+        .iter()
+        .map(|&v| (v - mean_eta).powi(2))
+        .sum::<f64>();
+    if !sst_eta.is_finite() || sst_eta <= 0.0 {
+        warnings.push(
+            "the EBEs are constant across subjects, so no covariate can explain them; \
+             nothing screened."
+                .into(),
+        );
+        return (f64::NAN, vec![], warnings);
+    }
+
     // Global null model (intercept only) AIC.
     let n_all = valid_eta.len();
     let x_null_all = DMatrix::from_element(n_all, 1, 1.0);
@@ -541,6 +560,16 @@ pub(crate) fn screen_eta_raw(
                 continue;
             }
         };
+        // The whole-column check above does not cover this: the EBEs can vary
+        // across the population and still be constant over the subset that has
+        // a value for *this* covariate, which puts the same NaN into ΔAIC.
+        if !aic_null_local.is_finite() {
+            warnings.push(format!(
+                "{cov_name}: the EBEs are constant over its {n} subjects, so ΔAIC is undefined; \
+                 skipped."
+            ));
+            continue;
+        }
 
         // Fit candidate forms and pick the one with the lowest AIC.
         let mut best_aic = f64::INFINITY;
@@ -549,16 +578,37 @@ pub(crate) fn screen_eta_raw(
 
         match kind {
             CovariateKind::Categorical => {
-                let dummies = categorical_design(&x_vals);
-                let n_dummies = dummies.ncols();
+                // Count the levels BEFORE building anything: a label with one
+                // level per subject would otherwise allocate an n × (n−1)
+                // design — O(n²) — only to be rejected on the next line.
+                let levels = categorical_levels(&x_vals);
+                let n_dummies = levels.len().saturating_sub(1);
+                let n_params = n_dummies + 1; // intercept + dummies
 
                 // A single-level categorical carries no information, and a
-                // near-saturated one carries too much: with `n_levels`
-                // approaching `n`, `n·ln(RSS/n)` dives and the `2p` penalty
-                // does not keep up, so a high-cardinality label (STUDY, SITE)
-                // would win the ranking on arithmetic alone. Both are skipped
-                // rather than scored — the continuous branch already refuses a
-                // constant covariate, and this is the same degenerate case.
+                // high-cardinality one carries too much. For a label with `k`
+                // levels over `n` subjects and no real signal,
+                // `E[RSS/RSS₀] ≈ (n−k)/(n−1)`, so
+                //
+                //     ΔAIC ≈ n·ln((n−1)/(n−k)) − 2(k−1)
+                //
+                // which is negative for small `k` but crosses zero near
+                // `k ≈ 0.8n` and reaches +474 at `k = n−1, n = 100`: the fit's
+                // freedom to interpolate outruns the `2p` penalty, and a SITE
+                // or STUDY identifier ranks above every real covariate. Refusing
+                // only `k = n` (residual df ≥ 1) leaves that whole band open.
+                //
+                // So the design must leave at least as many residual degrees of
+                // freedom as it spends parameters — `n ≥ 2p`, i.e. `k ≲ n/2`,
+                // where the expression above is still comfortably negative
+                // (≈ −30 at `k = n/2, n = 100`). Nothing of value is lost: a
+                // label in the discarded band scores negative when AIC works at
+                // all, so it would rank last either way.
+                //
+                // The threshold is a guard, not a scoring change. Switching to
+                // AICc would handle this more smoothly but would move every
+                // ΔAIC by ~0.1, breaking the R / xpose4 parity this module is
+                // validated against.
                 if n_dummies == 0 {
                     warnings.push(format!(
                         "{cov_name}: only one distinct level over the {n} screened subjects; \
@@ -566,16 +616,19 @@ pub(crate) fn screen_eta_raw(
                     ));
                     continue;
                 }
-                if n_dummies + 1 >= n {
+                if n < 2 * n_params {
                     warnings.push(format!(
-                        "{cov_name}: {} levels over {n} subjects leaves no residual degrees of \
-                         freedom; skipped.",
-                        n_dummies + 1
+                        "{cov_name}: {} levels over {n} subjects spends {n_params} parameters and \
+                         leaves only {} residual degrees of freedom, too few for AIC to \
+                         discriminate signal from interpolation; skipped.",
+                        levels.len(),
+                        n.saturating_sub(n_params)
                     ));
                     continue;
                 }
 
                 // Design: [intercept | dummies]
+                let dummies = categorical_design(&x_vals, &levels);
                 let mut x_cat = DMatrix::zeros(n, n_dummies + 1);
                 for row in 0..n {
                     x_cat[(row, 0)] = 1.0;
@@ -811,23 +864,35 @@ pub(crate) fn ols_aic(x: &DMatrix<f64>, y: &DVector<f64>) -> Option<(f64, f64)> 
     Some((aic, r2))
 }
 
+/// The distinct levels of a categorical covariate, ascending.
+///
+/// Separate from [`categorical_design`] so a caller can judge the cardinality
+/// before paying for an `n × (levels − 1)` matrix it may be about to reject.
+///
+/// `pub(crate)` for unit tests.
+pub(crate) fn categorical_levels(x: &[f64]) -> Vec<f64> {
+    let mut levels: Vec<f64> = x.to_vec();
+    levels.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    levels.dedup_by(|a, b| (*a - *b).abs() < 1e-10);
+    levels
+}
+
 /// One-hot encoding of a categorical covariate, shape `n × (levels − 1)`.
 ///
 /// The lowest observed level is the reference (dropped). Returns an empty
 /// matrix when there is only one unique level.
 ///
+/// Takes the levels from [`categorical_levels`] rather than recomputing them,
+/// so a caller can reject a design on its cardinality before paying to build
+/// it — for a label with one level per subject that matrix is `n × (n − 1)`.
+///
 /// `pub(crate)` for unit tests.
-pub(crate) fn categorical_design(x: &[f64]) -> DMatrix<f64> {
-    let mut levels: Vec<f64> = x.to_vec();
-    levels.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    levels.dedup_by(|a, b| (*a - *b).abs() < 1e-10);
-
-    let n_levels = levels.len();
-    if n_levels <= 1 {
+pub(crate) fn categorical_design(x: &[f64], levels: &[f64]) -> DMatrix<f64> {
+    if levels.len() <= 1 {
         return DMatrix::zeros(x.len(), 0);
     }
 
-    let n_dummies = n_levels - 1;
+    let n_dummies = levels.len() - 1;
     let mut mat = DMatrix::zeros(x.len(), n_dummies);
     for (row, &val) in x.iter().enumerate() {
         for (col, &level) in levels[1..].iter().enumerate() {
@@ -1295,6 +1360,172 @@ mod tests {
                 .any(|w| w.contains("SITE") && w.contains("residual degrees of freedom")),
             "the skip must name the reason: {warns:?}"
         );
+    }
+
+    #[test]
+    fn near_saturated_categorical_is_skipped_not_ranked_first() {
+        // The `n > p` guard alone was not enough. A label with n−1 levels over
+        // 100 unrelated ETA values has one residual degree of freedom, passes
+        // that guard, and scores ΔAIC ≈ +474 with R² ≈ 0.999 — ranking a SITE
+        // identifier far above a covariate carrying real signal.
+        let n = 100;
+        let eta: Vec<f64> = (0..n).map(|i| (i as f64 * 0.37 + 0.11).sin()).collect();
+        let site: Vec<f64> = (0..n)
+            .map(|i| if i == 0 { 1.0 } else { i as f64 })
+            .collect();
+        assert_eq!(
+            categorical_levels(&site).len(),
+            n - 1,
+            "fixture must be near-saturated, not saturated"
+        );
+        let wt: Vec<f64> = (0..n).map(|i| 60.0 + 0.5 * i as f64).collect();
+
+        let opts = GamOptions::default();
+        let cov_refs = [
+            ("SITE", site.as_slice(), CovariateKind::Categorical),
+            ("WT", wt.as_slice(), CovariateKind::Continuous),
+        ];
+        let (_, scores, warns) = screen_eta_raw(&eta, &cov_refs, &opts);
+        assert!(
+            !scores.iter().any(|s| s.covariate == "SITE"),
+            "a near-saturated label must not be scored: {:?}",
+            scores
+                .iter()
+                .map(|s| (&s.covariate, s.delta_aic))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            warns
+                .iter()
+                .any(|w| w.contains("SITE") && w.contains("residual degrees of freedom")),
+            "the skip must name the reason: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn a_categorical_with_room_to_spare_is_still_scored() {
+        // The cardinality guard must not swallow ordinary factors: 3 levels
+        // over 30 subjects spends 3 parameters and leaves 27.
+        let n = 30;
+        let grp: Vec<f64> = (0..n).map(|i| (i % 3) as f64).collect();
+        let eta: Vec<f64> = grp
+            .iter()
+            .enumerate()
+            .map(|(i, &g)| g * 0.4 + (i as f64 * 0.7).sin() * 0.02)
+            .collect();
+        let opts = GamOptions::default();
+        let cov_refs = [("GRP", grp.as_slice(), CovariateKind::Categorical)];
+        let (_, scores, warns) = screen_eta_raw(&eta, &cov_refs, &opts);
+        assert_eq!(scores.len(), 1, "warnings: {warns:?}");
+        assert_eq!(scores[0].best_form, CovariateForm::Categorical);
+        assert!(scores[0].delta_aic > 5.0, "got {}", scores[0].delta_aic);
+    }
+
+    #[test]
+    fn the_cardinality_guard_sits_exactly_at_two_parameters_per_subject() {
+        // n = 20: 10 levels spends 10 parameters and is admitted; 11 levels
+        // spends 11 and is not. Pins the boundary so a later "tidy-up" of the
+        // inequality is a red test rather than a silent widening.
+        let n = 20;
+        let eta: Vec<f64> = (0..n).map(|i| (i as f64 * 0.31 + 0.2).sin()).collect();
+        let ten: Vec<f64> = (0..n).map(|i| (i % 10) as f64).collect();
+        let eleven: Vec<f64> = (0..n).map(|i| (i % 11) as f64).collect();
+        let opts = GamOptions::default();
+
+        let (_, scores, _) = screen_eta_raw(
+            &eta,
+            &[("TEN", ten.as_slice(), CovariateKind::Categorical)],
+            &opts,
+        );
+        assert_eq!(
+            scores.len(),
+            1,
+            "10 levels over 20 subjects must be admitted"
+        );
+
+        let (_, scores, _) = screen_eta_raw(
+            &eta,
+            &[("ELEVEN", eleven.as_slice(), CovariateKind::Categorical)],
+            &opts,
+        );
+        assert!(
+            scores.is_empty(),
+            "11 levels over 20 subjects must be refused"
+        );
+    }
+
+    #[test]
+    fn constant_etas_produce_no_scores_and_a_warning() {
+        // Every model including the null fits perfectly, so both AICs are −∞
+        // and ΔAIC is `−∞ − (−∞)` = NaN — which sorted as "equal" and sat in
+        // the ranking looking like a score.
+        let eta = vec![0.0_f64; 20];
+        let cov: Vec<f64> = (0..20).map(|i| i as f64).collect();
+        let opts = GamOptions::default();
+        let cov_refs = [("X", cov.as_slice(), CovariateKind::Continuous)];
+        let (aic_null, scores, warns) = screen_eta_raw(&eta, &cov_refs, &opts);
+        assert!(aic_null.is_nan());
+        assert!(scores.is_empty(), "no covariate can explain a constant EBE");
+        assert!(
+            warns.iter().any(|w| w.contains("constant")),
+            "the refusal must be reported: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn constant_etas_over_one_covariates_subset_skip_only_that_covariate() {
+        // The EBEs vary across the population but are constant over the
+        // subjects that have a value for this covariate — same NaN, and not
+        // caught by the whole-column check.
+        let n = 24;
+        let eta: Vec<f64> = (0..n)
+            .map(|i| if i < 12 { 0.0 } else { i as f64 * 0.1 })
+            .collect();
+        let patchy: Vec<f64> = (0..n)
+            .map(|i| if i < 12 { i as f64 } else { f64::NAN })
+            .collect();
+        let full: Vec<f64> = (0..n).map(|i| 70.0 + i as f64).collect();
+        let opts = GamOptions::default();
+        let cov_refs = [
+            ("PATCHY", patchy.as_slice(), CovariateKind::Continuous),
+            ("FULL", full.as_slice(), CovariateKind::Continuous),
+        ];
+        let (_, scores, warns) = screen_eta_raw(&eta, &cov_refs, &opts);
+        assert!(
+            !scores.iter().any(|s| s.covariate == "PATCHY"),
+            "a covariate whose subset has constant EBEs must be skipped"
+        );
+        assert!(
+            scores.iter().any(|s| s.covariate == "FULL"),
+            "the other covariate must still be screened"
+        );
+        assert!(
+            warns
+                .iter()
+                .any(|w| w.contains("PATCHY") && w.contains("undefined")),
+            "{warns:?}"
+        );
+    }
+
+    #[test]
+    fn no_score_is_ever_nan() {
+        // The contract the ranking depends on: `sort_by` falls back to `Equal`
+        // for a NaN, so a NaN ΔAIC is not merely wrong, it is unordered.
+        let n = 40;
+        let eta: Vec<f64> = (0..n).map(|i| (i as f64 * 0.3).sin()).collect();
+        let flat = vec![1.0_f64; n];
+        let ramp: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let label: Vec<f64> = (0..n).map(|i| (i % 4) as f64).collect();
+        let opts = GamOptions::default();
+        let cov_refs = [
+            ("FLAT", flat.as_slice(), CovariateKind::Continuous),
+            ("RAMP", ramp.as_slice(), CovariateKind::Continuous),
+            ("LABEL", label.as_slice(), CovariateKind::Categorical),
+        ];
+        let (_, scores, _) = screen_eta_raw(&eta, &cov_refs, &opts);
+        for s in &scores {
+            assert!(!s.delta_aic.is_nan(), "{} produced a NaN ΔAIC", s.covariate);
+        }
     }
 
     #[test]
