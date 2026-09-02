@@ -25,9 +25,11 @@ section of the SDLC for the versioning policy).
   off-diagonal correlation are estimated. Previously the correlation was always frozen at the
   declared value, so a model with a `$SIGMA BLOCK` counterpart in NONMEM optimized a different
   objective — on the fluconazole RadboudUMC model NONMEM moved the residual correlation to
-  ~0.93 while ferx held the ~0.2 init. Append `FIX` to hold the whole block, which is the only
-  form that reproduces the previous behaviour; the shipped
-  `examples/correlated_residual_combined.ferx` already uses it and is unaffected. The
+  ~0.93 while ferx held the ~0.2 init. Append `FIX` to hold the whole block — SDs and
+  correlation alike, matching `$SIGMA BLOCK(n) FIX`. Note that the old behaviour (SDs
+  estimated, correlation frozen) is no longer expressible: NONMEM has no such form either, and
+  it was the mismatch this issue is about. The shipped
+  `examples/correlated_residual_combined.ferx` already uses `FIX` and is unaffected. The
   correlation is optimized as its Fisher-z transform `atanh(rho)`, so it stays strictly inside
   `(-1, 1)` and the residual covariance can never go singular from the correlation alone, and
   it rides the exact analytic FOCE/FOCEI outer gradient rather than falling back to finite

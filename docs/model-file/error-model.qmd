@@ -698,9 +698,11 @@ scale, via the delta method: `SE(rho) = SE(z) * (1 - rho^2)`.
 
 ::: {.callout-warning title="Changed in #847"}
 Before this change every `block_sigma` off-diagonal was held fixed regardless of
-`FIX`. A model written against the old behaviour that relied on a bare
-`block_sigma` keeping its declared correlation needs `FIX` added to reproduce its
-previous results.
+`FIX`, while the diagonal SDs were estimated. That combination is no longer
+expressible — NONMEM has no form for it either, and it is exactly the mismatch
+this change removes. Adding `FIX` to an existing bare `block_sigma` reproduces
+the old *correlation*, but it also pins the SDs the old form estimated, so it is
+not a drop-in way to reproduce an old fit's numbers. Re-run and compare instead.
 :::
 
 ### Which sigmas a `block_sigma` may correlate
