@@ -4998,6 +4998,72 @@ fn simulated_event_time_is_consistent_with_the_guarded_hazard() {
     );
 }
 
+/// The fifth surface, and the one with a symptom of its own: on a TV-covariate / reset
+/// subject, `ode_predictions_event_driven_with_states` takes its `ipred` from the
+/// event-driven walk (which resolves through the guarded `active_infusions`) but its
+/// **states** from `ode_dense_solve_states` (gated). Under the defect the same sdtab row
+/// therefore carried a correct `IPRED` beside a compartment column roughly twice as large —
+/// internally inconsistent, and neither column announcing a problem.
+///
+/// This pins the two halves against each other. The spec's readout is the forcing
+/// compartment itself, so `ipred[i]` and `states[i][0]` are the *same quantity* computed by
+/// the two different engines, and any disagreement is the split.
+#[test]
+fn event_driven_with_states_ipred_and_states_agree_for_infusion_into_absorption() {
+    let mut ode = first_order_one_cpt_spec(); // 1 state, readout ≡ state 0
+    ode.solver_opts.reltol = 1e-11;
+    ode.solver_opts.abstol = 1e-11;
+
+    let mut pk = PkParams::default();
+    pk.values[crate::types::PK_IDX_CL] = 2.0;
+    pk.values[crate::types::PK_IDX_V] = 20.0;
+    pk.values[4] = 0.6; // ka
+    pk.values[crate::types::PK_IDX_F] = 1.0;
+
+    let obs = vec![0.5, 1.5, 3.0, 5.0, 9.0];
+    let subj = make_subject(
+        vec![DoseEvent::new(0.0, 100.0, 1, 100.0 / 3.0, false, 0.0)],
+        obs.clone(),
+    );
+    assert!(
+        subj.doses[0].is_infusion(),
+        "fixture must carry a real infusion or it tests nothing"
+    );
+
+    // Per-event PK snapshots, uniform here — this entry point is reached for TV-covariate
+    // and reset subjects, but the engine split it exposes does not depend on them varying.
+    let at = |n: usize| vec![pk; n];
+    let (ipred, states) = ode_predictions_event_driven_with_states(
+        &ode,
+        &subj,
+        &[],
+        &[],
+        &at(subj.doses.len()),
+        &at(obs.len()),
+        &[],
+        &[],
+    );
+
+    for i in 0..obs.len() {
+        assert!(
+            ipred[i] > 0.0 && states[i][0].is_finite(),
+            "obs {i}: degenerate ({}, {})",
+            ipred[i],
+            states[i][0]
+        );
+        let rel = (states[i][0] - ipred[i]).abs() / ipred[i];
+        assert!(
+            rel < 1e-6,
+            "obs {i} (t={}): the event-driven ipred is {:.6} but the dense state column is \
+             {:.6} (rel {rel:.2e}) — the same sdtab row would report a correct IPRED beside \
+             a doubled compartment amount",
+            obs[i],
+            ipred[i],
+            states[i][0]
+        );
+    }
+}
+
 #[test]
 fn input_rate_consumes_cmt_matches_forcing_compartment() {
     let ode = transit_accumulator_spec(); // forcing on state 0 ≡ 1-based CMT 1

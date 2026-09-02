@@ -510,6 +510,134 @@ fn integral_window_zero_is_rejected_at_parse() {
 /// while `integral(compartments[1], 0→24)` read 19.17 against a true 31.13 (a
 /// `1e-12` `[odes]` twin of the same system) — a confident wrong number beside a
 /// column that correctly admitted it had none.
+/// #1187 at the `[derived]` grid. `integral(compartments[..])` reconstructs its grid with
+/// `ode_dense_solve_states` (`api::output_columns`), which resolved infusions through the
+/// unguarded `gated_infusions` — so a `RATE>0` dose into a built-in absorption compartment
+/// was integrated at roughly twice the true exposure.
+///
+/// Both subjects sit in **one** population and `omega ETA_CL ~ 0`, so they are evaluated at
+/// identical parameters with `eta = 0`: the only difference between them is how the same
+/// 100 mg is delivered. Subject `inf` gets it as one infusion over `[0, 3]`; subject
+/// `train` gets it as 200 sub-doses spanning the same window, which is immune to the defect
+/// because a *bolus* into an input-rate compartment never enters the infusion resolver at
+/// all. Their `[derived]` integrals must therefore agree.
+#[test]
+fn derived_grid_integral_matches_a_subdose_train_for_infusion_into_absorption() {
+    const MODEL: &str = "
+[parameters]
+  theta CL(2.0, 0.1, 50.0)
+  theta V(20.0, 1.0, 300.0)
+  theta KA(0.6, 0.01, 20.0)
+  omega ETA_CL ~ 0
+  sigma PROP   ~ 0.01
+
+[individual_parameters]
+  CL = CL * exp(ETA_CL)
+  V  = V
+  KA = KA
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = first_order(ka=KA) - CL/V * central
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[derived]
+  AUC_C = integral(compartments[0], from=0, to=8)
+
+[fit_options]
+  method   = focei
+  maxiter  = 0
+  gradient = fd
+";
+    let model = parse_model_string(MODEL).expect("model must parse");
+
+    let obs_times = vec![1.0, 4.0, 8.0];
+    let obs = vec![2.0, 3.0, 1.5];
+    // 40 sub-doses, not 300: this arm has to separate a ~2x error, and every extra dose
+    // costs a break time on a dense `[derived]` grid. The bound below is set from the
+    // measured discretisation error of *this* n, not inherited from the unit tests.
+    let (amt, t_inf, n_sub) = (100.0_f64, 3.0_f64, 40usize);
+
+    let infusion = DoseEvent::new(0.0, amt, 1, amt / t_inf, false, 0.0);
+    assert!(
+        infusion.is_infusion(),
+        "fixture must carry a real infusion or it tests nothing"
+    );
+    let train: Vec<DoseEvent> = (0..n_sub)
+        .map(|k| {
+            let tk = (k as f64 + 0.5) * t_inf / n_sub as f64;
+            DoseEvent::new(tk, amt / n_sub as f64, 1, 0.0, false, 0.0)
+        })
+        .collect();
+
+    let pop = Population {
+        covariate_names: vec![],
+        dv_column: "DV".to_string(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+        subjects: vec![
+            common::subject(
+                "inf",
+                vec![infusion],
+                obs_times.clone(),
+                obs.clone(),
+                vec![1; obs_times.len()],
+            ),
+            common::subject(
+                "train",
+                train,
+                obs_times.clone(),
+                obs.clone(),
+                vec![1; obs_times.len()],
+            ),
+        ],
+    };
+
+    let mut opts = FitOptions::default();
+    opts.verbose = false;
+    let result =
+        fit(&model, &pop, &model.default_params, &opts).expect("evaluation must not error");
+
+    let auc = |id: &str| -> f64 {
+        let sr = result
+            .subjects
+            .iter()
+            .find(|s| s.id == id)
+            .unwrap_or_else(|| panic!("subject '{id}' missing from the fit result"));
+        let col = sr
+            .extra_columns
+            .iter()
+            .find(|(n, _)| n == "AUC_C")
+            .unwrap_or_else(|| panic!("extra column 'AUC_C' missing for '{id}'"));
+        let v = col.1[0];
+        assert!(v.is_finite(), "'{id}' AUC_C must be finite, got {v}");
+        v
+    };
+
+    let (auc_inf, auc_train) = (auc("inf"), auc("train"));
+    // Non-degeneracy: a zero (or drug-free) integral would agree for the wrong reason.
+    assert!(
+        auc_train > 1.0,
+        "the sub-dose train's AUC is {auc_train} — no drug reached the compartment, so the \
+         comparison would be vacuous"
+    );
+    let rel = (auc_inf - auc_train).abs() / auc_train;
+    assert!(
+        // Measured at n_sub = 40: 1.80e-4, which is the train's own midpoint-rule
+        // discretisation, not ferx error. 1e-3 is ~5x that, and the defect this separates
+        // is ~100% — three orders of margin either side.
+        rel < 1e-3,
+        "[derived] grid integral under an infusion into the absorption compartment is \
+         {auc_inf}, but the equivalent sub-dose train gives {auc_train} (rel {rel:.2e}) — \
+         the grid is reconstructing the wrong exposure"
+    );
+}
+
 #[test]
 fn derived_grid_integral_over_compartments_is_nan_for_a_rerouted_subject() {
     const MODEL: &str = "
