@@ -210,8 +210,9 @@ section of the SDLC for the versioning policy).
   not have. The "does this model read model time?" question is now asked of the PK equations
   alone. Measured on a 40-subject fixture, one variable: **2.1×** faster on one objective
   evaluation and **2.6×** over eight outer iterations. Results are unaffected beyond solver
-  tolerance (4.4e-3 OFV at default tolerances, decaying with the tolerance), so earlier fits
-  do not need re-running. Steady-state gates deliberately keep the wider question, since SS
+  tolerance — the same fixture's objective moves 4.4e-3 at ferx's default tolerances and
+  7.7e-7 at `ode_reltol = 1e-9`, i.e. the difference decays with the integrator rather than
+  being a fixed offset — so earlier fits do not need re-running. Steady-state gates deliberately keep the wider question, since SS
   equilibration integrates the augmented system including the hazard state. Validated against
   a new NONMEM anchor (`nonmem_anchor/pktte_tdep.ctl`): `H(t)` matches `A(3)` to 3.6e-9
   relative and the per-subject objective matches the `.phi` `OBJ` to 6.0e-8.

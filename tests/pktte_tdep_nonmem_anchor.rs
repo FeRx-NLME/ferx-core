@@ -104,6 +104,17 @@ fn cumulative_hazard_matches_nonmem_for_a_time_dependent_hazard() {
             .iter()
             .find(|r| r.id == id.to_string() && (r.time - t).abs() < 1e-9)
             .expect("every TTE time is on the grid");
+        // `f64::max` RETURNS THE OTHER OPERAND when one side is NaN, so folding a
+        // NaN relative error through `.max()` silently leaves the running worst at
+        // 0 and every bound below passes. An anchor that goes green on NaN
+        // predictions is worse than no anchor, so the values are checked first.
+        assert!(
+            r.cum_hazard.is_finite() && r.hazard.is_finite(),
+            "subject {id} at t={t}: ferx returned a non-finite H/h \
+             (H={}, h={}) — the anchor cannot compare it",
+            r.cum_hazard,
+            r.hazard
+        );
         worst_h = worst_h.max(((r.cum_hazard - chz) / chz).abs());
         worst_haz = worst_haz.max(((r.hazard - haz) / haz).abs());
     }
@@ -133,6 +144,13 @@ fn per_subject_objective_matches_nonmem_for_a_time_dependent_hazard() {
     let mut total = 0.0f64;
     for (s, o) in pop.subjects.iter().zip(obj.iter()) {
         let ferx = 2.0 * individual_nll(&m, s, &p.theta, &[], &p.omega, &p.sigma.values);
+        // See the note in the sibling test: a NaN folded through `.max()` vanishes
+        // and leaves `worst` at 0, so the bound below would pass on a broken solve.
+        assert!(
+            ferx.is_finite(),
+            "subject {}: ferx objective is not finite ({ferx})",
+            s.id
+        );
         worst = worst.max((ferx - o).abs());
         total += ferx;
     }
@@ -176,6 +194,13 @@ fn the_time_term_in_the_hazard_is_live_at_every_record() {
                 .cum_hazard
         };
         let rel = ((at(&live) - at(&flat)) / at(&flat)).abs();
+        // Same NaN trap as the sibling tests, and worse here: `f64::min` discards a
+        // NaN too, so an all-NaN run would leave `smallest` at INFINITY and pass
+        // the "the term is live" bound while proving nothing at all.
+        assert!(
+            rel.is_finite(),
+            "subject {id} at t={t}: relative gap is {rel}"
+        );
         smallest = smallest.min(rel);
         largest = largest.max(rel);
     }
