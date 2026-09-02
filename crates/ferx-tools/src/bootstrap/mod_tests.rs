@@ -1,5 +1,5 @@
 use super::*;
-use ferx_core::Subject;
+use ferx_core::{CancelFlag, Subject};
 use nalgebra::DMatrix;
 
 /// A two-theta, two-eta, one-sigma template with a correlated Omega block.
@@ -390,7 +390,7 @@ fn replicate_fits_are_quiet_single_threaded_and_checkpoint_free() {
         ..FitOptions::default()
     };
 
-    let o = replicate_options(&base, false);
+    let o = replicate_options(&base, false, &None);
     assert!(!o.verbose);
     assert_eq!(o.threads, Some(1));
     assert!(!o.checkpoint);
@@ -399,7 +399,119 @@ fn replicate_fits_are_quiet_single_threaded_and_checkpoint_free() {
     assert!(!o.run_covariance_step);
 
     // `--keep-covariance` is the one that turns the step back on.
-    assert!(replicate_options(&base, true).run_covariance_step);
+    assert!(replicate_options(&base, true, &None).run_covariance_step);
+    // Nothing to cancel with, so nothing is installed: a replicate of an
+    // uncancellable run polls no flag.
+    assert!(o.cancel.is_none());
+}
+
+#[test]
+fn the_run_wide_cancel_flag_reaches_every_replicate_fit() {
+    // The propagation #1161 depends on: a replicate is an ordinary `fit`, and
+    // the only way the flag it polls gets there is this clone.
+    let flag = CancelFlag::new();
+    let o = replicate_options(&FitOptions::default(), false, &Some(flag.clone()));
+    let installed = o.cancel.expect("the replicate options carry the flag");
+    assert!(!installed.is_cancelled());
+    flag.cancel();
+    assert!(
+        installed.is_cancelled(),
+        "the replicate got a copy of the flag rather than a share of it"
+    );
+}
+
+#[test]
+fn a_flag_on_the_model_s_own_fit_options_is_still_honoured() {
+    // The pre-#1161 route: callers set `prepared.parsed.fit_options.cancel` and
+    // relied on the replicate options cloning it. That has to keep working, or
+    // this change silently stops honouring a flag that used to abort a run.
+    let flag = CancelFlag::new();
+    let base = FitOptions {
+        cancel: Some(flag.clone()),
+        ..FitOptions::default()
+    };
+    let options = BootstrapOptions::default();
+    let effective = effective_cancel(&options, &base).expect("inherited from the fit options");
+    flag.cancel();
+    assert!(effective.is_cancelled());
+
+    // And the run-wide flag wins when both are set, so a caller that passes one
+    // to the tool is not quietly overridden by whatever the model file carried.
+    let run_wide = CancelFlag::new();
+    let effective = effective_cancel(
+        &BootstrapOptions {
+            cancel: Some(run_wide.clone()),
+            ..BootstrapOptions::default()
+        },
+        &base,
+    )
+    .expect("the run-wide flag");
+    assert!(
+        !effective.is_cancelled(),
+        "the already-cancelled fit-options flag took precedence over the run's own"
+    );
+    run_wide.cancel();
+    assert!(effective.is_cancelled());
+}
+
+#[test]
+fn a_cancellation_is_not_a_failure() {
+    // What a caller reports with. `Cancelled` has to survive the trip through a
+    // `String` error type readably, since that is what the CLI and the R glue
+    // still use.
+    let cancelled = BootstrapError::Cancelled;
+    assert!(cancelled.is_cancelled());
+    assert!(!BootstrapError::Failed("boom".to_string()).is_cancelled());
+
+    assert_eq!(
+        BootstrapError::Failed("boom".to_string()).to_string(),
+        "boom",
+        "a failure must not be dressed up on its way through Display"
+    );
+    assert!(String::from(cancelled).contains("cancel"));
+
+    // `?` on the String-returning helpers inside the run depends on both.
+    assert_eq!(
+        BootstrapError::from("boom"),
+        BootstrapError::Failed("boom".to_string())
+    );
+    assert_eq!(
+        BootstrapError::from("boom".to_string()),
+        BootstrapError::Failed("boom".to_string())
+    );
+}
+
+#[test]
+fn an_error_raised_under_a_set_flag_is_a_cancellation() {
+    // `fit` reports a cancelled fit as an ordinary `Err("cancelled by user")`,
+    // so the classifier is what keeps a bare `?` around a fit from turning the
+    // whole point of #1161 back into "the base fit failed".
+    let flag = CancelFlag::new();
+    let cancel = Some(flag.clone());
+
+    assert_eq!(
+        cancel_aware("cancelled by user".to_string(), &cancel),
+        BootstrapError::Failed("cancelled by user".to_string()),
+        "an error before the flag is set is a failure, whatever it says"
+    );
+
+    flag.cancel();
+    assert_eq!(
+        cancel_aware("cancelled by user".to_string(), &cancel),
+        BootstrapError::Cancelled
+    );
+    // A genuine failure racing the cancel is attributed to the cancel — the
+    // same call `run_one` makes when it drops rather than journals one.
+    assert_eq!(
+        cancel_aware("the model file is nonsense".to_string(), &cancel),
+        BootstrapError::Cancelled
+    );
+
+    // No flag at all: every error is what it says it is.
+    assert_eq!(
+        cancel_aware("boom".to_string(), &None),
+        BootstrapError::Failed("boom".to_string())
+    );
 }
 
 // ── --summarize ─────────────────────────────────────────────────────────────
@@ -888,7 +1000,7 @@ fn a_failed_run_still_reports_that_it_finished() {
     let sink = |event| events.lock().expect("not poisoned").push(event);
     let err = run_bootstrap_with_progress(&prepared, &options, Some(&sink))
         .expect_err("--dofv needs a base fit");
-    assert!(err.contains("--dofv"), "{err}");
+    assert!(err.to_string().contains("--dofv"), "{err}");
 
     let events = events.into_inner().expect("not poisoned");
     assert_eq!(
