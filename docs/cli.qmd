@@ -54,6 +54,55 @@ estimation engine many times without changing it. See
 confidence-interval estimator, and a worked comparison against the covariance
 step's standard errors.
 
+### GAM Covariate Screening (`gam`)
+
+```bash
+ferx gam model.ferx --data data.csv
+```
+
+Regresses every declared covariate against every ETA and prints a table ranked by
+ΔAIC = `AIC_null − AIC_best`; a positive ΔAIC means the covariate improves the
+model for that ETA. This is the Rust equivalent of Xpose4's `xpose.gam()`.
+
+The screen needs empirical Bayes estimates, so by default it fits the model
+first. Two ways to avoid paying for that fit:
+
+```bash
+# Reuse a fit you already ran.
+ferx gam --from-fit run.fitrx
+
+# Compute EBEs at the initial estimates only (NONMEM MAXEVAL=0).
+ferx gam model.ferx --data data.csv --no-fit
+```
+
+`--from-fit` needs `--data` as well when the bundle was written without
+`--include-data`; the dataset must be the one the fit was run on, since ETAs are
+matched to covariates by subject position. `--no-fit` is refused for methods
+that would estimate anyway — SAEM, IMPMAP, Bayes, VI, and `gn_hybrid`, whose
+FOCEI polish runs a fixed 100 iterations regardless of `outer_maxiter`.
+
+| flag | default | meaning |
+|---|---|---|
+| `--no-fit` | off | compute EBEs at the initial estimates, skip the outer loop |
+| `--from-fit PATH` | — | load a `.fitrx` bundle instead of fitting |
+| `--csv PATH` | `{model}-gam.csv` | where to write the ranked table |
+| `--no-csv` | off | print the table only, write no file |
+| `--spline-df N` | `2,3` | spline degrees of freedom to try (repeatable) |
+| `--no-linear` | off | drop the linear form from the candidates |
+| `--shrink FRAC` | `0.30` | warn above this ETA shrinkage |
+| `--threads N` | auto | rayon worker count |
+
+The same screen runs as part of an ordinary fit with `--gam`, which writes
+`{model}-gam.csv` using the default options:
+
+```bash
+ferx model.ferx --data data.csv --gam
+```
+
+Treat the output as a shortlist, not a model — see
+[GAM covariate screening](tools/gam-screening.qmd) for what ΔAIC does and does
+not tell you, the shrinkage caveat, and the Xpose4 validation.
+
 ### Validate without Fitting (`check`)
 
 ```bash

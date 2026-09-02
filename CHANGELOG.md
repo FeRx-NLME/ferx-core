@@ -19,6 +19,17 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Added
+- **`ferx gam` — GAM covariate pre-screening from the command line (#1114).** Screens every
+  declared covariate against every ETA with independent GAM regressions and prints a table
+  ranked by delta-AIC (`AIC_null − AIC_best`), the Rust equivalent of Xpose4's `xpose.gam()`.
+  Run it on a model and dataset, on an existing fit with `--from-fit <run.fitrx>`, or without
+  estimating at all with `--no-fit` (the NONMEM `MAXEVAL=0` equivalent). Candidate forms are
+  tuned with `--spline-df N` (repeatable) and `--no-linear`, the shrinkage warning threshold
+  with `--shrink FRAC`. Results are written to `{model}-gam.csv` by default; `--csv PATH`
+  redirects the file and `--no-csv` suppresses it. The same screen runs as part of an ordinary
+  fit with the `--gam` flag. See [GAM covariate screening](https://ferx-nlme.github.io/ferx-core/tools/gam-screening.html).
+
 ### Changed
 - **`FitOptions::threads` now also caps a multi-start fit (#1115).** A pinned positive `threads`
   was honored only when `n_starts <= 1`; with several starts the fan-out ran on the full-width

@@ -1,8 +1,6 @@
 mod bootstrap_cmd;
 mod gam_cmd;
 
-use ferx_tools::gam::{gam_screen, write_gam_csv, GamOptions};
-
 use ferx_core::NcaInit;
 use std::env;
 use std::time::Instant;
@@ -276,15 +274,9 @@ fn main() {
 
             // --gam: run GAM covariate pre-screening after fitting and write CSV.
             if args.iter().any(|a| a == "--gam") {
-                let gam_opts = GamOptions::default();
-                let gam = gam_screen(&fit_result, &population, &gam_opts);
-                for w in &gam.warnings {
-                    eprintln!("GAM Warning: {w}");
-                }
-                let gam_path = format!("{}-gam.csv", model_name);
-                match write_gam_csv(&gam, &gam_path) {
-                    Ok(()) => eprintln!("GAM results written to {}", gam_path),
-                    Err(e) => eprintln!("Warning: failed to write GAM results: {}", e),
+                match gam_cmd::run_after_fit(&fit_result, &population, model_name) {
+                    Ok(path) => eprintln!("GAM results written to {path}"),
+                    Err(e) => eprintln!("Warning: failed to write GAM results: {e}"),
                 }
             }
 
