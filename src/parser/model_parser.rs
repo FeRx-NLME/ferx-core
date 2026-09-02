@@ -1963,6 +1963,11 @@ pub fn parse_full_model_with(
             .get("odes")
             .ok_or("ODE model requires [odes] block")?
             .clone();
+        // State slots of the hazard accumulators appended just below — empty for
+        // every model without an `[event_model]`, and in a build without the
+        // `survival` feature. `build_ode_spec` needs them by slot (#1166).
+        #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
+        let mut chz_state_slots: Vec<usize> = Vec::new();
         // For each ODE-driven `[event_model] hazard = <expr>`, append a synthetic
         // accumulator state `__chz_<cmt>` with `d/dt(__chz_<cmt>) = <expr>`. It then
         // compiles in the [odes] RHS namespace (states + individual parameters) like
@@ -1982,6 +1987,7 @@ pub fn parse_full_model_with(
             ode_lines.push(format!("d/dt({state}) = {hazard_expr}"));
             state_names.push(state);
             chz_state_map.insert(cmt, chz_idx);
+            chz_state_slots.push(chz_idx);
         }
         let mut ode_spec = build_ode_spec(
             &ode_lines,
@@ -1989,6 +1995,7 @@ pub fn parse_full_model_with(
             obs_cmt_name.as_deref(),
             &indiv_var_names,
             &ode_slot_map,
+            &chz_state_slots,
         )?;
 
         // Parse optional [diffusion] block
@@ -10846,12 +10853,23 @@ fn extract_input_rate_terms(
     Ok((cleaned, forcings))
 }
 
+/// Compile the `[odes]` block into an [`crate::ode::OdeSpec`].
+///
+/// `chz_state_slots` carries the state slots of the **injected** joint-PK-TTE
+/// `d/dt(__chz_<cmt>)` hazard lines — empty for every model without an
+/// `[event_model]`, and empty in a build without the `survival` feature. It is
+/// passed in rather than detected here, by slot rather than by name, for a
+/// reason: without `survival` there is no `prescan_ode_hazards` and no
+/// reserved-name guard, so a user may legally declare a state called
+/// `__chz_1`, and a name-prefix filter would then silently exclude that user's
+/// own derivative from [`OdeRhsProgram::pk_reads_model_time`] (#1166).
 fn build_ode_spec(
     lines: &[String],
     state_names: &[String],
     obs_cmt_name: Option<&str>,
     indiv_param_names: &[String],
     indiv_param_slots: &[usize],
+    chz_state_slots: &[usize],
 ) -> Result<crate::ode::OdeSpec, String> {
     let n_states = state_names.len();
     // When the user omitted `obs_cmt=` in `ode(states=[...])` they must
@@ -10914,6 +10932,18 @@ fn build_ode_spec(
                 return Err(format!(
                     "[odes]: duplicate init({}) — initial condition defined more than once",
                     name
+                ));
+            }
+            // `parse_init_line` accepts any declared state, and the appended
+            // hazard accumulators are declared states by the time we get here —
+            // so without this a user could seed H(0) ≠ 0 and silently shift every
+            // survival probability. Same reservation as the RHS-read rejection
+            // below; H(0) = 0 is definitional (#1166).
+            if chz_state_slots.contains(&idx) {
+                return Err(format!(
+                    "[odes]: init({name}) seeds the cumulative-hazard accumulator the parser \
+                     appends for the [event_model] hazard (joint PK-TTE). `__chz_*` is \
+                     reserved and starts at H(0) = 0 by definition."
                 ));
             }
             let ctx = ParseCtx::ode(&init_ctx_defined);
@@ -11462,6 +11492,71 @@ fn build_ode_spec(
     // same var layout — evaluated over a dual type by `eval_rhs_g`.
     let uses_time_vars = stmts_read_slots(&stmts_owned, &[time_slot, tafd_slot, tad_slot]);
     let rhs_reads_time_builtin = stmts_read_time_builtin(&stmts_owned);
+    // The no-feedback precondition the narrow flag below rests on, established by
+    // rejection rather than by detect-and-widen (#1166). Reading the cumulative
+    // hazard back into the dynamics — from a PK derivative, an intermediate, an
+    // `if` condition, or the hazard expression itself — makes the injected line
+    // part of the coupled system, and the shared solve's Hermite-interpolated
+    // `chz_times` readout was never designed for that. `stmts_read_slots` sees
+    // only `Op::PushVar`, so the injected lines' own *writes* to these slots do
+    // not trip it. A `[scaling]` readout may still read `__chz_*`: a readout
+    // cannot feed back, and it is pinned as allowed.
+    //
+    // This walks the WHOLE program, so it also rejects a *self-exciting* hazard
+    // (`hazard = f(__chz)`), which is self-coupling within the accumulator's own
+    // row and leaves the PK block autonomous — i.e. stricter than the narrow flag
+    // below actually requires. Deliberate: no oracle exists for that model family
+    // on any of the paths that consume the hazard state (the shared solve reads
+    // `H` back by Hermite interpolation, and `h` off the derivative), and shipping
+    // it on "returns a finite number" is how the neighbouring defects got in.
+    // Narrowing this to `pk_stmts` is #1208, and needs an anchor first.
+    if !chz_state_slots.is_empty() && stmts_read_slots(&stmts_owned, chz_state_slots) {
+        let names: Vec<&str> = chz_state_slots
+            .iter()
+            .filter_map(|i| state_names_owned.get(*i).map(|s| s.as_str()))
+            .collect();
+        return Err(format!(
+            "[odes]: an equation reads the cumulative-hazard accumulator ({}) that the \
+             parser appends for the [event_model] hazard (joint PK-TTE). `__chz_*` is \
+             reserved and write-only — the hazard may depend on the PK states, not the \
+             other way round. Introduce your own state if you need to feed an \
+             accumulated quantity back into the dynamics.",
+            names.join(", ")
+        ));
+    }
+    // The narrow predicate: does the **PK block** read model time, ignoring the
+    // injected hazard lines. `uses_time_vars` / `reads_time_builtin` above stay
+    // over the whole program — the SS gates need them wide, since steady-state
+    // equilibration integrates the augmented system including `__chz`.
+    //
+    // The injected line is always top-level (`d/dt(__chz_<cmt>) = <hazard>` is
+    // pushed as its own `[odes]` line), so no `If` recursion is needed for the
+    // exclusion and the user's `if` bodies are walked exactly as before. By this
+    // point `resolve_variable_indices` has rewritten every `DiffEq` to
+    // `DiffEqBc(slot, _)`; `DiffEqIdx` is matched too because it is a documented
+    // fallback form and silently skipping it would widen the flag, not narrow it.
+    let pk_stmts: Vec<Statement> = if chz_state_slots.is_empty() {
+        Vec::new()
+    } else {
+        stmts_owned
+            .iter()
+            .filter(|s| match s {
+                Statement::DiffEqBc(slot, _) | Statement::DiffEqIdx(slot, _) => {
+                    !chz_state_slots.contains(slot)
+                }
+                _ => true,
+            })
+            .cloned()
+            .collect()
+    };
+    let pk_reads_model_time = if chz_state_slots.is_empty() {
+        // No injected lines ⇒ the filter is a no-op and the narrow flag is the
+        // wide one. Kept as an explicit branch so the common case does no work.
+        uses_time_vars || rhs_reads_time_builtin
+    } else {
+        stmts_read_slots(&pk_stmts, &[time_slot, tafd_slot, tad_slot])
+            || stmts_read_time_builtin(&pk_stmts)
+    };
     let rhs_program = OdeRhsProgram {
         stmts: stmts_owned.clone(),
         n_vars_total,
@@ -11473,6 +11568,7 @@ fn build_ode_spec(
         macheps_slot,
         uses_time_vars,
         reads_time_builtin: rhs_reads_time_builtin,
+        pk_reads_model_time,
     };
 
     let rhs: Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync> =
@@ -19202,6 +19298,15 @@ pub struct OdeRhsProgram {
     /// and is `false` for a `TIME`-only RHS — see [`stmts_read_time_builtin`]
     /// (#1124).
     reads_time_builtin: bool,
+    /// [`Self::reads_model_time`] over the **PK block alone** — the same walk with
+    /// the injected joint-PK-TTE `d/dt(__chz_<cmt>)` hazard lines removed (#1166).
+    ///
+    /// Equal to `reads_model_time()` for every model with no `[event_model]`
+    /// (no injected lines ⇒ nothing is filtered out), so it narrows exactly one
+    /// class: a joint PK-TTE model whose hazard is time-dependent — a Weibull or
+    /// Gompertz baseline, i.e. the standard case — but whose PK dynamics are
+    /// time-invariant.
+    pk_reads_model_time: bool,
 }
 
 impl OdeRhsProgram {
@@ -19239,6 +19344,27 @@ impl OdeRhsProgram {
     /// signal, that a gate stopped asking one of them.
     pub(crate) fn reads_model_time(&self) -> bool {
         self.uses_time_vars() || self.reads_time_builtin()
+    }
+
+    /// **The PK state block is non-autonomous**: [`Self::reads_model_time`] asked
+    /// of the user's `[odes]` equations only, with the injected joint-PK-TTE
+    /// hazard lines excluded (#1166).
+    ///
+    /// Ask this when the question is "may the PK states be superposed / may the
+    /// two halves of a joint objective share one solve?"; ask
+    /// [`Self::reads_model_time`] when the question is about the *augmented*
+    /// system, which is what a steady-state dose equilibrates — `__chz` included,
+    /// and a time-reading `__chz` line does break that state's cycle recurrence.
+    ///
+    /// Safe to ask on a non-joint model: with no injected lines the two are equal
+    /// by construction, asserted rather than assumed.
+    ///
+    /// Deliberately over-declines one shape: an intermediate that reads time and
+    /// is used only by the hazard (`TT = TIME` … `hazard = f(TT)`) is a top-level
+    /// `AssignBc`, not one of the excluded derivative lines, so it still reads
+    /// wide. Conservative in the correct direction; a dataflow cut is out of scope.
+    pub(crate) fn pk_reads_model_time(&self) -> bool {
+        self.pk_reads_model_time
     }
 
     /// Evaluate `du = f(u, p, t)` over a dual type, generic over [`PkNum`]

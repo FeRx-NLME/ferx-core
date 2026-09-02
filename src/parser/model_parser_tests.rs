@@ -8271,7 +8271,7 @@ fn test_duplicate_diffeq_in_different_branches_allowed() {
         "}".into(),
     ];
     let state_names = vec!["central".to_string()];
-    let result = build_ode_spec(&ode_lines, &state_names, Some("central"), &[], &[]);
+    let result = build_ode_spec(&ode_lines, &state_names, Some("central"), &[], &[], &[]);
     assert!(
         result.is_ok(),
         "same state in different branches must be allowed"
@@ -8293,6 +8293,7 @@ fn test_ode_rhs_undefined_name_errors() {
         Some("central"),
         &["CL".to_string()],
         &[0],
+        &[],
     );
     let err = match result {
         Err(e) => e,
@@ -8331,6 +8332,7 @@ fn test_ode_rhs_undefined_name_walks_all_nodes() {
         Some("central"),
         &["CL".to_string()],
         &[0],
+        &[],
     );
     let err = match result {
         Err(e) => e,
@@ -8359,6 +8361,7 @@ fn test_ode_rhs_defined_names_ok() {
         Some("central"),
         &["CL".to_string(), "V".to_string()],
         &[0, 1],
+        &[],
     );
     assert!(
         result.is_ok(),
@@ -8374,7 +8377,7 @@ fn test_ode_rhs_macheps_resolves_to_epsilon() {
     // silently read 0.0.
     let ode_lines: Vec<String> = vec!["d/dt(central) = MACHEPS".into()];
     let state_names = vec!["central".to_string()];
-    let spec = match build_ode_spec(&ode_lines, &state_names, Some("central"), &[], &[]) {
+    let spec = match build_ode_spec(&ode_lines, &state_names, Some("central"), &[], &[], &[]) {
         Ok(s) => s,
         Err(e) => panic!("MACHEPS in an ODE RHS must parse, got: {e}"),
     };
@@ -8394,7 +8397,7 @@ fn test_ode_reserved_builtin_name_collision_errors() {
     // builtin name — `MACHEPS` is now reserved alongside TIME/TAFD/TAD.
     let ode_lines: Vec<String> = vec!["d/dt(MACHEPS) = -MACHEPS".into()];
     let state_names = vec!["MACHEPS".to_string()];
-    let result = build_ode_spec(&ode_lines, &state_names, Some("MACHEPS"), &[], &[]);
+    let result = build_ode_spec(&ode_lines, &state_names, Some("MACHEPS"), &[], &[], &[]);
     let err = match result {
         Err(e) => e,
         Ok(_) => panic!("a state named MACHEPS must collide with the reserved builtin"),
@@ -20601,6 +20604,372 @@ fn reads_model_time_covers_every_spelling_and_the_flags_are_disjoint() {
     assert_eq!(flags("*(1.0 + 0.01*TAFD)"), (true, false, true), "TAFD");
     assert_eq!(flags("*(1.0 + 0.01*TAD)"), (true, false, true), "TAD");
     assert_eq!(flags(""), (false, false, false), "autonomous control");
+}
+
+/// A joint PK-TTE model, with `{PK}` appended to the central derivative, `{PRE}`
+/// inserted as an `[odes]` intermediate line and `{HAZ}` as the hazard.
+#[cfg(feature = "survival")]
+fn joint_src(pk: &str, pre: &str, haz: &str) -> String {
+    format!(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  theta TVH0(0.02, 1e-5, 10.0)
+  theta TVBETA(0.5, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  KA   = TVKA
+  H0   = TVH0
+  BETA = TVBETA
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  {pre}
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central{pk}
+[event_model]
+  cmt    = 3
+  hazard = {haz}
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+"
+    )
+}
+
+/// `(uses_time_vars, reads_time_builtin, reads_model_time, pk_reads_model_time)`.
+#[cfg(feature = "survival")]
+fn joint_flags(pk: &str, pre: &str, haz: &str) -> (bool, bool, bool, bool) {
+    let m = parse_model_string(&joint_src(pk, pre, haz)).expect("joint model must parse");
+    let p = m
+        .ode_spec
+        .as_ref()
+        .and_then(|o| o.rhs_program.as_ref())
+        .expect("rhs program");
+    (
+        p.uses_time_vars(),
+        p.reads_time_builtin(),
+        p.reads_model_time(),
+        p.pk_reads_model_time(),
+    )
+}
+
+/// #1166: the injected `d/dt(__chz_<cmt>)` hazard line does not make the **PK
+/// block** non-autonomous, under any spelling of model time.
+///
+/// The three wide flags keep seeing the whole augmented program — the SS gates
+/// need them to, since steady-state equilibration integrates `__chz` too — and
+/// only the fourth narrows. Every row is one variable away from its neighbour.
+#[test]
+#[cfg(feature = "survival")]
+fn a_time_dependent_hazard_does_not_make_the_pk_block_non_autonomous() {
+    const AUTO: &str = "H0 * exp(BETA * (central / V))";
+
+    // Control: nothing anywhere reads time.
+    assert_eq!(
+        joint_flags("", "", AUTO),
+        (false, false, false, false),
+        "autonomous hazard, autonomous PK"
+    );
+
+    // The four spellings, in the hazard: wide flags fire, the narrow one does not.
+    for (term, wide) in [
+        ("TIME", (false, true, true)),
+        ("T", (true, false, true)),
+        ("TAD", (true, false, true)),
+        ("TAFD", (true, false, true)),
+    ] {
+        let haz = format!("H0 * exp(0.05*{term}) * exp(BETA * (central / V))");
+        assert_eq!(
+            joint_flags("", "", &haz),
+            (wide.0, wide.1, wide.2, false),
+            "`{term}` in the hazard must leave the PK block autonomous"
+        );
+    }
+
+    // The same term in the PK RHS, with an autonomous hazard: the narrow flag
+    // must stay wide. This is the row that fails if the exclusion is written as
+    // "drop every top-level derivative" rather than "drop the injected ones".
+    assert_eq!(
+        joint_flags("*(1.0 + 0.01*TIME)", "", AUTO),
+        (false, true, true, true),
+        "`TIME` in the PK RHS is a genuinely non-autonomous PK block"
+    );
+    assert_eq!(
+        joint_flags("*(1.0 + 0.01*TAD)", "", AUTO),
+        (true, false, true, true),
+        "`TAD` in the PK RHS likewise"
+    );
+
+    // Documented over-decline: an intermediate that reads time and is consumed
+    // *only* by the hazard is a top-level `AssignBc`, not one of the excluded
+    // derivative lines, so it still reads wide. Conservative in the safe
+    // direction — pinned so a later dataflow cut is a deliberate change.
+    assert_eq!(
+        joint_flags(
+            "",
+            "TT = TIME",
+            "H0 * exp(0.05*TT) * exp(BETA * (central / V))"
+        ),
+        (false, true, true, true),
+        "a time-reading intermediate used only by the hazard over-declines, by design"
+    );
+}
+
+/// The narrowing is scoped to joint models by construction: with no injected
+/// lines the filter is empty and the new flag *is* the old one. Asserted for
+/// both a time-reading and an autonomous RHS, and in a build without the
+/// `survival` feature this is the only shape that exists.
+#[test]
+fn without_an_event_model_the_narrow_flag_equals_the_wide_one() {
+    fn flags(term: &str) -> (bool, bool) {
+        let src = format!(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = -1.0 * depot
+  d/dt(central) =  1.0 * depot - (CL/V) * central{term}
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"
+        );
+        let m = parse_model_string(&src).expect("parse");
+        let p = m
+            .ode_spec
+            .as_ref()
+            .and_then(|o| o.rhs_program.as_ref())
+            .expect("rhs program");
+        (p.reads_model_time(), p.pk_reads_model_time())
+    }
+    for term in ["", "*(1.0 + 0.01*TIME)", "*(1.0 + 0.01*TAD)"] {
+        let (wide, narrow) = flags(term);
+        assert_eq!(
+            wide, narrow,
+            "with no [event_model] the two predicates must agree (term `{term}`)"
+        );
+    }
+}
+
+/// The exclusion is keyed on the **slot** the parser injected, never on the name.
+///
+/// Without an `[event_model]` there is no injection and no reserved-name guard, so
+/// `__chz_1` is an ordinary, legal user state — and in a build without the
+/// `survival` feature that is the *only* way the name can occur. A name-prefix
+/// filter would silently drop this user's own derivative from the predicate and
+/// route a genuinely non-autonomous model as if it were time-invariant.
+#[test]
+fn a_user_state_named_like_the_accumulator_is_not_excluded() {
+    let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central, __chz_1])
+[odes]
+  d/dt(central) = -(CL/V) * central
+  d/dt(__chz_1) =  0.01 * TIME
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+    let m = parse_model_string(src).expect("`__chz_1` is a legal user state with no [event_model]");
+    let p = m
+        .ode_spec
+        .as_ref()
+        .and_then(|o| o.rhs_program.as_ref())
+        .expect("rhs program");
+    assert!(
+        p.reads_model_time() && p.pk_reads_model_time(),
+        "a user's own `__chz_1` derivative reading TIME must still read as non-autonomous"
+    );
+}
+
+/// The same rule where a name filter and a slot filter actually diverge *with*
+/// `survival` on: the parser injects `__chz_3` for the CMT-3 endpoint, and the
+/// collision guard only rejects a user state of **that** name — so a user state
+/// called `__chz_9` is legal, is not injected, and must be walked.
+///
+/// The sibling above cannot catch a name-prefix filter, because with no
+/// `[event_model]` the slot list is empty and the filter never runs at all.
+#[test]
+#[cfg(feature = "survival")]
+fn a_second_chz_named_user_state_is_walked_because_it_was_not_injected() {
+    let src = joint_src("", "", "H0 * exp(BETA * (central / V))")
+        .replace(
+            "  ode(obs_cmt=central, states=[depot, central])",
+            "  ode(obs_cmt=central, states=[depot, central, __chz_9])",
+        )
+        .replace(
+            "  d/dt(depot)   = -KA * depot",
+            "  d/dt(depot)   = -KA * depot\n  d/dt(__chz_9) = 0.01 * TIME",
+        );
+    let m = parse_model_string(&src).expect("`__chz_9` is not the injected accumulator");
+    let p = m
+        .ode_spec
+        .as_ref()
+        .and_then(|o| o.rhs_program.as_ref())
+        .expect("rhs program");
+    assert!(
+        p.pk_reads_model_time(),
+        "a user state whose name merely looks like the accumulator is still a PK \
+         equation — only the injected slot may be excluded"
+    );
+}
+
+/// A Form C `[scaling] y = …` readout that reads `TIME` must **not** widen the
+/// predicate (#1166 §2).
+///
+/// Both engines evaluate the readout under a `ModelTimeGuard`, so a time-reading
+/// readout is already correct on the dense driver; folding
+/// `readout_program.reads_time_builtin()` into this predicate — which
+/// `pk/modified_release.rs` does hand-pair, for a closed-form-only reason — would
+/// decline the shared solve for nothing. Pinned so that folding is a red test
+/// rather than a silent cost.
+#[test]
+#[cfg(feature = "survival")]
+fn a_time_reading_form_c_readout_does_not_widen_the_predicate() {
+    let src = joint_src("", "", "H0 * exp(BETA * (central / V))")
+        .replace(
+            "  ode(obs_cmt=central, states=[depot, central])",
+            "  ode(states=[depot, central])",
+        )
+        .replace(
+            "[event_model]",
+            "[scaling]\n  y = (central / V) * (1.0 + 0.0*TIME)\n\n[event_model]",
+        );
+    let m = parse_model_string(&src).expect("a TIME-reading Form C readout must parse");
+    let spec = m.ode_spec.as_ref().expect("ode spec");
+    // The precondition, asserted rather than assumed: the readout really does read
+    // time. Without this the two assertions below would also hold for a model where
+    // the `[scaling]` substitution silently did nothing.
+    assert!(
+        spec.readout_program
+            .as_ref()
+            .expect("Form C readout")
+            .reads_time_builtin(),
+        "the readout must actually read the TIME built-in"
+    );
+    let prog = spec.rhs_program.as_ref().expect("rhs program");
+    assert!(
+        !prog.reads_model_time(),
+        "the RHS itself is autonomous — only the readout reads time"
+    );
+    assert!(
+        !crate::pk::model_uses_time_anywhere(&m),
+        "a time-reading readout must not route the model off the dense driver"
+    );
+}
+
+/// #1166: `__chz_*` is write-only. The narrow flag is sound only because the
+/// injected line cannot influence the PK dynamics, and that is a property of
+/// every *normal* model rather than a structurally enforced one — the collision
+/// guard rejects a user state of the same name, but a user *reference* to the
+/// accumulator compiled fine. Establish the precondition by rejecting.
+#[test]
+#[cfg(feature = "survival")]
+fn reading_the_hazard_accumulator_is_rejected_everywhere_it_could_feed_back() {
+    let cases = [
+        // From a PK derivative — the read that would actually couple the systems.
+        (
+            joint_src(" + 0.0*__chz_3", "", "H0 * exp(BETA * (central / V))"),
+            "PK derivative",
+        ),
+        // Case-insensitively: the aliases resolve to the same slot.
+        (
+            joint_src(" + 0.0*__CHZ_3", "", "H0 * exp(BETA * (central / V))"),
+            "PK derivative, upper case",
+        ),
+        // From an intermediate.
+        (
+            joint_src("", "Z = __chz_3", "H0 * exp(BETA * (central / V))"),
+            "intermediate",
+        ),
+        // From inside an `if` condition — `stmts_read_slots` recurses into both
+        // the condition and the body, and a gate that only walked bodies would
+        // miss this.
+        (
+            joint_src(
+                "",
+                "if (__chz_3 > 1.0) { Z = 1.0 } else { Z = 2.0 }",
+                "H0 * exp(BETA * (central / V))",
+            ),
+            "if condition",
+        ),
+        // From the hazard itself — a self-exciting hazard is the same coupling.
+        (
+            joint_src("", "", "H0 * exp(BETA * (central / V)) * exp(0.1*__chz_3)"),
+            "hazard expression",
+        ),
+    ];
+    for (src, what) in cases {
+        let err = parse_model_string(&src)
+            .err()
+            .unwrap_or_else(|| panic!("reading __chz_3 from the {what} must be rejected"));
+        assert!(
+            err.contains("__chz") && err.contains("reserved"),
+            "the {what} error must name the accumulator and say it is reserved: {err}"
+        );
+    }
+}
+
+/// `init(__chz_n)` is the same hole through a different door: `parse_init_line`
+/// accepts any declared state, and the accumulator is a declared state by then,
+/// so a user could seed `H(0) ≠ 0` and shift every survival probability.
+#[test]
+#[cfg(feature = "survival")]
+fn seeding_the_hazard_accumulator_with_init_is_rejected() {
+    let src = joint_src("", "init(__chz_3) = 0.5", "H0 * exp(BETA * (central / V))");
+    let err = parse_model_string(&src)
+        .err()
+        .expect("init(__chz_3) must be rejected");
+    assert!(
+        err.contains("init(__chz_3)") && err.contains("H(0) = 0"),
+        "error must name the init and the definition it violates: {err}"
+    );
+}
+
+/// The one read that is **allowed**, pinned as allowed: a `[scaling]` readout
+/// cannot feed back into the dynamics, so `y = __chz_3` is legal — and it
+/// reads the cumulative hazard, which is what makes it worth a test rather than
+/// an accident of where the rejection was placed.
+#[test]
+#[cfg(feature = "survival")]
+fn a_scaling_readout_may_read_the_hazard_accumulator() {
+    let src = joint_src("", "", "H0 * exp(BETA * (central / V))")
+        .replace(
+            "  ode(obs_cmt=central, states=[depot, central])",
+            "  ode(states=[depot, central])",
+        )
+        .replace("[event_model]", "[scaling]\n  y = __chz_3\n\n[event_model]");
+    let m = parse_model_string(&src).expect("a readout reading __chz_3 must parse");
+    let p = m
+        .ode_spec
+        .as_ref()
+        .and_then(|o| o.rhs_program.as_ref())
+        .expect("rhs program");
+    assert!(
+        !p.pk_reads_model_time(),
+        "a readout does not make the PK block non-autonomous"
+    );
 }
 
 /// As [`cl_at`], but with a *constant* then-branch — so a branch taken while
