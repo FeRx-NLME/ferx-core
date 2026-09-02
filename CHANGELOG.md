@@ -184,6 +184,13 @@ section of the SDLC for the versioning policy).
   top of them, so a tool and the CLI cannot diverge in how a model is loaded.
 
 ### Fixed
+- **The packaged crate no longer ships two files the CC BY-NC exclusion was meant to cover (#1170).**
+  `exclude`'s `data/mbma_naproxen.*` glob required a literal `.` after the stem, so
+  `data/mbma_naproxen_source.py` slipped through, and `examples/` was never listed, so
+  `examples/mbma_naproxen.ferx` shipped as an example whose data is excluded and so cannot run.
+  Neither file was itself CC BY-NC (both are repo-authored MIT, and the restricted csv was
+  correctly excluded throughout), but the licence note in `data/mbma_naproxen.LICENSE` described
+  a mechanism the globs did not implement. Both are now excluded.
 - **An infusion into a built-in absorption compartment is no longer delivered twice on the
   dense/states engines (#1187).** With a `RATE>0` or `RATE=-2` dose into a `first_order()`,
   `transit()`, `igd()` or `weibull()` kernel (#719 gap 2), the mass was released *both* through

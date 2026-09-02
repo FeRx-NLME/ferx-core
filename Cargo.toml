@@ -42,11 +42,17 @@ readme = "README.md"
 # `cargo test --features slow-tests` on the packaged crate into a panic on a
 # missing file rather than a test that simply is not there.
 #
+# The glob deliberately has no `.` after `mbma_naproxen`: `data/mbma_naproxen.*`
+# matched the csv/LICENSE/README but not `data/mbma_naproxen_source.py` (#1170).
+# `examples/mbma_naproxen.ferx` is listed separately for the same reason the
+# slow test is: without the excluded csv it is an example that cannot run.
+#
 # `api/` is the CI-enforced public-API baseline (#1114) — a 388 KB rustdoc-derived
 # snapshot that is repo infrastructure, not crate content, so it is kept out of
 # the published tarball too.
 exclude = [
-  "data/mbma_naproxen.*",
+  "data/mbma_naproxen*",
+  "examples/mbma_naproxen.ferx",
   "tests/mbma_naproxen_case_study.rs",
   "api/*",
 ]
