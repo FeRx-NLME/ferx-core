@@ -27,6 +27,20 @@ section of the SDLC for the versioning policy).
   replicate. The pin is now an upper bound on the whole `fit()` call. A multi-start fit that
   pins `threads` below the core count is correspondingly slower than before, and unpinned
   multi-start fits are unchanged.
+- **The four documentation sections the callout blind spot had been hiding are split into
+  addressable subsections (#1190).** ODE models' *Which regime am I in?* gains **Where the step
+  counts show up**, **Bounding what a stalled segment costs**, **Measured: an accuracy-limited
+  fit** and **Every feature works with every method**; the analytic transit closed form gains
+  **Scope (first version)** and **The flip-flop regime**; VI's *How `σ` is updated* gains **Why
+  the default is 32 draws** and **If a VI fit lands short**; adaptive dosing's *Keys* gains
+  **Writing an `observe` expression**. Nothing was deleted and every existing anchor still
+  resolves — the R1 baseline is one entry shorter than before this PR, not longer.
+- **`tools/render-docs.sh` renders the docs site; prefer it to a bare `quarto render docs`
+  (#1190).** Quarto's project input discovery skips any path containing a hidden (dot-prefixed)
+  directory component, so from a worktree under `.claude/worktrees/<name>/` a plain
+  `quarto render docs` discovers zero inputs: it writes `robots.txt` and `sitemap.xml`, renders no
+  page, warns about nothing and exits 0. The script stages `docs/` outside the dot directory when
+  it has to, and fails loudly on a zero-page render.
 - **The repo is now a cargo workspace, and the `ferx` binary moved into a `ferx-cli` package
   (#1114).** The installed binary is unchanged — still `ferx`, same arguments, same output — but
   building it from a source checkout now needs the workspace or the package named:
@@ -144,6 +158,40 @@ section of the SDLC for the versioning policy).
   top of them, so a tool and the CLI cannot diverge in how a model is loaded.
 
 ### Fixed
+- **The docs linter no longer reads a Quarto callout title as a section boundary (#1190).**
+  Pandoc lifts the heading that opens a `::: {.callout-*}` block into the callout header, so the
+  rendered page gets neither a section nor an anchor from it — but `docs-lint` counted all 37 of
+  them across 15 pages as real headings. That chopped each callout's body into chunks R1 never
+  measured whole (three oversized sections were hidden, and one baselined section was reported at
+  5,756 characters when it is 7,331 — all four are now split, see below), and registered ids R3
+  and R4 treated as addressable. A
+  heading *later* inside a callout is still a real section. Slug generation is fixed alongside it:
+  inside a code span `<op>` is literal text, not an HTML tag, so
+  `` ## Rules — `when signal <op> <value>` `` addresses as `#rules-when-signal-op-value` and no
+  longer truncates at the first placeholder. Checked against a full `quarto render` of all 86
+  pages, in both directions — every heading the parser computes is a section on the site, and
+  every section on the site is one the parser computes.
+- **A lagged `zero_order` absorption route is no longer dropped by the ODE engines that serve
+  diagnostics, the joint PK-TTE hazard and `simulate()` (#1171).** `zero_order(dur=D, lag=L)`
+  is delivered as a per-segment constant rate, admitted only when the segment sits fully inside
+  the window `[t_dose + L, t_dose + L + D]`, so the integrator has to break its timeline at the
+  window's onset as well as its end. The shared helper pushed only the *end*, leaving the start
+  unbracketed on the two builders that did not separately bracket the route onset — the rate was
+  then dropped for the whole window, and a model whose only input is a lagged `zero_order` read
+  **exactly zero everywhere** on those paths. The helper now emits both edges, so the timeline
+  and the containment test can no longer disagree in any builder. Affected:
+  the sdtab `IPRED` and compartment-state columns (and the `IWRES`/`CWRES`/`[derived]` values
+  computed from them), `[derived]` grid integrals, the **joint PK-TTE** cumulative hazard and
+  its contribution to the objective — which collapsed to the drug-free baseline `H0·t`,
+  removing the entire drug effect — the Markov/CTMM endpoint likelihood, the adaptive-dosing
+  window AUC signal, and `simulate()` event times, where a subject who should have had an event
+  was administratively censored. A **pure-Gaussian** fit's OFV and `predict()` are unaffected:
+  their predictor already carried the onset break, which is why no existing test caught this.
+  Anchored against a new NONMEM `ADVAN13` run (`nonmem_anchor/lagged_zo.ctl`, `D1`+`ALAG1` with
+  `RATE=-2`), which the fixed paths now match to the `$TABLE` print precision. The onset break is
+  also restored for a lagged **`first_order`**/`transit`/`weibull` route on those engines, whose
+  kernels step at the onset rather than losing the window; those move within solver tolerance
+  rather than from zero, so no fit result changes materially.
 - **An `[odes]` right-hand side that is nonlinear in the compartment amounts is no longer
   served by the closed-form fast path (#1149).** Linearity was established by evaluating the
   right-hand side one compartment at a time with every other amount held at zero, so a term

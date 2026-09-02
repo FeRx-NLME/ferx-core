@@ -229,7 +229,9 @@ absorption with `ka = 1/MTT`.
 it (the flip-flop regime) ferx routes the model to its ODE twin automatically — see
 the flip-flop note below.
 
-**Scope (first version).** This analytic model supports single and multiple
+### Scope (first version)
+
+This analytic model supports single and multiple
 **bolus** doses into the depot (`CMT=1`), bioavailability, lag time, and a `central`
 initial amount. A model whose disposition switches mid-profile — a **time-varying
 covariate** or a `TIME`-dependent structural parameter — or that carries
@@ -250,6 +252,8 @@ non-depot (`CMT≠1`) dose, and a `depot` initial amount are still rejected** wi
 message — use the `transit()` ODE forcing above for those. The two paths agree to ODE-solver
 tolerance (`tests/transit_analytic_equivalence.rs`), so the forcing model is the
 drop-in choice when you need a feature the closed form does not yet cover.
+
+### The flip-flop regime
 
 When the disposition rate reaches or exceeds the transit rate `KTR = (n+1)/mtt`
 (the **flip-flop** regime — a slow-absorption depot whose absorption rate-limits a
@@ -693,7 +697,9 @@ term (there is no separate `sequential` keyword):
 
 ### Shared behaviour — zero-order
 
-`zero_order` reuses the same dose machinery as `transit`/`igd`/`weibull`:
+`zero_order` reuses the same dose machinery as `transit`/`igd`/`weibull`.
+
+#### Dose handling
 
 - **Dose routing** — the dose feeds `zero_order` over its window and is **not**
   also added as a bolus; the depot/central state stays an amount.
@@ -707,10 +713,25 @@ term (there is no separate `sequential` keyword):
   infusion as a zero-order source feeding the kernel); a `[diffusion]` block
   (SDE/EKF) into the input-rate compartment is still rejected with a clear error.
 
-The hard cutoff at `tad = dur` is handled exactly: ferx breaks the integration
-timeline at the window end and delivers the input as a per-segment constant (the
-way an infusion is injected), so the absorbed mass is exact — not smeared across
-the step.
+#### The window is bracketed at both edges
+
+The window is handled exactly: ferx breaks the integration timeline at **both**
+edges — the onset `t_dose + lagtime` and the cutoff `t_dose + lagtime + dur` — and
+delivers the input as a per-segment constant (the way an infusion is injected), so
+the absorbed mass is exact, not smeared across the step.
+
+Both edges matter, because a segment receives the constant rate only if it lies
+*entirely* inside the window. Bracketing only the cutoff leaves the segment
+straddling the onset failing that test, which drops the rate for the **whole**
+window rather than mis-resolving one step. Until [#1171] that was the behaviour on
+the engines serving sdtab, `[derived]` grid integrals, the joint PK-TTE hazard and
+`simulate()` whenever the route carried its own `lag=`: a model whose only input was
+a lagged `zero_order` reported exactly `0.0` at every observation, while the
+objective — which segments on a different code path — was correct throughout.
+
+  [#1171]: https://github.com/FeRx-NLME/ferx-core/issues/1171
+
+#### Analytic sensitivity across the moving boundary
 
 ::: {.callout-note}
 ## Sensitivity of `zero_order(dur)` is analytic (#530)
