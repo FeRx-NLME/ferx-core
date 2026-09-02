@@ -181,6 +181,58 @@ fn systematic_drift_is_detected_below_the_settling_test_noise_floor() {
     assert!(!trace_still_drifting(&poisoned, 40));
 }
 
+/// #1119: a heavy tail must not be able to buy the run a "settled" verdict.
+///
+/// `trace_has_settled` scales its tolerance by the trace's own within-window spread.
+/// With mean/variance that is a lever an unhealthy run can pull: a handful of large
+/// values inflate `s²`, `se` grows with them, and the tolerance swallows the systematic
+/// drift that is still there. Median/MAD asks the same question with estimators the
+/// outliers cannot move.
+#[test]
+fn a_heavy_tail_cannot_mask_systematic_drift() {
+    // Steady descent of 0.02/iteration, contaminated by four large spikes per window.
+    // The spikes are balanced across the two windows, so they barely move either
+    // *location* — only the spread.
+    let contaminated: Vec<f64> = (0..200)
+        .map(|i| 500.0 - 0.02 * i as f64 + if i % 13 == 0 { 150.0 } else { 0.0 })
+        .collect();
+
+    // The fixture only proves something if the mean/variance criterion it replaces
+    // would have been fooled by it. Recompute that criterion here rather than keeping a
+    // second copy of it in `run.rs`.
+    let n = contaminated.len();
+    let recent = &contaminated[n - 50..];
+    let prior = &contaminated[n - 100..n - 50];
+    let mean = |s: &[f64]| s.iter().sum::<f64>() / s.len() as f64;
+    let var =
+        |s: &[f64], m: f64| s.iter().map(|v| (v - m) * (v - m)).sum::<f64>() / (s.len() - 1) as f64;
+    let (m_recent, m_prior) = (mean(recent), mean(prior));
+    let se_meanvar = ((var(recent, m_recent) + var(prior, m_prior)) / 50.0).sqrt();
+    assert!(
+        (m_prior - m_recent).abs() <= 2.0 * se_meanvar + CONVERGENCE_REL_TOL * (1.0 + 500.0),
+        "fixture must actually fool the mean/variance criterion, else it proves nothing"
+    );
+
+    // The robust criterion is not fooled: the drift is 1.0 per window against a MAD-
+    // based standard error of a few hundredths.
+    assert!(
+        !trace_has_settled(&contaminated, 50, CONVERGENCE_REL_TOL),
+        "systematic drift under a heavy tail must not count as settled"
+    );
+
+    // The converse must hold too, or the swap would just make early stopping never
+    // fire: the same contamination on a genuinely flat trace still settles.
+    let flat_contaminated: Vec<f64> = (0..200)
+        .map(|i| {
+            500.0 + if i % 2 == 0 { 0.5 } else { -0.5 } + if i % 13 == 0 { 150.0 } else { 0.0 }
+        })
+        .collect();
+    assert!(
+        trace_has_settled(&flat_contaminated, 50, CONVERGENCE_REL_TOL),
+        "a plateaued trace must still settle, spikes or not"
+    );
+}
+
 /// #1098: an implausibly loose ELBO is evidence that a flat trace is a bad basin,
 /// not successful convergence. It must also suppress the generic iteration-budget
 /// advice, which does not address this failure mode.
