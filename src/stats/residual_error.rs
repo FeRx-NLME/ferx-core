@@ -2800,6 +2800,65 @@ pub(crate) fn residual_rd(
     }
 }
 
+/// Closed-form `(∂R_jj/∂ρ_k, ∂d_j/∂ρ_k)` for every `block_sigma` off-diagonal
+/// `k` at one observation (#847), where `d_j = ∂R_jj/∂f_j`.
+///
+/// The within-observation part of the residual variance is
+/// `R_jj = Σ_s (c_s σ_s)² + Σ_k 2 ρ_k c_{i_k} c_{j_k} σ_{i_k} σ_{j_k}`
+/// (see [`ErrorSpec::variance_at_scaled`]), and every loading coefficient `c_s`
+/// is affine in `f`, so
+///
+/// ```text
+///   ∂R_jj/∂ρ_k = 2 σ_i σ_j c_i c_j
+///   ∂d_j /∂ρ_k = 2 σ_i σ_j (c_i' c_j + c_i c_j')
+/// ```
+///
+/// with `c'` the slope loading. The `∂d/∂ρ` form is exactly the ρ-derivative of
+/// `diag_self_deriv`'s cross term, so the two can only agree.
+///
+/// **The floor is asymmetric, deliberately.** `variance_at_scaled` clamps `R` at
+/// `MIN_VARIANCE` while `diag_self_deriv` computes `d` unclamped, so a clamped
+/// row has `∂R/∂ρ = 0` but keeps its `∂d/∂ρ`. Mirroring that here is what stops
+/// the analytic gradient from claiming a live `∂R/∂ρ` on a row whose variance the
+/// objective has already pinned to the floor — the #958 failure mode, on the
+/// correlation axis.
+///
+/// A correlation whose two sigma slots are not both loaded by this observation
+/// contributes nothing to its variance, and so returns `(0, 0)`.
+pub(crate) fn dvar_drho(
+    es: &ErrorSpec,
+    cmt: usize,
+    f: f64,
+    sigma: &[f64],
+    correlations: &[ResidualCorrelation],
+    out: &mut [(f64, f64)],
+) {
+    debug_assert_eq!(out.len(), correlations.len());
+    let loadings = es.sigma_loadings(cmt, f, sigma.len());
+    let slopes = es.sigma_loading_slopes(cmt, sigma.len());
+    let coeff = |ld: &[(usize, f64)], slot: usize| -> Option<f64> {
+        ld.iter().find(|(i, _)| *i == slot).map(|(_, c)| *c)
+    };
+    let floored = es.variance_at_with_correlations(cmt, f, sigma, correlations) <= MIN_VARIANCE;
+    for (k, corr) in correlations.iter().enumerate() {
+        out[k] = (0.0, 0.0);
+        let (Some(ci), Some(cj)) = (
+            coeff(&loadings, corr.sigma_i),
+            coeff(&loadings, corr.sigma_j),
+        ) else {
+            continue;
+        };
+        let (Some(&si), Some(&sj)) = (sigma.get(corr.sigma_i), sigma.get(corr.sigma_j)) else {
+            continue;
+        };
+        let di = coeff(&slopes, corr.sigma_i).unwrap_or(0.0);
+        let dj = coeff(&slopes, corr.sigma_j).unwrap_or(0.0);
+        let ss = si * sj;
+        let dr = if floored { 0.0 } else { 2.0 * ss * ci * cj };
+        out[k] = (dr, 2.0 * ss * (di * cj + ci * dj));
+    }
+}
+
 /// [`residual_rd`] plus the second `f`-derivative `d2 = ∂²R/∂f²`.
 #[inline]
 pub(crate) fn residual_rd2(

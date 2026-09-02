@@ -88,17 +88,24 @@ impl Default for ElboConfig {
 
 /// Offsets of the blocks of the packed parameter vector produced by
 /// [`crate::estimation::parameterization::pack_params`]:
-/// `[θ | chol(Ω) | σ | chol(Ω_iov)]`.
+/// `[θ | chol(Ω) | σ | chol(Ω_iov) | ρ]`.
 ///
-/// The trailing `Ω_iov` block is present exactly when the model declares `kappa`
+/// The `Ω_iov` block is present exactly when the model declares `kappa`
 /// parameters; `n_omega_iov` is zero otherwise, so every offset below collapses to the
 /// three-block layout without special-casing.
+///
+/// The trailing `ρ` block holds the `block_sigma` off-diagonals (#847). VI does not
+/// estimate them — the ELBO's σ machinery has no ρ channel — so the block exists here
+/// only to keep [`Self::total`] equal to `pack_params().len()`, which is what lets VI's
+/// `x` round-trip through `unpack_params`. Its gradient entries stay zero, so Adam
+/// leaves ρ at the declared value.
 #[derive(Debug, Clone, Copy)]
 pub struct PackedLayout {
     pub n_theta: usize,
     pub n_omega: usize,
     pub n_sigma: usize,
     pub n_omega_iov: usize,
+    pub n_rho: usize,
 }
 
 impl PackedLayout {
@@ -113,11 +120,12 @@ impl PackedLayout {
                 .as_ref()
                 .map(|iov| lower_tri_iter(iov.dim(), iov.diagonal).count())
                 .unwrap_or(0),
+            n_rho: template.residual_correlations.len(),
         }
     }
 
     pub fn total(&self) -> usize {
-        self.n_theta + self.n_omega + self.n_sigma + self.n_omega_iov
+        self.n_theta + self.n_omega + self.n_sigma + self.n_omega_iov + self.n_rho
     }
 
     /// Index of the first `Ω` Cholesky coordinate.
@@ -130,10 +138,25 @@ impl PackedLayout {
         self.n_theta + self.n_omega
     }
 
-    /// Index of the first `Ω_iov` Cholesky coordinate. Equal to [`Self::total`] when the
-    /// model has no IOV, so the empty range `omega_iov_start()..total()` is a no-op.
+    /// Index of the first `Ω_iov` Cholesky coordinate. Equal to
+    /// [`Self::omega_iov_end`] when the model has no IOV, so the empty range
+    /// `omega_iov_start()..omega_iov_end()` is a no-op.
     pub fn omega_iov_start(&self) -> usize {
         self.n_theta + self.n_omega + self.n_sigma
+    }
+
+    /// One past the last `Ω_iov` coordinate — **not** [`Self::total`], which now
+    /// also counts the trailing ρ block (#847). Every `Ω_iov` range must end here,
+    /// or a `block_sigma` model's ρ coordinate gets treated as an IOV Cholesky
+    /// entry.
+    pub fn omega_iov_end(&self) -> usize {
+        self.omega_iov_start() + self.n_omega_iov
+    }
+
+    /// Index of the first `block_sigma` ρ coordinate (#847); equal to
+    /// [`Self::total`] when the model declares none.
+    pub fn rho_start(&self) -> usize {
+        self.omega_iov_end()
     }
 }
 
@@ -901,7 +924,7 @@ pub fn population_neg_elbo(
                 iov,
                 tmpl_iov,
                 &template.kappa_fixed,
-                &mut eval.grad_x[layout.omega_iov_start()..layout.total()],
+                &mut eval.grad_x[layout.omega_iov_start()..layout.omega_iov_end()],
             );
         }
         eval.grad_phi.push(t.grad_phi);

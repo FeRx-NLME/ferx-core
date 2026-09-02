@@ -839,7 +839,12 @@ fn precise_ebe_corr(
         let sens =
             crate::sens::provider::subject_sensitivities(model, subject, &params.theta, &eta)
                 .unwrap();
-        let (rv, dv, d2v) = corr_residual_diag(model, subject, &sens, sigma).unwrap();
+        // The **live** correlations (#847). Reading them off `model` here would
+        // reconverge every FD-perturbed EBE at the *declared* ρ, so the FD
+        // reference would silently omit the ρ coordinate's EBE-response term.
+        let (rv, dv, d2v) =
+            corr_residual_diag(model, subject, &sens, sigma, &params.residual_correlations)
+                .unwrap();
         let mut grad = DVector::<f64>::from_column_slice(
             &(omega_inv * DVector::from_column_slice(&eta))
                 .iter()
