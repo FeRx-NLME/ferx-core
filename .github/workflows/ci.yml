@@ -123,6 +123,7 @@ jobs:
             --test categorical_convergence \
             --test categorical_smoke \
             --test dose_compartment_routing \
+            --test lagged_zero_order_break_times \
             --test markov_nonmem \
             --test markov_smoke \
             --test nn_dcm_smoke \
