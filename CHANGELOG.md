@@ -49,6 +49,15 @@ section of the SDLC for the versioning policy).
   marked fixed, which is what it meant at the time.
 
 ### Fixed
+- **The `block_sigma` correlation coordinate is no longer magnitude-scaled below 1 (#847).**
+  The outer optimizer's `abs` preconditioner divides each packed coordinate by its own
+  `|value|`, which is right for a log-space coordinate but meaningless for the Fisher-z
+  `atanh(rho)` — that is a *position* in a bounded range which passes through zero. At the
+  common `rho = 0.2` init it handed the optimizer a coordinate with roughly thirty times the
+  scaled room of every other one, and NLopt L-BFGS failed on its first step. The scale is now
+  `max(|atanh rho|, 1)`. On the fluconazole RadboudUMC model a cold-start FOCEI fit goes from
+  failing at OFV 1111.12 to converging at **736.89 with rho = 0.9319**, against NONMEM's
+  734.644 / 0.9312. Models without a `block_sigma` are unaffected by construction.
 - **`simulate()` drew correlated residuals at the declared `block_sigma` correlation (#847).**
   The dense residual `R` it samples from used the live sigmas but the model's declared
   correlation, so a VPC or posterior-predictive check of a fit with an estimated off-diagonal

@@ -774,6 +774,44 @@ pub fn compute_scale(x: &[f64]) -> Vec<f64> {
         .collect()
 }
 
+/// [`compute_scale`], but the `block_sigma` Fisher-z coordinates keep scale 1.0
+/// (#847).
+///
+/// Magnitude scaling divides a coordinate by its own |packed value|, which is the
+/// right preconditioner for a **log-space** coordinate: there `|v|` is the
+/// parameter's order of magnitude, and the scaled bound range comes out within a
+/// few units of the origin. A Fisher-z `z = atanh(ρ)` is not on a log scale.
+/// `|z|` is a *position* in a bounded range that passes through zero at ρ = 0, so
+/// dividing by it is meaningless — and actively harmful: at the common init
+/// ρ = 0.2, `z = 0.203`, so the scaled box becomes ±`RHO_Z_BOUND`/0.203 ≈ ±30
+/// while every other scaled coordinate spans single digits. A quasi-Newton
+/// optimizer reads that as one direction with thirty times the room of the
+/// others.
+///
+/// The rule is `max(|z|, 1)`: normalise a ρ that has already grown past 1 (near a
+/// strong correlation, `atanh(0.93) ≈ 1.68`, where dividing by it is the same
+/// well-behaved normalisation every other coordinate gets), but never *divide by
+/// a value below 1*, which is what inflates the box. `compute_scale` makes the
+/// same move with its own 0.1 floor; a Fisher-z coordinate simply needs the floor
+/// at 1, because that is where its useful range begins.
+///
+/// Measured on the fluconazole RadboudUMC model (#847's motivating case), FOCEI
+/// from the model's declared inits: plain `compute_scale` fails at 1111.12
+/// (NLopt `Failure`, ρ never leaves its 0.2 init), a flat 1.0 converges to 736.89
+/// but stalls at init when started from NONMEM's estimates, and `max(|z|, 1)`
+/// converges from both (736.89 with ρ = 0.9319, against NONMEM's 0.9312).
+pub(crate) fn compute_scale_packed(x: &[f64], template: &ModelParameters) -> Vec<f64> {
+    let mut scale = compute_scale(x);
+    for (s, z) in scale
+        .iter_mut()
+        .zip(x.iter())
+        .skip(rho_packed_start(template))
+    {
+        *s = z.abs().max(1.0);
+    }
+    scale
+}
+
 /// Divide each element of `x` by the corresponding scale factor.
 /// `x_s = x / scale` — the representation seen by the outer optimizer.
 pub fn apply_scale(x: &[f64], scale: &[f64]) -> Vec<f64> {
@@ -1037,6 +1075,61 @@ mod tests {
         let h = 1e-6;
         let fd = (unpack_rho(z + h) - unpack_rho(z - h)) / (2.0 * h);
         assert_relative_eq!(rho_chain(unpack_rho(z)), fd, epsilon = 1e-9);
+    }
+
+    /// `compute_scale_packed` must be **byte-identical** to `compute_scale` for
+    /// any model without a `block_sigma` — the scaling change (#847) is scoped to
+    /// the ρ block and must not perturb a single existing fit.
+    #[test]
+    fn test_scale_packed_is_unchanged_without_correlations() {
+        let template = make_template();
+        let x = pack_params(&template);
+        assert_eq!(compute_scale_packed(&x, &template), compute_scale(&x));
+    }
+
+    /// Magnitude scaling normalises by |packed value|, which is meaningless for a
+    /// Fisher-z coordinate: `z = atanh(ρ)` is a position in a bounded range, not
+    /// an order of magnitude, and it passes through zero at ρ = 0. At the common
+    /// ρ = 0.2 init that would hand the optimizer a coordinate with ~30× the
+    /// scaled room of every other one. Leave it at 1.0 (#847).
+    #[test]
+    fn test_scale_packed_leaves_the_rho_coordinate_alone() {
+        let template = make_rho_template(0.2, false);
+        let x = pack_params(&template);
+        let scale = compute_scale_packed(&x, &template);
+        let rho_idx = rho_packed_start(&template);
+
+        // atanh(0.2) ≈ 0.203 < 1, so the floor applies and the box is not inflated.
+        assert_eq!(scale[rho_idx], 1.0);
+        // Every non-ρ coordinate keeps the magnitude scaling untouched.
+        let plain = compute_scale(&x);
+        assert_eq!(scale[..rho_idx], plain[..rho_idx]);
+        // The wart this exists to remove: |atanh(0.2)| ≈ 0.203, so magnitude
+        // scaling would have given the ρ box ~30 units of scaled room.
+        let bounds = compute_bounds(&template);
+        let width_if_scaled =
+            (bounds.upper[rho_idx] - bounds.lower[rho_idx]) / plain[rho_idx].abs();
+        assert!(
+            width_if_scaled > 50.0,
+            "the unscaled-ρ guard is pointless if magnitude scaling were benign here \
+             (width {width_if_scaled})"
+        );
+        let width_now = (bounds.upper[rho_idx] - bounds.lower[rho_idx]) / scale[rho_idx];
+        assert_relative_eq!(width_now, 2.0 * RHO_Z_BOUND);
+    }
+
+    /// Above the floor the ρ coordinate is normalised like any other: at a strong
+    /// correlation `|atanh(ρ)| > 1`, and dividing by it is the same well-behaved
+    /// move `compute_scale` makes everywhere else. Only the *below-1* case is
+    /// special (#847).
+    #[test]
+    fn test_scale_packed_normalises_a_large_rho_coordinate() {
+        let template = make_rho_template(0.93, false);
+        let x = pack_params(&template);
+        let rho_idx = rho_packed_start(&template);
+        let z = 0.93_f64.atanh();
+        assert!(z > 1.0);
+        assert_relative_eq!(compute_scale_packed(&x, &template)[rho_idx], z);
     }
 
     /// A ρ coordinate is bounded symmetrically, so — like an Ω off-diagonal —

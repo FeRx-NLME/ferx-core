@@ -1465,13 +1465,13 @@ fn optimize_nlopt_once(
             if has_identity_theta {
                 vec![1.0; n]
             } else {
-                compute_scale(&x0)
+                compute_scale_packed(&x0, init_params)
             }
         }
         // `Auto` is resolved away by `resolve_scaling`; group with `None`.
         ParameterScaling::None | ParameterScaling::Auto => {
             if (options.scale_params || auto_scale_iov) && !has_identity_theta {
-                compute_scale(&x0)
+                compute_scale_packed(&x0, init_params)
             } else {
                 vec![1.0; n]
             }
@@ -2356,10 +2356,10 @@ fn optimize_bfgs(
     // Per-element scale factors for the BFGS outer loop.
     let scale: Vec<f64> = match resolve_scaling(options.parameter_scaling, options.optimizer) {
         ParameterScaling::Rescale2 => compute_rescale2_scale(&bounds),
-        ParameterScaling::Abs => compute_scale(&x),
+        ParameterScaling::Abs => compute_scale_packed(&x, init_params),
         ParameterScaling::None | ParameterScaling::Auto => {
             if options.scale_params {
-                compute_scale(&x)
+                compute_scale_packed(&x, init_params)
             } else {
                 vec![1.0; n]
             }
