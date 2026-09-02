@@ -21,6 +21,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use ferx_core::{
@@ -38,6 +39,50 @@ pub mod summary;
 pub use manifest::RunManifest;
 pub use resample::{Replicate, SampleSize, Strata};
 pub use summary::{BootstrapSummary, ParameterSummary};
+
+/// What a running bootstrap reports about its own progress.
+///
+/// The bootstrap is minutes to hours of fitting behind a single call, so a
+/// caller that wants to show progress needs the completion count *as it
+/// happens*, not once the run is over. The events are plain data and carry no
+/// terminal concern of any kind: `ferx bootstrap`'s `indicatif` bar and the R
+/// package's `cli` bar are two renderings of this one stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapEvent {
+    /// Emitted once, before the first fit, describing the work this run will
+    /// actually do. `replicates` is what is still to be fitted, so a `--resume`
+    /// run reports what is left rather than what the whole run was, and
+    /// `reused` is what it read off disk instead.
+    Started {
+        replicates: usize,
+        reused: usize,
+        base_fit: bool,
+    },
+    /// The fit on the original dataset finished. Not emitted when there is no
+    /// base fit to run (`run_base_model = false`, or a resume that reuses it).
+    BaseFitDone,
+    /// One replicate finished, converged or not. `completed` counts in
+    /// completion order, which on a thread pool is not index order, and counts
+    /// only the replicates this run fitted — it reaches `total` at the end of a
+    /// resumed run too.
+    ReplicateDone { completed: usize, total: usize },
+    /// One Δofv evaluation finished (`dofv = true` only). The Δofv pass is a
+    /// second sweep over every replicate that roughly doubles the run time, so
+    /// it counts separately instead of silently extending the first bar past
+    /// what it promised.
+    DeltaOfvDone { completed: usize, total: usize },
+    /// Every fit is done. The summary and the CSV artefacts still follow, and
+    /// on a large run those are not instant.
+    Finished,
+}
+
+/// A sink for [`BootstrapEvent`]s.
+///
+/// `Send + Sync` because the replicates are fitted on a Rayon pool and each one
+/// reports from whichever thread finished it: a sink that keeps state has to
+/// carry its own synchronisation (an `AtomicUsize`, a `Mutex`), and the event's
+/// `completed` field is there so that most sinks need neither.
+pub type ProgressFn<'a> = &'a (dyn Fn(BootstrapEvent) + Send + Sync);
 
 /// Everything the bootstrap needs beyond the model and data themselves.
 ///
@@ -643,6 +688,30 @@ pub fn run_bootstrap(
     prepared: &PreparedRun,
     options: &BootstrapOptions,
 ) -> Result<BootstrapResult, String> {
+    run_bootstrap_with_progress(prepared, options, None)
+}
+
+/// Run the bootstrap, reporting each fit as it completes.
+///
+/// Identical to [`run_bootstrap`] in every respect but the callback: the draws,
+/// the fits and the artefacts do not depend on whether anyone is watching, so a
+/// run with a progress sink and one without produce the same numbers from the
+/// same seed.
+///
+/// The sink is called from the Rayon worker that finished the fit, once per
+/// replicate — never in a hot loop, since a replicate is a whole fit — so it
+/// may do real work (redraw a bar, call back into R). It must not panic: a
+/// panic crosses the `par_iter` boundary and takes the run with it.
+pub fn run_bootstrap_with_progress(
+    prepared: &PreparedRun,
+    options: &BootstrapOptions,
+    progress: Option<ProgressFn<'_>>,
+) -> Result<BootstrapResult, String> {
+    let emit = |event: BootstrapEvent| {
+        if let Some(sink) = progress {
+            sink(event);
+        }
+    };
     reject_id_dependent_model(&prepared.parsed.model)?;
     reject_mixture_model(&prepared.init_params)?;
     options.validate()?;
@@ -698,6 +767,17 @@ pub fn run_bootstrap(
     };
     let n_reused = reused.len();
     let already_done: std::collections::HashSet<usize> = reused.iter().map(|r| r.index).collect();
+
+    // Announced here rather than at the top of the function because this is the
+    // first point at which the run knows its own size: `--resume` decides how
+    // many of the `samples` draws are actually going to be fitted, and a
+    // progress bar promising 200 when 190 are already on disk is a wrong bar.
+    let n_todo = draws.len() - already_done.len();
+    emit(BootstrapEvent::Started {
+        replicates: n_todo,
+        reused: n_reused,
+        base_fit: options.run_base_model && reused_original.is_none(),
+    });
 
     // ── the incremental journal ─────────────────────────────────────────────
     // Opened before the first fit so that a kill at any point from here on
@@ -760,6 +840,7 @@ pub fn run_bootstrap(
             if let Some(j) = &journal {
                 j.append(&base, None);
             }
+            emit(BootstrapEvent::BaseFitDone);
             Some(base)
         }
         None => None,
@@ -774,6 +855,7 @@ pub fn run_bootstrap(
     };
 
     // ── the replicates ──────────────────────────────────────────────────────
+    let n_completed = AtomicUsize::new(0);
     let run_one = |replicate: &Replicate| -> ReplicateResult {
         let population = resample::build_population(&prepared.population, replicate);
         let started = Instant::now();
@@ -818,6 +900,14 @@ pub fn run_bootstrap(
         if let Some(j) = &journal {
             j.append(&result, Some(replicate));
         }
+        // Counted here rather than by the sink so that every sink agrees on the
+        // number: `par_iter` hands results back in index order, but they are
+        // *produced* in completion order, and a bar that steps on the order the
+        // results are collected in would sit still and then jump.
+        emit(BootstrapEvent::ReplicateDone {
+            completed: n_completed.fetch_add(1, Ordering::Relaxed) + 1,
+            total: n_todo,
+        });
         result
     };
 
@@ -853,8 +943,16 @@ pub fn run_bootstrap(
             "--dofv needs the original fit's OFV as its reference; it cannot be combined with \
              --no-run-base-model",
         )?;
-        compute_delta_ofv(prepared, template, base.ofv, &base_options, &mut replicates)?;
+        compute_delta_ofv(
+            prepared,
+            template,
+            base.ofv,
+            &base_options,
+            &mut replicates,
+            progress,
+        )?;
     }
+    emit(BootstrapEvent::Finished);
 
     let n_estimated_parameters = count_estimated(template);
     let summary = summary::summarize(&names, original.as_ref(), &replicates, options);
@@ -1013,22 +1111,36 @@ fn compute_delta_ofv(
     ofv_original: f64,
     base_options: &FitOptions,
     replicates: &mut [ReplicateResult],
+    progress: Option<ProgressFn<'_>>,
 ) -> Result<(), String> {
     let mut eval = base_options.clone();
     eval.outer_maxiter = 0;
     eval.run_covariance_step = false;
 
+    let total = replicates.len();
+    let done = AtomicUsize::new(0);
     let deltas: Vec<(usize, Option<f64>)> = replicates
         .par_iter()
         .map(|r| {
-            if r.error.is_some() || r.estimates.is_empty() {
-                return (r.index, None);
+            let out = if r.error.is_some() || r.estimates.is_empty() {
+                (r.index, None)
+            } else {
+                let params = params_from_estimates(template, &r.estimates);
+                let ofv = fit(&prepared.parsed.model, &prepared.population, &params, &eval)
+                    .map(|f| f.ofv)
+                    .ok();
+                (r.index, ofv.map(|o| o - ofv_original))
+            };
+            // A skipped replicate is counted too: the bar tracks the sweep, and
+            // the sweep is over every replicate whether or not it has estimates
+            // worth evaluating.
+            if let Some(sink) = progress {
+                sink(BootstrapEvent::DeltaOfvDone {
+                    completed: done.fetch_add(1, Ordering::Relaxed) + 1,
+                    total,
+                });
             }
-            let params = params_from_estimates(template, &r.estimates);
-            let ofv = fit(&prepared.parsed.model, &prepared.population, &params, &eval)
-                .map(|f| f.ofv)
-                .ok();
-            (r.index, ofv.map(|o| o - ofv_original))
+            out
         })
         .collect();
 

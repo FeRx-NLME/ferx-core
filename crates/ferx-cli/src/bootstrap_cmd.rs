@@ -8,8 +8,10 @@
 use std::path::PathBuf;
 
 use ferx_tools::bootstrap::{
-    resummarize, run_bootstrap, BootstrapOptions, BootstrapResult, SampleSize,
+    resummarize, run_bootstrap_with_progress, BootstrapOptions, BootstrapResult, SampleSize,
 };
+
+use crate::bootstrap_progress::BootstrapProgress;
 
 pub const BOOTSTRAP_USAGE: &str = "\
 Usage: ferx bootstrap <model.ferx> [--data <data.csv>] [options]
@@ -31,6 +33,9 @@ estimates. Resampling is always over whole subjects.
                        column must take exactly one value per subject.
   --directory DIR      where the CSV artefacts go (default {model}-bootstrap)
   --ci LEVEL           two-sided confidence level in percent (default 95)
+  --no-progress        do not draw the progress bar. It is already suppressed
+                       when stderr is not a terminal, so this is for an
+                       interactive run whose output you want quiet.
 
   --no-update-inits    start replicates from the model file's initial estimates
                        instead of the base fit's final ones
@@ -217,7 +222,9 @@ fn run_bootstrap_command(args: &[String], model_path: &str) -> Result<i32, Strin
     }
 
     let started = std::time::Instant::now();
-    let result = run_bootstrap(&prepared, &options)?;
+    let progress = BootstrapProgress::new(!flag(args, "--no-progress"));
+    let sink = |event| progress.on_event(event);
+    let result = run_bootstrap_with_progress(&prepared, &options, Some(&sink))?;
     eprintln!(
         "Fitted {} replicates in {:.1}s{}",
         result.replicates.len() - result.n_reused,

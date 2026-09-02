@@ -46,7 +46,8 @@ ferx bootstrap model.ferx --data data.csv --samples 200 --seed 12345 --threads 8
 Resamples subjects with replacement, refits the model to each replicate dataset,
 and reports bias, standard errors and confidence intervals from the spread of the
 estimates — the non-parametric case bootstrap, at `PsN::bootstrap` feature parity.
-Writes PsN-named CSV artefacts to `{model}-bootstrap/`.
+Writes PsN-named CSV artefacts to `{model}-bootstrap/`. Progress is drawn as a bar on
+stderr while the replicates fit, when stderr is a terminal; `--no-progress` turns it off.
 
 Unlike a fit, this is a *tool*: it lives in the `ferx-tools` crate and calls the
 estimation engine many times without changing it. See
