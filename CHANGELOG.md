@@ -33,6 +33,11 @@ section of the SDLC for the versioning policy).
   fit with the `--gam` flag. See [GAM covariate screening](https://ferx-nlme.github.io/ferx-core/tools/gam-screening.html).
 
 ### Changed
+- **The published tarball no longer ships repo infrastructure (#1170).** `tests/`,
+  `nonmem_anchor/`, `docs/`, `plans/`, `tools/`, the workflow and hook directories and the
+  repo-process markdown are excluded from the crate: 1289 files / 5.47 MB compressed becomes
+  366 files / 3.22 MB. None of it is needed to build or document the crate. Running the test
+  suite needs a git checkout, as it needed the NONMEM anchors anyway. No source or API change.
 - **The three published crates now carry `keywords` and `categories` (#1170).** Registry metadata
   only -- no code change. It is what covers discoverability on crates.io, which is why claiming
   the `ferx-nlme` name was judged unnecessary in #1170.

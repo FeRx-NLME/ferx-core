@@ -39,10 +39,8 @@ readme = "README.md"
 # the crate published to crates.io free of any CC BY-NC file. The glob also takes
 # its README and licence companions, which are MIT / Creative Commons' own text
 # respectively — they are dropped because they are meaningless without the data,
-# not because of their licence. The slow test goes with them for the same reason:
-# it hardcodes the fixture path, so shipping it without the data would turn
-# `cargo test --features slow-tests` on the packaged crate into a panic on a
-# missing file rather than a test that simply is not there.
+# not because of their licence. The slow test that reads the fixture is covered
+# by the blanket `tests/*` exclusion below.
 #
 # The glob deliberately has no `.` after `mbma_naproxen`: `data/mbma_naproxen.*`
 # matched the csv/LICENSE/README but not `data/mbma_naproxen_source.py` (#1170).
@@ -55,8 +53,25 @@ readme = "README.md"
 exclude = [
   "data/mbma_naproxen*",
   "examples/mbma_naproxen.ferx",
-  "tests/mbma_naproxen_case_study.rs",
   "api/*",
+  # Repo infrastructure, not crate content. None of it is needed to build or
+  # document the crate, and together it is roughly 7.5 MB of a 19.6 MB tarball.
+  # `nonmem_anchor/` goes with `tests/`: it is the NONMEM reference output the
+  # anchor tests read, and nothing outside `tests/` opens it (the mentions in
+  # `src/` are prose in doc comments). Consumers who want to run the test suite
+  # clone the repo; the published crate exists to be built against.
+  "tests/*",
+  "nonmem_anchor/*",
+  "docs/*",
+  "plans/*",
+  "tools/*",
+  ".github/*",
+  ".githooks/*",
+  "AGENTS.md",
+  "CLAUDE.md",
+  "SDLC.md",
+  "VI_VALIDATION.md",
+  "codecov.yml",
 ]
 
 [features]
