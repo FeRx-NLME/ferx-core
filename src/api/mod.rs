@@ -97,7 +97,7 @@ pub(crate) use fit::{
 #[cfg(test)]
 pub(crate) use output_columns::build_indiv_map;
 #[cfg(test)]
-pub(crate) use pool::{cap_default_threads, default_thread_count};
+pub(crate) use pool::{cap_default_threads, default_thread_count, effective_default_threads};
 #[cfg(test)]
 pub(crate) use postfit::{
     diagnostic_details, high_correlation_pairs, packed_guard_side, should_run_sir_fallback,

@@ -52,9 +52,11 @@ fn from_budget_spends_the_budget_on_the_outer_level_first() {
 
 #[test]
 fn a_zero_budget_falls_back_to_the_engine_default() {
-    // `0` means "the engine default", not "let Rayon decide" — the same
-    // cores-minus-one capped at 8 an unpinned `fit()` uses.
-    let expected = crate::api::default_thread_count();
+    // `0` means "the engine default", not "let Rayon decide" — whatever an
+    // unpinned `fit()` would run on. That is cores-minus-one capped at 8, unless
+    // a CLI explicitly sized the process-wide pool, so the plan has to resolve it
+    // through the same helper `default_fit_pool` sizes itself with.
+    let expected = crate::api::effective_default_threads();
     let plan = PoolPlan::from_budget(0, 200);
     assert_eq!(plan.replicates(), expected);
     assert_eq!(plan.threads_per_fit(), 1);
@@ -96,6 +98,13 @@ fn the_outer_pool_really_has_more_than_the_default_stack() {
     // `install` overflows unless the plan applied `FIT_RAYON_STACK_SIZE`.
     // `install` runs `op` on a pool worker, so this is the worker's stack, not
     // the caller's.
+    //
+    // A regression here fails loudly but bluntly: a stack overflow aborts the
+    // process rather than unwinding, so the whole test binary dies and its other
+    // tests read as "not run". That is deliberate — the declared-size assertion
+    // in the test above is the graceful half of the pair, and it is what names
+    // the cause; this one is the observation that the declaration is real, and
+    // there is no way to observe it without risking the overflow.
     const PROBE: usize = 4 * 1024 * 1024;
     let sum = PoolPlan::new(2, 1)
         .install(|| {
@@ -224,6 +233,28 @@ fn a_single_threaded_plan_does_not_spawn_subject_level_workers() {
     assert_eq!(
         result.n_threads_used, 1,
         "the inner fit must stay on one worker so it does not compete with the replicate loop"
+    );
+}
+
+#[test]
+fn a_pinned_plan_also_caps_a_multi_start_fit() {
+    // The hazard `PoolPlan` exists for, in its worst form: a tool that pins
+    // `threads_per_fit = 1` and also asks for several starts. The start fan-out
+    // must run on the pinned pool, not on the full-width shared one underneath
+    // every replicate — otherwise an 8-wide outer pool times an 8-wide shared
+    // pool is 64-way oversubscription on 8 cores (#1115).
+    let model = one_cpt_model();
+    let pop = population();
+    let mut opts = short_fit_opts();
+    opts.n_starts = 3;
+    PoolPlan::from_budget(8, 200).apply_to(&mut opts);
+    assert_eq!(opts.threads, Some(1));
+
+    let result = fit(&model, &pop, &model.default_params, &opts).expect("fit");
+    assert_eq!(
+        result.n_threads_used, 1,
+        "a multi-start fit must honor the pinned thread count too, or a plan's \
+         budget is silently multiplied by `n_starts`"
     );
 }
 

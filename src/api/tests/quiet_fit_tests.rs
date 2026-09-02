@@ -104,9 +104,33 @@ fn run_quiet_fit() {
     // machinery pushes into it regardless of `verbose`.
     let _: &Vec<String> = &result.warnings;
     assert!(result.ofv.is_finite());
+
+    // Silence must not mean lost information: the trace filename embeds the pid
+    // and a timestamp, so a quiet caller can only learn it from `warnings`.
+    // Reading it back is also what lets this test clean up after itself instead
+    // of leaking one /tmp file per run.
+    let trace_path = result
+        .warnings
+        .iter()
+        .find_map(|w| w.strip_prefix("optimizer trace written to "))
+        .unwrap_or_else(|| {
+            panic!(
+                "a quiet fit with `optimizer_trace` must report the trace path \
+                 on `warnings`, since it prints nothing; got: {:?}",
+                result.warnings
+            )
+        });
+    assert!(
+        std::path::Path::new(trace_path).exists(),
+        "reported trace path does not exist: {trace_path}"
+    );
+    let _ = std::fs::remove_file(trace_path);
 }
 
-/// libtest's own progress lines, which are not the engine talking.
+/// libtest's own progress lines on **stdout**, which are not the engine talking.
+/// Blank lines count as harness output here because libtest pads its own report
+/// with them; that is why stderr is checked strictly-empty instead, where a bare
+/// `eprintln!()` from the engine has nothing to hide behind.
 fn is_harness_line(line: &str) -> bool {
     let l = line.trim();
     l.is_empty()
@@ -144,8 +168,10 @@ fn a_quiet_fit_writes_nothing_to_stdout_or_stderr() {
         "the child did not actually run the fit — filter `{TEST_PATH}` matched nothing:\n{stdout}"
     );
 
+    // Strictly empty, not `trim().is_empty()`: a bare `eprintln!()` leaking from
+    // the engine writes a lone newline, and trimming would hide exactly that.
     assert!(
-        stderr.trim().is_empty(),
+        out.stderr.is_empty(),
         "a quiet fit wrote to stderr:\n{stderr}"
     );
     let stray: Vec<&str> = stdout.lines().filter(|l| !is_harness_line(l)).collect();

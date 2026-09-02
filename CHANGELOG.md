@@ -20,6 +20,13 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Changed
+- **`FitOptions::threads` now also caps a multi-start fit (#1115).** A pinned positive `threads`
+  was honored only when `n_starts <= 1`; with several starts the fan-out ran on the full-width
+  shared pool regardless, so a tool that pinned one thread per fit from a `PoolPlan` and asked
+  for multiple starts got its replicate-level pool *and* a full-width pool underneath every
+  replicate. The pin is now an upper bound on the whole `fit()` call. A multi-start fit that
+  pins `threads` below the core count is correspondingly slower than before, and unpinned
+  multi-start fits are unchanged.
 - **The repo is now a cargo workspace, and the `ferx` binary moved into a `ferx-cli` package
   (#1114).** The installed binary is unchanged — still `ferx`, same arguments, same output — but
   building it from a source checkout now needs the workspace or the package named:
@@ -61,7 +68,8 @@ section of the SDLC for the versioning policy).
   (`FIT_RAYON_STACK_SIZE`) — a pool built by hand inherits the platform-default 2 MiB stack and
   overflows on wide ODE+IOV analytic-gradient models. `FitOptions::default().quiet()` turns off
   the per-iteration console output; every non-fatal message stays reachable on
-  `FitResult::warnings`.
+  `FitResult::warnings`, the optimizer-trace filename now included (it embeds a pid and a
+  timestamp, so a quiet caller could not otherwise learn where the trace went).
 - **A `present(COV)` condition for covariates that may be missing (#1111).** A missing covariate
   value is `NaN`, and division by it underflows to `0.0` here rather than erroring, so an
   unguarded `(CRCL/100)^THETA` silently zeroes the parameter on a row with no `CRCL`.
