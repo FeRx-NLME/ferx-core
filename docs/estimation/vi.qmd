@@ -220,11 +220,14 @@ unhealthy run is heavy-tailed, and a few outliers inflate the spread until the t
 swallows whatever systematic drift is left, so the run certifies itself at the earliest
 iteration arithmetically allowed (#1119). Median and MAD are unmoved by that tail.
 
-On a healthy fit the change is conservative rather than neutral: the MAD of a mildly
-leptokurtic trace is a little below its standard deviation, so the tolerance tightens and
-the run stops slightly later at the same answer. Measured with default options —
-`warfarin` 5125 → 8375 iterations, `two_cpt_oral_cov` 6625 → 7250, `warfarin_iov`
-3500 → 3625 — with every `θ`, `Ω` and `σ` agreeing to four or five significant figures.
+Whether a healthy fit notices depends on which of the two criteria stopped it. A run that
+stopped on **parameter stability** is untouched — `propofol_schnider` and
+`vancomycin_uvm` still stop at 2500 and 2000 iterations and reproduce every estimate and
+`−2·ELBO` digit for digit. A run that stopped on the **trace** is slightly more
+conservative, because the MAD of a mildly leptokurtic trace sits a little below its
+standard deviation: the tolerance tightens and the run stops later at the same answer
+(`warfarin` 5125 → 8375 iterations, `two_cpt_oral_cov` 6625 → 7250, `warfarin_iov`
+3500 → 3625, with every `θ`, `Ω` and `σ` agreeing to four or five significant figures).
 
 Settling is not the same as landing somewhere good — a stuck optimizer also stops moving.
 Read [`elbo_tightness_ratio`](#is-the-bound-tight-elbo_tightness_ratio) alongside

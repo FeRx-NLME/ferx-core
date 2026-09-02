@@ -28,11 +28,13 @@ section of the SDLC for the versioning policy).
   still there, and the run reported `converged` at the earliest iteration arithmetically
   allowed. The criterion now uses the median and the MAD (scaled by 1.4826) in the same
   `SETTLE_Z · spread + rel_tol · (1 + |location|)` form, so a tail can no longer buy a
-  premature stop. Estimates are unchanged on healthy fits — `warfarin`, `two_cpt_oral_cov`
-  and `warfarin_iov` agree to four or five significant figures — but the criterion is
-  slightly more conservative, so such a run stops somewhat later (on those three, 5125 →
-  8375, 6625 → 7250 and 3500 → 3625 iterations). A noiseless trace still settles on the
-  relative floor alone (#1119).
+  premature stop. Estimates on healthy fits are unchanged: `propofol_schnider` and
+  `vancomycin_uvm`, which stop on the parameter-stability criterion, are identical down to
+  the last reported digit, and `warfarin`, `two_cpt_oral_cov` and `warfarin_iov`, which
+  stop on the trace, agree to four or five significant figures. The trace criterion is
+  slightly more conservative, so those three run longer for the same answer (5125 → 8375,
+  6625 → 7250 and 3500 → 3625 iterations). A noiseless trace still settles on the relative
+  floor alone (#1119).
 
 ## [0.3.1] - 2026-09-02
 
