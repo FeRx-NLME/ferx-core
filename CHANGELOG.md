@@ -35,6 +35,35 @@ section of the SDLC for the versioning policy).
   slightly more conservative, so those three run longer for the same answer (5125 → 8375,
   6625 → 7250 and 3500 → 3625 iterations). A noiseless trace still settles on the relative
   floor alone (#1119).
+### Added
+
+- **A cancellable bootstrap (#1161).** `BootstrapOptions::cancel` takes a `CancelFlag`; setting
+  it from another thread stops a long `ferx_tools::bootstrap` run at the next replicate boundary
+  and returns the new `BootstrapError::Cancelled`, so a caller reports an abort as an abort
+  rather than as "every remaining replicate failed". Replicates the cancel unwound are dropped
+  rather than journaled as failures, so `--resume` refits them; everything already finished stays
+  on disk and resumes into exactly the run that was cancelled.
+### Fixed
+- **A fit whose estimate ran to an internal safety rail no longer reports `converged: true`
+  (#1118).** ferx caps a few packed coordinates internally (an implicit THETA cap, the OMEGA /
+  SIGMA runaway rails); unlike a THETA bound you declared, one of those cannot be a valid
+  constrained optimum. When a free estimate ends pinned to a rail the fit is now reported as not
+  converged and the `parameter_at_runaway_guard` warning is raised to `Critical`, so a script or
+  agent keying off the boolean stops accepting a point that is by construction not an interior
+  optimum. A *collapse* hit — a variance falling to its floor at zero — is unchanged: it stays a
+  `Warning` and leaves `converged` alone, because that is usually an unsupported component to
+  remove rather than a numerical runaway. Each listed hit now says which of the two it is
+  (`verdict: runaway` / `collapse` in the warning's `details`), because the side does not decide
+  it: an OMEGA off-diagonal is bounded symmetrically at ±10, so a correlation driven to the
+  *lower* rail is a runaway too. A SIGMA at its ceiling additionally suggests rescaling DV or
+  using a proportional / log-transformed error model, since that rail is the one an otherwise
+  sound model can reach on unscaled data.
+- **`ferx bootstrap` reflects the same rule.** A replicate that ends at a runaway rail is now a
+  non-converged replicate, so with the default `skip_minimization_terminated` it is excluded
+  from the confidence intervals and counts against the reported
+  `minimization_successful` fraction. Re-running a bootstrap of an unchanged model can therefore
+  report slightly different CIs than before; `--summarize` over a stored `raw_results.csv`
+  re-applies the criteria without refitting.
 
 ## [0.3.1] - 2026-09-02
 

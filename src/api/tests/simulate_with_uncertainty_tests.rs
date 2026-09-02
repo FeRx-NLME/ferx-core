@@ -1180,33 +1180,53 @@ fn runaway_guard_warning_reports_sigma_and_skips_fixed_or_nearby_values() {
     params.sigma_fixed = vec![false; params.sigma.values.len()];
 
     params.sigma.values[0] = 5.0_f64.exp();
-    let (msg, entry) = super::runaway_guard_warning(&params).expect("sigma guard hit");
-    assert!(msg.contains("implementation ceiling"));
+    let mut converged = true;
+    let (msg, entry) =
+        super::runaway_guard_warning(&mut converged, &params).expect("sigma guard hit");
+    assert!(msg.contains("implementation rail"));
+    // #1118: an implementation rail cannot be an interior optimum.
+    assert!(!converged, "a runaway hit is not a converged fit");
+    assert!(msg.contains("Reported converged: false"));
+    // The Σ ceiling is reachable by a sound model on unscaled data, so the
+    // message names the remediation the generic advice does not (#1205 review).
+    assert!(msg.contains("rescale DV"));
+    assert_eq!(entry.severity, crate::types::WarningSeverity::Critical);
     assert_eq!(entry.category, WarningCode::ParameterAtRunawayGuard);
     let details = entry.details.as_ref().expect("details");
     assert_eq!(details["guard_space"], "packed");
     assert_eq!(details["parameters"][0]["side"], "upper");
+    assert_eq!(details["parameters"][0]["verdict"], "runaway");
     assert_eq!(details["parameters"][0]["packed_estimate"], 5.0);
     assert_eq!(details["parameters"][0]["packed_guard"], 5.0);
 
     // FIX creates lower == upper at this value, but is intentional and excluded.
     params.sigma_fixed[0] = true;
-    assert!(super::runaway_guard_warning(&params).is_none());
+    let mut converged = true;
+    assert!(super::runaway_guard_warning(&mut converged, &params).is_none());
+    assert!(converged, "no hit must leave the flag alone");
 
     // A free value arbitrarily near the safety rail is still an interior result.
     params.sigma_fixed[0] = false;
     params.sigma.values[0] = (5.0_f64 - 1e-12).exp();
-    assert!(super::runaway_guard_warning(&params).is_none());
+    assert!(super::runaway_guard_warning(&mut converged, &params).is_none());
+    assert!(converged);
 
     // The lower rail has opposite meaning and remediation: collapse to zero.
     params.sigma.values[0] = (-8.0_f64).exp();
-    let (msg, entry) = super::runaway_guard_warning(&params).expect("sigma lower guard hit");
+    let (msg, entry) =
+        super::runaway_guard_warning(&mut converged, &params).expect("sigma lower guard hit");
     assert!(msg.contains("collapsed toward zero"));
     assert!(msg.contains("removing or simplifying"));
-    assert_eq!(
-        entry.details.as_ref().unwrap()["parameters"][0]["side"],
-        "lower"
-    );
+    // #1118: a collapsed component is a modelling decision, not a runaway — the
+    // fit still converged and the entry stays a plain warning. The Σ-ceiling
+    // remediation is for the ceiling only and must not ride along.
+    assert!(converged, "a collapse hit must not demote convergence");
+    assert!(!msg.contains("converged: false"));
+    assert!(!msg.contains("rescale DV"));
+    assert_eq!(entry.severity, crate::types::WarningSeverity::Warning);
+    let hit = &entry.details.as_ref().unwrap()["parameters"][0];
+    assert_eq!(hit["side"], "lower");
+    assert_eq!(hit["verdict"], "collapse");
 }
 
 #[test]
@@ -1226,7 +1246,10 @@ fn runaway_guard_warning_reports_omega_cholesky_guard_and_skips_fixed() {
         params.omega.free_mask.clone(),
     );
 
-    let (_msg, entry) = super::runaway_guard_warning(&params).expect("omega guard hit");
+    let mut converged = true;
+    let (_msg, entry) =
+        super::runaway_guard_warning(&mut converged, &params).expect("omega guard hit");
+    assert!(!converged);
     assert_eq!(entry.category, WarningCode::ParameterAtRunawayGuard);
     let hit = &entry.details.as_ref().unwrap()["parameters"][0];
     assert_eq!(hit["parameter"], params.omega.eta_names[0].as_str());
@@ -1237,13 +1260,73 @@ fn runaway_guard_warning_reports_omega_cholesky_guard_and_skips_fixed() {
 
     // A simultaneous lower collapse and upper runaway gets advice for both.
     params.sigma.values[0] = (-8.0_f64).exp();
-    let (msg, _entry) = super::runaway_guard_warning(&params).expect("mixed guard hits");
-    assert!(msg.contains("Lower-guard hits"));
-    assert!(msg.contains("Upper-guard hits"));
+    let mut converged = true;
+    let (msg, entry) =
+        super::runaway_guard_warning(&mut converged, &params).expect("mixed guard hits");
+    assert!(msg.contains("Collapse hits"));
+    assert!(msg.contains("Runaway hits"));
+    // A mixed set still contains a runaway hit, so the fit is demoted.
+    assert!(!converged);
+    assert_eq!(entry.severity, crate::types::WarningSeverity::Critical);
 
     params.sigma.values[0] = 1.0;
     params.omega_fixed[0] = true;
-    assert!(super::runaway_guard_warning(&params).is_none());
+    let mut converged = true;
+    assert!(super::runaway_guard_warning(&mut converged, &params).is_none());
+    assert!(converged);
+}
+
+/// #1205 review: an Ω off-diagonal is the raw `L[i,j]` bounded symmetrically at
+/// ±10, so the *lower* rail there is a correlation runaway, not a collapse
+/// toward zero. Keying the verdict on the side alone reported that runaway as
+/// `converged: true` with advice to remove the component.
+#[test]
+fn omega_off_diagonal_lower_rail_is_a_runaway_not_a_collapse() {
+    use crate::types::{OmegaMatrix, WarningSeverity};
+    use nalgebra::DMatrix;
+
+    let mut params = tiny_model().default_params;
+    params.sigma.values.fill(1.0);
+    params.sigma_fixed = vec![false; params.sigma.values.len()];
+
+    // A 2×2 block Ω whose off-diagonal ran to the negative rail.
+    let mut chol = DMatrix::<f64>::identity(2, 2);
+    chol[(1, 0)] = -10.0;
+    params.omega = OmegaMatrix::from_chol_factor(
+        chol,
+        vec!["ETA_CL".into(), "ETA_V".into()],
+        false,
+        DMatrix::from_element(2, 2, true),
+    );
+    params.omega_fixed = vec![false; 2];
+
+    let mut converged = true;
+    let (msg, entry) = super::runaway_guard_warning(&mut converged, &params)
+        .expect("omega off-diagonal at its lower rail");
+    assert_eq!(
+        entry.details.as_ref().unwrap()["parameters"][0]["side"],
+        "lower",
+        "the hit is factually on the lower rail"
+    );
+    assert_eq!(
+        entry.details.as_ref().unwrap()["parameters"][0]["verdict"],
+        "runaway",
+        "but a symmetric rail means it ran away, not collapsed"
+    );
+    assert!(
+        !converged,
+        "a runaway must demote convergence on either rail"
+    );
+    assert_eq!(entry.severity, WarningSeverity::Critical);
+    assert!(msg.contains("implementation rail"));
+    assert!(!msg.contains("collapsed toward zero"));
+
+    // The classifier must reach the same severity from the flat message alone,
+    // which is all a spliced multi-start warning carries.
+    assert_eq!(
+        crate::types::classify_warning(&msg).severity,
+        WarningSeverity::Critical
+    );
 }
 
 #[test]
@@ -1258,9 +1341,13 @@ fn hidden_theta_caps_use_internal_guard_warning_not_user_boundary_warning() {
 
     params.theta[0] = 1e9;
     assert!(super::boundary_estimate_warning(&params).is_none());
+    let mut converged = true;
     let (upper_msg, upper_entry) =
-        super::runaway_guard_warning(&params).expect("hidden theta upper cap");
-    assert!(upper_msg.contains("implementation ceiling"));
+        super::runaway_guard_warning(&mut converged, &params).expect("hidden theta upper cap");
+    assert!(upper_msg.contains("implementation rail"));
+    // The Σ remediation is Σ-specific; a THETA cap must not pick it up.
+    assert!(!upper_msg.contains("rescale DV"));
+    assert!(!converged);
     assert_eq!(upper_entry.category, WarningCode::ParameterAtRunawayGuard);
     assert_eq!(
         upper_entry.details.as_ref().unwrap()["parameters"][0]["parameter"],
@@ -1269,9 +1356,11 @@ fn hidden_theta_caps_use_internal_guard_warning_not_user_boundary_warning() {
 
     params.theta[0] = 1e-10;
     assert!(super::boundary_estimate_warning(&params).is_none());
+    let mut converged = true;
     let (lower_msg, lower_entry) =
-        super::runaway_guard_warning(&params).expect("hidden theta lower cap");
+        super::runaway_guard_warning(&mut converged, &params).expect("hidden theta lower cap");
     assert!(lower_msg.contains("collapsed toward zero"));
+    assert!(converged);
     assert_eq!(
         lower_entry.details.as_ref().unwrap()["parameters"][0]["side"],
         "lower"
@@ -1282,14 +1371,15 @@ fn hidden_theta_caps_use_internal_guard_warning_not_user_boundary_warning() {
     params.theta_upper[0] = 100.0;
     params.theta[0] = 0.1;
     assert!(super::boundary_estimate_warning(&params).is_some());
-    assert!(super::runaway_guard_warning(&params).is_none());
+    assert!(super::runaway_guard_warning(&mut converged, &params).is_none());
 
     // FIX'd hidden-cap coordinates remain intentional and excluded.
     params.theta_lower[0] = 0.0;
     params.theta_upper[0] = f64::INFINITY;
     params.theta[0] = 1e9;
     params.theta_fixed[0] = true;
-    assert!(super::runaway_guard_warning(&params).is_none());
+    assert!(super::runaway_guard_warning(&mut converged, &params).is_none());
+    assert!(converged, "a FIX'd cap must not demote convergence");
 }
 
 #[test]

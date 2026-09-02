@@ -325,6 +325,62 @@ pub fn omega_structural_zero_mask(template: &ModelParameters) -> Vec<bool> {
     mask
 }
 
+/// What kind of quantity a packed coordinate holds, in [`pack_params`] order.
+///
+/// The distinction the runaway-guard check needs is whether a coordinate's two
+/// rails mean *different* things. A variance-like coordinate — a log-packed
+/// Theta, an Ω / Ω_IOV Cholesky **diagonal**, a Σ — is packed on a log scale, so
+/// its lower rail is a collapse toward zero and its upper rail a runaway. An
+/// Ω / Ω_IOV **off-diagonal** is the raw `L[i,j]` bounded symmetrically at ±10,
+/// so *either* rail is a runaway and neither is a collapse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PackedCoordKind {
+    Theta,
+    OmegaDiagonal,
+    OmegaOffDiagonal,
+    Sigma,
+}
+
+fn push_omega_kinds(kinds: &mut Vec<PackedCoordKind>, om: &OmegaMatrix) {
+    // Column-major lower triangle — mirrors `pack_params`. `lower_tri_iter`
+    // yields only `(i,i)` when diagonal, so a diagonal Ω pushes no off-diagonal.
+    for (i, j) in lower_tri_iter(om.dim(), om.diagonal) {
+        kinds.push(if i == j {
+            PackedCoordKind::OmegaDiagonal
+        } else {
+            PackedCoordKind::OmegaOffDiagonal
+        });
+    }
+}
+
+/// Per-coordinate [`PackedCoordKind`], in the same order as [`pack_params`]:
+/// `[theta…, Ω (lower-tri col-major)…, sigma…, Ω_IOV…, mixture overrides…]`.
+/// Mixture overrides (#977) are diagonal scalars carrying their base
+/// counterpart's rails, so they take the base kind.
+pub(crate) fn coordinate_kinds(template: &ModelParameters) -> Vec<PackedCoordKind> {
+    let mut kinds = Vec::with_capacity(packed_len(template));
+    kinds.resize(template.theta.len(), PackedCoordKind::Theta);
+    push_omega_kinds(&mut kinds, &template.omega);
+    kinds.resize(
+        kinds.len() + template.sigma.values.len(),
+        PackedCoordKind::Sigma,
+    );
+    if let Some(ref iov) = template.omega_iov {
+        push_omega_kinds(&mut kinds, iov);
+    }
+    if let Some(ref mix) = template.mixture {
+        kinds.resize(
+            kinds.len() + mix.omega_override_addr.len(),
+            PackedCoordKind::OmegaDiagonal,
+        );
+        kinds.resize(
+            kinds.len() + mix.sigma_override_addr.len(),
+            PackedCoordKind::Sigma,
+        );
+    }
+    kinds
+}
+
 /// Compute the number of packed parameters
 pub fn packed_len(template: &ModelParameters) -> usize {
     let n_theta = template.theta.len();
@@ -1765,5 +1821,48 @@ mod tests {
         assert_relative_eq!(bounds.lower[iov_start + 1], -10.0, epsilon = 1e-12); // L21 off-diag
         assert_relative_eq!(bounds.lower[iov_start + 2], -6.0, epsilon = 1e-12);
         // L22 diag
+    }
+
+    /// `coordinate_kinds` must line up slot-for-slot with `compute_bounds`, since
+    /// the runaway-guard check reads a hit's meaning off the kind and the rail off
+    /// the bounds. An off-diagonal is the one kind whose rails are symmetric.
+    #[test]
+    fn test_coordinate_kinds_match_the_bounds_table() {
+        let template = make_block_kappa_iov_template();
+        let kinds = coordinate_kinds(&template);
+        assert_eq!(kinds.len(), packed_len(&template));
+        // theta(1) + diagonal BSV Ω(1) + sigma(1) + block Ω_IOV(L11, L21, L22)
+        assert_eq!(
+            kinds,
+            vec![
+                PackedCoordKind::Theta,
+                PackedCoordKind::OmegaDiagonal,
+                PackedCoordKind::Sigma,
+                PackedCoordKind::OmegaDiagonal,
+                PackedCoordKind::OmegaOffDiagonal,
+                PackedCoordKind::OmegaDiagonal,
+            ]
+        );
+
+        let bounds = compute_bounds(&template);
+        for (i, kind) in kinds.iter().enumerate() {
+            let (lo, hi) = (bounds.lower[i], bounds.upper[i]);
+            match kind {
+                // Symmetric rails: neither side means "collapsed toward zero".
+                PackedCoordKind::OmegaOffDiagonal => {
+                    assert_relative_eq!(lo, -hi, epsilon = 1e-12);
+                }
+                // Log-packed: the lower rail is a floor at (near) zero.
+                PackedCoordKind::OmegaDiagonal => {
+                    assert_relative_eq!(lo, -6.0, epsilon = 1e-12);
+                    assert_relative_eq!(hi, 6.0, epsilon = 1e-12);
+                }
+                PackedCoordKind::Sigma => {
+                    assert_relative_eq!(lo, -8.0, epsilon = 1e-12);
+                    assert_relative_eq!(hi, 5.0, epsilon = 1e-12);
+                }
+                PackedCoordKind::Theta => {}
+            }
+        }
     }
 }
