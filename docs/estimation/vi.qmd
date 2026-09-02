@@ -209,9 +209,25 @@ optimum, where it is the only remaining noise — and makes the KL gradient vani
 
 The objective is a Monte-Carlo estimate, so a per-iteration improvement test would stop on
 noise rather than on convergence. VI instead treats `vi_iters` as a **ceiling** and stops
-once the remaining drift is indistinguishable from that noise, judged on a moving average of
+once the remaining drift is indistinguishable from that noise, judged on a moving summary of
 the trace together with the stability of the parameters themselves. `n_iterations` reports
 what actually ran and `converged` whether it had in fact settled.
+
+That summary is deliberately **robust**: the two windows are compared by their medians, and
+the tolerance is sized from the median absolute deviation rather than the sample variance.
+A mean/variance version is fooled by exactly the traces that most need catching — an
+unhealthy run is heavy-tailed, and a few outliers inflate the spread until the tolerance
+swallows whatever systematic drift is left, so the run certifies itself at the earliest
+iteration arithmetically allowed (#1119). Median and MAD are unmoved by that tail.
+
+Whether a healthy fit notices depends on which of the two criteria stopped it. A run that
+stopped on **parameter stability** is untouched — `propofol_schnider` and
+`vancomycin_uvm` still stop at 2500 and 2000 iterations and reproduce every estimate and
+`−2·ELBO` digit for digit. A run that stopped on the **trace** is slightly more
+conservative, because the MAD of a mildly leptokurtic trace sits a little below its
+standard deviation: the tolerance tightens and the run stops later at the same answer
+(`warfarin` 5125 → 8375 iterations, `two_cpt_oral_cov` 6625 → 7250, `warfarin_iov`
+3500 → 3625, with every `θ`, `Ω` and `σ` agreeing to four or five significant figures).
 
 Settling is not the same as landing somewhere good — a stuck optimizer also stops moving.
 Read [`elbo_tightness_ratio`](#is-the-bound-tight-elbo_tightness_ratio) alongside

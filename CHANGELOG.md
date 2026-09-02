@@ -19,6 +19,22 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Changed
+- **VI early stopping is now judged with robust statistics.** The settling test compared
+  the *mean* of the last window of the objective trace against the mean of the one before
+  it, and sized its tolerance from the trace's own sample variance. Both estimators have a
+  breakdown point of zero, so on a heavy-tailed trace — what an unhealthy VI run emits — a
+  handful of outliers inflated the spread until the tolerance swallowed the drift that was
+  still there, and the run reported `converged` at the earliest iteration arithmetically
+  allowed. The criterion now uses the median and the MAD (scaled by 1.4826) in the same
+  `SETTLE_Z · spread + rel_tol · (1 + |location|)` form, so a tail can no longer buy a
+  premature stop. Estimates on healthy fits are unchanged: `propofol_schnider` and
+  `vancomycin_uvm`, which stop on the parameter-stability criterion, are identical down to
+  the last reported digit, and `warfarin`, `two_cpt_oral_cov` and `warfarin_iov`, which
+  stop on the trace, agree to four or five significant figures. The trace criterion is
+  slightly more conservative, so those three run longer for the same answer (5125 → 8375,
+  6625 → 7250 and 3500 → 3625 iterations). A noiseless trace still settles on the relative
+  floor alone (#1119).
 ### Added
 
 - **A cancellable bootstrap (#1161).** `BootstrapOptions::cancel` takes a `CancelFlag`; setting

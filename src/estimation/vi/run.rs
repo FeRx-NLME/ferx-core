@@ -181,31 +181,82 @@ fn param_criterion_applies(template: &ModelParameters) -> bool {
     fixed.iter().zip(structural.iter()).any(|(&f, &z)| !f && !z)
 }
 
+/// Scale factor turning the median absolute deviation into a consistent estimator of
+/// the standard deviation under normality (`1 / Φ⁻¹(0.75)`).
+const MAD_TO_SIGMA: f64 = 1.4826;
+
+/// Median of a window, averaging the two central values on an even count.
+///
+/// Takes an owned buffer because it sorts in place; callers hand it a copy of the
+/// window rather than the trace itself.
+fn median_of(buf: &mut [f64]) -> f64 {
+    buf.sort_by(f64::total_cmp);
+    let n = buf.len();
+    if n % 2 == 1 {
+        buf[n / 2]
+    } else {
+        0.5 * (buf[n / 2 - 1] + buf[n / 2])
+    }
+}
+
+/// Robust location and spread of a window: the median, and the median absolute
+/// deviation scaled to a standard-deviation equivalent.
+///
+/// Returns `None` if the window holds a non-finite value, which is never "settled".
+fn median_and_mad(window: &[f64]) -> Option<(f64, f64)> {
+    if window.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let mut buf: Vec<f64> = window.to_vec();
+    let med = median_of(&mut buf);
+    // Reuse the buffer: absolute deviations, then their median.
+    for (slot, v) in buf.iter_mut().zip(window.iter()) {
+        *slot = (v - med).abs();
+    }
+    Some((med, MAD_TO_SIGMA * median_of(&mut buf)))
+}
+
 /// Whether the tail of the objective trace has stopped moving.
 ///
-/// Compares the mean of the last `window` values against the mean of the `window`
-/// before it. Averaging both sides is the point: single-iteration deltas are
+/// Compares the **median** of the last `window` values against the median of the
+/// `window` before it. Summarising both sides is the point: single-iteration deltas are
 /// dominated by Monte-Carlo noise and would report convergence at random.
 ///
 /// # Why the threshold is noise-aware, not purely relative
 ///
-/// The ELBO is a Monte-Carlo estimate, so the difference between two window means is
+/// The ELBO is a Monte-Carlo estimate, so the difference between two window summaries is
 /// itself a random variable. Judging it against a *relative* tolerance
-/// (`rel_tol·(1 + |mean|)`) asks the wrong question: it scales with the objective's
+/// (`rel_tol·(1 + |location|)`) asks the wrong question: it scales with the objective's
 /// magnitude, which has nothing to do with how noisy the trace is. On a real fit that
 /// threshold is unreachable — a plateaued warfarin run still shows window-to-window
 /// differences orders of magnitude above `1e-4·(1 + 286)`, so the run is reported
 /// unsettled forever and early stopping never fires.
 ///
 /// The right comparison is against the **standard error of the difference**,
-/// `√(s²_recent/w + s²_prior/w)`, estimated from the trace's own within-window
-/// variance. That is scale-free, adapts automatically to `vi_mc_samples`, and asks the
-/// question that matters: *is the remaining drift distinguishable from noise?* If it is
-/// not, more iterations at this noise level cannot resolve it — the fix would be more
-/// Monte-Carlo draws, not more epochs.
+/// `√(s²_recent/w + s²_prior/w)`, estimated from the trace's own within-window spread.
+/// That is scale-free, adapts automatically to `vi_mc_samples`, and asks the question
+/// that matters: *is the remaining drift distinguishable from noise?* If it is not, more
+/// iterations at this noise level cannot resolve it — the fix would be more Monte-Carlo
+/// draws, not more epochs.
+///
+/// # Why median/MAD rather than mean/variance (#1119)
+///
+/// The noise-aware form above is the right question, but the mean and the sample
+/// variance are the wrong estimators to ask it with. They have a breakdown point of
+/// zero: on a heavy-tailed trace — precisely what an *unhealthy* VI run emits — a
+/// handful of outliers inflate `s²`, `se` grows with them, and the tolerance swallows
+/// whatever systematic drift is left. The criterion then fires at the earliest iteration
+/// it is arithmetically allowed to, and the run reports `converged` on a trace that is
+/// still moving. Measured on #1097: every unhealthy run stopped at iteration 1500 of a
+/// 25 000 ceiling.
+///
+/// The median (breakdown 50 %) and the MAD scaled by `MAD_TO_SIGMA` answer the same
+/// question with estimators a tail cannot move. On a clean Gaussian trace they agree
+/// with mean/σ up to their efficiency, so healthy runs are unaffected; on a
+/// contaminated one they keep reporting "not settled" while the drift is real.
 ///
 /// `rel_tol` is retained as an additive **floor** so the criterion is never stricter
-/// than the original one: a noiseless trace (`s² = 0`) still settles on the relative
+/// than the original one: a noiseless trace (`MAD = 0`) still settles on the relative
 /// test alone, which is what the synthetic-trace unit tests exercise.
 pub fn trace_has_settled(trace: &[f64], window: usize, rel_tol: f64) -> bool {
     if window == 0 || trace.len() < 2 * window {
@@ -215,22 +266,17 @@ pub fn trace_has_settled(trace: &[f64], window: usize, rel_tol: f64) -> bool {
     let recent = &trace[n - window..];
     let prior = &trace[n - 2 * window..n - window];
 
-    let mean = |s: &[f64]| s.iter().sum::<f64>() / s.len() as f64;
-    let m_recent = mean(recent);
-    let m_prior = mean(prior);
-    if !m_recent.is_finite() || !m_prior.is_finite() {
+    let Some((m_recent, s_recent)) = median_and_mad(recent) else {
         return false;
-    }
-
-    // Unbiased within-window variance; a 1-wide window carries no variance information,
-    // in which case this degenerates to the plain relative test below.
-    let var = |s: &[f64], m: f64| -> f64 {
-        if s.len() < 2 {
-            return 0.0;
-        }
-        s.iter().map(|v| (v - m) * (v - m)).sum::<f64>() / (s.len() - 1) as f64
     };
-    let se = ((var(recent, m_recent) + var(prior, m_prior)) / window as f64).sqrt();
+    let Some((m_prior, s_prior)) = median_and_mad(prior) else {
+        return false;
+    };
+
+    // Standard error of the difference of the two locations. A 1-wide window carries no
+    // spread information (`MAD = 0`), in which case this degenerates to the plain
+    // relative test below.
+    let se = ((s_recent * s_recent + s_prior * s_prior) / window as f64).sqrt();
     if !se.is_finite() {
         return false;
     }
