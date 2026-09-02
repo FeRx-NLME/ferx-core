@@ -16,6 +16,8 @@ fn template(diagonal: bool) -> ModelParameters {
     }
     let free = DMatrix::from_fn(2, 2, |i, j| diagonal == (i == j) || i == j);
     ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![1.0, 2.0],
         theta_names: vec!["CL".to_string(), "V".to_string()],
         theta_fixed: vec![false, false],

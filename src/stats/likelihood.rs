@@ -3797,6 +3797,7 @@ mod tests {
             &h_matrix,
             &p.omega,
             &p.sigma.values,
+            &p.residual_correlations,
             true,
         );
         assert!(

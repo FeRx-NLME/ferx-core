@@ -19,7 +19,37 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Changed
+- **`block_sigma` now estimates its off-diagonal correlation (#847).** A plain
+  `block_sigma (...) = [...]` is NONMEM `$SIGMA BLOCK(n)`: its diagonal SDs *and* its
+  off-diagonal correlation are estimated. Previously the correlation was always frozen at the
+  declared value, so a model with a `$SIGMA BLOCK` counterpart in NONMEM optimized a different
+  objective — on the fluconazole RadboudUMC model NONMEM moved the residual correlation to
+  ~0.93 while ferx held the ~0.2 init. Append `FIX` to hold the whole block, which is the only
+  form that reproduces the previous behaviour; the shipped
+  `examples/correlated_residual_combined.ferx` already uses it and is unaffected. The
+  correlation is optimized as its Fisher-z transform `atanh(rho)`, so it stays strictly inside
+  `(-1, 1)` and the residual covariance can never go singular from the correlation alone, and
+  it rides the exact analytic FOCE/FOCEI outer gradient rather than falling back to finite
+  differences. Estimators that do not estimate it (SAEM, IMP/IMPMAP, Bayes, AGQ, VI) continue
+  to hold it at the declaration.
+
+### Added
+- **Fitted `block_sigma` correlations are reported with their fixedness and standard error
+  (#847).** `FitResult` gains `residual_correlation_fixed` and `se_residual_correlations` (the
+  SE on the natural `rho` scale, by the delta method on the packed Fisher-z coordinate), the
+  fit YAML's `block_sigma:` section gains `correlation_se` and now reports
+  `correlation_fixed` from the model rather than always `true`, and `.fitrx` bundles
+  round-trip all three. A bundle written before this change loads with every correlation
+  marked fixed, which is what it meant at the time.
+
 ### Fixed
+- **`block_sigma` residual derivatives were built at the declared correlation, not the live
+  one (#847).** The outer-gradient assembly (`corr_residual_diag` /
+  `corr_residual_rd_at_sigma`) and the inner eta-gradient read the correlations off the frozen
+  `CompiledModel`, so once the off-diagonal became estimable the whole `(R, dR/df, d2R/df2)`
+  chain would have been evaluated at the initial value while the objective moved. Both now
+  take the live parameter vector's correlations.
 - **`ode_method = auto` no longer keeps a stiff solve whose analytic derivatives have
   overflowed (#1204).** The escalation guard checked that every saved state was finite, but
   read *values* only. A dual number's derivative jets carry higher powers of what its value

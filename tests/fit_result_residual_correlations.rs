@@ -44,3 +44,63 @@ fn fit_result_carries_fixed_block_sigma_correlations() {
     let covariance = corr.rho * result.sigma[corr.sigma_i] * result.sigma[corr.sigma_j];
     assert!((covariance - 0.1).abs() < 1e-12);
 }
+
+/// #847: a bare `block_sigma` (no `FIX`) **estimates** its off-diagonal — NONMEM
+/// `$SIGMA BLOCK(n)` semantics — so the fit must report it as a free coordinate.
+///
+/// `outer_maxiter: 0` keeps this a Tier-2 test (one evaluation, no convergence
+/// loop): it pins the *plumbing* — the flag reaches `FitResult`, rho is packed as
+/// a free coordinate, and the reported value is the parameter vector's, not the
+/// model's declaration. That the optimizer actually moves rho is the slow test
+/// `dense_residual_free_rho_beats_fixed_rho`.
+#[test]
+fn fit_result_marks_a_bare_block_sigma_correlation_free() {
+    use ferx_core::estimation::parameterization::{compute_bounds, packed_fixed_mask};
+
+    let src = MODEL.replace("1.00] FIX", "1.00]");
+    let model = parse_model_string(&src).expect("free block_sigma model must parse");
+    let population = read_nonmem_csv(
+        Path::new("data/correlated_residual_combined.csv"),
+        None,
+        None,
+    )
+    .expect("correlated residual data must load");
+    let options = FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+
+    let params = &model.default_params;
+    assert_eq!(params.residual_correlation_fixed, vec![false]);
+    // The rho coordinate is packed last, free (lower < upper) rather than pinned.
+    let mask = packed_fixed_mask(params);
+    let bounds = compute_bounds(params);
+    let rho_idx = mask.len() - 1;
+    assert!(!mask[rho_idx]);
+    assert!(bounds.lower[rho_idx] < bounds.upper[rho_idx]);
+    // The sigma SDs stay free too — `FIX` is what pinned them before.
+    assert_eq!(params.sigma_fixed, vec![false, false]);
+
+    let result = fit(&model, &population, params, &options)
+        .expect("free correlated-residual evaluation must succeed");
+    assert_eq!(result.residual_correlation_fixed, vec![false]);
+    assert!((result.residual_correlations[0].rho - 0.5).abs() < 1e-12);
+}
+
+/// The `FIX` companion to the test above: the whole block is pinned, so no
+/// optimizer that respects box bounds can move either the SDs or rho (#847).
+#[test]
+fn fit_result_marks_a_fixed_block_sigma_correlation_pinned() {
+    use ferx_core::estimation::parameterization::{compute_bounds, packed_fixed_mask};
+
+    let model = parse_model_string(MODEL).expect("block_sigma model must parse");
+    let params = &model.default_params;
+    assert_eq!(params.residual_correlation_fixed, vec![true]);
+    let mask = packed_fixed_mask(params);
+    let bounds = compute_bounds(params);
+    let rho_idx = mask.len() - 1;
+    assert!(mask[rho_idx]);
+    assert_eq!(bounds.lower[rho_idx], bounds.upper[rho_idx]);
+}

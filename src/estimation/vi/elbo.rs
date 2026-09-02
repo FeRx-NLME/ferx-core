@@ -152,12 +152,6 @@ impl PackedLayout {
     pub fn omega_iov_end(&self) -> usize {
         self.omega_iov_start() + self.n_omega_iov
     }
-
-    /// Index of the first `block_sigma` ρ coordinate (#847); equal to
-    /// [`Self::total`] when the model declares none.
-    pub fn rho_start(&self) -> usize {
-        self.omega_iov_end()
-    }
 }
 
 /// Which variational family serves each subject.

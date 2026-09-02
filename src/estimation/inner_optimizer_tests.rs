@@ -114,6 +114,7 @@ mod ctmm_inner {
                 &[eta0],
                 &params.omega,
                 &params.sigma.values,
+                &params.residual_correlations,
                 None,
                 None,
             )
