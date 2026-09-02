@@ -21,7 +21,7 @@ What this means in practice:
   * **Commercial use of this file is not granted.** The MIT grant in the root
     `LICENSE` does not extend to it.
   * The file is a test fixture only. It is never linked into the `ferx` binary
-    or any published artifact, and `Cargo.toml` excludes `data/mbma_naproxen.*`
+    or any published artifact, and `Cargo.toml` excludes `data/mbma_naproxen*`
     from the packaged crate, so the crate published to crates.io is uniformly
     MIT.
 
