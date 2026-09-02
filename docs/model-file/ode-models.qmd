@@ -593,12 +593,15 @@ limited. Run your model and look at the solver's step counts:
 
 #### Where the step counts show up
 
-After a fit, ferx runs one prediction pass over every subject
-at the final estimates and reports what the solver did there as an `ode_solver` warning
-(see [Warnings](../warnings.qmd#warning-codes)). It fires when a step clamped at the minimum
+After a fit, ferx runs one pass over every subject at the final estimates — the ordinary
+prediction dispatch, plus one analytic sensitivity solve per subject for models on the
+analytic ODE sensitivity path — and reports what the solver did there as an `ode_solver`
+warning (see [Warnings](../warnings.qmd#warning-codes)). It fires when a step clamped at the
+minimum
 step size, when a returned segment stopped before its requested end, when an `auto` escalation
-had to be discarded and re-solved explicitly, when that explicit fallback also failed, or when
-`ode_stiff_abort_after` cut a segment short — and, at `Info` severity, when `auto` escalated
+had to be discarded and re-solved explicitly, when that explicit fallback also failed, when an
+escalation was discarded because its derivatives overflowed, or when `ode_stiff_abort_after`
+cut a segment short — and, at `Info` severity, when `auto` escalated
 and everything worked, so an escalation is never invisible. Either way it says how many
 segments changed stepper part-way through, because that changes how the step counts above it
 read: the steps before a switch were taken by a different method than the ones after it. Clamps taken inside an escalation
@@ -608,6 +611,41 @@ most actionable line ferx prints about the solver: the probe was right that the 
 stiff and wrong about which stiff method could integrate it, which is the case for naming
 `ode_method = rodas5p` (or `rosenbrock23`) by hand. The counters ride along in the warning's
 `details` payload.
+
+#### When the derivatives overflow but the predictions do not
+
+One rejection reason is not about the method at all. A dual number's derivative jets carry
+higher powers of what its value carries linearly — integrating `u' = p·u` gives `∂u/∂p = t·u`
+and `∂²u/∂p² = t²·u`, and a `1/x` in the right-hand side scales the gradient by `1/x²` and the
+Hessian by `1/x³` — so a trajectory that reaches the top of double precision overflows its
+Hessian first, its gradient next, and its predicted value not at all. The result is a solve
+that reports success, returns finite predictions everywhere, clamps nothing, and hands
+FOCE/FOCEI a `NaN` gradient.
+
+`ode_method = auto` discards such a segment and re-solves it explicitly, and reports it as
+`auto_stiff_rejected_jets`. This is the one decision ferx takes on the sensitivity solve that
+it does not take on the prediction solve: `f64` carries no derivatives to check, so the
+predictions keep the stiff trajectory while the gradient comes from the explicit re-solve. The
+asymmetry is deliberate — a gradient that disagrees with its trajectory by solver tolerance is
+worth having, a `NaN` one is not — but a non-zero count is a reliable sign that the model is
+running at the edge of what `f64` can represent. Naming a different method will not help.
+Check the units and scaling instead: a state carried in ng rather than mg, a rate constant on
+a per-second clock, or a growth term with nothing bounding it.
+
+Because no `f64` pass can observe that decision, the post-fit sweep runs a sensitivity solve
+of its own to report it: the second-order provider (gradient **and** Hessian, what FOCEI
+differentiates) when the model has an analytic outer gradient, and the light first-order one
+when only the inner loop is analytic. A fit run with `gradient = fd` sweeps nothing, because
+it computed no analytic derivatives to overflow. The counter is collected separately from the
+prediction pass, so it is the one key in the warning's `details` payload that is disjoint from
+the escalation counts rather than a subset of them.
+
+Only a segment that *entered* with finite jets is scored. Derivatives that have already
+overflowed stay overflowed for the rest of a subject's event chain, and re-solving a later
+segment cannot repair damage done in an earlier one.
+
+A **named** `ode_method` is not guarded this way, here as everywhere else: a user who asked
+for `rodas4` gets `rodas4`, non-finite jets included.
 
 #### Bounding what a stalled segment costs
 

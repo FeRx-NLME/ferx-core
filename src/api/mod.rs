@@ -66,6 +66,7 @@ pub(crate) use postfit::{
     kappa_weight_typicals, keep_gn_zero_eta_warning, ode_solver_diagnostics_warning,
     probe_nlopt_algorithms, rebuild_warnings_structured, resolve_covariance_status,
     resolve_sir_fallback, runaway_guard_warning, sir_unavailable_warning,
+    sweep_sensitivity_solver_stats,
 };
 pub use predict::{predict, PredictionResult};
 #[cfg(feature = "survival")]

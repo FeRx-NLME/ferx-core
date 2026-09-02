@@ -392,8 +392,25 @@ pub struct OdeSolverStats {
     /// probe was right that the system is stiff and wrong that this stiff method could
     /// integrate it; naming `rodas5p` (or `rosenbrock23`) explicitly is the next thing to try.
     pub auto_stiff_rejected: usize,
+    /// Of [`auto_stiff_rejected`](Self::auto_stiff_rejected), the escalations rejected
+    /// **only** because their derivative jets were non-finite while every saved value was
+    /// finite (#1204).
+    ///
+    /// Structurally different from every other counter here, and the difference is the point:
+    /// it can only ever be non-zero on a **dual** instantiation, because `f64` carries no
+    /// jets to check ([`crate::sens::num::PkNum::jets_finite`] is `true` for it). So a
+    /// segment counted here was kept by the `f64` prediction solve and discarded by the
+    /// `Dual1`/`Dual2` sensitivity solve — the one place the two deliberately part company.
+    /// See the escalation guard for why that asymmetry is the right trade.
+    ///
+    /// Non-zero means the fit's *gradient* would otherwise have been `NaN`/`inf` on those
+    /// segments while its predictions looked clean. It is a repair, not a loss, but it is
+    /// also a reliable sign that the trajectory is running near the edge of double precision
+    /// — check the model's scaling and units before trusting the estimates.
+    pub auto_stiff_rejected_jets: usize,
     /// Rejected [`OdeMethod::Auto`] escalations whose pinned-explicit re-solve also failed:
-    /// it either stopped before the end of the segment or returned a non-finite saved state.
+    /// it stopped before the end of the segment, or returned a saved state whose value or
+    /// (on a dual instantiation) whose derivative jets were non-finite.
     ///
     /// A subset of [`auto_stiff_rejected`](Self::auto_stiff_rejected). The guard has no third
     /// method to return in this case, so the caller still receives the explicit result; this
@@ -485,6 +502,7 @@ impl OdeSolverStats {
             auto_stiff_segments,
             auto_switched_segments,
             auto_stiff_rejected,
+            auto_stiff_rejected_jets,
             auto_fallback_failed,
             unfinished_segments,
             stiff_aborted_segments,
@@ -499,6 +517,7 @@ impl OdeSolverStats {
         self.auto_stiff_segments += auto_stiff_segments;
         self.auto_switched_segments += auto_switched_segments;
         self.auto_stiff_rejected += auto_stiff_rejected;
+        self.auto_stiff_rejected_jets += auto_stiff_rejected_jets;
         self.auto_fallback_failed += auto_fallback_failed;
         self.unfinished_segments += unfinished_segments;
         self.stiff_aborted_segments += stiff_aborted_segments;
@@ -1648,9 +1667,15 @@ fn integrate_resolved_g<T: PkNum>(
 /// silently re-solved as something else would be the worse surprise.
 ///
 /// Generic over `T`, so the `f64` prediction and the `Dual2` sensitivity solve share one copy
-/// of both the resolution and the guard. Both read `.val()` only and see the same values, so
-/// they make the same decision on the same segment and the gradient keeps differentiating the
-/// trajectory the predictor reports.
+/// of both the resolution and the guard. Every trigger but one reads `.val()` only and sees
+/// the same values, so the two make the same decision on the same segment and the gradient
+/// keeps differentiating the trajectory the predictor reports.
+///
+/// The exception is the jet-finiteness clause (#1204), which no `f64` solve can fail. It is
+/// the deliberate one-directional break in that invariant: a dual solve whose jets have
+/// overflowed has nothing to differentiate, so keeping it on the predictor's stepper buys a
+/// `NaN` gradient rather than consistency. Nothing else in the guard is allowed to branch on
+/// a derivative.
 #[allow(clippy::too_many_arguments)]
 fn integrate_resolved_g_inner<T: PkNum>(
     rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
@@ -1730,12 +1755,48 @@ fn integrate_resolved_g_inner<T: PkNum>(
     // it like the other two. Left unguarded it was indistinguishable from an unfinished
     // *explicit* solve, whose remedy is the opposite one — raise `max_steps` or loosen the
     // tolerances, rather than name a different stiff method.
+    //
+    // A fourth shape, and the only one that is invisible to the `f64` prediction solve
+    // (#1204): every saved *value* is finite while the derivative jets are not. A dual's
+    // jets carry higher powers of what its value carries linearly — `∂u/∂p = t·u` and
+    // `∂²u/∂p² = t²·u` for `u' = p·u`, `1/x²` and `1/x³` against `recip`'s `1/x` — so a
+    // trajectory driven near the top of double precision overflows its Hessian first, its
+    // gradient next, and its value not at all. Measured on the repro in
+    // `stiffness_tests.rs`: value `7.2e303`, gradient `1.4e306`, Hessian `NaN`, with zero
+    // clamps, no unfinished segment, and a *successful* stiff solve. Every other trigger
+    // here reads clean and FOCEI gets a `NaN` gradient out of a solve that reported success.
+    //
+    // Guarding it costs the invariant this function otherwise maintains — that the `f64`
+    // and dual solves choose the same stepper — and does so knowingly, in one direction
+    // only. `jets_finite` is `true` for `f64`, so the prediction path never rejects on this
+    // clause and the asymmetry is confined to the case where the dual solve's result is
+    // *already* unusable: the choice is between a gradient from the explicit re-solve of a
+    // trajectory the predictor integrated stiffly (wrong by solver tolerance) and a `NaN`
+    // (wrong by everything). The rejection is counted separately, in
+    // `auto_stiff_rejected_jets`, precisely so the asymmetry is visible rather than hidden
+    // inside the ordinary rejection count.
     let ran_stiff = attempt.auto_stiff_segments > 0;
     let stalled = attempt.stiff_min_step_clamped_steps > 0;
     let unfinished = attempt.unfinished_segments > 0;
-    let usable = !ran_stiff || (!stalled && !unfinished && finite_g(&out.0) && finite_g(&out.1));
+    let values_finite = finite_g(&out.0) && finite_g(&out.1);
+    // Scored only when the segment *started* with finite jets. Once a state's jets overflow
+    // they stay overflowed for the rest of the subject's event chain, so without this every
+    // downstream segment would fail the clause, pay a second solve that cannot repair
+    // anything it did not break, and add another count for one overflow. The clause is about
+    // a segment that lost its derivatives, not about one handed them already gone.
+    let entry_jets_finite = u0.iter().all(|v| v.jets_finite());
+    let jets_finite = !entry_jets_finite || (jets_finite_g(&out.0) && jets_finite_g(&out.1));
+    let usable = !ran_stiff || (!stalled && !unfinished && values_finite && jets_finite);
     if !usable {
         attempt.auto_stiff_rejected = 1;
+        // The jet-only case: everything the `f64` path can see was clean, and this rejection
+        // exists solely because the dual jets were not. Scored apart so a reader can tell a
+        // repair the prediction solve agreed with from one it did not (and would not have
+        // made), which is the difference between "the stiff method failed" and "the stiff
+        // method succeeded at a scale the sensitivities cannot represent".
+        if !stalled && !unfinished && values_finite {
+            attempt.auto_stiff_rejected_jets = 1;
+        }
         // The clamps were taken, so they stay in `min_step_clamped_steps`; they are *also*
         // recorded as discarded, because the trajectory they damaged is about to be thrown
         // away and re-solved. Without this split every rejected escalation would read, to a
@@ -1773,7 +1834,15 @@ fn integrate_resolved_g_inner<T: PkNum>(
         &pinned_explicit,
         Some(&mut fallback),
     );
-    if fallback.unfinished_segments > 0 || !finite_g(&fallback_out.0) || !finite_g(&fallback_out.1)
+    // Scored on the same two finiteness questions as the attempt, jets included (#1204 item
+    // 4): an explicit re-solve that returns finite values with `NaN` jets has not repaired
+    // the gradient the guard discarded the escalation to repair, and reporting it as a
+    // successful fallback would be the same silence one layer down.
+    if fallback.unfinished_segments > 0
+        || !finite_g(&fallback_out.0)
+        || !finite_g(&fallback_out.1)
+        || (entry_jets_finite
+            && (!jets_finite_g(&fallback_out.0) || !jets_finite_g(&fallback_out.1)))
     {
         fallback.auto_fallback_failed = 1;
     }
@@ -1789,6 +1858,16 @@ fn finite_g<T: PkNum>(points: &[SolPointG<T>]) -> bool {
     points
         .iter()
         .all(|p| p.u.iter().all(|v| v.val().is_finite()))
+}
+
+/// Whether every saved state's **derivative jets** are finite, reading the jets only.
+///
+/// The deliberate counterpart to [`finite_g`]: at `T = f64` this is a compile-time `true`
+/// (there are no jets), so the prediction path decides exactly as it did before #1204 and
+/// only a `Dual1`/`Dual2` solve can fail it. See the escalation guard for why that
+/// asymmetry is wanted rather than tolerated.
+fn jets_finite_g<T: PkNum>(points: &[SolPointG<T>]) -> bool {
+    points.iter().all(|p| p.u.iter().all(|v| v.jets_finite()))
 }
 
 #[cfg(test)]

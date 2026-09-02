@@ -1742,6 +1742,69 @@ pub(crate) fn integrates_odes(model: &CompiledModel) -> bool {
     model.ode_spec.is_some() || model.absorption_ode_equivalent.is_some()
 }
 
+/// Re-run the analytic **sensitivity** solve once per subject at the final estimates, for its
+/// solver statistics only (#1204).
+///
+/// The post-fit prediction sweep is an `f64` sweep, and one whole class of solver decision is
+/// invisible to it: the `auto` escalation guard's jet-finiteness clause can only fire on a
+/// `Dual1`/`Dual2` instantiation, because `f64` carries no jets to check. A counter that no
+/// production path could ever set would be exactly the dead diagnostic #1080 item 3 existed to
+/// remove, so the diagnostic scope has to see a dual solve as well as a scalar one.
+///
+/// This is that solve: the same analytic sensitivity the fit's gradient evaluated throughout,
+/// evaluated once more per subject, inside the caller's
+/// [`crate::ode::solver::SolverStatsScope`]. The derivatives themselves are thrown away — the
+/// fit already has its EBEs and `h_matrix` — so the only product is the counters the
+/// integration deposits in the scope.
+///
+/// It must be the **same** provider the fit ran, for two reasons. The scope gates differ:
+/// `ode_inner_grad_supported_model` describes the ODE provider's analytical reach and says
+/// nothing about `gradient_method = fd`, SDE, or the other escape hatches, so it alone would
+/// sweep a dual solve for a fit that computed every gradient by finite differences and report
+/// counters from a code path that fit never took. `analytic_inner_common_bail` is the
+/// predicate the inner loop itself consults, so it is the veto used here.
+///
+/// And the *order* matters. The overflow this exists to observe reaches the Hessian first and
+/// the gradient only later — value `7.2e303`, gradient `1.4e306`, Hessian `NaN` on the #1204
+/// repro — so a first-order `Dual1` sweep would miss exactly the case the counter is named
+/// for. When the model has an analytic **outer** gradient the sweep runs the second-order
+/// [`crate::sens::provider::subject_sensitivities`] (`Dual2`, gradient *and* Hessian), which
+/// is what FOCEI differentiates; when only the inner loop is analytic it runs the light
+/// first-order [`crate::sens::provider::subject_eta_grad`], which is all that fit computes.
+///
+/// No-ops off the analytic ODE sensitivity path entirely: a closed-form model, an FD fit, or
+/// an IOV model (`ode_analytical_supported` declines `n_kappa != 0`) has no dual ODE solve to
+/// observe.
+pub(crate) fn sweep_sensitivity_solver_stats(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    eta_hats: &[DVector<f64>],
+    mixest: Option<&[usize]>,
+) {
+    if !crate::sens::provider::ode_inner_grad_supported_model(model)
+        || crate::estimation::inner_optimizer::analytic_inner_common_bail(model)
+    {
+        return;
+    }
+    let second_order = crate::sens::provider::analytic_outer_gradient_available(model);
+    for (i, subject) in population.subjects.iter().enumerate() {
+        let Some(eta) = eta_hats.get(i) else { continue };
+        // Same class binding the prediction sweep uses: a mixture subject's η̂ belongs to its
+        // winning class, so evaluating it under the class-1 default would integrate a
+        // trajectory the fit never reported.
+        let _mix_guard = mixest
+            .and_then(|m| m.get(i))
+            .map(|&c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
+        let (theta, eta) = (&params.theta, eta.as_slice());
+        if second_order {
+            let _ = crate::sens::provider::subject_sensitivities(model, subject, theta, eta);
+        } else {
+            let _ = crate::sens::provider::subject_eta_grad(model, subject, theta, eta);
+        }
+    }
+}
+
 /// Turn the post-fit pass's [`OdeSolverStats`] into the fit's one ODE-solver warning (#1080
 /// Part B item 2).
 ///
@@ -1762,9 +1825,19 @@ pub(crate) fn integrates_odes(model: &CompiledModel) -> bool {
 ///   `cr` testdata escalates 240 of 580 segments) and not a problem, but it *is* a decision
 ///   the user never asked for and could not otherwise see.
 ///
-/// The counters come from the post-fit per-subject prediction pass, so they describe the
-/// production dispatch (TV covariates, resets, the event-driven walker, IOV) at the final
-/// estimates — one `f64` sweep, not the thousands of likelihood evaluations that preceded it.
+/// Every counter but one comes from the post-fit per-subject **prediction** pass, so they
+/// describe the production dispatch (TV covariates, resets, the event-driven walker, IOV) at
+/// the final estimates — one `f64` sweep, not the thousands of likelihood evaluations that
+/// preceded it.
+///
+/// The exception is `auto_stiff_rejected_jets`, which comes from
+/// [`sweep_sensitivity_solver_stats`]: `f64` carries no jets, so no prediction sweep can ever
+/// take that decision and a counter reported only from here would be permanently zero. That
+/// sweep is collected in its own scope and only this one field is copied across — mixing its
+/// steps and clamps into the prediction counters would have the clamp clause below tell a
+/// user their *predictions* were freeze-padded on the strength of a clamp that happened in a
+/// gradient solve.
+///
 /// A fit whose solver only misbehaved at parameter values the optimizer passed through and
 /// left behind therefore reads clean here, which is the honest scope: the warning is about the
 /// trajectories the fit *reports*, not about every one it visited.
@@ -1781,6 +1854,13 @@ pub(crate) fn ode_solver_diagnostics_warning(
         .min_step_clamped_steps
         .saturating_sub(stats.discarded_clamped_steps);
     let rejected = stats.auto_stiff_rejected;
+    // The rejections only a dual solve could have taken (#1204), carried here from the
+    // post-fit *sensitivity* sweep — `fit_inner` collects that sweep in its own scope and
+    // copies this one field across, so it is the single counter in this payload that does not
+    // describe the prediction pass. Reported as its own clause rather than folded into the
+    // rejection wording above, because the remedy is the opposite one: an ordinary rejection
+    // says "name a different stiff method", a jet rejection says naming one will not help.
+    let rejected_jets = stats.auto_stiff_rejected_jets;
     let fallback_failed = stats.auto_fallback_failed;
     // Like clamps, an unfinished stiff attempt that the guard discarded did not reach the
     // caller. Only the explicit fallback (or a named/kept method) belongs in the returned-
@@ -1825,8 +1905,12 @@ pub(crate) fn ode_solver_diagnostics_warning(
     } else {
         String::new()
     };
-    let unclean =
-        clamped > 0 || rejected > 0 || fallback_failed > 0 || unfinished_kept > 0 || aborted > 0;
+    let unclean = clamped > 0
+        || rejected > 0
+        || rejected_jets > 0
+        || fallback_failed > 0
+        || unfinished_kept > 0
+        || aborted > 0;
     if !unclean && escalated == 0 {
         return None;
     }
@@ -1844,6 +1928,7 @@ pub(crate) fn ode_solver_diagnostics_warning(
         "auto_stiff_segments": escalated,
         "auto_switched_segments": stats.auto_switched_segments,
         "auto_stiff_rejected": rejected,
+        "auto_stiff_rejected_jets": rejected_jets,
         "auto_fallback_failed": fallback_failed,
         "unfinished_segments": stats.unfinished_segments,
         "discarded_unfinished_segments": stats.discarded_unfinished_segments,
@@ -1892,6 +1977,26 @@ pub(crate) fn ode_solver_diagnostics_warning(
              explicitly is the next thing to try",
             explicit = crate::ode::OdeMethod::EXPLICIT_FALLBACK.as_str(),
             discarded = stats.discarded_clamped_steps,
+        ));
+    }
+    if rejected_jets > 0 {
+        // Self-contained, and deliberately not "N of the M rejections above": those come from
+        // the post-fit *prediction* sweep and this counter from the post-fit *sensitivity*
+        // sweep, so the two are not nested and phrasing them as a subset would invent a
+        // relationship the numbers do not have. The remedy differs too — the clause above
+        // sends the user to another `ode_method`, and this one explicitly tells them not to
+        // bother, so the wording has to stand on its own or the two read as contradicting.
+        parts.push(format!(
+            "{rejected_jets} segment(s) of the analytic-sensitivity solve were discarded and \
+             re-solved with {explicit}: their predicted values were all finite while their \
+             analytic derivatives — the gradients FOCE/FOCEI differentiate — had overflowed to \
+             inf/NaN. The stiff method integrated those segments; the trajectory simply reached \
+             a magnitude the sensitivities cannot represent, so naming a different ode_method \
+             will not help. Check the model's units and scaling (a state in ng rather than mg, \
+             an unbounded growth term, a rate constant on the wrong clock) before trusting the \
+             estimates. This count comes from the sensitivity sweep and is separate from the \
+             escalation counts reported above",
+            explicit = crate::ode::OdeMethod::EXPLICIT_FALLBACK.as_str(),
         ));
     }
     if fallback_failed > 0 {
