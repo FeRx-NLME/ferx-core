@@ -36,8 +36,20 @@ fn fit_result_carries_fixed_block_sigma_correlations() {
     let result = fit(&model, &population, &model.default_params, &options)
         .expect("initial correlated-residual evaluation must succeed");
 
-    assert_eq!(result.residual_correlations, model.residual_correlations);
+    // Structural equality only. Since #847 the reported rho comes off the packed
+    // parameter vector, so even a `FIX`ed one round-trips through
+    // `tanh(atanh(rho))` — exact `assert_eq!` on the f64 is a last-ULP coin flip
+    // that depends on the codegen (it held locally and failed under the coverage
+    // build). The value itself is checked to tolerance just below.
+    assert_eq!(
+        result.residual_correlations.len(),
+        model.residual_correlations.len()
+    );
     let corr = result.residual_correlations[0];
+    let declared = model.residual_correlations[0];
+    assert_eq!(corr.sigma_i, declared.sigma_i);
+    assert_eq!(corr.sigma_j, declared.sigma_j);
+    assert!((corr.rho - declared.rho).abs() < 1e-12);
     assert_eq!(result.sigma_names[corr.sigma_i], "ADD_ERR");
     assert_eq!(result.sigma_names[corr.sigma_j], "PROP_ERR");
     assert!((corr.rho - 0.5).abs() < 1e-12);
