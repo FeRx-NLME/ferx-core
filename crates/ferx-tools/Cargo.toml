@@ -17,6 +17,7 @@ repository = "https://github.com/FeRx-NLME/ferx-core"
 # `default = []`; `survival` is slated to become default-on).
 ferx-core = { path = "../..", version = "0.3.0", default-features = false }
 csv = "1.3"
+nalgebra = "0.35"
 rand = "0.10"
 rayon = "1.10"
 # `bootstrap_run.json` only — the manifest a `--resume` checks itself against
@@ -25,6 +26,10 @@ rayon = "1.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+[features]
+# Heavy convergence tests (5–60 min wall). Default `cargo test` ignores them;
+# a nightly/manual job opts in with --features slow-tests.
+slow-tests = []
+
 [dev-dependencies]
-nalgebra = "0.35"
 tempfile = "3"

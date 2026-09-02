@@ -96,4 +96,16 @@ jobs:
         # (`tests/tte_convergence.rs`, gated on BOTH `survival` and `slow-tests`)
         # actually execute here — the ci.yml `survival` job runs the TTE *smoke*
         # tests but not the slow convergence/SSE fits.
-        run: cargo test --no-default-features --features ci,survival,slow-tests --profile ci-test --no-fail-fast
+        #
+        # `--workspace` with PACKAGE-QUALIFIED features (#1114): without
+        # `--workspace` this builds the root `ferx-core` package only, so a
+        # Tier-3 test in `crates/ferx-tools/tests/` stays `#[ignore]`d in every
+        # job that exists and never runs anywhere. The features have to be
+        # qualified because `ci`/`survival` are not features of the members and
+        # `slow-tests` is declared by both `ferx-core` and `ferx-tools` — an
+        # unqualified name would resolve to the root package's and leave the
+        # member's gate closed.
+        run: |
+          cargo test --workspace --no-default-features \
+            --features ferx-core/ci,ferx-core/survival,ferx-core/slow-tests,ferx-tools/slow-tests \
+            --profile ci-test --no-fail-fast

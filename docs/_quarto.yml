@@ -105,6 +105,7 @@ website:
       - text: "Tools"
         contents:
           - tools/bootstrap.qmd
+          - tools/gam-screening.qmd
       - text: "Data Format"
         href: data-format.qmd
       - text: "CLI Reference"

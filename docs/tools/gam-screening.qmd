@@ -1,0 +1,159 @@
+---
+pagetitle: "GAM covariate screening"
+description-meta: "Rank covariate–ETA pairs by ΔAIC before committing to a stepwise covariate model, the ferx equivalent of Xpose4's xpose.gam()."
+---
+
+# GAM covariate screening
+
+> **Maturity: alpha** — see [Feature Maturity](../maturity.qmd) for what this means.
+
+Stepwise covariate modelling is expensive: every ETA × covariate pair costs a
+full fit, and a model with 5 random effects and 8 candidate covariates is 40
+fits before the search has picked its first term. GAM screening narrows that
+list first. It takes the empirical Bayes estimates from **one** fit, regresses
+each `η̂` on each covariate independently, and ranks the pairs by how much the
+covariate improves on the null model.
+
+It lives in `ferx-tools` rather than the engine — like the
+[bootstrap](bootstrap.qmd), it is post-processing over fit output rather than a
+change to the likelihood.
+
+This is the Rust equivalent of Xpose4's `xpose.gam()` (Jonsson & Karlsson,
+*Pharm Res* 1999).
+
+## What it computes
+
+For each ETA, and each covariate independently:
+
+| | model | parameters `p` |
+|---|---|---|
+| null | `η ~ 1` | 1 |
+| linear | `η ~ 1 + x` | 2 |
+| spline | `η ~ 1 + ns(x, df)` | `df + 1` |
+| categorical | `η ~ 1 + one-hot(x)` | `levels` |
+
+each scored with the Gaussian least-squares AIC
+
+$$\text{AIC} = n \ln(\text{RSS}/n) + 2p$$
+
+and reported as `ΔAIC = AIC_null − AIC_best`, where `AIC_best` is the winning
+form. **Positive ΔAIC means the covariate earns its parameters**; the ranking is
+by ΔAIC descending.
+
+Natural cubic splines use the ESL §5.2.1 basis with `df + 1` knots — boundaries
+at the observed min and max, interior knots at evenly spaced quantiles. `df = 2`
+and `df = 3` are tried by default, matching the xpose4 defaults
+(`smoother3 = ns, arg3 = df = 2`; `smoother4 = ns, arg4 = df = 3`).
+
+The covariate's **kind** — continuous or categorical — comes from the
+`[covariates]` block when the model declares one. For an undeclared covariate a
+heuristic applies: categorical when every value is within 1 × 10⁻⁶ of an integer
+and there are 10 or fewer distinct values.
+
+## Using it
+
+```rust
+use ferx_tools::gam::{gam_screen, GamOptions};
+
+let result = gam_screen(&fit_result, &population, &GamOptions::default());
+
+for eta in &result.eta_results {
+    println!("{} (shrinkage {:.0}%)", eta.eta_name, eta.shrinkage * 100.0);
+    for score in &eta.covariate_scores {
+        println!(
+            "  {:8} ΔAIC = {:8.2}  {:?}",
+            score.covariate, score.delta_aic, score.best_form
+        );
+    }
+}
+
+for warning in &result.warnings {
+    eprintln!("warning: {warning}");
+}
+```
+
+`GamOptions` restricts the search and tunes the candidate forms:
+
+| field | default | meaning |
+|---|---|---|
+| `etas` | `None` | screen only these ETAs (`None` = all) |
+| `covariates` | `None` | screen only these covariates (`None` = all in the dataset) |
+| `spline_df` | `[2, 3]` | spline degrees of freedom to try; empty disables splines |
+| `include_linear` | `true` | try the linear form |
+| `shrinkage_warn_threshold` | `0.30` | warn above this ETA shrinkage |
+
+When the caller has already collated the columns — from R or Python bindings,
+say — `gam_screen_raw` takes plain slices instead of a `FitResult` /
+`Population` pair. It panics on a length mismatch rather than truncating to the
+shortest input, because a silently short column produces a plausible-looking
+ranking of the wrong subjects.
+
+## Reading the output
+
+The result is a *shortlist*, not a model. A high ΔAIC says the covariate is
+worth spending a fit on in the [`[covariate_model]`](../model-file/covariate-model.qmd)
+search; it does not say the relation belongs in the final model. Two reasons to
+be careful:
+
+- **Screening is univariate.** Correlated covariates (WT and BSA, CRCL and AGE)
+  will both rank high off the same underlying effect.
+- **EBEs are shrunk.** See below.
+
+The winning **form** is the more useful half of the output in practice: a
+covariate whose spline beats its linear form by a wide margin is telling you the
+relation is not log-linear, before you have spent a fit finding that out.
+
+## The shrinkage caveat
+
+EBE-based screening is only informative when ETA shrinkage is low. At high
+shrinkage the EBEs regress toward zero, the `η̂`–covariate relation is
+attenuated, and a real covariate effect can screen as nothing. `gam_screen`
+warns for each ETA whose shrinkage exceeds `shrinkage_warn_threshold` (30% by
+default), and — separately — for each ETA whose shrinkage the fit did not
+report at all, since an unknown precondition is not a satisfied one.
+
+Above roughly 30%, treat a *negative* result as uninformative rather than as
+evidence of no effect.
+
+## Covariates that are skipped
+
+A covariate that cannot be screened is dropped from the ranking *and* reported
+in `GamResult::warnings`. Being dropped and being screened-but-unimportant look
+identical in a ranking, so every skip says which happened:
+
+| situation | why it is skipped |
+|---|---|
+| fewer than 3 subjects with both an EBE and a value | nothing to regress |
+| constant over the screened subjects | carries no information |
+| categorical with one distinct level | the same degenerate case |
+| categorical with as many levels as subjects | saturated: RSS → 0 would win the ranking on arithmetic alone, not on signal |
+| singular design | no candidate form could be fitted |
+| column length ≠ subject count | the caller's data is misaligned |
+
+Always read the warnings before trusting an empty or short ranking.
+
+## Validation
+
+ΔAIC is anchored against R — `splines::ns()` + `lm.fit()` under the same
+`n·log(RSS/n) + 2p` formula, which is the engine `xpose4::xpose.gam()` uses
+internally. The generator for the committed anchor fixture is
+`docs/gam_anchor_reference/gen_anchor.R`, and the comparison is asserted in
+`crates/ferx-tools/src/gam.rs::tests::xpose4_anchor_delta_aic_matches_reference`.
+
+| dataset | pairs | max ΔAIC difference | form agreement | top-1 agreement |
+|---|---|---|---|---|
+| `two_cpt_oral_cov` (30 subjects) | 10 | 1.16 × 10⁻⁵ | 10/10 | 5/5 ETAs |
+| cefepime (458 subjects) | 18 | 2.69 × 10⁻⁵ | 18/18 | 3/3 ETAs |
+
+The residual differences are floating-point noise. On the cefepime base model
+CRCL ranks #1 for ETA_CL (ΔAIC = 394.85, spline df = 3) and CR ranks #2
+(ΔAIC = 245.93), which is the covariate structure of that model's published
+run.
+
+### Why not `mgcv`-style penalised splines
+
+Xpose4 calls `gam::gam()`, which backfits. Since `η ~ N(0, ω²)`, Gaussian OLS is
+already the optimal estimator for a single-covariate regression, so backfitting
+adds iterations without changing the answer. Penalised splines with GCV-selected
+degrees of freedom would add a second tuning problem to a step whose entire
+output is an ordering.
