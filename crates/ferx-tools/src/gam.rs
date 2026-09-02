@@ -120,19 +120,78 @@ pub struct GamResult {
 /// categorical if all values are within 1 × 10⁻⁶ of an integer and there are
 /// ≤ 10 unique values.
 pub fn gam_screen(fit: &FitResult, pop: &Population, opts: &GamOptions) -> GamResult {
+    let eta_rows: Vec<&[f64]> = fit.subjects.iter().map(|s| s.eta.as_slice()).collect();
+    screen_from_parts(
+        &fit.eta_names,
+        &fit.shrinkage_eta,
+        &eta_rows,
+        &fit.covariate_table,
+        pop,
+        opts,
+    )
+}
+
+/// The body of [`gam_screen`], taking only the pieces of the [`FitResult`] it
+/// actually reads.
+///
+/// Split out so the name-selection and column-collection logic is reachable
+/// from a unit test: `FitResult` has ~70 fields and no `Default`, so a test
+/// cannot construct one, while `Population` has six public fields and
+/// `Subject` derives `Default`. Every caller-visible behaviour of
+/// [`gam_screen`] lives here.
+///
+/// `eta_rows[i]` is subject `i`'s EBE vector, indexed by position in
+/// `all_eta_names`.
+pub(crate) fn screen_from_parts(
+    all_eta_names: &[String],
+    shrinkage_eta: &[f64],
+    eta_rows: &[&[f64]],
+    covariate_table: &Option<CovariateTable>,
+    pop: &Population,
+    opts: &GamOptions,
+) -> GamResult {
     let mut warnings = Vec::new();
 
-    // Determine which ETA names and covariate names to screen.
+    // Determine which ETA names to screen. A requested name the fit does not
+    // carry is reported rather than dropped in silence.
     let eta_names: Vec<&str> = match &opts.etas {
-        Some(names) => names
-            .iter()
-            .map(|s| s.as_str())
-            .filter(|n| fit.eta_names.iter().any(|en| en.as_str() == *n))
-            .collect(),
-        None => fit.eta_names.iter().map(|s| s.as_str()).collect(),
+        Some(names) => {
+            let mut kept = Vec::new();
+            for n in names {
+                if all_eta_names.iter().any(|en| en == n) {
+                    kept.push(n.as_str());
+                } else {
+                    warnings.push(format!(
+                        "Requested ETA '{n}' is not in the fit result; skipped."
+                    ));
+                }
+            }
+            kept
+        }
+        None => all_eta_names.iter().map(|s| s.as_str()).collect(),
     };
+
+    // Same for covariates. Membership is tested against the subject records
+    // rather than `pop.covariate_names`, because an in-memory `Population`
+    // built by a caller may carry covariates without populating that list.
     let cov_names: Vec<&str> = match &opts.covariates {
-        Some(names) => names.iter().map(|s| s.as_str()).collect(),
+        Some(names) => {
+            let mut kept = Vec::new();
+            for n in names {
+                let present = pop
+                    .subjects
+                    .iter()
+                    .any(|s| s.covariates.contains_key(n.as_str()));
+                if present {
+                    kept.push(n.as_str());
+                } else {
+                    warnings.push(format!(
+                        "Requested covariate '{n}' is carried by no subject in the dataset; skipped."
+                    ));
+                }
+            }
+            kept
+        }
         None => pop.covariate_names.iter().map(|s| s.as_str()).collect(),
     };
 
@@ -162,7 +221,7 @@ pub fn gam_screen(fit: &FitResult, pop: &Population, opts: &GamOptions) -> GamRe
     let cov_data: Vec<(String, Vec<f64>, CovariateKind)> = cov_names
         .iter()
         .map(|&name| {
-            let kind = determine_cov_kind(name, &fit.covariate_table, &pop.subjects);
+            let kind = determine_cov_kind(name, covariate_table, &pop.subjects);
             let values: Vec<f64> = pop
                 .subjects
                 .iter()
@@ -172,67 +231,48 @@ pub fn gam_screen(fit: &FitResult, pop: &Population, opts: &GamOptions) -> GamRe
         })
         .collect();
 
-    // Screen each ETA in parallel (independent fits).
-    let eta_results_raw: Vec<(EtaGamResult, Vec<String>)> = eta_names
-        .par_iter()
-        .map(|&eta_name| {
-            let eta_idx = fit
-                .eta_names
+    // Transpose the per-subject EBE vectors into one column per screened ETA.
+    let eta_idx: Vec<Option<usize>> = eta_names
+        .iter()
+        .map(|&name| all_eta_names.iter().position(|n| n == name))
+        .collect();
+    let eta_cols_owned: Vec<Vec<f64>> = eta_idx
+        .iter()
+        .map(|&idx| {
+            eta_rows
                 .iter()
-                .position(|n| n == eta_name)
-                .unwrap_or(usize::MAX);
-
-            let shrinkage = if eta_idx < fit.shrinkage_eta.len() {
-                fit.shrinkage_eta[eta_idx]
-            } else {
-                f64::NAN
-            };
-
-            let mut eta_warnings = Vec::new();
-            if let Some(w) = shrinkage_warning(eta_name, shrinkage, opts.shrinkage_warn_threshold) {
-                eta_warnings.push(w);
-            }
-
-            let eta_values: Vec<f64> = fit
-                .subjects
-                .iter()
-                .map(|s| {
-                    if eta_idx < s.eta.len() {
-                        s.eta[eta_idx]
-                    } else {
-                        f64::NAN
-                    }
+                .map(|row| match idx {
+                    Some(i) if i < row.len() => row[i],
+                    _ => f64::NAN,
                 })
-                .collect();
-
-            let cov_refs: Vec<(&str, &[f64], CovariateKind)> = cov_data
-                .iter()
-                .map(|(name, vals, kind)| (name.as_str(), vals.as_slice(), *kind))
-                .collect();
-
-            let (aic_null, scores) = screen_eta_raw(&eta_values, &cov_refs, opts);
-
-            let result = EtaGamResult {
-                eta_name: eta_name.to_string(),
-                shrinkage,
-                aic_null,
-                covariate_scores: scores,
-            };
-
-            (result, eta_warnings)
+                .collect()
+        })
+        .collect();
+    let shrink: Vec<f64> = eta_idx
+        .iter()
+        .map(|&idx| match idx {
+            Some(i) if i < shrinkage_eta.len() => shrinkage_eta[i],
+            _ => f64::NAN,
         })
         .collect();
 
-    let mut eta_results = Vec::with_capacity(eta_results_raw.len());
-    for (result, eta_warns) in eta_results_raw {
-        warnings.extend(eta_warns);
-        eta_results.push(result);
-    }
+    let cov_names_ref: Vec<&str> = cov_data.iter().map(|(n, _, _)| n.as_str()).collect();
+    let cov_cols: Vec<&[f64]> = cov_data.iter().map(|(_, v, _)| v.as_slice()).collect();
+    let cov_kinds: Vec<CovariateKind> = cov_data.iter().map(|(_, _, k)| *k).collect();
+    let eta_cols: Vec<&[f64]> = eta_cols_owned.iter().map(|v| v.as_slice()).collect();
 
-    GamResult {
-        eta_results,
-        warnings,
-    }
+    let mut result = gam_screen_raw(
+        &eta_names,
+        &eta_cols,
+        &shrink,
+        &cov_names_ref,
+        &cov_cols,
+        &cov_kinds,
+        opts,
+    );
+    warnings.append(&mut result.warnings);
+    result.warnings = warnings;
+    result
 }
 
 /// Low-level GAM screening that accepts pre-aggregated, aligned per-subject
@@ -252,6 +292,14 @@ pub fn gam_screen(fit: &FitResult, pop: &Population, opts: &GamOptions) -> GamRe
 ///
 /// - `eta_names`, `eta_cols`, and `shrinkage` must all have length `n_eta`.
 /// - `cov_names`, `cov_cols`, and `cov_kinds` must all have length `n_cov`.
+///
+/// # Panics
+///
+/// Panics when any of those length invariants is violated. A mismatched column
+/// would otherwise be truncated by `zip` to the shortest input and produce a
+/// silently wrong ranking — the worst outcome for a tool whose entire output
+/// is an ordering.
+#[allow(clippy::too_many_arguments)]
 pub fn gam_screen_raw(
     eta_names: &[&str],
     eta_cols: &[&[f64]],
@@ -261,6 +309,44 @@ pub fn gam_screen_raw(
     cov_kinds: &[CovariateKind],
     opts: &GamOptions,
 ) -> GamResult {
+    assert_eq!(
+        eta_names.len(),
+        eta_cols.len(),
+        "gam_screen_raw: eta_names and eta_cols must have the same length"
+    );
+    assert_eq!(
+        eta_names.len(),
+        shrinkage.len(),
+        "gam_screen_raw: eta_names and shrinkage must have the same length"
+    );
+    assert_eq!(
+        cov_names.len(),
+        cov_cols.len(),
+        "gam_screen_raw: cov_names and cov_cols must have the same length"
+    );
+    assert_eq!(
+        cov_names.len(),
+        cov_kinds.len(),
+        "gam_screen_raw: cov_names and cov_kinds must have the same length"
+    );
+    let n_subjects = eta_cols.first().map(|c| c.len()).unwrap_or(0);
+    for (i, col) in eta_cols.iter().enumerate() {
+        assert_eq!(
+            col.len(),
+            n_subjects,
+            "gam_screen_raw: eta_cols[{i}] has {} entries, expected {n_subjects}",
+            col.len()
+        );
+    }
+    for (j, col) in cov_cols.iter().enumerate() {
+        assert_eq!(
+            col.len(),
+            n_subjects,
+            "gam_screen_raw: cov_cols[{j}] has {} entries, expected {n_subjects}",
+            col.len()
+        );
+    }
+
     let cov_refs: Vec<(&str, &[f64], CovariateKind)> = cov_names
         .iter()
         .zip(cov_cols.iter())
@@ -277,7 +363,13 @@ pub fn gam_screen_raw(
             if let Some(w) = shrinkage_warning(eta_name, shrink, opts.shrinkage_warn_threshold) {
                 eta_warnings.push(w);
             }
-            let (aic_null, covariate_scores) = screen_eta_raw(eta_vals, &cov_refs, opts);
+            let (aic_null, covariate_scores, screen_warnings) =
+                screen_eta_raw(eta_vals, &cov_refs, opts);
+            eta_warnings.extend(
+                screen_warnings
+                    .into_iter()
+                    .map(|w| format!("{eta_name}: {w}")),
+            );
             let result = EtaGamResult {
                 eta_name: eta_name.to_string(),
                 shrinkage: shrink,
@@ -336,9 +428,22 @@ fn determine_cov_kind(
     CovariateKind::Continuous
 }
 
-/// Emit a shrinkage warning string if the threshold is exceeded.
+/// Emit a shrinkage warning string when the threshold is exceeded, or when
+/// shrinkage could not be determined at all.
+///
+/// A `NaN` shrinkage means the fit reported none for this ETA (a restored fit,
+/// or a method that does not populate `shrinkage_eta`). Staying silent there
+/// would skip the module's central caveat in exactly the case where the
+/// precondition is *unknown*, so it gets its own warning.
 pub(crate) fn shrinkage_warning(eta_name: &str, shrinkage: f64, threshold: f64) -> Option<String> {
-    if !shrinkage.is_nan() && shrinkage > threshold {
+    if shrinkage.is_nan() {
+        return Some(format!(
+            "{eta_name}: ETA shrinkage is unavailable for this fit, so the \
+             low-shrinkage precondition for EBE-based covariate screening \
+             could not be checked."
+        ));
+    }
+    if shrinkage > threshold {
         Some(format!(
             "{}: shrinkage {:.1}% exceeds the {:.0}% threshold; \
              EBE-based covariate screening may be unreliable.",
@@ -353,15 +458,22 @@ pub(crate) fn shrinkage_warning(eta_name: &str, shrinkage: f64, threshold: f64) 
 
 /// Screen all covariates against one set of ETA values.
 ///
-/// Returns the global null AIC (computed on all subjects with non-NaN ETA) and
-/// the per-covariate scores ranked by `delta_aic` descending.
+/// Returns the global null AIC (computed on all subjects with non-NaN ETA),
+/// the per-covariate scores ranked by `delta_aic` descending, and one warning
+/// per covariate that had to be skipped.
+///
+/// Every `continue` in this function drops a covariate from the ranking, where
+/// "dropped" and "screened, found unimportant" look identical to a reader of
+/// the result — so each one emits a warning saying which happened and why.
 ///
 /// `pub(crate)` for unit tests.
 pub(crate) fn screen_eta_raw(
     eta_values: &[f64],
     covariates: &[(&str, &[f64], CovariateKind)],
     opts: &GamOptions,
-) -> (f64, Vec<CovariateScore>) {
+) -> (f64, Vec<CovariateScore>, Vec<String>) {
+    let mut warnings = Vec::new();
+
     // Filter to subjects with a valid ETA.
     let valid_eta: DVector<f64> = DVector::from_iterator(
         eta_values.iter().filter(|&&v| !v.is_nan()).count(),
@@ -369,7 +481,11 @@ pub(crate) fn screen_eta_raw(
     );
 
     if valid_eta.len() < 3 {
-        return (f64::NAN, vec![]);
+        warnings.push(format!(
+            "only {} subject(s) have a usable EBE; at least 3 are needed to screen.",
+            valid_eta.len()
+        ));
+        return (f64::NAN, vec![], warnings);
     }
 
     // Global null model (intercept only) AIC.
@@ -377,12 +493,24 @@ pub(crate) fn screen_eta_raw(
     let x_null_all = DMatrix::from_element(n_all, 1, 1.0);
     let (aic_null, _) = match ols_aic(&x_null_all, &valid_eta) {
         Some(v) => v,
-        None => return (f64::NAN, vec![]),
+        None => {
+            warnings.push("the null model could not be fitted; nothing screened.".into());
+            return (f64::NAN, vec![], warnings);
+        }
     };
 
     let mut scores = Vec::with_capacity(covariates.len());
 
     for &(cov_name, cov_values, kind) in covariates {
+        if cov_values.len() != eta_values.len() {
+            warnings.push(format!(
+                "{cov_name}: covariate column has {} entries but there are {} subjects; skipped.",
+                cov_values.len(),
+                eta_values.len()
+            ));
+            continue;
+        }
+
         // Collect subjects with valid ETA and valid covariate.
         let pairs: Vec<(f64, f64)> = eta_values
             .iter()
@@ -393,6 +521,9 @@ pub(crate) fn screen_eta_raw(
 
         let n = pairs.len();
         if n < 3 {
+            warnings.push(format!(
+                "{cov_name}: only {n} subject(s) have both an EBE and a value; skipped."
+            ));
             continue;
         }
 
@@ -403,7 +534,12 @@ pub(crate) fn screen_eta_raw(
         let x_null = DMatrix::from_element(n, 1, 1.0);
         let (aic_null_local, _) = match ols_aic(&x_null, &y) {
             Some(v) => v,
-            None => continue,
+            None => {
+                warnings.push(format!(
+                    "{cov_name}: the null model could not be fitted on its {n} subjects; skipped."
+                ));
+                continue;
+            }
         };
 
         // Fit candidate forms and pick the one with the lowest AIC.
@@ -415,6 +551,30 @@ pub(crate) fn screen_eta_raw(
             CovariateKind::Categorical => {
                 let dummies = categorical_design(&x_vals);
                 let n_dummies = dummies.ncols();
+
+                // A single-level categorical carries no information, and a
+                // near-saturated one carries too much: with `n_levels`
+                // approaching `n`, `n·ln(RSS/n)` dives and the `2p` penalty
+                // does not keep up, so a high-cardinality label (STUDY, SITE)
+                // would win the ranking on arithmetic alone. Both are skipped
+                // rather than scored — the continuous branch already refuses a
+                // constant covariate, and this is the same degenerate case.
+                if n_dummies == 0 {
+                    warnings.push(format!(
+                        "{cov_name}: only one distinct level over the {n} screened subjects; \
+                         skipped."
+                    ));
+                    continue;
+                }
+                if n_dummies + 1 >= n {
+                    warnings.push(format!(
+                        "{cov_name}: {} levels over {n} subjects leaves no residual degrees of \
+                         freedom; skipped.",
+                        n_dummies + 1
+                    ));
+                    continue;
+                }
+
                 // Design: [intercept | dummies]
                 let mut x_cat = DMatrix::zeros(n, n_dummies + 1);
                 for row in 0..n {
@@ -432,10 +592,28 @@ pub(crate) fn screen_eta_raw(
                 }
             }
             CovariateKind::Continuous => {
+                // Centre and scale before building any design matrix. AIC and
+                // R² are invariant under an affine reparameterisation of the
+                // design's column space (RSS and p are both unchanged), so the
+                // ranking is untouched — but the truncated-power spline basis
+                // cubes its input, so for a covariate of order 10²–10³ the raw
+                // design spans ~10⁹ and the least-squares solve loses most of
+                // its digits. R's `ns()` sidesteps this by returning a
+                // QR-orthonormalised basis.
+                let mean = x_vals.iter().sum::<f64>() / n as f64;
+                let sd = (x_vals.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64).sqrt();
+                if !sd.is_finite() || sd <= 0.0 {
+                    warnings.push(format!(
+                        "{cov_name}: constant over the {n} screened subjects; skipped."
+                    ));
+                    continue;
+                }
+                let z: Vec<f64> = x_vals.iter().map(|v| (v - mean) / sd).collect();
+
                 // Linear form.
                 if opts.include_linear {
                     let mut x_lin = DMatrix::zeros(n, 2);
-                    for (row, &v) in x_vals.iter().enumerate() {
+                    for (row, &v) in z.iter().enumerate() {
                         x_lin[(row, 0)] = 1.0;
                         x_lin[(row, 1)] = v;
                     }
@@ -454,7 +632,7 @@ pub(crate) fn screen_eta_raw(
                     if df < 1 || n <= df + 1 {
                         continue;
                     }
-                    let basis = ns_basis(&x_vals, df);
+                    let basis = ns_basis(&z, df);
                     // Design: [intercept | basis columns]
                     let mut x_spl = DMatrix::zeros(n, df + 1);
                     for row in 0..n {
@@ -474,8 +652,15 @@ pub(crate) fn screen_eta_raw(
             }
         }
 
-        if best_aic.is_infinite() {
-            continue; // no valid form fit
+        // `== INFINITY`, not `is_infinite()`: the sentinel is +∞ ("no form was
+        // fitted"), but a perfect fit gives `n·ln(0) = −∞`, which is the
+        // strongest signal the screen can produce. `is_infinite()` matched both
+        // and dropped it.
+        if best_aic == f64::INFINITY {
+            warnings.push(format!(
+                "{cov_name}: no candidate form could be fitted (singular design); skipped."
+            ));
+            continue;
         }
 
         scores.push(CovariateScore {
@@ -494,7 +679,7 @@ pub(crate) fn screen_eta_raw(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    (aic_null, scores)
+    (aic_null, scores, warnings)
 }
 
 /// Natural cubic spline basis matrix of shape `n × df` (ESL §5.2.1).
@@ -581,21 +766,45 @@ fn quantile_sorted(sorted: &[f64], p: f64) -> f64 {
     sorted[lo] * (1.0 - frac) + sorted[hi] * frac
 }
 
-/// OLS fit: returns `(AIC, R²)` or `None` when X'X is singular.
+/// OLS fit: returns `(AIC, R²)`, or `None` when the design is rank-deficient
+/// or leaves no residual degrees of freedom.
 ///
 /// AIC = n·ln(RSS/n) + 2·p (Gaussian / least-squares AIC).
 ///
+/// Solved by SVD of `X` rather than a Cholesky of `XᵀX`: forming the normal
+/// equations squares the condition number, and the caller's spline design is a
+/// truncated-power basis whose columns are cubes, so the normal equations lose
+/// roughly twice the digits the problem needs. The SVD also gives an honest
+/// rank test, which is what lets a singular design be reported as skipped
+/// rather than silently scored.
+///
 /// `pub(crate)` for unit tests.
 pub(crate) fn ols_aic(x: &DMatrix<f64>, y: &DVector<f64>) -> Option<(f64, f64)> {
-    let xtx = x.transpose() * x;
-    let xty = x.transpose() * y;
-    let chol = xtx.cholesky()?;
-    let beta = chol.solve(&xty);
+    let n = y.len();
+    let p = x.ncols();
+
+    // Residual df ≥ 1. At n == p the fit is saturated, RSS is 0 and
+    // `n·ln(RSS/n)` is −∞, so a saturated design would beat every honest one.
+    if p == 0 || n <= p {
+        return None;
+    }
+
+    let svd = x.clone().svd(true, true);
+    let smax = svd.singular_values.iter().copied().fold(0.0_f64, f64::max);
+    if smax <= 0.0 || !smax.is_finite() {
+        return None;
+    }
+    let tol = smax * (n.max(p) as f64) * f64::EPSILON;
+    if svd.singular_values.iter().any(|&s| s <= tol) {
+        return None; // rank-deficient design
+    }
+
+    let beta = svd.solve(y, tol).ok()?;
     let residuals = y - x * beta;
     let rss = residuals.norm_squared();
-    let n = y.len() as f64;
-    let p = x.ncols() as f64;
-    let aic = n * (rss / n).ln() + 2.0 * p;
+    let n_f = n as f64;
+    let p_f = p as f64;
+    let aic = n_f * (rss / n_f).ln() + 2.0 * p_f;
     let mean_y = y.mean();
     let sst = y.iter().map(|&yi| (yi - mean_y).powi(2)).sum::<f64>();
     let r2 = if sst < 1e-20 { 0.0 } else { 1.0 - rss / sst };
@@ -726,7 +935,20 @@ mod tests {
     #[test]
     fn low_shrinkage_no_warning() {
         assert!(shrinkage_warning("ETA_CL", 0.20, 0.30).is_none());
-        assert!(shrinkage_warning("ETA_CL", f64::NAN, 0.30).is_none());
+    }
+
+    #[test]
+    fn unavailable_shrinkage_warns_rather_than_staying_silent() {
+        // A fit that reports no shrinkage for this ETA leaves the module's
+        // central precondition unchecked, which is worth saying out loud —
+        // silence there reads identically to "shrinkage is fine".
+        let w = shrinkage_warning("ETA_CL", f64::NAN, 0.30)
+            .expect("NaN shrinkage must produce its own warning");
+        assert!(w.contains("ETA_CL"), "warning should name the ETA: {w}");
+        assert!(
+            w.contains("unavailable"),
+            "warning should say shrinkage is unavailable: {w}"
+        );
     }
 
     // ── screen_eta_raw ────────────────────────────────────────────────────────
@@ -738,7 +960,7 @@ mod tests {
         let cov: Vec<f64> = (0..30).map(|i| (i as f64 * 0.13 + 0.71).cos()).collect();
         let opts = GamOptions::default();
         let cov_refs = [("COV", cov.as_slice(), CovariateKind::Continuous)];
-        let (_aic_null, scores) = screen_eta_raw(&eta, &cov_refs, &opts);
+        let (_aic_null, scores, _warns) = screen_eta_raw(&eta, &cov_refs, &opts);
         assert!(!scores.is_empty());
         assert!(
             scores[0].delta_aic.abs() < 8.0,
@@ -760,7 +982,7 @@ mod tests {
             .collect();
         let opts = GamOptions::default();
         let cov_refs = [("WT", x.as_slice(), CovariateKind::Continuous)];
-        let (_aic_null, scores) = screen_eta_raw(&eta, &cov_refs, &opts);
+        let (_aic_null, scores, _warns) = screen_eta_raw(&eta, &cov_refs, &opts);
         assert!(!scores.is_empty());
         assert!(
             scores[0].delta_aic > 5.0,
@@ -792,7 +1014,7 @@ mod tests {
             ..Default::default()
         };
         let cov_refs = [("X", x.as_slice(), CovariateKind::Continuous)];
-        let (_aic_null, scores) = screen_eta_raw(&eta, &cov_refs, &opts);
+        let (_aic_null, scores, _warns) = screen_eta_raw(&eta, &cov_refs, &opts);
         assert!(!scores.is_empty());
         // Spline form must win over linear.
         assert!(
@@ -817,7 +1039,7 @@ mod tests {
         let eta: Vec<f64> = x.iter().map(|&xi| xi * 3.0 + 0.1).collect();
         let opts = GamOptions::default();
         let cov_refs = [("SEX", x.as_slice(), CovariateKind::Categorical)];
-        let (_aic_null, scores) = screen_eta_raw(&eta, &cov_refs, &opts);
+        let (_aic_null, scores, _warns) = screen_eta_raw(&eta, &cov_refs, &opts);
         assert!(!scores.is_empty());
         assert_eq!(
             scores[0].best_form,
@@ -837,7 +1059,7 @@ mod tests {
         let cov = vec![0.0, 1.0];
         let opts = GamOptions::default();
         let cov_refs = [("X", cov.as_slice(), CovariateKind::Continuous)];
-        let (aic_null, scores) = screen_eta_raw(&eta, &cov_refs, &opts);
+        let (aic_null, scores, _warns) = screen_eta_raw(&eta, &cov_refs, &opts);
         assert!(aic_null.is_nan());
         assert!(scores.is_empty());
     }
@@ -906,7 +1128,7 @@ mod tests {
             ("CRCL", crcl.as_slice(), CovariateKind::Continuous),
             ("SEX", sex.as_slice(), CovariateKind::Categorical),
         ];
-        let (_, scores_cl) = screen_eta_raw(&eta_cl, covs_cl, &opts);
+        let (_, scores_cl, _) = screen_eta_raw(&eta_cl, covs_cl, &opts);
 
         let find = |scores: &Vec<CovariateScore>, name: &str| {
             scores
@@ -939,7 +1161,7 @@ mod tests {
             ("CRCL", crcl.as_slice(), CovariateKind::Continuous),
             ("SEX", sex.as_slice(), CovariateKind::Categorical),
         ];
-        let (_, scores_v) = screen_eta_raw(&eta_v, covs_v, &opts);
+        let (_, scores_v, _) = screen_eta_raw(&eta_v, covs_v, &opts);
 
         assert!(
             (find(&scores_v, "WT") - -1.655_242).abs() < tol,
@@ -959,103 +1181,591 @@ mod tests {
         assert_eq!(scores_v[0].covariate, "SEX", "SEX must rank #1 for ETA_V");
     }
 
-    // ── Speed benchmark ───────────────────────────────────────────────────────
-    //
-    // Ignored by default; run with:
-    //   cargo test -p ferx-tools --lib --release -- gam_speed --ignored --nocapture
-    //
-    // Exercises a large synthetic dataset: 2 000 subjects, 8 ETAs, 15 covariates
-    // (120 covariates × 3 forms = 360 OLS fits per run).  Runs sequential and
-    // parallel (rayon over ETAs) so you can see the parallelism gain.
+    // ── ols_aic guards ────────────────────────────────────────────────────────
+
     #[test]
-    #[ignore = "speed benchmark — run with: cargo test -p ferx-tools --lib --release -- gam_speed --ignored --nocapture"]
-    fn gam_speed_large_dataset() {
-        use std::time::Instant;
+    fn ols_saturated_design_returns_none() {
+        // n == p: the fit is saturated, RSS is 0 and `n·ln(RSS/n)` is −∞, so a
+        // saturated design would beat every honest one on arithmetic alone.
+        let y = DVector::from_vec(vec![1.0, 2.0, 3.0]);
+        let x = DMatrix::from_row_slice(3, 3, &[1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
+        assert!(ols_aic(&x, &y).is_none(), "n == p must be refused");
+    }
 
-        const N: usize = 2_000;
-        const N_ETAS: usize = 8;
-        const N_COVS: usize = 15;
+    #[test]
+    fn ols_empty_design_returns_none() {
+        let y = DVector::from_vec(vec![1.0, 2.0, 3.0]);
+        let x = DMatrix::zeros(3, 0);
+        assert!(ols_aic(&x, &y).is_none());
+    }
 
-        // Deterministic synthetic ETAs (no RNG dependency).
-        // Pattern: sine waves with incommensurable frequencies per ETA.
-        let eta_data: Vec<Vec<f64>> = (0..N_ETAS)
-            .map(|e| {
-                (0..N)
-                    .map(|i| ((i as f64 * (e as f64 * 0.7 + 1.1)) * 0.003_141).sin() * 0.35)
-                    .collect()
-            })
-            .collect();
+    #[test]
+    fn ols_survives_an_ill_conditioned_design() {
+        // Column of order 10³ alongside its cube: the normal equations span
+        // ~10¹⁸ and a Cholesky of XᵀX loses the fit entirely. The SVD path
+        // still recovers the exact least-squares residual.
+        let n = 40;
+        let xs: Vec<f64> = (0..n).map(|i| 1000.0 + i as f64).collect();
+        let y = DVector::from_iterator(n, xs.iter().map(|&v| 3.0 * v));
+        let mut x = DMatrix::zeros(n, 3);
+        for (row, &v) in xs.iter().enumerate() {
+            x[(row, 0)] = 1.0;
+            x[(row, 1)] = v;
+            x[(row, 2)] = v.powi(3);
+        }
+        let (aic, r2) = ols_aic(&x, &y).expect("ill-conditioned but full-rank design must fit");
+        assert!(aic.is_finite() || aic == f64::NEG_INFINITY, "got {aic}");
+        assert!(
+            r2 > 0.999,
+            "an exact linear relation should give R² ≈ 1, got {r2}"
+        );
+    }
 
-        // Covariates: 3 categorical (c % 5 == 0) + 12 continuous.
-        let cov_data: Vec<(String, Vec<f64>, CovariateKind)> = (0..N_COVS)
-            .map(|c| {
-                if c % 5 == 0 {
-                    let vals: Vec<f64> = (0..N)
-                        .map(|i| if (i + c * 3) % 2 == 0 { 0.0 } else { 1.0 })
-                        .collect();
-                    (format!("COV_{c:02}"), vals, CovariateKind::Categorical)
-                } else {
-                    // Continuous: mix of range, centre and scale for realism.
-                    let centre = 30.0 + c as f64 * 5.0;
-                    let vals: Vec<f64> = (0..N)
-                        .map(|i| {
-                            centre + ((i as f64 * (c as f64 * 0.4 + 0.9)) * 0.002_718).cos() * 20.0
-                        })
-                        .collect();
-                    (format!("COV_{c:02}"), vals, CovariateKind::Continuous)
-                }
-            })
-            .collect();
+    // ── screen_eta_raw degenerate inputs ──────────────────────────────────────
 
-        let cov_refs: Vec<(&str, &[f64], CovariateKind)> = cov_data
-            .iter()
-            .map(|(n, v, k)| (n.as_str(), v.as_slice(), *k))
-            .collect();
-
+    #[test]
+    fn constant_covariate_is_skipped_with_a_warning() {
+        let eta: Vec<f64> = (0..20).map(|i| (i as f64 * 0.3).sin()).collect();
+        let cov = vec![70.0_f64; 20];
         let opts = GamOptions::default();
-        let total_pairs = N_ETAS * N_COVS;
+        let cov_refs = [("WT", cov.as_slice(), CovariateKind::Continuous)];
+        let (_, scores, warns) = screen_eta_raw(&eta, &cov_refs, &opts);
+        assert!(scores.is_empty(), "a constant covariate carries no signal");
+        assert!(
+            warns
+                .iter()
+                .any(|w| w.contains("WT") && w.contains("constant")),
+            "the skip must be reported, not silent: {warns:?}"
+        );
+    }
 
-        // ── Sequential (one ETA after another, single thread) ─────────────────
-        // Warm-up.
-        for e in 0..N_ETAS {
-            let _ = screen_eta_raw(&eta_data[e], &cov_refs, &opts);
-        }
-        let t0 = Instant::now();
-        let n_seq_runs = 5;
-        for _ in 0..n_seq_runs {
-            for e in 0..N_ETAS {
-                let _ = screen_eta_raw(&eta_data[e], &cov_refs, &opts);
-            }
-        }
-        let seq_ms = t0.elapsed().as_secs_f64() * 1000.0 / n_seq_runs as f64;
+    #[test]
+    fn single_level_categorical_is_skipped_like_a_constant_continuous() {
+        // The same degenerate case as above, on the other branch: it used to be
+        // scored with delta_aic = 0.0 while the continuous twin was dropped.
+        let eta: Vec<f64> = (0..20).map(|i| (i as f64 * 0.3).sin()).collect();
+        let cov = vec![1.0_f64; 20];
+        let opts = GamOptions::default();
+        let cov_refs = [("SEX", cov.as_slice(), CovariateKind::Categorical)];
+        let (_, scores, warns) = screen_eta_raw(&eta, &cov_refs, &opts);
+        assert!(
+            scores.is_empty(),
+            "a one-level categorical carries no signal"
+        );
+        assert!(
+            warns
+                .iter()
+                .any(|w| w.contains("SEX") && w.contains("one distinct level")),
+            "the skip must be reported: {warns:?}"
+        );
+    }
 
-        // ── Parallel (rayon par_iter over ETAs, mirrors gam_screen internals) ──
-        // Warm-up.
-        (0..N_ETAS).into_par_iter().for_each(|e| {
-            let _ = screen_eta_raw(&eta_data[e], &cov_refs, &opts);
+    #[test]
+    fn saturated_categorical_is_skipped_not_ranked_first() {
+        // A label with one level per subject (a STUDY or SITE id) saturates the
+        // design: RSS → 0, `n·ln(RSS/n)` dives, and the 2p penalty does not
+        // keep up, so it would win the ranking outright against a covariate
+        // that carries real signal.
+        let n = 12;
+        let wt: Vec<f64> = (0..n).map(|i| 60.0 + 2.0 * i as f64).collect();
+        let eta: Vec<f64> = wt
+            .iter()
+            .enumerate()
+            .map(|(i, &w)| 0.02 * (w - 70.0) + (i as f64 * 0.7).sin() * 0.05)
+            .collect();
+        let site: Vec<f64> = (0..n).map(|i| i as f64).collect(); // one level per subject
+        let opts = GamOptions::default();
+        let cov_refs = [
+            ("WT", wt.as_slice(), CovariateKind::Continuous),
+            ("SITE", site.as_slice(), CovariateKind::Categorical),
+        ];
+        let (_, scores, warns) = screen_eta_raw(&eta, &cov_refs, &opts);
+        assert!(
+            !scores.iter().any(|s| s.covariate == "SITE"),
+            "a saturated categorical must not be scored: {:?}",
+            scores
+                .iter()
+                .map(|s| (&s.covariate, s.delta_aic))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(scores.first().map(|s| s.covariate.as_str()), Some("WT"));
+        assert!(
+            warns
+                .iter()
+                .any(|w| w.contains("SITE") && w.contains("residual degrees of freedom")),
+            "the skip must name the reason: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn perfect_fit_is_reported_rather_than_dropped() {
+        // RSS = 0 gives AIC = n·ln(0) = −∞. The "no form fitted" sentinel is
+        // +∞, and testing it with `is_infinite()` matched both — so the
+        // strongest signal the screen can produce disappeared from the report.
+        let x: Vec<f64> = (0..20).map(|i| i as f64).collect();
+        let eta: Vec<f64> = x.iter().map(|&v| 2.0 * v + 1.0).collect();
+        let opts = GamOptions {
+            spline_df: vec![],
+            ..Default::default()
+        };
+        let cov_refs = [("X", x.as_slice(), CovariateKind::Continuous)];
+        let (_, scores, _) = screen_eta_raw(&eta, &cov_refs, &opts);
+        assert_eq!(scores.len(), 1, "an exact relation must still be reported");
+        assert!(
+            scores[0].delta_aic > 0.0,
+            "an exact relation must rank as a strong improvement, got {}",
+            scores[0].delta_aic
+        );
+    }
+
+    #[test]
+    fn ill_conditioned_covariate_still_ranks() {
+        // CRCL-scale values (order 10²) fed to a truncated-power basis whose
+        // columns are cubes: the uncentred design ran to ~10⁹ and the fit came
+        // back singular, dropping a covariate that carries obvious signal.
+        let n = 40;
+        let crcl: Vec<f64> = (0..n).map(|i| 400.0 + 3.0 * i as f64).collect();
+        let eta: Vec<f64> = crcl
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| 0.004 * (c - 460.0) + (i as f64 * 0.9).sin() * 0.02)
+            .collect();
+        let opts = GamOptions::default();
+        let cov_refs = [("CRCL", crcl.as_slice(), CovariateKind::Continuous)];
+        let (_, scores, warns) = screen_eta_raw(&eta, &cov_refs, &opts);
+        assert_eq!(
+            scores.len(),
+            1,
+            "covariate was dropped; warnings: {warns:?}"
+        );
+        assert!(
+            scores[0].delta_aic > 10.0,
+            "a strong signal at CRCL scale should survive, got {}",
+            scores[0].delta_aic
+        );
+    }
+
+    #[test]
+    fn mismatched_covariate_column_is_skipped_with_a_warning() {
+        // `zip` would silently truncate to the shorter of the two and score a
+        // different subject set than the caller asked for.
+        let eta: Vec<f64> = (0..20).map(|i| (i as f64 * 0.3).sin()).collect();
+        let cov: Vec<f64> = (0..15).map(|i| i as f64).collect();
+        let opts = GamOptions::default();
+        let cov_refs = [("SHORT", cov.as_slice(), CovariateKind::Continuous)];
+        let (_, scores, warns) = screen_eta_raw(&eta, &cov_refs, &opts);
+        assert!(scores.is_empty());
+        assert!(
+            warns
+                .iter()
+                .any(|w| w.contains("SHORT") && w.contains("15")),
+            "the length mismatch must be reported: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn all_missing_covariate_is_skipped_with_a_warning() {
+        let eta: Vec<f64> = (0..20).map(|i| (i as f64 * 0.3).sin()).collect();
+        let cov = vec![f64::NAN; 20];
+        let opts = GamOptions::default();
+        let cov_refs = [("GONE", cov.as_slice(), CovariateKind::Continuous)];
+        let (_, scores, warns) = screen_eta_raw(&eta, &cov_refs, &opts);
+        assert!(scores.is_empty());
+        assert!(
+            warns.iter().any(|w| w.contains("GONE")),
+            "an all-missing covariate must be reported: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn too_few_subjects_reports_why() {
+        let eta = vec![1.0, 2.0];
+        let cov = vec![0.0, 1.0];
+        let opts = GamOptions::default();
+        let cov_refs = [("X", cov.as_slice(), CovariateKind::Continuous)];
+        let (_, _, warns) = screen_eta_raw(&eta, &cov_refs, &opts);
+        assert!(
+            warns.iter().any(|w| w.contains("at least 3")),
+            "an empty result must say why: {warns:?}"
+        );
+    }
+
+    // ── gam_screen_raw ────────────────────────────────────────────────────────
+
+    fn two_eta_screen_inputs() -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+        let n = 40;
+        let wt: Vec<f64> = (0..n).map(|i| 60.0 + i as f64).collect();
+        let noise: Vec<f64> = (0..n)
+            .map(|i| (i as f64 * 1.7 + 0.4).cos() * 10.0)
+            .collect();
+        // ETA_CL tracks WT; ETA_V tracks nothing.
+        let eta_cl: Vec<f64> = wt
+            .iter()
+            .enumerate()
+            .map(|(i, &w)| 0.03 * (w - 80.0) + (i as f64 * 0.9).sin() * 0.05)
+            .collect();
+        let eta_v: Vec<f64> = (0..n)
+            .map(|i| (i as f64 * 0.41 + 0.2).sin() * 0.2)
+            .collect();
+        (wt, noise, eta_cl, eta_v)
+    }
+
+    #[test]
+    fn gam_screen_raw_ranks_each_eta_independently() {
+        let (wt, noise, eta_cl, eta_v) = two_eta_screen_inputs();
+        let opts = GamOptions::default();
+        let result = gam_screen_raw(
+            &["ETA_CL", "ETA_V"],
+            &[eta_cl.as_slice(), eta_v.as_slice()],
+            &[0.05, 0.10],
+            &["WT", "NOISE"],
+            &[wt.as_slice(), noise.as_slice()],
+            &[CovariateKind::Continuous, CovariateKind::Continuous],
+            &opts,
+        );
+
+        assert_eq!(result.eta_results.len(), 2);
+        let cl = &result.eta_results[0];
+        assert_eq!(cl.eta_name, "ETA_CL");
+        assert_eq!(cl.shrinkage, 0.05);
+        assert!(cl.aic_null.is_finite());
+        assert_eq!(
+            cl.covariate_scores[0].covariate, "WT",
+            "WT must rank first for the ETA it drives"
+        );
+        assert!(cl.covariate_scores[0].delta_aic > cl.covariate_scores[1].delta_aic);
+
+        let v = &result.eta_results[1];
+        assert_eq!(v.eta_name, "ETA_V");
+        assert!(
+            v.covariate_scores.iter().all(|s| s.delta_aic < 5.0),
+            "no covariate drives ETA_V: {:?}",
+            v.covariate_scores
+                .iter()
+                .map(|s| (&s.covariate, s.delta_aic))
+                .collect::<Vec<_>>()
+        );
+        // Low shrinkage on both ETAs, so nothing to warn about.
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    }
+
+    #[test]
+    fn gam_screen_raw_propagates_shrinkage_and_skip_warnings() {
+        let (wt, _noise, eta_cl, _eta_v) = two_eta_screen_inputs();
+        let flat = vec![70.0_f64; wt.len()];
+        let opts = GamOptions::default();
+        let result = gam_screen_raw(
+            &["ETA_CL"],
+            &[eta_cl.as_slice()],
+            &[0.62], // above the 30% default threshold
+            &["WT", "FLAT"],
+            &[wt.as_slice(), flat.as_slice()],
+            &[CovariateKind::Continuous, CovariateKind::Continuous],
+            &opts,
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("shrinkage 62.0%")),
+            "{:?}",
+            result.warnings
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.starts_with("ETA_CL:") && w.contains("FLAT")),
+            "a per-covariate skip must be attributed to its ETA: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "eta_names and shrinkage must have the same length")]
+    fn gam_screen_raw_rejects_a_short_shrinkage_vector() {
+        let (wt, _, eta_cl, eta_v) = two_eta_screen_inputs();
+        let opts = GamOptions::default();
+        let _ = gam_screen_raw(
+            &["ETA_CL", "ETA_V"],
+            &[eta_cl.as_slice(), eta_v.as_slice()],
+            &[0.05], // one short
+            &["WT"],
+            &[wt.as_slice()],
+            &[CovariateKind::Continuous],
+            &opts,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "cov_cols[0] has")]
+    fn gam_screen_raw_rejects_a_short_covariate_column() {
+        let (wt, _, eta_cl, _) = two_eta_screen_inputs();
+        let opts = GamOptions::default();
+        let _ = gam_screen_raw(
+            &["ETA_CL"],
+            &[eta_cl.as_slice()],
+            &[0.05],
+            &["WT"],
+            &[&wt[..wt.len() - 1]], // one subject short
+            &[CovariateKind::Continuous],
+            &opts,
+        );
+    }
+
+    // ── determine_cov_kind ────────────────────────────────────────────────────
+
+    fn subject_with(id: &str, covs: &[(&str, f64)]) -> ferx_core::Subject {
+        let mut s = ferx_core::Subject {
+            id: id.to_string(),
+            ..Default::default()
+        };
+        for &(name, value) in covs {
+            s.covariates.insert(name.to_string(), value);
+        }
+        s
+    }
+
+    #[test]
+    fn declared_kind_beats_the_heuristic() {
+        // WT is near-integer with few levels here, so the heuristic would call
+        // it categorical — the `[covariates]` declaration must win.
+        let subjects = vec![
+            subject_with("1", &[("WT", 70.0)]),
+            subject_with("2", &[("WT", 80.0)]),
+            subject_with("3", &[("WT", 70.0)]),
+        ];
+        let table = Some(CovariateTable {
+            names: vec!["WT".into()],
+            kinds: vec![CovariateKind::Continuous],
+            rows: vec![],
         });
-        let t1 = Instant::now();
-        let n_par_runs = 20;
-        for _ in 0..n_par_runs {
-            (0..N_ETAS).into_par_iter().for_each(|e| {
-                let _ = screen_eta_raw(&eta_data[e], &cov_refs, &opts);
-            });
-        }
-        let par_ms = t1.elapsed().as_secs_f64() * 1000.0 / n_par_runs as f64;
+        assert_eq!(
+            determine_cov_kind("WT", &table, &subjects),
+            CovariateKind::Continuous
+        );
+        // A name the table does not declare still falls through to the heuristic.
+        assert_eq!(
+            determine_cov_kind("MISSING", &table, &subjects),
+            CovariateKind::Continuous
+        );
+    }
 
-        println!(
-            "\n╔══ GAM speed benchmark ══════════════════════════════════╗\n\
-             ║  dataset  : {N} subjects, {N_ETAS} ETAs, {N_COVS} covariates\n\
-             ║  OLS fits : {total_pairs} pairs × 3 forms = {} per run\n\
-             ╠══ sequential ═══════════════════════════════════════════╣\n\
-             ║  {seq_ms:.2} ms/run   ({:.3} ms/pair)\n\
-             ╠══ parallel (rayon over ETAs) ═══════════════════════════╣\n\
-             ║  {par_ms:.2} ms/run   ({:.3} ms/pair)   speedup {:.1}×\n\
-             ╚═════════════════════════════════════════════════════════╝",
-            total_pairs * 3,
-            seq_ms / total_pairs as f64,
-            par_ms / total_pairs as f64,
-            seq_ms / par_ms,
+    #[test]
+    fn heuristic_calls_few_valued_integers_categorical() {
+        let subjects: Vec<_> = (0..12)
+            .map(|i| subject_with(&i.to_string(), &[("SEX", (i % 2) as f64)]))
+            .collect();
+        assert_eq!(
+            determine_cov_kind("SEX", &None, &subjects),
+            CovariateKind::Categorical
+        );
+    }
+
+    #[test]
+    fn heuristic_calls_many_valued_integers_continuous() {
+        // > 10 distinct near-integer levels: an age column, not a label.
+        let subjects: Vec<_> = (0..20)
+            .map(|i| subject_with(&i.to_string(), &[("AGE", 20.0 + i as f64)]))
+            .collect();
+        assert_eq!(
+            determine_cov_kind("AGE", &None, &subjects),
+            CovariateKind::Continuous
+        );
+    }
+
+    #[test]
+    fn heuristic_calls_non_integers_continuous_and_survives_no_values() {
+        let subjects = vec![
+            subject_with("1", &[("CRCL", 88.4)]),
+            subject_with("2", &[("CRCL", 91.2)]),
+            subject_with("3", &[("CRCL", f64::NAN)]),
+        ];
+        assert_eq!(
+            determine_cov_kind("CRCL", &None, &subjects),
+            CovariateKind::Continuous
+        );
+        // A name no subject carries has no values to judge.
+        assert_eq!(
+            determine_cov_kind("ABSENT", &None, &subjects),
+            CovariateKind::Continuous
+        );
+    }
+
+    // ── screen_from_parts (the body of `gam_screen`) ──────────────────────────
+
+    fn population_from(subjects: Vec<ferx_core::Subject>, cov_names: &[&str]) -> Population {
+        Population {
+            subjects,
+            covariate_names: cov_names.iter().map(|s| s.to_string()).collect(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        }
+    }
+
+    /// A 40-subject population whose ETA_CL tracks WT and whose ETA_V tracks
+    /// nothing, laid out the way `gam_screen` receives it from a `FitResult`.
+    fn screen_fixture() -> (Vec<String>, Vec<f64>, Vec<Vec<f64>>, Population) {
+        let (wt, noise, eta_cl, eta_v) = two_eta_screen_inputs();
+        let subjects: Vec<_> = (0..wt.len())
+            .map(|i| subject_with(&i.to_string(), &[("WT", wt[i]), ("NOISE", noise[i])]))
+            .collect();
+        let eta_rows: Vec<Vec<f64>> = (0..wt.len()).map(|i| vec![eta_cl[i], eta_v[i]]).collect();
+        (
+            vec!["ETA_CL".into(), "ETA_V".into()],
+            vec![0.05, 0.10],
+            eta_rows,
+            population_from(subjects, &["WT", "NOISE"]),
+        )
+    }
+
+    #[test]
+    fn screen_from_parts_ranks_the_driving_covariate_first() {
+        let (names, shrink, eta_rows, pop) = screen_fixture();
+        let rows: Vec<&[f64]> = eta_rows.iter().map(|r| r.as_slice()).collect();
+        let result = screen_from_parts(&names, &shrink, &rows, &None, &pop, &GamOptions::default());
+
+        assert_eq!(result.eta_results.len(), 2);
+        assert_eq!(result.eta_results[0].eta_name, "ETA_CL");
+        assert_eq!(result.eta_results[0].covariate_scores[0].covariate, "WT");
+        assert_eq!(result.eta_results[0].shrinkage, 0.05);
+        assert_eq!(result.eta_results[1].eta_name, "ETA_V");
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    }
+
+    #[test]
+    fn screen_from_parts_honours_the_eta_and_covariate_filters() {
+        let (names, shrink, eta_rows, pop) = screen_fixture();
+        let rows: Vec<&[f64]> = eta_rows.iter().map(|r| r.as_slice()).collect();
+        let opts = GamOptions {
+            etas: Some(vec!["ETA_V".into()]),
+            covariates: Some(vec!["NOISE".into()]),
+            ..Default::default()
+        };
+        let result = screen_from_parts(&names, &shrink, &rows, &None, &pop, &opts);
+
+        assert_eq!(result.eta_results.len(), 1);
+        assert_eq!(result.eta_results[0].eta_name, "ETA_V");
+        // Shrinkage is taken by ETA *name*, not by filtered position.
+        assert_eq!(result.eta_results[0].shrinkage, 0.10);
+        assert_eq!(result.eta_results[0].covariate_scores.len(), 1);
+        assert_eq!(result.eta_results[0].covariate_scores[0].covariate, "NOISE");
+    }
+
+    #[test]
+    fn screen_from_parts_reports_names_it_could_not_find() {
+        let (names, shrink, eta_rows, pop) = screen_fixture();
+        let rows: Vec<&[f64]> = eta_rows.iter().map(|r| r.as_slice()).collect();
+        let opts = GamOptions {
+            etas: Some(vec!["ETA_CL".into(), "ETA_KA".into()]),
+            covariates: Some(vec!["WT".into(), "CRCL".into()]),
+            ..Default::default()
+        };
+        let result = screen_from_parts(&names, &shrink, &rows, &None, &pop, &opts);
+
+        assert_eq!(result.eta_results.len(), 1, "ETA_KA is not in the fit");
+        assert!(
+            result.warnings.iter().any(|w| w.contains("ETA_KA")),
+            "{:?}",
+            result.warnings
+        );
+        assert!(
+            result.warnings.iter().any(|w| w.contains("CRCL")),
+            "a covariate no subject carries must be reported, not screened as \
+             all-missing: {:?}",
+            result.warnings
+        );
+        assert_eq!(result.eta_results[0].covariate_scores.len(), 1);
+    }
+
+    #[test]
+    fn screen_from_parts_uses_the_declared_covariate_kinds() {
+        let n = 30;
+        let grp: Vec<f64> = (0..n).map(|i| (i % 3) as f64).collect();
+        let eta: Vec<f64> = grp
+            .iter()
+            .enumerate()
+            .map(|(i, &g)| g * 0.5 + (i as f64 * 0.7).sin() * 0.02)
+            .collect();
+        let subjects: Vec<_> = (0..n)
+            .map(|i| subject_with(&i.to_string(), &[("GRP", grp[i])]))
+            .collect();
+        let pop = population_from(subjects, &["GRP"]);
+        let eta_rows: Vec<Vec<f64>> = eta.iter().map(|&e| vec![e]).collect();
+        let rows: Vec<&[f64]> = eta_rows.iter().map(|r| r.as_slice()).collect();
+        let table = Some(CovariateTable {
+            names: vec!["GRP".into()],
+            kinds: vec![CovariateKind::Categorical],
+            rows: vec![],
+        });
+
+        let result = screen_from_parts(
+            &["ETA_CL".to_string()],
+            &[0.05],
+            &rows,
+            &table,
+            &pop,
+            &GamOptions::default(),
+        );
+        assert_eq!(
+            result.eta_results[0].covariate_scores[0].best_form,
+            CovariateForm::Categorical
+        );
+    }
+
+    #[test]
+    fn screen_from_parts_reports_an_empty_covariate_set() {
+        let (names, shrink, eta_rows, _) = screen_fixture();
+        let rows: Vec<&[f64]> = eta_rows.iter().map(|r| r.as_slice()).collect();
+        let empty = population_from(vec![], &[]);
+        let result = screen_from_parts(
+            &names,
+            &shrink,
+            &rows,
+            &None,
+            &empty,
+            &GamOptions::default(),
+        );
+        assert!(result.eta_results.is_empty());
+        assert!(
+            result.warnings.iter().any(|w| w.contains("No covariates")),
+            "{:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn screen_from_parts_reports_an_empty_eta_set() {
+        let (_, _, eta_rows, pop) = screen_fixture();
+        let rows: Vec<&[f64]> = eta_rows.iter().map(|r| r.as_slice()).collect();
+        let result = screen_from_parts(&[], &[], &rows, &None, &pop, &GamOptions::default());
+        assert!(result.eta_results.is_empty());
+        assert!(
+            result.warnings.iter().any(|w| w.contains("No ETAs")),
+            "{:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn screen_from_parts_marks_a_missing_ebe_column_as_unavailable() {
+        // A fit whose per-subject EBE vector is shorter than `eta_names` (or
+        // whose shrinkage vector is) must produce NaNs and say so, not index
+        // out of bounds.
+        let (names, _, eta_rows, pop) = screen_fixture();
+        let short: Vec<Vec<f64>> = eta_rows.iter().map(|r| vec![r[0]]).collect();
+        let rows: Vec<&[f64]> = short.iter().map(|r| r.as_slice()).collect();
+        let result = screen_from_parts(&names, &[], &rows, &None, &pop, &GamOptions::default());
+
+        assert_eq!(result.eta_results.len(), 2);
+        assert!(result.eta_results[1].aic_null.is_nan());
+        assert!(result.eta_results[1].covariate_scores.is_empty());
+        assert!(
+            result.warnings.iter().any(|w| w.contains("unavailable")),
+            "missing shrinkage must be reported: {:?}",
+            result.warnings
         );
     }
 }

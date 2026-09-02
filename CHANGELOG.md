@@ -41,7 +41,16 @@ section of the SDLC for the versioning policy).
   ETA × covariate pair, fits `η_i ~ f(cov_i)` (linear, natural cubic spline, or one-hot
   categorical) and ranks covariates by AIC improvement over the null model. High-ΔAIC
   covariates are then prioritised in an SCM. This is the Rust equivalent of Xpose4's
-  `xpose.gam()`. Shrinkage > 30% triggers a warning. Requires `ferx-tools`.
+  `xpose.gam()`. Requires `ferx-tools`. See
+  [GAM covariate screening](https://ferx-nlme.github.io/ferx-core/tools/gam-screening.html).
+
+  A covariate that cannot be screened is now reported in `GamResult::warnings` rather than
+  dropped in silence — being skipped and being screened-but-unimportant are indistinguishable
+  in a ranking. Skips cover: a constant covariate, a single-level or fully saturated
+  categorical, a singular design, a column whose length does not match the subject count, and
+  fewer than three usable subjects. Shrinkage above 30% warns, and so does an ETA whose
+  shrinkage the fit did not report at all. `gam_screen_raw()` panics on a length mismatch
+  instead of truncating to the shortest input.
 - **A `present(COV)` condition for covariates that may be missing (#1111).** A missing covariate
   value is `NaN`, and division by it underflows to `0.0` here rather than erroring, so an
   unguarded `(CRCL/100)^THETA` silently zeroes the parameter on a row with no `CRCL`.
