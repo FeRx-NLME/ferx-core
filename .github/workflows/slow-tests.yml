@@ -53,6 +53,8 @@ on:
       - '.github/workflows/slow-tests.yml'  # the feature set / cargo command this job runs
       - 'Cargo.lock'                        # a nlopt/nalgebra/rand bump moves fit numbers and RNG streams
       - 'Cargo.toml'                        # the `ci-test` profile + the `slow-tests` / `survival` features
+      - 'crates/**'                         # the workspace members — the job runs `--workspace`
+      - '!crates/docs-lint/**'              # ...except the one the command --excludes; see the run: step
       - 'data/**'                           # fixture CSVs the fits read by literal path
       - 'examples/**'                       # `.ferx` models the anchors load (e.g. the adaptive vanco suite)
       - 'nonmem_anchor/**'                  # committed NONMEM control streams, data and `.phi` references
@@ -105,7 +107,14 @@ jobs:
         # `slow-tests` is declared by both `ferx-core` and `ferx-tools` — an
         # unqualified name would resolve to the root package's and leave the
         # member's gate closed.
+        #
+        # `--exclude docs-lint`: that crate is a structural linter over `docs/**` with its
+        # own seconds-long CI job, and it depends on nothing. Running it here would put
+        # `docs/**` among this job's inputs, so a docs typo would trigger the two-hour fit
+        # suite — and it would couple the linter to the `ferx-core` compile path, which is
+        # exactly what keeping it dependency-free was for (#969). The guard reads this
+        # `--exclude` list, so adding or dropping one moves the path filter with it.
         run: |
-          cargo test --workspace --no-default-features \
+          cargo test --workspace --exclude docs-lint --no-default-features \
             --features ferx-core/ci,ferx-core/survival,ferx-core/slow-tests,ferx-tools/slow-tests \
             --profile ci-test --no-fail-fast
