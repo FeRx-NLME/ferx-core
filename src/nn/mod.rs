@@ -1105,6 +1105,12 @@ impl CurvatureGrid {
                 continue; // too narrow to form an interior triple
             }
             let n_nodes = ((span / step_z).floor() as usize + 1).min(NN_SMOOTH_GRID_MAX_NODES);
+            // Belt-and-braces: the `span < 2·step_z` check above already implies
+            // `n_nodes >= 3` in exact arithmetic (and the `.min` cap is 65, well
+            // clear of 3), so this is unreachable short of a rounding edge in
+            // `span / step_z`. Kept because the loop below would underflow on
+            // `n_nodes - 1` if it ever were reached; it reads as uncovered for
+            // the same reason it is safe.
             if n_nodes < 3 {
                 continue;
             }
@@ -2059,6 +2065,54 @@ mod regularization_tests {
             assert_relative_eq!(g[j], fd, epsilon = 1e-6, max_relative = 1e-5);
         }
     }
+
+    /// An input carrying no observed values at all contributes no curvature
+    /// axis, and one whose z-span cannot fit an interior triple is skipped.
+    ///
+    /// The empty case is reachable in production: `collect_input_values` skips
+    /// covariates a subject does not carry, so a covariate absent from every
+    /// subject arrives here as an empty vector.
+    #[test]
+    fn curvature_grid_skips_empty_and_too_narrow_inputs() {
+        // Input 0 has no observed values; input 1 varies widely.
+        let with_empty = vec![vec![], vec![50.0, 60.0, 70.0, 80.0, 90.0, 100.0]];
+        let grid = CurvatureGrid::build(&with_empty, NN_SMOOTH_GRID_STEP_Z);
+        assert!(!grid.is_empty(), "the varying input still yields nodes");
+        // Every triple holds the empty input at its default 0.0 and sweeps only
+        // input 1 — the empty axis contributed nothing of its own.
+        for t in grid.triples() {
+            assert_eq!(t[0][0], 0.0);
+            assert_eq!(t[1][0], 0.0);
+            assert_eq!(t[2][0], 0.0);
+        }
+
+        // Two distinct values always give a z-span of exactly 2.0 (±1 sd), so a
+        // step wider than 1.0 leaves no room for an interior triple.
+        let two_point = vec![vec![1.0, 2.0]];
+        assert!(
+            CurvatureGrid::build(&two_point, 1.5).is_empty(),
+            "z-span 2.0 < 2·step 3.0 must yield no nodes"
+        );
+        // The same data at a step that does fit is not empty — so the emptiness
+        // above is the span check, not the data being unusable.
+        assert!(!CurvatureGrid::build(&two_point, 0.5).is_empty());
+    }
+
+    /// `median_of_sorted` on the three shapes it can meet: empty (the neutral
+    /// 0.0 used for an input with no observed values), odd length (the middle
+    /// element), and even length (the midpoint of the two central elements).
+    #[test]
+    fn median_of_sorted_handles_empty_odd_and_even() {
+        assert_eq!(median_of_sorted(&[]), 0.0);
+        assert_relative_eq!(median_of_sorted(&[1.0, 2.0, 9.0]), 2.0, epsilon = 1e-12);
+        assert_relative_eq!(
+            median_of_sorted(&[1.0, 2.0, 4.0, 9.0]),
+            3.0,
+            epsilon = 1e-12
+        );
+        // Single element is its own median.
+        assert_relative_eq!(median_of_sorted(&[7.5]), 7.5, epsilon = 1e-12);
+    }
 }
 
 /// Fit-driven tests for the covariate-NN regularizers.
@@ -2074,9 +2128,11 @@ mod regularization_tests {
 /// `tests/nn_regularization.rs`.
 #[cfg(test)]
 mod regularizer_fit_tests {
+    use approx::assert_relative_eq;
+
     use crate::parser::model_parser::parse_full_model;
+    use crate::read_nonmem_csv;
     use crate::types::{CompiledModel, FitOptions, Population};
-    use crate::{fit, read_nonmem_csv};
 
     use super::{CovariateMapper, NnRegularizer};
 
@@ -2143,6 +2199,7 @@ mod regularizer_fit_tests {
 
     /// Variance of the NN's CL modulator (output 0) across subjects, evaluated at
     /// a given theta. Higher = more covariate-driven spread in the learned curve.
+    #[cfg(feature = "slow-tests")]
     fn cl_modulator_variance(model: &CompiledModel, population: &Population, theta: &[f64]) -> f64 {
         let nn = &model.covariate_nns[0];
         let n_w = nn.mapper.n_weights();
@@ -2159,6 +2216,7 @@ mod regularizer_fit_tests {
 
     /// L2 norm of the NN's *weight matrices* (biases excluded) at a given theta —
     /// the quantity `nn_l2` directly shrinks.
+    #[cfg(feature = "slow-tests")]
     fn weight_block_sq_norm(model: &CompiledModel, theta: &[f64]) -> f64 {
         let nn = &model.covariate_nns[0];
         let w = &theta[nn.weights_offset..nn.weights_offset + nn.mapper.n_weights()];
@@ -2255,18 +2313,27 @@ mod regularizer_fit_tests {
     /// unregularized one was flat too. It was, on raw inputs, because the network
     /// was saturated rather than because it had learned nothing — see the
     /// `center` / `scale` note on `MODEL`.
+    /// Gated with `#[cfg]` rather than the usual Tier-3
+    /// `#[cfg_attr(not(feature = "slow-tests"), ignore = "…")]`, because this
+    /// test lives in `src/` — which codecov measures — instead of `tests/`,
+    /// which `codecov.yml` ignores wholesale. An `#[ignore]`d body is compiled
+    /// but never run, so on a PR (where slow-tests never run) its ~50 lines
+    /// would read as uncovered and drag the patch gate under its 90% floor.
+    /// Compiling it out instead makes it a measurement gap rather than a miss,
+    /// the same way the rest of the feature-gated surface behaves (#293).
+    ///
+    /// Bit-rot is still caught: `cargo check --tests --no-default-features
+    /// --features ci,nn,slow-tests` is in the preflight check matrix and the
+    /// CI `Check` job, so this body is compile-checked on every PR.
     #[test]
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: opt in with --features slow-tests"
-    )]
+    #[cfg(feature = "slow-tests")]
     fn l2_shrinks_weights_and_modulator_variation() {
         let (model, options, population) = load();
 
         let fit_at = |lambda: f64| -> Vec<f64> {
             let mut o = options.clone();
             o.nn_l2_lambda = lambda;
-            fit(&model, &population, &model.default_params, &o)
+            crate::fit(&model, &population, &model.default_params, &o)
                 .unwrap_or_else(|e| panic!("fit at λ={lambda} failed: {e}"))
                 .theta
         };
@@ -2323,5 +2390,74 @@ mod regularizer_fit_tests {
             "L2 must collapse the spurious CL modulator spread \
              ({v0:.6} → {v_mid:.6} → {v_big:.6})"
         );
+    }
+    /// Each λ must act alone. `nn_l2` on its own is the likeliest real
+    /// configuration, and it must not drag the curvature machinery in with it:
+    /// with `nn_smooth = 0` the regularizer skips building a grid entirely, and
+    /// the penalty and gradient must equal the pure-L2 ones. Symmetrically for
+    /// `nn_smooth` alone.
+    ///
+    /// Without this, every test drove both λ together or both at zero, so the
+    /// single-λ branches in `penalty_value` / `add_packed_gradient` — and the
+    /// `CurvatureGrid::default()` arm of `build` — were never taken.
+    #[test]
+    fn each_lambda_acts_alone() {
+        let (model, options, population) = load();
+        let theta = model.default_params.theta.clone();
+        let nn = &model.covariate_nns[0];
+        let (w_lo, w_hi) = (nn.weights_offset, nn.weights_offset + nn.mapper.n_weights());
+        let w = &theta[w_lo..w_hi];
+        let mlp = nn.mapper.mlp();
+
+        let build = |l2: f64, smooth: f64| {
+            let mut o = options.clone();
+            o.nn_l2_lambda = l2;
+            o.nn_smooth_lambda = smooth;
+            NnRegularizer::build(&model, &population, &o)
+        };
+        let grad_of = |reg: &NnRegularizer| {
+            let mut g = vec![0.0; theta.len()];
+            reg.add_packed_gradient(&theta, &mut g);
+            g
+        };
+
+        // --- L2 only: no grid is built, and the penalty is exactly the L2 one.
+        let l2_only = build(1e-2, 0.0);
+        assert!(l2_only.is_active());
+        let expected_l2 = mlp.l2_weight_penalty_value(w, 1e-2);
+        assert_relative_eq!(
+            l2_only.penalty_value(&theta),
+            expected_l2,
+            max_relative = 1e-12
+        );
+        let (_v, expected_l2_g) = mlp.l2_weight_penalty(w, 1e-2);
+        let g_l2 = grad_of(&l2_only);
+        for (i, e) in expected_l2_g.iter().enumerate() {
+            assert_relative_eq!(g_l2[w_lo + i], e, max_relative = 1e-12);
+        }
+
+        // --- Smoothness only: the penalty carries no L2 term at all.
+        let smooth_only = build(0.0, 1e-1);
+        assert!(smooth_only.is_active());
+        let p_smooth = smooth_only.penalty_value(&theta);
+        assert!(
+            p_smooth > 0.0,
+            "the fixture's network must have some curvature to penalize"
+        );
+        let g_smooth = grad_of(&smooth_only);
+
+        // --- Both together must equal the sum of the two acting alone: the
+        // terms are additive and independent, which is what lets a caller reason
+        // about one λ at a time.
+        let both = build(1e-2, 1e-1);
+        assert_relative_eq!(
+            both.penalty_value(&theta),
+            expected_l2 + p_smooth,
+            max_relative = 1e-12
+        );
+        let g_both = grad_of(&both);
+        for k in w_lo..w_hi {
+            assert_relative_eq!(g_both[k], g_l2[k] + g_smooth[k], max_relative = 1e-9);
+        }
     }
 }
