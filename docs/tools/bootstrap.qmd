@@ -193,6 +193,40 @@ ferx bootstrap --summarize --directory run12-bootstrap --no-skip-minimization-te
 `--summarize` re-reads `raw_results.csv` — which carries each replicate's diagnostics
 alongside its estimates — and rewrites the statistics. It refits nothing.
 
+## Watching a run
+
+A 200-sample bootstrap is minutes to hours of fitting behind a single command, so the
+run reports each fit as it completes. On the command line that is a progress bar on
+stderr:
+
+```
+  [00:01:23] [===============>              ] 97/200 replicates (ETA 00:01:28)
+```
+
+The base model gets a spinner of its own before the bar appears — it is one fit, and a
+bar sitting at `0/200` through it reads as a run that is stuck. `--dofv` adds a second
+pass over every replicate, so it gets its own bar rather than extending the first one
+past what it promised. A `--resume` run counts what is *left*: 10 replicates missing
+from a 200-sample directory is a bar of 10.
+
+The bar is drawn only when stderr is a terminal, so a run in a log file, a pipe or a
+scheduler is unaffected. `--no-progress` suppresses it for an interactive run you want
+quiet.
+
+```bash
+ferx bootstrap run12.ferx --data data.csv --samples 200 --no-progress
+```
+
+In R the same events drive a [cli](https://cli.r-lib.org) progress bar:
+
+```r
+bs <- ferx_bootstrap(model, data, samples = 200, threads = 8, progress = TRUE)
+```
+
+The progress stream is presentation only. The draws, the fits and the artefacts are
+identical whether or not anything is watching, so a run in a terminal and the same run
+in a cron job produce the same numbers from the same seed.
+
 ## Recovering an interrupted run
 
 A 200-sample bootstrap is hours of fitting, and the two ways it goes wrong need different

@@ -22,6 +22,14 @@ section of the SDLC for the versioning policy).
 ## [0.3.1] - 2026-09-02
 
 ### Added
+- **A progress bar for `ferx bootstrap`.** A 200-sample bootstrap is minutes to hours of
+  fitting behind one command, with nothing on the terminal to say whether it was working
+  or wedged. The run now reports each fit as it completes: the base model gets a spinner,
+  the replicates a bar with an ETA, `--dofv` its own bar for its second pass, and a
+  `--resume` run counts only what is left to fit. The bar is drawn only when stderr is a
+  terminal; `--no-progress` suppresses it. `ferx_tools::bootstrap::run_bootstrap_with_progress`
+  is the same run with a `BootstrapEvent` sink, which is what ferx-r renders onto a `cli`
+  bar; `run_bootstrap` is unchanged.
 - **`ferx gam` — GAM covariate pre-screening from the command line (#1114).** Screens every
   declared covariate against every ETA with independent GAM regressions and prints a table
   ranked by delta-AIC (`AIC_null − AIC_best`), the Rust equivalent of Xpose4's `xpose.gam()`.
