@@ -70,6 +70,12 @@ fn fence_marker(line: &str) -> Option<(char, usize, bool)> {
     Some((c, n, t.chars().skip(n).all(char::is_whitespace)))
 }
 
+/// Columns of leading whitespace. Four or more make the line an indented code
+/// block, which is neither a heading nor a div marker.
+fn indent_of(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
 /// The colon run length and the attribute text of a fenced-div line (`:::`), if
 /// the line is one. A run with nothing after it closes the innermost open div.
 fn div_marker(line: &str) -> Option<(usize, String)> {
@@ -257,8 +263,12 @@ pub fn parse_str(text: &str, path: &Path, root: &Path) -> Doc {
         }
 
         // A fenced div. Its own `{#id}` still counts as a page id, but the line
-        // is not content — what matters is the frame it opens or closes.
-        if let Some((_, attrs)) = div_marker(line) {
+        // is not content — what matters is the frame it opens or closes. Four
+        // columns of indent make it an indented code block instead, the same
+        // guard the heading path below carries: without it a `:::` shown as
+        // sample markup pushes a frame that never closes, and a `.callout-*`
+        // one swallows the next real heading.
+        if let Some((_, attrs)) = div_marker(line).filter(|_| indent_of(line) < 4) {
             if attrs.is_empty() {
                 divs.pop();
             } else {
@@ -281,7 +291,7 @@ pub fn parse_str(text: &str, path: &Path, root: &Path) -> Doc {
         // heading — pandoc allows at most three. Without the guard a `#`
         // comment inside such a block reads as a heading of its own depth and
         // R2 reports a level jump that does not exist.
-        if line.len() - trimmed.len() < 4 && trimmed.starts_with('#') {
+        if indent_of(line) < 4 && trimmed.starts_with('#') {
             let level = trimmed.chars().take_while(|c| *c == '#').count();
             let rest = &trimmed[level..];
             // `#hashtag` is not a heading; `#| label:` is a code-cell option.
@@ -294,17 +304,25 @@ pub fn parse_str(text: &str, path: &Path, root: &Path) -> Doc {
                 // *later* heading inside the same callout is a real section —
                 // `docs/estimation/saem.qmd` has one — so this is the first
                 // block, not any heading in a callout.
+                let raw = rest.trim();
                 if divs
                     .last()
                     .is_some_and(|f| f.callout && f.awaiting_first_block)
                 {
+                    // The title still *spends* its identifier. Pandoc's reader
+                    // assigns auto-identifiers before Quarto's callout filter
+                    // drops the header, so a later `## Dup` on a page whose
+                    // callout title was also `Dup` renders as `#dup-1`. Claim
+                    // the slot and throw the id away: it addresses nothing in
+                    // the rendered page, so it belongs in neither `all_ids`
+                    // nor `headings`.
+                    let _ = ids.assign(raw);
                     mark_content(&mut divs);
                     pending_disable.clear();
                     i += 1;
                     continue;
                 }
                 mark_content(&mut divs);
-                let raw = rest.trim();
                 let (id, base_id) = ids.assign(raw);
                 // Report the visible title, not the `{#id}` attribute block.
                 let text = crate::slug::split_attributes(raw).0;
@@ -528,13 +546,32 @@ mod tests {
     }
 
     #[test]
-    fn a_callout_title_claims_no_id_so_a_real_heading_keeps_the_undisambiguated_one() {
-        // If the title consumed the slug, the real section below would render
-        // as `#dup-1` and every link written to `#dup` would break.
+    fn a_callout_title_spends_its_id_even_though_it_is_not_a_section() {
+        // Pandoc's reader assigns auto-identifiers before Quarto's callout
+        // filter drops the header, so the slot is gone by the time the real
+        // section below asks for it: `quarto render` puts `id="dup-1"` on it.
+        // Skipping the `assign` would make R4 bless a link to the dead `#dup`
+        // and report the live `#dup-1` as broken.
         let d = doc("::: {.callout-note}\n## Dup\n:::\n\n## Dup\n");
         assert_eq!(d.headings.len(), 1);
-        assert_eq!(d.headings[0].id, "dup");
+        assert_eq!(d.headings[0].id, "dup-1");
         assert_eq!(d.headings[0].base_id, "dup");
+        // The title's own id addresses nothing in the rendered page, so it is
+        // not a link target …
+        assert!(!d.ids.contains("dup"));
+        assert!(d.ids.contains("dup-1"));
+        // … and it is not an R3 collision either: only one anchor exists.
+        assert!(crate::rules::check_duplicate_ids(&d).is_empty());
+    }
+
+    #[test]
+    fn an_indented_div_marker_is_code_not_a_callout() {
+        // Four columns of indent make it an indented code block — sample
+        // markup, not a div. A phantom callout frame here would swallow the
+        // heading that follows.
+        let d = doc("    ::: {.callout-note}\n    Sample markup.\n    :::\n\n## Real\n");
+        let texts: Vec<_> = d.headings.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(texts, ["Real"]);
     }
 
     #[test]

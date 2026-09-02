@@ -55,8 +55,9 @@ fn strip_inline_markup(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let chars: Vec<char> = text.chars().collect();
     let mut i = 0;
-    // Inside a `` ` `` span, where pandoc parses no further inline markup.
-    let mut in_code = false;
+    // Length of the backtick run that opened the current code span, where
+    // pandoc parses no further inline markup; `None` outside one.
+    let mut open_run: Option<usize> = None;
     while i < chars.len() {
         match chars[i] {
             '[' => {
@@ -86,8 +87,18 @@ fn strip_inline_markup(text: &str) -> String {
                 }
             }
             '`' => {
-                in_code = !in_code;
-                i += 1;
+                // A code span is delimited by *runs* of backticks, and closes
+                // only on a run of the same length — which is how `` `x` ``
+                // gets to contain a literal backtick. Toggling per character
+                // would leave `` ``a <op> b`` `` reading as outside code, and
+                // `<op>` would be eaten as a tag again.
+                let run = chars[i..].iter().take_while(|&&c| c == '`').count();
+                match open_run {
+                    None => open_run = Some(run),
+                    Some(open) if open == run => open_run = None,
+                    Some(_) => {}
+                }
+                i += run;
             }
             '*' => i += 1,
             '_' => {
@@ -103,7 +114,7 @@ fn strip_inline_markup(text: &str) -> String {
                 }
                 i += 1;
             }
-            '<' if !in_code
+            '<' if open_run.is_none()
                 && chars
                     .get(i + 1)
                     .is_some_and(|c| c.is_ascii_alphabetic() || *c == '/')
@@ -301,6 +312,15 @@ mod tests {
         );
         // Still a tag outside the span.
         assert_eq!(slug("`a<b>c` and <br> d"), "abc-and-d");
+        // A code span delimited by a *run* of backticks — the spelling used to
+        // hold a literal backtick — is still code. Toggling per character
+        // instead of per run left this one reading as outside code, and the
+        // placeholder was eaten as a tag again. `quarto render` gives
+        // `#use-a-op-b-here`.
+        assert_eq!(slug("Use ``a <op> b`` here"), "use-a-op-b-here");
+        // The run must match to close: a lone backtick inside a ``…`` span
+        // does not end it.
+        assert_eq!(slug("Use ``a ` <op> b`` here"), "use-a-op-b-here");
     }
 
     #[test]
