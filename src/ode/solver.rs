@@ -1779,7 +1779,13 @@ fn integrate_resolved_g_inner<T: PkNum>(
     let stalled = attempt.stiff_min_step_clamped_steps > 0;
     let unfinished = attempt.unfinished_segments > 0;
     let values_finite = finite_g(&out.0) && finite_g(&out.1);
-    let jets_finite = jets_finite_g(&out.0) && jets_finite_g(&out.1);
+    // Scored only when the segment *started* with finite jets. Once a state's jets overflow
+    // they stay overflowed for the rest of the subject's event chain, so without this every
+    // downstream segment would fail the clause, pay a second solve that cannot repair
+    // anything it did not break, and add another count for one overflow. The clause is about
+    // a segment that lost its derivatives, not about one handed them already gone.
+    let entry_jets_finite = u0.iter().all(|v| v.jets_finite());
+    let jets_finite = !entry_jets_finite || (jets_finite_g(&out.0) && jets_finite_g(&out.1));
     let usable = !ran_stiff || (!stalled && !unfinished && values_finite && jets_finite);
     if !usable {
         attempt.auto_stiff_rejected = 1;
@@ -1835,8 +1841,8 @@ fn integrate_resolved_g_inner<T: PkNum>(
     if fallback.unfinished_segments > 0
         || !finite_g(&fallback_out.0)
         || !finite_g(&fallback_out.1)
-        || !jets_finite_g(&fallback_out.0)
-        || !jets_finite_g(&fallback_out.1)
+        || (entry_jets_finite
+            && (!jets_finite_g(&fallback_out.0) || !jets_finite_g(&fallback_out.1)))
     {
         fallback.auto_fallback_failed = 1;
     }

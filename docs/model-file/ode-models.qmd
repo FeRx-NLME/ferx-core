@@ -594,9 +594,10 @@ limited. Run your model and look at the solver's step counts:
 #### Where the step counts show up
 
 After a fit, ferx runs one pass over every subject at the final estimates — the ordinary
-prediction dispatch, plus one analytic `∂f/∂η` solve per subject for models on the analytic
-ODE sensitivity path — and reports what the solver did there as an `ode_solver` warning
-(see [Warnings](../warnings.qmd#warning-codes)). It fires when a step clamped at the minimum
+prediction dispatch, plus one analytic sensitivity solve per subject for models on the
+analytic ODE sensitivity path — and reports what the solver did there as an `ode_solver`
+warning (see [Warnings](../warnings.qmd#warning-codes)). It fires when a step clamped at the
+minimum
 step size, when a returned segment stopped before its requested end, when an `auto` escalation
 had to be discarded and re-solved explicitly, when that explicit fallback also failed, when an
 escalation was discarded because its derivatives overflowed, or when `ode_stiff_abort_after`
@@ -630,6 +631,18 @@ worth having, a `NaN` one is not — but a non-zero count is a reliable sign tha
 running at the edge of what `f64` can represent. Naming a different method will not help.
 Check the units and scaling instead: a state carried in ng rather than mg, a rate constant on
 a per-second clock, or a growth term with nothing bounding it.
+
+Because no `f64` pass can observe that decision, the post-fit sweep runs a sensitivity solve
+of its own to report it: the second-order provider (gradient **and** Hessian, what FOCEI
+differentiates) when the model has an analytic outer gradient, and the light first-order one
+when only the inner loop is analytic. A fit run with `gradient = fd` sweeps nothing, because
+it computed no analytic derivatives to overflow. The counter is collected separately from the
+prediction pass, so it is the one key in the warning's `details` payload that is disjoint from
+the escalation counts rather than a subset of them.
+
+Only a segment that *entered* with finite jets is scored. Derivatives that have already
+overflowed stay overflowed for the rest of a subject's event chain, and re-solving a later
+segment cannot repair damage done in an earlier one.
 
 A **named** `ode_method` is not guarded this way, here as everywhere else: a user who asked
 for `rodas4` gets `rodas4`, non-finite jets included.

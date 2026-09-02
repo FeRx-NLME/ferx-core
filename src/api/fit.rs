@@ -1817,12 +1817,23 @@ fn fit_inner(
         options.interaction,
         mixest_classes.as_deref(),
     );
+    let mut ode_solver_stats = solver_stats_scope
+        .map(|scope| scope.collected())
+        .unwrap_or_default();
     // The prediction sweep above is `f64`, so the guard's jet-finiteness clause — the one
     // decision only a dual solve can take (#1204) — leaves no trace in it. One analytic
-    // `∂f/∂η` per subject, inside the same scope, is what makes that clause reportable: it
-    // is the solve the inner loop ran throughout the fit, run once more at the estimates the
-    // fit reports. No-ops for every model that is not on the analytic ODE sensitivity path.
-    if solver_stats_scope.is_some() {
+    // sensitivity solve per subject is what makes that clause reportable: the solve the fit's
+    // gradient ran throughout, run once more at the estimates the fit reports. No-ops for
+    // every model not on the analytic ODE sensitivity path, and for every FD fit.
+    //
+    // It gets its **own** scope, and exactly one field crosses back. Sharing the prediction
+    // pass's scope would double every step, clamp and escalation count across two different
+    // solves — and worse, a `min_dt` clamp that happened only in the gradient solve would
+    // fire the warning's clamp clause, which tells the user their *predictions* were
+    // freeze-padded. Only `auto_stiff_rejected_jets` describes something the prediction pass
+    // structurally cannot observe, so only it is carried over.
+    if integrates_odes(model) {
+        let sens_scope = crate::ode::solver::SolverStatsScope::enter();
         sweep_sensitivity_solver_stats(
             model,
             population,
@@ -1830,10 +1841,8 @@ fn fit_inner(
             &result.eta_hats,
             mixest_classes.as_deref(),
         );
+        ode_solver_stats.auto_stiff_rejected_jets = sens_scope.collected().auto_stiff_rejected_jets;
     }
-    let ode_solver_stats = solver_stats_scope
-        .map(|scope| scope.collected())
-        .unwrap_or_default();
 
     // Mixture (#977 Phase 5): thread the converged per-subject posteriors onto
     // each SubjectResult so output.rs can emit the PMIX_1..PMIX_K and MIXEST

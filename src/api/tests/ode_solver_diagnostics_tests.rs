@@ -473,12 +473,43 @@ fn a_jet_rejection_says_the_derivatives_overflowed_not_that_the_method_failed() 
     let (msg, entry) =
         ode_solver_diagnostics_warning(&stats, &FitOptions::default()).expect("a warning");
     assert_eq!(entry.severity, WarningSeverity::Warning);
-    assert!(msg.contains("2 of those 2 rejection(s)"), "{msg}");
-    assert!(msg.contains("edge of double precision"), "{msg}");
+    assert!(
+        msg.contains("2 segment(s) of the analytic-sensitivity solve were discarded"),
+        "{msg}"
+    );
     assert!(msg.contains("units and scaling"), "{msg}");
+    assert!(
+        msg.contains("naming a different ode_method will not help"),
+        "{msg}"
+    );
+    // The count comes from a different sweep than the escalation counts, so the clause must
+    // not phrase itself as a subset of them.
+    assert!(!msg.contains("of those"), "{msg}");
+    // A clause literal wrapped without `\` continuations reaches the user as runs of
+    // indentation. This is what caught it (#1207 review); every clause here is checked.
+    assert!(
+        !msg.contains("  "),
+        "no run of blank space may reach a user: {msg}"
+    );
     let details = entry.details.as_ref().unwrap();
     assert_eq!(details["auto_stiff_rejected_jets"], serde_json::json!(2));
     assert_eq!(classify_warning(&msg).category, WarningCode::OdeSolver);
+}
+
+/// A jet rejection on an otherwise clean fit still warns. The prediction pass can be spotless
+/// — it is a different solve — so `unclean` has to count this counter or the one failure only
+/// the sensitivity sweep can see would be reported as an `Info` escalation note.
+#[test]
+fn a_jet_rejection_alone_is_a_warning_not_an_info_note() {
+    let stats = OdeSolverStats {
+        auto_stiff_segments: 4,
+        auto_stiff_rejected_jets: 1,
+        ..Default::default()
+    };
+    let (msg, entry) =
+        ode_solver_diagnostics_warning(&stats, &FitOptions::default()).expect("a warning");
+    assert_eq!(entry.severity, WarningSeverity::Warning, "{msg}");
+    assert!(msg.contains("analytic-sensitivity solve"), "{msg}");
 }
 
 /// The clause stays out of the way of an ordinary rejection, which is the common case: a
@@ -495,8 +526,16 @@ fn an_ordinary_rejection_carries_no_jet_clause() {
     };
     let (msg, entry) =
         ode_solver_diagnostics_warning(&stats, &FitOptions::default()).expect("a warning");
-    assert!(!msg.contains("edge of double precision"), "{msg}");
+    assert!(!msg.contains("analytic-sensitivity solve"), "{msg}");
     assert!(msg.contains("rodas5p"), "{msg}");
+    assert!(
+        !msg.contains("will not help"),
+        "the two remedies must never both appear: {msg}"
+    );
+    assert!(
+        !msg.contains("  "),
+        "no run of blank space may reach a user: {msg}"
+    );
     let details = entry.details.as_ref().unwrap();
     assert_eq!(details["auto_stiff_rejected_jets"], serde_json::json!(0));
 }
@@ -528,11 +567,20 @@ fn the_post_fit_sweep_observes_the_sensitivity_solve_too() {
         stats.auto_stiff_segments > 0,
         "and it should see the same escalations the prediction pass does: {stats:?}"
     );
+    // …and it must be the *second-order* provider for a model with an analytic outer
+    // gradient (#1207 review). The overflow this counter exists for reaches the Hessian
+    // first and the gradient only later, so a `Dual1` sweep would miss the very case #1204
+    // documents. This fixture has to take that branch, or the assertions above are only
+    // testing the first-order path.
+    assert!(
+        crate::sens::provider::analytic_outer_gradient_available(&model),
+        "the fixture must exercise the Dual2 branch of the sweep"
+    );
 }
 
 /// …and it costs nothing on a model that has no ODE sensitivity path to sweep. The helper is
-/// called on every ODE fit, so a model on FD (or on a closed-form solution) must exit before
-/// it integrates anything.
+/// called on every ODE fit, so a model on a closed-form solution must exit before it
+/// integrates anything.
 #[test]
 fn the_sensitivity_sweep_is_a_no_op_off_the_analytic_ode_path() {
     let model = closed_form_model();
@@ -569,4 +617,27 @@ fn closed_form_model() -> CompiledModel {
 "#,
     )
     .expect("parse")
+}
+
+/// An **FD fit** must sweep nothing (#1207 review). `ode_inner_grad_supported_model` describes
+/// the ODE provider's analytical reach and says nothing about `gradient_method`, so gating on
+/// it alone swept a dual solve for a fit that computed every gradient by finite differences —
+/// and then reported solver counters from a code path that fit never took.
+#[test]
+fn the_sensitivity_sweep_is_a_no_op_when_the_fit_asked_for_fd_gradients() {
+    let mut model = two_state_model(1000.0);
+    model.gradient_method = GradientMethod::Fd;
+    let pop = population();
+    let params = model.default_params.clone();
+    let etas: Vec<DVector<f64>> = pop
+        .subjects
+        .iter()
+        .map(|_| DVector::zeros(model.n_eta))
+        .collect();
+
+    let scope = crate::ode::solver::SolverStatsScope::enter();
+    sweep_sensitivity_solver_stats(&model, &pop, &params, &etas, None);
+    let stats = scope.collected();
+    assert_eq!(stats.accepted_steps, 0, "{stats:?}");
+    assert_eq!(stats.attempted_steps, 0, "{stats:?}");
 }

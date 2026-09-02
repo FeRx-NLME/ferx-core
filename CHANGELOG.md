@@ -34,9 +34,11 @@ section of the SDLC for the versioning policy).
   advice — the stiff method worked and the sensitivities did not, so naming another method
   will not help; check the model's units and scaling. A **named** `ode_method` stays
   unguarded, as before. To make the counter observable at all, the post-fit diagnostic sweep
-  now also runs one analytic `∂f/∂η` solve per subject for models on the analytic ODE
-  sensitivity path — the `f64` prediction pass carries no derivatives and could never see
-  this decision.
+  now also runs one analytic sensitivity solve per subject for models on the analytic ODE
+  sensitivity path — the second-order provider where the model has an analytic outer gradient,
+  since the Hessian is what overflows first, and nothing at all for an FD fit. The `f64`
+  prediction pass carries no derivatives and could never see this decision, so that sweep is
+  collected separately and only the new counter is reported from it.
 
 ## [0.3.1] - 2026-09-02
 

@@ -1645,3 +1645,37 @@ fn a_healthy_escalation_records_no_jet_rejection() {
     assert_eq!(stats.auto_stiff_rejected_jets, 0, "{stats:?}");
     assert!(out.iter().all(|p| p.u.iter().all(|v| v.jets_finite())));
 }
+
+/// A segment handed jets that are *already* non-finite must not be rejected for them
+/// (#1207 review). Once a state's derivatives overflow they stay overflowed for the rest of
+/// the subject's event chain, so scoring every downstream segment on them would pay a second
+/// solve per segment — one that cannot repair damage it did not do — and would report one
+/// overflow as many rejections.
+#[test]
+fn a_segment_entered_with_dead_jets_is_not_rejected_again() {
+    use crate::sens::dual2::Dual2;
+    const N: usize = 1;
+    let rhs = jet_overflow_rhs::<Dual2<N>>(JET_OVERFLOW_K);
+    // The state the previous segment would have handed on: finite value, jets already gone.
+    let mut carried = Dual2::<N>::constant(1.0);
+    carried.grad[0] = f64::NAN;
+    carried.hess[0][0] = f64::NAN;
+    let u0 = [Dual2::<N>::constant(1.0), carried];
+    let params = [Dual2::<N>::var(3.5 / JET_OVERFLOW_K, 0)];
+    let mut stats = OdeSolverStats::default();
+    let out = crate::ode::solver::solve_ode_g_with_stats(
+        &rhs,
+        &u0,
+        (0.0, 1.0),
+        &params,
+        &[1.0],
+        &jet_overflow_opts(OdeMethod::Auto),
+        Some(&mut stats),
+    );
+    assert_eq!(stats.auto_stiff_segments, 1, "{stats:?}");
+    assert_eq!(stats.auto_stiff_rejected, 0, "{stats:?}");
+    assert_eq!(stats.auto_stiff_rejected_jets, 0, "{stats:?}");
+    // And no second solve was paid for: the escalation's own result is what came back.
+    assert_eq!(stats.auto_fallback_failed, 0, "{stats:?}");
+    assert!(!out.last().unwrap().u[1].jets_finite());
+}
