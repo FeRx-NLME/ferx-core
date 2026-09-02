@@ -248,6 +248,31 @@ that no fixture could see.
 When an anchor does fail, vary **one input at a time** — the pair that differs by a
 single number is what localises the defect (`nonmem_anchor/tvcov_lag_saltation*`).
 
+**A green test is not evidence that it can fail.** The rule above is about a fixture that
+cannot expose the defect; these are three ways the *assertion* cannot observe it, all three
+found on #1166 in tests that had been written, run green and believed:
+
+- **A differential pair must straddle the gate under the OLD behaviour.** A routing oracle
+  compared `hazard = h` against `h * (1.0 + 0.0*TIME)` — the exact IEEE identity, so any
+  difference is a difference of engine — and asserted bit-identity. Both spellings read `TIME`,
+  so both took the same arm before *and* after the fix and agreed either way. Put the twins on
+  opposite sides of the predicate, and assert the straddle itself so it cannot silently become
+  a tautology again.
+- **A fast path can make the mutation unreachable.** "Filter by slot, not by name" was tested
+  on a model with no `[event_model]` — but with no injected slots the code short-circuits
+  before the filter runs, so a name-prefix mutation sailed through. If the code has an
+  `if xs.is_empty()` arm, a fixture with `xs` empty tests that arm, not the logic behind it.
+- **`f64::max` / `f64::min` discard `NaN`** (`a.max(NaN) == a`), so `worst = worst.max((got -
+  want).abs())` leaves `worst` at `0.0` when `got` is `NaN` and every bound passes. All three
+  assertions in a fresh NONMEM anchor had that shape: a regression making the solver return
+  `NaN` — the likeliest way to break the thing being anchored — would have gone green. Assert
+  `is_finite()` before folding. A *direct* `(got - want).abs() < tol` does catch `NaN`; only
+  the fold hides it. `filter_map(…ok())` and `unwrap_or(0.0)` absorb failures the same way.
+
+For each new assertion, name the regression it exists to catch and check that regression can
+actually reach it. For a regression test that means mutation; for an anchor, feeding it the
+failure it exists to catch.
+
 **Every change to an analytic sensitivity, gradient, marginal, or likelihood path requires a `Dual2`-vs-FD parity test.** The closed-form PK solutions and event-driven propagators are written once as generic `*_g<T: PkNum>` functions; instantiating `T = Dual2<M>` yields the exact `∂f/∂η` / `∂f/∂θ` that FOCE/FOCEI/HMC consume (`sens/`). A wrong sensitivity compiles and runs silently — there is no second copy of the formula to disagree with it — so when you add or modify one of these kernels, or the provider that assembles them, assert it against central finite differences of the `T = f64` production predictor, to tolerance, in a Tier-1 unit test. That parity pins the *derivative* against the value path, not the value path itself — when both share a wrong convention it passes against the exact derivative of the wrong function, which is how #1079 survived. It is an oracle for the gradient only; see the non-degeneracy rule above for what it cannot see. Follow the existing pattern: per-kernel `*_g_dual_matches_fd` checks (`sens/propagate.rs`, `sens/dual2.rs`) and the end-to-end `check_full_provider_vs_fd` harness (`sens/provider_tests.rs`). If a model is outside the analytic scope it must route to FD via the support predicates (`sens_supported` / `analytic_inner_grad_supported_model`); unit-test that routing so a scope gap fails loudly to FD instead of silently returning a wrong gradient. (This is the post-Enzyme successor to the retired `AD↔FD` parity rule — see #285 / #281.)
 
 **Coverage is gated per PR.** A PR's changed lines must carry their own tests — the Codecov `patch` status enforces ≥90% coverage on the diff, and a 90% project floor is enforced on the weekly `main` run (see `codecov.yml`). This is the automated backstop to the rules above; slow-tests never run on PRs, so unit / Tier-2 tests are what register coverage. When excluding code from coverage, **scope `ignore`s by role, not by coverage %**: leave code out for *what it is* — dev-only tooling (e.g. `src/bin/generate_data.rs`), generated code (`build.rs`), or test scaffolding (`tests/`) — never because it reads red. (Feature-gated code that the coverage build doesn't compile reads as "missed" but is a measurement gap, not an ignore target — see #293.)
