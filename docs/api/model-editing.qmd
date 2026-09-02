@@ -56,6 +56,19 @@ a model that computes a parameter it never uses. `SetStructural` therefore
 prunes to a fixed point after rewriting the line, following textual
 reachability from the blocks that *consume* parameters.
 
+Pruning reaches inside a `block_omega`: a block that loses an η is rewritten
+around the η that are left, surviving variances and covariances unchanged, and
+a lone survivor goes back to the diagonal `omega` it came from. Leaving the
+block whole would not be the conservative choice — an unused η is not a parse
+error, it is a flat direction in the omega matrix and one more parameter in the
+count, which is a wrong BIC for the search that ranks on it.
+
+One case is refused rather than pruned. An `if`/`else` in
+`[individual_parameters]` puts an assignment inside a branch, where deleting a
+line is a guess about the branch; when a narrowing edit leaves an assignment in
+such a block unreferenced, the edit fails naming it and the text is left
+exactly as it was found.
+
 Widening is the other direction, and the engine will not guess for you: a
 binding that names an `[individual_parameters]` value the model does not have
 must arrive with its init, bounds and (optionally) its η in

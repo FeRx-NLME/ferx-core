@@ -136,10 +136,16 @@ impl ModelText {
     /// Apply one transformation in place.
     ///
     /// On `Err` the text is left **untouched** — every variant validates its
-    /// preconditions before it mutates anything, so a rejected edit cannot
-    /// leave a half-written model behind.
+    /// preconditions before it mutates anything, and the edit runs on a copy
+    /// that is only committed on success, so a rejected edit cannot leave a
+    /// half-written model behind. The copy is what covers the one check that
+    /// *cannot* run up front: declaration pruning reads the post-edit text, so
+    /// it can only refuse an edit that has already been written.
     pub fn apply(&mut self, edit: ModelEdit<'_>) -> Result<(), String> {
-        apply::apply(self, edit)
+        let mut next = self.clone();
+        apply::apply(&mut next, edit)?;
+        *self = next;
+        Ok(())
     }
 
     /// A stable identity for the model this text describes.
@@ -263,20 +269,31 @@ impl ModelText {
                 (self.lines.len(), "  ".to_string())
             }
         };
+        // Appending past the last line glues onto it unless it is terminated
+        // (a source file may end without a final newline, and `[fit_options]`
+        // is very often the block that ends it).
+        if at == self.lines.len() {
+            self.terminate_last_line();
+        }
         let term = self.newline();
         self.lines.insert(at, format!("{indent}{code}{term}"));
     }
 
-    /// Start a new `[block]` at end of file, preceded by a blank line.
-    fn append_block_header(&mut self, block: &str) {
+    /// Terminate the final line if it has no terminator, so a line appended
+    /// after it starts on a line of its own.
+    fn terminate_last_line(&mut self) {
         let term = self.newline();
-        // Guarantee the previous line is terminated, or the new header would be
-        // glued onto it (a source file may end without a final newline).
         if let Some(last) = self.lines.last_mut() {
             if terminator_of(last).is_empty() {
                 last.push_str(&term);
             }
         }
+    }
+
+    /// Start a new `[block]` at end of file, preceded by a blank line.
+    fn append_block_header(&mut self, block: &str) {
+        let term = self.newline();
+        self.terminate_last_line();
         if self.lines.last().is_some_and(|l| !code_of(l).is_empty()) {
             self.lines.push(term.clone());
         }

@@ -45,6 +45,51 @@ const BASE: &str = "\
   maxiter    = 300
 ";
 
+/// The two-compartment model the narrowing tests start from. `SetStructural`
+/// to `one_cpt_oral` must take `Q`, `V2`, `TVQ`, `TVV2`, `ETA_Q` and `ETA_V2`
+/// with it.
+const TWO_CPT: &str = "\
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV1(40.0, 1.0, 500.0)
+  theta TVQ(8.0, 0.1, 100.0)
+  theta TVV2(80.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  omega ETA_CL ~ 0.15
+  omega ETA_V1 ~ 0.15
+  omega ETA_Q  ~ 0.08
+  omega ETA_V2 ~ 0.08
+  omega ETA_KA ~ 0.20
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ  * exp(ETA_Q)
+  V2 = TVV2 * exp(ETA_V2)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+/// Narrow a two-compartment model to `one_cpt_oral` — the edit every pruning
+/// test is about.
+fn narrow_to_one_cpt() -> ModelEdit<'static> {
+    ModelEdit::SetStructural(StructuralSpec {
+        template: "one_cpt_oral".into(),
+        bindings: vec![
+            ("cl".into(), "CL".into()),
+            ("v".into(), "V1".into()),
+            ("ka".into(), "KA".into()),
+        ],
+        new_parameters: vec![],
+    })
+}
+
 fn base() -> ModelText {
     ModelText::parse(BASE).expect("the base model must parse")
 }
@@ -86,6 +131,26 @@ fn a_bracketed_expression_is_not_mistaken_for_a_block_header() {
     let src = "[structural_model]\n  ode(obs_cmt=1, states=[central])\n";
     let text = ModelText::parse(src).unwrap();
     assert_eq!(text.block_names(), vec!["structural_model".to_string()]);
+}
+
+#[test]
+fn appending_to_the_last_block_does_not_glue_onto_a_missing_final_newline() {
+    // `[fit_options]` is very often the block that ends the file, and a file
+    // may end without a terminator — appending straight after that line would
+    // render `method = focei  seed = 1` as one line.
+    let src = "[parameters]\n  theta TVCL(1.0)\n\n[fit_options]\n  method = focei";
+    let mut text = ModelText::parse(src).unwrap();
+    apply(
+        &mut text,
+        ModelEdit::SetFitOption {
+            key: "seed".into(),
+            value: "1".into(),
+        },
+    );
+    assert_eq!(
+        text.render(),
+        "[parameters]\n  theta TVCL(1.0)\n\n[fit_options]\n  method = focei\n  seed = 1\n"
+    );
 }
 
 // ── canonical_hash ─────────────────────────────────────────────────────────
@@ -215,6 +280,21 @@ fn set_fit_option_creates_the_block_when_it_is_missing() {
     );
 }
 
+#[test]
+fn set_fit_option_refuses_a_comment_marker() {
+    // `code_of` strips the comment before the parser sees the line, so an
+    // option written with one would read back truncated.
+    for value in ["1 # nope", "1 // nope"] {
+        let err = base()
+            .apply(ModelEdit::SetFitOption {
+                key: "seed".into(),
+                value: value.into(),
+            })
+            .unwrap_err();
+        assert!(err.contains("comment marker"), "{err}");
+    }
+}
+
 // ── AddIiv / DropIiv ───────────────────────────────────────────────────────
 
 #[test]
@@ -310,6 +390,67 @@ fn a_rejected_edit_leaves_the_text_untouched() {
     assert_eq!(text.render(), before);
 }
 
+#[test]
+fn add_iiv_refuses_an_eta_a_block_omega_already_declares() {
+    // The duplicate guard reads `omega NAME ~ …`, which does not match a
+    // `block_omega` line — without a second look the same η is declared twice.
+    let mut text = base();
+    apply(
+        &mut text,
+        ModelEdit::SetOmegaBlock(vec!["ETA_CL".into(), "ETA_V".into()]),
+    );
+    apply(&mut text, ModelEdit::DropIiv { param: "KA".into() });
+    let err = text
+        .apply(ModelEdit::AddIiv {
+            param: "KA".into(),
+            form: IivForm::Exponential {
+                eta: "ETA_CL".into(),
+                variance: 0.1,
+            },
+        })
+        .unwrap_err();
+    assert!(err.contains("already declared by `block_omega"), "{err}");
+}
+
+#[test]
+fn add_iiv_tells_a_float_exponent_from_an_identifier_that_ends_in_e() {
+    // `TVCL_BASE-1` is a difference, not a product: appending `* exp(η)` to it
+    // re-associates the arithmetic silently. Reading one character back turns
+    // the `E` into a float exponent and lets exactly that through.
+    let src = BASE.replace("CL = TVCL * exp(ETA_CL)", "CL = TVCL_BASE-1");
+    let err = ModelText::parse(&src)
+        .unwrap()
+        .apply(ModelEdit::AddIiv {
+            param: "CL".into(),
+            form: IivForm::Exponential {
+                eta: "ETA_X".into(),
+                variance: 0.1,
+            },
+        })
+        .unwrap_err();
+    assert!(err.contains("not a top-level product"), "{err}");
+
+    // A real exponent is still part of the number.
+    let src = BASE.replace("CL = TVCL * exp(ETA_CL)", "CL = TVCL * 1e-5");
+    let mut text = ModelText::parse(&src).unwrap();
+    apply(
+        &mut text,
+        ModelEdit::AddIiv {
+            param: "CL".into(),
+            form: IivForm::Exponential {
+                eta: "ETA_X".into(),
+                variance: 0.1,
+            },
+        },
+    );
+    assert!(
+        text.block_lines("individual_parameters")
+            .contains(&"CL = TVCL * 1e-5 * exp(ETA_X)".to_string()),
+        "{:?}",
+        text.block_lines("individual_parameters")
+    );
+}
+
 // ── SetOmegaBlock ──────────────────────────────────────────────────────────
 
 #[test]
@@ -360,6 +501,24 @@ fn set_omega_block_rejects_a_single_eta_and_an_unknown_one() {
         ]))
         .unwrap_err()
         .contains("no `omega ETA_NOPE"));
+}
+
+#[test]
+fn set_omega_block_lists_the_eta_in_declaration_order() {
+    // The block takes the place of the *first* declaration, so writing the η
+    // in the caller's order would permute the omega matrix against the
+    // `eta_names` the model had before the edit.
+    let mut text = base();
+    apply(
+        &mut text,
+        ModelEdit::SetOmegaBlock(vec!["ETA_V".into(), "ETA_CL".into()]),
+    );
+    assert!(
+        text.block_lines("parameters")
+            .contains(&"block_omega (ETA_CL, ETA_V) = [0.09, 0.006, 0.04]".to_string()),
+        "{:?}",
+        text.block_lines("parameters")
+    );
 }
 
 // ── [covariate_model] ──────────────────────────────────────────────────────
@@ -531,46 +690,8 @@ fn set_structural_widens_to_two_compartments_and_declares_the_new_parameters() {
 fn set_structural_prunes_the_parameters_the_new_template_no_longer_uses() {
     // Start from the two-compartment model and narrow it: `Q`, `V2`, `TVQ`,
     // `TVV2`, `ETA_Q` and `ETA_V2` must all go — three blocks, one edit.
-    let two_cpt = "\
-[parameters]
-  theta TVCL(4.0, 0.1, 100.0)
-  theta TVV1(40.0, 1.0, 500.0)
-  theta TVQ(8.0, 0.1, 100.0)
-  theta TVV2(80.0, 1.0, 500.0)
-  theta TVKA(1.0, 0.01, 10.0)
-  omega ETA_CL ~ 0.15
-  omega ETA_V1 ~ 0.15
-  omega ETA_Q  ~ 0.08
-  omega ETA_V2 ~ 0.08
-  omega ETA_KA ~ 0.20
-  sigma PROP_ERR ~ 0.04 (sd)
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V1 = TVV1 * exp(ETA_V1)
-  Q  = TVQ  * exp(ETA_Q)
-  V2 = TVV2 * exp(ETA_V2)
-  KA = TVKA * exp(ETA_KA)
-
-[structural_model]
-  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
-
-[error_model]
-  DV ~ proportional(PROP_ERR)
-";
-    let mut text = ModelText::parse(two_cpt).unwrap();
-    apply(
-        &mut text,
-        ModelEdit::SetStructural(StructuralSpec {
-            template: "one_cpt_oral".into(),
-            bindings: vec![
-                ("cl".into(), "CL".into()),
-                ("v".into(), "V1".into()),
-                ("ka".into(), "KA".into()),
-            ],
-            new_parameters: vec![],
-        }),
-    );
+    let mut text = ModelText::parse(TWO_CPT).unwrap();
+    apply(&mut text, narrow_to_one_cpt());
     let params = text.block_lines("parameters");
     let indiv = text.block_lines("individual_parameters");
     for gone in ["TVQ", "TVV2", "ETA_Q", "ETA_V2"] {
@@ -631,6 +752,85 @@ fn set_structural_needs_a_pk_line() {
         }))
         .unwrap_err();
     assert!(err.contains("pk NAME(...)"), "{err}");
+}
+
+#[test]
+fn set_structural_shrinks_a_block_omega_around_the_eta_that_survive() {
+    // A blocked η is declared nowhere else, so a block left whole after its
+    // parameter is pruned leaves a random effect nothing uses: a flat omega
+    // direction and one parameter too many in the BIC the search ranks on.
+    let src = TWO_CPT
+        .replace("  omega ETA_CL ~ 0.15\n", "")
+        .replace("  omega ETA_V1 ~ 0.15\n", "")
+        .replace(
+            "  omega ETA_V2 ~ 0.08\n",
+            "  block_omega (ETA_CL, ETA_V1, ETA_V2) = [0.15, 0.05, 0.15, 0.02, 0.03, 0.08]\n",
+        );
+    let mut text = ModelText::parse(&src).unwrap();
+    apply(&mut text, narrow_to_one_cpt());
+    let params = text.block_lines("parameters");
+    // The surviving 2×2 sub-block, variances and covariance unchanged.
+    assert!(
+        params.contains(&"block_omega (ETA_CL, ETA_V1) = [0.15, 0.05, 0.15]".to_string()),
+        "{params:?}"
+    );
+    assert!(!params.iter().any(|l| l.contains("ETA_V2")), "{params:?}");
+}
+
+#[test]
+fn set_structural_collapses_a_block_omega_with_one_survivor_to_a_diagonal_omega() {
+    let src = TWO_CPT.replace("  omega ETA_CL ~ 0.15\n", "").replace(
+        "  omega ETA_V2 ~ 0.08\n",
+        "  block_omega (ETA_CL, ETA_V2) = [0.15, 0.03, 0.08]\n",
+    );
+    let mut text = ModelText::parse(&src).unwrap();
+    apply(&mut text, narrow_to_one_cpt());
+    let params = text.block_lines("parameters");
+    // A 1×1 block is not a form the parser accepts, so the survivor goes back
+    // to the diagonal declaration it came from.
+    assert!(
+        params.contains(&"omega ETA_CL ~ 0.15".to_string()),
+        "{params:?}"
+    );
+    assert!(
+        !params.iter().any(|l| l.contains("block_omega")),
+        "{params:?}"
+    );
+}
+
+#[test]
+fn set_structural_deletes_a_block_omega_whose_eta_all_die() {
+    let src = TWO_CPT.replace("  omega ETA_Q  ~ 0.08\n", "").replace(
+        "  omega ETA_V2 ~ 0.08\n",
+        "  block_omega (ETA_Q, ETA_V2) = [0.08, 0.01, 0.08]\n",
+    );
+    let mut text = ModelText::parse(&src).unwrap();
+    apply(&mut text, narrow_to_one_cpt());
+    let params = text.block_lines("parameters");
+    assert!(
+        !params
+            .iter()
+            .any(|l| l.contains("ETA_Q") || l.contains("ETA_V2")),
+        "{params:?}"
+    );
+}
+
+#[test]
+fn set_structural_refuses_to_prune_through_a_conditional_individual_parameters_block() {
+    // Reading a branch's assignments as roots instead would keep `TVQ` and
+    // `ETA_Q` alive for ever — an orphaned θ and a phantom η. Removing a line
+    // from inside a branch is a guess about the branch, so the edit is refused
+    // and the text left exactly as it was found.
+    let src = TWO_CPT.replace(
+        "  Q  = TVQ  * exp(ETA_Q)\n",
+        "  if (WT > 70) {\n    Q = TVQ * 1.2 * exp(ETA_Q)\n  } else {\n    Q = TVQ * exp(ETA_Q)\n  }\n",
+    );
+    let mut text = ModelText::parse(&src).unwrap();
+    let before = text.render();
+    let err = text.apply(narrow_to_one_cpt()).unwrap_err();
+    assert!(err.contains("`Q`"), "{err}");
+    assert!(err.contains("if"), "{err}");
+    assert_eq!(text.render(), before);
 }
 
 // ── SetErrorModel ──────────────────────────────────────────────────────────
@@ -730,6 +930,30 @@ fn set_error_model_checks_the_sigma_count() {
         }))
         .unwrap_err();
     assert!(err.contains("takes 2 sigma(s), 1 given"), "{err}");
+}
+
+#[test]
+fn set_error_model_refuses_a_block_sigma() {
+    // σ are reconciled positionally against `sigma NAME ~ …` declarations; a
+    // correlated block matches none of them, so the new σ would be appended
+    // beside it and the model would carry more σ than the error model names.
+    let src = BASE.replace(
+        "  sigma PROP_ERR ~ 0.02 (sd)",
+        "  block_sigma (PROP_ERR, ADD_ERR) = [0.02, 0.0, 0.1]",
+    );
+    let err = ModelText::parse(&src)
+        .unwrap()
+        .apply(ModelEdit::SetErrorModel(ErrorSpecText {
+            endpoint: "DV".into(),
+            form: ErrorForm::Additive,
+            sigmas: vec![SigmaDecl {
+                name: "ADD_ERR".into(),
+                init: 0.5,
+                as_sd: true,
+            }],
+        }))
+        .unwrap_err();
+    assert!(err.contains("block_sigma"), "{err}");
 }
 
 // ── SeedInits ──────────────────────────────────────────────────────────────

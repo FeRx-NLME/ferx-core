@@ -34,6 +34,9 @@ static SIGMA_RE: LazyLock<Regex> =
 static BLOCK_OMEGA_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^(block_omega\s*\(([^)]*)\)\s*=\s*)\[([^\]]*)\](.*)$").unwrap()
 });
+/// `block_sigma (A, B) = [ … ]` — detection only; this module never edits one.
+static BLOCK_SIGMA_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^block_sigma\s*\(").unwrap());
 /// `NAME = <expr>` — an `[individual_parameters]` assignment. The `[^=]`
 /// lookahead keeps `==` out.
 static ASSIGN_RE: LazyLock<Regex> =
@@ -148,8 +151,7 @@ fn set_structural(text: &mut ModelText, spec: &StructuralSpec) -> Result<(), Str
         }
     }
 
-    prune_unreferenced(text);
-    Ok(())
+    prune_unreferenced(text)
 }
 
 // ── [covariate_model] ───────────────────────────────────────────────────────
@@ -184,8 +186,7 @@ fn drop_covariate_relation(text: &mut ModelText, param: &str, cov: &str) -> Resu
     // An explicit `=> THETA(...)` clause may have deferred to a θ declared in
     // [parameters]; that θ is now unreferenced and would fail the parser's
     // "declared but never used" check.
-    prune_unreferenced(text);
-    Ok(())
+    prune_unreferenced(text)
 }
 
 /// The `[covariate_model]` line for one `(parameter, covariate)` pair.
@@ -216,6 +217,16 @@ fn add_iiv(text: &mut ModelText, param: &str, form: &IivForm) -> Result<(), Stri
         return Err(format!(
             "ferx-core::edit: `omega {}` is already declared",
             form.eta()
+        ));
+    }
+    // `OMEGA_RE` is anchored on `omega`, so it does not see an η that a
+    // `block_omega` declares — appending a diagonal `omega` for one would
+    // declare the same random effect twice.
+    if let Some(block) = block_omega_line_for(text, form.eta()) {
+        return Err(format!(
+            "ferx-core::edit: `{}` is already declared by `{}`",
+            form.eta(),
+            text.code(block)
         ));
     }
     if let Some(existing) = declared_etas(text).iter().find(|e| mentions(&rhs, e)) {
@@ -356,9 +367,18 @@ fn is_top_level_product(rhs: &str) -> bool {
             '(' | '[' => depth += 1,
             ')' | ']' => depth -= 1,
             '+' | '-' if depth == 0 => {
-                // A sign inside a float exponent (`1e-5`) is part of the number.
-                let prev = i.checked_sub(1).map(|p| bytes[p]);
-                if !matches!(prev, Some('e') | Some('E')) {
+                // A sign inside a float exponent (`1e-5`) is part of the
+                // number. One character of context is not enough to tell that
+                // from an identifier that merely ends in `e`: `BASE-1`,
+                // `AGE-40` and `SIZE-1` all have an `e` in front of the sign.
+                // A number has to be there too, on both sides of the `e`.
+                let exponent = i
+                    .checked_sub(1)
+                    .is_some_and(|p| matches!(bytes[p], 'e' | 'E'))
+                    && i.checked_sub(2)
+                        .is_some_and(|p| bytes[p].is_ascii_digit() || bytes[p] == '.')
+                    && bytes.get(i + 1).is_some_and(|c| c.is_ascii_digit());
+                if !exponent {
                     return false;
                 }
             }
@@ -407,8 +427,12 @@ fn set_omega_block(text: &mut ModelText, names: &[String]) -> Result<(), String>
             ));
         }
     }
-    let mut lines = Vec::with_capacity(names.len());
-    let mut variances = Vec::with_capacity(names.len());
+    // Collected per η and then sorted by declaration line: the block takes the
+    // place of the first declaration, so listing the η in *source* order — not
+    // in the caller's argument order — is what keeps each one's index in the
+    // omega matrix, and therefore the meaning of every `eta_names` position, as
+    // it was before the block.
+    let mut slots: Vec<(usize, &str, f64)> = Vec::with_capacity(names.len());
     for n in names {
         if let Some(b) = block_omega_line_for(text, n) {
             return Err(format!(
@@ -421,9 +445,12 @@ fn set_omega_block(text: &mut ModelText, names: &[String]) -> Result<(), String>
                 "ferx-core::edit: [parameters] declares no `omega {n} ~ …` to block"
             ));
         };
-        variances.push(omega_variance(text.code(i))?);
-        lines.push(i);
+        slots.push((i, n.as_str(), omega_variance(text.code(i))?));
     }
+    slots.sort_by_key(|(i, _, _)| *i);
+    let lines: Vec<usize> = slots.iter().map(|(i, _, _)| *i).collect();
+    let ordered: Vec<&str> = slots.iter().map(|(_, n, _)| *n).collect();
+    let variances: Vec<f64> = slots.iter().map(|(_, _, v)| *v).collect();
 
     let mut tri = Vec::new();
     for (i, vi) in variances.iter().enumerate() {
@@ -435,12 +462,10 @@ fn set_omega_block(text: &mut ModelText, names: &[String]) -> Result<(), String>
     let values: Vec<String> = tri.iter().map(|v| num(*v)).collect();
     let decl = format!(
         "block_omega ({}) = [{}]",
-        names.join(", "),
+        ordered.join(", "),
         values.join(", ")
     );
 
-    // The block takes the place of the first declaration, so the η keep their
-    // source order and therefore their index in the omega matrix.
     let first = *lines.iter().min().expect("names is non-empty");
     text.set_code(first, &decl);
     text.delete_lines(lines.into_iter().filter(|i| *i != first).collect());
@@ -475,6 +500,18 @@ fn set_error_model(text: &mut ModelText, spec: &ErrorSpecText) -> Result<(), Str
     }
     for s in &spec.sigmas {
         finite(s.init, &format!("`sigma {}` init", s.name))?;
+    }
+    // σ are reconciled positionally against the `sigma NAME ~ …` declarations
+    // below, and `SIGMA_RE` does not match a `block_sigma` line — so a
+    // correlated σ block would have the new σ *appended* beside it rather than
+    // reconciled with it, leaving the model with more σ than the error model
+    // names.
+    if let Some(i) = find_line(text, "parameters", |c| BLOCK_SIGMA_RE.is_match(c)) {
+        return Err(format!(
+            "ferx-core::edit: [parameters] declares σ as `{}`. SetErrorModel lays σ out \
+             positionally and cannot reconcile a correlated σ block; edit [parameters] by hand.",
+            text.code(i)
+        ));
     }
     let existing: Vec<usize> = text
         .body_indices("error_model")
@@ -648,6 +685,17 @@ fn set_fit_option(text: &mut ModelText, key: &str, value: &str) -> Result<(), St
             "ferx-core::edit: `{key} = {value}` spans a line break; a fit option is one line"
         ));
     }
+    // `code_of` strips `#` and `//` before the parser ever sees the line, so a
+    // marker anywhere in the option would silently truncate it on read-back.
+    if [key, value]
+        .iter()
+        .any(|s| s.contains('#') || s.contains("//"))
+    {
+        return Err(format!(
+            "ferx-core::edit: `{key} = {value}` contains a comment marker (`#` or `//`), which \
+             is stripped when the line is read back — the option would be truncated"
+        ));
+    }
     match find_line(text, "fit_options", |c| {
         c.split_once('=').is_some_and(|(k, _)| k.trim() == key)
     }) {
@@ -693,12 +741,6 @@ fn find_assignment(text: &ModelText, param: &str) -> Option<(usize, String)> {
 fn omega_decl_line(text: &ModelText, eta: &str) -> Option<usize> {
     find_line(text, "parameters", |c| {
         OMEGA_RE.captures(c).is_some_and(|m| &m[2] == eta)
-    })
-}
-
-fn sigma_decl_line(text: &ModelText, name: &str) -> Option<usize> {
-    find_line(text, "parameters", |c| {
-        SIGMA_RE.captures(c).is_some_and(|m| &m[2] == name)
     })
 }
 
@@ -753,12 +795,24 @@ fn mentions(expr: &str, name: &str) -> bool {
 /// at the blocks that *consume* parameters — `[structural_model]`, `[odes]`,
 /// `[scaling]`, `[error_model]`, everything that is not itself a declaration —
 /// and grows through the declarations those reach.
-fn prune_unreferenced(text: &mut ModelText) {
+///
+/// # Errors
+///
+/// When something is dead that this cannot remove safely: an assignment inside
+/// an `if`/`else` branch, or a `block_omega` whose triangle it cannot read.
+/// Leaving one behind is not the conservative option — an unused η is not a
+/// parse error, it is a flat direction in the omega matrix and an extra
+/// `n_parameters`, which is a wrong BIC for the search that ranks on it.
+fn prune_unreferenced(text: &mut ModelText) -> Result<(), String> {
     // An `if`/`else` in [individual_parameters] puts an assignment inside a
-    // branch, where "this line declares this name" stops being true. Rather
-    // than reason about scope, leave that block's assignments alone; θ and η
-    // pruning still runs.
-    let conditional = text.body_indices("individual_parameters").iter().any(|i| {
+    // branch, where "this line declares this name" stops being true. The
+    // assignments are still read as declarations — treating them as roots
+    // instead would keep every θ and η they mention alive, which is the
+    // orphaned-`TVQ`-and-phantom-η case — but a *dead* one is refused rather
+    // than deleted, because removing a line from inside a branch is a guess
+    // about the branch.
+    let individual = text.body_indices("individual_parameters");
+    let conditional = individual.iter().any(|i| {
         let c = text.code(*i);
         c.starts_with("if") || c.starts_with("else") || c.contains('{') || c.contains('}')
     });
@@ -767,19 +821,30 @@ fn prune_unreferenced(text: &mut ModelText) {
     // a consumer and therefore a root.
     let mut decls: Vec<(String, usize)> = Vec::new();
     let mut relations: Vec<(String, usize)> = Vec::new();
+    // `block_omega (A, B) = […]` declares several η on one line, and declares
+    // them nowhere else — so it has to be excluded from the root scan like any
+    // other declaration, or each η it names would keep *itself* alive.
+    let mut blocks: Vec<(Vec<String>, usize)> = Vec::new();
     for i in text.body_indices("parameters") {
         let code = text.code(i);
         if let Some(caps) = THETA_RE.captures(code) {
             decls.push((caps[2].to_string(), i));
         } else if let Some(caps) = OMEGA_RE.captures(code) {
             decls.push((caps[2].to_string(), i));
+        } else if let Some(caps) = BLOCK_OMEGA_RE.captures(code) {
+            let names: Vec<String> = caps[2]
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !names.is_empty() {
+                blocks.push((names, i));
+            }
         }
     }
-    if !conditional {
-        for i in text.body_indices("individual_parameters") {
-            if let Some(caps) = ASSIGN_RE.captures(text.code(i)) {
-                decls.push((caps[1].to_string(), i));
-            }
+    for i in &individual {
+        if let Some(caps) = ASSIGN_RE.captures(text.code(*i)) {
+            decls.push((caps[1].to_string(), *i));
         }
     }
     for i in text.body_indices("covariate_model") {
@@ -795,6 +860,7 @@ fn prune_unreferenced(text: &mut ModelText) {
 
     let mut declaration_lines: Vec<usize> = decls.iter().map(|(_, i)| *i).collect();
     declaration_lines.extend(relations.iter().map(|(_, i)| *i));
+    declaration_lines.extend(blocks.iter().map(|(_, i)| *i));
     let mut live = text.identifiers_excluding(&declaration_lines);
 
     // Grow the live set: a live name pulls in whatever its declaration reads.
@@ -837,11 +903,90 @@ fn prune_unreferenced(text: &mut ModelText) {
         }
     }
 
-    let dead: Vec<usize> = decls
+    let dead: Vec<(&str, usize)> = decls
         .iter()
         .chain(relations.iter())
         .filter(|(name, _)| !live.contains(name))
-        .map(|(_, i)| *i)
+        .map(|(name, i)| (name.as_str(), *i))
         .collect();
-    text.delete_lines(dead);
+    if conditional {
+        if let Some((name, _)) = dead.iter().find(|(_, i)| individual.contains(i)) {
+            return Err(format!(
+                "ferx-core::edit: `{name}` in [individual_parameters] is no longer referenced, \
+                 but the block contains an `if`/`else`, so removing a line from it would be a \
+                 guess about the branch. Edit [individual_parameters] by hand."
+            ));
+        }
+    }
+    let mut dead_lines: Vec<usize> = dead.into_iter().map(|(_, i)| i).collect();
+
+    // A `block_omega` that lost an η is rewritten around the ones that are
+    // left, rather than kept whole (a random effect no parameter uses) or
+    // deleted whole (which would take the live η with it).
+    for (names, i) in &blocks {
+        let keep: Vec<usize> = (0..names.len())
+            .filter(|k| live.contains(&names[*k]))
+            .collect();
+        if keep.len() == names.len() {
+            continue;
+        }
+        if keep.is_empty() {
+            dead_lines.push(*i);
+            continue;
+        }
+        let decl = shrink_omega_block(text.code(*i), names, &keep)?;
+        text.set_code(*i, &decl);
+    }
+
+    text.delete_lines(dead_lines);
+    Ok(())
+}
+
+/// Rewrite `block_omega (A, B, C) = […]` around the η at the indices in
+/// `keep`, which are ascending.
+///
+/// The triangle is row-major lower-triangular, so entry (a, b) with a ≥ b sits
+/// at `a(a+1)/2 + b` and the kept sub-block is that lookup over the kept
+/// indices — the surviving variances and their covariances, unchanged. A lone
+/// survivor is written back as the diagonal `omega` it would otherwise be a
+/// 1×1 block of, which is not a form the parser accepts.
+fn shrink_omega_block(code: &str, names: &[String], keep: &[usize]) -> Result<String, String> {
+    let caps = BLOCK_OMEGA_RE
+        .captures(code)
+        .ok_or_else(|| format!("ferx-core::edit: cannot read `{code}`"))?;
+    let values: Vec<f64> = caps[3]
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<f64>()
+                .map_err(|_| format!("ferx-core::edit: `{s}` is not a number in `{code}`"))
+        })
+        .collect::<Result<_, _>>()?;
+    let n = names.len();
+    if values.len() != n * (n + 1) / 2 {
+        return Err(format!(
+            "ferx-core::edit: `{code}` names {n} η but declares {} lower-triangle values, so the \
+             random effect it holds that nothing uses any more cannot be removed from it. \
+             Redeclare the block by hand.",
+            values.len()
+        ));
+    }
+    let rest = &caps[4];
+    if let [k] = keep {
+        let var = values[k * (k + 1) / 2 + k];
+        return Ok(format!("omega {} ~ {}{rest}", names[*k], num(var)));
+    }
+    let mut tri = Vec::with_capacity(keep.len() * (keep.len() + 1) / 2);
+    for (a, ia) in keep.iter().enumerate() {
+        for ib in keep.iter().take(a + 1) {
+            tri.push(num(values[ia * (ia + 1) / 2 + ib]));
+        }
+    }
+    let kept: Vec<&str> = keep.iter().map(|k| names[*k].as_str()).collect();
+    Ok(format!(
+        "block_omega ({}) = [{}]{rest}",
+        kept.join(", "),
+        tri.join(", ")
+    ))
 }
