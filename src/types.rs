@@ -5372,10 +5372,25 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // Word-boundary match so "beta shrinkage" (or similar) does not collide.
         (WarningSeverity::Warning, WarningCode::EtaShrinkage)
     } else if lower.contains("internal optimizer parameter guard") {
-        (
-            WarningSeverity::Warning,
-            WarningCode::ParameterAtRunawayGuard,
-        )
+        // #1118: a runaway hit is an estimate held at an implementation rail —
+        // not an interior optimum — and demotes `converged`, so it is Critical.
+        // A collapse hit (a component falling to the floor at zero) is usually a
+        // modelling decision to make, and stays a plain Warning. Each hit is
+        // listed as "... at <side> guard, <verdict>", so the verdict — not the
+        // bare side, which an Ω off-diagonal's symmetric rails make ambiguous —
+        // survives into the flat message a re-classified (e.g.
+        // multi-start-spliced) warning carries.
+        if lower.contains("guard, runaway") {
+            (
+                WarningSeverity::Critical,
+                WarningCode::ParameterAtRunawayGuard,
+            )
+        } else {
+            (
+                WarningSeverity::Warning,
+                WarningCode::ParameterAtRunawayGuard,
+            )
+        }
     } else if lower.contains("optimizer bound") {
         // Distinctive phrase; the eps-shrinkage message's "sigma at a bound" is
         // matched earlier and never reaches here.

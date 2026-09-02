@@ -91,8 +91,31 @@ optimizer scaling can introduce), the fit emits the structured
 `parameter_at_runaway_guard` warning. FIX'd coordinates are excluded because
 their equal bounds are intentional. The check is made in packed space, so it
 compares directly with the literal guard even though fit output reports Omega
-on the variance/covariance scale and Sigma on its stored SD scale. A lower hit
-means the component collapsed toward zero; an upper hit means it ran away.
+on the variance/covariance scale and Sigma on its stored SD scale.
+
+Each hit carries a **verdict**, and it is the verdict — not the side — that says
+what happened and what follows from it:
+
+- **`collapse`** — the coordinate fell to a floor at zero. Only the log-packed
+  coordinates have one: a Theta lower cap, an Omega / Omega-IOV Cholesky
+  *diagonal* at $-6$, a Sigma at $-8$. The warning stays a `Warning` and
+  `converged` is left alone, because an unsupported component collapsing is
+  usually a modelling decision to make rather than a numerical failure.
+- **`runaway`** — the coordinate is held at an implementation rail. Every upper
+  hit is one, and so is *either* rail of an Omega / Omega-IOV **off-diagonal**,
+  which is the raw $L_{ij}$ bounded symmetrically at $\pm 10$: a correlation
+  coordinate driven to $-10$ ran away exactly as its $+10$ twin did, and nothing
+  about it collapsed toward zero. A runaway hit **demotes `converged` to `false`
+  and raises the warning to `Critical`** (#1118): a point held at an
+  implementation rail is by construction not an interior optimum, so a script or
+  agent keying off the boolean must not accept it.
+
+One rail is reachable by a model that is otherwise sound: the Sigma ceiling,
+$e^5 \approx 148$ on the stored SD scale. An additive error model on unscaled
+data (DV in ng/mL, µg/L, cell counts) can have a residual SD genuinely above it.
+The remediation there is the data scale rather than the model — rescale DV, or
+use a proportional or log-transformed error model — and the warning message says
+so when the hit is a Sigma.
 
 ## Where the packed space surfaces
 
