@@ -19,6 +19,8 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-02
+
 ### Added
 - **`ferx gam` — GAM covariate pre-screening from the command line (#1114).** Screens every
   declared covariate against every ETA with independent GAM regressions and prints a table
@@ -5398,7 +5400,8 @@ and `git log v0.1.0..v0.1.5` for details.
 Initial tagged release. See the
 [GitHub release](https://github.com/FeRx-NLME/ferx-core/releases/tag/v0.1.0).
 
-[Unreleased]: https://github.com/FeRx-NLME/ferx-core/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/FeRx-NLME/ferx-core/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/FeRx-NLME/ferx-core/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/FeRx-NLME/ferx-core/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/FeRx-NLME/ferx-core/compare/v0.1.5...v0.2.0
 [0.1.5]: https://github.com/FeRx-NLME/ferx-core/compare/v0.1.0...v0.1.5

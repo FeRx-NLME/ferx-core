@@ -1,6 +1,6 @@
 [package]
 name = "ferx-tools"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "Model-development tooling on top of ferx-core: bootstrap, covariate search, cross-validation"
 license = "MIT"
@@ -15,7 +15,7 @@ repository = "https://github.com/FeRx-NLME/ferx-core"
 # instead of linking the rlib it just built, and `--no-default-features` is
 # silently defeated for `ferx-core` everywhere (harmless only while
 # `default = []`; `survival` is slated to become default-on).
-ferx-core = { path = "../..", version = "0.3.0", default-features = false }
+ferx-core = { path = "../..", version = "0.3.1", default-features = false }
 csv = "1.3"
 nalgebra = "0.35"
 rand = "0.10"
