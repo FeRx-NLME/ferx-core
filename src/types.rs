@@ -5372,13 +5372,15 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // Word-boundary match so "beta shrinkage" (or similar) does not collide.
         (WarningSeverity::Warning, WarningCode::EtaShrinkage)
     } else if lower.contains("internal optimizer parameter guard") {
-        // #1118: an upper-guard hit is an estimate held at an implementation
-        // ceiling — not an interior optimum — and demotes `converged`, so it is
-        // Critical. A lower-guard hit (a component collapsing to the floor) is
-        // usually a modelling decision to make, and stays a plain Warning. Each
-        // hit is listed as "... at <side> guard", so the side survives into the
-        // flat message a re-classified (e.g. multi-start-spliced) warning carries.
-        if lower.contains("at upper guard") {
+        // #1118: a runaway hit is an estimate held at an implementation rail —
+        // not an interior optimum — and demotes `converged`, so it is Critical.
+        // A collapse hit (a component falling to the floor at zero) is usually a
+        // modelling decision to make, and stays a plain Warning. Each hit is
+        // listed as "... at <side> guard, <verdict>", so the verdict — not the
+        // bare side, which an Ω off-diagonal's symmetric rails make ambiguous —
+        // survives into the flat message a re-classified (e.g.
+        // multi-start-spliced) warning carries.
+        if lower.contains("guard, runaway") {
             (
                 WarningSeverity::Critical,
                 WarningCode::ParameterAtRunawayGuard,

@@ -5,7 +5,7 @@ use super::*;
 use crate::diagnostics::{first_error, CheckReport, Diagnostic};
 use crate::estimation::outer_optimizer::optimize_population;
 use crate::estimation::parameterization::{
-    chol_lt_idx, lower_tri_iter, omega_packed_len, theta_packs_log,
+    chol_lt_idx, lower_tri_iter, omega_packed_len, theta_packs_log, PackedCoordKind,
 };
 use crate::estimation::saem;
 use crate::io::datareader::{
@@ -1129,6 +1129,32 @@ struct RunawayGuardHit {
     packed_estimate: f64,
     packed_guard: f64,
     side: &'static str,
+    kind: PackedCoordKind,
+}
+
+impl RunawayGuardHit {
+    /// Whether the estimate *ran away* to a rail rather than *collapsed* to a
+    /// floor at zero.
+    ///
+    /// The side alone does not answer this. Ω / Ω_IOV off-diagonals are the raw
+    /// `L[i,j]` bounded symmetrically at ±10, so a correlation coordinate driven
+    /// to −10 is the same runaway as its +10 twin and nothing about it collapsed
+    /// toward zero. Only the log-packed coordinates (Theta, Ω diagonal, Σ) have a
+    /// lower rail that means collapse.
+    fn is_runaway(&self) -> bool {
+        self.side == "upper" || self.kind == PackedCoordKind::OmegaOffDiagonal
+    }
+
+    /// The word carried into both the message and `details.verdict`; the message
+    /// token `classify_warning` keys on to recover the severity from a flat
+    /// (e.g. multi-start-spliced) string.
+    fn verdict(&self) -> &'static str {
+        if self.is_runaway() {
+            "runaway"
+        } else {
+            "collapse"
+        }
+    }
 }
 
 /// Tiny packed-space tolerance for an optimizer guard hit. The optimizer may
@@ -1170,7 +1196,8 @@ pub(crate) fn packed_guard_side(
 /// internal OMEGA/SIGMA, OMEGA_IOV, or mixture guard.
 fn runaway_guard_estimates(params: &ModelParameters) -> Vec<RunawayGuardHit> {
     use crate::estimation::parameterization::{
-        compute_bounds, coordinate_names, coordinate_values, pack_params, packed_fixed_mask,
+        compute_bounds, coordinate_kinds, coordinate_names, coordinate_values, pack_params,
+        packed_fixed_mask,
     };
 
     let packed = pack_params(params);
@@ -1178,12 +1205,14 @@ fn runaway_guard_estimates(params: &ModelParameters) -> Vec<RunawayGuardHit> {
     let fixed = packed_fixed_mask(params);
     let names = coordinate_names(params);
     let estimates = coordinate_values(params);
+    let kinds = coordinate_kinds(params);
     let end = packed
         .len()
         .min(bounds.lower.len())
         .min(bounds.upper.len())
         .min(names.len())
-        .min(estimates.len());
+        .min(estimates.len())
+        .min(kinds.len());
 
     (0..end)
         .filter(|&i| !fixed.get(i).copied().unwrap_or(false))
@@ -1199,6 +1228,7 @@ fn runaway_guard_estimates(params: &ModelParameters) -> Vec<RunawayGuardHit> {
                         packed_estimate: packed[i],
                         packed_guard,
                         side,
+                        kind: kinds[i],
                     })
                 },
             )
@@ -1344,14 +1374,18 @@ pub(crate) fn boundary_estimate_warning(
 /// Build the warning for parameter estimates pinned to an internal
 /// runaway guard, or `None` when every free coordinate is interior.
 ///
-/// An *upper*-guard hit also demotes `converged` and reports at `Critical`
-/// (#1118): the coordinate stopped at an implementation ceiling, so the point is
-/// by construction not an interior optimum and a consumer keying off the boolean
-/// must not keep it. A *lower*-guard hit stays a plain `Warning` and leaves
-/// `converged` alone — a variance collapsing to the floor is usually a genuinely
+/// A *runaway* hit also demotes `converged` and reports at `Critical` (#1118):
+/// the coordinate stopped at an implementation rail, so the point is by
+/// construction not an interior optimum and a consumer keying off the boolean
+/// must not keep it. A *collapse* hit stays a plain `Warning` and leaves
+/// `converged` alone — a variance falling to the floor is usually a genuinely
 /// unsupported component for the user to remove rather than a numerical runaway,
 /// so demoting there would be noise. This mirrors `vi::run::bad_basin_warning`,
 /// which owns the same consequence for the final ELBO check.
+///
+/// Which of the two a hit is comes from [`RunawayGuardHit::is_runaway`], not
+/// from the side: an Ω off-diagonal is rail-bounded symmetrically, so its lower
+/// rail is a runaway too.
 pub(crate) fn runaway_guard_warning(
     converged: &mut bool,
     params: &ModelParameters,
@@ -1364,39 +1398,58 @@ pub(crate) fn runaway_guard_warning(
         .iter()
         .map(|hit| {
             format!(
-                "{} (estimate {:.4}; packed coordinate {:.4} at {} guard)",
-                hit.name, hit.estimate, hit.packed_estimate, hit.side
+                "{} (estimate {:.4}; packed coordinate {:.4} at {} guard, {})",
+                hit.name,
+                hit.estimate,
+                hit.packed_estimate,
+                hit.side,
+                hit.verdict()
             )
         })
         .collect::<Vec<_>>()
         .join(", ");
-    let has_lower = hits.iter().any(|hit| hit.side == "lower");
-    let has_upper = hits.iter().any(|hit| hit.side == "upper");
-    // An estimate held at an implementation ceiling is not a solution of the
+    let has_runaway = hits.iter().any(|hit| hit.is_runaway());
+    let has_collapse = hits.iter().any(|hit| !hit.is_runaway());
+    // An estimate held at an implementation rail is not a solution of the
     // problem the user posed, whatever the outer optimizer's stop rule reported.
-    if has_upper {
+    if has_runaway {
         *converged = false;
     }
-    let guidance = match (has_lower, has_upper) {
+    let mut guidance = String::from(match (has_collapse, has_runaway) {
         (true, false) => {
             "The affected parameter(s) collapsed toward zero at an implementation floor \
              rather than reaching an interior optimum; consider removing or simplifying \
              the unsupported parameter, random effect, or error component."
         }
         (false, true) => {
-            "The affected parameter(s) ran to an implementation ceiling rather than \
+            "The affected parameter(s) ran to an implementation rail rather than \
              reaching an interior optimum; do not treat the value(s) as reliable estimates. \
              Reported converged: false. Revisit the model, data, initial estimates, or \
              estimation method."
         }
         (true, true) => {
-            "Lower-guard hits indicate parameters collapsing toward zero; consider removing \
-             or simplifying those unsupported components. Upper-guard hits indicate runaway \
-             estimates and are reported converged: false; revisit the model, data, initial \
-             estimates, or estimation method."
+            "Collapse hits indicate parameters falling toward zero; consider removing \
+             or simplifying those unsupported components. Runaway hits indicate estimates \
+             held at an implementation rail and are reported converged: false; revisit the \
+             model, data, initial estimates, or estimation method."
         }
-        (false, false) => unreachable!("every guard hit has a lower or upper side"),
-    };
+        (false, false) => unreachable!("every guard hit is a runaway or a collapse"),
+    });
+    // The Σ ceiling (exp(5) ≈ 148 on the stored SD scale) is the one rail an
+    // otherwise sound model can legitimately reach — an additive error on
+    // unscaled DV (ng/mL, cell counts) can have a residual SD above it — and the
+    // remediation is then the data scale, not the model. Name it, because the
+    // generic advice above does not.
+    if hits
+        .iter()
+        .any(|hit| hit.is_runaway() && hit.kind == PackedCoordKind::Sigma)
+    {
+        guidance.push_str(
+            " A SIGMA at the ceiling can also mean the residual error is genuinely that \
+             large on the scale of the data: rescale DV, or use a proportional or \
+             log-transformed error model.",
+        );
+    }
     let msg =
         format!("Internal optimizer parameter guard reached by estimate(s): {list}. {guidance}");
     let params_json: Vec<serde_json::Value> = hits
@@ -1408,6 +1461,7 @@ pub(crate) fn runaway_guard_warning(
                 "packed_estimate": hit.packed_estimate,
                 "packed_guard": hit.packed_guard,
                 "side": hit.side,
+                "verdict": hit.verdict(),
             })
         })
         .collect();
@@ -1416,7 +1470,7 @@ pub(crate) fn runaway_guard_warning(
         "parameters": params_json,
     });
     let entry = warning_entry_with_severity(
-        if has_upper {
+        if has_runaway {
             WarningSeverity::Critical
         } else {
             WarningSeverity::Warning

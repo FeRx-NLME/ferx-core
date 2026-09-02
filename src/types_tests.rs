@@ -684,22 +684,30 @@ fn classify_warning_recognizes_internal_runaway_guard() {
     assert_eq!(warning.category, WarningCode::ParameterAtRunawayGuard);
     assert_eq!(warning.severity, WarningSeverity::Warning);
 
-    // #1118: the side is carried in each listed hit, and an upper hit — the one
-    // that demotes `converged` — classifies Critical even when the entry reaches
-    // this path as a flat string (a spliced multi-start warning, say) instead of
-    // the native typed entry.
+    // #1118: each listed hit carries its verdict, and a runaway — the one that
+    // demotes `converged` — classifies Critical even when the entry reaches this
+    // path as a flat string (a spliced multi-start warning, say) instead of the
+    // native typed entry.
     let upper = classify_warning(
         "Internal optimizer parameter guard reached by estimate(s): PROP_ERR \
-         (estimate 148.4132; packed coordinate 5.0000 at upper guard).",
+         (estimate 148.4132; packed coordinate 5.0000 at upper guard, runaway).",
     );
     assert_eq!(upper.category, WarningCode::ParameterAtRunawayGuard);
     assert_eq!(upper.severity, WarningSeverity::Critical);
 
     let lower = classify_warning(
         "Internal optimizer parameter guard reached by estimate(s): PROP_ERR \
-         (estimate 0.0003; packed coordinate -8.0000 at lower guard).",
+         (estimate 0.0003; packed coordinate -8.0000 at lower guard, collapse).",
     );
     assert_eq!(lower.severity, WarningSeverity::Warning);
+
+    // #1205 review: the verdict, not the side, is what carries the severity —
+    // an Ω off-diagonal at its *lower* rail is a runaway and must reach Critical.
+    let off_diag = classify_warning(
+        "Internal optimizer parameter guard reached by estimate(s): ETA_CL~ETA_V \
+         (estimate -10.0000; packed coordinate -10.0000 at lower guard, runaway).",
+    );
+    assert_eq!(off_diag.severity, WarningSeverity::Critical);
 }
 
 /// #778: the `WarningCode` serde token is a public API an agent / the R
