@@ -697,7 +697,9 @@ term (there is no separate `sequential` keyword):
 
 ### Shared behaviour — zero-order
 
-`zero_order` reuses the same dose machinery as `transit`/`igd`/`weibull`:
+`zero_order` reuses the same dose machinery as `transit`/`igd`/`weibull`.
+
+#### Dose handling
 
 - **Dose routing** — the dose feeds `zero_order` over its window and is **not**
   also added as a bolus; the depot/central state stays an amount.
@@ -710,6 +712,8 @@ term (there is no separate `sequential` keyword):
   compartment are now **supported** (#719 — SS through a periodic-sum `R_in`,
   infusion as a zero-order source feeding the kernel); a `[diffusion]` block
   (SDE/EKF) into the input-rate compartment is still rejected with a clear error.
+
+#### The window is bracketed at both edges
 
 The window is handled exactly: ferx breaks the integration timeline at **both**
 edges — the onset `t_dose + lagtime` and the cutoff `t_dose + lagtime + dur` — and
@@ -726,6 +730,8 @@ a lagged `zero_order` reported exactly `0.0` at every observation, while the
 objective — which segments on a different code path — was correct throughout.
 
   [#1171]: https://github.com/FeRx-NLME/ferx-core/issues/1171
+
+#### Analytic sensitivity across the moving boundary
 
 ::: {.callout-note}
 ## Sensitivity of `zero_order(dur)` is analytic (#530)
