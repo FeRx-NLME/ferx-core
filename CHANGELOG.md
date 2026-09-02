@@ -19,7 +19,17 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-02
+
 ### Added
+- **A progress bar for `ferx bootstrap`.** A 200-sample bootstrap is minutes to hours of
+  fitting behind one command, with nothing on the terminal to say whether it was working
+  or wedged. The run now reports each fit as it completes: the base model gets a spinner,
+  the replicates a bar with an ETA, `--dofv` its own bar for its second pass, and a
+  `--resume` run counts only what is left to fit. The bar is drawn only when stderr is a
+  terminal; `--no-progress` suppresses it. `ferx_tools::bootstrap::run_bootstrap_with_progress`
+  is the same run with a `BootstrapEvent` sink, which is what ferx-r renders onto a `cli`
+  bar; `run_bootstrap` is unchanged.
 - **`ferx gam` — GAM covariate pre-screening from the command line (#1114).** Screens every
   declared covariate against every ETA with independent GAM regressions and prints a table
   ranked by delta-AIC (`AIC_null − AIC_best`), the Rust equivalent of Xpose4's `xpose.gam()`.
@@ -31,6 +41,14 @@ section of the SDLC for the versioning policy).
   fit with the `--gam` flag. See [GAM covariate screening](https://ferx-nlme.github.io/ferx-core/tools/gam-screening.html).
 
 ### Changed
+- **The published tarball no longer ships repo infrastructure (#1170).** `tests/`,
+  `nonmem_anchor/`, `docs/`, `plans/`, `tools/`, the workflow and hook directories and the
+  repo-process markdown are excluded from the crate: 1289 files / 5.47 MB compressed becomes
+  366 files / 3.22 MB. None of it is needed to build or document the crate. Running the test
+  suite needs a git checkout, as it needed the NONMEM anchors anyway. No source or API change.
+- **The three published crates now carry `keywords` and `categories` (#1170).** Registry metadata
+  only -- no code change. It is what covers discoverability on crates.io, which is why claiming
+  the `ferx-nlme` name was judged unnecessary in #1170.
 - **`FitOptions::threads` now also caps a multi-start fit (#1115).** A pinned positive `threads`
   was honored only when `n_starts <= 1`; with several starts the fan-out ran on the full-width
   shared pool regardless, so a tool that pinned one thread per fit from a `PoolPlan` and asked
@@ -203,6 +221,13 @@ section of the SDLC for the versioning policy).
   `init(__chz_<cmt>)`, is a parse error naming the state instead of silently producing a
   coupled system the shared solve was never designed for. A `[scaling]` readout may still
   read it.
+- **The packaged crate no longer ships two files the CC BY-NC exclusion was meant to cover (#1170).**
+  `exclude`'s `data/mbma_naproxen.*` glob required a literal `.` after the stem, so
+  `data/mbma_naproxen_source.py` slipped through, and `examples/` was never listed, so
+  `examples/mbma_naproxen.ferx` shipped as an example whose data is excluded and so cannot run.
+  Neither file was itself CC BY-NC (both are repo-authored MIT, and the restricted csv was
+  correctly excluded throughout), but the licence note in `data/mbma_naproxen.LICENSE` described
+  a mechanism the globs did not implement. Both are now excluded.
 - **An infusion into a built-in absorption compartment is no longer delivered twice on the
   dense/states engines (#1187).** With a `RATE>0` or `RATE=-2` dose into a `first_order()`,
   `transit()`, `igd()` or `weibull()` kernel (#719 gap 2), the mass was released *both* through
@@ -5410,7 +5435,8 @@ and `git log v0.1.0..v0.1.5` for details.
 Initial tagged release. See the
 [GitHub release](https://github.com/FeRx-NLME/ferx-core/releases/tag/v0.1.0).
 
-[Unreleased]: https://github.com/FeRx-NLME/ferx-core/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/FeRx-NLME/ferx-core/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/FeRx-NLME/ferx-core/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/FeRx-NLME/ferx-core/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/FeRx-NLME/ferx-core/compare/v0.1.5...v0.2.0
 [0.1.5]: https://github.com/FeRx-NLME/ferx-core/compare/v0.1.0...v0.1.5

@@ -1,11 +1,13 @@
 [package]
 name = "ferx-cli"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "Command-line interface for the ferx NLME modeling engine"
 license = "MIT"
 authors = ["Ron Keizer", "Teun Post", "Hidde van de Beek"]
 repository = "https://github.com/FeRx-NLME/ferx-core"
+keywords = ["nlme", "pharmacometrics", "pharmacokinetics", "population-pk", "cli"]
+categories = ["command-line-utilities", "science", "simulation"]
 
 # The installed binary keeps the name `ferx` — the package rename is invisible
 # to users. It lives here rather than in the `ferx-core` package because it will
@@ -23,8 +25,9 @@ path = "src/main.rs"
 # instead of linking the rlib it just built, and `--no-default-features` is
 # silently defeated for `ferx-core` everywhere (harmless only while
 # `default = []`; `survival` is slated to become default-on).
-ferx-core = { path = "../..", version = "0.3.0", default-features = false }
-ferx-tools = { path = "../ferx-tools", version = "0.3.0" }
+ferx-core = { path = "../..", version = "0.3.1", default-features = false }
+ferx-tools = { path = "../ferx-tools", version = "0.3.1" }
+indicatif = "0.18.4"
 serde_json = "1"
 
 [dev-dependencies]

@@ -1,4 +1,5 @@
 mod bootstrap_cmd;
+mod bootstrap_progress;
 mod gam_cmd;
 
 use ferx_core::NcaInit;

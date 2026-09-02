@@ -807,3 +807,148 @@ fn resume_needs_a_directory_and_retry_failed_needs_resume() {
     let err = dangling.validate_for_run().unwrap_err();
     assert!(err.contains("--resume"), "{err}");
 }
+
+// ── progress events ─────────────────────────────────────────────────────────
+
+/// One real run with a sink attached, on the smallest useful model.
+///
+/// The event contract is a sequence, not a set - a bar that is told its length
+/// after it has already been stepped draws wrong - so this asserts the order as
+/// well as the counts. Warfarin (10 subjects) at `--samples 1` with `--dofv` is
+/// three fits, one of which is an evaluation: enough to see every variant.
+#[test]
+fn a_run_reports_its_fits_in_order() {
+    let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let prepared = ferx_core::prepare_run(
+        repo.join("examples/warfarin.ferx").to_str().unwrap(),
+        Some(repo.join("data/warfarin.csv").to_str().unwrap()),
+    )
+    .expect("warfarin loads");
+    let options = BootstrapOptions {
+        samples: 1,
+        seed: 5,
+        threads: Some(1),
+        dofv: true,
+        ..BootstrapOptions::default()
+    };
+
+    let events = std::sync::Mutex::new(Vec::new());
+    let sink = |event| events.lock().expect("not poisoned").push(event);
+    run_bootstrap_with_progress(&prepared, &options, Some(&sink)).expect("the run succeeds");
+
+    let events = events.into_inner().expect("not poisoned");
+    assert_eq!(
+        events,
+        vec![
+            BootstrapEvent::Started {
+                replicates: 1,
+                reused: 0,
+                base_fit: true,
+            },
+            BootstrapEvent::BaseFitDone,
+            BootstrapEvent::ReplicateDone {
+                completed: 1,
+                total: 1,
+            },
+            BootstrapEvent::DeltaOfvDone {
+                completed: 1,
+                total: 1,
+            },
+            BootstrapEvent::Finished,
+        ],
+        "{events:?}"
+    );
+}
+
+/// A run that fails after it has announced itself still reports `Finished`.
+///
+/// A sink told that a run started and never told it ended leaves its bar on the
+/// terminal, over the error the caller is about to print. `--dofv` without a
+/// base fit is the cheapest way in: it passes `validate()` and fails at the
+/// reference OFV, after `Started` and after every replicate is in.
+#[test]
+fn a_failed_run_still_reports_that_it_finished() {
+    let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let prepared = ferx_core::prepare_run(
+        repo.join("examples/warfarin.ferx").to_str().unwrap(),
+        Some(repo.join("data/warfarin.csv").to_str().unwrap()),
+    )
+    .expect("warfarin loads");
+    let options = BootstrapOptions {
+        samples: 1,
+        seed: 5,
+        threads: Some(1),
+        dofv: true,
+        run_base_model: false,
+        update_inits: false,
+        ..BootstrapOptions::default()
+    };
+
+    let events = std::sync::Mutex::new(Vec::new());
+    let sink = |event| events.lock().expect("not poisoned").push(event);
+    let err = run_bootstrap_with_progress(&prepared, &options, Some(&sink))
+        .expect_err("--dofv needs a base fit");
+    assert!(err.contains("--dofv"), "{err}");
+
+    let events = events.into_inner().expect("not poisoned");
+    assert_eq!(
+        events.first(),
+        Some(&BootstrapEvent::Started {
+            replicates: 1,
+            reused: 0,
+            base_fit: false,
+        }),
+        "{events:?}"
+    );
+    assert_eq!(events.last(), Some(&BootstrapEvent::Finished), "{events:?}");
+    // Exactly one, whichever way the run leaves: the guard emits on the way
+    // out, and the success path disarms it by emitting first.
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| **e == BootstrapEvent::Finished)
+            .count(),
+        1,
+        "{events:?}"
+    );
+}
+
+/// A run with no sink is the same run. Nothing about the draws or the fits may
+/// depend on whether a bar was being drawn, so the two results have to agree
+/// down to the estimate.
+#[test]
+fn watching_a_run_does_not_change_it() {
+    let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let prepared = ferx_core::prepare_run(
+        repo.join("examples/warfarin.ferx").to_str().unwrap(),
+        Some(repo.join("data/warfarin.csv").to_str().unwrap()),
+    )
+    .expect("warfarin loads");
+    let options = BootstrapOptions {
+        samples: 1,
+        seed: 7,
+        threads: Some(1),
+        run_base_model: false,
+        update_inits: false,
+        ..BootstrapOptions::default()
+    };
+
+    let quiet = run_bootstrap(&prepared, &options).expect("the run succeeds");
+    let watched = {
+        let seen = std::sync::atomic::AtomicUsize::new(0);
+        let sink = |_| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        };
+        let result = run_bootstrap_with_progress(&prepared, &options, Some(&sink))
+            .expect("the run succeeds");
+        // Started, one ReplicateDone, Finished - and no BaseFitDone, because
+        // `run_base_model = false` means there was no base fit to report.
+        assert_eq!(seen.load(std::sync::atomic::Ordering::Relaxed), 3);
+        result
+    };
+
+    assert_eq!(
+        quiet.replicates[0].estimates,
+        watched.replicates[0].estimates
+    );
+}

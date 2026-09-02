@@ -25,30 +25,53 @@ resolver = "2"
 
 [package]
 name = "ferx-core"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "Nonlinear Mixed Effects modeling engine with FOCE/FOCEI estimation"
 license = "MIT"
 authors = ["Ron Keizer", "Teun Post", "Hidde van de Beek"]
 repository = "https://github.com/FeRx-NLME/ferx-core"
+keywords = ["nlme", "pharmacometrics", "pharmacokinetics", "foce", "ode"]
+categories = ["science", "mathematics", "simulation"]
 readme = "README.md"
 # `data/mbma_naproxen.csv` is CC BY-NC 4.0, not MIT (see the root LICENSE and
 # data/mbma_naproxen.LICENSE). It is a slow-test fixture, so excluding it keeps
 # the crate published to crates.io free of any CC BY-NC file. The glob also takes
 # its README and licence companions, which are MIT / Creative Commons' own text
 # respectively — they are dropped because they are meaningless without the data,
-# not because of their licence. The slow test goes with them for the same reason:
-# it hardcodes the fixture path, so shipping it without the data would turn
-# `cargo test --features slow-tests` on the packaged crate into a panic on a
-# missing file rather than a test that simply is not there.
+# not because of their licence. The slow test that reads the fixture is covered
+# by the blanket `tests/*` exclusion below.
+#
+# The glob deliberately has no `.` after `mbma_naproxen`: `data/mbma_naproxen.*`
+# matched the csv/LICENSE/README but not `data/mbma_naproxen_source.py` (#1170).
+# `examples/mbma_naproxen.ferx` is listed separately for the same reason the
+# slow test is: without the excluded csv it is an example that cannot run.
 #
 # `api/` is the CI-enforced public-API baseline (#1114) — a 388 KB rustdoc-derived
 # snapshot that is repo infrastructure, not crate content, so it is kept out of
 # the published tarball too.
 exclude = [
-  "data/mbma_naproxen.*",
-  "tests/mbma_naproxen_case_study.rs",
+  "data/mbma_naproxen*",
+  "examples/mbma_naproxen.ferx",
   "api/*",
+  # Repo infrastructure, not crate content. None of it is needed to build or
+  # document the crate, and together it is roughly 7.5 MB of a 19.6 MB tarball.
+  # `nonmem_anchor/` goes with `tests/`: it is the NONMEM reference output the
+  # anchor tests read, and nothing outside `tests/` opens it (the mentions in
+  # `src/` are prose in doc comments). Consumers who want to run the test suite
+  # clone the repo; the published crate exists to be built against.
+  "tests/*",
+  "nonmem_anchor/*",
+  "docs/*",
+  "plans/*",
+  "tools/*",
+  ".github/*",
+  ".githooks/*",
+  "AGENTS.md",
+  "CLAUDE.md",
+  "SDLC.md",
+  "VI_VALIDATION.md",
+  "codecov.yml",
 ]
 
 [features]
