@@ -184,6 +184,25 @@ section of the SDLC for the versioning policy).
   top of them, so a tool and the CLI cannot diverge in how a model is loaded.
 
 ### Fixed
+- **A joint PK-TTE model with a time-dependent hazard no longer integrates twice per subject
+  (#1166).** The `[event_model] hazard = …` expression is appended to the ODE system as
+  `d/dt(__chz_<cmt>)`, and a Weibull or Gompertz baseline hazard reads `TIME` by definition —
+  which made ferx treat the whole model as having non-autonomous PK dynamics, declining the
+  single shared solve (#570) and leaving the dense driver, for a property the PK block does
+  not have. The "does this model read model time?" question is now asked of the PK equations
+  alone. Measured on a 40-subject fixture, one variable: **2.1×** faster on one objective
+  evaluation and **2.6×** over eight outer iterations. Results are unaffected beyond solver
+  tolerance (4.4e-3 OFV at default tolerances, decaying with the tolerance), so earlier fits
+  do not need re-running. Steady-state gates deliberately keep the wider question, since SS
+  equilibration integrates the augmented system including the hazard state. Validated against
+  a new NONMEM anchor (`nonmem_anchor/pktte_tdep.ctl`): `H(t)` matches `A(3)` to 3.6e-9
+  relative and the per-subject objective matches the `.phi` `OBJ` to 6.0e-8.
+- **`__chz_*` is now rejected as a read (#1166).** The cumulative-hazard accumulator the
+  parser appends for a joint PK-TTE hazard is write-only: referencing it from an `[odes]`
+  equation, an `if` condition or the hazard expression, or seeding it with
+  `init(__chz_<cmt>)`, is a parse error naming the state instead of silently producing a
+  coupled system the shared solve was never designed for. A `[scaling]` readout may still
+  read it.
 - **An infusion into a built-in absorption compartment is no longer delivered twice on the
   dense/states engines (#1187).** With a `RATE>0` or `RATE=-2` dose into a `first_order()`,
   `transit()`, `igd()` or `weibull()` kernel (#719 gap 2), the mass was released *both* through

@@ -255,6 +255,35 @@ Such models take the event-driven ODE path, which places each dose on its timeli
 (possibly lagged) arrival so `TAD` anchors correctly. There is nothing to configure; the cost
 is that these models integrate rather than evaluate in closed form.
 
+#### The injected joint PK-TTE hazard line does not count {#chz-is-not-your-rhs}
+
+A joint PK-TTE model's `[event_model] hazard = …` is appended to the ODE system as a
+cumulative-hazard state, `d/dt(__chz_<cmt>) = <hazard>`. A Weibull or Gompertz baseline
+hazard reads `TIME` by definition, but that line never writes a PK state, so it does **not**
+make the PK dynamics non-autonomous and does not route the model off the fast paths:
+
+```
+[odes]
+  d/dt(depot)   = -KA*depot
+  d/dt(central) =  KA*depot - (CL/V)*central     # autonomous: the fast paths still apply
+
+[event_model]
+  cmt    = 3
+  hazard = H0*exp(GAM*TIME)*exp(BETA*central/V)  # time-dependent, and that is fine
+```
+
+Writing `TIME` in a PK equation still counts, hazard or no hazard.
+
+`__chz_*` is reserved and **write-only**: reading it from an `[odes]` equation, from an `if`
+condition, from the hazard itself, or seeding it with `init(__chz_<cmt>)` is a parse error.
+The accumulator is not part of the dynamics it accumulates over, and `H(0) = 0` by
+definition. A `[scaling]` readout may read it — a readout cannot feed back — which is how
+you would report `H(t)` alongside the predictions.
+
+One case is declined more often than it strictly must be: an intermediate that reads time and
+is used *only* by the hazard (`TT = TIME` … `hazard = f(TT)`) still marks the block
+non-autonomous. Write the time term in the `hazard =` expression itself to avoid it.
+
 ::: {.callout-warning}
 ## Affects results from ferx 0.3.0 and earlier
 

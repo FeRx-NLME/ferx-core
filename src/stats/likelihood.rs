@@ -4195,9 +4195,11 @@ mod tests {
 
         // Same shape as the sibling, but the time dependence lives in the RHS and
         // the individual parameters are entirely time-independent. The hazard is
-        // deliberately time-independent too: the injected `d/dt(__chz_n)` line is
-        // part of `stmts_owned`, so a `TIME`-reading hazard would trip the wide
-        // predicate on its own and the test would no longer be about the PK RHS.
+        // deliberately time-independent too, so the only thing this fixture can be
+        // rejected *for* is the PK RHS. Since #1166 a `TIME`-reading hazard no
+        // longer trips the predicate at all — the injected `d/dt(__chz_n)` line is
+        // excluded from it — which is what `joint_pktte_share_admits_a_time_
+        // dependent_hazard` below pins from the other side.
         let src = r"
 [parameters]
   theta TVCL(1.0, 0.01, 100.0)
@@ -4276,5 +4278,175 @@ mod tests {
             nll.is_finite() && moved.is_finite() && (nll - moved).abs() > 1e-9,
             "fallback joint NLL must be finite and η-sensitive (nll={nll}, moved={moved})"
         );
+    }
+
+    /// A joint PK-TTE model, `{HAZ}` substituted. Autonomous PK block throughout —
+    /// the hazard is the only thing that ever reads time here.
+    #[cfg(feature = "survival")]
+    fn joint_time_hazard_src(haz: &str) -> String {
+        format!(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  theta TVH0(0.01, 1e-5, 10.0)
+  theta TVBETA(0.5, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  KA   = TVKA
+  H0   = TVH0
+  BETA = TVBETA
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+[event_model]
+  cmt    = 2
+  hazard = {haz}
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+"
+        )
+    }
+
+    /// #1166, the admission side: a Gompertz-shaped hazard — a hazard that reads
+    /// `TIME` by definition — on an autonomous PK block **takes** #570's single
+    /// shared solve.
+    ///
+    /// The sibling above pins the opposite direction (a `TAD`-reading PK RHS is
+    /// still rejected), so between them the gate is pinned from both sides and
+    /// neither "always admit" nor "always decline" survives.
+    #[test]
+    #[cfg(feature = "survival")]
+    fn joint_pktte_share_admits_a_time_dependent_hazard() {
+        use crate::parser::model_parser::parse_model_string;
+        use crate::types::{EventType, ObsRecord};
+
+        let model = parse_model_string(&joint_time_hazard_src(
+            "H0 * exp(0.05*TIME) * exp(BETA * (central / V))",
+        ))
+        .expect("Gompertz-in-TIME joint PK-TTE model must parse");
+
+        // The discriminating precondition: the *wide* flag still fires — the
+        // augmented program does read model time, and the SS gates must keep
+        // seeing that — while the predicate the share asks does not.
+        let prog = model
+            .ode_spec
+            .as_ref()
+            .and_then(|o| o.rhs_program.as_ref())
+            .expect("rhs program");
+        assert!(
+            prog.reads_model_time(),
+            "the augmented RHS does read model time (the SS gates' predicate)"
+        );
+        assert!(
+            !crate::pk::model_uses_time_anywhere(&model),
+            "…but the PK block does not, so the routing predicate must be false"
+        );
+
+        let mut subject = make_simple_subject();
+        subject.obs_records = vec![ObsRecord::Event {
+            time: 5.0,
+            event_type: EventType::Exact,
+            entry_time: 0.0,
+            cmt: 2,
+        }];
+        let p = &model.default_params;
+        assert!(
+            try_joint_pktte_shared_solve(&model, &subject, &p.theta, &[0.0]).is_some(),
+            "a time-dependent hazard on an autonomous PK block must take the \
+             #570 shared-solve path"
+        );
+    }
+
+    /// #1166, the routing oracle: two models that compute the **same arithmetic**
+    /// must land on the same engine, and therefore agree bit-for-bit.
+    ///
+    /// `* (1.0 + 0.0*TIME)` is the exact identity in IEEE arithmetic — `0.0*t` is
+    /// `0.0` for finite `t`, `1.0 + 0.0` is `1.0`, and `h * 1.0` is `h` — and the
+    /// RHS is interpreted bytecode, so nothing folds it away. Any difference in
+    /// the result is therefore a difference of *engine*, not of arithmetic: before
+    /// #1166 the flagged twin declined the shared solve and assembled the Gaussian
+    /// half on the event-driven walk, which agreed with the dense driver only to
+    /// solver tolerance (measured: 0 of 40 subjects bit-identical on the anchored
+    /// fixture, worst per-subject 3.25e-4 at ferx's default tolerances).
+    ///
+    /// A value test could not see this — both arms are correct to tolerance — and
+    /// a routing assertion alone could not either, since it would pass for a
+    /// predicate that admitted the *wrong* pair too. Bit-identity is the assertion
+    /// that is exactly as strong as the claim.
+    #[test]
+    #[cfg(feature = "survival")]
+    fn identical_arithmetic_takes_the_identical_engine_bit_for_bit() {
+        use crate::parser::model_parser::parse_model_string;
+        use crate::types::{EventType, ObsRecord};
+
+        // The pair must **straddle** the predicate under the old behaviour, or the
+        // test is vacuous: with a time-reading base hazard both twins would have
+        // been flagged, both would have declined, and they would agree bit-for-bit
+        // whether the fix is present or not. (Found by mutating the fix away and
+        // watching this test survive.) So the base hazard is autonomous and only
+        // the twin's identity factor reads time.
+        let plain = parse_model_string(&joint_time_hazard_src("H0 * exp(BETA * (central / V))"))
+            .expect("parse");
+        let twin = parse_model_string(&joint_time_hazard_src(
+            "H0 * exp(BETA * (central / V)) * (1.0 + 0.0*TIME)",
+        ))
+        .expect("parse");
+        // Pin the straddle itself, so a later predicate change that stopped the
+        // twin from being *flagged at all* would show up here rather than turning
+        // this back into a tautology.
+        let flagged = |m: &crate::types::CompiledModel| {
+            m.ode_spec
+                .as_ref()
+                .and_then(|o| o.rhs_program.as_ref())
+                .expect("rhs program")
+                .reads_model_time()
+        };
+        assert!(
+            !flagged(&plain) && flagged(&twin),
+            "the twin must trip the wide flag and the plain model must not — that \
+             difference is what the fix has to make invisible"
+        );
+
+        let mut subject = make_simple_subject();
+        subject.obs_records = vec![ObsRecord::Event {
+            time: 5.0,
+            event_type: EventType::Exact,
+            entry_time: 0.0,
+            cmt: 2,
+        }];
+        let p = &plain.default_params;
+        let q = &twin.default_params;
+
+        for eta in [0.0, 0.3, -0.25] {
+            let a = individual_nll(
+                &plain,
+                &subject,
+                &p.theta,
+                &[eta],
+                &p.omega,
+                &p.sigma.values,
+            );
+            let b = individual_nll(&twin, &subject, &q.theta, &[eta], &q.omega, &q.sigma.values);
+            assert!(
+                a.is_finite(),
+                "the fixture must produce a real objective (eta={eta}, nll={a})"
+            );
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "an arithmetically identical hazard must take the same engine \
+                 (eta={eta}, plain={a}, identity-twin={b}, delta={})",
+                a - b
+            );
+        }
     }
 }

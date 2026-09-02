@@ -258,6 +258,42 @@ the same augmented system at the typical values (its `mean_survival` is `NaN` �
 `∫₀^∞ S` summary for ODE hazards is a follow-up; `median_survival` is interpolated from
 the cumulative-hazard grid).
 
+### A time-dependent hazard keeps the single shared solve {#time-dependent-hazard}
+
+A Weibull or Gompertz baseline reads `TIME`, so the appended `d/dt(__chz_<cmt>)` line is
+time-dependent — but the PK block above it usually is not, and ferx now asks that
+question of the **PK equations alone**. Such a model gets both halves of the objective
+from one integration of the augmented system rather than two:
+
+```
+[event_model]
+  cmt    = 3
+  hazard = H0 * exp(GAM * TIME) * exp(BETA * (central / V))   # Gompertz × exposure
+```
+
+Writing `TIME` in a PK equation still splits the solve, which is correct: the two halves
+then genuinely need different treatment. `__chz_*` may not be read from `[odes]` or seeded
+with `init(...)` — see
+[the ODE-models page](../model-file/ode-models.qmd#chz-is-not-your-rhs).
+
+::: {.callout-note}
+## Affects run time from ferx 0.3.0 and earlier, not results
+
+Between [#1124](https://github.com/FeRx-NLME/ferx-core/issues/1124) and
+[#1166](https://github.com/FeRx-NLME/ferx-core/issues/1166) every joint model with a
+time-dependent hazard declined the shared solve and integrated twice per subject per
+objective evaluation. Measured on a 40-subject fixture, one variable: **2.1×** on a single
+objective evaluation and **2.6×** over eight outer iterations. The objective itself moved
+only at solver-tolerance scale (4.4e-3 OFV at default tolerances, decaying with the
+tolerance), so earlier results do not need re-running — they were merely slow.
+:::
+
+Validated against NONMEM: `nonmem_anchor/pktte_tdep.ctl` (`ADVAN13 TOL=9`, `$OMEGA 0 FIX`)
+on 40 subjects. At `ode_reltol = 1e-9` ferx's `H(t)` matches NONMEM's `A(3)` to 3.6e-9
+relative at every event record, and the per-subject objective matches the `.phi` `OBJ` to
+6.0e-8 absolute with **no** additive constant between the two conventions
+(`tests/pktte_tdep_nonmem_anchor.rs`).
+
 ### Simulating drug-driven event times
 
 `simulate()` draws event times from a drug-driven hazard by integrating the augmented
