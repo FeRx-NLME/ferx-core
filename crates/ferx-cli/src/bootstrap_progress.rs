@@ -30,6 +30,18 @@ pub struct BootstrapProgress {
     state: Mutex<State>,
 }
 
+/// Which pass the bar on screen is counting.
+///
+/// The two bars are told apart by this rather than by their counts, because a
+/// count cannot do it: `completed` is handed out by a `fetch_add` inside
+/// `par_iter`, so the event carrying 1 is not necessarily the first one
+/// delivered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Pass {
+    Replicates,
+    DeltaOfv,
+}
+
 #[derive(Default)]
 struct State {
     /// The base fit's spinner, live only while that fit runs.
@@ -37,9 +49,48 @@ struct State {
     /// The replicate bar, and then the Δofv bar. Only one is ever on screen:
     /// the Δofv pass starts after the last replicate is in.
     bar: Option<ProgressBar>,
+    /// Which pass `bar` is counting, or `None` when there is no bar.
+    pass: Option<Pass>,
     /// Replicates still to fit, as `Started` reported them - kept so the bar
     /// can be created when the base fit clears the screen rather than before.
     replicates: usize,
+}
+
+impl State {
+    /// Put a fresh bar for `pass` on screen, clearing whatever was there.
+    fn open(&mut self, pass: Pass, len: usize, unit: &str) {
+        if let Some(previous) = self.bar.take() {
+            previous.finish_and_clear();
+        }
+        self.bar = Some(bar(len, unit));
+        self.pass = Some(pass);
+    }
+
+    /// Step the bar for `pass`, if that is the one on screen.
+    ///
+    /// Never backwards. `completed` is produced by a `fetch_add` inside
+    /// `par_iter` and reported from whichever worker finished the fit, so 5 can
+    /// reach us before 4 - and a bar that steps back also skews indicatif's
+    /// `{eta}`, which it derives from the rate so far.
+    fn advance(&self, pass: Pass, completed: usize) {
+        if self.pass != Some(pass) {
+            return;
+        }
+        if let Some(bar) = &self.bar {
+            bar.set_position(bar.position().max(completed as u64));
+        }
+    }
+
+    /// Take the bar and the spinner off screen.
+    fn clear(&mut self) {
+        if let Some(spinner) = self.base.take() {
+            spinner.finish_and_clear();
+        }
+        if let Some(bar) = self.bar.take() {
+            bar.finish_and_clear();
+        }
+        self.pass = None;
+    }
 }
 
 impl BootstrapProgress {
@@ -81,7 +132,7 @@ impl BootstrapProgress {
                 if base_fit {
                     state.base = Some(spinner("fitting the base model"));
                 } else {
-                    state.bar = Some(bar(replicates, "replicates"));
+                    state.open(Pass::Replicates, replicates, "replicates");
                 }
             }
             BootstrapEvent::BaseFitDone => {
@@ -89,34 +140,26 @@ impl BootstrapProgress {
                     spinner.finish_and_clear();
                 }
                 let replicates = state.replicates;
-                state.bar = Some(bar(replicates, "replicates"));
+                state.open(Pass::Replicates, replicates, "replicates");
             }
             BootstrapEvent::ReplicateDone { completed, .. } => {
-                if let Some(bar) = &state.bar {
-                    bar.set_position(completed as u64);
-                }
+                state.advance(Pass::Replicates, completed);
             }
             BootstrapEvent::DeltaOfvDone { completed, total } => {
-                // The first Δofv event is where the replicate bar is done: the
-                // pass only starts once every replicate is in.
-                if completed == 1 || state.bar.is_none() {
-                    if let Some(previous) = state.bar.take() {
-                        previous.finish_and_clear();
-                    }
-                    state.bar = Some(bar(total, "delta-OFV evaluations"));
+                // Any Δofv event is where the replicate bar is done: the pass
+                // only starts once every replicate is in. Which one arrives
+                // first is not known - the evaluations are handed their count by
+                // a `fetch_add` inside `par_iter` and report from whichever
+                // worker finished - so the swap keys on the pass rather than on
+                // `completed == 1`, which would leave the first evaluations
+                // drawn onto the replicate bar and then restart the Δofv bar
+                // under them.
+                if state.pass != Some(Pass::DeltaOfv) {
+                    state.open(Pass::DeltaOfv, total, "delta-OFV evaluations");
                 }
-                if let Some(bar) = &state.bar {
-                    bar.set_position(completed as u64);
-                }
+                state.advance(Pass::DeltaOfv, completed);
             }
-            BootstrapEvent::Finished => {
-                if let Some(spinner) = state.base.take() {
-                    spinner.finish_and_clear();
-                }
-                if let Some(bar) = state.bar.take() {
-                    bar.finish_and_clear();
-                }
-            }
+            BootstrapEvent::Finished => state.clear(),
         }
     }
 }
@@ -220,6 +263,59 @@ mod tests {
             total: 2,
         });
         assert_eq!(positions(&progress), Some(2));
+    }
+
+    #[test]
+    fn the_delta_ofv_bar_appears_whichever_evaluation_reports_first() {
+        // The evaluations take their `completed` from a `fetch_add` inside
+        // `par_iter` and report from whichever worker finished, so the event
+        // carrying 1 need not arrive first. Keying the swap on `completed == 1`
+        // drew these onto the replicate bar and then restarted under them.
+        // A resumed run, so the two passes have different lengths: 4 replicates
+        // left to fit, but the Δofv sweep covers all 6 including the reused.
+        let progress = BootstrapProgress::new(true);
+        progress.on_event(BootstrapEvent::Started {
+            replicates: 4,
+            reused: 2,
+            base_fit: false,
+        });
+        progress.on_event(BootstrapEvent::ReplicateDone {
+            completed: 4,
+            total: 4,
+        });
+
+        progress.on_event(BootstrapEvent::DeltaOfvDone {
+            completed: 3,
+            total: 6,
+        });
+        let state = progress.state.lock().expect("not poisoned");
+        assert_eq!(state.pass, Some(Pass::DeltaOfv));
+        // The Δofv bar, at 3 of 6 - not the replicate bar carried on past its
+        // end, which would have shown 3 of 4 under the wrong label and then
+        // been thrown away when `completed == 1` turned up.
+        let bar = state.bar.as_ref().expect("a bar");
+        assert_eq!(bar.position(), 3);
+        assert_eq!(bar.length(), Some(6));
+    }
+
+    #[test]
+    fn a_late_completion_does_not_step_the_bar_backwards() {
+        let progress = BootstrapProgress::new(true);
+        progress.on_event(BootstrapEvent::Started {
+            replicates: 8,
+            reused: 0,
+            base_fit: false,
+        });
+        progress.on_event(BootstrapEvent::ReplicateDone {
+            completed: 5,
+            total: 8,
+        });
+        // Worker A finished fourth but reported after worker B finished fifth.
+        progress.on_event(BootstrapEvent::ReplicateDone {
+            completed: 4,
+            total: 8,
+        });
+        assert_eq!(positions(&progress), Some(5));
     }
 
     #[test]

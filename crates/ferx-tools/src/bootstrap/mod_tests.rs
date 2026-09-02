@@ -860,6 +860,59 @@ fn a_run_reports_its_fits_in_order() {
     );
 }
 
+/// A run that fails after it has announced itself still reports `Finished`.
+///
+/// A sink told that a run started and never told it ended leaves its bar on the
+/// terminal, over the error the caller is about to print. `--dofv` without a
+/// base fit is the cheapest way in: it passes `validate()` and fails at the
+/// reference OFV, after `Started` and after every replicate is in.
+#[test]
+fn a_failed_run_still_reports_that_it_finished() {
+    let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let prepared = ferx_core::prepare_run(
+        repo.join("examples/warfarin.ferx").to_str().unwrap(),
+        Some(repo.join("data/warfarin.csv").to_str().unwrap()),
+    )
+    .expect("warfarin loads");
+    let options = BootstrapOptions {
+        samples: 1,
+        seed: 5,
+        threads: Some(1),
+        dofv: true,
+        run_base_model: false,
+        update_inits: false,
+        ..BootstrapOptions::default()
+    };
+
+    let events = std::sync::Mutex::new(Vec::new());
+    let sink = |event| events.lock().expect("not poisoned").push(event);
+    let err = run_bootstrap_with_progress(&prepared, &options, Some(&sink))
+        .expect_err("--dofv needs a base fit");
+    assert!(err.contains("--dofv"), "{err}");
+
+    let events = events.into_inner().expect("not poisoned");
+    assert_eq!(
+        events.first(),
+        Some(&BootstrapEvent::Started {
+            replicates: 1,
+            reused: 0,
+            base_fit: false,
+        }),
+        "{events:?}"
+    );
+    assert_eq!(events.last(), Some(&BootstrapEvent::Finished), "{events:?}");
+    // Exactly one, whichever way the run leaves: the guard emits on the way
+    // out, and the success path disarms it by emitting first.
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| **e == BootstrapEvent::Finished)
+            .count(),
+        1,
+        "{events:?}"
+    );
+}
+
 /// A run with no sink is the same run. Nothing about the draws or the fits may
 /// depend on whether a bar was being drawn, so the two results have to agree
 /// down to the estimate.

@@ -71,8 +71,10 @@ pub enum BootstrapEvent {
     /// it counts separately instead of silently extending the first bar past
     /// what it promised.
     DeltaOfvDone { completed: usize, total: usize },
-    /// Every fit is done. The summary and the CSV artefacts still follow, and
-    /// on a large run those are not instant.
+    /// The run is over. Emitted after the last fit on a run that succeeds, and
+    /// on the way out of one that fails, so a sink that has seen `Started` is
+    /// always told where to stop. On success the summary and the CSV artefacts
+    /// still follow, and on a large run those are not instant.
     Finished,
 }
 
@@ -83,6 +85,44 @@ pub enum BootstrapEvent {
 /// carry its own synchronisation (an `AtomicUsize`, a `Mutex`), and the event's
 /// `completed` field is there so that most sinks need neither.
 pub type ProgressFn<'a> = &'a (dyn Fn(BootstrapEvent) + Send + Sync);
+
+/// Emits [`BootstrapEvent::Finished`] however the run leaves.
+///
+/// A dozen `?`s sit between [`BootstrapEvent::Started`] and the end of the
+/// fits: the journal, the base fit, the Δofv reference. A renderer told that a
+/// run started and never told it ended leaves its bar on screen, on top of the
+/// error the caller is about to print. [`FinishGuard::finish`] is the success
+/// path, reporting the end of the fits where it actually is (before the summary
+/// and the artefacts); the `Drop` is every other path. Exactly one of the two
+/// emits.
+struct FinishGuard<'a> {
+    progress: Option<ProgressFn<'a>>,
+    pending: bool,
+}
+
+impl<'a> FinishGuard<'a> {
+    fn new(progress: Option<ProgressFn<'a>>) -> Self {
+        Self {
+            progress,
+            pending: true,
+        }
+    }
+
+    fn finish(&mut self) {
+        if !std::mem::replace(&mut self.pending, false) {
+            return;
+        }
+        if let Some(sink) = self.progress {
+            sink(BootstrapEvent::Finished);
+        }
+    }
+}
+
+impl Drop for FinishGuard<'_> {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
 
 /// Everything the bootstrap needs beyond the model and data themselves.
 ///
@@ -778,6 +818,9 @@ pub fn run_bootstrap_with_progress(
         reused: n_reused,
         base_fit: options.run_base_model && reused_original.is_none(),
     });
+    // The run has announced itself, so from here it owes a `Finished` whichever
+    // way it leaves.
+    let mut finish = FinishGuard::new(progress);
 
     // ── the incremental journal ─────────────────────────────────────────────
     // Opened before the first fit so that a kill at any point from here on
@@ -952,7 +995,7 @@ pub fn run_bootstrap_with_progress(
             progress,
         )?;
     }
-    emit(BootstrapEvent::Finished);
+    finish.finish();
 
     let n_estimated_parameters = count_estimated(template);
     let summary = summary::summarize(&names, original.as_ref(), &replicates, options);
