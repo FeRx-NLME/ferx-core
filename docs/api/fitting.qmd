@@ -87,6 +87,77 @@ pub fn run_model_simulate(
 
 Requires a `[simulation]` block in the model file.
 
+## Running many fits
+
+A tool that runs hundreds of fits (bootstrap, SCM, model search) has two things
+to get right that a single interactive fit does not: how the thread budget is
+split, and how much each fit prints.
+
+### Splitting the thread budget (`PoolPlan`)
+
+`fit()` already parallelises over subjects, so a naive outer `par_iter` over
+replicates nests one Rayon pool on top of another and the two levels compete
+for the same workers. `PoolPlan` makes the split explicit and builds the outer
+pool correctly:
+
+```rust
+use ferx_core::{fit, FitOptions, PoolPlan};
+
+// 200 replicates on an 8-thread budget: 8 fits at a time, each single-threaded.
+let plan = PoolPlan::from_budget(8, 200);
+assert_eq!((plan.replicates(), plan.threads_per_fit()), (8, 1));
+
+let mut options = FitOptions::default().quiet();
+plan.apply_to(&mut options);          // sets FitOptions::threads
+
+let results: Vec<_> = plan.install(|| {
+    use rayon::prelude::*;
+    (0..200).into_par_iter().map(|_i| fit(&model, &population, &init, &options)).collect()
+})?;
+```
+
+The budget is spent on the outer level first, because replicate-level
+parallelism is embarrassingly parallel while the per-subject level synchronises
+every iteration:
+
+```text
+replicates      = min(total_threads, n_units)     (at least 1)
+threads_per_fit = total_threads / replicates      (at least 1, floored)
+```
+
+So `from_budget(8, 200)` is `8 x 1`, `from_budget(8, 2)` is `2 x 4`, and
+`from_budget(8, 3)` is `3 x 2` — the division floors rather than
+oversubscribing. `total_threads = 0` means the engine default (available cores
+minus one, capped at 8); both levels are always at least 1, so a plan never
+silently means "let Rayon decide".
+
+`PoolPlan::install()` is the part you should not hand-roll. ferx builds its own
+pools with a 32 MiB worker stack (`FIT_RAYON_STACK_SIZE`) because wide ODE+IOV
+analytic-gradient models overflow the platform-default 2 MiB Rayon stack. An
+outer pool built from a bare `rayon::ThreadPoolBuilder::new()` inherits that
+default and faults on exactly the models that need the bigger stack — and only
+under a tool, where nothing else looks.
+
+With `threads_per_fit == 1`, `apply_to()` gives the documented single-threaded
+inner mode: the fit runs its per-subject loops on a one-worker pool and reports
+`n_threads_used == 1`. Estimates do not depend on the thread count — the
+per-subject likelihood is reduced in subject order — so a replicate fitted on
+one thread is bit-identical to the same replicate fitted on four.
+
+### Quiet fits
+
+`FitOptions::verbose` defaults to `true`, which suits one interactive fit and is
+unusable for 200 of them. `FitOptions::quiet()` turns it off:
+
+```rust
+let options = FitOptions { outer_maxiter: 200, ..Default::default() }.quiet();
+```
+
+A quiet fit writes nothing to stdout or stderr. Nothing is lost: every non-fatal
+message the engine produces goes into `FitResult::warnings` (and
+`warnings_structured`) regardless of `verbose`, so the tool reads them off each
+result and prints its own one-line-per-replicate progress instead.
+
 ## `build_fit_inputs()`
 
 Extract initial parameters and fit options from a parsed model, separating parsing from estimation for timing purposes.

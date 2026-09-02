@@ -42,7 +42,7 @@ use std::time::Instant;
 /// of them at once. Rayon/default pthread stacks can be as small as 2 MiB on macOS,
 /// which overflows before Rust can unwind. Use a larger fit-scoped stack for Rayon
 /// workers that may evaluate these gradients.
-pub(crate) const FIT_RAYON_STACK_SIZE: usize = 32 * 1024 * 1024;
+pub const FIT_RAYON_STACK_SIZE: usize = 32 * 1024 * 1024;
 
 pub(crate) fn fit_thread_pool_builder() -> rayon::ThreadPoolBuilder {
     rayon::ThreadPoolBuilder::new().stack_size(FIT_RAYON_STACK_SIZE)
@@ -126,15 +126,194 @@ pub(crate) fn build_fit_pool(n_threads: usize) -> Result<rayon::ThreadPool, Stri
 pub(crate) fn default_fit_pool() -> Option<&'static rayon::ThreadPool> {
     static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
-        let n_threads = if GLOBAL_THREADS_EXPLICIT.load(std::sync::atomic::Ordering::Acquire) {
-            rayon::current_num_threads()
-        } else {
-            default_thread_count()
-        };
         fit_thread_pool_builder()
-            .num_threads(n_threads)
+            .num_threads(effective_default_threads())
             .build()
             .ok()
     })
     .as_ref()
 }
+
+/// The thread count an unpinned `fit()` actually runs on: the explicitly configured
+/// process-wide width when the CLI called [`configure_global_thread_pool`], otherwise the
+/// capped [`default_thread_count`] (#707).
+///
+/// [`default_fit_pool`] sizes itself with this, and [`PoolPlan::from_budget`] resolves a
+/// `total_threads = 0` budget with it — the two must agree, or a `from_budget(0, …)` plan
+/// would silently disagree with the pool an unpinned fit uses (#1115).
+pub(crate) fn effective_default_threads() -> usize {
+    if GLOBAL_THREADS_EXPLICIT.load(std::sync::atomic::Ordering::Acquire) {
+        rayon::current_num_threads()
+    } else {
+        default_thread_count()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Nested-pool planning for tools that run many fits (#1115)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// How a total thread budget is split between the two levels of parallelism a
+/// many-fit tool (bootstrap, SCM, model search) has available.
+///
+/// `fit()` already `par_iter`s over subjects, so a tool that naively `par_iter`s
+/// over replicates nests one pool on top of another and the two levels compete
+/// for the same workers. A `PoolPlan` makes the split explicit:
+///
+/// * [`replicates`](Self::replicates) — width of the **outer** pool, i.e. how
+///   many fits run concurrently;
+/// * [`threads_per_fit`](Self::threads_per_fit) — what each inner `fit()` gets,
+///   applied via [`apply_to`](Self::apply_to) (which sets `FitOptions::threads`).
+///
+/// Both are always ≥ 1, so a plan can never silently mean "let Rayon decide".
+///
+/// The outer pool is built by [`install`](Self::install) with the ferx worker
+/// stack ([`FIT_RAYON_STACK_SIZE`]), **not** the platform default: wide ODE+IOV
+/// analytic-gradient models overflow a stock 2 MiB Rayon worker stack, and an
+/// outer pool built from a bare `rayon::ThreadPoolBuilder::new()` would inherit
+/// that default and fault on exactly the models that need the bigger stack.
+/// Using this type is how a tool gets the right stack without remembering to.
+///
+/// ```no_run
+/// use ferx_core::{FitOptions, PoolPlan};
+///
+/// // 200 bootstrap replicates over an 8-thread budget: 8 fits at a time,
+/// // each single-threaded (replicate-level parallelism is the better axis —
+/// // embarrassingly parallel, no per-subject synchronisation).
+/// let plan = PoolPlan::from_budget(8, 200);
+/// assert_eq!((plan.replicates(), plan.threads_per_fit()), (8, 1));
+///
+/// let mut opts = FitOptions::default().quiet();
+/// plan.apply_to(&mut opts);
+/// # let run_one = |_i: usize| ();
+/// plan.install(|| {
+///     use rayon::prelude::*;
+///     (0..200usize).into_par_iter().for_each(run_one);
+/// })
+/// .expect("outer pool");
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PoolPlan {
+    replicates: usize,
+    threads_per_fit: usize,
+}
+
+impl PoolPlan {
+    /// A plan with an explicit split. Both arguments are clamped to at least 1,
+    /// since `0` would mean "Rayon picks" — the ambiguity this type exists to
+    /// remove.
+    pub fn new(replicates: usize, threads_per_fit: usize) -> Self {
+        Self {
+            replicates: replicates.max(1),
+            threads_per_fit: threads_per_fit.max(1),
+        }
+    }
+
+    /// Split `total_threads` across `n_units` fits, spending the budget on the
+    /// **outer** level first:
+    ///
+    /// ```text
+    /// replicates      = min(total_threads, n_units)     (at least 1)
+    /// threads_per_fit = total_threads / replicates      (at least 1, floored)
+    /// ```
+    ///
+    /// So a 200-replicate bootstrap on 8 threads runs 8 single-threaded fits at
+    /// a time, while a 2-replicate run on the same budget gives each fit 4
+    /// subject-level workers. The division floors: 8 threads over 3 units is
+    /// `3 × 2`, leaving two threads unused rather than oversubscribing.
+    ///
+    /// `total_threads = 0` means "the engine default" — whatever an unpinned
+    /// `fit()` would run on, which is available-cores-minus-one capped at 8
+    /// unless a CLI sized the process-wide pool via
+    /// [`configure_global_thread_pool`], in which case that explicit width wins.
+    /// `n_units = 0` yields a single-replicate plan.
+    pub fn from_budget(total_threads: usize, n_units: usize) -> Self {
+        let total = if total_threads == 0 {
+            effective_default_threads()
+        } else {
+            total_threads
+        };
+        let replicates = total.min(n_units).max(1);
+        Self::new(replicates, total / replicates)
+    }
+
+    /// Width of the outer pool: how many fits run concurrently.
+    pub fn replicates(&self) -> usize {
+        self.replicates
+    }
+
+    /// Subject-level worker threads handed to each inner `fit()`.
+    pub fn threads_per_fit(&self) -> usize {
+        self.threads_per_fit
+    }
+
+    /// Worker threads in flight when every replicate is running:
+    /// `replicates * threads_per_fit`, saturating rather than overflowing on an
+    /// absurd hand-built plan.
+    ///
+    /// This counts the workers doing the fitting. Each replicate additionally
+    /// *blocks* one outer worker while its inner pool runs, so the live OS
+    /// thread count is `replicates + total_threads()`, each reserving
+    /// [`FIT_RAYON_STACK_SIZE`] of stack address space — see
+    /// [`apply_to`](Self::apply_to).
+    pub fn total_threads(&self) -> usize {
+        self.replicates.saturating_mul(self.threads_per_fit)
+    }
+
+    /// Worker-stack size of the outer pool [`install`](Self::install) builds —
+    /// always [`FIT_RAYON_STACK_SIZE`], never the platform default.
+    pub fn worker_stack_size(&self) -> usize {
+        FIT_RAYON_STACK_SIZE
+    }
+
+    /// Pin the inner fit's subject-level parallelism to
+    /// [`threads_per_fit`](Self::threads_per_fit) by setting
+    /// `FitOptions::threads`.
+    ///
+    /// With `threads_per_fit == 1` this is the documented single-threaded inner
+    /// mode: `fit()` runs its per-subject loops on a one-worker pool, so no
+    /// subject-level fan-out competes with the outer replicate loop, and the
+    /// resulting `FitResult::n_threads_used` is `1`.
+    ///
+    /// The pin is an upper bound on the whole `fit()` call, `n_starts > 1`
+    /// included: a multi-start fit runs its start fan-out and the per-subject
+    /// loops underneath it on the *same* pinned pool, so a plan's budget is not
+    /// multiplied by `n_starts` behind the caller's back.
+    ///
+    /// The inner pool is a real Rayon pool even at width 1, and the outer worker
+    /// that entered it stays blocked meanwhile — so `replicates` plan-wide costs
+    /// `replicates` blocked threads on top of [`total_threads`](Self::total_threads)
+    /// live workers, each reserving [`FIT_RAYON_STACK_SIZE`] of stack. Running the
+    /// inner fit inline on the outer pool instead would be cheaper but wrong: the
+    /// per-subject `par_iter` would then fan out over the *outer* pool's
+    /// `replicates` workers, which is exactly the nesting the pin removes.
+    pub fn apply_to(&self, options: &mut FitOptions) {
+        options.threads = Some(self.threads_per_fit);
+    }
+
+    /// Run `op` on an outer Rayon pool of [`replicates`](Self::replicates)
+    /// workers, each with the ferx worker stack ([`FIT_RAYON_STACK_SIZE`]).
+    ///
+    /// Any `par_iter` inside `op` fans out over that pool. Returns `Err` if the
+    /// pool cannot be built (e.g. resource limits).
+    pub fn install<R, OP>(&self, op: OP) -> Result<R, String>
+    where
+        OP: FnOnce() -> R + Send,
+        R: Send,
+    {
+        Ok(build_fit_pool(self.replicates)?.install(op))
+    }
+}
+
+impl Default for PoolPlan {
+    /// The engine's default budget spread entirely over the outer level:
+    /// `from_budget(0, usize::MAX)`, i.e. one single-threaded fit per default
+    /// worker thread.
+    fn default() -> Self {
+        Self::from_budget(0, usize::MAX)
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/pool_plan_tests.rs"]
+mod pool_plan_tests;

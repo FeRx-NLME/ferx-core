@@ -7344,6 +7344,24 @@ pub enum ViKl {
 }
 
 impl FitOptions {
+    /// Silence this fit's per-iteration console output (`verbose = false`).
+    ///
+    /// `verbose` defaults to `true`, which suits one interactive fit and is
+    /// unusable for a tool running hundreds of them (#1115). Every non-fatal
+    /// message the engine produces is collected into `FitResult::warnings`
+    /// rather than written to stderr, so a quiet fit loses no information — the
+    /// caller reads the warnings off the result and prints its own one-line-per-
+    /// replicate progress instead.
+    ///
+    /// ```
+    /// use ferx_core::FitOptions;
+    /// assert!(!FitOptions::default().quiet().verbose);
+    /// ```
+    pub fn quiet(mut self) -> Self {
+        self.verbose = false;
+        self
+    }
+
     /// Returns the sequence of methods to execute. If `methods` is non-empty it
     /// is returned as-is; otherwise a single-element chain wrapping `method`.
     pub fn method_chain(&self) -> Vec<EstimationMethod> {
