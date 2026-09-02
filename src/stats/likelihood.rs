@@ -3826,6 +3826,236 @@ mod tests {
         );
     }
 
+    /// #1187, at the objective: the joint PK-TTE hazard has **two** production routes and
+    /// they resolve infusions differently.
+    ///
+    /// Arm A is the #570 shared single solve (`ode_predictions_and_chz` →
+    /// `integrate_segment` → `active_infusions`). Arm B is the established two-solve
+    /// fallback (`tte_endpoint_nll` → `ode_cumhaz_hazard` → `ode_dense_solve_states` →
+    /// `gated_infusions`). Only arm B resolved through the unguarded helper, so for a PK
+    /// block with a **built-in absorption forcing fed by a `RATE>0` dose** the two arms
+    /// integrated different drug exposures and produced different cumulative hazards —
+    /// a wrong *objective*, not just a wrong diagnostic.
+    ///
+    /// The pairing matters beyond this bug: `model_uses_time_anywhere` (#1166) decides
+    /// which arm a time-dependent-hazard model takes, so a divergence here is reachable
+    /// by a routing change alone. Pinning A ≡ B is what makes that routing safe.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn joint_pktte_hazard_arms_agree_for_infusion_into_absorption() {
+        use crate::parser::model_parser::parse_model_string;
+        use crate::types::{DoseEvent, EventType, ObsRecord};
+
+        // `first_order(ka=KA)` puts the absorption kernel *in* central (no depot state),
+        // so CMT 1 is the input-rate compartment and a `RATE>0` dose there is #719 gap 2.
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  theta TVH0(0.01, 1e-5, 10.0)
+  theta TVBETA(0.5, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  KA   = TVKA
+  H0   = TVH0
+  BETA = TVBETA
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA) - (CL/V) * central
+[event_model]
+  cmt    = 2
+  hazard = H0 * exp(BETA * (central / V))
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+";
+        let model = parse_model_string(src).expect("joint PK-TTE model must parse");
+        let mut subject = make_simple_subject();
+        // Replace the bolus with an infusion into the input-rate compartment. This is the
+        // one input that matters — with a bolus both arms already agree.
+        let amt = subject.doses[0].amt;
+        subject.doses = vec![DoseEvent::new(0.0, amt, 1, amt / 2.0, false, 0.0)];
+        assert!(
+            subject.doses[0].is_infusion(),
+            "fixture must carry a real infusion or it tests nothing"
+        );
+        subject.obs_records = vec![ObsRecord::Event {
+            time: 5.0,
+            event_type: EventType::Exact,
+            entry_time: 0.0,
+            cmt: 2,
+        }];
+
+        let p = &model.default_params;
+        let eta_nz = [0.3_f64]; // non-zero, so the PK trajectory (hence the hazard) is non-trivial
+
+        let share = try_joint_pktte_shared_solve(&model, &subject, &p.theta, &eta_nz)
+            .expect("joint ODE PK-TTE model must qualify for the #570 shared solve");
+        let (chz_state, hazard) = match model.endpoints.get(&2) {
+            Some(EndpointLikelihood::Tte {
+                hazard: h @ HazardSpec::OdeAccumulated { chz_state },
+                ..
+            }) => (*chz_state, h),
+            _ => panic!("expected an OdeAccumulated TTE endpoint on CMT 2"),
+        };
+        let arm_a = tte_ode_nll_from_shared(
+            model.ode_spec.as_ref().unwrap(),
+            &share,
+            chz_state,
+            &subject.obs_records,
+        );
+        let arm_b = tte_endpoint_nll(
+            &model,
+            &subject,
+            hazard,
+            crate::types::TteRecurrence::Single,
+            &subject.obs_records,
+            &p.theta,
+            &eta_nz,
+        );
+        assert!(
+            arm_a.is_finite() && arm_b.is_finite(),
+            "both hazard arms must be finite (A={arm_a}, B={arm_b})"
+        );
+        // Non-degeneracy: a hazard that never left its baseline would agree for the wrong
+        // reason. `H0·t = 0.01·5 = 0.05` is the drug-free cumulative hazard; the drug must
+        // have moved the TTE term well away from it.
+        let drug_free = -(-0.05_f64).exp().ln() - (0.01_f64).ln();
+        assert!(
+            (arm_b - drug_free).abs() > 1e-2,
+            "TTE term {arm_b} sits at its drug-free value {drug_free} — the infusion is not \
+             reaching the hazard, so the arms would agree vacuously"
+        );
+        assert!(
+            (arm_a - arm_b).abs() <= 1e-4 * arm_b.abs().max(1.0),
+            "joint PK-TTE hazard arms disagree: shared solve {arm_a} vs dedicated {arm_b} \
+             (#1187 — the dedicated arm resolves infusions through `gated_infusions`)"
+        );
+    }
+
+    /// #1187 external anchor: the joint PK-TTE **cumulative hazard** under a `RATE>0` dose
+    /// into a built-in absorption compartment, against NONMEM 7.6.0.
+    ///
+    /// [`joint_pktte_hazard_arms_agree_for_infusion_into_absorption`] pins the two ferx arms
+    /// to each other; two engines agreeing is not evidence that either is right, so this
+    /// pins them to a tool that has no such split — NONMEM integrates the augmented system
+    /// once. `A(3)` (the CHZ compartment) is compared rather than the OFV: a likelihood
+    /// model (`F_FLAG=1`) carries different additive constants in the two tools, while the
+    /// cumulative hazard is constant-free.
+    ///
+    /// Reference: `nonmem_anchor/pktte_inf.{ctl,csv}` — `ADVAN13 TOL=9`, explicit
+    /// `DEPOT/CENTRAL/CHZ` compartments, `MAXEVAL=0 POSTHOC`, every `THETA FIX` and
+    /// `$OMEGA 0 FIX` so both tools evaluate at `eta = 0`. NONMEM's zero-order fill of an
+    /// explicit depot followed by first-order `KA` is exactly what ferx's `first_order()`
+    /// kernel plus the `R_in_inf` convolution reproduces — the equivalence already anchored
+    /// by `tests/infusion_absorption_nonmem_anchor.rs`.
+    ///
+    /// Measured: before the fix the dedicated arm read `H(1.86) = 3.796844e0` against
+    /// NONMEM's `1.2217e-1` — **31×** — while the shared arm was already correct. The
+    /// hazard is exponential in concentration (`H0·exp(BETA·C)`), so the doubled input
+    /// rate compounds rather than scaling linearly.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn joint_pktte_cumulative_hazard_matches_nonmem_for_infusion_into_absorption() {
+        use crate::parser::model_parser::parse_model_string;
+        use crate::types::{DoseEvent, EventType, ObsRecord};
+
+        // Mirrors `nonmem_anchor/pktte_inf.ctl`: CL=1, V=10, KA=1, H0=0.02, BETA=0.5.
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  theta TVH0(0.02, 1e-5, 10.0)
+  theta TVBETA(0.5, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  KA   = TVKA
+  H0   = TVH0
+  BETA = TVBETA
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA) - (CL/V) * central
+[event_model]
+  cmt    = 2
+  hazard = H0 * exp(BETA * (central / V))
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  ode_reltol = 1e-10
+  ode_abstol = 1e-10
+";
+        let model = parse_model_string(src).expect("joint PK-TTE model must parse");
+
+        // The NONMEM dataset, row for row: AMT=100 RATE=50 into CMT 1 (T = 2 h), PK
+        // observations at 0.5…18, and the exact event at t = 1.86.
+        let mut subject = make_simple_subject();
+        subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0)];
+        assert!(
+            subject.doses[0].is_infusion(),
+            "fixture must carry a real infusion or it tests nothing"
+        );
+        subject.obs_times = vec![0.5, 1.0, 2.0, 4.0, 6.0, 8.0, 12.0, 18.0];
+        subject.observations = vec![
+            4.6271, 6.2626, 7.1063, 8.0446, 6.3602, 4.8718, 3.6207, 2.0972,
+        ];
+        subject.obs_cmts = vec![1; 8];
+        subject.cens = vec![0; 8];
+        subject.occasions = vec![1; 8];
+        subject.obs_records = vec![ObsRecord::Event {
+            time: 1.86,
+            event_type: EventType::Exact,
+            entry_time: 0.0,
+            cmt: 2,
+        }];
+
+        let theta = &model.default_params.theta;
+        let eta = [0.0_f64]; // $OMEGA 0 FIX on the NONMEM side
+
+        let chz_state = match model.endpoints.get(&2) {
+            Some(EndpointLikelihood::Tte {
+                hazard: HazardSpec::OdeAccumulated { chz_state },
+                ..
+            }) => *chz_state,
+            _ => panic!("expected an OdeAccumulated TTE endpoint on CMT 2"),
+        };
+
+        // NONMEM 7.6.0, `pktte_inf.tab`: CHZ at TIME = 1.86 (5 significant figures).
+        const NONMEM_CHZ_AT_EVENT: f64 = 1.2217e-1;
+
+        // Arm B — the two-solve fallback, i.e. the arm that carried the defect.
+        let (cum_dedicated, _haz) =
+            crate::survival::ode_cumhaz_hazard(&model, &subject, chz_state, theta, &eta, &[1.86]);
+        // Arm A — the #570 shared single solve.
+        let share = try_joint_pktte_shared_solve(&model, &subject, theta, &eta)
+            .expect("joint ODE PK-TTE model must qualify for the #570 shared solve");
+        assert_eq!(share.times, vec![1.86], "share must cover the event time");
+        let cum_shared = share.chz_states[0][chz_state];
+
+        for (arm, got) in [
+            ("dedicated (ode_cumhaz_hazard)", cum_dedicated[0]),
+            ("shared (#570)", cum_shared),
+        ] {
+            let rel = (got - NONMEM_CHZ_AT_EVENT).abs() / NONMEM_CHZ_AT_EVENT;
+            assert!(
+                rel < 1e-4,
+                "H(1.86) on the {arm} arm: ferx {got:.6e} vs NONMEM \
+                 {NONMEM_CHZ_AT_EVENT:.6e} (rel {rel:.2e})"
+            );
+        }
+    }
+
     /// #570 guard regression (found by an independent review of #613): a joint PK-TTE
     /// model whose `[individual_parameters]` references the `TIME` built-in must NOT
     /// take the shared single-solve path. The standalone prediction path routes such a

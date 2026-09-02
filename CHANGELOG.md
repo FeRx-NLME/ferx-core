@@ -184,6 +184,18 @@ section of the SDLC for the versioning policy).
   top of them, so a tool and the CLI cannot diverge in how a model is loaded.
 
 ### Fixed
+- **An infusion into a built-in absorption compartment is no longer delivered twice on the
+  dense/states engines (#1187).** With a `RATE>0` or `RATE=-2` dose into a `first_order()`,
+  `transit()`, `igd()` or `weibull()` kernel (#719 gap 2), the mass was released *both* through
+  the convolved `R_in_inf` and again as a plain constant rate injected straight into the
+  compartment — bypassing absorption entirely. `predict()` was correct throughout; what was
+  wrong is everything routed through the dense engines: sdtab `IPRED` and compartment states,
+  `[derived]` grid integrals, `simulate()` event times, and — as a wrong *objective*, not just a
+  wrong diagnostic — the joint PK-TTE cumulative hazard and the Markov/CTMM likelihood. Measured
+  against NONMEM 7.6.0: the cumulative hazard at the event time read **31× high**
+  (`3.796844` vs `1.2217e-1`), and a concentration readout up to **214×** during the infusion
+  window, settling near 1.9× afterwards. Models without an infusion into an absorption
+  compartment are unaffected, and no estimate on the corrected path changes.
 - **The docs linter no longer reads a Quarto callout title as a section boundary (#1190).**
   Pandoc lifts the heading that opens a `::: {.callout-*}` block into the callout header, so the
   rendered page gets neither a section nor an anchor from it — but `docs-lint` counted all 37 of

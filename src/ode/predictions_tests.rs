@@ -4590,6 +4590,267 @@ fn duration_defined_infusion_into_first_order_absorption_matches_subdose_train()
     }
 }
 
+// ── #1187: `gated_infusions` must drop what `active_infusions` drops ─────────
+//
+// The `InfusionInput::Gated` arm feeds the same `wrap_rhs_with_forcings` seam as the
+// `Spanning` arm, which adds the resolved `+rate` *alongside* the convolved `R_in_inf`.
+// Without the input-rate suppression the mass is delivered twice on every gated engine
+// (`ode_predictions_with_states`, `ode_dense_solve_states`, `ode_solve_until_chz_threshold`)
+// while `ode_predictions` — which resolves through `active_infusions` — stays correct.
+
+/// The helper itself: an infusion into a forcing compartment is dropped, one into any
+/// other compartment is kept, and an empty forcing slice keeps everything (`ode/ekf.rs`
+/// passes `&[]` because it never applies the forcing).
+#[test]
+fn gated_infusions_suppresses_infusion_into_input_rate_cmt() {
+    // Two infusions: CMT 1 (≡ state 0, the forcing compartment) and CMT 2 (≡ state 1).
+    let doses = vec![
+        DoseEvent::new(0.0, 0.0, 1, 4.0, false, 0.0),
+        DoseEvent::new(0.0, 0.0, 2, 7.0, false, 0.0),
+    ];
+    let f_bio = vec![1.0, 1.0];
+    let active = vec![(0usize, 1.0, 3.0), (1usize, 1.0, 3.0)];
+    let forcing = transit_one_cpt_oral_spec().input_rate; // forcing on state 0
+
+    // No forcing applied → both plain `+rate` injections are kept.
+    assert_eq!(
+        gated_infusions(&[], &active, &doses, &f_bio, 2),
+        vec![(0usize, 4.0, 1.0, 3.0), (1usize, 7.0, 1.0, 3.0)]
+    );
+    // Forcing on state 0 → only the CMT-2 infusion survives; the CMT-1 mass arrives
+    // through `R_in_inf` instead.
+    assert_eq!(
+        gated_infusions(&forcing, &active, &doses, &f_bio, 2),
+        vec![(1usize, 7.0, 1.0, 3.0)]
+    );
+}
+
+/// Mass balance, with no integrator in the oracle: `transit_accumulator_spec` has
+/// `dy = 0`, so its single state *is* `∫R_in dt`, and `R_in_inf` is mass-exact
+/// (`∫₀^∞ R_in_inf = F·amt`, `PreparedInputRate::rate_infused`). Every engine must
+/// therefore read `F·amt` for an infusion, exactly as it already does for a bolus.
+/// Before the fix the two gated engines read `2·F·amt`.
+#[test]
+fn infusion_into_input_rate_cmt_is_mass_exact_on_every_engine() {
+    let ode = transit_accumulator_spec();
+    let pk = pk_transit_vec(3.0, 2.0, 1.0);
+    let obs = vec![40.0]; // far past the kernel's tail
+
+    // A duration-defined (RATE=-2) dose is *not* redundant with the rate-defined one:
+    // under `F != 1` the two modes differ (#419 — `F` scales the window in one and the
+    // rate in the other), and at `F = 1` they coincide, which is why `F` is free here.
+    let mut dur_defined = DoseEvent::new(0.0, 100.0, 1, 25.0, false, 0.0);
+    dur_defined.infusion_def = crate::types::InfusionDef::DurationDefined;
+
+    for (tag, doses, expected) in [
+        (
+            "bolus",
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            100.0,
+        ),
+        (
+            "infusion RATE>0",
+            vec![DoseEvent::new(0.0, 100.0, 1, 25.0, false, 0.0)],
+            100.0,
+        ),
+        ("infusion RATE=-2", vec![dur_defined.clone()], 100.0),
+        (
+            // Non-degenerate: the second window opens while the first kernel is still
+            // delivering, so the suppression has to hold per dose, not just for the first.
+            "two infusions",
+            vec![
+                DoseEvent::new(0.0, 100.0, 1, 25.0, false, 0.0),
+                DoseEvent::new(2.0, 100.0, 1, 25.0, false, 0.0),
+            ],
+            200.0,
+        ),
+        (
+            // Mixed: a bolus and an infusion into the same forcing compartment.
+            "bolus + infusion",
+            vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(3.0, 100.0, 1, 25.0, false, 0.0),
+            ],
+            200.0,
+        ),
+    ] {
+        let subj = make_subject(doses, obs.clone());
+        let plain = ode_predictions(&ode, &pk, &[], &[], &subj);
+        let (with_states_pred, with_states) =
+            ode_predictions_with_states(&ode, &pk, &[], &[], &subj);
+        let dense = ode_dense_solve_states(&ode, &pk, &[], &[], &subj, &obs);
+        for (engine, got) in [
+            ("ode_predictions", plain[0]),
+            ("ode_predictions_with_states", with_states_pred[0]),
+            ("with_states[0][0]", with_states[0][0]),
+            ("ode_dense_solve_states", dense[0][0]),
+        ] {
+            assert_relative_eq!(got, expected, max_relative = 5e-3);
+            assert!(
+                got < 1.5 * expected,
+                "{tag}/{engine}: delivered {got:.6}, expected {expected} (double-count?)"
+            );
+        }
+    }
+}
+
+/// The readout, not just the delivered mass: on real PK models every gated engine must
+/// equal an explicit **sub-dose train**, an oracle that shares no convention with
+/// `R_in_inf` (it delivers the same mass as N ordinary boluses through the ordinary
+/// bolus path). `ode_predictions` rides along as the already-anchored control — it
+/// resolves through `active_infusions` and was correct throughout.
+///
+/// Before the fix the gated engines were 8.3× (`first_order`) and 214× (`transit`) the
+/// train at the first observation: the stray `+rate` lands in the compartment *directly*,
+/// bypassing the kernel, so the divergence is worst early and settles near 1.86× once
+/// both copies have distributed.
+#[test]
+fn infusion_into_absorption_matches_subdose_train_on_gated_engines() {
+    fn check(
+        tag: &str,
+        ode: &OdeSpec,
+        pk: &[f64],
+        dose: DoseEvent,
+        t_inf: f64,
+        obs: &[f64],
+        read: usize,
+    ) {
+        let amt = dose.amt;
+        let subj = make_subject(vec![dose], obs.to_vec());
+        // N boluses of amt/N at the sub-interval midpoints of the *held* window.
+        let n = 300usize;
+        let train: Vec<DoseEvent> = (0..n)
+            .map(|k| {
+                let tk = (k as f64 + 0.5) * t_inf / n as f64;
+                DoseEvent::new(tk, amt / n as f64, 1, 0.0, false, 0.0)
+            })
+            .collect();
+        let reference = ode_predictions(ode, pk, &[], &[], &make_subject(train, obs.to_vec()));
+
+        let plain = ode_predictions(ode, pk, &[], &[], &subj);
+        let (ws_pred, ws) = ode_predictions_with_states(ode, pk, &[], &[], &subj);
+        let dense = ode_dense_solve_states(ode, pk, &[], &[], &subj, obs);
+
+        for i in 0..obs.len() {
+            assert!(reference[i] > 0.0, "{tag}: degenerate reference at obs {i}");
+            for (engine, got) in [
+                ("ode_predictions", plain[i]),
+                ("ode_predictions_with_states", ws_pred[i]),
+                ("with_states.state", ws[i][read]),
+                ("ode_dense_solve_states", dense[i][read]),
+            ] {
+                let rel = (got - reference[i]).abs() / reference[i];
+                assert!(
+                    rel < 1e-3,
+                    "{tag}/{engine} obs {i} (t={}): {got:.6} vs sub-dose train {:.6} \
+                     (rel {rel:.2e})",
+                    obs[i],
+                    reference[i]
+                );
+            }
+        }
+    }
+
+    // `first_order` kernel, rate-defined infusion. Readout ≡ state 0.
+    let mut fo = first_order_one_cpt_spec();
+    fo.solver_opts.reltol = 1e-11;
+    fo.solver_opts.abstol = 1e-11;
+    let mut pk_fo = PkParams::default();
+    pk_fo.values[crate::types::PK_IDX_CL] = 2.0;
+    pk_fo.values[crate::types::PK_IDX_V] = 20.0;
+    pk_fo.values[4] = 0.6; // ka
+    pk_fo.values[crate::types::PK_IDX_F] = 1.0;
+    let obs_fo = vec![0.5, 1.5, 3.0, 5.0, 9.0];
+    check(
+        "first_order RATE>0",
+        &fo,
+        &pk_fo.values,
+        DoseEvent::new(0.0, 100.0, 1, 100.0 / 3.0, false, 0.0),
+        3.0,
+        &obs_fo,
+        0,
+    );
+
+    // Duration-defined (RATE=-2) at **F != 1**: at F = 1 the two `InfusionDef` modes are
+    // numerically identical, so this arm only discriminates away from unity (#419 — here
+    // `F` scales the rate and the window is held, which is what the train mirrors).
+    let mut pk_dd = pk_fo;
+    pk_dd.values[crate::types::PK_IDX_F] = 0.6;
+    let mut dur_defined = DoseEvent::new(0.0, 100.0, 1, 100.0 / 3.0, false, 0.0);
+    dur_defined.infusion_def = crate::types::InfusionDef::DurationDefined;
+    check(
+        "first_order RATE=-2 (F=0.6)",
+        &fo,
+        &pk_dd.values,
+        dur_defined,
+        3.0,
+        &obs_fo,
+        0,
+    );
+
+    // `transit` kernel into a real depot state, readout ≡ state 1 (central) — a second
+    // kernel family, and a forcing compartment that is not the observed one.
+    let mut tr = transit_one_cpt_oral_spec();
+    tr.solver_opts.reltol = 1e-11;
+    tr.solver_opts.abstol = 1e-11;
+    let mut pk_tr = PkParams::default();
+    pk_tr.values[crate::types::PK_IDX_CL] = 3.0;
+    pk_tr.values[crate::types::PK_IDX_V] = 30.0;
+    pk_tr.values[4] = 1.2; // KA
+    pk_tr.values[6] = 3.0; // n transit compartments
+    pk_tr.values[7] = 1.5; // MTT
+    pk_tr.values[crate::types::PK_IDX_F] = 1.0;
+    check(
+        "transit RATE>0",
+        &tr,
+        &pk_tr.values,
+        DoseEvent::new(0.0, 50.0, 1, 20.0, false, 0.0),
+        2.5,
+        &[0.5, 1.5, 2.5, 4.0, 8.0],
+        1,
+    );
+}
+
+/// The other side of the guard, and the arm that fails if it is written too wide: an
+/// infusion into a compartment that is **not** an input-rate target keeps its plain
+/// `+rate` on every engine. A guard spelled `!input_rate.is_empty()` — or one asking
+/// [`input_rate_consumes_cmt`] about the spec rather than the applied forcing slice —
+/// passes every other test here and deletes this dose's mass entirely.
+#[test]
+fn infusion_into_non_input_rate_cmt_is_untouched_on_gated_engines() {
+    let mut ode = transit_one_cpt_oral_spec(); // forcing on state 0 (depot) only
+    ode.solver_opts.reltol = 1e-11;
+    ode.solver_opts.abstol = 1e-11;
+    let mut pk = PkParams::default();
+    pk.values[crate::types::PK_IDX_CL] = 3.0;
+    pk.values[crate::types::PK_IDX_V] = 30.0;
+    pk.values[4] = 1.2;
+    pk.values[6] = 3.0;
+    pk.values[7] = 1.5;
+    pk.values[crate::types::PK_IDX_F] = 1.0;
+
+    let obs = vec![0.5, 1.5, 2.5, 4.0, 8.0];
+    // CMT 2 ≡ state 1 (central): a plain infusion, no kernel involved.
+    let subj = make_subject(
+        vec![DoseEvent::new(0.0, 50.0, 2, 20.0, false, 0.0)],
+        obs.clone(),
+    );
+    let plain = ode_predictions(&ode, &pk.values, &[], &[], &subj);
+    let (ws_pred, ws) = ode_predictions_with_states(&ode, &pk.values, &[], &[], &subj);
+    let dense = ode_dense_solve_states(&ode, &pk.values, &[], &[], &subj, &obs);
+
+    for i in 0..obs.len() {
+        assert!(plain[i] > 0.0, "obs {i}: reference is degenerate (zero)");
+        for (engine, got) in [
+            ("ode_predictions_with_states", ws_pred[i]),
+            ("with_states.state", ws[i][1]),
+            ("ode_dense_solve_states", dense[i][1]),
+        ] {
+            assert_relative_eq!(got, plain[i], max_relative = 1e-9);
+        }
+    }
+}
+
 #[test]
 fn input_rate_consumes_cmt_matches_forcing_compartment() {
     let ode = transit_accumulator_spec(); // forcing on state 0 ≡ 1-based CMT 1
@@ -4908,7 +5169,9 @@ fn gated_infusions_resolves_rate_and_drops_unaddressable() {
     // the mode-aware bioavailability rate (#419): a rate-defined infusion
     // holds its rate (F scales the duration, carried by the window), while a
     // duration-defined infusion (RATE=-2) gets F·rate. CMT=0 and compartments
-    // beyond the state vector are dropped.
+    // beyond the state vector are dropped. The empty forcing slice is the
+    // "model has no built-in absorption" case; the input-rate drop it also owns
+    // (#1187) is covered by `gated_infusions_suppresses_infusion_into_input_rate_cmt`.
     let mut dur_defined = DoseEvent::new(0.0, 0.0, 1, 4.0, false, 0.0);
     dur_defined.infusion_def = crate::types::InfusionDef::DurationDefined;
     let doses = vec![
@@ -4924,7 +5187,7 @@ fn gated_infusions_resolves_rate_and_drops_unaddressable() {
         (2, 1.0, 3.0),
         (3, 1.0, 3.0),
     ];
-    let gated = gated_infusions(&active, &doses, &f_bio, 1);
+    let gated = gated_infusions(&[], &active, &doses, &f_bio, 1);
     assert_eq!(
         gated,
         vec![(0usize, 4.0, 1.0, 3.0), (0usize, 4.0 * 0.5, 1.0, 3.0)]
