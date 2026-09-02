@@ -19,6 +19,25 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Fixed
+- **`ode_method = auto` no longer keeps a stiff solve whose analytic derivatives have
+  overflowed (#1204).** The escalation guard checked that every saved state was finite, but
+  read *values* only. A dual number's derivative jets carry higher powers of what its value
+  carries linearly — integrating `u' = p·u` gives `∂u/∂p = t·u` and `∂²u/∂p² = t²·u` — so a
+  trajectory near the top of double precision overflows its Hessian first, its gradient next,
+  and its predicted value not at all. Such a segment reported success, clamped nothing,
+  finished cleanly, returned finite predictions, and handed FOCE/FOCEI a `NaN` gradient with
+  every counter reading zero. The guard now also rejects on non-finite jets and re-solves the
+  segment explicitly, and the same check scores the explicit fallback, so a fallback that did
+  not repair the gradient is reported instead of being presented as a successful retry. The
+  new `auto_stiff_rejected_jets` counter is reported in the `ode_solver` warning with its own
+  advice — the stiff method worked and the sensitivities did not, so naming another method
+  will not help; check the model's units and scaling. A **named** `ode_method` stays
+  unguarded, as before. To make the counter observable at all, the post-fit diagnostic sweep
+  now also runs one analytic `∂f/∂η` solve per subject for models on the analytic ODE
+  sensitivity path — the `f64` prediction pass carries no derivatives and could never see
+  this decision.
+
 ## [0.3.1] - 2026-09-02
 
 ### Added

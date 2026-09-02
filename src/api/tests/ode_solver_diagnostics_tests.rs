@@ -456,3 +456,117 @@ fn a_benign_ode_fit_reports_nothing() {
         result.warnings
     );
 }
+
+/// A jet-only rejection gets its own clause, because its remedy is not the one an ordinary
+/// rejection carries (#1204). "Name a different stiff method" is useless here — the stiff
+/// method integrated fine; what failed is that the trajectory reached a magnitude the
+/// sensitivities cannot represent.
+#[test]
+fn a_jet_rejection_says_the_derivatives_overflowed_not_that_the_method_failed() {
+    let stats = OdeSolverStats {
+        auto_stiff_segments: 12,
+        auto_stiff_rejected: 2,
+        auto_stiff_rejected_jets: 2,
+        auto_fallback_failed: 2,
+        ..Default::default()
+    };
+    let (msg, entry) =
+        ode_solver_diagnostics_warning(&stats, &FitOptions::default()).expect("a warning");
+    assert_eq!(entry.severity, WarningSeverity::Warning);
+    assert!(msg.contains("2 of those 2 rejection(s)"), "{msg}");
+    assert!(msg.contains("edge of double precision"), "{msg}");
+    assert!(msg.contains("units and scaling"), "{msg}");
+    let details = entry.details.as_ref().unwrap();
+    assert_eq!(details["auto_stiff_rejected_jets"], serde_json::json!(2));
+    assert_eq!(classify_warning(&msg).category, WarningCode::OdeSolver);
+}
+
+/// The clause stays out of the way of an ordinary rejection, which is the common case: a
+/// stiff solve the guard threw out on a `min_dt` stall has nothing to do with jets, and
+/// telling that user to check their units would be a wrong lead.
+#[test]
+fn an_ordinary_rejection_carries_no_jet_clause() {
+    let stats = OdeSolverStats {
+        auto_stiff_segments: 12,
+        auto_stiff_rejected: 2,
+        min_step_clamped_steps: 5,
+        discarded_clamped_steps: 5,
+        ..Default::default()
+    };
+    let (msg, entry) =
+        ode_solver_diagnostics_warning(&stats, &FitOptions::default()).expect("a warning");
+    assert!(!msg.contains("edge of double precision"), "{msg}");
+    assert!(msg.contains("rodas5p"), "{msg}");
+    let details = entry.details.as_ref().unwrap();
+    assert_eq!(details["auto_stiff_rejected_jets"], serde_json::json!(0));
+}
+
+/// The second half of the post-fit sweep (#1204): the diagnostic scope has to observe a
+/// **dual** solve, not only the `f64` prediction pass.
+///
+/// Without this the jet-rejection clause could never fire in production — `f64` carries no
+/// jets, so the only path that can take that decision is the sensitivity solve — and the
+/// counter would be exactly the dead diagnostic #1080 item 3 existed to remove. Asserting the
+/// sweep deposits counters of its own is what pins that it runs at all.
+#[test]
+fn the_post_fit_sweep_observes_the_sensitivity_solve_too() {
+    let model = two_state_model(1000.0);
+    let pop = population();
+    let result = fit(&model, &pop, &model.default_params, &one_iteration_opts()).expect("fit");
+
+    let mut params = model.default_params.clone();
+    params.theta = result.theta.clone();
+    let etas: Vec<DVector<f64>> = result.subjects.iter().map(|s| s.eta.clone()).collect();
+    let scope = crate::ode::solver::SolverStatsScope::enter();
+    sweep_sensitivity_solver_stats(&model, &pop, &params, &etas, None);
+    let stats = scope.collected();
+    assert!(
+        stats.accepted_steps > 0,
+        "the sensitivity sweep integrated nothing: {stats:?}"
+    );
+    assert!(
+        stats.auto_stiff_segments > 0,
+        "and it should see the same escalations the prediction pass does: {stats:?}"
+    );
+}
+
+/// …and it costs nothing on a model that has no ODE sensitivity path to sweep. The helper is
+/// called on every ODE fit, so a model on FD (or on a closed-form solution) must exit before
+/// it integrates anything.
+#[test]
+fn the_sensitivity_sweep_is_a_no_op_off_the_analytic_ode_path() {
+    let model = closed_form_model();
+    let pop = population();
+    let result = fit(&model, &pop, &model.default_params, &one_iteration_opts()).expect("fit");
+
+    let mut params = model.default_params.clone();
+    params.theta = result.theta.clone();
+    let etas: Vec<DVector<f64>> = result.subjects.iter().map(|s| s.eta.clone()).collect();
+    let scope = crate::ode::solver::SolverStatsScope::enter();
+    sweep_sensitivity_solver_stats(&model, &pop, &params, &etas, None);
+    let stats = scope.collected();
+    assert_eq!(stats.accepted_steps, 0, "{stats:?}");
+    assert_eq!(stats.attempted_steps, 0, "{stats:?}");
+}
+
+/// A one-compartment closed-form twin of [`two_state_model`]: no `[odes]`, so
+/// `ode_inner_grad_supported_model` is false and the sweep has nothing to do.
+fn closed_form_model() -> CompiledModel {
+    parse_model_string(
+        r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 50.0)
+  theta TVV(10.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.04
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP)
+"#,
+    )
+    .expect("parse")
+}

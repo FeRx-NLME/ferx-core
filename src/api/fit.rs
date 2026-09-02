@@ -1817,6 +1817,20 @@ fn fit_inner(
         options.interaction,
         mixest_classes.as_deref(),
     );
+    // The prediction sweep above is `f64`, so the guard's jet-finiteness clause — the one
+    // decision only a dual solve can take (#1204) — leaves no trace in it. One analytic
+    // `∂f/∂η` per subject, inside the same scope, is what makes that clause reportable: it
+    // is the solve the inner loop ran throughout the fit, run once more at the estimates the
+    // fit reports. No-ops for every model that is not on the analytic ODE sensitivity path.
+    if solver_stats_scope.is_some() {
+        sweep_sensitivity_solver_stats(
+            model,
+            population,
+            &result.params,
+            &result.eta_hats,
+            mixest_classes.as_deref(),
+        );
+    }
     let ode_solver_stats = solver_stats_scope
         .map(|scope| scope.collected())
         .unwrap_or_default();

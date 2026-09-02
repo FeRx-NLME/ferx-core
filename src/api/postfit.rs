@@ -1654,6 +1654,46 @@ pub(crate) fn integrates_odes(model: &CompiledModel) -> bool {
     model.ode_spec.is_some() || model.absorption_ode_equivalent.is_some()
 }
 
+/// Re-run the analytic **sensitivity** solve once per subject at the final estimates, for its
+/// solver statistics only (#1204).
+///
+/// The post-fit prediction sweep is an `f64` sweep, and one whole class of solver decision is
+/// invisible to it: the `auto` escalation guard's jet-finiteness clause can only fire on a
+/// `Dual1`/`Dual2` instantiation, because `f64` carries no jets to check. A counter that no
+/// production path could ever set would be exactly the dead diagnostic #1080 item 3 existed to
+/// remove, so the diagnostic scope has to see a dual solve as well as a scalar one.
+///
+/// This is that solve: the same `∂f/∂η` the inner loop evaluated millions of times, evaluated
+/// once more per subject, inside the caller's [`crate::ode::solver::SolverStatsScope`]. The
+/// gradient itself is thrown away — the fit already has its EBEs and `h_matrix` — so the only
+/// product is the counters the integration deposits in the scope.
+///
+/// No-ops unless the model routes to the analytic ODE sensitivity path. A model on FD, on a
+/// closed-form solution, or outside the provider's scope has no dual ODE solve to observe, and
+/// [`crate::sens::provider::subject_eta_grad`] would return `None` for every subject anyway.
+pub(crate) fn sweep_sensitivity_solver_stats(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    eta_hats: &[DVector<f64>],
+    mixest: Option<&[usize]>,
+) {
+    if !crate::sens::provider::ode_inner_grad_supported_model(model) {
+        return;
+    }
+    for (i, subject) in population.subjects.iter().enumerate() {
+        let Some(eta) = eta_hats.get(i) else { continue };
+        // Same class binding the prediction sweep uses: a mixture subject's η̂ belongs to its
+        // winning class, so evaluating it under the class-1 default would integrate a
+        // trajectory the fit never reported.
+        let _mix_guard = mixest
+            .and_then(|m| m.get(i))
+            .map(|&c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
+        let _ =
+            crate::sens::provider::subject_eta_grad(model, subject, &params.theta, eta.as_slice());
+    }
+}
+
 /// Turn the post-fit pass's [`OdeSolverStats`] into the fit's one ODE-solver warning (#1080
 /// Part B item 2).
 ///
@@ -1674,9 +1714,12 @@ pub(crate) fn integrates_odes(model: &CompiledModel) -> bool {
 ///   `cr` testdata escalates 240 of 580 segments) and not a problem, but it *is* a decision
 ///   the user never asked for and could not otherwise see.
 ///
-/// The counters come from the post-fit per-subject prediction pass, so they describe the
-/// production dispatch (TV covariates, resets, the event-driven walker, IOV) at the final
-/// estimates — one `f64` sweep, not the thousands of likelihood evaluations that preceded it.
+/// The counters come from the post-fit per-subject pass, so they describe the production
+/// dispatch (TV covariates, resets, the event-driven walker, IOV) at the final estimates —
+/// one sweep, not the thousands of likelihood evaluations that preceded it. It is an `f64`
+/// prediction sweep plus, for a model on the analytic ODE sensitivity path, one `∂f/∂η`
+/// solve per subject ([`sweep_sensitivity_solver_stats`]); without that second half the
+/// jet-rejection clause below could never fire in production, since `f64` carries no jets.
 /// A fit whose solver only misbehaved at parameter values the optimizer passed through and
 /// left behind therefore reads clean here, which is the honest scope: the warning is about the
 /// trajectories the fit *reports*, not about every one it visited.
@@ -1693,6 +1736,11 @@ pub(crate) fn ode_solver_diagnostics_warning(
         .min_step_clamped_steps
         .saturating_sub(stats.discarded_clamped_steps);
     let rejected = stats.auto_stiff_rejected;
+    // Of those, the ones only a dual solve could have rejected (#1204). Reported as its own
+    // clause rather than folded into the rejection wording above, because the remedy differs:
+    // an ordinary rejection says "name a different stiff method", a jet rejection says "the
+    // trajectory is at the edge of double precision — check the model's scaling".
+    let rejected_jets = stats.auto_stiff_rejected_jets;
     let fallback_failed = stats.auto_fallback_failed;
     // Like clamps, an unfinished stiff attempt that the guard discarded did not reach the
     // caller. Only the explicit fallback (or a named/kept method) belongs in the returned-
@@ -1756,6 +1804,7 @@ pub(crate) fn ode_solver_diagnostics_warning(
         "auto_stiff_segments": escalated,
         "auto_switched_segments": stats.auto_switched_segments,
         "auto_stiff_rejected": rejected,
+        "auto_stiff_rejected_jets": rejected_jets,
         "auto_fallback_failed": fallback_failed,
         "unfinished_segments": stats.unfinished_segments,
         "discarded_unfinished_segments": stats.discarded_unfinished_segments,
@@ -1804,6 +1853,11 @@ pub(crate) fn ode_solver_diagnostics_warning(
              explicitly is the next thing to try",
             explicit = crate::ode::OdeMethod::EXPLICIT_FALLBACK.as_str(),
             discarded = stats.discarded_clamped_steps,
+        ));
+    }
+    if rejected_jets > 0 {
+        parts.push(format!(
+            "{rejected_jets} of those {rejected} rejection(s) discarded a stiff solve whose              predicted values were all finite but whose analytic derivatives (the gradients              FOCE/FOCEI differentiate) had overflowed to inf/NaN — the segment integrated, at              a magnitude the sensitivities cannot represent, so the gradient for those              segments comes from the explicit re-solve while the predictions would have come              from the stiff one. The fit is repaired, not wrong, but the trajectory is running              at the edge of double precision: check the model's units and scaling (a state in              ng rather than mg, an unbounded growth term, a rate constant on the wrong clock)              before trusting the estimates"
         ));
     }
     if fallback_failed > 0 {

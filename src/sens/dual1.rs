@@ -163,6 +163,12 @@ impl<const N: usize> Dual1<N> {
         let inv2 = inv * inv;
         Dual1::chain1(inv, -inv2, &self.grad)
     }
+
+    /// Whether every gradient component is finite. Does **not** look at `value` — see
+    /// [`crate::sens::num::PkNum::jets_finite`] for why the two are checked apart (#1204).
+    pub fn jets_finite(self) -> bool {
+        self.grad.iter().all(|g| g.is_finite())
+    }
 }
 
 impl<const N: usize> Add for Dual1<N> {
@@ -266,5 +272,27 @@ mod tests {
         fd_check(|x, y| (x * y * Dual1::constant(0.1)).acos(), 1.2, 0.5, 1e-6);
         fd_check(|x, y| (x - y).inv_logit(), 0.6, 0.2, 1e-6);
         fd_check(|x, y| (x * y).logit(), 0.3, 0.9, 1e-6);
+    }
+
+    /// The gradient-only twin of the `DualMixed` check (#1204). `Dual1` is what the inner
+    /// EBE loop runs on, so a non-finite gradient here is a non-finite `∂f/∂η` — the FOCE
+    /// inner gradient, not just the FOCEI Hessian.
+    #[test]
+    fn jets_finite_reads_the_gradient_only() {
+        let healthy = Dual1::<2>::var(2.0, 0);
+        assert!(healthy.jets_finite());
+
+        let x = Dual1::<1> {
+            value: 1e-200,
+            grad: [1.0],
+        };
+        let r = x.recip();
+        assert!(r.value.is_finite(), "value 1e200 is finite: {}", r.value);
+        assert!(
+            !r.grad[0].is_finite(),
+            "gradient 1e400 is not: {}",
+            r.grad[0]
+        );
+        assert!(!r.jets_finite());
     }
 }

@@ -297,6 +297,18 @@ impl<const NA: usize, const N: usize> DualMixed<NA, N> {
             hess,
         }
     }
+
+    /// Whether every gradient **and** Hessian component is finite. Does **not** look at
+    /// `value` — see [`crate::sens::num::PkNum::jets_finite`] for why the two are checked
+    /// apart (#1204).
+    ///
+    /// The Hessian goes first, and by a wide margin: `recip` scales it by `1/x³` against
+    /// the gradient's `1/x²`, and a `u' = p·u` integration gives `∂²u/∂p² = t²·u` against
+    /// `∂u/∂p = t·u`. On the #1204 repro the value is `7.2e303` and the gradient
+    /// `1.4e306` — both finite — while the Hessian is already `NaN`.
+    pub fn jets_finite(self) -> bool {
+        self.grad.iter().all(|g| g.is_finite()) && self.hess.iter().flatten().all(|h| h.is_finite())
+    }
 }
 
 impl<const NA: usize, const N: usize> Add for DualMixed<NA, N> {
@@ -575,5 +587,70 @@ mod tests {
         assert_eq!(full.value, mixed.value);
         assert_eq!(full.grad, mixed.grad);
         assert_eq!(full.hess, mixed.hess);
+    }
+
+    /// #1204's premise, at the arithmetic level: a dual's value and its jets stop being
+    /// finite at very different magnitudes, so a value-only check cannot stand in for a
+    /// derivative check.
+    ///
+    /// `recip` is the sharpest case in the library — it scales the gradient by `1/x²` and
+    /// the Hessian by `1/x³` against the value's `1/x` — so the three cross `f64::MAX` a
+    /// hundred decades apart.
+    #[test]
+    fn jets_finite_sees_an_overflow_the_value_does_not() {
+        // A state that has decayed to 1e-120 with an O(100) seeded gradient: the reciprocal's
+        // value and gradient are comfortably finite, its Hessian is not.
+        let x = DualMixed::<1, 1> {
+            value: 1e-120,
+            grad: [100.0],
+            hess: [[0.0]],
+        };
+        let r = x.recip();
+        assert!(r.value.is_finite(), "value 1e120 is finite: {}", r.value);
+        assert!(
+            r.grad[0].is_finite(),
+            "gradient 1e242 is finite: {}",
+            r.grad[0]
+        );
+        assert!(
+            !r.hess[0][0].is_finite(),
+            "the Hessian must have overflowed: {}",
+            r.hess[0][0]
+        );
+        assert!(!r.jets_finite(), "so jets_finite must reject it");
+    }
+
+    /// Either order alone is enough to reject. The Hessian overflows first in practice, but
+    /// a gradient can go without it (a first-order `Dual1` solve has no Hessian at all), so
+    /// the check has to read both rather than pick the one that usually fails.
+    #[test]
+    fn jets_finite_rejects_a_gradient_only_overflow_too() {
+        let grad_only = DualMixed::<1, 1> {
+            value: 1.0,
+            grad: [f64::INFINITY],
+            hess: [[0.0]],
+        };
+        assert!(grad_only.value.is_finite());
+        assert!(!grad_only.jets_finite());
+
+        let hess_only = DualMixed::<1, 1> {
+            value: 1.0,
+            grad: [1.0],
+            hess: [[f64::NAN]],
+        };
+        assert!(hess_only.value.is_finite() && hess_only.grad[0].is_finite());
+        assert!(!hess_only.jets_finite());
+    }
+
+    /// And it must not fire on ordinary arithmetic, or the guard would reject every
+    /// escalation it saw.
+    #[test]
+    fn jets_finite_accepts_a_healthy_dual() {
+        let x = DualMixed::<2, 2>::var(2.0, 0);
+        let y = DualMixed::<2, 2>::var(3.0, 1);
+        assert!((x * y).jets_finite());
+        assert!((x / y).jets_finite());
+        assert!(x.ln().jets_finite());
+        assert!(x.sqrt().jets_finite());
     }
 }

@@ -1488,3 +1488,160 @@ fn the_abort_budget_starts_again_when_the_stepper_is_swapped() {
         got[0].u
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// #1204 — the escalation guard's jet-finiteness clause.
+// ---------------------------------------------------------------------------------------
+
+/// A system whose sensitivities overflow long before its states do.
+///
+/// `u[0]` is a fast decaying mode carrying `|Re λ|max = 100`, which is what makes the probe
+/// escalate. `u[1]` obeys `u' = (p·K)·u`, so its value is `e^{pKt}` while its jets are
+/// `∂u/∂p = Kt·u` and `∂²u/∂p² = (Kt)²·u`. `K` is the units `p` is measured in — a rate
+/// constant written per-microsecond rather than per-hour — so it scales the derivatives
+/// without touching the trajectory at all. At `K = 1e6` over `t = 200` the jets carry `2e8`
+/// and `4e16` times the value, which puts them past `f64::MAX` while the value sits at
+/// `1e304`, four decades below it.
+fn jet_overflow_rhs<T: PkNum>(k: f64) -> impl Fn(&[T], &[T], f64, &mut [T]) {
+    move |u: &[T], p: &[T], _t: f64, du: &mut [T]| {
+        du[0] = -u[0] * T::from_f64(100.0);
+        du[1] = u[1] * p[0] * T::from_f64(k);
+    }
+}
+
+/// Tolerances loose enough to keep the fixture at a few thousand steps. The margins above
+/// are decades wide, so the verdict does not depend on the solver's accuracy here.
+fn jet_overflow_opts(method: OdeMethod) -> OdeSolverOptions {
+    OdeSolverOptions {
+        method,
+        reltol: 1e-2,
+        abstol: 1e-2,
+        ..Default::default()
+    }
+}
+
+const JET_OVERFLOW_K: f64 = 1.0e6;
+
+/// The defect (#1204): a stiff escalation that returns finite values and non-finite jets.
+///
+/// Every pre-#1204 trigger reads clean — no `min_dt` clamp, no unfinished segment, every
+/// saved value finite — so the value-only guard kept this solve and handed FOCEI a `NaN`
+/// gradient out of an integration that reported success. The jet clause is the only thing
+/// that sees it.
+#[test]
+fn auto_rejects_an_escalation_whose_jets_overflowed_while_its_values_did_not() {
+    use crate::sens::dual2::Dual2;
+    const N: usize = 1;
+    let rhs = jet_overflow_rhs::<Dual2<N>>(JET_OVERFLOW_K);
+    let u0 = [Dual2::<N>::constant(1.0), Dual2::<N>::constant(1.0)];
+    let params = [Dual2::<N>::var(3.5 / JET_OVERFLOW_K, 0)];
+    let mut stats = OdeSolverStats::default();
+    let out = crate::ode::solver::solve_ode_g_with_stats(
+        &rhs,
+        &u0,
+        (0.0, 200.0),
+        &params,
+        &[200.0],
+        &jet_overflow_opts(OdeMethod::Auto),
+        Some(&mut stats),
+    );
+
+    // The premise: the probe escalated, and none of the checks that existed before #1204
+    // fired. Without the jet clause this segment is kept.
+    assert_eq!(stats.auto_stiff_segments, 1, "{stats:?}");
+    assert_eq!(stats.stiff_min_step_clamped_steps, 0, "{stats:?}");
+    assert_eq!(stats.unfinished_segments, 0, "{stats:?}");
+    assert!(
+        out.iter().all(|p| p.u.iter().all(|v| v.value.is_finite())),
+        "the fixture must return finite values — that is the whole point"
+    );
+
+    // The fix: rejected, and scored as the jet-only rejection it is.
+    assert_eq!(stats.auto_stiff_rejected, 1, "{stats:?}");
+    assert_eq!(stats.auto_stiff_rejected_jets, 1, "{stats:?}");
+    // The explicit re-solve integrates the same divergent trajectory, so its jets overflow
+    // too and there is no third method to try. That is `auto_fallback_failed`'s job (#1204
+    // item 4): a fallback scored on values alone would have reported a repair it did not
+    // make.
+    assert_eq!(stats.auto_fallback_failed, 1, "{stats:?}");
+}
+
+/// The asymmetry, stated as a test: the `f64` prediction solve of the *same* system takes
+/// none of the decisions above.
+///
+/// `PkNum::jets_finite` is `true` for `f64`, so the clause is inert on the prediction path —
+/// which is what confines #1204's break of the same-stepper invariant to the one case where
+/// the dual result was already unusable.
+#[test]
+fn the_jet_clause_is_inert_on_the_f64_prediction_path() {
+    let rhs = jet_overflow_rhs::<f64>(JET_OVERFLOW_K);
+    let mut stats = OdeSolverStats::default();
+    let out = solve_ode_with_stats(
+        &rhs,
+        &[1.0, 1.0],
+        (0.0, 200.0),
+        &[3.5 / JET_OVERFLOW_K],
+        &[200.0],
+        &jet_overflow_opts(OdeMethod::Auto),
+        Some(&mut stats),
+    );
+    assert_eq!(stats.auto_stiff_segments, 1, "{stats:?}");
+    assert_eq!(stats.auto_stiff_rejected, 0, "{stats:?}");
+    assert_eq!(stats.auto_stiff_rejected_jets, 0, "{stats:?}");
+    assert_eq!(stats.auto_fallback_failed, 0, "{stats:?}");
+    assert!(out.last().unwrap().u[1].is_finite());
+}
+
+/// A named method stays pinned, jets included. The guard is scoped to `auto`, and a user who
+/// asked for `rodas4` gets `rodas4` — silently re-solving a fixed method as something else
+/// would be the worse surprise, and it is the rule every other clause here already follows.
+#[test]
+fn a_named_stiff_method_is_not_jet_guarded() {
+    use crate::sens::dual2::Dual2;
+    const N: usize = 1;
+    let rhs = jet_overflow_rhs::<Dual2<N>>(JET_OVERFLOW_K);
+    let u0 = [Dual2::<N>::constant(1.0), Dual2::<N>::constant(1.0)];
+    let params = [Dual2::<N>::var(3.5 / JET_OVERFLOW_K, 0)];
+    let mut stats = OdeSolverStats::default();
+    let out = crate::ode::solver::solve_ode_g_with_stats(
+        &rhs,
+        &u0,
+        (0.0, 200.0),
+        &params,
+        &[200.0],
+        &jet_overflow_opts(OdeMethod::Rodas4),
+        Some(&mut stats),
+    );
+    assert_eq!(stats.auto_stiff_segments, 0, "{stats:?}");
+    assert_eq!(stats.auto_stiff_rejected, 0, "{stats:?}");
+    assert_eq!(stats.auto_stiff_rejected_jets, 0, "{stats:?}");
+    // Unguarded means unrepaired: the caller keeps the non-finite jets it asked for.
+    assert!(!out.last().unwrap().u[1].jets_finite());
+}
+
+/// A clean escalation must not acquire a jet rejection. The clause has to be quiet on the
+/// models `auto` exists to serve, or it would turn every stiff fit into a warning.
+#[test]
+fn a_healthy_escalation_records_no_jet_rejection() {
+    use crate::sens::dual1::Dual1;
+    const N: usize = 2;
+    let rhs = binding_rhs::<Dual1<N>>(1000.0, 20.0);
+    let u0 = [
+        Dual1::<N>::var(100.0, 0),
+        Dual1::<N>::var(10.0, 1),
+        Dual1::<N>::constant(0.0),
+    ];
+    let mut stats = OdeSolverStats::default();
+    let out = crate::ode::solver::solve_ode_g_with_stats(
+        &rhs,
+        &u0,
+        (0.0, 5.0),
+        &[],
+        &[1.0, 5.0],
+        &loose(),
+        Some(&mut stats),
+    );
+    assert!(stats.auto_stiff_segments > 0, "{stats:?}");
+    assert_eq!(stats.auto_stiff_rejected_jets, 0, "{stats:?}");
+    assert!(out.iter().all(|p| p.u.iter().all(|v| v.jets_finite())));
+}

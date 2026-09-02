@@ -57,6 +57,22 @@ pub trait PkNum:
     /// constant rides this on the analytic ODE sensitivity path, so for the dual
     /// types it must carry 1st/2nd-order derivatives (digamma/trigamma) (#430).
     fn ln_gamma(self) -> Self;
+    /// Whether every **derivative** component is finite — the gradient, and the Hessian
+    /// block when the type carries one. Says nothing about [`val`](Self::val), which a
+    /// caller checks separately.
+    ///
+    /// Exists because value-finiteness and jet-finiteness genuinely come apart (#1204). A
+    /// dual's jets carry higher powers of the same quantities its value carries linearly:
+    /// `recip` scales the gradient by `1/x²` and the Hessian by `1/x³`, and integrating
+    /// `u' = p·u` gives `∂u/∂p = t·u` and `∂²u/∂p² = t²·u`. So a state can sit at a finite
+    /// `7.2e303` with a gradient of `1.4e306` and a Hessian that has already overflowed to
+    /// `inf`/`NaN` — a solve that reports success, returns finite predictions, and hands
+    /// FOCEI a non-finite gradient.
+    ///
+    /// `f64` carries no jets and so is vacuously `true`; the guard that consumes this is
+    /// therefore inert on the prediction path and only ever fires on a dual instantiation
+    /// (see `crate::ode::solver`'s escalation guard for why that asymmetry is deliberate).
+    fn jets_finite(self) -> bool;
 }
 
 impl PkNum for f64 {
@@ -116,6 +132,12 @@ impl PkNum for f64 {
     #[inline]
     fn ln_gamma(self) -> Self {
         crate::stats::special::ln_gamma(self)
+    }
+    #[inline]
+    fn jets_finite(self) -> bool {
+        // No derivative components to be non-finite. Const-folds away in the guard, so the
+        // `f64` prediction path pays nothing for a check only the dual paths can fail.
+        true
     }
 }
 
@@ -194,6 +216,10 @@ macro_rules! impl_pknum_delegate {
             #[inline]
             fn ln_gamma(self) -> Self {
                 $ty::ln_gamma(self)
+            }
+            #[inline]
+            fn jets_finite(self) -> bool {
+                $ty::jets_finite(self)
             }
         }
     };
@@ -307,5 +333,18 @@ mod tests {
             let fd2 = (f(x + h2) - 2.0 * f(x) + f(x - h2)) / (h2 * h2);
             approx::assert_relative_eq!(u.hess[0][0], fd2, max_relative = 1e-4, epsilon = 1e-6);
         }
+    }
+
+    /// `f64` has no jets, so the check is vacuously true — which is exactly what keeps the
+    /// #1204 guard inert on the prediction path.
+    #[test]
+    fn f64_has_no_jets_to_be_non_finite() {
+        assert!(PkNum::jets_finite(1.0_f64));
+        assert!(PkNum::jets_finite(0.0_f64));
+        assert!(PkNum::jets_finite(f64::MAX));
+        // Even a non-finite *value*: this predicate is about derivatives only, and the
+        // caller checks `val()` separately.
+        assert!(PkNum::jets_finite(f64::NAN));
+        assert!(PkNum::jets_finite(f64::INFINITY));
     }
 }
