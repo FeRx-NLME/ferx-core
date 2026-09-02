@@ -669,11 +669,23 @@ fn emit_subject_rows<R: rand::Rng>(
     // so reading `model.residual_correlations` here would draw residuals at the
     // declared rho while using the fitted sigmas — exactly the mismatch that
     // would make a VPC of an estimated `block_sigma` fail to reproduce it.
-    if !params.residual_correlations.is_empty() && !has_frem_rows && !ipreds.is_empty() {
+    // Prefer the parameter vector's correlations, falling back to the model's
+    // declaration when a caller supplied a `ModelParameters` without them (a
+    // hand-built one, or an artifact predating the field). Dropping a declared
+    // `block_sigma` silently — independent draws for a model that asks for
+    // correlated ones — is the worse of the two failures.
+    let draw_correlations: &[crate::types::ResidualCorrelation] =
+        if params.residual_correlations.is_empty() {
+            &model.residual_correlations
+        } else {
+            &params.residual_correlations
+        };
+    if !draw_correlations.is_empty() && !has_frem_rows && !ipreds.is_empty() {
         emit_correlated_residual_rows(
             model,
             subject,
             params,
+            draw_correlations,
             &ipreds,
             ruv_scale,
             ruv_mult.as_deref(),
@@ -757,10 +769,13 @@ fn emit_subject_rows<R: rand::Rng>(
 /// draw instead of a Cholesky panic. Subjects whose R is diagonal (no paired
 /// rows) take a cheap per-row draw and skip the factorization entirely.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_correlated_residual_rows<R: rand::Rng>(
     model: &CompiledModel,
     subject: &Subject,
     params: &ModelParameters,
+    /* live correlations, resolved by the caller */
+    correlations: &[crate::types::ResidualCorrelation],
     ipreds: &[f64],
     ruv_scale: f64,
     ruv_mult: Option<&[Vec<f64>]>,
@@ -781,7 +796,7 @@ pub(crate) fn emit_correlated_residual_rows<R: rand::Rng>(
             &subject.occasions,
             &subject.obs_l2,
             &params.sigma.values,
-            &params.residual_correlations,
+            correlations,
             mult,
         ),
         None => compute_r_matrix_with_correlations(
@@ -793,7 +808,7 @@ pub(crate) fn emit_correlated_residual_rows<R: rand::Rng>(
             &subject.occasions,
             &subject.obs_l2,
             &params.sigma.values,
-            &params.residual_correlations,
+            correlations,
         ),
     };
     if ruv_scale != 1.0 {

@@ -13575,7 +13575,15 @@ fn build_residual_correlations(
         for row in 0..n {
             for col in 0..=row {
                 let value = block.lower_triangle[pos];
-                if row != col && value != 0.0 {
+                // A zero off-diagonal still declares a correlation *coordinate*
+                // when the block is estimated (#847): `$SIGMA BLOCK(2)` with a
+                // zero covariance init is how NONMEM users routinely start, and
+                // dropping the entry here would silently fit a diagonal residual
+                // with no way to reach a non-zero rho and no diagnostic. A `FIX`ed
+                // block keeps the old behaviour — a fixed zero correlation is the
+                // same thing as no correlation, so there is nothing to carry.
+                let carries_coordinate = value != 0.0 || !block.fixed;
+                if row != col && carries_coordinate {
                     let vi = variances[row];
                     let vj = variances[col];
                     if vi <= 0.0 || vj <= 0.0 {

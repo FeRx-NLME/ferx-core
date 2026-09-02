@@ -49,6 +49,25 @@ section of the SDLC for the versioning policy).
   marked fixed, which is what it meant at the time.
 
 ### Fixed
+- **An estimated `block_sigma` correlation is bounded at `|rho| <= 0.995` (#847).** Merely
+  keeping rho inside `(-1, 1)` is not enough: a paired residual block's determinant carries a
+  factor `1 - rho^2`, so a rho of 0.9999 leaves `R` numerically singular and the likelihood
+  will chase `log|R| -> -inf`. On the 12-observation `examples/correlated_residual_combined`
+  fixture an unbounded rho ran to -0.99993 and reported convergence at a degenerate optimum. A
+  rho sitting on this rail is now a legible diagnostic: the two endpoints are carrying the same
+  noise.
+- **A zero `block_sigma` off-diagonal is now estimated rather than dropped (#847).**
+  `block_sigma (A, B) = [0.04, 0.0, 1.0]` — the natural translation of `$SIGMA BLOCK(2)` with a
+  zero covariance init — previously built no correlation at all, so under the new
+  estimate-by-default semantics it would have silently fitted a diagonal residual with no
+  coordinate to move. A `FIX`ed zero is still dropped: a fixed zero correlation is the same
+  object as no correlation.
+- **`method = laplace` / `n_agq > 1` with a free `block_sigma` now uses the reconverged-FD
+  outer gradient (#847).** AGQ's analytic score assembles theta / omega / sigma / omega_iov and
+  never writes the rho slot, while its objective does depend on rho — so the analytic gradient
+  is declined for a free correlation rather than handing the optimizer a hard zero there. A
+  `FIX`ed block keeps the analytic score. The chain guard was widened to match: `laplace` can
+  move rho, so `[laplace, imp]` is rejected exactly like `[focei, imp]`.
 - **The `block_sigma` correlation coordinate is no longer magnitude-scaled below 1 (#847).**
   The outer optimizer's `abs` preconditioner divides each packed coordinate by its own
   `|value|`, which is right for a log-space coordinate but meaningless for the Fisher-z

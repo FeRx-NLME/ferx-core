@@ -1848,6 +1848,7 @@ fn test_emit_correlated_residual_rows_magnitude_and_scale_paths() {
         &model,
         subject,
         &model.default_params,
+        &model.default_params.residual_correlations,
         &ipreds,
         2.0, // ruv_scale != 1.0
         Some(&mult),

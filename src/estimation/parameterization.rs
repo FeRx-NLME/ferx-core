@@ -31,10 +31,22 @@ pub(crate) fn theta_packs_log(theta_lower: f64) -> bool {
 }
 
 /// Unconstrained-space bound for a Fisher-z (`atanh ρ`) residual-correlation
-/// coordinate (#847). `tanh(6) ≈ 0.999_988`, so a `block_sigma` off-diagonal
-/// stays strictly inside `(-1, 1)` and every residual block it induces stays
-/// positive-definite, while the optimizer still works on an unbounded scale.
-pub(crate) const RHO_Z_BOUND: f64 = 6.0;
+/// coordinate (#847). `tanh(3) ≈ 0.995_05`, so `1 − ρ² ≥ 9.9e-3`.
+///
+/// Strict positive-definiteness is not a strong enough bound here. A paired
+/// residual block's determinant carries a factor `1 − ρ²`, so a ρ merely
+/// *inside* `(-1, 1)` can still make `R` numerically singular: at the earlier
+/// `tanh(6) ≈ 0.999_988` the factor is `2.5e-5`, `R⁻¹` blows up by `4e4`, and the
+/// likelihood is happy to chase `log|R| → −∞`. On the 12-observation
+/// `examples/correlated_residual_combined` fixture a free ρ ran to −0.999_93 and
+/// reported convergence at OFV −8.38 — a degenerate optimum, not an estimate.
+///
+/// `0.995` is well clear of anything a real correlated-residual model needs
+/// (NONMEM's fluconazole `$SIGMA BLOCK` estimate is 0.9312, `z = 1.67`), and a ρ
+/// pinned at this rail is a legible diagnostic — the two endpoints are carrying
+/// the same noise — where a ρ of 0.999_9 is just a broken fit that looks
+/// converged.
+pub(crate) const RHO_Z_BOUND: f64 = 3.0;
 
 /// Largest `|ρ|` that survives the pack. The parser already rejects `|ρ| >= 1`
 /// at declaration time, so this only guards `atanh` against an init that lands
@@ -1066,6 +1078,15 @@ mod tests {
     fn test_rho_bounds_keep_correlation_admissible() {
         assert!(unpack_rho(RHO_Z_BOUND) < 1.0);
         assert!(unpack_rho(-RHO_Z_BOUND) > -1.0);
+        // Strictly inside (-1, 1) is not enough: a paired residual block's
+        // determinant carries `1 − ρ²`, so the rail must leave `R` invertible in
+        // floating point, not merely non-singular in exact arithmetic (#847).
+        let rho_max = unpack_rho(RHO_Z_BOUND);
+        assert!(
+            1.0 - rho_max * rho_max >= 9e-3,
+            "the ρ rail must keep 1 − ρ² ≥ 9e-3; got {}",
+            1.0 - rho_max * rho_max
+        );
         assert!(pack_rho(1.0).is_finite());
         assert_relative_eq!(pack_rho(1.0), RHO_Z_BOUND);
         assert_relative_eq!(pack_rho(-1.0), -RHO_Z_BOUND);
@@ -1110,7 +1131,7 @@ mod tests {
         let width_if_scaled =
             (bounds.upper[rho_idx] - bounds.lower[rho_idx]) / plain[rho_idx].abs();
         assert!(
-            width_if_scaled > 50.0,
+            width_if_scaled > 25.0,
             "the unscaled-ρ guard is pointless if magnitude scaling were benign here \
              (width {width_if_scaled})"
         );

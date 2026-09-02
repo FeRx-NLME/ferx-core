@@ -2157,7 +2157,6 @@ pub(crate) fn analytic_eta_nll_gradient(
 /// of re-walking every magnitude expression on every inner iteration (#486 review).
 /// `None` when no magnitude is active.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     model: &CompiledModel,
     subject: &Subject,

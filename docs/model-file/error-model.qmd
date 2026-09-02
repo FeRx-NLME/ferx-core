@@ -690,11 +690,22 @@ holds the whole block — SDs and correlation alike — at its declared value:
 ```
 
 An estimated correlation is optimized as its Fisher-z transform `z = atanh(rho)`,
-bounded at `|z| <= 6`. That keeps `rho` strictly inside `(-1, 1)` for every step
-the optimizer can take, so the residual covariance never goes singular from the
-correlation alone, and it removes the boundary that a raw `rho` coordinate would
-have to be clamped against. The reported standard error is on the natural `rho`
-scale, via the delta method: `SE(rho) = SE(z) * (1 - rho^2)`.
+bounded at `|z| <= 3`, i.e. `|rho| <= 0.995`. Strict positive-definiteness is not
+a strong enough bound: a paired residual block's determinant carries a factor
+`1 - rho^2`, so a rho merely *inside* `(-1, 1)` can still leave `R` numerically
+singular and let the likelihood chase `log|R|` downwards. At `|rho| = 0.995` that
+factor is about `0.01`, which keeps `R` invertible in floating point. A fit that
+reports rho sitting on this rail is telling you the two endpoints are carrying
+the same noise — treat it as a diagnostic, not an estimate.
+
+The reported standard error is on the natural `rho` scale, via the delta method:
+`SE(rho) = SE(z) * (1 - rho^2)`.
+
+A zero off-diagonal in a non-`FIX` block still declares an estimated correlation,
+so `block_sigma (A, B) = [0.04, 0.0, 1.0]` — the natural translation of a NONMEM
+`$SIGMA BLOCK(2)` with a zero covariance init — starts at `rho = 0` and is free
+to move. Adding `FIX` to a zero off-diagonal drops it, since a fixed zero
+correlation is the same object as no correlation.
 
 ::: {.callout-warning title="Changed in #847"}
 Before this change every `block_sigma` off-diagonal was held fixed regardless of
@@ -728,15 +739,21 @@ under `method = foce` / `method = focei` (the EKF variance is added to the dense
 `R`) but are rejected under `method = saem`, whose M-step data term does not yet
 include the process-noise inflation.
 
-An **estimated** correlation additionally restricts method *chains*. Only `foce`
-and `focei` estimate the off-diagonal; the other supported estimators read it
-from the model declaration. Because each chain stage starts from the previous
+An estimated correlation is also why `method = laplace` (and `focei` with
+`n_agq > 1`) falls back to the reconverged finite-difference outer gradient: the
+AGQ score has no rho block, so it is declined rather than reporting a zero
+gradient for a coordinate the objective actually depends on. Fits are correct,
+just slower. A `FIX`ed block keeps the analytic score.
+
+An **estimated** correlation additionally restricts method *chains*. Only `foce`,
+`focei` and `laplace` move the off-diagonal; the other supported estimators read
+it from the model declaration. Because each chain stage starts from the previous
 stage's estimates, a chain that runs `foce`/`focei` **before** a non-estimating
 stage would leave that stage scoring the declared correlation while the fit
 reported the estimated one, so it is rejected with
 `E_BLOCK_SIGMA_CHAIN_UNSUPPORTED`. `method = [saem, focei]` is fine (the
-correlation has not moved when SAEM runs); `method = [focei, imp]` is not, unless
-the block carries `FIX`.
+correlation has not moved when SAEM runs); `method = [focei, imp]` and
+`method = [laplace, imp]` are not, unless the block carries `FIX`.
 
 `simulate()` draws the full residual vector for each subject's paired
 observations (same subject time and occasion) from the dense covariance `R`

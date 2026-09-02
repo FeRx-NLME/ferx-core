@@ -167,3 +167,48 @@ fn block_sigma_chain_before_focei_is_allowed() {
         .iter()
         .any(|d| d.code == "E_BLOCK_SIGMA_CHAIN_UNSUPPORTED"));
 }
+
+/// #847 / review finding: AGQ's score assembles theta/omega/sigma/omega_iov and
+/// never writes the trailing rho slot, so a model with a **free** block_sigma must
+/// decline the analytic gradient and fall to `reconverged_fd_gradient`, which
+/// differences every free packed coordinate. A hard zero there would leave the
+/// optimizer no reason to move rho while the objective genuinely depends on it.
+#[test]
+fn agq_declines_the_analytic_gradient_for_a_free_block_sigma() {
+    let src = MODEL.replace("1.00] FIX", "1.00]");
+    let model = parse_model_string(&src).expect("free block_sigma model must parse");
+    assert_eq!(model.default_params.residual_correlation_fixed, vec![false]);
+    assert!(
+        !ferx_core::estimation::agq::analytic_gradient_available(&model),
+        "a free block_sigma must route AGQ/Laplace to the reconverged-FD gradient"
+    );
+}
+
+/// A `FIX`ed block carries no free rho coordinate for the score to miss, so the
+/// analytic AGQ gradient stays available — the fallback above must not become a
+/// blanket opt-out for every correlated model.
+#[test]
+fn agq_keeps_the_analytic_gradient_for_a_fixed_block_sigma() {
+    let model = parse_model_string(MODEL).expect("block_sigma model must parse");
+    assert_eq!(model.default_params.residual_correlation_fixed, vec![true]);
+    assert!(ferx_core::estimation::agq::analytic_gradient_available(
+        &model
+    ));
+}
+
+/// The chain guard keys on "can this stage move rho", which is not the same set as
+/// "has an analytic rho gradient": `laplace` moves rho through AGQ's FD fallback,
+/// so `[laplace, imp]` must be rejected exactly like `[focei, imp]` (#847).
+#[test]
+fn block_sigma_chain_after_laplace_is_rejected() {
+    let src = MODEL.replace("1.00] FIX", "1.00]");
+    let model = parse_model_string(&src).expect("free block_sigma model must parse");
+    let options = FitOptions {
+        methods: vec![EstimationMethod::Laplace, EstimationMethod::Imp],
+        ..FitOptions::default()
+    };
+    let diags = ferx_core::check_model_options(&model, &options);
+    assert!(diags
+        .iter()
+        .any(|d| d.code == "E_BLOCK_SIGMA_CHAIN_UNSUPPORTED"));
+}

@@ -3108,7 +3108,11 @@ pub fn subject_eta_dx(
     let sigma = &params.sigma.values;
     // Correlated residual (`block_sigma`, #627): σ FD must use the correlation-aware
     // variance / `∂R/∂f` (mirrors `sigma_block`). Diagonal-R only (guarded in `prepare`).
-    let correlated = !model.residual_correlations.is_empty();
+    // Live, not declared (#847): the values fed to `corr_residual_rd_at_sigma`
+    // below come from `params`, so the predicate that gates them must too, or a
+    // hand-built `ModelParameters` could disagree with the model about whether a
+    // correlation exists at all.
+    let correlated = !params.residual_correlations.is_empty();
     let eta_dx_ipreds: Vec<f64> = sens.obs.iter().map(|o| o.f).collect();
     for k in 0..n_sigma {
         let h = sigma_fd_step(sigma[k]);
