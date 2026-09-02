@@ -498,7 +498,18 @@ pub(crate) fn screen_eta_raw(
         .iter()
         .map(|&v| (v - mean_eta).powi(2))
         .sum::<f64>();
-    if !sst_eta.is_finite() || sst_eta <= 0.0 {
+    // Two different failures, reported as two different things. Only NaN is filtered out of
+    // `valid_eta`, so an EBE of ±∞ reaches here and makes the sum non-finite — telling that
+    // user the column is "constant" would hide a fit blow-up behind a benign message.
+    if !sst_eta.is_finite() {
+        warnings.push(
+            "the EBEs are not all finite, so the screening regressions cannot be fitted; \
+             nothing screened."
+                .into(),
+        );
+        return (f64::NAN, vec![], warnings);
+    }
+    if sst_eta <= 0.0 {
         warnings.push(
             "the EBEs are constant across subjects, so no covariate can explain them; \
              nothing screened."
@@ -564,9 +575,15 @@ pub(crate) fn screen_eta_raw(
         // across the population and still be constant over the subset that has
         // a value for *this* covariate, which puts the same NaN into ΔAIC.
         if !aic_null_local.is_finite() {
+            // `−∞` is the constant-EBE case (RSS = 0); anything else non-finite is a blown-up
+            // residual, which is a different problem and gets a different sentence.
+            let cause = if aic_null_local == f64::NEG_INFINITY {
+                "the EBEs are constant over its"
+            } else {
+                "the null model's residuals are not finite over its"
+            };
             warnings.push(format!(
-                "{cov_name}: the EBEs are constant over its {n} subjects, so ΔAIC is undefined; \
-                 skipped."
+                "{cov_name}: {cause} {n} subjects, so ΔAIC is undefined; skipped."
             ));
             continue;
         }
@@ -681,8 +698,14 @@ pub(crate) fn screen_eta_raw(
 
                 // Spline forms.
                 for &df in &opts.spline_df {
-                    // Need at least df+2 subjects to fit df+1 params + intercept.
-                    if df < 1 || n <= df + 1 {
+                    // The same residual-degrees-of-freedom rule the categorical branch
+                    // applies, for the same reason: `n > p` alone admits a fit with one
+                    // residual df, where `n·ln(RSS/n)` dives and `2p` does not keep up.
+                    // `spline_df` is a public `GamOptions` field, and even the default
+                    // `[2, 3]` reaches this on a small population — `n = 5`, `df = 3` spends
+                    // 4 parameters and leaves 1 — so a continuous covariate could reproduce
+                    // the same ranking pathology a high-cardinality label does.
+                    if df < 1 || n < 2 * (df + 1) {
                         continue;
                     }
                     let basis = ns_basis(&z, df);
@@ -1451,6 +1474,79 @@ mod tests {
         assert!(
             scores.is_empty(),
             "11 levels over 20 subjects must be refused"
+        );
+    }
+
+    #[test]
+    fn a_spline_is_refused_the_residual_df_a_categorical_is_refused() {
+        // The guard has to be two-sided. `spline_df` is a public option and even the
+        // default `[2, 3]` reaches this on a small population: 5 subjects with df = 3
+        // spends 4 parameters and leaves 1 residual df, which is the same arithmetic that
+        // let a 99-level label score +474.
+        let n = 5;
+        let x: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let eta: Vec<f64> = (0..n).map(|i| (i as f64 * 1.7 + 0.4).sin()).collect();
+        let opts = GamOptions {
+            spline_df: vec![3],
+            include_linear: false,
+            ..Default::default()
+        };
+        let cov_refs = [("X", x.as_slice(), CovariateKind::Continuous)];
+        let (_, scores, _) = screen_eta_raw(&eta, &cov_refs, &opts);
+        assert!(
+            scores.is_empty(),
+            "df = 3 over 5 subjects leaves 1 residual df and must be refused, got {:?}",
+            scores.iter().map(|s| s.delta_aic).collect::<Vec<_>>()
+        );
+
+        // Eight subjects spend the same 4 parameters and leave 4 — admitted.
+        let n = 8;
+        let x: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let eta: Vec<f64> = (0..n).map(|i| (i as f64 * 1.7 + 0.4).sin()).collect();
+        let cov_refs = [("X", x.as_slice(), CovariateKind::Continuous)];
+        let (_, scores, _) = screen_eta_raw(&eta, &cov_refs, &opts);
+        assert_eq!(scores.len(), 1, "df = 3 over 8 subjects must be admitted");
+    }
+
+    #[test]
+    fn a_caller_supplied_spline_df_near_n_cannot_win_on_arithmetic() {
+        // `GamOptions::spline_df` is public, so the pathological df is reachable without a
+        // small dataset: 20 subjects and df = 15 leaves 4 residual df.
+        let n = 20;
+        let x: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let eta: Vec<f64> = (0..n).map(|i| (i as f64 * 0.9 + 0.2).sin()).collect();
+        let opts = GamOptions {
+            spline_df: vec![15],
+            include_linear: false,
+            ..Default::default()
+        };
+        let cov_refs = [("X", x.as_slice(), CovariateKind::Continuous)];
+        let (_, scores, warns) = screen_eta_raw(&eta, &cov_refs, &opts);
+        assert!(
+            scores.is_empty(),
+            "a df spending three quarters of the subjects must be refused; warnings: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn a_non_finite_ebe_is_not_reported_as_constant() {
+        // Only NaN is filtered out of the EBE column, so ±∞ reaches the variance check and
+        // makes it non-finite. Saying "constant" there hides a fit blow-up behind a
+        // benign-sounding message.
+        let mut eta: Vec<f64> = (0..20).map(|i| (i as f64 * 0.3).sin()).collect();
+        eta[7] = f64::INFINITY;
+        let cov: Vec<f64> = (0..20).map(|i| i as f64).collect();
+        let opts = GamOptions::default();
+        let cov_refs = [("X", cov.as_slice(), CovariateKind::Continuous)];
+        let (_, scores, warns) = screen_eta_raw(&eta, &cov_refs, &opts);
+        assert!(scores.is_empty());
+        assert!(
+            warns.iter().any(|w| w.contains("not all finite")),
+            "a non-finite EBE must be named as such: {warns:?}"
+        );
+        assert!(
+            !warns.iter().any(|w| w.contains("constant")),
+            "a varying column must not be called constant: {warns:?}"
         );
     }
 

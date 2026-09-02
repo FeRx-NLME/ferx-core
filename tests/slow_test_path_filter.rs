@@ -328,6 +328,25 @@ fn string_literals(src: &str) -> Vec<String> {
     out
 }
 
+/// A YAML line with its `#` comment removed, respecting quotes.
+///
+/// A `#` inside a quoted scalar (`'!crates/docs-lint/**' # note`) does not start a comment
+/// until the quote closes, and the `paths:` list is full of quoted globs.
+fn strip_yaml_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut quote: Option<u8> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        match quote {
+            Some(q) if b == q => quote = None,
+            Some(_) => {}
+            None if b == b'\'' || b == b'"' => quote = Some(b),
+            None if b == b'#' => return &line[..i],
+            None => {}
+        }
+    }
+    line
+}
+
 /// The package name a member manifest declares, for matching against `--exclude`.
 fn member_package_name(root: &Path, member: &str) -> Option<String> {
     let manifest = std::fs::read_to_string(root.join(member).join("Cargo.toml")).ok()?;
@@ -342,9 +361,21 @@ fn member_package_name(root: &Path, member: &str) -> Option<String> {
 ///
 /// Read out of the workflow rather than listed here, so an exclusion added or dropped
 /// moves this guard's expectations with it in the same commit.
+///
+/// Comments are stripped first, and that is load-bearing rather than tidy: an exclusion
+/// removes a member from `built_members`, which removes its sources from the required set
+/// *and* removes its per-member assertion — so a stray `--exclude ferx-tools` in a YAML
+/// comment (a commented-out variant of the run line, or prose that forgets its backticks)
+/// would silently stop guarding that member while every test still passed. The guard's own
+/// failure mode is the one it exists to prevent.
 fn excluded_packages(workflow: &str) -> BTreeSet<String> {
+    let stripped: String = workflow
+        .lines()
+        .map(|line| strip_yaml_comment(line))
+        .collect::<Vec<_>>()
+        .join("\n");
     let mut out = BTreeSet::new();
-    let mut tokens = workflow.split_whitespace().peekable();
+    let mut tokens = stripped.split_whitespace().peekable();
     while let Some(tok) = tokens.next() {
         match tok.strip_prefix("--exclude=") {
             Some(name) => {
@@ -384,20 +415,30 @@ fn built_members(root: &Path) -> BTreeSet<String> {
 /// stale. Entries are directory paths relative to the root (`crates/ferx-tools`).
 fn workspace_members(root: &Path) -> BTreeSet<String> {
     let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("root Cargo.toml");
+    parse_workspace_members(&manifest)
+}
+
+/// [`workspace_members`] on the manifest text, so the parser is testable without a
+/// fixture repository on disk.
+fn parse_workspace_members(manifest: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     let mut in_members = false;
     for line in manifest.lines() {
         let trimmed = line.trim();
         if in_members {
-            if trimmed.starts_with(']') {
-                break;
-            }
             for literal in string_literals(trimmed) {
                 // Skip a glob member (`crates/*`): the concrete directories under it are
                 // what the caller needs, and those come from the tracked-file walk.
                 if !literal.contains('*') && !literal.is_empty() {
                     out.insert(literal.trim_end_matches('/').to_string());
                 }
+            }
+            // `contains`, not `starts_with`: a reformat that trails the bracket on the last
+            // entry (`"crates/docs-lint"]`) would otherwise never close the list, and every
+            // later quoted string in the manifest — dependency versions, feature names, the
+            // description — would be harvested as a member directory.
+            if trimmed.contains(']') {
+                break;
             }
         } else if trimmed.starts_with("members") && trimmed.contains('[') {
             in_members = true;
@@ -449,9 +490,24 @@ fn required_inputs(root: &Path, tracked: &[String]) -> Vec<String> {
         files.insert(format!("{member}/Cargo.toml"));
     }
 
+    // Subtract the members the command `--exclude`s. This is not belt-and-braces: the
+    // harvested runtime roots are top-level (`crates`), so without it the whole of
+    // `crates/` — the excluded member included — lands back in the required set, and the
+    // exclusion in the cargo command would be quietly undone by the derivation meant to
+    // respect it.
+    let all_members = workspace_members(root);
+    let built = built_members(root);
+    let excluded_prefixes: Vec<String> = all_members
+        .difference(&built)
+        .map(|m| format!("{m}/"))
+        .collect();
+
     tracked
         .iter()
-        .filter(|p| files.contains(p.as_str()) || dir_prefixes.iter().any(|pre| p.starts_with(pre)))
+        .filter(|p| {
+            !excluded_prefixes.iter().any(|pre| p.starts_with(pre))
+                && (files.contains(p.as_str()) || dir_prefixes.iter().any(|pre| p.starts_with(pre)))
+        })
         .cloned()
         .collect()
 }
@@ -534,6 +590,144 @@ fn slow_test_filter_covers_every_input_the_heavy_fits_read() {
             .collect::<Vec<_>>()
             .join("\n")
     );
+}
+
+/// The other direction of the coverage invariant.
+///
+/// `slow_test_filter_covers_every_input_the_heavy_fits_read` asserts `required ⊆ filter`,
+/// which says nothing about a filter that is too *wide*. `crates/**` matches every member,
+/// including the one the cargo command `--exclude`s — so a push touching only that crate
+/// would fire the two-hour fit suite it was excluded to stay out of. Nothing else notices:
+/// the coverage test is one-directional and `slow_test_filter_has_no_dead_globs` is
+/// satisfied by the other members matching the same glob.
+#[test]
+fn the_filter_does_not_select_an_excluded_member() {
+    let root = repo_root();
+    let workflow =
+        std::fs::read_to_string(root.join(WORKFLOW)).expect("slow-tests.yml is readable");
+    let patterns = push_path_patterns(&workflow);
+    let tracked = tracked_files(&root);
+
+    let excluded: BTreeSet<String> = workspace_members(&root)
+        .difference(&built_members(&root))
+        .cloned()
+        .collect();
+    assert!(
+        !excluded.is_empty(),
+        "the slow job `--exclude`s nothing, so this guard has nothing to check — delete it \
+         along with the `--exclude`, or fix the parser that stopped seeing one"
+    );
+
+    for member in &excluded {
+        let prefix = format!("{member}/");
+        let selected: Vec<&str> = tracked
+            .iter()
+            .filter(|p| p.starts_with(&prefix) && filter_selects(&patterns, p))
+            .map(String::as_str)
+            .collect();
+        assert!(
+            selected.is_empty(),
+            "`{member}` is `--exclude`d from the slow job's cargo command, but {} of its \
+             files are still matched by the push filter (e.g. `{}`), so a push touching only \
+             that crate fires the two-hour suite anyway. Add `- '!{member}/**'` after the \
+             `crates/**` entry in {WORKFLOW}.",
+            selected.len(),
+            selected[0]
+        );
+    }
+}
+
+#[test]
+fn excluded_packages_reads_the_command_and_not_the_prose_around_it() {
+    // An exclusion drops a member from `built_members`, which drops its sources from the
+    // required set AND drops its per-member assertion — so a `--exclude` picked up out of a
+    // comment silently stops guarding that member while every test here still passes. The
+    // guard's own worst failure mode is the one it exists to prevent, so pin it.
+    let yaml = r#"
+on:
+  push:
+    paths:
+      - 'crates/**'          # we once considered --exclude ferx-tools here
+      - '!crates/docs-lint/**'
+jobs:
+  slow:
+    steps:
+      # a commented-out variant: --exclude ferx-cli
+      - run: cargo test --workspace --exclude docs-lint --profile ci-test
+"#;
+    let excluded = excluded_packages(yaml);
+    assert!(
+        excluded.contains("docs-lint"),
+        "the real `--exclude` in the run: line must be seen: {excluded:?}"
+    );
+    assert!(
+        !excluded.contains("ferx-tools") && !excluded.contains("ferx-cli"),
+        "an `--exclude` inside a comment must not disarm the guard: {excluded:?}"
+    );
+
+    // The `=` spelling is the same flag.
+    assert!(excluded_packages("- run: cargo test --workspace --exclude=foo").contains("foo"));
+
+    // A `#` inside a quoted scalar does not open a comment, so what follows it is still
+    // command text.
+    let quoted = "      - 'a#b'\n      - run: cargo test --exclude bar\n";
+    assert!(
+        excluded_packages(quoted).contains("bar"),
+        "a `#` inside quotes must not swallow the rest of the file"
+    );
+}
+
+#[test]
+fn workspace_members_closes_on_a_trailing_bracket() {
+    // The list is one line today. If it is ever reformatted, a closing bracket that trails
+    // the last entry must still close it — otherwise every later quoted string in the
+    // manifest (dependency versions, feature names, the description) is harvested as a
+    // member directory, and the failure surfaces as a nonsense member rather than as a
+    // broken parser.
+    let one_line = r#"
+[workspace]
+members = ["crates/ferx-tools", "crates/ferx-cli"]
+resolver = "2"
+
+[package]
+description = "not/a/member"
+"#;
+    let trailing = r#"
+[workspace]
+members = [
+    "crates/ferx-tools",
+    "crates/ferx-cli"]
+resolver = "2"
+
+[package]
+description = "not/a/member"
+"#;
+    let own_line = r#"
+[workspace]
+members = [
+    "crates/ferx-tools",
+    "crates/ferx-cli",
+]
+resolver = "2"
+
+[package]
+description = "not/a/member"
+"#;
+    let expected: BTreeSet<String> = ["crates/ferx-tools", "crates/ferx-cli"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    for (label, manifest) in [
+        ("single line", one_line),
+        ("trailing bracket", trailing),
+        ("bracket on its own line", own_line),
+    ] {
+        assert_eq!(
+            parse_workspace_members(manifest),
+            expected,
+            "{label} form parsed wrong"
+        );
+    }
 }
 
 #[test]

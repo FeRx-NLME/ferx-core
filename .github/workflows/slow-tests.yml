@@ -54,6 +54,7 @@ on:
       - 'Cargo.lock'                        # a nlopt/nalgebra/rand bump moves fit numbers and RNG streams
       - 'Cargo.toml'                        # the `ci-test` profile + the `slow-tests` / `survival` features
       - 'crates/**'                         # the workspace members — the job runs `--workspace`
+      - '!crates/docs-lint/**'              # ...except the one the command --excludes; see the run: step
       - 'data/**'                           # fixture CSVs the fits read by literal path
       - 'examples/**'                       # `.ferx` models the anchors load (e.g. the adaptive vanco suite)
       - 'nonmem_anchor/**'                  # committed NONMEM control streams, data and `.phi` references
