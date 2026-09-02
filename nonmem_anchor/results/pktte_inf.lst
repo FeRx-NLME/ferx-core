@@ -1,4 +1,4 @@
-Wed Sep  2 08:39:23 AM UTC 2026
+Wed Sep  2 11:58:00 AM UTC 2026
 $PROBLEM Joint PK-TTE, RATE>0 into the absorption compartment -- external anchor for #1187
 ; ferx's joint PK-TTE cumulative hazard has two production routes: the #570 shared single
 ; solve (`ode_predictions_and_chz` -> `active_infusions`) and the two-solve fallback
@@ -69,7 +69,12 @@ $SIGMA
   0.01       ; proportional residual variance (0.10^2)
 
 $ESTIMATION METHOD=1 LAPLACE INTER NUMERICAL SLOW MAXEVAL=0 POSTHOC PRINT=1 NOABORT
-$TABLE ID TIME CMT DV IPRED CHZ HAZ ETA1 MDV NOPRINT ONEHEADER NOAPPEND FILE=pktte_inf.tab
+; FORMAT is load-bearing: $TABLE's default prints 5 significant figures, so a banked
+; reference of 1.2217E-01 carries +/-5e-6 of its own rounding = 4.1e-5 relative. That is
+; the floor on any tolerance the anchor can assert, regardless of how close ferx actually
+; is. s1PE15.8 gives 9 significant figures and moves the floor to ~1e-9.
+$TABLE ID TIME CMT DV IPRED CHZ HAZ ETA1 MDV NOPRINT ONEHEADER NOAPPEND
+       FORMAT=s1PE15.8 FILE=pktte_inf.tab
 
 NM-TRAN MESSAGES
   
@@ -145,7 +150,7 @@ Days until program expires : 347
  PRINTED:                NO
  HEADER:                YES
  FILE TO BE FORWARDED:   NO
- FORMAT:                S1PE11.4
+ FORMAT:                s1PE15.8
  IDFORMAT:
  LFORMAT:
  RFORMAT:
@@ -250,8 +255,8 @@ Days until program expires : 347
  IPRD=IPREDI
  IRS=IRESI
 
- Elapsed evaluation time in seconds:     0.01
- Elapsed postprocess time in seconds:     0.01
+ Elapsed evaluation time in seconds:     0.00
+ Elapsed postprocess time in seconds:     0.00
 1
  
  
@@ -345,6 +350,6 @@ Days until program expires : 347
 +        1.00E-01
  
  Elapsed finaloutput time in seconds:     0.00
- #CPUT: Total CPU Time in Seconds,        0.056
+ #CPUT: Total CPU Time in Seconds,        0.034
 Stop Time:
-Wed Sep  2 08:39:34 AM UTC 2026
+Wed Sep  2 11:58:02 AM UTC 2026

@@ -659,6 +659,98 @@ mod tests {
         );
     }
 
+    /// #1187 at this objective. The inhomogeneous CTMM path reads its drug concentration
+    /// from [`crate::ode::ode_dense_solve_states`], which resolved infusions through the
+    /// unguarded `gated_infusions` — so for a `RATE>0` dose into a built-in absorption
+    /// compartment the generator saw roughly twice the exposure and the **fitted** NLL was
+    /// wrong. Nothing else covers this surface.
+    ///
+    /// Oracle is an explicit sub-dose train: N boluses spanning the same window. That is
+    /// discriminating here precisely because a *bolus* into an input-rate compartment never
+    /// reaches `gated_infusions` at all — only real infusions enter the active list — so the
+    /// train is immune to the defect while the infusion is not.
+    #[test]
+    fn ctmm_nll_for_infusion_into_absorption_matches_a_subdose_train() {
+        use crate::types::DoseEvent;
+
+        // `first_order(ka=KA)` in central, so CMT 1 is the input-rate compartment; the
+        // transition intensity reads `central / V`, making the generator drug-driven.
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(0.6, 0.01, 50.0)
+  theta LQ01(-0.7, -6.0, 3.0)
+  theta LQ10(-1.2, -6.0, 3.0)
+  theta SLOPE(0.4, -5.0, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = first_order(ka=KA) - CL/V * central
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[markov_model]
+  type   = ctmm
+  cmt    = 5
+  states = [s0=0, s1=1]
+  transition s0 -> s1 = exp(LQ01 + SLOPE * (central / V))
+  transition s1 -> s0 = exp(LQ10)
+";
+        let model = crate::parser::model_parser::parse_model_string(src).expect("parse");
+        let theta = &model.default_params.theta;
+        let eta = [0.0_f64];
+
+        let obs = [(0.0, 0), (2.0, 1), (5.0, 0), (9.0, 1)];
+        let (amt, t_inf) = (100.0_f64, 3.0_f64);
+
+        let mut infused = ctmm_subject(&obs);
+        infused.doses = vec![DoseEvent::new(0.0, amt, 1, amt / t_inf, false, 0.0)];
+        assert!(
+            infused.doses[0].is_infusion(),
+            "fixture must carry a real infusion or it tests nothing"
+        );
+
+        let n = 300usize;
+        let mut train = ctmm_subject(&obs);
+        train.doses = (0..n)
+            .map(|k| {
+                let tk = (k as f64 + 0.5) * t_inf / n as f64;
+                DoseEvent::new(tk, amt / n as f64, 1, 0.0, false, 0.0)
+            })
+            .collect();
+
+        let nll_infused = ctmm_subject_nll(&model, &infused, theta, &eta);
+        let nll_train = ctmm_subject_nll(&model, &train, theta, &eta);
+
+        // Non-degeneracy: the drug must actually move this objective, or the comparison
+        // would hold for a generator that ignored `central` entirely.
+        let drug_free = ctmm_subject_nll(&model, &ctmm_subject(&obs), theta, &eta);
+        assert!(
+            nll_train.is_finite() && (nll_train - drug_free).abs() > 1e-2,
+            "CTMM NLL {nll_train} sits at its dose-free value {drug_free} — the concentration \
+             is not reaching the generator, so the comparison would be vacuous"
+        );
+
+        let rel = (nll_infused - nll_train).abs() / nll_train.abs().max(1.0);
+        assert!(
+            rel < 1e-3,
+            "CTMM NLL under an infusion into the absorption compartment is {nll_infused}, \
+             but the equivalent sub-dose train gives {nll_train} (rel {rel:.2e}) — the \
+             generator is seeing the wrong exposure"
+        );
+    }
+
     /// A subject with a single observation carries no transition ⇒ 0 contribution.
     #[test]
     fn ctmm_endpoint_single_obs_is_zero() {

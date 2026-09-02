@@ -195,7 +195,11 @@ section of the SDLC for the versioning policy).
   against NONMEM 7.6.0: the cumulative hazard at the event time read **31× high**
   (`3.796844` vs `1.2217e-1`), and a concentration readout up to **214×** during the infusion
   window, settling near 1.9× afterwards. Models without an infusion into an absorption
-  compartment are unaffected, and no estimate on the corrected path changes.
+  compartment are unaffected. Models with one should be re-fitted if they carry a joint PK-TTE
+  or a Markov/CTMM endpoint: those objectives were wrong, so the estimates they produced were
+  too. A pure-PK fit keeps its estimates — its objective always ran through the guarded
+  prediction path — but its sdtab `IPRED`, compartment states and `[derived]` columns were
+  wrong and should be regenerated.
 - **The docs linter no longer reads a Quarto callout title as a section boundary (#1190).**
   Pandoc lifts the heading that opens a `::: {.callout-*}` block into the callout header, so the
   rendered page gets neither a section nor an anchor from it — but `docs-lint` counted all 37 of

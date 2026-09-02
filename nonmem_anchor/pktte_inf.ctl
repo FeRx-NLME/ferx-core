@@ -68,4 +68,9 @@ $SIGMA
   0.01       ; proportional residual variance (0.10^2)
 
 $ESTIMATION METHOD=1 LAPLACE INTER NUMERICAL SLOW MAXEVAL=0 POSTHOC PRINT=1 NOABORT
-$TABLE ID TIME CMT DV IPRED CHZ HAZ ETA1 MDV NOPRINT ONEHEADER NOAPPEND FILE=pktte_inf.tab
+; FORMAT is load-bearing: $TABLE's default prints 5 significant figures, so a banked
+; reference of 1.2217E-01 carries +/-5e-6 of its own rounding = 4.1e-5 relative. That is
+; the floor on any tolerance the anchor can assert, regardless of how close ferx actually
+; is. s1PE15.8 gives 9 significant figures and moves the floor to ~1e-9.
+$TABLE ID TIME CMT DV IPRED CHZ HAZ ETA1 MDV NOPRINT ONEHEADER NOAPPEND
+       FORMAT=s1PE15.8 FILE=pktte_inf.tab

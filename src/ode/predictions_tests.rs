@@ -4685,20 +4685,36 @@ fn infusion_into_input_rate_cmt_is_mass_exact_on_every_engine() {
             ("with_states[0][0]", with_states[0][0]),
             ("ode_dense_solve_states", dense[0][0]),
         ] {
-            assert_relative_eq!(got, expected, max_relative = 5e-3);
+            // One bound, not two: a `got < 1.5·expected` "double-count?" guard alongside
+            // this would be dead code — 5e-3 relative already excludes 2·expected.
+            let rel = (got - expected).abs() / expected;
             assert!(
-                got < 1.5 * expected,
-                "{tag}/{engine}: delivered {got:.6}, expected {expected} (double-count?)"
+                rel < 5e-3,
+                "{tag}/{engine}: delivered {got:.6}, expected {expected} \
+                 (rel {rel:.2e}; ~2x means the plain `+rate` was not suppressed)"
             );
         }
     }
 }
 
 /// The readout, not just the delivered mass: on real PK models every gated engine must
-/// equal an explicit **sub-dose train**, an oracle that shares no convention with
-/// `R_in_inf` (it delivers the same mass as N ordinary boluses through the ordinary
-/// bolus path). `ode_predictions` rides along as the already-anchored control — it
-/// resolves through `active_infusions` and was correct throughout.
+/// equal an explicit **sub-dose train** — N sub-doses over the same window, which is the
+/// rectangle `rate_infused` claims to convolve with the kernel.
+///
+/// Be precise about what that does and does not pin. The train's sub-doses are *not*
+/// ordinary boluses: a bolus into an input-rate compartment is suppressed
+/// (`apply_prescheduled_boluses_at`) and delivered through the same
+/// `add_prepared_input_rate_forcing` machinery, via `prep.rate` instead of
+/// `prep.rate_infused`. So this pins **`rate_infused` against `rate`** — the convolution
+/// against the impulse response it is built from — not the kernel itself, and not the
+/// engines against anything outside `PreparedInputRate`. The kernel-independent checks
+/// are the closed-form mass balance above and the NONMEM anchors in
+/// `tests/infusion_absorption_nonmem_anchor.rs`.
+///
+/// It is nonetheless a sharp test of *this* defect: the stray `+rate` is injected by
+/// `wrap_rhs_with_forcings`, downstream of everything the two paths share.
+/// `ode_predictions` rides along as the already-anchored control — it resolves through
+/// `active_infusions` and was correct throughout.
 ///
 /// Before the fix the gated engines were 8.3× (`first_order`) and 214× (`transit`) the
 /// train at the first observation: the stray `+rate` lands in the compartment *directly*,
@@ -4706,25 +4722,34 @@ fn infusion_into_input_rate_cmt_is_mass_exact_on_every_engine() {
 /// both copies have distributed.
 #[test]
 fn infusion_into_absorption_matches_subdose_train_on_gated_engines() {
+    /// `doses` are infusions into CMT 1, each paired with the *held* window length its
+    /// train must cover. Several are allowed on purpose: the gated engines assemble their
+    /// timeline with `build_segment_break_times`, a different builder from the guarded
+    /// engines' `collect_dose_break_times` — the pair that diverged in #1171 — and only a
+    /// second window landing mid-kernel exercises it. (The mass-balance arms cannot: their
+    /// spec is `dy = 0`, so the state is `∫R_in dt` and is invariant to *when* the mass
+    /// arrives, hence to break placement.)
     fn check(
         tag: &str,
         ode: &OdeSpec,
         pk: &[f64],
-        dose: DoseEvent,
-        t_inf: f64,
+        doses: Vec<(DoseEvent, f64)>,
         obs: &[f64],
         read: usize,
     ) {
-        let amt = dose.amt;
-        let subj = make_subject(vec![dose], obs.to_vec());
-        // N boluses of amt/N at the sub-interval midpoints of the *held* window.
         let n = 300usize;
-        let train: Vec<DoseEvent> = (0..n)
-            .map(|k| {
-                let tk = (k as f64 + 0.5) * t_inf / n as f64;
-                DoseEvent::new(tk, amt / n as f64, 1, 0.0, false, 0.0)
+        let train: Vec<DoseEvent> = doses
+            .iter()
+            .flat_map(|(d, t_inf)| {
+                // N boluses of amt/N at the sub-interval midpoints of this dose's window.
+                let (amt, t0, w) = (d.amt, d.time, *t_inf);
+                (0..n).map(move |k| {
+                    let tk = t0 + (k as f64 + 0.5) * w / n as f64;
+                    DoseEvent::new(tk, amt / n as f64, 1, 0.0, false, 0.0)
+                })
             })
             .collect();
+        let subj = make_subject(doses.into_iter().map(|(d, _)| d).collect(), obs.to_vec());
         let reference = ode_predictions(ode, pk, &[], &[], &make_subject(train, obs.to_vec()));
 
         let plain = ode_predictions(ode, pk, &[], &[], &subj);
@@ -4765,8 +4790,7 @@ fn infusion_into_absorption_matches_subdose_train_on_gated_engines() {
         "first_order RATE>0",
         &fo,
         &pk_fo.values,
-        DoseEvent::new(0.0, 100.0, 1, 100.0 / 3.0, false, 0.0),
-        3.0,
+        vec![(DoseEvent::new(0.0, 100.0, 1, 100.0 / 3.0, false, 0.0), 3.0)],
         &obs_fo,
         0,
     );
@@ -4782,9 +4806,25 @@ fn infusion_into_absorption_matches_subdose_train_on_gated_engines() {
         "first_order RATE=-2 (F=0.6)",
         &fo,
         &pk_dd.values,
-        dur_defined,
-        3.0,
+        vec![(dur_defined, 3.0)],
         &obs_fo,
+        0,
+    );
+
+    // **Multi-dose trajectory** (#1171 class). The second infusion opens at t = 2 while the
+    // first window (`[0, 3]`) is still delivering and the kernel still has mass in flight, so
+    // the two windows overlap and the timeline needs breaks at 0, 2, 3 and 5. This is the arm
+    // that exercises `build_segment_break_times` against `collect_dose_break_times`; the
+    // single-dose arms above and the `dy = 0` mass-balance arms both cannot.
+    check(
+        "first_order RATE>0, two overlapping windows",
+        &fo,
+        &pk_fo.values,
+        vec![
+            (DoseEvent::new(0.0, 100.0, 1, 100.0 / 3.0, false, 0.0), 3.0),
+            (DoseEvent::new(2.0, 100.0, 1, 100.0 / 3.0, false, 0.0), 3.0),
+        ],
+        &[0.5, 2.5, 3.5, 5.5, 9.0, 14.0],
         0,
     );
 
@@ -4804,9 +4844,22 @@ fn infusion_into_absorption_matches_subdose_train_on_gated_engines() {
         "transit RATE>0",
         &tr,
         &pk_tr.values,
-        DoseEvent::new(0.0, 50.0, 1, 20.0, false, 0.0),
-        2.5,
+        vec![(DoseEvent::new(0.0, 50.0, 1, 20.0, false, 0.0), 2.5)],
         &[0.5, 1.5, 2.5, 4.0, 8.0],
+        1,
+    );
+
+    // Multi-dose on the transit kernel too — a forcing compartment that is not the observed
+    // one, so a break-placement error has to propagate through `KA` to show up.
+    check(
+        "transit RATE>0, two overlapping windows",
+        &tr,
+        &pk_tr.values,
+        vec![
+            (DoseEvent::new(0.0, 50.0, 1, 20.0, false, 0.0), 2.5),
+            (DoseEvent::new(1.5, 50.0, 1, 20.0, false, 0.0), 2.5),
+        ],
+        &[0.5, 2.0, 3.0, 5.0, 9.0],
         1,
     );
 }
@@ -4849,6 +4902,100 @@ fn infusion_into_non_input_rate_cmt_is_untouched_on_gated_engines() {
             assert_relative_eq!(got, plain[i], max_relative = 1e-9);
         }
     }
+}
+
+/// The sixth surface: `simulate()`'s event-time search
+/// ([`ode_solve_until_chz_threshold`]) has its own `wrap_rhs_with_forcings` call site and
+/// so resolved infusions through the unguarded `gated_infusions` too — a doubled exposure
+/// inflates the hazard and the simulated event fires early.
+///
+/// **The obvious oracle here is vacuous and is deliberately not used.** Comparing the
+/// returned crossing against [`ode_dense_solve_states`]' CHZ column compares two *gated*
+/// engines: under the defect both inflate identically and they agree. The reference has to
+/// come from the guarded side, so the crossing time is fed back through
+/// [`ode_predictions`] — which resolves via `active_infusions` — and the cumulative hazard
+/// it reports there must be the threshold that was asked for.
+#[cfg(feature = "survival")]
+#[test]
+fn simulated_event_time_is_consistent_with_the_guarded_hazard() {
+    // state 0: central, fed by the `first_order` kernel. state 1: the CHZ accumulator.
+    // Readout is the CHZ state, so `ode_predictions` reads H(t) off the guarded path.
+    let make_spec = || OdeSpec {
+        rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+            let (cl, v) = (p[crate::types::PK_IDX_CL], p[crate::types::PK_IDX_V]);
+            let ke = if v > 0.0 { cl / v } else { 0.0 };
+            let (h0, beta) = (p[6], p[7]);
+            dy[0] = -ke * y[0];
+            dy[1] = h0 * (beta * y[0] / v).exp();
+        }),
+        n_states: 2,
+        state_names: vec!["central".into(), "chz".into()],
+        readout: OdeReadout::ObsCmt(1),
+        diffusion_var: Vec::new(),
+        solver_opts: OdeSolverOptions {
+            reltol: 1e-11,
+            abstol: 1e-11,
+            ..OdeSolverOptions::default()
+        },
+        input_rate: vec![InputRateForcing {
+            cmt: 0,
+            kind: InputRateKind::FirstOrder,
+            arg_slots: vec![4],
+            frac_slot: None,
+            lag_slot: None,
+        }],
+        rhs_program: None,
+        readout_program: None,
+        indiv_param_program: None,
+        dose_attr_map: Default::default(),
+        init_fn: None,
+    };
+
+    let mut pk = PkParams::default();
+    pk.values[crate::types::PK_IDX_CL] = 2.0;
+    pk.values[crate::types::PK_IDX_V] = 20.0;
+    pk.values[4] = 0.6; // ka
+    pk.values[6] = 0.02; // H0
+    pk.values[7] = 0.5; // BETA
+    pk.values[crate::types::PK_IDX_F] = 1.0;
+
+    // RATE>0 into CMT 1 — the input-rate compartment, i.e. #719 gap 2.
+    let dose = DoseEvent::new(0.0, 100.0, 1, 100.0 / 3.0, false, 0.0);
+    let threshold = 0.3_f64;
+    let horizon = 48.0_f64;
+
+    let outcome = ode_solve_until_chz_threshold(
+        &make_spec(),
+        &pk.values,
+        &make_subject(vec![dose.clone()], vec![]),
+        1,
+        threshold,
+        horizon,
+    );
+    let t_cross = match outcome {
+        ThresholdOutcome::Crossed(t) => t,
+        other => panic!("hazard must reach {threshold} before t={horizon}; got {other:?}"),
+    };
+    assert!(
+        t_cross > 0.0 && t_cross < horizon,
+        "crossing {t_cross} must be interior, or the arm is degenerate"
+    );
+
+    // The guarded reference: H(t_cross) read through `ode_predictions`.
+    let h_at_cross = ode_predictions(
+        &make_spec(),
+        &pk.values,
+        &[],
+        &[],
+        &make_subject(vec![dose], vec![t_cross]),
+    )[0];
+    let rel = (h_at_cross - threshold).abs() / threshold;
+    assert!(
+        rel < 1e-4,
+        "simulate()'s crossing t={t_cross:.6} carries guarded H={h_at_cross:.6}, not the \
+         requested threshold {threshold} (rel {rel:.2e}) — the event-time search and the \
+         guarded hazard disagree about how much drug was delivered"
+    );
 }
 
 #[test]

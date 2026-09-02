@@ -3923,10 +3923,22 @@ mod tests {
             arm_a.is_finite() && arm_b.is_finite(),
             "both hazard arms must be finite (A={arm_a}, B={arm_b})"
         );
-        // Non-degeneracy: a hazard that never left its baseline would agree for the wrong
-        // reason. `H0·t = 0.01·5 = 0.05` is the drug-free cumulative hazard; the drug must
-        // have moved the TTE term well away from it.
-        let drug_free = -(-0.05_f64).exp().ln() - (0.01_f64).ln();
+        // Non-degeneracy: a hazard that never left its baseline would let the two arms agree
+        // for the wrong reason. Both inputs are read back out of the fixture rather than
+        // inlined, so editing `TVH0` or the event time above cannot silently leave this
+        // guard comparing against a stale baseline.
+        let h0 = p.theta[3]; // TVH0 — 4th `theta` declared in `src` above
+        assert!(
+            (h0 - 0.01).abs() < 1e-12,
+            "theta[3] is {h0}, not TVH0 = 0.01 — the `[parameters]` order in this fixture changed"
+        );
+        let t_event = match &subject.obs_records[0] {
+            ObsRecord::Event { time, .. } => *time,
+            _ => panic!("fixture must carry an exact event record"),
+        };
+        // Drug-free exact-event NLL is `H(t) − ln h(t)`, which at `BETA·C = 0` is
+        // `H0·t − ln H0`.
+        let drug_free = h0 * t_event - h0.ln();
         assert!(
             (arm_b - drug_free).abs() > 1e-2,
             "TTE term {arm_b} sits at its drug-free value {drug_free} — the infusion is not \
@@ -4031,8 +4043,15 @@ mod tests {
             _ => panic!("expected an OdeAccumulated TTE endpoint on CMT 2"),
         };
 
-        // NONMEM 7.6.0, `pktte_inf.tab`: CHZ at TIME = 1.86 (5 significant figures).
-        const NONMEM_CHZ_AT_EVENT: f64 = 1.2217e-1;
+        // NONMEM 7.6.0, `nonmem_anchor/results/pktte_inf.tab`: CHZ at TIME = 1.86.
+        //
+        // Printed at 9 significant figures via `FORMAT=s1PE15.8` in the control stream —
+        // deliberately, and load-bearing. `$TABLE`'s default is 5 significant figures, which
+        // would bank this as `1.2217e-1` and carry ±5e-6 of its **own rounding**: 4.1e-5
+        // relative — a floor under any tolerance this anchor could assert, regardless of how
+        // close ferx actually is. At 9 figures the reference's own contribution drops to
+        // ~1e-9 and the bound below measures ferx instead of NONMEM's printf.
+        const NONMEM_CHZ_AT_EVENT: f64 = 1.22168018e-1;
 
         // Arm B — the two-solve fallback, i.e. the arm that carried the defect.
         let (cum_dedicated, _haz) =
@@ -4043,15 +4062,23 @@ mod tests {
         assert_eq!(share.times, vec![1.86], "share must cover the event time");
         let cum_shared = share.chz_states[0][chz_state];
 
-        for (arm, got) in [
-            ("dedicated (ode_cumhaz_hazard)", cum_dedicated[0]),
-            ("shared (#570)", cum_shared),
+        // Per-arm bounds, each measured rather than chosen, because the two arms are not
+        // equally accurate: the dedicated arm lands at **1.41e-9** and the shared arm at
+        // **3.26e-6** — a 2300x spread. Both are far inside the arms-agree tolerance and
+        // neither is a defect; they integrate different timelines (the share covers the
+        // union of TTE record times in one pass, the dedicated call solves to `[1.86]`
+        // alone), so their local error differs. A single loose bound covering both would
+        // let a real regression in the tight arm pass unnoticed, which is the whole reason
+        // they are separated here.
+        for (arm, got, tol) in [
+            ("dedicated (ode_cumhaz_hazard)", cum_dedicated[0], 1e-8),
+            ("shared (#570)", cum_shared, 1e-5),
         ] {
             let rel = (got - NONMEM_CHZ_AT_EVENT).abs() / NONMEM_CHZ_AT_EVENT;
             assert!(
-                rel < 1e-4,
-                "H(1.86) on the {arm} arm: ferx {got:.6e} vs NONMEM \
-                 {NONMEM_CHZ_AT_EVENT:.6e} (rel {rel:.2e})"
+                rel < tol,
+                "H(1.86) on the {arm} arm: ferx {got:.9e} vs NONMEM \
+                 {NONMEM_CHZ_AT_EVENT:.9e} (rel {rel:.2e}, bound {tol:.0e})"
             );
         }
     }
