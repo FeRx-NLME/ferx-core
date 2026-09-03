@@ -43,11 +43,11 @@ section of the SDLC for the versioning policy).
 - **A joint PK-TTE model with a linear PK block now takes the exact steady-state solve
   (#1210).** The hazard accumulator's one-cycle map is the identity, so it made `I - M`
   singular and the exact `(I - M)^-1 b` fixed point (#914) declined for *every* joint model,
-  whatever its PK block looked like — the equilibration ran the full 50-cycle pulse train and
-  emitted two spurious `Steady-state (SS=1) equilibration ... did not converge` warnings, since
-  the accumulator never stops growing. The accumulator rows are now projected out of that
-  solve, so a linear PK block gets its handful of one-cycle integrations back and the warnings
-  are gone.
+  whatever its PK block looked like — the equilibration ran the full 50-cycle pulse train, and
+  could emit a spurious `Steady-state (SS=1) equilibration ... did not converge` warning for a
+  PK block that had settled long before, since the accumulator never stops growing. The
+  accumulator rows are now projected out of that solve, so a linear PK block gets its handful
+  of one-cycle integrations back.
 
 ### Added
 - **Fitted `block_sigma` correlations are reported with their fixedness and standard error

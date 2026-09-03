@@ -8751,36 +8751,56 @@ fn one_cpt_const_chz_spec() -> OdeSpec {
 /// walk `predict_survival`, `ode_cumhaz_hazard` and TTE simulation read.
 #[cfg(feature = "survival")]
 fn chz_at(ode: &OdeSpec, pk: &PkParams, subject: &Subject, times: &[f64]) -> Vec<f64> {
+    // Read the slot the spec declares, not a literal: a fixture that puts the accumulator
+    // anywhere but state 1 would otherwise have its drug amounts compared against `H0 * t`.
+    let slot = ode.chz_state_slots[0];
     ode_dense_solve_states(ode, &pk.values, &[], &[], subject, times)
         .iter()
-        .map(|s| s[1])
+        .map(|s| s[slot])
         .collect()
 }
 
 /// `H(t) = H0·t` at every requested time, and `H` non-decreasing along the grid.
 ///
-/// The monotonicity check is not redundant with the closed form: #1210's `ALAG1 = 2` arm read
-/// `H(1) = 12.22 > H(4) = 12.04`, i.e. the accumulator ran *backwards* between two records,
-/// which is impossible for a cumulative hazard and is the shape a phase advance through an
-/// unmasked RHS produces.
+/// **Length first.** `zip` truncates to the shorter side, so without this every assertion below
+/// is a no-op on an empty `got` and the arm passes having computed nothing. That is not
+/// hypothetical: `chz_at` hands back whatever `ode_dense_solve_states` returned, and a walk
+/// that bails — or the zero-max-grid path in #1218 — yields fewer rows than `times`. Every arm
+/// in this file routes its whole claim through this helper.
+///
+/// **Monotonicity is checked before the closed form**, so it is the assertion that fires on a
+/// backwards accumulator rather than dead weight behind a tighter bound. #1210's `ALAG1 = 2`
+/// arm read `H(1) = 12.22 > H(4) = 12.04` — impossible for a cumulative hazard, and the shape a
+/// phase advance through an unmasked RHS produces. Ordered the other way the closed-form bound
+/// panics on `H(1)` first and the monotonicity loop can never fail on its own.
 #[cfg(feature = "survival")]
 fn assert_hazard_is_the_closed_form(got: &[f64], times: &[f64], arm: &str) {
+    assert_eq!(
+        got.len(),
+        times.len(),
+        "{arm}: the walk returned {} hazard values for {} requested times; `zip` below would \
+         silently truncate and assert nothing",
+        got.len(),
+        times.len()
+    );
     for (&h, &t) in got.iter().zip(times) {
         assert!(
             h.is_finite(),
             "{arm}: H({t}) = {h} is not finite — a NaN here would be silently absorbed by any \
              `max`/`min` fold downstream"
         );
-        assert!(
-            (h - SS_CHZ_H0 * t).abs() < 1e-9,
-            "{arm}: H({t}) = {h}, closed form {}",
-            SS_CHZ_H0 * t
-        );
     }
     for w in got.windows(2) {
         assert!(
             w[1] >= w[0],
             "{arm}: H is non-monotone: {got:?} over {times:?}"
+        );
+    }
+    for (&h, &t) in got.iter().zip(times) {
+        assert!(
+            (h - SS_CHZ_H0 * t).abs() < 1e-9,
+            "{arm}: H({t}) = {h}, closed form {}",
+            SS_CHZ_H0 * t
         );
     }
 }
@@ -9084,7 +9104,9 @@ fn ss_equilibration_returns_the_accumulator_untouched() {
 /// Masking alone would leave `I − M` singular: an accumulator's one-cycle map is the
 /// identity, so its row of `I − M` is all zeros and the exact solve declines for **every**
 /// joint model, whatever the PK block looks like. That is why #1210's fixtures ran the full
-/// 50-cycle pulse train and fired two spurious #867 non-convergence warnings.
+/// 50-cycle pulse train — and why some of them fired spurious #867 non-convergence warnings.
+/// Only some: the warning rides a geometric-tail test, so it is not a reliable signature of
+/// the defect, which is why this arm asserts the cycle count instead.
 ///
 /// The straddle is the point: the *same* RHS, differing only in whether the accumulator row is
 /// declared, must take different paths — one solve when it is (the row is projected out), the
@@ -9102,13 +9124,10 @@ fn a_joint_linear_model_takes_the_exact_ss_solve() {
 
     let mut undeclared = one_cpt_const_chz_spec();
     undeclared.chz_state_slots.clear();
-    let _ = equilibrate_ss_state(
-        &undeclared,
-        &pk.values,
-        &dose,
-        &undeclared.solver_opts,
-        &[0.0],
-    );
+    // The snapshot is parallel to `chz_state_slots`, so with none declared it is empty. In
+    // production that is guaranteed — every caller passes a `chz_snapshot` of this same spec —
+    // and `restore_chz` debug-asserts the pairing.
+    let _ = equilibrate_ss_state(&undeclared, &pk.values, &dose, &undeclared.solver_opts, &[]);
     let cycles_undeclared = crate::dosing::last_ss_equilibration_cycles();
 
     assert_eq!(

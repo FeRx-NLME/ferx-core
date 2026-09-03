@@ -119,25 +119,48 @@ pub(crate) fn ss_equilibration_opts(opts: &OdeSolverOptions) -> OdeSolverOptions
     o
 }
 
-/// Periodic steady-state trough for an `SS=1` dose into a built-in absorption input-rate
-/// compartment (#719; nonlinear solve #867).
+/// The row restriction that makes an accumulator-carrying system solvable as its PK
+/// sub-problem: drop the `d/dt(__chz_<cmt>)` rows, solve, put them back at zero.
 ///
-/// The system is `du/dt = f(u) + R_in(t)`, where `R_in` is the periodic absorption forcing
-/// (period `II`, the superposed pulse train — see [`add_prepared_input_rate_forcing`]'s SS branch).
-/// The steady-state trough is the fixed point `u = P(u)` of the one-cycle Poincaré map
-/// `P(u₀)` = "integrate one `II` cycle under `R_in` from `u₀`".
-///
-/// For a **linear** disposition that fixed point is a closed form —
-/// `u_ss = (I − M)⁻¹·b`, `M = e^{A·II}`, `b` one forced cycle from a zero state — costing
-/// `n_states + 3` ODE solves ([`crate::dosing::periodic_ss_fixed_point_g`]). For a **nonlinear**
-/// disposition (its self-check declines) the same fixed point is found by an Anderson-accelerated
-/// iteration on the identical `P` ([`anderson_ss_fixed_point_g`]) — a bounded handful of one-cycle
-/// solves, unlike the plain pulse train's `O(1/(1−ρ))`. Delegates both to
-/// [`equilibrate_ss_input_rate_g`].
-///
-/// Returns `None` — so the caller falls back to the capped pulse train + #867 warning — only when
-/// *neither* converges: a singular `I − M`, a non-finite intermediate, or `ρ ≥ 1` (mean input ≥
-/// maximum elimination, so no periodic steady state exists).
+/// Two call sites need exactly this — [`periodic_ss_fixed_point_pk`] (delegating to
+/// [`crate::dosing::periodic_ss_fixed_point_g`]) and [`equilibrate_ss_input_rate`]'s joint
+/// branch (delegating to [`equilibrate_ss_input_rate_g`]) — and they cannot share a delegate.
+/// They share this instead, because the invariant is the subtle half of #1210: an accumulator
+/// row embeds as `0.0` and projects out, so the reduced one-cycle map is the PK propagator and
+/// `I − M` is no longer singular.
+struct ChzProjection {
+    n: usize,
+    pk_rows: Vec<usize>,
+}
+
+impl ChzProjection {
+    fn new(chz: &[usize], n: usize) -> Self {
+        Self {
+            n,
+            pk_rows: (0..n).filter(|i| !chz.contains(i)).collect(),
+        }
+    }
+
+    /// Size of the reduced system. Zero means the spec is all accumulator and no PK.
+    fn n_pk_rows(&self) -> usize {
+        self.pk_rows.len()
+    }
+
+    /// Reduced vector → full-length state, accumulator rows left at zero.
+    fn embed(&self, reduced: &[f64]) -> Vec<f64> {
+        let mut full = vec![0.0; self.n];
+        for (k, &row) in self.pk_rows.iter().enumerate() {
+            full[row] = reduced[k];
+        }
+        full
+    }
+
+    /// Full-length state → reduced vector.
+    fn project(&self, full: &[f64]) -> Vec<f64> {
+        self.pk_rows.iter().map(|&row| full[row]).collect()
+    }
+}
+
 /// Hold the injected cumulative-hazard accumulators still for one derivative evaluation.
 ///
 /// Steady-state equilibration is a statement about the **PK** sub-system: it asks what the
@@ -174,6 +197,14 @@ pub(crate) fn ss_equilibration_opts(opts: &OdeSolverOptions) -> OdeSolverOptions
 #[inline]
 fn mask_chz(chz: &[usize], dy: &mut [f64]) {
     for &slot in chz {
+        // A slot outside the state vector means `chz_state_slots` disagrees with `n_states`.
+        // Skipping silently would leave the row unmasked; assert in debug so an inconsistent
+        // spec is loud rather than quietly reinstating the #1210 behaviour.
+        debug_assert!(
+            slot < dy.len(),
+            "chz slot {slot} is outside a {}-state system",
+            dy.len()
+        );
         if slot < dy.len() {
             dy[slot] = 0.0;
         }
@@ -202,7 +233,21 @@ fn chz_snapshot(ode: &crate::ode::OdeSpec, u: &[f64]) -> Vec<f64> {
 /// reset the accumulator either.
 #[inline]
 fn restore_chz(ode: &crate::ode::OdeSpec, u: &mut [f64], chz_before: &[f64]) {
+    // Both fallbacks below — skipping an out-of-range slot, and substituting `0.0` for a short
+    // `chz_before` — degrade into *zeroing* the accumulator, which is precisely the behaviour
+    // #1210 rejects and the one outcome no first-SS-dose test can tell from correct. Assert in
+    // debug so a spec/snapshot mismatch fails loudly instead of reinstating the bug.
+    debug_assert_eq!(
+        chz_before.len(),
+        ode.chz_state_slots.len(),
+        "chz snapshot length does not match the spec's accumulator slots"
+    );
     for (k, &slot) in ode.chz_state_slots.iter().enumerate() {
+        debug_assert!(
+            slot < u.len(),
+            "chz slot {slot} is outside a {}-state system",
+            u.len()
+        );
         if slot < u.len() {
             u[slot] = chz_before.get(k).copied().unwrap_or(0.0);
         }
@@ -215,8 +260,10 @@ fn restore_chz(ode: &crate::ode::OdeSpec, u: &mut [f64], chz_before: &[f64]) {
 /// accumulator row's one-cycle map is the *identity*, so that row of `I − M` is all zeros and
 /// the system is singular — for **every** joint PK-TTE model, whatever its PK block looks
 /// like. Masking alone would therefore leave #1210's fixtures on the capped 50-cycle pulse
-/// train, still firing the two spurious #867 non-convergence warnings (the accumulator never
-/// stops growing, so `SsStopTracker` never sees convergence).
+/// train (the accumulator never stops growing, so `SsStopTracker` never sees convergence), and
+/// liable to the spurious #867 non-convergence warning that follows from capping. Whether that
+/// warning actually fires is a further question — it rides `note_ss_nonconvergence_if_capped`'s
+/// geometric-tail test, so a capped run does not always produce one.
 ///
 /// Projecting the accumulator rows out restores the PK propagator, and a linear PK block gets
 /// its handful of solves back. The returned vector is full-length with the accumulator rows
@@ -244,27 +291,40 @@ where
             advance_forced,
         );
     }
-    let pk_rows: Vec<usize> = (0..n).filter(|i| !chz.contains(i)).collect();
-    let m = pk_rows.len();
-    let embed = |reduced: &[f64]| -> Vec<f64> {
-        let mut full = vec![0.0; n];
-        for (k, &row) in pk_rows.iter().enumerate() {
-            full[row] = reduced[k];
-        }
-        full
-    };
-    let project = |full: &[f64]| -> Vec<f64> { pk_rows.iter().map(|&row| full[row]).collect() };
+    let proj = ChzProjection::new(chz, n);
+    if proj.n_pk_rows() == 0 {
+        return None;
+    }
     let u_red = crate::dosing::periodic_ss_fixed_point_g::<f64, _, _>(
-        m,
+        proj.n_pk_rows(),
         ii,
         reltol,
         abstol,
-        |r| advance_unforced(&embed(r)).map(|f| project(&f)),
-        |r| advance_forced(&embed(r)).map(|f| project(&f)),
+        |r| advance_unforced(&proj.embed(r)).map(|f| proj.project(&f)),
+        |r| advance_forced(&proj.embed(r)).map(|f| proj.project(&f)),
     )?;
-    Some(embed(&u_red))
+    Some(proj.embed(&u_red))
 }
 
+/// Periodic steady-state trough for an `SS=1` dose into a built-in absorption input-rate
+/// compartment (#719; nonlinear solve #867).
+///
+/// The system is `du/dt = f(u) + R_in(t)`, where `R_in` is the periodic absorption forcing
+/// (period `II`, the superposed pulse train — see [`add_prepared_input_rate_forcing`]'s SS branch).
+/// The steady-state trough is the fixed point `u = P(u)` of the one-cycle Poincaré map
+/// `P(u₀)` = "integrate one `II` cycle under `R_in` from `u₀`".
+///
+/// For a **linear** disposition that fixed point is a closed form —
+/// `u_ss = (I − M)⁻¹·b`, `M = e^{A·II}`, `b` one forced cycle from a zero state — costing
+/// `n_states + 3` ODE solves ([`crate::dosing::periodic_ss_fixed_point_g`]). For a **nonlinear**
+/// disposition (its self-check declines) the same fixed point is found by an Anderson-accelerated
+/// iteration on the identical `P` ([`anderson_ss_fixed_point_g`]) — a bounded handful of one-cycle
+/// solves, unlike the plain pulse train's `O(1/(1−ρ))`. Delegates both to
+/// [`equilibrate_ss_input_rate_g`].
+///
+/// Returns `None` — so the caller falls back to the capped pulse train + #867 warning — only when
+/// *neither* converges: a singular `I − M`, a non-finite intermediate, or `ρ ≥ 1` (mean input ≥
+/// maximum elimination, so no periodic steady state exists).
 fn equilibrate_ss_input_rate(
     ode: &crate::ode::OdeSpec,
     pk_params_flat: &[f64],
@@ -335,24 +395,22 @@ fn equilibrate_ss_input_rate(
         forced_rhs(y, p, t, dy);
         mask_chz(chz, dy);
     };
-    let pk_rows: Vec<usize> = (0..n).filter(|i| !chz.contains(i)).collect();
-    let embed = |reduced: &[f64]| -> Vec<f64> {
-        let mut full = vec![0.0; n];
-        for (k, &row) in pk_rows.iter().enumerate() {
-            full[row] = reduced[k];
-        }
-        full
-    };
-    let project = |full: &[f64]| -> Vec<f64> { pk_rows.iter().map(|&row| full[row]).collect() };
+    // Mirror the `n == 0` guard the non-joint path gets above: a system that is *all*
+    // accumulator has no PK sub-problem, and an empty reduced solve would hand back an
+    // all-zero state for the caller to mistake for an equilibrated trough.
+    let proj = ChzProjection::new(chz, n);
+    if proj.n_pk_rows() == 0 {
+        return None;
+    }
     let u_red = equilibrate_ss_input_rate_g::<f64, _, _>(
-        pk_rows.len(),
+        proj.n_pk_rows(),
         ii,
         eq_opts.reltol,
         eq_opts.abstol,
-        |r| advance(&masked_unforced, &embed(r)).map(|f| project(&f)),
-        |r| advance(&masked_forced, &embed(r)).map(|f| project(&f)),
+        |r| advance(&masked_unforced, &proj.embed(r)).map(|f| proj.project(&f)),
+        |r| advance(&masked_forced, &proj.embed(r)).map(|f| proj.project(&f)),
     )?;
-    Some(embed(&u_red))
+    Some(proj.embed(&u_red))
 }
 
 /// Bounded iteration budget for the Anderson-accelerated nonlinear periodic-SS solve (#867).

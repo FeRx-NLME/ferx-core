@@ -83,9 +83,10 @@ PK and the event model share the same random effects (a common frailty). Notes:
   at the dose record, so `H` starts at `0` for a first dose and is preserved across a
   later one — see
   [SS with an ODE-accumulated hazard](steady-state.qmd#ss-with-an-ode-accumulated-hazard).
-- `fit()` and `predict_survival()` work; **`simulate()` is not yet supported** for an
-  ODE-accumulated hazard (drug-driven event-time sampling is a later slice — it returns a
-  clear error rather than silently emitting no event rows).
+- `fit()`, `predict_survival()` and `simulate()` all work. Drug-driven event times are drawn
+  by root-finding the augmented ODE for the first time the cumulative hazard reaches
+  `-log U`, so `simulate()` needs a finite `horizon` — a drug-driven hazard can vanish, so
+  there is no implicit window and one is not guessed.
 
 See [Joint PK-TTE](../estimation/tte.qmd#joint-pk-tte) for a worked example.
 

@@ -3873,7 +3873,12 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
     d1_vars: &mut Vec<Dual1<1>>,
     d1_stack: &mut Vec<Dual1<1>>,
 ) -> Vec<T> {
-    debug_assert!(
+    // `assert!`, not `debug_assert!`: this guards a *future* widening of the routing, and the
+    // consequence of the widening landing without #1210's masking is a silently wrong gradient
+    // — FOCE/FOCEI converging to the wrong optimum rather than failing. A debug-only tripwire
+    // is absent from exactly the builds users fit in. One bool read on a path already running
+    // ODE solves.
+    assert!(
         !program.has_chz(),
         "dual SS equilibration reached a joint PK-TTE system: it has no accumulator handling, \
          so it would bank the run-in's hazard into the gradient (#1210). A joint model routes \
@@ -4132,7 +4137,7 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::PkNum>(
     params: &[T],
     opts: &crate::ode::solver::OdeSolverOptions,
 ) -> Vec<T> {
-    debug_assert!(
+    assert!(
         !program.has_chz(),
         "dual SS equilibration reached a joint PK-TTE system: see `equilibrate_ss_state_g` (#1210)."
     );
