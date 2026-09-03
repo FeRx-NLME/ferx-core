@@ -9126,3 +9126,70 @@ fn a_reset_zeroes_the_accumulator_with_or_without_an_ss_dose_on_the_row() {
         );
     }
 }
+
+/// 1-cpt **Michaelis–Menten** disposition + a declared constant-rate accumulator.
+///
+/// Nonlinear on purpose: `periodic_ss_fixed_point_g`'s linearity self-check declines a
+/// saturable disposition, so this model cannot take the exact solve and *must* run the capped
+/// pulse train — which is the only path on which [`mask_chz`] is observable. `Vmax` and `Km`
+/// ride the `CL`/`V` slots, as in `mm_disposition_spec`.
+#[cfg(feature = "survival")]
+fn mm_const_chz_spec() -> OdeSpec {
+    let mut ode = one_cpt_const_chz_spec();
+    ode.rhs = Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+        let vmax = p[crate::types::PK_IDX_CL];
+        let km = p[crate::types::PK_IDX_V];
+        dy[0] = -vmax * y[0] / (km + y[0]);
+        dy[1] = SS_CHZ_H0;
+    });
+    ode
+}
+
+/// On a **nonlinear** joint model the equilibration must still judge convergence on the PK
+/// compartments — the accumulator has none to reach.
+///
+/// This is the arm that makes the masking observable at all. Everywhere else `restore_chz`
+/// overwrites the accumulator row on the way out and `[odes]` may not read `__chz_*`, so a
+/// mask-less run reaches the same `H` and the same predictions; measured, dropping the mask
+/// from either equilibration kills no other test in this file. Here it is load-bearing:
+/// a saturable disposition fails the exact solve's linearity check, so the capped pulse train
+/// runs, and `SsStopTracker` watches the **whole** state vector. An unmasked accumulator grows
+/// by `H0 · II` every cycle and never stops moving, so the tracker can never early-stop — the
+/// run burns all `SS_EQUILIBRATION_CYCLES` and then reports a non-convergence that did not
+/// happen (#867's warning, fired on a PK block that settled long before).
+///
+/// Killed by dropping `mask_chz` from `equilibrate_ss_pk_state`'s `base_rhs`: the cycle count
+/// goes to the 50-cycle cap. The `H` assertion alone does **not** die — that is the point of
+/// asserting the cycle count here.
+#[cfg(feature = "survival")]
+#[test]
+fn a_nonlinear_joint_model_judges_convergence_on_the_pk_rows() {
+    let ode = mm_const_chz_spec();
+    let mut pk = PkParams::default();
+    pk.values[crate::types::PK_IDX_CL] = 20.0; // Vmax
+    pk.values[crate::types::PK_IDX_V] = 15.0; // Km — saturating at these amounts
+    let subject = make_subject(
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, SS_CHZ_II)],
+        vec![],
+    );
+
+    let times = [0.0, 1.0, 4.0, 12.0];
+    let got = chz_at(&ode, &pk, &subject, &times);
+    assert_hazard_is_the_closed_form(&got, &times, "MM disposition, SS bolus");
+
+    // The equilibration this model actually ran. It must be the capped pulse train (the
+    // straddle: if a future change made this disposition take the exact solve, the arm would
+    // silently stop testing the train), and it must have early-stopped well inside the cap.
+    let cycles = crate::dosing::last_ss_equilibration_cycles();
+    assert!(
+        cycles > 1,
+        "this fixture is meant to be nonlinear enough to decline the exact solve, but it took \
+         it ({cycles} cycle) — the pulse-train path is no longer under test here"
+    );
+    assert!(
+        cycles < crate::dosing::SS_EQUILIBRATION_CYCLES,
+        "the pulse train hit the {}-cycle cap ({cycles} cycles): the stop tracker is watching a \
+         row that never settles, which is what masking the accumulator prevents",
+        crate::dosing::SS_EQUILIBRATION_CYCLES
+    );
+}

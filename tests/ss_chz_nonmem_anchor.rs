@@ -215,23 +215,66 @@ fn steady_state_predictions_match_nonmem() {
     }
 }
 
-/// `fit()` on a joint `SS=1` model emits no steady-state non-convergence warning.
+/// The run-in does not reach the objective: `H(0) = 0` on the fit path, and `-2 log L` no
+/// longer carries `2 * H_runin`.
 ///
-/// It used to emit two. The accumulator's one-cycle map is the identity, so `I - M` was
-/// singular, the exact fixed point declined for every joint model, and the capped 50-cycle
-/// train ran — with `SsStopTracker` watching a row that grows by `H0 * II` every cycle and so
-/// never converging. The warnings were real reports of a real failure to converge; they are
-/// gone because the failure is.
+/// The two assertions are one claim measured twice. `H(0) = 0` is the property #1210 is about,
+/// read off this model and this dataset rather than a unit fixture. The objective is the same
+/// statement where a user would actually notice it, and it is pinned because the contamination
+/// entered it *additively* and in closed form: the fixture is one subject with one `SS=1` dose
+/// at `II = 12`, so the 50-cycle run-in banked `H_runin = H0 * 50 * II = 12.0` into `H(0)` and
+/// the objective carried `2 * H_runin = 24.0` of it.
 ///
-/// Paired with the objective, because "no warning" alone is satisfiable by deleting the
-/// warning. The constant-hazard arm's contribution is `-log S - log h` with `H(12) = 0.24` and
-/// `h = 0.02` — a small, finite number. Before the fix the same fit reported `83.592027`
-/// against `59.592027` now, the difference being exactly `2 x H_runin = 24.0`.
+/// Measured on this fixture by running the pre-#1210 engine against it (`M7`'s edits plus
+/// `M8`'s): `94.462287664653` before, `70.462287654391` after — a gap of `24.0000000103`
+/// against a predicted `24.0`. That closed form is what keeps the pinned number from being a
+/// bare change-detector; if it moves, the doc says what the number means.
+///
+/// The number is ferx-vs-ferx, not a NONMEM value — NONMEM cannot fit this model at all
+/// (`ss_chz_r1_const.ctl` returns `#OBJV = +INF`). The NONMEM oracles are the sibling tests on
+/// `H`, `h` and `PRED`.
+///
+/// **The SS-warning check below is a guard, not a discriminator, and the difference is
+/// measured.** #1210 did make the exact fixed point decline for every joint model — the
+/// accumulator's one-cycle map is the identity, so `I - M` had a zero row — and the capped
+/// 50-cycle train then ran with `SsStopTracker` watching a row that never settles. But on
+/// *this* fixture the pre-fix engine emits **zero** `Steady-state (SS=1) equilibration`
+/// warnings (its five warnings are the FOCEI default, FD inner gradients, the thread count,
+/// EPS shrinkage and IWRES autocorrelation). So the assertion holds before the fix as well as
+/// after, and it is kept only to catch a future regression that starts warning here. The arm
+/// that actually pins the cycle behaviour is the Tier-1
+/// `a_nonlinear_joint_model_judges_convergence_on_the_pk_rows`, which asserts the cycle count
+/// directly and dies when the equilibration is unmasked.
 #[test]
-fn a_joint_steady_state_fit_no_longer_reports_a_non_converged_equilibration() {
+fn a_joint_steady_state_fit_does_not_bank_the_run_in_into_the_objective() {
     use ferx_core::types::{EstimationMethod, FitOptions};
 
     let (m, pop) = load("const");
+
+    // The property, on the fit path's own model and data. Measured exactly 0.0.
+    //
+    // The `0.0` is asked for as part of a multi-point grid on purpose: `predict_survival` on a
+    // grid of ONE time returns `NaN` — a zero-length integration window — so `&[0.0]` alone
+    // would trip the `is_finite` guard below and say nothing about #1210. Measured:
+    // `[0.0] -> NaN`, `[0.0, 1.0] -> [0.0, 0.02]`. Do not shorten this grid.
+    let mut probe = vec![0.0];
+    probe.extend_from_slice(&GRID);
+    let sv = predict_survival(&m, &pop, &m.default_params, &probe);
+    let at_zero: Vec<_> = sv.iter().filter(|r| r.time == 0.0).collect();
+    assert!(!at_zero.is_empty(), "no survival row at t = 0");
+    for r in at_zero {
+        assert!(
+            r.cum_hazard.is_finite(),
+            "non-finite H at t = 0: {}",
+            r.cum_hazard
+        );
+        assert!(
+            r.cum_hazard.abs() < 1e-12,
+            "the SS run-in is still banked into H(0): {} (pre-#1210 this read 12.0 = H0*50*II)",
+            r.cum_hazard
+        );
+    }
+
     let opts = FitOptions {
         method: EstimationMethod::FoceI,
         outer_maxiter: 0,
@@ -253,8 +296,9 @@ fn a_joint_steady_state_fit_no_longer_reports_a_non_converged_equilibration() {
 
     assert!(r.ofv.is_finite(), "objective is not finite: {}", r.ofv);
     assert!(
-        (r.ofv - 59.592027).abs() < 1e-4,
-        "objective moved: {} (pre-#1210 this fixture read 83.592027, i.e. 2 x H_runin higher)",
+        (r.ofv - 70.462287654391).abs() < 1e-6,
+        "objective moved: {} (measured 70.462287654391 after the fix, 94.462287664653 before, \
+         a gap of 2 * H_runin = 24.0)",
         r.ofv
     );
 }
