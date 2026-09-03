@@ -223,18 +223,24 @@ pub(crate) fn with_fit_ode_scope<R: Send>(
 }
 
 /// The pool a call with these options must run on to keep its ODE settings, or `None` when the
-/// threads it would already use are correct — either because the caller set no `ode_*` at all,
-/// or because this thread is already a worker of the pool built for exactly this override.
+/// caller set no `ode_*` at all and any pool will do.
 ///
 /// Split out so [`with_fit_ode_scope`] and `fit`'s own pool selection cannot drift: both have
 /// to consult it *before* falling back to the shared pool, and both must fail loudly rather
 /// than run unpooled, since unpooled workers integrate at the baked options and the result
 /// still looks successful.
+///
+/// A non-empty override always names its pool, even on a thread that is already a worker of
+/// that same pool. Short-circuiting there looks like a free optimisation and is not: the
+/// caller's fallback is a pool built without the override, so a nested call that pinned
+/// `threads` would land on plain workers and integrate at the model file's options. Since the
+/// table is keyed, "the pool for these settings" is the one we are already on, and rayon runs
+/// an `install` on the current pool inline — the nesting costs nothing to begin with.
 pub(crate) fn ode_scope_pool(
     options: &FitOptions,
 ) -> Result<Option<&'static rayon::ThreadPool>, String> {
     let ov = options.ode_solver_override();
-    if ov.is_empty() || crate::ode::solver::worker_carries_ode_override(ov) {
+    if ov.is_empty() {
         return Ok(None);
     }
     let n = options

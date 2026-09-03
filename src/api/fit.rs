@@ -247,9 +247,11 @@ pub fn fit(
     // integration path reads it off the spec, and `fit` has only `&CompiledModel` — so without
     // this a `FitOptions { ode_reltol: 1e-10, .. }` (or an `ode_method` naming a stiff stepper)
     // ran at the parse-time value and reported success. Armed here rather than in `fit_inner`
-    // so the pre-fit validation, every multistart stage, the covariance step and the post-fit
-    // diagnostics all integrate at the same options; the guard disarms on every exit path,
-    // including an early `?`, so a later `predict` on the same model is unaffected.
+    // so the pre-fit validation below — which runs on this thread, before any pool — sees the
+    // same options as the fit; the guard disarms on every exit path, including an early `?`,
+    // so a later `predict` on the same model is unaffected. The fan-out is covered separately,
+    // by `install_on_fit_pool`: arming reaches this thread only, and the workers that do the
+    // integrating get the value from the pool built for it.
     let _ode_solver_override =
         crate::ode::solver::arm_ode_solver_override(options.ode_solver_override());
     // #1064: a `theta NAME[...]` block has no levels until it is bound

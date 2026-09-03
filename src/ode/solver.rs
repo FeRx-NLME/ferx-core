@@ -402,30 +402,8 @@ pub(crate) fn effective_solver_options(baked: OdeSolverOptions) -> OdeSolverOpti
     }
 }
 
-thread_local! {
-    /// Set only by [`install_worker_ode_override`], i.e. only on a worker of the pool built
-    /// for that override.
-    ///
-    /// Kept apart from [`LOCAL_OVERRIDE`] because the two answer different questions: that one
-    /// is "what do I integrate at", which a fit's *calling* thread also sets by arming, while
-    /// this one is "am I already inside the right pool" — and a calling thread that armed is
-    /// precisely the case that still needs to enter one.
-    static WORKER_OVERRIDE: std::cell::Cell<Option<OdeSolverOverride>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// Install `ov` on this thread permanently. Called from an override pool's `start_handler`,
-/// once per worker, which is what lets that pool's workers integrate at the fit's options.
 pub(crate) fn install_worker_ode_override(ov: OdeSolverOverride) {
     LOCAL_OVERRIDE.set(Some(Some(ov)));
-    WORKER_OVERRIDE.set(Some(ov));
-}
-
-/// True when this thread is a worker of the pool built for exactly `ov`.
-/// [`crate::api::pool`] uses it to skip re-entering a pool it is already inside — a nested
-/// `run_covariance` under a `fit` must not stack a second one.
-pub(crate) fn worker_carries_ode_override(ov: OdeSolverOverride) -> bool {
-    WORKER_OVERRIDE.get() == Some(ov)
 }
 
 /// Arms `ov` on this thread until the returned guard drops, restoring whatever was in force
@@ -2308,6 +2286,39 @@ mod tests {
         };
         let pool = crate::api::ode_override_pool(ov, 2).expect("the override pool builds");
         pool.install(|| assert_eq!(effective_solver_options(baked).stiff_abort_after, None));
+    }
+
+    /// A call that lands on a thread already carrying its override must still name that
+    /// override's pool, not fall through to a plain one.
+    ///
+    /// The trap is specific: skipping the pool "because this thread already has the value"
+    /// looks free, but the *fallback* for a pinned `threads` is a pool built without the
+    /// override, so a nested entry point that pinned threads would hand its fan-out to plain
+    /// workers and integrate at the model file's options — #1212, reached from the inside by
+    /// the one shape (`PoolPlan` pins `threads`) the tools actually use.
+    #[test]
+    fn a_nested_call_that_pins_threads_stays_on_the_override_pool() {
+        let baked = OdeSolverOptions::default();
+        let opts = crate::types::FitOptions {
+            ode_reltol: 1e-11,
+            threads: Some(2),
+            ..Default::default()
+        };
+        let ov = opts.ode_solver_override();
+        let pool = crate::api::ode_override_pool(ov, 2).expect("the override pool builds");
+        pool.install(|| {
+            // Already a worker carrying `ov` — exactly the state that made the short-circuit
+            // look safe.
+            assert_eq!(effective_solver_options(baked).reltol, 1e-11);
+            crate::api::install_on_fit_pool(&opts, || {
+                assert_eq!(
+                    effective_solver_options(baked).reltol,
+                    1e-11,
+                    "a nested pinned-threads call was handed a pool without the override"
+                );
+            })
+            .expect("the nested call gets its pool");
+        });
     }
 
     /// The pool table is keyed by the override, so two different settings must not land on one
