@@ -254,9 +254,12 @@ fn a_joint_steady_state_fit_does_not_bank_the_run_in_into_the_objective() {
     // The property, on the fit path's own model and data. Measured exactly 0.0.
     //
     // The `0.0` is asked for as part of a multi-point grid on purpose: `predict_survival` on a
-    // grid of ONE time returns `NaN` — a zero-length integration window — so `&[0.0]` alone
-    // would trip the `is_finite` guard below and say nothing about #1210. Measured:
-    // `[0.0] -> NaN`, `[0.0, 1.0] -> [0.0, 0.02]`. Do not shorten this grid.
+    // grid whose **maximum is 0** returns `NaN`, so `&[0.0]` alone would trip the `is_finite`
+    // guard below and say nothing about #1210. `ode_dense_solve_states` takes its integration
+    // horizon as `saveat.iter().fold(0.0, f64::max)`, so such a grid builds no segment and the
+    // rows keep their `f64::NAN` prefill. Not a single-point problem — measured:
+    // `[0.0] -> NaN`, `[0.0, 0.0] -> NaN`, but `[1.0] -> 0.02` and `[12.0] -> 0.24` are fine,
+    // and `[0.0, 1.0] -> [0.0, 0.02]`. Tracked separately; do not shorten this grid.
     let mut probe = vec![0.0];
     probe.extend_from_slice(&GRID);
     let sv = predict_survival(&m, &pop, &m.default_params, &probe);

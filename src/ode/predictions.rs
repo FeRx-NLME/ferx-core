@@ -149,14 +149,26 @@ pub(crate) fn ss_equilibration_opts(opts: &OdeSolverOptions) -> OdeSolverOptions
 /// **What this mask is and is not load-bearing for**, measured by mutation rather than argued:
 /// it is *not* what makes `H` correct — [`restore_chz`] overwrites the accumulator row on the
 /// way out unconditionally, and `[odes]` may not read `__chz_*` (rejected at parse time), so
-/// the PK rows cannot see the row either. Removing the mask changes no hazard this module's
-/// tests observe. It earns its place on the path where the accumulator is *read back*: when
-/// the exact fixed point declines — a nonlinear PK block — the capped pulse train runs and
-/// [`SsStopTracker`] judges convergence on the **whole** state vector. An unmasked accumulator
-/// grows by `hazard × II` every cycle and never settles, so the train can never early-stop: it
-/// burns all [`SS_EQUILIBRATION_CYCLES`] and then reports a #867 non-convergence for a PK block
-/// that converged long before. Masking also keeps a monotonically growing row out of the
-/// integrator's error norm, so it does not steer the PK step sizes.
+/// the PK rows cannot see the row either. Removing the mask changes no hazard directly.
+///
+/// It earns its place on the path where the accumulator is *read back*: when the exact fixed
+/// point declines — a nonlinear PK block — the capped pulse train runs and [`SsStopTracker`]
+/// judges convergence on the **whole** state vector. An unmasked accumulator grows by
+/// `hazard × II` every cycle and never settles, so the train can never early-stop: it burns all
+/// [`SS_EQUILIBRATION_CYCLES`] and then reports a #867 non-convergence for a PK block that
+/// converged long before. That is held by
+/// `a_nonlinear_joint_model_judges_convergence_on_the_pk_rows`, which asserts the cycle count
+/// and dies at the 50-cycle cap when [`equilibrate_ss_pk_state`]'s mask is dropped.
+///
+/// **The copy in [`ss_state_at_phase_pk`] is deliberately kept although no test can hold it.**
+/// Measured: dropping it kills nothing, because the wrapper's [`restore_chz`] overwrites the
+/// row on exit, and the phase advance spans at most one interval, so the row it would grow is
+/// bounded by `hazard × II` rather than by 50 times that. The only channel left is the
+/// integrator's error norm — a monotonically growing row would steer the PK step sizes — which
+/// is a tolerance-level effect and the wrong thing to pin in a test. It stays for uniformity
+/// (all three SS paths mask, so a reader who finds one unmasked does not have to re-derive
+/// why) and because deleting it would leave [`restore_chz`] as the *sole* thing carrying
+/// correctness on that path.
 ///
 /// A no-op (an empty loop) for every model without an `[event_model]`.
 #[inline]

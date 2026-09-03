@@ -8959,6 +8959,68 @@ fn a_plain_dose_followed_by_an_ss_dose_keeps_the_hazard_accrued_so_far() {
     assert_hazard_is_the_closed_form(&got, &times, "single@0 + SS@48");
 }
 
+/// The mid-record rule when the SS dose is **also lagged past the interval** — the only
+/// combination that reaches [`ss_state_at_phase`]'s own [`restore_chz`].
+///
+/// `ss_state_at_phase_pk` returns the accumulator at zero unconditionally: it starts from
+/// `equilibrate_ss_pk_state`'s zero vector and every integration inside it runs under
+/// [`mask_chz`]. So the wrapper's restore only has an effect when `chz_before != 0` — a dose
+/// that is *both* mid-record and lagged. Every other lag arm in this file doses once at
+/// `t = 0`, where restoring and zeroing are the same edit; measured, dropping that restore
+/// killed nothing at all before this arm existed. It is also why
+/// `ss_lag_beyond_the_interval_starts_the_hazard_clock_at_the_record` survived the composite
+/// pre-fix mutation: that arm's `chz_before` is zero, so the removal was invisible to it.
+///
+/// `ALAG1 > II` on purpose, and that is the half that isolates the restore. With a lag inside
+/// the interval the arrival is still the trough, so it re-equilibrates through
+/// [`equilibrate_ss_state`] and *that* function's restore would put the row back — the arm
+/// would then die from the wrong edit. Past `II` the phase clamps to zero and no arrival
+/// re-equilibration happens, leaving `ss_state_at_phase` the only thing carrying `H` across
+/// the record.
+///
+/// Killed by dropping `restore_chz` from [`ss_state_at_phase`]: the record seed zeroes the
+/// accumulator, so `H(48)` restarts from the phase advance's own accrual instead of
+/// continuing `H(47.9) ≈ 0.958`, and every later value is short by that much.
+#[cfg(feature = "survival")]
+#[test]
+fn a_mid_record_ss_dose_lagged_past_the_interval_keeps_the_hazard_accrued_so_far() {
+    let lag_slot = 6;
+    let mut ode = one_cpt_const_chz_spec();
+    ode.dose_attr_map
+        .insert(crate::types::DoseAttr::Lag, 1, lag_slot);
+    let mut pk = pk_one(1.0, 10.0);
+    pk.values[lag_slot] = 14.0; // > II, so the phase clamps and the record seed is what flows
+    let subject = make_subject(
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(48.0, 100.0, 1, 0.0, true, SS_CHZ_II),
+        ],
+        vec![],
+    );
+    let times = [0.0, 12.0, 47.9, 48.0, 48.1, 60.0];
+    let got = chz_at(&ode, &pk, &subject, &times);
+
+    // The straddle, asserted rather than assumed: with no live hazard arriving at the second
+    // record, "preserve" and "zero" agree and this arm cannot discriminate.
+    let h_before = got[2];
+    assert!(
+        h_before > 0.9,
+        "the pre-dose hazard must be materially non-zero for this arm to discriminate; got \
+         H(47.9) = {h_before}"
+    );
+
+    assert_hazard_is_the_closed_form(&got, &times, "single@0 + SS@48 + ALAG1 = 14");
+
+    let elapsed = times[3] - times[2];
+    assert!(
+        (got[3] - got[2] - SS_CHZ_H0 * elapsed).abs() < 1e-9,
+        "H jumped across the lagged SS dose record beyond the {elapsed} h of accrual: \
+         H(47.9) = {}, H(48) = {}",
+        got[2],
+        got[3]
+    );
+}
+
 /// `SS=1` into a built-in absorption compartment (#719) equilibrates through
 /// `equilibrate_ss_input_rate` — a third branch, with its own exact solve and its own
 /// Anderson fallback. It reaches the accumulator by a different route than either bolus
