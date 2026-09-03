@@ -89,6 +89,12 @@ pub fn run_sir(
     population: Option<&Population>,
     options: &FitOptions,
 ) -> Result<FitResult, String> {
+    // #1212: carry this call's ODE solver settings to the integrator, as `fit()` does. Every
+    // SIR sample re-solves the inner loop, so without this a caller-supplied `ode_reltol` /
+    // `ode_method` would be ignored and the sampled OFVs would come from a different
+    // integration accuracy than the fit being refined. Disarmed on every exit path.
+    let _ode_solver_override =
+        crate::ode::solver::arm_ode_solver_override(options.ode_solver_override());
     // Hash verification runs before the covariance check so a stale-input
     // error wins over a missing-cov error. A user pointing at the wrong
     // model or dataset should hear about that first; the cov-missing case

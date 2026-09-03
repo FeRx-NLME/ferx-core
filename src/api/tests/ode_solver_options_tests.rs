@@ -7,9 +7,15 @@
 //! rather than on a warning or a returned setting: only the objective can say whether the
 //! value actually reached the solver.
 //!
-//! The three cases are the three directions the merge has to get right — the caller's value
-//! wins where they set one, the model file's value survives where they did not, and neither
-//! outlives the fit.
+//! The first three cases are the three directions the merge has to get right — the caller's
+//! value wins where they set one, the model file's value survives where they did not, and
+//! neither outlives the fit — and the fourth is the same question for the standalone
+//! covariance step, which integrates just as `fit` does.
+//!
+//! All of them take `ode_override_test_lock()` first. The armed override is shared across
+//! threads and libtest runs this binary's tests concurrently, so without it one test's tight
+//! override is what another test's `loose` fit measures, and the bit-comparisons here stop
+//! meaning anything.
 
 use super::*;
 use crate::parser::model_parser::parse_model_string;
@@ -105,6 +111,7 @@ fn ofv(model: &CompiledModel, opts: &FitOptions) -> f64 {
 /// the solver.
 #[test]
 fn a_caller_supplied_ode_tolerance_reaches_the_integrator() {
+    let _serial = crate::ode::solver::ode_override_test_lock();
     let model = ode_model("");
     let loose = ofv(&model, &eval_opts());
     let tight = ofv(
@@ -137,6 +144,7 @@ fn a_caller_supplied_ode_tolerance_reaches_the_integrator() {
 /// the file wins — the fit stays at the accuracy the model asked for.
 #[test]
 fn an_untouched_ode_tolerance_keeps_the_model_files_pinned_value() {
+    let _serial = crate::ode::solver::ode_override_test_lock();
     let pinned = ode_model("[fit_options]\n  ode_reltol = 1e-10\n  ode_abstol = 1e-12\n");
     let plain = ode_model("");
 
@@ -168,11 +176,55 @@ fn an_untouched_ode_tolerance_keeps_the_model_files_pinned_value() {
     );
 }
 
+/// `run_covariance` is the same last hop as `fit()`, and the one where getting it wrong is
+/// worst: the R matrix is a second difference of the reconverged OFV, so a standalone
+/// covariance step run at the *parse-time* accuracy after a fit run at a caller-supplied tight
+/// one differences a different surface than the estimates came from — and reports plausible
+/// standard errors for it.
+#[test]
+fn a_caller_supplied_ode_tolerance_reaches_the_standalone_covariance_step() {
+    let _serial = crate::ode::solver::ode_override_test_lock();
+    let model = ode_model("");
+    let pop = population();
+    let fitted = fit(&model, &pop, &model.default_params, &eval_opts()).expect("the fit runs");
+
+    let se = |opts: &FitOptions| {
+        crate::estimation::run_covariance::run_covariance(&fitted, Some(&model), Some(&pop), opts)
+            .expect("the covariance step runs")
+            .se_theta
+            .expect("a standard error vector")
+    };
+
+    let loose = se(&eval_opts());
+    let tight = se(&FitOptions {
+        ode_reltol: 1e-10,
+        ode_abstol: 1e-12,
+        ..eval_opts()
+    });
+
+    assert_eq!(loose.len(), tight.len());
+    // Every entry must be a real number before the comparison folds them: a `NaN` from a
+    // failed step would otherwise make the "they differ" test pass for the wrong reason.
+    assert!(
+        loose.iter().chain(tight.iter()).all(|v| v.is_finite()),
+        "the covariance step returned non-finite standard errors ({loose:?} vs {tight:?})"
+    );
+    assert!(
+        loose
+            .iter()
+            .zip(tight.iter())
+            .any(|(a, b)| a.to_bits() != b.to_bits()),
+        "#1212: `ode_reltol` passed to `run_covariance` must reach the integrator, but the \
+         standard errors are bit-identical at 1e-4 and 1e-10 ({loose:?} vs {tight:?})"
+    );
+}
+
 /// The override is armed for the duration of one `fit` and no longer. A leak would be the same
 /// class of bug pointed the other way: a `predict` after a tight fit would silently run at the
 /// fit's tolerance instead of the spec's.
 #[test]
 fn a_fits_ode_options_do_not_outlive_it() {
+    let _serial = crate::ode::solver::ode_override_test_lock();
     let model = ode_model("");
     let baked = model
         .ode_spec

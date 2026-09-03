@@ -24,7 +24,7 @@ const ALLOWED: &[&str] = [
 .as_slice();
 
 fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
-    for entry in std::fs::read_dir(dir).expect("src/ must be readable") {
+    for entry in std::fs::read_dir(dir).expect("a source directory must be readable") {
         let path = entry.expect("a readable directory entry").path();
         if path.is_dir() {
             rust_sources(&path, out);
@@ -34,31 +34,62 @@ fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Every `src/` tree in the workspace: the engine, plus the members that consume it as an
+/// ordinary crate and can reach `OdeSpec::solver_opts` through the public API just as well.
+fn source_roots() -> Vec<PathBuf> {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut roots = vec![repo.join("src")];
+    for entry in std::fs::read_dir(repo.join("crates")).expect("crates/ must be readable") {
+        let member = entry
+            .expect("a readable directory entry")
+            .path()
+            .join("src");
+        if member.is_dir() {
+            roots.push(member);
+        }
+    }
+    roots
+}
+
+/// The lines of `src` that are production code, as `(zero-based line number, line)`.
+///
+/// Inline test modules sit at the end of a file by convention here, so everything from the
+/// first `#[cfg(test)]` **attribute** onward is test code — free to assert on the baked field,
+/// which is exactly what a test pinning the parser's stamping should do. The attribute has to
+/// be matched as a whole line and not with `str::find`: `src/ode/predictions.rs` names
+/// `#[cfg(test)]` inside an ordinary comment on line 17, and a substring search cut the scan
+/// off there — leaving ~6,000 lines holding half the converted call sites unguarded.
+fn production_lines(src: &str, is_test_file: bool) -> Vec<(usize, &str)> {
+    if is_test_file {
+        // A sibling test file (`<file>_tests.rs`) is test code in its entirety.
+        return Vec::new();
+    }
+    src.lines()
+        .enumerate()
+        .take_while(|(_, l)| l.trim() != "#[cfg(test)]")
+        .collect()
+}
+
 #[test]
 fn no_production_code_reads_the_baked_solver_opts_field() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let roots = source_roots();
     let mut files = Vec::new();
-    rust_sources(&root, &mut files);
-    assert!(files.len() > 100, "the source walk found only {} files, which is not this crate — the guard would pass vacuously", files.len());
+    for root in &roots {
+        rust_sources(root, &mut files);
+    }
+    assert!(files.len() > 100, "the source walk found only {} files, which is not this workspace — the guard would pass vacuously", files.len());
 
     let mut offenders: Vec<String> = Vec::new();
+    let mut scanned_lines = 0usize;
     for path in &files {
-        // A sibling test file (`<file>_tests.rs`) is test code in its entirety.
         let is_test_file = path
             .file_stem()
             .and_then(|s| s.to_str())
             .is_some_and(|s| s.ends_with("_tests") || s == "types_test_helpers");
         let src = std::fs::read_to_string(path).expect("a readable source file");
-        // Inline test modules sit at the end of a file by convention here, so everything from
-        // the first `#[cfg(test)]` onward is test code — free to assert on the baked field,
-        // which is exactly what a test pinning the parser's stamping should do.
-        let production = match src.find("#[cfg(test)]") {
-            Some(i) if !is_test_file => &src[..i],
-            Some(_) | None if is_test_file => "",
-            None => &src[..],
-            _ => "",
-        };
-        for (n, line) in production.lines().enumerate() {
+        let production = production_lines(&src, is_test_file);
+        scanned_lines += production.len();
+        for (n, line) in production {
             let t = line.trim();
             if !t.contains(".solver_opts") {
                 continue;
@@ -79,13 +110,15 @@ fn no_production_code_reads_the_baked_solver_opts_field() {
             if ALLOWED.contains(&t) {
                 continue;
             }
-            offenders.push(format!(
-                "{}:{}: {t}",
-                path.strip_prefix(&root).unwrap_or(path).display(),
-                n + 1
-            ));
+            offenders.push(format!("{}:{}: {t}", path.display(), n + 1));
         }
     }
+
+    assert!(
+        scanned_lines > 100_000,
+        "only {scanned_lines} lines were scanned as production code, which is a fraction of \
+         this workspace — the boundary detection has stopped early again"
+    );
 
     assert!(
         offenders.is_empty(),
@@ -94,4 +127,39 @@ fn no_production_code_reads_the_baked_solver_opts_field() {
          `spec.effective_solver_opts()`:\n  {}",
         offenders.join("\n  ")
     );
+}
+
+/// The guard's own failure mode, and the one it shipped with: a file that *mentions* the
+/// attribute in prose before its test module starts had everything after that comment treated
+/// as test code and never scanned. `src/ode/predictions.rs` is that file, and it holds 10 of
+/// the 19 converted call sites.
+#[test]
+fn the_test_module_boundary_ignores_a_comment_that_names_the_attribute() {
+    let src = "//! `MonitorSpec` is named only by the `#[cfg(test)]` wrapper below.\n\
+               fn integrate() { let o = spec.solver_opts; }\n\
+               #[cfg(test)]\n\
+               mod tests {\n\
+               let baked = spec.solver_opts;\n\
+               }\n";
+    let production = production_lines(src, false);
+    assert_eq!(
+        production.len(),
+        2,
+        "the prose mention of the attribute cut the scan short: {production:?}"
+    );
+    assert!(
+        production[1].1.contains("let o = spec.solver_opts;"),
+        "the line after the prose mention must still be scanned"
+    );
+
+    // …while a real attribute still ends the production region, so a test module keeps its
+    // licence to read the baked field.
+    let production = production_lines(
+        "fn f() {}\n#[cfg(test)]\nmod t { spec.solver_opts }\n",
+        false,
+    );
+    assert_eq!(production.len(), 1);
+
+    // And a sibling `_tests.rs` file is test code start to finish.
+    assert!(production_lines("spec.solver_opts\n", true).is_empty());
 }

@@ -3926,6 +3926,18 @@ impl CompiledModel {
     /// Calling this on an owned model before `fit` (as the R wrapper's `ferx_fit` does) remains
     /// correct and is still the way `predict` / `simulate`, which take no fit options at all,
     /// get the requested accuracy. Idempotent.
+    ///
+    /// It is also how the two are kept *consistent*. The fit-scoped override lasts exactly one
+    /// `fit` call, so a caller who passes `ode_reltol = 1e-10` to `fit(&model, …)` and then
+    /// calls `predict(&model, …)` gets a fit whose IPREDs were integrated at `1e-10` and
+    /// predictions integrated at the model file's value, with nothing to say the two differ.
+    /// Sync an owned model when both paths have to agree.
+    ///
+    /// One asymmetry to know when reading the two together: this stamps all six fields
+    /// unconditionally, so an `opts` field left at the `FitOptions` default overwrites a model
+    /// file that pinned one — the opposite of the override's "a default reads as no opinion"
+    /// rule. That is why the R wrapper builds `opts` from the parsed `[fit_options]` and merges
+    /// `settings` onto it, rather than from `FitOptions::default()`.
     pub fn sync_ode_solver_opts(&mut self, opts: &FitOptions) {
         if let Some(ode) = self.ode_spec.as_mut() {
             ode.solver_opts.reltol = opts.ode_reltol;

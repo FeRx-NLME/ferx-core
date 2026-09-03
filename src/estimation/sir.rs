@@ -476,6 +476,12 @@ pub fn run_sir_core(
     ofv_hat: f64,
     options: &FitOptions,
 ) -> Result<SirResult, String> {
+    // #1212: the math kernel is public API in its own right, so it arms the fit-scoped ODE
+    // override too rather than relying on its caller having done so. Nested inside `run_sir`'s
+    // or `fit()`'s arming this is a no-op — the same value is re-armed and retired — while a
+    // direct caller gets the tolerances they passed instead of the spec's parse-time ones.
+    let _ode_solver_override =
+        crate::ode::solver::arm_ode_solver_override(options.ode_solver_override());
     let n_samples = options.sir_samples;
     let n_resamples = options.sir_resamples;
 

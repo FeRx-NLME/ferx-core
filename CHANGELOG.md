@@ -60,8 +60,13 @@ section of the SDLC for the versioning policy).
   nothing to say so. A fit now carries the caller's ODE settings to the integrator for the
   duration of that fit. Precedence is per key and one-directional: a key the caller moved off
   its default wins, a key left at its default yields to the model file, so passing a
-  hand-built `FitOptions` cannot loosen a model that pinned `ode_reltol = 1e-10`. The
-  model-file route, `predict()` and `simulate()` are unchanged.
+  hand-built `FitOptions` cannot loosen a model that pinned `ode_reltol = 1e-10`. The same
+  now applies to the standalone `run_covariance()`, `run_sir()` and `run_sir_core()` entry
+  points, which previously ignored a caller's ODE settings — so a covariance step run beside
+  a tight fit no longer differences a coarser surface than the estimates came from. The
+  model-file route, `predict()` and `simulate()` are unchanged; note that the override lasts
+  one call, so `predict()` after a tight `fit()` on the same model still uses the model
+  file's accuracy unless you `sync_ode_solver_opts` an owned model.
 - **An estimated `block_sigma` correlation is bounded at `|rho| <= 0.995` (#847).** Merely
   keeping rho inside `(-1, 1)` is not enough: a paired residual block's determinant carries a
   factor `1 - rho^2`, so a rho of 0.9999 leaves `R` numerically singular and the likelihood

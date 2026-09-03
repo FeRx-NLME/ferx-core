@@ -85,6 +85,15 @@ pub fn run_covariance(
     population: Option<&Population>,
     options: &FitOptions,
 ) -> Result<FitResult, String> {
+    // #1212, same last hop as `fit()`: this call's `ode_reltol` / `ode_method` / … have to
+    // reach the integrator, and the spec they would otherwise be read off carries the
+    // parse-time values. It matters more here than almost anywhere else — the covariance step
+    // is a second difference of the reconverged OFV, so running it at a *different* accuracy
+    // than the fit that produced the estimates is exactly how a plausible-looking standard
+    // error comes out wrong. Armed for the whole call, including the re-parse and re-read
+    // paths below, and disarmed on every exit.
+    let _ode_solver_override =
+        crate::ode::solver::arm_ode_solver_override(options.ode_solver_override());
     // Input resolution mirrors `run_sir` exactly: stale-input errors win over
     // any downstream failure so a user pointing at the wrong model/dataset
     // hears about that first.
