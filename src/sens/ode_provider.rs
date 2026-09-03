@@ -3873,6 +3873,13 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
     d1_vars: &mut Vec<Dual1<1>>,
     d1_stack: &mut Vec<Dual1<1>>,
 ) -> Vec<T> {
+    debug_assert!(
+        !program.has_chz(),
+        "dual SS equilibration reached a joint PK-TTE system: it has no accumulator handling, \
+         so it would bank the run-in's hazard into the gradient (#1210). A joint model routes \
+         to FD end-to-end (`has_tte` in inner_optimizer, `has_non_gaussian` in the provider); \
+         if that routing is widened, the #1210 masking has to come with it."
+    );
     let mut u = vec![T::from_f64(0.0); n_states];
     if dose.ii <= 0.0 {
         return u;
@@ -4125,6 +4132,10 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::PkNum>(
     params: &[T],
     opts: &crate::ode::solver::OdeSolverOptions,
 ) -> Vec<T> {
+    debug_assert!(
+        !program.has_chz(),
+        "dual SS equilibration reached a joint PK-TTE system: see `equilibrate_ss_state_g` (#1210)."
+    );
     let n = n_states;
     let ii = dose.ii;
     // `CMT=0` equilibrates compartment 1 — the default dose compartment — like the f64 twin

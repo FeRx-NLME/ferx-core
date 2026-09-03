@@ -79,6 +79,10 @@ PK and the event model share the same random effects (a common frailty). Notes:
   thetas or covariates directly, so declare hazard parameters and any between-subject
   variability in `[individual_parameters]`.
 - **IOV is not yet supported** with an ODE hazard (rejected at parse time).
+- An `SS=1` dose equilibrates the PK compartments only; the accumulator keeps its value
+  at the dose record, so `H` starts at `0` for a first dose and is preserved across a
+  later one — see
+  [SS with an ODE-accumulated hazard](steady-state.qmd#ss-with-an-ode-accumulated-hazard).
 - `fit()` and `predict_survival()` work; **`simulate()` is not yet supported** for an
   ODE-accumulated hazard (drug-driven event-time sampling is a later slice — it returns a
   clear error rather than silently emitting no event rows).

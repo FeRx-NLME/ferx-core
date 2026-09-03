@@ -5,6 +5,7 @@ use approx::assert_relative_eq;
 /// 1-cpt IV bolus ODE: dA/dt = -ke·A. RHS reads CL,V from pk_params_flat.
 fn one_cpt_ode_spec() -> OdeSpec {
     OdeSpec {
+        chz_state_slots: Vec::new(),
         rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
             let cl = p[crate::types::PK_IDX_CL];
             let v = p[crate::types::PK_IDX_V];
@@ -62,6 +63,7 @@ fn make_subject(doses: Vec<DoseEvent>, obs_times: Vec<f64>) -> Subject {
 /// prediction vector *is* the sequence of `TIME` values the readout saw (#1028).
 fn time_readout_ode_spec() -> OdeSpec {
     OdeSpec {
+        chz_state_slots: Vec::new(),
         rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
             dy[0] = 0.0;
         }),
@@ -121,6 +123,7 @@ fn form_c_readout_time_is_the_raw_data_clock() {
 #[cfg(feature = "survival")]
 fn one_cpt_chz_ode_spec() -> OdeSpec {
     OdeSpec {
+        chz_state_slots: Vec::new(),
         rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
             let cl = p[crate::types::PK_IDX_CL];
             let v = p[crate::types::PK_IDX_V];
@@ -1978,6 +1981,7 @@ fn adaptive_decision_monitor_uses_observation_covariates() {
     // readout is `state * FREE`; with no decay the state stays at the dose
     // amount, so the monitored signal is driven purely by FREE.
     let ode = OdeSpec {
+        chz_state_slots: Vec::new(),
         rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
             dy[0] = 0.0;
         }),
@@ -2598,6 +2602,7 @@ fn one_cpt_lag_spec(lag_slot: usize) -> OdeSpec {
     let mut map = crate::types::DoseAttrMap::default();
     map.insert(crate::types::DoseAttr::Lag, 1, lag_slot);
     OdeSpec {
+        chz_state_slots: Vec::new(),
         rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
             let cl = p[crate::types::PK_IDX_CL];
             let v = p[crate::types::PK_IDX_V];
@@ -3861,6 +3866,7 @@ fn integrate_segment_tad_anchor_set_when_prior_dose_exists() {
 /// selects which compartment the observable reads.
 fn two_cpt_accumulator(readout_idx: usize, map: crate::types::DoseAttrMap) -> OdeSpec {
     OdeSpec {
+        chz_state_slots: Vec::new(),
         rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
             dy[0] = 0.0;
             dy[1] = 0.0;
@@ -4022,6 +4028,7 @@ fn dense_solve_ss_lagged_infusion_runs() {
 #[test]
 fn ode_predictions_ekf_wrapper_runs() {
     let ode = OdeSpec {
+        chz_state_slots: Vec::new(),
         rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
             let cl = p[crate::types::PK_IDX_CL];
             let v = p[crate::types::PK_IDX_V];
@@ -4053,6 +4060,7 @@ fn ode_predictions_ekf_wrapper_runs() {
 /// params: kin @ slot 0, kout @ slot 1. Observable reads R (state 0).
 fn turnover_ode_spec_with_init() -> OdeSpec {
     OdeSpec {
+        chz_state_slots: Vec::new(),
         rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
             dy[0] = p[0] - p[1] * y[0];
         }),
@@ -4089,6 +4097,7 @@ use crate::pk::absorption::{InputRateForcing, InputRateKind};
 /// Transit args live at free slots: `n` @ 6, `mtt` @ 7.
 fn transit_accumulator_spec() -> OdeSpec {
     OdeSpec {
+        chz_state_slots: Vec::new(),
         rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
             dy[0] = 0.0;
         }),
@@ -4134,6 +4143,7 @@ fn pk_transit_struct(n: f64, mtt: f64, f: f64) -> PkParams {
 /// dosing into a built-in absorption compartment against an explicit run-in (#719).
 fn first_order_one_cpt_spec() -> OdeSpec {
     OdeSpec {
+        chz_state_slots: Vec::new(),
         rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
             let cl = p[crate::types::PK_IDX_CL];
             let v = p[crate::types::PK_IDX_V];
@@ -4216,6 +4226,7 @@ fn ss_into_first_order_absorption_matches_explicit_run_in() {
 /// (CL/V)·central`. `n,mtt` @ slots 6,7; `KA` @ slot 4. Observable is central (state 1).
 fn transit_one_cpt_oral_spec() -> OdeSpec {
     OdeSpec {
+        chz_state_slots: Vec::new(),
         rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
             let cl = p[crate::types::PK_IDX_CL];
             let v = p[crate::types::PK_IDX_V];
@@ -4921,6 +4932,7 @@ fn simulated_event_time_is_consistent_with_the_guarded_hazard() {
     // state 0: central, fed by the `first_order` kernel. state 1: the CHZ accumulator.
     // Readout is the CHZ state, so `ode_predictions` reads H(t) off the guarded path.
     let make_spec = || OdeSpec {
+        chz_state_slots: Vec::new(),
         rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
             let (cl, v) = (p[crate::types::PK_IDX_CL], p[crate::types::PK_IDX_V]);
             let ke = if v > 0.0 { cl / v } else { 0.0 };
@@ -5080,6 +5092,7 @@ fn input_rate_consumes_cmt_matches_forcing_compartment() {
 /// `(F·amt/dur)·t` (a direct probe that the cutoff break is placed correctly).
 fn zero_order_accumulator_spec() -> OdeSpec {
     OdeSpec {
+        chz_state_slots: Vec::new(),
         rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
             dy[0] = 0.0;
         }),
@@ -5164,6 +5177,7 @@ fn push_route_lag_break_times_adds_route_onsets() {
         lag_slot,
     };
     let ode = OdeSpec {
+        chz_state_slots: Vec::new(),
         rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
             dy[0] = 0.0;
         }),
@@ -5536,6 +5550,7 @@ fn add_prepared_forcing_applies_pathway_fraction_linear_in_frac() {
         lag_slot: None,
     };
     let ode = OdeSpec {
+        chz_state_slots: Vec::new(),
         rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
             dy[0] = 0.0;
         }),
@@ -5925,6 +5940,7 @@ fn ode_event_driven_picks_up_changing_cl() {
 /// Used to test infusion into the depot compartment (cmt=1).
 fn one_cpt_oral_ode_spec() -> OdeSpec {
     OdeSpec {
+        chz_state_slots: Vec::new(),
         rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
             let cl = p[crate::types::PK_IDX_CL];
             let v = p[crate::types::PK_IDX_V];
@@ -6007,6 +6023,7 @@ fn ode_event_driven_form_c_uses_observation_covariates() {
     // FREE=0 and FREE=1. Form C must see the observation snapshot, not the
     // subject-level first-row covariate.
     let ode = OdeSpec {
+        chz_state_slots: Vec::new(),
         rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
             dy[0] = 0.0;
         }),
@@ -6361,7 +6378,7 @@ fn ss_linear_disposition_uses_exact_fixed_point() {
     // point being wrong (`ode_provider_ss_linear_bolus_uses_exact_solve` checks the gradient too).
     for (cl, v, label) in [(5.0_f64, 10.0_f64, "fast"), (0.1_f64, 50.0_f64, "slow")] {
         let pk = pk_one(cl, v);
-        let trough = equilibrate_ss_state(&ode, &pk.values, &dose, &ode.solver_opts);
+        let trough = equilibrate_ss_state(&ode, &pk.values, &dose, &ode.solver_opts, &[]);
         assert_eq!(
             crate::dosing::last_ss_equilibration_cycles(),
             1,
@@ -6383,6 +6400,7 @@ fn ss_linear_disposition_uses_exact_fixed_point() {
 /// also carries a `first_order` input rate and so exercises the input-rate branch instead.
 fn mm_disposition_spec() -> OdeSpec {
     OdeSpec {
+        chz_state_slots: Vec::new(),
         rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
             let vmax = p[crate::types::PK_IDX_CL];
             let km = p[crate::types::PK_IDX_V];
@@ -6440,7 +6458,7 @@ fn ss_nonlinear_bolus_with_steady_state_uses_fallback() {
     pk.values[crate::types::PK_IDX_V] = 30.0; // Km — the peak amount ≈ 100 ≫ Km, so genuinely nonlinear
     let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 8.0);
 
-    let trough = equilibrate_ss_state(&ode, &pk.values, &dose, &ode.solver_opts);
+    let trough = equilibrate_ss_state(&ode, &pk.values, &dose, &ode.solver_opts, &[]);
     let cycles = crate::dosing::last_ss_equilibration_cycles();
     assert!(
         (2..SS_EQUILIBRATION_CYCLES).contains(&cycles),
@@ -6473,7 +6491,7 @@ fn ss_nonlinear_over_capacity_bolus_caps_and_warns() {
     pk.values[crate::types::PK_IDX_V] = 8.0; // Km
     let ss = DoseEvent::new(0.0, 50.0, 1, 0.0, true, 8.0); // mean input 6.25 > Vmax 5
 
-    let trough = equilibrate_ss_state(&ode, &pk.values, &ss, &ode.solver_opts);
+    let trough = equilibrate_ss_state(&ode, &pk.values, &ss, &ode.solver_opts, &[]);
     assert_eq!(
         crate::dosing::last_ss_equilibration_cycles(),
         SS_EQUILIBRATION_CYCLES,
@@ -6658,6 +6676,7 @@ fn ode_ss_iv_bolus_with_lagtime_matches_nonmem() {
 /// V is passed in via `pk_params_flat[PK_IDX_V]`.
 fn one_cpt_ode_spec_amount_form() -> OdeSpec {
     OdeSpec {
+        chz_state_slots: Vec::new(),
         rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
             let cl = p[crate::types::PK_IDX_CL];
             // dA/dt = -CL/V * A   (state is amount; same exp decay as
@@ -6824,6 +6843,7 @@ fn test_ode_predictions_still_clamps_negatives() {
     // Sanity: dropping the NaN clamp must not change the negative
     // clamp behavior (ODE solver overshoot guard).
     let ode = OdeSpec {
+        chz_state_slots: Vec::new(),
         // dA/dt = -1 → state goes negative quickly with starting amount 1
         rhs: Box::new(|_y, _p, _t, dy| {
             dy[0] = -1.0;
@@ -6862,6 +6882,7 @@ fn test_ode_predictions_still_clamps_negatives() {
 /// it. The reprex of #1020, reduced to a Tier-1 spec.
 fn signed_readout_clock_spec(readout: OdeReadout) -> OdeSpec {
     OdeSpec {
+        chz_state_slots: Vec::new(),
         rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
             dy[0] = 1.0;
         }),
@@ -7375,6 +7396,7 @@ fn adaptive_observe_expression_flows_through_driver() {
 /// nonlinear-SS tests.
 fn mm_ss_absorption_spec() -> OdeSpec {
     OdeSpec {
+        chz_state_slots: Vec::new(),
         // Vmax reuses the CL slot, Km the V slot; `first_order` ka at slot 4.
         rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
             let vmax = p[crate::types::PK_IDX_CL];
@@ -7677,6 +7699,7 @@ fn ss_input_rate_linear_disposition_uses_fixed_point() {
     solver_opts.reltol = 1e-10;
     solver_opts.abstol = 1e-10;
     let ode = OdeSpec {
+        chz_state_slots: Vec::new(),
         rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
             let cl = p[crate::types::PK_IDX_CL];
             let v = p[crate::types::PK_IDX_V];
@@ -8034,6 +8057,7 @@ fn a_non_record_event_past_the_final_record_does_not_poison_the_walk() {
 /// propagates into the state instead of staying inert.
 fn one_cpt_tad_ode_spec() -> OdeSpec {
     let mut ode = OdeSpec {
+        chz_state_slots: Vec::new(),
         rhs: Box::new(|y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
             let cl = p[crate::types::PK_IDX_CL];
             let v = p[crate::types::PK_IDX_V];
@@ -8221,6 +8245,7 @@ fn the_pre_arrival_tad_anchor_does_not_depend_on_the_sampling_mesh() {
 /// `nonmem_anchor/dose_form_lag_ss.ctl` term for term.
 fn oral_depot_central_ode_spec() -> OdeSpec {
     OdeSpec {
+        chz_state_slots: Vec::new(),
         rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
             let cl = p[crate::types::PK_IDX_CL];
             let v = p[crate::types::PK_IDX_V];
@@ -8289,7 +8314,7 @@ fn ss_state_at_phase_matches_nonmem_at_the_dose_record() {
     let dose = DoseEvent::new(0.0, amt, 1, 0.0, true, ii);
     assert!(dose.ss && dose.ii > 0.0, "precondition: this is an SS dose");
 
-    let u = ss_state_at_phase(&ode, &pk.values, &dose, ii - lag, &ode.solver_opts);
+    let u = ss_state_at_phase(&ode, &pk.values, &dose, ii - lag, &ode.solver_opts, &[]);
 
     // `PRED` at `TIME = 0`, `nonmem_anchor/results/dose_form_lag_ss.tab`.
     const NM_PRED_AT_RECORD: f64 = 2.8687e-01;
@@ -8310,7 +8335,7 @@ fn ss_state_at_phase_matches_nonmem_at_the_dose_record() {
     // And the seed must genuinely differ from the bare trough, or the whole
     // distinction #1121 rests on is untested by this fixture: at phase `II` the
     // pulse has decayed a further `lag`, so the trough is strictly lower.
-    let trough = equilibrate_ss_state(&ode, &pk.values, &dose, &ode.solver_opts);
+    let trough = equilibrate_ss_state(&ode, &pk.values, &dose, &ode.solver_opts, &[]);
     assert!(
         trough[1] < u[1] * 0.95,
         "phase II−lag must be materially above the phase-II trough \
@@ -8664,6 +8689,440 @@ fn route_lagged_first_order_onset_reaches_both_dense_builders() {
             from_predictions.iter().any(|&t| (t - want).abs() < 1e-12),
             "collect_dose_break_times dropped the first_order route onset at {want}: \
              {from_predictions:?}"
+        );
+    }
+}
+
+// ── #1210 — an SS dose must not carry the equilibration run-in into H(0) ─────────────
+//
+// The whole family is anchored on a **constant** hazard, `dCHZ/dt = SS_CHZ_H0`. Then
+// `H(t) = H0·t` exactly, whatever the PK does, so the reference is arithmetic rather than a
+// second integration — a disagreement here is the engine's and cannot be the oracle's.
+// `nonmem_anchor/ss_chz_r2_*.ctl` carries the drug-driven and time-dependent arms, which no
+// closed form reaches; `tests/ss_chz_nonmem_anchor.rs` compares against them.
+
+/// #1210's constant hazard. `H(t) = SS_CHZ_H0 · t`.
+#[cfg(feature = "survival")]
+const SS_CHZ_H0: f64 = 0.02;
+
+/// #1210's dosing interval, and the SS run-in's own displacement: with
+/// `SS_EQUILIBRATION_CYCLES = 50` cycles of `II = 12`, an unmasked accumulator banks
+/// `0.02 × 50 × 12 = 12.0` before the record starts.
+#[cfg(feature = "survival")]
+const SS_CHZ_II: f64 = 12.0;
+
+/// 1-cpt IV bolus + a **declared** constant-rate cumulative-hazard accumulator: state 0 =
+/// central (`dC/dt = -ke·C`), state 1 = the injected `d/dt(__chz_<cmt>)` row.
+///
+/// The declaration is the point: `chz_state_slots = [1]` is what `build_ode_spec` produces
+/// for a model with an `[event_model]`, and it is what tells the steady-state equilibration
+/// that row is not a compartment. A fixture that carried the accumulator *without* declaring
+/// it would exercise the pre-#1210 code path and pass whatever the engine did.
+#[cfg(feature = "survival")]
+fn one_cpt_const_chz_spec() -> OdeSpec {
+    OdeSpec {
+        chz_state_slots: vec![1],
+        rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+            let cl = p[crate::types::PK_IDX_CL];
+            let v = p[crate::types::PK_IDX_V];
+            let ke = if v > 0.0 { cl / v } else { 0.0 };
+            dy[0] = -ke * y[0];
+            dy[1] = SS_CHZ_H0;
+        }),
+        n_states: 2,
+        state_names: vec!["central".into(), "__chz_3".into()],
+        readout: OdeReadout::ObsCmt(0),
+        diffusion_var: Vec::new(),
+        solver_opts: OdeSolverOptions {
+            abstol: 1e-11,
+            reltol: 1e-9,
+            ..OdeSolverOptions::default()
+        },
+        input_rate: Vec::new(),
+        rhs_program: None,
+        readout_program: None,
+        indiv_param_program: None,
+        dose_attr_map: Default::default(),
+        init_fn: None,
+    }
+}
+
+/// Cumulative hazard (state 1) at each of `times`, through the dense states path — the same
+/// walk `predict_survival`, `ode_cumhaz_hazard` and TTE simulation read.
+#[cfg(feature = "survival")]
+fn chz_at(ode: &OdeSpec, pk: &PkParams, subject: &Subject, times: &[f64]) -> Vec<f64> {
+    ode_dense_solve_states(ode, &pk.values, &[], &[], subject, times)
+        .iter()
+        .map(|s| s[1])
+        .collect()
+}
+
+/// `H(t) = H0·t` at every requested time, and `H` non-decreasing along the grid.
+///
+/// The monotonicity check is not redundant with the closed form: #1210's `ALAG1 = 2` arm read
+/// `H(1) = 12.22 > H(4) = 12.04`, i.e. the accumulator ran *backwards* between two records,
+/// which is impossible for a cumulative hazard and is the shape a phase advance through an
+/// unmasked RHS produces.
+#[cfg(feature = "survival")]
+fn assert_hazard_is_the_closed_form(got: &[f64], times: &[f64], arm: &str) {
+    for (&h, &t) in got.iter().zip(times) {
+        assert!(
+            h.is_finite(),
+            "{arm}: H({t}) = {h} is not finite — a NaN here would be silently absorbed by any \
+             `max`/`min` fold downstream"
+        );
+        assert!(
+            (h - SS_CHZ_H0 * t).abs() < 1e-9,
+            "{arm}: H({t}) = {h}, closed form {}",
+            SS_CHZ_H0 * t
+        );
+    }
+    for w in got.windows(2) {
+        assert!(
+            w[1] >= w[0],
+            "{arm}: H is non-monotone: {got:?} over {times:?}"
+        );
+    }
+}
+
+/// An `SS=1` bolus starts the hazard clock at the record: `H(0) = 0`, not the 600 hours of
+/// run-in the equilibration integrates through (#1210).
+///
+/// **No single-piece mutation kills this arm, and that is a property of the fix, not a gap in
+/// the test.** Measured: masking the accumulator, projecting it out of the fixed-point solve,
+/// and restoring `chz_before` each independently leave `H(0) = 0` for a *first* SS dose, whose
+/// pre-record value is zero either way. Removing any one of them keeps this green. It dies
+/// under the composite — all three removed, i.e. the pre-#1210 state — where `H(0)` reads
+/// `12.0 = H0 × SS_EQUILIBRATION_CYCLES × II` and every later record is displaced by the same
+/// amount. That is the number this arm exists to catch, and it is what ferx returned at
+/// `1187062a`.
+///
+/// The shape stays right under that defect — it is an origin error — so an assertion on the
+/// *increments* alone would pass in both directions; the absolute values are the test.
+#[cfg(feature = "survival")]
+#[test]
+fn ss_bolus_starts_the_hazard_clock_at_the_record() {
+    let ode = one_cpt_const_chz_spec();
+    let pk = pk_one(1.0, 10.0);
+    let subject = make_subject(
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, SS_CHZ_II)],
+        vec![],
+    );
+    let times = [0.0, 1.0, 4.0, 12.0];
+    let got = chz_at(&ode, &pk, &subject, &times);
+    assert_hazard_is_the_closed_form(&got, &times, "SS bolus");
+}
+
+/// The same for an `SS=1` **infusion**, which equilibrates through a different branch (an
+/// active-rate window plus a quiet window per cycle) and so cannot be inferred from the bolus
+/// arm. #1210's before-table read `12.0` here too.
+///
+/// Same mutation profile as the bolus arm: no single-piece removal reaches it, and the
+/// composite does. See [`ss_bolus_starts_the_hazard_clock_at_the_record`].
+#[cfg(feature = "survival")]
+#[test]
+fn ss_infusion_starts_the_hazard_clock_at_the_record() {
+    let ode = one_cpt_const_chz_spec();
+    let pk = pk_one(1.0, 10.0);
+    let subject = make_subject(
+        vec![DoseEvent::new(0.0, 100.0, 1, 25.0, true, SS_CHZ_II)],
+        vec![],
+    );
+    let times = [0.0, 1.0, 4.0, 12.0];
+    let got = chz_at(&ode, &pk, &subject, &times);
+    assert_hazard_is_the_closed_form(&got, &times, "SS infusion");
+}
+
+/// An `SS=1` dose whose arrival is lagged by less than `II` is seeded at the *record*
+/// (#1121): `ss_state_at_phase` equilibrates and then advances the trough through
+/// `phase = II − lag`. That advance is still run-in — it reconstructs the previous interval's
+/// tail, which happened before the record began — so it must not accrue hazard either.
+///
+/// Killed by dropping `restore_chz` — or by zeroing instead of preserving — and it dies
+/// through the **arrival**, not the record seed: with `lag < II` the lagged arrival is still
+/// the trough, so it re-equilibrates, and by then `0.02 × 2 = 0.04` of hazard has accrued
+/// since the record. Discarding it puts every later value 0.04 low. Measured, not inferred:
+/// masking `ss_state_at_phase_pk`'s own advance kills nothing on its own, because the wrapper
+/// restores that row afterwards regardless (see [`mask_chz`] for what the mask is actually
+/// load-bearing for).
+///
+/// At `1187062a` this arm read `H(0) = 12.2` — the equilibration's `12.0` plus the phase
+/// advance's `0.02 × 10` — with `H` non-monotone across the record (`H(1) = 12.22`,
+/// `H(4) = 12.04`), which is why the shared helper asserts monotonicity too.
+#[cfg(feature = "survival")]
+#[test]
+fn ss_lagged_dose_does_not_bank_its_phase_advance() {
+    let lag_slot = 6;
+    let mut ode = one_cpt_const_chz_spec();
+    ode.dose_attr_map
+        .insert(crate::types::DoseAttr::Lag, 1, lag_slot);
+    let mut pk = pk_one(1.0, 10.0);
+    pk.values[lag_slot] = 2.0; // < II, so the trough is seeded at the record and flows
+    let subject = make_subject(
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, SS_CHZ_II)],
+        vec![],
+    );
+    let times = [0.0, 1.0, 4.0, 12.0];
+    let got = chz_at(&ode, &pk, &subject, &times);
+    assert_hazard_is_the_closed_form(&got, &times, "SS bolus + ALAG1 = 2");
+}
+
+/// A lag **past** `II` takes the other branch (#1121: the arrival is no longer the trough, so
+/// the record-time seed flows to it instead of being recomputed). Its own arm, because the two
+/// branches reach the accumulator by different routes.
+#[cfg(feature = "survival")]
+#[test]
+fn ss_lag_beyond_the_interval_starts_the_hazard_clock_at_the_record() {
+    let lag_slot = 6;
+    let mut ode = one_cpt_const_chz_spec();
+    ode.dose_attr_map
+        .insert(crate::types::DoseAttr::Lag, 1, lag_slot);
+    let mut pk = pk_one(1.0, 10.0);
+    pk.values[lag_slot] = 14.0; // > II
+    let subject = make_subject(
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, SS_CHZ_II)],
+        vec![],
+    );
+    let times = [0.0, 1.0, 4.0, 12.0];
+    let got = chz_at(&ode, &pk, &subject, &times);
+    assert_hazard_is_the_closed_form(&got, &times, "SS bolus + ALAG1 = 14");
+}
+
+/// **The rule is preserve, not zero.** A second `SS=1` dose in the middle of a record
+/// re-equilibrates the compartments — that is what `SS=1` means — but the cumulative hazard
+/// accrued over `[0, 48)` is a fact about the subject's record and survives it.
+///
+/// This is the arm that separates the fix from the issue's original suggestion. Zeroing the
+/// accumulator rows (rather than restoring `chz_before`) passes every single-dose arm above,
+/// because a first SS dose's pre-record value *is* zero; here it would discard `H(48⁻) ≈ 0.96`
+/// and restart the clock, and `H(60)` would read `0.24` instead of `1.2`.
+///
+/// The straddle is asserted, not assumed: `H` just before the second dose must be materially
+/// non-zero, or "preserve" and "zero" would agree and the test could not tell them apart.
+#[cfg(feature = "survival")]
+#[test]
+fn a_second_ss_dose_keeps_the_hazard_accrued_so_far() {
+    let ode = one_cpt_const_chz_spec();
+    let pk = pk_one(1.0, 10.0);
+    let subject = make_subject(
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, true, SS_CHZ_II),
+            DoseEvent::new(48.0, 100.0, 1, 0.0, true, SS_CHZ_II),
+        ],
+        vec![],
+    );
+    let times = [0.0, 12.0, 47.9, 48.0, 48.1, 60.0];
+    let got = chz_at(&ode, &pk, &subject, &times);
+
+    // Without a live hazard on the incoming side of the second dose record, "preserve" and
+    // "zero" are the same edit and this test would be vacuous.
+    let h_before = got[2];
+    assert!(
+        h_before > 0.9,
+        "the pre-dose hazard must be materially non-zero for this arm to discriminate; got \
+         H(47.9) = {h_before}"
+    );
+
+    assert_hazard_is_the_closed_form(&got, &times, "SS@0 + SS@48");
+
+    // Continuity across the dose record itself, stated separately from the closed form: the
+    // accumulator is a state, so the only thing that may move it over `[47.9, 48]` is the
+    // 0.1 h of elapsed time — the dose event contributes no jump of its own.
+    let elapsed = times[3] - times[2];
+    assert!(
+        (got[3] - got[2] - SS_CHZ_H0 * elapsed).abs() < 1e-9,
+        "H jumped across the second SS dose beyond the {elapsed} h of accrual: H(47.9) = {}, \
+         H(48) = {}",
+        got[2],
+        got[3]
+    );
+}
+
+/// The same mid-record rule when the *first* dose is an ordinary bolus, so the accumulated
+/// hazard reaching the SS record came from a plain forward integration rather than from an
+/// earlier equilibration.
+#[cfg(feature = "survival")]
+#[test]
+fn a_plain_dose_followed_by_an_ss_dose_keeps_the_hazard_accrued_so_far() {
+    let ode = one_cpt_const_chz_spec();
+    let pk = pk_one(1.0, 10.0);
+    let subject = make_subject(
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(48.0, 100.0, 1, 0.0, true, SS_CHZ_II),
+        ],
+        vec![],
+    );
+    let times = [0.0, 12.0, 47.9, 48.0, 48.1, 60.0];
+    let got = chz_at(&ode, &pk, &subject, &times);
+    assert!(got[2] > 0.9, "pre-dose hazard must be live; got {}", got[2]);
+    assert_hazard_is_the_closed_form(&got, &times, "single@0 + SS@48");
+}
+
+/// `SS=1` into a built-in absorption compartment (#719) equilibrates through
+/// `equilibrate_ss_input_rate` — a third branch, with its own exact solve and its own
+/// Anderson fallback. It reaches the accumulator by a different route than either bolus
+/// branch, so it gets its own arm.
+#[cfg(feature = "survival")]
+#[test]
+fn ss_into_an_input_rate_compartment_starts_the_hazard_clock_at_the_record() {
+    let mut ode = one_cpt_const_chz_spec();
+    ode.input_rate = vec![InputRateForcing {
+        cmt: 0,
+        kind: InputRateKind::FirstOrder,
+        arg_slots: vec![4],
+        frac_slot: None,
+        lag_slot: None,
+    }];
+    let mut pk = pk_one(1.0, 10.0);
+    pk.values[4] = 0.15; // slow ka: the absorption tail spans more than one II
+    pk.values[crate::types::PK_IDX_F] = 1.0;
+    let subject = make_subject(
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, SS_CHZ_II)],
+        vec![],
+    );
+    let times = [0.0, 1.0, 4.0, 12.0];
+    let got = chz_at(&ode, &pk, &subject, &times);
+    assert_hazard_is_the_closed_form(&got, &times, "SS into first_order()");
+
+    // The hazard assertion above is carried by the *fallback* path: with the joint branch left
+    // unmasked and unreduced, the exact solve is singular, the Anderson iteration cannot
+    // converge a row that grows every cycle, and `equilibrate_ss_input_rate` returns `None` —
+    // at which point the masked pulse train downstream produces the right `H` anyway. So the
+    // cycle count is what actually pins this branch: measured `1` (one linear solve), versus
+    // the 50-cycle cap the pre-#1210 code reached.
+    let cycles = crate::dosing::last_ss_equilibration_cycles();
+    assert_eq!(
+        cycles, 1,
+        "the input-rate branch fell back to the pulse train ({cycles} cycles); its joint path \
+         is not taking the masked, projected solve"
+    );
+}
+
+/// The equilibration hands the accumulator rows back **exactly** as it received them — the
+/// unit statement of #1210's rule, one level below the walks above.
+///
+/// A non-zero, non-round `chz_before` catches a restore that writes the wrong slot or that
+/// silently substitutes zero, neither of which the `H(0) = 0` arms can see.
+#[cfg(feature = "survival")]
+#[test]
+fn ss_equilibration_returns_the_accumulator_untouched() {
+    let ode = one_cpt_const_chz_spec();
+    let pk = pk_one(1.0, 10.0);
+    let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, true, SS_CHZ_II);
+    let u = equilibrate_ss_state(&ode, &pk.values, &dose, &ode.solver_opts, &[7.5]);
+    assert_eq!(u[1], 7.5, "the accumulator row was not preserved: {u:?}");
+    assert!(
+        u[0] > 0.0,
+        "the PK row must still be equilibrated — a fixture that returns a zero state would \
+         satisfy the accumulator assertion vacuously; got {u:?}"
+    );
+}
+
+/// Masking alone would leave `I − M` singular: an accumulator's one-cycle map is the
+/// identity, so its row of `I − M` is all zeros and the exact solve declines for **every**
+/// joint model, whatever the PK block looks like. That is why #1210's fixtures ran the full
+/// 50-cycle pulse train and fired two spurious #867 non-convergence warnings.
+///
+/// The straddle is the point: the *same* RHS, differing only in whether the accumulator row is
+/// declared, must take different paths — one solve when it is (the row is projected out), the
+/// capped train when it is not (the pre-#1210 behaviour, kept here as the contrast rather
+/// than asserted as desirable).
+#[cfg(feature = "survival")]
+#[test]
+fn a_joint_linear_model_takes_the_exact_ss_solve() {
+    let pk = pk_one(1.0, 10.0);
+    let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, true, SS_CHZ_II);
+
+    let declared = one_cpt_const_chz_spec();
+    let _ = equilibrate_ss_state(&declared, &pk.values, &dose, &declared.solver_opts, &[0.0]);
+    let cycles_declared = crate::dosing::last_ss_equilibration_cycles();
+
+    let mut undeclared = one_cpt_const_chz_spec();
+    undeclared.chz_state_slots.clear();
+    let _ = equilibrate_ss_state(
+        &undeclared,
+        &pk.values,
+        &dose,
+        &undeclared.solver_opts,
+        &[0.0],
+    );
+    let cycles_undeclared = crate::dosing::last_ss_equilibration_cycles();
+
+    assert_eq!(
+        cycles_declared, 1,
+        "a joint model with a linear PK block must take the exact fixed point, not the pulse \
+         train; ran {cycles_declared} cycles"
+    );
+    assert!(
+        cycles_undeclared > 1,
+        "the contrast has collapsed: with the accumulator left undeclared the solve is \
+         singular and the capped train is expected, but it ran {cycles_undeclared} cycles — \
+         this test can no longer tell the projection from the fallback"
+    );
+}
+
+/// A reset **is** a reset: `EVID=3` zeroes the accumulator like every other state, and an
+/// `EVID=4` row (reset + dose at the same time) does too, because the reset runs first and
+/// the SS equilibration then preserves what it finds — which is zero.
+///
+/// This pins the boundary of #1210's rule from the other side. "Preserve across an SS dose"
+/// and "zero on a reset" are two different statements about the same row, and the second is
+/// unchanged by the fix: before it, `EVID=3` already zeroed and `EVID=4` read `12.0` (the
+/// run-in, not the pre-reset hazard). Both now read `0`, so a later decision to change reset
+/// semantics for the hazard shows up here as a deliberate diff rather than as drift.
+#[cfg(feature = "survival")]
+#[test]
+fn a_reset_zeroes_the_accumulator_with_or_without_an_ss_dose_on_the_row() {
+    let ode = one_cpt_const_chz_spec();
+    let pk = pk_one(1.0, 10.0);
+    let times = [4.0, 5.9, 6.0, 12.0];
+
+    for (label, doses) in [
+        (
+            "EVID=3 reset@6",
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, SS_CHZ_II)],
+        ),
+        (
+            "EVID=4 reset+SS@6",
+            vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, true, SS_CHZ_II),
+                DoseEvent::new(6.0, 100.0, 1, 0.0, true, SS_CHZ_II),
+            ],
+        ),
+    ] {
+        let mut subject = make_subject(doses, vec![]);
+        subject.reset_times = vec![6.0];
+        subject.reset_covariates = vec![HashMap::new()];
+        let got = chz_at(&ode, &pk, &subject, &times);
+
+        // The hazard must be live going into the reset, or "zero" and "preserve" agree at
+        // t = 6 and the test cannot tell them apart.
+        assert!(
+            got[1] > 0.1,
+            "{label}: pre-reset hazard must be materially non-zero; H(5.9) = {}",
+            got[1]
+        );
+        for (&h, &t) in got.iter().zip(&times) {
+            assert!(h.is_finite(), "{label}: H({t}) = {h} is not finite");
+        }
+        // Before the reset the clock reads record time; after it, time since the reset.
+        assert!(
+            (got[0] - SS_CHZ_H0 * 4.0).abs() < 1e-9,
+            "{label}: H(4) = {}, expected {}",
+            got[0],
+            SS_CHZ_H0 * 4.0
+        );
+        assert!(
+            got[2].abs() < 1e-9,
+            "{label}: the reset did not zero the accumulator; H(6) = {}",
+            got[2]
+        );
+        assert!(
+            (got[3] - SS_CHZ_H0 * 6.0).abs() < 1e-9,
+            "{label}: H(12) = {}, expected {} (6 h after the reset)",
+            got[3],
+            SS_CHZ_H0 * 6.0
         );
     }
 }

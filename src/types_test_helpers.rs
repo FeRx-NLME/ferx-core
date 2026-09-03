@@ -68,6 +68,7 @@ fn make_compiled_model(with_ode: bool, gradient_method: GradientMethod) -> Compi
         diffusion_state_indices: Vec::new(),
         ode_spec: if with_ode {
             Some(crate::ode::OdeSpec {
+                chz_state_slots: Vec::new(),
                 rhs: Box::new(|_y, _p, _t, _dy| {}),
                 n_states: 2,
                 state_names: vec!["depot".into(), "central".into()],

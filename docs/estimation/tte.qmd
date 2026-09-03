@@ -276,6 +276,15 @@ then genuinely need different treatment. `__chz_*` may not be read from `[odes]`
 with `init(...)` — see
 [the ODE-models page](../model-file/ode-models.qmd#chz-is-not-your-rhs).
 
+The same "the accumulator is not a compartment" reading governs steady-state dosing. An
+`SS=1` dose equilibrates the PK compartments to their periodic steady state, but the
+accumulator has none — it is a pure integrator — so it is held out of the run-in and keeps
+its value at the dose record. `H` therefore starts at `0` for a subject's first dose, and a
+later `SS=1` dose re-loads the compartments without discarding the hazard accrued so far.
+NONMEM's own steady-state routine cannot be handed such a system at all; see
+[SS with an ODE-accumulated hazard](../model-file/steady-state.qmd#ss-with-an-ode-accumulated-hazard)
+for the convention, the NONMEM result, and the committed anchor.
+
 ::: {.callout-note}
 ## Affects run time from ferx 0.3.0 and earlier, not results
 

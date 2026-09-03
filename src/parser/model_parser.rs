@@ -11572,6 +11572,7 @@ fn build_ode_spec(
         uses_time_vars,
         reads_time_builtin: rhs_reads_time_builtin,
         pk_reads_model_time,
+        has_chz: !chz_state_slots.is_empty(),
     };
 
     let rhs: Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync> =
@@ -11744,6 +11745,10 @@ fn build_ode_spec(
     }
 
     Ok(crate::ode::OdeSpec {
+        // The injected hazard accumulators, carried onto the spec so every consumer of the
+        // compiled system can tell a PK compartment from a pure integrator without re-deriving
+        // it from names (#1166's reason) — steady-state equilibration above all (#1210).
+        chz_state_slots: chz_state_slots.to_vec(),
         rhs,
         n_states,
         state_names: state_names.to_vec(),
@@ -19331,12 +19336,23 @@ pub struct OdeRhsProgram {
     /// Gompertz baseline, i.e. the standard case — but whose PK dynamics are
     /// time-invariant.
     pk_reads_model_time: bool,
+    /// Does this system carry injected joint-PK-TTE `d/dt(__chz_<cmt>)` accumulator rows?
+    /// The `Vec<usize>` of slots lives on [`crate::ode::OdeSpec::chz_state_slots`]; the
+    /// program only needs the predicate, for the dual SS equilibration's entry assertion
+    /// (#1210) — that path has no accumulator handling and is reachable only if a routing
+    /// gate is widened.
+    has_chz: bool,
 }
 
 impl OdeRhsProgram {
     /// See [`OdeRhsProgram::uses_time_vars`]. `true` ⇒ a steady-state dose must route to FD.
     pub(crate) fn uses_time_vars(&self) -> bool {
         self.uses_time_vars
+    }
+
+    /// See [`OdeRhsProgram::has_chz`].
+    pub(crate) fn has_chz(&self) -> bool {
+        self.has_chz
     }
 
     /// See [`OdeRhsProgram::reads_time_builtin`]. Almost every caller wants

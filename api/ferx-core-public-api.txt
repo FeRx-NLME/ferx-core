@@ -869,6 +869,7 @@ pub ferx_core::ode::predictions::ThresholdOutcome::CensoredAtHorizon
 pub ferx_core::ode::predictions::ThresholdOutcome::Crossed(f64)
 pub ferx_core::ode::predictions::ThresholdOutcome::SolveFailed(alloc::string::String)
 pub struct ferx_core::ode::predictions::OdeSpec
+pub ferx_core::ode::predictions::OdeSpec::chz_state_slots: alloc::vec::Vec<usize>
 pub ferx_core::ode::predictions::OdeSpec::diffusion_var: alloc::vec::Vec<f64>
 pub ferx_core::ode::predictions::OdeSpec::dose_attr_map: ferx_core::DoseAttrMap
 pub ferx_core::ode::predictions::OdeSpec::indiv_param_program: core::option::Option<ferx_core::parser::model_parser::IndivParamProgram>
@@ -1008,6 +1009,7 @@ pub ferx_core::ode::OdeSolverStats::stiff_aborted_segments: usize
 pub ferx_core::ode::OdeSolverStats::stiff_min_step_clamped_steps: usize
 pub ferx_core::ode::OdeSolverStats::unfinished_segments: usize
 pub struct ferx_core::ode::OdeSpec
+pub ferx_core::ode::OdeSpec::chz_state_slots: alloc::vec::Vec<usize>
 pub ferx_core::ode::OdeSpec::diffusion_var: alloc::vec::Vec<f64>
 pub ferx_core::ode::OdeSpec::dose_attr_map: ferx_core::DoseAttrMap
 pub ferx_core::ode::OdeSpec::indiv_param_program: core::option::Option<ferx_core::parser::model_parser::IndivParamProgram>
