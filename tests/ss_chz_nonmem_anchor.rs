@@ -76,6 +76,14 @@ fn load_with(arm: &str, data: &str) -> (CompiledModel, Population) {
     (m, pop)
 }
 
+/// `(H, h)` of every survival row at time `t`, matched at the file's `1e-9` tolerance.
+fn survival_rows_at(rows: &[ferx_core::SurvivalPredictionResult], t: f64) -> Vec<(f64, f64)> {
+    rows.iter()
+        .filter(|r| (r.time - t).abs() < 1e-9)
+        .map(|r| (r.cum_hazard, r.hazard))
+        .collect()
+}
+
 /// `nonmem_anchor/ss_chz_ss2.csv`: an `SS=1` dose at `t = 0` **and** a second at `t = 48`.
 const DATA_MID_RECORD: &str = "nonmem_anchor/ss_chz_ss2.csv";
 
@@ -402,18 +410,13 @@ fn a_joint_steady_state_fit_does_not_bank_the_run_in_into_the_objective() {
     // to pad the grid with `GRID` to get a finite row; the single-instant path is pinned by
     // `predict_survival_on_a_single_instant_grid_matches_the_multi_point_grid` below.
     let sv = predict_survival(&m, &pop, &m.default_params, &[0.0]);
-    let at_zero: Vec<_> = sv.iter().filter(|r| r.time == 0.0).collect();
+    let at_zero = survival_rows_at(&sv, 0.0);
     assert!(!at_zero.is_empty(), "no survival row at t = 0");
-    for r in at_zero {
+    for (h, _) in at_zero {
+        assert!(h.is_finite(), "non-finite H at t = 0: {h}");
         assert!(
-            r.cum_hazard.is_finite(),
-            "non-finite H at t = 0: {}",
-            r.cum_hazard
-        );
-        assert!(
-            r.cum_hazard.abs() < 1e-12,
-            "the SS run-in is still banked into H(0): {} (pre-#1210 this read 12.0 = H0*50*II)",
-            r.cum_hazard
+            h.abs() < 1e-12,
+            "the SS run-in is still banked into H(0): {h} (pre-#1210 this read 12.0 = H0*50*II)"
         );
     }
 
@@ -632,15 +635,9 @@ fn a_reset_zeroes_the_accumulated_hazard_and_matches_nonmem() {
 /// territory and is asserted unchanged: seeded state, drug-free hazard.
 #[test]
 fn predict_survival_on_a_single_instant_grid_matches_the_multi_point_grid() {
-    fn at(rows: &[ferx_core::SurvivalPredictionResult], t: f64) -> Vec<(f64, f64)> {
-        rows.iter()
-            .filter(|r| r.time == t)
-            .map(|r| (r.cum_hazard, r.hazard))
-            .collect()
-    }
-    for arm in ["const", "drug"] {
+    for (arm, drug_driven) in [("const", false), ("drug", true)] {
         let (m, pop) = load(arm);
-        let want = at(
+        let want = survival_rows_at(
             &predict_survival(&m, &pop, &m.default_params, &[0.0, 1.0]),
             0.0,
         );
@@ -651,38 +648,51 @@ fn predict_survival_on_a_single_instant_grid_matches_the_multi_point_grid() {
             "{arm}: the multi-point reference row is not finite: {want_h}, {want_haz}"
         );
         assert_eq!(want_h, 0.0, "{arm}: H(0) is not exactly zero");
+        // The straddle, before any comparison: on the drug arm the reference row must be
+        // distinguishable from the seeded state, or the bit comparisons below could not tell
+        // a post-dose row from a seeded one.
+        if drug_driven {
+            assert!(
+                want_haz > 5.0 * H0,
+                "{arm}: h(0) = {want_haz} is not distinguishable from the drug-free {H0}"
+            );
+        }
 
-        for grid in [&[0.0][..], &[0.0, 0.0], &[-1.0, 0.0]] {
-            let got = at(&predict_survival(&m, &pop, &m.default_params, grid), 0.0);
-            let n_zero = grid.iter().filter(|&&t| t == 0.0).count();
+        let single = predict_survival(&m, &pop, &m.default_params, &[0.0]);
+        let dup = predict_survival(&m, &pop, &m.default_params, &[0.0, 0.0]);
+        let pre_grid = predict_survival(&m, &pop, &m.default_params, &[-1.0, 0.0]);
+        for (label, rows, n_zero) in [
+            ("[0.0]", &single, 1),
+            ("[0.0, 0.0]", &dup, 2),
+            ("[-1.0, 0.0]", &pre_grid, 1),
+        ] {
+            let got = survival_rows_at(rows, 0.0);
             assert_eq!(
                 got.len(),
                 n_zero,
-                "{arm} {grid:?}: one row per requested t = 0"
+                "{arm} {label}: one row per requested t = 0"
             );
             for (h, haz) in got {
                 assert!(
                     h.is_finite() && haz.is_finite(),
-                    "{arm} {grid:?}: non-finite (H, h) at t = 0: {h}, {haz}"
+                    "{arm} {label}: non-finite (H, h) at t = 0: {h}, {haz}"
                 );
                 assert_eq!(
                     h.to_bits(),
                     want_h.to_bits(),
-                    "{arm} {grid:?}: H(0) {h} != {want_h}"
+                    "{arm} {label}: H(0) {h} != {want_h}"
                 );
                 assert_eq!(
                     haz.to_bits(),
                     want_haz.to_bits(),
-                    "{arm} {grid:?}: h(0) {haz} != {want_haz}"
+                    "{arm} {label}: h(0) {haz} != {want_haz}"
                 );
             }
         }
 
-        // Before the first event: the seeded state, so no drug and the bare `H0`.
-        let pre = at(
-            &predict_survival(&m, &pop, &m.default_params, &[-1.0, 0.0]),
-            -1.0,
-        );
+        // Before the first event: the seeded state, so no drug and the bare `H0` — the
+        // pre-first-event prefill's row, asserted unchanged.
+        let pre = survival_rows_at(&pre_grid, -1.0);
         assert_eq!(pre.len(), 1);
         assert_eq!(pre[0].0, 0.0, "{arm}: H(-1) is not zero");
         assert!(
@@ -690,13 +700,5 @@ fn predict_survival_on_a_single_instant_grid_matches_the_multi_point_grid() {
             "{arm}: h(-1) = {} is not the drug-free hazard {H0}",
             pre[0].1
         );
-
-        if arm == "drug" {
-            assert!(
-                want_haz > 5.0 * H0,
-                "drug arm: h(0) = {want_haz} is not distinguishable from the drug-free {H0}; \
-                 this test could not tell a post-dose row from a seeded one"
-            );
-        }
     }
 }

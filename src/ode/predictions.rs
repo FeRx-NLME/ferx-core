@@ -6444,11 +6444,37 @@ pub fn ode_dense_solve_states(
         }
     }
 
-    for w in break_times.windows(2) {
-        let (t_start, t_end) = (w[0], w[1]);
-        if (t_end - t_start).abs() < 1e-15 {
-            continue;
+    // Walk every break as a **left boundary** — bound `0..len`, the walk
+    // `ode_predictions` and `ode_predictions_with_states` use (#731) — so a dose
+    // landing on the final break is applied and its `saveat` read post-dose, and a
+    // one-break timeline is visited exactly once (#1218: every `saveat` at or before
+    // the first event puts the horizon `t_last` on the integration start, so the
+    // timeline is a single instant). The integration half runs only while a next
+    // break exists; on the last break the boundary visit is all there is.
+    //
+    // History, because both defects lived in this loop's shape: it was a
+    // `windows(2)` walk that saw the final break only as a segment *end*, patched by
+    // a post-loop re-visit for #731 that was guarded to `len >= 2` — "a single-instant
+    // `saveat` keeps its prior behaviour", and the prior behaviour was the `f64::NAN`
+    // prefill, which `predict_survival(&[0.0])` and the event-driven `[derived]` state
+    // path returned as a silent non-answer. The `0..len` walk has no special case to
+    // guard. The pre-first-event prefill above is deliberately *not* widened to cover
+    // the instant: it holds the seeded, pre-dose state, and a drug-driven hazard read
+    // off it is wrong in a way that looks finite.
+    //
+    // The last break's visit is skipped when no `saveat` sits on it: `u`, `ext_params`
+    // and `active_infusions` are dead after this loop, so the SS equilibration it
+    // would run for a grid entirely before the first event (`[-1.0]` with a dose at
+    // `0`, where the `0.0`-seeded horizon fold still puts the dose on the timeline)
+    // has no reader. Unobservable on every other timeline: `t_last` is a `saveat`
+    // whenever any point is non-negative.
+    for k in 0..break_times.len() {
+        let t_start = break_times[k];
+        let next = break_times.get(k + 1).copied();
+        if next.is_none() && !saveat_map.contains_key(&t_start.to_bits()) {
+            break;
         }
+        let t_end = next.unwrap_or(t_start);
 
         let forcings = apply_segment_boundary(
             ode,
@@ -6474,6 +6500,10 @@ pub fn ode_dense_solve_states(
                 result[i] = u.clone();
             }
         }
+
+        let Some(t_end) = next else {
+            break;
+        };
 
         let mut seg_saveat: Vec<f64> = saveat
             .iter()
@@ -6521,52 +6551,6 @@ pub fn ode_dense_solve_states(
 
         if let Some(last) = sol.last() {
             u.copy_from_slice(&last.u);
-        }
-    }
-
-    // #731: the `windows(2)` loop visits the final break `t_last` only as a segment
-    // *end*, so a dose landing exactly on it is never applied and a `saveat` there
-    // reads the pre-dose state — the same terminal-break bug fixed on the
-    // constant-parameter engine (`ode_predictions_and_chz`). Visit `t_last` once more
-    // as a left boundary (dose applied via the shared `apply_segment_boundary`, then
-    // the `saveat` re-read post-dose) so the two paths agree and #570's
-    // one-solve == two-solve equivalence holds at a dose-on-`t_last`. When no dose
-    // lands there this re-reads the identical carried `u`, so it stays byte-identical
-    // everywhere else.
-    //
-    // Unconditional, including the one-break timeline (#1218). When every `saveat`
-    // sits at or before the first event the horizon `t_last` coincides with the
-    // integration start, `break_times` is a single instant, the loop above never runs,
-    // and this visit is the *only* one: it applies whatever lands there (an SS
-    // equilibration, a bolus) and writes the `saveat` rows post-dose, exactly as the
-    // loop's `t_start` write does when a later point is also requested. Until #1218 this
-    // block was guarded to `len >= 2` and a single-instant grid kept "its prior
-    // behaviour" — the `f64::NAN` prefill, which `predict_survival(&[0.0])` and the
-    // `[derived]` state path returned as a silent non-answer. The pre-first-event
-    // prefill above is deliberately *not* widened to cover the instant: it holds the
-    // seeded, pre-dose state, and a drug-driven hazard read off it is wrong in a way
-    // that looks finite.
-    {
-        let t_last_break = break_times[break_times.len() - 1];
-        let _ = apply_segment_boundary(
-            ode,
-            subject,
-            &dose_lagtimes,
-            &dose_f_bio,
-            &zo_windows,
-            pk_params_flat,
-            n,
-            &opts,
-            t_last_break,
-            t_last_break,
-            &mut u,
-            &mut active_infusions,
-            &mut ext_params,
-        );
-        if let Some(idxs) = saveat_map.get(&t_last_break.to_bits()) {
-            for &i in idxs {
-                result[i] = u.clone();
-            }
         }
     }
 
@@ -6621,6 +6605,12 @@ pub enum ThresholdOutcome {
 /// `prepare_input_rates`, `wrap_rhs_with_forcings`); only the segment *loop* is
 /// restated, and it is pinned against drift by the `until_chz_threshold` parity
 /// test (the crossing time it returns must satisfy `CHZ_dense(t) ≈ threshold`).
+///
+/// One deliberate difference from the dense walk: the final break is visited only as
+/// a segment *end*, never as a left boundary (#731 / #1218). A dose landing exactly on
+/// `horizon` cannot move the accumulator before `horizon`, and a one-break timeline —
+/// `horizon` at the integration start — is a censored draw, not a solve; so there is
+/// no post-dose state to read here and nothing for the parity test to miss.
 #[cfg(feature = "survival")]
 pub(crate) fn ode_solve_until_chz_threshold(
     ode: &OdeSpec,

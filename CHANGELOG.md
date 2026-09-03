@@ -64,8 +64,11 @@ section of the SDLC for the versioning policy).
   pass the subject's first dose or observation — returned `NaN` for `cum_hazard` and `hazard`
   with no warning, while the same `t = 0` on a longer grid was fine. It now returns the state
   at that instant, post-dose, exactly what the longer grid reads. The same one-break timeline
-  left `[derived]` output columns `NaN` for a subject whose only observation coincides with its
-  dose; fixed by the same change.
+  reached two other readers of the dense state: `[derived]` output columns on the event-driven
+  path (time-varying covariates, resets, or a model-time read) were `NaN` for a subject whose
+  only observation coincides with its dose, and a joint PK-TTE subject outside the shared
+  single-solve (same routing) whose only event or censor sits on its first dose scored the
+  `1e20` sentinel instead of its finite likelihood. Both fixed by the same change.
 - **An `SS=1` dose no longer carries the steady-state run-in into a joint PK-TTE model's
   cumulative hazard (#1210).** The appended `d/dt(__chz_<cmt>)` accumulator was cycled through
   the equilibration along with the PK compartments, but it is a pure integrator with no steady

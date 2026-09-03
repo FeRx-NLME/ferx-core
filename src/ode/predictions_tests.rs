@@ -9298,43 +9298,41 @@ fn a_nonlinear_joint_model_judges_convergence_on_the_pk_rows() {
 #[cfg(feature = "survival")]
 const SS_CHZ_BETA: f64 = 0.01;
 
-/// 1-cpt IV bolus + a **drug-driven** accumulator: `d/dt(__chz) = H0 · exp(BETA · central)`.
-/// Same declaration as [`one_cpt_const_chz_spec`]; the hazard reads the state, so a row read
-/// from the wrong state is visible in `h` as well as in the compartments.
+/// [`one_cpt_const_chz_spec`] with a **drug-driven** accumulator:
+/// `d/dt(__chz) = H0 · exp(BETA · central)`. Derived from the const spec — the same
+/// declaration, tolerances and slot, as `mm_const_chz_spec` does — so the two stay twins;
+/// the hazard reads the state, so a row read from the wrong state is visible in `h` as well
+/// as in the compartments.
 #[cfg(feature = "survival")]
 fn one_cpt_drug_chz_spec() -> OdeSpec {
-    OdeSpec {
-        chz_state_slots: vec![1],
-        rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
-            let cl = p[crate::types::PK_IDX_CL];
-            let v = p[crate::types::PK_IDX_V];
-            let ke = if v > 0.0 { cl / v } else { 0.0 };
-            dy[0] = -ke * y[0];
-            dy[1] = SS_CHZ_H0 * (SS_CHZ_BETA * y[0]).exp();
-        }),
-        n_states: 2,
-        state_names: vec!["central".into(), "__chz_3".into()],
-        readout: OdeReadout::ObsCmt(0),
-        diffusion_var: Vec::new(),
-        solver_opts: OdeSolverOptions {
-            abstol: 1e-11,
-            reltol: 1e-9,
-            ..OdeSolverOptions::default()
-        },
-        input_rate: Vec::new(),
-        rhs_program: None,
-        readout_program: None,
-        indiv_param_program: None,
-        dose_attr_map: Default::default(),
-        init_fn: None,
-    }
+    let mut ode = one_cpt_const_chz_spec();
+    ode.rhs = Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+        let cl = p[crate::types::PK_IDX_CL];
+        let v = p[crate::types::PK_IDX_V];
+        let ke = if v > 0.0 { cl / v } else { 0.0 };
+        dy[0] = -ke * y[0];
+        dy[1] = SS_CHZ_H0 * (SS_CHZ_BETA * y[0]).exp();
+    });
+    ode
+}
+
+/// The #1218 fixture: the drug-driven accumulator on an `SS=1` bolus at `t = 0`, whose
+/// post-dose state (trough + pulse) is what every single-instant arm must read.
+#[cfg(feature = "survival")]
+fn ss_instant_fixture() -> (OdeSpec, PkParams, Subject) {
+    let ode = one_cpt_drug_chz_spec();
+    let pk = pk_one(1.0, 10.0);
+    let subject = make_subject(
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, SS_CHZ_II)],
+        vec![],
+    );
+    (ode, pk, subject)
 }
 
 /// Every state of `got` is finite and bit-identical to `want`.
 ///
 /// Finiteness first and on its own: `NaN == NaN` is `false`, so the equality would fail on a
 /// `NaN` row too, but it would say "bits differ" about a row that was never computed.
-#[cfg(feature = "survival")]
 fn assert_states_bit_identical(got: &[f64], want: &[f64], arm: &str) {
     assert_eq!(
         got.len(),
@@ -9364,12 +9362,7 @@ fn assert_states_bit_identical(got: &[f64], want: &[f64], arm: &str) {
 #[cfg(feature = "survival")]
 #[test]
 fn a_single_instant_grid_on_an_ss_dose_reads_the_post_dose_state() {
-    let ode = one_cpt_drug_chz_spec();
-    let pk = pk_one(1.0, 10.0);
-    let subject = make_subject(
-        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, SS_CHZ_II)],
-        vec![],
-    );
+    let (ode, pk, subject) = ss_instant_fixture();
     let single = ode_dense_solve_states(&ode, &pk.values, &[], &[], &subject, &[0.0]);
     let multi = ode_dense_solve_states(&ode, &pk.values, &[], &[], &subject, &[0.0, 1.0]);
     assert_eq!(single.len(), 1, "one row per saveat");
@@ -9377,8 +9370,9 @@ fn a_single_instant_grid_on_an_ss_dose_reads_the_post_dose_state() {
     assert_states_bit_identical(&single[0], &multi[0], "[0.0] vs [0.0, 1.0]");
 
     // The straddle, asserted: the row is the post-SS-dose state, not the seeded one. An SS
-    // bolus lands on its own trough, so central exceeds the bare 100 mg pulse, and the
-    // hazard read off it is not the drug-free `H0` the seeded state would give.
+    // bolus lands on its own trough, so central exceeds the bare 100 mg pulse — and since
+    // the accumulator's rate is `H0 · exp(BETA · central)`, that is also what makes `h(0)`
+    // differ from the drug-free `H0` the seeded state would give (the `<=` variant's number).
     let got = &single[0];
     assert!(
         got[0] > 100.0,
@@ -9386,13 +9380,6 @@ fn a_single_instant_grid_on_an_ss_dose_reads_the_post_dose_state() {
         got[0]
     );
     assert_eq!(got[1], 0.0, "H(0) must be exactly 0.0 at the first record");
-    let mut du = vec![0.0; ode.n_states];
-    (ode.rhs)(got, &pk.values, 0.0, &mut du);
-    assert!(
-        du[1] > 2.0 * SS_CHZ_H0,
-        "h(0) = {} reads as the drug-free hazard {SS_CHZ_H0}; the row is not post-dose",
-        du[1]
-    );
 }
 
 /// Duplicate nodes at the instant are all written, and a node *before* the first event keeps
@@ -9405,12 +9392,7 @@ fn a_single_instant_grid_on_an_ss_dose_reads_the_post_dose_state() {
 #[cfg(feature = "survival")]
 #[test]
 fn a_single_instant_grid_writes_every_duplicate_and_leaves_pre_event_nodes_seeded() {
-    let ode = one_cpt_drug_chz_spec();
-    let pk = pk_one(1.0, 10.0);
-    let subject = make_subject(
-        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, SS_CHZ_II)],
-        vec![],
-    );
+    let (ode, pk, subject) = ss_instant_fixture();
     let want = ode_dense_solve_states(&ode, &pk.values, &[], &[], &subject, &[0.0, 1.0]);
 
     let dup = ode_dense_solve_states(&ode, &pk.values, &[], &[], &subject, &[0.0, 0.0]);
@@ -9435,59 +9417,32 @@ fn a_single_instant_grid_writes_every_duplicate_and_leaves_pre_event_nodes_seede
 /// `[derived]` output column reads. Both a plain bolus and an SS dose, since they take
 /// different arms of `apply_segment_boundary` at the sole break.
 ///
-/// The readout is the compartment amount, so the state must also equal `ipred` exactly — the
-/// invariant the two-pass engine promises.
+/// The readout is the compartment amount, so the state row must also equal `ipred` exactly —
+/// the invariant the two-pass engine promises.
 #[test]
 fn with_states_on_a_single_instant_timeline_returns_the_post_dose_state() {
     let ode = one_cpt_ode_spec();
     let pk = pk_one(1.0, 10.0);
-    let at = |n: usize| vec![pk; n];
+    let run = |ss: bool, ii: f64, obs: Vec<f64>| {
+        let n_obs = obs.len();
+        let subject = make_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, ss, ii)], obs);
+        ode_predictions_event_driven_with_states(
+            &ode,
+            &subject,
+            &[],
+            &[],
+            &vec![pk; 1],
+            &vec![pk; n_obs],
+            &[],
+            &[],
+        )
+    };
     for (arm, ss, ii) in [("bolus", false, 0.0), ("ss", true, 12.0)] {
-        let one = make_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, ss, ii)], vec![0.0]);
-        let two = make_subject(
-            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, ss, ii)],
-            vec![0.0, 1.0],
-        );
-        let (ipred1, states1) = ode_predictions_event_driven_with_states(
-            &ode,
-            &one,
-            &[],
-            &[],
-            &at(1),
-            &at(1),
-            &[],
-            &[],
-        );
-        let (ipred2, states2) = ode_predictions_event_driven_with_states(
-            &ode,
-            &two,
-            &[],
-            &[],
-            &at(1),
-            &at(2),
-            &[],
-            &[],
-        );
+        let (ipred1, states1) = run(ss, ii, vec![0.0]);
+        let (ipred2, states2) = run(ss, ii, vec![0.0, 1.0]);
         assert_eq!(states1.len(), 1, "{arm}: one state row per observation");
-        assert!(
-            states1[0][0].is_finite(),
-            "{arm}: the single-instant state row is {:?}",
-            states1[0]
-        );
-        assert_eq!(
-            states1[0][0].to_bits(),
-            states2[0][0].to_bits(),
-            "{arm}: single-observation state {} differs from the two-observation row {}",
-            states1[0][0],
-            states2[0][0]
-        );
-        assert_eq!(
-            states1[0][0].to_bits(),
-            ipred1[0].to_bits(),
-            "{arm}: state {} and ipred {} disagree on an amount readout",
-            states1[0][0],
-            ipred1[0]
-        );
+        assert_states_bit_identical(&states1[0], &states2[0], arm);
+        assert_states_bit_identical(&states1[0], &[ipred1[0]], arm);
         assert_eq!(
             ipred1[0].to_bits(),
             ipred2[0].to_bits(),
