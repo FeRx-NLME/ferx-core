@@ -3177,11 +3177,12 @@ pub fn parse_full_model_with(
     }
 
     // Bake the configured ODE solver tolerances from [fit_options] onto the
-    // OdeSpec so predict()/fit_from_files (which integrate the parsed spec
-    // as-is) use the requested accuracy. Callers that merge call-time `settings`
-    // into their own FitOptions (the R wrapper's ferx_fit) must re-apply
-    // sync_ode_solver_opts on the owned model for those overrides to win;
-    // ferx-core fit() takes &CompiledModel and does not. No-op for analytical.
+    // OdeSpec so predict()/simulate()/fit_from_files (which integrate the parsed spec
+    // as-is, and in the first two cases receive no fit options at all) use the requested
+    // accuracy. This stays the only route for those entry points. A programmatic fit() no
+    // longer depends on it: fit() takes &CompiledModel and cannot re-stamp the spec, so it
+    // arms a fit-scoped override instead (#1212), which merges over whatever is baked here
+    // for the fields the caller actually moved. No-op for analytical.
     model.sync_ode_solver_opts(&fit_options);
 
     // ── [scaling] block ──

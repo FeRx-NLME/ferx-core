@@ -2213,6 +2213,18 @@ pub struct OdeSpec {
 }
 
 impl OdeSpec {
+    /// The solver options this spec is actually integrated at: its baked
+    /// [`solver_opts`](Self::solver_opts) with any fit-scoped override merged in (#1212).
+    ///
+    /// **Every integration path must read this, not the field.** `solver_opts` is stamped at
+    /// parse time and `fit` takes `&CompiledModel`, so a call-time `FitOptions::ode_reltol` /
+    /// `ode_method` / … has no other way to reach the integrator; a site that reads the field
+    /// directly silently runs at the parse-time value instead. Outside a fit (`predict`, a
+    /// hand-built spec) nothing is armed and this returns the field unchanged.
+    pub(crate) fn effective_solver_opts(&self) -> crate::ode::OdeSolverOptions {
+        crate::ode::solver::effective_solver_options(self.solver_opts)
+    }
+
     /// Initial compartment-amount vector for a subject, given the flat
     /// individual-parameter vector `params` (`PkParams.values`). Returns the
     /// `init(...)` expression values where declared and `0.0` elsewhere; when
@@ -2341,7 +2353,7 @@ fn integrate_segment(
     // Must be sorted ascending and lie in `(t_start, t_end]`; the caller filters.
     chz_times: &[f64],
 ) -> Vec<Vec<f64>> {
-    let opts = ode.solver_opts;
+    let opts = ode.effective_solver_opts();
 
     // Observation times in this segment (t_start < t <= t_end)
     let mut saveat: Vec<f64> = subject
@@ -2749,7 +2761,7 @@ fn ode_predictions_with_extra_breaks_and_stats(
 ) -> (Vec<f64>, Vec<Vec<f64>>) {
     let n = ode.n_states;
     let n_obs = subject.obs_times.len();
-    let opts = ode.solver_opts;
+    let opts = ode.effective_solver_opts();
     // #570: full state at each `chz_times[i]`, pre-filled NaN so a soft time before
     // the integration start (or otherwise uncovered by a segment) reads NaN → the TTE
     // 1e20 sentinel — exactly as the dedicated `ode_dense_solve_states` path does
@@ -4017,7 +4029,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 &base_lagtimes,
                 pk_params_flat,
                 t_start,
-                &ode.solver_opts,
+                &ode.effective_solver_opts(),
             );
         }
 
@@ -4606,8 +4618,11 @@ pub(crate) fn verify_adaptive_frozen_replay(
     // small multiple of the solver's own error control covers that while still
     // flagging any sub-percent dose-bookkeeping divergence.
     const REPLAY_TOL_FACTOR: f64 = 8.0;
-    let rel_tol = (REPLAY_TOL_FACTOR * ode.solver_opts.reltol).max(1e-9);
-    let abs_tol = (REPLAY_TOL_FACTOR * ode.solver_opts.abstol).max(1e-12);
+    // Both engines integrate at the fit-scoped options (#1212), so the agreement band is
+    // derived from those and not from the spec's parse-time field.
+    let replay_opts = ode.effective_solver_opts();
+    let rel_tol = (REPLAY_TOL_FACTOR * replay_opts.reltol).max(1e-9);
+    let abs_tol = (REPLAY_TOL_FACTOR * replay_opts.abstol).max(1e-12);
     for (j, (got, want)) in run.predictions.iter().zip(static_preds.iter()).enumerate() {
         // Unrecorded slots are NaN in both engines (same observation grid), so
         // NaN==NaN is agreement; a NaN-vs-finite split is a genuine divergence.
@@ -5136,7 +5151,7 @@ pub fn ode_predictions_event_driven(
 
     let n = ode.n_states;
     let n_obs = subject.obs_times.len();
-    let opts = ode.solver_opts;
+    let opts = ode.effective_solver_opts();
 
     // First-dose time anchor for TAFD injection via extended params.
     // fold yields INFINITY when there are no doses; convert to NaN so the ODE
@@ -5727,7 +5742,7 @@ pub fn ode_predictions_ekf_with_diffusion(
         &subject.doses,
         &subject.obs_times,
         &r_obs_vec,
-        ode.solver_opts,
+        ode.effective_solver_opts(),
     );
 
     let ipreds: Vec<f64> = pts.iter().map(|p| p.ipred).collect();
@@ -5794,7 +5809,7 @@ pub fn ode_predictions_ekf(
         &subject.doses,
         &subject.obs_times,
         &r_obs_vec,
-        ode.solver_opts,
+        ode.effective_solver_opts(),
     );
 
     let ipreds: Vec<f64> = pts.iter().map(|p| p.ipred).collect();
@@ -5842,7 +5857,7 @@ pub fn ode_predictions_with_states(
 ) -> (Vec<f64>, Vec<Vec<f64>>) {
     let n = ode.n_states;
     let n_obs = subject.obs_times.len();
-    let opts = ode.solver_opts;
+    let opts = ode.effective_solver_opts();
 
     let mut u = ode.initial_state(pk_params_flat);
     let mut predictions = vec![f64::NAN; n_obs];
@@ -6388,7 +6403,7 @@ pub fn ode_dense_solve_states(
         return vec![];
     }
     let n = ode.n_states;
-    let opts = ode.solver_opts;
+    let opts = ode.effective_solver_opts();
 
     let mut u = ode.initial_state(pk_params_flat);
     let mut result: Vec<Vec<f64>> = vec![vec![f64::NAN; n]; saveat.len()];
@@ -6623,7 +6638,7 @@ pub(crate) fn ode_solve_until_chz_threshold(
     use crate::ode::solver::{solve_ode_until_threshold, ThresholdCrossing};
 
     let n = ode.n_states;
-    let opts = ode.solver_opts;
+    let opts = ode.effective_solver_opts();
     let mut u = ode.initial_state(pk_params_flat);
 
     // Resolve modeled-RATE doses once, exactly as the dense path (#324).

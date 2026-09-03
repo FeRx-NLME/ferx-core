@@ -134,6 +134,155 @@ pub(crate) fn default_fit_pool() -> Option<&'static rayon::ThreadPool> {
     .as_ref()
 }
 
+/// A pool whose workers all carry `ov`, built once per `(override, width)` and kept for the
+/// life of the process.
+///
+/// This is what makes a fit-scoped ODE override (#1212) correct under concurrency. The
+/// override has to reach the rayon workers doing the integrating, and a worker cannot tell
+/// which fit's task it is running — so instead of asking, the value is installed on the
+/// worker at thread start and the pool is *keyed by it*. A worker here serves only fits
+/// carrying this exact override; a fit with no override never enters this pool at all and
+/// integrates at the spec's baked options, whatever any concurrent fit is doing.
+///
+/// Cached rather than built per fit for the same reason [`default_fit_pool`] is shared: a
+/// bootstrap running hundreds of replicate fits off one `FitOptions` arms the same override
+/// every time, and a fresh `N × 32 MiB` pool per replicate would oversubscribe the CPUs and
+/// churn address space. Distinct overrides in one process are few (one per settings object a
+/// caller actually uses), so the table stays small.
+///
+/// Returns `None` if the pool cannot be built; callers must treat that as an error rather
+/// than running unpooled, since unpooled workers would silently integrate at the baked
+/// options — the exact failure #1212 is about.
+pub(crate) fn ode_override_pool(
+    ov: crate::ode::solver::OdeSolverOverride,
+    n_threads: usize,
+) -> Option<&'static rayon::ThreadPool> {
+    /// `OdeSolverOverride` carries `f64`s, so it is keyed by bit pattern — two overrides that
+    /// differ only in a NaN payload would share a pool, which is harmless, and no tolerance
+    /// anyone can pass is a NaN.
+    type Key = (
+        usize,
+        u64,
+        u64,
+        Option<usize>,
+        Option<u8>,
+        Option<u64>,
+        Option<bool>,
+    );
+    fn key(ov: &crate::ode::solver::OdeSolverOverride, n: usize) -> Key {
+        (
+            n,
+            ov.reltol.map_or(u64::MAX, f64::to_bits),
+            ov.abstol.map_or(u64::MAX, f64::to_bits),
+            ov.max_steps,
+            ov.method.map(|m| m as u8),
+            ov.stiff_abort_after.map(|b| b.map_or(u64::MAX, u64::from)),
+            ov.auto_switch,
+        )
+    }
+    static POOLS: std::sync::Mutex<Option<HashMap<Key, &'static rayon::ThreadPool>>> =
+        std::sync::Mutex::new(None);
+
+    let mut guard = POOLS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let pools = guard.get_or_insert_with(HashMap::new);
+    if let Some(pool) = pools.get(&key(&ov, n_threads)) {
+        return Some(pool);
+    }
+    let pool = fit_thread_pool_builder()
+        .num_threads(n_threads)
+        .start_handler(move |_| crate::ode::solver::install_worker_ode_override(ov))
+        .build()
+        .ok()?;
+    // Leaked deliberately: the pool outlives the fit that asked for it so the next fit with
+    // the same settings reuses it, exactly as `default_fit_pool` is reused.
+    let pool: &'static rayon::ThreadPool = Box::leak(Box::new(pool));
+    pools.insert(key(&ov, n_threads), pool);
+    Some(pool)
+}
+
+/// Run `f` with `options`' ODE solver settings reaching every thread that can integrate for
+/// it: armed on this thread, and — when the caller actually set one — on a pool whose workers
+/// carry the same value (see [`ode_override_pool`]).
+///
+/// Used by the standalone `run_covariance` / `run_sir` / `run_sir_core` entry points, which
+/// integrate exactly as `fit` does but have no pool of their own. `fit` does not call this: it
+/// already chooses a pool (for `threads` and for its multi-start fan-out) and folds the
+/// override into that choice, so routing through here would nest a second pool inside the
+/// first.
+pub(crate) fn with_fit_ode_scope<R: Send>(
+    options: &FitOptions,
+    f: impl FnOnce() -> R + Send,
+) -> Result<R, String> {
+    let _armed = crate::ode::solver::arm_ode_solver_override(options.ode_solver_override());
+    match ode_scope_pool(options)? {
+        Some(pool) => Ok(pool.install(f)),
+        None => Ok(f()),
+    }
+}
+
+/// The pool a call with these options must run on to keep its ODE settings, or `None` when the
+/// caller set no `ode_*` at all and any pool will do.
+///
+/// Split out so [`with_fit_ode_scope`] and `fit`'s own pool selection cannot drift: both have
+/// to consult it *before* falling back to the shared pool, and both must fail loudly rather
+/// than run unpooled, since unpooled workers integrate at the baked options and the result
+/// still looks successful.
+///
+/// A non-empty override always names its pool, even on a thread that is already a worker of
+/// that same pool. Short-circuiting there looks like a free optimisation and is not: the
+/// caller's fallback is a pool built without the override, so a nested call that pinned
+/// `threads` would land on plain workers and integrate at the model file's options. Since the
+/// table is keyed, "the pool for these settings" is the one we are already on, and rayon runs
+/// an `install` on the current pool inline — the nesting costs nothing to begin with.
+pub(crate) fn ode_scope_pool(
+    options: &FitOptions,
+) -> Result<Option<&'static rayon::ThreadPool>, String> {
+    let ov = options.ode_solver_override();
+    if ov.is_empty() {
+        return Ok(None);
+    }
+    let n = options
+        .threads
+        .filter(|&n| n > 0)
+        .unwrap_or_else(effective_default_threads);
+    ode_override_pool(ov, n).map(Some).ok_or_else(|| {
+        format!(
+            "failed to build the {n}-thread pool this call's ODE solver settings need. \
+             Refusing to continue: without it the workers would integrate at the model \
+             file's settings and the result would look successful."
+        )
+    })
+}
+
+/// Run `f` on the pool this `fit()` call should use, with its ODE settings armed.
+///
+/// Pool choice, in order: the pool carrying this call's ODE override when it set one (so the
+/// workers integrate at the requested accuracy — #1212); a fit-scoped pool sized to a pinned
+/// `threads`; otherwise the shared big-stack pool, falling back to the ambient one only if
+/// that one-time build failed, which must not turn a previously-successful default fit into an
+/// `Err`. One pool serves both levels of a multi-start fan-out, which is why this is called
+/// once per `fit()` and not per start.
+pub(crate) fn install_on_fit_pool<R: Send>(
+    options: &FitOptions,
+    f: impl FnOnce() -> R + Send,
+) -> Result<R, String> {
+    let _armed = crate::ode::solver::arm_ode_solver_override(options.ode_solver_override());
+    if let Some(pool) = ode_scope_pool(options)? {
+        return Ok(pool.install(f));
+    }
+    match options.threads.filter(|&n| n > 0) {
+        // A pinned positive `threads` builds a fit-scoped pool sized to it, and surfaces a
+        // build failure as `Err`.
+        Some(n) => Ok(build_fit_pool(n)?.install(f)),
+        None => Ok(match default_fit_pool() {
+            Some(pool) => pool.install(f),
+            None => f(),
+        }),
+    }
+}
+
 /// The thread count an unpinned `fit()` actually runs on: the explicitly configured
 /// process-wide width when the CLI called [`configure_global_thread_pool`], otherwise the
 /// capped [`default_thread_count`] (#707).

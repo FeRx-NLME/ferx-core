@@ -69,6 +69,28 @@ section of the SDLC for the versioning policy).
   only observation coincides with its dose, and a joint PK-TTE subject outside the shared
   single-solve (same routing) whose only event or censor sits on its first dose scored the
   `1e20` sentinel instead of its finite likelihood. Both fixed by the same change.
+- **ODE solver settings passed to `fit()` now reach the solver (#1212).** `ode_reltol`,
+  `ode_abstol`, `ode_max_steps`, `ode_method`, `ode_stiff_abort_after` and `ode_auto_switch`
+  were stamped onto the compiled model at parse time and read from there by every integration
+  path, so the same keys set on a `FitOptions` handed to `fit()` were silently ignored: the
+  fit ran at the model file's (or the default) accuracy, on the default stepper, and reported
+  success. Tightening a tolerance to test an integration-noise hypothesis returned a
+  bit-identical objective across six orders of magnitude, and a caller selecting
+  `rosenbrock23` / `rodas4` / `rodas5p` for a stiff system stayed on the explicit stepper with
+  nothing to say so. A fit now carries the caller's ODE settings to the integrator for the
+  duration of that fit. Precedence is per key and one-directional: a key the caller moved off
+  its default wins, a key left at its default yields to the model file, so passing a
+  hand-built `FitOptions` cannot loosen a model that pinned `ode_reltol = 1e-10`. The same
+  now applies to the standalone `run_covariance()`, `run_sir()` and `run_sir_core()` entry
+  points, which previously ignored a caller's ODE settings — so a covariance step run beside
+  a tight fit no longer differences a coarser surface than the estimates came from. The
+  model-file route, `predict()` and `simulate()` are unchanged; note that the override lasts
+  one call, so `predict()` after a tight `fit()` on the same model still uses the model
+  file's accuracy unless you `sync_ode_solver_opts` an owned model. Concurrent fits are
+  isolated from each other: a call's settings travel on the thread that made it and on a
+  thread pool keyed to those settings, so a fit that asked for nothing keeps the model
+  file's accuracy even while another fit runs at `1e-10` beside it (and vice versa) — which
+  matters for `ferx-tools`' parallel replicate fits and for any caller sharing the fit pool.
 - **An `SS=1` dose no longer carries the steady-state run-in into a joint PK-TTE model's
   cumulative hazard (#1210).** The appended `d/dt(__chz_<cmt>)` accumulator was cycled through
   the equilibration along with the PK compartments, but it is a pure integrator with no steady

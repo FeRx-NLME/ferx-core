@@ -94,6 +94,14 @@ The post-fit covariance step. See [Covariance Step](../estimation/foce.qmd#covar
 
 Accuracy and step budget for `[odes]` models, and for the auto-generated ODE twin that closed-form transit / inverse-Gaussian absorption models carry. See [ODE Models](ode-models.qmd#solver-details).
 
+These six keys (and the two stepper keys below) can also arrive from a caller, and precedence is **per key** either way: a key the caller sets wins over the model file for that fit, a key the caller does not set keeps the file's value. What counts as "set" differs between the two front ends, so check which one you are on.
+
+From **R**, `ferx_fit(settings = list(ode_reltol = 1e-9))` merges your settings onto the model file's own `[fit_options]` and stamps the result on the model. Every key you name wins — *including* one you name with its default value, so `settings = list(ode_reltol = 1e-4)` does pull a file that pinned `1e-10` back to `1e-4`. Keys you leave out keep whatever the file said.
+
+From **Rust**, `fit(&model, &pop, &params, &options)` — and equally `run_covariance()`, `run_sir()` and `run_sir_core()`, which integrate the same way — compares your `FitOptions` field by field against `FitOptions::default()` and carries only the moved fields for the duration of that call, so a hand-built settings struct cannot silently loosen a model that pinned `ode_reltol = 1e-10`. The consequence is the mirror image of the R rule: asking explicitly for a default value (`ode_reltol = 1e-4`) reads the same as not asking, and the model file still wins. That override also lasts exactly one `fit()` — a later `predict()` on the same `&CompiledModel` integrates at the model file's values, so a fit's IPREDs and a subsequent `predict()` can come from different tolerances. Call `model.sync_ode_solver_opts(&options)` on an owned model when both paths must match (that is what the R front end does).
+
+Put the key in `[fit_options]` when a model needs a specific accuracy regardless of who runs it.
+
 | Key | Values | Default | Description |
 |-----|--------|---------|-------------|
 | `ode_reltol` | float | `1e-4` | RK45 ODE solver **relative** tolerance. Applies to ODE models, and to the auto-generated ODE **twin** that closed-form transit / inverse-Gaussian absorption models (`one_cpt_transit`, `two_cpt_transit`, `one_cpt_ig`, `two_cpt_ig`) use to serve IOV, time-varying-covariate, and `TIME`-switch subjects (#719/#814) — so a call-time override reaches those rerouted fits too; otherwise ignored for analytical PK. The default reproduces analytical closed forms in PRED to ~`1e-4`, but the FOCE objective amplifies solver error, so the OFV of an ODE-form model can differ from its analytical equivalent by several units. Set a tighter value (e.g. `1e-10`) when the ODE-form **OFV** must match an analytical reference; expect slower fits. |
