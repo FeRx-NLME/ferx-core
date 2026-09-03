@@ -49,6 +49,19 @@ section of the SDLC for the versioning policy).
   marked fixed, which is what it meant at the time.
 
 ### Fixed
+- **ODE solver settings passed to `fit()` now reach the solver (#1212).** `ode_reltol`,
+  `ode_abstol`, `ode_max_steps`, `ode_method`, `ode_stiff_abort_after` and `ode_auto_switch`
+  were stamped onto the compiled model at parse time and read from there by every integration
+  path, so the same keys set on a `FitOptions` handed to `fit()` were silently ignored: the
+  fit ran at the model file's (or the default) accuracy, on the default stepper, and reported
+  success. Tightening a tolerance to test an integration-noise hypothesis returned a
+  bit-identical objective across six orders of magnitude, and a caller selecting
+  `rosenbrock23` / `rodas4` / `rodas5p` for a stiff system stayed on the explicit stepper with
+  nothing to say so. A fit now carries the caller's ODE settings to the integrator for the
+  duration of that fit. Precedence is per key and one-directional: a key the caller moved off
+  its default wins, a key left at its default yields to the model file, so passing a
+  hand-built `FitOptions` cannot loosen a model that pinned `ode_reltol = 1e-10`. The
+  model-file route, `predict()` and `simulate()` are unchanged.
 - **An estimated `block_sigma` correlation is bounded at `|rho| <= 0.995` (#847).** Merely
   keeping rho inside `(-1, 1)` is not enough: a paired residual block's determinant carries a
   factor `1 - rho^2`, so a rho of 0.9999 leaves `R` numerically singular and the likelihood

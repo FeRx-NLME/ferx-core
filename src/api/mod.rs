@@ -247,6 +247,10 @@ mod tests_param_corr;
 mod ode_solver_diagnostics_tests;
 
 #[cfg(test)]
+#[path = "tests/ode_solver_options_tests.rs"]
+mod ode_solver_options_tests;
+
+#[cfg(test)]
 #[path = "tests/simulate_with_uncertainty_tests.rs"]
 mod simulate_with_uncertainty_tests;
 

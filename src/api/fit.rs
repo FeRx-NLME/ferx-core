@@ -242,6 +242,16 @@ pub fn fit(
     // is a no-op unless the user pinned `inner_optimizer`.
     crate::estimation::inner_optimizer::set_inner_optimizer(options.inner_optimizer);
     crate::estimation::inner_optimizer::set_ebe_warm_start(options.ebe_warm_start);
+    // #1212: carry this call's ODE solver settings the last hop to the integrator. The
+    // spec's `solver_opts` is stamped at parse time by `sync_ode_solver_opts`, every
+    // integration path reads it off the spec, and `fit` has only `&CompiledModel` — so without
+    // this a `FitOptions { ode_reltol: 1e-10, .. }` (or an `ode_method` naming a stiff stepper)
+    // ran at the parse-time value and reported success. Armed here rather than in `fit_inner`
+    // so the pre-fit validation, every multistart stage, the covariance step and the post-fit
+    // diagnostics all integrate at the same options; the guard disarms on every exit path,
+    // including an early `?`, so a later `predict` on the same model is unaffected.
+    let _ode_solver_override =
+        crate::ode::solver::arm_ode_solver_override(options.ode_solver_override());
     // #1064: a `theta NAME[...]` block has no levels until it is bound
     // to data. Fitting one unbound would gather out of an empty level table and
     // predict NaN everywhere; refuse, and name the two ways out.

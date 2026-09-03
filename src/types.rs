@@ -3914,12 +3914,18 @@ impl CompiledModel {
     /// primary's own `ode_spec` is `None`, so on such a model the call is no longer a
     /// full no-op.
     ///
-    /// Note: [`fit`](crate::fit) takes `&CompiledModel` and does **not** call
-    /// this. The integrator reads [`OdeSpec::solver_opts`](crate::ode::predictions::OdeSpec::solver_opts), never
-    /// `FitOptions::ode_reltol` directly, so a caller that merges call-time
-    /// `settings` into its own `FitOptions` (as the R wrapper's `ferx_fit`
-    /// does) must re-apply this on an owned model *before* `fit` for those
-    /// overrides to reach the solver. Idempotent.
+    /// Note: [`fit`](crate::fit) takes `&CompiledModel` and so cannot call this — the
+    /// integrator reads [`OdeSpec::solver_opts`](crate::ode::predictions::OdeSpec::solver_opts),
+    /// never `FitOptions::ode_reltol` directly. As of #1212 it does not have to: `fit` arms a
+    /// fit-scoped override (`FitOptions::ode_solver_override`) that every integration path
+    /// merges over the baked value, so a caller-supplied `ode_reltol` / `ode_method` / … reaches
+    /// the solver without an owned model. Only the fields moved away from the `FitOptions`
+    /// defaults are carried, so this stamping still wins wherever the caller expressed no
+    /// opinion.
+    ///
+    /// Calling this on an owned model before `fit` (as the R wrapper's `ferx_fit` does) remains
+    /// correct and is still the way `predict` / `simulate`, which take no fit options at all,
+    /// get the requested accuracy. Idempotent.
     pub fn sync_ode_solver_opts(&mut self, opts: &FitOptions) {
         if let Some(ode) = self.ode_spec.as_mut() {
             ode.solver_opts.reltol = opts.ode_reltol;
@@ -6092,7 +6098,10 @@ pub struct FitOptions {
     /// PRED to ~1e-4, but the FOCE OFV amplifies solver error, so a tighter
     /// value (e.g. `1e-10`) is needed for the ODE-form OFV to match the
     /// analytical OFV. Copied onto `OdeSpec::solver_opts` via
-    /// [`CompiledModel::sync_ode_solver_opts`].
+    /// [`CompiledModel::sync_ode_solver_opts`] at parse time, and carried to the integrator
+    /// for a programmatic [`fit`](crate::fit) by `FitOptions::ode_solver_override` — which
+    /// also states the one rule worth knowing: a field left at its default is read as "no
+    /// opinion" and yields to a model file that pinned one (#1212).
     pub ode_reltol: f64,
     /// RK45 ODE solver absolute tolerance (`[fit_options] ode_abstol`).
     /// Default `1e-6`. See [`FitOptions::ode_reltol`].
@@ -7390,6 +7399,38 @@ pub enum ViKl {
 }
 
 impl FitOptions {
+    /// The ODE solver fields this caller moved away from their defaults (#1212).
+    ///
+    /// [`fit`](crate::fit) takes `&CompiledModel` and so cannot restamp the spec that
+    /// [`CompiledModel::sync_ode_solver_opts`] wrote at parse time; the integrator reads
+    /// `OdeSpec::solver_opts`, never these fields. `fit` therefore arms the returned override
+    /// for the duration of the run, and every integration path merges it over the spec's baked
+    /// value. Without this, `FitOptions { ode_reltol: 1e-10, .. }` passed to `fit` was silently
+    /// ignored — the fit ran at the parse-time tolerance and reported success.
+    ///
+    /// **A field is carried only when it differs from [`FitOptions::default`].** The `ode_*`
+    /// defaults are identical to [`OdeSolverOptions::default`](crate::ode::OdeSolverOptions)'s
+    /// (pinned by `fit_option_ode_defaults_match_the_solver_defaults`), so "untouched" is
+    /// exactly "asked for the solver default", and a caller who hand-builds a `FitOptions` and
+    /// fits a model file that pinned `ode_reltol = 1e-10` keeps the file's value instead of
+    /// being silently loosened to `1e-4`. The one case this cannot resolve is a caller who
+    /// explicitly *wants* the default while the model file pinned something else: that is
+    /// indistinguishable from an untouched field, and the file wins — the safe direction, since
+    /// it errs tight rather than quietly reducing accuracy.
+    pub(crate) fn ode_solver_override(&self) -> crate::ode::solver::OdeSolverOverride {
+        let d = Self::default();
+        crate::ode::solver::OdeSolverOverride {
+            reltol: (self.ode_reltol != d.ode_reltol).then_some(self.ode_reltol),
+            abstol: (self.ode_abstol != d.ode_abstol).then_some(self.ode_abstol),
+            max_steps: (self.ode_max_steps != d.ode_max_steps).then_some(self.ode_max_steps),
+            method: (self.ode_method != d.ode_method).then_some(self.ode_method),
+            stiff_abort_after: (self.ode_stiff_abort_after != d.ode_stiff_abort_after)
+                .then_some(self.ode_stiff_abort_after),
+            auto_switch: (self.ode_auto_switch != d.ode_auto_switch)
+                .then_some(self.ode_auto_switch),
+        }
+    }
+
     /// Silence this fit's per-iteration console output (`verbose = false`).
     ///
     /// `verbose` defaults to `true`, which suits one interactive fit and is

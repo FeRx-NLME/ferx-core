@@ -1926,7 +1926,7 @@ fn integrate_subject_duals<T: crate::sens::num::PkNum>(
 ) -> Option<Vec<T>> {
     let ode = model.ode_spec.as_ref()?;
     let program = ode.rhs_program.as_ref()?;
-    let opts = ode.solver_opts;
+    let opts = ode.effective_solver_opts();
 
     // Seed the flat PK-parameter vector: individual parameter `i` (PK slot
     // `pk_indices[i]`) carries dual axis `axis_of[i]` — identity (`= i`) for the full
@@ -2372,7 +2372,7 @@ fn integrate_tvcov_readout<T: crate::sens::num::PkNum>(
         .rhs_program
         .as_ref()
         .expect("ode_analytical_supported (via ode_tvcov_supported) guarantees rhs_program");
-    let opts = ode.solver_opts;
+    let opts = ode.effective_solver_opts();
 
     // Per dose compartment, mirroring production's `DoseAttrMap::f_bio`: `F{cmt}` if
     // declared else the bare `PK_IDX_F` slot (#369 / #486), read from that dose's own
