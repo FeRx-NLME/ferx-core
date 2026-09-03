@@ -388,6 +388,7 @@ fn replicate_fits_are_quiet_single_threaded_and_checkpoint_free() {
         checkpoint: true,
         checkpoint_path: Some("model.tmp".to_string()),
         sir: true,
+        covariance_fallback: CovarianceFallback::Sir,
         run_covariance_step: true,
         ..FitOptions::default()
     };
@@ -398,6 +399,10 @@ fn replicate_fits_are_quiet_single_threaded_and_checkpoint_free() {
     assert!(!o.checkpoint);
     assert_eq!(o.checkpoint_path, None);
     assert!(!o.sir);
+    // "No SIR" includes the non-PD-Hessian fallback: a replicate whose FD
+    // Hessian is not PD must not run a full SIR pass (and then be counted a
+    // failed covariance step while a search's gate would accept it).
+    assert_eq!(o.covariance_fallback, CovarianceFallback::None);
     assert!(!o.run_covariance_step);
 
     // `--keep-covariance` is the one that turns the step back on.

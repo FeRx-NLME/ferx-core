@@ -47,8 +47,8 @@ pub use estimation::uncertainty_samples::UncertaintyMethod;
 pub use frem::{prepare_frem, FremDataInfo, FremFitInit, FremPrepareResult};
 pub use io::datareader::{read_nonmem_csv, read_nonmem_csv_with_covariates};
 pub use model_selection::{
-    bic, check_strictness, estimate_near_boundary, max_abs_correlation, stalled_at_init, BicType,
-    Strictness, StrictnessVerdict,
+    bic, check_strictness, estimate_near_boundary, max_abs_correlation, natural_scale_covariance,
+    stalled_at_init, BicType, Strictness, StrictnessVerdict,
 };
 pub use parser::model_parser::{
     known_block_names, parse_full_model_file, parse_model_file, parse_model_string,

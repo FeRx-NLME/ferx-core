@@ -1474,6 +1474,7 @@ fn run_mcem(
         bayes: None,
         cond_dist: None,
         packed_estimate: None,
+        left_init: None,
         mixture_posteriors: None,
         vi: None,
     })
@@ -2366,6 +2367,7 @@ fn run_mcem_mixture(
         bayes: None,
         cond_dist: None,
         packed_estimate: None,
+        left_init: None,
         mixture_posteriors,
         vi: None,
     })

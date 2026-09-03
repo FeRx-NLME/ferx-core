@@ -3583,6 +3583,7 @@ pub fn run_saem(
         bayes: None,
         cond_dist,
         packed_estimate: None,
+        left_init: None,
         mixture_posteriors,
         vi: None,
     })

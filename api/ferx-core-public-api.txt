@@ -249,6 +249,7 @@ pub ferx_core::estimation::outer_optimizer::OuterResult::final_gradient: core::o
 pub ferx_core::estimation::outer_optimizer::OuterResult::h_matrices: alloc::vec::Vec<nalgebra::base::alias::DMatrix<f64>>
 pub ferx_core::estimation::outer_optimizer::OuterResult::impmap_trace: core::option::Option<ferx_core::ImpmapTrace>
 pub ferx_core::estimation::outer_optimizer::OuterResult::kappas: alloc::vec::Vec<alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>>
+pub ferx_core::estimation::outer_optimizer::OuterResult::left_init: core::option::Option<bool>
 pub ferx_core::estimation::outer_optimizer::OuterResult::max_unconverged_subjects: u32
 pub ferx_core::estimation::outer_optimizer::OuterResult::mixture_posteriors: core::option::Option<ferx_core::estimation::outer_optimizer::MixturePosteriors>
 pub ferx_core::estimation::outer_optimizer::OuterResult::n_iterations: usize
@@ -793,10 +794,12 @@ pub ferx_core::model_selection::StrictnessVerdict::failures: alloc::vec::Vec<all
 pub ferx_core::model_selection::StrictnessVerdict::passed: bool
 pub ferx_core::model_selection::StrictnessVerdict::skipped: alloc::vec::Vec<alloc::string::String>
 pub const ferx_core::model_selection::INIT_STALL_REL_TOL: f64
+pub const ferx_core::model_selection::MIN_SIR_FALLBACK_ESS: f64
 pub fn ferx_core::model_selection::bic(result: &ferx_core::FitResult, kind: ferx_core::model_selection::BicType) -> f64
 pub fn ferx_core::model_selection::check_strictness(result: &ferx_core::FitResult, s: &ferx_core::model_selection::Strictness) -> ferx_core::model_selection::StrictnessVerdict
 pub fn ferx_core::model_selection::estimate_near_boundary(result: &ferx_core::FitResult) -> bool
 pub fn ferx_core::model_selection::max_abs_correlation(result: &ferx_core::FitResult) -> core::option::Option<f64>
+pub fn ferx_core::model_selection::natural_scale_covariance(result: &ferx_core::FitResult) -> core::option::Option<nalgebra::base::alias::DMatrix<f64>>
 pub fn ferx_core::model_selection::stalled_at_init(result: &ferx_core::FitResult) -> core::option::Option<bool>
 pub mod ferx_core::nn
 pub enum ferx_core::nn::Activation
@@ -2730,6 +2733,7 @@ pub ferx_core::types::FitResult::kappa_init_as_sd: alloc::vec::Vec<bool>
 pub ferx_core::types::FitResult::kappa_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::FitResult::kappa_weight_typical: alloc::vec::Vec<core::option::Option<f64>>
 pub ferx_core::types::FitResult::kappa_weights: alloc::vec::Vec<core::option::Option<alloc::string::String>>
+pub ferx_core::types::FitResult::left_init: core::option::Option<bool>
 pub ferx_core::types::FitResult::max_unconverged_subjects: u32
 pub ferx_core::types::FitResult::method: ferx_core::EstimationMethod
 pub ferx_core::types::FitResult::method_chain: alloc::vec::Vec<ferx_core::EstimationMethod>
@@ -4091,6 +4095,7 @@ pub ferx_core::FitResult::kappa_init_as_sd: alloc::vec::Vec<bool>
 pub ferx_core::FitResult::kappa_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::FitResult::kappa_weight_typical: alloc::vec::Vec<core::option::Option<f64>>
 pub ferx_core::FitResult::kappa_weights: alloc::vec::Vec<core::option::Option<alloc::string::String>>
+pub ferx_core::FitResult::left_init: core::option::Option<bool>
 pub ferx_core::FitResult::max_unconverged_subjects: u32
 pub ferx_core::FitResult::method: ferx_core::EstimationMethod
 pub ferx_core::FitResult::method_chain: alloc::vec::Vec<ferx_core::EstimationMethod>
@@ -4567,6 +4572,7 @@ pub fn ferx_core::inits_from_nca(model: &ferx_core::CompiledModel, population: &
 pub fn ferx_core::known_block_names() -> alloc::vec::Vec<&'static str>
 pub fn ferx_core::max_abs_correlation(result: &ferx_core::FitResult) -> core::option::Option<f64>
 pub fn ferx_core::method_specific_keys(m: ferx_core::EstimationMethod) -> &'static [&'static str]
+pub fn ferx_core::natural_scale_covariance(result: &ferx_core::FitResult) -> core::option::Option<nalgebra::base::alias::DMatrix<f64>>
 pub fn ferx_core::omega_se_at(se_omega: &core::option::Option<alloc::vec::Vec<f64>>, n_eta: usize, i: usize, j: usize) -> core::option::Option<f64>
 pub fn ferx_core::parse_full_model_file(path: &std::path::Path) -> core::result::Result<ferx_core::ParsedModel, alloc::string::String>
 pub fn ferx_core::parse_model_file(path: &std::path::Path) -> core::result::Result<ferx_core::CompiledModel, alloc::string::String>

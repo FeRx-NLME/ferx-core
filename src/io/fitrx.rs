@@ -161,6 +161,11 @@ struct FitWire {
     theta_init: Vec<f64>,
     #[serde(default)]
     omega_init: Option<MatrixWire>,
+    // Absent on bundles saved before #1177 recorded the optimizer's own
+    // init-escape verdict; `stalled_at_init` then falls back to comparing
+    // estimates against `theta_init` & co.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    left_init: Option<bool>,
     #[serde(default)]
     sigma_init: Vec<f64>,
     #[serde(default)]
@@ -674,6 +679,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         model_text: r.model_text.clone(),
         theta_init: r.theta_init.clone(),
         omega_init: Some(MatrixWire::from(&r.omega_init)),
+        left_init: r.left_init,
         sigma_init: r.sigma_init.clone(),
         obs_time_range: r.obs_time_range,
         final_gradient: r.final_gradient.clone(),
@@ -1979,6 +1985,7 @@ fn wire_to_fit_result(
         // Transient (`#[serde(skip)]`) and not persisted: a reloaded fit has no
         // optimizer packed vector, so `run_covariance` re-packs from omega (#816).
         packed_estimate: None,
+        left_init: w.left_init,
     })
 }
 
@@ -2528,6 +2535,63 @@ mod tests {
         let r0 = minimal_fit_result(); // npde_seed defaults to None
         save_fit(&r0, &p, "src\n", &none, SaveFitOptions::default()).unwrap();
         assert_eq!(load_fit(&none).unwrap().fit.npde_seed, None);
+    }
+
+    /// The tally behind the BIC variants and the optimizer's init-escape
+    /// verdict (#1177) round-trip. `minimal_fit_result` carries the *default*
+    /// tally, which is indistinguishable from a dropped field, so this uses a
+    /// non-default one — the mutation `bic_inputs: Default::default()` in
+    /// `build_fit_wire` is unobservable otherwise.
+    #[test]
+    fn bic_inputs_and_left_init_round_trip_through_fitrx() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run1.fitrx");
+        let mut r = minimal_fit_result();
+        r.bic_inputs = crate::types::BicInputs {
+            n_obs: 155,
+            theta_random: 2,
+            theta_fixed: 1,
+            omega: 2,
+            kappa: 0,
+            sigma: 1,
+            sigma_random: false,
+        };
+        r.left_init = Some(false);
+        assert_ne!(r.bic_inputs, crate::types::BicInputs::default());
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "model source\n", &path, SaveFitOptions::default()).unwrap();
+
+        let l = load_fit(&path).unwrap().fit;
+        assert_eq!(l.bic_inputs, r.bic_inputs);
+        assert_eq!(l.left_init, Some(false));
+        // And the loaded bundle ranks: the tally partitions `n_parameters`.
+        assert!(
+            crate::model_selection::bic(&l, crate::model_selection::BicType::Mixed).is_finite()
+        );
+    }
+
+    /// A bundle saved before #1177 has neither key: the tally defaults to all
+    /// zero, for which `bic()` reports NaN rather than a wrong penalty, and the
+    /// stall predicate falls back to comparing against the initial estimates.
+    #[test]
+    fn fit_wire_missing_bic_inputs_and_left_init_default() {
+        let r = minimal_fit_result();
+        let wire = build_fit_wire(&r);
+        let mut value = serde_json::to_value(&wire).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        assert!(obj.remove("bic_inputs").is_some());
+        // `left_init` is skipped when `None`; simulate an explicit old bundle
+        // by making sure it is absent either way.
+        obj.remove("left_init");
+        let reloaded: FitWire = serde_json::from_value(value).unwrap();
+        assert_eq!(reloaded.bic_inputs, crate::types::BicInputs::default());
+        assert_eq!(reloaded.left_init, None);
+
+        let mut old = r.clone();
+        old.bic_inputs = reloaded.bic_inputs;
+        old.left_init = reloaded.left_init;
+        assert!(old.n_parameters > 0);
+        assert!(crate::model_selection::bic(&old, crate::model_selection::BicType::Mixed).is_nan());
     }
 
     #[test]

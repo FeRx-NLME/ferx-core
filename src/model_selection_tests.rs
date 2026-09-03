@@ -142,6 +142,27 @@ fn bic_mixed_needs_only_the_logs_its_classes_use() {
     assert!(bic(&r, BicType::Fixed).is_nan());
 }
 
+/// A fit with no free parameter has penalty 0 under every convention, whatever
+/// `n_subjects` / `n_obs` say — so `Fixed` stays `FitResult::bic` on an old
+/// all-FIX bundle that recorded neither count, rather than NaN while the other
+/// three return `ofv`.
+#[test]
+fn bic_of_a_fit_with_no_free_parameter_is_the_ofv_under_every_convention() {
+    let mut r = minimal_fit_result();
+    r.ofv = 42.0;
+    r.n_parameters = 0;
+    r.bic_inputs = BicInputs::default(); // n_obs = 0
+    r.n_subjects = 0;
+    for kind in [
+        BicType::Mixed,
+        BicType::Iiv,
+        BicType::Random,
+        BicType::Fixed,
+    ] {
+        assert_eq!(bic(&r, kind), 42.0, "{kind:?}");
+    }
+}
+
 #[test]
 fn bic_type_serde_uses_snake_case_tokens() {
     assert_eq!(serde_json::to_string(&BicType::Mixed).unwrap(), "\"mixed\"");
@@ -362,13 +383,57 @@ fn require_covariance_names_each_non_computed_status() {
     // accepted, and with no matrix stored the threshold gates would skip.
     r.covariance_status = CovarianceStatus::SirFallback;
     r.covariance_matrix = None;
+    r.sir_ess = Some(120.0);
     let v = check_strictness(&r, &s);
     assert!(v.passed, "{v:?}");
     r.covariance_matrix = Some(DMatrix::<f64>::identity(3, 3));
+    r.sir_ess = None;
 
     r.covariance_status = CovarianceStatus::Computed;
     r.covariance_matrix = None;
     assert!(check_strictness(&r, &s).failures[0].contains("no matrix"));
+}
+
+/// SIR returns `Ok` with a single finite importance weight (`sir.rs`), so a
+/// fallback whose weights collapsed onto one draw reports `SirFallback` with
+/// zero-width intervals. `require_covariance` reads the ESS it recorded.
+#[test]
+fn require_covariance_rejects_a_collapsed_sir_fallback() {
+    let s = Strictness {
+        require_covariance: true,
+        ..Strictness::none()
+    };
+    let mut r = clean_fit();
+    r.covariance_status = CovarianceStatus::SirFallback;
+    r.covariance_matrix = None;
+    r.cov_condition_number = None;
+
+    r.sir_ess = Some(1.0); // one effective draw: every CI is (x, x)
+    let v = check_strictness(&r, &s);
+    assert!(!v.passed);
+    assert!(
+        v.failures[0].starts_with("SIR fallback collapsed") && v.failures[0].contains("1.00"),
+        "{v:?}"
+    );
+    r.sir_ess = Some(f64::NAN);
+    assert!(!check_strictness(&r, &s).passed);
+    r.sir_ess = None;
+    let v = check_strictness(&r, &s);
+    assert!(!v.passed);
+    assert!(v.failures[0].contains("no effective sample size"), "{v:?}");
+
+    // At the floor it is accepted; the matrix-based gates then skip.
+    r.sir_ess = Some(MIN_SIR_FALLBACK_ESS);
+    let v = check_strictness(
+        &r,
+        &Strictness {
+            require_covariance: true,
+            max_condition_number: Some(1000.0),
+            ..Strictness::none()
+        },
+    );
+    assert!(v.passed, "{v:?}");
+    assert_eq!(v.skipped.len(), 1);
 }
 
 #[test]
@@ -457,6 +522,103 @@ fn max_correlation_fails_above_threshold_naming_the_pair() {
     assert!(v.skipped[0].starts_with("parameter correlation"), "{v:?}");
 }
 
+/// The covariance matrix is the full packed n×n — θ, then Ω (Cholesky), then
+/// σ — so a pair past the θ block is named by its packed coordinate, not by
+/// `theta_names[k]` (which does not exist) or a bare index.
+#[test]
+fn max_correlation_names_an_omega_coordinate_by_its_packed_name() {
+    let s = Strictness {
+        max_correlation: Some(0.95),
+        ..Strictness::none()
+    };
+    let mut r = clean_fit();
+    // 3 θ + 2 diagonal Ω + 1 σ = 6 packed coordinates; (0, 3) is CL ~ Ω_CL.
+    let mut cov = DMatrix::<f64>::identity(6, 6);
+    cov[(0, 3)] = 0.97;
+    cov[(3, 0)] = 0.97;
+    r.covariance_matrix = Some(cov);
+    let v = check_strictness(&r, &s);
+    assert!(!v.passed);
+    assert!(v.failures[0].contains("CL ~ log_chol_eta_CL"), "{v:?}");
+    assert!(!v.failures[0].contains("packed coordinate"), "{v:?}");
+}
+
+/// A `block_omega` fit whose covariance matrix is on the packed (Cholesky)
+/// scale: `L₂₁` and `ln L₂₂` correlate at 0.99 there, but the natural
+/// `ω₂₁`/`ω₂₂` they map onto — what pyDarwin and Pharmpy read off a NONMEM
+/// `.cor` — barely correlate. Chosen so the two readings straddle the 0.95
+/// gate, and the straddle itself is asserted so the fixture cannot silently
+/// become a tautology.
+fn block_omega_fit() -> FitResult {
+    let mut r = clean_fit();
+    // L = [[0.3, 0], [-0.04, 0.2]] → Ω = L Lᵀ.
+    r.omega = DMatrix::from_row_slice(2, 2, &[0.09, -0.012, -0.012, 0.0416]);
+    r.omega_init = r.omega.clone() * 0.5;
+    // 3 θ + 3 Cholesky + 1 σ; packed variances 0.01, one 0.99 correlation
+    // between packed coordinates 4 (L₂₁) and 5 (ln L₂₂).
+    let mut cov = DMatrix::<f64>::identity(7, 7) * 0.01;
+    cov[(4, 5)] = 0.99 * 0.01;
+    cov[(5, 4)] = 0.99 * 0.01;
+    r.covariance_matrix = Some(cov);
+    r
+}
+
+fn max_abs_corr_of(cov: &DMatrix<f64>) -> f64 {
+    let n = cov.nrows();
+    let mut worst = 0.0f64;
+    for a in 0..n {
+        for b in (a + 1)..n {
+            let r = (cov[(a, b)] / (cov[(a, a)].sqrt() * cov[(b, b)].sqrt())).abs();
+            assert!(r.is_finite());
+            worst = worst.max(r);
+        }
+    }
+    worst
+}
+
+#[test]
+fn max_correlation_reads_block_omega_on_the_natural_scale() {
+    let r = block_omega_fit();
+    let packed = max_abs_corr_of(r.covariance_matrix.as_ref().unwrap());
+    let natural = natural_scale_covariance(&r).unwrap();
+    let natural_r = max_abs_corr_of(&natural);
+    // The straddle: the packed reading fails the gate, the natural one passes.
+    assert!(packed > 0.95, "packed |r| = {packed}");
+    assert!(natural_r < 0.95, "natural |r| = {natural_r}");
+    assert!((max_abs_correlation(&r).unwrap() - natural_r).abs() < 1e-12);
+
+    let s = Strictness {
+        max_correlation: Some(0.95),
+        ..Strictness::none()
+    };
+    assert!(check_strictness(&r, &s).passed);
+
+    // The transform is the delta method with the same Jacobian `se_omega`
+    // uses: the natural variance of ω₁₁ = L₁₁² from x = ln L₁₁ is (2·ω₁₁)²·var(x).
+    let want = (2.0 * 0.09_f64).powi(2) * 0.01;
+    assert!(
+        (natural[(3, 3)] - want).abs() < 1e-12,
+        "{}",
+        natural[(3, 3)]
+    );
+}
+
+#[test]
+fn natural_scale_covariance_is_the_stored_matrix_without_a_block_omega() {
+    // Diagonal Ω: every coordinate is a monotone function of one packed
+    // coordinate, so nothing is transformed and correlations are unchanged.
+    let mut r = clean_fit();
+    let mut cov = DMatrix::<f64>::identity(6, 6) * 0.02;
+    cov[(0, 3)] = 0.01;
+    cov[(3, 0)] = 0.01;
+    cov[(4, 5)] = -0.015;
+    cov[(5, 4)] = -0.015;
+    r.covariance_matrix = Some(cov.clone());
+    assert_eq!(natural_scale_covariance(&r).unwrap(), cov);
+    r.covariance_matrix = None;
+    assert!(natural_scale_covariance(&r).is_none());
+}
+
 #[test]
 fn reject_on_boundary_is_the_bootstrap_predicate() {
     let s = Strictness {
@@ -535,6 +697,68 @@ fn stalled_at_init_uses_an_absolute_tolerance_for_a_zero_init() {
     assert_eq!(stalled_at_init(&r), Some(true));
     r.theta[2] = 0.02;
     assert_eq!(stalled_at_init(&r), Some(false));
+}
+
+/// Nothing free cannot stall. Every loop skipping on `is_fixed` used to fall
+/// through to `Some(true)`, so an all-FIX evaluation run was rejected as
+/// "no free parameter moved".
+#[test]
+fn stalled_at_init_reports_a_fully_fixed_fit_as_not_stalled() {
+    let mut r = minimal_fit_result();
+    r.theta_init = r.theta.clone();
+    r.omega_init = r.omega.clone();
+    r.sigma_init = r.sigma.clone();
+    r.theta_fixed = vec![true; 3];
+    r.omega_fixed = vec![true; 2];
+    r.sigma_fixed = vec![true];
+    assert_eq!(stalled_at_init(&r), Some(false));
+    // The optimizer's own test reads "did not move" on an empty vector; the
+    // free-parameter check comes first.
+    r.left_init = Some(false);
+    assert_eq!(stalled_at_init(&r), Some(false));
+    let v = check_strictness(&r, &Strictness::default());
+    assert!(v.passed, "{v:?}");
+}
+
+/// The optimizer's `INIT_ESCAPE_STEP_S` test runs in its scaled packed space,
+/// where a log-packed coordinate is normalised by |ln θ₀|, so its 1 % and the
+/// natural-scale 1 % disagree on borderline fits (V₀ = 100 → 103: a stall to
+/// the optimizer, a move on the natural scale). When the result carries the
+/// optimizer's verdict, that verdict wins.
+#[test]
+fn stalled_at_init_prefers_the_optimizers_own_verdict() {
+    let mut r = minimal_fit_result();
+    r.theta_init = r.theta.clone();
+    r.omega_init = r.omega.clone();
+    r.sigma_init = r.sigma.clone();
+    // Natural scale says "moved 3 %"; the optimizer says it never left.
+    r.theta[1] = r.theta_init[1] * 1.03;
+    assert_eq!(stalled_at_init(&r), Some(false));
+    r.left_init = Some(false);
+    assert_eq!(stalled_at_init(&r), Some(true));
+    let v = check_strictness(
+        &r,
+        &Strictness {
+            reject_init_stall: true,
+            ..Strictness::none()
+        },
+    );
+    assert!(!v.passed);
+    assert!(
+        v.failures[0].starts_with("stalled at the initial estimates"),
+        "{v:?}"
+    );
+
+    // And the reverse: a sub-1 % natural move the optimizer counted as escape.
+    r.theta[1] = r.theta_init[1] * 1.005;
+    r.left_init = None;
+    assert_eq!(stalled_at_init(&r), Some(true));
+    r.left_init = Some(true);
+    assert_eq!(stalled_at_init(&r), Some(false));
+
+    // Missing initials still yield `None`, whatever the optimizer recorded.
+    r.theta_init.clear();
+    assert_eq!(stalled_at_init(&r), None);
 }
 
 #[test]

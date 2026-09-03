@@ -510,6 +510,7 @@ fn synthetic_fit(template: &ModelParameters) -> FitResult {
         covariate_table: None,
         exclusions: None,
         packed_estimate: None,
+        left_init: None,
     }
 }
 

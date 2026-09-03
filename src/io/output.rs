@@ -1727,15 +1727,15 @@ fn yaml_quote(s: &str) -> String {
     format!("\"{escaped}\"")
 }
 
-/// Build the ordered parameter name list that matches `pack_params` layout:
-/// `[theta..., omega_packed..., sigma..., kappa_packed...]`.
+/// Whether the fit's Ω and κ blocks are packed as diagonals or full Cholesky
+/// lower triangles, as `(omega_diagonal, kappa_diagonal)`, inferred from the
+/// size `n` of a packed-space matrix on the result (its covariance matrix).
 ///
-/// For a diagonal omega/kappa each entry is `log_chol_{eta_name}` — the packed
-/// value is `log(L_ii)` where `omega = L Lᵀ` (Cholesky diagonal, log-transformed).
-/// For a full-block omega/kappa the column-major lower-triangle entries are
-/// `log_chol_{eta_i}` on the diagonal (`log(L_ii)`) and `chol_{eta_i}_{eta_j}`
-/// (i > j) off-diagonal (`L_ij`, not log-transformed).
-fn packed_param_names(result: &FitResult, n: usize) -> Vec<String> {
+/// `FitResult` does not record the structure, so it is read off the count of
+/// packed coordinates left after θ and σ. Known ambiguity: when
+/// `n_eta == n_kappa > 1` and exactly one of the two is a block, both
+/// assignments give the same count and the block is assumed to be Ω.
+pub(crate) fn packed_layout(result: &FitResult, n: usize) -> (bool, bool) {
     let n_theta = result.theta_names.len();
     let n_eta = result.omega.nrows();
     let n_sigma = result.sigma_names.len();
@@ -1764,11 +1764,25 @@ fn packed_param_names(result: &FitResult, n: usize) -> Vec<String> {
         (true, false, n_omega_diag + n_kappa_full),
         (false, false, n_omega_full + n_kappa_full),
     ];
-    let (omega_diagonal, kappa_diagonal) = combos
+    combos
         .iter()
         .find(|(_, _, size)| *size == n_remaining)
         .map(|(od, kd, _)| (*od, *kd))
-        .unwrap_or((n_eta <= 1, n_kappa <= 1));
+        .unwrap_or((n_eta <= 1, n_kappa <= 1))
+}
+
+/// Build the ordered parameter name list that matches `pack_params` layout:
+/// `[theta..., omega_packed..., sigma..., kappa_packed...]`.
+///
+/// For a diagonal omega/kappa each entry is `log_chol_{eta_name}` — the packed
+/// value is `log(L_ii)` where `omega = L Lᵀ` (Cholesky diagonal, log-transformed).
+/// For a full-block omega/kappa the column-major lower-triangle entries are
+/// `log_chol_{eta_i}` on the diagonal (`log(L_ii)`) and `chol_{eta_i}_{eta_j}`
+/// (i > j) off-diagonal (`L_ij`, not log-transformed).
+pub(crate) fn packed_param_names(result: &FitResult, n: usize) -> Vec<String> {
+    let n_eta = result.omega.nrows();
+    let n_kappa = result.kappa_names.len();
+    let (omega_diagonal, kappa_diagonal) = packed_layout(result, n);
 
     let mut names: Vec<String> = Vec::with_capacity(n);
 
@@ -2765,6 +2779,7 @@ mod tests {
             covariate_table: None,
             exclusions: None,
             packed_estimate: None,
+            left_init: None,
         }
     }
 
@@ -3469,6 +3484,7 @@ mod tests {
             covariate_table: None,
             exclusions: None,
             packed_estimate: None,
+            left_init: None,
         }
     }
 

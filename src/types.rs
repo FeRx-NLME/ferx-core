@@ -5870,6 +5870,17 @@ pub struct FitResult {
     /// `.fitrx` / ferx-r format change.
     #[serde(skip)]
     pub packed_estimate: Option<Vec<f64>>,
+    /// The outer optimizer's own verdict on whether the fit left its initial
+    /// estimates — its `INIT_ESCAPE_STEP_S` test (#751) in scaled packed space,
+    /// on the point the reported estimates are built from. `Some(false)` is the
+    /// #751 stall signature; `crate::stalled_at_init` prefers this to its own
+    /// natural-scale comparison when it is present. `Some` for the NLopt outer
+    /// loop (BOBYQA, SLSQP, L-BFGS, MMA); `None` for the built-in BFGS, the
+    /// trust region, Gauss-Newton, SAEM / IMP / Bayes / VI, an
+    /// `outer_maxiter = 0` evaluation, hand-built results, and a `.fitrx`
+    /// bundle saved before it was recorded.
+    #[serde(default)]
+    pub left_init: Option<bool>,
     /// True when this result was reconstructed from a `.fitrx` checkpoint by
     /// [`crate::io::fitrx::load_fit`] rather than produced by a live fit.
     ///

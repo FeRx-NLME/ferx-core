@@ -483,6 +483,7 @@ pub fn run_foce_gn(
             // the exact factor `L`; reused by `run_covariance` for a bit-for-bit
             // covariance instead of re-decomposing `omega` (#816 follow-up).
             packed_estimate: Some(x.clone()),
+            left_init: None,
             mixture_posteriors: None,
             vi: None,
         };
@@ -594,6 +595,7 @@ pub fn run_foce_gn(
         // Exact packed vector this stage's covariance step used (see above);
         // reused by `run_covariance` for a bit-for-bit covariance (#816 follow-up).
         packed_estimate: Some(final_packed),
+        left_init: None,
         mixture_posteriors: None,
         vi: None,
     }

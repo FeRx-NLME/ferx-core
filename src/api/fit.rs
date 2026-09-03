@@ -1462,6 +1462,7 @@ fn fit_inner(
                         bayes: None,
                         cond_dist: None,
                         packed_estimate: None,
+                        left_init: None,
                         vi: None,
                         mixture_posteriors: None,
                     });
@@ -1531,6 +1532,7 @@ fn fit_inner(
                     bayes: None,
                     cond_dist: None,
                     packed_estimate: None,
+                    left_init: None,
                     mixture_posteriors: None,
                     vi: None,
                 });
@@ -2363,6 +2365,7 @@ fn fit_inner(
         // `run_covariance` reproduces this fit's covariance step bit-for-bit (#816
         // follow-up). `None` for estimators that don't pack in Cholesky space.
         packed_estimate: result.packed_estimate,
+        left_init: result.left_init,
         se_theta,
         se_omega,
         se_sigma,

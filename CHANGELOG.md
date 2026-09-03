@@ -50,8 +50,11 @@ section of the SDLC for the versioning policy).
   &Strictness { .. })` evaluates the pyDarwin-style gates — convergence, covariance step,
   condition number, parameter correlation, boundary estimates, and the #751 init stall — and
   returns the named reason for every failed gate, so a search report can say *why* a
-  candidate was excluded. `bootstrap`'s `skip_estimate_near_boundary` now uses the same
-  `estimate_near_boundary` predicate.
+  candidate was excluded. `FitResult` also gains `left_init`, the outer optimizer's own
+  init-escape verdict (round-trips through `.fitrx`), which `stalled_at_init` prefers to its
+  natural-scale comparison. `bootstrap`'s `skip_estimate_near_boundary` and its
+  covariance-step tally now use the same `estimate_near_boundary` / `require_covariance`
+  predicates, and its replicates no longer run the `covariance_fallback = sir` pass.
 - **Fitted `block_sigma` correlations are reported with their fixedness and standard error
   (#847).** `FitResult` gains `residual_correlation_fixed` and `se_residual_correlations` (the
   SE on the natural `rho` scale, by the delta method on the packed Fisher-z coordinate), the

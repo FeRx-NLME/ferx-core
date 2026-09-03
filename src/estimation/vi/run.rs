@@ -1114,6 +1114,7 @@ pub fn run_vi(
         // standalone `run_covariance` reproduces it bit-for-bit instead of
         // re-deriving `chol(Ω)` from `L·Lᵀ` (#816 follow-up).
         packed_estimate: Some(packed_final),
+        left_init: None,
         vi: Some(vi_result),
         mixture_posteriors: None,
     })
