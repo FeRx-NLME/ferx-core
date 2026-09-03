@@ -767,10 +767,9 @@ fn cancel_aware(error: String, cancel: &Option<CancelFlag>) -> BootstrapError {
 }
 
 fn diagnostics_from(result: &FitResult) -> (bool, bool, bool) {
-    let near_boundary = result
-        .warnings_structured
-        .iter()
-        .any(|w| w.category == WarningCode::BoundaryEstimate);
+    // The same predicate `Strictness::reject_on_boundary` applies (#1177), so a
+    // replicate this filter drops is exactly a candidate a search would drop.
+    let near_boundary = ferx_core::estimate_near_boundary(result);
     let cov_failed = result
         .warnings_structured
         .iter()

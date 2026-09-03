@@ -101,6 +101,7 @@ fn test_sdtab_ipred_honours_tv_covariates() {
         has_conditional_eta_params: false,
         eta_param_info: Vec::new(),
         theta_transform: Vec::new(),
+        theta_eta_linked: Vec::new(),
         #[cfg(feature = "nn")]
         covariate_nns: Vec::new(),
         scaling: ScalingSpec::None,
@@ -442,6 +443,7 @@ fn test_simulate_honours_tv_covariates() {
         has_conditional_eta_params: false,
         eta_param_info: Vec::new(),
         theta_transform: Vec::new(),
+        theta_eta_linked: Vec::new(),
         #[cfg(feature = "nn")]
         covariate_nns: Vec::new(),
         scaling: ScalingSpec::None,

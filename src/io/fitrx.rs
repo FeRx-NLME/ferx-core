@@ -130,6 +130,10 @@ struct FitWire {
     cov_eigenvalues: Option<Vec<f64>>,
     #[serde(with = "crate::io::serde_nan::opt")]
     cov_condition_number: Option<f64>,
+    // Absent on bundles saved before #1177; loaders default to an all-zero
+    // tally, for which `bic()` reports NaN rather than a wrong penalty.
+    #[serde(default)]
+    bic_inputs: BicInputs,
 
     sir: Option<SirWire>,
     iov: Option<IovWire>,
@@ -625,6 +629,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         covariance_matrix: r.covariance_matrix.as_ref().map(MatrixWire::from),
         cov_eigenvalues: r.cov_eigenvalues.clone(),
         cov_condition_number: r.cov_condition_number,
+        bic_inputs: r.bic_inputs,
         sir: if r.sir_ci_theta.is_some() || r.sir_ess.is_some() || r.sir_resamples_packed.is_some()
         {
             Some(SirWire {
@@ -1938,6 +1943,7 @@ fn wire_to_fit_result(
         sigma_types,
         cov_eigenvalues: w.cov_eigenvalues,
         cov_condition_number: w.cov_condition_number,
+        bic_inputs: w.bic_inputs,
         eta_log_transformed: w.omega.log_transformed,
         omega_param_corr,
         omega_iov_param_corr,
@@ -2040,28 +2046,7 @@ mod tests {
         assert!(pmix_column_order(&["ID", "eta_1", "ofv", "n_obs"]).is_empty());
     }
 
-    fn dummy_subject(id: &str, n_eta: usize, n_obs: usize) -> SubjectResult {
-        SubjectResult {
-            id: id.into(),
-            eta: DVector::from_vec((0..n_eta).map(|k| 0.1 * (k as f64 + 1.0)).collect()),
-            ipred: (0..n_obs).map(|j| 1.0 + j as f64).collect(),
-            pred: (0..n_obs).map(|j| 1.5 + j as f64).collect(),
-            iwres: (0..n_obs).map(|j| 0.01 * j as f64).collect(),
-            cwres: (0..n_obs).map(|j| -0.02 * j as f64).collect(),
-            npde: vec![],
-            npd: vec![],
-            ofv_contribution: 12.34,
-            cens: vec![0; n_obs],
-            n_obs,
-            pmix: None,
-            mixest: None,
-            extra_columns: vec![],
-            per_obs_tad: vec![],
-            compartment_states: vec![],
-            #[cfg(feature = "survival")]
-            discrete_rows: Vec::new(),
-        }
-    }
+    use crate::types::test_helpers::dummy_subject;
 
     fn dummy_population(ids: &[&str], n_obs_each: usize) -> Population {
         let mut subjects = Vec::new();
@@ -2099,143 +2084,7 @@ mod tests {
         }
     }
 
-    fn minimal_fit_result() -> FitResult {
-        let n_eta = 2;
-        FitResult {
-            residual_correlation_fixed: Vec::new(),
-            se_residual_correlations: None,
-            covariate_relations: Vec::new(),
-            restored_from_checkpoint: false,
-            method: EstimationMethod::FoceI,
-            method_chain: vec![EstimationMethod::FoceI],
-            method_wall_times_secs: vec![1.234],
-            covariance_wall_time_secs: 0.0,
-            converged: true,
-            ofv: 100.0,
-            aic: 110.0,
-            bic: 115.0,
-            theta: vec![1.0, 2.0, 0.5],
-            theta_names: vec!["CL".into(), "V".into(), "KA".into()],
-            eta_names: vec!["eta_CL".into(), "eta_V".into()],
-            omega: DMatrix::from_row_slice(2, 2, &[0.1, 0.0, 0.0, 0.2]),
-            sigma: vec![0.05],
-            sigma_names: vec!["prop".into()],
-            residual_correlations: Vec::new(),
-            error_model: ErrorModel::Proportional,
-            covariance_matrix: Some(DMatrix::<f64>::identity(3, 3)),
-            se_theta: Some(vec![0.01, 0.02, 0.005]),
-            se_omega: Some(vec![0.01, 0.02]),
-            se_sigma: Some(vec![0.001]),
-            theta_fixed: vec![false, false, false],
-            omega_fixed: vec![false, false],
-            sigma_fixed: vec![false],
-            omega_init_as_sd: vec![false, false],
-            sigma_init_as_sd: vec![false],
-            subjects: vec![dummy_subject("S1", n_eta, 3), dummy_subject("S2", n_eta, 2)],
-            n_obs: 5,
-            n_subjects: 2,
-            n_parameters: 6,
-            n_iterations: 10,
-            interaction: true,
-            warnings: vec!["watch out".into()],
-            warnings_structured: vec![crate::types::classify_warning("watch out")],
-            sir_ci_theta: None,
-            sir_ci_omega: None,
-            sir_ci_sigma: None,
-            sir_ess: None,
-            sir_resamples_packed: None,
-            importance_sampling: None,
-            impmap_trace: None,
-            bayes: None,
-            vi: None,
-            omega_iov: None,
-            kappa_names: vec![],
-            kappa_fixed: vec![],
-            kappa_init_as_sd: vec![],
-            kappa_weights: Vec::new(),
-            kappa_weight_typical: Vec::new(),
-            se_kappa: None,
-            shrinkage_kappa: vec![],
-            shrinkage_kappa_by_occ: vec![],
-            ebe_kappas: vec![],
-            saem_mu_ref_m_step_evals_saved: None,
-            saem_n_subjects_hmc: None,
-            gradient_method_inner: "analytic (Dual2)".into(),
-            gradient_method_outer: "finite differences".into(),
-            uses_ode_solver: false,
-            uses_sde: false,
-            n_threads_used: 4,
-            nlopt_missing_algorithms: vec![],
-            covariance_n_evals_estimated: None,
-            trace_path: None,
-            ebe_convergence_warnings: 0,
-            max_unconverged_subjects: 0,
-            total_ebe_fallbacks: 0,
-            covariance_status: CovarianceStatus::Computed,
-            shrinkage_eta: vec![0.1, 0.15],
-            cond_dist: None,
-            shrinkage_eps: 0.05,
-            iwres_lag1_r: 0.12,
-            dw_statistic: 1.75,
-            wall_time_secs: 1.234,
-            model_name: "test_model".into(),
-            ferx_version: "0.1.0".into(),
-            environment: crate::environment::detect(),
-            eta_param_info: vec![
-                EtaParamInfo {
-                    eta_name: "eta_CL".into(),
-                    param_type: EtaParamType::LogNormal,
-                    linked_theta: Some("CL".into()),
-                    individual_param_name: "CL".into(),
-                },
-                EtaParamInfo {
-                    eta_name: "eta_V".into(),
-                    param_type: EtaParamType::LogNormal,
-                    linked_theta: Some("V".into()),
-                    individual_param_name: "V".into(),
-                },
-            ],
-            theta_transform: vec![
-                ThetaTransform::Log,
-                ThetaTransform::Log,
-                ThetaTransform::Log,
-            ],
-            sigma_types: vec![SigmaType::Proportional],
-            cov_eigenvalues: Some(vec![1.0, 0.5, 0.2]),
-            cov_condition_number: Some(5.0),
-            eta_log_transformed: vec![true, true],
-            omega_param_corr: None,
-            omega_iov_param_corr: None,
-            model_path: None,
-            data_path: None,
-            model_hash: None,
-            data_hash: None,
-            model_text: None,
-            theta_init: vec![1.0, 2.0, 0.5],
-            omega_init: DMatrix::from_row_slice(2, 2, &[0.1, 0.0, 0.0, 0.2]),
-            sigma_init: vec![0.05],
-            obs_time_range: Some((0.25, 24.0)),
-            final_gradient: None,
-            optimizer: "slsqp".to_string(),
-            n_starts: 1,
-            multi_start_seed: None,
-            saem_seed: None,
-            sir_seed: None,
-            imp_seed: None,
-            npde_seed: None,
-            bloq_method: "drop".to_string(),
-            outer_maxiter: 300,
-            outer_gtol: 1e-4,
-            inits_from_nca: None,
-            covariate_names: vec!["WT".into(), "AGE".into()],
-            input_columns: vec![],
-            #[cfg(feature = "nn")]
-            neural_networks: Vec::new(),
-            covariate_table: None,
-            exclusions: None,
-            packed_estimate: None,
-        }
-    }
+    use crate::types::test_helpers::minimal_fit_result;
 
     #[test]
     fn json_result_has_versioned_schema_and_round_trips() {

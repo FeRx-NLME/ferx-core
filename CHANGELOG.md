@@ -40,6 +40,18 @@ section of the SDLC for the versioning policy).
   silently scoring the declared value — `[saem, focei]` is fine, `[focei, imp]` needs `FIX`.
 
 ### Added
+- **BIC variants and a `Strictness` gate for candidate ranking (#1177, part of #1175).**
+  `ferx_core::bic(&result, BicType::{Mixed, Iiv, Random, Fixed})` computes the four
+  conventions of `pharmpy.modeling.calculate_bic` from a finished `FitResult` — the
+  Delattre-style *mixed* BIC penalises random-effects-class parameters on `ln(n_subjects)`
+  and the rest on `ln(n_obs)`, which is what Pharmpy's `iivsearch` / `modelsearch` rank on.
+  The class tally is recorded on the new `FitResult::bic_inputs` (and round-trips through
+  `.fitrx`; older bundles read `NaN` rather than a wrong penalty). `check_strictness(&result,
+  &Strictness { .. })` evaluates the pyDarwin-style gates — convergence, covariance step,
+  condition number, parameter correlation, boundary estimates, and the #751 init stall — and
+  returns the named reason for every failed gate, so a search report can say *why* a
+  candidate was excluded. `bootstrap`'s `skip_estimate_near_boundary` now uses the same
+  `estimate_near_boundary` predicate.
 - **Fitted `block_sigma` correlations are reported with their fixedness and standard error
   (#847).** `FitResult` gains `residual_correlation_fixed` and `se_residual_correlations` (the
   SE on the natural `rho` scale, by the delta method on the packed Fisher-z coordinate), the
@@ -49,6 +61,11 @@ section of the SDLC for the versioning policy).
   marked fixed, which is what it meant at the time.
 
 ### Fixed
+- **`n_parameters`, AIC and BIC no longer count the structural zeros of a mixed
+  `block_omega` + diagonal `omega` as estimated parameters (#1177).** The cross-block
+  Cholesky entries of such an Ω are pinned, never searched, and the covariance step already
+  excluded them; the information criteria counted them anyway, inflating the penalty by one
+  per structural zero. `n_parameters` now equals `CompiledModel::free_packed_dim()`.
 - **An estimated `block_sigma` correlation is bounded at `|rho| <= 0.995` (#847).** Merely
   keeping rho inside `(-1, 1)` is not enough: a paired residual block's determinant carries a
   factor `1 - rho^2`, so a rho of 0.9999 leaves `R` numerically singular and the likelihood

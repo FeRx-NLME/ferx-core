@@ -1153,6 +1153,7 @@ mod tests {
             parse_warnings: Vec::new(),
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
+            theta_eta_linked: Vec::new(),
             #[cfg(feature = "nn")]
             covariate_nns: Vec::new(),
             scaling: ScalingSpec::None,

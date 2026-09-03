@@ -1201,6 +1201,7 @@ fn test_frem_jacobian_overrides_fd_with_exact_values() {
         parse_warnings: Vec::new(),
         eta_param_info: Vec::new(),
         theta_transform: Vec::new(),
+        theta_eta_linked: Vec::new(),
         #[cfg(feature = "nn")]
         covariate_nns: Vec::new(),
         scaling: crate::types::ScalingSpec::None,

@@ -372,6 +372,23 @@ pub fn packed_fixed_mask(template: &ModelParameters) -> Vec<bool> {
     mask
 }
 
+/// Every packed coordinate the outer optimizer does **not** search over:
+/// [`packed_fixed_mask`] OR [`omega_structural_zero_mask`]. Its complement is
+/// the free set — `CompiledModel::free_packed_dim` counts it, and `fit()`
+/// reports that count as `n_parameters` (#1177: previously the AIC/BIC penalty
+/// counted a mixed block + diagonal Ω's structural zeros as estimated
+/// parameters).
+pub(crate) fn packed_held_mask(template: &ModelParameters) -> Vec<bool> {
+    let fixed = packed_fixed_mask(template);
+    let structural = omega_structural_zero_mask(template);
+    debug_assert_eq!(fixed.len(), structural.len());
+    fixed
+        .iter()
+        .zip(structural.iter())
+        .map(|(f, z)| *f || *z)
+        .collect()
+}
+
 /// Packed-length mask marking the **structural-zero** off-diagonal entries of a
 /// mixed block + diagonal Ω (and Ω_IOV) — the cross-block elements where
 /// `free_mask[(i,j)] == false`. These are not estimated parameters, so the
@@ -1704,6 +1721,7 @@ mod tests {
             has_conditional_eta_params: false,
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
+            theta_eta_linked: Vec::new(),
             n_kappa: 0,
             kappa_names: Vec::new(),
             #[cfg(feature = "nn")]

@@ -1036,6 +1036,119 @@ fn detect_logit_pattern(expr: &Expression) -> Option<(usize, usize, bool)> {
     None
 }
 
+/// Per-theta Delattre class for the mixed BIC (#1177): `true` when theta `i`
+/// reaches an individual parameter that carries an ETA/KAPPA.
+///
+/// This is the statement-level analogue of Pharmpy's `_categorize_parameters`:
+/// each top-level assignment is expanded through the intermediate assignments
+/// it references (`TVCL = THETA_CL * WT; CL = TVCL * exp(ETA_CL)` makes
+/// `THETA_CL` random via `TVCL`), and a theta appearing in *any* eta-bearing
+/// expansion is random even if it also appears in an eta-free one. An
+/// `if`/`else` contributes its condition's thetas to every parameter assigned
+/// inside it, matching the `Piecewise` symbols Pharmpy's full expression
+/// carries. Variables that are not assigned in the block (covariates, `TIME`)
+/// expand to nothing. Runs before index resolution, so it sees
+/// `Expression::Variable`, never `VariableIdx`.
+fn classify_theta_eta_linked(stmts: &[Statement], n_theta: usize) -> Vec<bool> {
+    use std::collections::{HashMap, HashSet};
+
+    #[derive(Default, Clone)]
+    struct Deps {
+        thetas: HashSet<usize>,
+        has_eta: bool,
+        vars: HashSet<String>,
+    }
+    impl Deps {
+        fn merge(&mut self, other: &Deps) {
+            self.thetas.extend(other.thetas.iter().copied());
+            self.has_eta |= other.has_eta;
+            self.vars.extend(other.vars.iter().cloned());
+        }
+    }
+    fn note(e: &Expression, d: &mut Deps) {
+        match e {
+            Expression::Theta(i) => {
+                d.thetas.insert(*i);
+            }
+            Expression::ThetaGather { spec, .. } => {
+                for rule in &spec.levels {
+                    match *rule {
+                        LevelRule::Free(i) => {
+                            d.thetas.insert(i as usize);
+                        }
+                        LevelRule::NegSum(a, b) => {
+                            d.thetas.extend((a as usize)..=(b as usize));
+                        }
+                    }
+                }
+            }
+            Expression::Eta(_) => d.has_eta = true,
+            Expression::Variable(v) => {
+                d.vars.insert(v.clone());
+            }
+            _ => {}
+        }
+    }
+    fn expr_deps(e: &Expression, d: &mut Deps) {
+        visit_expr_nodes(e, &mut |n| note(n, d));
+    }
+    fn walk(stmts: &[Statement], ctx: &Deps, map: &mut HashMap<String, Deps>) {
+        for s in stmts {
+            match s {
+                Statement::Assign(name, e) => {
+                    let mut d = ctx.clone();
+                    expr_deps(e, &mut d);
+                    map.entry(name.clone()).or_default().merge(&d);
+                }
+                Statement::If {
+                    branches,
+                    else_body,
+                } => {
+                    // Each branch sees every condition evaluated to reach it.
+                    let mut cond_ctx = ctx.clone();
+                    for (cond, body) in branches {
+                        visit_condition_nodes(cond, &mut |n| note(n, &mut cond_ctx));
+                        walk(body, &cond_ctx, map);
+                    }
+                    if let Some(eb) = else_body {
+                        walk(eb, &cond_ctx, map);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut map: HashMap<String, Deps> = HashMap::new();
+    walk(stmts, &Deps::default(), &mut map);
+
+    let mut linked = vec![false; n_theta];
+    for name in map.keys() {
+        // Transitive closure over referenced variables (cycle-safe).
+        let mut thetas: HashSet<usize> = HashSet::new();
+        let mut has_eta = false;
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut stack: Vec<&str> = vec![name.as_str()];
+        while let Some(v) = stack.pop() {
+            if !seen.insert(v) {
+                continue;
+            }
+            let Some(d) = map.get(v) else { continue };
+            thetas.extend(d.thetas.iter().copied());
+            has_eta |= d.has_eta;
+            stack.extend(d.vars.iter().map(String::as_str));
+        }
+        if has_eta {
+            for i in thetas {
+                if i < n_theta {
+                    linked[i] = true;
+                }
+            }
+        }
+    }
+    linked
+}
+
 /// Classify each top-level [individual_parameters] assignment and return
 /// `(eta_param_infos, theta_transforms)`.
 ///
@@ -2700,6 +2813,9 @@ pub fn parse_full_model_with(
     // Uses BSV-only eta names (no kappas).
     let (eta_param_info, theta_transform) =
         classify_indiv_params(&indiv_stmts, &theta_names, &eta_names_bsv);
+    // Delattre class of every theta for the mixed BIC (#1177). Runs on the
+    // desugared statements, so `[covariate_model]` thetas are classified too.
+    let theta_eta_linked = classify_theta_eta_linked(&indiv_stmts, theta_names.len());
     debug_assert_eq!(
         theta_transform.len(),
         theta_names.len(),
@@ -2818,6 +2934,7 @@ pub fn parse_full_model_with(
         has_conditional_eta_params: false,
         eta_param_info,
         theta_transform,
+        theta_eta_linked,
         scaling: ScalingSpec::None,
         log_transform: ltbs_flags.log_transform,
         dv_pre_logged: ltbs_flags.dv_pre_logged,
@@ -22304,3 +22421,7 @@ mod tests;
 #[cfg(test)]
 #[path = "model_parser_adaptive_dosing_tests.rs"]
 mod adaptive_dosing_tests;
+
+#[cfg(test)]
+#[path = "model_parser_theta_eta_linked_tests.rs"]
+mod theta_eta_linked_tests;

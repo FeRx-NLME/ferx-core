@@ -2612,6 +2612,7 @@ mod tests {
             has_conditional_eta_params: false,
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
+            theta_eta_linked: Vec::new(),
             n_kappa: 0,
             kappa_names: Vec::new(),
             kappa_mu_refs: HashMap::new(),

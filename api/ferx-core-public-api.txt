@@ -771,6 +771,33 @@ pub fn ferx_core::markov::ctmm_inhomogeneous_transition_with_opts(q_at: impl cor
 pub fn ferx_core::markov::generator_rate_direction(s: usize, j: usize, k: usize, dt: f64) -> nalgebra::base::alias::DMatrix<f64>
 pub fn ferx_core::markov::matrix_exp(a: &nalgebra::base::alias::DMatrix<f64>) -> nalgebra::base::alias::DMatrix<f64>
 pub fn ferx_core::markov::matrix_exp_frechet(a: &nalgebra::base::alias::DMatrix<f64>, e: &nalgebra::base::alias::DMatrix<f64>) -> nalgebra::base::alias::DMatrix<f64>
+pub mod ferx_core::model_selection
+pub enum ferx_core::model_selection::BicType
+pub ferx_core::model_selection::BicType::Fixed
+pub ferx_core::model_selection::BicType::Iiv
+pub ferx_core::model_selection::BicType::Mixed
+pub ferx_core::model_selection::BicType::Random
+pub struct ferx_core::model_selection::Strictness
+pub ferx_core::model_selection::Strictness::max_condition_number: core::option::Option<f64>
+pub ferx_core::model_selection::Strictness::max_correlation: core::option::Option<f64>
+pub ferx_core::model_selection::Strictness::reject_init_stall: bool
+pub ferx_core::model_selection::Strictness::reject_on_boundary: bool
+pub ferx_core::model_selection::Strictness::require_converged: bool
+pub ferx_core::model_selection::Strictness::require_covariance: bool
+impl ferx_core::model_selection::Strictness
+pub fn ferx_core::model_selection::Strictness::none() -> Self
+impl core::default::Default for ferx_core::model_selection::Strictness
+pub fn ferx_core::model_selection::Strictness::default() -> Self
+pub struct ferx_core::model_selection::StrictnessVerdict
+pub ferx_core::model_selection::StrictnessVerdict::failures: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::model_selection::StrictnessVerdict::passed: bool
+pub ferx_core::model_selection::StrictnessVerdict::skipped: alloc::vec::Vec<alloc::string::String>
+pub const ferx_core::model_selection::INIT_STALL_REL_TOL: f64
+pub fn ferx_core::model_selection::bic(result: &ferx_core::FitResult, kind: ferx_core::model_selection::BicType) -> f64
+pub fn ferx_core::model_selection::check_strictness(result: &ferx_core::FitResult, s: &ferx_core::model_selection::Strictness) -> ferx_core::model_selection::StrictnessVerdict
+pub fn ferx_core::model_selection::estimate_near_boundary(result: &ferx_core::FitResult) -> bool
+pub fn ferx_core::model_selection::max_abs_correlation(result: &ferx_core::FitResult) -> core::option::Option<f64>
+pub fn ferx_core::model_selection::stalled_at_init(result: &ferx_core::FitResult) -> core::option::Option<bool>
 pub mod ferx_core::nn
 pub enum ferx_core::nn::Activation
 pub ferx_core::nn::Activation::Exp
@@ -2273,6 +2300,18 @@ pub ferx_core::types::BayesResult::n_divergent: usize
 pub ferx_core::types::BayesResult::n_draws_per_chain: usize
 pub ferx_core::types::BayesResult::n_warmup: usize
 pub ferx_core::types::BayesResult::summaries: alloc::vec::Vec<ferx_core::PosteriorSummary>
+pub struct ferx_core::types::BicInputs
+pub ferx_core::types::BicInputs::kappa: usize
+pub ferx_core::types::BicInputs::n_obs: usize
+pub ferx_core::types::BicInputs::omega: usize
+pub ferx_core::types::BicInputs::sigma: usize
+pub ferx_core::types::BicInputs::sigma_random: bool
+pub ferx_core::types::BicInputs::theta_fixed: usize
+pub ferx_core::types::BicInputs::theta_random: usize
+impl ferx_core::BicInputs
+pub fn ferx_core::BicInputs::n_fixed_class(&self) -> usize
+pub fn ferx_core::BicInputs::n_free(&self) -> usize
+pub fn ferx_core::BicInputs::n_random_class(&self) -> usize
 pub struct ferx_core::types::CompiledModel
 pub ferx_core::types::CompiledModel::absorption_ode_equivalent: core::option::Option<ferx_core::AbsorptionOdeEquivalent>
 pub ferx_core::types::CompiledModel::analytic_readout: core::option::Option<ferx_core::AnalyticReadout>
@@ -2324,6 +2363,7 @@ pub ferx_core::types::CompiledModel::ruv_magnitude: core::option::Option<ferx_co
 pub ferx_core::types::CompiledModel::scaling: ferx_core::ScalingSpec
 pub ferx_core::types::CompiledModel::sel_flat: alloc::vec::Vec<f64>
 pub ferx_core::types::CompiledModel::sigma_init_as_sd: alloc::vec::Vec<bool>
+pub ferx_core::types::CompiledModel::theta_eta_linked: alloc::vec::Vec<bool>
 pub ferx_core::types::CompiledModel::theta_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::CompiledModel::theta_transform: alloc::vec::Vec<ferx_core::ThetaTransform>
 pub ferx_core::types::CompiledModel::tv_fn: core::option::Option<ferx_core::TvFn>
@@ -2650,6 +2690,7 @@ pub struct ferx_core::types::FitResult
 pub ferx_core::types::FitResult::aic: f64
 pub ferx_core::types::FitResult::bayes: core::option::Option<ferx_core::BayesResult>
 pub ferx_core::types::FitResult::bic: f64
+pub ferx_core::types::FitResult::bic_inputs: ferx_core::BicInputs
 pub ferx_core::types::FitResult::bloq_method: alloc::string::String
 pub ferx_core::types::FitResult::cond_dist: core::option::Option<ferx_core::CondDist>
 pub ferx_core::types::FitResult::converged: bool
@@ -3074,6 +3115,11 @@ pub enum ferx_core::AggFunction
 pub ferx_core::AggFunction::Max
 pub ferx_core::AggFunction::Min
 pub ferx_core::AggFunction::Tmax
+pub enum ferx_core::BicType
+pub ferx_core::BicType::Fixed
+pub ferx_core::BicType::Iiv
+pub ferx_core::BicType::Mixed
+pub ferx_core::BicType::Random
 pub enum ferx_core::BloqMethod
 pub ferx_core::BloqMethod::Drop
 pub ferx_core::BloqMethod::M3
@@ -3547,6 +3593,18 @@ pub ferx_core::BayesResult::n_divergent: usize
 pub ferx_core::BayesResult::n_draws_per_chain: usize
 pub ferx_core::BayesResult::n_warmup: usize
 pub ferx_core::BayesResult::summaries: alloc::vec::Vec<ferx_core::PosteriorSummary>
+pub struct ferx_core::BicInputs
+pub ferx_core::BicInputs::kappa: usize
+pub ferx_core::BicInputs::n_obs: usize
+pub ferx_core::BicInputs::omega: usize
+pub ferx_core::BicInputs::sigma: usize
+pub ferx_core::BicInputs::sigma_random: bool
+pub ferx_core::BicInputs::theta_fixed: usize
+pub ferx_core::BicInputs::theta_random: usize
+impl ferx_core::BicInputs
+pub fn ferx_core::BicInputs::n_fixed_class(&self) -> usize
+pub fn ferx_core::BicInputs::n_free(&self) -> usize
+pub fn ferx_core::BicInputs::n_random_class(&self) -> usize
 pub struct ferx_core::CancelFlag(_)
 impl ferx_core::cancel::CancelFlag
 pub fn ferx_core::cancel::CancelFlag::cancel(&self)
@@ -3613,6 +3671,7 @@ pub ferx_core::CompiledModel::ruv_magnitude: core::option::Option<ferx_core::Ruv
 pub ferx_core::CompiledModel::scaling: ferx_core::ScalingSpec
 pub ferx_core::CompiledModel::sel_flat: alloc::vec::Vec<f64>
 pub ferx_core::CompiledModel::sigma_init_as_sd: alloc::vec::Vec<bool>
+pub ferx_core::CompiledModel::theta_eta_linked: alloc::vec::Vec<bool>
 pub ferx_core::CompiledModel::theta_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::CompiledModel::theta_transform: alloc::vec::Vec<ferx_core::ThetaTransform>
 pub ferx_core::CompiledModel::tv_fn: core::option::Option<ferx_core::TvFn>
@@ -3992,6 +4051,7 @@ pub struct ferx_core::FitResult
 pub ferx_core::FitResult::aic: f64
 pub ferx_core::FitResult::bayes: core::option::Option<ferx_core::BayesResult>
 pub ferx_core::FitResult::bic: f64
+pub ferx_core::FitResult::bic_inputs: ferx_core::BicInputs
 pub ferx_core::FitResult::bloq_method: alloc::string::String
 pub ferx_core::FitResult::cond_dist: core::option::Option<ferx_core::CondDist>
 pub ferx_core::FitResult::converged: bool
@@ -4358,6 +4418,21 @@ pub ferx_core::SimulationSpec::horizon: core::option::Option<f64>
 pub ferx_core::SimulationSpec::n_subjects: usize
 pub ferx_core::SimulationSpec::obs_times: alloc::vec::Vec<f64>
 pub ferx_core::SimulationSpec::seed: u64
+pub struct ferx_core::Strictness
+pub ferx_core::Strictness::max_condition_number: core::option::Option<f64>
+pub ferx_core::Strictness::max_correlation: core::option::Option<f64>
+pub ferx_core::Strictness::reject_init_stall: bool
+pub ferx_core::Strictness::reject_on_boundary: bool
+pub ferx_core::Strictness::require_converged: bool
+pub ferx_core::Strictness::require_covariance: bool
+impl ferx_core::model_selection::Strictness
+pub fn ferx_core::model_selection::Strictness::none() -> Self
+impl core::default::Default for ferx_core::model_selection::Strictness
+pub fn ferx_core::model_selection::Strictness::default() -> Self
+pub struct ferx_core::StrictnessVerdict
+pub ferx_core::StrictnessVerdict::failures: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::StrictnessVerdict::passed: bool
+pub ferx_core::StrictnessVerdict::skipped: alloc::vec::Vec<alloc::string::String>
 pub struct ferx_core::Subject
 pub ferx_core::Subject::cens: alloc::vec::Vec<i8>
 pub ferx_core::Subject::covariates: std::collections::hash::map::HashMap<alloc::string::String, f64>
@@ -4476,17 +4551,21 @@ pub const ferx_core::PK_IDX_Q3: usize
 pub const ferx_core::PK_IDX_V: usize
 pub const ferx_core::PK_IDX_V2: usize
 pub const ferx_core::PK_IDX_V3: usize
+pub fn ferx_core::bic(result: &ferx_core::FitResult, kind: ferx_core::model_selection::BicType) -> f64
 pub fn ferx_core::bind_theta_levels(parsed: &mut ferx_core::ParsedModel, model_text: &str, population: &mut ferx_core::Population) -> core::result::Result<(), alloc::string::String>
 pub fn ferx_core::check_model_data(model: &ferx_core::CompiledModel, population: &ferx_core::Population) -> alloc::vec::Vec<ferx_core::diagnostics::Diagnostic>
 pub fn ferx_core::check_model_data_warnings(model: &ferx_core::CompiledModel, population: &ferx_core::Population, init_params: &ferx_core::ModelParameters) -> alloc::vec::Vec<ferx_core::diagnostics::Diagnostic>
 pub fn ferx_core::check_model_options(model: &ferx_core::CompiledModel, options: &ferx_core::FitOptions) -> alloc::vec::Vec<ferx_core::diagnostics::Diagnostic>
+pub fn ferx_core::check_strictness(result: &ferx_core::FitResult, s: &ferx_core::model_selection::Strictness) -> ferx_core::model_selection::StrictnessVerdict
 pub fn ferx_core::classify_warning(raw: &str) -> ferx_core::WarningEntry
 pub fn ferx_core::configure_global_thread_pool(n_threads: usize) -> core::result::Result<(), alloc::string::String>
+pub fn ferx_core::estimate_near_boundary(result: &ferx_core::FitResult) -> bool
 pub fn ferx_core::fit(model: &ferx_core::CompiledModel, population: &ferx_core::Population, init_params: &ferx_core::ModelParameters, options: &ferx_core::FitOptions) -> core::result::Result<ferx_core::FitResult, alloc::string::String>
 pub fn ferx_core::fit_from_files(model_path: &str, data_path: core::option::Option<&str>, covariate_columns: core::option::Option<&[&str]>, options: core::option::Option<ferx_core::FitOptions>) -> core::result::Result<ferx_core::FitResult, alloc::string::String>
 pub fn ferx_core::framework_keys() -> &'static [&'static str]
 pub fn ferx_core::inits_from_nca(model: &ferx_core::CompiledModel, population: &ferx_core::Population, method: ferx_core::suggest_start::NcaInit) -> ferx_core::suggest_start::SuggestedStart
 pub fn ferx_core::known_block_names() -> alloc::vec::Vec<&'static str>
+pub fn ferx_core::max_abs_correlation(result: &ferx_core::FitResult) -> core::option::Option<f64>
 pub fn ferx_core::method_specific_keys(m: ferx_core::EstimationMethod) -> &'static [&'static str]
 pub fn ferx_core::omega_se_at(se_omega: &core::option::Option<alloc::vec::Vec<f64>>, n_eta: usize, i: usize, j: usize) -> core::option::Option<f64>
 pub fn ferx_core::parse_full_model_file(path: &std::path::Path) -> core::result::Result<ferx_core::ParsedModel, alloc::string::String>
@@ -4514,6 +4593,7 @@ pub fn ferx_core::simulate_with_options(model: &ferx_core::CompiledModel, popula
 pub fn ferx_core::simulate_with_options_diag(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, n_sim: usize, opts: &ferx_core::SimulateOptions) -> core::result::Result<ferx_core::SimulationOutput, alloc::string::String>
 pub fn ferx_core::simulate_with_seed(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, n_sim: usize, seed: u64) -> alloc::vec::Vec<ferx_core::SimulationResult>
 pub fn ferx_core::simulate_with_uncertainty(model: &ferx_core::CompiledModel, population: &ferx_core::Population, fit_result: &ferx_core::FitResult, opts: &ferx_core::SimulateUncertaintyOptions) -> core::result::Result<alloc::vec::Vec<ferx_core::SimulationResult>, alloc::string::String>
+pub fn ferx_core::stalled_at_init(result: &ferx_core::FitResult) -> core::option::Option<bool>
 pub fn ferx_core::theta_level_map(model: &ferx_core::CompiledModel) -> std::collections::hash::map::HashMap<alloc::string::String, alloc::vec::Vec<alloc::string::String>>
 pub fn ferx_core::validate_model_file(model_path: &str, data_path: core::option::Option<&str>) -> ferx_core::diagnostics::CheckReport
 pub type ferx_core::DerivedEvalFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&ferx_core::DerivedContext<'_>) -> f64 + core::marker::Send + core::marker::Sync)>

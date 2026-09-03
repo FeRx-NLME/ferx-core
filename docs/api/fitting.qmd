@@ -158,6 +158,96 @@ message the engine produces goes into `FitResult::warnings` (and
 `warnings_structured`) regardless of `verbose`, so the tool reads them off each
 result and prints its own one-line-per-replicate progress instead.
 
+## Ranking candidates: BIC variants and strictness
+
+A search (covariate, structural, variability — the #1175 tools) is *generate a
+candidate → fit it → rank it*. Two things the ranking step needs live in
+`ferx-core` (#1177): the BIC convention to rank on, and a gate that decides
+whether a candidate's fit is trustworthy enough to be ranked at all.
+
+### BIC variants (`bic`)
+
+`FitResult::bic` is the classical `OFV + p · ln(n_obs)`. Pharmpy's `iivsearch`
+and `modelsearch` rank on the Delattre et al. (2014) **mixed** BIC instead, which
+penalises the *random-effects class* of parameters on `ln(n_subjects)` and the
+rest on `ln(n_obs)` — ranking IIV structures on the observation-count BIC
+systematically favours the wrong model. `bic()` gives all four of
+`pharmpy.modeling.calculate_bic`'s variants from a finished `FitResult`:
+
+```rust
+use ferx_core::{bic, BicType};
+
+let mixed  = bic(&result, BicType::Mixed);   // Pharmpy's default
+let iiv    = bic(&result, BicType::Iiv);     // free Ω elements only, ln(n_subjects)
+let random = bic(&result, BicType::Random);  // every parameter on ln(n_subjects)
+let fixed  = bic(&result, BicType::Fixed);   // == result.bic
+```
+
+| `BicType` | penalty |
+|---|---|
+| `Mixed` | `n_random · ln(n_subjects) + n_fixed · ln(n_obs)` |
+| `Iiv` | `n_omega · ln(n_subjects)` |
+| `Random` | `n_parameters · ln(n_subjects)` |
+| `Fixed` | `n_parameters · ln(n_obs)` |
+
+Class membership follows Pharmpy: every free Ω / Ω_IOV element is random; a θ
+is random when it reaches — directly or through intermediate
+`[individual_parameters]` assignments — an individual parameter that carries an
+ETA or KAPPA, and fixed otherwise; σ (and a `block_sigma` correlation) is fixed
+unless the residual error itself carries an ETA (`iiv_on_ruv`). The tally is
+recorded on `FitResult::bic_inputs` at fit time, so a `.fitrx` bundle can be
+ranked without re-parsing the model; a bundle saved before the tally existed
+gets `NaN` rather than a wrong penalty.
+
+The four variants are pinned in unit tests to `calculate_bic()`'s own outputs
+on Pharmpy's `pheno` example (59 subjects, 155 observations, three θ that all
+reach an η-bearing parameter, two Ω, one σ): mixed 611.707, fixed 616.537,
+random 610.741, iiv 594.431.
+
+### Strictness (`check_strictness`)
+
+`FitResult::converged` is a bool. It does not distinguish a genuine optimum from
+an init stall (#751), a boundary estimate, an ill-conditioned covariance step or
+a near-singular correlation matrix. Under automation every one of those becomes
+a *model-selection error*: a candidate that never left its initial estimates is
+ranked on an OFV that says nothing about the model. `Strictness` is the
+pyDarwin-style gate, and the verdict carries the *reasons*, so a search report
+can say why a candidate was excluded instead of silently dropping it:
+
+```rust
+use ferx_core::{check_strictness, Strictness};
+
+let gate = Strictness {
+    require_covariance: true,
+    ..Strictness::default()
+};
+let verdict = check_strictness(&result, &gate);
+if !verdict.passed {
+    for reason in &verdict.failures {
+        eprintln!("excluded: {reason}");
+    }
+}
+```
+
+| field | default | fails when |
+|---|---|---|
+| `require_converged` | `true` | `converged == false` (also covers an internal runaway-guard hit, which demotes `converged`) |
+| `require_covariance` | `false` | the covariance step did not run, failed, or fell back to SIR |
+| `max_condition_number` | `Some(1000)` | `cov_condition_number` exceeds it (∞ for a singular correlation matrix) |
+| `max_correlation` | `Some(0.95)` | any off-diagonal of the covariance's correlation form exceeds it in absolute value — the whole matrix, not just θ |
+| `reject_on_boundary` | `true` | a θ is pinned to a declared bound — the same predicate `bootstrap`'s `skip_estimate_near_boundary` applies |
+| `reject_init_stall` | `true` | no free θ/Ω/σ moved more than 1 % of its initial value (the #751 signature, read off the result's own initial estimates) |
+
+The two thresholds are evaluated only when their input exists — a fit without a
+covariance matrix has no condition number to test. Such a case lands in
+`verdict.skipped` rather than failing or silently passing; pair the thresholds
+with `require_covariance = true` to make them mandatory. `Strictness::none()`
+turns every gate off for a "rank everything, report everything" run.
+
+The predicates are also available on their own — `estimate_near_boundary`,
+`stalled_at_init`, `max_abs_correlation` — for a report that prints the numbers
+rather than the verdict.
+
 ## `build_fit_inputs()`
 
 Extract initial parameters and fit options from a parsed model, separating parsing from estimation for timing purposes.

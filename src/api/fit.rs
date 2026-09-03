@@ -1027,9 +1027,11 @@ fn fit_inner(
     let option_diags = check_model_options(model, options);
     first_error(&option_diags)?;
 
-    // Pre-compute n_params (uses init_params, available before chain runs).
-    let fixed_mask = crate::estimation::parameterization::packed_fixed_mask(init_params);
-    let n_params_pre = fixed_mask.iter().filter(|&&b| !b).count();
+    // Pre-compute n_params (uses init_params, available before chain runs):
+    // the coordinates the outer optimizer actually searches — neither FIX nor
+    // a block + diagonal Ω structural zero (`CompiledModel::free_packed_dim`).
+    let held_mask = crate::estimation::parameterization::packed_held_mask(init_params);
+    let n_params_pre = held_mask.iter().filter(|&&b| !b).count();
 
     // Probe NLopt algorithm availability only when global_search will actually
     // run — otherwise the CRS2-LM warning is misleading for users who never
@@ -1908,6 +1910,15 @@ fn fit_inner(
     } else {
         f64::NAN
     };
+    // Delattre class tally behind the BIC variants (#1177): the same packed
+    // held mask `n_params` was counted from, split by segment.
+    let bic_inputs =
+        crate::model_selection::bic_inputs_for(model, init_params, &held_mask, n_for_bic);
+    debug_assert_eq!(
+        bic_inputs.n_free(),
+        n_params,
+        "BIC class tally must partition the free packed parameters"
+    );
 
     // Extract SEs from covariance matrix using converged parameter values
     let (se_theta, se_omega, se_sigma, se_kappa) =
@@ -2444,6 +2455,7 @@ fn fit_inner(
             .sigma_types(result.params.sigma.values.len()),
         cov_eigenvalues,
         cov_condition_number,
+        bic_inputs,
         eta_log_transformed,
         omega_param_corr,
         omega_iov_param_corr,

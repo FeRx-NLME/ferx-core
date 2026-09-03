@@ -142,7 +142,8 @@ pub struct FitResult {
     pub subjects: Vec<SubjectResult>,
     pub n_obs: usize,
     pub n_subjects: usize,
-    pub n_parameters: usize,
+    pub n_parameters: usize,      // free packed coordinates (FIX and structural zeros excluded)
+    pub bic_inputs: BicInputs,    // free-parameter tally by Delattre class, for `bic()`
     pub n_iterations: usize,
     pub interaction: bool,
     pub warnings: Vec<String>,
