@@ -10005,6 +10005,7 @@ fn ode_tad_rhs_zero_order_end_inside_a_covariate_step_matches_production() {
 /// **Both straddles are asserted**, or the test would pass on a predicate that always declines:
 /// the same model without an SS dose stays in scope, and an SS dose on a model with no
 /// accumulator stays in scope.
+#[cfg(feature = "survival")]
 #[test]
 fn a_joint_pktte_subject_under_ss_declines_to_fd_at_the_gate() {
     let model = parse_model_string(JOINT_PKTTE_ODE_SS).expect("parse joint PK-TTE ODE model");
@@ -10062,6 +10063,7 @@ fn a_joint_pktte_subject_under_ss_declines_to_fd_at_the_gate() {
 }
 
 /// Joint PK-TTE ODE model for [`a_joint_pktte_subject_under_ss_declines_to_fd_at_the_gate`].
+#[cfg(feature = "survival")]
 const JOINT_PKTTE_ODE_SS: &str = r"
 [parameters]
   theta TVCL(1.0, 0.01, 100.0)
@@ -10095,6 +10097,7 @@ const JOINT_PKTTE_ODE_SS: &str = r"
 ";
 
 /// The same PK block with **no** `[event_model]`, so no accumulator is injected — straddle 2.
+#[cfg(feature = "survival")]
 const ONECPT_ODE_NO_CHZ: &str = r"
 [parameters]
   theta TVCL(1.0, 0.01, 100.0)
@@ -10121,6 +10124,7 @@ const ONECPT_ODE_NO_CHZ: &str = r"
 
 /// [`bolus_subject`] whose single dose carries the `SS=1` flag, or not — the one bit the
 /// gate keys on, so the two straddle it exactly.
+#[cfg(feature = "survival")]
 fn joint_ss_subject(ss: bool) -> Subject {
     let mut s = bolus_subject(&[1.0, 4.0, 8.0, 12.0]);
     if ss {
