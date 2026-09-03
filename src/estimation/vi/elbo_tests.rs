@@ -314,6 +314,7 @@ fn data_term_collapses_to_fixed_eta_nll_as_q_degenerates() {
                 s,
                 &params.theta,
                 &params.sigma.values,
+                &params.residual_correlations,
                 &mu,
                 &mut scratch,
             )

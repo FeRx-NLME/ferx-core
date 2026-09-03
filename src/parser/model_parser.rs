@@ -2468,7 +2468,8 @@ pub fn parse_full_model_with(
         _ => Vec::new(),
     };
     let (error_model, error_spec) = build_error_spec(parsed_error_model, &sigma_names, is_ode)?;
-    let residual_correlations = build_residual_correlations(&block_sigmas, &sigma_names)?;
+    let (residual_correlations, residual_correlation_fixed) =
+        build_residual_correlations(&block_sigmas, &sigma_names)?;
     validate_residual_correlations(&error_spec, &residual_correlations, &sigma_names)?;
     // Keep a copy of the flat sigma names for the custom residual-magnitude
     // build (#484), which runs after the [covariates] block is parsed.
@@ -2537,6 +2538,8 @@ pub fn parse_full_model_with(
         omega_fixed,
         sigma,
         sigma_fixed,
+        residual_correlations: residual_correlations.clone(),
+        residual_correlation_fixed,
         omega_iov,
         kappa_fixed,
         mixture: None,
@@ -11844,6 +11847,11 @@ struct SigmaSpec {
 struct BlockSigmaSpec {
     names: Vec<String>,
     lower_triangle: Vec<f64>,
+    /// `true` when the declaration carried a trailing `FIX`. The flag already
+    /// pins the diagonal SDs via each `SigmaSpec`; it additionally pins the
+    /// off-diagonal correlations, which a plain `block_sigma` **estimates**
+    /// (NONMEM `$SIGMA BLOCK(n)` semantics, #847).
+    fixed: bool,
 }
 
 /// Diagonal inter-occasion variability (kappa) specification.
@@ -13132,6 +13140,7 @@ fn parse_parameters(
             block_sigmas.push(BlockSigmaSpec {
                 names,
                 lower_triangle: values,
+                fixed,
             });
         } else if let Some(caps) = block_kappa_re.captures(line) {
             let names: Vec<String> = caps[1].split(',').map(|s| s.trim().to_string()).collect();
@@ -13630,16 +13639,22 @@ fn build_omega_fixed(
     Ok(fixed)
 }
 
+/// Build the runtime residual correlations from the parsed `block_sigma` blocks,
+/// paired with their FIX flags (#847). The two vectors are parallel and become
+/// `ModelParameters::residual_correlations` / `residual_correlation_fixed`; the
+/// `CompiledModel` keeps only the values, since the model's copy is the
+/// *declaration* and fixedness is a property of the estimation problem.
 fn build_residual_correlations(
     block_sigmas: &[BlockSigmaSpec],
     sigma_names: &[String],
-) -> Result<Vec<ResidualCorrelation>, String> {
+) -> Result<(Vec<ResidualCorrelation>, Vec<bool>), String> {
     let name_to_idx: std::collections::HashMap<&str, usize> = sigma_names
         .iter()
         .enumerate()
         .map(|(i, n)| (n.as_str(), i))
         .collect();
     let mut out = Vec::new();
+    let mut fixed = Vec::new();
     for block in block_sigmas {
         let n = block.names.len();
         let mut variances = vec![0.0; n];
@@ -13656,7 +13671,15 @@ fn build_residual_correlations(
         for row in 0..n {
             for col in 0..=row {
                 let value = block.lower_triangle[pos];
-                if row != col && value != 0.0 {
+                // A zero off-diagonal still declares a correlation *coordinate*
+                // when the block is estimated (#847): `$SIGMA BLOCK(2)` with a
+                // zero covariance init is how NONMEM users routinely start, and
+                // dropping the entry here would silently fit a diagonal residual
+                // with no way to reach a non-zero rho and no diagnostic. A `FIX`ed
+                // block keeps the old behaviour — a fixed zero correlation is the
+                // same thing as no correlation, so there is nothing to carry.
+                let carries_coordinate = value != 0.0 || !block.fixed;
+                if row != col && carries_coordinate {
                     let vi = variances[row];
                     let vj = variances[col];
                     if vi <= 0.0 || vj <= 0.0 {
@@ -13697,12 +13720,13 @@ fn build_residual_correlations(
                         sigma_j: j,
                         rho,
                     });
+                    fixed.push(block.fixed);
                 }
                 pos += 1;
             }
         }
     }
-    Ok(out)
+    Ok((out, fixed))
 }
 
 fn validate_residual_correlations(

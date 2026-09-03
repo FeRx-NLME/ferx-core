@@ -652,7 +652,8 @@ Combined error:
   DV ~ combined(PROP_ERR, ADD_ERR)
 ```
 
-Correlated combined error:
+Correlated combined error (here with the whole block held fixed — drop `FIX` to
+estimate the correlation, see [Fixed vs. estimated `block_sigma`](#fixed-vs-estimated-block-sigma)):
 ```
 [parameters]
   block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00] FIX
@@ -673,8 +674,51 @@ V = (f \sigma_\mathrm{prop})^2 + \sigma_\mathrm{add}^2
     + 2 f \rho \sigma_\mathrm{prop}\sigma_\mathrm{add}
 $$
 
-The diagonal sigma SDs are estimated unless marked `FIX`; the off-diagonal
-covariance is always converted to a fixed correlation. A nonzero `block_sigma`
+### Fixed vs. estimated `block_sigma` {#fixed-vs-estimated-block-sigma}
+
+A plain `block_sigma (...) = [...]` **estimates** both the diagonal sigma SDs and
+the off-diagonal correlation, matching NONMEM `$SIGMA BLOCK(n)`. Appending `FIX`
+holds the whole block — SDs and correlation alike — at its declared value:
+
+```
+[parameters]
+  # rho is estimated (NONMEM $SIGMA BLOCK semantics)
+  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00]
+
+  # rho is held at 0.5, and both SDs at 0.2 / 1.0
+  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00] FIX
+```
+
+An estimated correlation is optimized as its Fisher-z transform `z = atanh(rho)`,
+bounded at `|z| <= 3`, i.e. `|rho| <= 0.995`. Strict positive-definiteness is not
+a strong enough bound: a paired residual block's determinant carries a factor
+`1 - rho^2`, so a rho merely *inside* `(-1, 1)` can still leave `R` numerically
+singular and let the likelihood chase `log|R|` downwards. At `|rho| = 0.995` that
+factor is about `0.01`, which keeps `R` invertible in floating point. A fit that
+reports rho sitting on this rail is telling you the two endpoints are carrying
+the same noise — treat it as a diagnostic, not an estimate.
+
+The reported standard error is on the natural `rho` scale, via the delta method:
+`SE(rho) = SE(z) * (1 - rho^2)`.
+
+A zero off-diagonal in a non-`FIX` block still declares an estimated correlation,
+so `block_sigma (A, B) = [0.04, 0.0, 1.0]` — the natural translation of a NONMEM
+`$SIGMA BLOCK(2)` with a zero covariance init — starts at `rho = 0` and is free
+to move. Adding `FIX` to a zero off-diagonal drops it, since a fixed zero
+correlation is the same object as no correlation.
+
+::: {.callout-warning title="Changed in #847"}
+Before this change every `block_sigma` off-diagonal was held fixed regardless of
+`FIX`, while the diagonal SDs were estimated. That combination is no longer
+expressible — NONMEM has no form for it either, and it is exactly the mismatch
+this change removes. Adding `FIX` to an existing bare `block_sigma` reproduces
+the old *correlation*, but it also pins the SDs the old form estimated, so it is
+not a drop-in way to reproduce an old fit's numbers. Re-run and compare instead.
+:::
+
+### Which sigmas a `block_sigma` may correlate
+
+A nonzero `block_sigma`
 covariance can connect sigmas that co-load on the same `combined(...)` endpoint,
 or sigmas used by different endpoints measured at the same subject time and
 occasion — whether those endpoints are selected by the CMT column (per-CMT) or
@@ -682,6 +726,8 @@ by a covariate `if/else` selector (#669). In the cross-endpoint case ferx builds
 a subject-level residual covariance matrix, so paired rows such as total/unbound
 assays receive the NONMEM-style covariance term
 `f_total * f_unbound * Cov(EPS_total, EPS_unbound)`.
+
+### Estimator and feature scope
 
 Current scope: `block_sigma` is supported for the Gaussian `method = foce`,
 `method = focei`, `method = saem`, and `method = imp` fits. The Gauss-Newton
@@ -693,6 +739,22 @@ under `method = foce` / `method = focei` (the EKF variance is added to the dense
 `R`) but are rejected under `method = saem`, whose M-step data term does not yet
 include the process-noise inflation.
 
+An estimated correlation is also why `method = laplace` (and `focei` with
+`n_agq > 1`) falls back to the reconverged finite-difference outer gradient: the
+AGQ score has no rho block, so it is declined rather than reporting a zero
+gradient for a coordinate the objective actually depends on. Fits are correct,
+just slower. A `FIX`ed block keeps the analytic score.
+
+An **estimated** correlation additionally restricts method *chains*. Only `foce`,
+`focei` and `laplace` move the off-diagonal; the other supported estimators read
+it from the model declaration. Because each chain stage starts from the previous
+stage's estimates, a chain that runs `foce`/`focei` **before** a non-estimating
+stage would leave that stage scoring the declared correlation while the fit
+reported the estimated one, so it is rejected with
+`E_BLOCK_SIGMA_CHAIN_UNSUPPORTED`. `method = [saem, focei]` is fine (the
+correlation has not moved when SAEM runs); `method = [focei, imp]` and
+`method = [laplace, imp]` are not, unless the block carries `FIX`.
+
 `simulate()` draws the full residual vector for each subject's paired
 observations (same subject time and occasion) from the dense covariance `R`
 built by `compute_r_matrix_with_correlations` — the same matrix FOCE/FOCEI/SAEM/
@@ -703,18 +765,23 @@ correlated endpoints recovers the specified correlation (#672). FREM covariate
 pseudo-observations are excluded from the correlated draw (mirroring the
 identical exclusion in the likelihood) and stay independent.
 
-The fixed correlations are copied to `FitResult.residual_correlations`, so the
-residual covariance assumed by a fit remains available without re-reading the
-model source. The human-readable fit YAML also emits a `block_sigma` section
-with each named pair's covariance and declared correlation:
+### Reporting a fitted `block_sigma`
+
+The fitted correlations are carried on `FitResult.residual_correlations`, their
+`FIX` flags on `FitResult.residual_correlation_fixed`, and their standard errors
+on `FitResult.se_residual_correlations`, so the residual covariance a fit
+actually used remains available without re-reading the model source. The
+human-readable fit YAML also emits a `block_sigma` section with each named pair's
+covariance, correlation, and correlation SE:
 
 ```yaml
 block_sigma:
   ADD_ERR__PROP_ERR:
-    covariance: 0.100000
+    covariance: 0.186600
     covariance_fixed: false
-    correlation: 0.500000
-    correlation_fixed: true
+    correlation: 0.933000
+    correlation_fixed: false
+    correlation_se: 0.021400
 ```
 
 `covariance` is the **sigma-scale** covariance `rho * sigma_i * sigma_j`, the
@@ -723,10 +790,13 @@ residual covariance matrix `R`. Each observation applies its own sigma loadings
 first, so the `R` term is `c_j * c_k * rho * sigma_i * sigma_j` with `c = 1`
 for an additive component and `c = f` (the individual prediction) for a
 proportional one — the `f_total * f_unbound * Cov(EPS_total, EPS_unbound)` form
-above. `correlation_fixed` is always `true` (the off-diagonal is converted to a
-fixed correlation); `covariance_fixed` is `true` only when both sigma SDs in
-the pair were declared `FIX`, since otherwise the SDs — and hence the
-covariance — moved during estimation.
+above. `correlation_fixed` is `true` only for a `FIX`ed block; `covariance_fixed`
+is `true` only when the correlation **and** both sigma SDs in the pair are
+fixed, since a free value in any of the three factors moves the covariance during
+estimation. `correlation_se` is `~` for a fixed correlation and for a fit whose
+covariance step did not run.
+
+### The interaction correction under a correlated `R`
 
 Under `method = focei` the off-diagonal covariance enters the interaction
 correction as well as the data term: the Almquist 2015 conditional Hessian

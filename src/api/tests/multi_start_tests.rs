@@ -5,6 +5,8 @@ use crate::types::{FitOptions, ModelParameters, OmegaMatrix, SigmaVector};
 fn make_params(theta: Vec<f64>, theta_lower: Vec<f64>, theta_upper: Vec<f64>) -> ModelParameters {
     let n = theta.len();
     ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta,
         theta_names: (0..n).map(|i| format!("T{i}")).collect(),
         theta_lower,

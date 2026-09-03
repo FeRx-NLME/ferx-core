@@ -460,6 +460,8 @@ fn test_packed_param_label_block_omega() {
         free_mask,
     );
     let template = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0, 50.0],
         theta_names: vec!["TVCL".into(), "TVV".into()],
         theta_lower: vec![0.1, 5.0],
@@ -520,6 +522,8 @@ fn test_packed_param_label_sigma() {
     use crate::types::SigmaVector;
     // n_theta=1 (diagonal omega), n_omega=1 (diagonal), n_sigma=2
     let template = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0],
         theta_names: vec!["CL".into()],
         theta_lower: vec![0.1],
@@ -546,6 +550,8 @@ fn test_packed_param_label_sigma() {
 fn test_packed_param_label_kappa() {
     use crate::types::SigmaVector;
     let template = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0],
         theta_names: vec!["CL".into()],
         theta_lower: vec![0.1],
@@ -591,6 +597,8 @@ fn test_compute_covariance_invalid_eps() {
     let model = make_model();
     let population = make_population(1);
     let template = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0, 50.0],
         theta_names: vec!["CL".into(), "V".into()],
         theta_lower: vec![0.1, 1.0],
@@ -950,6 +958,8 @@ use std::collections::HashMap;
 fn make_model() -> CompiledModel {
     let omega = OmegaMatrix::from_diagonal(&[0.04], vec!["ETA_CL".into()]);
     let default_params = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0, 50.0],
         theta_names: vec!["TVCL".into(), "TVV".into()],
         theta_lower: vec![0.1, 5.0],
@@ -1250,6 +1260,8 @@ fn test_outer_ad_gradient_block_omega() {
         free_mask,
     );
     let default_params = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0, 50.0],
         theta_names: vec!["TVCL".into(), "TVV".into()],
         theta_lower: vec![0.1, 5.0],
@@ -1728,6 +1740,8 @@ fn test_compute_covariance_iov_runs_and_is_pd() {
     let omega = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
     let omega_iov = OmegaMatrix::from_diagonal(&[0.04], vec!["KAPPA_CL".into()]);
     let default_params = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0, 50.0],
         theta_names: vec!["TVCL".into(), "TVV".into()],
         theta_lower: vec![0.1, 5.0],

@@ -30,6 +30,8 @@ fn test_sdtab_ipred_honours_tv_covariates() {
     // ── Minimal CompiledModel: 1-cpt IV bolus, CL scaled by per-event WT ──
     let omega = OmegaMatrix::from_diagonal(&[0.04], vec!["ETA_CL".into()]);
     let default_params = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0, 50.0], // TVCL = 5, TVV = 50
         theta_names: vec!["TVCL".into(), "TVV".into()],
         theta_lower: vec![0.1, 5.0],
@@ -374,6 +376,8 @@ fn test_sdtab_iwres_uses_block_sigma_correlation() {
 #[test]
 fn test_simulate_honours_tv_covariates() {
     let default_params = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0, 50.0],
         theta_names: vec!["TVCL".into(), "TVV".into()],
         theta_lower: vec![0.1, 5.0],

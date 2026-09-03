@@ -1820,12 +1820,18 @@ pub struct SigmaVector {
     pub names: Vec<String>,
 }
 
-/// Fixed correlation between two named residual-error terms.
+/// Correlation between two named residual-error terms.
 ///
 /// `sigma_i` and `sigma_j` index [`SigmaVector::values`]. The covariance used
 /// at runtime is `rho * sigma_i * sigma_j`, so the existing positive SD
 /// parameterization remains unchanged while off-diagonal residual covariance is
 /// carried into subject-level R matrices.
+///
+/// A plain `block_sigma (...) = [...]` **estimates** `rho` (NONMEM `$SIGMA
+/// BLOCK(n)` semantics, #847); `block_sigma (...) = [...] FIX` holds it at the
+/// declared value. Which of the two applies is carried alongside the value in
+/// [`ModelParameters::residual_correlation_fixed`], not in this struct, so the
+/// serialized shape stays what `FitResult` consumers already parse.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq)]
 pub struct ResidualCorrelation {
     pub sigma_i: usize,
@@ -1853,6 +1859,17 @@ pub struct ModelParameters {
     pub sigma: SigmaVector,
     /// Per-sigma FIX flags.
     pub sigma_fixed: Vec<bool>,
+    /// Live `block_sigma` off-diagonal residual correlations (#847), in the same
+    /// order and with the same `sigma_i`/`sigma_j` indices as
+    /// [`CompiledModel::residual_correlations`]. The model's copy holds the
+    /// *declared* value; this one moves during the fit whenever the block is not
+    /// `FIX`, so every residual-covariance consumer must read it from here (or
+    /// from the parameters threaded alongside) rather than from the frozen
+    /// model.
+    pub residual_correlations: Vec<ResidualCorrelation>,
+    /// Per-residual-correlation FIX flags, parallel to `residual_correlations`.
+    /// `true` for a `block_sigma ... FIX` declaration.
+    pub residual_correlation_fixed: Vec<bool>,
     /// Inter-occasion variability matrix (Omega_IOV). `None` when no `kappa`
     /// declarations appear in the model file.  Always diagonal for Option A.
     pub omega_iov: Option<OmegaMatrix>,
@@ -1901,6 +1918,7 @@ impl ModelParameters {
         self.theta_fixed.iter().any(|&b| b)
             || self.omega_fixed.iter().any(|&b| b)
             || self.sigma_fixed.iter().any(|&b| b)
+            || self.residual_correlation_fixed.iter().any(|&b| b)
             || self.kappa_fixed.iter().any(|&b| b)
     }
 }
@@ -5478,13 +5496,20 @@ pub struct FitResult {
     pub sigma: Vec<f64>,
     /// Names of the sigma parameters, parallel to `sigma`.
     pub sigma_names: Vec<String>,
-    /// Residual-error correlations in force for this fit, copied from the model.
+    /// Residual-error correlations in force for this fit.
     ///
-    /// These correlations are fixed by the `block_sigma` declaration rather
-    /// than estimated. Together with `sigma`, they make the fitted residual
-    /// covariance reconstructible as `rho * sigma[i] * sigma[j]`.
+    /// A plain `block_sigma` estimates these alongside theta/omega/sigma (#847);
+    /// a `block_sigma ... FIX` block holds them at the declared value — see
+    /// `residual_correlation_fixed`. Together with `sigma`, they make the fitted
+    /// residual covariance reconstructible as `rho * sigma[i] * sigma[j]`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub residual_correlations: Vec<ResidualCorrelation>,
+    /// FIX flags parallel to `residual_correlations` (#847). Empty for a fit
+    /// loaded from a pre-#847 artifact, where every correlation was fixed by
+    /// construction; readers should treat a missing entry as `true` only when
+    /// `residual_correlations` predates this field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub residual_correlation_fixed: Vec<bool>,
     /// Residual error model (additive, proportional, combined).
     ///
     /// For multi-endpoint (per-CMT) models this is only the *representative*
@@ -5504,6 +5529,12 @@ pub struct FitResult {
     ///   [`omega_se_at`] to index by (i, j).
     pub se_omega: Option<Vec<f64>>,
     pub se_sigma: Option<Vec<f64>>,
+    /// Standard errors for the estimated `block_sigma` correlations (#847), on
+    /// the natural ρ scale, parallel to `residual_correlations`. `0.0` for a
+    /// `FIX`ed entry, matching how the other `se_*` vectors report a pinned
+    /// coordinate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub se_residual_correlations: Option<Vec<f64>>,
     /// FIX flags carried through from the model so the output layer can
     /// render `FIXED` for SE columns rather than the (meaningless) zero
     /// they acquire from the reduced-Hessian covariance step.

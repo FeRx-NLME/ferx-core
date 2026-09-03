@@ -196,6 +196,7 @@ pub fn mixture_ofv(
                     &ebe.h_matrix,
                     &cp.omega,
                     &cp.sigma.values,
+                    &cp.residual_correlations,
                     interaction,
                 )
             };

@@ -5622,19 +5622,28 @@ fn test_parse_block_sigma_builds_sigmas_and_correlation() {
     assert!((sigmas[1].value - 1.0).abs() < 1e-12);
 
     let sigma_names: Vec<String> = sigmas.iter().map(|s| s.name.clone()).collect();
-    let corrs = build_residual_correlations(&block_sigmas, &sigma_names).unwrap();
+    let (corrs, fixed) = build_residual_correlations(&block_sigmas, &sigma_names).unwrap();
     assert_eq!(corrs.len(), 1);
     assert_eq!(corrs[0].sigma_i, 1);
     assert_eq!(corrs[0].sigma_j, 0);
     assert!((corrs[0].rho - 0.5).abs() < 1e-12);
+    // #847: a bare `block_sigma` estimates its off-diagonal.
+    assert_eq!(fixed, vec![false]);
 }
 
 #[test]
 fn test_parse_block_sigma_fix_marks_sigmas_fixed() {
     let lines = vec!["block_sigma (PROP, ADD) = [0.04, 0.10, 1.0] FIX".to_string()];
-    let (_, _, _, sigmas, _, _, _, _, _, _) =
+    let (_, _, _, sigmas, block_sigmas, _, _, _, _, _) =
         parse_parameters(&lines, &Default::default()).unwrap();
     assert!(sigmas.iter().all(|s| s.fixed));
+
+    // #847: `FIX` pins the off-diagonal too, which is what distinguishes it from
+    // a bare `block_sigma` (that one estimates ρ, NONMEM `$SIGMA BLOCK(n)`).
+    let sigma_names: Vec<String> = sigmas.iter().map(|s| s.name.clone()).collect();
+    let (corrs, fixed) = build_residual_correlations(&block_sigmas, &sigma_names).unwrap();
+    assert_eq!(corrs.len(), 1);
+    assert_eq!(fixed, vec![true]);
 }
 
 #[test]
@@ -5671,6 +5680,7 @@ fn test_build_residual_correlations_zero_diagonal_errs() {
     let block = BlockSigmaSpec {
         names: vec!["A".to_string(), "B".to_string()],
         lower_triangle: vec![0.0, 0.1, 1.0],
+        fixed: false,
     };
     let names = vec!["A".to_string(), "B".to_string()];
     let err = build_residual_correlations(&[block], &names).unwrap_err();
@@ -5683,6 +5693,7 @@ fn test_build_residual_correlations_invalid_rho_errs() {
     let block = BlockSigmaSpec {
         names: vec!["A".to_string(), "B".to_string()],
         lower_triangle: vec![0.04, 0.10, 0.04],
+        fixed: false,
     };
     let names = vec!["A".to_string(), "B".to_string()];
     let err = build_residual_correlations(&[block], &names).unwrap_err();
@@ -5698,6 +5709,7 @@ fn test_build_residual_correlations_unit_rho_errs() {
         let block = BlockSigmaSpec {
             names: vec!["A".to_string(), "B".to_string()],
             lower_triangle: vec![0.04, cov, 0.04],
+            fixed: false,
         };
         let names = vec!["A".to_string(), "B".to_string()];
         let err = build_residual_correlations(&[block], &names).unwrap_err();
@@ -5711,6 +5723,7 @@ fn test_build_residual_correlations_unknown_name_errs() {
     let block = BlockSigmaSpec {
         names: vec!["X".to_string(), "Y".to_string()],
         lower_triangle: vec![1.0, 0.5, 1.0],
+        fixed: false,
     };
     let names = vec!["A".to_string(), "B".to_string()];
     let err = build_residual_correlations(&[block], &names).unwrap_err();
@@ -5718,15 +5731,36 @@ fn test_build_residual_correlations_unknown_name_errs() {
 }
 
 #[test]
-fn test_build_residual_correlations_zero_covariance_omitted() {
-    // A zero off-diagonal entry carries no correlation, so no entry is built.
+fn test_build_residual_correlations_zero_covariance_kept_when_estimated() {
+    // #847: a zero off-diagonal on a non-`FIX` block still declares an estimated
+    // correlation. `$SIGMA BLOCK(2)` with a zero covariance init is a routine
+    // NONMEM starting point; dropping it would silently fit a diagonal residual
+    // with no coordinate to move and no diagnostic.
     let block = BlockSigmaSpec {
         names: vec!["A".to_string(), "B".to_string()],
         lower_triangle: vec![0.04, 0.0, 1.0],
+        fixed: false,
     };
     let names = vec!["A".to_string(), "B".to_string()];
-    let corrs = build_residual_correlations(&[block], &names).unwrap();
+    let (corrs, fixed) = build_residual_correlations(&[block], &names).unwrap();
+    assert_eq!(corrs.len(), 1);
+    assert_eq!(corrs[0].rho, 0.0);
+    assert_eq!(fixed, vec![false]);
+}
+
+#[test]
+fn test_build_residual_correlations_zero_covariance_omitted_when_fixed() {
+    // A `FIX`ed zero correlation is the same object as no correlation, so it
+    // still carries nothing — and costs no packed coordinate.
+    let block = BlockSigmaSpec {
+        names: vec!["A".to_string(), "B".to_string()],
+        lower_triangle: vec![0.04, 0.0, 1.0],
+        fixed: true,
+    };
+    let names = vec!["A".to_string(), "B".to_string()];
+    let (corrs, fixed) = build_residual_correlations(&[block], &names).unwrap();
     assert!(corrs.is_empty());
+    assert!(fixed.is_empty());
 }
 
 #[test]

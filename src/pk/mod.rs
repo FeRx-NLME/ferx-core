@@ -3210,6 +3210,8 @@ mod tests {
             eta_names: Vec::new(),
             kappa_names: Vec::new(),
             default_params: ModelParameters {
+                residual_correlations: Vec::new(),
+                residual_correlation_fixed: Vec::new(),
                 theta: vec![1.0],
                 theta_names: vec!["TVCL".into()],
                 theta_lower: vec![0.0],

@@ -12,6 +12,5 @@ R1 5802 docs/estimation/saem.qmd::what-saem-does-about-it-now
 R1 5239 docs/estimation/tte.qmd::competing-risks-cause-specific-hazards
 R1 7642 docs/model-file/adaptive-dosing.qmd::current-scope-and-limits
 R1 6006 docs/model-file/error-model.qmd::covariate-selected-error-models-ifelse
-R1 7367 docs/model-file/error-model.qmd::examples
 R1 5746 docs/model-file/scaling.qmd::interaction-with-gradients
 R1 7391 docs/warnings.qmd::warning-codes

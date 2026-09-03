@@ -914,7 +914,15 @@ pub(crate) fn obs_nll_sum(
         .par_iter()
         .enumerate()
         .map_init(EventPkParams::default, |scratch, (i, subject)| {
-            obs_nll_subject_into(model, subject, theta, sigma_values, &etas[i], scratch)
+            obs_nll_subject_into(
+                model,
+                subject,
+                theta,
+                sigma_values,
+                &model.residual_correlations,
+                &etas[i],
+                scratch,
+            )
         })
         .collect();
     per_subj.iter().sum()
@@ -974,7 +982,15 @@ fn obs_nll_sum_mix(
             let _g = crate::parser::model_parser::MixtureClassGuard::enter(c + 1);
             let sub_sg = class_sigma_subst(sigma_values, &mix.class_sigma_over[c]);
             let sg_i: &[f64] = sub_sg.as_deref().unwrap_or(sigma_values);
-            obs_nll_subject_into(model, subject, theta, sg_i, &etas[i], scratch)
+            obs_nll_subject_into(
+                model,
+                subject,
+                theta,
+                sg_i,
+                &model.residual_correlations,
+                &etas[i],
+                scratch,
+            )
         })
         .collect();
     per_subj.iter().sum()
@@ -1458,6 +1474,11 @@ fn saem_state_to_params(
             names: init_params.sigma.names.clone(),
         },
         sigma_fixed: init_params.sigma_fixed.clone(),
+        // SAEM does not update the `block_sigma` off-diagonals (#847); carry them
+        // through so a chained estimator (e.g. `[saem, foce]`) and the result
+        // snapshot both keep the declared residual covariance structure.
+        residual_correlations: init_params.residual_correlations.clone(),
+        residual_correlation_fixed: init_params.residual_correlation_fixed.clone(),
         omega_iov: if n_kappa > 0 {
             // Use from_matrix_with_mask so the structural free_mask is preserved
             // when this snapshot is handed to a chained estimator (e.g.

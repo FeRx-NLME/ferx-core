@@ -398,10 +398,12 @@ pub ferx_core::estimation::vi::elbo::ElboEval::neg_elbo: f64
 pub struct ferx_core::estimation::vi::elbo::PackedLayout
 pub ferx_core::estimation::vi::elbo::PackedLayout::n_omega: usize
 pub ferx_core::estimation::vi::elbo::PackedLayout::n_omega_iov: usize
+pub ferx_core::estimation::vi::elbo::PackedLayout::n_rho: usize
 pub ferx_core::estimation::vi::elbo::PackedLayout::n_sigma: usize
 pub ferx_core::estimation::vi::elbo::PackedLayout::n_theta: usize
 impl ferx_core::estimation::vi::elbo::PackedLayout
 pub fn ferx_core::estimation::vi::elbo::PackedLayout::new(template: &ferx_core::ModelParameters) -> Self
+pub fn ferx_core::estimation::vi::elbo::PackedLayout::omega_iov_end(&self) -> usize
 pub fn ferx_core::estimation::vi::elbo::PackedLayout::omega_iov_start(&self) -> usize
 pub fn ferx_core::estimation::vi::elbo::PackedLayout::omega_start(&self) -> usize
 pub fn ferx_core::estimation::vi::elbo::PackedLayout::sigma_start(&self) -> usize
@@ -549,10 +551,12 @@ pub fn ferx_core::estimation::vi::family::MeanField::sample(&self, phi: &[f64], 
 pub struct ferx_core::estimation::vi::PackedLayout
 pub ferx_core::estimation::vi::PackedLayout::n_omega: usize
 pub ferx_core::estimation::vi::PackedLayout::n_omega_iov: usize
+pub ferx_core::estimation::vi::PackedLayout::n_rho: usize
 pub ferx_core::estimation::vi::PackedLayout::n_sigma: usize
 pub ferx_core::estimation::vi::PackedLayout::n_theta: usize
 impl ferx_core::estimation::vi::elbo::PackedLayout
 pub fn ferx_core::estimation::vi::elbo::PackedLayout::new(template: &ferx_core::ModelParameters) -> Self
+pub fn ferx_core::estimation::vi::elbo::PackedLayout::omega_iov_end(&self) -> usize
 pub fn ferx_core::estimation::vi::elbo::PackedLayout::omega_iov_start(&self) -> usize
 pub fn ferx_core::estimation::vi::elbo::PackedLayout::omega_start(&self) -> usize
 pub fn ferx_core::estimation::vi::elbo::PackedLayout::sigma_start(&self) -> usize
@@ -1795,16 +1799,16 @@ pub fn ferx_core::stats::likelihood::apply_frem_r_overrides(r_diag: &mut [f64], 
 pub fn ferx_core::stats::likelihood::build_block_diag_omega(omega_bsv: &nalgebra::base::alias::DMatrix<f64>, omega_iov: &nalgebra::base::alias::DMatrix<f64>, n_occasions: usize) -> nalgebra::base::alias::DMatrix<f64>
 pub fn ferx_core::stats::likelihood::build_frem_r_override(frem_config: core::option::Option<&ferx_core::FremConfig>, fremtype: &[u16], sigma_values: &[f64]) -> core::option::Option<alloc::vec::Vec<core::option::Option<f64>>>
 pub fn ferx_core::stats::likelihood::compute_cwres(subject: &ferx_core::Subject, ipreds: &[f64], eta_hat: &nalgebra::base::alias::DVector<f64>, h_matrix: &nalgebra::base::alias::DMatrix<f64>, omega: &ferx_core::OmegaMatrix, sigma_values: &[f64], error_spec: &ferx_core::ErrorSpec, residual_correlations: &[ferx_core::ResidualCorrelation], frem_r_override: core::option::Option<&[core::option::Option<f64>]>, residual_error_eta: core::option::Option<usize>, ruv_mult: core::option::Option<&[alloc::vec::Vec<f64>]>) -> alloc::vec::Vec<f64>
-pub fn ferx_core::stats::likelihood::foce_population_nll(model: &ferx_core::CompiledModel, population: &ferx_core::Population, theta: &[f64], eta_hats: &[nalgebra::base::alias::DVector<f64>], h_matrices: &[nalgebra::base::alias::DMatrix<f64>], omega: &ferx_core::OmegaMatrix, sigma_values: &[f64], interaction: bool) -> f64
+pub fn ferx_core::stats::likelihood::foce_population_nll(model: &ferx_core::CompiledModel, population: &ferx_core::Population, theta: &[f64], eta_hats: &[nalgebra::base::alias::DVector<f64>], h_matrices: &[nalgebra::base::alias::DMatrix<f64>], omega: &ferx_core::OmegaMatrix, sigma_values: &[f64], residual_correlations: &[ferx_core::ResidualCorrelation], interaction: bool) -> f64
 pub fn ferx_core::stats::likelihood::foce_population_nll_iov(model: &ferx_core::CompiledModel, population: &ferx_core::Population, theta: &[f64], eta_hats: &[nalgebra::base::alias::DVector<f64>], h_matrices: &[nalgebra::base::alias::DMatrix<f64>], kappas_per_subject: &[alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>], omega_bsv: &ferx_core::OmegaMatrix, omega_iov: &ferx_core::OmegaMatrix, sigma_values: &[f64], interaction: bool) -> f64
-pub fn ferx_core::stats::likelihood::foce_subject_nll(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta_hat: &nalgebra::base::alias::DVector<f64>, h_matrix: &nalgebra::base::alias::DMatrix<f64>, omega: &ferx_core::OmegaMatrix, sigma_values: &[f64], interaction: bool) -> f64
+pub fn ferx_core::stats::likelihood::foce_subject_nll(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta_hat: &nalgebra::base::alias::DVector<f64>, h_matrix: &nalgebra::base::alias::DMatrix<f64>, omega: &ferx_core::OmegaMatrix, sigma_values: &[f64], residual_correlations: &[ferx_core::ResidualCorrelation], interaction: bool) -> f64
 pub fn ferx_core::stats::likelihood::foce_subject_nll_interaction(subject: &ferx_core::Subject, ipreds: &[f64], eta_hat: &nalgebra::base::alias::DVector<f64>, h_matrix: &nalgebra::base::alias::DMatrix<f64>, omega: &ferx_core::OmegaMatrix, sigma_values: &[f64], error_spec: &ferx_core::ErrorSpec, bloq_method: ferx_core::BloqMethod, p_obs: &[f64], frem_r_override: core::option::Option<&[core::option::Option<f64>]>, residual_error_eta: core::option::Option<usize>, ruv_mult: core::option::Option<&[alloc::vec::Vec<f64>]>) -> f64
 pub fn ferx_core::stats::likelihood::foce_subject_nll_interaction_dense(subject: &ferx_core::Subject, ipreds: &[f64], eta_hat: &nalgebra::base::alias::DVector<f64>, h_matrix: &nalgebra::base::alias::DMatrix<f64>, omega: &ferx_core::OmegaMatrix, sigma_values: &[f64], error_spec: &ferx_core::ErrorSpec, correlations: &[ferx_core::ResidualCorrelation], p_obs: &[f64], ruv_mult: core::option::Option<&[alloc::vec::Vec<f64>]>) -> f64
 pub fn ferx_core::stats::likelihood::foce_subject_nll_iov(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta_hat: &nalgebra::base::alias::DVector<f64>, h_matrix: &nalgebra::base::alias::DMatrix<f64>, omega_bsv: &ferx_core::OmegaMatrix, sigma_values: &[f64], interaction: bool, kappas: &[nalgebra::base::alias::DVector<f64>], omega_iov: &ferx_core::OmegaMatrix) -> f64
 pub fn ferx_core::stats::likelihood::foce_subject_nll_standard(subject: &ferx_core::Subject, ipreds: &[f64], eta_hat: &nalgebra::base::alias::DVector<f64>, h_matrix: &nalgebra::base::alias::DMatrix<f64>, omega: &ferx_core::OmegaMatrix, sigma_values: &[f64], error_spec: &ferx_core::ErrorSpec, residual_correlations: &[ferx_core::ResidualCorrelation], bloq_method: ferx_core::BloqMethod, p_obs: &[f64], frem_r_override: core::option::Option<&[core::option::Option<f64>]>, r_pred_override: core::option::Option<&[f64]>, ruv_mult: core::option::Option<&[alloc::vec::Vec<f64>]>) -> f64
 pub fn ferx_core::stats::likelihood::individual_nll(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64], omega: &ferx_core::OmegaMatrix, sigma_values: &[f64]) -> f64
 pub fn ferx_core::stats::likelihood::individual_nll_into(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64], omega: &ferx_core::OmegaMatrix, sigma_values: &[f64], scratch: &mut ferx_core::pk::EventPkParams) -> f64
-pub fn ferx_core::stats::likelihood::individual_nll_into_with_schedule(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64], omega: &ferx_core::OmegaMatrix, sigma_values: &[f64], scratch: &mut ferx_core::pk::EventPkParams, schedule: core::option::Option<&ferx_core::pk::event_driven::EventSchedule>) -> f64
+pub fn ferx_core::stats::likelihood::individual_nll_into_with_schedule(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64], omega: &ferx_core::OmegaMatrix, sigma_values: &[f64], residual_correlations: &[ferx_core::ResidualCorrelation], scratch: &mut ferx_core::pk::EventPkParams, schedule: core::option::Option<&ferx_core::pk::event_driven::EventSchedule>) -> f64
 pub fn ferx_core::stats::likelihood::individual_nll_iov(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64], kappas: &[alloc::vec::Vec<f64>], omega: &ferx_core::OmegaMatrix, omega_iov: core::option::Option<&ferx_core::OmegaMatrix>, sigma_values: &[f64]) -> f64
 pub fn ferx_core::stats::likelihood::iov_combined_effect(stacked_eta: &[f64], n_eta: usize, n_kappa: usize, g: usize) -> alloc::vec::Vec<f64>
 pub fn ferx_core::stats::likelihood::iov_combined_pk_only(stacked_eta: &[f64], n_eta: usize, n_kappa: usize) -> alloc::vec::Vec<f64>
@@ -2716,6 +2720,7 @@ pub ferx_core::types::FitResult::optimizer: alloc::string::String
 pub ferx_core::types::FitResult::outer_gtol: f64
 pub ferx_core::types::FitResult::outer_maxiter: usize
 pub ferx_core::types::FitResult::packed_estimate: core::option::Option<alloc::vec::Vec<f64>>
+pub ferx_core::types::FitResult::residual_correlation_fixed: alloc::vec::Vec<bool>
 pub ferx_core::types::FitResult::residual_correlations: alloc::vec::Vec<ferx_core::ResidualCorrelation>
 pub ferx_core::types::FitResult::restored_from_checkpoint: bool
 pub ferx_core::types::FitResult::saem_mu_ref_m_step_evals_saved: core::option::Option<u64>
@@ -2723,6 +2728,7 @@ pub ferx_core::types::FitResult::saem_n_subjects_hmc: core::option::Option<usize
 pub ferx_core::types::FitResult::saem_seed: core::option::Option<u64>
 pub ferx_core::types::FitResult::se_kappa: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::types::FitResult::se_omega: core::option::Option<alloc::vec::Vec<f64>>
+pub ferx_core::types::FitResult::se_residual_correlations: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::types::FitResult::se_sigma: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::types::FitResult::se_theta: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::types::FitResult::shrinkage_eps: f64
@@ -2822,6 +2828,8 @@ pub ferx_core::types::ModelParameters::mixture: core::option::Option<ferx_core::
 pub ferx_core::types::ModelParameters::omega: ferx_core::OmegaMatrix
 pub ferx_core::types::ModelParameters::omega_fixed: alloc::vec::Vec<bool>
 pub ferx_core::types::ModelParameters::omega_iov: core::option::Option<ferx_core::OmegaMatrix>
+pub ferx_core::types::ModelParameters::residual_correlation_fixed: alloc::vec::Vec<bool>
+pub ferx_core::types::ModelParameters::residual_correlations: alloc::vec::Vec<ferx_core::ResidualCorrelation>
 pub ferx_core::types::ModelParameters::sigma: ferx_core::SigmaVector
 pub ferx_core::types::ModelParameters::sigma_fixed: alloc::vec::Vec<bool>
 pub ferx_core::types::ModelParameters::theta: alloc::vec::Vec<f64>
@@ -4054,6 +4062,7 @@ pub ferx_core::FitResult::optimizer: alloc::string::String
 pub ferx_core::FitResult::outer_gtol: f64
 pub ferx_core::FitResult::outer_maxiter: usize
 pub ferx_core::FitResult::packed_estimate: core::option::Option<alloc::vec::Vec<f64>>
+pub ferx_core::FitResult::residual_correlation_fixed: alloc::vec::Vec<bool>
 pub ferx_core::FitResult::residual_correlations: alloc::vec::Vec<ferx_core::ResidualCorrelation>
 pub ferx_core::FitResult::restored_from_checkpoint: bool
 pub ferx_core::FitResult::saem_mu_ref_m_step_evals_saved: core::option::Option<u64>
@@ -4061,6 +4070,7 @@ pub ferx_core::FitResult::saem_n_subjects_hmc: core::option::Option<usize>
 pub ferx_core::FitResult::saem_seed: core::option::Option<u64>
 pub ferx_core::FitResult::se_kappa: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::FitResult::se_omega: core::option::Option<alloc::vec::Vec<f64>>
+pub ferx_core::FitResult::se_residual_correlations: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::FitResult::se_sigma: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::FitResult::se_theta: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::FitResult::shrinkage_eps: f64
@@ -4178,6 +4188,8 @@ pub ferx_core::ModelParameters::mixture: core::option::Option<ferx_core::Mixture
 pub ferx_core::ModelParameters::omega: ferx_core::OmegaMatrix
 pub ferx_core::ModelParameters::omega_fixed: alloc::vec::Vec<bool>
 pub ferx_core::ModelParameters::omega_iov: core::option::Option<ferx_core::OmegaMatrix>
+pub ferx_core::ModelParameters::residual_correlation_fixed: alloc::vec::Vec<bool>
+pub ferx_core::ModelParameters::residual_correlations: alloc::vec::Vec<ferx_core::ResidualCorrelation>
 pub ferx_core::ModelParameters::sigma: ferx_core::SigmaVector
 pub ferx_core::ModelParameters::sigma_fixed: alloc::vec::Vec<bool>
 pub ferx_core::ModelParameters::theta: alloc::vec::Vec<f64>

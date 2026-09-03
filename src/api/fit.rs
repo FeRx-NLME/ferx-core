@@ -1912,6 +1912,8 @@ fn fit_inner(
     // Extract SEs from covariance matrix using converged parameter values
     let (se_theta, se_omega, se_sigma, se_kappa) =
         extract_standard_errors(&result.covariance_matrix, &result.params);
+    let se_residual_correlations =
+        extract_residual_correlation_se(&result.covariance_matrix, &result.params);
 
     // Optional SIR step
     let mut warnings = result.warnings;
@@ -2339,7 +2341,11 @@ fn fit_inner(
         omega: result.params.omega.matrix.clone(),
         sigma: result.params.sigma.values.clone(),
         sigma_names: result.params.sigma.names.clone(),
-        residual_correlations: model.residual_correlations.clone(),
+        // The **fitted** correlations, not the model's declaration: a non-`FIX`
+        // `block_sigma` estimates its off-diagonal (#847), so reading these off
+        // `model` would report the initial value as if it were the estimate.
+        residual_correlations: result.params.residual_correlations.clone(),
+        residual_correlation_fixed: result.params.residual_correlation_fixed.clone(),
         error_model: model.error_model,
         covariance_matrix: result.covariance_matrix,
         // The optimizer's exact packed vector (FOCE/FOCEI paths), so a later
@@ -2349,6 +2355,7 @@ fn fit_inner(
         se_theta,
         se_omega,
         se_sigma,
+        se_residual_correlations,
         theta_fixed: result.params.theta_fixed.clone(),
         omega_fixed: result.params.omega_fixed.clone(),
         sigma_fixed: result.params.sigma_fixed.clone(),

@@ -5,7 +5,8 @@ use super::*;
 use crate::diagnostics::{first_error, CheckReport, Diagnostic};
 use crate::estimation::outer_optimizer::optimize_population;
 use crate::estimation::parameterization::{
-    chol_lt_idx, lower_tri_iter, omega_packed_len, theta_packs_log, PackedCoordKind,
+    chol_lt_idx, lower_tri_iter, omega_packed_len, rho_chain, rho_packed_start, theta_packs_log,
+    PackedCoordKind,
 };
 use crate::estimation::saem;
 use crate::io::datareader::{
@@ -665,7 +666,8 @@ pub(crate) fn compute_subject_results(
                 model.error_spec.obs_keys(subject).as_ref(),
                 &model.error_spec,
                 &params.sigma.values,
-                &model.residual_correlations,
+                // The fitted correlations, not the declaration (#847).
+                &params.residual_correlations,
                 ruv_mult.as_deref(),
             );
             // IIV on residual error (#409): the individual residual SD is scaled
@@ -699,7 +701,7 @@ pub(crate) fn compute_subject_results(
                 &params.omega,
                 &params.sigma.values,
                 &model.error_spec,
-                &model.residual_correlations,
+                &params.residual_correlations,
                 frem_r_override.as_deref(),
                 model.residual_error_eta,
                 ruv_mult.as_deref(),
@@ -732,6 +734,7 @@ pub(crate) fn compute_subject_results(
                     h,
                     &params.omega,
                     &params.sigma.values,
+                    &params.residual_correlations,
                     interaction,
                 )
             };
@@ -2205,4 +2208,49 @@ pub(crate) fn extract_standard_errors(
     });
 
     (Some(se_theta), Some(se_omega), Some(se_sigma), se_kappa)
+}
+
+/// Standard errors for the estimated `block_sigma` correlations (#847), on the
+/// natural ρ scale.
+///
+/// Kept apart from [`extract_standard_errors`] rather than widening its tuple:
+/// the ρ block is packed **last** (after Ω_IOV and the mixture overrides), so it
+/// needs its own offset — [`rho_packed_start`] — and none of that tuple's
+/// existing offsets.
+///
+/// The packed coordinate is the Fisher-z `z = atanh(ρ)`, so the delta method
+/// gives `SE(ρ) = SE(z)·|dρ/dz| = SE(z)·(1 − ρ²)`. A `FIX`ed correlation is
+/// excluded from the reduced-Hessian free set and reports `0.0`, exactly like a
+/// pinned theta/omega/sigma.
+pub(crate) fn extract_residual_correlation_se(
+    cov: &Option<DMatrix<f64>>,
+    template: &ModelParameters,
+) -> Option<Vec<f64>> {
+    if template.residual_correlations.is_empty() {
+        return None;
+    }
+    let cov = cov.as_ref()?;
+    let n = cov.nrows();
+    let start = rho_packed_start(template);
+    Some(
+        template
+            .residual_correlations
+            .iter()
+            .enumerate()
+            .map(|(k, corr)| {
+                let idx = start + k;
+                // Guard a truncated `cov` the same way the theta/omega/sigma
+                // branches above do — report 0.0, never panic away a fit.
+                if idx >= n {
+                    return 0.0;
+                }
+                let var = cov[(idx, idx)];
+                if var > 0.0 {
+                    var.sqrt() * rho_chain(corr.rho)
+                } else {
+                    0.0
+                }
+            })
+            .collect(),
+    )
 }

@@ -50,6 +50,8 @@ fn minimal_iov_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
         indiv_param_names: vec!["CL".into()],
         indiv_param_partials: IndivParamPartials::empty(),
         default_params: ModelParameters {
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             theta: Vec::new(),
             theta_names: Vec::new(),
             theta_lower: Vec::new(),
