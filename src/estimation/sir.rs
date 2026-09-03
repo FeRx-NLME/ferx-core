@@ -476,6 +476,34 @@ pub fn run_sir_core(
     ofv_hat: f64,
     options: &FitOptions,
 ) -> Result<SirResult, String> {
+    // #1212: the math kernel is public API in its own right, so it opens the fit-scoped ODE
+    // scope too rather than relying on its caller having done so. Called from `run_sir` or
+    // `fit()` this costs nothing — the threads already carry that override, which the scope
+    // detects — while a direct caller gets the tolerances they passed instead of the spec's
+    // parse-time ones.
+    crate::api::with_fit_ode_scope(options, || {
+        run_sir_core_scoped(
+            model,
+            population,
+            params,
+            eta_hats,
+            proposal_cov,
+            ofv_hat,
+            options,
+        )
+    })?
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_sir_core_scoped(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    eta_hats: &[DVector<f64>],
+    proposal_cov: &DMatrix<f64>,
+    ofv_hat: f64,
+    options: &FitOptions,
+) -> Result<SirResult, String> {
     let n_samples = options.sir_samples;
     let n_resamples = options.sir_resamples;
 

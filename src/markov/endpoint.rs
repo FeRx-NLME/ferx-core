@@ -418,7 +418,7 @@ fn ctmm_endpoint_nll_inhomogeneous(
             },
             dt,
             n_states,
-            &ode.solver_opts,
+            &ode.effective_solver_opts(),
         );
         let prob = p[(obs[m].state, obs[m + 1].state)];
         // Underflowed / non-positive probability for an observed transition → repel.

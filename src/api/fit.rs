@@ -242,6 +242,18 @@ pub fn fit(
     // is a no-op unless the user pinned `inner_optimizer`.
     crate::estimation::inner_optimizer::set_inner_optimizer(options.inner_optimizer);
     crate::estimation::inner_optimizer::set_ebe_warm_start(options.ebe_warm_start);
+    // #1212: carry this call's ODE solver settings the last hop to the integrator. The
+    // spec's `solver_opts` is stamped at parse time by `sync_ode_solver_opts`, every
+    // integration path reads it off the spec, and `fit` has only `&CompiledModel` — so without
+    // this a `FitOptions { ode_reltol: 1e-10, .. }` (or an `ode_method` naming a stiff stepper)
+    // ran at the parse-time value and reported success. Armed here rather than in `fit_inner`
+    // so the pre-fit validation below — which runs on this thread, before any pool — sees the
+    // same options as the fit; the guard disarms on every exit path, including an early `?`,
+    // so a later `predict` on the same model is unaffected. The fan-out is covered separately,
+    // by `install_on_fit_pool`: arming reaches this thread only, and the workers that do the
+    // integrating get the value from the pool built for it.
+    let _ode_solver_override =
+        crate::ode::solver::arm_ode_solver_override(options.ode_solver_override());
     // #1064: a `theta NAME[...]` block has no levels until it is bound
     // to data. Fitting one unbound would gather out of an empty level table and
     // predict NaN everywhere; refuse, and name the two ways out.
@@ -646,13 +658,7 @@ pub fn fit(
         // build failure as `Err`, as before). The unpinned default reuses the shared
         // big-stack pool; if that one-time build ever failed we run on the ambient pool
         // rather than turning a previously-successful default fit into an `Err`.
-        let res = match options.threads.filter(|&n| n > 0) {
-            Some(n) => build_fit_pool(n)?.install(run),
-            None => match default_fit_pool() {
-                Some(pool) => pool.install(run),
-                None => run(),
-            },
-        };
+        let res = install_on_fit_pool(options, run)?;
         return res.map(|mut result| {
             result.warnings.splice(0..0, ltbs_warnings);
             // Surface any SS-equilibration non-convergence seen during this (default, single-start)
@@ -727,14 +733,8 @@ pub fn fit(
 
     // Run the start fan-out on the pinned fit-scoped pool when `threads` is set, else on the
     // shared big-stack pool; fall back to the ambient pool only if that one-time build failed.
-    let results: Vec<(usize, Result<FitResult, String>)> = match options.threads.filter(|&n| n > 0)
-    {
-        Some(n) => build_fit_pool(n)?.install(par_starts),
-        None => match default_fit_pool() {
-            Some(pool) => pool.install(par_starts),
-            None => par_starts(),
-        },
-    };
+    let results: Vec<(usize, Result<FitResult, String>)> =
+        install_on_fit_pool(options, par_starts)?;
 
     // Pick the best start (see `multistart_prefers` for the ranking).
     let mut best: Option<(usize, FitResult)> = None;

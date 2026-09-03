@@ -175,7 +175,7 @@ fn tte_ode_nll(
     let tol = model
         .ode_spec
         .as_ref()
-        .map(|o| crate::survival::MonoTol::from_solver(&o.solver_opts))
+        .map(|o| crate::survival::MonoTol::from_solver(&o.effective_solver_opts()))
         .unwrap_or_default();
     tte_ode_nll_from_curves(records, &times, &cum, &haz, tol)
 }
@@ -358,7 +358,7 @@ fn tte_ode_nll_from_shared(
         (ode.rhs)(st, &share.pk_values, t, &mut du);
         haz[i] = du[chz_state];
     }
-    let tol = crate::survival::MonoTol::from_solver(&ode.solver_opts);
+    let tol = crate::survival::MonoTol::from_solver(&ode.effective_solver_opts());
     tte_ode_nll_from_curves(records, &share.times, &cum, &haz, tol)
 }
 
