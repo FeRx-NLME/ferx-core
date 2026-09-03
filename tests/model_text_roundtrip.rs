@@ -20,6 +20,30 @@ use std::path::{Path, PathBuf};
 
 use ferx_core::edit::ModelText;
 
+/// The shipped multi-line `block_omega` is one declaration, not six lines.
+///
+/// `prepare_frem()` emits the block form broken over a line per row, and the
+/// parser rejoins it before any declaration regex runs. An editor that reads
+/// physical lines sees no `block_omega` at all here: it would rewrite the
+/// `block_omega (…) = [` line and leave the five rows of triangle below it.
+#[test]
+fn the_shipped_multi_line_block_omega_reads_as_one_declaration() {
+    let src = fs::read_to_string("examples/warfarin_frem.ferx").expect("the example must exist");
+    let text = ModelText::parse(&src).expect("the example must parse");
+    let blocks: Vec<String> = text
+        .block_lines("parameters")
+        .into_iter()
+        .filter(|l| l.starts_with("block_omega"))
+        .collect();
+    assert_eq!(blocks.len(), 1, "{blocks:?}");
+    let block = &blocks[0];
+    for eta in ["ETA_CL", "ETA_V", "ETA_KA", "ETA_WT_FREM", "ETA_AGE_FREM"] {
+        assert!(block.contains(eta), "`{eta}` missing from `{block}`");
+    }
+    // The whole triangle came with it — the last row included.
+    assert!(block.contains("99.38") && block.ends_with(']'), "{block}");
+}
+
 /// Every `.ferx` file under `examples/`, recursively.
 fn example_models() -> Vec<PathBuf> {
     let mut out = Vec::new();

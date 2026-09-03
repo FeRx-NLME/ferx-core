@@ -53,10 +53,29 @@ pub(crate) fn canonical_hash(lines: &[String]) -> [u8; 32] {
 /// Drop every run of whitespace, except between two word characters where one
 /// space is kept — the boundary that separates `theta TVCL` (two tokens) from
 /// `TVCL * exp(...)` (one expression written loosely).
+///
+/// A quoted string is copied through byte for byte. Whitespace is not spacing
+/// there, it is *content*: `path = "cohort / A.csv"` and `path =
+/// "cohort/A.csv"` name two different files, and collapsing both to the same
+/// canonical form would have the fit cache answer one with the other's result.
 fn squeeze(code: &str) -> String {
     let mut out = String::with_capacity(code.len());
     let mut pending_space = false;
+    let mut quote: Option<char> = None;
     for c in code.chars() {
+        if let Some(q) = quote {
+            out.push(c);
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        if c == '\'' || c == '"' {
+            pending_space = false;
+            quote = Some(c);
+            out.push(c);
+            continue;
+        }
         if c.is_whitespace() {
             pending_space = !out.is_empty();
             continue;

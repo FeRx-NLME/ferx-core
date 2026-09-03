@@ -175,14 +175,12 @@ impl ModelText {
     }
 
     /// The body lines of every `[name]` block, comment-stripped and trimmed,
-    /// with blank lines dropped — the view the parser gets.
+    /// with blank lines dropped and continuation lines folded in — the view
+    /// the parser gets.
     pub fn block_lines(&self, name: &str) -> Vec<String> {
-        self.block_spans()
-            .iter()
-            .filter(|b| b.name == name)
-            .flat_map(|b| self.lines[b.body.clone()].iter())
-            .map(|l| code_of(l).to_string())
-            .filter(|l| !l.is_empty())
+        self.logical_lines(name)
+            .into_iter()
+            .map(|(_, c)| c)
             .collect()
     }
 
@@ -227,6 +225,93 @@ impl ModelText {
             .filter(|b| b.name == name)
             .flat_map(|b| b.body.clone())
             .collect()
+    }
+
+    /// The **logical** declarations of every `[name]` block: the line range
+    /// each one occupies, and its code with continuation lines folded in.
+    ///
+    /// A declaration is not always a line. The parser rejoins a bracketed one
+    /// written over several lines (`block_omega (…) = [` … `]`, plus a bare
+    /// `FIX` on the line after it) in `join_bracketed_lines`, and an
+    /// expression broken around a binary operator in `join_continuation_lines`
+    /// — and `examples/warfarin_frem.ferx` ships the multi-line block form. An
+    /// editor addressing the *physical* line instead rewrites the first line of
+    /// a six-line `block_omega` and leaves the other five behind, so every
+    /// lookup in this module goes through here.
+    pub(crate) fn logical_lines(&self, name: &str) -> Vec<(Range<usize>, String)> {
+        /// Leading characters that can only continue the previous line, and
+        /// trailing ones that leave it unfinished — the parser's two lists.
+        const LEADERS: &[char] = &['+', '-', '*', '/', '^'];
+        const TRAILERS: &[char] = &['+', '-', '*', '/', '^', ',', '='];
+
+        let mut out: Vec<(Range<usize>, String)> = Vec::new();
+        for span in self.block_spans().iter().filter(|b| b.name == name) {
+            let mut open: Option<(usize, String)> = None;
+            let mut depth = 0i32;
+            for i in span.body.clone() {
+                let code = self.code(i);
+                if code.is_empty() {
+                    continue;
+                }
+                let continues = depth > 0
+                    || code.starts_with(LEADERS)
+                    || out
+                        .last()
+                        .filter(|_| open.is_none())
+                        .is_some_and(|(r, c)| r.end == i && c.ends_with(TRAILERS));
+                match (&mut open, continues) {
+                    (Some((_, buf)), _) => {
+                        buf.push(' ');
+                        buf.push_str(code);
+                    }
+                    // A continuation of a declaration already emitted reopens
+                    // it, so the two end up in one range.
+                    (None, true) if !out.is_empty() => {
+                        let (r, c) = out.pop().expect("non-empty");
+                        depth += bracket_depth(&c);
+                        open = Some((r.start, format!("{c} {code}")));
+                    }
+                    (None, _) => open = Some((i, code.to_string())),
+                }
+                depth += bracket_depth(code);
+                if depth <= 0 {
+                    depth = 0;
+                    let (start, buf) = open.take().expect("opened just above");
+                    // A bare `FIX` line folds onto the block before it, exactly
+                    // as `join_bracketed_lines` folds it.
+                    if buf.eq_ignore_ascii_case("FIX")
+                        && out.last().is_some_and(|(_, c)| c.contains(']'))
+                    {
+                        let (r, c) = out.last_mut().expect("non-empty");
+                        r.end = i + 1;
+                        c.push(' ');
+                        c.push_str(&buf);
+                    } else {
+                        out.push((start..i + 1, buf));
+                    }
+                }
+            }
+            // An unterminated `[` — emit what there is, so the declaration
+            // regexes fail to match it and it is left alone rather than
+            // half-edited.
+            if let Some((start, buf)) = open {
+                out.push((start..span.body.end, buf));
+            }
+        }
+        out
+    }
+
+    /// Replace a logical declaration with a single line, keeping the first
+    /// line's indentation and terminator.
+    ///
+    /// Returns the continuation lines it leaves behind rather than deleting
+    /// them: a delete shifts every later index, and the callers here are
+    /// holding several spans at once. Pass them to
+    /// [`delete_lines`](Self::delete_lines) with the rest of the deletions.
+    #[must_use]
+    pub(crate) fn set_span(&mut self, span: &Range<usize>, code: &str) -> Vec<usize> {
+        self.set_code(span.start, code);
+        (span.start + 1..span.end).collect()
     }
 
     /// The comment-stripped, trimmed content of line `i`.
@@ -369,6 +454,11 @@ pub(crate) fn code_of(line: &str) -> &str {
 
 /// The leading whitespace of a line, excluding its own terminator (a blank
 /// line is all terminator and must not donate a newline as "indentation").
+/// How much `code` opens (`+`) or closes (`-`) bracket nesting.
+fn bracket_depth(code: &str) -> i32 {
+    code.matches('[').count() as i32 - code.matches(']').count() as i32
+}
+
 fn leading_ws(line: &str) -> &str {
     let end = line
         .find(|c: char| !c.is_whitespace() || c == '\n' || c == '\r')

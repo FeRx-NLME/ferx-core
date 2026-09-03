@@ -90,6 +90,15 @@ fn narrow_to_one_cpt() -> ModelEdit<'static> {
     })
 }
 
+/// [`BASE`] with `ETA_CL` and `ETA_V` blocked, written over several lines the
+/// way `examples/warfarin_frem.ferx` writes its block.
+fn multi_line_block_base() -> String {
+    BASE.replace("  omega ETA_CL ~ 0.09\n", "").replace(
+        "  omega ETA_V  ~ 0.04\n",
+        "  block_omega (ETA_CL, ETA_V) = [\n    0.09,\n    0.006, 0.04\n  ]\n",
+    )
+}
+
 fn base() -> ModelText {
     ModelText::parse(BASE).expect("the base model must parse")
 }
@@ -227,6 +236,19 @@ fn canonical_form_keeps_a_space_between_two_words() {
     // typo'd identifier would hash alike.
     let text = ModelText::parse("[parameters]\n  theta   TVCL( 1.0 , 0.1 )\n").unwrap();
     assert_eq!(text.canonical_form(), "[parameters]\ntheta TVCL(1.0,0.1)\n");
+}
+
+#[test]
+fn canonical_hash_keeps_the_bytes_inside_a_quoted_value() {
+    // Whitespace inside quotes is content, not spacing: these name two
+    // different files, and one canonical form for both would have the fit
+    // cache answer one candidate with the other's result.
+    let spaced = ModelText::parse("[data]\n  path = \"cohort / A.csv\"\n").unwrap();
+    let tight = ModelText::parse("[data]\n  path = \"cohort/A.csv\"\n").unwrap();
+    assert_ne!(spaced.canonical_hash(), tight.canonical_hash());
+    // Spacing *outside* the quotes still normalises away.
+    let reflowed = ModelText::parse("[data]\n  path=\"cohort / A.csv\"\n").unwrap();
+    assert_eq!(spaced.canonical_hash(), reflowed.canonical_hash());
 }
 
 // ── SetFitOption ───────────────────────────────────────────────────────────
@@ -451,6 +473,61 @@ fn add_iiv_tells_a_float_exponent_from_an_identifier_that_ends_in_e() {
     );
 }
 
+#[test]
+fn drop_iiv_keeps_an_omega_a_second_parameter_still_uses() {
+    // Two parameters may legally share one η. Dropping it from `CL` must not
+    // take the declaration with it, or `V` is left reading a random effect the
+    // model never declares.
+    let src = BASE
+        .replace("V  = TVV  * exp(ETA_V)", "V  = TVV  * exp(ETA_CL)")
+        .replace("  omega ETA_V  ~ 0.04\n", "");
+    let mut text = ModelText::parse(&src).unwrap();
+    apply(&mut text, ModelEdit::DropIiv { param: "CL".into() });
+    let params = text.block_lines("parameters");
+    assert!(
+        params.contains(&"omega ETA_CL ~ 0.09".to_string()),
+        "{params:?}"
+    );
+    let indiv = text.block_lines("individual_parameters");
+    assert!(indiv.contains(&"CL = TVCL".to_string()), "{indiv:?}");
+    assert!(
+        indiv.contains(&"V  = TVV  * exp(ETA_CL)".to_string()),
+        "{indiv:?}"
+    );
+    // The last user of the η does take the declaration with it.
+    apply(&mut text, ModelEdit::DropIiv { param: "V".into() });
+    assert!(
+        !text
+            .block_lines("parameters")
+            .iter()
+            .any(|l| l.contains("ETA_CL")),
+        "{:?}",
+        text.block_lines("parameters")
+    );
+}
+
+#[test]
+fn a_multi_line_block_omega_is_one_declaration_to_the_duplicate_guards() {
+    // `examples/warfarin_frem.ferx` writes its block over seven lines, and the
+    // parser rejoins it before matching. An editor reading physical lines sees
+    // no `block_omega` at all.
+    let mut text = ModelText::parse(&multi_line_block_base()).unwrap();
+    let err = text
+        .apply(ModelEdit::DropIiv { param: "CL".into() })
+        .unwrap_err();
+    assert!(err.contains("block_omega"), "{err}");
+    let err = text
+        .apply(ModelEdit::AddIiv {
+            param: "KA".into(),
+            form: IivForm::Exponential {
+                eta: "ETA_V".into(),
+                variance: 0.1,
+            },
+        })
+        .unwrap_err();
+    assert!(err.contains("already declared by `block_omega"), "{err}");
+}
+
 // ── SetOmegaBlock ──────────────────────────────────────────────────────────
 
 #[test]
@@ -519,6 +596,39 @@ fn set_omega_block_lists_the_eta_in_declaration_order() {
         "{:?}",
         text.block_lines("parameters")
     );
+}
+
+#[test]
+fn set_omega_block_carries_fix_and_refuses_a_mixed_block() {
+    // `FIX` is a block-level flag. Dropping it silently would turn two fixed
+    // variances into estimated ones — a different model, with two parameters
+    // the search does not know it added.
+    let src = BASE
+        .replace("omega ETA_CL ~ 0.09", "omega ETA_CL ~ 0.09 FIX")
+        .replace("omega ETA_V  ~ 0.04", "omega ETA_V  ~ 0.04 FIX");
+    let mut text = ModelText::parse(&src).unwrap();
+    apply(
+        &mut text,
+        ModelEdit::SetOmegaBlock(vec!["ETA_CL".into(), "ETA_V".into()]),
+    );
+    assert!(
+        text.block_lines("parameters")
+            .contains(&"block_omega (ETA_CL, ETA_V) = [0.09, 0.006, 0.04] FIX".to_string()),
+        "{:?}",
+        text.block_lines("parameters")
+    );
+
+    // One flag cannot say "fix these two and estimate that one".
+    let src = BASE.replace("omega ETA_CL ~ 0.09", "omega ETA_CL ~ 0.09 FIX");
+    let err = ModelText::parse(&src)
+        .unwrap()
+        .apply(ModelEdit::SetOmegaBlock(vec![
+            "ETA_CL".into(),
+            "ETA_V".into(),
+        ]))
+        .unwrap_err();
+    assert!(err.contains("FIX"), "{err}");
+    assert!(err.contains("ETA_V"), "{err}");
 }
 
 // ── [covariate_model] ──────────────────────────────────────────────────────
@@ -623,6 +733,41 @@ fn dropping_a_relation_that_is_not_there_names_the_pair() {
         })
         .unwrap_err();
     assert!(err.contains("no `CL ~ WT` relation"), "{err}");
+}
+
+#[test]
+fn dropping_a_relation_prunes_only_its_own_generated_theta_family() {
+    // `THETA_CL_WT2` starts with `THETA_CL_WT` but belongs to a different
+    // covariate: a raw prefix test keeps it alive after its own relation is
+    // dropped, and the candidate reports a parameter it never estimates.
+    let src = BASE
+        .replace(
+            "[covariates]",
+            "[covariate_model]\n  CL ~ WT power(center = median)\n  CL ~ WT2 power(center = \
+             median)\n\n[covariates]",
+        )
+        .replace(
+            "  theta TVKA(1.5, 0.01, 50.0)",
+            "  theta TVKA(1.5, 0.01, 50.0)\n  theta THETA_CL_WT(0.75, 0.01, 5.0)\n  theta \
+             THETA_CL_WT2(0.5, 0.01, 5.0)",
+        );
+    let mut text = ModelText::parse(&src).unwrap();
+    apply(
+        &mut text,
+        ModelEdit::DropCovariateRelation {
+            param: "CL".into(),
+            cov: "WT2".into(),
+        },
+    );
+    let params = text.block_lines("parameters");
+    assert!(
+        params.iter().any(|l| l.starts_with("theta THETA_CL_WT(")),
+        "{params:?}"
+    );
+    assert!(
+        !params.iter().any(|l| l.contains("THETA_CL_WT2")),
+        "{params:?}"
+    );
 }
 
 // ── SetStructural ──────────────────────────────────────────────────────────
@@ -831,6 +976,32 @@ fn set_structural_refuses_to_prune_through_a_conditional_individual_parameters_b
     assert!(err.contains("`Q`"), "{err}");
     assert!(err.contains("if"), "{err}");
     assert_eq!(text.render(), before);
+}
+
+#[test]
+fn set_structural_shrinks_a_multi_line_block_omega() {
+    // The shipped multi-line form, narrowed: the block is one declaration, so
+    // it is rewritten as one and its continuation lines go with it.
+    let src = TWO_CPT
+        .replace("  omega ETA_CL ~ 0.15\n", "")
+        .replace("  omega ETA_V1 ~ 0.15\n", "")
+        .replace("  omega ETA_Q  ~ 0.08\n", "")
+        .replace(
+            "  omega ETA_V2 ~ 0.08\n",
+            "  block_omega (ETA_CL, ETA_V1, ETA_Q, ETA_V2) = [\n    0.15,\n    0.05, 0.15,\n              0.0, 0.0, 0.08,\n    0.0, 0.0, 0.02, 0.08\n  ]\n",
+        );
+    let mut text = ModelText::parse(&src).unwrap();
+    apply(&mut text, narrow_to_one_cpt());
+    let params = text.block_lines("parameters");
+    assert!(
+        params.contains(&"block_omega (ETA_CL, ETA_V1) = [0.15, 0.05, 0.15]".to_string()),
+        "{params:?}"
+    );
+    // No orphaned continuation line survives anywhere in the file.
+    let rendered = text.render();
+    for gone in ["ETA_Q", "ETA_V2", "0.02"] {
+        assert!(!rendered.contains(gone), "`{gone}` survived:\n{rendered}");
+    }
 }
 
 // ── SetErrorModel ──────────────────────────────────────────────────────────
@@ -1079,6 +1250,24 @@ fn seed_inits_fills_a_block_omega_from_the_fitted_submatrix() {
         "{:?}",
         text.block_lines("parameters")
     );
+}
+
+#[test]
+fn seed_inits_fills_a_multi_line_block_omega() {
+    let mut text = ModelText::parse(&multi_line_block_base()).unwrap();
+    let mut fit = fit_with(&[], &[], &["ETA_CL", "ETA_V"], &[0.5, 0.6], &[], &[]);
+    fit.omega[(1, 0)] = 0.25;
+    fit.omega[(0, 1)] = 0.25;
+    apply(&mut text, ModelEdit::SeedInits(&fit));
+    assert!(
+        text.block_lines("parameters")
+            .contains(&"block_omega (ETA_CL, ETA_V) = [0.5, 0.25, 0.6]".to_string()),
+        "{:?}",
+        text.block_lines("parameters")
+    );
+    // The old triangle's continuation lines are gone, not left below the
+    // rewritten declaration.
+    assert!(!text.render().contains("0.006"), "{}", text.render());
 }
 
 // ── Number formatting ──────────────────────────────────────────────────────

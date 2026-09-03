@@ -5,7 +5,8 @@
 //! search loop that recovers from a bad proposal would carry a half-written
 //! model into the next candidate.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -89,7 +90,7 @@ fn set_structural(text: &mut ModelText, spec: &StructuralSpec) -> Result<(), Str
         }
     }
 
-    let Some(pk_line) = find_line(text, "structural_model", |c| PK_RE.is_match(c)) else {
+    let Some((pk_span, _)) = find_decl(text, "structural_model", |c| PK_RE.is_match(c)) else {
         return Err(
             "ferx-core::edit: SetStructural needs a `pk NAME(...)` line in [structural_model]. \
              An `ode(...)` or algebraic model has no template to swap — edit its [odes] block \
@@ -102,7 +103,7 @@ fn set_structural(text: &mut ModelText, spec: &StructuralSpec) -> Result<(), Str
     let existing = individual_parameter_names(text);
     let mut to_create = Vec::new();
     for (role, var) in &spec.bindings {
-        if existing.contains_key(var) {
+        if existing.contains(var) {
             continue;
         }
         match spec.new_parameters.iter().find(|p| &p.name == var) {
@@ -125,10 +126,11 @@ fn set_structural(text: &mut ModelText, spec: &StructuralSpec) -> Result<(), Str
         .iter()
         .map(|(role, var)| format!("{role}={var}"))
         .collect();
-    text.set_code(
-        pk_line,
+    let stale = text.set_span(
+        &pk_span,
         &format!("pk {}({})", spec.template, pairs.join(", ")),
     );
+    text.delete_lines(stale);
 
     for p in to_create {
         let rhs = match &p.iiv {
@@ -165,7 +167,7 @@ fn add_covariate_relation(text: &mut ModelText, rel: &Relation) -> Result<(), St
     if let Some(v) = rel.fix {
         finite(v, "`fix`")?;
     }
-    if find_relation_line(text, &rel.parameter, &rel.covariate).is_some() {
+    if find_relation_decl(text, &rel.parameter, &rel.covariate).is_some() {
         return Err(format!(
             "ferx-core::edit: [covariate_model] already declares `{} ~ {}` — one line per \
              (parameter, covariate) pair. Drop it first if you mean to change its form.",
@@ -177,12 +179,12 @@ fn add_covariate_relation(text: &mut ModelText, rel: &Relation) -> Result<(), St
 }
 
 fn drop_covariate_relation(text: &mut ModelText, param: &str, cov: &str) -> Result<(), String> {
-    let Some(line) = find_relation_line(text, param, cov) else {
+    let Some(span) = find_relation_decl(text, param, cov) else {
         return Err(format!(
             "ferx-core::edit: [covariate_model] declares no `{param} ~ {cov}` relation to drop"
         ));
     };
-    text.delete_lines(vec![line]);
+    text.delete_lines(span.collect());
     // An explicit `=> THETA(...)` clause may have deferred to a θ declared in
     // [parameters]; that θ is now unreferenced and would fail the parser's
     // "declared but never used" check.
@@ -194,26 +196,27 @@ fn drop_covariate_relation(text: &mut ModelText, param: &str, cov: &str) -> Resu
 /// Reads only as far as the pair — the form and the `=> …` clause are the
 /// parser's business, and a relation this cannot address is one the parser
 /// would reject anyway.
-fn find_relation_line(text: &ModelText, param: &str, cov: &str) -> Option<usize> {
-    find_line(text, "covariate_model", |code| {
+fn find_relation_decl(text: &ModelText, param: &str, cov: &str) -> Option<Range<usize>> {
+    find_decl(text, "covariate_model", |code| {
         let body = code.split("=>").next().unwrap_or(code);
         let Some((p, rest)) = body.split_once('~') else {
             return false;
         };
         p.trim() == param && rest.trim().split_whitespace().next() == Some(cov)
     })
+    .map(|(span, _)| span)
 }
 
 // ── η surgery ───────────────────────────────────────────────────────────────
 
 fn add_iiv(text: &mut ModelText, param: &str, form: &IivForm) -> Result<(), String> {
     finite(form.variance(), &format!("`omega {}` variance", form.eta()))?;
-    let Some((line, rhs)) = find_assignment(text, param) else {
+    let Some((span, rhs)) = find_assignment(text, param) else {
         return Err(format!(
             "ferx-core::edit: [individual_parameters] declares no `{param}` to give an η to"
         ));
     };
-    if omega_decl_line(text, form.eta()).is_some() {
+    if omega_decl(text, form.eta()).is_some() {
         return Err(format!(
             "ferx-core::edit: `omega {}` is already declared",
             form.eta()
@@ -222,11 +225,10 @@ fn add_iiv(text: &mut ModelText, param: &str, form: &IivForm) -> Result<(), Stri
     // `OMEGA_RE` is anchored on `omega`, so it does not see an η that a
     // `block_omega` declares — appending a diagonal `omega` for one would
     // declare the same random effect twice.
-    if let Some(block) = block_omega_line_for(text, form.eta()) {
+    if let Some((_, block)) = block_omega_decl(text, form.eta()) {
         return Err(format!(
-            "ferx-core::edit: `{}` is already declared by `{}`",
-            form.eta(),
-            text.code(block)
+            "ferx-core::edit: `{}` is already declared by `{block}`",
+            form.eta()
         ));
     }
     if let Some(existing) = declared_etas(text).iter().find(|e| mentions(&rhs, e)) {
@@ -247,7 +249,8 @@ fn add_iiv(text: &mut ModelText, param: &str, form: &IivForm) -> Result<(), Stri
         IivForm::Additive { eta, .. } => format!("{rhs} + {eta}"),
     };
 
-    text.set_code(line, &format!("{param} = {new_rhs}"));
+    let stale = text.set_span(&span, &format!("{param} = {new_rhs}"));
+    text.delete_lines(stale);
     text.append_to_block(
         "parameters",
         &format!("omega {} ~ {}", form.eta(), num(form.variance())),
@@ -256,7 +259,7 @@ fn add_iiv(text: &mut ModelText, param: &str, form: &IivForm) -> Result<(), Stri
 }
 
 fn drop_iiv(text: &mut ModelText, param: &str) -> Result<(), String> {
-    let Some((line, rhs)) = find_assignment(text, param) else {
+    let Some((span, rhs)) = find_assignment(text, param) else {
         return Err(format!(
             "ferx-core::edit: [individual_parameters] declares no `{param}` to take an η from"
         ));
@@ -278,21 +281,31 @@ fn drop_iiv(text: &mut ModelText, param: &str) -> Result<(), String> {
              one by rewriting the line would be a guess about which."
         ));
     }
-    if let Some(block) = block_omega_line_for(text, &eta) {
+    if let Some((_, block)) = block_omega_decl(text, &eta) {
         return Err(format!(
-            "ferx-core::edit: `{eta}` is part of `{}` — a block_omega cannot have one η removed \
-             from it by line surgery. Redeclare the block without `{eta}` first.",
-            text.code(block)
+            "ferx-core::edit: `{eta}` is part of `{block}` — a block_omega cannot have one η \
+             removed from it by line surgery. Redeclare the block without `{eta}` first."
         ));
     }
-    let Some(omega) = omega_decl_line(text, &eta) else {
+    let Some((omega, _)) = omega_decl(text, &eta) else {
         return Err(format!(
             "ferx-core::edit: `{param}` uses `{eta}`, which has no `omega {eta} ~ …` declaration"
         ));
     };
 
-    text.set_code(line, &format!("{param} = {head}"));
-    text.delete_lines(vec![omega]);
+    let mut stale = text.set_span(&span, &format!("{param} = {head}"));
+    // The declaration goes only if nothing else still reads the η. Two
+    // parameters may legally share one — `CL = TVCL * exp(ETA_SIZE)` beside
+    // `V = TVV * exp(ETA_SIZE)` — and deleting it on the first `DropIiv` would
+    // leave the other expression with a random effect the model never declares.
+    // The check runs on the rewritten text, and skips the lines that are on
+    // their way out: they still carry the η this edit just removed.
+    let mut skip: Vec<usize> = omega.clone().collect();
+    skip.extend(stale.iter().copied());
+    if !text.identifiers_excluding(&skip).contains(&eta) {
+        stale.extend(omega);
+    }
+    text.delete_lines(stale);
     Ok(())
 }
 
@@ -432,25 +445,43 @@ fn set_omega_block(text: &mut ModelText, names: &[String]) -> Result<(), String>
     // in the caller's argument order — is what keeps each one's index in the
     // omega matrix, and therefore the meaning of every `eta_names` position, as
     // it was before the block.
-    let mut slots: Vec<(usize, &str, f64)> = Vec::with_capacity(names.len());
+    let mut slots: Vec<(Range<usize>, &str, f64, bool)> = Vec::with_capacity(names.len());
     for n in names {
-        if let Some(b) = block_omega_line_for(text, n) {
+        if let Some((_, block)) = block_omega_decl(text, n) {
             return Err(format!(
-                "ferx-core::edit: `{n}` is already blocked by `{}`",
-                text.code(b)
+                "ferx-core::edit: `{n}` is already blocked by `{block}`"
             ));
         }
-        let Some(i) = omega_decl_line(text, n) else {
+        let Some((span, code)) = omega_decl(text, n) else {
             return Err(format!(
                 "ferx-core::edit: [parameters] declares no `omega {n} ~ …` to block"
             ));
         };
-        slots.push((i, n.as_str(), omega_variance(text.code(i))?));
+        let variance = omega_variance(&code)?;
+        slots.push((span, n.as_str(), variance, FIX_RE.is_match(&code)));
     }
-    slots.sort_by_key(|(i, _, _)| *i);
-    let lines: Vec<usize> = slots.iter().map(|(i, _, _)| *i).collect();
-    let ordered: Vec<&str> = slots.iter().map(|(_, n, _)| *n).collect();
-    let variances: Vec<f64> = slots.iter().map(|(_, _, v)| *v).collect();
+    slots.sort_by_key(|(span, _, _, _)| span.start);
+    let ordered: Vec<&str> = slots.iter().map(|(_, n, _, _)| *n).collect();
+    let variances: Vec<f64> = slots.iter().map(|(_, _, v, _)| *v).collect();
+    // `FIX` is a block-level flag: one `block_omega` cannot fix some of its
+    // entries and estimate the others. Dropping it silently would turn fixed
+    // covariance parameters into estimated ones — a different model, and one
+    // whose extra parameters the search would not know it had added.
+    let fixed = slots.iter().filter(|(_, _, _, f)| *f).count();
+    if fixed != 0 && fixed != slots.len() {
+        let free: Vec<&str> = slots
+            .iter()
+            .filter(|(_, _, _, f)| !f)
+            .map(|(_, n, _, _)| *n)
+            .collect();
+        return Err(format!(
+            "ferx-core::edit: {} of the η to block are `FIX`ed and {} are not ({}). `FIX` is a \
+             block-level flag, so a mixed block cannot be written; fix or free them all first.",
+            fixed,
+            free.len(),
+            free.join(", ")
+        ));
+    }
 
     let mut tri = Vec::new();
     for (i, vi) in variances.iter().enumerate() {
@@ -461,14 +492,20 @@ fn set_omega_block(text: &mut ModelText, names: &[String]) -> Result<(), String>
     }
     let values: Vec<String> = tri.iter().map(|v| num(*v)).collect();
     let decl = format!(
-        "block_omega ({}) = [{}]",
+        "block_omega ({}) = [{}]{}",
         ordered.join(", "),
-        values.join(", ")
+        values.join(", "),
+        if fixed > 0 { " FIX" } else { "" }
     );
 
-    let first = *lines.iter().min().expect("names is non-empty");
-    text.set_code(first, &decl);
-    text.delete_lines(lines.into_iter().filter(|i| *i != first).collect());
+    // `slots` is in source order, so the first declaration is the one the
+    // block takes the place of.
+    let (first, rest) = slots.split_first().expect("names is non-empty");
+    let mut stale = text.set_span(&first.0, &decl);
+    for (span, ..) in rest {
+        stale.extend(span.clone());
+    }
+    text.delete_lines(stale);
     Ok(())
 }
 
@@ -506,24 +543,19 @@ fn set_error_model(text: &mut ModelText, spec: &ErrorSpecText) -> Result<(), Str
     // correlated σ block would have the new σ *appended* beside it rather than
     // reconciled with it, leaving the model with more σ than the error model
     // names.
-    if let Some(i) = find_line(text, "parameters", |c| BLOCK_SIGMA_RE.is_match(c)) {
+    if let Some((_, block)) = find_decl(text, "parameters", |c| BLOCK_SIGMA_RE.is_match(c)) {
         return Err(format!(
-            "ferx-core::edit: [parameters] declares σ as `{}`. SetErrorModel lays σ out \
-             positionally and cannot reconcile a correlated σ block; edit [parameters] by hand.",
-            text.code(i)
+            "ferx-core::edit: [parameters] declares σ as `{block}`. SetErrorModel lays σ out \
+             positionally and cannot reconcile a correlated σ block; edit [parameters] by hand."
         ));
     }
-    let existing: Vec<usize> = text
-        .body_indices("error_model")
-        .into_iter()
-        .filter(|i| !text.code(*i).is_empty())
-        .collect();
+    let existing = text.logical_lines("error_model");
     // A per-CMT or covariate-selected block describes endpoints this edit does
     // not know about; replacing it wholesale would drop them silently.
     if existing.len() > 1
         || existing
             .iter()
-            .any(|i| text.code(*i).contains("CMT") || text.code(*i).starts_with("if"))
+            .any(|(_, c)| c.contains("CMT") || c.starts_with("if"))
     {
         return Err(
             "ferx-core::edit: [error_model] is a per-CMT or covariate-selected block. \
@@ -541,7 +573,10 @@ fn set_error_model(text: &mut ModelText, spec: &ErrorSpecText) -> Result<(), Str
         names.join(", ")
     );
     match existing.first() {
-        Some(i) => text.set_code(*i, &stmt),
+        Some((span, _)) => {
+            let stale = text.set_span(span, &stmt);
+            text.delete_lines(stale);
+        }
         None => text.append_to_block("error_model", &stmt),
     }
 
@@ -552,10 +587,10 @@ fn set_error_model(text: &mut ModelText, spec: &ErrorSpecText) -> Result<(), Str
     // in the order the statement names them, or the model does not parse (and,
     // for `combined`, a spelling that did parse would have swapped which σ is
     // the proportional component).
-    let slots: Vec<usize> = text
-        .body_indices("parameters")
+    let slots: Vec<(Range<usize>, String)> = text
+        .logical_lines("parameters")
         .into_iter()
-        .filter(|i| SIGMA_RE.is_match(text.code(*i)))
+        .filter(|(_, c)| SIGMA_RE.is_match(c))
         .collect();
     let wanted: Vec<String> = spec
         .sigmas
@@ -566,18 +601,22 @@ fn set_error_model(text: &mut ModelText, spec: &ErrorSpecText) -> Result<(), Str
             // `SetErrorModel` is not the edit that changes them.
             slots
                 .iter()
-                .map(|i| text.code(*i).to_string())
+                .map(|(_, c)| c.clone())
                 .find(|c| SIGMA_RE.captures(c).is_some_and(|m| m[2] == s.name))
                 .unwrap_or_else(|| s.render())
         })
         .collect();
-    for (slot, code) in slots.iter().zip(&wanted) {
-        text.set_code(*slot, code);
+    let mut stale = Vec::new();
+    for ((span, _), code) in slots.iter().zip(&wanted) {
+        stale.extend(text.set_span(span, code));
     }
     // σ the previous error model referenced and this one does not are dead.
     // The parser does not reject an unused σ, so leaving one behind would have
     // the candidate report a parameter it never estimates.
-    text.delete_lines(slots.iter().skip(wanted.len()).copied().collect());
+    for (span, _) in slots.iter().skip(wanted.len()) {
+        stale.extend(span.clone());
+    }
+    text.delete_lines(stale);
     for code in wanted.iter().skip(slots.len()) {
         text.append_to_block("parameters", code);
     }
@@ -608,8 +647,8 @@ fn seed_inits(text: &mut ModelText, fit: &FitResult) -> Result<(), String> {
 
     // A `FIX`ed parameter is a statement about the model, not an estimate to
     // carry over; a vector θ (`theta NAME[...]`) has no single init to write.
-    for i in text.body_indices("parameters") {
-        let code = text.code(i).to_string();
+    let mut stale = Vec::new();
+    for (span, code) in text.logical_lines("parameters") {
         if FIX_RE.is_match(&code) {
             continue;
         }
@@ -619,7 +658,7 @@ fn seed_inits(text: &mut ModelText, fit: &FitResult) -> Result<(), String> {
             // for free, which is right: it has no single init to write.
             if let Some(v) = theta.get(&caps[2]).copied().filter(|v| v.is_finite()) {
                 let new = format!("{}{}{}", &caps[1], num(v), &caps[4]);
-                text.set_code(i, &new);
+                stale.extend(text.set_span(&span, &new));
             }
         } else if let Some(caps) = OMEGA_RE.captures(&code) {
             let Some(k) = eta_index.get(&caps[2]).copied() else {
@@ -636,14 +675,14 @@ fn seed_inits(text: &mut ModelText, fit: &FitResult) -> Result<(), String> {
             } else {
                 var
             };
-            text.set_code(i, &format!("{}{}{}", &caps[1], num(value), &caps[4]));
+            stale.extend(text.set_span(&span, &format!("{}{}{}", &caps[1], num(value), &caps[4])));
         } else if let Some(caps) = SIGMA_RE.captures(&code) {
             // `FitResult::sigma` is on the SD scale throughout the engine.
             let Some(sd) = sigma.get(&caps[2]).copied().filter(|v| v.is_finite()) else {
                 continue;
             };
             let value = if SD_RE.is_match(&code) { sd } else { sd * sd };
-            text.set_code(i, &format!("{}{}{}", &caps[1], num(value), &caps[4]));
+            stale.extend(text.set_span(&span, &format!("{}{}{}", &caps[1], num(value), &caps[4])));
         } else if let Some(caps) = BLOCK_OMEGA_RE.captures(&code) {
             let names: Vec<String> = caps[2]
                 .split(',')
@@ -665,12 +704,13 @@ fn seed_inits(text: &mut ModelText, fit: &FitResult) -> Result<(), String> {
                 continue;
             }
             let values: Vec<String> = tri.iter().map(|v| num(*v)).collect();
-            text.set_code(
-                i,
+            stale.extend(text.set_span(
+                &span,
                 &format!("{}[{}]{}", &caps[1], values.join(", "), &caps[4]),
-            );
+            ));
         }
     }
+    text.delete_lines(stale);
     Ok(())
 }
 
@@ -718,34 +758,43 @@ fn find_line(text: &ModelText, block: &str, pred: impl Fn(&str) -> bool) -> Opti
         .find(|i| pred(text.code(*i)))
 }
 
-/// `[individual_parameters]` names in source order, mapped to their line.
-fn individual_parameter_names(text: &ModelText) -> HashMap<String, usize> {
-    let mut out = HashMap::new();
-    for i in text.body_indices("individual_parameters") {
-        if let Some(caps) = ASSIGN_RE.captures(text.code(i)) {
-            out.entry(caps[1].to_string()).or_insert(i);
-        }
-    }
-    out
+/// The first declaration of `block` whose *logical* text satisfies `pred` —
+/// the span it occupies and that text.
+fn find_decl(
+    text: &ModelText,
+    block: &str,
+    pred: impl Fn(&str) -> bool,
+) -> Option<(Range<usize>, String)> {
+    text.logical_lines(block)
+        .into_iter()
+        .find(|(_, code)| pred(code))
 }
 
-fn find_assignment(text: &ModelText, param: &str) -> Option<(usize, String)> {
-    text.body_indices("individual_parameters")
+/// The names `[individual_parameters]` assigns.
+fn individual_parameter_names(text: &ModelText) -> HashSet<String> {
+    text.logical_lines("individual_parameters")
+        .iter()
+        .filter_map(|(_, code)| ASSIGN_RE.captures(code).map(|c| c[1].to_string()))
+        .collect()
+}
+
+fn find_assignment(text: &ModelText, param: &str) -> Option<(Range<usize>, String)> {
+    text.logical_lines("individual_parameters")
         .into_iter()
-        .find_map(|i| {
-            let caps = ASSIGN_RE.captures(text.code(i))?;
-            (&caps[1] == param).then(|| (i, caps[2].trim().to_string()))
+        .find_map(|(span, code)| {
+            let caps = ASSIGN_RE.captures(&code)?;
+            (&caps[1] == param).then(|| (span.clone(), caps[2].trim().to_string()))
         })
 }
 
-fn omega_decl_line(text: &ModelText, eta: &str) -> Option<usize> {
-    find_line(text, "parameters", |c| {
+fn omega_decl(text: &ModelText, eta: &str) -> Option<(Range<usize>, String)> {
+    find_decl(text, "parameters", |c| {
         OMEGA_RE.captures(c).is_some_and(|m| &m[2] == eta)
     })
 }
 
-fn block_omega_line_for(text: &ModelText, eta: &str) -> Option<usize> {
-    find_line(text, "parameters", |c| {
+fn block_omega_decl(text: &ModelText, eta: &str) -> Option<(Range<usize>, String)> {
+    find_decl(text, "parameters", |c| {
         BLOCK_OMEGA_RE
             .captures(c)
             .is_some_and(|m| m[2].split(',').any(|n| n.trim() == eta))
@@ -755,11 +804,10 @@ fn block_omega_line_for(text: &ModelText, eta: &str) -> Option<usize> {
 /// Every η the model declares — diagonal `omega` and `block_omega` alike.
 fn declared_etas(text: &ModelText) -> Vec<String> {
     let mut out = Vec::new();
-    for i in text.body_indices("parameters") {
-        let code = text.code(i);
-        if let Some(caps) = OMEGA_RE.captures(code) {
+    for (_, code) in text.logical_lines("parameters") {
+        if let Some(caps) = OMEGA_RE.captures(&code) {
             out.push(caps[2].to_string());
-        } else if let Some(caps) = BLOCK_OMEGA_RE.captures(code) {
+        } else if let Some(caps) = BLOCK_OMEGA_RE.captures(&code) {
             out.extend(
                 caps[2]
                     .split(',')
@@ -804,6 +852,14 @@ fn mentions(expr: &str, name: &str) -> bool {
 /// parse error, it is a flat direction in the omega matrix and an extra
 /// `n_parameters`, which is a wrong BIC for the search that ranks on it.
 fn prune_unreferenced(text: &mut ModelText) -> Result<(), String> {
+    /// One declaration the pruner can delete: what it declares, the lines it
+    /// occupies, and its logical text.
+    struct Decl {
+        name: String,
+        span: Range<usize>,
+        code: String,
+    }
+
     // An `if`/`else` in [individual_parameters] puts an assignment inside a
     // branch, where "this line declares this name" stops being true. The
     // assignments are still read as declarations — treating them as roots
@@ -817,84 +873,91 @@ fn prune_unreferenced(text: &mut ModelText) -> Result<(), String> {
         c.starts_with("if") || c.starts_with("else") || c.contains('{') || c.contains('}')
     });
 
-    // Declaration lines, by what they declare. Everything else in the file is
-    // a consumer and therefore a root.
-    let mut decls: Vec<(String, usize)> = Vec::new();
-    let mut relations: Vec<(String, usize)> = Vec::new();
-    // `block_omega (A, B) = […]` declares several η on one line, and declares
-    // them nowhere else — so it has to be excluded from the root scan like any
-    // other declaration, or each η it names would keep *itself* alive.
-    let mut blocks: Vec<(Vec<String>, usize)> = Vec::new();
-    for i in text.body_indices("parameters") {
-        let code = text.code(i);
-        if let Some(caps) = THETA_RE.captures(code) {
-            decls.push((caps[2].to_string(), i));
-        } else if let Some(caps) = OMEGA_RE.captures(code) {
-            decls.push((caps[2].to_string(), i));
-        } else if let Some(caps) = BLOCK_OMEGA_RE.captures(code) {
-            let names: Vec<String> = caps[2]
+    // Declarations, by what they declare. Everything else in the file is a
+    // consumer and therefore a root.
+    let mut decls: Vec<Decl> = Vec::new();
+    let mut relations: Vec<Decl> = Vec::new();
+    // `block_omega (A, B) = […]` declares several η in one statement, and
+    // declares them nowhere else — so it has to be excluded from the root scan
+    // like any other declaration, or each η it names would keep *itself* alive.
+    let mut blocks: Vec<(Vec<String>, Range<usize>, String)> = Vec::new();
+    for (span, code) in text.logical_lines("parameters") {
+        let declared = THETA_RE
+            .captures(&code)
+            .or_else(|| OMEGA_RE.captures(&code))
+            .map(|caps| caps[2].to_string());
+        if let Some(name) = declared {
+            decls.push(Decl { name, span, code });
+            continue;
+        }
+        let names = BLOCK_OMEGA_RE.captures(&code).map(|caps| {
+            caps[2]
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
-                .collect();
-            if !names.is_empty() {
-                blocks.push((names, i));
-            }
+                .collect::<Vec<String>>()
+        });
+        if let Some(names) = names.filter(|n| !n.is_empty()) {
+            blocks.push((names, span, code));
         }
     }
-    for i in &individual {
-        if let Some(caps) = ASSIGN_RE.captures(text.code(*i)) {
-            decls.push((caps[1].to_string(), *i));
-        }
-    }
-    for i in text.body_indices("covariate_model") {
-        let code = text.code(i);
-        if code.is_empty() {
+    for (span, code) in text.logical_lines("individual_parameters") {
+        let Some(name) = ASSIGN_RE.captures(&code).map(|caps| caps[1].to_string()) else {
             continue;
-        }
-        let body = code.split("=>").next().unwrap_or(code);
-        if let Some((p, _)) = body.split_once('~') {
-            relations.push((p.trim().to_string(), i));
-        }
+        };
+        decls.push(Decl { name, span, code });
+    }
+    for (span, code) in text.logical_lines("covariate_model") {
+        let body = code.split("=>").next().unwrap_or(&code);
+        let Some(name) = body.split_once('~').map(|(p, _)| p.trim().to_string()) else {
+            continue;
+        };
+        relations.push(Decl { name, span, code });
     }
 
-    let mut declaration_lines: Vec<usize> = decls.iter().map(|(_, i)| *i).collect();
-    declaration_lines.extend(relations.iter().map(|(_, i)| *i));
-    declaration_lines.extend(blocks.iter().map(|(_, i)| *i));
+    let mut declaration_lines: Vec<usize> = Vec::new();
+    for d in decls.iter().chain(relations.iter()) {
+        declaration_lines.extend(d.span.clone());
+    }
+    for (_, span, _) in &blocks {
+        declaration_lines.extend(span.clone());
+    }
     let mut live = text.identifiers_excluding(&declaration_lines);
 
     // Grow the live set: a live name pulls in whatever its declaration reads.
     loop {
         let before = live.len();
-        for (name, i) in decls.iter().chain(relations.iter()) {
-            if !live.contains(name) {
+        for d in decls.iter().chain(relations.iter()) {
+            if !live.contains(&d.name) {
                 continue;
             }
-            for m in super::IDENT_RE.find_iter(text.code(*i)) {
+            for m in super::IDENT_RE.find_iter(&d.code) {
                 live.insert(m.as_str().to_string());
             }
         }
         // A relation's θ is *generated* — `THETA_<PARAM>_<COV>` and its
         // `_LO`/`_HI`/`_<LEVEL>` variants never appear in the block text — so a
         // `[parameters]` declaration the desugar would defer to has no textual
-        // reference to keep it alive. Protect the whole family by prefix.
-        for (param, i) in &relations {
-            if !live.contains(param) {
+        // reference to keep it alive. Protect that family, and only it: a raw
+        // prefix test also matches `THETA_CL_WT2`, which belongs to a *different*
+        // covariate and must still die when its own relation is dropped.
+        for r in &relations {
+            if !live.contains(&r.name) {
                 continue;
             }
-            let code = text.code(*i);
-            let body = code.split("=>").next().unwrap_or(code);
+            let body = r.code.split("=>").next().unwrap_or(&r.code);
             let Some((_, rest)) = body.split_once('~') else {
                 continue;
             };
             let Some(cov) = rest.trim().split_whitespace().next() else {
                 continue;
             };
-            let prefix = format!("THETA_{param}_{cov}");
+            let base = format!("THETA_{}_{}", r.name, cov);
+            let variant = format!("{base}_");
             let generated: Vec<String> = decls
                 .iter()
-                .map(|(n, _)| n.clone())
-                .filter(|n| n.starts_with(&prefix))
+                .map(|d| d.name.clone())
+                .filter(|n| *n == base || n.starts_with(&variant))
                 .collect();
             live.extend(generated);
         }
@@ -903,27 +966,27 @@ fn prune_unreferenced(text: &mut ModelText) -> Result<(), String> {
         }
     }
 
-    let dead: Vec<(&str, usize)> = decls
+    let dead: Vec<&Decl> = decls
         .iter()
         .chain(relations.iter())
-        .filter(|(name, _)| !live.contains(name))
-        .map(|(name, i)| (name.as_str(), *i))
+        .filter(|d| !live.contains(&d.name))
         .collect();
     if conditional {
-        if let Some((name, _)) = dead.iter().find(|(_, i)| individual.contains(i)) {
+        if let Some(d) = dead.iter().find(|d| individual.contains(&d.span.start)) {
             return Err(format!(
-                "ferx-core::edit: `{name}` in [individual_parameters] is no longer referenced, \
-                 but the block contains an `if`/`else`, so removing a line from it would be a \
-                 guess about the branch. Edit [individual_parameters] by hand."
+                "ferx-core::edit: `{}` in [individual_parameters] is no longer referenced, but \
+                 the block contains an `if`/`else`, so removing a line from it would be a guess \
+                 about the branch. Edit [individual_parameters] by hand.",
+                d.name
             ));
         }
     }
-    let mut dead_lines: Vec<usize> = dead.into_iter().map(|(_, i)| i).collect();
+    let mut dead_lines: Vec<usize> = dead.iter().flat_map(|d| d.span.clone()).collect();
 
     // A `block_omega` that lost an η is rewritten around the ones that are
     // left, rather than kept whole (a random effect no parameter uses) or
     // deleted whole (which would take the live η with it).
-    for (names, i) in &blocks {
+    for (names, span, code) in &blocks {
         let keep: Vec<usize> = (0..names.len())
             .filter(|k| live.contains(&names[*k]))
             .collect();
@@ -931,11 +994,11 @@ fn prune_unreferenced(text: &mut ModelText) -> Result<(), String> {
             continue;
         }
         if keep.is_empty() {
-            dead_lines.push(*i);
+            dead_lines.extend(span.clone());
             continue;
         }
-        let decl = shrink_omega_block(text.code(*i), names, &keep)?;
-        text.set_code(*i, &decl);
+        let decl = shrink_omega_block(code, names, &keep)?;
+        dead_lines.extend(text.set_span(span, &decl));
     }
 
     text.delete_lines(dead_lines);

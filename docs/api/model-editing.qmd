@@ -42,7 +42,7 @@ a search loop can propose, be refused, and move on.
 | `DropCovariateRelation { param, cov }` | removes that line and any θ it orphans |
 | `AddIiv { param, form }` | the `exp(ETA_P)` factor and its `omega` declaration |
 | `DropIiv { param }` | removes both |
-| `SetOmegaBlock(names)` | replaces the named diagonal `omega` declarations with one `block_omega` |
+| `SetOmegaBlock(names)` | replaces the named diagonal `omega` declarations with one `block_omega`, in declaration order |
 | `SetErrorModel(ErrorSpecText)` | the `[error_model]` statement, reconciling σ declarations |
 | `SeedInits(&FitResult)` | new initial estimates for every θ/ω/σ the fit names |
 | `SetFitOption { key, value }` | one `[fit_options]` key |
@@ -117,7 +117,19 @@ ferx-core::edit: `CL = TVCL * (1 + ETA_CL) + 0.5` is not in the canonical form
 
 The same applies to `block_omega`: an η that has been blocked with another
 cannot be removed by line surgery, because the block's lower triangle is not
-addressable one η at a time. Redeclare the block first.
+addressable one η at a time. Redeclare the block first. (Structural pruning
+*does* rewrite a block, because there the whole triangle is being recomputed —
+see above.)
+
+`DropIiv` removes the `omega` declaration only when nothing else still reads
+the η. Two parameters may legally share one, and taking the declaration away on
+the first drop would leave the second expression with a random effect the model
+never declares.
+
+A declaration written over several lines — the multi-line `block_omega` that
+`prepare_frem()` emits, an expression broken around a binary operator — is one
+declaration here, exactly as the parser rejoins it. It is rewritten as one, and
+its continuation lines go with it.
 
 ### Seeding initial estimates
 
