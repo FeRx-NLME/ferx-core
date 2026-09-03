@@ -259,7 +259,7 @@ fn a_joint_steady_state_fit_does_not_bank_the_run_in_into_the_objective() {
     // horizon as `saveat.iter().fold(0.0, f64::max)`, so such a grid builds no segment and the
     // rows keep their `f64::NAN` prefill. Not a single-point problem — measured:
     // `[0.0] -> NaN`, `[0.0, 0.0] -> NaN`, but `[1.0] -> 0.02` and `[12.0] -> 0.24` are fine,
-    // and `[0.0, 1.0] -> [0.0, 0.02]`. Tracked separately; do not shorten this grid.
+    // and `[0.0, 1.0] -> [0.0, 0.02]`. Tracked as #1218; do not shorten this grid.
     let mut probe = vec![0.0];
     probe.extend_from_slice(&GRID);
     let sv = predict_survival(&m, &pop, &m.default_params, &probe);
