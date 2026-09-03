@@ -9984,3 +9984,148 @@ fn ode_tad_rhs_zero_order_end_inside_a_covariate_step_matches_production() {
     check_vs_production(&model, &subject, &theta, &eta);
     check_inner_outer_eta_parity(&model, &subject, &theta, &eta);
 }
+
+/// A joint PK-TTE model (`d/dt(__chz_<cmt>)` accumulators) under a steady-state dose must
+/// decline **at the scope gate**, so the caller drops to FD rather than reaching a dual SS
+/// equilibration that has no accumulator handling (#1210).
+///
+/// This is the routing CLAUDE.md requires to be unit-tested: a scope gap here does not fail
+/// loudly, it silently returns a jet in which the run-in's hazard has been cycled into
+/// `d/deta` exactly as the f64 path did before #1210.
+///
+/// **How the gap was found, since it says what this test is really for.** The fit itself never
+/// used that jet — `inner_optimizer` routes every `[event_model]` model to the FD inner
+/// gradient — but `fd_fallback_warning` probes `subject_eta_grad` to count fallbacks, and the
+/// probe reached the dual SS equilibration for real. The predicates were reporting these
+/// subjects as *analytic* while the fit ran FD, which is precisely the mislabel that warning
+/// exists to catch. Nothing saw it until a Tier-3 convergence fit ran: every `ss_chz_*` anchor
+/// fixture routes to FD, so no anchor, no `--lib` run and no CI job could observe the dual
+/// path at all.
+///
+/// **Both straddles are asserted**, or the test would pass on a predicate that always declines:
+/// the same model without an SS dose stays in scope, and an SS dose on a model with no
+/// accumulator stays in scope.
+#[test]
+fn a_joint_pktte_subject_under_ss_declines_to_fd_at_the_gate() {
+    let model = parse_model_string(JOINT_PKTTE_ODE_SS).expect("parse joint PK-TTE ODE model");
+    assert!(
+        model
+            .ode_spec
+            .as_ref()
+            .is_some_and(|o| !o.chz_state_slots.is_empty()),
+        "fixture must actually carry an injected accumulator, or this tests nothing"
+    );
+    let theta = vec![1.0, 10.0, 1.0, 0.02, 0.3];
+    let eta = vec![0.0];
+
+    let ss = joint_ss_subject(true);
+    assert!(
+        ss_dual_equilibration_out_of_scope(&model, &ss),
+        "a joint model + SS dose must be out of the dual providers' scope"
+    );
+    assert!(
+        !ode_subject_supported(&model, &ss),
+        "the static ODE gate must decline it"
+    );
+    assert!(
+        !ode_tvcov_supported(&model, &ss),
+        "the event-driven ODE gate must decline it too, or a subject reaches the dual SS \
+         equilibration by taking the other route"
+    );
+    assert!(
+        ode_subject_eta_grad(&model, &ss, &theta, &eta).is_none(),
+        "the entry point must return None (→ FD), not a jet carrying the banked run-in"
+    );
+
+    // Straddle 1: drop the SS flag and the same model/subject is served again.
+    let plain = joint_ss_subject(false);
+    assert!(
+        !ss_dual_equilibration_out_of_scope(&model, &plain),
+        "without an SS dose the joint model must stay in scope, or the decline is unconditional \
+         and this test cannot tell the two apart"
+    );
+
+    // Straddle 2: an SS dose on a model with no accumulator is still in scope.
+    let no_chz = parse_model_string(ONECPT_ODE_NO_CHZ).expect("parse plain ODE model");
+    assert!(
+        no_chz
+            .ode_spec
+            .as_ref()
+            .is_some_and(|o| o.chz_state_slots.is_empty()),
+        "the contrast model must carry no accumulator"
+    );
+    assert!(
+        !ss_dual_equilibration_out_of_scope(&no_chz, &ss),
+        "the gate must key on the accumulator, not on SS dosing alone — an analytic-family TTE \
+         model carries no accumulator and its SS dosing is served fine"
+    );
+}
+
+/// Joint PK-TTE ODE model for [`a_joint_pktte_subject_under_ss_declines_to_fd_at_the_gate`].
+const JOINT_PKTTE_ODE_SS: &str = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  theta TVH0(0.02, 1e-5, 10.0)
+  theta TVBETA(0.30, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.05 (sd)
+
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  KA   = TVKA
+  H0   = TVH0
+  BETA = TVBETA
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+
+[event_model]
+  cmt    = 3
+  hazard = H0 * exp(BETA * (central / V))
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+/// The same PK block with **no** `[event_model]`, so no accumulator is injected — straddle 2.
+const ONECPT_ODE_NO_CHZ: &str = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.05 (sd)
+
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  KA   = TVKA
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+/// [`bolus_subject`] whose single dose carries the `SS=1` flag, or not — the one bit the
+/// gate keys on, so the two straddle it exactly.
+fn joint_ss_subject(ss: bool) -> Subject {
+    let mut s = bolus_subject(&[1.0, 4.0, 8.0, 12.0]);
+    if ss {
+        s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)];
+    }
+    s.obs_cmts = vec![2; s.obs_times.len()];
+    s
+}

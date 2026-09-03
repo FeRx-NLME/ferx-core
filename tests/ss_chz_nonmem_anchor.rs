@@ -492,3 +492,136 @@ fn a_simulated_steady_state_subject_draws_a_distribution_of_event_times() {
         "simulated event times are degenerate: min {lo}, max {hi}"
     );
 }
+
+/// `nonmem_anchor/ss_chz_reset.csv`: an `SS=1` dose at `t = 0`, then `EVID=4` (reset + dose)
+/// at `t = 6`.
+const DATA_RESET: &str = "nonmem_anchor/ss_chz_reset.csv";
+
+/// ferx times of the r4 records — NONMEM `T` minus 600. `4`/`5.9` sit before the reset with
+/// the hazard live; `8`/`12` after it, where a preserved `H` would still be too high.
+const GRID_R4: [f64; 4] = [4.0, 5.9, 8.0, 12.0];
+
+/// `(ferx time, IPRED, CHZ, HAZ)` for the four post-gate observation records of the r4 table.
+fn nonmem_rows_r4() -> Vec<(f64, f64, f64, f64)> {
+    let path = "nonmem_anchor/results/ss_chz_r4_const.tab";
+    let raw = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let mut rows: Vec<(f64, f64, f64, f64)> = raw
+        .lines()
+        .skip(2)
+        .filter_map(|l| {
+            let f: Vec<f64> = l
+                .split_whitespace()
+                .filter_map(|x| x.parse().ok())
+                .collect();
+            (f.len() >= 9 && f[8] == 0.0 && f[2] == 2.0 && f[1] > 600.0)
+                .then(|| (f[1] - 600.0, f[5], f[6], f[7]))
+        })
+        .collect();
+    rows.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("finite times"));
+    let times: Vec<f64> = rows.iter().map(|r| r.0).collect();
+    assert_eq!(
+        times.len(),
+        GRID_R4.len(),
+        "the r4 table has {} post-gate observation records, expected {}: {times:?}",
+        times.len(),
+        GRID_R4.len()
+    );
+    for (got, want) in times.iter().zip(&GRID_R4) {
+        assert!(
+            (got - want).abs() < 1e-9,
+            "r4 record at ferx t={got}, expected {want}"
+        );
+    }
+    rows
+}
+
+/// **A reset zeroes the accumulated hazard, and NONMEM agrees.**
+///
+/// Zeroing on reset is a *convention choice*, not a derivation: carrying `H` across a reset is
+/// just as implementable, and #1210's fix deliberately keeps a later `SS=1` dose from zeroing
+/// while leaving `EVID=3`/`4` as the things that do. Until this arm, that choice was checked
+/// only against ferx's own closed form — self-referential in exactly the way the
+/// preserve-not-zero rule was before r3, which is the comparison that proved the issue's
+/// suggested alternative wrong.
+///
+/// The r2 harness needs no change: the `$DES` gate is on absolute `T`, so after a reset the
+/// hazard keeps accruing while `A(3)` restarts from zero. NONMEM's `EVID=4` resets every
+/// compartment, accumulator included, and the reference reads `0.080 / 0.118` before the
+/// reset and `0.040 / 0.120` after — i.e. the clock restarts at `t = 6`. Preserving instead
+/// would give `0.158` and `0.238`.
+///
+/// **`EVID=4`, not `EVID=3`, and that is measured rather than stylistic.** An `EVID=3` reset
+/// zeroes the PK compartments too, so with no further dose `IPRED = 0` at the post-reset
+/// records and the proportional error model has zero variance there — NONMEM returns
+/// `PROGRAM TERMINATED BY OBJ` / `ERROR IN CELS`. `EVID=4` keeps drug present afterwards,
+/// which the anchor needs anyway to be non-degenerate on the *outgoing* side: the reference's
+/// `IPRED` runs `10.45 / 8.78` before and `7.59 / 6.07` after, so the PK is live throughout.
+///
+/// Const arm only, deliberately: after a reset a drug-driven hazard rides a PK profile that
+/// restarted from one dose, so it says nothing the const arm does not, while giving up the
+/// exact closed form that makes a convention test readable.
+#[test]
+fn a_reset_zeroes_the_accumulated_hazard_and_matches_nonmem() {
+    let (m, pop) = load_with("const", DATA_RESET);
+    let sv = predict_survival(&m, &pop, &m.default_params, &GRID_R4);
+    let pred = predict(&m, &pop, &m.default_params);
+    let reference = nonmem_rows_r4();
+
+    // The straddle: the reference must carry a materially non-zero hazard into the reset, or
+    // "zero" and "preserve" agree there and this arm proves nothing.
+    let h_before = reference[1].2;
+    assert!(
+        h_before > 0.1,
+        "the reference's pre-reset hazard is {h_before}; with nothing accrued this arm cannot \
+         tell zeroing from preserving"
+    );
+    // And it must drop across the reset, or the table is not showing a reset at all.
+    assert!(
+        reference[2].2 < h_before,
+        "the reference's hazard did not drop across the reset ({} -> {}); the fixture is not \
+         exercising a reset",
+        h_before,
+        reference[2].2
+    );
+
+    let mut worst_h = 0.0f64;
+    let mut worst_pred = 0.0f64;
+    let mut compared = 0usize;
+    for (t, ipred, chz, haz) in reference {
+        let r = sv
+            .iter()
+            .find(|r| (r.time - t).abs() < 1e-9)
+            .unwrap_or_else(|| panic!("no ferx survival row at t={t}"));
+        assert!(
+            r.cum_hazard.is_finite() && r.hazard.is_finite(),
+            "ferx returned a non-finite H/h at t={t}: {}, {}",
+            r.cum_hazard,
+            r.hazard
+        );
+        worst_h = worst_h.max(((r.cum_hazard - chz) / chz).abs());
+        worst_h = worst_h.max(((r.hazard - haz) / haz).abs());
+
+        let pr = pred
+            .iter()
+            .find(|p| (p.time - t).abs() < 1e-9)
+            .unwrap_or_else(|| panic!("no ferx PK row at t={t}"));
+        assert!(pr.pred.is_finite(), "non-finite PRED at t={t}");
+        worst_pred = worst_pred.max(((pr.pred - ipred) / ipred).abs());
+        compared += 1;
+    }
+    assert_eq!(
+        compared, 4,
+        "expected all four records to be compared, not {compared}"
+    );
+    // Measured worst relative disagreement: 3.5e-16 on H/h — the const arm's hazard is exact
+    // against the closed form on both sides of the reset — and 2.4e-9 on PRED, which is the
+    // reference table's own nine-digit print resolution. 2e-8 is ~8x the larger.
+    assert!(
+        worst_h < 2e-8,
+        "worst relative H/h disagreement vs the r4 train = {worst_h}"
+    );
+    assert!(
+        worst_pred < 2e-8,
+        "worst relative PRED disagreement vs the r4 train = {worst_pred}"
+    );
+}
