@@ -66,7 +66,11 @@ section of the SDLC for the versioning policy).
   a tight fit no longer differences a coarser surface than the estimates came from. The
   model-file route, `predict()` and `simulate()` are unchanged; note that the override lasts
   one call, so `predict()` after a tight `fit()` on the same model still uses the model
-  file's accuracy unless you `sync_ode_solver_opts` an owned model.
+  file's accuracy unless you `sync_ode_solver_opts` an owned model. Concurrent fits are
+  isolated from each other: a call's settings travel on the thread that made it and on a
+  thread pool keyed to those settings, so a fit that asked for nothing keeps the model
+  file's accuracy even while another fit runs at `1e-10` beside it (and vice versa) — which
+  matters for `ferx-tools`' parallel replicate fits and for any caller sharing the fit pool.
 - **An estimated `block_sigma` correlation is bounded at `|rho| <= 0.995` (#847).** Merely
   keeping rho inside `(-1, 1)` is not enough: a paired residual block's determinant carries a
   factor `1 - rho^2`, so a rho of 0.9999 leaves `R` numerically singular and the likelihood

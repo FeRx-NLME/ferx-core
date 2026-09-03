@@ -3918,10 +3918,11 @@ impl CompiledModel {
     /// integrator reads [`OdeSpec::solver_opts`](crate::ode::predictions::OdeSpec::solver_opts),
     /// never `FitOptions::ode_reltol` directly. As of #1212 it does not have to: `fit` arms a
     /// fit-scoped override (`FitOptions::ode_solver_override`) that every integration path
-    /// merges over the baked value, so a caller-supplied `ode_reltol` / `ode_method` / … reaches
-    /// the solver without an owned model. Only the fields moved away from the `FitOptions`
-    /// defaults are carried, so this stamping still wins wherever the caller expressed no
-    /// opinion.
+    /// merges over the baked value, and runs on a rayon pool whose workers carry the same
+    /// value, so a caller-supplied `ode_reltol` / `ode_method` / … reaches the solver on every
+    /// thread without an owned model — and cannot be seen by a concurrent fit that asked for
+    /// something else. Only the fields moved away from the `FitOptions` defaults are carried,
+    /// so this stamping still wins wherever the caller expressed no opinion.
     ///
     /// Calling this on an owned model before `fit` (as the R wrapper's `ferx_fit` does) remains
     /// correct and is still the way `predict` / `simulate`, which take no fit options at all,

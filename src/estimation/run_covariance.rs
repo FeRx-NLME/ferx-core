@@ -90,10 +90,21 @@ pub fn run_covariance(
     // parse-time values. It matters more here than almost anywhere else — the covariance step
     // is a second difference of the reconverged OFV, so running it at a *different* accuracy
     // than the fit that produced the estimates is exactly how a plausible-looking standard
-    // error comes out wrong. Armed for the whole call, including the re-parse and re-read
-    // paths below, and disarmed on every exit.
-    let _ode_solver_override =
-        crate::ode::solver::arm_ode_solver_override(options.ode_solver_override());
+    // error comes out wrong. The scope covers the whole call, including the re-parse and
+    // re-read paths, and puts the per-subject fan-out on a pool whose workers carry the same
+    // settings — arming alone would reach this thread and leave the workers on the model
+    // file's.
+    crate::api::with_fit_ode_scope(options, || {
+        run_covariance_scoped(fit, model, population, options)
+    })?
+}
+
+fn run_covariance_scoped(
+    fit: &FitResult,
+    model: Option<&CompiledModel>,
+    population: Option<&Population>,
+    options: &FitOptions,
+) -> Result<FitResult, String> {
     // Input resolution mirrors `run_sir` exactly: stale-input errors win over
     // any downstream failure so a user pointing at the wrong model/dataset
     // hears about that first.

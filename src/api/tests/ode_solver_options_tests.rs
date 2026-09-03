@@ -12,10 +12,12 @@
 //! neither outlives the fit — and the fourth is the same question for the standalone
 //! covariance step, which integrates just as `fit` does.
 //!
-//! All of them take `ode_override_test_lock()` first. The armed override is shared across
-//! threads and libtest runs this binary's tests concurrently, so without it one test's tight
-//! override is what another test's `loose` fit measures, and the bit-comparisons here stop
-//! meaning anything.
+//! These run unserialised, and that is itself part of what they pin. libtest runs this
+//! binary's tests concurrently, so every `fit()` in it is a concurrent fit: if a caller's ODE
+//! settings lived in one process-global, the `loose` fit below would measure some other
+//! test's tight override, and the bit-comparisons here would stop meaning anything. They hold
+//! because an override travels on the thread that armed it and on a pool keyed to it, never
+//! on a slot other fits can see.
 
 use super::*;
 use crate::parser::model_parser::parse_model_string;
@@ -111,7 +113,6 @@ fn ofv(model: &CompiledModel, opts: &FitOptions) -> f64 {
 /// the solver.
 #[test]
 fn a_caller_supplied_ode_tolerance_reaches_the_integrator() {
-    let _serial = crate::ode::solver::ode_override_test_lock();
     let model = ode_model("");
     let loose = ofv(&model, &eval_opts());
     let tight = ofv(
@@ -144,7 +145,6 @@ fn a_caller_supplied_ode_tolerance_reaches_the_integrator() {
 /// the file wins — the fit stays at the accuracy the model asked for.
 #[test]
 fn an_untouched_ode_tolerance_keeps_the_model_files_pinned_value() {
-    let _serial = crate::ode::solver::ode_override_test_lock();
     let pinned = ode_model("[fit_options]\n  ode_reltol = 1e-10\n  ode_abstol = 1e-12\n");
     let plain = ode_model("");
 
@@ -183,7 +183,6 @@ fn an_untouched_ode_tolerance_keeps_the_model_files_pinned_value() {
 /// standard errors for it.
 #[test]
 fn a_caller_supplied_ode_tolerance_reaches_the_standalone_covariance_step() {
-    let _serial = crate::ode::solver::ode_override_test_lock();
     let model = ode_model("");
     let pop = population();
     let fitted = fit(&model, &pop, &model.default_params, &eval_opts()).expect("the fit runs");
@@ -224,7 +223,6 @@ fn a_caller_supplied_ode_tolerance_reaches_the_standalone_covariance_step() {
 /// fit's tolerance instead of the spec's.
 #[test]
 fn a_fits_ode_options_do_not_outlive_it() {
-    let _serial = crate::ode::solver::ode_override_test_lock();
     let model = ode_model("");
     let baked = model
         .ode_spec
