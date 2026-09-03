@@ -262,12 +262,15 @@ found on #1166 in tests that had been written, run green and believed:
   on a model with no `[event_model]` — but with no injected slots the code short-circuits
   before the filter runs, so a name-prefix mutation sailed through. If the code has an
   `if xs.is_empty()` arm, a fixture with `xs` empty tests that arm, not the logic behind it.
-- **`f64::max` / `f64::min` discard `NaN`** (`a.max(NaN) == a`), so `worst = worst.max((got -
-  want).abs())` leaves `worst` at `0.0` when `got` is `NaN` and every bound passes. All three
-  assertions in a fresh NONMEM anchor had that shape: a regression making the solver return
-  `NaN` — the likeliest way to break the thing being anchored — would have gone green. Assert
-  `is_finite()` before folding. A *direct* `(got - want).abs() < tol` does catch `NaN`; only
-  the fold hides it. `filter_map(…ok())` and `unwrap_or(0.0)` absorb failures the same way.
+- **`f64::max` / `f64::min` discard `NaN`** — `0.0f64.max(NaN)` is `0.0` and
+  `f64::INFINITY.min(NaN)` is `inf`, verified, not recalled — so `worst = worst.max((got -
+  want).abs())` keeps whatever the *finite* records produced and the bound passes on the
+  strength of the rows that worked. Five folded accumulators across `pktte_tdep_nonmem_anchor`'s
+  three tests had that shape when it was written; a regression making the solver return `NaN` —
+  the likeliest way to break the thing being anchored — would have gone green. Assert
+  `is_finite()` before folding. That anchor's one *direct* `(total - want).abs() < tol` was
+  already safe, since any comparison against `NaN` is `false`; only the fold hides it.
+  `filter_map(…ok())` and `unwrap_or(0.0)` absorb failures the same way.
 
 For each new assertion, name the regression it exists to catch and check that regression can
 actually reach it. For a regression test that means mutation; for an anchor, feeding it the
