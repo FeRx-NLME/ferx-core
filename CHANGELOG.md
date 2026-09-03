@@ -19,7 +19,74 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Changed
+- **`block_sigma` now estimates its off-diagonal correlation (#847).** A plain
+  `block_sigma (...) = [...]` is NONMEM `$SIGMA BLOCK(n)`: its diagonal SDs *and* its
+  off-diagonal correlation are estimated. Previously the correlation was always frozen at the
+  declared value, so a model with a `$SIGMA BLOCK` counterpart in NONMEM optimized a different
+  objective — on the fluconazole RadboudUMC model NONMEM moved the residual correlation to
+  ~0.93 while ferx held the ~0.2 init. Append `FIX` to hold the whole block — SDs and
+  correlation alike, matching `$SIGMA BLOCK(n) FIX`. Note that the old behaviour (SDs
+  estimated, correlation frozen) is no longer expressible: NONMEM has no such form either, and
+  it was the mismatch this issue is about. The shipped
+  `examples/correlated_residual_combined.ferx` already uses `FIX` and is unaffected. The
+  correlation is optimized as its Fisher-z transform `atanh(rho)`, so it stays strictly inside
+  `(-1, 1)` and the residual covariance can never go singular from the correlation alone, and
+  it rides the exact analytic FOCE/FOCEI outer gradient rather than falling back to finite
+  differences. Estimators that do not estimate it (SAEM, IMP/IMPMAP, Bayes, AGQ, VI) continue
+  to hold it at the declaration. Because a method chain starts each stage from the previous
+  stage's estimates, a chain that runs `foce`/`focei` before a stage that cannot read the
+  estimated correlation is now rejected with `E_BLOCK_SIGMA_CHAIN_UNSUPPORTED` rather than
+  silently scoring the declared value — `[saem, focei]` is fine, `[focei, imp]` needs `FIX`.
+
+### Added
+- **Fitted `block_sigma` correlations are reported with their fixedness and standard error
+  (#847).** `FitResult` gains `residual_correlation_fixed` and `se_residual_correlations` (the
+  SE on the natural `rho` scale, by the delta method on the packed Fisher-z coordinate), the
+  fit YAML's `block_sigma:` section gains `correlation_se` and now reports
+  `correlation_fixed` from the model rather than always `true`, and `.fitrx` bundles
+  round-trip all three. A bundle written before this change loads with every correlation
+  marked fixed, which is what it meant at the time.
+
 ### Fixed
+- **An estimated `block_sigma` correlation is bounded at `|rho| <= 0.995` (#847).** Merely
+  keeping rho inside `(-1, 1)` is not enough: a paired residual block's determinant carries a
+  factor `1 - rho^2`, so a rho of 0.9999 leaves `R` numerically singular and the likelihood
+  will chase `log|R| -> -inf`. On the 12-observation `examples/correlated_residual_combined`
+  fixture an unbounded rho ran to -0.99993 and reported convergence at a degenerate optimum. A
+  rho sitting on this rail is now a legible diagnostic: the two endpoints are carrying the same
+  noise.
+- **A zero `block_sigma` off-diagonal is now estimated rather than dropped (#847).**
+  `block_sigma (A, B) = [0.04, 0.0, 1.0]` — the natural translation of `$SIGMA BLOCK(2)` with a
+  zero covariance init — previously built no correlation at all, so under the new
+  estimate-by-default semantics it would have silently fitted a diagonal residual with no
+  coordinate to move. A `FIX`ed zero is still dropped: a fixed zero correlation is the same
+  object as no correlation.
+- **`method = laplace` / `n_agq > 1` with a free `block_sigma` now uses the reconverged-FD
+  outer gradient (#847).** AGQ's analytic score assembles theta / omega / sigma / omega_iov and
+  never writes the rho slot, while its objective does depend on rho — so the analytic gradient
+  is declined for a free correlation rather than handing the optimizer a hard zero there. A
+  `FIX`ed block keeps the analytic score. The chain guard was widened to match: `laplace` can
+  move rho, so `[laplace, imp]` is rejected exactly like `[focei, imp]`.
+- **The `block_sigma` correlation coordinate is no longer magnitude-scaled below 1 (#847).**
+  The outer optimizer's `abs` preconditioner divides each packed coordinate by its own
+  `|value|`, which is right for a log-space coordinate but meaningless for the Fisher-z
+  `atanh(rho)` — that is a *position* in a bounded range which passes through zero. At the
+  common `rho = 0.2` init it handed the optimizer a coordinate with roughly thirty times the
+  scaled room of every other one, and NLopt L-BFGS failed on its first step. The scale is now
+  `max(|atanh rho|, 1)`. On the fluconazole RadboudUMC model a cold-start FOCEI fit goes from
+  failing at OFV 1111.12 to converging at **736.89 with rho = 0.9319**, against NONMEM's
+  734.644 / 0.9312. Models without a `block_sigma` are unaffected by construction.
+- **`simulate()` drew correlated residuals at the declared `block_sigma` correlation (#847).**
+  The dense residual `R` it samples from used the live sigmas but the model's declared
+  correlation, so a VPC or posterior-predictive check of a fit with an estimated off-diagonal
+  would not reproduce the correlation the fit reported. It now uses the parameter vector's.
+- **`block_sigma` residual derivatives were built at the declared correlation, not the live
+  one (#847).** The outer-gradient assembly (`corr_residual_diag` /
+  `corr_residual_rd_at_sigma`) and the inner eta-gradient read the correlations off the frozen
+  `CompiledModel`, so once the off-diagonal became estimable the whole `(R, dR/df, d2R/df2)`
+  chain would have been evaluated at the initial value while the objective moved. Both now
+  take the live parameter vector's correlations.
 - **`ode_method = auto` no longer keeps a stiff solve whose analytic derivatives have
   overflowed (#1204).** The escalation guard checked that every saved state was finite, but
   read *values* only. A dual number's derivative jets carry higher powers of what its value
@@ -281,6 +348,26 @@ section of the SDLC for the versioning policy).
   top of them, so a tool and the CLI cannot diverge in how a model is loaded.
 
 ### Fixed
+- **A joint PK-TTE model with a time-dependent hazard no longer integrates twice per subject
+  (#1166).** The `[event_model] hazard = …` expression is appended to the ODE system as
+  `d/dt(__chz_<cmt>)`, and a Weibull or Gompertz baseline hazard reads `TIME` by definition —
+  which made ferx treat the whole model as having non-autonomous PK dynamics, declining the
+  single shared solve (#570) and leaving the dense driver, for a property the PK block does
+  not have. The "does this model read model time?" question is now asked of the PK equations
+  alone. Measured on a 40-subject fixture, one variable: **2.1×** faster on one objective
+  evaluation and **2.6×** over eight outer iterations. Results are unaffected beyond solver
+  tolerance — the same fixture's objective moves 4.4e-3 at ferx's default tolerances and
+  7.7e-7 at `ode_reltol = 1e-9`, i.e. the difference decays with the integrator rather than
+  being a fixed offset — so earlier fits do not need re-running. Steady-state gates deliberately keep the wider question, since SS
+  equilibration integrates the augmented system including the hazard state. Validated against
+  a new NONMEM anchor (`nonmem_anchor/pktte_tdep.ctl`): `H(t)` matches `A(3)` to 3.6e-9
+  relative and the per-subject objective matches the `.phi` `OBJ` to 6.0e-8.
+- **`__chz_*` is now rejected as a read (#1166).** The cumulative-hazard accumulator the
+  parser appends for a joint PK-TTE hazard is write-only: referencing it from an `[odes]`
+  equation, an `if` condition or the hazard expression, or seeding it with
+  `init(__chz_<cmt>)`, is a parse error naming the state instead of silently producing a
+  coupled system the shared solve was never designed for. A `[scaling]` readout may still
+  read it.
 - **The packaged crate no longer ships two files the CC BY-NC exclusion was meant to cover (#1170).**
   `exclude`'s `data/mbma_naproxen.*` glob required a literal `.` after the stem, so
   `data/mbma_naproxen_source.py` slipped through, and `examples/` was never listed, so

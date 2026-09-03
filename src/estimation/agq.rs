@@ -268,6 +268,9 @@ impl Stack {
                 b,
                 &params.omega,
                 &params.sigma.values,
+                // AGQ holds the `block_sigma` off-diagonals at their declared
+                // value (#847); `params` carries exactly that.
+                &params.residual_correlations,
                 scratch,
                 schedule,
             );
@@ -753,8 +756,25 @@ pub fn analytic_gradient_available(model: &CompiledModel) -> bool {
     // Kept as a predicate (rather than inlining `true`) so a future model class that genuinely
     // cannot supply `∂nll/∂x` at fixed η has one place to opt out; `population_gradient`'s
     // `reconverged_fd_gradient` fallback stays wired up behind it.
-    let _ = model;
-    true
+    //
+    // #847: an **estimated** `block_sigma` off-diagonal is exactly such a class. The AGQ score
+    // assembles θ / Ω / σ / Ω_iov blocks and nothing else — neither
+    // `accumulate_fixed_eta_packed_gradient` nor the fixed-b FD salvage
+    // (`accumulate_fixed_b_packed_gradient_fd`, which differences only the θ and σ coordinates)
+    // writes the trailing ρ slot. The quadrature objective *does* depend on ρ (`Stack::nll_at`
+    // scores at `params.residual_correlations`), so returning a gradient with a hard zero
+    // there would leave the optimizer no reason to move ρ and let it report convergence at a
+    // point that is not stationary in it. Declining sends AGQ/Laplace to
+    // `reconverged_fd_gradient`, which differences every free packed coordinate — slower, and
+    // correct. A `FIX`ed block is unaffected: its ρ carries no free coordinate to miss.
+    //
+    // Extending the score with a ρ block is tracked in #1216 alongside the estimator-threading
+    // work; until then this is the loud fallback CLAUDE.md asks a scope gap to take.
+    !model
+        .default_params
+        .residual_correlation_fixed
+        .iter()
+        .any(|&fixed| !fixed)
 }
 
 /// Finite-differenced θ/σ score at a **fixed η** — the universal fallback when the analytic
@@ -1319,6 +1339,8 @@ fn node_nll_gradient(
             b,
             &params.omega,
             &params.sigma.values,
+            // AGQ holds ρ at the declaration; `params` carries it (#847).
+            &params.residual_correlations,
             schedule,
             mult,
         )
@@ -1998,6 +2020,7 @@ mod tests {
                     e,
                     &params.omega,
                     &params.sigma.values,
+                    &params.residual_correlations,
                     s,
                     None,
                 )

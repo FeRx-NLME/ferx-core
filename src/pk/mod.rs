@@ -101,13 +101,51 @@ pub(crate) fn model_uses_time_builtin(model: &CompiledModel) -> bool {
 /// design if the ratio starts to matter; the predicate itself is not a hot-loop
 /// cost (both flags are resolved once in `build_ode_spec` at parse time, and this
 /// is `#[inline]` over three `bool` reads).
+/// **Which flag the `[odes]` half asks, and why it is the narrow one.** This
+/// predicate asks whether the *PK dynamics* are non-autonomous, so it asks
+/// [`OdeRhsProgram::pk_reads_model_time`] — the same walk with the injected
+/// joint-PK-TTE `d/dt(__chz_<cmt>)` hazard lines excluded (#1166). A standard
+/// joint model has a Weibull or Gompertz baseline hazard, which reads `TIME` by
+/// definition, while its PK block is time-invariant; asking the wide flag made
+/// every such model decline #570's shared solve (measured 1.82× on one objective
+/// evaluation) and leave the dense driver, for a property it does not have.
+///
+/// The **steady-state gates do not follow this narrowing** and must keep asking
+/// `reads_model_time()` directly (`estimation/inner_optimizer.rs`,
+/// `sens/ode_provider.rs`): SS equilibration integrates the *augmented* system,
+/// `__chz` included, and a time-reading hazard line breaks that state's cycle
+/// recurrence just as a time-reading PK line would.
+///
+/// The Form C `readout_program` is deliberately **not** folded in either. Both
+/// engines evaluate the readout under a `ModelTimeGuard`, so a `TIME`-reading
+/// readout is already correct on the dense driver and folding it in would decline
+/// the shared solve for nothing. `pk/modified_release.rs` hand-pairs it for a
+/// closed-form-only reason (its linearity probe cannot see the readout's time
+/// term), which does not apply here.
+///
+/// **What keeps a joint model out of the closed form is `identify_disposition`,
+/// not this predicate.** `mr_scope` asks this predicate too, so before #1166 a
+/// time-dependent hazard declined the closed form here; now it does not, and the
+/// decline rests entirely on `identify_disposition`. That bails at
+/// `n_states > 2`, which covers every joint model with two or more PK states —
+/// but a *one*-state PK block plus the injected accumulator is exactly two and
+/// reaches the probe. Measured on such a model (one state, a built-in forcing, a
+/// Form C readout, and a hazard linear in the state so it clears the "no
+/// autonomous term" check): `identify_disposition` still returns `None`, because
+/// the accumulator makes the disposition triangular — the hazard row reads the
+/// state but nothing returns from it — and that is not a disposition the closed
+/// form recognises. So the exposure is closed, by a different gate than the one
+/// that used to close it. The invariant is pinned by
+/// `pk::modified_release::tests::a_joint_pk_tte_model_never_reaches_the_closed_form`
+/// rather than enforced; whether to enforce it is #1209.
 #[inline]
 pub(crate) fn model_uses_time_anywhere(model: &CompiledModel) -> bool {
     model_uses_time_builtin(model)
-        || model
-            .ode_spec
-            .as_ref()
-            .is_some_and(|s| s.rhs_program.as_ref().is_some_and(|p| p.reads_model_time()))
+        || model.ode_spec.as_ref().is_some_and(|s| {
+            s.rhs_program
+                .as_ref()
+                .is_some_and(|p| p.pk_reads_model_time())
+        })
 }
 
 #[inline]
@@ -3172,6 +3210,8 @@ mod tests {
             eta_names: Vec::new(),
             kappa_names: Vec::new(),
             default_params: ModelParameters {
+                residual_correlations: Vec::new(),
+                residual_correlation_fixed: Vec::new(),
                 theta: vec![1.0],
                 theta_names: vec!["TVCL".into()],
                 theta_lower: vec![0.0],

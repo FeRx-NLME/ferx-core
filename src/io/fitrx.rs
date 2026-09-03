@@ -235,10 +235,18 @@ struct SigmaWire {
     /// for backward compatibility with .fitrx files from before issue #5.
     #[serde(default)]
     init_as_sd: Vec<bool>,
-    /// Fixed `block_sigma` correlations. Absent in bundles written before
-    /// issue #1100 and omitted for the common diagonal-sigma case.
+    /// `block_sigma` correlations. Absent in bundles written before issue #1100
+    /// and omitted for the common diagonal-sigma case.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     residual_correlations: Vec<crate::types::ResidualCorrelation>,
+    /// FIX flags parallel to `residual_correlations` (#847). Absent in bundles
+    /// written before the off-diagonal became estimable, where every correlation
+    /// was fixed by construction — hence the `true` fill on load.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    residual_correlation_fixed: Vec<bool>,
+    /// Standard errors for the estimated correlations, natural ρ scale (#847).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    se_residual_correlations: Option<Vec<f64>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -607,6 +615,8 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
                 .collect(),
             init_as_sd: r.sigma_init_as_sd.clone(),
             residual_correlations: r.residual_correlations.clone(),
+            residual_correlation_fixed: r.residual_correlation_fixed.clone(),
+            se_residual_correlations: r.se_residual_correlations.clone(),
         },
         error_model: error_model_to_str(r.error_model).into(),
         shrinkage_eps: r.shrinkage_eps,
@@ -1651,6 +1661,29 @@ fn validate_parallel_lengths(w: &FitWire) -> Result<(), FitrxError> {
             ));
         }
     }
+    // #847 companions to `residual_correlations`: both are optional (a pre-#847
+    // bundle carries neither), but a present one must be parallel — a truncated
+    // FIX vector would silently report an estimated correlation as free, and a
+    // truncated SE vector would mis-align the SE with the pair it belongs to.
+    let n_corr = w.sigma.residual_correlations.len();
+    if !w.sigma.residual_correlation_fixed.is_empty()
+        && w.sigma.residual_correlation_fixed.len() != n_corr
+    {
+        return bail(format!(
+            "sigma.residual_correlation_fixed ({}) does not match sigma.residual_correlations ({})",
+            w.sigma.residual_correlation_fixed.len(),
+            n_corr
+        ));
+    }
+    if let Some(se) = &w.sigma.se_residual_correlations {
+        if se.len() != n_corr {
+            return bail(format!(
+                "sigma.se_residual_correlations ({}) does not match sigma.residual_correlations ({})",
+                se.len(),
+                n_corr
+            ));
+        }
+    }
     // IOV init_as_sd: same backward-compat rule as omega/sigma. Only validate
     // when an `iov` section is present (otherwise there's no n_kappa to match
     // against).
@@ -1800,6 +1833,16 @@ fn wire_to_fit_result(
         std::mem::take(&mut w.sigma.init_as_sd)
     };
 
+    // A bundle written before #847 has correlations but no FIX vector: back then
+    // every `block_sigma` off-diagonal was held fixed, so that is what it meant.
+    let residual_correlation_fixed_resolved = if w.sigma.residual_correlations.is_empty() {
+        Vec::new()
+    } else if w.sigma.residual_correlation_fixed.is_empty() {
+        vec![true; w.sigma.residual_correlations.len()]
+    } else {
+        std::mem::take(&mut w.sigma.residual_correlation_fixed)
+    };
+
     Ok(FitResult {
         restored_from_checkpoint: true,
         covariate_relations: Vec::new(),
@@ -1818,11 +1861,13 @@ fn wire_to_fit_result(
         sigma: w.sigma.estimates,
         sigma_names: w.sigma.names,
         residual_correlations: w.sigma.residual_correlations,
+        residual_correlation_fixed: residual_correlation_fixed_resolved,
         error_model: error_model_from_str(&w.error_model)?,
         covariance_matrix,
         se_theta: w.theta.se,
         se_omega: w.omega.se,
         se_sigma: w.sigma.se,
+        se_residual_correlations: w.sigma.se_residual_correlations,
         theta_fixed: w.theta.fixed,
         omega_fixed: w.omega.fixed,
         sigma_fixed: w.sigma.fixed,
@@ -2057,6 +2102,8 @@ mod tests {
     fn minimal_fit_result() -> FitResult {
         let n_eta = 2;
         FitResult {
+            residual_correlation_fixed: Vec::new(),
+            se_residual_correlations: None,
             covariate_relations: Vec::new(),
             restored_from_checkpoint: false,
             method: EstimationMethod::FoceI,

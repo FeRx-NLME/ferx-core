@@ -1,0 +1,61 @@
+# Joint PK-TTE with a TIME-dependent (Gompertz-shaped) hazard on an AUTONOMOUS PK block.
+#
+# The ferx twin of `nonmem_anchor/pktte_tdep.ctl` — same fixed THETA, same data, and the
+# same augmented system. Consumed by `tests/pktte_tdep_nonmem_anchor.rs` (#1166).
+#
+# Two things make this the fixture #1166 needed and did not have:
+#
+#   * `TIME` is LIVE in the hazard. Nothing committed exercised that: a grep for a
+#     time-reading `hazard =` over src/, tests/, examples/ and docs/ was empty, so the
+#     shared solve's segment integration had never been checked against an outside
+#     reference with a non-constant hazard. The identity trick `* (1.0 + 0.0*TIME)` used
+#     by the routing oracle proves routing only — a mishandled model time would be
+#     invisible to it, since the term is worth exactly zero.
+#   * The PK block is autonomous, so this model must take the single shared solve. Before
+#     #1166 the injected `d/dt(__chz_3)` line made the whole model read as non-autonomous.
+#
+# `[fit_options]` pins the solver at reltol 1e-9 / abstol 1e-11. At ferx's defaults
+# (1e-4 / 1e-6) ferx and NONMEM agree only to ~1e-3 per subject, which is far looser than
+# anything this anchor is meant to resolve.
+
+[parameters]
+  theta TVCL(1.0, FIX)
+  theta TVV(10.0, FIX)
+  theta TVKA(1.0, FIX)
+  theta TVH0(0.02, FIX)
+  theta TVBETA(0.5, FIX)
+  theta TVGAM(0.15, FIX)
+
+  # No omega: the NONMEM twin runs `$OMEGA 0 FIX`, so both sides are evaluated at eta = 0.
+  sigma PROP_ERR ~ 0.01            # variance; NONMEM `$SIGMA 0.01`
+
+[individual_parameters]
+  CL   = TVCL
+  V    = TVV
+  KA   = TVKA
+  H0   = TVH0
+  BETA = TVBETA
+  GAM  = TVGAM
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+
+[scaling]
+  obs_scale = V                    # states are AMOUNTS; NONMEM's `$ERROR` divides by V
+
+[event_model]
+  cmt    = 3
+  hazard = H0 * exp(GAM * TIME) * exp(BETA * (central / V))
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 0
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11

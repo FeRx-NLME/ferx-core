@@ -30,6 +30,8 @@ fn make_compiled_model(with_ode: bool, gradient_method: GradientMethod) -> Compi
         indiv_param_names: vec!["CL".into()],
         indiv_param_partials: IndivParamPartials::empty(),
         default_params: ModelParameters {
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             theta: vec![1.0],
             theta_names: vec!["CL".into()],
             theta_lower: vec![0.0],
@@ -119,6 +121,8 @@ fn make_compiled_model(with_ode: bool, gradient_method: GradientMethod) -> Compi
 /// simulated replicates is residual error, which keeps NPD deterministic.
 pub(crate) fn tv_cov_iv_model_and_subject() -> (CompiledModel, Subject) {
     let params = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0, 50.0],
         theta_names: vec!["TVCL".into(), "TVV".into()],
         theta_lower: vec![0.1, 5.0],

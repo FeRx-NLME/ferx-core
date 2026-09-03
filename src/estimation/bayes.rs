@@ -221,7 +221,16 @@ fn subject_nll(
             let _g = MixtureClassGuard::enter(c + 1);
             *slot = if kappas.is_empty() {
                 individual_nll_into_with_schedule(
-                    model, subject, theta, eta, omega, sigma, scratch, schedule,
+                    model,
+                    subject,
+                    theta,
+                    eta,
+                    omega,
+                    sigma,
+                    // Bayes holds the `block_sigma` off-diagonals fixed (#847).
+                    &model.residual_correlations,
+                    scratch,
+                    schedule,
                 )
             } else {
                 individual_nll_iov(model, subject, theta, eta, kappas, omega, omega_iov, sigma)
@@ -232,7 +241,15 @@ fn subject_nll(
     }
     if kappas.is_empty() {
         individual_nll_into_with_schedule(
-            model, subject, theta, eta, omega, sigma, scratch, schedule,
+            model,
+            subject,
+            theta,
+            eta,
+            omega,
+            sigma,
+            &model.residual_correlations,
+            scratch,
+            schedule,
         )
     } else {
         individual_nll_iov(model, subject, theta, eta, kappas, omega, omega_iov, sigma)
@@ -1399,6 +1416,12 @@ pub fn run_bayes(
             names: init_params.sigma.names.clone(),
         },
         sigma_fixed: init_params.sigma_fixed.clone(),
+        // Bayes does not sample the `block_sigma` off-diagonals (#847), so the
+        // posterior-mean snapshot carries them through at their declared value
+        // rather than dropping them — an empty vector here would silently make
+        // the residual `R` diagonal for every downstream consumer.
+        residual_correlations: init_params.residual_correlations.clone(),
+        residual_correlation_fixed: init_params.residual_correlation_fixed.clone(),
         omega_iov: omega_iov_mean.clone(),
         kappa_fixed: init_params.kappa_fixed.clone(),
         // Carry the mixture so the post-loop pass sees the structure (#985). Ω/Σ
@@ -2339,6 +2362,7 @@ mod tests {
                 &eta,
                 &params.omega,
                 &params.sigma.values,
+                &params.residual_correlations,
                 &mut scratch,
                 None,
             );

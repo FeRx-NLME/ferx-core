@@ -692,7 +692,7 @@ pub fn run_vi(
             }
             // Same for `Ω_iov`, which the closed form also sets. An empty range without
             // IOV.
-            for g in grad_x[layout.omega_iov_start()..layout.total()].iter_mut() {
+            for g in grad_x[layout.omega_iov_start()..layout.omega_iov_end()].iter_mut() {
                 *g = 0.0;
             }
         }

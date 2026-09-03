@@ -147,9 +147,25 @@ fn central_fd_theta_grad(
         let h = 1e-6 * (1.0 + theta[i].abs());
         let mut tp = theta.to_vec();
         tp[i] += h;
-        let f_plus = obs_nll_subject_into(model, subject, &tp, sigma_values, eta, &mut scratch);
+        let f_plus = obs_nll_subject_into(
+            model,
+            subject,
+            &tp,
+            sigma_values,
+            &model.residual_correlations,
+            eta,
+            &mut scratch,
+        );
         tp[i] = theta[i] - h;
-        let f_minus = obs_nll_subject_into(model, subject, &tp, sigma_values, eta, &mut scratch);
+        let f_minus = obs_nll_subject_into(
+            model,
+            subject,
+            &tp,
+            sigma_values,
+            &model.residual_correlations,
+            eta,
+            &mut scratch,
+        );
         let raw = (f_plus - f_minus) / (2.0 * h);
         out[i] = if mask[i] { theta[i] * raw } else { raw };
     }
@@ -317,12 +333,28 @@ fn hybrid_is_closer_to_central_fd_than_forward_fd() {
     // The superseded estimator, reproduced here so the comparison is explicit:
     // forward FD at the same 1e-5 relative step the production loop used.
     let mut forward = vec![0.0f64; n_theta];
-    let f0 = obs_nll_subject_into(&model, &subject, &theta, &sigma_values, &eta, &mut scratch);
+    let f0 = obs_nll_subject_into(
+        &model,
+        &subject,
+        &theta,
+        &sigma_values,
+        &model.residual_correlations,
+        &eta,
+        &mut scratch,
+    );
     for i in 0..n_theta {
         let delta = 1e-5 * (1.0 + theta[i].abs());
         let mut tp = theta.clone();
         tp[i] += delta;
-        let fp = obs_nll_subject_into(&model, &subject, &tp, &sigma_values, &eta, &mut scratch);
+        let fp = obs_nll_subject_into(
+            &model,
+            &subject,
+            &tp,
+            &sigma_values,
+            &model.residual_correlations,
+            &eta,
+            &mut scratch,
+        );
         let raw = (fp - f0) / delta;
         forward[i] = if mask[i] { theta[i] * raw } else { raw };
     }

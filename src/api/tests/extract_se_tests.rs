@@ -8,6 +8,8 @@ use nalgebra::DMatrix;
 fn make_template(omega_iov: Option<OmegaMatrix>, kappa_fixed: Vec<bool>) -> ModelParameters {
     let omega = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
     ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0],
         theta_names: vec!["TVCL".into()],
         theta_lower: vec![0.1],
@@ -40,6 +42,8 @@ fn test_se_omega_block_n3_full_lower_triangle() {
     mat[(2, 2)] = 0.16;
     let omega = OmegaMatrix::from_matrix(mat, vec!["E1".into(), "E2".into(), "E3".into()], false);
     let template = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0],
         theta_names: vec!["TVCL".into()],
         theta_lower: vec![0.1],
@@ -103,6 +107,8 @@ fn test_se_omega_block_offdiag_positive() {
     mat[(1, 0)] = 0.02;
     let omega = OmegaMatrix::from_matrix(mat, vec!["E1".into(), "E2".into()], false);
     let template = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0],
         theta_names: vec!["TVCL".into()],
         theta_lower: vec![0.1],
@@ -142,6 +148,8 @@ fn test_se_omega_block_offdiag_positive() {
 fn test_se_omega_diagonal_unchanged() {
     let omega = OmegaMatrix::from_diagonal(&[0.04, 0.09], vec!["E1".into(), "E2".into()]);
     let template = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0],
         theta_names: vec!["TVCL".into()],
         theta_lower: vec![0.1],
@@ -179,6 +187,8 @@ fn test_se_theta_respects_packing_scale() {
     // theta[1] = BETA, lower -10 < 0   → identity-packed (can be negative)
     let omega = OmegaMatrix::from_diagonal(&[0.04], vec!["E1".into()]);
     let template = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![2.0, 0.25],
         theta_names: vec!["TVCL".into(), "BETA".into()],
         theta_lower: vec![0.1, -10.0],
@@ -283,4 +293,77 @@ fn test_se_kappa_none_when_no_cov() {
     let template = make_template(Some(iov), vec![false]);
     let (_, _, _, se_kappa) = extract_standard_errors(&None, &template);
     assert!(se_kappa.is_none());
+}
+
+// ── block_sigma residual correlations (#847) ─────────────────────────────
+
+/// #847: the ρ coordinate is packed **last** — after Ω_IOV — so its SE must be
+/// read at `rho_packed_start`, not at an offset derived from
+/// n_theta/n_omega/n_sigma. This template carries an IOV block precisely so a
+/// slot-counting mistake lands on a kappa coordinate and shows up here.
+#[test]
+fn test_se_residual_correlation_uses_the_trailing_rho_slot() {
+    use super::extract_residual_correlation_se;
+
+    let iov = OmegaMatrix::from_diagonal(&[0.02], vec!["KAPPA_CL".into()]);
+    let mut template = make_template(Some(iov), vec![false]);
+    template.sigma = SigmaVector {
+        values: vec![0.3, 1.0],
+        names: vec!["PROP_ERR".into(), "ADD_ERR".into()],
+    };
+    template.sigma_fixed = vec![false; 2];
+    let rho = 0.6_f64;
+    template.residual_correlations = vec![ResidualCorrelation {
+        sigma_i: 1,
+        sigma_j: 0,
+        rho,
+    }];
+    template.residual_correlation_fixed = vec![false];
+
+    // 1 theta + 1 omega + 2 sigma + 1 kappa + 1 rho = 6, rho last.
+    let n = 6;
+    let mut cov = DMatrix::<f64>::zeros(n, n);
+    // A distinct variance in every slot, so reading the wrong one is visible.
+    for i in 0..n {
+        cov[(i, i)] = 0.01 * (i + 1) as f64;
+    }
+    let se = extract_residual_correlation_se(&Some(cov), &template).expect("rho SE");
+    assert_eq!(se.len(), 1);
+    // Delta method on the Fisher-z coordinate: SE(ρ) = SE(z)·(1 − ρ²).
+    let expected = (0.01 * 6.0_f64).sqrt() * (1.0 - rho * rho);
+    approx::assert_relative_eq!(se[0], expected, max_relative = 1e-12);
+}
+
+/// No correlations declared → no SE vector at all, rather than an empty one.
+#[test]
+fn test_se_residual_correlation_none_without_block_sigma() {
+    use super::extract_residual_correlation_se;
+
+    let template = make_template(None, Vec::new());
+    let cov = DMatrix::<f64>::identity(3, 3);
+    assert!(extract_residual_correlation_se(&Some(cov), &template).is_none());
+}
+
+/// A covariance matrix truncated below the ρ slot reports 0.0 rather than
+/// panicking a converged fit away — matching every other `se_*` branch.
+#[test]
+fn test_se_residual_correlation_truncated_cov_reports_zero() {
+    use super::extract_residual_correlation_se;
+
+    let mut template = make_template(None, Vec::new());
+    template.sigma = SigmaVector {
+        values: vec![0.3, 1.0],
+        names: vec!["PROP_ERR".into(), "ADD_ERR".into()],
+    };
+    template.sigma_fixed = vec![false; 2];
+    template.residual_correlations = vec![ResidualCorrelation {
+        sigma_i: 1,
+        sigma_j: 0,
+        rho: 0.4,
+    }];
+    template.residual_correlation_fixed = vec![false];
+    // Packed length is 5; hand it a 3×3.
+    let cov = DMatrix::<f64>::identity(3, 3);
+    let se = extract_residual_correlation_se(&Some(cov), &template).expect("rho SE");
+    assert_eq!(se, vec![0.0]);
 }

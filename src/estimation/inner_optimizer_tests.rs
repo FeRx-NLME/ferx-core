@@ -114,6 +114,7 @@ mod ctmm_inner {
                 &[eta0],
                 &params.omega,
                 &params.sigma.values,
+                &params.residual_correlations,
                 None,
                 None,
             )
@@ -456,7 +457,17 @@ fn analytic_inner_gradient_m3_matches_fd_on_warfarin_bloq() {
     let scratch = RefCell::new(pk::EventPkParams::with_capacity_for(subject));
     let obj = |e: &[f64]| -> f64 {
         let mut s = scratch.borrow_mut();
-        individual_nll_into_with_schedule(&model, subject, theta, e, omega, sigma, &mut s, None)
+        individual_nll_into_with_schedule(
+            &model,
+            subject,
+            theta,
+            e,
+            omega,
+            sigma,
+            &model.residual_correlations,
+            &mut s,
+            None,
+        )
     };
     let fd = gradient_fd(&obj, &eta, model.n_eta);
 
@@ -548,7 +559,17 @@ fn analytic_inner_gradient_ode_init_theta_sqrt_matches_fd() {
     let scratch = RefCell::new(pk::EventPkParams::with_capacity_for(&subject));
     let obj = |e: &[f64]| -> f64 {
         let mut s = scratch.borrow_mut();
-        individual_nll_into_with_schedule(&model, &subject, theta, e, omega, sigma, &mut s, None)
+        individual_nll_into_with_schedule(
+            &model,
+            &subject,
+            theta,
+            e,
+            omega,
+            sigma,
+            &model.residual_correlations,
+            &mut s,
+            None,
+        )
     };
     let fd = gradient_fd(&obj, &eta, model.n_eta);
     for k in 0..model.n_eta {
@@ -611,7 +632,17 @@ fn analytic_inner_gradient_iiv_on_ruv_m3_matches_fd() {
     let scratch = RefCell::new(pk::EventPkParams::with_capacity_for(&subject));
     let obj = |e: &[f64]| -> f64 {
         let mut s = scratch.borrow_mut();
-        individual_nll_into_with_schedule(&model, &subject, theta, e, omega, sigma, &mut s, None)
+        individual_nll_into_with_schedule(
+            &model,
+            &subject,
+            theta,
+            e,
+            omega,
+            sigma,
+            &model.residual_correlations,
+            &mut s,
+            None,
+        )
     };
     let fd = gradient_fd(&obj, &eta, model.n_eta);
     for k in 0..model.n_eta {
@@ -665,7 +696,17 @@ fn analytic_inner_gradient_m3_matches_fd_on_warfarin_ode_bloq() {
     let scratch = RefCell::new(pk::EventPkParams::with_capacity_for(subject));
     let obj = |e: &[f64]| -> f64 {
         let mut s = scratch.borrow_mut();
-        individual_nll_into_with_schedule(&model, subject, theta, e, omega, sigma, &mut s, None)
+        individual_nll_into_with_schedule(
+            &model,
+            subject,
+            theta,
+            e,
+            omega,
+            sigma,
+            &model.residual_correlations,
+            &mut s,
+            None,
+        )
     };
     let fd = gradient_fd(&obj, &eta, model.n_eta);
 
@@ -733,7 +774,17 @@ fn analytic_inner_gradient_m3_iiv_on_ruv_matches_fd_on_ode() {
     let scratch = RefCell::new(pk::EventPkParams::with_capacity_for(&subject));
     let obj = |e: &[f64]| -> f64 {
         let mut s = scratch.borrow_mut();
-        individual_nll_into_with_schedule(&model, &subject, theta, e, omega, sigma, &mut s, None)
+        individual_nll_into_with_schedule(
+            &model,
+            &subject,
+            theta,
+            e,
+            omega,
+            sigma,
+            &model.residual_correlations,
+            &mut s,
+            None,
+        )
     };
     let fd = gradient_fd(&obj, &eta, model.n_eta);
     for k in 0..model.n_eta {
@@ -1086,6 +1137,8 @@ fn test_frem_jacobian_overrides_fd_with_exact_values() {
         vec!["ETA_CL".into(), "ETA_V".into(), "ETA_WT_FREM".into()],
     );
     let default_params = crate::types::ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![10.0, 100.0, 90.0],
         theta_names: vec!["TVCL".into(), "TVV".into(), "TV_WT".into()],
         theta_lower: vec![0.01, 1.0, 0.0],

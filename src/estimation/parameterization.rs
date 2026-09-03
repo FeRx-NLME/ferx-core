@@ -1,4 +1,4 @@
-use crate::types::{CompiledModel, ModelParameters, OmegaMatrix, SigmaVector};
+use crate::types::{CompiledModel, ModelParameters, OmegaMatrix, ResidualCorrelation, SigmaVector};
 use nalgebra::DMatrix;
 
 /// Bounds for the packed parameter vector
@@ -30,11 +30,58 @@ pub(crate) fn theta_packs_log(theta_lower: f64) -> bool {
     theta_lower >= 0.0
 }
 
+/// Unconstrained-space bound for a Fisher-z (`atanh ρ`) residual-correlation
+/// coordinate (#847). `tanh(3) ≈ 0.995_05`, so `1 − ρ² ≥ 9.9e-3`.
+///
+/// Strict positive-definiteness is not a strong enough bound here. A paired
+/// residual block's determinant carries a factor `1 − ρ²`, so a ρ merely
+/// *inside* `(-1, 1)` can still make `R` numerically singular: at the earlier
+/// `tanh(6) ≈ 0.999_988` the factor is `2.5e-5`, `R⁻¹` blows up by `4e4`, and the
+/// likelihood is happy to chase `log|R| → −∞`. On the 12-observation
+/// `examples/correlated_residual_combined` fixture a free ρ ran to −0.999_93 and
+/// reported convergence at OFV −8.38 — a degenerate optimum, not an estimate.
+///
+/// `0.995` is well clear of anything a real correlated-residual model needs
+/// (NONMEM's fluconazole `$SIGMA BLOCK` estimate is 0.9312, `z = 1.67`), and a ρ
+/// pinned at this rail is a legible diagnostic — the two endpoints are carrying
+/// the same noise — where a ρ of 0.999_9 is just a broken fit that looks
+/// converged.
+pub(crate) const RHO_Z_BOUND: f64 = 3.0;
+
+/// Largest `|ρ|` that survives the pack. The parser already rejects `|ρ| >= 1`
+/// at declaration time, so this only guards `atanh` against an init that lands
+/// on the boundary through a covariance/variance round-trip.
+const RHO_CLAMP: f64 = 0.999_999;
+
+/// Pack a residual correlation `ρ ∈ (-1, 1)` as its Fisher-z coordinate
+/// `atanh(ρ)`, clamped into `[-RHO_Z_BOUND, RHO_Z_BOUND]`.
+#[inline]
+pub(crate) fn pack_rho(rho: f64) -> f64 {
+    rho.clamp(-RHO_CLAMP, RHO_CLAMP)
+        .atanh()
+        .clamp(-RHO_Z_BOUND, RHO_Z_BOUND)
+}
+
+/// Inverse of [`pack_rho`]: `ρ = tanh(z)`.
+#[inline]
+pub(crate) fn unpack_rho(z: f64) -> f64 {
+    z.tanh()
+}
+
+/// Chain factor `dρ/dz = 1 − ρ²` for the Fisher-z coordinate, applied by every
+/// packed-gradient producer that emits a ρ slot.
+#[inline]
+pub(crate) fn rho_chain(rho: f64) -> f64 {
+    1.0 - rho * rho
+}
+
 /// Pack ModelParameters into a flat unconstrained vector for optimization.
 ///
 /// Layout: [pack(theta_1), ..., pack(theta_n),
 ///          log(L_11), L_21, log(L_22), ...,   (Cholesky lower triangle)
-///          log(sigma_1), ..., log(sigma_m)]
+///          log(sigma_1), ..., log(sigma_m),
+///          Ω_IOV Cholesky, mixture overrides,
+///          atanh(rho_1), ..., atanh(rho_r)]  (`block_sigma` off-diagonals)
 ///
 /// Theta packing depends on whether the user's `theta_lower[i]` allows
 /// negatives — see `theta_packs_log`.
@@ -94,6 +141,16 @@ pub fn pack_params(params: &ModelParameters) -> Vec<f64> {
         for &(c, s) in &mix.sigma_override_addr {
             v.push(mix.sigma[c].values[s].max(1e-10).ln());
         }
+    }
+
+    // `block_sigma` off-diagonals (#847): Fisher-z `atanh(ρ)`. Appended **last**,
+    // after IOV and the mixture overrides, so every offset the rest of the
+    // codebase computes from `n_theta`/`n_omega`/`n_sigma` (the covariance step's
+    // `kappa_start`, the mixture segment start, …) keeps pointing at the same
+    // coordinate. A `FIX`ed block is pinned by `compute_bounds` (lower == upper)
+    // and flagged in `packed_fixed_mask`.
+    for corr in &params.residual_correlations {
+        v.push(pack_rho(corr.rho));
     }
 
     v
@@ -220,6 +277,18 @@ pub fn unpack_params(v: &[f64], template: &ModelParameters) -> ModelParameters {
         }
     });
 
+    // Residual correlations (#847). The pair indices are structural, so they are
+    // taken from the template; only ρ = tanh(z) comes off the packed vector.
+    let residual_correlations: Vec<ResidualCorrelation> = template
+        .residual_correlations
+        .iter()
+        .map(|c| {
+            let rho = unpack_rho(v[idx]);
+            idx += 1;
+            ResidualCorrelation { rho, ..*c }
+        })
+        .collect();
+
     ModelParameters {
         theta,
         theta_names: template.theta_names.clone(),
@@ -230,6 +299,8 @@ pub fn unpack_params(v: &[f64], template: &ModelParameters) -> ModelParameters {
         omega_fixed: template.omega_fixed.clone(),
         sigma,
         sigma_fixed: template.sigma_fixed.clone(),
+        residual_correlations,
+        residual_correlation_fixed: template.residual_correlation_fixed.clone(),
         omega_iov,
         kappa_fixed: template.kappa_fixed.clone(),
         mixture,
@@ -282,6 +353,20 @@ pub fn packed_fixed_mask(template: &ModelParameters) -> Vec<bool> {
     if let Some(ref mix) = template.mixture {
         mask.extend_from_slice(&mix.omega_override_fixed);
         mask.extend_from_slice(&mix.sigma_override_fixed);
+    }
+
+    // `block_sigma` off-diagonals (#847), appended last to mirror `pack_params`.
+    // A short `residual_correlation_fixed` reads as free rather than panicking:
+    // the parser always fills it, but `ModelParameters` is public and a caller
+    // that builds one by hand should not lose the correlation entirely.
+    for i in 0..template.residual_correlations.len() {
+        mask.push(
+            template
+                .residual_correlation_fixed
+                .get(i)
+                .copied()
+                .unwrap_or(false),
+        );
     }
 
     mask
@@ -378,6 +463,13 @@ pub(crate) fn coordinate_kinds(template: &ModelParameters) -> Vec<PackedCoordKin
             PackedCoordKind::Sigma,
         );
     }
+    // `block_sigma` off-diagonals (#847) are Fisher-z coordinates bounded
+    // symmetrically at ±`RHO_Z_BOUND`, so — exactly like an Ω off-diagonal —
+    // *either* rail is a runaway and neither is a collapse toward zero.
+    kinds.resize(
+        kinds.len() + template.residual_correlations.len(),
+        PackedCoordKind::OmegaOffDiagonal,
+    );
     kinds
 }
 
@@ -393,7 +485,16 @@ pub fn packed_len(template: &ModelParameters) -> usize {
     let n_mixture = template.mixture.as_ref().map_or(0, |mix| {
         mix.omega_override_addr.len() + mix.sigma_override_addr.len()
     });
-    n_theta + n_omega + n_sigma + n_iov + n_mixture
+    let n_rho = template.residual_correlations.len();
+    n_theta + n_omega + n_sigma + n_iov + n_mixture + n_rho
+}
+
+/// Index of the first `block_sigma` residual-correlation coordinate in the
+/// packed vector (#847) — i.e. `packed_len` minus the number of correlations,
+/// since they are packed last. Callers that assemble or read a ρ slot must go
+/// through this rather than re-deriving the offset.
+pub(crate) fn rho_packed_start(template: &ModelParameters) -> usize {
+    packed_len(template) - template.residual_correlations.len()
 }
 
 /// Compute box constraints for the packed parameter vector.
@@ -474,6 +575,14 @@ pub fn compute_bounds(template: &ModelParameters) -> PackedBounds {
         }
     }
 
+    // `block_sigma` off-diagonal bounds (#847), in Fisher-z space. See
+    // `RHO_Z_BOUND`: the box keeps ρ = tanh(z) inside (-1, 1), so R never goes
+    // singular from the correlation alone.
+    for _ in 0..template.residual_correlations.len() {
+        lower.push(-RHO_Z_BOUND);
+        upper.push(RHO_Z_BOUND);
+    }
+
     // Pin any FIX parameters to their packed (log-space) initial value.
     // We pack first, then overwrite lower=upper=packed[i] for fixed indices.
     // Pack-before-overwrite is correct even for block Cholesky off-diagonals,
@@ -524,6 +633,17 @@ pub fn coordinate_names(params: &ModelParameters) -> Vec<String> {
         for &(c, s) in &mix.sigma_override_addr {
             let base = named_or(&params.sigma.names, s, || format!("SIGMA({})", s + 1));
             names.push(format!("{base}_MIX{}", c + 1));
+        }
+    }
+    // `block_sigma` off-diagonals (#847), packed last. Named like an Ω
+    // off-diagonal — `EPS_i~EPS_j` when both sigmas are declared, else the
+    // NONMEM-style `SIGMA(i,j)`.
+    for c in &params.residual_correlations {
+        let ni = params.sigma.names.get(c.sigma_i).filter(|s| !s.is_empty());
+        let nj = params.sigma.names.get(c.sigma_j).filter(|s| !s.is_empty());
+        match (ni, nj) {
+            (Some(a), Some(b)) => names.push(format!("{}~{}", a, b)),
+            _ => names.push(format!("SIGMA({},{})", c.sigma_i + 1, c.sigma_j + 1)),
         }
     }
     names
@@ -578,6 +698,10 @@ pub fn coordinate_values(params: &ModelParameters) -> Vec<f64> {
         for &(c, s) in &mix.sigma_override_addr {
             v.push(mix.sigma[c].values[s]);
         }
+    }
+    // `block_sigma` off-diagonals report on their natural ρ scale, not Fisher-z.
+    for c in &params.residual_correlations {
+        v.push(c.rho);
     }
     v
 }
@@ -660,6 +784,44 @@ pub fn compute_scale(x: &[f64]) -> Vec<f64> {
     x.iter()
         .map(|&v| if v.abs() > 0.1 { v.abs() } else { 1.0 })
         .collect()
+}
+
+/// [`compute_scale`], but the `block_sigma` Fisher-z coordinates keep scale 1.0
+/// (#847).
+///
+/// Magnitude scaling divides a coordinate by its own |packed value|, which is the
+/// right preconditioner for a **log-space** coordinate: there `|v|` is the
+/// parameter's order of magnitude, and the scaled bound range comes out within a
+/// few units of the origin. A Fisher-z `z = atanh(ρ)` is not on a log scale.
+/// `|z|` is a *position* in a bounded range that passes through zero at ρ = 0, so
+/// dividing by it is meaningless — and actively harmful: at the common init
+/// ρ = 0.2, `z = 0.203`, so the scaled box becomes ±`RHO_Z_BOUND`/0.203 ≈ ±30
+/// while every other scaled coordinate spans single digits. A quasi-Newton
+/// optimizer reads that as one direction with thirty times the room of the
+/// others.
+///
+/// The rule is `max(|z|, 1)`: normalise a ρ that has already grown past 1 (near a
+/// strong correlation, `atanh(0.93) ≈ 1.68`, where dividing by it is the same
+/// well-behaved normalisation every other coordinate gets), but never *divide by
+/// a value below 1*, which is what inflates the box. `compute_scale` makes the
+/// same move with its own 0.1 floor; a Fisher-z coordinate simply needs the floor
+/// at 1, because that is where its useful range begins.
+///
+/// Measured on the fluconazole RadboudUMC model (#847's motivating case), FOCEI
+/// from the model's declared inits: plain `compute_scale` fails at 1111.12
+/// (NLopt `Failure`, ρ never leaves its 0.2 init), a flat 1.0 converges to 736.89
+/// but stalls at init when started from NONMEM's estimates, and `max(|z|, 1)`
+/// converges from both (736.89 with ρ = 0.9319, against NONMEM's 0.9312).
+pub(crate) fn compute_scale_packed(x: &[f64], template: &ModelParameters) -> Vec<f64> {
+    let mut scale = compute_scale(x);
+    for (s, z) in scale
+        .iter_mut()
+        .zip(x.iter())
+        .skip(rho_packed_start(template))
+    {
+        *s = z.abs().max(1.0);
+    }
+    scale
 }
 
 /// Divide each element of `x` by the corresponding scale factor.
@@ -812,6 +974,8 @@ mod tests {
             names: vec!["sigma_prop".into()],
         };
         ModelParameters {
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             theta: vec![10.0, 100.0],
             theta_names: vec!["cl".into(), "v".into()],
             theta_lower: vec![0.01, 0.01],
@@ -832,6 +996,172 @@ mod tests {
         let template = make_template();
         // 2 theta + 2 diagonal omega + 1 sigma = 5
         assert_eq!(packed_len(&template), 5);
+    }
+
+    /// A two-sigma template carrying one `block_sigma` off-diagonal (#847).
+    fn make_rho_template(rho: f64, fixed: bool) -> ModelParameters {
+        let mut t = make_template();
+        t.sigma = SigmaVector {
+            values: vec![0.3, 1.0],
+            names: vec!["prop".into(), "add".into()],
+        };
+        t.sigma_fixed = vec![false; 2];
+        t.residual_correlations = vec![ResidualCorrelation {
+            sigma_i: 1,
+            sigma_j: 0,
+            rho,
+        }];
+        t.residual_correlation_fixed = vec![fixed];
+        t
+    }
+
+    /// #847: a residual correlation packs as `atanh(ρ)` in the **last** slot and
+    /// round-trips through `tanh`. Packing it last is what keeps every offset
+    /// derived from `n_theta`/`n_omega`/`n_sigma` — the covariance step's
+    /// `kappa_start`, the mixture segment — pointing at the same coordinate.
+    #[test]
+    fn test_pack_unpack_rho_round_trip() {
+        let template = make_rho_template(0.62, false);
+
+        // 2 theta + 2 omega + 2 sigma + 1 rho = 7, with rho last.
+        assert_eq!(packed_len(&template), 7);
+        assert_eq!(rho_packed_start(&template), 6);
+        let packed = pack_params(&template);
+        assert_eq!(packed.len(), 7);
+        assert_relative_eq!(packed[6], 0.62_f64.atanh(), epsilon = 1e-12);
+
+        let recovered = unpack_params(&packed, &template);
+        assert_eq!(recovered.residual_correlations.len(), 1);
+        // Pair indices are structural — they come from the template, not the vector.
+        assert_eq!(recovered.residual_correlations[0].sigma_i, 1);
+        assert_eq!(recovered.residual_correlations[0].sigma_j, 0);
+        assert_relative_eq!(
+            recovered.residual_correlations[0].rho,
+            0.62,
+            epsilon = 1e-12
+        );
+        assert_eq!(recovered.residual_correlation_fixed, vec![false]);
+
+        // Free (non-FIX): the box is the open Fisher-z interval, not a pin.
+        let bounds = compute_bounds(&template);
+        assert_relative_eq!(bounds.lower[6], -RHO_Z_BOUND);
+        assert_relative_eq!(bounds.upper[6], RHO_Z_BOUND);
+        assert!(!packed_fixed_mask(&template)[6]);
+
+        // Trace name / value carry the ρ coordinate last, on its natural scale.
+        let names = coordinate_names(&template);
+        assert_eq!(names.len(), 7);
+        assert_eq!(names[6], "add~prop");
+        let vals = coordinate_values(&template);
+        assert_eq!(vals.len(), 7);
+        assert_relative_eq!(vals[6], 0.62, epsilon = 1e-12);
+    }
+
+    /// A `block_sigma ... FIX` correlation is pinned by `compute_bounds`
+    /// (lower == upper) and flagged in `packed_fixed_mask`, so no optimizer that
+    /// respects box bounds can move it (#847).
+    #[test]
+    fn test_fixed_rho_is_pinned() {
+        let template = make_rho_template(0.2, true);
+        let packed = pack_params(&template);
+        let bounds = compute_bounds(&template);
+        assert!(packed_fixed_mask(&template)[6]);
+        assert_relative_eq!(bounds.lower[6], packed[6], epsilon = 1e-15);
+        assert_relative_eq!(bounds.upper[6], packed[6], epsilon = 1e-15);
+        assert!(template.has_any_fixed());
+    }
+
+    /// The Fisher-z box keeps ρ strictly inside (-1, 1) — the residual block
+    /// stays positive-definite even when the optimizer sits on a rail — and the
+    /// pack clamps an init that lands on the boundary instead of returning ±∞.
+    #[test]
+    fn test_rho_bounds_keep_correlation_admissible() {
+        assert!(unpack_rho(RHO_Z_BOUND) < 1.0);
+        assert!(unpack_rho(-RHO_Z_BOUND) > -1.0);
+        // Strictly inside (-1, 1) is not enough: a paired residual block's
+        // determinant carries `1 − ρ²`, so the rail must leave `R` invertible in
+        // floating point, not merely non-singular in exact arithmetic (#847).
+        let rho_max = unpack_rho(RHO_Z_BOUND);
+        assert!(
+            1.0 - rho_max * rho_max >= 9e-3,
+            "the ρ rail must keep 1 − ρ² ≥ 9e-3; got {}",
+            1.0 - rho_max * rho_max
+        );
+        assert!(pack_rho(1.0).is_finite());
+        assert_relative_eq!(pack_rho(1.0), RHO_Z_BOUND);
+        assert_relative_eq!(pack_rho(-1.0), -RHO_Z_BOUND);
+        // `rho_chain` is `dρ/dz` for `ρ = tanh(z)`; check it against a central
+        // difference of `unpack_rho` so the two can never drift apart.
+        let z = 0.7_f64;
+        let h = 1e-6;
+        let fd = (unpack_rho(z + h) - unpack_rho(z - h)) / (2.0 * h);
+        assert_relative_eq!(rho_chain(unpack_rho(z)), fd, epsilon = 1e-9);
+    }
+
+    /// `compute_scale_packed` must be **byte-identical** to `compute_scale` for
+    /// any model without a `block_sigma` — the scaling change (#847) is scoped to
+    /// the ρ block and must not perturb a single existing fit.
+    #[test]
+    fn test_scale_packed_is_unchanged_without_correlations() {
+        let template = make_template();
+        let x = pack_params(&template);
+        assert_eq!(compute_scale_packed(&x, &template), compute_scale(&x));
+    }
+
+    /// Magnitude scaling normalises by |packed value|, which is meaningless for a
+    /// Fisher-z coordinate: `z = atanh(ρ)` is a position in a bounded range, not
+    /// an order of magnitude, and it passes through zero at ρ = 0. At the common
+    /// ρ = 0.2 init that would hand the optimizer a coordinate with ~30× the
+    /// scaled room of every other one. Leave it at 1.0 (#847).
+    #[test]
+    fn test_scale_packed_leaves_the_rho_coordinate_alone() {
+        let template = make_rho_template(0.2, false);
+        let x = pack_params(&template);
+        let scale = compute_scale_packed(&x, &template);
+        let rho_idx = rho_packed_start(&template);
+
+        // atanh(0.2) ≈ 0.203 < 1, so the floor applies and the box is not inflated.
+        assert_eq!(scale[rho_idx], 1.0);
+        // Every non-ρ coordinate keeps the magnitude scaling untouched.
+        let plain = compute_scale(&x);
+        assert_eq!(scale[..rho_idx], plain[..rho_idx]);
+        // The wart this exists to remove: |atanh(0.2)| ≈ 0.203, so magnitude
+        // scaling would have given the ρ box ~30 units of scaled room.
+        let bounds = compute_bounds(&template);
+        let width_if_scaled =
+            (bounds.upper[rho_idx] - bounds.lower[rho_idx]) / plain[rho_idx].abs();
+        assert!(
+            width_if_scaled > 25.0,
+            "the unscaled-ρ guard is pointless if magnitude scaling were benign here \
+             (width {width_if_scaled})"
+        );
+        let width_now = (bounds.upper[rho_idx] - bounds.lower[rho_idx]) / scale[rho_idx];
+        assert_relative_eq!(width_now, 2.0 * RHO_Z_BOUND);
+    }
+
+    /// Above the floor the ρ coordinate is normalised like any other: at a strong
+    /// correlation `|atanh(ρ)| > 1`, and dividing by it is the same well-behaved
+    /// move `compute_scale` makes everywhere else. Only the *below-1* case is
+    /// special (#847).
+    #[test]
+    fn test_scale_packed_normalises_a_large_rho_coordinate() {
+        let template = make_rho_template(0.93, false);
+        let x = pack_params(&template);
+        let rho_idx = rho_packed_start(&template);
+        let z = 0.93_f64.atanh();
+        assert!(z > 1.0);
+        assert_relative_eq!(compute_scale_packed(&x, &template)[rho_idx], z);
+    }
+
+    /// A ρ coordinate is bounded symmetrically, so — like an Ω off-diagonal —
+    /// the runaway guard must treat *either* rail as a runaway, never as a
+    /// collapse toward zero.
+    #[test]
+    fn test_rho_coordinate_kind_is_symmetric() {
+        let template = make_rho_template(0.4, false);
+        let kinds = coordinate_kinds(&template);
+        assert_eq!(kinds.len(), packed_len(&template));
+        assert_eq!(kinds[6], PackedCoordKind::OmegaOffDiagonal);
     }
 
     #[test]
@@ -897,6 +1227,8 @@ mod tests {
             names: vec!["sigma_prop".into()],
         };
         let template = ModelParameters {
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             theta: vec![5.0, -0.8, -0.01],
             theta_names: vec!["tvcl".into(), "gamma".into(), "age_eff".into()],
             theta_lower: vec![0.1, -3.0, -1.0],
@@ -988,6 +1320,8 @@ mod tests {
             names: vec!["sigma_prop".into()],
         };
         ModelParameters {
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             theta: vec![10.0, 100.0],
             theta_names: vec!["cl".into(), "v".into()],
             theta_lower: vec![0.01, 0.01],
@@ -1041,6 +1375,8 @@ mod tests {
         // 2 theta + block+diag Ω (col-major lower-tri: (0,0)(1,0)(2,0)(1,1)(2,1)(2,2))
         // + 1 sigma. Structural zeros are (2,0) and (2,1).
         let template = ModelParameters {
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             theta: vec![1.0, 2.0],
             theta_names: vec!["a".into(), "b".into()],
             theta_lower: vec![0.0, 0.0],
@@ -1097,6 +1433,8 @@ mod tests {
         // Layout: theta(1) + bsvΩ(1) + sigma(1) + iovΩ(6) = 9.
         //   iov packed offset 3: (0,0)=3 (1,0)=4 (2,0)=5 (1,1)=6 (2,1)=7 (2,2)=8
         let template = ModelParameters {
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             theta: vec![1.0],
             theta_names: vec!["a".into()],
             theta_lower: vec![0.0],
@@ -1218,6 +1556,8 @@ mod tests {
         m[(1, 0)] = 0.02;
         let omega = OmegaMatrix::from_matrix(m, vec![String::new(), String::new()], false);
         let t = ModelParameters {
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             theta: vec![1.0],
             theta_names: vec![String::new()],
             theta_lower: vec![0.0],
@@ -1302,6 +1642,8 @@ mod tests {
             names: vec!["PROP_ERR".into()],
         };
         let default_params = ModelParameters {
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             theta: vec![0.2, 10.0, 1.5],
             theta_names: theta_names.clone(),
             theta_lower: vec![0.001, 0.1, 0.01],
@@ -1598,6 +1940,8 @@ mod tests {
             names: vec!["PROP_ERR".into()],
         };
         ModelParameters {
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             theta: vec![5.0],
             theta_names: vec!["TVCL".into()],
             theta_lower: vec![0.01],
@@ -1752,6 +2096,8 @@ mod tests {
             names: vec!["PROP_ERR".into()],
         };
         ModelParameters {
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             theta: vec![0.2],
             theta_names: vec!["TVCL".into()],
             theta_lower: vec![0.01],

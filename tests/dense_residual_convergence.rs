@@ -42,7 +42,11 @@ const MODEL: &str = "\
 ";
 
 fn fit_with(gradient: GradientMethod) -> ferx_core::FitResult {
-    let mut model = parse_model_string(MODEL).expect("block_sigma model must parse");
+    fit_source(MODEL, gradient)
+}
+
+fn fit_source(src: &str, gradient: GradientMethod) -> ferx_core::FitResult {
+    let mut model = parse_model_string(src).expect("block_sigma model must parse");
     assert!(
         !model.residual_correlations.is_empty(),
         "model must carry a residual correlation"
@@ -107,4 +111,64 @@ fn dense_residual_analytic_and_fd_fits_agree() {
             fd.theta[k]
         );
     }
+}
+
+/// #847: a bare `block_sigma` estimates its off-diagonal, so the free-rho fit must
+/// (a) actually move rho off its declared value and (b) land at an OFV no worse
+/// than the `FIX`ed fit — the fixed model is the free model restricted to a
+/// single point of the rho axis, so a free fit that scored worse would mean the
+/// rho gradient points the optimizer the wrong way.
+///
+/// This is the convergence-level companion to the per-coordinate parity tests
+/// (`population_packed_gradient_block_sigma_matches_fd` and siblings), which pin
+/// the rho gradient itself against Richardson reconverged FD.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn dense_residual_free_rho_beats_fixed_rho() {
+    let free_src = MODEL.replace("1.00] FIX", "1.00]");
+    let free = fit_source(&free_src, GradientMethod::Auto);
+    let fixed = fit_with(GradientMethod::Auto);
+
+    assert!(
+        free.ofv.is_finite() && fixed.ofv.is_finite(),
+        "both OFVs must be finite: free {}, fixed {}",
+        free.ofv,
+        fixed.ofv
+    );
+    assert_eq!(free.residual_correlation_fixed, vec![false]);
+    assert_eq!(fixed.residual_correlation_fixed, vec![true]);
+
+    // The FIXed fit holds rho at the declaration; the free fit moves it.
+    let declared = 0.5_f64;
+    assert!((fixed.residual_correlations[0].rho - declared).abs() < 1e-12);
+    let free_rho = free.residual_correlations[0].rho;
+    assert!(
+        (free_rho - declared).abs() > 1e-3,
+        "free rho should move off the {declared} init, got {free_rho}"
+    );
+    assert!(
+        free_rho.abs() < 1.0,
+        "the Fisher-z box must keep rho admissible, got {free_rho}"
+    );
+
+    // Widening the feasible set cannot make the optimum worse.
+    assert!(
+        free.ofv <= fixed.ofv + 1e-2,
+        "free-rho OFV {} should be no worse than fixed-rho OFV {}",
+        free.ofv,
+        fixed.ofv
+    );
+
+    // The analytic rho gradient must reach the same optimum the FD path does —
+    // the rho analogue of `dense_residual_analytic_and_fd_fits_agree`.
+    let free_fd = fit_source(&free_src, GradientMethod::Fd);
+    assert!(
+        free.ofv <= free_fd.ofv + 1e-2,
+        "analytic free-rho OFV {} should be no worse than FD {}",
+        free.ofv,
+        free_fd.ofv
+    );
 }

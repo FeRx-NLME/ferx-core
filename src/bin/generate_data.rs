@@ -167,6 +167,8 @@ fn build_warfarin_model() -> CompiledModel {
         names: vec!["PROP_ERR".into()],
     };
     let default_params = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![0.134, 8.1, 1.0],
         theta_names: theta_names.clone(),
         theta_lower: vec![0.001, 0.1, 0.01],
@@ -263,6 +265,8 @@ fn build_warfarin_model() -> CompiledModel {
 
 fn build_warfarin_true_params() -> ModelParameters {
     ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![0.134, 8.1, 1.0],
         theta_names: vec!["TVCL".into(), "TVV".into(), "TVKA".into()],
         theta_lower: vec![0.001, 0.1, 0.01],
@@ -301,6 +305,8 @@ fn generate_two_cpt_iv() {
         names: vec!["PROP_ERR".into()],
     };
     let params = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0, 15.0, 3.0, 30.0],
         theta_names: theta_names.clone(),
         theta_lower: vec![0.1, 1.0, 0.01, 1.0],
@@ -427,6 +433,8 @@ fn generate_two_cpt_oral_cov() {
         names: vec!["PROP_ERR".into()],
     };
     let params = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0, 50.0, 10.0, 100.0, 1.2, 0.75, 0.50],
         theta_names: theta_names.clone(),
         theta_lower: vec![0.1, 1.0, 0.1, 1.0, 0.01, 0.01, 0.01],
@@ -619,6 +627,8 @@ fn generate_mm_oral() {
         names: vec!["PROP_ERR".into()],
     };
     let params = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![4.0, 6.0, 12.0, 1.5],
         theta_names: theta_names.clone(),
         theta_lower: vec![0.1, 0.1, 1.0, 0.05],

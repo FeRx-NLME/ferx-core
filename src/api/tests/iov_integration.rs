@@ -10,6 +10,8 @@ fn make_iov_model() -> CompiledModel {
     let omega = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
     let omega_iov = OmegaMatrix::from_diagonal(&[0.04], vec!["KAPPA_CL".into()]);
     let default_params = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0, 50.0],
         theta_names: vec!["TVCL".into(), "TVV".into()],
         theta_lower: vec![0.1, 5.0],
@@ -1782,11 +1784,17 @@ fn test_simulate_zero_rho_matches_diagonal_draw_path() {
 #[test]
 fn test_simulate_singular_rho_one_does_not_panic() {
     let (mut model, population) = block_sigma_selected_model_and_population();
-    model.residual_correlations = vec![crate::types::ResidualCorrelation {
+    let singular = vec![crate::types::ResidualCorrelation {
         sigma_i: 0,
         sigma_j: 1,
         rho: 1.0,
     }];
+    // `simulate` draws from the **parameter vector's** correlations since #847
+    // (so a VPC of an estimated `block_sigma` reproduces the fitted rho), so the
+    // singular value has to be set there; the model copy is kept in step because
+    // the two must agree for every other consumer.
+    model.residual_correlations = singular.clone();
+    model.default_params.residual_correlations = singular;
 
     let n_sim = 20_000;
     let results = simulate_with_seed(&model, &population, &model.default_params, n_sim, 11);
@@ -1840,6 +1848,7 @@ fn test_emit_correlated_residual_rows_magnitude_and_scale_paths() {
         &model,
         subject,
         &model.default_params,
+        &model.default_params.residual_correlations,
         &ipreds,
         2.0, // ruv_scale != 1.0
         Some(&mult),

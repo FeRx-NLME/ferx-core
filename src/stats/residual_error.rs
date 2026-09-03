@@ -1512,6 +1512,89 @@ mod tests {
         assert_relative_eq!(v, 0.25, epsilon = 1e-12);
     }
 
+    /// #847: `dvar_drho`'s closed forms must equal central differences of the
+    /// production `R` and `∂R/∂f` builders in ρ. Those two are what the objective
+    /// and the outer gradient consume, so agreeing with them is the whole
+    /// contract — a hand-derived formula that drifts from either is the bug this
+    /// pins.
+    #[test]
+    fn dvar_drho_matches_fd_of_the_production_builders() {
+        let es = ErrorSpec::Single(ErrorModel::Combined);
+        let sigma = [0.3_f64, 1.4];
+        let f = 7.5_f64;
+        let rho = 0.42_f64;
+        let corr_at = |r: f64| {
+            vec![ResidualCorrelation {
+                sigma_i: 0,
+                sigma_j: 1,
+                rho: r,
+            }]
+        };
+        // `∂R/∂f` comes from the same helper `compute_dr_df_matrices` puts on the
+        // diagonal, so this differentiates exactly what production reads.
+        let d_at = |r: f64| {
+            diag_self_deriv(
+                &es.sigma_loadings(0, f, sigma.len()),
+                &es.sigma_loading_slopes(0, sigma.len()),
+                &sigma,
+                &corr_at(r),
+            )
+        };
+        let h = 1e-6;
+        let fd_r = (es.variance_at_with_correlations(0, f, &sigma, &corr_at(rho + h))
+            - es.variance_at_with_correlations(0, f, &sigma, &corr_at(rho - h)))
+            / (2.0 * h);
+        let fd_d = (d_at(rho + h) - d_at(rho - h)) / (2.0 * h);
+
+        let mut out = [(0.0, 0.0)];
+        dvar_drho(&es, 0, f, &sigma, &corr_at(rho), &mut out);
+        assert_relative_eq!(out[0].0, fd_r, max_relative = 1e-8);
+        assert_relative_eq!(out[0].1, fd_d, max_relative = 1e-8);
+        // Combined error: R = (fσ_p)² + σ_a² + 2ρ·f·σ_p·σ_a, so the hand value is
+        // 2·f·σ_p·σ_a — pinned so an FD-only check can't hide a shared mistake.
+        assert_relative_eq!(out[0].0, 2.0 * f * sigma[0] * sigma[1], epsilon = 1e-12);
+        assert_relative_eq!(out[0].1, 2.0 * sigma[0] * sigma[1], epsilon = 1e-12);
+    }
+
+    /// The `MIN_VARIANCE` clamp is asymmetric on purpose: `variance_at_scaled`
+    /// floors `R` while `diag_self_deriv` leaves `d` unfloored, so a clamped row
+    /// must report `∂R/∂ρ = 0` and keep its `∂d/∂ρ`. Claiming a live `∂R/∂ρ` on a
+    /// row whose variance the objective has pinned is the #958 failure mode, on
+    /// the correlation axis (#847).
+    #[test]
+    fn dvar_drho_zeroes_the_variance_term_at_the_floor() {
+        // `Combined` loads both slots, so the correlation has a partner; driving
+        // both sigmas to zero puts the row on the floor.
+        let es = ErrorSpec::Single(ErrorModel::Combined);
+        let sigma = [0.0_f64, 0.0];
+        let corr = vec![ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        }];
+        assert!(es.variance_at_with_correlations(0, 5.0, &sigma, &corr) <= MIN_VARIANCE);
+        let mut out = [(0.0, 0.0)];
+        dvar_drho(&es, 0, 5.0, &sigma, &corr, &mut out);
+        assert_eq!(out[0].0, 0.0);
+    }
+
+    /// A correlation whose two sigma slots are not both loaded by an observation
+    /// contributes nothing to that observation's variance, so both derivatives
+    /// are zero — the same `continue` `variance_at_scaled` takes (#847).
+    #[test]
+    fn dvar_drho_is_zero_when_a_slot_is_not_loaded() {
+        // `Additive` loads slot 0 only, so a (0, 1) correlation has no partner.
+        let es = ErrorSpec::Single(ErrorModel::Additive);
+        let corr = vec![ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        }];
+        let mut out = [(1.0, 1.0)];
+        dvar_drho(&es, 0, 3.0, &[0.4, 0.9], &corr, &mut out);
+        assert_eq!(out[0], (0.0, 0.0));
+    }
+
     #[test]
     fn test_additive_variance_independent_of_prediction() {
         let v1 = residual_variance(ErrorModel::Additive, 1.0, &[0.5]);
@@ -2797,6 +2880,65 @@ pub(crate) fn residual_rd(
             es.dvar_df_scaled(cmt, f, sigma, m),
         ),
         None => (es.variance_at(cmt, f, sigma), es.dvar_df(cmt, f, sigma)),
+    }
+}
+
+/// Closed-form `(∂R_jj/∂ρ_k, ∂d_j/∂ρ_k)` for every `block_sigma` off-diagonal
+/// `k` at one observation (#847), where `d_j = ∂R_jj/∂f_j`.
+///
+/// The within-observation part of the residual variance is
+/// `R_jj = Σ_s (c_s σ_s)² + Σ_k 2 ρ_k c_{i_k} c_{j_k} σ_{i_k} σ_{j_k}`
+/// (see [`ErrorSpec::variance_at_scaled`]), and every loading coefficient `c_s`
+/// is affine in `f`, so
+///
+/// ```text
+///   ∂R_jj/∂ρ_k = 2 σ_i σ_j c_i c_j
+///   ∂d_j /∂ρ_k = 2 σ_i σ_j (c_i' c_j + c_i c_j')
+/// ```
+///
+/// with `c'` the slope loading. The `∂d/∂ρ` form is exactly the ρ-derivative of
+/// `diag_self_deriv`'s cross term, so the two can only agree.
+///
+/// **The floor is asymmetric, deliberately.** `variance_at_scaled` clamps `R` at
+/// `MIN_VARIANCE` while `diag_self_deriv` computes `d` unclamped, so a clamped
+/// row has `∂R/∂ρ = 0` but keeps its `∂d/∂ρ`. Mirroring that here is what stops
+/// the analytic gradient from claiming a live `∂R/∂ρ` on a row whose variance the
+/// objective has already pinned to the floor — the #958 failure mode, on the
+/// correlation axis.
+///
+/// A correlation whose two sigma slots are not both loaded by this observation
+/// contributes nothing to its variance, and so returns `(0, 0)`.
+pub(crate) fn dvar_drho(
+    es: &ErrorSpec,
+    cmt: usize,
+    f: f64,
+    sigma: &[f64],
+    correlations: &[ResidualCorrelation],
+    out: &mut [(f64, f64)],
+) {
+    debug_assert_eq!(out.len(), correlations.len());
+    let loadings = es.sigma_loadings(cmt, f, sigma.len());
+    let slopes = es.sigma_loading_slopes(cmt, sigma.len());
+    let coeff = |ld: &[(usize, f64)], slot: usize| -> Option<f64> {
+        ld.iter().find(|(i, _)| *i == slot).map(|(_, c)| *c)
+    };
+    let floored = es.variance_at_with_correlations(cmt, f, sigma, correlations) <= MIN_VARIANCE;
+    for (k, corr) in correlations.iter().enumerate() {
+        out[k] = (0.0, 0.0);
+        let (Some(ci), Some(cj)) = (
+            coeff(&loadings, corr.sigma_i),
+            coeff(&loadings, corr.sigma_j),
+        ) else {
+            continue;
+        };
+        let (Some(&si), Some(&sj)) = (sigma.get(corr.sigma_i), sigma.get(corr.sigma_j)) else {
+            continue;
+        };
+        let di = coeff(&slopes, corr.sigma_i).unwrap_or(0.0);
+        let dj = coeff(&slopes, corr.sigma_j).unwrap_or(0.0);
+        let ss = si * sj;
+        let dr = if floored { 0.0 } else { 2.0 * ss * ci * cj };
+        out[k] = (dr, 2.0 * ss * (di * cj + ci * dj));
     }
 }
 

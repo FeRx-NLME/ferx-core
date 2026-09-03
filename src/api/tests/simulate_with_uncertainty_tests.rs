@@ -11,6 +11,8 @@ use std::collections::HashMap;
 fn tiny_model() -> CompiledModel {
     let omega = OmegaMatrix::from_diagonal(&[0.04], vec!["ETA_CL".into()]);
     let default_params = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0, 50.0],
         theta_names: vec!["TVCL".into(), "TVV".into()],
         theta_lower: vec![0.1, 5.0],
@@ -391,6 +393,8 @@ fn synthetic_fit(template: &ModelParameters) -> FitResult {
     let n_packed = crate::estimation::parameterization::packed_len(template);
     let cov = DMatrix::identity(n_packed, n_packed) * 0.01;
     FitResult {
+        residual_correlation_fixed: Vec::new(),
+        se_residual_correlations: None,
         covariate_relations: Vec::new(),
         restored_from_checkpoint: false,
         method: EstimationMethod::FoceI,

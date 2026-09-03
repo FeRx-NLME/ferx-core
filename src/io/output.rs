@@ -2174,7 +2174,7 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
 
     if !result.residual_correlations.is_empty() {
         writeln!(f, "\nblock_sigma:").map_err(|e| e.to_string())?;
-        for corr in &result.residual_correlations {
+        for (k, corr) in result.residual_correlations.iter().enumerate() {
             let name_i = result.sigma_names.get(corr.sigma_i).ok_or_else(|| {
                 format!(
                     "residual correlation sigma_i index {} is out of bounds",
@@ -2199,18 +2199,44 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     corr.sigma_j
                 )
             })?;
-            // The correlation itself is always fixed by the `block_sigma`
-            // declaration, but the covariance it scales is only fixed when both
-            // sigma SDs were declared `FIX` — a bare `block_sigma (...) = [...]`
-            // estimates the diagonal, so its covariance moves during the fit.
+            // Since #847 a bare `block_sigma (...) = [...]` **estimates** the
+            // off-diagonal (NONMEM `$SIGMA BLOCK(n)`); only `... FIX` pins it. A
+            // pre-#847 `FitResult` carries no flags at all, and back then every
+            // correlation was fixed by construction — hence the `true` default.
+            let correlation_fixed = result
+                .residual_correlation_fixed
+                .get(k)
+                .copied()
+                .unwrap_or(true);
+            // The covariance `rho·sigma_i·sigma_j` is fixed only when *all three*
+            // factors are: a free rho or a free SD moves it during the fit.
             let sigma_is_fixed = |i: usize| result.sigma_fixed.get(i).copied().unwrap_or(false);
-            let covariance_fixed = sigma_is_fixed(corr.sigma_i) && sigma_is_fixed(corr.sigma_j);
+            let covariance_fixed =
+                correlation_fixed && sigma_is_fixed(corr.sigma_i) && sigma_is_fixed(corr.sigma_j);
             writeln!(f, "  {}__{}:", name_i, name_j).map_err(|e| e.to_string())?;
             writeln!(f, "    covariance: {:.6}", corr.rho * sigma_i * sigma_j)
                 .map_err(|e| e.to_string())?;
             writeln!(f, "    covariance_fixed: {}", covariance_fixed).map_err(|e| e.to_string())?;
             writeln!(f, "    correlation: {:.6}", corr.rho).map_err(|e| e.to_string())?;
-            writeln!(f, "    correlation_fixed: true").map_err(|e| e.to_string())?;
+            writeln!(f, "    correlation_fixed: {}", correlation_fixed)
+                .map_err(|e| e.to_string())?;
+            // SE on the natural rho scale. `~` for a FIXed correlation and for a
+            // fit whose covariance step did not run — the same convention the
+            // theta/omega/sigma blocks above use.
+            let corr_se = if correlation_fixed {
+                None
+            } else {
+                result
+                    .se_residual_correlations
+                    .as_ref()
+                    .and_then(|v| v.get(k))
+                    .copied()
+            };
+            match corr_se {
+                Some(se) => writeln!(f, "    correlation_se: {:.6}", se),
+                None => writeln!(f, "    correlation_se: ~"),
+            }
+            .map_err(|e| e.to_string())?;
         }
     }
 
@@ -2623,6 +2649,8 @@ mod tests {
         let sigma_types = error_model.sigma_types();
         let n = sigma.len();
         FitResult {
+            residual_correlation_fixed: Vec::new(),
+            se_residual_correlations: None,
             covariate_relations: Vec::new(),
             restored_from_checkpoint: false,
             method: EstimationMethod::Foce,
@@ -3324,6 +3352,8 @@ mod tests {
     fn minimal_sdtab_result(subjects: Vec<SubjectResult>) -> FitResult {
         let sigma_types = ErrorModel::Proportional.sigma_types();
         FitResult {
+            residual_correlation_fixed: Vec::new(),
+            se_residual_correlations: None,
             covariate_relations: Vec::new(),
             restored_from_checkpoint: false,
             method: EstimationMethod::Foce,
@@ -4309,9 +4339,59 @@ mod tests {
         assert!(yaml.contains("  ADD_ERR__PROP_ERR:"), "{yaml}");
         assert!(yaml.contains("    covariance: 0.100000"), "{yaml}");
         assert!(yaml.contains("    correlation: 0.500000"), "{yaml}");
-        // The correlation is fixed by the declaration; the covariance is not,
-        // because neither sigma SD was declared `FIX`.
+        // A `FitResult` with no `residual_correlation_fixed` is one written
+        // before #847, when every `block_sigma` off-diagonal was fixed by
+        // construction — so it must still read as fixed, with no SE.
         assert!(yaml.contains("    correlation_fixed: true"), "{yaml}");
+        assert!(yaml.contains("    covariance_fixed: false"), "{yaml}");
+        assert!(yaml.contains("    correlation_se: ~"), "{yaml}");
+    }
+
+    /// #847: a bare `block_sigma` estimates its off-diagonal, so the YAML must
+    /// report it as free and carry its natural-scale SE.
+    #[test]
+    fn write_yaml_reports_estimated_block_sigma_correlation() {
+        let mut r = make_sigma_only_result(ErrorModel::Combined, vec![0.2, 1.0]);
+        r.sigma_names = vec!["PROP_ERR".into(), "ADD_ERR".into()];
+        r.sigma_fixed = vec![false, false];
+        r.residual_correlations = vec![crate::types::ResidualCorrelation {
+            sigma_i: 1,
+            sigma_j: 0,
+            rho: 0.5,
+        }];
+        r.residual_correlation_fixed = vec![false];
+        r.se_residual_correlations = Some(vec![0.031_25]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+        let yaml = std::fs::read_to_string(&path).expect("yaml read");
+
+        assert!(yaml.contains("    correlation_fixed: false"), "{yaml}");
+        assert!(yaml.contains("    correlation_se: 0.031250"), "{yaml}");
+        // A free rho keeps the covariance free even when both SDs are pinned.
+        assert!(yaml.contains("    covariance_fixed: false"), "{yaml}");
+    }
+
+    /// A free rho makes the covariance free even with both sigma SDs `FIX`ed —
+    /// the covariance is `rho·sigma_i·sigma_j`, so all three factors must be
+    /// pinned before it is (#847).
+    #[test]
+    fn write_yaml_block_sigma_covariance_free_when_only_sigmas_fixed() {
+        let mut r = make_sigma_only_result(ErrorModel::Combined, vec![0.2, 1.0]);
+        r.sigma_names = vec!["PROP_ERR".into(), "ADD_ERR".into()];
+        r.sigma_fixed = vec![true, true];
+        r.residual_correlations = vec![crate::types::ResidualCorrelation {
+            sigma_i: 1,
+            sigma_j: 0,
+            rho: 0.5,
+        }];
+        r.residual_correlation_fixed = vec![false];
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+        let yaml = std::fs::read_to_string(&path).expect("yaml read");
+
+        assert!(yaml.contains("    correlation_fixed: false"), "{yaml}");
         assert!(yaml.contains("    covariance_fixed: false"), "{yaml}");
     }
 
@@ -4327,6 +4407,7 @@ mod tests {
             sigma_j: 0,
             rho: 0.5,
         }];
+        r.residual_correlation_fixed = vec![true];
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("fit.yaml");
         write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
@@ -4334,6 +4415,8 @@ mod tests {
 
         assert!(yaml.contains("    covariance_fixed: true"), "{yaml}");
         assert!(yaml.contains("    correlation_fixed: true"), "{yaml}");
+        // A pinned correlation reports no SE, like every other FIXed coordinate.
+        assert!(yaml.contains("    correlation_se: ~"), "{yaml}");
     }
 
     #[test]

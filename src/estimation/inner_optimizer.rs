@@ -846,6 +846,11 @@ pub fn find_ebe(
             e,
             &params.omega,
             &params.sigma.values,
+            // The live `block_sigma` off-diagonals (#847). FOCE/FOCEI estimate
+            // ρ, so the inner objective must see the optimizer's current value —
+            // reading `model.residual_correlations` here would hold the EBE
+            // search at the declared correlation while the outer loop moved it.
+            &params.residual_correlations,
             &mut scratch,
             schedule.as_ref(),
         )
@@ -881,6 +886,9 @@ pub fn find_ebe(
             e,
             &params.omega,
             &params.sigma.values,
+            // Live ρ (#847) — the same value `obj` above scores, so the BFGS
+            // gradient and objective can never disagree about the residual R.
+            &params.residual_correlations,
             schedule.as_ref(),
             mult.as_deref(),
         ) {
@@ -2109,6 +2117,10 @@ fn m3_censored_dterm_df(y: f64, f: f64, v: f64, dv_df: f64, cens: i8) -> f64 {
 /// #486 (the quotient rule is applied to the η-block), except when combined with
 /// LTBS, which still declines. Shared by the inner EBE loop and the HMC sampler so
 /// both estimators use the same Dual2 gradient (replacing the retired Enzyme path).
+/// `residual_correlations` carries the live `block_sigma` off-diagonals,
+/// parallel to `sigma` (#847). The inner EBE search has to see the ρ the outer
+/// loop is proposing, or it converges to the mode of a different objective than
+/// the one being minimised.
 pub(crate) fn analytic_eta_nll_gradient(
     model: &CompiledModel,
     subject: &Subject,
@@ -2128,6 +2140,8 @@ pub(crate) fn analytic_eta_nll_gradient(
         eta,
         omega,
         sigma,
+        // HMC and the one-off diagnostic callers hold ρ at the declaration (#847).
+        &model.residual_correlations,
         None,
         mult.as_deref(),
     )
@@ -2150,6 +2164,7 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     eta: &[f64],
     omega: &crate::types::OmegaMatrix,
     sigma: &[f64],
+    residual_correlations: &[crate::types::ResidualCorrelation],
     cached_schedule: Option<&crate::pk::event_driven::EventSchedule>,
     mult: Option<&[Vec<f64>]>,
 ) -> Option<Vec<f64>> {
@@ -2212,9 +2227,18 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     // Correlated residual (`block_sigma`, #627): the per-obs `coef·∂f/∂η` loop below
     // assumes a diagonal R. Route the dense-R generalisation here — it serves both the
     // analytical and the ODE (`Dual1`) inner path, since `sens` carries `∂f/∂η` for both.
-    if !model.residual_correlations.is_empty() {
-        return dense_residual_inner_gradient(model, subject, theta, eta, omega, sigma, &sens)
-            .map(add_nongaussian);
+    if !residual_correlations.is_empty() {
+        return dense_residual_inner_gradient(
+            model,
+            subject,
+            theta,
+            eta,
+            omega,
+            sigma,
+            residual_correlations,
+            &sens,
+        )
+        .map(add_nongaussian);
     }
     let n_eta = model.n_eta;
     let m3 = matches!(model.bloq_method, crate::types::BloqMethod::M3);
@@ -2312,6 +2336,7 @@ fn dense_residual_inner_gradient(
     eta: &[f64],
     omega: &crate::types::OmegaMatrix,
     sigma: &[f64],
+    residual_correlations: &[crate::types::ResidualCorrelation],
     sens: &[crate::sens::provider::ObsGrad],
 ) -> Option<Vec<f64>> {
     use nalgebra::{DMatrix, DVector};
@@ -2323,7 +2348,7 @@ fn dense_residual_inner_gradient(
         return Some(prior.as_slice().to_vec());
     }
     let ipreds: Vec<f64> = sens.iter().map(|o| o.f).collect();
-    let corr = &model.residual_correlations;
+    let corr = residual_correlations;
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = model.error_spec.obs_keys(subject);
     // Per-observation custom residual magnitude (#484); η-independent, matches the marginal.

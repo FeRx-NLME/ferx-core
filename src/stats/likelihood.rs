@@ -110,6 +110,11 @@ pub fn individual_nll_into(
         eta,
         omega,
         sigma_values,
+        // The model's declared `block_sigma` correlations. Every caller of this
+        // wrapper (SAEM, HMC, VI, AGQ) holds ρ fixed at the declaration, so that
+        // *is* their live value; FOCE/FOCEI, which estimate it (#847), call
+        // `individual_nll_into_with_schedule` directly with the optimizer's ρ.
+        &model.residual_correlations,
         scratch,
         None,
     )
@@ -471,6 +476,12 @@ pub(crate) fn accumulate_non_gaussian_nll(
 /// [`pk::event_driven::EventSchedule`]. The FOCE inner-loop obj closure
 /// and Jacobian build the schedule once per `find_ebe` call and reuse
 /// it across all BFGS iterations.
+///
+/// `residual_correlations` carries the **live** `block_sigma` off-diagonals the
+/// way `sigma_values` carries the live σ (#847). FOCE/FOCEI estimate ρ, so their
+/// inner loop must pass the current optimizer value rather than the model's
+/// declaration; an estimator that holds ρ fixed passes
+/// `&model.residual_correlations`, which is then the same thing.
 pub fn individual_nll_into_with_schedule(
     model: &CompiledModel,
     subject: &Subject,
@@ -478,6 +489,7 @@ pub fn individual_nll_into_with_schedule(
     eta: &[f64],
     omega: &OmegaMatrix,
     sigma_values: &[f64],
+    residual_correlations: &[ResidualCorrelation],
     scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
 ) -> f64 {
@@ -534,12 +546,13 @@ pub fn individual_nll_into_with_schedule(
     let has_censored_m3 =
         matches!(model.bloq_method, BloqMethod::M3) && subject.has_censored_observation();
     let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
-    if !model.residual_correlations.is_empty() && !has_censored_m3 && !has_frem_rows {
+    if !residual_correlations.is_empty() && !has_censored_m3 && !has_frem_rows {
         match dense_residual_data_term(
             model,
             subject,
             &preds,
             sigma_values,
+            residual_correlations,
             ruv_scale,
             &p_obs,
             ruv_mult.as_deref(),
@@ -646,6 +659,7 @@ fn dense_residual_data_term(
     subject: &Subject,
     preds: &[f64],
     sigma_values: &[f64],
+    residual_correlations: &[ResidualCorrelation],
     ruv_scale: f64,
     p_obs: &[f64],
     ruv_mult: Option<&[Vec<f64>]>,
@@ -658,7 +672,7 @@ fn dense_residual_data_term(
         err_keys.as_ref(),
         subject,
         sigma_values,
-        &model.residual_correlations,
+        residual_correlations,
         ruv_mult,
     );
     if ruv_scale != 1.0 {
@@ -689,16 +703,32 @@ fn dense_residual_data_term(
 ///
 /// Under M3, censored rows contribute the matching normal-tail likelihood
 /// instead of the Gaussian residual term.
+/// `residual_correlations` carries the **live** `block_sigma` off-diagonals
+/// alongside the live `sigma_values` (#847). Reading them off `model` instead
+/// would be wrong for any estimator that inherits a fitted rho from an earlier
+/// chain stage — `method = [focei, imp]` hands IMP the FOCEI estimate, so a
+/// declaration-sourced R would score a different likelihood than the one just
+/// optimized.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn obs_nll_subject_into(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     sigma_values: &[f64],
+    residual_correlations: &[ResidualCorrelation],
     eta: &[f64],
     pk_scratch: &mut pk::EventPkParams,
 ) -> f64 {
     let preds = pk::compute_predictions_with_tv_into(model, subject, theta, eta, pk_scratch);
-    obs_nll_subject_from_preds(model, subject, &preds, theta, sigma_values, eta)
+    obs_nll_subject_from_preds(
+        model,
+        subject,
+        &preds,
+        theta,
+        sigma_values,
+        residual_correlations,
+        eta,
+    )
 }
 
 /// Observation-only NLL from *precomputed* predictions.
@@ -708,12 +738,14 @@ pub(crate) fn obs_nll_subject_into(
 /// loop reuse one ODE solve across all σ perturbations instead of re-solving per
 /// element (#557). `theta` is only consumed by the TTE hazard term.
 #[cfg_attr(not(feature = "survival"), allow(unused_variables))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn obs_nll_subject_from_preds(
     model: &CompiledModel,
     subject: &Subject,
     preds: &[f64],
     theta: &[f64],
     sigma_values: &[f64],
+    residual_correlations: &[ResidualCorrelation],
     eta: &[f64],
 ) -> f64 {
     let m3 = matches!(model.bloq_method, BloqMethod::M3);
@@ -729,7 +761,7 @@ pub(crate) fn obs_nll_subject_from_preds(
     let err_keys = model.error_spec.obs_keys(subject);
     let mut nll = 0.0;
     let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
-    if !model.residual_correlations.is_empty() && !m3 && !has_frem_rows {
+    if !residual_correlations.is_empty() && !m3 && !has_frem_rows {
         // block_sigma + SDE is rejected up front (E_BLOCK_SIGMA_SDE_UNSUPPORTED)
         // for the SAEM M-step, so no EKF process noise enters here.
         match dense_residual_data_term(
@@ -737,6 +769,7 @@ pub(crate) fn obs_nll_subject_from_preds(
             subject,
             preds,
             sigma_values,
+            residual_correlations,
             ruv_scale,
             &[],
             ruv_mult.as_deref(),
@@ -904,6 +937,10 @@ pub(crate) fn ruv_scale_from(eta: &[f64], residual_error_eta: Option<usize>) -> 
 #[cfg(feature = "markov")]
 const CTMM_FD_SENTINEL_GUARD: f64 = 1e18;
 
+/// `residual_correlations` carries the **live** `block_sigma` off-diagonals,
+/// parallel to `sigma_values` (#847): FOCE/FOCEI estimate ρ, so the marginal has
+/// to be scored at the optimizer's current value, not the model's declaration.
+#[allow(clippy::too_many_arguments)]
 pub fn foce_subject_nll(
     model: &CompiledModel,
     subject: &Subject,
@@ -912,6 +949,7 @@ pub fn foce_subject_nll(
     h_matrix: &DMatrix<f64>,
     omega: &OmegaMatrix,
     sigma_values: &[f64],
+    residual_correlations: &[ResidualCorrelation],
     interaction: bool,
 ) -> f64 {
     // Individual predictions at eta_hat (per-event PK when subject has TV covariates).
@@ -1094,7 +1132,7 @@ pub fn foce_subject_nll(
     // off-diagonal covariance. The non-interaction (Sheiner–Beal) branch carries
     // the dense R for both cases via `compute_r_matrix_with_correlations`.
     if interaction {
-        if model.residual_correlations.is_empty() {
+        if residual_correlations.is_empty() {
             foce_subject_nll_interaction(
                 subject,
                 &ipreds,
@@ -1118,7 +1156,7 @@ pub fn foce_subject_nll(
                 omega,
                 sigma_values,
                 &model.error_spec,
-                &model.residual_correlations,
+                residual_correlations,
                 &p_obs,
                 ruv_mult.as_deref(),
             )
@@ -1146,7 +1184,7 @@ pub fn foce_subject_nll(
             omega,
             sigma_values,
             &model.error_spec,
-            &model.residual_correlations,
+            residual_correlations,
             model.bloq_method,
             &p_obs,
             frem_r_override.as_deref(),
@@ -1924,6 +1962,9 @@ pub fn foce_subject_nll_iov(
             h_matrix,
             omega_bsv,
             sigma_values,
+            // `block_sigma` + IOV is rejected up front, so an IOV model's
+            // correlations are always the (empty) declaration (#847).
+            &model.residual_correlations,
             interaction,
         );
     }
@@ -2072,6 +2113,9 @@ pub fn foce_subject_nll_iov(
             &sigma_b,
             sigma_values,
             &model.error_spec,
+            // `block_sigma` + IOV is rejected up front
+            // (`E_BLOCK_SIGMA_IOV_UNSUPPORTED`), so this vector is empty in
+            // practice and the estimated-ρ threading (#847) never reaches here.
             &model.residual_correlations,
             model.bloq_method,
             &p_obs_iov,
@@ -2132,6 +2176,7 @@ pub fn foce_population_nll_iov(
 }
 
 /// Population FOCE objective: sum over all subjects
+#[allow(clippy::too_many_arguments)]
 pub fn foce_population_nll(
     model: &CompiledModel,
     population: &Population,
@@ -2140,6 +2185,7 @@ pub fn foce_population_nll(
     h_matrices: &[DMatrix<f64>],
     omega: &OmegaMatrix,
     sigma_values: &[f64],
+    residual_correlations: &[ResidualCorrelation],
     interaction: bool,
 ) -> f64 {
     // Deterministic reduction: collect per-subject NLLs in subject order, then
@@ -2159,6 +2205,7 @@ pub fn foce_population_nll(
                 &h_matrices[i],
                 omega,
                 sigma_values,
+                residual_correlations,
                 interaction,
             )
         })
@@ -2526,6 +2573,8 @@ mod tests {
             theta_names: vec!["TVCL".into(), "TVV".into()],
             eta_names: vec!["ETA_CL".into()],
             default_params: crate::types::ModelParameters {
+                residual_correlations: Vec::new(),
+                residual_correlation_fixed: Vec::new(),
                 theta: vec![5.0, 50.0],
                 theta_names: vec!["TVCL".into(), "TVV".into()],
                 theta_lower: vec![0.01, 1.0],
@@ -2625,9 +2674,10 @@ mod tests {
         let sigma = vec![0.2, 0.3];
         let mut scratch = pk::EventPkParams::default();
 
-        let dense = obs_nll_subject_into(&model, &subj, &theta, &sigma, &eta, &mut scratch);
+        let corr = model.residual_correlations.clone();
+        let dense = obs_nll_subject_into(&model, &subj, &theta, &sigma, &corr, &eta, &mut scratch);
         model.residual_correlations.clear();
-        let diagonal = obs_nll_subject_into(&model, &subj, &theta, &sigma, &eta, &mut scratch);
+        let diagonal = obs_nll_subject_into(&model, &subj, &theta, &sigma, &[], &eta, &mut scratch);
 
         assert!(dense.is_finite());
         assert!(diagonal.is_finite());
@@ -2754,9 +2804,16 @@ mod tests {
         let eta = [0.0];
 
         let nll_weighted =
-            obs_nll_subject_from_preds(&weighted, &natural, &f, &theta, &sigma, &eta);
-        let nll_hand =
-            obs_nll_subject_from_preds(&plain, &prescaled, &scaled_preds, &theta, &sigma, &eta);
+            obs_nll_subject_from_preds(&weighted, &natural, &f, &theta, &sigma, &[], &eta);
+        let nll_hand = obs_nll_subject_from_preds(
+            &plain,
+            &prescaled,
+            &scaled_preds,
+            &theta,
+            &sigma,
+            &[],
+            &eta,
+        );
         let jacobian: f64 = w.iter().map(|wi| wi.ln()).sum();
 
         approx::assert_relative_eq!(nll_weighted, nll_hand + jacobian, epsilon = 1e-12);
@@ -2963,7 +3020,15 @@ mod tests {
         //     marginal. The OLD code added 0.5·K·log|Ω_iov| = log(1e-12) ≈ -27.6,
         //     so this assertion fails without the proper-marginal fix.
         let base = foce_subject_nll(
-            &model, &subj, &theta, &eta_hat, &h_bsv, &omega_bsv, &sigma, false,
+            &model,
+            &subj,
+            &theta,
+            &eta_hat,
+            &h_bsv,
+            &omega_bsv,
+            &sigma,
+            &model.residual_correlations,
+            false,
         );
         let zero_kappas = vec![DVector::zeros(1), DVector::zeros(1)];
         let reduced = foce_subject_nll_iov(
@@ -3576,9 +3641,9 @@ mod tests {
         let eta = vec![0.4];
         let mut scratch = pk::EventPkParams::with_capacity_for(&subj);
 
-        let base = obs_nll_subject_into(&model, &subj, &theta, &sigma, &eta, &mut scratch);
+        let base = obs_nll_subject_into(&model, &subj, &theta, &sigma, &[], &eta, &mut scratch);
         model.residual_error_eta = Some(0);
-        let scaled = obs_nll_subject_into(&model, &subj, &theta, &sigma, &eta, &mut scratch);
+        let scaled = obs_nll_subject_into(&model, &subj, &theta, &sigma, &[], &eta, &mut scratch);
 
         let s = (2.0_f64 * 0.4).exp();
         let preds = pk::compute_predictions_with_tv(&model, &subj, &theta, &eta);
@@ -3737,8 +3802,15 @@ mod tests {
 
         // (2) SAEM M-step: obs_nll_subject_from_preds (Gaussian preds supplied).
         let preds = vec![30.0_f64; n_obs];
-        let saem =
-            obs_nll_subject_from_preds(&model, &subject, &preds, &p.theta, &p.sigma.values, &eta);
+        let saem = obs_nll_subject_from_preds(
+            &model,
+            &subject,
+            &preds,
+            &p.theta,
+            &p.sigma.values,
+            &p.residual_correlations,
+            &eta,
+        );
         assert!(
             saem.is_finite(),
             "SAEM M-step joint NLL must be finite; got {saem}"
@@ -3756,6 +3828,7 @@ mod tests {
             &h_matrix,
             &p.omega,
             &p.sigma.values,
+            &p.residual_correlations,
             true,
         );
         assert!(
@@ -4195,9 +4268,11 @@ mod tests {
 
         // Same shape as the sibling, but the time dependence lives in the RHS and
         // the individual parameters are entirely time-independent. The hazard is
-        // deliberately time-independent too: the injected `d/dt(__chz_n)` line is
-        // part of `stmts_owned`, so a `TIME`-reading hazard would trip the wide
-        // predicate on its own and the test would no longer be about the PK RHS.
+        // deliberately time-independent too, so the only thing this fixture can be
+        // rejected *for* is the PK RHS. Since #1166 a `TIME`-reading hazard no
+        // longer trips the predicate at all — the injected `d/dt(__chz_n)` line is
+        // excluded from it — which is what `joint_pktte_share_admits_a_time_
+        // dependent_hazard` below pins from the other side.
         let src = r"
 [parameters]
   theta TVCL(1.0, 0.01, 100.0)
@@ -4276,5 +4351,175 @@ mod tests {
             nll.is_finite() && moved.is_finite() && (nll - moved).abs() > 1e-9,
             "fallback joint NLL must be finite and η-sensitive (nll={nll}, moved={moved})"
         );
+    }
+
+    /// A joint PK-TTE model, `{HAZ}` substituted. Autonomous PK block throughout —
+    /// the hazard is the only thing that ever reads time here.
+    #[cfg(feature = "survival")]
+    fn joint_time_hazard_src(haz: &str) -> String {
+        format!(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  theta TVH0(0.01, 1e-5, 10.0)
+  theta TVBETA(0.5, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  KA   = TVKA
+  H0   = TVH0
+  BETA = TVBETA
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+[event_model]
+  cmt    = 2
+  hazard = {haz}
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+"
+        )
+    }
+
+    /// #1166, the admission side: a Gompertz-shaped hazard — a hazard that reads
+    /// `TIME` by definition — on an autonomous PK block **takes** #570's single
+    /// shared solve.
+    ///
+    /// The sibling above pins the opposite direction (a `TAD`-reading PK RHS is
+    /// still rejected), so between them the gate is pinned from both sides and
+    /// neither "always admit" nor "always decline" survives.
+    #[test]
+    #[cfg(feature = "survival")]
+    fn joint_pktte_share_admits_a_time_dependent_hazard() {
+        use crate::parser::model_parser::parse_model_string;
+        use crate::types::{EventType, ObsRecord};
+
+        let model = parse_model_string(&joint_time_hazard_src(
+            "H0 * exp(0.05*TIME) * exp(BETA * (central / V))",
+        ))
+        .expect("Gompertz-in-TIME joint PK-TTE model must parse");
+
+        // The discriminating precondition: the *wide* flag still fires — the
+        // augmented program does read model time, and the SS gates must keep
+        // seeing that — while the predicate the share asks does not.
+        let prog = model
+            .ode_spec
+            .as_ref()
+            .and_then(|o| o.rhs_program.as_ref())
+            .expect("rhs program");
+        assert!(
+            prog.reads_model_time(),
+            "the augmented RHS does read model time (the SS gates' predicate)"
+        );
+        assert!(
+            !crate::pk::model_uses_time_anywhere(&model),
+            "…but the PK block does not, so the routing predicate must be false"
+        );
+
+        let mut subject = make_simple_subject();
+        subject.obs_records = vec![ObsRecord::Event {
+            time: 5.0,
+            event_type: EventType::Exact,
+            entry_time: 0.0,
+            cmt: 2,
+        }];
+        let p = &model.default_params;
+        assert!(
+            try_joint_pktte_shared_solve(&model, &subject, &p.theta, &[0.0]).is_some(),
+            "a time-dependent hazard on an autonomous PK block must take the \
+             #570 shared-solve path"
+        );
+    }
+
+    /// #1166, the routing oracle: two models that compute the **same arithmetic**
+    /// must land on the same engine, and therefore agree bit-for-bit.
+    ///
+    /// `* (1.0 + 0.0*TIME)` is the exact identity in IEEE arithmetic — `0.0*t` is
+    /// `0.0` for finite `t`, `1.0 + 0.0` is `1.0`, and `h * 1.0` is `h` — and the
+    /// RHS is interpreted bytecode, so nothing folds it away. Any difference in
+    /// the result is therefore a difference of *engine*, not of arithmetic: before
+    /// #1166 the flagged twin declined the shared solve and assembled the Gaussian
+    /// half on the event-driven walk, which agreed with the dense driver only to
+    /// solver tolerance (measured: 0 of 40 subjects bit-identical on the anchored
+    /// fixture, worst per-subject 3.25e-4 at ferx's default tolerances).
+    ///
+    /// A value test could not see this — both arms are correct to tolerance — and
+    /// a routing assertion alone could not either, since it would pass for a
+    /// predicate that admitted the *wrong* pair too. Bit-identity is the assertion
+    /// that is exactly as strong as the claim.
+    #[test]
+    #[cfg(feature = "survival")]
+    fn identical_arithmetic_takes_the_identical_engine_bit_for_bit() {
+        use crate::parser::model_parser::parse_model_string;
+        use crate::types::{EventType, ObsRecord};
+
+        // The pair must **straddle** the predicate under the old behaviour, or the
+        // test is vacuous: with a time-reading base hazard both twins would have
+        // been flagged, both would have declined, and they would agree bit-for-bit
+        // whether the fix is present or not. (Found by mutating the fix away and
+        // watching this test survive.) So the base hazard is autonomous and only
+        // the twin's identity factor reads time.
+        let plain = parse_model_string(&joint_time_hazard_src("H0 * exp(BETA * (central / V))"))
+            .expect("parse");
+        let twin = parse_model_string(&joint_time_hazard_src(
+            "H0 * exp(BETA * (central / V)) * (1.0 + 0.0*TIME)",
+        ))
+        .expect("parse");
+        // Pin the straddle itself, so a later predicate change that stopped the
+        // twin from being *flagged at all* would show up here rather than turning
+        // this back into a tautology.
+        let flagged = |m: &crate::types::CompiledModel| {
+            m.ode_spec
+                .as_ref()
+                .and_then(|o| o.rhs_program.as_ref())
+                .expect("rhs program")
+                .reads_model_time()
+        };
+        assert!(
+            !flagged(&plain) && flagged(&twin),
+            "the twin must trip the wide flag and the plain model must not — that \
+             difference is what the fix has to make invisible"
+        );
+
+        let mut subject = make_simple_subject();
+        subject.obs_records = vec![ObsRecord::Event {
+            time: 5.0,
+            event_type: EventType::Exact,
+            entry_time: 0.0,
+            cmt: 2,
+        }];
+        let p = &plain.default_params;
+        let q = &twin.default_params;
+
+        for eta in [0.0, 0.3, -0.25] {
+            let a = individual_nll(
+                &plain,
+                &subject,
+                &p.theta,
+                &[eta],
+                &p.omega,
+                &p.sigma.values,
+            );
+            let b = individual_nll(&twin, &subject, &q.theta, &[eta], &q.omega, &q.sigma.values);
+            assert!(
+                a.is_finite(),
+                "the fixture must produce a real objective (eta={eta}, nll={a})"
+            );
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "an arithmetically identical hazard must take the same engine \
+                 (eta={eta}, plain={a}, identity-twin={b}, delta={})",
+                a - b
+            );
+        }
     }
 }
