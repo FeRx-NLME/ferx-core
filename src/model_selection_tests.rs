@@ -358,8 +358,13 @@ fn require_covariance_names_each_non_computed_status() {
     r.covariance_status = CovarianceStatus::Failed;
     assert!(check_strictness(&r, &s).failures[0].contains("failed"));
 
+    // A SIR fallback delivered the uncertainty the user configured it for:
+    // accepted, and with no matrix stored the threshold gates would skip.
     r.covariance_status = CovarianceStatus::SirFallback;
-    assert!(check_strictness(&r, &s).failures[0].contains("SIR"));
+    r.covariance_matrix = None;
+    let v = check_strictness(&r, &s);
+    assert!(v.passed, "{v:?}");
+    r.covariance_matrix = Some(DMatrix::<f64>::identity(3, 3));
 
     r.covariance_status = CovarianceStatus::Computed;
     r.covariance_matrix = None;

@@ -225,9 +225,12 @@ pub struct Strictness {
     /// Fail a fit with `converged == false`. This already covers an internal
     /// runaway-guard hit, which demotes `converged` (#1118).
     pub require_converged: bool,
-    /// Fail unless the covariance step ran and produced a matrix
-    /// (`CovarianceStatus::Computed`). A SIR fallback does not count: it means
-    /// the FD Hessian was not positive-definite.
+    /// Fail unless the covariance step ran and produced uncertainty:
+    /// `CovarianceStatus::Computed`, or `SirFallback` — the FD Hessian was not
+    /// positive-definite but SIR delivered credible intervals, which is the
+    /// uncertainty the user configured that fallback to produce. A SIR-fallback
+    /// fit stores no covariance matrix, so the condition-number and correlation
+    /// gates then report `skipped` rather than a verdict.
     pub require_covariance: bool,
     /// Fail when `FitResult::cov_condition_number` (largest over smallest
     /// eigenvalue of the free-parameter correlation matrix) exceeds this.
@@ -305,9 +308,9 @@ pub fn check_strictness(result: &FitResult, s: &Strictness) -> StrictnessVerdict
                 Some("covariance step not requested (`covariance = false`)")
             }
             CovarianceStatus::Failed => Some("covariance step failed"),
-            CovarianceStatus::SirFallback => {
-                Some("covariance step fell back to SIR (FD Hessian not positive-definite)")
-            }
+            // Accepted: the user opted into SIR as the uncertainty source when
+            // the Hessian is not PD, and it delivered.
+            CovarianceStatus::SirFallback => None,
         };
         if let Some(r) = reason {
             v.failures.push(r.to_string());

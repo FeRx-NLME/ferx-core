@@ -232,7 +232,7 @@ if !verdict.passed {
 | field | default | fails when |
 |---|---|---|
 | `require_converged` | `true` | `converged == false` (also covers an internal runaway-guard hit, which demotes `converged`) |
-| `require_covariance` | `false` | the covariance step did not run, failed, or fell back to SIR |
+| `require_covariance` | `false` | the covariance step did not run or failed (a SIR fallback that delivered credible intervals is accepted; its threshold gates below then report `skipped`, as no matrix is stored) |
 | `max_condition_number` | `Some(1000)` | `cov_condition_number` exceeds it (∞ for a singular correlation matrix) |
 | `max_correlation` | `Some(0.95)` | any off-diagonal of the covariance's correlation form exceeds it in absolute value — the whole matrix, not just θ |
 | `reject_on_boundary` | `true` | a θ is pinned to a declared bound — the same predicate `bootstrap`'s `skip_estimate_near_boundary` applies |
