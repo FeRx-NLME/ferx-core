@@ -398,16 +398,10 @@ fn a_joint_steady_state_fit_does_not_bank_the_run_in_into_the_objective() {
 
     // The property, on the fit path's own model and data. Measured exactly 0.0.
     //
-    // The `0.0` is asked for as part of a multi-point grid on purpose: `predict_survival` on a
-    // grid whose **maximum is 0** returns `NaN`, so `&[0.0]` alone would trip the `is_finite`
-    // guard below and say nothing about #1210. `ode_dense_solve_states` takes its integration
-    // horizon as `saveat.iter().fold(0.0, f64::max)`, so such a grid builds no segment and the
-    // rows keep their `f64::NAN` prefill. Not a single-point problem — measured:
-    // `[0.0] -> NaN`, `[0.0, 0.0] -> NaN`, but `[1.0] -> 0.02` and `[12.0] -> 0.24` are fine,
-    // and `[0.0, 1.0] -> [0.0, 0.02]`. Tracked as #1218; do not shorten this grid.
-    let mut probe = vec![0.0];
-    probe.extend_from_slice(&GRID);
-    let sv = predict_survival(&m, &pop, &m.default_params, &probe);
+    // Asked for on its own. Until #1218 a grid whose maximum is 0 returned `NaN` and this had
+    // to pad the grid with `GRID` to get a finite row; the single-instant path is pinned by
+    // `predict_survival_on_a_single_instant_grid_matches_the_multi_point_grid` below.
+    let sv = predict_survival(&m, &pop, &m.default_params, &[0.0]);
     let at_zero: Vec<_> = sv.iter().filter(|r| r.time == 0.0).collect();
     assert!(!at_zero.is_empty(), "no survival row at t = 0");
     for r in at_zero {
@@ -624,4 +618,85 @@ fn a_reset_zeroes_the_accumulated_hazard_and_matches_nonmem() {
         worst_pred < 2e-8,
         "worst relative PRED disagreement vs the r4 train = {worst_pred}"
     );
+}
+
+/// #1218: a grid with no point past the first event returned `NaN, NaN` — `[0.0]`, `[0.0, 0.0]`
+/// and the `0` row of `[-1.0, 0.0]` — while the same `t = 0` asked for alongside a later point
+/// was finite. Measured before the fix on both arms.
+///
+/// The single-instant row must be the multi-point row bit for bit. The drug arm is the one that
+/// can tell the post-dose state from the seeded one — `h(0) = 0.2193` at the SS trough against
+/// the drug-free `H0 = 0.02` — so its `h(0)` is asserted away from `H0` explicitly: the guard
+/// against fixing this by widening the pre-first-event prefill (which would return a finite,
+/// wrong `h(0)` and pass every other assertion here). The `-1.0` row *is* that prefill's
+/// territory and is asserted unchanged: seeded state, drug-free hazard.
+#[test]
+fn predict_survival_on_a_single_instant_grid_matches_the_multi_point_grid() {
+    fn at(rows: &[ferx_core::SurvivalPredictionResult], t: f64) -> Vec<(f64, f64)> {
+        rows.iter()
+            .filter(|r| r.time == t)
+            .map(|r| (r.cum_hazard, r.hazard))
+            .collect()
+    }
+    for arm in ["const", "drug"] {
+        let (m, pop) = load(arm);
+        let want = at(
+            &predict_survival(&m, &pop, &m.default_params, &[0.0, 1.0]),
+            0.0,
+        );
+        assert_eq!(want.len(), 1, "{arm}: one subject, one row at t = 0");
+        let (want_h, want_haz) = want[0];
+        assert!(
+            want_h.is_finite() && want_haz.is_finite(),
+            "{arm}: the multi-point reference row is not finite: {want_h}, {want_haz}"
+        );
+        assert_eq!(want_h, 0.0, "{arm}: H(0) is not exactly zero");
+
+        for grid in [&[0.0][..], &[0.0, 0.0], &[-1.0, 0.0]] {
+            let got = at(&predict_survival(&m, &pop, &m.default_params, grid), 0.0);
+            let n_zero = grid.iter().filter(|&&t| t == 0.0).count();
+            assert_eq!(
+                got.len(),
+                n_zero,
+                "{arm} {grid:?}: one row per requested t = 0"
+            );
+            for (h, haz) in got {
+                assert!(
+                    h.is_finite() && haz.is_finite(),
+                    "{arm} {grid:?}: non-finite (H, h) at t = 0: {h}, {haz}"
+                );
+                assert_eq!(
+                    h.to_bits(),
+                    want_h.to_bits(),
+                    "{arm} {grid:?}: H(0) {h} != {want_h}"
+                );
+                assert_eq!(
+                    haz.to_bits(),
+                    want_haz.to_bits(),
+                    "{arm} {grid:?}: h(0) {haz} != {want_haz}"
+                );
+            }
+        }
+
+        // Before the first event: the seeded state, so no drug and the bare `H0`.
+        let pre = at(
+            &predict_survival(&m, &pop, &m.default_params, &[-1.0, 0.0]),
+            -1.0,
+        );
+        assert_eq!(pre.len(), 1);
+        assert_eq!(pre[0].0, 0.0, "{arm}: H(-1) is not zero");
+        assert!(
+            (pre[0].1 - H0).abs() < 1e-15,
+            "{arm}: h(-1) = {} is not the drug-free hazard {H0}",
+            pre[0].1
+        );
+
+        if arm == "drug" {
+            assert!(
+                want_haz > 5.0 * H0,
+                "drug arm: h(0) = {want_haz} is not distinguishable from the drug-free {H0}; \
+                 this test could not tell a post-dose row from a seeded one"
+            );
+        }
+    }
 }

@@ -59,6 +59,13 @@ section of the SDLC for the versioning policy).
   marked fixed, which is what it meant at the time.
 
 ### Fixed
+- **`predict_survival` returned `NaN` for a time grid with no point past the first event
+  (#1218).** Asking for the curve at `[0.0]` alone — or any grid whose largest time does not
+  pass the subject's first dose or observation — returned `NaN` for `cum_hazard` and `hazard`
+  with no warning, while the same `t = 0` on a longer grid was fine. It now returns the state
+  at that instant, post-dose, exactly what the longer grid reads. The same one-break timeline
+  left `[derived]` output columns `NaN` for a subject whose only observation coincides with its
+  dose; fixed by the same change.
 - **An `SS=1` dose no longer carries the steady-state run-in into a joint PK-TTE model's
   cumulative hazard (#1210).** The appended `d/dt(__chz_<cmt>)` accumulator was cycled through
   the equilibration along with the PK compartments, but it is a pure integrator with no steady

@@ -6532,9 +6532,21 @@ pub fn ode_dense_solve_states(
     // the `saveat` re-read post-dose) so the two paths agree and #570's
     // one-solve == two-solve equivalence holds at a dose-on-`t_last`. When no dose
     // lands there this re-reads the identical carried `u`, so it stays byte-identical
-    // everywhere else. Guarded to a timeline the loop actually ran (`len >= 2`); a
-    // single-instant `saveat` keeps its prior behaviour.
-    if break_times.len() >= 2 {
+    // everywhere else.
+    //
+    // Unconditional, including the one-break timeline (#1218). When every `saveat`
+    // sits at or before the first event the horizon `t_last` coincides with the
+    // integration start, `break_times` is a single instant, the loop above never runs,
+    // and this visit is the *only* one: it applies whatever lands there (an SS
+    // equilibration, a bolus) and writes the `saveat` rows post-dose, exactly as the
+    // loop's `t_start` write does when a later point is also requested. Until #1218 this
+    // block was guarded to `len >= 2` and a single-instant grid kept "its prior
+    // behaviour" — the `f64::NAN` prefill, which `predict_survival(&[0.0])` and the
+    // `[derived]` state path returned as a silent non-answer. The pre-first-event
+    // prefill above is deliberately *not* widened to cover the instant: it holds the
+    // seeded, pre-dose state, and a drug-driven hazard read off it is wrong in a way
+    // that looks finite.
+    {
         let t_last_break = break_times[break_times.len() - 1];
         let _ = apply_segment_boundary(
             ode,

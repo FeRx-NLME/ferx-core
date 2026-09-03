@@ -9274,3 +9274,229 @@ fn a_nonlinear_joint_model_judges_convergence_on_the_pk_rows() {
         crate::dosing::SS_EQUILIBRATION_CYCLES
     );
 }
+
+// ── #1218 — a single-instant `saveat` reads the post-dose state, never the `NaN` prefill ──
+//
+// `ode_dense_solve_states` takes its horizon as the largest `saveat`, so a grid with no point
+// past the first event builds a one-break timeline. The `windows(2)` loop never runs on it,
+// and until #1218 the post-loop `#731` left-boundary visit was skipped for exactly that
+// timeline — "a single-instant `saveat` keeps its prior behaviour", and the prior behaviour was
+// the `f64::NAN` prefill. `predict_survival(&[0.0])` returned `NaN, NaN` while `[0.0, 1.0]`
+// returned a finite `t = 0` row; `ode_predictions_event_driven_with_states` returned a finite
+// `ipred` over an all-`NaN` state row for a subject whose only observation sits on its dose.
+//
+// The wrong fix is as quiet as the bug: filling the node from the *seeded* initial state
+// (widening the pre-first-event prefill from `<` to `<=`) gives `H(0) = 0` and a pre-dose
+// `h(0)`. On a drug-driven hazard that is the hazard at zero drug — `0.02` where the
+// multi-point grid reads `0.219` on #1210's fixture. A constant hazard cannot tell the two
+// apart, so the arms below use a drug-driven accumulator and compare the single-instant row
+// against the multi-point row on **every** state, bit for bit.
+
+/// Exposure slope of the drug-driven accumulator below. Small enough that `h` stays O(1) at
+/// an SS peak of ~143 amount units, large enough that "post-dose" and "seeded" differ by far
+/// more than a rounding error.
+#[cfg(feature = "survival")]
+const SS_CHZ_BETA: f64 = 0.01;
+
+/// 1-cpt IV bolus + a **drug-driven** accumulator: `d/dt(__chz) = H0 · exp(BETA · central)`.
+/// Same declaration as [`one_cpt_const_chz_spec`]; the hazard reads the state, so a row read
+/// from the wrong state is visible in `h` as well as in the compartments.
+#[cfg(feature = "survival")]
+fn one_cpt_drug_chz_spec() -> OdeSpec {
+    OdeSpec {
+        chz_state_slots: vec![1],
+        rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+            let cl = p[crate::types::PK_IDX_CL];
+            let v = p[crate::types::PK_IDX_V];
+            let ke = if v > 0.0 { cl / v } else { 0.0 };
+            dy[0] = -ke * y[0];
+            dy[1] = SS_CHZ_H0 * (SS_CHZ_BETA * y[0]).exp();
+        }),
+        n_states: 2,
+        state_names: vec!["central".into(), "__chz_3".into()],
+        readout: OdeReadout::ObsCmt(0),
+        diffusion_var: Vec::new(),
+        solver_opts: OdeSolverOptions {
+            abstol: 1e-11,
+            reltol: 1e-9,
+            ..OdeSolverOptions::default()
+        },
+        input_rate: Vec::new(),
+        rhs_program: None,
+        readout_program: None,
+        indiv_param_program: None,
+        dose_attr_map: Default::default(),
+        init_fn: None,
+    }
+}
+
+/// Every state of `got` is finite and bit-identical to `want`.
+///
+/// Finiteness first and on its own: `NaN == NaN` is `false`, so the equality would fail on a
+/// `NaN` row too, but it would say "bits differ" about a row that was never computed.
+#[cfg(feature = "survival")]
+fn assert_states_bit_identical(got: &[f64], want: &[f64], arm: &str) {
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "{arm}: state vectors differ in length"
+    );
+    for (k, (g, w)) in got.iter().zip(want).enumerate() {
+        assert!(
+            g.is_finite() && w.is_finite(),
+            "{arm}: state {k} is not finite on both sides: got {g}, want {w}"
+        );
+        assert_eq!(
+            g.to_bits(),
+            w.to_bits(),
+            "{arm}: state {k} differs: got {g}, want {w}"
+        );
+    }
+}
+
+/// `[0.0]` on an SS dose at `t = 0` must equal the `t = 0` row of `[0.0, 1.0]` — every state,
+/// bit for bit — and that row must be the *post-dose* state.
+///
+/// Killed by: the `len >= 2` guard restored (the row is the `NaN` prefill); the `<=` prefill
+/// variant (central reads the seeded `0.0` instead of trough + pulse — `H` still reads `0.0`
+/// under that variant, which is why the comparison is on every state and not on `H`); a
+/// second visit of the sole break (another pulse moves central by 100).
+#[cfg(feature = "survival")]
+#[test]
+fn a_single_instant_grid_on_an_ss_dose_reads_the_post_dose_state() {
+    let ode = one_cpt_drug_chz_spec();
+    let pk = pk_one(1.0, 10.0);
+    let subject = make_subject(
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, SS_CHZ_II)],
+        vec![],
+    );
+    let single = ode_dense_solve_states(&ode, &pk.values, &[], &[], &subject, &[0.0]);
+    let multi = ode_dense_solve_states(&ode, &pk.values, &[], &[], &subject, &[0.0, 1.0]);
+    assert_eq!(single.len(), 1, "one row per saveat");
+    assert_eq!(multi.len(), 2, "one row per saveat");
+    assert_states_bit_identical(&single[0], &multi[0], "[0.0] vs [0.0, 1.0]");
+
+    // The straddle, asserted: the row is the post-SS-dose state, not the seeded one. An SS
+    // bolus lands on its own trough, so central exceeds the bare 100 mg pulse, and the
+    // hazard read off it is not the drug-free `H0` the seeded state would give.
+    let got = &single[0];
+    assert!(
+        got[0] > 100.0,
+        "central at t = 0 is {} — the seeded pre-dose state, not trough + pulse",
+        got[0]
+    );
+    assert_eq!(got[1], 0.0, "H(0) must be exactly 0.0 at the first record");
+    let mut du = vec![0.0; ode.n_states];
+    (ode.rhs)(got, &pk.values, 0.0, &mut du);
+    assert!(
+        du[1] > 2.0 * SS_CHZ_H0,
+        "h(0) = {} reads as the drug-free hazard {SS_CHZ_H0}; the row is not post-dose",
+        du[1]
+    );
+}
+
+/// Duplicate nodes at the instant are all written, and a node *before* the first event keeps
+/// the seeded initial state (nothing has acted on the system yet) while the node on the event
+/// reads post-dose.
+///
+/// The `-1.0` row is the pre-first-event prefill's territory and must not move: widening that
+/// prefill to cover the instant is the wrong fix, and this is the arm that would see the two
+/// rows collapse onto the same (seeded) state.
+#[cfg(feature = "survival")]
+#[test]
+fn a_single_instant_grid_writes_every_duplicate_and_leaves_pre_event_nodes_seeded() {
+    let ode = one_cpt_drug_chz_spec();
+    let pk = pk_one(1.0, 10.0);
+    let subject = make_subject(
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, SS_CHZ_II)],
+        vec![],
+    );
+    let want = ode_dense_solve_states(&ode, &pk.values, &[], &[], &subject, &[0.0, 1.0]);
+
+    let dup = ode_dense_solve_states(&ode, &pk.values, &[], &[], &subject, &[0.0, 0.0]);
+    assert_eq!(dup.len(), 2, "one row per saveat, duplicates included");
+    assert_states_bit_identical(&dup[0], &want[0], "[0.0, 0.0] row 0");
+    assert_states_bit_identical(&dup[1], &want[0], "[0.0, 0.0] row 1");
+
+    let pre = ode_dense_solve_states(&ode, &pk.values, &[], &[], &subject, &[-1.0, 0.0]);
+    assert_eq!(pre.len(), 2);
+    let seeded = ode.initial_state(&pk.values);
+    assert_states_bit_identical(&pre[0], &seeded, "[-1.0, 0.0] row 0 (pre-event)");
+    assert_states_bit_identical(&pre[1], &want[0], "[-1.0, 0.0] row 1");
+    assert!(
+        pre[0][0] < pre[1][0],
+        "the pre-event row and the on-event row collapsed onto one state: {pre:?}"
+    );
+}
+
+/// `ode_predictions_event_driven_with_states` hands `subject.obs_times` to the dense solve, so
+/// a subject whose only observation sits on its dose returned `ipred = [100.0]` over
+/// `states = [[NaN]]` — a finite prediction with a `NaN` state behind it, which is what a
+/// `[derived]` output column reads. Both a plain bolus and an SS dose, since they take
+/// different arms of `apply_segment_boundary` at the sole break.
+///
+/// The readout is the compartment amount, so the state must also equal `ipred` exactly — the
+/// invariant the two-pass engine promises.
+#[test]
+fn with_states_on_a_single_instant_timeline_returns_the_post_dose_state() {
+    let ode = one_cpt_ode_spec();
+    let pk = pk_one(1.0, 10.0);
+    let at = |n: usize| vec![pk; n];
+    for (arm, ss, ii) in [("bolus", false, 0.0), ("ss", true, 12.0)] {
+        let one = make_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, ss, ii)], vec![0.0]);
+        let two = make_subject(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, ss, ii)],
+            vec![0.0, 1.0],
+        );
+        let (ipred1, states1) = ode_predictions_event_driven_with_states(
+            &ode,
+            &one,
+            &[],
+            &[],
+            &at(1),
+            &at(1),
+            &[],
+            &[],
+        );
+        let (ipred2, states2) = ode_predictions_event_driven_with_states(
+            &ode,
+            &two,
+            &[],
+            &[],
+            &at(1),
+            &at(2),
+            &[],
+            &[],
+        );
+        assert_eq!(states1.len(), 1, "{arm}: one state row per observation");
+        assert!(
+            states1[0][0].is_finite(),
+            "{arm}: the single-instant state row is {:?}",
+            states1[0]
+        );
+        assert_eq!(
+            states1[0][0].to_bits(),
+            states2[0][0].to_bits(),
+            "{arm}: single-observation state {} differs from the two-observation row {}",
+            states1[0][0],
+            states2[0][0]
+        );
+        assert_eq!(
+            states1[0][0].to_bits(),
+            ipred1[0].to_bits(),
+            "{arm}: state {} and ipred {} disagree on an amount readout",
+            states1[0][0],
+            ipred1[0]
+        );
+        assert_eq!(
+            ipred1[0].to_bits(),
+            ipred2[0].to_bits(),
+            "{arm}: ipred moved"
+        );
+        assert!(
+            ipred1[0] >= 100.0,
+            "{arm}: the post-dose amount is {}",
+            ipred1[0]
+        );
+    }
+}
