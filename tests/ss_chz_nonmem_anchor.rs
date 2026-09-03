@@ -4,7 +4,7 @@
 //! along with the PK compartments. That row is a pure integrator with no elimination term, so
 //! it has no steady state; it just counted up, and its run-in total landed in `H(0)`.
 //!
-//! **NONMEM has no native comparator here, and that is a measured result.** Handing NONMEM's
+//! **NONMEM has no native *steady-state* comparator here, and that is a measured result.** Handing NONMEM's
 //! own SS routine the augmented system (`nonmem_anchor/ss_chz_r1_{const,drug}.ctl`) returns
 //! `A(3) = -2.39e7` with `#OBJV = +INF` for the constant-hazard arm and
 //! `NUMERICAL DIFFICULTIES WITH STEADY STATE SOLUTION` / `PROGRAM TERMINATED BY OBJ` for the
@@ -28,6 +28,14 @@
 //!     record start. It pins the model clock, which is the quantity an SS run-in displaces:
 //!     before the fix ferx evaluated that baseline 600 hours into the run-in and read
 //!     `H(1) = 4.5e10` against NONMEM's 1.667.
+//!
+//! A fourth construction, `ss_chz_r3_{const,drug}.ctl`, anchors the rule the other three
+//! cannot reach: that a **second** `SS=1` dose keeps the hazard accrued so far. It needs no SS
+//! record on the NONMEM side at all. A second SS dose on the regimen a subject is already at
+//! steady state under asserts two things — the compartments re-equilibrate to that same trough,
+//! and the accumulated hazard survives — and an uninterrupted 56-dose train through `T = 660`
+//! satisfies both by construction. Zeroing the accumulator there (the issue's own suggested
+//! fix) disagrees with that train by 99.8% relative on `H`; verified by mutation.
 //!
 //! `IPRED` is compared too, and it is the control rather than the finding: the PK side was
 //! never wrong — ferx matched it to 8 digits *before* the fix — so its agreement localises
@@ -53,13 +61,27 @@ const H0: f64 = 0.02;
 const GRID: [f64; 4] = [1.0, 4.0, 8.0, 12.0];
 
 fn load(arm: &str) -> (CompiledModel, Population) {
+    load_with(arm, DATA)
+}
+
+/// The same model files against a different dataset. `r3` reuses the `const` and `drug`
+/// models unchanged and swaps only the records, which is what makes it a test of the *dose
+/// semantics* rather than of a second model.
+fn load_with(arm: &str, data: &str) -> (CompiledModel, Population) {
     let path = format!("nonmem_anchor/ss_chz_{arm}_fit.ferx");
     let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
     let m = parse_model_string(&src).expect("anchor model must parse");
-    let (pop, _) = read_population_for(&m, &None, DATA, None, None, None, &[])
+    let (pop, _) = read_population_for(&m, &None, data, None, None, None, &[])
         .expect("endpoint-routed load must succeed");
     (m, pop)
 }
+
+/// `nonmem_anchor/ss_chz_ss2.csv`: an `SS=1` dose at `t = 0` **and** a second at `t = 48`.
+const DATA_MID_RECORD: &str = "nonmem_anchor/ss_chz_ss2.csv";
+
+/// ferx times of the r3 records — NONMEM `T` minus 600. `47.9`/`48.1` straddle the second
+/// dose; `60` is a full interval past it, where a discarded `H(48)` would still be missing.
+const GRID_R3: [f64; 4] = [12.0, 47.9, 48.1, 60.0];
 
 /// `(ferx time, IPRED, CHZ, HAZ)` for the four post-gate records of an r2 table.
 ///
@@ -87,6 +109,129 @@ fn nonmem_rows(arm: &str) -> Vec<(f64, f64, f64, f64)> {
         "{arm}: the reference table's post-gate records are not the four expected ones"
     );
     rows
+}
+
+/// `(ferx time, IPRED, CHZ, HAZ)` for the four post-gate **observation** records of an r3
+/// table. Same column layout and same `T - 600` alignment as [`nonmem_rows`]; the r3 train
+/// runs on to `T = 660` and its records straddle the second dose.
+fn nonmem_rows_r3(arm: &str) -> Vec<(f64, f64, f64, f64)> {
+    let path = format!("nonmem_anchor/results/ss_chz_r3_{arm}.tab");
+    let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let mut rows: Vec<(f64, f64, f64, f64)> = raw
+        .lines()
+        .skip(2)
+        .filter_map(|l| {
+            let f: Vec<f64> = l
+                .split_whitespace()
+                .filter_map(|x| x.parse().ok())
+                .collect();
+            // `f[2]` is CMT: keep the PK observations only, so the TTE row at T = 660 does not
+            // collide with the PK row at the same time.
+            (f.len() >= 9 && f[8] == 0.0 && f[2] == 2.0 && f[1] > 600.0)
+                .then(|| (f[1] - 600.0, f[5], f[6], f[7]))
+        })
+        .collect();
+    rows.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("finite times"));
+    // `647.9 - 600.0` is `47.89999999999998`, so the grid is matched to tolerance rather than
+    // bit-exactly. Still a strict count-and-position check: a missing, extra or misaligned
+    // record fails here before anything is compared.
+    let times: Vec<f64> = rows.iter().map(|r| r.0).collect();
+    assert_eq!(
+        times.len(),
+        GRID_R3.len(),
+        "{arm}: the r3 table has {} post-gate observation records, expected {}: {times:?}",
+        times.len(),
+        GRID_R3.len()
+    );
+    for (got, want) in times.iter().zip(&GRID_R3) {
+        assert!(
+            (got - want).abs() < 1e-9,
+            "{arm}: r3 record at ferx t={got}, expected {want}"
+        );
+    }
+    rows
+}
+
+/// **A second `SS=1` dose keeps the hazard accrued so far, and NONMEM says so.**
+///
+/// This is the rule that separates #1210's fix from the issue's own suggestion ("zero the
+/// accumulator"), and it is the one I first judged un-anchorable, because NONMEM's steady-state
+/// routine cannot be handed this system at all (`ss_chz_r1_*`). That was too pessimistic: the
+/// r2 construction generalises, and the generalisation needs **no SS record on the NONMEM side
+/// whatsoever**.
+///
+/// A second `SS=1` dose at `t = 48`, on the same regimen the subject is already at steady state
+/// under, asserts exactly two things: the PK compartments re-equilibrate to that same periodic
+/// trough (so nothing changes), and the accumulated hazard is a fact about the record that
+/// survives the re-equilibration. A subject who has simply been dosed every 12 h without
+/// interruption satisfies both by construction. So `ss_chz_r3_*.ctl` is one uninterrupted
+/// 56-dose train through `T = 660` with the hazard gated on at `T = 600` — and ferx's
+/// `SS@0 + SS@48` must reproduce it record for record.
+///
+/// The discrimination is wide, not marginal. Reference `A(3)` on the const arm reads
+/// `0.958 -> 0.960 -> 0.962` across the dose and `1.200` a full interval later. Zeroing at the
+/// second dose would give `0.002` and `0.240`: every record after `t = 48` short by `H(48)`.
+/// The straddle is asserted below so the arm cannot quietly stop discriminating.
+///
+/// Non-degenerate on the incoming side, which is what the dose-event rule in CLAUDE.md
+/// requires: the reference's own `IPRED` reads `4.83708578` at `t = 47.9` against `4.78896241`
+/// at the dose times, so drug from the preceding interval is genuinely present when the second
+/// dose lands — never the `g(x-) = 0` of a first dose.
+#[test]
+fn a_second_ss_dose_keeps_the_hazard_and_matches_nonmem() {
+    for arm in ["const", "drug"] {
+        let (m, pop) = load_with(arm, DATA_MID_RECORD);
+        let sv = predict_survival(&m, &pop, &m.default_params, &GRID_R3);
+        let pred = predict(&m, &pop, &m.default_params);
+        let reference = nonmem_rows_r3(arm);
+
+        // The straddle: the reference must carry a materially non-zero hazard into the second
+        // dose, or "preserve" and "zero" agree there and this arm proves nothing.
+        let h_before = reference[1].2;
+        assert!(
+            h_before > 0.9,
+            "{arm}: the reference's pre-dose hazard is {h_before}; with nothing accrued this              arm cannot tell preserve from zero"
+        );
+
+        let mut worst_h = 0.0f64;
+        let mut worst_pred = 0.0f64;
+        let mut compared_pred = 0usize;
+        for (t, ipred, chz, haz) in reference {
+            let r = sv
+                .iter()
+                .find(|r| (r.time - t).abs() < 1e-9)
+                .unwrap_or_else(|| panic!("{arm}: no ferx survival row at t={t}"));
+            assert!(
+                r.cum_hazard.is_finite() && r.hazard.is_finite(),
+                "{arm}: ferx returned a non-finite H/h at t={t}: {}, {}",
+                r.cum_hazard,
+                r.hazard
+            );
+            worst_h = worst_h.max(((r.cum_hazard - chz) / chz).abs());
+            worst_h = worst_h.max(((r.hazard - haz) / haz).abs());
+
+            if let Some(pr) = pred.iter().find(|p| (p.time - t).abs() < 1e-9) {
+                assert!(pr.pred.is_finite(), "{arm}: non-finite PRED at t={t}");
+                worst_pred = worst_pred.max(((pr.pred - ipred) / ipred).abs());
+                compared_pred += 1;
+            }
+        }
+        assert_eq!(
+            compared_pred, 4,
+            "{arm}: expected all four PK records to be compared, not {compared_pred}"
+        );
+        // Measured worst relative disagreement: const 4.6e-16 on H/h and 1.0e-9 on PRED,
+        // drug 7.8e-9 and 1.0e-9. 2e-8 is ~2.6x the largest, which is the drug arm's H —
+        // the reference's nine printed digits on `A(3) = 1.3e2` are themselves worth ~1e-9.
+        assert!(
+            worst_h < 2e-8,
+            "{arm}: worst relative H/h disagreement vs the r3 train = {worst_h}"
+        );
+        assert!(
+            worst_pred < 2e-8,
+            "{arm}: worst relative PRED disagreement vs the r3 train = {worst_pred}"
+        );
+    }
 }
 
 /// The reference certifies itself before anything is compared against it: on the constant

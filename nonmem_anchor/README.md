@@ -763,8 +763,11 @@ Three arms, in the order that makes them trustworthy:
 | `ss_chz_r2_tdep.ctl` | drug × Gompertz baseline `EXP(GAM·(T−600))`, `GAM = 0.15`. The baseline is anchored on the record start, so it pins the model clock — the one quantity an SS run-in displaces. |
 | `ss_chz_train.csv` | The 51-dose dataset the r2 streams run on (PK obs at 601/604/608, TTE record at 612). |
 | `ss_chz_ss.csv` | The `SS=1, II=12` dataset — r1's input, and ferx's own (PK obs at 1/4/8, TTE record at 12). |
-| `results/ss_chz_r{1,2}_*.{lst,tab}` | The committed NONMEM outputs (NONMEM 7.6.0). |
-| `ss_chz_{const,drug,tdep}_fit.ferx` | The three ferx twins. |
+| `ss_chz_r3_{const,drug}.ctl` | The mid-record second-SS-dose anchor: one uninterrupted 56-dose train through `T = 660`, no SS record anywhere. |
+| `ss_chz_train3.csv` | The 56-dose dataset the r3 streams run on (PK obs at 612/647.9/648.1/660, TTE record at 660). |
+| `ss_chz_ss2.csv` | ferx's r3 twin: `SS=1` at `t = 0` **and** `t = 48`, with explicit doses at 12/24/36/60 between them. |
+| `results/ss_chz_r{1,2,3}_*.{lst,tab}` | The committed NONMEM outputs (NONMEM 7.6.0). |
+| `ss_chz_{const,drug,tdep}_fit.ferx` | The three ferx twins. r3 reuses `const` and `drug` unchanged and swaps only the records, which is what makes it a test of the dose semantics rather than of a second model. |
 
 ### Run NONMEM
 
@@ -773,6 +776,8 @@ cd nonmem_anchor
 nmfe76 ss_chz_r2_const.ctl ss_chz_r2_const.lst
 nmfe76 ss_chz_r2_drug.ctl  ss_chz_r2_drug.lst
 nmfe76 ss_chz_r2_tdep.ctl  ss_chz_r2_tdep.lst
+nmfe76 ss_chz_r3_const.ctl ss_chz_r3_const.lst
+nmfe76 ss_chz_r3_drug.ctl  ss_chz_r3_drug.lst
 ```
 
 `ss_chz_r1_{const,drug}.ctl` run the same way; they are committed for their failure,
@@ -809,5 +814,44 @@ row was **already matched before the fix** (ferx `10.29946878 / 10.45467542 /
 compartments all along, which localises #1210 to the accumulator row alone.
 
 Before the fix ferx's `H` on this fixture was displaced by exactly its own `H(0)` —
-`+12.000000` (const), `+1268.971796` (drug), `+4.5360222e10` (tdep) at every record.
+`+12.000000` (const), `+1268.972` (drug), `+4.5360222e10` (tdep) at every record.
+
+## r3 — a *second* `SS=1` dose, anchored without any SS record at all
+
+r1 and r2 settle what an `SS=1` dose at the **start** of a record means. They cannot reach the
+rule that separates #1210's fix from the issue's own suggested one — that a **later** `SS=1`
+dose *keeps* the hazard accrued so far rather than zeroing it. It first looks un-anchorable:
+r1 is precisely the measurement that NONMEM's SS routine cannot be handed this system.
+
+The r2 construction generalises, and the generalisation needs no SS record on the NONMEM side.
+A second `SS=1` dose at `t = 48`, on the regimen the subject is already at steady state under,
+asserts exactly two things: the compartments re-equilibrate to that same periodic trough, and
+the accumulated hazard is a fact about the record that survives the re-equilibration. **A
+subject who has simply been dosed every 12 h without interruption satisfies both by
+construction.** So `ss_chz_r3_{const,drug}.ctl` is one uninterrupted 56-dose train through
+`T = 660`, same gate at `T = 600`, and ferx's `SS@0 + SS@48` must reproduce it record for
+record.
+
+The ferx twin (`ss_chz_ss2.csv`) therefore carries **explicit** doses at 12/24/36/60 alongside
+the two `SS=1` records. That is not decoration: an `SS=1` dose means "the infinite past was
+periodic *up to here*", not "keep dosing", so a twin without them decays from `t = 0` and reads
+`PRED = 0.132` against the train's `4.837` at `t = 47.9`. The first draft of this anchor had
+exactly that bug, and the `IPRED` control is what caught it.
+
+| NONMEM `T` | ferx `t` | `r3_const` (= `0.02·t`) | `r3_drug` | `IPRED` |
+|-----------:|---------:|------------------------:|----------:|--------:|
+| 612   | 12   | 0.240 | 26.1185123 | 4.78896241 |
+| 647.9 | 47.9 | 0.958 | 104.451859 | 4.83708578 |
+| 648.1 | 48.1 | 0.962 | 104.501853 | 5.68812187 |
+| 660   | 60   | 1.200 | 130.592562 | 4.78896241 |
+
+`r3_drug` at `t = 12` reproducing r2's `26.1185123` is a free consistency check between the two
+constructions. `IPRED` reading `4.83708578` just before the second dose and `4.78896241` at the
+dose times is the non-degeneracy the dose-event rule requires: drug from the preceding interval
+is genuinely present when that dose lands.
+
+The discrimination is wide. Zeroing the accumulator at the second dose gives `0.002` and `0.240`
+where the train says `0.962` and `1.200` — every record after `t = 48` short by `H(48)`.
+Mutation-verified: with `restore_chz` writing `0.0` the arm fails at **99.8% relative
+disagreement** on `H`.
 The shape was right; only the origin was wrong.
