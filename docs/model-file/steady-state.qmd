@@ -344,6 +344,37 @@ dose time, so don't interpret the fit as a steady-state fit.
   for those, model the overlapping infusions with an `[odes]` block and
   explicit periodic dose records (without `SS=1`).
 
+### SS with an ODE-accumulated hazard {#ss-with-an-ode-accumulated-hazard}
+
+A joint PK-TTE model (`[event_model] hazard = ...`) appends a cumulative-hazard
+accumulator to the ODE system. That row is **not** a compartment: it is a pure
+integrator with no elimination term, so it has no steady state — it just counts up.
+
+`SS=1` therefore equilibrates the **PK compartments only**. The accumulator keeps
+the value it had at the dose record:
+
+- At the **first** dose of a record that value is `0`, so `H(0) = 0`. The cumulative
+  hazard is measured from the start of the subject's record; no amount of run-in
+  changes that.
+- At a **later** `SS=1` dose the value is whatever has accrued so far, and it
+  survives the re-equilibration. A second `SS=1` dose at `t = 48` re-loads the
+  compartments but keeps `H(48)` — the dose is not a reset. (`EVID=3`/`EVID=4`
+  *are*, and zero the accumulator like any other state.)
+
+Through ferx 0.3.1 the accumulator was cycled along with the compartments, so
+`H(0)` came back holding the run-in's own hazard —
+`H0 x 50 cycles x II` for a constant hazard — and every survival quantity
+downstream of it was displaced by that amount
+([#1210](https://github.com/FeRx-NLME/ferx-core/issues/1210)).
+
+**NONMEM has no native answer here.** Handing NONMEM's own steady-state routine an
+`ADVAN13` system with a hazard compartment returns `A(3) = -2.4e7` and
+`#OBJV = +INF` for a constant hazard, and `NUMERICAL DIFFICULTIES WITH STEADY STATE
+SOLUTION` / `PROGRAM TERMINATED BY OBJ` for a drug-driven one. A NONMEM user has to
+gate the hazard by hand — an explicit pulse train with `IF (T.GE.TREC) GATE = 1` in
+`$DES`. That construction is exactly what ferx's convention reproduces, and it is
+committed as the anchor for this behaviour (`nonmem_anchor/ss_chz_r2_*.ctl`).
+
 ### `SS=2`
 
 NONMEM's `SS=2` semantic ("add to the existing train without

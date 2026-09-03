@@ -39,6 +39,16 @@ section of the SDLC for the versioning policy).
   estimated correlation is now rejected with `E_BLOCK_SIGMA_CHAIN_UNSUPPORTED` rather than
   silently scoring the declared value — `[saem, focei]` is fine, `[focei, imp]` needs `FIX`.
 
+### Performance
+- **A joint PK-TTE model with a linear PK block now takes the exact steady-state solve
+  (#1210).** The hazard accumulator's one-cycle map is the identity, so it made `I - M`
+  singular and the exact `(I - M)^-1 b` fixed point (#914) declined for *every* joint model,
+  whatever its PK block looked like — the equilibration ran the full 50-cycle pulse train, and
+  could emit a spurious `Steady-state (SS=1) equilibration ... did not converge` warning for a
+  PK block that had settled long before, since the accumulator never stops growing. The
+  accumulator rows are now projected out of that solve, so a linear PK block gets its handful
+  of one-cycle integrations back.
+
 ### Added
 - **Fitted `block_sigma` correlations are reported with their fixedness and standard error
   (#847).** `FitResult` gains `residual_correlation_fixed` and `se_residual_correlations` (the
@@ -71,6 +81,19 @@ section of the SDLC for the versioning policy).
   thread pool keyed to those settings, so a fit that asked for nothing keeps the model
   file's accuracy even while another fit runs at `1e-10` beside it (and vice versa) — which
   matters for `ferx-tools`' parallel replicate fits and for any caller sharing the fit pool.
+- **An `SS=1` dose no longer carries the steady-state run-in into a joint PK-TTE model's
+  cumulative hazard (#1210).** The appended `d/dt(__chz_<cmt>)` accumulator was cycled through
+  the equilibration along with the PK compartments, but it is a pure integrator with no steady
+  state — so `H(0)` came back holding the run-in's own hazard (`H0 x 50 cycles x II`, e.g.
+  `12.0` for a constant `H0 = 0.02` at `II = 12`) and every survival quantity downstream of it
+  was displaced by that amount. `S(t) = exp(-H(t))` made this fatal rather than cosmetic: on a
+  drug-driven hazard `S(0)` underflowed to `0` and each subject's objective was inflated by
+  ~2500, and a simulated `SS=1` subject drew its event at `t = 0` in every draw. `SS=1` now
+  equilibrates the PK compartments only and the accumulator keeps its value at the dose record
+  — `0` for a subject's first dose, and, for a **later** `SS=1` dose, the hazard accrued so far
+  (an SS dose re-loads the compartments; it is not a reset — `EVID=3`/`4` still are). A lagged
+  SS dose no longer banks its phase advance either, which also removes a non-monotone `H`. A
+  hazard reading `TAD`/`TAFD` under `SS=1` returned `NaN` for the whole subject and now works.
 - **An estimated `block_sigma` correlation is bounded at `|rho| <= 0.995` (#847).** Merely
   keeping rho inside `(-1, 1)` is not enough: a paired residual block's determinant carries a
   factor `1 - rho^2`, so a rho of 0.9999 leaves `R` numerically singular and the likelihood
@@ -146,6 +169,19 @@ section of the SDLC for the versioning policy).
   floor alone (#1119).
 ### Added
 
+- **`ferx_core::edit` — a typed model-transformation API, so a program can now *write* a
+  `.ferx` model as well as read one (#1176).** `ModelText::parse` / `render` round-trips a
+  model file byte for byte (comments, alignment, blank lines and line endings included), and
+  `ModelText::apply` applies one typed `ModelEdit`: swap the structural model, add or drop a
+  `[covariate_model]` relation, add or drop an η, block two ηs together, change the residual
+  error model, carry a parent fit's estimates into the child (`SeedInits`, keyed on parameter
+  *names*, not positions), or set a `[fit_options]` key. A structural swap performs the coupled
+  θ/η/expression edits across all three blocks — `two_cpt_oral` → `one_cpt_oral` drops `Q`,
+  `V2`, `TVQ`, `TVV2`, `ETA_Q` and `ETA_V2` in one call. η surgery requires the canonical
+  `P = TVP * exp(ETA_P)` form and is a hard error naming the parameter on anything else, never
+  a silent wrong edit. `ModelText::canonical_hash` gives a candidate a stable identity — equal
+  across comment and whitespace changes, different for every semantic one — for use as a fit
+  cache key. This is the prerequisite for the model-search tooling in #1175.
 - **A cancellable bootstrap (#1161).** `BootstrapOptions::cancel` takes a `CancelFlag`; setting
   it from another thread stops a long `ferx_tools::bootstrap` run at the next replicate boundary
   and returns the new `BootstrapError::Cancelled`, so a caller reports an abort as an abort

@@ -146,6 +146,7 @@ website:
           - api/fitting.qmd
           - api/simulation.qmd
           - api/parsing.qmd
+          - api/model-editing.qmd
       - text: "FAQ"
         href: faq.qmd
       - text: "Development"
