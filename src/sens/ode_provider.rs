@@ -451,6 +451,12 @@ pub(crate) fn ode_subject_supported(model: &CompiledModel, subject: &Subject) ->
     if has_infusion_into_input_rate(model, subject) {
         return false;
     }
+    // Joint PK-TTE under a steady-state dose (#1210) — see
+    // `ss_dual_equilibration_out_of_scope`. Declined on both ODE routes, so a subject cannot
+    // reach a dual SS equilibration by taking the other one.
+    if ss_dual_equilibration_out_of_scope(model, subject) {
+        return false;
+    }
     // Model-level scope + time-varying covariates (the static dual walk holds the PK
     // params constant across the integration). A `TIME`-built-in structural parameter
     // is per-event dynamic for the same reason a TV covariate is, so the static walk
@@ -633,11 +639,42 @@ pub(crate) fn modeled_slot_for(
     }
 }
 
+/// A joint PK-TTE system (injected `d/dt(__chz_<cmt>)` accumulators) whose subject carries a
+/// steady-state dose is outside the dual providers' scope (#1210).
+///
+/// The dual SS equilibrations hold no accumulator rows still and restore none, so they would
+/// bank the run-in's hazard into the jet the way the f64 path did before #1210. The f64 path
+/// is fixed; FD differentiates *that*, so declining here is both correct and cheap — a joint
+/// model's inner gradient is FD regardless (`inner_optimizer`'s `has_tte` route).
+///
+/// Keyed on `chz_state_slots`, not on `has_tte()`: an analytic-family TTE model carries no
+/// accumulator and its SS dosing is served fine.
+pub(crate) fn ss_dual_equilibration_out_of_scope(model: &CompiledModel, subject: &Subject) -> bool {
+    model
+        .ode_spec
+        .as_ref()
+        .is_some_and(|o| !o.chz_state_slots.is_empty())
+        && subject.has_ss_doses()
+}
+
 pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> bool {
     // Infusion into a built-in absorption compartment (#719 gap 2) → FD fallback (the f64
     // prediction is exact; the dual walk would double-count the suppressed `+rate`). Same decline
     // as the static gate above — see `has_infusion_into_input_rate`.
     if has_infusion_into_input_rate(model, subject) {
+        return false;
+    }
+    // A joint PK-TTE system under a steady-state dose (#1210): the dual SS equilibration
+    // (`equilibrate_ss_state_g`) has no `d/dt(__chz_<cmt>)` handling, so it would cycle the
+    // accumulator through the run-in exactly as the f64 path did before #1210. Decline the
+    // subject so the walk falls back to FD, which runs on the *fixed* f64 predictor.
+    //
+    // The fit already routed here — `inner_optimizer` sends every `[event_model]` model to the
+    // FD inner gradient — but `fd_fallback_warning` probes `subject_eta_grad` to count the
+    // fallbacks, and that probe reached the dual SS equilibration for real. Without this the
+    // probe reports these subjects as analytic, which both mislabels the fit (the very drift
+    // the warning exists to catch) and, with the #1210 tripwire in place, panics.
+    if ss_dual_equilibration_out_of_scope(model, subject) {
         return false;
     }
     // The event-driven walk serves a subject with time-varying covariates, an estimated
@@ -3873,6 +3910,18 @@ fn equilibrate_ss_state_g<T: crate::sens::num::PkNum>(
     d1_vars: &mut Vec<Dual1<1>>,
     d1_stack: &mut Vec<Dual1<1>>,
 ) -> Vec<T> {
+    // `assert!`, not `debug_assert!`: this guards a *future* widening of the routing, and the
+    // consequence of the widening landing without #1210's masking is a silently wrong gradient
+    // — FOCE/FOCEI converging to the wrong optimum rather than failing. A debug-only tripwire
+    // is absent from exactly the builds users fit in. One bool read on a path already running
+    // ODE solves.
+    assert!(
+        !program.has_chz(),
+        "dual SS equilibration reached a joint PK-TTE system: it has no accumulator handling, \
+         so it would bank the run-in's hazard into the gradient (#1210). A joint model routes \
+         to FD end-to-end (`has_tte` in inner_optimizer, `has_non_gaussian` in the provider); \
+         if that routing is widened, the #1210 masking has to come with it."
+    );
     let mut u = vec![T::from_f64(0.0); n_states];
     if dose.ii <= 0.0 {
         return u;
@@ -4125,6 +4174,10 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::PkNum>(
     params: &[T],
     opts: &crate::ode::solver::OdeSolverOptions,
 ) -> Vec<T> {
+    assert!(
+        !program.has_chz(),
+        "dual SS equilibration reached a joint PK-TTE system: see `equilibrate_ss_state_g` (#1210)."
+    );
     let n = n_states;
     let ii = dose.ii;
     // `CMT=0` equilibrates compartment 1 — the default dose compartment — like the f64 twin

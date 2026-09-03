@@ -414,6 +414,7 @@ mod tests {
             obs_records: vec![],
         };
         let ode_spec = OdeSpec {
+            chz_state_slots: Vec::new(),
             rhs: Box::new(one_cpt_rhs),
             n_states: 1,
             state_names: vec!["central".into()],
