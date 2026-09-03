@@ -427,8 +427,29 @@ impl MlpMapper {
         weights: &[f64],
         preactivation: bool,
     ) -> Result<DMatrix<f64>, NnError> {
+        self.jacobian_with_output(x, weights, preactivation)
+            .map(|(_, jac)| jac)
+    }
+
+    /// [`jacobian_impl`](Self::jacobian_impl) plus the network output `a_L` at
+    /// the same point. The backward sweep already runs the forward pass, so a
+    /// caller that needs both (the curvature penalty evaluates `f` and `∂f/∂w`
+    /// at every grid node) gets the output for free instead of paying a second
+    /// forward pass.
+    fn jacobian_with_output(
+        &self,
+        x: &[f64],
+        weights: &[f64],
+        preactivation: bool,
+    ) -> Result<(Vec<f64>, DMatrix<f64>), NnError> {
         self.check_shapes(x, weights)?;
         let (pre, post) = self.forward_cache(x, weights);
+        let output: Vec<f64> = post
+            .last()
+            .expect("at least one layer activation")
+            .iter()
+            .copied()
+            .collect();
 
         let n_out = self.n_outputs();
         let mut jac = DMatrix::<f64>::zeros(n_out, self.n_params);
@@ -493,7 +514,7 @@ impl MlpMapper {
             }
         }
 
-        Ok(jac)
+        Ok((output, jac))
     }
 
     /// Local flat-vector indices of the **weight-matrix** parameters, excluding
@@ -503,6 +524,7 @@ impl MlpMapper {
     /// `[W_l, b_l]` layout and the parser's `W_…`/`B_…` theta naming). Used by
     /// the L2 (weight-decay) penalty, which shrinks weights but leaves biases
     /// free.
+    #[cfg(test)]
     pub(crate) fn weight_param_indices(&self) -> Vec<usize> {
         let mut idx = Vec::new();
         for l in 1..self.layers.len() {
@@ -515,28 +537,35 @@ impl MlpMapper {
 
     /// L2 (weight-decay) penalty value `lambda · Σ wᵢ²` over the **weight**
     /// blocks only (biases excluded). `lambda == 0.0` returns `0.0` (no-op).
+    /// Test-facing wrapper; production goes through [`NnRegularizer`].
+    #[cfg(test)]
     pub(crate) fn l2_weight_penalty_value(&self, weights: &[f64], lambda: f64) -> f64 {
-        if lambda == 0.0 {
-            return 0.0;
-        }
-        let mut s = 0.0;
-        for l in 1..self.layers.len() {
-            let start = self.offsets[l - 1];
-            let n_w = self.layers[l] * self.layers[l - 1];
-            for &w in &weights[start..start + n_w] {
-                s += w * w;
-            }
-        }
-        lambda * s
+        self.l2_weight_penalty_accum(weights, lambda, &mut PenaltySink::none())
     }
 
     /// L2 penalty value and its gradient w.r.t. the flat weight vector.
     /// `grad[i] = 2·lambda·wᵢ` on weight entries, `0` on bias entries.
     /// `lambda == 0.0` returns `(0.0, zeros)` (strict no-op).
+    #[cfg(test)]
     pub(crate) fn l2_weight_penalty(&self, weights: &[f64], lambda: f64) -> (f64, Vec<f64>) {
         let mut grad = vec![0.0f64; self.n_params];
+        let v = self.l2_weight_penalty_accum(weights, lambda, &mut PenaltySink::grad(&mut grad));
+        (v, grad)
+    }
+
+    /// One-pass L2 kernel behind [`l2_weight_penalty_value`](Self::l2_weight_penalty_value)
+    /// / [`l2_weight_penalty`](Self::l2_weight_penalty): returns the value and
+    /// accumulates whatever derivative pieces `sink` asks for. The gradient is
+    /// `2·lambda·wᵢ` on weight entries; the Hessian is exact, `2·lambda` on the
+    /// weight diagonal and nothing on biases. `lambda == 0.0` touches nothing.
+    pub(crate) fn l2_weight_penalty_accum(
+        &self,
+        weights: &[f64],
+        lambda: f64,
+        sink: &mut PenaltySink<'_>,
+    ) -> f64 {
         if lambda == 0.0 {
-            return (0.0, grad);
+            return 0.0;
         }
         let mut s = 0.0;
         for l in 1..self.layers.len() {
@@ -544,10 +573,15 @@ impl MlpMapper {
             let n_w = self.layers[l] * self.layers[l - 1];
             for i in start..start + n_w {
                 s += weights[i] * weights[i];
-                grad[i] = 2.0 * lambda * weights[i];
+                if let Some(g) = sink.grad.as_deref_mut() {
+                    g[i] += 2.0 * lambda * weights[i];
+                }
+                if let Some(h) = sink.hess.as_deref_mut() {
+                    h(i, i, 2.0 * lambda);
+                }
             }
         }
-        (lambda * s, grad)
+        lambda * s
     }
 
     /// Smoothness (curvature) penalty value `lambda · Σ_grid Σ_output C²`, where
@@ -555,34 +589,20 @@ impl MlpMapper {
     /// each output along a marginal partial-dependence curve (see
     /// [`CurvatureGrid`]). Forward passes only; `lambda == 0.0` or an empty grid
     /// returns `0.0` (no-op).
+    #[cfg(test)]
     pub(crate) fn curvature_penalty_value(
         &self,
         weights: &[f64],
         grid: &CurvatureGrid,
         lambda: f64,
     ) -> f64 {
-        if lambda == 0.0 || grid.is_empty() {
-            return 0.0;
-        }
-        let mut s = 0.0;
-        for t in grid.triples() {
-            let ym = self.forward(&t[0], weights).expect("grid input shape ok");
-            let yc = self.forward(&t[1], weights).expect("grid input shape ok");
-            let yp = self.forward(&t[2], weights).expect("grid input shape ok");
-            for o in 0..ym.len() {
-                let c = yp[o] - 2.0 * yc[o] + ym[o];
-                s += c * c;
-            }
-        }
-        lambda * s
+        self.curvature_penalty_accum(weights, grid, lambda, &mut PenaltySink::none())
     }
 
     /// Smoothness (curvature) penalty value and its gradient w.r.t. the flat
-    /// weight vector. Reuses the analytic [`MlpMapper::jacobian`]:
-    /// `∂C/∂w = J(x+h) − 2·J(x) + J(x−h)`, so
-    /// `∂pen/∂w = Σ 2·lambda·C·(∂C/∂w)`. No autodiff needed. `lambda == 0.0` or
-    /// an empty grid returns `(0.0, zeros)` (strict no-op). The gradient touches
-    /// bias entries too (biases shift the curve), unlike the L2 term.
+    /// weight vector. `lambda == 0.0` or an empty grid returns `(0.0, zeros)`
+    /// (strict no-op). See [`curvature_penalty_accum`](Self::curvature_penalty_accum).
+    #[cfg(test)]
     pub(crate) fn curvature_penalty(
         &self,
         weights: &[f64],
@@ -590,28 +610,91 @@ impl MlpMapper {
         lambda: f64,
     ) -> (f64, Vec<f64>) {
         let mut grad = vec![0.0f64; self.n_params];
+        let v =
+            self.curvature_penalty_accum(weights, grid, lambda, &mut PenaltySink::grad(&mut grad));
+        (v, grad)
+    }
+
+    /// One-pass curvature kernel: value, plus whatever `sink` asks for.
+    ///
+    /// Each grid axis is a uniform sweep of nodes `x_0 … x_{n−1}` in the
+    /// network's own input space (see [`CurvatureGrid`]), and every interior
+    /// node `k` contributes `C_k = f(x_{k+1}) − 2·f(x_k) + f(x_{k−1})` per
+    /// output. The network is evaluated **once per node** — adjacent stencils
+    /// share nodes, so this is `n` evaluations per axis rather than `3(n−2)` —
+    /// and when a derivative is wanted the output is read off the same backward
+    /// sweep that produces the Jacobian ([`jacobian_with_output`](Self::jacobian_with_output)),
+    /// so no separate forward pass runs.
+    ///
+    /// Gradient: `∂C/∂w = J(x_{k+1}) − 2·J(x_k) + J(x_{k−1})`, so
+    /// `∂pen/∂w = Σ 2·lambda·C·∂C/∂w`. Touches bias entries too (biases shift
+    /// the curve), unlike the L2 term. Hessian: the Gauss–Newton form
+    /// `2·lambda·Σ (∂C/∂w)(∂C/∂w)ᵀ`, which drops the `C·∂²C/∂w²` term — positive
+    /// semi-definite by construction and exact at `C = 0`, i.e. at the flat map
+    /// the penalty pulls toward, which is the regime a trust-region / BHHH
+    /// consumer needs it in. `lambda == 0.0` or an empty grid touches nothing.
+    pub(crate) fn curvature_penalty_accum(
+        &self,
+        weights: &[f64],
+        grid: &CurvatureGrid,
+        lambda: f64,
+        sink: &mut PenaltySink<'_>,
+    ) -> f64 {
         if lambda == 0.0 || grid.is_empty() {
-            return (0.0, grad);
+            return 0.0;
         }
+        let want_deriv = sink.grad.is_some() || sink.hess.is_some();
+        let n_p = self.n_params;
         let mut s = 0.0;
-        for t in grid.triples() {
-            let ym = self.forward(&t[0], weights).expect("grid input shape ok");
-            let yc = self.forward(&t[1], weights).expect("grid input shape ok");
-            let yp = self.forward(&t[2], weights).expect("grid input shape ok");
-            let jm = self.jacobian(&t[0], weights).expect("grid input shape ok");
-            let jc = self.jacobian(&t[1], weights).expect("grid input shape ok");
-            let jp = self.jacobian(&t[2], weights).expect("grid input shape ok");
-            for o in 0..ym.len() {
-                let c = yp[o] - 2.0 * yc[o] + ym[o];
-                s += c * c;
-                let two_lc = 2.0 * lambda * c;
-                for w in 0..self.n_params {
-                    let dc = jp[(o, w)] - 2.0 * jc[(o, w)] + jm[(o, w)];
-                    grad[w] += two_lc * dc;
+        let mut dc = vec![0.0f64; n_p];
+        for nodes in grid.axes() {
+            // Evaluate every node once.
+            let mut ys: Vec<Vec<f64>> = Vec::with_capacity(nodes.len());
+            let mut js: Vec<DMatrix<f64>> = Vec::new();
+            for x in nodes {
+                if want_deriv {
+                    let (y, j) = self
+                        .jacobian_with_output(x, weights, false)
+                        .expect("grid input shape ok");
+                    ys.push(y);
+                    js.push(j);
+                } else {
+                    ys.push(self.forward(x, weights).expect("grid input shape ok"));
+                }
+            }
+            let n_out = ys[0].len();
+            for k in 1..nodes.len() - 1 {
+                for o in 0..n_out {
+                    let c = ys[k + 1][o] - 2.0 * ys[k][o] + ys[k - 1][o];
+                    s += c * c;
+                    if !want_deriv {
+                        continue;
+                    }
+                    let (jm, jc, jp) = (&js[k - 1], &js[k], &js[k + 1]);
+                    for w in 0..n_p {
+                        dc[w] = jp[(o, w)] - 2.0 * jc[(o, w)] + jm[(o, w)];
+                    }
+                    if let Some(g) = sink.grad.as_deref_mut() {
+                        let two_lc = 2.0 * lambda * c;
+                        for w in 0..n_p {
+                            g[w] += two_lc * dc[w];
+                        }
+                    }
+                    if let Some(h) = sink.hess.as_deref_mut() {
+                        let two_l = 2.0 * lambda;
+                        for i in 0..n_p {
+                            if dc[i] == 0.0 {
+                                continue;
+                            }
+                            for j in 0..n_p {
+                                h(i, j, two_l * dc[i] * dc[j]);
+                            }
+                        }
+                    }
                 }
             }
         }
-        (lambda * s, grad)
+        lambda * s
     }
 
     /// Build an `(n_l × n_{l-1})` `DMatrix` from the layer-`l` weight block
@@ -1040,37 +1123,88 @@ pub struct CovariateNn {
 // Regularization — L2 (weight-decay) + smoothness (curvature)
 // ---------------------------------------------------------------------------
 
+/// Derivative sinks for a penalty kernel. A kernel always returns the penalty
+/// value; on top of that it accumulates `+= ∂pen/∂w` into `grad` (indexed by the
+/// network's local flat weight vector) and calls `hess(i, j, v)` for every
+/// Hessian contribution `v` at local `(i, j)`. Either may be absent, and the
+/// kernels skip the corresponding work entirely, so value-only callers pay for
+/// forward passes alone.
+pub(crate) struct PenaltySink<'a> {
+    pub(crate) grad: Option<&'a mut [f64]>,
+    pub(crate) hess: Option<&'a mut dyn FnMut(usize, usize, f64)>,
+}
+
+#[cfg(test)]
+impl<'a> PenaltySink<'a> {
+    /// Value only.
+    pub(crate) fn none() -> Self {
+        Self {
+            grad: None,
+            hess: None,
+        }
+    }
+
+    /// Value + gradient.
+    pub(crate) fn grad(grad: &'a mut [f64]) -> Self {
+        Self {
+            grad: Some(grad),
+            hess: None,
+        }
+    }
+}
+
 /// A marginal partial-dependence grid for the smoothness/curvature penalty.
 ///
 /// For each NN input in turn, the input is swept across its observed range in
-/// **z-scored** space (uniform step `NN_SMOOTH_GRID_STEP_Z`) while every other
-/// input is held at its median. Each interior node contributes a triple of
-/// **raw** input vectors `(x−h, x, x+h)` at which the penalty finite-differences
-/// the 2nd derivative `C = f(x+h) − 2·f(x) + f(x−h)`. The grid mirrors the
+/// **z-scored** space (uniform step `NN_SMOOTH_GRID_STEP_Z`, in units of that
+/// input's observed sd) while every other input is held at its median. Every
+/// interior node `k` of a sweep contributes one stencil
+/// `C = f(x_{k+1}) − 2·f(x_k) + f(x_{k−1})`. The grid mirrors the
 /// partial-dependence curves used in downstream diagnostics, so the penalty
-/// smooths exactly what those plots show. Inputs are read raw by the NN, so the
-/// z-scored sweep is mapped back to raw values (`z·sd + mean`) here; the raw
-/// vectors are what feed [`MlpMapper::forward`] / [`MlpMapper::jacobian`].
+/// smooths exactly what those plots show.
+///
+/// **The grid lives in the network's input space, not in raw covariate
+/// space.** [`NamedMlpMapper`] feeds its MLP `(x − center) / scale` on every
+/// prediction (`build_input_vec_zero_fill`), so the values handed to
+/// [`build`](Self::build) are already normalised the same way
+/// ([`collect_input_values`]), and the node vectors go straight into
+/// [`MlpMapper::forward`] / [`MlpMapper::jacobian`] — the same function the fit
+/// evaluates, at the same inputs. A grid built on raw covariates would probe the
+/// network where the fit never runs it: with `center = [70, 86]`, `scale = [12,
+/// 23]` the fit sees `z ∈ ≈[−2, 2]` while raw `WT ∈ [45, 90]` saturates every
+/// `tanh` unit, so `C ≈ 0` and the penalty is a silent no-op on exactly the
+/// normalised models it targets.
+///
+/// Node count per axis is capped at `NN_SMOOTH_GRID_MAX_NODES`; an axis whose
+/// observed z-span would need more nodes at the default step gets a **coarser
+/// step** over the full span rather than a truncated sweep, so the upper tail of
+/// a wide-range covariate is never silently left unpenalised.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CurvatureGrid {
-    /// Each entry is `[x_minus, x_center, x_plus]`, raw input vectors of length
-    /// `n_inputs`.
-    triples: Vec<[Vec<f64>; 3]>,
+    /// One sweep per usable input axis: the node input vectors (length
+    /// `n_inputs`, in the network's input space), uniformly spaced along that
+    /// axis, at least three per sweep.
+    axes: Vec<Vec<Vec<f64>>>,
 }
 
 impl CurvatureGrid {
     /// Build the grid from per-input observed values. `input_values[i]` is the
-    /// vector of observed values of NN input `i` (in the mapper's input order),
-    /// and `step_z` is the uniform grid step in z-scored units.
+    /// vector of observed values of NN input `i` (in the mapper's input order and
+    /// **in the network's input space**, i.e. already `(x − center) / scale`),
+    /// and `step_z` is the uniform grid step in units of each input's observed
+    /// sd.
     ///
-    /// An input with zero spread (constant covariate) or too narrow a range to
-    /// fit an interior triple contributes nothing. Returns an empty grid (a
-    /// no-op penalty) when no input yields a usable sweep.
+    /// Non-finite values are ignored — the reader stores `NaN` for a subject with
+    /// no finite value in a covariate column, and one such subject must not
+    /// poison the whole axis' mean/sd and silently drop it. An input with zero
+    /// spread (constant covariate) or too narrow a range to fit an interior
+    /// stencil contributes nothing. Returns an empty grid (a no-op penalty) when
+    /// no input yields a usable sweep.
     pub(crate) fn build(input_values: &[Vec<f64>], step_z: f64) -> Self {
         let n_in = input_values.len();
-        let mut triples = Vec::new();
+        let mut axes = Vec::new();
         if step_z <= 0.0 {
-            return Self { triples };
+            return Self { axes };
         }
         // Held-input centers (median) and per-axis mean/sd/min/max.
         let mut medians = vec![0.0; n_in];
@@ -1079,15 +1213,15 @@ impl CurvatureGrid {
         let mut mins = vec![0.0; n_in];
         let mut maxs = vec![0.0; n_in];
         for (i, vals) in input_values.iter().enumerate() {
-            if vals.is_empty() {
+            let mut sorted: Vec<f64> = vals.iter().copied().filter(|v| v.is_finite()).collect();
+            if sorted.is_empty() {
                 continue;
             }
-            let mut sorted = vals.clone();
-            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            sorted.sort_by(|a, b| a.partial_cmp(b).expect("finite values are ordered"));
             medians[i] = median_of_sorted(&sorted);
-            let n = vals.len() as f64;
-            let mean = vals.iter().sum::<f64>() / n;
-            let var = vals.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / n;
+            let n = sorted.len() as f64;
+            let mean = sorted.iter().sum::<f64>() / n;
+            let var = sorted.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / n;
             means[i] = mean;
             sds[i] = var.sqrt();
             mins[i] = *sorted.first().expect("non-empty");
@@ -1102,43 +1236,52 @@ impl CurvatureGrid {
             let z_hi = (maxs[i] - means[i]) / sd;
             let span = z_hi - z_lo;
             if span < 2.0 * step_z {
-                continue; // too narrow to form an interior triple
+                continue; // too narrow to form an interior stencil
             }
-            let n_nodes = ((span / step_z).floor() as usize + 1).min(NN_SMOOTH_GRID_MAX_NODES);
-            // Belt-and-braces: the `span < 2·step_z` check above already implies
-            // `n_nodes >= 3` in exact arithmetic (and the `.min` cap is 65, well
-            // clear of 3), so this is unreachable short of a rounding edge in
-            // `span / step_z`. Kept because the loop below would underflow on
-            // `n_nodes - 1` if it ever were reached; it reads as uncovered for
-            // the same reason it is safe.
-            if n_nodes < 3 {
-                continue;
-            }
-            let raw_at = |z: f64| -> Vec<f64> {
-                let mut x = medians.clone();
-                x[i] = z * sd + means[i];
-                x
+            // `span >= 2·step_z` gives `floor(span / step_z) >= 2`, so at least
+            // three nodes. Past the cap, widen the step to keep the whole span.
+            let n_at_step = (span / step_z).floor() as usize + 1;
+            let (n_nodes, step) = if n_at_step > NN_SMOOTH_GRID_MAX_NODES {
+                (
+                    NN_SMOOTH_GRID_MAX_NODES,
+                    span / (NN_SMOOTH_GRID_MAX_NODES - 1) as f64,
+                )
+            } else {
+                (n_at_step, step_z)
             };
-            for g in 1..n_nodes - 1 {
-                let z_center = z_lo + step_z * g as f64;
-                triples.push([
-                    raw_at(z_center - step_z),
-                    raw_at(z_center),
-                    raw_at(z_center + step_z),
-                ]);
-            }
+            debug_assert!(n_nodes >= 3);
+            let nodes: Vec<Vec<f64>> = (0..n_nodes)
+                .map(|g| {
+                    let mut x = medians.clone();
+                    x[i] = (z_lo + step * g as f64) * sd + means[i];
+                    x
+                })
+                .collect();
+            axes.push(nodes);
         }
-        Self { triples }
+        Self { axes }
     }
 
-    /// The `(x−h, x, x+h)` triples of raw input vectors.
-    fn triples(&self) -> &[[Vec<f64>; 3]] {
-        &self.triples
+    /// The per-axis node sweeps (see the struct docs).
+    fn axes(&self) -> &[Vec<Vec<f64>>] {
+        &self.axes
+    }
+
+    /// The `(x−h, x, x+h)` stencils the penalty evaluates, materialised.
+    #[cfg(test)]
+    fn triples(&self) -> Vec<[Vec<f64>; 3]> {
+        self.axes
+            .iter()
+            .flat_map(|nodes| {
+                (1..nodes.len() - 1)
+                    .map(|k| [nodes[k - 1].clone(), nodes[k].clone(), nodes[k + 1].clone()])
+            })
+            .collect()
     }
 
     /// Whether the grid contributes any curvature terms.
     pub(crate) fn is_empty(&self) -> bool {
-        self.triples.is_empty()
+        self.axes.is_empty()
     }
 }
 
@@ -1155,19 +1298,29 @@ fn median_of_sorted(sorted: &[f64]) -> f64 {
 }
 
 /// Collect the observed values of each of a mapper's named inputs across the
-/// population's subject-static covariates, in the mapper's input order. Missing
-/// covariates are skipped (they never contribute a value), matching the
-/// forward-pass zero-fill only in that they don't distort the observed
-/// distribution used to build the grid.
+/// population's subject-static covariates, in the mapper's input order and
+/// **normalised the way the mapper feeds them to its MLP** (`(x − center) /
+/// scale`, [`NamedMlpMapper::normalize`]) — so the grid built from them lives in
+/// the space the fit actually evaluates the network in. Missing covariates are
+/// skipped (they never contribute a value); a subject's `NaN` placeholder for a
+/// column it has no finite value in passes through and is dropped by
+/// [`CurvatureGrid::build`].
+///
+/// This reads the subject-static covariate snapshot (the first finite row per
+/// subject). A time-varying NN input is therefore swept over its *baseline*
+/// range; later-occasion values only enter the grid through the subjects whose
+/// baseline lands there.
 fn collect_input_values(mapper: &NamedMlpMapper, population: &Population) -> Vec<Vec<f64>> {
     mapper
         .input_names()
         .iter()
-        .map(|name| {
+        .enumerate()
+        .map(|(i, name)| {
             population
                 .subjects
                 .iter()
                 .filter_map(|s| s.covariates.get(name).copied())
+                .map(|x| mapper.normalize(i, x))
                 .collect()
         })
         .collect()
@@ -1176,10 +1329,19 @@ fn collect_input_values(mapper: &NamedMlpMapper, population: &Population) -> Vec
 /// Per-network regularization state, built once before the optimize loop and
 /// shared (by reference) across every objective/gradient evaluation.
 ///
-/// Holds a cheap clone of each NN's [`MlpMapper`], the theta offset of its
-/// weight block, and (when smoothness is on) its prebuilt [`CurvatureGrid`].
-/// Both penalties are strict no-ops when their λ is `0.0`, so an unregularized
-/// fit adds nothing.
+/// Holds a cheap clone of each NN's inner [`MlpMapper`], the theta offset of
+/// its weight block, and (when smoothness is on) its prebuilt
+/// [`CurvatureGrid`]. Built with no specs — so every method is a no-op that
+/// touches nothing — unless at least one λ is positive, and each kernel is
+/// itself a no-op at `λ == 0.0`, so an unregularized fit adds nothing.
+///
+/// The penalty is applied to the **optimizer's** objective only. `theta` is the
+/// full natural-space theta vector; NN weights are identity-packed (the parser
+/// gives them `theta_lower = −∞`), so a natural-space weight coordinate *is* a
+/// packed coordinate and the raw-weight gradient / Hessian map one-to-one onto
+/// packed indices. The outer optimizers' per-coordinate `scale[k]` is applied
+/// by the caller on the assembled packed gradient, exactly as it is to the
+/// likelihood part — the penalty needs no separate Jacobian-of-scaling factor.
 #[derive(Debug, Clone)]
 pub(crate) struct NnRegularizer {
     l2_lambda: f64,
@@ -1190,7 +1352,6 @@ pub(crate) struct NnRegularizer {
 #[derive(Debug, Clone)]
 struct NnRegSpec {
     weights_offset: usize,
-    n_weights: usize,
     mapper: MlpMapper,
     grid: CurvatureGrid,
 }
@@ -1209,8 +1370,6 @@ impl NnRegularizer {
         let mut specs = Vec::new();
         if l2_lambda > 0.0 || smooth_lambda > 0.0 {
             for nn in &model.covariate_nns {
-                let mapper = nn.mapper.mlp().clone();
-                let n_weights = mapper.n_weights();
                 let grid = if smooth_lambda > 0.0 {
                     CurvatureGrid::build(
                         &collect_input_values(&nn.mapper, population),
@@ -1221,8 +1380,7 @@ impl NnRegularizer {
                 };
                 specs.push(NnRegSpec {
                     weights_offset: nn.weights_offset,
-                    n_weights,
-                    mapper,
+                    mapper: nn.mapper.mlp().clone(),
                     grid,
                 });
             }
@@ -1234,54 +1392,68 @@ impl NnRegularizer {
         }
     }
 
-    /// Whether any penalty term is active (non-zero λ and at least one NN).
+    /// Whether any penalty term is active (a positive λ and at least one NN).
     pub(crate) fn is_active(&self) -> bool {
-        !self.specs.is_empty() && (self.l2_lambda > 0.0 || self.smooth_lambda > 0.0)
+        !self.specs.is_empty()
     }
 
     /// Additive penalty on the population objective: `Σ_nn (L2 + smoothness)`.
-    /// `theta` is the full (natural-space) theta vector; the NN weight blocks
-    /// are sliced out at each spec's offset. Returns `0.0` when inactive.
+    /// Returns `0.0` when inactive.
     pub(crate) fn penalty_value(&self, theta: &[f64]) -> f64 {
-        let mut p = 0.0;
-        for spec in &self.specs {
-            let w = &theta[spec.weights_offset..spec.weights_offset + spec.n_weights];
-            if self.l2_lambda > 0.0 {
-                p += spec.mapper.l2_weight_penalty_value(w, self.l2_lambda);
-            }
-            if self.smooth_lambda > 0.0 {
-                p += spec
-                    .mapper
-                    .curvature_penalty_value(w, &spec.grid, self.smooth_lambda);
-            }
-        }
-        p
+        self.accumulate(theta, None, None)
     }
 
-    /// Add the penalty gradient into `grad` at the NN-weight coordinates. Both
-    /// penalties are separable and the NN weights are identity-packed with unit
-    /// optimizer scale, so the raw-weight gradient maps one-to-one into the
-    /// packed gradient `grad` (no Jacobian-of-scaling factor). No-op when
-    /// inactive.
+    /// Add the penalty gradient into `grad` at the NN-weight (packed)
+    /// coordinates. No-op when inactive.
     pub(crate) fn add_packed_gradient(&self, theta: &[f64], grad: &mut [f64]) {
+        self.accumulate(theta, Some(grad), None);
+    }
+
+    /// Penalty value **and** gradient in one pass — the gradient-path callers
+    /// use this instead of `penalty_value` + `add_packed_gradient`, which would
+    /// evaluate every curvature node twice.
+    pub(crate) fn penalty_and_gradient(&self, theta: &[f64], grad: &mut [f64]) -> f64 {
+        self.accumulate(theta, Some(grad), None)
+    }
+
+    /// Add the penalty's Hessian contributions through `add(i, j, v)` at packed
+    /// coordinates: exact `2·λ_l2` on the weight diagonal for L2, and the
+    /// Gauss–Newton `2·λ_smooth·Σ ∂C/∂w ∂C/∂wᵀ` for the curvature term (see
+    /// [`MlpMapper::curvature_penalty_accum`]). Storage-agnostic so the
+    /// trust-region `Vec<Vec<f64>>` and the Gauss–Newton `DMatrix` both feed
+    /// from it. No-op when inactive.
+    pub(crate) fn add_packed_hessian(&self, theta: &[f64], add: &mut dyn FnMut(usize, usize, f64)) {
+        self.accumulate(theta, None, Some(add));
+    }
+
+    fn accumulate(
+        &self,
+        theta: &[f64],
+        mut grad: Option<&mut [f64]>,
+        mut hess: Option<&mut dyn FnMut(usize, usize, f64)>,
+    ) -> f64 {
+        let mut p = 0.0;
         for spec in &self.specs {
             let off = spec.weights_offset;
-            let w = &theta[off..off + spec.n_weights];
-            if self.l2_lambda > 0.0 {
-                let (_v, g) = spec.mapper.l2_weight_penalty(w, self.l2_lambda);
-                for (i, gi) in g.iter().enumerate() {
-                    grad[off + i] += gi;
-                }
-            }
-            if self.smooth_lambda > 0.0 {
-                let (_v, g) = spec
-                    .mapper
-                    .curvature_penalty(w, &spec.grid, self.smooth_lambda);
-                for (i, gi) in g.iter().enumerate() {
-                    grad[off + i] += gi;
-                }
-            }
+            let n_w = spec.mapper.n_weights();
+            let w = &theta[off..off + n_w];
+            let mut hess_local = hess
+                .as_deref_mut()
+                .map(|h| move |i: usize, j: usize, v: f64| h(off + i, off + j, v));
+            let mut sink = PenaltySink {
+                grad: grad.as_deref_mut().map(|g| &mut g[off..off + n_w]),
+                hess: hess_local
+                    .as_mut()
+                    .map(|h| h as &mut dyn FnMut(usize, usize, f64)),
+            };
+            p += spec
+                .mapper
+                .l2_weight_penalty_accum(w, self.l2_lambda, &mut sink);
+            p += spec
+                .mapper
+                .curvature_penalty_accum(w, &spec.grid, self.smooth_lambda, &mut sink);
         }
+        p
     }
 }
 
@@ -2113,6 +2285,257 @@ mod regularization_tests {
         // Single element is its own median.
         assert_relative_eq!(median_of_sorted(&[7.5]), 7.5, epsilon = 1e-12);
     }
+
+    /// Past the node cap the sweep gets a **coarser step over the full span**,
+    /// not a truncated one: the last node must still sit at the observed
+    /// maximum. Regression — the cap once dropped the upper tail of any input
+    /// whose z-span exceeded `(cap − 1) · step` (16 sd at the defaults).
+    #[test]
+    fn curvature_grid_coarsens_instead_of_truncating_past_the_node_cap() {
+        // A wide input: 200 evenly spaced values plus one far outlier gives a
+        // z-span of ~14 sd, well past 16/… — use a step small enough that the
+        // default cap binds.
+        let mut wide: Vec<f64> = (0..200).map(|i| i as f64).collect();
+        wide.push(2000.0);
+        let vals = vec![wide.clone()];
+        let n = wide.len() as f64;
+        let mean = wide.iter().sum::<f64>() / n;
+        let sd = (wide.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n).sqrt();
+        let span_z = (2000.0 - mean) / sd - (0.0 - mean) / sd;
+        let step = 0.05;
+        assert!(
+            span_z / step + 1.0 > NN_SMOOTH_GRID_MAX_NODES as f64,
+            "fixture must exceed the cap at this step ({})",
+            span_z / step
+        );
+        let grid = CurvatureGrid::build(&vals, step);
+        let nodes = &grid.axes()[0];
+        assert_eq!(
+            nodes.len(),
+            NN_SMOOTH_GRID_MAX_NODES,
+            "capped at the max node count"
+        );
+        assert_relative_eq!(nodes[0][0], 0.0, epsilon = 1e-9);
+        assert_relative_eq!(nodes[nodes.len() - 1][0], 2000.0, epsilon = 1e-6);
+        // Uniform in between.
+        let h = nodes[1][0] - nodes[0][0];
+        for k in 1..nodes.len() {
+            assert_relative_eq!(nodes[k][0] - nodes[k - 1][0], h, epsilon = 1e-6);
+        }
+        // Below the cap the requested step is honoured exactly.
+        let narrow = vec![vec![50.0, 60.0, 70.0, 80.0, 90.0, 100.0]];
+        let g = CurvatureGrid::build(&narrow, NN_SMOOTH_GRID_STEP_Z);
+        let nodes = &g.axes()[0];
+        let sd = (narrow[0].iter().map(|v| (v - 75.0).powi(2)).sum::<f64>() / 6.0).sqrt();
+        assert!(nodes.len() < NN_SMOOTH_GRID_MAX_NODES);
+        assert_relative_eq!(
+            nodes[1][0] - nodes[0][0],
+            NN_SMOOTH_GRID_STEP_Z * sd,
+            epsilon = 1e-9
+        );
+    }
+
+    /// A subject with no finite value for an input arrives as `NaN` (the reader's
+    /// placeholder) and must be dropped from that axis — not poison its mean/sd
+    /// and silently delete the whole axis, which is what `NaN` did through
+    /// `sd <= 0.0` (false), `span` (NaN) and `(NaN).floor() as usize` (0).
+    #[test]
+    fn curvature_grid_ignores_non_finite_values() {
+        let clean = vec![vec![50.0, 60.0, 70.0, 80.0, 90.0, 100.0]];
+        let mut dirty = clean.clone();
+        dirty[0].push(f64::NAN);
+        dirty[0].insert(2, f64::INFINITY);
+        let g_clean = CurvatureGrid::build(&clean, NN_SMOOTH_GRID_STEP_Z);
+        let g_dirty = CurvatureGrid::build(&dirty, NN_SMOOTH_GRID_STEP_Z);
+        assert!(!g_clean.is_empty());
+        assert_eq!(
+            g_dirty.axes().len(),
+            g_clean.axes().len(),
+            "axis must survive"
+        );
+        for (a, b) in g_dirty.axes()[0].iter().zip(&g_clean.axes()[0]) {
+            assert_relative_eq!(a[0], b[0], epsilon = 1e-12);
+        }
+        // All-NaN input: nothing usable, no axis, no panic.
+        assert!(CurvatureGrid::build(&[vec![f64::NAN; 4]], NN_SMOOTH_GRID_STEP_Z).is_empty());
+    }
+
+    /// The curvature penalty must evaluate the network **where the fit does**:
+    /// a `NamedMlpMapper` with `center`/`scale` feeds its MLP `(x − center) /
+    /// scale`, so the grid built from its observed covariates must equal, node
+    /// for node, the grid a mapper *without* normalisation builds from the
+    /// pre-normalised covariates — and the penalty values must agree exactly.
+    /// Regression: the grid was built on raw covariates and handed to the inner
+    /// MLP, so with `center = [70, 86]`, `scale = [12, 23]` it probed `tanh` at
+    /// pre-activations of ±100 where `C ≈ 0` and `nn_smooth` was a silent no-op.
+    #[test]
+    fn curvature_grid_lives_in_the_mappers_normalised_input_space() {
+        use std::collections::HashMap;
+
+        let names = vec!["WT".to_string(), "CRCL".to_string()];
+        let outs = vec!["CL".to_string()];
+        let center = vec![70.0, 86.0];
+        let scale = vec![12.0, 23.0];
+        let raw: Vec<(f64, f64)> = vec![
+            (45.0, 46.0),
+            (52.0, 60.0),
+            (61.0, 70.0),
+            (70.0, 75.0),
+            (78.0, 82.0),
+            (90.0, 66.0),
+        ];
+
+        let mlp = || MlpMapper::new(vec![2, 4, 1], Activation::Tanh, Activation::Softplus).unwrap();
+        let normed = NamedMlpMapper::new(mlp(), names.clone(), outs.clone())
+            .unwrap()
+            .with_normalization(center.clone(), scale.clone())
+            .unwrap();
+        let plain = NamedMlpMapper::new(mlp(), names, outs).unwrap();
+
+        let subj = |wt: f64, crcl: f64| {
+            let mut c = HashMap::new();
+            c.insert("WT".to_string(), wt);
+            c.insert("CRCL".to_string(), crcl);
+            c
+        };
+        let pop_raw = raw.iter().map(|&(w, c)| subj(w, c)).collect::<Vec<_>>();
+        let pop_z = raw
+            .iter()
+            .map(|&(w, c)| subj((w - center[0]) / scale[0], (c - center[1]) / scale[1]))
+            .collect::<Vec<_>>();
+        let values = |mapper: &NamedMlpMapper, covs: &[HashMap<String, f64>]| -> Vec<Vec<f64>> {
+            mapper
+                .input_names()
+                .iter()
+                .enumerate()
+                .map(|(i, n)| covs.iter().map(|c| mapper.normalize(i, c[n])).collect())
+                .collect()
+        };
+        let g_normed = CurvatureGrid::build(&values(&normed, &pop_raw), NN_SMOOTH_GRID_STEP_Z);
+        let g_plain = CurvatureGrid::build(&values(&plain, &pop_z), NN_SMOOTH_GRID_STEP_Z);
+        assert!(!g_normed.is_empty());
+        assert_eq!(g_normed.axes().len(), g_plain.axes().len());
+        for (a, b) in g_normed.axes().iter().zip(g_plain.axes()) {
+            assert_eq!(a.len(), b.len());
+            for (x, y) in a.iter().zip(b) {
+                for (p, q) in x.iter().zip(y) {
+                    assert_relative_eq!(p, q, epsilon = 1e-12);
+                }
+            }
+            // The nodes are in z-space: nothing should look like a raw kilogram.
+            for x in a {
+                assert!(
+                    x[0].abs() < 5.0 && x[1].abs() < 5.0,
+                    "raw-looking node {x:?}"
+                );
+            }
+        }
+        // Same weights, same inputs, same function → same penalty, and a
+        // non-trivial one: the un-saturated tanh has curvature here. Weights
+        // of order 1 so that z ∈ [−2, 2] lands in tanh's curved band (the tiny
+        // `det_weights` keep the net nearly affine, which is the *other* way to
+        // read zero curvature).
+        let w: Vec<f64> = det_weights(normed.mlp().n_weights())
+            .into_iter()
+            .map(|v| 5.0 * v)
+            .collect();
+        let p_normed = normed.mlp().curvature_penalty_value(&w, &g_normed, 1.0);
+        let p_plain = plain.mlp().curvature_penalty_value(&w, &g_plain, 1.0);
+        assert_relative_eq!(p_normed, p_plain, max_relative = 1e-12);
+        assert!(
+            p_normed > 1e-6,
+            "penalty must be live in the responsive band: {p_normed}"
+        );
+        // …whereas the old raw-space grid, fed to the same network, sits in the
+        // saturated tail: orders of magnitude smaller. This is the failure the
+        // fix removes.
+        let raw_vals: Vec<Vec<f64>> = (0..2)
+            .map(|i| {
+                raw.iter()
+                    .map(|&(w, c)| if i == 0 { w } else { c })
+                    .collect()
+            })
+            .collect();
+        let g_raw = CurvatureGrid::build(&raw_vals, NN_SMOOTH_GRID_STEP_Z);
+        let p_raw = normed.mlp().curvature_penalty_value(&w, &g_raw, 1.0);
+        assert!(
+            p_raw < 1e-3 * p_normed,
+            "raw-space grid must be (nearly) blind: raw {p_raw} vs normalised {p_normed}"
+        );
+    }
+
+    /// One-pass kernel: value with a gradient sink must equal the value-only
+    /// call, and the Gauss–Newton Hessian sink must match central FD of the
+    /// gradient on the affine-in-weights (last-layer) coordinates exactly and
+    /// the full block to GN tolerance.
+    #[test]
+    fn curvature_penalty_hessian_matches_fd_of_gradient() {
+        let mlp = MlpMapper::new(vec![2, 3, 2], Activation::Tanh, Activation::Identity).unwrap();
+        let w = det_weights(mlp.n_weights());
+        let vals = vec![
+            vec![-1.5, -0.8, -0.2, 0.3, 0.9, 1.6],
+            vec![-1.2, -0.5, 0.0, 0.4, 1.1, 1.7],
+        ];
+        let grid = CurvatureGrid::build(&vals, NN_SMOOTH_GRID_STEP_Z);
+        assert!(!grid.is_empty());
+        let lambda = 0.7;
+        let n = mlp.n_weights();
+
+        let mut grad = vec![0.0; n];
+        let mut hess = vec![vec![0.0; n]; n];
+        let v = {
+            let mut add = |i: usize, j: usize, x: f64| hess[i][j] += x;
+            let mut sink = PenaltySink {
+                grad: Some(&mut grad),
+                hess: Some(&mut add),
+            };
+            mlp.curvature_penalty_accum(&w, &grid, lambda, &mut sink)
+        };
+        assert_relative_eq!(
+            v,
+            mlp.curvature_penalty_value(&w, &grid, lambda),
+            max_relative = 1e-12
+        );
+        let (_v2, g2) = mlp.curvature_penalty(&w, &grid, lambda);
+        for (a, b) in grad.iter().zip(&g2) {
+            assert_relative_eq!(a, b, max_relative = 1e-12);
+        }
+        // Symmetric PSD by construction.
+        for i in 0..n {
+            for j in 0..n {
+                assert_relative_eq!(hess[i][j], hess[j][i], epsilon = 1e-12);
+            }
+            assert!(hess[i][i] >= 0.0);
+        }
+        // Against FD of the gradient. On the output layer (identity head, so
+        // the output is affine in its weights) `∂²C/∂w²` vanishes and GN is
+        // exact; elsewhere GN drops `C·∂²C/∂w²`, so compare to a loose bound.
+        let eps = 1e-5;
+        let out_start = mlp.offsets[mlp.layers.len() - 2];
+        let mut p = w.clone();
+        for k in 0..n {
+            let saved = p[k];
+            p[k] = saved + eps;
+            let (_, gp) = mlp.curvature_penalty(&p, &grid, lambda);
+            p[k] = saved - eps;
+            let (_, gm) = mlp.curvature_penalty(&p, &grid, lambda);
+            p[k] = saved;
+            for j in 0..n {
+                let fd = (gp[j] - gm[j]) / (2.0 * eps);
+                if k >= out_start && j >= out_start {
+                    assert_relative_eq!(hess[k][j], fd, epsilon = 1e-6, max_relative = 1e-5);
+                } else {
+                    let scale = fd.abs().max(hess[k][j].abs()).max(1e-3);
+                    assert!(
+                        (hess[k][j] - fd).abs() / scale < 0.5,
+                        "({k},{j}): GN {} vs FD {}",
+                        hess[k][j],
+                        fd
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Fit-driven tests for the covariate-NN regularizers.
@@ -2137,54 +2560,12 @@ mod regularizer_fit_tests {
     use super::{CovariateMapper, NnRegularizer};
 
     /// Two-cpt oral DCM with a small MLP mapping (WT, CRCL) → the five PK params.
-    ///
-    /// Kept in step with the copy in `tests/nn_regularization.rs`; the two cannot
-    /// share a fixture because an integration test cannot see `#[cfg(test)]` items.
-    ///
-    /// `center` / `scale` are load-bearing, not cosmetic. `WT` runs 45–90 and
-    /// `CRCL` 46–82 on this dataset, so on raw inputs the Glorot-initialised first
-    /// layer produces pre-activations spanning ±170 — `tanh` is clipped at ±1 for
-    /// every subject and the network is constant *by saturation* before the fit
-    /// starts, making the λ = 0 baseline in
-    /// [`l2_shrinks_weights_and_modulator_variation`] flat for the wrong reason.
-    /// z-scoring puts layer 1 in tanh's responsive band, and matches the space the
-    /// `nn_smooth` curvature grid already works in.
-    const MODEL: &str = r#"
-[parameters]
-  omega ETA_CL ~ 0.15
-  omega ETA_V1 ~ 0.15
-  omega ETA_Q  ~ 0.08
-  omega ETA_V2 ~ 0.08
-  omega ETA_KA ~ 0.20
-  sigma PROP_ERR ~ 0.04 (sd)
-
-[covariate_nn TYPICAL_PK]
-  inputs     = [WT, CRCL]
-  outputs    = [CL, V1, Q, V2, KA]
-  layers     = [4]
-  activation = tanh
-  output     = softplus
-  center     = [70, 86]
-  scale      = [12, 23]
-
-[individual_parameters]
-  CL = TYPICAL_PK.CL * exp(ETA_CL)
-  V1 = TYPICAL_PK.V1 * exp(ETA_V1)
-  Q  = TYPICAL_PK.Q  * exp(ETA_Q)
-  V2 = TYPICAL_PK.V2 * exp(ETA_V2)
-  KA = TYPICAL_PK.KA * exp(ETA_KA)
-
-[structural_model]
-  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
-
-[error_model]
-  DV ~ proportional(PROP_ERR)
-
-[fit_options]
-  method = focei
-  maxiter = 50
-  covariance = false
-"#;
+    /// One file shared with `tests/nn_regularization.rs` and the trust-region
+    /// end-to-end check (`include_str!` is visible from both `tests/` and
+    /// `#[cfg(test)]` code), so the fixtures cannot drift. The notes in it on why
+    /// `center` / `scale` are load-bearing apply to the λ = 0 baseline of
+    /// [`l2_shrinks_weights_and_modulator_variation`] in particular.
+    const MODEL: &str = include_str!("../../tests/fixtures/two_cpt_dcm_regularized.ferx");
 
     fn load() -> (CompiledModel, FitOptions, Population) {
         let parsed = parse_full_model(MODEL).expect("model parses with --features nn");
@@ -2295,6 +2676,67 @@ mod regularizer_fit_tests {
         }
     }
 
+    /// The single-pass `penalty_and_gradient` the optimizers call must equal
+    /// `penalty_value` + `add_packed_gradient` exactly, and the packed Hessian
+    /// adder must touch NN-weight coordinates only (with the exact `2λ` L2
+    /// diagonal on weight entries).
+    #[test]
+    fn single_pass_and_hessian_agree_with_the_separate_calls() {
+        let (model, mut options, population) = load();
+        options.nn_l2_lambda = 2e-2;
+        options.nn_smooth_lambda = 3e-1;
+        let reg = NnRegularizer::build(&model, &population, &options);
+        let theta = model.default_params.theta.clone();
+        let n = theta.len();
+
+        let mut g_sep = vec![0.0; n];
+        reg.add_packed_gradient(&theta, &mut g_sep);
+        let v_sep = reg.penalty_value(&theta);
+        let mut g_one = vec![0.0; n];
+        let v_one = reg.penalty_and_gradient(&theta, &mut g_one);
+        assert_relative_eq!(v_one, v_sep, max_relative = 1e-12);
+        for (a, b) in g_one.iter().zip(&g_sep) {
+            assert_relative_eq!(a, b, max_relative = 1e-12);
+        }
+
+        let nn = &model.covariate_nns[0];
+        let (w_lo, w_hi) = (nn.weights_offset, nn.weights_offset + nn.mapper.n_weights());
+        let mut h = vec![vec![0.0; n]; n];
+        reg.add_packed_hessian(&theta, &mut |i, j, v| h[i][j] += v);
+        for i in 0..n {
+            for j in 0..n {
+                let in_block = (w_lo..w_hi).contains(&i) && (w_lo..w_hi).contains(&j);
+                if !in_block {
+                    assert_eq!(h[i][j], 0.0, "penalty Hessian leaked to ({i}, {j})");
+                }
+                assert_relative_eq!(h[i][j], h[j][i], epsilon = 1e-12);
+            }
+        }
+        // L2 alone: exact diagonal on weight entries, zero on biases.
+        let mut l2 = options.clone();
+        l2.nn_smooth_lambda = 0.0;
+        let reg_l2 = NnRegularizer::build(&model, &population, &l2);
+        let mut h = vec![vec![0.0; n]; n];
+        reg_l2.add_packed_hessian(&theta, &mut |i, j, v| h[i][j] += v);
+        let weight_idx: std::collections::HashSet<usize> = nn
+            .mapper
+            .mlp()
+            .weight_param_indices()
+            .into_iter()
+            .map(|i| w_lo + i)
+            .collect();
+        for i in 0..n {
+            for j in 0..n {
+                let expect = if i == j && weight_idx.contains(&i) {
+                    2.0 * 2e-2
+                } else {
+                    0.0
+                };
+                assert_relative_eq!(h[i][j], expect, epsilon = 1e-15);
+            }
+        }
+    }
+
     /// Growing the L2 strength shrinks the NN weights, flattening the learned
     /// covariate→modulator curve so the across-subject modulator variance
     /// collapses toward 0.
@@ -2322,9 +2764,12 @@ mod regularizer_fit_tests {
     /// Compiling it out instead makes it a measurement gap rather than a miss,
     /// the same way the rest of the feature-gated surface behaves (#293).
     ///
-    /// Bit-rot is still caught: `cargo check --tests --no-default-features
-    /// --features ci,nn,slow-tests` is in the preflight check matrix and the
-    /// CI `Check` job, so this body is compile-checked on every PR.
+    /// Bit-rot is caught on every PR by `cargo check --tests --no-default-features
+    /// --features ci,nn,slow-tests` (preflight check matrix and the CI `Check`
+    /// job), and the body actually *runs* nightly: `slow-tests.yml` passes
+    /// `ferx-core/nn` alongside `ferx-core/slow-tests` for exactly this
+    /// `nn` + `slow-tests` family (it once passed no `nn`, which left every DCM
+    /// Tier-3 fit — this one included — running in no CI job at all).
     #[test]
     #[cfg(feature = "slow-tests")]
     fn l2_shrinks_weights_and_modulator_variation() {

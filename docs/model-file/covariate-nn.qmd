@@ -304,6 +304,7 @@ Two consequences worth knowing:
   do *not* feed the network are unaffected.
 
 `method = focei` uses a different gradient path and is unchanged.
+
 ## Regularization (`nn_l2`, `nn_smooth`)
 
 Because an unregularized DCM can invent spurious covariate-driven
@@ -318,18 +319,49 @@ available. Both default to `0.0` (off, a strict no-op) and are set from
 - **`nn_smooth`** — smoothness/curvature penalty, `nn_smooth · Σ C²`,
   where `C = f(x+h) − 2·f(x) + f(x−h)` is the finite-difference 2nd
   derivative of each output along an input's marginal
-  partial-dependence curve (z-scored input space, other inputs at their
-  median). It penalizes *curvature*, so monotone slopes are free and
-  only the wiggles are punished.
+  partial-dependence curve. It penalizes *curvature*, so monotone slopes
+  are free and only the wiggles are punished.
+
+The curvature grid is built **in the network's own input space** — the
+`(x − center) / scale` values the MLP actually receives (see
+[Normalize your inputs](#normalize-your-inputs)) — sweeping each input
+across its observed range in steps of a quarter of its sd while the
+other inputs sit at their median. A grid on raw covariates would probe
+the network where the fit never evaluates it (with `center`/`scale`
+declared, raw `WT ∈ [45, 90]` saturates every `tanh` unit and the
+penalty would silently read ≈ 0). Wide-range inputs get a coarser step
+over the full range rather than a truncated sweep; a time-varying NN
+input is swept over its *baseline* (first-record) range; subjects with
+no finite value for an input are left out of that axis.
 
 Both add to the objective the optimizer minimizes and carry matching
 analytic gradients (no autodiff — the smoothness term reuses the MLP's
-analytic Jacobian). They apply across the FOCE/FOCEI outer optimizers.
+analytic Jacobian) and, where the optimizer uses one, the penalty's
+curvature in the Hessian. They apply across the **FOCE-family** methods
+— `foce`, `focei`, `laplace` (every outer optimizer: NLopt, built-in
+BFGS, trust-region) and `gn` / `gn_hybrid`. SAEM, IMP/IMPMAP, Bayes and
+VI do not apply them; setting either key with one of those as the final
+stage produces a warning and an unregularized fit.
 
 The **reported** `fit$ofv` (and hence AIC/BIC) is the **unpenalized**
 −2·log-likelihood, so a regularized DCM stays directly comparable to an
 analytic-covariate model on information criteria; the penalty only
-shapes the optimization.
+shapes the optimization. The optimizer trace, checkpoint and verbose
+`Eval`/`Iter` lines carry that same unpenalized value, so they agree
+with the reported OFV. Two consequences to keep in mind:
+
+- `final_gradient` is the gradient of the *penalized* objective — that is
+  what a regularized fit converges on; the gradient of the reported OFV
+  is not ≈ 0 at the optimum by design.
+- Multi-start (`n_starts`) and the `gn_hybrid` phase selection rank
+  candidates on the penalized objective, so a heavier λ cannot be
+  out-voted by a start that merely fits the data better.
+- **Standard errors** come from the curvature of the *unpenalized*
+  objective at the regularized optimum, which is not a stationary point
+  of that objective. Under a strong λ the NN-weight directions are flat
+  in the unpenalized OFV, so their SEs are large and the covariance step
+  may fall back to SIR — read NN-weight SEs as "how much the data alone
+  constrain this weight", not as posterior uncertainty under the penalty.
 
 ```
 [fit_options]

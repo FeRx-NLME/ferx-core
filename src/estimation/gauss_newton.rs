@@ -81,6 +81,12 @@ pub fn run_foce_gn(
 
     let mut warnings = Vec::new();
 
+    // Covariate-NN (DCM) regularizer. No-op when both λ are 0. GN minimises the
+    // penalized objective (`ofv`), with ∇P in the gradient and the penalty's
+    // curvature in the BHHH system; `ofv_clean` — the −2LL at the same point —
+    // is what the trace, checkpoint, verbose lines and the reported OFV carry.
+    let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, options);
+
     // BHHH Information-matrix approximation degrades as the censoring fraction
     // grows — each censored row contributes less Fisher information than its
     // Gaussian counterpart, biasing the outer-product Hessian small-sample.
@@ -121,7 +127,7 @@ pub fn run_foce_gn(
         options.inner_restarts,
     );
 
-    let mut ofv = 2.0
+    let mut ofv_clean = 2.0
         * pop_nll(
             model,
             population,
@@ -131,9 +137,10 @@ pub fn run_foce_gn(
             &kappas,
             options.interaction,
         );
+    let mut ofv = ofv_clean + nn_reg.penalty_value(&params.theta);
 
     if verbose {
-        eprintln!("  GN iter {:>3}: OFV = {:.6}", 0, ofv);
+        eprintln!("  GN iter {:>3}: OFV = {:.6}", 0, ofv_clean);
     }
 
     let mut converged = false;
@@ -160,6 +167,15 @@ pub fn run_foce_gn(
             &bounds,
             options,
         );
+        // Covariate-NN penalty: ∇P into the gradient, its curvature (exact 2λ
+        // on the L2 weight diagonal, Gauss–Newton `2λ·Σ ∂C/∂w ∂C/∂wᵀ` for the
+        // smoothness term) into the BHHH system, so the quadratic model
+        // predicts the penalized objective it is stepping on.
+        if nn_reg.is_active() {
+            let theta_x = unpack_params(&x, init_params).theta;
+            nn_reg.add_packed_gradient(&theta_x, grad.as_mut_slice());
+            nn_reg.add_packed_hessian(&theta_x, &mut |i, j, v| h_bhhh[(i, j)] += v);
+        }
 
         // Zero gradient rows / BHHH rows & cols for FIX parameters, and set
         // their diagonal to 1. The clamp at step-application keeps x[i] at its
@@ -264,7 +280,7 @@ pub fn run_foce_gn(
             options.min_obs_for_convergence_check as usize,
             options.inner_restarts,
         );
-        let ofv_try = 2.0
+        let ofv_try_clean = 2.0
             * pop_nll(
                 model,
                 population,
@@ -274,6 +290,7 @@ pub fn run_foce_gn(
                 &kap_try,
                 options.interaction,
             );
+        let ofv_try = ofv_try_clean + nn_reg.penalty_value(&params_try.theta);
 
         // TR ratio: actual OFV decrease vs quadratic model decrease.
         // rho < 0 or non-finite OFV → reject.
@@ -302,7 +319,7 @@ pub fn run_foce_gn(
                     iter,
                     gn_method,
                     gn_phase,
-                    ofv,
+                    ofv_clean,
                     Some(grad_norm_trace),
                     radius_before,
                     0.0,
@@ -335,8 +352,9 @@ pub fn run_foce_gn(
         let rel_change = ofv_change / ofv.abs().max(1.0);
 
         x = x_try;
-        let prev_ofv = ofv;
+        let prev_ofv_clean = ofv_clean;
         ofv = ofv_try;
+        ofv_clean = ofv_try_clean;
         eta_hats = eta_try;
         h_matrices = h_try;
         kappas = kap_try;
@@ -354,10 +372,10 @@ pub fn run_foce_gn(
                 iter,
                 gn_method,
                 gn_phase,
-                ofv,
+                ofv_clean,
                 Some(grad_norm_trace),
                 trust_radius,
-                ofv - prev_ofv,
+                ofv_clean - prev_ofv_clean,
                 true,
                 None,
                 None,
@@ -369,13 +387,13 @@ pub fn run_foce_gn(
         // Checkpoint (#755): persist the accepted point periodically. `x` is
         // already the packed vector, so this is alloc-free until a write is due.
         if crate::io::checkpoint::is_due() {
-            crate::io::checkpoint::maybe_write(iter, ofv, &x);
+            crate::io::checkpoint::maybe_write(iter, ofv_clean, &x);
         }
 
         if verbose {
             eprintln!(
                 "  GN iter {:>3}: OFV = {:.6}  (delta={:.2e}, radius={:.4})",
-                iter, ofv, ofv_change, trust_radius
+                iter, ofv_clean, ofv_change, trust_radius
             );
         }
 
@@ -420,17 +438,25 @@ pub fn run_foce_gn(
         &bounds,
         options,
     );
-    let mut final_gradient: Option<Vec<f64>> = Some(grad_final.as_slice().to_vec());
+    let gn_params = unpack_params(&x, init_params);
+    // `final_gradient` is the gradient of the objective GN minimised, i.e.
+    // penalized under covariate-NN regularization (see `FitResult::final_gradient`).
+    let mut grad_final = grad_final.as_slice().to_vec();
+    nn_reg.add_packed_gradient(&gn_params.theta, &mut grad_final);
+    let mut final_gradient: Option<Vec<f64>> = Some(grad_final);
 
+    // Penalized: this is what the FOCEI polish below is ranked against.
     let gn_ofv = ofv;
+    let gn_ofv_clean = ofv_clean;
     let do_polish = matches!(options.method, EstimationMethod::FoceGnHybrid);
 
     // ---- Optional hybrid: polish with FOCEI from GN result ----
     if do_polish && verbose {
-        eprintln!("GN phase done (OFV={:.4}). Polishing with FOCEI...", ofv);
+        eprintln!(
+            "GN phase done (OFV={:.4}). Polishing with FOCEI...",
+            gn_ofv_clean
+        );
     }
-
-    let gn_params = unpack_params(&x, init_params);
 
     if !do_polish {
         // Pure GN — skip FOCEI polish, go directly to covariance step
@@ -454,12 +480,12 @@ pub fn run_foce_gn(
         warnings.extend(cov_warnings);
 
         if verbose {
-            eprintln!("FOCE-GN completed. Final OFV = {:.4}", ofv);
+            eprintln!("FOCE-GN completed. Final OFV = {:.4}", gn_ofv_clean);
         }
 
         return OuterResult {
             params: gn_params,
-            ofv,
+            ofv: gn_ofv_clean,
             converged,
             n_iterations: maxiter,
             eta_hats,
@@ -514,11 +540,17 @@ pub fn run_foce_gn(
     let final_h_mats;
     let final_kappas;
 
-    if polish_result.ofv < gn_ofv {
+    // Rank the two phases on the objective both of them minimised. The polish
+    // reports the clean −2LL, so under covariate-NN regularization its penalty
+    // is added back before the compare — comparing clean against clean would
+    // throw the regularized polish away whenever the penalty bit (a penalized
+    // optimum's clean OFV is ≥ the unregularized GN optimum's by construction).
+    let polish_penalized = polish_result.ofv + nn_reg.penalty_value(&polish_result.params.theta);
+    if polish_penalized < gn_ofv {
         if verbose {
             eprintln!(
                 "  FOCEI polish improved OFV: {:.4} -> {:.4}",
-                gn_ofv, polish_result.ofv
+                gn_ofv_clean, polish_result.ofv
             );
         }
         final_ofv = polish_result.ofv;
@@ -532,7 +564,7 @@ pub fn run_foce_gn(
         if verbose {
             eprintln!("  FOCEI polish did not improve (GN result kept)");
         }
-        final_ofv = gn_ofv;
+        final_ofv = gn_ofv_clean;
         final_params = gn_params;
         final_etas = eta_hats;
         final_h_mats = h_matrices;

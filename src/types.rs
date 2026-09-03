@@ -5729,11 +5729,16 @@ pub struct FitResult {
     /// `(min_time, max_time)` across all observation records. `None` only when
     /// there are no observations at all.
     pub obs_time_range: Option<(f64, f64)>,
-    /// Gradient of the objective function at the best-OFV parameter point,
-    /// in the packed parameter space (log-theta, Cholesky-omega, log-sigma).
-    /// `Some` only for NLopt gradient-based runs (SLSQP, L-BFGS, MMA) when at
-    /// least one gradient-requesting iteration improved the OFV; `None` for
-    /// BOBYQA (derivative-free), built-in BFGS, GN, and SAEM.
+    /// Gradient of the objective **the optimizer minimised** at the best-OFV
+    /// parameter point, in the packed parameter space (log-theta,
+    /// Cholesky-omega, log-sigma). That is the OFV itself for an ordinary fit;
+    /// under covariate-NN regularization (`nn_l2` / `nn_smooth` > 0) it is
+    /// `∇(OFV + penalty)`, since the stationarity of the *penalized* objective
+    /// is what a regularized fit converges on — the gradient of the reported
+    /// (unpenalized) `ofv` is not ≈ 0 at that point by design. `Some` only for
+    /// NLopt gradient-based runs (SLSQP, L-BFGS, MMA) when at least one
+    /// gradient-requesting iteration improved the OFV, and for trust-region and
+    /// GN; `None` for BOBYQA (derivative-free), built-in BFGS, and SAEM.
     pub final_gradient: Option<Vec<f64>>,
     // ── Run settings (for runlog / reproducibility) ──────────────────────────
     /// Outer optimizer used for this fit, as a lowercase label ("bobyqa",
@@ -7664,6 +7669,8 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "global_maxeval",
             "stagnation_guard",
             "reconverge_gradient_interval",
+            "nn_l2",
+            "nn_smooth",
         ],
         // FOCEI accepts `n_agq`: `= 1` (default) is plain FOCEI, `> 1` is the Gauss-Newton-
         // anchored quadrature refinement.
@@ -7682,6 +7689,8 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "global_maxeval",
             "stagnation_guard",
             "reconverge_gradient_interval",
+            "nn_l2",
+            "nn_smooth",
         ],
         // Laplace is the exact-anchor quadrature; `n_agq` (default 1) is its node count.
         // `n_agq = 1` is Laplace, `> 1` is adaptive Gauss–Hermite quadrature.
@@ -7701,6 +7710,8 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "global_maxeval",
             "stagnation_guard",
             "reconverge_gradient_interval",
+            "nn_l2",
+            "nn_smooth",
         ],
         EstimationMethod::FoceGn => &[
             "maxiter",
@@ -7709,6 +7720,8 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_restarts",
             "inner_optimizer",
             "gn_lambda",
+            "nn_l2",
+            "nn_smooth",
         ],
         EstimationMethod::FoceGnHybrid => &[
             "maxiter",
@@ -7725,6 +7738,8 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "stagnation_guard",
             "gn_lambda",
             "reconverge_gradient_interval",
+            "nn_l2",
+            "nn_smooth",
         ],
         EstimationMethod::Saem => &[
             "inner_maxiter",

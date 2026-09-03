@@ -10,64 +10,28 @@
 //! `pub(crate)` internals (`NnRegularizer`, `CurvatureGrid`,
 //! `MlpMapper::weight_param_indices`) that the workspace boundary rule keeps out
 //! of the public API:
-//!   - `nn::regularization_tests` — per-kernel L2 / curvature values and their
-//!     analytic-vs-FD gradient parity.
+//!   - `nn::regularization_tests` — per-kernel L2 / curvature values, their
+//!     analytic-vs-FD gradient and Hessian parity, and the grid living in the
+//!     network's normalised input space.
 //!   - `nn::regularizer_fit_tests` — the whole-`NnRegularizer` λ = 0 no-op, its
 //!     FD gradient parity, and the fitted weight-norm / modulator-variance
 //!     shrinkage (Tier 3, `slow-tests`).
+//!   - `estimation::trust_region` — the assembled packed gradient (likelihood +
+//!     penalty) against central FD of the penalized cost at λ > 0.
 //!
 //! Run via:
-//!   cargo test --features nn --test nn_regularization                 # fast
-//!   cargo test --features nn,slow-tests --test nn_regularization      # + slow
+//!   cargo test --features nn --test nn_regularization
 
 #![cfg(feature = "nn")]
 
 use ferx_core::parser::model_parser::parse_full_model;
-use ferx_core::types::{CompiledModel, FitOptions, Population};
+use ferx_core::types::{CompiledModel, EstimationMethod, FitOptions, Population};
 use ferx_core::{fit, read_nonmem_csv};
 
-/// Two-cpt oral DCM with a small MLP mapping (WT, CRCL) → the five PK params.
-///
-/// Kept in step with the copy in `src/nn/mod.rs`'s `regularizer_fit_tests`; the
-/// two cannot share a fixture because an integration test cannot see
-/// `#[cfg(test)]` items. `center` / `scale` z-score the inputs — see the note on
-/// that copy for why raw covariates saturate this network.
-const MODEL: &str = r#"
-[parameters]
-  omega ETA_CL ~ 0.15
-  omega ETA_V1 ~ 0.15
-  omega ETA_Q  ~ 0.08
-  omega ETA_V2 ~ 0.08
-  omega ETA_KA ~ 0.20
-  sigma PROP_ERR ~ 0.04 (sd)
-
-[covariate_nn TYPICAL_PK]
-  inputs     = [WT, CRCL]
-  outputs    = [CL, V1, Q, V2, KA]
-  layers     = [4]
-  activation = tanh
-  output     = softplus
-  center     = [70, 86]
-  scale      = [12, 23]
-
-[individual_parameters]
-  CL = TYPICAL_PK.CL * exp(ETA_CL)
-  V1 = TYPICAL_PK.V1 * exp(ETA_V1)
-  Q  = TYPICAL_PK.Q  * exp(ETA_Q)
-  V2 = TYPICAL_PK.V2 * exp(ETA_V2)
-  KA = TYPICAL_PK.KA * exp(ETA_KA)
-
-[structural_model]
-  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
-
-[error_model]
-  DV ~ proportional(PROP_ERR)
-
-[fit_options]
-  method = focei
-  maxiter = 50
-  covariance = false
-"#;
+/// Two-cpt oral DCM with a small MLP mapping (WT, CRCL) → the five PK params;
+/// one file shared with the `src/` tests so the fixtures cannot drift (see the
+/// notes in it on why `center` / `scale` are load-bearing).
+const MODEL: &str = include_str!("fixtures/two_cpt_dcm_regularized.ferx");
 
 fn load() -> (CompiledModel, FitOptions, Population) {
     let parsed = parse_full_model(MODEL).expect("model parses with --features nn");
@@ -80,9 +44,22 @@ fn load() -> (CompiledModel, FitOptions, Population) {
     (parsed.model, parsed.fit_options, population)
 }
 
+/// A regularization-related warning a regularized FOCE-family fit must *not*
+/// carry: the spurious "not used by method" one (the keys were once in no
+/// `method_specific_keys` list) and the "not applied" one (reserved for non-FOCE
+/// final stages).
+fn regularization_warnings(result: &ferx_core::types::FitResult) -> Vec<&String> {
+    result
+        .warnings
+        .iter()
+        .filter(|w| w.contains("nn_l2") || w.contains("nn_smooth"))
+        .collect()
+}
+
 /// A couple of outer iterations with both penalties on — proves the optimizer
 /// wiring (penalized objective value + matching analytic gradient) runs end to
-/// end from a public-API caller without panicking and returns a finite OFV.
+/// end from a public-API caller without panicking, returns a finite OFV, and
+/// raises none of the regularization warnings.
 #[test]
 fn fit_with_regularization_runs() {
     let (model, mut options, population) = load();
@@ -96,33 +73,62 @@ fn fit_with_regularization_runs() {
         "regularized fit OFV must be finite, got {}",
         result.ofv
     );
+    assert!(
+        regularization_warnings(&result).is_empty(),
+        "a regularized FOCEI fit must not warn about nn_l2/nn_smooth: {:?}",
+        result.warnings
+    );
 }
 
-/// λ = 0 must reproduce the unregularized fit byte-for-byte (the no-op
-/// guarantee). Runs two short fits and asserts identical OFV and theta.
+/// Same wiring under Gauss–Newton, which has its own objective / gradient /
+/// BHHH assembly: the penalty must reach it (regression — `method = gn` once
+/// ignored both keys silently).
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
-fn zero_lambda_fit_matches_baseline() {
-    let (model, options, population) = load();
-
-    let mut baseline = options.clone();
-    baseline.outer_maxiter = 8;
-    let base_fit =
-        fit(&model, &population, &model.default_params, &baseline).expect("baseline fit");
-
-    let mut zero_reg = baseline.clone();
-    zero_reg.nn_l2_lambda = 0.0;
-    zero_reg.nn_smooth_lambda = 0.0;
-    let zr_fit = fit(&model, &population, &model.default_params, &zero_reg).expect("λ=0 fit");
-
-    assert_eq!(
-        base_fit.ofv, zr_fit.ofv,
-        "λ = 0 must be byte-identical to the unregularized baseline"
+fn fit_with_regularization_runs_under_gn() {
+    let (model, mut options, population) = load();
+    options.method = EstimationMethod::FoceGn;
+    options.outer_maxiter = 2;
+    options.nn_l2_lambda = 5e-2;
+    options.nn_smooth_lambda = 5e-2;
+    let result = fit(&model, &population, &model.default_params, &options)
+        .expect("regularized GN fit returns Ok");
+    assert!(
+        result.ofv.is_finite(),
+        "GN OFV must be finite, got {}",
+        result.ofv
     );
-    for (a, b) in base_fit.theta.iter().zip(zr_fit.theta.iter()) {
-        assert_eq!(a, b, "λ = 0 theta must be byte-identical to baseline");
-    }
+    assert!(
+        regularization_warnings(&result).is_empty(),
+        "a regularized GN fit must not warn about nn_l2/nn_smooth: {:?}",
+        result.warnings
+    );
+}
+
+/// The penalties are applied by the FOCE-family methods only. Asking for them
+/// with SAEM as the final stage — which ferx-r can do programmatically, never
+/// touching the parser's key check — must say so up front instead of silently
+/// returning an unregularized fit.
+#[test]
+fn non_foce_final_stage_warns_that_regularization_is_not_applied() {
+    let (model, mut options, population) = load();
+    options.method = EstimationMethod::Saem;
+    options.saem_n_exploration = 2;
+    options.saem_n_convergence = 1;
+    options.nn_l2_lambda = 5e-2;
+    // Any outcome is fine — the warning is assembled before the fit starts —
+    // but a short SAEM run also has to succeed for the warning to be read back.
+    let result = fit(&model, &population, &model.default_params, &options)
+        .expect("short SAEM fit returns Ok");
+    let hits: Vec<&String> = result
+        .warnings
+        .iter()
+        .filter(|w| w.contains("does not apply covariate-NN regularization"))
+        .collect();
+    assert_eq!(
+        hits.len(),
+        1,
+        "expected exactly one 'not applied' warning, got {:?}",
+        result.warnings
+    );
+    assert!(hits[0].contains("nn_l2 is set"), "{}", hits[0]);
 }
