@@ -19,7 +19,7 @@
 mod common;
 
 use ferx_core::parser::model_parser::parse_full_model;
-use ferx_core::{check_model_data, predict, DoseEvent, Population};
+use ferx_core::{check_model_data, predict, DoseEvent, Population, WarningCode};
 
 // ── Per-route-lag models under test ──────────────────────────────────────────
 
@@ -591,12 +591,22 @@ fn per_route_lag_fit_runs_end_to_end() {
 /// The models in this file declare `omega ETA_CL ~ 0.0 FIX`, and the `FIX` is what makes
 /// this test's `converged` assertion meaningful (#1227). Fitting **one** subject leaves ω²
 /// with no between-subject information to estimate from, so a *free* zero-variance omega is
-/// unidentifiable by construction: nothing bounds it above and it walks to `compute_bounds`'
-/// `+6` Cholesky-diagonal ceiling (ω² ≈ 162 755). Since #1205 that rail is a `runaway`
-/// verdict and demotes `converged`, so the assertion below failed on every nightly run —
-/// on a fit whose TVLAG was nonetheless recovered to eight decimals. Declaring the omega
-/// FIX'd matches what the model already says (zero IIV) and removes the coordinate from the
-/// packed vector, rather than teaching the assertion to accept a runaway.
+/// unidentifiable by construction and walks to `compute_bounds`' `+6` Cholesky-diagonal
+/// ceiling (ω² ≈ 162 755). Since #1205 that rail carries a `runaway` verdict and demotes
+/// `converged`, so the assertion below failed on every nightly run — on a fit whose TVLAG
+/// was nonetheless recovered to eight decimals.
+///
+/// Worth knowing before reading that as "it starts at ln(0)": it does not. The parser floors
+/// a declared `~ 0.0` to a Cholesky diagonal of `1e-4` — measured, and *identical* with and
+/// without `FIX` — so the free coordinate's packed start is `ln(1e-4) = -9.21`, which is
+/// below its own `-6` lower rail (`parameterization.rs`, `compute_bounds`). It begins clamped
+/// outside its admissible interval and ends at the opposite one. `FIX` changes nothing but
+/// `omega_fixed`, which is why it is inert for the predict-only twins here (verified
+/// bit-identical, 0 ulp over the sampled curve) and decisive for the two fits: the coordinate
+/// leaves the packed vector instead of being optimized from a start it cannot reach.
+///
+/// So the fix declares what the model already says — zero IIV — rather than teaching the
+/// assertion to accept a runaway.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
@@ -629,6 +639,15 @@ fn per_route_lag_fit_recovers_lag() {
         warnings: vec![],
         subjects: vec![common::subject("1", vec![dose], obs_times, obs, vec![1; n])],
     };
+    // Only KA and LAG start off truth; TVCL and TVV start at their data-generating values,
+    // deliberately. Perturbing them was tried (CL 5.0 -> 3.0, V 50.0 -> 70.0) and the fit does
+    // not come back: it returns `converged: true` with no guard hit and TVV at 43.55, 12.9%
+    // off. One subject of noise-free data identifies the absorption pair strongly and the
+    // disposition pair only weakly — the fit's own output says so, reporting
+    // `TVV ~ TVKA = -1.00`. So the two assertions on TVCL / TVV below are *drift* guards, not
+    // identifiability claims: they say a sound fit must not drag them away from a start that
+    // is already correct. That is exactly the regression they exist for — the runaway-omega
+    // fit moved them 48% and 13% off from these same starting values.
     let mut init = model.default_params.clone();
     init.theta[2] = 0.7; // KA off truth (1.0)
     init.theta[3] = 3.0; // LAG off truth (2.0)
@@ -639,12 +658,29 @@ fn per_route_lag_fit_recovers_lag() {
         "recovered per-route lag {} should be near 2.0",
         fitted.theta[3]
     );
-    // Pin the disposition too, not just the lag (#1227). While ω ran to the +6 rail it
-    // absorbed the structural signal and these came back TVCL −48%, TVKA −29%, TVV −13%
-    // on the same noise-free data — a fit this test called a success because it only ever
-    // looked at theta[3]. With the omega FIX'd the worst of the three is TVKA at 1.5%
-    // (TVCL 0.09%, TVV 0.59%), so 5% sits ~3x above what the sound fit produces and ~1/9
-    // of the smallest error the degenerate one produced. Both numbers are measured.
+    // Assert the *cause*, not only its downstream boolean. `converged` alone cannot tell
+    // "omega is identifiable" apart from "the #1205 demotion rule stopped firing" — a change
+    // to `RunawayGuardHit::is_runaway` would flip the boolean back to true with ETA_CL still
+    // pinned at +6, and every other assertion here would still pass.
+    assert!(
+        !fitted
+            .warnings_structured
+            .iter()
+            .any(|w| w.category == WarningCode::ParameterAtRunawayGuard),
+        "no estimate should sit at an internal guard; got: {:?}",
+        fitted
+            .warnings_structured
+            .iter()
+            .filter(|w| w.category == WarningCode::ParameterAtRunawayGuard)
+            .map(|w| w.message.as_str())
+            .collect::<Vec<_>>()
+    );
+    // Pin the disposition too, not just the lag (#1227). What is measured, twice, on the same
+    // noise-free data: with omega free the fit ends at the +6 rail and TVCL / TVV / TVKA come
+    // back −48% / −13% / −29% off truth; with omega FIX'd it converges and the worst of the
+    // three is TVKA at 1.5% (TVCL 0.09%, TVV 0.59%). The 5% band is set from those two
+    // measurements — ~3x above what the sound fit produces, ~1/9 of the smallest error the
+    // degenerate one produced — not from a view about what a good tolerance looks like.
     for (i, truth, name) in [(0usize, 5.0, "TVCL"), (1, 50.0, "TVV"), (2, 1.0, "TVKA")] {
         let rel = (fitted.theta[i] - truth).abs() / truth;
         assert!(
@@ -652,6 +688,51 @@ fn per_route_lag_fit_recovers_lag() {
             "{name} = {} is {:.1}% off truth {truth}; the noise-free optimum recovers it",
             fitted.theta[i],
             rel * 100.0
+        );
+    }
+}
+
+/// Tier-2 (runs on every PR): the fixtures above keep `omega ETA_CL ~ 0.0 FIX`.
+///
+/// Without this, the `FIX` that #1227 turns on is defended only by
+/// [`per_route_lag_fit_recovers_lag`], which is `slow-tests`-gated and therefore skipped in
+/// PR CI — so dropping a `FIX` would merge green and reappear in the next nightly, which is
+/// the loop #1227 was filed to end. `per_route_lag_fit_runs_end_to_end` does not close the
+/// gap either: it runs two outer iterations and asserts only that the OFV is finite, and an
+/// omega parked at the `+6` rail gives a perfectly finite OFV.
+///
+/// Four of these carry `[fit_options] method = focei` and are one `fit()` call away from the
+/// same trap; the compartment-lag twins are predict-only today, but a twin whose declaration
+/// drifts from its pair undercuts the "compared at identical parameters" claim the equality
+/// tests rest on. Parsing is all this needs, so it costs nothing.
+#[test]
+fn per_route_lag_fixtures_fix_their_zero_variance_omega() {
+    for (name, src) in [
+        ("ROUTE_LAG_SINGLE", ROUTE_LAG_SINGLE),
+        ("COMP_LAG_SINGLE", COMP_LAG_SINGLE),
+        ("ROUTE_LAG_ZERO", ROUTE_LAG_ZERO),
+        ("COMP_LAG_ZERO", COMP_LAG_ZERO),
+        ("ROUTE_LAG_PARALLEL", ROUTE_LAG_PARALLEL),
+        ("ROUTE_LAG_MIXED", ROUTE_LAG_MIXED),
+        ("TRANSIT_ROUTE_LAG", TRANSIT_ROUTE_LAG),
+        ("TRANSIT_COMP_LAG", TRANSIT_COMP_LAG),
+        ("IGD_ROUTE_LAG", IGD_ROUTE_LAG),
+        ("IGD_COMP_LAG", IGD_COMP_LAG),
+    ] {
+        let params = parse_full_model(src)
+            .unwrap_or_else(|e| panic!("{name} parses: {e}"))
+            .model
+            .default_params;
+        assert!(
+            !params.omega_fixed.is_empty(),
+            "{name} declares no omega, so this guard would be vacuous"
+        );
+        assert!(
+            params.omega_fixed.iter().all(|&f| f),
+            "{name} has a FREE omega ({:?}); these models fit ONE subject, so a free \
+             zero-variance omega runs to the +6 Cholesky rail and #1205 demotes converged \
+             (#1227). Declare it `~ 0.0 FIX`.",
+            params.omega_fixed
         );
     }
 }
