@@ -1,0 +1,54 @@
+# SS=1 dose x ODE-accumulated cumulative hazard (#1210) — DRUG-DRIVEN arm.
+#
+# The ferx twin of `nonmem_anchor/ss_chz_r2_drug.ctl`. Identical to
+# `ss_chz_const_fit.ferx` except `BETA = 0.5`, so the hazard rides the central
+# concentration and has no closed form — this is the arm that anchors the part the
+# constant arm cannot see.
+#
+# Non-degenerate on both sides of every hazard evaluation by construction: the dose is
+# `SS=1`, so drug from the preceding interval is present at `t = 0` (trough 4.78896241)
+# and the hazard is live at every record, not just after the first arrival.
+#
+# ferx time `t` corresponds to NONMEM time `600 + t`.
+
+[parameters]
+  theta TVCL(1.0, FIX)
+  theta TVV(10.0, FIX)
+  theta TVKA(1.0, FIX)
+  theta TVH0(0.02, FIX)
+  theta TVBETA(0.5, FIX)
+  theta TVLAG(24.0, FIX)
+
+  # No omega: the NONMEM twin runs `$OMEGA 0 FIX`, so both sides evaluate at eta = 0.
+  sigma PROP_ERR ~ 0.01            # variance; NONMEM `$SIGMA 0.01`
+
+[individual_parameters]
+  CL   = TVCL
+  V    = TVV
+  KA   = TVKA
+  H0   = TVH0
+  BETA = TVBETA
+  ALAG1 = TVLAG
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+
+[scaling]
+  obs_scale = V                    # states are AMOUNTS; NONMEM's `$ERROR` divides by V
+
+[event_model]
+  cmt    = 3
+  hazard = H0 * exp(BETA * (central / V))
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 0
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
