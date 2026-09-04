@@ -19,6 +19,27 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Added
+- **Optional regularization for the covariate NN (`[covariate_nn]` / DCM) (#1215).** Via two
+  new `[fit_options]` keys, `nn_l2` and `nn_smooth` (both non-negative, default `0.0` =
+  off — a strict no-op that keeps existing fits byte-identical). `nn_l2` adds L2
+  weight-decay (`Σ wᵢ²`, weight matrices only, biases free); `nn_smooth` penalizes the
+  finite-difference 2nd derivative (curvature) of each output along every input's
+  marginal partial-dependence curve, damping the high-frequency wiggles a high-capacity
+  DCM invents on a null covariate structure. The curvature grid is built in the network's
+  own `(x − center) / scale` input space and spans every per-record covariate snapshot a
+  time-varying input takes (not just its baseline), so it smooths the curve the fit
+  actually evaluates over the range it is actually evaluated on. Both feed the optimizer a penalized objective with matching analytic
+  gradients (the smoothness term reuses the MLP's analytic Jacobian — no autodiff) and
+  Hessian terms across the FOCE-family methods — `foce` / `focei` / `laplace` under every
+  outer optimizer, and `gn` / `gn_hybrid`; a non-FOCE final stage (SAEM, IMP, Bayes, VI)
+  warns that the keys are not applied. The reported `ofv`/AIC/BIC, the optimizer trace,
+  the checkpoint and the verbose `Eval`/`Iter` lines remain the unpenalized
+  −2·log-likelihood so DCM-vs-analytic model comparisons stay valid; `final_gradient`,
+  multi-start / `gn_hybrid` phase ranking and the convergence gates use the penalized
+  objective the fit actually minimised. Settable identically from the model file and
+  `ferx_fit(settings = list(nn_l2 = ..., nn_smooth = ...))`.
+
 ### Fixed
 - **A joint PK-TTE subject whose `TENTRY` (or interval-censored left bound) falls at or
   before its first record no longer scores the `1e20` sentinel (#1223).** The one-solve

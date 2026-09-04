@@ -129,6 +129,7 @@ jobs:
             --test nn_dcm_smoke \
             --test nn_fit_convergence \
             --test nn_fit_smoke \
+            --test nn_regularization \
             --test pktte_prestart_entry \
             --test pktte_tdep_nonmem_anchor \
             --test ss_chz_nonmem_anchor \

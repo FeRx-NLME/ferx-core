@@ -3431,6 +3431,26 @@ fn test_parse_inits_from_nca() {
 }
 
 #[test]
+fn test_parse_nn_regularization_lambdas() {
+    // Default: both off (0.0), a strict no-op for existing fits.
+    let d = FitOptions::default();
+    assert_eq!(d.nn_l2_lambda, 0.0);
+    assert_eq!(d.nn_smooth_lambda, 0.0);
+
+    // Settable from the [fit_options] block (same path as ferx_fit settings).
+    let opts =
+        parse_fit_options(&["nn_l2 = 1e-2".to_string(), "nn_smooth = 0.25".to_string()]).unwrap();
+    assert_eq!(opts.nn_l2_lambda, 1e-2);
+    assert_eq!(opts.nn_smooth_lambda, 0.25);
+
+    // Non-negativity guard: negative strengths are rejected.
+    assert!(parse_fit_options(&["nn_l2 = -1.0".to_string()]).is_err());
+    assert!(parse_fit_options(&["nn_smooth = -0.5".to_string()]).is_err());
+    // Non-numeric values are rejected.
+    assert!(parse_fit_options(&["nn_l2 = high".to_string()]).is_err());
+}
+
+#[test]
 fn test_parse_method_chain() {
     let opts = parse_fit_options(&["method = [saem, focei]".to_string()]).unwrap();
     assert_eq!(
@@ -4432,6 +4452,43 @@ fn test_checkpoint_keys_parse_and_do_not_warn() {
             opts.unsupported_keys_warnings()
         );
     }
+}
+
+#[test]
+fn test_nn_regularization_keys_do_not_warn_on_foce_family() {
+    // nn_l2 / nn_smooth are applied by every FOCE-family outer optimizer
+    // (foce, focei, laplace, gn, gn_hybrid — NLopt, built-in BFGS, trust-region
+    // and Gauss–Newton all add the penalty), so they must never be flagged "not
+    // used by method" there. Regression: they were parsed but listed in no
+    // `method_specific_keys` arm, so every regularized fit — including one from
+    // ferx-r's `settings = list(nn_l2 = ...)`, which routes through the same
+    // `apply_fit_option` — reported them as ignored.
+    for method in ["focei", "foce", "laplace", "gn", "gn_hybrid"] {
+        let opts = parse_fit_options(&[
+            format!("method = {method}"),
+            "nn_l2 = 1e-2".to_string(),
+            "nn_smooth = 1e-1".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(opts.nn_l2_lambda, 1e-2);
+        assert_eq!(opts.nn_smooth_lambda, 1e-1);
+        assert!(
+            opts.unsupported_keys_warnings().is_empty(),
+            "method={method} spuriously warned on nn_l2/nn_smooth: {:?}",
+            opts.unsupported_keys_warnings()
+        );
+    }
+    // ...and they *are* flagged where nothing applies them, so a user asking
+    // for a regularized SAEM fit hears about it rather than getting an
+    // unregularized one silently.
+    let saem =
+        parse_fit_options(&["method = saem".to_string(), "nn_l2 = 1e-2".to_string()]).unwrap();
+    let w = saem.unsupported_keys_warnings();
+    assert_eq!(w.len(), 1, "saem must warn once on nn_l2: {w:?}");
+    assert!(
+        w[0].contains("`nn_l2` is not used by method `SAEM`"),
+        "{w:?}"
+    );
 }
 
 #[test]

@@ -40,6 +40,10 @@ struct FoceiProblem<'a> {
     bounds: PackedBounds,
     cached_etas: std::sync::Mutex<Vec<DVector<f64>>>,
     grad_cache: std::sync::Mutex<Option<GradCache>>,
+    /// Covariate-NN (DCM) regularizer. No-op when both λ are 0. Added to the
+    /// optimizer objective (`cost`/`ofv_fixed`), gradient and Hessian, not to
+    /// the final reported OFV, which reuses a clean `pop_nll_opts`.
+    nn_reg: crate::estimation::nn_reg::NnRegularizer,
 }
 
 impl FoceiProblem<'_> {
@@ -78,7 +82,8 @@ impl FoceiProblem<'_> {
             &[], // trust_region doesn't support IOV yet; kappas empty
             self.options,
         );
-        let raw = 2.0 * nll;
+        // Penalized objective fed to the optimizer (unregularized fits unchanged).
+        let raw = 2.0 * nll + self.nn_reg.penalty_value(&params.theta);
         if raw.is_finite() {
             raw
         } else {
@@ -220,6 +225,11 @@ impl Gradient for FoceiProblem<'_> {
                 g[k] += 2.0 * (gi[k] + ti[k]);
             }
         }
+        // NN penalty gradient. NN weights are identity-packed, so a natural-space
+        // weight coordinate is a packed coordinate and the raw-weight gradient
+        // maps 1:1 into `g`. Its curvature goes into `hessian()` below.
+        let params = unpack_params(p, self.init_params);
+        self.nn_reg.add_packed_gradient(&params.theta, &mut g);
         Ok(g)
     }
 }
@@ -245,6 +255,15 @@ impl Hessian for FoceiProblem<'_> {
                 }
             }
         }
+        // Covariate-NN penalty curvature: exact `2λ` on the L2 weight diagonal
+        // and the Gauss–Newton `2λ·Σ ∂C/∂w ∂C/∂wᵀ` for the curvature term. The
+        // gradient carries ∇P, so a quadratic model without this would predict
+        // zero curvature along every NN-weight direction under a large λ, ρ
+        // would read poor on each step and the radius would shrink for no
+        // reason. Both pieces are PSD, so the BHHH model stays PSD.
+        let params = unpack_params(p, self.init_params);
+        self.nn_reg
+            .add_packed_hessian(&params.theta, &mut |i, j, v| h[i][j] += v);
         Ok(h)
     }
 }
@@ -642,6 +661,8 @@ pub fn optimize_trust_region(
     let n_subj = population.subjects.len();
     let n_eta = model.n_eta;
 
+    let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, options);
+    let nn_reg_active = nn_reg.is_active();
     let problem = FoceiProblem {
         model,
         population,
@@ -650,6 +671,7 @@ pub fn optimize_trust_region(
         bounds,
         cached_etas: std::sync::Mutex::new(vec![DVector::zeros(n_eta); n_subj]),
         grad_cache: std::sync::Mutex::new(None),
+        nn_reg,
     };
 
     if options.verbose {
@@ -717,7 +739,15 @@ pub fn optimize_trust_region(
             let grad = prob.gradient(&vec).ok();
             if let Some(mut w) = warning {
                 if let Some(g) = grad.as_deref() {
-                    w.push_str(&format!(" Final ‖∂OFV/∂x‖ = {:.3e}.", l2_norm(g)));
+                    // Under covariate-NN regularization this gradient is of the
+                    // penalized objective the optimizer minimised, not of the
+                    // reported OFV — label it as such.
+                    let label = if nn_reg_active {
+                        "∂(OFV + NN penalty)/∂x"
+                    } else {
+                        "∂OFV/∂x"
+                    };
+                    w.push_str(&format!(" Final ‖{label}‖ = {:.3e}.", l2_norm(g)));
                 }
                 warnings.push(w);
             }
@@ -916,6 +946,7 @@ mod tests {
             bounds,
             cached_etas: std::sync::Mutex::new(vec![nalgebra::DVector::zeros(n_eta); n_subj]),
             grad_cache: std::sync::Mutex::new(None),
+            nn_reg: crate::estimation::nn_reg::NnRegularizer::build(&model, &population, &options),
         };
 
         // 1. Before cost(): cache is None.
@@ -1211,6 +1242,11 @@ mod tests {
                     population.subjects.len()
                 ]),
                 grad_cache: std::sync::Mutex::new(None),
+                nn_reg: crate::estimation::nn_reg::NnRegularizer::build(
+                    &model,
+                    &population,
+                    &options,
+                ),
             };
 
             let analytic = fresh().gradient(&x).expect("gradient must evaluate");
@@ -1228,6 +1264,207 @@ mod tests {
                     "interaction={interaction} coord {k}: analytic {} vs central FD {}",
                     analytic[k],
                     fd
+                );
+            }
+        }
+    }
+
+    /// The **assembled** packed gradient — likelihood part plus the covariate-NN
+    /// penalty spliced in at the NN-weight coordinates — against central FD of
+    /// the penalized `cost` at λ > 0, on the DCM fixture. The per-kernel FD
+    /// checks in `nn::` pin each penalty against its own value; this is the seam
+    /// they cannot see: that the penalty gradient lands at the right *packed*
+    /// index and in the right space (identity-packed weights, no scale factor),
+    /// as CLAUDE.md asks of "the provider that assembles them". The warfarin
+    /// test above builds its regularizer from `FitOptions::default()` (λ = 0),
+    /// so without this the new arm was exercised only as a no-op.
+    ///
+    /// Also pins the Hessian's penalty block: the exact `2λ` L2 diagonal and the
+    /// Gauss–Newton curvature term must match central FD of the assembled
+    /// gradient along the NN-weight coordinates (the BHHH likelihood part is an
+    /// approximation, so only the *difference* between λ > 0 and λ = 0 is
+    /// compared, which isolates the penalty's contribution).
+    #[cfg(feature = "nn")]
+    #[test]
+    fn assembled_gradient_and_hessian_match_fd_of_penalized_cost_on_dcm() {
+        use crate::io::datareader::read_nonmem_csv;
+        use crate::nn::CovariateMapper;
+        use crate::parser::model_parser::parse_full_model;
+        use std::path::Path;
+
+        let parsed = parse_full_model(include_str!(
+            "../../tests/fixtures/two_cpt_dcm_regularized.ferx"
+        ))
+        .expect("DCM fixture parses");
+        let model = parsed.model;
+        let population = read_nonmem_csv(
+            Path::new("data/two_cpt_oral_cov.csv"),
+            Some(&["WT", "CRCL"]),
+            None,
+        )
+        .expect("dataset loads");
+
+        let mk_options = |l2: f64, smooth: f64| FitOptions {
+            inner_tol: 1e-10,
+            inner_maxiter: 200,
+            verbose: false,
+            nn_l2_lambda: l2,
+            nn_smooth_lambda: smooth,
+            ..parsed.fit_options.clone()
+        };
+        let options = mk_options(3e-2, 2e-1);
+        let init = &model.default_params;
+        let bounds = compute_bounds(init);
+        let mut x = pack_params(init);
+        clamp_to_bounds(&mut x, &bounds);
+
+        fn fresh<'a>(
+            model: &'a CompiledModel,
+            population: &'a Population,
+            init: &'a ModelParameters,
+            options: &'a FitOptions,
+        ) -> FoceiProblem<'a> {
+            FoceiProblem {
+                model,
+                population,
+                options,
+                init_params: init,
+                bounds: compute_bounds(init),
+                cached_etas: std::sync::Mutex::new(vec![
+                    DVector::zeros(model.n_eta);
+                    population.subjects.len()
+                ]),
+                grad_cache: std::sync::Mutex::new(None),
+                nn_reg: crate::estimation::nn_reg::NnRegularizer::build(model, population, options),
+            }
+        }
+        assert!(fresh(&model, &population, init, &options)
+            .nn_reg
+            .is_active());
+
+        let nn = &model.covariate_nns[0];
+        let (w_lo, w_hi) = (nn.weights_offset, nn.weights_offset + nn.mapper.n_weights());
+        let zero = mk_options(0.0, 0.0);
+
+        // Gradient seam: [∇cost(λ) − ∇cost(0)] against central FD of
+        // [cost(λ) − cost(0)], over *every* packed coordinate. At a fixed `x` the
+        // likelihood part is identical in both, so the difference is exactly the
+        // penalty as the optimizer sees it in packed space — which is the seam
+        // under test (index placement, no stray scale factor), free of the
+        // EBE-fixpoint FD noise the DCM likelihood carries. The likelihood part
+        // of the assembled gradient is pinned by the warfarin test above.
+        let grad_at = |o: &FitOptions, p: &Vec<f64>| -> Vec<f64> {
+            fresh(&model, &population, init, o)
+                .gradient(p)
+                .expect("gradient must evaluate")
+        };
+        let pen_cost_at = |p: &Vec<f64>| -> f64 {
+            fresh(&model, &population, init, &options).cost(p).unwrap()
+                - fresh(&model, &population, init, &zero).cost(p).unwrap()
+        };
+        let (gl, g0) = (grad_at(&options, &x), grad_at(&zero, &x));
+        let pen_grad: Vec<f64> = gl.iter().zip(&g0).map(|(a, b)| a - b).collect();
+        assert!(
+            pen_grad[w_lo..w_hi].iter().any(|g| g.abs() > 1e-6),
+            "penalty gradient must be live on the NN block"
+        );
+        let h = 1e-6;
+        for k in 0..x.len() {
+            let mut up = x.clone();
+            up[k] += h;
+            let mut dn = x.clone();
+            dn[k] -= h;
+            let fd = (pen_cost_at(&up) - pen_cost_at(&dn)) / (2.0 * h);
+            // The likelihood cancels exactly in value but its rayon reduction
+            // order is not bit-stable across evals; ~1e-12 of noise on a cost of
+            // O(1e3) divided by 2h is ~1e-6 absolute, so the comparison floors the
+            // scale at 1e-3 and asks for 5e-3 relative — a misplaced index or a
+            // stray scale factor still shows up as an O(1) mismatch.
+            let scale = fd.abs().max(pen_grad[k].abs()).max(1e-3);
+            assert!(
+                (pen_grad[k] - fd).abs() / scale < 5e-3,
+                "coord {k} (nn weight: {}): penalty grad {} vs central FD {}",
+                (w_lo..w_hi).contains(&k),
+                pen_grad[k],
+                fd
+            );
+            if !(w_lo..w_hi).contains(&k) {
+                assert_eq!(pen_grad[k], 0.0, "penalty gradient leaked to coord {k}");
+            }
+        }
+
+        // Hessian seam: H(λ) − H(0) must be exactly the regularizer's own packed
+        // Hessian (index placement into the `Vec<Vec<f64>>` the trust region
+        // consumes), confined to the NN block. The kernel itself — Gauss–Newton
+        // for the curvature term, exact for L2 — is pinned against FD of the
+        // penalty gradient in `nn::regularization_tests`, where it is cheap;
+        // here the point is that `hessian()` carries it at all, at the right
+        // indices, and adds nothing anywhere else.
+        let h_pen: Vec<Vec<f64>> = {
+            let hl = fresh(&model, &population, init, &options)
+                .hessian(&x)
+                .unwrap();
+            let h0 = fresh(&model, &population, init, &zero).hessian(&x).unwrap();
+            hl.iter()
+                .zip(&h0)
+                .map(|(a, b)| a.iter().zip(b).map(|(p, q)| p - q).collect())
+                .collect()
+        };
+        let mut expected = vec![vec![0.0; x.len()]; x.len()];
+        let theta = unpack_params(&x, init).theta;
+        crate::estimation::nn_reg::NnRegularizer::build(&model, &population, &options)
+            .add_packed_hessian(&theta, &mut |i, j, v| expected[i][j] += v);
+        assert!(
+            (w_lo..w_hi).any(|k| expected[k][k] > 0.0),
+            "penalty Hessian must be live on the NN block"
+        );
+        for k in 0..x.len() {
+            for j in 0..x.len() {
+                if !((w_lo..w_hi).contains(&k) && (w_lo..w_hi).contains(&j)) {
+                    assert_eq!(h_pen[k][j], 0.0, "penalty Hessian leaked to ({k}, {j})");
+                }
+                assert!(
+                    (h_pen[k][j] - expected[k][j]).abs() <= 1e-9 * (1.0 + expected[k][j].abs()),
+                    "penalty Hessian ({k}, {j}): hessian() diff {} vs regularizer {}",
+                    h_pen[k][j],
+                    expected[k][j]
+                );
+            }
+        }
+        // …and with the curvature term off, the L2 block is exact: `2λ` on weight
+        // entries, `0` on biases, nothing off-diagonal.
+        let l2_only = mk_options(3e-2, 0.0);
+        let hl2: Vec<Vec<f64>> = {
+            let hl = fresh(&model, &population, init, &l2_only)
+                .hessian(&x)
+                .unwrap();
+            let h0 = fresh(&model, &population, init, &zero).hessian(&x).unwrap();
+            hl.iter()
+                .zip(&h0)
+                .map(|(a, b)| a.iter().zip(b).map(|(p, q)| p - q).collect())
+                .collect()
+        };
+        let weight_idx: std::collections::HashSet<usize> = nn
+            .mapper
+            .mlp()
+            .weight_param_indices()
+            .into_iter()
+            .map(|i| w_lo + i)
+            .collect();
+        for k in 0..x.len() {
+            for j in 0..x.len() {
+                let expect = if k == j && weight_idx.contains(&k) {
+                    2.0 * 3e-2
+                } else {
+                    0.0
+                };
+                // 1e-8 absolute: the BHHH likelihood part cancels between the two
+                // `hessian()` calls only up to rayon reduction-order noise (~1e-12
+                // on entries of O(1e3)); the L2 term itself is exact.
+                assert!(
+                    (hl2[k][j] - expect).abs() < 1e-8,
+                    "L2 Hessian ({k}, {j}): {} vs {expect}",
+                    hl2[k][j]
                 );
             }
         }
