@@ -1,4 +1,22 @@
 $PROBLEM SS dose x ODE-accumulated hazard (#1220 item 1) -- r5_drug_lag: mid-record SS dose with ALAG1 = 24 > II = 12
+;
+; NO $PK ALAG HERE, ON PURPOSE. The ferx twin (ss_chz_ss2_lag.csv +
+; ss_chz_drug_lag_fit.ferx) carries ALAG1 = 24; this train is a plain pulse
+; train placed at that side's lagged ARRIVALS. For lag >= II ferx clamps the
+; seed phase to 0 and so does NONMEM, so an SS record means "pulses ending on
+; the record, then this dose's own pulse at t + lag" -- NOT a shifted train.
+; No shifted train reproduces it; an earlier draft with ALAG1 = 14 on both
+; sides was 2.4x off at ferx t = 49.9.
+;
+; TWO DELIBERATE HOLES, both load-bearing -- do not "repair" either:
+;   * train5.csv has NO dose at T = 612 (ferx t = 12). The ferx record that
+;     would arrive there precedes the first record, so that pulse exists on
+;     neither side.
+;   * ss_chz_ss2_lag.csv has NO record at 216 or 228. 216's lagged arrival
+;     (240) is the second SS record's own seed pulse; carrying both would
+;     dose it twice.
+; The IPRED comparison in tests/ss_chz_nonmem_anchor.rs is what catches a
+; mistake in either, which is why that test reads IPRED before H.
 $INPUT ID TIME DV EVID AMT CMT RATE MDV SS II
 $DATA train5.csv IGNORE=@
 $SUBROUTINES ADVAN13 TOL=9

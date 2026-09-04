@@ -1,13 +1,23 @@
-# SS=1 dose x ODE-accumulated cumulative hazard (#1210) — DRUG-DRIVEN arm.
+# SS=1 dose x ODE-accumulated cumulative hazard, LAGGED arm (#1220 item 1).
 #
-# The ferx twin of `nonmem_anchor/ss_chz_r2_drug.ctl`. Identical to
-# `ss_chz_const_fit.ferx` except `BETA = 0.5`, so the hazard rides the central
-# concentration and has no closed form — this is the arm that anchors the part the
-# constant arm cannot see.
+# `ss_chz_drug_fit.ferx` plus `ALAG1 = TVLAG` with `TVLAG = 24` FIXed, run against
+# `nonmem_anchor/ss_chz_ss2_lag.csv`. The NONMEM twin is
+# `nonmem_anchor/ss_chz_r5_drug_lag.ctl`, which carries **no ALAG at all** — see that
+# file's header for why a shifted train cannot reproduce this, and for the two
+# deliberate holes in the two datasets.
 #
-# Non-degenerate on both sides of every hazard evaluation by construction: the dose is
-# `SS=1`, so drug from the preceding interval is present at `t = 0` (trough 4.78896241)
-# and the hazard is live at every record, not just after the first arrival.
+# `BETA = 0.5`, so the hazard rides the central concentration and has no closed form.
+# That is required here: with `BETA = 0` the hazard is `H0` whatever the lag does, so a
+# const arm is structurally blind to this construction.
+#
+# The lag is a FIXed theta, not a data column, on purpose: `ode_cumhaz_hazard` snapshots
+# the PK parameters at `t = 0`, so a per-dose lag column would be read at its baseline
+# for every dose, and a time-varying one would trip `assert_survival_tv_covariates`.
+#
+# `ALAG1 = 24 = 2 x II`. That keeps the first record's own arrival on the `II` grid, but
+# it also means this fixture cannot tell ferx's phase CLAMP from a WRAP (both give phase
+# 0 at an exact multiple). The clamp convention is anchored by #1121's `ss_lag_ge_ii`
+# (`LG = 15`, `II = 12`); what this fixture anchors is `restore_chz`.
 #
 # ferx time `t` corresponds to NONMEM time `600 + t`.
 
