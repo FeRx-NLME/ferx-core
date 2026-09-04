@@ -61,6 +61,10 @@ pub fn predict(
     // the model (notably `[scaling]`, #1028) silently collapsed the prediction. `fit()`
     // and `simulate()` already refuse this; match them here.
     assert_covariates_present(model, population);
+    // A population read by the model-blind `read_nonmem_csv` carries a declared
+    // endpoint's rows as Gaussian observations, and this function would return a
+    // *concentration* for the event row (#1199). `fit()` Err's on the same signature.
+    assert_endpoint_routing(model, population);
     // …and that no `[covariate_model]` relation is still waiting on the
     // data-derived statistics that build it (#1111): an unresolved relation
     // simply is not in the compiled expression, and a dropped covariate effect
@@ -154,6 +158,11 @@ pub fn predict_categorical(
     // takes no time argument (#741). Without this, `predict_categorical` was the one
     // public entry point that returned quietly-wrong probabilities.
     assert_survival_tv_covariates(model, population);
+    // And the routing precondition `predict()` applies (#1199): `predict_binary` walks
+    // `obs_records`, so a population read model-blind — its binary rows in the
+    // Gaussian grid — would come back empty, indistinguishable from a model with no
+    // binary endpoint.
+    assert_endpoint_routing(model, population);
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     let mut results = Vec::new();
     for subject in &population.subjects {

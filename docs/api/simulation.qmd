@@ -27,8 +27,10 @@ pub fn simulate(
 
 **Example:**
 ```rust
+use ferx_core::api::read_population_for;
+
 let model = parse_model_file(Path::new("model.ferx"))?;
-let population = read_nonmem_csv(Path::new("data.csv"), None)?;
+let (population, _) = read_population_for(&model, &None, "data.csv", None, None, None, &[])?;
 
 // Simulate 1000 replicates
 let sims = simulate(&model, &population, &model.default_params, 1000);

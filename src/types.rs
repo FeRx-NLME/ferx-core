@@ -2997,6 +2997,18 @@ pub enum ObsRecord {
     },
 }
 
+impl ObsRecord {
+    /// The CMT the row was routed to — the same value for every variant.
+    #[cfg(feature = "survival")]
+    pub(crate) fn cmt(&self) -> usize {
+        match self {
+            ObsRecord::Event { cmt, .. }
+            | ObsRecord::DiscreteState { cmt, .. }
+            | ObsRecord::Count { cmt, .. } => *cmt,
+        }
+    }
+}
+
 #[cfg(feature = "survival")]
 /// Analytic parametric hazard families.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

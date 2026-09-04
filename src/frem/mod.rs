@@ -98,6 +98,30 @@ struct CategoricalExpansion {
 /// effectively imputes missing covariates.
 ///
 /// Returns the augmented CSV content (as a string) and metadata.
+/// FREM is a covariate model on the PK etas, and the transformed dataset is written
+/// from the Gaussian rows (`obs_times`) only. A non-Gaussian endpoint's rows live in
+/// `obs_records` and would be dropped from the file silently — while the model-blind
+/// read `prepare_frem` used to do (#1199) kept them as Gaussian rows and mis-stated
+/// the covariate statistics. Neither is FREM on a joint model; refuse by name
+/// (`E_FREM_NON_GAUSSIAN_ENDPOINT`), at both entry points and before anything else
+/// (covariate resolution included) can report a less specific cause.
+fn reject_non_gaussian_endpoints(base_model: &CompiledModel) -> Result<(), String> {
+    #[cfg(feature = "survival")]
+    if base_model.has_non_gaussian() {
+        let mut cmts: Vec<usize> = base_model.endpoints.keys().copied().collect();
+        cmts.sort_unstable();
+        return Err(format!(
+            "E_FREM_NON_GAUSSIAN_ENDPOINT: FREM is defined for Gaussian endpoints only; the \
+             model declares a non-Gaussian endpoint (`[event_model]` / `[binary_model]` / \
+             `[markov_model]`) on CMT {cmts:?}. Run the FREM step on the PK model without \
+             that block."
+        ));
+    }
+    #[cfg(not(feature = "survival"))]
+    let _ = base_model;
+    Ok(())
+}
+
 pub fn transform_dataset_for_frem(
     population: &Population,
     base_model: &CompiledModel,
@@ -106,6 +130,7 @@ pub fn transform_dataset_for_frem(
     missing_value: Option<f64>,
 ) -> Result<(String, FremDataInfo), String> {
     let missing_val = missing_value.unwrap_or(-99.0);
+    reject_non_gaussian_endpoints(base_model)?;
     // Validate covariates exist in the dataset.
     for cov in covariates {
         let found = population
@@ -893,6 +918,7 @@ pub fn prepare_frem(
     // Full parse so the optional `[covariates]` block is available for fallback.
     let parsed = parse_full_model_file(model_path)?;
     let base_model = &parsed.model;
+    reject_non_gaussian_endpoints(base_model)?;
     // Honour the model's `[data]` column mapping (#730) so FREM prep reads the
     // same columns as `fit()`/`check` do — otherwise a mapped TIME/DV header is
     // missed here even though it works everywhere else.
@@ -2221,5 +2247,70 @@ mod tests {
         assert!(empty.contains("is empty"), "got: {empty}");
         // A filter doesn't change the requirement.
         assert!(resolve_frem_covariates(&["WT".to_string()], None, None).is_err());
+    }
+
+    /// #1199: FREM prep on a model with a non-Gaussian endpoint is refused by name.
+    /// The transformed dataset is written from the Gaussian rows only, so a routed
+    /// joint population would lose its event rows silently; the model-blind read
+    /// `prepare_frem` used before kept them by accident and mis-stated the
+    /// covariate statistics. Both entry points, so neither path stays silent.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn a_non_gaussian_endpoint_is_rejected_by_name() {
+        let src = std::fs::read_to_string("examples/pktte_joint.ferx").unwrap();
+        let m = crate::parser::model_parser::parse_full_model(&src)
+            .unwrap()
+            .model;
+        let (pop, _) = crate::api::read_population_for(
+            &m,
+            &None,
+            "data/pktte_joint.csv",
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        let err = transform_dataset_for_frem(&pop, &m, &["WT".to_string()], &[], None)
+            .expect_err("joint model must be refused");
+        assert!(
+            err.contains("E_FREM_NON_GAUSSIAN_ENDPOINT") && err.contains("CMT [3]"),
+            "{err}"
+        );
+
+        let err = prepare_frem(
+            Path::new("examples/pktte_joint.ferx"),
+            Path::new("data/pktte_joint.csv"),
+            &["WT".to_string()],
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("prepare_frem must refuse the joint model too");
+        assert!(err.contains("E_FREM_NON_GAUSSIAN_ENDPOINT"), "{err}");
+
+        // The binary arm of `has_non_gaussian()` trips the same guard.
+        let src = std::fs::read_to_string("examples/binary_logistic.ferx").unwrap();
+        let m = crate::parser::model_parser::parse_full_model(&src)
+            .unwrap()
+            .model;
+        let (pop, _) = crate::api::read_population_for(
+            &m,
+            &None,
+            "data/binary_logistic.csv",
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        let err = transform_dataset_for_frem(&pop, &m, &["X".to_string()], &[], None)
+            .expect_err("binary model must be refused");
+        assert!(
+            err.contains("E_FREM_NON_GAUSSIAN_ENDPOINT") && err.contains("CMT [3]"),
+            "{err}"
+        );
     }
 }

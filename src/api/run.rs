@@ -956,6 +956,110 @@ pub(crate) fn build_selection_filter_merged(
     SelectionFilter::from_opts(&ignore, &accept, &subjects).map(Some)
 }
 
+/// The non-Gaussian row routing a dataset needs for `model`: every CMT the model
+/// declares as a TTE / binary / CTMM endpoint, plus the design-row DV placeholder
+/// per CTMM endpoint and the missing-DV policy. Empty routing sets for a
+/// Gaussian-only model.
+///
+/// This is the **only** place the routing is derived from a model. Every reader
+/// call that has a model in hand must go through it — the file-based
+/// [`read_population_for`] family, and [`read_population_routed_by`] for the
+/// `.fitrx` reload and the `run_covariance` / `run_sir` re-read — because a
+/// population read *without* it carries the endpoint's rows as Gaussian
+/// observations and no event records, which `fit()` then rejects with
+/// `E_ENDPOINT_UNROUTED` (#1199).
+fn obs_routing_for(model: &CompiledModel, missing_dv: MissingDvPolicy) -> ObsRouting {
+    // Nothing to route without `survival`: no non-Gaussian endpoint can be parsed.
+    #[cfg(not(feature = "survival"))]
+    let _ = model;
+    // Extract TTE CMTs from model endpoints so the reader can route TTE rows
+    // to obs_records instead of the Gaussian parallel Vecs.
+    #[cfg(feature = "survival")]
+    let tte_cmts: std::collections::HashSet<usize> = model
+        .endpoints
+        .iter()
+        .filter_map(|(&cmt, ep)| {
+            if matches!(ep, EndpointLikelihood::Tte { .. }) {
+                Some(cmt)
+            } else {
+                None
+            }
+        })
+        .collect();
+    #[cfg(not(feature = "survival"))]
+    let tte_cmts: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+    // Discrete-state CMTs route to `ObsRecord::DiscreteState` (integer DV), like TTE
+    // rows route to `ObsRecord::Event` — both need the non-Gaussian reader path. This
+    // set covers binary/categorical (#760) and CTMM (#759) endpoints, which share the
+    // discrete-state plumbing.
+    #[cfg(feature = "survival")]
+    // Binary **∪ CTMM** — every CMT whose integer DV routes to `ObsRecord::DiscreteState`.
+    // Deliberately not named `binary_cmts`: this function used to share that name with the
+    // binary-only `Vec` above, and the two are equal today only because CTMM `--simulate`
+    // is rejected upstream. When CTMM simulation lands (#820) they diverge.
+    let discrete_cmts: std::collections::HashSet<usize> = {
+        let mut discrete: std::collections::HashSet<usize> =
+            model.binary_cmts().into_iter().collect();
+        #[cfg(feature = "markov")]
+        discrete.extend(model.ctmm_cmts());
+        discrete
+    };
+    #[cfg(not(feature = "survival"))]
+    let discrete_cmts: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+    // One reader call covers every combination: the routing sets are empty for a
+    // Gaussian-only model (so no row is routed to `obs_records`), and the reader
+    // builds the covariate read set from `decls` when the model declares
+    // `[covariates]`, from `fallback_columns` otherwise.
+    // Placeholder DV code for an integer-coded design row: the endpoint's first
+    // declared state code, so a `state_codes` table that is not 0-based (e.g.
+    // `1`/`2`) never gets an undecodable `0` placeholder. Only CTMM declares
+    // codes; Binary is `{0,1}` and keeps the `0` default.
+    #[cfg(feature = "markov")]
+    let design_states: HashMap<usize, usize> = model
+        .endpoints
+        .iter()
+        .filter_map(|(&cmt, ep)| match ep {
+            EndpointLikelihood::Ctmm { state_codes, .. } => {
+                state_codes.first().map(|&code| (cmt, code))
+            }
+            _ => None,
+        })
+        .collect();
+    #[cfg(not(feature = "markov"))]
+    let design_states: HashMap<usize, usize> = HashMap::new();
+
+    ObsRouting::tte_and_discrete(&tte_cmts, &discrete_cmts)
+        .with_missing_dv(missing_dv)
+        .with_design_states(design_states)
+}
+
+/// Read `data_path` routed by `model`, for the callers that hold a `CompiledModel`
+/// but no `ParsedModel`: the `.fitrx` reload (`io::fitrx::load_fit`) and the
+/// post-hoc `run_covariance` / `run_sir` re-read of `fit.data_path`. The same
+/// reader call as [`read_population_for`] with no covariate declarations and no
+/// row filter, so the population comes back the way the original fit saw it —
+/// the endpoint's rows as event records, not as Gaussian observations (#1199).
+pub(crate) fn read_population_routed_by(
+    model: &CompiledModel,
+    data_path: &Path,
+    iov_column: Option<&str>,
+    column_map: &[(String, String)],
+) -> Result<Population, String> {
+    read_nonmem_csv_routed(
+        data_path,
+        None,
+        None,
+        &[],
+        iov_column,
+        None,
+        &obs_routing_for(model, MissingDvPolicy::Skip),
+        column_map,
+    )
+    .map(|(population, _)| population)
+}
+
 /// Read a [`Population`] from `data_path` using the correct reader for `model`.
 ///
 /// When the model declares a `[covariates]` block this routes through the strict
@@ -1042,67 +1146,7 @@ fn read_population_for_policy(
     column_map: &[(String, String)],
     missing_dv: MissingDvPolicy,
 ) -> Result<(Population, Option<CovariateTable>), String> {
-    // Extract TTE CMTs from model endpoints so the reader can route TTE rows
-    // to obs_records instead of the Gaussian parallel Vecs.
-    #[cfg(feature = "survival")]
-    let tte_cmts: std::collections::HashSet<usize> = model
-        .endpoints
-        .iter()
-        .filter_map(|(&cmt, ep)| {
-            if matches!(ep, EndpointLikelihood::Tte { .. }) {
-                Some(cmt)
-            } else {
-                None
-            }
-        })
-        .collect();
-    #[cfg(not(feature = "survival"))]
-    let tte_cmts: std::collections::HashSet<usize> = std::collections::HashSet::new();
-
-    // Discrete-state CMTs route to `ObsRecord::DiscreteState` (integer DV), like TTE
-    // rows route to `ObsRecord::Event` — both need the non-Gaussian reader path. This
-    // set covers binary/categorical (#760) and CTMM (#759) endpoints, which share the
-    // discrete-state plumbing.
-    #[cfg(feature = "survival")]
-    // Binary **∪ CTMM** — every CMT whose integer DV routes to `ObsRecord::DiscreteState`.
-    // Deliberately not named `binary_cmts`: this function used to share that name with the
-    // binary-only `Vec` above, and the two are equal today only because CTMM `--simulate`
-    // is rejected upstream. When CTMM simulation lands (#820) they diverge.
-    let discrete_cmts: std::collections::HashSet<usize> = {
-        let mut discrete: std::collections::HashSet<usize> =
-            model.binary_cmts().into_iter().collect();
-        #[cfg(feature = "markov")]
-        discrete.extend(model.ctmm_cmts());
-        discrete
-    };
-    #[cfg(not(feature = "survival"))]
-    let discrete_cmts: std::collections::HashSet<usize> = std::collections::HashSet::new();
-
-    // One reader call covers every combination: the routing sets are empty for a
-    // Gaussian-only model (so no row is routed to `obs_records`), and the reader
-    // builds the covariate read set from `decls` when the model declares
-    // `[covariates]`, from `fallback_columns` otherwise.
-    // Placeholder DV code for an integer-coded design row: the endpoint's first
-    // declared state code, so a `state_codes` table that is not 0-based (e.g.
-    // `1`/`2`) never gets an undecodable `0` placeholder. Only CTMM declares
-    // codes; Binary is `{0,1}` and keeps the `0` default.
-    #[cfg(feature = "markov")]
-    let design_states: HashMap<usize, usize> = model
-        .endpoints
-        .iter()
-        .filter_map(|(&cmt, ep)| match ep {
-            EndpointLikelihood::Ctmm { state_codes, .. } => {
-                state_codes.first().map(|&code| (cmt, code))
-            }
-            _ => None,
-        })
-        .collect();
-    #[cfg(not(feature = "markov"))]
-    let design_states: HashMap<usize, usize> = HashMap::new();
-
-    let routing = ObsRouting::tte_and_discrete(&tte_cmts, &discrete_cmts)
-        .with_missing_dv(missing_dv)
-        .with_design_states(design_states);
+    let routing = obs_routing_for(model, missing_dv);
     let (decls, extra) = match covariate_decls {
         Some(d) => (Some(d.as_slice()), undeclared_referenced(model, d)),
         None => (None, Vec::new()),

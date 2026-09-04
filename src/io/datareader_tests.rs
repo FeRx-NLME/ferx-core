@@ -2488,3 +2488,75 @@ fn keep_as_design_still_rejects_an_out_of_range_integer_dv() {
     let err = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap_err();
     assert!(err.contains("out-of-range DV"), "{err}");
 }
+
+/// The invariant `api::validation::check_endpoint_routing` (#1199) stands on: a
+/// routed CMT never reaches the Gaussian grid. With no routing every event row is
+/// a Gaussian observation on its CMT; with the CMT routed, every one of them is an
+/// `obs_records` entry and none is in `obs_cmts`. If a reader change ever blurs
+/// this, the `E_ENDPOINT_UNROUTED` guard goes blind — this is the test that says so.
+#[cfg(feature = "survival")]
+#[test]
+fn routed_reader_never_places_an_endpoint_cmt_in_the_gaussian_grid() {
+    use std::collections::HashSet;
+    let path = std::path::Path::new("data/pktte_joint.csv");
+    let read = |routing: &ObsRouting| -> (usize, usize) {
+        let (pop, _) = read_nonmem_csv_routed(path, None, None, &[], None, None, routing, &[])
+            .expect("fixture reads");
+        let events: usize = pop.subjects.iter().map(|s| s.obs_records.len()).sum();
+        let gaussian_on_3: usize = pop
+            .subjects
+            .iter()
+            .map(|s| s.obs_cmts.iter().filter(|&&c| c == 3).count())
+            .sum();
+        (events, gaussian_on_3)
+    };
+    let (ev_unrouted, g3_unrouted) = read(&ObsRouting::default());
+    let tte: HashSet<usize> = [3].into_iter().collect();
+    let (ev_routed, g3_routed) = read(&ObsRouting::tte_and_discrete(&tte, &HashSet::new()));
+
+    assert!(g3_unrouted > 0, "the fixture has event rows on CMT 3");
+    assert_eq!(ev_unrouted, 0, "no routing ⇒ no event records");
+    assert_eq!(
+        g3_routed, 0,
+        "routed ⇒ CMT 3 is never a Gaussian observation"
+    );
+    assert_eq!(
+        ev_routed, g3_unrouted,
+        "every CMT-3 row moves from the Gaussian grid to obs_records, none is lost"
+    );
+}
+
+/// The discrete half of the same invariant: a CMT in the `discrete` routing set
+/// (binary / CTMM) never reaches the Gaussian grid either — the `integer_kind` arm
+/// precedes the Gaussian push, and `ObsRouting::validate` forbids a CMT in two sets.
+#[cfg(feature = "survival")]
+#[test]
+fn routed_reader_never_places_a_discrete_endpoint_cmt_in_the_gaussian_grid() {
+    use std::collections::HashSet;
+    let path = std::path::Path::new("data/binary_logistic.csv");
+    let read = |routing: &ObsRouting| -> (usize, usize) {
+        let (pop, _) = read_nonmem_csv_routed(path, None, None, &[], None, None, routing, &[])
+            .expect("fixture reads");
+        let records: usize = pop.subjects.iter().map(|s| s.obs_records.len()).sum();
+        let gaussian_on_3: usize = pop
+            .subjects
+            .iter()
+            .map(|s| s.obs_cmts.iter().filter(|&&c| c == 3).count())
+            .sum();
+        (records, gaussian_on_3)
+    };
+    let (rec_unrouted, g3_unrouted) = read(&ObsRouting::default());
+    let discrete: HashSet<usize> = [3].into_iter().collect();
+    let (rec_routed, g3_routed) = read(&ObsRouting::tte_and_discrete(&HashSet::new(), &discrete));
+
+    assert!(g3_unrouted > 0, "the fixture has binary rows on CMT 3");
+    assert_eq!(rec_unrouted, 0, "no routing ⇒ no discrete records");
+    assert_eq!(
+        g3_routed, 0,
+        "routed ⇒ CMT 3 is never a Gaussian observation"
+    );
+    assert_eq!(
+        rec_routed, g3_unrouted,
+        "every CMT-3 row moves from the Gaussian grid to obs_records, none is lost"
+    );
+}

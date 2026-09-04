@@ -132,6 +132,12 @@ many covariates the improvement can be dramatic.
 
 - Categorical covariates are binarized (one-hot encoded) before the FREM
   transformation.
-- TTE + FREM combination is not yet supported.
+- FREM is defined for Gaussian endpoints only. A model with a non-Gaussian
+  endpoint (`[event_model]`, `[binary_model]`, a Markov block) is refused by
+  `prepare_frem()` / `transform_dataset_for_frem()` with
+  `E_FREM_NON_GAUSSIAN_ENDPOINT`: the transformed dataset is written from the
+  Gaussian rows only, so the endpoint's rows would be lost. Run the FREM step on
+  the PK model without that block
+  ([#1199](https://github.com/FeRx-NLME/ferx-core/issues/1199)).
 - The `prepare_frem()` API handles the full transformation; manual FREM model
   construction is not recommended.

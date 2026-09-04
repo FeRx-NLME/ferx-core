@@ -19,7 +19,27 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Fixed
+- **A joint PK-TTE (or binary / Markov) model fed a population read without the model
+  is now a hard error instead of a silently wrong fit (#1199).** `read_nonmem_csv()` knows
+  no model, so a dataset read through it carried the endpoint's rows as Gaussian
+  observations and no event records; `fit()` then ran the Gaussian half only and reported a
+  plausible, finite, wrong objective, `predict()` returned a concentration for the event
+  row, and `simulate()` drew no events. `fit()`, `simulate()` and `predict()` now reject
+  that population with `E_ENDPOINT_UNROUTED` (naming the CMT and `read_population_for()`),
+  and `fit()` / `ferx check` reject a routed population whose declared endpoint has no rows
+  at all — typically a missing `CMT` column — with `E_ENDPOINT_NO_RECORDS`. The same guard
+  covers `predict_categorical()`, `run_covariance()` and `run_sir()`; the last two now also
+  re-read `fit.data_path` routed by the model (the path the R wrapper's `ferx_covariance()` /
+  `ferx_sir()` take), instead of computing the covariance step or SIR on the Gaussian half
+  of a joint likelihood. The `.fitrx` reload (`load_fit`, used by the CLI) routes the
+  bundled data by the bundled model too, so a reloaded joint fit keeps its event records.
+
 ### Changed
+- **FREM prep refuses a model with a non-Gaussian endpoint (#1199).** `prepare_frem()` /
+  `transform_dataset_for_frem()` return `E_FREM_NON_GAUSSIAN_ENDPOINT` instead of writing
+  a dataset from the Gaussian rows alone; run the FREM step on the PK model without the
+  endpoint block.
 - **`block_sigma` now estimates its off-diagonal correlation (#847).** A plain
   `block_sigma (...) = [...]` is NONMEM `$SIGMA BLOCK(n)`: its diagonal SDs *and* its
   off-diagonal correlation are estimated. Previously the correlation was always frozen at the

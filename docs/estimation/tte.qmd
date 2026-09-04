@@ -137,6 +137,14 @@ ID,TIME,DV,EVID,CMT
 1,10.0, 2, 0, 2   # right bound  →  event occurred in (5, 10]
 ```
 
+**Loading the data.** The event rows are recognised *by the model*: read the
+dataset with `read_population_for(&model, …)` (the R entry points and the CLI do),
+not with the model-blind `read_nonmem_csv()`. A population read without the model
+carries the event rows as Gaussian observations and no event records, and `fit()`
+refuses it with `E_ENDPOINT_UNROUTED`; a dataset whose event CMT has no rows at
+all — usually a missing `CMT` column — is refused with `E_ENDPOINT_NO_RECORDS`.
+See the [check report codes](../file-formats/check-report.qmd#codes-data-and-dosing).
+
 ### Left truncation (delayed entry)
 
 If subjects enter the study at a time > 0 (e.g. they survived until enrolment),

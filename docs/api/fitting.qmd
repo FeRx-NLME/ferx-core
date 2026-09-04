@@ -19,7 +19,7 @@ pub fn fit(
 
 **Parameters:**
 - `model`: Compiled model from `parse_model_file()` or `parse_full_model_file()`
-- `population`: Population data from `read_nonmem_csv()`
+- `population`: Population data from `read_population_for()` (or `read_nonmem_csv()` for a Gaussian-only model — see [Parsing](parsing.qmd#read_nonmem_csv))
 - `init_params`: Initial parameter values
 - `options`: Estimation configuration
 
@@ -27,8 +27,10 @@ pub fn fit(
 
 **Example:**
 ```rust
+use ferx_core::api::read_population_for;
+
 let model = parse_model_file(Path::new("model.ferx"))?;
-let population = read_nonmem_csv(Path::new("data.csv"), None)?;
+let (population, _) = read_population_for(&model, &None, "data.csv", None, None, None, &[])?;
 let options = FitOptions::default();
 
 let result = fit(&model, &population, &model.default_params, &options)?;
@@ -272,6 +274,8 @@ pub fn build_fit_inputs(
 let parsed = parse_full_model_file(Path::new("model.ferx"))?;
 let (init_params, options) = build_fit_inputs(&parsed)?;
 
-let population = read_nonmem_csv(Path::new("data.csv"), None)?;
+let (population, _) = read_population_for(
+    &parsed.model, &parsed.covariate_decls, "data.csv", None, None, None, &[],
+)?;
 let result = fit(&parsed.model, &population, &init_params, &options)?;
 ```
