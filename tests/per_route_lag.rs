@@ -662,18 +662,36 @@ fn per_route_lag_fit_recovers_lag() {
     // "omega is identifiable" apart from "the #1205 demotion rule stopped firing" — a change
     // to `RunawayGuardHit::is_runaway` would flip the boolean back to true with ETA_CL still
     // pinned at +6, and every other assertion here would still pass.
+    //
+    // Key on the per-hit `verdict`, NOT on the category: `ParameterAtRunawayGuard` carries
+    // both verdicts, and one *collapse* here is expected and correct. The data are noise-free,
+    // so the residual SD has nothing to estimate and PROP_ERR walks to its `-8` floor — which
+    // #1205 deliberately leaves as a `Warning` that does not demote `converged`. Whether it
+    // gets all the way there is platform-dependent (macOS stops around 0.0153, Linux CI
+    // reaches 3e-4), so asserting no guard hit at all is both wrong and flaky. `runaway` is
+    // the verdict that means an estimate is held at a rail, and it is the one #1227 is about.
+    let runaways: Vec<&str> = fitted
+        .warnings_structured
+        .iter()
+        .filter(|w| w.category == WarningCode::ParameterAtRunawayGuard)
+        .filter(|w| {
+            w.details
+                .as_ref()
+                .and_then(|d| d.get("parameters"))
+                .and_then(|p| p.as_array())
+                .map(|hits| {
+                    hits.iter()
+                        .any(|h| h.get("verdict").and_then(|v| v.as_str()) == Some("runaway"))
+                })
+                // No structured payload to read: fall back to the message token
+                // `classify_warning` keys on, rather than silently passing.
+                .unwrap_or_else(|| w.message.contains("guard, runaway"))
+        })
+        .map(|w| w.message.as_str())
+        .collect();
     assert!(
-        !fitted
-            .warnings_structured
-            .iter()
-            .any(|w| w.category == WarningCode::ParameterAtRunawayGuard),
-        "no estimate should sit at an internal guard; got: {:?}",
-        fitted
-            .warnings_structured
-            .iter()
-            .filter(|w| w.category == WarningCode::ParameterAtRunawayGuard)
-            .map(|w| w.message.as_str())
-            .collect::<Vec<_>>()
+        runaways.is_empty(),
+        "no estimate should be held at an internal rail; got: {runaways:?}"
     );
     // Pin the disposition too, not just the lag (#1227). What is measured, twice, on the same
     // noise-free data: with omega free the fit ends at the +6 rail and TVCL / TVV / TVKA come
