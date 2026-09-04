@@ -361,6 +361,16 @@ fn a_lagged_mid_record_ss_dose_keeps_the_hazard_and_matches_nonmem() {
     let mut worst_pred = 0.0f64;
     let mut compared_pred = 0usize;
     for (t, ipred, chz, haz) in reference {
+        // The *reference* side is checked for finiteness too, not only ferx's. `"NaN".parse::
+        // <f64>()` succeeds in Rust, so a `NaN` cell in the table would not shift columns and
+        // would not trip the grid check above — it would make the quotient `NaN`, and
+        // `worst.max(NaN)` returns `worst`, silently dropping that record from the bound. The
+        // arm would then pass on the strength of the records that happened to parse.
+        assert!(
+            ipred.is_finite() && chz.is_finite() && haz.is_finite(),
+            "the reference table carries a non-finite value at t={t}: \
+             IPRED={ipred}, CHZ={chz}, HAZ={haz}"
+        );
         // IPRED first, and separately: if the PK disagrees the fixture is not a twin of the
         // train, and the hazard comparison downstream of it would be meaningless. This is the
         // control that caught r3's first draft (`PRED = 0.132` against the train's `4.837`).
