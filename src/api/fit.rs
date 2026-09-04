@@ -2366,6 +2366,8 @@ fn fit_inner(
         // follow-up). `None` for estimators that don't pack in Cholesky space.
         packed_estimate: result.packed_estimate,
         left_init: result.left_init,
+        omega_is_diagonal: Some(result.params.omega.diagonal),
+        kappa_is_diagonal: result.params.omega_iov.as_ref().map(|m| m.diagonal),
         se_theta,
         se_omega,
         se_sigma,

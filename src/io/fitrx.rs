@@ -166,6 +166,12 @@ struct FitWire {
     // estimates against `theta_init` & co.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     left_init: Option<bool>,
+    // The packed Ω / κ layout (#1177); absent on older bundles, which then
+    // read their covariance matrix as stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    omega_is_diagonal: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kappa_is_diagonal: Option<bool>,
     #[serde(default)]
     sigma_init: Vec<f64>,
     #[serde(default)]
@@ -680,6 +686,8 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         theta_init: r.theta_init.clone(),
         omega_init: Some(MatrixWire::from(&r.omega_init)),
         left_init: r.left_init,
+        omega_is_diagonal: r.omega_is_diagonal,
+        kappa_is_diagonal: r.kappa_is_diagonal,
         sigma_init: r.sigma_init.clone(),
         obs_time_range: r.obs_time_range,
         final_gradient: r.final_gradient.clone(),
@@ -1986,6 +1994,8 @@ fn wire_to_fit_result(
         // optimizer packed vector, so `run_covariance` re-packs from omega (#816).
         packed_estimate: None,
         left_init: w.left_init,
+        omega_is_diagonal: w.omega_is_diagonal,
+        kappa_is_diagonal: w.kappa_is_diagonal,
     })
 }
 
@@ -2557,6 +2567,8 @@ mod tests {
             sigma_random: false,
         };
         r.left_init = Some(false);
+        r.omega_is_diagonal = Some(false);
+        r.kappa_is_diagonal = Some(true);
         assert_ne!(r.bic_inputs, crate::types::BicInputs::default());
         let p = dummy_population(&["S1", "S2"], 3);
         save_fit(&r, &p, "model source\n", &path, SaveFitOptions::default()).unwrap();
@@ -2564,6 +2576,8 @@ mod tests {
         let l = load_fit(&path).unwrap().fit;
         assert_eq!(l.bic_inputs, r.bic_inputs);
         assert_eq!(l.left_init, Some(false));
+        assert_eq!(l.omega_is_diagonal, Some(false));
+        assert_eq!(l.kappa_is_diagonal, Some(true));
         // And the loaded bundle ranks: the tally partitions `n_parameters`.
         assert!(
             crate::model_selection::bic(&l, crate::model_selection::BicType::Mixed).is_finite()
@@ -2583,9 +2597,13 @@ mod tests {
         // `left_init` is skipped when `None`; simulate an explicit old bundle
         // by making sure it is absent either way.
         obj.remove("left_init");
+        obj.remove("omega_is_diagonal");
+        obj.remove("kappa_is_diagonal");
         let reloaded: FitWire = serde_json::from_value(value).unwrap();
         assert_eq!(reloaded.bic_inputs, crate::types::BicInputs::default());
         assert_eq!(reloaded.left_init, None);
+        assert_eq!(reloaded.omega_is_diagonal, None);
+        assert_eq!(reloaded.kappa_is_diagonal, None);
 
         let mut old = r.clone();
         old.bic_inputs = reloaded.bic_inputs;

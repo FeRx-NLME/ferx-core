@@ -462,6 +462,8 @@ mod tests {
             exclusions: None,
             packed_estimate: None,
             left_init: None,
+            omega_is_diagonal: None,
+            kappa_is_diagonal: None,
         }
     }
 

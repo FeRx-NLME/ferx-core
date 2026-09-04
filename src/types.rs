@@ -5900,6 +5900,19 @@ pub struct FitResult {
     /// bundle saved before it was recorded.
     #[serde(default)]
     pub left_init: Option<bool>,
+    /// Whether the BSV Ω was estimated as a diagonal (`omega NAME ~ v`, one
+    /// packed coordinate per η) or a full Cholesky block (`block_omega`, a
+    /// lower triangle) — the packed layout of `covariance_matrix`, which the
+    /// result otherwise does not record. `None` on a `.fitrx` bundle saved
+    /// before it was recorded and on hand-built results; consumers that need
+    /// the layout (`crate::natural_scale_covariance`) then leave the matrix as
+    /// stored rather than guess it from the matrix size.
+    #[serde(default)]
+    pub omega_is_diagonal: Option<bool>,
+    /// The same for the IOV κ block (`omega_iov`): `Some` when the fit has
+    /// one, `None` without IOV or when unrecorded.
+    #[serde(default)]
+    pub kappa_is_diagonal: Option<bool>,
     /// True when this result was reconstructed from a `.fitrx` checkpoint by
     /// [`crate::io::fitrx::load_fit`] rather than produced by a live fit.
     ///

@@ -1728,14 +1728,24 @@ fn yaml_quote(s: &str) -> String {
 }
 
 /// Whether the fit's Ω and κ blocks are packed as diagonals or full Cholesky
-/// lower triangles, as `(omega_diagonal, kappa_diagonal)`, inferred from the
-/// size `n` of a packed-space matrix on the result (its covariance matrix).
+/// lower triangles, as `(omega_diagonal, kappa_diagonal)`.
 ///
-/// `FitResult` does not record the structure, so it is read off the count of
-/// packed coordinates left after θ and σ. Known ambiguity: when
-/// `n_eta == n_kappa > 1` and exactly one of the two is a block, both
-/// assignments give the same count and the block is assumed to be Ω.
+/// Read from `FitResult::omega_is_diagonal` / `kappa_is_diagonal` when the
+/// fit recorded them (#1177). A bundle saved before that, or a hand-built
+/// result, falls back to inferring the layout from the size `n` of a
+/// packed-space matrix on the result (its covariance matrix) — the count of
+/// coordinates left after θ and σ — which is a guess: it ignores any trailing
+/// mixture-override / `block_sigma` coordinates, and when `n_eta == n_kappa >
+/// 1` with exactly one of the two a block, both assignments give the same
+/// count and the block is assumed to be Ω. Labels only; nothing that gates a
+/// candidate reads the inferred layout.
 pub(crate) fn packed_layout(result: &FitResult, n: usize) -> (bool, bool) {
+    if let Some(od) = result.omega_is_diagonal {
+        let kd = result
+            .kappa_is_diagonal
+            .unwrap_or(result.kappa_names.len() <= 1);
+        return (od, kd);
+    }
     let n_theta = result.theta_names.len();
     let n_eta = result.omega.nrows();
     let n_sigma = result.sigma_names.len();
@@ -2780,6 +2790,8 @@ mod tests {
             exclusions: None,
             packed_estimate: None,
             left_init: None,
+            omega_is_diagonal: None,
+            kappa_is_diagonal: None,
         }
     }
 
@@ -3485,6 +3497,8 @@ mod tests {
             exclusions: None,
             packed_estimate: None,
             left_init: None,
+            omega_is_diagonal: None,
+            kappa_is_diagonal: None,
         }
     }
 

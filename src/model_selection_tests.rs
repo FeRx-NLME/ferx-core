@@ -553,6 +553,7 @@ fn block_omega_fit() -> FitResult {
     let mut r = clean_fit();
     // L = [[0.3, 0], [-0.04, 0.2]] → Ω = L Lᵀ.
     r.omega = DMatrix::from_row_slice(2, 2, &[0.09, -0.012, -0.012, 0.0416]);
+    r.omega_is_diagonal = Some(false);
     r.omega_init = r.omega.clone() * 0.5;
     // 3 θ + 3 Cholesky + 1 σ; packed variances 0.01, one 0.99 correlation
     // between packed coordinates 4 (L₂₁) and 5 (ln L₂₂).
@@ -603,11 +604,78 @@ fn max_correlation_reads_block_omega_on_the_natural_scale() {
     );
 }
 
+/// The layout is read from the result, never inferred from the matrix size:
+/// the packed vector also carries `block_sigma` ρ (and mixture-override)
+/// coordinates after κ, so "coordinates left after θ and σ" is not the Ω
+/// count. Two diagonal η plus one free ρ leaves three — a guess would embed a
+/// 3×3 Cholesky Jacobian over the two Ω coordinates and the ρ.
+#[test]
+fn natural_scale_covariance_is_not_fooled_by_trailing_rho_coordinates() {
+    let mut r = clean_fit();
+    r.omega_is_diagonal = Some(true);
+    // 3 θ + 2 diagonal Ω + 1 σ + 1 ρ = 7, with a strong correlation between
+    // the second Ω coordinate and the ρ.
+    let mut cov = DMatrix::<f64>::identity(7, 7) * 0.01;
+    cov[(4, 6)] = 0.99 * 0.01;
+    cov[(6, 4)] = 0.99 * 0.01;
+    r.covariance_matrix = Some(cov.clone());
+    assert_eq!(natural_scale_covariance(&r).unwrap(), cov);
+    assert!((max_abs_correlation(&r).unwrap() - 0.99).abs() < 1e-12);
+    // Without the recorded layout the matrix is also left as stored — an old
+    // bundle is never transformed on a guess.
+    r.omega_is_diagonal = None;
+    assert_eq!(natural_scale_covariance(&r).unwrap(), cov);
+}
+
+/// Diagonal Ω with a same-size block κ: the size-based guess (Ω assumed to be
+/// the block) would transform the Ω coordinates and leave κ on the Cholesky
+/// scale. With the layout recorded, the κ segment — after θ, Ω and σ — is the
+/// one transformed, with the same straddle as the block-Ω fixture.
+#[test]
+fn natural_scale_covariance_transforms_a_block_kappa_beside_a_diagonal_omega() {
+    let mut r = clean_fit();
+    r.omega_is_diagonal = Some(true);
+    r.kappa_names = vec!["KAPPA_CL".into(), "KAPPA_V".into()];
+    r.kappa_fixed = vec![false, false];
+    r.omega_iov = Some(DMatrix::from_row_slice(
+        2,
+        2,
+        &[0.09, -0.012, -0.012, 0.0416],
+    ));
+    r.kappa_is_diagonal = Some(false);
+    // 3 θ + 2 Ω + 1 σ + 3 κ Cholesky = 9; κ coordinates 6, 7, 8.
+    let mut cov = DMatrix::<f64>::identity(9, 9) * 0.01;
+    cov[(7, 8)] = 0.99 * 0.01;
+    cov[(8, 7)] = 0.99 * 0.01;
+    r.covariance_matrix = Some(cov.clone());
+    let natural = natural_scale_covariance(&r).unwrap();
+    // θ / Ω / σ untouched …
+    assert_eq!(natural.view((0, 0), (6, 6)), cov.view((0, 0), (6, 6)));
+    // … κ transformed: the straddle from the block-Ω fixture, on κ.
+    let packed = max_abs_corr_of(&cov);
+    let natural_r = max_abs_corr_of(&natural);
+    assert!(packed > 0.95 && natural_r < 0.95, "{packed} vs {natural_r}");
+    let want = (2.0 * 0.09_f64).powi(2) * 0.01;
+    assert!((natural[(6, 6)] - want).abs() < 1e-12);
+    // The gate names the pair by its κ packed name.
+    r.covariance_matrix = Some(cov);
+    r.kappa_is_diagonal = None; // unrecorded κ layout: κ left as stored → fails
+    let v = check_strictness(
+        &r,
+        &Strictness {
+            max_correlation: Some(0.95),
+            ..Strictness::none()
+        },
+    );
+    assert!(!v.passed && v.failures[0].contains("KAPPA_V"), "{v:?}");
+}
+
 #[test]
 fn natural_scale_covariance_is_the_stored_matrix_without_a_block_omega() {
     // Diagonal Ω: every coordinate is a monotone function of one packed
     // coordinate, so nothing is transformed and correlations are unchanged.
     let mut r = clean_fit();
+    r.omega_is_diagonal = Some(true);
     let mut cov = DMatrix::<f64>::identity(6, 6) * 0.02;
     cov[(0, 3)] = 0.01;
     cov[(3, 0)] = 0.01;
@@ -711,6 +779,7 @@ fn stalled_at_init_reports_a_fully_fixed_fit_as_not_stalled() {
     r.theta_fixed = vec![true; 3];
     r.omega_fixed = vec![true; 2];
     r.sigma_fixed = vec![true];
+    r.n_parameters = 0;
     assert_eq!(stalled_at_init(&r), Some(false));
     // The optimizer's own test reads "did not move" on an empty vector; the
     // free-parameter check comes first.
@@ -718,6 +787,33 @@ fn stalled_at_init_reports_a_fully_fixed_fit_as_not_stalled() {
     assert_eq!(stalled_at_init(&r), Some(false));
     let v = check_strictness(&r, &Strictness::default());
     assert!(v.passed, "{v:?}");
+}
+
+/// The θ/Ω/σ masks are not the whole packed vector: a model can fix all of
+/// them and still estimate a κ, a mixture override or a `block_sigma`
+/// correlation. The no-free shortcut must read `n_parameters`, and with no
+/// initials for those segments the optimizer's verdict is the only reading.
+#[test]
+fn stalled_at_init_with_free_parameters_outside_the_base_masks_defers_to_the_optimizer() {
+    let mut r = minimal_fit_result();
+    r.theta_init = r.theta.clone();
+    r.omega_init = r.omega.clone();
+    r.sigma_init = r.sigma.clone();
+    r.theta_fixed = vec![true; 3];
+    r.omega_fixed = vec![true; 2];
+    r.sigma_fixed = vec![true];
+    r.n_parameters = 1; // one free κ
+    r.left_init = Some(false);
+    assert_eq!(stalled_at_init(&r), Some(true));
+    let v = check_strictness(&r, &Strictness::default());
+    assert!(!v.passed, "{v:?}");
+    r.left_init = Some(true);
+    assert_eq!(stalled_at_init(&r), Some(false));
+    // No verdict recorded and nothing comparable: skipped, not passed.
+    r.left_init = None;
+    assert_eq!(stalled_at_init(&r), None);
+    let v = check_strictness(&r, &Strictness::default());
+    assert!(v.passed && v.skipped.len() == 1, "{v:?}");
 }
 
 /// The optimizer's `INIT_ESCAPE_STEP_S` test runs in its scaled packed space,

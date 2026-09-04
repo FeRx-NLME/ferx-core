@@ -368,6 +368,8 @@ pub(crate) fn empty_fit_result() -> FitResult {
         packed_estimate: None,
         bic_inputs: BicInputs::default(),
         left_init: None,
+        omega_is_diagonal: None,
+        kappa_is_diagonal: None,
     }
 }
 
@@ -512,6 +514,8 @@ pub(crate) fn minimal_fit_result() -> FitResult {
         exclusions: None,
         packed_estimate: None,
         left_init: None,
+        omega_is_diagonal: Some(true),
+        kappa_is_diagonal: None,
     }
 }
 

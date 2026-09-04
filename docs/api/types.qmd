@@ -144,6 +144,9 @@ pub struct FitResult {
     pub n_subjects: usize,
     pub n_parameters: usize,      // free packed coordinates (FIX and structural zeros excluded)
     pub bic_inputs: BicInputs,    // free-parameter tally by Delattre class, for `bic()`
+    pub left_init: Option<bool>,  // the outer optimizer's own init-escape verdict (#751); NLopt loop only
+    pub omega_is_diagonal: Option<bool>, // packed layout of Ω (diagonal vs `block_omega`); None on older bundles
+    pub kappa_is_diagonal: Option<bool>, // same for the IOV κ block
     pub n_iterations: usize,
     pub interaction: bool,
     pub warnings: Vec<String>,

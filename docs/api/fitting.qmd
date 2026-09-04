@@ -200,7 +200,11 @@ since they accept ETA directly: `scale = TVSCALE * exp(ETA_SCALE)` in a TTE-only
 model with no `[individual_parameters]` makes `TVSCALE` random-class, the same
 as writing that line as an individual parameter. (A θ that meets its η only in a
 Form-C `y = …` readout or an `[odes]` hazard line is not seen and stays
-fixed-class.) The tally is recorded on `FitResult::bic_inputs` at fit time, so a
+fixed-class.) A `[covariate_nn]`'s weights are θ too: an output head read
+through an η-bearing parameter (`CL = TYPICAL_PK.CL * exp(ETA_CL)`) makes the
+shared hidden-layer weights and that head's row and bias random-class, while
+another head's own weights stay fixed-class. The tally is recorded on
+`FitResult::bic_inputs` at fit time, so a
 `.fitrx` bundle can be ranked without re-parsing the model; a bundle saved
 before the tally existed gets `NaN` rather than a wrong penalty.
 
@@ -239,9 +243,9 @@ if !verdict.passed {
 | `require_converged` | `true` | `converged == false` (also covers an internal runaway-guard hit, which demotes `converged`) |
 | `require_covariance` | `false` | the covariance step did not run or failed. A SIR fallback that delivered credible intervals is accepted — unless its importance weights collapsed onto a single draw (Kish ESS below 2, every interval of zero width), which fails like a failed step; an accepted fallback stores no matrix, so the threshold gates below then report `skipped` |
 | `max_condition_number` | `Some(1000)` | `cov_condition_number` exceeds it (∞ for a singular correlation matrix) |
-| `max_correlation` | `Some(0.95)` | any off-diagonal of the covariance's correlation form exceeds it in absolute value — the whole matrix, not just θ, read on the natural scale (a `block_omega` segment is mapped off its Cholesky coordinates by the delta method first, so the number is the ω correlation NONMEM's `.cor` would show); the offending pair is named by its packed coordinate (`CL ~ log_chol_ETA_CL`) |
+| `max_correlation` | `Some(0.95)` | any off-diagonal of the covariance's correlation form exceeds it in absolute value — the whole matrix, not just θ, read on the natural scale (a `block_omega` / block-κ segment is mapped off its Cholesky coordinates by the delta method first, so the number is the ω correlation NONMEM's `.cor` would show — the layout comes from `FitResult::omega_is_diagonal` / `kappa_is_diagonal`, and a bundle saved before those were recorded is read as stored); the offending pair is named by its packed coordinate (`CL ~ log_chol_ETA_CL`) |
 | `reject_on_boundary` | `true` | a θ is pinned to a declared bound — the same predicate `bootstrap`'s `skip_estimate_near_boundary` applies |
-| `reject_init_stall` | `true` | the fit never left its initial estimates (the #751 signature): the outer optimizer's own escape verdict when the result carries it (`FitResult::left_init`, recorded by the NLopt outer loop), otherwise no free θ/Ω/σ moved more than 1 % of its initial value. This assumes a **cold start** — a candidate warm-started from its parent's estimates legitimately converges where it began, so turn the gate off for such a search |
+| `reject_init_stall` | `true` | the fit never left its initial estimates (the #751 signature): the outer optimizer's own escape verdict when the result carries it (`FitResult::left_init`, recorded by the NLopt outer loop), otherwise no free θ/Ω/σ moved more than 1 % of its initial value; a fit with `n_parameters == 0` cannot stall, and one whose only free coordinates are κ / mixture / `block_sigma` entries with no optimizer verdict is `skipped`. This assumes a **cold start** — a candidate warm-started from its parent's estimates legitimately converges where it began, so turn the gate off for such a search |
 
 The two thresholds are evaluated only when their input exists — a fit without a
 covariance matrix has no condition number to test. Such a case lands in

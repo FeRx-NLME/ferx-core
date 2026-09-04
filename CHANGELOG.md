@@ -61,8 +61,9 @@ section of the SDLC for the versioning policy).
   condition number, parameter correlation, boundary estimates, and the #751 init stall — and
   returns the named reason for every failed gate, so a search report can say *why* a
   candidate was excluded. `FitResult` also gains `left_init`, the outer optimizer's own
-  init-escape verdict (round-trips through `.fitrx`), which `stalled_at_init` prefers to its
-  natural-scale comparison. `bootstrap`'s `skip_estimate_near_boundary` and its
+  init-escape verdict, which `stalled_at_init` prefers to its natural-scale comparison, and
+  `omega_is_diagonal` / `kappa_is_diagonal`, the packed Ω / κ layout the correlation gate needs
+  to read a `block_omega` on the natural scale (all three round-trip through `.fitrx`). `bootstrap`'s `skip_estimate_near_boundary` and its
   covariance-step tally now use the same `estimate_near_boundary` / `require_covariance`
   predicates, and its replicates no longer run the `covariance_fallback = sir` pass.
 - **Fitted `block_sigma` correlations are reported with their fixedness and standard error

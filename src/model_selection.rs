@@ -418,7 +418,9 @@ pub fn check_strictness(result: &FitResult, s: &Strictness) -> StrictnessVerdict
             )),
             Some(false) => {}
             None => v.skipped.push(
-                "init stall: result carries no initial estimates to compare against".to_string(),
+                "init stall: result carries no initial estimates (or no optimizer verdict) \
+                 to compare against"
+                    .to_string(),
             ),
         }
     }
@@ -465,29 +467,43 @@ pub const INIT_STALL_REL_TOL: f64 = 1e-2;
 /// fit whose OFV is the OFV *of the initial estimates* and says nothing about
 /// the model — surfaced as a named predicate on the result.
 ///
-/// Reads `FitResult::left_init`, the outer optimizer's own escape test, when
-/// the fit recorded one. Otherwise (an older `.fitrx` bundle, an estimator
-/// that does not run the test) it compares the estimates against the initial
-/// values: stalled when no free θ, Ω or σ moved by more than
-/// [`INIT_STALL_REL_TOL`] of its initial value (or by more than that tolerance
-/// in absolute terms when the initial value is exactly zero, the
-/// identity-packed case). Fixed parameters are ignored; a fit with no free
-/// parameter at all cannot stall and reports `Some(false)`. IOV κ variances
-/// are not compared (the result carries no κ initials).
+/// A fit with no free parameter at all (`n_parameters == 0`) cannot stall and
+/// reports `Some(false)`. Otherwise it reads `FitResult::left_init`, the outer
+/// optimizer's own escape test over every packed coordinate, when the fit
+/// recorded one. Otherwise (an older `.fitrx` bundle, an estimator that does
+/// not run the test) it compares the estimates against the initial values:
+/// stalled when no free θ, Ω or σ moved by more than [`INIT_STALL_REL_TOL`]
+/// of its initial value (or by more than that tolerance in absolute terms when
+/// the initial value is exactly zero, the identity-packed case). Fixed
+/// parameters are ignored. IOV κ, mixture-override and `block_sigma`
+/// coordinates are not compared (the result carries no initials for them), so
+/// a fit whose only free coordinates live there and that recorded no
+/// optimizer verdict is `None` rather than a guess.
 ///
 /// Both readings are relative to where the fit *started*, which for a
 /// warm-started candidate is not the model file — see
 /// [`Strictness::reject_init_stall`].
 ///
-/// `None` when the result carries no comparable initial estimates: a `.fitrx`
-/// bundle saved before they were recorded, or shape-mismatched vectors.
+/// `None` when the result carries nothing to judge by: no comparable initial
+/// estimates (a `.fitrx` bundle saved before they were recorded, or
+/// shape-mismatched vectors), or free coordinates only in segments it has no
+/// initials for.
 pub fn stalled_at_init(result: &FitResult) -> Option<bool> {
+    // Nothing free cannot stall. `n_parameters` counts every packed segment,
+    // unlike the θ/Ω/σ masks below — and the optimizer's own test reads "did
+    // not move" on an empty vector, so this has to come first.
+    if result.n_parameters == 0 {
+        return Some(false);
+    }
     let shapes_ok = result.theta_init.len() == result.theta.len()
         && result.sigma_init.len() == result.sigma.len()
         && result.omega_init.shape() == result.omega.shape()
         && !(result.theta.is_empty() && result.sigma.is_empty() && result.omega.is_empty());
     if !shapes_ok {
         return None;
+    }
+    if let Some(left) = result.left_init {
+        return Some(!left);
     }
     let moved = |x: f64, x0: f64| -> bool {
         let d = (x - x0).abs();
@@ -499,8 +515,6 @@ pub fn stalled_at_init(result: &FitResult) -> Option<bool> {
     };
     let is_fixed = |mask: &[bool], i: usize| mask.get(i).copied().unwrap_or(false);
 
-    // Nothing free cannot stall — and the optimizer's own test reads "did not
-    // move" on an empty vector, so this has to come first.
     let mut saw_free = false;
     let mut any_moved = false;
     for (i, (&x, &x0)) in result.theta.iter().zip(&result.theta_init).enumerate() {
@@ -527,10 +541,9 @@ pub fn stalled_at_init(result: &FitResult) -> Option<bool> {
         }
     }
     if !saw_free {
-        return Some(false);
-    }
-    if let Some(left) = result.left_init {
-        return Some(!left);
+        // Free coordinates exist (`n_parameters > 0`) but only in segments
+        // with no recorded initials: nothing to judge by.
+        return None;
     }
     Some(!any_moved)
 }
@@ -560,18 +573,28 @@ pub fn max_abs_correlation(result: &FitResult) -> Option<f64> {
 /// every other coordinate left as stored.
 ///
 /// The untouched coordinates are each a monotone function of exactly one
-/// packed coordinate (`θ = exp(x)` or identity, `σ = exp(x)`, `ω_ii = L_ii²`),
-/// whose Jacobian is diagonal and cancels out of a correlation — so for a fit
-/// with no block Ω this is the stored matrix and the correlations are already
-/// natural-scale. `None` without a covariance matrix.
+/// packed coordinate (`θ = exp(x)` or identity, `σ = exp(x)`, `ω_ii = L_ii²`,
+/// a `block_sigma` Fisher-z `ρ`), whose Jacobian is diagonal and cancels out
+/// of a correlation — so for a fit with no block Ω this is the stored matrix
+/// and the correlations are already natural-scale.
+///
+/// Which segments are blocks is read from `FitResult::omega_is_diagonal` /
+/// `kappa_is_diagonal`, never inferred from the matrix size (the packed
+/// vector also carries mixture-override and `block_sigma` coordinates, and a
+/// guessed layout would embed the Jacobian over the wrong coordinates). A
+/// result that did not record the layout — a `.fitrx` bundle saved before
+/// #1177, a hand-built result — is returned as stored, packed scale and all.
+/// `None` without a covariance matrix.
 pub fn natural_scale_covariance(result: &FitResult) -> Option<DMatrix<f64>> {
     let cov = result.covariance_matrix.as_ref()?;
     let n = cov.nrows().min(cov.ncols());
-    let (omega_diagonal, kappa_diagonal) = crate::io::output::packed_layout(result, n);
+    let cov = cov.view((0, 0), (n, n));
+    let Some(omega_diagonal) = result.omega_is_diagonal else {
+        return Some(cov.into_owned());
+    };
     let n_theta = result.theta_names.len();
     let n_eta = result.omega.nrows();
     let n_sigma = result.sigma_names.len();
-    let n_kappa = result.kappa_names.len();
     let n_omega = omega_packed_len(n_eta, omega_diagonal);
 
     let mut j = DMatrix::<f64>::identity(n, n);
@@ -587,12 +610,10 @@ pub fn natural_scale_covariance(result: &FitResult) -> Option<DMatrix<f64>> {
         j.view_mut((start, start), (len, len)).copy_from(&block);
     };
     embed(n_theta, &result.omega, omega_diagonal);
-    if n_kappa > 0 {
-        if let Some(iov) = result.omega_iov.as_ref() {
-            embed(n_theta + n_omega + n_sigma, iov, kappa_diagonal);
-        }
+    if let (Some(iov), Some(kappa_diagonal)) = (result.omega_iov.as_ref(), result.kappa_is_diagonal)
+    {
+        embed(n_theta + n_omega + n_sigma, iov, kappa_diagonal);
     }
-    let cov = cov.view((0, 0), (n, n));
     Some(&j * cov * j.transpose())
 }
 

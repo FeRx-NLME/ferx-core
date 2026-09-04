@@ -125,7 +125,7 @@ fn negsum_level_group_is_half_open_and_does_not_capture_the_next_theta() {
         Statement::Assign("KA".into(), Expression::Theta(2)),
     ];
     assert_eq!(
-        classify_theta_eta_linked(&stmts, 3),
+        classify_theta_eta_linked(&stmts, 3, &[]),
         [true, true, false],
         "θ2 is declared after the level group and never meets an η"
     );
@@ -142,7 +142,63 @@ fn negsum_level_group_is_half_open_and_does_not_capture_the_next_theta() {
         "CL".into(),
         Expression::BinOp(Box::new(gather), BinOp::Mul, Box::new(Expression::Eta(0))),
     )];
-    assert_eq!(classify_theta_eta_linked(&stmts, 3), [false, true, false]);
+    assert_eq!(
+        classify_theta_eta_linked(&stmts, 3, &[]),
+        [false, true, false]
+    );
+}
+
+/// A `[covariate_nn]`'s weights are registered as θ after the declared ones,
+/// and `TYPICAL_PK.CL * exp(ETA_CL)` reads them through `Expression::NnOutput`,
+/// which names no θ index itself. The shared hidden-layer weights and the CL
+/// head's row + bias are random-class; the V head's row + bias (V carries no
+/// η) and the declared `TVKA` stay fixed-class.
+#[cfg(feature = "nn")]
+#[test]
+fn covariate_nn_weights_follow_the_eta_bearing_output_head() {
+    let text = r#"
+[parameters]
+  theta TVKA(1.0, 0.001, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[covariate_nn TYPICAL_PK]
+  inputs = [WT, CRCL]
+  outputs = [CL, V]
+  layers = [3]
+  activation = tanh
+  output = softplus
+
+[individual_parameters]
+  CL = TYPICAL_PK.CL * exp(ETA_CL)
+  V  = TYPICAL_PK.V
+  KA = TVKA
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+    let model = parse_model_string(text).expect("nn model parses");
+    // 1 declared θ + 17 weights (2→3→2: W_1 6 + b_1 3 + W_2 6 + b_2 2).
+    assert_eq!(model.theta_names.len(), 18);
+    assert_eq!(model.covariate_nns[0].weights_offset, 1);
+    let mut want = vec![false; 18];
+    for i in 1..=9 {
+        want[i] = true; // shared hidden layer
+    }
+    for i in [10, 11, 12, 16] {
+        want[i] = true; // CL head: W_2 row 0 and b_2[0]
+    }
+    assert_eq!(model.theta_eta_linked, want, "{:?}", model.theta_names);
+    // And the names agree with the indices: every random-class weight is a
+    // layer-1 weight or a layer-2 `_1_*` (CL) entry.
+    for (name, &linked) in model.theta_names.iter().zip(&model.theta_eta_linked) {
+        let is_cl_head = name.starts_with("W_TYPICAL_PK_2_1_") || name == "B_TYPICAL_PK_2_1";
+        let is_hidden = name.starts_with("W_TYPICAL_PK_1_") || name.starts_with("B_TYPICAL_PK_1_");
+        assert_eq!(linked, is_cl_head || is_hidden, "{name}");
+    }
 }
 
 /// `[event_model]` accepts ETA directly, and the shipped TTE examples use it

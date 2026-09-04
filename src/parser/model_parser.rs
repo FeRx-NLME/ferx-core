@@ -1046,6 +1046,13 @@ fn detect_logit_pattern(expr: &Expression) -> Option<(usize, usize, bool)> {
 /// `[individual_parameters]` at all), and a θ that meets its η only there is
 /// random-class too.
 ///
+/// `nn_theta_deps[nn_idx][output_idx]` lists the absolute θ indices (the
+/// `[covariate_nn]` weights registered as θ) that `Expression::NnOutput`
+/// depends on — every hidden-layer weight plus that head's own row and bias
+/// (`MlpMapper::weight_indices_for_output`), so `CL = TYPICAL_PK.CL *
+/// exp(ETA_CL)` makes the shared and CL-head weights random-class and leaves
+/// an unrelated head's weights fixed-class.
+///
 /// This is the statement-level analogue of Pharmpy's `_categorize_parameters`:
 /// each top-level assignment is expanded through the intermediate assignments
 /// it references (`TVCL = THETA_CL * WT; CL = TVCL * exp(ETA_CL)` makes
@@ -1056,7 +1063,11 @@ fn detect_logit_pattern(expr: &Expression) -> Option<(usize, usize, bool)> {
 /// carries. Variables that are not assigned in the block (covariates, `TIME`)
 /// expand to nothing. Runs before index resolution, so it sees
 /// `Expression::Variable`, never `VariableIdx`.
-fn classify_theta_eta_linked(stmts: &[Statement], n_theta: usize) -> Vec<bool> {
+fn classify_theta_eta_linked(
+    stmts: &[Statement],
+    n_theta: usize,
+    nn_theta_deps: &[Vec<Vec<usize>>],
+) -> Vec<bool> {
     use std::collections::{HashMap, HashSet};
 
     #[derive(Default, Clone)]
@@ -1072,10 +1083,15 @@ fn classify_theta_eta_linked(stmts: &[Statement], n_theta: usize) -> Vec<bool> {
             self.vars.extend(other.vars.iter().cloned());
         }
     }
-    fn note(e: &Expression, d: &mut Deps) {
+    fn note(e: &Expression, d: &mut Deps, nn: &[Vec<Vec<usize>>]) {
         match e {
             Expression::Theta(i) => {
                 d.thetas.insert(*i);
+            }
+            Expression::NnOutput { nn_idx, output_idx } => {
+                if let Some(deps) = nn.get(*nn_idx).and_then(|heads| heads.get(*output_idx)) {
+                    d.thetas.extend(deps.iter().copied());
+                }
             }
             Expression::ThetaGather { spec, .. } => {
                 for rule in &spec.levels {
@@ -1100,15 +1116,20 @@ fn classify_theta_eta_linked(stmts: &[Statement], n_theta: usize) -> Vec<bool> {
             _ => {}
         }
     }
-    fn expr_deps(e: &Expression, d: &mut Deps) {
-        visit_expr_nodes(e, &mut |n| note(n, d));
+    fn expr_deps(e: &Expression, d: &mut Deps, nn: &[Vec<Vec<usize>>]) {
+        visit_expr_nodes(e, &mut |n| note(n, d, nn));
     }
-    fn walk(stmts: &[Statement], ctx: &Deps, map: &mut HashMap<String, Deps>) {
+    fn walk(
+        stmts: &[Statement],
+        ctx: &Deps,
+        map: &mut HashMap<String, Deps>,
+        nn: &[Vec<Vec<usize>>],
+    ) {
         for s in stmts {
             match s {
                 Statement::Assign(name, e) => {
                     let mut d = ctx.clone();
-                    expr_deps(e, &mut d);
+                    expr_deps(e, &mut d, nn);
                     map.entry(name.clone()).or_default().merge(&d);
                 }
                 Statement::If {
@@ -1118,11 +1139,11 @@ fn classify_theta_eta_linked(stmts: &[Statement], n_theta: usize) -> Vec<bool> {
                     // Each branch sees every condition evaluated to reach it.
                     let mut cond_ctx = ctx.clone();
                     for (cond, body) in branches {
-                        visit_condition_nodes(cond, &mut |n| note(n, &mut cond_ctx));
-                        walk(body, &cond_ctx, map);
+                        visit_condition_nodes(cond, &mut |n| note(n, &mut cond_ctx, nn));
+                        walk(body, &cond_ctx, map, nn);
                     }
                     if let Some(eb) = else_body {
-                        walk(eb, &cond_ctx, map);
+                        walk(eb, &cond_ctx, map, nn);
                     }
                 }
                 _ => {}
@@ -1131,7 +1152,7 @@ fn classify_theta_eta_linked(stmts: &[Statement], n_theta: usize) -> Vec<bool> {
     }
 
     let mut map: HashMap<String, Deps> = HashMap::new();
-    walk(stmts, &Deps::default(), &mut map);
+    walk(stmts, &Deps::default(), &mut map, nn_theta_deps);
 
     let mut linked = vec![false; n_theta];
     for name in map.keys() {
@@ -2241,6 +2262,27 @@ pub fn parse_full_model_with(
         }
         acc
     };
+    // Per network, per output head: the absolute θ indices that head reads
+    // (shared hidden weights + its own row and bias), for the mixed-BIC θ
+    // classification (#1177). Built here, before the handles move into the
+    // pk_param_fn closure.
+    #[cfg(feature = "nn")]
+    let nn_theta_deps: Vec<Vec<Vec<usize>>> = covariate_nns_for_closure
+        .iter()
+        .map(|nn| {
+            let mlp = nn.mapper.mlp();
+            (0..mlp.n_outputs())
+                .map(|k| {
+                    mlp.weight_indices_for_output(k)
+                        .into_iter()
+                        .map(|w| nn.weights_offset + w)
+                        .collect()
+                })
+                .collect()
+        })
+        .collect();
+    #[cfg(not(feature = "nn"))]
+    let nn_theta_deps: Vec<Vec<Vec<usize>>> = Vec::new();
 
     // Build pk_param_fn with the extended eta context (BSV + kappa names).
     // `n_theta_base` is the user-declared θ count, which is what the partial
@@ -2826,7 +2868,8 @@ pub fn parse_full_model_with(
         classify_indiv_params(&indiv_stmts, &theta_names, &eta_names_bsv);
     // Delattre class of every theta for the mixed BIC (#1177). Runs on the
     // desugared statements, so `[covariate_model]` thetas are classified too.
-    let theta_eta_linked = classify_theta_eta_linked(&indiv_stmts, theta_names.len());
+    let theta_eta_linked =
+        classify_theta_eta_linked(&indiv_stmts, theta_names.len(), &nn_theta_deps);
     debug_assert_eq!(
         theta_transform.len(),
         theta_names.len(),
@@ -4032,7 +4075,8 @@ pub fn parse_full_model_with(
     if !endpoint_stmts.is_empty() {
         let mut all_stmts = indiv_stmts.clone();
         all_stmts.extend(endpoint_stmts);
-        model.theta_eta_linked = classify_theta_eta_linked(&all_stmts, model.theta_names.len());
+        model.theta_eta_linked =
+            classify_theta_eta_linked(&all_stmts, model.theta_names.len(), &nn_theta_deps);
     }
     // #486 — surface the FD fallback when a direct-θ/η readout could not be
     // desugared because the PK-slot layout was full (see the headroom check above).
