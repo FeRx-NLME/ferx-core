@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use ferx_core::{BicType, Strictness};
+use ferx_core::{BicType, EstimationMethod, FitOptions, Strictness};
 
 use super::*;
 use crate::search::candidate::{Candidate, Criterion, FeatureVector, RunOptions};
@@ -53,6 +53,18 @@ impl Recorder {
         let mut ids = self.calls.lock().unwrap().clone();
         ids.sort();
         ids
+    }
+}
+
+/// `expect_err` on a `Result<RunReport, _>` dumps every `FitResult` the report
+/// holds into the panic message — megabytes of noise around a one-line failure.
+fn expect_refusal(outcome: Result<RunReport, String>, what: &str) -> String {
+    match outcome {
+        Err(message) => message,
+        Ok(report) => panic!(
+            "{what}: the run was accepted ({} fitted, {} reused)",
+            report.fitted, report.reused
+        ),
     }
 }
 
@@ -122,11 +134,12 @@ fn duplicate_ids_are_rejected() {
         candidate("same", "[parameters]\ntheta CL = 1\n"),
         candidate("same", "[parameters]\ntheta CL = 2\n"),
     ];
-    let err = Runner::new()
-        .run_with_fitter(&candidates, &population(&["1"]), &lenient(), |_, _| {
+    let err = expect_refusal(
+        Runner::new().run_with_fitter(&candidates, &population(&["1"]), &lenient(), |_, _| {
             Ok(converged_fit(1.0))
-        })
-        .expect_err("duplicate ids must be refused");
+        }),
+        "duplicate ids must be refused",
+    );
     assert!(err.contains("`same`"), "unhelpful message: {err}");
 }
 
@@ -545,12 +558,15 @@ fn a_resume_against_a_different_criterion_is_refused() {
         criterion: Criterion::Bic(BicType::Mixed),
         ..lenient()
     };
-    let err = Runner::new()
-        .cache_dir(dir.path())
-        .run_with_fitter(&candidates, &population(&["1"]), &options, |_, _| {
-            Ok(converged_fit(1.0))
-        })
-        .expect_err("resuming under another criterion must be refused");
+    let err = expect_refusal(
+        Runner::new().cache_dir(dir.path()).run_with_fitter(
+            &candidates,
+            &population(&["1"]),
+            &options,
+            |_, _| Ok(converged_fit(1.0)),
+        ),
+        "resuming under another criterion must be refused",
+    );
     assert!(
         err.contains("ranking criterion"),
         "unhelpful message: {err}"
@@ -567,13 +583,126 @@ fn a_resume_against_a_different_dataset_is_refused() {
         resume: true,
         ..lenient()
     };
-    let err = Runner::new()
+    let err = expect_refusal(
+        Runner::new().cache_dir(dir.path()).run_with_fitter(
+            &candidates,
+            &population(&["1", "2"]),
+            &options,
+            |_, _| Ok(converged_fit(1.0)),
+        ),
+        "resuming against other data must be refused",
+    );
+    assert!(err.contains("dataset"), "unhelpful message: {err}");
+}
+
+#[test]
+fn a_resume_against_the_same_shaped_but_edited_dataset_is_refused() {
+    // The dangerous case, because nothing about it *looks* different: same
+    // subject ids, same observation counts, one changed measurement. A
+    // fingerprint over the shape alone would reuse every candidate and return
+    // scores computed from the previous dataset.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let candidates = vec![candidate("a", "[parameters]\ntheta CL = 1\n")];
+
+    let mut data = population(&["1", "2"]);
+    for subject in &mut data.subjects {
+        subject.obs_times = vec![1.0, 4.0];
+        subject.observations = vec![5.5, 2.5];
+        subject.obs_cmts = vec![1, 1];
+    }
+    Runner::new()
+        .threads(1)
         .cache_dir(dir.path())
-        .run_with_fitter(&candidates, &population(&["1", "2"]), &options, |_, _| {
+        .run_with_fitter(&candidates, &data, &lenient(), |_, _| {
             Ok(converged_fit(1.0))
         })
-        .expect_err("resuming against other data must be refused");
+        .expect("first run");
+
+    let mut edited = data.clone();
+    edited.subjects[1].observations[0] = 5.6;
+    let options = RunOptions {
+        resume: true,
+        ..lenient()
+    };
+    let err = expect_refusal(
+        Runner::new()
+            .threads(1)
+            .cache_dir(dir.path())
+            .run_with_fitter(&candidates, &edited, &options, |_, _| {
+                Ok(converged_fit(1.0))
+            }),
+        "resuming against edited data must be refused",
+    );
     assert!(err.contains("dataset"), "unhelpful message: {err}");
+
+    // The premise, so the test cannot pass for the wrong reason: the edit did
+    // not change the shape the old fingerprint saw.
+    assert_eq!(edited.subjects.len(), data.subjects.len());
+    assert_eq!(
+        edited.subjects[1].observations.len(),
+        data.subjects[1].observations.len()
+    );
+}
+
+#[test]
+fn a_resume_under_different_fit_settings_is_refused() {
+    // A candidate's hash covers the `[fit_options]` in its own model text, but
+    // an override handed to the runner sits outside `ModelText` — so without
+    // the manifest's fit-settings fingerprint this resume would reuse scores
+    // produced under another method or iteration cap.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let candidates = vec![candidate("a", "[parameters]\ntheta CL = 1\n")];
+    let with = |method: EstimationMethod, resume: bool| {
+        let mut fit_options = FitOptions::default();
+        fit_options.method = method;
+        RunOptions {
+            fit_options: Some(fit_options),
+            resume,
+            ..lenient()
+        }
+    };
+
+    Runner::new()
+        .threads(1)
+        .cache_dir(dir.path())
+        .run_with_fitter(
+            &candidates,
+            &population(&["1"]),
+            &with(EstimationMethod::FoceI, false),
+            |_, _| Ok(converged_fit(1.0)),
+        )
+        .expect("first run");
+
+    let err = expect_refusal(
+        Runner::new()
+            .threads(1)
+            .cache_dir(dir.path())
+            .run_with_fitter(
+                &candidates,
+                &population(&["1"]),
+                &with(EstimationMethod::Saem, true),
+                |_, _| Ok(converged_fit(1.0)),
+            ),
+        "resuming under other fit settings must be refused",
+    );
+    assert!(err.contains("fit settings"), "unhelpful message: {err}");
+
+    // The same settings still resume, so the gate is not simply refusing
+    // everything with an override.
+    let (report, _) = (
+        Runner::new()
+            .threads(1)
+            .cache_dir(dir.path())
+            .run_with_fitter(
+                &candidates,
+                &population(&["1"]),
+                &with(EstimationMethod::FoceI, true),
+                |_, _| panic!("a journalled candidate was refitted"),
+            )
+            .expect("resume under the original settings"),
+        (),
+    );
+    assert_eq!((report.fitted, report.reused), (0, 1));
 }
 
 #[test]

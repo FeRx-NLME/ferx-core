@@ -1,5 +1,12 @@
 //! The candidate journal, the fit cache and the resume manifest (#1178).
 
+use std::collections::HashMap;
+
+use ferx_core::{
+    BloqMethod, CancelFlag, DoseEvent, EstimationMethod, FitOptions, GradientMethod, Population,
+    Subject,
+};
+
 use super::*;
 use crate::search::candidate::{Criterion, FeatureVector};
 use crate::search::test_support::{converged_fit, population};
@@ -147,7 +154,7 @@ fn each_difference_is_refused_by_name() {
     let data = population(&["1", "2"]);
     let manifest = SearchManifest::new(&options(), &data);
 
-    let cases: [(SearchManifest, &str); 4] = [
+    let cases: [(SearchManifest, &str); 5] = [
         (
             SearchManifest::new(
                 &RunOptions {
@@ -182,6 +189,16 @@ fn each_difference_is_refused_by_name() {
             SearchManifest::new(&options(), &population(&["1", "3"])),
             "dataset",
         ),
+        (
+            SearchManifest::new(
+                &RunOptions {
+                    fit_options: Some(ferx_core::FitOptions::default()),
+                    ..options()
+                },
+                &data,
+            ),
+            "fit settings",
+        ),
     ];
 
     for (disk, expected) in cases {
@@ -206,4 +223,215 @@ fn the_data_fingerprint_moves_with_the_data_and_not_with_anything_else() {
         "a different subject set hashed the same"
     );
     assert_eq!(a.data_fingerprint.len(), 64);
+}
+
+/// One subject with every kind of content the fingerprint has to see: doses,
+/// observations, compartments, censoring, occasions, and covariates.
+fn loaded_subject(id: &str) -> Subject {
+    let mut covariates = HashMap::new();
+    covariates.insert("WT".to_string(), 70.0);
+    covariates.insert("AGE".to_string(), 40.0);
+    Subject {
+        id: id.to_string(),
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times: vec![1.0, 4.0],
+        observations: vec![5.5, 2.5],
+        obs_cmts: vec![1, 1],
+        cens: vec![0, 0],
+        occasions: vec![1, 1],
+        covariates,
+        ..Default::default()
+    }
+}
+
+fn loaded_population() -> Population {
+    Population {
+        subjects: vec![loaded_subject("1"), loaded_subject("2")],
+        covariate_names: vec!["WT".into(), "AGE".into()],
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    }
+}
+
+#[test]
+fn the_fingerprint_sees_the_contents_and_not_only_the_shape() {
+    // The regression this exists to catch: a fingerprint over ids and counts
+    // alone leaves a resume blind to a *changed dataset of the same shape*. It
+    // then reuses every candidate and returns criteria computed from the old
+    // data — a wrong ranking, with nothing downstream able to detect it. Every
+    // mutation below preserves the subject ids and the observation counts.
+    let base = SearchManifest::new(&options(), &loaded_population());
+
+    let mutate = |f: &dyn Fn(&mut Population)| {
+        let mut data = loaded_population();
+        f(&mut data);
+        SearchManifest::new(&options(), &data)
+    };
+
+    let cases: [(&str, &dyn Fn(&mut Population)); 7] = [
+        ("a DV value", &|d: &mut Population| {
+            d.subjects[0].observations[1] = 2.6;
+        }),
+        ("an observation time", &|d: &mut Population| {
+            d.subjects[1].obs_times[0] = 1.5;
+        }),
+        ("a dose amount", &|d: &mut Population| {
+            d.subjects[0].doses[0].amt = 200.0;
+        }),
+        ("a dose compartment", &|d: &mut Population| {
+            // `cmt` is private, so the whole event is rebuilt into another one.
+            d.subjects[0].doses[0] = DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0);
+        }),
+        ("an observation compartment", &|d: &mut Population| {
+            d.subjects[0].obs_cmts[1] = 2;
+        }),
+        ("a censoring flag", &|d: &mut Population| {
+            d.subjects[0].cens[0] = 1;
+        }),
+        ("a covariate value", &|d: &mut Population| {
+            d.subjects[1].covariates.insert("WT".into(), 90.0);
+        }),
+    ];
+
+    for (what, mutation) in cases {
+        let changed = mutate(mutation);
+        assert_eq!(
+            (changed.n_subjects, changed.n_observations),
+            (base.n_subjects, base.n_observations),
+            "the {what} case changed the shape, so it does not test the contents"
+        );
+        assert_ne!(
+            changed.data_fingerprint, base.data_fingerprint,
+            "changing {what} left the fingerprint unmoved"
+        );
+        assert!(
+            base.check_compatible(&changed, std::path::Path::new("."))
+                .is_err(),
+            "a resume against changed {what} was accepted"
+        );
+    }
+}
+
+#[test]
+fn the_fingerprint_is_stable_across_repeated_construction() {
+    // Covariates live in `HashMap`s, whose iteration order varies per process.
+    // Hashing them unsorted would produce a fresh digest on every call and
+    // refuse every resume — the failure mode opposite to the one above.
+    let first = SearchManifest::new(&options(), &loaded_population());
+    for _ in 0..8 {
+        let again = SearchManifest::new(&options(), &loaded_population());
+        assert_eq!(again.data_fingerprint, first.data_fingerprint);
+    }
+    assert!(first
+        .check_compatible(
+            &SearchManifest::new(&options(), &loaded_population()),
+            std::path::Path::new(".")
+        )
+        .is_ok());
+}
+
+// ── the fit-settings fingerprint ─────────────────────────────────────────────
+
+fn with_fit_options(fit_options: Option<FitOptions>) -> SearchManifest {
+    SearchManifest::new(
+        &RunOptions {
+            fit_options,
+            ..options()
+        },
+        &loaded_population(),
+    )
+}
+
+#[test]
+fn the_fit_settings_fingerprint_moves_with_every_setting_that_changes_a_fit() {
+    // A candidate's hash covers its own `[fit_options]` block, but not an
+    // override handed to the runner — that lives outside `ModelText`. Without
+    // this fingerprint a run could be resumed under another method, iteration
+    // cap or censoring convention and reuse scores the override never produced.
+    let base = FitOptions::default();
+    let reference = with_fit_options(Some(base.clone()));
+
+    let mutate = |f: &dyn Fn(&mut FitOptions)| {
+        let mut options = base.clone();
+        f(&mut options);
+        with_fit_options(Some(options))
+    };
+
+    let cases: [(&str, &dyn Fn(&mut FitOptions)); 6] = [
+        ("the estimation method", &|o: &mut FitOptions| {
+            o.method = EstimationMethod::Saem;
+        }),
+        ("the outer iteration cap", &|o: &mut FitOptions| {
+            o.outer_maxiter = 7;
+        }),
+        ("the covariance step", &|o: &mut FitOptions| {
+            o.run_covariance_step = !o.run_covariance_step;
+        }),
+        ("the BLOQ convention", &|o: &mut FitOptions| {
+            o.bloq_method = BloqMethod::M3;
+        }),
+        ("the gradient method", &|o: &mut FitOptions| {
+            o.gradient_method = GradientMethod::Fd;
+        }),
+        ("the multi-start seed", &|o: &mut FitOptions| {
+            o.multi_start_seed = Some(1234);
+        }),
+    ];
+
+    for (what, mutation) in cases {
+        let changed = mutate(mutation);
+        assert_ne!(
+            changed.fit_options_fingerprint, reference.fit_options_fingerprint,
+            "changing {what} left the fit-settings fingerprint unmoved"
+        );
+        assert!(
+            reference
+                .check_compatible(&changed, std::path::Path::new("."))
+                .is_err(),
+            "a resume against changed {what} was accepted"
+        );
+    }
+}
+
+#[test]
+fn the_fit_settings_fingerprint_ignores_this_runs_scheduling() {
+    // The runner overrides these four per candidate, so they say nothing about
+    // the numbers a journalled row holds. Including them would refuse resumes
+    // that are in fact identical.
+    let base = FitOptions::default();
+    let reference = with_fit_options(Some(base.clone()));
+
+    let mut rescheduled = base.clone();
+    rescheduled.threads = Some(7);
+    rescheduled.cancel = Some(CancelFlag::new());
+    rescheduled.n_starts = 9;
+    rescheduled.verbose = true;
+    rescheduled.user_set_keys = vec!["method".to_string()];
+    let same = with_fit_options(Some(rescheduled));
+
+    assert_eq!(
+        same.fit_options_fingerprint, reference.fit_options_fingerprint,
+        "a run-scheduling knob leaked into the fit-settings fingerprint"
+    );
+    assert!(reference
+        .check_compatible(&same, std::path::Path::new("."))
+        .is_ok());
+}
+
+#[test]
+fn no_override_and_an_override_are_not_interchangeable() {
+    // `None` means "each candidate's own `[fit_options]`" — a different thing
+    // from any particular override, even the default one.
+    let none = with_fit_options(None);
+    let default_override = with_fit_options(Some(FitOptions::default()));
+    assert!(none.fit_options_fingerprint.is_none());
+    assert!(default_override.fit_options_fingerprint.is_some());
+    assert!(none
+        .check_compatible(&default_override, std::path::Path::new("."))
+        .is_err());
+    assert!(default_override
+        .check_compatible(&none, std::path::Path::new("."))
+        .is_err());
 }

@@ -509,8 +509,18 @@ fn compile_and_fit(
         .clone()
         .unwrap_or_else(|| parsed.fit_options.clone());
 
-    // Mirrors `prepare_run`: the file's `gradient = ...` reaches the engine
-    // through `model.gradient_method`, and an SDE model is forced to FD.
+    // Two `FitOptions` keys reach the engine through the *model* rather than
+    // through the options, so an override that only lands in `fit_options` is an
+    // override the fit does not see. `fit_from_files` stamps both; so does this.
+    //
+    // `bloq_method` is the one that bites: the censored-data likelihood reads
+    // `model.bloq_method`, so a candidate run with an override from `drop` to
+    // `m3` (or back) would report the requested setting and score the other
+    // one's likelihood — a wrong ranking, silently. Parsing already stamps the
+    // *file's* value, which is why this is invisible until a caller supplies
+    // `RunOptions::fit_options`.
+    parsed.model.bloq_method = base.bloq_method;
+    // And the file's `gradient = ...`, with an SDE model forced to FD.
     parsed.model.gradient_method = if parsed.model.is_sde() {
         GradientMethod::Fd
     } else {

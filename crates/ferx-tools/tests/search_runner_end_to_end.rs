@@ -17,7 +17,7 @@
 use std::path::Path;
 
 use ferx_core::edit::{ModelEdit, ModelText};
-use ferx_core::{fit, prepare_run, CancelFlag, FitOptions, PreparedRun, Strictness};
+use ferx_core::{fit, prepare_run, BloqMethod, CancelFlag, FitOptions, PreparedRun, Strictness};
 use ferx_tools::search::{Candidate, Criterion, FeatureVector, RunOptions, Runner};
 
 const MODEL: &str = "../../examples/warfarin.ferx";
@@ -329,10 +329,103 @@ fn an_edit_that_changes_the_random_effects_changes_the_bic_it_is_ranked_on() {
     );
 }
 
+// ── options that reach the engine through the model, not the options ─────────
+
+const BLOQ_MODEL: &str = "../../examples/warfarin_bloq.ferx";
+const BLOQ_DATA: &str = "../../data/warfarin_bloq.csv";
+
+fn bloq_options(base: &FitOptions, bloq: BloqMethod) -> FitOptions {
+    let mut o = eval_options(base);
+    o.bloq_method = bloq;
+    o
+}
+
+/// The reference: an evaluation with `bloq` stamped onto **both** the options
+/// and the model, which is what `fit_from_files` does.
+fn direct_bloq_ofv(bloq: BloqMethod) -> f64 {
+    let mut p = prepare_run(BLOQ_MODEL, Some(BLOQ_DATA)).expect("bloq model + data load");
+    let options = bloq_options(&p.parsed.fit_options, bloq);
+    p.parsed.model.bloq_method = bloq;
+    fit(&p.parsed.model, &p.population, &p.init_params, &options)
+        .expect("censored evaluation")
+        .ofv
+}
+
+#[test]
+fn a_bloq_override_reaches_the_censored_likelihood_in_both_directions() {
+    // `bloq_method` is one of the two keys the engine reads off the *model*
+    // rather than off `FitOptions`, and parsing stamps the candidate file's
+    // value there. A `RunOptions::fit_options` override that only landed in the
+    // options would report the requested convention and score the other one's
+    // likelihood — a wrong ranking, silently.
+    let p = prepare_run(BLOQ_MODEL, Some(BLOQ_DATA)).expect("bloq model + data load");
+    let m3 = direct_bloq_ofv(BloqMethod::M3);
+    let dropped = direct_bloq_ofv(BloqMethod::Drop);
+    // Non-degeneracy: on a dataset with no censored rows the two conventions
+    // agree and everything below would pass without testing anything.
+    assert!(
+        p.population
+            .subjects
+            .iter()
+            .any(|s| s.has_censored_observation()),
+        "the fixture carries no censored rows"
+    );
+    assert_ne!(
+        m3.to_bits(),
+        dropped.to_bits(),
+        "M3 and drop agree on this data, so the assertions below are vacuous"
+    );
+
+    let file_m3 = ModelText::parse(&std::fs::read_to_string(BLOQ_MODEL).expect("read the model"))
+        .expect("parse the model");
+    let mut file_drop = file_m3.clone();
+    file_drop
+        .apply(ModelEdit::SetFitOption {
+            key: "bloq_method".to_string(),
+            value: "drop".to_string(),
+        })
+        .expect("set bloq_method = drop");
+
+    // Both directions: the file's value and the override disagree each way
+    // round, and the override has to win each time.
+    for (label, text, override_with, want) in [
+        ("m3 file, drop override", file_m3, BloqMethod::Drop, dropped),
+        ("drop file, m3 override", file_drop, BloqMethod::M3, m3),
+    ] {
+        let report = Runner::new()
+            .threads(1)
+            .run(
+                &[Candidate::new("candidate", text)],
+                &p.population,
+                &RunOptions {
+                    criterion: Criterion::Ofv,
+                    strictness: Strictness::none(),
+                    n_starts: 1,
+                    resume: false,
+                    fit_options: Some(bloq_options(&p.parsed.fit_options, override_with)),
+                },
+            )
+            .expect("run");
+
+        let got = report.results[0]
+            .fit
+            .as_ref()
+            .unwrap_or_else(|| panic!("{label}: no fit — {:?}", report.results[0].error))
+            .ofv;
+        assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "{label}: the fit scored OFV {got}, the requested convention gives {want}"
+        );
+    }
+}
+
 #[test]
 fn the_fixtures_exist() {
     // A wrong relative path would turn every test above into a `prepare_run`
     // failure that reads like an engine problem.
     assert!(Path::new(MODEL).exists(), "missing {MODEL}");
     assert!(Path::new(DATA).exists(), "missing {DATA}");
+    assert!(Path::new(BLOQ_MODEL).exists(), "missing {BLOQ_MODEL}");
+    assert!(Path::new(BLOQ_DATA).exists(), "missing {BLOQ_DATA}");
 }

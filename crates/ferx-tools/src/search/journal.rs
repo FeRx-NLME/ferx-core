@@ -37,7 +37,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use ferx_core::{FitResult, Population, Strictness};
+use ferx_core::{FitOptions, FitResult, Population, Strictness};
 use serde::{Deserialize, Serialize};
 
 use super::candidate::FeatureVector;
@@ -253,10 +253,19 @@ pub struct SearchManifest {
     pub strictness: Strictness,
     pub n_subjects: usize,
     pub n_observations: usize,
-    /// SHA-256 over the subject ids, their observation counts and the DV column
-    /// name — enough to catch "resumed against a different dataset" without
-    /// hashing a file the runner never sees (it is handed a `Population`).
+    /// SHA-256 over the dataset's contents: every field of every subject, with
+    /// covariate maps written in key order so the digest is stable across runs.
     pub data_fingerprint: String,
+    /// SHA-256 over [`RunOptions::fit_options`], when the caller supplied them.
+    ///
+    /// A candidate's identity is the hash of its *model text*, which carries the
+    /// `[fit_options]` block — so with `fit_options: None` the fit settings are
+    /// already part of the cache key. An override is not: it lives outside
+    /// `ModelText`, so resuming a run under a different method, iteration cap,
+    /// optimizer, tolerance, seed or covariance setting would reuse scores the
+    /// override never produced. `None` here records "no override", which is
+    /// itself incompatible with a run that had one.
+    pub fit_options_fingerprint: Option<String>,
 }
 
 impl SearchManifest {
@@ -268,6 +277,7 @@ impl SearchManifest {
             n_subjects: data.subjects.len(),
             n_observations: data.subjects.iter().map(|s| s.observations.len()).sum(),
             data_fingerprint: data_fingerprint(data),
+            fit_options_fingerprint: options.fit_options.as_ref().map(fit_options_fingerprint),
         }
     }
 
@@ -314,6 +324,17 @@ impl SearchManifest {
                 format!("{:?}", self.strictness),
             );
         }
+        if disk.fit_options_fingerprint != self.fit_options_fingerprint {
+            let describe = |f: &Option<String>| match f {
+                Some(hash) => hash.clone(),
+                None => "the candidates' own `[fit_options]`".to_string(),
+            };
+            return refuse(
+                "the fit settings",
+                describe(&disk.fit_options_fingerprint),
+                describe(&self.fit_options_fingerprint),
+            );
+        }
         if disk.data_fingerprint != self.data_fingerprint
             || disk.n_subjects != self.n_subjects
             || disk.n_observations != self.n_observations
@@ -334,19 +355,134 @@ impl SearchManifest {
     }
 }
 
-/// SHA-256 of the dataset's identity — subject ids, per-subject observation
-/// counts, and the DV column.
+/// SHA-256 over the fit settings that can change a candidate's *result*.
+///
+/// Taken off the `Debug` rendering of the options as the runner will actually
+/// apply them — `quiet()` included — with the four knobs the runner overrides
+/// per candidate normalised away, since they are properties of *this* run's
+/// scheduling rather than of the numbers it produces:
+///
+/// * `threads` — the [`PoolPlan`](ferx_core::PoolPlan) share, and pinned per run;
+/// * `cancel` — the run's own flag;
+/// * `n_starts` — recorded separately as [`SearchManifest::n_starts`];
+/// * `user_set_keys` — bookkeeping for the "key not consumed by this method"
+///   warning, and order-dependent on how the caller happened to build the
+///   options, so including it would refuse resumes that are in fact identical.
+///
+/// `FitOptions` implements neither `Hash` nor `Serialize`, and its `Debug` holds
+/// no maps, so its rendering is both complete and deterministic — a field added
+/// to it lands in this digest automatically.
+fn fit_options_fingerprint(options: &FitOptions) -> String {
+    let mut normalised = options.clone().quiet();
+    normalised.threads = None;
+    normalised.cancel = None;
+    normalised.n_starts = 1;
+    normalised.user_set_keys.clear();
+    ferx_core::io::hash::sha256_bytes(format!("{normalised:?}").as_bytes())
+}
+
+/// SHA-256 over the dataset's **contents**, not its shape.
+///
+/// The first version hashed subject ids, per-subject observation counts and the
+/// DV column, and that is a silent wrong-result path: change a DV value, an
+/// observation time, a dose, a censoring flag or a covariate while keeping the
+/// ids and the counts, and the fingerprint does not move. A resume then finds
+/// every candidate hash in the journal, fits nothing, and returns criteria
+/// computed from the *previous* dataset. Nothing downstream could detect it.
+///
+/// So every field of every subject is hashed. Two properties make that
+/// trustworthy rather than approximately trustworthy:
+///
+/// * **The subject is destructured exhaustively, with no `..`.** A field added
+///   to `ferx_core::Subject` stops this file compiling, which forces whoever
+///   adds it to decide whether it belongs in the fingerprint. A `..` here would
+///   silently un-hash it, which is exactly the failure this function exists to
+///   prevent.
+/// * **Every map is written in key order.** `HashMap`'s iteration order varies
+///   per process, so hashing its `Debug` directly would produce a different
+///   digest on every run and refuse every resume.
+///
+/// `Population::warnings` and `exclusions` are deliberately excluded: they
+/// describe what the *reader* did on the way to this population, not what the
+/// fit sees, and `exclusions` has already been applied to `subjects`.
 fn data_fingerprint(data: &Population) -> String {
+    use std::fmt::Write as _;
+
     let mut buf = String::new();
-    buf.push_str(&data.dv_column);
-    buf.push('\n');
+    let _ = writeln!(buf, "dv={}", data.dv_column);
+    let _ = writeln!(buf, "covariate_names={:?}", data.covariate_names);
+    let _ = writeln!(buf, "input_columns={:?}", data.input_columns);
+
     for subject in &data.subjects {
-        buf.push_str(&subject.id);
-        buf.push(':');
-        buf.push_str(&subject.observations.len().to_string());
+        // No `..`: see the note above — a new `Subject` field must fail to
+        // compile here rather than quietly leave the fingerprint blind to it.
+        let ferx_core::Subject {
+            id,
+            doses,
+            obs_times,
+            obs_raw_times,
+            observations,
+            obs_cmts,
+            covariates,
+            dose_covariates,
+            obs_covariates,
+            pk_only_times,
+            pk_only_covariates,
+            reset_times,
+            reset_covariates,
+            cens,
+            occasions,
+            obs_l2,
+            dose_occasions,
+            reset_occasions,
+            fremtype,
+            obs_records,
+        } = subject;
+
+        let _ = writeln!(buf, "id={id}");
+        let _ = writeln!(buf, "doses={doses:?}");
+        let _ = writeln!(buf, "obs_times={obs_times:?}");
+        let _ = writeln!(buf, "obs_raw_times={obs_raw_times:?}");
+        let _ = writeln!(buf, "observations={observations:?}");
+        let _ = writeln!(buf, "obs_cmts={obs_cmts:?}");
+        let _ = writeln!(buf, "pk_only_times={pk_only_times:?}");
+        let _ = writeln!(buf, "reset_times={reset_times:?}");
+        let _ = writeln!(buf, "cens={cens:?}");
+        let _ = writeln!(buf, "occasions={occasions:?}");
+        let _ = writeln!(buf, "obs_l2={obs_l2:?}");
+        let _ = writeln!(buf, "dose_occasions={dose_occasions:?}");
+        let _ = writeln!(buf, "reset_occasions={reset_occasions:?}");
+        let _ = writeln!(buf, "fremtype={fremtype:?}");
+        let _ = writeln!(buf, "obs_records={obs_records:?}");
+
+        write_covariates(&mut buf, "covariates", std::slice::from_ref(covariates));
+        write_covariates(&mut buf, "dose_covariates", dose_covariates);
+        write_covariates(&mut buf, "obs_covariates", obs_covariates);
+        write_covariates(&mut buf, "pk_only_covariates", pk_only_covariates);
+        write_covariates(&mut buf, "reset_covariates", reset_covariates);
+    }
+
+    ferx_core::io::hash::sha256_bytes(buf.as_bytes())
+}
+
+/// Append covariate snapshots in **key order**, so the digest does not depend on
+/// `HashMap`'s per-process iteration order.
+fn write_covariates(
+    buf: &mut String,
+    label: &str,
+    maps: &[std::collections::HashMap<String, f64>],
+) {
+    use std::fmt::Write as _;
+
+    for (i, map) in maps.iter().enumerate() {
+        let mut entries: Vec<(&String, &f64)> = map.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        let _ = write!(buf, "{label}[{i}]=");
+        for (name, value) in entries {
+            let _ = write!(buf, "{name}:{value:?};");
+        }
         buf.push('\n');
     }
-    ferx_core::io::hash::sha256_bytes(buf.as_bytes())
 }
 
 #[cfg(test)]
