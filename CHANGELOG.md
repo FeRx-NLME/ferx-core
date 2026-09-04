@@ -50,6 +50,19 @@ section of the SDLC for the versioning policy).
   of one-cycle integrations back.
 
 ### Added
+- **A shared candidate runner for model-space search (#1178, part of #1175).**
+  `ferx_tools::search::Runner` fits a list of candidate models in parallel and returns each
+  one scored: the ranking criterion (`ofv`, `aic`, or any of the four BIC variants), the
+  `Strictness` verdict with the reasons for every gate it failed, and the fit itself.
+  Candidates are identified by the canonical hash of their model text, so a model reached
+  twice by two different edit paths is fitted **once**; with a cache directory each outcome is
+  journalled as it finishes, so an interrupted overnight search resumes and refits only what
+  is missing, and every candidate — including the ones that failed to compile, failed to fit
+  or failed the gate — appears in `candidates.csv` with its reason rather than being dropped.
+  The thread budget splits across both levels of parallelism via `PoolPlan` (#1115) instead of
+  nesting Rayon pools, and a `CancelFlag` stops a search between candidates and returns the
+  partial results. This is the orchestration layer the covariate, structural, variability and
+  residual-error searches of #1175 are built on.
 - **BIC variants and a `Strictness` gate for candidate ranking (#1177, part of #1175).**
   `ferx_core::bic(&result, BicType::{Mixed, Iiv, Random, Fixed})` computes the four
   conventions of `pharmpy.modeling.calculate_bic` from a finished `FitResult` — the

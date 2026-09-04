@@ -54,3 +54,4 @@ mod tests {
 
 pub mod bootstrap;
 pub mod gam;
+pub mod search;
