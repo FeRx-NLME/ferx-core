@@ -38,6 +38,57 @@ fn options() -> RunOptions {
     }
 }
 
+// ── the numbers survive the round trip ───────────────────────────────────────
+
+#[test]
+fn a_journalled_criterion_and_ofv_come_back_bit_for_bit() {
+    // `serde_json` parses floats with a fast algorithm that is accurate only to
+    // within 1 ULP unless its `float_roundtrip` feature is on — and the journal
+    // exists to answer "what did the interrupted run score this candidate?".
+    // A resumed run that reports a *different number* from the one it is
+    // replaying breaks the contract in the module docs, and it breaks it
+    // invisibly: the CSV prints six decimals, so nothing downstream would show
+    // the drift.
+    //
+    // `-200.28784144636057` is the value that actually caught this, from the
+    // warfarin evaluation in `search_runner_end_to_end`. It is one ULP from
+    // `-200.28784144636055`, and each is its own shortest decimal form, so a
+    // correct parser cannot confuse them.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let awkward = [
+        -200.28784144636057_f64,
+        -200.28784144636055,
+        f64::MIN_POSITIVE,
+        1.0 / 3.0,
+        (2.0_f64).sqrt(),
+        1e308,
+        -0.0,
+    ];
+
+    let journal = Journal::create(dir.path(), &[]).expect("create");
+    for (i, value) in awkward.iter().enumerate() {
+        let mut row = record(&format!("c{i}"), &format!("{i:064x}"));
+        row.criterion = Some(*value);
+        row.ofv = Some(*value);
+        row.seconds = *value;
+        journal.append(&row, None);
+    }
+    journal.into_result().expect("no write failure");
+
+    let back = read_records(&journal_path(dir.path()));
+    assert_eq!(back.len(), awkward.len());
+    for (row, want) in back.iter().zip(&awkward) {
+        assert_eq!(
+            row.criterion.map(f64::to_bits),
+            Some(want.to_bits()),
+            "criterion {want:?} drifted to {:?}",
+            row.criterion
+        );
+        assert_eq!(row.ofv.map(f64::to_bits), Some(want.to_bits()));
+        assert_eq!(row.seconds.to_bits(), want.to_bits());
+    }
+}
+
 // ── append and read ──────────────────────────────────────────────────────────
 
 #[test]

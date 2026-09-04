@@ -26,7 +26,14 @@ rayon = "1.10"
 # (#1143). Both are already in the workspace's lockfile via `ferx-core`, so this
 # adds no crate to the build.
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `float_roundtrip` is load-bearing, not tidiness. Without it `serde_json`
+# parses floats with a fast algorithm accurate only to within 1 ULP, so a
+# journalled criterion or OFV can come back one bit different from the one the
+# interrupted run computed — and a resumed run whose whole promise is "the same
+# numbers" would report a different score, invisibly, since the CSV prints six
+# decimals. Caught by `search_runner_end_to_end`: -200.28784144636055 read back
+# as -200.28784144636057.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 
 # `search.lock` staleness only: `kill(pid, 0)` is how a search directory whose
 # owner was hard-killed is taken over instead of needing a manual delete —

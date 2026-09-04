@@ -98,6 +98,14 @@ section of the SDLC for the versioning policy).
   marked fixed, which is what it meant at the time.
 
 ### Fixed
+- **Numbers written to JSON now reload as themselves, bit for bit (#1178).** `serde_json`
+  parses floats with a fast algorithm accurate only to within 1 ULP unless its
+  `float_roundtrip` feature is enabled, which it now is across `ferx-core`, `ferx-tools` and
+  the CLI. Anything that writes a number and reads it back — a `.fitrx` bundle, a search
+  journal, a cached fit — could otherwise return an estimate one bit from the one that was
+  computed, and do it invisibly, since every printed form rounds long before that digit. The
+  case that caught it was a resumed candidate search reporting a criterion of
+  `-200.28784144636057` for a fit that scored `-200.28784144636055`.
 - **`n_parameters`, AIC and BIC no longer count the structural zeros of a mixed
   `block_omega` + diagonal `omega` as estimated parameters (#1177).** The cross-block
   Cholesky entries of such an Ω are pinned, never searched, and the covariance step already
