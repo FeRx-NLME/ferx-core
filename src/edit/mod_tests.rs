@@ -251,6 +251,42 @@ fn canonical_hash_keeps_the_bytes_inside_a_quoted_value() {
     assert_eq!(spaced.canonical_hash(), reflowed.canonical_hash());
 }
 
+#[test]
+fn canonical_hash_keeps_a_comment_marker_inside_a_quoted_value() {
+    // `squeeze` copies a quoted string byte for byte, but it never sees one
+    // that `code_of` already cut: a naive "cut at the first `#` or `//`" ends
+    // both of these at `path = "s3:`, and the search then fits one candidate
+    // and reports its criterion for the other under `duplicate_of`.
+    for (a, b) in [
+        ("\"s3://bucket/a.csv\"", "\"s3://bucket/b.csv\""),
+        ("\"cohort#A.csv\"", "\"cohort#B.csv\""),
+        ("'s3://bucket/a.csv'", "'s3://bucket/b.csv'"),
+    ] {
+        let one = ModelText::parse(&format!("[data]\n  path = {a}\n")).unwrap();
+        let two = ModelText::parse(&format!("[data]\n  path = {b}\n")).unwrap();
+        assert_ne!(
+            one.canonical_hash(),
+            two.canonical_hash(),
+            "`{a}` and `{b}` canonicalised alike:\n{}",
+            one.canonical_form()
+        );
+        // And the straddle the pair exists to test: the marker must actually be
+        // past the opening quote, or both spellings survive a naive cut too.
+        assert!(a.find("//").or_else(|| a.find('#')).unwrap() > 0);
+    }
+}
+
+#[test]
+fn code_of_still_strips_a_comment_that_follows_a_quoted_value() {
+    // The quote closes before the marker, so the marker is a comment again —
+    // otherwise the fix would trade a wrong hash for an uncommentable line.
+    let with = ModelText::parse("[data]\n  path = \"a.csv\"  # the cohort\n").unwrap();
+    let without = ModelText::parse("[data]\n  path = \"a.csv\"\n").unwrap();
+    assert_eq!(with.canonical_hash(), without.canonical_hash());
+    let slashes = ModelText::parse("[data]\n  path = \"a.csv\"  // the cohort\n").unwrap();
+    assert_eq!(slashes.canonical_hash(), without.canonical_hash());
+}
+
 // ── SetFitOption ───────────────────────────────────────────────────────────
 
 #[test]

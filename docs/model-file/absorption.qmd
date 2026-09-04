@@ -876,8 +876,16 @@ delay to *one* route, so a route's effective onset is `dose time + lag_cmt + lag
 The argument is universal — `zero_order(dur=DUR, lag=L)` shifts the whole zero-order
 window (start, end, and its cutoff break) by `L`. `lag` must be a single declared
 individual parameter (like the `FR*` fraction), and must be finite; a negative value
-is warned (`W_NEGATIVE_LAGTIME`), not clamped. `lag=0` (or no `lag`) is bit-identical
-to an unlagged route, so the argument is a strict superset.
+is warned (`W_NEGATIVE_LAGTIME`), not clamped. NONMEM **aborts** on a negative absorption
+lag (`PK PARAMETER FOR ABSORPTION LAG IS NEGATIVE`, `PROGRAM TERMINATED BY OBJ`); ferx
+instead warns and starts the subject's timeline at the *earlier* onset, identically on
+every engine — the predictions equal the closed form from that earlier onset, and the
+grid nodes between it and the first record are integrated, not left missing
+([#1189](https://github.com/FeRx-NLME/ferx-core/issues/1189)). `lag=0` (or no `lag`) is
+bit-identical to an unlagged route, so the argument is a strict superset. A **non-finite**
+lag (`NaN`/`Inf`) is a different matter: it is rejected at fit-init with
+`E_DOSE_ATTR_NONFINITE`, and one arising mid-fit makes that subject's predictions `NaN`
+rather than aborting the run.
 
 A plain **infusion** (`RATE>0`) into a per-route-lagged compartment composes as expected
 (the whole infused-kernel appearance is delayed by `lag`). **Steady-state** dosing

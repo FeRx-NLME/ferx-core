@@ -4942,11 +4942,23 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
             ri,
         ));
     }
-    tl.sort_by(|a, b| {
-        a.0.partial_cmp(&b.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.1.cmp(&b.1))
-    });
+    tl.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    // A non-finite event time makes the subject non-finite (#1189) — see
+    // `ode::predictions::timeline_has_non_finite`. This walk dispatches typed events by
+    // index and so never re-applies a dose, but a `NaN`/`inf` time sorts to the end and
+    // its event is simply never reached: with a `+inf` lagtime both doses go unapplied
+    // and the walk returns a *finite, drug-free* gradient. NaN jets instead, so the
+    // caller sees a diverged subject rather than a plausible wrong one. This is the
+    // event-driven twin of the same guard in `integrate_g`; an estimated lagtime routes
+    // here, not there, so the two must both carry it.
+    if crate::ode::predictions::times_have_non_finite(tl.iter().map(|e| e.0)) {
+        for row in states.iter_mut() {
+            for x in row.iter_mut() {
+                *x = T::from_f64(f64::NAN);
+            }
+        }
+        return states;
+    }
     if tl.is_empty() {
         return states;
     }
@@ -6534,7 +6546,7 @@ fn integrate_g<T: crate::sens::num::PkNum>(
     // observations (PR #438 review). The precise `obs_time_matches` test still
     // gates each candidate; the sort only narrows the search window.
     let mut sorted_obs: Vec<(f64, usize)> = subject.obs_times.iter().copied().zip(0..).collect();
-    sorted_obs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    sorted_obs.sort_by(|a, b| a.0.total_cmp(&b.0));
     // Record `src` at every not-yet-recorded observation whose time matches `q`.
     let record_at = |q: f64, src: &[T], states: &mut [Vec<T>], recorded: &mut [bool]| {
         // Candidates lie within the relative tolerance band; widen slightly for the
@@ -6616,10 +6628,29 @@ fn integrate_g<T: crate::sens::num::PkNum>(
     }
     break_times.push(t_last);
     // NaN-safe sort: a malformed dose/reset time (e.g. `duration = amt/rate = NaN`)
-    // must not panic on the `None` `partial_cmp` returns — mirrors the production
-    // f64 walk (`pk::event_driven`) (PR #381 review #13).
-    break_times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // must not panic — mirrors the production f64 walk (`pk::event_driven`) (PR #381
+    // review #13). `total_cmp`, not the `partial_cmp(..).unwrap_or(Equal)` this was:
+    // that comparator is not a total order, and `sort_by` *panics* when it detects one
+    // ("user-provided comparison function does not correctly implement a total order").
+    // The detection is opportunistic — it depends on length, element size and
+    // arrangement, measured to fire on some ordinary subject shapes and not others — so
+    // the "NaN-safe" spelling was neither safe nor reliably loud (#1189). The guard
+    // below is what makes the outcome deterministic.
+    break_times.sort_by(|a, b| a.total_cmp(b));
     break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
+    // A non-finite break time makes the subject non-finite (#1189) — see
+    // `ode::predictions::timeline_has_non_finite`. NaN *jets*, not just NaN values: the
+    // whole walk is unreachable, so neither the value nor its `∂/∂η` is defined, and the
+    // caller already tolerates a diverged walk. Without this the NaN-lagged dose is
+    // simply never applied and the gradient comes back finite and wrong.
+    if crate::ode::predictions::timeline_has_non_finite(&break_times) {
+        for row in states.iter_mut() {
+            for x in row.iter_mut() {
+                *x = T::from_f64(f64::NAN);
+            }
+        }
+        return Some(states);
+    }
     // Degenerate single-instant timeline (one observation, no dose, off zero):
     // keep a second identical break so the loop runs once and `record_at(t_start)`
     // captures the observation at the first record from the initial state.
@@ -6646,6 +6677,13 @@ fn integrate_g<T: crate::sens::num::PkNum>(
     // `integrate_tvcov_g` short-circuit (#472 review round 2 #7).
     let has_any_infusion = subject.doses.iter().any(crate::dosing::is_real_infusion);
 
+    // Apply-once mask (#1186), the dual-side twin of production's: this walk rescans
+    // every dose at every break, and an infusion end (`dose.time + duration`) or a route
+    // onset is a derived break that can land within `EVENT_MATCH_TOL` of another dose's
+    // own break. Generic over `T`, so the one mask serves the `f64` value walk and the
+    // `Dual2` sensitivity instantiation alike.
+    let mut dose_applied = vec![false; subject.doses.len()];
+
     // Most-recent EVID 3/4 reset time (`NEG_INFINITY` until the first reset). An infusion
     // whose window *straddles* a reset must stop contributing afterward — the reset zeroed
     // the state, and production drops such infusions from the active set via `reset_floor`
@@ -6664,7 +6702,7 @@ fn integrate_g<T: crate::sens::num::PkNum>(
         if subject
             .reset_times
             .iter()
-            .any(|&rt| (rt - t_start).abs() < 1e-12)
+            .any(|&rt| (rt - t_start).abs() < crate::ode::predictions::EVENT_MATCH_TOL)
         {
             u.copy_from_slice(init_state);
             reset_floor = t_start;
@@ -6679,10 +6717,16 @@ fn integrate_g<T: crate::sens::num::PkNum>(
         // skipped here — the dose feeds R_in (the forcing in the RHS below), not a bolus
         // (#430). `F` is per dose compartment via `dose_f_bio[k]` (#486).
         for (k, dose) in subject.doses.iter().enumerate() {
-            if !dose.is_infusion()
-                && (dose.time - t_start).abs() < 1e-12
-                && !input_rate_consumes_cmt(ode, dose.cmt_raw())
-            {
+            if dose_applied[k] {
+                continue;
+            }
+            if (dose.time - t_start).abs() >= crate::ode::predictions::EVENT_MATCH_TOL {
+                continue;
+            }
+            // Marked for every dose matched at this break, infusion included — the
+            // arrival is one event and fires at the first break inside the match (#1186).
+            dose_applied[k] = true;
+            if !dose.is_infusion() && !input_rate_consumes_cmt(ode, dose.cmt_raw()) {
                 let cmt_idx = dose.cmt_idx();
                 if cmt_idx < n_states {
                     u[cmt_idx] = u[cmt_idx] + dose_f_bio[k] * T::from_f64(dose.amt);
@@ -6754,7 +6798,7 @@ fn integrate_g<T: crate::sens::num::PkNum>(
         if saveat.last().map_or(true, |&l| (l - t_end).abs() > 1e-12) {
             saveat.push(t_end);
         }
-        saveat.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        saveat.sort_by(|a, b| a.total_cmp(b));
         saveat.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
 
         // `F·rate` to their compartment (the break times guarantee a segment is fully

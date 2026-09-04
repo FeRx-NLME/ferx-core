@@ -442,14 +442,34 @@ fn split_keeping_terminators(src: &str) -> Vec<String> {
 
 /// A line with its comment and surrounding whitespace removed — what the
 /// parser reads. `#` and `//` both start a comment, whichever comes first.
+///
+/// A marker **inside a quoted string is content, not a comment**. This is the
+/// same rule [`canonical::squeeze`] applies to whitespace, and it is here for
+/// the same reason: with a naive cut at the first `#` or `//`, the two `[data]`
+/// paths `"s3://bucket/a.csv"` and `"s3://bucket/b.csv"` both truncate to
+/// `path = "s3:` and hash alike, so a search would fit one candidate and report
+/// its criterion for the other. An unterminated quote never cuts, which errs
+/// towards keeping text: a hash that keeps too much costs a refit, one that
+/// keeps too little costs a wrong answer.
 pub(crate) fn code_of(line: &str) -> &str {
-    let cut = line
-        .find('#')
-        .into_iter()
-        .chain(line.find("//"))
-        .min()
-        .unwrap_or(line.len());
-    line[..cut].trim()
+    let bytes = line.as_bytes();
+    let mut quote: Option<u8> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        match quote {
+            Some(q) => {
+                if b == q {
+                    quote = None;
+                }
+            }
+            None if b == b'"' || b == b'\'' => quote = Some(b),
+            // Both markers are ASCII, so `i` is always a char boundary.
+            None if b == b'#' || (b == b'/' && bytes.get(i + 1) == Some(&b'/')) => {
+                return line[..i].trim();
+            }
+            None => {}
+        }
+    }
+    line.trim()
 }
 
 /// The leading whitespace of a line, excluding its own terminator (a blank

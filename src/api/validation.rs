@@ -752,6 +752,7 @@ pub fn check_model_data_rule(
     diags.extend(check_absorption_dosing(model, population));
     diags.extend(check_modeled_dose_rates(model, population));
     diags.extend(check_dose_compartments(model, population));
+    diags.extend(check_dose_attr_finiteness(model, population));
     diags.extend(validate_output_columns(model, population));
     diags
 }
@@ -1621,6 +1622,110 @@ pub(crate) fn check_dose_compartments(
         }
     }
     diags
+}
+
+/// Every dose attribute the **engine** applies at a dose event — bioavailability `F`
+/// and lag time `ALAG`/`LAGTIME`, per dose compartment — must be finite at typical
+/// values, for every subject (#1189).
+///
+/// A `NaN` lag makes `dose.time + lag` non-finite, and with it every break derived from
+/// it, so the subject's integration timeline cannot be ordered. Until #1189 that
+/// *panicked* the objective path and both dense builders
+/// (`called Option::unwrap() on a None value`, from a `partial_cmp(..).unwrap()` sort);
+/// it now yields a typed non-finite subject
+/// ([`timeline_has_non_finite`](crate::ode::predictions::timeline_has_non_finite)),
+/// which the estimation guards absorb as a diverged solve. That is the right behaviour
+/// for a *mid-fit* θ/η excursion, but a wasteful and opaque one when the model is
+/// already broken at its starting point — a covariate relationship that divides by a
+/// zero `WT`, say. This is the front door for that case: reject before the fit runs,
+/// naming the subject.
+///
+/// Evaluated at η = 0 and `TIME = 0`, per subject, so a covariate relationship that
+/// pushes one subject's typical attribute non-finite is caught — the same shape as the
+/// per-subject [`InputRateForcing::validate`](crate::pk::absorption::InputRateForcing::validate)
+/// loop in [`check_absorption_dosing`].
+///
+/// **Scope, stated because the `TIME = 0` snapshot is a real limit and not a detail.**
+/// This reads the subject's *baseline* covariates only. A time-varying covariate that is
+/// benign at the first record and overflows at a later one is **not** caught here; it
+/// surfaces as the engine-side non-finite subject instead, which is the opaque outcome
+/// this check exists to pre-empt. Widening it to every dose-time snapshot is the obvious
+/// follow-up; it is not done here because the engine guard makes the missed case correct
+/// (just not diagnosed), and because the same `TIME = 0` limitation applies to every
+/// other per-subject typical-value check in this file, so fixing it in one place only
+/// would be misleading. It is a **separate** check rather than an
+/// extension of that loop, deliberately: `check_absorption_dosing` returns early unless
+/// the model has a built-in absorption forcing, and a `NaN` `ALAG1` on a plain 1-cpt
+/// model has nothing to do with absorption.
+///
+/// Only compartments the data actually doses into are examined; a model with neither `F`
+/// nor a lag reads the `PkParams` defaults (1.0 / 0.0), finite by construction, so this
+/// is a no-op there. Reported once: a single fatal error already halts the fit.
+///
+/// **What can actually make one non-finite, measured.** The DSL's arithmetic is
+/// domain-guarded where you would expect: `/` returns `0.0` when the denominator is below
+/// `1e-30`, and `ln`/`sqrt` floor their argument. `exp` is not clamped, so an exponential
+/// covariate model on an unscaled covariate (`ALAG1 = TVLAG*exp(WT)` with `WT` in the
+/// hundreds) overflows to `+inf` — that is the reachable route at typical values, and it
+/// is what the regression test uses. Mid-fit, any θ/η excursion into the same overflow
+/// does it, which is what the engine-side guard covers.
+pub(crate) fn check_dose_attr_finiteness(
+    model: &CompiledModel,
+    population: &Population,
+) -> Vec<Diagnostic> {
+    // NOT gated on `DoseAttrMap::is_empty()`: that reports only whether a
+    // *compartment-indexed* attribute (`F1`/`ALAG2`/…) is declared, and the common
+    // model spells a bare `lagtime` / `F`, which resolves through `PK_IDX_LAGTIME` /
+    // `PK_IDX_F` with an empty indexed map. Gating there would skip exactly the
+    // everyday case this exists for.
+    let map = model.active_dose_attr_map();
+    let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
+    for subject in &population.subjects {
+        if subject.doses.is_empty() {
+            continue;
+        }
+        let pk = (model.pk_param_fn)(
+            &model.default_params.theta,
+            &zero_eta,
+            &subject.covariates,
+            0.0,
+        );
+        // De-dup per subject: a regimen repeats the same compartment many times and
+        // one bad `ALAG{cmt}` would otherwise be reported once per dose record.
+        let mut seen: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        for dose in &subject.doses {
+            let cmt = dose.cmt_1based();
+            if !seen.insert(cmt) {
+                continue;
+            }
+            for (what, value) in [
+                (
+                    "lag time (`lagtime` / `ALAG`)",
+                    map.lagtime(cmt, &pk.values),
+                ),
+                ("bioavailability (`F`)", map.f_bio(cmt, &pk.values)),
+            ] {
+                if !value.is_finite() {
+                    return vec![Diagnostic::error(
+                        "E_DOSE_ATTR_NONFINITE",
+                        format!(
+                            "Dose {what} for compartment {cmt} is {value} at typical values \
+                             (subject {}). The engine applies this at the dose event, so a \
+                             non-finite value makes the subject's whole integration timeline \
+                             non-finite and every prediction NaN. The usual cause is an \
+                             overflowing `exp(...)` — an exponential covariate model on an \
+                             unscaled covariate — since `exp` is the one arithmetic here with \
+                             no domain guard (`/` by ~0 returns 0, and `ln`/`sqrt` floor their \
+                             argument). Check this subject's covariate values.",
+                            subject.id
+                        ),
+                    )
+                    .with_block("individual_parameters")];
+                }
+            }
+        }
+    }
+    Vec::new()
 }
 
 /// Precondition shared by [`predict`] and the `simulate*` family: every dose

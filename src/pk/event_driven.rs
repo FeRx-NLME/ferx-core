@@ -140,6 +140,20 @@ pub struct EventSchedule {
     /// Dose event times are `subject.doses[k].time + dose_lagtimes[k]`
     /// so the schedule already reflects per-dose lagtime.
     pub events: Vec<Event>,
+    /// `true` when any event time is `NaN`/infinite (#1189) — a non-finite dose
+    /// lagtime, typically. The sort is [`f64::total_cmp`], a total order that puts
+    /// `NaN` last and cannot panic, but that alone is a *silent wrong number*: the
+    /// walk advances on `ev.time > cur_t`, which is `false` for `NaN`, so the bad
+    /// dose is simply never applied and the rest of the trajectory comes back finite
+    /// — a drug-free subject reported as a valid prediction. The walk reports the
+    /// whole subject non-finite instead, which the estimation guards already handle.
+    ///
+    /// `pub(crate)`, unlike this struct's other fields: nothing outside the crate has a
+    /// use for it, and the public-API baseline is a design gate, not paperwork. The side
+    /// effect is that an external struct literal can no longer build an `EventSchedule`
+    /// — which is right, since `bounds_per_interval` must stay consistent with `events`
+    /// and only [`EventSchedule::for_subject`] can establish that.
+    pub(crate) non_finite_event_time: bool,
     /// For each interval `i` between `events[i]` and `events[i+1]`, the
     /// sub-interval boundary points (sorted, deduped, including the two
     /// interval endpoints) at which the active infusion rate matrix
@@ -245,8 +259,7 @@ impl EventSchedule {
         }
         events.sort_by(|a, b| {
             a.time
-                .partial_cmp(&b.time)
-                .unwrap_or(std::cmp::Ordering::Equal)
+                .total_cmp(&b.time)
                 .then_with(|| kind_order(a.kind).cmp(&kind_order(b.kind)))
         });
 
@@ -280,10 +293,13 @@ impl EventSchedule {
             }
         }
 
+        let non_finite_event_time = events.iter().any(|e| !e.time.is_finite());
+
         Self {
             events,
             bounds_per_interval,
             dose_lagtimes: stored_lagtimes,
+            non_finite_event_time,
         }
     }
 }
@@ -355,7 +371,7 @@ fn compute_propagation_bounds(
             }
         }
     }
-    bounds.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    bounds.sort_by(|a, b| a.total_cmp(b));
     bounds.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
     bounds
 }
@@ -763,6 +779,11 @@ fn event_driven_predictions_with_schedule_impl(
 
     if n_obs == 0 || schedule.events.is_empty() {
         return preds;
+    }
+    // A non-finite event time makes the subject non-finite (#1189) — see
+    // `EventSchedule::non_finite_event_time`.
+    if schedule.non_finite_event_time {
+        return vec![f64::NAN; n_obs];
     }
 
     let (n_states, central_slot) = state_layout(pk_model);
@@ -3464,5 +3485,108 @@ mod tests {
                                                                            // Both deliver the same AMT; AUC = AMT/CL regardless of absorption shape.
         assert_relative_eq!(auc_inf, amt / cl, max_relative = 2e-3);
         assert_relative_eq!(auc_inf, auc_bolus, max_relative = 2e-3);
+    }
+
+    /// #1189 — a non-finite dose lagtime must not panic this walk's event sort, and
+    /// must not come back as a *finite* answer with the bad dose silently dropped.
+    ///
+    /// This is the **analytical** (closed-form) event walk — a *different* timeline sort
+    /// from the ODE engines', and one an ODE-model test never reaches, which is why it
+    /// needs its own coverage. It carried `partial_cmp(..).unwrap_or(Ordering::Equal)`,
+    /// there deliberately as the NaN-safe form. It is not a total order, and `sort_by`
+    /// panics when it detects one — but **only opportunistically**: measured on this
+    /// toolchain the same composite comparator panics on a 30-event (5 NaN) and an
+    /// 84-event (2 NaN) timeline of this walk's own `Event` type, and does *not* on 24,
+    /// 40, 60 or 120. Adding a single `usize` to the element flips shapes either way, so
+    /// the old spelling was neither safe nor reliably loud.
+    ///
+    /// `total_cmp` alone is not enough either: it sorts `NaN` last, and the walk advances
+    /// on `ev.time > cur_t`, which is `false` for `NaN` — so the lagged dose is never
+    /// applied and every prediction comes back finite and drug-free.
+    ///
+    /// The fixture is 5 doses + 20 observations = **30 events**, one of the shapes
+    /// measured to trip the detector, so both mutations below are lethal here. The
+    /// durable signal is the second one: the guard makes the outcome deterministic on
+    /// every shape, whereas the panic is an implementation detail of the sort.
+    ///
+    /// Mutations (both run): restore `unwrap_or(Ordering::Equal)` → panic; drop
+    /// `EventSchedule::non_finite_event_time`'s guard → finite predictions and the assert
+    /// below fires.
+    #[test]
+    fn non_finite_lagtime_gives_a_non_finite_subject_not_a_panic_or_a_silent_drop() {
+        // 5 doses x 2 events + 20 observations = 30 events, one of the shapes measured
+        // to make `sort_by` detect the old non-total comparator (24 and 40 do not).
+        let doses: Vec<DoseEvent> = (0..5)
+            .map(|k| DoseEvent::new(k as f64 * 12.0, 100.0, 1, 0.0, false, 0.0))
+            .collect();
+        let obs_times: Vec<f64> = (1..=20).map(|i| i as f64 * 1.5).collect();
+        let subj = make_subject(doses, obs_times.clone());
+
+        for (label, lag) in [
+            ("NaN", f64::NAN),
+            ("+inf", f64::INFINITY),
+            ("-inf", f64::NEG_INFINITY),
+        ] {
+            let lags = vec![lag; subj.doses.len()];
+            let schedule = EventSchedule::for_subject(&subj, PkModel::OneCptIv, &subj.doses, &lags);
+            assert_eq!(
+                schedule.events.len(),
+                30,
+                "[{label}] the fixture must keep the 30-event shape the sort-detector \
+                 measurement was made on"
+            );
+            assert!(
+                schedule.non_finite_event_time,
+                "[{label}] a non-finite lagtime must be recorded on the schedule"
+            );
+
+            let mut pk = PkParams::default();
+            pk.values[crate::types::PK_IDX_CL] = 1.0;
+            pk.values[crate::types::PK_IDX_V] = 10.0;
+            let pk_at_dose = vec![pk; subj.doses.len()];
+            let pk_at_obs = vec![pk; obs_times.len()];
+            let preds = event_driven_predictions_with_schedule(
+                PkModel::OneCptIv,
+                &subj,
+                &schedule,
+                &pk_at_dose,
+                &pk_at_obs,
+                &[],
+            );
+            assert_eq!(preds.len(), obs_times.len());
+            assert!(
+                preds.iter().all(|p| !p.is_finite()),
+                "[{label}] a non-finite-lagged subject must come back non-finite; the \
+                 dose was silently never applied instead: {preds:?}"
+            );
+        }
+    }
+
+    /// The control for the test above: with a **finite** lagtime the same subject is
+    /// solved normally. Without this, that test would also pass if the schedule flagged
+    /// every subject as non-finite, which would turn every analytical fit into `NaN`.
+    #[test]
+    fn a_finite_lagtime_is_not_flagged_non_finite() {
+        let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        let obs_times = vec![1.0, 4.0, 8.0];
+        let subj = make_subject(doses, obs_times.clone());
+        let schedule = EventSchedule::for_subject(&subj, PkModel::OneCptIv, &subj.doses, &[0.5]);
+        assert!(!schedule.non_finite_event_time);
+
+        let mut pk = PkParams::default();
+        pk.values[crate::types::PK_IDX_CL] = 1.0;
+        pk.values[crate::types::PK_IDX_V] = 10.0;
+        let preds = event_driven_predictions_with_schedule(
+            PkModel::OneCptIv,
+            &subj,
+            &schedule,
+            &[pk],
+            &vec![pk; obs_times.len()],
+            &[],
+        );
+        assert!(
+            preds.iter().all(|p| p.is_finite() && *p > 0.0),
+            "a finite lagtime must still solve normally, got {preds:?}"
+        );
     }
 }

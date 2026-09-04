@@ -49,6 +49,32 @@ section of the SDLC for the versioning policy).
   a question of resets and time-varying covariates, not of where its entry time falls.
   Both engines now agree with `predict_survival()`: `H = 0` and `h = h(u₀)` there, so a
   pre-start entry time contributes nothing.
+- **A dose landing within 1e-12 of a *derived* break time is no longer applied twice
+  (#1186).** A per-route absorption onset (`dose.time + ALAG + lag`) and an infusion end
+  (`dose.time + AMT/RATE`) are multi-term float sums, so they routinely land one or two
+  ULP from another dose's own break — past the timeline's 1e-15 dedup and inside the
+  dose-arrival match. Every engine that resolves its events by rescanning the timeline
+  then applied that dose at both breaks: a bolus was doubled (144.04 against NONMEM's
+  144.041725 on the anchor fixture, and 239.11 against 170.73 further out), and a
+  colliding *infusion* was activated twice so its rate doubled for the whole window. Every
+  engine now fires each dose event exactly once, and the dose / SS-seed / reset match is
+  one tolerance everywhere. It used to be 1e-12 on the objective path and **1e-10** on the
+  sdtab, joint PK-TTE hazard, `[derived]`, Markov and `simulate()` paths, so the same
+  dataset could double a dose in every diagnostic while the reported OFV was correct — and
+  an infusion doubled on *only* those paths at any separation. Reachable without any
+  absorption DSL (any infusion whose computed end nears a later dose), through a large
+  time value, an optimizer iterate driving an estimated lag toward zero, or a
+  covariate-scaled lag. New anchor: `nonmem_anchor/break_collision{,_inf}.ctl`.
+- **A non-finite dose lagtime no longer panics the fit (#1189).** A `NaN` or infinite
+  `ALAG`/`LAGTIME` — typically an exponential covariate model on an unscaled covariate —
+  made the subject's integration timeline unorderable and aborted with
+  `called Option::unwrap() on a None value` on the objective path and both dense builders.
+  Such a subject now comes back non-finite, which the estimator already handles as a
+  diverged solve, and a lagtime or `F` that is already non-finite at typical values is
+  rejected before the fit starts with `E_DOSE_ATTR_NONFINITE`, naming the subject. (The
+  previous "NaN-safe" sort spelling was not safe either: its comparator is not a total
+  order, which `sort_by` panics on when it notices — which it does only for some
+  timelines, so that spelling was neither safe nor reliably loud.)
 - **A joint PK-TTE (or binary / Markov) model fed a population read without the model
   is now a hard error instead of a silently wrong fit (#1199).** `read_nonmem_csv()` knows
   no model, so a dataset read through it carried the endpoint's rows as Gaussian
@@ -99,6 +125,29 @@ section of the SDLC for the versioning policy).
   of one-cycle integrations back.
 
 ### Added
+- **A shared candidate runner for model-space search (#1178, part of #1175).**
+  `ferx_tools::search::Runner` fits a list of candidate models in parallel and returns each
+  one scored: the ranking criterion (`ofv`, `aic`, or any of the four BIC variants), the
+  `Strictness` verdict with the reasons for every gate it failed, and the fit itself.
+  Candidates are identified by the canonical hash of their model text, so a model reached
+  twice by two different edit paths is fitted **once**; with a cache directory each outcome is
+  journalled as it finishes, so an interrupted overnight search resumes and refits only what
+  is missing, and every candidate — including the ones that failed to compile, failed to fit
+  or failed the gate — appears in `candidates.csv` with its reason rather than being dropped.
+  The thread budget splits across both levels of parallelism via `PoolPlan` (#1115) instead of
+  nesting Rayon pools, and a `CancelFlag` stops a search between candidates and returns the
+  partial results — into `candidates.partial.csv`, so cancelling a resumed run never overwrites
+  the complete table of the run it resumed. The cache directory is claimed for the length of a
+  run (`search.lock`) because two runs sharing one would silently destroy each other's journal,
+  and a directory that cannot be written costs the resume and the report rather than the fits:
+  those failures come back on `RunReport::warnings` with the results intact. A lock whose owner
+  was hard-killed is taken over automatically, so resuming after a kill — the case the journal
+  exists for — never needs a file deleted by hand. A candidate that produced no fit carries a
+  `CandidateError` saying whether the failure was the *model* (it does not compile: remembered,
+  and reported without refitting) or the *run* (a fit pool that could not be built: refitted on
+  the next resume), so one bad minute cannot permanently mark a fittable model as unfittable.
+  This is the orchestration layer the covariate, structural, variability and residual-error
+  searches of #1175 are built on.
 - **BIC variants and a `Strictness` gate for candidate ranking (#1177, part of #1175).**
   `ferx_core::bic(&result, BicType::{Mixed, Iiv, Random, Fixed})` computes the four
   conventions of `pharmpy.modeling.calculate_bic` from a finished `FitResult` — the
@@ -124,6 +173,14 @@ section of the SDLC for the versioning policy).
   marked fixed, which is what it meant at the time.
 
 ### Fixed
+- **Numbers written to JSON now reload as themselves, bit for bit (#1178).** `serde_json`
+  parses floats with a fast algorithm accurate only to within 1 ULP unless its
+  `float_roundtrip` feature is enabled, which it now is across `ferx-core`, `ferx-tools` and
+  the CLI. Anything that writes a number and reads it back — a `.fitrx` bundle, a search
+  journal, a cached fit — could otherwise return an estimate one bit from the one that was
+  computed, and do it invisibly, since every printed form rounds long before that digit. The
+  case that caught it was a resumed candidate search reporting a criterion of
+  `-200.28784144636057` for a fit that scored `-200.28784144636055`.
 - **`n_parameters`, AIC and BIC no longer count the structural zeros of a mixed
   `block_omega` + diagonal `omega` as estimated parameters (#1177).** The cross-block
   Cholesky entries of such an Ω are pinned, never searched, and the covariance step already
@@ -261,7 +318,9 @@ section of the SDLC for the versioning policy).
   `P = TVP * exp(ETA_P)` form and is a hard error naming the parameter on anything else, never
   a silent wrong edit. `ModelText::canonical_hash` gives a candidate a stable identity — equal
   across comment and whitespace changes, different for every semantic one — for use as a fit
-  cache key. This is the prerequisite for the model-search tooling in #1175.
+  cache key; a `#` or `//` inside a quoted value is content, not a comment, so two candidates
+  differing only in a quoted path (`"s3://bucket/a.csv"` vs `.../b.csv`) are two candidates.
+  This is the prerequisite for the model-search tooling in #1175.
 - **A cancellable bootstrap (#1161).** `BootstrapOptions::cancel` takes a `CancelFlag`; setting
   it from another thread stops a long `ferx_tools::bootstrap` run at the next replicate boundary
   and returns the new `BootstrapError::Cancelled`, so a caller reports an abort as an abort
