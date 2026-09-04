@@ -11487,3 +11487,199 @@ fn tad_reading_model_without_a_lagtime_takes_a_route_that_matches_fd() {
 
     check_full_provider_vs_fd(&model, &subject, &theta, &eta);
 }
+
+// ── #1186 / #1189 on the analytic-sensitivity static walk (`integrate_g`) ────────
+//
+// `integrate_g` rescans `subject.doses` at every break exactly as production's dense
+// engines do, so it carries the same two defects: an infusion end (`dose.time +
+// amt/rate`) landing within `EVENT_MATCH_TOL` of a later dose applied that dose twice,
+// and a `NaN` timeline entry went through a `partial_cmp(..).unwrap_or(Equal)` sort that
+// is not a total order. It is generic over `T`, so one apply-once mask serves the `f64`
+// value walk and the `Dual2`/`Dual1` sensitivity instantiations alike — which is why the
+// FD parity harness below is the right check: it compares the *dual* walk against finite
+// differences of the `T = f64` production predictor, so a mask that fired on only one
+// instantiation would split them.
+
+/// The rate whose computed infusion duration `100/rate` lands strictly inside
+/// `(1e-15, EVENT_MATCH_TOL)` of `8.2` — the #1186 geometry with no absorption DSL at
+/// all. Searched rather than hard-coded (the exact bits come out of the division), then
+/// asserted, so the fixture cannot silently drift out of the band it exists to test.
+fn colliding_infusion_rate() -> (f64, f64) {
+    let r0 = 100.0 / 8.2;
+    let ulp = f64::EPSILON * r0;
+    let (rate, dur) = (-200..=200)
+        .filter_map(|k| {
+            let r = r0 + (k as f64) * ulp;
+            let d = 100.0 / r;
+            let s = (d - 8.2f64).abs();
+            (s > 1e-15 && s < crate::ode::predictions::EVENT_MATCH_TOL).then_some((r, d))
+        })
+        .next()
+        .expect("no rate in the (1e-15, EVENT_MATCH_TOL) band");
+    let sep = (dur - 8.2f64).abs();
+    assert!(
+        sep > 1e-15 && sep < crate::ode::predictions::EVENT_MATCH_TOL,
+        "the infusion end must straddle the 1e-15 dedup and EVENT_MATCH_TOL (sep {sep:.3e})"
+    );
+    (rate, dur)
+}
+
+const COLLIDING_INFUSION_ODE: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-11
+  ode_abstol = 1e-13
+"#;
+
+/// #1186 on the static sensitivity walk: an infusion whose end collides with a later
+/// bolus must contribute its mass **once**, in the value and in every jet.
+///
+/// The value side is anchored on the closed form (`ode_predictions` is itself pinned
+/// against NONMEM `break_collision_inf` in `ode/predictions_tests.rs`), and the
+/// derivative side on `check_full_provider_vs_fd`, which finite-differences the `T = f64`
+/// production predictor — so this is the Dual2-vs-FD parity the CLAUDE.md rule requires
+/// for a change to a sensitivity walk, exercised **on the collision** rather than on a
+/// clean timeline.
+///
+/// Mutation: delete `integrate_g`'s `if dose_applied[k] { continue; }` and the value
+/// doubles (the FD reference doubles with it — hence the closed-form assert, which does
+/// not, is the one that catches it).
+#[test]
+fn colliding_infusion_end_is_applied_once_on_the_sens_walk() {
+    let m = parse_model_string(COLLIDING_INFUSION_ODE).expect("parse colliding-infusion ODE");
+    let (rate, dur) = colliding_infusion_rate();
+    let theta = [1.0, 10.0];
+    let eta = [0.0, 0.0];
+    let s = subject_with_doses_and_resets(
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, rate, false, 0.0),
+            DoseEvent::new(8.2, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &[8.2001, 12.0, 24.0],
+        Vec::new(),
+    );
+
+    // Value oracle, independent of both engines: a zero-order input over `[0, dur]`
+    // followed by one bolus at 8.2, read as `central / V`.
+    let (cl, v) = (1.0_f64, 10.0_f64);
+    let ke = cl / v;
+    let closed = |t: f64, n_b: f64| {
+        let inf = (rate / ke) * (1.0 - (-ke * dur).exp()) * (-ke * (t - dur)).exp();
+        (inf + n_b * 100.0 * (-ke * (t - 8.2)).exp()) / v
+    };
+    let sens = subject_sensitivities(&m, &s, &theta, &eta)
+        .expect("a plain infusion+bolus subject stays in analytic scope");
+    for (i, &t) in [8.2001_f64, 12.0, 24.0].iter().enumerate() {
+        let want = closed(t, 1.0);
+        let doubled = closed(t, 2.0);
+        assert!(
+            (want - doubled).abs() > 0.5,
+            "the once/twice oracles must differ at t={t} or this cannot fail"
+        );
+        assert!(
+            sens.obs[i].f.is_finite(),
+            "the sens walk returned a non-finite value at t={t}"
+        );
+        assert!(
+            (sens.obs[i].f - want).abs() < 1e-4,
+            "sens walk at t={t}: {:.6} — expected the applied-once {want:.6} \
+             (doubled reads {doubled:.6})",
+            sens.obs[i].f
+        );
+    }
+
+    // Dual2-vs-FD parity on the same collision, so the mask is exercised on the dual
+    // instantiation and not only on the `T = f64` value walk.
+    check_full_provider_vs_fd(&m, &s, &theta, &eta);
+}
+
+/// #1189 on the static sensitivity walk: a `NaN` lag makes the timeline unorderable, and
+/// the walk must return non-finite jets rather than panicking or — worse — a finite
+/// gradient computed with the bad dose silently never applied.
+///
+/// Its sort was one of the `partial_cmp(..).unwrap_or(Ordering::Equal)` sites, which is
+/// not a total order — `sort_by` panics when it detects one, though only opportunistically
+/// (see [`timeline_has_non_finite`](crate::ode::predictions::timeline_has_non_finite)).
+/// The assertion here does not rely on that: it pins the *outcome*, which the guard makes
+/// deterministic on every shape.
+///
+/// Mutation (run): delete the sens event-driven walk's `timeline_has_non_finite` guard →
+/// finite jets and the assert below fires.
+#[test]
+fn nan_lagtime_sens_walk_is_non_finite_not_a_panic() {
+    const NAN_LAG_ODE: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  theta TVLAG(0.3, 0.0, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  LAGTIME = TVLAG * exp(WT)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-11
+  ode_abstol = 1e-13
+"#;
+    let m = parse_model_string(NAN_LAG_ODE).expect("parse NaN-lag ODE");
+    // `WT = 1000` ⇒ `LAGTIME = 0.3·exp(1000) = +inf`, so every derived break is
+    // non-finite. `exp` is the reachable overflow: the DSL's `/`, `ln` and `sqrt` are
+    // all domain-guarded (division by ~0 returns 0, `ln`/`sqrt` floor their argument),
+    // so an exponential covariate model on an unscaled covariate — a real modelling
+    // mistake — is how a lag actually goes non-finite at typical values, and an
+    // optimizer iterate is how it happens mid-fit.
+    let times: Vec<f64> = (1..=40).map(|i| i as f64 * 0.5).collect();
+    assert!(
+        times.len() >= 21,
+        "the timeline must exceed the 21-element threshold where sort_by starts \
+         detecting a non-total comparator, or this cannot fail"
+    );
+    let mut s = subject_with_doses_and_resets(
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(8.2, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &times,
+        Vec::new(),
+    );
+    s.covariates.insert("WT".to_string(), 1000.0);
+
+    // No panic. Whatever the provider returns — a declined `None` or non-finite jets —
+    // it must not be a *finite* answer, which would mean the bad dose was dropped and
+    // the rest of the trajectory reported as valid.
+    let theta = [1.0, 10.0, 0.3];
+    let eta = [0.0, 0.0];
+    if let Some(sens) = subject_sensitivities(&m, &s, &theta, &eta) {
+        assert!(
+            sens.obs.iter().any(|o| !o.f.is_finite()),
+            "a non-finite-lagged subject came back entirely finite from the sens walk: \
+             the bad dose was silently never applied"
+        );
+    }
+}

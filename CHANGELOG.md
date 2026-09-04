@@ -20,6 +20,32 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Fixed
+- **A dose landing within 1e-12 of a *derived* break time is no longer applied twice
+  (#1186).** A per-route absorption onset (`dose.time + ALAG + lag`) and an infusion end
+  (`dose.time + AMT/RATE`) are multi-term float sums, so they routinely land one or two
+  ULP from another dose's own break — past the timeline's 1e-15 dedup and inside the
+  dose-arrival match. Every engine that resolves its events by rescanning the timeline
+  then applied that dose at both breaks: a bolus was doubled (144.04 against NONMEM's
+  144.041725 on the anchor fixture, and 239.11 against 170.73 further out), and a
+  colliding *infusion* was activated twice so its rate doubled for the whole window. Every
+  engine now fires each dose event exactly once, and the dose / SS-seed / reset match is
+  one tolerance everywhere. It used to be 1e-12 on the objective path and **1e-10** on the
+  sdtab, joint PK-TTE hazard, `[derived]`, Markov and `simulate()` paths, so the same
+  dataset could double a dose in every diagnostic while the reported OFV was correct — and
+  an infusion doubled on *only* those paths at any separation. Reachable without any
+  absorption DSL (any infusion whose computed end nears a later dose), through a large
+  time value, an optimizer iterate driving an estimated lag toward zero, or a
+  covariate-scaled lag. New anchor: `nonmem_anchor/break_collision{,_inf}.ctl`.
+- **A non-finite dose lagtime no longer panics the fit (#1189).** A `NaN` or infinite
+  `ALAG`/`LAGTIME` — typically an exponential covariate model on an unscaled covariate —
+  made the subject's integration timeline unorderable and aborted with
+  `called Option::unwrap() on a None value` on the objective path and both dense builders.
+  Such a subject now comes back non-finite, which the estimator already handles as a
+  diverged solve, and a lagtime or `F` that is already non-finite at typical values is
+  rejected before the fit starts with `E_DOSE_ATTR_NONFINITE`, naming the subject. (The
+  previous "NaN-safe" sort spelling was not safe either: its comparator is not a total
+  order, which `sort_by` panics on when it notices — which it does only for some
+  timelines, so that spelling was neither safe nor reliably loud.)
 - **A joint PK-TTE (or binary / Markov) model fed a population read without the model
   is now a hard error instead of a silently wrong fit (#1199).** `read_nonmem_csv()` knows
   no model, so a dataset read through it carried the endpoint's rows as Gaussian

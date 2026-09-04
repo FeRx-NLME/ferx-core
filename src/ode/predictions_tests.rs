@@ -4615,9 +4615,12 @@ fn duration_defined_infusion_into_first_order_absorption_matches_subdose_train()
 #[test]
 fn gated_infusions_suppresses_infusion_into_input_rate_cmt() {
     // Two infusions: CMT 1 (≡ state 0, the forcing compartment) and CMT 2 (≡ state 1).
+    // `amt > 0` so both rows are real infusions (`duration = amt/rate = 3`); since
+    // #1196 the shared predicate includes `is_real_infusion`, so a degenerate `amt = 0`
+    // row would be dropped before the compartment rule under test is reached.
     let doses = vec![
-        DoseEvent::new(0.0, 0.0, 1, 4.0, false, 0.0),
-        DoseEvent::new(0.0, 0.0, 2, 7.0, false, 0.0),
+        DoseEvent::new(0.0, 12.0, 1, 4.0, false, 0.0),
+        DoseEvent::new(0.0, 21.0, 2, 7.0, false, 0.0),
     ];
     let f_bio = vec![1.0, 1.0];
     let active = vec![(0usize, 1.0, 3.0), (1usize, 1.0, 3.0)];
@@ -5399,13 +5402,18 @@ fn gated_infusions_resolves_rate_and_drops_unaddressable() {
     // beyond the state vector are dropped. The empty forcing slice is the
     // "model has no built-in absorption" case; the input-rate drop it also owns
     // (#1187) is covered by `gated_infusions_suppresses_infusion_into_input_rate_cmt`.
-    let mut dur_defined = DoseEvent::new(0.0, 0.0, 1, 4.0, false, 0.0);
+    // Real infusions (`amt > 0`, so `duration = amt/rate > 0`): since #1196 both
+    // resolvers share one predicate, and `is_real_infusion` is part of it — a
+    // degenerate `amt = 0` row is a bolus, not a zero-length infusion, and is dropped
+    // for *that* reason. Keeping the amounts non-zero is what makes the two drops
+    // below test the compartment rule they are named for.
+    let mut dur_defined = DoseEvent::new(0.0, 12.0, 1, 4.0, false, 0.0);
     dur_defined.infusion_def = crate::types::InfusionDef::DurationDefined;
     let doses = vec![
-        DoseEvent::new(0.0, 0.0, 1, 4.0, false, 0.0), // rate-defined: rate held
-        DoseEvent::new(0.0, 0.0, 0, 9.0, false, 0.0), // CMT 0 -> dropped
-        DoseEvent::new(0.0, 0.0, 5, 9.0, false, 0.0), // CMT 5 -> state 4 >= n -> dropped
-        dur_defined,                                  // duration-defined: F·rate
+        DoseEvent::new(0.0, 12.0, 1, 4.0, false, 0.0), // rate-defined: rate held
+        DoseEvent::new(0.0, 27.0, 0, 9.0, false, 0.0), // CMT 0 -> dropped
+        DoseEvent::new(0.0, 27.0, 5, 9.0, false, 0.0), // CMT 5 -> state 4 >= n -> dropped
+        dur_defined,                                   // duration-defined: F·rate
     ];
     let f_bio = vec![0.5, 1.0, 1.0, 0.5];
     let active = vec![
@@ -9452,6 +9460,644 @@ fn with_states_on_a_single_instant_timeline_returns_the_post_dose_state() {
             ipred1[0] >= 100.0,
             "{arm}: the post-dose amount is {}",
             ipred1[0]
+        );
+    }
+}
+
+// ── #1186 / #1189 / #1196: a derived break within the event-match tolerance ──
+//
+// A *derived* break time — a per-route absorption onset `dose.time + lag_cmt + lag_route`,
+// an infusion end `dose.time + amt/rate` — is a multi-term float sum, so it routinely lands
+// one or two ULP away from another dose's own break. That gap is past the timeline's `1e-15`
+// dedup and well inside the dose-arrival match, and every engine that resolves its events by
+// *rescanning* the timeline used to apply the colliding dose at both breaks: a doubled bolus
+// (144.04 → 244.04 below), or an infusion pushed into `active_infusions` twice so its rate
+// doubled for the whole window (99.52 → 148.30).
+//
+// The fix is an apply-once mask per dose event plus one `EVENT_MATCH_TOL` on every engine;
+// see that constant's doc for why no pair of tolerances can do it instead.
+//
+// **Oracle**: `nonmem_anchor/break_collision{,_inf}.ctl` — an exact ADVAN13 twin of the
+// fixture below, whose `ONSET = TDOS + LAGC + LAGR` is the same `8.200000000000001` in
+// double. NONMEM is event-typed, so it applies each dose record once regardless of the float
+// coincidence, which makes it an "applied once" reference independent of the defect.
+mod break_collision_1186 {
+    use super::*;
+    use crate::pk::absorption::{InputRateForcing, InputRateKind};
+    use crate::types::{
+        DoseEvent, PkParams, MAX_PK_PARAMS, PK_IDX_CL, PK_IDX_F, PK_IDX_KA, PK_IDX_V,
+    };
+
+    const ROUTE_LAG_SLOT: usize = 20;
+    const ALAG1_SLOT: usize = 21;
+
+    /// `nonmem_anchor/results/break_collision.tab`, `PRED` at 8.2001 / 8.7 / 12 / 24.
+    const NM_BOLUS: [f64; 4] = [144.041725, 145.877353, 170.725636, 55.0980713];
+    /// `nonmem_anchor/results/break_collision_inf.tab`, `PRED` at 8.7 / 9.2001 / 12 / 24.
+    const NM_INFUSION: [f64; 4] = [99.5249857, 160.432175, 174.261827, 56.1631517];
+
+    /// The ferx twin of `break_collision.ctl`: `depot(0) ← first_order(ka, lag=ROUTE_LAG)`,
+    /// `central(1) ← KA·depot − CL/V·central`, with a compartment lag `ALAG1` on cmt 1.
+    /// A dose into cmt 2 is unlagged, so its own break is exactly its record time.
+    fn spec() -> OdeSpec {
+        let mut map = crate::types::DoseAttrMap::default();
+        map.insert(crate::types::DoseAttr::Lag, 1, ALAG1_SLOT);
+        OdeSpec {
+            chz_state_slots: Vec::new(),
+            rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+                let cl = p[PK_IDX_CL];
+                let v = p[PK_IDX_V];
+                let ka = p[PK_IDX_KA];
+                dy[0] = -ka * y[0];
+                dy[1] = ka * y[0] - (cl / v) * y[1];
+            }),
+            n_states: 2,
+            state_names: vec!["depot".into(), "central".into()],
+            readout: OdeReadout::ObsCmt(1),
+            diffusion_var: Vec::new(),
+            // Tight enough that the engine comparison below is about event handling,
+            // not integrator error: the doubled-dose signal is 100 mg against a 1e-6
+            // bound, but the NONMEM anchor is asserted to the printed digits.
+            solver_opts: OdeSolverOptions {
+                abstol: 1e-12,
+                reltol: 1e-10,
+                ..OdeSolverOptions::default()
+            },
+            input_rate: vec![InputRateForcing {
+                cmt: 0,
+                kind: InputRateKind::FirstOrder,
+                arg_slots: vec![PK_IDX_KA],
+                frac_slot: None,
+                lag_slot: Some(ROUTE_LAG_SLOT),
+            }],
+            init_fn: None,
+            rhs_program: None,
+            readout_program: None,
+            indiv_param_program: None,
+            dose_attr_map: map,
+        }
+    }
+
+    fn pk(route_lag: f64, alag1: f64) -> Vec<f64> {
+        let mut p = vec![0.0; MAX_PK_PARAMS];
+        p[PK_IDX_CL] = 1.0;
+        p[PK_IDX_V] = 10.0;
+        p[PK_IDX_KA] = 1.0;
+        p[PK_IDX_F] = 1.0;
+        p[ROUTE_LAG_SLOT] = route_lag;
+        p[ALAG1_SLOT] = alag1;
+        p
+    }
+
+    /// A (t=0, cmt 1 — feeds the lagged route, so its own bolus is suppressed),
+    /// C (t=0, cmt 2 — residual drug, so the victim lands with the compartment
+    /// non-empty: the incoming side of the dose event is live, not `g(x⁻) = 0`),
+    /// B (t=`b_time`, cmt 2 — the victim, a plain bolus on a compartment with no
+    /// input-rate forcing, which is the only kind of dose that can double).
+    fn doses(b_time: f64) -> Vec<DoseEvent> {
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0),
+            DoseEvent::new(b_time, 100.0, 2, 0.0, false, 0.0),
+        ]
+    }
+
+    /// Central at `t` with `n_b` central boluses applied. The route's contribution at
+    /// 8.2001 is ≤ 5e-7 (KA = 1, onset 8.2), so this is the closed form to 1e-6 there.
+    fn once_closed_form(t: f64, n_b: f64) -> f64 {
+        let ke = 0.1;
+        100.0 * (-ke * t).exp() + n_b * 100.0 * (-ke * (t - 8.2)).exp()
+    }
+
+    /// `central` at each `t_obs` from all four engines:
+    /// (`ode_predictions`, `ode_predictions_with_states`, `ode_dense_solve_states`,
+    /// `ode_predictions_event_driven`). The event-driven one dispatches typed events by
+    /// index and never rescans, so it is the in-repo control: it was already right, and
+    /// it must stay right.
+    fn all_engines(ode: &OdeSpec, pkv: &[f64], subject: &Subject, t_obs: &[f64]) -> [Vec<f64>; 4] {
+        let p = ode_predictions(ode, pkv, &[], &[], subject);
+        let (_wi, ws) = ode_predictions_with_states(ode, pkv, &[], &[], subject);
+        let d = ode_dense_solve_states(ode, pkv, &[], &[], subject, t_obs);
+        let mk = |v: &[f64]| PkParams {
+            values: v.try_into().unwrap(),
+        };
+        let pk_d: Vec<PkParams> = subject.doses.iter().map(|_| mk(pkv)).collect();
+        let pk_o: Vec<PkParams> = subject.obs_times.iter().map(|_| mk(pkv)).collect();
+        let ed = ode_predictions_event_driven(ode, subject, &[], &[], &pk_d, &pk_o, &[], &[]);
+        [
+            p,
+            ws.iter().map(|u| u[1]).collect(),
+            d.iter().map(|u| u[1]).collect(),
+            ed,
+        ]
+    }
+
+    const ENGINES: [&str; 4] = [
+        "ode_predictions",
+        "ode_predictions_with_states",
+        "ode_dense_solve_states",
+        "ode_predictions_event_driven",
+    ];
+
+    /// The straddle this whole family rests on: the route onset and the victim's own
+    /// break must be **separated but inside the match** — past the `1e-15` dedup (else
+    /// they merge into one break and nothing can double) and inside `EVENT_MATCH_TOL`
+    /// (else the scan never matches twice and there is no defect to catch).
+    ///
+    /// Asserted on its own so a later change to `ALAG1`, the route lag or the dose time
+    /// cannot quietly make the pair bit-identical and turn every test below into a
+    /// tautology that passes for the wrong reason.
+    #[test]
+    fn issue_fixture_straddles_the_dedup_and_the_match() {
+        let onset = (0.0 + 0.3) + 7.9;
+        let sep = (onset - 8.2f64).abs();
+        assert!(
+            sep > 1e-15,
+            "onset {onset:.17} and the t=8.2 dose are within the 1e-15 dedup (sep {sep:.3e}); \
+             they would merge into one break and the collision could not occur"
+        );
+        assert!(
+            sep < crate::ode::predictions::EVENT_MATCH_TOL,
+            "onset {onset:.17} is further than EVENT_MATCH_TOL from the t=8.2 dose \
+             (sep {sep:.3e}); the scan would never match it twice"
+        );
+    }
+
+    /// #1186, the reported geometry: a route onset landing 1.78e-15 past a *different*
+    /// dose's break must not apply that dose a second time.
+    ///
+    /// Catches: the `applied` mask on all three rescanning engines. Mutation — delete any
+    /// one engine's `if applied[i] { continue; }` and that engine reads 244.04 against a
+    /// 144.041725 NONMEM anchor.
+    #[test]
+    fn derived_break_within_match_tol_applies_bolus_once() {
+        let ode = spec();
+        let obs = vec![8.2001, 8.7, 12.0, 24.0];
+        let pkv = pk(7.9, 0.3);
+        let s = make_subject(doses(8.2), obs.clone());
+        let got = all_engines(&ode, &pkv, &s, &obs);
+
+        for (e, vals) in ENGINES.iter().zip(got.iter()) {
+            for (i, (&g, &want)) in vals.iter().zip(NM_BOLUS.iter()).enumerate() {
+                assert!(
+                    g.is_finite(),
+                    "{e} returned a non-finite prediction at obs {i}"
+                );
+                let rel = (g - want).abs() / want.abs();
+                assert!(
+                    rel < 1e-6,
+                    "{e} at t={}: {g:.6} vs NONMEM {want} (rel {rel:.2e}) — a doubled \
+                     bolus reads {:.6}",
+                    obs[i],
+                    once_closed_form(obs[i], 2.0)
+                );
+            }
+        }
+        // Independent of NONMEM: the closed form at the first observation, where the
+        // route's contribution is negligible. Pins the *size* of the defect (100 mg).
+        let want_once = once_closed_form(8.2001, 1.0);
+        let want_twice = once_closed_form(8.2001, 2.0);
+        assert!(
+            (want_twice - want_once).abs() > 99.0,
+            "the once/twice fixtures must be far apart to be a real oracle"
+        );
+        for (e, vals) in ENGINES.iter().zip(got.iter()) {
+            assert!(
+                (vals[0] - want_once).abs() < 1e-3,
+                "{e}: {:.6} is not the applied-once closed form {want_once:.6}",
+                vals[0]
+            );
+        }
+    }
+
+    /// The **whole reachable band**, on every engine: the collision must be harmless at
+    /// every separation from one ULP to past the widest tolerance any engine ever used.
+    ///
+    /// The band is what made #1186 two defects rather than one. The objective path
+    /// matched a dose arrival at `1e-12` while `with_states` and the dense solve matched
+    /// at `1e-10`, so at a separation between the two the *same dataset* doubled a dose
+    /// in sdtab, the joint PK-TTE hazard, `[derived]` integrals and `simulate()` while
+    /// the reported OFV stayed correct — a 100× asymmetry, and the reason an OFV
+    /// regression test could not have found this.
+    ///
+    /// Catches: **the masks**, at four separations spanning both old tolerances.
+    /// Measured mutations — deleting the mask in `apply_prescheduled_boluses_at`,
+    /// `ode_predictions_with_states` or `apply_segment_boundary` each kills this test.
+    ///
+    /// It does **not** catch reverting a tolerance to `1e-10`, and that was verified by
+    /// running that mutation: it survives. Once a dose fires at most once, a wider match
+    /// only lets it fire at a break up to `1e-10` *earlier*, which no observable
+    /// distinguishes. The single `EVENT_MATCH_TOL` is therefore hygiene — one named
+    /// constant, no second spelling to drift — not the fix; the masks are the fix.
+    #[test]
+    fn dose_match_band_is_engine_uniform() {
+        let ode = spec();
+        let obs = vec![8.2001];
+        let onset = (0.0 + 0.3) + 7.9;
+        let pkv = pk(7.9, 0.3);
+        let want = once_closed_form(8.2001, 1.0);
+        // Separations spanning both old tolerances: inside `1e-12` (both engines were
+        // wrong), between `1e-12` and `1e-10` (only the gated engines were wrong), and
+        // past `1e-10` (both were right — the control that keeps this from passing
+        // vacuously if the match were widened instead of the mask added).
+        for delta in [3.5e-15, 5e-13, 5e-12, 5e-11, 5e-10] {
+            let b_time = onset + delta;
+            let s = make_subject(doses(b_time), obs.clone());
+            let got = all_engines(&ode, &pkv, &s, &obs);
+            for (e, vals) in ENGINES.iter().zip(got.iter()) {
+                assert!(vals[0].is_finite(), "{e} non-finite at delta {delta:.0e}");
+                assert!(
+                    (vals[0] - want).abs() < 1e-3,
+                    "{e} at sep {:.3e}: {:.4} — expected the applied-once {want:.4} \
+                     (doubled reads {:.4})",
+                    (b_time - onset).abs(),
+                    vals[0],
+                    once_closed_form(8.2001, 2.0)
+                );
+            }
+        }
+    }
+
+    /// The class is reachable with **no absorption DSL at all**: an infusion's end is
+    /// `dose.time + F·amt/rate`, a derived break like any other, and any later dose
+    /// whose own break lands inside `EVENT_MATCH_TOL` of it doubles. So this is not a
+    /// per-route-lag defect — it reaches every model that carries an infusion.
+    ///
+    /// Catches: the mask on a geometry with no `input_rate` in play.
+    /// Mutation — delete the mask on any rescanning engine → 268.24 instead of 168.24.
+    #[test]
+    fn infusion_end_within_match_tol_of_bolus_applies_once() {
+        let ode = spec();
+        let pkv = pk(0.0, 0.0);
+        // Search the ULP neighbourhood of `rate = 100/8.2` for a rate whose computed
+        // duration lands strictly inside the band. Searched, not hard-coded, because the
+        // exact bits depend on the division — but the band membership is then asserted,
+        // so the fixture cannot silently drift out of the geometry it exists to test.
+        let r0 = 100.0 / 8.2;
+        let ulp = f64::EPSILON * r0;
+        let (rate, dur, sep) = (-200..=200)
+            .filter_map(|k| {
+                let r = r0 + (k as f64) * ulp;
+                let d = 100.0 / r;
+                let s = (d - 8.2f64).abs();
+                (s > 1e-15 && s < crate::ode::predictions::EVENT_MATCH_TOL).then_some((r, d, s))
+            })
+            .next()
+            .expect("no rate in the (1e-15, EVENT_MATCH_TOL) band");
+        assert!(
+            sep > 1e-15 && sep < crate::ode::predictions::EVENT_MATCH_TOL,
+            "the infusion end must straddle the dedup and the match (sep {sep:.3e})"
+        );
+
+        let obs = vec![8.2001];
+        let ds = vec![
+            DoseEvent::new(0.0, 100.0, 2, rate, false, 0.0),
+            DoseEvent::new(8.2, 100.0, 2, 0.0, false, 0.0),
+        ];
+        let s = make_subject(ds, obs.clone());
+        let got = all_engines(&ode, &pkv, &s, &obs);
+
+        // Closed form: the infusion's washout plus one bolus.
+        let ke = 0.1_f64;
+        let inf = (rate / ke) * (1.0 - (-ke * dur).exp()) * (-ke * (8.2001 - dur)).exp();
+        let once = inf + 100.0 * (-ke * 0.0001_f64).exp();
+        for (e, vals) in ENGINES.iter().zip(got.iter()) {
+            assert!(vals[0].is_finite(), "{e} non-finite");
+            assert!(
+                (vals[0] - once).abs() < 1e-3,
+                "{e}: {:.4} — expected the applied-once {once:.4} (doubled reads {:.4})",
+                vals[0],
+                inf + 200.0 * (-ke * 0.0001_f64).exp()
+            );
+        }
+    }
+
+    /// The infusion victim: a colliding **infusion** was pushed into `active_infusions`
+    /// twice on the two `Gated` engines, doubling its rate for the whole window. The
+    /// objective path's `Spanning` arm recomputes the active set per segment and cannot
+    /// push twice, so this is the one arm of #1186 that the OFV never saw — sdtab, the
+    /// joint PK-TTE hazard, `[derived]` and `simulate()` were wrong alone.
+    ///
+    /// Catches: the `active_infusions.push` half of the `applied` mask.
+    /// Mutation — delete the mask in `ode_predictions_with_states` or
+    /// `apply_segment_boundary` → 148.30 against NONMEM's 99.5249857.
+    #[test]
+    fn colliding_infusion_rate_pushed_once() {
+        let ode = spec();
+        let obs = vec![8.7, 9.2001, 12.0, 24.0];
+        let pkv = pk(7.9, 0.3);
+        let mut ds = doses(8.2);
+        // The victim becomes a 1 h infusion (RATE = 100 over AMT = 100).
+        ds[2] = DoseEvent::new(8.2, 100.0, 2, 100.0, false, 0.0);
+        let s = make_subject(ds, obs.clone());
+        let got = all_engines(&ode, &pkv, &s, &obs);
+
+        for (e, vals) in ENGINES.iter().zip(got.iter()) {
+            for (i, (&g, &want)) in vals.iter().zip(NM_INFUSION.iter()).enumerate() {
+                assert!(g.is_finite(), "{e} non-finite at obs {i}");
+                let rel = (g - want).abs() / want.abs();
+                assert!(
+                    rel < 1e-6,
+                    "{e} at t={}: {g:.6} vs NONMEM {want} (rel {rel:.2e})",
+                    obs[i]
+                );
+            }
+        }
+    }
+
+    /// Reachability route 2: an optimizer iterate that puts a route lag *near its zero
+    /// lower bound* makes the route onset land within the match of the dose's own break
+    /// — so any other dose at that same instant doubles. No large `t` and no unusual
+    /// data are needed; just a lag on its way to zero.
+    ///
+    /// Catches: the mask, at `t = 0` where the timeline is densest.
+    /// Mutation — delete the mask on any rescanning engine → ~199.998 instead of ~99.999.
+    #[test]
+    fn near_zero_route_lag_simultaneous_doses_applies_once() {
+        let ode = spec();
+        let obs = vec![0.0001];
+        // Below, inside and above the old tolerances, so the test spans the same band
+        // the two engines used to disagree over.
+        for lag in [5e-13, 5e-11, 5e-9] {
+            let pkv = pk(lag, 0.0);
+            let ds = vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0),
+            ];
+            let s = make_subject(ds, obs.clone());
+            let got = all_engines(&ode, &pkv, &s, &obs);
+            let want = 100.0 * (-0.1f64 * 0.0001).exp();
+            for (e, vals) in ENGINES.iter().zip(got.iter()) {
+                assert!(vals[0].is_finite(), "{e} non-finite at route lag {lag:.0e}");
+                assert!(
+                    (vals[0] - want).abs() < 1e-2,
+                    "{e} at route lag {lag:.0e}: {:.4} — expected the applied-once \
+                     {want:.4} (doubled reads {:.4})",
+                    vals[0],
+                    2.0 * want
+                );
+            }
+        }
+    }
+
+    // ── #1196 step 3: the two infusion resolvers must agree on membership ────────
+
+    /// `active_infusions` (the `Spanning` arm) and `gated_infusions` (the `Gated` arm)
+    /// feed the same `wrap_rhs_with_forcings` seam, so a dose either contributes a plain
+    /// `+rate` on both or on neither. They disagreed: `active_infusions` admitted a
+    /// `CMT=0` infusion as compartment 1 and one with `cmt > n_states`, both of which
+    /// `gated_infusions` dropped — the `Spanning` RHS delivered a rate the `Gated` one
+    /// did not. Unreachable from `fit()` (`check_dose_compartments` rejects both since
+    /// #899, asserted below), but it is exactly the drift #1187 was.
+    ///
+    /// The index sets are built **from each resolver's own output**, so a term added to
+    /// one resolver outside the shared predicate still fails this.
+    /// Mutation — add `&& false` to either resolver's `infusion_contributes` call.
+    #[test]
+    fn infusion_resolvers_agree_on_membership() {
+        let n_states = 3;
+        // Forcing on state 2 (≡ CMT 3), so the last dose is the "feeds the kernel" case.
+        let ir = vec![InputRateForcing {
+            cmt: 2,
+            kind: InputRateKind::FirstOrder,
+            arg_slots: vec![PK_IDX_KA],
+            frac_slot: None,
+            lag_slot: None,
+        }];
+        let ds = vec![
+            DoseEvent::new(0.0, 30.0, 1, 10.0, false, 0.0), // plain infusion, kept
+            DoseEvent::new(0.0, 60.0, 0, 20.0, false, 0.0), // CMT 0
+            DoseEvent::new(0.0, 90.0, 7, 30.0, false, 0.0), // cmt > n_states
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0), // bolus, not an infusion
+            DoseEvent::new(0.0, 0.0, 1, 40.0, false, 0.0),  // amt = 0 → duration 0
+            DoseEvent::new(0.0, 50.0, 3, 50.0, false, 0.0), // into the forced cmt
+        ];
+        let f = vec![1.0; ds.len()];
+        let lags = vec![0.0; ds.len()];
+
+        // `active_infusions` returns `(cmt_idx, rate)`; recover the dose indices by
+        // rebuilding the same call one dose at a time, so the set really is that
+        // resolver's own membership decision and not a re-derivation of the rule.
+        let spanning: std::collections::BTreeSet<usize> = (0..ds.len())
+            .filter(|&k| {
+                !active_infusions(
+                    &ir,
+                    std::slice::from_ref(&ds[k]),
+                    0.0,
+                    1.0,
+                    &lags[..1],
+                    &f[..1],
+                    f64::NEG_INFINITY,
+                    n_states,
+                )
+                .is_empty()
+            })
+            .collect();
+
+        // `gated_infusions` projects a pre-built `(dose_idx, t_start, t_end)` list and
+        // returns `(cmt_idx, rate, t_start, t_end)`; feed it one dose at a time for the
+        // same reason.
+        let gated: std::collections::BTreeSet<usize> = (0..ds.len())
+            .filter(|&k| !gated_infusions(&ir, &[(k, 0.0, 1.0)], &ds, &f, n_states).is_empty())
+            .collect();
+
+        assert_eq!(
+            spanning, gated,
+            "the two infusion resolvers disagree on membership: Spanning {spanning:?} \
+             vs Gated {gated:?}"
+        );
+        // And the membership itself is the intended one — equality alone would also hold
+        // if both resolvers dropped everything.
+        assert_eq!(
+            spanning,
+            std::collections::BTreeSet::from([0usize]),
+            "only the plain in-range infusion into an unforced compartment contributes"
+        );
+    }
+
+    // ── #1189 item 1: a non-finite lag must not panic, and must not be silent ────
+
+    /// A `NaN` compartment lag (`ALAG`) or route lag used to **panic** — the objective
+    /// path included, not just the dense builders — inside
+    /// `break_times.sort_by(|a, b| a.partial_cmp(b).unwrap())`.
+    ///
+    /// `total_cmp` alone would be a *silent wrong number*: the `NaN`-lagged dose simply
+    /// never matches a break, so it is never applied and the rest of the trajectory is
+    /// finite — a drug-free subject reported as a valid prediction. So the fix is the
+    /// total order **plus** the explicit non-finite-break guard, and this asserts both:
+    /// no panic, and every prediction `NaN`.
+    ///
+    /// Mutation — restore `partial_cmp(..).unwrap()` → panic; delete the
+    /// `timeline_has_non_finite` guard → finite predictions and the assert below fires.
+    #[test]
+    fn non_finite_lag_yields_non_finite_subject_not_panic() {
+        let ode = spec();
+        let obs = vec![8.2001, 12.0];
+        for (label, route_lag, alag1) in [
+            ("route lag NaN", f64::NAN, 0.3),
+            ("ALAG1 NaN", 7.9, f64::NAN),
+            ("route lag +inf", f64::INFINITY, 0.3),
+            ("ALAG1 -inf", 7.9, f64::NEG_INFINITY),
+        ] {
+            let pkv = pk(route_lag, alag1);
+            let s = make_subject(doses(8.2), obs.clone());
+            let got = all_engines(&ode, &pkv, &s, &obs);
+            for (e, vals) in ENGINES.iter().zip(got.iter()) {
+                for (i, &g) in vals.iter().enumerate() {
+                    assert!(
+                        !g.is_finite(),
+                        "[{label}] {e} returned a finite {g} at obs {i}: the \
+                         non-finite-lagged dose was silently never applied"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A long timeline through every ODE engine, with a non-finite lag.
+    ///
+    /// Two distinct traps live here. `partial_cmp(..).unwrap()` — what these builders
+    /// actually had — panics deterministically on the `None`. `partial_cmp(..)
+    /// .unwrap_or(Ordering::Equal)`, the spelling elsewhere in the codebase *as* the
+    /// NaN-safe fix, is not a total order either, and `sort_by` panics when it detects
+    /// one — but that detection is opportunistic (see
+    /// [`timeline_has_non_finite`](crate::ode::predictions::timeline_has_non_finite) for
+    /// the measurement), so it cannot be relied on as a test signal. What this asserts is
+    /// therefore the *outcome*: no panic, and a non-finite subject on every engine.
+    ///
+    /// Mutations (run): restore `partial_cmp(..).unwrap()` on the objective builder →
+    /// panic; drop the objective's `timeline_has_non_finite` guard → finite predictions
+    /// and the assert below fires.
+    #[test]
+    fn timeline_sort_never_panics_on_nan() {
+        let ode = spec();
+        // 40 observations plus dose/onset/infusion-end breaks: comfortably past the
+        // 21-element threshold on every builder.
+        let obs: Vec<f64> = (1..=40).map(|i| i as f64 * 0.5).collect();
+        let pkv = pk(f64::NAN, 0.3);
+        let s = make_subject(doses(8.2), obs.clone());
+        assert!(
+            s.obs_times.len() >= 21,
+            "the timeline must exceed the 21-element threshold where sort_by starts \
+             detecting a non-total comparator, or this cannot fail"
+        );
+
+        // No panic on any walk, and every prediction non-finite.
+        for (e, vals) in ENGINES.iter().zip(all_engines(&ode, &pkv, &s, &obs).iter()) {
+            assert!(
+                vals.iter().all(|g| !g.is_finite()),
+                "[{e}] a NaN-lagged subject must come back non-finite"
+            );
+        }
+
+        // The analytic-sensitivity static walk carries the same timeline and was one of
+        // the `unwrap_or(Equal)` sites; its twin lives in `sens/provider_tests.rs`
+        // (`nan_lagtime_sens_walk_is_non_finite_not_a_panic`), where the provider can be
+        // driven directly.
+    }
+
+    // ── #1189 item 2: negative lag — pinned, not changed ─────────────────────────
+
+    /// A **negative** route lag is not an engine inconsistency: all four engines agree
+    /// with each other and with the closed form measured from the *earlier* onset, and
+    /// the dense pre-seed grid between the onset and the seed is integrated, not `NaN`.
+    /// The integration start simply moves earlier, identically everywhere — the
+    /// documented "onset earlier" semantics.
+    ///
+    /// NONMEM's reference behaviour differs: it **aborts**
+    /// (`PK PARAMETER FOR ABSORPTION LAG IS NEGATIVE`, `PROGRAM TERMINATED BY OBJ`).
+    /// Whether to match that is a user-visible policy decision, tracked on #1189; this
+    /// test pins what ferx does today so the decision is taken deliberately rather than
+    /// drifted into.
+    #[test]
+    fn negative_route_lag_engines_agree_from_earlier_onset() {
+        let mut ode = first_order_one_cpt_spec();
+        ode.input_rate[0].lag_slot = Some(ROUTE_LAG_SLOT);
+        ode.solver_opts = OdeSolverOptions {
+            abstol: 1e-12,
+            reltol: 1e-10,
+            ..OdeSolverOptions::default()
+        };
+        let mut p = vec![0.0; MAX_PK_PARAMS];
+        p[PK_IDX_CL] = 1.0;
+        p[PK_IDX_V] = 10.0;
+        p[PK_IDX_KA] = 1.0;
+        p[PK_IDX_F] = 1.0;
+        p[ROUTE_LAG_SLOT] = -0.5;
+
+        // First-order absorption into a 1-cpt disposition, onset at `t0`.
+        let closed = |t: f64, t0: f64| -> f64 {
+            let (ka, ke) = (1.0_f64, 0.1_f64);
+            if t <= t0 {
+                0.0
+            } else {
+                100.0 * ka / (ka - ke) * ((-ke * (t - t0)).exp() - (-ka * (t - t0)).exp())
+            }
+        };
+        let obs = vec![0.5, 2.0, 4.0];
+        let s = make_subject(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs.clone(),
+        );
+        let pr = ode_predictions(&ode, &p, &[], &[], &s);
+        let (wi, _) = ode_predictions_with_states(&ode, &p, &[], &[], &s);
+        let d = ode_dense_solve_states(&ode, &p, &[], &[], &s, &obs);
+        let mk = |v: &[f64]| PkParams {
+            values: v.try_into().unwrap(),
+        };
+        let ed = ode_predictions_event_driven(
+            &ode,
+            &s,
+            &[],
+            &[],
+            &[mk(&p)],
+            &obs.iter().map(|_| mk(&p)).collect::<Vec<_>>(),
+            &[],
+            &[],
+        );
+
+        for (i, &t) in obs.iter().enumerate() {
+            let want = closed(t, -0.5);
+            // The onset-0 value is what a "clamp the lag at zero" engine would return —
+            // a live control, since the two differ by 21 units at the first observation.
+            let clamped = closed(t, 0.0);
+            assert!(
+                (want - clamped).abs() > 1.0,
+                "the earlier-onset and clamped closed forms must differ, or this test \
+                 cannot tell them apart at t={t}"
+            );
+            for (e, got) in [
+                ("ode_predictions", pr[i]),
+                ("ode_predictions_with_states", wi[i]),
+                ("ode_dense_solve_states", d[i][0]),
+                ("ode_predictions_event_driven", ed[i]),
+            ] {
+                assert!(got.is_finite(), "{e} non-finite at t={t}");
+                assert!(
+                    (got - want).abs() < 1e-4,
+                    "{e} at t={t}: {got:.6} — expected the earlier-onset closed form \
+                     {want:.6} (clamped-at-zero would be {clamped:.6})"
+                );
+            }
+        }
+
+        // The pre-seed grid between the negative onset and the seed is integrated, not
+        // left `NaN` — the consequence #1189 reports as happening, which does not.
+        let grid = vec![-0.7, -0.6, -0.4, -0.2, 0.0, 0.5];
+        let dense = ode_dense_solve_states(&ode, &p, &[], &[], &s, &grid);
+        for (i, row) in dense.iter().enumerate() {
+            assert!(
+                row[0].is_finite(),
+                "dense pre-seed node t={} is not finite",
+                grid[i]
+            );
+        }
+        // And the nodes *inside* the shifted window are non-zero — otherwise "finite"
+        // would be satisfied by a grid of zeros that never integrated anything.
+        assert!(
+            dense[2][0] > 1.0 && dense[3][0] > dense[2][0],
+            "nodes between the earlier onset and t=0 must carry drug: got {:?}",
+            dense.iter().map(|u| u[0]).collect::<Vec<_>>()
         );
     }
 }

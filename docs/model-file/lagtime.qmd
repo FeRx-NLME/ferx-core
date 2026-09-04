@@ -168,6 +168,17 @@ intended; prefer using only one of the two names per model.
   before its record time. Prefer a log-link (`exp(...)`) or any other
   parameterisation that keeps `lagtime ≥ 0`. ferx emits a warning in
   `FitResult.warnings` when the initial typical-value lagtime is negative.
+  This is a deliberate divergence from NONMEM, which **aborts** on a negative
+  absorption lag (`PK PARAMETER FOR ABSORPTION LAG IS NEGATIVE`, `PROGRAM
+  TERMINATED BY OBJ`); ferx warns and starts the subject's timeline at the
+  earlier onset, identically on every engine
+  ([#1189](https://github.com/FeRx-NLME/ferx-core/issues/1189)).
+- A **non-finite** `lagtime` (`NaN`/`Inf`) is rejected, not warned. It makes
+  `dose time + lagtime` — and every break derived from it — non-finite, so the
+  subject's integration timeline cannot be ordered at all. One that is already
+  non-finite at typical values is caught at fit-init as `E_DOSE_ATTR_NONFINITE`
+  naming the subject; one produced by a mid-fit parameter excursion makes that
+  subject's predictions `NaN`, which the estimator treats as a diverged solve.
 - Steady-state doses (`SS=1`) combined with non-zero `lagtime` are
   fully supported. Under linear superposition the lagged SS curve at
   time `t` equals the un-lagged SS curve evaluated at `t - lagtime`,

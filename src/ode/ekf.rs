@@ -203,8 +203,25 @@ pub fn solve_ekf(
         .map(|d| dose_attr_map.f_bio(d.cmt_raw(), pk_params_flat))
         .collect();
     break_times.push(t_last);
-    break_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    break_times.sort_by(|a, b| a.total_cmp(b));
     break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
+    // A non-finite break time makes the subject non-finite (#1189) — see
+    // `ode::predictions::timeline_has_non_finite`. `results` is prefilled with the
+    // caller's default point, so overwrite it with NaN ipreds rather than returning a
+    // finite-looking filter pass built on a timeline that could not be ordered.
+    if crate::ode::predictions::timeline_has_non_finite(&break_times) {
+        for r in results.iter_mut() {
+            r.ipred = f64::NAN;
+            r.p_obs = f64::NAN;
+        }
+        return results;
+    }
+
+    // Apply-once mask (#1186): an infusion end (`dose.time + duration`) is a derived
+    // break that can land within `EVENT_MATCH_TOL` of a later dose's own break, and
+    // this loop rescans every dose at every break. The EKF path applies no lagtime, so
+    // one mask (the arrival) covers it.
+    let mut applied = vec![false; doses.len()];
 
     for k in 0..(break_times.len() - 1) {
         let t_start = break_times[k];
@@ -212,10 +229,16 @@ pub fn solve_ekf(
 
         // Apply bolus doses at t_start (infusions enter via the wrapped RHS).
         for (di, dose) in doses.iter().enumerate() {
-            if (dose.time - t_start).abs() < 1e-12 && !is_real_infusion(dose) {
-                let cmt_idx = dose.cmt_idx();
-                if cmt_idx < n {
-                    u[cmt_idx] += dose_f_bio[di] * dose.amt;
+            if applied[di] {
+                continue;
+            }
+            if (dose.time - t_start).abs() < crate::ode::predictions::EVENT_MATCH_TOL {
+                applied[di] = true;
+                if !is_real_infusion(dose) {
+                    let cmt_idx = dose.cmt_idx();
+                    if cmt_idx < n {
+                        u[cmt_idx] += dose_f_bio[di] * dose.amt;
+                    }
                 }
             }
         }
@@ -240,7 +263,7 @@ pub fn solve_ekf(
         if saveat.is_empty() || (saveat.last().unwrap() - t_end).abs() > 1e-12 {
             saveat.push(t_end);
         }
-        saveat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        saveat.sort_by(|a, b| a.total_cmp(b));
         saveat.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
 
         if (t_end - t_start).abs() < 1e-15 {
@@ -258,6 +281,7 @@ pub fn solve_ekf(
             &[],
             &dose_f_bio,
             f64::NEG_INFINITY,
+            n,
         );
 
         let wrapped_rhs = |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
@@ -596,5 +620,167 @@ mod tests {
                 pt.p_obs
             );
         }
+    }
+
+    // ── #1186 / #1189 on the EKF walk ───────────────────────────────────────
+    //
+    // This loop rescans `doses` at every break exactly as the ODE prediction engines do,
+    // and it pushes an infusion-end break at `dose.time + duration` — a derived time that
+    // can land within `EVENT_MATCH_TOL` of a later dose's own break. Its sort was a
+    // `partial_cmp(..).unwrap()` too, so a non-finite time panicked here as well.
+
+    /// A colliding infusion end must not make the later bolus land twice, and with zero
+    /// diffusion the EKF must still equal `ode_predictions` — which is itself anchored on
+    /// NONMEM `break_collision_inf` in `ode/predictions_tests.rs`.
+    ///
+    /// Mutation: delete `ekf.rs`'s `if applied[di] { continue; }` → the bolus doubles and
+    /// the closed-form assert below fires (the `ode_predictions` cross-check would too,
+    /// since only one of the two engines is mutated).
+    #[test]
+    fn ekf_infusion_end_collision_applies_the_bolus_once() {
+        use crate::ode::predictions::{ode_predictions, OdeReadout, OdeSpec};
+        use crate::types::Subject;
+        use std::collections::HashMap;
+
+        // The rate whose computed duration `100/rate` lands strictly inside
+        // `(1e-15, EVENT_MATCH_TOL)` of 8.2 — searched, then asserted, so the fixture
+        // cannot drift out of the band it exists to test.
+        let r0 = 100.0 / 8.2;
+        let ulp = f64::EPSILON * r0;
+        let (rate, dur) = (-200..=200)
+            .filter_map(|k| {
+                let r = r0 + (k as f64) * ulp;
+                let d = 100.0 / r;
+                let s = (d - 8.2f64).abs();
+                (s > 1e-15 && s < crate::ode::predictions::EVENT_MATCH_TOL).then_some((r, d))
+            })
+            .next()
+            .expect("no rate in the (1e-15, EVENT_MATCH_TOL) band");
+        assert!(
+            (dur - 8.2f64).abs() > 1e-15
+                && (dur - 8.2f64).abs() < crate::ode::predictions::EVENT_MATCH_TOL,
+            "the infusion end must straddle the 1e-15 dedup and EVENT_MATCH_TOL"
+        );
+
+        let doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, rate, false, 0.0),
+            DoseEvent::new(8.2, 100.0, 1, 0.0, false, 0.0),
+        ];
+        let obs_times = vec![8.2001, 12.0, 24.0];
+        let pk = make_pk(1.0, 10.0);
+        let opts = OdeSolverOptions {
+            abstol: 1e-12,
+            reltol: 1e-10,
+            ..OdeSolverOptions::default()
+        };
+        let got = solve_ekf(
+            &one_cpt_rhs,
+            1,
+            0,
+            &[0.0],
+            &pk,
+            &crate::types::DoseAttrMap::default(),
+            &[0.0],
+            &doses,
+            &obs_times,
+            &vec![1.0; obs_times.len()],
+            opts,
+        );
+
+        // Closed form: the infusion's washout plus exactly one bolus.
+        let ke = 0.1_f64;
+        for (i, &t) in obs_times.iter().enumerate() {
+            let inf = (rate / ke) * (1.0 - (-ke * dur).exp()) * (-ke * (t - dur)).exp();
+            let once = inf + 100.0 * (-ke * (t - 8.2)).exp();
+            let twice = inf + 200.0 * (-ke * (t - 8.2)).exp();
+            assert!(
+                (once - twice).abs() > 1.0,
+                "the once/twice oracles must differ at t={t} or this cannot fail"
+            );
+            assert!(got[i].ipred.is_finite(), "EKF non-finite at t={t}");
+            assert_relative_eq!(got[i].ipred, once, max_relative = 1e-6);
+        }
+
+        // And against the objective engine at zero diffusion, so the two cannot drift.
+        let ode = OdeSpec {
+            chz_state_slots: Vec::new(),
+            rhs: Box::new(one_cpt_rhs),
+            n_states: 1,
+            state_names: vec!["central".into()],
+            readout: OdeReadout::ObsCmt(0),
+            diffusion_var: Vec::new(),
+            solver_opts: opts,
+            input_rate: Vec::new(),
+            init_fn: None,
+            rhs_program: None,
+            readout_program: None,
+            indiv_param_program: None,
+            dose_attr_map: crate::types::DoseAttrMap::default(),
+        };
+        let subject = Subject {
+            id: "1".into(),
+            doses,
+            obs_times: obs_times.clone(),
+            observations: vec![1.0; obs_times.len()],
+            obs_cmts: vec![1; obs_times.len()],
+            covariates: HashMap::new(),
+            cens: vec![0; obs_times.len()],
+            occasions: vec![1; obs_times.len()],
+            ..Default::default()
+        };
+        let want = ode_predictions(&ode, &pk, &[], &[], &subject);
+        for (i, &t) in obs_times.iter().enumerate() {
+            assert_relative_eq!(got[i].ipred, want[i], max_relative = 1e-8);
+            let _ = t;
+        }
+    }
+
+    /// A non-finite time on this walk's timeline used to panic its
+    /// `partial_cmp(..).unwrap()` sort. It must now return non-finite `ipred`s — not a
+    /// finite filter pass computed on a timeline that could not be ordered, which is
+    /// what `total_cmp` alone would give.
+    ///
+    /// **Defence in depth, and the fixture says why.** The route that reaches the other
+    /// engines — a non-finite *lag* — cannot reach this one: the EKF path applies no
+    /// lagtime, and its only derived break is the infusion end, which
+    /// [`is_real_infusion`] already refuses to emit when `duration = amt/rate` is
+    /// non-finite (that dose falls back to the bolus branch, deliberately, and the
+    /// timeline stays orderable — measured). So the trigger here is a non-finite *record*
+    /// time, reachable through the hand-built entry `solve_ekf` exposes. The guard exists
+    /// because this walk's sort is the same one, not because a fitted dataset gets here.
+    ///
+    /// Mutation: restore `partial_cmp(..).unwrap()` → panic; delete the
+    /// `timeline_has_non_finite` guard → finite `ipred`s and the assert below fires.
+    #[test]
+    fn ekf_non_finite_break_is_non_finite_not_a_panic() {
+        let doses = vec![
+            DoseEvent::new(f64::NAN, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(8.2, 100.0, 1, 0.0, false, 0.0),
+        ];
+        let obs_times: Vec<f64> = (1..=40).map(|i| i as f64 * 0.5).collect();
+        assert!(
+            obs_times.len() >= 21,
+            "the timeline must exceed the 21-element threshold where sort_by starts \
+             detecting a non-total comparator, or this cannot fail"
+        );
+        let pk = make_pk(1.0, 10.0);
+        let got = solve_ekf(
+            &one_cpt_rhs,
+            1,
+            0,
+            &[0.0],
+            &pk,
+            &crate::types::DoseAttrMap::default(),
+            &[0.0],
+            &doses,
+            &obs_times,
+            &vec![1.0; obs_times.len()],
+            OdeSolverOptions::default(),
+        );
+        assert!(
+            got.iter().all(|p| !p.ipred.is_finite()),
+            "a non-finite timeline must give non-finite EKF ipreds, not a finite pass \
+             with the bad dose silently dropped"
+        );
     }
 }
