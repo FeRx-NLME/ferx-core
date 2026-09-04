@@ -4050,6 +4050,26 @@ mod tests {
                     cmt: 2,
                 }],
             ),
+            // `left = 0.0` specifically, because the two bounds are gated differently:
+            // `try_joint_pktte_shared_solve` pushes `entry_time` only `if *entry_time > 0.0`
+            // ("no truncation"), but pushes `left`/`right` unconditionally. So on this subject
+            // a `left = 0` *is* a pre-start CHZ time that reaches the share while a
+            // `TENTRY = 0` never does — the asymmetry the docs sentence ("at or before") has to
+            // cover, and the one a later refactor could silently remove by adding a `> 0` gate
+            // to `left` for symmetry.
+            (
+                "interval censoring with left = 0 (ungated bound)",
+                0.0_f64,
+                vec![ObsRecord::Event {
+                    time: 20.0,
+                    event_type: EventType::IntervalCensored {
+                        left: 0.0,
+                        right: 20.0,
+                    },
+                    entry_time: 0.0,
+                    cmt: 2,
+                }],
+            ),
         ] {
             let subject = late_start_joint_subject(records);
 
@@ -4075,8 +4095,19 @@ mod tests {
                 .position(|&t| t == t_pre)
                 .unwrap_or_else(|| panic!("{arm}: {t_pre} must be a shared-solve CHZ time"));
             let st = &share.chz_states[i];
+            // Two assertions, not one `&&`: a width mismatch is a different defect from a
+            // non-finite value, and a combined message would name the wrong one (printing a
+            // perfectly finite `[0.0, 0.0]` under "non-finite") and send the next reader into
+            // the wrong engine.
+            assert_eq!(
+                st.len(),
+                ode.n_states,
+                "{arm}: share state has {} slots, expected {}",
+                st.len(),
+                ode.n_states
+            );
             assert!(
-                st.len() == ode.n_states && st.iter().all(|x| x.is_finite()),
+                st.iter().all(|x| x.is_finite()),
                 "{arm}: share left the pre-start state non-finite: {st:?}"
             );
             let seeded = ode.initial_state(&share.pk_values);
@@ -4155,6 +4186,38 @@ mod tests {
             assert!(
                 (shared_tte - dedicated_tte).abs() <= 1e-4 * dedicated_tte.abs().max(1.0),
                 "{arm}: share {shared_tte} must match dedicated {dedicated_tte} to solver tol"
+            );
+
+            // The FOCEI Laplace objective, which adds the ODE-TTE **FD-Hessian** term. Without
+            // this leg every assertion above is on the value path: before the fix the pre-start
+            // node returned the `1e20` sentinel, so a Hessian built by perturbing η around it was
+            // garbage rather than merely a wrong scalar — and a regression that reinstated the
+            // sentinel only inside the perturbation would pass all the value-path checks. The
+            // Tier-2 end-to-end test cannot cover this either: its model declares no omega, so no
+            // Hessian term is ever formed. A zero Gaussian sensitivity matrix is fine here — the
+            // prior plus the TTE Hessian keep H̃ positive-definite (same setup as
+            // `joint_pktte_ode_hazard_nll_paths_finite`, which does this for `entry_time = 0`).
+            let n_obs = subject.observations.len();
+            let foce = foce_subject_nll(
+                &model,
+                &subject,
+                theta,
+                &DVector::from_vec(vec![0.0]),
+                &DMatrix::<f64>::zeros(n_obs, 1),
+                &p.omega,
+                &p.sigma.values,
+                &p.residual_correlations,
+                true,
+            );
+            // `is_finite()` alone would be useless here: the TTE sentinel is `1e20`, which *is*
+            // finite, so a Laplace objective built entirely on repelled records passes a
+            // finiteness check. Bound it below the sentinel instead. `1e12` is ~8 orders under
+            // `1e20` and ~10 orders over this fixture's actual objective (order 10), so it
+            // discriminates "scored" from "repelled" without being a tolerance test.
+            assert!(
+                foce.is_finite() && foce.abs() < 1e12,
+                "{arm}: FOCEI Laplace objective (incl. the TTE FD-Hessian) must be scored, not \
+                 repelled; got {foce} (the TTE sentinel is 1e20 and is itself finite)"
             );
         }
     }

@@ -97,6 +97,51 @@ pub(crate) fn subject_integration_start(subject: &Subject) -> f64 {
     }
 }
 
+/// Fill every requested sample time that falls **before the first break** with the seeded
+/// initial state `u`.
+///
+/// Nothing has acted on the system before the first event, so that *is* the state there. Both
+/// engines that read states at caller-supplied times need this and must agree on it: the
+/// dedicated [`ode_dense_solve_states`] (whose `saveat` may hold a CTMM observation recorded
+/// before the first dose) and the #570 one-solve share
+/// [`ode_predictions_and_chz`] (whose `chz_times` may hold a left-truncation `TENTRY` or an
+/// interval-censored `left`). Left as `NaN`, such a node is read as a diverged solve — the CTMM
+/// scorer's finiteness guard rejects the subject, and the TTE likelihood maps it to the `1e20`
+/// sentinel.
+///
+/// **This function exists because the two engines drifted (#1223).** They carried separate
+/// copies of this loop; the dense one grew the fill for the CTMM scorer and the share's kept its
+/// `NaN`, so whether a joint PK-TTE subject was scored or repelled depended on which engine
+/// `try_joint_pktte_shared_solve` admitted it to. Keep it one function: a comment claiming two
+/// copies are twins is what failed last time.
+///
+/// Keyed on the caller's **first break**, not on [`subject_integration_start`]: both engines fold
+/// a terminal horizon (`max(0, …)`) into the timeline before sorting, so a timeline whose every
+/// sample precedes the first dose puts the first break *below* the start, and there the node is
+/// read at the `k = 0` boundary visit instead — the same seeded state by the other mechanism
+/// (#1218). Strict `<` (with the shared `1e-12`), so a time *on* the first break still reads at
+/// that boundary visit, post-dose.
+///
+/// The scan is unconditional rather than a `take_while` over a sorted slice: `chz_times` is
+/// sorted-unique by the share's caller contract, but [`ode_dense_solve_states`] is `pub` and its
+/// `saveat` carries no such guarantee, so an early exit would be wrong there. One shared
+/// implementation is worth more than the micro-optimisation on one of the two callers.
+fn fill_prestart_states(
+    times: &[f64],
+    states: &mut [Vec<f64>],
+    first_break: Option<f64>,
+    u: &[f64],
+) {
+    let Some(first_break) = first_break else {
+        return;
+    };
+    for (i, &t) in times.iter().enumerate() {
+        if t < first_break - 1e-12 {
+            states[i] = u.to_vec();
+        }
+    }
+}
+
 /// Tighten the ODE tolerance used for the SS **fixed-point equilibration** (#867). The value error
 /// of the periodic-SS trough is the one-cycle residual amplified by `1/(1−ρ)`, and a heavily-
 /// accumulating disposition has `ρ → 1`, so the per-cycle integration must be tighter than the
@@ -2849,31 +2894,12 @@ fn ode_predictions_with_extra_breaks_and_stats(
     break_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
 
-    // #1223: a soft (CHZ) time earlier than the first break — a left-truncation `TENTRY`,
-    // or an interval-censored `left`, before the subject's first dose or observation. No
-    // segment covers it, so without this it keeps its NaN prefill, and the TTE likelihood
-    // reads that as a diverged solve and repels the subject with its `1e20` sentinel.
-    // Nothing has acted on the system before the first event, so the state there is the
-    // seeded `u`. This is the exact twin of the fill in the dedicated
-    // `ode_dense_solve_states` (same `< first_break - 1e-12` test, same clone) — which is
-    // what makes the shared and two-solve arms agree on such a time, rather than the
-    // objective depending on which engine `try_joint_pktte_shared_solve` admitted the
-    // subject to.
-    //
-    // Keyed on `break_times[0]`, **not** on `subject_integration_start`: the terminal
-    // `t_last` fold above can put the first break *below* the start, when every
-    // observation and CHZ time precedes the first dose. There the time is read at the
-    // `k = 0` boundary visit instead — the same seeded state by the other mechanism
-    // (#1218) — and the dense builder folds `t_last` in the same way, so keying on the
-    // start would diverge from the twin in exactly that corner. Strict `<`, so a CHZ time
-    // *on* the first break still reads at that boundary visit, post-dose.
-    if let Some(&first_break) = break_times.first() {
-        for (gi, &t) in chz_times.iter().enumerate() {
-            if t < first_break - 1e-12 {
-                chz_states[gi] = u.clone();
-            }
-        }
-    }
+    // #1223: a soft (CHZ) time earlier than the first break — a left-truncation `TENTRY`, or an
+    // interval-censored `left`, before the subject's first dose or observation. No segment covers
+    // it, so without this it keeps its NaN prefill and the TTE likelihood repels the subject with
+    // its `1e20` sentinel. Shared verbatim with `ode_dense_solve_states`, which is the point:
+    // see [`fill_prestart_states`] for why this is one function and not two copies.
+    fill_prestart_states(chz_times, &mut chz_states, break_times.first().copied(), &u);
 
     // Most-recent system-reset time; `NEG_INFINITY` until the first reset is
     // crossed. Threaded into `integrate_segment` so infusions / zero-order windows
@@ -6473,21 +6499,13 @@ pub fn ode_dense_solve_states(
 
     let mut active_infusions: Vec<(usize, f64, f64)> = Vec::new();
 
-    // Saveat nodes earlier than the first integrated segment (e.g. a discrete-state
-    // CTMM observation recorded before the first dose, whose times the segment
-    // timeline — built from doses/obs_times/pk-only/resets, not `obs_records` — does
-    // not cover). Nothing has acted on the system before the first event, so the state
-    // there is the seeded initial state `u`; fill it so these nodes are not left as
-    // `NaN`, which a downstream finiteness guard (the inhomogeneous CTMM scorer) would
-    // otherwise read as a diverged solve and use to wrongly repel a valid subject. No-op
-    // for the usual case where every saveat is at or after the first event.
-    if let Some(&first_start) = break_times.first() {
-        for (i, &t) in saveat.iter().enumerate() {
-            if t < first_start - 1e-12 {
-                result[i] = u.clone();
-            }
-        }
-    }
+    // Saveat nodes earlier than the first integrated segment (e.g. a discrete-state CTMM
+    // observation recorded before the first dose, whose times the segment timeline — built from
+    // doses/obs_times/pk-only/resets, not `obs_records` — does not cover). No-op for the usual
+    // case where every saveat is at or after the first event. Shared verbatim with the #570
+    // one-solve share; see [`fill_prestart_states`] for why this is one function and not two
+    // copies (#1223).
+    fill_prestart_states(saveat, &mut result, break_times.first().copied(), &u);
 
     // Walk every break as a **left boundary** — bound `0..len`, the walk
     // `ode_predictions` and `ode_predictions_with_states` use (#731) — so a dose

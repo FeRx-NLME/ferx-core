@@ -9,7 +9,7 @@
 //! `try_joint_pktte_shared_solve` admitted it to — a question about resets and covariates,
 //! not about where its `TENTRY` falls.
 //!
-//! Two arms, and they are **not** symmetric:
+//! Three arms, and they are **not** symmetric:
 //!
 //!   * **A1** — a dose, a PK observation and the event. Qualifies for the share, so this is
 //!     the arm that was red: `TENTRY = 5` returned the sentinel while `TENTRY = 0` returned
@@ -129,6 +129,21 @@ fn prestart_entry_matches_no_entry_on_the_shared_engine() {
     assert!(
         (none - A1_OFV).abs() <= 1e-6 * A1_OFV.abs(),
         "A1 objective moved: {none} vs the pinned {A1_OFV}"
+    );
+
+    // The other side of the gate, or the test above is satisfied by an implementation that
+    // ignores `TENTRY` entirely — never pushing it into the shared solve's CHZ times, never
+    // subtracting `H(entry)`. That implementation also passes A4 and A5, so nothing else in this
+    // file would notice. The first record is the dose at 10, so 12 is post-start and must move
+    // the objective by `H(12) > 0`.
+    let post = ofv(&arm_a1(12.0));
+    assert!(
+        post.is_finite(),
+        "A1 with a post-start TENTRY must be finite: {post}"
+    );
+    assert!(
+        (post - none).abs() > 1e-6,
+        "A1: a post-start TENTRY must change the objective — TENTRY=12 {post} vs TENTRY=0 {none}"
     );
 }
 
