@@ -90,7 +90,16 @@ pub(crate) const EVENT_MATCH_TOL: f64 = 1e-12;
 /// is for the mid-fit θ/η excursion that no init-time check can see.
 #[inline]
 pub(crate) fn timeline_has_non_finite(break_times: &[f64]) -> bool {
-    break_times.iter().any(|t| !t.is_finite())
+    times_have_non_finite(break_times.iter().copied())
+}
+
+/// [`timeline_has_non_finite`] for a walk whose timeline is not a `&[f64]` — the two
+/// event-driven engines carry `(time, kind, idx)` tuples. Takes an iterator so those
+/// call sites share this one definition instead of open-coding `!is_finite()`, and
+/// without allocating a temporary `Vec` on a per-subject hot path.
+#[inline]
+pub(crate) fn times_have_non_finite(mut times: impl Iterator<Item = f64>) -> bool {
+    times.any(|t| !t.is_finite())
 }
 
 // Dose resolution + SS-equilibration primitives moved to `crate::dosing` (a neutral
@@ -1484,16 +1493,29 @@ pub(crate) fn forcing_consumes_cmt(
 /// necessarily the spec's: a caller that applies no forcing (the EKF path) passes
 /// `&[]` and keeps its plain `+rate`. Hard-wiring the spec would suppress a rate
 /// nothing replaces.
+///
+/// **Two effects inside [`active_infusions`], not one.** The compartment tests are new
+/// to that resolver (they were `gated_infusions`-only before #1196 step 3), and they
+/// gate its `ss_residual_infusion_end` branch as well as its plain `+rate` branch — so a
+/// `CMT=0` or out-of-range **`SS=1`** infusion now loses its previous-cycle residual
+/// window too, not just its rate. Both are unreachable from a validated call:
+/// `check_dose_compartments` rejects a `CMT=0` infusion (`E_DOSE_CMT_NOT_INFUSABLE`) and
+/// any `cmt > n_states`, and `check_absorption_dosing` rejects an SS infusion into an
+/// absorption compartment (`E_ABSORPTION_SS_INFUSION`). Recorded because "confined to
+/// the plain `+rate`" would understate the change for a hand-built [`OdeSpec`].
 #[inline]
 pub(crate) fn infusion_contributes(
     input_rate: &[crate::pk::absorption::InputRateForcing],
     d: &DoseEvent,
     n_states: usize,
 ) -> bool {
-    is_real_infusion(d)
-        && d.cmt_raw() != 0
-        && d.cmt_idx() < n_states
-        && !forcing_consumes_cmt(input_rate, d.cmt_idx())
+    if !is_real_infusion(d) || d.cmt_raw() == 0 {
+        return false;
+    }
+    // One binding, so the range test and the forcing test provably ask about the same
+    // compartment — the property this shared predicate exists to guarantee.
+    let cmt = d.cmt_idx();
+    cmt < n_states && !forcing_consumes_cmt(input_rate, cmt)
 }
 
 /// True if a built-in absorption input-rate forcing (transit/etc.) feeds the
@@ -5535,7 +5557,7 @@ pub fn ode_predictions_event_driven(
     // dispatches typed events by index and so never re-applies a dose, but a `NaN` time
     // still sorts to the end and its event is silently never reached — the same silent
     // drop the dense engines get, reported the same way (`predictions` is NaN-prefilled).
-    if timeline.iter().any(|e| !e.0.is_finite()) {
+    if times_have_non_finite(timeline.iter().map(|e| e.0)) {
         return predictions;
     }
 
@@ -6897,12 +6919,19 @@ pub(crate) fn ode_solve_until_chz_threshold(
         &zo_windows,
         horizon,
     );
-    break_times.retain(|&t| t <= horizon + 1e-15);
     // A non-finite break time makes the subject unsolvable (#1189). This engine has a
     // typed failure, so it uses it rather than reporting a NaN crossing time.
+    //
+    // **Before the `retain` below, deliberately.** `NaN <= horizon + 1e-15` and
+    // `inf <= horizon + 1e-15` are both `false`, so the horizon filter *removes* exactly
+    // the entries this guard exists to catch. Ordered the other way the guard is dead
+    // code: the walk would proceed on a timeline the bad dose had been deleted from,
+    // never apply it, and return a finite crossing time — the silent-wrong-number
+    // outcome, on the one engine whose typed failure was supposed to make it loud.
     if timeline_has_non_finite(&break_times) {
         return ThresholdOutcome::SolveFailed("non-finite break time".to_string());
     }
+    break_times.retain(|&t| t <= horizon + 1e-15);
 
     let mut active_infusions: Vec<(usize, f64, f64)> = Vec::new();
     // Apply-once masks (#1186) — same ownership as the dense solve's pair.

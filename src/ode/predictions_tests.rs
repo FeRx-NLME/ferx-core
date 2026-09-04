@@ -9996,6 +9996,98 @@ mod break_collision_1186 {
         // driven directly.
     }
 
+    /// **The CHZ event-time search must report a non-finite timeline as `SolveFailed`.**
+    ///
+    /// This engine is `simulate()`'s event-time search and the joint PK-TTE hazard path,
+    /// and it is the only one with a *typed* failure channel, so a non-finite lag there
+    /// should be the loudest of all. It very nearly was the quietest: the guard was
+    /// originally placed after `break_times.retain(|&t| t <= horizon + 1e-15)`, and both
+    /// `NaN <= x` and `inf <= x` are `false`, so the horizon filter **removed exactly the
+    /// entries the guard was looking for**. The walk then ran on a timeline the bad dose
+    /// had been deleted from and returned a finite crossing time. Only `-inf` survived
+    /// the filter, so a fixture using it would have passed against a dead guard.
+    ///
+    /// Hence all three values here, `NaN` and `+inf` first: those are the two the filter
+    /// eats. Mutation (run): move the guard back below the `retain` → `NaN` and `+inf`
+    /// return `Crossed`/`Censored` instead of `SolveFailed` and this fails, while a
+    /// `-inf`-only fixture would not have noticed.
+    // `ThresholdOutcome` and `ode_solve_until_chz_threshold` are `survival`-gated, so
+    // this test must be too — the feature sets are not nested (#1133, #1157).
+    #[cfg(feature = "survival")]
+    #[test]
+    fn chz_threshold_search_reports_a_non_finite_timeline_as_solve_failed() {
+        let mut ode = spec();
+        // One accumulating hazard state so the threshold search has something to cross.
+        ode.chz_state_slots = vec![1];
+        let obs = vec![4.0, 8.0, 12.0];
+        for (label, route_lag, alag1) in [
+            ("route lag NaN", f64::NAN, 0.3),
+            ("route lag +inf", f64::INFINITY, 0.3),
+            ("ALAG1 NaN", 7.9, f64::NAN),
+            ("ALAG1 +inf", 7.9, f64::INFINITY),
+            ("ALAG1 -inf", 7.9, f64::NEG_INFINITY),
+        ] {
+            let pkv = pk(route_lag, alag1);
+            let s = make_subject(doses(8.2), obs.clone());
+            let got = ode_solve_until_chz_threshold(&ode, &pkv, &s, 1, 0.5, 24.0);
+            assert!(
+                matches!(got, ThresholdOutcome::SolveFailed(_)),
+                "[{label}] a non-finite timeline must be a typed SolveFailed, got {got:?}"
+            );
+        }
+    }
+
+    /// The control for the test above: the *same* engine on the *same* fixture with a
+    /// finite lag must still solve. Without it, the guard could reject every subject and
+    /// the test above would pass while `simulate()` returned nothing at all.
+    // `ThresholdOutcome` and `ode_solve_until_chz_threshold` are `survival`-gated, so
+    // this test must be too — the feature sets are not nested (#1133, #1157).
+    #[cfg(feature = "survival")]
+    #[test]
+    fn chz_threshold_search_still_solves_a_finite_timeline() {
+        let mut ode = spec();
+        ode.chz_state_slots = vec![1];
+        let pkv = pk(7.9, 0.3);
+        let s = make_subject(doses(8.2), vec![4.0, 8.0, 12.0]);
+        let got = ode_solve_until_chz_threshold(&ode, &pkv, &s, 1, 0.5, 24.0);
+        assert!(
+            !matches!(got, ThresholdOutcome::SolveFailed(_)),
+            "a finite timeline must not be reported as SolveFailed, got {got:?}"
+        );
+    }
+
+    /// The EVID=3/4 **reset** match is the one scan whose tolerance narrowed 100x
+    /// (`1e-10` → `EVENT_MATCH_TOL`) on the dense and CHZ engines. It is safe only
+    /// because `build_segment_break_times` pushes every reset time *verbatim*, so the
+    /// distance from a reset to its own break is exactly zero — an invariant nothing
+    /// asserted until now.
+    ///
+    /// Mutation: push a reset into the timeline through any expression that perturbs it
+    /// by more than `EVENT_MATCH_TOL` (or drop the `subject.reset_times` push from
+    /// `build_segment_break_times`) → the state is never zeroed and the post-reset
+    /// reading stays at the pre-reset amount.
+    #[test]
+    fn reset_still_fires_on_the_dense_engine_at_the_tightened_match() {
+        let ode = spec();
+        let pkv = pk(7.85, 0.3); // onset clear of the t=8.2 dose: resets under test here
+        let obs = vec![4.0, 12.0];
+        let mut s = make_subject(doses(8.2), obs.clone());
+        // A reset at t=10 — after both central boluses, before the t=12 read.
+        s.reset_times = vec![10.0];
+
+        let dense = ode_dense_solve_states(&ode, &pkv, &[], &[], &s, &obs);
+        assert!(
+            dense[0][1] > 50.0,
+            "pre-reset read must carry drug: {dense:?}"
+        );
+        assert!(
+            dense[1][1].abs() < 1e-6,
+            "the reset at t=10 must zero the central compartment, so the t=12 read is \
+             ~0; got {} (without the reset it is ~170)",
+            dense[1][1]
+        );
+    }
+
     // ── #1189 item 2: negative lag — pinned, not changed ─────────────────────────
 
     /// A **negative** route lag is not an engine inconsistency: all four engines agree

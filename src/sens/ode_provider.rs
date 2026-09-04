@@ -4951,7 +4951,7 @@ fn integrate_tvcov_g<T: crate::sens::num::PkNum>(
     // caller sees a diverged subject rather than a plausible wrong one. This is the
     // event-driven twin of the same guard in `integrate_g`; an estimated lagtime routes
     // here, not there, so the two must both carry it.
-    if tl.iter().any(|e| !e.0.is_finite()) {
+    if crate::ode::predictions::times_have_non_finite(tl.iter().map(|e| e.0)) {
         for row in states.iter_mut() {
             for x in row.iter_mut() {
                 *x = T::from_f64(f64::NAN);

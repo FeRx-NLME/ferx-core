@@ -1643,7 +1643,17 @@ pub(crate) fn check_dose_compartments(
 /// Evaluated at η = 0 and `TIME = 0`, per subject, so a covariate relationship that
 /// pushes one subject's typical attribute non-finite is caught — the same shape as the
 /// per-subject [`InputRateForcing::validate`](crate::pk::absorption::InputRateForcing::validate)
-/// loop in [`check_absorption_dosing`]. It is a **separate** check rather than an
+/// loop in [`check_absorption_dosing`].
+///
+/// **Scope, stated because the `TIME = 0` snapshot is a real limit and not a detail.**
+/// This reads the subject's *baseline* covariates only. A time-varying covariate that is
+/// benign at the first record and overflows at a later one is **not** caught here; it
+/// surfaces as the engine-side non-finite subject instead, which is the opaque outcome
+/// this check exists to pre-empt. Widening it to every dose-time snapshot is the obvious
+/// follow-up; it is not done here because the engine guard makes the missed case correct
+/// (just not diagnosed), and because the same `TIME = 0` limitation applies to every
+/// other per-subject typical-value check in this file, so fixing it in one place only
+/// would be misleading. It is a **separate** check rather than an
 /// extension of that loop, deliberately: `check_absorption_dosing` returns early unless
 /// the model has a built-in absorption forcing, and a `NaN` `ALAG1` on a plain 1-cpt
 /// model has nothing to do with absorption.
