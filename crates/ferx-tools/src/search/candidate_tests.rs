@@ -131,6 +131,25 @@ fn criterion_labels_are_distinct_and_serde_round_trips() {
     assert_eq!(Criterion::default(), Criterion::Bic(BicType::Mixed));
 }
 
+#[test]
+fn two_candidates_differing_only_inside_a_quoted_path_are_not_one_candidate() {
+    // The hash is the dedup key *and* the fit-cache key, so a collision here is
+    // not a wasted fit — it is candidate B reported with candidate A's
+    // criterion and verdict under `duplicate_of`. A comment stripper that cut
+    // at the first `//` regardless of quoting ended both of these at
+    // `path = "s3:`.
+    let a = Candidate::new("a", model_text("[data]\n  path = \"s3://bucket/a.csv\"\n"));
+    let b = Candidate::new("b", model_text("[data]\n  path = \"s3://bucket/b.csv\"\n"));
+    assert_ne!(a.hash(), b.hash(), "{}", a.model.canonical_form());
+    // The spelling that *is* one candidate still is, so the fix did not simply
+    // stop canonicalising.
+    let reflowed = Candidate::new(
+        "a2",
+        model_text("[data]\npath=\"s3://bucket/a.csv\"  # x\n"),
+    );
+    assert_eq!(a.hash(), reflowed.hash());
+}
+
 // ── eligibility ──────────────────────────────────────────────────────────────
 
 fn result_with(criterion: f64, passed: bool, error: Option<&str>) -> CandidateResult {
@@ -140,6 +159,8 @@ fn result_with(criterion: f64, passed: bool, error: Option<&str>) -> CandidateRe
         parent: None,
         features: FeatureVector::new(),
         fit: None,
+        ofv: None,
+        converged: None,
         verdict: StrictnessVerdict {
             passed,
             failures: vec![],

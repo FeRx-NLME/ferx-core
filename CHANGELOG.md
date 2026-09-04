@@ -61,7 +61,14 @@ section of the SDLC for the versioning policy).
   or failed the gate — appears in `candidates.csv` with its reason rather than being dropped.
   The thread budget splits across both levels of parallelism via `PoolPlan` (#1115) instead of
   nesting Rayon pools, and a `CancelFlag` stops a search between candidates and returns the
-  partial results. This is the orchestration layer the covariate, structural, variability and
+  partial results — into `candidates.partial.csv`, so cancelling a resumed run never overwrites
+  the complete table of the run it resumed. The cache directory is claimed for the length of a
+  run (`search.lock`) because two runs sharing one would silently destroy each other's journal,
+  and a directory that cannot be written costs the resume and the report rather than the fits:
+  those failures come back on `RunReport::warnings` with the results intact. A candidate whose
+  fit *errored* is refitted on the next resume instead of being remembered as permanently
+  unfittable, since a transient resource limit and a broken model are the same string from
+  there. This is the orchestration layer the covariate, structural, variability and
   residual-error searches of #1175 are built on.
 - **BIC variants and a `Strictness` gate for candidate ranking (#1177, part of #1175).**
   `ferx_core::bic(&result, BicType::{Mixed, Iiv, Random, Fixed})` computes the four
@@ -225,7 +232,9 @@ section of the SDLC for the versioning policy).
   `P = TVP * exp(ETA_P)` form and is a hard error naming the parameter on anything else, never
   a silent wrong edit. `ModelText::canonical_hash` gives a candidate a stable identity — equal
   across comment and whitespace changes, different for every semantic one — for use as a fit
-  cache key. This is the prerequisite for the model-search tooling in #1175.
+  cache key; a `#` or `//` inside a quoted value is content, not a comment, so two candidates
+  differing only in a quoted path (`"s3://bucket/a.csv"` vs `.../b.csv`) are two candidates.
+  This is the prerequisite for the model-search tooling in #1175.
 - **A cancellable bootstrap (#1161).** `BootstrapOptions::cancel` takes a `CancelFlag`; setting
   it from another thread stops a long `ferx_tools::bootstrap` run at the next replicate boundary
   and returns the new `BootstrapError::Cancelled`, so a caller reports an abort as an abort

@@ -806,3 +806,265 @@ fn the_default_options_retry_and_gate() {
     assert!(!options.resume);
     assert!(options.fit_options.is_none());
 }
+
+// ── the results outrank the files ────────────────────────────────────────────
+
+#[test]
+fn a_journal_that_cannot_be_written_warns_and_keeps_every_fit() {
+    // An overnight run that hits ENOSPC on candidate 3 of 500 used to return a
+    // `String` and nothing else: the fits already finished, and every one still
+    // in flight, went with it. The journal is a *recovery log* derived from the
+    // results — losing it costs the resume, not the run.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let candidates = vec![
+        candidate("a", "[parameters]\ntheta CL = 1\n"),
+        candidate("b", "[parameters]\ntheta CL = 2\n"),
+    ];
+    // A plain file where the fit cache wants its directory: every `store_fit`
+    // then fails from inside the parallel loop, exactly as a full disk would.
+    std::fs::write(journal::fits_dir(dir.path()), b"not a directory").expect("blocker");
+
+    let report = Runner::new()
+        .threads(1)
+        .cache_dir(dir.path())
+        .run_with_fitter(&candidates, &population(&["1"]), &lenient(), |_, _| {
+            Ok(converged_fit(3.0))
+        })
+        .expect("a journal failure is not a run failure");
+
+    assert_eq!(report.results.len(), 2, "the finished fits were discarded");
+    assert_eq!(report.fitted, 2);
+    assert!(report.results.iter().all(|r| r.fit.is_some()));
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    assert!(
+        report.warnings[0].contains("not resumable"),
+        "unhelpful warning: {}",
+        report.warnings[0]
+    );
+    // …and the report the run *can* still write is written.
+    assert!(output::table_path(dir.path()).exists());
+}
+
+#[test]
+fn a_cancelled_run_does_not_overwrite_the_table_it_resumed() {
+    // `csv::Writer::from_path` truncates, so writing a cancelled run's partial
+    // rows to `candidates.csv` destroys the complete table of the run being
+    // resumed — the one human-readable artefact the module promises.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let candidates = vec![
+        candidate("a", "[parameters]\ntheta CL = 1\n"),
+        candidate("b", "[parameters]\ntheta CL = 2\n"),
+        candidate("c", "[parameters]\ntheta CL = 3\n"),
+    ];
+    let (complete, _) = run_over(dir.path(), &candidates, &lenient());
+    assert_eq!(complete.results.len(), 3);
+    let table_before = std::fs::read_to_string(output::table_path(dir.path())).expect("table");
+
+    let flag = CancelFlag::new();
+    let report = Runner::new()
+        .threads(1)
+        .cache_dir(dir.path())
+        .cancel(flag.clone())
+        .run_with_fitter(&candidates, &population(&["1"]), &lenient(), |_, _| {
+            flag.cancel();
+            Ok(converged_fit(1.0))
+        })
+        .expect("a cancelled run still reports");
+    assert!(report.cancelled);
+    assert!(
+        report.results.len() < 3,
+        "the run was not actually cut short"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(output::table_path(dir.path())).expect("table"),
+        table_before,
+        "the cancelled run overwrote the complete table"
+    );
+    // The partial rows are not thrown away either — they go beside it.
+    let partial = std::fs::read_to_string(output::partial_table_path(dir.path())).expect("partial");
+    assert_eq!(partial.lines().count(), report.results.len() + 1);
+}
+
+#[test]
+fn a_completed_run_clears_the_partial_table_of_the_run_it_resumed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let candidates = vec![candidate("a", "[parameters]\ntheta CL = 1\n")];
+    output::write_partial_table(dir.path(), &[]).expect("stale partial");
+    run_over(dir.path(), &candidates, &lenient());
+    assert!(!output::partial_table_path(dir.path()).exists());
+}
+
+// ── failures are not permanent ───────────────────────────────────────────────
+
+#[test]
+fn a_resume_refits_a_candidate_whose_first_run_errored() {
+    // `install_on_fit_pool` returns `Err` when the machine is briefly out of
+    // threads, and a compile failure returns `Err` too — from here the two are
+    // one string. Journalling the outcome as final would have one bad minute
+    // mark a perfectly fittable model unfittable in every later resume, with
+    // nothing to tell the user which kind of failure they were looking at.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let candidates = vec![
+        candidate("ok", "[parameters]\ntheta CL = 1\n"),
+        candidate("flaky", "[parameters]\ntheta CL = 2\n"),
+    ];
+    let first =
+        Runner::new()
+            .threads(1)
+            .cache_dir(dir.path())
+            .run_with_fitter(&candidates, &population(&["1"]), &lenient(), |c, _| match c
+                .id
+                .as_str()
+            {
+                "flaky" => {
+                    Err("cannot build the fit pool: Resource temporarily unavailable".to_string())
+                }
+                _ => Ok(converged_fit(1.0)),
+            })
+            .expect("first run");
+    assert_eq!(first.results.len(), 2);
+    assert!(first.results[1].error.is_some());
+
+    let recorder = Recorder::new();
+    let options = RunOptions {
+        resume: true,
+        ..lenient()
+    };
+    let second = Runner::new()
+        .threads(1)
+        .cache_dir(dir.path())
+        .run_with_fitter(&candidates, &population(&["1"]), &options, |c, _| {
+            recorder.record(&c.id);
+            Ok(converged_fit(2.0))
+        })
+        .expect("resumed run");
+
+    assert_eq!(
+        recorder.ids(),
+        vec!["flaky"],
+        "the error row was carried forward"
+    );
+    assert_eq!((second.fitted, second.reused), (1, 1));
+    assert!(second.results[1].error.is_none());
+    assert_eq!(second.results[1].ofv, Some(2.0));
+
+    // A third resume reuses it, so the refit landed in the journal rather than
+    // the candidate being refitted for ever.
+    let third = Runner::new()
+        .threads(1)
+        .cache_dir(dir.path())
+        .run_with_fitter(&candidates, &population(&["1"]), &options, |c, _| {
+            panic!("`{}` was refitted after a successful run", c.id)
+        })
+        .expect("second resume");
+    assert_eq!((third.fitted, third.reused), (0, 2));
+}
+
+// ── the shared population ────────────────────────────────────────────────────
+
+#[test]
+fn a_model_with_no_level_block_leaves_the_population_untouched() {
+    // `compile_and_fit` skips its per-candidate `Population` clone on exactly
+    // the emptiness test `bind_theta_levels` early-returns on, and the two
+    // cannot be allowed to drift: if the binder ever mutated a population for a
+    // model with no level block, the runner would hand `fit()` an unbound one.
+    // Pinned on the binder rather than on the clone because the absence of a
+    // copy is not observable from outside.
+    let text = std::fs::read_to_string(crate::search::test_support::MODEL).expect("model source");
+    let mut parsed = ferx_core::parser::model_parser::parse_full_model(&text).expect("parse");
+    assert!(
+        parsed.model.theta_blocks().level_blocks().is_empty(),
+        "the fixture declares a level block, so it cannot test the skip"
+    );
+
+    let prepared = ferx_core::prepare_run(
+        crate::search::test_support::MODEL,
+        Some(crate::search::test_support::DATA),
+    )
+    .expect("warfarin model + data load");
+    let before = SearchManifest::new(&lenient(), &prepared.population).data_fingerprint;
+    let mut population = prepared.population.clone();
+    ferx_core::bind_theta_levels(&mut parsed, &text, &mut population).expect("bind");
+
+    assert_eq!(
+        SearchManifest::new(&lenient(), &population).data_fingerprint,
+        before,
+        "the binder mutated a population the runner now shares between candidates"
+    );
+}
+
+// ── one run per directory ────────────────────────────────────────────────────
+
+#[test]
+fn a_second_run_over_a_live_directory_is_refused_by_name() {
+    // Not a nicety: `Journal::create` renames a fresh file over
+    // `search_journal.jsonl`, so the run already appending keeps writing into
+    // an unlinked inode and every row it produces afterwards is gone, with
+    // nothing on disk to say so.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let candidates = vec![candidate("a", "[parameters]\ntheta CL = 1\n")];
+    let held = journal::DirLock::acquire(dir.path()).expect("lock");
+
+    let err = expect_refusal(
+        Runner::new()
+            .threads(1)
+            .cache_dir(dir.path())
+            .run_with_fitter(&candidates, &population(&["1"]), &lenient(), |_, _| {
+                panic!("nothing may be fitted while the directory is held")
+            }),
+        "a second run over a live directory must be refused",
+    );
+    assert!(err.contains("already in use"), "unhelpful message: {err}");
+    assert!(
+        err.contains("delete"),
+        "the message does not say how to clear a stale lock: {err}"
+    );
+
+    // Releasing it lets the next run through, so the lock is not a one-way door.
+    drop(held);
+    Runner::new()
+        .threads(1)
+        .cache_dir(dir.path())
+        .run_with_fitter(&candidates, &population(&["1"]), &lenient(), |_, _| {
+            Ok(converged_fit(1.0))
+        })
+        .expect("run after the lock was released");
+    assert!(
+        !journal::lock_path(dir.path()).exists(),
+        "the run kept the lock"
+    );
+}
+
+#[test]
+fn a_run_refused_after_it_took_the_lock_still_releases_it() {
+    // The refusal has to happen *past* the acquisition or this passes for the
+    // wrong reason, so it is an incompatible resume — which is checked with the
+    // directory already claimed.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let candidates = vec![candidate("a", "[parameters]\ntheta CL = 1\n")];
+    run_over(dir.path(), &candidates, &lenient());
+
+    let options = RunOptions {
+        criterion: Criterion::Aic,
+        resume: true,
+        ..lenient()
+    };
+    let err = expect_refusal(
+        Runner::new()
+            .threads(1)
+            .cache_dir(dir.path())
+            .run_with_fitter(&candidates, &population(&["1"]), &options, |_, _| {
+                Ok(converged_fit(1.0))
+            }),
+        "an incompatible resume must be refused",
+    );
+    assert!(
+        err.contains("ranking criterion"),
+        "unhelpful message: {err}"
+    );
+    assert!(
+        !journal::lock_path(dir.path()).exists(),
+        "a refused run left the directory locked"
+    );
+}

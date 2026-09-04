@@ -27,9 +27,17 @@
 //!   appears in `candidates.csv`.
 //! * **Resume.** With a cache directory, each outcome is journalled as it
 //!   finishes and a resumed run refits only what is missing — see
-//!   [`super::journal`].
+//!   [`super::journal`]. The directory is claimed for the length of the run
+//!   ([`journal::DirLock`]), because two runs sharing one silently destroy each
+//!   other's journal.
 //! * **Cancellation.** A flipped [`CancelFlag`] stops the run *between*
 //!   candidates and returns what finished, with [`RunReport::cancelled`] set.
+//!   Its partial rows go to `candidates.partial.csv`, never over the complete
+//!   `candidates.csv` a resumed run may already have.
+//! * **The results outrank the files.** The journal and the table are *derived*
+//!   from the results, so a directory that cannot be written costs the resume
+//!   and the report, not the fits: those failures come back in
+//!   [`RunReport::warnings`] with the run intact.
 //!
 //! # What it is not responsible for
 //!
@@ -37,6 +45,7 @@
 //! those are the individual search tools. The runner takes a list and returns
 //! the same list scored.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -69,6 +78,17 @@ pub struct RunReport {
     /// Candidates that shared another candidate's canonical text and were
     /// therefore not fitted — the fits this run did not have to run.
     pub deduped: usize,
+    /// Non-fatal problems: a journal row that could not be written, a table
+    /// that could not be rewritten.
+    ///
+    /// Everything the cache directory holds is *derived* from `results` — the
+    /// journal is a recovery log and `candidates.csv` is a report — so a
+    /// failure to write one is not a reason to throw away the fits themselves.
+    /// A disk that fills on candidate 3 of 500 used to lose the two that had
+    /// finished and every one still running; now it costs the resume, and says
+    /// so here. Collected rather than printed, per the crate's warning
+    /// convention.
+    pub warnings: Vec<String>,
 }
 
 impl RunReport {
@@ -197,10 +217,27 @@ impl Runner {
         }
         let deduped = duplicate_of.iter().filter(|d| d.is_some()).count();
 
+        // ── the directory ───────────────────────────────────────────────────
+        // Claimed before anything is read from it, since the resume read and
+        // the journal rewrite that follows it have to be one transaction with
+        // respect to another run. Dropped — and the lock file removed — on
+        // every path out of this function, including the early cancel below.
+        let _lock = match &self.cache_dir {
+            Some(dir) => Some(journal::DirLock::acquire(dir)?),
+            None => None,
+        };
+
         // ── resume ──────────────────────────────────────────────────────────
-        let manifest = SearchManifest::new(options, data);
-        let kept = match (&self.cache_dir, options.resume) {
-            (Some(dir), true) => load_resumable(dir, &manifest)?,
+        // Built only when there is a directory to write it to: the manifest
+        // fingerprints the *whole dataset* — a SHA-256 over every field of
+        // every subject — so computing one for a cacheless run would hash
+        // hundreds of megabytes for a value nothing reads.
+        let manifest = self
+            .cache_dir
+            .as_ref()
+            .map(|_| SearchManifest::new(options, data));
+        let kept = match (&self.cache_dir, &manifest, options.resume) {
+            (Some(dir), Some(manifest), true) => load_resumable(dir, manifest)?,
             _ => Vec::new(),
         };
         let reused: HashMap<&str, &CandidateRecord> = kept
@@ -218,19 +255,20 @@ impl Runner {
                 fitted: 0,
                 reused: 0,
                 deduped: 0,
+                warnings: Vec::new(),
             });
         }
 
         // ── the journal ─────────────────────────────────────────────────────
         // Opened before the first fit so that a kill at any point from here on
         // leaves a directory the next resume can read.
-        let journal = match &self.cache_dir {
-            Some(dir) => {
+        let journal = match (&self.cache_dir, &manifest) {
+            (Some(dir), Some(manifest)) => {
                 let j = Journal::create(dir, &kept)?;
                 manifest.write(&journal::manifest_path(dir))?;
                 Some(j)
             }
-            None => None,
+            _ => None,
         };
 
         // ── what has to be fitted ───────────────────────────────────────────
@@ -258,12 +296,15 @@ impl Runner {
                 Ok(fitted) => {
                     let verdict = check_strictness(&fitted, &options.strictness);
                     let criterion = options.criterion.of(&fitted);
+                    let (ofv, converged) = (Some(fitted.ofv), Some(fitted.converged));
                     CandidateResult {
                         id: candidate.id.clone(),
                         hash: hashes[i].clone(),
                         parent: candidate.parent.clone(),
                         features: candidate.features.clone(),
                         fit: Some(fitted),
+                        ofv,
+                        converged,
                         verdict,
                         criterion,
                         seconds,
@@ -283,6 +324,8 @@ impl Runner {
                     parent: candidate.parent.clone(),
                     features: candidate.features.clone(),
                     fit: None,
+                    ofv: None,
+                    converged: None,
                     verdict: failed_verdict(&e),
                     criterion: f64::NAN,
                     seconds,
@@ -305,9 +348,17 @@ impl Runner {
         };
 
         // Closed before the table is written, and the point at which a write
-        // failure inside the parallel loop surfaces.
+        // failure inside the parallel loop surfaces. It is a *warning*, not a
+        // run failure: the journal exists so a future run need not repeat these
+        // fits, and returning `Err` here would throw away the very fits it
+        // failed to protect.
+        let mut warnings: Vec<String> = Vec::new();
         if let Some(j) = journal {
-            j.into_result()?;
+            if let Err(e) = j.into_result() {
+                warnings.push(format!(
+                    "the search journal could not be written, so this run is not resumable: {e}"
+                ));
+            }
         }
 
         // ── assembly, in submission order ───────────────────────────────────
@@ -346,6 +397,8 @@ impl Runner {
                             parent: candidates[i].parent.clone(),
                             features: candidates[i].features.clone(),
                             fit: None,
+                            ofv: source.ofv,
+                            converged: source.converged,
                             verdict: source.verdict.clone(),
                             criterion: source.criterion,
                             seconds: 0.0,
@@ -358,16 +411,31 @@ impl Runner {
             }
         }
 
+        // A cancelled run's rows are partial, and `candidates.csv` is rewritten
+        // from scratch — so writing them there would have a run cancelled two
+        // candidates into a resume replace the complete table of the run it
+        // resumed with a two-row one. The partial goes to a file of its own.
+        let cancelled = is_cancelled(&self.cancel);
         if let Some(dir) = &self.cache_dir {
-            output::write_table(dir, &results)?;
+            let written = if cancelled {
+                output::write_partial_table(dir, &results)
+            } else {
+                output::write_table(dir, &results)
+            };
+            // Same reasoning as the journal above: the table is derived from
+            // `results`, which the caller is about to receive either way.
+            if let Err(e) = written {
+                warnings.push(format!("the candidate table could not be written: {e}"));
+            }
         }
 
         Ok(RunReport {
             results,
-            cancelled: is_cancelled(&self.cancel),
+            cancelled,
             fitted: n_fitted.load(Ordering::Relaxed),
             reused: n_reused,
             deduped,
+            warnings,
         })
     }
 }
@@ -408,12 +476,8 @@ fn record_of(result: &CandidateResult) -> CandidateRecord {
         parent: result.parent.clone(),
         features: result.features.clone(),
         criterion: result.criterion.is_finite().then_some(result.criterion),
-        ofv: result
-            .fit
-            .as_ref()
-            .map(|f| f.ofv)
-            .filter(|ofv| ofv.is_finite()),
-        converged: result.fit.as_ref().is_some_and(|f| f.converged),
+        ofv: result.ofv.filter(|ofv| ofv.is_finite()),
+        converged: result.converged.unwrap_or(false),
         passed: result.verdict.passed,
         failures: result.verdict.failures.clone(),
         skipped: result.verdict.skipped.clone(),
@@ -424,7 +488,9 @@ fn record_of(result: &CandidateResult) -> CandidateRecord {
 }
 
 /// Rebuild a result from a journalled row, loading the cached fit when it is
-/// still readable. A missing cache file costs the `FitResult`, not the row.
+/// still readable. A missing cache file costs the `FitResult`, not the row —
+/// including the row's `ofv` and `converged`, which are carried across from the
+/// journal rather than read back off the fit that may be gone.
 fn reused_result(
     candidate: &Candidate,
     record: &CandidateRecord,
@@ -440,6 +506,8 @@ fn reused_result(
         parent: candidate.parent.clone(),
         features: candidate.features.clone(),
         fit,
+        ofv: record.ofv,
+        converged: record.has_fit.then_some(record.converged),
         verdict: StrictnessVerdict {
             passed: record.passed,
             failures: record.failures.clone(),
@@ -471,6 +539,20 @@ fn load_resumable(dir: &Path, manifest: &SearchManifest) -> Result<Vec<Candidate
     let mut seen: HashSet<String> = HashSet::new();
     let mut kept = Vec::new();
     for record in journal::read_records(&journal::journal_path(dir)) {
+        // A row with an `error` is not reused. `error` means the candidate
+        // produced no fit at all, and the runner cannot tell *why* from here:
+        // a model that does not compile fails the same way as one whose fit
+        // hit a transient resource limit — `install_on_fit_pool` returns `Err`
+        // when the machine is briefly out of threads. Carrying that forward
+        // would have one bad minute permanently mark a fittable model as
+        // unfittable in every later resume. Refitting a genuinely broken
+        // candidate costs a parse; believing a false failure costs the search.
+        //
+        // Filtered *before* the dedup below, or an error row would consume the
+        // hash and hide the successful refit appended after it.
+        if record.error.is_some() {
+            continue;
+        }
         // A hash appearing twice — two runs over the same directory — keeps the
         // first row, so a resume is not sensitive to the order of the log.
         if seen.insert(record.hash.clone()) {
@@ -482,12 +564,16 @@ fn load_resumable(dir: &Path, manifest: &SearchManifest) -> Result<Vec<Candidate
 
 /// Compile one candidate against the data and fit it.
 ///
-/// The population is cloned per candidate because binding mutates it:
-/// `theta NAME[COL]` synthesizes a per-record level-index column (#1064), and
-/// the binder that does it takes `&mut Population`. A candidate whose model has
-/// no such block is unchanged by the clone, but the runner cannot know that
-/// without compiling first, and a shared mutable population across concurrent
-/// candidates would be a data race by construction.
+/// The population is cloned per candidate **only when binding actually mutates
+/// it**: `theta NAME[COL]` synthesizes a per-record level-index column (#1064),
+/// and the binder that does it takes `&mut Population`, so a shared mutable
+/// population across concurrent candidates would be a data race by
+/// construction. But a model with no level block is left untouched by that
+/// binder — it early-returns on the same emptiness test as the `Cow` below —
+/// and `bind_covariate_stats` only ever reads. Cloning unconditionally put one
+/// copy of the dataset per in-flight candidate on top of the one `fit()` may
+/// make for itself (`api/fit.rs` is `Cow` for the same reason), so a 16-wide
+/// plan held up to 32 copies of data nothing was going to modify.
 fn compile_and_fit(
     candidate: &Candidate,
     data: &Population,
@@ -498,8 +584,10 @@ fn compile_and_fit(
     let text = candidate.model.render();
     let mut parsed = parse_full_model(&text)
         .map_err(|e| format!("candidate `{}` does not compile: {e}", candidate.id))?;
-    let mut population = data.clone();
-    bind_theta_levels(&mut parsed, &text, &mut population)?;
+    let mut population = Cow::Borrowed(data);
+    if !parsed.model.theta_blocks().level_blocks().is_empty() {
+        bind_theta_levels(&mut parsed, &text, population.to_mut())?;
+    }
     ferx_core::api::bind_covariate_stats(&mut parsed, &text, &population)?;
 
     // The caller's settings replace the file's wholesale when given; the four

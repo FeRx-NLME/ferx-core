@@ -35,6 +35,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use ferx_core::{FitOptions, FitResult, Population, Strictness};
@@ -84,12 +85,82 @@ pub fn fit_path(dir: &Path, hash: &str) -> PathBuf {
     fits_dir(dir).join(format!("{hash}.json"))
 }
 
+pub fn lock_path(dir: &Path) -> PathBuf {
+    dir.join("search.lock")
+}
+
 /// The temp sibling a file is rewritten through, in the same directory so the
 /// `rename` that swaps it in is atomic.
+///
+/// The name carries this process's id and a per-call counter, because a
+/// *fixed* `.part` name is shared state between processes: two runs pointed at
+/// one cache directory would `write` the same temp file concurrently and then
+/// rename it twice, publishing a byte-mix of two fits under a hash that names
+/// neither. [`DirLock`] is what normally keeps them apart; this is the second
+/// lock on that door, since a `.part` collision fails silently.
 fn part_path(path: &Path) -> PathBuf {
+    static NONCE: AtomicU64 = AtomicU64::new(0);
+    let n = NONCE.fetch_add(1, Ordering::Relaxed);
     let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".part");
+    name.push(format!(".{}.{n}.part", std::process::id()));
     path.with_file_name(name)
+}
+
+/// An exclusive claim on a search directory, held for the length of one run and
+/// released when it is dropped.
+///
+/// Two runs sharing a cache directory do not merely interleave — they lose
+/// data silently. `Journal::create` *renames* a fresh file over
+/// `search_journal.jsonl`, so the run that was already appending keeps writing
+/// into an unlinked inode and every row it produces from then on is gone, with
+/// nothing on disk to say so. A lock file turns that into a message.
+///
+/// It is deliberately a plain `O_EXCL` file rather than an OS advisory lock: no
+/// new dependency, and the failure mode is one a user can see and fix. The cost
+/// is that a hard kill leaves the file behind, so the error says how to clear
+/// it.
+pub struct DirLock {
+    path: PathBuf,
+}
+
+impl DirLock {
+    /// Claim `dir`, or explain who holds it.
+    pub fn acquire(dir: &Path) -> Result<DirLock, String> {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("cannot create search directory `{}`: {e}", dir.display()))?;
+        let path = lock_path(dir);
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                // Best-effort: the lock is the file's existence, not its
+                // contents, so a failed write costs a better error message and
+                // nothing else.
+                let _ = writeln!(file, "pid {}", std::process::id());
+                Ok(DirLock { path })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let owner = std::fs::read_to_string(&path)
+                    .ok()
+                    .map(|text| text.trim().to_string())
+                    .filter(|text| !text.is_empty())
+                    .unwrap_or_else(|| "owner unknown".to_string());
+                Err(format!(
+                    "the search directory `{}` is already in use ({owner}): two runs sharing one \
+                     directory overwrite each other's journal, so the second one's fits would be \
+                     lost. Point this run at a different directory — or, if no such process is \
+                     running (a hard kill leaves the lock behind), delete `{}` and retry.",
+                    dir.display(),
+                    path.display()
+                ))
+            }
+            Err(e) => Err(format!("cannot create `{}`: {e}", path.display())),
+        }
+    }
+}
+
+impl Drop for DirLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// Every well-formed record in `path`, in file order.

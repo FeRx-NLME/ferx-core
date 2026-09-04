@@ -269,6 +269,20 @@ pub struct CandidateResult {
     /// (`duplicate_of` is set), or the outcome was read back from a journal
     /// whose cached fit is absent or unreadable (`reused`).
     pub fit: Option<FitResult>,
+    /// The objective function value, mirroring [`FitResult::ofv`] whenever
+    /// [`fit`](Self::fit) is present.
+    ///
+    /// Kept beside the fit rather than read out of it because the fit is the
+    /// part a resume can lose: `fits/<hash>.json` is a cache, and a candidate
+    /// whose cached fit is missing or corrupt still has its OFV in the journal
+    /// row. Reading the table's `ofv` column off `fit` alone would blank it for
+    /// exactly the degraded resume the journal is designed to survive.
+    /// `None` when there is no fit at all.
+    pub ofv: Option<f64>,
+    /// Whether the fit converged, mirroring [`FitResult::converged`] — and kept
+    /// beside it for the same reason as [`ofv`](Self::ofv). `None` when there
+    /// is no fit at all, which is not the same statement as `Some(false)`.
+    pub converged: Option<bool>,
     /// Every gate the fit failed, and every gate that could not be evaluated.
     /// A compile or fit failure yields a verdict with one failure naming it.
     pub verdict: StrictnessVerdict,

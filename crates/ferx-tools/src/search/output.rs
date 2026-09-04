@@ -18,6 +18,18 @@ pub fn table_path(dir: &Path) -> PathBuf {
     dir.join("candidates.csv")
 }
 
+/// Where a **cancelled** run's partial table goes.
+///
+/// A cancelled run has a report worth reading and a `candidates.csv` it must
+/// not be the one to destroy: the run it resumed may have finished hundreds of
+/// candidates, and `csv::Writer::from_path` truncates. So the partial table is
+/// a file of its own, and a run that reaches the end removes it — a stale
+/// partial next to a complete table would be the more confusing of the two
+/// failure modes.
+pub fn partial_table_path(dir: &Path) -> PathBuf {
+    dir.join("candidates.partial.csv")
+}
+
 /// The columns of `candidates.csv`, in order.
 pub const COLUMNS: [&str; 14] = [
     "id",
@@ -53,41 +65,65 @@ fn reasons(list: &[String]) -> String {
     list.join("; ")
 }
 
-/// Write `candidates.csv` into `dir`.
+/// Write `candidates.csv` into `dir`, and drop any partial table left by an
+/// earlier cancelled run.
 pub fn write_table(dir: &Path, results: &[CandidateResult]) -> Result<(), String> {
+    write_table_to(&table_path(dir), dir, results)?;
+    // Best-effort: a partial table that outlives its complete successor is
+    // confusing, but failing the run over it would be worse.
+    let _ = std::fs::remove_file(partial_table_path(dir));
+    Ok(())
+}
+
+/// Write a cancelled run's rows to [`partial_table_path`], leaving any complete
+/// `candidates.csv` beside it untouched.
+pub fn write_partial_table(dir: &Path, results: &[CandidateResult]) -> Result<(), String> {
+    write_table_to(&partial_table_path(dir), dir, results)
+}
+
+/// The table itself, written through a `.part` sibling renamed into place so a
+/// reader never sees a half-written file and a failure mid-write does not
+/// destroy the previous one.
+fn write_table_to(path: &Path, dir: &Path, results: &[CandidateResult]) -> Result<(), String> {
     std::fs::create_dir_all(dir)
         .map_err(|e| format!("cannot create search directory `{}`: {e}", dir.display()))?;
-    let path = table_path(dir);
-    let mut writer = csv::Writer::from_path(&path)
-        .map_err(|e| format!("cannot write `{}`: {e}", path.display()))?;
-    writer
-        .write_record(COLUMNS)
-        .map_err(|e| format!("cannot write `{}`: {e}", path.display()))?;
-    for r in results {
-        let ofv = r.fit.as_ref().map(|f| f.ofv).unwrap_or(f64::NAN);
-        let converged = r.fit.as_ref().map(|f| f.converged);
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".part");
+    let temp = path.with_file_name(name);
+    {
+        let mut writer = csv::Writer::from_path(&temp)
+            .map_err(|e| format!("cannot write `{}`: {e}", temp.display()))?;
         writer
-            .write_record([
-                r.id.clone(),
-                r.parent.clone().unwrap_or_default(),
-                r.hash.clone(),
-                r.features.render(),
-                number(r.criterion),
-                number(ofv),
-                converged.map(|c| c.to_string()).unwrap_or_default(),
-                r.verdict.passed.to_string(),
-                reasons(&r.verdict.failures),
-                reasons(&r.verdict.skipped),
-                number(r.seconds),
-                r.error.clone().unwrap_or_default(),
-                r.duplicate_of.clone().unwrap_or_default(),
-                r.reused.to_string(),
-            ])
-            .map_err(|e| format!("cannot write `{}`: {e}", path.display()))?;
+            .write_record(COLUMNS)
+            .map_err(|e| format!("cannot write `{}`: {e}", temp.display()))?;
+        for r in results {
+            writer
+                .write_record([
+                    r.id.clone(),
+                    r.parent.clone().unwrap_or_default(),
+                    r.hash.clone(),
+                    r.features.render(),
+                    number(r.criterion),
+                    number(r.ofv.unwrap_or(f64::NAN)),
+                    r.converged.map(|c| c.to_string()).unwrap_or_default(),
+                    r.verdict.passed.to_string(),
+                    reasons(&r.verdict.failures),
+                    reasons(&r.verdict.skipped),
+                    number(r.seconds),
+                    r.error.clone().unwrap_or_default(),
+                    r.duplicate_of.clone().unwrap_or_default(),
+                    r.reused.to_string(),
+                ])
+                .map_err(|e| format!("cannot write `{}`: {e}", temp.display()))?;
+        }
+        writer
+            .flush()
+            .map_err(|e| format!("cannot flush `{}`: {e}", temp.display()))?;
     }
-    writer
-        .flush()
-        .map_err(|e| format!("cannot flush `{}`: {e}", path.display()))
+    std::fs::rename(&temp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp);
+        format!("cannot rename `{}`: {e}", temp.display())
+    })
 }
 
 #[cfg(test)]
