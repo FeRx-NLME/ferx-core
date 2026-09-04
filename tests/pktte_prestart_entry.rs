@@ -117,8 +117,13 @@ fn prestart_entry_matches_no_entry_on_the_shared_engine() {
         pre.is_finite() && none.is_finite(),
         "A1 objectives must be finite: TENTRY=5 {pre}, TENTRY=0 {none}"
     );
-    assert!(
-        (pre - none).abs() <= 1e-9 * none.abs().max(1.0),
+    // Bit-exact, not merely close: the extra CHZ node the `TENTRY` adds is filled before the
+    // break walk and lies in no segment, and it does not move the horizon, so the integration
+    // is identical. Measured — see the sibling assertion in `prestart_entry_time_contributes_
+    // nothing_post_start_entry_does`, which reports a difference of exactly `0.0`.
+    assert_eq!(
+        pre.to_bits(),
+        none.to_bits(),
         "A1: a pre-start TENTRY must contribute nothing — TENTRY=5 {pre} vs TENTRY=0 {none}"
     );
     assert!(
@@ -137,8 +142,9 @@ fn prestart_entry_matches_no_entry_on_the_dedicated_engine() {
         pre.is_finite() && none.is_finite(),
         "A4 objectives must be finite: TENTRY=5 {pre}, TENTRY=0 {none}"
     );
-    assert!(
-        (pre - none).abs() <= 1e-9 * none.abs().max(1.0),
+    assert_eq!(
+        pre.to_bits(),
+        none.to_bits(),
         "A4: a pre-start TENTRY must contribute nothing — TENTRY=5 {pre} vs TENTRY=0 {none}"
     );
     assert!(

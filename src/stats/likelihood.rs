@@ -4202,14 +4202,22 @@ mod tests {
             "the pair must straddle the integration start ({start})"
         );
 
-        // Pre-start entry: identical objective. Not bit-equal — `entry_time > 0` adds a
-        // node to the shared solve's CHZ time vector, which re-segments the integration —
-        // so a solver-tolerance bound, measured at 0 (exact) on this fixture.
-        assert!(
-            (pre - none).abs() <= 1e-9 * none.abs().max(1.0),
+        // Pre-start entry contributes nothing, and does so **bit-exactly** — measured
+        // (`306.2186273580891` both ways, difference `0.0`), and bit-exact by construction
+        // rather than by luck: `entry_time = 5` adds a node to the shared solve's CHZ time
+        // vector, but that node is filled before the break walk and lies in no segment, and
+        // the horizon `t_last = max(obs 24, chz) = 24` is unchanged either way — so the
+        // break timeline, every segment and the Gaussian solve are identical. A tolerance
+        // here would be strictly weaker with nothing bought for it.
+        assert_eq!(
+            pre.to_bits(),
+            none.to_bits(),
             "a pre-start entry must contribute nothing: entry=5 {pre} vs entry=0 {none}"
         );
-        // Post-start entry: the objective must move by `H(12) > 0`.
+        // Post-start entry: the objective must move by `H(12) > 0`. Measured separation is
+        // 1.363e-3 relative, so the `1e-6` floor is ~1300x below what a real contribution
+        // produces — loose enough not to be a tolerance test, tight enough that "the entry
+        // time was ignored" (separation 0) cannot pass.
         assert!(
             (post - none).abs() > 1e-6,
             "a post-start entry must change the objective: entry=12 {post} vs entry=0 {none}"
