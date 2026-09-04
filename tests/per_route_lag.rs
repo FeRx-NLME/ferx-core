@@ -31,7 +31,7 @@ const ROUTE_LAG_SINGLE: &str = r#"
   theta TVV(50.0,  5.0, 500.0)
   theta TVKA(1.0, 0.01,  24.0)
   theta TVLAG(2.0, 0.0,  12.0)
-  omega ETA_CL ~ 0.0
+  omega ETA_CL ~ 0.0 FIX
   sigma PROP_ERR ~ 0.01 (sd)
 [individual_parameters]
   CL  = TVCL * exp(ETA_CL)
@@ -59,7 +59,7 @@ const COMP_LAG_SINGLE: &str = r#"
   theta TVV(50.0,  5.0, 500.0)
   theta TVKA(1.0, 0.01,  24.0)
   theta TVLAG(2.0, 0.0,  12.0)
-  omega ETA_CL ~ 0.0
+  omega ETA_CL ~ 0.0 FIX
   sigma PROP_ERR ~ 0.01 (sd)
 [individual_parameters]
   CL      = TVCL * exp(ETA_CL)
@@ -84,7 +84,7 @@ const ROUTE_LAG_ZERO: &str = r#"
   theta TVV(50.0,  5.0, 500.0)
   theta TVDUR(3.0, 0.05, 24.0)
   theta TVLAG(2.0, 0.0,  12.0)
-  omega ETA_CL ~ 0.0
+  omega ETA_CL ~ 0.0 FIX
   sigma PROP_ERR ~ 0.01 (sd)
 [individual_parameters]
   CL  = TVCL * exp(ETA_CL)
@@ -110,7 +110,7 @@ const COMP_LAG_ZERO: &str = r#"
   theta TVV(50.0,  5.0, 500.0)
   theta TVDUR(3.0, 0.05, 24.0)
   theta TVLAG(2.0, 0.0,  12.0)
-  omega ETA_CL ~ 0.0
+  omega ETA_CL ~ 0.0 FIX
   sigma PROP_ERR ~ 0.01 (sd)
 [individual_parameters]
   CL      = TVCL * exp(ETA_CL)
@@ -138,7 +138,7 @@ const ROUTE_LAG_PARALLEL: &str = r#"
   theta TVKA2(0.7, 0.05,  24.0)
   theta TVL1(0.5,  0.0,   12.0)
   theta TVL2(3.0,  0.0,   12.0)
-  omega ETA_CL ~ 0.0
+  omega ETA_CL ~ 0.0 FIX
   sigma PROP_ERR ~ 0.01 (sd)
 [individual_parameters]
   CL  = TVCL * exp(ETA_CL)
@@ -171,7 +171,7 @@ const ROUTE_LAG_MIXED: &str = r#"
   theta TVKA(1.0,  0.05,  24.0)
   theta TVDUR(3.0, 0.05,  24.0)
   theta TVLAG(2.0, 0.0,   12.0)
-  omega ETA_CL ~ 0.0
+  omega ETA_CL ~ 0.0 FIX
   sigma PROP_ERR ~ 0.01 (sd)
 [individual_parameters]
   CL   = TVCL * exp(ETA_CL)
@@ -415,7 +415,7 @@ fn zero_route_lag_is_bit_identical_to_no_lag() {
   theta TVCL(5.0,  0.1, 100.0)
   theta TVV(50.0,  5.0, 500.0)
   theta TVKA(1.0, 0.01,  24.0)
-  omega ETA_CL ~ 0.0
+  omega ETA_CL ~ 0.0 FIX
   sigma PROP_ERR ~ 0.01 (sd)
 [individual_parameters]
   CL  = TVCL * exp(ETA_CL)
@@ -436,7 +436,7 @@ fn zero_route_lag_is_bit_identical_to_no_lag() {
   theta TVV(50.0,  5.0, 500.0)
   theta TVKA(1.0, 0.01,  24.0)
   theta TVLAG(0.0, 0.0,  12.0)
-  omega ETA_CL ~ 0.0
+  omega ETA_CL ~ 0.0 FIX
   sigma PROP_ERR ~ 0.01 (sd)
 [individual_parameters]
   CL  = TVCL * exp(ETA_CL)
@@ -587,6 +587,16 @@ fn per_route_lag_fit_runs_end_to_end() {
 /// Tier-3 (slow): a full FOCEI fit (exact analytic gradients since #859) recovers the
 /// per-route lag from a perturbed start on noise-free data — the optimum sits at the
 /// data-generating lag.
+///
+/// The models in this file declare `omega ETA_CL ~ 0.0 FIX`, and the `FIX` is what makes
+/// this test's `converged` assertion meaningful (#1227). Fitting **one** subject leaves ω²
+/// with no between-subject information to estimate from, so a *free* zero-variance omega is
+/// unidentifiable by construction: nothing bounds it above and it walks to `compute_bounds`'
+/// `+6` Cholesky-diagonal ceiling (ω² ≈ 162 755). Since #1205 that rail is a `runaway`
+/// verdict and demotes `converged`, so the assertion below failed on every nightly run —
+/// on a fit whose TVLAG was nonetheless recovered to eight decimals. Declaring the omega
+/// FIX'd matches what the model already says (zero IIV) and removes the coordinate from the
+/// packed vector, rather than teaching the assertion to accept a runaway.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
@@ -629,6 +639,21 @@ fn per_route_lag_fit_recovers_lag() {
         "recovered per-route lag {} should be near 2.0",
         fitted.theta[3]
     );
+    // Pin the disposition too, not just the lag (#1227). While ω ran to the +6 rail it
+    // absorbed the structural signal and these came back TVCL −48%, TVKA −29%, TVV −13%
+    // on the same noise-free data — a fit this test called a success because it only ever
+    // looked at theta[3]. With the omega FIX'd the worst of the three is TVKA at 1.5%
+    // (TVCL 0.09%, TVV 0.59%), so 5% sits ~3x above what the sound fit produces and ~1/9
+    // of the smallest error the degenerate one produced. Both numbers are measured.
+    for (i, truth, name) in [(0usize, 5.0, "TVCL"), (1, 50.0, "TVV"), (2, 1.0, "TVKA")] {
+        let rel = (fitted.theta[i] - truth).abs() / truth;
+        assert!(
+            rel < 0.05,
+            "{name} = {} is {:.1}% off truth {truth}; the noise-free optimum recovers it",
+            fitted.theta[i],
+            rel * 100.0
+        );
+    }
 }
 
 #[test]
@@ -698,7 +723,7 @@ const TRANSIT_ROUTE_LAG: &str = r#"
   theta TVN(3.0, 0.1, 20.0)
   theta TVMTT(1.0, 0.05, 24.0)
   theta TVLAG(2.0, 0.0, 12.0)
-  omega ETA_CL ~ 0.0
+  omega ETA_CL ~ 0.0 FIX
   sigma PROP_ERR ~ 0.01 (sd)
 [individual_parameters]
   CL  = TVCL * exp(ETA_CL)
@@ -723,7 +748,7 @@ const TRANSIT_COMP_LAG: &str = r#"
   theta TVN(3.0, 0.1, 20.0)
   theta TVMTT(1.0, 0.05, 24.0)
   theta TVLAG(2.0, 0.0, 12.0)
-  omega ETA_CL ~ 0.0
+  omega ETA_CL ~ 0.0 FIX
   sigma PROP_ERR ~ 0.01 (sd)
 [individual_parameters]
   CL      = TVCL * exp(ETA_CL)
@@ -748,7 +773,7 @@ const IGD_ROUTE_LAG: &str = r#"
   theta TVMAT(2.0, 0.05, 24.0)
   theta TVCV2(0.5, 0.01, 10.0)
   theta TVLAG(2.0, 0.0, 12.0)
-  omega ETA_CL ~ 0.0
+  omega ETA_CL ~ 0.0 FIX
   sigma PROP_ERR ~ 0.01 (sd)
 [individual_parameters]
   CL  = TVCL * exp(ETA_CL)
@@ -773,7 +798,7 @@ const IGD_COMP_LAG: &str = r#"
   theta TVMAT(2.0, 0.05, 24.0)
   theta TVCV2(0.5, 0.01, 10.0)
   theta TVLAG(2.0, 0.0, 12.0)
-  omega ETA_CL ~ 0.0
+  omega ETA_CL ~ 0.0 FIX
   sigma PROP_ERR ~ 0.01 (sd)
 [individual_parameters]
   CL      = TVCL * exp(ETA_CL)
