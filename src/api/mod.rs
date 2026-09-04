@@ -20,10 +20,10 @@ pub(crate) use validation::{
     apply_iov_occasion_rule, assert_absorption_closed_form_support,
     assert_absorption_dosing_supported, assert_absorption_flip_flop_no_twin,
     assert_analytic_readout_support, assert_covariates_present, assert_dose_compartments_supported,
-    assert_modeled_doses_supported, check_absorption_closed_form_support, check_absorption_dosing,
-    check_absorption_flip_flop_no_twin, check_analytic_readout_support, check_covariates,
-    check_dose_compartments, check_kappa_weights, check_modeled_dose_rates,
-    check_residual_magnitude, check_simulation_data,
+    assert_endpoint_routing, assert_modeled_doses_supported, check_absorption_closed_form_support,
+    check_absorption_dosing, check_absorption_flip_flop_no_twin, check_analytic_readout_support,
+    check_covariates, check_dose_compartments, check_endpoint_routing, check_kappa_weights,
+    check_modeled_dose_rates, check_residual_magnitude, check_simulation_data,
 };
 #[cfg(feature = "survival")]
 pub(crate) use validation::{
@@ -75,7 +75,9 @@ pub(crate) use postfit::{
 pub use predict::{predict, PredictionResult};
 #[cfg(feature = "survival")]
 pub use predict::{predict_categorical, predict_survival, SurvivalPredictionResult};
-pub(crate) use run::{build_selection_filter_merged, log_transform_observations};
+pub(crate) use run::{
+    build_selection_filter_merged, log_transform_observations, read_population_routed_by,
+};
 pub use run::{
     prepare_run, prepare_run_with_inits, read_population_for, read_population_for_simulation,
     resolve_data_path, run_from_file, run_model_simulate, run_model_with_data,
@@ -198,6 +200,10 @@ mod simulation_template_tests;
 #[cfg(test)]
 #[path = "tests/simulation_design_covariates_tests.rs"]
 mod simulation_design_covariates_tests;
+
+#[cfg(test)]
+#[path = "tests/endpoint_routing_tests.rs"]
+mod endpoint_routing_tests;
 
 // ======================================================================
 // Adaptive (state-reactive / feedback) dosing — epic #391, beta.

@@ -64,7 +64,7 @@ use std::path::Path;
 /// `iov_column` name from the model file's `[fit_options]` block, which does
 /// not survive on a `CompiledModel`. When the caller passes `None` for both
 /// `model` and `population`, this function parses the full model file and
-/// threads `iov_column` into `read_nonmem_csv`. When the caller supplies
+/// threads `iov_column` into the model-routed reader. When the caller supplies
 /// `Some(model)` for an IOV model but leaves `population = None`, there is no
 /// source of `iov_column`, so `run_covariance` returns an error rather than
 /// silently dropping occasion parsing. Workaround: pass both `Some(model)` and
@@ -74,7 +74,9 @@ use std::path::Path;
 /// - `fit`: the maximum-likelihood fit to compute a covariance for.
 /// - `model`: pre-compiled model. When `None`, re-parsed from `fit.model_path`.
 /// - `population`: dataset. When `None`, re-read from `fit.data_path` (with the
-///   `iov_column` constraint above for IOV models).
+///   `iov_column` constraint above for IOV models), routed by the model so a
+///   joint model's event rows come back as event records (#1199). A supplied
+///   population read without that routing is rejected (`E_ENDPOINT_UNROUTED`).
 /// - `options`: covariance-relevant fields read are `covariance_method`,
 ///   `fd_hessian_step`, `cov_inner_tol`, `interaction`, `mu_referencing`, the
 ///   inner-loop settings, and `cancel`. `run_covariance_step` on `options` is
@@ -176,9 +178,9 @@ fn run_covariance_scoped(
                     ));
                 }
             }
-            let p = crate::io::datareader::read_nonmem_csv_mapped(
+            let p = crate::api::read_population_routed_by(
+                model_ref,
                 Path::new(path),
-                None,
                 iov_column_from_parse.as_deref(),
                 &column_map_from_parse,
             )?;
@@ -194,6 +196,13 @@ fn run_covariance_scoped(
     // `Result` form used at the adaptive chokepoint rather than the
     // `predict()`/`simulate()` panic.
     crate::diagnostics::first_error(&crate::api::check_dose_compartments(model_ref, pop_ref))?;
+    // …and the endpoint-routing precondition (#1199), as `fit()` enforces it: a
+    // population read model-blind carries a joint model's event rows as Gaussian
+    // observations, and the covariance step would be taken on the Gaussian half of
+    // the likelihood. The re-read above is routed; this covers a supplied population.
+    crate::diagnostics::first_error(&crate::api::check_endpoint_routing(
+        model_ref, pop_ref, true,
+    ))?;
 
     // --- Sanity-check dimensions ------------------------------------------
     if model_ref.n_eta != fit.omega.nrows() {

@@ -229,6 +229,152 @@ fn check_per_cmt_error_model(model: &CompiledModel, population: &Population) -> 
     .with_block("error_model")]
 }
 
+/// A declared non-Gaussian endpoint must have been *routed* by the reader (#1199).
+///
+/// `read_population_for` routes every row on a CMT the model declares as a TTE /
+/// binary / CTMM endpoint into `Subject::obs_records`; the model-blind
+/// `read_nonmem_csv` family cannot, so those rows land in the Gaussian grid
+/// (`obs_cmts`) and the endpoint's likelihood term scores nothing. The result is a
+/// finite, plausible, wrong objective — 4606.6 against 1912.0 (the NONMEM value) on
+/// the `pktte_tdep` fixture — with no message, and `predict()` returns a
+/// concentration for the event row. Two codes, both errors:
+///
+/// - `E_ENDPOINT_UNROUTED`: some subject has a Gaussian observation on an endpoint
+///   CMT. The routed reader never puts an endpoint CMT into `obs_cmts` (pinned by
+///   `datareader_tests::routed_reader_never_places_an_endpoint_cmt_in_the_gaussian_grid`),
+///   so this has no false positive: it is the signature of a population that was
+///   not built for this model. Checked at every entry point (`fit`, `simulate`,
+///   `predict`).
+/// - `E_ENDPOINT_NO_RECORDS` (`require_records`): a declared endpoint has no routed
+///   row anywhere in the population. Catches the routed-but-empty case — the `CMT`
+///   column is absent, so every row reads as CMT 1 and the endpoint's rows are
+///   silently Gaussian on CMT 1 (same 4606.6, no reader warning). Fit only: a
+///   simulation design template carries no event rows by construction, and
+///   `predict()` legitimately takes a PK-only population.
+///
+/// Not auto-repaired: re-classifying Gaussian rows into events after the fact would
+/// lose `TENTRY` and the DV-code validation the routed reader performs — a second
+/// silent path. A no-op without the `survival` feature, where no non-Gaussian
+/// endpoint can be parsed.
+#[cfg(feature = "survival")]
+pub(crate) fn check_endpoint_routing(
+    model: &CompiledModel,
+    population: &Population,
+    require_records: bool,
+) -> Vec<Diagnostic> {
+    use crate::types::EndpointLikelihood;
+    use std::collections::BTreeMap;
+
+    // (what to call the endpoint in the message, the block the diagnostic points at)
+    let kind_of = |ep: &EndpointLikelihood| -> Option<(&'static str, &'static str)> {
+        match ep {
+            EndpointLikelihood::Tte { .. } => {
+                Some(("time-to-event (`[event_model]`)", "event_model"))
+            }
+            EndpointLikelihood::Binary { .. } => {
+                Some(("binary (`[binary_model]`)", "binary_model"))
+            }
+            #[cfg(feature = "markov")]
+            EndpointLikelihood::Ctmm { .. } => Some(("Markov (`[markov_model]`)", "markov_model")),
+            // Not an endpoint the parser ever registers here; skipped rather than
+            // matched by a wildcard so a Gaussian CMT can never be reported as unrouted.
+            EndpointLikelihood::Gaussian(_) => None,
+        }
+    };
+    let endpoints: BTreeMap<usize, (&'static str, &'static str)> = model
+        .endpoints
+        .iter()
+        .filter_map(|(&cmt, ep)| kind_of(ep).map(|k| (cmt, k)))
+        .collect();
+    if endpoints.is_empty() {
+        return Vec::new();
+    }
+
+    let mut diags = Vec::new();
+    // cmt -> (first offending subject, number of Gaussian rows on it)
+    let mut unrouted: BTreeMap<usize, (String, usize)> = BTreeMap::new();
+    for subj in &population.subjects {
+        for &cmt in &subj.obs_cmts {
+            if endpoints.contains_key(&cmt) {
+                unrouted
+                    .entry(cmt)
+                    .or_insert_with(|| (subj.id.clone(), 0))
+                    .1 += 1;
+            }
+        }
+    }
+    for (cmt, (id, n)) in &unrouted {
+        let (kind, block) = endpoints[cmt];
+        diags.push(
+            Diagnostic::error(
+                "E_ENDPOINT_UNROUTED",
+                format!(
+                    "E_ENDPOINT_UNROUTED: CMT {cmt} is declared as a {kind} endpoint, but the \
+                     data carries {n} Gaussian observation(s) on it (first: subject {id}). This \
+                     population was \
+                     loaded without endpoint routing — `read_nonmem_csv` and its variants know \
+                     nothing about the model — so the endpoint's rows would be scored as \
+                     concentrations and its likelihood would contribute nothing. Load the data \
+                     with `read_population_for(&model, ...)` so those rows become event records."
+                ),
+            )
+            .with_block(block),
+        );
+    }
+    if require_records {
+        // one pass over the records: cmt -> routed rows
+        let mut routed: BTreeMap<usize, usize> = BTreeMap::new();
+        for r in population
+            .subjects
+            .iter()
+            .flat_map(|s| s.obs_records.iter())
+        {
+            *routed.entry(r.cmt()).or_insert(0) += 1;
+        }
+        for (&cmt, &(kind, block)) in &endpoints {
+            if unrouted.contains_key(&cmt) {
+                continue; // already reported, with the more precise cause
+            }
+            if routed.get(&cmt).copied().unwrap_or(0) == 0 {
+                diags.push(
+                    Diagnostic::error(
+                        "E_ENDPOINT_NO_RECORDS",
+                        format!(
+                            "E_ENDPOINT_NO_RECORDS: CMT {cmt} is declared as a {kind} endpoint, \
+                             but no row in the data is routed to it, so its likelihood would \
+                             contribute nothing. Check \
+                             that the dataset has a `CMT` column (without one every row reads \
+                             as CMT 1) and that the endpoint's rows carry CMT={cmt}."
+                        ),
+                    )
+                    .with_block(block),
+                );
+            }
+        }
+    }
+    diags
+}
+
+/// See the `survival` twin; no non-Gaussian endpoint exists on this build.
+#[cfg(not(feature = "survival"))]
+pub(crate) fn check_endpoint_routing(
+    _model: &CompiledModel,
+    _population: &Population,
+    _require_records: bool,
+) -> Vec<Diagnostic> {
+    Vec::new()
+}
+
+/// `predict()` twin of the `E_ENDPOINT_UNROUTED` half of [`check_endpoint_routing`]
+/// (the no-records half is fit-only). Panics per the `predict()` convention (#898).
+pub(crate) fn assert_endpoint_routing(model: &CompiledModel, population: &Population) {
+    panic_if_unsupported(
+        first_error(&check_endpoint_routing(model, population, false)).err(),
+        "a population loaded without endpoint routing (`read_nonmem_csv` on a model with a \
+         non-Gaussian endpoint)",
+    );
+}
+
 /// Every per-observation residual-error magnitude (#484) — including the one a
 /// `weight = <expr>` modifier compiles to (#1029) — must be strictly positive
 /// and finite at the initial estimates.
@@ -557,6 +703,10 @@ pub(crate) fn check_simulation_data(
     diags.extend(check_covariate_model_bound(model));
     diags.extend(check_covariate_levels(model, population));
     diags.extend(check_covariates(model, population));
+    // Unrouted half only: a design template has no event rows by construction. An
+    // unrouted template would otherwise simulate *no* events (the TTE draw is keyed
+    // on `obs_records`) and emit a concentration for every event-CMT design row.
+    diags.extend(check_endpoint_routing(model, population, false));
     diags.extend(check_kappa_weights(model, population));
     diags.extend(check_theta_gather_indices(model, population));
     diags.extend(check_residual_magnitude(model, population));
@@ -567,7 +717,8 @@ pub(crate) fn check_simulation_data(
 /// a dataset, collected into one diagnostic list. Shared by `fit()` (which
 /// stops at the first error via [`first_error`]) and `ferx check` (which
 /// reports every finding). Check order matches the historical inline order in
-/// `fit()` so the first error is unchanged: covariates, scaling, error model,
+/// `fit()` so the first error is unchanged: covariates, endpoint routing (#1199,
+/// ahead of the per-CMT checks so it names the cause), scaling, error model,
 /// iov occasions.
 pub fn check_model_data(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
     // Default (no model-side occasion rule): occasions, if any, come from the data.
@@ -586,6 +737,9 @@ pub fn check_model_data_rule(
     diags.extend(check_covariate_model_bound(model));
     diags.extend(check_covariate_levels(model, population));
     diags.extend(check_covariates(model, population));
+    // Before the per-CMT checks: an unrouted endpoint CMT would otherwise surface as
+    // `E_PER_CMT_ERROR_MODEL` ("CMT 3 has no error model") and name the wrong cause.
+    diags.extend(check_endpoint_routing(model, population, true));
     diags.extend(check_per_cmt_scaling(model, population));
     diags.extend(check_per_cmt_error_model(model, population));
     diags.extend(check_residual_magnitude(model, population));

@@ -981,16 +981,20 @@ pub fn load_fit(path: &Path) -> Result<LoadedFit, FitrxError> {
         std::fs::write(tmp.path(), &data_csv_bytes)?;
         // data.csv is bundled with its original headers, so honour the model's
         // `[data]` column mapping (#730) when re-reading — otherwise a fit that
-        // mapped e.g. `DV = CONC` cannot round-trip through load_fit. Parse the
-        // bundled model source for the map; fall back to no mapping if it can't
-        // be parsed (leave the read to fail with its own diagnostic).
-        let column_map = crate::parser::model_parser::parse_full_model(&model_source)
-            .map(|m| m.column_map)
-            .unwrap_or_default();
-        Some(
-            crate::io::datareader::read_nonmem_csv_mapped(tmp.path(), None, None, &column_map)
-                .map_err(FitrxError::Corrupt)?,
-        )
+        // mapped e.g. `DV = CONC` cannot round-trip through load_fit — and route
+        // the model's non-Gaussian endpoints (#1199): a joint PK-TTE bundle read
+        // model-blind came back with *no* event records, and `fit()` now rejects
+        // such a population outright (`E_ENDPOINT_UNROUTED`). Parse the bundled
+        // model source for both; fall back to the plain mapped read only if it
+        // can't be parsed (leave the read to fail with its own diagnostic).
+        let population = match crate::parser::model_parser::parse_full_model(&model_source) {
+            Ok(m) => {
+                crate::api::read_population_routed_by(&m.model, tmp.path(), None, &m.column_map)
+            }
+            Err(_) => crate::io::datareader::read_nonmem_csv_mapped(tmp.path(), None, None, &[]),
+        }
+        .map_err(FitrxError::Corrupt)?;
+        Some(population)
     } else {
         None
     };
@@ -2484,6 +2488,115 @@ mod tests {
         assert_eq!(n_obs, 2, "mapped observations should be read");
         assert!(!pop.covariate_names.contains(&"TAFD".to_string()));
         assert!(!pop.covariate_names.contains(&"CONC".to_string()));
+    }
+
+    #[cfg(feature = "survival")]
+    #[test]
+    fn roundtrip_bundled_data_routes_the_model_endpoints() {
+        // #1199: a joint PK-TTE bundle re-read through the model-blind reader came
+        // back with *no* event records (and its event rows as Gaussian CMT-3
+        // observations), so anything fed the reloaded population re-fit or
+        // predicted the Gaussian half only. `load_fit` now routes by the bundled
+        // model. The reference is the routed reader on the same file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("joint.fitrx");
+        let model_source = std::fs::read_to_string("examples/pktte_joint.ferx").unwrap();
+        let data_csv = PathBuf::from("data/pktte_joint.csv");
+
+        let r = minimal_fit_result();
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(
+            &r,
+            &p,
+            &model_source,
+            &path,
+            SaveFitOptions {
+                include_data: Some(data_csv),
+            },
+        )
+        .unwrap();
+
+        let loaded = load_fit(&path).expect("load_fit reads the bundled joint data.csv");
+        let pop = loaded.population.expect("data.csv was bundled");
+        let events: usize = pop.subjects.iter().map(|s| s.obs_records.len()).sum();
+        let gaussian_on_3: usize = pop
+            .subjects
+            .iter()
+            .map(|s| s.obs_cmts.iter().filter(|&&c| c == 3).count())
+            .sum();
+
+        let m = crate::parser::model_parser::parse_full_model(&model_source)
+            .unwrap()
+            .model;
+        let (want, _) = crate::api::read_population_for(
+            &m,
+            &None,
+            "data/pktte_joint.csv",
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        let want_events: usize = want.subjects.iter().map(|s| s.obs_records.len()).sum();
+        assert!(want_events > 0, "the fixture carries event rows");
+        assert_eq!(
+            events, want_events,
+            "reloaded population must carry every event record"
+        );
+        assert_eq!(
+            gaussian_on_3, 0,
+            "…and none of them as a Gaussian CMT-3 row"
+        );
+    }
+
+    /// The discrete arm of the same reload: a `[binary_model]` bundle comes back
+    /// with its rows as `DiscreteState` records, none in the Gaussian grid.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn roundtrip_bundled_data_routes_a_binary_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("binary.fitrx");
+        let model_source = std::fs::read_to_string("examples/binary_logistic.ferx").unwrap();
+        let data = "data/binary_logistic.csv";
+
+        save_fit(
+            &minimal_fit_result(),
+            &dummy_population(&["S1", "S2"], 3),
+            &model_source,
+            &path,
+            SaveFitOptions {
+                include_data: Some(PathBuf::from(data)),
+            },
+        )
+        .unwrap();
+
+        let pop = load_fit(&path)
+            .expect("load_fit reads the bundled binary data.csv")
+            .population
+            .expect("data.csv was bundled");
+        let records: usize = pop.subjects.iter().map(|s| s.obs_records.len()).sum();
+        let gaussian_on_3: usize = pop
+            .subjects
+            .iter()
+            .map(|s| s.obs_cmts.iter().filter(|&&c| c == 3).count())
+            .sum();
+
+        let m = crate::parser::model_parser::parse_full_model(&model_source)
+            .unwrap()
+            .model;
+        let (want, _) =
+            crate::api::read_population_for(&m, &None, data, None, None, None, &[]).unwrap();
+        let want_records: usize = want.subjects.iter().map(|s| s.obs_records.len()).sum();
+        assert!(want_records > 0, "the fixture carries binary rows");
+        assert_eq!(
+            records, want_records,
+            "reloaded population must carry every record"
+        );
+        assert_eq!(
+            gaussian_on_3, 0,
+            "…and none of them as a Gaussian CMT-3 row"
+        );
     }
 
     #[test]

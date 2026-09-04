@@ -147,6 +147,16 @@ fn is_missing_cell(s: &str) -> bool {
 /// `iov_column`: when `Some(name)`, that column is read as the occasion index
 /// (integer) and stored in `Subject::occasions` / `Subject::dose_occasions`.
 /// The column is excluded from the covariate auto-detection list.
+///
+/// **Model-blind — no endpoint routing.** This reader (and its `_with_covariates`
+/// / `_filtered` variants) does not know the model, so every `EVID=0` row is a
+/// Gaussian observation. A model with a non-Gaussian endpoint (`[event_model]`,
+/// `[binary_model]`, a Markov block) needs those rows routed to
+/// `Subject::obs_records`, which only the model-aware
+/// [`read_population_for`](crate::api::read_population_for) does. `fit()`,
+/// `simulate()` and `predict()` reject a population read here for such a model
+/// with `E_ENDPOINT_UNROUTED` rather than scoring the Gaussian half alone (#1199).
+/// Use this reader for Gaussian-only models.
 pub fn read_nonmem_csv(
     path: &Path,
     covariate_columns: Option<&[&str]>,
@@ -155,8 +165,8 @@ pub fn read_nonmem_csv(
     read_nonmem_csv_mapped(path, covariate_columns, iov_column, &[])
 }
 
-/// Like [`read_nonmem_csv`] but with a `[data]` canonical-role → header
-/// remapping (#730). `column_map` entries are `(canonical_role, actual_header)`;
+/// Like [`read_nonmem_csv`] (model-blind: no endpoint routing, see there) but with
+/// a `[data]` canonical-role → header remapping (#730). `column_map` entries are `(canonical_role, actual_header)`;
 /// an empty slice is the no-remap identity used by the public wrapper.
 pub(crate) fn read_nonmem_csv_mapped(
     path: &Path,
@@ -253,8 +263,9 @@ pub(crate) fn read_nonmem_csv_with_covariates_mapped(
     ))
 }
 
-/// Like [`read_nonmem_csv`] but applies `[data_selection]` filtering at read time.
-/// Called from `api::read_population_for` when `FitOptions` carries selection rules.
+/// Like [`read_nonmem_csv`] (model-blind: no endpoint routing, see there) but
+/// applies `[data_selection]` filtering at read time. Called from
+/// `api::read_population_for` when `FitOptions` carries selection rules.
 pub fn read_nonmem_csv_filtered(
     path: &Path,
     covariate_columns: Option<&[&str]>,
@@ -291,7 +302,8 @@ pub(crate) fn read_nonmem_csv_filtered_mapped(
     .map(|(pop, _)| pop)
 }
 
-/// Like [`read_nonmem_csv_with_covariates`] but applies `[data_selection]` filtering.
+/// Like [`read_nonmem_csv_with_covariates`] (model-blind: no endpoint routing, see
+/// [`read_nonmem_csv`]) but applies `[data_selection]` filtering.
 pub fn read_nonmem_csv_with_covariates_filtered(
     path: &Path,
     decls: &[CovariateDecl],

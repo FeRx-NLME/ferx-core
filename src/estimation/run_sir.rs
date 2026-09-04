@@ -67,7 +67,7 @@ fn push_sir_warnings(warnings: &mut Vec<String>, sir_warnings: &[String]) {
 /// block — that name doesn't survive on a `CompiledModel`. When the
 /// caller passes `None` for both `model` and `population`, this function
 /// parses the full model file (including `[fit_options]`) and threads
-/// `iov_column` into `read_nonmem_csv`. When the caller supplies
+/// `iov_column` into the model-routed reader. When the caller supplies
 /// `Some(model)` for an IOV model but leaves `population = None`, there
 /// is no source of `iov_column`, so `run_sir` returns an error rather
 /// than silently dropping occasion parsing. Workaround: pass both
@@ -78,7 +78,9 @@ fn push_sir_warnings(warnings: &mut Vec<String>, sir_warnings: &[String]) {
 ///   `covariance_matrix` (i.e. the original fit ran with `covariance = true`).
 /// - `model`: pre-compiled model. When `None`, re-parsed from `fit.model_path`.
 /// - `population`: dataset. When `None`, re-read from `fit.data_path` (with
-///   the `iov_column` constraint above for IOV models).
+///   the `iov_column` constraint above for IOV models), routed by the model so
+///   a joint model's event rows come back as event records (#1199). A supplied
+///   population read without that routing is rejected (`E_ENDPOINT_UNROUTED`).
 /// - `options`: SIR-relevant fields read are `sir_samples`, `sir_resamples`,
 ///   `sir_seed`, `sir_keep_samples`, plus the inner-loop settings
 ///   (`inner_maxiter`, `inner_tol`, `interaction`, `mu_referencing`,
@@ -118,6 +120,9 @@ fn run_sir_scoped(
     // population re-read below.
     let model_owned: Option<CompiledModel>;
     let mut iov_column_from_parse: Option<String> = None;
+    // `[data]` column renames (#730), as in `run_covariance`: the re-read has to
+    // resolve `TIME = TAFD` the way the original fit did.
+    let mut column_map_from_parse: Vec<(String, String)> = Vec::new();
     let model_ref: &CompiledModel = match model {
         Some(m) => m,
         None => {
@@ -140,6 +145,7 @@ fn run_sir_scoped(
             }
             let parsed = crate::parser::model_parser::parse_full_model_file(Path::new(path))?;
             iov_column_from_parse = parsed.fit_options.iov_column.clone();
+            column_map_from_parse = parsed.column_map.clone();
             model_owned = Some(parsed.model);
             model_owned.as_ref().unwrap()
         }
@@ -182,10 +188,11 @@ fn run_sir_scoped(
                     ));
                 }
             }
-            let p = crate::io::datareader::read_nonmem_csv(
+            let p = crate::api::read_population_routed_by(
+                model_ref,
                 Path::new(path),
-                None,
                 iov_column_from_parse.as_deref(),
+                &column_map_from_parse,
             )?;
             pop_owned = Some(p);
             pop_owned.as_ref().unwrap()
@@ -196,6 +203,12 @@ fn run_sir_scoped(
     // dose-compartment precondition `fit()` enforces (#375) — a `Result`-returning
     // API must not abort the process from inside the walk. Mirrors `run_covariance`.
     crate::diagnostics::first_error(&crate::api::check_dose_compartments(model_ref, pop_ref))?;
+    // …and the endpoint-routing precondition (#1199), as `fit()` enforces it: SIR on
+    // a population read model-blind would resample the Gaussian half of a joint
+    // likelihood. The re-read above is routed; this covers a supplied population.
+    crate::diagnostics::first_error(&crate::api::check_endpoint_routing(
+        model_ref, pop_ref, true,
+    ))?;
 
     // --- Sanity-check dimensions ------------------------------------------
     if model_ref.n_eta != fit.omega.nrows() {

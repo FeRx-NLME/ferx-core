@@ -29,6 +29,8 @@
 //! | `E_MISSING_COVARIATE`     | the model references a covariate not present in the data |
 //! | `E_PER_CMT_SCALING`       | an observed compartment lacks a per-CMT scaling entry |
 //! | `E_PER_CMT_ERROR_MODEL`   | an observed compartment lacks a per-CMT `[error_model]` entry |
+//! | `E_ENDPOINT_UNROUTED`     | a CMT declared as a non-Gaussian endpoint carries Gaussian observations — the population was read without the model's endpoint routing (#1199) |
+//! | `E_ENDPOINT_NO_RECORDS`   | a declared non-Gaussian endpoint has no row routed to it (typically a missing `CMT` column) |
 //! | `E_DATA`                  | the `--data` file could not be read or parsed |
 //! | `E_SDE_INCOMPATIBLE`      | an SDE (`[diffusion]`) model used with SAEM / GN |
 //! | `E_AD_RETIRED`            | `gradient_method = ad` requested; the Enzyme AD path was retired (use `auto` / `fd`) |

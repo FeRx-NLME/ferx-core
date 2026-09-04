@@ -17,13 +17,16 @@ ferx-core = { path = "../ferx-core" }
 ## Quick Example
 
 ```rust
+use ferx_core::api::read_population_for;
 use ferx_core::*;
 use std::path::Path;
 
 fn main() -> Result<(), String> {
     // Parse model and data
     let parsed = parse_full_model_file(Path::new("model.ferx"))?;
-    let population = read_nonmem_csv(Path::new("data.csv"), None)?;
+    let (population, _) = read_population_for(
+        &parsed.model, &parsed.covariate_decls, "data.csv", None, None, None, &[],
+    )?;
 
     // Build initial parameters and options
     let (init_params, options) = build_fit_inputs(&parsed)?;
@@ -46,4 +49,4 @@ fn main() -> Result<(), String> {
 - [Core Types](types.qmd) -- `CompiledModel`, `Population`, `FitResult`, `FitOptions`, etc.
 - [Fitting Functions](fitting.qmd) -- `fit()`, `fit_from_files()`, `run_model_with_data()`
 - [Simulation](simulation.qmd) -- `simulate()`, `simulate_with_seed()`, `predict()`
-- [Parsing](parsing.qmd) -- `parse_model_file()`, `parse_full_model_file()`, `read_nonmem_csv()`
+- [Parsing](parsing.qmd) -- `parse_model_file()`, `parse_full_model_file()`, `read_population_for()`, `read_nonmem_csv()`

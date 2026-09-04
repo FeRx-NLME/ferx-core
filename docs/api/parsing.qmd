@@ -97,9 +97,56 @@ on what is and isn't valid.
 
 ## Data Parsing
 
+### `read_population_for()`
+
+Read a NONMEM-format CSV file into a `Population` **for a given model**
+(`ferx_core::api::read_population_for`). This is the reader every fitting entry
+point uses, and the one to call from library code:
+it knows which compartments the model declares as non-Gaussian endpoints
+(`[event_model]`, `[binary_model]`, a Markov block) and routes those rows to
+`Subject::obs_records` instead of the Gaussian observation grid.
+
+```rust
+pub fn read_population_for(
+    model: &CompiledModel,
+    covariate_decls: &Option<Vec<CovariateDecl>>,
+    data_path: &str,
+    fallback_columns: Option<&[&str]>,
+    iov_column: Option<&str>,
+    filter: Option<&SelectionFilter>,
+    column_map: &[(String, String)],
+) -> Result<(Population, Option<CovariateTable>), String>
+```
+
+```rust
+use ferx_core::api::read_population_for;
+
+let parsed = parse_full_model_file(Path::new("model.ferx"))?;
+let (population, _table) = read_population_for(
+    &parsed.model, &parsed.covariate_decls, "data.csv", None, None, None, &[],
+)?;
+```
+
+For a Gaussian-only model it is equivalent to `read_nonmem_csv()` below.
+
 ### `read_nonmem_csv()`
 
-Read a NONMEM-format CSV file into a `Population`.
+Read a NONMEM-format CSV file into a `Population`, **without a model**.
+
+::: {.callout-warning}
+## Model-blind: no endpoint routing
+`read_nonmem_csv()` (and its `_with_covariates` / `_filtered` variants) does not
+know the model, so every `EVID=0` row becomes a Gaussian observation. Read a
+dataset for a model with a non-Gaussian endpoint this way and the endpoint's rows
+are concentrations on its CMT, with no event records. `fit()`, `simulate()`,
+`predict()`, `predict_categorical()`, `run_covariance()` and `run_sir()` refuse
+such a population with `E_ENDPOINT_UNROUTED` (naming the CMT and
+`read_population_for()`), and `fit()` / `run_covariance()` / `run_sir()` refuse a
+routed population whose declared endpoint has no rows at all — typically a
+missing `CMT` column — with `E_ENDPOINT_NO_RECORDS`. Before these guards the fit
+ran the Gaussian half only and reported a plausible, wrong objective
+([#1199](https://github.com/FeRx-NLME/ferx-core/issues/1199)).
+:::
 
 ```rust
 pub fn read_nonmem_csv(
