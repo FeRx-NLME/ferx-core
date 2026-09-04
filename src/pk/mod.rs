@@ -3252,6 +3252,7 @@ mod tests {
             indiv_param_names: Vec::new(),
             indiv_param_partials: crate::types::IndivParamPartials::empty(),
             theta_transform: Vec::new(),
+            theta_eta_linked: Vec::new(),
             #[cfg(feature = "nn")]
             covariate_nns: Vec::new(),
             scaling: ScalingSpec::None,

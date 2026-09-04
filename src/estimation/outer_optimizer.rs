@@ -93,6 +93,11 @@ pub struct OuterResult {
     /// (`omega → chol` is not the round-trip inverse of the stored `L·Lᵀ`, and the
     /// FD Hessian amplifies the difference on ill-conditioned ω directions).
     pub packed_estimate: Option<Vec<f64>>,
+    /// Whether the fit left its initial estimates by the optimizer's own
+    /// `INIT_ESCAPE_STEP_S` test (#751), measured on the restored best point.
+    /// `Some` for the NLopt outer loop (`optimize_nlopt`), `None` for every
+    /// other estimator; lifted onto `FitResult::left_init`.
+    pub left_init: Option<bool>,
     /// Per-subject mixture posteriors from the final mixture eval. `Some` only for
     /// a converged `[mixture]` fit (#977); `None` for every non-mixture path.
     pub mixture_posteriors: Option<MixturePosteriors>,
@@ -503,6 +508,7 @@ fn evaluate_at_initial_params(
         // fallback (`chol(L·Lᵀ) ≠ L`) would otherwise diverge on an ill-conditioned
         // init omega just as it does for a converged fit (#816 follow-up).
         packed_estimate: Some(x.clone()),
+        left_init: None,
         mixture_posteriors,
         vi: None,
         params,
@@ -2257,6 +2263,7 @@ fn optimize_nlopt_once(
         // The exact packed vector this stage's inline covariance step used (#816
         // follow-up): reused by `run_covariance` to avoid re-decomposing omega.
         packed_estimate: Some(x0.clone()),
+        left_init: Some(left_init),
         mixture_posteriors: final_mixture_posteriors,
         vi: None,
     };
@@ -2655,6 +2662,7 @@ fn optimize_bfgs(
         // The exact packed vector this stage's inline covariance step used (#816
         // follow-up): reused by `run_covariance` to avoid re-decomposing omega.
         packed_estimate: Some(x_final.clone()),
+        left_init: None,
         mixture_posteriors: None,
         vi: None,
         params: final_params,

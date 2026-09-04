@@ -5,8 +5,8 @@ use super::*;
 use crate::diagnostics::{first_error, CheckReport, Diagnostic};
 use crate::estimation::outer_optimizer::optimize_population;
 use crate::estimation::parameterization::{
-    chol_lt_idx, lower_tri_iter, omega_packed_len, rho_chain, rho_packed_start, theta_packs_log,
-    PackedCoordKind,
+    chol_lt_idx, lower_tri_iter, omega_cholesky_jacobian, omega_packed_len, rho_chain,
+    rho_packed_start, theta_packs_log, PackedCoordKind,
 };
 use crate::estimation::saem;
 use crate::io::datareader::{
@@ -2124,31 +2124,17 @@ pub(crate) fn extract_standard_errors(
             .collect()
     } else {
         let n_lt = omega_packed_len(n_eta, false);
-        let l = &template.omega.chol;
 
         // Extract omega sub-block of the full covariance matrix.
         let cov_omega = cov.view((omega_start, omega_start), (n_lt, n_lt));
 
+        // Row r of the Jacobian is ∂omega_{ij}/∂x for the r-th lower-triangle
+        // element — single source: `omega_cholesky_jacobian`, which the
+        // natural-scale correlation gate (`natural_scale_covariance`) shares.
+        let jac = omega_cholesky_jacobian(&template.omega.chol);
         let mut se_vec = Vec::with_capacity(n_lt);
-        // Column-major lower-triangle order — single source: `lower_tri_iter`.
-        for (i, j) in lower_tri_iter(n_eta, false) {
-            // Build gradient of omega_{ij} w.r.t. packed omega params.
-            // omega_{ij} = Σ_{k=0}^{j} L_{ik} * L_{jk}
-            let mut grad = vec![0.0f64; n_lt];
-            for k in 0..=j {
-                let idx_ik = chol_lt_idx(i, k, n_eta);
-                let idx_jk = chol_lt_idx(j, k, n_eta);
-                // Chain rule: ∂L_{ab}/∂x_{ab} = L_{ab} if a==b (log), else 1.
-                let chain_ik = if i == k { l[(i, k)] } else { 1.0 };
-                let chain_jk = if j == k { l[(j, k)] } else { 1.0 };
-                grad[idx_ik] += l[(j, k)] * chain_ik;
-                if i != j {
-                    grad[idx_jk] += l[(i, k)] * chain_jk;
-                } else {
-                    // i == j: both terms contribute to the same index
-                    grad[idx_ik] += l[(i, k)] * chain_ik;
-                }
-            }
+        for r in 0..n_lt {
+            let grad = jac.row(r);
             // SE²(omega_{ij}) = g^T * C_omega * g
             let mut var = 0.0;
             for a in 0..n_lt {

@@ -76,6 +76,7 @@ fn tiny_model() -> CompiledModel {
         has_conditional_eta_params: false,
         eta_param_info: Vec::new(),
         theta_transform: Vec::new(),
+        theta_eta_linked: Vec::new(),
         #[cfg(feature = "nn")]
         covariate_nns: Vec::new(),
         scaling: ScalingSpec::None,
@@ -477,6 +478,7 @@ fn synthetic_fit(template: &ModelParameters) -> FitResult {
         sigma_types: vec![],
         cov_eigenvalues: None,
         cov_condition_number: None,
+        bic_inputs: Default::default(),
         eta_log_transformed: vec![],
         omega_param_corr: None,
         omega_iov_param_corr: None,
@@ -508,6 +510,9 @@ fn synthetic_fit(template: &ModelParameters) -> FitResult {
         covariate_table: None,
         exclusions: None,
         packed_estimate: None,
+        left_init: None,
+        omega_is_diagonal: None,
+        kappa_is_diagonal: None,
     }
 }
 

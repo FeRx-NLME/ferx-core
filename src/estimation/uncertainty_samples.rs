@@ -429,6 +429,7 @@ mod tests {
             sigma_types: vec![],
             cov_eigenvalues: None,
             cov_condition_number: None,
+            bic_inputs: Default::default(),
             eta_log_transformed: vec![],
             omega_param_corr: None,
             omega_iov_param_corr: None,
@@ -460,6 +461,9 @@ mod tests {
             covariate_table: None,
             exclusions: None,
             packed_estimate: None,
+            left_init: None,
+            omega_is_diagonal: None,
+            kappa_is_diagonal: None,
         }
     }
 

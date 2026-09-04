@@ -313,6 +313,21 @@ impl MlpMapper {
             .expect("layers non-empty by construction")
     }
 
+    /// Indices, within the flat weight vector, of every weight output `k`
+    /// depends on: all hidden-layer weights and biases (shared by every head)
+    /// plus row `k` of the output layer's weight matrix and its bias. The
+    /// other heads' rows and biases are excluded. Panics on
+    /// `k >= n_outputs()`, like [`output_bias_index`](Self::output_bias_index).
+    pub fn weight_indices_for_output(&self, k: usize) -> Vec<usize> {
+        let l = self.layers.len() - 1; // the output layer, 1-based
+        let n_in = self.layers[l - 1];
+        let w_start = self.offsets[l - 1] + k * n_in;
+        let mut idx: Vec<usize> = (0..self.offsets[l - 1]).collect();
+        idx.extend(w_start..w_start + n_in);
+        idx.push(self.output_bias_index(k));
+        idx
+    }
+
     /// Index, within the flat weight vector, of the output layer's bias for
     /// output `k`.
     ///
@@ -942,6 +957,30 @@ mod tests {
         // y = W_2 h + b_2 = 5.1 + 11.2 + 17.3 = 33.6
         assert_eq!(y.len(), 1);
         assert_relative_eq!(y[0], 33.6, epsilon = 1e-12);
+    }
+
+    /// `weight_indices_for_output`: hidden weights are shared, each output
+    /// head owns its row and bias. On the 2→3→2 shape of the `[covariate_nn]`
+    /// fixture: W_1 (6) + b_1 (3) = 9 shared, then W_2 rows at 9..12 / 12..15
+    /// and b_2 at 15 / 16.
+    #[test]
+    fn weight_indices_for_output_split_shared_and_per_head_weights() {
+        let mlp = MlpMapper::new(vec![2, 3, 2], Activation::Tanh, Activation::Identity).unwrap();
+        assert_eq!(mlp.n_weights(), 17);
+        let head0 = mlp.weight_indices_for_output(0);
+        let head1 = mlp.weight_indices_for_output(1);
+        let shared: Vec<usize> = (0..9).collect();
+        assert_eq!(&head0[..9], &shared[..]);
+        assert_eq!(&head1[..9], &shared[..]);
+        assert_eq!(&head0[9..], &[9, 10, 11, 15]);
+        assert_eq!(&head1[9..], &[12, 13, 14, 16]);
+        // A single-output network: every weight.
+        let one =
+            MlpMapper::new(vec![2, 3, 1], Activation::Identity, Activation::Identity).unwrap();
+        assert_eq!(
+            one.weight_indices_for_output(0),
+            (0..13).collect::<Vec<_>>()
+        );
     }
 
     /// ReLU activation in the hidden layer with a known mix of active /

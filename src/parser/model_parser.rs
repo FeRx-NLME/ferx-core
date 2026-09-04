@@ -1036,6 +1036,151 @@ fn detect_logit_pattern(expr: &Expression) -> Option<(usize, usize, bool)> {
     None
 }
 
+/// Per-theta Delattre class for the mixed BIC (#1177): `true` when theta `i`
+/// reaches an individual parameter that carries an ETA/KAPPA.
+///
+/// `stmts` is `[individual_parameters]` (desugared) plus, once the endpoint
+/// blocks are parsed, one synthetic assignment per `[event_model]` /
+/// `[binary_model]` / `[markov_model]` parameter expression — those blocks
+/// accept ETA directly (`scale = TVSCALE * exp(ETA_SCALE)` in a model with no
+/// `[individual_parameters]` at all), and a θ that meets its η only there is
+/// random-class too.
+///
+/// `nn_theta_deps[nn_idx][output_idx]` lists the absolute θ indices (the
+/// `[covariate_nn]` weights registered as θ) that `Expression::NnOutput`
+/// depends on — every hidden-layer weight plus that head's own row and bias
+/// (`MlpMapper::weight_indices_for_output`), so `CL = TYPICAL_PK.CL *
+/// exp(ETA_CL)` makes the shared and CL-head weights random-class and leaves
+/// an unrelated head's weights fixed-class.
+///
+/// This is the statement-level analogue of Pharmpy's `_categorize_parameters`:
+/// each top-level assignment is expanded through the intermediate assignments
+/// it references (`TVCL = THETA_CL * WT; CL = TVCL * exp(ETA_CL)` makes
+/// `THETA_CL` random via `TVCL`), and a theta appearing in *any* eta-bearing
+/// expansion is random even if it also appears in an eta-free one. An
+/// `if`/`else` contributes its condition's thetas to every parameter assigned
+/// inside it, matching the `Piecewise` symbols Pharmpy's full expression
+/// carries. Variables that are not assigned in the block (covariates, `TIME`)
+/// expand to nothing. Runs before index resolution, so it sees
+/// `Expression::Variable`, never `VariableIdx`.
+fn classify_theta_eta_linked(
+    stmts: &[Statement],
+    n_theta: usize,
+    nn_theta_deps: &[Vec<Vec<usize>>],
+) -> Vec<bool> {
+    use std::collections::{HashMap, HashSet};
+
+    #[derive(Default, Clone)]
+    struct Deps {
+        thetas: HashSet<usize>,
+        has_eta: bool,
+        vars: HashSet<String>,
+    }
+    impl Deps {
+        fn merge(&mut self, other: &Deps) {
+            self.thetas.extend(other.thetas.iter().copied());
+            self.has_eta |= other.has_eta;
+            self.vars.extend(other.vars.iter().cloned());
+        }
+    }
+    fn note(e: &Expression, d: &mut Deps, nn: &[Vec<Vec<usize>>]) {
+        match e {
+            Expression::Theta(i) => {
+                d.thetas.insert(*i);
+            }
+            Expression::NnOutput { nn_idx, output_idx } => {
+                if let Some(deps) = nn.get(*nn_idx).and_then(|heads| heads.get(*output_idx)) {
+                    d.thetas.extend(deps.iter().copied());
+                }
+            }
+            Expression::ThetaGather { spec, .. } => {
+                for rule in &spec.levels {
+                    match *rule {
+                        LevelRule::Free(i) => {
+                            d.thetas.insert(i as usize);
+                        }
+                        // Half-open `θ[a..b]`, as the rule's doc and every
+                        // other consumer read it: `b` is already one past
+                        // the group, and `..=` would drag the next block's
+                        // first θ into this parameter's class.
+                        LevelRule::NegSum(a, b) => {
+                            d.thetas.extend((a as usize)..(b as usize));
+                        }
+                    }
+                }
+            }
+            Expression::Eta(_) => d.has_eta = true,
+            Expression::Variable(v) => {
+                d.vars.insert(v.clone());
+            }
+            _ => {}
+        }
+    }
+    fn expr_deps(e: &Expression, d: &mut Deps, nn: &[Vec<Vec<usize>>]) {
+        visit_expr_nodes(e, &mut |n| note(n, d, nn));
+    }
+    fn walk(
+        stmts: &[Statement],
+        ctx: &Deps,
+        map: &mut HashMap<String, Deps>,
+        nn: &[Vec<Vec<usize>>],
+    ) {
+        for s in stmts {
+            match s {
+                Statement::Assign(name, e) => {
+                    let mut d = ctx.clone();
+                    expr_deps(e, &mut d, nn);
+                    map.entry(name.clone()).or_default().merge(&d);
+                }
+                Statement::If {
+                    branches,
+                    else_body,
+                } => {
+                    // Each branch sees every condition evaluated to reach it.
+                    let mut cond_ctx = ctx.clone();
+                    for (cond, body) in branches {
+                        visit_condition_nodes(cond, &mut |n| note(n, &mut cond_ctx, nn));
+                        walk(body, &cond_ctx, map, nn);
+                    }
+                    if let Some(eb) = else_body {
+                        walk(eb, &cond_ctx, map, nn);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut map: HashMap<String, Deps> = HashMap::new();
+    walk(stmts, &Deps::default(), &mut map, nn_theta_deps);
+
+    let mut linked = vec![false; n_theta];
+    for name in map.keys() {
+        // Transitive closure over referenced variables (cycle-safe).
+        let mut thetas: HashSet<usize> = HashSet::new();
+        let mut has_eta = false;
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut stack: Vec<&str> = vec![name.as_str()];
+        while let Some(v) = stack.pop() {
+            if !seen.insert(v) {
+                continue;
+            }
+            let Some(d) = map.get(v) else { continue };
+            thetas.extend(d.thetas.iter().copied());
+            has_eta |= d.has_eta;
+            stack.extend(d.vars.iter().map(String::as_str));
+        }
+        if has_eta {
+            for i in thetas {
+                if i < n_theta {
+                    linked[i] = true;
+                }
+            }
+        }
+    }
+    linked
+}
+
 /// Classify each top-level [individual_parameters] assignment and return
 /// `(eta_param_infos, theta_transforms)`.
 ///
@@ -2117,6 +2262,27 @@ pub fn parse_full_model_with(
         }
         acc
     };
+    // Per network, per output head: the absolute θ indices that head reads
+    // (shared hidden weights + its own row and bias), for the mixed-BIC θ
+    // classification (#1177). Built here, before the handles move into the
+    // pk_param_fn closure.
+    #[cfg(feature = "nn")]
+    let nn_theta_deps: Vec<Vec<Vec<usize>>> = covariate_nns_for_closure
+        .iter()
+        .map(|nn| {
+            let mlp = nn.mapper.mlp();
+            (0..mlp.n_outputs())
+                .map(|k| {
+                    mlp.weight_indices_for_output(k)
+                        .into_iter()
+                        .map(|w| nn.weights_offset + w)
+                        .collect()
+                })
+                .collect()
+        })
+        .collect();
+    #[cfg(not(feature = "nn"))]
+    let nn_theta_deps: Vec<Vec<Vec<usize>>> = Vec::new();
 
     // Build pk_param_fn with the extended eta context (BSV + kappa names).
     // `n_theta_base` is the user-declared θ count, which is what the partial
@@ -2700,6 +2866,10 @@ pub fn parse_full_model_with(
     // Uses BSV-only eta names (no kappas).
     let (eta_param_info, theta_transform) =
         classify_indiv_params(&indiv_stmts, &theta_names, &eta_names_bsv);
+    // Delattre class of every theta for the mixed BIC (#1177). Runs on the
+    // desugared statements, so `[covariate_model]` thetas are classified too.
+    let theta_eta_linked =
+        classify_theta_eta_linked(&indiv_stmts, theta_names.len(), &nn_theta_deps);
     debug_assert_eq!(
         theta_transform.len(),
         theta_names.len(),
@@ -2818,6 +2988,7 @@ pub fn parse_full_model_with(
         has_conditional_eta_params: false,
         eta_param_info,
         theta_transform,
+        theta_eta_linked,
         scaling: ScalingSpec::None,
         log_transform: ltbs_flags.log_transform,
         dv_pre_logged: ltbs_flags.dv_pre_logged,
@@ -3751,6 +3922,10 @@ pub fn parse_full_model_with(
     #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
     let mut event_model_used_etas: std::collections::HashSet<usize> =
         std::collections::HashSet::new();
+    // Every endpoint block's parameter expressions as synthetic assignments,
+    // for the mixed-BIC θ classification below (#1177).
+    #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
+    let mut endpoint_stmts: Vec<Statement> = Vec::new();
     #[cfg(feature = "survival")]
     {
         let theta_names = model.theta_names.clone();
@@ -3776,6 +3951,7 @@ pub fn parse_full_model_with(
                 &model.kappa_names,
                 &model.error_spec,
                 &chz_state_map,
+                &mut endpoint_stmts,
             )?;
             if model.endpoints.contains_key(&cmt) {
                 return Err(format!("[event_model]: CMT={cmt} declared more than once"));
@@ -3811,6 +3987,7 @@ pub fn parse_full_model_with(
                 &indiv_stmts,
                 &model.kappa_names,
                 &model.error_spec,
+                &mut endpoint_stmts,
             )?;
             if model.endpoints.contains_key(&cmt) {
                 return Err(format!(
@@ -3864,6 +4041,7 @@ pub fn parse_full_model_with(
                     &model.error_spec,
                     ode_state_names,
                     &declared_cov_names,
+                    &mut endpoint_stmts,
                 )?;
                 if model.endpoints.contains_key(&cmt) {
                     return Err(format!(
@@ -3891,6 +4069,15 @@ pub fn parse_full_model_with(
     // too, the same way — it is meaningfully estimated (the analytic θ/σ gradient
     // now carries its direct-θ channel), just never seen by `indiv_stmts`.
     event_model_used_thetas.extend(ruv_magnitude_used_thetas);
+    // A θ that meets its η only in an endpoint block is random-class for the
+    // mixed BIC (#1177): re-run the classification over the individual
+    // parameters plus the endpoint expressions, which may reference them.
+    if !endpoint_stmts.is_empty() {
+        let mut all_stmts = indiv_stmts.clone();
+        all_stmts.extend(endpoint_stmts);
+        model.theta_eta_linked =
+            classify_theta_eta_linked(&all_stmts, model.theta_names.len(), &nn_theta_deps);
+    }
     // #486 — surface the FD fallback when a direct-θ/η readout could not be
     // desugared because the PK-slot layout was full (see the headroom check above).
     if let Some(note) = readout_fd_fallback_note.take() {
@@ -5256,6 +5443,7 @@ fn parse_event_model_block(
     kappa_names: &[String],
     error_spec: &ErrorSpec,
     chz_state_map: &std::collections::HashMap<usize, usize>,
+    endpoint_stmts: &mut Vec<Statement>,
 ) -> Result<
     (
         usize,
@@ -5559,6 +5747,19 @@ fn parse_event_model_block(
         &loghr_expr,
     ];
     let hazard_exprs: Vec<&Expression> = hazard_param_exprs.into_iter().flatten().collect();
+    // The same expressions as synthetic assignments, so the mixed-BIC θ
+    // classification (#1177) sees a θ that meets its η only here.
+    for (key, expr) in ["scale", "shape", "alpha", "gamma", "loghr"]
+        .into_iter()
+        .zip(hazard_param_exprs)
+    {
+        if let Some(e) = expr {
+            endpoint_stmts.push(Statement::Assign(
+                format!("__ferx_event_model_{cmt}_{key}"),
+                e.clone(),
+            ));
+        }
+    }
     let (event_model_thetas, event_model_etas) = {
         let mut theta_set = std::collections::HashSet::new();
         let mut eta_set = std::collections::HashSet::new();
@@ -5662,6 +5863,7 @@ fn parse_binary_model_block(
     indiv_stmts: &[Statement],
     kappa_names: &[String],
     error_spec: &ErrorSpec,
+    endpoint_stmts: &mut Vec<Statement>,
 ) -> Result<
     (
         usize,
@@ -5727,6 +5929,11 @@ fn parse_binary_model_block(
 
     let cmt = cmt_opt.ok_or("[binary_model]: missing required key `cmt`")?;
     let logit_expr = logit_expr.ok_or("[binary_model]: missing required key `logit`")?;
+    // For the mixed-BIC θ classification (#1177); see `parse_event_model_block`.
+    endpoint_stmts.push(Statement::Assign(
+        format!("__ferx_binary_model_{cmt}_logit"),
+        logit_expr.clone(),
+    ));
 
     // Same CMT can't be both Gaussian and binary (parallels the event-model guard).
     if let ErrorSpec::PerCmt(cmt_map) = error_spec {
@@ -5826,6 +6033,7 @@ fn parse_markov_model_block(
     // reject a name that is *both* an ODE state and a declared data covariate — that
     // collision would otherwise silently reinterpret the covariate column as the state.
     declared_covariates: &[String],
+    endpoint_stmts: &mut Vec<Statement>,
 ) -> Result<
     (
         usize,
@@ -6061,6 +6269,13 @@ fn parse_markov_model_block(
             ));
         }
         transitions.push((j, k, expr));
+    }
+    // For the mixed-BIC θ classification (#1177); see `parse_event_model_block`.
+    for (j, k, expr) in &transitions {
+        endpoint_stmts.push(Statement::Assign(
+            format!("__ferx_markov_model_{cmt}_{j}_{k}"),
+            expr.clone(),
+        ));
     }
 
     // Collect covariate/theta/eta references across every intensity BEFORE the
@@ -22321,3 +22536,7 @@ mod tests;
 #[cfg(test)]
 #[path = "model_parser_adaptive_dosing_tests.rs"]
 mod adaptive_dosing_tests;
+
+#[cfg(test)]
+#[path = "model_parser_theta_eta_linked_tests.rs"]
+mod theta_eta_linked_tests;

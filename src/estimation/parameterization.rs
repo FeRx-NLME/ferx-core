@@ -372,6 +372,23 @@ pub fn packed_fixed_mask(template: &ModelParameters) -> Vec<bool> {
     mask
 }
 
+/// Every packed coordinate the outer optimizer does **not** search over:
+/// [`packed_fixed_mask`] OR [`omega_structural_zero_mask`]. Its complement is
+/// the free set — `CompiledModel::free_packed_dim` counts it, and `fit()`
+/// reports that count as `n_parameters` (#1177: previously the AIC/BIC penalty
+/// counted a mixed block + diagonal Ω's structural zeros as estimated
+/// parameters).
+pub(crate) fn packed_held_mask(template: &ModelParameters) -> Vec<bool> {
+    let fixed = packed_fixed_mask(template);
+    let structural = omega_structural_zero_mask(template);
+    debug_assert_eq!(fixed.len(), structural.len());
+    fixed
+        .iter()
+        .zip(structural.iter())
+        .map(|(f, z)| *f || *z)
+        .collect()
+}
+
 /// Packed-length mask marking the **structural-zero** off-diagonal entries of a
 /// mixed block + diagonal Ω (and Ω_IOV) — the cross-block elements where
 /// `free_mask[(i,j)] == false`. These are not estimated parameters, so the
@@ -888,6 +905,36 @@ pub(crate) fn omega_packed_len(n: usize, diagonal: bool) -> usize {
 /// Layout: `for j in 0..n { for i in j..n { .. } }`, so column `j` starts at
 /// offset `Σ_{k<j}(n−k) = j·n − j·(j−1)/2`.
 #[inline]
+/// Jacobian of the natural block-Ω elements with respect to their packed
+/// Cholesky coordinates, for the delta method: row `r` is `∂ω_{ij}/∂x` for the
+/// `r`-th `(i, j)` of [`lower_tri_iter`] (column-major lower triangle) and
+/// column `c` is the `c`-th packed coordinate in the same order — `x = ln L_ii`
+/// on the diagonal, `x = L_ij` off it. `l` is the Cholesky factor `L` itself.
+///
+/// `ω_ij = Σ_{k≤j} L_ik L_jk`, so `∂ω_ij/∂L_ik = L_jk` and `∂ω_ij/∂L_jk = L_ik`
+/// (both landing on the same coordinate when `i == j`), with the extra factor
+/// `L_ii` on a log-packed diagonal by the chain rule.
+pub(crate) fn omega_cholesky_jacobian(l: &DMatrix<f64>) -> DMatrix<f64> {
+    let n_eta = l.nrows();
+    let n_lt = omega_packed_len(n_eta, false);
+    let mut jac = DMatrix::<f64>::zeros(n_lt, n_lt);
+    for (row, (i, j)) in lower_tri_iter(n_eta, false).enumerate() {
+        for k in 0..=j {
+            let idx_ik = chol_lt_idx(i, k, n_eta);
+            let idx_jk = chol_lt_idx(j, k, n_eta);
+            let chain_ik = if i == k { l[(i, k)] } else { 1.0 };
+            let chain_jk = if j == k { l[(j, k)] } else { 1.0 };
+            jac[(row, idx_ik)] += l[(j, k)] * chain_ik;
+            if i != j {
+                jac[(row, idx_jk)] += l[(i, k)] * chain_jk;
+            } else {
+                jac[(row, idx_ik)] += l[(i, k)] * chain_ik;
+            }
+        }
+    }
+    jac
+}
+
 pub(crate) fn chol_lt_idx(i: usize, j: usize, n: usize) -> usize {
     debug_assert!(i >= j && i < n);
     let col_offset = if j == 0 { 0 } else { j * n - j * (j - 1) / 2 };
@@ -945,6 +992,48 @@ pub(crate) fn block_chol_full(
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    /// `omega_cholesky_jacobian` against central finite differences of
+    /// `Ω = L Lᵀ` over the packed coordinates (`ln L_ii`, `L_ij`), on a 3×3
+    /// block so every off-diagonal contributes to more than one element.
+    #[test]
+    fn omega_cholesky_jacobian_matches_finite_differences() {
+        let n = 3;
+        let l = DMatrix::from_row_slice(n, n, &[0.5, 0.0, 0.0, -0.2, 0.4, 0.0, 0.1, -0.3, 0.6]);
+        let n_lt = omega_packed_len(n, false);
+        let packed: Vec<f64> = lower_tri_iter(n, false)
+            .map(|(i, j)| {
+                if i == j {
+                    f64::ln(l[(i, j)])
+                } else {
+                    l[(i, j)]
+                }
+            })
+            .collect();
+        let omega_of = |x: &[f64]| -> Vec<f64> {
+            let mut lm = DMatrix::<f64>::zeros(n, n);
+            for (c, (i, j)) in lower_tri_iter(n, false).enumerate() {
+                lm[(i, j)] = if i == j { x[c].exp() } else { x[c] };
+            }
+            let om = &lm * lm.transpose();
+            lower_tri_iter(n, false).map(|(i, j)| om[(i, j)]).collect()
+        };
+        let jac = omega_cholesky_jacobian(&l);
+        assert_eq!(jac.shape(), (n_lt, n_lt));
+        let h = 1e-6;
+        for c in 0..n_lt {
+            let mut xp = packed.clone();
+            let mut xm = packed.clone();
+            xp[c] += h;
+            xm[c] -= h;
+            let (op, om) = (omega_of(&xp), omega_of(&xm));
+            for r in 0..n_lt {
+                let fd = (op[r] - om[r]) / (2.0 * h);
+                assert!(fd.is_finite());
+                assert_relative_eq!(jac[(r, c)], fd, epsilon = 1e-7, max_relative = 1e-6);
+            }
+        }
+    }
 
     #[test]
     fn test_lower_tri_entries_frozen_order() {
@@ -1704,6 +1793,7 @@ mod tests {
             has_conditional_eta_params: false,
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
+            theta_eta_linked: Vec::new(),
             n_kappa: 0,
             kappa_names: Vec::new(),
             #[cfg(feature = "nn")]

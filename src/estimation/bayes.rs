@@ -1595,6 +1595,7 @@ pub fn run_bayes(
         bayes: Some(bayes),
         cond_dist: None,
         packed_estimate: None,
+        left_init: None,
         mixture_posteriors,
         vi: None,
     })

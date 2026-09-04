@@ -25,9 +25,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use ferx_core::cancel::is_cancelled;
+use ferx_core::types::CovarianceFallback;
 use ferx_core::{
     fit, CancelFlag, CompiledModel, FitOptions, FitResult, ModelParameters, OmegaMatrix,
-    Population, PreparedRun, SigmaVector, WarningCode,
+    Population, PreparedRun, SigmaVector, Strictness, WarningCode,
 };
 use rayon::prelude::*;
 
@@ -703,7 +704,11 @@ pub fn strata_from_csv(
 /// * **no checkpoint** — every replicate would otherwise write and resume the
 ///   *same* `{model}.tmp`, so they would restore each other's state;
 /// * **no SIR** — a per-replicate uncertainty step inside an uncertainty
-///   analysis is pure cost.
+///   analysis is pure cost. That covers the `sir = true` step *and* the
+///   non-PD-Hessian fallback (`covariance_fallback = sir`), which would
+///   otherwise run a full SIR pass on every replicate whose FD Hessian is not
+///   positive-definite — and then count as a *failed* covariance step here
+///   while a search's `Strictness::require_covariance` accepts it.
 ///
 /// `cancel` is the run's one effective flag (see [`effective_cancel`]) and is
 /// installed unconditionally, so a `BootstrapOptions::cancel` overrides
@@ -721,6 +726,7 @@ fn replicate_options(
     o.checkpoint = false;
     o.checkpoint_path = None;
     o.sir = false;
+    o.covariance_fallback = CovarianceFallback::None;
     o.cancel = cancel.clone();
     o
 }
@@ -767,21 +773,27 @@ fn cancel_aware(error: String, cancel: &Option<CancelFlag>) -> BootstrapError {
 }
 
 fn diagnostics_from(result: &FitResult) -> (bool, bool, bool) {
-    let near_boundary = result
-        .warnings_structured
-        .iter()
-        .any(|w| w.category == WarningCode::BoundaryEstimate);
-    let cov_failed = result
-        .warnings_structured
-        .iter()
-        .any(|w| w.category == WarningCode::CovarianceFailed);
+    // The same predicates a search's `Strictness` applies (#1177) —
+    // `reject_on_boundary` and `require_covariance` — so a replicate this
+    // filter drops, or counts as a failed covariance step, is exactly a
+    // candidate a search would drop. (`require_covariance` also accepts a
+    // healthy SIR fallback; `replicate_options` disables that fallback, so
+    // here it only ever sees a computed matrix or a failure.)
+    let near_boundary = ferx_core::estimate_near_boundary(result);
+    let cov_ok = ferx_core::check_strictness(
+        result,
+        &Strictness {
+            require_covariance: true,
+            ..Strictness::none()
+        },
+    )
+    .passed;
     let cov_warnings = result.warnings_structured.iter().any(|w| {
         matches!(
             w.category,
             WarningCode::CovarianceRegularized | WarningCode::CovarianceStep
         )
     });
-    let cov_ok = result.covariance_matrix.is_some() && !cov_failed;
     (near_boundary, cov_ok, cov_warnings)
 }
 

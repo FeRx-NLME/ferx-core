@@ -3548,6 +3548,13 @@ pub struct CompiledModel {
     /// Per-theta transformation: `theta_transform[i]` describes whether theta i
     /// is used on the natural (Identity), log, or logit scale. Length == n_theta.
     pub theta_transform: Vec<ThetaTransform>,
+    /// Per-theta Delattre class for the mixed BIC (#1177): `true` when theta i
+    /// enters — directly or through intermediate `[individual_parameters]`
+    /// assignments — an individual parameter that carries an ETA or KAPPA, so it
+    /// is penalised on `ln(n_subjects)` rather than `ln(n_obs)`. Mirrors
+    /// `pharmpy.modeling.calculate_bic`'s `_categorize_parameters`. Length ==
+    /// n_theta; `[covariate_model]` thetas are classified after desugaring.
+    pub theta_eta_linked: Vec<bool>,
     /// Parsed `[covariate_nn NAME]` blocks (one entry per block in the model
     /// file). Empty when the `nn` feature is off or no block is present.
     ///
@@ -4402,14 +4409,9 @@ impl CompiledModel {
     /// This uses the same packed FIX and structural-zero masks as estimation,
     /// including diagonal/separate BSV and IOV blocks and mixture overrides.
     pub fn free_packed_dim(&self) -> usize {
-        let p = &self.default_params;
-        let fixed = crate::estimation::parameterization::packed_fixed_mask(p);
-        let structural = crate::estimation::parameterization::omega_structural_zero_mask(p);
-        debug_assert_eq!(fixed.len(), structural.len());
-        fixed
+        crate::estimation::parameterization::packed_held_mask(&self.default_params)
             .iter()
-            .zip(structural.iter())
-            .filter(|(is_fixed, is_structural)| !**is_fixed && !**is_structural)
+            .filter(|held| !**held)
             .count()
     }
 
@@ -5887,6 +5889,30 @@ pub struct FitResult {
     /// `.fitrx` / ferx-r format change.
     #[serde(skip)]
     pub packed_estimate: Option<Vec<f64>>,
+    /// The outer optimizer's own verdict on whether the fit left its initial
+    /// estimates — its `INIT_ESCAPE_STEP_S` test (#751) in scaled packed space,
+    /// on the point the reported estimates are built from. `Some(false)` is the
+    /// #751 stall signature; `crate::stalled_at_init` prefers this to its own
+    /// natural-scale comparison when it is present. `Some` for the NLopt outer
+    /// loop (BOBYQA, SLSQP, L-BFGS, MMA); `None` for the built-in BFGS, the
+    /// trust region, Gauss-Newton, SAEM / IMP / Bayes / VI, an
+    /// `outer_maxiter = 0` evaluation, hand-built results, and a `.fitrx`
+    /// bundle saved before it was recorded.
+    #[serde(default)]
+    pub left_init: Option<bool>,
+    /// Whether the BSV Ω was estimated as a diagonal (`omega NAME ~ v`, one
+    /// packed coordinate per η) or a full Cholesky block (`block_omega`, a
+    /// lower triangle) — the packed layout of `covariance_matrix`, which the
+    /// result otherwise does not record. `None` on a `.fitrx` bundle saved
+    /// before it was recorded and on hand-built results; consumers that need
+    /// the layout (`crate::natural_scale_covariance`) then leave the matrix as
+    /// stored rather than guess it from the matrix size.
+    #[serde(default)]
+    pub omega_is_diagonal: Option<bool>,
+    /// The same for the IOV κ block (`omega_iov`): `Some` when the fit has
+    /// one, `None` without IOV or when unrecorded.
+    #[serde(default)]
+    pub kappa_is_diagonal: Option<bool>,
     /// True when this result was reconstructed from a `.fitrx` checkpoint by
     /// [`crate::io::fitrx::load_fit`] rather than produced by a live fit.
     ///
@@ -5903,6 +5929,45 @@ pub struct FitResult {
     /// Removed once diagnostics round-trip (#911).
     #[serde(skip)]
     pub restored_from_checkpoint: bool,
+    /// Free-parameter tally by Delattre class, the inputs to the BIC variants
+    /// (`crate::bic`, #1177). Absent on `.fitrx` bundles saved before this field
+    /// existed; such bundles load with an all-zero tally, for which `bic()`
+    /// returns `NaN`.
+    #[serde(default)]
+    pub bic_inputs: BicInputs,
+}
+
+/// Free-parameter counts by Delattre et al. (2014) class, plus the record count
+/// the observation-level BIC penalty uses (#1177). Filled by `fit()` from the
+/// packed free-parameter mask; consumed by [`crate::bic`].
+///
+/// The five counts sum to `FitResult::n_parameters`. Class membership follows
+/// `pharmpy.modeling.calculate_bic`: every free Ω / Ω_IOV element is random; a
+/// free θ is random when it enters an individual parameter that carries an η or
+/// κ (`CompiledModel::theta_eta_linked`) and fixed otherwise; σ (and any
+/// `block_sigma` correlation) is fixed unless the residual error itself carries
+/// an η (`iiv_on_ruv`), in which case it joins the random class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct BicInputs {
+    /// Records the observation-level penalty counts: Gaussian observations plus,
+    /// under the `survival` feature, time-to-event records — the same `n` that
+    /// `FitResult::bic` uses, so `bic(result, BicType::Fixed)` equals it.
+    pub n_obs: usize,
+    /// Free θ linked to a random effect (penalised on `ln(n_subjects)`).
+    pub theta_random: usize,
+    /// Free θ not linked to any random effect (penalised on `ln(n_obs)`).
+    pub theta_fixed: usize,
+    /// Free BSV Ω elements (diagonal and, for `block_omega`, off-diagonal),
+    /// including mixture per-class Ω overrides. This is the `iiv` BIC's count.
+    pub omega: usize,
+    /// Free IOV Ω elements (`[iov]` κ variances and covariances).
+    pub kappa: usize,
+    /// Free residual-error elements: σ, mixture per-class σ overrides, and
+    /// `block_sigma` correlations.
+    pub sigma: usize,
+    /// `true` when the residual error carries an η (`iiv_on_ruv`), which moves
+    /// the `sigma` count into the random class of the mixed BIC.
+    pub sigma_random: bool,
 }
 
 impl FitResult {

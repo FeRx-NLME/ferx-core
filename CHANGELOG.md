@@ -50,6 +50,22 @@ section of the SDLC for the versioning policy).
   of one-cycle integrations back.
 
 ### Added
+- **BIC variants and a `Strictness` gate for candidate ranking (#1177, part of #1175).**
+  `ferx_core::bic(&result, BicType::{Mixed, Iiv, Random, Fixed})` computes the four
+  conventions of `pharmpy.modeling.calculate_bic` from a finished `FitResult` — the
+  Delattre-style *mixed* BIC penalises random-effects-class parameters on `ln(n_subjects)`
+  and the rest on `ln(n_obs)`, which is what Pharmpy's `iivsearch` / `modelsearch` rank on.
+  The class tally is recorded on the new `FitResult::bic_inputs` (and round-trips through
+  `.fitrx`; older bundles read `NaN` rather than a wrong penalty). `check_strictness(&result,
+  &Strictness { .. })` evaluates the pyDarwin-style gates — convergence, covariance step,
+  condition number, parameter correlation, boundary estimates, and the #751 init stall — and
+  returns the named reason for every failed gate, so a search report can say *why* a
+  candidate was excluded. `FitResult` also gains `left_init`, the outer optimizer's own
+  init-escape verdict, which `stalled_at_init` prefers to its natural-scale comparison, and
+  `omega_is_diagonal` / `kappa_is_diagonal`, the packed Ω / κ layout the correlation gate needs
+  to read a `block_omega` on the natural scale (all three round-trip through `.fitrx`). `bootstrap`'s `skip_estimate_near_boundary` and its
+  covariance-step tally now use the same `estimate_near_boundary` / `require_covariance`
+  predicates, and its replicates no longer run the `covariance_fallback = sir` pass.
 - **Fitted `block_sigma` correlations are reported with their fixedness and standard error
   (#847).** `FitResult` gains `residual_correlation_fixed` and `se_residual_correlations` (the
   SE on the natural `rho` scale, by the delta method on the packed Fisher-z coordinate), the
@@ -59,6 +75,11 @@ section of the SDLC for the versioning policy).
   marked fixed, which is what it meant at the time.
 
 ### Fixed
+- **`n_parameters`, AIC and BIC no longer count the structural zeros of a mixed
+  `block_omega` + diagonal `omega` as estimated parameters (#1177).** The cross-block
+  Cholesky entries of such an Ω are pinned, never searched, and the covariance step already
+  excluded them; the information criteria counted them anyway, inflating the penalty by one
+  per structural zero. `n_parameters` now equals `CompiledModel::free_packed_dim()`.
 - **`predict_survival` returned `NaN` for a time grid with no point past the first event
   (#1218).** Asking for the curve at `[0.0]` alone — or any grid whose largest time does not
   pass the subject's first dose or observation — returned `NaN` for `cum_hazard` and `hazard`

@@ -231,7 +231,10 @@ Space](estimation/parameterization.qmd) for the full layout and bounds.
 
 - **ofv**: Objective Function Value (-2 log-likelihood)
 - **aic**: Akaike Information Criterion (OFV + 2p)
-- **bic**: Bayesian Information Criterion (OFV + p * ln(n))
+- **bic**: Bayesian Information Criterion (OFV + p * ln(n), with n the number of
+  observations). The Delattre-style variants a model search ranks on (`mixed`,
+  `iiv`, `random`) are computed from the same result by `ferx_core::bic()` — see
+  [Ranking candidates](api/fitting.qmd#ranking-candidates-bic-variants-and-strictness).
 - **se**: Standard error from the covariance step
 - **rse_pct**: Relative standard error as percentage (SE/estimate * 100)
 - **cv_pct**: Coefficient of variation for omega (sqrt(variance) * 100)
