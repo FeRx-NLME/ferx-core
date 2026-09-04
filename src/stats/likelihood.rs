@@ -216,7 +216,8 @@ pub(crate) struct JointPkTteSolve {
     preds: Vec<f64>,
     /// Sorted-unique union of every OdeAccumulated endpoint's record times.
     times: Vec<f64>,
-    /// Full ODE state at each `times[i]` (NaN if before the integration start).
+    /// Full ODE state at each `times[i]` — the seeded initial state for a time before the
+    /// integration start (#1223), NaN only where the solve diverged.
     chz_states: Vec<Vec<f64>>,
     /// PK-parameter snapshot used for the solve — reused to evaluate `h = dCHZ/dt`.
     pk_values: Vec<f64>,
@@ -335,8 +336,9 @@ fn try_joint_pktte_shared_solve(
 /// instead of integrating again. `cum = CHZ` and `haz = dCHZ/dt` are read exactly as
 /// `ode_cumhaz_hazard` does (state slot `chz_state`; the bare RHS for the derivative);
 /// the only difference is that the state came from the Gaussian solve's Hermite
-/// read-back, equal to a dedicated clamped solve to solver tolerance. A NaN state
-/// (time before the integration start, or a diverged solve) stays NaN, which
+/// read-back, equal to a dedicated clamped solve to solver tolerance. A time before the
+/// integration start carries the seeded initial state on both engines (#1223), so it
+/// scores `H = 0`; a NaN state means a diverged solve and stays NaN, which
 /// `tte_nll_from_curves` maps to the `1e20` sentinel — matching `ode_cumhaz_hazard`.
 #[cfg(feature = "survival")]
 fn tte_ode_nll_from_shared(
@@ -3897,6 +3899,320 @@ mod tests {
         assert!(
             (shared_tte - dedicated_tte).abs() <= 1e-4 * dedicated_tte.abs().max(1.0),
             "shared TTE NLL {shared_tte} must match dedicated {dedicated_tte} to solver tol"
+        );
+    }
+
+    /// The joint PK-TTE harness model of [`joint_pktte_ode_hazard_nll_paths_finite`],
+    /// as a helper so the #1223 pre-start arms use the same PK block, hazard and error
+    /// model without editing that test's fixture.
+    #[cfg(feature = "survival")]
+    fn joint_pktte_ode_model() -> CompiledModel {
+        crate::parser::model_parser::parse_model_string(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  theta TVH0(0.01, 1e-5, 10.0)
+  theta TVBETA(0.5, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  KA   = TVKA
+  H0   = TVH0
+  BETA = TVBETA
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+[event_model]
+  cmt    = 2
+  hazard = H0 * exp(BETA * (central / V))
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+",
+        )
+        .expect("joint PK-TTE model must parse")
+    }
+
+    /// A joint PK-TTE subject whose first record is a dose at **t = 10** — so the
+    /// integration starts at 10 and a TTE time below it is genuinely pre-start.
+    ///
+    /// `make_simple_subject` cannot host one: it doses at `t = 0`, and `entry_time` is
+    /// gated `> 0.0` ("no truncation"), so there is no positive time before its start.
+    /// PK observations sit at 12 / 16 / 24, all *after* the dose, which keeps
+    /// `t_last ≥ subject_integration_start` and so routes the pre-start read through the
+    /// engines' pre-first-break **fill** rather than through the `k = 0` boundary visit
+    /// that covers a degenerate every-time-before-the-dose timeline (#1218).
+    #[cfg(feature = "survival")]
+    fn late_start_joint_subject(records: Vec<ObsRecord>) -> Subject {
+        let mut subject = make_simple_subject();
+        subject.doses = vec![DoseEvent::new(10.0, 100.0, 1, 0.0, false, 0.0)];
+        subject.obs_times = vec![12.0, 16.0, 24.0];
+        subject.observations = vec![50.0, 40.0, 30.0];
+        subject.obs_cmts = vec![1; 3];
+        subject.cens = vec![0; 3];
+        subject.occasions = vec![1; 3];
+        subject.obs_records = records;
+        subject
+    }
+
+    /// #1223: a TTE time **at or before the subject's first record** must be scored, not
+    /// repelled, and must be scored identically on all three production callers.
+    ///
+    /// The one-solve share (`ode_predictions_and_chz`, #570) NaN-filled a `chz_times`
+    /// entry before the integration start; `tte_ode_nll_from_shared` skips a non-finite
+    /// state, `tte_nll_from_curves` maps the resulting NaN `H` to its `1e20` sentinel, and
+    /// the subject is repelled. The dedicated engine (`ode_dense_solve_states`) has filled
+    /// the same node with the seeded state since the CTMM scorer needed it. Which engine a
+    /// subject reaches is decided by `try_joint_pktte_shared_solve`'s admission list — a
+    /// reset, a time-varying covariate, model time in the PK block — none of which has
+    /// anything to do with when its `TENTRY` falls.
+    ///
+    /// Three arms, one per shape that can put a time before the start: a left-truncation
+    /// `entry_time`, an interval-censored `left` (pushed unconditionally, with no `> 0`
+    /// gate), and a right-censoring time itself.
+    ///
+    /// **What is non-degenerate here.** The seeded state of this model is all zeros (no
+    /// `init(...)`), so "state == `initial_state`" is a zeros-against-zeros identity; the
+    /// value that actually discriminates is the hazard, `h = H0·exp(BETA·0/V) = H0 = 0.01`
+    /// exactly — non-zero, and wrong under any other state. The non-degenerate *state*
+    /// check lives in the driver twin
+    /// (`ode::predictions::tests::prestart_chz_time_reads_the_seeded_state_on_both_paths`),
+    /// which seeds a non-zero `init(central)`.
+    ///
+    /// **`predict_survival` is a third caller, not a third geometry**: it routes
+    /// `OdeAccumulated` straight to `crate::survival::ode_cumhaz_hazard`, the same dense
+    /// solve the two-solve arm uses. It is here because it is the public entry point users
+    /// read `H`/`h` from, not as independent evidence. The independent oracle is the
+    /// hand-computed `H = 0`, `h = H0`.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn prestart_tte_time_is_scored_on_share_dedicated_and_predict_survival() {
+        use crate::types::{EventType, ObsRecord};
+
+        let model = joint_pktte_ode_model();
+        let ode = model.ode_spec.as_ref().expect("model has an [odes] block");
+        let (chz_state, hazard) = match model.endpoints.get(&2) {
+            Some(EndpointLikelihood::Tte {
+                hazard: h @ HazardSpec::OdeAccumulated { chz_state },
+                ..
+            }) => (*chz_state, h),
+            _ => panic!("expected an OdeAccumulated TTE endpoint on CMT 2"),
+        };
+        let p = &model.default_params;
+        let theta = &p.theta;
+        // `H0` carries no η, and at the seeded state `central = 0`, so `h = H0` for any η.
+        // η = 0 also matches what `predict_survival` evaluates at.
+        let eta = [0.0_f64];
+        let tv_h0 = theta[3];
+        assert_eq!(
+            tv_h0, 0.01,
+            "theta[3] must be TVH0 — the arms read h against it"
+        );
+
+        for (arm, t_pre, records) in [
+            (
+                "left truncation: Exact @20, entry 5",
+                5.0_f64,
+                vec![ObsRecord::Event {
+                    time: 20.0,
+                    event_type: EventType::Exact,
+                    entry_time: 5.0,
+                    cmt: 2,
+                }],
+            ),
+            (
+                "interval censoring: (5, 20]",
+                5.0_f64,
+                vec![ObsRecord::Event {
+                    time: 20.0,
+                    event_type: EventType::IntervalCensored {
+                        left: 5.0,
+                        right: 20.0,
+                    },
+                    entry_time: 0.0,
+                    cmt: 2,
+                }],
+            ),
+            (
+                "right censoring at 8, before the first record",
+                8.0_f64,
+                vec![ObsRecord::Event {
+                    time: 8.0,
+                    event_type: EventType::RightCensored,
+                    entry_time: 0.0,
+                    cmt: 2,
+                }],
+            ),
+        ] {
+            let subject = late_start_joint_subject(records);
+
+            // The straddle, asserted rather than assumed: the time under test is before
+            // the integration start, and the subject still has an observation at or after
+            // it, so the pre-start read goes through the fill (see the helper's note).
+            let start = crate::ode::subject_integration_start(&subject);
+            assert!(
+                t_pre < start,
+                "{arm}: fixture must straddle the start — t_pre {t_pre} vs start {start}"
+            );
+            assert!(
+                subject.obs_times.iter().any(|&t| t >= start),
+                "{arm}: fixture must keep an observation at or after the start"
+            );
+
+            // Engine 1 — the #570 one-solve share.
+            let share = try_joint_pktte_shared_solve(&model, &subject, theta, &eta)
+                .expect("model and subject must qualify for the #570 shared solve");
+            let i = share
+                .times
+                .iter()
+                .position(|&t| t == t_pre)
+                .unwrap_or_else(|| panic!("{arm}: {t_pre} must be a shared-solve CHZ time"));
+            let st = &share.chz_states[i];
+            assert!(
+                st.len() == ode.n_states && st.iter().all(|x| x.is_finite()),
+                "{arm}: share left the pre-start state non-finite: {st:?}"
+            );
+            let seeded = ode.initial_state(&share.pk_values);
+            for j in 0..ode.n_states {
+                assert_eq!(
+                    st[j].to_bits(),
+                    seeded[j].to_bits(),
+                    "{arm}: share state slot {j} = {} must be the seeded {}",
+                    st[j],
+                    seeded[j]
+                );
+            }
+            // `H` and `h` read exactly as `tte_ode_nll_from_shared` reads them.
+            let mut du = vec![0.0; ode.n_states];
+            (ode.rhs)(st, &share.pk_values, t_pre, &mut du);
+            let (share_cum, share_haz) = (st[chz_state], du[chz_state]);
+
+            // Engine 2 — the dedicated two-solve arm.
+            let (cum_ded, haz_ded) = crate::survival::ode_cumhaz_hazard(
+                &model,
+                &subject,
+                chz_state,
+                theta,
+                &eta,
+                &[t_pre],
+            );
+
+            // Caller 3 — the public `predict_survival` (η = 0), on the same dense engine.
+            let population = crate::types::Population {
+                subjects: vec![subject.clone()],
+                covariate_names: Vec::new(),
+                dv_column: "DV".into(),
+                input_columns: Vec::new(),
+                exclusions: None,
+                warnings: Vec::new(),
+            };
+            let surv = crate::api::predict_survival(&model, &population, p, &[t_pre]);
+            let row = surv
+                .iter()
+                .find(|r| r.cmt == 2 && r.time == t_pre)
+                .unwrap_or_else(|| panic!("{arm}: predict_survival must report CMT 2 @{t_pre}"));
+
+            // Every leg named separately, and finite before any comparison — a fold or a
+            // `max` would let a NaN leg ride along on the ones that worked.
+            for (leg, cum, haz) in [
+                ("share (#570)", share_cum, share_haz),
+                ("dedicated (ode_cumhaz_hazard)", cum_ded[0], haz_ded[0]),
+                ("predict_survival", row.cum_hazard, row.hazard),
+            ] {
+                assert!(
+                    cum.is_finite() && haz.is_finite(),
+                    "{arm} / {leg}: H = {cum}, h = {haz} — must be finite"
+                );
+                // Nothing has acted on the system yet: `H = 0`, and `h = H0·exp(BETA·0)`
+                // is `H0` bit-exactly (`exp(0.0) == 1.0`). Hand-computed, not read off
+                // another engine.
+                assert_eq!(cum, 0.0, "{arm} / {leg}: H({t_pre}) must be exactly 0");
+                assert_eq!(haz, tv_h0, "{arm} / {leg}: h({t_pre}) must be exactly TVH0");
+            }
+
+            // And the per-record NLL agrees between the two engines that actually score.
+            let shared_tte = tte_ode_nll_from_shared(ode, &share, chz_state, &subject.obs_records);
+            let dedicated_tte = tte_endpoint_nll(
+                &model,
+                &subject,
+                hazard,
+                crate::types::TteRecurrence::Single,
+                &subject.obs_records,
+                theta,
+                &eta,
+            );
+            assert!(
+                shared_tte.is_finite() && dedicated_tte.is_finite(),
+                "{arm}: TTE NLL must be finite — share {shared_tte}, dedicated {dedicated_tte}"
+            );
+            assert!(
+                (shared_tte - dedicated_tte).abs() <= 1e-4 * dedicated_tte.abs().max(1.0),
+                "{arm}: share {shared_tte} must match dedicated {dedicated_tte} to solver tol"
+            );
+        }
+    }
+
+    /// #1223 positive control: the *convention* the fix adopts, as a differential pair
+    /// that straddles the integration start.
+    ///
+    /// A pre-start `entry_time` must contribute **nothing** — `H(entry) = 0`, so the
+    /// left-truncated `H(T) − H(entry)` equals the untruncated `H(T)` — while a post-start
+    /// one must change the objective. Without the second leg the first is satisfied by any
+    /// implementation that ignores `entry_time` entirely; without the first, by the
+    /// alternative convention of starting the hazard clock at the earliest TTE time, which
+    /// would make `H(entry) > 0` and shift the NLL.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn prestart_entry_time_contributes_nothing_post_start_entry_does() {
+        use crate::types::{EventType, ObsRecord};
+
+        let model = joint_pktte_ode_model();
+        let p = &model.default_params;
+        let eta = [0.0_f64];
+
+        let nll_at = |entry_time: f64| -> f64 {
+            let subject = late_start_joint_subject(vec![ObsRecord::Event {
+                time: 20.0,
+                event_type: EventType::Exact,
+                entry_time,
+                cmt: 2,
+            }]);
+            individual_nll(&model, &subject, &p.theta, &eta, &p.omega, &p.sigma.values)
+        };
+
+        let (none, pre, post) = (nll_at(0.0), nll_at(5.0), nll_at(12.0));
+        assert!(
+            none.is_finite() && pre.is_finite() && post.is_finite(),
+            "every leg must be finite: none {none}, pre {pre}, post {post}"
+        );
+
+        // The integration starts at the dose (t = 10), so 5 is before it and 12 after —
+        // the pair genuinely straddles the gate rather than sitting on one side of it.
+        let subject = late_start_joint_subject(Vec::new());
+        let start = crate::ode::subject_integration_start(&subject);
+        assert!(
+            5.0 < start && 12.0 > start,
+            "the pair must straddle the integration start ({start})"
+        );
+
+        // Pre-start entry: identical objective. Not bit-equal — `entry_time > 0` adds a
+        // node to the shared solve's CHZ time vector, which re-segments the integration —
+        // so a solver-tolerance bound, measured at 0 (exact) on this fixture.
+        assert!(
+            (pre - none).abs() <= 1e-9 * none.abs().max(1.0),
+            "a pre-start entry must contribute nothing: entry=5 {pre} vs entry=0 {none}"
+        );
+        // Post-start entry: the objective must move by `H(12) > 0`.
+        assert!(
+            (post - none).abs() > 1e-6,
+            "a post-start entry must change the objective: entry=12 {post} vs entry=0 {none}"
         );
     }
 

@@ -149,6 +149,20 @@ fn one_cpt_chz_ode_spec() -> OdeSpec {
     }
 }
 
+/// [`one_cpt_chz_ode_spec`] with a **non-zero** `init(central) = seed`.
+///
+/// Exists so a test of the pre-integration-start state can distinguish "the engine
+/// cloned the seeded `u`" from "the engine wrote zeros": with the default `init_fn:
+/// None` every slot of `initial_state` is `0.0`, and an assertion against it holds
+/// just as well for a `vec![0.0; n]` fill (#1223).
+#[cfg(feature = "survival")]
+fn one_cpt_chz_seeded_ode_spec(seed: f64) -> OdeSpec {
+    OdeSpec {
+        init_fn: Some(Box::new(move |_p: &[f64]| vec![seed, 0.0])),
+        ..one_cpt_chz_ode_spec()
+    }
+}
+
 /// Bolus-driven crossing matches the closed form: `amt=100`, `CL=10`, `V=100`
 /// ⇒ `ke=0.1`, `CHZ(t)=100(1-e^{-0.1t})`; solving `CHZ=50` gives `t = 10·ln2`.
 #[cfg(feature = "survival")]
@@ -281,6 +295,117 @@ fn terminal_dose_on_chz_time_reads_post_dose_on_both_paths() {
     assert_relative_eq!(
         chz_states[0][0],
         100.0 * (-ke * 24.0).exp() + 100.0,
+        max_relative = 1e-4
+    );
+}
+
+/// A CHZ time **before the integration start** must read the same seeded state on the
+/// shared one-solve engine (`ode_predictions_and_chz`) as on the dedicated dense engine
+/// (`ode_dense_solve_states`) — #1223.
+///
+/// The dense engine has filled such a node with the seeded `u` since the CTMM scorer
+/// needed it; the share kept a `f64::NAN` prefill whose comment claimed it was "matching
+/// the dedicated path". It was not, and the difference is not cosmetic: the TTE
+/// likelihood maps a NaN `H` to its `1e20` sentinel, so a subject with a `TENTRY` (or an
+/// interval `left`) before its first record was scored on one engine and repelled on the
+/// other — decided by nothing but whether the subject also carried a PK observation.
+///
+/// Two things make this test able to fail, both of which a plainer version would lack:
+///
+/// * **`is_finite()` is asserted before the bit compare.** Both engines pre-filled with
+///   the `f64::NAN` *literal*, and `f64::NAN.to_bits()` is a single fixed pattern — so a
+///   bare `to_bits()` twin is green on the broken code, NaN matching NaN bitwise. The
+///   finiteness assertions are the only ones that fail before the fix.
+/// * **The fixture seeds a non-zero `init(central) = 7.5`.** With the default all-zero
+///   `initial_state` the twin would compare `[0.0, 0.0]` to `[0.0, 0.0]` and pass just as
+///   well against a fill written `vec![0.0; n]` — it would pin the slot, not the value.
+///
+/// **Both engines must reach the pre-start node through their `< break_times[0] - 1e-12`
+/// fill**, and that is what the second CHZ time (`12`, after the dose) is for. Each engine
+/// folds its own horizon into the timeline before sorting: the share folds
+/// `max(0, obs…, chz…)`, the dense builder folds `max(0, saveat…)` — and the dense engine's
+/// `saveat` *is* `chz_times`, not the subject's observations. With `chz_times = [5.0]`
+/// alone the dense horizon would be `5.0`, putting `break_times[0]` **below** the
+/// integration start; the node would then be read at the `k = 0` boundary visit as the same
+/// seeded state by the other mechanism (#1218) and a broken dense fill would go unnoticed.
+/// Verified by mutation: with only `[5.0]`, disabling the dense fill leaves this test green.
+#[cfg(feature = "survival")]
+#[test]
+fn prestart_chz_time_reads_the_seeded_state_on_both_paths() {
+    let ode = one_cpt_chz_seeded_ode_spec(7.5);
+    // Dose at 10, observation at 12 — so the integration starts at 10.
+    let subject = make_subject(
+        vec![DoseEvent::new(10.0, 100.0, 1, 0.0, false, 0.0)],
+        vec![12.0],
+    );
+    let pk = pk_one(10.0, 100.0);
+    // One CHZ time before the integration start, one after — the second is what lifts
+    // *both* engines' horizons above the start, so both take the fill (see the note above).
+    let chz_times = vec![5.0, 12.0];
+    let start = subject_integration_start(&subject);
+    assert!(
+        chz_times[0] < start && chz_times[1] > start,
+        "fixture must straddle the integration start ({start}) or it tests nothing: \
+         {chz_times:?}"
+    );
+
+    let (_ipred, chz_states) =
+        ode_predictions_and_chz(&ode, &pk.values, &[], &[], &subject, &chz_times);
+    let chz_ref = ode_dense_solve_states(&ode, &pk.values, &[], &[], &subject, &chz_times);
+
+    // (1) Finite on both — the assertions that are red before the fix, one per engine so
+    // the failure names which one dropped the node.
+    assert!(
+        chz_states[0].iter().all(|x| x.is_finite()),
+        "shared engine left the pre-start state non-finite: {:?}",
+        chz_states[0]
+    );
+    assert!(
+        chz_ref[0].iter().all(|x| x.is_finite()),
+        "dense engine left the pre-start state non-finite: {:?}",
+        chz_ref[0]
+    );
+
+    // (2) Bit-identical to each other, and (3) bit-identical to the seeded state — the
+    // value nothing has acted on yet. `to_bits`, not a tolerance: both engines clone the
+    // same `ode.initial_state(pk)`, so any difference is a defect, not solver error.
+    let seeded = ode.initial_state(&pk.values);
+    for j in 0..ode.n_states {
+        assert_eq!(
+            chz_states[0][j].to_bits(),
+            chz_ref[0][j].to_bits(),
+            "slot {j}: shared {} vs dense {}",
+            chz_states[0][j],
+            chz_ref[0][j]
+        );
+        assert_eq!(
+            chz_states[0][j].to_bits(),
+            seeded[j].to_bits(),
+            "slot {j}: shared {} must be the seeded initial state {}",
+            chz_states[0][j],
+            seeded[j]
+        );
+    }
+    // (4) And the seed is genuinely non-zero, so (3) is not a zeros-against-zeros identity.
+    assert_eq!(seeded[0], 7.5, "fixture must seed a non-zero initial state");
+    assert_eq!(seeded[1], 0.0, "the CHZ accumulator starts at zero");
+
+    // (5) The post-start node is a live control: both engines integrated, they agree, and
+    // the answer is *not* the seeded state — so (3) is a statement about the pre-start
+    // node specifically, not about an engine that returned the seed everywhere.
+    assert!(
+        chz_states[1].iter().all(|x| x.is_finite()) && chz_ref[1].iter().all(|x| x.is_finite()),
+        "post-start states must be finite: shared {:?}, dense {:?}",
+        chz_states[1],
+        chz_ref[1]
+    );
+    for j in 0..ode.n_states {
+        assert_relative_eq!(chz_states[1][j], chz_ref[1][j], max_relative = 1e-5);
+    }
+    // Seeded 7.5, plus the 100 mg bolus at t=10, decayed 2 h at ke = 0.1.
+    assert_relative_eq!(
+        chz_states[1][0],
+        (7.5 + 100.0) * (-0.1_f64 * 2.0).exp(),
         max_relative = 1e-4
     );
 }

@@ -2485,10 +2485,12 @@ pub fn ode_predictions(
 /// `saveat` (which clamps the step sequence) is untouched; the CHZ states are read
 /// by in-step cubic Hermite interpolation, which does not perturb the steps.
 /// `chz_times` must be **sorted ascending and unique**. Returns `(ipred, chz_states)`
-/// where `chz_states[i]` is the full ODE state at `chz_times[i]` — NaN-filled for any
-/// time before the integration start (matching the dedicated `ode_dense_solve_states`
-/// path, which the TTE NLL maps to its `1e20` sentinel). `ipred` is the raw observable
-/// readout; callers apply `[scaling]` / log-transform exactly as for `ode_predictions`.
+/// where `chz_states[i]` is the full ODE state at `chz_times[i]`. A time before the
+/// integration start reads the **seeded initial state** — nothing has acted on the system
+/// yet — exactly as the dedicated `ode_dense_solve_states` path does (#1223). NaN survives
+/// only where a solve diverged, which the TTE NLL maps to its `1e20` sentinel. `ipred` is
+/// the raw observable readout; callers apply `[scaling]` / log-transform exactly as for
+/// `ode_predictions`.
 ///
 /// Gated on `survival` — its only consumer is the joint PK-TTE fit path, so the
 /// default build neither compiles nor flags it.
@@ -2762,11 +2764,13 @@ fn ode_predictions_with_extra_breaks_and_stats(
     let n = ode.n_states;
     let n_obs = subject.obs_times.len();
     let opts = ode.effective_solver_opts();
-    // #570: full state at each `chz_times[i]`, pre-filled NaN so a soft time before
-    // the integration start (or otherwise uncovered by a segment) reads NaN → the TTE
-    // 1e20 sentinel — exactly as the dedicated `ode_dense_solve_states` path does
-    // today. `chz_times` is sorted-unique (caller contract), enabling the binary
-    // search that maps each segment's soft samples back to their global slot.
+    // #570: full state at each `chz_times[i]`, pre-filled NaN so a soft time no segment
+    // covered is visibly *unset* rather than silently zero. Times before the first break
+    // are overwritten with the seeded state below (#1223), the same fill the dedicated
+    // `ode_dense_solve_states` path applies — so a surviving NaN means one thing on both
+    // engines: a diverged solve, which the TTE NLL maps to its 1e20 sentinel.
+    // `chz_times` is sorted-unique (caller contract), enabling the binary search that
+    // maps each segment's soft samples back to their global slot.
     let mut chz_states: Vec<Vec<f64>> = vec![vec![f64::NAN; n]; chz_times.len()];
 
     // Seed compartments from `init(state) = expr` (zeros when none declared).
@@ -2844,6 +2848,32 @@ fn ode_predictions_with_extra_breaks_and_stats(
     );
     break_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
+
+    // #1223: a soft (CHZ) time earlier than the first break — a left-truncation `TENTRY`,
+    // or an interval-censored `left`, before the subject's first dose or observation. No
+    // segment covers it, so without this it keeps its NaN prefill, and the TTE likelihood
+    // reads that as a diverged solve and repels the subject with its `1e20` sentinel.
+    // Nothing has acted on the system before the first event, so the state there is the
+    // seeded `u`. This is the exact twin of the fill in the dedicated
+    // `ode_dense_solve_states` (same `< first_break - 1e-12` test, same clone) — which is
+    // what makes the shared and two-solve arms agree on such a time, rather than the
+    // objective depending on which engine `try_joint_pktte_shared_solve` admitted the
+    // subject to.
+    //
+    // Keyed on `break_times[0]`, **not** on `subject_integration_start`: the terminal
+    // `t_last` fold above can put the first break *below* the start, when every
+    // observation and CHZ time precedes the first dose. There the time is read at the
+    // `k = 0` boundary visit instead — the same seeded state by the other mechanism
+    // (#1218) — and the dense builder folds `t_last` in the same way, so keying on the
+    // start would diverge from the twin in exactly that corner. Strict `<`, so a CHZ time
+    // *on* the first break still reads at that boundary visit, post-dose.
+    if let Some(&first_break) = break_times.first() {
+        for (gi, &t) in chz_times.iter().enumerate() {
+            if t < first_break - 1e-12 {
+                chz_states[gi] = u.clone();
+            }
+        }
+    }
 
     // Most-recent system-reset time; `NEG_INFINITY` until the first reset is
     // crossed. Threaded into `integrate_segment` so infusions / zero-order windows

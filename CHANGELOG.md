@@ -20,6 +20,14 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Fixed
+- **A joint PK-TTE subject whose `TENTRY` (or interval-censored left bound) falls at or
+  before its first record no longer scores the `1e20` sentinel (#1223).** The one-solve
+  shared path left such a time's ODE state `NaN`, which the TTE likelihood reads as a
+  diverged solve; the dedicated two-solve path filled it with the seeded initial state, so
+  whether a subject was repelled or scored depended on which engine it was admitted to —
+  a question of resets and time-varying covariates, not of where its entry time falls.
+  Both engines now agree with `predict_survival()`: `H = 0` and `h = h(u₀)` there, so a
+  pre-start entry time contributes nothing.
 - **A joint PK-TTE (or binary / Markov) model fed a population read without the model
   is now a hard error instead of a silently wrong fit (#1199).** `read_nonmem_csv()` knows
   no model, so a dataset read through it carried the endpoint's rows as Gaussian
