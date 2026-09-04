@@ -64,9 +64,22 @@ pub struct CandidateRecord {
     pub skipped: Vec<String>,
     pub seconds: f64,
     pub error: Option<String>,
+    /// Whether `error` describes the run rather than the candidate, in which
+    /// case a resumed run refits instead of trusting this row — see
+    /// [`CandidateError`](super::CandidateError).
+    ///
+    /// Defaults to `true` so a row written before the field existed is refitted
+    /// rather than believed. That is the safe direction: a needless refit costs
+    /// time, and a wrongly trusted failure costs the candidate.
+    #[serde(default = "retryable_by_default")]
+    pub retryable: bool,
     /// Whether a `fits/<hash>.json` was written for this row. `false` for a
     /// failed fit; `true` does not promise the file is still readable.
     pub has_fit: bool,
+}
+
+fn retryable_by_default() -> bool {
+    true
 }
 
 pub fn journal_path(dir: &Path) -> PathBuf {
@@ -115,39 +128,52 @@ fn part_path(path: &Path) -> PathBuf {
 /// into an unlinked inode and every row it produces from then on is gone, with
 /// nothing on disk to say so. A lock file turns that into a message.
 ///
-/// It is deliberately a plain `O_EXCL` file rather than an OS advisory lock: no
-/// new dependency, and the failure mode is one a user can see and fix. The cost
-/// is that a hard kill leaves the file behind, so the error says how to clear
-/// it.
+/// It is deliberately a plain `O_EXCL` file rather than an OS advisory lock, so
+/// that it needs no new dependency and leaves something a user can see. The
+/// price of that choice is a *stale* lock: a hard kill releases no file, and
+/// resuming after a hard kill is the whole point of the journal — a lock that
+/// had to be deleted by hand would break the flagship case. So the holder's pid
+/// is written into the file and a lock whose owner is gone is taken over
+/// automatically.
+///
+/// The one thing it will not do is take a lock from a *live* pid, so the
+/// failure direction is "refused a run that could have proceeded", never "two
+/// runs in one directory". A recycled pid therefore reads as live and refuses;
+/// the message says which file to delete.
 pub struct DirLock {
     path: PathBuf,
 }
 
 impl DirLock {
-    /// Claim `dir`, or explain who holds it.
+    /// Claim `dir`, taking over a lock whose owner is no longer running.
     pub fn acquire(dir: &Path) -> Result<DirLock, String> {
         std::fs::create_dir_all(dir)
             .map_err(|e| format!("cannot create search directory `{}`: {e}", dir.display()))?;
         let path = lock_path(dir);
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(mut file) => {
-                // Best-effort: the lock is the file's existence, not its
-                // contents, so a failed write costs a better error message and
-                // nothing else.
-                let _ = writeln!(file, "pid {}", std::process::id());
-                Ok(DirLock { path })
-            }
+        match Self::claim(&path) {
+            Ok(lock) => Ok(lock),
+            // Taken. If the holder is gone this is the debris of a hard kill,
+            // and one retry is enough: losing the race to a third process just
+            // means that process holds a lock we then report honestly.
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let owner = std::fs::read_to_string(&path)
-                    .ok()
-                    .map(|text| text.trim().to_string())
-                    .filter(|text| !text.is_empty())
-                    .unwrap_or_else(|| "owner unknown".to_string());
+                let owner = std::fs::read_to_string(&path).unwrap_or_default();
+                if !owner_is_running(&owner) {
+                    let _ = std::fs::remove_file(&path);
+                    if let Ok(lock) = Self::claim(&path) {
+                        return Ok(lock);
+                    }
+                }
+                let owner = owner.trim();
+                let owner = if owner.is_empty() {
+                    "owner unknown"
+                } else {
+                    owner
+                };
                 Err(format!(
                     "the search directory `{}` is already in use ({owner}): two runs sharing one \
-                     directory overwrite each other's journal, so the second one's fits would be \
-                     lost. Point this run at a different directory — or, if no such process is \
-                     running (a hard kill leaves the lock behind), delete `{}` and retry.",
+                     directory overwrite each other's journal, so one run's fits would be lost. \
+                     Point this run at a different directory — or, if that process is not \
+                     actually running, delete `{}` and retry.",
                     dir.display(),
                     path.display()
                 ))
@@ -155,6 +181,50 @@ impl DirLock {
             Err(e) => Err(format!("cannot create `{}`: {e}", path.display())),
         }
     }
+
+    fn claim(path: &Path) -> Result<DirLock, std::io::Error> {
+        let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+        // Best-effort: the lock is the file's existence, not its contents, so a
+        // failed write costs the takeover check and nothing else — and an
+        // unreadable owner reads as "still running", which refuses rather than
+        // steals.
+        let _ = writeln!(file, "pid {}", std::process::id());
+        Ok(DirLock {
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+/// Whether the process named in a lock file is still alive.
+///
+/// Unparseable contents count as running: the takeover is the only path that
+/// deletes another run's lock, so everything it cannot positively establish has
+/// to fall on the refusing side.
+fn owner_is_running(contents: &str) -> bool {
+    let Some(pid) = contents
+        .trim()
+        .strip_prefix("pid ")
+        .and_then(|rest| rest.trim().parse::<u32>().ok())
+    else {
+        return true;
+    };
+    process_is_running(pid)
+}
+
+#[cfg(unix)]
+fn process_is_running(pid: u32) -> bool {
+    // Signal 0 performs the permission and existence checks without delivering
+    // anything. `ESRCH` — and only `ESRCH` — means there is no such process;
+    // `EPERM` means one exists that we may not signal, which is still alive.
+    let alive = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    alive == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(not(unix))]
+fn process_is_running(_pid: u32) -> bool {
+    // No dependency-free liveness check, so a lock is never taken over and the
+    // error tells the user which file to delete.
+    true
 }
 
 impl Drop for DirLock {

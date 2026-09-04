@@ -319,7 +319,9 @@ fn a_failed_fit_is_reported_with_its_error() {
     let candidates = vec![candidate("broken", "[parameters]\ntheta CL = 1\n")];
     let report = Runner::new()
         .run_with_fitter(&candidates, &population(&["1"]), &lenient(), |_, _| {
-            Err("does not compile: unknown block `[wat]`".to_string())
+            Err(CandidateError::model(
+                "does not compile: unknown block `[wat]`",
+            ))
         })
         .expect("run");
 
@@ -329,7 +331,7 @@ fn a_failed_fit_is_reported_with_its_error() {
     assert!(!result.verdict.passed);
     assert!(result.verdict.failures[0].contains("unknown block"));
     assert_eq!(
-        result.error.as_deref(),
+        result.error.as_ref().map(|e| e.message.as_str()),
         Some("does not compile: unknown block `[wat]`")
     );
     assert!(!result.eligible());
@@ -749,7 +751,7 @@ fn every_candidate_appears_in_the_table_in_submission_order() {
         .cache_dir(dir.path())
         .run_with_fitter(&candidates, &population(&["1"]), &options, |c, _| {
             match c.id.as_str() {
-                "broken" => Err("the model does not compile".to_string()),
+                "broken" => Err(CandidateError::model("the model does not compile")),
                 "bad" => {
                     let mut result = converged_fit(3.0);
                     result.converged = false;
@@ -897,34 +899,57 @@ fn a_completed_run_clears_the_partial_table_of_the_run_it_resumed() {
 
 // ── failures are not permanent ───────────────────────────────────────────────
 
-#[test]
-fn a_resume_refits_a_candidate_whose_first_run_errored() {
-    // `install_on_fit_pool` returns `Err` when the machine is briefly out of
-    // threads, and a compile failure returns `Err` too — from here the two are
-    // one string. Journalling the outcome as final would have one bad minute
-    // mark a perfectly fittable model unfittable in every later resume, with
-    // nothing to tell the user which kind of failure they were looking at.
-    let dir = tempfile::tempdir().expect("tempdir");
-    let candidates = vec![
+/// The three candidates a resume has to tell apart: one that fitted, one whose
+/// failure describes the machine, and one whose failure describes the model.
+fn ok_flaky_broken() -> Vec<Candidate> {
+    vec![
         candidate("ok", "[parameters]\ntheta CL = 1\n"),
         candidate("flaky", "[parameters]\ntheta CL = 2\n"),
-    ];
-    let first =
-        Runner::new()
-            .threads(1)
-            .cache_dir(dir.path())
-            .run_with_fitter(&candidates, &population(&["1"]), &lenient(), |c, _| match c
-                .id
-                .as_str()
-            {
-                "flaky" => {
-                    Err("cannot build the fit pool: Resource temporarily unavailable".to_string())
-                }
+        candidate("broken", "[parameters]\ntheta CL = 3\n"),
+    ]
+}
+
+fn first_run_over(dir: &std::path::Path, candidates: &[Candidate]) -> RunReport {
+    Runner::new()
+        .threads(1)
+        .cache_dir(dir)
+        .run_with_fitter(
+            candidates,
+            &population(&["1"]),
+            &lenient(),
+            |c, _| match c.id.as_str() {
+                "flaky" => Err(CandidateError::environment(
+                    "cannot build the fit pool: Resource temporarily unavailable",
+                )),
+                "broken" => Err(CandidateError::model(
+                    "candidate `broken` does not compile: unknown block `[wat]`",
+                )),
                 _ => Ok(converged_fit(1.0)),
-            })
-            .expect("first run");
-    assert_eq!(first.results.len(), 2);
-    assert!(first.results[1].error.is_some());
+            },
+        )
+        .expect("first run")
+}
+
+#[test]
+fn a_resume_refits_an_environment_failure_and_trusts_a_model_failure() {
+    // The two `Err`s are one string from inside the runner, which is why the
+    // classification is made where the failure is raised. Journalling a pool
+    // that could not be built as final would have one bad minute mark a
+    // fittable model dead for the rest of the search's life; re-parsing a model
+    // that does not compile, on every resume, for ever, is the opposite waste.
+    //
+    // Both candidates are here so the pair straddles the predicate: a filter
+    // that dropped *every* error row, or none, agrees with the fix on one of
+    // them, and a test carrying only one would pass either way.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let candidates = ok_flaky_broken();
+    let first = first_run_over(dir.path(), &candidates);
+    assert_eq!(first.results.len(), 3);
+    assert!(first.results[1].error.as_ref().is_some_and(|e| e.retryable));
+    assert!(first.results[2]
+        .error
+        .as_ref()
+        .is_some_and(|e| !e.retryable));
 
     let recorder = Recorder::new();
     let options = RunOptions {
@@ -943,14 +968,20 @@ fn a_resume_refits_a_candidate_whose_first_run_errored() {
     assert_eq!(
         recorder.ids(),
         vec!["flaky"],
-        "the error row was carried forward"
+        "the resume refit the wrong set"
     );
-    assert_eq!((second.fitted, second.reused), (1, 1));
+    assert_eq!((second.fitted, second.reused), (1, 2));
     assert!(second.results[1].error.is_none());
     assert_eq!(second.results[1].ofv, Some(2.0));
+    // The model failure comes back with its reason rather than as a hole in the
+    // report — it is reused, not dropped.
+    let reused_failure = second.results[2].error.as_ref().expect("reason");
+    assert!(reused_failure.message.contains("unknown block"));
+    assert!(!reused_failure.retryable);
+    assert!(second.results[2].reused);
 
-    // A third resume reuses it, so the refit landed in the journal rather than
-    // the candidate being refitted for ever.
+    // A third resume reuses the refit too, so the successful retry landed in
+    // the journal rather than the candidate being refitted for ever.
     let third = Runner::new()
         .threads(1)
         .cache_dir(dir.path())
@@ -958,7 +989,48 @@ fn a_resume_refits_a_candidate_whose_first_run_errored() {
             panic!("`{}` was refitted after a successful run", c.id)
         })
         .expect("second resume");
-    assert_eq!((third.fitted, third.reused), (0, 2));
+    assert_eq!((third.fitted, third.reused), (0, 3));
+}
+
+#[test]
+fn a_journal_row_written_before_the_flag_existed_is_refitted() {
+    // `CandidateRecord::retryable` defaults to `true` on a row that predates
+    // the field, so an old journal refits its failures instead of believing
+    // them. The safe direction: a needless refit costs time, a wrongly trusted
+    // failure costs the candidate.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let candidates = ok_flaky_broken();
+    first_run_over(dir.path(), &candidates);
+
+    // Strip the field from every row, as a journal written by the previous
+    // version would have.
+    let path = journal::journal_path(dir.path());
+    let aged: String = std::fs::read_to_string(&path)
+        .expect("journal")
+        .lines()
+        .map(|line| {
+            let mut row: serde_json::Value = serde_json::from_str(line).expect("row");
+            row.as_object_mut().expect("object").remove("retryable");
+            format!("{row}\n")
+        })
+        .collect();
+    assert!(!aged.contains("retryable"), "the field survived the strip");
+    std::fs::write(&path, aged).expect("write");
+
+    let recorder = Recorder::new();
+    let options = RunOptions {
+        resume: true,
+        ..lenient()
+    };
+    Runner::new()
+        .threads(1)
+        .cache_dir(dir.path())
+        .run_with_fitter(&candidates, &population(&["1"]), &options, |c, _| {
+            recorder.record(&c.id);
+            Ok(converged_fit(2.0))
+        })
+        .expect("resumed run");
+    assert_eq!(recorder.ids(), vec!["broken", "flaky"]);
 }
 
 // ── the shared population ────────────────────────────────────────────────────
@@ -1034,6 +1106,73 @@ fn a_second_run_over_a_live_directory_is_refused_by_name() {
         !journal::lock_path(dir.path()).exists(),
         "the run kept the lock"
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_lock_left_behind_by_a_dead_process_is_taken_over() {
+    // Resuming after a hard kill is the case the journal exists for, and a hard
+    // kill releases no lock file — so a lock that had to be deleted by hand
+    // would break exactly the workflow the directory is built around.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let candidates = vec![candidate("a", "[parameters]\ntheta CL = 1\n")];
+
+    // A pid that is not running. Spawning and reaping a real process is what
+    // makes this a *dead* pid rather than one that was never alive, which the
+    // takeover has to treat the same way but which a reader could dismiss.
+    let mut corpse = std::process::Command::new("true")
+        .spawn()
+        .expect("spawn a process to outlive");
+    let dead = corpse.id();
+    corpse.wait().expect("reap");
+    std::fs::create_dir_all(dir.path()).expect("dir");
+    std::fs::write(journal::lock_path(dir.path()), format!("pid {dead}\n")).expect("stale lock");
+
+    let report = Runner::new()
+        .threads(1)
+        .cache_dir(dir.path())
+        .run_with_fitter(&candidates, &population(&["1"]), &lenient(), |_, _| {
+            Ok(converged_fit(1.0))
+        })
+        .expect("a stale lock must not block a resume");
+    assert_eq!(report.fitted, 1);
+    assert!(!journal::lock_path(dir.path()).exists());
+
+    // The other side of the predicate: *this* process is running, so its lock
+    // is not stale and the same code path refuses instead of stealing.
+    std::fs::write(
+        journal::lock_path(dir.path()),
+        format!("pid {}\n", std::process::id()),
+    )
+    .expect("live lock");
+    let err = expect_refusal(
+        Runner::new()
+            .threads(1)
+            .cache_dir(dir.path())
+            .run_with_fitter(&candidates, &population(&["1"]), &lenient(), |_, _| {
+                Ok(converged_fit(1.0))
+            }),
+        "a live owner must not be stolen from",
+    );
+    assert!(err.contains("already in use"), "unhelpful message: {err}");
+    std::fs::remove_file(journal::lock_path(dir.path())).expect("cleanup");
+}
+
+#[test]
+fn a_lock_whose_owner_cannot_be_read_is_never_stolen() {
+    // Takeover is the only path that deletes another run's lock, so anything it
+    // cannot positively establish has to fall on the refusing side — an empty
+    // file (the write after `create_new` did not land) or a garbled one.
+    for contents in ["", "pid \n", "held by someone", "pid not-a-number"] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path()).expect("dir");
+        std::fs::write(journal::lock_path(dir.path()), contents).expect("lock");
+        let err = journal::DirLock::acquire(dir.path())
+            .err()
+            .unwrap_or_else(|| panic!("`{contents:?}` was treated as stale"));
+        assert!(err.contains("already in use"), "unhelpful message: {err}");
+        assert!(journal::lock_path(dir.path()).exists());
+    }
 }
 
 #[test]

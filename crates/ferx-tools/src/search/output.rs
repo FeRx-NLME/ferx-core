@@ -31,7 +31,7 @@ pub fn partial_table_path(dir: &Path) -> PathBuf {
 }
 
 /// The columns of `candidates.csv`, in order.
-pub const COLUMNS: [&str; 14] = [
+pub const COLUMNS: [&str; 15] = [
     "id",
     "parent",
     "hash",
@@ -44,6 +44,7 @@ pub const COLUMNS: [&str; 14] = [
     "skipped",
     "seconds",
     "error",
+    "retryable",
     "duplicate_of",
     "reused",
 ];
@@ -110,7 +111,17 @@ fn write_table_to(path: &Path, dir: &Path, results: &[CandidateResult]) -> Resul
                     reasons(&r.verdict.failures),
                     reasons(&r.verdict.skipped),
                     number(r.seconds),
-                    r.error.clone().unwrap_or_default(),
+                    r.error
+                        .as_ref()
+                        .map(|e| e.message.clone())
+                        .unwrap_or_default(),
+                    // Empty rather than `false` when there is no failure to
+                    // describe: the column answers "will a resume try this
+                    // again?", and a row that succeeded is not asking.
+                    r.error
+                        .as_ref()
+                        .map(|e| e.retryable.to_string())
+                        .unwrap_or_default(),
                     r.duplicate_of.clone().unwrap_or_default(),
                     r.reused.to_string(),
                 ])

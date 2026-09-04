@@ -28,6 +28,14 @@ rayon = "1.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# `search.lock` staleness only: `kill(pid, 0)` is how a search directory whose
+# owner was hard-killed is taken over instead of needing a manual delete —
+# resuming after a kill is the case the journal exists for. Already in the
+# workspace lockfile (via `tempfile` and `rand`), so this adds no crate to the
+# build; non-unix targets compile a `cfg` fallback and never take a lock over.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 # Heavy convergence tests (5–60 min wall). Default `cargo test` ignores them;
 # a nightly/manual job opts in with --features slow-tests.

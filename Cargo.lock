@@ -319,6 +319,7 @@ version = "0.3.1"
 dependencies = [
  "csv",
  "ferx-core",
+ "libc",
  "nalgebra",
  "rand 0.10.2",
  "rayon",

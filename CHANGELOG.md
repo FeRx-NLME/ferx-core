@@ -65,11 +65,14 @@ section of the SDLC for the versioning policy).
   the complete table of the run it resumed. The cache directory is claimed for the length of a
   run (`search.lock`) because two runs sharing one would silently destroy each other's journal,
   and a directory that cannot be written costs the resume and the report rather than the fits:
-  those failures come back on `RunReport::warnings` with the results intact. A candidate whose
-  fit *errored* is refitted on the next resume instead of being remembered as permanently
-  unfittable, since a transient resource limit and a broken model are the same string from
-  there. This is the orchestration layer the covariate, structural, variability and
-  residual-error searches of #1175 are built on.
+  those failures come back on `RunReport::warnings` with the results intact. A lock whose owner
+  was hard-killed is taken over automatically, so resuming after a kill — the case the journal
+  exists for — never needs a file deleted by hand. A candidate that produced no fit carries a
+  `CandidateError` saying whether the failure was the *model* (it does not compile: remembered,
+  and reported without refitting) or the *run* (a fit pool that could not be built: refitted on
+  the next resume), so one bad minute cannot permanently mark a fittable model as unfittable.
+  This is the orchestration layer the covariate, structural, variability and residual-error
+  searches of #1175 are built on.
 - **BIC variants and a `Strictness` gate for candidate ranking (#1177, part of #1175).**
   `ferx_core::bic(&result, BicType::{Mixed, Iiv, Random, Fixed})` computes the four
   conventions of `pharmpy.modeling.calculate_bic` from a finished `FitResult` — the

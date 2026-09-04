@@ -3,7 +3,7 @@
 use ferx_core::StrictnessVerdict;
 
 use super::*;
-use crate::search::candidate::{CandidateResult, FeatureVector};
+use crate::search::candidate::{CandidateError, CandidateResult, FeatureVector};
 use crate::search::test_support::converged_fit;
 
 fn result(id: &str) -> CandidateResult {
@@ -101,7 +101,7 @@ fn a_candidate_without_a_fit_leaves_its_numeric_cells_empty() {
     failed.ofv = None;
     failed.converged = None;
     failed.criterion = f64::NAN;
-    failed.error = Some("does not compile".into());
+    failed.error = Some(CandidateError::model("does not compile"));
     write_table(dir.path(), &[failed]).expect("write");
 
     let rows = rows(dir.path());

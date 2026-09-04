@@ -168,7 +168,7 @@ fn result_with(criterion: f64, passed: bool, error: Option<&str>) -> CandidateRe
         },
         criterion,
         seconds: 0.0,
-        error: error.map(str::to_string),
+        error: error.map(CandidateError::model),
         duplicate_of: None,
         reused: false,
     }

@@ -246,6 +246,63 @@ impl Default for RunOptions {
     }
 }
 
+/// Why a candidate produced no fit, and whether a later run should try again.
+///
+/// The flag is not cosmetic: a journalled outcome is what every subsequent
+/// `resume: true` run believes without rechecking, and the two failures that
+/// arrive here are not the same statement. A model that does not compile will
+/// not compile on the next machine either — remembering that saves the parse
+/// and, more importantly, keeps the candidate in the report. A fit that died
+/// because `install_on_fit_pool` could not build a pool (`api/pool.rs`) says
+/// nothing about the model at all, and writing *that* down as final would let
+/// one bad minute mark a fittable model dead for the rest of the search's life.
+///
+/// From inside the runner the two are one `String`, which is why the
+/// classification is made where the failure is raised rather than recovered
+/// from the message afterwards.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandidateError {
+    /// What went wrong, as shown in the report.
+    pub message: String,
+    /// `true` when the failure describes the run rather than the candidate, so
+    /// a resumed run should fit it again instead of trusting the row.
+    pub retryable: bool,
+}
+
+impl CandidateError {
+    /// A failure that is a property of the candidate itself — a model that does
+    /// not compile, or does not bind against this run's data. Deterministic, so
+    /// a resume reuses it.
+    pub fn model(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    /// A failure raised by the run rather than by the candidate. A resume
+    /// refits it.
+    ///
+    /// This is the default for anything `fit()` itself returns. Note that the
+    /// *expected* bad outcome of a search candidate — a fit that finishes but
+    /// does not converge — is not an error at all: it comes back `Ok` and is
+    /// judged by [`check_strictness`](ferx_core::check_strictness), so it is
+    /// journalled and reused like any other result. An `Err` out of `fit()` is
+    /// the pathological case, and refitting it is cheap because it is rare.
+    pub fn environment(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: true,
+        }
+    }
+}
+
+impl std::fmt::Display for CandidateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 /// One candidate's outcome.
 ///
 /// A candidate that failed its strictness gate, failed to compile or failed to
@@ -291,8 +348,9 @@ pub struct CandidateResult {
     pub criterion: f64,
     /// Wall-clock seconds the fit took; `0.0` for a reused or duplicate result.
     pub seconds: f64,
-    /// Why there is no fit, when that is the reason.
-    pub error: Option<String>,
+    /// Why there is no fit, when that is the reason — and whether a resumed run
+    /// will take the candidate's word for it. See [`CandidateError`].
+    pub error: Option<CandidateError>,
     /// Set when this candidate rendered to the same canonical text as an
     /// earlier one in the same run: the named id is the one that was fitted,
     /// and this result carries its criterion and verdict.

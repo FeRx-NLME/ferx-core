@@ -29,7 +29,10 @@
 //!   finishes and a resumed run refits only what is missing — see
 //!   [`super::journal`]. The directory is claimed for the length of the run
 //!   ([`journal::DirLock`]), because two runs sharing one silently destroy each
-//!   other's journal.
+//!   other's journal; a claim whose owner was hard-killed is taken over rather
+//!   than needing a manual delete. What is refitted is decided by
+//!   [`CandidateError::retryable`]: a model that does not compile is remembered,
+//!   a fit the *machine* failed is tried again.
 //! * **Cancellation.** A flipped [`CancelFlag`] stops the run *between*
 //!   candidates and returns what finished, with [`RunReport::cancelled`] set.
 //!   Its partial rows go to `candidates.partial.csv`, never over the complete
@@ -59,7 +62,7 @@ use ferx_core::{
 };
 use rayon::prelude::*;
 
-use super::candidate::{Candidate, CandidateResult, RunOptions};
+use super::candidate::{Candidate, CandidateError, CandidateResult, RunOptions};
 use super::journal::{self, CandidateRecord, Journal, SearchManifest};
 use super::output;
 
@@ -197,7 +200,7 @@ impl Runner {
         fitter: F,
     ) -> Result<RunReport, String>
     where
-        F: Fn(&Candidate, usize) -> Result<FitResult, String> + Sync,
+        F: Fn(&Candidate, usize) -> Result<FitResult, CandidateError> + Sync,
     {
         reject_duplicate_ids(candidates)?;
 
@@ -461,10 +464,10 @@ fn reject_duplicate_ids(candidates: &[Candidate]) -> Result<(), String> {
 
 /// The verdict of a candidate that produced no fit at all. Not `passed`, and
 /// the reason is the failure itself.
-fn failed_verdict(error: &str) -> StrictnessVerdict {
+fn failed_verdict(error: &CandidateError) -> StrictnessVerdict {
     StrictnessVerdict {
         passed: false,
-        failures: vec![format!("no fit: {error}")],
+        failures: vec![format!("no fit: {}", error.message)],
         skipped: Vec::new(),
     }
 }
@@ -482,7 +485,8 @@ fn record_of(result: &CandidateResult) -> CandidateRecord {
         failures: result.verdict.failures.clone(),
         skipped: result.verdict.skipped.clone(),
         seconds: result.seconds,
-        error: result.error.clone(),
+        error: result.error.as_ref().map(|e| e.message.clone()),
+        retryable: result.error.as_ref().is_some_and(|e| e.retryable),
         has_fit: result.fit.is_some(),
     }
 }
@@ -515,7 +519,10 @@ fn reused_result(
         },
         criterion: record.criterion.unwrap_or(f64::NAN),
         seconds: record.seconds,
-        error: record.error.clone(),
+        error: record.error.clone().map(|message| CandidateError {
+            message,
+            retryable: record.retryable,
+        }),
         duplicate_of: None,
         reused: true,
     }
@@ -539,18 +546,16 @@ fn load_resumable(dir: &Path, manifest: &SearchManifest) -> Result<Vec<Candidate
     let mut seen: HashSet<String> = HashSet::new();
     let mut kept = Vec::new();
     for record in journal::read_records(&journal::journal_path(dir)) {
-        // A row with an `error` is not reused. `error` means the candidate
-        // produced no fit at all, and the runner cannot tell *why* from here:
-        // a model that does not compile fails the same way as one whose fit
-        // hit a transient resource limit — `install_on_fit_pool` returns `Err`
-        // when the machine is briefly out of threads. Carrying that forward
+        // A *retryable* failure is not reused. The row says the run failed, not
+        // that the candidate is bad — `install_on_fit_pool` returns `Err` when
+        // the machine is briefly out of threads — and carrying that forward
         // would have one bad minute permanently mark a fittable model as
-        // unfittable in every later resume. Refitting a genuinely broken
-        // candidate costs a parse; believing a false failure costs the search.
+        // unfittable in every later resume. A model that does not compile is
+        // kept, because it will not compile next time either.
         //
-        // Filtered *before* the dedup below, or an error row would consume the
-        // hash and hide the successful refit appended after it.
-        if record.error.is_some() {
+        // Filtered *before* the dedup below, or a discarded row would consume
+        // the hash and hide the successful refit appended after it.
+        if record.error.is_some() && record.retryable {
             continue;
         }
         // A hash appearing twice — two runs over the same directory — keeps the
@@ -580,15 +585,26 @@ fn compile_and_fit(
     options: &RunOptions,
     threads_per_fit: usize,
     cancel: &Option<CancelFlag>,
-) -> Result<FitResult, String> {
+) -> Result<FitResult, CandidateError> {
+    // Compilation and binding are properties of the candidate and this run's
+    // data, both of which the resume manifest pins — so they fail the same way
+    // every time and a resumed run can trust the row rather than re-deriving
+    // it. Everything below `fit()` is classified the other way; see
+    // [`CandidateError`].
     let text = candidate.model.render();
-    let mut parsed = parse_full_model(&text)
-        .map_err(|e| format!("candidate `{}` does not compile: {e}", candidate.id))?;
+    let mut parsed = parse_full_model(&text).map_err(|e| {
+        CandidateError::model(format!(
+            "candidate `{}` does not compile: {e}",
+            candidate.id
+        ))
+    })?;
     let mut population = Cow::Borrowed(data);
     if !parsed.model.theta_blocks().level_blocks().is_empty() {
-        bind_theta_levels(&mut parsed, &text, population.to_mut())?;
+        bind_theta_levels(&mut parsed, &text, population.to_mut())
+            .map_err(CandidateError::model)?;
     }
-    ferx_core::api::bind_covariate_stats(&mut parsed, &text, &population)?;
+    ferx_core::api::bind_covariate_stats(&mut parsed, &text, &population)
+        .map_err(CandidateError::model)?;
 
     // The caller's settings replace the file's wholesale when given; the four
     // overrides below are the runner's own and always win.
@@ -621,7 +637,12 @@ fn compile_and_fit(
     fit_options.threads = Some(threads_per_fit);
     fit_options.cancel = cancel.clone();
 
-    fit(&parsed.model, &population, &init_params, &fit_options)
+    // Retryable, because the thing `fit()` most plausibly fails on here is the
+    // machine rather than the model: `install_on_fit_pool` returns `Err` when a
+    // pool cannot be built, and the model-shaped bad outcome — a fit that
+    // finishes without converging — is an `Ok` judged by the strictness gate,
+    // not an error at all.
+    fit(&parsed.model, &population, &init_params, &fit_options).map_err(CandidateError::environment)
 }
 
 #[cfg(test)]

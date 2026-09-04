@@ -25,6 +25,7 @@ fn record(id: &str, hash: &str) -> CandidateRecord {
         skipped: vec![],
         seconds: 1.5,
         error: None,
+        retryable: false,
         has_fit: false,
     }
 }

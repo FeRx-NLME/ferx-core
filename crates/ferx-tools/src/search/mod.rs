@@ -43,7 +43,9 @@ mod runner;
 #[cfg(test)]
 mod test_support;
 
-pub use candidate::{Candidate, CandidateResult, Criterion, FeatureVector, RunOptions};
+pub use candidate::{
+    Candidate, CandidateError, CandidateResult, Criterion, FeatureVector, RunOptions,
+};
 pub use journal::{CandidateRecord, SearchManifest};
 pub use output::{partial_table_path, table_path, COLUMNS as TABLE_COLUMNS};
 pub use runner::{RunReport, Runner};
