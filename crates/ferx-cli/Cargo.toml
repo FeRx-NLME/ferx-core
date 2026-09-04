@@ -28,7 +28,9 @@ path = "src/main.rs"
 ferx-core = { path = "../..", version = "0.3.1", default-features = false }
 ferx-tools = { path = "../ferx-tools", version = "0.3.1" }
 indicatif = "0.18.4"
-serde_json = "1"
+# Matches the root package and `ferx-tools`: see the note there — floats must
+# reload as themselves, not to within 1 ULP.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 
 [dev-dependencies]
 tempfile = "3"

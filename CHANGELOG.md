@@ -117,6 +117,29 @@ section of the SDLC for the versioning policy).
   of one-cycle integrations back.
 
 ### Added
+- **A shared candidate runner for model-space search (#1178, part of #1175).**
+  `ferx_tools::search::Runner` fits a list of candidate models in parallel and returns each
+  one scored: the ranking criterion (`ofv`, `aic`, or any of the four BIC variants), the
+  `Strictness` verdict with the reasons for every gate it failed, and the fit itself.
+  Candidates are identified by the canonical hash of their model text, so a model reached
+  twice by two different edit paths is fitted **once**; with a cache directory each outcome is
+  journalled as it finishes, so an interrupted overnight search resumes and refits only what
+  is missing, and every candidate — including the ones that failed to compile, failed to fit
+  or failed the gate — appears in `candidates.csv` with its reason rather than being dropped.
+  The thread budget splits across both levels of parallelism via `PoolPlan` (#1115) instead of
+  nesting Rayon pools, and a `CancelFlag` stops a search between candidates and returns the
+  partial results — into `candidates.partial.csv`, so cancelling a resumed run never overwrites
+  the complete table of the run it resumed. The cache directory is claimed for the length of a
+  run (`search.lock`) because two runs sharing one would silently destroy each other's journal,
+  and a directory that cannot be written costs the resume and the report rather than the fits:
+  those failures come back on `RunReport::warnings` with the results intact. A lock whose owner
+  was hard-killed is taken over automatically, so resuming after a kill — the case the journal
+  exists for — never needs a file deleted by hand. A candidate that produced no fit carries a
+  `CandidateError` saying whether the failure was the *model* (it does not compile: remembered,
+  and reported without refitting) or the *run* (a fit pool that could not be built: refitted on
+  the next resume), so one bad minute cannot permanently mark a fittable model as unfittable.
+  This is the orchestration layer the covariate, structural, variability and residual-error
+  searches of #1175 are built on.
 - **BIC variants and a `Strictness` gate for candidate ranking (#1177, part of #1175).**
   `ferx_core::bic(&result, BicType::{Mixed, Iiv, Random, Fixed})` computes the four
   conventions of `pharmpy.modeling.calculate_bic` from a finished `FitResult` — the
@@ -142,6 +165,14 @@ section of the SDLC for the versioning policy).
   marked fixed, which is what it meant at the time.
 
 ### Fixed
+- **Numbers written to JSON now reload as themselves, bit for bit (#1178).** `serde_json`
+  parses floats with a fast algorithm accurate only to within 1 ULP unless its
+  `float_roundtrip` feature is enabled, which it now is across `ferx-core`, `ferx-tools` and
+  the CLI. Anything that writes a number and reads it back — a `.fitrx` bundle, a search
+  journal, a cached fit — could otherwise return an estimate one bit from the one that was
+  computed, and do it invisibly, since every printed form rounds long before that digit. The
+  case that caught it was a resumed candidate search reporting a criterion of
+  `-200.28784144636057` for a fit that scored `-200.28784144636055`.
 - **`n_parameters`, AIC and BIC no longer count the structural zeros of a mixed
   `block_omega` + diagonal `omega` as estimated parameters (#1177).** The cross-block
   Cholesky entries of such an Ω are pinned, never searched, and the covariance step already
@@ -279,7 +310,9 @@ section of the SDLC for the versioning policy).
   `P = TVP * exp(ETA_P)` form and is a hard error naming the parameter on anything else, never
   a silent wrong edit. `ModelText::canonical_hash` gives a candidate a stable identity — equal
   across comment and whitespace changes, different for every semantic one — for use as a fit
-  cache key. This is the prerequisite for the model-search tooling in #1175.
+  cache key; a `#` or `//` inside a quoted value is content, not a comment, so two candidates
+  differing only in a quoted path (`"s3://bucket/a.csv"` vs `.../b.csv`) are two candidates.
+  This is the prerequisite for the model-search tooling in #1175.
 - **A cancellable bootstrap (#1161).** `BootstrapOptions::cancel` takes a `CancelFlag`; setting
   it from another thread stops a long `ferx_tools::bootstrap` run at the next replicate boundary
   and returns the new `BootstrapError::Cancelled`, so a caller reports an abort as an abort
