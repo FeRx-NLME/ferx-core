@@ -114,7 +114,14 @@ jobs:
         # suite — and it would couple the linter to the `ferx-core` compile path, which is
         # exactly what keeping it dependency-free was for (#969). The guard reads this
         # `--exclude` list, so adding or dropping one moves the path filter with it.
+        #
+        # `ferx-core/nn`: the covariate-NN Tier-3 fits (`tests/nn_fit_smoke.rs`,
+        # `tests/nn_fit_convergence.rs`, `nn::regularizer_fit_tests`) are gated on BOTH
+        # `nn` and `slow-tests`. Without `nn` here those files compile to empty
+        # binaries and the `src/` bodies are `#[cfg]`ed out, so the only fits that
+        # exercise the DCM regularizers end to end would run in no CI job at all
+        # (the per-PR job that passes `nn` has no `slow-tests`, by design).
         run: |
           cargo test --workspace --exclude docs-lint --no-default-features \
-            --features ferx-core/ci,ferx-core/survival,ferx-core/slow-tests,ferx-tools/slow-tests \
+            --features ferx-core/ci,ferx-core/survival,ferx-core/nn,ferx-core/slow-tests,ferx-tools/slow-tests \
             --profile ci-test --no-fail-fast

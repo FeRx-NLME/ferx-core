@@ -2707,6 +2707,8 @@ pub ferx_core::types::FitOptions::mu_referencing: bool
 pub ferx_core::types::FitOptions::multi_start_seed: core::option::Option<u64>
 pub ferx_core::types::FitOptions::n_agq: usize
 pub ferx_core::types::FitOptions::n_starts: usize
+pub ferx_core::types::FitOptions::nn_l2_lambda: f64
+pub ferx_core::types::FitOptions::nn_smooth_lambda: f64
 pub ferx_core::types::FitOptions::npde_nsim: usize
 pub ferx_core::types::FitOptions::npde_seed: core::option::Option<u64>
 pub ferx_core::types::FitOptions::ode_abstol: f64
@@ -4073,6 +4075,8 @@ pub ferx_core::FitOptions::mu_referencing: bool
 pub ferx_core::FitOptions::multi_start_seed: core::option::Option<u64>
 pub ferx_core::FitOptions::n_agq: usize
 pub ferx_core::FitOptions::n_starts: usize
+pub ferx_core::FitOptions::nn_l2_lambda: f64
+pub ferx_core::FitOptions::nn_smooth_lambda: f64
 pub ferx_core::FitOptions::npde_nsim: usize
 pub ferx_core::FitOptions::npde_seed: core::option::Option<u64>
 pub ferx_core::FitOptions::ode_abstol: f64

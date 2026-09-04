@@ -563,6 +563,26 @@ Setting `global_search = true` runs a gradient-free pre-search (NLopt CRS2-LM) b
 
 The number of global evaluations is auto-scaled based on the number of parameters and observations, or can be set explicitly with `global_maxeval`.
 
+## Covariate-NN regularization (`nn_l2`, `nn_smooth`)
+
+Two optional penalties regularize the small MLP behind a [`[covariate_nn]`](covariate-nn.qmd) (DCM) block. Both are **NN-only**, take a non-negative strength, and **default to `0.0` (off)** — a strict no-op that leaves non-NN and unregularized-NN fits byte-identical. They are added to the population objective the optimizer minimizes, each with a matching analytic gradient term (and the penalty's curvature where the optimizer builds a Hessian), and apply across the **FOCE-family** methods: `foce` / `focei` / `laplace` under every outer optimizer (`bobyqa`, `slsqp`, `nlopt_lbfgs`, `mma`, `trust_region`, and the built-in BFGS) and `gn` / `gn_hybrid`. `saem`, `imp`, `impmap`, `bayes` and `vi` do not apply them: setting either key with one of those as the final stage warns and fits unregularized.
+
+| Key | Range | Default | Description |
+|-----|-------|---------|-------------|
+| `nn_l2` | float ≥ 0 | `0.0` | L2 (weight-decay) strength. Adds `nn_l2 · Σ wᵢ²` over the network's **weight** matrices only (bias terms are left free). Shrinks all weights toward 0, damping spurious covariate-driven variation whose magnitude otherwise grows with network capacity. |
+| `nn_smooth` | float ≥ 0 | `0.0` | Smoothness (curvature) strength. Penalizes the finite-difference 2nd derivative `C = f(x+h) − 2·f(x) + f(x−h)` of each output along every input's marginal partial-dependence curve, i.e. `nn_smooth · Σ C²`. The curve is swept in the **network's input space** (`(x − center) / scale`, the values the MLP actually sees) in steps of a quarter of the input's observed sd, other inputs held at their median; wide-range inputs get a coarser step over the full range rather than a truncated one. Punishes high-frequency *wiggles* in the learned covariate→modulator curves while leaving monotone slopes free — it targets curvature, not slope. The grid mirrors the partial-dependence curves used in downstream diagnostics, so it smooths exactly what those plots show. |
+
+Motivation: on a null covariate structure (no true effect) an unregularized DCM invents spurious covariate-driven variation that scales with net capacity, with sharp wiggles at higher capacity. `nn_l2` shrinks all weights; `nn_smooth` targets the wiggles directly. The two are independently toggleable.
+
+**Reported OFV is unpenalized.** The optimizer minimizes the penalized objective, but `fit$ofv` — and therefore AIC/BIC — report the **unpenalized −2·log-likelihood**, so a regularized DCM's information criteria stay directly comparable to an analytic-covariate model's. The `optimizer_trace` `ofv` column, the checkpoint and the verbose `Eval`/`Iter` lines carry that same unpenalized value. What *is* penalized: `final_gradient` (the gradient of the objective the fit converged on), the ranking of multi-start candidates and of the `gn_hybrid` phases (so a heavier λ cannot lose to a start that merely fits the data better), and the convergence gates. Standard errors are still the curvature of the unpenalized objective at the regularized optimum — see the [covariate-NN page](covariate-nn.qmd#regularization-nn_l2-nn_smooth) for how to read NN-weight SEs under a strong λ. (Set via the model file `[fit_options]` block or, in ferx-r, `ferx_fit(settings = list(nn_l2 = ..., nn_smooth = ...))` — the same code path.)
+
+```
+[fit_options]
+  method    = focei
+  nn_l2     = 1e-2
+  nn_smooth = 1e-1
+```
+
 ## Examples
 
 Standard FOCEI with defaults:

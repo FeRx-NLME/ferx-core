@@ -979,6 +979,11 @@ fn run_global_presearch(
     let n_evals_cl = Arc::clone(&n_evals);
     let verbose = options.verbose;
 
+    // Covariate-NN (DCM) regularizer, built once from the observed covariate
+    // distribution + NN architecture. A strict no-op when both λ are 0, so the
+    // pre-search objective stays byte-identical for unregularized fits.
+    let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, options);
+
     // Helper: evaluate the FOCE OFV at a single point in scaled space,
     // independent of any NLopt state. Used to compute the user's initial
     // OFV up-front (for the keep-best-of-(user, CRS2-LM) compare below).
@@ -999,7 +1004,8 @@ fn run_global_presearch(
             options.inner_restarts,
         );
         let nll = pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
-        let raw = 2.0 * nll;
+        // Penalized objective fed to the optimizer (unregularized fits unchanged).
+        let raw = 2.0 * nll + nn_reg.penalty_value(&params.theta);
         let guarded = ebe_guard_rejects(&ebe_stats, n_subj, raw, options.max_unconverged_frac);
         if !raw.is_finite() || guarded {
             1e20
@@ -1040,7 +1046,8 @@ fn run_global_presearch(
         );
 
         let nll = pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
-        let raw_ofv = 2.0 * nll;
+        // Penalized objective fed to the optimizer (unregularized fits unchanged).
+        let raw_ofv = 2.0 * nll + nn_reg.penalty_value(&params.theta);
 
         let ebe_guard =
             ebe_guard_rejects(&ebe_stats, n_subj, raw_ofv, options.max_unconverged_frac);
@@ -1358,12 +1365,18 @@ fn optimize_nlopt(
     options: &FitOptions,
 ) -> OuterResult {
     let first = optimize_nlopt_once(model, population, init_params, options, false);
+    // The attempts minimised the *penalized* objective (covariate-NN
+    // regularization), so they are ranked on it too: `result.ofv` is the clean
+    // −2LL, and comparing that alone would prefer the less-regularized attempt —
+    // the opposite of what the penalty asks for. A no-op (`+ 0.0`) when
+    // unregularized.
+    let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, options);
     resolve_stall_retry(
         options.optimizer,
         options.verbose,
         first,
         || optimize_nlopt_once(model, population, init_params, options, true),
-        |result| result.ofv,
+        |result| result.ofv + nn_reg.penalty_value(&result.params.theta),
     )
 }
 
@@ -1424,6 +1437,16 @@ fn optimize_nlopt_once(
     let n_eta = model.n_eta;
 
     let mut warnings = Vec::new();
+
+    // Covariate-NN (DCM) regularizer (L2 + smoothness). No-op when both λ are 0,
+    // so the penalized objective/gradient below stay byte-identical for
+    // unregularized fits. The optimizer (and everything that ranks or gates on
+    // what it minimised — `best_ofv`, stagnation, `best_seen`, the stall retry)
+    // sees the penalized objective; everything user-facing (verbose `Eval`
+    // lines, the trace, the checkpoint, the plateau self-consistency check, and
+    // the reported OFV/AIC/BIC) sees the clean −2LL, which is what `final_ofv`
+    // recomputes from a fresh `pop_nll_opts` at the end.
+    let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, options);
 
     // Per-element scale factors: present O(1) coordinates to NLopt.
     //
@@ -1532,9 +1555,13 @@ fn optimize_nlopt_once(
     // point, not the best one — when the stagnation guard short-circuits
     // by returning `best_ofv` with zero gradient, the optimizer can drift
     // a step or two off the true minimum before its xtol/ftol fires. We
-    // track the best (xs, ofv) externally and restore x0 to it after
-    // optimize() returns, before the final inner loop and covariance step.
-    let best_seen: Arc<Mutex<Option<(Vec<f64>, f64)>>> = Arc::new(Mutex::new(None));
+    // track the best `(xs, ofv, ofv_clean)` externally and restore x0 to it
+    // after optimize() returns, before the final inner loop and covariance
+    // step. `ofv` is what the optimizer minimised (penalized under covariate-NN
+    // regularization) and ranks the points; `ofv_clean` is the −2LL at the same
+    // point, kept so the plateau self-consistency check compares it against the
+    // equally clean `final_ofv` instead of against a penalized number.
+    let best_seen: Arc<Mutex<Option<(Vec<f64>, f64, f64)>>> = Arc::new(Mutex::new(None));
     let best_seen_cl = Arc::clone(&best_seen);
 
     let last_gradient: Arc<Mutex<Option<Vec<f64>>>> = Arc::new(Mutex::new(None));
@@ -1676,6 +1703,23 @@ fn optimize_nlopt_once(
             let nll = pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
             (ehs, hms, ebe_stats, kappas, 2.0 * nll)
         };
+        // Penalized objective fed to the optimizer (unregularized fits unchanged).
+        // When a gradient is wanted the penalty gradient comes out of the same
+        // pass (one network evaluation per curvature node) and is spliced into
+        // `grad_raw` below; `clean_ofv` keeps the −2LL for the user-facing
+        // streams.
+        let clean_ofv = raw_ofv;
+        let mut nn_grad: Vec<f64> = if grad.is_some() && nn_reg.is_active() {
+            vec![0.0; n]
+        } else {
+            Vec::new()
+        };
+        let nn_penalty = if nn_grad.is_empty() {
+            nn_reg.penalty_value(&params.theta)
+        } else {
+            nn_reg.penalty_and_gradient(&params.theta, &mut nn_grad)
+        };
+        let raw_ofv = raw_ofv + nn_penalty;
 
         // EBE convergence guard: reject step when too many subjects unconverged or any
         // subject was hard-rejected at its inner start.
@@ -1706,6 +1750,10 @@ fn optimize_nlopt_once(
         } else {
             raw_ofv
         };
+        // The −2LL twin of `ofv` for the user-facing streams (trace, checkpoint,
+        // verbose lines, plateau check). Identical to `ofv` unless a covariate-NN
+        // penalty is on; a guarded eval carries its sentinel in both.
+        let ofv_clean = if guarded { ofv } else { clean_ofv };
 
         // Compute gradient if requested (central FD with fixed EBEs)
         let mut grad_norm_for_trace: Option<f64> = None;
@@ -1727,7 +1775,7 @@ fn optimize_nlopt_once(
                 // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x); then scale for optimizer space.
                 // Mixture (#977 Phase 4): analytic posterior-weighted gradient,
                 // FD fallback when out of analytic scope.
-                let grad_raw = if let Some(mev) = &mixeval {
+                let mut grad_raw = if let Some(mev) = &mixeval {
                     crate::estimation::mixture::mixture_gradient(
                         model, population, &params, options, mev,
                     )
@@ -1755,6 +1803,17 @@ fn optimize_nlopt_once(
                         &mut state.n_grad_evals,
                     )
                 };
+                // Splice in the NN penalty gradient (computed above, in the same
+                // pass as its value). It lands in packed-x space: NN weights are
+                // identity-packed, so a natural-space weight coordinate *is* a
+                // packed coordinate. The `* scale[k]` below is the chain rule
+                // `x = x_s · scale` and applies to this term exactly as it does
+                // to the likelihood part — do not "simplify" it away for the
+                // penalty on the strength of NN scales usually being 1.0;
+                // `compute_scale` gives any |w| > 0.1 a non-unit scale.
+                for (gk, nk) in grad_raw.iter_mut().zip(&nn_grad) {
+                    *gk += nk;
+                }
                 let mut sq = 0.0_f64;
                 for k in 0..g.len() {
                     let gi = if grad_raw[k].is_finite() {
@@ -1786,7 +1845,7 @@ fn optimize_nlopt_once(
                         .lock()
                         .unwrap()
                         .as_ref()
-                        .map(|(_, o)| *o)
+                        .map(|(_, o, _)| *o)
                         .unwrap_or(f64::INFINITY);
                     if ofv < global_best {
                         *last_gradient_cl.lock().unwrap() = Some(grad_raw.clone());
@@ -1803,7 +1862,14 @@ fn optimize_nlopt_once(
         if ofv < state.best_ofv {
             state.best_ofv = ofv;
             if verbose {
-                eprintln!("Eval {:>4}: OFV = {:.6}", state.n_evals, ofv);
+                if nn_reg.is_active() {
+                    eprintln!(
+                        "Eval {:>4}: OFV = {:.6} (penalized objective {:.6})",
+                        state.n_evals, ofv_clean, ofv
+                    );
+                } else {
+                    eprintln!("Eval {:>4}: OFV = {:.6}", state.n_evals, ofv);
+                }
             }
         }
         // Record the *feasible*-eval index at which the feasible best OFV last
@@ -1836,8 +1902,8 @@ fn optimize_nlopt_once(
         // optimizer drifts away from it before terminating.
         {
             let mut bs = best_seen_cl.lock().unwrap();
-            if bs.as_ref().is_none_or(|(_, prev)| ofv < *prev) {
-                *bs = Some((xs.to_vec(), ofv));
+            if bs.as_ref().is_none_or(|(_, prev, _)| ofv < *prev) {
+                *bs = Some((xs.to_vec(), ofv, ofv_clean));
             }
         }
         // After updating best_ofv, check whether we've stalled. If yes,
@@ -1882,7 +1948,7 @@ fn optimize_nlopt_once(
             crate::estimation::trace::write_foce(
                 state.n_evals,
                 method_str,
-                ofv,
+                ofv_clean,
                 grad_norm_for_trace,
                 step_norm,
                 optimizer_str,
@@ -1898,7 +1964,7 @@ fn optimize_nlopt_once(
         // per-eval allocation on the (default) no-checkpoint-due path.
         if crate::io::checkpoint::is_due() {
             let packed = crate::estimation::parameterization::pack_params(&params);
-            crate::io::checkpoint::maybe_write(state.n_evals, ofv, &packed);
+            crate::io::checkpoint::maybe_write(state.n_evals, ofv_clean, &packed);
         }
 
         state.prev_x = xs.to_vec();
@@ -2062,16 +2128,20 @@ fn optimize_nlopt_once(
     // gradient and the optimizer can drift off the true minimum before
     // termination. Replacing `x0` with the best-seen xs guarantees the
     // final inner loop and covariance step run at the actual minimum.
+    // `best_seen_ofv` is the *clean* −2LL at the restored point: it is compared
+    // against the equally clean `final_ofv` in the plateau self-consistency
+    // check below, and mixing a penalized best with a clean final would loosen
+    // that check by exactly the penalty magnitude.
     let mut best_seen_ofv: Option<f64> = None;
-    if let Some((best_xs, best_ofv)) = best_seen.lock().unwrap().clone() {
+    if let Some((best_xs, _best_penalized, best_clean)) = best_seen.lock().unwrap().clone() {
         if best_xs.len() == n {
             x0.copy_from_slice(&best_xs);
-            best_seen_ofv = Some(best_ofv);
+            best_seen_ofv = Some(best_clean);
             if options.verbose {
                 eprintln!(
                     "Restored best-seen point (OFV = {:.6}) for final inner loop \
                      and covariance step.",
-                    best_ofv,
+                    best_clean,
                 );
             }
         }
@@ -2290,6 +2360,22 @@ fn optimize_bfgs(
     let mut warnings = Vec::new();
     let mut cached_etas: Vec<DVector<f64>> = vec![DVector::zeros(n_eta); n_subj];
 
+    // Covariate-NN (DCM) regularizer. No-op when both λ are 0. Penalty is added
+    // to the optimizer-facing `f_only`/`fdfg` values (and `fdfg`'s gradient) but
+    // NOT to `ofv_at_fixed`, which the final reported OFV reuses — so the
+    // reported OFV/AIC/BIC stay the unpenalized −2LL. The trace, checkpoint and
+    // verbose `Iter` lines report the clean value too (`clean_ofv_at` below).
+    let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, options);
+    // The −2LL behind a penalized objective value at scaled point `xs`: what the
+    // user-facing streams print, so they agree with the reported `Final OFV`.
+    let clean_ofv_at = |xs: &[f64], f_penalized: f64, scale: &[f64]| -> f64 {
+        if !nn_reg.is_active() {
+            return f_penalized;
+        }
+        let x_real: Vec<f64> = xs.iter().zip(scale).map(|(v, s)| v * s).collect();
+        f_penalized - nn_reg.penalty_value(&unpack_params(&x_real, init_params).theta)
+    };
+
     // Closures operating on unscaled real (log/Cholesky) space.
     let ofv_at_fixed = |x: &[f64],
                         eta_hats: &[DVector<f64>],
@@ -2316,7 +2402,9 @@ fn optimize_bfgs(
             options.min_obs_for_convergence_check as usize,
             options.inner_restarts,
         );
-        let ofv = 2.0 * pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
+        // Penalized objective fed to the optimizer (unregularized fits unchanged).
+        let ofv = 2.0 * pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options)
+            + nn_reg.penalty_value(&params.theta);
         if ofv.is_finite() {
             ofv
         } else {
@@ -2343,7 +2431,7 @@ fn optimize_bfgs(
         );
         let ofv = ofv_at_fixed(x, &ehs, &hms, &kappas);
         // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x).
-        let g = population_gradient(
+        let mut g = population_gradient(
             x,
             n_subj,
             init_params,
@@ -2356,6 +2444,10 @@ fn optimize_bfgs(
             options,
             grad_eval_idx,
         );
+        // Penalized value + matching gradient fed to the optimizer (unregularized
+        // fits unchanged), in one pass. `ofv_at_fixed` above stays clean for
+        // final reporting.
+        let ofv = ofv + nn_reg.penalty_and_gradient(&params.theta, &mut g);
         let f = if ofv.is_finite() { ofv } else { 1e20 };
         (f, g, ehs, hms)
     };
@@ -2429,7 +2521,11 @@ fn optimize_bfgs(
     };
 
     if options.verbose {
-        eprintln!("Iter {:>4}: OFV = {:.6}", 0, f_val);
+        eprintln!(
+            "Iter {:>4}: OFV = {:.6}",
+            0,
+            clean_ofv_at(&xs, f_val, &scale)
+        );
     }
 
     // Two outer Hessian strategies share this loop: `Optimizer::Lbfgs` uses a
@@ -2557,7 +2653,10 @@ fn optimize_bfgs(
         if options.verbose && (iter % 10 == 0 || iter <= 5) {
             eprintln!(
                 "Iter {:>4}: OFV = {:.6}  |g| = {:.2e}  alpha = {:.2e}",
-                iter, f_val, g_norm, alpha
+                iter,
+                clean_ofv_at(&xs, f_val, &scale),
+                g_norm,
+                alpha
             );
         }
 
@@ -2586,7 +2685,7 @@ fn optimize_bfgs(
             crate::estimation::trace::write_foce(
                 iter,
                 method_str,
-                f_val,
+                clean_ofv_at(&xs, f_val, &scale),
                 Some(g_norm),
                 Some(step_norm),
                 optimizer_str,
@@ -2601,7 +2700,7 @@ fn optimize_bfgs(
         // due (the trace's `x_real` is scoped to the trace block above).
         if crate::io::checkpoint::is_due() {
             let x_real: Vec<f64> = (0..n).map(|i| xs[i] * scale[i]).collect();
-            crate::io::checkpoint::maybe_write(iter, f_val, &x_real);
+            crate::io::checkpoint::maybe_write(iter, clean_ofv_at(&xs, f_val, &scale), &x_real);
         }
 
         let rel_change = (f_val - prev_ofv).abs() / (f_val.abs() + 1.0);

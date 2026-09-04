@@ -63,6 +63,10 @@ fn build_neural_network_infos(model: &CompiledModel) -> Vec<NeuralNetworkInfo> {
 #[path = "tests/nn_info_tests.rs"]
 mod nn_info_tests;
 
+#[cfg(all(test, feature = "nn"))]
+#[path = "tests/nn_regularization_warning_tests.rs"]
+mod nn_regularization_warning_tests;
+
 /// High-level fit: model file path + data file path → FitResult
 ///
 /// `data_path` is `None` to rely solely on the model's own `[data]` block
@@ -216,6 +220,69 @@ pub(crate) fn multistart_prefers(b_ofv: f64, b_conv: bool, c_ofv: f64, c_conv: b
         (true, false) => false,
         _ => (!b_conv && c_conv) || (b_conv == c_conv && c_ofv < b_ofv),
     }
+}
+
+/// Whether an estimation method's outer optimizer applies the covariate-NN
+/// regularization penalties (`nn_l2` / `nn_smooth`). The FOCE family does —
+/// every outer optimizer under `foce` / `focei` / `laplace` (NLopt, built-in
+/// BFGS, trust-region) and both Gauss–Newton variants. SAEM, IMP/IMPMAP, Bayes
+/// and VI do not touch the penalty.
+pub(crate) fn applies_nn_regularization(method: EstimationMethod) -> bool {
+    matches!(
+        method,
+        EstimationMethod::Foce
+            | EstimationMethod::FoceI
+            | EstimationMethod::Laplace
+            | EstimationMethod::FoceGn
+            | EstimationMethod::FoceGnHybrid
+    )
+}
+
+/// A pre-run warning when `nn_l2` / `nn_smooth` are set but the chain's final
+/// stage does not apply them (see [`applies_nn_regularization`]). `None` when
+/// both are `0.0`, when the model has no `[covariate_nn]` block (the penalty
+/// is then a no-op regardless of method), or when the final stage does apply
+/// them — an earlier non-FOCE stage in a chain like `[saem, focei]` is fine,
+/// since the regularized stage is the one whose estimates are reported.
+pub(crate) fn nn_regularization_unapplied_warning(
+    model: &CompiledModel,
+    options: &FitOptions,
+    chain: &[EstimationMethod],
+) -> Option<String> {
+    let set: Vec<&str> = [
+        ("nn_l2", options.nn_l2_lambda),
+        ("nn_smooth", options.nn_smooth_lambda),
+    ]
+    .into_iter()
+    .filter(|(_, l)| *l > 0.0)
+    .map(|(k, _)| k)
+    .collect();
+    if set.is_empty() || !model_has_covariate_nn(model) {
+        return None;
+    }
+    let last = *chain.last()?;
+    if applies_nn_regularization(last) {
+        return None;
+    }
+    Some(format!(
+        "{} {} set but the final estimation stage (`{}`) does not apply covariate-NN \
+         regularization — the fit is unregularized. The penalties are applied by the \
+         FOCE-family methods (foce, focei, laplace, gn, gn_hybrid); use one of those as the \
+         final stage, or drop the option.",
+        set.join(" / "),
+        if set.len() == 1 { "is" } else { "are" },
+        last.label(),
+    ))
+}
+
+#[cfg(feature = "nn")]
+fn model_has_covariate_nn(model: &CompiledModel) -> bool {
+    !model.covariate_nns.is_empty()
+}
+
+#[cfg(not(feature = "nn"))]
+fn model_has_covariate_nn(_model: &CompiledModel) -> bool {
+    false
 }
 
 /// Main fit entry point: CompiledModel + Population → FitResult.
@@ -736,7 +803,13 @@ pub fn fit(
     let results: Vec<(usize, Result<FitResult, String>)> =
         install_on_fit_pool(options, par_starts)?;
 
-    // Pick the best start (see `multistart_prefers` for the ranking).
+    // Pick the best start (see `multistart_prefers` for the ranking). Under
+    // covariate-NN regularization every start minimised the *penalized*
+    // objective, so the ranking uses it too: `FitResult.ofv` is the clean −2LL,
+    // and ranking on that alone would crown the least-regularized start — the
+    // opposite of what the penalty asks for. `+ 0.0` when unregularized.
+    let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, options);
+    let rank_ofv = |r: &FitResult| r.ofv + nn_reg.penalty_value(&r.theta);
     let mut best: Option<(usize, FitResult)> = None;
     let mut failed_starts: Vec<String> = Vec::new();
     for (k, res) in results {
@@ -744,7 +817,9 @@ pub fn fit(
             Ok(r) => {
                 let better = match &best {
                     None => true,
-                    Some((_, b)) => multistart_prefers(b.ofv, b.converged, r.ofv, r.converged),
+                    Some((_, b)) => {
+                        multistart_prefers(rank_ofv(b), b.converged, rank_ofv(&r), r.converged)
+                    }
                 };
                 if better {
                     best = Some((k, r));
@@ -860,6 +935,14 @@ fn fit_inner(
     // Surface a "no method specified, defaulting to FOCEI" notice through the
     // same channel so it reaches both stderr and FitResult.warnings.
     if let Some(w) = options.method_default_warning() {
+        pre_run_warnings.push(w);
+    }
+    // Covariate-NN regularization is applied by the FOCE-family outer
+    // optimizers only. A programmatic caller (ferx-r sets the two fields
+    // directly, bypassing `user_set_keys`) asking for it under SAEM / IMP /
+    // Bayes / VI as the final stage would otherwise get an unregularized fit
+    // with no signal at all.
+    if let Some(w) = nn_regularization_unapplied_warning(model, options, &chain) {
         pre_run_warnings.push(w);
     }
     // Emitted whenever the chain runs SAEM, independent of `options.mu_referencing`:
