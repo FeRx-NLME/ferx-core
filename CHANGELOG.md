@@ -27,8 +27,9 @@ section of the SDLC for the versioning policy).
   finite-difference 2nd derivative (curvature) of each output along every input's
   marginal partial-dependence curve, damping the high-frequency wiggles a high-capacity
   DCM invents on a null covariate structure. The curvature grid is built in the network's
-  own `(x − center) / scale` input space, so it smooths the curve the fit actually
-  evaluates. Both feed the optimizer a penalized objective with matching analytic
+  own `(x − center) / scale` input space and spans every per-record covariate snapshot a
+  time-varying input takes (not just its baseline), so it smooths the curve the fit
+  actually evaluates over the range it is actually evaluated on. Both feed the optimizer a penalized objective with matching analytic
   gradients (the smoothness term reuses the MLP's analytic Jacobian — no autodiff) and
   Hessian terms across the FOCE-family methods — `foce` / `focei` / `laplace` under every
   outer optimizer, and `gn` / `gn_hybrid`; a non-FOCE final stage (SAEM, IMP, Bayes, VI)

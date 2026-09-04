@@ -1298,32 +1298,51 @@ fn median_of_sorted(sorted: &[f64]) -> f64 {
 }
 
 /// Collect the observed values of each of a mapper's named inputs across the
-/// population's subject-static covariates, in the mapper's input order and
-/// **normalised the way the mapper feeds them to its MLP** (`(x − center) /
-/// scale`, [`NamedMlpMapper::normalize`]) — so the grid built from them lives in
-/// the space the fit actually evaluates the network in. Missing covariates are
-/// skipped (they never contribute a value); a subject's `NaN` placeholder for a
-/// column it has no finite value in passes through and is dropped by
-/// [`CurvatureGrid::build`].
+/// population, in the mapper's input order and **normalised the way the mapper
+/// feeds them to its MLP** (`(x − center) / scale`, [`NamedMlpMapper::normalize`])
+/// — so the grid built from them lives in the space the fit actually evaluates
+/// the network in. Missing covariates are skipped (they never contribute a
+/// value); a subject's `NaN` placeholder for a column it has no finite value in
+/// passes through and is dropped by [`CurvatureGrid::build`].
 ///
-/// This reads the subject-static covariate snapshot (the first finite row per
-/// subject). A time-varying NN input is therefore swept over its *baseline*
-/// range; later-occasion values only enter the grid through the subjects whose
-/// baseline lands there.
+/// **Every covariate snapshot the model reads is a source**, not just the
+/// subject-static baseline. A time-varying NN input reaches the network through
+/// the per-event LOCF maps (`obs_covariates`, `dose_covariates`,
+/// `pk_only_covariates`, and the EVID=3/4 `reset_covariates` — the same four
+/// [`crate::types::Subject::time_varying_covariate_names`] scans), so those are what the sweep
+/// has to span: a population whose every subject *starts* at the same value but
+/// moves later has zero baseline spread, and a baseline-only grid would drop the
+/// axis and leave the whole traversed range unpenalised. The snapshots are
+/// deduplicated **per subject** (LOCF copies are bit-identical, so exact
+/// equality is the right test), so a subject contributes one entry per distinct
+/// value it actually visits rather than one per record — a densely-sampled
+/// subject does not out-vote the others in the axis' mean / sd / median.
 fn collect_input_values(mapper: &NamedMlpMapper, population: &Population) -> Vec<Vec<f64>> {
-    mapper
-        .input_names()
-        .iter()
-        .enumerate()
-        .map(|(i, name)| {
-            population
-                .subjects
-                .iter()
-                .filter_map(|s| s.covariates.get(name).copied())
-                .map(|x| mapper.normalize(i, x))
-                .collect()
-        })
-        .collect()
+    let names = mapper.input_names();
+    let mut values: Vec<Vec<f64>> = vec![Vec::new(); names.len()];
+    for s in &population.subjects {
+        let snapshots = std::iter::once(&s.covariates)
+            .chain(s.obs_covariates.iter())
+            .chain(s.dose_covariates.iter())
+            .chain(s.pk_only_covariates.iter())
+            .chain(s.reset_covariates.iter());
+        let mut seen: Vec<Vec<f64>> = vec![Vec::new(); names.len()];
+        for snap in snapshots {
+            for (i, name) in names.iter().enumerate() {
+                if let Some(&x) = snap.get(name) {
+                    // Bitwise identity: dedupes a carried-forward value exactly and
+                    // keeps a single `NaN` placeholder rather than one per record.
+                    if !seen[i].iter().any(|v| v.to_bits() == x.to_bits()) {
+                        seen[i].push(x);
+                    }
+                }
+            }
+        }
+        for (i, vals) in seen.into_iter().enumerate() {
+            values[i].extend(vals.into_iter().map(|x| mapper.normalize(i, x)));
+        }
+    }
+    values
 }
 
 /// Per-network regularization state, built once before the optimize loop and
@@ -2368,6 +2387,97 @@ mod regularization_tests {
     /// Regression: the grid was built on raw covariates and handed to the inner
     /// MLP, so with `center = [70, 86]`, `scale = [12, 23]` it probed `tanh` at
     /// pre-activations of ±100 where `C ≈ 0` and `nn_smooth` was a silent no-op.
+    /// The sweep must span every covariate snapshot the network is evaluated
+    /// at, not only the subject-static baseline: with every subject *starting*
+    /// at the same `WT` and moving later, a baseline-only grid sees zero spread
+    /// and drops the axis, leaving the whole traversed range unpenalised.
+    /// Per-subject LOCF duplicates collapse to one entry per distinct value.
+    #[test]
+    fn curvature_grid_covers_time_varying_covariate_snapshots() {
+        use std::collections::HashMap;
+
+        let wt = |v: f64| HashMap::from([("WT".to_string(), v)]);
+        let (_, template) = crate::types::test_helpers::tv_cov_iv_model_and_subject();
+        // Every subject's baseline is 70; the variation lives only in the
+        // per-event snapshots — one source of each kind.
+        let mut a = template.clone();
+        a.id = "A".into();
+        a.covariates = wt(70.0);
+        a.dose_covariates = vec![wt(70.0)];
+        a.obs_covariates = vec![wt(70.0), wt(70.0), wt(140.0)];
+        let mut b = a.clone();
+        b.id = "B".into();
+        b.obs_covariates = vec![wt(70.0), wt(210.0), wt(210.0)];
+        b.pk_only_times = vec![1.5];
+        b.pk_only_covariates = vec![wt(100.0)];
+        let mut c = a.clone();
+        c.id = "C".into();
+        c.obs_covariates = vec![wt(70.0), wt(70.0), wt(70.0)];
+        c.reset_times = vec![2.5];
+        c.reset_covariates = vec![wt(180.0)];
+        let population = Population {
+            subjects: vec![a, b, c],
+            covariate_names: vec!["WT".into()],
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+
+        let mlp = MlpMapper::new(vec![1, 4, 1], Activation::Tanh, Activation::Softplus).unwrap();
+        let mapper = NamedMlpMapper::new(mlp, vec!["WT".into()], vec!["CL".into()])
+            .unwrap()
+            .with_normalization(vec![70.0], vec![50.0])
+            .unwrap();
+
+        // The baseline-only reading (what the grid used to be built from):
+        // one value per subject, all 70 → no axis at all.
+        let baseline_only: Vec<Vec<f64>> = vec![population
+            .subjects
+            .iter()
+            .map(|s| mapper.normalize(0, s.covariates["WT"]))
+            .collect()];
+        assert!(
+            CurvatureGrid::build(&baseline_only, NN_SMOOTH_GRID_STEP_Z).is_empty(),
+            "baseline-only grid must be blind here, or the test proves nothing"
+        );
+
+        // Snapshot-aware: every distinct value each subject visits, once.
+        // A {70, 140}, B {70, 210, 100}, C {70, 180} — the LOCF repeats and
+        // the baseline/dose copies of 70 collapse per subject.
+        let values = collect_input_values(&mapper, &population);
+        assert_eq!(values.len(), 1);
+        let mut raw: Vec<f64> = values[0].iter().map(|z| z * 50.0 + 70.0).collect();
+        raw.sort_by(|p, q| p.partial_cmp(q).unwrap());
+        let expect = [70.0, 70.0, 70.0, 100.0, 140.0, 180.0, 210.0];
+        assert_eq!(raw.len(), expect.len(), "{raw:?}");
+        for (x, e) in raw.iter().zip(expect) {
+            assert_relative_eq!(x, &e, epsilon = 1e-12);
+        }
+
+        // …and the grid it builds spans the full traversed range, in z-space.
+        let grid = CurvatureGrid::build(&values, NN_SMOOTH_GRID_STEP_Z);
+        assert_eq!(grid.axes().len(), 1);
+        let nodes = &grid.axes()[0];
+        assert!(nodes.len() >= 3);
+        // First node sits on the min; the sweep ends within one step of the
+        // max (nodes are `min + k·step`), i.e. well past the 180 that a
+        // baseline-only grid never reached.
+        assert_relative_eq!(nodes[0][0], mapper.normalize(0, 70.0), epsilon = 1e-12);
+        let last = nodes[nodes.len() - 1][0];
+        assert!(
+            last > mapper.normalize(0, 180.0) && last <= mapper.normalize(0, 210.0) + 1e-12,
+            "sweep must reach the traversed top: last node {last}"
+        );
+        // The penalty is live on this axis (weights of order 1 keep tanh in
+        // its curved band).
+        let w: Vec<f64> = det_weights(mapper.mlp().n_weights())
+            .into_iter()
+            .map(|v| 5.0 * v)
+            .collect();
+        assert!(mapper.mlp().curvature_penalty_value(&w, &grid, 1.0) > 1e-6);
+    }
+
     #[test]
     fn curvature_grid_lives_in_the_mappers_normalised_input_space() {
         use std::collections::HashMap;
