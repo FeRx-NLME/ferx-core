@@ -175,7 +175,7 @@ fn tte_ode_nll(
     let tol = model
         .ode_spec
         .as_ref()
-        .map(|o| crate::survival::MonoTol::from_solver(&o.solver_opts))
+        .map(|o| crate::survival::MonoTol::from_solver(&o.effective_solver_opts()))
         .unwrap_or_default();
     tte_ode_nll_from_curves(records, &times, &cum, &haz, tol)
 }
@@ -358,7 +358,7 @@ fn tte_ode_nll_from_shared(
         (ode.rhs)(st, &share.pk_values, t, &mut du);
         haz[i] = du[chz_state];
     }
-    let tol = crate::survival::MonoTol::from_solver(&ode.solver_opts);
+    let tol = crate::survival::MonoTol::from_solver(&ode.effective_solver_opts());
     tte_ode_nll_from_curves(records, &share.times, &cum, &haz, tol)
 }
 
@@ -4522,5 +4522,122 @@ mod tests {
                 a - b
             );
         }
+    }
+
+    /// #1218 on the fit path. `tte_ode_nll` is the two-solve arm `tte_endpoint_nll` takes when
+    /// `try_joint_pktte_shared_solve` declines — time-varying covariates, EVID-3/4 resets, a
+    /// model-time read, SDE, FREM. A subject whose only TTE record sits on its first dose
+    /// builds `times = [0.0]`, a one-break timeline in `ode_dense_solve_states`, and until
+    /// #1218 read `NaN` there, which `tte_nll_from_curves` maps to the `1e20` sentinel: the
+    /// subject was repelled, not scored. It now scores `H(0) − ln h(0)` with `h(0)` the
+    /// post-dose hazard — the number the multi-point grid already gave.
+    ///
+    /// An exact event rather than a censor, on purpose: a censor at `t = 0` scores
+    /// `H(0) = 0` under the fix *and* under the wrong fix (filling the row from the seeded
+    /// pre-dose state), while `−ln h(0)` sees the difference — `h(0) = H0·exp(BETA·C)` at the
+    /// SS trough + pulse against the drug-free `H0`. Measured: `1e20` before, and under the
+    /// seeded-state variant `−ln 0.02 = 3.91` where the post-dose row gives `−ln 25.6`.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn tte_ode_nll_scores_an_event_on_the_first_dose_instead_of_the_sentinel() {
+        use crate::parser::model_parser::parse_model_string;
+        use crate::types::{DoseEvent, EventType, ObsRecord};
+
+        // #1210's drug arm, IV: CL=1, V=10, H0=0.02, BETA=0.5, hazard on central/V.
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVH0(0.02, 1e-5, 10.0)
+  theta TVBETA(0.5, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  H0   = TVH0
+  BETA = TVBETA
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[event_model]
+  cmt    = 2
+  hazard = H0 * exp(BETA * (central / V))
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+";
+        let model = parse_model_string(src).expect("joint PK-TTE model must parse");
+
+        // An `SS=1` bolus at t = 0 (so drug is present on the incoming side of the record)
+        // and nothing else: no PK rows, one exact event on the dose instant.
+        let mut subject = make_simple_subject();
+        subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)];
+        subject.obs_times = Vec::new();
+        subject.observations = Vec::new();
+        subject.obs_cmts = Vec::new();
+        subject.cens = Vec::new();
+        subject.occasions = Vec::new();
+        subject.obs_records = vec![ObsRecord::Event {
+            time: 0.0,
+            event_type: EventType::Exact,
+            entry_time: 0.0,
+            cmt: 2,
+        }];
+
+        let theta = &model.default_params.theta;
+        let eta = [0.0_f64];
+        let chz_state = match model.endpoints.get(&2) {
+            Some(EndpointLikelihood::Tte {
+                hazard: HazardSpec::OdeAccumulated { chz_state },
+                ..
+            }) => *chz_state,
+            _ => panic!("expected an OdeAccumulated TTE endpoint on CMT 2"),
+        };
+
+        let nll = tte_ode_nll(
+            &model,
+            &subject,
+            chz_state,
+            &subject.obs_records,
+            theta,
+            &eta,
+        );
+        assert!(
+            nll.is_finite() && nll < 1e20,
+            "an event on the first dose is scored with the sentinel, not a likelihood: {nll}"
+        );
+
+        // The reference: the same H/h read off a grid that also asks for a later point.
+        let (cum, haz) = crate::survival::ode_cumhaz_hazard(
+            &model,
+            &subject,
+            chz_state,
+            theta,
+            &eta,
+            &[0.0, 1.0],
+        );
+        assert!(
+            cum[0].is_finite() && haz[0].is_finite(),
+            "the multi-point reference row is not finite: {}, {}",
+            cum[0],
+            haz[0]
+        );
+        // The straddle: the post-dose hazard must be far from the drug-free `H0 = 0.02`, or
+        // this test could not tell the post-dose row from a seeded one.
+        assert!(
+            haz[0] > 5.0 * 0.02,
+            "h(0) = {} is not distinguishable from the drug-free hazard",
+            haz[0]
+        );
+        let want = cum[0] - haz[0].ln();
+        assert!(
+            (nll - want).abs() < 1e-12,
+            "tte_ode_nll = {nll} but H(0) - ln h(0) from the multi-point grid = {want}"
+        );
     }
 }

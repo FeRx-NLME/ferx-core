@@ -161,6 +161,86 @@ pub fn ferx_core::diagnostics::Diagnostic::with_block(self, block: impl core::co
 pub fn ferx_core::diagnostics::Diagnostic::with_line(self, line: usize) -> Self
 pub fn ferx_core::diagnostics::Diagnostic::with_suggestion(self, suggestion: impl core::convert::Into<alloc::string::String>) -> Self
 pub fn ferx_core::diagnostics::first_error(diagnostics: &[ferx_core::diagnostics::Diagnostic]) -> core::result::Result<(), alloc::string::String>
+pub mod ferx_core::edit
+pub enum ferx_core::edit::ErrorForm
+pub ferx_core::edit::ErrorForm::Additive
+pub ferx_core::edit::ErrorForm::Combined
+pub ferx_core::edit::ErrorForm::Proportional
+impl ferx_core::edit::ErrorForm
+pub fn ferx_core::edit::ErrorForm::label(&self) -> &'static str
+pub fn ferx_core::edit::ErrorForm::n_sigma(&self) -> usize
+pub enum ferx_core::edit::IivForm
+pub ferx_core::edit::IivForm::Additive
+pub ferx_core::edit::IivForm::Additive::eta: alloc::string::String
+pub ferx_core::edit::IivForm::Additive::variance: f64
+pub ferx_core::edit::IivForm::Exponential
+pub ferx_core::edit::IivForm::Exponential::eta: alloc::string::String
+pub ferx_core::edit::IivForm::Exponential::variance: f64
+pub ferx_core::edit::IivForm::Proportional
+pub ferx_core::edit::IivForm::Proportional::eta: alloc::string::String
+pub ferx_core::edit::IivForm::Proportional::variance: f64
+impl ferx_core::edit::IivForm
+pub fn ferx_core::edit::IivForm::eta(&self) -> &str
+pub fn ferx_core::edit::IivForm::variance(&self) -> f64
+pub enum ferx_core::edit::ModelEdit<'a>
+pub ferx_core::edit::ModelEdit::AddCovariateRelation(ferx_core::edit::Relation)
+pub ferx_core::edit::ModelEdit::AddIiv
+pub ferx_core::edit::ModelEdit::AddIiv::form: ferx_core::edit::IivForm
+pub ferx_core::edit::ModelEdit::AddIiv::param: alloc::string::String
+pub ferx_core::edit::ModelEdit::DropCovariateRelation
+pub ferx_core::edit::ModelEdit::DropCovariateRelation::cov: alloc::string::String
+pub ferx_core::edit::ModelEdit::DropCovariateRelation::param: alloc::string::String
+pub ferx_core::edit::ModelEdit::DropIiv
+pub ferx_core::edit::ModelEdit::DropIiv::param: alloc::string::String
+pub ferx_core::edit::ModelEdit::SeedInits(&'a ferx_core::FitResult)
+pub ferx_core::edit::ModelEdit::SetErrorModel(ferx_core::edit::ErrorSpecText)
+pub ferx_core::edit::ModelEdit::SetFitOption
+pub ferx_core::edit::ModelEdit::SetFitOption::key: alloc::string::String
+pub ferx_core::edit::ModelEdit::SetFitOption::value: alloc::string::String
+pub ferx_core::edit::ModelEdit::SetOmegaBlock(alloc::vec::Vec<alloc::string::String>)
+pub ferx_core::edit::ModelEdit::SetStructural(ferx_core::edit::StructuralSpec)
+pub struct ferx_core::edit::ErrorSpecText
+pub ferx_core::edit::ErrorSpecText::endpoint: alloc::string::String
+pub ferx_core::edit::ErrorSpecText::form: ferx_core::edit::ErrorForm
+pub ferx_core::edit::ErrorSpecText::sigmas: alloc::vec::Vec<ferx_core::edit::SigmaDecl>
+pub struct ferx_core::edit::ModelText
+impl ferx_core::edit::ModelText
+pub fn ferx_core::edit::ModelText::apply(&mut self, edit: ferx_core::edit::ModelEdit<'_>) -> core::result::Result<(), alloc::string::String>
+pub fn ferx_core::edit::ModelText::block_lines(&self, name: &str) -> alloc::vec::Vec<alloc::string::String>
+pub fn ferx_core::edit::ModelText::block_names(&self) -> alloc::vec::Vec<alloc::string::String>
+pub fn ferx_core::edit::ModelText::canonical_form(&self) -> alloc::string::String
+pub fn ferx_core::edit::ModelText::canonical_hash(&self) -> [u8; 32]
+pub fn ferx_core::edit::ModelText::parse(src: &str) -> core::result::Result<Self, alloc::string::String>
+pub fn ferx_core::edit::ModelText::render(&self) -> alloc::string::String
+pub struct ferx_core::edit::NewParameter
+pub ferx_core::edit::NewParameter::iiv: core::option::Option<(alloc::string::String, f64)>
+pub ferx_core::edit::NewParameter::init: f64
+pub ferx_core::edit::NewParameter::lower: f64
+pub ferx_core::edit::NewParameter::name: alloc::string::String
+pub ferx_core::edit::NewParameter::theta: alloc::string::String
+pub ferx_core::edit::NewParameter::upper: f64
+pub struct ferx_core::edit::Relation
+pub ferx_core::edit::Relation::center: core::option::Option<ferx_core::CovariateStat>
+pub ferx_core::edit::Relation::covariate: alloc::string::String
+pub ferx_core::edit::Relation::fix: core::option::Option<f64>
+pub ferx_core::edit::Relation::form: ferx_core::CovariateForm
+pub ferx_core::edit::Relation::parameter: alloc::string::String
+pub ferx_core::edit::Relation::thetas: alloc::vec::Vec<ferx_core::edit::RelationTheta>
+impl core::convert::From<&ferx_core::CovariateRelation> for ferx_core::edit::Relation
+pub fn ferx_core::edit::Relation::from(r: &ferx_core::CovariateRelation) -> Self
+pub struct ferx_core::edit::RelationTheta
+pub ferx_core::edit::RelationTheta::init: f64
+pub ferx_core::edit::RelationTheta::lower: f64
+pub ferx_core::edit::RelationTheta::name: alloc::string::String
+pub ferx_core::edit::RelationTheta::upper: f64
+pub struct ferx_core::edit::SigmaDecl
+pub ferx_core::edit::SigmaDecl::as_sd: bool
+pub ferx_core::edit::SigmaDecl::init: f64
+pub ferx_core::edit::SigmaDecl::name: alloc::string::String
+pub struct ferx_core::edit::StructuralSpec
+pub ferx_core::edit::StructuralSpec::bindings: alloc::vec::Vec<(alloc::string::String, alloc::string::String)>
+pub ferx_core::edit::StructuralSpec::new_parameters: alloc::vec::Vec<ferx_core::edit::NewParameter>
+pub ferx_core::edit::StructuralSpec::template: alloc::string::String
 pub mod ferx_core::environment
 pub struct ferx_core::environment::EnvironmentInfo
 pub ferx_core::environment::EnvironmentInfo::arch: alloc::string::String
@@ -899,6 +979,7 @@ pub ferx_core::ode::predictions::ThresholdOutcome::CensoredAtHorizon
 pub ferx_core::ode::predictions::ThresholdOutcome::Crossed(f64)
 pub ferx_core::ode::predictions::ThresholdOutcome::SolveFailed(alloc::string::String)
 pub struct ferx_core::ode::predictions::OdeSpec
+pub ferx_core::ode::predictions::OdeSpec::chz_state_slots: alloc::vec::Vec<usize>
 pub ferx_core::ode::predictions::OdeSpec::diffusion_var: alloc::vec::Vec<f64>
 pub ferx_core::ode::predictions::OdeSpec::dose_attr_map: ferx_core::DoseAttrMap
 pub ferx_core::ode::predictions::OdeSpec::indiv_param_program: core::option::Option<ferx_core::parser::model_parser::IndivParamProgram>
@@ -1038,6 +1119,7 @@ pub ferx_core::ode::OdeSolverStats::stiff_aborted_segments: usize
 pub ferx_core::ode::OdeSolverStats::stiff_min_step_clamped_steps: usize
 pub ferx_core::ode::OdeSolverStats::unfinished_segments: usize
 pub struct ferx_core::ode::OdeSpec
+pub ferx_core::ode::OdeSpec::chz_state_slots: alloc::vec::Vec<usize>
 pub ferx_core::ode::OdeSpec::diffusion_var: alloc::vec::Vec<f64>
 pub ferx_core::ode::OdeSpec::dose_attr_map: ferx_core::DoseAttrMap
 pub ferx_core::ode::OdeSpec::indiv_param_program: core::option::Option<ferx_core::parser::model_parser::IndivParamProgram>
@@ -2435,6 +2517,8 @@ pub ferx_core::types::CovariateRelation::source_line: alloc::string::String
 pub ferx_core::types::CovariateRelation::thetas: alloc::vec::Vec<ferx_core::CovariateTheta>
 impl ferx_core::CovariateRelation
 pub fn ferx_core::CovariateRelation::needs_data(&self) -> bool
+impl core::convert::From<&ferx_core::CovariateRelation> for ferx_core::edit::Relation
+pub fn ferx_core::edit::Relation::from(r: &ferx_core::CovariateRelation) -> Self
 pub struct ferx_core::types::CovariateRelationEstimate
 pub ferx_core::types::CovariateRelationEstimate::center: core::option::Option<f64>
 pub ferx_core::types::CovariateRelationEstimate::center_source: core::option::Option<alloc::string::String>
@@ -3753,6 +3837,8 @@ pub ferx_core::CovariateRelation::source_line: alloc::string::String
 pub ferx_core::CovariateRelation::thetas: alloc::vec::Vec<ferx_core::CovariateTheta>
 impl ferx_core::CovariateRelation
 pub fn ferx_core::CovariateRelation::needs_data(&self) -> bool
+impl core::convert::From<&ferx_core::CovariateRelation> for ferx_core::edit::Relation
+pub fn ferx_core::edit::Relation::from(r: &ferx_core::CovariateRelation) -> Self
 pub struct ferx_core::CovariateRelationEstimate
 pub ferx_core::CovariateRelationEstimate::center: core::option::Option<f64>
 pub ferx_core::CovariateRelationEstimate::center_source: core::option::Option<alloc::string::String>

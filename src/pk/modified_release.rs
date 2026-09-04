@@ -978,7 +978,11 @@ fn verify_against_ode_twin(
     const MR_TWIN_MAX_RELTOL: f64 = 1e-8;
     /// Companion bound on the absolute floor, which is what actually bit (#1124 review).
     const MR_TWIN_MAX_ABSTOL: f64 = 1e-10;
-    let verify_tol = (500.0 * s.spec.solver_opts.reltol).max(1e-4);
+    // The effective options, not the baked field: the twin below integrates at the
+    // fit-scoped ones (#1212), so the bound and the admission gate have to be derived
+    // from what the twin actually ran at.
+    let solver = s.spec.effective_solver_opts();
+    let verify_tol = (500.0 * solver.reltol).max(1e-4);
     // Only a twin tight enough to out-resolve `verify_tol` may arbitrate. The integrator
     // controls its local error as `abstol + reltol·|y|`, so its relative accuracy is
     // `abstol/|y| + reltol`: once the trajectory decays toward `abstol`, the twin has no
@@ -994,9 +998,7 @@ fn verify_against_ode_twin(
     //
     // The models this check exists to guard (`reduces_to_ode_*`) pin `1e-10`/`1e-12`
     // deliberately, so they still verify.
-    if s.spec.solver_opts.reltol > MR_TWIN_MAX_RELTOL
-        || s.spec.solver_opts.abstol > MR_TWIN_MAX_ABSTOL
-    {
+    if solver.reltol > MR_TWIN_MAX_RELTOL || solver.abstol > MR_TWIN_MAX_ABSTOL {
         release();
         return;
     }

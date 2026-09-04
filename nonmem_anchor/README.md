@@ -23,6 +23,7 @@ the CLAUDE.md "compare with NONMEM output" rule:
 | **`TAD`-reading RHS on a closed-form-eligible model** | an `[odes]` right-hand side that reads the `TAD` built-in on a model whose absorption ferx can serve in **closed form** (one built-in `first_order` forcing into a linear 1-cpt disposition) — [#1124](https://github.com/FeRx-NLME/ferx-core/issues/1124) (`ADVAN13 TOL=9`, `$EST MAXEVAL=0 POSTHOC INTERACTION`). That fast path never evaluates the right-hand side, so the `TAD` term was **absent from the predictions**, not approximated — output was bit-identical to the same model with the term deleted. Unlike #1070 this is a *value* defect and needs no lagtime. Two doses, so the `TAD` anchor switches strictly inside the observation range with records on both sides (11.5 / 12.5) and the second dose lands on residual drug (22.90 against an eventual peak of 91.21) — a single dose would make `TAD == TAFD` and could not tell the two apart. No `MTIME` is needed here precisely because there is no lag: `TDOS` switches *at* a dose record, which NONMEM already breaks on — verified, not assumed, against `mr_tad_deterministic_truth.py` (independent stdlib RK4) via `mr_tad_det.ctl` (`$OMEGA 0 FIX`), agreeing to **1.7e-5**, i.e. `$TABLE` print precision. No `WT` column: #1124 routes a model-time-reading RHS to the event-driven predictor directly, so the #1110 workaround the `tad_lag` streams need is obsolete. ferx **−12.4832** before the fix vs NONMEM **−234.478426** (222 OFV units), **−234.478426** after (2.5e-7) | `mr_tad.ctl`, `mr_tad_det.ctl` (2) | `mr_tad_fit.ferx` |
 | **Lagged zero-order absorption into the states engines** | `zero_order(dur=DUR, lag=LAG)` read back through the *states* paths, not the objective — [#1171](https://github.com/FeRx-NLME/ferx-core/issues/1171) (`ADVAN13 TOL=9`, `$EST MAXEVAL=0 POSTHOC`, all `$THETA` `FIX`). A zero-order route is delivered as a per-segment *constant rate* admitted only when the segment is fully inside the window, so the timeline must break at the route's onset as well as its end; two of the four break-time builders pushed only the end, and the rate was dropped for the whole window — a model whose only input is a lagged `zero_order` read **exactly zero** on the sdtab / dense / hazard / simulate paths. Two design points: the input is NONMEM's own duration-modeled dose (`RATE=-2` + `D1=DUR`, shifted by `ALAG1=LAG`), **not** `mixed_zero_first.ctl`'s `PODO`/`F1=0` `$DES` trick — `PODO` tracks only the most recent dose, and this fixture needs the second window to open with drug from the first still present; and the target is **`PRED`/`IPRED`, not the OFV** — ferx's objective path was already correct, so an OFV anchor passes vacuously in both directions. Setup validated before use: NONMEM `PRED` at t=2.3 is `7.6884E-01` against `0.768837` hand-computed from the closed form. Only the `lag_cmt = 0` case is expressible (`ALAGn` is per-compartment). ferx **0.0 at every observation** before the fix, **2.8e-5** after, i.e. `$TABLE` print precision. `#OBJV = -264.65083533221622` | `lagged_zo.ctl` | `lagged_zo_fit.ferx` |
 | **Time-dependent hazard on an autonomous PK block** | a joint PK-TTE `[event_model] hazard =` that reads `TIME` (Gompertz baseline × exposure) while the `[odes]` PK block is time-invariant — [#1166](https://github.com/FeRx-NLME/ferx-core/issues/1166) (`ADVAN13 TOL=9`, `$OMEGA 0 FIX`, `$EST MAXEVAL=0 POSTHOC`, all `$THETA` `FIX`, `$TABLE FORMAT=s1PE15.8`). The injected `d/dt(__chz_<cmt>)` line made the whole model read as non-autonomous, so it declined #570's single shared solve and integrated twice per subject. This is the first anchor with `TIME` **live** in a hazard at all: a grep for a time-reading `hazard =` over `src/ tests/ examples/ docs/` was empty, and the identity trick `× (1.0 + 0.0*TIME)` used by the routing oracle proves routing only. Non-degeneracy is the run's own `GAM = 0` twin (`~/NONMEMruns/pktte-engine-split/pktte_eta0.ctl`, same data, same THETA): `H(t)` differs by **0.55 %** at the earliest event record and **85 %** at the latest, against a 5e-8 bound. Two objects compared — `A(3)` (constant-free) and per-subject `.phi` `OBJ`; the second is sound because the ferx↔NONMEM constant was *measured* to be **zero** on the twin (`2 × individual_nll` **is** `OBJ`, no `n·log 2π`). Needs ferx `ode_reltol = 1e-9 / ode_abstol = 1e-11`: at ferx's defaults the same comparison is good only to ~8e-4 per subject. ferx matches to **3.6e-9** (`H`), **4.3e-9** (`h`), **6.0e-8** (per-subject objective). `#OBJV = 1912.025` | `pktte_tdep.ctl` | `pktte_tdep_fit.ferx` |
+| **`SS=1` dose × ODE-accumulated hazard** | a joint PK-TTE `[event_model] hazard =` on a subject whose dose carries `SS=1` — [#1210](https://github.com/FeRx-NLME/ferx-core/issues/1210) (`ADVAN13 TOL=9`, `$OMEGA 0 FIX`, `$EST MAXEVAL=0 POSTHOC`, all `$THETA` `FIX`, `$TABLE FORMAT=s1PE15.8`). The steady-state equilibration cycled the injected `d/dt(__chz_<cmt>)` accumulator along with the PK states, so `H(0)` held the run-in's own hazard instead of 0. **This family has no native NONMEM comparator, and that is a measured result, not an assumption** — `ss_chz_r1_*.ctl` hand NONMEM's own SS routine the augmented system and it returns `A(3) = −2.39e7` with `#OBJV = +INF` (const) or `NUMERICAL DIFFICULTIES WITH STEADY STATE SOLUTION` / `PROGRAM TERMINATED BY OBJ` (drug). The anchor is instead the construction a NONMEM user must write by hand: `ss_chz_r2_*.ctl`, an explicit 51-dose pulse train (0, 12, …, 600) whose `$DES` gates the hazard on `T ≥ 600`, so the PK is at its periodic steady state and `A(3)` restarts at the record. Three arms, in the order that makes them trustworthy: `const` (`BETA = 0`) reproduces the closed form `H(t) = H0·t` to the printed digits, which certifies the train itself; `drug` is then the oracle for what no closed form sees; `tdep` (Gompertz `EXP(GAM·(T−600))`) pins the model clock, the quantity an SS run-in displaces. The PK side was never wrong — ferx's `PRED` already matched `IPRED` to 8 digits before the fix | `ss_chz_r1_{const,drug}.ctl`, `ss_chz_r2_{const,drug,tdep}.ctl` (5) | `ss_chz_{const,drug,tdep}_fit.ferx` |
 
 The **`TIME`-readout** control runs on its own tiny `scaling_time_readout.csv`
 (one subject, 100 mg IV bolus, seven samples over 24 h) — see
@@ -702,3 +703,155 @@ ferx reproduces the `IPRED` column to <1e-4 relative (NONMEM's table carries fiv
 significant figures). The middle column is what a readout stuck at `TIME = 0`
 would return — 1.18x off at the first sample and 15x off by 24 h — so the anchor
 discriminates the bug by three orders of magnitude more than the tolerance.
+
+## `SS=1` dose × ODE-accumulated hazard (#1210)
+
+A joint PK-TTE model injects `d/dt(__chz_<cmt>)` — a pure integrator with no
+elimination term — into the ODE system. [#1210](https://github.com/FeRx-NLME/ferx-core/issues/1210)
+is that row being fed through steady-state equilibration along with the PK states:
+the accumulator never reaches a steady state, it just counts up, so `H(0)` came out
+holding the run-in's own hazard rather than 0.
+
+This family is unusual in that **NONMEM has no native answer to compare against**, and
+that is itself one of the committed runs.
+
+### r1 — the negative result: native `SS=1` on the augmented system
+
+`ss_chz_r1_{const,drug}.ctl` are the obvious control streams — the same three-compartment
+system (`DEPOT`, `CENTRAL`, `CHZ`) with `SS=1, II=12` on the dose record, handed to
+NONMEM's own steady-state routine. Both fail, and neither fails loudly enough to be safe:
+
+| run | `A(3)` | outcome |
+|-----|-------:|---------|
+| `ss_chz_r1_const` (`BETA = 0`) | **−2.38842166E+07** at every record | `#OBJV: +INF` — the table is still written |
+| `ss_chz_r1_drug` (`BETA = 0.5`) | — | `NUMERICAL DIFFICULTIES WITH STEADY STATE SOLUTION`, `PROGRAM TERMINATED BY OBJ`, `PRDERR` |
+
+So "what NONMEM does here" is not an anchor: a NONMEM user has to gate the hazard
+themselves. `H(0) = 0` is therefore a **ferx definition** — the cumulative hazard is
+measured from the start of the subject's record — and the anchor below is the
+construction that expresses that definition in NONMEM.
+
+The const run is worth keeping precisely because it *does* produce a table. The PK
+columns in it are fine (its `IPRED` agrees with r2's periodic steady state to 5e-7);
+only `A(3)` is garbage. A reviewer reaching for the native stream would get numbers
+back, and they would be wrong by seven orders of magnitude.
+
+### r2 — the anchor: explicit gated pulse train
+
+`ss_chz_r2_{const,drug,tdep}.ctl` replace `SS=1` with what it means: 51 doses at
+0, 12, …, 600, with the hazard gated off until the last of them.
+
+```
+$PK   TREC = 600
+$DES  GATE = 0
+      IF (T.GE.TREC) GATE = 1
+      DADT(3) = GATE*H0*EXP(BETA*CONCD)
+```
+
+At `T = 600` the PK is at its periodic steady state (trough `4.78896241`) and `A(3)`
+restarts from zero — `8.1e-13` in the const run, i.e. integrator noise, which is the
+run's own check that the gate holds. NONMEM `T = 600 + t` is ferx `t`, so `A(3)` at
+601/604/608/612 is exactly ferx's `H(1/4/8/12)` after an `SS=1` dose at 0, and `IPRED`
+at the same records is ferx's SS `PRED`.
+
+Three arms, in the order that makes them trustworthy:
+
+| File | What it is |
+|------|------------|
+| `ss_chz_r2_const.ctl` | `BETA = 0` — the hazard collapses to the constant `H0`, so `A(3)` must equal the closed form `H0·t`. This arm certifies the pulse-train construction; it needs no engine to check. |
+| `ss_chz_r2_drug.ctl` | `BETA = 0.5` — the hazard rides `A(2)/V`. No closed form; this is the oracle for the part the const arm cannot see. |
+| `ss_chz_r2_tdep.ctl` | drug × Gompertz baseline `EXP(GAM·(T−600))`, `GAM = 0.15`. The baseline is anchored on the record start, so it pins the model clock — the one quantity an SS run-in displaces. |
+| `ss_chz_train.csv` | The 51-dose dataset the r2 streams run on (PK obs at 601/604/608, TTE record at 612). |
+| `ss_chz_ss.csv` | The `SS=1, II=12` dataset — r1's input, and ferx's own (PK obs at 1/4/8, TTE record at 12). |
+| `ss_chz_r3_{const,drug}.ctl` | The mid-record second-SS-dose anchor: one uninterrupted 56-dose train through `T = 660`, no SS record anywhere. |
+| `ss_chz_train3.csv` | The 56-dose dataset the r3 streams run on (PK obs at 612/647.9/648.1/660, TTE record at 660). |
+| `ss_chz_ss2.csv` | ferx's r3 twin: `SS=1` at `t = 0` **and** `t = 48`, with explicit doses at 12/24/36/60 between them. |
+| `results/ss_chz_r{1,2,3}_*.{lst,tab}` | The committed NONMEM outputs (NONMEM 7.6.0). |
+| `ss_chz_{const,drug,tdep}_fit.ferx` | The three ferx twins. r3 reuses `const` and `drug` unchanged and swaps only the records, which is what makes it a test of the dose semantics rather than of a second model. |
+
+### Run NONMEM
+
+```bash
+cd nonmem_anchor
+nmfe76 ss_chz_r2_const.ctl ss_chz_r2_const.lst
+nmfe76 ss_chz_r2_drug.ctl  ss_chz_r2_drug.lst
+nmfe76 ss_chz_r2_tdep.ctl  ss_chz_r2_tdep.lst
+nmfe76 ss_chz_r3_const.ctl ss_chz_r3_const.lst
+nmfe76 ss_chz_r3_drug.ctl  ss_chz_r3_drug.lst
+```
+
+`ss_chz_r1_{const,drug}.ctl` run the same way; they are committed for their failure,
+not for their numbers.
+
+### Run ferx (cross-check)
+
+```bash
+cargo test --test ss_chz_nonmem_anchor --no-default-features --features ci,survival
+```
+
+### Expected
+
+`A(3)`, from `results/ss_chz_r2_*.tab`:
+
+| NONMEM `T` | ferx `t` | `r2_const` (= `0.02·t`) | `r2_drug` | `r2_tdep` |
+|-----------:|---------:|------------------------:|----------:|----------:|
+| 601 | 1 | 0.02 | 1.50356118 | 1.66704849 |
+| 604 | 4 | 0.08 | 17.4316438 | 24.8746770 |
+| 608 | 8 | 0.16 | 24.5093214 | 41.1505197 |
+| 612 | 12 | 0.24 | 26.1185123 | 48.0540176 |
+
+`IPRED`, identical across all three arms (the PK does not depend on the hazard):
+
+| ferx `t` | 1 | 4 | 8 | 12 |
+|---|---:|---:|---:|---:|
+| NONMEM `IPRED` | 10.2994688 | 10.4546754 | 7.14066685 | 4.78896241 |
+
+Two things this table settles. The const arm landing on `0.02·t` to the printed digits
+is what makes the other two believable — the train, the gate and the `T − 600`
+alignment are all checked by a number computed without an integrator. And the `IPRED`
+row was **already matched before the fix** (ferx `10.29946878 / 10.45467542 /
+7.14066685`, 8 digits): the SS equilibration was doing the right thing for the PK
+compartments all along, which localises #1210 to the accumulator row alone.
+
+Before the fix ferx's `H` on this fixture was displaced by exactly its own `H(0)` —
+`+12.000000` (const), `+1268.972` (drug), `+4.5360222e10` (tdep) at every record.
+
+## r3 — a *second* `SS=1` dose, anchored without any SS record at all
+
+r1 and r2 settle what an `SS=1` dose at the **start** of a record means. They cannot reach the
+rule that separates #1210's fix from the issue's own suggested one — that a **later** `SS=1`
+dose *keeps* the hazard accrued so far rather than zeroing it. It first looks un-anchorable:
+r1 is precisely the measurement that NONMEM's SS routine cannot be handed this system.
+
+The r2 construction generalises, and the generalisation needs no SS record on the NONMEM side.
+A second `SS=1` dose at `t = 48`, on the regimen the subject is already at steady state under,
+asserts exactly two things: the compartments re-equilibrate to that same periodic trough, and
+the accumulated hazard is a fact about the record that survives the re-equilibration. **A
+subject who has simply been dosed every 12 h without interruption satisfies both by
+construction.** So `ss_chz_r3_{const,drug}.ctl` is one uninterrupted 56-dose train through
+`T = 660`, same gate at `T = 600`, and ferx's `SS@0 + SS@48` must reproduce it record for
+record.
+
+The ferx twin (`ss_chz_ss2.csv`) therefore carries **explicit** doses at 12/24/36/60 alongside
+the two `SS=1` records. That is not decoration: an `SS=1` dose means "the infinite past was
+periodic *up to here*", not "keep dosing", so a twin without them decays from `t = 0` and reads
+`PRED = 0.132` against the train's `4.837` at `t = 47.9`. The first draft of this anchor had
+exactly that bug, and the `IPRED` control is what caught it.
+
+| NONMEM `T` | ferx `t` | `r3_const` (= `0.02·t`) | `r3_drug` | `IPRED` |
+|-----------:|---------:|------------------------:|----------:|--------:|
+| 612   | 12   | 0.240 | 26.1185123 | 4.78896241 |
+| 647.9 | 47.9 | 0.958 | 104.451859 | 4.83708578 |
+| 648.1 | 48.1 | 0.962 | 104.501853 | 5.68812187 |
+| 660   | 60   | 1.200 | 130.592562 | 4.78896241 |
+
+`r3_drug` at `t = 12` reproducing r2's `26.1185123` is a free consistency check between the two
+constructions. `IPRED` reading `4.83708578` just before the second dose and `4.78896241` at the
+dose times is the non-degeneracy the dose-event rule requires: drug from the preceding interval
+is genuinely present when that dose lands.
+
+The discrimination is wide. Zeroing the accumulator at the second dose gives `0.002` and `0.240`
+where the train says `0.962` and `1.200` — every record after `t = 48` short by `H(48)`.
+Mutation-verified: with `restore_chz` writing `0.0` the arm fails at **99.8% relative
+disagreement** on `H`.
+The shape was right; only the origin was wrong.

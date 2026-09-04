@@ -119,6 +119,193 @@ pub(crate) fn ss_equilibration_opts(opts: &OdeSolverOptions) -> OdeSolverOptions
     o
 }
 
+/// The row restriction that makes an accumulator-carrying system solvable as its PK
+/// sub-problem: drop the `d/dt(__chz_<cmt>)` rows, solve, put them back at zero.
+///
+/// Two call sites need exactly this — [`periodic_ss_fixed_point_pk`] (delegating to
+/// [`crate::dosing::periodic_ss_fixed_point_g`]) and [`equilibrate_ss_input_rate`]'s joint
+/// branch (delegating to [`equilibrate_ss_input_rate_g`]) — and they cannot share a delegate.
+/// They share this instead, because the invariant is the subtle half of #1210: an accumulator
+/// row embeds as `0.0` and projects out, so the reduced one-cycle map is the PK propagator and
+/// `I − M` is no longer singular.
+struct ChzProjection {
+    n: usize,
+    pk_rows: Vec<usize>,
+}
+
+impl ChzProjection {
+    fn new(chz: &[usize], n: usize) -> Self {
+        Self {
+            n,
+            pk_rows: (0..n).filter(|i| !chz.contains(i)).collect(),
+        }
+    }
+
+    /// Size of the reduced system. Zero means the spec is all accumulator and no PK.
+    fn n_pk_rows(&self) -> usize {
+        self.pk_rows.len()
+    }
+
+    /// Reduced vector → full-length state, accumulator rows left at zero.
+    fn embed(&self, reduced: &[f64]) -> Vec<f64> {
+        let mut full = vec![0.0; self.n];
+        for (k, &row) in self.pk_rows.iter().enumerate() {
+            full[row] = reduced[k];
+        }
+        full
+    }
+
+    /// Full-length state → reduced vector.
+    fn project(&self, full: &[f64]) -> Vec<f64> {
+        self.pk_rows.iter().map(|&row| full[row]).collect()
+    }
+}
+
+/// Hold the injected cumulative-hazard accumulators still for one derivative evaluation.
+///
+/// Steady-state equilibration is a statement about the **PK** sub-system: it asks what the
+/// compartments look like after an infinite past of identical dosing intervals. A
+/// `d/dt(__chz_<cmt>)` row has no such state — it is a pure integrator, so it just counts up,
+/// and cycling it along with the compartments is what put the run-in's own hazard into `H(0)`
+/// (#1210).
+///
+/// **What this mask is and is not load-bearing for**, measured by mutation rather than argued:
+/// it is *not* what makes `H` correct — [`restore_chz`] overwrites the accumulator row on the
+/// way out unconditionally, and `[odes]` may not read `__chz_*` (rejected at parse time), so
+/// the PK rows cannot see the row either. Removing the mask changes no hazard directly.
+///
+/// It earns its place on the path where the accumulator is *read back*: when the exact fixed
+/// point declines — a nonlinear PK block — the capped pulse train runs and [`SsStopTracker`]
+/// judges convergence on the **whole** state vector. An unmasked accumulator grows by
+/// `hazard × II` every cycle and never settles, so the train can never early-stop: it burns all
+/// [`SS_EQUILIBRATION_CYCLES`] and then reports a #867 non-convergence for a PK block that
+/// converged long before. That is held by
+/// `a_nonlinear_joint_model_judges_convergence_on_the_pk_rows`, which asserts the cycle count
+/// and dies at the 50-cycle cap when [`equilibrate_ss_pk_state`]'s mask is dropped.
+///
+/// **The copy in [`ss_state_at_phase_pk`] is deliberately kept although no test can hold it.**
+/// Measured: dropping it kills nothing, because the wrapper's [`restore_chz`] overwrites the
+/// row on exit, and the phase advance spans at most one interval, so the row it would grow is
+/// bounded by `hazard × II` rather than by 50 times that. The only channel left is the
+/// integrator's error norm — a monotonically growing row would steer the PK step sizes — which
+/// is a tolerance-level effect and the wrong thing to pin in a test. It stays for uniformity
+/// (all three SS paths mask, so a reader who finds one unmasked does not have to re-derive
+/// why) and because deleting it would leave [`restore_chz`] as the *sole* thing carrying
+/// correctness on that path.
+///
+/// A no-op (an empty loop) for every model without an `[event_model]`.
+#[inline]
+fn mask_chz(chz: &[usize], dy: &mut [f64]) {
+    for &slot in chz {
+        // A slot outside the state vector means `chz_state_slots` disagrees with `n_states`.
+        // Skipping silently would leave the row unmasked; assert in debug so an inconsistent
+        // spec is loud rather than quietly reinstating the #1210 behaviour.
+        debug_assert!(
+            slot < dy.len(),
+            "chz slot {slot} is outside a {}-state system",
+            dy.len()
+        );
+        if slot < dy.len() {
+            dy[slot] = 0.0;
+        }
+    }
+}
+
+/// The accumulator values an SS equilibration must hand back untouched (#1210), read off the
+/// state the caller is about to overwrite. Parallel to `ode.chz_state_slots`.
+///
+/// The rule is *preserve*, not *zero*: for a first SS dose at the start of the record the value
+/// is 0 and the two agree, but a second SS dose at `t = 48` must keep the hazard accrued over
+/// `[0, 48)` rather than discard it. Zeroing there would throw away `H(48⁻)`.
+///
+/// Allocation-free (`Vec::new()` does not allocate) whenever the model has no accumulators.
+#[inline]
+fn chz_snapshot(ode: &crate::ode::OdeSpec, u: &[f64]) -> Vec<f64> {
+    ode.chz_state_slots
+        .iter()
+        .map(|&slot| u.get(slot).copied().unwrap_or(0.0))
+        .collect()
+}
+
+/// Write a [`chz_snapshot`] back into an equilibrated state. The single chokepoint for
+/// #1210's rule — every early return of the equilibration passes through it, so a bail-out
+/// path (`ii <= 0`, an out-of-range dose compartment, overlapping infusions) cannot silently
+/// reset the accumulator either.
+#[inline]
+fn restore_chz(ode: &crate::ode::OdeSpec, u: &mut [f64], chz_before: &[f64]) {
+    // Both fallbacks below — skipping an out-of-range slot, and substituting `0.0` for a short
+    // `chz_before` — degrade into *zeroing* the accumulator, which is precisely the behaviour
+    // #1210 rejects and the one outcome no first-SS-dose test can tell from correct. Assert in
+    // debug so a spec/snapshot mismatch fails loudly instead of reinstating the bug.
+    debug_assert_eq!(
+        chz_before.len(),
+        ode.chz_state_slots.len(),
+        "chz snapshot length does not match the spec's accumulator slots"
+    );
+    for (k, &slot) in ode.chz_state_slots.iter().enumerate() {
+        debug_assert!(
+            slot < u.len(),
+            "chz slot {slot} is outside a {}-state system",
+            u.len()
+        );
+        if slot < u.len() {
+            u[slot] = chz_before.get(k).copied().unwrap_or(0.0);
+        }
+    }
+}
+
+/// [`crate::dosing::periodic_ss_fixed_point_g`] restricted to the PK sub-system.
+///
+/// The exact solve inverts `I − M` for the one-cycle propagator `M`. Under [`mask_chz`] an
+/// accumulator row's one-cycle map is the *identity*, so that row of `I − M` is all zeros and
+/// the system is singular — for **every** joint PK-TTE model, whatever its PK block looks
+/// like. Masking alone would therefore leave #1210's fixtures on the capped 50-cycle pulse
+/// train (the accumulator never stops growing, so `SsStopTracker` never sees convergence), and
+/// liable to the spurious #867 non-convergence warning that follows from capping. Whether that
+/// warning actually fires is a further question — it rides `note_ss_nonconvergence_if_capped`'s
+/// geometric-tail test, so a capped run does not always produce one.
+///
+/// Projecting the accumulator rows out restores the PK propagator, and a linear PK block gets
+/// its handful of solves back. The returned vector is full-length with the accumulator rows
+/// left at zero; the caller's [`restore_chz`] fills them.
+fn periodic_ss_fixed_point_pk<FUnf, FFor>(
+    chz: &[usize],
+    n: usize,
+    ii: f64,
+    reltol: f64,
+    abstol: f64,
+    advance_unforced: FUnf,
+    advance_forced: FFor,
+) -> Option<Vec<f64>>
+where
+    FUnf: Fn(&[f64]) -> Option<Vec<f64>>,
+    FFor: Fn(&[f64]) -> Option<Vec<f64>>,
+{
+    if chz.is_empty() {
+        return crate::dosing::periodic_ss_fixed_point_g::<f64, _, _>(
+            n,
+            ii,
+            reltol,
+            abstol,
+            advance_unforced,
+            advance_forced,
+        );
+    }
+    let proj = ChzProjection::new(chz, n);
+    if proj.n_pk_rows() == 0 {
+        return None;
+    }
+    let u_red = crate::dosing::periodic_ss_fixed_point_g::<f64, _, _>(
+        proj.n_pk_rows(),
+        ii,
+        reltol,
+        abstol,
+        |r| advance_unforced(&proj.embed(r)).map(|f| proj.project(&f)),
+        |r| advance_forced(&proj.embed(r)).map(|f| proj.project(&f)),
+    )?;
+    Some(proj.embed(&u_red))
+}
+
 /// Periodic steady-state trough for an `SS=1` dose into a built-in absorption input-rate
 /// compartment (#719; nonlinear solve #867).
 ///
@@ -181,14 +368,49 @@ fn equilibrate_ss_input_rate(
             .last()
             .map(|p| p.u.clone())
     };
-    equilibrate_ss_input_rate_g::<f64, _, _>(
-        n,
+    let chz = &ode.chz_state_slots[..];
+    if chz.is_empty() {
+        return equilibrate_ss_input_rate_g::<f64, _, _>(
+            n,
+            ii,
+            eq_opts.reltol,
+            eq_opts.abstol,
+            |u0| advance(ode.rhs.as_ref(), u0),
+            |u0| advance(&forced_rhs, u0),
+        );
+    }
+
+    // Joint PK-TTE (#1210). Two things have to happen for the run-in, and neither is enough
+    // alone: the accumulator's derivative is held at zero (`mask_chz`) so the equilibration
+    // cannot bank the run-in's hazard, and its row is projected out of the one-cycle map so
+    // `I − M` is the PK propagator rather than a singular matrix. Both the exact solve and the
+    // Anderson fallback inside `equilibrate_ss_input_rate_g` then work on the PK sub-system.
+    // The returned vector is full-length with the accumulator rows at zero; the caller
+    // restores their record values.
+    let masked_unforced = |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
+        (ode.rhs)(y, p, t, dy);
+        mask_chz(chz, dy);
+    };
+    let masked_forced = |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
+        forced_rhs(y, p, t, dy);
+        mask_chz(chz, dy);
+    };
+    // Mirror the `n == 0` guard the non-joint path gets above: a system that is *all*
+    // accumulator has no PK sub-problem, and an empty reduced solve would hand back an
+    // all-zero state for the caller to mistake for an equilibrated trough.
+    let proj = ChzProjection::new(chz, n);
+    if proj.n_pk_rows() == 0 {
+        return None;
+    }
+    let u_red = equilibrate_ss_input_rate_g::<f64, _, _>(
+        proj.n_pk_rows(),
         ii,
         eq_opts.reltol,
         eq_opts.abstol,
-        |u0| advance(ode.rhs.as_ref(), u0),
-        |u0| advance(&forced_rhs, u0),
-    )
+        |r| advance(&masked_unforced, &proj.embed(r)).map(|f| proj.project(&f)),
+        |r| advance(&masked_forced, &proj.embed(r)).map(|f| proj.project(&f)),
+    )?;
+    Some(proj.embed(&u_red))
 }
 
 /// Bounded iteration budget for the Anderson-accelerated nonlinear periodic-SS solve (#867).
@@ -510,13 +732,43 @@ where
 /// `dose.duration <= dose.ii` (non-overlapping); overlapping pulses
 /// would need a different equilibration scheme and are out of scope —
 /// the existing api.rs warning fires for those.
+///
+/// `chz_before` carries the injected cumulative-hazard accumulators' values *at the record
+/// this dose sits on* (from [`chz_snapshot`] of the caller's current state). Those rows are
+/// held still through the run-in and handed back unchanged: an equilibration is a statement
+/// about the PK compartments, and the hazard clock runs on record time, not on the infinite
+/// past the run-in stands in for (#1210).
 fn equilibrate_ss_state(
+    ode: &crate::ode::OdeSpec,
+    pk_params_flat: &[f64],
+    dose: &DoseEvent,
+    opts: &OdeSolverOptions,
+    chz_before: &[f64],
+) -> Vec<f64> {
+    let mut u = equilibrate_ss_pk_state(ode, pk_params_flat, dose, opts);
+    restore_chz(ode, &mut u, chz_before);
+    u
+}
+
+/// The PK-only body of [`equilibrate_ss_state`]. Every integration here runs under
+/// [`mask_chz`], so the accumulator rows do not move; they come back at zero and the
+/// caller-facing wrapper writes the record values over them. Kept separate so that single
+/// restore is the one exit — including from the three early bail-outs below.
+fn equilibrate_ss_pk_state(
     ode: &crate::ode::OdeSpec,
     pk_params_flat: &[f64],
     dose: &DoseEvent,
     opts: &OdeSolverOptions,
 ) -> Vec<f64> {
     let n = ode.n_states;
+    let chz = &ode.chz_state_slots[..];
+    // The model's own RHS with the accumulator derivatives held at zero. Everything the
+    // equilibration integrates goes through this instead of `ode.rhs` — the exact solve's
+    // propagator probes, the infusion windows, and the capped pulse-train fallback alike.
+    let base_rhs = |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
+        (ode.rhs)(y, p, t, dy);
+        mask_chz(chz, dy);
+    };
     let mut u = vec![0.0; n];
 
     if dose.ii <= 0.0 {
@@ -593,7 +845,7 @@ fn equilibrate_ss_state(
         let local_f_bio = vec![f_bio; n_pulses];
         let no_lag: [f64; 0] = [];
         let no_zero_order: [(usize, f64); 0] = [];
-        let wrapped = wrap_rhs_with_forcings(
+        let wrapped_raw = wrap_rhs_with_forcings(
             ode,
             &local_doses,
             &no_lag,
@@ -603,6 +855,11 @@ fn equilibrate_ss_state(
             InfusionInput::Spanning(Vec::new()),
             &no_zero_order,
         );
+        // The forcing wrapper builds on `ode.rhs`, so the mask goes on the outside of it.
+        let wrapped = |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
+            wrapped_raw(y, p, t, dy);
+            mask_chz(chz, dy);
+        };
         let mut tracker = SsStopTracker::default();
         let mut cycles_run = 0usize;
         let mut early_stopped = false;
@@ -653,7 +910,7 @@ fn equilibrate_ss_state(
     let eq_opts = ss_equilibration_opts(opts);
     let advance_unforced = |u0: &[f64]| -> Option<Vec<f64>> {
         solve_ode(
-            &ode.rhs,
+            &base_rhs,
             u0,
             (0.0, dose.ii),
             pk_params_flat,
@@ -669,7 +926,7 @@ fn equilibrate_ss_state(
             // loop runs, as a pure function of `u0`.
             let rate = inf_rate;
             let wrapped_rhs = |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
-                (ode.rhs)(y, p, t, dy);
+                base_rhs(y, p, t, dy);
                 if cmt_idx < dy.len() {
                     dy[cmt_idx] += rate;
                 }
@@ -687,7 +944,7 @@ fn equilibrate_ss_state(
             let quiet = dose.ii - t_inf;
             if quiet > 0.0 {
                 y = solve_ode(
-                    &ode.rhs,
+                    &base_rhs,
                     &y,
                     (0.0, quiet),
                     pk_params_flat,
@@ -702,7 +959,7 @@ fn equilibrate_ss_state(
             let mut y = u0.to_vec();
             y[cmt_idx] += f_bio * dose.amt;
             solve_ode(
-                &ode.rhs,
+                &base_rhs,
                 &y,
                 (0.0, dose.ii),
                 pk_params_flat,
@@ -713,7 +970,8 @@ fn equilibrate_ss_state(
             .map(|p| p.u.clone())
         }
     };
-    if let Some(u_ss) = crate::dosing::periodic_ss_fixed_point_g::<f64, _, _>(
+    if let Some(u_ss) = periodic_ss_fixed_point_pk(
+        chz,
         n,
         dose.ii,
         eq_opts.reltol,
@@ -739,7 +997,7 @@ fn equilibrate_ss_state(
             // dosing compartment.
             let rate = inf_rate;
             let wrapped_rhs = |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
-                (ode.rhs)(y, p, t, dy);
+                base_rhs(y, p, t, dy);
                 if cmt_idx < dy.len() {
                     dy[cmt_idx] += rate;
                 }
@@ -758,7 +1016,7 @@ fn equilibrate_ss_state(
             // Quiet window from end-of-infusion to end-of-cycle.
             let quiet = dose.ii - t_inf;
             if quiet > 0.0 {
-                let sol = solve_ode(&ode.rhs, &u, (0.0, quiet), pk_params_flat, &[quiet], opts);
+                let sol = solve_ode(&base_rhs, &u, (0.0, quiet), pk_params_flat, &[quiet], opts);
                 if let Some(last) = sol.last() {
                     u.copy_from_slice(&last.u);
                 }
@@ -776,7 +1034,7 @@ fn equilibrate_ss_state(
             // the cycle instead.
             u[cmt_idx] += f_bio * dose.amt;
             let sol = solve_ode(
-                &ode.rhs,
+                &base_rhs,
                 &u,
                 (0.0, dose.ii),
                 pk_params_flat,
@@ -828,14 +1086,40 @@ fn equilibrate_ss_state(
 /// [`crate::dosing::ss_residual_infusion_end`], which is where that window and
 /// this one are kept consistent. (Overlapping infusions, `T_inf > II`, are
 /// rejected upstream.)
+///
+/// `chz_before` is [`equilibrate_ss_state`]'s: the accumulator values at the record. The phase
+/// advance is still part of the run-in — it reconstructs the *previous* interval's tail, which
+/// happened before the record began — so it too integrates under [`mask_chz`]. Without that,
+/// a lagged SS dose banked another `phase` worth of hazard on top of the equilibration's, which
+/// is where #1210's `ALAG1 = 2` arm got its extra `0.2` and its non-monotone `H`.
 fn ss_state_at_phase(
     ode: &crate::ode::OdeSpec,
     pk_params_flat: &[f64],
     dose: &DoseEvent,
     phase: f64,
     opts: &OdeSolverOptions,
+    chz_before: &[f64],
 ) -> Vec<f64> {
-    let mut u = equilibrate_ss_state(ode, pk_params_flat, dose, opts);
+    let mut u = ss_state_at_phase_pk(ode, pk_params_flat, dose, phase, opts);
+    restore_chz(ode, &mut u, chz_before);
+    u
+}
+
+/// The PK-only body of [`ss_state_at_phase`] — see that function. Every integration runs under
+/// [`mask_chz`]; the accumulator rows come back at zero for the wrapper to fill.
+fn ss_state_at_phase_pk(
+    ode: &crate::ode::OdeSpec,
+    pk_params_flat: &[f64],
+    dose: &DoseEvent,
+    phase: f64,
+    opts: &OdeSolverOptions,
+) -> Vec<f64> {
+    let chz = &ode.chz_state_slots[..];
+    let base_rhs = |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
+        (ode.rhs)(y, p, t, dy);
+        mask_chz(chz, dy);
+    };
+    let mut u = equilibrate_ss_pk_state(ode, pk_params_flat, dose, opts);
     let cmt_idx = dose.cmt_idx();
     if cmt_idx >= u.len() {
         return u;
@@ -857,7 +1141,7 @@ fn ss_state_at_phase(
         let (rate, t_inf) = dose.bioavailable_infusion(f_bio);
         let active = phase.min(t_inf);
         let wrapped_rhs = |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
-            (ode.rhs)(y, p, t, dy);
+            base_rhs(y, p, t, dy);
             if cmt_idx < dy.len() {
                 dy[cmt_idx] += rate;
             }
@@ -875,7 +1159,7 @@ fn ss_state_at_phase(
         }
         if phase > t_inf {
             let quiet = phase - t_inf;
-            let sol = solve_ode(&ode.rhs, &u, (0.0, quiet), pk_params_flat, &[quiet], opts);
+            let sol = solve_ode(&base_rhs, &u, (0.0, quiet), pk_params_flat, &[quiet], opts);
             if let Some(last) = sol.last() {
                 u.copy_from_slice(&last.u);
             }
@@ -885,7 +1169,7 @@ fn ss_state_at_phase(
         // an input-rate compartment is rejected upstream by `E_ABSORPTION_SS`;
         // see the matching note in `equilibrate_ss_state`.
         u[cmt_idx] += f_bio * dose.amt;
-        let sol = solve_ode(&ode.rhs, &u, (0.0, phase), pk_params_flat, &[phase], opts);
+        let sol = solve_ode(&base_rhs, &u, (0.0, phase), pk_params_flat, &[phase], opts);
         if let Some(last) = sol.last() {
             u.copy_from_slice(&last.u);
         }
@@ -1853,6 +2137,20 @@ pub struct OdeSpec {
     pub n_states: usize,
     /// Names of state variables (e.g., ["depot", "central"])
     pub state_names: Vec<String>,
+    /// State slots of the **injected** joint-PK-TTE `d/dt(__chz_<cmt>)` cumulative-hazard
+    /// accumulators. Empty for every model without an `[event_model]`, and empty in a build
+    /// without the `survival` feature.
+    ///
+    /// These rows are not compartments of the PK system: each is a pure integrator with no
+    /// elimination term, so it has no steady state and must be held out of anything that
+    /// assumes one. `[fit_options]`-visible consequence: an `SS=1` dose equilibrates the PK
+    /// rows only and hands the accumulator back at its pre-record value (#1210).
+    ///
+    /// Carried by slot rather than by name for the reason #1166 records: without `survival`
+    /// there is no reserved-name guard, so a user may legally declare a state called
+    /// `__chz_1`, and a name-prefix filter would then silently treat that user's own state as
+    /// an accumulator.
+    pub chz_state_slots: Vec<usize>,
     /// How the per-observation observable is computed. Replaces the
     /// earlier `(obs_cmt_idx, output_fn)` pair — see [`OdeReadout`].
     pub readout: OdeReadout,
@@ -1915,6 +2213,18 @@ pub struct OdeSpec {
 }
 
 impl OdeSpec {
+    /// The solver options this spec is actually integrated at: its baked
+    /// [`solver_opts`](Self::solver_opts) with any fit-scoped override merged in (#1212).
+    ///
+    /// **Every integration path must read this, not the field.** `solver_opts` is stamped at
+    /// parse time and `fit` takes `&CompiledModel`, so a call-time `FitOptions::ode_reltol` /
+    /// `ode_method` / … has no other way to reach the integrator; a site that reads the field
+    /// directly silently runs at the parse-time value instead. Outside a fit (`predict`, a
+    /// hand-built spec) nothing is armed and this returns the field unchanged.
+    pub(crate) fn effective_solver_opts(&self) -> crate::ode::OdeSolverOptions {
+        crate::ode::solver::effective_solver_options(self.solver_opts)
+    }
+
     /// Initial compartment-amount vector for a subject, given the flat
     /// individual-parameter vector `params` (`PkParams.values`). Returns the
     /// `init(...)` expression values where declared and `0.0` elsewhere; when
@@ -2043,7 +2353,7 @@ fn integrate_segment(
     // Must be sorted ascending and lie in `(t_start, t_end]`; the caller filters.
     chz_times: &[f64],
 ) -> Vec<Vec<f64>> {
-    let opts = ode.solver_opts;
+    let opts = ode.effective_solver_opts();
 
     // Observation times in this segment (t_start < t <= t_end)
     let mut saveat: Vec<f64> = subject
@@ -2342,12 +2652,14 @@ fn reseed_prescheduled_states_at(
     for (i, dose) in doses.iter().enumerate() {
         let lag = dose_lagtimes[i];
         if ss_seeded_at_record(dose, lag) && (dose.time - t_start).abs() < 1e-12 {
+            let chz_before = chz_snapshot(ode, u);
             u.copy_from_slice(&ss_state_at_phase(
                 ode,
                 pk_params_flat,
                 dose,
                 ss_seed_phase(dose, lag),
                 opts,
+                &chz_before,
             ));
         }
     }
@@ -2359,7 +2671,14 @@ fn reseed_prescheduled_states_at(
         // there, and it is exact only while the flowed state IS the trough
         // (#1121). Past `lag = II` it is not, and the shortcut reads ~4 % high.
         if dose.ss && dose.ii > 0.0 && ss_arrival_is_trough(dose, dose_lagtimes[i]) {
-            u.copy_from_slice(&equilibrate_ss_state(ode, pk_params_flat, dose, opts));
+            let chz_before = chz_snapshot(ode, u);
+            u.copy_from_slice(&equilibrate_ss_state(
+                ode,
+                pk_params_flat,
+                dose,
+                opts,
+                &chz_before,
+            ));
         }
     }
 }
@@ -2442,7 +2761,7 @@ fn ode_predictions_with_extra_breaks_and_stats(
 ) -> (Vec<f64>, Vec<Vec<f64>>) {
     let n = ode.n_states;
     let n_obs = subject.obs_times.len();
-    let opts = ode.solver_opts;
+    let opts = ode.effective_solver_opts();
     // #570: full state at each `chz_times[i]`, pre-filled NaN so a soft time before
     // the integration start (or otherwise uncovered by a segment) reads NaN → the TTE
     // 1e20 sentinel — exactly as the dedicated `ode_dense_solve_states` path does
@@ -3710,7 +4029,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 &base_lagtimes,
                 pk_params_flat,
                 t_start,
-                &ode.solver_opts,
+                &ode.effective_solver_opts(),
             );
         }
 
@@ -4299,8 +4618,11 @@ pub(crate) fn verify_adaptive_frozen_replay(
     // small multiple of the solver's own error control covers that while still
     // flagging any sub-percent dose-bookkeeping divergence.
     const REPLAY_TOL_FACTOR: f64 = 8.0;
-    let rel_tol = (REPLAY_TOL_FACTOR * ode.solver_opts.reltol).max(1e-9);
-    let abs_tol = (REPLAY_TOL_FACTOR * ode.solver_opts.abstol).max(1e-12);
+    // Both engines integrate at the fit-scoped options (#1212), so the agreement band is
+    // derived from those and not from the spec's parse-time field.
+    let replay_opts = ode.effective_solver_opts();
+    let rel_tol = (REPLAY_TOL_FACTOR * replay_opts.reltol).max(1e-9);
+    let abs_tol = (REPLAY_TOL_FACTOR * replay_opts.abstol).max(1e-12);
     for (j, (got, want)) in run.predictions.iter().zip(static_preds.iter()).enumerate() {
         // Unrecorded slots are NaN in both engines (same observation grid), so
         // NaN==NaN is agreement; a NaN-vs-finite split is a genuine divergence.
@@ -4829,7 +5151,7 @@ pub fn ode_predictions_event_driven(
 
     let n = ode.n_states;
     let n_obs = subject.obs_times.len();
-    let opts = ode.solver_opts;
+    let opts = ode.effective_solver_opts();
 
     // First-dose time anchor for TAFD injection via extended params.
     // fold yields INFINITY when there are no doses; convert to NaN so the ODE
@@ -5254,12 +5576,14 @@ pub fn ode_predictions_event_driven(
                 // the arrival, where only the pulse is applied.
                 let d = &subject.doses[idx];
                 if ss_seeded_at_record(d, dose_lagtimes[idx]) {
+                    let chz_before = chz_snapshot(ode, &u);
                     u = ss_state_at_phase(
                         ode,
                         &pk_at_dose[idx].values,
                         d,
                         ss_seed_phase(d, dose_lagtimes[idx]),
                         &opts,
+                        &chz_before,
                     );
                 }
             }
@@ -5280,7 +5604,8 @@ pub fn ode_predictions_event_driven(
                 // propagation and restore the defect. The two branches read the
                 // same predicate, so they cannot both fire or both skip.
                 if d.ss && d.ii > 0.0 && !ss_seeded_at_record(d, dose_lagtimes[idx]) {
-                    u = equilibrate_ss_state(ode, &dose_pk.values, d, &opts);
+                    let chz_before = chz_snapshot(ode, &u);
+                    u = equilibrate_ss_state(ode, &dose_pk.values, d, &opts, &chz_before);
                 }
                 // Boluses: add amt to state. Infusions: no instantaneous
                 // change — handled via the wrapped RHS for segments inside
@@ -5417,7 +5742,7 @@ pub fn ode_predictions_ekf_with_diffusion(
         &subject.doses,
         &subject.obs_times,
         &r_obs_vec,
-        ode.solver_opts,
+        ode.effective_solver_opts(),
     );
 
     let ipreds: Vec<f64> = pts.iter().map(|p| p.ipred).collect();
@@ -5484,7 +5809,7 @@ pub fn ode_predictions_ekf(
         &subject.doses,
         &subject.obs_times,
         &r_obs_vec,
-        ode.solver_opts,
+        ode.effective_solver_opts(),
     );
 
     let ipreds: Vec<f64> = pts.iter().map(|p| p.ipred).collect();
@@ -5532,7 +5857,7 @@ pub fn ode_predictions_with_states(
 ) -> (Vec<f64>, Vec<Vec<f64>>) {
     let n = ode.n_states;
     let n_obs = subject.obs_times.len();
-    let opts = ode.solver_opts;
+    let opts = ode.effective_solver_opts();
 
     let mut u = ode.initial_state(pk_params_flat);
     let mut predictions = vec![f64::NAN; n_obs];
@@ -5606,7 +5931,15 @@ pub fn ode_predictions_with_states(
         for (i, dose) in subject.doses.iter().enumerate() {
             let lag = dose_lagtimes[i];
             if ss_seeded_at_record(dose, lag) && (dose.time - t_start).abs() < 1e-12 {
-                u = ss_state_at_phase(ode, pk_params_flat, dose, ss_seed_phase(dose, lag), &opts);
+                let chz_before = chz_snapshot(ode, &u);
+                u = ss_state_at_phase(
+                    ode,
+                    pk_params_flat,
+                    dose,
+                    ss_seed_phase(dose, lag),
+                    &opts,
+                    &chz_before,
+                );
                 if let Some(residual_end) = ss_residual_infusion_end(dose, lag, dose_f_bio[i]) {
                     // The previous cycle's infusion is still running at the record
                     // and stops inside the pre-arrival window (#1121). Registered
@@ -5630,7 +5963,8 @@ pub fn ode_predictions_with_states(
                     // because the propagated state at the arrival is the trough
                     // (#1121). Past `lag = II` it is not, so the seed flows here
                     // instead of being overwritten.
-                    u = equilibrate_ss_state(ode, pk_params_flat, dose, &opts);
+                    let chz_before = chz_snapshot(ode, &u);
+                    u = equilibrate_ss_state(ode, pk_params_flat, dose, &opts, &chz_before);
                 }
                 if !is_real_infusion(dose) {
                     if !input_rate_consumes_cmt(ode, dose.cmt_raw()) {
@@ -5952,7 +6286,15 @@ fn apply_segment_boundary(
     for (i, dose) in subject.doses.iter().enumerate() {
         let lag = dose_lagtimes[i];
         if ss_seeded_at_record(dose, lag) && (dose.time - t_start).abs() < 1e-12 {
-            *u = ss_state_at_phase(ode, pk_params_flat, dose, ss_seed_phase(dose, lag), opts);
+            let chz_before = chz_snapshot(ode, u);
+            *u = ss_state_at_phase(
+                ode,
+                pk_params_flat,
+                dose,
+                ss_seed_phase(dose, lag),
+                opts,
+                &chz_before,
+            );
             if let Some(residual_end) = ss_residual_infusion_end(dose, lag, dose_f_bio[i]) {
                 // The previous cycle's infusion is still running at the record
                 // and stops inside the pre-arrival window (#1121). Registered
@@ -5973,7 +6315,8 @@ fn apply_segment_boundary(
                 // Lagged arrival: pre-lag seeding already done above. The
                 // overwrite is exact only while the flowed state is the trough
                 // (#1121); past `lag = II` the seed flows here instead.
-                *u = equilibrate_ss_state(ode, pk_params_flat, dose, opts);
+                let chz_before = chz_snapshot(ode, u);
+                *u = equilibrate_ss_state(ode, pk_params_flat, dose, opts, &chz_before);
             }
             if !is_real_infusion(dose) {
                 if !input_rate_consumes_cmt(ode, dose.cmt_raw()) {
@@ -6060,7 +6403,7 @@ pub fn ode_dense_solve_states(
         return vec![];
     }
     let n = ode.n_states;
-    let opts = ode.solver_opts;
+    let opts = ode.effective_solver_opts();
 
     let mut u = ode.initial_state(pk_params_flat);
     let mut result: Vec<Vec<f64>> = vec![vec![f64::NAN; n]; saveat.len()];
@@ -6116,11 +6459,37 @@ pub fn ode_dense_solve_states(
         }
     }
 
-    for w in break_times.windows(2) {
-        let (t_start, t_end) = (w[0], w[1]);
-        if (t_end - t_start).abs() < 1e-15 {
-            continue;
+    // Walk every break as a **left boundary** — bound `0..len`, the walk
+    // `ode_predictions` and `ode_predictions_with_states` use (#731) — so a dose
+    // landing on the final break is applied and its `saveat` read post-dose, and a
+    // one-break timeline is visited exactly once (#1218: every `saveat` at or before
+    // the first event puts the horizon `t_last` on the integration start, so the
+    // timeline is a single instant). The integration half runs only while a next
+    // break exists; on the last break the boundary visit is all there is.
+    //
+    // History, because both defects lived in this loop's shape: it was a
+    // `windows(2)` walk that saw the final break only as a segment *end*, patched by
+    // a post-loop re-visit for #731 that was guarded to `len >= 2` — "a single-instant
+    // `saveat` keeps its prior behaviour", and the prior behaviour was the `f64::NAN`
+    // prefill, which `predict_survival(&[0.0])` and the event-driven `[derived]` state
+    // path returned as a silent non-answer. The `0..len` walk has no special case to
+    // guard. The pre-first-event prefill above is deliberately *not* widened to cover
+    // the instant: it holds the seeded, pre-dose state, and a drug-driven hazard read
+    // off it is wrong in a way that looks finite.
+    //
+    // The last break's visit is skipped when no `saveat` sits on it: `u`, `ext_params`
+    // and `active_infusions` are dead after this loop, so the SS equilibration it
+    // would run for a grid entirely before the first event (`[-1.0]` with a dose at
+    // `0`, where the `0.0`-seeded horizon fold still puts the dose on the timeline)
+    // has no reader. Unobservable on every other timeline: `t_last` is a `saveat`
+    // whenever any point is non-negative.
+    for k in 0..break_times.len() {
+        let t_start = break_times[k];
+        let next = break_times.get(k + 1).copied();
+        if next.is_none() && !saveat_map.contains_key(&t_start.to_bits()) {
+            break;
         }
+        let t_end = next.unwrap_or(t_start);
 
         let forcings = apply_segment_boundary(
             ode,
@@ -6146,6 +6515,10 @@ pub fn ode_dense_solve_states(
                 result[i] = u.clone();
             }
         }
+
+        let Some(t_end) = next else {
+            break;
+        };
 
         let mut seg_saveat: Vec<f64> = saveat
             .iter()
@@ -6193,40 +6566,6 @@ pub fn ode_dense_solve_states(
 
         if let Some(last) = sol.last() {
             u.copy_from_slice(&last.u);
-        }
-    }
-
-    // #731: the `windows(2)` loop visits the final break `t_last` only as a segment
-    // *end*, so a dose landing exactly on it is never applied and a `saveat` there
-    // reads the pre-dose state — the same terminal-break bug fixed on the
-    // constant-parameter engine (`ode_predictions_and_chz`). Visit `t_last` once more
-    // as a left boundary (dose applied via the shared `apply_segment_boundary`, then
-    // the `saveat` re-read post-dose) so the two paths agree and #570's
-    // one-solve == two-solve equivalence holds at a dose-on-`t_last`. When no dose
-    // lands there this re-reads the identical carried `u`, so it stays byte-identical
-    // everywhere else. Guarded to a timeline the loop actually ran (`len >= 2`); a
-    // single-instant `saveat` keeps its prior behaviour.
-    if break_times.len() >= 2 {
-        let t_last_break = break_times[break_times.len() - 1];
-        let _ = apply_segment_boundary(
-            ode,
-            subject,
-            &dose_lagtimes,
-            &dose_f_bio,
-            &zo_windows,
-            pk_params_flat,
-            n,
-            &opts,
-            t_last_break,
-            t_last_break,
-            &mut u,
-            &mut active_infusions,
-            &mut ext_params,
-        );
-        if let Some(idxs) = saveat_map.get(&t_last_break.to_bits()) {
-            for &i in idxs {
-                result[i] = u.clone();
-            }
         }
     }
 
@@ -6281,6 +6620,12 @@ pub enum ThresholdOutcome {
 /// `prepare_input_rates`, `wrap_rhs_with_forcings`); only the segment *loop* is
 /// restated, and it is pinned against drift by the `until_chz_threshold` parity
 /// test (the crossing time it returns must satisfy `CHZ_dense(t) ≈ threshold`).
+///
+/// One deliberate difference from the dense walk: the final break is visited only as
+/// a segment *end*, never as a left boundary (#731 / #1218). A dose landing exactly on
+/// `horizon` cannot move the accumulator before `horizon`, and a one-break timeline —
+/// `horizon` at the integration start — is a censored draw, not a solve; so there is
+/// no post-dose state to read here and nothing for the parity test to miss.
 #[cfg(feature = "survival")]
 pub(crate) fn ode_solve_until_chz_threshold(
     ode: &OdeSpec,
@@ -6293,7 +6638,7 @@ pub(crate) fn ode_solve_until_chz_threshold(
     use crate::ode::solver::{solve_ode_until_threshold, ThresholdCrossing};
 
     let n = ode.n_states;
-    let opts = ode.solver_opts;
+    let opts = ode.effective_solver_opts();
     let mut u = ode.initial_state(pk_params_flat);
 
     // Resolve modeled-RATE doses once, exactly as the dense path (#324).

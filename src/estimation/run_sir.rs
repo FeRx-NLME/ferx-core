@@ -89,6 +89,20 @@ pub fn run_sir(
     population: Option<&Population>,
     options: &FitOptions,
 ) -> Result<FitResult, String> {
+    // #1212: carry this call's ODE solver settings to the integrator, as `fit()` does. Every
+    // SIR sample re-solves the inner loop, so without this a caller-supplied `ode_reltol` /
+    // `ode_method` would be ignored and the sampled OFVs would come from a different
+    // integration accuracy than the fit being refined. The scope also puts the sample
+    // fan-out on a pool whose workers carry the same settings.
+    crate::api::with_fit_ode_scope(options, || run_sir_scoped(fit, model, population, options))?
+}
+
+fn run_sir_scoped(
+    fit: &FitResult,
+    model: Option<&CompiledModel>,
+    population: Option<&Population>,
+    options: &FitOptions,
+) -> Result<FitResult, String> {
     // Hash verification runs before the covariance check so a stale-input
     // error wins over a missing-cov error. A user pointing at the wrong
     // model or dataset should hear about that first; the cov-missing case

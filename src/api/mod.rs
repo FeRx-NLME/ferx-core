@@ -55,8 +55,12 @@ pub use fit::{fit, fit_from_files};
 pub use levels::{bind_theta_levels, level_map as theta_level_map};
 pub use output_columns::tafd_tad_for_subject;
 pub(crate) use output_columns::{compute_extra_output_columns, trapezoid};
-pub(crate) use pool::{build_fit_pool, default_fit_pool};
 pub use pool::{configure_global_thread_pool, PoolPlan, FIT_RAYON_STACK_SIZE};
+pub(crate) use pool::{install_on_fit_pool, with_fit_ode_scope};
+// Reached only from tests (the fit paths call these from inside `pool` itself), but `pool` is
+// private to `api`, so a test elsewhere in the crate needs the re-export.
+#[cfg(test)]
+pub(crate) use pool::{default_fit_pool, ode_override_pool};
 pub(crate) use postfit::{
     absorption_flip_flop_ebe_warning, boundary_estimate_warning, compute_eps_shrinkage,
     compute_eta_shrinkage, compute_kappa_shrinkage, compute_kappa_shrinkage_by_occ,
@@ -245,6 +249,10 @@ mod tests_param_corr;
 #[cfg(test)]
 #[path = "tests/ode_solver_diagnostics_tests.rs"]
 mod ode_solver_diagnostics_tests;
+
+#[cfg(test)]
+#[path = "tests/ode_solver_options_tests.rs"]
+mod ode_solver_options_tests;
 
 #[cfg(test)]
 #[path = "tests/simulate_with_uncertainty_tests.rs"]

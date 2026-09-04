@@ -663,6 +663,7 @@ fn generate_mm_oral() {
             du[1] = ka * depot / v - vmax * central / (km + central);
         });
     let ode_spec = ferx_core::ode::OdeSpec {
+        chz_state_slots: Vec::new(),
         rhs: ode_rhs,
         n_states: 2,
         state_names: vec!["depot".into(), "central".into()],

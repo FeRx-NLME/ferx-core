@@ -298,6 +298,139 @@ impl Default for OdeSolverOptions {
     }
 }
 
+// ── Fit-scoped solver-option override (#1212) ───────────────────────────────────────────
+//
+// `OdeSpec::solver_opts` is stamped once, at parse time, by
+// `CompiledModel::sync_ode_solver_opts`, and every integration entry point reads the value off
+// the spec rather than off `FitOptions`. `fit` takes `&CompiledModel`, so it cannot restamp the
+// spec — which is why, before #1212, a caller-supplied `FitOptions::ode_reltol` / `ode_method` /
+// … reached nothing at all: the fit ran at the parse-time value and reported success. The
+// override below carries those fields the last hop.
+
+/// A per-field override of a spec's baked [`OdeSolverOptions`], armed for the duration of one
+/// [`fit`](crate::fit) (#1212).
+///
+/// Only the fields a caller actually moved are `Some`. `FitOptions::ode_solver_override` builds
+/// this by comparing against `FitOptions::default()`, whose `ode_*` values are identical to
+/// [`OdeSolverOptions::default`]'s by construction (pinned by
+/// `fit_option_ode_defaults_match_the_solver_defaults`), which is what makes the merge
+/// one-directional: a caller who never touched a field cannot silently *loosen* a model file
+/// that pinned it.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct OdeSolverOverride {
+    pub(crate) reltol: Option<f64>,
+    pub(crate) abstol: Option<f64>,
+    pub(crate) max_steps: Option<usize>,
+    pub(crate) method: Option<OdeMethod>,
+    /// Doubly wrapped deliberately: the outer `Option` is "the caller moved this field", the
+    /// inner one is the field's own `None` (no abort budget). While the default is `None` the
+    /// inner `None` is unreachable from `FitOptions::ode_solver_override` — "moved" and "set to
+    /// something" coincide — but collapsing the two would silently turn a future non-`None`
+    /// default into a field that could no longer be cleared.
+    pub(crate) stiff_abort_after: Option<Option<u32>>,
+    pub(crate) auto_switch: Option<bool>,
+}
+
+impl OdeSolverOverride {
+    /// True when no field was moved, i.e. arming this would be a no-op.
+    pub(crate) fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Merge onto a spec's baked options. Unset fields keep the baked value, so a model file's
+    /// `[fit_options]` still wins wherever the caller expressed no opinion.
+    pub(crate) fn apply_to(&self, base: OdeSolverOptions) -> OdeSolverOptions {
+        OdeSolverOptions {
+            reltol: self.reltol.unwrap_or(base.reltol),
+            abstol: self.abstol.unwrap_or(base.abstol),
+            max_steps: self.max_steps.unwrap_or(base.max_steps),
+            method: self.method.unwrap_or(base.method),
+            stiff_abort_after: self.stiff_abort_after.unwrap_or(base.stiff_abort_after),
+            auto_switch: self.auto_switch.unwrap_or(base.auto_switch),
+            ..base
+        }
+    }
+}
+
+// ── Where the armed override lives: one thread-local, and a pool that carries it ────────
+//
+// The override is *per fit*, and a fit is not one thread: the inner loop fans out over
+// subjects with rayon, so the workers doing the integrating have to see it too. Two shapes
+// were tried and both are wrong, which is why this one looks the way it does.
+//
+// A single process-global slot — the shape `estimation::inner_optimizer::INNER_OPT_MODE`
+// uses — cannot express "this fit's options" at all. `ferx-tools` runs `fit()` from a
+// `par_iter` over replicates and `api::pool` explicitly supports concurrent callers, so with
+// one slot a second fit's arming overwrites the first's, and a fit that expressed *no*
+// opinion (the default `FitOptions`, i.e. almost every fit in the process) pushes the slot
+// back to "nothing armed" while another fit is still running. Both directions silently return
+// a number computed at an accuracy nobody asked for, which is #1212 itself.
+//
+// A thread-local alone fixes the arming thread and leaves every worker reading whatever some
+// other fit published — the same defect, one thread over, and *not* bounded in the safe
+// direction: `ode_reltol` takes any positive value, a method-only override replaces no
+// tolerance at all, and `ode_max_steps` / `ode_stiff_abort_after` have no tighter/coarser
+// ordering to fall back on.
+//
+// So the override is a thread-local, and a fit that has one **runs on a pool whose workers
+// were started with that same value already installed** ([`crate::api::ode_override_pool`]).
+// A worker in that pool serves only fits carrying that override — the pool is keyed by it —
+// so "which fit am I serving?" has one answer per thread and no cross-fit read exists to be
+// wrong. A fit with no override keeps using the shared pool, whose workers never install one
+// and therefore integrate at the spec's baked options, whatever any other fit is doing.
+
+thread_local! {
+    /// The override in force on this thread: `None` outside a fit (and on every worker of the
+    /// shared pool), `Some(None)` for a fit that expressed no opinion, `Some(Some(ov))`
+    /// otherwise.
+    ///
+    /// On a thread that arms, [`OdeSolverOverrideGuard`] restores the previous value on drop —
+    /// correct here in a way it is not for a process-global, since arm and drop are the same
+    /// thread's and the nesting really is LIFO. On a worker of an override pool the value is
+    /// installed once at thread start and never changes.
+    static LOCAL_OVERRIDE: std::cell::Cell<Option<Option<OdeSolverOverride>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The options an integration should actually run at: `baked` with any fit-scoped override
+/// applied. Read through [`OdeSpec::effective_solver_opts`](crate::ode::predictions::OdeSpec),
+/// never by touching `OdeSpec::solver_opts` directly.
+pub(crate) fn effective_solver_options(baked: OdeSolverOptions) -> OdeSolverOptions {
+    match LOCAL_OVERRIDE.get().flatten() {
+        Some(ov) => ov.apply_to(baked),
+        None => baked,
+    }
+}
+
+pub(crate) fn install_worker_ode_override(ov: OdeSolverOverride) {
+    LOCAL_OVERRIDE.set(Some(Some(ov)));
+}
+
+/// Arms `ov` on this thread until the returned guard drops, restoring whatever was in force
+/// before — so a nested fit's opinion wins while it runs and hands the setting back on exit,
+/// and an early `?` return out of the fit cannot leak the override into a later `predict`.
+///
+/// Arming alone reaches only this thread. A caller whose work fans out over rayon must run
+/// that work through [`crate::api::pool::with_fit_ode_scope`], which also puts it on a pool
+/// whose workers carry the same value.
+#[must_use = "the override is disarmed as soon as this guard drops"]
+pub(crate) struct OdeSolverOverrideGuard {
+    prev: Option<Option<OdeSolverOverride>>,
+}
+
+/// See [`OdeSolverOverrideGuard`]. An empty override arms `Some(None)`: "this fit expressed no
+/// opinion" has to mean the spec's own baked value, not the enclosing fit's tolerance.
+pub(crate) fn arm_ode_solver_override(ov: OdeSolverOverride) -> OdeSolverOverrideGuard {
+    let prev = LOCAL_OVERRIDE.replace(Some((!ov.is_empty()).then_some(ov)));
+    OdeSolverOverrideGuard { prev }
+}
+
+impl Drop for OdeSolverOverrideGuard {
+    fn drop(&mut self) {
+        LOCAL_OVERRIDE.set(self.prev);
+    }
+}
+
 /// Scale-aware tolerance band `abstol + reltol * max(|a|, |b|)`. Shared by the RK45
 /// step-error control, the per-step monotonicity guard (`mono_tol`), and the TTE
 /// cumulative-hazard monotonicity floor (`survival::MonoTol`), so the integrator and the
@@ -1874,6 +2007,351 @@ fn jets_finite_g<T: PkNum>(points: &[SolPointG<T>]) -> bool {
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    // -- Fit-scoped solver-option override (#1212) -------------------------------------
+    //
+    // Note for anyone adding to these: an armed override reaches the thread that armed it
+    // and the workers of the pool keyed to it, and nothing else - so these need no
+    // serialising against the rest of the binary, and adding a lock would hide the very
+    // property they exist to check. Two things still follow. Assert from the thread that
+    // should see the value (arming thread, or inside `pool.install`), since the *absence* of
+    // an override elsewhere is half of what is being pinned. And prefer values that tighten
+    // accuracy: `ode_override_pool` caches a pool per override for the life of the process,
+    // so an exotic one costs a set of worker threads that never go away.
+
+    /// The whole merge rule rests on this: `ode_solver_override` treats "equal to the
+    /// `FitOptions` default" as "the caller expressed no opinion", which is only sound
+    /// while those defaults are the solver's own. If someone changes one side alone, a
+    /// caller asking for the new `FitOptions` default would start silently overriding a
+    /// model file (or stop being able to ask for the solver default at all).
+    #[test]
+    fn fit_option_ode_defaults_match_the_solver_defaults() {
+        let f = crate::types::FitOptions::default();
+        let s = OdeSolverOptions::default();
+        assert_eq!(f.ode_reltol, s.reltol);
+        assert_eq!(f.ode_abstol, s.abstol);
+        assert_eq!(f.ode_max_steps, s.max_steps);
+        assert_eq!(f.ode_method, s.method);
+        assert_eq!(f.ode_stiff_abort_after, s.stiff_abort_after);
+        assert_eq!(f.ode_auto_switch, s.auto_switch);
+    }
+
+    #[test]
+    fn untouched_fit_options_carry_no_override() {
+        assert!(crate::types::FitOptions::default()
+            .ode_solver_override()
+            .is_empty());
+    }
+
+    /// The no-loosening half of #1212: a caller who never touched `ode_reltol` must not
+    /// pull a model file that pinned `1e-10` back to the `1e-4` default.
+    #[test]
+    fn an_empty_override_keeps_a_pinned_spec_value() {
+        let baked = OdeSolverOptions {
+            reltol: 1e-10,
+            abstol: 1e-12,
+            ..Default::default()
+        };
+        let merged = OdeSolverOverride::default().apply_to(baked);
+        assert_eq!(merged.reltol, 1e-10);
+        assert_eq!(merged.abstol, 1e-12);
+    }
+
+    /// ...and the half the issue was filed for: a moved field wins over the baked value,
+    /// while every field the caller left alone still comes off the spec.
+    #[test]
+    fn a_moved_field_wins_and_the_rest_stays_baked() {
+        let opts = crate::types::FitOptions {
+            ode_reltol: 1e-10,
+            ode_method: OdeMethod::Rodas4,
+            ode_stiff_abort_after: Some(7),
+            ..Default::default()
+        };
+        let ov = opts.ode_solver_override();
+        assert!(!ov.is_empty());
+        let baked = OdeSolverOptions {
+            reltol: 1e-4,
+            abstol: 1e-9,
+            max_steps: 55_555,
+            method: OdeMethod::Rk45,
+            ..Default::default()
+        };
+        let merged = ov.apply_to(baked);
+        assert_eq!(merged.reltol, 1e-10);
+        assert_eq!(merged.method, OdeMethod::Rodas4);
+        assert_eq!(merged.stiff_abort_after, Some(7));
+        // Untouched by the caller - these must not be reset to the *FitOptions* default.
+        assert_eq!(merged.abstol, 1e-9);
+        assert_eq!(merged.max_steps, 55_555);
+        // And the fields no fit option addresses at all are carried through verbatim.
+        assert_eq!(merged.initial_dt, baked.initial_dt);
+        assert_eq!(merged.min_dt, baked.min_dt);
+    }
+
+    /// `effective_solver_options` is the read path every integration site goes through, and
+    /// the guard is what keeps a fit's setting from leaking into a later `predict`.
+    ///
+    /// Nothing here needs serialising against the rest of the binary: the value lives on this
+    /// thread, so a concurrent test's arming is not visible and this one's is not visible to
+    /// it. That is the property, not a convenience.
+    #[test]
+    fn arming_applies_the_override_and_the_guard_restores_the_previous_one() {
+        let baked = OdeSolverOptions::default();
+        // Nothing armed: the spec's own value, untouched.
+        assert_eq!(effective_solver_options(baked).reltol, baked.reltol);
+
+        let outer = arm_ode_solver_override(OdeSolverOverride {
+            reltol: Some(1e-9),
+            ..Default::default()
+        });
+        assert_eq!(effective_solver_options(baked).reltol, 1e-9);
+        {
+            // A nested fit's opinion wins while it runs...
+            let _inner = arm_ode_solver_override(OdeSolverOverride {
+                reltol: Some(1e-11),
+                ..Default::default()
+            });
+            assert_eq!(effective_solver_options(baked).reltol, 1e-11);
+        }
+        // ...and hands the setting back rather than disarming the outer fit.
+        assert_eq!(effective_solver_options(baked).reltol, 1e-9);
+        {
+            // An *empty* override still shadows: "this fit expressed no opinion" has to
+            // mean the spec's baked value, not the enclosing fit's tolerance.
+            let _quiet = arm_ode_solver_override(OdeSolverOverride::default());
+            assert_eq!(effective_solver_options(baked).reltol, baked.reltol);
+        }
+        assert_eq!(effective_solver_options(baked).reltol, 1e-9);
+        drop(outer);
+        assert_eq!(effective_solver_options(baked).reltol, baked.reltol);
+    }
+
+    /// Concurrent fits with different ODE settings must not see each other's — the case a
+    /// single process-global slot cannot express at all, and the one `ferx-tools` reaches by
+    /// running `fit()` from a `par_iter` while `api::pool` lets other callers fit at the same
+    /// time.
+    ///
+    /// Two earlier shapes failed exactly here. A global slot restored on drop let one fit's
+    /// exit disarm another that was still running, and let the last exit leave a value armed
+    /// with no guard holding it. Publishing the last-armed value to a global mirror replaced
+    /// that with a quieter version of the same thing: a fit that expressed *no* opinion — the
+    /// default `FitOptions`, i.e. almost every fit in a process — read another fit's
+    /// tolerance, and two non-default fits overwrote each other. Neither is bounded in the
+    /// safe direction: `ode_reltol` takes any positive value, so `1e-2` can land on a fit that
+    /// asked for `1e-10`, and `ode_method` / `ode_max_steps` have no tighter-or-coarser
+    /// ordering to fall back on at all.
+    #[test]
+    fn concurrent_fits_do_not_see_each_others_overrides() {
+        use std::sync::mpsc::channel;
+        let baked = OdeSolverOptions::default();
+
+        // Each thread arms, reports, waits until every thread has armed, then checks that it
+        // still reads its own value — so the assertions all happen while all three arms and
+        // one deliberately-empty arm are live at once.
+        let (armed_tx, armed) = channel::<()>();
+        let (go_tx, go) = channel::<()>();
+        let arms = [Some(1e-9), Some(1e-11), Some(1e-13), None];
+
+        std::thread::scope(|s| {
+            let mut releases = Vec::new();
+            for want in arms {
+                let (release_tx, release) = (go_tx.clone(), {
+                    let (tx, rx) = channel::<()>();
+                    releases.push(tx);
+                    rx
+                });
+                let armed_tx = armed_tx.clone();
+                s.spawn(move || {
+                    let _guard = arm_ode_solver_override(OdeSolverOverride {
+                        reltol: want,
+                        ..Default::default()
+                    });
+                    armed_tx.send(()).expect("the test thread is listening");
+                    release.recv().expect("the test thread releases this check");
+                    assert_eq!(
+                        effective_solver_options(baked).reltol,
+                        // An empty override reads as the spec's baked value, and must keep
+                        // reading as that however tight a concurrent fit is running.
+                        want.unwrap_or(baked.reltol),
+                        "a concurrent fit's ODE settings reached this one"
+                    );
+                    drop(release_tx);
+                });
+            }
+            for _ in arms {
+                armed.recv().expect("every fit arms");
+            }
+            for release in releases {
+                release.send(()).expect("a fit is waiting");
+            }
+        });
+
+        // Nothing armed here at any point, and nothing leaked back.
+        assert_eq!(effective_solver_options(baked).reltol, baked.reltol);
+    }
+
+    /// The other half of the same rule, and the one that needs the pool: a worker doing the
+    /// integrating for a fit is *not* the thread that armed. A worker of the shared pool
+    /// serves fits that asked for nothing, so it must read the spec's baked options even
+    /// while another thread holds a tight override; a worker of the pool built for an
+    /// override must read that override without anyone arming anything on it.
+    #[test]
+    fn only_the_pool_built_for_an_override_carries_it() {
+        let baked = OdeSolverOptions::default();
+        let ov = OdeSolverOverride {
+            reltol: Some(1e-11),
+            ..Default::default()
+        };
+        let _tight = arm_ode_solver_override(ov);
+
+        // The shared pool's workers never install an override, so a default-options fit
+        // running there is unaffected by the arming on this thread.
+        if let Some(pool) = crate::api::default_fit_pool() {
+            pool.install(|| {
+                assert_eq!(
+                    effective_solver_options(baked).reltol,
+                    baked.reltol,
+                    "a worker of the shared pool inherited another fit's override"
+                );
+            });
+        }
+
+        // The pool keyed to this override does carry it — on threads that armed nothing.
+        let pool = crate::api::ode_override_pool(ov, 2).expect("the override pool builds");
+        pool.install(|| {
+            assert_eq!(effective_solver_options(baked).reltol, 1e-11);
+            // ...including inside a nested fan-out, which is where the real integrations
+            // happen.
+            use rayon::prelude::*;
+            let seen: Vec<f64> = (0..8)
+                .into_par_iter()
+                .map(|_| effective_solver_options(baked).reltol)
+                .collect();
+            assert!(
+                seen.iter().all(|&r| r == 1e-11),
+                "a worker of the override pool integrated at the baked tolerance: {seen:?}"
+            );
+        });
+    }
+
+    /// Every field has to survive the trip onto a pool worker, since the pool is keyed by the
+    /// override and a key collision would hand a fit someone else's settings. The two cases a
+    /// "did anything change" assertion cannot catch are here: `stiff_abort_after` of
+    /// `Some(Some(0))` (abort on the first clamp) must stay distinct from `Some(None)` (no
+    /// budget), and `auto_switch: Some(false)` from "unset".
+    #[test]
+    fn every_overridable_field_reaches_a_pool_worker() {
+        let baked = OdeSolverOptions {
+            reltol: 1e-4,
+            abstol: 1e-6,
+            max_steps: 10_000,
+            method: OdeMethod::Auto,
+            stiff_abort_after: Some(7),
+            auto_switch: true,
+            ..Default::default()
+        };
+        for method in [
+            OdeMethod::Rk45,
+            OdeMethod::Rosenbrock23,
+            OdeMethod::Rodas4,
+            OdeMethod::Rodas5P,
+            OdeMethod::Vern7,
+            OdeMethod::Auto,
+        ] {
+            let ov = OdeSolverOverride {
+                reltol: Some(1e-9),
+                abstol: Some(1e-12),
+                max_steps: Some(123_456),
+                method: Some(method),
+                stiff_abort_after: Some(Some(0)),
+                auto_switch: Some(false),
+            };
+            let pool = crate::api::ode_override_pool(ov, 2).expect("the override pool builds");
+            pool.install(|| {
+                let eff = effective_solver_options(baked);
+                assert_eq!(eff.reltol, 1e-9);
+                assert_eq!(eff.abstol, 1e-12);
+                assert_eq!(eff.max_steps, 123_456);
+                assert_eq!(eff.method, method, "{method:?} did not reach the worker");
+                assert_eq!(eff.stiff_abort_after, Some(0));
+                assert!(!eff.auto_switch);
+            });
+        }
+
+        // A budget of `None` is distinct from the field being unset: it has to overwrite the
+        // baked `Some(7)` rather than leave it standing.
+        let ov = OdeSolverOverride {
+            stiff_abort_after: Some(None),
+            ..Default::default()
+        };
+        let pool = crate::api::ode_override_pool(ov, 2).expect("the override pool builds");
+        pool.install(|| assert_eq!(effective_solver_options(baked).stiff_abort_after, None));
+    }
+
+    /// A call that lands on a thread already carrying its override must still name that
+    /// override's pool, not fall through to a plain one.
+    ///
+    /// The trap is specific: skipping the pool "because this thread already has the value"
+    /// looks free, but the *fallback* for a pinned `threads` is a pool built without the
+    /// override, so a nested entry point that pinned threads would hand its fan-out to plain
+    /// workers and integrate at the model file's options — #1212, reached from the inside by
+    /// the one shape (`PoolPlan` pins `threads`) the tools actually use.
+    #[test]
+    fn a_nested_call_that_pins_threads_stays_on_the_override_pool() {
+        let baked = OdeSolverOptions::default();
+        let opts = crate::types::FitOptions {
+            ode_reltol: 1e-11,
+            threads: Some(2),
+            ..Default::default()
+        };
+        let ov = opts.ode_solver_override();
+        let pool = crate::api::ode_override_pool(ov, 2).expect("the override pool builds");
+        pool.install(|| {
+            // Already a worker carrying `ov` — exactly the state that made the short-circuit
+            // look safe.
+            assert_eq!(effective_solver_options(baked).reltol, 1e-11);
+            crate::api::install_on_fit_pool(&opts, || {
+                assert_eq!(
+                    effective_solver_options(baked).reltol,
+                    1e-11,
+                    "a nested pinned-threads call was handed a pool without the override"
+                );
+            })
+            .expect("the nested call gets its pool");
+        });
+    }
+
+    /// The pool table is keyed by the override, so two different settings must not land on one
+    /// pool — that would hand a fit another's tolerance through the very mechanism meant to
+    /// keep them apart — and the same settings must reuse one, or a bootstrap's replicate fits
+    /// would each spawn an `N × 32 MiB` pool.
+    #[test]
+    fn the_override_pool_table_is_keyed_by_the_override() {
+        let a = OdeSolverOverride {
+            reltol: Some(1e-9),
+            ..Default::default()
+        };
+        let b = OdeSolverOverride {
+            reltol: Some(1e-10),
+            ..Default::default()
+        };
+        let pool_a = crate::api::ode_override_pool(a, 2).expect("pool a");
+        let pool_b = crate::api::ode_override_pool(b, 2).expect("pool b");
+        let pool_a_again = crate::api::ode_override_pool(a, 2).expect("pool a again");
+        assert!(
+            std::ptr::eq(pool_a, pool_a_again),
+            "the same override built a second pool instead of reusing its own"
+        );
+        assert!(
+            !std::ptr::eq(pool_a, pool_b),
+            "two different overrides share one pool, so its workers carry the wrong one"
+        );
+        // Width is part of the key too: a fit that pinned `threads` must not be handed a pool
+        // of some other width.
+        let narrow = crate::api::ode_override_pool(a, 1).expect("pool a, one thread");
+        assert!(!std::ptr::eq(pool_a, narrow));
+        assert_eq!(narrow.current_num_threads(), 1);
+    }
 
     #[test]
     fn test_exponential_decay() {

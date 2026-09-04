@@ -39,6 +39,16 @@ section of the SDLC for the versioning policy).
   estimated correlation is now rejected with `E_BLOCK_SIGMA_CHAIN_UNSUPPORTED` rather than
   silently scoring the declared value — `[saem, focei]` is fine, `[focei, imp]` needs `FIX`.
 
+### Performance
+- **A joint PK-TTE model with a linear PK block now takes the exact steady-state solve
+  (#1210).** The hazard accumulator's one-cycle map is the identity, so it made `I - M`
+  singular and the exact `(I - M)^-1 b` fixed point (#914) declined for *every* joint model,
+  whatever its PK block looked like — the equilibration ran the full 50-cycle pulse train, and
+  could emit a spurious `Steady-state (SS=1) equilibration ... did not converge` warning for a
+  PK block that had settled long before, since the accumulator never stops growing. The
+  accumulator rows are now projected out of that solve, so a linear PK block gets its handful
+  of one-cycle integrations back.
+
 ### Added
 - **BIC variants and a `Strictness` gate for candidate ranking (#1177, part of #1175).**
   `ferx_core::bic(&result, BicType::{Mixed, Iiv, Random, Fixed})` computes the four
@@ -69,6 +79,51 @@ section of the SDLC for the versioning policy).
   Cholesky entries of such an Ω are pinned, never searched, and the covariance step already
   excluded them; the information criteria counted them anyway, inflating the penalty by one
   per structural zero. `n_parameters` now equals `CompiledModel::free_packed_dim()`.
+- **`predict_survival` returned `NaN` for a time grid with no point past the first event
+  (#1218).** Asking for the curve at `[0.0]` alone — or any grid whose largest time does not
+  pass the subject's first dose or observation — returned `NaN` for `cum_hazard` and `hazard`
+  with no warning, while the same `t = 0` on a longer grid was fine. It now returns the state
+  at that instant, post-dose, exactly what the longer grid reads. The same one-break timeline
+  reached two other readers of the dense state: `[derived]` output columns on the event-driven
+  path (time-varying covariates, resets, or a model-time read) were `NaN` for a subject whose
+  only observation coincides with its dose, and a joint PK-TTE subject outside the shared
+  single-solve (same routing) whose only event or censor sits on its first dose scored the
+  `1e20` sentinel instead of its finite likelihood. Both fixed by the same change.
+- **ODE solver settings passed to `fit()` now reach the solver (#1212).** `ode_reltol`,
+  `ode_abstol`, `ode_max_steps`, `ode_method`, `ode_stiff_abort_after` and `ode_auto_switch`
+  were stamped onto the compiled model at parse time and read from there by every integration
+  path, so the same keys set on a `FitOptions` handed to `fit()` were silently ignored: the
+  fit ran at the model file's (or the default) accuracy, on the default stepper, and reported
+  success. Tightening a tolerance to test an integration-noise hypothesis returned a
+  bit-identical objective across six orders of magnitude, and a caller selecting
+  `rosenbrock23` / `rodas4` / `rodas5p` for a stiff system stayed on the explicit stepper with
+  nothing to say so. A fit now carries the caller's ODE settings to the integrator for the
+  duration of that fit. Precedence is per key and one-directional: a key the caller moved off
+  its default wins, a key left at its default yields to the model file, so passing a
+  hand-built `FitOptions` cannot loosen a model that pinned `ode_reltol = 1e-10`. The same
+  now applies to the standalone `run_covariance()`, `run_sir()` and `run_sir_core()` entry
+  points, which previously ignored a caller's ODE settings — so a covariance step run beside
+  a tight fit no longer differences a coarser surface than the estimates came from. The
+  model-file route, `predict()` and `simulate()` are unchanged; note that the override lasts
+  one call, so `predict()` after a tight `fit()` on the same model still uses the model
+  file's accuracy unless you `sync_ode_solver_opts` an owned model. Concurrent fits are
+  isolated from each other: a call's settings travel on the thread that made it and on a
+  thread pool keyed to those settings, so a fit that asked for nothing keeps the model
+  file's accuracy even while another fit runs at `1e-10` beside it (and vice versa) — which
+  matters for `ferx-tools`' parallel replicate fits and for any caller sharing the fit pool.
+- **An `SS=1` dose no longer carries the steady-state run-in into a joint PK-TTE model's
+  cumulative hazard (#1210).** The appended `d/dt(__chz_<cmt>)` accumulator was cycled through
+  the equilibration along with the PK compartments, but it is a pure integrator with no steady
+  state — so `H(0)` came back holding the run-in's own hazard (`H0 x 50 cycles x II`, e.g.
+  `12.0` for a constant `H0 = 0.02` at `II = 12`) and every survival quantity downstream of it
+  was displaced by that amount. `S(t) = exp(-H(t))` made this fatal rather than cosmetic: on a
+  drug-driven hazard `S(0)` underflowed to `0` and each subject's objective was inflated by
+  ~2500, and a simulated `SS=1` subject drew its event at `t = 0` in every draw. `SS=1` now
+  equilibrates the PK compartments only and the accumulator keeps its value at the dose record
+  — `0` for a subject's first dose, and, for a **later** `SS=1` dose, the hazard accrued so far
+  (an SS dose re-loads the compartments; it is not a reset — `EVID=3`/`4` still are). A lagged
+  SS dose no longer banks its phase advance either, which also removes a non-monotone `H`. A
+  hazard reading `TAD`/`TAFD` under `SS=1` returned `NaN` for the whole subject and now works.
 - **An estimated `block_sigma` correlation is bounded at `|rho| <= 0.995` (#847).** Merely
   keeping rho inside `(-1, 1)` is not enough: a paired residual block's determinant carries a
   factor `1 - rho^2`, so a rho of 0.9999 leaves `R` numerically singular and the likelihood
@@ -144,6 +199,19 @@ section of the SDLC for the versioning policy).
   floor alone (#1119).
 ### Added
 
+- **`ferx_core::edit` — a typed model-transformation API, so a program can now *write* a
+  `.ferx` model as well as read one (#1176).** `ModelText::parse` / `render` round-trips a
+  model file byte for byte (comments, alignment, blank lines and line endings included), and
+  `ModelText::apply` applies one typed `ModelEdit`: swap the structural model, add or drop a
+  `[covariate_model]` relation, add or drop an η, block two ηs together, change the residual
+  error model, carry a parent fit's estimates into the child (`SeedInits`, keyed on parameter
+  *names*, not positions), or set a `[fit_options]` key. A structural swap performs the coupled
+  θ/η/expression edits across all three blocks — `two_cpt_oral` → `one_cpt_oral` drops `Q`,
+  `V2`, `TVQ`, `TVV2`, `ETA_Q` and `ETA_V2` in one call. η surgery requires the canonical
+  `P = TVP * exp(ETA_P)` form and is a hard error naming the parameter on anything else, never
+  a silent wrong edit. `ModelText::canonical_hash` gives a candidate a stable identity — equal
+  across comment and whitespace changes, different for every semantic one — for use as a fit
+  cache key. This is the prerequisite for the model-search tooling in #1175.
 - **A cancellable bootstrap (#1161).** `BootstrapOptions::cancel` takes a `CancelFlag`; setting
   it from another thread stops a long `ferx_tools::bootstrap` run at the next replicate boundary
   and returns the new `BootstrapError::Cancelled`, so a caller reports an abort as an abort

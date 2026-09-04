@@ -5,6 +5,7 @@ pub mod cancel;
 pub mod categorical;
 pub mod diagnostics;
 pub(crate) mod dosing;
+pub mod edit;
 pub mod environment;
 pub mod estimation;
 pub mod frem;
