@@ -11849,3 +11849,164 @@ fn provider_reads_an_obs_one_ulp_after_a_dose_post_dose() {
 
     check_full_provider_vs_fd(&m, &subject, &theta, &eta);
 }
+
+/// A dose landing on the subject's **last observation** must be applied by the static
+/// `Dual2` walk, as production applies it.
+///
+/// `integrate_g` walked `0..break_times.len() - 1`, so the final break was only ever a
+/// segment *end*, never a `t_start` — neither the bolus application nor the boundary read
+/// ran there. `t_last = max(obs_times)` is itself a break, so a dose and a sample both at
+/// `t = 24` dedup to one final break and that dose was silently never applied: the walk took
+/// the observation from the preceding segment's `t_end` save point, pre-dose.
+///
+/// Measured at the first #1226 commit: **provider 3.79 against production 1003.79** — the
+/// entire 1000 mg dose missing from the gradient while the objective had it. That is the same
+/// gradient-vs-objective divergence this issue fixes one break earlier, and both other
+/// provider tests here use an *interior* dose, so nothing covered it.
+///
+/// Mutation: restore `0..(break_times.len() - 1)` and this reads 3.79.
+#[test]
+fn provider_reads_a_dose_landing_on_the_last_observation() {
+    const ODE_1CPT: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV * exp(ETA_V)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let m = parse_model_string(ODE_1CPT).expect("parses");
+    let t_last = 24.0f64;
+    // The earlier dose keeps the compartment non-empty, so the pre/post pair at `t_last` is
+    // 3.79 vs 1003.79 rather than 0 vs 1000 — the incoming side of the event is live.
+    let doses = vec![
+        DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(t_last, 1000.0, 1, 0.0, false, 0.0),
+    ];
+    let times = [4.0, 12.0, t_last];
+    let subject = subject_with_doses_and_resets(doses, &times, Vec::new());
+    let theta = [10.0, 50.0];
+    let eta = [0.10, -0.05];
+
+    let f = compute_predictions_with_tv(&m, &subject, &theta, &eta);
+    let ke = (theta[0] * eta[0].exp()) / (theta[1] * eta[1].exp());
+    let pre = 1000.0 * (-ke * t_last).exp();
+    let post = pre + 1000.0;
+    assert!(
+        post - pre > 999.0,
+        "the pre/post-dose pair must be a whole dose apart, got {pre:.4} / {post:.4}"
+    );
+    assert!(
+        f[2].is_finite() && (f[2] - post).abs() < 1e-4 * post,
+        "production must apply a dose landing on the last observation: got {:.6}, expected \
+         {post:.6} (pre-dose is {pre:.6})",
+        f[2]
+    );
+
+    let s = subject_sensitivities(&m, &subject, &theta, &eta).expect("supported");
+    assert!(
+        s.obs[2].f.is_finite(),
+        "the provider returned a non-finite value at the last observation"
+    );
+    assert_eq!(
+        s.obs[2].f.to_bits(),
+        f[2].to_bits(),
+        "provider {:.10} vs production {:.10} at a dose landing on the last observation — \
+         the static walk must visit the final break as a left boundary",
+        s.obs[2].f,
+        f[2]
+    );
+
+    check_full_provider_vs_fd(&m, &subject, &theta, &eta);
+}
+
+/// The provider's boundary read stays **one-sided**: an observation one ULP *before* a dose
+/// keeps the pre-dose state, matching production.
+///
+/// `record_at_break` is one-sided by construction, but the tolerant `record_at` that runs on
+/// the line above it is not — its window is a *symmetric* `2e-9 * (1 + |q|)`, some 2000×
+/// `EVENT_MATCH_TOL`. That catch-all predates #1226 and is load-bearing for #410, so it stays;
+/// this test is what keeps it from claiming the mirror side. Both other provider tests place
+/// the observation at or after the dose, so without this the mirror sign is untested there.
+///
+/// Measured: provider and production both read 155.847 (the pre-dose value), before and after
+/// the #1226 changes, including after the loop-bound fix that makes `record_at_break` run at
+/// one more break. The `recorded[j]` mask is what covers it — the preceding segment's save
+/// point gets there first.
+#[test]
+fn provider_keeps_an_obs_one_ulp_before_a_dose_pre_dose() {
+    const ODE_1CPT: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV * exp(ETA_V)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let m = parse_model_string(ODE_1CPT).expect("parses");
+    let dose_time = 8.0f64;
+    let obs_before = f64::from_bits(dose_time.to_bits() - 1);
+    let sep = dose_time - obs_before;
+    assert!(
+        sep > 0.0 && sep < crate::ode::predictions::EVENT_MATCH_TOL,
+        "the sample must sit strictly inside EVENT_MATCH_TOL *before* the dose (sep \
+         {sep:.3e}) or this tests an ordinary segment point"
+    );
+    let doses = vec![
+        DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(dose_time, 1000.0, 1, 0.0, false, 0.0),
+    ];
+    let times = [4.0, obs_before, 12.0, 24.0];
+    let subject = subject_with_doses_and_resets(doses, &times, Vec::new());
+    let theta = [10.0, 50.0];
+    let eta = [0.10, -0.05];
+
+    let f = compute_predictions_with_tv(&m, &subject, &theta, &eta);
+    let ke = (theta[0] * eta[0].exp()) / (theta[1] * eta[1].exp());
+    let pre = 1000.0 * (-ke * dose_time).exp();
+    let post = pre + 1000.0;
+    assert!(
+        post - pre > 999.0,
+        "the pre/post-dose pair must be a whole dose apart, got {pre:.4} / {post:.4}"
+    );
+    assert!(
+        f[1].is_finite() && (f[1] - pre).abs() < 1e-4 * pre,
+        "production must read one ULP *before* the dose pre-dose: got {:.6}, expected \
+         {pre:.6} (post-dose is {post:.6})",
+        f[1]
+    );
+
+    let s = subject_sensitivities(&m, &subject, &theta, &eta).expect("supported");
+    assert!(
+        s.obs[1].f.is_finite(),
+        "the provider returned a non-finite value at the mirror observation"
+    );
+    assert_eq!(
+        s.obs[1].f.to_bits(),
+        f[1].to_bits(),
+        "provider {:.10} vs production {:.10} one ULP before a dose — the boundary read \
+         must not claim the mirror side",
+        s.obs[1].f,
+        f[1]
+    );
+
+    check_full_provider_vs_fd(&m, &subject, &theta, &eta);
+}

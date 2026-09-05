@@ -10923,4 +10923,120 @@ mod lag_arrival_read_1226 {
         // or before `t` — write wins.
         assert!(b <= t && b > a);
     }
+
+    /// **Test 7 — the band never collapses, at any study timescale.**
+    ///
+    /// `EVENT_MATCH_TOL` is *absolute*, so a band written as the sum `t < t_break + TOL`
+    /// silently becomes **empty** once `ulp(t_break)` exceeds the tolerance: `t_break + TOL`
+    /// rounds back to `t_break`, and the half-open `[t_break, t_break)` matches nothing —
+    /// not even bit equality, which the exact-bit `obs_map` lookups these predicates replaced
+    /// always matched. A record at the break would then be read by neither the band nor the
+    /// segment and keep its `NaN` prefill.
+    ///
+    /// `16384.0` is where that starts on this scale, and `17520.0` is hours in two years, so
+    /// it is an ordinary timescale rather than a corner. Every other fixture in this module
+    /// sits at `t ≈ 8.2`, where the band is 563 ulp wide — so nothing else here, including
+    /// the partition test above, can see it. This is the assertion those tests were making
+    /// implicitly and never checking.
+    ///
+    /// Mutation: write either predicate in the sum form (`t < t_break + EVENT_MATCH_TOL`,
+    /// `t >= t_start + EVENT_MATCH_TOL`) and the `>= 16384.0` rows fail.
+    #[test]
+    fn the_band_still_matches_bit_equality_at_large_times() {
+        for t0 in [8.2f64, 1000.0, 8192.0, 16384.0, 17520.0, 100_000.0, 1.0e7] {
+            let ulp = f64::from_bits(t0.to_bits() + 1) - t0;
+            // A break always reads its own time, whatever the magnitude — the property the
+            // exact-bit lookup had unconditionally.
+            assert!(
+                reads_at_break(t0, t0),
+                "the band at t={t0} (ulp {ulp:.3e}) does not match bit equality — it has \
+                 collapsed, and a record exactly on this break would be read by nothing"
+            );
+            // Still one-sided there: the previous representable value stays pre-event.
+            assert!(!reads_at_break(f64::from_bits(t0.to_bits() - 1), t0));
+            // And still a partition: the next representable value is claimed by exactly one
+            // of band / segment, never by both and never by neither.
+            let nxt = f64::from_bits(t0.to_bits() + 1);
+            let t_end = t0 + 1.0;
+            assert!(
+                reads_at_break(nxt, t0) ^ reads_in_segment(nxt, t0, t_end),
+                "t0={t0} (ulp {ulp:.3e}): the next representable time is in {} of \
+                 band/segment",
+                if reads_at_break(nxt, t0) {
+                    "both"
+                } else {
+                    "neither"
+                }
+            );
+            // The segment never claims the break's own time — the `(t_start, t_end]`
+            // contract, which the sum form broke once `t0 + TOL == t0`.
+            assert!(
+                !reads_in_segment(t0, t0, t_end),
+                "t0={t0}: the segment claimed its own left boundary, which would hand \
+                 solve_ode a save point equal to t0"
+            );
+        }
+    }
+
+    /// **Test 8 — every engine still reads a record on its final break at a large time.**
+    ///
+    /// The predicate test above is pure; this is the engine-level consequence, and it is the
+    /// one that would have gone red. `ode_dense_solve_states`' last-break skip was rewritten
+    /// from `saveat_map.contains_key(&t_start.to_bits())` — magnitude-independent — to a band
+    /// scan. Where the band collapsed, the scan was always `false`, so the loop `break`ed
+    /// before the final break's dose was applied and before its grid point was read: `NaN`
+    /// on a single-break timeline (#1218's shape, the silent non-answer that issue removed),
+    /// or the pre-dose state on a multi-break one (reverting #731).
+    ///
+    /// `t = 17520` is hours in two years — an ordinary trial horizon. At that magnitude
+    /// `ulp` is 3.638e-12, wider than `EVENT_MATCH_TOL`, so the sample sits exactly on the
+    /// dose's break and the band is precisely the bit-equal set. That is the regime the whole
+    /// module was blind to: every other fixture here is at `t ≈ 8.2`.
+    ///
+    /// Mutation: write either predicate in the sum form and `ode_dense_solve_states` returns
+    /// `NaN` here while the other engines still read 145.38.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn every_engine_reads_a_record_on_its_final_break_at_a_large_time() {
+        let t_dose = 17520.0f64;
+        assert!(
+            t_dose + EVENT_MATCH_TOL == t_dose,
+            "this fixture only tests the collapsed-band regime if t + TOL rounds back; \
+             at t={t_dose} it does not, so pick a larger time"
+        );
+        // No lag: at this magnitude a sub-ulp arrival offset is not representable, so the
+        // reachable geometry is a record landing *exactly* on the dose's own break.
+        let pkv = pk_flat(0.0);
+        let doses = vec![
+            DoseEvent::new(t_dose - 8.2, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(t_dose, 100.0, 1, 0.0, false, 0.0),
+        ];
+        // The sample IS the last break (`t_last = max(obs_times)`), which is exactly the
+        // case the dense engine's last-break skip decides.
+        let obs = vec![t_dose];
+        let s = make_subject(doses, obs.clone());
+        let got = all_readers(&pkv, &s, &obs);
+
+        let ke = CL / V;
+        let pre = 100.0 * (-ke * 8.2f64).exp();
+        let post = pre + 100.0;
+        assert!(
+            post - pre > 99.0,
+            "the pre/post-dose pair must be a whole dose apart ({pre:.4} / {post:.4})"
+        );
+        for (e, vals) in ENGINES.iter().zip(got.iter()) {
+            assert!(
+                vals[0].is_finite(),
+                "{e} returned {} at t={t_dose} — a record on the final break was read by \
+                 neither the band nor the segment",
+                vals[0]
+            );
+            assert!(
+                (vals[0] - post).abs() < 1e-6,
+                "{e} at t={t_dose}: {:.8} — expected the post-dose {post:.8} (pre-dose \
+                 reads {pre:.8})",
+                vals[0]
+            );
+        }
+    }
 }

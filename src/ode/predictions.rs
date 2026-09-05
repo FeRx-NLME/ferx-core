@@ -99,9 +99,28 @@ pub(crate) const EVENT_MATCH_TOL: f64 = 1e-12;
 ///
 /// One-sided: the band is the half-open `[t_break, t_break + EVENT_MATCH_TOL)`. See
 /// [`EVENT_MATCH_TOL`] for why the *before* side must stay on the pre-event state.
+///
+/// Written as a **difference**, `t - t_break < TOL`, never as the sum `t < t_break + TOL`.
+/// `EVENT_MATCH_TOL` is absolute, so the sum rounds back to `t_break` once `ulp(t_break)`
+/// exceeds it and the half-open band becomes **empty** — the predicate then fails even at
+/// bit equality, which the exact-bit `obs_map` lookups it replaced always matched. Measured:
+///
+/// | `t_break` | `ulp` | band width, sum form | difference form |
+/// |---|---|---|---|
+/// | `8.2` | 1.776e-15 | 563 ulp | 563 ulp |
+/// | `1000.0` | 1.137e-13 | 9 ulp | 9 ulp |
+/// | `8192.0` | 1.819e-12 | 1 ulp | 1 ulp |
+/// | `16384.0` | 3.638e-12 | **0 ulp — matches nothing** | 1 ulp (bit equality) |
+/// | `17520.0` | 3.638e-12 | **0 ulp** | 1 ulp |
+///
+/// `17520` is hours in two years, so this is an ordinary study timescale, not a corner.
+/// The difference form degrades gracefully: as `ulp` grows past the tolerance the band
+/// narrows to exactly the bit-equal set and never below it. That is the same shape as the
+/// dose-application predicate (`(dose.time - t_start).abs() < EVENT_MATCH_TOL`), which is
+/// why that one never had this failure mode.
 #[inline]
 pub(crate) fn reads_at_break(t: f64, t_break: f64) -> bool {
-    t >= t_break && t < t_break + EVENT_MATCH_TOL
+    t >= t_break && t - t_break < EVENT_MATCH_TOL
 }
 
 /// True when a record time `t` is recorded off the integration of `(t_start, t_end]` —
@@ -119,9 +138,16 @@ pub(crate) fn reads_at_break(t: f64, t_break: f64) -> bool {
 /// and stops the solver being handed a `saveat` point outside its own span; the only place
 /// where an equivalent slack is load-bearing is `sens/ode_provider.rs`, whose `recorded[j]`
 /// mask *is* first-write-wins and which therefore needed an explicit overwrite instead.
+///
+/// The lower bound is a **difference** for the reason [`reads_at_break`] gives, and that
+/// also keeps it strictly greater than `t_start` at every magnitude: `t - t_start >= TOL`
+/// implies `t > t_start`, so the `(t_start, t_end]` contract the surrounding `saveat`
+/// comments state holds by construction. The sum form `t >= t_start + TOL` did not — once
+/// `t_start + TOL == t_start` it admits `t == t_start` into that segment's own `saveat`,
+/// handing `solve_ode` a save point equal to `t0`, outside its span.
 #[inline]
 pub(crate) fn reads_in_segment(t: f64, t_start: f64, t_end: f64) -> bool {
-    t >= t_start + EVENT_MATCH_TOL && t <= t_end
+    t - t_start >= EVENT_MATCH_TOL && t <= t_end
 }
 
 /// Indices of the record times in `times` that [`reads_at_break`] assigns to `t_break`,
@@ -3230,19 +3256,17 @@ fn ode_predictions_with_extra_breaks_and_stats(
         // exact-bit lookup handed those to the *preceding* segment, i.e. to the state
         // before the dose was applied.
         collect_records_at_break(&subject.obs_times, t_start, &mut boundary_obs);
-        if !boundary_obs.is_empty() {
-            record_observations(
-                ode,
-                &boundary_obs,
-                &u,
-                pk_params_flat,
-                theta,
-                eta,
-                subject,
-                &mut predictions,
-                None,
-            );
-        }
+        record_observations(
+            ode,
+            &boundary_obs,
+            &u,
+            pk_params_flat,
+            theta,
+            eta,
+            subject,
+            &mut predictions,
+            None,
+        );
 
         // #570: a soft (CHZ) time coinciding with this segment's *left* boundary is
         // read here, as the post-dose / initial state `u` — the exact analogue of the
@@ -6420,19 +6444,17 @@ pub fn ode_predictions_with_states(
         // Handle obs read *at* t_start (after dose) — the whole `EVENT_MATCH_TOL` band,
         // through the same helper as the objective path (#1226).
         collect_records_at_break(&subject.obs_times, t_start, &mut boundary_obs);
-        if !boundary_obs.is_empty() {
-            record_observations(
-                ode,
-                &boundary_obs,
-                &u,
-                pk_params_flat,
-                theta,
-                eta,
-                subject,
-                &mut predictions,
-                Some(states.as_mut_slice()),
-            );
-        }
+        record_observations(
+            ode,
+            &boundary_obs,
+            &u,
+            pk_params_flat,
+            theta,
+            eta,
+            subject,
+            &mut predictions,
+            Some(states.as_mut_slice()),
+        );
 
         // #731: integrate the open interval `(t_start, t_end]` to the next break, if
         // there is one. The final break has no successor — its dose was applied and its

@@ -581,19 +581,23 @@ NONMEM gives, and the same answer you get when the gap is an hour.
 
 This is not hypothetical: an estimated or covariate-scaled `ALAG` is a float sum,
 so an optimizer walking it continuously will land arrivals a handful of ULP away
-from a sample time. ferx applies a single tolerance, `1e-12`, and applies it
-**one-sided**:
+from a sample time. The rule has no tolerance in it at all — it is just the
+ordering, and it is **one-sided**:
 
-| separation | read |
+| the arrival is… | the sample reads |
 |---|---|
-| arrival **at or up to `1e-12` before** the sample | post-dose |
-| arrival **after** the sample, by any amount | pre-dose |
+| **at or before** the sample, by any amount | post-dose |
+| **after** the sample, by any amount | pre-dose |
 
-A sample inside that band is read from the state just after the arrival's events
-(reset, then dose), rather than by integrating the sub-picosecond span to the
-sample's own time; the difference is bounded by `|f|·1e-12`, far below any solver
-tolerance. The one-sidedness is the part worth knowing: an arrival even one ULP
-*after* a sample has not happened yet at that sample, and never contributes to it.
+The one-sidedness is the part worth knowing: an arrival even one ULP *after* a
+sample has not happened yet at that sample, and never contributes to it.
+
+A `1e-12` tolerance appears only in *how* the first row is evaluated when the gap
+is tiny. A sample within `1e-12` after the arrival is read from the state just
+after the arrival's events (reset, then dose), rather than by integrating the
+sub-picosecond span to the sample's own time; the difference is bounded by
+`|f|·1e-12`, far below any solver tolerance. Beyond that gap the sample is read
+off the ordinary integration — same answer, arrived at the usual way.
 
 ::: {.callout-note}
 ## Changed in #1226

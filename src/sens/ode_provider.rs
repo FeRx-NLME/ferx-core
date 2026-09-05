@@ -6720,9 +6720,21 @@ fn integrate_g<T: crate::sens::num::PkNum>(
     // the static `integrate_g` twin) (#472 review round 2 #1).
     let mut reset_floor = f64::NEG_INFINITY;
 
-    for w in 0..(break_times.len() - 1) {
+    // Walk every break as a left boundary — bound `0..len`, not the old `0..len - 1`, so a
+    // dose or observation landing on the **final** break is applied and read there. This
+    // mirrors `ode_predictions`' `0..len` + `k + 1 < len` shape (#731), and it has to: with
+    // the old bound the last break was only ever a segment *end*, never a `t_start`, so
+    // neither the dose application below nor `record_at_break` ran at it.
+    //
+    // `t_last = max(obs_times)` is itself a break, so a subject whose last dose lands on its
+    // last observation — dose and sample both at `t = 24` — dedups to one final break and
+    // that dose was never applied: the walk recorded the observation from the preceding
+    // segment's `t_end` save point, pre-dose, while `ode_predictions` applied it and read
+    // post-dose. Measured 3.79 here against production's 1003.79 — the same gradient-vs-
+    // objective divergence #1226 fixes one break earlier, and it is what
+    // `provider_reads_a_dose_landing_on_the_last_observation` pins.
+    for w in 0..break_times.len() {
         let t_start = break_times[w];
-        let t_end = break_times[w + 1];
 
         // EVID 3/4 reset: re-seed the state to the initial conditions at this time, *before*
         // the same-time dose (EVID=4 = reset + dose), and record the reset time so an
@@ -6816,6 +6828,11 @@ fn integrate_g<T: crate::sens::num::PkNum>(
             }
         }
 
+        // The final break has no successor: its reset, dose and boundary read happened
+        // above, and there is nothing left to integrate.
+        let Some(&t_end) = break_times.get(w + 1) else {
+            continue;
+        };
         if (t_end - t_start).abs() < 1e-15 {
             continue;
         }

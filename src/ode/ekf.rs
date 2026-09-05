@@ -227,6 +227,17 @@ pub fn solve_ekf(
 
     // Records read *at* the current break (#1226) — hoisted, as on the ODE engines.
     let mut boundary_obs: Vec<usize> = Vec::new();
+    // Assimilate-once mask — the measurement analogue of the `applied` dose mask above.
+    //
+    // On the ODE engines a band write is an idempotent index assignment, so "the later write
+    // wins" is the whole rule. Here it is **not** a write: each match runs a `kalman_update`
+    // that mutates `p_mat`, so visiting the same measurement twice assimilates it twice and
+    // returns an over-confident `p_obs` plus a distorted covariance for the rest of the
+    // subject. Two ways that happens, and the first predates #1226: an observation exactly on
+    // an interior break is saved by the segment ending there *and* read at that break as the
+    // next `t_start`; and since the band is `1e-12` wide while `break_times` dedups at
+    // `1e-15`, two breaks (a #1186 infusion-end / dose collision) can both claim one sample.
+    let mut assimilated = vec![false; obs_times.len()];
     for k in 0..(break_times.len() - 1) {
         let t_start = break_times[k];
         let t_end = break_times[k + 1];
@@ -250,22 +261,39 @@ pub fn solve_ekf(
         // Record obs read *at* t_start (after dose application) — the whole
         // `EVENT_MATCH_TOL` band, through the same helper as the ODE engines (#1226).
         crate::ode::predictions::collect_records_at_break(obs_times, t_start, &mut boundary_obs);
-        for &obs_idx in &boundary_obs {
-            // One update per *distinct* record time, at the index `obs_map` keeps for it
-            // — exactly the collapsing the old `obs_map.get(&t_start.to_bits())` did for
-            // duplicate times. The band widens *which* times match here, not how many
-            // updates a repeated time gets.
-            if obs_map.get(&obs_times[obs_idx].to_bits()) != Some(&obs_idx) {
+        for i in 0..boundary_obs.len() {
+            let obs_idx = boundary_obs[i];
+            let v = u[obs_cmt_idx];
+            let ipred = if v.is_nan() || v < 0.0 { 0.0 } else { v };
+            if assimilated[obs_idx] {
+                // The **covariance** must be assimilated once; the **mean** is still the
+                // post-event one. An observation exactly on this break was saved by the
+                // segment that ended here, pre-dose — blocking it outright would keep that
+                // pre-dose `ipred` and reintroduce the very defect #1226 fixes (measured:
+                // 68.73 instead of 168.73). A bolus shifts the state deterministically and
+                // leaves `p_mat` untouched, so `p_obs` is the same either side of it and
+                // only the mean needs the later write.
+                results[obs_idx].ipred = ipred;
                 continue;
             }
             let r = r_obs_vec.get(obs_idx).copied().unwrap_or(1.0);
             let (p_new, p_obs) = kalman_update(&p_mat, obs_cmt_idx, r, n);
             p_mat = p_new;
-            let v = u[obs_cmt_idx];
-            results[obs_idx] = EkfObsPoint {
-                ipred: if v.is_nan() || v < 0.0 { 0.0 } else { v },
-                p_obs,
-            };
+            let point = EkfObsPoint { ipred, p_obs };
+            // Records sharing this exact time are one measurement instant: they take the
+            // same `ipred`/`p_obs` from this single update rather than each running their
+            // own — the collapsing the old `obs_map.get(&t_start.to_bits())` did, since that
+            // map keeps one index per bit pattern. They are *filled* rather than dropped:
+            // the band excludes them from the segment `saveat` too, so a dropped index would
+            // keep its `EkfObsPoint { ipred: 0.0, p_obs: 0.0 }` prefill and feed a finite,
+            // plausible zero into the likelihood.
+            let bits = obs_times[obs_idx].to_bits();
+            for &j in &boundary_obs {
+                if !assimilated[j] && obs_times[j].to_bits() == bits {
+                    results[j] = point.clone();
+                    assimilated[j] = true;
+                }
+            }
         }
 
         let mut saveat: Vec<f64> = obs_times
@@ -351,14 +379,20 @@ pub fn solve_ekf(
             }
 
             if let Some(&obs_idx) = obs_map.get(&pt.t.to_bits()) {
-                let r = r_obs_vec.get(obs_idx).copied().unwrap_or(1.0);
-                let (p_new, p_obs) = kalman_update(&p_mat, obs_cmt_idx, r, n);
-                p_mat = p_new;
-                let v = pt.u[obs_cmt_idx];
-                results[obs_idx] = EkfObsPoint {
-                    ipred: if v.is_nan() || v < 0.0 { 0.0 } else { v },
-                    p_obs,
-                };
+                // Same assimilate-once mask as the boundary read: an observation sitting
+                // exactly on this segment's `t_end` is read here *and* at the next break as
+                // its `t_start`, and `kalman_update` is not idempotent.
+                if !assimilated[obs_idx] {
+                    let r = r_obs_vec.get(obs_idx).copied().unwrap_or(1.0);
+                    let (p_new, p_obs) = kalman_update(&p_mat, obs_cmt_idx, r, n);
+                    p_mat = p_new;
+                    let v = pt.u[obs_cmt_idx];
+                    results[obs_idx] = EkfObsPoint {
+                        ipred: if v.is_nan() || v < 0.0 { 0.0 } else { v },
+                        p_obs,
+                    };
+                    assimilated[obs_idx] = true;
+                }
             }
 
             t_prev = pt.t;
@@ -757,6 +791,101 @@ mod tests {
                 pt.p_obs
             );
         }
+    }
+
+    /// A measurement landing exactly on a dose break must be assimilated **once**, while its
+    /// `ipred` is still the post-dose one.
+    ///
+    /// Unlike the ODE engines, where a band write is an idempotent index assignment, the EKF
+    /// runs a `kalman_update` that mutates `p_mat`. An observation on an interior break is
+    /// saved by the segment ending there *and* read at that break as the next `t_start`, so
+    /// it was assimilated twice — the covariance shrank twice, giving an over-confident
+    /// `p_obs` at that record and a distorted covariance for the rest of the subject.
+    ///
+    /// Measured on this fixture: `p_obs` at `t = 6` was **0.0437** against the correct
+    /// **0.3460** (a factor of 8), and the knock-on at `t = 12` was 0.4420 against 0.4514.
+    /// The defect **predates #1226** — the old exact-bit boundary lookup matched an
+    /// observation exactly at `t_start` just as the band does — but the band widens which
+    /// records can reach it, so the mask is part of this change.
+    ///
+    /// **Oracle: a bolus does not touch `p_mat`.** So nudging the dose 1e-6 h earlier —
+    /// far outside the match band, but a negligible amount of propagation — must leave every
+    /// `p_obs` unchanged. That differential is what a double assimilation violates by a
+    /// factor of 8, and it needs no reference implementation.
+    ///
+    /// The split matters and is asserted both ways: gating the *whole* boundary read on the
+    /// mask (rather than only the `kalman_update`) makes `ipred` read pre-dose — measured
+    /// 68.73 instead of 168.73, i.e. it reintroduces the #1226 defect on the EKF.
+    ///
+    /// Mutations: drop the `assimilated` guard → `p_obs` at `t = 6` collapses to 0.0437;
+    /// make the guard `continue` before writing `ipred` → `ipred` at `t = 6` reads 68.73.
+    #[test]
+    fn ekf_assimilates_a_measurement_on_a_dose_break_exactly_once() {
+        let obs_times = vec![2.0, 6.0, 12.0];
+        let pk = make_pk(5.0, 80.0);
+        let r = vec![0.05; obs_times.len()];
+        let run = |dose_time: f64| {
+            solve_ekf(
+                &one_cpt_rhs,
+                1,
+                0,
+                &[0.1], // positive diffusion, so p_obs is a live quantity
+                &pk,
+                &Default::default(),
+                &[],
+                &[
+                    DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                    DoseEvent::new(dose_time, 100.0, 1, 0.0, false, 0.0),
+                ],
+                &obs_times,
+                &r,
+                OdeSolverOptions::default(),
+            )
+        };
+        // A: the dose lands exactly on the t=6 observation. B: 1e-6 h earlier — a separate
+        // break, negligible propagation.
+        let a = run(6.0);
+        let b = run(6.0 - 1e-6);
+
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert!(
+                x.p_obs.is_finite() && y.p_obs.is_finite(),
+                "non-finite p_obs at obs {i}: {} / {}",
+                x.p_obs,
+                y.p_obs
+            );
+            assert!(
+                x.p_obs > 0.0,
+                "p_obs must stay positive with diffusion; got {} at obs {i}",
+                x.p_obs
+            );
+            let rel = (x.p_obs - y.p_obs).abs() / y.p_obs;
+            assert!(
+                rel < 1e-6,
+                "p_obs at t={} depends on whether the dose coincides with the sample \
+                 ({:.10} vs {:.10}, rel {rel:.3e}) — a bolus does not touch the covariance, \
+                 so this is the measurement being assimilated more than once",
+                obs_times[i],
+                x.p_obs,
+                y.p_obs
+            );
+        }
+
+        // …and the coincident record is still read post-dose: two 100 mg boluses, so the
+        // post-dose mean is a whole dose above the pre-dose one.
+        let ke = 5.0f64 / 80.0;
+        let pre = 100.0 * (-ke * 6.0f64).exp();
+        let post = pre + 100.0;
+        assert!(
+            post - pre > 99.0,
+            "the pre/post-dose pair must be a whole dose apart ({pre:.4} / {post:.4})"
+        );
+        assert!(
+            a[1].ipred.is_finite() && (a[1].ipred - post).abs() < 1e-3,
+            "the EKF reads {:.6} at a sample on the dose break — expected the post-dose \
+             {post:.6} (pre-dose is {pre:.6})",
+            a[1].ipred
+        );
     }
 
     // ── #1186 / #1189 on the EKF walk ───────────────────────────────────────
