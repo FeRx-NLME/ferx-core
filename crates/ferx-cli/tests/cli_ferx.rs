@@ -613,3 +613,115 @@ fn allometry_scales_a_model_from_the_command_line() {
     assert!(written.contains("[covariate_model]"));
     assert!(written.contains("V1 ~ WT power(center = 70, fix = 1.0)"));
 }
+
+/// The `.ferxsearch` form of `ferx allometry`, with estimated exponents and
+/// a signed exponent on the command line (review of #1238).
+#[test]
+fn allometry_from_a_search_file_estimates_exponents() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("wt.ferx"), ONE_CPT_WT).unwrap();
+    let data = repo_root().join("data/two_cpt_oral_cov.csv");
+    let config = format!(
+        "base = \"wt.ferx\"\ndata = \"{}\"\n[space]\nmfl = \"ALLOMETRY(WT, 70)\"\n\
+         [allometry]\nfixed = false\n\
+         [strictness]\nrequire_converged = false\nreject_init_stall = false\n\
+         reject_on_boundary = false\n[run]\nretries = 0\nthreads = 2\n",
+        data.display()
+    );
+    let search = dir.path().join("wt.ferxsearch");
+    std::fs::write(&search, config).unwrap();
+
+    let out = ferx()
+        .args([
+            "allometry",
+            &search.to_string_lossy(),
+            "--parameters",
+            "CL,V",
+            "--exponents",
+            "-0.5,1",
+            "--lower",
+            "-2",
+        ])
+        .output()
+        .expect("run ferx allometry");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stderr: {stderr}\nstdout: {stdout}");
+    assert!(
+        stdout.contains("CL ~ WT power(center = 70, init = -0.5, estimated)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("estimated exponents: THETA_CL_WT = -0.5000"),
+        "{stdout}"
+    );
+    assert!(dir.path().join("wt-allometric.ferx").exists());
+
+    // A search file names its own data.
+    let out = ferx()
+        .args(["allometry", &search.to_string_lossy(), "--data", "x.csv"])
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--data does not apply"));
+}
+
+/// A search that accepts effects: at `p_forward = 1` every non-negative
+/// ΔOFV is significant, so the evaluations still walk two forward steps —
+/// covering the "added" progress line and the SELECTED rows — and a second,
+/// `--resume --quiet` invocation on the same directory refits nothing.
+#[test]
+fn covsearch_accepts_effects_and_resumes_quietly() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("wt.ferx"), ONE_CPT_WT).unwrap();
+    let data = repo_root().join("data/two_cpt_oral_cov.csv");
+    let config = format!(
+        "base = \"wt.ferx\"\ndata = \"{}\"\n[space]\nmfl = \"COVARIATE?([CL,V], WT, pow)\"\n\
+         [covsearch]\nalgorithm = \"scm-forward\"\np_forward = 1.0\n\
+         [strictness]\nrequire_converged = false\nreject_init_stall = false\n\
+         reject_on_boundary = false\n[run]\nretries = 0\nthreads = 2\n",
+        data.display()
+    );
+    std::fs::write(dir.path().join("wt.ferxsearch"), config).unwrap();
+    let run_dir = dir.path().join("run");
+
+    let out = ferx()
+        .args([
+            "covsearch",
+            &dir.path().join("wt.ferxsearch").to_string_lossy(),
+            "--directory",
+            &run_dir.to_string_lossy(),
+        ])
+        .output()
+        .expect("run ferx covsearch");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stderr: {stderr}\nstdout: {stdout}");
+    assert!(stderr.contains("Step 1 (forward): added"), "{stderr}");
+    assert!(stderr.contains("Step 2 (forward): added"), "{stderr}");
+    assert!(stdout.contains("SELECTED"), "{stdout}");
+    assert!(stdout.contains("2 relations"), "{stdout}");
+    assert!(run_dir.join("forward-2/candidates.csv").exists());
+
+    let out = ferx()
+        .args([
+            "covsearch",
+            &dir.path().join("wt.ferxsearch").to_string_lossy(),
+            "--directory",
+            &run_dir.to_string_lossy(),
+            "--resume",
+            "--quiet",
+            "--threads",
+            "2",
+        ])
+        .output()
+        .expect("run ferx covsearch --resume");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stderr: {stderr}\nstdout: {stdout}");
+    assert!(
+        !stderr.contains("Step 1"),
+        "quiet run printed progress: {stderr}"
+    );
+    assert!(stdout.contains("2 relations"), "{stdout}");
+}

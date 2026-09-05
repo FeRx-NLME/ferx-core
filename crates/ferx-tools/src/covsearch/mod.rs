@@ -823,6 +823,23 @@ impl Pass<'_> {
                 &report,
                 self.options.p_forward,
             );
+            // A cancelled step is reported, never judged: the runner may not
+            // have reached every candidate, so its rows are partial and the
+            // best of what finished is not the step's winner. Nothing is
+            // selected, and the event says so.
+            if report.cancelled {
+                rows.extend(step_rows);
+                (self.emit)(CovsearchEvent::StepFinished {
+                    step: *step,
+                    phase,
+                    selected: None,
+                });
+                return Ok(Outcome { cancelled: true });
+            }
+            // A complete step has one row per candidate, in candidate order,
+            // so a row index is a `remaining` index.
+            debug_assert_eq!(step_rows.len(), remaining.len());
+
             // Lowest OFV among the candidates that passed the gate and the
             // test — PsN's largest significant drop.
             let winner = step_rows
@@ -841,11 +858,6 @@ impl Pass<'_> {
                 phase,
                 selected: selected.clone(),
             });
-
-            if report.cancelled {
-                rows.extend(step_rows);
-                return Ok(Outcome { cancelled: true });
-            }
 
             // SCM+: stash what was fitted and found wanting, so it is not
             // fitted again at every later step. Only while the phase is still
@@ -955,6 +967,19 @@ impl Pass<'_> {
                 &report,
                 self.options.p_backward,
             );
+            // Same as the forward pass: a cancelled step's rows are partial,
+            // so nothing is selected from them.
+            if report.cancelled {
+                rows.extend(step_rows);
+                (self.emit)(CovsearchEvent::StepFinished {
+                    step: *step,
+                    phase,
+                    selected: None,
+                });
+                return Ok(Outcome { cancelled: true });
+            }
+            debug_assert_eq!(step_rows.len(), removable.len());
+
             // The smallest increase among the removals that are *not*
             // significant — and that passed the gate.
             let winner = step_rows
@@ -972,10 +997,6 @@ impl Pass<'_> {
                 phase,
                 selected,
             });
-            if report.cancelled {
-                rows.extend(step_rows);
-                return Ok(Outcome { cancelled: true });
-            }
             rows.extend(step_rows);
             let Some(i) = winner else {
                 return Ok(Outcome { cancelled: false });

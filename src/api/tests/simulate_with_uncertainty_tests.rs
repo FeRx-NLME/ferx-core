@@ -1059,6 +1059,12 @@ fn theta_boundary_side_detects_bounds() {
     // A bound of zero on the identity path uses an absolute tolerance.
     assert_eq!(side(-0.0005, -5.0, 0.0), Some("upper"));
     assert_eq!(side(-0.5, -5.0, 0.0), None);
+    // …capped by the range: on a narrow identity interval the midpoint is
+    // interior, and only the ends themselves are at a bound (review of #1238).
+    assert_eq!(side(0.0, -1e-4, 1e-4), None);
+    assert_eq!(side(-1e-4, -1e-4, 1e-4), Some("lower"));
+    assert_eq!(side(1e-4 - 1e-8, -1e-4, 1e-4), Some("upper"));
+    assert_eq!(side(0.5e-4, -1e-4, 1e-4), None);
     // Log-packed (lower >= 0): "at bound" is within a constant factor.
     assert_eq!(side(1.0, 0.001, 1000.0), None);
     assert_eq!(side(0.001, 0.001, 1000.0), Some("lower"));

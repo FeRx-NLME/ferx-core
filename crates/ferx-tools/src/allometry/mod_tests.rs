@@ -201,6 +201,28 @@ fn nothing_to_add_is_an_error_not_a_base_refit() {
 }
 
 #[test]
+fn a_run_cancelled_before_it_starts_names_the_fit_it_never_made() {
+    let flag = ferx_core::CancelFlag::new();
+    flag.cancel();
+    let dir = tempfile::tempdir().unwrap();
+    let e = run_allometry(
+        &two_cpt(),
+        &AllometryOptions::default(),
+        AllometryRun {
+            dir: Some(dir.path().to_path_buf()),
+            threads: Some(1),
+            cancel: Some(flag),
+            run_options: crate::search::RunOptions::default(),
+        },
+    )
+    .unwrap_err();
+    assert!(
+        e.contains("the base model was not fitted (run cancelled)"),
+        "{e}"
+    );
+}
+
+#[test]
 fn options_validate_their_shape() {
     let bad = AllometryOptions {
         parameters: Some(vec!["CL".into()]),

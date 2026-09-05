@@ -1078,7 +1078,13 @@ pub(crate) fn theta_boundary_side(est: f64, lower: f64, upper: f64) -> Option<(&
             None
         }
     } else {
-        let near = |bound: f64| (est - bound).abs() <= BOUNDARY_REL_TOL * bound.abs().max(1.0);
+        // The tolerance is a fraction of the bound's magnitude, floored at 1
+        // so a bound of zero still has one — and capped by the same fraction
+        // of the declared range, so a narrow interval (`(-1e-4, 1e-4)`) keeps
+        // its midpoint interior rather than having the floor swallow it.
+        let range = upper - lower;
+        let near =
+            |bound: f64| (est - bound).abs() <= BOUNDARY_REL_TOL * bound.abs().max(1.0).min(range);
         if near(lower) {
             Some(("lower", lower))
         } else if near(upper) {

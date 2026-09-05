@@ -90,6 +90,12 @@ struct Script {
     erroring: Vec<String>,
     /// Feature keys whose candidate compiles to the parent's parameter count.
     no_extra_parameter: Vec<String>,
+    /// Feature keys whose candidate comes back with an OFV but no `FitResult`
+    /// — a journalled row whose cached fit is gone.
+    fitless: Vec<String>,
+    /// OFVs keyed by candidate *id*, taking precedence over the feature
+    /// table — for a candidate whose relation set another candidate shares.
+    ofv_by_id: HashMap<String, f64>,
     /// Flip the report's `cancelled` after this many `fit_step` calls.
     cancel_after: Option<usize>,
     calls: Mutex<Vec<(String, Vec<String>)>>,
@@ -103,6 +109,8 @@ impl Script {
             failing: Vec::new(),
             erroring: Vec::new(),
             no_extra_parameter: Vec::new(),
+            fitless: Vec::new(),
+            ofv_by_id: HashMap::new(),
             cancel_after: None,
             calls: Mutex::new(Vec::new()),
         }
@@ -158,7 +166,12 @@ impl StepFitter for Script {
         let mut results = Vec::new();
         for c in candidates {
             let key = c.features.render();
-            let ofv = self.ofv.get(&key).copied().unwrap_or(self.fallback);
+            let ofv = self
+                .ofv_by_id
+                .get(&c.id)
+                .or_else(|| self.ofv.get(&key))
+                .copied()
+                .unwrap_or(self.fallback);
             if self.erroring.contains(&key) {
                 results.push(CandidateResult {
                     id: c.id.clone(),
@@ -193,7 +206,7 @@ impl StepFitter for Script {
                 hash: c.hash(),
                 parent: c.parent.clone(),
                 features: c.features.clone(),
-                fit: Some(fit),
+                fit: (!self.fitless.contains(&key)).then_some(fit),
                 ofv: Some(ofv),
                 converged: Some(!failing),
                 verdict: StrictnessVerdict {
@@ -700,18 +713,161 @@ fn adaptive_stash_keeps_a_significant_runner_up_in_play() {
 fn a_cancelled_step_ends_the_search_with_what_it_had() {
     let mut script = Script::new(&[("", 100.0), ("CL-WT=power", 80.0), ("V-WT=power", 90.0)]);
     script.cancel_after = Some(2);
-    let result = run(
+    let events: Mutex<Vec<CovsearchEvent>> = Mutex::new(Vec::new());
+    let progress = |e: CovsearchEvent| events.lock().unwrap().push(e);
+    let result = search(
         &script,
         space(vec![pow("CL", "WT"), pow("V", "WT")]),
         &CovsearchOptions::default(),
-    );
+        Some(&progress),
+    )
+    .expect("search");
     assert!(result.cancelled);
     assert_eq!(script.dirs(), vec!["base", "forward-1"]);
-    // The rows of the cancelled step are kept, but its winner is not taken:
-    // the run may not have reached every candidate.
+    // The rows of the cancelled step are kept, but the step has no winner:
+    // the run may not have reached every candidate, so the best of what
+    // finished is not a decision. CL-WT *would* have won (−20, significant)
+    // had the step completed, which is what makes this assertion bite.
     assert_eq!(result.step_rows(1).count(), 2);
+    assert!(result.step_rows(1).all(|r| !r.selected));
     assert_eq!(result.final_step, 0);
     assert_eq!(result.final_ofv, 100.0);
+    assert!(result.included.is_empty());
+    let events = events.lock().unwrap();
+    assert_eq!(
+        events.last(),
+        Some(&CovsearchEvent::StepFinished {
+            step: 1,
+            phase: Phase::Forward,
+            selected: None
+        }),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn a_cancelled_backward_step_selects_nothing_either() {
+    let mut script = Script::new(&[("", 100.0), ("CL-WT=power", 80.0)]);
+    // base, forward-1, forward-2 (empty list → not fitted), backward-2.
+    script.cancel_after = Some(3);
+    let result = run(
+        &script,
+        space(vec![pow("CL", "WT")]),
+        &CovsearchOptions::default(),
+    );
+    assert!(result.cancelled);
+    assert_eq!(script.dirs(), vec!["base", "forward-1", "backward-2"]);
+    // Removing CL-WT would be refused anyway (cost 20 at p = 0.001), so make
+    // the row *removable* and check it is still not selected: the backward
+    // candidate is scripted by id to an OFV of 79, a free improvement.
+    let mut script = Script::new(&[("", 100.0), ("CL-WT=power", 80.0)]);
+    script.cancel_after = Some(3);
+    script.ofv_by_id.insert("b2-CL-WT-power".into(), 79.0);
+    let result = run(
+        &script,
+        space(vec![pow("CL", "WT")]),
+        &CovsearchOptions::default(),
+    );
+    assert!(result.cancelled);
+    let row = result.step_rows(2).next().expect("the backward row");
+    assert_eq!(row.phase, Phase::Backward);
+    assert!(row.lrt.is_some_and(|t| !t.significant));
+    assert!(!row.selected);
+    assert_eq!(labels(&result.included), vec!["CL-WT-power"]);
+}
+
+#[test]
+fn a_search_cancelled_before_its_first_step_is_the_base_model() {
+    let mut script = Script::new(&[("", 100.0), ("CL-WT=power", 80.0)]);
+    script.cancel_after = Some(1);
+    let result = run(
+        &script,
+        space(vec![pow("CL", "WT")]),
+        &CovsearchOptions::default(),
+    );
+    assert!(result.cancelled);
+    assert_eq!(script.dirs(), vec!["base"]);
+    assert!(result.steps.is_empty());
+    assert_eq!(result.final_ofv, 100.0);
+    assert_eq!(result.final_model.render(), result.base_model.render());
+}
+
+// ── the base model ───────────────────────────────────────────────────────────
+
+fn search_err(script: &Script) -> String {
+    match search(
+        script,
+        space(vec![pow("CL", "WT")]),
+        &CovsearchOptions::default(),
+        None,
+    ) {
+        Err(e) => e,
+        Ok(r) => panic!("the search ran: final OFV {}", r.final_ofv),
+    }
+}
+
+#[test]
+fn a_base_model_that_fails_the_gate_or_the_fit_is_refused() {
+    let mut script = Script::new(&[("", 100.0), ("CL-WT=power", 80.0)]);
+    script.failing.push(String::new());
+    let e = search_err(&script);
+    assert!(e.contains("fails the strictness gate"), "{e}");
+    assert!(e.contains("stalled at the initial estimates"), "{e}");
+
+    let mut script = Script::new(&[("", 100.0)]);
+    script.erroring.push(String::new());
+    let e = search_err(&script);
+    assert!(e.contains("could not be fitted: does not compile"), "{e}");
+
+    // A journalled base whose cached fit is gone cannot seed anything.
+    let mut script = Script::new(&[("", 100.0)]);
+    script.fitless.push(String::new());
+    let e = search_err(&script);
+    assert!(e.contains("missing from the resumed journal"), "{e}");
+}
+
+#[test]
+fn a_candidate_without_a_cached_fit_is_reported_as_unjudgeable() {
+    let mut script = Script::new(&[("", 100.0), ("CL-WT=power", 50.0), ("V-WT=power", 90.0)]);
+    script.fitless.push("CL-WT=power".into());
+    let result = run(
+        &script,
+        space(vec![pow("CL", "WT"), pow("V", "WT")]),
+        &forward_only(),
+    );
+    let row = result
+        .step_rows(1)
+        .find(|r| r.effect.label() == "CL-WT-power")
+        .unwrap();
+    assert_eq!(row.ofv, Some(50.0));
+    assert!(row.lrt.is_none());
+    assert!(row.p_value().is_nan());
+    assert!(
+        row.note
+            .as_ref()
+            .unwrap()
+            .contains("not in the journal cache"),
+        "{:?}",
+        row.note
+    );
+    assert_eq!(selected(&result)[0].2, "V-WT-power");
+}
+
+// ── labels ───────────────────────────────────────────────────────────────────
+
+#[test]
+fn labels_are_the_spellings_the_files_use() {
+    assert_eq!(Algorithm::ScmForward.label(), "scm-forward");
+    assert_eq!(
+        Algorithm::ScmForwardThenBackward.label(),
+        "scm-forward-then-backward"
+    );
+    assert_eq!(Phase::Forward.label(), "forward");
+    assert_eq!(Phase::Adaptive.label(), "adaptive");
+    assert_eq!(Phase::Backward.label(), "backward");
+    assert_eq!(Origin::Base.label(), "base model");
+    assert_eq!(Origin::Forced.label(), "forced");
+    assert_eq!(Origin::Forward(3).label(), "forward step 3");
 }
 
 // ── options ──────────────────────────────────────────────────────────────────
@@ -765,6 +921,14 @@ fn options_refuse_what_covsearch_cannot_honour() {
         bic.contains("[rank] type = \"bic\"") && bic.contains("likelihood-ratio"),
         "{bic}"
     );
+    // Every other rank type is named back in the file's own spelling.
+    for kind in ["aic", "bic_mixed", "bic_iiv", "bic_random", "bic_fixed"] {
+        let msg = e(&format!("[rank]\ntype = \"{kind}\"\n"));
+        assert!(msg.contains(&format!("[rank] type = \"{kind}\"")), "{msg}");
+    }
+    // `ofv` is the one the LRT agrees with.
+    let cfg = config("COVARIATE?(CL, WT, pow)", "[rank]\ntype = \"ofv\"\n").unwrap();
+    assert!(CovsearchOptions::from_config(&cfg).is_ok());
     let cutoff = e("[rank]\ncutoff = 3.84\n");
     assert!(cutoff.contains("[rank] cutoff = 3.84"), "{cutoff}");
 }
@@ -889,6 +1053,87 @@ fn the_report_writes_the_step_table_and_the_seeded_final_model() {
     assert!(summary.contains("SELECTED"));
     assert!(summary.contains("Final model: OFV 80.000 (step 1), 1 relation"));
     assert!(summary.contains("CL ~ WT power  [forward step 1]"));
+}
+
+#[test]
+fn the_summary_and_the_table_say_why_a_candidate_was_excluded() {
+    // One stalled candidate, one that does not compile, one plain loser; a
+    // backward step that keeps CL-WT; a note; a cancelled flag set by hand.
+    let mut script = Script::new(&[
+        ("", 100.0),
+        ("CL-WT=power", 80.0),
+        ("V-WT=power", 70.0),
+        ("KA-WT=power", 95.0),
+        ("CL-WT=power;V-WT=power", 79.5),
+        ("CL-WT=power;KA-WT=power", 79.0),
+    ]);
+    script.failing.push("V-WT=power".into());
+    script.erroring.push("KA-WT=power".into());
+    let mut result = run(
+        &script,
+        space(vec![pow("CL", "WT"), pow("V", "WT"), pow("KA", "WT")]),
+        &CovsearchOptions::default(),
+    );
+    result.notes.push("a note the user should see once".into());
+    result.cancelled = true;
+
+    let summary = render_summary(&result);
+    assert!(summary.contains("not converged"), "{summary}");
+    assert!(
+        summary.contains("stalled at the initial estimates"),
+        "{summary}"
+    );
+    assert!(summary.contains("excluded"), "{summary}");
+    assert!(summary.contains("no fit: does not compile"), "{summary}");
+    assert!(summary.contains("SELECTED"), "{summary}");
+    assert!(summary.contains("kept (removal significant)"), "{summary}");
+    assert!(summary.contains("(search cancelled)"), "{summary}");
+    assert!(
+        summary.contains("Notes:\n  - a note the user should see once"),
+        "{summary}"
+    );
+
+    // The step-2 retry of V-WT and KA-WT from CL-WT: V-WT stalls again,
+    // KA-WT still does not compile; both are "not significant" rows in the
+    // backward phase's sense only if they passed — so neither is.
+    let dir = tempfile::tempdir().unwrap();
+    // A final fit that is gone (a degraded resume) still writes the model.
+    result.final_fit = None;
+    write_report(dir.path(), &result).unwrap();
+    let table = std::fs::read_to_string(steps_path(dir.path())).unwrap();
+    let rows: Vec<&str> = table.lines().skip(1).collect();
+    let stalled = rows.iter().find(|r| r.contains("f1-V-WT-power")).unwrap();
+    assert!(
+        stalled.ends_with(",false,false,stalled at the initial estimates (#751)"),
+        "{stalled}"
+    );
+    let broken = rows.iter().find(|r| r.contains("f1-KA-WT-power")).unwrap();
+    // No OFV, no ΔOFV, no df, no p — empty cells, not `NaN`.
+    assert!(
+        broken.contains(",power,100.000000,,,,,,,false,,false,no fit: does not compile"),
+        "{broken}"
+    );
+    // Step 2 retried V-WT and KA-WT from CL-WT (stalled again, still broken);
+    // step 3 is the backward pass that keeps CL-WT.
+    let kept = rows.iter().find(|r| r.starts_with("3,backward")).unwrap();
+    assert!(kept.contains(",true,false,true,true,"), "{kept}");
+    let final_model = std::fs::read_to_string(final_model_path(dir.path())).unwrap();
+    assert!(final_model.contains("CL ~ WT power(center = median)"));
+}
+
+#[test]
+fn a_removable_effect_reads_as_removable_in_the_summary() {
+    // Backward at p = 0.001: removing CL-WT costs 2 — removable, and taken.
+    let script = Script::new(&[("", 82.0), ("CL-WT=power", 80.0)]);
+    let options = CovsearchOptions {
+        p_forward: 0.5,
+        ..CovsearchOptions::default()
+    };
+    let result = run(&script, space(vec![pow("CL", "WT")]), &options);
+    assert_eq!(result.final_ofv, 82.0);
+    let summary = render_summary(&result);
+    assert!(summary.contains("Step 2 (backward)"), "{summary}");
+    assert!(summary.contains("SELECTED"), "{summary}");
 }
 
 #[test]

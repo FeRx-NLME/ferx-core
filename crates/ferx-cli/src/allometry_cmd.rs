@@ -45,15 +45,23 @@ fn flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
 
+/// The token after `name`, or an error when it is absent or is itself one of
+/// this command's flags. Tested against the flag tables rather than a leading
+/// `-`, because `--exponents -0.5` and `--lower -2` are legitimate: a signed
+/// number starts with a hyphen and is not a flag.
 fn value<'a>(args: &'a [String], name: &str) -> Result<Option<&'a str>, String> {
     let Some(i) = args.iter().position(|a| a == name) else {
         return Ok(None);
     };
     match args.get(i + 1) {
-        Some(v) if !v.starts_with('-') => Ok(Some(v.as_str())),
+        Some(v) if !is_flag(v) => Ok(Some(v.as_str())),
         Some(v) => Err(format!("{name} requires a value but got '{v}'")),
         None => Err(format!("{name} requires a value")),
     }
+}
+
+fn is_flag(token: &str) -> bool {
+    VALUE_FLAGS.contains(&token) || BOOL_FLAGS.contains(&token)
 }
 
 fn number(args: &[String], name: &str) -> Result<Option<f64>, String> {
@@ -270,4 +278,114 @@ fn run_allometry_command(args: &[String]) -> Result<i32, String> {
         .map_err(|e| format!("cannot write {}: {e}", out.display()))?;
     eprintln!("Allometric model written to {}", out.display());
     Ok(if result.cancelled { 130 } else { 0 })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn signed_numbers_are_values_not_flags() {
+        // Review of #1238: `--exponents -0.5` and `--lower -2` are legitimate.
+        let a = args(&[
+            "ferx",
+            "allometry",
+            "m.ferx",
+            "--parameters",
+            "CL,V",
+            "--exponents",
+            "-0.5,1.5",
+            "--estimate",
+            "--lower",
+            "-2",
+            "--upper",
+            "-0.1",
+            "--covariate",
+            "CRCL",
+            "--reference",
+            "100",
+        ]);
+        let mut o = AllometryOptions::default();
+        apply_flags(&a, &mut o).unwrap();
+        assert_eq!(
+            o.parameters.as_deref(),
+            Some(&["CL".to_string(), "V".to_string()][..])
+        );
+        assert_eq!(o.exponents.as_deref(), Some(&[-0.5, 1.5][..]));
+        assert!(!o.fixed);
+        assert_eq!((o.lower, o.upper), (-2.0, -0.1));
+        assert_eq!(o.covariate, "CRCL");
+        assert_eq!(o.reference, 100.0);
+        assert_eq!(
+            scan_args(&a, VALUE_FLAGS, BOOL_FLAGS).unwrap(),
+            vec!["m.ferx"]
+        );
+    }
+
+    #[test]
+    fn a_flag_where_a_value_should_be_is_still_an_error() {
+        let a = args(&["ferx", "allometry", "m.ferx", "--parameters", "--estimate"]);
+        let e = apply_flags(&a, &mut AllometryOptions::default()).unwrap_err();
+        assert!(
+            e.contains("--parameters requires a value but got '--estimate'"),
+            "{e}"
+        );
+        let a = args(&["ferx", "allometry", "m.ferx", "--reference"]);
+        let e = apply_flags(&a, &mut AllometryOptions::default()).unwrap_err();
+        assert!(e.contains("--reference requires a value"), "{e}");
+        assert!(value(&a, "--covariate").unwrap().is_none());
+    }
+
+    #[test]
+    fn non_numbers_are_named() {
+        let a = args(&["ferx", "allometry", "m.ferx", "--reference", "seventy"]);
+        let e = apply_flags(&a, &mut AllometryOptions::default()).unwrap_err();
+        assert!(
+            e.contains("--reference requires a number; got 'seventy'"),
+            "{e}"
+        );
+        let a = args(&[
+            "ferx",
+            "allometry",
+            "m.ferx",
+            "--parameters",
+            "CL",
+            "--exponents",
+            "0.5,x",
+        ]);
+        let e = apply_flags(&a, &mut AllometryOptions::default()).unwrap_err();
+        assert!(
+            e.contains("--exponents requires numbers; got '0.5,x'"),
+            "{e}"
+        );
+        // `validate` runs last, so a shape error is reported too.
+        let a = args(&["ferx", "allometry", "m.ferx", "--exponents", "0.5"]);
+        let e = apply_flags(&a, &mut AllometryOptions::default()).unwrap_err();
+        assert!(e.contains("needs `parameters`"), "{e}");
+    }
+
+    #[test]
+    fn run_rejects_bad_invocations_and_prints_help() {
+        assert_eq!(run(&args(&["ferx", "allometry", "a.ferx", "b.ferx"])), 1);
+        assert_eq!(run(&args(&["ferx", "allometry", "--help"])), 0);
+        assert_eq!(run(&args(&["ferx", "allometry", "a.ferx", "--bogus"])), 1);
+        assert_eq!(
+            run(&args(&["ferx", "allometry", "a.ferx", "--retries", "x"])),
+            1
+        );
+        assert_eq!(
+            run(&args(&[
+                "ferx",
+                "allometry",
+                "a.ferxsearch",
+                "--data",
+                "d.csv"
+            ])),
+            1
+        );
+    }
 }
