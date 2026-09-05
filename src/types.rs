@@ -3834,6 +3834,20 @@ impl CompiledModel {
         self.ode_spec.is_some()
     }
 
+    /// Returns true when the `ode_*` solver knobs actually reach an integrator for
+    /// this model — i.e. when [`CompiledModel::sync_ode_solver_opts`] has something to
+    /// stamp them onto.
+    ///
+    /// Not the same predicate as [`Self::is_ode_based`]. A **closed-form**
+    /// transit/IG model is analytic, yet carries an absorption ODE twin
+    /// (`absorption_ode_equivalent`, #814) that its TV-covariate / `TIME` / IOV
+    /// subjects integrate on — and `sync_ode_solver_opts` stamps the tolerances onto
+    /// that twin too. So the keys are live there even though `ode_spec` is `None`,
+    /// and warning "this model has no `[odes]` block" would be wrong.
+    pub(crate) fn honors_ode_solver_opts(&self) -> bool {
+        self.ode_spec.is_some() || self.absorption_ode_equivalent.is_some()
+    }
+
     /// Returns true for a **compartment-free** (`$PRED`-equivalent) model — one
     /// whose `[structural_model]` declares its prediction as an equation with no
     /// compartments underneath (issue #811).
@@ -7730,6 +7744,41 @@ impl FitOptions {
         warnings
     }
 
+    /// [`Self::unsupported_keys_warnings`] plus the **model-conditional** notices.
+    ///
+    /// A handful of `framework_keys()` entries are framework-level with respect to the
+    /// *method* — every estimator honours them — but conditional on the *model*. The
+    /// `ode_*` solver knobs are the case in point: `sync_ode_solver_opts` applies them
+    /// on any model that integrates, and is a silent no-op on one that does not. Since
+    /// [`Self::unsupported_keys_warnings`] only sees `FitOptions`, listing them in
+    /// `framework_keys()` (#517) suppressed the false positive on ODE models at the
+    /// price of a false *negative* on analytical ones (#518). This variant takes the
+    /// model, so it can say which it is.
+    ///
+    /// The method-level warnings are unchanged; this only appends notices.
+    pub(crate) fn unsupported_keys_warnings_with_model(
+        &self,
+        model: &CompiledModel,
+    ) -> Vec<String> {
+        let mut warnings = self.unsupported_keys_warnings();
+        if model.honors_ode_solver_opts() {
+            return warnings;
+        }
+        let mut seen = std::collections::HashSet::new();
+        for key in &self.user_set_keys {
+            if !ode_solver_keys().contains(&key.as_str()) {
+                continue;
+            }
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            warnings.push(format!(
+                "fit option `{key}` configures the ODE integrator, but this model has no                  `[odes]` block (and no closed-form absorption ODE twin), so it has no effect."
+            ));
+        }
+        warnings
+    }
+
     /// Warn when no estimation method was set anywhere — neither in the model
     /// file's `[fit_options]` nor by the caller (CLI / R / Python wrapper).
     /// In that case `method` carries its `FOCEI` default, and the user may not
@@ -7749,6 +7798,24 @@ impl FitOptions {
             self.method.label()
         ))
     }
+}
+
+/// The `ode_*` subset of [`framework_keys`]: knobs that only ever reach the ODE
+/// integrator, via [`CompiledModel::sync_ode_solver_opts`].
+///
+/// Kept as its own list so [`FitOptions::unsupported_keys_warnings_with_model`] can
+/// treat exactly these as model-conditional. `framework_keys` still carries them, so
+/// they never draw the method-level "not used by method" warning; a unit test pins the
+/// subset relation so the two lists cannot drift.
+pub(crate) fn ode_solver_keys() -> &'static [&'static str] {
+    &[
+        "ode_reltol",
+        "ode_abstol",
+        "ode_max_steps",
+        "ode_method",
+        "ode_stiff_abort_after",
+        "ode_auto_switch",
+    ]
 }
 
 /// Framework-level fit-option keys: consumed by every method and typically

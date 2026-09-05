@@ -2754,3 +2754,141 @@ mod theta_block_scale_guards {
         assert!(compact_theta_blocks(&names).is_empty());
     }
 }
+
+// ---------------------------------------------------------------------------
+// #518: the unsupported-keys warning is model-aware for the `ode_*` knobs.
+//
+// #517 fixed a false positive by adding the ODE-solver keys to `framework_keys()`,
+// which suppresses the "not used by method" warning *unconditionally* — including on
+// an analytical model, where `sync_ode_solver_opts` is a no-op and the keys really do
+// nothing. `unsupported_keys_warnings_with_model` restores that diagnostic without
+// bringing the false positive back.
+// ---------------------------------------------------------------------------
+
+/// Build a `FitOptions` whose `user_set_keys` names exactly `keys` (the field the
+/// warning layer reads); the values themselves are irrelevant to the warning.
+fn opts_with_user_set_keys(keys: &[&str]) -> FitOptions {
+    FitOptions {
+        user_set_keys: keys.iter().map(|k| k.to_string()).collect(),
+        ..FitOptions::default()
+    }
+}
+
+#[test]
+fn ode_solver_keys_are_a_subset_of_framework_keys() {
+    // The two lists are separate on purpose — `framework_keys` suppresses the
+    // *method*-level warning, `ode_solver_keys` selects the *model*-conditional
+    // notice — but an `ode_*` key missing from the former would draw the old
+    // spurious "not used by method FOCEI" warning again (#516/#517). Pin the
+    // subset relation so the lists cannot drift apart.
+    let fw = framework_keys();
+    for k in ode_solver_keys() {
+        assert!(
+            fw.contains(k),
+            "`{k}` is in ode_solver_keys() but not framework_keys() — it would \
+             spuriously warn as method-unsupported"
+        );
+    }
+}
+
+#[test]
+fn analytical_model_warns_that_ode_solver_keys_have_no_effect() {
+    let model = test_helpers::analytical_model(GradientMethod::Auto);
+    assert!(!model.honors_ode_solver_opts());
+
+    let opts = opts_with_user_set_keys(&["ode_reltol"]);
+    let w = opts.unsupported_keys_warnings_with_model(&model);
+
+    assert_eq!(w.len(), 1, "expected exactly one warning, got: {w:?}");
+    assert!(w[0].contains("ode_reltol"), "got: {}", w[0]);
+    assert!(w[0].contains("`[odes]` block"), "got: {}", w[0]);
+    // The method-level phrasing would be the wrong diagnosis here: the key is
+    // fine for FOCEI, it is the *model* that never integrates.
+    assert!(!w[0].contains("is not used by method"), "got: {}", w[0]);
+}
+
+#[test]
+fn analytical_model_warns_once_per_distinct_ode_solver_key() {
+    let model = test_helpers::analytical_model(GradientMethod::Auto);
+    // Every key in the list must be covered, and a duplicate must not double up.
+    let mut keys: Vec<&str> = ode_solver_keys().to_vec();
+    keys.push("ode_reltol");
+    let opts = opts_with_user_set_keys(&keys);
+
+    let w = opts.unsupported_keys_warnings_with_model(&model);
+    assert_eq!(
+        w.len(),
+        ode_solver_keys().len(),
+        "one notice per distinct key, got: {w:?}"
+    );
+    for k in ode_solver_keys() {
+        assert!(
+            w.iter().any(|m| m.contains(k)),
+            "no notice named `{k}`: {w:?}"
+        );
+    }
+}
+
+#[test]
+fn ode_model_does_not_warn_on_ode_solver_keys() {
+    // The #517 regression guard, at the model tier: `sync_ode_solver_opts` does
+    // apply these here, so neither the method-level nor the model-level layer
+    // may say a word.
+    let model = test_helpers::ode_model(GradientMethod::Auto);
+    assert!(model.honors_ode_solver_opts());
+
+    let opts = opts_with_user_set_keys(ode_solver_keys());
+    assert!(
+        opts.unsupported_keys_warnings_with_model(&model).is_empty(),
+        "ODE model warned on solver keys: {:?}",
+        opts.unsupported_keys_warnings_with_model(&model)
+    );
+}
+
+#[test]
+fn closed_form_absorption_twin_suppresses_the_ode_solver_key_notice() {
+    // The predicate is *not* `is_ode_based()`. A closed-form transit primary is
+    // analytic (`ode_spec == None`) but carries an absorption ODE twin (#814) that
+    // `sync_ode_solver_opts` also stamps, so the keys are live and "this model has
+    // no `[odes]` block" would be a false positive of the kind #517 removed.
+    use crate::parser::model_parser::parse_model_string;
+    let model = parse_model_string(TRANSIT_IOV_TOL_SRC).expect("parse transit+IOV");
+    assert!(!model.is_ode_based(), "the transit primary is analytic");
+    assert!(
+        model.absorption_ode_equivalent.is_some(),
+        "it carries a twin"
+    );
+    assert!(model.honors_ode_solver_opts());
+
+    let opts = opts_with_user_set_keys(ode_solver_keys());
+    assert!(
+        opts.unsupported_keys_warnings_with_model(&model).is_empty(),
+        "twin-carrying analytic model warned: {:?}",
+        opts.unsupported_keys_warnings_with_model(&model)
+    );
+}
+
+#[test]
+fn model_aware_warnings_keep_the_method_level_ones() {
+    // The model layer only *appends*: a genuinely method-unsupported key must still
+    // produce its own warning alongside the ODE notice.
+    let model = test_helpers::analytical_model(GradientMethod::Auto);
+    let opts = opts_with_user_set_keys(&["n_convergence", "ode_abstol"]);
+
+    let w = opts.unsupported_keys_warnings_with_model(&model);
+    assert_eq!(w.len(), 2, "got: {w:?}");
+    assert!(
+        w.iter()
+            .any(|m| m.contains("n_convergence") && m.contains("is not used by method")),
+        "lost the method-level warning: {w:?}"
+    );
+    assert!(
+        w.iter().any(|m| m.contains("ode_abstol")),
+        "lost the model-level notice: {w:?}"
+    );
+    // The model-agnostic entry point is unchanged — it still sees only the
+    // method-level miss, which is what keeps the public API's contract stable.
+    let base = opts.unsupported_keys_warnings();
+    assert_eq!(base.len(), 1, "got: {base:?}");
+    assert!(base[0].contains("n_convergence"), "got: {}", base[0]);
+}

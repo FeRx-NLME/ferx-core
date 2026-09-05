@@ -98,6 +98,12 @@ section of the SDLC for the versioning policy).
   bundled data by the bundled model too, so a reloaded joint fit keeps its event records.
 
 ### Changed
+- **The unused-fit-option warning is model-aware for the ODE solver keys (#518).** Setting
+  `ode_reltol` / `ode_abstol` / `ode_max_steps` / `ode_method` / `ode_stiff_abort_after` /
+  `ode_auto_switch` on a model that never integrates — analytical PK with no `[odes]` block and
+  no closed-form absorption ODE twin — now warns that the key has no effect, instead of being
+  dropped silently. Models that do integrate (including a closed-form transit / inverse-Gaussian
+  model reaching its twin) still never warn on these keys, as of #517.
 - **FREM prep refuses a model with a non-Gaussian endpoint (#1199).** `prepare_frem()` /
   `transform_dataset_for_frem()` return `E_FREM_NON_GAUSSIAN_ENDPOINT` instead of writing
   a dataset from the Gaussian rows alone; run the FREM step on the PK model without the

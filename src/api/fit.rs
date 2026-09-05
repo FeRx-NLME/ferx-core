@@ -931,7 +931,10 @@ fn fit_inner(
     // Compute up-front so we can both surface the warnings before the fit
     // starts (a long-running fit shouldn't bury a "this option is unused"
     // notice at the end) and carry them through into FitResult.warnings.
-    let mut pre_run_warnings = options.unsupported_keys_warnings();
+    // Model-aware: the `ode_*` solver knobs are framework-level for every *method*
+    // but conditional on the *model* (#518) — on a model that never integrates they
+    // are silently dropped, so say so rather than staying quiet.
+    let mut pre_run_warnings = options.unsupported_keys_warnings_with_model(model);
     // Surface a "no method specified, defaulting to FOCEI" notice through the
     // same channel so it reaches both stderr and FitResult.warnings.
     if let Some(w) = options.method_default_warning() {
