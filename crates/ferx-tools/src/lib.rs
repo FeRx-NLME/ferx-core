@@ -36,6 +36,20 @@ pub fn core_version() -> &'static str {
 mod tests {
     use super::core_version;
 
+    /// #529 convention guard, `ferx-tools` half: every `pub` options struct
+    /// this crate exposes must implement `Default` so a caller can build it
+    /// with `..Default::default()` and survive an added field. A new options
+    /// struct that forgets it fails to compile here.
+    #[test]
+    fn every_public_options_struct_implements_default() {
+        fn assert_default<T: Default>() -> T {
+            T::default()
+        }
+        let _ = assert_default::<crate::bootstrap::BootstrapOptions>();
+        let _ = assert_default::<crate::gam::GamOptions>();
+        let _ = assert_default::<crate::search::RunOptions>();
+    }
+
     #[test]
     fn core_version_is_reported_through_the_public_api() {
         let v = core_version();

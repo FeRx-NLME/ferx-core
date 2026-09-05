@@ -20,6 +20,12 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **`Default` on `UncertaintyMethod` and `SimulateUncertaintyOptions` (#529).** The
+  uncertainty-simulation options can now be built with `..Default::default()`
+  (`UncertaintyMethod::Asymptotic` is the default method), so wrapper code stays
+  source-compatible when a field is added. Every other `pub` options struct in
+  `ferx-core` and `ferx-tools` already implemented `Default`; a test now pins that
+  convention.
 - **`.ferxsearch` search configuration and an MFL search-space parser in `ferx-tools` (#1179).**
   A TOML file (`base`, `data`, `[space] mfl`, `[rank]`, `[strictness]`, `[run]`) whose space is
   written in Pharmpy's Model Feature Language, with `@IIV` / `@PK` / `@CONTINUOUS` / … resolved
