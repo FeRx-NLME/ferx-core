@@ -147,8 +147,10 @@ section of the SDLC for the versioning policy).
   used only for prediction still works. The check applies only when an optimizer will
   actually search: `maxiter = 0` (NONMEM `MAXEVAL=0`, as used by `ferx gam --no-fit` and by
   `ferx-tools`' bootstrap `--dofv`, which re-evaluates each replicate at its own estimates)
-  clamps nothing and is exempt, while `saem` / `imp` / `impmap` / `bayes` carry their own
-  iteration counts and are checked regardless. A near-singular `block_omega` / `block_kappa`
+  is exempt — it clamps the start like any other run, but produces one objective and stops,
+  so nothing is trapped on the rail. Note that it therefore *evaluates* a free `~ 0.0` at
+  `exp(-12)` rather than at the declared value, which `FIX` avoids (#1251). `saem` / `imp` /
+  `impmap` / `bayes` carry their own iteration counts and are checked regardless. A near-singular `block_omega` / `block_kappa`
   is reported as the correlation problem it is, rather than as a small variance.
 - **FREM prep refuses a model with a non-Gaussian endpoint (#1199).** `prepare_frem()` /
   `transform_dataset_for_frem()` return `E_FREM_NON_GAUSSIAN_ENDPOINT` instead of writing
