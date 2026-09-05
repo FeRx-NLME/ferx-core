@@ -10993,8 +10993,16 @@ mod lag_arrival_read_1226 {
     /// dose's break and the band is precisely the bit-equal set. That is the regime the whole
     /// module was blind to: every other fixture here is at `t ≈ 8.2`.
     ///
-    /// Mutation: write either predicate in the sum form and `ode_dense_solve_states` returns
-    /// `NaN` here while the other engines still read 145.38.
+    /// **Anchored on NONMEM**, not only on the closed form:
+    /// `nonmem_anchor/lag_arrival_read_largetime.ctl` is the same fixture (`ADVAN1 TRANS2`,
+    /// doses at 17511.8 and 17520, sample at 17520) and tables
+    /// `PRED = 1.4404316545059672E+02`. That run does double duty — it is also a *dose
+    /// landing on the same time as an observation*, so it pins the ordering convention that
+    /// `provider_reads_a_dose_landing_on_the_last_observation` checks the sensitivity walk
+    /// against.
+    ///
+    /// Mutation: write either predicate in the sum form and `ode_predictions` reads the
+    /// pre-dose 44.04 here while the event-driven control still reads 144.04.
     #[cfg(feature = "survival")]
     #[test]
     fn every_engine_reads_a_record_on_its_final_break_at_a_large_time() {
@@ -11019,10 +11027,17 @@ mod lag_arrival_read_1226 {
 
         let ke = CL / V;
         let pre = 100.0 * (-ke * 8.2f64).exp();
+        // `results/lag_arrival_read_largetime.tab`, `PRED` at TIME = 17520.
+        const NM_LARGETIME: f64 = 1.4404316545059672E+02;
         let post = pre + 100.0;
         assert!(
             post - pre > 99.0,
             "the pre/post-dose pair must be a whole dose apart ({pre:.4} / {post:.4})"
+        );
+        assert!(
+            (post - NM_LARGETIME).abs() / NM_LARGETIME < 1e-9,
+            "the closed form {post:.10} and the NONMEM anchor {NM_LARGETIME} must agree, or \
+             one of the two fixtures has drifted from the other"
         );
         for (e, vals) in ENGINES.iter().zip(got.iter()) {
             assert!(
@@ -11031,10 +11046,11 @@ mod lag_arrival_read_1226 {
                  neither the band nor the segment",
                 vals[0]
             );
+            let rel = (vals[0] - NM_LARGETIME).abs() / NM_LARGETIME;
             assert!(
-                (vals[0] - post).abs() < 1e-6,
-                "{e} at t={t_dose}: {:.8} — expected the post-dose {post:.8} (pre-dose \
-                 reads {pre:.8})",
+                rel < 1e-9,
+                "{e} at t={t_dose}: {:.8} vs NONMEM {NM_LARGETIME} (rel {rel:.3e}) — a \
+                 pre-dose read is {pre:.8}",
                 vals[0]
             );
         }

@@ -1,0 +1,20 @@
+$PROBLEM #1226 record ordering at a large time (advan1); dose and sample both at TIME=17520
+$INPUT ID TIME DV AMT EVID CMT MDV
+$DATA lag_arrival_read_largetime.csv IGNORE=@
+$SUBROUTINES ADVAN1 TRANS2
+
+$PK
+  CL = THETA(1)
+  V  = THETA(2)
+  K  = CL/V
+
+$ERROR
+  IPRED = F
+  Y = IPRED + EPS(1)
+$THETA
+  1.0 FIX
+  10.0 FIX
+$OMEGA 0 FIX
+$SIGMA 1 FIX
+$ESTIMATION METHOD=0 MAXEVAL=0 PRINT=1 NOABORT
+$TABLE ID TIME PRED IPRED AMT EVID NOPRINT ONEHEADER FORMAT=s1PE23.16 FILE=lag_arrival_read_largetime.tab
