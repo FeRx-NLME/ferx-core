@@ -91,6 +91,15 @@ const DATA_MID_RECORD: &str = "nonmem_anchor/ss_chz_ss2.csv";
 /// dose; `60` is a full interval past it, where a discarded `H(48)` would still be missing.
 const GRID_R3: [f64; 4] = [12.0, 47.9, 48.1, 60.0];
 
+/// `nonmem_anchor/ss_chz_ss2_lag.csv`: r3's shape with `ALAG1 = 24 > II = 12` on every dose,
+/// so the mid-record `SS=1` lands in the clamped-phase arm (#1220 item 1).
+const DATA_MID_RECORD_LAG: &str = "nonmem_anchor/ss_chz_ss2_lag.csv";
+
+/// ferx times of the r5 records — NONMEM `T` minus 600. `239.9`/`240.1` straddle the second
+/// `SS=1` record; `252` and `263.9`/`264.1` sit either side of that record's own lagged
+/// arrival at `264`, and `276` is the next lagged arrival.
+const GRID_R5: [f64; 7] = [12.0, 239.9, 240.1, 252.0, 263.9, 264.1, 276.0];
+
 /// `(ferx time, IPRED, CHZ, HAZ)` for the four post-gate records of an r2 table.
 ///
 /// Columns are `ID TIME CMT DV EVID IPRED CHZ HAZ MDV`. Only records at `T > 600` are
@@ -155,6 +164,47 @@ fn nonmem_rows_r3(arm: &str) -> Vec<(f64, f64, f64, f64)> {
         assert!(
             (got - want).abs() < 1e-9,
             "{arm}: r3 record at ferx t={got}, expected {want}"
+        );
+    }
+    rows
+}
+
+/// `(ferx time, IPRED, CHZ, HAZ)` for the seven post-gate **observation** records of the r5
+/// table. Same column layout and `T - 600` alignment as [`nonmem_rows_r3`]; only the drug arm
+/// exists (see the test's note on why `const` cannot see a lag).
+fn nonmem_rows_r5() -> Vec<(f64, f64, f64, f64)> {
+    let path = "nonmem_anchor/results/ss_chz_r5_drug_lag.tab";
+    let raw = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let mut rows: Vec<(f64, f64, f64, f64)> = raw
+        .lines()
+        .skip(2)
+        .filter_map(|l| {
+            let f: Vec<f64> = l
+                .split_whitespace()
+                .filter_map(|x| x.parse().ok())
+                .collect();
+            // `f[2]` is CMT: PK observations only, so the TTE row at T = 876 does not collide
+            // with the PK row at the same time.
+            (f.len() >= 9 && f[8] == 0.0 && f[2] == 2.0 && f[1] > 600.0)
+                .then(|| (f[1] - 600.0, f[5], f[6], f[7]))
+        })
+        .collect();
+    rows.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("finite times"));
+    // `839.9 - 600.0` is `239.89999999999998`, so the grid is matched to tolerance rather than
+    // bit-exactly — a missing, extra or misaligned record still fails here, before anything is
+    // compared against it.
+    let times: Vec<f64> = rows.iter().map(|r| r.0).collect();
+    assert_eq!(
+        times.len(),
+        GRID_R5.len(),
+        "the r5 table has {} post-gate observation records, expected {}: {times:?}",
+        times.len(),
+        GRID_R5.len()
+    );
+    for (got, want) in times.iter().zip(&GRID_R5) {
+        assert!(
+            (got - want).abs() < 1e-9,
+            "r5 record at ferx t={got}, expected {want}"
         );
     }
     rows
@@ -240,6 +290,213 @@ fn a_second_ss_dose_keeps_the_hazard_and_matches_nonmem() {
             "{arm}: worst relative PRED disagreement vs the r3 train = {worst_pred}"
         );
     }
+}
+
+/// Every committed reference run is what it claims to be, checked before any table is read.
+///
+/// The run recipe for these anchors says to inspect the `.lst` for `PRDERR` / `+INF` /
+/// `PROGRAM TERMINATED` before trusting the corresponding `.tab` — that is how `r1` announced
+/// itself. That check was performed by hand at each run and recorded in prose; nothing enforced
+/// it, so a future re-run pasted in with a silent solver failure would be compared against
+/// happily. This asserts it, in both directions:
+///
+///   * `r2`–`r5` are the **positive** references. Their tables are only meaningful if NONMEM
+///     integrated cleanly, so they must carry none of those markers.
+///   * `r1` is the **negative** result — the measured finding that NONMEM's own steady-state
+///     routine cannot be handed the augmented system at all. Its value is precisely that it
+///     failed, so it must *still* carry the failure. If a future NONMEM version made `r1`
+///     succeed, that is a real change in the anchor's premise and this test is where it
+///     surfaces, rather than silently invalidating the "H(0) = 0 is a ferx definition"
+///     reasoning the whole file rests on.
+#[test]
+fn every_committed_reference_run_is_what_it_claims_to_be() {
+    const FAILURE_MARKERS: [&str; 3] = ["PRDERR", "NUMERICAL DIFFICULTIES", "PROGRAM TERMINATED"];
+
+    for arm in [
+        "r2_const",
+        "r2_drug",
+        "r2_tdep",
+        "r3_const",
+        "r3_drug",
+        "r4_const",
+        "r5_drug_lag",
+    ] {
+        let path = format!("nonmem_anchor/results/ss_chz_{arm}.lst");
+        let lst = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        for marker in FAILURE_MARKERS {
+            assert!(
+                !lst.contains(marker),
+                "{arm}: the committed run carries `{marker}` — its table is not trustworthy \
+                 and must not be used as a reference"
+            );
+        }
+    }
+
+    // The negative result, still negative. `r1_drug` terminates outright; `r1_const` "succeeds"
+    // but reports `+INF` for the objective with a wildly negative `A(3)`, so it is pinned on the
+    // objective rather than on a termination marker.
+    let drug = std::fs::read_to_string("nonmem_anchor/results/ss_chz_r1_drug.lst")
+        .expect("r1_drug .lst is committed");
+    assert!(
+        FAILURE_MARKERS.iter().any(|m| drug.contains(m)),
+        "r1_drug is the anchor for `NONMEM cannot solve this system`; it no longer fails, \
+         which changes the premise of every arm in this file"
+    );
+    let konst = std::fs::read_to_string("nonmem_anchor/results/ss_chz_r1_const.lst")
+        .expect("r1_const .lst is committed");
+    assert!(
+        konst.contains("INF"),
+        "r1_const is the anchor for NONMEM's SS routine returning a non-finite objective on \
+         the augmented system; it no longer does"
+    );
+}
+
+/// **A mid-record `SS=1` dose whose lag exceeds `II` keeps the hazard accrued so far — the
+/// external anchor for the one case r3 could not reach** (#1220 item 1).
+///
+/// `a_mid_record_ss_dose_lagged_past_the_interval_keeps_the_hazard_accrued_so_far` (Tier-1) is
+/// the sole holder of `restore_chz` inside `ss_state_at_phase` — mutation `M8` kills it and
+/// nothing else — but it is checked against a closed form. r3 anchors *preserve* externally and
+/// #1121's `ss_lagtime_edge_nonmem_anchor.rs` anchors the SS-plus-lag *PK* convention
+/// externally; what had no external anchor was the intersection.
+///
+/// **Only the drug arm can see it.** With `BETA = 0` the hazard is `H0` regardless of the PK,
+/// so `H(t) = H0·t` holds whatever the lag does — the const arm is structurally blind here,
+/// which is why this is a one-arm test rather than the two-arm loop above.
+///
+/// **The construction, and why it is not a shifted train.** For `lag >= II` ferx clamps the seed
+/// phase to zero (`ss_seed_phase` is `(II - lag).max(0)`), and so does NONMEM 7.6.0
+/// (`results/ss_lag_ge_ii.tab`). An `SS=1` record with `lag >= II` therefore means *periodic
+/// pulses ending with one on the record itself*, then this dose's own pulse at `t + lag` — not a
+/// train shifted by the lag, and no shifted train reproduces it. So the NONMEM twin
+/// (`ss_chz_r5_drug_lag.ctl` + `ss_chz_train5.csv`) carries **no `ALAG` at all**: it is a plain
+/// pulse train placed at the ferx side's lagged *arrivals*.
+///
+/// `ALAG1 = 24` is a multiple of `II = 12` so the first record's own arrival lands back on the
+/// `II` grid. The pulse that would land at ferx `t = 12` exists on neither side — the record that
+/// would arrive there precedes the first record — so the train omits `T = 612` too, and the
+/// mid-record `SS=1` is placed far enough out (`t = 240`) that the gap has decayed below
+/// tolerance (`e^{-0.1*228} ~ 1e-10`).
+///
+/// **What this arm does not pin.** Taking `lag` to be an exact multiple of `II` costs the ability
+/// to tell ferx's clamp from a wrap: `ss_seed_phase` is `(II - lag).max(0)` = `0`, and a wrapping
+/// implementation `(II - lag % II) % II` is also `0`. So the clamp branch is *entered* here but a
+/// clamp-for-wrap mutation would leave this arm green. That convention is pinned by #1121's
+/// `ss_lag_ge_ii` anchor, which uses `LG = 15` with `II = 12`, where the two differ wide
+/// (`PRED(0)`: clamp `13.197`, the post-pulse peak, vs wrap `2.1815`). What *this* arm pins is
+/// `restore_chz` inside `ss_state_at_phase` — the hazard surviving the re-seed — which is the
+/// object #1220 item 1 was opened for.
+///
+/// The lag is a **fixed theta**, not a column: `ode_cumhaz_hazard` snapshots the PK parameters
+/// at `t = 0`, so a per-dose lag column would be read at its baseline for every dose, and a
+/// time-varying one would trip `assert_survival_tv_covariates`.
+#[test]
+fn a_lagged_mid_record_ss_dose_keeps_the_hazard_and_matches_nonmem() {
+    let (m, pop) = load_with("drug_lag", DATA_MID_RECORD_LAG);
+
+    // The regime this arm exists for, asserted on the fixture rather than assumed. Without it,
+    // a `ss_chz_drug_lag_fit.ferx` that lost its `ALAG1 = TVLAG` line would still fail — but as
+    // an unexplained numerical disagreement, not as "the lag is gone". `II` comes from the
+    // dataset's SS records, the lag from the model's fixed theta.
+    let lag = m.default_params.theta[5];
+    let ii = pop.subjects[0]
+        .doses
+        .iter()
+        .find(|d| d.ss)
+        .map(|d| d.ii)
+        .expect("the fixture must carry an SS dose");
+    assert!(
+        lag > ii,
+        "this arm anchors the `lag >= II` regime; got ALAG1={lag}, II={ii}"
+    );
+    let sv = predict_survival(&m, &pop, &m.default_params, &GRID_R5);
+    let pred = predict(&m, &pop, &m.default_params);
+    let reference = nonmem_rows_r5();
+
+    // The straddle, on the reference itself: drug has been present since t = 0 and the hazard
+    // is live going into the second SS record, so "preserve" and "zero" cannot agree there.
+    let (h_before, chz_before, chz_after) = (reference[1].3, reference[1].2, reference[2].2);
+    assert!(
+        h_before > 0.2 && chz_before > 400.0,
+        "the reference carries H={chz_before}, h={h_before} into the second SS record; with \
+         nothing accrued this arm cannot tell preserve from zero"
+    );
+    // And the reference's own increment across the record is the train's (~0.05 over 0.2 h at
+    // h ~ 0.22-0.34), which is what certifies that the train really is uninterrupted there —
+    // if the construction had accidentally restarted, `chz_after` would be ~0.05 rather than
+    // ~467.7 and every comparison below would be against a reference asserting the wrong rule.
+    //
+    // Note what these two checks are and are not: they interrogate the **reference**, before it
+    // is used. ferx's own behaviour is discriminated by the tolerance assertions at the end —
+    // measured, on the three mutations this arm exists for: `restore_chz` dropped from
+    // `ss_state_at_phase` gives `worst_h = 0.99994`, and so does zeroing the accumulator
+    // outright (the fix #1210's issue originally suggested). Dropping `restore_chz` from
+    // `equilibrate_ss_state` instead leaves this arm green and reddens `a_second_ss_dose_...`
+    // above — the clamped phase (`lag >= II`) is exactly what keeps that branch out of this
+    // path, which is the Tier-1's doc claim, here confirmed externally.
+    let increment = chz_after - chz_before;
+    assert!(
+        (0.03..0.08).contains(&increment),
+        "the reference's H moved by {increment} across the lagged SS record \
+         ({chz_before} -> {chz_after}); an uninterrupted train increments by ~0.05 there"
+    );
+
+    let mut worst_h = 0.0f64;
+    let mut worst_pred = 0.0f64;
+    // No `compared_pred` counter here, unlike the r3 arm above: there the increment sits inside
+    // an `if let Some(pr)`, so the count genuinely catches a PRED row that was silently skipped.
+    // This loop panics on a missing row instead, runs `reference.len()` times, and
+    // `nonmem_rows_r5` has already pinned that length to `GRID_R5.len()` — so the same assertion
+    // here could never fail.
+    for (t, ipred, chz, haz) in reference {
+        // The *reference* side is checked for finiteness too, not only ferx's. `"NaN".parse::
+        // <f64>()` succeeds in Rust, so a `NaN` cell in the table would not shift columns and
+        // would not trip the grid check above — it would make the quotient `NaN`, and
+        // `worst.max(NaN)` returns `worst`, silently dropping that record from the bound. The
+        // arm would then pass on the strength of the records that happened to parse.
+        assert!(
+            ipred.is_finite() && chz.is_finite() && haz.is_finite(),
+            "the reference table carries a non-finite value at t={t}: \
+             IPRED={ipred}, CHZ={chz}, HAZ={haz}"
+        );
+        // IPRED first, and separately: if the PK disagrees the fixture is not a twin of the
+        // train, and the hazard comparison downstream of it would be meaningless. This is the
+        // control that caught r3's first draft (`PRED = 0.132` against the train's `4.837`).
+        let pr = pred
+            .iter()
+            .find(|p| (p.time - t).abs() < 1e-9)
+            .unwrap_or_else(|| panic!("no ferx PRED row at t={t}"));
+        assert!(pr.pred.is_finite(), "non-finite ferx PRED at t={t}");
+        worst_pred = worst_pred.max(((pr.pred - ipred) / ipred).abs());
+
+        let r = sv
+            .iter()
+            .find(|r| (r.time - t).abs() < 1e-9)
+            .unwrap_or_else(|| panic!("no ferx survival row at t={t}"));
+        // Finiteness before the fold: `f64::max` returns the *other* operand for a NaN, so an
+        // unchecked `worst = worst.max(...)` would keep whatever the finite records produced
+        // and pass on their strength.
+        assert!(
+            r.cum_hazard.is_finite() && r.hazard.is_finite(),
+            "ferx returned a non-finite H/h at t={t}: {}, {}",
+            r.cum_hazard,
+            r.hazard
+        );
+        worst_h = worst_h.max(((r.cum_hazard - chz) / chz).abs());
+        worst_h = worst_h.max(((r.hazard - haz) / haz).abs());
+    }
+    // Measured on the run: worst relative disagreement 5.5e-9 on H/h and 3.5e-9 on PRED. Both
+    // sit on the reference's own printf floor — `FORMAT=s1PE15.8` gives nine significant digits,
+    // and `A(3) ~ 5e2` is therefore worth ~1e-9 by itself. 2e-8 is ~3.6x the largest, the same
+    // bound and the same reasoning as the r3 arm above.
+    assert!(
+        worst_h < 2e-8,
+        "worst relative H/h disagreement vs the r5 train = {worst_h}"
+    );
+    assert!(
+        worst_pred < 2e-8,
+        "worst relative PRED disagreement vs the r5 train = {worst_pred}"
+    );
 }
 
 /// The reference certifies itself before anything is compared against it: on the constant
