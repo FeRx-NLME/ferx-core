@@ -144,7 +144,12 @@ section of the SDLC for the versioning policy).
   the same stream with error 76. Write `~ 0.0 FIX` for no variability, or start at ≥ 1e-5
   to estimate it. `sigma ~ 0.0` is unaffected — measured to reach the optimum from its own
   `-8` rail — and `predict()` / `simulate()` are untouched, so a zero-variance fixture
-  used only for prediction still works.
+  used only for prediction still works. The check applies only when an optimizer will
+  actually search: `maxiter = 0` (NONMEM `MAXEVAL=0`, as used by `ferx gam --no-fit` and by
+  `ferx-tools`' bootstrap `--dofv`, which re-evaluates each replicate at its own estimates)
+  clamps nothing and is exempt, while `saem` / `imp` / `impmap` / `bayes` carry their own
+  iteration counts and are checked regardless. A near-singular `block_omega` / `block_kappa`
+  is reported as the correlation problem it is, rather than as a small variance.
 - **FREM prep refuses a model with a non-Gaussian endpoint (#1199).** `prepare_frem()` /
   `transform_dataset_for_frem()` return `E_FREM_NON_GAUSSIAN_ENDPOINT` instead of writing
   a dataset from the Gaussian rows alone; run the FREM step on the PK model without the

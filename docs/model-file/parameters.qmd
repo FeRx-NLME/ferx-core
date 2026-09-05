@@ -253,11 +253,27 @@ one-subject fixture the same model gave `TVCL` 48% low free versus 0.09% low
 ESTIMATE OF VARIANCE CANNOT BE ZERO UNLESS FIXED`).
 
 The check is on the **variance the optimizer starts from**, not on the literal
-zero: any free variance ≤ 6.1e-6 (`ln(√v) ≤ -6`) lands on the same rail, and in
-a `block_omega` it is the Cholesky diagonal — which the off-diagonals feed into
-— that is tested. Start such a parameter at ≥ 1e-5 if you do want to estimate
-it. Sigma is not affected: a free `sigma ~ 0.0 (sd)` is clamped onto its own
-`-8` rail and still reaches the optimum. See
+zero: any free variance ≤ 6.1e-6 (`ln(√v) ≤ -6`) lands on the same rail. Start
+such a parameter at ≥ 1e-5 if you do want to estimate it.
+
+In a `block_omega` the quantity tested is the Cholesky diagonal `L_ii`, which is
+what remains of that eta's variance once the off-diagonals are accounted for — so
+a *near-singular* block trips this even when every declared variance is
+ordinary, and the fix there is to lower the declared covariances (or `FIX` the
+block), not to raise a variance that is already fine.
+
+Two things are deliberately outside the check. **Sigma**: a free
+`sigma ~ 0.0 (sd)` is clamped onto its own `-8` rail and still reaches the
+optimum, so it is not rejected. **Runs where nothing optimises**: with
+`maxiter = 0` (NONMEM `MAXEVAL=0`) no start is ever clamped, so a zero variance
+is accepted — which is what lets `ferx gam --no-fit`, and any evaluation at
+fixed parameters, keep working. `saem`, `imp`, `impmap` and `bayes` carry their
+own iteration counts and are checked regardless of `maxiter`.
+
+`predict()` and `simulate()` never apply the check, so a simulation-only fixture
+with a free zero keeps working — but `ferx check` reports what `fit()` would
+refuse, so it will flag such a file. Add `maxiter = 0` to `[fit_options]` if the
+model is genuinely simulation-only. See
 [#1229](https://github.com/FeRx-NLME/ferx-core/issues/1229) and
 [`E_OMEGA_INIT_AT_RAIL`](../file-formats/check-report.qmd#codes-parameters-and-random-effects).
 :::

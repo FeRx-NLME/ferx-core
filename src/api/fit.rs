@@ -1119,7 +1119,7 @@ fn fit_inner(
     // inits, and it is the vector the optimizer actually starts from that gets
     // clamped. Placed here — before every population-dependent check — because
     // the predicate needs no data and fails identically for every method.
-    first_error(&check_variance_init_rails(init_params))?;
+    first_error(&check_variance_init_rails(init_params, options))?;
 
     // Pre-compute n_params (uses init_params, available before chain runs):
     // the coordinates the outer optimizer actually searches — neither FIX nor
