@@ -20,6 +20,13 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **`.ferxsearch` search configuration and an MFL search-space parser in `ferx-tools` (#1179).**
+  A TOML file (`base`, `data`, `[space] mfl`, `[rank]`, `[strictness]`, `[run]`) whose space is
+  written in Pharmpy's Model Feature Language, with `@IIV` / `@PK` / `@CONTINUOUS` / … resolved
+  against the base model's `[individual_parameters]`, `pk` line, `[covariates]` block and the
+  dataset. A feature ferx cannot build (`ELIMINATION(MM)`, `ABSORPTION(SEQ-ZO-FO)`, the PD
+  families, …) is a hard error naming it, never a silently narrowed search; the coverage table is
+  in `docs/tools/search.qmd`.
 - **Optional regularization for the covariate NN (`[covariate_nn]` / DCM) (#1215).** Via two
   new `[fit_options]` keys, `nn_l2` and `nn_smooth` (both non-negative, default `0.0` =
   off — a strict no-op that keeps existing fits byte-identical). `nn_l2` adds L2

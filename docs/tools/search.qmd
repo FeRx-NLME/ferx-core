@@ -1,0 +1,304 @@
+---
+pagetitle: "Search configuration"
+description-meta: "The .ferxsearch file: a TOML search configuration whose space is written in Pharmpy's Model Feature Language, with @-symbols resolved against the base model and a hard-error coverage table."
+---
+
+# Search configuration
+
+> **Maturity: alpha** — see [Feature Maturity](../maturity.qmd) for what this means.
+
+Every automated model-development tool in `ferx-tools` — covariate search,
+structural search, variability search — is the same loop: generate a candidate
+model, fit it, rank it. What differs between runs is *what to search over*, and
+that is configuration, not model. The
+[covariate model page](../model-file/covariate-model.qmd#coming-from-psn-scm)
+already fixes the boundary: what PsN calls `[test_relations]`, `valid_states`
+and `p_forward` does not belong in a `.ferx` block.
+
+So the search space lives in a **`.ferxsearch`** file next to the model. It is
+TOML, and its `[space]` section carries the space as a string in Pharmpy's
+**Model Feature Language (MFL)** — reused verbatim, so a space written for
+Pharmpy's `modelsearch`, `covsearch` or `iivsearch` transfers directly, and so a
+space is short enough to quote in an issue or a paper.
+
+This page documents the file, the grammar, the `@`-symbols and the
+[coverage table](#coverage): the features ferx can build a candidate for, and
+the ones it refuses by name. The search tools that consume it are the
+sub-issues of [#1175](https://github.com/FeRx-NLME/ferx-core/issues/1175).
+
+## The file
+
+```toml
+base = "warfarin.ferx"
+data = "warfarin.csv"          # optional: falls back to the model's [data] block
+
+[space]
+mfl = """
+ABSORPTION([INST,FO]); PERIPHERALS(0..1); LAGTIME([OFF,ON])
+COVARIATE?(@IIV, @CONTINUOUS, [pow,lin]); COVARIATE?(@IIV, @CATEGORICAL, cat)
+"""
+
+[rank]
+type   = "bic"      # ofv | aic | bic | bic_mixed | bic_iiv | bic_random | bic_fixed
+cutoff = 3.84
+
+[strictness]
+require_converged    = true
+max_condition_number = 1000.0
+max_correlation      = 0.95
+reject_on_boundary   = true
+
+[run]
+threads   = 8
+retries   = 3
+cache_dir = ".ferx-search"
+```
+
+| key | meaning |
+|---|---|
+| `base` | the base model. Relative paths are taken against the `.ferxsearch` file's own directory, so the pair moves together |
+| `data` | the dataset; omit it to use the model's `[data]` block |
+| `[space] mfl` | the search space, in MFL (below). Parsed and coverage-checked when the file is loaded |
+| `[rank]` | what candidates are ranked on, and the improvement one must show over its parent |
+| `[strictness]` | the gate a fit must pass before its criterion is trusted — every key is optional and overlays the engine default |
+| `[run]` | threads, retries (perturbed starts per candidate on top of the exact one, as in Pharmpy), journal directory, resume |
+
+A tool section — `[covsearch]`, `[modelsearch]`, `[iivsearch]`, `[iovsearch]`,
+`[ruvsearch]`, `[structsearch]` or `[allometry]` — is kept for the tool that
+owns it; this loader does not know its schema. Any other table is an error
+naming the sections the file takes, so a misspelt `[strictnes]` cannot be
+filed away as a tool section and leave the gate at its defaults. A typo
+*inside* a known section (`thread = 8`) is an error, and so is a stray
+top-level scalar.
+
+Loading a file does three things beyond reading it. It parses the MFL, so a
+syntax error names the statement. It checks every feature against the
+[coverage table](#coverage), so an unsupported feature is an error naming the
+feature — never a quietly narrowed search. And it validates `[rank] type`, so
+a file asking for something unimplemented fails before the first fit rather
+than after the last one.
+
+## The search space — MFL
+
+Statements are separated by `;` or a newline; `#` starts a comment. Keywords,
+modes and effect names are case-insensitive. Each feature takes a
+comma-separated argument list whose entries are:
+
+| form | example | meaning |
+|---|---|---|
+| name | `FO` | one mode |
+| array | `[FO, ZO]` | several |
+| number | `1` | a count, at most 64 |
+| range | `0..2` | counts, both ends included; a range is materialised at load, so its ends are bounded like any count |
+| wildcard | `*` | every mode the grammar knows. In a parameter slot it is feature-specific — `@PK` for `COVARIATE` and `IIV`, `@IIV` for `IOV` and `COVARIANCE` — and resolves exactly as that symbol does, a `LET` of the same name included; for covariate effects, the four continuous forms |
+| symbol | `@IIV` | a set resolved against the base model — see [Symbols](#symbols) |
+
+A `?` after the keyword — `COVARIATE?`, `IIV?`, `IOV?`, `COVARIANCE?` — marks
+the feature **exploratory**: the search may include it. Without the `?` every
+candidate carries it. `LET(NAME, [...])` defines a symbol referenced as
+`@NAME`, and overrides a built-in of the same name.
+
+| feature | arguments | values |
+|---|---|---|
+| `ABSORPTION(x)` | mode(s) | `INST`, `FO`, `ZO`, `SEQ-ZO-FO`, `WEIBULL` |
+| `ELIMINATION(x)` | mode(s) | `FO`, `ZO`, `MM`, `MIX-FO-MM` |
+| `PERIPHERALS(n[, k])` | count(s), kind | `n` a number, range or array; `k` = `DRUG` / `MET` |
+| `TRANSITS(n[, d])` | count(s) or `N`, depot | `N` estimates the count as a continuous parameter; `d` = `DEPOT` / `NODEPOT` |
+| `LAGTIME(x)` | mode(s) | `ON`, `OFF` |
+| `COVARIATE[?](p, c, e[, op])` | parameter(s), covariate(s), effect(s), operator | `e` = `lin`, `piece_lin`, `exp`, `pow`, `cat`, `cat2`, `custom`; `op` = `*` (default) / `+` |
+| `ALLOMETRY(c[, ref])` | covariate, reference | e.g. `ALLOMETRY(WT, 70)` |
+| `IIV[?](p, e)` / `IOV[?](p, e)` | parameter(s), effect(s) | `EXP`, `ADD`, `PROP`, `LOG`, `RE_LOG` |
+| `COVARIANCE[?](l, p)` | level(s), parameter(s) | `l` = `IIV` / `IOV`, an array of them, or `*` |
+| `DIRECTEFFECT(x)`, `EFFECTCOMP(x)` | type(s) | `LINEAR`, `EMAX`, `SIGMOID`, `STEP`, `LOGLIN` |
+| `INDIRECTEFFECT(x, k)` | type(s), kind | `k` = `PRODUCTION` / `DEGRADATION` |
+| `METABOLITE(x)` | model(s) | `BASIC`, `PSC` |
+
+Every category is *parsed*, whether or not ferx can build it, so that
+`ELIMINATION(MM)` is refused as "not expressible" rather than as an unknown
+keyword.
+
+The MFL effect names map onto `[covariate_model]` forms as `lin` → `linear`,
+`piece_lin` → `hockey`, `exp` → `exponential`, `pow` → `power`,
+`cat` → `categorical`.
+
+### Deviations from Pharmpy
+
+Three, all deliberate:
+
+- **Names keep their case.** Pharmpy upper-cases parameter and covariate names;
+  ferx's `[individual_parameters]` and CSV headers are case-sensitive, and
+  `Vc` upper-cased to `VC` would resolve to nothing. Keywords, modes and
+  effects are still case-insensitive.
+- **`TRANSITS(n)` without a depot option means DEPOT, as in Pharmpy.** ferx's
+  analytic `*_transit` templates feed central straight from the last transit
+  compartment, which is Pharmpy's NODEPOT, so a Pharmpy-ported `TRANSITS(1..3)`
+  is a coverage error (see below) naming the fix — write `NODEPOT` — rather
+  than a silent reinterpretation. `TRANSITS(N)` takes no option and is
+  NODEPOT by Pharmpy's own grammar.
+- **`COVARIATE(..., *)` on a categorical covariate is `cat`.** Pharmpy expands
+  the effect wildcard to the four continuous forms regardless; ferx knows the
+  covariate's declared kind, so on a categorical one the wildcard is the only
+  form that can apply.
+
+### Anchored against Pharmpy
+
+The parser and the symbol resolver are checked against Pharmpy itself, not
+against a reading of its documentation: `tools/pharmpy-mfl-anchor/` feeds a
+corpus of MFL programs to `pharmpy.tools.mfl.parse.parse` (Pharmpy 2.0.0)
+and `expand()`s a set of symbol-bearing statements on a reference model, and
+a Tier-1 test replays the committed dump against ferx. Every corpus line
+either agrees or is a divergence named in the test with its reason — the
+deviations above, plus a handful where Pharmpy's interpreter crashes on
+input its grammar allows, and its silent `()` for an unknown `@FOO` where
+ferx errors. Two Pharmpy rules were adopted because of the anchor: a
+mandatory `COVARIATE` may not use `*` for its effects, and `TRANSITS(N)`
+takes no depot option. The README in that directory carries the full table.
+
+### Rendering and round-trip
+
+A parsed space renders back to a canonical string — keywords upper-case,
+arrays without spaces, statements joined by `;` — that re-parses to the same
+features. The rendering of a *resolved* space (every symbol and wildcard
+replaced by names) is a stable description of the space on that model, and
+is what a search records in its journal.
+
+## Symbols
+
+A `@`-symbol stands for a set of names read off the base model and its
+dataset:
+
+| symbol | resolves to |
+|---|---|
+| `@IIV` | every individual parameter carrying an η |
+| `@PK` | every individual parameter bound on the `pk NAME(...)` or `ode_template NAME(...)` line, in that order |
+| `@PK_IIV` | `@PK` ∩ `@IIV` |
+| `@ABSORPTION` | the `ka`, `n`, `mtt`, `mat`, `cv2` and `lagtime` bindings |
+| `@ELIMINATION` | the `cl` binding |
+| `@DISTRIBUTION` | the `v` / `v1` / `v2` / `v3` and `q` / `q2` / `q3` bindings |
+| `@BIOAVAIL` | the `f` binding |
+| `@CONTINUOUS` | the covariates declared `continuous` in `[covariates]` |
+| `@CATEGORICAL` | the covariates declared `categorical` |
+| `@PD`, `@PD_IIV` | nothing — there is no PD template family |
+
+The rules around them:
+
+- **The `[covariates]` block is authoritative for kinds.** `@CONTINUOUS` and
+  `@CATEGORICAL` need it; the dataset alone cannot tell a numerically coded
+  categorical from a continuous column, so without the block they are an
+  error that says so. With no block, an explicit covariate name or `*` still
+  means the dataset's covariate columns.
+- **The dataset is checked.** A declared covariate that the data does not
+  carry is an error at resolution, not fifty candidates later.
+- **The structural symbols need a `pk` line.** On an `ode(...)` or algebraic
+  model `@PK`, `@ABSORPTION` and friends are an error suggesting `LET`;
+  `@IIV` still works.
+- **Explicit names are validated** against `[individual_parameters]` and the
+  declared covariates, whichever slot they land in — so `LET(X, [WT]);
+  IIV(@X, EXP)` fails naming `WT`.
+- **Kinds are checked against effects.** `pow` on a covariate declared
+  categorical, or `cat` on a continuous one, is refused here rather than by
+  the candidate's parser.
+- **An empty symbol drops the feature with a note**, as in Pharmpy:
+  `COVARIATE?(@IIV, @CATEGORICAL, cat)` on a model without categoricals is a
+  space that happens to be empty, not a mistake. The note is returned so a
+  tool can print it once.
+- **Pharmpy's override rules apply to `COVARIATE`.** A `(parameter,
+  covariate)` pair from a statement that names its parameter explicitly wins
+  over the same pair produced by a statement whose parameter is a symbol
+  (`COVARIATE?(@IIV, @CONTINUOUS, [pow,lin]); COVARIATE(CL, WT, exp)` keeps
+  only the forced `exp` on CL-WT). As in Pharmpy, only the parameter operand
+  decides: `COVARIATE?(CL, @CONTINUOUS, [pow,lin]); COVARIATE(CL, WT, exp)`
+  keeps all three CL-WT forms. A forced term wins over the identical optional
+  one; a pair *forced* by two statements is an error.
+
+## Coverage
+
+What ferx can build a candidate for. Anything marked ✗ is a **hard error at
+load time naming the feature and the reason** — a search never narrows itself
+silently.
+
+| MFL feature | ferx | how / why not |
+|---|---|---|
+| `ABSORPTION(INST / FO)` | ✓ | `pk *_iv` / `*_oral` |
+| `ABSORPTION(ZO / SEQ-ZO-FO / WEIBULL)` | ✗ | no `pk` template; `zero_order()` / `weibull()` are `[odes]` input functions, hand-writable only |
+| `ELIMINATION(FO)` | ✓ | every `pk` template |
+| `ELIMINATION(ZO / MM / MIX-FO-MM)` | ✗ | reachable only via `[odes]`, which a search cannot generate |
+| `PERIPHERALS(0..2)` | ✓ | `one_cpt_*` / `two_cpt_*` / `three_cpt_*` |
+| `PERIPHERALS(3+)`, `PERIPHERALS(n, MET)` | ✗ | no four-compartment template; no metabolite template family |
+| `TRANSITS(N)`, `TRANSITS(n, NODEPOT)` | ✓ | `pk *_transit(n=…, mtt=…)` — `n` continuous, or fixed |
+| `TRANSITS(n, DEPOT)`, and `TRANSITS(n)` (Pharmpy's default is DEPOT) | ✗ | needs a separate depot with its own `ka`: an `[odes]` model with `transit(...) - KA*depot`; write `NODEPOT` |
+| `LAGTIME(ON / OFF)` | ✓ | `lagtime=` binding |
+| `COVARIATE(..., lin / piece_lin / exp / pow / cat)` | ✓ | `[covariate_model]` forms `linear` / `hockey` / `exponential` / `power` / `categorical` |
+| `COVARIATE(..., cat2 / custom)` | ✗ | no second categorical form; a search cannot invent an `expr(...)` |
+| `COVARIATE(..., +)` | ✗ | relations are multiplicative factors on a top-level product |
+| `ALLOMETRY(c, ref)` | ✓ | `power(center = ref, fix = 0.75)` |
+| `IIV(p, EXP / ADD / PROP)` | ✓ | `ferx-core::edit` add / drop η |
+| `IIV(p, LOG / RE_LOG)` | ✗ | the edit layer writes `exp`, `add` and `prop` forms only |
+| `IOV(...)`, `COVARIANCE(IOV, ...)` | ✗ | expressible as a model, not yet as a searchable edit (#1175 P4) |
+| `COVARIANCE(IIV, ...)` | ✓ | `block_omega` |
+| `DIRECTEFFECT`, `EFFECTCOMP`, `INDIRECTEFFECT` | ✗ | no PD template family |
+| `METABOLITE` | ✗ | structsearch is out of scope for v1 |
+
+Wildcards are checked against their full expansion: `ELIMINATION(*)` fails on
+`ZO`, `MM` and `MIX-FO-MM` just as the explicit list would. A wildcard is not
+a way to opt out.
+
+The error lists every gap at once and ends with a link back to this table:
+
+```
+[space] mfl: the search space asks for 2 features ferx cannot build a candidate for:
+  - ELIMINATION(MM): only first-order elimination has an analytic `pk` template; ...
+  - IOV(...): inter-occasion variability is expressible in a model (`[iov]`) but not yet
+    as a searchable edit — `ferx-core::edit` has no add/drop-IOV operation (#1175 P4)
+See the coverage table at https://ferx-nlme.github.io/ferx-core/tools/search.html#coverage
+```
+
+## Ranking, strictness and run settings
+
+`[rank] type` selects the criterion every candidate is scored on; all are
+lower-is-better:
+
+| type | criterion |
+|---|---|
+| `ofv` | the objective function value — only comparable between nested models, so the tool supplies a likelihood-ratio cutoff |
+| `aic` | `FitResult::aic` |
+| `bic` / `bic_mixed` | the mixed BIC — Pharmpy's default and the one its structural and IIV searches rank on |
+| `bic_iiv`, `bic_random`, `bic_fixed` | the other three `calculate_bic` conventions (#1177) |
+| `penalized` | pyDarwin-style penalized fitness: accepted by the parser so the format is stable, refused at load until #1175 P6 |
+
+`cutoff` is the improvement a candidate must show over its parent, on the
+criterion's own scale; how a tool applies it (a ΔOFV in an SCM step, a ΔBIC in
+a structural search) is the tool's, and omitting it leaves the tool's default.
+
+`[strictness]` maps one-to-one onto `ferx-core`'s `Strictness` predicate
+(#1177): `require_converged`, `require_covariance`, `max_condition_number`,
+`max_correlation`, `reject_on_boundary`, `reject_init_stall`. Every key is
+optional; an unstated key keeps the engine default. Under automation an init
+stall (#751) or a wrong inner-EBE mode (#864) is a *model-selection* error,
+not a slow fit, so every candidate gets `retries` starts first, then the gate,
+then ranking.
+
+`[run]` carries `threads` (the candidate pool; each fit's own pool is pinned
+underneath it so the machine is not oversubscribed), `retries` (perturbed
+starts per candidate on top of the fit from the exact initials — Pharmpy's
+meaning, so `n_starts = retries + 1`; default 2, i.e. three starts; `0` is a
+single fit), `cache_dir` (the journal a `resume = true` run picks up from,
+relative to the file) and `resume`.
+
+## From Rust
+
+```rust
+use ferx_tools::search::SearchConfig;
+
+let cfg = SearchConfig::load("warfarin.ferxsearch")?;   // parsed + coverage-checked
+let base = cfg.load_base()?;                              // model text, parsed model, data
+let space = cfg.resolve_space(&base)?;                    // symbols → names
+println!("{}", space.mfl.render());                       // canonical, ground MFL
+for note in &space.notes { eprintln!("note: {note}"); }
+let runner = cfg.runner();                                // threads + cache_dir applied
+let options = cfg.run_options();                          // criterion + strictness + retries
+```
+
+`space.covariate_effects` is the same information as the ground `COVARIATE`
+statements, one entry per (parameter, covariate, effect, operator, optional)
+tuple after the override rules — the list a covariate search iterates over.

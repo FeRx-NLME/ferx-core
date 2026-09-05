@@ -10,7 +10,10 @@
 //! including the ones that failed.
 //!
 //! That is [`Runner`] (#1178). It is written once here rather than four times
-//! in the tools above it.
+//! in the tools above it. What to search over comes from a `.ferxsearch` file
+//! ([`SearchConfig`], #1179): a TOML file whose space is a Pharmpy MFL string
+//! ([`mfl`]), checked against what ferx can build ([`coverage`]) and resolved
+//! against the base model's parameters and covariates ([`mod@resolve`]).
 //!
 //! ```no_run
 //! use ferx_core::edit::ModelText;
@@ -37,8 +40,12 @@
 //! ```
 
 mod candidate;
+pub mod config;
+pub mod coverage;
 pub mod journal;
+pub mod mfl;
 mod output;
+pub mod resolve;
 mod runner;
 #[cfg(test)]
 mod test_support;
@@ -46,6 +53,10 @@ mod test_support;
 pub use candidate::{
     Candidate, CandidateError, CandidateResult, Criterion, FeatureVector, RunOptions,
 };
+pub use config::{BaseModel, RankConfig, RankType, RunConfig, SearchConfig, StrictnessConfig};
+pub use coverage::{check_coverage, CoverageError, Gap};
 pub use journal::{CandidateRecord, SearchManifest};
+pub use mfl::{Feature, Mfl, Statement};
 pub use output::{partial_table_path, table_path, COLUMNS as TABLE_COLUMNS};
+pub use resolve::{resolve, CovariateEffectSpec, ModelContext, PkTemplate, Resolved};
 pub use runner::{RunReport, Runner};

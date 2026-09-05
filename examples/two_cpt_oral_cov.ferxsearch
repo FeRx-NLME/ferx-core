@@ -1,0 +1,30 @@
+# Search configuration for examples/two_cpt_oral_cov.ferx (#1179).
+#
+# The space is written in Pharmpy's Model Feature Language; `@IIV` and
+# `@CONTINUOUS` are resolved against the base model's [individual_parameters]
+# and [covariates] blocks. See docs/tools/search.qmd for the grammar and the
+# coverage table.
+
+base = "two_cpt_oral_cov.ferx"
+data = "../data/two_cpt_oral_cov.csv"
+
+[space]
+mfl = """
+PERIPHERALS(0..1); LAGTIME([OFF,ON])
+COVARIATE?(@IIV, @CONTINUOUS, [pow,lin])
+"""
+
+[rank]
+type   = "bic"
+cutoff = 3.84
+
+[strictness]
+require_converged    = true
+max_condition_number = 1000.0
+max_correlation      = 0.95
+reject_on_boundary   = true
+
+[run]
+threads   = 4
+retries   = 3
+cache_dir = ".ferx-search"
