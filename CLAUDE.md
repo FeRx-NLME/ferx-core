@@ -302,17 +302,13 @@ a test that has quietly stopped testing: at `3e-2` a regression delivering 99% o
 mass passes green, and that was the only end-to-end `fit()` → sdtab check against an external
 reference. If the realised error surprises you, chase it — that is information.
 
-**When the bug report is "two implementations disagree", the fix is one implementation.**
-#1223's first fix re-wrote the dense engine's pre-start fill inline in the #570 shared solve
-~3600 lines away, with its own `- 1e-12` and its own `break_times.first()` guard, under a
-comment calling it "the exact twin of" — restoring by prose exactly the configuration that
-produced the defect. Extracting `fill_prestart_states` and calling it from both sites closed
-the drift class in the compiler instead, and the payoff is a test property: **one mutation of
-the helper now reddens both engines**, where the dedicated-engine control previously needed a
-separate dense-side mutation to fail. Before writing a second copy, check whether the callers
-can share a function; if they genuinely cannot, record the specific asymmetry at the call site
-(here: the share's `chz_times` is sorted-unique by contract but `ode_dense_solve_states` is
-`pub` with no such guarantee, so the helper keeps a full scan rather than a `take_while`).
+**When the bug report is "two implementations disagree", the fix is one implementation.** This
+is the `*_g<T: PkNum>` rule in *Analytic Sensitivities* below, generalised past `sens/` to any
+two engines, and it buys a *test* property: after #1223 extracted `fill_prestart_states`, one
+mutation of the helper reddens both the dense and the shared solve, where the dedicated-engine
+control had needed its own. A comment calling a second copy "the exact twin of" restores by
+prose exactly the configuration that produced the defect. If two callers genuinely cannot
+share, record the asymmetry at the call site.
 
 **A green test is not evidence that it can fail.** The rule above is about a fixture that
 cannot expose the defect; these are three ways the *assertion* cannot observe it, all three
