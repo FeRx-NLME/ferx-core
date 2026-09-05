@@ -62,8 +62,8 @@ fn every_feature_category_round_trips() {
         "LAGTIME(*)",
         "COVARIATE(CL,WT,pow)",
         "COVARIATE([CL,V],[WT,AGE],[exp,pow])",
-        "COVARIATE(*,*,*)",
-        "COVARIATE(@PK,@CONTINUOUS,*,+)",
+        "COVARIATE?(*,*,*)",
+        "COVARIATE?(@PK,@CONTINUOUS,*,+)",
         "COVARIATE?(CL,SEX,cat)",
         "ALLOMETRY(WT)",
         "ALLOMETRY(WT,70)",
@@ -265,6 +265,23 @@ fn syntax_errors_are_located() {
     assert!(e.contains("in LET: expected `,`"), "{e}");
     let e = err("LET(X,[])");
     assert!(e.contains("an empty array `[]` names nothing"), "{e}");
+}
+
+#[test]
+fn mandatory_covariate_effects_must_be_explicit() {
+    // Pharmpy: "Mandatory effects need to be explicit (not '*')".
+    let e = err("COVARIATE(CL,WT,*)");
+    assert!(e.contains("needs explicit effects, not `*`"), "{e}");
+    parse("COVARIATE?(CL,WT,*)");
+}
+
+#[test]
+fn transits_n_takes_no_depot_option() {
+    // Pharmpy's grammar: `transits: ... (n | (_counts ["," _depot_option]))`.
+    let e = err("TRANSITS(N,DEPOT)");
+    assert!(e.contains("`TRANSITS(N)` takes no second argument"), "{e}");
+    parse("TRANSITS(N)");
+    parse("TRANSITS(1,DEPOT)");
 }
 
 #[test]

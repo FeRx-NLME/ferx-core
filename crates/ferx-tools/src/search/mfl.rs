@@ -1027,7 +1027,16 @@ fn build_feature(
                 "a count (or `N`) and an optional DEPOT/NODEPOT argument",
             )?;
             let counts = match &args[0] {
-                Arg::Word(w) if w.eq_ignore_ascii_case("N") => TransitCounts::N,
+                Arg::Word(w) if w.eq_ignore_ascii_case("N") => {
+                    // Pharmpy's grammar: `TRANSITS(N)` takes no depot option.
+                    if args.len() > 1 {
+                        return Err(format!(
+                            "MFL: in {ctx}: `TRANSITS(N)` takes no second argument — \
+                             estimating the count implies NODEPOT"
+                        ));
+                    }
+                    TransitCounts::N
+                }
                 other => TransitCounts::Counts(counts_of(other, &ctx)?),
             };
             let depot = match args.get(1) {
@@ -1057,6 +1066,15 @@ fn build_feature(
             let parameters = operand_of(&args[0], &ctx, "parameter")?;
             let covariates = operand_of(&args[1], &ctx, "covariate")?;
             let effects = modes_of(&args[2], &ctx)?;
+            // Pharmpy: "Mandatory effects need to be explicit (not '*')". A
+            // forced relation is in every candidate, so the search has no
+            // way to pick a form for it.
+            if !optional && effects == Modes::Wildcard {
+                return Err(format!(
+                    "MFL: in {ctx}: a mandatory (non-`?`) COVARIATE needs explicit effects, \
+                     not `*` — write `COVARIATE?` to search over the forms, or name one"
+                ));
+            }
             let op = match args.get(3) {
                 None => CovariateOp::Multiply,
                 Some(Arg::Plus) => CovariateOp::Add,
@@ -1220,3 +1238,7 @@ impl Mfl {
 #[cfg(test)]
 #[path = "mfl_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "mfl_pharmpy_anchor.rs"]
+mod pharmpy_anchor;

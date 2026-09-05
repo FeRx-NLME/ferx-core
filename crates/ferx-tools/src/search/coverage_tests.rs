@@ -66,7 +66,7 @@ fn wildcards_are_checked_against_their_full_expansion() {
     assert_eq!(gaps("PERIPHERALS(1,*)"), vec!["PERIPHERALS(n, MET)"]);
     assert_eq!(gaps("IIV(CL,*)"), vec!["IIV(..., LOG)", "IIV(..., RE_LOG)"]);
     assert_eq!(
-        gaps("COVARIATE(CL,WT,*)"),
+        gaps("COVARIATE?(CL,WT,*)"),
         Vec::<String>::new(),
         "the covariate wildcard is the four continuous forms, all supported"
     );

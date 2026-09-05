@@ -134,6 +134,20 @@ Three, all deliberate:
   covariate's declared kind, so on a categorical one the wildcard is the only
   form that can apply.
 
+### Anchored against Pharmpy
+
+The parser and the symbol resolver are checked against Pharmpy itself, not
+against a reading of its documentation: `tools/pharmpy-mfl-anchor/` feeds a
+corpus of MFL programs to `pharmpy.tools.mfl.parse.parse` (Pharmpy 2.0.0)
+and `expand()`s a set of symbol-bearing statements on a reference model, and
+a Tier-1 test replays the committed dump against ferx. Every corpus line
+either agrees or is a divergence named in the test with its reason — the
+deviations above, plus a handful where Pharmpy's interpreter crashes on
+input its grammar allows, and its silent `()` for an unknown `@FOO` where
+ferx errors. Two Pharmpy rules were adopted because of the anchor: a
+mandatory `COVARIATE` may not use `*` for its effects, and `TRANSITS(N)`
+takes no depot option. The README in that directory carries the full table.
+
 ### Rendering and round-trip
 
 A parsed space renders back to a canonical string — keywords upper-case,
