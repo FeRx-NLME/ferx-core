@@ -231,6 +231,70 @@ The `(sd)` form is convenient when you're setting initial values from expected C
 
 Block omega (`block_omega (...) = [...]`) is variance-only — `(sd)` is not accepted there because the lower-triangle list mixes variances and covariances and a single tag would be ambiguous.
 
+::: {.callout-important}
+#### A free `omega NAME ~ 0.0` is rejected — write `FIX`
+
+To declare that a parameter carries **no** between-subject variability, the
+zero has to be fixed:
+
+```
+omega ETA_CL ~ 0.0 FIX      # correct: no IIV on CL
+omega ETA_CL ~ 0.0          # rejected: E_OMEGA_INIT_AT_RAIL
+```
+
+A *free* zero asks the optimizer to estimate a variance from a start it cannot
+leave. The optimizer works on `ln(L_ii)` (the log Cholesky diagonal), bounded
+below at `-6`; a declared zero is regularised to a variance of `1e-8`, which
+packs to `ln(L) = -9.21` — below its own bound — so the start is clamped onto
+the rail. From there the coordinate either stays collapsed or runs away to the
+opposite rail (variance ≈ 1.6e5), and the **theta** estimates move with it: on a
+one-subject fixture the same model gave `TVCL` 48% low free versus 0.09% low
+`FIX`-ed. NM-TRAN refuses the equivalent stream outright (error 76, `INITIAL
+ESTIMATE OF VARIANCE CANNOT BE ZERO UNLESS FIXED`).
+
+The check is on the **variance the optimizer starts from**, not on the literal
+zero: any free variance ≤ 6.1e-6 (`ln(√v) ≤ -6`) lands on the same rail. Start
+such a parameter at ≥ 1e-5 if you do want to estimate it.
+
+In a `block_omega` the quantity tested is the Cholesky diagonal `L_ii`, which is
+what remains of that eta's variance once the off-diagonals are accounted for — so
+a *near-singular* block trips this even when every declared variance is
+ordinary, and the fix there is to lower the declared covariances (or `FIX` the
+block), not to raise a variance that is already fine.
+
+Two things are deliberately outside the check. **Sigma**: a free
+`sigma ~ 0.0 (sd)` is clamped onto its own `-8` rail and still reaches the
+optimum, so it is not rejected. **Runs where nothing searches**: with
+`maxiter = 0` (NONMEM `MAXEVAL=0`) a zero variance is accepted — which is what
+lets `ferx gam --no-fit`, and any evaluation at fixed parameters, keep working.
+`saem`, `imp`, `impmap` and `bayes` carry their own iteration counts and are
+checked regardless of `maxiter`.
+
+::: {.callout-warning}
+## `maxiter = 0` still clamps the start
+
+An evaluation-only run clamps the packed start to the bounds exactly like a
+fitting run does — what it does not do is *hold* it there through a search, and
+that stickiness is what the check is about. The consequence is worth knowing:
+with `maxiter = 0`, a free `omega ETA_CL ~ 0.0` is **evaluated at the rail
+variance `exp(-12) ≈ 6.14e-6`**, not at the `1e-8` it is stored as, and nothing
+says so. Write `omega ETA_CL ~ 0.0 FIX` if you want the objective evaluated at
+the variance you declared — a fixed coordinate is pinned at its own packed
+start, so the clamp cannot move it.
+
+This is not specific to variances: a `theta TVCL(0.05, 0.1, 10.0)` starts at
+`0.1`, silently, on every run. A general diagnostic for a start outside its own
+bounds is tracked separately.
+:::
+
+`predict()` and `simulate()` never apply the check, so a simulation-only fixture
+with a free zero keeps working — but `ferx check` reports what `fit()` would
+refuse, so it will flag such a file. Add `maxiter = 0` to `[fit_options]` if the
+model is genuinely simulation-only. See
+[#1229](https://github.com/FeRx-NLME/ferx-core/issues/1229) and
+[`E_OMEGA_INIT_AT_RAIL`](../file-formats/check-report.qmd#codes-parameters-and-random-effects).
+:::
+
 ### No omega at all — fixed-effects-only (naive-pooled) fits
 
 The `omega` block is **optional**. A model may declare no random effects, giving a
@@ -404,6 +468,11 @@ kappa KAPPA_CL ~ 0.05
 kappa KAPPA_V  ~ 0.03
 kappa KAPPA_CL ~ 0.02 FIX
 ```
+
+A free `kappa NAME ~ 0.0` is rejected for the same reason a free `omega NAME ~ 0.0`
+is — Ω_IOV goes through the same builder and the same `-6` lower rail — so a kappa
+that should carry no variability needs `FIX` too. See
+[A free `omega NAME ~ 0.0` is rejected](#diagonal-omega) above.
 
 ### Block kappa — Option B (correlated IOV)
 

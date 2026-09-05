@@ -673,7 +673,7 @@ fn depot_readout_with_a_non_default_dose_compartment_is_rejected() {
   theta TVCL(5.0, 0.1, 50.0)
   theta TVV(50.0, 3.0, 300.0)
   theta TVKA(1.0, 0.05, 20.0)
-  omega ETA_CL ~ 0.0
+  omega ETA_CL ~ 0.0 FIX
   sigma PROP ~ 0.02 (sd)
 
 [individual_parameters]

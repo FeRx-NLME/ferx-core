@@ -32,7 +32,7 @@ const PARALLEL_MODEL: &str = r#"
   theta TVKA1(1.5, 0.05,  24.0)
   theta TVKA2(0.3, 0.01,  24.0)
 
-  omega ETA_CL ~ 0.0
+  omega ETA_CL ~ 0.0 FIX
 
   sigma PROP_ERR ~ 0.01 (sd)
 
@@ -70,7 +70,7 @@ const MIXED_MODEL: &str = r#"
   theta TVKA(1.0,  0.05,  24.0)
   theta TVDUR(3.0, 0.05,  24.0)
 
-  omega ETA_CL ~ 0.0
+  omega ETA_CL ~ 0.0 FIX
 
   sigma PROP_ERR ~ 0.01 (sd)
 

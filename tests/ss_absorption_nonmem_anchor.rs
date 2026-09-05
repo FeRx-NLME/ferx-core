@@ -196,7 +196,7 @@ const SS_MM_NO_STEADY_STATE_MODEL: &str = r#"
   theta TVKM(20.0, 1.0, 5000.0)
   theta TVKA(2.0, 0.05, 20.0)
 
-  omega ETA_X ~ 0.0
+  omega ETA_X ~ 0.0 FIX
 
   sigma PROP_ERR ~ 0.01 (sd)
 
