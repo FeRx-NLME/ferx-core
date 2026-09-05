@@ -16,7 +16,7 @@ fn the_epic_table_supported_rows_pass() {
         "PERIPHERALS(0..2)",
         "PERIPHERALS(1,DRUG)",
         "TRANSITS(N)",
-        "TRANSITS(0..3)",
+        "TRANSITS(0..3,NODEPOT)",
         "TRANSITS(1,NODEPOT)",
         "LAGTIME(*)",
         "COVARIATE?(@IIV,@CONTINUOUS,*)",
@@ -93,6 +93,11 @@ fn the_remaining_gap_rows() {
         vec!["PERIPHERALS(3)", "PERIPHERALS(4)"]
     );
     assert_eq!(gaps("TRANSITS(2,DEPOT)"), vec!["TRANSITS(n, DEPOT)"]);
+    // Omitting the option is Pharmpy's DEPOT, not a way past the gap; `N`
+    // has no option and is NODEPOT by Pharmpy's own grammar.
+    assert_eq!(gaps("TRANSITS(0..3)"), vec!["TRANSITS(n, DEPOT)"]);
+    assert_eq!(gaps("TRANSITS(2)"), vec!["TRANSITS(n, DEPOT)"]);
+    assert_eq!(gaps("TRANSITS(N)"), Vec::<String>::new());
     assert_eq!(gaps("METABOLITE(PSC)"), vec!["METABOLITE(...)"]);
     assert_eq!(gaps("COVARIATE(CL,SEX,cat2)"), vec!["COVARIATE(..., cat2)"]);
     assert_eq!(

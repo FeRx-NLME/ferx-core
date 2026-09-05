@@ -31,6 +31,11 @@ const PARSE_DIVERGENCES: &[(&str, &str)] = &[
         "Pharmpy yields an empty count set silently; ferx refuses a backwards range",
     ),
     (
+        "PERIPHERALS(0..100)",
+        "Pharmpy materialises any range; ferx bounds a count at MAX_COUNT (64) so a typo cannot \
+         allocate a 16 GiB vector at config-load time",
+    ),
+    (
         "ALLOMETRY(WT)",
         "Pharmpy raises IndexError (a bug: its grammar documents the reference as optional)",
     ),

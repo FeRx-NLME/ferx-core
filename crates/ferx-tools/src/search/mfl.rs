@@ -291,8 +291,16 @@ impl Operand {
     }
 }
 
+/// The largest compartment count a `PERIPHERALS` / `TRANSITS` argument may
+/// name. A count is a number of compartments, so anything above this is a
+/// typo, not a space — and a range is materialised by [`Counts::expand`], so
+/// the bound is what keeps `PERIPHERALS(0..4294967295)` from allocating a
+/// 16 GiB vector at config-load time. Pharmpy has no such bound.
+pub const MAX_COUNT: u32 = 64;
+
 /// A count argument (`PERIPHERALS`, `TRANSITS`): one number, a range, or an
 /// array of numbers. The source shape is kept so rendering is faithful.
+/// Every count is at most [`MAX_COUNT`], checked at parse time.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Counts {
     Single(u32),
@@ -836,8 +844,16 @@ impl Parser {
 }
 
 fn count_of(text: &str, context: &str) -> Result<u32, String> {
-    text.parse::<u32>()
-        .map_err(|_| format!("MFL: in {context}: `{text}` is not a non-negative integer count"))
+    let n = text
+        .parse::<u32>()
+        .map_err(|_| format!("MFL: in {context}: `{text}` is not a non-negative integer count"))?;
+    if n > MAX_COUNT {
+        return Err(format!(
+            "MFL: in {context}: `{text}` is above the largest compartment count accepted \
+             ({MAX_COUNT})"
+        ));
+    }
+    Ok(n)
 }
 
 /// A word, or an array of words, as a list of names (case preserved).

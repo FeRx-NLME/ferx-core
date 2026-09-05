@@ -247,6 +247,24 @@ fn range_and_count_errors() {
 }
 
 #[test]
+fn counts_are_bounded_at_parse_time() {
+    // A range is materialised by `Counts::expand`, so an unbounded one is an
+    // allocation of the user's choosing at config-load time. The bound is on
+    // every count, so it covers a range's ends, a single and an array alike.
+    let e = err("PERIPHERALS(0..4294967295)");
+    assert!(
+        e.contains("`4294967295` is above the largest compartment count accepted (64)"),
+        "{e}"
+    );
+    let e = err("TRANSITS(65)");
+    assert!(e.contains("`65` is above"), "{e}");
+    let e = err("PERIPHERALS([1,65])");
+    assert!(e.contains("`65` is above"), "{e}");
+    parse("PERIPHERALS(0..64)");
+    assert_eq!(MAX_COUNT, 64);
+}
+
+#[test]
 fn syntax_errors_are_located() {
     let e = err("ABSORPTION(FO");
     assert!(e.contains("expected `)`"), "{e}");

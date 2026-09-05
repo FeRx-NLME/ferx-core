@@ -61,11 +61,15 @@ cache_dir = ".ferx-search"
 | `[space] mfl` | the search space, in MFL (below). Parsed and coverage-checked when the file is loaded |
 | `[rank]` | what candidates are ranked on, and the improvement one must show over its parent |
 | `[strictness]` | the gate a fit must pass before its criterion is trusted — every key is optional and overlays the engine default |
-| `[run]` | threads, retries (`n_starts` per candidate), journal directory, resume |
+| `[run]` | threads, retries (perturbed starts per candidate on top of the exact one, as in Pharmpy), journal directory, resume |
 
-Any other section — `[covsearch]`, `[modelsearch]`, … — is kept for the tool
-that owns it; this loader does not know its schema. A typo *inside* a known
-section (`thread = 8`) is an error, and so is a stray top-level scalar.
+A tool section — `[covsearch]`, `[modelsearch]`, `[iivsearch]`, `[iovsearch]`,
+`[ruvsearch]`, `[structsearch]` or `[allometry]` — is kept for the tool that
+owns it; this loader does not know its schema. Any other table is an error
+naming the sections the file takes, so a misspelt `[strictnes]` cannot be
+filed away as a tool section and leave the gate at its defaults. A typo
+*inside* a known section (`thread = 8`) is an error, and so is a stray
+top-level scalar.
 
 Loading a file does three things beyond reading it. It parses the MFL, so a
 syntax error names the statement. It checks every feature against the
@@ -84,9 +88,9 @@ comma-separated argument list whose entries are:
 |---|---|---|
 | name | `FO` | one mode |
 | array | `[FO, ZO]` | several |
-| number | `1` | a count |
-| range | `0..2` | counts, both ends included |
-| wildcard | `*` | every mode the grammar knows. In a parameter slot it is feature-specific: `@PK` for `COVARIATE` and `IIV`, `@IIV` for `IOV` and `COVARIANCE`; for covariate effects, the four continuous forms |
+| number | `1` | a count, at most 64 |
+| range | `0..2` | counts, both ends included; a range is materialised at load, so its ends are bounded like any count |
+| wildcard | `*` | every mode the grammar knows. In a parameter slot it is feature-specific — `@PK` for `COVARIATE` and `IIV`, `@IIV` for `IOV` and `COVARIANCE` — and resolves exactly as that symbol does, a `LET` of the same name included; for covariate effects, the four continuous forms |
 | symbol | `@IIV` | a set resolved against the base model — see [Symbols](#symbols) |
 
 A `?` after the keyword — `COVARIATE?`, `IIV?`, `IOV?`, `COVARIANCE?` — marks
@@ -125,10 +129,12 @@ Three, all deliberate:
   ferx's `[individual_parameters]` and CSV headers are case-sensitive, and
   `Vc` upper-cased to `VC` would resolve to nothing. Keywords, modes and
   effects are still case-insensitive.
-- **`TRANSITS(n)` without a depot option means NODEPOT.** ferx's analytic
-  `*_transit` templates feed central straight from the last transit
-  compartment; an explicit `DEPOT` is a coverage error (see below), not a
-  silent reinterpretation.
+- **`TRANSITS(n)` without a depot option means DEPOT, as in Pharmpy.** ferx's
+  analytic `*_transit` templates feed central straight from the last transit
+  compartment, which is Pharmpy's NODEPOT, so a Pharmpy-ported `TRANSITS(1..3)`
+  is a coverage error (see below) naming the fix — write `NODEPOT` — rather
+  than a silent reinterpretation. `TRANSITS(N)` takes no option and is
+  NODEPOT by Pharmpy's own grammar.
 - **`COVARIATE(..., *)` on a categorical covariate is `cat`.** Pharmpy expands
   the effect wildcard to the four continuous forms regardless; ferx knows the
   covariate's declared kind, so on a categorical one the wildcard is the only
@@ -219,8 +225,8 @@ silently.
 | `ELIMINATION(ZO / MM / MIX-FO-MM)` | ✗ | reachable only via `[odes]`, which a search cannot generate |
 | `PERIPHERALS(0..2)` | ✓ | `one_cpt_*` / `two_cpt_*` / `three_cpt_*` |
 | `PERIPHERALS(3+)`, `PERIPHERALS(n, MET)` | ✗ | no four-compartment template; no metabolite template family |
-| `TRANSITS(n)`, `TRANSITS(N)`, `TRANSITS(n, NODEPOT)` | ✓ | `pk *_transit(n=…, mtt=…)` — `n` continuous, or fixed |
-| `TRANSITS(n, DEPOT)` | ✗ | needs a separate depot with its own `ka`: an `[odes]` model with `transit(...) - KA*depot` |
+| `TRANSITS(N)`, `TRANSITS(n, NODEPOT)` | ✓ | `pk *_transit(n=…, mtt=…)` — `n` continuous, or fixed |
+| `TRANSITS(n, DEPOT)`, and `TRANSITS(n)` (Pharmpy's default is DEPOT) | ✗ | needs a separate depot with its own `ka`: an `[odes]` model with `transit(...) - KA*depot`; write `NODEPOT` |
 | `LAGTIME(ON / OFF)` | ✓ | `lagtime=` binding |
 | `COVARIATE(..., lin / piece_lin / exp / pow / cat)` | ✓ | `[covariate_model]` forms `linear` / `hockey` / `exponential` / `power` / `categorical` |
 | `COVARIATE(..., cat2 / custom)` | ✗ | no second categorical form; a search cannot invent an `expr(...)` |
@@ -273,9 +279,11 @@ not a slow fit, so every candidate gets `retries` starts first, then the gate,
 then ranking.
 
 `[run]` carries `threads` (the candidate pool; each fit's own pool is pinned
-underneath it so the machine is not oversubscribed), `retries` (`n_starts` per
-candidate, default 3), `cache_dir` (the journal a `resume = true` run picks up
-from, relative to the file) and `resume`.
+underneath it so the machine is not oversubscribed), `retries` (perturbed
+starts per candidate on top of the fit from the exact initials — Pharmpy's
+meaning, so `n_starts = retries + 1`; default 2, i.e. three starts; `0` is a
+single fit), `cache_dir` (the journal a `resume = true` run picks up from,
+relative to the file) and `resume`.
 
 ## From Rust
 

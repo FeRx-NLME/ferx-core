@@ -39,9 +39,11 @@
 //! `data` relative to the file's own directory, so the file can be moved
 //! with its model.
 //!
-//! Tool-specific sections (`[covsearch]`, `[modelsearch]`, …) are kept as raw
-//! tables in [`SearchConfig::tools`] for the tool that owns them to read;
-//! this module does not know their schemas.
+//! Tool-specific sections — one of [`TOOL_SECTIONS`], e.g. `[covsearch]` or
+//! `[modelsearch]` — are kept as raw tables in [`SearchConfig::tools`] for
+//! the tool that owns them to read; this module does not know their schemas.
+//! Any other table is an error, so a misspelt `[strictnes]` cannot land in
+//! `tools` and silently leave the gate at its defaults.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -58,6 +60,24 @@ use super::runner::Runner;
 
 /// The file extension a search configuration is expected to carry.
 pub const EXTENSION: &str = "ferxsearch";
+
+/// The tool sections a `.ferxsearch` file may carry, by Pharmpy's tool
+/// names (#1175). The loader keeps them verbatim in [`SearchConfig::tools`];
+/// a table with any other name is an error, since the alternative — a
+/// misspelt core section quietly filed under `tools` — is a gate that never
+/// runs.
+pub const TOOL_SECTIONS: &[&str] = &[
+    "covsearch",
+    "modelsearch",
+    "iivsearch",
+    "iovsearch",
+    "ruvsearch",
+    "structsearch",
+    "allometry",
+];
+
+/// The core sections, for error messages.
+const CORE_SECTIONS: &[&str] = &["space", "rank", "strictness", "run"];
 
 /// A loaded `.ferxsearch` file.
 #[derive(Debug, Clone)]
@@ -186,8 +206,11 @@ pub struct RunConfig {
     /// Worker threads for the candidate pool; `None` lets the runner choose.
     #[serde(default)]
     pub threads: Option<usize>,
-    /// `n_starts` per candidate (Pharmpy's *retries*). Defaults to the
-    /// runner's 3.
+    /// Perturbed restarts per candidate on top of the fit from the exact
+    /// initials — Pharmpy's *retries*, so a value copied from a Pharmpy call
+    /// means the same thing. The engine's `n_starts` is `retries + 1`, start
+    /// 0 being the exact initials; `retries = 0` is a single start. Defaults
+    /// to 2, which is the runner's default of 3 starts.
     #[serde(default = "default_retries")]
     pub retries: usize,
     /// Journal / cache directory, relative to the config file.
@@ -199,7 +222,7 @@ pub struct RunConfig {
 }
 
 fn default_retries() -> usize {
-    RunOptions::default().n_starts
+    RunOptions::default().n_starts - 1
 }
 
 impl Default for RunConfig {
@@ -263,8 +286,22 @@ impl SearchConfig {
         let mut tools = BTreeMap::new();
         for (key, value) in raw.rest {
             match value {
-                toml::Value::Table(table) => {
+                toml::Value::Table(table) if TOOL_SECTIONS.contains(&key.as_str()) => {
                     tools.insert(key, table);
+                }
+                toml::Value::Table(_) => {
+                    let sections = |names: &[&str]| {
+                        names
+                            .iter()
+                            .map(|s| format!("[{s}]"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    return Err(format!(
+                        "unknown section `[{key}]`; the file takes {} and the tool sections {}",
+                        sections(CORE_SECTIONS),
+                        sections(TOOL_SECTIONS)
+                    ));
                 }
                 _ => {
                     return Err(format!(
@@ -303,7 +340,8 @@ impl SearchConfig {
                 .criterion()
                 .expect("rank type validated at load"),
             strictness: self.strictness.strictness(),
-            n_starts: self.run.retries.max(1),
+            // Pharmpy's retries are on top of the exact-initials fit.
+            n_starts: self.run.retries + 1,
             resume: self.run.resume,
             fit_options: None,
         }

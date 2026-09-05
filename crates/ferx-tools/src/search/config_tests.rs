@@ -71,7 +71,9 @@ fn the_issue_example_loads_and_maps_onto_the_runner() {
 
     let opts = cfg.run_options();
     assert_eq!(opts.criterion, Criterion::Bic(BicType::Mixed));
-    assert_eq!(opts.n_starts, 3);
+    // Pharmpy's `retries = 3` is three perturbed starts on top of the exact
+    // one, not three starts in total.
+    assert_eq!(opts.n_starts, 4);
     assert!(!opts.resume);
     assert!(opts.fit_options.is_none());
     assert!(opts.strictness.require_converged);
@@ -201,6 +203,46 @@ p_forward = 0.01
     );
     let e = load_err("base = \"m.ferx\"\nbsae = \"x\"\n[space]\nmfl = \"ABSORPTION(FO)\"\n");
     assert!(e.contains("unknown top-level key `bsae`"), "{e}");
+}
+
+#[test]
+fn a_misspelt_core_section_is_an_error_not_a_tool_section() {
+    // `[strictnes]` filed under `tools` would leave the gate at its defaults
+    // with nothing to say so.
+    let e = load_err(
+        "base = \"m.ferx\"\n[space]\nmfl = \"ABSORPTION(FO)\"\n[strictnes]\n\
+         require_converged = true\n",
+    );
+    assert!(e.contains("unknown section `[strictnes]`"), "{e}");
+    assert!(e.contains("[strictness]"), "{e}");
+    assert!(e.contains("[covsearch]"), "{e}");
+    for tool in TOOL_SECTIONS {
+        load(&format!(
+            "base = \"m.ferx\"\n[space]\nmfl = \"ABSORPTION(FO)\"\n[{tool}]\nx = 1\n"
+        ));
+    }
+}
+
+#[test]
+fn retries_are_pharmpys_perturbed_starts_on_top_of_the_exact_one() {
+    let starts = |retries: usize| {
+        load(&format!(
+            "base = \"m.ferx\"\n[space]\nmfl = \"ABSORPTION(FO)\"\n[run]\nretries = {retries}\n"
+        ))
+        .run_options()
+        .n_starts
+    };
+    assert_eq!(starts(0), 1, "no retries is a single fit from the initials");
+    assert_eq!(starts(1), 2);
+    assert_eq!(starts(3), 4);
+    // The default stays the runner's default: three starts.
+    assert_eq!(RunConfig::default().retries, 2);
+    assert_eq!(
+        load("base = \"m.ferx\"\n[space]\nmfl = \"ABSORPTION(FO)\"\n")
+            .run_options()
+            .n_starts,
+        RunOptions::default().n_starts
+    );
 }
 
 #[test]

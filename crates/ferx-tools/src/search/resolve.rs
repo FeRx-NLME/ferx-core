@@ -596,7 +596,8 @@ fn check_covariate_name(name: &str, ctx: &ModelContext, context: &str) -> Result
 
 /// `wildcard` names the built-in symbol `*` stands for in this slot — the
 /// wildcard is feature-specific in MFL (`@PK` for a covariate's parameters,
-/// `@IIV` for a covariance's), so the caller says which.
+/// `@IIV` for a covariance's), so the caller says which. It resolves exactly
+/// as `@{wildcard}` would, `LET` overrides included.
 fn resolve_parameters(
     operand: &Operand,
     ctx: &ModelContext,
@@ -607,7 +608,9 @@ fn resolve_parameters(
     let names = match operand {
         Operand::Names(names) => names.clone(),
         Operand::Symbol(symbol) => lookup(symbol, ctx, lets)?,
-        Operand::Wildcard => ctx.builtin(wildcard)?,
+        // `*` *is* the slot's built-in symbol, so a `LET` of that name
+        // governs it too: `LET(PK,[CL]); IIV(*,EXP)` is `IIV(CL,EXP)`.
+        Operand::Wildcard => lookup(wildcard, ctx, lets)?,
     };
     let mut out: Vec<String> = Vec::new();
     for name in names {

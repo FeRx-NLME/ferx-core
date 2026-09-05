@@ -36,6 +36,7 @@ The divergences, and why each is kept:
 | corpus line | Pharmpy 2.0.0 | ferx | why |
 |---|---|---|---|
 | `PERIPHERALS(2..0)` | empty count set, silently | error "runs backwards" | a search over no compartments is a typo, not a space |
+| `PERIPHERALS(0..100)` | 101 counts | error "above the largest compartment count accepted (64)" | a range is materialised at load; an unbounded one is an allocation of the user's choosing |
 | `ALLOMETRY(WT)` | `IndexError` | reference optional | the grammar documents `ALLOMETRY(c[, ref])`; the crash is a Pharmpy bug |
 | `COVARIATE?(*, …)`, `COVARIATE?(…, *, …)` | `TypeError` | accepted | the grammar has `parameter_wildcard` / `covariate_wildcard`; the interpreter crashes on them — a Pharmpy bug |
 | `# comment`, empty program, `;;` | rejected | accepted | conveniences for a `"""…"""` TOML string |

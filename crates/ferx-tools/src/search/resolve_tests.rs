@@ -256,9 +256,8 @@ fn symbol_names_are_case_insensitive_and_unknown_ones_list_the_builtins() {
 
 // --- structural symbols without a pk line -----------------------------------
 
-#[test]
-fn structural_symbols_need_a_pk_line() {
-    let ode = r#"
+/// A one-compartment `[odes]` base with no template line.
+const ODE_MODEL: &str = r#"
 [parameters]
   theta TVCL(4.0, 0.1, 100.0)
   theta TVV(40.0, 1.0, 500.0)
@@ -281,7 +280,14 @@ fn structural_symbols_need_a_pk_line() {
 [error_model]
   DV ~ additive(ADD_ERR)
 "#;
-    let c = context_for(ode, &[]);
+
+fn ode_ctx() -> ModelContext {
+    context_for(ODE_MODEL, &[])
+}
+
+#[test]
+fn structural_symbols_need_a_pk_line() {
+    let c = ode_ctx();
     assert!(c.template.is_none());
     assert_eq!(c.builtin("IIV").unwrap(), names(&["CL"]));
     for sym in [
@@ -659,4 +665,24 @@ fn explicit_parameter_with_symbolic_covariate_is_not_overridden() {
         &ctx(),
     );
     assert_eq!(r.covariate_effects.len(), 2 + 1);
+}
+
+/// `*` in a parameter slot is the slot's built-in symbol, so a `LET` of that
+/// name governs it exactly as it governs the `@` spelling.
+#[test]
+fn parameter_wildcard_honours_a_let_of_its_symbol() {
+    let r = resolved("LET(PK,[CL]);IIV(*,EXP)", &ctx());
+    assert_eq!(r.mfl.render(), "IIV(CL,EXP)");
+    let twin = resolved("LET(PK,[CL]);IIV(@PK,EXP)", &ctx());
+    assert_eq!(r.mfl, twin.mfl);
+    // COVARIANCE's wildcard is `@IIV`, so it is `LET(IIV, …)` that narrows it.
+    let r = resolved("LET(IIV,[CL,V1]);COVARIANCE(IIV,*)", &ctx());
+    assert_eq!(r.mfl.render(), "COVARIANCE(IIV,[CL,V1])");
+    // On an `[odes]` base the error told the user to write `LET(PK, …)`;
+    // that advice has to work for the `*` spelling too.
+    let ode = context_for(ODE_MODEL, &["WT"]);
+    let e = resolve_err("COVARIATE?(*,WT,pow)", &ode);
+    assert!(e.contains("LET(PK, [...])"), "{e}");
+    let r = resolved("LET(PK,[CL,V]);COVARIATE?(*,WT,pow)", &ode);
+    assert_eq!(r.mfl.render(), "COVARIATE?(CL,WT,pow);COVARIATE?(V,WT,pow)");
 }

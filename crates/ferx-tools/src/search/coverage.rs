@@ -13,7 +13,7 @@
 
 use super::mfl::{
     AbsorptionMode, CovariateEffect, CovariateOp, DepotMode, EliminationMode, Feature, Mfl, Mode,
-    Modes, PeripheralKind, VariabilityEffect, VariabilityLevel,
+    Modes, PeripheralKind, TransitCounts, VariabilityEffect, VariabilityLevel,
 };
 
 /// Where the coverage table lives, appended to every gap error.
@@ -160,18 +160,29 @@ fn check_feature(feature: &Feature, gaps: &mut Vec<Gap>) {
                 }
             }
         }
-        Feature::Transits { depot, .. } => {
-            if let Some(depot) = depot {
-                if depot.expand().contains(&DepotMode::Depot) {
-                    gap(
-                        gaps,
-                        "TRANSITS(n, DEPOT)".into(),
-                        "the analytic `*_transit` templates feed central straight from the last \
-                         transit compartment (Pharmpy's NODEPOT); a separate depot with its own \
-                         `ka` needs an `[odes]` model with `transit(...) - KA*depot`. Write \
-                         NODEPOT, or omit the option",
-                    );
-                }
+        Feature::Transits { counts, depot } => {
+            // Pharmpy's defaults when the option is omitted: DEPOT for a
+            // count, NODEPOT for `N` (its grammar gives `TRANSITS(N)` no
+            // option at all). A Pharmpy-ported `TRANSITS(1..3)` therefore
+            // asks for a depot, and must hit the gap rather than be quietly
+            // read as the NODEPOT family ferx can build.
+            let default = match counts {
+                TransitCounts::N => DepotMode::NoDepot,
+                TransitCounts::Counts(_) => DepotMode::Depot,
+            };
+            let modes = depot
+                .as_ref()
+                .map(Modes::expand)
+                .unwrap_or_else(|| vec![default]);
+            if modes.contains(&DepotMode::Depot) {
+                gap(
+                    gaps,
+                    "TRANSITS(n, DEPOT)".into(),
+                    "the analytic `*_transit` templates feed central straight from the last \
+                     transit compartment (Pharmpy's NODEPOT); a separate depot with its own \
+                     `ka` needs an `[odes]` model with `transit(...) - KA*depot`. Write \
+                     NODEPOT explicitly — `TRANSITS(n)` alone means DEPOT, as in Pharmpy",
+                );
             }
         }
         Feature::Lagtime(_) => {}
