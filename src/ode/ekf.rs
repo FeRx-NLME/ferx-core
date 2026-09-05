@@ -225,6 +225,8 @@ pub fn solve_ekf(
     // one mask (the arrival) covers it.
     let mut applied = vec![false; doses.len()];
 
+    // Records read *at* the current break (#1226) — hoisted, as on the ODE engines.
+    let mut boundary_obs: Vec<usize> = Vec::new();
     for k in 0..(break_times.len() - 1) {
         let t_start = break_times[k];
         let t_end = break_times[k + 1];
@@ -245,8 +247,17 @@ pub fn solve_ekf(
             }
         }
 
-        // Record obs exactly at t_start (after dose application)
-        if let Some(&obs_idx) = obs_map.get(&t_start.to_bits()) {
+        // Record obs read *at* t_start (after dose application) — the whole
+        // `EVENT_MATCH_TOL` band, through the same helper as the ODE engines (#1226).
+        crate::ode::predictions::collect_records_at_break(obs_times, t_start, &mut boundary_obs);
+        for &obs_idx in &boundary_obs {
+            // One update per *distinct* record time, at the index `obs_map` keeps for it
+            // — exactly the collapsing the old `obs_map.get(&t_start.to_bits())` did for
+            // duplicate times. The band widens *which* times match here, not how many
+            // updates a repeated time gets.
+            if obs_map.get(&obs_times[obs_idx].to_bits()) != Some(&obs_idx) {
+                continue;
+            }
             let r = r_obs_vec.get(obs_idx).copied().unwrap_or(1.0);
             let (p_new, p_obs) = kalman_update(&p_mat, obs_cmt_idx, r, n);
             p_mat = p_new;
@@ -259,7 +270,7 @@ pub fn solve_ekf(
 
         let mut saveat: Vec<f64> = obs_times
             .iter()
-            .filter(|&&t| t > t_start + 1e-12 && t <= t_end + 1e-12)
+            .filter(|&&t| crate::ode::predictions::reads_in_segment(t, t_start, t_end))
             .cloned()
             .collect();
         if saveat.is_empty() || (saveat.last().unwrap() - t_end).abs() > 1e-12 {
@@ -459,6 +470,130 @@ mod tests {
         for (ekf, &ode) in ekf_pts.iter().zip(ode_preds.iter()) {
             assert_relative_eq!(ekf.ipred, ode, epsilon = 1e-4, max_relative = 1e-4);
             assert_relative_eq!(ekf.p_obs, 0.0, epsilon = 1e-10);
+        }
+    }
+
+    /// #1226 on the EKF walk: an observation **one ULP after** a dose record is read
+    /// post-dose, matching `ode_predictions`.
+    ///
+    /// This loop rescans every dose at every break exactly as the ODE prediction engines
+    /// do, and it carried the same `t > t_start + 1e-12 && t <= t_end + 1e-12` segment
+    /// filter plus an exact-bit `obs_map` boundary lookup — so the sample was claimed by
+    /// the *pre*-dose segment and the post-dose read missed it. The EKF path applies no
+    /// lagtime, so a data time one ULP after a dose record is the reachable geometry here
+    /// rather than a lagged arrival.
+    ///
+    /// Oracle: `ode_predictions` on the identical fixture, which is itself anchored on
+    /// NONMEM in `ode/predictions_tests.rs::lag_arrival_read_1226` — plus the closed form
+    /// below, so the two engines cannot agree on a wrong answer.
+    ///
+    /// Mutation: revert either the boundary band read or the segment filter in `solve_ekf`
+    /// and `ipred` at the ULP sample drops by a whole 100 mg dose.
+    #[test]
+    fn ekf_reads_an_obs_one_ulp_after_a_dose_post_dose() {
+        use crate::ode::predictions::{ode_predictions, OdeSpec};
+        use crate::types::Subject;
+        use std::collections::HashMap;
+
+        // Two doses so the second lands with the compartment non-empty: the pre/post-dose
+        // pair is 45.38 vs 145.38 rather than 0 vs 100.
+        let dose_time = 8.2f64;
+        let obs_1ulp = f64::from_bits(dose_time.to_bits() + 1);
+        let sep = obs_1ulp - dose_time;
+        assert!(
+            sep > 1e-15 && sep < crate::ode::predictions::EVENT_MATCH_TOL,
+            "the sample must straddle the 1e-15 dedup and EVENT_MATCH_TOL (sep {sep:.3e})"
+        );
+        let doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(dose_time, 100.0, 1, 0.0, false, 0.0),
+        ];
+        let obs_times = vec![obs_1ulp, 9.0];
+        let pk = make_pk(1.0, 10.0);
+        let opts = OdeSolverOptions {
+            abstol: 1e-12,
+            reltol: 1e-10,
+            ..OdeSolverOptions::default()
+        };
+        let ekf_pts = solve_ekf(
+            &one_cpt_rhs,
+            1,
+            0,
+            &[0.0], // zero diffusion, so ipred must equal `ode_predictions`
+            &pk,
+            &Default::default(),
+            &[],
+            &doses,
+            &obs_times,
+            &vec![0.01; obs_times.len()],
+            opts,
+        );
+
+        // Closed form, independent of either engine: the first dose's residual plus the
+        // second, which has already arrived.
+        let ke = 0.1f64;
+        let pre = 100.0 * (-ke * obs_1ulp).exp();
+        let post = pre + 100.0 * (-ke * sep).exp();
+        assert!(
+            post - pre > 99.0,
+            "the pre/post-dose pair must be a whole dose apart ({pre:.4} / {post:.4})"
+        );
+        assert!(
+            ekf_pts[0].ipred.is_finite(),
+            "the EKF returned a non-finite ipred at the ULP sample"
+        );
+        assert!(
+            (ekf_pts[0].ipred - post).abs() < 1e-6,
+            "EKF reads {:.8} one ULP after the dose — expected the post-dose {post:.8} \
+             (pre-dose is {pre:.8})",
+            ekf_pts[0].ipred
+        );
+
+        let subj = Subject {
+            id: "1".into(),
+            doses: doses.clone(),
+            obs_times: obs_times.clone(),
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; obs_times.len()],
+            obs_cmts: vec![1; obs_times.len()],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
+            cens: vec![0; obs_times.len()],
+            occasions: Vec::new(),
+            obs_l2: Vec::new(),
+            dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        };
+        let ode_spec = OdeSpec {
+            chz_state_slots: Vec::new(),
+            rhs: Box::new(one_cpt_rhs),
+            n_states: 1,
+            state_names: vec!["central".into()],
+            readout: crate::ode::OdeReadout::ObsCmt(0),
+            diffusion_var: Vec::new(),
+            init_fn: None,
+            solver_opts: opts,
+            input_rate: Vec::new(),
+            rhs_program: None,
+            readout_program: None,
+            indiv_param_program: None,
+            dose_attr_map: Default::default(),
+        };
+        let ode_preds = ode_predictions(&ode_spec, &pk, &[], &[], &subj);
+        for (i, (ekf, &ode)) in ekf_pts.iter().zip(ode_preds.iter()).enumerate() {
+            assert!(
+                ekf.ipred.is_finite() && ode.is_finite(),
+                "non-finite at obs {i}: ekf {} / ode {ode}",
+                ekf.ipred
+            );
+            assert_relative_eq!(ekf.ipred, ode, epsilon = 1e-6, max_relative = 1e-6);
         }
     }
 

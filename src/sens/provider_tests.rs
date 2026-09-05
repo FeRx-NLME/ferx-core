@@ -11683,3 +11683,169 @@ fn nan_lagtime_sens_walk_is_non_finite_not_a_panic() {
         );
     }
 }
+
+/// #1226 on the sensitivity path: an observation **one ULP after** a dose record must be
+/// read post-dose by the static `Dual2` walk (`integrate_g`), exactly as production reads
+/// it after the recording-rule fix.
+///
+/// The walk's boundary `record_at` was already tolerance-based, but its previous segment's
+/// `saveat` filter carried the same `t <= t_end + 1e-12` upper bound as production, so the
+/// solver's pre-dose save point reached the observation first and `recorded[j]` locked it
+/// in. Nothing here needs a lag: the static walk applies doses at their record times, so
+/// two data times one ULP apart are enough to reach it.
+///
+/// **This test cannot be red until production is fixed** — it is a differential check
+/// between the provider and `compute_predictions_with_tv`, and before #1226 both read
+/// pre-dose and agreed on the wrong value. Measured in that order: green at `2faeebc5`,
+/// red with the production sites fixed and the provider's one-line bound left alone
+/// (`obs.f` 68.42 vs production 168.42), green with both. Deleting the provider's
+/// `t <= t_end` bound reproduces the red half.
+///
+/// The dose at `t = 0` is load-bearing for the same reason as in
+/// `ode::predictions::tests::lag_arrival_read_1226`: without it the compartment is empty
+/// when the second dose lands and pre/post-dose reads are indistinguishable.
+/// The **pre-existing** half of the same defect, found while fixing #1226: an observation
+/// landing *exactly* on an interior dose time already disagreed between the static `Dual2`
+/// walk and production — provider 155.85 (pre-dose) against production 1155.85 (post-dose),
+/// a whole 1000 mg dose, measured at `2faeebc5`.
+///
+/// Cause and cure are the same as the one-ULP case. `record_at` is first-write-wins, and
+/// the previous segment's final save point *is* this break, so its pre-event state got
+/// there first and `recorded[j]` locked it in; production has no such guard and its next
+/// break's boundary read overwrites. The `t <= t_end` bound alone cannot close this one —
+/// an observation equal to `t_end` is a legitimate member of that segment's `saveat` — so
+/// this test is what pins the overwrite in `record_at_break`, not the bound.
+///
+/// Mutation: drop the `record_at_break` call and this reads 155.85 again.
+#[test]
+fn provider_reads_an_obs_exactly_at_a_dose_post_dose() {
+    const ODE_1CPT: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV * exp(ETA_V)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let m = parse_model_string(ODE_1CPT).expect("parses");
+    let doses = vec![
+        DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(8.0, 1000.0, 1, 0.0, false, 0.0),
+    ];
+    let times = [4.0, 8.0, 12.0, 24.0];
+    let subject = subject_with_doses_and_resets(doses, &times, Vec::new());
+    let theta = [10.0, 50.0];
+    let eta = [0.10, -0.05];
+
+    let f = compute_predictions_with_tv(&m, &subject, &theta, &eta);
+    let ke = (theta[0] * eta[0].exp()) / (theta[1] * eta[1].exp());
+    let pre = 1000.0 * (-8.0f64 * ke).exp();
+    let post = pre + 1000.0;
+    assert!(
+        post - pre > 999.0,
+        "the pre/post-dose pair must be a whole dose apart, got {pre:.4} / {post:.4}"
+    );
+    assert!(
+        f[1].is_finite() && (f[1] - post).abs() < 1e-4 * post,
+        "production must read the coincident observation post-dose: got {:.6}, expected \
+         {post:.6} (pre-dose is {pre:.6})",
+        f[1]
+    );
+
+    // The parity `check_full_provider_vs_fd` would catch this too, but assert the value
+    // side directly first so the failure names *which* side drifted rather than surfacing
+    // as an FD mismatch.
+    let s = subject_sensitivities(&m, &subject, &theta, &eta).expect("supported");
+    assert!(
+        s.obs[1].f.is_finite(),
+        "the provider returned a non-finite value at the coincident observation"
+    );
+    assert_eq!(
+        s.obs[1].f.to_bits(),
+        f[1].to_bits(),
+        "provider {:.10} vs production {:.10} at an observation exactly on a dose — the \
+         static Dual2 walk must record the post-event state, as production does",
+        s.obs[1].f,
+        f[1]
+    );
+
+    check_full_provider_vs_fd(&m, &subject, &theta, &eta);
+}
+
+#[test]
+fn provider_reads_an_obs_one_ulp_after_a_dose_post_dose() {
+    const ODE_1CPT: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV * exp(ETA_V)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let m = parse_model_string(ODE_1CPT).expect("parses");
+    let dose_time = 8.0f64;
+    // One ULP after the dose record: inside `EVENT_MATCH_TOL`, past the `1e-15` break
+    // dedup, and strictly *after* the dose — so the read must be post-dose.
+    let obs_1ulp = f64::from_bits(dose_time.to_bits() + 1);
+    let sep = obs_1ulp - dose_time;
+    assert!(
+        sep > 1e-15 && sep < crate::ode::predictions::EVENT_MATCH_TOL,
+        "the observation must straddle the dedup and the match (sep {sep:.3e}) or this \
+         fixture tests an ordinary segment point"
+    );
+    let doses = vec![
+        DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(dose_time, 1000.0, 1, 0.0, false, 0.0),
+    ];
+    let times = [4.0, obs_1ulp, 12.0, 24.0];
+    let subject = subject_with_doses_and_resets(doses, &times, Vec::new());
+    let theta = [10.0, 50.0];
+    let eta = [0.10, -0.05];
+
+    // Production must itself read the ULP observation post-dose — the fix this test rides
+    // on. `obs_cmt=central` with no `[scaling]` reads the **amount**, so the two sides are
+    // 155.85 and 1155.85, a whole dose apart. Asserted rather than assumed: before the fix
+    // production returned the pre-dose 155.85, and a parity check alone would have gone
+    // green on the provider agreeing with that wrong value.
+    let f = compute_predictions_with_tv(&m, &subject, &theta, &eta);
+    assert!(
+        f.iter().all(|v| v.is_finite()),
+        "production returned a non-finite prediction: {f:?}"
+    );
+    let ke = (theta[0] * eta[0].exp()) / (theta[1] * eta[1].exp());
+    let pre = 1000.0 * (-ke * dose_time).exp();
+    let post = pre + 1000.0;
+    assert!(
+        post - pre > 999.0,
+        "the pre/post-dose pair must be a whole dose apart, got {pre:.4} / {post:.4}"
+    );
+    // The model runs at the default solver tolerances, so the bound is relative:
+    // measured 8.5e-3 absolute (7.3e-6 relative) against this closed form, and the gap
+    // it must not confuse is a whole 1000 mg dose.
+    assert!(
+        (f[1] - post).abs() < 1e-4 * post,
+        "production reads {:.6} at one ULP after the dose — expected the post-dose \
+         {post:.6} (pre-dose is {pre:.6})",
+        f[1]
+    );
+
+    check_full_provider_vs_fd(&m, &subject, &theta, &eta);
+}

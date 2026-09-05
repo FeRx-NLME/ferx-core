@@ -6564,6 +6564,34 @@ fn integrate_g<T: crate::sens::num::PkNum>(
         }
     };
 
+    // Record `src` at every observation in the break `q`'s recording band, **overwriting**
+    // an earlier write (#1226).
+    //
+    // The overwrite is the whole point, and it is what makes this walk agree with
+    // production rather than only with itself. `record_at` above is first-write-wins, and
+    // the previous segment's final save point is `t_end` — the very break being visited
+    // here — so its *pre*-event state reaches a band member first and `recorded[j]` then
+    // locks it in. Production has no such guard: its segment `saveat` writes and the next
+    // break's boundary read overwrites, so the post-event state is what an observation at
+    // or just after a dose gets. Measured before this: an observation exactly at an
+    // interior dose read 155.85 here against production's 1155.85 — a whole dose, and a
+    // gap that predates #1226 (`t <= t_end` alone does not close it, since an observation
+    // *equal* to `t_end` is a legitimate member of that segment's `saveat`).
+    //
+    // One-sided, like every other recording site: [`reads_at_break`] never claims a time
+    // *before* the break, so an observation a hair earlier keeps the pre-event state the
+    // preceding segment gave it.
+    let record_at_break = |q: f64, src: &[T], states: &mut [Vec<T>], recorded: &mut [bool]| {
+        let lo = sorted_obs.partition_point(|&(t, _)| t < q);
+        for &(t, j) in &sorted_obs[lo..] {
+            if !crate::ode::predictions::reads_at_break(t, q) {
+                break;
+            }
+            states[j].copy_from_slice(src);
+            recorded[j] = true;
+        }
+    };
+
     // #530: zero-order absorption windows. A dose feeding a `zero_order(dur)` forcing
     // delivers a constant `F·amt·frac/dur` over `[dose.time, dose.time + dur]` — mechanically
     // an infusion, but `dur` is an estimated parameter so the window END is a moving boundary.
@@ -6739,6 +6767,11 @@ fn integrate_g<T: crate::sens::num::PkNum>(
         // coincides with it can be value-equal but bit-different — match by
         // tolerance, not bit pattern (issue #410).
         record_at(t_start, &u, &mut states, &mut recorded);
+        // …and force the post-event state onto this break's whole recording band, over
+        // any pre-event write the previous segment's `t_end` save point already made
+        // (#1226). Ordered after the tolerant catch-all above so that one still covers a
+        // record the solver's save points missed, on either side.
+        record_at_break(t_start, &u, &mut states, &mut recorded);
 
         // Last effective dose at or before the segment start (the TAD anchor). Shared by the
         // zero-order saltation below and the RHS forcing — one fold over `subject.doses` per
@@ -6789,10 +6822,17 @@ fn integrate_g<T: crate::sens::num::PkNum>(
 
         // Observation times in (t_start, t_end]; always include t_end so `u`
         // advances for the next segment.
+        //
+        // #1226: the upper bound is **exact**. It used to be `t <= t_end + 1e-12`, which
+        // handed an observation inside `t_end`'s own match band to *this* segment's save
+        // points — pre-event — and the boundary `record_at` on the next iteration then
+        // found `recorded[j]` already set, so the pre-dose write won. `record_at` is
+        // already tolerance-based, so removing the slack here is the whole change: the
+        // band member is now recorded at the break, post-dose, matching production.
         let mut saveat: Vec<f64> = subject
             .obs_times
             .iter()
-            .filter(|&&t| t > t_start + 1e-12 && t <= t_end + 1e-12)
+            .filter(|&&t| t > t_start + 1e-12 && t <= t_end)
             .cloned()
             .collect();
         if saveat.last().map_or(true, |&l| (l - t_end).abs() > 1e-12) {

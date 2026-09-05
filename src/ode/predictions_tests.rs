@@ -1272,6 +1272,146 @@ fn adaptive_tv_frozen_replay_is_bit_exact() {
     );
 }
 
+/// #1226 on the reactive driver: an observation **one ULP after** a base-regimen dose reads
+/// post-dose, and the frozen replay agrees bit for bit.
+///
+/// The driver carried the same exact-bit `obs_map.get(&t_start.to_bits())` boundary read as
+/// the static engine, so the sample was claimed by the preceding segment's `saveat` and read
+/// before the dose landed. It and the replay are a bit-identity pair
+/// (`verify_adaptive_frozen_replay`), so they had to change through the same
+/// [`collect_records_at_break`] helper — this test is what makes that a *checked* claim.
+///
+/// **Constant-covariate path, deliberately.** The driver pushes observation times onto the
+/// break list only when `tv` is set (`event_pk = Some(..)`), and the replay pushes them
+/// unconditionally; where every observation is its own break the exact-bit read never misses
+/// and the defect is unreachable. Measured: the first draft of this test used the TV path and
+/// the mutation survived it — the same "a fast path makes the mutation unreachable" shape the
+/// single-observation fixtures in `lag_arrival_read_1226` hit. With `event_pk = None` the
+/// sample is an ordinary interior time and the band is what decides it.
+///
+/// So this pins the **driver's** band read. `adaptive_frozen_replay_tv`'s own band read stays
+/// unreachable for #1226 by construction (its observations are always breaks); it changes
+/// with the driver because the pair must not drift, not because a fixture can separate them.
+///
+/// The closed form is the reason the test cannot pass vacuously: the oracle below is the
+/// static engine, which shares the fix, so agreement alone would be satisfied by both reading
+/// the pre-dose 44.04.
+#[test]
+fn adaptive_reads_an_obs_one_ulp_after_a_base_dose_post_dose() {
+    let ode = OdeSpec {
+        solver_opts: OdeSolverOptions {
+            abstol: 1e-12,
+            reltol: 1e-10,
+            ..OdeSolverOptions::default()
+        },
+        ..one_cpt_ode_spec()
+    };
+    let (cl, v) = (1.0, 10.0);
+    let dose_time = 8.2f64;
+    let obs_1ulp = f64::from_bits(dose_time.to_bits() + 1);
+    let sep = obs_1ulp - dose_time;
+    assert!(
+        sep > 1e-15 && sep < EVENT_MATCH_TOL,
+        "the sample must straddle the 1e-15 dedup and EVENT_MATCH_TOL (sep {sep:.3e})"
+    );
+
+    // Two base-regimen doses so the second lands with the compartment non-empty.
+    let base = make_subject(
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(dose_time, 100.0, 1, 0.0, false, 0.0),
+        ],
+        vec![obs_1ulp, 9.0],
+    );
+    let pkv = pk_one(cl, v);
+    // Decisions away from the dose break, and a hold-only controller: the base regimen is
+    // the only thing that doses, so the ledger replays exactly what was scheduled.
+    let decisions = [0.0, 4.0];
+    let mons: Vec<AdaptiveMonitor> = Vec::new();
+    let mut decide = |_ctx: &ControllerCtx| ControllerDecision {
+        actions: vec![DoseAction::Hold],
+        rule: None,
+    };
+    let run = ode_predictions_adaptive_impl(
+        &ode,
+        &pkv.values,
+        None,
+        None,
+        None,
+        &[],
+        &[],
+        &base,
+        &decisions,
+        &mons,
+        &mut decide,
+        100,
+        None,
+    )
+    .expect("driver runs");
+
+    // Closed form, independent of every engine here: the first dose's residual plus the
+    // second, which arrived one ULP earlier.
+    let ke = cl / v;
+    let pre = 100.0 * (-ke * obs_1ulp).exp();
+    let post = pre + 100.0 * (-ke * sep).exp();
+    assert!(
+        post - pre > 99.0,
+        "the pre/post-dose pair must be a whole dose apart ({pre:.4} / {post:.4})"
+    );
+    assert!(
+        run.predictions[0].is_finite(),
+        "the driver returned a non-finite prediction at the ULP sample"
+    );
+    assert!(
+        (run.predictions[0] - post).abs() < 1e-6,
+        "the reactive driver reads {:.8} one ULP after the dose — expected the post-dose \
+         {post:.8} (pre-dose is {pre:.8})",
+        run.predictions[0]
+    );
+
+    // The verifier accepts the run, …
+    verify_adaptive_frozen_replay(
+        &ode,
+        &pkv.values,
+        None,
+        None,
+        None,
+        &[],
+        &[],
+        &base,
+        &decisions,
+        &run,
+    )
+    .expect("the driver run must match its static replay");
+
+    // …and the agreement is bit-exact, not merely inside the verifier's slack. On the
+    // constant path the replay *is* `ode_predictions_with_extra_breaks` — the static engine
+    // over the driver's own decision breaks — built here exactly as the verifier builds it:
+    // the base regimen kept, the ledger's realized doses appended. (Replacing the doses with
+    // the ledger alone — the shape the dose-free adaptive tests use — drops the base regimen
+    // and reads 0.0.)
+    let mut static_subject = base.clone();
+    static_subject.doses.extend(
+        run.ledger
+            .iter()
+            .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0)),
+    );
+    let replay =
+        ode_predictions_with_extra_breaks(&ode, &pkv.values, &[], &[], &static_subject, &decisions);
+    for (i, (got, want)) in run.predictions.iter().zip(replay.iter()).enumerate() {
+        assert!(
+            got.is_finite() && want.is_finite(),
+            "non-finite at obs {i}: driver {got} / replay {want}"
+        );
+        assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "driver {got:.10} and frozen replay {want:.10} diverged at obs {i} — the pair \
+             must take its boundary read through the same helper"
+        );
+    }
+}
+
 #[test]
 fn earliest_record_pk_seeds_earliest_else_fallback() {
     // #700 seed helper: with records present, seed from the earliest record's
@@ -10316,5 +10456,471 @@ mod break_collision_1186 {
             "nodes between the earlier onset and t=0 must carry drug: got {:?}",
             dense.iter().map(|u| u[0]).collect::<Vec<_>>()
         );
+    }
+}
+
+// ── #1226: an observation within `EVENT_MATCH_TOL` *after* a lagged dose arrival ──
+//
+// A compartment lag walked by the optimizer puts a dose arrival a few ULP short of a
+// sample time. The arrival strictly precedes the observation, so the observation must be
+// read post-dose — NONMEM applies each record once, by type, and a dose record earlier
+// than an observation record is applied first.
+//
+// The rescanning engines used to read it *pre*-dose: `t <= t_end + 1e-12` on the previous
+// segment's `saveat` claimed the sample, `t > t_start + 1e-12` on the following segment
+// excluded it, and the post-dose boundary read was an exact-bit `obs_map` lookup that
+// missed it. So a subject read drug-free at a sample taken after its own dose — 45.38
+// against NONMEM's 145.38, on the objective as well as the diagnostics.
+//
+// The **mirror** sign was wrong on exactly one site and in the opposite direction: the
+// #570 shared solve's CHZ boundary read was a *symmetric* `abs() < 1e-12`, so a hazard
+// time 1.8e-15 *before* an arrival was overwritten with the post-dose state while the
+// dedicated dense path kept the pre-dose one — the "shared solve ≡ dedicated path"
+// invariant, broken on the mirror only.
+//
+// **Oracle**: NONMEM 7.6.0, both signs, exact.
+// `nonmem_anchor/lag_arrival_read_{before,after}_advan{1,13}.ctl` pass `ALAG1` as a
+// 17-digit `$THETA … FIX` and table `ARR = TDOS + ALAG1` / `SEP = 8.2 - ARR`; NM-TRAN
+// keeps the literal, so `ARR` is the same double ferx forms and the comparison is on
+// identical bits. The event-driven engines are **not** touched by the fix and are the
+// in-repo controls — they dispatch typed events by index off one sorted timeline and were
+// measured right on both signs.
+mod lag_arrival_read_1226 {
+    use super::*;
+    use crate::types::{PkModel, MAX_PK_PARAMS, PK_IDX_CL, PK_IDX_F, PK_IDX_LAGTIME, PK_IDX_V};
+
+    const DOSE_TIME: f64 = 7.9;
+    const OBS_TIME: f64 = 8.2;
+    const CL: f64 = 1.0;
+    const V: f64 = 10.0;
+
+    /// NONMEM's own `ARR = TDOS + ALAG1` column, printed at 17 significant digits so the
+    /// literal round-trips to the double the run used.
+    ///
+    /// `results/lag_arrival_read_before_advan1.tab`: 74 ULP **below** the 8.2 sample
+    /// (`SEP = +1.3145040611561853E-13`) — the issue geometry.
+    const NM_ARRIVAL_BEFORE: f64 = 8.1999999999998678;
+    /// `results/lag_arrival_read_after_advan1.tab`: 1 ULP **above** it
+    /// (`SEP = -1.7763568394002505E-15`) — the mirror.
+    const NM_ARRIVAL_AFTER: f64 = 8.2000000000000011;
+
+    /// `PRED` at 8.2 / 9.0 from `results/lag_arrival_read_before_advan1.tab`. ADVAN1
+    /// TRANS2 with no `S1`, so `F = A(1)` — a central **amount**, which is what the
+    /// 1-state ferx fixture below reads.
+    const NM_BEFORE_ADVAN1: [f64; 2] = [1.4538447952823367E+02, 1.3420678956342570E+02];
+    /// `results/lag_arrival_read_after_advan1.tab`, same columns.
+    const NM_AFTER_ADVAN1: [f64; 2] = [4.5384479528235588E+01, 1.3420678956342749E+02];
+    /// `results/lag_arrival_read_before_advan13.tab`, `IPRED = A(1)/V` — the ODE twin of
+    /// the analytic ADVAN1 run, at `TOL=9`. Multiplied by `V` to compare as an amount.
+    const NM_BEFORE_ADVAN13: [f64; 2] = [1.4538447943810009E+01, 1.3420678940629491E+01];
+    /// `results/lag_arrival_read_after_advan13.tab`, same columns.
+    const NM_AFTER_ADVAN13: [f64; 2] = [4.5384479438102048E+00, 1.3420678940629784E+01];
+
+    /// 1-cpt IV, one state, amount readout — the ferx twin of `ADVAN1 TRANS2` with no
+    /// `S1` (and of the `$DES DADT(1) = -K*A(1)` ADVAN13 run). The lag is the bare
+    /// `PK_IDX_LAGTIME` slot with an empty `DoseAttrMap`, which is what `ALAG1` on the
+    /// only compartment resolves to — and the same slot the analytic
+    /// `predict_concentration` arm reads, so every engine below sees one lag from one
+    /// number.
+    fn spec() -> OdeSpec {
+        OdeSpec {
+            solver_opts: OdeSolverOptions {
+                abstol: 1e-12,
+                reltol: 1e-10,
+                ..OdeSolverOptions::default()
+            },
+            ..one_cpt_ode_spec()
+        }
+    }
+
+    fn pk_flat(lag: f64) -> Vec<f64> {
+        let mut p = vec![0.0; MAX_PK_PARAMS];
+        p[PK_IDX_CL] = CL;
+        p[PK_IDX_V] = V;
+        p[PK_IDX_F] = 1.0;
+        p[PK_IDX_LAGTIME] = lag;
+        p
+    }
+
+    /// Two 100 mg IV boluses, at `t = 0` and `t = 7.9`, both lagged by `ALAG1`.
+    ///
+    /// **Multi-dose deliberately**: the first dose leaves ~45.38 in central at 8.2, so the
+    /// victim dose lands with the compartment non-empty and the pre/post-dose reads are
+    /// 45.38 vs 145.38. On a single-dose fixture the incoming side is `g(x⁻) = 0` and a
+    /// pre-dose read of 0.0 is indistinguishable from "nothing has happened yet".
+    fn doses() -> Vec<DoseEvent> {
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(DOSE_TIME, 100.0, 1, 0.0, false, 0.0),
+        ]
+    }
+
+    /// The lag whose arrival `7.9 + lag` is **bit-equal** to `target`.
+    ///
+    /// Searched over the ULP neighbourhood of the nominal 0.3 (by bit pattern, so the walk
+    /// visits consecutive doubles exactly) rather than hard-coded, so a change to the
+    /// sample or dose time cannot leave the fixture silently outside the band it exists to
+    /// test — the search fails loudly instead. The straddle is then asserted separately.
+    fn lag_for(target: f64) -> f64 {
+        let base = 0.3f64.to_bits();
+        (0..=8192u64)
+            .flat_map(|k| [base - k, base + k])
+            .map(f64::from_bits)
+            .find(|&l| DOSE_TIME + l == target)
+            .expect("no lag within 8192 ULP of 0.3 reproduces NONMEM's arrival")
+    }
+
+    /// Central **amount** at `t` from the closed form: the first dose's residual plus the
+    /// second dose iff it has already arrived.
+    fn closed_form(t: f64, lag: f64, post_dose: bool) -> f64 {
+        let ke = CL / V;
+        let second = if post_dose {
+            100.0 * (-ke * (t - (DOSE_TIME + lag))).exp()
+        } else {
+            0.0
+        };
+        100.0 * (-ke * (t - lag)).exp() + second
+    }
+
+    const ENGINES: [&str; 6] = [
+        "ode_predictions",
+        "ode_predictions_with_states",
+        "ode_dense_solve_states",
+        "ode_predictions_event_driven (control)",
+        "ode_predictions_and_chz (shared-solve CHZ)",
+        "pk::predict_concentration (analytic)",
+    ];
+
+    /// The central amount at each `t_obs` from every production reader of this quantity.
+    ///
+    /// Asserted **per engine** by the callers, so a failure names the one that drifted.
+    /// Index 3 is the event-driven control (untouched by the fix); index 4 is the #570
+    /// shared solve's CHZ read, which routes to the same integration as index 0 but takes
+    /// its boundary decision on a separate line; index 5 is the analytic closed-form PK
+    /// path, which shares no code with any of them.
+    #[cfg(feature = "survival")]
+    fn all_readers(pkv: &[f64], subject: &Subject, t_obs: &[f64]) -> [Vec<f64>; 6] {
+        let ode = spec();
+        let p = ode_predictions(&ode, pkv, &[], &[], subject);
+        let (_ip, ws) = ode_predictions_with_states(&ode, pkv, &[], &[], subject);
+        let d = ode_dense_solve_states(&ode, pkv, &[], &[], subject, t_obs);
+        let mk = |v: &[f64]| PkParams {
+            values: v.try_into().unwrap(),
+        };
+        let pk_d: Vec<PkParams> = subject.doses.iter().map(|_| mk(pkv)).collect();
+        let pk_o: Vec<PkParams> = subject.obs_times.iter().map(|_| mk(pkv)).collect();
+        let ed = ode_predictions_event_driven(&ode, subject, &[], &[], &pk_d, &pk_o, &[], &[]);
+        // The shared solve reads `t_obs` as *soft* (CHZ) samples off the same integration
+        // as `ode_predictions` — a different boundary decision on the same geometry.
+        let (_ip2, chz) = ode_predictions_and_chz(&ode, pkv, &[], &[], subject, t_obs);
+        let an: Vec<f64> = t_obs
+            .iter()
+            .map(|&t| {
+                crate::pk::predict_concentration(PkModel::OneCptIv, &subject.doses, t, &mk(pkv)) * V
+            })
+            .collect();
+        [
+            p,
+            ws.iter().map(|u| u[0]).collect(),
+            d.iter().map(|u| u[0]).collect(),
+            ed,
+            chz.iter().map(|u| u[0]).collect(),
+            an,
+        ]
+    }
+
+    /// **Test 1 — the straddle, asserted on its own.**
+    ///
+    /// Both fixtures must sit strictly inside the band on their own side: past the `1e-15`
+    /// break dedup (else the arrival merges into the sample's own break and there is no
+    /// ordering question left) and inside `EVENT_MATCH_TOL` (else the record is an
+    /// ordinary segment point and nothing under test is exercised).
+    ///
+    /// Without this, a later edit to `EVENT_MATCH_TOL`, the dose time or the sample time
+    /// could make the two arrivals bit-identical to 8.2 and turn every test below into a
+    /// tautology that passes for the wrong reason.
+    #[test]
+    fn issue_and_mirror_fixtures_straddle_the_band() {
+        let sep_before = OBS_TIME - NM_ARRIVAL_BEFORE;
+        assert!(
+            sep_before > 1e-15 && sep_before < EVENT_MATCH_TOL,
+            "the issue-side arrival {NM_ARRIVAL_BEFORE:.17} must be inside \
+             (1e-15, EVENT_MATCH_TOL) *before* the {OBS_TIME} sample; sep {sep_before:.4e}"
+        );
+        let sep_after = OBS_TIME - NM_ARRIVAL_AFTER;
+        assert!(
+            sep_after < -1e-15 && sep_after > -EVENT_MATCH_TOL,
+            "the mirror arrival {NM_ARRIVAL_AFTER:.17} must be inside \
+             (1e-15, EVENT_MATCH_TOL) *after* the {OBS_TIME} sample; sep {sep_after:.4e}"
+        );
+        // And the searched lags actually reproduce those arrivals, bit for bit — the
+        // premise the NONMEM anchors are compared under.
+        assert_eq!(DOSE_TIME + lag_for(NM_ARRIVAL_BEFORE), NM_ARRIVAL_BEFORE);
+        assert_eq!(DOSE_TIME + lag_for(NM_ARRIVAL_AFTER), NM_ARRIVAL_AFTER);
+    }
+
+    /// **Test 4 — the two oracles straddle the value.**
+    ///
+    /// `post - pre > 99` on this fixture, so tests 2 and 3 cannot both pass on an engine
+    /// that picks the wrong side: one of them is 100 mg away from its anchor.
+    #[test]
+    fn pre_and_post_dose_anchors_are_a_hundred_apart() {
+        let pre = NM_AFTER_ADVAN1[0];
+        let post = NM_BEFORE_ADVAN1[0];
+        assert!(
+            post - pre > 99.0,
+            "the pre-dose {pre:.6} and post-dose {post:.6} NONMEM anchors must be far \
+             apart or neither test can fail"
+        );
+        // The two NONMEM runs differ *only* in `ALAG1`, by 1.3e-13 — everything else in
+        // the two control streams is identical, so the 100 mg gap is the dose ordering
+        // and nothing else. At t=9.0, past both arrivals, they agree to round-off.
+        let tail = (NM_BEFORE_ADVAN1[1] - NM_AFTER_ADVAN1[1]).abs() / NM_AFTER_ADVAN1[1];
+        assert!(
+            tail < 1e-12,
+            "the two runs must agree at t=9.0 (both post-dose there); rel {tail:.3e}"
+        );
+    }
+
+    /// **Test 2 — the issue geometry, every engine, against NONMEM.**
+    ///
+    /// An observation `1.3e-13` **after** a lagged arrival reads post-dose: 145.38, not
+    /// 45.38. Red before the fix on `ode_predictions`, `ode_predictions_with_states` and
+    /// `ode_dense_solve_states`; green throughout on the event-driven control, the
+    /// shared-solve CHZ read and the analytic path.
+    ///
+    /// Mutation: revert one engine's band read to the exact-bit `obs_map` lookup and only
+    /// that engine reads 45.38 — the per-engine assert names it.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn arrival_within_tol_before_obs_reads_post_dose() {
+        let lag = lag_for(NM_ARRIVAL_BEFORE);
+        let pkv = pk_flat(lag);
+        let obs = vec![OBS_TIME, 9.0];
+        let s = make_subject(doses(), obs.clone());
+        let got = all_readers(&pkv, &s, &obs);
+
+        for (e, vals) in ENGINES.iter().zip(got.iter()) {
+            for (i, &want) in NM_BEFORE_ADVAN1.iter().enumerate() {
+                let g = vals[i];
+                assert!(g.is_finite(), "{e} returned {g} at t={}", obs[i]);
+                let rel = (g - want).abs() / want.abs();
+                assert!(
+                    rel < 1e-9,
+                    "{e} at t={}: {g:.10} vs NONMEM ADVAN1 {want} (rel {rel:.3e}) — a \
+                     pre-dose read is {:.6}",
+                    obs[i],
+                    closed_form(obs[i], lag, false)
+                );
+                // The independent ADVAN13 twin: the same geometry through NONMEM's own
+                // ODE integrator at `TOL=9`, so the bound is that run's error, not ours.
+                let want13 = NM_BEFORE_ADVAN13[i] * V;
+                let rel13 = (g - want13).abs() / want13.abs();
+                assert!(
+                    rel13 < 1e-8,
+                    "{e} at t={}: {g:.10} vs NONMEM ADVAN13xV {want13:.10} (rel {rel13:.3e})",
+                    obs[i]
+                );
+            }
+        }
+    }
+
+    /// **Test 3 — the mirror, every engine including the shared-solve CHZ read.**
+    ///
+    /// An observation `1.8e-15` **before** a lagged arrival stays pre-dose: 45.38. This is
+    /// the direction the fix must *not* change, and the one site that had it wrong is the
+    /// #570 shared solve's symmetric `abs() < 1e-12` CHZ boundary read.
+    ///
+    /// Red before the fix on `ode_predictions_and_chz` **only**. Mutation: make
+    /// [`reads_at_break`] symmetric (`(t - t_break).abs() < EVENT_MATCH_TOL`) and this
+    /// goes red again, on every rescanning engine.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn arrival_within_tol_after_obs_reads_pre_dose() {
+        let lag = lag_for(NM_ARRIVAL_AFTER);
+        let pkv = pk_flat(lag);
+        let obs = vec![OBS_TIME, 9.0];
+        let s = make_subject(doses(), obs.clone());
+        let got = all_readers(&pkv, &s, &obs);
+
+        for (e, vals) in ENGINES.iter().zip(got.iter()) {
+            for (i, &want) in NM_AFTER_ADVAN1.iter().enumerate() {
+                let g = vals[i];
+                assert!(g.is_finite(), "{e} returned {g} at t={}", obs[i]);
+                let rel = (g - want).abs() / want.abs();
+                assert!(
+                    rel < 1e-9,
+                    "{e} at t={}: {g:.10} vs NONMEM ADVAN1 {want} (rel {rel:.3e}) — a \
+                     post-dose read is {:.6}",
+                    obs[i],
+                    closed_form(obs[i], lag, true)
+                );
+                let want13 = NM_AFTER_ADVAN13[i] * V;
+                let rel13 = (g - want13).abs() / want13.abs();
+                assert!(
+                    rel13 < 1e-8,
+                    "{e} at t={}: {g:.10} vs NONMEM ADVAN13xV {want13:.10} (rel {rel13:.3e})",
+                    obs[i]
+                );
+            }
+        }
+    }
+
+    /// **Test 5a — the whole band reads post-dose, on every engine.**
+    ///
+    /// From one ULP of the sample time out past `EVENT_MATCH_TOL` to a separation the
+    /// integrator resolves normally. The two entries past the tolerance are the control:
+    /// they take the ordinary segment path, so if they were to fail the fix would have
+    /// changed something other than the boundary.
+    ///
+    /// The **trailing 9.0 record is load-bearing**, and this test was green before the fix
+    /// without it: `t_last = max(obs_times)` is always a break, so a lone 8.2 sample is the
+    /// *final* break and the old exact-bit boundary read caught it post-dose — a fast path
+    /// that made the defect unreachable. With a later record, 8.2 is an ordinary interior
+    /// time and the band is what decides it.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn post_dose_read_holds_across_the_whole_separation_band() {
+        let obs = vec![OBS_TIME, 9.0];
+        let ulp = OBS_TIME - f64::from_bits(OBS_TIME.to_bits() - 1);
+        for sep in [2.0 * ulp, 1e-14, 1e-13, 9e-13, 1.1e-12, 1e-9] {
+            let lag = (OBS_TIME - sep) - DOSE_TIME;
+            let actual_sep = OBS_TIME - (DOSE_TIME + lag);
+            assert!(
+                actual_sep > 0.0,
+                "sep {sep:.2e} did not survive the round trip through the lag \
+                 (got {actual_sep:.3e}) — the arrival must stay strictly before the sample"
+            );
+            // The round trip must not move an entry across the tolerance edge, or the
+            // sweep silently stops covering the side it was chosen for.
+            assert_eq!(
+                actual_sep < EVENT_MATCH_TOL,
+                sep < EVENT_MATCH_TOL,
+                "sep {sep:.2e} landed at {actual_sep:.4e}, on the other side of \
+                 EVENT_MATCH_TOL than intended"
+            );
+            let pkv = pk_flat(lag);
+            let s = make_subject(doses(), obs.clone());
+            let got = all_readers(&pkv, &s, &obs);
+            let want = closed_form(OBS_TIME, lag, true);
+            let pre = closed_form(OBS_TIME, lag, false);
+            assert!(
+                want - pre > 99.0,
+                "sep {sep:.2e}: the post/pre pair must stay 100 mg apart"
+            );
+            for (e, vals) in ENGINES.iter().zip(got.iter()) {
+                assert!(vals[0].is_finite(), "{e} non-finite at sep {sep:.2e}");
+                assert!(
+                    (vals[0] - want).abs() < 1e-8,
+                    "{e} at sep {actual_sep:.4e}: {:.10} — expected the post-dose \
+                     {want:.10} (pre-dose reads {pre:.6})",
+                    vals[0]
+                );
+            }
+        }
+    }
+
+    /// **Test 5b — the band read is continuous across the tolerance edge.**
+    ///
+    /// Inside the band the engines return `u(t_k⁺)` instead of integrating the sub-`1e-12`
+    /// span to `u(t)`. That shortcut is shown, not argued, to be below tolerance: at
+    /// `0.9·EVENT_MATCH_TOL` (band read) and `1.1·EVENT_MATCH_TOL` (integrated read) the
+    /// two straddle the predicate, and the values agree to `< 1e-8` — and each agrees with
+    /// the closed form at the sample time to the same bound.
+    ///
+    /// The trailing 9.0 record is load-bearing for the same reason as in
+    /// `post_dose_read_holds_across_the_whole_separation_band`.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn band_read_is_continuous_across_the_tolerance_edge() {
+        let obs = vec![OBS_TIME, 9.0];
+        let mut vals: Vec<[f64; 6]> = Vec::new();
+        for sep in [0.9 * EVENT_MATCH_TOL, 1.1 * EVENT_MATCH_TOL] {
+            let lag = (OBS_TIME - sep) - DOSE_TIME;
+            let arrival = DOSE_TIME + lag;
+            // The straddle itself: one side is a band read, the other a segment read.
+            // Asserted so the pair cannot silently collapse onto one arm.
+            assert_eq!(
+                reads_at_break(OBS_TIME, arrival),
+                sep < EVENT_MATCH_TOL,
+                "sep {sep:.3e}: the two fixtures must land on opposite sides of the band"
+            );
+            let pkv = pk_flat(lag);
+            let s = make_subject(doses(), obs.clone());
+            let got = all_readers(&pkv, &s, &obs);
+            let want = closed_form(OBS_TIME, lag, true);
+            let mut row = [0.0f64; 6];
+            for (j, (e, v)) in ENGINES.iter().zip(got.iter()).enumerate() {
+                assert!(v[0].is_finite(), "{e} non-finite at sep {sep:.3e}");
+                assert!(
+                    (v[0] - want).abs() < 1e-8,
+                    "{e} at sep {sep:.3e}: {:.10} vs the closed form {want:.10} — the \
+                     `u(t_k+)` shortcut must stay below solver tolerance",
+                    v[0]
+                );
+                row[j] = v[0];
+            }
+            vals.push(row);
+        }
+        for (j, e) in ENGINES.iter().enumerate() {
+            let d = (vals[0][j] - vals[1][j]).abs();
+            assert!(
+                d < 1e-8,
+                "{e}: the band read {:.10} and the integrated read {:.10} differ by \
+                 {d:.3e} across the EVENT_MATCH_TOL edge",
+                vals[0][j],
+                vals[1][j]
+            );
+        }
+    }
+
+    /// **Test 6 — the two predicates partition each segment.** Pure, no ODE.
+    ///
+    /// For breaks at least `EVENT_MATCH_TOL` apart, every `t` in `[t_k, t_{k+1}]` satisfies
+    /// exactly one of band / segment; `t == t_start + EVENT_MATCH_TOL` is a *segment* time
+    /// (the band is half-open); and when two breaks are closer than the tolerance both
+    /// bands can claim a time, in which case the later break's band is the one that must
+    /// win — which the ascending break loops give for free.
+    #[test]
+    fn band_and_segment_predicates_partition_the_interval() {
+        let t0 = 8.2f64;
+        let t1 = t0 + 3.0 * EVENT_MATCH_TOL;
+        let offsets = [
+            0.0,
+            f64::EPSILON * t0,
+            0.5 * EVENT_MATCH_TOL,
+            EVENT_MATCH_TOL,
+            1.5 * EVENT_MATCH_TOL,
+            3.0 * EVENT_MATCH_TOL,
+        ];
+        for off in offsets {
+            let t = t0 + off;
+            let band = reads_at_break(t, t0);
+            let seg = reads_in_segment(t, t0, t1);
+            assert!(
+                band ^ seg,
+                "t = t0 + {off:.3e} is in {} of band/segment — the two must partition \
+                 [t_start, t_end]",
+                if band { "both" } else { "neither" }
+            );
+        }
+        // The half-open boundary, called out on its own: exactly `t_start + tol` is a
+        // segment time, not a band time.
+        assert!(!reads_at_break(t0 + EVENT_MATCH_TOL, t0));
+        assert!(reads_in_segment(t0 + EVENT_MATCH_TOL, t0, t1));
+        // Before the break is never a band read — the one-sidedness, stated directly.
+        assert!(!reads_at_break(t0 - f64::EPSILON * t0, t0));
+        assert!(!reads_at_break(t0 - 0.5 * EVENT_MATCH_TOL, t0));
+
+        // Two breaks closer than the tolerance: a time between them is claimed by both
+        // bands, and never by the segment they bound, so no `saveat` records it twice.
+        let a = 8.2f64;
+        let b = a + 0.5 * EVENT_MATCH_TOL;
+        let t = a + 0.7 * EVENT_MATCH_TOL;
+        assert!(reads_at_break(t, a) && reads_at_break(t, b));
+        assert!(!reads_in_segment(t, a, b));
+        // `b` is visited after `a`, so the later — and correct, being the latest break at
+        // or before `t` — write wins.
+        assert!(b <= t && b > a);
     }
 }
