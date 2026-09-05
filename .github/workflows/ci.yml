@@ -171,6 +171,16 @@ jobs:
   # and the CI gate cannot drift. It is the one group that is opt-in locally: it
   # runs a suite rather than a compile, so a no-argument `tools/preflight.sh`
   # stays a pre-push habit and this job is where it has to be green.
+  #
+  # Note that "no `--profile` flag" is an invariant held by ABSENCE, and this job
+  # would be a no-op again — silently, with every test green — if a
+  # `[profile.dev] debug-assertions = false` or a
+  # `CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false` ever appeared. So the group's
+  # commands arm `debug_assertion_canary` (`src/lib.rs`) via
+  # `env FERX_REQUIRE_DEBUG_ASSERTIONS=1`, and that canary fails the run if
+  # `debug_assert!` turns out to compile to nothing. Do NOT set that variable at
+  # the workflow or job level: every other job legitimately runs with the guards
+  # off, and arming it there would fail them for doing the right thing.
   debug-assertions:
     name: Tests (debug-assertions)
     runs-on: ubuntu-latest

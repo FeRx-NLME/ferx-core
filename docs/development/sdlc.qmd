@@ -292,6 +292,18 @@ That group is the one `tools/preflight.sh` skips when you pass no arguments: it
 runs a test suite rather than a compile, so it is minutes rather than seconds.
 Name it when you want it.
 
+Its commands carry `env FERX_REQUIRE_DEBUG_ASSERTIONS=1`, which arms a canary
+(`debug_assertion_canary` in `src/lib.rs`) that fails the run if `debug_assert!`
+turns out to compile to nothing after all. Without it the gate would rest on the
+*absence* of a `--profile` flag, and a `[profile.dev] debug-assertions = false`
+or a `CARGO_PROFILE_DEV_DEBUG_ASSERTIONS` in the environment would neuter the
+whole job with every test still green. Do not set that variable anywhere else:
+every other job legitimately runs with the guards off.
+
+What this does **not** fix: `debug_assert!` condition lines are still permanently
+zero-hit regions in the Codecov reports, because every coverage job uses a
+release-derived profile. See #1248.
+
 ### 8.3 CI workflows (ferx-r)
 
 `R-CMD-check.yaml` and `test-coverage.yaml`. **ferx-r CI builds ferx-core from

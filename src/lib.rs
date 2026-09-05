@@ -70,3 +70,72 @@ pub use types::*;
 
 #[cfg(feature = "survival")]
 pub use api::{predict_categorical, predict_survival, SurvivalPredictionResult};
+
+/// Positive proof that the `debug_assert!` guards in this crate are LIVE (#344).
+///
+/// Every other test job builds with `ci-test`/`ci-fast`, both of which
+/// `inherits = "release"`, so all ~180 `debug_assert!`s compile to nothing. The
+/// `Tests (debug-assertions)` job exists to run them, and it does that by simply
+/// omitting `--profile` — the dev default has them on.
+///
+/// That is an invariant held by *absence*, which is the fragile kind. Nothing in
+/// the command string distinguishes a build with the guards live from one without:
+/// a `[profile.dev] debug-assertions = false` in `Cargo.toml`, or a
+/// `CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false` in the workflow environment, would
+/// neuter the whole job while all 4366 tests, all nine preflight-contract tests and
+/// both `cargo test` commands stayed green. The gate would then be exactly the
+/// no-op it was filed to replace.
+///
+/// So the group arms this canary through its own argument vector
+/// (`env FERX_REQUIRE_DEBUG_ASSERTIONS=1 cargo test …`, visible in
+/// `tools/preflight.sh --list` and asserted by
+/// `tests/preflight_owns_the_fast_gates.rs`), and the canary fails the run when the
+/// guards turn out to be dead.
+#[cfg(test)]
+mod debug_assertion_canary {
+    /// The env var `tools/preflight.sh`'s `debug-assertions` group sets. Deliberately
+    /// opt-*in*: every other job legitimately runs with the guards off, so an
+    /// unconditional assertion here would fail `Tests + coverage (core)` and both
+    /// coverage jobs for doing exactly what they are supposed to do.
+    const DEMAND: &str = "FERX_REQUIRE_DEBUG_ASSERTIONS";
+
+    #[test]
+    fn debug_assert_guards_run_when_the_gate_demands_them() {
+        let demanded = std::env::var_os(DEMAND).is_some();
+
+        // Observe the MACRO, not `cfg!(debug_assertions)`. The property the job exists
+        // to establish is "the condition of a `debug_assert!` is evaluated"; reading
+        // the cfg flag is one indirection away from it.
+        //
+        // `Cell` rather than `let mut`: with the guards off the assignment is compiled
+        // away, and a `mut` binding that is then never mutated warns.
+        let evaluated = std::cell::Cell::new(false);
+        debug_assert!({
+            evaluated.set(true);
+            true
+        });
+        let evaluated = evaluated.get();
+
+        assert_eq!(
+            evaluated,
+            cfg!(debug_assertions),
+            "`debug_assert!` and `cfg!(debug_assertions)` disagree, which should be \
+             impossible — the macro is defined in terms of that cfg. Read this as the \
+             canary itself being broken rather than the profile being wrong."
+        );
+
+        // The gate. Note the shape: `!demanded || evaluated`, so the only run this can
+        // fail is one that asked for the guards and did not get them. A single
+        // expression rather than an `if`, so both profiles execute every line here and
+        // the canary cannot read as uncovered on the patch gate.
+        assert!(
+            !demanded || evaluated,
+            "{DEMAND} is set — this run came from `tools/preflight.sh debug-assertions` \
+             or the `Tests (debug-assertions)` CI job — but `debug_assert!` compiled to \
+             nothing, so every guard in the crate is dead and the job is green for no \
+             reason. Something switched debug-assertions off for the dev profile: a \
+             `[profile.dev] debug-assertions = false` in Cargo.toml, or a \
+             `CARGO_PROFILE_DEV_DEBUG_ASSERTIONS` in the environment (#344)."
+        );
+    }
+}

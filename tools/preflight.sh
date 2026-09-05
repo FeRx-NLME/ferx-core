@@ -389,7 +389,20 @@ group_debug_assertions() {
   # `Tests + coverage (core)`, and compiling 120-odd of them again under a second
   # profile is the cost this group is shaped to avoid. Tier-1 is also where the
   # guards live — `debug_assert!` sits next to the invariant, in `src/`.
-  run cargo test --lib --no-default-features --features ci
+  # `env FERX_REQUIRE_DEBUG_ASSERTIONS=1` in the ARGUMENT VECTOR, not as a shell
+  # assignment prefix and not an `export` up in this function. Both of those would
+  # reach the child just the same, but `run` echoes `$*`, so only this form appears
+  # in `--list` — and what `--list` prints is what the guard test can assert and
+  # what a developer can copy. Same reasoning as `RUSTDOCFLAGS` in `group_rustdoc`.
+  #
+  # It arms `debug_assertion_canary` in `src/lib.rs`, which fails the run if
+  # `debug_assert!` turns out to compile to nothing. Without it this whole group is
+  # an invariant held by ABSENCE — nothing in `cargo test --lib --features ci`
+  # distinguishes a build with the guards live from one without, so a
+  # `[profile.dev] debug-assertions = false` or a `CARGO_PROFILE_DEV_DEBUG_ASSERTIONS`
+  # in the environment would neuter it with every test still green. The canary is
+  # opt-in precisely because every OTHER job legitimately runs with the guards off.
+  run env FERX_REQUIRE_DEBUG_ASSERTIONS=1 cargo test --lib --no-default-features --features ci
 
   # The feature-gated surface, for the same non-nesting reason `check` is a matrix
   # rather than one line: `--features ci` compiles neither `src/survival`,
@@ -398,7 +411,8 @@ group_debug_assertions() {
   # as they are in every other one. `markov` implies `survival`, so
   # `ci,markov,nn` is the union of the production cfgs — the same set `clippy` and
   # `rustdoc` take, and for the same reason.
-  run cargo test --lib --no-default-features --features ci,markov,nn
+  run env FERX_REQUIRE_DEBUG_ASSERTIONS=1 cargo test --lib --no-default-features \
+    --features ci,markov,nn
 }
 
 # ── Drive ───────────────────────────────────────────────────────────────────

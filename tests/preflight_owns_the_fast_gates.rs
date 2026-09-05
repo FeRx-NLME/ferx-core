@@ -575,10 +575,33 @@ fn load_bearing_flags_and_feature_coverage_survive_in_the_command_list() {
              green (#344). Drop the flag; the dev default is the gate."
         );
         assert!(
-            cmd.starts_with("cargo test "),
+            cmd.contains("cargo test "),
             "`{cmd}` is in the `debug-assertions` group but does not RUN anything. \
              A `cargo check`/`clippy` line compiles the assertions and never \
              evaluates them, which is the blind spot, not the fix (#344)."
+        );
+
+        // The POSITIVE half, and the one the flag check above cannot supply.
+        // Rejecting `--profile` only rules out the ways of turning the guards off
+        // that are VISIBLE in the command string. Two are not: `[profile.dev]
+        // debug-assertions = false` in Cargo.toml, and a
+        // `CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false` in the workflow environment.
+        // Either would leave
+        // this group's two commands intact, run all 4366 tests, and keep every
+        // assertion in this file green while the job verified nothing —
+        // an invariant held by absence is exactly what #344 was filed about.
+        // `debug_assertion_canary` in `src/lib.rs` closes that, but only when armed,
+        // so the arming has to be pinned as tightly as the flags are.
+        //
+        // `starts_with`, not `contains`: it must be the argv-leading `env` form, so
+        // `run` echoes it and `--list` tells the truth about what will run.
+        assert!(
+            cmd.starts_with("env FERX_REQUIRE_DEBUG_ASSERTIONS=1 cargo "),
+            "`{cmd}` does not arm the debug-assertions canary. Prefix it with \
+             `env FERX_REQUIRE_DEBUG_ASSERTIONS=1` (in the argument vector, so \
+             `--list` shows it): without that, `debug_assertion_canary` in \
+             src/lib.rs passes vacuously and nothing in this group ever verifies \
+             that `debug_assert!` is actually live (#344)."
         );
     }
 
@@ -782,16 +805,23 @@ fn the_default_run_is_every_group_that_is_not_opt_in_and_ci_runs_the_rest() {
          to ALL_GROUPS and to neither list's intent."
     );
 
-    // The other half: each opt-in group is invoked by name in ci.yml. Searched over
-    // the whole file rather than one job body, so moving it between jobs is fine —
-    // what must not happen is it running nowhere.
+    // The other half: each opt-in group is invoked by name in ci.yml — read from the
+    // file's parsed `run:` steps, NOT from its raw text. A YAML *comment* that merely
+    // mentions `tools/preflight.sh <group>` would satisfy a `contains` check while
+    // nothing executed the group, and this workflow is full of comments that name
+    // exactly these commands, so that check would have been self-satisfying. Applied
+    // to the whole document rather than one job body on purpose: moving the group
+    // between jobs is fine, running it nowhere is not.
     let yml = ci_yml();
+    let executed = run_commands(&yml);
     for g in &opt_in {
         let want = format!("tools/preflight.sh {g}");
         assert!(
-            yml.contains(&want),
-            "group `{g}` is opt-in locally and no job in ci.yml runs `{want}`, so it \
-             is a gate that nothing executes"
+            executed.iter().any(|c| c == &want),
+            "group `{g}` is opt-in locally and no job in ci.yml RUNS `{want}`, so it \
+             is a gate that nothing executes. Naming it in a comment does not count — \
+             this reads the `run:` steps.\nrun steps found:\n  {}",
+            executed.join("\n  ")
         );
     }
 }
