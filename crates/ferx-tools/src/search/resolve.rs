@@ -350,7 +350,7 @@ pub fn resolve(mfl: &Mfl, ctx: &ModelContext) -> Result<Resolved, String> {
                 op,
             } => {
                 let explicit = !parameters.is_symbolic() && !covariates.is_symbolic();
-                let params = resolve_parameters(parameters, ctx, &lets, &feature.keyword())?;
+                let params = resolve_parameters(parameters, ctx, &lets, &feature.keyword(), "PK")?;
                 let covs = resolve_covariates(covariates, ctx, &lets, &feature.keyword())?;
                 if params.is_empty() || covs.is_empty() {
                     notes.push(format!(
@@ -403,7 +403,16 @@ pub fn resolve(mfl: &Mfl, ctx: &ModelContext) -> Result<Resolved, String> {
                 parameters,
                 effects,
             } => {
-                let params = resolve_parameters(parameters, ctx, &lets, &feature.keyword())?;
+                // `IIV(*, …)` is every parameter an η could go on; `IOV(*, …)`
+                // is every parameter that already has one (Pharmpy's iovsearch
+                // adds κ on top of the IIV set).
+                let wildcard = if matches!(feature, Feature::Iiv { .. }) {
+                    "PK"
+                } else {
+                    "IIV"
+                };
+                let params =
+                    resolve_parameters(parameters, ctx, &lets, &feature.keyword(), wildcard)?;
                 if params.is_empty() {
                     notes.push(format!(
                         "dropped `{feature}`: {parameters} resolves to nothing on this model"
@@ -431,7 +440,10 @@ pub fn resolve(mfl: &Mfl, ctx: &ModelContext) -> Result<Resolved, String> {
                 level,
                 parameters,
             } => {
-                let params = resolve_parameters(parameters, ctx, &lets, &feature.keyword())?;
+                // `COVARIANCE(IIV, *)`: the wildcard is the η-bearing set, not
+                // `@PK` — a covariance between parameters without an η is not
+                // a candidate anything can build.
+                let params = resolve_parameters(parameters, ctx, &lets, &feature.keyword(), "IIV")?;
                 if params.len() < 2 {
                     notes.push(format!(
                         "dropped `{feature}`: {parameters} resolves to {} parameter{} on this \
@@ -443,7 +455,7 @@ pub fn resolve(mfl: &Mfl, ctx: &ModelContext) -> Result<Resolved, String> {
                 }
                 statements.push(Statement::Feature(Feature::Covariance {
                     optional: *optional,
-                    level: *level,
+                    level: Modes::List(level.expand()),
                     parameters: Operand::Names(params),
                 }));
             }
@@ -548,16 +560,20 @@ fn check_covariate_name(name: &str, ctx: &ModelContext, context: &str) -> Result
     ))
 }
 
+/// `wildcard` names the built-in symbol `*` stands for in this slot — the
+/// wildcard is feature-specific in MFL (`@PK` for a covariate's parameters,
+/// `@IIV` for a covariance's), so the caller says which.
 fn resolve_parameters(
     operand: &Operand,
     ctx: &ModelContext,
     lets: &HashMap<String, Vec<String>>,
     context: &str,
+    wildcard: &str,
 ) -> Result<Vec<String>, String> {
     let names = match operand {
         Operand::Names(names) => names.clone(),
         Operand::Symbol(symbol) => lookup(symbol, ctx, lets)?,
-        Operand::Wildcard => ctx.builtin("PK")?,
+        Operand::Wildcard => ctx.builtin(wildcard)?,
     };
     let mut out: Vec<String> = Vec::new();
     for name in names {

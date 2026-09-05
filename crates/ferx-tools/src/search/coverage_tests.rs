@@ -90,6 +90,13 @@ fn the_remaining_gap_rows() {
     assert_eq!(gaps("IOV(CL,EXP)"), vec!["IOV(...)"]);
     assert_eq!(gaps("COVARIANCE(IOV,[CL,V])"), vec!["COVARIANCE(IOV, ...)"]);
     assert_eq!(gaps("COVARIANCE(IIV,[CL,V])"), Vec::<String>::new());
+    // An array or `*` in the level slot reaches the coverage table, not the
+    // parser: the IOV member is the named gap, the IIV member is fine.
+    assert_eq!(
+        gaps("COVARIANCE([IIV,IOV],[CL,V])"),
+        vec!["COVARIANCE(IOV, ...)"]
+    );
+    assert_eq!(gaps("COVARIANCE(*,[CL,V])"), vec!["COVARIANCE(IOV, ...)"]);
 }
 
 #[test]

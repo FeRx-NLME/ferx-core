@@ -230,7 +230,7 @@ fn check_feature(feature: &Feature, gaps: &mut Vec<Gap>) {
              searchable edit — `ferx-core::edit` has no add/drop-IOV operation (#1175 P4)",
         ),
         Feature::Covariance { level, .. } => {
-            if *level == VariabilityLevel::Iov {
+            if level.expand().contains(&VariabilityLevel::Iov) {
                 gap(
                     gaps,
                     "COVARIANCE(IOV, ...)".into(),

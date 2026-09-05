@@ -100,7 +100,8 @@ pub enum Feature {
     },
     Covariance {
         optional: bool,
-        level: VariabilityLevel,
+        /// `IIV`, `IOV`, an array of them, or `*`.
+        level: Modes<VariabilityLevel>,
         parameters: Operand,
     },
 }
@@ -427,7 +428,7 @@ impl fmt::Display for Feature {
             } => write!(f, "{parameters},{}", render_modes(effects))?,
             Feature::Covariance {
                 level, parameters, ..
-            } => write!(f, "{},{parameters}", level.label())?,
+            } => write!(f, "{},{parameters}", render_modes(level))?,
         }
         write!(f, ")")
     }
@@ -1183,17 +1184,9 @@ fn build_feature(
         }
         "COVARIANCE" => {
             arity(&ctx, &args, 2, 2, "IIV or IOV, then parameter(s)")?;
-            let level = match &args[0] {
-                Arg::Word(w) => VariabilityLevel::parse(w).ok_or_else(|| {
-                    format!("MFL: in {ctx}: the first argument must be IIV or IOV, found `{w}`")
-                })?,
-                other => {
-                    return Err(format!(
-                        "MFL: in {ctx}: the first argument must be IIV or IOV, found {}",
-                        other.describe()
-                    ))
-                }
-            };
+            // The grammar's first argument is `values | wildcard`, so an
+            // array and `*` are as valid as a bare level.
+            let level = modes_of(&args[0], &ctx)?;
             let parameters = operand_of(&args[1], &ctx, "parameter")?;
             Ok(Feature::Covariance {
                 optional,

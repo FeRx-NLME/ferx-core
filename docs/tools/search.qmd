@@ -86,7 +86,7 @@ comma-separated argument list whose entries are:
 | array | `[FO, ZO]` | several |
 | number | `1` | a count |
 | range | `0..2` | counts, both ends included |
-| wildcard | `*` | every mode the grammar knows (for covariate effects: the four continuous forms) |
+| wildcard | `*` | every mode the grammar knows. In a parameter slot it is feature-specific: `@PK` for `COVARIATE` and `IIV`, `@IIV` for `IOV` and `COVARIANCE`; for covariate effects, the four continuous forms |
 | symbol | `@IIV` | a set resolved against the base model — see [Symbols](#symbols) |
 
 A `?` after the keyword — `COVARIATE?`, `IIV?`, `IOV?`, `COVARIANCE?` — marks
@@ -104,7 +104,7 @@ candidate carries it. `LET(NAME, [...])` defines a symbol referenced as
 | `COVARIATE[?](p, c, e[, op])` | parameter(s), covariate(s), effect(s), operator | `e` = `lin`, `piece_lin`, `exp`, `pow`, `cat`, `cat2`, `custom`; `op` = `*` (default) / `+` |
 | `ALLOMETRY(c[, ref])` | covariate, reference | e.g. `ALLOMETRY(WT, 70)` |
 | `IIV[?](p, e)` / `IOV[?](p, e)` | parameter(s), effect(s) | `EXP`, `ADD`, `PROP`, `LOG`, `RE_LOG` |
-| `COVARIANCE[?](l, p)` | level, parameter(s) | `l` = `IIV` / `IOV` |
+| `COVARIANCE[?](l, p)` | level(s), parameter(s) | `l` = `IIV` / `IOV`, an array of them, or `*` |
 | `DIRECTEFFECT(x)`, `EFFECTCOMP(x)` | type(s) | `LINEAR`, `EMAX`, `SIGMOID`, `STEP`, `LOGLIN` |
 | `INDIRECTEFFECT(x, k)` | type(s), kind | `k` = `PRODUCTION` / `DEGRADATION` |
 | `METABOLITE(x)` | model(s) | `BASIC`, `PSC` |

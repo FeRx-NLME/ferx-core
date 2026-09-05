@@ -401,6 +401,17 @@ fn wildcards_expand_by_slot() {
         r.mfl.render(),
         "IIV?([CL,V1,Q,V2,KA,F],[EXP,ADD,PROP,LOG,RE_LOG])"
     );
+    // The parameter wildcard is feature-specific: `@PK` for IIV (any
+    // parameter can get an η), `@IIV` for IOV and COVARIANCE (only an
+    // η-bearing parameter can carry a κ or sit in an omega block). The
+    // review caught `COVARIANCE(IIV,*)` grounding to the six PK parameters,
+    // three of which have no η.
+    let r = resolved("COVARIANCE(IIV,*)", &ctx());
+    assert_eq!(r.mfl.render(), "COVARIANCE(IIV,[CL,V1,KA])");
+    let r = resolved("IOV?(*,EXP)", &ctx());
+    assert_eq!(r.mfl.render(), "IOV?([CL,V1,KA],EXP)");
+    let r = resolved("COVARIANCE(*,*)", &ctx());
+    assert_eq!(r.mfl.render(), "COVARIANCE([IIV,IOV],[CL,V1,KA])");
     let r = resolved("ABSORPTION(*);LAGTIME(*);TRANSITS(1,*)", &ctx());
     assert_eq!(
         r.mfl.render(),

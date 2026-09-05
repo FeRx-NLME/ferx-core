@@ -79,6 +79,8 @@ fn every_feature_category_round_trips() {
         "IOV?(*,*)",
         "COVARIANCE(IIV,@PK_IIV)",
         "COVARIANCE?(IOV,[CL,V])",
+        "COVARIANCE([IIV,IOV],[CL,V])",
+        "COVARIANCE(*,*)",
         "LET(CONTINUOUS,[WT,AGE])",
         "LET(X,WT)",
     ] {
@@ -285,9 +287,22 @@ fn transits_n_takes_no_depot_option() {
 }
 
 #[test]
-fn covariance_level_must_be_iiv_or_iov() {
+fn covariance_level_is_a_mode_argument() {
+    // The grammar's first argument is `values | wildcard`: a level, an array
+    // of levels, or `*`.
     let e = err("COVARIANCE(RUV,[CL,V])");
-    assert!(e.contains("must be IIV or IOV, found `RUV`"), "{e}");
+    assert!(e.contains("`RUV` is not a known variability level"), "{e}");
+    assert!(e.contains("known: IIV, IOV"), "{e}");
+    assert_eq!(
+        parse("COVARIANCE([IIV],[CL,V])"),
+        parse("COVARIANCE(IIV,[CL,V])")
+    );
+    match parse("COVARIANCE(*,[CL,V])").statements.pop() {
+        Some(Statement::Feature(Feature::Covariance { level, .. })) => {
+            assert_eq!(level.expand(), VariabilityLevel::ALL.to_vec());
+        }
+        other => panic!("unexpected {other:?}"),
+    }
 }
 
 #[test]
