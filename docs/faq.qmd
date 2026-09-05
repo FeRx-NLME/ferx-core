@@ -599,6 +599,13 @@ sub-picosecond span to the sample's own time; the difference is bounded by
 `|f|·1e-12`, far below any solver tolerance. Beyond that gap the sample is read
 off the ordinary integration — same answer, arrived at the usual way.
 
+That `1e-12` is an absolute tolerance, so how many representable times it spans
+depends on where you are on the clock: 563 of them at `t = 8.2 h`, nine at
+`t = 1000 h`, and past `t ≈ 16384 h` — roughly two years — none but the sample
+time itself, because one floating-point step is already wider than the tolerance.
+The rule in the table above does not change there; only the sub-tolerance case
+stops arising, since a gap that small can no longer be represented.
+
 ::: {.callout-note}
 ## Changed in #1226
 

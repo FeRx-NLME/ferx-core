@@ -6581,9 +6581,19 @@ fn integrate_g<T: crate::sens::num::PkNum>(
     // gap that predates #1226 (`t <= t_end` alone does not close it, since an observation
     // *equal* to `t_end` is a legitimate member of that segment's `saveat`).
     //
-    // One-sided, like every other recording site: [`reads_at_break`] never claims a time
-    // *before* the break, so an observation a hair earlier keeps the pre-event state the
-    // preceding segment gave it.
+    // This closure is one-sided — `reads_at_break` never claims a time *before* the break —
+    // but the boundary read as a whole is **not**, and the difference matters when reading
+    // the line above. `record_at` runs first with a *symmetric* window widened by
+    // `slack = 2e-9 * (1 + |q|)`, some 2000× `EVENT_MATCH_TOL`, and writes the same
+    // post-event `u`. That window is the #410 catch-all and predates #1226, so it stays;
+    // what keeps it off the mirror side is `recorded[j]` — the preceding segment's save
+    // point gets there first.
+    //
+    // Measured rather than assumed, because "a mask covers it" is exactly the kind of claim
+    // that is true until it isn't: an observation one ULP *before* a dose reads the pre-dose
+    // 155.847 on both this walk and production, and a record before the first break reads
+    // 0.0 on both. `provider_keeps_an_obs_one_ulp_before_a_dose_pre_dose` pins the first;
+    // without it no provider test placed an observation on the mirror side at all.
     let mut band_scratch: Vec<usize> = Vec::new();
     let mut record_at_break = |q: f64, src: &[T], states: &mut [Vec<T>], recorded: &mut [bool]| {
         obs_index.records_at_break(q, &mut band_scratch);

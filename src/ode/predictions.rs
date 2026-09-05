@@ -129,15 +129,22 @@ pub(crate) fn reads_at_break(t: f64, t_break: f64) -> bool {
 /// The upper bound is **exact**: a time up to `EVENT_MATCH_TOL` past `t_end` belongs to
 /// `t_end`'s own band, on the next iteration, after that break's events are applied.
 ///
-/// That exactness is **hygiene, not the fix**, and this was verified by running the
-/// mutation rather than argued: restoring `t <= t_end + 1e-12` here, in
+/// The **upper** bound's exactness is hygiene rather than the fix, and that was verified by
+/// running the mutation rather than argued: restoring `t <= t_end + 1e-12` here, in
 /// `ode_predictions_with_states`, in `ode_dense_solve_states` or in `ode/ekf.rs` leaves the
-/// whole suite green. These engines have no first-write-wins guard, so the band read at the
-/// next break simply overwrites the pre-event value the wider bound let through — the band
-/// reads are the fix. The exact bound is kept because it stops a record being written twice
-/// and stops the solver being handed a `saveat` point outside its own span; the only place
-/// where an equivalent slack is load-bearing is `sens/ode_provider.rs`, whose `recorded[j]`
-/// mask *is* first-write-wins and which therefore needed an explicit overwrite instead.
+/// whole suite green (re-measured against the current suite: 4228 pass). These engines have
+/// no first-write-wins guard, so the band read at the next break simply overwrites the
+/// pre-event value the wider bound let through — the band reads are the fix. It is kept
+/// because it stops a record being written twice and stops the solver being handed a
+/// `saveat` point outside its own span; the only place where an equivalent slack is
+/// load-bearing is `sens/ode_provider.rs`, whose `recorded[j]` mask *is* first-write-wins
+/// and which therefore needed an explicit overwrite instead.
+///
+/// The **lower** bound is a different matter and is not hygiene: written as a sum it admits
+/// `t == t_start` into this segment's own `saveat` once `t_start + TOL == t_start`, and
+/// `lag_arrival_read_1226::the_band_still_matches_bit_equality_at_large_times` fails on that
+/// spelling. The difference form makes `t > t_start` structural, so the contract holds by
+/// construction rather than by a tolerance being small enough.
 ///
 /// The lower bound is a **difference** for the reason [`reads_at_break`] gives, and that
 /// also keeps it strictly greater than `t_start` at every magnitude: `t - t_start >= TOL`
