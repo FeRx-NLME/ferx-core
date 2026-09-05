@@ -2800,8 +2800,16 @@ fn analytical_model_warns_that_ode_solver_keys_have_no_effect() {
     let w = opts.unsupported_keys_warnings_with_model(&model);
 
     assert_eq!(w.len(), 1, "expected exactly one warning, got: {w:?}");
-    assert!(w[0].contains("ode_reltol"), "got: {}", w[0]);
-    assert!(w[0].contains("`[odes]` block"), "got: {}", w[0]);
+    // Pinned in full, not by `contains`. This string is user-facing — it reaches the
+    // CLI and the fit YAML verbatim — and a `\`-continuation in the source silently
+    // keeps the next line's indentation unless the escape is exactly right, which is
+    // how a run of 18 spaces shipped in review. A substring check cannot see that.
+    assert_eq!(
+        w[0],
+        "fit option `ode_reltol` configures the ODE integrator, but this model has \
+         no `[odes]` block (and no closed-form absorption ODE twin), so it has no \
+         effect."
+    );
     // The method-level phrasing would be the wrong diagnosis here: the key is
     // fine for FOCEI, it is the *model* that never integrates.
     assert!(!w[0].contains("is not used by method"), "got: {}", w[0]);
@@ -2825,6 +2833,14 @@ fn analytical_model_warns_once_per_distinct_ode_solver_key() {
         assert!(
             w.iter().any(|m| m.contains(k)),
             "no notice named `{k}`: {w:?}"
+        );
+    }
+    // No notice may carry a run of whitespace. The exact-message assertion above
+    // pins one key's text; this covers the other five, and any key added later.
+    for m in &w {
+        assert!(
+            !m.contains("  "),
+            "notice contains a run of spaces — check the `\\` line continuations: {m:?}"
         );
     }
 }

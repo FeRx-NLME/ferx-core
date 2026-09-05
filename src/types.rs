@@ -7773,7 +7773,9 @@ impl FitOptions {
                 continue;
             }
             warnings.push(format!(
-                "fit option `{key}` configures the ODE integrator, but this model has no                  `[odes]` block (and no closed-form absorption ODE twin), so it has no effect."
+                "fit option `{key}` configures the ODE integrator, but this model has \
+                 no `[odes]` block (and no closed-form absorption ODE twin), so it \
+                 has no effect."
             ));
         }
         warnings
