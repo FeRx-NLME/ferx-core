@@ -160,6 +160,77 @@ pub(crate) fn subject_integration_start(subject: &Subject) -> f64 {
     }
 }
 
+/// Fill every requested sample time that falls **before the first break** with the seeded
+/// initial state `u`.
+///
+/// Nothing has acted on the system before the first event, so that *is* the state there. Both
+/// engines that read states at caller-supplied times need this and must agree on it: the
+/// dedicated [`ode_dense_solve_states`] (whose `saveat` may hold a CTMM observation recorded
+/// before the first dose) and the #570 one-solve share
+/// [`ode_predictions_and_chz`] (whose `chz_times` may hold a left-truncation `TENTRY` or an
+/// interval-censored `left`). Left as `NaN`, such a node is read as a diverged solve — the CTMM
+/// scorer's finiteness guard rejects the subject, and the TTE likelihood maps it to the `1e20`
+/// sentinel.
+///
+/// **This function exists because the two engines drifted (#1223).** They carried separate
+/// copies of this loop; the dense one grew the fill for the CTMM scorer and the share's kept its
+/// `NaN`, so whether a joint PK-TTE subject was scored or repelled depended on which engine
+/// `try_joint_pktte_shared_solve` admitted it to. Keep it one function: a comment claiming two
+/// copies are twins is what failed last time.
+///
+/// Keyed on the caller's **first break**, not on [`subject_integration_start`]: both engines fold
+/// a terminal horizon (`max(0, …)`) into the timeline before sorting, so a timeline whose every
+/// sample precedes the first dose puts the first break *below* the start, and there the node is
+/// read at the `k = 0` boundary visit instead — the same seeded state by the other mechanism
+/// (#1218). Strict `<` (with the shared `1e-12`), so a time *on* the first break still reads at
+/// that boundary visit, post-dose.
+///
+/// The scan is unconditional rather than a `take_while` over a sorted slice: `chz_times` is
+/// sorted-unique by the share's caller contract, but [`ode_dense_solve_states`] is `pub` and its
+/// `saveat` carries no such guarantee, so an early exit would be wrong there. One shared
+/// implementation is worth more than the micro-optimisation on one of the two callers.
+///
+/// **Preconditions**, asserted in debug because extracting this loop is what removed the local
+/// context that made them self-evident — it used to sit a few lines under the allocation it was
+/// paired with, and now lives thousands of lines from one of its two callers:
+///
+/// * `states.len() == times.len()`. `states` is indexed by an enumerate over `times`, so a short
+///   `states` panics out of bounds naming neither slice, and a long one silently leaves its tail
+///   unconsidered.
+/// * `u.len() == states[i].len()` (i.e. `ode.n_states`) — a short `u` would write rows of the
+///   wrong width for every downstream `st[chz_state]` read.
+/// * `first_break` is finite. Both callers run `timeline_has_non_finite` first and return early;
+///   a `NaN` here would make every comparison false and fill nothing, silently.
+fn fill_prestart_states(
+    times: &[f64],
+    states: &mut [Vec<f64>],
+    first_break: Option<f64>,
+    u: &[f64],
+) {
+    debug_assert_eq!(
+        times.len(),
+        states.len(),
+        "fill_prestart_states: one state row per requested time"
+    );
+    debug_assert!(
+        first_break.is_none_or(|b| b.is_finite()),
+        "fill_prestart_states: callers guard `timeline_has_non_finite` before this point"
+    );
+    let Some(first_break) = first_break else {
+        return;
+    };
+    for (i, &t) in times.iter().enumerate() {
+        if t < first_break - 1e-12 {
+            debug_assert_eq!(
+                u.len(),
+                states[i].len(),
+                "fill_prestart_states: seeded state is not the system's width"
+            );
+            states[i] = u.to_vec();
+        }
+    }
+}
+
 /// Tighten the ODE tolerance used for the SS **fixed-point equilibration** (#867). The value error
 /// of the periodic-SS trough is the one-cycle residual amplified by `1/(1−ρ)`, and a heavily-
 /// accumulating disposition has `ρ → 1`, so the per-cycle integration must be tighter than the
@@ -2571,10 +2642,12 @@ pub fn ode_predictions(
 /// `saveat` (which clamps the step sequence) is untouched; the CHZ states are read
 /// by in-step cubic Hermite interpolation, which does not perturb the steps.
 /// `chz_times` must be **sorted ascending and unique**. Returns `(ipred, chz_states)`
-/// where `chz_states[i]` is the full ODE state at `chz_times[i]` — NaN-filled for any
-/// time before the integration start (matching the dedicated `ode_dense_solve_states`
-/// path, which the TTE NLL maps to its `1e20` sentinel). `ipred` is the raw observable
-/// readout; callers apply `[scaling]` / log-transform exactly as for `ode_predictions`.
+/// where `chz_states[i]` is the full ODE state at `chz_times[i]`. A time before the
+/// integration start reads the **seeded initial state** — nothing has acted on the system
+/// yet — exactly as the dedicated `ode_dense_solve_states` path does (#1223). NaN survives
+/// only where a solve diverged, which the TTE NLL maps to its `1e20` sentinel. `ipred` is
+/// the raw observable readout; callers apply `[scaling]` / log-transform exactly as for
+/// `ode_predictions`.
 ///
 /// Gated on `survival` — its only consumer is the joint PK-TTE fit path, so the
 /// default build neither compiles nor flags it.
@@ -2892,11 +2965,13 @@ fn ode_predictions_with_extra_breaks_and_stats(
     let n = ode.n_states;
     let n_obs = subject.obs_times.len();
     let opts = ode.effective_solver_opts();
-    // #570: full state at each `chz_times[i]`, pre-filled NaN so a soft time before
-    // the integration start (or otherwise uncovered by a segment) reads NaN → the TTE
-    // 1e20 sentinel — exactly as the dedicated `ode_dense_solve_states` path does
-    // today. `chz_times` is sorted-unique (caller contract), enabling the binary
-    // search that maps each segment's soft samples back to their global slot.
+    // #570: full state at each `chz_times[i]`, pre-filled NaN so a soft time no segment
+    // covered is visibly *unset* rather than silently zero. Times before the first break
+    // are overwritten with the seeded state below (#1223), the same fill the dedicated
+    // `ode_dense_solve_states` path applies — so a surviving NaN means one thing on both
+    // engines: a diverged solve, which the TTE NLL maps to its 1e20 sentinel.
+    // `chz_times` is sorted-unique (caller contract), enabling the binary search that
+    // maps each segment's soft samples back to their global slot.
     let mut chz_states: Vec<Vec<f64>> = vec![vec![f64::NAN; n]; chz_times.len()];
 
     // Seed compartments from `init(state) = expr` (zeros when none declared).
@@ -2978,9 +3053,20 @@ fn ode_predictions_with_extra_breaks_and_stats(
     // A non-finite break time makes the whole subject non-finite (#1189) — see
     // [`timeline_has_non_finite`]. `predictions` and `chz_states` are already
     // NaN-prefilled, so returning them here is exactly that outcome.
+    //
+    // Ordered **before** the #1223 fill below, deliberately: on a broken timeline every record
+    // must be repelled, and filling first would hand a pre-start `TENTRY` the seeded state — a
+    // scored `H = 0` — on a subject whose integration never happened.
     if timeline_has_non_finite(&break_times) {
         return (predictions, chz_states);
     }
+
+    // #1223: a soft (CHZ) time earlier than the first break — a left-truncation `TENTRY`, or an
+    // interval-censored `left`, before the subject's first dose or observation. No segment covers
+    // it, so without this it keeps its NaN prefill and the TTE likelihood repels the subject with
+    // its `1e20` sentinel. One function with `ode_dense_solve_states`, which is the point: see
+    // [`fill_prestart_states`] for why there is no second copy to keep in step.
+    fill_prestart_states(chz_times, &mut chz_states, break_times.first().copied(), &u);
 
     // Most-recent system-reset time; `NEG_INFINITY` until the first reset is
     // crossed. Threaded into `integrate_segment` so infusions / zero-order windows
@@ -6695,21 +6781,13 @@ pub fn ode_dense_solve_states(
     let mut seed_applied = vec![false; subject.doses.len()];
     let mut applied = vec![false; subject.doses.len()];
 
-    // Saveat nodes earlier than the first integrated segment (e.g. a discrete-state
-    // CTMM observation recorded before the first dose, whose times the segment
-    // timeline — built from doses/obs_times/pk-only/resets, not `obs_records` — does
-    // not cover). Nothing has acted on the system before the first event, so the state
-    // there is the seeded initial state `u`; fill it so these nodes are not left as
-    // `NaN`, which a downstream finiteness guard (the inhomogeneous CTMM scorer) would
-    // otherwise read as a diverged solve and use to wrongly repel a valid subject. No-op
-    // for the usual case where every saveat is at or after the first event.
-    if let Some(&first_start) = break_times.first() {
-        for (i, &t) in saveat.iter().enumerate() {
-            if t < first_start - 1e-12 {
-                result[i] = u.clone();
-            }
-        }
-    }
+    // Saveat nodes earlier than the first integrated segment (e.g. a discrete-state CTMM
+    // observation recorded before the first dose, whose times the segment timeline — built from
+    // doses/obs_times/pk-only/resets, not `obs_records` — does not cover). No-op for the usual
+    // case where every saveat is at or after the first event. One function with the #570
+    // one-solve share; see [`fill_prestart_states`] for why there is no second copy to keep in
+    // step (#1223).
+    fill_prestart_states(saveat, &mut result, break_times.first().copied(), &u);
 
     // Walk every break as a **left boundary** — bound `0..len`, the walk
     // `ode_predictions` and `ode_predictions_with_states` use (#731) — so a dose
