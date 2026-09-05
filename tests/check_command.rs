@@ -870,3 +870,133 @@ fn compartment_model_still_warns_about_missing_doses() {
     );
     let _ = std::fs::remove_file(&model);
 }
+
+// ── E_OMEGA_INIT_AT_RAIL (#1229) ────────────────────────────────────────────
+
+/// The `[parameters]` block is the only thing that differs between the arms of
+/// the tests below — one `omega ETA_CL` line, everything else the warfarin base.
+fn rail_model_src(omega_line: &str) -> String {
+    format!(
+        "[parameters]\n\
+         \x20 theta TVCL(0.2, 0.001, 10.0)\n\
+         \x20 theta TVV(10.0, 0.1, 500.0)\n\
+         \x20 theta TVKA(1.5, 0.01, 50.0)\n\
+         \x20 {omega_line}\n\
+         \x20 sigma PROP_ERR ~ 0.02 (sd)\n\
+         \n\
+         [individual_parameters]\n\
+         \x20 CL = TVCL * exp(ETA_CL)\n\
+         \x20 V  = TVV\n\
+         \x20 KA = TVKA\n\
+         \n\
+         [structural_model]\n\
+         \x20 pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
+         \n\
+         [error_model]\n\
+         \x20 DV ~ proportional(PROP_ERR)\n"
+    )
+}
+
+/// `ferx check` (no `--data`) lists the code with its block, so the JSON report
+/// carries the machine-readable identifier tooling matches on.
+#[test]
+fn free_zero_omega_is_reported_by_check_without_data() {
+    let model = temp_model("rail_free_zero", &rail_model_src("omega ETA_CL ~ 0.0"));
+    let report = validate_model_file(model.to_str().unwrap(), None);
+    assert!(!report.valid, "{:?}", report.diagnostics);
+    let d = report
+        .diagnostics
+        .iter()
+        .find(|d| d.code == "E_OMEGA_INIT_AT_RAIL")
+        .unwrap_or_else(|| panic!("code absent: {:?}", report.diagnostics));
+    assert_eq!(d.block.as_deref(), Some("parameters"));
+    // `validate_model_file` attaches the owning block's header line, so the
+    // report points at `[parameters]` (line 1 here) rather than nowhere.
+    assert_eq!(d.line, Some(1));
+    assert!(d.message.contains("ETA_CL"), "{}", d.message);
+    assert!(d.suggestion.is_some());
+    // Serialisable as the CLI's `--json` output, which is how the code reaches
+    // a caller at all.
+    let json = serde_json::to_string(&report).expect("report serialises");
+    assert!(json.contains("E_OMEGA_INIT_AT_RAIL"), "{json}");
+    let _ = std::fs::remove_file(&model);
+}
+
+/// The same rejection reaches `fit()` — byte-identical to the diagnostic, and
+/// before any objective evaluation, so this stays a Tier-2 test.
+#[test]
+fn free_zero_omega_fails_fit_with_the_check_message() {
+    let model_path = temp_model("rail_free_zero_fit", &rail_model_src("omega ETA_CL ~ 0.0"));
+    let report = validate_model_file(model_path.to_str().unwrap(), None);
+    let diag_msg = report
+        .diagnostics
+        .iter()
+        .find(|d| d.code == "E_OMEGA_INIT_AT_RAIL")
+        .expect("diagnostic present")
+        .message
+        .clone();
+
+    let model = parse_full_model_file(&model_path).unwrap().model;
+    let pop = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap();
+    let err = fit(&model, &pop, &model.default_params, &FitOptions::default())
+        .expect_err("a free zero variance must be refused before fitting");
+
+    assert_eq!(diag_msg, err);
+    assert!(err.contains("`FIX`"), "{err}");
+    assert!(
+        err.contains("INITIAL ESTIMATE OF VARIANCE CANNOT BE ZERO UNLESS FIXED"),
+        "{err}"
+    );
+    let _ = std::fs::remove_file(&model_path);
+}
+
+/// The differential half that keeps the two tests above from passing on a
+/// blanket rejection: `FIX`-ing the same zero is the supported spelling, and
+/// must still validate *and* reach the optimizer.
+#[test]
+fn fixed_zero_omega_passes_check_and_starts_a_fit() {
+    let model_path = temp_model("rail_fixed_zero", &rail_model_src("omega ETA_CL ~ 0.0 FIX"));
+    let report = validate_model_file(model_path.to_str().unwrap(), None);
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "E_OMEGA_INIT_AT_RAIL"),
+        "{:?}",
+        report.diagnostics
+    );
+
+    // One outer iteration only: this asserts the check does not reject the
+    // model, not that the fit converges.
+    let model = parse_full_model_file(&model_path).unwrap().model;
+    let pop = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap();
+    let options = FitOptions {
+        outer_maxiter: 1,
+        run_covariance_step: false,
+        ..FitOptions::default()
+    };
+    fit(&model, &pop, &model.default_params, &options).expect("`0.0 FIX` must still fit");
+    let _ = std::fs::remove_file(&model_path);
+}
+
+/// `--inits-from-nca` and the ferx-r override path replace the parsed inits, so
+/// `fit()` must judge the vector it is handed. A model whose declaration is
+/// fine is still refused when the caller's initial estimates put the variance
+/// on the rail.
+#[test]
+fn overridden_zero_variance_fails_fit_even_though_the_file_is_fine() {
+    let model_path = temp_model("rail_override", &rail_model_src("omega ETA_CL ~ 0.09"));
+    let report = validate_model_file(model_path.to_str().unwrap(), None);
+    assert!(report.valid, "{:?}", report.diagnostics);
+
+    let model = parse_full_model_file(&model_path).unwrap().model;
+    let pop = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap();
+    let mut inits = model.default_params.clone();
+    inits.omega = ferx_core::OmegaMatrix::from_diagonal(&[0.0], inits.omega.eta_names.clone());
+
+    let err = fit(&model, &pop, &inits, &FitOptions::default())
+        .expect_err("the caller's own initial estimates must be judged, not the file's");
+    assert!(err.contains("ETA_CL"), "{err}");
+    assert!(err.contains("`FIX`"), "{err}");
+    let _ = std::fs::remove_file(&model_path);
+}

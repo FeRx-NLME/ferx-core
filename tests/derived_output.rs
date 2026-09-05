@@ -528,7 +528,7 @@ fn derived_grid_integral_matches_a_subdose_train_for_infusion_into_absorption() 
   theta CL(2.0, 0.1, 50.0)
   theta V(20.0, 1.0, 300.0)
   theta KA(0.6, 0.01, 20.0)
-  omega ETA_CL ~ 0
+  omega ETA_CL ~ 0 FIX
   sigma PROP   ~ 0.01
 
 [individual_parameters]

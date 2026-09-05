@@ -133,6 +133,18 @@ section of the SDLC for the versioning policy).
   no closed-form absorption ODE twin — now warns that the key has no effect, instead of being
   dropped silently. Models that do integrate (including a closed-form transit / inverse-Gaussian
   model reaching its twin) still never warn on these keys, as of #517.
+- **A free variance declared on the optimizer's lower rail is now rejected up front
+  (#1229).** `omega ETA_CL ~ 0.0` without `FIX` — and any free `omega` / `kappa` /
+  `[mixture] omega(k)` variance ≤ 6.1e-6, since all of them pack to `ln(L) ≤ -6` — fails
+  with `E_OMEGA_INIT_AT_RAIL` from `fit()` and from `ferx check`, naming the parameter and
+  the one-keyword fix. A declared zero is regularised to `1e-8`, so its packed start
+  (`-9.21`) sits *below* its own lower bound and is clamped onto the rail; from there the
+  coordinate stays collapsed or runs away to the opposite rail, and the θ estimates move
+  with it (48% off on the #1227 fixture) while `converged` is a coin flip. NM-TRAN refuses
+  the same stream with error 76. Write `~ 0.0 FIX` for no variability, or start at ≥ 1e-5
+  to estimate it. `sigma ~ 0.0` is unaffected — measured to reach the optimum from its own
+  `-8` rail — and `predict()` / `simulate()` are untouched, so a zero-variance fixture
+  used only for prediction still works.
 - **FREM prep refuses a model with a non-Gaussian endpoint (#1199).** `prepare_frem()` /
   `transform_dataset_for_frem()` return `E_FREM_NON_GAUSSIAN_ENDPOINT` instead of writing
   a dataset from the Gaussian rows alone; run the FREM step on the PK model without the

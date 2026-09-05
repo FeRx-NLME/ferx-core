@@ -1113,6 +1113,14 @@ fn fit_inner(
     let option_diags = check_model_options(model, options);
     first_error(&option_diags)?;
 
+    // A free variance whose initial value packs onto the optimizer's own lower
+    // rail (#1229). Evaluated on `init_params`, not `model.default_params`:
+    // `--inits-from-nca` and the ferx-r override path both replace the parsed
+    // inits, and it is the vector the optimizer actually starts from that gets
+    // clamped. Placed here — before every population-dependent check — because
+    // the predicate needs no data and fails identically for every method.
+    first_error(&check_variance_init_rails(init_params))?;
+
     // Pre-compute n_params (uses init_params, available before chain runs):
     // the coordinates the outer optimizer actually searches — neither FIX nor
     // a block + diagonal Ω structural zero (`CompiledModel::free_packed_dim`).

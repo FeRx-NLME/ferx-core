@@ -3294,6 +3294,236 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     diags
 }
 
+/// The eigenvalue floor `OmegaMatrix::from_matrix_with_mask` adds when the
+/// declared matrix is not positive-definite (`crate::types`, the `min_eig`
+/// arm), and therefore where a variance declared as exactly `0.0` ends up:
+/// **the declared zero is not carried through the parse**. Measured on #1229 —
+/// `omega ETA_CL ~ 0.0` yields `omega.matrix[(0,0)] == 1e-8` and
+/// `omega.chol[(0,0)] == 1e-4`, identical with and without `FIX`. A declared
+/// `1e-8` is indistinguishable from a declared `0.0` after the parse, which is
+/// why `check_variance_init_rails` keys its "add `FIX`" message variant on
+/// *this floor* rather than on a zero it cannot see.
+const OMEGA_REGULARIZATION_FLOOR: f64 = 1e-8;
+
+/// The largest **variance** whose packed coordinate still lands on the `-6`
+/// lower rail: `ln(√v) ≤ -6 ⇔ v ≤ e⁻¹²`. Quoted in the tiny-non-zero message so
+/// the user is told where the cliff is, not just that they are past it.
+const RAIL_VARIANCE: f64 = 6.144_212_353_328_21e-6;
+
+/// Which declaration a flagged variance coordinate came from — the keyword the
+/// user has to go and edit.
+enum VarianceDecl {
+    /// A `Ω` diagonal: `omega NAME ~ v` (or a `block_omega` diagonal).
+    Omega,
+    /// An `Ω_IOV` diagonal: `kappa NAME ~ v`.
+    Kappa,
+    /// A `[mixture]` per-class Ω override (#977), carrying its 1-based class.
+    MixtureOmega(usize),
+}
+
+impl VarianceDecl {
+    /// How the declaration is spelled in the model file.
+    fn keyword(&self) -> String {
+        match self {
+            VarianceDecl::Omega => "omega".to_string(),
+            VarianceDecl::Kappa => "kappa".to_string(),
+            VarianceDecl::MixtureOmega(class) => format!("[mixture] omega({class})"),
+        }
+    }
+}
+
+/// The declaration behind each packed coordinate that holds **a variance the
+/// optimizer can clamp against a collapse rail** — exactly the `OmegaDiagonal`
+/// coordinates — in [`pack_params`](crate::estimation::parameterization::pack_params)
+/// order. `None` for θ, Σ, Ω off-diagonals and the `block_sigma` ρ slots.
+///
+/// This is `check_variance_init_rails`'s **only** filter, deliberately: an
+/// earlier version also tested `coordinate_kinds` in the loop, and the two
+/// gates covered for each other so completely that deleting either left every
+/// test green — the scope pin excluding Σ could not fail. One gate, so a
+/// mutation to it reddens.
+///
+/// `coordinate_kinds` decides *whether* a
+/// coordinate qualifies; the segment boundaries below only decide *which
+/// keyword* to print, and they are re-derived the way `packed_len` derives them
+/// because the packed vector carries no provenance. All three live arms
+/// (`omega`, `kappa`, `[mixture] omega(2)`) are pinned by a sibling test
+/// asserting that keyword in the message, so a layout change that moves a
+/// segment reddens rather than silently mislabelling a declaration.
+fn variance_decl_by_coordinate(template: &ModelParameters) -> Vec<Option<VarianceDecl>> {
+    use crate::estimation::parameterization::{
+        coordinate_kinds, omega_packed_len, PackedCoordKind,
+    };
+
+    let n_theta = template.theta.len();
+    let n_omega = omega_packed_len(template.omega.dim(), template.omega.diagonal);
+    let n_sigma = template.sigma.values.len();
+    let n_iov = template
+        .omega_iov
+        .as_ref()
+        .map_or(0, |m| omega_packed_len(m.dim(), m.diagonal));
+    let iov_end = n_theta + n_omega + n_sigma + n_iov;
+
+    coordinate_kinds(template)
+        .iter()
+        .enumerate()
+        .map(|(i, kind)| {
+            if *kind != PackedCoordKind::OmegaDiagonal {
+                return None;
+            }
+            if i < n_theta + n_omega {
+                Some(VarianceDecl::Omega)
+            } else if i < iov_end {
+                Some(VarianceDecl::Kappa)
+            } else {
+                // A `[mixture]` Ω override (#977): one packed scalar each, in
+                // `omega_override_addr` order, immediately after the Ω_IOV
+                // segment. `map` rather than `expect` so a hand-built
+                // `ModelParameters` whose addresses disagree with its packed
+                // length degrades to no diagnostic instead of panicking.
+                template
+                    .mixture
+                    .as_ref()
+                    .and_then(|mix| mix.omega_override_addr.get(i - iov_end))
+                    .map(|&(class_0based, _)| VarianceDecl::MixtureOmega(class_0based + 1))
+            }
+        })
+        .collect()
+}
+
+/// Reject a **free** variance whose initial value packs onto (or below) the
+/// optimizer's own lower rail, where it is clamped and cannot be estimated
+/// (#1229).
+///
+/// Data-independent: the predicate is a property of the initial parameters
+/// alone, so `ferx check model.ferx` reports it without a `--data` file and
+/// `fit()` refuses before the first objective evaluation.
+///
+/// # The predicate
+///
+/// `packed[i] <= lower[i]` on a **free** Ω / Ω_IOV / mixture-Ω **diagonal**
+/// coordinate, computed from the real
+/// [`pack_params`](crate::estimation::parameterization::pack_params) /
+/// [`compute_bounds`](crate::estimation::parameterization::compute_bounds) /
+/// `packed_fixed_mask` rather than from the declared variance. Three reasons it
+/// has to be the packed value:
+///
+/// * A `block_omega` diagonal's `L_ii` depends on the block's off-diagonals, so
+///   the declared variance is not the coordinate that gets clamped.
+/// * The parse regularises a non-PD Ω, so a declared `0.0` arrives as
+///   `OMEGA_REGULARIZATION_FLOOR` and is *not* readable as a zero.
+/// * `compute_bounds` pins a `FIX`-ed coordinate with `lower == upper == packed`
+///   — so `packed <= lower` is **true for every `FIX`-ed variance**, and the
+///   `packed_fixed_mask` consult is what keeps `omega ETA_CL ~ 0.0 FIX` (the
+///   documented way to declare no variability) from being rejected.
+///
+/// # Scope
+///
+/// **Σ is deliberately excluded**, measured rather than assumed: a free
+/// `sigma PROP_ERR ~ 0.0 (sd)` packs to `ln(1e-10) = -23`, is clamped onto its
+/// own `-8` rail, and *recovers the base optimum exactly* on the #1229 warfarin
+/// arm. The Σ rail does not trap, so folding Σ in "for symmetry" would reject
+/// a declaration that works.
+///
+/// # Why an error rather than a warning
+///
+/// NM-TRAN rejects the equivalent stream outright (error 76, `INITIAL ESTIMATE
+/// OF VARIANCE CANNOT BE ZERO UNLESS FIXED`), and on the #1229 warfarin arm
+/// every ferx *default* path fails from this start: `foce`×`bobyqa` and
+/// `foce`×`lbfgs` collapse at the `-6` rail (TVV 10× off), `saem` collapses,
+/// `gn` never moves, and #1227's one-subject fixture ran away to `+6`
+/// (ω² ≈ 1.6e5) with materially wrong θ. Two combinations do escape it —
+/// `foce`×`slsqp` and `focei`×`lbfgs` — so the message does not claim
+/// impossibility. The case against a warning is `focei`×`bobyqa`, which
+/// half-collapses (ω² 1e-5, σ 15% high) while reporting `converged: true` and
+/// hitting no guard: a warning nobody reads is no better than today's post-hoc
+/// `parameter_at_runaway_guard`, which fires after the damage and blames the
+/// data.
+pub(crate) fn check_variance_init_rails(init_params: &ModelParameters) -> Vec<Diagnostic> {
+    use crate::estimation::parameterization::{
+        compute_bounds, coordinate_names, coordinate_values, pack_params, packed_fixed_mask,
+    };
+
+    let packed = pack_params(init_params);
+    let bounds = compute_bounds(init_params);
+    let fixed = packed_fixed_mask(init_params);
+    let names = coordinate_names(init_params);
+    let values = coordinate_values(init_params);
+    let decls = variance_decl_by_coordinate(init_params);
+
+    let mut diags = Vec::new();
+    for i in 0..packed.len() {
+        // `decls` is the scope gate — `Some` exactly on the Ω / Ω_IOV /
+        // mixture-Ω diagonals — and it is the only one, so a mutation to it
+        // reddens a test rather than being covered by a second filter.
+        //
+        // A coordinate any one of the parallel vectors is too short to describe
+        // cannot be judged. `ModelParameters` is public and every producer in
+        // the crate keeps these in lockstep, so that arm only guards a
+        // hand-built one against a panic here.
+        let (Some(&p), Some(&lo), Some(&is_fixed), Some(Some(decl))) = (
+            packed.get(i),
+            bounds.lower.get(i),
+            fixed.get(i),
+            decls.get(i),
+        ) else {
+            continue;
+        };
+        if is_fixed || p > lo {
+            continue;
+        }
+        let name = names.get(i).cloned().unwrap_or_else(|| format!("#{i}"));
+        let variance = values.get(i).copied().unwrap_or(f64::NAN);
+        let keyword = decl.keyword();
+
+        // Two variants. The declared zero is unrecoverable after the parse (see
+        // `OMEGA_REGULARIZATION_FLOOR`), so "the user wrote 0.0" is inferred
+        // from the variance having landed at or below that floor — which is
+        // also exactly the range in which the variance is numerically zero,
+        // whatever was typed.
+        let (message, suggestion) = if variance <= OMEGA_REGULARIZATION_FLOOR {
+            (
+                format!(
+                    "`{keyword} {name} ~ 0.0` declares no variability but is not `FIX`-ed, so \
+                     the optimizer is asked to estimate a variance from a start it cannot \
+                     leave: a zero variance is regularised to {OMEGA_REGULARIZATION_FLOOR:e}, \
+                     whose packed coordinate ln(L) = {p:.2} lies below its own lower bound of \
+                     {lo:.1}, and the start is clamped onto that rail. From there the \
+                     coordinate stays collapsed or walks to the opposite rail (variance ≈ \
+                     1.6e5), and the population estimates move with it. Add `FIX` if {name} \
+                     should carry no variability, or give it a real starting variance \
+                     (≥ 1e-5). NONMEM rejects the same declaration outright: `INITIAL \
+                     ESTIMATE OF VARIANCE CANNOT BE ZERO UNLESS FIXED`."
+                ),
+                format!("write `{keyword} {name} ~ 0.0 FIX`, or start it at 0.09"),
+            )
+        } else {
+            (
+                format!(
+                    "initial variance {variance:e} for {name} (`{keyword} {name} ~ \
+                     {variance:e}`) packs to ln(L) = {p:.2}, at or below the optimizer's lower \
+                     bound of {lo:.1} — every variance ≤ {RAIL_VARIANCE:.2e} lands there — so \
+                     the start is clamped onto the rail and the coordinate cannot be estimated \
+                     from it. Start {name} at ≥ 1e-5, or `FIX` it if it should carry no \
+                     variability. NONMEM accepts this start but collapses it to ≈ 1e-9, which \
+                     is the same no-variability model spelled less clearly."
+                ),
+                format!("start it at ≥ 1e-5, or write `{keyword} {name} ~ 0.0 FIX`"),
+            )
+        };
+        diags.push(
+            Diagnostic::error("E_OMEGA_INIT_AT_RAIL", message)
+                .with_block("parameters")
+                .with_suggestion(suggestion),
+        );
+    }
+    diags
+}
+
+#[cfg(test)]
+#[path = "tests/variance_init_rail_tests.rs"]
+mod variance_init_rail_tests;
+
 /// Data-dependent *warning*-level checks: malformed steady-state rows, EVID=3/4
 /// resets under an SDE model, and a negative typical-value lag time. These are
 /// non-fatal — `fit()` pushes their messages into `FitResult.warnings` and
@@ -4230,6 +4460,13 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
     //    clean check and a fit agree. Uses the parsed `[fit_options]`, mirroring
     //    what the CLI fit path (`run_model_with_data`) passes to `fit()`.
     diags.extend(check_model_options(&parsed.model, &parsed.fit_options));
+
+    // 2b-bis. Free variances whose initial value lands on the optimizer's lower
+    //    rail (#1229). Data-independent, so `ferx check model.ferx` reports it
+    //    without `--data`. The fit path evaluates the same predicate on its
+    //    *actual* `init_params`; here the parsed inits are all there is, which
+    //    is exactly what the model file declares.
+    diags.extend(check_variance_init_rails(&parsed.model.default_params));
 
     // 2c. Experimental-feature notices (data-independent): these depend only on
     //    the model, so they surface from `ferx check model.ferx` even without a
