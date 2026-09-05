@@ -1000,3 +1000,76 @@ fn overridden_zero_variance_fails_fit_even_though_the_file_is_fine() {
     assert!(err.contains("`FIX`"), "{err}");
     let _ = std::fs::remove_file(&model_path);
 }
+
+/// What the evaluation-only exemption concedes, through the real path — because
+/// the obvious justification for the exemption is **false**.
+///
+/// "Nothing optimises at `maxiter = 0`, so nothing is clamped" is wrong:
+/// `evaluate_at_initial_params` calls `clamp_to_bounds` before it evaluates,
+/// exactly like the optimizing paths. What actually distinguishes an eval-only
+/// run is that it produces one OFV and stops, so a clamped start is never
+/// *held* there by a search — the stickiness is the defect, not the clamp.
+///
+/// So the exemption has a price, and it is measured here rather than described:
+/// a declared free `~ 0.0` (stored as the `1e-8` regularisation floor) is
+/// evaluated at the rail variance `exp(-12) ≈ 6.14e-6`, 614× higher, with no
+/// diagnostic. That is pre-existing and not specific to Ω — a
+/// `theta TVCL(0.05, 0.1, 10.0)` starts at `0.1` the same way — so it is
+/// tracked as a follow-up rather than fixed inside a rail check.
+///
+/// This goes through `fit()` rather than composing `pack_params` /
+/// `clamp_to_bounds` by hand: composing them would assert that
+/// `clamp_to_bounds` clamps, which is a tautology, and would stay green if
+/// `evaluate_at_initial_params` ever stopped calling it — the exact change that
+/// would make this comment wrong.
+#[test]
+fn an_eval_only_fit_reports_the_rail_not_the_declared_zero() {
+    let model_path = temp_model("rail_eval_only", &rail_model_src("omega ETA_CL ~ 0.0"));
+    let model = parse_full_model_file(&model_path).unwrap().model;
+    let pop = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap();
+    let declared = model.default_params.omega.matrix[(0, 0)];
+    assert_eq!(
+        declared, 1e-8,
+        "premise: a declared zero is stored as the regularisation floor"
+    );
+
+    let eval_only = FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        ..FitOptions::default()
+    };
+    let evaluated = fit(&model, &pop, &model.default_params, &eval_only)
+        .expect("an eval-only run must not be judged by the rail check");
+    assert_eq!(
+        evaluated.omega[(0, 0)],
+        (-12.0f64).exp(),
+        "an eval-only run still clamps: it reports the rail variance, not `1e-8`"
+    );
+    assert!(
+        evaluated.ofv.is_finite(),
+        "and the OFV it produced is a real number: {}",
+        evaluated.ofv
+    );
+
+    // `FIX` is the remedy the diagnostic recommends, so it must not have this
+    // problem: pinning makes `lower == packed`, so the clamp is a no-op.
+    let fixed_path = temp_model(
+        "rail_eval_only_fix",
+        &rail_model_src("omega ETA_CL ~ 0.0 FIX"),
+    );
+    let fixed = parse_full_model_file(&fixed_path).unwrap().model;
+    let fixed_eval = fit(&fixed, &pop, &fixed.default_params, &eval_only).expect("`0.0 FIX` eval");
+    let fixed_at = fixed_eval.omega[(0, 0)];
+    // Not bit-exact: the pin is on the *packed* coordinate, so the value still
+    // round-trips variance → chol → ln → exp → chol², costing ~2 ULP. The point
+    // is that it stays at `1e-8` rather than moving 614× to the rail, so the
+    // bound is relative and tight enough to exclude `exp(-12)` by ~9 orders.
+    assert!(
+        (fixed_at - declared).abs() < declared * 1e-12,
+        "a FIX-ed zero is pinned at its packed start, so it is evaluated as \
+         declared: {fixed_at} vs {declared}"
+    );
+
+    let _ = std::fs::remove_file(&model_path);
+    let _ = std::fs::remove_file(&fixed_path);
+}

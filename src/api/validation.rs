@@ -3313,8 +3313,21 @@ const OMEGA_REGULARIZATION_FLOOR: f64 = 1e-8;
 /// Will an outer optimizer actually **search** the packed vector on this run?
 ///
 /// `check_variance_init_rails` exists because the optimizer clamps a start onto
-/// the rail and cannot leave it. When nothing optimises, nothing is clamped and
-/// the rejection has no basis — so the check is scoped to runs that search.
+/// the rail and **cannot leave it**. The stickiness is the defect, not the
+/// clamp: an eval-only run clamps too — `evaluate_at_initial_params` calls
+/// `clamp_to_bounds` (`estimation/outer_optimizer.rs`) before it evaluates —
+/// but it produces one OFV and stops, so there is no search to be trapped. So
+/// the check is scoped to runs that search.
+///
+/// What that scoping *concedes* is measured, not assumed: on an eval-only run a
+/// declared free `omega ETA_CL ~ 0.0` (stored as the `1e-8` floor above, packed
+/// at `ln(1e-4) = -9.21`) is clamped to `-6` and evaluated at `exp(-12) ≈
+/// 6.14e-6` — 614× the declared value, silently. That is pre-existing behaviour
+/// shared with θ (a `theta TVCL(0.05, 0.1, 10.0)` starts at `0.1`) and is not
+/// specific to Ω; it is tracked as a follow-up rather than fixed here, because
+/// the fix is a general "start outside its own box" diagnostic and not a rail
+/// check. `omega ETA_CL ~ 0.0 FIX` is unaffected — the pin makes
+/// `lower == packed`, so the clamp is a no-op and the `1e-8` survives.
 ///
 /// `outer_maxiter == 0` is NONMEM `MAXEVAL=0`: `optimize_population`
 /// short-circuits to `evaluate_at_initial_params` *before any optimizer is

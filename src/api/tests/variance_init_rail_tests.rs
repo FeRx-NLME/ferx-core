@@ -587,7 +587,8 @@ fn evaluation_only_run_is_not_judged() {
     };
     assert!(
         check_variance_init_rails(p, &eval_only).is_empty(),
-        "nothing optimises at outer_maxiter = 0, so nothing is clamped: {:#?}",
+        "nothing searches at outer_maxiter = 0, so no start can be trapped on \
+         the rail: {:#?}",
         check_variance_init_rails(p, &eval_only)
     );
 }

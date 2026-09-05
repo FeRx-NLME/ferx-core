@@ -264,11 +264,28 @@ block), not to raise a variance that is already fine.
 
 Two things are deliberately outside the check. **Sigma**: a free
 `sigma ~ 0.0 (sd)` is clamped onto its own `-8` rail and still reaches the
-optimum, so it is not rejected. **Runs where nothing optimises**: with
-`maxiter = 0` (NONMEM `MAXEVAL=0`) no start is ever clamped, so a zero variance
-is accepted — which is what lets `ferx gam --no-fit`, and any evaluation at
-fixed parameters, keep working. `saem`, `imp`, `impmap` and `bayes` carry their
-own iteration counts and are checked regardless of `maxiter`.
+optimum, so it is not rejected. **Runs where nothing searches**: with
+`maxiter = 0` (NONMEM `MAXEVAL=0`) a zero variance is accepted — which is what
+lets `ferx gam --no-fit`, and any evaluation at fixed parameters, keep working.
+`saem`, `imp`, `impmap` and `bayes` carry their own iteration counts and are
+checked regardless of `maxiter`.
+
+::: {.callout-warning}
+## `maxiter = 0` still clamps the start
+
+An evaluation-only run clamps the packed start to the bounds exactly like a
+fitting run does — what it does not do is *hold* it there through a search, and
+that stickiness is what the check is about. The consequence is worth knowing:
+with `maxiter = 0`, a free `omega ETA_CL ~ 0.0` is **evaluated at the rail
+variance `exp(-12) ≈ 6.14e-6`**, not at the `1e-8` it is stored as, and nothing
+says so. Write `omega ETA_CL ~ 0.0 FIX` if you want the objective evaluated at
+the variance you declared — a fixed coordinate is pinned at its own packed
+start, so the clamp cannot move it.
+
+This is not specific to variances: a `theta TVCL(0.05, 0.1, 10.0)` starts at
+`0.1`, silently, on every run. A general diagnostic for a start outside its own
+bounds is tracked separately.
+:::
 
 `predict()` and `simulate()` never apply the check, so a simulation-only fixture
 with a free zero keeps working — but `ferx check` reports what `fit()` would
