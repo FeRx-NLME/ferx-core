@@ -6545,8 +6545,11 @@ fn integrate_g<T: crate::sens::num::PkNum>(
     // and solver save point, replacing the per-query linear scan over all
     // observations (PR #438 review). The precise `obs_time_matches` test still
     // gates each candidate; the sort only narrows the search window.
-    let mut sorted_obs: Vec<(f64, usize)> = subject.obs_times.iter().copied().zip(0..).collect();
-    sorted_obs.sort_by(|a, b| a.0.total_cmp(&b.0));
+    // The shared index (`ode::predictions::RecordIndex`), not a private copy: its
+    // `records_at_break` is the one spelling of the #1226 band rule, and the ODE engines
+    // resolve their boundary records through the same type.
+    let obs_index = crate::ode::predictions::RecordIndex::new(&subject.obs_times);
+    let sorted_obs = obs_index.sorted();
     // Record `src` at every not-yet-recorded observation whose time matches `q`.
     let record_at = |q: f64, src: &[T], states: &mut [Vec<T>], recorded: &mut [bool]| {
         // Candidates lie within the relative tolerance band; widen slightly for the
@@ -6561,6 +6564,42 @@ fn integrate_g<T: crate::sens::num::PkNum>(
                 states[j].copy_from_slice(src);
                 recorded[j] = true;
             }
+        }
+    };
+
+    // Record `src` at every observation in the break `q`'s recording band, **overwriting**
+    // an earlier write (#1226).
+    //
+    // The overwrite is the whole point, and it is what makes this walk agree with
+    // production rather than only with itself. `record_at` above is first-write-wins, and
+    // the previous segment's final save point is `t_end` — the very break being visited
+    // here — so its *pre*-event state reaches a band member first and `recorded[j]` then
+    // locks it in. Production has no such guard: its segment `saveat` writes and the next
+    // break's boundary read overwrites, so the post-event state is what an observation at
+    // or just after a dose gets. Measured before this: an observation exactly at an
+    // interior dose read 155.85 here against production's 1155.85 — a whole dose, and a
+    // gap that predates #1226 (`t <= t_end` alone does not close it, since an observation
+    // *equal* to `t_end` is a legitimate member of that segment's `saveat`).
+    //
+    // This closure is one-sided — `reads_at_break` never claims a time *before* the break —
+    // but the boundary read as a whole is **not**, and the difference matters when reading
+    // the line above. `record_at` runs first with a *symmetric* window widened by
+    // `slack = 2e-9 * (1 + |q|)`, some 2000× `EVENT_MATCH_TOL`, and writes the same
+    // post-event `u`. That window is the #410 catch-all and predates #1226, so it stays;
+    // what keeps it off the mirror side is `recorded[j]` — the preceding segment's save
+    // point gets there first.
+    //
+    // Measured rather than assumed, because "a mask covers it" is exactly the kind of claim
+    // that is true until it isn't: an observation one ULP *before* a dose reads the pre-dose
+    // 155.847 on both this walk and production, and a record before the first break reads
+    // 0.0 on both. `provider_keeps_an_obs_one_ulp_before_a_dose_pre_dose` pins the first;
+    // without it no provider test placed an observation on the mirror side at all.
+    let mut band_scratch: Vec<usize> = Vec::new();
+    let mut record_at_break = |q: f64, src: &[T], states: &mut [Vec<T>], recorded: &mut [bool]| {
+        obs_index.records_at_break(q, &mut band_scratch);
+        for &j in &band_scratch {
+            states[j].copy_from_slice(src);
+            recorded[j] = true;
         }
     };
 
@@ -6692,9 +6731,21 @@ fn integrate_g<T: crate::sens::num::PkNum>(
     // the static `integrate_g` twin) (#472 review round 2 #1).
     let mut reset_floor = f64::NEG_INFINITY;
 
-    for w in 0..(break_times.len() - 1) {
+    // Walk every break as a left boundary — bound `0..len`, not the old `0..len - 1`, so a
+    // dose or observation landing on the **final** break is applied and read there. This
+    // mirrors `ode_predictions`' `0..len` + `k + 1 < len` shape (#731), and it has to: with
+    // the old bound the last break was only ever a segment *end*, never a `t_start`, so
+    // neither the dose application below nor `record_at_break` ran at it.
+    //
+    // `t_last = max(obs_times)` is itself a break, so a subject whose last dose lands on its
+    // last observation — dose and sample both at `t = 24` — dedups to one final break and
+    // that dose was never applied: the walk recorded the observation from the preceding
+    // segment's `t_end` save point, pre-dose, while `ode_predictions` applied it and read
+    // post-dose. Measured 3.79 here against production's 1003.79 — the same gradient-vs-
+    // objective divergence #1226 fixes one break earlier, and it is what
+    // `provider_reads_a_dose_landing_on_the_last_observation` pins.
+    for w in 0..break_times.len() {
         let t_start = break_times[w];
-        let t_end = break_times[w + 1];
 
         // EVID 3/4 reset: re-seed the state to the initial conditions at this time, *before*
         // the same-time dose (EVID=4 = reset + dose), and record the reset time so an
@@ -6739,6 +6790,11 @@ fn integrate_g<T: crate::sens::num::PkNum>(
         // coincides with it can be value-equal but bit-different — match by
         // tolerance, not bit pattern (issue #410).
         record_at(t_start, &u, &mut states, &mut recorded);
+        // …and force the post-event state onto this break's whole recording band, over
+        // any pre-event write the previous segment's `t_end` save point already made
+        // (#1226). Ordered after the tolerant catch-all above so that one still covers a
+        // record the solver's save points missed, on either side.
+        record_at_break(t_start, &u, &mut states, &mut recorded);
 
         // Last effective dose at or before the segment start (the TAD anchor). Shared by the
         // zero-order saltation below and the RHS forcing — one fold over `subject.doses` per
@@ -6783,16 +6839,28 @@ fn integrate_g<T: crate::sens::num::PkNum>(
             }
         }
 
+        // The final break has no successor: its reset, dose and boundary read happened
+        // above, and there is nothing left to integrate.
+        let Some(&t_end) = break_times.get(w + 1) else {
+            continue;
+        };
         if (t_end - t_start).abs() < 1e-15 {
             continue;
         }
 
         // Observation times in (t_start, t_end]; always include t_end so `u`
         // advances for the next segment.
+        //
+        // #1226: the upper bound is **exact**. It used to be `t <= t_end + 1e-12`, which
+        // handed an observation inside `t_end`'s own match band to *this* segment's save
+        // points — pre-event — and the boundary `record_at` on the next iteration then
+        // found `recorded[j]` already set, so the pre-dose write won. `record_at` is
+        // already tolerance-based, so removing the slack here is the whole change: the
+        // band member is now recorded at the break, post-dose, matching production.
         let mut saveat: Vec<f64> = subject
             .obs_times
             .iter()
-            .filter(|&&t| t > t_start + 1e-12 && t <= t_end + 1e-12)
+            .filter(|&&t| t > t_start + 1e-12 && t <= t_end)
             .cloned()
             .collect();
         if saveat.last().map_or(true, |&l| (l - t_end).abs() > 1e-12) {

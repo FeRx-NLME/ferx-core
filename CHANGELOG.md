@@ -56,6 +56,27 @@ section of the SDLC for the versioning policy).
   `ferx_fit(settings = list(nn_l2 = ..., nn_smooth = ...))`.
 
 ### Fixed
+- **An observation within `1e-12` after a lagged dose arrival is no longer read pre-dose
+  (#1226).** With a compartment or route lag whose arrival lands a few ULP short of a
+  sample time — reachable whenever `ALAG` is estimated or covariate-scaled, since an
+  optimizer walks it continuously — the objective, `sdtab` and the dense grid behind the
+  joint PK-TTE hazard, `[derived]` integrals and `simulate()` recorded that sample from the
+  state *before* the dose was applied, so a subject read drug-free at a sample taken after
+  its own dose (45.38 against NONMEM's 145.38 on the committed anchor — a whole 100 mg, on
+  the OFV and not only a diagnostic). The mirror sign was wrong in the opposite direction on
+  one path: the shared PK-TTE solve's cumulative-hazard boundary read used a symmetric
+  tolerance, so a hazard time just *before* an arrival was overwritten with the post-dose
+  state. Recording is now one-sided everywhere — at or up to `1e-12` after a break reads
+  post-event, anything before it reads pre-event — matching NONMEM's record ordering, which
+  is anchored on both signs (`nonmem_anchor/lag_arrival_read_{before,after}_advan{1,13}`).
+  The event-driven predictor and the analytical closed forms were always correct and are
+  unchanged. The same fix closes three pre-existing gaps found while making it: an
+  observation landing exactly on an interior dose read pre-dose on the analytic-sensitivity
+  walk while the predictor read post-dose; a dose landing on a subject's **last** observation
+  was never applied by that walk at all (the FOCEI gradient short by a whole dose while the
+  objective had it); and an observation coinciding with a dose break was assimilated **twice**
+  by the SDE/EKF filter, returning an over-confident `p_obs` at that record and a distorted
+  covariance for the rest of the subject.
 - **A joint PK-TTE subject whose `TENTRY` (or interval-censored left bound) falls at or
   before its first record no longer scores the `1e20` sentinel (#1223).** The one-solve
   shared path left such a time's ODE state `NaN`, which the TTE likelihood reads as a
