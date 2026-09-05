@@ -147,6 +147,64 @@ jobs:
           fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}
 
+  # #344. Every other test job in this file builds with `--profile ci-test` or
+  # `--profile ci-fast`, and both `inherits = "release"` — so `debug-assertions`
+  # is OFF and all 177 `debug_assert!` guards in the crate compile to nothing.
+  # They are invariant checks that CI was not running.
+  #
+  # That was not theoretical. An off-by-one in `compute_max_stack`
+  # (`src/parser/model_parser.rs`) tripped its own `debug_assert!` for any
+  # expression containing an `if`, and four lib tests panicked under the dev
+  # profile while CI stayed green through the whole thing (fixed in #342; this
+  # job closes the blind spot that hid it).
+  #
+  # Deliberately a SEPARATE job rather than flipping `ci-test`: that profile
+  # exists so the population-fit tests run at release speed, and this repo is
+  # compile-bound (93% LLVM, #969/#971), so the cheap way to get the guards
+  # executed is one extra UNOPTIMISED build — not a second optimised one.
+  # Measured locally on the dev profile: 80s of tests for `--features ci` (4035
+  # tests) and 198s for `--features ci,markov,nn` (4366), all green — turning the
+  # guards on surfaced no latent failure, so this job starts green.
+  #
+  # The commands live in `tools/preflight.sh` (group `debug-assertions`) for the
+  # same reason as `Check`/`Clippy`/`Format` (#1157) — one list, so the local gate
+  # and the CI gate cannot drift. It is the one group that is opt-in locally: it
+  # runs a suite rather than a compile, so a no-argument `tools/preflight.sh`
+  # stays a pre-push habit and this job is where it has to be green.
+  #
+  # Note that "no `--profile` flag" is an invariant held by ABSENCE, and this job
+  # would be a no-op again — silently, with every test green — if a
+  # `[profile.dev] debug-assertions = false` or a
+  # `CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false` ever appeared. So the group's
+  # commands arm `debug_assertion_canary` (`src/lib_tests.rs`) via
+  # `env FERX_REQUIRE_DEBUG_ASSERTIONS=1`, and that canary fails the run if
+  # `debug_assert!` turns out to compile to nothing. Do NOT set that variable at
+  # the workflow or job level: every other job legitimately runs with the guards
+  # off, and arming it there would fail them for doing the right thing.
+  debug-assertions:
+    name: Tests (debug-assertions)
+    runs-on: ubuntu-latest
+    # Stable, not the workflow-level nightly: `--features ci,markov,nn` has no
+    # nightly-only code, and stable's rustc holds for ~6 weeks against nightly's
+    # daily bump — `rust-cache` keys on `rustc -vV`, so nightly here would cold-
+    # rebuild the dep graph every day for no gate. Same reasoning as the coverage
+    # jobs. `tools/preflight.sh` honours an inherited `RUSTUP_TOOLCHAIN`.
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install stable toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Own key: the dev profile shares no artifacts with the `ci` (check /
+          # clippy) caches or with the instrumented coverage ones.
+          shared-key: ci-debug-assertions
+
+      - name: cargo test --lib with debug-assertions on (via tools/preflight.sh)
+        run: tools/preflight.sh debug-assertions
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
