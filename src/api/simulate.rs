@@ -1010,11 +1010,19 @@ fn simulate_inner_with_draw<R: rand::Rng>(
 }
 
 /// Options controlling `simulate_with_uncertainty()`.
-#[derive(Debug, Clone)]
+///
+/// Derives `Default` so an out-of-crate caller (the R wrapper) can build one
+/// with `..Default::default()` and stay source-compatible when a field is
+/// added here (#529). Note that the two counts default to `0`, which draws
+/// nothing and returns an empty row set — a caller spreading the default is
+/// expected to set both explicitly.
+#[derive(Debug, Clone, Default)]
 pub struct SimulateUncertaintyOptions {
     /// Number of parameter sets to draw from the uncertainty distribution.
+    /// Defaults to `0`; set it explicitly when spreading `Default::default()`.
     pub n_uncertainty_draws: usize,
     /// Number of eta/eps replicates simulated *per* parameter draw.
+    /// Defaults to `0`; set it explicitly when spreading `Default::default()`.
     pub n_sim_per_draw: usize,
     /// How to draw the parameter sets — asymptotic MVN or SIR resamples.
     pub method: crate::estimation::uncertainty_samples::UncertaintyMethod,
