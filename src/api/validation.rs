@@ -3415,10 +3415,24 @@ impl VarianceDecl {
     /// Is this a `block_omega` / `block_kappa` diagonal, where `L_ii` carries
     /// the off-diagonals and no per-eta declared variance describes it?
     fn is_block_element(&self) -> bool {
-        matches!(
-            self,
-            VarianceDecl::Omega { block: true } | VarianceDecl::Kappa { block: true }
-        )
+        self.block_keyword().is_some()
+    }
+
+    /// How the enclosing block is spelled in the model file, for the arm that
+    /// reports a near-singular block. `None` for anything that is not a block
+    /// diagonal.
+    ///
+    /// Ω_IOV's block spelling is `block_kappa`, not `block_omega`: both take
+    /// the same message arm — the cause and the remedy are identical — but
+    /// quoting the wrong keyword names a block the reader did not write and
+    /// cannot find. Pinned by the sibling `near_singular_block_*` tests, which
+    /// assert the keyword each way round.
+    fn block_keyword(&self) -> Option<&'static str> {
+        match self {
+            VarianceDecl::Omega { block: true } => Some("block_omega"),
+            VarianceDecl::Kappa { block: true } => Some("block_kappa"),
+            _ => None,
+        }
     }
 }
 
@@ -3592,7 +3606,8 @@ pub(crate) fn check_variance_init_rails(
         compute_bounds, coordinate_names, pack_params, packed_fixed_mask,
     };
 
-    // Nothing is clamped when nothing optimises — see `outer_search_runs`.
+    // A clamped start is only trapped when something searches — an eval-only
+    // run clamps too, it just does not hold. See `outer_search_runs`.
     if !outer_search_runs(options) {
         return Vec::new();
     }
@@ -3646,14 +3661,14 @@ pub(crate) fn check_variance_init_rails(
         // Every message describes the coordinate the optimizer clamps, never a
         // declaration the check cannot see. Three shapes, in decreasing
         // confidence about what the user actually wrote.
-        let (message, suggestion) = if decl.is_block_element() {
+        let (message, suggestion) = if let Some(block_kw) = decl.block_keyword() {
             // A `block_omega` diagonal. The declared variances may all be
             // perfectly ordinary — it is the *correlation* that drives `L_ii`
             // to zero — so naming a per-eta variance here would point away from
             // the fix.
             (
                 format!(
-                    "the `block_omega` Cholesky diagonal for {name} starts at L = {l:.3e} \
+                    "the `{block_kw}` Cholesky diagonal for {name} starts at L = {l:.3e} \
                      (L² = {rail_variance:.3e}), which packs to ln(L) = {p:.2} — at or below \
                      the optimizer's lower bound of {lo:.1}, where the start is clamped and \
                      cannot be estimated from. In a block it is the **correlations** that do \

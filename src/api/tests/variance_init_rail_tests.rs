@@ -373,6 +373,14 @@ fn near_singular_block_flags_the_factor_not_the_declared_variance() {
         msg.contains("correlation"),
         "a near-singular block must be reported as a correlation problem: {msg}"
     );
+    // The keyword the user has to go and edit. `block_omega` and `block_kappa`
+    // share this message arm, so the keyword is the *only* thing distinguishing
+    // them — and every other assertion here passes with either one, which is how
+    // a hardcoded `block_omega` survived into the kappa message unnoticed.
+    assert!(
+        msg.contains("`block_omega`") && !msg.contains("block_kappa"),
+        "a block_omega must be named as one, not as the other block keyword: {msg}"
+    );
     // Whatever quantity *is* quoted must be the one compared against the rail.
     let l22 = p.omega.chol[(1, 1)];
     assert!(
@@ -790,6 +798,15 @@ fn near_singular_block_kappa_is_reported_as_a_correlation_problem() {
         !msg.contains("≥ 1e-5"),
         "KAPPA_V is declared at 0.09; telling the user to raise it above 1e-5 \
          points away from the fix: {msg}"
+    );
+    // The regression this pair exists to catch, found by reading the diff after
+    // the tests were already green: `block_omega` and `block_kappa` share this
+    // message arm, and the arm hardcoded `block_omega`. Every assertion above
+    // passed on a message telling a `block_kappa` user to go and fix a
+    // `block_omega` — a block that appears nowhere in their file.
+    assert!(
+        msg.contains("`block_kappa`") && !msg.contains("block_omega"),
+        "a block_kappa must be named as one, not as `block_omega`: {msg}"
     );
 }
 
