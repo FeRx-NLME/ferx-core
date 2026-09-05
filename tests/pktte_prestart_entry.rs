@@ -45,6 +45,14 @@ const MODEL: &str = "nonmem_anchor/ss_chz_drug_fit.ferx";
 
 const HEADER: &str = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,SS,II,TENTRY\n";
 
+/// Measured on this branch with the fix in place. Pinned to `1e-6` relative: the bit-equality
+/// legs below are what test the fix, and this is the guard against both sides of such a pair
+/// drifting together to some other objective.
+const A1_OFV: f64 = 24.417862686939927;
+/// Measured the same way. Unchanged by the fix — A4 declines the share and runs the dedicated
+/// engine, which already filled the pre-start node.
+const A4_OFV: f64 = 16.97903614243416;
+
 /// A1: dose at 10, PK observation at 12, exact event at 20 with `TENTRY = entry`.
 /// The first record is the dose, so any `0 < entry < 10` is pre-start.
 fn arm_a1(entry: f64) -> String {
@@ -193,11 +201,3 @@ fn mdv_one_row_before_the_first_dose_changes_nothing() {
         );
     }
 }
-
-/// Measured on this branch with the fix in place (`24.417862686939927`). Pinned to `1e-6`
-/// relative: the equality legs above are what test the fix, and this is the guard against
-/// both of them drifting together to some other objective.
-const A1_OFV: f64 = 24.417862686939927;
-/// Measured the same way (`16.97903614243416`). Unchanged by the fix — this arm declines
-/// the share and runs the dedicated engine, which already filled the pre-start node.
-const A4_OFV: f64 = 16.97903614243416;

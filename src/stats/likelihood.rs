@@ -4050,7 +4050,13 @@ mod tests {
                     cmt: 2,
                 }],
             ),
-            // `left = 0.0` specifically, because the two bounds are gated differently:
+            // `left = 0.0` specifically, because the two bounds are gated differently. The
+            // value also has to stay `0.0` for a second reason: it makes this arm's
+            // `predict_survival(&[0.0])` a zero-*maximum* grid, which is #1218's exact shape, so
+            // the arm doubles as free regression coverage for PR #1222's fix. Changing it to
+            // some other pre-start value (5.0 or 8.0, matching its siblings) would look like a
+            // tidy-up and would silently drop that.
+            //
             // `try_joint_pktte_shared_solve` pushes `entry_time` only `if *entry_time > 0.0`
             // ("no truncation"), but pushes `left`/`right` unconditionally. So on this subject
             // a `left = 0` *is* a pre-start CHZ time that reaches the share while a
@@ -4824,6 +4830,67 @@ mod tests {
             try_joint_pktte_shared_solve(&model, &subject, &p.theta, &[0.0]).is_some(),
             "a time-dependent hazard on an autonomous PK block must take the \
              #570 shared-solve path"
+        );
+    }
+
+    /// An `EVID=3/4` reset **declines** the share — the routing that
+    /// `tests/pktte_prestart_entry.rs` is built on, and which nothing pinned until #1223.
+    ///
+    /// That file's whole structure is "A1 goes through the share, A4 (the same subject plus a
+    /// reset) goes through the dedicated engine, both must agree". Admit reset subjects to the
+    /// share and A4 silently becomes a second run of A1's engine: every assertion there still
+    /// passes, both pinned OFVs still match, and its own guard —
+    /// `(A4_OFV - A1_OFV).abs() > 1e-3` — does not notice, because it shows the two *subjects*
+    /// differ, not that they took different *engines*. The "both engines agree" claim would be
+    /// false while reading green.
+    ///
+    /// The share's own precondition is why the decline is required, not merely conventional:
+    /// it computes predictions via `ode_predictions_and_chz`, i.e. the no-TV `ode_predictions`
+    /// with a single `t = 0` PK snapshot, and a reset needs the event-driven walker.
+    ///
+    /// Measured, not argued: with `|| subject.has_resets()` disabled in the admission list, this
+    /// test is the **only** one that fails. The other three admission tests stay green (they
+    /// cover model time and a time-dependent hazard), and so do all three tests in
+    /// `tests/pktte_prestart_entry.rs` — A4 included, whose whole premise is that it runs the
+    /// dedicated engine.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn joint_pktte_share_rejects_a_subject_with_resets() {
+        use crate::types::{EventType, ObsRecord};
+
+        let model = joint_pktte_ode_model();
+        let p = &model.default_params;
+        let records = vec![ObsRecord::Event {
+            time: 20.0,
+            event_type: EventType::Exact,
+            entry_time: 5.0,
+            cmt: 2,
+        }];
+
+        // Without the reset the subject qualifies — the straddle that makes the next
+        // assertion about the reset rather than about something else in the admission list.
+        let subject = late_start_joint_subject(records.clone());
+        assert!(
+            !subject.has_resets(),
+            "control subject must carry no resets"
+        );
+        assert!(
+            try_joint_pktte_shared_solve(&model, &subject, &p.theta, &[0.0]).is_some(),
+            "the reset-free subject must qualify for the share, or this test proves nothing \
+             about resets"
+        );
+
+        // With one, it must not.
+        let mut reset_subject = late_start_joint_subject(records);
+        reset_subject.reset_times = vec![15.0];
+        assert!(
+            reset_subject.has_resets(),
+            "fixture must actually carry a reset"
+        );
+        assert!(
+            try_joint_pktte_shared_solve(&model, &reset_subject, &p.theta, &[0.0]).is_none(),
+            "an EVID=3/4 reset must decline the #570 share — the share takes a single t=0 PK \
+             snapshot, and a reset needs the event-driven walker"
         );
     }
 

@@ -189,17 +189,43 @@ pub(crate) fn subject_integration_start(subject: &Subject) -> f64 {
 /// sorted-unique by the share's caller contract, but [`ode_dense_solve_states`] is `pub` and its
 /// `saveat` carries no such guarantee, so an early exit would be wrong there. One shared
 /// implementation is worth more than the micro-optimisation on one of the two callers.
+///
+/// **Preconditions**, asserted in debug because extracting this loop is what removed the local
+/// context that made them self-evident — it used to sit a few lines under the allocation it was
+/// paired with, and now lives thousands of lines from one of its two callers:
+///
+/// * `states.len() == times.len()`. `states` is indexed by an enumerate over `times`, so a short
+///   `states` panics out of bounds naming neither slice, and a long one silently leaves its tail
+///   unconsidered.
+/// * `u.len() == states[i].len()` (i.e. `ode.n_states`) — a short `u` would write rows of the
+///   wrong width for every downstream `st[chz_state]` read.
+/// * `first_break` is finite. Both callers run `timeline_has_non_finite` first and return early;
+///   a `NaN` here would make every comparison false and fill nothing, silently.
 fn fill_prestart_states(
     times: &[f64],
     states: &mut [Vec<f64>],
     first_break: Option<f64>,
     u: &[f64],
 ) {
+    debug_assert_eq!(
+        times.len(),
+        states.len(),
+        "fill_prestart_states: one state row per requested time"
+    );
+    debug_assert!(
+        first_break.is_none_or(|b| b.is_finite()),
+        "fill_prestart_states: callers guard `timeline_has_non_finite` before this point"
+    );
     let Some(first_break) = first_break else {
         return;
     };
     for (i, &t) in times.iter().enumerate() {
         if t < first_break - 1e-12 {
+            debug_assert_eq!(
+                u.len(),
+                states[i].len(),
+                "fill_prestart_states: seeded state is not the system's width"
+            );
             states[i] = u.to_vec();
         }
     }
@@ -3038,8 +3064,8 @@ fn ode_predictions_with_extra_breaks_and_stats(
     // #1223: a soft (CHZ) time earlier than the first break — a left-truncation `TENTRY`, or an
     // interval-censored `left`, before the subject's first dose or observation. No segment covers
     // it, so without this it keeps its NaN prefill and the TTE likelihood repels the subject with
-    // its `1e20` sentinel. Shared verbatim with `ode_dense_solve_states`, which is the point:
-    // see [`fill_prestart_states`] for why this is one function and not two copies.
+    // its `1e20` sentinel. One function with `ode_dense_solve_states`, which is the point: see
+    // [`fill_prestart_states`] for why there is no second copy to keep in step.
     fill_prestart_states(chz_times, &mut chz_states, break_times.first().copied(), &u);
 
     // Most-recent system-reset time; `NEG_INFINITY` until the first reset is
@@ -6758,9 +6784,9 @@ pub fn ode_dense_solve_states(
     // Saveat nodes earlier than the first integrated segment (e.g. a discrete-state CTMM
     // observation recorded before the first dose, whose times the segment timeline — built from
     // doses/obs_times/pk-only/resets, not `obs_records` — does not cover). No-op for the usual
-    // case where every saveat is at or after the first event. Shared verbatim with the #570
-    // one-solve share; see [`fill_prestart_states`] for why this is one function and not two
-    // copies (#1223).
+    // case where every saveat is at or after the first event. One function with the #570
+    // one-solve share; see [`fill_prestart_states`] for why there is no second copy to keep in
+    // step (#1223).
     fill_prestart_states(saveat, &mut result, break_times.first().copied(), &u);
 
     // Walk every break as a **left boundary** — bound `0..len`, the walk

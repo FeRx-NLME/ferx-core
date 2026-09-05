@@ -243,6 +243,15 @@ These run nightly via `slow-tests.yml` and on any push to `main` that touches es
 > say which is which; and (c) a **differential pair straddling the boundary** — a pre-start time
 > must contribute nothing while a post-start one must move the objective, since either half alone
 > is satisfied by an implementation that ignores the field entirely.
+>
+> **This is not a licence to skip an anchor that is merely awkward to build**, and the
+> counter-example lives in the same subsystem: `ss_chz_r5_drug_lag` (#1220) anchors a mid-record
+> `SS=1` dose whose lag exceeds `II`, on a drug-driven hazard — an object that reads as
+> unanchorable, because NONMEM's own SS routine returns `+INF` on the augmented system and no
+> *shifted* train reproduces a clamped seed phase. It was anchored anyway, by dropping `ALAG`
+> from the NONMEM side entirely and placing a plain pulse train at the ferx side's lagged
+> **arrivals**. Reach for this exception only when the quantity has no NONMEM spelling at all —
+> not when the construction is hard to find.
 
 **An oracle — NONMEM anchor, ODE twin, or FD parity — must keep every side of the object under test non-degenerate.** A
 single-dose dataset cannot test a dose event's *incoming* side: the state is zero
