@@ -121,7 +121,57 @@ jobs:
         # binaries and the `src/` bodies are `#[cfg]`ed out, so the only fits that
         # exercise the DCM regularizers end to end would run in no CI job at all
         # (the per-PR job that passes `nn` has no `slow-tests`, by design).
+        #
+        # `ferx-core/nn` is NOT here — it moved to the `slow-tests-nn` job below. It was
+        # added to this job by #1215, which switched on `tests/vi_dcm_omega_recovery.rs`
+        # (`#![cfg(feature = "nn")]`, 5 DCM VI/FOCEI fits) in CI for the first time. Those
+        # fits consumed the whole 120-minute budget, so the other ~165 test binaries after
+        # them never ran — five nightlies in a row covered less than they appeared to.
+        # Splitting the feature into its own job means an over-budget NN fit costs the NN
+        # job and nothing else.
+        #
+        # `timeout` is what makes that visible. A job killed by `timeout-minutes` is
+        # reported by GitHub as **`cancelled`, not `failure`** — it does not read as a red
+        # test, which is why the five timed-out nightlies looked like infra blips. Exceeding
+        # the inner budget here exits 124 and fails the step loudly instead.
         run: |
-          cargo test --workspace --exclude docs-lint --no-default-features \
-            --features ferx-core/ci,ferx-core/survival,ferx-core/nn,ferx-core/slow-tests,ferx-tools/slow-tests \
-            --profile ci-test --no-fail-fast
+          timeout --signal=INT --kill-after=2m 100m \
+            cargo test --workspace --exclude docs-lint --no-default-features \
+              --features ferx-core/ci,ferx-core/survival,ferx-core/slow-tests,ferx-tools/slow-tests \
+              --profile ci-test --no-fail-fast \
+            || { code=$?; \
+                 if [ "$code" -eq 124 ]; then \
+                   echo "::error::slow-tests exceeded its 100m budget - a test is hanging or the suite outgrew the runner"; \
+                 fi; \
+                 exit "$code"; }
+
+  # The `nn`-gated Tier-3 fits, isolated so they cannot spend the main suite's budget.
+  #
+  # Same command and same `--exclude` list as above (the `slow_test_path_filter` guard reads
+  # both), plus `ferx-core/nn`. Kept as a full `--workspace` run rather than an enumerated
+  # list of NN test targets on purpose: a new `#![cfg(feature = "nn")]` test file would be
+  # silently uncovered by a list, which is the failure mode #949 already cost this repo once.
+  # The duplicated non-NN work is the price, and it is a nightly.
+  slow-tests-nn:
+    name: Slow regression tests (nn)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install nightly toolchain
+        run: rustup toolchain install nightly --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-slow-nn
+      - name: cargo test (ci-test profile + slow-tests + nn)
+        run: |
+          timeout --signal=INT --kill-after=2m 100m \
+            cargo test --workspace --exclude docs-lint --no-default-features \
+              --features ferx-core/ci,ferx-core/survival,ferx-core/nn,ferx-core/slow-tests,ferx-tools/slow-tests \
+              --profile ci-test --no-fail-fast \
+            || { code=$?; \
+                 if [ "$code" -eq 124 ]; then \
+                   echo "::error::slow-tests (nn) exceeded its 100m budget - see FeRx-NLME/ferx-core#1239"; \
+                 fi; \
+                 exit "$code"; }
