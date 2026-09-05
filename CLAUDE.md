@@ -227,6 +227,23 @@ These run nightly via `slow-tests.yml` and on any push to `main` that touches es
 > added when that tool is available in the environment; its absence does not block the closed-form
 > + reduction validation above.
 
+> **Exception — a hazard time outside the span NONMEM can express.** The `TENTRY` column has no
+> NONMEM analogue for an **ODE-accumulated** (drug-driven) hazard: NONMEM has no left-truncation
+> record for `$DES`-integrated `A(chz)`, and its own steady-state routine cannot be handed the
+> augmented system at all (`nonmem_anchor/ss_chz_r1_*`, a measured negative result). So a change
+> to how a hazard time **at or before the subject's first record** is scored (#1223) has no
+> equivalent run to anchor against — the quantity is defined by where ferx starts integrating,
+> which is the very thing NONMEM spells differently (it integrates from the first record of any
+> `EVID`; ferx from the first dose or scored observation). Validate these with: (a) an **exact
+> hand-computed value** rather than a second engine — before the first event nothing has acted on
+> the system, so `H = 0` and `h = h(u₀)` are closed forms, not tolerances; (b) **agreement across
+> every production caller** of the quantity (the #570 shared solve, `ode_cumhaz_hazard`, and
+> `predict_survival`), asserted per caller so the failure names which one drifted — noting that
+> callers routing to the same engine are callers, **not** independent geometries, and the PR must
+> say which is which; and (c) a **differential pair straddling the boundary** — a pre-start time
+> must contribute nothing while a post-start one must move the objective, since either half alone
+> is satisfied by an implementation that ignores the field entirely.
+
 **An oracle — NONMEM anchor, ODE twin, or FD parity — must keep every side of the object under test non-degenerate.** A
 single-dose dataset cannot test a dose event's *incoming* side: the state is zero
 before a first arrival, so `g(x⁻) = 0` and any error there cancels rather than
