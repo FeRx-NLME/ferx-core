@@ -34,6 +34,10 @@ serde = { version = "1", features = ["derive"] }
 # decimals. Caught by `search_runner_end_to_end`: -200.28784144636055 read back
 # as -200.28784144636057.
 serde_json = { version = "1", features = ["float_roundtrip"] }
+# The `.ferxsearch` search configuration (#1179) is TOML — the space a search
+# runs over is configuration, not model, so it lives in its own file rather
+# than a `.ferx` block. Only the `search::config` module reads it.
+toml = "1"
 
 # `search.lock` staleness only: `kill(pid, 0)` is how a search directory whose
 # owner was hard-killed is taken over instead of needing a manual delete —
