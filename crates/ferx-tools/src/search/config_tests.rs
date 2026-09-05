@@ -59,7 +59,7 @@ fn the_issue_example_loads_and_maps_onto_the_runner() {
     assert!(cfg.data.as_ref().unwrap().ends_with("two_cpt_oral_cov.csv"));
     assert_eq!(cfg.mfl.features().count(), 4);
     assert!(cfg.mfl_source.contains("COVARIATE?(@IIV"));
-    assert_eq!(cfg.rank.kind, RankType::Bic);
+    assert_eq!(cfg.rank.kind, Some(RankType::Bic));
     assert_eq!(cfg.rank.cutoff, Some(3.84));
     assert_eq!(cfg.run.threads, Some(8));
     assert_eq!(cfg.run.retries, 3);

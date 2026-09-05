@@ -1,0 +1,35 @@
+# Base model for the PsN scm anchor (#1180): the same model as base.mod.
+
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV1(40.0, 1.0, 500.0)
+  theta TVQ(8.0, 0.1, 100.0)
+  theta TVV2(80.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+
+  omega ETA_CL ~ 0.15
+  omega ETA_V1 ~ 0.15
+
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+  KA = TVKA
+
+[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+
+[covariates]
+  WT   continuous
+  CRCL continuous
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 500
+  covariance = false

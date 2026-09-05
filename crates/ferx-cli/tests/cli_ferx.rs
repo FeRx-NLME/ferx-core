@@ -385,3 +385,231 @@ fn the_bootstrap_subcommand_does_not_shadow_a_plain_fit() {
         .expect("run ferx check");
     assert!(out.status.success());
 }
+
+// ── ferx covsearch / ferx allometry (#1180) ─────────────────────────────────
+
+#[test]
+fn covsearch_help_lists_the_search_options() {
+    let out = ferx()
+        .args(["covsearch", "--help"])
+        .output()
+        .expect("run ferx covsearch --help");
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    for word in [
+        "p_forward",
+        "p_backward",
+        "scm-forward-then-backward",
+        "adaptive_scope_reduction",
+        "--directory",
+        "--resume",
+    ] {
+        assert!(stdout.contains(word), "help does not mention {word}");
+    }
+}
+
+#[test]
+fn covsearch_without_a_file_is_a_usage_error_and_unknown_flags_are_refused() {
+    let out = ferx().args(["covsearch"]).output().expect("run");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Usage: ferx covsearch"));
+
+    let out = ferx()
+        .args([
+            "covsearch",
+            "examples/two_cpt_oral_cov.ferxsearch",
+            "--samples",
+            "3",
+        ])
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown flag: --samples"));
+}
+
+#[test]
+fn covsearch_refuses_a_file_meant_for_another_tool_before_reading_data() {
+    // The shipped example ranks on BIC (a modelsearch file); covsearch
+    // refuses it by name — and before loading the dataset, so the refusal
+    // is immediate.
+    let out = ferx()
+        .args(["covsearch", "examples/two_cpt_oral_cov.ferxsearch"])
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("[rank] type = \"bic\": covsearch selects by the likelihood-ratio test"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Data:"), "{stderr}");
+}
+
+const ONE_CPT_WT: &str = "[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[covariates]
+  WT continuous
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = foce
+  maxiter    = 0
+  covariance = false
+  checkpoint = false
+";
+
+/// A whole search from the command line, on evaluations (`maxiter = 0`) so
+/// it is seconds: the base model, one forward step over two candidates that
+/// cannot be significant, and the files a user reads afterwards.
+#[test]
+fn covsearch_runs_a_search_and_writes_its_files() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("wt.ferx"), ONE_CPT_WT).unwrap();
+    let data = repo_root().join("data/two_cpt_oral_cov.csv");
+    let config = format!(
+        "base = \"wt.ferx\"\ndata = \"{}\"\n[space]\nmfl = \"COVARIATE?([CL,V], WT, pow)\"\n\
+         [covsearch]\nalgorithm = \"scm-forward\"\n\
+         [strictness]\nrequire_converged = false\nreject_init_stall = false\n\
+         reject_on_boundary = false\n[run]\nretries = 0\nthreads = 2\n",
+        data.display()
+    );
+    std::fs::write(dir.path().join("wt.ferxsearch"), config).unwrap();
+
+    let out = ferx()
+        .args([
+            "covsearch",
+            &dir.path().join("wt.ferxsearch").to_string_lossy(),
+        ])
+        .output()
+        .expect("run ferx covsearch");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stderr: {stderr}\nstdout: {stdout}");
+    assert!(
+        stderr.contains("Step 1 (forward): fitting 2 candidates"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("Step 1 (forward): nothing accepted"),
+        "{stderr}"
+    );
+    assert!(stdout.contains("CL-WT-power"), "{stdout}");
+    assert!(stdout.contains("not significant"), "{stdout}");
+    assert!(stdout.contains("Final model: OFV"), "{stdout}");
+
+    let run = dir.path().join("wt-covsearch");
+    assert!(run.join("steps.csv").exists(), "{stderr}");
+    assert!(run.join("final.ferx").exists());
+    assert!(run.join("final-fit.yaml").exists());
+    assert!(run.join("base/candidates.csv").exists());
+    assert!(run.join("forward-1/candidates.csv").exists());
+    let steps = std::fs::read_to_string(run.join("steps.csv")).unwrap();
+    assert_eq!(steps.lines().count(), 3, "{steps}");
+}
+
+#[test]
+fn allometry_help_and_usage() {
+    let out = ferx()
+        .args(["allometry", "--help"])
+        .output()
+        .expect("run ferx allometry --help");
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    for word in [
+        "--covariate",
+        "--reference",
+        "--estimate",
+        "--parameters",
+        "ALLOMETRY(WT, 70)",
+    ] {
+        assert!(stdout.contains(word), "help does not mention {word}");
+    }
+    let out = ferx().args(["allometry"]).output().expect("run");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Usage: ferx allometry"));
+}
+
+#[test]
+fn allometry_scales_a_model_from_the_command_line() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let model = "[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV1(40.0, 1.0, 500.0)
+  theta TVQ(8.0, 0.1, 100.0)
+  theta TVV2(80.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  omega ETA_CL ~ 0.15
+  omega ETA_V1 ~ 0.15
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+  KA = TVKA
+
+[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+
+[covariates]
+  WT continuous
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 0
+  covariance = false
+  checkpoint = false
+";
+    let path = dir.path().join("two_cpt.ferx");
+    std::fs::write(&path, model).unwrap();
+    let data = repo_root().join("data/two_cpt_oral_cov.csv");
+    let out = ferx()
+        .args([
+            "allometry",
+            &path.to_string_lossy(),
+            "--data",
+            &data.to_string_lossy(),
+            "--retries",
+            "0",
+            "--threads",
+            "2",
+        ])
+        .output()
+        .expect("run ferx allometry");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stderr: {stderr}\nstdout: {stdout}");
+    for line in [
+        "CL ~ WT power(center = 70, fix = 0.75)",
+        "Q ~ WT power(center = 70, fix = 0.75)",
+        "V1 ~ WT power(center = 70, fix = 1)",
+        "V2 ~ WT power(center = 70, fix = 1)",
+        "dOFV (base - allometric)",
+    ] {
+        assert!(stdout.contains(line), "missing `{line}` in:\n{stdout}");
+    }
+    let written = std::fs::read_to_string(dir.path().join("two_cpt-allometric.ferx")).unwrap();
+    assert!(written.contains("[covariate_model]"));
+    assert!(written.contains("V1 ~ WT power(center = 70, fix = 1.0)"));
+}

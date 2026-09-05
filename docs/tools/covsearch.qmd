@@ -1,0 +1,294 @@
+---
+pagetitle: "Covariate search"
+description-meta: "Stepwise covariate modelling in ferx — PsN scm forward / forward-then-backward and Pharmpy covsearch — driven by a .ferxsearch file, with every candidate's convergence status beside its ΔOFV, plus allometric scaling."
+---
+
+# Covariate search
+
+> **Maturity: alpha** — see [Feature Maturity](../maturity.qmd) for what this means.
+
+`ferx covsearch` is stepwise covariate modelling: PsN's `scm` in its forward
+and forward-then-backward forms, Pharmpy's `covsearch`. It is the first
+model-space search tool of `ferx-tools`, and the one the
+[`[covariate_model]` block](../model-file/covariate-model.qmd) was built for —
+one relation per line, so a candidate is the parent model plus one line, and
+the rest of the file is invariant.
+
+```bash
+ferx covsearch warfarin.ferxsearch --directory warfarin-covsearch --threads 8
+```
+
+What to search over comes from a [`.ferxsearch` file](search.qmd). The
+`COVARIATE?(...)` statements of its `[space]` are the candidate effects,
+`COVARIATE(...)` without the `?` forces an effect into every candidate, and a
+`[covsearch]` section sets the algorithm and its levels:
+
+```toml
+base = "warfarin.ferx"
+data = "warfarin.csv"
+
+[space]
+mfl = """
+COVARIATE?(@IIV, @CONTINUOUS, [pow,lin]); COVARIATE?(@IIV, @CATEGORICAL, cat)
+COVARIATE(CL, CRCL, pow)             # forced: in the base model before the search
+"""
+
+[covsearch]
+algorithm  = "scm-forward-then-backward"   # or "scm-forward"
+p_forward  = 0.01
+p_backward = 0.001
+max_steps  = 10                            # omit for unlimited
+adaptive_scope_reduction = false           # SCM+
+
+[strictness]
+require_converged = true
+
+[run]
+retries   = 2
+threads   = 8
+cache_dir = "warfarin-covsearch"
+```
+
+| key | default | meaning |
+|---|---|---|
+| `algorithm` | `scm-forward-then-backward` | forward selection, optionally followed by backward elimination |
+| `p_forward` | `0.01` | the level a forward step's winner must reach |
+| `p_backward` | `0.001` | the level at which a removal is *refused*: an effect whose removal is significant here stays in |
+| `max_steps` | unlimited | most steps per phase (Pharmpy's `-1`) |
+| `adaptive_scope_reduction` | `false` | SCM+, below |
+
+The defaults are Pharmpy's. `[rank]` does not apply — covsearch selects by
+the likelihood-ratio test on the OFV and refuses a file that asks for a BIC
+or a `cutoff`, rather than ranking one way and reporting another.
+
+## The algorithm
+
+**Forward.** From the base model, every remaining candidate effect is added
+on its own and the candidates are fitted in parallel. Each child is compared
+with its parent by the likelihood-ratio test: `ΔOFV = OFV_parent −
+OFV_child` against `χ²(df)`, where `df` is the number of free parameters the
+child added — read off the fits, so a `FIX`ed θ or a categorical whose level
+count only the data knows is counted as it was estimated. Among the children
+that pass the strictness gate *and* are significant at `p_forward`, the one
+with the lowest OFV — the largest drop — becomes the next parent, and every
+other form on that (parameter, covariate) pair leaves the candidate list. The
+phase ends when no child is significant, the list is empty, or `max_steps` is
+reached. This is the selection rule of PsN's `gof_pval` and of Pharmpy's
+`modelrank(rank_type='lrt')`.
+
+**Backward.** From the forward phase's final model, every effect the forward
+phase added is removed on its own. The removal with the smallest OFV increase
+is taken if that increase is not significant at `p_backward`; the phase ends
+when every remaining effect is. Forced effects and relations the base model
+already declared are never candidates for removal.
+
+**Between steps** each child starts from its parent's final estimates
+(Pharmpy's `update_initial_estimates`); the new relation's θ takes the
+block's PsN default init and bounds for its form.
+
+### Adaptive scope reduction (SCM+)
+
+With `adaptive_scope_reduction = true`, every effect a forward step fits and
+finds insignificant is *stashed*: it is not fitted again at later steps,
+which is where the saving is. Once the ordinary forward phase is exhausted,
+the stash — minus anything on a pair the model has since acquired — is
+searched again with the same rule, so an effect that only shows once another
+is in the model still gets its chance. The extra pass is reported as its own
+phase, `adaptive`, in the step table.
+
+### What the effects become
+
+An MFL effect is one `[covariate_model]` line, centred as PsN's `scm`
+centres it and with the θ left to the block's defaults, which are PsN's
+inits and bounds verbatim:
+
+| MFL | `[covariate_model]` line |
+|---|---|
+| `COVARIATE?(CL, WT, pow)` | `CL ~ WT power(center = median)` |
+| `COVARIATE?(CL, WT, lin)` | `CL ~ WT linear(center = median)` |
+| `COVARIATE?(CL, WT, exp)` | `CL ~ WT exponential(center = median)` |
+| `COVARIATE?(CL, WT, piece_lin)` | `CL ~ WT hockey(breakpoint = median)` |
+| `COVARIATE?(CL, SEX, cat)` | `CL ~ SEX categorical(ref = mode)` |
+
+`cat2`, `custom` and the `+` operator have no block spelling and are refused
+by the [coverage check](search.qmd#coverage) when the file is loaded.
+
+## Convergence is shown next to ΔOFV, never omitted
+
+Under automation, a fit that stalled at its initial estimates (#751) or
+landed in the wrong inner-EBE mode (#864) is not a slow fit, it is a
+*model-selection error*: the candidate is ranked on an OFV that says nothing
+about the model. So every candidate is fitted with `[run] retries` perturbed
+restarts, then judged by the [`[strictness]` gate](search.qmd#the-file), and
+only then tested. A candidate that fails the gate cannot win the step however
+good its OFV, and the table says so:
+
+```
+Step 1 (forward), parent OFV -696.794, p = 0.05
+  effect                                OFV       dOFV  df          p  status      decision
+  CL-WT-power                      -703.387      6.593   1     0.0102  ok          significant
+  CL-CRCL-power                    -703.552      6.758   1     0.0093  ok          SELECTED
+  V1-WT-power                      -698.380      1.585   1     0.2080  ok          not significant
+  V1-CRCL-power                    -697.028      0.233   1     0.6290  ok          not significant
+```
+
+An excluded candidate keeps its row, with the gate's reason in place of the
+decision (`stalled at the initial estimates`, `estimate pinned to a declared
+bound: THETA_CL_WT`, `did not converge`), and its ΔOFV and p-value are still
+printed beside it. A candidate whose fit failed outright is a row too. The
+search continues past it: an effect that stalled from one parent is offered
+again from the next, where it may well converge.
+
+The base model has to pass the gate itself; a search from a base fit that
+cannot be trusted has nothing to compare against and is refused with the
+gate's reasons.
+
+## Output
+
+Into `--directory` (default `{search}-covsearch` next to the `.ferxsearch`
+file, or `[run] cache_dir`):
+
+| file | contents |
+|---|---|
+| `steps.csv` | one row per candidate of every step: `step`, `phase`, `candidate`, `parameter`, `covariate`, `form`, `parent_ofv`, `ofv`, `dofv`, `df`, `p_value`, `alpha`, `significant`, `selected`, `converged`, `passed`, `failures` |
+| `final.ferx` | the model the search ended on, with its own estimates written into the initial values |
+| `final-fit.yaml` | its estimates |
+| `base/`, `forward-1/`, `backward-4/`, … | one [runner directory](search.qmd) per step: `candidates.csv`, the journal and the cached fits |
+
+In the backward phase a row describes the *removal*: `dofv` is the OFV
+increase on taking the effect out, `significant` means the effect had to
+stay.
+
+The per-step directories are what `--resume` reads. A search interrupted at
+step 5 of 9 restarts from the same base, walks the same steps, and refits
+only what its journals do not already hold — the candidates are deterministic
+given the trajectory, so the resumed run is the uninterrupted run.
+
+## Compared with PsN `scm`
+
+The anchor for a search tool is the *trajectory*, not a kernel. The same
+dataset (`data/two_cpt_oral_cov.csv`, 30 subjects), the same base model
+(two-compartment oral, η on CL and V1, FOCEI) and the same four test
+relations — `CL` and `V1` against `WT` and `CRCL`, PsN `valid_states = 1,5`
+(none / power) — were run through PsN 5.7.1 with NONMEM 7.6 and through ferx,
+forward then backward at `p = 0.05` in both directions. The inputs and PsN's
+`scmlog.txt` are committed under `crates/ferx-tools/tests/psn/scm_anchor/`,
+and `tests/covsearch_psn_anchor.rs` replays the comparison.
+
+| step | candidate | NONMEM OFV | ferx OFV | ΔOFV | p | PsN | ferx |
+|---|---|---:|---:|---:|---:|---|---|
+| base | — | −696.794 | −696.794 | | | | |
+| 1 | CL-CRCL | −703.552 | −703.552 | 6.758 | 0.0093 | **chosen** | **chosen** |
+| 1 | CL-WT | −703.387 | −703.387 | 6.593 | 0.0102 | significant | significant |
+| 1 | V1-WT | −698.380 | −698.380 | 1.585 | 0.208 | | |
+| 1 | V1-CRCL | −697.028 | −697.028 | 0.233 | 0.629 | | |
+| 2 | CL-WT | −709.144 | −709.144 | 5.591 | 0.018 | **chosen** | **chosen** |
+| 2 | V1-WT | −705.134 | −705.134 | 1.582 | 0.208 | | |
+| 2 | V1-CRCL | −703.793 | −703.793 | 0.241 | 0.624 | | |
+| 3 | V1-WT | −710.722 | −710.722 | 1.579 | 0.209 | stop | stop |
+| 3 | V1-CRCL | −709.380 | −709.380 | 0.236 | 0.627 | | |
+| back | − CL-CRCL | −703.387 | −703.387 | 5.756 | 0.016 | kept | kept |
+| back | − CL-WT | −703.552 | −703.552 | 5.591 | 0.018 | kept | kept |
+
+(In the backward rows ΔOFV is the increase on removal, as in `steps.csv`;
+PsN prints it as a negative drop.) Same trajectory, same final relation set
+(`CL ~ CRCL power`, `CL ~ WT power`), and every OFV within 1e-4 of NONMEM's —
+the p-values agree to the digits PsN prints. The step-1 ordering is the
+closest call: CL-CRCL's drop beats CL-WT's by 0.165 OFV, and both engines
+make it.
+
+Why `p = 0.05` rather than PsN's usual `0.01 / 0.001`: at those levels the
+first step's runner-up misses the cutoff by 0.04 OFV and the backward phase
+removes the winner again — a trajectory decided by numbers finer than two
+engines can be expected to agree on, which is not an anchor.
+
+## Deviations from Pharmpy and PsN, stated
+
+- **The base model's own relations are kept as written.** Pharmpy removes any
+  `[covariate_model]` relation that also appears in the search space so it
+  can re-explore it; ferx treats a relation the author wrote as structural,
+  drops the matching exploratory effects from the candidate list with a note,
+  and never removes it in the backward phase.
+- **A child that adds no free parameter cannot win.** A relation whose θ is
+  `FIX`ed, or one that compiled to the parent's parameter vector, is reported
+  as unjudgeable. Pharmpy runs it through `χ²(0)` and would accept it on any
+  non-negative ΔOFV.
+- **The adaptive stash is handled by exact effect.** Pharmpy removes every
+  form on a stashed *pair* from the running candidate list — including a form
+  that was significant but not that step's winner — and, before the adaptive
+  pass, drops a stashed effect whenever its parameter *and* its covariate
+  each appear in some step. ferx removes only the stashed effects themselves,
+  and before the adaptive pass only those on a pair the model now carries.
+- **One form per pair per step, as in Pharmpy.** PsN's `scm` walks each
+  relation through its `valid_states` in order (`1 → 2 → 3 …`); ferx and
+  Pharmpy offer every listed form at once and retire the pair when one is
+  chosen. A PsN configuration with one non-null state per relation — the
+  anchor above — is the same search under both.
+
+## Allometry
+
+```bash
+ferx allometry model.ferx --data data.csv                 # fixed exponents
+ferx allometry model.ferx --data data.csv --estimate      # estimate them, bounded (0, 2)
+ferx allometry search.ferxsearch                          # ALLOMETRY(WT, 70) in [space]
+```
+
+Allometric scaling is a convention, not new machinery: `(WT / 70)^0.75` on
+every clearance the `pk` line binds (`cl`, `q`, `q2`, `q3`) and
+`(WT / 70)^1.0` on every volume (`v`, `v1`, `v2`, `v3`), written as
+`[covariate_model]` lines —
+
+```
+[covariate_model]
+  CL ~ WT power(center = 70, fix = 0.75)
+  Q ~ WT power(center = 70, fix = 0.75)
+  V1 ~ WT power(center = 70, fix = 1.0)
+  V2 ~ WT power(center = 70, fix = 1.0)
+```
+
+— and, with `--estimate`, as `CL ~ WT power(center = 70) =>
+THETA_CL_WT(0.75, 0.0, 2.0)`. This is Pharmpy's `allometry` tool, with the
+same classification (`find_clearance_parameters` / `find_volume_parameters`)
+and the same defaults. Nothing else — `KA`, a lag time, a transit count — is
+scaled unless named, and a parameter that already carries a relation on the
+covariate is left alone with a note.
+
+| flag | `[allometry]` key | default | meaning |
+|---|---|---|---|
+| `--covariate` | from `ALLOMETRY(cov, …)` | `WT` | the size covariate |
+| `--reference` | from `ALLOMETRY(…, ref)` | `70` | the value it is divided by |
+| `--parameters A,B` | `parameters` | the template's clearances and volumes | what to scale |
+| `--exponents x,y` | `exponents` | 0.75 / 1.0 by role | one per parameter |
+| `--estimate` | `fixed = false` | fixed | estimate the exponents |
+| `--lower`, `--upper` | `lower`, `upper` | `0`, `2` | bounds of an estimated exponent |
+
+The base and the scaled model are fitted side by side through the candidate
+runner (`--retries`, `--threads`, `--directory` as for a search), and the
+report shows both OFVs, the ΔOFV, the strictness verdicts and — when
+estimated — each exponent's estimate and SE. The scaled model is written as
+`{model}-allometric.ferx` with its estimates in place. Pharmpy fits only the
+scaled model and leaves the comparison to the caller.
+
+## From Rust
+
+```rust
+use ferx_tools::covsearch::{run_covsearch, CovsearchRun};
+use ferx_tools::search::SearchConfig;
+
+let cfg = SearchConfig::load("warfarin.ferxsearch")?;
+let base = cfg.load_base()?;
+let result = run_covsearch(&cfg, &base, CovsearchRun {
+    dir: Some("warfarin-covsearch".into()),
+    ..CovsearchRun::default()
+})?;
+for row in &result.steps {
+    println!("{} {} {} p={:.4} selected={}",
+        row.step, row.phase.label(), row.effect.label(), row.p_value(), row.selected);
+}
+println!("{}", result.final_model.render());
+```
+
+`CovsearchRun` also takes a `threads` override, a `CancelFlag` that stops the
+search between candidates with what it has, and a progress callback
+(`CovsearchEvent`). `ferx_tools::allometry::run_allometry` is the library
+form of `ferx allometry`.

@@ -1,0 +1,52 @@
+Model directory /work/crates/ferx-tools/tests/psn/scm_anchor/psn_run/m1
+
+MODEL            TEST     BASE OFV     NEW OFV         TEST OFV (DROP)    GOAL     dDF    SIGNIFICANT PVAL
+CLCRCL-5         PVAL   -696.79434   -703.55245              6.75811  >   3.84150    1        YES!  0.009332 
+CLWT-5           PVAL   -696.79434   -703.38740              6.59306  >   3.84150    1        YES!  0.010238 
+V1CRCL-5         PVAL   -696.79434   -697.02773              0.23338  >   3.84150    1              0.629030 
+V1WT-5           PVAL   -696.79434   -698.37971              1.58537  >   3.84150    1              0.207990 
+
+Parameter-covariate relation chosen in this forward step: CL-CRCL-5
+CRITERION              PVAL < 0.05
+BASE_MODEL_OFV        -696.79434
+CHOSEN_MODEL_OFV      -703.55245
+Relations included after this step:
+CL      CRCL-5           
+V1      
+--------------------
+
+Model directory /work/crates/ferx-tools/tests/psn/scm_anchor/psn_run/forward_scm_dir1/m1
+
+MODEL            TEST     BASE OFV     NEW OFV         TEST OFV (DROP)    GOAL     dDF    SIGNIFICANT PVAL
+CLWT-5           PVAL   -703.55245   -709.14359              5.59114  >   3.84150    1        YES!  0.018052 
+V1CRCL-5         PVAL   -703.55245   -703.79309              0.24064  >   3.84150    1              0.623740 
+V1WT-5           PVAL   -703.55245   -705.13444              1.58199  >   3.84150    1              0.208470 
+
+Parameter-covariate relation chosen in this forward step: CL-WT-5
+CRITERION              PVAL < 0.05
+BASE_MODEL_OFV        -703.55245
+CHOSEN_MODEL_OFV      -709.14359
+Relations included after this step:
+CL      CRCL-5           WT-5             
+V1      
+--------------------
+
+Model directory /work/crates/ferx-tools/tests/psn/scm_anchor/psn_run/forward_scm_dir1/scm_dir1/m1
+
+MODEL            TEST     BASE OFV     NEW OFV         TEST OFV (DROP)    GOAL     dDF    SIGNIFICANT PVAL
+V1CRCL-5         PVAL   -709.14359   -709.38002              0.23643  >   3.84150    1              0.626800 
+V1WT-5           PVAL   -709.14359   -710.72213              1.57854  >   3.84150    1              0.208970 
+
+--------------------
+
+
+--------------------
+Forward search done. Starting backward search inside forward top level directory
+Model directory /work/crates/ferx-tools/tests/psn/scm_anchor/psn_run/backward_scm_dir1/m1
+
+MODEL            TEST     BASE OFV     NEW OFV         TEST OFV (DROP)    GOAL     dDF  INSIGNIFICANT PVAL
+CLCRCL-1         PVAL   -709.14359   -703.38740             -5.75619  >  -3.84150   -1              0.016431 
+CLWT-1           PVAL   -709.14359   -703.55245             -5.59114  >  -3.84150   -1              0.018052 
+
+--------------------
+

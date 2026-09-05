@@ -52,6 +52,8 @@ mod tests {
     }
 }
 
+pub mod allometry;
 pub mod bootstrap;
+pub mod covsearch;
 pub mod gam;
 pub mod search;

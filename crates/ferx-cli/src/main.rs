@@ -1,5 +1,7 @@
+mod allometry_cmd;
 mod bootstrap_cmd;
 mod bootstrap_progress;
+mod covsearch_cmd;
 mod gam_cmd;
 
 use ferx_core::NcaInit;
@@ -17,6 +19,10 @@ Usage: ferx <model.ferx> --data <data.csv> [--threads N|auto] [--output <run.fit
                       [--stratify-on COL] [--threads N]   (see `ferx bootstrap --help`)
        ferx gam      <model.ferx>  --data <data.csv> [--csv gam.csv] [--threads N]
                                                          (see `ferx gam --help`)
+       ferx covsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
+                                                         (see `ferx covsearch --help`)
+       ferx allometry <model.ferx> --data <data.csv> [--covariate WT] [--reference 70]
+                                                         (see `ferx allometry --help`)
 
 Fits a NLME model and writes sdtab.csv with residuals.
 Data must be in NONMEM format (ID, TIME, DV, EVID, AMT, CMT, ...)
@@ -112,6 +118,16 @@ fn main() {
 
     if args.get(1).map(String::as_str) == Some("gam") {
         std::process::exit(gam_cmd::run(&args));
+    }
+
+    // `ferx covsearch` / `ferx allometry` (#1180): the first model-space
+    // search tools, driven by a `.ferxsearch` file (or, for allometry, a
+    // model file plus flags).
+    if args.get(1).map(String::as_str) == Some("covsearch") {
+        std::process::exit(covsearch_cmd::run(&args));
+    }
+    if args.get(1).map(String::as_str) == Some("allometry") {
+        std::process::exit(allometry_cmd::run(&args));
     }
 
     if args.len() < 2 {
