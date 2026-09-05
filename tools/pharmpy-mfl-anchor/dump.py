@@ -18,7 +18,9 @@ and read by crates/ferx-tools/src/search/mfl_pharmpy_anchor.rs.
 
 import dataclasses
 import json
+import os
 import sys
+import tempfile
 
 import pandas as pd
 import pharmpy
@@ -47,6 +49,9 @@ EXPAND_CASES = [
     "COVARIATE(@IIV,WT,pow);COVARIATE(@ELIMINATION,WT,exp)",
     "COVARIATE?(@PK,@CONTINUOUS,[pow,lin]);COVARIATE(CL,WT,exp)",
     "COVARIATE?(@IIV,[WT,CRCL],*);COVARIATE?(CL,WT,exp)",
+    # Explicit parameter, symbolic covariate: Pharmpy gates the override on
+    # the parameter operand alone, so nothing is dropped here.
+    "COVARIATE?(CL,@CONTINUOUS,[pow,lin]);COVARIATE(CL,WT,exp)",
     "COVARIATE?(@NOSUCH,WT,pow)",
     "COVARIATE(CL,WT,[pow,exp])",
 ]
@@ -89,7 +94,7 @@ def dump_parse(corpus_path):
 def reference_model(data_path):
     df = pd.read_csv(data_path)
     df["SEX"] = (df["ID"].astype(int) % 2).astype(int)
-    tmp = "/tmp/mfl_anchor_data.csv"
+    tmp = os.path.join(tempfile.mkdtemp(prefix="mfl_anchor_"), "data.csv")
     df.to_csv(tmp, index=False)
     m = create_basic_pk_model("oral", dataset_path=tmp)
     m = set_peripheral_compartments(m, 1)
@@ -111,7 +116,9 @@ def dump_expand(model):
                     for cov in c.covariate:
                         for fp in c.fp:
                             tuples.append([p, cov, fp, c.op, c.optional.option])
-            cases.append({"mfl": s, "covariates": tuples})
+            # Pharmpy builds the sets in hash order; sort so a regeneration
+            # only diffs where the semantics changed.
+            cases.append({"mfl": s, "covariates": sorted(tuples)})
         except Exception as e:  # noqa: BLE001
             cases.append({"mfl": s, "error": type(e).__name__})
     return {

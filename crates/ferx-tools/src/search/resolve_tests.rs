@@ -293,7 +293,10 @@ fn structural_symbols_need_a_pk_line() {
         "BIOAVAIL",
     ] {
         let e = c.builtin(sym).expect_err(sym);
-        assert!(e.contains("reads the `pk NAME(...)` line"), "{sym}: {e}");
+        assert!(
+            e.contains("reads the `pk NAME(...)` or `ode_template NAME(...)` line"),
+            "{sym}: {e}"
+        );
         assert!(e.contains("LET("), "{sym}: {e}");
     }
     // LET rescues it.
@@ -523,4 +526,137 @@ fn ground_output_is_stable_under_re_resolution() {
         CovariateEffectSpec::pair(&once.covariate_effects[0]),
         "CL-WT"
     );
+}
+
+// --- review of #1237: template, parameter and override edge cases -------------
+
+#[test]
+fn ode_template_line_is_a_template_too() {
+    let t = PkTemplate::parse_line("  ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)")
+        .expect("is a template line")
+        .expect("parses");
+    assert_eq!(t.name, "two_cpt_oral");
+    assert_eq!(t.parameters(), names(&["CL", "V1", "Q", "V2", "KA"]));
+    assert!(PkTemplate::parse_line("ode_templatex(cl=CL)").is_none());
+    let e = PkTemplate::parse_line("ode_template two_cpt_oral cl=CL")
+        .expect("is a template line")
+        .expect_err("no parens");
+    assert!(e.contains("`ode_template` line has no `(`"), "{e}");
+}
+
+/// A base that generates its disposition with `ode_template` binds the same
+/// roles as a `pk` line, so the structural symbols must read it.
+#[test]
+fn structural_symbols_read_an_ode_template_base() {
+    let model = MODEL.replace(
+        "pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA, f=F)",
+        "ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)",
+    );
+    let c = context_for(&model, &["WT", "SEX", "CRCL"]);
+    assert_eq!(c.template.as_ref().expect("template").name, "two_cpt_oral");
+    assert_eq!(
+        c.builtin("PK").unwrap(),
+        names(&["CL", "V1", "Q", "V2", "KA"])
+    );
+    assert_eq!(c.builtin("ABSORPTION").unwrap(), names(&["KA"]));
+    assert_eq!(c.builtin("ELIMINATION").unwrap(), names(&["CL"]));
+    assert_eq!(
+        c.builtin("DISTRIBUTION").unwrap(),
+        names(&["V1", "Q", "V2"])
+    );
+    let r = resolved("COVARIATE?(@PK,@CONTINUOUS,pow);IIV(*,EXP)", &c);
+    assert_eq!(r.covariate_effects.len(), 5 * 2);
+    assert!(r.notes.is_empty(), "{:?}", r.notes);
+}
+
+/// The parser lets a `pk` line bind a role to a numeric literal (`f=1`);
+/// that is not an individual parameter, so the symbols must skip it rather
+/// than fail on a name the user never typed.
+#[test]
+fn template_symbols_skip_a_literal_binding() {
+    let model = MODEL
+        .replace(
+            "pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA, f=F)",
+            "pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA, f=1)",
+        )
+        .replace("  F  = TVF\n", "");
+    let c = context_for(&model, &["WT", "SEX", "CRCL"]);
+    assert_eq!(
+        c.template.as_ref().unwrap().parameters(),
+        names(&["CL", "V1", "Q", "V2", "KA", "1"]),
+        "the raw bindings keep the literal"
+    );
+    assert_eq!(
+        c.builtin("PK").unwrap(),
+        names(&["CL", "V1", "Q", "V2", "KA"])
+    );
+    assert_eq!(c.builtin("BIOAVAIL").unwrap(), Vec::<String>::new());
+    // The symbol and both wildcards resolve on such a base.
+    let r = resolved("COVARIATE?(@PK,@CONTINUOUS,*);IIV(*,EXP)", &c);
+    assert_eq!(r.covariate_effects.len(), 5 * 2 * 4);
+    let r = resolved("COVARIATE?(@BIOAVAIL,WT,pow)", &c);
+    assert!(r.covariate_effects.is_empty());
+    assert!(
+        r.notes[0].contains("@BIOAVAIL resolves to nothing"),
+        "{}",
+        r.notes[0]
+    );
+}
+
+/// A block-form `if` in `[individual_parameters]` is not an assignment; the
+/// context reads the parser's list, not the text.
+#[test]
+fn block_form_if_headers_are_not_parameters() {
+    let model = MODEL.replace(
+        "  CL = TVCL * exp(ETA_CL)\n",
+        "  if (WT >= 70) {\n    CL = TVCL * 1.2 * exp(ETA_CL)\n  } else if (SEX == 1) {\n    \
+         CL = TVCL * 0.9 * exp(ETA_CL)\n  } else {\n    CL = TVCL * exp(ETA_CL)\n  }\n",
+    );
+    let c = context_for(&model, &["WT", "SEX", "CRCL"]);
+    assert!(
+        c.parameters.iter().all(|p| !p.contains('(')),
+        "{:?}",
+        c.parameters
+    );
+    assert!(
+        c.parameters.contains(&"CL".to_string()),
+        "{:?}",
+        c.parameters
+    );
+    assert_eq!(c.parameters.len(), 7, "{:?}", c.parameters);
+    let e = resolve_err("COVARIATE(FOO,WT,pow)", &c);
+    assert!(!e.contains("if ("), "{e}");
+}
+
+/// Pharmpy gates the override on the *parameter* operand alone: a statement
+/// that names its parameter explicitly is never overridden, even when its
+/// covariate operand is a symbol.
+#[test]
+fn explicit_parameter_with_symbolic_covariate_is_not_overridden() {
+    let r = resolved(
+        "COVARIATE?(CL,@CONTINUOUS,[pow,lin]);COVARIATE(CL,WT,exp)",
+        &ctx(),
+    );
+    let mut cl_wt: Vec<(CovariateEffect, bool)> = r
+        .covariate_effects
+        .iter()
+        .filter(|t| t.parameter == "CL" && t.covariate == "WT")
+        .map(|t| (t.effect, t.optional))
+        .collect();
+    cl_wt.sort_by_key(|(e, o)| (e.label(), *o));
+    assert_eq!(
+        cl_wt,
+        vec![
+            (CovariateEffect::Exp, false),
+            (CovariateEffect::Lin, true),
+            (CovariateEffect::Pow, true),
+        ]
+    );
+    assert_eq!(r.covariate_effects.len(), 2 * 2 + 1);
+    // The symbolic-parameter twin straddles the gate: its CL-WT terms go.
+    let r = resolved(
+        "COVARIATE?(@ELIMINATION,@CONTINUOUS,[pow,lin]);COVARIATE(CL,WT,exp)",
+        &ctx(),
+    );
+    assert_eq!(r.covariate_effects.len(), 2 + 1);
 }

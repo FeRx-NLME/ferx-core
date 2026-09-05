@@ -14,7 +14,7 @@ data = "{DATA}/two_cpt_oral_cov.csv"
 
 [space]
 mfl = """
-ABSORPTION([FO,ZO]); PERIPHERALS(0..1); LAGTIME([OFF,ON])
+ABSORPTION([INST,FO]); PERIPHERALS(0..1); LAGTIME([OFF,ON])
 COVARIATE?(@IIV, @CONTINUOUS, [pow,lin])
 """
 
@@ -238,7 +238,7 @@ fn end_to_end_on_the_shipped_covariate_example() {
     assert!(resolved.notes.is_empty(), "{:?}", resolved.notes);
     assert_eq!(
         resolved.mfl.render(),
-        "ABSORPTION([FO,ZO]);PERIPHERALS(0..1);LAGTIME([OFF,ON]);\
+        "ABSORPTION([INST,FO]);PERIPHERALS(0..1);LAGTIME([OFF,ON]);\
          COVARIATE?(CL,WT,[pow,lin]);COVARIATE?(CL,CRCL,[pow,lin]);\
          COVARIATE?(V1,WT,[pow,lin]);COVARIATE?(V1,CRCL,[pow,lin]);\
          COVARIATE?(Q,WT,[pow,lin]);COVARIATE?(Q,CRCL,[pow,lin]);\

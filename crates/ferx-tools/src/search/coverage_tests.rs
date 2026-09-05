@@ -11,7 +11,7 @@ fn gaps(src: &str) -> Vec<String> {
 #[test]
 fn the_epic_table_supported_rows_pass() {
     for src in [
-        "ABSORPTION([INST,FO,ZO,WEIBULL])",
+        "ABSORPTION([INST,FO])",
         "ELIMINATION(FO)",
         "PERIPHERALS(0..2)",
         "PERIPHERALS(1,DRUG)",
@@ -43,6 +43,12 @@ fn the_issue_gaps_are_hard_errors_naming_the_feature() {
         vec!["ELIMINATION(MIX-FO-MM)"]
     );
     assert_eq!(gaps("ABSORPTION(SEQ-ZO-FO)"), vec!["ABSORPTION(SEQ-ZO-FO)"]);
+    // ZO and WEIBULL are ODE-only input functions, not `pk` templates: the
+    // same class as SEQ-ZO-FO, and a search that admits them would fail per
+    // candidate instead of at load.
+    assert_eq!(gaps("ABSORPTION(ZO)"), vec!["ABSORPTION(ZO)"]);
+    assert_eq!(gaps("ABSORPTION(WEIBULL)"), vec!["ABSORPTION(WEIBULL)"]);
+    assert_eq!(gaps("ABSORPTION([FO,ZO])"), vec!["ABSORPTION(ZO)"]);
     assert_eq!(gaps("DIRECTEFFECT(EMAX)"), vec!["DIRECTEFFECT(...)"]);
     assert_eq!(gaps("EFFECTCOMP(*)"), vec!["EFFECTCOMP(...)"]);
     assert_eq!(
@@ -61,7 +67,14 @@ fn wildcards_are_checked_against_their_full_expansion() {
             "ELIMINATION(MIX-FO-MM)"
         ]
     );
-    assert_eq!(gaps("ABSORPTION(*)"), vec!["ABSORPTION(SEQ-ZO-FO)"]);
+    assert_eq!(
+        gaps("ABSORPTION(*)"),
+        vec![
+            "ABSORPTION(ZO)",
+            "ABSORPTION(SEQ-ZO-FO)",
+            "ABSORPTION(WEIBULL)"
+        ]
+    );
     assert_eq!(gaps("TRANSITS(1,*)"), vec!["TRANSITS(n, DEPOT)"]);
     assert_eq!(gaps("PERIPHERALS(1,*)"), vec!["PERIPHERALS(n, MET)"]);
     assert_eq!(gaps("IIV(CL,*)"), vec!["IIV(..., LOG)", "IIV(..., RE_LOG)"]);

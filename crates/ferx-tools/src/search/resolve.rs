@@ -3,13 +3,14 @@
 //! model (#1179).
 //!
 //! The built-in symbols are Pharmpy's, resolved against the base model's
-//! `[individual_parameters]`, its `pk` template line, its `[covariates]`
+//! `[individual_parameters]`, its template line (`pk NAME(...)` or
+//! `ode_template NAME(...)` — the same role grammar), its `[covariates]`
 //! block and the dataset:
 //!
 //! | symbol | resolves to |
 //! |---|---|
 //! | `@IIV` | every individual parameter carrying an η |
-//! | `@PK` | every parameter bound on the `pk NAME(...)` line, in that order |
+//! | `@PK` | every individual parameter bound on the template line, in that order |
 //! | `@PK_IIV` | `@PK` ∩ `@IIV` |
 //! | `@ABSORPTION` | the `ka`, `n`, `mtt`, `mat`, `cv2` and `lagtime` bindings |
 //! | `@ELIMINATION` | the `cl` binding |
@@ -39,32 +40,47 @@ use ferx_core::{CovariateKind, ParsedModel, Population};
 
 use super::mfl::{CovariateEffect, CovariateOp, Feature, Mfl, Mode, Modes, Operand, Statement};
 
-/// The `pk NAME(role=VAR, ...)` line of a base model.
+/// The template line of a base model: `pk NAME(role=VAR, ...)` or
+/// `ode_template NAME(role=VAR, ...)`. Both bind the same roles to the same
+/// individual parameters; only the disposition's engine differs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PkTemplate {
     /// The template name, e.g. `two_cpt_oral`.
     pub name: String,
-    /// `(role, variable)` in source order, e.g. `[("cl", "CL"), ("v", "V")]`.
+    /// `(role, value)` in source order, e.g. `[("cl", "CL"), ("v", "V")]`.
+    /// A value is whatever the line bound — usually an
+    /// `[individual_parameters]` name, but the parser also accepts a numeric
+    /// literal (`f=1`), so callers that want *parameters* intersect with the
+    /// model's.
     pub bindings: Vec<(String, String)>,
 }
 
 impl PkTemplate {
-    /// Parse a `pk NAME(role=VAR, ...)` line. `None` when the line is not a
-    /// `pk` line at all.
+    /// The keywords that open a template line.
+    const KEYWORDS: &'static [&'static str] = &["pk", "ode_template"];
+
+    /// Parse a `pk NAME(role=VAR, ...)` or `ode_template NAME(role=VAR, ...)`
+    /// line. `None` when the line is neither.
     pub fn parse_line(line: &str) -> Option<Result<PkTemplate, String>> {
-        let rest = line.trim().strip_prefix("pk")?;
-        if !rest.starts_with(|c: char| c.is_whitespace()) {
-            return None;
-        }
+        let trimmed = line.trim();
+        let (keyword, rest) = Self::KEYWORDS.iter().find_map(|kw| {
+            let rest = trimmed.strip_prefix(kw)?;
+            rest.starts_with(|c: char| c.is_whitespace())
+                .then_some((*kw, rest))
+        })?;
         let rest = rest.trim();
         let open = match rest.find('(') {
             Some(i) => i,
-            None => return Some(Err(format!("`pk` line has no `(`: `{line}`"))),
+            None => return Some(Err(format!("`{keyword}` line has no `(`: `{line}`"))),
         };
         let name = rest[..open].trim().to_string();
         let close = match rest.rfind(')') {
             Some(i) if i > open => i,
-            _ => return Some(Err(format!("`pk` line has no closing `)`: `{line}`"))),
+            _ => {
+                return Some(Err(format!(
+                    "`{keyword}` line has no closing `)`: `{line}`"
+                )))
+            }
         };
         let mut bindings = Vec::new();
         for pair in rest[open + 1..close].split(',') {
@@ -74,7 +90,7 @@ impl PkTemplate {
             }
             let Some((role, var)) = pair.split_once('=') else {
                 return Some(Err(format!(
-                    "`pk {name}(...)`: `{pair}` is not a `role=VAR` binding"
+                    "`{keyword} {name}(...)`: `{pair}` is not a `role=VAR` binding"
                 )));
             };
             bindings.push((role.trim().to_ascii_lowercase(), var.trim().to_string()));
@@ -92,7 +108,7 @@ impl PkTemplate {
         out
     }
 
-    /// Every bound variable, in `pk` line order.
+    /// Every bound value, in template-line order.
     pub fn parameters(&self) -> Vec<String> {
         let mut out = Vec::new();
         for (_, var) in &self.bindings {
@@ -118,8 +134,8 @@ pub struct ModelContext {
     pub parameters: Vec<String>,
     /// The subset of `parameters` carrying an η, in η order.
     pub iiv: Vec<String>,
-    /// The `pk` template line; `None` for an `ode(...)` or algebraic model,
-    /// in which case the structural symbols are unavailable.
+    /// The `pk` / `ode_template` line; `None` for an `ode(...)` or algebraic
+    /// model, in which case the structural symbols are unavailable.
     pub template: Option<PkTemplate>,
     /// The `[covariates]` declarations; `None` when the block is absent.
     pub covariates: Option<Vec<(String, CovariateKind)>>,
@@ -139,7 +155,18 @@ impl ModelContext {
         text: &ModelText,
         population: &Population,
     ) -> Result<Self, String> {
-        let parameters = individual_parameter_names(text);
+        // The parser's list of top-level `[individual_parameters]`
+        // assignments, in source order — not a text scan, which would read a
+        // block-form `if (WT > 70) {` header as a parameter named `if (WT >`.
+        // The parser also appends synthetic `__ferx_*` parameters (readouts,
+        // direct `pk(...=TIME)` bindings); nobody searches over those.
+        let parameters: Vec<String> = parsed
+            .model
+            .indiv_param_names
+            .iter()
+            .filter(|n| !n.starts_with("__ferx_"))
+            .cloned()
+            .collect();
         if parameters.is_empty() {
             return Err(
                 "search space: the base model declares no `[individual_parameters]`, so there \
@@ -231,14 +258,39 @@ impl ModelContext {
         }
     }
 
+    /// The template's bound values that are individual parameters of the
+    /// model, in template order and with the model's spelling. A numeric
+    /// literal (`f=1`) or an unbound alias is not a parameter and is skipped,
+    /// so `@BIOAVAIL` on such a line resolves to nothing rather than to a
+    /// name the user never typed.
+    fn template_parameters(&self, bound: Vec<String>) -> Vec<String> {
+        let mut out = Vec::new();
+        for value in bound {
+            if let Some(p) = self
+                .parameters
+                .iter()
+                .find(|p| p.eq_ignore_ascii_case(&value))
+            {
+                if !out.contains(p) {
+                    out.push(p.clone());
+                }
+            }
+        }
+        out
+    }
+
+    fn no_template_error(&self, symbol: &str, let_name: &str) -> String {
+        format!(
+            "search space: `@{symbol}` reads the `pk NAME(...)` or `ode_template NAME(...)` \
+             line, and the base model has none (an `ode(...)` or algebraic model). Name the \
+             parameters explicitly, or define the symbol with `LET({let_name}, [...])`"
+        )
+    }
+
     fn template_roles(&self, symbol: &str, roles: &[&str]) -> Result<Vec<String>, String> {
         match &self.template {
-            Some(t) => Ok(t.with_roles(roles)),
-            None => Err(format!(
-                "search space: `@{symbol}` reads the `pk NAME(...)` line, and the base model has \
-                 none (an `ode(...)` or algebraic model). Name the parameters explicitly, or \
-                 define the symbol with `LET({symbol}, [...])`"
-            )),
+            Some(t) => Ok(self.template_parameters(t.with_roles(roles))),
+            None => Err(self.no_template_error(symbol, symbol)),
         }
     }
 
@@ -248,12 +300,8 @@ impl ModelContext {
         match upper.as_str() {
             "IIV" => Ok(self.iiv.clone()),
             "PK" => match &self.template {
-                Some(t) => Ok(t.parameters()),
-                None => Err(format!(
-                    "search space: `@{symbol}` reads the `pk NAME(...)` line, and the base \
-                     model has none (an `ode(...)` or algebraic model). Name the parameters \
-                     explicitly, or define the symbol with `LET(PK, [...])`"
-                )),
+                Some(t) => Ok(self.template_parameters(t.parameters())),
+                None => Err(self.no_template_error(symbol, "PK")),
             },
             "PK_IIV" => {
                 let pk = self.builtin("PK")?;
@@ -273,25 +321,6 @@ impl ModelContext {
             )),
         }
     }
-}
-
-/// The individual-parameter names a model text assigns: the left-hand sides
-/// of `[individual_parameters]`.
-pub fn individual_parameter_names(text: &ModelText) -> Vec<String> {
-    let mut names = Vec::new();
-    for line in text.block_lines("individual_parameters") {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((lhs, _)) = line.split_once('=') {
-            let name = lhs.trim();
-            if !name.is_empty() && !names.iter().any(|n| n == name) {
-                names.push(name.to_string());
-            }
-        }
-    }
-    names
 }
 
 /// One fully explicit covariate effect the resolved space contains.
@@ -349,7 +378,12 @@ pub fn resolve(mfl: &Mfl, ctx: &ModelContext) -> Result<Resolved, String> {
                 effects,
                 op,
             } => {
-                let explicit = !parameters.is_symbolic() && !covariates.is_symbolic();
+                // Pharmpy's override rule (covariate.py, `Covariate.eval`):
+                // a statement is overridable only when its *parameter*
+                // operand is a symbol. `COVARIATE?(CL, @CONTINUOUS, …)` names
+                // CL explicitly, so a later `COVARIATE(CL, WT, exp)` adds to
+                // it rather than replacing its CL-WT terms.
+                let explicit = !parameters.is_symbolic();
                 let params = resolve_parameters(parameters, ctx, &lets, &feature.keyword(), "PK")?;
                 let covs = resolve_covariates(covariates, ctx, &lets, &feature.keyword())?;
                 if params.is_empty() || covs.is_empty() {
@@ -629,8 +663,11 @@ fn check_effect_kind(
 
 /// Pharmpy's `expand()` rules over the per-statement covariate terms:
 ///
-/// 1. an explicit `(parameter, covariate)` pair (both operands named) wins
-///    over the same pair produced by a symbol or wildcard, which is dropped;
+/// 1. a `(parameter, covariate)` pair from a statement whose *parameter*
+///    operand is explicit wins over the same pair produced by a statement
+///    whose parameter is a symbol or wildcard, which is dropped (Pharmpy
+///    gates on the parameter operand alone; a symbolic covariate does not
+///    make a statement overridable);
 /// 2. a forced pair (`COVARIATE`) named by more than one statement is an
 ///    error — the space would be over-specified;
 /// 3. a forced term wins over the identical optional term.

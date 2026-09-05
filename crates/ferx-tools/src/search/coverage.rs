@@ -92,14 +92,34 @@ fn gap(gaps: &mut Vec<Gap>, feature: String, reason: impl Into<String>) {
 fn check_feature(feature: &Feature, gaps: &mut Vec<Gap>) {
     match feature {
         Feature::Absorption(modes) => {
+            // The `pk` templates are `*_iv` (INST) and `*_oral` (FO), and
+            // that is all a search can switch between. `zero_order(...)` and
+            // `weibull(...)` are ODE-only input functions (the parser's
+            // `ODE_ONLY_ABSORPTION_FNS`), the same class as SEQ-ZO-FO: a
+            // candidate for them is `[odes]` text, which a search cannot
+            // generate.
             for m in modes.expand() {
-                if m == AbsorptionMode::SeqZoFo {
-                    gap(
+                match m {
+                    AbsorptionMode::Inst | AbsorptionMode::Fo => {}
+                    AbsorptionMode::Zo => gap(
+                        gaps,
+                        "ABSORPTION(ZO)".into(),
+                        "zero-order absorption has no `pk` template; it is the `[odes]` input \
+                         function `zero_order(...)` (or a modeled duration on an IV template), \
+                         neither of which a search can generate",
+                    ),
+                    AbsorptionMode::SeqZoFo => gap(
                         gaps,
                         "ABSORPTION(SEQ-ZO-FO)".into(),
                         "sequential zero-order-then-first-order absorption has no `pk` template; \
                          it is hand-writable as an `[odes]` model only",
-                    );
+                    ),
+                    AbsorptionMode::Weibull => gap(
+                        gaps,
+                        "ABSORPTION(WEIBULL)".into(),
+                        "Weibull absorption has no `pk` template; it is the `[odes]` input \
+                         function `weibull(...)`, which a search cannot generate",
+                    ),
                 }
             }
         }

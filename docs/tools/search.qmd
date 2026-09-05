@@ -34,7 +34,7 @@ data = "warfarin.csv"          # optional: falls back to the model's [data] bloc
 
 [space]
 mfl = """
-ABSORPTION([FO,ZO]); PERIPHERALS(0..1); LAGTIME([OFF,ON])
+ABSORPTION([INST,FO]); PERIPHERALS(0..1); LAGTIME([OFF,ON])
 COVARIATE?(@IIV, @CONTINUOUS, [pow,lin]); COVARIATE?(@IIV, @CATEGORICAL, cat)
 """
 
@@ -164,7 +164,7 @@ dataset:
 | symbol | resolves to |
 |---|---|
 | `@IIV` | every individual parameter carrying an η |
-| `@PK` | every parameter bound on the `pk NAME(...)` line, in that order |
+| `@PK` | every individual parameter bound on the `pk NAME(...)` or `ode_template NAME(...)` line, in that order |
 | `@PK_IIV` | `@PK` ∩ `@IIV` |
 | `@ABSORPTION` | the `ka`, `n`, `mtt`, `mat`, `cv2` and `lagtime` bindings |
 | `@ELIMINATION` | the `cl` binding |
@@ -196,10 +196,14 @@ The rules around them:
   `COVARIATE?(@IIV, @CATEGORICAL, cat)` on a model without categoricals is a
   space that happens to be empty, not a mistake. The note is returned so a
   tool can print it once.
-- **Pharmpy's override rules apply to `COVARIATE`.** An explicit
-  `(parameter, covariate)` pair wins over the same pair produced by a symbol;
-  a forced term wins over the identical optional one; a pair *forced* by two
-  statements is an error.
+- **Pharmpy's override rules apply to `COVARIATE`.** A `(parameter,
+  covariate)` pair from a statement that names its parameter explicitly wins
+  over the same pair produced by a statement whose parameter is a symbol
+  (`COVARIATE?(@IIV, @CONTINUOUS, [pow,lin]); COVARIATE(CL, WT, exp)` keeps
+  only the forced `exp` on CL-WT). As in Pharmpy, only the parameter operand
+  decides: `COVARIATE?(CL, @CONTINUOUS, [pow,lin]); COVARIATE(CL, WT, exp)`
+  keeps all three CL-WT forms. A forced term wins over the identical optional
+  one; a pair *forced* by two statements is an error.
 
 ## Coverage
 
@@ -209,8 +213,8 @@ silently.
 
 | MFL feature | ferx | how / why not |
 |---|---|---|
-| `ABSORPTION(INST / FO / ZO / WEIBULL)` | ✓ | `pk *_iv` / `*_oral`; zero-order input via modeled duration; `weibull()` |
-| `ABSORPTION(SEQ-ZO-FO)` | ✗ | no `pk` template; hand-writable as `[odes]` only |
+| `ABSORPTION(INST / FO)` | ✓ | `pk *_iv` / `*_oral` |
+| `ABSORPTION(ZO / SEQ-ZO-FO / WEIBULL)` | ✗ | no `pk` template; `zero_order()` / `weibull()` are `[odes]` input functions, hand-writable only |
 | `ELIMINATION(FO)` | ✓ | every `pk` template |
 | `ELIMINATION(ZO / MM / MIX-FO-MM)` | ✗ | reachable only via `[odes]`, which a search cannot generate |
 | `PERIPHERALS(0..2)` | ✓ | `one_cpt_*` / `two_cpt_*` / `three_cpt_*` |
