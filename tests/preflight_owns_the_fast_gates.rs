@@ -590,7 +590,7 @@ fn load_bearing_flags_and_feature_coverage_survive_in_the_command_list() {
         // this group's two commands intact, run all 4366 tests, and keep every
         // assertion in this file green while the job verified nothing —
         // an invariant held by absence is exactly what #344 was filed about.
-        // `debug_assertion_canary` in `src/lib.rs` closes that, but only when armed,
+        // `debug_assertion_canary` (`src/lib_tests.rs`) closes that, but only when armed,
         // so the arming has to be pinned as tightly as the flags are.
         //
         // `starts_with`, not `contains`: it must be the argv-leading `env` form, so
@@ -600,7 +600,7 @@ fn load_bearing_flags_and_feature_coverage_survive_in_the_command_list() {
             "`{cmd}` does not arm the debug-assertions canary. Prefix it with \
              `env FERX_REQUIRE_DEBUG_ASSERTIONS=1` (in the argument vector, so \
              `--list` shows it): without that, `debug_assertion_canary` in \
-             src/lib.rs passes vacuously and nothing in this group ever verifies \
+             src/lib_tests.rs passes vacuously and nothing in this group ever verifies \
              that `debug_assert!` is actually live (#344)."
         );
     }

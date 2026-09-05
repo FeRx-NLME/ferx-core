@@ -176,7 +176,7 @@ jobs:
   # would be a no-op again — silently, with every test green — if a
   # `[profile.dev] debug-assertions = false` or a
   # `CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false` ever appeared. So the group's
-  # commands arm `debug_assertion_canary` (`src/lib.rs`) via
+  # commands arm `debug_assertion_canary` (`src/lib_tests.rs`) via
   # `env FERX_REQUIRE_DEBUG_ASSERTIONS=1`, and that canary fails the run if
   # `debug_assert!` turns out to compile to nothing. Do NOT set that variable at
   # the workflow or job level: every other job legitimately runs with the guards

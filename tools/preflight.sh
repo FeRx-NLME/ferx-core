@@ -395,7 +395,7 @@ group_debug_assertions() {
   # in `--list` — and what `--list` prints is what the guard test can assert and
   # what a developer can copy. Same reasoning as `RUSTDOCFLAGS` in `group_rustdoc`.
   #
-  # It arms `debug_assertion_canary` in `src/lib.rs`, which fails the run if
+  # It arms `debug_assertion_canary` (`src/lib_tests.rs`), which fails the run if
   # `debug_assert!` turns out to compile to nothing. Without it this whole group is
   # an invariant held by ABSENCE — nothing in `cargo test --lib --features ci`
   # distinguishes a build with the guards live from one without, so a
