@@ -36,10 +36,17 @@ pub fn core_version() -> &'static str {
 mod tests {
     use super::core_version;
 
-    /// #529 convention guard, `ferx-tools` half: every `pub` options struct
-    /// this crate exposes must implement `Default` so a caller can build it
-    /// with `..Default::default()` and survive an added field. A new options
-    /// struct that forgets it fails to compile here.
+    /// #529, trait-level half for `ferx-tools`: this crate's options types
+    /// really do resolve `Default`, so a caller can build them with
+    /// `..Default::default()`.
+    ///
+    /// A **named spot check, not the inventory guard** — the list is
+    /// hand-written and a new options struct does not change it. Discovery for
+    /// the whole workspace (this crate included: the scan walks `crates/`) is
+    /// `every_public_options_type_implements_default` in `ferx-core`'s
+    /// `tests/public_api_boundary.rs` (A4). It lives there rather than here
+    /// because `ferx-core` must not depend on `ferx-tools`, and a source scan
+    /// needs no dependency in either direction.
     #[test]
     fn every_public_options_struct_implements_default() {
         fn assert_default<T: Default>() -> T {

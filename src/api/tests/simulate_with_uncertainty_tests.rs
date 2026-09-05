@@ -1605,10 +1605,18 @@ fn spread_default_matches_exhaustive_literal() {
     }
 }
 
-/// #529 convention guard: every `pub` options struct `ferx-core` exposes at
-/// the R boundary must implement `Default`, so the wrapper can spread it and
-/// survive an added field. A new one that forgets the derive fails to compile
-/// here rather than breaking `ferx-r`'s build after the merge.
+/// #529, trait-level half: the options types `ferx-core` exposes at the R
+/// boundary really do resolve `Default`, so the wrapper can spread them.
+///
+/// This is a **named spot check, not the inventory guard** — the list is
+/// hand-written, so adding a new options struct does not change it and this
+/// test would stay green. Discovery is
+/// `every_public_options_type_implements_default` in
+/// `tests/public_api_boundary.rs` (A4), which scans `src/` and `crates/` for
+/// every `*Options` declaration and fails on one lacking `Default`. The two
+/// are complementary: the scan is textual and sees types nobody registered,
+/// this one is a real trait bound and would catch a `Default` that exists in
+/// source but does not apply to the type (a `cfg`-ed out impl, say).
 #[test]
 fn every_public_options_struct_implements_default() {
     fn assert_default<T: Default>() -> T {
