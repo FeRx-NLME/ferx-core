@@ -225,7 +225,9 @@ pub fn solve_ekf(
     // one mask (the arrival) covers it.
     let mut applied = vec![false; doses.len()];
 
-    // Records read *at* the current break (#1226) — hoisted, as on the ODE engines.
+    // Records read *at* the current break (#1226) — sorted once, hoisted, as on the ODE
+    // engines.
+    let obs_index = crate::ode::predictions::RecordIndex::new(obs_times);
     let mut boundary_obs: Vec<usize> = Vec::new();
     // Assimilate-once mask — the measurement analogue of the `applied` dose mask above.
     //
@@ -260,7 +262,7 @@ pub fn solve_ekf(
 
         // Record obs read *at* t_start (after dose application) — the whole
         // `EVENT_MATCH_TOL` band, through the same helper as the ODE engines (#1226).
-        crate::ode::predictions::collect_records_at_break(obs_times, t_start, &mut boundary_obs);
+        obs_index.records_at_break(t_start, &mut boundary_obs);
         for i in 0..boundary_obs.len() {
             let obs_idx = boundary_obs[i];
             let v = u[obs_cmt_idx];

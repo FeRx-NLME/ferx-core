@@ -6545,8 +6545,11 @@ fn integrate_g<T: crate::sens::num::PkNum>(
     // and solver save point, replacing the per-query linear scan over all
     // observations (PR #438 review). The precise `obs_time_matches` test still
     // gates each candidate; the sort only narrows the search window.
-    let mut sorted_obs: Vec<(f64, usize)> = subject.obs_times.iter().copied().zip(0..).collect();
-    sorted_obs.sort_by(|a, b| a.0.total_cmp(&b.0));
+    // The shared index (`ode::predictions::RecordIndex`), not a private copy: its
+    // `records_at_break` is the one spelling of the #1226 band rule, and the ODE engines
+    // resolve their boundary records through the same type.
+    let obs_index = crate::ode::predictions::RecordIndex::new(&subject.obs_times);
+    let sorted_obs = obs_index.sorted();
     // Record `src` at every not-yet-recorded observation whose time matches `q`.
     let record_at = |q: f64, src: &[T], states: &mut [Vec<T>], recorded: &mut [bool]| {
         // Candidates lie within the relative tolerance band; widen slightly for the
@@ -6581,12 +6584,10 @@ fn integrate_g<T: crate::sens::num::PkNum>(
     // One-sided, like every other recording site: [`reads_at_break`] never claims a time
     // *before* the break, so an observation a hair earlier keeps the pre-event state the
     // preceding segment gave it.
-    let record_at_break = |q: f64, src: &[T], states: &mut [Vec<T>], recorded: &mut [bool]| {
-        let lo = sorted_obs.partition_point(|&(t, _)| t < q);
-        for &(t, j) in &sorted_obs[lo..] {
-            if !crate::ode::predictions::reads_at_break(t, q) {
-                break;
-            }
+    let mut band_scratch: Vec<usize> = Vec::new();
+    let mut record_at_break = |q: f64, src: &[T], states: &mut [Vec<T>], recorded: &mut [bool]| {
+        obs_index.records_at_break(q, &mut band_scratch);
+        for &j in &band_scratch {
             states[j].copy_from_slice(src);
             recorded[j] = true;
         }
