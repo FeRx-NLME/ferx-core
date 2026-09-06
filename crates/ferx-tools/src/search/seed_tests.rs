@@ -92,3 +92,93 @@ fn seed_from_raises_the_diagonal_only() {
         "diagonal floored, off-diagonal verbatim: {params:?}"
     );
 }
+
+/// The #1256 vancomycin case: every declared variance is ordinary, but the
+/// block's correlations leave `ETA_V2` with a Cholesky diagonal of 6.1e-6 —
+/// the engine refuses to start a child there (`E_OMEGA_INIT_AT_RAIL`). The
+/// seed nudges the block by `δ·I` until its factor is above the rail.
+#[test]
+fn seed_from_regularises_a_block_whose_cholesky_diagonal_is_at_the_rail() {
+    // A 3×3 block whose third Schur complement is exactly the rail.
+    let mut fit = fixture_fit();
+    let names = fit.eta_names.clone();
+    assert_eq!(names.len(), 3, "the warfarin fixture has three η");
+    let rail: f64 = 6.144_212_353_328_21e-6;
+    // ω = L Lᵀ with L = [[a,0,0],[b,c,0],[d,e,f]], f² = rail.
+    let (a, b, c, d, e, f) = (0.6f64, 0.3f64, 0.1f64, 0.2f64, 0.9f64, rail.sqrt());
+    let l = nalgebra::DMatrix::from_row_slice(3, 3, &[a, 0.0, 0.0, b, c, 0.0, d, e, f]);
+    fit.omega = &l * l.transpose();
+    assert!(
+        (0..3).all(|k| fit.omega[(k, k)] > MIN_SEED_VARIANCE),
+        "every declared variance is ordinary: {:?}",
+        fit.omega
+    );
+    assert!(!super::cholesky_above_rail(&fit.omega));
+
+    // A model that blocks the three η, so `SeedInits` writes the block.
+    let src = std::fs::read_to_string(MODEL).unwrap();
+    let src = src
+        .replace("  omega ETA_CL ~ 0.09\n", "")
+        .replace("  omega ETA_V  ~ 0.04\n", "")
+        .replace(
+            "  omega ETA_KA ~ 0.30\n",
+            "  block_omega (ETA_CL, ETA_V, ETA_KA) = [0.09, 0.0, 0.04, 0.0, 0.0, 0.30]\n",
+        );
+    let mut model = ModelText::parse(&src).unwrap();
+    seed_from(&mut model, &fit).expect("seeding a child");
+    let line = model
+        .block_lines("parameters")
+        .into_iter()
+        .find(|l| l.starts_with("block_omega"))
+        .expect("the block is written");
+    // Read the written triangle back and factor it: every Cholesky diagonal
+    // is now above the floor, and the declared variances moved by one δ.
+    let tri: Vec<f64> = line
+        .split_once('[')
+        .unwrap()
+        .1
+        .trim_end_matches(']')
+        .split(',')
+        .map(|s| s.trim().parse().unwrap())
+        .collect();
+    assert_eq!(tri.len(), 6, "{line}");
+    let mut written = nalgebra::DMatrix::zeros(3, 3);
+    let mut i = 0;
+    for r in 0..3 {
+        for c in 0..=r {
+            written[(r, c)] = tri[i];
+            written[(c, r)] = tri[i];
+            i += 1;
+        }
+    }
+    assert!(super::cholesky_above_rail(&written), "{line}");
+    for k in 0..3 {
+        let moved = written[(k, k)] - fit.omega[(k, k)];
+        assert!(
+            (moved - MIN_SEED_VARIANCE).abs() < 1e-12,
+            "diagonal {k} moved by {moved:e}, not one δ"
+        );
+    }
+    // One nudge of δ lifts the collapsed Schur complement to at least δ.
+    let l_new = nalgebra::Cholesky::new(written).unwrap();
+    let l_new = l_new.l();
+    assert!(l_new[(2, 2)] * l_new[(2, 2)] >= MIN_SEED_VARIANCE);
+
+    // The mutation this pins: `SeedInits` alone writes the singular block.
+    let mut verbatim = ModelText::parse(&src).unwrap();
+    verbatim.apply(ModelEdit::SeedInits(&fit)).unwrap();
+    let raw = verbatim
+        .block_lines("parameters")
+        .into_iter()
+        .find(|l| l.starts_with("block_omega"))
+        .unwrap();
+    assert_ne!(raw, line);
+}
+
+/// A healthy block is left alone: no nudge, no clone.
+#[test]
+fn seed_from_leaves_a_well_conditioned_block_alone() {
+    let fit = fixture_fit();
+    assert!(super::cholesky_above_rail(&fit.omega));
+    assert!(super::floor_variances(&fit).is_none());
+}

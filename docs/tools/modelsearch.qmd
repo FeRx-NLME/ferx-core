@@ -116,7 +116,12 @@ orders happen to render the same text. A variance the parent collapsed
 (an ω at the optimizer's rail, 6 × 10⁻⁶) is seeded at the smallest value
 the engine will start from, 10⁻⁵, so the child can still be fitted; on the
 warfarin example a lag whose η collapsed would otherwise have left every
-two-compartment lag candidate seeded from it unfittable.
+two-compartment lag candidate seeded from it unfittable. A `block_omega`
+can collapse the same way through its *correlations* — every declared
+variance ordinary, one Cholesky diagonal at the rail (the vancomycin base's
+`ETA_V2`) — and is nudged by 10⁻⁵ on its diagonal until its factor clears
+the rail. `SeedInits` on its own stays faithful to the fit; the floor and
+the nudge belong to a search deriving a child.
 
 **`reduced_stepwise`** — the default, as in Pharmpy. As above, but before a
 layer is extended the models that carry the same feature *set* are collapsed
