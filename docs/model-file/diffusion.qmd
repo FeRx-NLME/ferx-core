@@ -171,6 +171,12 @@ equivalence:
 | `lagtime` / `ALAGn` | `W_SDE_LAGTIME` | every dose is applied at its record time |
 | `SS=1` steady-state dose | `W_SDE_STEADY_STATE` | the record is applied as a single dose, not equilibrated |
 
+These are **fitting** gaps, not prediction gaps. The filter runs only inside the objective, so
+`predict()` and `simulate()` on the same model go through the ordinary ODE path, which does
+equilibrate a steady-state dose and does apply a lag time. A model can therefore show a correct
+`IPRED` and a wrong objective at the same time — which is why the warnings are raised by `fit()`
+and `ferx check` rather than at prediction time.
+
 The steady-state gap is the one most likely to be mistaken for a converged answer: on a
 1-cpt model with `CL = 1`, `V = 20`, one `SS=1, II=12` record and an autonomous right-hand
 side, the EKF returns `90.48` where an explicit eleven-dose train returns `200.27`. The

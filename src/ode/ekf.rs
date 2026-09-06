@@ -1126,7 +1126,15 @@ mod tests {
 
         for (i, &t) in obs_times.iter().enumerate() {
             let p_analytic = (sigma2_w / (2.0 * ke)) * (1.0 - (-2.0 * ke * t).exp());
-            // Euler covariance propagation introduces O(Δt²) error; 5% tolerance is adequate.
+            // 5% is a **discretisation floor, not a loose tolerance**: `propagate_covariance`
+            // steps the Riccati equation with forward Euler at `DT_MAX = 0.5`, so at `t = 1`
+            // it computes exactly `Q·0.5 + (Q − 2·ke·P₁)·0.5` — for this fixture
+            // `0.04·0.5 + (0.04 − 2·0.05·0.02)·0.5 = 0.039` — against a true `0.0380650`,
+            // i.e. 2.46% before any other source of error. The realised error falls with `t`
+            // as `P` approaches steady state (2.46% → 1.32% over t = 1…12), so this bound is
+            // set by the smallest `t` in the grid. Any oracle for this quantity inherits the
+            // same floor; see `ekf_covariance_matches_a_quadrature_oracle_on_a_time_varying_rate`
+            // (#1263), which measures it on a time-varying rate.
             assert_relative_eq!(ekf_pts[i].p_obs, p_analytic, max_relative = 0.05);
         }
     }
