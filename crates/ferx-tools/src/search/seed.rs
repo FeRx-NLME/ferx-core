@@ -35,29 +35,67 @@ pub(crate) const MIN_SEED_VARIANCE: f64 = 1e-5;
 /// The floored variance is the same no-variability model the parent found —
 /// spelled so the child can move off it.
 pub(crate) fn seed_from(model: &mut ModelText, fit: &FitResult) -> Result<(), String> {
-    let floored = floor_variances(fit);
+    let blocks = free_blocks_of(model, &fit.eta_names);
+    let floored = floor_variances(fit, &blocks);
     model.apply(ModelEdit::SeedInits(floored.as_ref().unwrap_or(fit)))
 }
 
-/// How many times a near-singular ω may be nudged by `MIN_SEED_VARIANCE·I`
-/// before the seed gives up and hands the parent's ω through verbatim (so
-/// the engine's own message names the block).
+/// How many times a near-singular block may be nudged by `MIN_SEED_VARIANCE·I`
+/// before the seed gives up on it and hands the parent's block through
+/// verbatim (so the engine's own message names the block).
 const MAX_NUDGES: usize = 16;
+
+/// The η indices of every `block_omega` the model declares **free** — a
+/// `FIX`ed block is a statement about the model, which `SeedInits` leaves
+/// alone and the engine exempts from the rail, so it is never nudged and
+/// never a reason to touch anything else. A block naming an η the fit does
+/// not carry is skipped too: there is nothing to seed it from.
+fn free_blocks_of(model: &ModelText, eta_names: &[String]) -> Vec<Vec<usize>> {
+    let mut blocks = Vec::new();
+    for line in model.block_lines("parameters") {
+        let Some(rest) = line.strip_prefix("block_omega") else {
+            continue;
+        };
+        if rest
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|tok| tok.eq_ignore_ascii_case("FIX"))
+        {
+            continue;
+        }
+        let Some((_, inner)) = rest.split_once('(') else {
+            continue;
+        };
+        let Some((names, _)) = inner.split_once(')') else {
+            continue;
+        };
+        let idx: Option<Vec<usize>> = names
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|name| eta_names.iter().position(|n| n == name))
+            .collect();
+        if let Some(idx) = idx.filter(|i| i.len() > 1) {
+            blocks.push(idx);
+        }
+    }
+    blocks
+}
 
 /// `fit` with its ω made startable, or `None` when it already was — the
 /// common case, and the one that costs no clone.
 ///
 /// Two things put an ω on the rail. A collapsed **diagonal** (`ω_kk ≤ e⁻¹²`)
-/// is raised to the floor. A **block** whose correlations make it
+/// is raised to the floor. A free **block** whose correlations make it
 /// near-singular — the #1256 vancomycin case, where every declared variance
 /// is ordinary but the Cholesky diagonal for `ETA_V2` is what is left of its
-/// variance after the covariances, 6.1e-6 — is nudged by `δ·I`, δ the same
-/// floor: for a positive-semidefinite ω every Schur complement of `ω + δI`
-/// is at least δ, so one nudge lifts every Cholesky diagonal above the rail
-/// while moving the declared variances by a part in 10⁵ of the floor. A
-/// fitted ω that is slightly *indefinite* in the last digits may need more
-/// than one; the loop is bounded and, past it, the seed is verbatim.
-fn floor_variances(fit: &FitResult) -> Option<FitResult> {
+/// variance after the covariances, 6.1e-6 — is nudged by `δ·I` **on that
+/// block alone**, δ the same floor: for a positive-semidefinite block every
+/// Schur complement of `ω + δI` is at least δ, so one nudge lifts every
+/// Cholesky diagonal above the rail while moving the block's variances by
+/// the floor and nothing outside the block at all. A fitted block that is
+/// slightly *indefinite* in the last digits may need more than one; the
+/// loop is bounded and, past the bound, the block goes through verbatim.
+fn floor_variances(fit: &FitResult, blocks: &[Vec<usize>]) -> Option<FitResult> {
     let n = fit.omega.nrows();
     let mut omega = fit.omega.clone();
     let mut changed = false;
@@ -68,16 +106,35 @@ fn floor_variances(fit: &FitResult) -> Option<FitResult> {
             changed = true;
         }
     }
-    // The block check is on the whole matrix: outside a block ω is diagonal,
-    // so its Cholesky diagonals are the per-block ones and the floored
-    // variances above.
-    let mut nudges = 0;
-    while nudges < MAX_NUDGES && !cholesky_above_rail(&omega) {
-        for k in 0..n {
-            omega[(k, k)] += MIN_SEED_VARIANCE;
+    for block in blocks {
+        if block.iter().any(|&k| k >= n) {
+            continue;
         }
-        changed = true;
-        nudges += 1;
+        let mut sub = omega.select_rows(block).select_columns(block);
+        let mut nudges = 0;
+        while nudges < MAX_NUDGES && !cholesky_above_rail(&sub) {
+            for k in 0..sub.nrows() {
+                sub[(k, k)] += MIN_SEED_VARIANCE;
+            }
+            nudges += 1;
+        }
+        if nudges == 0 {
+            continue;
+        }
+        if cholesky_above_rail(&sub) {
+            for (a, &ia) in block.iter().enumerate() {
+                omega[(ia, ia)] = sub[(a, a)];
+            }
+            changed = true;
+        } else {
+            // Exhausted: the parent's block, verbatim — not sixteen nudges
+            // that still do not start. The engine's message then names it.
+            for &ia in block {
+                for &ib in block {
+                    omega[(ia, ib)] = fit.omega[(ia, ib)];
+                }
+            }
+        }
     }
     if !changed {
         return None;

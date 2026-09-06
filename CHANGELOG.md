@@ -47,7 +47,9 @@ section of the SDLC for the versioning policy).
   the vancomycin base the (CL, V1, V2) block's Cholesky diagonal for `ETA_V2` sat on the
   optimizer's rail (6e-6) through its correlations, every declared variance being ordinary; the
   three-compartment candidate seeded from it was refused by every start. The shared seed now
-  nudges such a block by `1e-5·I` until its factor clears the rail, alongside the diagonal floor.
+  nudges that block alone by `1e-5·I` until its factor clears the rail, alongside the diagonal
+  floor; a standalone ω beside it and a `FIX`ed block are untouched, and a block that cannot be
+  repaired within the bound goes through verbatim.
 - **"All multi-start fits failed" now carries each start's reason** (`start 0: …; start 1: …`),
   so a search table says *why* a candidate never fitted — a refused start is a different repair
   from a diverged fit.

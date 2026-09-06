@@ -180,5 +180,137 @@ fn seed_from_regularises_a_block_whose_cholesky_diagonal_is_at_the_rail() {
 fn seed_from_leaves_a_well_conditioned_block_alone() {
     let fit = fixture_fit();
     assert!(super::cholesky_above_rail(&fit.omega));
-    assert!(super::floor_variances(&fit).is_none());
+    let blocks = super::free_blocks_of(&warfarin_text(), &fit.eta_names);
+    assert!(blocks.is_empty(), "warfarin's ωs are diagonal");
+    assert!(super::floor_variances(&fit, &[vec![0, 1, 2]]).is_none());
+}
+
+/// The review on #1265: the nudge is scoped to the failing block. A
+/// near-singular `(ETA_CL, ETA_V)` block beside a healthy standalone
+/// `ETA_KA` at 2e-5: the block is nudged, `ETA_KA` is written verbatim.
+#[test]
+fn seed_from_nudges_only_the_failing_block_not_a_healthy_standalone_omega() {
+    let mut fit = fixture_fit();
+    let names = fit.eta_names.clone();
+    let cl = names.iter().position(|n| n == "ETA_CL").unwrap();
+    let v = names.iter().position(|n| n == "ETA_V").unwrap();
+    let ka = names.iter().position(|n| n == "ETA_KA").unwrap();
+    // (CL, V) = L Lᵀ with the second Cholesky diagonal on the rail.
+    let rail: f64 = 6.144_212_353_328_21e-6;
+    let (a, b, c) = (0.5f64, 0.3f64, rail.sqrt());
+    fit.omega[(cl, cl)] = a * a;
+    fit.omega[(cl, v)] = a * b;
+    fit.omega[(v, cl)] = a * b;
+    fit.omega[(v, v)] = b * b + c * c;
+    fit.omega[(ka, ka)] = 2e-5;
+    fit.omega[(ka, cl)] = 0.0;
+    fit.omega[(cl, ka)] = 0.0;
+    fit.omega[(ka, v)] = 0.0;
+    fit.omega[(v, ka)] = 0.0;
+
+    let src = std::fs::read_to_string(MODEL).unwrap();
+    let src = src.replace(
+        "omega ETA_CL ~ 0.09\n  omega ETA_V  ~ 0.04",
+        "block_omega (ETA_CL, ETA_V) = [0.09, 0.01, 0.04]",
+    );
+    let mut model = ModelText::parse(&src).unwrap();
+    seed_from(&mut model, &fit).expect("seeding a child");
+    let params = model.block_lines("parameters");
+    assert!(
+        params.contains(&"omega ETA_KA ~ 0.00002".to_string()),
+        "the standalone ω is untouched: {params:?}"
+    );
+    let block = params
+        .iter()
+        .find(|l| l.starts_with("block_omega"))
+        .unwrap();
+    let tri: Vec<f64> = block
+        .split_once('[')
+        .unwrap()
+        .1
+        .trim_end_matches(']')
+        .split(',')
+        .map(|s| s.trim().parse().unwrap())
+        .collect();
+    assert!(
+        (tri[0] - (a * a + MIN_SEED_VARIANCE)).abs() < 1e-12,
+        "{block}"
+    );
+    assert!(
+        (tri[1] - a * b).abs() < 1e-12,
+        "the covariance is verbatim: {block}"
+    );
+    assert!(
+        (tri[2] - (b * b + c * c + MIN_SEED_VARIANCE)).abs() < 1e-12,
+        "{block}"
+    );
+}
+
+/// A `FIX`ed block is never nudged, and is never a reason to touch anything
+/// else: the engine exempts it from the rail, and `SeedInits` leaves a `FIX`
+/// line alone. The standalone ω beside it is seeded verbatim.
+#[test]
+fn seed_from_leaves_a_fixed_block_and_its_neighbours_alone() {
+    let mut fit = fixture_fit();
+    let names = fit.eta_names.clone();
+    let cl = names.iter().position(|n| n == "ETA_CL").unwrap();
+    let v = names.iter().position(|n| n == "ETA_V").unwrap();
+    let ka = names.iter().position(|n| n == "ETA_KA").unwrap();
+    fit.omega[(cl, cl)] = 0.25;
+    fit.omega[(cl, v)] = 0.15;
+    fit.omega[(v, cl)] = 0.15;
+    fit.omega[(v, v)] = 0.09; // exactly singular: 0.15² = 0.25 · 0.09
+    fit.omega[(ka, ka)] = 2e-5;
+    let src = std::fs::read_to_string(MODEL).unwrap();
+    let src = src.replace(
+        "omega ETA_CL ~ 0.09\n  omega ETA_V  ~ 0.04",
+        "block_omega (ETA_CL, ETA_V) = [0.09, 0.01, 0.04] FIX",
+    );
+    let mut model = ModelText::parse(&src).unwrap();
+    seed_from(&mut model, &fit).expect("seeding a child");
+    let params = model.block_lines("parameters");
+    assert!(
+        params.contains(&"block_omega (ETA_CL, ETA_V) = [0.09, 0.01, 0.04] FIX".to_string()),
+        "{params:?}"
+    );
+    assert!(
+        params.contains(&"omega ETA_KA ~ 0.00002".to_string()),
+        "{params:?}"
+    );
+    assert!(super::free_blocks_of(&model, &names).is_empty());
+}
+
+/// Past `MAX_NUDGES` the block goes through verbatim — not sixteen nudges
+/// that still do not start. An indefinite block (covariance far larger than
+/// its variances) never becomes positive-definite by `16·δ`.
+#[test]
+fn seed_from_hands_an_unrepairable_block_through_verbatim() {
+    let mut fit = fixture_fit();
+    let names = fit.eta_names.clone();
+    let cl = names.iter().position(|n| n == "ETA_CL").unwrap();
+    let v = names.iter().position(|n| n == "ETA_V").unwrap();
+    fit.omega[(cl, cl)] = 1e-5;
+    fit.omega[(v, v)] = 1e-5;
+    fit.omega[(cl, v)] = 1e-3;
+    fit.omega[(v, cl)] = 1e-3;
+    let src = std::fs::read_to_string(MODEL).unwrap();
+    let src = src.replace(
+        "omega ETA_CL ~ 0.09\n  omega ETA_V  ~ 0.04",
+        "block_omega (ETA_CL, ETA_V) = [0.09, 0.01, 0.04]",
+    );
+    let blocks = super::free_blocks_of(&ModelText::parse(&src).unwrap(), &names);
+    assert_eq!(blocks, vec![vec![cl, v]]);
+    let floored = super::floor_variances(&fit, &blocks);
+    // Nothing else was below the floor, and the block was given back as it
+    // was: no change at all.
+    assert!(floored.is_none(), "{:?}", floored.map(|f| f.omega));
+
+    let mut model = ModelText::parse(&src).unwrap();
+    seed_from(&mut model, &fit).expect("seeding a child");
+    let mut verbatim = ModelText::parse(&src).unwrap();
+    verbatim.apply(ModelEdit::SeedInits(&fit)).unwrap();
+    assert_eq!(
+        model.block_lines("parameters"),
+        verbatim.block_lines("parameters")
+    );
 }

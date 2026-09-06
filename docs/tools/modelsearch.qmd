@@ -119,8 +119,11 @@ warfarin example a lag whose η collapsed would otherwise have left every
 two-compartment lag candidate seeded from it unfittable. A `block_omega`
 can collapse the same way through its *correlations* — every declared
 variance ordinary, one Cholesky diagonal at the rail (the vancomycin base's
-`ETA_V2`) — and is nudged by 10⁻⁵ on its diagonal until its factor clears
-the rail. `SeedInits` on its own stays faithful to the fit; the floor and
+`ETA_V2`) — and that block alone is nudged by 10⁻⁵ on its diagonal until
+its factor clears the rail; a standalone ω beside it, and a `FIX`ed block,
+are left as they are, and a block that does not clear the rail after a
+bounded number of nudges goes through verbatim so the engine's own message
+names it. `SeedInits` on its own stays faithful to the fit; the floor and
 the nudge belong to a search deriving a child.
 
 **`reduced_stepwise`** — the default, as in Pharmpy. As above, but before a
