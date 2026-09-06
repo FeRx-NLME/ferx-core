@@ -441,6 +441,25 @@ fn test_extract_eigenvalues_none_on_nan() {
     );
 }
 
+/// extract_eigenvalues returns None — rather than panicking — for a 0x0 matrix.
+///
+/// A model with no random effects has a 0x0 Omega, and the non-finite-objective diagnostic
+/// in `compute_covariance` inspects exactly that matrix when a fit has already gone wrong.
+/// `nalgebra`'s `SymmetricEigen::new` panics on an empty input, so before this guard an
+/// `n_eta = 0` fit whose objective went non-finite aborted with "Unable to compute the
+/// symmetric tridiagonal decomposition of an empty matrix" instead of reporting the
+/// objective. Both conjuncts are required to reach it — measured: `n_eta = 1` with a
+/// non-finite objective returns the `1e20` sentinel and does not panic, and `n_eta = 0`
+/// with a finite objective never enters this branch.
+#[test]
+fn test_extract_eigenvalues_none_on_empty_matrix() {
+    let h: DMatrix<f64> = DMatrix::zeros(0, 0);
+    assert!(
+        extract_eigenvalues(&h).is_none(),
+        "a 0x0 matrix must return None, not panic"
+    );
+}
+
 /// packed_param_label decodes the lower-triangular block-omega index correctly.
 /// Packing order (column-major lower triangle): (0,0), (1,0), (1,1).
 /// With n_theta=2, packed_idx=3 → omega_idx=1 → (row=1, col=0).

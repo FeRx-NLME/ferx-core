@@ -3971,6 +3971,51 @@ pub fn check_model_data_warnings(
         }
     }
 
+    // Absorption lag times are not applied on the EKF/SDE path. `solve_ekf` never calls
+    // `DoseAttrMap::lagtime`: the bolus lands at the raw `dose.time`, `active_infusions`
+    // is handed an empty lag slice, and the `TAD` anchor is computed at zero lag. Same
+    // silent-drop shape as `W_SDE_RESET` above (#1263 review).
+    if model.is_sde() && model.has_lagtime() {
+        diags.push(Diagnostic::warning(
+            "W_SDE_LAGTIME",
+            "This model declares an absorption lag time (`lagtime` / `ALAGn`) with a \
+             [diffusion] (SDE) model. Lag times are not yet honoured on the EKF/SDE \
+             path — every dose is applied at its record time and the lag is ignored. \
+             Use an ODE or analytical model if the lag matters."
+                .to_string(),
+        ));
+    }
+
+    // Steady-state doses are not equilibrated on the EKF/SDE path. `solve_ekf` applies an
+    // `SS=1` record as a single bolus and never runs the equilibration, so the state is
+    // the one-dose state while `tad_anchor_for`'s `ss` branch hands the RHS a `TAD`
+    // folded into `[0, II)` — an anchor describing a periodic pulse train that this
+    // engine did not build. Measured on #1263: 55% low against an explicit train on an
+    // autonomous model (90.48 vs 200.27), and a further 24.1% `ipred` divergence at
+    // t=150 for an `SS=1` infusion whose end break lands past a virtual pulse. Both are
+    // silent — hence a warning rather than a quiet wrong answer (#1260).
+    if model.is_sde() {
+        let n_ss_sde = population
+            .subjects
+            .iter()
+            .filter(|s| s.has_periodic_ss_dose())
+            .count();
+        if n_ss_sde > 0 {
+            diags.push(Diagnostic::warning(
+                "W_SDE_STEADY_STATE",
+                format!(
+                    "{} subject(s) have SS=1 dose records with a [diffusion] (SDE) \
+                     model. Steady-state doses are not yet equilibrated on the EKF/SDE \
+                     path — the record is applied as a single dose, so predictions and \
+                     the objective reflect a one-dose history rather than a steady \
+                     state. Use an ODE or analytical model, or expand the steady state \
+                     into an explicit dose train.",
+                    n_ss_sde
+                ),
+            ));
+        }
+    }
+
     // Negative typical-value lag time at the initial point (eta = 0).
     if model.has_lagtime() {
         if let Some(first_subj) = population.subjects.first() {

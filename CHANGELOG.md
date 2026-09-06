@@ -479,6 +479,43 @@ section of the SDLC for the versioning policy).
   `minimization_successful` fraction. Re-running a bootstrap of an unchanged model can therefore
   report slightly different CIs than before; `--summarize` over a stored `raw_results.csv`
   re-applies the criteria without refitting.
+- **An `[odes]` right-hand side that reads `TAD` / `TAFD` no longer destroys the objective on an
+  SDE (`[diffusion]`) model (#1131).** The extended-Kalman-filter path handed the compiled RHS a
+  bare PK parameter array, two slots shorter than the one the ODE predictors build, so both
+  model-time anchors read as missing and the RHS injected `NaN`. The state was then clamped back
+  to a plausible-looking number while the observation variance kept the `NaN`, so `ipred` looked
+  right and the fit silently reported the diverged-subject sentinel (`OFV` ≈ `2e20`) instead of a
+  real objective. The EKF now carries the same extended array and re-anchors `TAD` per dose
+  segment by the same rule as the two ODE predictors, so an SDE fit of a time-varying RHS agrees
+  with its zero-diffusion ODE twin. A model whose RHS reads neither builtin is bit-identical to
+  before.
+- **A model with no random effects no longer panics when its objective is non-finite (#1259).**
+  The covariance step's non-finite-objective diagnostic asked for the eigenvalues of the
+  0×0 OMEGA such a model has, which `nalgebra` rejects. It now reports the non-finite objective
+  as the failure reason, which is what the diagnostic exists to say.
+- **An infusion under `F ≠ 1` no longer delivers zero drug on an SDE (`[diffusion]`) model
+  (#1263).** Bioavailability reshapes a `RATE`-defined infusion's *duration*, not its rate, and
+  the EKF path placed the window's segment boundary at the unscaled end. The infusion window
+  then failed its own membership test in every segment, so the dose delivered no mass at all and
+  every prediction read zero. The boundary is now `F`-scaled, matching the ODE path and NONMEM
+  (anchored against `nonmem_anchor/oral_central_inf_advan2_f06`).
+- **An SDE model whose records start after `t = 0` no longer inflates its observation variance
+  (#1263).** The EKF began integrating at a hard-coded `t = 0` rather than at the subject's first
+  record, so the covariance accumulated process noise across a segment that does not exist —
+  for a first dose at `t = 24`, thirteen times the correct value at the first observation. An
+  `init(state) = …` starting amount was decayed across the same phantom segment.
+- **Two observation records at the same time no longer read as zero on an SDE model (#1263).**
+  Inside a dose segment the EKF kept one record per observation time, so a second record at that
+  instant kept its initialised `0.0` prediction and variance and fed a plausible zero into the
+  likelihood. All records at one instant now share a single filter update, as they already did
+  at a dose boundary.
+- **Dosing features the EKF/SDE path does not implement now warn instead of returning a
+  plausible wrong answer (#1263, #1260).** An `SS=1` record is applied as a single dose rather
+  than equilibrated (`W_SDE_STEADY_STATE`), and an absorption `lagtime` / `ALAGn` is ignored
+  (`W_SDE_LAGTIME`) — joining the existing `W_SDE_RESET`. Neither gap is visible in `IPRED`, and
+  the steady-state one is large: a 1-cpt model with one `SS=1, II=12` record predicts `90.48`
+  where the equivalent explicit dose train predicts `200.27`. Expand the steady state into
+  explicit records, or fit without `[diffusion]`.
 
 ## [0.3.1] - 2026-09-02
 

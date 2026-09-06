@@ -177,8 +177,25 @@ fn fmt_eig(v: f64) -> String {
     }
 }
 
-/// Eigenvalues of `sym` sorted descending. Returns `None` if any eigenvalue is non-finite.
+/// Eigenvalues of `sym` sorted descending. Returns `None` if any eigenvalue is non-finite,
+/// or if `sym` is empty.
+///
+/// The empty case is reachable, not defensive: a model with **no random effects** has a
+/// 0×0 Omega, and the non-finite-objective diagnostic below asks this function to inspect
+/// it precisely when the fit has already gone wrong. `nalgebra`'s `SymmetricEigen::new`
+/// panics outright on a 0×0 input ("Unable to compute the symmetric tridiagonal
+/// decomposition of an empty matrix"), so an `n_eta = 0` fit whose objective went
+/// non-finite aborted with that message instead of reporting the objective — the diagnostic
+/// killed the run it was there to explain. `None` is the existing "cannot diagnose" signal
+/// and every caller already handles it.
+///
+/// One predicate, not `nrows() == 0 || ncols() == 0`: those two reject exactly the same
+/// inputs here, so either could be deleted with the guard still passing its own test —
+/// the redundant-gate hole from #1229 / #1255.
 pub(crate) fn extract_eigenvalues(sym: &DMatrix<f64>) -> Option<Vec<f64>> {
+    if sym.is_empty() {
+        return None;
+    }
     let eig = SymmetricEigen::new(sym.clone());
     if eig.eigenvalues.iter().any(|l| !l.is_finite()) {
         return None;
