@@ -36,7 +36,11 @@ section of the SDLC for the versioning policy).
   Anchored against NONMEM 7.5 on the warfarin dataset: same OFVs, same BIC ranking.
 - **`NewParameter::fixed` in `ferx-core::edit` (#1181).** `SetStructural` can declare a new
   parameter's θ `FIX` — a fixed transit-compartment count stated as a named parameter rather
-  than a literal binding, so the ODE twin and the estimates file still see it.
+  than a literal binding, so the ODE twin and the estimates file still see it. **Breaking for
+  struct-literal construction**: `NewParameter` gained the field and is now `#[non_exhaustive]`;
+  build one with `NewParameter::new(name, theta, init, lower, upper)` and the `.with_iiv(...)` /
+  `.fixed()` builders, which makes the next field addition non-breaking. Its fields stay public
+  to read. No effect on `.ferx` models, the CLI or the R wrapper, none of which constructs it.
 
 ### Fixed
 - **`SeedInits` floors a collapsed variance at the smallest startable one (#1181).** A parent

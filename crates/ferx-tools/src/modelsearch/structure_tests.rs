@@ -308,11 +308,11 @@ fn a_category_is_moved_once_per_path_and_repeats_are_refused() {
     let inst = FeatureKey::Absorption(Absorption::Inst);
     let fo_ = FeatureKey::Absorption(Absorption::Fo);
     let lag = FeatureKey::Lagtime(true);
-    assert!(allowed(&lag, &[], &funcs));
-    assert!(!allowed(&lag, &[lag], &funcs));
-    assert!(!allowed(&fo_, &[inst], &funcs));
-    assert!(!allowed(&inst, &[fo_], &funcs));
-    assert!(allowed(&lag, &[fo_], &funcs));
+    assert!(allowed(&lag, &[], &funcs, &fo(0)));
+    assert!(!allowed(&lag, &[lag], &funcs, &fo(0)));
+    assert!(!allowed(&fo_, &[inst], &funcs, &fo(0)));
+    assert!(!allowed(&inst, &[fo_], &funcs, &fo(0)));
+    assert!(allowed(&lag, &[fo_], &funcs, &fo(0)));
 }
 
 #[test]
@@ -320,36 +320,42 @@ fn peripherals_start_at_the_smallest_count_then_any_other() {
     let funcs = keys("PERIPHERALS(1..2); LAGTIME(ON)");
     let p1 = FeatureKey::Peripherals(1);
     let p2 = FeatureKey::Peripherals(2);
-    assert!(allowed(&p1, &[], &funcs));
+    assert!(allowed(&p1, &[], &funcs, &fo(0)));
     assert!(
-        !allowed(&p2, &[], &funcs),
+        !allowed(&p2, &[], &funcs, &fo(0)),
         "the first peripheral move must be the smallest"
     );
-    assert!(allowed(&p2, &[p1], &funcs));
-    assert!(!allowed(&p1, &[p1], &funcs));
+    assert!(allowed(&p2, &[p1], &funcs, &fo(0)));
+    assert!(!allowed(&p1, &[p1], &funcs, &fo(0)));
     // Pharmpy's rule verbatim: after a non-minimal count, any count other
     // than the smallest is still allowed — `0 → 2 → 1` is a path.
     let funcs = keys("PERIPHERALS(0..2)");
     let p0 = FeatureKey::Peripherals(0);
-    assert!(allowed(&p1, &[p0, p2], &funcs));
-    assert!(!allowed(&p0, &[p2], &funcs));
+    assert!(allowed(&p1, &[p0, p2], &funcs, &fo(0)));
+    assert!(!allowed(&p0, &[p2], &funcs, &fo(0)));
     // A peripheral move is exempt from the same-category rule.
-    assert!(allowed(&p2, &[p0], &funcs));
+    assert!(allowed(&p2, &[p0], &funcs, &fo(0)));
 }
 
 #[test]
-fn transits_zero_is_never_a_move() {
+fn transits_zero_is_a_move_only_off_a_chain() {
     let funcs = keys("TRANSITS(0..2, NODEPOT)");
-    assert!(!allowed(
-        &FeatureKey::Transits(TransitCount::Count(0)),
-        &[],
-        &funcs
-    ));
-    assert!(allowed(
-        &FeatureKey::Transits(TransitCount::Count(2)),
-        &[],
-        &funcs
-    ));
+    let t0 = FeatureKey::Transits(TransitCount::Count(0));
+    let t2 = FeatureKey::Transits(TransitCount::Count(2));
+    // On a first-order model TRANSITS(0) is the model itself (Pharmpy's rule).
+    assert!(!allowed(&t0, &[], &funcs, &fo(0)));
+    assert!(allowed(&t2, &[], &funcs, &fo(0)));
+    // From a chain, dropping it is a real move — one Pharmpy cannot make,
+    // since its base never carries a chain into the space.
+    let chain = Structure {
+        transits: Some(TransitCount::Count(3)),
+        ..fo(0)
+    };
+    assert!(allowed(&t0, &[], &funcs, &chain));
+    // …and still one move per category: not after another transit step.
+    assert!(!allowed(&t0, &[t2], &funcs, &chain));
+    assert!(!combination_allowed(&[t0], &fo(0)));
+    assert!(combination_allowed(&[t0], &chain));
 }
 
 #[test]
@@ -362,19 +368,23 @@ fn pharmpys_unsupported_pairs_are_refused_in_either_order() {
     let t3 = FeatureKey::Transits(TransitCount::Count(3));
     let tn = FeatureKey::Transits(TransitCount::N);
     for (a, b) in [(inst, lag), (inst, t3), (lag, t3), (lag, tn), (fo_, t1)] {
-        assert!(!allowed(&a, &[b], &funcs), "{a} after {b}");
-        assert!(!allowed(&b, &[a], &funcs), "{b} after {a}");
+        assert!(!allowed(&a, &[b], &funcs, &fo(0)), "{a} after {b}");
+        assert!(!allowed(&b, &[a], &funcs, &fo(0)), "{b} after {a}");
     }
     // …and the pairs Pharmpy allows: FO with three transits, in both orders.
-    assert!(allowed(&t3, &[fo_], &funcs));
-    assert!(allowed(&fo_, &[t3], &funcs));
+    assert!(allowed(&t3, &[fo_], &funcs, &fo(0)));
+    assert!(allowed(&fo_, &[t3], &funcs, &fo(0)));
     // The exhaustive filter applies the same table to a combination.
-    assert!(!combination_allowed(&[inst, lag]));
-    assert!(!combination_allowed(&[t3, lag]));
-    assert!(!combination_allowed(&[FeatureKey::Transits(
-        TransitCount::Count(0)
-    )]));
-    assert!(combination_allowed(&[fo_, t3, FeatureKey::Peripherals(1)]));
+    assert!(!combination_allowed(&[inst, lag], &fo(0)));
+    assert!(!combination_allowed(&[t3, lag], &fo(0)));
+    assert!(!combination_allowed(
+        &[FeatureKey::Transits(TransitCount::Count(0))],
+        &fo(0)
+    ));
+    assert!(combination_allowed(
+        &[fo_, t3, FeatureKey::Peripherals(1)],
+        &fo(0)
+    ));
 }
 
 // ── from a structure to an edit ─────────────────────────────────────────────
@@ -434,6 +444,7 @@ fn widening_keeps_bound_variables_by_slot_and_declares_the_rest_from_pharmpy_rul
     let parent = template("pk one_cpt_oral(cl=CL, v=V, ka=KA)");
     let spec = structural_spec(
         &fo(1),
+        &fo(0),
         &parent,
         &lines(),
         &defaults(),
@@ -474,7 +485,15 @@ fn widening_keeps_bound_variables_by_slot_and_declares_the_rest_from_pharmpy_rul
 
     // Two peripherals at once: the first Q is a tenth of CL, the second
     // nine tenths, both volumes 0.05·Vc.
-    let spec = structural_spec(&fo(2), &parent, &lines(), &defaults(), IivStrategy::NoAdd).unwrap();
+    let spec = structural_spec(
+        &fo(2),
+        &fo(0),
+        &parent,
+        &lines(),
+        &defaults(),
+        IivStrategy::NoAdd,
+    )
+    .unwrap();
     assert_eq!(spec.template, "three_cpt_oral");
     let by_name: HashMap<&str, &NewParameter> = spec
         .new_parameters
@@ -496,7 +515,15 @@ fn widening_keeps_bound_variables_by_slot_and_declares_the_rest_from_pharmpy_rul
 #[test]
 fn a_second_peripheral_on_a_two_compartment_parent_reuses_q_and_v2_by_slot() {
     let parent = template("pk two_cpt_oral(cl=CL, v1=VC, q=QP, v2=VP, ka=KA)");
-    let spec = structural_spec(&fo(2), &parent, &lines(), &defaults(), IivStrategy::NoAdd).unwrap();
+    let spec = structural_spec(
+        &fo(2),
+        &fo(0),
+        &parent,
+        &lines(),
+        &defaults(),
+        IivStrategy::NoAdd,
+    )
+    .unwrap();
     let bindings: Vec<(&str, &str)> = spec
         .bindings
         .iter()
@@ -525,7 +552,15 @@ fn a_second_peripheral_on_a_two_compartment_parent_reuses_q_and_v2_by_slot() {
 #[test]
 fn narrowing_binds_only_what_the_smaller_template_reads() {
     let parent = template("pk two_cpt_oral(cl=CL, v1=V, q=Q, v2=V2, ka=KA)");
-    let spec = structural_spec(&fo(0), &parent, &lines(), &defaults(), IivStrategy::NoAdd).unwrap();
+    let spec = structural_spec(
+        &fo(0),
+        &fo(0),
+        &parent,
+        &lines(),
+        &defaults(),
+        IivStrategy::NoAdd,
+    )
+    .unwrap();
     assert_eq!(spec.template, "one_cpt_oral");
     assert_eq!(
         spec.bindings,
@@ -547,6 +582,7 @@ fn a_lag_time_and_a_transit_chain_take_the_absorption_delay_init_and_eta() {
     };
     let spec = structural_spec(
         &lag,
+        &fo(0),
         &parent,
         &lines(),
         &defaults(),
@@ -568,6 +604,7 @@ fn a_lag_time_and_a_transit_chain_take_the_absorption_delay_init_and_eta() {
     };
     let spec = structural_spec(
         &transit,
+        &fo(0),
         &parent,
         &lines(),
         &defaults(),
@@ -596,6 +633,7 @@ fn a_lag_time_and_a_transit_chain_take_the_absorption_delay_init_and_eta() {
     };
     let spec = structural_spec(
         &estimated,
+        &fo(0),
         &parent,
         &lines(),
         &defaults(),
@@ -630,7 +668,7 @@ fn iiv_strategies_decide_which_new_parameters_get_an_eta() {
         "V = TVV * exp(ETA_V)".to_string(),
     ];
     let etas = |iiv: IivStrategy| -> Vec<String> {
-        structural_spec(&target, &parent, &lines, &d, iiv)
+        structural_spec(&target, &fo(0), &parent, &lines, &d, iiv)
             .unwrap()
             .new_parameters
             .iter()
@@ -643,10 +681,11 @@ fn iiv_strategies_decide_which_new_parameters_get_an_eta() {
         etas(IivStrategy::AddDiagonal),
         vec!["ETA_Q", "ETA_V2", "ETA_KA", "ETA_ALAG"]
     );
-    let err = structural_spec(&target, &parent, &lines, &d, IivStrategy::Fullblock).unwrap_err();
+    let err =
+        structural_spec(&target, &fo(0), &parent, &lines, &d, IivStrategy::Fullblock).unwrap_err();
     assert!(err.contains("fullblock"), "{err}");
     // KA on an IV parent: 1 / (2 · t_first).
-    let spec = structural_spec(&fo(0), &parent, &lines, &d, IivStrategy::NoAdd).unwrap();
+    let spec = structural_spec(&fo(0), &fo(0), &parent, &lines, &d, IivStrategy::NoAdd).unwrap();
     assert_eq!(spec.new_parameters[0].name, "KA");
     assert_eq!(spec.new_parameters[0].init, 1.0);
 }
@@ -663,7 +702,15 @@ fn generated_names_avoid_the_base_models_own() {
         vec!["ETA_CL".into(), "ETA_Q".into()],
         &population(&[0.0, 0.5]),
     );
-    let spec = structural_spec(&fo(1), &parent, &lines(), &d, IivStrategy::AddDiagonal).unwrap();
+    let spec = structural_spec(
+        &fo(1),
+        &fo(0),
+        &parent,
+        &lines(),
+        &d,
+        IivStrategy::AddDiagonal,
+    )
+    .unwrap();
     let q = spec.new_parameters.iter().find(|p| p.name == "Q").unwrap();
     assert_eq!(q.theta, "TVQ_2");
     assert_eq!(q.iiv.as_ref().unwrap().0, "ETA_Q_2");
@@ -672,7 +719,7 @@ fn generated_names_avoid_the_base_models_own() {
         parameters: vec!["CL".into(), "V".into(), "KA".into(), "Q".into()],
         ..d
     };
-    let spec = structural_spec(&fo(1), &parent, &lines(), &d, IivStrategy::NoAdd).unwrap();
+    let spec = structural_spec(&fo(1), &fo(0), &parent, &lines(), &d, IivStrategy::NoAdd).unwrap();
     assert!(spec.new_parameters.iter().all(|p| p.name != "Q"));
     assert!(spec.bindings.contains(&("q".to_string(), "Q".to_string())));
 }
@@ -694,14 +741,14 @@ fn inits_scale_from_the_parents_own_clearance_and_volume_lines() {
         "VC = TVVC * exp(ETA_V)".to_string(),
         "KA = TVKA".to_string(),
     ];
-    let spec = structural_spec(&fo(1), &parent, &lines, &d, IivStrategy::NoAdd).unwrap();
+    let spec = structural_spec(&fo(1), &fo(0), &parent, &lines, &d, IivStrategy::NoAdd).unwrap();
     let q = spec.new_parameters.iter().find(|p| p.name == "Q").unwrap();
     assert_eq!(q.init, 4.0);
     let v2 = spec.new_parameters.iter().find(|p| p.name == "V2").unwrap();
     assert_eq!(v2.init, 2.0);
     // No θ behind the line: Pharmpy's fallbacks, Q = 0.1 and V = 0.1.
     let lines = vec!["CLR = 4.0".to_string(), "VC = 40.0".to_string()];
-    let spec = structural_spec(&fo(1), &parent, &lines, &d, IivStrategy::NoAdd).unwrap();
+    let spec = structural_spec(&fo(1), &fo(0), &parent, &lines, &d, IivStrategy::NoAdd).unwrap();
     let q = spec.new_parameters.iter().find(|p| p.name == "Q").unwrap();
     assert_eq!(q.init, 0.1);
     let v2 = spec.new_parameters.iter().find(|p| p.name == "V2").unwrap();
@@ -720,4 +767,203 @@ fn theta_inits_are_read_off_the_text_so_a_seeded_parent_scales_its_children() {
     assert_eq!(inits.get("TVKA"), Some(&1.5));
     assert!(!inits.contains_key("PL"), "a vector θ has no single init");
     assert_eq!(inits.len(), 2);
+}
+
+// ── the review on #1256 ─────────────────────────────────────────────────────
+
+fn text(src: &str) -> ferx_core::edit::ModelText {
+    ferx_core::edit::ModelText::parse(src).unwrap()
+}
+
+#[test]
+fn a_transit_bases_count_is_read_off_the_declaration_its_n_binding_points_at() {
+    // A literal.
+    let t = template("pk one_cpt_transit(cl=CL, v=V, n=3, mtt=MTT)");
+    let m = text(
+        "[parameters]\n  theta TVMTT(1.0, 0.0, 10.0)\n[individual_parameters]\n  MTT = TVMTT\n",
+    );
+    assert_eq!(
+        Structure::from_model(&t, Some(&m)).unwrap().transits,
+        Some(TransitCount::Count(3))
+    );
+    // A parameter behind a FIXed θ — what the search itself writes.
+    let t = template("pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)");
+    let m = text(
+        "[parameters]\n  theta TVNTR(3.0, 0.0, 64.0) FIX\n  theta TVMTT(1.0, 0.0, 10.0)\n\
+         [individual_parameters]\n  NTR = TVNTR\n  MTT = TVMTT\n",
+    );
+    assert_eq!(
+        Structure::from_model(&t, Some(&m)).unwrap().transits,
+        Some(TransitCount::Count(3))
+    );
+    // The same parameter behind a free θ.
+    let m = text(
+        "[parameters]\n  theta TVNTR(3.0, 0.0, 64.0)\n  theta TVMTT(1.0, 0.0, 10.0)\n\
+         [individual_parameters]\n  NTR = TVNTR\n  MTT = TVMTT\n",
+    );
+    assert_eq!(
+        Structure::from_model(&t, Some(&m)).unwrap().transits,
+        Some(TransitCount::N)
+    );
+    // A parameter set from a number.
+    let m = text("[parameters]\n  theta TVMTT(1.0, 0.0, 10.0)\n[individual_parameters]\n  NTR = 2\n  MTT = TVMTT\n");
+    assert_eq!(
+        Structure::from_model(&t, Some(&m)).unwrap().transits,
+        Some(TransitCount::Count(2))
+    );
+    // A non-integral fixed count is refused by name.
+    let m = text(
+        "[parameters]\n  theta TVNTR(2.5, 0.0, 64.0) FIX\n[individual_parameters]\n  NTR = TVNTR\n",
+    );
+    let err = Structure::from_model(&t, Some(&m)).unwrap_err();
+    assert!(err.contains("2.5") && err.contains("whole number"), "{err}");
+    // Without the text, a chain reads as estimated.
+    assert_eq!(
+        Structure::from_template(&t).unwrap().transits,
+        Some(TransitCount::N)
+    );
+    // The `pk` line alone is not enough for the tests that only need it.
+    assert_eq!(
+        Structure::from_model(&template("pk one_cpt_oral(cl=CL, v=V, ka=KA)"), Some(&m)).unwrap(),
+        fo(0)
+    );
+}
+
+#[test]
+fn a_parents_bioavailability_binding_is_carried_across_a_swap() {
+    // `f` is not a coordinate, and every template reads it: dropping it
+    // would reset F to 1 and prune its θ while the row claims only the
+    // compartment count changed.
+    let parent = template("pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)");
+    let d = Defaults {
+        parameters: vec!["CL".into(), "V".into(), "KA".into(), "F".into()],
+        ..defaults()
+    };
+    let spec = structural_spec(&fo(1), &fo(0), &parent, &lines(), &d, IivStrategy::NoAdd).unwrap();
+    assert_eq!(
+        spec.bindings.last().unwrap(),
+        &("f".to_string(), "F".to_string())
+    );
+    assert!(spec.new_parameters.iter().all(|p| p.name != "F"));
+    // …and to a bolus, where there is no absorption role at all.
+    let iv = Structure {
+        absorption: Absorption::Inst,
+        ..fo(0)
+    };
+    let spec = structural_spec(&iv, &fo(0), &parent, &lines(), &d, IivStrategy::NoAdd).unwrap();
+    assert_eq!(
+        spec.bindings,
+        vec![
+            ("cl".to_string(), "CL".to_string()),
+            ("v".to_string(), "V".to_string()),
+            ("f".to_string(), "F".to_string())
+        ]
+    );
+}
+
+#[test]
+fn a_different_transit_coordinate_rebinds_n_to_a_fresh_parameter() {
+    // The parent's `n=NTR` is behind `theta TVNTR(3) FIX`; `TRANSITS(1)`
+    // must not reuse that declaration — the edit layer binds an existing
+    // name as it is — so `n` goes to a fresh `NTR2` and the old one is
+    // left unreferenced for the pruner.
+    let parent_t = template("pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)");
+    let d = Defaults {
+        parameters: vec!["CL".into(), "V".into(), "NTR".into(), "MTT".into()],
+        theta_names: vec!["TVCL".into(), "TVV".into(), "TVNTR".into(), "TVMTT".into()],
+        ..defaults()
+    };
+    let three = Structure {
+        transits: Some(TransitCount::Count(3)),
+        ..fo(0)
+    };
+    let one = Structure {
+        transits: Some(TransitCount::Count(1)),
+        ..fo(0)
+    };
+    let spec = structural_spec(&one, &three, &parent_t, &lines(), &d, IivStrategy::NoAdd).unwrap();
+    assert!(
+        spec.bindings
+            .contains(&("n".to_string(), "NTR2".to_string())),
+        "{:?}",
+        spec.bindings
+    );
+    assert!(spec
+        .bindings
+        .contains(&("mtt".to_string(), "MTT".to_string())));
+    let n = spec
+        .new_parameters
+        .iter()
+        .find(|p| p.name == "NTR2")
+        .unwrap();
+    assert!(n.fixed);
+    assert_eq!((n.theta.as_str(), n.init), ("TVNTR2", 1.0));
+    // Fixed → estimated: a fresh free θ at Pharmpy's init.
+    let estimated = Structure {
+        transits: Some(TransitCount::N),
+        ..fo(0)
+    };
+    let spec = structural_spec(
+        &estimated,
+        &three,
+        &parent_t,
+        &lines(),
+        &d,
+        IivStrategy::NoAdd,
+    )
+    .unwrap();
+    let n = spec
+        .new_parameters
+        .iter()
+        .find(|p| p.name == "NTR2")
+        .unwrap();
+    assert!(!n.fixed);
+    assert_eq!(n.init, 2.0);
+    // Estimated → fixed likewise.
+    let spec = structural_spec(
+        &three,
+        &estimated,
+        &parent_t,
+        &lines(),
+        &d,
+        IivStrategy::NoAdd,
+    )
+    .unwrap();
+    let n = spec
+        .new_parameters
+        .iter()
+        .find(|p| p.name == "NTR2")
+        .unwrap();
+    assert!(n.fixed && n.init == 3.0);
+    // The same coordinate keeps the parent's declaration untouched.
+    let spec =
+        structural_spec(&three, &three, &parent_t, &lines(), &d, IivStrategy::NoAdd).unwrap();
+    assert!(spec
+        .bindings
+        .contains(&("n".to_string(), "NTR".to_string())));
+    assert!(spec.new_parameters.is_empty());
+    // A chain to first-order: no `n`, a new KA; the chain's parameters are
+    // the pruner's.
+    let spec =
+        structural_spec(&fo(0), &three, &parent_t, &lines(), &d, IivStrategy::NoAdd).unwrap();
+    assert_eq!(spec.template, "one_cpt_oral");
+    assert!(!spec.bindings.iter().any(|(r, _)| r == "n" || r == "mtt"));
+    assert_eq!(spec.new_parameters[0].name, "KA");
+}
+
+#[test]
+fn defaults_of_text_read_the_parents_own_declarations() {
+    let m = text(
+        "[parameters]\n  theta TVCL(0.5, 0.0, 10.0)\n  theta TVQ(0.2, 0.0, 1.0) FIX\n  \
+         omega ETA_CL ~ 0.1\n  block_omega (ETA_V, ETA_KA) = [0.1, 0.01, 0.2]\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = 10\n  if (WT > 70) {\n  Q = TVQ\n  }\n",
+    );
+    let d = Defaults::of_text(&m, 0.5);
+    assert_eq!(d.parameters, vec!["CL", "V", "Q"]);
+    assert_eq!(d.theta_names, vec!["TVCL", "TVQ"]);
+    assert_eq!(d.eta_names, vec!["ETA_CL", "ETA_V", "ETA_KA"]);
+    assert_eq!(d.theta_init["TVQ"], 0.2);
+    assert_eq!(d.t_first, 0.5);
+    let decls = theta_decls_of(&m);
+    assert!(decls[1].fixed && !decls[0].fixed);
 }

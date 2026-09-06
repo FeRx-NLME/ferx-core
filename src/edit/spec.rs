@@ -76,7 +76,13 @@ pub struct StructuralSpec {
 
 /// One `[individual_parameters]` value to create, with the θ (and optional η)
 /// behind it — written in the canonical `P = TVP * exp(ETA_P)` form.
+///
+/// `#[non_exhaustive]`: build one with [`NewParameter::new`] and the
+/// [`with_iiv`](NewParameter::with_iiv) / [`fixed`](NewParameter::fixed)
+/// builders, so the next field this struct grows (as `fixed` did on #1181)
+/// does not break a caller's struct literal. The fields stay public to read.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct NewParameter {
     /// The individual-parameter name, e.g. `Q`.
     pub name: String,
@@ -92,6 +98,39 @@ pub struct NewParameter {
     /// (`TRANSITS(3)`) is the case — so that it still has a name the ODE twin
     /// and the estimates file can see, unlike a literal `n=3` binding.
     pub fixed: bool,
+}
+
+impl NewParameter {
+    /// A free θ with no η: `NAME = THETA`, `theta THETA(init, lower, upper)`.
+    pub fn new(
+        name: impl Into<String>,
+        theta: impl Into<String>,
+        init: f64,
+        lower: f64,
+        upper: f64,
+    ) -> Self {
+        NewParameter {
+            name: name.into(),
+            theta: theta.into(),
+            init,
+            lower,
+            upper,
+            iiv: None,
+            fixed: false,
+        }
+    }
+
+    /// Give the parameter an η: `NAME = THETA * exp(ETA)`, `omega ETA ~ variance`.
+    pub fn with_iiv(mut self, eta: impl Into<String>, variance: f64) -> Self {
+        self.iiv = Some((eta.into(), variance));
+        self
+    }
+
+    /// Declare the θ `FIX`.
+    pub fn fixed(mut self) -> Self {
+        self.fixed = true;
+        self
+    }
 }
 
 /// How an η enters a parameter's expression.

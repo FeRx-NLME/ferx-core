@@ -67,11 +67,12 @@ The four structural categories, and what each value becomes:
 |---|---|---|
 | `ABSORPTION(INST)` | ✓ | the `*_iv` templates |
 | `ABSORPTION(FO)` | ✓ | the `*_oral` templates; `*_transit` when a chain is present |
-| `ABSORPTION(ZO / SEQ-ZO-FO / WEIBULL)` | ✗ | no `pk` template — refused by name when the file is loaded |
+| `ABSORPTION(ZO / WEIBULL)` | ✗ | no `pk` template: `ZO` is a modeled duration on an IV template with `RATE=-2` **in the dataset**, `WEIBULL` the `[odes]` input function `weibull(...)` — both are the `[odes]` candidate family of [#1257](https://github.com/FeRx-NLME/ferx-core/issues/1257), split out of #1181 |
+| `ABSORPTION(SEQ-ZO-FO)` | ✗ | no template and no input function — refused by name when the file is loaded |
 | `ELIMINATION(FO)` | ✓ | every template; the statement is accepted and contributes nothing |
 | `ELIMINATION(ZO / MM / MIX-FO-MM)` | ✗ | see [the elimination gap](#the-elimination-gap) |
 | `PERIPHERALS(0 / 1 / 2)` | ✓ | `one_cpt_*` / `two_cpt_*` / `three_cpt_*` |
-| `TRANSITS(n, NODEPOT)` | ✓ | `*_transit` with a `FIX`ed count, `theta TVNTR(n, …) FIX` |
+| `TRANSITS(n, NODEPOT)` | ✓ | `*_transit` with a `FIX`ed count, `theta TVNTR(n, …) FIX`; `TRANSITS(0)` is a move *off* a chain |
 | `TRANSITS(N)` | ✓ | `*_transit` with the count estimated |
 | `TRANSITS(n, DEPOT)` | ✗ | needs a separate depot with its own `ka` — an `[odes]` model |
 | `LAGTIME(ON / OFF)` | ✓ | the `lagtime=` binding |
@@ -86,7 +87,13 @@ meaningless (below).
 
 The base model must be a `pk` model — `one_cpt_oral`, `two_cpt_iv`, and so
 on. An `ode(...)` model has no template to swap and is refused; so is the
-`*_ig` family, which has no MFL coordinate.
+`*_ig` family, which has no MFL coordinate. A `*_transit` base is read at
+the count its `n` binding declares: a literal (`n=3`) or a parameter behind
+a `FIX`ed θ is `TRANSITS(3)`, a parameter behind a free θ is `TRANSITS(N)`,
+and a non-integral fixed count is refused by name. A base's `f=`
+(bioavailability) binding is not a coordinate and is carried through every
+swap — every template reads it — so `F` and its θ and η survive a change of
+compartment count.
 
 ## The algorithms
 
@@ -174,6 +181,15 @@ estimates:
 | `mtt` | `MTT` | `t₁ / 2` | `(0, 10⁶)` | `absorption_delay`, `add_diagonal` |
 | `n` | `NTR` | the count, `FIX`; or `2.0` for `TRANSITS(N)` | `(0, 64)` | never |
 
+A move that changes a chain the parent already has — another count, or
+fixed ↔ estimated — binds `n` to a **fresh** parameter (`NTR2` when the
+parent's is `NTR`) rather than rewriting the parent's declaration, and the
+old one is pruned with its θ; `MTT` is kept. Names and inits are read off
+the parent's own text after its edits and seeding, not the input's, so a
+name an earlier step pruned (a three-compartment input narrowed to one,
+then widened again) is re-declared, and a θ an earlier step added is not
+declared twice.
+
 A new η has variance 0.01, Pharmpy's initial estimate. A generated name
 that collides with a θ or η the model already declares takes a `_2` suffix;
 a parameter the model declares but does not bind (a leftover `KA` on an IV
@@ -234,6 +250,15 @@ least that much on the criterion; the base stays otherwise, and the ranks
 still show what came closest. When the base itself fails the gate the
 candidates are ranked among themselves and the cutoff cannot apply, which
 the notes say.
+
+What a child is seeded from is never silent. A candidate the runner
+deduplicated (the same canonical text as an earlier one) is seeded from its
+representative's fit, and carries that fit out if it wins; a candidate that
+produced no fit at all extends with its own initial estimates, and the
+notes say so; and a `--resume` row whose cached `fits/<hash>.json` is
+missing or unreadable is an error naming the row and the fix (refit
+without `--resume`) rather than a search that quietly continues from the
+file's initials.
 
 The `seconds` column is deliberate. The analytic templates cost about the
 same per fit, but the column is what shows when one does not — and it is

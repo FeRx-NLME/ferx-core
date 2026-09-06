@@ -478,3 +478,231 @@ fn the_transit_count_of_a_fixed_chain_stays_fixed_through_a_resume() {
     assert_eq!(line(&fit), "theta TVNTR(3.0, 0.0, 64.0) FIX");
     assert_eq!(line(&seeded), line(&fit));
 }
+
+/// A parent's `f=` binding survives a template swap: the two-compartment
+/// candidate of a base with an estimated bioavailability still binds
+/// `f=F`, keeps `TVF`, and is the model a pharmacometrician would have
+/// typed — bit-identical predictions and evaluation against the twin.
+#[test]
+fn an_estimated_bioavailability_is_carried_across_the_swap() {
+    let dir = tempfile::tempdir().unwrap();
+    let base_f = BASE
+        .replace(
+            "  theta TVKA(1.5, 0.01, 50.0)\n",
+            "  theta TVKA(1.5, 0.01, 50.0)\n  theta TVF(0.8, 0.1, 1.0)\n",
+        )
+        .replace(
+            "  KA = TVKA * exp(ETA_KA)\n",
+            "  KA = TVKA * exp(ETA_KA)\n  F = TVF\n",
+        )
+        .replace(
+            "pk one_cpt_oral(cl=CL, v=V, ka=KA)",
+            "pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)",
+        );
+    std::fs::write(dir.path().join("base.ferx"), &base_f).unwrap();
+    let data = Path::new(env!("CARGO_MANIFEST_DIR")).join(DATA);
+    let config = format!(
+        "base = \"base.ferx\"\ndata = \"{}\"\n\n[space]\nmfl = \"PERIPHERALS(0..1)\"\n\n\
+         [modelsearch]\nalgorithm = \"exhaustive\"\n\n\
+         [strictness]\nrequire_converged = false\nreject_init_stall = false\n\
+         reject_on_boundary = false\n\n[run]\nretries = 0\nthreads = 2\n",
+        data.display()
+    );
+    let path = dir.path().join("search.ferxsearch");
+    std::fs::write(&path, config).unwrap();
+    let (config, result) = run(dir.path(), &path);
+    let base = config.load_base().unwrap();
+
+    let two = result
+        .rows
+        .iter()
+        .find(|r| r.structure.peripherals == 1)
+        .expect("the two-compartment candidate");
+    assert!(two.error.is_none(), "{:?}", two.error);
+    let generated = result.models[&two.id].render();
+    assert!(
+        generated.contains("pk two_cpt_oral(cl=CL, v1=V, q=Q, v2=V2, ka=KA, f=F)"),
+        "{generated}"
+    );
+    assert!(generated.contains("theta TVF("), "{generated}");
+    // TVF is estimated, so the candidate has one θ more than a swap that
+    // dropped it would.
+    assert_eq!(
+        two.n_parameters.unwrap(),
+        result.row("base").unwrap().n_parameters.unwrap() + 2
+    );
+
+    let base_fit_result = {
+        let mut o = base.prepared.parsed.fit_options.clone().quiet();
+        o.threads = Some(2);
+        fit(
+            &base.prepared.parsed.model,
+            &base.prepared.population,
+            &base.prepared.init_params,
+            &o,
+        )
+        .unwrap()
+    };
+    let seeded = |name: &str| {
+        let i = base_fit_result
+            .theta_names
+            .iter()
+            .position(|n| n == name)
+            .unwrap();
+        base_fit_result.theta[i]
+    };
+    let hand_written = format!(
+        "\
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta TVF(0.8, 0.1, 1.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.02 (sd)
+  theta TVQ({q}, 0.0, 1000000.0)
+  theta TVV2({v2}, 0.0, 1000000.0)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+  F = TVF
+  Q = TVQ
+  V2 = TVV2
+
+[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V, q=Q, v2=V2, ka=KA, f=F)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = foce
+  maxiter    = 0
+  covariance = false
+  checkpoint = false
+",
+        q = seeded("TVCL"),
+        v2 = 0.05 * seeded("TVV"),
+    );
+    let mut twin = ModelText::parse(&hand_written).unwrap();
+    twin.apply(ModelEdit::SeedInits(&base_fit_result)).unwrap();
+    let hand_written = twin.render();
+
+    let gen = parse_full_model(&generated)
+        .unwrap_or_else(|e| panic!("the generated model must parse: {e}\n---\n{generated}"));
+    let hand = parse_full_model(&hand_written).expect("the hand-written model must parse");
+    assert_eq!(gen.model.theta_names, hand.model.theta_names);
+    assert_eq!(
+        gen.model.default_params.theta,
+        hand.model.default_params.theta
+    );
+    let pop = &base.prepared.population;
+    let gen_pred = predict(&gen.model, pop, &gen.model.default_params);
+    let hand_pred = predict(&hand.model, pop, &hand.model.default_params);
+    for (g, h) in gen_pred.iter().zip(&hand_pred) {
+        assert_eq!(
+            g.pred.to_bits(),
+            h.pred.to_bits(),
+            "PRED differs for subject {}",
+            g.id
+        );
+    }
+    let opts = {
+        let mut o = gen.fit_options.clone().quiet();
+        o.threads = Some(2);
+        o
+    };
+    let gen_fit = fit(&gen.model, pop, &gen.model.default_params, &opts).unwrap();
+    let hand_fit = fit(&hand.model, pop, &hand.model.default_params, &opts).unwrap();
+    assert_eq!(gen_fit.ofv.to_bits(), hand_fit.ofv.to_bits());
+    assert_eq!(two.ofv.unwrap().to_bits(), gen_fit.ofv.to_bits());
+    // The mutation this pins: a swap that dropped `f=F` would evaluate a
+    // different model (F = 1) — the search's own evaluation of the base
+    // with F = 0.8 is not the candidate's with F reset.
+    let base_ofv = result.row("base").unwrap().ofv.unwrap();
+    assert_ne!(two.ofv.unwrap().to_bits(), base_ofv.to_bits());
+}
+
+/// A search from a base that already carries a fixed transit chain: every
+/// move — to no chain, to another count, to an estimated count — compiles
+/// and evaluates, and the rows say which chain each model has.
+#[test]
+fn a_fixed_transit_base_compiles_every_transit_move() {
+    let dir = tempfile::tempdir().unwrap();
+    let chain = "\
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVNTR(3.0, 0.0, 64.0) FIX
+  theta TVMTT(1.0, 0.0, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV * exp(ETA_V)
+  NTR = TVNTR
+  MTT = TVMTT
+
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = foce
+  maxiter    = 0
+  covariance = false
+  checkpoint = false
+";
+    std::fs::write(dir.path().join("base.ferx"), chain).unwrap();
+    let data = Path::new(env!("CARGO_MANIFEST_DIR")).join(DATA);
+    let config = format!(
+        "base = \"base.ferx\"\ndata = \"{}\"\n\n[space]\n\
+         mfl = \"ABSORPTION(FO); TRANSITS([0,1,3], NODEPOT); TRANSITS(N)\"\n\n\
+         [modelsearch]\nalgorithm = \"exhaustive\"\n\n\
+         [strictness]\nrequire_converged = false\nreject_init_stall = false\n\
+         reject_on_boundary = false\n\n[run]\nretries = 0\nthreads = 2\n",
+        data.display()
+    );
+    let path = dir.path().join("search.ferxsearch");
+    std::fs::write(&path, config).unwrap();
+    let (_, result) = run(dir.path(), &path);
+    assert_eq!(result.base_structure.transits, Some(TransitCount::Count(3)));
+    let candidates: Vec<_> = result.layer_rows(1).collect();
+    let transits: Vec<Option<TransitCount>> =
+        candidates.iter().map(|r| r.structure.transits).collect();
+    assert_eq!(
+        transits,
+        vec![None, Some(TransitCount::Count(1)), Some(TransitCount::N)]
+    );
+    let base_ofv = result.row("base").unwrap().ofv.unwrap();
+    let mut ofvs = std::collections::HashSet::new();
+    ofvs.insert(base_ofv.to_bits());
+    for r in &candidates {
+        assert!(r.error.is_none(), "{}: {:?}", r.id, r.error);
+        let ofv = r.ofv.unwrap();
+        assert!(ofv.is_finite());
+        // Four different models, four different evaluations.
+        assert!(
+            ofvs.insert(ofv.to_bits()),
+            "{} evaluates like another model",
+            r.id
+        );
+    }
+    // The estimated-count candidate has one free θ more than the fixed base.
+    let n = |r: &&ferx_tools::modelsearch::ModelRow| r.n_parameters.unwrap();
+    let base_n = result.row("base").unwrap().n_parameters.unwrap();
+    assert_eq!(
+        n(&candidates[1]),
+        base_n,
+        "another fixed count: same free θ"
+    );
+    assert_eq!(n(&candidates[2]), base_n + 1);
+}

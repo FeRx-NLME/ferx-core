@@ -84,7 +84,7 @@ use serde::Deserialize;
 use crate::search::fitter::{RunnerFitter, StepFitter};
 use crate::search::{
     BaseModel, Candidate, CandidateError, CandidateResult, Criterion, ModelContext, PkTemplate,
-    RankType, SearchConfig,
+    RankType, RunReport, SearchConfig,
 };
 
 pub mod structure;
@@ -383,7 +383,7 @@ impl Space {
              algebraic model has no template to swap, so there is nothing structural to search"
                 .to_string()
         })?;
-        let input_structure = Structure::from_template(template)?;
+        let input_structure = Structure::from_model(template, Some(&base.text))?;
         let defaults = Defaults::new(
             ctx.parameters.clone(),
             base.prepared.init_params.theta_names.clone(),
@@ -467,6 +467,9 @@ struct Node {
     lines: Vec<String>,
     /// Eligible for the reduced-stepwise collapse's first preference.
     passed: bool,
+    /// Produced no fit at all (`CandidateResult::error`): its children
+    /// start from its own initial estimates, and the notes say so.
+    failed: bool,
 }
 
 impl Node {
@@ -475,7 +478,7 @@ impl Node {
         model: ModelText,
         structure: Structure,
         path: Vec<FeatureKey>,
-        result: Option<&CandidateResult>,
+        result: Option<(&CandidateResult, &RunReport)>,
     ) -> Result<Node, String> {
         let template = model
             .block_lines("structural_model")
@@ -484,11 +487,16 @@ impl Node {
             .transpose()?
             .ok_or_else(|| format!("{id}: the model has no `pk NAME(...)` line"))?;
         let lines = model.block_lines("individual_parameters");
+        let fit = match result {
+            Some((r, report)) => resolve_fit(r, report)?,
+            None => None,
+        };
         Ok(Node {
             id: id.to_string(),
-            fit: result.and_then(|r| r.fit.clone()),
-            ofv: result.and_then(|r| r.ofv),
-            passed: result.is_some_and(|r| r.eligible()),
+            fit,
+            ofv: result.and_then(|(r, _)| r.ofv),
+            passed: result.is_some_and(|(r, _)| r.eligible()),
+            failed: result.is_some_and(|(r, _)| r.error.is_some()),
             model,
             structure,
             path,
@@ -496,6 +504,44 @@ impl Node {
             lines,
         })
     }
+}
+
+/// The fit a result stands for, so a child can be seeded from it.
+///
+/// A result legitimately carries no fit in three cases, and they are not
+/// the same statement: a **duplicate** (`duplicate_of`) was scored by its
+/// representative, whose fit is the one to seed from; a **failed**
+/// candidate has nothing to seed from and says so through `error`; and a
+/// **resumed** row whose `fits/<hash>.json` is missing or unreadable looks
+/// eligible while having nothing to hand its children — silently starting
+/// them from the file's initials would contradict the documented seeding,
+/// so that one is an error naming the fix.
+fn resolve_fit(result: &CandidateResult, report: &RunReport) -> Result<Option<FitResult>, String> {
+    if let Some(fit) = &result.fit {
+        return Ok(Some(fit.clone()));
+    }
+    if let Some(rep) = &result.duplicate_of {
+        return report
+            .results
+            .iter()
+            .find(|r| r.id == *rep)
+            .and_then(|r| r.fit.clone())
+            .map(Some)
+            .ok_or_else(|| {
+                format!(
+                    "{}: a duplicate of {rep}, whose fit is not available to seed from",
+                    result.id
+                )
+            });
+    }
+    if result.error.is_some() {
+        return Ok(None);
+    }
+    Err(format!(
+        "{}: the fit is not in the journal cache (a resumed row whose `fits/<hash>.json` is \
+         missing or unreadable), so nothing can be seeded from it; refit without `resume`",
+        result.id
+    ))
 }
 
 /// The candidate that moves `parent` by `keys`, seeded from the parent's
@@ -515,15 +561,15 @@ fn derive(
     if let Some(fit) = &parent.fit {
         model.apply(ModelEdit::SeedInits(fit))?;
     }
-    // New parameters scale from the parent's *seeded* estimates — Pharmpy
-    // updates the inits first and adds the compartment second — so
-    // `Q = CL` is the parent's converged clearance, not the file's.
-    let defaults = Defaults {
-        theta_init: structure::theta_inits_of(&model),
-        ..space.defaults.clone()
-    };
+    // Declarations and inits come from the parent's own (seeded) text, not
+    // the input's: a name an earlier step pruned is not present, a θ an
+    // earlier step added is taken, and `Q = CL` is the parent's converged
+    // clearance — Pharmpy updates the inits first and adds the compartment
+    // second.
+    let defaults = Defaults::of_text(&model, space.defaults.t_first);
     let spec = structure::structural_spec(
         &target,
+        &parent.structure,
         &parent.template,
         &parent.lines,
         &defaults,
@@ -592,7 +638,7 @@ pub(crate) fn search(
         space.input_model.clone(),
         space.input_structure,
         vec![],
-        Some(result),
+        Some((result, &report)),
     )?;
     store.insert(root.id.clone(), (root.model.clone(), root.fit.clone()));
     cancelled |= report.cancelled;
@@ -617,7 +663,7 @@ pub(crate) fn search(
             candidate.model.clone(),
             structure,
             vec![],
-            Some(result),
+            Some((result, &report)),
         )?;
         store.insert(root.id.clone(), (root.model.clone(), root.fit.clone()));
         cancelled |= report.cancelled;
@@ -654,8 +700,18 @@ pub(crate) fn search(
             // features in dictionary order.
             let mut planned: Vec<(usize, FeatureKey)> = Vec::new();
             for (i, leaf) in leaves.iter().enumerate() {
+                if leaf.failed {
+                    push_note(
+                        &mut notes,
+                        format!(
+                            "{} produced no fit; its children start from its own initial \
+                             estimates rather than a parent's",
+                            leaf.id
+                        ),
+                    );
+                }
                 for key in &space.funcs {
-                    if !structure::allowed(key, &leaf.path, &space.funcs) {
+                    if !structure::allowed(key, &leaf.path, &space.funcs, &leaf.structure) {
                         continue;
                     }
                     if let Some(why) = leaf.structure.apply(key).unbuildable() {
@@ -708,7 +764,7 @@ pub(crate) fn search(
                     candidate.model.clone(),
                     structure,
                     path,
-                    Some(result),
+                    Some((result, &report)),
                 )?;
                 store.insert(node.id.clone(), (node.model.clone(), node.fit.clone()));
                 children.push(node);
@@ -737,7 +793,7 @@ pub(crate) fn search(
     } else if !cancelled {
         let mut candidates = Vec::new();
         let mut meta = Vec::new();
-        for combo in combinations(&space.funcs) {
+        for combo in combinations(&space.funcs, &root.structure) {
             let mut target = root.structure;
             for k in &combo {
                 target = target.apply(k);
@@ -775,7 +831,7 @@ pub(crate) fn search(
                 ));
                 store.insert(
                     candidate.id.clone(),
-                    (candidate.model.clone(), result.fit.clone()),
+                    (candidate.model.clone(), resolve_fit(result, &report)?),
                 );
             }
             let best = rows
@@ -905,7 +961,11 @@ fn row_of(
 /// only for groups every member of which still has a move, as Pharmpy adds
 /// a collector node only there. Returns the ids that continue.
 fn collapse(children: &[Node], funcs: &[FeatureKey]) -> Vec<String> {
-    let has_action = |n: &Node| funcs.iter().any(|k| structure::allowed(k, &n.path, funcs));
+    let has_action = |n: &Node| {
+        funcs
+            .iter()
+            .any(|k| structure::allowed(k, &n.path, funcs, &n.structure))
+    };
     let mut kept: Vec<String> = Vec::new();
     let mut grouped: Vec<bool> = vec![false; children.len()];
     for i in 0..children.len() {
@@ -954,7 +1014,7 @@ fn feature_set(path: &[FeatureKey]) -> Vec<(&'static str, String)> {
 /// one of the category's features", minus the empty choice and minus the
 /// pairs Pharmpy's stepwise rules refuse — the first category outermost, in
 /// dictionary order, so the candidate numbering matches.
-fn combinations(funcs: &[FeatureKey]) -> Vec<Vec<FeatureKey>> {
+fn combinations(funcs: &[FeatureKey], base: &Structure) -> Vec<Vec<FeatureKey>> {
     let mut groups: Vec<Vec<FeatureKey>> = Vec::new();
     for key in funcs {
         match groups
@@ -978,7 +1038,7 @@ fn combinations(funcs: &[FeatureKey]) -> Vec<Vec<FeatureKey>> {
         }
         out = next;
     }
-    out.retain(|c| !c.is_empty() && structure::combination_allowed(c));
+    out.retain(|c| !c.is_empty() && structure::combination_allowed(c, base));
     out
 }
 

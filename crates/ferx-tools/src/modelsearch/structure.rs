@@ -145,12 +145,25 @@ fn slot_of(role: &str) -> &str {
 }
 
 impl Structure {
-    /// Read the structure off a base model's `pk NAME(...)` line.
+    /// Read the structure off a `pk NAME(...)` line alone. A transit chain
+    /// reads as `TRANSITS(N)`; see [`from_model`](Self::from_model) for the
+    /// count the model actually declares.
+    pub fn from_template(template: &PkTemplate) -> Result<Structure, String> {
+        Self::from_model(template, None)
+    }
+
+    /// Read the structure off a base model's `pk NAME(...)` line and, for a
+    /// transit chain, the declaration its `n` binding points at: a literal
+    /// (`n=3`) or a parameter behind a `FIX`ed θ is `TRANSITS(3)`, a
+    /// parameter behind a free θ is `TRANSITS(N)`.
     ///
     /// The `*_ig` templates and any `ode_template` line are refused: the
     /// former has no MFL coordinate, the latter no analytic sibling to swap
     /// to, so neither is a point the search can move from.
-    pub fn from_template(template: &PkTemplate) -> Result<Structure, String> {
+    pub fn from_model(
+        template: &PkTemplate,
+        text: Option<&ferx_core::edit::ModelText>,
+    ) -> Result<Structure, String> {
         let name = template.name.as_str();
         let (cpt, rest) = name
             .split_once("_cpt_")
@@ -174,7 +187,13 @@ impl Structure {
         let (absorption, transits) = match rest {
             "iv" => (Absorption::Inst, None),
             "oral" => (Absorption::Fo, None),
-            "transit" => (Absorption::Fo, Some(TransitCount::N)),
+            "transit" => (
+                Absorption::Fo,
+                Some(match text {
+                    Some(text) => transit_count_of(template, text)?,
+                    None => TransitCount::N,
+                }),
+            ),
             "ig" => {
                 return Err(format!(
                     "modelsearch: the base model's `pk {name}(...)` uses inverse-Gaussian \
@@ -409,9 +428,21 @@ pub fn onto_space(base: &Structure, space: &[FeatureKey]) -> Vec<FeatureKey> {
 
 /// Pharmpy's `_is_allowed`: whether `key` may be applied next on a path
 /// that has already applied `applied`, in a space whose candidate features
-/// are `funcs` (the base's own features already removed).
-pub fn allowed(key: &FeatureKey, applied: &[FeatureKey], funcs: &[FeatureKey]) -> bool {
+/// are `funcs` (the base's own features already removed). `current` is the
+/// structure the path stands on.
+pub fn allowed(
+    key: &FeatureKey,
+    applied: &[FeatureKey],
+    funcs: &[FeatureKey],
+    current: &Structure,
+) -> bool {
     if applied.contains(key) {
+        return false;
+    }
+    // `TRANSITS(0)` is a move only *off* a chain: on a first-order model it
+    // is the model itself (Pharmpy never allows it, since its base cannot
+    // carry a chain into the space; ferx's can).
+    if *key == FeatureKey::Transits(TransitCount::Count(0)) && current.transits.is_none() {
         return false;
     }
     if let FeatureKey::Peripherals(n) = key {
@@ -435,10 +466,6 @@ pub fn allowed(key: &FeatureKey, applied: &[FeatureKey], funcs: &[FeatureKey]) -
             return false;
         };
         return index > 0 && all[index - 1] < *n;
-    }
-    // Equivalent to first-order absorption: never a move.
-    if *key == FeatureKey::Transits(TransitCount::Count(0)) {
-        return false;
     }
     if applied.iter().any(|k| k.category() == key.category()) {
         return false;
@@ -469,10 +496,10 @@ fn pharmpy_incompatible(a: &FeatureKey, b: &FeatureKey) -> bool {
 }
 
 /// Whether an exhaustive combination — at most one feature per category —
-/// is one Pharmpy would build and ferx can. The same pair table as
-/// [`allowed`], applied to the combination itself.
-pub fn combination_allowed(combo: &[FeatureKey]) -> bool {
-    if combo.contains(&FeatureKey::Transits(TransitCount::Count(0))) {
+/// is one Pharmpy would build and ferx can, from `base`. The same pair
+/// table as [`allowed`], applied to the combination itself.
+pub fn combination_allowed(combo: &[FeatureKey], base: &Structure) -> bool {
+    if combo.contains(&FeatureKey::Transits(TransitCount::Count(0))) && base.transits.is_none() {
         return false;
     }
     for (i, a) in combo.iter().enumerate() {
@@ -511,12 +538,22 @@ pub struct Defaults {
     pub t_first: f64,
 }
 
-/// The `theta NAME(init, …)` inits of a model text, by name — read off the
-/// text rather than the parse so a candidate seeded from its parent's
-/// estimates scales its new parameters from those, as Pharmpy's
-/// `update_initial_estimates` → `add_peripheral_compartment` order does.
-pub fn theta_inits_of(text: &ferx_core::edit::ModelText) -> HashMap<String, f64> {
-    let mut out = HashMap::new();
+/// One `theta NAME(init, …)` declaration of a model text: its name, init and
+/// whether it is `FIX`ed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThetaDecl {
+    pub name: String,
+    pub init: f64,
+    pub fixed: bool,
+}
+
+/// The `theta` declarations of a model text, read off the text rather than
+/// the parse — so a candidate seeded from its parent's estimates scales its
+/// new parameters from those, as Pharmpy's `update_initial_estimates` →
+/// `add_peripheral_compartment` order does. A vector θ (`NAME[...]`) has no
+/// single init and is skipped.
+pub fn theta_decls_of(text: &ferx_core::edit::ModelText) -> Vec<ThetaDecl> {
+    let mut out = Vec::new();
     for line in text.block_lines("parameters") {
         let Some(rest) = line.strip_prefix("theta ") else {
             continue;
@@ -525,7 +562,6 @@ pub fn theta_inits_of(text: &ferx_core::edit::ModelText) -> HashMap<String, f64>
             continue;
         };
         let name = name.trim();
-        // A vector θ (`NAME[...]`) has no single init.
         if name.contains('[') {
             continue;
         }
@@ -534,13 +570,134 @@ pub fn theta_inits_of(text: &ferx_core::edit::ModelText) -> HashMap<String, f64>
             .next()
             .and_then(|a| a.trim().trim_end_matches(')').trim().parse::<f64>().ok())
         {
-            out.insert(name.to_string(), init);
+            let fixed = args
+                .split(|c: char| !c.is_alphanumeric())
+                .any(|tok| tok.eq_ignore_ascii_case("FIX"));
+            out.push(ThetaDecl {
+                name: name.to_string(),
+                init,
+                fixed,
+            });
         }
     }
     out
 }
 
+/// The `theta` inits of a model text, by name.
+pub fn theta_inits_of(text: &ferx_core::edit::ModelText) -> HashMap<String, f64> {
+    theta_decls_of(text)
+        .into_iter()
+        .map(|d| (d.name, d.init))
+        .collect()
+}
+
+/// The η names a model text declares, on `omega` lines and inside
+/// `block_omega (…)` headers.
+pub fn eta_names_of(text: &ferx_core::edit::ModelText) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.block_lines("parameters") {
+        if let Some(rest) = line.strip_prefix("omega ") {
+            if let Some(name) = rest.split('~').next() {
+                out.push(name.trim().to_string());
+            }
+        } else if let Some(rest) = line.strip_prefix("block_omega") {
+            if let Some(inner) = rest.split_once('(').and_then(|(_, r)| r.split_once(')')) {
+                out.extend(
+                    inner
+                        .0
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty()),
+                );
+            }
+        }
+    }
+    out
+}
+
+/// The `[individual_parameters]` names a model text declares.
+pub fn parameter_names_of(text: &ferx_core::edit::ModelText) -> Vec<String> {
+    text.block_lines("individual_parameters")
+        .iter()
+        .filter_map(|l| l.split_once('=').map(|(lhs, _)| lhs.trim().to_string()))
+        .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_alphanumeric() || c == '_'))
+        .collect()
+}
+
+/// The transit count a `*_transit` line's `n` binding declares: a literal,
+/// or a parameter set from a number or from a θ — `FIX`ed θ and literals
+/// are a count, a free θ is `N`.
+fn transit_count_of(
+    template: &PkTemplate,
+    text: &ferx_core::edit::ModelText,
+) -> Result<TransitCount, String> {
+    let var = template
+        .bindings
+        .iter()
+        .find(|(role, _)| role == "n")
+        .map(|(_, v)| v.as_str())
+        .ok_or_else(|| {
+            format!(
+                "modelsearch: `pk {}(...)` binds no `n`; a transit template needs its count",
+                template.name
+            )
+        })?;
+    let count = |v: f64, what: &str| -> Result<TransitCount, String> {
+        if v.is_finite() && v >= 0.0 && v.fract() == 0.0 {
+            Ok(TransitCount::Count(v as u32))
+        } else {
+            Err(format!(
+                "modelsearch: the transit count {what} is {v}, which is not a whole number; \
+                 a fixed count must be an integer, or estimate it (`TRANSITS(N)`)"
+            ))
+        }
+    };
+    if let Ok(v) = var.parse::<f64>() {
+        return count(v, &format!("`n={var}`"));
+    }
+    let rhs = text
+        .block_lines("individual_parameters")
+        .iter()
+        .find_map(|l| {
+            l.split_once('=')
+                .filter(|(lhs, _)| lhs.trim() == var)
+                .map(|(_, rhs)| rhs.trim().to_string())
+        })
+        .ok_or_else(|| {
+            format!(
+                "modelsearch: `n={var}` names `{var}`, which [individual_parameters] does not \
+                 declare"
+            )
+        })?;
+    if let Ok(v) = rhs.parse::<f64>() {
+        return count(v, &format!("`{var} = {rhs}`"));
+    }
+    let thetas = theta_decls_of(text);
+    let behind = rhs
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .find_map(|tok| thetas.iter().find(|d| d.name == tok));
+    match behind {
+        Some(d) if d.fixed => count(d.init, &format!("`theta {}` (FIX)", d.name)),
+        _ => Ok(TransitCount::N),
+    }
+}
+
 impl Defaults {
+    /// The defaults read off one model text — the parent a candidate is
+    /// derived from, *after* its own edits and seeding, so a name the input
+    /// declared but an earlier step pruned is not taken as present, and a
+    /// θ the parent added is seen as taken.
+    pub fn of_text(text: &ferx_core::edit::ModelText, t_first: f64) -> Defaults {
+        let thetas = theta_decls_of(text);
+        Defaults {
+            parameters: parameter_names_of(text),
+            theta_names: thetas.iter().map(|d| d.name.clone()).collect(),
+            eta_names: eta_names_of(text),
+            theta_init: thetas.into_iter().map(|d| (d.name, d.init)).collect(),
+            t_first,
+        }
+    }
+
     /// Read the defaults off a base model and its dataset.
     pub fn new(
         parameters: Vec<String>,
@@ -663,12 +820,18 @@ fn default_name(role: &str) -> &'static str {
 /// the edit layer then binds as it is.
 pub fn structural_spec(
     target: &Structure,
+    parent: &Structure,
     parent_template: &PkTemplate,
     parent_lines: &[String],
     defaults: &Defaults,
     iiv: IivStrategy,
 ) -> Result<StructuralSpec, String> {
     let template = target.template()?;
+    // A different transit coordinate needs a different `n` declaration —
+    // another count, or fixed ↔ estimated — and the edit layer binds an
+    // existing name as it is. So the count is bound to a *fresh* parameter,
+    // and the parent's old one, now unreferenced, is pruned with its θ.
+    let rebind_n = target.transits.is_some() && target.transits != parent.transits;
     let bound: HashMap<&str, &str> = parent_template
         .bindings
         .iter()
@@ -690,14 +853,31 @@ pub fn structural_spec(
     let mut taken_theta: Vec<String> = Vec::new();
     let mut taken_eta: Vec<String> = Vec::new();
     for role in &template.roles {
-        if let Some(var) = bound.get(slot_of(role)) {
+        let rebinding = *role == "n" && rebind_n;
+        if let Some(var) = bound.get(slot_of(role)).filter(|_| !rebinding) {
             bindings.push((role.to_string(), var.to_string()));
             continue;
         }
-        let name = default_name(role).to_string();
+        let name = if rebinding {
+            // Not the parent's own `n` variable (which must go), and not a
+            // name the parent declares for anything else.
+            let old = bound.get("n").copied().unwrap_or("");
+            (1..)
+                .map(|k| {
+                    if k == 1 {
+                        "NTR".to_string()
+                    } else {
+                        format!("NTR{k}")
+                    }
+                })
+                .find(|n| n != old && !defaults.parameters.contains(n))
+                .expect("an untaken name exists")
+        } else {
+            default_name(role).to_string()
+        };
         bindings.push((role.to_string(), name.clone()));
-        if defaults.parameters.contains(&name) {
-            // Declared in the base already (unbound): the edit binds it as is.
+        if !rebinding && defaults.parameters.contains(&name) {
+            // Declared in the parent already (unbound): the edit binds it as is.
             continue;
         }
         let (init, lower, upper) = match *role {
@@ -739,15 +919,20 @@ pub fn structural_spec(
             taken_eta.push(eta.clone());
             (eta, NEW_IIV_VARIANCE)
         });
-        new_parameters.push(NewParameter {
-            name,
-            theta,
-            init,
-            lower,
-            upper,
-            iiv,
-            fixed,
-        });
+        let mut p = NewParameter::new(name, theta, init, lower, upper);
+        if let Some((eta, variance)) = iiv {
+            p = p.with_iiv(eta, variance);
+        }
+        if fixed {
+            p = p.fixed();
+        }
+        new_parameters.push(p);
+    }
+    // Bioavailability is not a coordinate of the search, and every template
+    // reads it: a parent's `f=` binding is carried as it is, or the swap
+    // would silently reset F to 1 and prune its θ and η.
+    if let Some(var) = bound.get("f") {
+        bindings.push(("f".to_string(), var.to_string()));
     }
     Ok(StructuralSpec {
         template: template.name.to_string(),

@@ -212,7 +212,7 @@ pub fn ferx_core::edit::ModelText::canonical_form(&self) -> alloc::string::Strin
 pub fn ferx_core::edit::ModelText::canonical_hash(&self) -> [u8; 32]
 pub fn ferx_core::edit::ModelText::parse(src: &str) -> core::result::Result<Self, alloc::string::String>
 pub fn ferx_core::edit::ModelText::render(&self) -> alloc::string::String
-pub struct ferx_core::edit::NewParameter
+#[non_exhaustive] pub struct ferx_core::edit::NewParameter
 pub ferx_core::edit::NewParameter::fixed: bool
 pub ferx_core::edit::NewParameter::iiv: core::option::Option<(alloc::string::String, f64)>
 pub ferx_core::edit::NewParameter::init: f64
@@ -220,6 +220,10 @@ pub ferx_core::edit::NewParameter::lower: f64
 pub ferx_core::edit::NewParameter::name: alloc::string::String
 pub ferx_core::edit::NewParameter::theta: alloc::string::String
 pub ferx_core::edit::NewParameter::upper: f64
+impl ferx_core::edit::NewParameter
+pub fn ferx_core::edit::NewParameter::fixed(self) -> Self
+pub fn ferx_core::edit::NewParameter::new(name: impl core::convert::Into<alloc::string::String>, theta: impl core::convert::Into<alloc::string::String>, init: f64, lower: f64, upper: f64) -> Self
+pub fn ferx_core::edit::NewParameter::with_iiv(self, eta: impl core::convert::Into<alloc::string::String>, variance: f64) -> Self
 pub struct ferx_core::edit::Relation
 pub ferx_core::edit::Relation::center: core::option::Option<ferx_core::CovariateStat>
 pub ferx_core::edit::Relation::covariate: alloc::string::String

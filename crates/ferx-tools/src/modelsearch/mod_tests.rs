@@ -123,6 +123,15 @@ struct Script {
     failing: Vec<String>,
     /// Ids whose candidate produces no fit at all.
     erroring: Vec<String>,
+    /// Ids reported as canonical duplicates of another id: no fit of their
+    /// own, `duplicate_of` set, the representative's score.
+    duplicates: HashMap<String, String>,
+    /// Ids reported as a resumed row whose cached fit is gone: an OFV and a
+    /// verdict, no `FitResult`.
+    fitless: Vec<String>,
+    /// TVCL written into the fit of the named id, so a child seeded from it
+    /// can be told apart.
+    theta_override: HashMap<String, f64>,
     cancel_after: Option<usize>,
     /// `(step_dir, candidates)` per `fit_step` call, in order.
     calls: Mutex<Vec<(String, Vec<Candidate>)>>,
@@ -136,6 +145,9 @@ impl Script {
             fallback: 1000.0,
             failing: Vec::new(),
             erroring: Vec::new(),
+            duplicates: HashMap::new(),
+            fitless: Vec::new(),
+            theta_override: HashMap::new(),
             cancel_after: None,
             calls: Mutex::new(Vec::new()),
         }
@@ -214,12 +226,18 @@ impl StepFitter for Script {
                 continue;
             }
             let failing = self.failing.contains(&key) || self.failing.contains(&c.id);
+            let mut fit = converged_fit(ofv);
+            if let Some(v) = self.theta_override.get(&c.id) {
+                fit.theta[0] = *v;
+            }
+            let duplicate_of = self.duplicates.get(&c.id).cloned();
+            let has_fit = duplicate_of.is_none() && !self.fitless.contains(&c.id);
             results.push(CandidateResult {
                 id: c.id.clone(),
                 hash: c.hash(),
                 parent: c.parent.clone(),
                 features: c.features.clone(),
-                fit: Some(converged_fit(ofv)),
+                fit: has_fit.then_some(fit),
                 ofv: Some(ofv),
                 converged: Some(!failing),
                 verdict: StrictnessVerdict {
@@ -234,8 +252,8 @@ impl StepFitter for Script {
                 criterion: ofv,
                 seconds: 1.5,
                 error: None,
-                duplicate_of: None,
-                reused: false,
+                reused: self.fitless.contains(&c.id),
+                duplicate_of,
             });
         }
         Ok(RunReport {
@@ -986,5 +1004,339 @@ fn default_dir_sits_next_to_the_config() {
     assert_eq!(
         default_dir(std::path::Path::new("runs/warfarin.ferxsearch")),
         std::path::PathBuf::from("runs/warfarin-modelsearch")
+    );
+}
+
+// ── the review on #1256 ─────────────────────────────────────────────────────
+
+const BASE_THREE: &str = "\
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV1(10.0, 0.1, 500.0)
+  theta TVQ2(1.0, 0.0, 100.0)
+  theta TVV2(5.0, 0.0, 100.0)
+  theta TVQ3(0.5, 0.0, 100.0)
+  theta TVV3(20.0, 0.0, 100.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL
+  V1 = TVV1
+  Q2 = TVQ2
+  V2 = TVV2
+  Q3 = TVQ3
+  V3 = TVV3
+  KA = TVKA
+
+[structural_model]
+  pk three_cpt_oral(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+/// A one-compartment transit base with a `FIX`ed count of 3 — what the
+/// search itself writes for `TRANSITS(3)`.
+const BASE_TRANSIT_FIXED: &str = "\
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVNTR(3.0, 0.0, 64.0) FIX
+  theta TVMTT(1.0, 0.0, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  NTR = TVNTR
+  MTT = TVMTT
+
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+/// The space from a base whose structure is read off its own text.
+fn space_from_text(base: &str, mfl: &str) -> Space {
+    let text = ModelText::parse(base).unwrap();
+    let template = text
+        .block_lines("structural_model")
+        .iter()
+        .find_map(|l| crate::search::PkTemplate::parse_line(l))
+        .unwrap()
+        .unwrap();
+    let structure = Structure::from_model(&template, Some(&text)).unwrap();
+    let features = space_features(&Mfl::parse(mfl).unwrap()).unwrap();
+    let d = defaults(&text);
+    Space::build(text, structure, &features, d, Vec::new()).expect("a buildable base")
+}
+
+#[test]
+fn a_narrowed_base_can_be_widened_again_because_declarations_come_from_the_parent() {
+    // A three-compartment input in a `PERIPHERALS(0..1)` space: the base
+    // is the input narrowed to one compartment, which prunes Q2/V2/Q3/V3.
+    // The one-peripheral child must then re-declare Q and V2 — which it
+    // cannot if "declared" is read off the input rather than its parent.
+    let script = Script::new(&[]);
+    let result = run(
+        &script,
+        space_from_text(BASE_THREE, "ABSORPTION(FO); PERIPHERALS(0..1)"),
+        &options(Algorithm::ExhaustiveStepwise),
+    );
+    assert_eq!(result.base_id, "base");
+    assert_eq!(result.base_structure, fo(0));
+    let base_text = &result.models["base"];
+    assert_eq!(
+        base_text.block_lines("structural_model"),
+        vec!["pk one_cpt_oral(cl=CL, v=V1, ka=KA)"]
+    );
+    assert!(!base_text
+        .block_lines("parameters")
+        .iter()
+        .any(|l| l.contains("TVV2") || l.contains("TVQ2")));
+    assert_eq!(
+        paths(&result, 1),
+        vec![triple("run1", "base", "PERIPHERALS(1)")]
+    );
+    let child = &result.models["run1"];
+    assert_eq!(
+        child.block_lines("structural_model"),
+        vec!["pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)"]
+    );
+    let params = child.block_lines("parameters");
+    assert!(
+        params.iter().any(|l| l.starts_with("theta TVQ(")),
+        "{params:?}"
+    );
+    assert!(
+        params.iter().any(|l| l.starts_with("theta TVV2(")),
+        "{params:?}"
+    );
+}
+
+#[test]
+fn a_fixed_transit_base_moves_to_zero_and_to_another_count_by_rebinding_n() {
+    let script = Script::new(&[]);
+    let result = run(
+        &script,
+        space_from_text(
+            BASE_TRANSIT_FIXED,
+            "ABSORPTION(FO); TRANSITS([0,1,3], NODEPOT)",
+        ),
+        &options(Algorithm::ExhaustiveStepwise),
+    );
+    // The base's own TRANSITS(3) is not a move; 0 and 1 are.
+    assert_eq!(result.base_structure.transits, Some(TransitCount::Count(3)));
+    assert_eq!(
+        paths(&result, 1),
+        vec![
+            triple("run1", "base", "TRANSITS(0, NODEPOT)"),
+            triple("run2", "base", "TRANSITS(1, NODEPOT)"),
+        ]
+    );
+    // TRANSITS(0): first-order absorption, a new KA, the chain gone.
+    let zero = &result.models["run1"];
+    assert_eq!(
+        zero.block_lines("structural_model"),
+        vec!["pk one_cpt_oral(cl=CL, v=V, ka=KA)"]
+    );
+    let params = zero.block_lines("parameters");
+    assert!(
+        params.iter().any(|l| l.starts_with("theta TVKA(")),
+        "{params:?}"
+    );
+    assert!(
+        !params
+            .iter()
+            .any(|l| l.contains("TVNTR") || l.contains("TVMTT")),
+        "{params:?}"
+    );
+    // TRANSITS(1): a fresh FIXed count; the old one pruned, MTT kept.
+    let one = &result.models["run2"];
+    assert_eq!(
+        one.block_lines("structural_model"),
+        vec!["pk one_cpt_transit(cl=CL, v=V, n=NTR2, mtt=MTT)"]
+    );
+    let params = one.block_lines("parameters");
+    assert!(
+        params.contains(&"theta TVNTR2(1.0, 0.0, 64.0) FIX".to_string()),
+        "{params:?}"
+    );
+    assert!(
+        !params.iter().any(|l| l.starts_with("theta TVNTR(")),
+        "{params:?}"
+    );
+    assert!(
+        params.iter().any(|l| l.starts_with("theta TVMTT(")),
+        "{params:?}"
+    );
+    // Three different models, not one canonical text three times.
+    let hashes: std::collections::HashSet<[u8; 32]> = ["base", "run1", "run2"]
+        .iter()
+        .map(|id| result.models[*id].canonical_hash())
+        .collect();
+    assert_eq!(hashes.len(), 3);
+    assert_eq!(result.row("run1").unwrap().structure.transits, None);
+    assert_eq!(
+        result.row("run2").unwrap().structure.transits,
+        Some(TransitCount::Count(1))
+    );
+}
+
+#[test]
+fn an_estimated_transit_base_moves_to_a_fixed_count_and_back() {
+    let free = BASE_TRANSIT_FIXED.replace(
+        "theta TVNTR(3.0, 0.0, 64.0) FIX",
+        "theta TVNTR(3.0, 0.0, 64.0)",
+    );
+    let script = Script::new(&[]);
+    let result = run(
+        &script,
+        space_from_text(
+            &free,
+            "ABSORPTION(FO); TRANSITS(N); TRANSITS([0,3], NODEPOT)",
+        ),
+        &options(Algorithm::ExhaustiveStepwise),
+    );
+    assert_eq!(result.base_structure.transits, Some(TransitCount::N));
+    assert_eq!(
+        paths(&result, 1),
+        vec![
+            triple("run1", "base", "TRANSITS(0, NODEPOT)"),
+            triple("run2", "base", "TRANSITS(3, NODEPOT)"),
+        ]
+    );
+    let three = &result.models["run2"];
+    let params = three.block_lines("parameters");
+    assert!(
+        params.contains(&"theta TVNTR2(3.0, 0.0, 64.0) FIX".to_string()),
+        "{params:?}"
+    );
+    assert!(
+        !params.iter().any(|l| l.starts_with("theta TVNTR(")),
+        "{params:?}"
+    );
+    // The reverse move, from the fixed base, gives a free count at Pharmpy's init.
+    let script = Script::new(&[]);
+    let result = run(
+        &script,
+        space_from_text(
+            BASE_TRANSIT_FIXED,
+            "ABSORPTION(FO); TRANSITS(N); TRANSITS(3, NODEPOT)",
+        ),
+        &options(Algorithm::ExhaustiveStepwise),
+    );
+    assert_eq!(
+        paths(&result, 1),
+        vec![triple("run1", "base", "TRANSITS(N, NODEPOT)")]
+    );
+    let params = result.models["run1"].block_lines("parameters");
+    assert!(
+        params.contains(&"theta TVNTR2(2.0, 0.0, 64.0)".to_string()),
+        "{params:?}"
+    );
+}
+
+#[test]
+fn a_duplicates_children_are_seeded_from_its_representatives_fit() {
+    // run2 is reported as a canonical duplicate of run1 (no fit of its
+    // own); run1's fit carries a TVCL the file does not have, and run2's
+    // child must start from it.
+    let mut script = Script::new(&[(FO_BASE, 100.0)]);
+    script.duplicates.insert("run2".into(), "run1".into());
+    script.theta_override.insert("run1".into(), 0.777);
+    let result = run(
+        &script,
+        space("PERIPHERALS(0..1); LAGTIME([OFF,ON])"),
+        &options(Algorithm::ExhaustiveStepwise),
+    );
+    let child = result
+        .rows
+        .iter()
+        .find(|r| r.parent.as_deref() == Some("run2"))
+        .expect("run2 was extended");
+    let params = result.models[&child.id].block_lines("parameters");
+    assert!(
+        params.iter().any(|l| l.starts_with("theta TVCL(0.777,")),
+        "{params:?}"
+    );
+    // …and a duplicate that wins carries its representative's fit out.
+    let mut script = Script::new(&[(FO_BASE, 100.0)]).by_id(&[("run2", 10.0)]);
+    script.duplicates.insert("run2".into(), "run1".into());
+    let result = run(
+        &script,
+        space("PERIPHERALS(0..1); LAGTIME([OFF,ON])"),
+        &options(Algorithm::Exhaustive),
+    );
+    assert_eq!(result.final_id, "run2");
+    assert!(result.final_fit.is_some());
+    // A duplicate whose representative has no fit either is an error — the
+    // representative's own, raised first, naming it and the fix.
+    let mut script = Script::new(&[(FO_BASE, 100.0)]);
+    script.duplicates.insert("run2".into(), "run1".into());
+    script.fitless.push("run1".into());
+    let err = search(
+        &script,
+        space("PERIPHERALS(0..1); LAGTIME([OFF,ON])"),
+        &options(Algorithm::ExhaustiveStepwise),
+        None,
+    )
+    .unwrap_err();
+    assert!(err.starts_with("run1:") && err.contains("resume"), "{err}");
+}
+
+#[test]
+fn a_resumed_row_without_its_cached_fit_is_an_error_naming_the_fix() {
+    let mut script = Script::new(&[(FO_BASE, 100.0)]);
+    script.fitless.push("run1".into());
+    let err = search(
+        &script,
+        space("PERIPHERALS(0..1); LAGTIME([OFF,ON])"),
+        &options(Algorithm::ExhaustiveStepwise),
+        None,
+    )
+    .unwrap_err();
+    assert!(err.contains("run1"), "{err}");
+    assert!(
+        err.contains("journal cache") && err.contains("resume"),
+        "{err}"
+    );
+    // The base too.
+    let mut script = Script::new(&[(FO_BASE, 100.0)]);
+    script.fitless.push("base".into());
+    let err = search(
+        &script,
+        space("LAGTIME([OFF,ON])"),
+        &options(Algorithm::Exhaustive),
+        None,
+    )
+    .unwrap_err();
+    assert!(err.contains("base") && err.contains("resume"), "{err}");
+}
+
+#[test]
+fn a_failed_candidates_children_start_unseeded_and_the_notes_say_so() {
+    let mut script = Script::new(&[(FO_BASE, 100.0)]);
+    script.erroring.push("run1".into());
+    let result = run(
+        &script,
+        space("PERIPHERALS(0..1); LAGTIME([OFF,ON])"),
+        &options(Algorithm::ExhaustiveStepwise),
+    );
+    assert!(result
+        .rows
+        .iter()
+        .any(|r| r.parent.as_deref() == Some("run1")));
+    assert!(
+        result
+            .notes
+            .iter()
+            .any(|n| n.starts_with("run1 produced no fit")),
+        "{:?}",
+        result.notes
     );
 }
