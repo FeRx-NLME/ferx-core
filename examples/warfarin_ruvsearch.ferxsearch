@@ -1,0 +1,32 @@
+# Residual-error model search over examples/warfarin.ferx (#1182).
+#
+#   ferx ruvsearch examples/warfarin_ruvsearch.ferxsearch
+#
+# There is no [space]: the candidates are Pharmpy ruvsearch's four
+# residual-error forms — IIV on the residual error, a power form, a combined
+# form, and a time-varying magnitude cut at the time-after-dose quantiles —
+# each added to the parent on its own and kept when the likelihood-ratio test
+# says so. `skip` leaves a family out. See docs/tools/ruvsearch.qmd.
+#
+# warfarin.ferx fits with `method = foce`, which has no η–ε interaction, so
+# IIV_on_RUV would be skipped with a note; the search file cannot change the
+# method, so this example skips it explicitly.
+
+base = "warfarin.ferx"
+data = "../data/warfarin.csv"
+
+[ruvsearch]
+groups          = 4          # 3 time-varying candidates, at the 25/50/75% TAD quantiles
+p_value         = 0.001      # the likelihood-ratio level (Pharmpy's default)
+skip            = ["IIV_on_RUV"]
+max_iter        = 3
+cwres_prescreen = false      # true: screen on the parent's CWRES first, refit the winner only
+
+[strictness]
+require_converged  = true
+reject_on_boundary = true
+
+[run]
+threads   = 4
+retries   = 2
+cache_dir = ".ferx-ruvsearch"

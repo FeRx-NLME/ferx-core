@@ -3372,3 +3372,61 @@ fn analytical_ad_unsupported_flags_each_class() {
         "but the LIVE inner gate serves a differentiable ExpressionScale analytically (#486)"
     );
 }
+
+/// #1182: the `power(σ, P)` form's analytic inner η-gradient must match FD of
+/// the (exponent-aware) `individual_nll` — the exponent rides the magnitude
+/// channel, so `residual_inner_obs` sees `|f|^{p}` through `dvar_df_scaled`.
+#[test]
+fn power_exponent_inner_eta_gradient_matches_fd() {
+    use crate::parser::model_parser::parse_model_string;
+    let model = parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  theta TVKA(1.5,0.01,50.0)\n  theta RUV_POW(1.3,0.01,10.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_KA ~ 0.30\n  sigma PROP_ERR ~ 0.04\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n[error_model]\n  DV ~ power(PROP_ERR, RUV_POW)\n",
+        )
+        .expect("parse power model");
+    assert!(model.has_ruv_exponent());
+    let mut subject = Subject {
+        id: "1".into(),
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 24.0, 48.0],
+        observations: vec![0.0; 7],
+        obs_cmts: vec![1; 7],
+        cens: vec![0; 7],
+        occasions: vec![1; 7],
+        ..Default::default()
+    };
+    let theta = vec![0.22, 11.0, 1.4, 1.3];
+    let preds =
+        crate::pk::compute_predictions_with_tv(&model, &subject, &theta, &[0.1, -0.1, 0.05]);
+    subject.observations = preds.iter().map(|p| p * 0.85).collect();
+    let mut params = model.default_params.clone();
+    params.theta = theta.clone();
+    let eta = [0.15_f64, -0.10, 0.20];
+    let analytic = analytic_eta_nll_gradient(
+        &model,
+        &subject,
+        &params.theta,
+        &eta,
+        &params.omega,
+        &params.sigma.values,
+    )
+    .expect("power model is in the analytic inner scope");
+    for k in 0..model.n_eta {
+        let h = 1e-6 * (1.0 + eta[k].abs());
+        let mut ep = eta;
+        ep[k] += h;
+        let mut em = eta;
+        em[k] -= h;
+        let nll = |e: &[f64]| {
+            crate::stats::likelihood::individual_nll(
+                &model,
+                &subject,
+                &params.theta,
+                e,
+                &params.omega,
+                &params.sigma.values,
+            )
+        };
+        let fd = (nll(&ep) - nll(&em)) / (2.0 * h);
+        approx::assert_relative_eq!(analytic[k], fd, max_relative = 1e-5, epsilon = 1e-6);
+    }
+}

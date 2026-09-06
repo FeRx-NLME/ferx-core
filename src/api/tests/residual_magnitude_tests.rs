@@ -213,3 +213,39 @@ fn a_larger_weight_widens_the_simulated_residual() {
         "a 4x weight must widen the residual ~4x: {small} then {large}"
     );
 }
+
+/// #1182: a `power(...)` exponent at or below zero at the initial estimates is
+/// rejected on the same code, with a message that says "exponent" rather than
+/// "magnitude for sigma slot" — the row's upper half is the exponent.
+#[test]
+fn a_non_positive_power_exponent_is_rejected_as_an_exponent() {
+    let model = parse_model_string(
+        "[parameters]\n  theta TVCL(0.2)\n  theta TVV(10.0)\n  theta RUV_POW(0.0, -1.0, 10.0)\n  \
+         omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.04\n[individual_parameters]\n  CL = TVCL * \
+         exp(ETA_CL)\n  V  = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, \
+         v=V)\n[error_model]\n  DV ~ power(PROP_ERR, RUV_POW)\n",
+    )
+    .expect("parse");
+    let pop = population_with_weights(&[0.5, 1.5]);
+    let msg = check_model_data(&model, &pop)
+        .into_iter()
+        .find(|d| d.code == "E_RUV_MAGNITUDE_NONPOSITIVE")
+        .map(|d| d.message)
+        .expect("a zero exponent must be an error");
+    assert!(
+        msg.contains("power exponent for sigma slot 0"),
+        "got: {msg}"
+    );
+    assert!(!msg.contains("magnitude for sigma slot"), "got: {msg}");
+    // A positive exponent passes.
+    let ok = parse_model_string(
+        "[parameters]\n  theta TVCL(0.2)\n  theta TVV(10.0)\n  theta RUV_POW(1.3, 0.01, 10.0)\n  \
+         omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.04\n[individual_parameters]\n  CL = TVCL * \
+         exp(ETA_CL)\n  V  = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, \
+         v=V)\n[error_model]\n  DV ~ power(PROP_ERR, RUV_POW)\n",
+    )
+    .expect("parse");
+    assert!(check_model_data(&ok, &pop)
+        .into_iter()
+        .all(|d| d.code != "E_RUV_MAGNITUDE_NONPOSITIVE"));
+}

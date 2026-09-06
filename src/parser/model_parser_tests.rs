@@ -17,10 +17,10 @@ fn ruv_mag_theta_grad_dispatches_up_to_axis_cap() {
             BinOp::Mul,
             Box::new(Expression::Variable("PROP".to_string())),
         );
-        let prog = compile_ruv_mag_deriv_program(&expr, "PROP", n);
+        let prog = compile_ruv_mag_deriv_program(&expr, Some("PROP"), n);
         let theta = vec![0.5f64; n];
         let grad = prog
-            .theta_grad(&theta, &cov, 0.0)
+            .theta_grad(&theta, &cov, 0.0, f64::NAN)
             .unwrap_or_else(|| panic!("theta_grad must dispatch for n_theta = {n}"));
         assert_eq!(grad.len(), n);
         assert!(
@@ -43,9 +43,9 @@ fn ruv_mag_theta_grad_dispatches_up_to_axis_cap() {
         BinOp::Mul,
         Box::new(Expression::Variable("PROP".to_string())),
     );
-    let prog = compile_ruv_mag_deriv_program(&expr, "PROP", over);
+    let prog = compile_ruv_mag_deriv_program(&expr, Some("PROP"), over);
     assert!(
-        prog.theta_grad(&vec![0.5; over], &HashMap::new(), 0.0)
+        prog.theta_grad(&vec![0.5; over], &HashMap::new(), 0.0, f64::NAN)
             .is_none(),
         "n_theta beyond MAX_RUV_MAG_AXES must decline to FD"
     );
@@ -6203,8 +6203,8 @@ fn test_ruv_magnitude_time_varying_prop_parses() {
     let theta = vec![0.2, 10.0, 1.5];
     let cov = std::collections::HashMap::new();
     // Before 24 h the multiplier is 1; after, it is RUV_LATE.
-    let m_early = rm.eval_obs(&theta, &cov, 10.0);
-    let m_late = rm.eval_obs(&theta, &cov, 30.0);
+    let m_early = rm.eval_obs(&theta, &cov, 10.0, 10.0);
+    let m_late = rm.eval_obs(&theta, &cov, 30.0, 30.0);
     assert!((m_early[0] - 1.0).abs() < 1e-12);
     assert!((m_early[1] - 1.0).abs() < 1e-12);
     assert!((m_late[0] - 1.5).abs() < 1e-12);
@@ -6394,7 +6394,7 @@ fn test_ruv_magnitude_macheps_resolves_in_theta_grad() {
     let theta = vec![0.2, 10.0, 1.5];
     let cov_zero = std::collections::HashMap::from([("WT".to_string(), 0.0)]);
     let grad = deriv
-        .theta_grad(&theta, &cov_zero, 10.0)
+        .theta_grad(&theta, &cov_zero, 10.0, 10.0)
         .expect("theta_grad supported");
     assert!(
         grad.iter().all(|g| g.is_finite()),
@@ -6421,10 +6421,10 @@ fn test_ruv_magnitude_deriv_program_resolves_time_as_covariate_node() {
         BinOp::Mul,
         Box::new(Expression::Covariate("TIME".to_string())),
     );
-    let deriv = compile_ruv_mag_deriv_program(&expr, "UNUSED_SIGMA", 1);
+    let deriv = compile_ruv_mag_deriv_program(&expr, Some("UNUSED_SIGMA"), 1);
     let empty_cov = std::collections::HashMap::new();
     let grad = deriv
-        .theta_grad(&[2.0], &empty_cov, 10.0)
+        .theta_grad(&[2.0], &empty_cov, 10.0, 10.0)
         .expect("theta_grad supported");
     // d(RUV_LATE * TIME)/d(RUV_LATE) = TIME = 10.0, not 0.0.
     approx::assert_relative_eq!(grad[0], 10.0, max_relative = 1e-12);
@@ -18248,7 +18248,7 @@ fn test_weight_modifier_scales_the_additive_slot() {
     let theta = vec![0.2, 10.0];
     let cov: std::collections::HashMap<String, f64> =
         [("WPSE".to_string(), 2.5)].into_iter().collect();
-    let m = rm.eval_obs(&theta, &cov, 0.0);
+    let m = rm.eval_obs(&theta, &cov, 0.0, 0.0);
     assert!((m[0] - 2.5).abs() < 1e-12, "got {m:?}");
 }
 
@@ -18272,7 +18272,7 @@ fn test_weight_modifier_on_combined_leaves_the_proportional_slot_bare() {
     let theta = vec![0.2, 10.0];
     let cov: std::collections::HashMap<String, f64> =
         [("WPSE".to_string(), 4.0)].into_iter().collect();
-    let m = rm.eval_obs(&theta, &cov, 0.0);
+    let m = rm.eval_obs(&theta, &cov, 0.0, 0.0);
     assert!((m[0] - 1.0).abs() < 1e-12, "got {m:?}");
     assert!((m[1] - 4.0).abs() < 1e-12, "got {m:?}");
 }
@@ -18289,7 +18289,7 @@ fn test_weight_modifier_accepts_an_expression_with_its_own_parens() {
     let theta = vec![0.2, 10.0];
     let cov: std::collections::HashMap<String, f64> =
         [("NARM".to_string(), 16.0)].into_iter().collect();
-    let m = rm.eval_obs(&theta, &cov, 0.0);
+    let m = rm.eval_obs(&theta, &cov, 0.0, 0.0);
     assert!((m[0] - 0.25).abs() < 1e-12, "got {m:?}");
 }
 
@@ -18305,7 +18305,7 @@ fn test_weight_modifier_composes_with_a_custom_magnitude() {
     let theta = vec![0.2, 10.0];
     let cov: std::collections::HashMap<String, f64> =
         [("WPSE".to_string(), 2.0)].into_iter().collect();
-    let m = rm.eval_obs(&theta, &cov, 0.0);
+    let m = rm.eval_obs(&theta, &cov, 0.0, 0.0);
     assert!((m[0] - 6.0).abs() < 1e-12, "got {m:?}");
 }
 
@@ -21133,4 +21133,240 @@ fn an_unclosed_present_is_a_parse_error() {
         e.to_lowercase().contains("present") || e.contains(')'),
         "{e}"
     );
+}
+
+// ── #1182: `power(SIGMA, P)` and the `TAD` magnitude built-in ───────────────
+
+const POWER_MODEL: &str = r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  theta RUV_POW(1.3, 0.01, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ power(PROP_ERR, RUV_POW)
+"#;
+
+/// `power(σ, P)` is the proportional model plus an exponent program on its
+/// slot: the compiled error model is `Proportional`, the magnitude row carries
+/// `[m, p]`, and `∂p/∂θ` is the unit vector on the exponent θ.
+#[test]
+fn power_form_parses_as_proportional_with_an_exponent_slot() {
+    let model = parse_model_string(POWER_MODEL).unwrap();
+    assert_eq!(model.error_model, ErrorModel::Proportional);
+    assert!(model.has_custom_ruv_magnitude());
+    assert!(model.has_ruv_exponent());
+    assert!(model.has_theta_dependent_ruv_magnitude());
+    let rm = model.ruv_magnitude.as_ref().unwrap();
+    assert!(rm.per_sigma[0].is_none(), "the sigma itself is bare");
+    assert!(rm.per_sigma_exponent[0].is_some());
+    let theta = vec![0.2, 10.0, 1.3];
+    let cov = std::collections::HashMap::new();
+    let row = rm.eval_obs(&theta, &cov, 1.0, 1.0);
+    assert_eq!(row, vec![1.0, 1.3], "multiplier half then exponent half");
+    let grad = rm.eval_obs_theta_grad(&theta, &cov, 1.0, 1.0).unwrap();
+    assert_eq!(grad.len(), 2);
+    assert_eq!(
+        grad[0],
+        vec![0.0; 3],
+        "the bare multiplier has no θ derivative"
+    );
+    assert_eq!(
+        grad[1],
+        vec![0.0, 0.0, 1.0],
+        "∂p/∂θ is the unit vector on RUV_POW"
+    );
+    // The exponent θ is referenced from [error_model], so it is not "unused".
+    assert!(
+        !model.parse_warnings.iter().any(|w| w.contains("RUV_POW")),
+        "{:?}",
+        model.parse_warnings
+    );
+    // The row reaches the variance: σ²·|f|^{2p} at f = 2.
+    let sigma = &model.default_params.sigma.values;
+    let v = model
+        .error_spec
+        .variance_at_scaled(1, 2.0, sigma, &[], &row);
+    approx::assert_relative_eq!(
+        v,
+        sigma[0] * sigma[0] * 2.0f64.powf(2.6),
+        max_relative = 1e-12
+    );
+}
+
+/// An exponent of exactly `1` is the proportional model, on the legacy
+/// arithmetic bit for bit — the search's neutral start must not move the
+/// base fit.
+#[test]
+fn power_form_with_unit_exponent_is_the_proportional_variance_bit_for_bit() {
+    let model = parse_model_string(&POWER_MODEL.replace("RUV_POW(1.3,", "RUV_POW(1.0,")).unwrap();
+    let rm = model.ruv_magnitude.as_ref().unwrap();
+    let theta = vec![0.2, 10.0, 1.0];
+    let row = rm.eval_obs(&theta, &std::collections::HashMap::new(), 1.0, 1.0);
+    assert_eq!(row, vec![1.0, 1.0]);
+    let sigma = &model.default_params.sigma.values;
+    for f in [0.0, 0.37, 2.0, 15.5, -3.0] {
+        assert_eq!(
+            model.error_spec.variance_at_scaled(1, f, sigma, &[], &row),
+            model
+                .error_spec
+                .variance_at_scaled(1, f, sigma, &[], &row[..1]),
+            "f = {f}"
+        );
+        assert_eq!(
+            model.error_spec.dvar_df_scaled(1, f, sigma, &row),
+            model.error_spec.dvar_df_scaled(1, f, sigma, &row[..1]),
+        );
+    }
+}
+
+/// `TAD` inside a magnitude expression is the record's data-derived time after
+/// dose, in both the runtime closure and the `Dual1` θ-program.
+#[test]
+fn magnitude_expression_reads_tad() {
+    let content = r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  theta RUV_TV(1.5, 0.01, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR * (if (TAD < 12.0) RUV_TV else 1.0))
+"#;
+    let model = parse_model_string(content).unwrap();
+    let rm = model.ruv_magnitude.as_ref().unwrap();
+    assert!(!rm.has_exponent());
+    let theta = vec![0.2, 10.0, 1.5];
+    let cov = std::collections::HashMap::new();
+    // TIME is 100 on both records; only TAD tells them apart.
+    assert_eq!(rm.eval_obs(&theta, &cov, 100.0, 5.0), vec![1.5]);
+    assert_eq!(rm.eval_obs(&theta, &cov, 100.0, 20.0), vec![1.0]);
+    let early = rm.eval_obs_theta_grad(&theta, &cov, 100.0, 5.0).unwrap();
+    let late = rm.eval_obs_theta_grad(&theta, &cov, 100.0, 20.0).unwrap();
+    assert_eq!(early[0], vec![0.0, 0.0, 1.0]);
+    assert_eq!(late[0], vec![0.0, 0.0, 0.0]);
+}
+
+/// `Subject::time_after_dose` is the data TAD: last dose at or before the
+/// record, steady-state aware, `NaN` before the first dose.
+#[test]
+fn subject_time_after_dose_is_the_data_tad() {
+    use crate::types::{DoseEvent, Subject};
+    let subject = Subject {
+        id: "1".into(),
+        doses: vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        obs_times: vec![-1.0, 2.0, 23.9, 24.0, 30.0],
+        ..Default::default()
+    };
+    let tad: Vec<f64> = (0..5).map(|j| subject.time_after_dose(j)).collect();
+    assert!(tad[0].is_nan());
+    assert_eq!(tad[1..], [2.0, 23.9, 0.0, 6.0]);
+    let ss = Subject {
+        id: "2".into(),
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)],
+        obs_times: vec![26.0],
+        ..Default::default()
+    };
+    assert_eq!(
+        ss.time_after_dose(0),
+        2.0,
+        "SS with II=12: last implied dose at 24"
+    );
+}
+
+#[test]
+fn power_form_rejects_the_wrong_argument_count() {
+    let err = expect_parse_err(&POWER_MODEL.replace("power(PROP_ERR, RUV_POW)", "power(PROP_ERR)"));
+    assert!(err.contains("power(SIGMA, EXPONENT)"), "got: {err}");
+    let err = expect_parse_err(
+        &POWER_MODEL.replace("power(PROP_ERR, RUV_POW)", "power(PROP_ERR, RUV_POW, TVV)"),
+    );
+    assert!(err.contains("3 argument(s)"), "got: {err}");
+}
+
+#[test]
+fn power_form_rejects_a_sigma_in_the_exponent() {
+    let err = expect_parse_err(&POWER_MODEL.replace(
+        "power(PROP_ERR, RUV_POW)",
+        "power(PROP_ERR, RUV_POW * PROP_ERR)",
+    ));
+    assert!(err.contains("references sigma `PROP_ERR`"), "got: {err}");
+}
+
+#[test]
+fn power_form_rejects_an_eta_in_the_exponent() {
+    let err = expect_parse_err(&POWER_MODEL.replace(
+        "power(PROP_ERR, RUV_POW)",
+        "power(PROP_ERR, RUV_POW * exp(ETA_CL))",
+    ));
+    assert!(
+        err.contains("power exponent may not depend on a random effect"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn power_form_rejects_the_forms_it_cannot_combine_with() {
+    let err = expect_parse_err(&POWER_MODEL.replace(
+        "DV ~ power(PROP_ERR, RUV_POW)",
+        "log(DV) ~ power(PROP_ERR, RUV_POW)",
+    ));
+    assert!(
+        err.contains("log-transform-both-sides supports only additive"),
+        "got: {err}"
+    );
+    let err = expect_parse_err(&POWER_MODEL.replace(
+        "DV ~ power(PROP_ERR, RUV_POW)",
+        "DV ~ power(PROP_ERR, RUV_POW) weight = TVV",
+    ));
+    assert!(
+        err.contains("`weight = …` has no effect on a `power(...)`"),
+        "got: {err}"
+    );
+    let err = expect_parse_err(&POWER_MODEL.replace(
+        "DV ~ power(PROP_ERR, RUV_POW)",
+        "if (TVV > 1.0) { DV ~ power(PROP_ERR, RUV_POW) } else { DV ~ proportional(PROP_ERR) }",
+    ));
+    assert!(
+        err.contains("not supported inside a covariate-selected"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn power_form_rejects_per_cmt() {
+    let content = r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  theta RUV_POW(1.3, 0.01, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[error_model]
+  CMT=1: DV ~ power(PROP_ERR, RUV_POW)
+"#;
+    let err = expect_parse_err(content);
+    assert!(err.contains("not supported with per-CMT"), "got: {err}");
 }

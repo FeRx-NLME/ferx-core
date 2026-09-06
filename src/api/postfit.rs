@@ -693,6 +693,18 @@ pub(crate) fn compute_subject_results(
                 &subject.fremtype,
                 &params.sigma.values,
             );
+            // `R` where the marginal evaluates it — `IPRED` under an interaction
+            // fit, the population prediction f(η=0) under FOCE — which is what
+            // NONMEM's `CWRES` does (pinned in `compute_cwres`'s doc comment).
+            // Additive error keeps the linearized `f0` (bit-identical: `R` does
+            // not depend on the prediction).
+            let r_preds: Option<&[f64]> = if !model.error_spec.has_f_dependent_variance() {
+                None
+            } else if interaction {
+                Some(ipred.as_slice())
+            } else {
+                Some(pred.as_slice())
+            };
             let cwres = compute_cwres(
                 subject,
                 &ipred,
@@ -705,6 +717,7 @@ pub(crate) fn compute_subject_results(
                 frem_r_override.as_deref(),
                 model.residual_error_eta,
                 ruv_mult.as_deref(),
+                r_preds,
             );
 
             // OFV contribution

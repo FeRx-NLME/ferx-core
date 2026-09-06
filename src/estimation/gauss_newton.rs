@@ -1781,7 +1781,11 @@ pub(crate) fn subject_nll_pop_grad(
     // neither chain rule carries — and it enters `log|H̃|` as well as the data
     // term — so route those subjects to the FD fallback below, which differences
     // `subject_nll_at` and is magnitude-aware end to end.
-    let no_theta_dep_magnitude = !model.has_theta_dependent_ruv_magnitude();
+    // A `power(...)` exponent (#1182) likewise: `dr_diag_d_log_sigma`'s
+    // `Combined` arm reads the proportional slot's variance as `σ²·f²·m²`,
+    // which a `|f|^{2p}` loading does not satisfy — so route it to FD too.
+    let no_theta_dep_magnitude =
+        !model.has_theta_dependent_ruv_magnitude() && !model.has_ruv_exponent();
     let no_ruv_eta = model.residual_error_eta.is_none();
     let common_ok = !matches!(model.bloq_method, BloqMethod::M3)
         && kappas.is_empty()
