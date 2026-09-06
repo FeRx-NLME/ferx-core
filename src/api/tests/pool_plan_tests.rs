@@ -312,3 +312,30 @@ fn a_fit_is_bit_identical_across_thread_counts() {
     );
     assert_eq!(one.n_iterations, four.n_iterations);
 }
+
+#[test]
+fn a_fit_whose_every_start_is_refused_says_why() {
+    // #1256: a search child seeded with an ω on the optimizer's rail is
+    // refused by every start, and the runner's table showed only "All
+    // multi-start fits failed" — the repair (regularise the seed) is a
+    // different one from a fit that diverged, so the reason must survive.
+    let model = one_cpt_model();
+    let pop = population();
+    let mut params = model.default_params.clone();
+    params.omega = crate::types::OmegaMatrix::from_diagonal(
+        &[6.144_212_353_328_21e-6],
+        params.omega.eta_names.clone(),
+    );
+    let mut opts = short_fit_opts();
+    opts.n_starts = 2;
+    let err = fit(&model, &pop, &params, &opts).expect_err("every start is refused");
+    assert!(
+        err.starts_with("All multi-start fits failed: start 0:"),
+        "{err}"
+    );
+    assert!(err.contains("start 1:"), "{err}");
+    assert!(
+        err.contains("lower bound") || err.contains("rail"),
+        "the engine's own reason is carried: {err}"
+    );
+}

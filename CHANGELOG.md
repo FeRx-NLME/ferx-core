@@ -43,6 +43,16 @@ section of the SDLC for the versioning policy).
   to read. No effect on `.ferx` models, the CLI or the R wrapper, none of which constructs it.
 
 ### Fixed
+- **A search child seeded from a parent whose ω block is near-singular can start (#1256).** On
+  the vancomycin base the (CL, V1, V2) block's Cholesky diagonal for `ETA_V2` sat on the
+  optimizer's rail (6e-6) through its correlations, every declared variance being ordinary; the
+  three-compartment candidate seeded from it was refused by every start. The shared seed now
+  nudges that block alone by `1e-5·I` until its factor clears the rail, alongside the diagonal
+  floor; a standalone ω beside it and a `FIX`ed block are untouched, and a block that cannot be
+  repaired within the bound goes through verbatim.
+- **"All multi-start fits failed" now carries each start's reason** (`start 0: …; start 1: …`),
+  so a search table says *why* a candidate never fitted — a refused start is a different repair
+  from a diverged fit.
 - **`ferx modelsearch` never selects the input model (#1181).** The input has a row of its own
   only when a base had to be derived from it — which happens exactly when its structure lies
   outside the space the MFL declares — so it is ranked in the table but excluded from
