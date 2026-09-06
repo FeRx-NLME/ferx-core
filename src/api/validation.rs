@@ -750,6 +750,7 @@ pub fn check_model_data_rule(
     diags.extend(check_theta_gather_indices(model, population));
     diags.extend(check_iov_occasions(model, population, iov_rule));
     diags.extend(check_absorption_dosing(model, population));
+    diags.extend(check_ss_lagtime_tad_rhs(model, population));
     diags.extend(check_modeled_dose_rates(model, population));
     diags.extend(check_dose_compartments(model, population));
     diags.extend(check_dose_attr_finiteness(model, population));
@@ -1215,6 +1216,97 @@ pub(crate) fn check_absorption_dosing(
     }
 
     diags
+}
+
+/// An `SS=1` dose carrying a **lagtime** on an `[odes]` model whose right-hand side reads
+/// the `TAD` built-in — rejected rather than mis-predicted (#1126).
+///
+/// The steady-state run-in itself is correct for `TAD` since #1139: it expands the periodic
+/// train on a cycle-local clock and anchors `TAD` per window
+/// ([`crate::ode::predictions`]'s `ss_run_in_params`), and the un-lagged case is anchored
+/// against NONMEM. A **lagtime** adds a second, separate question this does not answer:
+/// what `TAD` refers to inside `[t_dose, t_dose + ALAG)`, the window between the dose
+/// record and the lagged arrival. There the walk's anchor falls back to the subject's first
+/// arrival, so `TAD` runs negative where the periodic fiction says it should be
+/// `t − (t_dose + ALAG − II)` — the previous cycle's pulse.
+///
+/// That is not confined to the window. Since #1121 the record-time seed *flows* to the
+/// arrival instead of being re-equilibrated there, so the wrong anchor is carried into the
+/// trough and multiplies into every later prediction: measured on `CL = 1`, `V = 20`,
+/// `AMT = 100`, `II = 12`, `ALAG = 3` and `-(CL/V)·A·(1 + 0.03·TAD)`, a uniform **2.733 %**
+/// high at every post-arrival observation and 3.67 % inside the window, against a closed
+/// form computed outside the engine. A plausible number that far out is worse than the
+/// `NaN` this configuration returned before #1139, so it is named instead.
+///
+/// **Structural, not typical-value.** The gate asks whether a lagtime is *declared* on the
+/// dosed compartment, not whether it is currently non-zero, because an estimated `ALAG`
+/// moves during the fit — a value gate would let a run start at `lag = 0` and drift into
+/// the wrong regime with no diagnostic. Same shape, and same compartment scoping, as the
+/// neighbouring `E_ABSORPTION_SS_LAG`.
+///
+/// `reads_tad`, not `reads_model_time`: `TAFD`, `T` and `TIME` under `SS=1` are a different
+/// question (they have no periodic steady state to anchor to, or already match NONMEM), and
+/// none of them has a pre-arrival referent, so sweeping them in here would name the wrong
+/// issue. #1126 lifts this gate.
+///
+/// # This gate reaches `fit()` and `ferx check` only, and that is a gap — not the design
+///
+/// `check_model_data_rule` has no caller in `api::simulate` or `api::predict`, so a
+/// `simulate()` of this configuration is served rather than rejected. It returns the same
+/// `NaN` it did before #1139, so nothing silently *worsens*, but the model is exactly as
+/// wrong there as it is under `fit()` and it goes unnamed. Widening it is its own change:
+/// simulate reaches rejections only through panicking `assert_*` helpers, which cross the
+/// ferx-r boundary as a panic rather than an R error.
+///
+/// Do not "align" this with the neighbouring `W_SDE_*` warnings, which are also raised only
+/// from the fit path — for them that is **correct**, not a gap. Verified 2026-09-06, and the
+/// advice inverts if it stops holding, so re-check it rather than trusting it: the sole
+/// production caller of `ode_predictions_ekf_with_diffusion` is `stats/likelihood.rs`, so
+/// the extended Kalman filter runs *only* inside the objective; `predict()` and `simulate()`
+/// take `ode_predictions`, which equilibrates an `SS=1` dose and applies a lagtime properly.
+/// Their defect exists only where they warn. This one rejects a **model structure**, which
+/// is wrong on every path that evaluates it.
+pub(crate) fn check_ss_lagtime_tad_rhs(
+    model: &CompiledModel,
+    population: &Population,
+) -> Vec<Diagnostic> {
+    let reads_tad = model
+        .ode_spec
+        .as_ref()
+        .and_then(|o| o.rhs_program.as_ref())
+        .is_some_and(|p| p.reads_tad());
+    if !reads_tad {
+        return Vec::new();
+    }
+    let Some(subject) = population.subjects.iter().find(|s| {
+        s.doses
+            .iter()
+            .any(|d| d.ss && d.ii > 0.0 && model.has_lagtime_on_cmt(d.cmt_1based()))
+    }) else {
+        return Vec::new();
+    };
+    vec![Diagnostic::error(
+        "E_SS_LAGTIME_TAD_RHS",
+        format!(
+            "Subject '{}' has a steady-state dose (SS=1) with a lagtime on a model whose \
+             `[odes]` right-hand side reads `TAD`. `TAD` has no referent in the window \
+             between the dose record and the lagged arrival, and the wrong value is carried \
+             into the steady-state trough, so it shifts every prediction and not only those \
+             inside that window. The size depends on the model; it is not small. Rejected \
+             rather than reported as a plausible number.",
+            subject.id
+        ),
+    )
+    .with_block("odes")
+    .with_suggestion(
+        "Remove the lagtime, remove the `TAD` term, expand the run-in with explicit dosing \
+         records instead of `SS=1`, or use `TAFD`/`TIME` if an absolute clock is what the \
+         model means. A steady-state dose *without* a lagtime reads `TAD` correctly. This \
+         is about the `SS=1` x lagtime x `TAD` combination and not about which engine \
+         serves the model, so moving between the `[odes]`, `[diffusion]` and analytical \
+         paths does not change it — a warning that suggests switching engines is answering \
+         a different question.",
+    )]
 }
 
 /// NONMEM coded `RATE=-2` (modeled infusion duration → `D{cmt}`) needs a

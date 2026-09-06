@@ -384,6 +384,12 @@ thread_local! {
     /// closed-form loops, and the event-driven loop.
     static LAST_SS_EQUILIBRATION_CYCLES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 
+    /// Branch the most recent SS equilibration took — see [`SsBranch`] for why the cycle
+    /// count above is not enough.
+    #[cfg(test)]
+    static LAST_SS_EQUILIBRATION_BRANCH: std::cell::Cell<SsBranch> =
+        const { std::cell::Cell::new(SsBranch::None) };
+
     /// When set, [`ss_cycle_converged`] always reports "not converged" so every path runs the
     /// full cycle budget — lets a test pin that early-stop is value-preserving vs full
     /// equilibration (#532 review #4).
@@ -393,6 +399,67 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn record_ss_equilibration_cycles(n: usize) {
     LAST_SS_EQUILIBRATION_CYCLES.with(|c| c.set(n));
+}
+
+/// Which SS-equilibration branch the most recent call took — a **test-only** observation,
+/// alongside the cycle count above.
+///
+/// The branches **fall back to one another**: the exact linear fixed point declines to
+/// Anderson, and Anderson declines to the capped pulse train. When all three are correct
+/// they return the same trough, so a value assertion cannot tell them apart — and, worse,
+/// *breaking* one silently routes to the next and the assertion stays green. That is not
+/// hypothetical: two #1139 mutations (a `NaN` anchor in `equilibrate_ss_input_rate`'s
+/// one-cycle advance, and a flat `0` anchor in the monotone input-rate train) left the whole
+/// suite passing, because the first made the exact solve decline into a correct fallback and
+/// the second sat on a branch the fixture never reached. A test that means to pin a branch's
+/// clock must assert which branch ran.
+///
+/// **One cell per thread, shared across numeric types.** The recording sites live in
+/// helpers that are generic over `T: PkNum` (`equilibrate_ss_input_rate_g`,
+/// `anderson_ss_fixed_point_g`), and `sens::ode_provider` instantiates them with a dual
+/// `T`. So a test that drives a `fit()` or the analytic provider observes whichever walk
+/// ran *last*, f64 or dual — not necessarily the value-path run-in it means to pin. Assert
+/// this only from a test that calls the f64 helpers directly, as the #1139 tests do. The
+/// neighbouring cycle counter has the same property and the same caveat.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum SsBranch {
+    /// No SS equilibration has completed on this thread since the last one started.
+    ///
+    /// Written at the top of `equilibrate_ss_pk_state`, so a call that **bails out early**
+    /// (`II <= 0`, an out-of-range compartment, overlapping infusions) leaves `None` rather
+    /// than the previous call's tag. That matters: without it a test asserting a branch
+    /// after a bail-out would read a stale value and pass for the wrong reason — the class
+    /// of un-failable assertion this enum exists to prevent.
+    #[default]
+    None,
+    /// The exact affine fixed point `(I − M)⁻¹·b` for a **bolus or infusion** dose on a
+    /// linear disposition (#914) — `equilibrate_ss_pk_state`'s `periodic_ss_fixed_point_pk`.
+    Exact,
+    /// The same closed form on the **input-rate** (built-in absorption) path,
+    /// `equilibrate_ss_input_rate`. Distinct from [`Self::Exact`] so an assertion can say
+    /// which of the two ran: they are different functions with different windows, and a
+    /// test naming one of them should not pass on the other.
+    InputRateExact,
+    /// Anderson-accelerated iteration on the same one-cycle map, for a nonlinear
+    /// disposition into a built-in absorption compartment (#867).
+    Anderson,
+    /// The capped explicit pulse train, on a clock local to each cycle (bolus/infusion).
+    CappedTrain,
+    /// The capped explicit pulse train of the input-rate path, which unlike every other
+    /// window runs on a **monotone** clock `0 … n·II` and advances its `TAD` anchor per
+    /// segment (#1139).
+    InputRateTrain,
+}
+
+#[cfg(test)]
+pub(crate) fn record_ss_equilibration_branch(b: SsBranch) {
+    LAST_SS_EQUILIBRATION_BRANCH.with(|c| c.set(b));
+}
+
+/// Branch the most recent SS equilibration took (test observation; see [`SsBranch`]).
+#[cfg(test)]
+pub(crate) fn last_ss_equilibration_branch() -> SsBranch {
+    LAST_SS_EQUILIBRATION_BRANCH.with(|c| c.get())
 }
 
 /// Cycles the most recent SS-equilibration call ran (test observation; see above).
@@ -423,6 +490,12 @@ pub(crate) fn with_full_ss_equilibration<R>(f: impl FnOnce() -> R) -> R {
 #[cfg(not(test))]
 #[inline(always)]
 pub(crate) fn record_ss_equilibration_cycles(_n: usize) {}
+
+/// The branch tag's non-test counterpart — same signature, so the call sites are
+/// unconditional. [`SsBranch`] is a fieldless enum, so naming a variant costs nothing.
+#[cfg(not(test))]
+#[inline(always)]
+pub(crate) fn record_ss_equilibration_branch(_b: SsBranch) {}
 
 /// Relative-magnitude threshold above which a **cycle-capped** SS equilibration is reported as
 /// non-converged (#867). The pulse-train equilibration

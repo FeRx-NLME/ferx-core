@@ -1,0 +1,44 @@
+# `SS=1` dose on an `[odes]` RHS that reads **absolute model time** (#1139, T3's half).
+#
+# The ferx twin of `nonmem_anchor/ss_tabs.ctl` / `train_tabs.ctl` — same shape as
+# `ss_tad_fit.ferx`, with `0.03*TAD` replaced by `0.003*T`. It is committed here as the
+# **parity guard** for T2, not as a claim that the number is right.
+#
+# What it pins: ferx and NONMEM agree on the steady state of an absolute-clock RHS — 8.5679
+# from both, to 1.5e-9 — because both engines equilibrate on a cycle-local clock and then
+# integrate forward on absolute time, so both sit ~67% away from their own converged train
+# (5.1221) *together*. Neither is "the steady state" of a system that has none: the explicit
+# `T`-reading train does not converge at all, and `train_tabs_n21.tab` against
+# `train_tabs.tab` measures the divergence rather than a limit.
+#
+# So this file exists so that a later change to the steady-state run-in cannot quietly move
+# a number that currently matches NONMEM. Rejecting or "fixing" this configuration would
+# break a parity that holds today; whether to warn about it is #1139's remaining half.
+
+[parameters]
+  theta TVCL(1.0, FIX)
+  theta TVV(20.0, FIX)
+
+  sigma PROP ~ 0.01                # variance; NONMEM `$SIGMA 0.01`
+
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central * (1.0 + 0.003*T)
+
+[scaling]
+  obs_scale = V                    # the state is an AMOUNT; NONMEM's `$ERROR` divides by V
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[fit_options]
+  method     = focei
+  maxiter    = 0
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11

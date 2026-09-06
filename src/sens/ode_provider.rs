@@ -920,10 +920,18 @@ pub(crate) fn ode_tvcov_supported(model: &CompiledModel, subject: &Subject) -> b
     // declined. The gap was known: this gate's own regression test
     // (`ode_ss_time_only_rhs_still_routes_to_fd`) spells the term `T` *to work around it*.
     //
-    // The gate is about the analytic-vs-FD **gradient** route. It does not make SS + a
-    // non-autonomous RHS correct: measured against an explicit 40-cycle pulse train, the
-    // production *value* is 17% wrong for `T` and `TIME` alike, and `NaN` for `TAD`/`TAFD`
-    // even when the term's coefficient is zero. That is a separate defect (#1139); the
+    // The gate is about the analytic-vs-FD **gradient** route, and one side of what it
+    // used to say has changed. The production *value* for `TAD` is now the periodic steady
+    // state, anchored per run-in window and NONMEM-anchored to 7.4e-9 (#1139,
+    // `tests/ss_model_time_nonmem_anchor.rs`) — this gate still declines it, because the
+    // *dual* equilibration is not the same recurrence: `equilibrate_ss_state_g` runs every
+    // window through one `eval_rhs_anchored::<T>(.., 0.0, T::from_f64(0.0), ..)`, so it does
+    // not re-anchor an infusion's quiet window at `−T_inf` the way the value path now does,
+    // and it makes `TAFD` cycle-local where the value path leaves it `NaN`. Both are
+    // unreachable while this gate holds, and neither is fixed here. `T`/`TIME`
+    // under SS is unchanged: it matches NONMEM while agreeing with neither engine's own
+    // dose train (67% apart — an absolute clock has no periodic limit to converge to), and
+    // `TAFD` under SS still reads `NaN` by design. Those are #1139's remaining half. The
     // same note is at `pk/mod.rs`, `pk/modified_release.rs`, and `ode_provider_tests.rs`.
     if has_ss
         && ode

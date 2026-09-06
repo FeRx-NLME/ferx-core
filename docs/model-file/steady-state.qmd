@@ -140,11 +140,16 @@ This also covers the dosing forms below (all closed by #486):
   recurrence anchored to the pulse, not wall-clock time), but a later observation's elapsed
   time since arrival still does, and the saltation captures exactly that.
 
-One SS sub-case still routes to the finite-difference fallback (and always will):
+One SS sub-case routes to the finite-difference fallback:
 
 - **SS + a non-autonomous RHS** (one that reads the `TIME`/`TAFD`/`TAD` builtins) — the
-  equilibration expands a *time-invariant* pulse train, so a time/`TAD`-dependent RHS breaks
-  the steady-state cycle recurrence; such models stay on FD.
+  *dual* equilibration anchors both model-time slots at zero and does not re-anchor them
+  per window, so its cycle recurrence is not the one the value path computes. Such models
+  stay on FD. Note this is a statement about the **gradient route only**: the value path
+  does anchor `TAD` correctly since [#1139](https://github.com/FeRx-NLME/ferx-core/issues/1139) (see
+  [Steady state with a `TAD`-reading RHS](#steady-state-with-a-tad-reading-rhs)), so these
+  models fit — with a finite-difference inner gradient, reported in
+  `FitResult.warnings`.
 
 ### Numeric cross-check against NONMEM 7.5.1 (SS + modeled-duration dose)
 
@@ -322,7 +327,62 @@ the ODE solver), and the result is validated against NONMEM `ALAG1` +
 > This holds for any realistic lagtime; overlapping infusions
 > (`T_inf > II`) are rejected as described under *Limitations*.
 
+## Steady state with a `TAD`-reading RHS
+
+An `[odes]` right-hand side may read the model-time builtins `TIME`/`T`, `TAFD` and `TAD`
+(see [ODE models](ode-models.qmd)). Under `SS=1` these behave differently, because the
+steady-state run-in does not integrate on the subject's clock — it expands a periodic
+pulse train on a clock local to each cycle.
+
+`TAD` is the one of the three that has a periodic steady state at all: it is bounded
+inside one dosing interval, so an infinitely long dose train converges. ferx anchors it to
+each run-in window's own pulse, so an `SS=1` dose on a `TAD`-reading RHS returns the
+periodic solution and agrees with the same model written as an explicit dose train.
+
+```
+[odes]
+  d/dt(central) = -(CL/V) * central * (1.0 + 0.03*TAD)
+```
+
+Measured on `CL = 1`, `V = 20`, `AMT = 100`, `II = 12` with a single `SS=1` record at
+`t = 480` and samples at 482/485/488/491, against NONMEM 7.6.0 (`ADVAN13 TOL=9`, the cycle
+clock written as `MOD(T + 120, 12)` since `$DES` has no `TAD` builtin — see
+`nonmem_anchor/ss_tad.ctl`):
+
+| | t = 482 | worst relative error |
+|---|---|---|
+| ferx `SS=1` | 8.8902009677 | — |
+| NONMEM `SS=1` | 8.8902010334 | 7.4e-9 |
+| Explicit 41-dose train (both engines) | 8.8902010448 | 9.1e-9 |
+| Closed form, outside both engines | 8.8902009650 | ferx 3.0e-10 · NONMEM 8.3e-9 |
+
+Before [#1139](https://github.com/FeRx-NLME/ferx-core/issues/1139) this returned `NaN` at
+every observation and a non-finite objective —
+including when the term's coefficient was **zero**, since `0.0 * NaN` is `NaN`, so merely
+mentioning `TAD` broke an otherwise ordinary steady-state model.
+
+`TAFD` and `TIME`/`T` are a different case and are **not** covered by the above. They read
+an absolute clock, so the dose train has no periodic limit for the run-in to converge to —
+measured, an explicit `TAFD` train moves 29 % per doubling of its length while the `TAD`
+train moves 3.5e-7. `TIME`/`T` under `SS=1` matches NONMEM (both engines equilibrate on a
+cycle-local clock and then integrate forward on absolute time, so both sit the same
+distance from their own non-convergent train), and `TAFD` under `SS=1` still reads `NaN`.
+Neither number is the steady state of a system that has one; if your model means an
+absolute clock, expand the run-in with explicit dose records instead of `SS=1`.
+
 ## Limitations
+
+`SS=1` combined with a **lagtime** on a model whose `[odes]` RHS reads `TAD` is rejected by
+`fit()` and `ferx check` (`E_SS_LAGTIME_TAD_RHS`). `simulate()` and `predict()` do **not**
+run that check — they validate a narrower bundle — so on those paths the configuration is
+not rejected and still returns the `NaN` it did before; treat a non-finite simulation of
+such a model as this diagnostic in disguise. `TAD` has no referent in the window between the dose
+record and the lagged arrival, and since the record-time seed flows to the arrival rather
+than being re-equilibrated there, the wrong value is carried into the steady-state trough
+and shifts *every* prediction, not just the ones inside that window — measured 2.7 % on
+the model above with `ALAG1 = 3`. Remove the lagtime, drop the `TAD` term, or expand the
+run-in with explicit dose records. A steady-state dose **without** a lagtime reads `TAD`
+correctly, as above.
 
 For the following malformed configurations, ferx-core skips the SS
 pre-equilibration (treating the dose as a single, non-SS bolus or
