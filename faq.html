@@ -1,0 +1,2032 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en"><head>
+
+<meta charset="utf-8">
+<meta name="generator" content="quarto-1.10.18">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+
+<meta name="description" content="Answers about ferx population PK/PD modeling, NONMEM and nlmixr2 compatibility, FOCEI, optimizers, data handling, and model syntax.">
+
+<title>ferx NLME modeling FAQ – ferx-core</title>
+<style>
+/* Default styles provided by pandoc.
+** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+*/
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: 1.5em;}
+div.column{flex: auto;}
+@media screen {
+div.columns{gap: min(4vw, 1.5em);}
+div.column{overflow-x: auto;}
+}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+  width: 0.8em;
+  margin: 0 0.8em 0.2em -1em; /* quarto-specific, see https://github.com/quarto-dev/quarto-cli/issues/4556 */ 
+  vertical-align: middle;
+}
+/* CSS for syntax highlighting */
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+  { counter-reset: source-line 0; }
+pre.numberSource code > span
+  { position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+  { content: counter(source-line);
+    position: relative; left: -1em; text-align: right; vertical-align: baseline;
+    border: none; display: inline-block;
+    -webkit-touch-callout: none; -webkit-user-select: none;
+    -khtml-user-select: none; -moz-user-select: none;
+    -ms-user-select: none; user-select: none;
+    padding: 0 4px; width: 4em;
+  }
+pre.numberSource { margin-left: 3em;  padding-left: 4px; }
+div.sourceCode
+  {   }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+</style>
+
+
+<script src="site_libs/quarto-nav/quarto-nav.js"></script>
+<script src="site_libs/quarto-nav/headroom.min.js"></script>
+<script src="site_libs/clipboard/clipboard.min.js"></script>
+<script src="site_libs/quarto-search/autocomplete.umd.js"></script>
+<script src="site_libs/quarto-search/fuse.min.js"></script>
+<script src="site_libs/quarto-search/quarto-search.js"></script>
+<meta name="quarto:offset" content="./">
+<link href="./assets/ferx-favicon.svg" rel="icon" type="image/svg+xml">
+<script src="site_libs/quarto-html/quarto.js" type="module"></script>
+<script src="site_libs/quarto-html/tabsets/tabsets.js" type="module"></script>
+<script src="site_libs/quarto-html/popper.min.js"></script>
+<script src="site_libs/quarto-html/tippy.umd.min.js"></script>
+<script src="site_libs/quarto-html/anchor.min.js"></script>
+<link href="site_libs/quarto-html/tippy.css" rel="stylesheet">
+<link href="site_libs/quarto-html/quarto-syntax-highlighting-51776f957f81c5a6b38322b65a6a6987.css" rel="stylesheet" class="quarto-color-scheme" id="quarto-text-highlighting-styles">
+<link href="site_libs/quarto-html/quarto-syntax-highlighting-dark-31632d092df9090a2ed68f79c078059d.css" rel="stylesheet" class="quarto-color-scheme quarto-color-alternate" id="quarto-text-highlighting-styles">
+<link href="site_libs/quarto-html/quarto-syntax-highlighting-51776f957f81c5a6b38322b65a6a6987.css" rel="stylesheet" class="quarto-color-scheme-extra" id="quarto-text-highlighting-styles">
+<script src="site_libs/bootstrap/bootstrap.min.js"></script>
+<link href="site_libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
+<link href="site_libs/bootstrap/bootstrap-f5ed25dbf962e4596f9f4df24f2ade0d.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme" id="quarto-bootstrap" data-mode="light">
+<link href="site_libs/bootstrap/bootstrap-dark-8a64b8d4793081e9872239f556c8075c.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme quarto-color-alternate" id="quarto-bootstrap" data-mode="dark">
+<link href="site_libs/bootstrap/bootstrap-f5ed25dbf962e4596f9f4df24f2ade0d.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme-extra" id="quarto-bootstrap" data-mode="light">
+<script id="quarto-search-options" type="application/json">{
+  "location": "navbar",
+  "copy-button": false,
+  "collapse-after": 3,
+  "panel-placement": "end",
+  "type": "overlay",
+  "limit": 50,
+  "keyboard-shortcut": [
+    "f",
+    "/",
+    "s"
+  ],
+  "show-item-context": false,
+  "language": {
+    "search-no-results-text": "No results",
+    "search-matching-documents-text": "matching documents",
+    "search-copy-link-title": "Copy link to search",
+    "search-hide-matches-text": "Hide additional matches",
+    "search-more-match-text": "more match in this document",
+    "search-more-matches-text": "more matches in this document",
+    "search-clear-button-title": "Clear",
+    "search-text-placeholder": "",
+    "search-detached-cancel-button-title": "Cancel",
+    "search-submit-button-title": "Submit",
+    "search-label": "Search"
+  }
+}</script>
+
+
+<link rel="stylesheet" href="styles.css">
+<meta property="og:title" content="ferx NLME modeling FAQ">
+<meta property="og:description" content="Answers about ferx population PK/PD modeling, NONMEM and nlmixr2 compatibility, FOCEI, optimizers, data handling, and model syntax.">
+<meta property="og:site_name" content="ferx-core">
+<meta property="og:locale" content="en_US">
+<meta name="twitter:title" content="ferx NLME modeling FAQ">
+<meta name="twitter:description" content="Answers about ferx population PK/PD modeling, NONMEM and nlmixr2 compatibility, FOCEI, optimizers, data handling, and model syntax.">
+<meta name="twitter:card" content="summary">
+<link rel="canonical" href="https://ferx-nlme.github.io/ferx-core/faq.html">
+</head>
+
+<body class="nav-sidebar floating nav-fixed quarto-light"><script id="quarto-html-before-body" type="application/javascript">
+    const toggleBodyColorMode = (bsSheetEl) => {
+      const mode = bsSheetEl.getAttribute("data-mode");
+      const bodyEl = window.document.querySelector("body");
+      if (mode === "dark") {
+        bodyEl.classList.add("quarto-dark");
+        bodyEl.classList.remove("quarto-light");
+      } else {
+        bodyEl.classList.add("quarto-light");
+        bodyEl.classList.remove("quarto-dark");
+      }
+    }
+    const toggleBodyColorPrimary = () => {
+      const bsSheetEl = window.document.querySelector("link#quarto-bootstrap:not([rel=disabled-stylesheet])");
+      if (bsSheetEl) {
+        toggleBodyColorMode(bsSheetEl);
+      }
+    }
+    const setColorSchemeToggle = (alternate) => {
+      const toggles = window.document.querySelectorAll('.quarto-color-scheme-toggle');
+      for (let i=0; i < toggles.length; i++) {
+        const toggle = toggles[i];
+        if (toggle) {
+          if (alternate) {
+            toggle.classList.add("alternate");
+          } else {
+            toggle.classList.remove("alternate");
+          }
+        }
+      }
+    };
+    const toggleColorMode = (alternate) => {
+      // Switch the stylesheets
+      const primaryStylesheets = window.document.querySelectorAll('link.quarto-color-scheme:not(.quarto-color-alternate)');
+      const alternateStylesheets = window.document.querySelectorAll('link.quarto-color-scheme.quarto-color-alternate');
+      manageTransitions('#quarto-margin-sidebar .nav-link', false);
+      if (alternate) {
+        // note: dark is layered on light, we don't disable primary!
+        enableStylesheet(alternateStylesheets);
+        for (const sheetNode of alternateStylesheets) {
+          if (sheetNode.id === "quarto-bootstrap") {
+            toggleBodyColorMode(sheetNode);
+          }
+        }
+      } else {
+        disableStylesheet(alternateStylesheets);
+        enableStylesheet(primaryStylesheets)
+        toggleBodyColorPrimary();
+      }
+      manageTransitions('#quarto-margin-sidebar .nav-link', true);
+      // Switch the toggles
+      setColorSchemeToggle(alternate)
+      // Hack to workaround the fact that safari doesn't
+      // properly recolor the scrollbar when toggling (#1455)
+      if (navigator.userAgent.indexOf('Safari') > 0 && navigator.userAgent.indexOf('Chrome') == -1) {
+        manageTransitions("body", false);
+        window.scrollTo(0, 1);
+        setTimeout(() => {
+          window.scrollTo(0, 0);
+          manageTransitions("body", true);
+        }, 40);
+      }
+    }
+    const disableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        stylesheet.rel = 'disabled-stylesheet';
+      }
+    }
+    const enableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        if(stylesheet.rel !== 'stylesheet') { // for Chrome, which will still FOUC without this check
+          stylesheet.rel = 'stylesheet';
+        }
+      }
+    }
+    const manageTransitions = (selector, allowTransitions) => {
+      const els = window.document.querySelectorAll(selector);
+      for (let i=0; i < els.length; i++) {
+        const el = els[i];
+        if (allowTransitions) {
+          el.classList.remove('notransition');
+        } else {
+          el.classList.add('notransition');
+        }
+      }
+    }
+    const isFileUrl = () => {
+      return window.location.protocol === 'file:';
+    }
+    const hasAlternateSentinel = () => {
+      let styleSentinel = getColorSchemeSentinel();
+      if (styleSentinel !== null) {
+        return styleSentinel === "alternate";
+      } else {
+        return false;
+      }
+    }
+    const setStyleSentinel = (alternate) => {
+      const value = alternate ? "alternate" : "default";
+      if (!isFileUrl()) {
+        window.localStorage.setItem("quarto-color-scheme", value);
+      } else {
+        localAlternateSentinel = value;
+      }
+    }
+    const getColorSchemeSentinel = () => {
+      if (!isFileUrl()) {
+        const storageValue = window.localStorage.getItem("quarto-color-scheme");
+        return storageValue != null ? storageValue : localAlternateSentinel;
+      } else {
+        return localAlternateSentinel;
+      }
+    }
+    const toggleGiscusIfUsed = (isAlternate, darkModeDefault) => {
+      const baseTheme = document.querySelector('#giscus-base-theme')?.value ?? 'light';
+      const alternateTheme = document.querySelector('#giscus-alt-theme')?.value ?? 'dark';
+      let newTheme = '';
+      if(authorPrefersDark) {
+        newTheme = isAlternate ? baseTheme : alternateTheme;
+      } else {
+        newTheme = isAlternate ? alternateTheme : baseTheme;
+      }
+      const changeGiscusTheme = () => {
+        // From: https://github.com/giscus/giscus/issues/336
+        const sendMessage = (message) => {
+          const iframe = document.querySelector('iframe.giscus-frame');
+          if (!iframe) return;
+          iframe.contentWindow.postMessage({ giscus: message }, 'https://giscus.app');
+        }
+        sendMessage({
+          setConfig: {
+            theme: newTheme
+          }
+        });
+      }
+      const isGiscussLoaded = window.document.querySelector('iframe.giscus-frame') !== null;
+      if (isGiscussLoaded) {
+        changeGiscusTheme();
+      }
+    };
+    const authorPrefersDark = false;
+    const darkModeDefault = authorPrefersDark;
+      document.querySelector('link#quarto-text-highlighting-styles.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+      document.querySelector('link#quarto-bootstrap.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+    let localAlternateSentinel = darkModeDefault ? 'alternate' : 'default';
+    // Dark / light mode switch
+    window.quartoToggleColorScheme = () => {
+      // Read the current dark / light value
+      let toAlternate = !hasAlternateSentinel();
+      toggleColorMode(toAlternate);
+      setStyleSentinel(toAlternate);
+      toggleGiscusIfUsed(toAlternate, darkModeDefault);
+      window.dispatchEvent(new Event('resize'));
+    };
+    // Switch to dark mode if need be
+    if (hasAlternateSentinel()) {
+      toggleColorMode(true);
+    } else {
+      toggleColorMode(false);
+    }
+  </script>
+
+<div id="quarto-search-results"></div>
+  <header id="quarto-header" class="headroom fixed-top">
+    <nav class="navbar navbar-expand-lg " data-bs-theme="dark">
+      <div class="navbar-container container-fluid">
+      <div class="navbar-brand-container mx-auto">
+    <a href="./index.html" class="navbar-brand navbar-brand-logo">
+    <img src="./assets/ferx-dsl-brackets.svg" alt="ferx" class="navbar-logo light-content">
+    <img src="./assets/ferx-dsl-brackets.svg" alt="ferx" class="navbar-logo dark-content">
+    </a>
+    <a class="navbar-brand" href="./index.html">
+    <span class="navbar-title">ferx-core</span>
+    </a>
+  </div>
+            <div id="quarto-search" class="" title="Search"></div>
+          <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarCollapse" aria-controls="navbarCollapse" role="menu" aria-expanded="false" aria-label="Toggle navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+  <span class="navbar-toggler-icon"></span>
+</button>
+          <div class="collapse navbar-collapse" id="navbarCollapse">
+            <ul class="navbar-nav navbar-nav-scroll me-auto">
+  <li class="nav-item">
+    <a class="nav-link active" href="./getting-started.html" aria-current="page"> 
+<span class="menu-text">Get started</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/features.html"> 
+<span class="menu-text">Features</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/changelog.html"> 
+<span class="menu-text">Changelog</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/roadmap.html"> 
+<span class="menu-text">Roadmap</span></a>
+  </li>  
+</ul>
+            <ul class="navbar-nav navbar-nav-scroll ms-auto">
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/ferx-core/"> 
+<span class="menu-text">ferx-core</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/ferx-book/"> 
+<span class="menu-text">ferx-r</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/reference/"> 
+<span class="menu-text">Reference</span></a>
+  </li>  
+  <li class="nav-item compact">
+    <a class="nav-link" href="https://github.com/FeRx-NLME"> <i class="bi bi-github" role="img" aria-label="GitHub">
+</i> 
+<span class="menu-text"></span></a>
+  </li>  
+</ul>
+          </div> <!-- /navcollapse -->
+            <div class="quarto-navbar-tools">
+  <a href="" class="quarto-color-scheme-toggle quarto-navigation-tool  px-1" onclick="window.quartoToggleColorScheme(); return false;" title="Toggle dark mode"><i class="bi"></i></a>
+</div>
+      </div> <!-- /container-fluid -->
+    </nav>
+  <nav class="quarto-secondary-nav">
+    <div class="container-fluid d-flex">
+      <button type="button" class="quarto-btn-toggle btn" data-bs-toggle="collapse" role="button" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+        <i class="bi bi-layout-text-sidebar-reverse"></i>
+      </button>
+        <nav class="quarto-page-breadcrumbs" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="./faq.html">FAQ</a></li></ol></nav>
+        <a class="flex-grow-1" role="navigation" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">      
+        </a>
+      <button type="button" class="btn quarto-search-button" aria-label="Search" onclick="window.quartoOpenSearch();">
+        <i class="bi bi-search"></i>
+      </button>
+    </div>
+  </nav>
+</header>
+<!-- content -->
+<div id="quarto-content" class="quarto-container page-columns page-rows-contents page-layout-article page-navbar">
+<!-- sidebar -->
+  <nav id="quarto-sidebar" class="sidebar collapse collapse-horizontal quarto-sidebar-collapse-item sidebar-navigation floating overflow-auto">
+    <div class="pt-lg-2 mt-2 text-left sidebar-header">
+      <a href="./index.html" class="sidebar-logo-link">
+      <img src="./assets/ferx-favicon.svg" alt="" class="sidebar-logo light-content py-0 d-lg-inline d-none">
+      <img src="./assets/ferx-favicon.svg" alt="" class="sidebar-logo dark-content py-0 d-lg-inline d-none">
+      </a>
+      </div>
+        <div class="mt-2 flex-shrink-0 align-items-center">
+        <div class="sidebar-search">
+        <div id="quarto-search" class="" title="Search"></div>
+        </div>
+        </div>
+    <div class="sidebar-menu-container"> 
+    <ul class="list-unstyled mt-1">
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Introduction</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./maturity.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Feature Maturity</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="./getting-started.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Getting Started</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./installation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Installation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./quick-start.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Quick Start</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="./model-file/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Model File Reference</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./model-file/parameters.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Parameters</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./model-file/iov.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Inter-Occasion Variability (IOV)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./model-file/individual-parameters.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Individual Parameters</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./model-file/covariates.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariates</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./model-file/covariate-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./model-file/structural-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Structural Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./model-file/lagtime.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Lagtime</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./model-file/steady-state.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Steady-State Doses (SS=1)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./model-file/error-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Error Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./model-file/bloq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">LOQ-Censored Observations</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./model-file/ode-models.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./model-file/absorption.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Built-in Absorption Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./model-file/scaling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Scaling</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./model-file/initial-conditions.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Initial Conditions</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./model-file/diffusion.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Stochastic Differential Equations (SDE / Diffusion)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./model-file/neural-networks.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Neural Networks</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./model-file/covariate-nn.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><code>[covariate_nn]</code> — Deep Compartment Models (DCM)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./model-file/data.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./model-file/data-selection.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Selection</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./model-file/derived.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Derived Columns (<code>[derived]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./model-file/output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Output Columns (<code>[output]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./model-file/fit-options.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Fit Options</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./model-file/simulation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Simulation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./model-file/adaptive-dosing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Adaptive (Feedback) Dosing</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./model-file/event-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Time-to-Event Endpoints (<code>[event_model]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./model-file/categorical.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Categorical endpoints — <code>[binary_model]</code></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./model-file/markov-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Markov models ([markov_model])</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="./estimation/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Estimation Methods</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./estimation/foce.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FOCE / FOCEI</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./estimation/agq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">AGQ — Adaptive Gaussian Quadrature</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./estimation/gauss-newton.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Gauss-Newton (BHHH)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./estimation/saem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">SAEM</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./estimation/sir.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Sampling Importance Resampling (SIR)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./estimation/importance-sampling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Importance Sampling (IMP)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./estimation/frem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FREM (Full Random Effects Model)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./estimation/impmap.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">IMPMAP — Importance Sampling assisted by Mode A Posteriori</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./estimation/bayes.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Bayesian estimation (MCMC)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./estimation/vi.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Variational Inference</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./estimation/parameterization.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Packed Parameter Space</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./estimation/optimizers.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Outer Optimizers</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./estimation/tte.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Time-to-Event (TTE) Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./estimation/categorical.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Categorical endpoints (binary / logistic)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./estimation/ctmm.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Continuous-time Markov models (CTMM)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./estimation/mixture.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Mixture Models</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false">
+ <span class="menu-text">Tools</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./tools/bootstrap.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Bootstrap</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./tools/gam-screening.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">GAM covariate screening</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./tools/search.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Search configuration</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./tools/covsearch.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate search</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./tools/modelsearch.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Structural model search</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./data-format.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Format</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./cli.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">CLI Reference</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Output Files</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./warnings.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Warnings</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="./file-formats/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">File Formats</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./file-formats/fitrx.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">The <code>.fitrx</code> Fit Bundle</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./file-formats/check-report.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Check Report (<code>ferx check --json</code>)</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="./examples/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Examples</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./examples/one-cpt-oral.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">One-Compartment Oral (Warfarin)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./examples/two-cpt-iv.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Two-Compartment IV Bolus</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./examples/covariates.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./examples/ode-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Model (Michaelis-Menten)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./examples/bloq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">BLOQ (M3 method)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./examples/iov.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Inter-Occasion Variability (IOV)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./examples/iov-saem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">IOV with SAEM</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./examples/multiple-dosing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Multiple Dosing (ADDL Column)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./examples/steady-state.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Steady-State Dosing (SS Column)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./examples/scaling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Unit Scaling (<code>[scaling]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./examples/derived-output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Derived Columns and Output</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./examples/data-selection.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Selection (IGNORE / ACCEPT)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./examples/ode-lagtime.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Model with Absorption Lag Time</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./examples/transit-absorption.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Transit Absorption (Two-Compartment)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./examples/sde.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Stochastic Differential Equations (SDE)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./examples/frem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FREM (Covariate Analysis)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./examples/multistart.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Multi-Start: Michaelis-Menten Elimination</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="./api/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Rust API</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./api/types.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Core Types</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./api/fitting.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Fitting Functions</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./api/simulation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Simulation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./api/parsing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Parsing</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./api/model-editing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Model editing</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./faq.html" class="sidebar-item-text sidebar-link active">
+ <span class="menu-text">FAQ</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="./development/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Development</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./development/contributing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Contributing to FeRx development</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./development/sdlc.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Development Lifecycle (SDLC)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./development/docs-lint.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Docs linter</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+    </ul>
+    </div>
+</nav>
+<div id="quarto-sidebar-glass" class="quarto-sidebar-collapse-item" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item"></div>
+<!-- margin-sidebar -->
+    <div id="quarto-margin-sidebar" class="sidebar margin-sidebar">
+        <nav id="TOC" role="doc-toc" class="toc-active">
+    <h2 id="toc-title">On this page</h2>
+   
+  <ul>
+  <li><a href="#frequently-asked-questions" id="toc-frequently-asked-questions" class="nav-link active" data-scroll-target="#frequently-asked-questions">Frequently Asked Questions</a>
+  <ul>
+  <li><a href="#do-i-need-to-use-mu-referencing-in-my-model-definitions-like-in-nonmem-nlmixr2" id="toc-do-i-need-to-use-mu-referencing-in-my-model-definitions-like-in-nonmem-nlmixr2" class="nav-link" data-scroll-target="#do-i-need-to-use-mu-referencing-in-my-model-definitions-like-in-nonmem-nlmixr2">Do I need to use MU-referencing in my model definitions, like in NONMEM / nlmixr2?</a>
+  <ul class="collapse">
+  <li><a href="#how-ferx-handles-it" id="toc-how-ferx-handles-it" class="nav-link" data-scroll-target="#how-ferx-handles-it">How ferx handles it</a></li>
+  <li><a href="#why-it-matters" id="toc-why-it-matters" class="nav-link" data-scroll-target="#why-it-matters">Why it matters</a></li>
+  <li><a href="#disabling-it" id="toc-disabling-it" class="nav-link" data-scroll-target="#disabling-it">Disabling it</a></li>
+  <li><a href="#porting-from-nonmem" id="toc-porting-from-nonmem" class="nav-link" data-scroll-target="#porting-from-nonmem">Porting from NONMEM</a></li>
+  </ul></li>
+  <li><a href="#can-i-use-if-else-statements-like-in-nonmem-or-nlmixr2" id="toc-can-i-use-if-else-statements-like-in-nonmem-or-nlmixr2" class="nav-link" data-scroll-target="#can-i-use-if-else-statements-like-in-nonmem-or-nlmixr2">Can I use <code>if</code> / <code>else</code> statements like in NONMEM or nlmixr2?</a></li>
+  <li><a href="#which-outer-optimizer-should-i-pick" id="toc-which-outer-optimizer-should-i-pick" class="nav-link" data-scroll-target="#which-outer-optimizer-should-i-pick">Which outer optimizer should I pick?</a></li>
+  <li><a href="#does-ferx-have-a-laplacian-estimation-method-like-nonmem" id="toc-does-ferx-have-a-laplacian-estimation-method-like-nonmem" class="nav-link" data-scroll-target="#does-ferx-have-a-laplacian-estimation-method-like-nonmem">Does ferx have a <code>LAPLACIAN</code> estimation method, like NONMEM?</a></li>
+  <li><a href="#how-do-i-fit-on-the-log-scale-like-nonmems-y-logf-eps1" id="toc-how-do-i-fit-on-the-log-scale-like-nonmems-y-logf-eps1" class="nav-link" data-scroll-target="#how-do-i-fit-on-the-log-scale-like-nonmems-y-logf-eps1">How do I fit on the log scale, like NONMEM’s <code>Y = LOG(F) + EPS(1)</code>?</a></li>
+  <li><a href="#how-do-i-scale-predictions-to-match-my-datas-units-like-nonmems-s1s2" id="toc-how-do-i-scale-predictions-to-match-my-datas-units-like-nonmems-s1s2" class="nav-link" data-scroll-target="#how-do-i-scale-predictions-to-match-my-datas-units-like-nonmems-s1s2">How do I scale predictions to match my data’s units, like NONMEM’s <code>S1</code>/<code>S2</code>?</a></li>
+  <li><a href="#my-dv-data-is-on-the-log-scale-or-i-want-to-fit-on-the-log-scale.-how-do-i-do-that" id="toc-my-dv-data-is-on-the-log-scale-or-i-want-to-fit-on-the-log-scale.-how-do-i-do-that" class="nav-link" data-scroll-target="#my-dv-data-is-on-the-log-scale-or-i-want-to-fit-on-the-log-scale.-how-do-i-do-that">My DV data is on the log scale (or I want to fit on the log scale). How do I do that?</a></li>
+  <li><a href="#which-outer-optimizer-should-i-use" id="toc-which-outer-optimizer-should-i-use" class="nav-link" data-scroll-target="#which-outer-optimizer-should-i-use">Which outer optimizer should I use?</a></li>
+  <li><a href="#fixed-effects-only-fits-vs-nonmem" id="toc-fixed-effects-only-fits-vs-nonmem" class="nav-link" data-scroll-target="#fixed-effects-only-fits-vs-nonmem">Fixed-effects-only fits vs NONMEM</a>
+  <ul class="collapse">
+  <li><a href="#anchor" id="toc-anchor" class="nav-link" data-scroll-target="#anchor">Anchor</a></li>
+  </ul></li>
+  <li><a href="#how-do-i-validate-a-model-file-without-running-a-full-fit" id="toc-how-do-i-validate-a-model-file-without-running-a-full-fit" class="nav-link" data-scroll-target="#how-do-i-validate-a-model-file-without-running-a-full-fit">How do I validate a model file without running a full fit?</a></li>
+  <li><a href="#how-do-i-exclude-records-or-subjects-like-nonmems-data-ignore" id="toc-how-do-i-exclude-records-or-subjects-like-nonmems-data-ignore" class="nav-link" data-scroll-target="#how-do-i-exclude-records-or-subjects-like-nonmems-data-ignore">How do I exclude records or subjects, like NONMEM’s <code>$DATA IGNORE=</code>?</a></li>
+  <li><a href="#what-about-nonmems-coded-rate-values--1--2" id="toc-what-about-nonmems-coded-rate-values--1--2" class="nav-link" data-scroll-target="#what-about-nonmems-coded-rate-values--1--2">What about NONMEM’s coded <code>RATE</code> values (<code>-1</code>, <code>-2</code>)?</a>
+  <ul class="collapse">
+  <li><a href="#which-compartments-can-an-analytical-model-be-infused-into" id="toc-which-compartments-can-an-analytical-model-be-infused-into" class="nav-link" data-scroll-target="#which-compartments-can-an-analytical-model-be-infused-into">Which compartments can an analytical model be infused into?</a></li>
+  </ul></li>
+  <li><a href="#can-i-model-zero-order-absorption-zero-order-input-into-the-depot" id="toc-can-i-model-zero-order-absorption-zero-order-input-into-the-depot" class="nav-link" data-scroll-target="#can-i-model-zero-order-absorption-zero-order-input-into-the-depot">Can I model zero-order absorption (zero-order input into the depot)?</a>
+  <ul class="collapse">
+  <li><a href="#nonmem-comparison" id="toc-nonmem-comparison" class="nav-link" data-scroll-target="#nonmem-comparison">NONMEM comparison</a></li>
+  </ul></li>
+  <li><a href="#which-records-covariates-govern-a-lagged-dose-like-nonmems-pk-timing" id="toc-which-records-covariates-govern-a-lagged-dose-like-nonmems-pk-timing" class="nav-link" data-scroll-target="#which-records-covariates-govern-a-lagged-dose-like-nonmems-pk-timing">Which record’s covariates govern a lagged dose, like NONMEM’s <code>$PK</code> timing?</a>
+  <ul class="collapse">
+  <li><a href="#worked-example" id="toc-worked-example" class="nav-link" data-scroll-target="#worked-example">Worked example</a></li>
+  <li><a href="#a-useful-invariant" id="toc-a-useful-invariant" class="nav-link" data-scroll-target="#a-useful-invariant">A useful invariant</a></li>
+  <li><a href="#what-if-the-arrival-lands-a-few-ulp-before-a-sample" id="toc-what-if-the-arrival-lands-a-few-ulp-before-a-sample" class="nav-link" data-scroll-target="#what-if-the-arrival-lands-a-few-ulp-before-a-sample">What if the arrival lands a few ULP before a sample?</a></li>
+  <li><a href="#what-about-a-steady-state-dose-with-a-lagtime" id="toc-what-about-a-steady-state-dose-with-a-lagtime" class="nav-link" data-scroll-target="#what-about-a-steady-state-dose-with-a-lagtime">What about a steady-state dose with a lagtime?</a></li>
+  </ul></li>
+  </ul></li>
+  </ul>
+<div class="toc-actions"><ul><li><a href="https://github.com/FeRx-NLME/ferx-core/edit/main/faq.qmd" class="toc-action"><i class="bi bi-github"></i>Edit this page</a></li><li><a href="https://github.com/FeRx-NLME/ferx-core/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></nav>
+    </div>
+<!-- main -->
+<main class="content" id="quarto-document-content"><header id="title-block-header" class="quarto-title-block"></header>
+
+
+
+
+
+<section id="frequently-asked-questions" class="level1">
+<h1>Frequently Asked Questions</h1>
+<section id="do-i-need-to-use-mu-referencing-in-my-model-definitions-like-in-nonmem-nlmixr2" class="level2">
+<h2 class="anchored" data-anchor-id="do-i-need-to-use-mu-referencing-in-my-model-definitions-like-in-nonmem-nlmixr2">Do I need to use MU-referencing in my model definitions, like in NONMEM / nlmixr2?</h2>
+<p><strong>No.</strong> You do not need to write an explicit <code>MU_i</code> intermediate variable — ferx detects the same structure automatically from the right-hand side of each <code>[individual_parameters]</code> line.</p>
+<p>In NONMEM and nlmixr2, MU-referencing is a convention in which each random effect <code>ETA(i)</code> is linearly associated with a single <code>MU_i</code> term (typically <code>MU_i = LOG(THETA(i))</code>), so individual parameters look like:</p>
+<pre><code>MU_1 = LOG(THETA(1))
+CL   = EXP(MU_1 + ETA(1))</code></pre>
+<p>This structure is required by NONMEM’s SAEM implementation, whose conjugate-Gibbs E-step is only valid when the <code>MU_i → ETA(i)</code> relationship is strictly linear (typically on a log scale). Deviating from it — for example writing <code>CL = THETA(1) * EXP(ETA(1))</code> without going through an intermediate <code>MU_1</code> — causes NONMEM SAEM to reject the model or silently produce biased estimates.</p>
+<section id="how-ferx-handles-it" class="level3">
+<h3 class="anchored" data-anchor-id="how-ferx-handles-it">How ferx handles it</h3>
+<p>In ferx, you simply write the individual-parameter line in the form that makes sense for your model. The parser inspects each line and records which <code>THETA</code> acts as the “anchor” for each <code>ETA</code>, then uses that information to re-centre the estimation search at every outer iteration. The following patterns are detected automatically:</p>
+<pre><code>CL = TVCL * exp(ETA_CL)              # multiplicative exp — most common
+CL = exp(log(TVCL) + ETA_CL)         # canonical MU form
+CL = TVCL * (WT/70)^0.75 * exp(ETA_CL)   # with covariate adjustment
+CL = TVCL + ETA_CL                   # additive eta (linear shift)</code></pre>
+<p>The parser records <code>ETA_CL → (TVCL, log_transformed)</code> and at each outer step computes the shift</p>
+<pre><code>mu[i] = log(theta[i])   # for multiplicative/exp patterns
+mu[i] = theta[i]        # for additive patterns</code></pre>
+<p>The inner optimizer (and the SAEM exploration-phase MH proposal) is then centred on this <code>mu</code> shift rather than on <code>eta = 0</code>. This matches the convergence behaviour that NONMEM / nlmixr2 get from an explicit <code>MU_i = LOG(THETA(i))</code> block, without requiring you to write it.</p>
+<p>Patterns that ferx <strong>does not</strong> auto-detect (and therefore falls back to the plain <code>eta = 0</code> start) include:</p>
+<ul>
+<li>Parameters with two or more free thetas in the product (<code>CL = TVCL * TVSCALE * exp(ETA_CL)</code>) — ambiguous anchor.</li>
+<li>Compound eta expressions inside the <code>exp</code> (<code>CL = TVCL * exp(ETA_CL + ETA_OCC)</code>).</li>
+<li>Non-standard transforms the parser doesn’t recognise.</li>
+</ul>
+<p>Mu-referencing being absent is not an error — it just means that eta for that parameter is initialised to zero at each outer step, same as the pre-automatic behaviour. When a fit runs, ferx records the list of auto-detected mu-referenced ETAs in <code>FitResult.warnings</code> (as a line starting with <code>mu-ref: …</code>) so you can confirm what the parser picked up.</p>
+</section>
+<section id="why-it-matters" class="level3">
+<h3 class="anchored" data-anchor-id="why-it-matters">Why it matters</h3>
+<p>Mu-referencing mostly affects convergence speed and robustness, not the final MLE:</p>
+<ul>
+<li><strong>FOCE / FOCEI</strong>: each outer step re-optimises ETA by BFGS. With a mu-shift, the warm-started BFGS sees a much better starting point when <code>THETA</code> moves away from the initial estimate, so fewer inner iterations are needed and pathological steps are less likely.</li>
+<li><strong>SAEM</strong>: during the exploration phase, Metropolis–Hastings proposals are centred on <code>mu_k</code> instead of on the current chain state. This helps the chain escape the (incorrect) <code>eta = 0</code> basin when <code>TVCL</code> is still far from the true value. During the convergence phase the proposal reverts to a symmetric random walk so that detailed balance holds.</li>
+</ul>
+<p>Because the estimator is MLE in both cases, models that converge without mu-referencing will converge to the same estimates with it — just (usually) in fewer iterations.</p>
+</section>
+<section id="disabling-it" class="level3">
+<h3 class="anchored" data-anchor-id="disabling-it">Disabling it</h3>
+<p>If you want to benchmark against the pre-2026 behaviour, set:</p>
+<pre><code>[fit_options]
+  mu_referencing = false</code></pre>
+<p>or, from the Rust API, <code>FitOptions { mu_referencing: false, .. }</code>. The default is <code>true</code>.</p>
+</section>
+<section id="porting-from-nonmem" class="level3">
+<h3 class="anchored" data-anchor-id="porting-from-nonmem">Porting from NONMEM</h3>
+<p>If you have a NONMEM model that uses an explicit <code>MU_1 = LOG(THETA(1))</code> line, just drop the <code>MU_i</code> intermediate and write the individual parameter directly — ferx will detect the equivalent mu-reference automatically and the fit will be equivalent.</p>
+</section>
+</section>
+<section id="can-i-use-if-else-statements-like-in-nonmem-or-nlmixr2" class="level2">
+<h2 class="anchored" data-anchor-id="can-i-use-if-else-statements-like-in-nonmem-or-nlmixr2">Can I use <code>if</code> / <code>else</code> statements like in NONMEM or nlmixr2?</h2>
+<p><strong>Yes.</strong> ferx supports two forms of conditional logic in both <code>[individual_parameters]</code> and <code>[odes]</code> blocks:</p>
+<pre><code># Block form
+if (WT &gt; 70) {
+  CL = TVCL * (WT / 70)^0.75 * exp(ETA_CL)
+} else if (SEX == 1) {
+  CL = TVCL * 1.2 * exp(ETA_CL)
+} else {
+  CL = TVCL * exp(ETA_CL)
+}
+
+# Inline (ternary) form
+CL = if (SEX == 1) TVCL * 1.5 else TVCL</code></pre>
+<p>Conditions support comparisons (<code>&lt;</code>, <code>&lt;=</code>, <code>&gt;</code>, <code>&gt;=</code>, <code>==</code>, <code>!=</code>) and logical operators (<code>&amp;&amp;</code>, <code>||</code>, <code>!</code>). Either form may be combined with arbitrary arithmetic, including covariate references and other ETAs.</p>
+<p><strong>Compared to NONMEM:</strong> NONMEM uses Fortran-style <code>IF (cond) THEN ... ELSE ... ENDIF</code> and Fortran comparison aliases (<code>.GT.</code>, <code>.LE.</code>, etc.). ferx uses C-style braces and operator symbols. The semantics are otherwise the same — exactly one branch fires per evaluation, the rest are ignored.</p>
+<p><strong>Compared to nlmixr2:</strong> nlmixr2’s <code>if (cond) { ... } else { ... }</code> syntax is a near-verbatim match for ferx’s block form. Drop the <code>&lt;-</code> assignments in favour of <code>=</code> and the model translates directly.</p>
+<p><strong>Caveat:</strong> when a parameter is assigned inside an <code>if</code> block, ferx skips mu-reference detection for that parameter (the <code>(ETA → THETA)</code> link is no longer unconditional). See <a href="./model-file/individual-parameters.html#interaction-with-mu-referencing">Individual Parameters</a> for the workaround if you need both conditional logic and mu-referencing on the same parameter.</p>
+<p><strong>A note on <code>==</code> and <code>!=</code>:</strong> these operators do an exact bitwise float comparison. They work as you’d expect for integer-coded covariates (<code>SEX == 1</code>, <code>STUDY != 3</code>) but are unreliable on continuous values, where floating-point round-off can flip the result. For continuous thresholds prefer a bracketed comparison (<code>WT &gt;= 70 &amp;&amp; WT &lt; 80</code>) over <code>WT == 75</code>.</p>
+</section>
+<section id="which-outer-optimizer-should-i-pick" class="level2">
+<h2 class="anchored" data-anchor-id="which-outer-optimizer-should-i-pick">Which outer optimizer should I pick?</h2>
+<p><code>bobyqa</code> (the default) is the right choice for most models — derivative-free quadratic trust-region, robust to noisy FD gradients, and consistently reaches a lower OFV than <code>slsqp</code> on ODE/PD models, sparse data, and Hill-ridge identifiability problems. Previously the default was <code>slsqp</code>; the change is one line away if you need the old behaviour (<code>optimizer = slsqp</code> in <code>[fit_options]</code>).</p>
+<p>Reach for a different optimizer when the default misbehaves:</p>
+<ul>
+<li><strong><code>slsqp</code></strong> — gradient-based; faster per iteration on smooth, well-conditioned analytical PK models with many parameters. Can stall above the true minimum on ill-conditioned fits unless paired with <code>reconverge_gradient_interval = 1</code> (5–6× cost per gradient).</li>
+<li><strong><code>trust_region</code></strong> — second-order Newton trust-region with the analytic outer gradient and BHHH approximate Hessian. Can be faster near convergence because it uses curvature information; the CG budget defaults to <code>ceil(sqrt(n_params))</code> (~5 for standard NLME models), but you can pin it with <code>steihaug_max_iters</code> if you have many packed parameters and want more aggressive sub-problem solves.</li>
+<li><strong><code>lbfgs</code> / <code>bfgs</code></strong> — fall back to these only when NLopt is unavailable.</li>
+</ul>
+<p>See <a href="./model-file/fit-options.html#optimizer-choices">Fit Options</a> for the full list.</p>
+</section>
+<section id="does-ferx-have-a-laplacian-estimation-method-like-nonmem" class="level2">
+<h2 class="anchored" data-anchor-id="does-ferx-have-a-laplacian-estimation-method-like-nonmem">Does ferx have a <code>LAPLACIAN</code> estimation method, like NONMEM?</h2>
+<p>There is no separate <code>LAPLACE</code> / <code>LAPLACIAN</code> switch in ferx — and you don’t need one. In NONMEM, <code>METHOD=COND</code> (FOCE/FOCEI) and <code>METHOD=COND LAPLACE</code> differ only in how the curvature of the individual objective in the random effects (<code>η</code>) is formed: FOCE uses a first-order (Gauss–Newton) approximation that drops the second derivative of the prediction, whereas LAPLACE computes the <strong>exact</strong> second derivative of the individual <code>−2·log L</code> in <code>η</code>. LAPLACE is <em>required</em> whenever a subject’s likelihood is not the built-in Gaussian-residual form — i.e. a user-defined likelihood (NONMEM’s <code>F_FLAG</code>): categorical, count, and <strong>time-to-event</strong> data.</p>
+<p>ferx’s conditional engine is itself a Laplace approximation, and it selects the right curvature per endpoint automatically:</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 41%">
+<col style="width: 33%">
+<col style="width: 25%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Endpoint</th>
+<th>NONMEM</th>
+<th>ferx</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Continuous (Gaussian residual error)</td>
+<td>FOCE / FOCEI — first-order Hessian</td>
+<td>FOCEI — same first-order Laplace form (matches nlmixr2)</td>
+</tr>
+<tr class="even">
+<td>Time-to-event (<code>[event_model]</code> hazard)</td>
+<td><strong><code>LAPLACIAN</code> required</strong></td>
+<td><strong>exact second-order η-Hessian — applied automatically</strong></td>
+</tr>
+</tbody>
+</table>
+<p>So for a survival model you still write <code>method = focei</code>; ferx detects the <code>[event_model]</code> endpoint and, because there is no Gaussian residual to linearize, computes the true second derivative of the hazard <code>−log L</code> with respect to <code>η</code> and folds it into the Laplace marginal. That is exactly NONMEM’s LAPLACIAN computation — which is why ferx TTE fits are validated against NONMEM <code>CONDITIONAL LAPLACIAN INTERACTION</code> (see <a href="./estimation/tte.html">Time-to-event estimation</a>). It is not a user-selectable option because no alternative is meaningful: a hazard likelihood always uses it.</p>
+<p>For continuous data, ferx (like nlmixr2 FOCEI) keeps the first-order Hessian and does <strong>not</strong> offer a full-Laplace-on-Gaussian toggle — the extra curvature term it would add is rarely worth it. When FOCE/Laplace accuracy is genuinely the concern (strong nonlinearity, non-Gaussian <code>η</code> posteriors), reach for the importance-sampling (<code>imp</code> / <code>impmap</code>) or <code>saem</code> / <code>bayes</code> methods, which <em>integrate</em> over <code>η</code> rather than approximating around its mode. See <a href="./estimation/foce.html">FOCE/FOCEI</a> and <a href="./model-file/fit-options.html">Fit Options</a>.</p>
+<blockquote class="blockquote">
+<p><strong>The Laplace approximation has limits either way.</strong> Because Laplace is exact only for Gaussian integrands, frailty variances on <em>nonlinear</em> hazard parameters can be over-estimated under FOCEI-Laplace — in ferx <strong>and</strong> in NONMEM. Prefer SAEM/IMP there; the <a href="./estimation/tte.html">TTE page</a> has the cross-tool comparison.</p>
+</blockquote>
+</section>
+<section id="how-do-i-fit-on-the-log-scale-like-nonmems-y-logf-eps1" class="level2">
+<h2 class="anchored" data-anchor-id="how-do-i-fit-on-the-log-scale-like-nonmems-y-logf-eps1">How do I fit on the log scale, like NONMEM’s <code>Y = LOG(F) + EPS(1)</code>?</h2>
+<p>Use a log-transform-both-sides (LTBS) error model. Two forms are available in the <code>[error_model]</code> block, depending on the scale of your <code>DV</code> column:</p>
+<pre><code># DV on the natural scale — engine log-transforms DV and the prediction:
+log(DV) ~ additive(ADD_LOG)
+
+# DV already log-transformed in the data (e.g. ported from NONMEM):
+DV ~ log_additive(ADD_LOG)</code></pre>
+<p>Both compare <code>log(prediction)</code> to a log-scale observation with <strong>additive</strong> error on the log scale — exactly NONMEM’s <code>IPRED = LOG(F); Y = IPRED + EPS(1)</code>. Under LTBS, <code>IPRED</code>/<code>PRED</code>, <code>IWRES</code>/<code>CWRES</code>, and simulated <code>DV</code> are all reported on the log scale (back-transform with <code>exp()</code> for natural-scale values).</p>
+<p><strong>Relationship to proportional error.</strong> For a small residual CV, additive-on-log and proportional error coincide. On the warfarin dataset the two parameterizations agree closely: <code>examples/warfarin.ferx</code> (<code>DV ~ proportional(PROP_ERR)</code>) fits <code>PROP_ERR ≈ 0.0106</code> with <code>TVCL ≈ 0.133, TVV ≈ 7.69, TVKA ≈ 0.76</code>, and <code>examples/warfarin_ltbs.ferx</code> (<code>log(DV) ~ additive(ADD_LOG)</code>) fits <code>ADD_LOG ≈ 0.0106</code> with <code>TVCL ≈ 0.133, TVV ≈ 7.74, TVKA ≈ 0.81</code> — the same structural parameters and the same residual magnitude. See <a href="./model-file/error-model.html#log-transform-both-sides-ltbs">Error Model</a> for the full reference and restrictions.</p>
+</section>
+<section id="how-do-i-scale-predictions-to-match-my-datas-units-like-nonmems-s1s2" class="level2">
+<h2 class="anchored" data-anchor-id="how-do-i-scale-predictions-to-match-my-datas-units-like-nonmems-s1s2">How do I scale predictions to match my data’s units, like NONMEM’s <code>S1</code>/<code>S2</code>?</h2>
+<p>Use the <code>[scaling]</code> block. The convention is divisive (<code>pred_scaled = pred_raw / scale</code>), matching the natural reading of <code>obs_scale = V/1000</code>.</p>
+<pre><code>[scaling]
+  obs_scale = 1000          # mg/L → mg/mL</code></pre>
+<p>The block also supports expression-form scales (<code>obs_scale = WT / 70</code>) and a full Form C readout that replaces the built-in output entirely — on ODE <strong>and</strong> analytical (closed-form) PK models (#650):</p>
+<pre><code>[structural_model]
+  ode(states=[depot, central])   # or: pk one_cpt_iv(cl=CL, v=V)
+
+[scaling]
+  y = central / V           # central holds the amount; observe as concentration</code></pre>
+<p>On an analytical model the readout can express a nonlinear multi-DV output such as a saturable free-vs-total protein-binding correction switched by a per-row covariate, and stays analytic in the FOCEI/FOCE gradient (including non-structural readout parameters like a binding <code>BMAX</code>/<code>KD</code>):</p>
+<pre><code>[scaling]
+  y = if (FREE == 0) central / V + BMAX * (central / V) / (KD + central / V) \
+      else           central / V</code></pre>
+<p>For models with multiple observed compartments (parent + metabolite, sum-of-moieties, free vs.&nbsp;total), specify a scale per CMT:</p>
+<pre><code>[scaling]
+  obs_scale[CMT=1] = 1000
+  obs_scale[CMT=2] = 1
+  y[CMT=1] = parent / V
+  y[CMT=2] = metab  / VM</code></pre>
+<p>Every observed CMT must have a matching <code>[CMT=N]</code> entry — <code>fit()</code> errors at startup with the list of missing CMTs.</p>
+<p>See <a href="./model-file/scaling.html">Scaling</a> for the full reference, including how this compares to NONMEM’s <code>S1</code>/<code>S2</code> and nlmixr2’s <code>cmt(central); f = ...</code>.</p>
+</section>
+<section id="my-dv-data-is-on-the-log-scale-or-i-want-to-fit-on-the-log-scale.-how-do-i-do-that" class="level2">
+<h2 class="anchored" data-anchor-id="my-dv-data-is-on-the-log-scale-or-i-want-to-fit-on-the-log-scale.-how-do-i-do-that">My DV data is on the log scale (or I want to fit on the log scale). How do I do that?</h2>
+<p>Use the log-transform-both-sides (LTBS) error model. There are two forms depending on the scale of the <code>DV</code> column:</p>
+<p><strong><code>DV</code> is on the natural (concentration) scale</strong> — use <code>log(DV) ~ additive(SIGMA)</code>. ferx log-transforms the <code>DV</code> column at load time and compares it to <code>log(prediction)</code>:</p>
+<pre><code>[parameters]
+  sigma ADD_LOG ~ 0.1     # additive SD on the log scale (≈ CV if small)
+
+[error_model]
+  log(DV) ~ additive(ADD_LOG)</code></pre>
+<p><strong><code>DV</code> is already log-transformed in the dataset</strong> — use <code>DV ~ log_additive(SIGMA)</code>. ferx takes <code>DV</code> as-is and only log-transforms the prediction:</p>
+<pre><code>[error_model]
+  DV ~ log_additive(ADD_LOG)</code></pre>
+<p>Both produce IPRED, PRED, IWRES, and CWRES on the log scale (back-transform with <code>exp()</code> for natural-scale values). BLOQ/M3 is supported; multi-endpoint and SDE models are not. See <a href="./model-file/error-model.html#log-transform-both-sides-ltbs">Error Model</a> for full details.</p>
+</section>
+<section id="which-outer-optimizer-should-i-use" class="level2">
+<h2 class="anchored" data-anchor-id="which-outer-optimizer-should-i-use">Which outer optimizer should I use?</h2>
+<p><strong>Default (<code>bobyqa</code>)</strong> works well for most models — including ODE/PD models, sparse data, and Hill-ridge problems where gradient-based optimizers stall. If you’re unsure, start here.</p>
+<p><strong><code>slsqp</code></strong> is the right pick when <code>bobyqa</code> is too slow on a smooth, well-conditioned model with many parameters (it can take many quadratic-interpolation samples to triangulate a high-dimensional surface). Pair with <code>reconverge_gradient_interval = 1</code> if it stalls above an expected OFV.</p>
+<p><strong><code>trust_region</code></strong> shines on high-parameter-count models (many thetas/omegas) or when combined with <code>inits_from_nca</code> — the second-order curvature helps when starting values are good. Set <code>steihaug_max_iters</code> if you want to pin the CG budget.</p>
+<p><strong><code>gn</code> / <code>gn_hybrid</code></strong> for fast iteration during model development: Gauss-Newton converges in 10–30 steps vs 100+ for gradient methods. <code>gn_hybrid</code> adds a FOCEI polish pass for robustness; that polish stage runs with <code>bobyqa</code> by default and inherits any <code>optimizer</code> override.</p>
+<p><strong>Gradient-based (<code>lbfgs</code>, <code>mma</code>)</strong> are rarely needed; prefer <code>bobyqa</code> or <code>slsqp</code>. See <a href="./estimation/foce.html#optimizer-options">FOCE/FOCEI — Optimizer Options</a> for a full comparison.</p>
+</section>
+<section id="fixed-effects-only-fits-vs-nonmem" class="level2">
+<h2 class="anchored" data-anchor-id="fixed-effects-only-fits-vs-nonmem">Fixed-effects-only fits vs NONMEM</h2>
+<p>You can fit a model with no random effects at all — just omit every <code>omega</code> declaration and the corresponding <code>exp(ETA_…)</code> terms (see <a href="./model-file/parameters.html#no-omega-at-all-fixed-effects-only-naive-pooled-fits">no omega at all</a>). <code>sigma</code> is still required for a continuous endpoint.</p>
+<p><strong>The NONMEM equivalent is <code>$OMEGA 0 FIX</code>, not an omitted <code>$OMEGA</code>.</strong> This trips people up, so it is worth being precise. If you delete <code>$OMEGA</code> from a control stream, NM-TRAN does not give you a fixed-effects population fit — it reports</p>
+<pre class="text"><code>(WARNING  1) NM-TRAN INFERS THAT THE DATA ARE SINGLE-SUBJECT.
+(WARNING 132) SIGMA IS INTEPRETED AS RESIDUAL VARIANCE TO SINGLE SUBJECT ANALYSIS</code></pre>
+<p>and switches to a <strong>single-subject</strong> analysis, dropping the <code>ID</code> grouping. On a multi-subject dataset whose <code>TIME</code> restarts at 0 for each subject, the run then aborts outright:</p>
+<pre class="text"><code>0DATA REC          11: TIME DATA ITEM IS LESS THAN PREVIOUS TIME DATA ITEM
+0RUN TERMINATED BECAUSE OF ERRORS IN DATA RECORDS</code></pre>
+<p>Declaring a degenerate <code>ETA(1)</code> with its variance fixed at zero keeps NONMEM in population mode with per-subject dose bookkeeping, which is what ferx does at <code>n_eta = 0</code>:</p>
+<pre class="text"><code>$PK    CL = THETA(1)*EXP(ETA(1))
+       V  = THETA(2)
+       S1 = V
+$OMEGA 0 FIX</code></pre>
+<section id="anchor" class="level3">
+<h3 class="anchored" data-anchor-id="anchor">Anchor</h3>
+<p><code>examples/one_cpt_iv_pooled.ferx</code> against <code>data/one_cpt_iv.csv</code>, versus the control stream above under <code>$EST METHOD=0 MAXEVAL=9999 SIGDIGITS=4</code> (<code>nonmem_anchor/results/zero_omega_pooled.{ctl,lst,ext}</code>, NONMEM 7.6.0):</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Quantity</th>
+<th>ferx</th>
+<th>NONMEM</th>
+<th>Relative Δ</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>OFV</td>
+<td>−269.637010</td>
+<td>−269.63700440</td>
+<td>6e-6 (abs)</td>
+</tr>
+<tr class="even">
+<td>TVCL</td>
+<td>4.840820</td>
+<td>4.84070</td>
+<td>2.5e-5</td>
+</tr>
+<tr class="odd">
+<td>TVV</td>
+<td>52.834133</td>
+<td>52.8324</td>
+<td>3.3e-5</td>
+</tr>
+<tr class="even">
+<td>SIGMA (variance)</td>
+<td>0.0166360</td>
+<td>0.0166323</td>
+<td>2.2e-4</td>
+</tr>
+<tr class="odd">
+<td>SE TVCL</td>
+<td>0.166312</td>
+<td>0.166298</td>
+<td>8e-5</td>
+</tr>
+<tr class="even">
+<td>SE TVV</td>
+<td>1.760499</td>
+<td>1.76021</td>
+<td>1.6e-4</td>
+</tr>
+<tr class="odd">
+<td>SE SIGMA (SD scale)</td>
+<td>0.018243</td>
+<td>0.0182395</td>
+<td>2e-4</td>
+</tr>
+</tbody>
+</table>
+<p>Two conventions matter when reproducing this:</p>
+<ul>
+<li><strong>OFV constant.</strong> ferx’s <code>ofv</code> is <code>Σ IWRES² + Σ log Var</code>, matching NONMEM’s <code>OBJECTIVE FUNCTION VALUE WITHOUT CONSTANT</code>. NONMEM also prints a <em>with constant</em> figure (here −104.228068) that adds <code>n·log 2π</code>.</li>
+<li><strong>Covariance estimator.</strong> The standard errors above are ferx’s under <code>covariance_method = rsr</code>. NONMEM’s <code>$COVARIANCE</code> default is the <code>RSR</code> sandwich, while ferx’s default is <code>r</code> (the inverse Hessian). Comparing ferx’s default against NONMEM’s default on this model gives SEs that differ by roughly a factor of two — that is the convention difference, not a discrepancy. See <a href="./model-file/fit-options.html"><code>covariance_method</code></a>.</li>
+</ul>
+</section>
+</section>
+<section id="how-do-i-validate-a-model-file-without-running-a-full-fit" class="level2">
+<h2 class="anchored" data-anchor-id="how-do-i-validate-a-model-file-without-running-a-full-fit">How do I validate a model file without running a full fit?</h2>
+<p>Use <code>ferx check</code>:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb16"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="ex">ferx</span> check model.ferx                  <span class="co"># parse + structural validation</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="ex">ferx</span> check model.ferx <span class="at">--data</span> data.csv  <span class="co"># also run data-dependent checks</span></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a><span class="ex">ferx</span> check model.ferx <span class="at">--data</span> data.csv <span class="at">--json</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>It runs the parser and every validation step that normally fires at the start of a fit — missing blocks, missing covariates, per-CMT scaling / error-model coverage, steady-state and lag-time sanity — then reports the findings and exits, without fitting. This turns a multi-second fit-to-find-a-typo into a sub-second loop.</p>
+<p><code>--json</code> emits a structured report (stable <code>code</code> per finding, optional block / line / suggestion) that tooling and coding agents can consume directly, rather than parsing prose. The exit code is <code>0</code> when no errors are found, <code>1</code> when there are errors. See the <a href="./file-formats/check-report.html">check report reference</a> for the JSON schema and the full code table.</p>
+</section>
+<section id="how-do-i-exclude-records-or-subjects-like-nonmems-data-ignore" class="level2">
+<h2 class="anchored" data-anchor-id="how-do-i-exclude-records-or-subjects-like-nonmems-data-ignore">How do I exclude records or subjects, like NONMEM’s <code>$DATA IGNORE=</code>?</h2>
+<p>Use the <code>[data_selection]</code> block:</p>
+<pre><code>[data_selection]
+  ignore = DV &lt; 0.001          # drop any obs where DV is below detection
+  ignore_subjects = [3, 17]    # drop subjects 3 and 17 entirely</code></pre>
+<p>The <code>ignore</code> key works like NONMEM’s <code>$DATA IGNORE=</code>: a record is excluded when the expression is true. The <code>accept</code> key is the complement: a record is kept only when the expression passes (equivalent to NONMEM’s <code>$DATA ACCEPT=</code>).</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 57%">
+<col style="width: 42%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>NONMEM</th>
+<th>ferx</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>$DATA IGNORE=(BW.GT.80)</code></td>
+<td><code>ignore = BW &gt; 80</code></td>
+</tr>
+<tr class="even">
+<td><code>$DATA ACCEPT=(DV.GE.0.001)</code></td>
+<td><code>accept = DV &gt;= 0.001</code></td>
+</tr>
+<tr class="odd">
+<td><code>$DATA IGNORE=(ID.EQ.3) IGNORE=(ID.EQ.17)</code></td>
+<td><code>ignore_subjects = [3, 17]</code></td>
+</tr>
+</tbody>
+</table>
+<p>Multiple <code>ignore</code> lines mean “exclude if any condition matches”; multiple <code>accept</code> lines mean “exclude unless all conditions pass”. Conditions within a single line can be joined with <code>&amp;&amp;</code> (both must hold to trigger the rule). <code>||</code> within a single expression is not supported — use two separate lines instead.</p>
+<p>After the fit, the CLI prints a <code>--- Data Selection ---</code> block and the YAML output file includes an <code>exclusions:</code> section with record counts and the expressions that fired. See <a href="./model-file/data-selection.html">Data Selection</a> for the full reference.</p>
+</section>
+<section id="what-about-nonmems-coded-rate-values--1--2" class="level2">
+<h2 class="anchored" data-anchor-id="what-about-nonmems-coded-rate-values--1--2">What about NONMEM’s coded <code>RATE</code> values (<code>-1</code>, <code>-2</code>)?</h2>
+<p>NONMEM overloads the <code>RATE</code> column. A positive value is a constant infusion rate, but negative values are <em>codes</em> that tell NONMEM to take the rate or duration from a <code>$PK</code> parameter rather than the data:</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 26%">
+<col style="width: 53%">
+<col style="width: 20%">
+</colgroup>
+<thead>
+<tr class="header">
+<th><code>RATE</code></th>
+<th>NONMEM meaning</th>
+<th>ferx</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>0</code></td>
+<td>Bolus — route set by the dose compartment</td>
+<td>supported</td>
+</tr>
+<tr class="even">
+<td><code>&gt; 0</code></td>
+<td>Constant-rate infusion, duration = <code>AMT/RATE</code></td>
+<td>supported</td>
+</tr>
+<tr class="odd">
+<td><code>-1</code></td>
+<td>Infusion <strong>rate</strong> modeled — <code>R1</code> defined in <code>$PK</code></td>
+<td>supported, both engines (#324)</td>
+</tr>
+<tr class="even">
+<td><code>-2</code></td>
+<td>Infusion <strong>duration</strong> modeled — <code>D1</code> defined in <code>$PK</code></td>
+<td>supported, both engines (#324, #394)</td>
+</tr>
+</tbody>
+</table>
+<p><code>RATE = -2</code> (duration) and <code>RATE = -1</code> (rate) are both supported on the analytical <code>pk(...)</code> engine and <code>ode(...)</code> models. Declare the matching <code>$PK</code>-style parameter — <code>D{cmt}</code> for <code>-2</code> (ferx infuses <code>AMT</code> over that duration, rate <code>AMT / D{cmt}</code>) or <code>R{cmt}</code> for <code>-1</code> (ferx infuses at that rate, duration <code>AMT / R{cmt}</code>) — evaluated per iteration and occasion, matching NONMEM’s <code>$PK D{n}</code> / <code>R{n}</code>. A coded <code>RATE</code> with no matching parameter is a loud error (<code>E_MODELED_DURATION_NO_PARAM</code> / <code>E_MODELED_RATE_NO_PARAM</code>), never a silent bolus. Both codes are <em>parameter</em>-driven; neither reads a separate <code>DURATION</code> data column. Any other negative or non-finite <code>RATE</code> is rejected — earlier versions silently misread the coded forms as a bolus (#324).</p>
+<section id="which-compartments-can-an-analytical-model-be-infused-into" class="level3">
+<h3 class="anchored" data-anchor-id="which-compartments-can-an-analytical-model-be-infused-into">Which compartments can an analytical model be infused into?</h3>
+<p>On the six analytical <strong>disposition</strong> models — <code>one_cpt_iv</code>, <code>one_cpt_oral</code>, <code>two_cpt_iv</code>, <code>two_cpt_oral</code>, <code>three_cpt_iv</code>, <code>three_cpt_oral</code> — the closed forms deliver a zero-order input into <strong>any compartment the model has</strong>: the <strong>central</strong> compartment of every model, the <strong>oral depot</strong> (<code>CMT=1</code>, a zero-order release followed by first-order <code>ka</code> absorption), and the <strong>peripheral</strong> compartment(s) of both the IV and the oral models. A <strong>bolus</strong> likewise targets any compartment those models have.</p>
+<p>Two cases are still rejected, both up front, naming the subject and time:</p>
+<ul>
+<li><code>CMT=0</code> on an <strong>infusion</strong> → <code>E_DOSE_CMT_NOT_INFUSABLE</code>. <code>CMT=0</code> is NONMEM’s <em>default dose compartment</em>, which is defined for a bolus (and treated as compartment 1 throughout ferx, including under <code>SS</code>) but has no meaning for a zero-order input. Name the target compartment explicitly.</li>
+<li>A <code>CMT</code> past the end of the model’s compartment list, for <strong>either</strong> dose kind → <code>E_DOSE_CMT_OUT_OF_RANGE</code> (#375).</li>
+</ul>
+<p><code>fit()</code> returns the error; <code>predict()</code> / <code>simulate()</code> fail with the same message.</p>
+<p>The <strong>transit</strong> and <strong>inverse-Gaussian</strong> absorption models are the exception: they are dosed through the depot (<code>CMT=1</code>) only, for either dose kind, because the closed form routes every dose through the absorption process regardless of compartment while their ODE twin would bolus it into a disposition compartment — so the two paths would disagree. Use an <code>ode(...)</code> model to dose those compartments directly; ODE models address any compartment their <code>[odes]</code> block declares, so neither check applies to them.</p>
+<p>For bioavailability <code>F ≠ 1</code>, ferx reshapes an infusion the NONMEM way (#419): a <em>rate-defined</em> infusion (<code>RATE&gt;0</code> data and <code>RATE=-1</code> → <code>R{cmt}</code>) holds the rate and scales the <strong>duration</strong> to <code>F·AMT/RATE</code>, while a <em>duration-defined</em> infusion (<code>RATE=-2</code> → <code>D{cmt}</code>) holds the duration and scales the <strong>rate</strong> to <code>F·AMT/D{cmt}</code>. Total exposure (<code>F·AMT</code>) is identical; only the infusion shape differs between the two modes, and only when <code>F ≠ 1</code>. At <code>F = 1</code> they coincide.</p>
+<p><code>RATE=0</code> denotes a <em>bolus</em>, not specifically an <em>intravenous</em> dose: the route follows the dose compartment — a bolus into the central compartment is intravenous, while a bolus into a depot compartment with first-order absorption is extravascular (oral).</p>
+</section>
+</section>
+<section id="can-i-model-zero-order-absorption-zero-order-input-into-the-depot" class="level2">
+<h2 class="anchored" data-anchor-id="can-i-model-zero-order-absorption-zero-order-input-into-the-depot">Can I model zero-order absorption (zero-order input into the depot)?</h2>
+<p>Yes — on the analytical engine, with no <code>ode(...)</code> block. A <code>RATE=-2</code> modeled duration <code>D1</code> (or an explicit positive <code>RATE</code>) into <strong>compartment 1</strong> of an analytical oral model (<code>pk one_cpt_oral</code> / <code>two_cpt_oral</code> / <code>three_cpt_oral</code>) releases the dose into the <strong>depot</strong> at a constant zero-order rate over <code>D1</code>, which is then absorbed first-order into central via <code>KA</code> — the standard zero-order-into-depot absorption model. This mirrors NONMEM’s <code>ADVAN2</code> with a <code>$PK D1</code> (the depot is compartment 1 in both). <code>D2</code> into the same model is a depot-bypassing infusion straight into central.</p>
+<p>This stays on the closed form (it’s a linear system with piecewise-constant forcing) — <code>ferx</code> does not silently rewrite it into an ODE. The one limitation: per-compartment amounts in <code>sdtab</code> / <code>[derived]</code> are not available for these subjects (predictions are exact; a <code>W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL</code> warning notes it). Use an <code>ode(...)</code> model if you need the compartment amounts.</p>
+<section id="nonmem-comparison" class="level3">
+<h3 class="anchored" data-anchor-id="nonmem-comparison">NONMEM comparison</h3>
+<p>A <code>one_cpt_oral</code> model with <code>CL=5</code>, <code>V=50</code>, <code>KA=1</code>, and a modeled depot duration <code>D1=5</code> (so a 100-unit dose is released into the depot at rate 20 over 5 h), versus NONMEM 7.5.1 <code>ADVAN2 TRANS2</code> with <code>$PK D1=THETA(4)</code> (<code>MAXEVAL=0</code>, <code>eta=0</code>). Control file and data: <code>tests/nonmem/oral_depot_d1.ctl</code> / <code>.csv</code>.</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th style="text-align: right;">time (h)</th>
+<th style="text-align: right;">ferx <code>pk one_cpt_oral</code></th>
+<th style="text-align: right;">NONMEM <code>ADVAN2</code> PRED</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">0.14200</td>
+<td style="text-align: right;">0.14200</td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">0.42135</td>
+<td style="text-align: right;">0.42135</td>
+</tr>
+<tr class="odd">
+<td style="text-align: right;">3</td>
+<td style="text-align: right;">0.72960</td>
+<td style="text-align: right;">0.72960</td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">5</td>
+<td style="text-align: right;">1.30730</td>
+<td style="text-align: right;">1.30730</td>
+</tr>
+<tr class="odd">
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">1.27350</td>
+<td style="text-align: right;">1.27350</td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">12</td>
+<td style="text-align: right;">0.86800</td>
+<td style="text-align: right;">0.86800</td>
+</tr>
+<tr class="odd">
+<td style="text-align: right;">18</td>
+<td style="text-align: right;">0.47659</td>
+<td style="text-align: right;">0.47659</td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">24</td>
+<td style="text-align: right;">0.26156</td>
+<td style="text-align: right;">0.26156</td>
+</tr>
+</tbody>
+</table>
+<p>ferx matches NONMEM to the 5 significant figures tabulated (the <code>analytical_oral_depot_modeled_duration_matches_nonmem</code> regression test asserts this).</p>
+</section>
+</section>
+<section id="which-records-covariates-govern-a-lagged-dose-like-nonmems-pk-timing" class="level2">
+<h2 class="anchored" data-anchor-id="which-records-covariates-govern-a-lagged-dose-like-nonmems-pk-timing">Which record’s covariates govern a lagged dose, like NONMEM’s <code>$PK</code> timing?</h2>
+<p>The record that <strong>terminates</strong> the interval — never the dose row, and never the row before it.</p>
+<p>NONMEM evaluates <code>$PK</code> at every data record and then lets <code>ADVAN</code> propagate <em>to</em> that record, so the advance over <code>(recordᵢ, recordᵢ₊₁]</code> uses <strong><code>recordᵢ₊₁</code>’s</strong> covariates. A lagged dose arrival at <code>t + ALAG</code> is not a data record: it changes the compartment state, but no <code>$PK</code> runs there. It therefore lands <em>inside</em> whichever record interval contains it, and the whole of that interval — both sides of the arrival — runs on the covariates of the record that ends it.</p>
+<p>The same holds for every other event that is not a data row: an infusion’s end, a <code>zero_order(dur)</code> window’s cutoff, a per-route absorption onset.</p>
+<section id="worked-example" class="level3">
+<h3 class="anchored" data-anchor-id="worked-example">Worked example</h3>
+<pre class="text"><code>TIME   EVID  AMT   WT
+   5      0    .   150     observation
+   6      1  100   150     dose,  ALAG1 = 0.7  -&gt;  arrives at 6.7
+   7      0    .    75     observation</code></pre>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>interval</th>
+<th>governed by</th>
+<th><code>WT</code></th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>(5, 6]</code></td>
+<td>the <code>t = 6</code> dose record</td>
+<td>150</td>
+</tr>
+<tr class="even">
+<td><code>(6, 7]</code></td>
+<td>the <code>t = 7</code> observation</td>
+<td><strong>75</strong></td>
+</tr>
+</tbody>
+</table>
+<p>The arrival at 6.7 sits inside <code>(6, 7]</code>, so it is propagated at <code>WT = 75</code> on <strong>both</strong> sides. The dose row’s <code>WT = 150</code> governs the advance <em>into</em> <code>t = 6</code> and nothing after it — though it still supplies the dose’s own attributes (<code>F</code>, <code>ALAG</code>, <code>D</code>/<code>R</code>, and the steady-state equilibration), which are properties of that record rather than of the interval.</p>
+<div class="callout callout-style-default callout-note callout-titled">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Note</span>Changed in #1073
+</div>
+</div>
+<div class="callout-body-container callout-body">
+<p>Before that fix ferx broke the timeline only at the arrival, so the dose row’s snapshot was stretched forward to <code>6.7</code> and <code>(6, 6.7]</code> ran at <code>WT = 150</code>. On the committed anchor this was worth <strong>14.89 OFV</strong> against NONMEM 7.6.0. If you are comparing a fit across that change, expect estimates to move for any model combining a lagtime with time-varying covariates or IOV — re-run rather than diffing.</p>
+</div>
+</div>
+</section>
+<section id="a-useful-invariant" class="level3">
+<h3 class="anchored" data-anchor-id="a-useful-invariant">A useful invariant</h3>
+<p>Inserting an extra record inside <code>[dose row, arrival]</code> that carries the <em>same</em> covariate values as the record already governing the interval must not change any prediction. That is true in NONMEM, and it is now true in ferx — the <code>a_record_inside_the_dose_to_arrival_window_does_not_move_the_prediction</code> regression test asserts it. If you are ever unsure which convention a tool uses, that null test tells you without needing a reference implementation.</p>
+</section>
+<section id="what-if-the-arrival-lands-a-few-ulp-before-a-sample" class="level3">
+<h3 class="anchored" data-anchor-id="what-if-the-arrival-lands-a-few-ulp-before-a-sample">What if the arrival lands a few ULP before a sample?</h3>
+<p>It is still <em>before</em> the sample, so the sample reads post-dose — the same answer NONMEM gives, and the same answer you get when the gap is an hour.</p>
+<p>This is not hypothetical: an estimated or covariate-scaled <code>ALAG</code> is a float sum, so an optimizer walking it continuously will land arrivals a handful of ULP away from a sample time. The rule has no tolerance in it at all — it is just the ordering, and it is <strong>one-sided</strong>:</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>the arrival is…</th>
+<th>the sample reads</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><strong>at or before</strong> the sample, by any amount</td>
+<td>post-dose</td>
+</tr>
+<tr class="even">
+<td><strong>after</strong> the sample, by any amount</td>
+<td>pre-dose</td>
+</tr>
+</tbody>
+</table>
+<p>The one-sidedness is the part worth knowing: an arrival even one ULP <em>after</em> a sample has not happened yet at that sample, and never contributes to it.</p>
+<p>A <code>1e-12</code> tolerance appears only in <em>how</em> the first row is evaluated when the gap is tiny. A sample within <code>1e-12</code> after the arrival is read from the state just after the arrival’s events (reset, then dose), rather than by integrating the sub-picosecond span to the sample’s own time; the difference is bounded by <code>|f|·1e-12</code>, far below any solver tolerance. Beyond that gap the sample is read off the ordinary integration — same answer, arrived at the usual way.</p>
+<p>That <code>1e-12</code> is an absolute tolerance, so how many representable times it spans depends on where you are on the clock: 563 of them at <code>t = 8.2 h</code>, nine at <code>t = 1000 h</code>, and past <code>t ≈ 16384 h</code> — roughly two years — none but the sample time itself, because one floating-point step is already wider than the tolerance. The rule in the table above does not change there; only the sub-tolerance case stops arising, since a gap that small can no longer be represented.</p>
+<div class="callout callout-style-default callout-note callout-titled">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Note</span>Changed in #1226
+</div>
+</div>
+<div class="callout-body-container callout-body">
+<p>Before that fix an arrival landing within <code>1e-12</code> <strong>before</strong> a sample was read <em>pre</em>-dose on the objective, on <code>sdtab</code>, and on the dense grid that feeds the joint PK-TTE hazard, <code>[derived]</code> integrals and <code>simulate()</code> — the subject read drug-free at a sample taken after its own dose. On the committed anchor that is 45.38 against NONMEM’s 145.38, a whole 100 mg dose, and it moved the OFV rather than only a diagnostic. The event-driven predictor and the analytical closed forms were always correct. Both signs are anchored on NONMEM 7.6.0 in <code>nonmem_anchor/lag_arrival_read_{before,after}_advan{1,13}</code>.</p>
+</div>
+</div>
+</section>
+<section id="what-about-a-steady-state-dose-with-a-lagtime" class="level3">
+<h3 class="anchored" data-anchor-id="what-about-a-steady-state-dose-with-a-lagtime">What about a steady-state dose with a lagtime?</h3>
+<p>Same rule, one extra step. <code>SS = 1</code> says “assume the patient has already been on this regimen forever”, so the compartments are <em>loaded</em> rather than propagated into — and they are loaded at the <strong>dose record</strong>, not at the lagged arrival.</p>
+<p>The state at the record time is the periodic solution at phase <code>II − ALAG</code>: the previous cycle’s pulse landed at <code>t + ALAG − II</code>, so by <code>t</code> it has been decaying for <code>II − ALAG</code>. From there the ordinary rule takes over — the walk advances to the arrival under the record that terminates that interval — and the arrival applies only the dose’s own pulse.</p>
+<p>Two things follow that are easy to get wrong:</p>
+<ul>
+<li>The <strong>equilibration</strong> uses the dose row’s own covariates, because the steady state is a property of that record (like <code>F</code> and <code>ALAG</code>). The <strong>propagation</strong> from the record to the arrival does not — it follows the interval rule above.</li>
+<li>Observations falling between the dose row and the lagged arrival read that decaying tail, not zero and not the trough.</li>
+</ul>
+<div class="callout callout-style-default callout-note callout-titled">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Note</span>Changed in #1121
+</div>
+</div>
+<div class="callout-body-container callout-body">
+<p>ferx previously equilibrated at the <em>arrival</em>, computing the trough throughout under the dose row’s covariates. Under flat covariates that is the same number — propagating from phase <code>II − ALAG</code> for <code>ALAG</code> hours returns exactly to the trough — so this only ever showed up when a covariate changed inside the pre-arrival window. On the committed anchor it was worth <strong>7.67 OFV</strong> against NONMEM 7.6.0, from a per-point error of about 2 %. Fits without both ingredients are unaffected.</p>
+<p>The same change gives the IOV predictor a pre-arrival state, where it previously returned zero for any observation between an <code>SS</code> dose’s record and its arrival.</p>
+</div>
+</div>
+<p>Two edges of the same rule are worth stating, because in both of them “load at the record” and “equilibrate at the arrival” are genuinely different numbers:</p>
+<ul>
+<li><p><strong>The previous cycle may still be infusing.</strong> If <code>ALAG &gt; II − T_inf</code>, the pulse before the record is recent enough that its infusion has not finished, so the rate keeps flowing <em>past the dose record</em> and stops at <code>record + (T_inf − phase)</code>. That window belongs to no dose row in the data — it is part of the periodic fiction — and ferx carries it explicitly. NONMEM does the same: on the committed anchor the concentration <em>rises</em> off the record and turns over exactly there.</p></li>
+<li><p><strong><code>ALAG</code> may exceed <code>II</code>.</strong> There is then no phase <code>II − ALAG</code>. ferx clamps it to zero rather than wrapping it, matching NONMEM: the pulse lands on the record itself, so the record carries the steady-state <em>peak</em> and decays from there with no intervening pulse before the real arrival. Clamping is also the only choice that is continuous in <code>ALAG</code>, which matters whenever the lagtime is estimated — wrapping would step every pre-arrival prediction by a factor <code>exp(-k·II)</code> the moment the optimiser walked <code>ALAG</code> across the interval.</p>
+<p>The one place ferx deliberately differs from NONMEM is <code>ALAG ≥ II</code> on an <strong>infusion</strong>, where NONMEM delivers more drug than the dose specifies; see <a href="./model-file/lagtime.html">Lagtime</a>.</p></li>
+</ul>
+
+
+</section>
+</section>
+</section>
+
+</main> <!-- /main -->
+<script>
+(function () {
+  var HEAD = '<div class="panel-head"><span class="dots"><i></i><i></i><i></i></span><span class="file"><span class="br">[</span>warfarin_pk.ferx<span class="br">]</span></span></div>';
+
+  function apply() {
+    var dark = document.documentElement.getAttribute('data-bs-theme') === 'dark';
+    document.querySelectorAll('div.sourceCode').forEach(function (el) {
+      if (el.parentElement && el.parentElement.closest('.code-panel')) return;
+      if (dark) {
+        if (!el.classList.contains('code-panel')) {
+          el.classList.add('code-panel');
+          el.insertAdjacentHTML('afterbegin', HEAD);
+        }
+      } else {
+        el.classList.remove('code-panel');
+        var h = el.querySelector(':scope > .panel-head');
+        if (h) h.remove();
+      }
+    });
+  }
+
+  if (document.body) apply();
+  document.addEventListener('DOMContentLoaded', apply);
+  new MutationObserver(function (ms) {
+    ms.forEach(function (m) { if (m.attributeName === 'data-bs-theme') apply(); });
+  }).observe(document.documentElement, { attributes: true });
+}());
+</script>
+<script id="quarto-html-after-body" type="application/javascript">
+  window.document.addEventListener("DOMContentLoaded", function (event) {
+    // Ensure there is a toggle, if there isn't float one in the top right
+    if (window.document.querySelector('.quarto-color-scheme-toggle') === null) {
+      const a = window.document.createElement('a');
+      a.classList.add('top-right');
+      a.classList.add('quarto-color-scheme-toggle');
+      a.href = "";
+      a.onclick = function() { try { window.quartoToggleColorScheme(); } catch {} return false; };
+      const i = window.document.createElement("i");
+      i.classList.add('bi');
+      a.appendChild(i);
+      window.document.body.appendChild(a);
+    }
+    setColorSchemeToggle(hasAlternateSentinel())
+    const icon = "";
+    const anchorJS = new window.AnchorJS();
+    anchorJS.options = {
+      placement: 'right',
+      icon: icon
+    };
+    anchorJS.add('.anchored');
+    const isCodeAnnotation = (el) => {
+      for (const clz of el.classList) {
+        if (clz.startsWith('code-annotation-')) {                     
+          return true;
+        }
+      }
+      return false;
+    }
+    const onCopySuccess = function(e) {
+      // button target
+      const button = e.trigger;
+      // don't keep focus
+      button.blur();
+      // flash "checked"
+      button.classList.add('code-copy-button-checked');
+      var currentTitle = button.getAttribute("title");
+      button.setAttribute("title", "Copied!");
+      let tooltip;
+      if (window.bootstrap) {
+        button.setAttribute("data-bs-toggle", "tooltip");
+        button.setAttribute("data-bs-placement", "left");
+        button.setAttribute("data-bs-title", "Copied!");
+        tooltip = new bootstrap.Tooltip(button, 
+          { trigger: "manual", 
+            customClass: "code-copy-button-tooltip",
+            offset: [0, -8]});
+        tooltip.show();    
+      }
+      setTimeout(function() {
+        if (tooltip) {
+          tooltip.hide();
+          button.removeAttribute("data-bs-title");
+          button.removeAttribute("data-bs-toggle");
+          button.removeAttribute("data-bs-placement");
+        }
+        button.setAttribute("title", currentTitle);
+        button.classList.remove('code-copy-button-checked');
+      }, 1000);
+      // clear code selection
+      e.clearSelection();
+    }
+    const getTextToCopy = function(trigger) {
+      const outerScaffold = trigger.parentElement.cloneNode(true);
+      const codeEl = outerScaffold.querySelector('code');
+      for (const childEl of codeEl.children) {
+        if (isCodeAnnotation(childEl)) {
+          childEl.remove();
+        }
+      }
+      return codeEl.innerText;
+    }
+    const clipboard = new window.ClipboardJS('.code-copy-button:not([data-in-quarto-modal])', {
+      text: getTextToCopy
+    });
+    clipboard.on('success', onCopySuccess);
+    if (window.document.getElementById('quarto-embedded-source-code-modal')) {
+      const clipboardModal = new window.ClipboardJS('.code-copy-button[data-in-quarto-modal]', {
+        text: getTextToCopy,
+        container: window.document.getElementById('quarto-embedded-source-code-modal')
+      });
+      clipboardModal.on('success', onCopySuccess);
+    }
+      var localhostRegex = new RegExp(/^(?:http|https):\/\/localhost\:?[0-9]*\//);
+      var mailtoRegex = new RegExp(/^mailto:/);
+        var filterRegex = new RegExp("https:\/\/ferx-nlme\.github\.io\/ferx-core\/");
+      var isInternal = (href) => {
+          return filterRegex.test(href) || localhostRegex.test(href) || mailtoRegex.test(href);
+      }
+      // Inspect non-navigation links and adorn them if external
+     var links = window.document.querySelectorAll('a[href]:not(.nav-link):not(.navbar-brand):not(.toc-action):not(.sidebar-link):not(.sidebar-item-toggle):not(.pagination-link):not(.no-external):not([aria-hidden]):not(.dropdown-item):not(.quarto-navigation-tool):not(.about-link)');
+      for (var i=0; i<links.length; i++) {
+        const link = links[i];
+        if (!isInternal(link.href)) {
+          // undo the damage that might have been done by quarto-nav.js in the case of
+          // links that we want to consider external
+          if (link.dataset.originalHref !== undefined) {
+            link.href = link.dataset.originalHref;
+          }
+        }
+      }
+    function tippyHover(el, contentFn, onTriggerFn, onUntriggerFn) {
+      const config = {
+        allowHTML: true,
+        maxWidth: 500,
+        delay: 100,
+        arrow: false,
+        appendTo: function(el) {
+            return el.parentElement;
+        },
+        interactive: true,
+        interactiveBorder: 10,
+        theme: 'quarto',
+        placement: 'bottom-start',
+      };
+      if (contentFn) {
+        config.content = contentFn;
+      }
+      if (onTriggerFn) {
+        config.onTrigger = onTriggerFn;
+      }
+      if (onUntriggerFn) {
+        config.onUntrigger = onUntriggerFn;
+      }
+      window.tippy(el, config); 
+    }
+    const noterefs = window.document.querySelectorAll('a[role="doc-noteref"]');
+    for (var i=0; i<noterefs.length; i++) {
+      const ref = noterefs[i];
+      tippyHover(ref, function() {
+        // use id or data attribute instead here
+        let href = ref.getAttribute('data-footnote-href') || ref.getAttribute('href');
+        try { href = new URL(href).hash; } catch {}
+        const id = href.replace(/^#\/?/, "");
+        const note = window.document.getElementById(id);
+        if (note) {
+          return note.innerHTML;
+        } else {
+          return "";
+        }
+      });
+    }
+    const xrefs = window.document.querySelectorAll('a.quarto-xref');
+    const processXRef = (id, note) => {
+      // Strip column container classes
+      const stripColumnClz = (el) => {
+        el.classList.remove("page-full", "page-columns");
+        if (el.children) {
+          for (const child of el.children) {
+            stripColumnClz(child);
+          }
+        }
+      }
+      stripColumnClz(note)
+      if (id === null || id.startsWith('sec-')) {
+        // Special case sections, only their first couple elements
+        const container = document.createElement("div");
+        if (note.children && note.children.length > 2) {
+          container.appendChild(note.children[0].cloneNode(true));
+          for (let i = 1; i < note.children.length; i++) {
+            const child = note.children[i];
+            if (child.tagName === "P" && child.innerText === "") {
+              continue;
+            } else {
+              container.appendChild(child.cloneNode(true));
+              break;
+            }
+          }
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(container);
+          }
+          return container.innerHTML
+        } else {
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(note);
+          }
+          return note.innerHTML;
+        }
+      } else {
+        // Remove any anchor links if they are present
+        const anchorLink = note.querySelector('a.anchorjs-link');
+        if (anchorLink) {
+          anchorLink.remove();
+        }
+        if (window.Quarto?.typesetMath) {
+          window.Quarto.typesetMath(note);
+        }
+        if (note.classList.contains("callout")) {
+          return note.outerHTML;
+        } else {
+          return note.innerHTML;
+        }
+      }
+    }
+    for (var i=0; i<xrefs.length; i++) {
+      const xref = xrefs[i];
+      tippyHover(xref, undefined, function(instance) {
+        instance.disable();
+        let url = xref.getAttribute('href');
+        let hash = undefined; 
+        if (url.startsWith('#')) {
+          hash = url;
+        } else {
+          try { hash = new URL(url).hash; } catch {}
+        }
+        if (hash) {
+          const id = hash.replace(/^#\/?/, "");
+          const note = window.document.getElementById(id);
+          if (note !== null) {
+            try {
+              const html = processXRef(id, note.cloneNode(true));
+              instance.setContent(html);
+            } finally {
+              instance.enable();
+              instance.show();
+            }
+          } else {
+            // See if we can fetch this
+            fetch(url.split('#')[0])
+            .then(res => res.text())
+            .then(html => {
+              const parser = new DOMParser();
+              const htmlDoc = parser.parseFromString(html, "text/html");
+              const note = htmlDoc.getElementById(id);
+              if (note !== null) {
+                const html = processXRef(id, note);
+                instance.setContent(html);
+              } 
+            }).finally(() => {
+              instance.enable();
+              instance.show();
+            });
+          }
+        } else {
+          // See if we can fetch a full url (with no hash to target)
+          // This is a special case and we should probably do some content thinning / targeting
+          fetch(url)
+          .then(res => res.text())
+          .then(html => {
+            const parser = new DOMParser();
+            const htmlDoc = parser.parseFromString(html, "text/html");
+            const note = htmlDoc.querySelector('main.content');
+            if (note !== null) {
+              // This should only happen for chapter cross references
+              // (since there is no id in the URL)
+              // remove the first header
+              if (note.children.length > 0 && note.children[0].tagName === "HEADER") {
+                note.children[0].remove();
+              }
+              const html = processXRef(null, note);
+              instance.setContent(html);
+            } 
+          }).finally(() => {
+            instance.enable();
+            instance.show();
+          });
+        }
+      }, function(instance) {
+      });
+    }
+        let selectedAnnoteEl;
+        const selectorForAnnotation = ( cell, annotation) => {
+          let cellAttr = 'data-code-cell="' + cell + '"';
+          let lineAttr = 'data-code-annotation="' +  annotation + '"';
+          const selector = 'span[' + cellAttr + '][' + lineAttr + ']';
+          return selector;
+        }
+        const selectCodeLines = (annoteEl) => {
+          const doc = window.document;
+          const targetCell = annoteEl.getAttribute("data-target-cell");
+          const targetAnnotation = annoteEl.getAttribute("data-target-annotation");
+          const annoteSpan = window.document.querySelector(selectorForAnnotation(targetCell, targetAnnotation));
+          const lines = annoteSpan.getAttribute("data-code-lines").split(",");
+          const lineIds = lines.map((line) => {
+            return targetCell + "-" + line;
+          })
+          let top = null;
+          let height = null;
+          let parent = null;
+          if (lineIds.length > 0) {
+              //compute the position of the single el (top and bottom and make a div)
+              const el = window.document.getElementById(lineIds[0]);
+              top = el.offsetTop;
+              height = el.offsetHeight;
+              parent = el.parentElement.parentElement;
+            if (lineIds.length > 1) {
+              const lastEl = window.document.getElementById(lineIds[lineIds.length - 1]);
+              const bottom = lastEl.offsetTop + lastEl.offsetHeight;
+              height = bottom - top;
+            }
+            if (top !== null && height !== null && parent !== null) {
+              // cook up a div (if necessary) and position it 
+              let div = window.document.getElementById("code-annotation-line-highlight");
+              if (div === null) {
+                div = window.document.createElement("div");
+                div.setAttribute("id", "code-annotation-line-highlight");
+                div.style.position = 'absolute';
+                parent.appendChild(div);
+              }
+              div.style.top = top - 2 + "px";
+              div.style.height = height + 4 + "px";
+              div.style.left = 0;
+              let gutterDiv = window.document.getElementById("code-annotation-line-highlight-gutter");
+              if (gutterDiv === null) {
+                gutterDiv = window.document.createElement("div");
+                gutterDiv.setAttribute("id", "code-annotation-line-highlight-gutter");
+                gutterDiv.style.position = 'absolute';
+                const codeCell = window.document.getElementById(targetCell);
+                const gutter = codeCell.querySelector('.code-annotation-gutter');
+                gutter.appendChild(gutterDiv);
+              }
+              gutterDiv.style.top = top - 2 + "px";
+              gutterDiv.style.height = height + 4 + "px";
+            }
+            selectedAnnoteEl = annoteEl;
+          }
+        };
+        const unselectCodeLines = () => {
+          const elementsIds = ["code-annotation-line-highlight", "code-annotation-line-highlight-gutter"];
+          elementsIds.forEach((elId) => {
+            const div = window.document.getElementById(elId);
+            if (div) {
+              div.remove();
+            }
+          });
+          selectedAnnoteEl = undefined;
+        };
+          // Handle positioning of the toggle
+      window.addEventListener(
+        "resize",
+        throttle(() => {
+          elRect = undefined;
+          if (selectedAnnoteEl) {
+            selectCodeLines(selectedAnnoteEl);
+          }
+        }, 10)
+      );
+      function throttle(fn, ms) {
+      let throttle = false;
+      let timer;
+        return (...args) => {
+          if(!throttle) { // first call gets through
+              fn.apply(this, args);
+              throttle = true;
+          } else { // all the others get throttled
+              if(timer) clearTimeout(timer); // cancel #2
+              timer = setTimeout(() => {
+                fn.apply(this, args);
+                timer = throttle = false;
+              }, ms);
+          }
+        };
+      }
+        // Attach click handler to the DT
+        const annoteDls = window.document.querySelectorAll('dt[data-target-cell]');
+        for (const annoteDlNode of annoteDls) {
+          annoteDlNode.addEventListener('click', (event) => {
+            const clickedEl = event.target;
+            if (clickedEl !== selectedAnnoteEl) {
+              unselectCodeLines();
+              const activeEl = window.document.querySelector('dt[data-target-cell].code-annotation-active');
+              if (activeEl) {
+                activeEl.classList.remove('code-annotation-active');
+              }
+              selectCodeLines(clickedEl);
+              clickedEl.classList.add('code-annotation-active');
+            } else {
+              // Unselect the line
+              unselectCodeLines();
+              clickedEl.classList.remove('code-annotation-active');
+            }
+          });
+        }
+    const findCites = (el) => {
+      const parentEl = el.parentElement;
+      if (parentEl) {
+        const cites = parentEl.dataset.cites;
+        if (cites) {
+          return {
+            el,
+            cites: cites.split(' ')
+          };
+        } else {
+          return findCites(el.parentElement)
+        }
+      } else {
+        return undefined;
+      }
+    };
+    var bibliorefs = window.document.querySelectorAll('a[role="doc-biblioref"]');
+    for (var i=0; i<bibliorefs.length; i++) {
+      const ref = bibliorefs[i];
+      const citeInfo = findCites(ref);
+      if (citeInfo) {
+        tippyHover(citeInfo.el, function() {
+          var popup = window.document.createElement('div');
+          citeInfo.cites.forEach(function(cite) {
+            var citeDiv = window.document.createElement('div');
+            citeDiv.classList.add('hanging-indent');
+            citeDiv.classList.add('csl-entry');
+            var biblioDiv = window.document.getElementById('ref-' + cite);
+            if (biblioDiv) {
+              citeDiv.innerHTML = biblioDiv.innerHTML;
+            }
+            popup.appendChild(citeDiv);
+          });
+          return popup.innerHTML;
+        });
+      }
+    }
+  });
+  </script>
+</div> <!-- /content -->
+<footer class="footer">
+  <div class="nav-footer">
+    <div class="nav-footer-left">
+<p>© 2026 FeRx-NLME · MIT licensed</p>
+</div>   
+    <div class="nav-footer-center">
+      &nbsp;
+    <div class="toc-actions d-sm-block d-md-none"><ul><li><a href="https://github.com/FeRx-NLME/ferx-core/edit/main/faq.qmd" class="toc-action"><i class="bi bi-github"></i>Edit this page</a></li><li><a href="https://github.com/FeRx-NLME/ferx-core/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></div>
+    <div class="nav-footer-right">
+<p>Fe · 26 · Rx · 2026</p>
+</div>
+  </div>
+</footer>
+
+
+
+
+</body></html>

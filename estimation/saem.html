@@ -1,0 +1,1976 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en"><head>
+
+<meta charset="utf-8">
+<meta name="generator" content="quarto-1.10.18">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+
+<meta name="description" content="Fit complex nonlinear mixed-effects population PK/PD models with Stochastic Approximation Expectation-Maximization in ferx.">
+
+<title>SAEM estimation for population PK/PD – ferx-core</title>
+<style>
+/* Default styles provided by pandoc.
+** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+*/
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: 1.5em;}
+div.column{flex: auto;}
+@media screen {
+div.columns{gap: min(4vw, 1.5em);}
+div.column{overflow-x: auto;}
+}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+  width: 0.8em;
+  margin: 0 0.8em 0.2em -1em; /* quarto-specific, see https://github.com/quarto-dev/quarto-cli/issues/4556 */ 
+  vertical-align: middle;
+}
+</style>
+
+
+<script src="../site_libs/quarto-nav/quarto-nav.js"></script>
+<script src="../site_libs/quarto-nav/headroom.min.js"></script>
+<script src="../site_libs/clipboard/clipboard.min.js"></script>
+<script src="../site_libs/quarto-search/autocomplete.umd.js"></script>
+<script src="../site_libs/quarto-search/fuse.min.js"></script>
+<script src="../site_libs/quarto-search/quarto-search.js"></script>
+<meta name="quarto:offset" content="../">
+<link href="../assets/ferx-favicon.svg" rel="icon" type="image/svg+xml">
+<script src="../site_libs/quarto-html/quarto.js" type="module"></script>
+<script src="../site_libs/quarto-html/tabsets/tabsets.js" type="module"></script>
+<script src="../site_libs/quarto-html/popper.min.js"></script>
+<script src="../site_libs/quarto-html/tippy.umd.min.js"></script>
+<script src="../site_libs/quarto-html/anchor.min.js"></script>
+<link href="../site_libs/quarto-html/tippy.css" rel="stylesheet">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-51776f957f81c5a6b38322b65a6a6987.css" rel="stylesheet" class="quarto-color-scheme" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-dark-31632d092df9090a2ed68f79c078059d.css" rel="stylesheet" class="quarto-color-scheme quarto-color-alternate" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-51776f957f81c5a6b38322b65a6a6987.css" rel="stylesheet" class="quarto-color-scheme-extra" id="quarto-text-highlighting-styles">
+<script src="../site_libs/bootstrap/bootstrap.min.js"></script>
+<link href="../site_libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
+<link href="../site_libs/bootstrap/bootstrap-f5ed25dbf962e4596f9f4df24f2ade0d.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme" id="quarto-bootstrap" data-mode="light">
+<link href="../site_libs/bootstrap/bootstrap-dark-8a64b8d4793081e9872239f556c8075c.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme quarto-color-alternate" id="quarto-bootstrap" data-mode="dark">
+<link href="../site_libs/bootstrap/bootstrap-f5ed25dbf962e4596f9f4df24f2ade0d.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme-extra" id="quarto-bootstrap" data-mode="light">
+<script id="quarto-search-options" type="application/json">{
+  "location": "navbar",
+  "copy-button": false,
+  "collapse-after": 3,
+  "panel-placement": "end",
+  "type": "overlay",
+  "limit": 50,
+  "keyboard-shortcut": [
+    "f",
+    "/",
+    "s"
+  ],
+  "show-item-context": false,
+  "language": {
+    "search-no-results-text": "No results",
+    "search-matching-documents-text": "matching documents",
+    "search-copy-link-title": "Copy link to search",
+    "search-hide-matches-text": "Hide additional matches",
+    "search-more-match-text": "more match in this document",
+    "search-more-matches-text": "more matches in this document",
+    "search-clear-button-title": "Clear",
+    "search-text-placeholder": "",
+    "search-detached-cancel-button-title": "Cancel",
+    "search-submit-button-title": "Submit",
+    "search-label": "Search"
+  }
+}</script>
+
+  <script src="https://cdnjs.cloudflare.com/polyfill/v3/polyfill.min.js?features=es6"></script>
+  <script defer="" src="https://cdn.jsdelivr.net/npm/mathjax@4/tex-chtml.js" type="text/javascript"></script>
+
+<script type="text/javascript">
+const typesetMath = (el) => {
+  if (window.MathJax) {
+    // MathJax Typeset
+    window.MathJax.typeset([el]);
+  } else if (window.katex) {
+    // KaTeX Render
+    var mathElements = el.getElementsByClassName("math");
+    var macros = [];
+    for (var i = 0; i < mathElements.length; i++) {
+      var texText = mathElements[i].firstChild;
+      if (mathElements[i].tagName == "SPAN" && texText && texText.data) {
+        window.katex.render(texText.data, mathElements[i], {
+          displayMode: mathElements[i].classList.contains('display'),
+          throwOnError: false,
+          macros: macros,
+          fleqn: false
+        });
+      }
+    }
+  }
+}
+window.Quarto = {
+  typesetMath
+};
+</script>
+
+<link rel="stylesheet" href="../styles.css">
+<meta property="og:title" content="SAEM estimation for population PK/PD">
+<meta property="og:description" content="Open-source nonlinear mixed-effects modeling for population PK/PD and pharmacometrics">
+<meta property="og:site_name" content="ferx-core">
+<meta property="og:locale" content="en_US">
+<meta name="twitter:title" content="SAEM estimation for population PK/PD">
+<meta name="twitter:description" content="Open-source nonlinear mixed-effects modeling for population PK/PD and pharmacometrics">
+<meta name="twitter:card" content="summary">
+<link rel="canonical" href="https://ferx-nlme.github.io/ferx-core/estimation/saem.html">
+</head>
+
+<body class="nav-sidebar floating nav-fixed quarto-light"><script id="quarto-html-before-body" type="application/javascript">
+    const toggleBodyColorMode = (bsSheetEl) => {
+      const mode = bsSheetEl.getAttribute("data-mode");
+      const bodyEl = window.document.querySelector("body");
+      if (mode === "dark") {
+        bodyEl.classList.add("quarto-dark");
+        bodyEl.classList.remove("quarto-light");
+      } else {
+        bodyEl.classList.add("quarto-light");
+        bodyEl.classList.remove("quarto-dark");
+      }
+    }
+    const toggleBodyColorPrimary = () => {
+      const bsSheetEl = window.document.querySelector("link#quarto-bootstrap:not([rel=disabled-stylesheet])");
+      if (bsSheetEl) {
+        toggleBodyColorMode(bsSheetEl);
+      }
+    }
+    const setColorSchemeToggle = (alternate) => {
+      const toggles = window.document.querySelectorAll('.quarto-color-scheme-toggle');
+      for (let i=0; i < toggles.length; i++) {
+        const toggle = toggles[i];
+        if (toggle) {
+          if (alternate) {
+            toggle.classList.add("alternate");
+          } else {
+            toggle.classList.remove("alternate");
+          }
+        }
+      }
+    };
+    const toggleColorMode = (alternate) => {
+      // Switch the stylesheets
+      const primaryStylesheets = window.document.querySelectorAll('link.quarto-color-scheme:not(.quarto-color-alternate)');
+      const alternateStylesheets = window.document.querySelectorAll('link.quarto-color-scheme.quarto-color-alternate');
+      manageTransitions('#quarto-margin-sidebar .nav-link', false);
+      if (alternate) {
+        // note: dark is layered on light, we don't disable primary!
+        enableStylesheet(alternateStylesheets);
+        for (const sheetNode of alternateStylesheets) {
+          if (sheetNode.id === "quarto-bootstrap") {
+            toggleBodyColorMode(sheetNode);
+          }
+        }
+      } else {
+        disableStylesheet(alternateStylesheets);
+        enableStylesheet(primaryStylesheets)
+        toggleBodyColorPrimary();
+      }
+      manageTransitions('#quarto-margin-sidebar .nav-link', true);
+      // Switch the toggles
+      setColorSchemeToggle(alternate)
+      // Hack to workaround the fact that safari doesn't
+      // properly recolor the scrollbar when toggling (#1455)
+      if (navigator.userAgent.indexOf('Safari') > 0 && navigator.userAgent.indexOf('Chrome') == -1) {
+        manageTransitions("body", false);
+        window.scrollTo(0, 1);
+        setTimeout(() => {
+          window.scrollTo(0, 0);
+          manageTransitions("body", true);
+        }, 40);
+      }
+    }
+    const disableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        stylesheet.rel = 'disabled-stylesheet';
+      }
+    }
+    const enableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        if(stylesheet.rel !== 'stylesheet') { // for Chrome, which will still FOUC without this check
+          stylesheet.rel = 'stylesheet';
+        }
+      }
+    }
+    const manageTransitions = (selector, allowTransitions) => {
+      const els = window.document.querySelectorAll(selector);
+      for (let i=0; i < els.length; i++) {
+        const el = els[i];
+        if (allowTransitions) {
+          el.classList.remove('notransition');
+        } else {
+          el.classList.add('notransition');
+        }
+      }
+    }
+    const isFileUrl = () => {
+      return window.location.protocol === 'file:';
+    }
+    const hasAlternateSentinel = () => {
+      let styleSentinel = getColorSchemeSentinel();
+      if (styleSentinel !== null) {
+        return styleSentinel === "alternate";
+      } else {
+        return false;
+      }
+    }
+    const setStyleSentinel = (alternate) => {
+      const value = alternate ? "alternate" : "default";
+      if (!isFileUrl()) {
+        window.localStorage.setItem("quarto-color-scheme", value);
+      } else {
+        localAlternateSentinel = value;
+      }
+    }
+    const getColorSchemeSentinel = () => {
+      if (!isFileUrl()) {
+        const storageValue = window.localStorage.getItem("quarto-color-scheme");
+        return storageValue != null ? storageValue : localAlternateSentinel;
+      } else {
+        return localAlternateSentinel;
+      }
+    }
+    const toggleGiscusIfUsed = (isAlternate, darkModeDefault) => {
+      const baseTheme = document.querySelector('#giscus-base-theme')?.value ?? 'light';
+      const alternateTheme = document.querySelector('#giscus-alt-theme')?.value ?? 'dark';
+      let newTheme = '';
+      if(authorPrefersDark) {
+        newTheme = isAlternate ? baseTheme : alternateTheme;
+      } else {
+        newTheme = isAlternate ? alternateTheme : baseTheme;
+      }
+      const changeGiscusTheme = () => {
+        // From: https://github.com/giscus/giscus/issues/336
+        const sendMessage = (message) => {
+          const iframe = document.querySelector('iframe.giscus-frame');
+          if (!iframe) return;
+          iframe.contentWindow.postMessage({ giscus: message }, 'https://giscus.app');
+        }
+        sendMessage({
+          setConfig: {
+            theme: newTheme
+          }
+        });
+      }
+      const isGiscussLoaded = window.document.querySelector('iframe.giscus-frame') !== null;
+      if (isGiscussLoaded) {
+        changeGiscusTheme();
+      }
+    };
+    const authorPrefersDark = false;
+    const darkModeDefault = authorPrefersDark;
+      document.querySelector('link#quarto-text-highlighting-styles.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+      document.querySelector('link#quarto-bootstrap.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+    let localAlternateSentinel = darkModeDefault ? 'alternate' : 'default';
+    // Dark / light mode switch
+    window.quartoToggleColorScheme = () => {
+      // Read the current dark / light value
+      let toAlternate = !hasAlternateSentinel();
+      toggleColorMode(toAlternate);
+      setStyleSentinel(toAlternate);
+      toggleGiscusIfUsed(toAlternate, darkModeDefault);
+      window.dispatchEvent(new Event('resize'));
+    };
+    // Switch to dark mode if need be
+    if (hasAlternateSentinel()) {
+      toggleColorMode(true);
+    } else {
+      toggleColorMode(false);
+    }
+  </script>
+
+<div id="quarto-search-results"></div>
+  <header id="quarto-header" class="headroom fixed-top">
+    <nav class="navbar navbar-expand-lg " data-bs-theme="dark">
+      <div class="navbar-container container-fluid">
+      <div class="navbar-brand-container mx-auto">
+    <a href="../index.html" class="navbar-brand navbar-brand-logo">
+    <img src="../assets/ferx-dsl-brackets.svg" alt="ferx" class="navbar-logo light-content">
+    <img src="../assets/ferx-dsl-brackets.svg" alt="ferx" class="navbar-logo dark-content">
+    </a>
+    <a class="navbar-brand" href="../index.html">
+    <span class="navbar-title">ferx-core</span>
+    </a>
+  </div>
+            <div id="quarto-search" class="" title="Search"></div>
+          <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarCollapse" aria-controls="navbarCollapse" role="menu" aria-expanded="false" aria-label="Toggle navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+  <span class="navbar-toggler-icon"></span>
+</button>
+          <div class="collapse navbar-collapse" id="navbarCollapse">
+            <ul class="navbar-nav navbar-nav-scroll me-auto">
+  <li class="nav-item">
+    <a class="nav-link active" href="../getting-started.html" aria-current="page"> 
+<span class="menu-text">Get started</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/features.html"> 
+<span class="menu-text">Features</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/changelog.html"> 
+<span class="menu-text">Changelog</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/roadmap.html"> 
+<span class="menu-text">Roadmap</span></a>
+  </li>  
+</ul>
+            <ul class="navbar-nav navbar-nav-scroll ms-auto">
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/ferx-core/"> 
+<span class="menu-text">ferx-core</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/ferx-book/"> 
+<span class="menu-text">ferx-r</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/reference/"> 
+<span class="menu-text">Reference</span></a>
+  </li>  
+  <li class="nav-item compact">
+    <a class="nav-link" href="https://github.com/FeRx-NLME"> <i class="bi bi-github" role="img" aria-label="GitHub">
+</i> 
+<span class="menu-text"></span></a>
+  </li>  
+</ul>
+          </div> <!-- /navcollapse -->
+            <div class="quarto-navbar-tools">
+  <a href="" class="quarto-color-scheme-toggle quarto-navigation-tool  px-1" onclick="window.quartoToggleColorScheme(); return false;" title="Toggle dark mode"><i class="bi"></i></a>
+</div>
+      </div> <!-- /container-fluid -->
+    </nav>
+  <nav class="quarto-secondary-nav">
+    <div class="container-fluid d-flex">
+      <button type="button" class="quarto-btn-toggle btn" data-bs-toggle="collapse" role="button" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+        <i class="bi bi-layout-text-sidebar-reverse"></i>
+      </button>
+        <nav class="quarto-page-breadcrumbs" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../estimation/index.html">Estimation Methods</a></li><li class="breadcrumb-item"><a href="../estimation/saem.html">SAEM</a></li></ol></nav>
+        <a class="flex-grow-1" role="navigation" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">      
+        </a>
+      <button type="button" class="btn quarto-search-button" aria-label="Search" onclick="window.quartoOpenSearch();">
+        <i class="bi bi-search"></i>
+      </button>
+    </div>
+  </nav>
+</header>
+<!-- content -->
+<div id="quarto-content" class="quarto-container page-columns page-rows-contents page-layout-article page-navbar">
+<!-- sidebar -->
+  <nav id="quarto-sidebar" class="sidebar collapse collapse-horizontal quarto-sidebar-collapse-item sidebar-navigation floating overflow-auto">
+    <div class="pt-lg-2 mt-2 text-left sidebar-header">
+      <a href="../index.html" class="sidebar-logo-link">
+      <img src="../assets/ferx-favicon.svg" alt="" class="sidebar-logo light-content py-0 d-lg-inline d-none">
+      <img src="../assets/ferx-favicon.svg" alt="" class="sidebar-logo dark-content py-0 d-lg-inline d-none">
+      </a>
+      </div>
+        <div class="mt-2 flex-shrink-0 align-items-center">
+        <div class="sidebar-search">
+        <div id="quarto-search" class="" title="Search"></div>
+        </div>
+        </div>
+    <div class="sidebar-menu-container"> 
+    <ul class="list-unstyled mt-1">
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Introduction</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../maturity.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Feature Maturity</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../getting-started.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Getting Started</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../installation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Installation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../quick-start.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Quick Start</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../model-file/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Model File Reference</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/parameters.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Parameters</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/iov.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Inter-Occasion Variability (IOV)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/individual-parameters.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Individual Parameters</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariates.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariates</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariate-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/structural-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Structural Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/lagtime.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Lagtime</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/steady-state.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Steady-State Doses (SS=1)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/error-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Error Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/bloq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">LOQ-Censored Observations</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/ode-models.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/absorption.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Built-in Absorption Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/scaling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Scaling</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/initial-conditions.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Initial Conditions</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/diffusion.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Stochastic Differential Equations (SDE / Diffusion)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/neural-networks.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Neural Networks</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariate-nn.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><code>[covariate_nn]</code> — Deep Compartment Models (DCM)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/data.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/data-selection.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Selection</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/derived.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Derived Columns (<code>[derived]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Output Columns (<code>[output]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/fit-options.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Fit Options</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/simulation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Simulation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/adaptive-dosing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Adaptive (Feedback) Dosing</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/event-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Time-to-Event Endpoints (<code>[event_model]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/categorical.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Categorical endpoints — <code>[binary_model]</code></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/markov-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Markov models ([markov_model])</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../estimation/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Estimation Methods</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/foce.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FOCE / FOCEI</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/agq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">AGQ — Adaptive Gaussian Quadrature</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/gauss-newton.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Gauss-Newton (BHHH)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/saem.html" class="sidebar-item-text sidebar-link active">
+ <span class="menu-text">SAEM</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/sir.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Sampling Importance Resampling (SIR)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/importance-sampling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Importance Sampling (IMP)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/frem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FREM (Full Random Effects Model)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/impmap.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">IMPMAP — Importance Sampling assisted by Mode A Posteriori</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/bayes.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Bayesian estimation (MCMC)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/vi.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Variational Inference</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/parameterization.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Packed Parameter Space</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/optimizers.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Outer Optimizers</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/tte.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Time-to-Event (TTE) Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/categorical.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Categorical endpoints (binary / logistic)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/ctmm.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Continuous-time Markov models (CTMM)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/mixture.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Mixture Models</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false">
+ <span class="menu-text">Tools</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/bootstrap.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Bootstrap</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/gam-screening.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">GAM covariate screening</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/search.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Search configuration</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/covsearch.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate search</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/modelsearch.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Structural model search</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../data-format.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Format</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../cli.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">CLI Reference</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Output Files</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../warnings.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Warnings</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../file-formats/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">File Formats</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../file-formats/fitrx.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">The <code>.fitrx</code> Fit Bundle</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../file-formats/check-report.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Check Report (<code>ferx check --json</code>)</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../examples/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Examples</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/one-cpt-oral.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">One-Compartment Oral (Warfarin)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/two-cpt-iv.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Two-Compartment IV Bolus</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/covariates.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/ode-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Model (Michaelis-Menten)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/bloq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">BLOQ (M3 method)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/iov.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Inter-Occasion Variability (IOV)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/iov-saem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">IOV with SAEM</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/multiple-dosing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Multiple Dosing (ADDL Column)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/steady-state.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Steady-State Dosing (SS Column)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/scaling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Unit Scaling (<code>[scaling]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/derived-output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Derived Columns and Output</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/data-selection.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Selection (IGNORE / ACCEPT)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/ode-lagtime.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Model with Absorption Lag Time</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/transit-absorption.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Transit Absorption (Two-Compartment)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/sde.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Stochastic Differential Equations (SDE)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/frem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FREM (Covariate Analysis)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/multistart.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Multi-Start: Michaelis-Menten Elimination</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../api/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Rust API</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/types.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Core Types</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/fitting.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Fitting Functions</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/simulation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Simulation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/parsing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Parsing</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/model-editing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Model editing</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../faq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FAQ</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../development/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Development</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/contributing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Contributing to FeRx development</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/sdlc.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Development Lifecycle (SDLC)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/docs-lint.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Docs linter</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+    </ul>
+    </div>
+</nav>
+<div id="quarto-sidebar-glass" class="quarto-sidebar-collapse-item" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item"></div>
+<!-- margin-sidebar -->
+    <div id="quarto-margin-sidebar" class="sidebar margin-sidebar">
+        <nav id="TOC" role="doc-toc" class="toc-active">
+    <h2 id="toc-title">On this page</h2>
+   
+  <ul>
+  <li><a href="#saem" id="toc-saem" class="nav-link active" data-scroll-target="#saem">SAEM</a>
+  <ul>
+  <li><a href="#algorithm-overview" id="toc-algorithm-overview" class="nav-link" data-scroll-target="#algorithm-overview">Algorithm Overview</a>
+  <ul class="collapse">
+  <li><a href="#references" id="toc-references" class="nav-link" data-scroll-target="#references">References</a></li>
+  </ul></li>
+  <li><a href="#two-phase-schedule" id="toc-two-phase-schedule" class="nav-link" data-scroll-target="#two-phase-schedule">Two-Phase Schedule</a>
+  <ul class="collapse">
+  <li><a href="#phase-1-exploration-iterations-1-to-k1" id="toc-phase-1-exploration-iterations-1-to-k1" class="nav-link" data-scroll-target="#phase-1-exploration-iterations-1-to-k1">Phase 1: Exploration (iterations 1 to K1)</a></li>
+  <li><a href="#phase-2-convergence-iterations-k11-to-k1k2" id="toc-phase-2-convergence-iterations-k11-to-k1k2" class="nav-link" data-scroll-target="#phase-2-convergence-iterations-k11-to-k1k2">Phase 2: Convergence (iterations K1+1 to K1+K2)</a></li>
+  </ul></li>
+  <li><a href="#per-iteration-steps" id="toc-per-iteration-steps" class="nav-link" data-scroll-target="#per-iteration-steps">Per-Iteration Steps</a>
+  <ul class="collapse">
+  <li><a href="#e-step-sampling" id="toc-e-step-sampling" class="nav-link" data-scroll-target="#e-step-sampling">1. E-Step: Sampling</a>
+  <ul class="collapse">
+  <li><a href="#metropolis-hastings-default-n_leapfrog-0" id="toc-metropolis-hastings-default-n_leapfrog-0" class="nav-link" data-scroll-target="#metropolis-hastings-default-n_leapfrog-0">Metropolis-Hastings (default, <code>n_leapfrog = 0</code>)</a></li>
+  <li><a href="#hmc-hamiltonian-monte-carlo-n_leapfrog-0" id="toc-hmc-hamiltonian-monte-carlo-n_leapfrog-0" class="nav-link" data-scroll-target="#hmc-hamiltonian-monte-carlo-n_leapfrog-0">HMC (Hamiltonian Monte Carlo, <code>n_leapfrog &gt; 0</code>)</a></li>
+  </ul></li>
+  <li><a href="#stochastic-approximation-update" id="toc-stochastic-approximation-update" class="nav-link" data-scroll-target="#stochastic-approximation-update">2. Stochastic Approximation Update</a></li>
+  <li><a href="#m-step-for-omega-closed-form" id="toc-m-step-for-omega-closed-form" class="nav-link" data-scroll-target="#m-step-for-omega-closed-form">3. M-Step for Omega (Closed Form)</a></li>
+  <li><a href="#4-m-step-for-theta-and-sigma-optimization" id="toc-4-m-step-for-theta-and-sigma-optimization" class="nav-link" data-scroll-target="#4-m-step-for-theta-and-sigma-optimization">4. M-Step for Theta and Sigma (Optimization)</a>
+  <ul class="collapse">
+  <li><a href="#saem-mstep-closed-form" id="toc-saem-mstep-closed-form" class="nav-link" data-scroll-target="#saem-mstep-closed-form">Closed-form EM update for mu-referenced thetas</a></li>
+  <li><a href="#saem-mstep-bobyqa" id="toc-saem-mstep-bobyqa" class="nav-link" data-scroll-target="#saem-mstep-bobyqa">The NLopt M-step (BOBYQA)</a></li>
+  <li><a href="#saem-mstep-no-closed-form" id="toc-saem-mstep-no-closed-form" class="nav-link" data-scroll-target="#saem-mstep-no-closed-form">Thetas the closed-form update cannot reach</a></li>
+  </ul></li>
+  <li><a href="#adaptive-step-sizes" id="toc-adaptive-step-sizes" class="nav-link" data-scroll-target="#adaptive-step-sizes">5. Adaptive Step Sizes</a></li>
+  </ul></li>
+  <li><a href="#post-saem-finalization" id="toc-post-saem-finalization" class="nav-link" data-scroll-target="#post-saem-finalization">Post-SAEM Finalization</a></li>
+  <li><a href="#conditional-distribution-conditional-mode-vs.-distribution" id="toc-conditional-distribution-conditional-mode-vs.-distribution" class="nav-link" data-scroll-target="#conditional-distribution-conditional-mode-vs.-distribution">Conditional Distribution (conditional mode vs.&nbsp;distribution)</a>
+  <ul class="collapse">
+  <li><a href="#validation-against-saemix-and-nonmem" id="toc-validation-against-saemix-and-nonmem" class="nav-link" data-scroll-target="#validation-against-saemix-and-nonmem">Validation against saemix and NONMEM</a></li>
+  </ul></li>
+  <li><a href="#inter-occasion-variability-iov" id="toc-inter-occasion-variability-iov" class="nav-link" data-scroll-target="#inter-occasion-variability-iov">Inter-Occasion Variability (IOV)</a></li>
+  <li><a href="#models-with-no-random-effects-are-rejected" id="toc-models-with-no-random-effects-are-rejected" class="nav-link" data-scroll-target="#models-with-no-random-effects-are-rejected">Models with no random effects are rejected</a></li>
+  <li><a href="#configuration" id="toc-configuration" class="nav-link" data-scroll-target="#configuration">Configuration</a></li>
+  <li><a href="#tuning-guide" id="toc-tuning-guide" class="nav-link" data-scroll-target="#tuning-guide">Tuning Guide</a>
+  <ul class="collapse">
+  <li><a href="#not-converging" id="toc-not-converging" class="nav-link" data-scroll-target="#not-converging">Not Converging</a></li>
+  <li><a href="#pd-curve-thetas-collapse-on-cold-start-emax-sigmoid-readouts" id="toc-pd-curve-thetas-collapse-on-cold-start-emax-sigmoid-readouts" class="nav-link" data-scroll-target="#pd-curve-thetas-collapse-on-cold-start-emax-sigmoid-readouts">PD-curve thetas collapse on cold start (Emax / sigmoid readouts)</a></li>
+  <li><a href="#ω-collapses-residual-error-inflates" id="toc-ω-collapses-residual-error-inflates" class="nav-link" data-scroll-target="#ω-collapses-residual-error-inflates">Ω Collapses / Residual Error Inflates</a></li>
+  <li><a href="#block-ω-correlations-near-1-rank-1-collapse" id="toc-block-ω-correlations-near-1-rank-1-collapse" class="nav-link" data-scroll-target="#block-ω-correlations-near-1-rank-1-collapse">Block Ω correlations near ±1 (rank-1 collapse)</a></li>
+  <li><a href="#iiv-on-residual-error-iiv_on_ruv-σ-ω_ruv-ridge" id="toc-iiv-on-residual-error-iiv_on_ruv-σ-ω_ruv-ridge" class="nav-link" data-scroll-target="#iiv-on-residual-error-iiv_on_ruv-σ-ω_ruv-ridge">IIV on residual error (<code>iiv_on_ruv</code>): σ × ω_RUV ridge</a></li>
+  <li><a href="#slow-convergence" id="toc-slow-convergence" class="nav-link" data-scroll-target="#slow-convergence">Slow Convergence</a></li>
+  <li><a href="#reproducibility" id="toc-reproducibility" class="nav-link" data-scroll-target="#reproducibility">Reproducibility</a></li>
+  </ul></li>
+  <li><a href="#output" id="toc-output" class="nav-link" data-scroll-target="#output">Output</a>
+  <ul class="collapse">
+  <li><a href="#why-γ-gamma-is-shown" id="toc-why-γ-gamma-is-shown" class="nav-link" data-scroll-target="#why-γ-gamma-is-shown">Why <code>γ</code> (gamma) is shown</a></li>
+  <li><a href="#why-condnll-and-not-ofv" id="toc-why-condnll-and-not-ofv" class="nav-link" data-scroll-target="#why-condnll-and-not-ofv">Why <code>condNLL</code> and not <code>OFV</code></a></li>
+  </ul></li>
+  </ul></li>
+  </ul>
+<div class="toc-actions"><ul><li><a href="https://github.com/FeRx-NLME/ferx-core/edit/main/estimation/saem.qmd" class="toc-action"><i class="bi bi-github"></i>Edit this page</a></li><li><a href="https://github.com/FeRx-NLME/ferx-core/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></nav>
+    </div>
+<!-- main -->
+<main class="content" id="quarto-document-content"><header id="title-block-header" class="quarto-title-block"><nav class="quarto-page-breadcrumbs quarto-title-breadcrumbs d-none d-lg-block" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../estimation/index.html">Estimation Methods</a></li><li class="breadcrumb-item"><a href="../estimation/saem.html">SAEM</a></li></ol></nav></header>
+
+
+
+
+
+<section id="saem" class="level1">
+<h1>SAEM</h1>
+<blockquote class="blockquote">
+<p><strong>Maturity: beta</strong> — see <a href="../maturity.html">Feature Maturity</a> for what this means.</p>
+</blockquote>
+<p>Stochastic Approximation Expectation-Maximization (SAEM) is an alternative estimation method that uses MCMC sampling for random effects instead of MAP optimization. It is more robust to local minima and can handle complex random effect structures, including models with <strong>inter-occasion variability (IOV)</strong>.</p>
+<section id="algorithm-overview" class="level2">
+<h2 class="anchored" data-anchor-id="algorithm-overview">Algorithm Overview</h2>
+<p>SAEM replaces the deterministic inner loop of FOCE with stochastic sampling, following the Monolix convention with a two-phase step-size schedule.</p>
+<section id="references" class="level3">
+<h3 class="anchored" data-anchor-id="references">References</h3>
+<ul>
+<li>Delyon, Lavielle, Moulines (1999). <em>Convergence of a stochastic approximation version of the EM algorithm.</em> Annals of Statistics, 94–128.</li>
+<li>Kuhn &amp; Lavielle (2004). <em>Coupling a stochastic approximation version of EM with an MCMC procedure.</em> ESAIM: Probability and Statistics 8:115–131.</li>
+</ul>
+</section>
+</section>
+<section id="two-phase-schedule" class="level2">
+<h2 class="anchored" data-anchor-id="two-phase-schedule">Two-Phase Schedule</h2>
+<section id="phase-1-exploration-iterations-1-to-k1" class="level3">
+<h3 class="anchored" data-anchor-id="phase-1-exploration-iterations-1-to-k1">Phase 1: Exploration (iterations 1 to K1)</h3>
+<p>Step size <span class="math inline">\(\gamma_k = 1\)</span>. The algorithm explores the parameter space rapidly, with the sufficient statistics being fully replaced each iteration. This allows fast movement toward the basin of the MLE.</p>
+<p>Default: 150 iterations.</p>
+</section>
+<section id="phase-2-convergence-iterations-k11-to-k1k2" class="level3">
+<h3 class="anchored" data-anchor-id="phase-2-convergence-iterations-k11-to-k1k2">Phase 2: Convergence (iterations K1+1 to K1+K2)</h3>
+<p>Step size <span class="math inline">\(\gamma_k = 1/(k - K_1)\)</span>. The algorithm performs a decreasing-weight average, which guarantees almost-sure convergence to the MLE under regularity conditions.</p>
+<p>Default: 250 iterations.</p>
+</section>
+</section>
+<section id="per-iteration-steps" class="level2">
+<h2 class="anchored" data-anchor-id="per-iteration-steps">Per-Iteration Steps</h2>
+<p>Each SAEM iteration consists of:</p>
+<section id="e-step-sampling" class="level3">
+<h3 class="anchored" data-anchor-id="e-step-sampling">1. E-Step: Sampling</h3>
+<p>For each subject, sample from the conditional distribution of random effects:</p>
+<p><span class="math display">\[
+p(\eta_i | y_i, \theta, \Omega, \sigma)
+\]</span></p>
+<p>Two samplers are available:</p>
+<section id="metropolis-hastings-default-n_leapfrog-0" class="level4">
+<h4 class="anchored" data-anchor-id="metropolis-hastings-default-n_leapfrog-0">Metropolis-Hastings (default, <code>n_leapfrog = 0</code>)</h4>
+<p>Two MH kernels run per subject per SAEM iteration (the mixture of Kuhn &amp; Lavielle 2004):</p>
+<p><strong>Kernel 1 — block proposal</strong>: run <code>n_mh_steps</code> symmetric random-walk steps <span class="math inline">\(\eta_{\text{prop}} = \eta_{\text{current}} + \delta_i \cdot L \cdot z\)</span>, with <span class="math inline">\(z \sim N(0, I)\)</span> and <span class="math inline">\(L = \text{chol}(\Omega)\)</span>. This mixes the joint scale efficiently. For <strong>FREM</strong> models the covariate ETAs are near-deterministic (their pseudo-observations pin them to a posterior SD of <span class="math inline">\(\approx\sqrt{\text{EPSCOV}} \ll \sqrt{\Omega_{jj}}\)</span>), so a full-scale joint proposal for them is rejected every time and the <em>joint</em> acceptance collapses to 0%. Each covariate coordinate is therefore damped in the block move by a factor <span class="math inline">\(\min(1, \sqrt{\text{EPSCOV}}/\sqrt{\Omega_{jj}})\)</span>, so the joint step still explores the correlated PK block while the componentwise sweep handles the covariate coordinates themselves. Ordinary (non-FREM) ETAs use a damping factor of exactly 1, i.e.&nbsp;the plain <span class="math inline">\(\text{chol}(\Omega)\,z\)</span> move (issue #895).</p>
+<p><strong>Kernel 2 — componentwise sweep</strong>: for multi-η models, follow the block move with <span class="math inline">\(\max(2, \lfloor \texttt{n\_mh\_steps} / n_\eta \rfloor)\)</span> sweeps that perturb one coordinate at a time, <span class="math inline">\(\eta_j' = \eta_j + \delta_i^{\text{cw}} \cdot \sqrt{\Omega_{jj}} \cdot z\)</span>, holding the others fixed. Because the block proposal is shaped by <span class="math inline">\(\text{chol}(\Omega)\)</span>, once <span class="math inline">\(\Omega\)</span> drifts toward a high correlation the block move can only travel along that near-degenerate direction; the single-draw Ω M-step then feeds the correlation back into <span class="math inline">\(\Omega\)</span>, and during the <span class="math inline">\(\gamma=1\)</span> exploration phase this compounds into a runaway collapse toward a <strong>near rank-1 <span class="math inline">\(\Omega\)</span></strong> (every off-diagonal correlation <span class="math inline">\(\to \pm 1\)</span>, one variance <span class="math inline">\(\to 0\)</span>). A componentwise move can always shift a single η independently of <span class="math inline">\(\Omega\)</span>’s off-diagonals, so the sampled draws are not forced collinear. The kernel is skipped for single-η models (no off-diagonal to decorrelate).</p>
+<p>Both kernels are symmetric in <span class="math inline">\(\eta\)</span>, so the proposal density cancels and the acceptance log-ratio is the difference of <code>individual_nll</code> values, which encodes the prior <span class="math inline">\(N(0, \Omega)\)</span> plus the observation likelihood.</p>
+<p><strong>Acceptance</strong>: <span class="math inline">\(\min(1, \exp(\text{NLL}_{\text{current}} - \text{NLL}_{\text{prop}}))\)</span>. Target acceptance rate: 40%.</p>
+<p><strong>Reported acceptance is combined.</strong> The <code>mh_accept_rate</code> column in the optimizer trace (and the verbose banner) is the <strong>combined block + componentwise</strong> rate. Reporting the block kernel alone is misleading for FREM-scale <span class="math inline">\(\Omega\)</span>: as above, the block move reads 0% acceptance even when the componentwise sweep is mixing the chain perfectly well. If the <em>combined</em> post-burn-in rate stays below 1%, the E-step genuinely is not mixing and SAEM appends a warning to <code>FitResult.warnings</code> — the sampled ETAs never moved, so the <span class="math inline">\(\Omega/\sigma\)</span> estimates are unreliable (issue #895).</p>
+</section>
+<section id="hmc-hamiltonian-monte-carlo-n_leapfrog-0" class="level4">
+<h4 class="anchored" data-anchor-id="hmc-hamiltonian-monte-carlo-n_leapfrog-0">HMC (Hamiltonian Monte Carlo, <code>n_leapfrog &gt; 0</code>)</h4>
+<p>When <code>n_leapfrog</code> is set to a positive integer (e.g.&nbsp;<code>3</code>), one HMC proposal replaces the <code>n_mh_steps</code> MH proposals per subject per iteration. HMC uses the gradient of the individual NLL to make longer, more directed moves through the posterior:</p>
+<p><span class="math display">\[
+H(\eta, p) = \text{NLL}(\eta) + \tfrac{1}{2} \|p\|^2
+\]</span></p>
+<p>with momentum <span class="math inline">\(p \sim N(0, I)\)</span> and a standard velocity Störmer-Verlet (leapfrog) integrator. Acceptance is on <span class="math inline">\(\Delta H\)</span>, targeting ~65% acceptance.</p>
+<p><strong>Requirements</strong>: an analytical PK model (no ODE). The HMC gradient is the exact analytic <code>Dual2</code> η-gradient (the same one FOCEI uses). A warning is emitted if <code>n_leapfrog &gt; 0</code> but the model is out of the analytic provider’s scope.</p>
+<p><strong>Per-subject fallback to MH</strong>: <code>hmc_step</code> silently falls back to MH for a subject when any of the following conditions hold: - The model uses an ODE (<code>[odes]</code> block present) - The model has no analytical PK path (no <code>tv_fn</code> — pure ODE-only models) - The Ω matrix has a non-finite log-determinant (degenerate variance) - The model is outside the analytic gradient’s scope (time-varying covariates, oral infusion, SS+reset, or LTBS). A η-dependent expression <code>obs_scale</code> is served analytically (since #486), so on a closed-form model it takes the HMC path — only LTBS combined with it falls back to MH.</p>
+<p>In a single run with <code>n_leapfrog &gt; 0</code>, different subjects can therefore use different samplers. The acceptance rate reported in verbose output and the optimizer trace is an aggregate across all subjects; in mixed HMC/MH runs the target (65% for HMC, 40% for MH) may not be meaningful for the aggregate. The <code>n_mh_steps</code> option governs the number of proposals for MH-fallback subjects even when <code>n_leapfrog &gt; 0</code>.</p>
+<p>The E-step sampling is parallelized across subjects using Rayon.</p>
+<p>The startup banner reports the resolved E-step kernel on a <code>sampler:</code> line, e.g.&nbsp;<code>sampler:  Metropolis-Hastings random walk</code> or <code>sampler:  HMC (3 leapfrog steps, Dual2 analytic gradients)</code>. If <code>n_leapfrog &gt; 0</code> but HMC is unavailable (an ODE model, or one outside the analytic gradient’s scope), the line says so and reflects the MH fallback. Because SAEM is sampling-based rather than gradient-driven, it does not print the <code>gradient:</code> line that FOCE/FOCEI use — the <code>gradient_method</code> option only governs the inner EBE/Hessian step (used for diagnostics, and consumed by a following <code>imp</code> stage), not the SAEM iterations themselves.</p>
+</section>
+</section>
+<section id="stochastic-approximation-update" class="level3">
+<h3 class="anchored" data-anchor-id="stochastic-approximation-update">2. Stochastic Approximation Update</h3>
+<p>Update the sufficient statistic for <span class="math inline">\(\Omega\)</span>:</p>
+<p><span class="math display">\[
+S_2 \leftarrow (1 - \gamma_k^\Omega) \cdot S_2 + \gamma_k^\Omega \cdot \frac{1}{N} \sum_{i=1}^{N} \eta_i \eta_i^T
+\]</span></p>
+<p><strong>Damped Ω step.</strong> The θ/σ M-step uses the full <span class="math inline">\(\gamma_k\)</span> (1.0 during exploration), but the Ω sufficient statistic uses a <em>capped</em> step <span class="math inline">\(\gamma_k^\Omega = \min(\gamma_k, 0.1)\)</span>. With the full <span class="math inline">\(\gamma=1\)</span>, Ω would be overwritten every exploration iteration by a single warm-started, not-yet-equilibrated MCMC draw; for a correlated block that one snapshot is biased toward the chain’s current correlation, and the bias feeds back through <span class="math inline">\(\mathrm{chol}(\Omega)\)</span> into the next proposal — the same rank-1 runaway the componentwise kernel guards against, here attacked from the M-step side. Capping the Ω learning rate during exploration averages those draws (Robbins-Monro) and breaks the feedback while θ still moves at full speed. The cap applies during exploration only; in the convergence phase it is lifted and Ω uses the full decaying <span class="math inline">\(\gamma_k = 1/(k-K_1)\)</span> — the same Robbins-Monro schedule as θ — so the SA estimate settles correctly (by then the chain is equilibrated, so the single-draw overwrite risk no longer applies).</p>
+</section>
+<section id="m-step-for-omega-closed-form" class="level3">
+<h3 class="anchored" data-anchor-id="m-step-for-omega-closed-form">3. M-Step for Omega (Closed Form)</h3>
+<p><span class="math display">\[
+\Omega_k = S_2
+\]</span></p>
+<p>with structurally-zero entries (cross-block off-diagonals, standalone-vs-block off-diagonals, and all off-diagonals in a fully-diagonal Ω) zeroed out — the SA accumulator <span class="math inline">\((1/N) \sum_i \eta_i \eta_i^T\)</span> is dense by construction, but the model declares which entries are free parameters. Without this projection the chain feeds spurious sampling correlations into the next iteration’s MH proposal Cholesky and Ω drifts toward rank-deficiency. Free diagonals are then floored at <code>1e-6</code> to keep them away from zero (which would collapse the per-eta proposal scale <code>δ·chol(Ω)</code>); this floor does not by itself guarantee positive-definiteness of a full block Ω.</p>
+<p><strong>Burn-in.</strong> This M-step is suppressed for the first <code>omega_burnin</code> iterations (default 20, clamped to <code>n_exploration</code>): Ω is held at its starting value while the MH chain warms up. The MH proposal scale is <span class="math inline">\(\delta_i \cdot \mathrm{chol}(\Omega)\)</span>, so Ω and the sampler are coupled. On sparse data (few observations per subject) a cold-start chain (η = 0, only <code>n_mh_steps</code> proposals) produces a tiny <span class="math inline">\((1/N) \sum_i \eta_i \eta_i^T\)</span>; with <span class="math inline">\(\gamma_1 = 1\)</span> the M-step would install that as Ω on iteration 1, shrinking the proposal, which keeps the chain near zero — a self-reinforcing collapse that dumps between-subject variability into the residual error. The SA statistic <span class="math inline">\(S_2\)</span> is still refreshed each burn-in iteration (at the damped rate <span class="math inline">\(\gamma_k^\Omega\)</span>, so it is a running average of the warming chain), so the first Ω update after burn-in reflects the warmed-up chain rather than the cold-start spread. Set <code>omega_burnin = 0</code> to disable the burn-in; note that the damped Ω step above now also guards this cold-start collapse on its own (it is a strict generalisation — continuous rather than for the first <code>omega_burnin</code> iterations only), so disabling the burn-in no longer reproduces the collapse by itself.</p>
+</section>
+<section id="4-m-step-for-theta-and-sigma-optimization" class="level3">
+<h3 class="anchored" data-anchor-id="4-m-step-for-theta-and-sigma-optimization">4. M-Step for Theta and Sigma (Optimization)</h3>
+<p>Minimize the conditional observation negative log-likelihood with ETAs held fixed:</p>
+<p><span class="math display">\[
+\sum_{i=1}^{N} \sum_{j=1}^{n_i} \left[ \frac{1}{2} \log V_{ij} + \frac{1}{2} \frac{(y_{ij} - f_{ij})^2}{V_{ij}} \right]
+\]</span></p>
+<section id="saem-mstep-closed-form" class="level4">
+<h4 class="anchored" data-anchor-id="saem-mstep-closed-form">Closed-form EM update for mu-referenced thetas</h4>
+<p>When <code>mu_referencing = true</code> (the default), ferx detects lognormal parameters from the <code>[individual_parameters]</code> block and applies the <strong>closed-form EM update</strong> for those thetas instead of running NLopt:</p>
+<p><span class="math display">\[
+\log \theta_j \leftarrow \log \theta_j + \gamma_k \cdot \overline{\eta_j}
+\]</span></p>
+<p>where <span class="math inline">\(\overline{\eta_j} = (1/N) \sum_i \eta_{i,j}\)</span> is the empirical mean of the post-MH random effects for the eta paired with <span class="math inline">\(\theta_j\)</span>. For a log-mu-referenced model where <span class="math inline">\(\log P_i = \log \theta + \eta_i\)</span> with <span class="math inline">\(\eta_i \sim N(0, \omega^2)\)</span>, this is exactly the M-step that maximises the complete-data log-likelihood, scaled by the SA step size <span class="math inline">\(\gamma_k\)</span>. After the update the etas are re-centred by the same shift so they remain deviations from the new <span class="math inline">\(\log \theta_j\)</span>.</p>
+<p>NLopt still runs for any remaining thetas (non-mu-referenced) and for sigma — the closed-form-updated thetas are pinned at their new values for the NLopt call.</p>
+</section>
+<section id="saem-mstep-bobyqa" class="level4">
+<h4 class="anchored" data-anchor-id="saem-mstep-bobyqa">The NLopt M-step (BOBYQA)</h4>
+<p>The NLopt M-step uses <strong>BOBYQA</strong> (derivative-free trust-region with quadratic interpolation). The earlier gradient-based SLSQP path was found to lock onto one side of the Emax-Hill identifiability ridge on the dense-Emax PKPD benchmark (under-estimating EMAX by ~40% at virtually identical OFV); BOBYQA’s quadratic trust-region exploration lands much closer to truth and ~40% faster on that benchmark (no FD-gradient eval per parameter), while remaining numerically equivalent (ΔOFV &lt; 0.1) on simpler PK-only models.</p>
+<p>When <code>mu_referencing = false</code>, the full NLopt M-step runs for all thetas as before.</p>
+</section>
+<section id="saem-mstep-no-closed-form" class="level4">
+<h4 class="anchored">Thetas the closed-form update cannot reach</h4>
+<p>Two model shapes leave a theta on the numerical M-step. The first is slower; the second can bias the estimate outright.</p>
+<div class="callout callout-style-default callout-warning callout-titled">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Warning</span>Non-mu-referenced parameters slow SAEM convergence
+</div>
+</div>
+<div class="callout-body-container callout-body">
+<p>Whenever the estimation chain runs SAEM, ferx warns if any individual parameter’s random effect is <strong>not</strong> mu-referenced — for example <code>CL = TVCL + ETA_CL</code> (or any non-loglinear form) instead of <code>CL = TVCL * exp(ETA_CL)</code>. Such parameters cannot use the closed-form EM update above and fall back to the slower NLopt M-step, which can strongly slow convergence. The warning fires independently of the <code>mu_referencing</code> fit option: turning the option off does not remove the risk — it removes the mu-centering that mitigates it — so the diagnostic is most warranted in exactly that case. Prefer log-mu-referenced forms (<code>P = TV * exp(ETA)</code>) where the model allows.</p>
+</div>
+</div>
+<div class="callout callout-style-default callout-important callout-titled">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Important</span>A theta with no ETA at all is worse than slow — it can drift
+</div>
+</div>
+<div class="callout-body-container callout-body">
+<p>The warning above covers a parameter whose eta ferx could not mu-reference. A <strong>fixed-effect-only theta</strong> — one that carries no eta anywhere in <code>[individual_parameters]</code> — is a distinct and more damaging case, and SAEM warns about it separately:</p>
+<pre><code>SAEM: estimated parameter(s) [TVFRD1] have NO associated ETA, so they are not
+mu-referenced and are moved only by the η-frozen numerical M-step. ...</code></pre>
+<p>Such a theta never receives the closed-form <code>log θ += γ·mean(η)</code> shift, which is an exact Robbins-Monro average. Its only channel is the numerical M-step, which re-maximises the conditional observation likelihood against a <strong>single</strong> MCMC η draw. Assigning that maximiser outright is <code>argmax</code> of one draw rather than the SA average of <code>E[argmax]</code>, so the estimate carries a Monte-Carlo bias that does not decay with iteration count, and it can settle a long way from the marginal optimum — dragging correlated typical values with it.</p>
+<p>Measured on a FREM <code>iiv_on_ruv</code> model (475 subjects, 12 etas) whose absorption fraction <code>TVFRD1</code> splits a zero-order duration and a first-order rate (<code>D1 = MAT*(1-TVFRD1)</code>, <code>KA = 1/(MAT*TVFRD1)</code>) with no eta of its own. The marginal −2logL optimum for <code>TVFRD1</code> on this dataset is ≈ 0.29:</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 20%">
+<col style="width: 20%">
+<col style="width: 20%">
+<col style="width: 20%">
+<col style="width: 20%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Run</th>
+<th>TVCL</th>
+<th>TVV</th>
+<th>TVMAT</th>
+<th>TVFRD1</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>NONMEM IMP (reference)</td>
+<td>7.060</td>
+<td>133.8</td>
+<td>2.680</td>
+<td>0.394</td>
+</tr>
+<tr class="even">
+<td>ferx IMP</td>
+<td>7.068</td>
+<td>135.5</td>
+<td>2.751</td>
+<td>0.311</td>
+</tr>
+<tr class="odd">
+<td>ferx IMPMAP</td>
+<td>7.046</td>
+<td>134.2</td>
+<td>2.780</td>
+<td>0.318</td>
+</tr>
+<tr class="even">
+<td>ferx SAEM, <strong>before</strong> the #1011 damping</td>
+<td>7.169</td>
+<td>143.2</td>
+<td>3.020</td>
+<td><strong>0.039</strong></td>
+</tr>
+<tr class="odd">
+<td>ferx SAEM, before, started <em>at</em> the IMPMAP solution</td>
+<td>7.046</td>
+<td>136.4</td>
+<td>3.191</td>
+<td><strong>0.065</strong></td>
+</tr>
+<tr class="even">
+<td><strong>ferx SAEM, current</strong></td>
+<td>7.123</td>
+<td>139.5</td>
+<td>2.686</td>
+<td><strong>0.290</strong></td>
+</tr>
+<tr class="odd">
+<td>ferx SAEM, <code>FRD1 = TVFRD1*exp(ETA_FRD1)</code>, ω² = 0.01</td>
+<td>7.181</td>
+<td>142.5</td>
+<td>2.646</td>
+<td>0.313</td>
+</tr>
+<tr class="even">
+<td>ferx SAEM, <code>TVFRD1</code> held <code>FIX</code> at 0.394</td>
+<td>7.025</td>
+<td>131.9</td>
+<td>2.770</td>
+<td>(fixed)</td>
+</tr>
+</tbody>
+</table>
+<p>Restarting SAEM at the right answer did not rescue the old behaviour — the M-step walked the parameter back down — so this was never a starting-value problem.</p>
+<p>The remedy depends on what the parameter <em>is</em>. A typical value should be put in a mu-referenceable form (<code>P = TVP * exp(ETA_P)</code>, with a small — optionally <code>FIX</code> — omega; ferx applies the mu-referencing automatically). A parameter that has no eta to give — a covariate coefficient, an allometric exponent, a structural constant — should be held <code>FIX</code>, or the fit cross-checked against FOCEI/IMPMAP.</p>
+<p>The advisory deliberately stays quiet about two kinds of theta, because “has no ETA” would be false for them:</p>
+<ul>
+<li><strong>Mixing coefficients</strong> of a <a href="../estimation/mixture.html">mixture model</a>. The numerical θ/σ M-step never moves them — they do not enter the residual/eta likelihood, and the mixing M-step overwrites them from the class responsibilities — and a mixing expression is <em>forbidden</em> from depending on an eta in the first place.</li>
+<li><strong><code>MIXNUM</code>-switched class typical values</strong>, and log-mu-referenced thetas dropped to the identity scale by a negative lower bound. These carry an eta in the model text and are on the numerical M-step for a reason SAEM already states in its own warning; repeating “add an ETA” on top of that would be both false and contradictory.</li>
+</ul>
+<section id="what-saem-does-about-it-now" class="level3">
+<h3 class="anchored" data-anchor-id="what-saem-does-about-it-now">Damping the numerical M-step (<code>mstep_damping</code>)</h3>
+<p>The numerical θ/σ M-step result is blended in as a Robbins-Monro step <code>θ ← θ + γ_θ·(θ* − θ)</code> rather than assigned outright, with <code>γ_θ</code> capped at <strong>0.03</strong> during exploration and following the full decaying <code>γ = 1/(k−k1)</code> in convergence. This is the θ-side counterpart of the cap SAEM already applied to the Ω sufficient statistic, and it exists for the same reason: a single un-equilibrated MCMC draw must not be able to carry a parameter away.</p>
+<p>The cap is the <code>mstep_damping</code> fit option, and defaults to 0.03:</p>
+<pre><code>[fit_options]
+  method        = saem
+  mstep_damping = 0.01   # smaller damps harder; 1.0 turns the damping off</code></pre>
+<p>Values must lie in <code>(0, 1]</code>. Smaller damps harder — on the model below, 0.01 moves <code>TVFRD1</code> to 0.355 and 0.003 to 0.357, against NONMEM’s 0.394 — but tighter caps also slow legitimate exploration, and here they pull <code>TVV</code> off (129.9 at 0.01 against NONMEM’s 133.8). <strong><code>mstep_damping = 1.0</code> disables the damping entirely</strong>, in both phases, restoring the pre-0.3.x behaviour exactly; that is the escape hatch if a model fitted better without it.</p>
+<p><code>1.0</code> is therefore a <em>sentinel</em>, not a cap value, and the option is deliberately discontinuous there: <code>mstep_damping = 0.999</code> still buys the full convergence schedule <code>γ = 1/(k−k1)</code>, while <code>1.0</code> buys none of it. There is no setting that means “cap exploration a little and leave convergence alone” — the option only ever governs the exploration cap — and “off” has to restore the whole pre-damping trajectory to be a useful escape hatch. (Lifting only the exploration cap left the model above at <code>TVFRD1</code> 0.047 rather than its true undamped 0.039.)</p>
+<p>The damping is applied only to the channel the bias lives in: a fit is damped when NLopt is left estimating a theta that is <strong>not mu-referenced</strong>, which is exactly the situation the advisory above warns about. A theta that is <code>FIX</code>, that is pinned out by the mu-reference shift, or that is mu-referenceable at all (so the exact closed-form <code>log θ += γ·mean(η)</code> update is available to it) is left on the undamped update, and a fit whose every estimated theta is one of those is unaffected down to the last bit — and setting <code>mstep_damping</code> on such a model warns that it has no effect rather than accepting it silently.</p>
+<p><strong>Sigma is damped with the same <code>γ_θ</code></strong>, on the same gate, even though the gate is a statement about theta. That is not an oversight: the numerical M-step is a <em>single</em> NLopt problem over the concatenated <code>[θ; σ]</code> vector, so <code>θ*</code> and <code>σ*</code> are one joint maximiser of the same frozen-η likelihood. Blending theta at <code>γ_θ</code> while assigning sigma outright would take an inconsistent partial step — sigma would jump to the value that is optimal for the theta the M-step wanted, while theta is held near the theta it had, leaving sigma to absorb the very misfit the damping just stopped theta from fixing. So a model that trips the gate has its sigma damped too, including when the theta that trips it is a covariate coefficient or an allometric exponent rather than a typical value.</p>
+<p>One case is deliberately left out of scope: under <code>mu_referencing = false</code> every theta goes through the numerical M-step, but a theta written in a mu-referenceable form is not the fixed-effect-only channel the damping was calibrated against, so such a fit keeps the undamped update and <code>mstep_damping</code> reports that it had no effect (naming that reason).</p>
+<p>“Mu-referenced” here means ferx <em>detected</em> the pairing — the <code>TVX * exp(ETA_X)</code> and logit forms. A parameter that carries an eta in a form ferx cannot pair with a single theta (an additive <code>X = TVX + ETA_X</code>, or a covariate model whose typical value is not log-linear in one theta) counts as un-referenced and is damped, which is the intended side to err on: that theta has no closed-form shift either, so the numerical M-step really is its only mover.</p>
+<p><a href="../estimation/mixture.html">Mixture models</a> are also excluded. A <code>MIXNUM</code>-switched typical value goes through the same numerical M-step, but it is solving a different problem — the class typical values must <em>separate</em> from a common start, and the class assignments only settle once they have. Damping that excursion stalls the separation, so mixtures keep the undamped update.</p>
+<p>Averaging the M-step <em>objective</em> over the last <code>K</code> η draws instead — the obvious alternative — is both weaker and far more expensive: it reaches <code>TVFRD1</code> 0.081 at K = 50 and 0.130 at K = 150 (15× the wall time), because consecutive SAEM draws are heavily autocorrelated. Damping the iterate accumulates over every iteration rather than a K-window, which is why it wins on both axes.</p>
+<p>Damping reduces the Monte-Carlo bias but does not remove it, so the advisory still fires and the two structural remedies remain the better answer:</p>
+<ul>
+<li><strong>Attach an eta</strong> — <code>P = TVP * exp(ETA_P)</code> with a small omega (optionally <code>FIX</code>). ferx then mu-references it automatically and the exact closed-form update takes over.</li>
+<li><strong>Hold it <code>FIX</code></strong> at a value estimated by another method. Every theta then lands within 3% of NONMEM, <code>TVV</code> included.</li>
+</ul>
+<p>Otherwise estimate the model with <a href="../estimation/foce.html">FOCEI</a> or <a href="../estimation/impmap.html">IMPMAP</a>, which do not depend on this channel.</p>
+</section>
+</div>
+</div>
+<p>The number of NLopt evaluations saved is stored in <code>FitResult::saem_mu_ref_m_step_evals_saved</code>, accumulated across SAEM iterations as <code>2 × mstep_maxiter × n_mu_ref_pairs</code> per outer step (one finite-difference probe pair per pinned mu-ref dimension, capped at <code>mstep_maxiter</code> NLopt gradient requests). The field is <code>None</code> when mu-referencing is off or method ≠ SAEM.</p>
+<p>When <code>n_leapfrog &gt; 0</code>, <code>FitResult::saem_n_subjects_hmc</code> records how many subjects used HMC at least once during the E-step (the remainder used MH fallback). The field is <code>None</code> for MH-only runs. The fit YAML also emits <code>saem_n_subjects_hmc</code> and <code>saem_n_subjects_mh</code> when the field is <code>Some</code>.</p>
+</section>
+</section>
+<section id="adaptive-step-sizes" class="level3">
+<h3 class="anchored" data-anchor-id="adaptive-step-sizes">5. Adaptive Step Sizes</h3>
+<p>Every <code>adapt_interval</code> iterations, the per-subject step sizes <span class="math inline">\(\delta_i\)</span> (MH) or leapfrog step sizes (HMC) are adjusted based on acceptance rate:</p>
+<ul>
+<li>If acceptance rate exceeds the target: increase <span class="math inline">\(\delta_i\)</span> by 10% (up to 5.0)</li>
+<li>If acceptance rate falls below the target: decrease <span class="math inline">\(\delta_i\)</span> by 10% (down to 0.01)</li>
+</ul>
+<p>The block kernel and the componentwise kernel carry independent per-subject scales (the componentwise scale is adapted toward the higher 1-D optimum), and the kappa MH (IOV) scale is adapted the same way.</p>
+<p>Target acceptance rates: 40% for the block MH kernel, 44% for the componentwise kernel, 65% for HMC.</p>
+</section>
+</section>
+<section id="post-saem-finalization" class="level2">
+<h2 class="anchored" data-anchor-id="post-saem-finalization">Post-SAEM Finalization</h2>
+<p>After the SAEM iterations complete:</p>
+<ol type="1">
+<li><strong>EBE Refinement</strong>: Run the standard FOCE inner loop (BFGS optimization) warm-started from the SAEM ETAs to obtain final empirical Bayes estimates</li>
+<li><strong>Combined-error additive-collapse repair</strong>: for <code>combined(PROP, ADD)</code> residual-error models, <em>only when SAEM has driven the additive component <code>ADD</code> onto its lower bound</em>, ferx runs a final FOCEI marginal-likelihood polish from the SAEM estimates (retrying from the model’s initial parameters if <code>ADD</code> is still pinned) and adopts it <strong>only if it lowers the marginal OFV</strong>. Fits whose <code>ADD</code> converged to a healthy non-zero value are left untouched. This guards against point-η SAEM M-steps overfitting the low-concentration tail and collapsing <code>ADD</code> when the marginal likelihood identifies a non-zero additive term. It is a safety net, not a substitute for checking <code>ADD</code> identifiability yourself (RSE, σ-correlation, profile likelihood); on sparse data prefer the importance-sampling −2LL over the Laplace OFV when judging whether the additive term is real.</li>
+<li><strong>FOCE OFV</strong>: Compute the objective function using the FOCE/Laplace approximation, so AIC and BIC are directly comparable with FOCE results</li>
+<li><strong>Covariance Step</strong>: Optionally compute standard errors via finite-difference Hessian (same method as FOCE)</li>
+<li><strong>Diagnostics</strong>: Compute PRED, IPRED, CWRES, IWRES for each subject</li>
+</ol>
+<p>For sparsely-sampled data where the Laplace OFV is biased, you can append an importance-sampling stage that estimates <code>−2 log L</code> by Monte Carlo:</p>
+<pre><code>method = [saem, imp]</code></pre>
+<p>See <a href="../estimation/importance-sampling.html">Importance Sampling (IMP)</a>.</p>
+</section>
+<section id="conditional-distribution-conditional-mode-vs.-distribution" class="level2">
+<h2 class="anchored" data-anchor-id="conditional-distribution-conditional-mode-vs.-distribution">Conditional Distribution (conditional mode vs.&nbsp;distribution)</h2>
+<p>The post-SAEM finalization above produces the conditional <strong>mode</strong> of each subject’s random effects — the empirical Bayes estimate (EBE), the single most probable \( _i \). That is a point estimate. SAEM’s MCMC E-step is, however, already sampling each subject’s full <strong>conditional distribution</strong> \( p(_i y_i; ) \); the mode discards everything but its peak.</p>
+<p>Set <code>conddist = true</code> to run an opt-in post-fit pass that characterises that distribution. With the population parameters fixed at their converged values, the same MH kernels (block, componentwise, and the per-occasion kappa kernel for IOV) are re-run per subject — warm-started at the EBE mode — and the draws are <em>accumulated</em> rather than discarded. The pass reports, per subject:</p>
+<ul>
+<li>the <strong>conditional mean</strong> \( [_i y_i] \),</li>
+<li>the <strong>conditional SD</strong> \( (_i y_i) \),</li>
+<li>optionally the raw draws (<code>conddist_keep_samples = true</code>), and</li>
+<li>a distribution-based <strong>η-shrinkage</strong>, \( 1 - _i(_i)/\), reported alongside the usual mode-based <code>shrinkage_eta</code>.</li>
+</ul>
+<p>This mirrors the conditional-mode vs.&nbsp;conditional-distribution distinction in <strong>saemix</strong> (<code>map.saemix</code> vs <code>conddist.saemix</code>; Comets, Lavenu &amp; Lavielle, <em>J. Stat. Soft.</em> 80(3), 2017) and <strong>Monolix</strong> (the “Conditional Mode” vs “Conditional Distribution” tasks). Why prefer the distribution for diagnostics: EBEs and conditional means are shrunk toward the population, so η–covariate and η–η relationships built on them can be hidden or fabricated; samples from the conditional distribution are not shrinkage-biased.</p>
+<p>Results are exposed on <code>FitResult.cond_dist</code> and written by the CLI to <code>{model}-conddist.csv</code> (<code>ID, ETA, COND_MEAN, COND_SD, COND_MODE</code>), with the raw draws in <code>{model}-conddist-samples.csv</code> when retained.</p>
+<section id="validation-against-saemix-and-nonmem" class="level3">
+<h3 class="anchored" data-anchor-id="validation-against-saemix-and-nonmem">Validation against saemix and NONMEM</h3>
+<p>On the bundled warfarin data (10 subjects, 1-cpt oral, log-normal CL/V/KA, proportional error), all three engines converge to identical population parameters (TVCL 0.1327, TVV 7.737, TVKA 0.811), and ferx’s per-subject conditional distribution agrees with both references to within Monte-Carlo noise.</p>
+<p><strong>vs saemix</strong> (<code>conddist.saemix</code>):</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Quantity (per-subject η)</th>
+<th>corr</th>
+<th>max|diff|</th>
+<th>RMSE</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>conditional mean</td>
+<td>1.0000</td>
+<td>0.0029</td>
+<td>0.0011</td>
+</tr>
+<tr class="even">
+<td>conditional SD</td>
+<td>0.9913</td>
+<td>0.0024</td>
+<td>0.0009</td>
+</tr>
+<tr class="odd">
+<td>mode / MAP</td>
+<td>1.0000</td>
+<td>0.0002</td>
+<td>0.0001</td>
+</tr>
+</tbody>
+</table>
+<p><strong>vs NONMEM</strong> (<code>$EST METHOD=SAEM</code> then <code>METHOD=IMP EONLY=1</code>; conditional moments read from the <code>.phi</code> file — <code>PHI(k) − log θ_k</code> is the η conditional mean, <code>sqrt(PHC(k,k))</code> the conditional SD):</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Quantity (per-subject η)</th>
+<th>corr</th>
+<th>max|diff|</th>
+<th>RMSE</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>conditional mean</td>
+<td>1.0000</td>
+<td>0.0012</td>
+<td>0.0004</td>
+</tr>
+<tr class="even">
+<td>conditional SD</td>
+<td>0.9987</td>
+<td>0.0017</td>
+<td>0.0004</td>
+</tr>
+</tbody>
+</table>
+<p>(ferx <code>conddist_nsamp = 2000</code>. Comparison scripts: <code>tests/reference/saem_conddist/bench_saemix_conddist.R</code>, <code>tests/reference/saem_conddist/parse_nm_conddist.R</code>.)</p>
+</section>
+</section>
+<section id="inter-occasion-variability-iov" class="level2">
+<h2 class="anchored" data-anchor-id="inter-occasion-variability-iov">Inter-Occasion Variability (IOV)</h2>
+<p><code>method = saem</code> supports models with <code>kappa</code> declarations (<code>n_kappa &gt; 0</code>). IOV is handled with a per-occasion Gibbs Metropolis-Hastings step interleaved with the standard eta MH:</p>
+<ul>
+<li><strong>E-step</strong>: After sampling <span class="math inline">\(\eta\)</span>, one MH proposal is made for each occasion’s <span class="math inline">\(\kappa_k\)</span>. Both the eta and kappa samplers target the correct conditional distributions: <span class="math inline">\(p(\eta | \kappa, \theta, \text{data})\)</span> and <span class="math inline">\(p(\kappa_k | \eta, \theta, \text{data})\)</span> respectively.</li>
+<li><strong>SA update</strong>: <span class="math inline">\(S_2^{\text{iov}} \leftarrow (1 - \gamma_k) S_2^{\text{iov}} + \gamma_k \cdot \frac{1}{N_{\text{occ}}} \sum_i \sum_k \kappa_{ik} \kappa_{ik}^T\)</span></li>
+<li><strong>M-step</strong>: <span class="math inline">\(\Omega_{\text{iov}} = S_2^{\text{iov}}\)</span> (analytic update, same structure as the BSV omega M-step).</li>
+</ul>
+<p>No additional configuration is required; <code>method = saem</code> works for both BSV-only and IOV models.</p>
+</section>
+<section id="models-with-no-random-effects-are-rejected" class="level2">
+<h2 class="anchored" data-anchor-id="models-with-no-random-effects-are-rejected">Models with no random effects are rejected</h2>
+<p>SAEM is an EM algorithm <em>over the random effects</em>. A model that declares none (<code>n_eta = 0</code> — see <a href="../model-file/parameters.html#no-omega-at-all-fixed-effects-only-naive-pooled-fits">no omega at all</a>) has an empty E-step: there is nothing to sample and the stochastic approximation has nothing to average, leaving an M-step that is plain maximum likelihood on θ/σ. Left to run, it terminates on its own criterion slightly short of the optimum — on the <code>one_cpt_iv</code> zero-Ω anchor it reports converged at OFV −269.599 where FOCEI reaches −269.637.</p>
+<p>Rather than return a quietly-wrong answer, <code>method = saem</code> errors at <code>n_eta = 0</code>:</p>
+<pre class="text"><code>method = saem requires at least one random effect (n_eta = 0). SAEM is an EM over
+the random effects, so with none declared its E-step is empty and it only
+approaches the objective that FOCE/FOCEI minimise exactly. Use method = foce,
+focei, or laplace for a fixed-effects-only (naive-pooled) model.</code></pre>
+<p>The check runs in the same validation pass as <code>ferx check</code>, and fires if <code>saem</code> appears <strong>anywhere</strong> in a <code>methods = [...]</code> chain — so <code>methods = [saem, focei]</code> fails up front rather than after the SAEM stage has already run.</p>
+<p><code>imp</code>, <code>impmap</code> and <code>bayes</code> are rejected at <code>n_eta = 0</code> in the same pass, under the code <code>E_METHOD_NO_RANDOM_EFFECTS</code> (#1007) — each integrates over the random effects, and with none declared the marginal likelihood collapses to the observation likelihood FOCE/FOCEI already minimise exactly. Like the SAEM guard this fires anywhere in a chain, so <code>methods = [focei, imp]</code> fails up front instead of after the FOCEI stage has run. Each of the three still refuses at run time as well, which is what a direct <code>fit()</code> caller bypassing <code>ferx check</code> sees.</p>
+</section>
+<section id="configuration" class="level2">
+<h2 class="anchored" data-anchor-id="configuration">Configuration</h2>
+<pre><code>[fit_options]
+  method        = saem
+  n_exploration = 150      # Phase 1 iterations
+  n_convergence = 250      # Phase 2 iterations
+  n_mh_steps    = 20       # block-MH steps per subject per iteration (ignored when n_leapfrog &gt; 0)
+  n_leapfrog    = 0        # Set &gt; 0 (e.g. 3) to use HMC instead of MH
+  adapt_interval = 50      # Step-size adaptation frequency
+  omega_burnin  = 20       # Iterations to hold Ω fixed while the chain warms up
+  seed          = 12345    # RNG seed for reproducibility
+  covariance    = true     # Compute standard errors
+
+  # Conditional-distribution pass (opt-in; off by default)
+  conddist              = true    # Estimate p(η_i | y_i) per subject after the fit
+  conddist_nsamp        = 2000    # Retained MCMC draws per subject
+  conddist_burnin       = 500     # Burn-in draws discarded before accumulation
+  conddist_keep_samples = false   # Retain the raw draws (writes -conddist-samples.csv)</code></pre>
+</section>
+<section id="tuning-guide" class="level2">
+<h2 class="anchored" data-anchor-id="tuning-guide">Tuning Guide</h2>
+<section id="not-converging" class="level3">
+<h3 class="anchored" data-anchor-id="not-converging">Not Converging</h3>
+<ul>
+<li>Increase <code>n_exploration</code> (e.g., 300) to give more time for basin finding</li>
+<li>Increase <code>n_convergence</code> (e.g., 500) for a longer averaging window</li>
+<li>Raise <code>n_mh_steps</code> further (e.g.&nbsp;30-50) for better mixing in the E-step on hard surfaces — the default 20 is calibrated to escape the basin trap observed on Emax PKPD with stressful initial values (see below) and to drive the componentwise kernel that prevents block-Ω collapse, but ODE-with-Form-C readouts may need more proposals to fully decorrelate samples between M-step calls.</li>
+</ul>
+</section>
+<section id="pd-curve-thetas-collapse-on-cold-start-emax-sigmoid-readouts" class="level3">
+<h3 class="anchored" data-anchor-id="pd-curve-thetas-collapse-on-cold-start-emax-sigmoid-readouts">PD-curve thetas collapse on cold start (Emax / sigmoid readouts)</h3>
+<p>A failure mode specific to models that read population thetas through a Form C <code>[scaling]</code> block (e.g.&nbsp;<code>y[CMT=N] = E0 + EMAX * effect^GAMMA / ...</code>) and score them via a per-CMT additive <code>[error_model]</code>: from stressful initial values (e.g.&nbsp;1.5× truth) the M-step can lock the PD-curve thetas into a degenerate basin where <code>E0 → 0</code>, <code>EMAX</code> and <code>EC50</code> blow up, and <code>GAMMA</code> collapses below 1. The likelihood at the bad basin is only modestly worse than at truth (~150 OFV units on a 100-subject benchmark), so SAEM doesn’t back out on its own.</p>
+<p>The underlying cause is MCMC sample correlation: with an early default <code>n_mh_steps = 3</code> the chain didn’t decorrelate enough between SAEM outer iterations, so the single-draw stochastic M-step received sticky correlated ETAs that biased the population-θ update toward the basin. The default was raised to 10 and then to 20 (alongside the componentwise kernel and the damped Ω step), which resolves this reliably across seeds at modest extra wall on the affected model and ~0% on simpler PK-only models.</p>
+<p>If you still see this signature (E0 hitting its lower bound, EMAX large, EC50 large) on a related Emax/Hill model:</p>
+<ol type="1">
+<li>Try <code>n_mh_steps = 20</code> or <code>n_mh_steps = 50</code></li>
+<li>Warm-start from a FOCEI fit (<code>method = [focei, saem]</code>)</li>
+<li>Run with several seeds and keep the lowest OFV</li>
+</ol>
+</section>
+<section id="ω-collapses-residual-error-inflates" class="level3">
+<h3 class="anchored" data-anchor-id="ω-collapses-residual-error-inflates">Ω Collapses / Residual Error Inflates</h3>
+<p>On sparse data (few observations per subject) the variance components can collapse toward zero on the first iterations while the residual error absorbs the between-subject variability (e.g.&nbsp;tiny <code>omega</code> with a large additive <code>sigma</code>). The default <code>omega_burnin = 20</code> and the damped Ω SA step guard against this by keeping Ω near its starting value while the chain warms up. If it still occurs, raise <code>omega_burnin</code> (e.g.&nbsp;40) and/or <code>n_mh_steps</code> so the chain reaches a representative spread before Ω is first estimated, then polish with <code>method = [saem, focei]</code>.</p>
+</section>
+<section id="block-ω-correlations-near-1-rank-1-collapse" class="level3">
+<h3 class="anchored" data-anchor-id="block-ω-correlations-near-1-rank-1-collapse">Block Ω correlations near ±1 (rank-1 collapse)</h3>
+<p>For a <code>block_omega</code> (correlated) random-effects block, a faulty E-step/M-step coupling can drive <strong>every</strong> off-diagonal correlation toward ±1 while one variance collapses toward zero — a near rank-1 Ω that FOCEI on the same data does not show. The mechanism is the block proposal (preconditioned by <code>chol(Ω)</code>) plus the single-draw Ω M-step feeding correlation back into Ω during the <code>γ=1</code> exploration phase. ferx guards this by default with two mechanisms — the <strong>componentwise MH kernel</strong> and the <strong>damped Ω SA step</strong> described above — so on a poorly-identified 2-cpt model the SAEM Ω now matches the FOCEI/NONMEM estimate (e.g.&nbsp;corr(CL,V1) ≈ 0.67, corr(V1,V2) ≈ 0.4) across seeds instead of collapsing to ≈0.99. If you still see inflated block correlations, raise <code>n_mh_steps</code> (this also raises the componentwise sweep count <code>n_mh_steps / n_eta</code>) and run several seeds.</p>
+</section>
+<section id="iiv-on-residual-error-iiv_on_ruv-σ-ω_ruv-ridge" class="level3">
+<h3 class="anchored" data-anchor-id="iiv-on-residual-error-iiv_on_ruv-σ-ω_ruv-ridge">IIV on residual error (<code>iiv_on_ruv</code>): σ × ω_RUV ridge</h3>
+<p>With <code>iiv_on_ruv = ETA</code>, the residual is <span class="math inline">\(Y = f + \varepsilon \exp(\eta_{\text{RUV}})\)</span>, so the residual variance is <span class="math inline">\(\sigma^2 \exp(2\eta_{\text{RUV}})\)</span>. This form is invariant to <span class="math inline">\(\eta_{\text{RUV}} \to \eta_{\text{RUV}} - c,\ \sigma \to \sigma\,e^{c}\)</span> — <span class="math inline">\(\sigma\)</span> and a <em>shift</em> of <span class="math inline">\(\eta_{\text{RUV}}\)</span> are a degenerate pair. Unlike a mu-referenced structural <span class="math inline">\(\eta\)</span> (whose mean is folded into its typical value <span class="math inline">\(\theta\)</span> each M-step), <span class="math inline">\(\eta_{\text{RUV}}\)</span> has <strong>no typical-value <span class="math inline">\(\theta\)</span></strong>, so nothing absorbs its mean: it drifts along that degenerate direction, and because <span class="math inline">\(\omega_{\text{RUV}}\)</span> is estimated as <span class="math inline">\(\overline{\eta_{\text{RUV}}^2}\)</span> the drift injects a spurious <span class="math inline">\(\text{mean}^2\)</span> term that pumps <span class="math inline">\(\sigma\)</span> and <span class="math inline">\(\omega_{\text{RUV}}\)</span> <strong>up together</strong> — the runaway reported in issue #895 (<span class="math inline">\(\omega_{\text{RUV}}\)</span> toward ~49, <span class="math inline">\(\sigma\)</span> toward its e⁵ ceiling), worst on FREM models with an extreme <span class="math inline">\(\Omega\)</span>-diagonal scale range.</p>
+<p>ferx fixes this by treating <span class="math inline">\(\sigma\)</span> as the residual-scale typical value: each iteration <span class="math inline">\(\eta_{\text{RUV}}\)</span> is <strong>re-centred to zero mean</strong>, absorbing the shift into <span class="math inline">\(\sigma\)</span> (<span class="math inline">\(\eta_{\text{RUV}} \mathrel{-}= \overline{\eta_{\text{RUV}}}\)</span>, every RUV-scaled <span class="math inline">\(\sigma \mathrel{\times}= e^{\overline{\eta_{\text{RUV}}}}\)</span>). Each subject’s residual variance is exactly unchanged, so the likelihood is untouched, but <span class="math inline">\(E[\eta_{\text{RUV}}]=0\)</span> is restored and <span class="math inline">\(\omega_{\text{RUV}}\)</span> measures the true variance. On the 475-subject FREM reprex this converges to <span class="math inline">\(\omega_{\text{RUV}} \approx 0.28\)</span>, <span class="math inline">\(\sigma \approx 0.20\)</span> from both a too-small and a too-large <span class="math inline">\(\sigma\)</span> start (NONMEM: 0.28 / 0.18), where it previously ran to <span class="math inline">\(\omega_{\text{RUV}} \approx 49\)</span>. Re-centring is applied only when <strong>every</strong> RUV-scaled <span class="math inline">\(\sigma\)</span> component is free to absorb the shift — this keeps each subject’s residual variance exactly unchanged. If any residual <span class="math inline">\(\sigma\)</span> component is FIXed (e.g.&nbsp;a fixed additive term of a combined error), scaling only the free component would leave the fixed part uncompensated, so re-centring is skipped and the growth caps below carry the load (a FIXed <span class="math inline">\(\sigma\)</span> already partially pins the mean).</p>
+<p>Two growth caps remain as belt-and-braces backstops, both no-ops on a well-behaved fit:</p>
+<ul>
+<li><strong>σ growth cap</strong> — each free RUV-scaled residual <span class="math inline">\(\sigma\)</span> is capped at <span class="math inline">\(\approx 20\times\)</span> its scale (a post-M-step clamp). A <span class="math inline">\(\sigma\)</span> whose own user upper bound is already tighter carries no separate cap — NLopt enforces that bound directly.</li>
+<li><strong>ω_RUV growth cap</strong> — the RUV <span class="math inline">\(\Omega\)</span> variance is capped at <span class="math inline">\(\approx 20\times\)</span> its scale, applied as a correlation-preserving rescale of the RUV row/column so a block <span class="math inline">\(\Omega\)</span> stays positive-definite. A FIXed off-diagonal covariance with the RUV eta is left exactly as declared.</li>
+</ul>
+<p>The reference “scale” is the <em>larger</em> of the starting value and the data-informed value the fit reaches by the end of the exploration phase, so a run started from a <span class="math inline">\(\sigma\)</span>/<span class="math inline">\(\omega_{\text{RUV}}\)</span> guess many-fold below the truth is not spuriously clamped. If either cap ever binds (it should not, now that the drift is removed), SAEM warns that the split is weakly identified and suggests fixing <span class="math inline">\(\sigma\)</span>.</p>
+</section>
+<section id="slow-convergence" class="level3">
+<h3 class="anchored" data-anchor-id="slow-convergence">Slow Convergence</h3>
+<ul>
+<li>Decrease <code>n_exploration</code> and <code>n_convergence</code> if parameters stabilize early</li>
+<li>Use <code>adapt_interval = 25</code> for faster step-size adaptation</li>
+</ul>
+</section>
+<section id="reproducibility" class="level3">
+<h3 class="anchored" data-anchor-id="reproducibility">Reproducibility</h3>
+<ul>
+<li>Always set <code>seed</code> for reproducible results</li>
+<li>Different seeds will produce slightly different estimates due to the stochastic nature of the algorithm</li>
+</ul>
+</section>
+</section>
+<section id="output" class="level2">
+<h2 class="anchored" data-anchor-id="output">Output</h2>
+<p>The SAEM iteration progress is printed to stderr:</p>
+<pre><code>SAEM: 10 subjects, 3 ETAs, 400 total iter (150 explore + 250 converge)
+  SAEM iter    1/400 [explore] γ=1.000  condNLL=95.244
+  SAEM iter   50/400 [explore] γ=1.000  condNLL=56.705
+  SAEM iter  150/400 [explore] γ=1.000  condNLL=46.071
+  SAEM iter  200/400 [converge] γ=0.020  condNLL=36.799
+  SAEM iter  400/400 [converge] γ=0.004  condNLL=38.096
+SAEM iterations complete. Computing final EBEs and OFV...
+SAEM completed. Final OFV = ...
+Running covariance step...</code></pre>
+<p>The <code>Final OFV = ...</code> line is printed <strong>before</strong> the covariance step starts (#893). SAEM only learns its OFV at the very end (the final FOCE approximation), and the covariance matrix is often the most expensive part of the run — so seeing the OFV first lets you interrupt (Ctrl-C) when the OFV already rules the run out, instead of waiting for a covariance matrix you won’t use.</p>
+<section id="why-γ-gamma-is-shown" class="level3">
+<h3 class="anchored" data-anchor-id="why-γ-gamma-is-shown">Why <code>γ</code> (gamma) is shown</h3>
+<p><span class="math inline">\(\gamma_k\)</span> is the <strong>stochastic-approximation step size</strong>, not a model quantity — it is intrinsic to the SAEM algorithm and tells you which phase the run is in and how aggressively the estimates are still moving:</p>
+<ul>
+<li><strong>Exploration</strong> (<code>[explore]</code>, <span class="math inline">\(k \le K_1\)</span>): <span class="math inline">\(\gamma_k = 1\)</span>. Each iteration fully replaces the running sufficient statistics, so the chain roams freely toward the basin of the MLE.</li>
+<li><strong>Convergence</strong> (<code>[converge]</code>, <span class="math inline">\(k &gt; K_1\)</span>): <span class="math inline">\(\gamma_k = 1/(k - K_1)\)</span> decays toward zero. Updates shrink into a decreasing-weight average that damps the Monte-Carlo noise so the estimates settle. The printed value (e.g.&nbsp;<code>0.020</code>, <code>0.004</code>) is exactly this decaying weight applied to the Ω, θ, and σ updates each iteration.</li>
+</ul>
+</section>
+<section id="why-condnll-and-not-ofv" class="level3">
+<h3 class="anchored" data-anchor-id="why-condnll-and-not-ofv">Why <code>condNLL</code> and not <code>OFV</code></h3>
+<p>During the iterations ferx prints <code>condNLL</code>, the <strong>conditional</strong> (joint) negative log-likelihood summed over subjects, evaluated at the <em>current MH/HMC-sampled</em> etas:</p>
+<p><span class="math display">\[
+\text{condNLL} = \sum_{i=1}^{N} \text{NLL}(\eta_i^{\text{sampled}})
+\]</span></p>
+<p>This is a cheap per-iteration progress signal. It is <strong>not</strong> the marginal objective function value (OFV): it is evaluated at one stochastic draw of the random effects rather than integrated over their distribution, so unlike the FOCE/FOCEI outer-loop OFV it is noisy, will not decrease monotonically, and is <strong>not comparable across runs</strong> for model selection.</p>
+<p>The true marginal <strong>OFV</strong> (<span class="math inline">\(-2 \log L\)</span> via the Laplace approximation, directly comparable with FOCE for AIC/BIC) is expensive and is therefore computed only once, after the iterations finish — this is the <code>Final OFV = ...</code> line. See <a href="#post-saem-finalization">Post-SAEM Finalization</a>.</p>
+<p>(<code>NLL</code> = <em>negative log-likelihood</em>, i.e.&nbsp;<span class="math inline">\(-\log L\)</span>. NONMEM’s <code>OFV = -2 \log L</code> is essentially <code>2 × NLL</code> plus a constant.)</p>
+<p><code>condNLL</code> should generally decrease during the exploration phase and stabilize during convergence.</p>
+
+
+</section>
+</section>
+</section>
+
+</main> <!-- /main -->
+<script>
+(function () {
+  var HEAD = '<div class="panel-head"><span class="dots"><i></i><i></i><i></i></span><span class="file"><span class="br">[</span>warfarin_pk.ferx<span class="br">]</span></span></div>';
+
+  function apply() {
+    var dark = document.documentElement.getAttribute('data-bs-theme') === 'dark';
+    document.querySelectorAll('div.sourceCode').forEach(function (el) {
+      if (el.parentElement && el.parentElement.closest('.code-panel')) return;
+      if (dark) {
+        if (!el.classList.contains('code-panel')) {
+          el.classList.add('code-panel');
+          el.insertAdjacentHTML('afterbegin', HEAD);
+        }
+      } else {
+        el.classList.remove('code-panel');
+        var h = el.querySelector(':scope > .panel-head');
+        if (h) h.remove();
+      }
+    });
+  }
+
+  if (document.body) apply();
+  document.addEventListener('DOMContentLoaded', apply);
+  new MutationObserver(function (ms) {
+    ms.forEach(function (m) { if (m.attributeName === 'data-bs-theme') apply(); });
+  }).observe(document.documentElement, { attributes: true });
+}());
+</script>
+<script id="quarto-html-after-body" type="application/javascript">
+  window.document.addEventListener("DOMContentLoaded", function (event) {
+    // Ensure there is a toggle, if there isn't float one in the top right
+    if (window.document.querySelector('.quarto-color-scheme-toggle') === null) {
+      const a = window.document.createElement('a');
+      a.classList.add('top-right');
+      a.classList.add('quarto-color-scheme-toggle');
+      a.href = "";
+      a.onclick = function() { try { window.quartoToggleColorScheme(); } catch {} return false; };
+      const i = window.document.createElement("i");
+      i.classList.add('bi');
+      a.appendChild(i);
+      window.document.body.appendChild(a);
+    }
+    setColorSchemeToggle(hasAlternateSentinel())
+    const icon = "";
+    const anchorJS = new window.AnchorJS();
+    anchorJS.options = {
+      placement: 'right',
+      icon: icon
+    };
+    anchorJS.add('.anchored');
+    const isCodeAnnotation = (el) => {
+      for (const clz of el.classList) {
+        if (clz.startsWith('code-annotation-')) {                     
+          return true;
+        }
+      }
+      return false;
+    }
+    const onCopySuccess = function(e) {
+      // button target
+      const button = e.trigger;
+      // don't keep focus
+      button.blur();
+      // flash "checked"
+      button.classList.add('code-copy-button-checked');
+      var currentTitle = button.getAttribute("title");
+      button.setAttribute("title", "Copied!");
+      let tooltip;
+      if (window.bootstrap) {
+        button.setAttribute("data-bs-toggle", "tooltip");
+        button.setAttribute("data-bs-placement", "left");
+        button.setAttribute("data-bs-title", "Copied!");
+        tooltip = new bootstrap.Tooltip(button, 
+          { trigger: "manual", 
+            customClass: "code-copy-button-tooltip",
+            offset: [0, -8]});
+        tooltip.show();    
+      }
+      setTimeout(function() {
+        if (tooltip) {
+          tooltip.hide();
+          button.removeAttribute("data-bs-title");
+          button.removeAttribute("data-bs-toggle");
+          button.removeAttribute("data-bs-placement");
+        }
+        button.setAttribute("title", currentTitle);
+        button.classList.remove('code-copy-button-checked');
+      }, 1000);
+      // clear code selection
+      e.clearSelection();
+    }
+    const getTextToCopy = function(trigger) {
+      const outerScaffold = trigger.parentElement.cloneNode(true);
+      const codeEl = outerScaffold.querySelector('code');
+      for (const childEl of codeEl.children) {
+        if (isCodeAnnotation(childEl)) {
+          childEl.remove();
+        }
+      }
+      return codeEl.innerText;
+    }
+    const clipboard = new window.ClipboardJS('.code-copy-button:not([data-in-quarto-modal])', {
+      text: getTextToCopy
+    });
+    clipboard.on('success', onCopySuccess);
+    if (window.document.getElementById('quarto-embedded-source-code-modal')) {
+      const clipboardModal = new window.ClipboardJS('.code-copy-button[data-in-quarto-modal]', {
+        text: getTextToCopy,
+        container: window.document.getElementById('quarto-embedded-source-code-modal')
+      });
+      clipboardModal.on('success', onCopySuccess);
+    }
+      var localhostRegex = new RegExp(/^(?:http|https):\/\/localhost\:?[0-9]*\//);
+      var mailtoRegex = new RegExp(/^mailto:/);
+        var filterRegex = new RegExp("https:\/\/ferx-nlme\.github\.io\/ferx-core\/");
+      var isInternal = (href) => {
+          return filterRegex.test(href) || localhostRegex.test(href) || mailtoRegex.test(href);
+      }
+      // Inspect non-navigation links and adorn them if external
+     var links = window.document.querySelectorAll('a[href]:not(.nav-link):not(.navbar-brand):not(.toc-action):not(.sidebar-link):not(.sidebar-item-toggle):not(.pagination-link):not(.no-external):not([aria-hidden]):not(.dropdown-item):not(.quarto-navigation-tool):not(.about-link)');
+      for (var i=0; i<links.length; i++) {
+        const link = links[i];
+        if (!isInternal(link.href)) {
+          // undo the damage that might have been done by quarto-nav.js in the case of
+          // links that we want to consider external
+          if (link.dataset.originalHref !== undefined) {
+            link.href = link.dataset.originalHref;
+          }
+        }
+      }
+    function tippyHover(el, contentFn, onTriggerFn, onUntriggerFn) {
+      const config = {
+        allowHTML: true,
+        maxWidth: 500,
+        delay: 100,
+        arrow: false,
+        appendTo: function(el) {
+            return el.parentElement;
+        },
+        interactive: true,
+        interactiveBorder: 10,
+        theme: 'quarto',
+        placement: 'bottom-start',
+      };
+      if (contentFn) {
+        config.content = contentFn;
+      }
+      if (onTriggerFn) {
+        config.onTrigger = onTriggerFn;
+      }
+      if (onUntriggerFn) {
+        config.onUntrigger = onUntriggerFn;
+      }
+      window.tippy(el, config); 
+    }
+    const noterefs = window.document.querySelectorAll('a[role="doc-noteref"]');
+    for (var i=0; i<noterefs.length; i++) {
+      const ref = noterefs[i];
+      tippyHover(ref, function() {
+        // use id or data attribute instead here
+        let href = ref.getAttribute('data-footnote-href') || ref.getAttribute('href');
+        try { href = new URL(href).hash; } catch {}
+        const id = href.replace(/^#\/?/, "");
+        const note = window.document.getElementById(id);
+        if (note) {
+          return note.innerHTML;
+        } else {
+          return "";
+        }
+      });
+    }
+    const xrefs = window.document.querySelectorAll('a.quarto-xref');
+    const processXRef = (id, note) => {
+      // Strip column container classes
+      const stripColumnClz = (el) => {
+        el.classList.remove("page-full", "page-columns");
+        if (el.children) {
+          for (const child of el.children) {
+            stripColumnClz(child);
+          }
+        }
+      }
+      stripColumnClz(note)
+      if (id === null || id.startsWith('sec-')) {
+        // Special case sections, only their first couple elements
+        const container = document.createElement("div");
+        if (note.children && note.children.length > 2) {
+          container.appendChild(note.children[0].cloneNode(true));
+          for (let i = 1; i < note.children.length; i++) {
+            const child = note.children[i];
+            if (child.tagName === "P" && child.innerText === "") {
+              continue;
+            } else {
+              container.appendChild(child.cloneNode(true));
+              break;
+            }
+          }
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(container);
+          }
+          return container.innerHTML
+        } else {
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(note);
+          }
+          return note.innerHTML;
+        }
+      } else {
+        // Remove any anchor links if they are present
+        const anchorLink = note.querySelector('a.anchorjs-link');
+        if (anchorLink) {
+          anchorLink.remove();
+        }
+        if (window.Quarto?.typesetMath) {
+          window.Quarto.typesetMath(note);
+        }
+        if (note.classList.contains("callout")) {
+          return note.outerHTML;
+        } else {
+          return note.innerHTML;
+        }
+      }
+    }
+    for (var i=0; i<xrefs.length; i++) {
+      const xref = xrefs[i];
+      tippyHover(xref, undefined, function(instance) {
+        instance.disable();
+        let url = xref.getAttribute('href');
+        let hash = undefined; 
+        if (url.startsWith('#')) {
+          hash = url;
+        } else {
+          try { hash = new URL(url).hash; } catch {}
+        }
+        if (hash) {
+          const id = hash.replace(/^#\/?/, "");
+          const note = window.document.getElementById(id);
+          if (note !== null) {
+            try {
+              const html = processXRef(id, note.cloneNode(true));
+              instance.setContent(html);
+            } finally {
+              instance.enable();
+              instance.show();
+            }
+          } else {
+            // See if we can fetch this
+            fetch(url.split('#')[0])
+            .then(res => res.text())
+            .then(html => {
+              const parser = new DOMParser();
+              const htmlDoc = parser.parseFromString(html, "text/html");
+              const note = htmlDoc.getElementById(id);
+              if (note !== null) {
+                const html = processXRef(id, note);
+                instance.setContent(html);
+              } 
+            }).finally(() => {
+              instance.enable();
+              instance.show();
+            });
+          }
+        } else {
+          // See if we can fetch a full url (with no hash to target)
+          // This is a special case and we should probably do some content thinning / targeting
+          fetch(url)
+          .then(res => res.text())
+          .then(html => {
+            const parser = new DOMParser();
+            const htmlDoc = parser.parseFromString(html, "text/html");
+            const note = htmlDoc.querySelector('main.content');
+            if (note !== null) {
+              // This should only happen for chapter cross references
+              // (since there is no id in the URL)
+              // remove the first header
+              if (note.children.length > 0 && note.children[0].tagName === "HEADER") {
+                note.children[0].remove();
+              }
+              const html = processXRef(null, note);
+              instance.setContent(html);
+            } 
+          }).finally(() => {
+            instance.enable();
+            instance.show();
+          });
+        }
+      }, function(instance) {
+      });
+    }
+        let selectedAnnoteEl;
+        const selectorForAnnotation = ( cell, annotation) => {
+          let cellAttr = 'data-code-cell="' + cell + '"';
+          let lineAttr = 'data-code-annotation="' +  annotation + '"';
+          const selector = 'span[' + cellAttr + '][' + lineAttr + ']';
+          return selector;
+        }
+        const selectCodeLines = (annoteEl) => {
+          const doc = window.document;
+          const targetCell = annoteEl.getAttribute("data-target-cell");
+          const targetAnnotation = annoteEl.getAttribute("data-target-annotation");
+          const annoteSpan = window.document.querySelector(selectorForAnnotation(targetCell, targetAnnotation));
+          const lines = annoteSpan.getAttribute("data-code-lines").split(",");
+          const lineIds = lines.map((line) => {
+            return targetCell + "-" + line;
+          })
+          let top = null;
+          let height = null;
+          let parent = null;
+          if (lineIds.length > 0) {
+              //compute the position of the single el (top and bottom and make a div)
+              const el = window.document.getElementById(lineIds[0]);
+              top = el.offsetTop;
+              height = el.offsetHeight;
+              parent = el.parentElement.parentElement;
+            if (lineIds.length > 1) {
+              const lastEl = window.document.getElementById(lineIds[lineIds.length - 1]);
+              const bottom = lastEl.offsetTop + lastEl.offsetHeight;
+              height = bottom - top;
+            }
+            if (top !== null && height !== null && parent !== null) {
+              // cook up a div (if necessary) and position it 
+              let div = window.document.getElementById("code-annotation-line-highlight");
+              if (div === null) {
+                div = window.document.createElement("div");
+                div.setAttribute("id", "code-annotation-line-highlight");
+                div.style.position = 'absolute';
+                parent.appendChild(div);
+              }
+              div.style.top = top - 2 + "px";
+              div.style.height = height + 4 + "px";
+              div.style.left = 0;
+              let gutterDiv = window.document.getElementById("code-annotation-line-highlight-gutter");
+              if (gutterDiv === null) {
+                gutterDiv = window.document.createElement("div");
+                gutterDiv.setAttribute("id", "code-annotation-line-highlight-gutter");
+                gutterDiv.style.position = 'absolute';
+                const codeCell = window.document.getElementById(targetCell);
+                const gutter = codeCell.querySelector('.code-annotation-gutter');
+                gutter.appendChild(gutterDiv);
+              }
+              gutterDiv.style.top = top - 2 + "px";
+              gutterDiv.style.height = height + 4 + "px";
+            }
+            selectedAnnoteEl = annoteEl;
+          }
+        };
+        const unselectCodeLines = () => {
+          const elementsIds = ["code-annotation-line-highlight", "code-annotation-line-highlight-gutter"];
+          elementsIds.forEach((elId) => {
+            const div = window.document.getElementById(elId);
+            if (div) {
+              div.remove();
+            }
+          });
+          selectedAnnoteEl = undefined;
+        };
+          // Handle positioning of the toggle
+      window.addEventListener(
+        "resize",
+        throttle(() => {
+          elRect = undefined;
+          if (selectedAnnoteEl) {
+            selectCodeLines(selectedAnnoteEl);
+          }
+        }, 10)
+      );
+      function throttle(fn, ms) {
+      let throttle = false;
+      let timer;
+        return (...args) => {
+          if(!throttle) { // first call gets through
+              fn.apply(this, args);
+              throttle = true;
+          } else { // all the others get throttled
+              if(timer) clearTimeout(timer); // cancel #2
+              timer = setTimeout(() => {
+                fn.apply(this, args);
+                timer = throttle = false;
+              }, ms);
+          }
+        };
+      }
+        // Attach click handler to the DT
+        const annoteDls = window.document.querySelectorAll('dt[data-target-cell]');
+        for (const annoteDlNode of annoteDls) {
+          annoteDlNode.addEventListener('click', (event) => {
+            const clickedEl = event.target;
+            if (clickedEl !== selectedAnnoteEl) {
+              unselectCodeLines();
+              const activeEl = window.document.querySelector('dt[data-target-cell].code-annotation-active');
+              if (activeEl) {
+                activeEl.classList.remove('code-annotation-active');
+              }
+              selectCodeLines(clickedEl);
+              clickedEl.classList.add('code-annotation-active');
+            } else {
+              // Unselect the line
+              unselectCodeLines();
+              clickedEl.classList.remove('code-annotation-active');
+            }
+          });
+        }
+    const findCites = (el) => {
+      const parentEl = el.parentElement;
+      if (parentEl) {
+        const cites = parentEl.dataset.cites;
+        if (cites) {
+          return {
+            el,
+            cites: cites.split(' ')
+          };
+        } else {
+          return findCites(el.parentElement)
+        }
+      } else {
+        return undefined;
+      }
+    };
+    var bibliorefs = window.document.querySelectorAll('a[role="doc-biblioref"]');
+    for (var i=0; i<bibliorefs.length; i++) {
+      const ref = bibliorefs[i];
+      const citeInfo = findCites(ref);
+      if (citeInfo) {
+        tippyHover(citeInfo.el, function() {
+          var popup = window.document.createElement('div');
+          citeInfo.cites.forEach(function(cite) {
+            var citeDiv = window.document.createElement('div');
+            citeDiv.classList.add('hanging-indent');
+            citeDiv.classList.add('csl-entry');
+            var biblioDiv = window.document.getElementById('ref-' + cite);
+            if (biblioDiv) {
+              citeDiv.innerHTML = biblioDiv.innerHTML;
+            }
+            popup.appendChild(citeDiv);
+          });
+          return popup.innerHTML;
+        });
+      }
+    }
+  });
+  </script>
+</div> <!-- /content -->
+<footer class="footer">
+  <div class="nav-footer">
+    <div class="nav-footer-left">
+<p>© 2026 FeRx-NLME · MIT licensed</p>
+</div>   
+    <div class="nav-footer-center">
+      &nbsp;
+    <div class="toc-actions d-sm-block d-md-none"><ul><li><a href="https://github.com/FeRx-NLME/ferx-core/edit/main/estimation/saem.qmd" class="toc-action"><i class="bi bi-github"></i>Edit this page</a></li><li><a href="https://github.com/FeRx-NLME/ferx-core/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></div>
+    <div class="nav-footer-right">
+<p>Fe · 26 · Rx · 2026</p>
+</div>
+  </div>
+</footer>
+
+
+
+
+</body></html>

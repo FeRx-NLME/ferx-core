@@ -1,0 +1,2286 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en"><head>
+
+<meta charset="utf-8">
+<meta name="generator" content="quarto-1.10.18">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+
+
+<title>Built-in absorption models – ferx-core</title>
+<style>
+/* Default styles provided by pandoc.
+** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+*/
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: 1.5em;}
+div.column{flex: auto;}
+@media screen {
+div.columns{gap: min(4vw, 1.5em);}
+div.column{overflow-x: auto;}
+}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+  width: 0.8em;
+  margin: 0 0.8em 0.2em -1em; /* quarto-specific, see https://github.com/quarto-dev/quarto-cli/issues/4556 */ 
+  vertical-align: middle;
+}
+/* CSS for syntax highlighting */
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+  { counter-reset: source-line 0; }
+pre.numberSource code > span
+  { position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+  { content: counter(source-line);
+    position: relative; left: -1em; text-align: right; vertical-align: baseline;
+    border: none; display: inline-block;
+    -webkit-touch-callout: none; -webkit-user-select: none;
+    -khtml-user-select: none; -moz-user-select: none;
+    -ms-user-select: none; user-select: none;
+    padding: 0 4px; width: 4em;
+  }
+pre.numberSource { margin-left: 3em;  padding-left: 4px; }
+div.sourceCode
+  {   }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+</style>
+
+
+<script src="../site_libs/quarto-nav/quarto-nav.js"></script>
+<script src="../site_libs/quarto-nav/headroom.min.js"></script>
+<script src="../site_libs/clipboard/clipboard.min.js"></script>
+<script src="../site_libs/quarto-search/autocomplete.umd.js"></script>
+<script src="../site_libs/quarto-search/fuse.min.js"></script>
+<script src="../site_libs/quarto-search/quarto-search.js"></script>
+<meta name="quarto:offset" content="../">
+<link href="../assets/ferx-favicon.svg" rel="icon" type="image/svg+xml">
+<script src="../site_libs/quarto-html/quarto.js" type="module"></script>
+<script src="../site_libs/quarto-html/tabsets/tabsets.js" type="module"></script>
+<script src="../site_libs/quarto-html/popper.min.js"></script>
+<script src="../site_libs/quarto-html/tippy.umd.min.js"></script>
+<script src="../site_libs/quarto-html/anchor.min.js"></script>
+<link href="../site_libs/quarto-html/tippy.css" rel="stylesheet">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-51776f957f81c5a6b38322b65a6a6987.css" rel="stylesheet" class="quarto-color-scheme" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-dark-31632d092df9090a2ed68f79c078059d.css" rel="stylesheet" class="quarto-color-scheme quarto-color-alternate" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-51776f957f81c5a6b38322b65a6a6987.css" rel="stylesheet" class="quarto-color-scheme-extra" id="quarto-text-highlighting-styles">
+<script src="../site_libs/bootstrap/bootstrap.min.js"></script>
+<link href="../site_libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
+<link href="../site_libs/bootstrap/bootstrap-f5ed25dbf962e4596f9f4df24f2ade0d.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme" id="quarto-bootstrap" data-mode="light">
+<link href="../site_libs/bootstrap/bootstrap-dark-8a64b8d4793081e9872239f556c8075c.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme quarto-color-alternate" id="quarto-bootstrap" data-mode="dark">
+<link href="../site_libs/bootstrap/bootstrap-f5ed25dbf962e4596f9f4df24f2ade0d.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme-extra" id="quarto-bootstrap" data-mode="light">
+<script id="quarto-search-options" type="application/json">{
+  "location": "navbar",
+  "copy-button": false,
+  "collapse-after": 3,
+  "panel-placement": "end",
+  "type": "overlay",
+  "limit": 50,
+  "keyboard-shortcut": [
+    "f",
+    "/",
+    "s"
+  ],
+  "show-item-context": false,
+  "language": {
+    "search-no-results-text": "No results",
+    "search-matching-documents-text": "matching documents",
+    "search-copy-link-title": "Copy link to search",
+    "search-hide-matches-text": "Hide additional matches",
+    "search-more-match-text": "more match in this document",
+    "search-more-matches-text": "more matches in this document",
+    "search-clear-button-title": "Clear",
+    "search-text-placeholder": "",
+    "search-detached-cancel-button-title": "Cancel",
+    "search-submit-button-title": "Submit",
+    "search-label": "Search"
+  }
+}</script>
+
+  <script src="https://cdnjs.cloudflare.com/polyfill/v3/polyfill.min.js?features=es6"></script>
+  <script defer="" src="https://cdn.jsdelivr.net/npm/mathjax@4/tex-chtml.js" type="text/javascript"></script>
+
+<script type="text/javascript">
+const typesetMath = (el) => {
+  if (window.MathJax) {
+    // MathJax Typeset
+    window.MathJax.typeset([el]);
+  } else if (window.katex) {
+    // KaTeX Render
+    var mathElements = el.getElementsByClassName("math");
+    var macros = [];
+    for (var i = 0; i < mathElements.length; i++) {
+      var texText = mathElements[i].firstChild;
+      if (mathElements[i].tagName == "SPAN" && texText && texText.data) {
+        window.katex.render(texText.data, mathElements[i], {
+          displayMode: mathElements[i].classList.contains('display'),
+          throwOnError: false,
+          macros: macros,
+          fleqn: false
+        });
+      }
+    }
+  }
+}
+window.Quarto = {
+  typesetMath
+};
+</script>
+
+<link rel="stylesheet" href="../styles.css">
+<meta property="og:title" content="Built-in absorption models">
+<meta property="og:description" content="Open-source nonlinear mixed-effects modeling for population PK/PD and pharmacometrics">
+<meta property="og:site_name" content="ferx-core">
+<meta property="og:locale" content="en_US">
+<meta name="twitter:title" content="Built-in absorption models">
+<meta name="twitter:description" content="Open-source nonlinear mixed-effects modeling for population PK/PD and pharmacometrics">
+<meta name="twitter:card" content="summary">
+<link rel="canonical" href="https://ferx-nlme.github.io/ferx-core/model-file/absorption.html">
+</head>
+
+<body class="nav-sidebar floating nav-fixed quarto-light"><script id="quarto-html-before-body" type="application/javascript">
+    const toggleBodyColorMode = (bsSheetEl) => {
+      const mode = bsSheetEl.getAttribute("data-mode");
+      const bodyEl = window.document.querySelector("body");
+      if (mode === "dark") {
+        bodyEl.classList.add("quarto-dark");
+        bodyEl.classList.remove("quarto-light");
+      } else {
+        bodyEl.classList.add("quarto-light");
+        bodyEl.classList.remove("quarto-dark");
+      }
+    }
+    const toggleBodyColorPrimary = () => {
+      const bsSheetEl = window.document.querySelector("link#quarto-bootstrap:not([rel=disabled-stylesheet])");
+      if (bsSheetEl) {
+        toggleBodyColorMode(bsSheetEl);
+      }
+    }
+    const setColorSchemeToggle = (alternate) => {
+      const toggles = window.document.querySelectorAll('.quarto-color-scheme-toggle');
+      for (let i=0; i < toggles.length; i++) {
+        const toggle = toggles[i];
+        if (toggle) {
+          if (alternate) {
+            toggle.classList.add("alternate");
+          } else {
+            toggle.classList.remove("alternate");
+          }
+        }
+      }
+    };
+    const toggleColorMode = (alternate) => {
+      // Switch the stylesheets
+      const primaryStylesheets = window.document.querySelectorAll('link.quarto-color-scheme:not(.quarto-color-alternate)');
+      const alternateStylesheets = window.document.querySelectorAll('link.quarto-color-scheme.quarto-color-alternate');
+      manageTransitions('#quarto-margin-sidebar .nav-link', false);
+      if (alternate) {
+        // note: dark is layered on light, we don't disable primary!
+        enableStylesheet(alternateStylesheets);
+        for (const sheetNode of alternateStylesheets) {
+          if (sheetNode.id === "quarto-bootstrap") {
+            toggleBodyColorMode(sheetNode);
+          }
+        }
+      } else {
+        disableStylesheet(alternateStylesheets);
+        enableStylesheet(primaryStylesheets)
+        toggleBodyColorPrimary();
+      }
+      manageTransitions('#quarto-margin-sidebar .nav-link', true);
+      // Switch the toggles
+      setColorSchemeToggle(alternate)
+      // Hack to workaround the fact that safari doesn't
+      // properly recolor the scrollbar when toggling (#1455)
+      if (navigator.userAgent.indexOf('Safari') > 0 && navigator.userAgent.indexOf('Chrome') == -1) {
+        manageTransitions("body", false);
+        window.scrollTo(0, 1);
+        setTimeout(() => {
+          window.scrollTo(0, 0);
+          manageTransitions("body", true);
+        }, 40);
+      }
+    }
+    const disableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        stylesheet.rel = 'disabled-stylesheet';
+      }
+    }
+    const enableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        if(stylesheet.rel !== 'stylesheet') { // for Chrome, which will still FOUC without this check
+          stylesheet.rel = 'stylesheet';
+        }
+      }
+    }
+    const manageTransitions = (selector, allowTransitions) => {
+      const els = window.document.querySelectorAll(selector);
+      for (let i=0; i < els.length; i++) {
+        const el = els[i];
+        if (allowTransitions) {
+          el.classList.remove('notransition');
+        } else {
+          el.classList.add('notransition');
+        }
+      }
+    }
+    const isFileUrl = () => {
+      return window.location.protocol === 'file:';
+    }
+    const hasAlternateSentinel = () => {
+      let styleSentinel = getColorSchemeSentinel();
+      if (styleSentinel !== null) {
+        return styleSentinel === "alternate";
+      } else {
+        return false;
+      }
+    }
+    const setStyleSentinel = (alternate) => {
+      const value = alternate ? "alternate" : "default";
+      if (!isFileUrl()) {
+        window.localStorage.setItem("quarto-color-scheme", value);
+      } else {
+        localAlternateSentinel = value;
+      }
+    }
+    const getColorSchemeSentinel = () => {
+      if (!isFileUrl()) {
+        const storageValue = window.localStorage.getItem("quarto-color-scheme");
+        return storageValue != null ? storageValue : localAlternateSentinel;
+      } else {
+        return localAlternateSentinel;
+      }
+    }
+    const toggleGiscusIfUsed = (isAlternate, darkModeDefault) => {
+      const baseTheme = document.querySelector('#giscus-base-theme')?.value ?? 'light';
+      const alternateTheme = document.querySelector('#giscus-alt-theme')?.value ?? 'dark';
+      let newTheme = '';
+      if(authorPrefersDark) {
+        newTheme = isAlternate ? baseTheme : alternateTheme;
+      } else {
+        newTheme = isAlternate ? alternateTheme : baseTheme;
+      }
+      const changeGiscusTheme = () => {
+        // From: https://github.com/giscus/giscus/issues/336
+        const sendMessage = (message) => {
+          const iframe = document.querySelector('iframe.giscus-frame');
+          if (!iframe) return;
+          iframe.contentWindow.postMessage({ giscus: message }, 'https://giscus.app');
+        }
+        sendMessage({
+          setConfig: {
+            theme: newTheme
+          }
+        });
+      }
+      const isGiscussLoaded = window.document.querySelector('iframe.giscus-frame') !== null;
+      if (isGiscussLoaded) {
+        changeGiscusTheme();
+      }
+    };
+    const authorPrefersDark = false;
+    const darkModeDefault = authorPrefersDark;
+      document.querySelector('link#quarto-text-highlighting-styles.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+      document.querySelector('link#quarto-bootstrap.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+    let localAlternateSentinel = darkModeDefault ? 'alternate' : 'default';
+    // Dark / light mode switch
+    window.quartoToggleColorScheme = () => {
+      // Read the current dark / light value
+      let toAlternate = !hasAlternateSentinel();
+      toggleColorMode(toAlternate);
+      setStyleSentinel(toAlternate);
+      toggleGiscusIfUsed(toAlternate, darkModeDefault);
+      window.dispatchEvent(new Event('resize'));
+    };
+    // Switch to dark mode if need be
+    if (hasAlternateSentinel()) {
+      toggleColorMode(true);
+    } else {
+      toggleColorMode(false);
+    }
+  </script>
+
+<div id="quarto-search-results"></div>
+  <header id="quarto-header" class="headroom fixed-top">
+    <nav class="navbar navbar-expand-lg " data-bs-theme="dark">
+      <div class="navbar-container container-fluid">
+      <div class="navbar-brand-container mx-auto">
+    <a href="../index.html" class="navbar-brand navbar-brand-logo">
+    <img src="../assets/ferx-dsl-brackets.svg" alt="ferx" class="navbar-logo light-content">
+    <img src="../assets/ferx-dsl-brackets.svg" alt="ferx" class="navbar-logo dark-content">
+    </a>
+    <a class="navbar-brand" href="../index.html">
+    <span class="navbar-title">ferx-core</span>
+    </a>
+  </div>
+            <div id="quarto-search" class="" title="Search"></div>
+          <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarCollapse" aria-controls="navbarCollapse" role="menu" aria-expanded="false" aria-label="Toggle navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+  <span class="navbar-toggler-icon"></span>
+</button>
+          <div class="collapse navbar-collapse" id="navbarCollapse">
+            <ul class="navbar-nav navbar-nav-scroll me-auto">
+  <li class="nav-item">
+    <a class="nav-link active" href="../getting-started.html" aria-current="page"> 
+<span class="menu-text">Get started</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/features.html"> 
+<span class="menu-text">Features</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/changelog.html"> 
+<span class="menu-text">Changelog</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/roadmap.html"> 
+<span class="menu-text">Roadmap</span></a>
+  </li>  
+</ul>
+            <ul class="navbar-nav navbar-nav-scroll ms-auto">
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/ferx-core/"> 
+<span class="menu-text">ferx-core</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/ferx-book/"> 
+<span class="menu-text">ferx-r</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/reference/"> 
+<span class="menu-text">Reference</span></a>
+  </li>  
+  <li class="nav-item compact">
+    <a class="nav-link" href="https://github.com/FeRx-NLME"> <i class="bi bi-github" role="img" aria-label="GitHub">
+</i> 
+<span class="menu-text"></span></a>
+  </li>  
+</ul>
+          </div> <!-- /navcollapse -->
+            <div class="quarto-navbar-tools">
+  <a href="" class="quarto-color-scheme-toggle quarto-navigation-tool  px-1" onclick="window.quartoToggleColorScheme(); return false;" title="Toggle dark mode"><i class="bi"></i></a>
+</div>
+      </div> <!-- /container-fluid -->
+    </nav>
+  <nav class="quarto-secondary-nav">
+    <div class="container-fluid d-flex">
+      <button type="button" class="quarto-btn-toggle btn" data-bs-toggle="collapse" role="button" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+        <i class="bi bi-layout-text-sidebar-reverse"></i>
+      </button>
+        <nav class="quarto-page-breadcrumbs" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../model-file/index.html">Model File Reference</a></li><li class="breadcrumb-item"><a href="../model-file/absorption.html">Built-in Absorption Models</a></li></ol></nav>
+        <a class="flex-grow-1" role="navigation" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">      
+        </a>
+      <button type="button" class="btn quarto-search-button" aria-label="Search" onclick="window.quartoOpenSearch();">
+        <i class="bi bi-search"></i>
+      </button>
+    </div>
+  </nav>
+</header>
+<!-- content -->
+<div id="quarto-content" class="quarto-container page-columns page-rows-contents page-layout-article page-navbar">
+<!-- sidebar -->
+  <nav id="quarto-sidebar" class="sidebar collapse collapse-horizontal quarto-sidebar-collapse-item sidebar-navigation floating overflow-auto">
+    <div class="pt-lg-2 mt-2 text-left sidebar-header">
+      <a href="../index.html" class="sidebar-logo-link">
+      <img src="../assets/ferx-favicon.svg" alt="" class="sidebar-logo light-content py-0 d-lg-inline d-none">
+      <img src="../assets/ferx-favicon.svg" alt="" class="sidebar-logo dark-content py-0 d-lg-inline d-none">
+      </a>
+      </div>
+        <div class="mt-2 flex-shrink-0 align-items-center">
+        <div class="sidebar-search">
+        <div id="quarto-search" class="" title="Search"></div>
+        </div>
+        </div>
+    <div class="sidebar-menu-container"> 
+    <ul class="list-unstyled mt-1">
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Introduction</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../maturity.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Feature Maturity</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../getting-started.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Getting Started</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../installation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Installation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../quick-start.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Quick Start</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../model-file/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Model File Reference</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/parameters.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Parameters</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/iov.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Inter-Occasion Variability (IOV)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/individual-parameters.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Individual Parameters</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariates.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariates</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariate-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/structural-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Structural Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/lagtime.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Lagtime</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/steady-state.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Steady-State Doses (SS=1)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/error-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Error Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/bloq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">LOQ-Censored Observations</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/ode-models.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/absorption.html" class="sidebar-item-text sidebar-link active">
+ <span class="menu-text">Built-in Absorption Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/scaling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Scaling</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/initial-conditions.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Initial Conditions</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/diffusion.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Stochastic Differential Equations (SDE / Diffusion)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/neural-networks.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Neural Networks</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariate-nn.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><code>[covariate_nn]</code> — Deep Compartment Models (DCM)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/data.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/data-selection.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Selection</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/derived.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Derived Columns (<code>[derived]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Output Columns (<code>[output]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/fit-options.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Fit Options</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/simulation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Simulation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/adaptive-dosing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Adaptive (Feedback) Dosing</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/event-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Time-to-Event Endpoints (<code>[event_model]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/categorical.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Categorical endpoints — <code>[binary_model]</code></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/markov-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Markov models ([markov_model])</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../estimation/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Estimation Methods</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/foce.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FOCE / FOCEI</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/agq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">AGQ — Adaptive Gaussian Quadrature</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/gauss-newton.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Gauss-Newton (BHHH)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/saem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">SAEM</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/sir.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Sampling Importance Resampling (SIR)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/importance-sampling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Importance Sampling (IMP)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/frem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FREM (Full Random Effects Model)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/impmap.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">IMPMAP — Importance Sampling assisted by Mode A Posteriori</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/bayes.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Bayesian estimation (MCMC)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/vi.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Variational Inference</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/parameterization.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Packed Parameter Space</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/optimizers.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Outer Optimizers</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/tte.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Time-to-Event (TTE) Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/categorical.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Categorical endpoints (binary / logistic)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/ctmm.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Continuous-time Markov models (CTMM)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/mixture.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Mixture Models</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false">
+ <span class="menu-text">Tools</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/bootstrap.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Bootstrap</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/gam-screening.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">GAM covariate screening</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/search.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Search configuration</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/covsearch.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate search</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/modelsearch.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Structural model search</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../data-format.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Format</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../cli.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">CLI Reference</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Output Files</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../warnings.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Warnings</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../file-formats/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">File Formats</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../file-formats/fitrx.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">The <code>.fitrx</code> Fit Bundle</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../file-formats/check-report.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Check Report (<code>ferx check --json</code>)</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../examples/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Examples</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/one-cpt-oral.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">One-Compartment Oral (Warfarin)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/two-cpt-iv.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Two-Compartment IV Bolus</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/covariates.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/ode-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Model (Michaelis-Menten)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/bloq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">BLOQ (M3 method)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/iov.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Inter-Occasion Variability (IOV)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/iov-saem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">IOV with SAEM</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/multiple-dosing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Multiple Dosing (ADDL Column)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/steady-state.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Steady-State Dosing (SS Column)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/scaling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Unit Scaling (<code>[scaling]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/derived-output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Derived Columns and Output</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/data-selection.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Selection (IGNORE / ACCEPT)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/ode-lagtime.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Model with Absorption Lag Time</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/transit-absorption.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Transit Absorption (Two-Compartment)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/sde.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Stochastic Differential Equations (SDE)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/frem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FREM (Covariate Analysis)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/multistart.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Multi-Start: Michaelis-Menten Elimination</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../api/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Rust API</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/types.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Core Types</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/fitting.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Fitting Functions</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/simulation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Simulation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/parsing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Parsing</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/model-editing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Model editing</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../faq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FAQ</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../development/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Development</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/contributing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Contributing to FeRx development</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/sdlc.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Development Lifecycle (SDLC)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/docs-lint.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Docs linter</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+    </ul>
+    </div>
+</nav>
+<div id="quarto-sidebar-glass" class="quarto-sidebar-collapse-item" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item"></div>
+<!-- margin-sidebar -->
+    <div id="quarto-margin-sidebar" class="sidebar margin-sidebar">
+        <nav id="TOC" role="doc-toc" class="toc-active">
+    <h2 id="toc-title">On this page</h2>
+   
+  <ul>
+  <li><a href="#built-in-absorption-models" id="toc-built-in-absorption-models" class="nav-link active" data-scroll-target="#built-in-absorption-models">Built-in Absorption Models</a>
+  <ul>
+  <li><a href="#transit-compartment-absorption-transitn-mtt" id="toc-transit-compartment-absorption-transitn-mtt" class="nav-link" data-scroll-target="#transit-compartment-absorption-transitn-mtt">Transit-compartment absorption — <code>transit(n, mtt)</code></a>
+  <ul class="collapse">
+  <li><a href="#syntax-transit" id="toc-syntax-transit" class="nav-link" data-scroll-target="#syntax-transit">Syntax — transit</a></li>
+  <li><a href="#dose-routing-the-dose-feeds-the-function-not-a-bolus" id="toc-dose-routing-the-dose-feeds-the-function-not-a-bolus" class="nav-link" data-scroll-target="#dose-routing-the-dose-feeds-the-function-not-a-bolus">Dose routing — the dose feeds the function, not a bolus</a></li>
+  <li><a href="#parameter-domains" id="toc-parameter-domains" class="nav-link" data-scroll-target="#parameter-domains">Parameter domains</a></li>
+  <li><a href="#steady-state-dosing-ss1" id="toc-steady-state-dosing-ss1" class="nav-link" data-scroll-target="#steady-state-dosing-ss1">Steady-state dosing (<code>SS=1</code>)</a></li>
+  <li><a href="#infusion-rate0-into-an-absorption-compartment" id="toc-infusion-rate0-into-an-absorption-compartment" class="nav-link" data-scroll-target="#infusion-rate0-into-an-absorption-compartment">Infusion (<code>RATE&gt;0</code>) into an absorption compartment</a></li>
+  <li><a href="#not-yet-supported-phase-0" id="toc-not-yet-supported-phase-0" class="nav-link" data-scroll-target="#not-yet-supported-phase-0">Not yet supported (Phase 0)</a></li>
+  </ul></li>
+  <li><a href="#analytic-closed-form-pk-one_cpt_transitcl-v-n-mtt" id="toc-analytic-closed-form-pk-one_cpt_transitcl-v-n-mtt" class="nav-link" data-scroll-target="#analytic-closed-form-pk-one_cpt_transitcl-v-n-mtt">Analytic closed form — <code>pk one_cpt_transit(cl, v, n, mtt)</code></a>
+  <ul class="collapse">
+  <li><a href="#scope-first-version" id="toc-scope-first-version" class="nav-link" data-scroll-target="#scope-first-version">Scope (first version)</a></li>
+  <li><a href="#the-flip-flop-regime" id="toc-the-flip-flop-regime" class="nav-link" data-scroll-target="#the-flip-flop-regime">The flip-flop regime</a></li>
+  </ul></li>
+  <li><a href="#two-compartment-analytic-transit-pk-two_cpt_transitcl-v1-q-v2-n-mtt" id="toc-two-compartment-analytic-transit-pk-two_cpt_transitcl-v1-q-v2-n-mtt" class="nav-link" data-scroll-target="#two-compartment-analytic-transit-pk-two_cpt_transitcl-v1-q-v2-n-mtt">Two-compartment analytic transit — <code>pk two_cpt_transit(cl, v1, q, v2, n, mtt)</code></a></li>
+  <li><a href="#analytic-inverse-gaussian-pk-one_cpt_igcl-v-mat-cv2-pk-two_cpt_ig..." id="toc-analytic-inverse-gaussian-pk-one_cpt_igcl-v-mat-cv2-pk-two_cpt_ig..." class="nav-link" data-scroll-target="#analytic-inverse-gaussian-pk-one_cpt_igcl-v-mat-cv2-pk-two_cpt_ig...">Analytic inverse-Gaussian — <code>pk one_cpt_ig(cl, v, mat, cv2)</code> / <code>pk two_cpt_ig(...)</code></a></li>
+  <li><a href="#worked-example-analytic-transit" id="toc-worked-example-analytic-transit" class="nav-link" data-scroll-target="#worked-example-analytic-transit">Worked example — analytic transit</a></li>
+  <li><a href="#inverse-gaussian-absorption-igdmat-cv2" id="toc-inverse-gaussian-absorption-igdmat-cv2" class="nav-link" data-scroll-target="#inverse-gaussian-absorption-igdmat-cv2">Inverse-Gaussian absorption — <code>igd(mat, cv2)</code></a>
+  <ul class="collapse">
+  <li><a href="#syntax-inverse-gaussian" id="toc-syntax-inverse-gaussian" class="nav-link" data-scroll-target="#syntax-inverse-gaussian">Syntax — inverse-Gaussian</a></li>
+  <li><a href="#shared-behaviour-inverse-gaussian" id="toc-shared-behaviour-inverse-gaussian" class="nav-link" data-scroll-target="#shared-behaviour-inverse-gaussian">Shared behaviour — inverse-Gaussian</a></li>
+  <li><a href="#worked-example-inverse-gaussian" id="toc-worked-example-inverse-gaussian" class="nav-link" data-scroll-target="#worked-example-inverse-gaussian">Worked example — inverse-Gaussian</a></li>
+  <li><a href="#biphasic-parallel-absorption" id="toc-biphasic-parallel-absorption" class="nav-link" data-scroll-target="#biphasic-parallel-absorption">Biphasic (parallel) absorption</a></li>
+  </ul></li>
+  <li><a href="#weibull-absorption-weibulltd-beta" id="toc-weibull-absorption-weibulltd-beta" class="nav-link" data-scroll-target="#weibull-absorption-weibulltd-beta">Weibull absorption — <code>weibull(td, beta)</code></a>
+  <ul class="collapse">
+  <li><a href="#syntax-weibull" id="toc-syntax-weibull" class="nav-link" data-scroll-target="#syntax-weibull">Syntax — Weibull</a></li>
+  <li><a href="#shared-behaviour-weibull" id="toc-shared-behaviour-weibull" class="nav-link" data-scroll-target="#shared-behaviour-weibull">Shared behaviour — Weibull</a></li>
+  <li><a href="#worked-example-weibull" id="toc-worked-example-weibull" class="nav-link" data-scroll-target="#worked-example-weibull">Worked example — Weibull</a></li>
+  </ul></li>
+  <li><a href="#zero-order-absorption-zero_orderdur" id="toc-zero-order-absorption-zero_orderdur" class="nav-link" data-scroll-target="#zero-order-absorption-zero_orderdur">Zero-order absorption — <code>zero_order(dur)</code></a>
+  <ul class="collapse">
+  <li><a href="#syntax-zero-order" id="toc-syntax-zero-order" class="nav-link" data-scroll-target="#syntax-zero-order">Syntax — zero-order</a></li>
+  <li><a href="#shared-behaviour-zero-order" id="toc-shared-behaviour-zero-order" class="nav-link" data-scroll-target="#shared-behaviour-zero-order">Shared behaviour — zero-order</a>
+  <ul class="collapse">
+  <li><a href="#dose-handling" id="toc-dose-handling" class="nav-link" data-scroll-target="#dose-handling">Dose handling</a></li>
+  <li><a href="#the-window-is-bracketed-at-both-edges" id="toc-the-window-is-bracketed-at-both-edges" class="nav-link" data-scroll-target="#the-window-is-bracketed-at-both-edges">The window is bracketed at both edges</a></li>
+  <li><a href="#analytic-sensitivity-across-the-moving-boundary" id="toc-analytic-sensitivity-across-the-moving-boundary" class="nav-link" data-scroll-target="#analytic-sensitivity-across-the-moving-boundary">Analytic sensitivity across the moving boundary</a></li>
+  </ul></li>
+  <li><a href="#worked-examples-zero-order-sensitivity" id="toc-worked-examples-zero-order-sensitivity" class="nav-link" data-scroll-target="#worked-examples-zero-order-sensitivity">Worked examples — zero-order sensitivity</a></li>
+  </ul></li>
+  <li><a href="#parallel-mixed" id="toc-parallel-mixed" class="nav-link" data-scroll-target="#parallel-mixed">Parallel / mixed absorption — <code>first_order(ka)</code></a>
+  <ul class="collapse">
+  <li><a href="#pathway-fractions" id="toc-pathway-fractions" class="nav-link" data-scroll-target="#pathway-fractions">Pathway fractions</a></li>
+  <li><a href="#parallel-dual-first-order" id="toc-parallel-dual-first-order" class="nav-link" data-scroll-target="#parallel-dual-first-order">Parallel — dual first-order</a></li>
+  <li><a href="#mixed-zero-order-first-order" id="toc-mixed-zero-order-first-order" class="nav-link" data-scroll-target="#mixed-zero-order-first-order">Mixed — zero-order + first-order</a></li>
+  <li><a href="#per-route-lag" id="toc-per-route-lag" class="nav-link" data-scroll-target="#per-route-lag">Per-route lag — <code>first_order(ka=…, lag=L)</code></a></li>
+  <li><a href="#mr-closed-form" id="toc-mr-closed-form" class="nav-link" data-scroll-target="#mr-closed-form">Closed-form evaluation</a></li>
+  <li><a href="#sensitivities" id="toc-sensitivities" class="nav-link" data-scroll-target="#sensitivities">Sensitivities</a></li>
+  <li><a href="#worked-examples-analytic-gradients" id="toc-worked-examples-analytic-gradients" class="nav-link" data-scroll-target="#worked-examples-analytic-gradients">Worked examples — analytic gradients</a></li>
+  </ul></li>
+  <li><a href="#numerical-note" id="toc-numerical-note" class="nav-link" data-scroll-target="#numerical-note">Numerical note</a></li>
+  <li><a href="#verification-against-nonmem" id="toc-verification-against-nonmem" class="nav-link" data-scroll-target="#verification-against-nonmem">Verification against NONMEM</a>
+  <ul class="collapse">
+  <li><a href="#savic-transit-transit" id="toc-savic-transit-transit" class="nav-link" data-scroll-target="#savic-transit-transit">Savic transit (<code>transit</code>)</a></li>
+  <li><a href="#freijer-post-inverse-gaussian-igd" id="toc-freijer-post-inverse-gaussian-igd" class="nav-link" data-scroll-target="#freijer-post-inverse-gaussian-igd">Freijer &amp; Post inverse-Gaussian (<code>igd</code>)</a></li>
+  <li><a href="#weibull-weibull" id="toc-weibull-weibull" class="nav-link" data-scroll-target="#weibull-weibull">Weibull (<code>weibull</code>)</a></li>
+  <li><a href="#zero-order-zero_order" id="toc-zero-order-zero_order" class="nav-link" data-scroll-target="#zero-order-zero_order">Zero-order (<code>zero_order</code>)</a></li>
+  </ul></li>
+  <li><a href="#generating-the-disposition-ode_template" id="toc-generating-the-disposition-ode_template" class="nav-link" data-scroll-target="#generating-the-disposition-ode_template">Generating the disposition — <code>ode_template</code></a>
+  <ul class="collapse">
+  <li><a href="#override-semantics-re-declare-a-compartment-to-replace-it" id="toc-override-semantics-re-declare-a-compartment-to-replace-it" class="nav-link" data-scroll-target="#override-semantics-re-declare-a-compartment-to-replace-it">Override semantics — re-declare a compartment to replace it</a></li>
+  </ul></li>
+  <li><a href="#the-error-rule-ode-only-absorption-needs-an-ode-disposition" id="toc-the-error-rule-ode-only-absorption-needs-an-ode-disposition" class="nav-link" data-scroll-target="#the-error-rule-ode-only-absorption-needs-an-ode-disposition">The error rule — ODE-only absorption needs an ODE disposition</a></li>
+  </ul></li>
+  </ul>
+<div class="toc-actions"><ul><li><a href="https://github.com/FeRx-NLME/ferx-core/edit/main/model-file/absorption.qmd" class="toc-action"><i class="bi bi-github"></i>Edit this page</a></li><li><a href="https://github.com/FeRx-NLME/ferx-core/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></nav>
+    </div>
+<!-- main -->
+<main class="content" id="quarto-document-content"><header id="title-block-header" class="quarto-title-block"><nav class="quarto-page-breadcrumbs quarto-title-breadcrumbs d-none d-lg-block" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../model-file/index.html">Model File Reference</a></li><li class="breadcrumb-item"><a href="../model-file/absorption.html">Built-in Absorption Models</a></li></ol></nav></header>
+
+
+
+
+
+<section id="built-in-absorption-models" class="level1">
+<h1>Built-in Absorption Models</h1>
+<blockquote class="blockquote">
+<p><strong>Maturity: beta</strong> — see <a href="../maturity.html">Feature Maturity</a> for what this means.</p>
+</blockquote>
+<p>ferx provides built-in <strong>absorption input-rate functions</strong> for ODE models — a dose-driven appearance rate <code>R_in(tad)</code> that is added into the dosing compartment instead of treating the dose as an instantaneous bolus. They let you write a flexible absorption <em>shape</em> (transit-chain delay, etc.) as a single intrinsic in the <code>[odes]</code> block, rather than hand-coding a chain of physical transit compartments.</p>
+<p>ferx ships the <strong>transit-compartment</strong> model (<code>transit</code>), the <strong>Freijer &amp; Post inverse-Gaussian</strong> model (<code>igd</code>), the <strong>Weibull</strong> model (<code>weibull</code>), and the <strong>zero-order</strong> model (<code>zero_order</code>). Two or more input-rate terms can be combined on one compartment with <strong>pathway fractions</strong> (<code>FR1*igd(...) + FR2*igd(...)</code>) for biphasic / parallel absorption — see <a href="#biphasic-parallel-absorption">Biphasic (parallel) absorption</a>. The dual-pathway first-order (<code>parallel</code>) and zero-order + first-order (<code>mixed</code>) families are built with <code>first_order(ka)</code> — see <a href="#parallel-mixed">Parallel / mixed absorption</a>.</p>
+<section id="transit-compartment-absorption-transitn-mtt" class="level2">
+<h2 class="anchored" data-anchor-id="transit-compartment-absorption-transitn-mtt">Transit-compartment absorption — <code>transit(n, mtt)</code></h2>
+<p>The Savic et al.&nbsp;(2007) transit-compartment model with a <strong>continuous</strong> number of compartments <code>n</code>:</p>
+<p><span class="math display">\[
+R_\text{in}(t_\text{ad}) = F\cdot\text{Dose}\;\cdot\;
+\text{KTR}\;\frac{(\text{KTR}\cdot t_\text{ad})^{n}\,e^{-\text{KTR}\cdot t_\text{ad}}}{\Gamma(n+1)},
+\qquad \text{KTR}=\frac{n+1}{\text{MTT}}
+\]</span></p>
+<p>where <code>tad</code> is time after the dose, <code>MTT</code> is the mean transit time, and <code>KTR</code> is the transit rate constant. The input integrates to the full dose (<code>∫₀^∞ R_in dt = F·Dose</code>), and <code>R_in = 0</code> for <code>tad ≤ 0</code>. With <code>n = 0</code> it reduces to a first-order (Bateman) input with rate <code>1/MTT</code>. Because <code>n</code> is continuous, the absorption <em>shape</em> itself is an estimable parameter.</p>
+<section id="syntax-transit" class="level3">
+<h3 class="anchored" data-anchor-id="syntax-transit">Syntax — transit</h3>
+<p>Add <code>transit(...)</code> to the right-hand side of the depot compartment’s ODE:</p>
+<pre class="text"><code>[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV  * exp(ETA_V)
+  KA  = TVKA
+  MTT = TVMTT          # mean transit time (h)
+  NTR = TVN            # number of transit compartments (continuous)
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = transit(n=NTR, mtt=MTT) - KA*depot
+  d/dt(central) = KA*depot/V - CL/V*central</code></pre>
+<ul>
+<li><strong>Arguments are named</strong>: <code>n=&lt;param&gt;</code> and <code>mtt=&lt;param&gt;</code>. Both must be declared <code>[individual_parameters]</code> (so they fold in theta/eta/covariates and can carry IIV/IOV exactly like any other individual parameter).</li>
+<li><code>transit(...)</code> may appear <strong>once</strong> on a <code>d/dt(...)</code> line and must not be scaled or combined with other input-rate terms — it is the chain input, not an ordinary expression. (It is split out of the RHS at parse time and evaluated by the engine with dose context; the rest of the RHS — here <code>- KA*depot</code> — is the disposition you write normally.)</li>
+</ul>
+</section>
+<section id="dose-routing-the-dose-feeds-the-function-not-a-bolus" class="level3">
+<h3 class="anchored" data-anchor-id="dose-routing-the-dose-feeds-the-function-not-a-bolus">Dose routing — the dose feeds the function, not a bolus</h3>
+<p>A dose into a transit compartment is delivered <strong>entirely</strong> through <code>R_in</code> over time. ferx therefore does <strong>not</strong> also add it as an instantaneous bolus — doing so would double-count the dose. This mirrors NONMEM, where the transit dose compartment carries <code>F1 = 0</code> for the bolus while the analytical/<code>$DES</code> input delivers the mass.</p>
+<ul>
+<li><strong>Bioavailability <code>F</code></strong> scales the delivered mass (<code>Dose = F · AMT</code>), exactly as for ordinary doses — see <a href="../model-file/ode-models.html#bioavailability">Bioavailability</a>. Do <strong>not</strong> multiply <code>transit(...)</code> by <code>F</code> in the RHS.</li>
+<li><strong>Lagtime</strong> shifts <code>tad</code> (the input starts at <code>dose time + lagtime</code>).</li>
+<li><strong>Multiple doses</strong> superpose: <code>R_in</code> is summed per dose. With <strong>IOV</strong> on the transit parameters, an absorption tail that is still appearing when the next occasion begins is evaluated with the <em>current</em> occasion’s <code>n</code>/<code>mtt</code> — exact when <code>II</code> exceeds the absorption window (the usual case) and for IIV-only models, approximate only for overlapping occasions.</li>
+</ul>
+</section>
+<section id="parameter-domains" class="level3">
+<h3 class="anchored" data-anchor-id="parameter-domains">Parameter domains</h3>
+<p>The domain is <code>mtt &gt; 0</code> and <code>n ≥ 0</code>. It is enforced in two places:</p>
+<ul>
+<li><strong>Typical values</strong> (η = 0, per subject, so covariate relationships are included) are validated at fit time. A non-finite or out-of-domain typical value is rejected with <code>E_ABSORPTION_DOMAIN</code> — a clear error, not an opaque <code>NaN</code> fit failure. Constrain the parameter so it stays in range, e.g. <code>MTT = TVMTT * exp(ETA_MTT)</code> keeps <code>MTT &gt; 0</code>.</li>
+<li><strong>Transient mid-fit excursions</strong> are clamped. With an additive parameterisation (<code>MTT = TVMTT + ETA_MTT</code>), the inner EBE search or a finite-difference step can momentarily push <code>mtt ≤ 0</code> / <code>n &lt; 0</code> even though the typical value is in range. There <code>R_in</code> is evaluated at the domain boundary (a finite value) rather than producing a <code>NaN</code> that would poison the objective. Because the converged optimum is interior, this clamp never affects reported estimates — it only keeps the optimiser numerically stable. (A log-normal parameterisation avoids the excursion entirely and is recommended.)</li>
+</ul>
+</section>
+<section id="steady-state-dosing-ss1" class="level3">
+<h3 class="anchored" data-anchor-id="steady-state-dosing-ss1">Steady-state dosing (<code>SS=1</code>)</h3>
+<p>A steady-state dose into a built-in absorption compartment — the density kernels <code>transit()</code>, <code>igd()</code>, <code>weibull()</code>, and <code>first_order()</code> — <strong>is supported</strong> (#719). The single <code>SS=1</code> record stands for an infinite past pulse train, and ferx serves it <em>through</em> the absorption kernel rather than as a bolus: the still-arriving tail of every prior pulse is superposed as a periodic <code>R_in = Σⱼ R_in(tad + j·II)</code>, and the disposition carried in from those prior pulses (the trough) is the periodic steady state of the disposition. For a <strong>linear</strong> disposition (every built-in PK model) that trough is a closed form — <code>u_ss = (I − M)⁻¹·b</code>, with <code>M = e^{A·II}</code> one homogeneous cycle and <code>b</code> one forced cycle — so it costs a handful of ODE solves rather than iterating the pulse train (a nonlinear disposition self-detects and falls back to the iteration). Predictions therefore match an explicit long run-in of the same schedule (to solver precision) and NONMEM’s exact analytic <code>ADVAN2</code> steady state (see <code>tests/ss_absorption_nonmem_anchor.rs</code>). A closed-form <code>pk *_transit</code> / <code>*_ig</code> model with an <code>SS</code> dose reroutes to its ODE twin automatically, exactly as for time-varying covariates and IOV.</p>
+<div class="callout callout-style-default callout-note callout-titled">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Note</span>Saturable (nonlinear) disposition
+</div>
+</div>
+<div class="callout-body-container callout-body">
+<p>A nonlinear disposition (e.g.&nbsp;Michaelis–Menten) declines the linear closed form, so its periodic steady state is found by an <strong>Anderson-accelerated solve</strong> of the same one-cycle fixed point <code>u = P(u)</code> (#867). Across the clinical accumulation range this converges in a bounded handful of cycles even when the elimination half-life far exceeds <code>II</code> and the per-cycle carryover ratio approaches 1 — the regime where the earlier fixed-budget iteration silently stopped short and returned an <code>SS</code> trough biased low — so the trough (and its analytic sensitivities) are correct there. A case with <strong>no periodic steady state</strong> — a saturable drug whose mean input rate meets or exceeds its maximum elimination rate (phenytoin-like dosing above capacity), where the amount grows without bound — is declined and falls to the capped pulse train with a non-convergence warning (surfaced through <code>simulate()</code> / <code>fit()</code>; <code>predict()</code> returns the value without a warnings channel). An extreme genuinely-accumulating model that the bounded solve cannot converge degrades the same way rather than returning a silently-biased trough.</p>
+</div>
+</div>
+<p><code>fit()</code> on an SS-absorption model works and converges, with <strong>analytic</strong> FOCEI sensitivities: the closed-form linear trough carries its <code>∂u_ss/∂(θ,η)</code> through the dual linear solve (#835), and the nonlinear Anderson solve carries them through the same fixed-point recursion plus a dual Newton derivative correction (#867) — not the FD-of-prediction fallback the earlier nonlinear case used. (The Newton correction’s state-Jacobian <code>J_P</code> is itself a finite difference, so the nonlinear-SS gradient carries an <code>O(reltol/eps)</code> term amplified by <code>1/(1−ρ)</code>; it is accurate across the clinical range but loosens as <code>ρ → 1</code>.) Two <code>SS</code> combinations remain <strong>rejected with a clear error</strong>: a <code>zero_order()</code> window (<code>E_ABSORPTION_SS_ZERO_ORDER</code> — a spanning window needs a distinct periodic-window equilibration) and an absorption <strong>lagtime</strong> (<code>E_ABSORPTION_SS_LAG</code> — the SS + lagtime pre-arrival seed is still bolus-only).</p>
+</section>
+<section id="infusion-rate0-into-an-absorption-compartment" class="level3">
+<h3 class="anchored" data-anchor-id="infusion-rate0-into-an-absorption-compartment">Infusion (<code>RATE&gt;0</code>) into an absorption compartment</h3>
+<p>An infusion into a built-in absorption compartment — the density kernels <code>transit()</code>, <code>igd()</code>, <code>weibull()</code>, and <code>first_order()</code> — <strong>is supported</strong> (#719): the dose is a <strong>zero-order source feeding the kernel</strong>. Instead of an instantaneous bolus, its mass is released at a constant rate over the infusion window <code>T</code> (<code>= F·amt/RATE</code>), so <code>R_in</code> becomes the convolution of the kernel with that rectangle,</p>
+<p><span class="math display">\[R_{\text{in,inf}}(t_{ad}) = \frac{F\cdot amt}{T}\,\bigl[G(t_{ad}) - G(t_{ad}-T)\bigr],\]</span></p>
+<p>where <code>G</code> is the kernel’s absorbed-fraction CDF (<code>PreparedInputRate::rate_infused</code>). This is mass-exact (<code>∫R_in_inf = F·amt</code>) and reduces to the bolus <code>R_in</code> as <code>T→0</code>; the dose’s plain <code>+rate</code> injection is suppressed so it is not double-counted. It matches NONMEM’s native <code>ADVAN2</code> zero-order-into-depot behaviour exactly (see <code>tests/infusion_absorption_nonmem_anchor.rs</code>) and an explicit sub-dose train. A closed-form <code>pk *_transit</code> / <code>*_ig</code> model with an infusion reroutes to its ODE twin automatically. Because every kernel’s CDF is a closed form (<code>regularized_gamma_p</code> for transit, the two-<code>Φ</code> IG CDF, elementary for Weibull/first-order), <code>R_in_inf</code> is exact and cheap; fit-time sensitivities use a finite-difference fallback (the dual walk’s <code>+rate</code> suppression is a follow-up), which runs at normal FOCEI speed since an infusion prediction needs no equilibration.</p>
+<p>Two infusion combinations remain <strong>rejected with a clear error</strong>: into a <code>zero_order()</code> window (<code>E_ABSORPTION_RATE_ZERO_ORDER</code> — a window-with-window convolution) and a <strong>steady-state infusion</strong> (<code>SS=1</code> with <code>RATE&gt;0</code>, <code>E_ABSORPTION_SS_INFUSION</code> — a periodic zero-order source feeding the kernel).</p>
+</section>
+<section id="not-yet-supported-phase-0" class="level3">
+<h3 class="anchored" data-anchor-id="not-yet-supported-phase-0">Not yet supported (Phase 0)</h3>
+<p>These combinations are <strong>rejected with a clear error</strong> rather than silently mis-modeled:</p>
+<ul>
+<li><strong>A <code>[diffusion]</code> block (SDE/EKF) together with <code>transit()</code></strong> (<code>E_ABSORPTION_DIFFUSION</code>) — the EKF propagation does not yet carry the input-rate forcing.</li>
+</ul>
+<blockquote class="blockquote">
+<p><strong>Note:</strong> these built-in-absorption guards run at <code>fit()</code> time and via <code>ferx check</code> — where full model–data compatibility is validated — <strong>and on the lower-level <code>predict()</code> / <code>simulate()</code> paths too</strong>: a combination <code>fit()</code> reports as an <code>Err</code> becomes a <strong>panic</strong> there, since those <code>Vec</code>-returning entry points cannot return an error (#588). The data-independent <em>structural</em> rules (e.g.&nbsp;the pathway-fraction partition below) fire even earlier, at parse time, so <em>every</em> entry point rejects a malformed model. Other, non-absorption data checks are still only run by <code>fit()</code> / <code>ferx check</code>, so validate a new model there before relying on <code>predict</code>/<code>simulate</code> output.</p>
+</blockquote>
+</section>
+</section>
+<section id="analytic-closed-form-pk-one_cpt_transitcl-v-n-mtt" class="level2">
+<h2 class="anchored" data-anchor-id="analytic-closed-form-pk-one_cpt_transitcl-v-n-mtt">Analytic closed form — <code>pk one_cpt_transit(cl, v, n, mtt)</code></h2>
+<p>The <code>transit()</code> forcing above runs on the numerical <strong>ODE</strong> path. For a <strong>one-compartment</strong> disposition there is also a fast <strong>analytic</strong> transit model, <code>pk one_cpt_transit(...)</code>, that needs no ODE solver:</p>
+<pre><code>[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)</code></pre>
+<p>It evaluates the exponential-tilting closed form of the Savic transit input absorbed directly into central,</p>
+<pre><code>  C(t) = (F·Dose/V) · M(ke) · exp(−ke·t) · P(N+1, (KTR−ke)·t),   ke = CL/V</code></pre>
+<p>where <code>M</code> is the Gamma moment-generating function and <code>P</code> the regularized lower incomplete gamma. The closed form carries <strong>exact <code>Dual2</code> FOCE/FOCEI sensitivities</strong> <code>∂C/∂{CL, V, N, MTT, F, η}</code> — the same gradients the estimator uses — so a transit fit avoids both the ODE solve and finite differences. <code>N</code> is continuous (the absorption <em>shape</em> is estimable), and <code>F</code> / <code>lagtime</code> map exactly as for <code>one_cpt_oral</code>. With <code>N = 0</code> the model reduces exactly to first-order (Bateman) oral absorption with <code>ka = 1/MTT</code>.</p>
+<p><strong>Domain.</strong> The closed form converges for <code>ke = CL/V</code> below the transit rate <code>KTR = (N+1)/MTT</code> (the absorption-rate-limited regime — the usual case). At or above it (the flip-flop regime) ferx routes the model to its ODE twin automatically — see the flip-flop note below.</p>
+<section id="scope-first-version" class="level3">
+<h3 class="anchored" data-anchor-id="scope-first-version">Scope (first version)</h3>
+<p>This analytic model supports single and multiple <strong>bolus</strong> doses into the depot (<code>CMT=1</code>), bioavailability, lag time, and a <code>central</code> initial amount. A model whose disposition switches mid-profile — a <strong>time-varying covariate</strong> or a <code>TIME</code>-dependent structural parameter — or that carries <strong>inter-occasion variability</strong> (IOV, <code>n_kappa &gt; 0</code>) is transparently rerouted per subject to an exact ODE <code>transit()</code> twin, so it is <strong>supported</strong>, not rejected. (IOV needs cross-occasion dose carryover the closed-form superposition cannot express, so it is served by the twin’s exact integration. The rerouted predictions match the hand-written <code>transit()</code> ODE forcing <strong>bit-for-bit</strong> at non-zero per-occasion κ, including multiple doses (<code>tests/transit_analytic_equivalence.rs</code>); the transit+IOV FOCEI <em>objective</em> itself sits a small, pre-existing ~8 OFV units from NONMEM — an ODE-path IOV marginal offset shared by every ODE+IOV model, orthogonal to this reroute, tracked in <a href="https://github.com/FeRx-NLME/ferx-core/issues/810">#810</a> and guarded (not asserted-equal) by <code>tests/transit_iov_nonmem_anchor.rs</code>.) A <strong>steady-state (<code>SS=1</code>) dose or an infusion (<code>RATE&gt;0</code>) reroutes</strong> to the <code>transit()</code> ODE forcing automatically (#719) — the twin equilibrates SS through the absorption kernel and delivers an infusion as a zero-order source feeding it — exactly as TV-covariate and IOV subjects do. <strong>System resets (EVID=3/4), a non-depot (<code>CMT≠1</code>) dose, and a <code>depot</code> initial amount are still rejected</strong> with an actionable message — use the <code>transit()</code> ODE forcing above for those. The two paths agree to ODE-solver tolerance (<code>tests/transit_analytic_equivalence.rs</code>), so the forcing model is the drop-in choice when you need a feature the closed form does not yet cover.</p>
+</section>
+<section id="the-flip-flop-regime" class="level3">
+<h3 class="anchored" data-anchor-id="the-flip-flop-regime">The flip-flop regime</h3>
+<p>When the disposition rate reaches or exceeds the transit rate <code>KTR = (n+1)/mtt</code> (the <strong>flip-flop</strong> regime — a slow-absorption depot whose absorption rate-limits a faster disposition), the closed form is outside its convergence domain. ferx detects this <em>per evaluation</em> and routes the model to its exact ODE <code>transit()</code> twin, which is valid in both regimes (matched to a NONMEM ADVAN13 transit simulation to ~1e-4), so a flip-flop model fits and predicts correctly instead of returning a zero profile. A <code>W_TRANSIT_FLIP_FLOP</code> note still flags the regime at the typical-value estimates. The reroute needs an ODE twin. A closed-form transit model that carries a <code>lagtime</code> or bioavailability <code>f</code> mapping is desugared to a twin that applies them too (since #735), so it auto-routes just like the plain form. Only a model with a user <code>[odes]</code> / <code>[scaling]</code> / <code>[initial_conditions]</code> block cannot be desugared (no unique twin); rather than silently returning a zero profile that degenerates the objective, such a twin-less model is <strong>rejected with a hard error</strong> (<code>E_TRANSIT_FLIP_FLOP</code>) on <code>fit</code>, <code>predict</code>, <code>simulate</code>, and <code>ferx check</code> — rewrite it as an explicit ODE <code>transit()</code> model, or adjust the MTT / CL starting estimates.</p>
+<div class="callout callout-style-default callout-note callout-titled">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Note</span>When a model loses its ODE twin
+</div>
+</div>
+<div class="callout-body-container callout-body">
+<p>The twin is a real ODE model, built and validated when your model file is parsed. It is therefore subject to the checks that apply only to ODE models — which your analytic model itself is out of scope for. So a construct can be legal in the closed form and illegal in its twin. The likeliest one is an individual parameter named after one of the twin’s own compartments: <code>CENTRAL = ...</code> (or <code>PERIPH</code> for a 2-compartment model) means nothing to the closed form, which has no compartment namespace, but collides with the twin’s state names.</p>
+<p>Such a model still parses and still fits — it simply keeps no ODE fallback, and ferx says so with a <code>W_ABSORPTION_TWIN_DECLINED</code> warning quoting the reason. The consequence is that every feature reached through the twin becomes unavailable: SS and infusion doses, IOV, time-varying covariates, a <code>TIME</code>-dependent parameter, and the flip-flop reroute above are all rejected with an explicit error instead — and that error repeats the reason, so you do not have to go back to the parse warning to find out what broke. Renaming the offending parameter restores the twin.</p>
+<p>(A handful of shapes are recognised by name and declined <strong>without</strong> that warning — a user <code>[odes]</code> / <code>[scaling]</code> / <code>[initial_conditions]</code> block; a parameter whose name shadows a reserved <code>f</code> / <code>lagtime</code> slot it is not the mapping for, or collides with a slot already taken by a disposition role (<code>f=V1</code> alongside <code>v=V</code>); and a parameter that is both a dose attribute and a disposition parameter, as in <code>pk one_cpt_transit(..., v=F, f=F)</code>. Those are deliberate scope limits rather than build failures, so they are silent — but the model is just as twin-less, and the same SS / IOV / time-varying-covariate rejections apply, with no quoted reason since there is no build failure to quote.)</p>
+</div>
+</div>
+<p><a href="https://github.com/FeRx-NLME/ferx-core/blob/main/examples/one_cpt_transit.ferx"><code>examples/one_cpt_transit.ferx</code></a> is a complete self-contained analytic transit model:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb4"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">--release</span> <span class="at">-p</span> ferx-cli <span class="at">--</span> examples/one_cpt_transit.ferx <span class="at">--simulate</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</section>
+</section>
+<section id="two-compartment-analytic-transit-pk-two_cpt_transitcl-v1-q-v2-n-mtt" class="level2">
+<h2 class="anchored" data-anchor-id="two-compartment-analytic-transit-pk-two_cpt_transitcl-v1-q-v2-n-mtt">Two-compartment analytic transit — <code>pk two_cpt_transit(cl, v1, q, v2, n, mtt)</code></h2>
+<p>The same closed form extends to a <strong>two-compartment</strong> disposition:</p>
+<pre><code>[structural_model]
+  pk two_cpt_transit(cl=CL, v1=V1, q=Q, v2=V2, n=NTR, mtt=MTT)</code></pre>
+<p>The 2-cpt central impulse response is the bi-exponential <code>cα·e^{−α·t} + cβ·e^{−β·t}</code> at the disposition macro-rates <code>α ≥ β</code>; convolving each exponential with the Savic transit density gives the two-term tilting form</p>
+<pre><code>  C(t) = (F·Dose/V1) · [ cα·M(α)·e^{−α·t}·P(N+1,(KTR−α)·t)
+                       + cβ·M(β)·e^{−β·t}·P(N+1,(KTR−β)·t) ]</code></pre>
+<p>with <code>cα = (α−k21)/(α−β)</code>, <code>cβ = (k21−β)/(α−β)</code> (<code>cα + cβ = 1</code>). It carries the same <strong>exact <code>Dual2</code> FOCE/FOCEI sensitivities</strong> <code>∂C/∂{CL, V1, Q, V2, N, MTT, F, η}</code>, and with <code>N = 0</code> reduces exactly to 2-cpt first-order oral absorption with <code>ka = 1/MTT</code>. The <strong>domain</strong> (<code>α &lt; KTR</code>, since <code>α ≥ β</code>) and <strong>scope/limits</strong> are identical to <code>one_cpt_transit</code> (bolus doses into the depot, bioavailability, lag time; time-varying covariates, <code>TIME</code>-dependent parameters, and IOV (<code>n_kappa &gt; 0</code>) transparently rerouted to an exact 2-cpt ODE <code>transit()</code> twin; the flip-flop <code>α ≥ KTR</code> regime likewise auto-rerouted to that twin per evaluation — exactly as for <code>one_cpt_transit</code> above; an <code>SS=1</code> dose likewise reroutes to the twin (#719); an infusion likewise reroutes (gap 2), while resets / non-depot (<code>CMT≠1</code>) doses / <code>depot</code>-init are still rejected — use an ODE transit model for those).</p>
+<p><a href="https://github.com/FeRx-NLME/ferx-core/blob/main/examples/two_cpt_transit.ferx"><code>examples/two_cpt_transit.ferx</code></a> is a complete self-contained example:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb7"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">--release</span> <span class="at">-p</span> ferx-cli <span class="at">--</span> examples/two_cpt_transit.ferx <span class="at">--simulate</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</section>
+<section id="analytic-inverse-gaussian-pk-one_cpt_igcl-v-mat-cv2-pk-two_cpt_ig..." class="level2">
+<h2 class="anchored" data-anchor-id="analytic-inverse-gaussian-pk-one_cpt_igcl-v-mat-cv2-pk-two_cpt_ig...">Analytic inverse-Gaussian — <code>pk one_cpt_ig(cl, v, mat, cv2)</code> / <code>pk two_cpt_ig(...)</code></h2>
+<p>The Freijer &amp; Post <code>igd()</code> forcing (below) also has a fast <strong>analytic</strong> closed form, <code>pk one_cpt_ig(...)</code> (and the 2-cpt <code>pk two_cpt_ig(...)</code>), that needs no ODE solver:</p>
+<pre><code>[structural_model]
+  pk one_cpt_ig(cl=CL, v=V, mat=MAT, cv2=CV2)</code></pre>
+<p>It is the exponential-tilting closed form of the same inverse-Gaussian absorption-time density (mean <code>MAT</code>, relative dispersion <code>CV2</code>, shape <code>λ = MAT/CV2</code>) absorbed directly into central,</p>
+<pre><code>  C(t) = (F·Dose/V) · M(ke) · exp(−ke·t) · F_IG(t; μ*, λ),   ke = CL/V</code></pre>
+<p>where <code>M(k) = exp((λ/μ)(1 − √(1 − 2μ²k/λ)))</code> is the IG moment-generating function and <code>F_IG(·; μ*, λ)</code> the IG CDF of the exponentially-tilted density (<code>μ* = μ/√(1 − 2μ²k/λ)</code>), expressed through the normal CDF <code>Φ</code>. The closed form carries <strong>exact <code>Dual2</code> FOCE/FOCEI sensitivities</strong> <code>∂C/∂{CL, V, MAT, CV2, F, η}</code> — the same gradients the estimator uses — so an IG fit avoids both the ODE solve and finite differences. <code>F</code> / <code>lagtime</code> map exactly as for <code>one_cpt_oral</code>. The 2-cpt form <code>pk two_cpt_ig(cl=CL, v1=V1, q=Q, v2=V2, mat=MAT, cv2=CV2)</code> convolves the IG density with the bi-exponential 2-cpt impulse response, carrying <code>∂C/∂{CL, V1, Q, V2, MAT, CV2, F, η}</code>.</p>
+<p><strong>Domain.</strong> The closed form converges for <code>ke = CL/V</code> below the IG abscissa <code>1/(2·MAT·CV²)</code> (the 2-cpt guard is <code>α &lt; 1/(2·MAT·CV²)</code>, since <code>α ≥ β</code>). At or above it (the flip-flop regime) ferx routes the model to its ODE <code>igd()</code> twin automatically.</p>
+<p><strong>Scope / limits.</strong> Identical to the analytic transit models above: single and multiple <strong>bolus</strong> doses into the depot (<code>CMT=1</code>), bioavailability, lag time, and a <code>central</code> initial amount are supported; <strong>time-varying covariates</strong> and <code>TIME</code>-dependent parameters, and <strong>IOV</strong> (<code>n_kappa &gt; 0</code>) are transparently rerouted to an exact ODE <code>igd()</code> twin (so they are supported, not rejected — IOV via the twin’s exact cross-occasion carryover, #719); the <strong>flip-flop</strong> regime (<code>ke ≥ 1/(2·MAT·CV²)</code>) is likewise auto-rerouted to that twin per evaluation, with a <code>W_IG_FLIP_FLOP</code> note at the typical-value estimates. A <strong>steady-state (<code>SS=1</code>) dose or an infusion (<code>RATE&gt;0</code>) reroutes</strong> to the <code>igd()</code> twin too (#719). <strong>System resets (EVID=3/4), a non-depot (<code>CMT≠1</code>) dose, and a <code>depot</code> initial amount are still rejected</strong> with an actionable message — use the <code>igd()</code> ODE forcing below for those. A flip-flop model carrying a <code>lagtime</code>/<code>f</code>/user-<code>[odes]</code> mapping has no ODE twin to route to and is <strong>rejected with a hard error</strong> (<code>E_IG_FLIP_FLOP</code>). The analytic and ODE paths agree to ODE-solver tolerance (<code>tests/ig_analytic_equivalence.rs</code>, 1- and 2-cpt), and the closed form is anchored <strong>directly</strong> against NONMEM <code>$DES</code> on an in-domain IG-truth dataset (<code>tests/ig_analytic_nonmem_anchor.rs</code>: ferx −1303.528 vs NONMEM −1303.639).</p>
+<div class="callout callout-style-default callout-note callout-titled">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Note</span>Not a speed optimisation (unlike analytic transit)
+</div>
+</div>
+<div class="callout-body-container callout-body">
+<p>The analytic <em>transit</em> models are ~28–31× faster than their ODE forcing because the transit chain is comparatively expensive to integrate — the closed form’s win is <em>avoiding that integration</em>. IG has no such win: its <code>igd()</code> ODE is <strong>non-stiff and cheap</strong> (and not even tolerance-sensitive — ~134 ms/eval at default tol, ~157 ms at <code>TOL=9</code>), so the closed form — whose normal-CDF terms go through the exact-derivative incomplete-gamma continued fraction — is actually <strong>~2× slower per objective evaluation</strong> than the <code>igd()</code> forcing on a typical dataset. <code>pk one_cpt_ig</code> is a <strong>consistency / correctness</strong> feature: exact <code>Dual2</code> gradients that don’t depend on ODE-solver tolerance, and a uniform <code>pk</code>-line interface matching the transit models. <strong>If raw fit speed is what you need, prefer the <code>igd()</code> ODE forcing</strong> below.</p>
+</div>
+</div>
+<p><a href="https://github.com/FeRx-NLME/ferx-core/blob/main/examples/one_cpt_ig.ferx"><code>examples/one_cpt_ig.ferx</code></a> is a complete self-contained analytic IG model:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb10"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">--release</span> <span class="at">-p</span> ferx-cli <span class="at">--</span> examples/one_cpt_ig.ferx <span class="at">--simulate</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</section>
+<section id="worked-example-analytic-transit" class="level2">
+<h2 class="anchored" data-anchor-id="worked-example-analytic-transit">Worked example — analytic transit</h2>
+<p><a href="https://github.com/FeRx-NLME/ferx-core/blob/main/examples/transit_savic.ferx"><code>examples/transit_savic.ferx</code></a> is a complete one-compartment oral model with built-in transit absorption. Run it on simulated data:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb11"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">--release</span> <span class="at">-p</span> ferx-cli <span class="at">--</span> examples/transit_savic.ferx <span class="at">--simulate</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>For comparison, <a href="https://github.com/FeRx-NLME/ferx-core/blob/main/examples/transit_2cpt.ferx"><code>examples/transit_2cpt.ferx</code></a> codes the same idea as three <strong>explicit</strong> transit ODE states (fixed integer <code>n = 3</code>); the built-in <code>transit()</code> collapses that to one line with a single continuous <code>n</code>. See <a href="../examples/transit-absorption.html">Transit Absorption</a> for the worked two-compartment example and diagnostics guidance.</p>
+</section>
+<section id="inverse-gaussian-absorption-igdmat-cv2" class="level2">
+<h2 class="anchored" data-anchor-id="inverse-gaussian-absorption-igdmat-cv2">Inverse-Gaussian absorption — <code>igd(mat, cv2)</code></h2>
+<p>The Freijer &amp; Post (1997) convection–dispersion absorption model: the absorption time follows an <strong>inverse-Gaussian distribution</strong>, and the input rate is that density scaled by the dose, fed <strong>straight into the central compartment</strong> (no separate first-order <code>ka</code> step — the IG models the entire absorption delay):</p>
+<p><span class="math display">\[
+R_\text{in}(t_\text{ad}) = \text{Dose}\;\sqrt{\frac{\text{MAT}}{2\pi\,\text{CV2}\,t_\text{ad}^{3}}}\;
+\exp\!\left(-\frac{(t_\text{ad}-\text{MAT})^2}{2\,\text{CV2}\,\text{MAT}\,t_\text{ad}}\right)
+\]</span></p>
+<p>with mean absorption time <code>MAT</code> (the distribution mean μ) and relative dispersion <code>CV2</code> (= Var/mean², equivalently shape λ = MAT/CV2). Like <code>transit</code>, the input integrates to the full dose (<code>∫₀^∞ R_in dt = F·Dose</code>) and <code>R_in = 0</code> for <code>tad ≤ 0</code>; the essential singularity at <code>tad → 0</code> is finite (<code>R_in → 0</code>).</p>
+<section id="syntax-inverse-gaussian" class="level3">
+<h3 class="anchored" data-anchor-id="syntax-inverse-gaussian">Syntax — inverse-Gaussian</h3>
+<p>Add <code>igd(...)</code> to the <strong>central</strong> compartment’s ODE. Because the input rate carries mass (not concentration), write the central state as an <strong>amount</strong> and convert to concentration in <code>[scaling]</code> — the NONMEM <code>A(2)</code> / <code>IPRED = A(2)/V</code> convention:</p>
+<pre class="text"><code>[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV  * exp(ETA_V)
+  MAT = TVMAT          # mean absorption time (h)
+  CV2 = TVCV2          # relative dispersion (Var/mean²)
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = igd(mat=MAT, cv2=CV2) - CL/V*central
+
+[scaling]
+  y = central / V</code></pre>
+<ul>
+<li><strong>Arguments are named</strong>: <code>mat=&lt;param&gt;</code> and <code>cv2=&lt;param&gt;</code>, both declared <code>[individual_parameters]</code> (so they fold in theta/eta/covariates and carry IIV/IOV like any other parameter).</li>
+<li><code>igd(...)</code> is a positively-signed input-rate term: it must not be negated, divided, raised to a power, or parenthesised. It <strong>may</strong> be scaled by a single declared pathway fraction (<code>FR*igd(...)</code>), and more than one input-rate term may feed a compartment — see <a href="#biphasic-parallel-absorption">Biphasic (parallel) absorption</a> below for the Freijer sum-of-two.</li>
+</ul>
+</section>
+<section id="shared-behaviour-inverse-gaussian" class="level3">
+<h3 class="anchored" data-anchor-id="shared-behaviour-inverse-gaussian">Shared behaviour — inverse-Gaussian</h3>
+<p><code>igd</code> reuses the same dose machinery as <code>transit</code>, so the rules are identical:</p>
+<ul>
+<li><strong>Dose routing</strong> — the dose feeds <code>igd</code> over time and is <strong>not</strong> also added as a bolus; the dose record targets the <code>igd</code> compartment (here <code>central</code>). See <a href="#dose-routing-the-dose-feeds-the-function-not-a-bolus">Dose routing</a> above.</li>
+<li><strong>Bioavailability <code>F</code>, lagtime, multiple-dose superposition, and IOV</strong> behave exactly as for <code>transit</code>. Do not multiply <code>igd(...)</code> by <code>F</code>.</li>
+<li><strong>Parameter domains</strong> <code>mat &gt; 0</code>, <code>cv2 &gt; 0</code> are validated at typical values (<code>E_ABSORPTION_DOMAIN</code>) and clamped for transient mid-fit excursions — a log-normal parameterisation avoids excursions and is recommended.</li>
+<li>Steady-state (<code>SS=1</code>) dosing and an infusion (<code>RATE&gt;0</code>) into the input-rate compartment are now <strong>supported</strong> (#719 — SS through a periodic-sum <code>R_in</code>, infusion as a zero-order source feeding the kernel); a <code>[diffusion]</code> block (SDE/EKF) into the input-rate compartment is still rejected with a clear error.</li>
+</ul>
+</section>
+<section id="worked-example-inverse-gaussian" class="level3">
+<h3 class="anchored" data-anchor-id="worked-example-inverse-gaussian">Worked example — inverse-Gaussian</h3>
+<p><a href="https://github.com/FeRx-NLME/ferx-core/blob/main/examples/igd_inverse_gaussian.ferx"><code>examples/igd_inverse_gaussian.ferx</code></a> is a complete one-compartment oral model with inverse-Gaussian absorption. Run it on simulated data:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb13"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">--release</span> <span class="at">-p</span> ferx-cli <span class="at">--</span> examples/igd_inverse_gaussian.ferx <span class="at">--simulate</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</section>
+<section id="biphasic-parallel-absorption" class="level3">
+<h3 class="anchored" data-anchor-id="biphasic-parallel-absorption">Biphasic (parallel) absorption</h3>
+<p>The Freijer &amp; Post <strong>biphasic</strong> form splits the dose across two inverse-Gaussian pathways — typically a fast and a slow one — that feed the same compartment. Write it as a sum of two <code>igd(...)</code> terms, each scaled by a <strong>pathway fraction</strong>:</p>
+<pre class="text"><code>[individual_parameters]
+  FR1   = TVFR1            # fraction through the fast pathway
+  FR2   = 1 - TVFR1        # complementary fraction (FR1 + FR2 = 1)
+  MAT1  = TVMAT1
+  MAT2  = TVMAT2
+  CV2_1 = TVCV2_1
+  CV2_2 = TVCV2_2
+
+[odes]
+  d/dt(central) = FR1*igd(mat=MAT1, cv2=CV2_1) + FR2*igd(mat=MAT2, cv2=CV2_2) - CL/V*central</code></pre>
+<p>Rules for the fraction multiplier:</p>
+<ul>
+<li>It must be a <strong>single declared individual parameter</strong> (<code>FR1*igd(...)</code>), <em>not</em> an expression such as <code>(1-FR)</code>. Declare the complementary fraction explicitly (<code>FR2 = 1 - TVFR1</code>) so each term binds to one parameter. This also lets the fraction carry IIV/covariates and keeps its gradient exact (analytic <code>Dual2</code>).</li>
+<li>The dose is <strong>partitioned</strong>, not duplicated: when more than one input-rate term feeds a compartment, <strong>each</strong> must carry a fraction (and a <em>lone</em> fractioned term is rejected — a single pathway is written bare). This <em>structural</em> rule is checked at <strong>parse time</strong>, so it fires for every entry point. The <em>value</em> checks — each fraction in <code>(0, 1]</code> and the fractions summing to ≈ 1 (<code>E_ABSORPTION_FRACTION</code>) — are evaluated at typical values by <code>fit()</code> / <code>ferx check</code>, and enforced on <code>predict()</code> / <code>simulate()</code> as well (#588). Two pathways together still deliver exactly <code>F·Dose</code> (<code>∫ Σ FRᵢ·R_inᵢ dt = F·Dose</code>).</li>
+<li>The same multiplier works for <code>transit</code>/<code>weibull</code>/<code>first_order</code> terms, and on <code>zero_order(...)</code> as part of a <code>mixed</code> model — see <a href="#parallel-mixed">Parallel / mixed absorption</a> (<a href="https://github.com/FeRx-NLME/ferx-core/issues/505">#505</a>).</li>
+</ul>
+<p><a href="https://github.com/FeRx-NLME/ferx-core/blob/main/examples/biphasic_igd_absorption.ferx"><code>examples/biphasic_igd_absorption.ferx</code></a> is a complete biphasic model; run it on simulated data:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb15"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">--release</span> <span class="at">-p</span> ferx-cli <span class="at">--</span> examples/biphasic_igd_absorption.ferx <span class="at">--simulate</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</section>
+</section>
+<section id="weibull-absorption-weibulltd-beta" class="level2">
+<h2 class="anchored" data-anchor-id="weibull-absorption-weibulltd-beta">Weibull absorption — <code>weibull(td, beta)</code></h2>
+<p>The absorption time follows a <strong>Weibull distribution</strong>, and the input rate is that density scaled by the dose, fed <strong>straight into the central compartment</strong> (no separate first-order <code>ka</code> step — like <code>igd</code>, the Weibull models the entire absorption delay):</p>
+<p><span class="math display">\[
+R_\text{in}(t_\text{ad}) = \text{Dose}\;\frac{\beta}{T_d}\left(\frac{t_\text{ad}}{T_d}\right)^{\beta-1}
+\exp\!\left(-\left(\frac{t_\text{ad}}{T_d}\right)^{\beta}\right)
+\]</span></p>
+<p>with scale <code>td</code> (<span class="math inline">\(T_d\)</span>) and shape <code>beta</code> (<span class="math inline">\(\beta\)</span>) — the appearance-rate form of the cumulative absorbed fraction <span class="math inline">\(1 - \exp(-(t_\text{ad}/T_d)^\beta)\)</span>. The input integrates to the full dose (<code>∫₀^∞ R_in dt = F·Dose</code>) and <code>R_in = 0</code> for <code>tad ≤ 0</code>.</p>
+<p>The <strong>shape <code>beta</code> selects the absorption profile</strong>:</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 22%">
+<col style="width: 25%">
+<col style="width: 52%">
+</colgroup>
+<thead>
+<tr class="header">
+<th><code>beta</code></th>
+<th>Profile</th>
+<th>Edge at <code>tad → 0</code></th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>&gt; 1</code></td>
+<td>Delayed, sigmoidal uptake with an interior peak — the common PK case</td>
+<td><code>R_in → 0</code></td>
+</tr>
+<tr class="even">
+<td><code>= 1</code></td>
+<td>Reduces exactly to first-order absorption with <code>ka = 1/Td</code></td>
+<td>finite (<code>Dose/Td</code>)</td>
+</tr>
+<tr class="odd">
+<td><code>&lt; 1</code></td>
+<td>Fast early uptake tapering off</td>
+<td><code>R_in → ∞</code>, an <strong>integrable</strong> spike</td>
+</tr>
+</tbody>
+</table>
+<p>For <code>beta &lt; 1</code> the rate diverges as <code>tad → 0⁺</code>, but the spike is integrable (the cumulative absorbed amount still goes to 0 as the window shrinks, and <code>∫R_in = F·Dose</code> holds) — the value is <em>not</em> capped, and the adaptive ODE solver resolves it with small steps.</p>
+<section id="syntax-weibull" class="level3">
+<h3 class="anchored" data-anchor-id="syntax-weibull">Syntax — Weibull</h3>
+<p>Add <code>weibull(...)</code> to the <strong>central</strong> compartment’s ODE, writing the state as an <strong>amount</strong> and converting to concentration in <code>[scaling]</code> (the same convention as <code>igd</code>):</p>
+<pre class="text"><code>[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV  * exp(ETA_V)
+  TD   = TVTD          # Weibull scale (h)
+  BETA = TVBETA        # Weibull shape (dimensionless)
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = weibull(td=TD, beta=BETA) - CL/V*central
+
+[scaling]
+  y = central / V</code></pre>
+<ul>
+<li><strong>Arguments are named</strong>: <code>td=&lt;param&gt;</code> and <code>beta=&lt;param&gt;</code>, both declared <code>[individual_parameters]</code>.</li>
+<li>As with <code>transit</code>/<code>igd</code>, <code>weibull(...)</code> is a standalone, positively-signed input-rate term: it may appear <strong>once</strong> per <code>d/dt</code> line and must not be scaled, negated, or parenthesised.</li>
+</ul>
+</section>
+<section id="shared-behaviour-weibull" class="level3">
+<h3 class="anchored" data-anchor-id="shared-behaviour-weibull">Shared behaviour — Weibull</h3>
+<p><code>weibull</code> reuses the same dose machinery as <code>transit</code>/<code>igd</code>:</p>
+<ul>
+<li><strong>Dose routing</strong> — the dose feeds <code>weibull</code> over time and is <strong>not</strong> also added as a bolus.</li>
+<li><strong>Bioavailability <code>F</code>, lagtime, multiple-dose superposition, and IOV</strong> behave exactly as for <code>transit</code>. Do not multiply <code>weibull(...)</code> by <code>F</code>.</li>
+<li><strong>Parameter domains</strong> <code>td &gt; 0</code>, <code>beta &gt; 0</code> are validated at typical values (<code>E_ABSORPTION_DOMAIN</code>) and clamped for transient mid-fit excursions — a log-normal parameterisation avoids excursions and is recommended.</li>
+<li>Steady-state (<code>SS=1</code>) dosing and an infusion (<code>RATE&gt;0</code>) into the input-rate compartment are now <strong>supported</strong> (#719 — SS through a periodic-sum <code>R_in</code>, infusion as a zero-order source feeding the kernel); a <code>[diffusion]</code> block (SDE/EKF) into the input-rate compartment is still rejected with a clear error.</li>
+</ul>
+<p>Unlike <code>transit</code>/<code>igd</code>, the Weibull has <strong>no elementary closed form</strong> with linear disposition, so it is permanently a numerical-ODE model — it always requires an explicit ODE disposition (<code>ode(...)</code> or <code>ode_template</code>) and can never ride an analytical <code>pk</code> (see the error rule below). Because the forcing is evaluated over <code>Dual2</code>, a <code>weibull()</code> model still drives <strong>exact analytic</strong> FOCE/FOCEI/Bayes gradients — this generic input-rate forcing is the <em>only</em> exact-gradient route for Weibull (it has no Phase-3 closed form to fall back on).</p>
+</section>
+<section id="worked-example-weibull" class="level3">
+<h3 class="anchored" data-anchor-id="worked-example-weibull">Worked example — Weibull</h3>
+<p><a href="https://github.com/FeRx-NLME/ferx-core/blob/main/examples/weibull_absorption.ferx"><code>examples/weibull_absorption.ferx</code></a> is a complete one-compartment oral model with Weibull absorption. Run it on simulated data:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb17"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">--release</span> <span class="at">-p</span> ferx-cli <span class="at">--</span> examples/weibull_absorption.ferx <span class="at">--simulate</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</section>
+</section>
+<section id="zero-order-absorption-zero_orderdur" class="level2">
+<h2 class="anchored" data-anchor-id="zero-order-absorption-zero_orderdur">Zero-order absorption — <code>zero_order(dur)</code></h2>
+<p>The dose enters at a <strong>constant rate</strong> over a modeled duration <code>dur</code> — a zero-order input (an infusion whose duration is an estimated parameter):</p>
+<p><span class="math display">\[
+R_\text{in}(t_\text{ad}) = \frac{\text{Dose}}{\text{dur}}\quad\text{for } 0 &lt; t_\text{ad} \le \text{dur},\qquad 0 \text{ otherwise}
+\]</span></p>
+<p>The input integrates to the full dose (<code>∫₀^∞ R_in dt = F·Dose</code>) and <code>R_in = 0</code> for <code>tad ≤ 0</code> and <code>tad &gt; dur</code>. This is the same constant-rate input as a NONMEM modeled-duration infusion (<code>RATE=−2</code> / <code>D1</code>, #324), exposed as an <code>[odes]</code> input-rate function so it can drive any compartment.</p>
+<section id="syntax-zero-order" class="level3">
+<h3 class="anchored" data-anchor-id="syntax-zero-order">Syntax — zero-order</h3>
+<p><code>zero_order</code> takes a <strong>single</strong> named argument <code>dur</code>. Add it to the compartment the dose feeds — central directly, or a depot for a <em>sequential</em> (zero-then-first-order) model:</p>
+<pre class="text"><code>[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV  * exp(ETA_V)
+  DUR = TVDUR          # zero-order input duration (h)
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = zero_order(dur=DUR) - CL/V*central</code></pre>
+<p>For <strong>sequential</strong> absorption — a zero-order fill of a depot followed by first-order <code>ka</code> to central — compose <code>zero_order</code> with a hand-written transfer term (there is no separate <code>sequential</code> keyword):</p>
+<pre class="text"><code>[odes]
+  d/dt(depot)   = zero_order(dur=DUR) - KA*depot
+  d/dt(central) = KA*depot - CL/V*central</code></pre>
+<ul>
+<li>The argument is named: <code>dur=&lt;param&gt;</code>, declared in <code>[individual_parameters]</code>.</li>
+<li>A bare <code>zero_order(...)</code> is a standalone, positively-signed term and must not be scaled (other than by a pathway fraction), negated, or parenthesised. It <strong>may</strong> be weighted by a single declared pathway fraction (<code>FZO*zero_order(...)</code>) as part of a <code>mixed</code> model — see <a href="#parallel-mixed">Parallel / mixed absorption</a> below. At most <strong>one</strong> <code>zero_order(...)</code> term may feed a given compartment.</li>
+</ul>
+</section>
+<section id="shared-behaviour-zero-order" class="level3">
+<h3 class="anchored" data-anchor-id="shared-behaviour-zero-order">Shared behaviour — zero-order</h3>
+<p><code>zero_order</code> reuses the same dose machinery as <code>transit</code>/<code>igd</code>/<code>weibull</code>.</p>
+<section id="dose-handling" class="level4">
+<h4 class="anchored" data-anchor-id="dose-handling">Dose handling</h4>
+<ul>
+<li><strong>Dose routing</strong> — the dose feeds <code>zero_order</code> over its window and is <strong>not</strong> also added as a bolus; the depot/central state stays an amount.</li>
+<li><strong>Bioavailability <code>F</code>, lagtime, multiple-dose superposition, and IOV</strong> behave exactly as for the other input rates (<code>F</code> scales the rate <code>F·Dose/dur</code>; the window stays <code>dur</code>). Do not multiply <code>zero_order(...)</code> by <code>F</code>.</li>
+<li><strong>Parameter domain</strong> <code>dur &gt; 0</code> is validated at typical values (<code>E_ABSORPTION_DOMAIN</code>) and clamped for transient mid-fit excursions.</li>
+<li>Steady-state (<code>SS=1</code>) dosing and an infusion (<code>RATE&gt;0</code>) into the input-rate compartment are now <strong>supported</strong> (#719 — SS through a periodic-sum <code>R_in</code>, infusion as a zero-order source feeding the kernel); a <code>[diffusion]</code> block (SDE/EKF) into the input-rate compartment is still rejected with a clear error.</li>
+</ul>
+</section>
+<section id="the-window-is-bracketed-at-both-edges" class="level4">
+<h4 class="anchored" data-anchor-id="the-window-is-bracketed-at-both-edges">The window is bracketed at both edges</h4>
+<p>The window is handled exactly: ferx breaks the integration timeline at <strong>both</strong> edges — the onset <code>t_dose + lagtime</code> and the cutoff <code>t_dose + lagtime + dur</code> — and delivers the input as a per-segment constant (the way an infusion is injected), so the absorbed mass is exact, not smeared across the step.</p>
+<p>Both edges matter, because a segment receives the constant rate only if it lies <em>entirely</em> inside the window. Bracketing only the cutoff leaves the segment straddling the onset failing that test, which drops the rate for the <strong>whole</strong> window rather than mis-resolving one step. Until <a href="https://github.com/FeRx-NLME/ferx-core/issues/1171">#1171</a> that was the behaviour on the engines serving sdtab, <code>[derived]</code> grid integrals, the joint PK-TTE hazard and <code>simulate()</code> whenever the route carried its own <code>lag=</code>: a model whose only input was a lagged <code>zero_order</code> reported exactly <code>0.0</code> at every observation, while the objective — which segments on a different code path — was correct throughout.</p>
+</section>
+<section id="analytic-sensitivity-across-the-moving-boundary" class="level4">
+<h4 class="anchored" data-anchor-id="analytic-sensitivity-across-the-moving-boundary">Analytic sensitivity across the moving boundary</h4>
+<div class="callout callout-style-default callout-note callout-titled">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Note</span>Sensitivity of <code>zero_order(dur)</code> is analytic (#530)
+</div>
+</div>
+<div class="callout-body-container callout-body">
+<p>All input-rate models — including <code>zero_order(dur)</code> — carry <strong>exact analytic</strong> (<code>Dual2</code>) FOCE/FOCEI gradients. The derivative with respect to <code>dur</code> crosses the moving boundary at <code>tad = dur</code> (a Leibniz boundary term); the analytic provider delivers the window as a per-segment constant (like an infusion) and injects the <strong>rate-off saltation</strong> at the cutoff for that boundary term — the sign-mirror of the estimated-lagtime dose-start saltation. The closely-related <strong>modeled-duration / modeled-rate infusion</strong> (<code>RATE=−2</code> / <code>D{cmt}</code> and <code>RATE=−1</code> / <code>R{cmt}</code>) is analytic by the same mechanism, but on the <em>event-driven</em> walk.</p>
+<p>The two paths differ in what keeps them analytic. A <strong>modeled-duration / -rate dose</strong> stays analytic when composed with an estimated lagtime (the start <em>and</em> end saltations carry the combined <code>δlag + δdur</code> shift), an EVID 3/4 reset, time-varying covariates, multiple doses, <strong>IOV</strong>, or a <strong>steady-state</strong> dose (the dual SS equilibration threads the modeled-window jet into each cycle’s active/quiet split, on both the ODE and closed-form paths, #486) — only a rate-defined <code>RATE=-1</code> infusion under <code>F ≠ 1</code> falls back to finite differences. The <strong><code>zero_order(dur)</code> forcing</strong> is analytic across multiple doses, a mixed (zero- + first-order) pathway, and an EVID 3/4 reset (#486 — the reset case is kind-agnostic, so <code>zero_order</code> inherits it too) on the static walk, and its moving-boundary window is now also carried on the <strong>event-driven</strong> walk, so it stays analytic combined with an estimated <strong>lagtime</strong> or <strong>time-varying covariates</strong> (#486): the constant <code>F·amt·frac/dur</code> window is delivered per segment there, its moving end <code>d.time + lag + dur</code> (and, under lagtime, its moving start) injected as the same rate-on / rate-off saltations used for infusions. Under a covariate that varies <em>across</em> the window end the rate-off uses the general <code>g⁻ − g⁺</code> saltation (the RHS Jacobian jumps across the boundary too, not just the forcing). Because the IOV walk is the same event-driven walk, <strong>every</strong> absorption forcing is analytic under <strong>IOV</strong> too (#486 — the smooth densities <code>igd</code>/<code>transit</code>/<code>weibull</code>/<code>first_order</code>, the moving-window <code>zero_order</code>, and any composition <code>mixed</code>/<code>parallel</code>; each forcing’s rate/window is rebuilt from its dose’s own occasion-seeded PK jet); the only IOV holdouts are <code>weibull</code> + lagtime (β&lt;1 onset divergence) and any forcing combined with a <strong>steady-state</strong> dose (the dual SS equilibration does not spread the forcing over the cycle). See <a href="https://github.com/FeRx-NLME/ferx-core/issues/530">#530</a>.</p>
+<p>The <strong>smooth-density forcings</strong> (<code>igd</code>, <code>transit</code>, <code>weibull</code>, <code>first_order</code>) have a <em>wider</em> analytic scope combined with an EVID 3/4 reset or time-varying covariates: all four stay analytic there (#486) — the reset case turns off a dose’s pre-reset tail exactly like the infusion rule, and the TV-cov case hoists the forcing’s constants fresh per segment on the event-driven walk. Combined with an <strong>estimated lagtime</strong>, <code>igd</code>/<code>transit</code>/<code>first_order</code> are <em>also</em> analytic (#486): the continuous <code>∂R_in/∂lag</code> rides the walk’s dual time-after-dose, and the forcing’s onset at the dose’s lagged arrival is injected as an exact rate-on saltation — the sign-mirror of the <code>zero_order</code> rate-off saltation above, generalised from a constant rate to <code>R_in(0⁺)</code>. <code>weibull</code> + lagtime still falls back to finite differences: its onset can diverge for shape <code>β &lt; 1</code> (an integrable spike, not a finite jump), so no closed-form saltation exists there.</p>
+</div>
+</div>
+</section>
+</section>
+<section id="worked-examples-zero-order-sensitivity" class="level3">
+<h3 class="anchored" data-anchor-id="worked-examples-zero-order-sensitivity">Worked examples — zero-order sensitivity</h3>
+<p><a href="https://github.com/FeRx-NLME/ferx-core/blob/main/examples/zero_order_absorption.ferx"><code>examples/zero_order_absorption.ferx</code></a> is a one-compartment model with zero-order input, and <a href="https://github.com/FeRx-NLME/ferx-core/blob/main/examples/sequential_absorption.ferx"><code>examples/sequential_absorption.ferx</code></a> is the sequential (zero-then-first-order) variant. Run either on simulated data:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb20"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">--release</span> <span class="at">-p</span> ferx-cli <span class="at">--</span> examples/zero_order_absorption.ferx <span class="at">--simulate</span></span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">--release</span> <span class="at">-p</span> ferx-cli <span class="at">--</span> examples/sequential_absorption.ferx <span class="at">--simulate</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</section>
+</section>
+<section id="parallel-mixed" class="level2">
+<h2 class="anchored" data-anchor-id="parallel-mixed">Parallel / mixed absorption — <code>first_order(ka)</code></h2>
+<p>Some drugs are absorbed through <strong>two pathways at once</strong> — e.g.&nbsp;a fast and a slow first-order phase, or an immediate zero-order release plus a first-order tail. ferx expresses these by <strong>composing input-rate functions split by a dose fraction</strong>, with no need for extra compartments or per-compartment bioavailability.</p>
+<p>The building block is <code>first_order(ka)</code> — the classic first-order (Bateman) absorption, exposed as an input-rate function so it can be composed:</p>
+<p><span class="math display">\[
+R_\text{in}(t_\text{ad}) = \text{Dose}\cdot k_a\cdot e^{-k_a\,t_\text{ad}}
+\]</span></p>
+<p>(Standalone first-order absorption still uses the analytical <code>pk one_cpt_oral(...)</code> path; <code>first_order(...)</code> is for the multi-pathway case a single closed form can’t express.)</p>
+<section id="pathway-fractions" class="level3">
+<h3 class="anchored" data-anchor-id="pathway-fractions">Pathway fractions</h3>
+<p>A multi-pathway term is written <code>FR*fn(...)</code>, where <code>FR</code> is a <strong>single declared individual parameter</strong> in <code>(0, 1]</code> (not an expression like <code>(1-FR)</code>). The fractions on a compartment must <strong>partition the dose</strong> — <code>Σ FR ≈ 1</code> — so a two-pathway split declares a complementary parameter:</p>
+<pre class="text"><code>[individual_parameters]
+  FR1 = TVFR1
+  FR2 = 1 - TVFR1      # declared complement; FR1 + FR2 = 1</code></pre>
+<p>This is the same fraction mechanism as biphasic <code>igd</code> (see above): validated at fit-init (<code>E_ABSORPTION_FRACTION</code>) — each <code>0 &lt; FR ≤ 1</code>, the fractions sum to 1, and a lone fractioned term is rejected (a single pathway is written bare).</p>
+</section>
+<section id="parallel-dual-first-order" class="level3">
+<h3 class="anchored" data-anchor-id="parallel-dual-first-order">Parallel — dual first-order</h3>
+<p>Two first-order pathways (a fast <code>KA1</code> and a slow <code>KA2</code>) feeding central:</p>
+<pre class="text"><code>[odes]
+  d/dt(central) = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2) - CL/V*central</code></pre>
+</section>
+<section id="mixed-zero-order-first-order" class="level3">
+<h3 class="anchored" data-anchor-id="mixed-zero-order-first-order">Mixed — zero-order + first-order</h3>
+<p>A zero-order release (<code>FZO</code> of the dose, over <code>DUR</code>) plus a first-order phase (<code>FZO1 = 1 − FZO</code>):</p>
+<pre class="text"><code>[odes]
+  d/dt(central) = FZO1*first_order(ka=KA) + FZO*zero_order(dur=DUR) - CL/V*central</code></pre>
+<p>A pathway fraction on <code>zero_order(...)</code> is supported here (the per-segment zero-order channel carries the fraction). At most <strong>one</strong> <code>zero_order(...)</code> term may feed a compartment — biphasic zero-order is rejected when the model is parsed (so a <code>fit</code>, <code>simulate</code>, or <code>predict</code> run all surface the error the same way).</p>
+</section>
+<section id="per-route-lag" class="level3">
+<h3 class="anchored" data-anchor-id="per-route-lag">Per-route lag — <code>first_order(ka=…, lag=L)</code></h3>
+<p>Every input-rate function takes an optional <code>lag</code> argument giving <strong>that pathway its own absorption delay</strong>, so parallel / mixed routes can switch on at different times — the classic immediate-release + delayed-release (enteric-coated) picture:</p>
+<pre class="text"><code>[individual_parameters]
+  FR1  = TVFR1          # immediate-release fraction (no lag)
+  FR2  = 1 - TVFR1      # delayed-release fraction
+  LAG2 = TVLAG2         # delayed-release onset (h)
+[odes]
+  d/dt(central) = FR1*first_order(ka=KA1)
+                + FR2*first_order(ka=KA2, lag=LAG2) - CL/V*central</code></pre>
+<p>The per-route lag is an offset <strong>on top of</strong> any compartment lagtime (<code>lagtime</code> / <code>ALAG{n}</code>): a bare <code>lagtime</code> shifts <em>every</em> route together, while <code>lag=</code> adds a further delay to <em>one</em> route, so a route’s effective onset is <code>dose time + lag_cmt + lag_route</code>. The argument is universal — <code>zero_order(dur=DUR, lag=L)</code> shifts the whole zero-order window (start, end, and its cutoff break) by <code>L</code>. <code>lag</code> must be a single declared individual parameter (like the <code>FR*</code> fraction), and must be finite; a negative value is warned (<code>W_NEGATIVE_LAGTIME</code>), not clamped. NONMEM <strong>aborts</strong> on a negative absorption lag (<code>PK PARAMETER FOR ABSORPTION LAG IS NEGATIVE</code>, <code>PROGRAM TERMINATED BY OBJ</code>); ferx instead warns and starts the subject’s timeline at the <em>earlier</em> onset, identically on every engine — the predictions equal the closed form from that earlier onset, and the grid nodes between it and the first record are integrated, not left missing (<a href="https://github.com/FeRx-NLME/ferx-core/issues/1189">#1189</a>). <code>lag=0</code> (or no <code>lag</code>) is bit-identical to an unlagged route, so the argument is a strict superset. A <strong>non-finite</strong> lag (<code>NaN</code>/<code>Inf</code>) is a different matter: it is rejected at fit-init with <code>E_DOSE_ATTR_NONFINITE</code>, and one arising mid-fit makes that subject’s predictions <code>NaN</code> rather than aborting the run.</p>
+<p>A plain <strong>infusion</strong> (<code>RATE&gt;0</code>) into a per-route-lagged compartment composes as expected (the whole infused-kernel appearance is delayed by <code>lag</code>). <strong>Steady-state</strong> dosing (<code>SS=1</code>) into a per-route-lagged compartment is <em>rejected</em> (<code>E_ABSORPTION_SS_LAG</code>) — the same limitation as a compartment <code>lagtime</code>/<code>ALAG</code> under <code>SS</code> (<a href="https://github.com/FeRx-NLME/ferx-core/issues/719">#719</a>): the steady-state pre-arrival seed does not yet route the dose through the absorption kernel over a lagged onset.</p>
+</section>
+<section id="mr-closed-form" class="level3">
+<h3 class="anchored" data-anchor-id="mr-closed-form">Closed-form evaluation</h3>
+<p>A parallel / mixed / per-route-lagged model with a <strong>linear disposition</strong> (1- or 2-compartment) whose pathways are all <code>first_order</code>, <code>zero_order</code>, <code>transit</code>, or <code>igd</code> is evaluated <strong>without integrating the ODE</strong>. Because the disposition is linear and time-invariant its inputs superpose, so the observable is a fraction-weighted sum of the <em>single-route</em> closed forms, each shifted by its onset:</p>
+<p><span class="math display">\[
+y(t) = \sum_k \text{FR}_k \cdot C_k\!\left(t - \text{LAG}_k\right)
+\]</span></p>
+<p>ferx recognises the disposition from the compiled model <strong>by its behaviour, not by how it is written</strong>: it probes the RHS for a constant, canonical 1-/2-compartment Jacobian and reads the observable’s scale off the readout, so <code>- CL/V*central</code>, <code>- KE*central</code>, and micro-constant forms are all detected, while a non-linear disposition (e.g.&nbsp;Michaelis–Menten) is <em>declined</em> and integrated instead. The closed form is used for <code>predict()</code>, <code>simulate()</code>, and finite-difference fits; it reduces to the integrated <code>[odes]</code> twin to solver tolerance, and so to the same NONMEM <code>$DES</code> optimum the twin already matches. An <strong>analytic-sensitivity</strong> (default) FOCE/FOCEI fit on the same static subjects also skips the ODE integration for its gradient — the disposition-recovery and superposition formulas are evaluated once over dual numbers instead of over plain doubles, giving the exact <code>∂/∂(θ,η)</code> jet with no separate integration pass.</p>
+<p>It applies only to <strong>static</strong> subjects: a time-varying covariate, IOV, a reset (<code>EVID 3/4</code>), a steady-state or infusion dose, a compartment-indexed <code>F{c}</code>/<code>ALAG{c}</code>, a <code>weibull</code> pathway, or a route in its flip-flop domain routes the subject back to the ODE solver automatically — the result is identical, only slower.</p>
+<div class="callout callout-style-default callout-note callout-titled">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Note</span>Gradients (analytic)
+</div>
+</div>
+<div class="callout-body-container callout-body">
+<p>A per-route <code>lag=</code> on a <strong><code>first_order</code></strong>, <strong><code>zero_order</code></strong>, <strong><code>transit</code></strong>, or <strong><code>igd</code></strong> forcing is fit with <strong>exact analytic</strong> FOCE/FOCEI gradients (<a href="https://github.com/FeRx-NLME/ferx-core/issues/859">#859</a>). The event-driven walk gives each route its own onset event at <code>dose + lag_cmt + lag_route</code>: for the discontinuous kernels (<code>first_order</code>, <code>zero_order</code>) that onset injects a rate-on saltation carrying the combined <code>∂/∂(lag_cmt + lag_route)</code> jet — and a route-lagged <code>zero_order</code> window also carries the same jet on its rate-off at the window end; for the smooth kernels (<code>transit</code>, <code>igd</code>) the onset is continuous (<code>R_in → 0</code>), so the route lag flows through the continuous <code>∂R_in/∂lag_route</code> alone, with a timeline break at the onset. The predicted values are unchanged — only the gradient moves off finite differences.</p>
+<p>Two cases remain on the <strong>finite-difference</strong> fallback: a per-route lag on a <strong><code>weibull</code></strong> forcing (its onset diverges for shape <code>β &lt; 1</code>, so no finite rate-on saltation exists — the exact analogue of the <code>weibull()</code> + compartment-lagtime fallback), and a per-route lag combined with <strong>IOV</strong> (<code>κ</code>). Both stay exact in predictions and simulation; only their FOCEI gradient is FD. Analytic IOV per-route lag is a planned follow-up (<a href="https://github.com/FeRx-NLME/ferx-core/issues/856">#856</a>).</p>
+</div>
+</div>
+</section>
+<section id="sensitivities" class="level3">
+<h3 class="anchored" data-anchor-id="sensitivities">Sensitivities</h3>
+<p>Both <code>parallel</code> (smooth <code>first_order</code> terms) and <code>mixed</code> (a <code>zero_order</code> term alongside a <code>first_order</code> one) keep <strong>exact analytic</strong> (<code>Dual2</code>) FOCE/FOCEI gradients — including the derivatives with respect to the pathway fraction and the zero-order <strong>duration</strong>: the moving-boundary <code>∂/∂dur</code> is carried by the rate-off saltation at the cutoff (<a href="https://github.com/FeRx-NLME/ferx-core/issues/530">#530</a>). Both families are now analytic combined with an EVID 3/4 reset, <strong>time-varying covariates</strong>, <em>or</em> an estimated <strong>lagtime</strong> (#486): <strong><code>parallel</code></strong> (two <code>first_order</code> terms, no <code>zero_order</code>) because every forcing feeding the compartment is a smooth density carried on the event-driven walk; <strong><code>mixed</code></strong> because that walk now also carries the <code>zero_order</code> term’s moving-boundary window (delivered as a per-segment constant, with rate-on / rate-off saltations at its moving start / end). In the <code>mixed</code> case the two forcings switch on together at the lagged arrival, so their onset saltations sum on the shared compartment. The <strong>IOV</strong> path shares this same event-driven walk, so <strong>all</strong> of these families (<code>igd</code>/<code>transit</code>/<code>weibull</code>/<code>first_order</code>, <code>zero_order</code>, <code>mixed</code>, <code>parallel</code>) are analytic under IOV too (#486); the only holdouts are <code>weibull</code> + lagtime and any forcing combined with a <strong>steady-state</strong> dose (the dual SS equilibration does not spread the forcing over the cycle).</p>
+</section>
+<section id="worked-examples-analytic-gradients" class="level3">
+<h3 class="anchored" data-anchor-id="worked-examples-analytic-gradients">Worked examples — analytic gradients</h3>
+<p><a href="https://github.com/FeRx-NLME/ferx-core/blob/main/examples/parallel_absorption.ferx"><code>examples/parallel_absorption.ferx</code></a> and <a href="https://github.com/FeRx-NLME/ferx-core/blob/main/examples/mixed_absorption.ferx"><code>examples/mixed_absorption.ferx</code></a> are self-contained; run either on simulated data:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb25"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb25-1"><a href="#cb25-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">--release</span> <span class="at">-p</span> ferx-cli <span class="at">--</span> examples/parallel_absorption.ferx <span class="at">--simulate</span></span>
+<span id="cb25-2"><a href="#cb25-2" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">--release</span> <span class="at">-p</span> ferx-cli <span class="at">--</span> examples/mixed_absorption.ferx <span class="at">--simulate</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>The value path is anchored by an <strong>in-engine superposition oracle</strong> (<code>tests/parallel_mixed_absorption.rs</code>): by the linearity of the disposition ODE, a dual-pathway curve is <em>exactly</em> the fraction-weighted sum of its single-pathway curves, so <code>parallel ≡ FR1·first_order(ka1) + FR2·first_order(ka2)</code> and <code>mixed ≡ FZO1·first_order(ka) + FZO·zero_order(dur)</code> to numerical precision. Each is <em>also</em> anchored against a licensed NONMEM <code>ADVAN13 $DES</code> run (committed under <code>nonmem_anchor/</code>): ferx’s FOCEI objective at NONMEM’s optimum matches NONMEM’s <code>#OBJV</code> to ~1e-5 for <code>parallel</code> (−688.019) and ~1e-4 for <code>mixed</code> (−698.966), and both recover the data-generating parameters (<code>tests/parallel_mixed_nonmem_anchor.rs</code>).</p>
+<p>The <strong>per-route lag</strong> (<a href="https://github.com/FeRx-NLME/ferx-core/blob/main/examples/per_route_lag_absorption.ferx"><code>examples/per_route_lag_absorption.ferx</code></a>, <code>tests/per_route_lag.rs</code>) is validated two ways. First, <em>reduction to an already-anchored term</em>: a single route with <code>lag=L</code> is, by construction, the same time shift as that route on a compartment <code>lagtime</code>/<code>ALAG</code> — a lag form validated against NONMEM above — so it must predict identically, which the tests pin to 1e-5 (matching the analytic Bateman-with-lag value); by the linearity of the disposition ODE the parallel / mixed cases are then the fraction-weighted sum of these anchored single-route curves. The single-route reduction also cross-validates the two f64 integration paths (a route lag rides the static superposition walk; its compartment-lag twin rides the event-driven walk). Second, a <strong>direct NONMEM <code>ADVAN13 $DES</code> anchor</strong> (an immediate-release + delayed-release model, the DR pathway’s <code>$DES</code> input shifted by a per-route lag; committed under <code>nonmem_anchor/</code>): NONMEM recovers the data-generating per-route lag (<code>LAG2 = 3.074</code> from a truth of 3.0), and ferx’s FOCEI objective at NONMEM’s optimum matches NONMEM’s <code>#OBJV = −882.357</code> to ~1e-6 (<code>tests/per_route_lag_nonmem_anchor.rs</code>).</p>
+</section>
+</section>
+<section id="numerical-note" class="level2">
+<h2 class="anchored" data-anchor-id="numerical-note">Numerical note</h2>
+<p>The transit input is integrated numerically through the ODE solver (the same RHS-wrapper mechanism that injects <code>+rate</code> for infusions). An analytical closed form for continuous-<code>n</code> transit (via the regularized incomplete gamma function) is planned so 1-/2-compartment transit models can stay in the analytical engine — see <code>plans/absorption-models.md</code>.</p>
+</section>
+<section id="verification-against-nonmem" class="level2">
+<h2 class="anchored" data-anchor-id="verification-against-nonmem">Verification against NONMEM</h2>
+<section id="savic-transit-transit" class="level3">
+<h3 class="anchored" data-anchor-id="savic-transit-transit">Savic transit (<code>transit</code>)</h3>
+<p>The Savic transit model was validated against NONMEM (<code>ADVAN13 TOL=9</code>, FOCEI) on a 20-subject / 240-observation single-dose oral dataset simulated from the model (<code>TVCL=5</code>, <code>TVV=50</code>, <code>TVKA=1</code>, <code>TVMTT=1</code>, <code>TVN=3</code>; IIV on CL &amp; V ω²=0.09; proportional SD 0.15). The NONMEM control stream, dataset, and ferx model live in <code>nonmem_anchor/</code> in the repository.</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 12%">
+<col style="width: 8%">
+<col style="width: 9%">
+<col style="width: 25%">
+<col style="width: 44%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Quantity</th>
+<th>Truth</th>
+<th>NONMEM</th>
+<th>ferx (default tols)</th>
+<th>ferx (<code>ode_reltol=ode_abstol=1e-9</code>)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>OFV</td>
+<td>—</td>
+<td>−1077.13</td>
+<td>−1069.07</td>
+<td><strong>−1076.67</strong></td>
+</tr>
+<tr class="even">
+<td>TVCL</td>
+<td>5.0</td>
+<td>5.386</td>
+<td>5.240</td>
+<td>5.453 (+1.2%)</td>
+</tr>
+<tr class="odd">
+<td>TVV</td>
+<td>50.0</td>
+<td>56.169</td>
+<td>52.563</td>
+<td>55.759 (−0.7%)</td>
+</tr>
+<tr class="even">
+<td>TVKA</td>
+<td>1.0</td>
+<td>0.952</td>
+<td>1.018</td>
+<td>0.950 (−0.2%)</td>
+</tr>
+<tr class="odd">
+<td>TVMTT</td>
+<td>1.0</td>
+<td>0.965</td>
+<td>1.007</td>
+<td>0.966 (+0.1%)</td>
+</tr>
+<tr class="even">
+<td>TVN</td>
+<td>3.0</td>
+<td>3.133</td>
+<td>3.033</td>
+<td>3.128 (−0.2%)</td>
+</tr>
+<tr class="odd">
+<td>ω²(CL)</td>
+<td>0.09</td>
+<td>0.0480</td>
+<td>0.0783</td>
+<td>0.0409 (−15%)</td>
+</tr>
+<tr class="even">
+<td>ω²(V)</td>
+<td>0.09</td>
+<td>0.0431</td>
+<td>0.0950</td>
+<td>0.0489 (+14%)</td>
+</tr>
+<tr class="odd">
+<td>σ² (prop)</td>
+<td>0.0225</td>
+<td>0.0255</td>
+<td>0.0253</td>
+<td>0.0254 (−0.4%)</td>
+</tr>
+</tbody>
+</table>
+<p>With NONMEM-equivalent ODE accuracy, the objective function agrees to <strong>0.46 units</strong>, all fixed effects to <strong>~1%</strong>, and the variance components bracket NONMEM within sampling noise (n=20). The looser default tolerances (<code>ode_reltol=1e-4</code>, <code>ode_abstol=1e-6</code>) recover the fixed effects well but inject integration noise into the FOCEI Hessian that inflates the ω² estimates. <strong>For accurate variance-component estimates on transit (and other stiff) ODE models, tighten <code>ode_reltol</code>/<code>ode_abstol</code> toward <code>1e-9</code></strong> via <code>[fit_options]</code>.</p>
+</section>
+<section id="freijer-post-inverse-gaussian-igd" class="level3">
+<h3 class="anchored" data-anchor-id="freijer-post-inverse-gaussian-igd">Freijer &amp; Post inverse-Gaussian (<code>igd</code>)</h3>
+<p><code>igd(mat, cv2)</code> was cross-checked against a NONMEM <code>$DES</code> inverse-Gaussian run (<code>nonmem_anchor/freijer_ig.ctl</code>, <code>ADVAN13 TOL=9</code>, FOCEI) on the same 20-subject / 240-observation dataset (re-keyed to one central compartment so the dose feeds the <code>igd</code> input — likelihood-equivalent to the control’s inert depot + <code>PODO</code>). Because the data were simulated from a transit model, the IG fit is mildly mis-specified, so this is an <strong>implementation</strong> check (NONMEM-igd ≈ ferx-igd on identical data), not a parameter-recovery check.</p>
+<p>On the mis-specified objective the likelihood surface has a long flat ridge: NONMEM’s gradient FOCEI climbs it to <code>MAT≈6.07</code>, whereas ferx’s default derivative-free outer optimiser stalls partway up (full-fit OFV ≈ −881). The optimiser <em>path</em> on a flat surface is not the implementation check — the <strong>objective at the optimum</strong> is. (This stall is the ODE analogue of the fixed-EBE gradient bias that the analytic FOCE/FOCEI gradient work — issues #367 / #381 — removes for <em>analytical</em> models; extending that exact gradient to ODE models via sensitivity equations is the path to converging such fits.) Evaluating ferx’s full FOCEI objective (inner EBEs + Laplace + ODE integration of the <code>igd</code> forcing) at NONMEM’s reported optimum reproduces it:</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 13%">
+<col style="width: 10%">
+<col style="width: 76%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Quantity</th>
+<th>NONMEM</th>
+<th>ferx (at NONMEM’s optimum, <code>ode_reltol=ode_abstol=1e-9</code>)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>FOCEI objective</td>
+<td>−899.38</td>
+<td><strong>−899.39</strong> (Δ 0.02)</td>
+</tr>
+</tbody>
+</table>
+<p>evaluated at <code>CL 5.612</code>, <code>V 33.95</code>, <code>MAT 6.071</code>, <code>CV2 1.868</code>. The 0.02-unit agreement confirms the <code>igd</code> density and its ODE machinery reproduce the NONMEM <code>$DES</code> inverse-Gaussian input (<code>nonmem_anchor/results/freijer_ig.ext</code>; the ferx anchor is <code>tests/igd_nonmem_anchor.rs</code>, gated behind <code>--features slow-tests</code>).</p>
+</section>
+<section id="weibull-weibull" class="level3">
+<h3 class="anchored" data-anchor-id="weibull-weibull">Weibull (<code>weibull</code>)</h3>
+<p>The Weibull NONMEM cross-check uses the same <code>$DES</code> implementation-anchor design as <code>igd</code>: a NONMEM <code>ADVAN13 TOL=9</code> FOCEI control with the Weibull density forcing (<code>nonmem_anchor/weibull_absorption.ctl</code>) and the matching ferx model (<code>nonmem_anchor/weibull_absorption_fit.ferx</code>), run on the shared <code>igd_oral.csv</code> dataset. Because the data were simulated from a transit model, the Weibull fit is mildly mis-specified, so the check is <strong>NONMEM-weibull ≈ ferx-weibull at the shared optimum</strong> (the objective, not the optimiser path), not parameter recovery.</p>
+<p>As for <code>igd</code>, the path-independent implementation check is the <strong>objective at the shared optimum</strong>. Evaluating ferx’s full FOCEI objective (inner EBEs + Laplace + ODE integration of the <code>weibull</code> forcing) at NONMEM’s reported optimum reproduces it (NONMEM <code>ADVAN13 TOL=9</code>, MINIMIZATION SUCCESSFUL):</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Quantity</th>
+<th>NONMEM</th>
+<th>ferx (at NONMEM’s optimum)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>FOCEI objective</td>
+<td>−943.83</td>
+<td><strong>−943.85</strong> (Δ 0.01)</td>
+</tr>
+</tbody>
+</table>
+<p>evaluated at <code>CL 5.398</code>, <code>V 63.02</code>, <code>TD 1.656</code>, <code>BETA 3.479</code>. The 0.01-unit agreement confirms the <code>weibull</code> density and its ODE machinery reproduce the NONMEM <code>$DES</code> Weibull input (<code>nonmem_anchor/results/weibull_absorption.ext</code>; the ferx anchor is <code>tests/weibull_nonmem_anchor.rs</code>, gated behind <code>--features slow-tests</code>). Unlike the stiffer transit/IG forcings, the smooth Weibull density matches to 0.01 even at default ODE tolerances. The forcing is additionally validated in-repo without NONMEM by the absorption-independent <strong>mass-balance invariant</strong> <code>∫A dt = F·Dose/ke</code> (<code>tests/weibull_absorption.rs</code>) and the <strong>analytic-<code>Dual2</code> ≡ central-FD gradient</strong> parity (<code>src/pk/absorption.rs</code>, <code>src/sens/ode_provider.rs</code>).</p>
+<p>A <strong>free fit also converges</strong> under the default <a href="../model-file/fit-options.html"><code>optimizer = auto</code></a>, which selects gradient-based NLopt L-BFGS whenever the exact analytic outer gradient is available — and the <code>weibull()</code> forcing now provides it through the <code>Dual2</code> ODE-sensitivity path. From generic initials the free fit lands essentially <strong>on</strong> the NONMEM optimum; the legacy derivative-free <code>bobyqa</code> (the pre-<code>auto</code> default) is shown for contrast:</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 12%">
+<col style="width: 9%">
+<col style="width: 32%">
+<col style="width: 10%">
+<col style="width: 34%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Quantity</th>
+<th>NONMEM</th>
+<th><code>auto</code> → L-BFGS (default)</th>
+<th>Δ vs NM</th>
+<th>legacy <code>optimizer = bobyqa</code></th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>OFV</td>
+<td>−943.8326</td>
+<td><strong>−943.8326</strong></td>
+<td>~1e-6</td>
+<td>−942.359 (+1.47)</td>
+</tr>
+<tr class="even">
+<td>TVCL</td>
+<td>5.39758</td>
+<td>5.39762</td>
+<td>+0.007 %</td>
+<td>5.4237</td>
+</tr>
+<tr class="odd">
+<td>TVV</td>
+<td>63.0166</td>
+<td>63.0172</td>
+<td>+0.001 %</td>
+<td>63.868</td>
+</tr>
+<tr class="even">
+<td>TVTD</td>
+<td>1.65572</td>
+<td>1.65571</td>
+<td>−0.001 %</td>
+<td>1.6581</td>
+</tr>
+<tr class="odd">
+<td>TVBETA</td>
+<td>3.47905</td>
+<td>3.47907</td>
+<td>+0.001 %</td>
+<td>3.4750</td>
+</tr>
+<tr class="even">
+<td>ω²(CL)</td>
+<td>0.050675</td>
+<td>0.050671</td>
+<td>−0.008 %</td>
+<td>0.0343</td>
+</tr>
+<tr class="odd">
+<td>ω²(V)</td>
+<td>0.042042</td>
+<td>0.042046</td>
+<td>+0.010 %</td>
+<td>0.0493</td>
+</tr>
+<tr class="even">
+<td>σ²(prop)</td>
+<td>0.0479645</td>
+<td>0.047964</td>
+<td>−0.001 %</td>
+<td>0.0490</td>
+</tr>
+</tbody>
+</table>
+<p>Under <code>auto</code> → L-BFGS the free fit matches NONMEM to <strong>~1e-6</strong> in OFV and <strong>&lt; 0.01 %</strong> on every fixed effect and variance component. The legacy <code>bobyqa</code> instead stalls ~1.47 units short: a derivative-free trust-region method cannot resolve the shallow descent direction on the flat mis-specified ridge from function values alone — a pure optimiser artefact, not a density issue (the shared-optimum check above rules that out at 0.01 units). This run doubles as an end-to-end verification that <code>auto</code> plus the analytic <code>Dual2</code> ODE-forcing gradient resolve and converge on a <code>weibull()</code> model.</p>
+</section>
+<section id="zero-order-zero_order" class="level3">
+<h3 class="anchored" data-anchor-id="zero-order-zero_order">Zero-order (<code>zero_order</code>)</h3>
+<p><code>zero_order(dur)</code> is, by definition, a zero-order infusion of duration <code>dur</code> — i.e. NONMEM’s modeled-duration case (<code>RATE=−2</code> → <code>D1</code>, rate <code>AMT/D1</code>) — so it is anchored two ways in <code>tests/zero_order_absorption.rs</code>:</p>
+<ul>
+<li><strong>Directly against NONMEM.</strong> <code>zero_order(dur=5)</code> (CL = 5, V = 50, AMT = 100) reproduces NONMEM’s exact ADVAN1 PRED for the matching <code>RATE=−2</code>/<code>D1</code> run — published in <code>tests/nonmem/modeled_duration.ctl</code> / <code>data/modeled_duration_ref.csv</code> — to within NONMEM’s 3-decimal output rounding (observed max ≈ <code>4·10⁻⁴</code>). This ties the absorption term to a real licensed NONMEM run, not only to an in-engine sibling.</li>
+<li><strong>In-engine against an explicit infusion.</strong> A <code>zero_order(dur=DUR)</code> model fed by a bolus predicts identically (to <code>1e-6</code>, across the in-window ramp, the window-end kink, and the post-window decay) to the <em>same disposition</em> fed by an explicit infusion of duration <code>DUR</code> (rate <code>Dose/DUR</code>) — pinning the new per-segment delivery against the established infusion path.</li>
+</ul>
+<p>The forcing is additionally validated by the absorption-independent <strong>mass-balance invariant</strong> <code>∫A dt = F·Dose/ke</code> and by an end-to-end <strong>duration-recovery fit</strong> (gated behind <code>--features slow-tests</code>). <code>dur</code>’s sensitivity is finite-difference (see the note above), so this model uses the FD gradient path rather than the analytic <code>Dual2</code> route.</p>
+</section>
+</section>
+<section id="generating-the-disposition-ode_template" class="level2">
+<h2 class="anchored" data-anchor-id="generating-the-disposition-ode_template">Generating the disposition — <code>ode_template</code></h2>
+<p>The transit example above hand-writes the disposition ODE (<code>d/dt(central) = KA*depot/V - CL/V*central</code>). For the <strong>standard</strong> PK models you do not have to: <code>ode_template NAME(...)</code> tells ferx to <strong>generate</strong> the standard disposition ODE for a named model — the same closed-form↔︎ODE transcription that <a href="../model-file/structural-model.html"><code>pk NAME(...)</code></a> uses, but written out as states you can then customise. The generated model is fully runnable on its own:</p>
+<pre class="text"><code>[structural_model]
+  ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)</code></pre>
+<p>is exactly equivalent to writing the <code>ode(obs_cmt=central, states=[depot, central, periph])</code> structural line, the three <code>d/dt(...)</code> disposition equations, and <code>[scaling] obs_scale = V1</code> by hand. <code>ode_template NAME(...)</code> takes the <strong>same parameters as the analytical <code>pk NAME(...)</code></strong> for the same model — including <code>ka</code> for the oral routes (the generated <code>central</code> equation needs the depot→central transfer constant, so it is required even when you override the depot below).</p>
+<p>Supported names: <code>one_cpt_iv</code>, <code>one_cpt_oral</code>, <code>two_cpt_iv</code>, <code>two_cpt_oral</code>, <code>three_cpt_iv</code>, <code>three_cpt_oral</code> (the <code>*_compartment_*</code> spellings also work).</p>
+<section id="override-semantics-re-declare-a-compartment-to-replace-it" class="level3">
+<h3 class="anchored" data-anchor-id="override-semantics-re-declare-a-compartment-to-replace-it">Override semantics — re-declare a compartment to replace it</h3>
+<p>To add absorption (or any custom dynamics), re-declare that compartment’s equation in <code>[odes]</code>. A <code>d/dt(X)</code> you write <strong>replaces</strong> the template’s equation for compartment <code>X</code>; every compartment you leave undeclared keeps its generated equation. (There is no <code>+=</code> append form — an override is a full replacement.)</p>
+<pre class="text"><code>[structural_model]
+  ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+
+[odes]
+  # Replaces the generated depot equation with a transit input;
+  # d/dt(central) and d/dt(periph) keep their generated equations.
+  d/dt(depot) = transit(n=NTR, mtt=MTT) - KA*depot</code></pre>
+<p>A <code>d/dt(X)</code> for a compartment the template does not generate is an error (it names the generated states) — write a fully hand-written <code>ode(...)</code> model if you need a different compartment structure.</p>
+</section>
+</section>
+<section id="the-error-rule-ode-only-absorption-needs-an-ode-disposition" class="level2">
+<h2 class="anchored" data-anchor-id="the-error-rule-ode-only-absorption-needs-an-ode-disposition">The error rule — ODE-only absorption needs an ODE disposition</h2>
+<p><code>transit(...)</code>, <code>igd(...)</code>, <code>weibull(...)</code>, and <code>zero_order(...)</code> are currently served by numerical ODE integration, so they can only feed an ODE disposition. Combining one with an analytical <code>pk NAME(...)</code> is a <strong>hard error</strong>, not a silent conversion:</p>
+<pre class="text"><code>[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)   # analytical — closed form
+
+[odes]
+  d/dt(depot) = transit(n=NTR, mtt=MTT) - KA*depot   # ERROR</code></pre>
+<p>ferx rejects this and points you at the fix: replace <code>pk two_cpt_oral(...)</code> with <code>ode_template two_cpt_oral(...)</code> and keep the <code>transit(...)</code> override in <code>[odes]</code>. ferx never silently turns an analytical <code>pk</code> request into an ODE — asking for the closed-form model and getting numerical integration instead would be a surprise.</p>
+<p><code>transit</code> and <code>igd</code> both have closed-form convolutions with 1-/2-compartment disposition (planned via the analytical incomplete-gamma / inverse-Gaussian forms, <code>plans/absorption-models.md</code>), so this restriction is interim for them. <code>zero_order</code> is also closed-form-able (it is a zero-order infusion), so its rule is likewise interim — it ships on the ODE path first and leaves the list when the closed-form acceleration lands. <strong>Weibull has no elementary closed form, so its error rule is permanent</strong> — <code>weibull(...)</code> will always require an explicit ODE disposition.</p>
+
+
+</section>
+</section>
+
+</main> <!-- /main -->
+<script>
+(function () {
+  var HEAD = '<div class="panel-head"><span class="dots"><i></i><i></i><i></i></span><span class="file"><span class="br">[</span>warfarin_pk.ferx<span class="br">]</span></span></div>';
+
+  function apply() {
+    var dark = document.documentElement.getAttribute('data-bs-theme') === 'dark';
+    document.querySelectorAll('div.sourceCode').forEach(function (el) {
+      if (el.parentElement && el.parentElement.closest('.code-panel')) return;
+      if (dark) {
+        if (!el.classList.contains('code-panel')) {
+          el.classList.add('code-panel');
+          el.insertAdjacentHTML('afterbegin', HEAD);
+        }
+      } else {
+        el.classList.remove('code-panel');
+        var h = el.querySelector(':scope > .panel-head');
+        if (h) h.remove();
+      }
+    });
+  }
+
+  if (document.body) apply();
+  document.addEventListener('DOMContentLoaded', apply);
+  new MutationObserver(function (ms) {
+    ms.forEach(function (m) { if (m.attributeName === 'data-bs-theme') apply(); });
+  }).observe(document.documentElement, { attributes: true });
+}());
+</script>
+<script id="quarto-html-after-body" type="application/javascript">
+  window.document.addEventListener("DOMContentLoaded", function (event) {
+    // Ensure there is a toggle, if there isn't float one in the top right
+    if (window.document.querySelector('.quarto-color-scheme-toggle') === null) {
+      const a = window.document.createElement('a');
+      a.classList.add('top-right');
+      a.classList.add('quarto-color-scheme-toggle');
+      a.href = "";
+      a.onclick = function() { try { window.quartoToggleColorScheme(); } catch {} return false; };
+      const i = window.document.createElement("i");
+      i.classList.add('bi');
+      a.appendChild(i);
+      window.document.body.appendChild(a);
+    }
+    setColorSchemeToggle(hasAlternateSentinel())
+    const icon = "";
+    const anchorJS = new window.AnchorJS();
+    anchorJS.options = {
+      placement: 'right',
+      icon: icon
+    };
+    anchorJS.add('.anchored');
+    const isCodeAnnotation = (el) => {
+      for (const clz of el.classList) {
+        if (clz.startsWith('code-annotation-')) {                     
+          return true;
+        }
+      }
+      return false;
+    }
+    const onCopySuccess = function(e) {
+      // button target
+      const button = e.trigger;
+      // don't keep focus
+      button.blur();
+      // flash "checked"
+      button.classList.add('code-copy-button-checked');
+      var currentTitle = button.getAttribute("title");
+      button.setAttribute("title", "Copied!");
+      let tooltip;
+      if (window.bootstrap) {
+        button.setAttribute("data-bs-toggle", "tooltip");
+        button.setAttribute("data-bs-placement", "left");
+        button.setAttribute("data-bs-title", "Copied!");
+        tooltip = new bootstrap.Tooltip(button, 
+          { trigger: "manual", 
+            customClass: "code-copy-button-tooltip",
+            offset: [0, -8]});
+        tooltip.show();    
+      }
+      setTimeout(function() {
+        if (tooltip) {
+          tooltip.hide();
+          button.removeAttribute("data-bs-title");
+          button.removeAttribute("data-bs-toggle");
+          button.removeAttribute("data-bs-placement");
+        }
+        button.setAttribute("title", currentTitle);
+        button.classList.remove('code-copy-button-checked');
+      }, 1000);
+      // clear code selection
+      e.clearSelection();
+    }
+    const getTextToCopy = function(trigger) {
+      const outerScaffold = trigger.parentElement.cloneNode(true);
+      const codeEl = outerScaffold.querySelector('code');
+      for (const childEl of codeEl.children) {
+        if (isCodeAnnotation(childEl)) {
+          childEl.remove();
+        }
+      }
+      return codeEl.innerText;
+    }
+    const clipboard = new window.ClipboardJS('.code-copy-button:not([data-in-quarto-modal])', {
+      text: getTextToCopy
+    });
+    clipboard.on('success', onCopySuccess);
+    if (window.document.getElementById('quarto-embedded-source-code-modal')) {
+      const clipboardModal = new window.ClipboardJS('.code-copy-button[data-in-quarto-modal]', {
+        text: getTextToCopy,
+        container: window.document.getElementById('quarto-embedded-source-code-modal')
+      });
+      clipboardModal.on('success', onCopySuccess);
+    }
+      var localhostRegex = new RegExp(/^(?:http|https):\/\/localhost\:?[0-9]*\//);
+      var mailtoRegex = new RegExp(/^mailto:/);
+        var filterRegex = new RegExp("https:\/\/ferx-nlme\.github\.io\/ferx-core\/");
+      var isInternal = (href) => {
+          return filterRegex.test(href) || localhostRegex.test(href) || mailtoRegex.test(href);
+      }
+      // Inspect non-navigation links and adorn them if external
+     var links = window.document.querySelectorAll('a[href]:not(.nav-link):not(.navbar-brand):not(.toc-action):not(.sidebar-link):not(.sidebar-item-toggle):not(.pagination-link):not(.no-external):not([aria-hidden]):not(.dropdown-item):not(.quarto-navigation-tool):not(.about-link)');
+      for (var i=0; i<links.length; i++) {
+        const link = links[i];
+        if (!isInternal(link.href)) {
+          // undo the damage that might have been done by quarto-nav.js in the case of
+          // links that we want to consider external
+          if (link.dataset.originalHref !== undefined) {
+            link.href = link.dataset.originalHref;
+          }
+        }
+      }
+    function tippyHover(el, contentFn, onTriggerFn, onUntriggerFn) {
+      const config = {
+        allowHTML: true,
+        maxWidth: 500,
+        delay: 100,
+        arrow: false,
+        appendTo: function(el) {
+            return el.parentElement;
+        },
+        interactive: true,
+        interactiveBorder: 10,
+        theme: 'quarto',
+        placement: 'bottom-start',
+      };
+      if (contentFn) {
+        config.content = contentFn;
+      }
+      if (onTriggerFn) {
+        config.onTrigger = onTriggerFn;
+      }
+      if (onUntriggerFn) {
+        config.onUntrigger = onUntriggerFn;
+      }
+      window.tippy(el, config); 
+    }
+    const noterefs = window.document.querySelectorAll('a[role="doc-noteref"]');
+    for (var i=0; i<noterefs.length; i++) {
+      const ref = noterefs[i];
+      tippyHover(ref, function() {
+        // use id or data attribute instead here
+        let href = ref.getAttribute('data-footnote-href') || ref.getAttribute('href');
+        try { href = new URL(href).hash; } catch {}
+        const id = href.replace(/^#\/?/, "");
+        const note = window.document.getElementById(id);
+        if (note) {
+          return note.innerHTML;
+        } else {
+          return "";
+        }
+      });
+    }
+    const xrefs = window.document.querySelectorAll('a.quarto-xref');
+    const processXRef = (id, note) => {
+      // Strip column container classes
+      const stripColumnClz = (el) => {
+        el.classList.remove("page-full", "page-columns");
+        if (el.children) {
+          for (const child of el.children) {
+            stripColumnClz(child);
+          }
+        }
+      }
+      stripColumnClz(note)
+      if (id === null || id.startsWith('sec-')) {
+        // Special case sections, only their first couple elements
+        const container = document.createElement("div");
+        if (note.children && note.children.length > 2) {
+          container.appendChild(note.children[0].cloneNode(true));
+          for (let i = 1; i < note.children.length; i++) {
+            const child = note.children[i];
+            if (child.tagName === "P" && child.innerText === "") {
+              continue;
+            } else {
+              container.appendChild(child.cloneNode(true));
+              break;
+            }
+          }
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(container);
+          }
+          return container.innerHTML
+        } else {
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(note);
+          }
+          return note.innerHTML;
+        }
+      } else {
+        // Remove any anchor links if they are present
+        const anchorLink = note.querySelector('a.anchorjs-link');
+        if (anchorLink) {
+          anchorLink.remove();
+        }
+        if (window.Quarto?.typesetMath) {
+          window.Quarto.typesetMath(note);
+        }
+        if (note.classList.contains("callout")) {
+          return note.outerHTML;
+        } else {
+          return note.innerHTML;
+        }
+      }
+    }
+    for (var i=0; i<xrefs.length; i++) {
+      const xref = xrefs[i];
+      tippyHover(xref, undefined, function(instance) {
+        instance.disable();
+        let url = xref.getAttribute('href');
+        let hash = undefined; 
+        if (url.startsWith('#')) {
+          hash = url;
+        } else {
+          try { hash = new URL(url).hash; } catch {}
+        }
+        if (hash) {
+          const id = hash.replace(/^#\/?/, "");
+          const note = window.document.getElementById(id);
+          if (note !== null) {
+            try {
+              const html = processXRef(id, note.cloneNode(true));
+              instance.setContent(html);
+            } finally {
+              instance.enable();
+              instance.show();
+            }
+          } else {
+            // See if we can fetch this
+            fetch(url.split('#')[0])
+            .then(res => res.text())
+            .then(html => {
+              const parser = new DOMParser();
+              const htmlDoc = parser.parseFromString(html, "text/html");
+              const note = htmlDoc.getElementById(id);
+              if (note !== null) {
+                const html = processXRef(id, note);
+                instance.setContent(html);
+              } 
+            }).finally(() => {
+              instance.enable();
+              instance.show();
+            });
+          }
+        } else {
+          // See if we can fetch a full url (with no hash to target)
+          // This is a special case and we should probably do some content thinning / targeting
+          fetch(url)
+          .then(res => res.text())
+          .then(html => {
+            const parser = new DOMParser();
+            const htmlDoc = parser.parseFromString(html, "text/html");
+            const note = htmlDoc.querySelector('main.content');
+            if (note !== null) {
+              // This should only happen for chapter cross references
+              // (since there is no id in the URL)
+              // remove the first header
+              if (note.children.length > 0 && note.children[0].tagName === "HEADER") {
+                note.children[0].remove();
+              }
+              const html = processXRef(null, note);
+              instance.setContent(html);
+            } 
+          }).finally(() => {
+            instance.enable();
+            instance.show();
+          });
+        }
+      }, function(instance) {
+      });
+    }
+        let selectedAnnoteEl;
+        const selectorForAnnotation = ( cell, annotation) => {
+          let cellAttr = 'data-code-cell="' + cell + '"';
+          let lineAttr = 'data-code-annotation="' +  annotation + '"';
+          const selector = 'span[' + cellAttr + '][' + lineAttr + ']';
+          return selector;
+        }
+        const selectCodeLines = (annoteEl) => {
+          const doc = window.document;
+          const targetCell = annoteEl.getAttribute("data-target-cell");
+          const targetAnnotation = annoteEl.getAttribute("data-target-annotation");
+          const annoteSpan = window.document.querySelector(selectorForAnnotation(targetCell, targetAnnotation));
+          const lines = annoteSpan.getAttribute("data-code-lines").split(",");
+          const lineIds = lines.map((line) => {
+            return targetCell + "-" + line;
+          })
+          let top = null;
+          let height = null;
+          let parent = null;
+          if (lineIds.length > 0) {
+              //compute the position of the single el (top and bottom and make a div)
+              const el = window.document.getElementById(lineIds[0]);
+              top = el.offsetTop;
+              height = el.offsetHeight;
+              parent = el.parentElement.parentElement;
+            if (lineIds.length > 1) {
+              const lastEl = window.document.getElementById(lineIds[lineIds.length - 1]);
+              const bottom = lastEl.offsetTop + lastEl.offsetHeight;
+              height = bottom - top;
+            }
+            if (top !== null && height !== null && parent !== null) {
+              // cook up a div (if necessary) and position it 
+              let div = window.document.getElementById("code-annotation-line-highlight");
+              if (div === null) {
+                div = window.document.createElement("div");
+                div.setAttribute("id", "code-annotation-line-highlight");
+                div.style.position = 'absolute';
+                parent.appendChild(div);
+              }
+              div.style.top = top - 2 + "px";
+              div.style.height = height + 4 + "px";
+              div.style.left = 0;
+              let gutterDiv = window.document.getElementById("code-annotation-line-highlight-gutter");
+              if (gutterDiv === null) {
+                gutterDiv = window.document.createElement("div");
+                gutterDiv.setAttribute("id", "code-annotation-line-highlight-gutter");
+                gutterDiv.style.position = 'absolute';
+                const codeCell = window.document.getElementById(targetCell);
+                const gutter = codeCell.querySelector('.code-annotation-gutter');
+                gutter.appendChild(gutterDiv);
+              }
+              gutterDiv.style.top = top - 2 + "px";
+              gutterDiv.style.height = height + 4 + "px";
+            }
+            selectedAnnoteEl = annoteEl;
+          }
+        };
+        const unselectCodeLines = () => {
+          const elementsIds = ["code-annotation-line-highlight", "code-annotation-line-highlight-gutter"];
+          elementsIds.forEach((elId) => {
+            const div = window.document.getElementById(elId);
+            if (div) {
+              div.remove();
+            }
+          });
+          selectedAnnoteEl = undefined;
+        };
+          // Handle positioning of the toggle
+      window.addEventListener(
+        "resize",
+        throttle(() => {
+          elRect = undefined;
+          if (selectedAnnoteEl) {
+            selectCodeLines(selectedAnnoteEl);
+          }
+        }, 10)
+      );
+      function throttle(fn, ms) {
+      let throttle = false;
+      let timer;
+        return (...args) => {
+          if(!throttle) { // first call gets through
+              fn.apply(this, args);
+              throttle = true;
+          } else { // all the others get throttled
+              if(timer) clearTimeout(timer); // cancel #2
+              timer = setTimeout(() => {
+                fn.apply(this, args);
+                timer = throttle = false;
+              }, ms);
+          }
+        };
+      }
+        // Attach click handler to the DT
+        const annoteDls = window.document.querySelectorAll('dt[data-target-cell]');
+        for (const annoteDlNode of annoteDls) {
+          annoteDlNode.addEventListener('click', (event) => {
+            const clickedEl = event.target;
+            if (clickedEl !== selectedAnnoteEl) {
+              unselectCodeLines();
+              const activeEl = window.document.querySelector('dt[data-target-cell].code-annotation-active');
+              if (activeEl) {
+                activeEl.classList.remove('code-annotation-active');
+              }
+              selectCodeLines(clickedEl);
+              clickedEl.classList.add('code-annotation-active');
+            } else {
+              // Unselect the line
+              unselectCodeLines();
+              clickedEl.classList.remove('code-annotation-active');
+            }
+          });
+        }
+    const findCites = (el) => {
+      const parentEl = el.parentElement;
+      if (parentEl) {
+        const cites = parentEl.dataset.cites;
+        if (cites) {
+          return {
+            el,
+            cites: cites.split(' ')
+          };
+        } else {
+          return findCites(el.parentElement)
+        }
+      } else {
+        return undefined;
+      }
+    };
+    var bibliorefs = window.document.querySelectorAll('a[role="doc-biblioref"]');
+    for (var i=0; i<bibliorefs.length; i++) {
+      const ref = bibliorefs[i];
+      const citeInfo = findCites(ref);
+      if (citeInfo) {
+        tippyHover(citeInfo.el, function() {
+          var popup = window.document.createElement('div');
+          citeInfo.cites.forEach(function(cite) {
+            var citeDiv = window.document.createElement('div');
+            citeDiv.classList.add('hanging-indent');
+            citeDiv.classList.add('csl-entry');
+            var biblioDiv = window.document.getElementById('ref-' + cite);
+            if (biblioDiv) {
+              citeDiv.innerHTML = biblioDiv.innerHTML;
+            }
+            popup.appendChild(citeDiv);
+          });
+          return popup.innerHTML;
+        });
+      }
+    }
+  });
+  </script>
+</div> <!-- /content -->
+<footer class="footer">
+  <div class="nav-footer">
+    <div class="nav-footer-left">
+<p>© 2026 FeRx-NLME · MIT licensed</p>
+</div>   
+    <div class="nav-footer-center">
+      &nbsp;
+    <div class="toc-actions d-sm-block d-md-none"><ul><li><a href="https://github.com/FeRx-NLME/ferx-core/edit/main/model-file/absorption.qmd" class="toc-action"><i class="bi bi-github"></i>Edit this page</a></li><li><a href="https://github.com/FeRx-NLME/ferx-core/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></div>
+    <div class="nav-footer-right">
+<p>Fe · 26 · Rx · 2026</p>
+</div>
+  </div>
+</footer>
+
+
+
+
+</body></html>

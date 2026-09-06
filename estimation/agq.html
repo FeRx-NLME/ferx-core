@@ -1,0 +1,2001 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en"><head>
+
+<meta charset="utf-8">
+<meta name="generator" content="quarto-1.10.18">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+
+
+<title>Adaptive Gaussian Quadrature (AGQ) – ferx-core</title>
+<style>
+/* Default styles provided by pandoc.
+** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+*/
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: 1.5em;}
+div.column{flex: auto;}
+@media screen {
+div.columns{gap: min(4vw, 1.5em);}
+div.column{overflow-x: auto;}
+}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+  width: 0.8em;
+  margin: 0 0.8em 0.2em -1em; /* quarto-specific, see https://github.com/quarto-dev/quarto-cli/issues/4556 */ 
+  vertical-align: middle;
+}
+/* CSS for syntax highlighting */
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+  { counter-reset: source-line 0; }
+pre.numberSource code > span
+  { position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+  { content: counter(source-line);
+    position: relative; left: -1em; text-align: right; vertical-align: baseline;
+    border: none; display: inline-block;
+    -webkit-touch-callout: none; -webkit-user-select: none;
+    -khtml-user-select: none; -moz-user-select: none;
+    -ms-user-select: none; user-select: none;
+    padding: 0 4px; width: 4em;
+  }
+pre.numberSource { margin-left: 3em;  padding-left: 4px; }
+div.sourceCode
+  {   }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+</style>
+
+
+<script src="../site_libs/quarto-nav/quarto-nav.js"></script>
+<script src="../site_libs/quarto-nav/headroom.min.js"></script>
+<script src="../site_libs/clipboard/clipboard.min.js"></script>
+<script src="../site_libs/quarto-search/autocomplete.umd.js"></script>
+<script src="../site_libs/quarto-search/fuse.min.js"></script>
+<script src="../site_libs/quarto-search/quarto-search.js"></script>
+<meta name="quarto:offset" content="../">
+<link href="../assets/ferx-favicon.svg" rel="icon" type="image/svg+xml">
+<script src="../site_libs/quarto-html/quarto.js" type="module"></script>
+<script src="../site_libs/quarto-html/tabsets/tabsets.js" type="module"></script>
+<script src="../site_libs/quarto-html/popper.min.js"></script>
+<script src="../site_libs/quarto-html/tippy.umd.min.js"></script>
+<script src="../site_libs/quarto-html/anchor.min.js"></script>
+<link href="../site_libs/quarto-html/tippy.css" rel="stylesheet">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-51776f957f81c5a6b38322b65a6a6987.css" rel="stylesheet" class="quarto-color-scheme" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-dark-31632d092df9090a2ed68f79c078059d.css" rel="stylesheet" class="quarto-color-scheme quarto-color-alternate" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-51776f957f81c5a6b38322b65a6a6987.css" rel="stylesheet" class="quarto-color-scheme-extra" id="quarto-text-highlighting-styles">
+<script src="../site_libs/bootstrap/bootstrap.min.js"></script>
+<link href="../site_libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
+<link href="../site_libs/bootstrap/bootstrap-f5ed25dbf962e4596f9f4df24f2ade0d.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme" id="quarto-bootstrap" data-mode="light">
+<link href="../site_libs/bootstrap/bootstrap-dark-8a64b8d4793081e9872239f556c8075c.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme quarto-color-alternate" id="quarto-bootstrap" data-mode="dark">
+<link href="../site_libs/bootstrap/bootstrap-f5ed25dbf962e4596f9f4df24f2ade0d.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme-extra" id="quarto-bootstrap" data-mode="light">
+<script id="quarto-search-options" type="application/json">{
+  "location": "navbar",
+  "copy-button": false,
+  "collapse-after": 3,
+  "panel-placement": "end",
+  "type": "overlay",
+  "limit": 50,
+  "keyboard-shortcut": [
+    "f",
+    "/",
+    "s"
+  ],
+  "show-item-context": false,
+  "language": {
+    "search-no-results-text": "No results",
+    "search-matching-documents-text": "matching documents",
+    "search-copy-link-title": "Copy link to search",
+    "search-hide-matches-text": "Hide additional matches",
+    "search-more-match-text": "more match in this document",
+    "search-more-matches-text": "more matches in this document",
+    "search-clear-button-title": "Clear",
+    "search-text-placeholder": "",
+    "search-detached-cancel-button-title": "Cancel",
+    "search-submit-button-title": "Submit",
+    "search-label": "Search"
+  }
+}</script>
+
+  <script src="https://cdnjs.cloudflare.com/polyfill/v3/polyfill.min.js?features=es6"></script>
+  <script defer="" src="https://cdn.jsdelivr.net/npm/mathjax@4/tex-chtml.js" type="text/javascript"></script>
+
+<script type="text/javascript">
+const typesetMath = (el) => {
+  if (window.MathJax) {
+    // MathJax Typeset
+    window.MathJax.typeset([el]);
+  } else if (window.katex) {
+    // KaTeX Render
+    var mathElements = el.getElementsByClassName("math");
+    var macros = [];
+    for (var i = 0; i < mathElements.length; i++) {
+      var texText = mathElements[i].firstChild;
+      if (mathElements[i].tagName == "SPAN" && texText && texText.data) {
+        window.katex.render(texText.data, mathElements[i], {
+          displayMode: mathElements[i].classList.contains('display'),
+          throwOnError: false,
+          macros: macros,
+          fleqn: false
+        });
+      }
+    }
+  }
+}
+window.Quarto = {
+  typesetMath
+};
+</script>
+
+<link rel="stylesheet" href="../styles.css">
+<meta property="og:title" content="Adaptive Gaussian Quadrature (AGQ)">
+<meta property="og:description" content="Open-source nonlinear mixed-effects modeling for population PK/PD and pharmacometrics">
+<meta property="og:site_name" content="ferx-core">
+<meta property="og:locale" content="en_US">
+<meta name="twitter:title" content="Adaptive Gaussian Quadrature (AGQ)">
+<meta name="twitter:description" content="Open-source nonlinear mixed-effects modeling for population PK/PD and pharmacometrics">
+<meta name="twitter:card" content="summary">
+<link rel="canonical" href="https://ferx-nlme.github.io/ferx-core/estimation/agq.html">
+</head>
+
+<body class="nav-sidebar floating nav-fixed quarto-light"><script id="quarto-html-before-body" type="application/javascript">
+    const toggleBodyColorMode = (bsSheetEl) => {
+      const mode = bsSheetEl.getAttribute("data-mode");
+      const bodyEl = window.document.querySelector("body");
+      if (mode === "dark") {
+        bodyEl.classList.add("quarto-dark");
+        bodyEl.classList.remove("quarto-light");
+      } else {
+        bodyEl.classList.add("quarto-light");
+        bodyEl.classList.remove("quarto-dark");
+      }
+    }
+    const toggleBodyColorPrimary = () => {
+      const bsSheetEl = window.document.querySelector("link#quarto-bootstrap:not([rel=disabled-stylesheet])");
+      if (bsSheetEl) {
+        toggleBodyColorMode(bsSheetEl);
+      }
+    }
+    const setColorSchemeToggle = (alternate) => {
+      const toggles = window.document.querySelectorAll('.quarto-color-scheme-toggle');
+      for (let i=0; i < toggles.length; i++) {
+        const toggle = toggles[i];
+        if (toggle) {
+          if (alternate) {
+            toggle.classList.add("alternate");
+          } else {
+            toggle.classList.remove("alternate");
+          }
+        }
+      }
+    };
+    const toggleColorMode = (alternate) => {
+      // Switch the stylesheets
+      const primaryStylesheets = window.document.querySelectorAll('link.quarto-color-scheme:not(.quarto-color-alternate)');
+      const alternateStylesheets = window.document.querySelectorAll('link.quarto-color-scheme.quarto-color-alternate');
+      manageTransitions('#quarto-margin-sidebar .nav-link', false);
+      if (alternate) {
+        // note: dark is layered on light, we don't disable primary!
+        enableStylesheet(alternateStylesheets);
+        for (const sheetNode of alternateStylesheets) {
+          if (sheetNode.id === "quarto-bootstrap") {
+            toggleBodyColorMode(sheetNode);
+          }
+        }
+      } else {
+        disableStylesheet(alternateStylesheets);
+        enableStylesheet(primaryStylesheets)
+        toggleBodyColorPrimary();
+      }
+      manageTransitions('#quarto-margin-sidebar .nav-link', true);
+      // Switch the toggles
+      setColorSchemeToggle(alternate)
+      // Hack to workaround the fact that safari doesn't
+      // properly recolor the scrollbar when toggling (#1455)
+      if (navigator.userAgent.indexOf('Safari') > 0 && navigator.userAgent.indexOf('Chrome') == -1) {
+        manageTransitions("body", false);
+        window.scrollTo(0, 1);
+        setTimeout(() => {
+          window.scrollTo(0, 0);
+          manageTransitions("body", true);
+        }, 40);
+      }
+    }
+    const disableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        stylesheet.rel = 'disabled-stylesheet';
+      }
+    }
+    const enableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        if(stylesheet.rel !== 'stylesheet') { // for Chrome, which will still FOUC without this check
+          stylesheet.rel = 'stylesheet';
+        }
+      }
+    }
+    const manageTransitions = (selector, allowTransitions) => {
+      const els = window.document.querySelectorAll(selector);
+      for (let i=0; i < els.length; i++) {
+        const el = els[i];
+        if (allowTransitions) {
+          el.classList.remove('notransition');
+        } else {
+          el.classList.add('notransition');
+        }
+      }
+    }
+    const isFileUrl = () => {
+      return window.location.protocol === 'file:';
+    }
+    const hasAlternateSentinel = () => {
+      let styleSentinel = getColorSchemeSentinel();
+      if (styleSentinel !== null) {
+        return styleSentinel === "alternate";
+      } else {
+        return false;
+      }
+    }
+    const setStyleSentinel = (alternate) => {
+      const value = alternate ? "alternate" : "default";
+      if (!isFileUrl()) {
+        window.localStorage.setItem("quarto-color-scheme", value);
+      } else {
+        localAlternateSentinel = value;
+      }
+    }
+    const getColorSchemeSentinel = () => {
+      if (!isFileUrl()) {
+        const storageValue = window.localStorage.getItem("quarto-color-scheme");
+        return storageValue != null ? storageValue : localAlternateSentinel;
+      } else {
+        return localAlternateSentinel;
+      }
+    }
+    const toggleGiscusIfUsed = (isAlternate, darkModeDefault) => {
+      const baseTheme = document.querySelector('#giscus-base-theme')?.value ?? 'light';
+      const alternateTheme = document.querySelector('#giscus-alt-theme')?.value ?? 'dark';
+      let newTheme = '';
+      if(authorPrefersDark) {
+        newTheme = isAlternate ? baseTheme : alternateTheme;
+      } else {
+        newTheme = isAlternate ? alternateTheme : baseTheme;
+      }
+      const changeGiscusTheme = () => {
+        // From: https://github.com/giscus/giscus/issues/336
+        const sendMessage = (message) => {
+          const iframe = document.querySelector('iframe.giscus-frame');
+          if (!iframe) return;
+          iframe.contentWindow.postMessage({ giscus: message }, 'https://giscus.app');
+        }
+        sendMessage({
+          setConfig: {
+            theme: newTheme
+          }
+        });
+      }
+      const isGiscussLoaded = window.document.querySelector('iframe.giscus-frame') !== null;
+      if (isGiscussLoaded) {
+        changeGiscusTheme();
+      }
+    };
+    const authorPrefersDark = false;
+    const darkModeDefault = authorPrefersDark;
+      document.querySelector('link#quarto-text-highlighting-styles.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+      document.querySelector('link#quarto-bootstrap.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+    let localAlternateSentinel = darkModeDefault ? 'alternate' : 'default';
+    // Dark / light mode switch
+    window.quartoToggleColorScheme = () => {
+      // Read the current dark / light value
+      let toAlternate = !hasAlternateSentinel();
+      toggleColorMode(toAlternate);
+      setStyleSentinel(toAlternate);
+      toggleGiscusIfUsed(toAlternate, darkModeDefault);
+      window.dispatchEvent(new Event('resize'));
+    };
+    // Switch to dark mode if need be
+    if (hasAlternateSentinel()) {
+      toggleColorMode(true);
+    } else {
+      toggleColorMode(false);
+    }
+  </script>
+
+<div id="quarto-search-results"></div>
+  <header id="quarto-header" class="headroom fixed-top">
+    <nav class="navbar navbar-expand-lg " data-bs-theme="dark">
+      <div class="navbar-container container-fluid">
+      <div class="navbar-brand-container mx-auto">
+    <a href="../index.html" class="navbar-brand navbar-brand-logo">
+    <img src="../assets/ferx-dsl-brackets.svg" alt="ferx" class="navbar-logo light-content">
+    <img src="../assets/ferx-dsl-brackets.svg" alt="ferx" class="navbar-logo dark-content">
+    </a>
+    <a class="navbar-brand" href="../index.html">
+    <span class="navbar-title">ferx-core</span>
+    </a>
+  </div>
+            <div id="quarto-search" class="" title="Search"></div>
+          <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarCollapse" aria-controls="navbarCollapse" role="menu" aria-expanded="false" aria-label="Toggle navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+  <span class="navbar-toggler-icon"></span>
+</button>
+          <div class="collapse navbar-collapse" id="navbarCollapse">
+            <ul class="navbar-nav navbar-nav-scroll me-auto">
+  <li class="nav-item">
+    <a class="nav-link active" href="../getting-started.html" aria-current="page"> 
+<span class="menu-text">Get started</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/features.html"> 
+<span class="menu-text">Features</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/changelog.html"> 
+<span class="menu-text">Changelog</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/roadmap.html"> 
+<span class="menu-text">Roadmap</span></a>
+  </li>  
+</ul>
+            <ul class="navbar-nav navbar-nav-scroll ms-auto">
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/ferx-core/"> 
+<span class="menu-text">ferx-core</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/ferx-book/"> 
+<span class="menu-text">ferx-r</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/reference/"> 
+<span class="menu-text">Reference</span></a>
+  </li>  
+  <li class="nav-item compact">
+    <a class="nav-link" href="https://github.com/FeRx-NLME"> <i class="bi bi-github" role="img" aria-label="GitHub">
+</i> 
+<span class="menu-text"></span></a>
+  </li>  
+</ul>
+          </div> <!-- /navcollapse -->
+            <div class="quarto-navbar-tools">
+  <a href="" class="quarto-color-scheme-toggle quarto-navigation-tool  px-1" onclick="window.quartoToggleColorScheme(); return false;" title="Toggle dark mode"><i class="bi"></i></a>
+</div>
+      </div> <!-- /container-fluid -->
+    </nav>
+  <nav class="quarto-secondary-nav">
+    <div class="container-fluid d-flex">
+      <button type="button" class="quarto-btn-toggle btn" data-bs-toggle="collapse" role="button" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+        <i class="bi bi-layout-text-sidebar-reverse"></i>
+      </button>
+        <nav class="quarto-page-breadcrumbs" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../estimation/index.html">Estimation Methods</a></li><li class="breadcrumb-item"><a href="../estimation/agq.html">AGQ — Adaptive Gaussian Quadrature</a></li></ol></nav>
+        <a class="flex-grow-1" role="navigation" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">      
+        </a>
+      <button type="button" class="btn quarto-search-button" aria-label="Search" onclick="window.quartoOpenSearch();">
+        <i class="bi bi-search"></i>
+      </button>
+    </div>
+  </nav>
+</header>
+<!-- content -->
+<div id="quarto-content" class="quarto-container page-columns page-rows-contents page-layout-article page-navbar">
+<!-- sidebar -->
+  <nav id="quarto-sidebar" class="sidebar collapse collapse-horizontal quarto-sidebar-collapse-item sidebar-navigation floating overflow-auto">
+    <div class="pt-lg-2 mt-2 text-left sidebar-header">
+      <a href="../index.html" class="sidebar-logo-link">
+      <img src="../assets/ferx-favicon.svg" alt="" class="sidebar-logo light-content py-0 d-lg-inline d-none">
+      <img src="../assets/ferx-favicon.svg" alt="" class="sidebar-logo dark-content py-0 d-lg-inline d-none">
+      </a>
+      </div>
+        <div class="mt-2 flex-shrink-0 align-items-center">
+        <div class="sidebar-search">
+        <div id="quarto-search" class="" title="Search"></div>
+        </div>
+        </div>
+    <div class="sidebar-menu-container"> 
+    <ul class="list-unstyled mt-1">
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Introduction</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../maturity.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Feature Maturity</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../getting-started.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Getting Started</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../installation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Installation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../quick-start.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Quick Start</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../model-file/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Model File Reference</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/parameters.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Parameters</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/iov.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Inter-Occasion Variability (IOV)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/individual-parameters.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Individual Parameters</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariates.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariates</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariate-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/structural-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Structural Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/lagtime.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Lagtime</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/steady-state.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Steady-State Doses (SS=1)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/error-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Error Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/bloq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">LOQ-Censored Observations</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/ode-models.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/absorption.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Built-in Absorption Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/scaling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Scaling</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/initial-conditions.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Initial Conditions</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/diffusion.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Stochastic Differential Equations (SDE / Diffusion)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/neural-networks.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Neural Networks</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariate-nn.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><code>[covariate_nn]</code> — Deep Compartment Models (DCM)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/data.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/data-selection.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Selection</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/derived.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Derived Columns (<code>[derived]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Output Columns (<code>[output]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/fit-options.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Fit Options</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/simulation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Simulation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/adaptive-dosing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Adaptive (Feedback) Dosing</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/event-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Time-to-Event Endpoints (<code>[event_model]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/categorical.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Categorical endpoints — <code>[binary_model]</code></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/markov-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Markov models ([markov_model])</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../estimation/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Estimation Methods</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/foce.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FOCE / FOCEI</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/agq.html" class="sidebar-item-text sidebar-link active">
+ <span class="menu-text">AGQ — Adaptive Gaussian Quadrature</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/gauss-newton.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Gauss-Newton (BHHH)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/saem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">SAEM</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/sir.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Sampling Importance Resampling (SIR)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/importance-sampling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Importance Sampling (IMP)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/frem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FREM (Full Random Effects Model)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/impmap.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">IMPMAP — Importance Sampling assisted by Mode A Posteriori</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/bayes.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Bayesian estimation (MCMC)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/vi.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Variational Inference</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/parameterization.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Packed Parameter Space</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/optimizers.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Outer Optimizers</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/tte.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Time-to-Event (TTE) Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/categorical.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Categorical endpoints (binary / logistic)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/ctmm.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Continuous-time Markov models (CTMM)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/mixture.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Mixture Models</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false">
+ <span class="menu-text">Tools</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/bootstrap.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Bootstrap</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/gam-screening.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">GAM covariate screening</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/search.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Search configuration</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/covsearch.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate search</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/modelsearch.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Structural model search</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../data-format.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Format</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../cli.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">CLI Reference</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Output Files</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../warnings.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Warnings</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../file-formats/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">File Formats</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../file-formats/fitrx.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">The <code>.fitrx</code> Fit Bundle</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../file-formats/check-report.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Check Report (<code>ferx check --json</code>)</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../examples/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Examples</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/one-cpt-oral.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">One-Compartment Oral (Warfarin)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/two-cpt-iv.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Two-Compartment IV Bolus</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/covariates.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/ode-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Model (Michaelis-Menten)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/bloq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">BLOQ (M3 method)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/iov.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Inter-Occasion Variability (IOV)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/iov-saem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">IOV with SAEM</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/multiple-dosing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Multiple Dosing (ADDL Column)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/steady-state.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Steady-State Dosing (SS Column)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/scaling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Unit Scaling (<code>[scaling]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/derived-output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Derived Columns and Output</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/data-selection.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Selection (IGNORE / ACCEPT)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/ode-lagtime.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Model with Absorption Lag Time</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/transit-absorption.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Transit Absorption (Two-Compartment)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/sde.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Stochastic Differential Equations (SDE)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/frem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FREM (Covariate Analysis)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/multistart.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Multi-Start: Michaelis-Menten Elimination</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../api/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Rust API</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/types.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Core Types</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/fitting.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Fitting Functions</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/simulation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Simulation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/parsing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Parsing</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/model-editing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Model editing</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../faq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FAQ</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../development/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Development</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/contributing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Contributing to FeRx development</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/sdlc.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Development Lifecycle (SDLC)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/docs-lint.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Docs linter</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+    </ul>
+    </div>
+</nav>
+<div id="quarto-sidebar-glass" class="quarto-sidebar-collapse-item" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item"></div>
+<!-- margin-sidebar -->
+    <div id="quarto-margin-sidebar" class="sidebar margin-sidebar">
+        <nav id="TOC" role="doc-toc" class="toc-active">
+    <h2 id="toc-title">On this page</h2>
+   
+  <ul>
+  <li><a href="#agq-adaptive-gaussian-quadrature" id="toc-agq-adaptive-gaussian-quadrature" class="nav-link active" data-scroll-target="#agq-adaptive-gaussian-quadrature">AGQ — Adaptive Gaussian Quadrature</a>
+  <ul>
+  <li><a href="#usage" id="toc-usage" class="nav-link" data-scroll-target="#usage">Usage</a></li>
+  <li><a href="#cost-and-the-dimensionality-limit" id="toc-cost-and-the-dimensionality-limit" class="nav-link" data-scroll-target="#cost-and-the-dimensionality-limit">Cost, and the dimensionality limit</a></li>
+  <li><a href="#n_agq-1-is-exactly-laplace-and-has-its-own-method-name" id="toc-n_agq-1-is-exactly-laplace-and-has-its-own-method-name" class="nav-link" data-scroll-target="#n_agq-1-is-exactly-laplace-and-has-its-own-method-name"><code>n_agq = 1</code> is exactly Laplace — and has its own method name</a></li>
+  <li><a href="#validation" id="toc-validation" class="nav-link" data-scroll-target="#validation">Validation</a>
+  <ul class="collapse">
+  <li><a href="#against-nonmem" id="toc-against-nonmem" class="nav-link" data-scroll-target="#against-nonmem">Against NONMEM</a></li>
+  <li><a href="#speed" id="toc-speed" class="nav-link" data-scroll-target="#speed">Speed</a></li>
+  <li><a href="#against-ferxs-importance-sampler" id="toc-against-ferxs-importance-sampler" class="nav-link" data-scroll-target="#against-ferxs-importance-sampler">Against ferx’s importance sampler</a></li>
+  <li><a href="#converged-fit-vs-focei" id="toc-converged-fit-vs-focei" class="nav-link" data-scroll-target="#converged-fit-vs-focei">Converged fit vs FOCEI</a></li>
+  </ul></li>
+  <li><a href="#what-runs-under-the-hood" id="toc-what-runs-under-the-hood" class="nav-link" data-scroll-target="#what-runs-under-the-hood">What runs under the hood</a></li>
+  <li><a href="#the-analytic-outer-gradient" id="toc-the-analytic-outer-gradient" class="nav-link" data-scroll-target="#the-analytic-outer-gradient">The analytic outer gradient</a>
+  <ul class="collapse">
+  <li><a href="#the-grid-moves-too-and-that-term-is-not-optional" id="toc-the-grid-moves-too-and-that-term-is-not-optional" class="nav-link" data-scroll-target="#the-grid-moves-too-and-that-term-is-not-optional">The grid moves too, and that term is not optional</a></li>
+  <li><a href="#every-model-gets-this-gradient-including-tte-and-categorical" id="toc-every-model-gets-this-gradient-including-tte-and-categorical" class="nav-link" data-scroll-target="#every-model-gets-this-gradient-including-tte-and-categorical">Every model gets this gradient — including TTE and categorical</a>
+  <ul class="collapse">
+  <li><a href="#scope-parity-with-focefocei" id="toc-scope-parity-with-focefocei" class="nav-link" data-scroll-target="#scope-parity-with-focefocei">Scope parity with FOCE/FOCEI</a></li>
+  </ul></li>
+  <li><a href="#where-agq-stops" id="toc-where-agq-stops" class="nav-link" data-scroll-target="#where-agq-stops">Where AGQ stops</a></li>
+  <li><a href="#dont-use-bobyqa" id="toc-dont-use-bobyqa" class="nav-link" data-scroll-target="#dont-use-bobyqa">Don’t use BOBYQA</a></li>
+  </ul></li>
+  <li><a href="#inter-occasion-variability-iov" id="toc-inter-occasion-variability-iov" class="nav-link" data-scroll-target="#inter-occasion-variability-iov">Inter-occasion variability (IOV)</a></li>
+  <li><a href="#limitations" id="toc-limitations" class="nav-link" data-scroll-target="#limitations">Limitations</a></li>
+  <li><a href="#references" id="toc-references" class="nav-link" data-scroll-target="#references">References</a></li>
+  </ul></li>
+  </ul>
+<div class="toc-actions"><ul><li><a href="https://github.com/FeRx-NLME/ferx-core/edit/main/estimation/agq.qmd" class="toc-action"><i class="bi bi-github"></i>Edit this page</a></li><li><a href="https://github.com/FeRx-NLME/ferx-core/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></nav>
+    </div>
+<!-- main -->
+<main class="content" id="quarto-document-content"><header id="title-block-header" class="quarto-title-block"><nav class="quarto-page-breadcrumbs quarto-title-breadcrumbs d-none d-lg-block" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../estimation/index.html">Estimation Methods</a></li><li class="breadcrumb-item"><a href="../estimation/agq.html">AGQ — Adaptive Gaussian Quadrature</a></li></ol></nav></header>
+
+
+
+
+
+<section id="agq-adaptive-gaussian-quadrature" class="level1">
+<h1>AGQ — Adaptive Gaussian Quadrature</h1>
+<blockquote class="blockquote">
+<p><strong>Maturity: beta</strong> — see <a href="../maturity.html">Feature Maturity</a> for what this means.</p>
+</blockquote>
+<p><code>agq</code> (aliases <code>aghq</code>, <code>gauss_hermite</code>, <code>adaptive_gaussian_quadrature</code>) generalises the Laplace approximation. Where <a href="../estimation/foce.html">FOCE/FOCEI</a> approximate each subject’s marginal likelihood with a <em>single</em> Gaussian centred at the empirical-Bayes mode, AGQ keeps that centring but evaluates the integrand on a Gauss–Hermite grid laid around the mode. One node reproduces Laplace exactly; more nodes refine the marginal.</p>
+<p>Its two defining properties:</p>
+<ul>
+<li><strong>It integrates the model’s real likelihood.</strong> Nothing is linearised and no Gaussian-residual assumption is made, so count, categorical and time-to-event endpoints are handled by the same engine, without the approximation FOCE/FOCEI structurally depend on.</li>
+<li><strong>It is deterministic.</strong> The grid is fixed, so the objective carries no Monte-Carlo noise — unlike <a href="../estimation/saem.html">SAEM</a> or <a href="../estimation/importance-sampling.html">IMP</a>, it needs no common random numbers, no step-size schedule, and returns a bit-identical OFV run to run.</li>
+</ul>
+<section id="usage" class="level2">
+<h2 class="anchored" data-anchor-id="usage">Usage</h2>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb1"><pre class="sourceCode ini code-with-copy"><code class="sourceCode ini"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[fit_options]</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="dt">  method </span><span class="ot">=</span><span class="st"> laplace</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="dt">  n_agq  </span><span class="ot">=</span><span class="st"> 3      # Gauss-Hermite nodes per random effect (default 1 = Laplace)</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>There is no separate <code>method = agq</code>: adaptive Gauss–Hermite quadrature is <code>method = laplace</code> with <code>n_agq &gt; 1</code> (the exact Hessian anchor). <code>n_agq = 1</code> (the default) is the Laplace approximation.</p>
+<p>From R:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb2"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a>fit <span class="ot">&lt;-</span> <span class="fu">ferx_fit</span>(model, data, <span class="at">method =</span> <span class="st">"agq"</span>, <span class="at">settings =</span> <span class="fu">list</span>(<span class="at">n_agq =</span> <span class="dv">5</span>))</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p><code>n_agq</code> is the number of nodes <strong>per random effect</strong>. Odd values are conventional — they keep a node exactly at the mode. <code>n_agq = 1</code> <em>is</em> the Laplace approximation (see below).</p>
+</section>
+<section id="cost-and-the-dimensionality-limit" class="level2">
+<h2 class="anchored" data-anchor-id="cost-and-the-dimensionality-limit">Cost, and the dimensionality limit</h2>
+<p>The grid is a tensor product: <code>n_agq ^ n_eta</code> likelihood evaluations per subject per outer iteration. That is the whole cost model, and it is exponential in the number of random effects.</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>n_eta</th>
+<th><code>n_agq = 1</code></th>
+<th><code>n_agq = 3</code></th>
+<th><code>n_agq = 5</code></th>
+<th><code>n_agq = 7</code></th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>2</td>
+<td>1</td>
+<td>9</td>
+<td>25</td>
+<td>49</td>
+</tr>
+<tr class="even">
+<td>3</td>
+<td>1</td>
+<td>27</td>
+<td>125</td>
+<td>343</td>
+</tr>
+<tr class="odd">
+<td>5</td>
+<td>1</td>
+<td>243</td>
+<td>3 125</td>
+<td>16 807</td>
+</tr>
+<tr class="even">
+<td>8</td>
+<td>1</td>
+<td>6 561</td>
+<td>390 625</td>
+<td>5.7 M</td>
+</tr>
+</tbody>
+</table>
+<p>ferx rejects a fit whose grid exceeds <strong>100 000 nodes</strong> rather than start work that will not finish. If you hit that, lower <code>n_agq</code>, reduce the number of random effects, or use <a href="../estimation/saem.html">SAEM</a> / <a href="../estimation/importance-sampling.html">IMP</a> — Monte-Carlo methods whose cost does not grow with the η dimension. AGQ is at its best at <strong>n_eta ≤ 4</strong>.</p>
+<blockquote class="blockquote">
+<p><strong>Note on grid pruning.</strong> A natural-looking optimisation — dropping nodes whose Gauss–Hermite weight is negligible — is <em>unsound</em> here and ferx does not do it. The adaptive rule multiplies each weight by <code>exp(‖z‖²)</code>, which exactly cancels the <code>e^{−z²}</code> decay the Hermite weights carry, so the corrected weights are <code>Θ(1)</code> right across the grid. A node with a tiny raw weight can carry a perfectly ordinary share of the integral. Sparse (Smolyak) grids are the real answer for <code>n_eta = 5..8</code> and are tracked as future work.</p>
+</blockquote>
+</section>
+<section id="n_agq-1-is-exactly-laplace-and-has-its-own-method-name" class="level2">
+<h2 class="anchored" data-anchor-id="n_agq-1-is-exactly-laplace-and-has-its-own-method-name"><code>n_agq = 1</code> is exactly Laplace — and has its own method name</h2>
+<p>Because the one-node case is a genuinely useful estimator in its own right (it is NONMEM’s <code>$EST METHOD=1 LAPLACIAN</code>), it is exposed directly:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb3"><pre class="sourceCode ini code-with-copy"><code class="sourceCode ini"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[fit_options]</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="dt">  method </span><span class="ot">=</span><span class="st"> laplace     # alias: laplacian</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p><code>method = laplace</code> with the default <code>n_agq = 1</code> <strong>is</strong> the Laplace approximation: one node, no grid, the exact-Hessian anchor. Raising <code>n_agq</code> turns the same objective — same analytic gradient, same covariance step, same code — into adaptive Gauss–Hermite quadrature. Prefer <code>n_agq = 1</code> when you want a NONMEM-<code>LAPLACIAN</code>-comparable fit or a baseline to raise <code>n_agq</code> from.</p>
+<p>It is the cheapest configuration — one node, no grid — and on warfarin it converges <em>faster than FOCEI</em> (0.23 s vs 0.60 s), because the analytic gradient needs fewer outer iterations.</p>
+<p>The <strong>Hessian anchor</strong> is what the method name selects: <code>method = laplace</code> anchors the grid on the exact conditional Hessian, <code>method = focei</code> on the Gauss-Newton <code>H̃</code>. So <code>method = focei</code> with <code>n_agq &gt; 1</code> is the Gauss-Newton-anchored quadrature — FOCEI refined toward the exact marginal. Both anchors converge to the same integral as <code>n_agq → ∞</code>; they differ only in where the nodes are placed (and, at one node, in whether the <code>½log|H|</code> term carries the exact curvature or the Gauss-Newton approximation).</p>
+<blockquote class="blockquote">
+<p><strong><code>laplace</code> is not <code>focei</code>.</strong> Both place a single Gaussian at the empirical-Bayes mode, but they build it from different Hessians — see below. They are different estimators and will report different OFVs.</p>
+</blockquote>
+<p>With one node the rule is <code>z = 0</code> with weight <code>√π</code>, and the quadrature sum collapses, term for term, to</p>
+<p><span class="math display">\[
+L_i \approx (2\pi)^{d/2}\,|H|^{-1/2}\,\exp\!\big(l_i(\hat\eta)\big),
+\]</span></p>
+<p>which is the Laplace approximation. This is an identity, not a numerical coincidence.</p>
+<p><strong>AGQ(1) is Laplace with the <em>exact</em> Hessian — NONMEM’s <code>$EST METHOD=1 LAPLACIAN</code>.</strong> It is deliberately <em>not</em> identical to ferx’s FOCEI, which is Laplace with the <strong>Gauss-Newton</strong> Hessian <code>CᵀC + Ω⁻¹</code> (that form drops <code>∂²f/∂η²</code>). ferx computes <code>H</code> by central differences of the true conditional NLL, because the Gauss-Newton form carries <em>no curvature at all</em> from TTE or categorical endpoints — it is blind on precisely the models AGQ exists to serve.</p>
+<p>The grid scaling only affects accuracy at finite <code>n</code> (AGQ converges to the same marginal under any invertible scaling), but at <code>n_agq = 1</code> it enters the objective directly through <code>½·log|H|</code>. So the two Laplace variants differ by exactly that term, and no more.</p>
+</section>
+<section id="validation" class="level2">
+<h2 class="anchored" data-anchor-id="validation">Validation</h2>
+<section id="against-nonmem" class="level3">
+<h3 class="anchored" data-anchor-id="against-nonmem">Against NONMEM</h3>
+<p>NONMEM has no AGQ. But <code>n_agq = 1</code> <em>is</em> Laplace with the exact Hessian, and that is precisely what <code>$EST METHOD=1 LAPLACIAN</code> computes — so LAPLACIAN is the exact external anchor for the one-node identity.</p>
+<p>Warfarin, OFV evaluated at identical initial parameters (<code>MAXEVAL=0</code>):</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 44%">
+<col style="width: 24%">
+<col style="width: 32%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Objective</th>
+<th>ferx</th>
+<th>NONMEM</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>FOCEI — Laplace, Gauss-Newton Hessian (<code>METHOD=1 INTER</code>)</td>
+<td>7.496684</td>
+<td><strong>7.4967</strong></td>
+</tr>
+<tr class="even">
+<td><strong>AGQ <code>n_agq = 1</code></strong> — Laplace, exact Hessian (<code>METHOD=1 LAPLACIAN INTER</code>)</td>
+<td>7.899403</td>
+<td><strong>7.8994</strong></td>
+</tr>
+<tr class="odd">
+<td><code>METHOD=1 LAPLACIAN</code> <em>without</em> <code>INTER</code></td>
+<td>—</td>
+<td>17.2049</td>
+</tr>
+</tbody>
+</table>
+<p>AGQ(1) reproduces NONMEM’s LAPLACIAN to <strong>5 significant figures</strong>. Three things follow, and together they are the strongest statement available about this implementation:</p>
+<ol type="1">
+<li><strong>The one-node/Laplace identity holds against an independent engine</strong>, not just against ferx’s own arithmetic.</li>
+<li><strong>NONMEM shows the same 0.40-unit gap between LAPLACIAN and FOCEI that ferx does.</strong> So that gap is FOCEI’s Gauss-Newton Hessian — a real property of the estimator, reproduced by the reference implementation — and not a defect here.</li>
+<li><strong><code>INTER</code> is required.</strong> Plain <code>LAPLACIAN</code> misses by 9.3 OFV units, because the exact Hessian of the conditional NLL must carry the curvature of the η-dependent residual variance (<code>ln V(f(η))</code> under a proportional error model). ferx’s <code>individual_nll</code> includes that term, which is exactly why the Hessian is finite-differenced from the true NLL rather than taken from the Gauss-Newton form — the latter would have silently dropped it.</li>
+</ol>
+<p>Converged fit (<code>MAXEVAL=9999</code> / <code>maxiter = 500</code>, <code>optimizer = auto</code> → L-BFGS on the analytic gradient). <code>n_agq = 1</code> is the like-for-like comparison — both are Laplace with the exact Hessian:</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Parameter</th>
+<th>NONMEM <code>LAPLACIAN INTER</code></th>
+<th>ferx AGQ <code>n_agq = 1</code></th>
+<th>Δ</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>OFV</td>
+<td>−285.9703</td>
+<td>−285.9702</td>
+<td>0.0001</td>
+</tr>
+<tr class="even">
+<td>TVCL</td>
+<td>0.132687</td>
+<td>0.132688</td>
+<td>+0.001%</td>
+</tr>
+<tr class="odd">
+<td>TVV</td>
+<td>7.737460</td>
+<td>7.737470</td>
+<td>+0.000%</td>
+</tr>
+<tr class="even">
+<td>TVKA</td>
+<td>0.810924</td>
+<td>0.810898</td>
+<td>−0.003%</td>
+</tr>
+<tr class="odd">
+<td>PROP_ERR</td>
+<td>0.0105646</td>
+<td>0.010565</td>
+<td>+0.004%</td>
+</tr>
+<tr class="even">
+<td>ω²(ETA_CL)</td>
+<td>0.0285916</td>
+<td>0.028592</td>
+<td>+0.001%</td>
+</tr>
+<tr class="odd">
+<td>ω²(ETA_V)</td>
+<td>0.00959221</td>
+<td>0.009592</td>
+<td>−0.002%</td>
+</tr>
+<tr class="even">
+<td>ω²(ETA_KA)</td>
+<td>0.336006</td>
+<td>0.336021</td>
+<td>+0.004%</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Every parameter agrees with NONMEM to within 0.004%.</strong> Raising to <code>n_agq = 3</code> moves the OFV to −285.9739 (a strictly better marginal) and barely moves the estimates — on warfarin the Laplace approximation is already near-exact, so the two share a minimum. That is the <em>point</em>: where Laplace is good, AGQ confirms it; where it is not, AGQ moves away from it and you can watch it happen by raising <code>n_agq</code>.</p>
+</section>
+<section id="speed" class="level3">
+<h3 class="anchored" data-anchor-id="speed">Speed</h3>
+<p>Same fit, wall-clock:</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th></th>
+<th>evaluations</th>
+<th>wall</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>ferx FOCEI (analytic gradient)</td>
+<td>42</td>
+<td>0.60 s</td>
+</tr>
+<tr class="even">
+<td><strong>ferx AGQ <code>n_agq = 1</code></strong></td>
+<td>31</td>
+<td><strong>0.23 s</strong></td>
+</tr>
+<tr class="odd">
+<td><strong>ferx AGQ <code>n_agq = 3</code></strong></td>
+<td>32</td>
+<td><strong>0.30 s</strong></td>
+</tr>
+<tr class="even">
+<td>NONMEM <code>LAPLACIAN INTER</code></td>
+<td>220</td>
+<td>1.21 s</td>
+</tr>
+<tr class="odd">
+<td>ferx AGQ, naive finite-difference gradient</td>
+<td>38</td>
+<td>6.5 s</td>
+</tr>
+</tbody>
+</table>
+<p>AGQ is <strong>faster than ferx’s own FOCEI</strong> and ~4–5× faster than NONMEM’s LAPLACIAN, while integrating a strictly better marginal. The last row is what the analytic gradient bought: a ~20× speedup over differencing the objective numerically, because that route re-solves every subject’s inner loop at every perturbed parameter and this one never does.</p>
+<p>(NONMEM’s 1.21 s is its reported <em>estimation</em> time and excludes the gfortran compile of the control stream, which dominates a real NONMEM run. Different hardware, so read the ratio, not the absolute.)</p>
+</section>
+<section id="against-ferxs-importance-sampler" class="level3">
+<h3 class="anchored" data-anchor-id="against-ferxs-importance-sampler">Against ferx’s importance sampler</h3>
+<p>The NONMEM check validates <code>n_agq = 1</code>. To validate the <em>node sweep</em> — the part NONMEM cannot anchor, because it has no AGQ — the reference is ferx’s own importance sampler, which estimates the same integral by a completely different route.</p>
+<p>Warfarin, OFV evaluated at identical initial parameters and identical EBEs — so the <em>only</em> thing varying across rows is the marginal approximation.</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 22%">
+<col style="width: 14%">
+<col style="width: 62%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Method</th>
+<th>OFV</th>
+<th>What it approximates</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>FOCE</td>
+<td>16.475</td>
+<td>Sheiner–Beal <em>linearised</em> marginal</td>
+</tr>
+<tr class="even">
+<td>FOCEI</td>
+<td>7.497</td>
+<td>Laplace, Gauss-Newton Hessian</td>
+</tr>
+<tr class="odd">
+<td><strong>AGQ <code>n_agq = 1</code></strong></td>
+<td><strong>7.899</strong></td>
+<td><strong>Laplace, exact Hessian</strong></td>
+</tr>
+<tr class="even">
+<td>AGQ <code>n_agq = 3</code></td>
+<td>7.697</td>
+<td></td>
+</tr>
+<tr class="odd">
+<td>AGQ <code>n_agq = 5</code></td>
+<td>7.501</td>
+<td></td>
+</tr>
+<tr class="even">
+<td>AGQ <code>n_agq = 7</code></td>
+<td>7.483</td>
+<td></td>
+</tr>
+<tr class="odd">
+<td>AGQ <code>n_agq = 11</code></td>
+<td><strong>7.480</strong></td>
+<td>← converged</td>
+</tr>
+<tr class="even">
+<td><strong>IMP</strong> (20 000 samples)</td>
+<td><strong>7.457</strong></td>
+<td>Monte-Carlo marginal (independent)</td>
+</tr>
+</tbody>
+</table>
+<p>The last row is the check that matters. Importance sampling estimates the <em>same integral</em> by a completely different route — a Student-t proposal with self-normalised weights: no quadrature, no Hessian, no Laplace. AGQ’s refined grid lands within <strong>0.02 OFV units</strong> of it, which is inside IS’s own Monte-Carlo error at 20 000 samples. Two estimators sharing no code path agree, which certifies both the marginal and the likelihood’s constant convention (an error in either would show as tens of OFV units, not hundredths).</p>
+<p>Note that FOCEI’s 7.497 is <em>closer</em> to the truth than AGQ(1)’s 7.899 here. That is not a defect — and NONMEM reproduces exactly the same ordering. Both are one-term approximations, and on this model FOCEI’s Gauss-Newton Hessian error happens to partially cancel the Laplace error. The point of AGQ is that you do not have to rely on that cancellation: you add nodes and watch the number stop moving.</p>
+</section>
+<section id="converged-fit-vs-focei" class="level3">
+<h3 class="anchored" data-anchor-id="converged-fit-vs-focei">Converged fit vs FOCEI</h3>
+<p>Full fit of the same model, <code>maxiter = 500</code>, covariance step on:</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Parameter</th>
+<th>FOCEI</th>
+<th>AGQ (<code>n_agq = 3</code>)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>OFV</td>
+<td>−286.004</td>
+<td>−285.973</td>
+</tr>
+<tr class="even">
+<td>TVCL</td>
+<td>0.132673</td>
+<td>0.132684</td>
+</tr>
+<tr class="odd">
+<td>TVV</td>
+<td>7.73806</td>
+<td>7.73881</td>
+</tr>
+<tr class="even">
+<td>TVKA</td>
+<td>0.809975</td>
+<td>0.811433</td>
+</tr>
+<tr class="odd">
+<td>ω²(ETA_V)</td>
+<td>0.009593</td>
+<td>0.009589</td>
+</tr>
+<tr class="even">
+<td>ω²(ETA_KA)</td>
+<td>0.336241</td>
+<td>0.337807</td>
+</tr>
+<tr class="odd">
+<td>PROP_ERR</td>
+<td>0.010565</td>
+<td>0.010561</td>
+</tr>
+</tbody>
+</table>
+<p>On a well-behaved Gaussian PK model Laplace is already accurate, so AGQ reproduces the FOCEI estimates to ~0.2% — which is the expected and desired result. AGQ earns its cost on models where that assumption <em>fails</em>: non-Gaussian endpoints, sparse data, and large <code>ω²</code>.</p>
+<blockquote class="blockquote">
+<p><strong>Reproducing the NONMEM anchor.</strong> The runner is <code>C:\package\ferx\nm_agq_laplace_warfarin.R</code> (klebsiella, <code>nmfe75</code>). It submits the four control streams above and prints the comparison table. Note the warfarin data has <code>CMT = 1</code> on observation rows, so the <code>$ERROR</code> block must use <code>IPRED = A(2)/V</code>, not <code>IPRED = F</code>.</p>
+</blockquote>
+</section>
+</section>
+<section id="what-runs-under-the-hood" class="level2">
+<h2 class="anchored" data-anchor-id="what-runs-under-the-hood">What runs under the hood</h2>
+<p>AGQ reuses the FOCE/Laplace machinery almost entirely:</p>
+<ol type="1">
+<li><strong>Inner loop — unchanged.</strong> The per-subject EBE mode <code>η̂</code> comes from the same solver FOCE/FOCEI use, including the analytic <code>Dual2</code> η-gradient where the model is in the sensitivity provider’s scope. AGQ does <strong>not</strong> re-optimise the mode; it only lays the grid around it.</li>
+<li><strong>Hessian.</strong> <code>H</code> is central-differenced from the true conditional NLL at <code>η̂</code>.</li>
+<li><strong>Grid.</strong> Gauss–Hermite nodes/weights are computed by Golub–Welsch, then transformed to <code>η_j = η̂ + √2·Σ^{1/2}·z_j</code> with <code>Σ = H⁻¹</code>.</li>
+<li><strong>Objective.</strong> The exact conditional likelihood is evaluated at each node.</li>
+<li><strong>Outer loop.</strong> AGQ has an <strong>analytic outer gradient</strong> (below), so <code>optimizer = auto</code> resolves to gradient-based <strong>L-BFGS</strong>. The covariance step differences the AGQ objective too, so the reported standard errors belong to the likelihood that was actually optimised.</li>
+</ol>
+<p>Subjects are evaluated in parallel (rayon); the node sweep is serial within a subject. The population sum is reduced in a fixed subject order, so the OFV does not depend on the thread count.</p>
+</section>
+<section id="the-analytic-outer-gradient" class="level2">
+<h2 class="anchored" data-anchor-id="the-analytic-outer-gradient">The analytic outer gradient</h2>
+<p>The quadrature has no closed form, but its <em>gradient</em> does — and it costs almost nothing extra.</p>
+<p>The node terms <code>t_j = log w_j + ‖z_j‖² − nll(η_j)</code> normalise to <code>ŵ_j = softmax(t)_j</code>, which are exactly the <strong>posterior weights at the nodes</strong>. By the Fisher (Louis) identity,</p>
+<p><span class="math display">\[
+\frac{\partial(-\log G_i)}{\partial\theta}
+= \mathbb{E}_{p(\eta\mid y)}\!\left[\frac{\partial\,\mathrm{nll}(\eta;\theta)}{\partial\theta}\right]
+\;\approx\; \sum_j \hat w_j\, \frac{\partial\,\mathrm{nll}(\eta_j;\theta)}{\partial\theta},
+\]</span></p>
+<p>so the outer gradient is a <strong>posterior-weighted average of fixed-η scores</strong>. Each <code>∂nll(η_j)/∂θ</code> is available exactly from the <code>Dual2</code> sensitivity provider (the same <code>∂f/∂θ</code> FOCE/FOCEI use — it makes no mode assumption, so it evaluates at any η). The Ω block is closed-form from the η-prior, the σ block closed-form from the variance model.</p>
+<section id="the-grid-moves-too-and-that-term-is-not-optional" class="level3">
+<h3 class="anchored" data-anchor-id="the-grid-moves-too-and-that-term-is-not-optional">The grid moves too, and that term is not optional</h3>
+<p>The nodes are built from <code>(η̂(θ), H(θ))</code>, so the total derivative also carries <code>∂F/∂η̂ · dη̂/dθ</code> and <code>∂F/∂H · dH/dθ</code>. Both <em>vanish in the exact-quadrature limit</em> — an exactly-integrated marginal does not care where you centre or scale the grid, it is a change of variables — but at finite <code>n_agq</code> they do not vanish, and they are <strong>not small</strong>. Measured against a finite-difference of the real objective on warfarin, the fixed-η score <em>alone</em> is <strong>26% wrong at <code>n_agq = 1</code></strong> (where the rule <em>is</em> Laplace and the cancellation fails completely) and 0.8% wrong at <code>n_agq = 3</code>.</p>
+<p>ferx therefore computes the grid-response term rather than dropping it, and the gradient is the exact total derivative at <strong>every</strong> node count:</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th><code>n_agq</code></th>
+<th>fixed-η score alone</th>
+<th>with grid response</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>1</td>
+<td>26%</td>
+<td><strong>0.16%</strong></td>
+</tr>
+<tr class="even">
+<td>3</td>
+<td>0.79%</td>
+<td><strong>0.008%</strong></td>
+</tr>
+<tr class="odd">
+<td>5</td>
+<td>0.51%</td>
+<td><strong>0.001%</strong></td>
+</tr>
+<tr class="even">
+<td>7</td>
+<td>0.055%</td>
+<td><strong>0.001%</strong></td>
+</tr>
+</tbody>
+</table>
+<p>(Relative error against a finite-difference of the objective, which re-solves the inner loop at each perturbed point. The remaining error is that reference’s own noise floor.)</p>
+<p>Two traps, both of which look like details and are not:</p>
+<p><strong>1. <code>H</code> depends on the parameters twice.</strong> <code>H = ∂²nll/∂η²|_{η̂(θ)}</code> varies with <code>θ</code> explicitly (through θ/Ω/σ) <em>and</em> implicitly through the mode <code>η̂(θ)</code>. Differencing only the explicit half is not a partial improvement — it is <strong>worse than omitting the term entirely</strong> (26% → 62%), because the two halves substantially cancel. The mode has to move too, along <code>dη̂/dθ</code> (the implicit-function derivative <code>−H⁻¹·∂²nll/∂η∂θ</code>, which ferx already computes for EBE warm-start prediction). That is also what keeps the whole correction <strong>free of any inner re-solve</strong>.</p>
+<p><strong>2. The step is truncation-dominated, not noise-dominated.</strong> The instinct — “<code>H</code> is itself finite-differenced, so use a <em>large</em> step and stay off its noise floor” — is exactly backwards here. <code>log|H|</code> curves sharply in the packed coordinates, so a large step is catastrophic: at <code>1e-2</code> the θ gradient comes out <strong>5× wrong</strong>, at <code>1e-3</code> still 4% wrong. <code>H</code>’s own error floor sits well below where truncation bites. The answer is converged by <code>1e-4</code> and unchanged at <code>1e-5</code>.</p>
+<p>Cost: the score is one provider call per node; the correction adds <code>2 × n_free</code> Hessian rebuilds and grid sweeps — no inner re-solve. The finite-difference alternative costs <code>2 × n_free</code> <em>full population objective</em> evaluations, each re-solving every subject’s inner loop. On warfarin that is the difference between 6.5 s and 0.4 s.</p>
+<p>A fully analytic <code>dH/dθ</code> would need third derivatives (<code>∂³nll/∂η²∂θ</code>); the provider stops at <code>∂²f/∂η∂θ</code>, so that one order is finite-differenced.</p>
+</section>
+<section id="every-model-gets-this-gradient-including-tte-and-categorical" class="level3">
+<h3 class="anchored" data-anchor-id="every-model-gets-this-gradient-including-tte-and-categorical">Every model gets this gradient — including TTE and categorical</h3>
+<p>There is no scope gate. Both ingredients work for any likelihood ferx can evaluate:</p>
+<ul>
+<li>the <strong>score</strong> <code>∂nll(η_j;θ)/∂θ</code> is taken analytically from the <code>Dual2</code> provider where it reaches, and finite-differenced <em>at fixed η</em> otherwise;</li>
+<li><strong><code>dη̂/dθ</code></strong> comes from the implicit function theorem (<code>−H⁻¹·∂²nll/∂η∂θ</code>), again analytic where the provider reaches and finite-differenced otherwise.</li>
+</ul>
+<p>Crucially <strong>neither route re-solves the inner loop</strong> — that is the cost that makes the naive finite-difference gradient expensive, and it is what both avoid. So the sensitivity provider only decides whether the θ/σ score is analytic (a little faster) or finite-differenced; it does <em>not</em> decide whether AGQ has a usable gradient at all.</p>
+<p>That distinction matters here more than anywhere: TTE and categorical endpoints sit outside the <code>Dual2</code> provider, and they are precisely the models AGQ exists to serve. Letting them fall back to the inner-re-solving gradient would have made the headline use case the slow one. The test <code>fd_score_path_agrees_with_the_analytic_one</code> pins that the two routes return the same gradient.</p>
+<section id="scope-parity-with-focefocei" class="level4">
+<h4 class="anchored" data-anchor-id="scope-parity-with-focefocei">Scope parity with FOCE/FOCEI</h4>
+<p>The analytic score reaches <strong>exactly as far as the FOCE/FOCEI analytic outer gradient does</strong> — no further, and no less. It is the same per-observation residual chain (<code>sens_outer_gradient::score_core</code>), so M3 censoring, IIV-on-RUV, a custom or time-varying residual magnitude, LTBS, correlated residuals (<code>block_sigma</code>) and ODE models all take the analytic route, exactly as they do under FOCE/FOCEI.</p>
+<p>That parity holds <em>by construction</em>: AGQ does not keep its own list of supported families, so there is nothing to drift out of step with the FOCE/FOCEI gate.</p>
+<p>FREM is included too: a covariate pseudo-observation row (<code>FREMTYPE &gt; 0</code>) is scored against <code>θ[i] + η[j]</code> with the dedicated <code>EPSCOV</code> error rather than against the PK model, and both halves of that — the jet and the variance — now flow through the shared machinery.</p>
+<p>Models that still take the finite-differenced score:</p>
+<ul>
+<li><strong>TTE and categorical endpoints</strong>, which have no analytic outer gradient at all — the sensitivity provider covers the structural PK/PD model, not the event or category likelihood. These are also the models AGQ exists to serve, which is why the FD route must (and does) avoid re-solving the inner loop.</li>
+<li><code>gradient_method = fd</code>, the explicit opt-out.</li>
+</ul>
+<p>Two cases decline per <em>subject</em> rather than per model, and fall back for that population: a genuinely off-diagonal correlated residual, and a custom magnitude combined with an M3-censored row.</p>
+<p>The fit output reports which route ran.</p>
+</section>
+</section>
+<section id="where-agq-stops" class="level3">
+<h3 class="anchored" data-anchor-id="where-agq-stops">Where AGQ stops</h3>
+<p>AGQ’s gradient is exact but still <strong>finite-difference-limited</strong>, though far less so than it was. The posterior Hessian is now analytic — the exact conditional <code>∂²nll/∂b²</code> assembled by the same sensitivity sweep FOCEI’s own gradient uses — and the grid-response term contracts each node’s analytic <code>∂nll/∂b</code> against a node displacement differenced from a cheap <em>exact</em> linear-algebra map. What remains finite-differenced is <code>dH/dx</code>, which would need a third derivative (<code>∂³nll/∂η²∂θ</code>) to close.</p>
+<p>Removing the previous finite-difference-of-a-finite-difference dropped the noise floor by two to three orders of magnitude — measured against a reconverged finite-difference of the objective on warfarin, <code>6.5e-8</code> relative at <code>n_agq = 1</code> and <code>1.8e-9</code> at <code>n_agq = 7</code>, where the same test read <code>2.0e-5</code> and <code>2.1e-7</code> before. At that level the finite-difference <em>reference</em> is the inaccurate side, not the gradient.</p>
+<p>So AGQ stops on the <strong>objective-change</strong> criterion (<code>outer_ftol</code>, default 1e-6) and the step-size criterion (<code>outer_xtol</code>), not on a gradient norm. That is where its objective actually settles. This is deliberately <strong>unchanged</strong> by the accuracy gain above: whether the tighter floor now makes a gradient-norm stop reachable is a separate question, and re-tuning a convergence criterion is not something to fold into a gradient change.</p>
+<p>This matters more than it sounds. FOCE/FOCEI are given a <code>1e-12</code> stop, which they can reach; giving the same to AGQ makes it <em>unreachable</em>, and an unreachable stop is not harmless — the optimizer keeps stepping until the true gradient drops under its own noise floor, at which point the search direction is noise, the line search fails, and the run is reported as <strong>not converged</strong> despite sitting on an OFV that has been flat for a dozen evaluations. Stopping AGQ where it actually settles both fixes that and makes it <em>faster</em> (on warfarin + IOV: 14.5 s → 8.2 s), because the grinding past the plateau was pure waste.</p>
+</section>
+<section id="dont-use-bobyqa" class="level3">
+<h3 class="anchored" data-anchor-id="dont-use-bobyqa">Don’t use BOBYQA</h3>
+<p><code>optimizer = bobyqa</code> <strong>false-converges</strong> on the AGQ objective. On warfarin it stops 0.015 OFV units above the optimum at the default <code>inner_tol</code> — and gets <em>worse</em>, to 0.18, as <code>inner_tol</code> is tightened, because a smoother objective merely lets its trust-region stopping rule trip sooner (63 → 34 evaluations, still reporting “converged”). Its ω estimates land ~3% off NONMEM. This is the failure mode ferx records in #317. <code>auto</code> picks L-BFGS for AGQ precisely to avoid it.</p>
+</section>
+</section>
+<section id="inter-occasion-variability-iov" class="level2">
+<h2 class="anchored" data-anchor-id="inter-occasion-variability-iov">Inter-occasion variability (IOV)</h2>
+<p>AGQ and <code>laplace</code> both support <code>[iov]</code>. Under IOV the integral is over the <strong>stacked</strong> random-effect vector</p>
+<p><span class="math display">\[
+b = [\eta,\ \kappa_1,\ \dots,\ \kappa_K],
+\qquad d = n_\eta + K \cdot n_\kappa
+\]</span></p>
+<p>whose prior is the block-diagonal <code>Ω_joint = Ω ⊕ Ω_iov ⊕ … ⊕ Ω_iov</code> (one block per occasion). That is not a new model — it is exactly what ferx’s IOV likelihood already scores, since</p>
+<pre class="text"><code>nll_iov = ½·(ηᵀΩ⁻¹η + log|Ω| + Σ_k κ_kᵀΩ_iov⁻¹κ_k + K·log|Ω_iov| + data)
+        = ½·(bᵀΩ_joint⁻¹b + log|Ω_joint| + data)</code></pre>
+<p>So <strong>every formula on this page carries over verbatim</strong> with <code>d</code> the stacked dimension: the marginal, the <code>½log|H|</code> normaliser, the node transform, the Fisher-identity gradient. IOV is a change of <em>dimension</em>, not of method. The mode is the joint <code>(η̂, κ̂)</code> one the inner loop already converges.</p>
+<p><strong>The catch is the dimension.</strong> The tensor grid is <code>n_agq^d</code>, and <code>K</code> — the number of occasions — comes from the <em>data</em>. Three η, one κ, two occasions gives <code>d = 5</code> and <code>3⁵ = 243</code> nodes (fine); ten occasions gives <code>d = 13</code> and <code>3¹³ ≈ 1.6 M</code> (not). ferx enforces the 100 000-node cap against the stacked dimension once the data is read, and the error names the occasion count so the cause is obvious.</p>
+<blockquote class="blockquote">
+<p><strong><code>method = laplace</code> is always tractable under IOV.</strong> Its grid is a <em>single point</em> no matter how large <code>d</code> grows — only the Hessian gets bigger. So Laplace + IOV works at any occasion count, and is the natural choice when the AGQ grid blows up.</p>
+</blockquote>
+</section>
+<section id="limitations" class="level2">
+<h2 class="anchored" data-anchor-id="limitations">Limitations</h2>
+<ul>
+<li><strong>Exponential in the random-effect dimension</strong> — see the cost table above, and the IOV section below. This is the real limit.</li>
+<li>Models outside the <code>Dual2</code> provider take a finite-differenced θ/σ score rather than an analytic one (see above). Same gradient, no inner re-solve, just a little slower per iteration.</li>
+</ul>
+</section>
+<section id="references" class="level2">
+<h2 class="anchored" data-anchor-id="references">References</h2>
+<ul>
+<li>Pinheiro &amp; Bates (1995), <em>Approximations to the log-likelihood function in the nonlinear mixed-effects model</em>, J Comput Graph Stat 4(1):12–35.</li>
+<li>Adaptive Gaussian quadrature as a generalisation of the Laplacian method, as implemented in Phoenix NLME (ADPO), J Pharmacokinet Pharmacodyn (2025).</li>
+</ul>
+
+
+</section>
+</section>
+
+</main> <!-- /main -->
+<script>
+(function () {
+  var HEAD = '<div class="panel-head"><span class="dots"><i></i><i></i><i></i></span><span class="file"><span class="br">[</span>warfarin_pk.ferx<span class="br">]</span></span></div>';
+
+  function apply() {
+    var dark = document.documentElement.getAttribute('data-bs-theme') === 'dark';
+    document.querySelectorAll('div.sourceCode').forEach(function (el) {
+      if (el.parentElement && el.parentElement.closest('.code-panel')) return;
+      if (dark) {
+        if (!el.classList.contains('code-panel')) {
+          el.classList.add('code-panel');
+          el.insertAdjacentHTML('afterbegin', HEAD);
+        }
+      } else {
+        el.classList.remove('code-panel');
+        var h = el.querySelector(':scope > .panel-head');
+        if (h) h.remove();
+      }
+    });
+  }
+
+  if (document.body) apply();
+  document.addEventListener('DOMContentLoaded', apply);
+  new MutationObserver(function (ms) {
+    ms.forEach(function (m) { if (m.attributeName === 'data-bs-theme') apply(); });
+  }).observe(document.documentElement, { attributes: true });
+}());
+</script>
+<script id="quarto-html-after-body" type="application/javascript">
+  window.document.addEventListener("DOMContentLoaded", function (event) {
+    // Ensure there is a toggle, if there isn't float one in the top right
+    if (window.document.querySelector('.quarto-color-scheme-toggle') === null) {
+      const a = window.document.createElement('a');
+      a.classList.add('top-right');
+      a.classList.add('quarto-color-scheme-toggle');
+      a.href = "";
+      a.onclick = function() { try { window.quartoToggleColorScheme(); } catch {} return false; };
+      const i = window.document.createElement("i");
+      i.classList.add('bi');
+      a.appendChild(i);
+      window.document.body.appendChild(a);
+    }
+    setColorSchemeToggle(hasAlternateSentinel())
+    const icon = "";
+    const anchorJS = new window.AnchorJS();
+    anchorJS.options = {
+      placement: 'right',
+      icon: icon
+    };
+    anchorJS.add('.anchored');
+    const isCodeAnnotation = (el) => {
+      for (const clz of el.classList) {
+        if (clz.startsWith('code-annotation-')) {                     
+          return true;
+        }
+      }
+      return false;
+    }
+    const onCopySuccess = function(e) {
+      // button target
+      const button = e.trigger;
+      // don't keep focus
+      button.blur();
+      // flash "checked"
+      button.classList.add('code-copy-button-checked');
+      var currentTitle = button.getAttribute("title");
+      button.setAttribute("title", "Copied!");
+      let tooltip;
+      if (window.bootstrap) {
+        button.setAttribute("data-bs-toggle", "tooltip");
+        button.setAttribute("data-bs-placement", "left");
+        button.setAttribute("data-bs-title", "Copied!");
+        tooltip = new bootstrap.Tooltip(button, 
+          { trigger: "manual", 
+            customClass: "code-copy-button-tooltip",
+            offset: [0, -8]});
+        tooltip.show();    
+      }
+      setTimeout(function() {
+        if (tooltip) {
+          tooltip.hide();
+          button.removeAttribute("data-bs-title");
+          button.removeAttribute("data-bs-toggle");
+          button.removeAttribute("data-bs-placement");
+        }
+        button.setAttribute("title", currentTitle);
+        button.classList.remove('code-copy-button-checked');
+      }, 1000);
+      // clear code selection
+      e.clearSelection();
+    }
+    const getTextToCopy = function(trigger) {
+      const outerScaffold = trigger.parentElement.cloneNode(true);
+      const codeEl = outerScaffold.querySelector('code');
+      for (const childEl of codeEl.children) {
+        if (isCodeAnnotation(childEl)) {
+          childEl.remove();
+        }
+      }
+      return codeEl.innerText;
+    }
+    const clipboard = new window.ClipboardJS('.code-copy-button:not([data-in-quarto-modal])', {
+      text: getTextToCopy
+    });
+    clipboard.on('success', onCopySuccess);
+    if (window.document.getElementById('quarto-embedded-source-code-modal')) {
+      const clipboardModal = new window.ClipboardJS('.code-copy-button[data-in-quarto-modal]', {
+        text: getTextToCopy,
+        container: window.document.getElementById('quarto-embedded-source-code-modal')
+      });
+      clipboardModal.on('success', onCopySuccess);
+    }
+      var localhostRegex = new RegExp(/^(?:http|https):\/\/localhost\:?[0-9]*\//);
+      var mailtoRegex = new RegExp(/^mailto:/);
+        var filterRegex = new RegExp("https:\/\/ferx-nlme\.github\.io\/ferx-core\/");
+      var isInternal = (href) => {
+          return filterRegex.test(href) || localhostRegex.test(href) || mailtoRegex.test(href);
+      }
+      // Inspect non-navigation links and adorn them if external
+     var links = window.document.querySelectorAll('a[href]:not(.nav-link):not(.navbar-brand):not(.toc-action):not(.sidebar-link):not(.sidebar-item-toggle):not(.pagination-link):not(.no-external):not([aria-hidden]):not(.dropdown-item):not(.quarto-navigation-tool):not(.about-link)');
+      for (var i=0; i<links.length; i++) {
+        const link = links[i];
+        if (!isInternal(link.href)) {
+          // undo the damage that might have been done by quarto-nav.js in the case of
+          // links that we want to consider external
+          if (link.dataset.originalHref !== undefined) {
+            link.href = link.dataset.originalHref;
+          }
+        }
+      }
+    function tippyHover(el, contentFn, onTriggerFn, onUntriggerFn) {
+      const config = {
+        allowHTML: true,
+        maxWidth: 500,
+        delay: 100,
+        arrow: false,
+        appendTo: function(el) {
+            return el.parentElement;
+        },
+        interactive: true,
+        interactiveBorder: 10,
+        theme: 'quarto',
+        placement: 'bottom-start',
+      };
+      if (contentFn) {
+        config.content = contentFn;
+      }
+      if (onTriggerFn) {
+        config.onTrigger = onTriggerFn;
+      }
+      if (onUntriggerFn) {
+        config.onUntrigger = onUntriggerFn;
+      }
+      window.tippy(el, config); 
+    }
+    const noterefs = window.document.querySelectorAll('a[role="doc-noteref"]');
+    for (var i=0; i<noterefs.length; i++) {
+      const ref = noterefs[i];
+      tippyHover(ref, function() {
+        // use id or data attribute instead here
+        let href = ref.getAttribute('data-footnote-href') || ref.getAttribute('href');
+        try { href = new URL(href).hash; } catch {}
+        const id = href.replace(/^#\/?/, "");
+        const note = window.document.getElementById(id);
+        if (note) {
+          return note.innerHTML;
+        } else {
+          return "";
+        }
+      });
+    }
+    const xrefs = window.document.querySelectorAll('a.quarto-xref');
+    const processXRef = (id, note) => {
+      // Strip column container classes
+      const stripColumnClz = (el) => {
+        el.classList.remove("page-full", "page-columns");
+        if (el.children) {
+          for (const child of el.children) {
+            stripColumnClz(child);
+          }
+        }
+      }
+      stripColumnClz(note)
+      if (id === null || id.startsWith('sec-')) {
+        // Special case sections, only their first couple elements
+        const container = document.createElement("div");
+        if (note.children && note.children.length > 2) {
+          container.appendChild(note.children[0].cloneNode(true));
+          for (let i = 1; i < note.children.length; i++) {
+            const child = note.children[i];
+            if (child.tagName === "P" && child.innerText === "") {
+              continue;
+            } else {
+              container.appendChild(child.cloneNode(true));
+              break;
+            }
+          }
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(container);
+          }
+          return container.innerHTML
+        } else {
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(note);
+          }
+          return note.innerHTML;
+        }
+      } else {
+        // Remove any anchor links if they are present
+        const anchorLink = note.querySelector('a.anchorjs-link');
+        if (anchorLink) {
+          anchorLink.remove();
+        }
+        if (window.Quarto?.typesetMath) {
+          window.Quarto.typesetMath(note);
+        }
+        if (note.classList.contains("callout")) {
+          return note.outerHTML;
+        } else {
+          return note.innerHTML;
+        }
+      }
+    }
+    for (var i=0; i<xrefs.length; i++) {
+      const xref = xrefs[i];
+      tippyHover(xref, undefined, function(instance) {
+        instance.disable();
+        let url = xref.getAttribute('href');
+        let hash = undefined; 
+        if (url.startsWith('#')) {
+          hash = url;
+        } else {
+          try { hash = new URL(url).hash; } catch {}
+        }
+        if (hash) {
+          const id = hash.replace(/^#\/?/, "");
+          const note = window.document.getElementById(id);
+          if (note !== null) {
+            try {
+              const html = processXRef(id, note.cloneNode(true));
+              instance.setContent(html);
+            } finally {
+              instance.enable();
+              instance.show();
+            }
+          } else {
+            // See if we can fetch this
+            fetch(url.split('#')[0])
+            .then(res => res.text())
+            .then(html => {
+              const parser = new DOMParser();
+              const htmlDoc = parser.parseFromString(html, "text/html");
+              const note = htmlDoc.getElementById(id);
+              if (note !== null) {
+                const html = processXRef(id, note);
+                instance.setContent(html);
+              } 
+            }).finally(() => {
+              instance.enable();
+              instance.show();
+            });
+          }
+        } else {
+          // See if we can fetch a full url (with no hash to target)
+          // This is a special case and we should probably do some content thinning / targeting
+          fetch(url)
+          .then(res => res.text())
+          .then(html => {
+            const parser = new DOMParser();
+            const htmlDoc = parser.parseFromString(html, "text/html");
+            const note = htmlDoc.querySelector('main.content');
+            if (note !== null) {
+              // This should only happen for chapter cross references
+              // (since there is no id in the URL)
+              // remove the first header
+              if (note.children.length > 0 && note.children[0].tagName === "HEADER") {
+                note.children[0].remove();
+              }
+              const html = processXRef(null, note);
+              instance.setContent(html);
+            } 
+          }).finally(() => {
+            instance.enable();
+            instance.show();
+          });
+        }
+      }, function(instance) {
+      });
+    }
+        let selectedAnnoteEl;
+        const selectorForAnnotation = ( cell, annotation) => {
+          let cellAttr = 'data-code-cell="' + cell + '"';
+          let lineAttr = 'data-code-annotation="' +  annotation + '"';
+          const selector = 'span[' + cellAttr + '][' + lineAttr + ']';
+          return selector;
+        }
+        const selectCodeLines = (annoteEl) => {
+          const doc = window.document;
+          const targetCell = annoteEl.getAttribute("data-target-cell");
+          const targetAnnotation = annoteEl.getAttribute("data-target-annotation");
+          const annoteSpan = window.document.querySelector(selectorForAnnotation(targetCell, targetAnnotation));
+          const lines = annoteSpan.getAttribute("data-code-lines").split(",");
+          const lineIds = lines.map((line) => {
+            return targetCell + "-" + line;
+          })
+          let top = null;
+          let height = null;
+          let parent = null;
+          if (lineIds.length > 0) {
+              //compute the position of the single el (top and bottom and make a div)
+              const el = window.document.getElementById(lineIds[0]);
+              top = el.offsetTop;
+              height = el.offsetHeight;
+              parent = el.parentElement.parentElement;
+            if (lineIds.length > 1) {
+              const lastEl = window.document.getElementById(lineIds[lineIds.length - 1]);
+              const bottom = lastEl.offsetTop + lastEl.offsetHeight;
+              height = bottom - top;
+            }
+            if (top !== null && height !== null && parent !== null) {
+              // cook up a div (if necessary) and position it 
+              let div = window.document.getElementById("code-annotation-line-highlight");
+              if (div === null) {
+                div = window.document.createElement("div");
+                div.setAttribute("id", "code-annotation-line-highlight");
+                div.style.position = 'absolute';
+                parent.appendChild(div);
+              }
+              div.style.top = top - 2 + "px";
+              div.style.height = height + 4 + "px";
+              div.style.left = 0;
+              let gutterDiv = window.document.getElementById("code-annotation-line-highlight-gutter");
+              if (gutterDiv === null) {
+                gutterDiv = window.document.createElement("div");
+                gutterDiv.setAttribute("id", "code-annotation-line-highlight-gutter");
+                gutterDiv.style.position = 'absolute';
+                const codeCell = window.document.getElementById(targetCell);
+                const gutter = codeCell.querySelector('.code-annotation-gutter');
+                gutter.appendChild(gutterDiv);
+              }
+              gutterDiv.style.top = top - 2 + "px";
+              gutterDiv.style.height = height + 4 + "px";
+            }
+            selectedAnnoteEl = annoteEl;
+          }
+        };
+        const unselectCodeLines = () => {
+          const elementsIds = ["code-annotation-line-highlight", "code-annotation-line-highlight-gutter"];
+          elementsIds.forEach((elId) => {
+            const div = window.document.getElementById(elId);
+            if (div) {
+              div.remove();
+            }
+          });
+          selectedAnnoteEl = undefined;
+        };
+          // Handle positioning of the toggle
+      window.addEventListener(
+        "resize",
+        throttle(() => {
+          elRect = undefined;
+          if (selectedAnnoteEl) {
+            selectCodeLines(selectedAnnoteEl);
+          }
+        }, 10)
+      );
+      function throttle(fn, ms) {
+      let throttle = false;
+      let timer;
+        return (...args) => {
+          if(!throttle) { // first call gets through
+              fn.apply(this, args);
+              throttle = true;
+          } else { // all the others get throttled
+              if(timer) clearTimeout(timer); // cancel #2
+              timer = setTimeout(() => {
+                fn.apply(this, args);
+                timer = throttle = false;
+              }, ms);
+          }
+        };
+      }
+        // Attach click handler to the DT
+        const annoteDls = window.document.querySelectorAll('dt[data-target-cell]');
+        for (const annoteDlNode of annoteDls) {
+          annoteDlNode.addEventListener('click', (event) => {
+            const clickedEl = event.target;
+            if (clickedEl !== selectedAnnoteEl) {
+              unselectCodeLines();
+              const activeEl = window.document.querySelector('dt[data-target-cell].code-annotation-active');
+              if (activeEl) {
+                activeEl.classList.remove('code-annotation-active');
+              }
+              selectCodeLines(clickedEl);
+              clickedEl.classList.add('code-annotation-active');
+            } else {
+              // Unselect the line
+              unselectCodeLines();
+              clickedEl.classList.remove('code-annotation-active');
+            }
+          });
+        }
+    const findCites = (el) => {
+      const parentEl = el.parentElement;
+      if (parentEl) {
+        const cites = parentEl.dataset.cites;
+        if (cites) {
+          return {
+            el,
+            cites: cites.split(' ')
+          };
+        } else {
+          return findCites(el.parentElement)
+        }
+      } else {
+        return undefined;
+      }
+    };
+    var bibliorefs = window.document.querySelectorAll('a[role="doc-biblioref"]');
+    for (var i=0; i<bibliorefs.length; i++) {
+      const ref = bibliorefs[i];
+      const citeInfo = findCites(ref);
+      if (citeInfo) {
+        tippyHover(citeInfo.el, function() {
+          var popup = window.document.createElement('div');
+          citeInfo.cites.forEach(function(cite) {
+            var citeDiv = window.document.createElement('div');
+            citeDiv.classList.add('hanging-indent');
+            citeDiv.classList.add('csl-entry');
+            var biblioDiv = window.document.getElementById('ref-' + cite);
+            if (biblioDiv) {
+              citeDiv.innerHTML = biblioDiv.innerHTML;
+            }
+            popup.appendChild(citeDiv);
+          });
+          return popup.innerHTML;
+        });
+      }
+    }
+  });
+  </script>
+</div> <!-- /content -->
+<footer class="footer">
+  <div class="nav-footer">
+    <div class="nav-footer-left">
+<p>© 2026 FeRx-NLME · MIT licensed</p>
+</div>   
+    <div class="nav-footer-center">
+      &nbsp;
+    <div class="toc-actions d-sm-block d-md-none"><ul><li><a href="https://github.com/FeRx-NLME/ferx-core/edit/main/estimation/agq.qmd" class="toc-action"><i class="bi bi-github"></i>Edit this page</a></li><li><a href="https://github.com/FeRx-NLME/ferx-core/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></div>
+    <div class="nav-footer-right">
+<p>Fe · 26 · Rx · 2026</p>
+</div>
+  </div>
+</footer>
+
+
+
+
+</body></html>

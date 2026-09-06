@@ -1,0 +1,1927 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en"><head>
+
+<meta charset="utf-8">
+<meta name="generator" content="quarto-1.10.18">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+
+
+<title>Inter-occasion variability in ferx – ferx-core</title>
+<style>
+/* Default styles provided by pandoc.
+** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+*/
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: 1.5em;}
+div.column{flex: auto;}
+@media screen {
+div.columns{gap: min(4vw, 1.5em);}
+div.column{overflow-x: auto;}
+}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+  width: 0.8em;
+  margin: 0 0.8em 0.2em -1em; /* quarto-specific, see https://github.com/quarto-dev/quarto-cli/issues/4556 */ 
+  vertical-align: middle;
+}
+</style>
+
+
+<script src="../site_libs/quarto-nav/quarto-nav.js"></script>
+<script src="../site_libs/quarto-nav/headroom.min.js"></script>
+<script src="../site_libs/clipboard/clipboard.min.js"></script>
+<script src="../site_libs/quarto-search/autocomplete.umd.js"></script>
+<script src="../site_libs/quarto-search/fuse.min.js"></script>
+<script src="../site_libs/quarto-search/quarto-search.js"></script>
+<meta name="quarto:offset" content="../">
+<link href="../assets/ferx-favicon.svg" rel="icon" type="image/svg+xml">
+<script src="../site_libs/quarto-html/quarto.js" type="module"></script>
+<script src="../site_libs/quarto-html/tabsets/tabsets.js" type="module"></script>
+<script src="../site_libs/quarto-html/popper.min.js"></script>
+<script src="../site_libs/quarto-html/tippy.umd.min.js"></script>
+<script src="../site_libs/quarto-html/anchor.min.js"></script>
+<link href="../site_libs/quarto-html/tippy.css" rel="stylesheet">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-51776f957f81c5a6b38322b65a6a6987.css" rel="stylesheet" class="quarto-color-scheme" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-dark-31632d092df9090a2ed68f79c078059d.css" rel="stylesheet" class="quarto-color-scheme quarto-color-alternate" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-51776f957f81c5a6b38322b65a6a6987.css" rel="stylesheet" class="quarto-color-scheme-extra" id="quarto-text-highlighting-styles">
+<script src="../site_libs/bootstrap/bootstrap.min.js"></script>
+<link href="../site_libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
+<link href="../site_libs/bootstrap/bootstrap-f5ed25dbf962e4596f9f4df24f2ade0d.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme" id="quarto-bootstrap" data-mode="light">
+<link href="../site_libs/bootstrap/bootstrap-dark-8a64b8d4793081e9872239f556c8075c.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme quarto-color-alternate" id="quarto-bootstrap" data-mode="dark">
+<link href="../site_libs/bootstrap/bootstrap-f5ed25dbf962e4596f9f4df24f2ade0d.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme-extra" id="quarto-bootstrap" data-mode="light">
+<script id="quarto-search-options" type="application/json">{
+  "location": "navbar",
+  "copy-button": false,
+  "collapse-after": 3,
+  "panel-placement": "end",
+  "type": "overlay",
+  "limit": 50,
+  "keyboard-shortcut": [
+    "f",
+    "/",
+    "s"
+  ],
+  "show-item-context": false,
+  "language": {
+    "search-no-results-text": "No results",
+    "search-matching-documents-text": "matching documents",
+    "search-copy-link-title": "Copy link to search",
+    "search-hide-matches-text": "Hide additional matches",
+    "search-more-match-text": "more match in this document",
+    "search-more-matches-text": "more matches in this document",
+    "search-clear-button-title": "Clear",
+    "search-text-placeholder": "",
+    "search-detached-cancel-button-title": "Cancel",
+    "search-submit-button-title": "Submit",
+    "search-label": "Search"
+  }
+}</script>
+
+  <script src="https://cdnjs.cloudflare.com/polyfill/v3/polyfill.min.js?features=es6"></script>
+  <script defer="" src="https://cdn.jsdelivr.net/npm/mathjax@4/tex-chtml.js" type="text/javascript"></script>
+
+<script type="text/javascript">
+const typesetMath = (el) => {
+  if (window.MathJax) {
+    // MathJax Typeset
+    window.MathJax.typeset([el]);
+  } else if (window.katex) {
+    // KaTeX Render
+    var mathElements = el.getElementsByClassName("math");
+    var macros = [];
+    for (var i = 0; i < mathElements.length; i++) {
+      var texText = mathElements[i].firstChild;
+      if (mathElements[i].tagName == "SPAN" && texText && texText.data) {
+        window.katex.render(texText.data, mathElements[i], {
+          displayMode: mathElements[i].classList.contains('display'),
+          throwOnError: false,
+          macros: macros,
+          fleqn: false
+        });
+      }
+    }
+  }
+}
+window.Quarto = {
+  typesetMath
+};
+</script>
+
+<link rel="stylesheet" href="../styles.css">
+<meta property="og:title" content="Inter-occasion variability in ferx">
+<meta property="og:description" content="Open-source nonlinear mixed-effects modeling for population PK/PD and pharmacometrics">
+<meta property="og:site_name" content="ferx-core">
+<meta property="og:locale" content="en_US">
+<meta name="twitter:title" content="Inter-occasion variability in ferx">
+<meta name="twitter:description" content="Open-source nonlinear mixed-effects modeling for population PK/PD and pharmacometrics">
+<meta name="twitter:card" content="summary">
+<link rel="canonical" href="https://ferx-nlme.github.io/ferx-core/model-file/iov.html">
+</head>
+
+<body class="nav-sidebar floating nav-fixed quarto-light"><script id="quarto-html-before-body" type="application/javascript">
+    const toggleBodyColorMode = (bsSheetEl) => {
+      const mode = bsSheetEl.getAttribute("data-mode");
+      const bodyEl = window.document.querySelector("body");
+      if (mode === "dark") {
+        bodyEl.classList.add("quarto-dark");
+        bodyEl.classList.remove("quarto-light");
+      } else {
+        bodyEl.classList.add("quarto-light");
+        bodyEl.classList.remove("quarto-dark");
+      }
+    }
+    const toggleBodyColorPrimary = () => {
+      const bsSheetEl = window.document.querySelector("link#quarto-bootstrap:not([rel=disabled-stylesheet])");
+      if (bsSheetEl) {
+        toggleBodyColorMode(bsSheetEl);
+      }
+    }
+    const setColorSchemeToggle = (alternate) => {
+      const toggles = window.document.querySelectorAll('.quarto-color-scheme-toggle');
+      for (let i=0; i < toggles.length; i++) {
+        const toggle = toggles[i];
+        if (toggle) {
+          if (alternate) {
+            toggle.classList.add("alternate");
+          } else {
+            toggle.classList.remove("alternate");
+          }
+        }
+      }
+    };
+    const toggleColorMode = (alternate) => {
+      // Switch the stylesheets
+      const primaryStylesheets = window.document.querySelectorAll('link.quarto-color-scheme:not(.quarto-color-alternate)');
+      const alternateStylesheets = window.document.querySelectorAll('link.quarto-color-scheme.quarto-color-alternate');
+      manageTransitions('#quarto-margin-sidebar .nav-link', false);
+      if (alternate) {
+        // note: dark is layered on light, we don't disable primary!
+        enableStylesheet(alternateStylesheets);
+        for (const sheetNode of alternateStylesheets) {
+          if (sheetNode.id === "quarto-bootstrap") {
+            toggleBodyColorMode(sheetNode);
+          }
+        }
+      } else {
+        disableStylesheet(alternateStylesheets);
+        enableStylesheet(primaryStylesheets)
+        toggleBodyColorPrimary();
+      }
+      manageTransitions('#quarto-margin-sidebar .nav-link', true);
+      // Switch the toggles
+      setColorSchemeToggle(alternate)
+      // Hack to workaround the fact that safari doesn't
+      // properly recolor the scrollbar when toggling (#1455)
+      if (navigator.userAgent.indexOf('Safari') > 0 && navigator.userAgent.indexOf('Chrome') == -1) {
+        manageTransitions("body", false);
+        window.scrollTo(0, 1);
+        setTimeout(() => {
+          window.scrollTo(0, 0);
+          manageTransitions("body", true);
+        }, 40);
+      }
+    }
+    const disableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        stylesheet.rel = 'disabled-stylesheet';
+      }
+    }
+    const enableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        if(stylesheet.rel !== 'stylesheet') { // for Chrome, which will still FOUC without this check
+          stylesheet.rel = 'stylesheet';
+        }
+      }
+    }
+    const manageTransitions = (selector, allowTransitions) => {
+      const els = window.document.querySelectorAll(selector);
+      for (let i=0; i < els.length; i++) {
+        const el = els[i];
+        if (allowTransitions) {
+          el.classList.remove('notransition');
+        } else {
+          el.classList.add('notransition');
+        }
+      }
+    }
+    const isFileUrl = () => {
+      return window.location.protocol === 'file:';
+    }
+    const hasAlternateSentinel = () => {
+      let styleSentinel = getColorSchemeSentinel();
+      if (styleSentinel !== null) {
+        return styleSentinel === "alternate";
+      } else {
+        return false;
+      }
+    }
+    const setStyleSentinel = (alternate) => {
+      const value = alternate ? "alternate" : "default";
+      if (!isFileUrl()) {
+        window.localStorage.setItem("quarto-color-scheme", value);
+      } else {
+        localAlternateSentinel = value;
+      }
+    }
+    const getColorSchemeSentinel = () => {
+      if (!isFileUrl()) {
+        const storageValue = window.localStorage.getItem("quarto-color-scheme");
+        return storageValue != null ? storageValue : localAlternateSentinel;
+      } else {
+        return localAlternateSentinel;
+      }
+    }
+    const toggleGiscusIfUsed = (isAlternate, darkModeDefault) => {
+      const baseTheme = document.querySelector('#giscus-base-theme')?.value ?? 'light';
+      const alternateTheme = document.querySelector('#giscus-alt-theme')?.value ?? 'dark';
+      let newTheme = '';
+      if(authorPrefersDark) {
+        newTheme = isAlternate ? baseTheme : alternateTheme;
+      } else {
+        newTheme = isAlternate ? alternateTheme : baseTheme;
+      }
+      const changeGiscusTheme = () => {
+        // From: https://github.com/giscus/giscus/issues/336
+        const sendMessage = (message) => {
+          const iframe = document.querySelector('iframe.giscus-frame');
+          if (!iframe) return;
+          iframe.contentWindow.postMessage({ giscus: message }, 'https://giscus.app');
+        }
+        sendMessage({
+          setConfig: {
+            theme: newTheme
+          }
+        });
+      }
+      const isGiscussLoaded = window.document.querySelector('iframe.giscus-frame') !== null;
+      if (isGiscussLoaded) {
+        changeGiscusTheme();
+      }
+    };
+    const authorPrefersDark = false;
+    const darkModeDefault = authorPrefersDark;
+      document.querySelector('link#quarto-text-highlighting-styles.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+      document.querySelector('link#quarto-bootstrap.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+    let localAlternateSentinel = darkModeDefault ? 'alternate' : 'default';
+    // Dark / light mode switch
+    window.quartoToggleColorScheme = () => {
+      // Read the current dark / light value
+      let toAlternate = !hasAlternateSentinel();
+      toggleColorMode(toAlternate);
+      setStyleSentinel(toAlternate);
+      toggleGiscusIfUsed(toAlternate, darkModeDefault);
+      window.dispatchEvent(new Event('resize'));
+    };
+    // Switch to dark mode if need be
+    if (hasAlternateSentinel()) {
+      toggleColorMode(true);
+    } else {
+      toggleColorMode(false);
+    }
+  </script>
+
+<div id="quarto-search-results"></div>
+  <header id="quarto-header" class="headroom fixed-top">
+    <nav class="navbar navbar-expand-lg " data-bs-theme="dark">
+      <div class="navbar-container container-fluid">
+      <div class="navbar-brand-container mx-auto">
+    <a href="../index.html" class="navbar-brand navbar-brand-logo">
+    <img src="../assets/ferx-dsl-brackets.svg" alt="ferx" class="navbar-logo light-content">
+    <img src="../assets/ferx-dsl-brackets.svg" alt="ferx" class="navbar-logo dark-content">
+    </a>
+    <a class="navbar-brand" href="../index.html">
+    <span class="navbar-title">ferx-core</span>
+    </a>
+  </div>
+            <div id="quarto-search" class="" title="Search"></div>
+          <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarCollapse" aria-controls="navbarCollapse" role="menu" aria-expanded="false" aria-label="Toggle navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+  <span class="navbar-toggler-icon"></span>
+</button>
+          <div class="collapse navbar-collapse" id="navbarCollapse">
+            <ul class="navbar-nav navbar-nav-scroll me-auto">
+  <li class="nav-item">
+    <a class="nav-link active" href="../getting-started.html" aria-current="page"> 
+<span class="menu-text">Get started</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/features.html"> 
+<span class="menu-text">Features</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/changelog.html"> 
+<span class="menu-text">Changelog</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/roadmap.html"> 
+<span class="menu-text">Roadmap</span></a>
+  </li>  
+</ul>
+            <ul class="navbar-nav navbar-nav-scroll ms-auto">
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/ferx-core/"> 
+<span class="menu-text">ferx-core</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/ferx-book/"> 
+<span class="menu-text">ferx-r</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/reference/"> 
+<span class="menu-text">Reference</span></a>
+  </li>  
+  <li class="nav-item compact">
+    <a class="nav-link" href="https://github.com/FeRx-NLME"> <i class="bi bi-github" role="img" aria-label="GitHub">
+</i> 
+<span class="menu-text"></span></a>
+  </li>  
+</ul>
+          </div> <!-- /navcollapse -->
+            <div class="quarto-navbar-tools">
+  <a href="" class="quarto-color-scheme-toggle quarto-navigation-tool  px-1" onclick="window.quartoToggleColorScheme(); return false;" title="Toggle dark mode"><i class="bi"></i></a>
+</div>
+      </div> <!-- /container-fluid -->
+    </nav>
+  <nav class="quarto-secondary-nav">
+    <div class="container-fluid d-flex">
+      <button type="button" class="quarto-btn-toggle btn" data-bs-toggle="collapse" role="button" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+        <i class="bi bi-layout-text-sidebar-reverse"></i>
+      </button>
+        <nav class="quarto-page-breadcrumbs" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../model-file/index.html">Model File Reference</a></li><li class="breadcrumb-item"><a href="../model-file/iov.html">Inter-Occasion Variability (IOV)</a></li></ol></nav>
+        <a class="flex-grow-1" role="navigation" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">      
+        </a>
+      <button type="button" class="btn quarto-search-button" aria-label="Search" onclick="window.quartoOpenSearch();">
+        <i class="bi bi-search"></i>
+      </button>
+    </div>
+  </nav>
+</header>
+<!-- content -->
+<div id="quarto-content" class="quarto-container page-columns page-rows-contents page-layout-article page-navbar">
+<!-- sidebar -->
+  <nav id="quarto-sidebar" class="sidebar collapse collapse-horizontal quarto-sidebar-collapse-item sidebar-navigation floating overflow-auto">
+    <div class="pt-lg-2 mt-2 text-left sidebar-header">
+      <a href="../index.html" class="sidebar-logo-link">
+      <img src="../assets/ferx-favicon.svg" alt="" class="sidebar-logo light-content py-0 d-lg-inline d-none">
+      <img src="../assets/ferx-favicon.svg" alt="" class="sidebar-logo dark-content py-0 d-lg-inline d-none">
+      </a>
+      </div>
+        <div class="mt-2 flex-shrink-0 align-items-center">
+        <div class="sidebar-search">
+        <div id="quarto-search" class="" title="Search"></div>
+        </div>
+        </div>
+    <div class="sidebar-menu-container"> 
+    <ul class="list-unstyled mt-1">
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Introduction</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../maturity.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Feature Maturity</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../getting-started.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Getting Started</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../installation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Installation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../quick-start.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Quick Start</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../model-file/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Model File Reference</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/parameters.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Parameters</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/iov.html" class="sidebar-item-text sidebar-link active">
+ <span class="menu-text">Inter-Occasion Variability (IOV)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/individual-parameters.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Individual Parameters</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariates.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariates</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariate-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/structural-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Structural Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/lagtime.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Lagtime</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/steady-state.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Steady-State Doses (SS=1)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/error-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Error Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/bloq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">LOQ-Censored Observations</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/ode-models.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/absorption.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Built-in Absorption Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/scaling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Scaling</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/initial-conditions.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Initial Conditions</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/diffusion.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Stochastic Differential Equations (SDE / Diffusion)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/neural-networks.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Neural Networks</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariate-nn.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><code>[covariate_nn]</code> — Deep Compartment Models (DCM)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/data.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/data-selection.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Selection</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/derived.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Derived Columns (<code>[derived]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Output Columns (<code>[output]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/fit-options.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Fit Options</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/simulation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Simulation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/adaptive-dosing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Adaptive (Feedback) Dosing</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/event-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Time-to-Event Endpoints (<code>[event_model]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/categorical.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Categorical endpoints — <code>[binary_model]</code></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/markov-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Markov models ([markov_model])</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../estimation/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Estimation Methods</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/foce.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FOCE / FOCEI</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/agq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">AGQ — Adaptive Gaussian Quadrature</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/gauss-newton.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Gauss-Newton (BHHH)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/saem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">SAEM</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/sir.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Sampling Importance Resampling (SIR)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/importance-sampling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Importance Sampling (IMP)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/frem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FREM (Full Random Effects Model)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/impmap.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">IMPMAP — Importance Sampling assisted by Mode A Posteriori</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/bayes.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Bayesian estimation (MCMC)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/vi.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Variational Inference</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/parameterization.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Packed Parameter Space</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/optimizers.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Outer Optimizers</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/tte.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Time-to-Event (TTE) Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/categorical.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Categorical endpoints (binary / logistic)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/ctmm.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Continuous-time Markov models (CTMM)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/mixture.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Mixture Models</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false">
+ <span class="menu-text">Tools</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/bootstrap.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Bootstrap</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/gam-screening.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">GAM covariate screening</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/search.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Search configuration</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/covsearch.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate search</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/modelsearch.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Structural model search</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../data-format.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Format</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../cli.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">CLI Reference</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Output Files</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../warnings.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Warnings</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../file-formats/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">File Formats</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../file-formats/fitrx.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">The <code>.fitrx</code> Fit Bundle</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../file-formats/check-report.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Check Report (<code>ferx check --json</code>)</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../examples/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Examples</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/one-cpt-oral.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">One-Compartment Oral (Warfarin)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/two-cpt-iv.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Two-Compartment IV Bolus</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/covariates.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/ode-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Model (Michaelis-Menten)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/bloq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">BLOQ (M3 method)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/iov.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Inter-Occasion Variability (IOV)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/iov-saem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">IOV with SAEM</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/multiple-dosing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Multiple Dosing (ADDL Column)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/steady-state.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Steady-State Dosing (SS Column)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/scaling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Unit Scaling (<code>[scaling]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/derived-output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Derived Columns and Output</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/data-selection.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Selection (IGNORE / ACCEPT)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/ode-lagtime.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Model with Absorption Lag Time</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/transit-absorption.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Transit Absorption (Two-Compartment)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/sde.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Stochastic Differential Equations (SDE)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/frem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FREM (Covariate Analysis)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/multistart.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Multi-Start: Michaelis-Menten Elimination</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../api/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Rust API</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/types.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Core Types</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/fitting.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Fitting Functions</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/simulation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Simulation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/parsing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Parsing</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/model-editing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Model editing</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../faq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FAQ</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../development/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Development</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/contributing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Contributing to FeRx development</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/sdlc.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Development Lifecycle (SDLC)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/docs-lint.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Docs linter</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+    </ul>
+    </div>
+</nav>
+<div id="quarto-sidebar-glass" class="quarto-sidebar-collapse-item" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item"></div>
+<!-- margin-sidebar -->
+    <div id="quarto-margin-sidebar" class="sidebar margin-sidebar">
+        <nav id="TOC" role="doc-toc" class="toc-active">
+    <h2 id="toc-title">On this page</h2>
+   
+  <ul>
+  <li><a href="#inter-occasion-variability-iov" id="toc-inter-occasion-variability-iov" class="nav-link active" data-scroll-target="#inter-occasion-variability-iov">Inter-Occasion Variability (IOV)</a>
+  <ul>
+  <li><a href="#concepts" id="toc-concepts" class="nav-link" data-scroll-target="#concepts">Concepts</a>
+  <ul class="collapse">
+  <li><a href="#occasions" id="toc-occasions" class="nav-link" data-scroll-target="#occasions">Occasions</a></li>
+  <li><a href="#kappa-parameters" id="toc-kappa-parameters" class="nav-link" data-scroll-target="#kappa-parameters">Kappa parameters</a></li>
+  <li><a href="#individual-parameters" id="toc-individual-parameters" class="nav-link" data-scroll-target="#individual-parameters">Individual parameters</a></li>
+  <li><a href="#structural-model-scope" id="toc-structural-model-scope" class="nav-link" data-scroll-target="#structural-model-scope">Structural-model scope</a></li>
+  </ul></li>
+  <li><a href="#option-a-diagonal-iov-independent-kappas" id="toc-option-a-diagonal-iov-independent-kappas" class="nav-link" data-scroll-target="#option-a-diagonal-iov-independent-kappas">Option A: Diagonal IOV (independent kappas)</a></li>
+  <li><a href="#option-b-block-iov-correlated-kappas" id="toc-option-b-block-iov-correlated-kappas" class="nav-link" data-scroll-target="#option-b-block-iov-correlated-kappas">Option B: Block IOV (correlated kappas)</a>
+  <ul class="collapse">
+  <li><a href="#mixed-option-a-b" id="toc-mixed-option-a-b" class="nav-link" data-scroll-target="#mixed-option-a-b">Mixed Option A + B</a></li>
+  </ul></li>
+  <li><a href="#sample-size-weighted-iov-weight-..." id="toc-sample-size-weighted-iov-weight-..." class="nav-link" data-scroll-target="#sample-size-weighted-iov-weight-...">Sample-size-weighted IOV (<code>weight = ...</code>)</a>
+  <ul class="collapse">
+  <li><a href="#why-declare-it-rather-than-write-it" id="toc-why-declare-it-rather-than-write-it" class="nav-link" data-scroll-target="#why-declare-it-rather-than-write-it">Why declare it rather than write it</a></li>
+  <li><a href="#what-is-reported" id="toc-what-is-reported" class="nav-link" data-scroll-target="#what-is-reported">What is reported</a></li>
+  <li><a href="#rules-and-diagnostics" id="toc-rules-and-diagnostics" class="nav-link" data-scroll-target="#rules-and-diagnostics">Rules and diagnostics</a></li>
+  <li><a href="#validation-against-nonmem" id="toc-validation-against-nonmem" class="nav-link" data-scroll-target="#validation-against-nonmem">Validation against NONMEM</a></li>
+  <li><a href="#simulating-an-arm-that-is-not-in-the-data" id="toc-simulating-an-arm-that-is-not-in-the-data" class="nav-link" data-scroll-target="#simulating-an-arm-that-is-not-in-the-data">Simulating an arm that is not in the data</a></li>
+  </ul></li>
+  <li><a href="#model-file-setup" id="toc-model-file-setup" class="nav-link" data-scroll-target="#model-file-setup">Model File Setup</a></li>
+  <li><a href="#declaring-occasions-in-the-model" id="toc-declaring-occasions-in-the-model" class="nav-link" data-scroll-target="#declaring-occasions-in-the-model">Declaring occasions in the model</a></li>
+  <li><a href="#algorithm-details" id="toc-algorithm-details" class="nav-link" data-scroll-target="#algorithm-details">Algorithm Details</a>
+  <ul class="collapse">
+  <li><a href="#inner-loop" id="toc-inner-loop" class="nav-link" data-scroll-target="#inner-loop">Inner loop</a></li>
+  <li><a href="#outer-loop" id="toc-outer-loop" class="nav-link" data-scroll-target="#outer-loop">Outer loop</a></li>
+  <li><a href="#outer-loop-gradient-ebe-re-convergence-for-iov" id="toc-outer-loop-gradient-ebe-re-convergence-for-iov" class="nav-link" data-scroll-target="#outer-loop-gradient-ebe-re-convergence-for-iov">Outer-loop gradient (EBE re-convergence for IOV)</a></li>
+  <li><a href="#covariance-step" id="toc-covariance-step" class="nav-link" data-scroll-target="#covariance-step">Covariance step</a></li>
+  </ul></li>
+  <li><a href="#output" id="toc-output" class="nav-link" data-scroll-target="#output">Output</a></li>
+  <li><a href="#simulation" id="toc-simulation" class="nav-link" data-scroll-target="#simulation">Simulation</a></li>
+  <li><a href="#limitations" id="toc-limitations" class="nav-link" data-scroll-target="#limitations">Limitations</a></li>
+  <li><a href="#comparison-to-nonmem" id="toc-comparison-to-nonmem" class="nav-link" data-scroll-target="#comparison-to-nonmem">Comparison to NONMEM</a></li>
+  </ul></li>
+  </ul>
+<div class="toc-actions"><ul><li><a href="https://github.com/FeRx-NLME/ferx-core/edit/main/model-file/iov.qmd" class="toc-action"><i class="bi bi-github"></i>Edit this page</a></li><li><a href="https://github.com/FeRx-NLME/ferx-core/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></nav>
+    </div>
+<!-- main -->
+<main class="content" id="quarto-document-content"><header id="title-block-header" class="quarto-title-block"><nav class="quarto-page-breadcrumbs quarto-title-breadcrumbs d-none d-lg-block" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../model-file/index.html">Model File Reference</a></li><li class="breadcrumb-item"><a href="../model-file/iov.html">Inter-Occasion Variability (IOV)</a></li></ol></nav></header>
+
+
+
+
+
+<section id="inter-occasion-variability-iov" class="level1">
+<h1>Inter-Occasion Variability (IOV)</h1>
+<blockquote class="blockquote">
+<p><strong>Maturity: stable</strong> — see <a href="../maturity.html">Feature Maturity</a> for what this means.</p>
+</blockquote>
+<p>Inter-Occasion Variability (IOV) models the fact that a subject’s PK parameters may shift between occasions (treatment periods, study visits, dosing intervals). Unlike between-subject variability (BSV), which is fixed for a subject across the whole study, IOV is a random effect that is re-drawn for each occasion.</p>
+<section id="concepts" class="level2">
+<h2 class="anchored" data-anchor-id="concepts">Concepts</h2>
+<section id="occasions" class="level3">
+<h3 class="anchored" data-anchor-id="occasions">Occasions</h3>
+<p>An <strong>occasion</strong> is a distinct time window during which the same kappa value applies. All rows — dose records and observation records — that share the same occasion index belong to one occasion. Occasions can be supplied two ways:</p>
+<ul>
+<li><strong>From the data</strong> — an integer column (e.g.&nbsp;<code>OCC</code>) named via <code>iov_column</code> in <code>[fit_options]</code>.</li>
+<li><strong>From the model</strong> — a rule (<code>iov_occasion = dose</code> or <code>iov_occasion = time(...)</code>) that derives the occasion of each row from its timeline, so you do not have to precompute an occasion column. See <a href="#declaring-occasions-in-the-model">Declaring occasions in the model</a>.</li>
+</ul>
+</section>
+<section id="kappa-parameters" class="level3">
+<h3 class="anchored" data-anchor-id="kappa-parameters">Kappa parameters</h3>
+<p><strong>Kappa</strong> (κ) is the IOV random effect, analogous to eta (η) for BSV. Each kappa is drawn independently per occasion:</p>
+<p><span class="math display">\[
+\kappa_{ik} \sim \mathcal{N}(0, \Omega_\text{IOV})
+\]</span></p>
+<p>where <em>i</em> indexes subjects and <em>k</em> indexes occasions. The IOV omega matrix Ω_IOV is estimated alongside the BSV omega.</p>
+</section>
+<section id="individual-parameters" class="level3">
+<h3 class="anchored" data-anchor-id="individual-parameters">Individual parameters</h3>
+<p>Kappas enter the individual-parameter expressions in the same way as etas:</p>
+<pre><code>CL = TVCL * exp(ETA_CL + KAPPA_CL)</code></pre>
+<p>At each occasion <em>k</em>, the effective individual CL is <code>TVCL * exp(ETA_CL_i + KAPPA_CL_ik)</code>. The BSV eta captures stable between-subject differences; the kappa captures occasion-to-occasion fluctuation within a subject.</p>
+</section>
+<section id="structural-model-scope" class="level3">
+<h3 class="anchored" data-anchor-id="structural-model-scope">Structural-model scope</h3>
+<p>IOV composes with every structural model, including the <strong>analytic absorption closed forms</strong> — <code>pk one_cpt_transit</code> / <code>two_cpt_transit</code> / <code>one_cpt_ig</code> / <code>two_cpt_ig</code>. Because a per-dose closed-form superposition cannot carry a dose’s drug across an occasion boundary where the disposition changes, a subject with IOV on such a model is <strong>transparently rerouted to the model’s exact <code>transit()</code> / <code>igd()</code> ODE twin</strong>, which integrates the cross-occasion carryover exactly (the same reroute used for time-varying covariates). This is automatic — no model change is needed — and covered on the <a href="../model-file/absorption.html">Absorption</a> page. A closed-form absorption model that has <em>no</em> ODE twin (one carrying a user <code>[odes]</code> / <code>[scaling]</code> / <code>[initial_conditions]</code> block, a role that shadows a reserved <code>F</code>/lagtime slot, or one whose twin could not be built — see <a href="../model-file/absorption.html">When a model loses its ODE twin</a>) still rejects IOV with an actionable message.</p>
+</section>
+</section>
+<section id="option-a-diagonal-iov-independent-kappas" class="level2">
+<h2 class="anchored" data-anchor-id="option-a-diagonal-iov-independent-kappas">Option A: Diagonal IOV (independent kappas)</h2>
+<p>Each kappa is declared independently, giving a <strong>diagonal</strong> Ω_IOV:</p>
+<pre><code>[parameters]
+  ...
+  kappa KAPPA_CL ~ 0.05
+  kappa KAPPA_V  ~ 0.03</code></pre>
+<p>The two kappas are uncorrelated across occasions. This is the most common formulation and corresponds to NONMEM’s IOV Option A.</p>
+<p>Use <code>FIX</code> to hold a kappa variance constant during estimation:</p>
+<pre><code>kappa KAPPA_CL ~ 0.05 FIX</code></pre>
+</section>
+<section id="option-b-block-iov-correlated-kappas" class="level2">
+<h2 class="anchored" data-anchor-id="option-b-block-iov-correlated-kappas">Option B: Block IOV (correlated kappas)</h2>
+<p>When occasion effects on different parameters are expected to covary, use <code>block_kappa</code>:</p>
+<pre><code>[parameters]
+  ...
+  block_kappa (KAPPA_CL, KAPPA_V) = [0.05, 0.01, 0.03]</code></pre>
+<p>Values are the lower triangle of Ω_IOV: Var(KAPPA_CL), Cov(KAPPA_CL, KAPPA_V), Var(KAPPA_V). This mirrors the <code>block_omega</code> syntax for BSV.</p>
+<section id="mixed-option-a-b" class="level3">
+<h3 class="anchored" data-anchor-id="mixed-option-a-b">Mixed Option A + B</h3>
+<p><code>kappa</code> and <code>block_kappa</code> declarations can be combined freely — uncorrelated kappas can coexist with a correlated block:</p>
+<pre><code>block_kappa (KAPPA_CL, KAPPA_V) = [0.05, 0.01, 0.03]
+kappa KAPPA_KA ~ 0.10</code></pre>
+<p>A name may not appear in both a <code>kappa</code> and a <code>block_kappa</code> line.</p>
+</section>
+</section>
+<section id="sample-size-weighted-iov-weight-..." class="level2">
+<h2 class="anchored" data-anchor-id="sample-size-weighted-iov-weight-...">Sample-size-weighted IOV (<code>weight = ...</code>)</h2>
+<blockquote class="blockquote">
+<p><strong>Maturity: experimental</strong> (<a href="https://github.com/FeRx-NLME/ferx-core/issues/1031">#1031</a>).</p>
+</blockquote>
+<p>The arm-level random effect of a longitudinal model-based meta-analysis — the <strong>between-treatment-arm variability (BTAV)</strong> — is not drawn from one variance. It scales with the number of subjects behind the arm:</p>
+<p><span class="math display">\[
+\kappa_{ik} \sim \mathcal{N}\!\left(0, \frac{\gamma^2}{N_{ik}}\right)
+\]</span></p>
+<p>A 400-subject arm’s mean wanders a quarter as far as a 25-subject arm’s. Declare that where the rest of the variance structure is declared:</p>
+<pre><code>[parameters]
+  kappa KAPPA_EMAX ~ 2.0 (sd) weight = NARM
+
+[individual_parameters]
+  LEMAX = LEMAX0 + log(OR_ABATA) * ABATA + ETA_EMAX + KAPPA_EMAX
+
+[covariates]
+  NARM continuous     # number of subjects in this arm</code></pre>
+<p><code>weight = W</code> means <code>κ ~ N(0, Ω_IOV / W)</code>. The engine applies the scaling by rewriting every reference to the kappa as <code>KAPPA / sqrt(W)</code> — precisely the hand-written form the modifier replaces — so the objective, the analytic sensitivities, the EBEs and every estimator see a model they already support.</p>
+<section id="why-declare-it-rather-than-write-it" class="level3">
+<h3 class="anchored" data-anchor-id="why-declare-it-rather-than-write-it">Why declare it rather than write it</h3>
+<p><code>KAPPA_EMAX / sqrt(NARM)</code> in the middle of a structural equation works, but it puts a <strong>variance-structure decision inside a structural expression</strong>:</p>
+<ul>
+<li><code>/ NARM</code> instead of <code>/ sqrt(NARM)</code> produces a plausible wrong answer rather than an error;</li>
+<li>nothing in the model summary marks <code>KAPPA_EMAX</code> as weighted — it reports as an ordinary IOV term;</li>
+<li>the term can only be scaled where it is <em>used</em>, so the same divisor has to be repeated in every expression the kappa enters.</li>
+</ul>
+</section>
+<section id="what-is-reported" class="level3">
+<h3 class="anchored" data-anchor-id="what-is-reported">What is reported</h3>
+<p>The estimate stays the <strong>unweighted</strong> <span class="math inline">\(\gamma^2\)</span> — the quantity a published MBMA reports — and the fit prints the effective SD at the median arm alongside it:</p>
+<pre><code>--- KAPPA (IOV) Estimates ---
+  KAPPA_EMAX           = 4.145382  SE = 0.412000
+                         weight = NARM  →  SD = 0.1440 at NARM = 200.0000 (κ ~ N(0, KAPPA_EMAX/NARM))</code></pre>
+<p>A raw <span class="math inline">\(\gamma\)</span> of 2.0 on a logit scale reads as alarming until it is divided; <span class="math inline">\(\gamma/\sqrt{200} \approx 0.14\)</span> is the between-arm SD a reader is looking for. <code>FitResult</code> carries both as <code>kappa_weights</code> (the source text) and <code>kappa_weight_typical</code> (the median arm size).</p>
+</section>
+<section id="rules-and-diagnostics" class="level3">
+<h3 class="anchored" data-anchor-id="rules-and-diagnostics">Rules and diagnostics</h3>
+<ul>
+<li>The weight may reference <strong>covariates, <code>FIX</code>ed thetas and <code>TIME</code></strong> — not random effects, and not estimated thetas. A weight is the <em>known</em> precision of an occasion: a random effect there would make the variance of κ a function of κ, and an estimated theta would move the weight during the fit, so the positivity check below (evaluated at the initial θ) could not certify it.</li>
+<li>A weighted kappa may be referenced <strong>only in <code>[individual_parameters]</code></strong>. Elsewhere it would read as the unweighted κ, so the parser rejects it — and it must be referenced <em>somewhere</em> in that block, since a weight that scales nothing would still be reported as if it had been applied.</li>
+<li><code>block_kappa</code> cannot carry a weight: the divisor would have to apply to the block’s covariances too for the matrix to stay a valid one. Declare a weighted kappa as a diagonal <code>kappa</code>.</li>
+<li>A weight that is zero, negative or non-finite at any record is a fit-time error (<code>E_KAPPA_WEIGHT_NONPOSITIVE</code>) — the usual cause is a blank arm-size cell. <code>simulate()</code> enforces the same check. A weight that changes <em>within</em> an occasion warns (<code>W_KAPPA_WEIGHT_VARIES_WITHIN_OCCASION</code>): κ is drawn once per occasion, so <code>Ω_IOV/W</code> is ambiguous when <code>W</code> moves underneath it.</li>
+</ul>
+</section>
+<section id="validation-against-nonmem" class="level3">
+<h3 class="anchored" data-anchor-id="validation-against-nonmem">Validation against NONMEM</h3>
+<p>NONMEM has no <code>weight =</code> on an <code>$OMEGA</code>, so its equivalent model writes the scaling into <code>$PK</code> by hand — which is exactly what the declaration desugars into. Both engines were run on the warfarin IOV dataset with an arm-size column (<code>NARM</code> = 400 on occasion 1, 25 on occasion 2), 1-cpt oral, FOCE, same starting values (<code>tests/nonmem/kappa_weight_iov.{ctl,lst,ext}</code>):</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Quantity</th>
+<th>NONMEM 7.6.0</th>
+<th>ferx</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>OFV (without constant)</td>
+<td>207.455</td>
+<td>205.683</td>
+</tr>
+<tr class="even">
+<td>TVCL</td>
+<td>0.31727</td>
+<td>0.32464</td>
+</tr>
+<tr class="odd">
+<td>TVV</td>
+<td>8.4018</td>
+<td>8.4445</td>
+</tr>
+<tr class="even">
+<td>TVKA</td>
+<td>2.6180</td>
+<td>2.4467</td>
+</tr>
+<tr class="odd">
+<td>ω²(CL)</td>
+<td>0.59721</td>
+<td>0.61281</td>
+</tr>
+<tr class="even">
+<td>ω²(KA)</td>
+<td>1.0571</td>
+<td>0.89725</td>
+</tr>
+<tr class="odd">
+<td>γ² (Ω_IOV)</td>
+<td>2.0013</td>
+<td>1.8402</td>
+</tr>
+<tr class="even">
+<td>σ² (proportional)</td>
+<td>0.037588</td>
+<td>0.040884</td>
+</tr>
+</tbody>
+</table>
+<p>ferx reaches a lower objective from the same start on a surface where κ is weakly identified (it enters divided by √400 and √25). The residual difference is the pre-existing cross-engine FOCE/IOV gap, not the weighting — evaluated at <em>identical fixed</em> parameters it is <strong>smaller</strong> with the weight than without:</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Parameters</th>
+<th>Model</th>
+<th>NONMEM</th>
+<th>ferx</th>
+<th>Δ</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>inits, γ² = 0.01</td>
+<td>weighted <code>κ/√NARM</code></td>
+<td>466.779</td>
+<td>466.720</td>
+<td>0.06</td>
+</tr>
+<tr class="even">
+<td>inits, γ² = 0.01</td>
+<td>plain <code>κ</code></td>
+<td>332.265</td>
+<td>331.620</td>
+<td>0.65</td>
+</tr>
+<tr class="odd">
+<td>NM MLE, γ² = 2.00</td>
+<td>weighted <code>κ/√NARM</code></td>
+<td>207.455</td>
+<td>205.943</td>
+<td>1.51</td>
+</tr>
+<tr class="even">
+<td>NM MLE, γ² = 2.00</td>
+<td>plain <code>κ</code></td>
+<td>238.889</td>
+<td>238.524</td>
+<td>0.37</td>
+</tr>
+</tbody>
+</table>
+<p>The declaration itself is exact: <code>weight = NARM</code> and the hand-written <code>KAPPA_CL / sqrt(NARM)</code> score <strong>bit-identically</strong> in ferx under FOCE, FOCEI, Laplace and SAEM (<code>tests/weighted_kappa_iov.rs</code>), and the analytic <code>∂f/∂κ</code> matches finite differences of the production predictor to tolerance.</p>
+<p>This is the random-effect sibling of the residual <a href="../model-file/error-model.html#residual-weighting-weight-..."><code>weight = ...</code></a> modifier, and the two share syntax and validation.</p>
+</section>
+<section id="simulating-an-arm-that-is-not-in-the-data" class="level3">
+<h3 class="anchored" data-anchor-id="simulating-an-arm-that-is-not-in-the-data">Simulating an arm that is not in the data</h3>
+<p>The weight is a data column, and <code>fit()</code> always has one — the arm exists, and its size is a column. A simulated trial frequently does not: the point of simulating one is to propose arms that are <em>not</em> in the data. Arm sizes are therefore part of a <code>[simulation]</code> design and must be stated with <code>covariate NARM = [...]</code>; a design that omits one is refused rather than defaulted. See <a href="../model-file/simulation.html#sim-covariates-required">Covariates in simulation</a> for why neither silent default is safe.</p>
+</section>
+</section>
+<section id="model-file-setup" class="level2">
+<h2 class="anchored" data-anchor-id="model-file-setup">Model File Setup</h2>
+<pre><code>[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+
+  omega ETA_CL ~ 0.09          # BSV
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+
+  kappa KAPPA_CL ~ 0.05        # IOV (Option A)
+
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = foce
+  iov_column = OCC</code></pre>
+<p>See <code>examples/warfarin_iov.ferx</code> for a complete runnable example.</p>
+</section>
+<section id="declaring-occasions-in-the-model" class="level2">
+<h2 class="anchored" data-anchor-id="declaring-occasions-in-the-model">Declaring occasions in the model</h2>
+<p>Instead of carrying an occasion column in the data, you can have ferx derive the occasion partition from each subject’s timeline with the <code>iov_occasion</code> key in <code>[fit_options]</code>. The kappa declarations are unchanged — only where the occasion <em>labels</em> come from differs.</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 50%">
+<col style="width: 50%">
+</colgroup>
+<thead>
+<tr class="header">
+<th><code>iov_occasion</code> value</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>column</code> (default)</td>
+<td>Occasions come from the <code>iov_column</code> dataset column.</td>
+</tr>
+<tr class="even">
+<td><code>dose</code></td>
+<td>Each administration <em>time</em> begins a new occasion. An observation takes the occasion of the most recent dose at or before its time (dose-before-observation at equal <code>TIME</code>). Doses that share a time (e.g.&nbsp;a simultaneous depot + central bolus) share one occasion. ADDL-expanded doses each start their own occasion.</td>
+</tr>
+<tr class="odd">
+<td><code>time(t₁, t₂, …)</code></td>
+<td>Time-window breakpoints. The strictly-increasing edges define bins: <code>time(24, 48)</code> → occasion 0 for <code>TIME &lt; 24</code>, occasion 1 for <code>24 ≤ TIME &lt; 48</code>, occasion 2 for <code>TIME ≥ 48</code>. The first occasion runs from <code>-∞</code> to the first breakpoint and the last runs from the last breakpoint to <code>+∞</code>, so you specify only the <em>interior</em> boundaries.</td>
+</tr>
+</tbody>
+</table>
+<p>For example, a two-period crossover with a washout at 24 h needs no <code>OCC</code> column:</p>
+<pre><code>[fit_options]
+  method       = foce
+  iov_occasion = time(24)</code></pre>
+<p>This single breakpoint defines <strong>two</strong> occasions: <code>TIME &lt; 24</code> (occasion 0) and <code>TIME ≥ 24</code> (occasion 1). You give only the interior boundaries — the breakpoint list is <em>not</em> a list of occasion start times. In particular, <strong>do not add a leading <code>0</code></strong>: occasion 0 already starts at <code>-∞</code>, so <code>time(0, 24, 48)</code> is a mistake (it would carve out an empty occasion for <code>TIME &lt; 0</code> and shift every real occasion up by one). ferx rejects a <code>0</code> breakpoint with an error pointing you at the correct <code>time(24, 48)</code> form. Likewise there is no trailing edge for the last occasion — it runs to <code>+∞</code>.</p>
+<p><strong>Precedence.</strong> If both <code>iov_occasion</code> (set to <code>dose</code>/<code>time(...)</code>) and <code>iov_column</code> are given, the model-side rule <strong>wins</strong> and a warning notes that the column was ignored.</p>
+<p><strong>Clock.</strong> Both rules bucket observations <em>and</em> doses on ferx’s internal event clock — the same monotonic timeline the solver integrates on. For reset-stacked subjects (<code>EVID=3/4</code>, where the data-file <code>TIME</code> restarts each period) that clock keeps advancing across the reset, so <code>time(...)</code> breakpoints separate the periods correctly and each dose stays in the same occasion as its co-timed observations.</p>
+<p><strong>Identifiability.</strong> A rule that yields only one occasion for every subject (e.g.&nbsp;<code>time(...)</code> breakpoints outside the sampling window, or <code>dose</code> on single-dose subjects) leaves kappa confounded with between-subject variability, so <code>fit()</code> errors — set breakpoints inside the sampling window, use <code>dose</code> on a multiple-dose design, or supply an <code>iov_column</code>. On the other end, <code>dose</code> on a long ADDL/steady-state train produces one occasion per expanded dose; this can balloon the per-subject inner problem, so ferx warns when the derived occasion count is large — prefer <code>time(...)</code> windows there. If the model declares no <code>kappa</code>, <code>iov_occasion</code> has no effect and a warning says so.</p>
+</section>
+<section id="algorithm-details" class="level2">
+<h2 class="anchored" data-anchor-id="algorithm-details">Algorithm Details</h2>
+<section id="inner-loop" class="level3">
+<h3 class="anchored" data-anchor-id="inner-loop">Inner loop</h3>
+<p>When a model has kappa declarations and the subject has occasion labels, the inner optimizer runs <code>find_ebe_iov</code> instead of the standard <code>find_ebe</code>. It jointly optimizes over:</p>
+<p><span class="math display">\[
+p = [\underbrace{\eta_1, \ldots, \eta_{n_\eta}}_{\text{BSV}},\ \underbrace{\kappa_{1,1}, \ldots, \kappa_{1,n_\kappa}}_{\text{occasion 1}},\ \ldots,\ \underbrace{\kappa_{K,1}, \ldots, \kappa_{K,n_\kappa}}_{\text{occasion K}}]
+\]</span></p>
+<p>The joint negative log-posterior is:</p>
+<p><span class="math display">\[
+-\log p(p \mid y_i) = \frac{1}{2}\left[
+  \eta^T \Omega^{-1} \eta + \log|\Omega|
+  + \sum_{k=1}^{K} \kappa_k^T \Omega_\text{IOV}^{-1} \kappa_k
+  + K \log|\Omega_\text{IOV}|
+  + \sum_{j} \left(\frac{(y_{ij} - f_{ij}^{(k_j)})^2}{V_{ij}} + \log V_{ij}\right)
+\right]
+\]</span></p>
+<p>where <span class="math inline">\(k_j\)</span> is the occasion of observation <em>j</em> and <span class="math inline">\(f_{ij}^{(k)} = f(\theta, \eta_i, \kappa_{ik})\)</span>.</p>
+<p>Optimization uses BFGS. Within the analytical 1-/2-/3-compartment scope the inner-loop H-matrix (the Jacobian ∂f/∂[η, κ] over the stacked random effects) is taken from the exact analytic second-order-dual sensitivity provider rather than finite differences. User-<code>[odes]</code> IOV models within the event-driven analytic scope (a compiled RHS, bolus/finite-infusion dosing, resets and EVID=2 breakpoints, dose-only occasions, and a per-subject stacked axis count up to 96) use the same exact analytic stacked-η inner gradient. Models outside both scopes — steady-state IOV doses, IIV-on-residual-error (<code>iiv_on_ruv</code>), FREM, an estimated lagtime, or a per-subject axis count above the cap — keep the finite-difference Jacobian.</p>
+</section>
+<section id="outer-loop" class="level3">
+<h3 class="anchored" data-anchor-id="outer-loop">Outer loop</h3>
+<p>The IOV omega is packed after the sigma block in the optimizer vector. For Option A (diagonal Ω_IOV) only the log-diagonal entries are appended; for Option B the full Cholesky lower triangle is appended (log-diagonals plus off-diagonals as-is), mirroring the BSV omega packing:</p>
+<p><span class="math display">\[
+x = [\log\theta,\ \text{chol}(\Omega_\text{BSV}),\ \log\sigma,\ \text{chol}(\Omega_\text{IOV})]
+\]</span></p>
+<p>The per-subject FOCE objective is a <em>proper augmented marginal</em>: the per-occasion kappas are integrated out through the linearised marginal exactly like the BSV etas. The random-effect vector is <span class="math inline">\(b = [\eta,\ \kappa_1, \ldots, \kappa_K]\)</span> with block-diagonal prior covariance</p>
+<p><span class="math display">\[
+\Sigma_b = \text{blockdiag}(\Omega_\text{BSV},\ \Omega_\text{IOV},\ \ldots,\ \Omega_\text{IOV})
+\]</span></p>
+<p>(<em>K</em> copies of Ω_IOV), and the H-matrix is <strong>augmented</strong> with kappa columns, <span class="math inline">\(H_\text{full} = [\,\partial f/\partial\eta \mid \partial f/\partial\kappa_1 \mid \cdots \mid \partial f/\partial\kappa_K\,]\)</span>. A kappa column can affect later observations through cross-occasion carryover, including when the kappa belongs to a dose-only occasion. The objective is then the ordinary Sheiner–Beal form</p>
+<p><span class="math display">\[
+\text{NLL}_i = \tfrac{1}{2}\left[(y - f_0)^T \tilde{R}^{-1} (y - f_0) + \log|\tilde{R}|\right],\qquad
+\tilde{R} = H_\text{full}\,\Sigma_b\,H_\text{full}^T + R
+\]</span></p>
+<p>with no separate kappa prior added (it is already folded into <span class="math inline">\(\tilde{R}\)</span>). This reduces exactly to the BSV-only FOCE objective when there are no kappas.</p>
+<blockquote class="blockquote">
+<p><strong>Why this matters (issue #101).</strong> An earlier implementation linearised only the BSV etas and added an explicit kappa MAP penalty <span class="math inline">\(\tfrac{1}{2}\sum_k(\kappa_k^T\Omega_\text{IOV}^{-1}\kappa_k + \log|\Omega_\text{IOV}|)\)</span>. That penalty omits the kappa Laplace determinant, so Ω_IOV was unidentified and the FOCE OFV disagreed with SAEM and NONMEM. The augmented marginal above fixes this; all estimation paths now share one consistent objective.</p>
+</blockquote>
+</section>
+<section id="outer-loop-gradient-ebe-re-convergence-for-iov" class="level3">
+<h3 class="anchored" data-anchor-id="outer-loop-gradient-ebe-re-convergence-for-iov">Outer-loop gradient (EBE re-convergence for IOV)</h3>
+<p>The IOV variance components — especially Ω_IOV — are <em>weakly identified</em>, and their gradient is dominated by the <strong>EBE response</strong>. Raising Ω_IOV un-shrinks the per-occasion kappas and improves the data fit, an effect a <em>fixed-EBE</em> gradient cannot see, so a gradient that holds the EBEs fixed leaves Ω_IOV pinned at its initial value (while derivative-free methods, which re-solve the EBEs at each trial point, move it freely).</p>
+<p>For IOV models within the analytical 1-/2-/3-compartment scope, under a <strong>gradient-based outer optimizer</strong> (<code>lbfgs</code>, <code>bfgs</code>, <code>slsqp</code>), the outer gradient is now the <strong>exact analytic marginal gradient</strong> (Almquist et al.&nbsp;2015) assembled over the stacked random-effect vector <code>[η_bsv, κ₁, …, κ_K]</code> with the block-diagonal prior <code>Ω_bsv ⊕ K·Ω_iov</code>. It carries the EBE response (Eq. 46) in closed form on every θ/Ω/σ/Ω_iov block — including the κ-variance — so it sees the un-shrinkage effect directly and converges Ω_IOV without re-solving the inner loop. Both FOCEI (Laplace marginal) and FOCE (Sheiner–Beal linearized marginal) have exact closed-form gradients here, and the cross-occasion dose carryover is differentiated exactly through the second-order-dual event-driven walk. Validated against reconverged finite differences (~1e-6 on every packed parameter) and against NONMEM on the warfarin IOV model.</p>
+<p>User-<code>[odes]</code> IOV models get the same exact analytic outer gradient when they are in the event-driven analytic scope (a compiled RHS, bolus or finite-infusion dosing with or without time-varying covariates, EVID=2 breakpoints, resets, dose-only occasions, and a per-subject stacked axis count up to 96), assembled by the same second-order-dual walk fed per-occasion parameters. The outer gradient is assembled <strong>per subject</strong>: subjects in analytic scope use the exact gradient, and the few outside it (steady-state IOV doses, an estimated lagtime, <code>iiv_on_ruv</code>, FREM, an above-cap axis count, or a non-finite analytic component) fall back to <strong>central finite differences that re-converge that subject’s inner loop at each perturbed point</strong> (<code>subject_reconverged_fd_gradient_iov</code>) — so one out-of-scope subject no longer forces the whole population onto finite differences. The default <strong>BOBYQA</strong> optimizer is derivative-free and uses neither path. Setting <code>reconverge_gradient_interval = 1</code> forces the reconverged-FD gradient even within the analytical scope, as a documented escape hatch.</p>
+<p>In addition, on the <strong>SLSQP</strong> path IOV models auto-enable per-coordinate scaling. SLSQP applies a uniform gradient cap that rescales the whole gradient by its largest (theta) component; with the disparate-magnitude IOV parameters (block-diagonal omega + kappa) that cap otherwise starves the omega/Ω_IOV step and leaves the variances pinned at their initial values. Presenting O(1) scaled coordinates removes the starvation, so a <em>pure</em> FOCEI/SLSQP fit moves the variance components off their initial values and descends toward the marginal minimum from a cold start. It does not always <em>reach</em> it: the final descent is driven by a noisy re-converged FD gradient on a weakly-identified variance surface, and SLSQP can terminate a few OFV units high in a platform-dependent way (see <a href="#limitations">Limitations</a>). The default <strong>BOBYQA</strong> optimizer and the <code>methods = [saem, focei]</code> chain reach the true minimum platform-independently. (This scaling is scoped to IOV + SLSQP: it is unnecessary for BFGS, which optimizes in unscaled space, and counter-productive for MMA — and the global <code>scale_params</code> default stays off to preserve the issue-#99 non-IOV behaviour.)</p>
+</section>
+<section id="covariance-step" class="level3">
+<h3 class="anchored" data-anchor-id="covariance-step">Covariance step</h3>
+<p>When <code>covariance = true</code>, standard errors for the IOV omega diagonal (or its Cholesky elements) are computed via the finite-difference Hessian at convergence, using the same procedure as for BSV omega.</p>
+</section>
+</section>
+<section id="output" class="level2">
+<h2 class="anchored" data-anchor-id="output">Output</h2>
+<p>The following IOV-related fields are populated on <code>FitResult</code> and printed by <code>print_results()</code>. The fit YAML gains an <code>omega_iov:</code> section listing the kappa variances and (for Option B) the off-diagonal covariances/correlations.</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 35%">
+<col style="width: 65%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>omega_iov</code></td>
+<td>Estimated IOV covariance matrix (<code>Option&lt;DMatrix&lt;f64&gt;&gt;</code>)</td>
+</tr>
+<tr class="even">
+<td><code>kappa_names</code></td>
+<td>Names of kappa parameters in declaration order</td>
+</tr>
+<tr class="odd">
+<td><code>kappa_fixed</code></td>
+<td>Per-kappa <code>FIX</code> flags</td>
+</tr>
+<tr class="even">
+<td><code>se_kappa</code></td>
+<td>Standard errors for IOV omega elements (requires <code>covariance = true</code>)</td>
+</tr>
+<tr class="odd">
+<td><code>ebe_kappas</code></td>
+<td>Per-subject, per-occasion kappa EBEs. <code>ebe_kappas[i][k]</code> is the kappa vector for subject <em>i</em>, occasion <em>k</em></td>
+</tr>
+</tbody>
+</table>
+<p>When the dataset has occasion labels the sdtab CSV gains an <code>OCC</code> column (one row per observation, the subject’s occasion index for that row).</p>
+<blockquote class="blockquote">
+<p><strong>Note</strong>: <code>shrinkage_kappa</code> exists as a placeholder field on <code>FitResult</code> but is not yet computed — it is always returned as an empty <code>Vec</code>. Use <code>ebe_kappas</code> directly if you need a manual shrinkage diagnostic.</p>
+</blockquote>
+</section>
+<section id="simulation" class="level2">
+<h2 class="anchored" data-anchor-id="simulation">Simulation</h2>
+<p><code>simulate()</code> is occasion-aware for a <code>kappa</code> model: it draws one independent κ ~ N(0, Ω<sub>IOV</sub>) per occasion group, so a VPC from an IOV model carries the inter-occasion spread the fit estimated (drawing a single κ for the whole subject would silently under-disperse it).</p>
+<p>That draw needs Ω<sub>IOV</sub> in the parameters you hand to <code>simulate()</code>. The model’s own parameters (<code>model.default_params</code>) always carry it, but a caller that <strong>rebuilds</strong> parameters from a fit must thread the fitted IOV covariance through as well — <code>estimation::uncertainty_samples::fitted_params_from_result()</code> does this and is the supported way to go from a <code>FitResult</code> to a simulate-ready <code>ModelParameters</code>. Parameters with a missing <code>omega_iov</code> are rejected: <code>simulate_with_options()</code> / <code>simulate_with_options_diag()</code> return an <code>Err</code> naming the omission, and the <code>Vec</code>-returning <code>simulate()</code> / <code>simulate_with_seed()</code> panic with the same message rather than silently emitting occasion-free draws (issue #1019).</p>
+</section>
+<section id="limitations" class="level2">
+<h2 class="anchored" data-anchor-id="limitations">Limitations</h2>
+<ul>
+<li><strong>Cross-occasion dose carryover.</strong> Predictions are computed by <code>pk::predict_iov</code>, which builds per-event PK parameters carrying each event’s occasion kappa and propagates the compartment amounts <em>continuously</em> across occasion boundaries (via the event-driven solver). A dose from an earlier occasion is therefore eliminated through a later occasion with the later occasion’s clearance — matching NONMEM’s integration model (this replaced the earlier “Option A” superposition, which used a single clearance for the whole dose history and biased no-washout designs; issue #104). On the warfarin IOV reference, ferx’s population prediction now matches NONMEM’s to 5 significant figures on every row. A ~17 OFV-unit gap versus NONMEM remains at matched parameters, but it is <em>not</em> a prediction difference — it is a cross-engine FOCEI marginal/EBE difference for this weakly-identified multi-random-effect model (and NONMEM’s reference itself did not converge cleanly here). See <code>tests/warfarin_iov_nonmem.rs</code>.</li>
+<li><strong>Overlapping-occasion absorption tails use the current occasion’s kappa</strong> (built-in input-rate forcings only — <code>transit()</code>, <code>igd()</code>, <code>weibull()</code>, <code>first_order()</code>). Each integration segment evaluates its absorption shape parameters (e.g.&nbsp;<code>MTT</code>, <code>MAT</code>, <code>KA</code>) from that segment’s occasion snapshot, so if a dose from an earlier occasion is <em>still absorbing</em> when a new occasion begins, its remaining input rate is computed with the <strong>new</strong> occasion’s parameters. This is exact for pure IIV and whenever the inter-occasion interval exceeds the absorption window (the usual washout case); only genuinely overlapping-occasion absorption tails are approximated. Bioavailability <code>F</code>, lagtime, and <code>zero_order(dur)</code> windows are read per-dose from each dose’s own occasion snapshot and stay occasion-correct even under overlap.</li>
+<li><strong>Local-optimizer convergence from a far-off cold start.</strong> Pure FOCEI (SLSQP via the auto-scaling above, or BFGS) reaches the minimum from a <em>sensible</em> start, but the IOV variance surface is ill-conditioned and weakly identified, so a <em>far-off</em> start (e.g.&nbsp;a residual-error init off by more than ~2×) can still stall. Set a realistic <code>sigma</code> init (a too-small one drives early omega inflation). The most robust workflow remains <strong>SAEM</strong>, or a <code>methods = [saem, focei]</code> chain (SAEM finds the basin, FOCEI polishes to a strictly better marginal optimum). See <code>tests/iov_convergence.rs</code>.</li>
+<li><strong>Platform-dependent pure-SLSQP cold-start termination.</strong> Even from the model’s cold default start, a <em>pure</em> FOCEI/SLSQP fit on <code>warfarin_iov</code> reaches a different point on different architectures: macOS arm64 lands at ≈307.8 (the minimum), while Linux x86_64 deterministically stalls at ≈314.7, ~7 OFV units high (issue #160). The descent direction near the minimum comes from a re-converged central-FD gradient whose floating-point summation order differs across architectures, and SLSQP’s stagnation guard latches at whichever flat-looking point it reaches first. This affects only an explicit <code>optimizer = slsqp</code>; the default <strong>BOBYQA</strong> (derivative-free) and the SAEM→FOCEI chain reach ≈307.8 on both platforms. Prefer them for IOV fits — reserve pure SLSQP for a warm start already in the basin.</li>
+<li><strong>Form C output (<code>[scaling] y = &lt;expr&gt;</code>) cannot reference <code>KAPPA_*</code> directly</strong> under IOV — the <code>[scaling]</code> eta scope is between-subject only, so a bare kappa name would resolve to <code>kappa = 0</code>. The parser rejects it with a clear error (issue #107); put the occasion dependence in an <code>[individual_parameters]</code> entry (e.g.&nbsp;<code>BASE = TVBASE * exp(KAPPA_B)</code>, or a structural parameter such as <code>CL</code>) and reference <em>that</em> in the readout. Such a reference <strong>is</strong> occasion-correct: the readout is evaluated per observation with that observation’s occasion κ, on both the ODE and the closed-form engine (fixed in #1079 for the closed-form engine, which previously evaluated the readout’s individual parameters at <code>kappa = 0</code>). The PK dynamics themselves are always occasion-correct.</li>
+<li><strong>Inner-loop and outer gradients come from the exact analytic sensitivity provider</strong> within scope for IOV models — both the analytical 1-/2-/3-compartment models and user-<code>[odes]</code> IOV models with a compiled RHS, event-driven dosing, dose-only occasions, and a per-subject stacked axis count up to 96 (see <a href="#inner-loop">Inner loop</a> and <a href="#outer-loop-gradient-ebe-re-convergence-for-iov">Outer-loop gradient</a>). Steady-state IOV doses, <code>iiv_on_ruv</code>, FREM, an estimated lagtime, and above-cap axis counts still fall back to finite differences (per subject for the outer gradient).</li>
+<li>The occasion column must contain non-negative integers. Non-integer or negative values are silently treated as missing (<code>OCC = 0</code>) and a single summary warning is emitted.</li>
+<li>Per-kappa shrinkage is not yet computed (see Output note above).</li>
+<li>Kappa EBEs are not yet emitted as columns in the sdtab CSV; access them via <code>FitResult.ebe_kappas</code>.</li>
+</ul>
+</section>
+<section id="comparison-to-nonmem" class="level2">
+<h2 class="anchored" data-anchor-id="comparison-to-nonmem">Comparison to NONMEM</h2>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 39%">
+<col style="width: 34%">
+<col style="width: 26%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Concept</th>
+<th>NONMEM</th>
+<th>ferx-core</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Diagonal IOV</td>
+<td><code>OMEGA BLOCK(n) SAME</code> with one kappa per block</td>
+<td><code>kappa NAME ~ variance</code> (Option A)</td>
+</tr>
+<tr class="even">
+<td>Correlated IOV</td>
+<td><code>OMEGA BLOCK(n)</code> shared across occasions</td>
+<td><code>block_kappa (N1, N2) = [...]</code> (Option B)</td>
+</tr>
+<tr class="odd">
+<td>Occasion from data</td>
+<td><code>OCC</code> in <code>$INPUT</code>; referenced in <code>$PK</code></td>
+<td><code>iov_column = OCC</code> in <code>[fit_options]</code></td>
+</tr>
+<tr class="even">
+<td>Occasion from model</td>
+<td><code>IF(TIME.LT.24) OCC=1</code> logic in <code>$PK</code></td>
+<td><code>iov_occasion = dose</code> or <code>time(...)</code> in <code>[fit_options]</code></td>
+</tr>
+<tr class="odd">
+<td>Kappa in PK</td>
+<td><code>ETA(n)</code> with <code>SAME</code> block</td>
+<td><code>KAPPA_xxx</code> in <code>[individual_parameters]</code></td>
+</tr>
+</tbody>
+</table>
+
+
+</section>
+</section>
+
+</main> <!-- /main -->
+<script>
+(function () {
+  var HEAD = '<div class="panel-head"><span class="dots"><i></i><i></i><i></i></span><span class="file"><span class="br">[</span>warfarin_pk.ferx<span class="br">]</span></span></div>';
+
+  function apply() {
+    var dark = document.documentElement.getAttribute('data-bs-theme') === 'dark';
+    document.querySelectorAll('div.sourceCode').forEach(function (el) {
+      if (el.parentElement && el.parentElement.closest('.code-panel')) return;
+      if (dark) {
+        if (!el.classList.contains('code-panel')) {
+          el.classList.add('code-panel');
+          el.insertAdjacentHTML('afterbegin', HEAD);
+        }
+      } else {
+        el.classList.remove('code-panel');
+        var h = el.querySelector(':scope > .panel-head');
+        if (h) h.remove();
+      }
+    });
+  }
+
+  if (document.body) apply();
+  document.addEventListener('DOMContentLoaded', apply);
+  new MutationObserver(function (ms) {
+    ms.forEach(function (m) { if (m.attributeName === 'data-bs-theme') apply(); });
+  }).observe(document.documentElement, { attributes: true });
+}());
+</script>
+<script id="quarto-html-after-body" type="application/javascript">
+  window.document.addEventListener("DOMContentLoaded", function (event) {
+    // Ensure there is a toggle, if there isn't float one in the top right
+    if (window.document.querySelector('.quarto-color-scheme-toggle') === null) {
+      const a = window.document.createElement('a');
+      a.classList.add('top-right');
+      a.classList.add('quarto-color-scheme-toggle');
+      a.href = "";
+      a.onclick = function() { try { window.quartoToggleColorScheme(); } catch {} return false; };
+      const i = window.document.createElement("i");
+      i.classList.add('bi');
+      a.appendChild(i);
+      window.document.body.appendChild(a);
+    }
+    setColorSchemeToggle(hasAlternateSentinel())
+    const icon = "";
+    const anchorJS = new window.AnchorJS();
+    anchorJS.options = {
+      placement: 'right',
+      icon: icon
+    };
+    anchorJS.add('.anchored');
+    const isCodeAnnotation = (el) => {
+      for (const clz of el.classList) {
+        if (clz.startsWith('code-annotation-')) {                     
+          return true;
+        }
+      }
+      return false;
+    }
+    const onCopySuccess = function(e) {
+      // button target
+      const button = e.trigger;
+      // don't keep focus
+      button.blur();
+      // flash "checked"
+      button.classList.add('code-copy-button-checked');
+      var currentTitle = button.getAttribute("title");
+      button.setAttribute("title", "Copied!");
+      let tooltip;
+      if (window.bootstrap) {
+        button.setAttribute("data-bs-toggle", "tooltip");
+        button.setAttribute("data-bs-placement", "left");
+        button.setAttribute("data-bs-title", "Copied!");
+        tooltip = new bootstrap.Tooltip(button, 
+          { trigger: "manual", 
+            customClass: "code-copy-button-tooltip",
+            offset: [0, -8]});
+        tooltip.show();    
+      }
+      setTimeout(function() {
+        if (tooltip) {
+          tooltip.hide();
+          button.removeAttribute("data-bs-title");
+          button.removeAttribute("data-bs-toggle");
+          button.removeAttribute("data-bs-placement");
+        }
+        button.setAttribute("title", currentTitle);
+        button.classList.remove('code-copy-button-checked');
+      }, 1000);
+      // clear code selection
+      e.clearSelection();
+    }
+    const getTextToCopy = function(trigger) {
+      const outerScaffold = trigger.parentElement.cloneNode(true);
+      const codeEl = outerScaffold.querySelector('code');
+      for (const childEl of codeEl.children) {
+        if (isCodeAnnotation(childEl)) {
+          childEl.remove();
+        }
+      }
+      return codeEl.innerText;
+    }
+    const clipboard = new window.ClipboardJS('.code-copy-button:not([data-in-quarto-modal])', {
+      text: getTextToCopy
+    });
+    clipboard.on('success', onCopySuccess);
+    if (window.document.getElementById('quarto-embedded-source-code-modal')) {
+      const clipboardModal = new window.ClipboardJS('.code-copy-button[data-in-quarto-modal]', {
+        text: getTextToCopy,
+        container: window.document.getElementById('quarto-embedded-source-code-modal')
+      });
+      clipboardModal.on('success', onCopySuccess);
+    }
+      var localhostRegex = new RegExp(/^(?:http|https):\/\/localhost\:?[0-9]*\//);
+      var mailtoRegex = new RegExp(/^mailto:/);
+        var filterRegex = new RegExp("https:\/\/ferx-nlme\.github\.io\/ferx-core\/");
+      var isInternal = (href) => {
+          return filterRegex.test(href) || localhostRegex.test(href) || mailtoRegex.test(href);
+      }
+      // Inspect non-navigation links and adorn them if external
+     var links = window.document.querySelectorAll('a[href]:not(.nav-link):not(.navbar-brand):not(.toc-action):not(.sidebar-link):not(.sidebar-item-toggle):not(.pagination-link):not(.no-external):not([aria-hidden]):not(.dropdown-item):not(.quarto-navigation-tool):not(.about-link)');
+      for (var i=0; i<links.length; i++) {
+        const link = links[i];
+        if (!isInternal(link.href)) {
+          // undo the damage that might have been done by quarto-nav.js in the case of
+          // links that we want to consider external
+          if (link.dataset.originalHref !== undefined) {
+            link.href = link.dataset.originalHref;
+          }
+        }
+      }
+    function tippyHover(el, contentFn, onTriggerFn, onUntriggerFn) {
+      const config = {
+        allowHTML: true,
+        maxWidth: 500,
+        delay: 100,
+        arrow: false,
+        appendTo: function(el) {
+            return el.parentElement;
+        },
+        interactive: true,
+        interactiveBorder: 10,
+        theme: 'quarto',
+        placement: 'bottom-start',
+      };
+      if (contentFn) {
+        config.content = contentFn;
+      }
+      if (onTriggerFn) {
+        config.onTrigger = onTriggerFn;
+      }
+      if (onUntriggerFn) {
+        config.onUntrigger = onUntriggerFn;
+      }
+      window.tippy(el, config); 
+    }
+    const noterefs = window.document.querySelectorAll('a[role="doc-noteref"]');
+    for (var i=0; i<noterefs.length; i++) {
+      const ref = noterefs[i];
+      tippyHover(ref, function() {
+        // use id or data attribute instead here
+        let href = ref.getAttribute('data-footnote-href') || ref.getAttribute('href');
+        try { href = new URL(href).hash; } catch {}
+        const id = href.replace(/^#\/?/, "");
+        const note = window.document.getElementById(id);
+        if (note) {
+          return note.innerHTML;
+        } else {
+          return "";
+        }
+      });
+    }
+    const xrefs = window.document.querySelectorAll('a.quarto-xref');
+    const processXRef = (id, note) => {
+      // Strip column container classes
+      const stripColumnClz = (el) => {
+        el.classList.remove("page-full", "page-columns");
+        if (el.children) {
+          for (const child of el.children) {
+            stripColumnClz(child);
+          }
+        }
+      }
+      stripColumnClz(note)
+      if (id === null || id.startsWith('sec-')) {
+        // Special case sections, only their first couple elements
+        const container = document.createElement("div");
+        if (note.children && note.children.length > 2) {
+          container.appendChild(note.children[0].cloneNode(true));
+          for (let i = 1; i < note.children.length; i++) {
+            const child = note.children[i];
+            if (child.tagName === "P" && child.innerText === "") {
+              continue;
+            } else {
+              container.appendChild(child.cloneNode(true));
+              break;
+            }
+          }
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(container);
+          }
+          return container.innerHTML
+        } else {
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(note);
+          }
+          return note.innerHTML;
+        }
+      } else {
+        // Remove any anchor links if they are present
+        const anchorLink = note.querySelector('a.anchorjs-link');
+        if (anchorLink) {
+          anchorLink.remove();
+        }
+        if (window.Quarto?.typesetMath) {
+          window.Quarto.typesetMath(note);
+        }
+        if (note.classList.contains("callout")) {
+          return note.outerHTML;
+        } else {
+          return note.innerHTML;
+        }
+      }
+    }
+    for (var i=0; i<xrefs.length; i++) {
+      const xref = xrefs[i];
+      tippyHover(xref, undefined, function(instance) {
+        instance.disable();
+        let url = xref.getAttribute('href');
+        let hash = undefined; 
+        if (url.startsWith('#')) {
+          hash = url;
+        } else {
+          try { hash = new URL(url).hash; } catch {}
+        }
+        if (hash) {
+          const id = hash.replace(/^#\/?/, "");
+          const note = window.document.getElementById(id);
+          if (note !== null) {
+            try {
+              const html = processXRef(id, note.cloneNode(true));
+              instance.setContent(html);
+            } finally {
+              instance.enable();
+              instance.show();
+            }
+          } else {
+            // See if we can fetch this
+            fetch(url.split('#')[0])
+            .then(res => res.text())
+            .then(html => {
+              const parser = new DOMParser();
+              const htmlDoc = parser.parseFromString(html, "text/html");
+              const note = htmlDoc.getElementById(id);
+              if (note !== null) {
+                const html = processXRef(id, note);
+                instance.setContent(html);
+              } 
+            }).finally(() => {
+              instance.enable();
+              instance.show();
+            });
+          }
+        } else {
+          // See if we can fetch a full url (with no hash to target)
+          // This is a special case and we should probably do some content thinning / targeting
+          fetch(url)
+          .then(res => res.text())
+          .then(html => {
+            const parser = new DOMParser();
+            const htmlDoc = parser.parseFromString(html, "text/html");
+            const note = htmlDoc.querySelector('main.content');
+            if (note !== null) {
+              // This should only happen for chapter cross references
+              // (since there is no id in the URL)
+              // remove the first header
+              if (note.children.length > 0 && note.children[0].tagName === "HEADER") {
+                note.children[0].remove();
+              }
+              const html = processXRef(null, note);
+              instance.setContent(html);
+            } 
+          }).finally(() => {
+            instance.enable();
+            instance.show();
+          });
+        }
+      }, function(instance) {
+      });
+    }
+        let selectedAnnoteEl;
+        const selectorForAnnotation = ( cell, annotation) => {
+          let cellAttr = 'data-code-cell="' + cell + '"';
+          let lineAttr = 'data-code-annotation="' +  annotation + '"';
+          const selector = 'span[' + cellAttr + '][' + lineAttr + ']';
+          return selector;
+        }
+        const selectCodeLines = (annoteEl) => {
+          const doc = window.document;
+          const targetCell = annoteEl.getAttribute("data-target-cell");
+          const targetAnnotation = annoteEl.getAttribute("data-target-annotation");
+          const annoteSpan = window.document.querySelector(selectorForAnnotation(targetCell, targetAnnotation));
+          const lines = annoteSpan.getAttribute("data-code-lines").split(",");
+          const lineIds = lines.map((line) => {
+            return targetCell + "-" + line;
+          })
+          let top = null;
+          let height = null;
+          let parent = null;
+          if (lineIds.length > 0) {
+              //compute the position of the single el (top and bottom and make a div)
+              const el = window.document.getElementById(lineIds[0]);
+              top = el.offsetTop;
+              height = el.offsetHeight;
+              parent = el.parentElement.parentElement;
+            if (lineIds.length > 1) {
+              const lastEl = window.document.getElementById(lineIds[lineIds.length - 1]);
+              const bottom = lastEl.offsetTop + lastEl.offsetHeight;
+              height = bottom - top;
+            }
+            if (top !== null && height !== null && parent !== null) {
+              // cook up a div (if necessary) and position it 
+              let div = window.document.getElementById("code-annotation-line-highlight");
+              if (div === null) {
+                div = window.document.createElement("div");
+                div.setAttribute("id", "code-annotation-line-highlight");
+                div.style.position = 'absolute';
+                parent.appendChild(div);
+              }
+              div.style.top = top - 2 + "px";
+              div.style.height = height + 4 + "px";
+              div.style.left = 0;
+              let gutterDiv = window.document.getElementById("code-annotation-line-highlight-gutter");
+              if (gutterDiv === null) {
+                gutterDiv = window.document.createElement("div");
+                gutterDiv.setAttribute("id", "code-annotation-line-highlight-gutter");
+                gutterDiv.style.position = 'absolute';
+                const codeCell = window.document.getElementById(targetCell);
+                const gutter = codeCell.querySelector('.code-annotation-gutter');
+                gutter.appendChild(gutterDiv);
+              }
+              gutterDiv.style.top = top - 2 + "px";
+              gutterDiv.style.height = height + 4 + "px";
+            }
+            selectedAnnoteEl = annoteEl;
+          }
+        };
+        const unselectCodeLines = () => {
+          const elementsIds = ["code-annotation-line-highlight", "code-annotation-line-highlight-gutter"];
+          elementsIds.forEach((elId) => {
+            const div = window.document.getElementById(elId);
+            if (div) {
+              div.remove();
+            }
+          });
+          selectedAnnoteEl = undefined;
+        };
+          // Handle positioning of the toggle
+      window.addEventListener(
+        "resize",
+        throttle(() => {
+          elRect = undefined;
+          if (selectedAnnoteEl) {
+            selectCodeLines(selectedAnnoteEl);
+          }
+        }, 10)
+      );
+      function throttle(fn, ms) {
+      let throttle = false;
+      let timer;
+        return (...args) => {
+          if(!throttle) { // first call gets through
+              fn.apply(this, args);
+              throttle = true;
+          } else { // all the others get throttled
+              if(timer) clearTimeout(timer); // cancel #2
+              timer = setTimeout(() => {
+                fn.apply(this, args);
+                timer = throttle = false;
+              }, ms);
+          }
+        };
+      }
+        // Attach click handler to the DT
+        const annoteDls = window.document.querySelectorAll('dt[data-target-cell]');
+        for (const annoteDlNode of annoteDls) {
+          annoteDlNode.addEventListener('click', (event) => {
+            const clickedEl = event.target;
+            if (clickedEl !== selectedAnnoteEl) {
+              unselectCodeLines();
+              const activeEl = window.document.querySelector('dt[data-target-cell].code-annotation-active');
+              if (activeEl) {
+                activeEl.classList.remove('code-annotation-active');
+              }
+              selectCodeLines(clickedEl);
+              clickedEl.classList.add('code-annotation-active');
+            } else {
+              // Unselect the line
+              unselectCodeLines();
+              clickedEl.classList.remove('code-annotation-active');
+            }
+          });
+        }
+    const findCites = (el) => {
+      const parentEl = el.parentElement;
+      if (parentEl) {
+        const cites = parentEl.dataset.cites;
+        if (cites) {
+          return {
+            el,
+            cites: cites.split(' ')
+          };
+        } else {
+          return findCites(el.parentElement)
+        }
+      } else {
+        return undefined;
+      }
+    };
+    var bibliorefs = window.document.querySelectorAll('a[role="doc-biblioref"]');
+    for (var i=0; i<bibliorefs.length; i++) {
+      const ref = bibliorefs[i];
+      const citeInfo = findCites(ref);
+      if (citeInfo) {
+        tippyHover(citeInfo.el, function() {
+          var popup = window.document.createElement('div');
+          citeInfo.cites.forEach(function(cite) {
+            var citeDiv = window.document.createElement('div');
+            citeDiv.classList.add('hanging-indent');
+            citeDiv.classList.add('csl-entry');
+            var biblioDiv = window.document.getElementById('ref-' + cite);
+            if (biblioDiv) {
+              citeDiv.innerHTML = biblioDiv.innerHTML;
+            }
+            popup.appendChild(citeDiv);
+          });
+          return popup.innerHTML;
+        });
+      }
+    }
+  });
+  </script>
+</div> <!-- /content -->
+<footer class="footer">
+  <div class="nav-footer">
+    <div class="nav-footer-left">
+<p>© 2026 FeRx-NLME · MIT licensed</p>
+</div>   
+    <div class="nav-footer-center">
+      &nbsp;
+    <div class="toc-actions d-sm-block d-md-none"><ul><li><a href="https://github.com/FeRx-NLME/ferx-core/edit/main/model-file/iov.qmd" class="toc-action"><i class="bi bi-github"></i>Edit this page</a></li><li><a href="https://github.com/FeRx-NLME/ferx-core/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></div>
+    <div class="nav-footer-right">
+<p>Fe · 26 · Rx · 2026</p>
+</div>
+  </div>
+</footer>
+
+
+
+
+</body></html>

@@ -1,0 +1,1914 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en"><head>
+
+<meta charset="utf-8">
+<meta name="generator" content="quarto-1.10.18">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+
+
+<title>FeRx development lifecycle – ferx-core</title>
+<style>
+/* Default styles provided by pandoc.
+** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+*/
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: 1.5em;}
+div.column{flex: auto;}
+@media screen {
+div.columns{gap: min(4vw, 1.5em);}
+div.column{overflow-x: auto;}
+}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+  width: 0.8em;
+  margin: 0 0.8em 0.2em -1em; /* quarto-specific, see https://github.com/quarto-dev/quarto-cli/issues/4556 */ 
+  vertical-align: middle;
+}
+/* CSS for syntax highlighting */
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+  { counter-reset: source-line 0; }
+pre.numberSource code > span
+  { position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+  { content: counter(source-line);
+    position: relative; left: -1em; text-align: right; vertical-align: baseline;
+    border: none; display: inline-block;
+    -webkit-touch-callout: none; -webkit-user-select: none;
+    -khtml-user-select: none; -moz-user-select: none;
+    -ms-user-select: none; user-select: none;
+    padding: 0 4px; width: 4em;
+  }
+pre.numberSource { margin-left: 3em;  padding-left: 4px; }
+div.sourceCode
+  {   }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+</style>
+
+
+<script src="../site_libs/quarto-nav/quarto-nav.js"></script>
+<script src="../site_libs/quarto-nav/headroom.min.js"></script>
+<script src="../site_libs/clipboard/clipboard.min.js"></script>
+<script src="../site_libs/quarto-search/autocomplete.umd.js"></script>
+<script src="../site_libs/quarto-search/fuse.min.js"></script>
+<script src="../site_libs/quarto-search/quarto-search.js"></script>
+<meta name="quarto:offset" content="../">
+<link href="../assets/ferx-favicon.svg" rel="icon" type="image/svg+xml">
+<script src="../site_libs/quarto-html/quarto.js" type="module"></script>
+<script src="../site_libs/quarto-html/tabsets/tabsets.js" type="module"></script>
+<script src="../site_libs/quarto-html/popper.min.js"></script>
+<script src="../site_libs/quarto-html/tippy.umd.min.js"></script>
+<script src="../site_libs/quarto-html/anchor.min.js"></script>
+<link href="../site_libs/quarto-html/tippy.css" rel="stylesheet">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-51776f957f81c5a6b38322b65a6a6987.css" rel="stylesheet" class="quarto-color-scheme" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-dark-31632d092df9090a2ed68f79c078059d.css" rel="stylesheet" class="quarto-color-scheme quarto-color-alternate" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-51776f957f81c5a6b38322b65a6a6987.css" rel="stylesheet" class="quarto-color-scheme-extra" id="quarto-text-highlighting-styles">
+<script src="../site_libs/bootstrap/bootstrap.min.js"></script>
+<link href="../site_libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
+<link href="../site_libs/bootstrap/bootstrap-f5ed25dbf962e4596f9f4df24f2ade0d.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme" id="quarto-bootstrap" data-mode="light">
+<link href="../site_libs/bootstrap/bootstrap-dark-8a64b8d4793081e9872239f556c8075c.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme quarto-color-alternate" id="quarto-bootstrap" data-mode="dark">
+<link href="../site_libs/bootstrap/bootstrap-f5ed25dbf962e4596f9f4df24f2ade0d.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme-extra" id="quarto-bootstrap" data-mode="light">
+<script id="quarto-search-options" type="application/json">{
+  "location": "navbar",
+  "copy-button": false,
+  "collapse-after": 3,
+  "panel-placement": "end",
+  "type": "overlay",
+  "limit": 50,
+  "keyboard-shortcut": [
+    "f",
+    "/",
+    "s"
+  ],
+  "show-item-context": false,
+  "language": {
+    "search-no-results-text": "No results",
+    "search-matching-documents-text": "matching documents",
+    "search-copy-link-title": "Copy link to search",
+    "search-hide-matches-text": "Hide additional matches",
+    "search-more-match-text": "more match in this document",
+    "search-more-matches-text": "more matches in this document",
+    "search-clear-button-title": "Clear",
+    "search-text-placeholder": "",
+    "search-detached-cancel-button-title": "Cancel",
+    "search-submit-button-title": "Submit",
+    "search-label": "Search"
+  }
+}</script>
+
+
+<link rel="stylesheet" href="../styles.css">
+<meta property="og:title" content="FeRx development lifecycle">
+<meta property="og:description" content="Open-source nonlinear mixed-effects modeling for population PK/PD and pharmacometrics">
+<meta property="og:site_name" content="ferx-core">
+<meta property="og:locale" content="en_US">
+<meta name="twitter:title" content="FeRx development lifecycle">
+<meta name="twitter:description" content="Open-source nonlinear mixed-effects modeling for population PK/PD and pharmacometrics">
+<meta name="twitter:card" content="summary">
+<link rel="canonical" href="https://ferx-nlme.github.io/ferx-core/development/sdlc.html">
+</head>
+
+<body class="nav-sidebar floating nav-fixed quarto-light"><script id="quarto-html-before-body" type="application/javascript">
+    const toggleBodyColorMode = (bsSheetEl) => {
+      const mode = bsSheetEl.getAttribute("data-mode");
+      const bodyEl = window.document.querySelector("body");
+      if (mode === "dark") {
+        bodyEl.classList.add("quarto-dark");
+        bodyEl.classList.remove("quarto-light");
+      } else {
+        bodyEl.classList.add("quarto-light");
+        bodyEl.classList.remove("quarto-dark");
+      }
+    }
+    const toggleBodyColorPrimary = () => {
+      const bsSheetEl = window.document.querySelector("link#quarto-bootstrap:not([rel=disabled-stylesheet])");
+      if (bsSheetEl) {
+        toggleBodyColorMode(bsSheetEl);
+      }
+    }
+    const setColorSchemeToggle = (alternate) => {
+      const toggles = window.document.querySelectorAll('.quarto-color-scheme-toggle');
+      for (let i=0; i < toggles.length; i++) {
+        const toggle = toggles[i];
+        if (toggle) {
+          if (alternate) {
+            toggle.classList.add("alternate");
+          } else {
+            toggle.classList.remove("alternate");
+          }
+        }
+      }
+    };
+    const toggleColorMode = (alternate) => {
+      // Switch the stylesheets
+      const primaryStylesheets = window.document.querySelectorAll('link.quarto-color-scheme:not(.quarto-color-alternate)');
+      const alternateStylesheets = window.document.querySelectorAll('link.quarto-color-scheme.quarto-color-alternate');
+      manageTransitions('#quarto-margin-sidebar .nav-link', false);
+      if (alternate) {
+        // note: dark is layered on light, we don't disable primary!
+        enableStylesheet(alternateStylesheets);
+        for (const sheetNode of alternateStylesheets) {
+          if (sheetNode.id === "quarto-bootstrap") {
+            toggleBodyColorMode(sheetNode);
+          }
+        }
+      } else {
+        disableStylesheet(alternateStylesheets);
+        enableStylesheet(primaryStylesheets)
+        toggleBodyColorPrimary();
+      }
+      manageTransitions('#quarto-margin-sidebar .nav-link', true);
+      // Switch the toggles
+      setColorSchemeToggle(alternate)
+      // Hack to workaround the fact that safari doesn't
+      // properly recolor the scrollbar when toggling (#1455)
+      if (navigator.userAgent.indexOf('Safari') > 0 && navigator.userAgent.indexOf('Chrome') == -1) {
+        manageTransitions("body", false);
+        window.scrollTo(0, 1);
+        setTimeout(() => {
+          window.scrollTo(0, 0);
+          manageTransitions("body", true);
+        }, 40);
+      }
+    }
+    const disableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        stylesheet.rel = 'disabled-stylesheet';
+      }
+    }
+    const enableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        if(stylesheet.rel !== 'stylesheet') { // for Chrome, which will still FOUC without this check
+          stylesheet.rel = 'stylesheet';
+        }
+      }
+    }
+    const manageTransitions = (selector, allowTransitions) => {
+      const els = window.document.querySelectorAll(selector);
+      for (let i=0; i < els.length; i++) {
+        const el = els[i];
+        if (allowTransitions) {
+          el.classList.remove('notransition');
+        } else {
+          el.classList.add('notransition');
+        }
+      }
+    }
+    const isFileUrl = () => {
+      return window.location.protocol === 'file:';
+    }
+    const hasAlternateSentinel = () => {
+      let styleSentinel = getColorSchemeSentinel();
+      if (styleSentinel !== null) {
+        return styleSentinel === "alternate";
+      } else {
+        return false;
+      }
+    }
+    const setStyleSentinel = (alternate) => {
+      const value = alternate ? "alternate" : "default";
+      if (!isFileUrl()) {
+        window.localStorage.setItem("quarto-color-scheme", value);
+      } else {
+        localAlternateSentinel = value;
+      }
+    }
+    const getColorSchemeSentinel = () => {
+      if (!isFileUrl()) {
+        const storageValue = window.localStorage.getItem("quarto-color-scheme");
+        return storageValue != null ? storageValue : localAlternateSentinel;
+      } else {
+        return localAlternateSentinel;
+      }
+    }
+    const toggleGiscusIfUsed = (isAlternate, darkModeDefault) => {
+      const baseTheme = document.querySelector('#giscus-base-theme')?.value ?? 'light';
+      const alternateTheme = document.querySelector('#giscus-alt-theme')?.value ?? 'dark';
+      let newTheme = '';
+      if(authorPrefersDark) {
+        newTheme = isAlternate ? baseTheme : alternateTheme;
+      } else {
+        newTheme = isAlternate ? alternateTheme : baseTheme;
+      }
+      const changeGiscusTheme = () => {
+        // From: https://github.com/giscus/giscus/issues/336
+        const sendMessage = (message) => {
+          const iframe = document.querySelector('iframe.giscus-frame');
+          if (!iframe) return;
+          iframe.contentWindow.postMessage({ giscus: message }, 'https://giscus.app');
+        }
+        sendMessage({
+          setConfig: {
+            theme: newTheme
+          }
+        });
+      }
+      const isGiscussLoaded = window.document.querySelector('iframe.giscus-frame') !== null;
+      if (isGiscussLoaded) {
+        changeGiscusTheme();
+      }
+    };
+    const authorPrefersDark = false;
+    const darkModeDefault = authorPrefersDark;
+      document.querySelector('link#quarto-text-highlighting-styles.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+      document.querySelector('link#quarto-bootstrap.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+    let localAlternateSentinel = darkModeDefault ? 'alternate' : 'default';
+    // Dark / light mode switch
+    window.quartoToggleColorScheme = () => {
+      // Read the current dark / light value
+      let toAlternate = !hasAlternateSentinel();
+      toggleColorMode(toAlternate);
+      setStyleSentinel(toAlternate);
+      toggleGiscusIfUsed(toAlternate, darkModeDefault);
+      window.dispatchEvent(new Event('resize'));
+    };
+    // Switch to dark mode if need be
+    if (hasAlternateSentinel()) {
+      toggleColorMode(true);
+    } else {
+      toggleColorMode(false);
+    }
+  </script>
+
+<div id="quarto-search-results"></div>
+  <header id="quarto-header" class="headroom fixed-top">
+    <nav class="navbar navbar-expand-lg " data-bs-theme="dark">
+      <div class="navbar-container container-fluid">
+      <div class="navbar-brand-container mx-auto">
+    <a href="../index.html" class="navbar-brand navbar-brand-logo">
+    <img src="../assets/ferx-dsl-brackets.svg" alt="ferx" class="navbar-logo light-content">
+    <img src="../assets/ferx-dsl-brackets.svg" alt="ferx" class="navbar-logo dark-content">
+    </a>
+    <a class="navbar-brand" href="../index.html">
+    <span class="navbar-title">ferx-core</span>
+    </a>
+  </div>
+            <div id="quarto-search" class="" title="Search"></div>
+          <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarCollapse" aria-controls="navbarCollapse" role="menu" aria-expanded="false" aria-label="Toggle navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+  <span class="navbar-toggler-icon"></span>
+</button>
+          <div class="collapse navbar-collapse" id="navbarCollapse">
+            <ul class="navbar-nav navbar-nav-scroll me-auto">
+  <li class="nav-item">
+    <a class="nav-link active" href="../getting-started.html" aria-current="page"> 
+<span class="menu-text">Get started</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/features.html"> 
+<span class="menu-text">Features</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/changelog.html"> 
+<span class="menu-text">Changelog</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/roadmap.html"> 
+<span class="menu-text">Roadmap</span></a>
+  </li>  
+</ul>
+            <ul class="navbar-nav navbar-nav-scroll ms-auto">
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/ferx-core/"> 
+<span class="menu-text">ferx-core</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/ferx-book/"> 
+<span class="menu-text">ferx-r</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/reference/"> 
+<span class="menu-text">Reference</span></a>
+  </li>  
+  <li class="nav-item compact">
+    <a class="nav-link" href="https://github.com/FeRx-NLME"> <i class="bi bi-github" role="img" aria-label="GitHub">
+</i> 
+<span class="menu-text"></span></a>
+  </li>  
+</ul>
+          </div> <!-- /navcollapse -->
+            <div class="quarto-navbar-tools">
+  <a href="" class="quarto-color-scheme-toggle quarto-navigation-tool  px-1" onclick="window.quartoToggleColorScheme(); return false;" title="Toggle dark mode"><i class="bi"></i></a>
+</div>
+      </div> <!-- /container-fluid -->
+    </nav>
+  <nav class="quarto-secondary-nav">
+    <div class="container-fluid d-flex">
+      <button type="button" class="quarto-btn-toggle btn" data-bs-toggle="collapse" role="button" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+        <i class="bi bi-layout-text-sidebar-reverse"></i>
+      </button>
+        <nav class="quarto-page-breadcrumbs" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../development/index.html">Development</a></li><li class="breadcrumb-item"><a href="../development/sdlc.html">Development Lifecycle (SDLC)</a></li></ol></nav>
+        <a class="flex-grow-1" role="navigation" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">      
+        </a>
+      <button type="button" class="btn quarto-search-button" aria-label="Search" onclick="window.quartoOpenSearch();">
+        <i class="bi bi-search"></i>
+      </button>
+    </div>
+  </nav>
+</header>
+<!-- content -->
+<div id="quarto-content" class="quarto-container page-columns page-rows-contents page-layout-article page-navbar">
+<!-- sidebar -->
+  <nav id="quarto-sidebar" class="sidebar collapse collapse-horizontal quarto-sidebar-collapse-item sidebar-navigation floating overflow-auto">
+    <div class="pt-lg-2 mt-2 text-left sidebar-header">
+      <a href="../index.html" class="sidebar-logo-link">
+      <img src="../assets/ferx-favicon.svg" alt="" class="sidebar-logo light-content py-0 d-lg-inline d-none">
+      <img src="../assets/ferx-favicon.svg" alt="" class="sidebar-logo dark-content py-0 d-lg-inline d-none">
+      </a>
+      </div>
+        <div class="mt-2 flex-shrink-0 align-items-center">
+        <div class="sidebar-search">
+        <div id="quarto-search" class="" title="Search"></div>
+        </div>
+        </div>
+    <div class="sidebar-menu-container"> 
+    <ul class="list-unstyled mt-1">
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Introduction</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../maturity.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Feature Maturity</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../getting-started.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Getting Started</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../installation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Installation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../quick-start.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Quick Start</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../model-file/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Model File Reference</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/parameters.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Parameters</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/iov.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Inter-Occasion Variability (IOV)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/individual-parameters.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Individual Parameters</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariates.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariates</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariate-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/structural-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Structural Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/lagtime.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Lagtime</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/steady-state.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Steady-State Doses (SS=1)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/error-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Error Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/bloq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">LOQ-Censored Observations</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/ode-models.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/absorption.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Built-in Absorption Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/scaling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Scaling</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/initial-conditions.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Initial Conditions</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/diffusion.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Stochastic Differential Equations (SDE / Diffusion)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/neural-networks.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Neural Networks</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariate-nn.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><code>[covariate_nn]</code> — Deep Compartment Models (DCM)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/data.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/data-selection.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Selection</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/derived.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Derived Columns (<code>[derived]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Output Columns (<code>[output]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/fit-options.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Fit Options</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/simulation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Simulation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/adaptive-dosing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Adaptive (Feedback) Dosing</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/event-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Time-to-Event Endpoints (<code>[event_model]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/categorical.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Categorical endpoints — <code>[binary_model]</code></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/markov-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Markov models ([markov_model])</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../estimation/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Estimation Methods</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/foce.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FOCE / FOCEI</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/agq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">AGQ — Adaptive Gaussian Quadrature</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/gauss-newton.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Gauss-Newton (BHHH)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/saem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">SAEM</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/sir.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Sampling Importance Resampling (SIR)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/importance-sampling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Importance Sampling (IMP)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/frem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FREM (Full Random Effects Model)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/impmap.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">IMPMAP — Importance Sampling assisted by Mode A Posteriori</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/bayes.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Bayesian estimation (MCMC)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/vi.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Variational Inference</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/parameterization.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Packed Parameter Space</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/optimizers.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Outer Optimizers</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/tte.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Time-to-Event (TTE) Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/categorical.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Categorical endpoints (binary / logistic)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/ctmm.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Continuous-time Markov models (CTMM)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/mixture.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Mixture Models</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false">
+ <span class="menu-text">Tools</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/bootstrap.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Bootstrap</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/gam-screening.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">GAM covariate screening</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/search.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Search configuration</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/covsearch.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate search</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/modelsearch.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Structural model search</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../data-format.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Format</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../cli.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">CLI Reference</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Output Files</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../warnings.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Warnings</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../file-formats/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">File Formats</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../file-formats/fitrx.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">The <code>.fitrx</code> Fit Bundle</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../file-formats/check-report.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Check Report (<code>ferx check --json</code>)</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../examples/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Examples</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/one-cpt-oral.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">One-Compartment Oral (Warfarin)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/two-cpt-iv.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Two-Compartment IV Bolus</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/covariates.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/ode-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Model (Michaelis-Menten)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/bloq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">BLOQ (M3 method)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/iov.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Inter-Occasion Variability (IOV)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/iov-saem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">IOV with SAEM</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/multiple-dosing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Multiple Dosing (ADDL Column)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/steady-state.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Steady-State Dosing (SS Column)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/scaling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Unit Scaling (<code>[scaling]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/derived-output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Derived Columns and Output</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/data-selection.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Selection (IGNORE / ACCEPT)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/ode-lagtime.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Model with Absorption Lag Time</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/transit-absorption.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Transit Absorption (Two-Compartment)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/sde.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Stochastic Differential Equations (SDE)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/frem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FREM (Covariate Analysis)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/multistart.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Multi-Start: Michaelis-Menten Elimination</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../api/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Rust API</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/types.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Core Types</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/fitting.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Fitting Functions</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/simulation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Simulation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/parsing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Parsing</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/model-editing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Model editing</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../faq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FAQ</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../development/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Development</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/contributing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Contributing to FeRx development</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/sdlc.html" class="sidebar-item-text sidebar-link active">
+ <span class="menu-text">Development Lifecycle (SDLC)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/docs-lint.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Docs linter</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+    </ul>
+    </div>
+</nav>
+<div id="quarto-sidebar-glass" class="quarto-sidebar-collapse-item" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item"></div>
+<!-- margin-sidebar -->
+    <div id="quarto-margin-sidebar" class="sidebar margin-sidebar">
+        <nav id="TOC" role="doc-toc" class="toc-active">
+    <h2 id="toc-title">On this page</h2>
+   
+  <ul>
+  <li><a href="#development-lifecycle-sdlc" id="toc-development-lifecycle-sdlc" class="nav-link active" data-scroll-target="#development-lifecycle-sdlc">Development Lifecycle (SDLC)</a>
+  <ul>
+  <li><a href="#philosophy-and-quality-bar" id="toc-philosophy-and-quality-bar" class="nav-link" data-scroll-target="#philosophy-and-quality-bar">1. Philosophy and quality bar</a></li>
+  <li><a href="#team-and-governance" id="toc-team-and-governance" class="nav-link" data-scroll-target="#team-and-governance">2. Team and governance</a></li>
+  <li><a href="#communication" id="toc-communication" class="nav-link" data-scroll-target="#communication">3. Communication</a></li>
+  <li><a href="#the-development-workflow-with-ai" id="toc-the-development-workflow-with-ai" class="nav-link" data-scroll-target="#the-development-workflow-with-ai">4. The development workflow (with AI)</a></li>
+  <li><a href="#git-workflow" id="toc-git-workflow" class="nav-link" data-scroll-target="#git-workflow">5. Git workflow</a>
+  <ul class="collapse">
+  <li><a href="#branching-model-trunk-based" id="toc-branching-model-trunk-based" class="nav-link" data-scroll-target="#branching-model-trunk-based">5.1 Branching model — trunk-based</a></li>
+  <li><a href="#experimental-large-features" id="toc-experimental-large-features" class="nav-link" data-scroll-target="#experimental-large-features">5.2 Experimental / large features</a></li>
+  <li><a href="#git-worktrees" id="toc-git-worktrees" class="nav-link" data-scroll-target="#git-worktrees">5.3 Git worktrees</a></li>
+  </ul></li>
+  <li><a href="#pull-requests" id="toc-pull-requests" class="nav-link" data-scroll-target="#pull-requests">6. Pull requests</a></li>
+  <li><a href="#gold-standard-validation" id="toc-gold-standard-validation" class="nav-link" data-scroll-target="#gold-standard-validation">7. Gold-standard validation</a></li>
+  <li><a href="#cicd-and-quality-gates" id="toc-cicd-and-quality-gates" class="nav-link" data-scroll-target="#cicd-and-quality-gates">8. CI/CD and quality gates</a>
+  <ul class="collapse">
+  <li><a href="#testing-pyramid" id="toc-testing-pyramid" class="nav-link" data-scroll-target="#testing-pyramid">8.1 Testing pyramid</a></li>
+  <li><a href="#ci-workflows-ferx-core" id="toc-ci-workflows-ferx-core" class="nav-link" data-scroll-target="#ci-workflows-ferx-core">8.2 CI workflows (ferx-core)</a></li>
+  <li><a href="#ci-workflows-ferx-r" id="toc-ci-workflows-ferx-r" class="nav-link" data-scroll-target="#ci-workflows-ferx-r">8.3 CI workflows (ferx-r)</a></li>
+  <li><a href="#code-quality-thresholds" id="toc-code-quality-thresholds" class="nav-link" data-scroll-target="#code-quality-thresholds">8.4 Code-quality thresholds</a></li>
+  <li><a href="#documentation-workflow" id="toc-documentation-workflow" class="nav-link" data-scroll-target="#documentation-workflow">8.5 Documentation workflow</a></li>
+  <li><a href="#build-portability-stock-nightly" id="toc-build-portability-stock-nightly" class="nav-link" data-scroll-target="#build-portability-stock-nightly">8.6 Build portability (stock nightly)</a></li>
+  <li><a href="#the-public-api-gate" id="toc-the-public-api-gate" class="nav-link" data-scroll-target="#the-public-api-gate">8.7 The public-API gate</a></li>
+  </ul></li>
+  <li><a href="#releases" id="toc-releases" class="nav-link" data-scroll-target="#releases">9. Releases</a></li>
+  <li><a href="#cross-repo-synchronization" id="toc-cross-repo-synchronization" class="nav-link" data-scroll-target="#cross-repo-synchronization">10. Cross-repo synchronization</a></li>
+  <li><a href="#tooling-conventions" id="toc-tooling-conventions" class="nav-link" data-scroll-target="#tooling-conventions">11. Tooling conventions</a></li>
+  <li><a href="#definition-of-done" id="toc-definition-of-done" class="nav-link" data-scroll-target="#definition-of-done">12. Definition of done</a></li>
+  <li><a href="#maintenance-support" id="toc-maintenance-support" class="nav-link" data-scroll-target="#maintenance-support">13. Maintenance &amp; support</a></li>
+  <li><a href="#security-dependencies" id="toc-security-dependencies" class="nav-link" data-scroll-target="#security-dependencies">14. Security &amp; dependencies</a></li>
+  </ul></li>
+  </ul>
+<div class="toc-actions"><ul><li><a href="https://github.com/FeRx-NLME/ferx-core/edit/main/development/sdlc.qmd" class="toc-action"><i class="bi bi-github"></i>Edit this page</a></li><li><a href="https://github.com/FeRx-NLME/ferx-core/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></nav>
+    </div>
+<!-- main -->
+<main class="content" id="quarto-document-content"><header id="title-block-header" class="quarto-title-block"><nav class="quarto-page-breadcrumbs quarto-title-breadcrumbs d-none d-lg-block" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../development/index.html">Development</a></li><li class="breadcrumb-item"><a href="../development/sdlc.html">Development Lifecycle (SDLC)</a></li></ol></nav></header>
+
+
+
+
+
+<section id="development-lifecycle-sdlc" class="level1">
+<h1>Development Lifecycle (SDLC)</h1>
+<p>This page describes how the FeRx project is developed across its two coupled repositories — <strong>ferx-core</strong> (the Rust NLME engine) and <strong>ferx-r</strong> (the R wrapper package) — from idea to release. It is the canonical process document for contributors and AI agents working on either repo.</p>
+<p>FeRx follows an <strong>iterative, trunk-based continuous-delivery</strong> model (close to Agile): small changes flow continuously to <code>main</code>, releases are tags, and the loop repeats. The scarcest planning/feasibility input is often not engineering time but <strong>AI token budget</strong> — treat it as first-class when scoping and sequencing work (a heavy multi-agent review or a large refactor is a <em>cost</em> to plan for, see <a href="#the-development-workflow-with-ai">§4</a>).</p>
+<blockquote class="blockquote">
+<p><strong>Scope.</strong> This covers governance, the issue→PR→merge→release flow, the git model, cross-repo synchronization, the testing pyramid, NONMEM validation, and the quality gates enforced by CI. It complements (does not replace) each repo’s <code>CLAUDE.md</code>, which carries the low-level build/test/style rules.</p>
+<p><strong>Want to help?</strong> You don’t need to be on the core team — see <a href="../development/contributing.html">Contributing to FeRx development</a>.</p>
+</blockquote>
+<hr>
+<section id="philosophy-and-quality-bar" class="level2">
+<h2 class="anchored" data-anchor-id="philosophy-and-quality-bar">1. Philosophy and quality bar</h2>
+<p>FeRx is a numerical estimation engine. A wrong answer that <em>looks</em> right is worse than a crash. Because the project is openly AI-assisted, it is (fairly or not) perceived as an “AI-generated” product, which raises — not lowers — the bar we hold ourselves to.</p>
+<p><strong>Principles</strong></p>
+<ul>
+<li><strong>High quality bar, especially for core numerics.</strong> Aim <em>higher</em> than comparable tools on testing and validation. Every numerical result must be reproducible and validated (see <a href="#gold-standard-validation">§7</a>).</li>
+<li><strong>Match dev speed to risk.</strong> Fast iteration is welcome for simple, non-core features and fixes. <strong>Deliberately slow down</strong> for anything that touches estimation, likelihood, PK/ODE math, or the <code>.ferx</code>/DSL surface.</li>
+<li><strong>Parity first, novelty second.</strong> The initial priority is parity with <strong>NONMEM</strong>, then Monolix / nlmixr2. Novel features (copula-IIV, neural ODEs, FREM, …) come <em>after</em> the core is trusted. The emphasis will shift toward novel features as the foundation matures.</li>
+<li><strong>Avoid FeRx becoming a “Christmas tree”</strong> Not every request belongs in FeRx. Evaluate each issue/PR against the design philosophy and <strong>prioritize the majority of users</strong>. It is fine — expected — to push back, defer, or decline, even for PRs from well-known developers. Deferral is a valid outcome if feature is not a priority: log it as a backlog issue.</li>
+</ul>
+<p><strong>Gate questions for any incoming issue or PR</strong></p>
+<ol type="1">
+<li>Does it fit the design philosophy, or does it bloat the tool?</li>
+<li>Does it serve the majority of users, or a niche of one?</li>
+<li>For a PR: is the code well-designed, well-documented, and well-tested?</li>
+<li>Can it be deferred to a future cycle without harm?</li>
+</ol>
+<hr>
+</section>
+<section id="team-and-governance" class="level2">
+<h2 class="anchored" data-anchor-id="team-and-governance">2. Team and governance</h2>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 13%">
+<col style="width: 50%">
+<col style="width: 36%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Role</th>
+<th>Members</th>
+<th>Responsibility</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><strong>Core team</strong> (≤ ~5)</td>
+<td>TBD</td>
+<td>Direction, design authority, merge rights, releases</td>
+</tr>
+<tr class="even">
+<td><strong>Power users / developers</strong> (10+)</td>
+<td>TBD</td>
+<td>Feature contributions, domain review</td>
+</tr>
+<tr class="odd">
+<td><strong>Advisory board</strong></td>
+<td>TBD</td>
+<td>Scientific guidance, validation perspective</td>
+</tr>
+<tr class="even">
+<td><strong>Pharma partners</strong></td>
+<td>—</td>
+<td>Real-world use cases, guidance</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Governance guardrails</strong></p>
+<ul>
+<li><strong>No single controlling entity.</strong> Explicitly avoid one organization controlling the project’s direction.</li>
+<li><strong>Avoid a bloated organization.</strong> Keep the decision-making core small and the process lightweight.</li>
+<li>Design-level decisions (DSL changes, estimation defaults, breaking API changes) require <strong>core-team</strong> sign-off.</li>
+</ul>
+<hr>
+</section>
+<section id="communication" class="level2">
+<h2 class="anchored" data-anchor-id="communication">3. Communication</h2>
+<ul>
+<li><strong>Google Chat</strong> for day-to-day coordination.</li>
+<li><strong>(Bi-)weekly meetings</strong> for planning and design discussion.</li>
+<li><strong>Technical discussion happens on GitHub</strong> — in the relevant Issue or PR — so it is visible, searchable, and tied to the code. Decisions made in chat or meetings that affect design should be written back into the issue/PR.</li>
+</ul>
+<hr>
+</section>
+<section id="the-development-workflow-with-ai" class="level2">
+<h2 class="anchored" data-anchor-id="the-development-workflow-with-ai">4. The development workflow (with AI)</h2>
+<p>FeRx is developed with Claude Code (CC) as a primary implementer, with humans owning intent, design, and final judgment. The standard loop:</p>
+<ol type="1">
+<li><strong>Open a Backlog Issue</strong> in the GitHub Project view. Describe the intent clearly — <strong>Why, How, and the design choices</strong>. This gives visibility to the rest of the team and forces the problem to be laid out before code is written.</li>
+<li><strong>Review the issue and agree the design before coding.</strong> Have CC rewrite the issue for clarity, then settle the <em>approach</em>. For anything touching estimation, the numerics, or the <code>.ferx</code>/DSL surface, this is an explicit <strong>design gate</strong>: write the chosen approach and the alternatives weighed into the Issue (or a short design note) and get <strong>core-team buy-in first</strong> — don’t discover the design in the diff. Simple, non-core changes can skip straight to implementation.</li>
+<li><strong>Have CC implement the issue and open the PR.</strong> Fill every section of the <a href="#pull-requests">PR template</a> — including the cross-repo dependency table.</li>
+<li><strong>For large / complex PRs — especially with numerical consequences — run the multi-agent review</strong> (<code>/code-review</code> / “ultrareview”, at medium or high effort with up to ~9 agents), then have CC fix what it finds. This is token-expensive: if the budget is tight, schedule it overnight or hand it to someone with budget.</li>
+<li><strong>Produce a NONMEM comparison</strong> of the fit (see <a href="#gold-standard-validation">§7</a>). Wire it into the test suite at the right tier: a real convergence fit → <strong>slow tests</strong>; a simulation or quick numeric check → <strong>regular tests</strong>.</li>
+<li><em>(Optional, for complex issues)</em> have <strong>Copilot</strong> review afterward as a second independent pass.</li>
+<li><strong>Large / complex PRs, or anything affecting design or the DSL, always get a human review</strong> in addition to AI review.</li>
+<li><strong>Log any remaining or deferred work as new Issues</strong> — nothing important should live only in a PR comment.</li>
+<li><strong>Manually test an example fit</strong>, ideally on real data and/or a model not already used by CC. If it misbehaves, have CC fix it.</li>
+<li><strong>Merge.</strong> Before merging, confirm the <strong>Rust and R sides are in sync</strong>, documentation is updated, and the feature/fix is fully tested.</li>
+</ol>
+<blockquote class="blockquote">
+<p><strong>Rule of thumb on AI autonomy:</strong> let CC move fast on mechanical and non-core work; insert human checkpoints (design discussion, manual fit, human review) precisely where a subtle numerical error would be expensive.</p>
+</blockquote>
+<hr>
+</section>
+<section id="git-workflow" class="level2">
+<h2 class="anchored" data-anchor-id="git-workflow">5. Git workflow</h2>
+<section id="branching-model-trunk-based" class="level3">
+<h3 class="anchored" data-anchor-id="branching-model-trunk-based">5.1 Branching model — trunk-based</h3>
+<p><strong><code>main</code> is always the latest code.</strong></p>
+<ul>
+<li>New feature/fix work is <strong>branched off <code>main</code></strong>.</li>
+<li>When done (reviewed, tested, in sync), the branch is <strong>merged into <code>main</code></strong>.</li>
+<li>A <strong>release is a tag on <code>main</code></strong> (e.g.&nbsp;<code>v0.3.0</code>); see <a href="#releases">§9</a>.</li>
+</ul>
+<pre><code>main ──●──●──●──●──●──▶   tag v0.3.0
+        \   /  \   /
+ feat/x  ●─●    \ /
+ fix/y         ●──●</code></pre>
+<p><strong>Trade-off we accept:</strong> <code>main</code> is always newest but is <em>not guaranteed release-stable</em> between tags. We mitigate this with the CI gates in <a href="#cicd-and-quality-gates">§8</a> and by treating tagged releases — not arbitrary <code>main</code> commits — as what we point users at.</p>
+<blockquote class="blockquote">
+<p>This is intentionally the simplest model. If instability on <code>main</code> becomes a recurring problem, the alternative (<code>dev</code> + release branches) can be revisited by the core team — but the default is trunk-based.</p>
+</blockquote>
+<p><strong>Hygiene</strong></p>
+<ul>
+<li><strong>Always pull the latest <code>main</code> before starting new work</strong>, and branch off it.</li>
+<li>Keep branches short-lived and focused on one issue.</li>
+<li>Branch/PR titles follow <code>type(scope): short description [closes #N]</code> — see the PR template header for the allowed <code>type</code>/<code>scope</code> values.</li>
+</ul>
+</section>
+<section id="experimental-large-features" class="level3">
+<h3 class="anchored" data-anchor-id="experimental-large-features">5.2 Experimental / large features</h3>
+<p>Big experimental features (e.g.&nbsp;copula-IIV, neural ODEs, FREM) are the exception to “merge small, merge often”:</p>
+<ul>
+<li>Develop them on a <strong>long-lived feature branch</strong> until production-ready — <strong>do not</strong> merge them into <code>main</code> piece-by-piece in a half-working state.</li>
+<li>They must be <strong>documented with multiple examples</strong>.</li>
+<li>They must be <strong>referenced to the literature</strong> (or carry a vignette, if the method is genuinely new).</li>
+</ul>
+</section>
+<section id="git-worktrees" class="level3">
+<h3 class="anchored" data-anchor-id="git-worktrees">5.3 Git worktrees</h3>
+<p>By default git checks out one revision per folder, so you work one issue at a time. <strong>Worktrees</strong> let you check out multiple branches at once, so CC can work several issues in parallel. The cost: local testing is harder (e.g.&nbsp;for the R package you must install from the worktree folder).</p>
+<ul>
+<li><strong>Avoid worktrees</strong> unless you have <strong>two or more complex issues</strong> that can’t each be finished quickly.</li>
+<li><strong>Always create the worktree off <code>main</code>.</strong></li>
+<li><strong>In ferx-r specifically</strong>, use <code>EnterWorktree</code> at the start of any session on a non-<code>main</code> branch — it stops uncommitted WIP from one chat contaminating another chat that shares the same checkout directory.</li>
+</ul>
+<hr>
+</section>
+</section>
+<section id="pull-requests" class="level2">
+<h2 class="anchored" data-anchor-id="pull-requests">6. Pull requests</h2>
+<p>Every PR uses <code>.github/PULL_REQUEST_TEMPLATE.md</code> and must fill <strong>every</strong> section before <code>gh pr create</code>. Key sections that exist specifically because of how FeRx is built:</p>
+<ul>
+<li><strong>Cross-repo dependency table</strong> — record the matching ferx-r (or ferx-core) PR and whether it must merge <em>before / after / together</em>. If a sibling PR is required but not yet open, mark the PR <strong>Draft</strong>. See <a href="#cross-repo-synchronization">§10</a>.</li>
+<li><strong>Numerical validation</strong> — reference values vs NONMEM / nlmixr2 / a prior ferx commit (see <a href="#gold-standard-validation">§7</a>).</li>
+<li><strong>Breaking changes</strong> — <code>.ferx</code> format, <code>FitResult</code>/sdtab fields, or public Rust API. sdtab/<code>FitResult</code> changes are parsed by ferx-r → link the R PR.</li>
+<li><strong>Tests</strong>, <strong>Docs</strong>, <strong>Example</strong>, and the <strong>example-execution checklist</strong> (build ferx-core, rebuild ferx-r against it, run affected examples).</li>
+</ul>
+<p><strong>R-side pre-PR gates (ferx-r)</strong></p>
+<ul>
+<li><p>Run <code>roxygen2::roxygenize()</code> and <strong>commit the regenerated <code>man/*.Rd</code></strong> — they are checked into the repo and must stay in sync with the <code>#'</code> comments in <code>R/</code>. Never hand-edit the auto-generated <code>R/extendr-wrappers.R</code>.</p></li>
+<li><p><strong>No non-ASCII characters in <code>R/*.R</code></strong> — <code>R CMD check --as-cran</code> requires pure ASCII (use <code>-</code> / <code>...</code>, not <code>—</code> / <code>…</code>). Verify before every PR:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb2"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> <span class="at">-c</span> <span class="st">"import glob; [print(f) for f in glob.glob('R/*.R') if any(b&gt;127 for b in open(f,'rb').read())]"</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div></li>
+</ul>
+<p><strong>Review requirements</strong></p>
+<ul>
+<li>All PRs: green CI + at least the AI review pass.</li>
+<li>Large/complex, numerical, design-, or DSL-affecting PRs: <strong>a human core-team review is mandatory</strong> on top of AI review.</li>
+</ul>
+<hr>
+</section>
+<section id="gold-standard-validation" class="level2">
+<h2 class="anchored" data-anchor-id="gold-standard-validation">7. Gold-standard validation</h2>
+<p><strong>Every feature that produces numerical results requires a comparison with NONMEM output</strong>, and every new feature requires a test (lowest tier that fits).</p>
+<ul>
+<li>NONMEM comparison is <strong>essential for core features</strong>. nlmixr2 parity is a fine <em>first pass</em>, but <strong>NONMEM parity is what matters</strong> — unless it’s clear nlmixr2 is the better reference.</li>
+<li>CI has <strong>no NONMEM access</strong>, so commit the <strong>NONMEM output files</strong> alongside the test/docs rather than running NONMEM in CI.</li>
+<li>Reference NONMEM 7.5+ runs are reproducible in the <code>pmx</code> container.</li>
+</ul>
+<p>Put the comparison either in the feature’s docs page (<code>docs/...</code>, <code>docs/faq.qmd</code>, or the relevant <code>estimation/*.qmd</code>) or in the PR description.</p>
+<hr>
+</section>
+<section id="cicd-and-quality-gates" class="level2">
+<h2 class="anchored" data-anchor-id="cicd-and-quality-gates">8. CI/CD and quality gates</h2>
+<section id="testing-pyramid" class="level3">
+<h3 class="anchored" data-anchor-id="testing-pyramid">8.1 Testing pyramid</h3>
+<p>Tests live in three tiers (see <code>CLAUDE.md</code> for placement rules). Put a new test in the <strong>lowest tier whose constraints it fits</strong>.</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 18%">
+<col style="width: 18%">
+<col style="width: 21%">
+<col style="width: 42%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Tier</th>
+<th>What</th>
+<th>Where</th>
+<th>When it runs</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><strong>1 — Unit</strong></td>
+<td>Smallest helper isolating the behaviour; core functionality, math/predictions, fast numeric checks vs NONMEM (e.g.&nbsp;IPRED for ADVAN1-5). Avoid <code>fit()</code>.</td>
+<td>inline <code>#[cfg(test)]</code> in <code>src/**</code></td>
+<td>Every PR. <strong>Whole suite must stay &lt; 10 min</strong> (target seconds).</td>
+</tr>
+<tr class="even">
+<td><strong>2 — Integration</strong></td>
+<td>Public API (<code>fit()</code>, <code>predict()</code>, …) but returns immediately — <code>Ok</code> after a few outer iterations, or an <code>Err</code>. <strong>No convergence loops.</strong></td>
+<td><code>tests/*.rs</code></td>
+<td>Compile-checked every PR; run nightly.</td>
+</tr>
+<tr class="odd">
+<td><strong>3 — Slow / convergence</strong></td>
+<td>Full population fits to convergence; NONMEM / nlmixr2 fit comparisons.</td>
+<td><code>tests/*.rs</code> or <code>src/</code>, gated behind <code>slow-tests</code></td>
+<td>Nightly (<code>slow-tests.yml</code>, 06:00 UTC) + on push to <code>main</code> touching estimation code.</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Real-data tests</strong> are currently <strong>manual</strong> (a handful of models Ron re-runs after each major feature) and not yet on GitHub — a known gap to formalize.</p>
+</section>
+<section id="ci-workflows-ferx-core" class="level3">
+<h3 class="anchored" data-anchor-id="ci-workflows-ferx-core">8.2 CI workflows (ferx-core)</h3>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 40%">
+<col style="width: 36%">
+<col style="width: 24%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Workflow</th>
+<th>Trigger</th>
+<th>Jobs</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>ci.yml</code></td>
+<td>PR + push to <code>main</code></td>
+<td><code>Check</code> (compile-only, incl.&nbsp;the <code>survival</code> / <code>markov</code> / <code>slow-tests</code> feature combos), <code>Tests + coverage (core)</code> (<code>--tests --features ci</code>, instrumented — runs the Tier-1/2 suite <em>and</em> produces the patch-coverage report), <code>Tests + coverage (TTE/CTMM endpoints)</code> (<code>--features ci,markov</code>, only the endpoint test binaries), <code>Tests (debug-assertions)</code> (<code>--lib</code> on the <strong>dev</strong> profile, so <code>debug_assert!</code> guards actually run — see below), <code>Clippy</code>, <code>Format</code>, <code>Public API baseline</code> (diffs <code>api/ferx-core-public-api.txt</code>); <strong><code>Tests + coverage (full, slow-tests)</code></strong> on weekly schedule / manual</td>
+</tr>
+<tr class="even">
+<td><code>slow-tests.yml</code></td>
+<td>nightly 06:00 UTC, manual, push to <code>main</code> touching estimation paths</td>
+<td>Tier-3 fits to convergence (<code>--features ci,slow-tests --release</code>, <code>--no-fail-fast</code>)</td>
+</tr>
+<tr class="odd">
+<td><code>docs.yml</code></td>
+<td>push to <code>main</code> touching <code>docs/**</code></td>
+<td><code>quarto render</code> → deploy to <code>gh-pages</code></td>
+</tr>
+<tr class="even">
+<td><code>release.yml</code></td>
+<td>tag <code>v*</code> or manual</td>
+<td>GitHub release with generated notes</td>
+</tr>
+</tbody>
+</table>
+<blockquote class="blockquote">
+<p>Note: <code>RAYON_NUM_THREADS=1</code> is pinned in CI so cargo owns the test parallelism on 2-core runners. Don’t remove it.</p>
+</blockquote>
+<p><strong>Why a separate <code>Tests (debug-assertions)</code> job.</strong> Every other test job builds with <code>--profile ci-test</code> or <code>--profile ci-fast</code>, and both <code>inherits = "release"</code> — so <code>debug-assertions</code> is off and each of the ~180 <code>debug_assert!</code> guards in the crate compiles to nothing. They were invariant checks CI never ran: an off-by-one in <code>compute_max_stack</code> tripped its own <code>debug_assert!</code> for any expression containing an <code>if</code>, and four lib tests panicked under the dev profile while CI stayed green (fixed in #342; the blind spot in #344). The fix is a separate job, not a flipped profile — <code>ci-test</code> exists so the fits run at release speed. Its commands live in <code>tools/preflight.sh</code> under the <code>debug-assertions</code> group; run them locally with</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb3"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">tools/preflight.sh</span> debug-assertions</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>That group is the one <code>tools/preflight.sh</code> skips when you pass no arguments: it runs a test suite rather than a compile, so it is minutes rather than seconds. Name it when you want it.</p>
+<p>Its commands carry <code>env FERX_REQUIRE_DEBUG_ASSERTIONS=1</code>, which arms a canary (<code>debug_assertion_canary</code> in <code>src/lib_tests.rs</code>) that fails the run if <code>debug_assert!</code> turns out to compile to nothing after all. Without it the gate would rest on the <em>absence</em> of a <code>--profile</code> flag, and a <code>[profile.dev] debug-assertions = false</code> or a <code>CARGO_PROFILE_DEV_DEBUG_ASSERTIONS</code> in the environment would neuter the whole job with every test still green. Do not set that variable anywhere else: every other job legitimately runs with the guards off.</p>
+<p>What this does <strong>not</strong> fix: <code>debug_assert!</code> condition lines are still permanently zero-hit regions in the Codecov reports, because every coverage job uses a release-derived profile. See #1248.</p>
+</section>
+<section id="ci-workflows-ferx-r" class="level3">
+<h3 class="anchored" data-anchor-id="ci-workflows-ferx-r">8.3 CI workflows (ferx-r)</h3>
+<p><code>R-CMD-check.yaml</code> and <code>test-coverage.yaml</code>. <strong>ferx-r CI builds ferx-core from the commit pinned in <code>ferx-r/src/rust/Cargo.lock</code></strong> — not from latest <code>main</code>. See <a href="#cross-repo-synchronization">§10</a>.</p>
+</section>
+<section id="code-quality-thresholds" class="level3">
+<h3 class="anchored" data-anchor-id="code-quality-thresholds">8.4 Code-quality thresholds</h3>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 25%">
+<col style="width: 41%">
+<col style="width: 33%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Tool</th>
+<th>Measures</th>
+<th>Target</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><strong>Codecov</strong></td>
+<td>unit-test line coverage</td>
+<td><strong>&gt;90%</strong>; a PR must not degrade coverage (Codecov comments on PRs)</td>
+</tr>
+<tr class="even">
+<td><strong>CodeFactor</strong></td>
+<td>code quality / smells</td>
+<td><strong>A+</strong></td>
+</tr>
+</tbody>
+</table>
+<p><code>rustfmt</code> is enforced by the shared pre-commit hook (<code>git config core.hooksPath .githooks</code>) and by the <code>fmt</code> CI job; <code>clippy</code> must be clean.</p>
+</section>
+<section id="documentation-workflow" class="level3">
+<h3 class="anchored" data-anchor-id="documentation-workflow">8.5 Documentation workflow</h3>
+<p>Docs are a <a href="https://quarto.org/">Quarto</a> website under <code>docs/</code>, using the same brand assets and styling as the main ferx site in <code>../ferx-nlme.github.io</code>.</p>
+<ul>
+<li><strong>Edit only Quarto sources under <code>docs/</code>.</strong> <code>docs/_site/</code> is generated, git-ignored, and <strong>never committed</strong> — <code>docs.yml</code> builds and deploys it to <code>gh-pages</code> on every push to <code>main</code> touching <code>docs/**</code>. Build locally to preview, but leave the output untracked.</li>
+<li><strong>New pages must be linked in <code>docs/_quarto.yml</code></strong> or they won’t appear in the website sidebar.</li>
+<li>Route user-visible changes to the right page: <code>model-file/fit-options.qmd</code> (<code>[fit_options]</code> keys), <code>model-file/individual-parameters.qmd</code> (DSL syntax), <code>estimation/*.qmd</code> (estimator behaviour), <code>faq.qmd</code> (NONMEM / nlmixr2 comparisons).</li>
+<li>On the R side, the <code>roxygen2</code>-generated <code>man/*.Rd</code> files <strong>are</strong> the docs — regenerate and commit them (see <a href="#pull-requests">§6</a>).</li>
+<li><strong><code>cargo test -p docs-lint</code> gates the structure</strong> — section size, heading levels, duplicate anchors and dead internal links. It runs on every PR as the <code>Docs lint</code> job; the rules and how to fix each one are on the <a href="../development/docs-lint.html">Docs linter</a> page.</li>
+<li><strong>Keep rationale and validation in their own subsection</strong>, so a usage section is not also a wall of background — see <a href="../development/contributing.html#writing-a-docs-page">Writing a docs page</a>.</li>
+</ul>
+<p>Render locally with <code>tools/render-docs.sh</code> before marking documentation-heavy PRs ready for review. Prefer it to a bare <code>quarto render docs</code>: Quarto’s project input discovery skips any path with a <strong>hidden</strong> (dot-prefixed) directory component, so in a worktree under <code>.claude/worktrees/&lt;name&gt;/</code> — which <code>CLAUDE.md</code> asks for on any branch that is not <code>main</code> — <code>quarto render docs</code> finds <em>zero</em> inputs. It writes <code>robots.txt</code> and <code>sitemap.xml</code>, renders not one page, prints no warning and <strong>exits 0</strong>. The script stages <code>docs/</code> outside the dot directory in that case, and fails loudly if a render produces no pages.</p>
+</section>
+<section id="build-portability-stock-nightly" class="level3">
+<h3 class="anchored" data-anchor-id="build-portability-stock-nightly">8.6 Build portability (stock nightly)</h3>
+<p>ferx-core builds on a <strong>stock nightly</strong> toolchain — no custom compiler. The exact FOCE/FOCEI and HMC gradients come from hand-rolled analytic <code>Dual2</code> sensitivities (<code>sens/</code>), and models outside the provider’s scope fall back to finite differences.</p>
+<p>In fact there is no nightly-only code left, which is why the three coverage jobs in <code>ci.yml</code> — and <code>Tests (debug-assertions)</code> — override <code>RUSTUP_TOOLCHAIN</code> to <strong>stable</strong>: stable’s rustc version holds for ~6 weeks against nightly’s daily bump, keeping their instrumented build cache warm. <code>rust-toolchain.toml</code> still pins nightly as the default, and <code>Check</code> / <code>Clippy</code> / <code>Format</code> run on it.</p>
+<ul>
+<li><strong>Keep the build toolchain-light.</strong> Standard-Rust users (Mac / Linux / Windows) and CI install ferx with <code>cargo build</code> alone. Do not reintroduce a dependency on a custom compiler or a non-default Cargo feature for the core gradient path.</li>
+</ul>
+<hr>
+</section>
+<section id="the-public-api-gate" class="level3">
+<h3 class="anchored" data-anchor-id="the-public-api-gate">8.7 The public-API gate</h3>
+<p>The repo is a cargo workspace: the root package is the <code>ferx-core</code> <strong>library</strong>, with <code>crates/ferx-tools</code> (multi-fit tooling — bootstrap, covariate search, cross-validation) and <code>crates/ferx-cli</code> (the <code>ferx</code> binary) stacked on top. The boundary rule is <em><code>ferx-core</code> = one model, one dataset, one fit; <code>ferx-tools</code> = many fits</em>. Statistical kernels stay in core; orchestration of repeated fits does not.</p>
+<p>Members can only reach <code>ferx-core</code> through its <code>pub</code> API, so the way that boundary erodes is core growing an ad-hoc <code>pub</code> in the same PR that needs it. <code>api/ferx-core-public-api.txt</code> is a committed <code>cargo public-api</code> snapshot and the <code>Public API baseline</code> job diffs it, which turns every widening into one explicit reviewable line rather than something buried in a large change. It doubles as semver protection for the crates.io release and for ferx-r.</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb4"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">tools/update-public-api.sh</span>          <span class="co"># regenerate after an intended change</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="ex">tools/update-public-api.sh</span> <span class="at">--check</span>  <span class="co"># what CI runs</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p><code>#[doc(hidden)]</code> is banned outright (<code>tests/public_api_boundary.rs</code>): <code>cargo public-api</code> omits such items, so the attribute is a working bypass of this gate, not a style question. And anything <code>ferx-tools</code> needs must also be reachable from ferx-r, which consumes <code>ferx-core</code> as an ordinary external crate — an API that only makes sense “because we’re in the same workspace” is the wrong API.</p>
+<hr>
+</section>
+</section>
+<section id="releases" class="level2">
+<h2 class="anchored" data-anchor-id="releases">9. Releases</h2>
+<p>Trunk-based, so a release is a <strong>tag on <code>main</code></strong>:</p>
+<ol type="1">
+<li>Confirm <code>main</code> is green (CI), ferx-core ↔︎ ferx-r are in sync, docs are current, and the relevant <code>Cargo.toml</code> / <code>DESCRIPTION</code> versions are bumped. <em>(Current: ferx-core <code>0.1.6</code>, ferx-r <code>0.1.5</code>.)</em></li>
+<li>Tag <code>main</code> with <code>vX.Y.Z</code> (e.g.&nbsp;<code>v0.3.0</code>). <code>release.yml</code> builds the GitHub release and generates notes.</li>
+<li>Point users at the <strong>tagged release</strong>, not an arbitrary <code>main</code> commit.</li>
+<li>For an R-side release, ensure <code>Cargo.lock</code> pins the intended ferx-core commit (see below) so the build is reproducible.</li>
+</ol>
+<p><strong>Versioning.</strong> Both repos follow <strong>semantic versioning</strong> (<code>MAJOR.MINOR.PATCH</code>). A breaking change to the <code>.ferx</code> format, the public Rust API, or sdtab / <code>FitResult</code> fields bumps MAJOR (pre-1.0, bump MINOR); a backward-compatible feature bumps MINOR; a fix bumps PATCH. The PR template’s <em>Breaking changes</em> section is what flags that a MAJOR/MINOR bump is due.</p>
+<p><strong>Changelog.</strong> ferx-core keeps a hand-curated <code>CHANGELOG.md</code> (Keep a Changelog format); add an <code>[Unreleased]</code> entry <strong>in the same PR</strong> as any user-facing change — <code>CLAUDE.md</code> carries the rule. ferx-r keeps the equivalent <code>NEWS.md</code>, so a cross-repo change may touch both. <code>release.yml</code> additionally auto-generates GitHub release notes from merged PRs, so keep PR titles in <code>type(scope): …</code> form. User-facing breaking changes also carry <strong>migration notes</strong> (PR template).</p>
+<p><strong>Distribution.</strong> Releases are <strong>GitHub releases</strong> built by <code>release.yml</code> on each <code>vX.Y.Z</code> tag. Today ferx-core is consumed as a <strong>git dependency</strong> (not published to crates.io) and ferx-r is installed from source / GitHub (<code>R CMD INSTALL</code>, e.g.&nbsp;<code>remotes::install_github</code>). If we later publish to crates.io or a CRAN-style channel, add that publish step here.</p>
+<hr>
+</section>
+<section id="cross-repo-synchronization" class="level2">
+<h2 class="anchored" data-anchor-id="cross-repo-synchronization">10. Cross-repo synchronization</h2>
+<p>The two repos are coupled, and keeping them in sync is a first-class part of the lifecycle — <strong>a PR is not “done” until both sides agree.</strong></p>
+<p><strong>Local builds (automatic).</strong> ferx-r’s <code>src/rust/.cargo/config.toml</code> carries a <code>[patch]</code> that swaps in <code>../../../ferx-core</code> when this checkout exists, so <strong>local</strong> R builds pick up ferx-core changes with no Cargo edits. Verify a ferx-core change by rebuilding the R package:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb5"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> build <span class="at">--release</span>                       <span class="co"># ferx-core</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> ../ferx-r <span class="kw">&amp;&amp;</span> <span class="ex">R</span> CMD INSTALL .</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<blockquote class="blockquote">
+<p><strong>Never commit a <code>Cargo.toml</code> that flips the ferx-core dep to a path dependency.</strong> ferx-r’s <code>src/rust/Cargo.toml</code> pins ferx-core as a git dep on <code>main</code>; the <code>[patch]</code> already handles the local swap. A committed path dep breaks reviewers and CI, which build against GitHub <code>main</code>.</p>
+</blockquote>
+<p><strong>ferx-r CI (manual bump required).</strong> CI does <strong>not</strong> get the change automatically — it builds from the ferx-core commit pinned in <code>ferx-r/src/rust/Cargo.lock</code>. A ferx-r PR that needs a new ferx-core commit (e.g.&nbsp;a newly-<code>pub</code> API) must bump that lock with:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb6"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">ferx-r/tools/update-ferx-core-lock.sh</span>        <span class="co"># never a bare `cargo update`</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>A bare <code>cargo update</code> unpins the patch and CI fails with <code>error[E0603]: ... is private</code>.</p>
+<p><strong>Checklist when changing a <code>pub</code> API or <code>FitResult</code>/sdtab field</strong></p>
+<ul class="task-list">
+<li><label><input type="checkbox">Regenerate the public-API baseline in the same PR (<code>tools/update-public-api.sh</code>) and state which caller needs each added item — the <code>Public API baseline</code> job fails until you do. See <a href="#the-public-api-gate">§8.7</a>.</label></li>
+<li><label><input type="checkbox">Open the matching ferx-r PR and record it in the PR cross-repo table.</label></li>
+<li><label><input type="checkbox">Bump <code>Cargo.lock</code> in ferx-r via <code>update-ferx-core-lock.sh</code>.</label></li>
+<li><label><input type="checkbox">Confirm the R package compiles against the new ferx-core.</label></li>
+<li><label><input type="checkbox">Update docs on both sides.</label></li>
+<li><label><input type="checkbox">Coverage not degraded.</label></li>
+</ul>
+<hr>
+</section>
+<section id="tooling-conventions" class="level2">
+<h2 class="anchored" data-anchor-id="tooling-conventions">11. Tooling conventions</h2>
+<ul>
+<li><strong>Model:</strong> use <strong>Opus 4.6 or better</strong> for development. <strong>Never Sonnet or Haiku</strong> for code (Sonnet is acceptable only for documentation). <em>(Newer Opus releases — 4.7, 4.8 — supersede 4.6 under the same rule.)</em></li>
+<li><strong>Pre-commit hook:</strong> <code>git config core.hooksPath .githooks</code> after cloning (blocks commits failing <code>rustfmt</code>).</li>
+<li><strong>Sensitivity-reachable code:</strong> keep functions on the <code>Dual2</code> path (the <code>*_g&lt;T: PkNum&gt;</code> closed forms and propagators) differentiable — use <code>if</code>/<code>else</code> rather than <code>f64::max</code>/<code>min</code> where it matters; see “Analytic Sensitivities” in <code>CLAUDE.md</code>.</li>
+</ul>
+<hr>
+</section>
+<section id="definition-of-done" class="level2">
+<h2 class="anchored" data-anchor-id="definition-of-done">12. Definition of done</h2>
+<p>A change is done only when <strong>all</strong> of the following hold:</p>
+<ul class="task-list">
+<li><label><input type="checkbox">Implements the issue’s stated intent; design choices discussed where open.</label></li>
+<li><label><input type="checkbox">Tests added at the correct tier; whole fast suite still &lt; 10 min.</label></li>
+<li><label><input type="checkbox">NONMEM comparison included for any numerical behaviour.</label></li>
+<li><label><input type="checkbox">CI green: <code>check</code>, <code>test</code>, <code>survival</code>, <code>clippy</code>, <code>fmt</code>, <code>public-api</code>; coverage not degraded.</label></li>
+<li><label><input type="checkbox">AI review run (and human review for large/numerical/DSL/design PRs).</label></li>
+<li><label><input type="checkbox">Docs updated (<code>docs/**</code>, examples) for any user-visible change.</label></li>
+<li><label><input type="checkbox">ferx-core ↔︎ ferx-r in sync (R package compiles; <code>Cargo.lock</code> bumped if needed).</label></li>
+<li><label><input type="checkbox">R-side (if touched): <code>man/</code> regenerated &amp; committed, <code>R/*.R</code> pure ASCII, the package still installs with a stock <code>cargo build</code>.</label></li>
+<li><label><input type="checkbox">Deferred/remaining work logged as new Issues.</label></li>
+<li><label><input type="checkbox">Manually tested on an example fit (ideally real / novel data).</label></li>
+</ul>
+<hr>
+</section>
+<section id="maintenance-support" class="level2">
+<h2 class="anchored" data-anchor-id="maintenance-support">13. Maintenance &amp; support</h2>
+<p>Work doesn’t stop at a release — most of an estimation engine’s life is bug reports, parity questions, and follow-up fixes.</p>
+<p><strong>Bug triage.</strong> User-reported problems land as GitHub Issues (see <a href="../development/contributing.html">Contributing</a>) and are labelled and prioritized in the Project view. Reproduce first; a confirmed bug gets a <strong>failing regression test before the fix</strong> (see <a href="#cicd-and-quality-gates">§8</a>). Correctness bugs in the core numerics outrank cosmetic issues.</p>
+<p><strong>Patch / hotfix releases.</strong> Trunk-based keeps <code>main</code> as the newest code, which is the easy case: an urgent fix branches off <code>main</code>, merges, and ships as a <strong>PATCH tag</strong> (<code>vX.Y.Z+1</code>). If <code>main</code> already carries unreleased work that shouldn’t go out yet, cherry-pick the fix onto the <strong>latest release tag</strong> on a short-lived <code>release/vX.Y</code> branch and tag the patch from there — this is the explicit answer to trunk-based’s “<code>main</code> isn’t always release-stable” trade-off (<a href="#git-workflow">§5</a>). A cross-repo fix must keep ferx-core ↔︎ ferx-r in sync (<a href="#cross-repo-synchronization">§10</a>).</p>
+<p><strong>Deprecation &amp; breaking changes.</strong> Avoid silent breaks. A breaking change to the <code>.ferx</code> format, the public API, or sdtab / <code>FitResult</code> fields must be flagged in the PR template’s <em>Breaking changes</em> section, carry <strong>migration notes</strong>, bump the version (<a href="#releases">§9</a>), and be announced in the release notes / <code>NEWS.md</code>. Where practical, <strong>deprecate with a warning for one release</strong> before removing.</p>
+<p><strong>Supported versions &amp; support channel.</strong> We support the <strong>latest release</strong> and encourage users to upgrade; old release lines aren’t maintained unless a security fix demands it. User-facing support is via <strong>GitHub Issues</strong>; internal coordination via Google Chat (<a href="#communication">§3</a>).</p>
+<hr>
+</section>
+<section id="security-dependencies" class="level2">
+<h2 class="anchored" data-anchor-id="security-dependencies">14. Security &amp; dependencies</h2>
+<p>FeRx is a numerical library, not a network service, so its attack surface is small — but it ships native code (FFI via extendr) and a tree of crate / R dependencies, all of which need hygiene. We aim for a lightweight <strong>DevSecOps</strong> posture: push these checks into CI rather than bolt them on later.</p>
+<p><strong>Dependency hygiene.</strong> Keep dependencies current and watch for advisories:</p>
+<ul>
+<li>Run <strong><code>cargo audit</code></strong> (RUSTSEC advisory DB) over the Rust tree — wired into CI as <code>.github/workflows/audit.yml</code> (on dependency-file changes, weekly, and on demand).</li>
+<li><strong>Dependabot</strong> (<code>.github/dependabot.yml</code>) opens weekly <code>cargo</code> and <code>github-actions</code> update PRs for ferx-core. <em>(ferx-r: still to add.)</em></li>
+<li>Pin the nightly toolchain (<code>rust-toolchain.toml</code>) and bump it deliberately; a toolchain roll should not silently change numerical behaviour (<a href="#cicd-and-quality-gates">§8</a>).</li>
+</ul>
+<p><strong>Native / unsafe code.</strong> Review any <code>unsafe</code> and the <strong>extendr FFI boundary</strong> (<code>src/rust/src/lib.rs</code> in ferx-r) with extra care — a memory-safety bug there can crash the host R session. Prefer safe abstractions; justify any <code>unsafe</code> in the PR.</p>
+<p><strong>Vulnerability reporting.</strong> Report suspected vulnerabilities <strong>privately</strong>, not in a public Issue — ferx-core’s <a href="https://github.com/FeRx-NLME/ferx-core/security/policy"><code>SECURITY.md</code></a> documents the GitHub private-advisory flow. <em>(ferx-r: <code>SECURITY.md</code> still to add.)</em></p>
+<p><strong>Security-sensitive changes.</strong> For changes that parse untrusted input, do file I/O, or touch the FFI boundary, run the <strong><code>/security-review</code></strong> skill (or request a focused human review) before merge.</p>
+
+
+</section>
+</section>
+
+</main> <!-- /main -->
+<script>
+(function () {
+  var HEAD = '<div class="panel-head"><span class="dots"><i></i><i></i><i></i></span><span class="file"><span class="br">[</span>warfarin_pk.ferx<span class="br">]</span></span></div>';
+
+  function apply() {
+    var dark = document.documentElement.getAttribute('data-bs-theme') === 'dark';
+    document.querySelectorAll('div.sourceCode').forEach(function (el) {
+      if (el.parentElement && el.parentElement.closest('.code-panel')) return;
+      if (dark) {
+        if (!el.classList.contains('code-panel')) {
+          el.classList.add('code-panel');
+          el.insertAdjacentHTML('afterbegin', HEAD);
+        }
+      } else {
+        el.classList.remove('code-panel');
+        var h = el.querySelector(':scope > .panel-head');
+        if (h) h.remove();
+      }
+    });
+  }
+
+  if (document.body) apply();
+  document.addEventListener('DOMContentLoaded', apply);
+  new MutationObserver(function (ms) {
+    ms.forEach(function (m) { if (m.attributeName === 'data-bs-theme') apply(); });
+  }).observe(document.documentElement, { attributes: true });
+}());
+</script>
+<script id="quarto-html-after-body" type="application/javascript">
+  window.document.addEventListener("DOMContentLoaded", function (event) {
+    // Ensure there is a toggle, if there isn't float one in the top right
+    if (window.document.querySelector('.quarto-color-scheme-toggle') === null) {
+      const a = window.document.createElement('a');
+      a.classList.add('top-right');
+      a.classList.add('quarto-color-scheme-toggle');
+      a.href = "";
+      a.onclick = function() { try { window.quartoToggleColorScheme(); } catch {} return false; };
+      const i = window.document.createElement("i");
+      i.classList.add('bi');
+      a.appendChild(i);
+      window.document.body.appendChild(a);
+    }
+    setColorSchemeToggle(hasAlternateSentinel())
+    const icon = "";
+    const anchorJS = new window.AnchorJS();
+    anchorJS.options = {
+      placement: 'right',
+      icon: icon
+    };
+    anchorJS.add('.anchored');
+    const isCodeAnnotation = (el) => {
+      for (const clz of el.classList) {
+        if (clz.startsWith('code-annotation-')) {                     
+          return true;
+        }
+      }
+      return false;
+    }
+    const onCopySuccess = function(e) {
+      // button target
+      const button = e.trigger;
+      // don't keep focus
+      button.blur();
+      // flash "checked"
+      button.classList.add('code-copy-button-checked');
+      var currentTitle = button.getAttribute("title");
+      button.setAttribute("title", "Copied!");
+      let tooltip;
+      if (window.bootstrap) {
+        button.setAttribute("data-bs-toggle", "tooltip");
+        button.setAttribute("data-bs-placement", "left");
+        button.setAttribute("data-bs-title", "Copied!");
+        tooltip = new bootstrap.Tooltip(button, 
+          { trigger: "manual", 
+            customClass: "code-copy-button-tooltip",
+            offset: [0, -8]});
+        tooltip.show();    
+      }
+      setTimeout(function() {
+        if (tooltip) {
+          tooltip.hide();
+          button.removeAttribute("data-bs-title");
+          button.removeAttribute("data-bs-toggle");
+          button.removeAttribute("data-bs-placement");
+        }
+        button.setAttribute("title", currentTitle);
+        button.classList.remove('code-copy-button-checked');
+      }, 1000);
+      // clear code selection
+      e.clearSelection();
+    }
+    const getTextToCopy = function(trigger) {
+      const outerScaffold = trigger.parentElement.cloneNode(true);
+      const codeEl = outerScaffold.querySelector('code');
+      for (const childEl of codeEl.children) {
+        if (isCodeAnnotation(childEl)) {
+          childEl.remove();
+        }
+      }
+      return codeEl.innerText;
+    }
+    const clipboard = new window.ClipboardJS('.code-copy-button:not([data-in-quarto-modal])', {
+      text: getTextToCopy
+    });
+    clipboard.on('success', onCopySuccess);
+    if (window.document.getElementById('quarto-embedded-source-code-modal')) {
+      const clipboardModal = new window.ClipboardJS('.code-copy-button[data-in-quarto-modal]', {
+        text: getTextToCopy,
+        container: window.document.getElementById('quarto-embedded-source-code-modal')
+      });
+      clipboardModal.on('success', onCopySuccess);
+    }
+      var localhostRegex = new RegExp(/^(?:http|https):\/\/localhost\:?[0-9]*\//);
+      var mailtoRegex = new RegExp(/^mailto:/);
+        var filterRegex = new RegExp("https:\/\/ferx-nlme\.github\.io\/ferx-core\/");
+      var isInternal = (href) => {
+          return filterRegex.test(href) || localhostRegex.test(href) || mailtoRegex.test(href);
+      }
+      // Inspect non-navigation links and adorn them if external
+     var links = window.document.querySelectorAll('a[href]:not(.nav-link):not(.navbar-brand):not(.toc-action):not(.sidebar-link):not(.sidebar-item-toggle):not(.pagination-link):not(.no-external):not([aria-hidden]):not(.dropdown-item):not(.quarto-navigation-tool):not(.about-link)');
+      for (var i=0; i<links.length; i++) {
+        const link = links[i];
+        if (!isInternal(link.href)) {
+          // undo the damage that might have been done by quarto-nav.js in the case of
+          // links that we want to consider external
+          if (link.dataset.originalHref !== undefined) {
+            link.href = link.dataset.originalHref;
+          }
+        }
+      }
+    function tippyHover(el, contentFn, onTriggerFn, onUntriggerFn) {
+      const config = {
+        allowHTML: true,
+        maxWidth: 500,
+        delay: 100,
+        arrow: false,
+        appendTo: function(el) {
+            return el.parentElement;
+        },
+        interactive: true,
+        interactiveBorder: 10,
+        theme: 'quarto',
+        placement: 'bottom-start',
+      };
+      if (contentFn) {
+        config.content = contentFn;
+      }
+      if (onTriggerFn) {
+        config.onTrigger = onTriggerFn;
+      }
+      if (onUntriggerFn) {
+        config.onUntrigger = onUntriggerFn;
+      }
+      window.tippy(el, config); 
+    }
+    const noterefs = window.document.querySelectorAll('a[role="doc-noteref"]');
+    for (var i=0; i<noterefs.length; i++) {
+      const ref = noterefs[i];
+      tippyHover(ref, function() {
+        // use id or data attribute instead here
+        let href = ref.getAttribute('data-footnote-href') || ref.getAttribute('href');
+        try { href = new URL(href).hash; } catch {}
+        const id = href.replace(/^#\/?/, "");
+        const note = window.document.getElementById(id);
+        if (note) {
+          return note.innerHTML;
+        } else {
+          return "";
+        }
+      });
+    }
+    const xrefs = window.document.querySelectorAll('a.quarto-xref');
+    const processXRef = (id, note) => {
+      // Strip column container classes
+      const stripColumnClz = (el) => {
+        el.classList.remove("page-full", "page-columns");
+        if (el.children) {
+          for (const child of el.children) {
+            stripColumnClz(child);
+          }
+        }
+      }
+      stripColumnClz(note)
+      if (id === null || id.startsWith('sec-')) {
+        // Special case sections, only their first couple elements
+        const container = document.createElement("div");
+        if (note.children && note.children.length > 2) {
+          container.appendChild(note.children[0].cloneNode(true));
+          for (let i = 1; i < note.children.length; i++) {
+            const child = note.children[i];
+            if (child.tagName === "P" && child.innerText === "") {
+              continue;
+            } else {
+              container.appendChild(child.cloneNode(true));
+              break;
+            }
+          }
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(container);
+          }
+          return container.innerHTML
+        } else {
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(note);
+          }
+          return note.innerHTML;
+        }
+      } else {
+        // Remove any anchor links if they are present
+        const anchorLink = note.querySelector('a.anchorjs-link');
+        if (anchorLink) {
+          anchorLink.remove();
+        }
+        if (window.Quarto?.typesetMath) {
+          window.Quarto.typesetMath(note);
+        }
+        if (note.classList.contains("callout")) {
+          return note.outerHTML;
+        } else {
+          return note.innerHTML;
+        }
+      }
+    }
+    for (var i=0; i<xrefs.length; i++) {
+      const xref = xrefs[i];
+      tippyHover(xref, undefined, function(instance) {
+        instance.disable();
+        let url = xref.getAttribute('href');
+        let hash = undefined; 
+        if (url.startsWith('#')) {
+          hash = url;
+        } else {
+          try { hash = new URL(url).hash; } catch {}
+        }
+        if (hash) {
+          const id = hash.replace(/^#\/?/, "");
+          const note = window.document.getElementById(id);
+          if (note !== null) {
+            try {
+              const html = processXRef(id, note.cloneNode(true));
+              instance.setContent(html);
+            } finally {
+              instance.enable();
+              instance.show();
+            }
+          } else {
+            // See if we can fetch this
+            fetch(url.split('#')[0])
+            .then(res => res.text())
+            .then(html => {
+              const parser = new DOMParser();
+              const htmlDoc = parser.parseFromString(html, "text/html");
+              const note = htmlDoc.getElementById(id);
+              if (note !== null) {
+                const html = processXRef(id, note);
+                instance.setContent(html);
+              } 
+            }).finally(() => {
+              instance.enable();
+              instance.show();
+            });
+          }
+        } else {
+          // See if we can fetch a full url (with no hash to target)
+          // This is a special case and we should probably do some content thinning / targeting
+          fetch(url)
+          .then(res => res.text())
+          .then(html => {
+            const parser = new DOMParser();
+            const htmlDoc = parser.parseFromString(html, "text/html");
+            const note = htmlDoc.querySelector('main.content');
+            if (note !== null) {
+              // This should only happen for chapter cross references
+              // (since there is no id in the URL)
+              // remove the first header
+              if (note.children.length > 0 && note.children[0].tagName === "HEADER") {
+                note.children[0].remove();
+              }
+              const html = processXRef(null, note);
+              instance.setContent(html);
+            } 
+          }).finally(() => {
+            instance.enable();
+            instance.show();
+          });
+        }
+      }, function(instance) {
+      });
+    }
+        let selectedAnnoteEl;
+        const selectorForAnnotation = ( cell, annotation) => {
+          let cellAttr = 'data-code-cell="' + cell + '"';
+          let lineAttr = 'data-code-annotation="' +  annotation + '"';
+          const selector = 'span[' + cellAttr + '][' + lineAttr + ']';
+          return selector;
+        }
+        const selectCodeLines = (annoteEl) => {
+          const doc = window.document;
+          const targetCell = annoteEl.getAttribute("data-target-cell");
+          const targetAnnotation = annoteEl.getAttribute("data-target-annotation");
+          const annoteSpan = window.document.querySelector(selectorForAnnotation(targetCell, targetAnnotation));
+          const lines = annoteSpan.getAttribute("data-code-lines").split(",");
+          const lineIds = lines.map((line) => {
+            return targetCell + "-" + line;
+          })
+          let top = null;
+          let height = null;
+          let parent = null;
+          if (lineIds.length > 0) {
+              //compute the position of the single el (top and bottom and make a div)
+              const el = window.document.getElementById(lineIds[0]);
+              top = el.offsetTop;
+              height = el.offsetHeight;
+              parent = el.parentElement.parentElement;
+            if (lineIds.length > 1) {
+              const lastEl = window.document.getElementById(lineIds[lineIds.length - 1]);
+              const bottom = lastEl.offsetTop + lastEl.offsetHeight;
+              height = bottom - top;
+            }
+            if (top !== null && height !== null && parent !== null) {
+              // cook up a div (if necessary) and position it 
+              let div = window.document.getElementById("code-annotation-line-highlight");
+              if (div === null) {
+                div = window.document.createElement("div");
+                div.setAttribute("id", "code-annotation-line-highlight");
+                div.style.position = 'absolute';
+                parent.appendChild(div);
+              }
+              div.style.top = top - 2 + "px";
+              div.style.height = height + 4 + "px";
+              div.style.left = 0;
+              let gutterDiv = window.document.getElementById("code-annotation-line-highlight-gutter");
+              if (gutterDiv === null) {
+                gutterDiv = window.document.createElement("div");
+                gutterDiv.setAttribute("id", "code-annotation-line-highlight-gutter");
+                gutterDiv.style.position = 'absolute';
+                const codeCell = window.document.getElementById(targetCell);
+                const gutter = codeCell.querySelector('.code-annotation-gutter');
+                gutter.appendChild(gutterDiv);
+              }
+              gutterDiv.style.top = top - 2 + "px";
+              gutterDiv.style.height = height + 4 + "px";
+            }
+            selectedAnnoteEl = annoteEl;
+          }
+        };
+        const unselectCodeLines = () => {
+          const elementsIds = ["code-annotation-line-highlight", "code-annotation-line-highlight-gutter"];
+          elementsIds.forEach((elId) => {
+            const div = window.document.getElementById(elId);
+            if (div) {
+              div.remove();
+            }
+          });
+          selectedAnnoteEl = undefined;
+        };
+          // Handle positioning of the toggle
+      window.addEventListener(
+        "resize",
+        throttle(() => {
+          elRect = undefined;
+          if (selectedAnnoteEl) {
+            selectCodeLines(selectedAnnoteEl);
+          }
+        }, 10)
+      );
+      function throttle(fn, ms) {
+      let throttle = false;
+      let timer;
+        return (...args) => {
+          if(!throttle) { // first call gets through
+              fn.apply(this, args);
+              throttle = true;
+          } else { // all the others get throttled
+              if(timer) clearTimeout(timer); // cancel #2
+              timer = setTimeout(() => {
+                fn.apply(this, args);
+                timer = throttle = false;
+              }, ms);
+          }
+        };
+      }
+        // Attach click handler to the DT
+        const annoteDls = window.document.querySelectorAll('dt[data-target-cell]');
+        for (const annoteDlNode of annoteDls) {
+          annoteDlNode.addEventListener('click', (event) => {
+            const clickedEl = event.target;
+            if (clickedEl !== selectedAnnoteEl) {
+              unselectCodeLines();
+              const activeEl = window.document.querySelector('dt[data-target-cell].code-annotation-active');
+              if (activeEl) {
+                activeEl.classList.remove('code-annotation-active');
+              }
+              selectCodeLines(clickedEl);
+              clickedEl.classList.add('code-annotation-active');
+            } else {
+              // Unselect the line
+              unselectCodeLines();
+              clickedEl.classList.remove('code-annotation-active');
+            }
+          });
+        }
+    const findCites = (el) => {
+      const parentEl = el.parentElement;
+      if (parentEl) {
+        const cites = parentEl.dataset.cites;
+        if (cites) {
+          return {
+            el,
+            cites: cites.split(' ')
+          };
+        } else {
+          return findCites(el.parentElement)
+        }
+      } else {
+        return undefined;
+      }
+    };
+    var bibliorefs = window.document.querySelectorAll('a[role="doc-biblioref"]');
+    for (var i=0; i<bibliorefs.length; i++) {
+      const ref = bibliorefs[i];
+      const citeInfo = findCites(ref);
+      if (citeInfo) {
+        tippyHover(citeInfo.el, function() {
+          var popup = window.document.createElement('div');
+          citeInfo.cites.forEach(function(cite) {
+            var citeDiv = window.document.createElement('div');
+            citeDiv.classList.add('hanging-indent');
+            citeDiv.classList.add('csl-entry');
+            var biblioDiv = window.document.getElementById('ref-' + cite);
+            if (biblioDiv) {
+              citeDiv.innerHTML = biblioDiv.innerHTML;
+            }
+            popup.appendChild(citeDiv);
+          });
+          return popup.innerHTML;
+        });
+      }
+    }
+  });
+  </script>
+</div> <!-- /content -->
+<footer class="footer">
+  <div class="nav-footer">
+    <div class="nav-footer-left">
+<p>© 2026 FeRx-NLME · MIT licensed</p>
+</div>   
+    <div class="nav-footer-center">
+      &nbsp;
+    <div class="toc-actions d-sm-block d-md-none"><ul><li><a href="https://github.com/FeRx-NLME/ferx-core/edit/main/development/sdlc.qmd" class="toc-action"><i class="bi bi-github"></i>Edit this page</a></li><li><a href="https://github.com/FeRx-NLME/ferx-core/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></div>
+    <div class="nav-footer-right">
+<p>Fe · 26 · Rx · 2026</p>
+</div>
+  </div>
+</footer>
+
+
+
+
+</body></html>

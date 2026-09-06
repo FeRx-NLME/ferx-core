@@ -1,0 +1,1895 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en"><head>
+
+<meta charset="utf-8">
+<meta name="generator" content="quarto-1.10.18">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+
+<meta name="description" content="Pharmpy modelsearch in ferx — a search over the analytic pk templates (absorption, peripheral compartments, transit compartments, lag time) driven by a .ferxsearch file, with Pharmpy’s three algorithms, its incompatible-pair rules, and every candidate’s fit time beside its rank.">
+
+<title>Structural model search – ferx-core</title>
+<style>
+/* Default styles provided by pandoc.
+** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+*/
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: 1.5em;}
+div.column{flex: auto;}
+@media screen {
+div.columns{gap: min(4vw, 1.5em);}
+div.column{overflow-x: auto;}
+}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+  width: 0.8em;
+  margin: 0 0.8em 0.2em -1em; /* quarto-specific, see https://github.com/quarto-dev/quarto-cli/issues/4556 */ 
+  vertical-align: middle;
+}
+/* CSS for syntax highlighting */
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+  { counter-reset: source-line 0; }
+pre.numberSource code > span
+  { position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+  { content: counter(source-line);
+    position: relative; left: -1em; text-align: right; vertical-align: baseline;
+    border: none; display: inline-block;
+    -webkit-touch-callout: none; -webkit-user-select: none;
+    -khtml-user-select: none; -moz-user-select: none;
+    -ms-user-select: none; user-select: none;
+    padding: 0 4px; width: 4em;
+  }
+pre.numberSource { margin-left: 3em;  padding-left: 4px; }
+div.sourceCode
+  {   }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+</style>
+
+
+<script src="../site_libs/quarto-nav/quarto-nav.js"></script>
+<script src="../site_libs/quarto-nav/headroom.min.js"></script>
+<script src="../site_libs/clipboard/clipboard.min.js"></script>
+<script src="../site_libs/quarto-search/autocomplete.umd.js"></script>
+<script src="../site_libs/quarto-search/fuse.min.js"></script>
+<script src="../site_libs/quarto-search/quarto-search.js"></script>
+<meta name="quarto:offset" content="../">
+<link href="../assets/ferx-favicon.svg" rel="icon" type="image/svg+xml">
+<script src="../site_libs/quarto-html/quarto.js" type="module"></script>
+<script src="../site_libs/quarto-html/tabsets/tabsets.js" type="module"></script>
+<script src="../site_libs/quarto-html/popper.min.js"></script>
+<script src="../site_libs/quarto-html/tippy.umd.min.js"></script>
+<script src="../site_libs/quarto-html/anchor.min.js"></script>
+<link href="../site_libs/quarto-html/tippy.css" rel="stylesheet">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-51776f957f81c5a6b38322b65a6a6987.css" rel="stylesheet" class="quarto-color-scheme" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-dark-31632d092df9090a2ed68f79c078059d.css" rel="stylesheet" class="quarto-color-scheme quarto-color-alternate" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-51776f957f81c5a6b38322b65a6a6987.css" rel="stylesheet" class="quarto-color-scheme-extra" id="quarto-text-highlighting-styles">
+<script src="../site_libs/bootstrap/bootstrap.min.js"></script>
+<link href="../site_libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
+<link href="../site_libs/bootstrap/bootstrap-f5ed25dbf962e4596f9f4df24f2ade0d.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme" id="quarto-bootstrap" data-mode="light">
+<link href="../site_libs/bootstrap/bootstrap-dark-8a64b8d4793081e9872239f556c8075c.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme quarto-color-alternate" id="quarto-bootstrap" data-mode="dark">
+<link href="../site_libs/bootstrap/bootstrap-f5ed25dbf962e4596f9f4df24f2ade0d.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme-extra" id="quarto-bootstrap" data-mode="light">
+<script id="quarto-search-options" type="application/json">{
+  "location": "navbar",
+  "copy-button": false,
+  "collapse-after": 3,
+  "panel-placement": "end",
+  "type": "overlay",
+  "limit": 50,
+  "keyboard-shortcut": [
+    "f",
+    "/",
+    "s"
+  ],
+  "show-item-context": false,
+  "language": {
+    "search-no-results-text": "No results",
+    "search-matching-documents-text": "matching documents",
+    "search-copy-link-title": "Copy link to search",
+    "search-hide-matches-text": "Hide additional matches",
+    "search-more-match-text": "more match in this document",
+    "search-more-matches-text": "more matches in this document",
+    "search-clear-button-title": "Clear",
+    "search-text-placeholder": "",
+    "search-detached-cancel-button-title": "Cancel",
+    "search-submit-button-title": "Submit",
+    "search-label": "Search"
+  }
+}</script>
+
+
+<link rel="stylesheet" href="../styles.css">
+<meta property="og:title" content="Structural model search">
+<meta property="og:description" content="Open-source nonlinear mixed-effects modeling for population PK/PD and pharmacometrics">
+<meta property="og:site_name" content="ferx-core">
+<meta property="og:locale" content="en_US">
+<meta name="twitter:title" content="Structural model search">
+<meta name="twitter:description" content="Open-source nonlinear mixed-effects modeling for population PK/PD and pharmacometrics">
+<meta name="twitter:card" content="summary">
+<link rel="canonical" href="https://ferx-nlme.github.io/ferx-core/tools/modelsearch.html">
+</head>
+
+<body class="nav-sidebar floating nav-fixed quarto-light"><script id="quarto-html-before-body" type="application/javascript">
+    const toggleBodyColorMode = (bsSheetEl) => {
+      const mode = bsSheetEl.getAttribute("data-mode");
+      const bodyEl = window.document.querySelector("body");
+      if (mode === "dark") {
+        bodyEl.classList.add("quarto-dark");
+        bodyEl.classList.remove("quarto-light");
+      } else {
+        bodyEl.classList.add("quarto-light");
+        bodyEl.classList.remove("quarto-dark");
+      }
+    }
+    const toggleBodyColorPrimary = () => {
+      const bsSheetEl = window.document.querySelector("link#quarto-bootstrap:not([rel=disabled-stylesheet])");
+      if (bsSheetEl) {
+        toggleBodyColorMode(bsSheetEl);
+      }
+    }
+    const setColorSchemeToggle = (alternate) => {
+      const toggles = window.document.querySelectorAll('.quarto-color-scheme-toggle');
+      for (let i=0; i < toggles.length; i++) {
+        const toggle = toggles[i];
+        if (toggle) {
+          if (alternate) {
+            toggle.classList.add("alternate");
+          } else {
+            toggle.classList.remove("alternate");
+          }
+        }
+      }
+    };
+    const toggleColorMode = (alternate) => {
+      // Switch the stylesheets
+      const primaryStylesheets = window.document.querySelectorAll('link.quarto-color-scheme:not(.quarto-color-alternate)');
+      const alternateStylesheets = window.document.querySelectorAll('link.quarto-color-scheme.quarto-color-alternate');
+      manageTransitions('#quarto-margin-sidebar .nav-link', false);
+      if (alternate) {
+        // note: dark is layered on light, we don't disable primary!
+        enableStylesheet(alternateStylesheets);
+        for (const sheetNode of alternateStylesheets) {
+          if (sheetNode.id === "quarto-bootstrap") {
+            toggleBodyColorMode(sheetNode);
+          }
+        }
+      } else {
+        disableStylesheet(alternateStylesheets);
+        enableStylesheet(primaryStylesheets)
+        toggleBodyColorPrimary();
+      }
+      manageTransitions('#quarto-margin-sidebar .nav-link', true);
+      // Switch the toggles
+      setColorSchemeToggle(alternate)
+      // Hack to workaround the fact that safari doesn't
+      // properly recolor the scrollbar when toggling (#1455)
+      if (navigator.userAgent.indexOf('Safari') > 0 && navigator.userAgent.indexOf('Chrome') == -1) {
+        manageTransitions("body", false);
+        window.scrollTo(0, 1);
+        setTimeout(() => {
+          window.scrollTo(0, 0);
+          manageTransitions("body", true);
+        }, 40);
+      }
+    }
+    const disableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        stylesheet.rel = 'disabled-stylesheet';
+      }
+    }
+    const enableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        if(stylesheet.rel !== 'stylesheet') { // for Chrome, which will still FOUC without this check
+          stylesheet.rel = 'stylesheet';
+        }
+      }
+    }
+    const manageTransitions = (selector, allowTransitions) => {
+      const els = window.document.querySelectorAll(selector);
+      for (let i=0; i < els.length; i++) {
+        const el = els[i];
+        if (allowTransitions) {
+          el.classList.remove('notransition');
+        } else {
+          el.classList.add('notransition');
+        }
+      }
+    }
+    const isFileUrl = () => {
+      return window.location.protocol === 'file:';
+    }
+    const hasAlternateSentinel = () => {
+      let styleSentinel = getColorSchemeSentinel();
+      if (styleSentinel !== null) {
+        return styleSentinel === "alternate";
+      } else {
+        return false;
+      }
+    }
+    const setStyleSentinel = (alternate) => {
+      const value = alternate ? "alternate" : "default";
+      if (!isFileUrl()) {
+        window.localStorage.setItem("quarto-color-scheme", value);
+      } else {
+        localAlternateSentinel = value;
+      }
+    }
+    const getColorSchemeSentinel = () => {
+      if (!isFileUrl()) {
+        const storageValue = window.localStorage.getItem("quarto-color-scheme");
+        return storageValue != null ? storageValue : localAlternateSentinel;
+      } else {
+        return localAlternateSentinel;
+      }
+    }
+    const toggleGiscusIfUsed = (isAlternate, darkModeDefault) => {
+      const baseTheme = document.querySelector('#giscus-base-theme')?.value ?? 'light';
+      const alternateTheme = document.querySelector('#giscus-alt-theme')?.value ?? 'dark';
+      let newTheme = '';
+      if(authorPrefersDark) {
+        newTheme = isAlternate ? baseTheme : alternateTheme;
+      } else {
+        newTheme = isAlternate ? alternateTheme : baseTheme;
+      }
+      const changeGiscusTheme = () => {
+        // From: https://github.com/giscus/giscus/issues/336
+        const sendMessage = (message) => {
+          const iframe = document.querySelector('iframe.giscus-frame');
+          if (!iframe) return;
+          iframe.contentWindow.postMessage({ giscus: message }, 'https://giscus.app');
+        }
+        sendMessage({
+          setConfig: {
+            theme: newTheme
+          }
+        });
+      }
+      const isGiscussLoaded = window.document.querySelector('iframe.giscus-frame') !== null;
+      if (isGiscussLoaded) {
+        changeGiscusTheme();
+      }
+    };
+    const authorPrefersDark = false;
+    const darkModeDefault = authorPrefersDark;
+      document.querySelector('link#quarto-text-highlighting-styles.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+      document.querySelector('link#quarto-bootstrap.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+    let localAlternateSentinel = darkModeDefault ? 'alternate' : 'default';
+    // Dark / light mode switch
+    window.quartoToggleColorScheme = () => {
+      // Read the current dark / light value
+      let toAlternate = !hasAlternateSentinel();
+      toggleColorMode(toAlternate);
+      setStyleSentinel(toAlternate);
+      toggleGiscusIfUsed(toAlternate, darkModeDefault);
+      window.dispatchEvent(new Event('resize'));
+    };
+    // Switch to dark mode if need be
+    if (hasAlternateSentinel()) {
+      toggleColorMode(true);
+    } else {
+      toggleColorMode(false);
+    }
+  </script>
+
+<div id="quarto-search-results"></div>
+  <header id="quarto-header" class="headroom fixed-top">
+    <nav class="navbar navbar-expand-lg " data-bs-theme="dark">
+      <div class="navbar-container container-fluid">
+      <div class="navbar-brand-container mx-auto">
+    <a href="../index.html" class="navbar-brand navbar-brand-logo">
+    <img src="../assets/ferx-dsl-brackets.svg" alt="ferx" class="navbar-logo light-content">
+    <img src="../assets/ferx-dsl-brackets.svg" alt="ferx" class="navbar-logo dark-content">
+    </a>
+    <a class="navbar-brand" href="../index.html">
+    <span class="navbar-title">ferx-core</span>
+    </a>
+  </div>
+            <div id="quarto-search" class="" title="Search"></div>
+          <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarCollapse" aria-controls="navbarCollapse" role="menu" aria-expanded="false" aria-label="Toggle navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+  <span class="navbar-toggler-icon"></span>
+</button>
+          <div class="collapse navbar-collapse" id="navbarCollapse">
+            <ul class="navbar-nav navbar-nav-scroll me-auto">
+  <li class="nav-item">
+    <a class="nav-link active" href="../getting-started.html" aria-current="page"> 
+<span class="menu-text">Get started</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/features.html"> 
+<span class="menu-text">Features</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/changelog.html"> 
+<span class="menu-text">Changelog</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/roadmap.html"> 
+<span class="menu-text">Roadmap</span></a>
+  </li>  
+</ul>
+            <ul class="navbar-nav navbar-nav-scroll ms-auto">
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/ferx-core/"> 
+<span class="menu-text">ferx-core</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/ferx-book/"> 
+<span class="menu-text">ferx-r</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/reference/"> 
+<span class="menu-text">Reference</span></a>
+  </li>  
+  <li class="nav-item compact">
+    <a class="nav-link" href="https://github.com/FeRx-NLME"> <i class="bi bi-github" role="img" aria-label="GitHub">
+</i> 
+<span class="menu-text"></span></a>
+  </li>  
+</ul>
+          </div> <!-- /navcollapse -->
+            <div class="quarto-navbar-tools">
+  <a href="" class="quarto-color-scheme-toggle quarto-navigation-tool  px-1" onclick="window.quartoToggleColorScheme(); return false;" title="Toggle dark mode"><i class="bi"></i></a>
+</div>
+      </div> <!-- /container-fluid -->
+    </nav>
+  <nav class="quarto-secondary-nav">
+    <div class="container-fluid d-flex">
+      <button type="button" class="quarto-btn-toggle btn" data-bs-toggle="collapse" role="button" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+        <i class="bi bi-layout-text-sidebar-reverse"></i>
+      </button>
+        <nav class="quarto-page-breadcrumbs" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../tools/bootstrap.html">Tools</a></li><li class="breadcrumb-item"><a href="../tools/modelsearch.html">Structural model search</a></li></ol></nav>
+        <a class="flex-grow-1" role="navigation" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">      
+        </a>
+      <button type="button" class="btn quarto-search-button" aria-label="Search" onclick="window.quartoOpenSearch();">
+        <i class="bi bi-search"></i>
+      </button>
+    </div>
+  </nav>
+</header>
+<!-- content -->
+<div id="quarto-content" class="quarto-container page-columns page-rows-contents page-layout-article page-navbar">
+<!-- sidebar -->
+  <nav id="quarto-sidebar" class="sidebar collapse collapse-horizontal quarto-sidebar-collapse-item sidebar-navigation floating overflow-auto">
+    <div class="pt-lg-2 mt-2 text-left sidebar-header">
+      <a href="../index.html" class="sidebar-logo-link">
+      <img src="../assets/ferx-favicon.svg" alt="" class="sidebar-logo light-content py-0 d-lg-inline d-none">
+      <img src="../assets/ferx-favicon.svg" alt="" class="sidebar-logo dark-content py-0 d-lg-inline d-none">
+      </a>
+      </div>
+        <div class="mt-2 flex-shrink-0 align-items-center">
+        <div class="sidebar-search">
+        <div id="quarto-search" class="" title="Search"></div>
+        </div>
+        </div>
+    <div class="sidebar-menu-container"> 
+    <ul class="list-unstyled mt-1">
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Introduction</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../maturity.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Feature Maturity</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../getting-started.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Getting Started</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../installation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Installation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../quick-start.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Quick Start</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../model-file/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Model File Reference</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/parameters.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Parameters</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/iov.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Inter-Occasion Variability (IOV)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/individual-parameters.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Individual Parameters</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariates.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariates</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariate-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/structural-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Structural Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/lagtime.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Lagtime</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/steady-state.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Steady-State Doses (SS=1)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/error-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Error Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/bloq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">LOQ-Censored Observations</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/ode-models.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/absorption.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Built-in Absorption Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/scaling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Scaling</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/initial-conditions.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Initial Conditions</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/diffusion.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Stochastic Differential Equations (SDE / Diffusion)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/neural-networks.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Neural Networks</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariate-nn.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><code>[covariate_nn]</code> — Deep Compartment Models (DCM)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/data.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/data-selection.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Selection</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/derived.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Derived Columns (<code>[derived]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Output Columns (<code>[output]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/fit-options.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Fit Options</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/simulation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Simulation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/adaptive-dosing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Adaptive (Feedback) Dosing</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/event-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Time-to-Event Endpoints (<code>[event_model]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/categorical.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Categorical endpoints — <code>[binary_model]</code></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/markov-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Markov models ([markov_model])</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../estimation/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Estimation Methods</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/foce.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FOCE / FOCEI</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/agq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">AGQ — Adaptive Gaussian Quadrature</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/gauss-newton.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Gauss-Newton (BHHH)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/saem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">SAEM</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/sir.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Sampling Importance Resampling (SIR)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/importance-sampling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Importance Sampling (IMP)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/frem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FREM (Full Random Effects Model)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/impmap.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">IMPMAP — Importance Sampling assisted by Mode A Posteriori</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/bayes.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Bayesian estimation (MCMC)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/vi.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Variational Inference</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/parameterization.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Packed Parameter Space</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/optimizers.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Outer Optimizers</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/tte.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Time-to-Event (TTE) Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/categorical.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Categorical endpoints (binary / logistic)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/ctmm.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Continuous-time Markov models (CTMM)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/mixture.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Mixture Models</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="true">
+ <span class="menu-text">Tools</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/bootstrap.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Bootstrap</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/gam-screening.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">GAM covariate screening</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/search.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Search configuration</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/covsearch.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate search</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/modelsearch.html" class="sidebar-item-text sidebar-link active">
+ <span class="menu-text">Structural model search</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../data-format.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Format</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../cli.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">CLI Reference</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Output Files</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../warnings.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Warnings</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../file-formats/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">File Formats</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../file-formats/fitrx.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">The <code>.fitrx</code> Fit Bundle</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../file-formats/check-report.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Check Report (<code>ferx check --json</code>)</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../examples/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Examples</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/one-cpt-oral.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">One-Compartment Oral (Warfarin)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/two-cpt-iv.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Two-Compartment IV Bolus</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/covariates.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/ode-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Model (Michaelis-Menten)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/bloq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">BLOQ (M3 method)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/iov.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Inter-Occasion Variability (IOV)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/iov-saem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">IOV with SAEM</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/multiple-dosing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Multiple Dosing (ADDL Column)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/steady-state.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Steady-State Dosing (SS Column)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/scaling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Unit Scaling (<code>[scaling]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/derived-output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Derived Columns and Output</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/data-selection.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Selection (IGNORE / ACCEPT)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/ode-lagtime.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Model with Absorption Lag Time</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/transit-absorption.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Transit Absorption (Two-Compartment)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/sde.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Stochastic Differential Equations (SDE)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/frem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FREM (Covariate Analysis)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/multistart.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Multi-Start: Michaelis-Menten Elimination</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../api/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Rust API</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/types.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Core Types</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/fitting.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Fitting Functions</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/simulation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Simulation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/parsing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Parsing</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/model-editing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Model editing</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../faq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FAQ</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../development/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Development</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/contributing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Contributing to FeRx development</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/sdlc.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Development Lifecycle (SDLC)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/docs-lint.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Docs linter</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+    </ul>
+    </div>
+</nav>
+<div id="quarto-sidebar-glass" class="quarto-sidebar-collapse-item" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item"></div>
+<!-- margin-sidebar -->
+    <div id="quarto-margin-sidebar" class="sidebar margin-sidebar">
+        <nav id="TOC" role="doc-toc" class="toc-active">
+    <h2 id="toc-title">On this page</h2>
+   
+  <ul>
+  <li><a href="#structural-model-search" id="toc-structural-model-search" class="nav-link active" data-scroll-target="#structural-model-search">Structural model search</a>
+  <ul>
+  <li><a href="#the-space" id="toc-the-space" class="nav-link" data-scroll-target="#the-space">The space</a></li>
+  <li><a href="#the-algorithms" id="toc-the-algorithms" class="nav-link" data-scroll-target="#the-algorithms">The algorithms</a>
+  <ul class="collapse">
+  <li><a href="#which-move-may-follow-which" id="toc-which-move-may-follow-which" class="nav-link" data-scroll-target="#which-move-may-follow-which">Which move may follow which</a></li>
+  <li><a href="#the-base-model" id="toc-the-base-model" class="nav-link" data-scroll-target="#the-base-model">The base model</a></li>
+  <li><a href="#what-a-candidate-becomes" id="toc-what-a-candidate-becomes" class="nav-link" data-scroll-target="#what-a-candidate-becomes">What a candidate becomes</a></li>
+  </ul></li>
+  <li><a href="#the-elimination-gap" id="toc-the-elimination-gap" class="nav-link" data-scroll-target="#the-elimination-gap">The elimination gap</a></li>
+  <li><a href="#ranking-and-convergence-beside-it" id="toc-ranking-and-convergence-beside-it" class="nav-link" data-scroll-target="#ranking-and-convergence-beside-it">Ranking, and convergence beside it</a></li>
+  <li><a href="#output" id="toc-output" class="nav-link" data-scroll-target="#output">Output</a></li>
+  <li><a href="#compared-with-pharmpy" id="toc-compared-with-pharmpy" class="nav-link" data-scroll-target="#compared-with-pharmpy">Compared with Pharmpy</a></li>
+  <li><a href="#compared-with-nonmem" id="toc-compared-with-nonmem" class="nav-link" data-scroll-target="#compared-with-nonmem">Compared with NONMEM</a></li>
+  <li><a href="#deviations-from-pharmpy-stated" id="toc-deviations-from-pharmpy-stated" class="nav-link" data-scroll-target="#deviations-from-pharmpy-stated">Deviations from Pharmpy, stated</a></li>
+  <li><a href="#from-rust" id="toc-from-rust" class="nav-link" data-scroll-target="#from-rust">From Rust</a></li>
+  </ul></li>
+  </ul>
+<div class="toc-actions"><ul><li><a href="https://github.com/FeRx-NLME/ferx-core/edit/main/tools/modelsearch.qmd" class="toc-action"><i class="bi bi-github"></i>Edit this page</a></li><li><a href="https://github.com/FeRx-NLME/ferx-core/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></nav>
+    </div>
+<!-- main -->
+<main class="content" id="quarto-document-content"><header id="title-block-header" class="quarto-title-block"><nav class="quarto-page-breadcrumbs quarto-title-breadcrumbs d-none d-lg-block" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../tools/bootstrap.html">Tools</a></li><li class="breadcrumb-item"><a href="../tools/modelsearch.html">Structural model search</a></li></ol></nav></header>
+
+
+
+
+
+<section id="structural-model-search" class="level1">
+<h1>Structural model search</h1>
+<blockquote class="blockquote">
+<p><strong>Maturity: alpha</strong> — see <a href="../maturity.html">Feature Maturity</a> for what this means.</p>
+</blockquote>
+<p><code>ferx modelsearch</code> is Pharmpy’s <code>modelsearch</code>: a search over the structural PK model — absorption route, number of peripheral compartments, transit compartments and lag time — where every candidate is one <code>pk</code> template swap away from its parent. Where <a href="../tools/covsearch.html">covsearch</a> inserts and deletes <code>[covariate_model]</code> lines, this tool rewrites the <code>pk</code> line and, with it, the <code>[parameters]</code> and <code>[individual_parameters]</code> declarations the new template needs, pruning the ones it no longer reads.</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb1"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="ex">ferx</span> modelsearch warfarin.ferxsearch <span class="at">--directory</span> warfarin-modelsearch <span class="at">--threads</span> 8</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>What to search over comes from a <a href="../tools/search.html"><code>.ferxsearch</code> file</a>. Its <code>ABSORPTION</code>, <code>PERIPHERALS</code>, <code>TRANSITS</code> and <code>LAGTIME</code> statements are the space, <code>[rank]</code> the criterion, and a <code>[modelsearch]</code> section picks the algorithm and how η is given to the parameters a candidate introduces:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb2"><pre class="sourceCode toml code-with-copy"><code class="sourceCode toml"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="dt">base</span> <span class="op">=</span> <span class="st">"warfarin.ferx"</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="dt">data</span> <span class="op">=</span> <span class="st">"warfarin.csv"</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="kw">[space]</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="dt">mfl</span> <span class="op">=</span> <span class="st">"""</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="st">ABSORPTION([INST,FO]); PERIPHERALS(0..2)</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="st">TRANSITS([0,1,3], NODEPOT); TRANSITS(N)</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="st">LAGTIME([OFF,ON])</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="st">"""</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="kw">[modelsearch]</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="dt">algorithm</span>    <span class="op">=</span> <span class="st">"reduced_stepwise"</span>     <span class="co"># or "exhaustive_stepwise", "exhaustive"</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="dt">iiv_strategy</span> <span class="op">=</span> <span class="st">"absorption_delay"</span>     <span class="co"># or "add_diagonal", "no_add"</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="kw">[rank]</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="dt">type</span>   <span class="op">=</span> <span class="st">"bic"</span>                        <span class="co"># the mixed BIC, Pharmpy's default</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="dt">cutoff</span> <span class="op">=</span> <span class="fl">3.84</span>                         <span class="co"># optional: the improvement a candidate must show over the base</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a><span class="kw">[strictness]</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a><span class="dt">require_converged</span> <span class="op">=</span> <span class="cn">true</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a><span class="kw">[run]</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a><span class="dt">retries</span>   <span class="op">=</span> <span class="dv">2</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a><span class="dt">threads</span>   <span class="op">=</span> <span class="dv">8</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a><span class="dt">cache_dir</span> <span class="op">=</span> <span class="st">"warfarin-modelsearch"</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>key</th>
+<th>default</th>
+<th>meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>algorithm</code></td>
+<td><code>reduced_stepwise</code></td>
+<td>one of Pharmpy’s three, <a href="#the-algorithms">below</a></td>
+</tr>
+<tr class="even">
+<td><code>iiv_strategy</code></td>
+<td><code>absorption_delay</code></td>
+<td>η on a new lag time or mean transit time only; <code>add_diagonal</code> gives every new parameter an η; <code>no_add</code> none. Pharmpy’s <code>fullblock</code> is not offered — a block over the new and existing η is <a href="https://github.com/FeRx-NLME/ferx-core/issues/1183">iivsearch</a>’s move</td>
+</tr>
+<tr class="odd">
+<td><code>[rank] type</code></td>
+<td><code>bic</code></td>
+<td>any of the <a href="../tools/search.html#ranking-strictness-and-run-settings">rank types</a>; every candidate is scored on it</td>
+</tr>
+<tr class="even">
+<td><code>[rank] cutoff</code></td>
+<td>none</td>
+<td>a candidate is selected only when it beats the base by at least this much; the base wins otherwise</td>
+</tr>
+</tbody>
+</table>
+<section id="the-space" class="level2">
+<h2 class="anchored" data-anchor-id="the-space">The space</h2>
+<p>The four structural categories, and what each value becomes:</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>MFL feature</th>
+<th>ferx</th>
+<th>how</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>ABSORPTION(INST)</code></td>
+<td>✓</td>
+<td>the <code>*_iv</code> templates</td>
+</tr>
+<tr class="even">
+<td><code>ABSORPTION(FO)</code></td>
+<td>✓</td>
+<td>the <code>*_oral</code> templates; <code>*_transit</code> when a chain is present</td>
+</tr>
+<tr class="odd">
+<td><code>ABSORPTION(ZO / WEIBULL)</code></td>
+<td>✗</td>
+<td>no <code>pk</code> template: <code>ZO</code> is a modeled duration on an IV template with <code>RATE=-2</code> <strong>in the dataset</strong>, <code>WEIBULL</code> the <code>[odes]</code> input function <code>weibull(...)</code> — both are the <code>[odes]</code> candidate family of <a href="https://github.com/FeRx-NLME/ferx-core/issues/1257">#1257</a>, split out of #1181</td>
+</tr>
+<tr class="even">
+<td><code>ABSORPTION(SEQ-ZO-FO)</code></td>
+<td>✗</td>
+<td>no template and no input function — refused by name when the file is loaded</td>
+</tr>
+<tr class="odd">
+<td><code>ELIMINATION(FO)</code></td>
+<td>✓</td>
+<td>every template; the statement is accepted and contributes nothing</td>
+</tr>
+<tr class="even">
+<td><code>ELIMINATION(ZO / MM / MIX-FO-MM)</code></td>
+<td>✗</td>
+<td>see <a href="#the-elimination-gap">the elimination gap</a></td>
+</tr>
+<tr class="odd">
+<td><code>PERIPHERALS(0 / 1 / 2)</code></td>
+<td>✓</td>
+<td><code>one_cpt_*</code> / <code>two_cpt_*</code> / <code>three_cpt_*</code></td>
+</tr>
+<tr class="even">
+<td><code>TRANSITS(n, NODEPOT)</code></td>
+<td>✓</td>
+<td><code>*_transit</code> with a <code>FIX</code>ed count, <code>theta TVNTR(n, …) FIX</code>; <code>TRANSITS(0)</code> is a move <em>off</em> a chain</td>
+</tr>
+<tr class="odd">
+<td><code>TRANSITS(N)</code></td>
+<td>✓</td>
+<td><code>*_transit</code> with the count estimated</td>
+</tr>
+<tr class="even">
+<td><code>TRANSITS(n, DEPOT)</code></td>
+<td>✗</td>
+<td>needs a separate depot with its own <code>ka</code> — an <code>[odes]</code> model</td>
+</tr>
+<tr class="odd">
+<td><code>LAGTIME(ON / OFF)</code></td>
+<td>✓</td>
+<td>the <code>lagtime=</code> binding</td>
+</tr>
+</tbody>
+</table>
+<p>Anything marked ✗ is a hard error naming the feature when the file is loaded — the <a href="../tools/search.html#coverage">coverage check</a> of every <code>.ferxsearch</code> file — so a search never narrows itself silently. Two combinations the coverage check cannot see are refused per candidate, with a note in the report rather than a candidate: transit absorption with two peripheral compartments (there is no <code>three_cpt_transit</code> template), and the pairs Pharmpy itself declares meaningless (below).</p>
+<p>The base model must be a <code>pk</code> model — <code>one_cpt_oral</code>, <code>two_cpt_iv</code>, and so on. An <code>ode(...)</code> model has no template to swap and is refused; so is the <code>*_ig</code> family, which has no MFL coordinate. A <code>*_transit</code> base is read at the count its <code>n</code> binding declares: a literal (<code>n=3</code>) or a parameter behind a <code>FIX</code>ed θ is <code>TRANSITS(3)</code>, a parameter behind a free θ is <code>TRANSITS(N)</code>, and a non-integral fixed count is refused by name. A base’s <code>f=</code> (bioavailability) binding is not a coordinate and is carried through every swap — every template reads it — so <code>F</code> and its θ and η survive a change of compartment count.</p>
+</section>
+<section id="the-algorithms" class="level2">
+<h2 class="anchored" data-anchor-id="the-algorithms">The algorithms</h2>
+<p>All three are Pharmpy’s (<code>tools/modelsearch/algorithms.py</code>), and the candidate enumeration is checked against Pharmpy’s own — see <a href="#compared-with-pharmpy">Compared with Pharmpy</a>.</p>
+<p><strong><code>exhaustive</code>.</strong> Every combination of at most one feature per category, every one derived from the base in a single layer and fitted in parallel. With <em>k</em> candidate moves across <em>c</em> categories that is at most ∏(<em>n</em><sub>i</sub> + 1) − 1 models.</p>
+<p><strong><code>exhaustive_stepwise</code>.</strong> One feature at a time, in every order. Layer 1 applies each allowed feature to the base; layer <em>k</em> applies each feature still allowed to every model of layer <em>k</em> − 1, each child seeded from its parent’s final estimates (Pharmpy’s <code>update_initial_estimates</code>). Two orders of the same features are two candidates, because they start from different parents — the runner’s canonical-hash dedup catches the case where two orders happen to render the same text. A variance the parent collapsed (an ω at the optimizer’s rail, 6 × 10⁻⁶) is seeded at the smallest value the engine will start from, 10⁻⁵, so the child can still be fitted; on the warfarin example a lag whose η collapsed would otherwise have left every two-compartment lag candidate seeded from it unfittable. A <code>block_omega</code> can collapse the same way through its <em>correlations</em> — every declared variance ordinary, one Cholesky diagonal at the rail (the vancomycin base’s <code>ETA_V2</code>) — and that block alone is nudged by 10⁻⁵ on its diagonal until its factor clears the rail; a standalone ω beside it, and a <code>FIX</code>ed block, are left as they are, and a block that does not clear the rail after a bounded number of nudges goes through verbatim so the engine’s own message names it. <code>SeedInits</code> on its own stays faithful to the fit; the floor and the nudge belong to a search deriving a child.</p>
+<p><strong><code>reduced_stepwise</code></strong> — the default, as in Pharmpy. As above, but before a layer is extended the models that carry the same feature <em>set</em> are collapsed to the one with the lowest OFV, and only it continues. Every model is still ranked at the end; the table’s <code>continued</code> column says which one went on.</p>
+<section id="which-move-may-follow-which" class="level3">
+<h3 class="anchored" data-anchor-id="which-move-may-follow-which">Which move may follow which</h3>
+<p>Pharmpy’s <code>_is_allowed</code>, kept verbatim so the enumeration anchors:</p>
+<ul>
+<li>a category is moved along once per path — <code>LAGTIME(ON)</code> after <code>LAGTIME(ON)</code>, or <code>ABSORPTION(INST)</code> after <code>ABSORPTION(FO)</code>, is never a step;</li>
+<li>the peripheral count starts at the smallest count in the space; a later peripheral step may take any other count not yet tried;</li>
+<li><code>TRANSITS(0, NODEPOT)</code> is never a move (it is first-order absorption);</li>
+<li>the pairs Pharmpy declares meaningless are never combined: a lag time or a transit chain on a bolus, a lag time with a transit chain, and first-order absorption with a one-transit chain.</li>
+</ul>
+<p>ferx applies the pair table in two places Pharmpy does not: to the <code>exhaustive</code> combinations (Pharmpy builds and fits <code>INST + LAGTIME(ON)</code> there), and to the candidate’s <strong>whole structure</strong> rather than only to the features a path applied — so a base that already carries a lag time is never given a transit chain, and a bolus base is never given a lag. Both are stated <a href="#deviations-from-pharmpy-stated">below</a>.</p>
+</section>
+<section id="the-base-model" class="level3">
+<h3 class="anchored" data-anchor-id="the-base-model">The base model</h3>
+<p>The base is the input model when its structure lies in the space. When it does not — a one-compartment input in a <code>PERIPHERALS(1..2)</code> space — the input is fitted first and a <strong>base</strong> is derived from it with Pharmpy’s least number of transformations: for every category the space names whose values do not include the input’s, the space’s first value (its smallest count for <code>PERIPHERALS</code>). The base is fitted and used as the root; both appear in the table, and the base’s own features are removed from the candidate moves, so a feature the base already carries is never a step.</p>
+<p>The practical consequence: <strong>a category the space names is a set of allowed values, and the base is moved onto it.</strong> <code>LAGTIME(ON)</code> alone means “every model has a lag time”; write <code>LAGTIME([OFF,ON])</code> to explore it. A category the space does not name keeps the base’s value. (Pharmpy differs here — it fills an unnamed category with its default, so an oral base in a space without an <code>ABSORPTION</code> statement becomes a bolus.)</p>
+</section>
+<section id="what-a-candidate-becomes" class="level3">
+<h3 class="anchored" data-anchor-id="what-a-candidate-becomes">What a candidate becomes</h3>
+<p>A candidate is its parent’s text with the <code>pk</code> line replaced and the parameters reconciled. Roles the parent already binds keep their variable — by slot, so <code>v1=V</code> on a two-compartment line satisfies <code>v=V</code> on a one-compartment one, and <code>q=Q</code> becomes <code>q2=Q</code> under three compartments. Roles it does not bind get a default name and a declaration whose init is Pharmpy’s (<code>modeling/odes.py</code>), scaled from the parent’s <strong>seeded</strong> estimates:</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 20%">
+<col style="width: 20%">
+<col style="width: 20%">
+<col style="width: 20%">
+<col style="width: 20%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>role</th>
+<th>name</th>
+<th>init</th>
+<th>bounds</th>
+<th>η</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>first peripheral <code>q</code>, <code>v2</code></td>
+<td><code>Q</code>, <code>V2</code></td>
+<td><code>Q = CL</code>, <code>V2 = 0.05 · Vc</code></td>
+<td><code>(0, 10⁶)</code></td>
+<td><code>add_diagonal</code> only</td>
+</tr>
+<tr class="even">
+<td>second peripheral <code>q3</code>, <code>v3</code></td>
+<td><code>Q3</code>, <code>V3</code></td>
+<td><code>Q3 = 0.9 · CL</code> (and a first one added alongside it <code>0.1 · CL</code>), <code>V3 = 0.05 · Vc</code></td>
+<td><code>(0, 10⁶)</code></td>
+<td><code>add_diagonal</code> only</td>
+</tr>
+<tr class="odd">
+<td><code>ka</code></td>
+<td><code>KA</code></td>
+<td><code>1 / (2 · t₁)</code>, <em>t₁</em> the first positive observation time</td>
+<td><code>(0, 10⁶)</code></td>
+<td><code>add_diagonal</code> only</td>
+</tr>
+<tr class="even">
+<td><code>lagtime</code></td>
+<td><code>ALAG</code></td>
+<td><code>t₁ / 2</code></td>
+<td><code>(0, 10⁶)</code></td>
+<td><code>absorption_delay</code>, <code>add_diagonal</code></td>
+</tr>
+<tr class="odd">
+<td><code>mtt</code></td>
+<td><code>MTT</code></td>
+<td><code>t₁ / 2</code></td>
+<td><code>(0, 10⁶)</code></td>
+<td><code>absorption_delay</code>, <code>add_diagonal</code></td>
+</tr>
+<tr class="even">
+<td><code>n</code></td>
+<td><code>NTR</code></td>
+<td>the count, <code>FIX</code>; or <code>2.0</code> for <code>TRANSITS(N)</code></td>
+<td><code>(0, 64)</code></td>
+<td>never</td>
+</tr>
+</tbody>
+</table>
+<p>A move that changes a chain the parent already has — another count, or fixed ↔︎ estimated — binds <code>n</code> to a <strong>fresh</strong> parameter (<code>NTR2</code> when the parent’s is <code>NTR</code>) rather than rewriting the parent’s declaration, and the old one is pruned with its θ; <code>MTT</code> is kept. Names and inits are read off the parent’s own text after its edits and seeding, not the input’s, so a name an earlier step pruned (a three-compartment input narrowed to one, then widened again) is re-declared, and a θ an earlier step added is not declared twice.</p>
+<p>A new η has variance 0.01, Pharmpy’s initial estimate. A generated name that collides with a θ or η the model already declares takes a <code>_2</code> suffix; a parameter the model declares but does not bind (a leftover <code>KA</code> on an IV base) is bound as it is. A template that drops a parameter — two compartments back to one, or first-order absorption to a transit chain, which reads <code>MTT</code> in place of <code>KA</code> — drops its θ and η too; a <code>[covariate_model]</code> relation on a dropped parameter goes with it.</p>
+<p>That a generated candidate <em>is</em> the model a pharmacometrician would have typed is pinned the way the <code>[covariate_model]</code> desugar is: the search’s two-compartment lagged candidate and its hand-written twin agree on <code>predict()</code> bit for bit and on the evaluated objective bit for bit (<code>crates/ferx-tools/tests/modelsearch_end_to_end.rs</code>).</p>
+</section>
+</section>
+<section id="the-elimination-gap" class="level2">
+<h2 class="anchored" data-anchor-id="the-elimination-gap">The elimination gap</h2>
+<p><code>ELIMINATION(ZO)</code>, <code>MM</code> and <code>MIX-FO-MM</code> are refused. Non-linear elimination has no analytic template: a candidate using it would have to be emitted as an <code>[odes]</code> model, and that changes both the numerics path and the runtime by one to two orders of magnitude relative to its analytic siblings. Ranking such a candidate against analytic ones is still valid — it is the same likelihood — but two things would have to be handled explicitly rather than discovered: the runtime budget is no longer uniform across candidates, and Michaelis–Menten models are the canonical <a href="../examples/multistart.html">local-minimum case</a>, needing more starts than their siblings or the search rejects a correct model on a stalled fit.</p>
+<p>The decision for this version is to <strong>refuse the feature by name</strong> rather than offer it half-handled. The report already carries what the ODE case would need first — every candidate’s wall-clock <code>seconds</code> beside its rank — and the coverage error points here. An elimination search over <code>[odes]</code> candidates, with a per-candidate start budget, is a follow-up to <a href="https://github.com/FeRx-NLME/ferx-core/issues/1175">#1175</a>.</p>
+</section>
+<section id="ranking-and-convergence-beside-it" class="level2">
+<h2 class="anchored" data-anchor-id="ranking-and-convergence-beside-it">Ranking, and convergence beside it</h2>
+<p>Every fitted model — input, base, every candidate — is ranked on <code>[rank] type</code> among the models that pass the <a href="../tools/search.html#the-file"><code>[strictness]</code> gate</a>. Under automation a fit that stalled at its initial estimates (#751) or landed in the wrong inner-EBE mode (#864) is not a slow fit, it is a <em>model-selection error</em>, so every candidate gets <code>[run] retries</code> perturbed restarts first, then the gate, then a rank. A model that fails the gate, does not compile or does not fit keeps its row with the reason and no rank:</p>
+<pre><code>Base model (base): FO, 0 peripherals — OFV -286.004, bic_mixed -262.985
+Algorithm: exhaustive, 4 models fitted
+
+  model    structure                                 npar          OFV    bic_mixed         d rank seconds  status        decision
+  base     FO, 0 peripherals                            7     -286.004     -262.985    +0.000    1     0.9  ok            SELECTED
+  run1     FO, 1 peripheral                             9     -289.073     -256.653    +6.332    2     2.1  ok
+  run3     FO, 1 peripheral, lag                       11     -287.483     -252.760   +10.225    3     3.4  ok
+  run2     FO, 0 peripherals, lag                       9     -287.053     -257.427    +5.558    -     1.7  not converged stalled at the initial estimates (#751)</code></pre>
+<p>With a <code>cutoff</code>, a candidate is selected only when it beats the base by at least that much on the criterion; the base stays otherwise, and the ranks still show what came closest.</p>
+<p>The <strong>input model is ranked but never selected</strong>. It only has a row of its own when a base had to be derived from it, and that happens exactly when its structure lies outside the space the MFL declares — so selecting it would write a <code>final.ferx</code> the space excluded. Read its row to see what the move onto the space cost; if you want the input’s structure to be selectable, name its value in the category concerned (<code>ABSORPTION([INST,FO])</code> rather than <code>ABSORPTION(FO)</code>) and it becomes the base. When the base itself fails the gate the candidates are ranked among themselves and the cutoff cannot apply, which the notes say.</p>
+<p>What a child is seeded from is never silent. A candidate the runner deduplicated (the same canonical text as an earlier one) is seeded from its representative’s fit, and carries that fit out if it wins; a candidate that produced no fit at all extends with its own initial estimates, and the notes say so; and a <code>--resume</code> row whose cached <code>fits/&lt;hash&gt;.json</code> is missing or unreadable is an error naming the row and the fix (refit without <code>--resume</code>) rather than a search that quietly continues from the file’s initials.</p>
+<p>The <code>seconds</code> column is deliberate. The analytic templates cost about the same per fit, but the column is what shows when one does not — and it is the first thing an <code>[odes]</code> candidate would need, should the elimination gap close.</p>
+</section>
+<section id="output" class="level2">
+<h2 class="anchored" data-anchor-id="output">Output</h2>
+<p>Into <code>--directory</code> (default <code>{search}-modelsearch</code> next to the <code>.ferxsearch</code> file, or <code>[run] cache_dir</code>):</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>file</th>
+<th>contents</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>models.csv</code></td>
+<td>one row per fitted model: <code>id</code>, <code>parent</code>, <code>layer</code>, <code>path</code>, <code>absorption</code>, <code>peripherals</code>, <code>transits</code>, <code>lagtime</code>, <code>n_parameters</code>, <code>ofv</code>, <code>criterion</code>, <code>d_criterion</code>, <code>rank</code>, <code>converged</code>, <code>passed</code>, <code>failures</code>, <code>error</code>, <code>seconds</code>, <code>selected</code>, <code>continued</code>, <code>reused</code></td>
+</tr>
+<tr class="even">
+<td><code>final.ferx</code></td>
+<td>the selected model, with its own estimates written into the initial values</td>
+</tr>
+<tr class="odd">
+<td><code>final-fit.yaml</code></td>
+<td>its estimates</td>
+</tr>
+<tr class="even">
+<td><code>models/&lt;id&gt;.ferx</code></td>
+<td>every fitted model as it was fitted, so the runner-up can be read and refitted by hand</td>
+</tr>
+<tr class="odd">
+<td><code>base/</code>, <code>layer-1/</code>, <code>layer-2/</code>, … (or <code>candidates/</code> for <code>exhaustive</code>)</td>
+<td>one <a href="../tools/search.html">runner directory</a> per layer: <code>candidates.csv</code>, the journal and the cached fits</td>
+</tr>
+</tbody>
+</table>
+<p>The per-layer directories are what <code>--resume</code> reads. A search interrupted at layer 3 restarts from the same base, generates the same layers, and refits only what its journals do not already hold; a reused row is marked in the table.</p>
+</section>
+<section id="compared-with-pharmpy" class="level2">
+<h2 class="anchored" data-anchor-id="compared-with-pharmpy">Compared with Pharmpy</h2>
+<p>The anchor for the enumeration is Pharmpy 2.0.0’s own workflow. <code>tools/pharmpy-modelsearch-anchor/dump.py</code> builds, for nine (base, space, algorithm) cases, the base Pharmpy derives, the candidate moves it filters and every <code>create_candidate</code> task with its feature set and parents — without fitting anything — and a Tier-1 test replays the cases through ferx. The candidate moves agree in Pharmpy’s order, the <code>(feature set, parent feature set)</code> edges agree as multisets through the reduced-stepwise collectors, and the <code>exhaustive</code> combinations agree in order, so <code>run{n}</code> is Pharmpy’s <code>modelsearch_run{n}</code>. Where ferx differs the case is named in the test with its reason, and the test asserts the two sides really do differ:</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 33%">
+<col style="width: 33%">
+<col style="width: 33%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>case</th>
+<th>Pharmpy 2.0.0</th>
+<th>ferx</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>a space with no <code>ABSORPTION</code> statement, oral base</td>
+<td>fills the category with its default and derives a <strong>bolus</strong> base</td>
+<td>keeps the base’s absorption</td>
+</tr>
+<tr class="even">
+<td><code>LAGTIME([OFF,ON])</code> on an IV base</td>
+<td>a lag time on the bolus is a candidate (the pair table sees only applied features)</td>
+<td>never builds a lagged bolus</td>
+</tr>
+<tr class="odd">
+<td><code>reduced_stepwise</code> with one duplicate group in a layer</td>
+<td>does not collapse it (<code>len(groups) &gt; 1</code>) and runs the full stepwise tree</td>
+<td>collapses every group</td>
+</tr>
+<tr class="even">
+<td><code>exhaustive</code> with <code>INST</code> and <code>LAGTIME(ON)</code> in the space</td>
+<td>builds <code>INST + LAGTIME(ON)</code></td>
+<td>applies the pair table to combinations too</td>
+</tr>
+</tbody>
+</table>
+<p>Transit cases are absent from the anchor on purpose: Pharmpy’s base derivation raises on a space that lists <code>TRANSITS(0, NODEPOT)</code> against a first-order model, and its model-feature reader counts compartments rather than transits, so a base derived with <code>TRANSITS(1)</code> re-applies its own chain as a candidate. The README in the anchor directory records both; the transit rules of the pair table are pinned by unit tests transcribed from <code>_is_allowed</code>.</p>
+</section>
+<section id="compared-with-nonmem" class="level2">
+<h2 class="anchored" data-anchor-id="compared-with-nonmem">Compared with NONMEM</h2>
+<p>The anchor for the <em>numbers</em> is NONMEM 7.5.1 on the warfarin dataset (<code>data/warfarin.csv</code>, 10 subjects), FOCEI, over the space <code>PERIPHERALS(0..1); LAGTIME([OFF,ON])</code> run exhaustively. The base was fitted in NONMEM (<code>base.ctl</code>); the three candidates were written by hand the way the search writes them — seeded from the base’s <code>.ext</code>, with <code>Q = CL</code>, <code>V2 = 0.05 · V</code>, <code>ALAG = 0.25</code> and an η of 0.01 on the lag — and fitted (<code>lag.ctl</code>, <code>p1.ctl</code>, <code>p1_lag.ctl</code>). The control streams, <code>.lst</code> and <code>.ext</code> files are under <code>crates/ferx-tools/tests/nonmem/modelsearch_anchor/</code>, and <code>tests/modelsearch_nonmem_anchor.rs</code> replays the comparison.</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 13%">
+<col style="width: 18%">
+<col style="width: 18%">
+<col style="width: 18%">
+<col style="width: 18%">
+<col style="width: 13%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>model</th>
+<th style="text-align: right;">NONMEM, own run</th>
+<th style="text-align: right;">NONMEM at ferx’s estimates</th>
+<th style="text-align: right;">ferx</th>
+<th style="text-align: right;">mixed BIC</th>
+<th>rank</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>base, <code>one_cpt_oral</code></td>
+<td style="text-align: right;">−286.0042 (successful)</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">−286.0042</td>
+<td style="text-align: right;">−267.488</td>
+<td>1</td>
+</tr>
+<tr class="even">
+<td><code>LAGTIME(ON)</code></td>
+<td style="text-align: right;">−287.0526 (terminated)</td>
+<td style="text-align: right;">−287.6292</td>
+<td style="text-align: right;">−287.6292</td>
+<td style="text-align: right;">−264.508</td>
+<td>2</td>
+</tr>
+<tr class="odd">
+<td><code>PERIPHERALS(1)</code></td>
+<td style="text-align: right;">−289.0727 (terminated)</td>
+<td style="text-align: right;">−289.0986</td>
+<td style="text-align: right;">−289.0986</td>
+<td style="text-align: right;">−261.182</td>
+<td>3</td>
+</tr>
+<tr class="even">
+<td><code>LAGTIME(ON); PERIPHERALS(1)</code></td>
+<td style="text-align: right;">−287.4830 (terminated)</td>
+<td style="text-align: right;">−287.6292</td>
+<td style="text-align: right;">−287.6292</td>
+<td style="text-align: right;">−255.107</td>
+<td>4</td>
+</tr>
+</tbody>
+</table>
+<p>NONMEM’s own minimiser reports <code>MINIMIZATION TERMINATED</code> on all three candidates: warfarin’s first sample is at 0.5 h, so the lag is barely identified and its η collapses (ω → 10⁻⁶), and the two-compartment lag model’s peripheral collapses with it. On those flat directions NONMEM stopped short, so the comparison is made <strong>at the same point</strong>: <code>*_eval.ctl</code> evaluates NONMEM’s objective (<code>MAXEVAL=0</code>) at ferx’s estimates, and the two engines agree to 1.2 × 10⁻⁹ (lag), 3.7 × 10⁻⁹ (two-compartment) and 5.4 × 10⁻⁵ (two-compartment lag, on a corner with <code>Q = 3069</code> and <code>V2 = 9 × 10⁻⁶</code>). And <code>lag_refit.ctl</code> re-minimises the lag model <em>from</em> ferx’s estimates: NONMEM declares <code>MINIMIZATION SUCCESSFUL</code> there, at −287.62917388 against ferx’s −287.62917388 — ferx’s optimum is one NONMEM confirms, and NONMEM’s own run had stopped above it.</p>
+<p>The ranking on the mixed BIC is the same under either NONMEM reading — base, lag, two compartments, both — and the base is selected on both sides: no candidate earns its extra parameters on ten subjects. The smallest BIC gap the ranking depends on (2.98, base against lag) is four orders of magnitude above the worst OFV disagreement, so it is not a ranking decided by numbers finer than two engines agree on. The tolerance in the test is measured, not assumed: 10⁻³, twenty times the worst realised error.</p>
+</section>
+<section id="deviations-from-pharmpy-stated" class="level2">
+<h2 class="anchored" data-anchor-id="deviations-from-pharmpy-stated">Deviations from Pharmpy, stated</h2>
+<ul>
+<li><strong>The pair table is applied to the whole structure, and to the exhaustive combinations.</strong> Pharmpy checks its incompatible pairs against the features a path <em>applied</em>, so a lag time on a bolus base, or a transit chain on a base that already has a lag, is a candidate; and <code>exhaustive</code> skips the check entirely. ferx never generates a model the table calls meaningless, whichever way it would be reached.</li>
+<li><strong>A category the space does not name keeps the base’s value.</strong> Pharmpy fills it with the category’s default (<code>INST</code>, no transits, no peripherals, no lag) and moves the base there.</li>
+<li><strong><code>reduced_stepwise</code> collapses every duplicate group.</strong> Pharmpy 2.0.0 collapses only when a layer holds two or more such groups.</li>
+<li><strong>The collapse prefers a model that passed the gate.</strong> Pharmpy keeps the lowest OFV among the group’s models that have any result; ferx keeps the lowest OFV among those that passed strictness, and only when none did the lowest of the rest.</li>
+<li><strong><code>TRANSITS(n)</code> is a <code>FIX</code>ed θ</strong>, not a literal binding, so the count keeps a name the estimates file and the ODE twin can see.</li>
+<li><strong><code>fullblock</code> is not offered</strong> as an IIV strategy; that move belongs to the variability search.</li>
+<li><strong>The input model is ranked but not selectable.</strong> Pharmpy ranks the base and the candidates; ferx additionally shows the input’s row when a base had to be derived, and excludes that row from selection so the space binds the result.</li>
+</ul>
+</section>
+<section id="from-rust" class="level2">
+<h2 class="anchored" data-anchor-id="from-rust">From Rust</h2>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb4"><pre class="sourceCode rust code-with-copy"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">ferx_tools::modelsearch::</span><span class="op">{</span>run_modelsearch<span class="op">,</span> ModelsearchRun<span class="op">};</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">ferx_tools::search::</span>SearchConfig<span class="op">;</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> cfg <span class="op">=</span> <span class="pp">SearchConfig::</span>load(<span class="st">"warfarin.ferxsearch"</span>)<span class="op">?;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> base <span class="op">=</span> cfg<span class="op">.</span>load_base()<span class="op">?;</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> result <span class="op">=</span> run_modelsearch(<span class="op">&amp;</span>cfg<span class="op">,</span> <span class="op">&amp;</span>base<span class="op">,</span> ModelsearchRun <span class="op">{</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    dir<span class="op">:</span> <span class="cn">Some</span>(<span class="st">"warfarin-modelsearch"</span><span class="op">.</span>into())<span class="op">,</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">..</span><span class="pp">ModelsearchRun::</span><span class="kw">default</span>()</span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span>)<span class="op">?;</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> row <span class="kw">in</span> result<span class="op">.</span>ranked() <span class="op">{</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    <span class="pp">println!</span>(<span class="st">"{} {:?} {:.3} rank {:?} {:.1}s"</span><span class="op">,</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>        row<span class="op">.</span>id<span class="op">,</span> row<span class="op">.</span>structure<span class="op">,</span> row<span class="op">.</span>criterion<span class="op">,</span> row<span class="op">.</span>rank<span class="op">,</span> row<span class="op">.</span>seconds)<span class="op">;</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="pp">println!</span>(<span class="st">"{}"</span><span class="op">,</span> result<span class="op">.</span>final_model<span class="op">.</span>render())<span class="op">;</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> runner_up <span class="op">=</span> <span class="op">&amp;</span>result<span class="op">.</span>models[<span class="st">"run2"</span>]<span class="op">;</span>   <span class="co">// every fitted model's text, by id</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p><code>ModelsearchRun</code> also takes a <code>threads</code> override, a <code>CancelFlag</code> that stops the search between layers with what it has, and a progress callback (<code>ModelsearchEvent</code>).</p>
+
+
+</section>
+</section>
+
+</main> <!-- /main -->
+<script>
+(function () {
+  var HEAD = '<div class="panel-head"><span class="dots"><i></i><i></i><i></i></span><span class="file"><span class="br">[</span>warfarin_pk.ferx<span class="br">]</span></span></div>';
+
+  function apply() {
+    var dark = document.documentElement.getAttribute('data-bs-theme') === 'dark';
+    document.querySelectorAll('div.sourceCode').forEach(function (el) {
+      if (el.parentElement && el.parentElement.closest('.code-panel')) return;
+      if (dark) {
+        if (!el.classList.contains('code-panel')) {
+          el.classList.add('code-panel');
+          el.insertAdjacentHTML('afterbegin', HEAD);
+        }
+      } else {
+        el.classList.remove('code-panel');
+        var h = el.querySelector(':scope > .panel-head');
+        if (h) h.remove();
+      }
+    });
+  }
+
+  if (document.body) apply();
+  document.addEventListener('DOMContentLoaded', apply);
+  new MutationObserver(function (ms) {
+    ms.forEach(function (m) { if (m.attributeName === 'data-bs-theme') apply(); });
+  }).observe(document.documentElement, { attributes: true });
+}());
+</script>
+<script id="quarto-html-after-body" type="application/javascript">
+  window.document.addEventListener("DOMContentLoaded", function (event) {
+    // Ensure there is a toggle, if there isn't float one in the top right
+    if (window.document.querySelector('.quarto-color-scheme-toggle') === null) {
+      const a = window.document.createElement('a');
+      a.classList.add('top-right');
+      a.classList.add('quarto-color-scheme-toggle');
+      a.href = "";
+      a.onclick = function() { try { window.quartoToggleColorScheme(); } catch {} return false; };
+      const i = window.document.createElement("i");
+      i.classList.add('bi');
+      a.appendChild(i);
+      window.document.body.appendChild(a);
+    }
+    setColorSchemeToggle(hasAlternateSentinel())
+    const icon = "";
+    const anchorJS = new window.AnchorJS();
+    anchorJS.options = {
+      placement: 'right',
+      icon: icon
+    };
+    anchorJS.add('.anchored');
+    const isCodeAnnotation = (el) => {
+      for (const clz of el.classList) {
+        if (clz.startsWith('code-annotation-')) {                     
+          return true;
+        }
+      }
+      return false;
+    }
+    const onCopySuccess = function(e) {
+      // button target
+      const button = e.trigger;
+      // don't keep focus
+      button.blur();
+      // flash "checked"
+      button.classList.add('code-copy-button-checked');
+      var currentTitle = button.getAttribute("title");
+      button.setAttribute("title", "Copied!");
+      let tooltip;
+      if (window.bootstrap) {
+        button.setAttribute("data-bs-toggle", "tooltip");
+        button.setAttribute("data-bs-placement", "left");
+        button.setAttribute("data-bs-title", "Copied!");
+        tooltip = new bootstrap.Tooltip(button, 
+          { trigger: "manual", 
+            customClass: "code-copy-button-tooltip",
+            offset: [0, -8]});
+        tooltip.show();    
+      }
+      setTimeout(function() {
+        if (tooltip) {
+          tooltip.hide();
+          button.removeAttribute("data-bs-title");
+          button.removeAttribute("data-bs-toggle");
+          button.removeAttribute("data-bs-placement");
+        }
+        button.setAttribute("title", currentTitle);
+        button.classList.remove('code-copy-button-checked');
+      }, 1000);
+      // clear code selection
+      e.clearSelection();
+    }
+    const getTextToCopy = function(trigger) {
+      const outerScaffold = trigger.parentElement.cloneNode(true);
+      const codeEl = outerScaffold.querySelector('code');
+      for (const childEl of codeEl.children) {
+        if (isCodeAnnotation(childEl)) {
+          childEl.remove();
+        }
+      }
+      return codeEl.innerText;
+    }
+    const clipboard = new window.ClipboardJS('.code-copy-button:not([data-in-quarto-modal])', {
+      text: getTextToCopy
+    });
+    clipboard.on('success', onCopySuccess);
+    if (window.document.getElementById('quarto-embedded-source-code-modal')) {
+      const clipboardModal = new window.ClipboardJS('.code-copy-button[data-in-quarto-modal]', {
+        text: getTextToCopy,
+        container: window.document.getElementById('quarto-embedded-source-code-modal')
+      });
+      clipboardModal.on('success', onCopySuccess);
+    }
+      var localhostRegex = new RegExp(/^(?:http|https):\/\/localhost\:?[0-9]*\//);
+      var mailtoRegex = new RegExp(/^mailto:/);
+        var filterRegex = new RegExp("https:\/\/ferx-nlme\.github\.io\/ferx-core\/");
+      var isInternal = (href) => {
+          return filterRegex.test(href) || localhostRegex.test(href) || mailtoRegex.test(href);
+      }
+      // Inspect non-navigation links and adorn them if external
+     var links = window.document.querySelectorAll('a[href]:not(.nav-link):not(.navbar-brand):not(.toc-action):not(.sidebar-link):not(.sidebar-item-toggle):not(.pagination-link):not(.no-external):not([aria-hidden]):not(.dropdown-item):not(.quarto-navigation-tool):not(.about-link)');
+      for (var i=0; i<links.length; i++) {
+        const link = links[i];
+        if (!isInternal(link.href)) {
+          // undo the damage that might have been done by quarto-nav.js in the case of
+          // links that we want to consider external
+          if (link.dataset.originalHref !== undefined) {
+            link.href = link.dataset.originalHref;
+          }
+        }
+      }
+    function tippyHover(el, contentFn, onTriggerFn, onUntriggerFn) {
+      const config = {
+        allowHTML: true,
+        maxWidth: 500,
+        delay: 100,
+        arrow: false,
+        appendTo: function(el) {
+            return el.parentElement;
+        },
+        interactive: true,
+        interactiveBorder: 10,
+        theme: 'quarto',
+        placement: 'bottom-start',
+      };
+      if (contentFn) {
+        config.content = contentFn;
+      }
+      if (onTriggerFn) {
+        config.onTrigger = onTriggerFn;
+      }
+      if (onUntriggerFn) {
+        config.onUntrigger = onUntriggerFn;
+      }
+      window.tippy(el, config); 
+    }
+    const noterefs = window.document.querySelectorAll('a[role="doc-noteref"]');
+    for (var i=0; i<noterefs.length; i++) {
+      const ref = noterefs[i];
+      tippyHover(ref, function() {
+        // use id or data attribute instead here
+        let href = ref.getAttribute('data-footnote-href') || ref.getAttribute('href');
+        try { href = new URL(href).hash; } catch {}
+        const id = href.replace(/^#\/?/, "");
+        const note = window.document.getElementById(id);
+        if (note) {
+          return note.innerHTML;
+        } else {
+          return "";
+        }
+      });
+    }
+    const xrefs = window.document.querySelectorAll('a.quarto-xref');
+    const processXRef = (id, note) => {
+      // Strip column container classes
+      const stripColumnClz = (el) => {
+        el.classList.remove("page-full", "page-columns");
+        if (el.children) {
+          for (const child of el.children) {
+            stripColumnClz(child);
+          }
+        }
+      }
+      stripColumnClz(note)
+      if (id === null || id.startsWith('sec-')) {
+        // Special case sections, only their first couple elements
+        const container = document.createElement("div");
+        if (note.children && note.children.length > 2) {
+          container.appendChild(note.children[0].cloneNode(true));
+          for (let i = 1; i < note.children.length; i++) {
+            const child = note.children[i];
+            if (child.tagName === "P" && child.innerText === "") {
+              continue;
+            } else {
+              container.appendChild(child.cloneNode(true));
+              break;
+            }
+          }
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(container);
+          }
+          return container.innerHTML
+        } else {
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(note);
+          }
+          return note.innerHTML;
+        }
+      } else {
+        // Remove any anchor links if they are present
+        const anchorLink = note.querySelector('a.anchorjs-link');
+        if (anchorLink) {
+          anchorLink.remove();
+        }
+        if (window.Quarto?.typesetMath) {
+          window.Quarto.typesetMath(note);
+        }
+        if (note.classList.contains("callout")) {
+          return note.outerHTML;
+        } else {
+          return note.innerHTML;
+        }
+      }
+    }
+    for (var i=0; i<xrefs.length; i++) {
+      const xref = xrefs[i];
+      tippyHover(xref, undefined, function(instance) {
+        instance.disable();
+        let url = xref.getAttribute('href');
+        let hash = undefined; 
+        if (url.startsWith('#')) {
+          hash = url;
+        } else {
+          try { hash = new URL(url).hash; } catch {}
+        }
+        if (hash) {
+          const id = hash.replace(/^#\/?/, "");
+          const note = window.document.getElementById(id);
+          if (note !== null) {
+            try {
+              const html = processXRef(id, note.cloneNode(true));
+              instance.setContent(html);
+            } finally {
+              instance.enable();
+              instance.show();
+            }
+          } else {
+            // See if we can fetch this
+            fetch(url.split('#')[0])
+            .then(res => res.text())
+            .then(html => {
+              const parser = new DOMParser();
+              const htmlDoc = parser.parseFromString(html, "text/html");
+              const note = htmlDoc.getElementById(id);
+              if (note !== null) {
+                const html = processXRef(id, note);
+                instance.setContent(html);
+              } 
+            }).finally(() => {
+              instance.enable();
+              instance.show();
+            });
+          }
+        } else {
+          // See if we can fetch a full url (with no hash to target)
+          // This is a special case and we should probably do some content thinning / targeting
+          fetch(url)
+          .then(res => res.text())
+          .then(html => {
+            const parser = new DOMParser();
+            const htmlDoc = parser.parseFromString(html, "text/html");
+            const note = htmlDoc.querySelector('main.content');
+            if (note !== null) {
+              // This should only happen for chapter cross references
+              // (since there is no id in the URL)
+              // remove the first header
+              if (note.children.length > 0 && note.children[0].tagName === "HEADER") {
+                note.children[0].remove();
+              }
+              const html = processXRef(null, note);
+              instance.setContent(html);
+            } 
+          }).finally(() => {
+            instance.enable();
+            instance.show();
+          });
+        }
+      }, function(instance) {
+      });
+    }
+        let selectedAnnoteEl;
+        const selectorForAnnotation = ( cell, annotation) => {
+          let cellAttr = 'data-code-cell="' + cell + '"';
+          let lineAttr = 'data-code-annotation="' +  annotation + '"';
+          const selector = 'span[' + cellAttr + '][' + lineAttr + ']';
+          return selector;
+        }
+        const selectCodeLines = (annoteEl) => {
+          const doc = window.document;
+          const targetCell = annoteEl.getAttribute("data-target-cell");
+          const targetAnnotation = annoteEl.getAttribute("data-target-annotation");
+          const annoteSpan = window.document.querySelector(selectorForAnnotation(targetCell, targetAnnotation));
+          const lines = annoteSpan.getAttribute("data-code-lines").split(",");
+          const lineIds = lines.map((line) => {
+            return targetCell + "-" + line;
+          })
+          let top = null;
+          let height = null;
+          let parent = null;
+          if (lineIds.length > 0) {
+              //compute the position of the single el (top and bottom and make a div)
+              const el = window.document.getElementById(lineIds[0]);
+              top = el.offsetTop;
+              height = el.offsetHeight;
+              parent = el.parentElement.parentElement;
+            if (lineIds.length > 1) {
+              const lastEl = window.document.getElementById(lineIds[lineIds.length - 1]);
+              const bottom = lastEl.offsetTop + lastEl.offsetHeight;
+              height = bottom - top;
+            }
+            if (top !== null && height !== null && parent !== null) {
+              // cook up a div (if necessary) and position it 
+              let div = window.document.getElementById("code-annotation-line-highlight");
+              if (div === null) {
+                div = window.document.createElement("div");
+                div.setAttribute("id", "code-annotation-line-highlight");
+                div.style.position = 'absolute';
+                parent.appendChild(div);
+              }
+              div.style.top = top - 2 + "px";
+              div.style.height = height + 4 + "px";
+              div.style.left = 0;
+              let gutterDiv = window.document.getElementById("code-annotation-line-highlight-gutter");
+              if (gutterDiv === null) {
+                gutterDiv = window.document.createElement("div");
+                gutterDiv.setAttribute("id", "code-annotation-line-highlight-gutter");
+                gutterDiv.style.position = 'absolute';
+                const codeCell = window.document.getElementById(targetCell);
+                const gutter = codeCell.querySelector('.code-annotation-gutter');
+                gutter.appendChild(gutterDiv);
+              }
+              gutterDiv.style.top = top - 2 + "px";
+              gutterDiv.style.height = height + 4 + "px";
+            }
+            selectedAnnoteEl = annoteEl;
+          }
+        };
+        const unselectCodeLines = () => {
+          const elementsIds = ["code-annotation-line-highlight", "code-annotation-line-highlight-gutter"];
+          elementsIds.forEach((elId) => {
+            const div = window.document.getElementById(elId);
+            if (div) {
+              div.remove();
+            }
+          });
+          selectedAnnoteEl = undefined;
+        };
+          // Handle positioning of the toggle
+      window.addEventListener(
+        "resize",
+        throttle(() => {
+          elRect = undefined;
+          if (selectedAnnoteEl) {
+            selectCodeLines(selectedAnnoteEl);
+          }
+        }, 10)
+      );
+      function throttle(fn, ms) {
+      let throttle = false;
+      let timer;
+        return (...args) => {
+          if(!throttle) { // first call gets through
+              fn.apply(this, args);
+              throttle = true;
+          } else { // all the others get throttled
+              if(timer) clearTimeout(timer); // cancel #2
+              timer = setTimeout(() => {
+                fn.apply(this, args);
+                timer = throttle = false;
+              }, ms);
+          }
+        };
+      }
+        // Attach click handler to the DT
+        const annoteDls = window.document.querySelectorAll('dt[data-target-cell]');
+        for (const annoteDlNode of annoteDls) {
+          annoteDlNode.addEventListener('click', (event) => {
+            const clickedEl = event.target;
+            if (clickedEl !== selectedAnnoteEl) {
+              unselectCodeLines();
+              const activeEl = window.document.querySelector('dt[data-target-cell].code-annotation-active');
+              if (activeEl) {
+                activeEl.classList.remove('code-annotation-active');
+              }
+              selectCodeLines(clickedEl);
+              clickedEl.classList.add('code-annotation-active');
+            } else {
+              // Unselect the line
+              unselectCodeLines();
+              clickedEl.classList.remove('code-annotation-active');
+            }
+          });
+        }
+    const findCites = (el) => {
+      const parentEl = el.parentElement;
+      if (parentEl) {
+        const cites = parentEl.dataset.cites;
+        if (cites) {
+          return {
+            el,
+            cites: cites.split(' ')
+          };
+        } else {
+          return findCites(el.parentElement)
+        }
+      } else {
+        return undefined;
+      }
+    };
+    var bibliorefs = window.document.querySelectorAll('a[role="doc-biblioref"]');
+    for (var i=0; i<bibliorefs.length; i++) {
+      const ref = bibliorefs[i];
+      const citeInfo = findCites(ref);
+      if (citeInfo) {
+        tippyHover(citeInfo.el, function() {
+          var popup = window.document.createElement('div');
+          citeInfo.cites.forEach(function(cite) {
+            var citeDiv = window.document.createElement('div');
+            citeDiv.classList.add('hanging-indent');
+            citeDiv.classList.add('csl-entry');
+            var biblioDiv = window.document.getElementById('ref-' + cite);
+            if (biblioDiv) {
+              citeDiv.innerHTML = biblioDiv.innerHTML;
+            }
+            popup.appendChild(citeDiv);
+          });
+          return popup.innerHTML;
+        });
+      }
+    }
+  });
+  </script>
+</div> <!-- /content -->
+<footer class="footer">
+  <div class="nav-footer">
+    <div class="nav-footer-left">
+<p>© 2026 FeRx-NLME · MIT licensed</p>
+</div>   
+    <div class="nav-footer-center">
+      &nbsp;
+    <div class="toc-actions d-sm-block d-md-none"><ul><li><a href="https://github.com/FeRx-NLME/ferx-core/edit/main/tools/modelsearch.qmd" class="toc-action"><i class="bi bi-github"></i>Edit this page</a></li><li><a href="https://github.com/FeRx-NLME/ferx-core/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></div>
+    <div class="nav-footer-right">
+<p>Fe · 26 · Rx · 2026</p>
+</div>
+  </div>
+</footer>
+
+
+
+
+</body></html>

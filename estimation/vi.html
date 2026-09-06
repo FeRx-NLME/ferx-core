@@ -1,0 +1,2329 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en"><head>
+
+<meta charset="utf-8">
+<meta name="generator" content="quarto-1.10.18">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+
+
+<title>Variational Inference – ferx-core</title>
+<style>
+/* Default styles provided by pandoc.
+** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+*/
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: 1.5em;}
+div.column{flex: auto;}
+@media screen {
+div.columns{gap: min(4vw, 1.5em);}
+div.column{overflow-x: auto;}
+}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+  width: 0.8em;
+  margin: 0 0.8em 0.2em -1em; /* quarto-specific, see https://github.com/quarto-dev/quarto-cli/issues/4556 */ 
+  vertical-align: middle;
+}
+/* CSS for syntax highlighting */
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+  { counter-reset: source-line 0; }
+pre.numberSource code > span
+  { position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+  { content: counter(source-line);
+    position: relative; left: -1em; text-align: right; vertical-align: baseline;
+    border: none; display: inline-block;
+    -webkit-touch-callout: none; -webkit-user-select: none;
+    -khtml-user-select: none; -moz-user-select: none;
+    -ms-user-select: none; user-select: none;
+    padding: 0 4px; width: 4em;
+  }
+pre.numberSource { margin-left: 3em;  padding-left: 4px; }
+div.sourceCode
+  {   }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+</style>
+
+
+<script src="../site_libs/quarto-nav/quarto-nav.js"></script>
+<script src="../site_libs/quarto-nav/headroom.min.js"></script>
+<script src="../site_libs/clipboard/clipboard.min.js"></script>
+<script src="../site_libs/quarto-search/autocomplete.umd.js"></script>
+<script src="../site_libs/quarto-search/fuse.min.js"></script>
+<script src="../site_libs/quarto-search/quarto-search.js"></script>
+<meta name="quarto:offset" content="../">
+<link href="../assets/ferx-favicon.svg" rel="icon" type="image/svg+xml">
+<script src="../site_libs/quarto-html/quarto.js" type="module"></script>
+<script src="../site_libs/quarto-html/tabsets/tabsets.js" type="module"></script>
+<script src="../site_libs/quarto-html/popper.min.js"></script>
+<script src="../site_libs/quarto-html/tippy.umd.min.js"></script>
+<script src="../site_libs/quarto-html/anchor.min.js"></script>
+<link href="../site_libs/quarto-html/tippy.css" rel="stylesheet">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-51776f957f81c5a6b38322b65a6a6987.css" rel="stylesheet" class="quarto-color-scheme" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-dark-31632d092df9090a2ed68f79c078059d.css" rel="stylesheet" class="quarto-color-scheme quarto-color-alternate" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-51776f957f81c5a6b38322b65a6a6987.css" rel="stylesheet" class="quarto-color-scheme-extra" id="quarto-text-highlighting-styles">
+<script src="../site_libs/bootstrap/bootstrap.min.js"></script>
+<link href="../site_libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
+<link href="../site_libs/bootstrap/bootstrap-f5ed25dbf962e4596f9f4df24f2ade0d.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme" id="quarto-bootstrap" data-mode="light">
+<link href="../site_libs/bootstrap/bootstrap-dark-8a64b8d4793081e9872239f556c8075c.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme quarto-color-alternate" id="quarto-bootstrap" data-mode="dark">
+<link href="../site_libs/bootstrap/bootstrap-f5ed25dbf962e4596f9f4df24f2ade0d.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme-extra" id="quarto-bootstrap" data-mode="light">
+<script id="quarto-search-options" type="application/json">{
+  "location": "navbar",
+  "copy-button": false,
+  "collapse-after": 3,
+  "panel-placement": "end",
+  "type": "overlay",
+  "limit": 50,
+  "keyboard-shortcut": [
+    "f",
+    "/",
+    "s"
+  ],
+  "show-item-context": false,
+  "language": {
+    "search-no-results-text": "No results",
+    "search-matching-documents-text": "matching documents",
+    "search-copy-link-title": "Copy link to search",
+    "search-hide-matches-text": "Hide additional matches",
+    "search-more-match-text": "more match in this document",
+    "search-more-matches-text": "more matches in this document",
+    "search-clear-button-title": "Clear",
+    "search-text-placeholder": "",
+    "search-detached-cancel-button-title": "Cancel",
+    "search-submit-button-title": "Submit",
+    "search-label": "Search"
+  }
+}</script>
+
+  <script src="https://cdnjs.cloudflare.com/polyfill/v3/polyfill.min.js?features=es6"></script>
+  <script defer="" src="https://cdn.jsdelivr.net/npm/mathjax@4/tex-chtml.js" type="text/javascript"></script>
+
+<script type="text/javascript">
+const typesetMath = (el) => {
+  if (window.MathJax) {
+    // MathJax Typeset
+    window.MathJax.typeset([el]);
+  } else if (window.katex) {
+    // KaTeX Render
+    var mathElements = el.getElementsByClassName("math");
+    var macros = [];
+    for (var i = 0; i < mathElements.length; i++) {
+      var texText = mathElements[i].firstChild;
+      if (mathElements[i].tagName == "SPAN" && texText && texText.data) {
+        window.katex.render(texText.data, mathElements[i], {
+          displayMode: mathElements[i].classList.contains('display'),
+          throwOnError: false,
+          macros: macros,
+          fleqn: false
+        });
+      }
+    }
+  }
+}
+window.Quarto = {
+  typesetMath
+};
+</script>
+
+<link rel="stylesheet" href="../styles.css">
+<meta property="og:title" content="Variational Inference – ferx-core">
+<meta property="og:description" content="Open-source nonlinear mixed-effects modeling for population PK/PD and pharmacometrics">
+<meta property="og:site_name" content="ferx-core">
+<meta property="og:locale" content="en_US">
+<meta name="twitter:title" content="Variational Inference – ferx-core">
+<meta name="twitter:description" content="Open-source nonlinear mixed-effects modeling for population PK/PD and pharmacometrics">
+<meta name="twitter:card" content="summary">
+<link rel="canonical" href="https://ferx-nlme.github.io/ferx-core/estimation/vi.html">
+</head>
+
+<body class="nav-sidebar floating nav-fixed quarto-light"><script id="quarto-html-before-body" type="application/javascript">
+    const toggleBodyColorMode = (bsSheetEl) => {
+      const mode = bsSheetEl.getAttribute("data-mode");
+      const bodyEl = window.document.querySelector("body");
+      if (mode === "dark") {
+        bodyEl.classList.add("quarto-dark");
+        bodyEl.classList.remove("quarto-light");
+      } else {
+        bodyEl.classList.add("quarto-light");
+        bodyEl.classList.remove("quarto-dark");
+      }
+    }
+    const toggleBodyColorPrimary = () => {
+      const bsSheetEl = window.document.querySelector("link#quarto-bootstrap:not([rel=disabled-stylesheet])");
+      if (bsSheetEl) {
+        toggleBodyColorMode(bsSheetEl);
+      }
+    }
+    const setColorSchemeToggle = (alternate) => {
+      const toggles = window.document.querySelectorAll('.quarto-color-scheme-toggle');
+      for (let i=0; i < toggles.length; i++) {
+        const toggle = toggles[i];
+        if (toggle) {
+          if (alternate) {
+            toggle.classList.add("alternate");
+          } else {
+            toggle.classList.remove("alternate");
+          }
+        }
+      }
+    };
+    const toggleColorMode = (alternate) => {
+      // Switch the stylesheets
+      const primaryStylesheets = window.document.querySelectorAll('link.quarto-color-scheme:not(.quarto-color-alternate)');
+      const alternateStylesheets = window.document.querySelectorAll('link.quarto-color-scheme.quarto-color-alternate');
+      manageTransitions('#quarto-margin-sidebar .nav-link', false);
+      if (alternate) {
+        // note: dark is layered on light, we don't disable primary!
+        enableStylesheet(alternateStylesheets);
+        for (const sheetNode of alternateStylesheets) {
+          if (sheetNode.id === "quarto-bootstrap") {
+            toggleBodyColorMode(sheetNode);
+          }
+        }
+      } else {
+        disableStylesheet(alternateStylesheets);
+        enableStylesheet(primaryStylesheets)
+        toggleBodyColorPrimary();
+      }
+      manageTransitions('#quarto-margin-sidebar .nav-link', true);
+      // Switch the toggles
+      setColorSchemeToggle(alternate)
+      // Hack to workaround the fact that safari doesn't
+      // properly recolor the scrollbar when toggling (#1455)
+      if (navigator.userAgent.indexOf('Safari') > 0 && navigator.userAgent.indexOf('Chrome') == -1) {
+        manageTransitions("body", false);
+        window.scrollTo(0, 1);
+        setTimeout(() => {
+          window.scrollTo(0, 0);
+          manageTransitions("body", true);
+        }, 40);
+      }
+    }
+    const disableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        stylesheet.rel = 'disabled-stylesheet';
+      }
+    }
+    const enableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        if(stylesheet.rel !== 'stylesheet') { // for Chrome, which will still FOUC without this check
+          stylesheet.rel = 'stylesheet';
+        }
+      }
+    }
+    const manageTransitions = (selector, allowTransitions) => {
+      const els = window.document.querySelectorAll(selector);
+      for (let i=0; i < els.length; i++) {
+        const el = els[i];
+        if (allowTransitions) {
+          el.classList.remove('notransition');
+        } else {
+          el.classList.add('notransition');
+        }
+      }
+    }
+    const isFileUrl = () => {
+      return window.location.protocol === 'file:';
+    }
+    const hasAlternateSentinel = () => {
+      let styleSentinel = getColorSchemeSentinel();
+      if (styleSentinel !== null) {
+        return styleSentinel === "alternate";
+      } else {
+        return false;
+      }
+    }
+    const setStyleSentinel = (alternate) => {
+      const value = alternate ? "alternate" : "default";
+      if (!isFileUrl()) {
+        window.localStorage.setItem("quarto-color-scheme", value);
+      } else {
+        localAlternateSentinel = value;
+      }
+    }
+    const getColorSchemeSentinel = () => {
+      if (!isFileUrl()) {
+        const storageValue = window.localStorage.getItem("quarto-color-scheme");
+        return storageValue != null ? storageValue : localAlternateSentinel;
+      } else {
+        return localAlternateSentinel;
+      }
+    }
+    const toggleGiscusIfUsed = (isAlternate, darkModeDefault) => {
+      const baseTheme = document.querySelector('#giscus-base-theme')?.value ?? 'light';
+      const alternateTheme = document.querySelector('#giscus-alt-theme')?.value ?? 'dark';
+      let newTheme = '';
+      if(authorPrefersDark) {
+        newTheme = isAlternate ? baseTheme : alternateTheme;
+      } else {
+        newTheme = isAlternate ? alternateTheme : baseTheme;
+      }
+      const changeGiscusTheme = () => {
+        // From: https://github.com/giscus/giscus/issues/336
+        const sendMessage = (message) => {
+          const iframe = document.querySelector('iframe.giscus-frame');
+          if (!iframe) return;
+          iframe.contentWindow.postMessage({ giscus: message }, 'https://giscus.app');
+        }
+        sendMessage({
+          setConfig: {
+            theme: newTheme
+          }
+        });
+      }
+      const isGiscussLoaded = window.document.querySelector('iframe.giscus-frame') !== null;
+      if (isGiscussLoaded) {
+        changeGiscusTheme();
+      }
+    };
+    const authorPrefersDark = false;
+    const darkModeDefault = authorPrefersDark;
+      document.querySelector('link#quarto-text-highlighting-styles.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+      document.querySelector('link#quarto-bootstrap.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+    let localAlternateSentinel = darkModeDefault ? 'alternate' : 'default';
+    // Dark / light mode switch
+    window.quartoToggleColorScheme = () => {
+      // Read the current dark / light value
+      let toAlternate = !hasAlternateSentinel();
+      toggleColorMode(toAlternate);
+      setStyleSentinel(toAlternate);
+      toggleGiscusIfUsed(toAlternate, darkModeDefault);
+      window.dispatchEvent(new Event('resize'));
+    };
+    // Switch to dark mode if need be
+    if (hasAlternateSentinel()) {
+      toggleColorMode(true);
+    } else {
+      toggleColorMode(false);
+    }
+  </script>
+
+<div id="quarto-search-results"></div>
+  <header id="quarto-header" class="headroom fixed-top">
+    <nav class="navbar navbar-expand-lg " data-bs-theme="dark">
+      <div class="navbar-container container-fluid">
+      <div class="navbar-brand-container mx-auto">
+    <a href="../index.html" class="navbar-brand navbar-brand-logo">
+    <img src="../assets/ferx-dsl-brackets.svg" alt="ferx" class="navbar-logo light-content">
+    <img src="../assets/ferx-dsl-brackets.svg" alt="ferx" class="navbar-logo dark-content">
+    </a>
+    <a class="navbar-brand" href="../index.html">
+    <span class="navbar-title">ferx-core</span>
+    </a>
+  </div>
+            <div id="quarto-search" class="" title="Search"></div>
+          <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarCollapse" aria-controls="navbarCollapse" role="menu" aria-expanded="false" aria-label="Toggle navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+  <span class="navbar-toggler-icon"></span>
+</button>
+          <div class="collapse navbar-collapse" id="navbarCollapse">
+            <ul class="navbar-nav navbar-nav-scroll me-auto">
+  <li class="nav-item">
+    <a class="nav-link active" href="../getting-started.html" aria-current="page"> 
+<span class="menu-text">Get started</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/features.html"> 
+<span class="menu-text">Features</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/changelog.html"> 
+<span class="menu-text">Changelog</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/roadmap.html"> 
+<span class="menu-text">Roadmap</span></a>
+  </li>  
+</ul>
+            <ul class="navbar-nav navbar-nav-scroll ms-auto">
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/ferx-core/"> 
+<span class="menu-text">ferx-core</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/ferx-book/"> 
+<span class="menu-text">ferx-r</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/reference/"> 
+<span class="menu-text">Reference</span></a>
+  </li>  
+  <li class="nav-item compact">
+    <a class="nav-link" href="https://github.com/FeRx-NLME"> <i class="bi bi-github" role="img" aria-label="GitHub">
+</i> 
+<span class="menu-text"></span></a>
+  </li>  
+</ul>
+          </div> <!-- /navcollapse -->
+            <div class="quarto-navbar-tools">
+  <a href="" class="quarto-color-scheme-toggle quarto-navigation-tool  px-1" onclick="window.quartoToggleColorScheme(); return false;" title="Toggle dark mode"><i class="bi"></i></a>
+</div>
+      </div> <!-- /container-fluid -->
+    </nav>
+  <nav class="quarto-secondary-nav">
+    <div class="container-fluid d-flex">
+      <button type="button" class="quarto-btn-toggle btn" data-bs-toggle="collapse" role="button" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+        <i class="bi bi-layout-text-sidebar-reverse"></i>
+      </button>
+        <nav class="quarto-page-breadcrumbs" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../estimation/index.html">Estimation Methods</a></li><li class="breadcrumb-item"><a href="../estimation/vi.html">Variational Inference</a></li></ol></nav>
+        <a class="flex-grow-1" role="navigation" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">      
+        </a>
+      <button type="button" class="btn quarto-search-button" aria-label="Search" onclick="window.quartoOpenSearch();">
+        <i class="bi bi-search"></i>
+      </button>
+    </div>
+  </nav>
+</header>
+<!-- content -->
+<div id="quarto-content" class="quarto-container page-columns page-rows-contents page-layout-article page-navbar">
+<!-- sidebar -->
+  <nav id="quarto-sidebar" class="sidebar collapse collapse-horizontal quarto-sidebar-collapse-item sidebar-navigation floating overflow-auto">
+    <div class="pt-lg-2 mt-2 text-left sidebar-header">
+      <a href="../index.html" class="sidebar-logo-link">
+      <img src="../assets/ferx-favicon.svg" alt="" class="sidebar-logo light-content py-0 d-lg-inline d-none">
+      <img src="../assets/ferx-favicon.svg" alt="" class="sidebar-logo dark-content py-0 d-lg-inline d-none">
+      </a>
+      </div>
+        <div class="mt-2 flex-shrink-0 align-items-center">
+        <div class="sidebar-search">
+        <div id="quarto-search" class="" title="Search"></div>
+        </div>
+        </div>
+    <div class="sidebar-menu-container"> 
+    <ul class="list-unstyled mt-1">
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Introduction</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../maturity.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Feature Maturity</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../getting-started.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Getting Started</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../installation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Installation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../quick-start.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Quick Start</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../model-file/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Model File Reference</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/parameters.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Parameters</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/iov.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Inter-Occasion Variability (IOV)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/individual-parameters.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Individual Parameters</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariates.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariates</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariate-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/structural-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Structural Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/lagtime.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Lagtime</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/steady-state.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Steady-State Doses (SS=1)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/error-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Error Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/bloq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">LOQ-Censored Observations</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/ode-models.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/absorption.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Built-in Absorption Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/scaling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Scaling</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/initial-conditions.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Initial Conditions</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/diffusion.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Stochastic Differential Equations (SDE / Diffusion)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/neural-networks.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Neural Networks</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariate-nn.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><code>[covariate_nn]</code> — Deep Compartment Models (DCM)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/data.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/data-selection.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Selection</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/derived.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Derived Columns (<code>[derived]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Output Columns (<code>[output]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/fit-options.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Fit Options</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/simulation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Simulation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/adaptive-dosing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Adaptive (Feedback) Dosing</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/event-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Time-to-Event Endpoints (<code>[event_model]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/categorical.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Categorical endpoints — <code>[binary_model]</code></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/markov-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Markov models ([markov_model])</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../estimation/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Estimation Methods</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/foce.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FOCE / FOCEI</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/agq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">AGQ — Adaptive Gaussian Quadrature</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/gauss-newton.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Gauss-Newton (BHHH)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/saem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">SAEM</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/sir.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Sampling Importance Resampling (SIR)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/importance-sampling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Importance Sampling (IMP)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/frem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FREM (Full Random Effects Model)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/impmap.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">IMPMAP — Importance Sampling assisted by Mode A Posteriori</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/bayes.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Bayesian estimation (MCMC)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/vi.html" class="sidebar-item-text sidebar-link active">
+ <span class="menu-text">Variational Inference</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/parameterization.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Packed Parameter Space</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/optimizers.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Outer Optimizers</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/tte.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Time-to-Event (TTE) Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/categorical.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Categorical endpoints (binary / logistic)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/ctmm.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Continuous-time Markov models (CTMM)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/mixture.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Mixture Models</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false">
+ <span class="menu-text">Tools</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/bootstrap.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Bootstrap</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/gam-screening.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">GAM covariate screening</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/search.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Search configuration</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/covsearch.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate search</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/modelsearch.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Structural model search</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../data-format.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Format</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../cli.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">CLI Reference</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Output Files</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../warnings.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Warnings</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../file-formats/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">File Formats</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../file-formats/fitrx.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">The <code>.fitrx</code> Fit Bundle</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../file-formats/check-report.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Check Report (<code>ferx check --json</code>)</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../examples/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Examples</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/one-cpt-oral.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">One-Compartment Oral (Warfarin)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/two-cpt-iv.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Two-Compartment IV Bolus</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/covariates.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/ode-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Model (Michaelis-Menten)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/bloq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">BLOQ (M3 method)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/iov.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Inter-Occasion Variability (IOV)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/iov-saem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">IOV with SAEM</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/multiple-dosing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Multiple Dosing (ADDL Column)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/steady-state.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Steady-State Dosing (SS Column)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/scaling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Unit Scaling (<code>[scaling]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/derived-output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Derived Columns and Output</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/data-selection.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Selection (IGNORE / ACCEPT)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/ode-lagtime.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Model with Absorption Lag Time</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/transit-absorption.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Transit Absorption (Two-Compartment)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/sde.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Stochastic Differential Equations (SDE)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/frem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FREM (Covariate Analysis)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/multistart.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Multi-Start: Michaelis-Menten Elimination</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../api/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Rust API</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/types.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Core Types</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/fitting.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Fitting Functions</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/simulation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Simulation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/parsing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Parsing</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/model-editing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Model editing</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../faq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FAQ</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../development/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Development</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/contributing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Contributing to FeRx development</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/sdlc.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Development Lifecycle (SDLC)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/docs-lint.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Docs linter</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+    </ul>
+    </div>
+</nav>
+<div id="quarto-sidebar-glass" class="quarto-sidebar-collapse-item" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item"></div>
+<!-- margin-sidebar -->
+    <div id="quarto-margin-sidebar" class="sidebar margin-sidebar">
+        <nav id="TOC" role="doc-toc" class="toc-active">
+    <h2 id="toc-title">On this page</h2>
+   
+  <ul>
+  <li><a href="#what-it-is" id="toc-what-it-is" class="nav-link active" data-scroll-target="#what-it-is">What it is</a></li>
+  <li><a href="#when-to-reach-for-it" id="toc-when-to-reach-for-it" class="nav-link" data-scroll-target="#when-to-reach-for-it">When to reach for it</a></li>
+  <li><a href="#the-objective" id="toc-the-objective" class="nav-link" data-scroll-target="#the-objective">The objective</a></li>
+  <li><a href="#the-elbo-is-not-an-ofv" id="toc-the-elbo-is-not-an-ofv" class="nav-link" data-scroll-target="#the-elbo-is-not-an-ofv">The ELBO is not an OFV</a>
+  <ul>
+  <li><a href="#the-bound-is-verified-not-assumed" id="toc-the-bound-is-verified-not-assumed" class="nav-link" data-scroll-target="#the-bound-is-verified-not-assumed">The bound is verified, not assumed</a></li>
+  </ul></li>
+  <li><a href="#options" id="toc-options" class="nav-link" data-scroll-target="#options">Options</a>
+  <ul>
+  <li><a href="#choosing-a-family" id="toc-choosing-a-family" class="nav-link" data-scroll-target="#choosing-a-family">Choosing a family</a></li>
+  <li><a href="#the-kl-half-vi_kl" id="toc-the-kl-half-vi_kl" class="nav-link" data-scroll-target="#the-kl-half-vi_kl">The KL half: <code>vi_kl</code></a></li>
+  <li><a href="#why-there-is-no-convergence-tolerance" id="toc-why-there-is-no-convergence-tolerance" class="nav-link" data-scroll-target="#why-there-is-no-convergence-tolerance">Why there is no convergence tolerance</a></li>
+  <li><a href="#how-σ-is-updated" id="toc-how-σ-is-updated" class="nav-link" data-scroll-target="#how-σ-is-updated">How <code>σ</code> is updated</a>
+  <ul class="collapse">
+  <li><a href="#why-the-default-is-32-draws" id="toc-why-the-default-is-32-draws" class="nav-link" data-scroll-target="#why-the-default-is-32-draws">Why the default is 32 draws</a></li>
+  <li><a href="#if-a-vi-fit-lands-short" id="toc-if-a-vi-fit-lands-short" class="nav-link" data-scroll-target="#if-a-vi-fit-lands-short">If a VI fit lands short</a></li>
+  </ul></li>
+  <li><a href="#why-the-estimate-is-averaged" id="toc-why-the-estimate-is-averaged" class="nav-link" data-scroll-target="#why-the-estimate-is-averaged">Why the estimate is averaged</a></li>
+  <li><a href="#reproducibility" id="toc-reproducibility" class="nav-link" data-scroll-target="#reproducibility">Reproducibility</a></li>
+  <li><a href="#parameter-bounds" id="toc-parameter-bounds" class="nav-link" data-scroll-target="#parameter-bounds">Parameter bounds</a></li>
+  <li><a href="#ω-structure" id="toc-ω-structure" class="nav-link" data-scroll-target="#ω-structure">Ω structure</a></li>
+  </ul></li>
+  <li><a href="#grad-clip" id="toc-grad-clip" class="nav-link" data-scroll-target="#grad-clip">Gradient clipping, and the freeze it prevents</a>
+  <ul>
+  <li><a href="#the-mechanism" id="toc-the-mechanism" class="nav-link" data-scroll-target="#the-mechanism">The mechanism</a></li>
+  <li><a href="#why-the-threshold-barely-matters" id="toc-why-the-threshold-barely-matters" class="nav-link" data-scroll-target="#why-the-threshold-barely-matters">Why the threshold barely matters</a></li>
+  </ul></li>
+  <li><a href="#standard-errors" id="toc-standard-errors" class="nav-link" data-scroll-target="#standard-errors">Standard errors</a></li>
+  <li><a href="#reading-the-per-subject-posterior" id="toc-reading-the-per-subject-posterior" class="nav-link" data-scroll-target="#reading-the-per-subject-posterior">Reading the per-subject posterior</a></li>
+  <li><a href="#is-the-bound-tight-elbo_tightness_ratio" id="toc-is-the-bound-tight-elbo_tightness_ratio" class="nav-link" data-scroll-target="#is-the-bound-tight-elbo_tightness_ratio">Is the bound tight? (<code>elbo_tightness_ratio</code>)</a></li>
+  <li><a href="#dcm-omega" id="toc-dcm-omega" class="nav-link" data-scroll-target="#dcm-omega">Reading <code>Ω</code> from a deep compartment model</a>
+  <ul>
+  <li><a href="#what-actually-drives-it" id="toc-what-actually-drives-it" class="nav-link" data-scroll-target="#what-actually-drives-it">What actually drives it</a></li>
+  <li><a href="#how-to-tell-it-happened" id="toc-how-to-tell-it-happened" class="nav-link" data-scroll-target="#how-to-tell-it-happened">How to tell it happened</a></li>
+  </ul></li>
+  <li><a href="#inter-occasion-variability" id="toc-inter-occasion-variability" class="nav-link" data-scroll-target="#inter-occasion-variability">Inter-occasion variability</a>
+  <ul>
+  <li><a href="#time-varying-clearance-and-iov-together" id="toc-time-varying-clearance-and-iov-together" class="nav-link" data-scroll-target="#time-varying-clearance-and-iov-together">Time-varying clearance and IOV together</a></li>
+  </ul></li>
+  <li><a href="#unsupported-models" id="toc-unsupported-models" class="nav-link" data-scroll-target="#unsupported-models">Unsupported models</a></li>
+  <li><a href="#performance-note" id="toc-performance-note" class="nav-link" data-scroll-target="#performance-note">Performance note</a></li>
+  <li><a href="#reproducing-janssen-et-al.-2024" id="toc-reproducing-janssen-et-al.-2024" class="nav-link" data-scroll-target="#reproducing-janssen-et-al.-2024">Reproducing Janssen et al.&nbsp;(2024)</a></li>
+  <li><a href="#comparison-with-nonmem" id="toc-comparison-with-nonmem" class="nav-link" data-scroll-target="#comparison-with-nonmem">Comparison with NONMEM</a></li>
+  <li><a href="#residual-error-and-vis-σ" id="toc-residual-error-and-vis-σ" class="nav-link" data-scroll-target="#residual-error-and-vis-σ">Residual error and VI’s <code>σ</code></a></li>
+  <li><a href="#references" id="toc-references" class="nav-link" data-scroll-target="#references">References</a></li>
+  </ul>
+<div class="toc-actions"><ul><li><a href="https://github.com/FeRx-NLME/ferx-core/edit/main/estimation/vi.qmd" class="toc-action"><i class="bi bi-github"></i>Edit this page</a></li><li><a href="https://github.com/FeRx-NLME/ferx-core/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></nav>
+    </div>
+<!-- main -->
+<main class="content" id="quarto-document-content">
+
+
+<header id="title-block-header" class="quarto-title-block default"><nav class="quarto-page-breadcrumbs quarto-title-breadcrumbs d-none d-lg-block" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../estimation/index.html">Estimation Methods</a></li><li class="breadcrumb-item"><a href="../estimation/vi.html">Variational Inference</a></li></ol></nav>
+<div class="quarto-title">
+<h1 class="title">Variational Inference</h1>
+</div>
+
+
+
+<div class="quarto-title-meta">
+
+    
+  
+    
+  </div>
+  
+
+
+</header>
+
+
+<section id="what-it-is" class="level2">
+<h2 class="anchored" data-anchor-id="what-it-is">What it is</h2>
+<p>Variational inference (VI) is a third way to <strong>marginalize the random effects</strong>, alongside the two ferx already offers:</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 33%">
+<col style="width: 33%">
+<col style="width: 33%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Approach</th>
+<th>How <code>η</code> is handled</th>
+<th>Methods</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Profile it out at its mode</td>
+<td>inner optimization per subject per iteration</td>
+<td><code>foce</code>, <code>focei</code>, <code>laplace</code></td>
+</tr>
+<tr class="even">
+<td>Sample it</td>
+<td>MCMC / importance sampling</td>
+<td><code>saem</code>, <code>imp</code>, <code>impmap</code>, <code>bayes</code></td>
+</tr>
+<tr class="odd">
+<td><strong>Approximate its posterior</strong></td>
+<td>fit <code>q(η)</code> and optimize its parameters</td>
+<td><strong><code>vi</code></strong></td>
+</tr>
+</tbody>
+</table>
+<p>VI posits a tractable posterior <code>q_φᵢ(η)</code> for each subject and optimizes every <code>φᵢ</code> <em>jointly</em> with the population parameters, by maximizing the evidence lower bound (ELBO). There is no inner loop: <code>φ</code> persists across iterations the way an EBE warm-start does, but it is optimized rather than re-solved.</p>
+<p>The method follows Janssen et al.&nbsp;(2024), who introduced mixed-effects estimation to deep compartment models and found VI more stable than FOCE when the fixed-effects part is a neural network. Nothing about the implementation is specific to that case — <code>method = vi</code> works on any supported model.</p>
+</section>
+<section id="when-to-reach-for-it" class="level2">
+<h2 class="anchored" data-anchor-id="when-to-reach-for-it">When to reach for it</h2>
+<ul>
+<li><strong>Deep compartment models</strong> (<code>[covariate_nn]</code>). This is the case the method was built for: a highly flexible fixed-effects model makes the FOCE inner loop’s landscape shift under it every iteration, and Janssen et al.&nbsp;report FOCE behaving erratically as a result.</li>
+<li><strong>When you want per-subject posterior uncertainty.</strong> VI produces each subject’s posterior <em>covariance</em> as a by-product, where FOCE and Laplace need a Hessian for it.</li>
+<li><strong>High inter-individual variability</strong>, where the FO approximation is known to be poor and a mode-centred Gaussian is a stretch.</li>
+</ul>
+<p>Reach for something else when you need a defensible likelihood for model comparison as the primary output — see <a href="#the-elbo-is-not-an-ofv">The ELBO is not an OFV</a> — or when your model has non-Gaussian endpoints, which VI does not support. IOV <strong>is</strong> supported; see <a href="#inter-occasion-variability">Inter-occasion variability</a>.</p>
+</section>
+<section id="the-objective" class="level2">
+<h2 class="anchored" data-anchor-id="the-objective">The objective</h2>
+<p>For each subject, VI maximizes</p>
+<p><span class="math display">\[
+\text{ELBO}_i = \mathbb{E}_{\eta \sim q_i}\!\left[\log p(y_i \mid \eta, \theta, \Sigma)\right] - \mathrm{KL}\!\left(q_i \,\|\, N(0, \Omega)\right) \;\le\; \log p(y_i)
+\]</span></p>
+<p>Because both the prior and <code>q</code> are Gaussian, the KL term is available in closed form, so <strong>only the data term needs Monte Carlo</strong>. That is a large variance reduction over estimating the whole bound by sampling, and it has a second consequence: with the KL analytic, the ELBO-maximizing <code>Ω</code> is exactly</p>
+<p><span class="math display">\[
+\Omega^* = \frac{1}{N}\sum_i \left(S_i + \mu_i\mu_i^\top\right)
+\]</span></p>
+<p>so <code>Ω</code> leaves the stochastic optimization entirely. Janssen et al.&nbsp;step <code>Ω</code> by gradient descent and report it fluctuating badly during training (their Fig. 3); taking the exact maximizer removes that failure mode by construction rather than by tuning. Set <code>vi_omega_update = adam</code> to reproduce the published behaviour.</p>
+</section>
+<section id="the-elbo-is-not-an-ofv" class="level2">
+<h2 class="anchored" data-anchor-id="the-elbo-is-not-an-ofv">The ELBO is not an OFV</h2>
+<p>This is the one thing to internalize before using the method.</p>
+<p>The ELBO is a <strong>lower bound</strong> on the log marginal likelihood. <code>−2 × ELBO</code> is therefore an <em>upper</em> bound on <code>−2 log L</code>, and:</p>
+<ul>
+<li>it is <strong>not</strong> comparable with a FOCE, FOCEI, SAEM or Laplace OFV;</li>
+<li>it is <strong>not</strong> comparable across variational families — a richer family raises the bound without the model fitting any better;</li>
+<li>it is <strong>not</strong> a <code>−2 log L</code>, so it does not belong in an AIC or a likelihood-ratio test.</li>
+</ul>
+<p>Accordingly, <code>ofv</code> is <code>NaN</code> after a VI fit by default, with a warning saying why. No number at all is safer than a number that looks like an OFV and is not one. The bound itself is reported on <code>FitResult$vi$neg_two_elbo</code>, where it is useful for judging convergence and for comparing VI fits of the same data with the same family.</p>
+<p>To get a genuine marginal likelihood at the VI estimate:</p>
+<pre><code>[fit_options]
+  method       = vi
+  vi_final_ofv = laplace     # EBE reconvergence + the FOCE objective; cheap, deterministic</code></pre>
+<p>for a <strong>deterministic</strong> quadrature <code>−2 log L</code>:</p>
+<pre><code>[fit_options]
+  method        = vi, laplace
+  n_agq         = 21
+  agq_eval_only = true</code></pre>
+<p>or, for an importance-sampling <code>−2 log L</code> with the full IS diagnostics:</p>
+<pre><code>[fit_options]
+  methods        = vi, imp
+  imp_eval_only  = true</code></pre>
+<p>Any of the three is a reasonable way to finish a VI fit for a model you intend to report. The middle one is the tightest: adaptive quadrature converges to the exact marginal as <code>n_agq</code> rises and carries no Monte-Carlo error, so two runs agree bit for bit and the number is comparable across fits without a sampling caveat. It costs <code>n_agq ^ n_eta</code> likelihood evaluations per subject, so it suits <code>n_eta ≤ 4</code>. The IS route scales better in <code>n_eta</code> and brings its own diagnostics.</p>
+<p>Evaluating the marginal this way also lets you read the <strong>bound gap</strong> directly: <code>−2·ELBO</code> minus the AGQ <code>ofv</code> is <code>2·KL(q ‖ p(η|y))</code> summed over subjects, which is the quantity <a href="#is-the-bound-tight-elbo_tightness_ratio"><code>elbo_tightness_ratio</code></a> approximates. That inequality is enforced as a test — see the note below.</p>
+<section id="the-bound-is-verified-not-assumed" class="level3">
+<h3 class="anchored" data-anchor-id="the-bound-is-verified-not-assumed">The bound is verified, not assumed</h3>
+<p><code>−2·ELBO ≥ −2 log p(y)</code> is a theorem, but an implementation can still violate it. It is checked per subject against adaptive Gauss–Hermite quadrature — which reproduces NONMEM <code>LAPLACIAN</code> to six significant figures, and is itself pinned to a closed-form marginal at machine precision on a linear-Gaussian fixture — over a sweep of deliberately-wrong <code>q</code>s, in one and two <code>η</code> dimensions, for both the ELBO formula and the number <code>FitResult$vi$neg_two_elbo</code> reports. See <code>src/estimation/vi/elbo_agq_bound.rs</code>.</p>
+<p>Worth knowing what that does <em>not</em> cover, since the bound is one-sided: an objective that came out too <em>large</em> would satisfy it more comfortably, so it is paired with a two-sided check of the Monte-Carlo ELBO against a deterministic quadrature ELBO, and an exact comparison of the closed-form KL.</p>
+</section>
+</section>
+<section id="options" class="level2">
+<h2 class="anchored" data-anchor-id="options">Options</h2>
+<p>All keys go in <code>[fit_options]</code>.</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 33%">
+<col style="width: 33%">
+<col style="width: 33%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Key</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>vi_iters</code></td>
+<td>25000</td>
+<td><strong>Ceiling</strong> on Adam iterations; the fit stops earlier once it has settled — see below</td>
+</tr>
+<tr class="even">
+<td><code>vi_mc_samples</code></td>
+<td>32</td>
+<td>Monte-Carlo draws per subject per iteration. Sets the noise floor the settling test measures against, so it decides where the fit stops — see below</td>
+</tr>
+<tr class="odd">
+<td><code>vi_lr</code></td>
+<td>0.02</td>
+<td>Adam learning rate</td>
+</tr>
+<tr class="even">
+<td><code>vi_grad_clip</code></td>
+<td>1e4</td>
+<td>Global-L2 gradient clip on the Adam steps; <code>0</code> disables it. Keeps one catastrophic gradient from freezing the optimizer — see below</td>
+</tr>
+<tr class="odd">
+<td><code>vi_family</code></td>
+<td><code>full_rank</code></td>
+<td><code>full_rank</code> or <code>mean_field</code></td>
+</tr>
+<tr class="even">
+<td><code>vi_omega_update</code></td>
+<td><code>closed_form</code></td>
+<td><code>closed_form</code> or <code>adam</code></td>
+</tr>
+<tr class="odd">
+<td><code>vi_sigma_update</code></td>
+<td><code>closed_form</code></td>
+<td><code>closed_form</code> or <code>adam</code></td>
+</tr>
+<tr class="even">
+<td><code>vi_avg_last</code></td>
+<td>final 25%</td>
+<td>Polyak averaging window (iterations)</td>
+</tr>
+<tr class="odd">
+<td><code>vi_eta_grad</code></td>
+<td><code>auto</code></td>
+<td><code>auto</code>, <code>analytic</code>, or <code>fd</code></td>
+</tr>
+<tr class="even">
+<td><code>vi_kl</code></td>
+<td><code>analytic</code></td>
+<td><code>analytic</code> or <code>mc</code> — how the KL half is evaluated</td>
+</tr>
+<tr class="odd">
+<td><code>vi_final_ofv</code></td>
+<td><code>none</code></td>
+<td><code>none</code> or <code>laplace</code></td>
+</tr>
+<tr class="even">
+<td><code>vi_seed</code></td>
+<td>fixed default</td>
+<td>Seed for the common random numbers</td>
+</tr>
+</tbody>
+</table>
+<section id="choosing-a-family" class="level3">
+<h3 class="anchored" data-anchor-id="choosing-a-family">Choosing a family</h3>
+<p><code>full_rank</code> fits <code>q(η) = N(μ, LLᵀ)</code> with a full covariance and is the default. <code>mean_field</code> fits a diagonal covariance: <code>O(d)</code> parameters per subject rather than <code>O(d²)</code>, so it is preferable once <code>n_eta</code> is large — at the cost of a looser bound whenever the true posterior is correlated, which for CL/V it almost always is.</p>
+<p>How much looser is not a matter of taste: for a Gaussian posterior with precision <code>H = Σ⁻¹</code>, the best diagonal <code>q</code> matches the diagonal of the <strong>precision</strong> (<code>Sₖₖ = 1/Hₖₖ</code>, which is smaller than <code>Σₖₖ</code>), and the bound it pays is</p>
+<p><span class="math display">\[
+-2\cdot\mathrm{ELBO}_{\text{mean field}} - (-2 \log p(y)) = -\log(1 - r^2)
+\]</span></p>
+<p>with <code>r</code> the posterior <em>precision</em> correlation, for two random effects; in general the cost is <code>log(det Σ · Πₖ Hₖₖ)</code>, which is zero exactly when the posterior is uncorrelated. On warfarin with <code>block_omega (ETA_CL, ETA_V)</code> the two families converge to the same parameter vector (max drift 0.89%) and <code>mean_field</code>’s bound is <strong>7.70 units</strong> looser. So <code>mean_field</code> is a scaling decision, and on a strongly correlated posterior it costs real tightness — check <code>elbo_tightness_ratio</code> after switching.</p>
+</section>
+<section id="the-kl-half-vi_kl" class="level3">
+<h3 class="anchored" data-anchor-id="the-kl-half-vi_kl">The KL half: <code>vi_kl</code></h3>
+<p>By default the <code>KL(q ‖ N(0, Ω))</code> term is taken in closed form, so only the data term is sampled. <code>vi_kl = mc</code> estimates it from the same draws instead, as <code>E_q[log q(η) − log p(η | Ω)]</code>.</p>
+<p>Both estimate the same objective and <code>mc</code> is unbiased, so this is a <strong>variance</strong> choice, not an accuracy one. Three reasons it exists:</p>
+<ul>
+<li>It reproduces Janssen et al., who sample the whole ELBO.</li>
+<li>It is what a variational family with no closed-form KL — a mixture, a normalizing flow — will need. Such a family falls back to it automatically, with a warning, rather than failing; <code>FitResult$vi$kl</code> reports which route actually ran and <code>n_kl_fallback_subjects</code> how many subjects fell back.</li>
+<li>It cross-checks the analytic KL against a route sharing none of its algebra, the same way <code>vi_eta_grad = fd</code> cross-checks the analytic <code>∂/∂η</code>.</li>
+</ul>
+<p>Expect a noisier ELBO trace; raise <code>vi_mc_samples</code> to compensate. Keep <code>vi_omega_update = closed_form</code>, which stays valid under a sampled KL because the sampled <code>∂KL/∂Ω</code> has the closed form as its expectation.</p>
+<p>Combining <code>vi_kl = mc</code> with <code>vi_omega_update = adam</code> is the one configuration in which nothing exact anchors <code>Ω</code> — the closed-form maximizer is off and the gradient replacing it is sampled — and it warns (<code>W_VI_OMEGA_UNANCHORED</code>). Either option alone is fine: under the analytic KL the <code>Ω</code> gradient is exact, and under the closed form <code>Ω</code> never enters the stochastic optimization at all. It is a warning rather than an error because that pair is precisely what Janssen et al. run, so reproducing their result is a legitimate reason to ask for it — expect the <code>Ω</code> fluctuation their Fig. 3 shows.</p>
+<p>The gradient uses the path-derivative (“sticking the landing”, Roeder et al.&nbsp;2017) estimator, which drops a score term with zero expectation. That lowers variance — decisively so near the optimum, where it is the only remaining noise — and makes the KL gradient vanish exactly when <code>q</code> equals the prior. One consequence worth knowing if you are reading the code: under <code>vi_kl = mc</code> the reported <code>φ</code> gradient is deliberately not the derivative of the reported ELBO.</p>
+</section>
+<section id="why-there-is-no-convergence-tolerance" class="level3">
+<h3 class="anchored" data-anchor-id="why-there-is-no-convergence-tolerance">Why there is no convergence tolerance</h3>
+<p>The objective is a Monte-Carlo estimate, so a per-iteration improvement test would stop on noise rather than on convergence. VI instead treats <code>vi_iters</code> as a <strong>ceiling</strong> and stops once the remaining drift is indistinguishable from that noise, judged on a moving summary of the trace together with the stability of the parameters themselves. <code>n_iterations</code> reports what actually ran and <code>converged</code> whether it had in fact settled.</p>
+<p>That summary is deliberately <strong>robust</strong>: the two windows are compared by their medians, and the tolerance is sized from the median absolute deviation rather than the sample variance. A mean/variance version is fooled by exactly the traces that most need catching — an unhealthy run is heavy-tailed, and a few outliers inflate the spread until the tolerance swallows whatever systematic drift is left, so the run certifies itself at the earliest iteration arithmetically allowed (#1119). Median and MAD are unmoved by that tail.</p>
+<p>Whether a healthy fit notices depends on which of the two criteria stopped it. A run that stopped on <strong>parameter stability</strong> is untouched — <code>propofol_schnider</code> and <code>vancomycin_uvm</code> still stop at 2500 and 2000 iterations and reproduce every estimate and <code>−2·ELBO</code> digit for digit. A run that stopped on the <strong>trace</strong> is slightly more conservative, because the MAD of a mildly leptokurtic trace sits a little below its standard deviation: the tolerance tightens and the run stops later at the same answer (<code>warfarin</code> 5125 → 8375 iterations, <code>two_cpt_oral_cov</code> 6625 → 7250, <code>warfarin_iov</code> 3500 → 3625, with every <code>θ</code>, <code>Ω</code> and <code>σ</code> agreeing to four or five significant figures).</p>
+<p>Settling is not the same as landing somewhere good — a stuck optimizer also stops moving. Read <a href="#is-the-bound-tight-elbo_tightness_ratio"><code>elbo_tightness_ratio</code></a> alongside <code>converged</code>.</p>
+<p>Either criterion is sufficient, so the second one is stated carefully. It measures <strong>both</strong> halves of the optimization — the packed population vector <em>and</em> <code>φ</code>, the per-subject variational parameters — because <code>φ</code> is what a VI fit is usually for, and a model whose <code>θ</code>/<code>Ω</code>/<code>σ</code> settle first would otherwise stop while the posteriors were still moving. Both must be still, on the same window and tolerance.</p>
+<p>The population half is still disabled outright when every population parameter is FIXed and you are fitting <code>q</code> alone — a reasonable thing to ask for, since it is how you read per-subject posteriors at a known estimate. There the test would compare a constant against itself, so convergence rests on the objective alone and a warning says so.</p>
+</section>
+<section id="how-σ-is-updated" class="level3">
+<h3 class="anchored" data-anchor-id="how-σ-is-updated">How <code>σ</code> is updated</h3>
+<p><code>Ω</code> is not the only population parameter with an exact ELBO maximizer. For a single proportional or additive residual error, stationarity of the data term gives</p>
+<p><span class="math display">\[\sigma^{*2} = \frac{1}{n_{obs}} \sum_{obs} \mathbb{E}_q\!\left[\frac{(y - f(\eta))^2}{f(\eta)^2}\right]\]</span></p>
+<p>(the <code>f^2</code> divisor present for proportional error, absent for additive). <code>vi_sigma_update = closed_form</code>, the default, takes that maximizer each iteration, so <code>σ</code> never enters the stochastic optimization. It costs nothing: the same identity expresses the sum in terms of the <code>σ</code> gradient the ELBO already computes, so no extra pass over the data is needed.</p>
+<p><strong>Why this is the default.</strong> Exactness and consistency with <code>Ω</code>, rather than a measured improvement: it makes <code>σ</code> the exact conditional maximizer, so that coordinate carries no <code>vi_lr</code> sensitivity of its own. At adequate draw counts the two routes agree to ~0.3 OFV on warfarin, with <code>adam</code> marginally ahead, so do not expect <code>closed_form</code> to change a converged answer. Error structures with no scalar stationary point — combined error, several <code>σ</code>, per-endpoint or covariate-selected error, correlated residuals, M3 BLOQ, IIV-on-RUV, FREM, or a FIXed <code>σ</code> — fall back to <code>adam</code>, with the reason in <code>FitResult$warnings</code>.</p>
+<section id="why-the-default-is-32-draws" class="level4">
+<h4 class="anchored" data-anchor-id="why-the-default-is-32-draws">Why the default is 32 draws</h4>
+<p><strong>The thing actually worth knowing about <code>σ</code>.</strong> At <code>vi_mc_samples = 8</code> — the default before this was measured — a warfarin fit (<code>data/warfarin.csv</code>) returns <code>σ ≈ 0.0138</code> where AGQ (<code>n_agq = 9</code>) and FOCEI both give <code>0.010565</code> — <strong>31% high</strong>, with the OFV 9.4–9.6 units short of AGQ’s <code>−285.977</code>. Since per-subject posterior width scales with <code>σ²</code>, an error that size makes every reported variational covariance about 1.7× too wide. This is <strong>not</strong> a defect in the <code>σ</code> update: <code>closed_form</code> gives <code>0.013810</code> and <code>adam</code> <code>0.013932</code> on the same data, and both stop showing it at higher draw counts.</p>
+<p><strong>The gap by draw count.</strong> Measured against AGQ’s <code>−285.977</code>, the OFV gap runs <strong>9.6 units at 8 draws, 1.4 at 32, and 0.37 at 128</strong> (<code>−285.606</code>), with <code>σ</code> +31%, +10% and +5% respectively. The draw count sets the noise floor the settling test measures against, so too few draws do not merely make the fit noisy — they change where it stops.</p>
+<div class="callout callout-style-default callout-warning callout-titled">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Warning</span>At 8 draws this fit could still report <code>converged: true</code>
+</div>
+</div>
+<div class="callout-body-container callout-body">
+<p>The convergence rule has a drift check that demotes a run stopping at its noise floor while the objective is still falling (see <a href="#why-there-is-no-convergence-tolerance">Why there is no convergence tolerance</a>). It does not catch every case here, because there are two different failures at 8 draws and it only sees the first:</p>
+<ul>
+<li><strong>Still descending at the ceiling.</strong> With the default <code>vi_seed</code>, the run reaches <code>vi_iters = 25000</code> still moving and reports <code>converged: false</code> — correctly.</li>
+<li><strong>Settled at a biased fixed point.</strong> With <code>vi_seed = 99</code> and <em>otherwise default options</em>, the same fit stops at 17 125 iterations and reports <strong><code>converged: true</code></strong> at <code>σ = 0.013761</code> (+30%) and an OFV of <code>−276.569</code>, 9.4 units short. The ELBO trace tail really has plateaued — a sign test over it finds 4 of 9 block steps falling, i.e.&nbsp;noise — so nothing flags it. Raising <code>vi_iters</code> to 150 000 produces the same outcome from the default seed (converges at 30 500, <code>σ = 0.013690</code>).</li>
+</ul>
+<p><code>elbo_tightness_ratio</code> does not catch it either — it read <code>0.989</code> on that run, a healthy value, because it measures whether <code>q</code> matches the posterior <em>at the current parameters</em>, and it does.</p>
+<p><strong>This is why the default is 32.</strong> Across the seeds tried at 32 draws, none certified a materially wrong fit: the runs that reported <code>converged: true</code> landed <code>σ</code> +10% with the OFV within 1.4 units, and a seed that fell into a bad basin (<code>σ = 0.079</code>, OFV <code>−34</code>) was correctly reported <code>converged: false</code>. The failure above is a property of the noise floor, not of a particular seed, so on a residual error under ~3% it is still worth checking <code>σ</code> against a <code>method = laplace</code> or <code>focei</code> fit rather than reading <code>converged</code> alone.</p>
+</div>
+</div>
+</section>
+<section id="if-a-vi-fit-lands-short" class="level4">
+<h4 class="anchored" data-anchor-id="if-a-vi-fit-lands-short">If a VI fit lands short</h4>
+<p>Three consequences worth carrying:</p>
+<ul>
+<li><strong>If a VI fit lands well short of a FOCEI or AGQ fit of the same data, raise <code>vi_mc_samples</code> first.</strong> More iterations do not fix the estimate — 150 000 at 8 draws still lands 9.1 units short — and, worse, they let the run settle and certify itself. This is the right knob for the failure <em>described here</em>: a fit whose <code>q</code> is in the correct basin and whose bound is tight (<code>elbo_tightness_ratio</code> near 1), limited only by Monte-Carlo noise. It is the wrong knob for a fit reporting a tightness ratio in the hundreds or thousands — there <code>q</code> is nowhere near the posterior, more draws do not help, and the thing to check is <a href="#grad-clip">gradient clipping</a>.</li>
+<li>Lowering <code>vi_lr</code> also works (<code>0.002</code> reaches −285.9 at 8 draws), but it is tuning where the draw count is the principled knob.</li>
+<li><strong>Chaining <code>[focei, vi]</code> does not help.</strong> Starting from the fitted FOCEI point, the fit still ends at <code>σ ≈ 0.0141</code>: <code>σ</code> legitimately rises early, because FOCEI’s value is not the ELBO’s conditional optimum given a <code>q</code> that starts at the prior, and the run stops before it comes back down. So a bad <code>σ</code> here is not a bad-basin problem and a warm start is not the remedy.</li>
+</ul>
+</section>
+</section>
+<section id="why-the-estimate-is-averaged" class="level3">
+<h3 class="anchored" data-anchor-id="why-the-estimate-is-averaged">Why the estimate is averaged</h3>
+<p>The last iterate of a stochastic optimizer is a draw carrying the full gradient noise of its final step. Reporting it unaveraged would make two runs of the same fit disagree by more than the estimator’s actual accuracy. The reported estimate is therefore the mean over the final <code>vi_avg_last</code> iterations (Polyak–Ruppert averaging), matching what Janssen et al.&nbsp;do.</p>
+</section>
+<section id="reproducibility" class="level3">
+<h3 class="anchored" data-anchor-id="reproducibility">Reproducibility</h3>
+<p>Random draws come from a seed derived deterministically from <code>(vi_seed, iteration, subject, sample)</code> rather than from a shared RNG, so a fit is reproducible regardless of thread count. <code>q</code> starts at the prior and <code>θ</code> at the model file’s initial estimates — no random initialization.</p>
+</section>
+<section id="parameter-bounds" class="level3">
+<h3 class="anchored" data-anchor-id="parameter-bounds">Parameter bounds</h3>
+<p>Declared bounds are respected. <code>theta TVCL(0.13, 0.001, 10.0)</code> constrains a VI fit exactly as it constrains a FOCE/FOCEI or SAEM fit: Adam is unconstrained, so each step is followed by a projection back into the box, and <code>Ω</code>/<code>σ</code> pick up the same runaway guards the other estimators get. A <code>θ</code> that ends up pinned against a bound raises the usual boundary warning.</p>
+<p>Bounds are enforced in the same transformed space the optimizer works in (log for a sign-constrained <code>θ</code>), so a reported estimate sitting <em>on</em> a bound can differ from the declared value in the last significant digit — the same behaviour as every other method.</p>
+</section>
+<section id="ω-structure" class="level3">
+<h3 class="anchored" data-anchor-id="ω-structure">Ω structure</h3>
+<p>A <code>block_omega</code> declaration is honoured. In a mixed <code>Ω</code> —</p>
+<pre class="ferx"><code>block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]
+omega ETA_KA ~ 0.30</code></pre>
+<p>— the <code>ETA_KA</code>/<code>ETA_CL</code> and <code>ETA_KA</code>/<code>ETA_V</code> covariances are not parameters, and VI leaves them at exactly zero rather than letting them pick up sampling correlation. Both <code>vi_omega_update</code> routes preserve this: the closed-form maximizer masks <code>Ω</code> directly, and the Adam route simply gets no gradient at those coordinates. Cross-checked externally — nlmixr2 7.0’s <code>est = "emvi"</code> holds the same two slots at exactly zero on the same declaration, under both variational families, while estimating the declared block. A <code>FIX</code>ed random effect likewise keeps its whole declared row and column of <code>Ω</code>, not just its own variance.</p>
+</section>
+</section>
+<section id="grad-clip" class="level2">
+<h2 class="anchored" data-anchor-id="grad-clip">Gradient clipping, and the freeze it prevents</h2>
+<p><code>vi_grad_clip</code> bounds the length of the gradient vector before each Adam step. If <code>‖g‖₂</code> exceeds it, the whole vector is rescaled to that length; the direction is untouched. It defaults to <code>1e4</code> and <code>0</code> turns it off.</p>
+<p>This looks like a nuisance parameter and is not. Without it, VI on warfarin from the initial estimates in <code>ferx-testdata/warfarin_pk</code> — <code>TVCL 0.3, TVV 2, TVKA 1.0, σ 0.01</code>, an ordinary distance from the optimum, and the same values NONMEM’s control stream uses — did not converge slowly. It froze.</p>
+<section id="the-mechanism" class="level3">
+<h3 class="anchored" data-anchor-id="the-mechanism">The mechanism</h3>
+<p>Adam does not use the raw gradient. It keeps a running mean <code>m</code> and a running mean of <em>squares</em> <code>v</code>, and steps by <code>lr · m̂ / √v̂</code>. The two have very different memories: <code>beta1 = 0.9</code> forgets in ~10 iterations, <code>beta2 = 0.999</code> in ~1000.</p>
+<p>At <code>TVV = 2</code> the model predicts almost nothing at late times, and a proportional error model turns that into <code>(y−f)²/(σf)²</code>. Iteration 0 evaluates at <code>−2·ELBO = 1.5e14</code>. That gradient enters <code>v</code>, leaving <code>v ≈ 1e25</code> and <code>√v̂ ≈ 1e12</code>. Once the fit recovers and ordinary gradients are ~<code>1e3</code>, the step is <code>lr·1e3/1e12 ≈ 1e-9·lr</code> — zero for practical purposes — and <code>v</code> sheds those twelve orders of magnitude only at <code>0.999</code> per iteration, which takes tens of thousands of them.</p>
+<p>So the optimizer stops moving. And because a frozen trace is a flat trace, the settling rule then fires at the earliest iteration it is allowed to, and the fit reports itself converged.</p>
+<div class="callout callout-style-default callout-important callout-titled">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Important</span>What that looked like
+</div>
+</div>
+<div class="callout-body-container callout-body">
+<p>Warfarin, <code>ferx-testdata</code> initial estimates, against the NONMEM FOCEI run in that folder (<code>nm/run1_focei.lst</code>) started from the same values:</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 16%">
+<col style="width: 16%">
+<col style="width: 16%">
+<col style="width: 16%">
+<col style="width: 16%">
+<col style="width: 16%">
+</colgroup>
+<thead>
+<tr class="header">
+<th></th>
+<th>TVCL</th>
+<th>TVV</th>
+<th>TVKA</th>
+<th>σ</th>
+<th>objective</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>VI, <code>vi_grad_clip = 0</code></td>
+<td>0.2431</td>
+<td>2.4750</td>
+<td>0.7939</td>
+<td><strong>148.41</strong></td>
+<td><code>−2·ELBO</code> 3.6e7</td>
+</tr>
+<tr class="even">
+<td>VI, <code>vi_grad_clip = 1e4</code></td>
+<td>0.132693</td>
+<td>7.73787</td>
+<td>0.81100</td>
+<td>0.01162</td>
+<td><code>−2·ELBO</code> −284.61</td>
+</tr>
+<tr class="odd">
+<td>NONMEM FOCEI</td>
+<td>0.132695</td>
+<td>7.73770</td>
+<td>0.810795</td>
+<td>0.010565</td>
+<td>OFV −286.004</td>
+</tr>
+</tbody>
+</table>
+<p><code>σ = 148.413159</code> is exactly <code>exp(5)</code>, ferx’s internal runaway guard — the fit ran to an implementation ceiling. It stopped after 1500 iterations of a 25 000 ceiling. NONMEM converges from these values in under a second.</p>
+</div>
+</div>
+<p>Two things this was <em>not</em>, both worth stating because both were checked:</p>
+<ul>
+<li><strong>Not a bad basin.</strong> Profiling <code>−2·ELBO</code> against <code>TVV</code> with everything else held fixed is monotone from 2 to 20. There is no local minimum near 2.47; the optimizer was walking away from a downhill direction.</li>
+<li><strong>Not <code>σ</code>.</strong> The closed-form <code>σ</code> update is the exact conditional maximizer given <code>q</code>, and it was behaving correctly — a <code>q</code> that predicts near-zero concentrations really does imply an enormous proportional <code>σ</code>. Pinning <code>σ</code> at the FOCEI value still left <code>TVV</code> at 2.83 after 25 000 iterations. <code>σ</code> at its bound was the symptom.</li>
+</ul>
+</section>
+<section id="why-the-threshold-barely-matters" class="level3">
+<h3 class="anchored" data-anchor-id="why-the-threshold-barely-matters">Why the threshold barely matters</h3>
+<p>Adam is scale-invariant in steady state: multiplying every gradient by a constant leaves <code>m̂/√v̂</code> unchanged. A clip that binds uniformly therefore does not move the trajectory, and clipping only bites during the transient, where it compresses the <em>ratio</em> between a catastrophic gradient and an ordinary one. On warfarin every setting from <code>1</code> to <code>1e5</code> recovers the reference and only <code>0</code> fails. Models that already converged are unchanged — <code>propofol_schnider</code> and <code>vancomycin_uvm</code> agree to seven significant figures with the clip on, and settle in the same number of iterations (2500 and 2000 respectively).</p>
+<p>There is correspondingly little reason to tune this. Lower it only if a trace oscillates violently; raising it has no observed benefit.</p>
+<div class="callout callout-style-default callout-note callout-titled">
+<div class="callout-header d-flex align-content-center collapsed" data-bs-toggle="collapse" data-bs-target=".callout-3-contents" aria-controls="callout-3" aria-expanded="false" aria-label="Toggle callout">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Note</span>Why clipping the norm, and why not an adaptive threshold
+</div>
+<div class="callout-btn-toggle d-inline-block border-0 py-1 ps-1 pe-0 float-end"><i class="callout-toggle"></i></div>
+</div>
+<div id="callout-3" class="callout-3-contents callout-collapse collapse">
+<div class="callout-body-container callout-body">
+<p>Clipping each coordinate independently (<code>clamp(-c, c)</code>) shortens the largest components relative to the rest, which points the step somewhere the gradient does not. Clipping the norm is a uniform rescale and preserves direction exactly.</p>
+<p>The obvious refinement — set the threshold from a percentile of the gradient’s own recent history, as in AutoClip — does not work here, and measurably makes things worse (it left <code>−2·ELBO</code> at 2.4e9 on this fit). The early history <em>is</em> the pathology: when the first ten gradients are all ~<code>1e14</code>, a self-referential threshold sits at <code>1e14</code> and nothing is ever clipped. Breaking the freeze requires an external scale, even a crude one.</p>
+</div>
+</div>
+</div>
+</section>
+</section>
+<section id="standard-errors" class="level2">
+<h2 class="anchored" data-anchor-id="standard-errors">Standard errors</h2>
+<p>Variational posteriors can <strong>understate</strong> posterior variance relative to MCMC, which Janssen et al.&nbsp;flag as a limitation of the approach. So <code>FitResult$vi$eta_covs</code> is for individual-level reporting and shrinkage, and is <strong>not</strong> the route to population standard errors.</p>
+<p>How large the effect is depends on the model, and on warfarin it is <strong>negligible</strong>. Measured against NUTS at a fixed population estimate (4 chains × 20 000 draws, 0 divergences), the variational per-subject variance comes out at <strong>1.00× the exact posterior’s</strong> — 0.2% — with means agreeing to <code>2×10⁻⁵</code>. Thinning to two observations a subject moves it to <strong>4%</strong>. The reason it is this small is measurable rather than lucky: the Laplace covariance matches NUTS to 0.1% on the same fits, so the true per-subject posterior <em>is</em> Gaussian here, and a Gaussian <code>q</code> has nothing to get wrong. Both limits of this model are Gaussian — data-rich by asymptotics, data-poor because the <code>N(0, Ω)</code> prior dominates.</p>
+<p>The <strong>correlations</strong> hold up as well as the variances, which matters because they are what <code>full_rank</code> exists for: against the same NUTS reference the variational correlations land within <strong>0.008</strong> — and they are not small correlations being reproduced, <code>(V, KA)</code> sits at <code>+0.67</code>. So <code>eta_covs</code> is validated as a covariance, not as a set of variances.</p>
+<p>Both numbers above are from a dataset with a ~1% residual error. At a realistic <strong>10%</strong> residual the same comparison gives a variational variance of <strong>0.96–0.98×</strong> the exact posterior’s — a 3–4% understatement — and the decomposition attributes it: the <em>Laplace</em> covariance understates by the same 3–4%, and VI reproduces Laplace to 0.4%. So what is being measured there is the Gaussian family meeting a mildly non-Gaussian posterior, which is the effect the literature describes, rather than anything about the optimizer.</p>
+<p>The <strong>20–25%</strong> figure in the literature comes from deep compartment models, where a neural-network structural model gives the per-subject posterior a geometry a 1-cpt model cannot produce. Treat it as the number for that regime, not a general one, and expect something closer to the measurements above on ordinary compartmental models. It has not been reproduced here, and if a deep compartment model returns an <code>Ω</code> that is <em>several times</em> too small, understatement is not the explanation either way; see <a href="#dcm-omega">Reading <code>Ω</code> from a deep compartment model</a>.</p>
+<p>Those come from the ordinary covariance step — the same FD-of-OFV Hessian every other method uses — run at the VI estimate on the EBEs and <code>H</code> from VI’s final inner-loop pass. It is therefore a <em>Laplace</em> covariance at the VI point, directly comparable with the one a FOCE/FOCEI or SAEM fit reports, and <code>covariance_status</code> / <code>se_theta</code> behave exactly as they do elsewhere. It runs independently of <code>vi_final_ofv</code>: the covariance is the curvature of the Laplace objective, not of the ELBO, so a fit can legitimately report standard errors while leaving <code>ofv</code> as <code>NaN</code>. Set <code>run_covariance_step = false</code> to skip it; in a chain such as <code>methods = vi, focei</code> it runs once, on the final stage.</p>
+</section>
+<section id="reading-the-per-subject-posterior" class="level2">
+<h2 class="anchored" data-anchor-id="reading-the-per-subject-posterior">Reading the per-subject posterior</h2>
+<p>VI produces each subject’s posterior mean <em>and covariance</em> as a by-product, where FOCE and Laplace need a Hessian for the latter. Both are on <code>FitResult$vi$eta_means</code> / <code>$eta_covs</code>, and a <code>method = vi</code> fit also writes them to the fit YAML:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb5"><pre class="sourceCode yaml code-with-copy"><code class="sourceCode yaml"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="fu">vi</span><span class="kw">:</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">eta_names</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="at">ETA_CL</span><span class="kw">,</span><span class="at"> ETA_V</span><span class="kw">,</span><span class="at"> ETA_KA</span><span class="kw">]</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="fu">eta_posterior</span><span class="kw">:</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="at">    </span><span class="kw">-</span><span class="at"> </span><span class="fu">id</span><span class="kw">:</span><span class="at"> </span><span class="st">"1"</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">mean</span><span class="kw">:</span><span class="at"> </span><span class="kw">[</span><span class="fl">0.029863</span><span class="kw">,</span><span class="at"> </span><span class="fl">0.064874</span><span class="kw">,</span><span class="at"> </span><span class="fl">0.369859</span><span class="kw">]</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="at">      </span><span class="fu">cov</span><span class="kw">:</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="kw">-</span><span class="at"> </span><span class="kw">[</span><span class="fl">0.00002566</span><span class="kw">,</span><span class="at"> </span><span class="fl">0.00001221</span><span class="kw">,</span><span class="at"> </span><span class="fl">0.00001864</span><span class="kw">]</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="kw">-</span><span class="at"> </span><span class="kw">[</span><span class="fl">0.00001221</span><span class="kw">,</span><span class="at"> </span><span class="fl">0.00004973</span><span class="kw">,</span><span class="at"> </span><span class="fl">0.00008409</span><span class="kw">]</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="at">        </span><span class="kw">-</span><span class="at"> </span><span class="kw">[</span><span class="fl">0.00001864</span><span class="kw">,</span><span class="at"> </span><span class="fl">0.00008409</span><span class="kw">,</span><span class="at"> </span><span class="fl">0.00036332</span><span class="kw">]</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Rows are keyed by <strong>subject ID</strong>, not position, so a posterior can be matched back to the data without relying on ordering. The ID is emitted as a quoted YAML string, so a zero-padded <code>001</code> reads back as the string it was in the data rather than as the integer <code>1</code>, and an ID containing <code>:</code> or <code>#</code> cannot reshape the document. The covariance is emitted in full rather than as a diagonal: the off-diagonals are the whole point of <code>vi_family = full_rank</code>, and a CL/V posterior correlation is usually the largest of them. Under IOV each entry also carries a <code>kappa_means</code> list, one row per occasion; a non-IOV fit omits the key entirely.</p>
+<p>Two cautions carry over from <a href="#standard-errors">Standard errors</a>. This is the <strong>variational</strong> covariance, so it understates the true posterior variance — it is for individual-level reporting and shrinkage, not a route to population standard errors. And it is a converged-<code>φ</code> quantity: read it alongside <code>converged</code> and <code>elbo_tightness_ratio</code>, because a stuck optimizer also reports a covariance.</p>
+<p><strong>In a chain, check <code>superseded_by</code>.</strong> Everything under <code>vi</code> — the posteriors, both ELBO halves and <code>elbo_tightness_ratio</code> — is evaluated at the parameters <em>VI</em> ended on. A trailing evaluator (<code>methods = vi, laplace</code> with <code>agq_eval_only</code>, or <code>methods = vi, imp</code> with <code>imp_eval_only</code>) reads the fit out without moving it, so the block still describes the reported estimate and <code>superseded_by</code> is absent. A later <strong>estimating</strong> stage does move it: on <code>methods = vi, focei</code> the reported <code>θ</code>/<code>Ω</code>/<code>σ</code> and subject diagnostics come from FOCEI while the <code>vi</code> block still describes the pre-FOCEI point. The block is kept — it is the only per-subject covariance in the result — but it carries <code>superseded_by: "FOCEI"</code> and a warning saying so. Read it at VI’s parameters, not the fit’s.</p>
+</section>
+<section id="is-the-bound-tight-elbo_tightness_ratio" class="level2">
+<h2 class="anchored" data-anchor-id="is-the-bound-tight-elbo_tightness_ratio">Is the bound tight? (<code>elbo_tightness_ratio</code>)</h2>
+<p><code>converged</code> answers “did the objective stop moving”, which a stuck optimizer satisfies just as well as a successful one. Read <code>FitResult$vi$elbo_tightness_ratio</code> alongside it.</p>
+<p>The data term is <code>E_q[−log p(y|η)]</code>. Evaluated at the variational means it is <code>−log p(y|μ)</code>, and the gap between them is <code>≈ ½ tr(H·S)</code> — which is <code>d/2</code> per subject when <code>q</code> has the posterior’s curvature. The ratio is the measured gap over that expectation, so <strong>≈ 1 is ideal</strong> and single digits are unremarkable on a nonlinear model. Above 25 the fit emits a warning naming the likely cause.</p>
+<p>This is what distinguishes a converged fit from a stuck one without running a second estimator. On a deep compartment model started badly it read <strong>306.6</strong> while the fit reported <code>converged: true</code> at 973 OFV worse than the same model started sensibly; started sensibly it read <strong>0.54</strong>.</p>
+<p>If it fires: start from better values (<code>init</code> on a <code>[covariate_nn]</code> block, see <a href="../model-file/covariate-nn.html#start-the-network-at-plausible-values-init"><code>[covariate_nn]</code></a>), or chain <code>method = [focei, vi]</code> to begin VI from a fitted point.</p>
+</section>
+<section id="dcm-omega" class="level2">
+<h2 class="anchored" data-anchor-id="dcm-omega">Reading <code>Ω</code> from a deep compartment model</h2>
+<p>A <code>[covariate_nn]</code> typical-value function can be flexible enough to explain <em>between-subject</em> variation as a covariate effect. When it does, that variation leaves <code>Ω</code> — and <strong>every health check on this page still reads green.</strong></p>
+<p>Measured on a simulated busulfan-shaped DCM (60 subjects, <code>WT</code> and <code>CRCL</code>, IOV on CL, true <code>ω²(CL) = 0.09</code>), varying only the hidden layers and holding data, seed and options fixed:</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th><code>layers</code></th>
+<th>NN weights</th>
+<th>ω²(CL)</th>
+<th>−2 log L</th>
+<th>AIC</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>[2]</code></td>
+<td>12</td>
+<td>0.132</td>
+<td>1151.3</td>
+<td>1181.3</td>
+</tr>
+<tr class="even">
+<td><code>[3]</code></td>
+<td>17</td>
+<td>0.132</td>
+<td>1147.6</td>
+<td>1187.6</td>
+</tr>
+<tr class="odd">
+<td><code>[6, 6]</code></td>
+<td>74</td>
+<td><strong>0.017</strong></td>
+<td>1061.0</td>
+<td>1215.0</td>
+</tr>
+</tbody>
+</table>
+<p>The <code>[6, 6]</code> fit reported <code>converged: true</code>, <code>elbo_tightness_ratio: 0.544</code>, <code>n_fd_subjects: 0</code>, and an OFV 87 points <em>better</em> than FOCEI’s on the same model. Nothing above would have told you it had lost 80% of the IIV.</p>
+<p><strong>This is not the variational-variance effect</strong> described under <a href="#standard-errors">Standard errors</a>. That one is mild (~20–25%), applies to <code>S_i</code>, and averages away over subjects. This is a property of the <em>fixed-effects</em> model, is not specific to VI, and grows with network capacity instead of washing out.</p>
+<section id="what-actually-drives-it" class="level3">
+<h3 class="anchored" data-anchor-id="what-actually-drives-it">What actually drives it</h3>
+<p>Not capacity on its own — <strong>capacity relative to the number of distinct covariate patterns, in a space where those patterns are separable.</strong> The dataset above has 60 subjects and 60 distinct <code>(WT, CRCL)</code> pairs, so a 74-weight network can index subjects. Three fixtures in <code>tests/vi_dcm_omega_recovery.rs</code> separate the ingredients:</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 50%">
+<col style="width: 50%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Covariate design</th>
+<th><code>[4]</code> → <code>[8, 8]</code> (22 → 114 weights)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>12 tied levels, 5 subjects each</td>
+<td>0.089 → 0.085 — no collapse at any width</td>
+</tr>
+<tr class="even">
+<td>60 distinct values on <strong>one</strong> covariate</td>
+<td>0.126 → 0.107 — no collapse</td>
+</tr>
+<tr class="odd">
+<td>60 distinct <strong><code>(WT, CRCL)</code></strong> pairs</td>
+<td>0.072 → <strong>0.005</strong> — 17× collapse</td>
+</tr>
+</tbody>
+</table>
+<p>Ties defeat it outright: five subjects sharing a covariate pattern cannot be told apart by any typical-value function, however flexible. A single subject-unique covariate is also not enough — 60 distinct values on one axis still ask a <code>tanh</code> network for a wiggly interpolant over an ordered domain, which its smoothness bias makes hard to reach. Two scattered covariates make the subjects trivially separable, and that is when <code>Ω</code> goes.</p>
+</section>
+<section id="how-to-tell-it-happened" class="level3">
+<h3 class="anchored" data-anchor-id="how-to-tell-it-happened">How to tell it happened</h3>
+<ul>
+<li><strong>Watch <code>σ</code>.</strong> Across every fit above it stayed at 0.089–0.092. Variance the network <em>takes</em> from <code>Ω</code> does not reappear in the residual, so a plausible <code>σ</code> alongside a shrunken <code>Ω</code> is the signature — not reassurance.</li>
+<li><strong>Use AIC, on <code>vi_final_ofv = laplace</code>’s <code>ofv</code>, never the ELBO.</strong> The collapsed fit buys 87 points of −2 log L with 57 extra parameters, so AIC rejects it by 27 without being told anything about <code>Ω</code>. It is a blunt guard — it penalises capacity unconditionally — but it points the right way.</li>
+<li><strong>Refit the same structure with FOCEI, SAEM, or a parametric covariate model.</strong> On the busulfan data, FOCEI (0.120), a <code>[focei, vi]</code> chain (0.101) and VI at <code>layers = [3]</code> (0.132) all agree near the truth; only cold-started VI at <code>[6, 6]</code> disagrees. FOCEI is not more trustworthy here in principle — its outer loop simply never reached the memorising optimum that VI’s Adam found.</li>
+</ul>
+<p>Regularizing the network (weight decay / curvature penalties) is the direct fix and is not yet implemented; until it is, size the network to the design and check <code>Ω</code> against a second estimator.</p>
+</section>
+</section>
+<section id="inter-occasion-variability" class="level2">
+<h2 class="anchored" data-anchor-id="inter-occasion-variability">Inter-occasion variability</h2>
+<p>IOV (<code>kappa</code>) is supported. The variational posterior covers the <strong>stacked</strong> vector <code>[η, κ₁ … κ_K]</code> for each subject, against the block-diagonal prior <code>Σ_b = Ω_bsv ⊕ Ω_iov^⊗K</code>. Because <code>K</code> is a per-subject quantity, subjects with different occasion counts carry differently-sized <code>q</code>; nothing else about the method changes, and <code>Ω_iov</code> gets the same exact-maximizer treatment as <code>Ω</code>, pooled over all occasions of all subjects.</p>
+<p><code>FitResult$vi</code> reports per-occasion <code>κ</code> means alongside the <code>η</code> means.</p>
+<p>One caveat worth knowing before you read <code>Ω_iov</code> closely. Variational posteriors understate posterior variance, and <code>Ω_iov</code> is estimated as a mean of <code>S + μμᵀ</code> over occasions — so the understatement biases it <strong>downward</strong>, and unlike <code>Ω_bsv</code> (averaged over subjects) it has comparatively few occasions to average that bias away. On a simulated 60-subject, 4-occasion recovery fit, <code>Ω_iov</code> came back about 24% low while <code>θ</code> landed within 2%. Treat <code>Ω_iov</code> from a VI fit as an estimate with a known downward lean; if it is the parameter you care about, confirm it with SAEM or FOCEI.</p>
+<p>The lean is not the whole story, and the design can dominate it. On a busulfan-shaped fit pairing a <code>TIME</code> decline with per-occasion <code>κ</code> (true <code>Ω_iov = 0.09</code>), <code>Ω_iov</code> read <strong>high</strong> — 0.16 under VI, and 0.16–0.18 under FOCEI and a <code>[focei, vi]</code> chain alike. When <code>κ</code> and a systematic trend compete for the same signal (see <a href="#time-varying-clearance-and-iov-together">below</a>), that confounding moves <code>Ω_iov</code> further than the variational bias does, and it moves it in every estimator. Read the two together rather than assuming a direction.</p>
+<section id="time-varying-clearance-and-iov-together" class="level3">
+<h3 class="anchored" data-anchor-id="time-varying-clearance-and-iov-together">Time-varying clearance and IOV together</h3>
+<p>A clearance that declines over a course (the busulfan shape) and a per-occasion <code>κ</code> are <em>confusable by construction</em> — both make clearance differ between early and late records, and only the shape of the difference distinguishes them. Both are supported together, whether the time dependence comes from the <code>TIME</code> built-in or from a time-varying covariate.</p>
+<p>Two practical points, measured on a simulated recovery (<code>tests/vi_time_varying_iov.rs</code>):</p>
+<ul>
+<li><strong>Sample more than once per occasion.</strong> With a single trough per occasion, a systematic decline and an exchangeable per-occasion offset produce the same data; no estimator can separate them.</li>
+<li><strong>Fit IOV even if you only care about the decline.</strong> Omitting <code>κ</code> pushed the residual error up 45% and understated the decline parameter by 11% — the between-occasion variation has to go somewhere, and the trend absorbs part of it.</li>
+</ul>
+</section>
+</section>
+<section id="unsupported-models" class="level2">
+<h2 class="anchored" data-anchor-id="unsupported-models">Unsupported models</h2>
+<p>One class is refused up front rather than fitted approximately:</p>
+<ul>
+<li><strong>Non-Gaussian endpoints (TTE, categorical)</strong> — VI’s data term is the fixed-<code>η</code> observation NLL, which scores those rows through a separate channel; fitting them with VI would silently omit their likelihood contribution.</li>
+</ul>
+<p>It produces an error naming a method that does work. This is a deliberate asymmetry: a <em>gradient</em> the analytic provider cannot supply falls back to finite differences and is still correct, but an <em>objective</em> missing part of the likelihood cannot be salvaged.</p>
+</section>
+<section id="performance-note" class="level2">
+<h2 class="anchored" data-anchor-id="performance-note">Performance note</h2>
+<p>VI needs <code>∂/∂η</code> of the data term for every subject at every iteration. The analytic <code>Dual2</code> provider covers this for most models — including ODE models, <code>iiv_on_ruv</code>, steady-state doses and reset events — and anything it declines falls back to central finite differences, roughly 10–40× slower for that subject. <code>FitResult$vi$n_fd_subjects</code> reports how many subjects took the slow path, and a non-zero count raises a warning. It means the fit was slower than it needed to be, not that it was wrong.</p>
+</section>
+<section id="reproducing-janssen-et-al.-2024" class="level2">
+<h2 class="anchored" data-anchor-id="reproducing-janssen-et-al.-2024">Reproducing Janssen et al.&nbsp;(2024)</h2>
+<p>Fitted on their simulated haemophilia A / FVIII dataset (fold 1, <code>n = 55</code>, 165 observations), with the same multi-branch deep compartment model — WT → CL and V₁, VWF:Ag → CL, Q and V₂ global — under <code>method = vi</code> and <code>method = focei</code>.</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Quantity</th>
+<th>True</th>
+<th><strong>VI</strong> (500 iter)</th>
+<th>FOCEI (converged)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>ω²(CL)</td>
+<td>0.037</td>
+<td><strong>0.0291</strong></td>
+<td>0.0934</td>
+</tr>
+<tr class="even">
+<td>ω²(V₁)</td>
+<td>0.017</td>
+<td><strong>0.0169</strong></td>
+<td><strong>15.81</strong></td>
+</tr>
+<tr class="odd">
+<td>corr(CL, V₁)</td>
+<td>0.45</td>
+<td><strong>0.393</strong></td>
+<td>0.996</td>
+</tr>
+<tr class="even">
+<td>σ (additive)</td>
+<td>0.030</td>
+<td><strong>0.0305</strong></td>
+<td>0.0626</td>
+</tr>
+<tr class="odd">
+<td>Q</td>
+<td>0.15</td>
+<td><strong>0.164</strong></td>
+<td>0.353</td>
+</tr>
+<tr class="even">
+<td>V₂</td>
+<td>0.75</td>
+<td><strong>0.828</strong></td>
+<td>1.646</td>
+</tr>
+<tr class="odd">
+<td>OFV (FOCE objective)</td>
+<td>—</td>
+<td><strong>−877.2</strong></td>
+<td>−689.8</td>
+</tr>
+<tr class="even">
+<td>Reported converged</td>
+<td>—</td>
+<td>false</td>
+<td>true</td>
+</tr>
+</tbody>
+</table>
+<p>VI lands close on every population parameter except <code>ω²(CL)</code>, which is 21% low (0.0291 against 0.037) — worth naming rather than rounding into “closely”, because a shortfall in exactly that parameter is the signature discussed under <a href="#dcm-omega">Reading <code>Ω</code> from a deep compartment model</a>, and this is a multi-branch network on a dataset with subject-unique covariates. One fold cannot distinguish that from sampling noise; treat it as unresolved rather than as evidence either way. FOCEI’s Ω collapses onto a degenerate ridge — ω²(V₁) roughly 930× the truth at correlation 0.996 — and its residual error is twice too large, reproducing the instability the paper reports.</p>
+<p>Two results worth dwelling on. <strong>VI reaches a better point on FOCEI’s own objective than FOCEI does</strong> (−877.2 vs −689.8), measured by the same Laplace machinery through <code>vi_final_ofv = laplace</code>. And <strong>FOCEI reports convergence at that degenerate solution while VI reports non-convergence while being far more accurate</strong> — the paper makes the same observation, that the FOCE objective value is a poor convergence indicator here. VI’s flag is the honest one: its ELBO trace was still descending at 500 iterations.</p>
+<p>The dataset is not redistributed here — the source repository carries no licence — and the conversion has several silent traps (the <code>amt</code> column is 2× the intended dose; the doses need <code>sim.jl</code>’s <code>S1 = 1/1000</code> scaling; the fold files sample with replacement). The multi-fold harness lives outside this repo.</p>
+<p>This is one fold, one replicate, one seed. The paper runs 20 folds × 5 replicates and reports medians with spread; the across-replicate <em>variability</em> is half their claim and is not covered here.</p>
+</section>
+<section id="comparison-with-nonmem" class="level2">
+<h2 class="anchored" data-anchor-id="comparison-with-nonmem">Comparison with NONMEM</h2>
+<p>On warfarin (10 subjects, 110 observations, 1-cpt oral, lognormal <code>η</code> on CL/V/KA, proportional error), all four estimators fit the same file from the same initial estimates:</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 11%">
+<col style="width: 11%">
+<col style="width: 11%">
+<col style="width: 11%">
+<col style="width: 11%">
+<col style="width: 11%">
+<col style="width: 11%">
+<col style="width: 11%">
+<col style="width: 11%">
+</colgroup>
+<thead>
+<tr class="header">
+<th></th>
+<th>TVCL</th>
+<th>TVV</th>
+<th>TVKA</th>
+<th>ω²(CL)</th>
+<th>ω²(V)</th>
+<th>ω²(KA)</th>
+<th>σ</th>
+<th>OFV</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><strong>NONMEM FOCEI</strong> (<code>METHOD=COND INTERACTION</code>)</td>
+<td>0.132695</td>
+<td>7.73771</td>
+<td>0.81080</td>
+<td>0.028588</td>
+<td>0.009592</td>
+<td>0.335880</td>
+<td>0.010565</td>
+<td><strong>−286.004219</strong></td>
+</tr>
+<tr class="even">
+<td>ferx FOCEI</td>
+<td>0.132695</td>
+<td>7.73771</td>
+<td>0.81080</td>
+<td>0.028590</td>
+<td>0.009592</td>
+<td>0.335871</td>
+<td>0.010565</td>
+<td><strong>−286.004220</strong></td>
+</tr>
+<tr class="odd">
+<td>ferx AGQ (<code>n_agq = 9</code>)</td>
+<td>0.132687</td>
+<td>7.73746</td>
+<td>0.81090</td>
+<td>0.028592</td>
+<td>0.009592</td>
+<td>0.336036</td>
+<td>0.010565</td>
+<td>−285.977</td>
+</tr>
+<tr class="even">
+<td>ferx VI (<code>vi_mc_samples = 128</code>)</td>
+<td>0.132693</td>
+<td>7.73775</td>
+<td>0.81092</td>
+<td>0.028592</td>
+<td>0.009587</td>
+<td>0.335997</td>
+<td>0.011175</td>
+<td>−285.519</td>
+</tr>
+<tr class="odd">
+<td>nlmixr2 FOCEI</td>
+<td>0.132738</td>
+<td>7.73851</td>
+<td>0.82849</td>
+<td>0.030642</td>
+<td>0.010205</td>
+<td>0.342155</td>
+<td>0.010574</td>
+<td>−285.947</td>
+</tr>
+</tbody>
+</table>
+<p><strong>ferx FOCEI reproduces NONMEM’s FOCEI to six decimal places on the OFV</strong> and to 5–6 significant figures on every parameter. That is what makes the row above it worth reading: the predictor, the dose bookkeeping, the residual model and the objective’s additive constants are pinned against NONMEM, so where VI differs, the difference is the estimator rather than the plumbing.</p>
+<p>VI lands on the same solution — <code>θ</code> within 0.015%, <code>Ω</code> within 0.05%, and its Laplace objective 0.49 units off. The one parameter that misses is <code>σ</code>, at <strong>+5.8%</strong>, and the next section explains why: this dataset carries a ~1% proportional residual, which is the one regime where VI’s <code>σ</code> stalls. VI’s OFV here is the Laplace objective at the VI estimate (<code>vi_final_ofv = laplace</code>), so it is comparable with the rest of the column; <code>−2·ELBO</code> never is.</p>
+<div class="callout callout-style-default callout-warning callout-titled">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Warning</span>From a distant start, VI may need more than the default 25 000 iterations
+</div>
+</div>
+<div class="callout-body-container callout-body">
+<p>This table starts VI where NONMEM’s control stream starts (<code>TVCL 0.2, TVV 10, TVKA 1.5, σ 0.02</code>), and from there it takes <strong>~34 250 iterations</strong> to settle. At the default <code>vi_iters = 25000</code> it stops on the ceiling with <code>TVCL</code> 4.9% high, reporting <code>converged: false</code> and <code>elbo_tightness_ratio: 2.7</code> — correctly, and those two fields are the thing to check. If a VI fit reports non-convergence with an <code>elbo_tightness_ratio</code> far from 1, raise <code>vi_iters</code> before concluding anything about the model. Starting closer (the same model from <code>0.13 / 8 / 1.0</code>) needs ~17 500.</p>
+</div>
+</div>
+<p>The FOCEI rows also pin the objective <em>convention</em>: ferx omits <code>½·n_obs·log 2π</code> and nlmixr2 has an <code>adjObf</code> flag defaulting to <code>TRUE</code>, and the measured offset between them is zero — a mismatch would have shown as <code>110 · log 2π ≈ 202</code>.</p>
+<p>The harness that produces these numbers, including a cross-implementation comparison against nlmixr2 7.0’s <code>est = "emvi"</code> — the only other variational-inference implementation in a pharmacometrics package — lives in <code>tools/vi-emvi-comparison/</code>. Against <code>emvi</code> on this model, ferx agrees to 0.01–0.05% on <code>θ</code> and 0.2–0.6% on <code>Ω</code>; per-subject, both implementations recover the exact posterior’s <em>correlations</em> (from a per-subject NUTS reference), ferx to ≤0.008 and <code>emvi</code> to ≤0.20. The reproducible tests are <code>tests/warfarin_vi_nonmem.rs</code> (this table) and <code>tests/vi.rs::vi_recovers_the_agq_solution_on_warfarin</code>.</p>
+<div class="callout callout-style-default callout-note callout-titled">
+<div class="callout-header d-flex align-content-center collapsed" data-bs-toggle="collapse" data-bs-target=".callout-5-contents" aria-controls="callout-5" aria-expanded="false" aria-label="Toggle callout">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Note</span>Comparing ferx’s <code>−2·ELBO</code> with nlmixr2’s <code>viElbo</code>
+</div>
+<div class="callout-btn-toggle d-inline-block border-0 py-1 ps-1 pe-0 float-end"><i class="callout-toggle"></i></div>
+</div>
+<div id="callout-5" class="callout-5-contents callout-collapse collapse">
+<div class="callout-body-container callout-body">
+<p>The two are not on the same scale, and the difference is a constant rather than a mystery. nlmixr2’s <code>emvi</code> reports the ELBO on the <strong>log</strong> scale and drops two per-subject constants that a fully-normalized ELBO carries — the <code>η</code>-prior normalizer <code>−(d/2)·log 2π</code> and the Gaussian entropy constant <code>+(d/2)(1 + log 2π)</code> — which net to <code>+d/2</code> each. Both tools drop the observation constant <code>½·n_obs·log 2π</code> (the NONMEM convention). So</p>
+<pre><code>ferx_ELBO = viElbo + N·d/2,     and ferx reports −2·ELBO</code></pre>
+<p>which on warfarin (<code>N = 10</code>, <code>d = 3</code>) is <code>+15</code>. Read <code>emvi</code>’s value off a <strong>tail mean</strong> of its trace, not the last iterate: one iterate of a stochastic optimizer carries the noise of its final step (per-iterate <code>sd ≈ 1.7</code> here), enough to put the converted number below the marginal it is supposed to bound. Converted properly, ferx’s bound is the tighter of the two by 1–3 units on this model — though the two fits sit at slightly different parameter vectors, and an ELBO only bounds <code>−2 log L</code> at the vector where it was evaluated.</p>
+</div>
+</div>
+</div>
+</section>
+<section id="residual-error-and-vis-σ" class="level2">
+<h2 class="anchored" data-anchor-id="residual-error-and-vis-σ">Residual error and VI’s <code>σ</code></h2>
+<p>The warfarin file above carries a <strong>~1% proportional residual</strong>, which is not a realistic PK error and is the only regime in which VI’s <code>σ</code> misses. Same model, same design, changing only the residual:</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>residual</th>
+<th>AGQ <code>σ</code> (reference)</th>
+<th>VI <code>σ</code></th>
+<th>VI − AGQ</th>
+<th>VI iterations</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>1%</td>
+<td>0.010565</td>
+<td>0.011149</td>
+<td><strong>+5.5%</strong></td>
+<td>10 875</td>
+</tr>
+<tr class="even">
+<td>3%</td>
+<td>0.031290</td>
+<td>0.031555</td>
+<td>+0.85%</td>
+<td>5 000</td>
+</tr>
+<tr class="odd">
+<td>10%</td>
+<td>0.104005</td>
+<td>0.104046</td>
+<td><strong>+0.04%</strong></td>
+<td>2 125</td>
+</tr>
+<tr class="even">
+<td>25%</td>
+<td>0.258353</td>
+<td>0.258362</td>
+<td>+0.003%</td>
+<td>1 750</td>
+</tr>
+</tbody>
+</table>
+<p>At any realistic residual, VI reproduces the quadrature reference on every population parameter, and it gets there in a fifth of the iterations. Two practical consequences:</p>
+<ul>
+<li><strong><code>vi_mc_samples</code> is not the lever.</strong> Going 128 → 512 draws at a 1% residual moves <code>σ</code> by 0.8%. Raising the draw count <em>does</em> fix the old <code>vi_mc_samples = 8</code>, which was 30% high — that is why the default is now 32 — but it does not fix the residual beyond that.</li>
+<li><strong>The tell is <code>q</code>’s contraction.</strong> VI initialises <code>q</code> at the prior <code>Ω</code>. At a 1% residual the per-subject posterior variance is ~1400× smaller than the prior, and <code>σ</code> — coupled to <code>q</code>’s width, since posterior width scales with <code>σ²</code> — settles before <code>q</code> finishes contracting. At 10% the contraction is ~14× and the problem disappears. If you are fitting data with a residual error under ~3%, check <code>σ</code> against a <code>method = laplace</code> fit before trusting it.</li>
+</ul>
+<div class="callout callout-style-default callout-note callout-titled">
+<div class="callout-header d-flex align-content-center collapsed" data-bs-toggle="collapse" data-bs-target=".callout-6-contents" aria-controls="callout-6" aria-expanded="false" aria-label="Toggle callout">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Note</span>Why this is not the ELBO preferring a larger <code>σ</code>
+</div>
+<div class="callout-btn-toggle d-inline-block border-0 py-1 ps-1 pe-0 float-end"><i class="callout-toggle"></i></div>
+</div>
+<div id="callout-6" class="callout-6-contents callout-collapse collapse">
+<div class="callout-body-container callout-body">
+<p>Worth ruling out, since a Gaussian <code>q</code> of positive width does pay for that width partly by inflating residual variance. Fixing <code>θ</code> and <code>Ω</code> at the AGQ estimate and profiling:</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th><code>σ</code> (FIXed)</th>
+<th><code>−2·ELBO</code></th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>0.010565 (AGQ)</td>
+<td><strong>−285.924</strong></td>
+</tr>
+<tr class="even">
+<td>0.011149 (VI’s)</td>
+<td>−285.477</td>
+</tr>
+</tbody>
+</table>
+<p>Lower is tighter, so VI’s own objective is 0.45 units <em>better</em> at the value it failed to reach — there is no optimum offset. And started at that optimum with <code>σ</code> free, it walks <em>up</em> to 0.010832 and reports <code>converged: true</code> at a worse bound than where it began. A convergence failure of the <code>σ</code> coordinate, not a property of the variational objective.</p>
+</div>
+</div>
+</div>
+</section>
+<section id="references" class="level2">
+<h2 class="anchored" data-anchor-id="references">References</h2>
+<p>Janssen A, Bennis FC, Cnossen MH, Mathôt RAA. <em>Mixed effect estimation in deep compartment models: variational methods outperform first-order approximations.</em> J Pharmacokinet Pharmacodyn (2024) 51:797–808. <a href="https://doi.org/10.1007/s10928-024-09931-w" class="uri">https://doi.org/10.1007/s10928-024-09931-w</a></p>
+<p>Roeder G, Wu Y, Duvenaud DK. <em>Sticking the landing: simple, lower-variance gradient estimators for variational inference.</em> Adv Neural Inf Process Syst 30 (2017).</p>
+
+
+</section>
+
+</main> <!-- /main -->
+<script>
+(function () {
+  var HEAD = '<div class="panel-head"><span class="dots"><i></i><i></i><i></i></span><span class="file"><span class="br">[</span>warfarin_pk.ferx<span class="br">]</span></span></div>';
+
+  function apply() {
+    var dark = document.documentElement.getAttribute('data-bs-theme') === 'dark';
+    document.querySelectorAll('div.sourceCode').forEach(function (el) {
+      if (el.parentElement && el.parentElement.closest('.code-panel')) return;
+      if (dark) {
+        if (!el.classList.contains('code-panel')) {
+          el.classList.add('code-panel');
+          el.insertAdjacentHTML('afterbegin', HEAD);
+        }
+      } else {
+        el.classList.remove('code-panel');
+        var h = el.querySelector(':scope > .panel-head');
+        if (h) h.remove();
+      }
+    });
+  }
+
+  if (document.body) apply();
+  document.addEventListener('DOMContentLoaded', apply);
+  new MutationObserver(function (ms) {
+    ms.forEach(function (m) { if (m.attributeName === 'data-bs-theme') apply(); });
+  }).observe(document.documentElement, { attributes: true });
+}());
+</script>
+<script id="quarto-html-after-body" type="application/javascript">
+  window.document.addEventListener("DOMContentLoaded", function (event) {
+    // Ensure there is a toggle, if there isn't float one in the top right
+    if (window.document.querySelector('.quarto-color-scheme-toggle') === null) {
+      const a = window.document.createElement('a');
+      a.classList.add('top-right');
+      a.classList.add('quarto-color-scheme-toggle');
+      a.href = "";
+      a.onclick = function() { try { window.quartoToggleColorScheme(); } catch {} return false; };
+      const i = window.document.createElement("i");
+      i.classList.add('bi');
+      a.appendChild(i);
+      window.document.body.appendChild(a);
+    }
+    setColorSchemeToggle(hasAlternateSentinel())
+    const icon = "";
+    const anchorJS = new window.AnchorJS();
+    anchorJS.options = {
+      placement: 'right',
+      icon: icon
+    };
+    anchorJS.add('.anchored');
+    const isCodeAnnotation = (el) => {
+      for (const clz of el.classList) {
+        if (clz.startsWith('code-annotation-')) {                     
+          return true;
+        }
+      }
+      return false;
+    }
+    const onCopySuccess = function(e) {
+      // button target
+      const button = e.trigger;
+      // don't keep focus
+      button.blur();
+      // flash "checked"
+      button.classList.add('code-copy-button-checked');
+      var currentTitle = button.getAttribute("title");
+      button.setAttribute("title", "Copied!");
+      let tooltip;
+      if (window.bootstrap) {
+        button.setAttribute("data-bs-toggle", "tooltip");
+        button.setAttribute("data-bs-placement", "left");
+        button.setAttribute("data-bs-title", "Copied!");
+        tooltip = new bootstrap.Tooltip(button, 
+          { trigger: "manual", 
+            customClass: "code-copy-button-tooltip",
+            offset: [0, -8]});
+        tooltip.show();    
+      }
+      setTimeout(function() {
+        if (tooltip) {
+          tooltip.hide();
+          button.removeAttribute("data-bs-title");
+          button.removeAttribute("data-bs-toggle");
+          button.removeAttribute("data-bs-placement");
+        }
+        button.setAttribute("title", currentTitle);
+        button.classList.remove('code-copy-button-checked');
+      }, 1000);
+      // clear code selection
+      e.clearSelection();
+    }
+    const getTextToCopy = function(trigger) {
+      const outerScaffold = trigger.parentElement.cloneNode(true);
+      const codeEl = outerScaffold.querySelector('code');
+      for (const childEl of codeEl.children) {
+        if (isCodeAnnotation(childEl)) {
+          childEl.remove();
+        }
+      }
+      return codeEl.innerText;
+    }
+    const clipboard = new window.ClipboardJS('.code-copy-button:not([data-in-quarto-modal])', {
+      text: getTextToCopy
+    });
+    clipboard.on('success', onCopySuccess);
+    if (window.document.getElementById('quarto-embedded-source-code-modal')) {
+      const clipboardModal = new window.ClipboardJS('.code-copy-button[data-in-quarto-modal]', {
+        text: getTextToCopy,
+        container: window.document.getElementById('quarto-embedded-source-code-modal')
+      });
+      clipboardModal.on('success', onCopySuccess);
+    }
+      var localhostRegex = new RegExp(/^(?:http|https):\/\/localhost\:?[0-9]*\//);
+      var mailtoRegex = new RegExp(/^mailto:/);
+        var filterRegex = new RegExp("https:\/\/ferx-nlme\.github\.io\/ferx-core\/");
+      var isInternal = (href) => {
+          return filterRegex.test(href) || localhostRegex.test(href) || mailtoRegex.test(href);
+      }
+      // Inspect non-navigation links and adorn them if external
+     var links = window.document.querySelectorAll('a[href]:not(.nav-link):not(.navbar-brand):not(.toc-action):not(.sidebar-link):not(.sidebar-item-toggle):not(.pagination-link):not(.no-external):not([aria-hidden]):not(.dropdown-item):not(.quarto-navigation-tool):not(.about-link)');
+      for (var i=0; i<links.length; i++) {
+        const link = links[i];
+        if (!isInternal(link.href)) {
+          // undo the damage that might have been done by quarto-nav.js in the case of
+          // links that we want to consider external
+          if (link.dataset.originalHref !== undefined) {
+            link.href = link.dataset.originalHref;
+          }
+        }
+      }
+    function tippyHover(el, contentFn, onTriggerFn, onUntriggerFn) {
+      const config = {
+        allowHTML: true,
+        maxWidth: 500,
+        delay: 100,
+        arrow: false,
+        appendTo: function(el) {
+            return el.parentElement;
+        },
+        interactive: true,
+        interactiveBorder: 10,
+        theme: 'quarto',
+        placement: 'bottom-start',
+      };
+      if (contentFn) {
+        config.content = contentFn;
+      }
+      if (onTriggerFn) {
+        config.onTrigger = onTriggerFn;
+      }
+      if (onUntriggerFn) {
+        config.onUntrigger = onUntriggerFn;
+      }
+      window.tippy(el, config); 
+    }
+    const noterefs = window.document.querySelectorAll('a[role="doc-noteref"]');
+    for (var i=0; i<noterefs.length; i++) {
+      const ref = noterefs[i];
+      tippyHover(ref, function() {
+        // use id or data attribute instead here
+        let href = ref.getAttribute('data-footnote-href') || ref.getAttribute('href');
+        try { href = new URL(href).hash; } catch {}
+        const id = href.replace(/^#\/?/, "");
+        const note = window.document.getElementById(id);
+        if (note) {
+          return note.innerHTML;
+        } else {
+          return "";
+        }
+      });
+    }
+    const xrefs = window.document.querySelectorAll('a.quarto-xref');
+    const processXRef = (id, note) => {
+      // Strip column container classes
+      const stripColumnClz = (el) => {
+        el.classList.remove("page-full", "page-columns");
+        if (el.children) {
+          for (const child of el.children) {
+            stripColumnClz(child);
+          }
+        }
+      }
+      stripColumnClz(note)
+      if (id === null || id.startsWith('sec-')) {
+        // Special case sections, only their first couple elements
+        const container = document.createElement("div");
+        if (note.children && note.children.length > 2) {
+          container.appendChild(note.children[0].cloneNode(true));
+          for (let i = 1; i < note.children.length; i++) {
+            const child = note.children[i];
+            if (child.tagName === "P" && child.innerText === "") {
+              continue;
+            } else {
+              container.appendChild(child.cloneNode(true));
+              break;
+            }
+          }
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(container);
+          }
+          return container.innerHTML
+        } else {
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(note);
+          }
+          return note.innerHTML;
+        }
+      } else {
+        // Remove any anchor links if they are present
+        const anchorLink = note.querySelector('a.anchorjs-link');
+        if (anchorLink) {
+          anchorLink.remove();
+        }
+        if (window.Quarto?.typesetMath) {
+          window.Quarto.typesetMath(note);
+        }
+        if (note.classList.contains("callout")) {
+          return note.outerHTML;
+        } else {
+          return note.innerHTML;
+        }
+      }
+    }
+    for (var i=0; i<xrefs.length; i++) {
+      const xref = xrefs[i];
+      tippyHover(xref, undefined, function(instance) {
+        instance.disable();
+        let url = xref.getAttribute('href');
+        let hash = undefined; 
+        if (url.startsWith('#')) {
+          hash = url;
+        } else {
+          try { hash = new URL(url).hash; } catch {}
+        }
+        if (hash) {
+          const id = hash.replace(/^#\/?/, "");
+          const note = window.document.getElementById(id);
+          if (note !== null) {
+            try {
+              const html = processXRef(id, note.cloneNode(true));
+              instance.setContent(html);
+            } finally {
+              instance.enable();
+              instance.show();
+            }
+          } else {
+            // See if we can fetch this
+            fetch(url.split('#')[0])
+            .then(res => res.text())
+            .then(html => {
+              const parser = new DOMParser();
+              const htmlDoc = parser.parseFromString(html, "text/html");
+              const note = htmlDoc.getElementById(id);
+              if (note !== null) {
+                const html = processXRef(id, note);
+                instance.setContent(html);
+              } 
+            }).finally(() => {
+              instance.enable();
+              instance.show();
+            });
+          }
+        } else {
+          // See if we can fetch a full url (with no hash to target)
+          // This is a special case and we should probably do some content thinning / targeting
+          fetch(url)
+          .then(res => res.text())
+          .then(html => {
+            const parser = new DOMParser();
+            const htmlDoc = parser.parseFromString(html, "text/html");
+            const note = htmlDoc.querySelector('main.content');
+            if (note !== null) {
+              // This should only happen for chapter cross references
+              // (since there is no id in the URL)
+              // remove the first header
+              if (note.children.length > 0 && note.children[0].tagName === "HEADER") {
+                note.children[0].remove();
+              }
+              const html = processXRef(null, note);
+              instance.setContent(html);
+            } 
+          }).finally(() => {
+            instance.enable();
+            instance.show();
+          });
+        }
+      }, function(instance) {
+      });
+    }
+        let selectedAnnoteEl;
+        const selectorForAnnotation = ( cell, annotation) => {
+          let cellAttr = 'data-code-cell="' + cell + '"';
+          let lineAttr = 'data-code-annotation="' +  annotation + '"';
+          const selector = 'span[' + cellAttr + '][' + lineAttr + ']';
+          return selector;
+        }
+        const selectCodeLines = (annoteEl) => {
+          const doc = window.document;
+          const targetCell = annoteEl.getAttribute("data-target-cell");
+          const targetAnnotation = annoteEl.getAttribute("data-target-annotation");
+          const annoteSpan = window.document.querySelector(selectorForAnnotation(targetCell, targetAnnotation));
+          const lines = annoteSpan.getAttribute("data-code-lines").split(",");
+          const lineIds = lines.map((line) => {
+            return targetCell + "-" + line;
+          })
+          let top = null;
+          let height = null;
+          let parent = null;
+          if (lineIds.length > 0) {
+              //compute the position of the single el (top and bottom and make a div)
+              const el = window.document.getElementById(lineIds[0]);
+              top = el.offsetTop;
+              height = el.offsetHeight;
+              parent = el.parentElement.parentElement;
+            if (lineIds.length > 1) {
+              const lastEl = window.document.getElementById(lineIds[lineIds.length - 1]);
+              const bottom = lastEl.offsetTop + lastEl.offsetHeight;
+              height = bottom - top;
+            }
+            if (top !== null && height !== null && parent !== null) {
+              // cook up a div (if necessary) and position it 
+              let div = window.document.getElementById("code-annotation-line-highlight");
+              if (div === null) {
+                div = window.document.createElement("div");
+                div.setAttribute("id", "code-annotation-line-highlight");
+                div.style.position = 'absolute';
+                parent.appendChild(div);
+              }
+              div.style.top = top - 2 + "px";
+              div.style.height = height + 4 + "px";
+              div.style.left = 0;
+              let gutterDiv = window.document.getElementById("code-annotation-line-highlight-gutter");
+              if (gutterDiv === null) {
+                gutterDiv = window.document.createElement("div");
+                gutterDiv.setAttribute("id", "code-annotation-line-highlight-gutter");
+                gutterDiv.style.position = 'absolute';
+                const codeCell = window.document.getElementById(targetCell);
+                const gutter = codeCell.querySelector('.code-annotation-gutter');
+                gutter.appendChild(gutterDiv);
+              }
+              gutterDiv.style.top = top - 2 + "px";
+              gutterDiv.style.height = height + 4 + "px";
+            }
+            selectedAnnoteEl = annoteEl;
+          }
+        };
+        const unselectCodeLines = () => {
+          const elementsIds = ["code-annotation-line-highlight", "code-annotation-line-highlight-gutter"];
+          elementsIds.forEach((elId) => {
+            const div = window.document.getElementById(elId);
+            if (div) {
+              div.remove();
+            }
+          });
+          selectedAnnoteEl = undefined;
+        };
+          // Handle positioning of the toggle
+      window.addEventListener(
+        "resize",
+        throttle(() => {
+          elRect = undefined;
+          if (selectedAnnoteEl) {
+            selectCodeLines(selectedAnnoteEl);
+          }
+        }, 10)
+      );
+      function throttle(fn, ms) {
+      let throttle = false;
+      let timer;
+        return (...args) => {
+          if(!throttle) { // first call gets through
+              fn.apply(this, args);
+              throttle = true;
+          } else { // all the others get throttled
+              if(timer) clearTimeout(timer); // cancel #2
+              timer = setTimeout(() => {
+                fn.apply(this, args);
+                timer = throttle = false;
+              }, ms);
+          }
+        };
+      }
+        // Attach click handler to the DT
+        const annoteDls = window.document.querySelectorAll('dt[data-target-cell]');
+        for (const annoteDlNode of annoteDls) {
+          annoteDlNode.addEventListener('click', (event) => {
+            const clickedEl = event.target;
+            if (clickedEl !== selectedAnnoteEl) {
+              unselectCodeLines();
+              const activeEl = window.document.querySelector('dt[data-target-cell].code-annotation-active');
+              if (activeEl) {
+                activeEl.classList.remove('code-annotation-active');
+              }
+              selectCodeLines(clickedEl);
+              clickedEl.classList.add('code-annotation-active');
+            } else {
+              // Unselect the line
+              unselectCodeLines();
+              clickedEl.classList.remove('code-annotation-active');
+            }
+          });
+        }
+    const findCites = (el) => {
+      const parentEl = el.parentElement;
+      if (parentEl) {
+        const cites = parentEl.dataset.cites;
+        if (cites) {
+          return {
+            el,
+            cites: cites.split(' ')
+          };
+        } else {
+          return findCites(el.parentElement)
+        }
+      } else {
+        return undefined;
+      }
+    };
+    var bibliorefs = window.document.querySelectorAll('a[role="doc-biblioref"]');
+    for (var i=0; i<bibliorefs.length; i++) {
+      const ref = bibliorefs[i];
+      const citeInfo = findCites(ref);
+      if (citeInfo) {
+        tippyHover(citeInfo.el, function() {
+          var popup = window.document.createElement('div');
+          citeInfo.cites.forEach(function(cite) {
+            var citeDiv = window.document.createElement('div');
+            citeDiv.classList.add('hanging-indent');
+            citeDiv.classList.add('csl-entry');
+            var biblioDiv = window.document.getElementById('ref-' + cite);
+            if (biblioDiv) {
+              citeDiv.innerHTML = biblioDiv.innerHTML;
+            }
+            popup.appendChild(citeDiv);
+          });
+          return popup.innerHTML;
+        });
+      }
+    }
+  });
+  </script>
+</div> <!-- /content -->
+<footer class="footer">
+  <div class="nav-footer">
+    <div class="nav-footer-left">
+<p>© 2026 FeRx-NLME · MIT licensed</p>
+</div>   
+    <div class="nav-footer-center">
+      &nbsp;
+    <div class="toc-actions d-sm-block d-md-none"><ul><li><a href="https://github.com/FeRx-NLME/ferx-core/edit/main/estimation/vi.qmd" class="toc-action"><i class="bi bi-github"></i>Edit this page</a></li><li><a href="https://github.com/FeRx-NLME/ferx-core/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></div>
+    <div class="nav-footer-right">
+<p>Fe · 26 · Rx · 2026</p>
+</div>
+  </div>
+</footer>
+
+
+
+
+</body></html>

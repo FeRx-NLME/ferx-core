@@ -1,0 +1,1861 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en"><head>
+
+<meta charset="utf-8">
+<meta name="generator" content="quarto-1.10.18">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+
+<meta name="description" content="Fit latent subpopulation mixture models with FOCEI, SAEM, and Bayesian methods in the ferx NLME engine.">
+
+<title>Mixture models in ferx – ferx-core</title>
+<style>
+/* Default styles provided by pandoc.
+** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+*/
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: 1.5em;}
+div.column{flex: auto;}
+@media screen {
+div.columns{gap: min(4vw, 1.5em);}
+div.column{overflow-x: auto;}
+}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+  width: 0.8em;
+  margin: 0 0.8em 0.2em -1em; /* quarto-specific, see https://github.com/quarto-dev/quarto-cli/issues/4556 */ 
+  vertical-align: middle;
+}
+/* CSS for syntax highlighting */
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+  { counter-reset: source-line 0; }
+pre.numberSource code > span
+  { position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+  { content: counter(source-line);
+    position: relative; left: -1em; text-align: right; vertical-align: baseline;
+    border: none; display: inline-block;
+    -webkit-touch-callout: none; -webkit-user-select: none;
+    -khtml-user-select: none; -moz-user-select: none;
+    -ms-user-select: none; user-select: none;
+    padding: 0 4px; width: 4em;
+  }
+pre.numberSource { margin-left: 3em;  padding-left: 4px; }
+div.sourceCode
+  {   }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+</style>
+
+
+<script src="../site_libs/quarto-nav/quarto-nav.js"></script>
+<script src="../site_libs/quarto-nav/headroom.min.js"></script>
+<script src="../site_libs/clipboard/clipboard.min.js"></script>
+<script src="../site_libs/quarto-search/autocomplete.umd.js"></script>
+<script src="../site_libs/quarto-search/fuse.min.js"></script>
+<script src="../site_libs/quarto-search/quarto-search.js"></script>
+<meta name="quarto:offset" content="../">
+<link href="../assets/ferx-favicon.svg" rel="icon" type="image/svg+xml">
+<script src="../site_libs/quarto-html/quarto.js" type="module"></script>
+<script src="../site_libs/quarto-html/tabsets/tabsets.js" type="module"></script>
+<script src="../site_libs/quarto-html/popper.min.js"></script>
+<script src="../site_libs/quarto-html/tippy.umd.min.js"></script>
+<script src="../site_libs/quarto-html/anchor.min.js"></script>
+<link href="../site_libs/quarto-html/tippy.css" rel="stylesheet">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-51776f957f81c5a6b38322b65a6a6987.css" rel="stylesheet" class="quarto-color-scheme" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-dark-31632d092df9090a2ed68f79c078059d.css" rel="stylesheet" class="quarto-color-scheme quarto-color-alternate" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-51776f957f81c5a6b38322b65a6a6987.css" rel="stylesheet" class="quarto-color-scheme-extra" id="quarto-text-highlighting-styles">
+<script src="../site_libs/bootstrap/bootstrap.min.js"></script>
+<link href="../site_libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
+<link href="../site_libs/bootstrap/bootstrap-f5ed25dbf962e4596f9f4df24f2ade0d.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme" id="quarto-bootstrap" data-mode="light">
+<link href="../site_libs/bootstrap/bootstrap-dark-8a64b8d4793081e9872239f556c8075c.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme quarto-color-alternate" id="quarto-bootstrap" data-mode="dark">
+<link href="../site_libs/bootstrap/bootstrap-f5ed25dbf962e4596f9f4df24f2ade0d.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme-extra" id="quarto-bootstrap" data-mode="light">
+<script id="quarto-search-options" type="application/json">{
+  "location": "navbar",
+  "copy-button": false,
+  "collapse-after": 3,
+  "panel-placement": "end",
+  "type": "overlay",
+  "limit": 50,
+  "keyboard-shortcut": [
+    "f",
+    "/",
+    "s"
+  ],
+  "show-item-context": false,
+  "language": {
+    "search-no-results-text": "No results",
+    "search-matching-documents-text": "matching documents",
+    "search-copy-link-title": "Copy link to search",
+    "search-hide-matches-text": "Hide additional matches",
+    "search-more-match-text": "more match in this document",
+    "search-more-matches-text": "more matches in this document",
+    "search-clear-button-title": "Clear",
+    "search-text-placeholder": "",
+    "search-detached-cancel-button-title": "Cancel",
+    "search-submit-button-title": "Submit",
+    "search-label": "Search"
+  }
+}</script>
+
+  <script src="https://cdnjs.cloudflare.com/polyfill/v3/polyfill.min.js?features=es6"></script>
+  <script defer="" src="https://cdn.jsdelivr.net/npm/mathjax@4/tex-chtml.js" type="text/javascript"></script>
+
+<script type="text/javascript">
+const typesetMath = (el) => {
+  if (window.MathJax) {
+    // MathJax Typeset
+    window.MathJax.typeset([el]);
+  } else if (window.katex) {
+    // KaTeX Render
+    var mathElements = el.getElementsByClassName("math");
+    var macros = [];
+    for (var i = 0; i < mathElements.length; i++) {
+      var texText = mathElements[i].firstChild;
+      if (mathElements[i].tagName == "SPAN" && texText && texText.data) {
+        window.katex.render(texText.data, mathElements[i], {
+          displayMode: mathElements[i].classList.contains('display'),
+          throwOnError: false,
+          macros: macros,
+          fleqn: false
+        });
+      }
+    }
+  }
+}
+window.Quarto = {
+  typesetMath
+};
+</script>
+
+<link rel="stylesheet" href="../styles.css">
+<meta property="og:title" content="Mixture models in ferx">
+<meta property="og:description" content="Open-source nonlinear mixed-effects modeling for population PK/PD and pharmacometrics">
+<meta property="og:site_name" content="ferx-core">
+<meta property="og:locale" content="en_US">
+<meta name="twitter:title" content="Mixture models in ferx">
+<meta name="twitter:description" content="Open-source nonlinear mixed-effects modeling for population PK/PD and pharmacometrics">
+<meta name="twitter:card" content="summary">
+<link rel="canonical" href="https://ferx-nlme.github.io/ferx-core/estimation/mixture.html">
+</head>
+
+<body class="nav-sidebar floating nav-fixed quarto-light"><script id="quarto-html-before-body" type="application/javascript">
+    const toggleBodyColorMode = (bsSheetEl) => {
+      const mode = bsSheetEl.getAttribute("data-mode");
+      const bodyEl = window.document.querySelector("body");
+      if (mode === "dark") {
+        bodyEl.classList.add("quarto-dark");
+        bodyEl.classList.remove("quarto-light");
+      } else {
+        bodyEl.classList.add("quarto-light");
+        bodyEl.classList.remove("quarto-dark");
+      }
+    }
+    const toggleBodyColorPrimary = () => {
+      const bsSheetEl = window.document.querySelector("link#quarto-bootstrap:not([rel=disabled-stylesheet])");
+      if (bsSheetEl) {
+        toggleBodyColorMode(bsSheetEl);
+      }
+    }
+    const setColorSchemeToggle = (alternate) => {
+      const toggles = window.document.querySelectorAll('.quarto-color-scheme-toggle');
+      for (let i=0; i < toggles.length; i++) {
+        const toggle = toggles[i];
+        if (toggle) {
+          if (alternate) {
+            toggle.classList.add("alternate");
+          } else {
+            toggle.classList.remove("alternate");
+          }
+        }
+      }
+    };
+    const toggleColorMode = (alternate) => {
+      // Switch the stylesheets
+      const primaryStylesheets = window.document.querySelectorAll('link.quarto-color-scheme:not(.quarto-color-alternate)');
+      const alternateStylesheets = window.document.querySelectorAll('link.quarto-color-scheme.quarto-color-alternate');
+      manageTransitions('#quarto-margin-sidebar .nav-link', false);
+      if (alternate) {
+        // note: dark is layered on light, we don't disable primary!
+        enableStylesheet(alternateStylesheets);
+        for (const sheetNode of alternateStylesheets) {
+          if (sheetNode.id === "quarto-bootstrap") {
+            toggleBodyColorMode(sheetNode);
+          }
+        }
+      } else {
+        disableStylesheet(alternateStylesheets);
+        enableStylesheet(primaryStylesheets)
+        toggleBodyColorPrimary();
+      }
+      manageTransitions('#quarto-margin-sidebar .nav-link', true);
+      // Switch the toggles
+      setColorSchemeToggle(alternate)
+      // Hack to workaround the fact that safari doesn't
+      // properly recolor the scrollbar when toggling (#1455)
+      if (navigator.userAgent.indexOf('Safari') > 0 && navigator.userAgent.indexOf('Chrome') == -1) {
+        manageTransitions("body", false);
+        window.scrollTo(0, 1);
+        setTimeout(() => {
+          window.scrollTo(0, 0);
+          manageTransitions("body", true);
+        }, 40);
+      }
+    }
+    const disableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        stylesheet.rel = 'disabled-stylesheet';
+      }
+    }
+    const enableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        if(stylesheet.rel !== 'stylesheet') { // for Chrome, which will still FOUC without this check
+          stylesheet.rel = 'stylesheet';
+        }
+      }
+    }
+    const manageTransitions = (selector, allowTransitions) => {
+      const els = window.document.querySelectorAll(selector);
+      for (let i=0; i < els.length; i++) {
+        const el = els[i];
+        if (allowTransitions) {
+          el.classList.remove('notransition');
+        } else {
+          el.classList.add('notransition');
+        }
+      }
+    }
+    const isFileUrl = () => {
+      return window.location.protocol === 'file:';
+    }
+    const hasAlternateSentinel = () => {
+      let styleSentinel = getColorSchemeSentinel();
+      if (styleSentinel !== null) {
+        return styleSentinel === "alternate";
+      } else {
+        return false;
+      }
+    }
+    const setStyleSentinel = (alternate) => {
+      const value = alternate ? "alternate" : "default";
+      if (!isFileUrl()) {
+        window.localStorage.setItem("quarto-color-scheme", value);
+      } else {
+        localAlternateSentinel = value;
+      }
+    }
+    const getColorSchemeSentinel = () => {
+      if (!isFileUrl()) {
+        const storageValue = window.localStorage.getItem("quarto-color-scheme");
+        return storageValue != null ? storageValue : localAlternateSentinel;
+      } else {
+        return localAlternateSentinel;
+      }
+    }
+    const toggleGiscusIfUsed = (isAlternate, darkModeDefault) => {
+      const baseTheme = document.querySelector('#giscus-base-theme')?.value ?? 'light';
+      const alternateTheme = document.querySelector('#giscus-alt-theme')?.value ?? 'dark';
+      let newTheme = '';
+      if(authorPrefersDark) {
+        newTheme = isAlternate ? baseTheme : alternateTheme;
+      } else {
+        newTheme = isAlternate ? alternateTheme : baseTheme;
+      }
+      const changeGiscusTheme = () => {
+        // From: https://github.com/giscus/giscus/issues/336
+        const sendMessage = (message) => {
+          const iframe = document.querySelector('iframe.giscus-frame');
+          if (!iframe) return;
+          iframe.contentWindow.postMessage({ giscus: message }, 'https://giscus.app');
+        }
+        sendMessage({
+          setConfig: {
+            theme: newTheme
+          }
+        });
+      }
+      const isGiscussLoaded = window.document.querySelector('iframe.giscus-frame') !== null;
+      if (isGiscussLoaded) {
+        changeGiscusTheme();
+      }
+    };
+    const authorPrefersDark = false;
+    const darkModeDefault = authorPrefersDark;
+      document.querySelector('link#quarto-text-highlighting-styles.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+      document.querySelector('link#quarto-bootstrap.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+    let localAlternateSentinel = darkModeDefault ? 'alternate' : 'default';
+    // Dark / light mode switch
+    window.quartoToggleColorScheme = () => {
+      // Read the current dark / light value
+      let toAlternate = !hasAlternateSentinel();
+      toggleColorMode(toAlternate);
+      setStyleSentinel(toAlternate);
+      toggleGiscusIfUsed(toAlternate, darkModeDefault);
+      window.dispatchEvent(new Event('resize'));
+    };
+    // Switch to dark mode if need be
+    if (hasAlternateSentinel()) {
+      toggleColorMode(true);
+    } else {
+      toggleColorMode(false);
+    }
+  </script>
+
+<div id="quarto-search-results"></div>
+  <header id="quarto-header" class="headroom fixed-top">
+    <nav class="navbar navbar-expand-lg " data-bs-theme="dark">
+      <div class="navbar-container container-fluid">
+      <div class="navbar-brand-container mx-auto">
+    <a href="../index.html" class="navbar-brand navbar-brand-logo">
+    <img src="../assets/ferx-dsl-brackets.svg" alt="ferx" class="navbar-logo light-content">
+    <img src="../assets/ferx-dsl-brackets.svg" alt="ferx" class="navbar-logo dark-content">
+    </a>
+    <a class="navbar-brand" href="../index.html">
+    <span class="navbar-title">ferx-core</span>
+    </a>
+  </div>
+            <div id="quarto-search" class="" title="Search"></div>
+          <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarCollapse" aria-controls="navbarCollapse" role="menu" aria-expanded="false" aria-label="Toggle navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+  <span class="navbar-toggler-icon"></span>
+</button>
+          <div class="collapse navbar-collapse" id="navbarCollapse">
+            <ul class="navbar-nav navbar-nav-scroll me-auto">
+  <li class="nav-item">
+    <a class="nav-link active" href="../getting-started.html" aria-current="page"> 
+<span class="menu-text">Get started</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/features.html"> 
+<span class="menu-text">Features</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/changelog.html"> 
+<span class="menu-text">Changelog</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/roadmap.html"> 
+<span class="menu-text">Roadmap</span></a>
+  </li>  
+</ul>
+            <ul class="navbar-nav navbar-nav-scroll ms-auto">
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/ferx-core/"> 
+<span class="menu-text">ferx-core</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/ferx-book/"> 
+<span class="menu-text">ferx-r</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/reference/"> 
+<span class="menu-text">Reference</span></a>
+  </li>  
+  <li class="nav-item compact">
+    <a class="nav-link" href="https://github.com/FeRx-NLME"> <i class="bi bi-github" role="img" aria-label="GitHub">
+</i> 
+<span class="menu-text"></span></a>
+  </li>  
+</ul>
+          </div> <!-- /navcollapse -->
+            <div class="quarto-navbar-tools">
+  <a href="" class="quarto-color-scheme-toggle quarto-navigation-tool  px-1" onclick="window.quartoToggleColorScheme(); return false;" title="Toggle dark mode"><i class="bi"></i></a>
+</div>
+      </div> <!-- /container-fluid -->
+    </nav>
+  <nav class="quarto-secondary-nav">
+    <div class="container-fluid d-flex">
+      <button type="button" class="quarto-btn-toggle btn" data-bs-toggle="collapse" role="button" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+        <i class="bi bi-layout-text-sidebar-reverse"></i>
+      </button>
+        <nav class="quarto-page-breadcrumbs" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../estimation/index.html">Estimation Methods</a></li><li class="breadcrumb-item"><a href="../estimation/mixture.html">Mixture Models</a></li></ol></nav>
+        <a class="flex-grow-1" role="navigation" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">      
+        </a>
+      <button type="button" class="btn quarto-search-button" aria-label="Search" onclick="window.quartoOpenSearch();">
+        <i class="bi bi-search"></i>
+      </button>
+    </div>
+  </nav>
+</header>
+<!-- content -->
+<div id="quarto-content" class="quarto-container page-columns page-rows-contents page-layout-article page-navbar">
+<!-- sidebar -->
+  <nav id="quarto-sidebar" class="sidebar collapse collapse-horizontal quarto-sidebar-collapse-item sidebar-navigation floating overflow-auto">
+    <div class="pt-lg-2 mt-2 text-left sidebar-header">
+      <a href="../index.html" class="sidebar-logo-link">
+      <img src="../assets/ferx-favicon.svg" alt="" class="sidebar-logo light-content py-0 d-lg-inline d-none">
+      <img src="../assets/ferx-favicon.svg" alt="" class="sidebar-logo dark-content py-0 d-lg-inline d-none">
+      </a>
+      </div>
+        <div class="mt-2 flex-shrink-0 align-items-center">
+        <div class="sidebar-search">
+        <div id="quarto-search" class="" title="Search"></div>
+        </div>
+        </div>
+    <div class="sidebar-menu-container"> 
+    <ul class="list-unstyled mt-1">
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Introduction</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../maturity.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Feature Maturity</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../getting-started.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Getting Started</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../installation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Installation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../quick-start.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Quick Start</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../model-file/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Model File Reference</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/parameters.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Parameters</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/iov.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Inter-Occasion Variability (IOV)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/individual-parameters.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Individual Parameters</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariates.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariates</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariate-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/structural-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Structural Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/lagtime.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Lagtime</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/steady-state.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Steady-State Doses (SS=1)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/error-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Error Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/bloq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">LOQ-Censored Observations</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/ode-models.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/absorption.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Built-in Absorption Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/scaling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Scaling</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/initial-conditions.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Initial Conditions</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/diffusion.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Stochastic Differential Equations (SDE / Diffusion)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/neural-networks.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Neural Networks</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariate-nn.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><code>[covariate_nn]</code> — Deep Compartment Models (DCM)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/data.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/data-selection.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Selection</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/derived.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Derived Columns (<code>[derived]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Output Columns (<code>[output]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/fit-options.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Fit Options</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/simulation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Simulation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/adaptive-dosing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Adaptive (Feedback) Dosing</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/event-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Time-to-Event Endpoints (<code>[event_model]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/categorical.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Categorical endpoints — <code>[binary_model]</code></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/markov-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Markov models ([markov_model])</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../estimation/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Estimation Methods</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/foce.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FOCE / FOCEI</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/agq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">AGQ — Adaptive Gaussian Quadrature</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/gauss-newton.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Gauss-Newton (BHHH)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/saem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">SAEM</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/sir.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Sampling Importance Resampling (SIR)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/importance-sampling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Importance Sampling (IMP)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/frem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FREM (Full Random Effects Model)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/impmap.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">IMPMAP — Importance Sampling assisted by Mode A Posteriori</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/bayes.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Bayesian estimation (MCMC)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/vi.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Variational Inference</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/parameterization.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Packed Parameter Space</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/optimizers.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Outer Optimizers</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/tte.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Time-to-Event (TTE) Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/categorical.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Categorical endpoints (binary / logistic)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/ctmm.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Continuous-time Markov models (CTMM)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/mixture.html" class="sidebar-item-text sidebar-link active">
+ <span class="menu-text">Mixture Models</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false">
+ <span class="menu-text">Tools</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/bootstrap.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Bootstrap</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/gam-screening.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">GAM covariate screening</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/search.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Search configuration</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/covsearch.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate search</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/modelsearch.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Structural model search</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../data-format.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Format</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../cli.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">CLI Reference</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Output Files</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../warnings.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Warnings</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../file-formats/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">File Formats</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../file-formats/fitrx.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">The <code>.fitrx</code> Fit Bundle</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../file-formats/check-report.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Check Report (<code>ferx check --json</code>)</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../examples/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Examples</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/one-cpt-oral.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">One-Compartment Oral (Warfarin)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/two-cpt-iv.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Two-Compartment IV Bolus</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/covariates.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/ode-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Model (Michaelis-Menten)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/bloq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">BLOQ (M3 method)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/iov.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Inter-Occasion Variability (IOV)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/iov-saem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">IOV with SAEM</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/multiple-dosing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Multiple Dosing (ADDL Column)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/steady-state.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Steady-State Dosing (SS Column)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/scaling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Unit Scaling (<code>[scaling]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/derived-output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Derived Columns and Output</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/data-selection.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Selection (IGNORE / ACCEPT)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/ode-lagtime.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Model with Absorption Lag Time</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/transit-absorption.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Transit Absorption (Two-Compartment)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/sde.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Stochastic Differential Equations (SDE)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/frem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FREM (Covariate Analysis)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/multistart.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Multi-Start: Michaelis-Menten Elimination</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../api/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Rust API</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/types.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Core Types</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/fitting.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Fitting Functions</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/simulation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Simulation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/parsing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Parsing</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/model-editing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Model editing</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../faq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FAQ</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../development/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Development</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/contributing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Contributing to FeRx development</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/sdlc.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Development Lifecycle (SDLC)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/docs-lint.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Docs linter</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+    </ul>
+    </div>
+</nav>
+<div id="quarto-sidebar-glass" class="quarto-sidebar-collapse-item" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item"></div>
+<!-- margin-sidebar -->
+    <div id="quarto-margin-sidebar" class="sidebar margin-sidebar">
+        <nav id="TOC" role="doc-toc" class="toc-active">
+    <h2 id="toc-title">On this page</h2>
+   
+  <ul>
+  <li><a href="#mixture-models" id="toc-mixture-models" class="nav-link active" data-scroll-target="#mixture-models">Mixture Models</a>
+  <ul>
+  <li><a href="#model-file" id="toc-model-file" class="nav-link" data-scroll-target="#model-file">Model file</a></li>
+  <li><a href="#objective" id="toc-objective" class="nav-link" data-scroll-target="#objective">Objective</a></li>
+  <li><a href="#output" id="toc-output" class="nav-link" data-scroll-target="#output">Output</a></li>
+  <li><a href="#validation-against-nonmem" id="toc-validation-against-nonmem" class="nav-link" data-scroll-target="#validation-against-nonmem">Validation against NONMEM</a>
+  <ul class="collapse">
+  <li><a href="#standard-errors" id="toc-standard-errors" class="nav-link" data-scroll-target="#standard-errors">Standard errors</a></li>
+  </ul></li>
+  <li><a href="#inter-occasion-variability-under-a-mixture" id="toc-inter-occasion-variability-under-a-mixture" class="nav-link" data-scroll-target="#inter-occasion-variability-under-a-mixture">Inter-occasion variability under a mixture</a>
+  <ul class="collapse">
+  <li><a href="#nonmem-cross-check-testsnonmemmixture_iv_iov.ctl" id="toc-nonmem-cross-check-testsnonmemmixture_iv_iov.ctl" class="nav-link" data-scroll-target="#nonmem-cross-check-testsnonmemmixture_iv_iov.ctl">NONMEM cross-check (<code>tests/nonmem/mixture_iv_iov.ctl</code>)</a></li>
+  </ul></li>
+  <li><a href="#saem-under-a-mixture" id="toc-saem-under-a-mixture" class="nav-link" data-scroll-target="#saem-under-a-mixture">SAEM under a mixture</a>
+  <ul class="collapse">
+  <li><a href="#mu-referencing-under-a-mixture" id="toc-mu-referencing-under-a-mixture" class="nav-link" data-scroll-target="#mu-referencing-under-a-mixture">Mu-referencing under a mixture</a></li>
+  <li><a href="#nonmem-cross-check-testsnonmemmixture_iv_saem.ctl" id="toc-nonmem-cross-check-testsnonmemmixture_iv_saem.ctl" class="nav-link" data-scroll-target="#nonmem-cross-check-testsnonmemmixture_iv_saem.ctl">NONMEM cross-check (<code>tests/nonmem/mixture_iv_saem.ctl</code>)</a></li>
+  </ul></li>
+  <li><a href="#bayesian-estimation-under-a-mixture" id="toc-bayesian-estimation-under-a-mixture" class="nav-link" data-scroll-target="#bayesian-estimation-under-a-mixture">Bayesian estimation under a mixture</a>
+  <ul class="collapse">
+  <li><a href="#priors-label-switching-and-the-reported-ofv" id="toc-priors-label-switching-and-the-reported-ofv" class="nav-link" data-scroll-target="#priors-label-switching-and-the-reported-ofv">Priors, label switching, and the reported OFV</a></li>
+  </ul></li>
+  <li><a href="#imp-objective-evaluation-under-a-mixture" id="toc-imp-objective-evaluation-under-a-mixture" class="nav-link" data-scroll-target="#imp-objective-evaluation-under-a-mixture">IMP objective evaluation under a mixture</a>
+  <ul class="collapse">
+  <li><a href="#estimating-imp-impmap" id="toc-estimating-imp-impmap" class="nav-link" data-scroll-target="#estimating-imp-impmap">Estimating IMP / IMPMAP</a></li>
+  </ul></li>
+  <li><a href="#not-yet-supported" id="toc-not-yet-supported" class="nav-link" data-scroll-target="#not-yet-supported">Not yet supported</a></li>
+  </ul></li>
+  </ul>
+<div class="toc-actions"><ul><li><a href="https://github.com/FeRx-NLME/ferx-core/edit/main/estimation/mixture.qmd" class="toc-action"><i class="bi bi-github"></i>Edit this page</a></li><li><a href="https://github.com/FeRx-NLME/ferx-core/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></nav>
+    </div>
+<!-- main -->
+<main class="content" id="quarto-document-content"><header id="title-block-header" class="quarto-title-block"><nav class="quarto-page-breadcrumbs quarto-title-breadcrumbs d-none d-lg-block" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../estimation/index.html">Estimation Methods</a></li><li class="breadcrumb-item"><a href="../estimation/mixture.html">Mixture Models</a></li></ol></nav></header>
+
+
+
+
+
+<section id="mixture-models" class="level1">
+<h1>Mixture Models</h1>
+<blockquote class="blockquote">
+<p><strong>Maturity: experimental</strong> — see <a href="../maturity.html">Feature Maturity</a> for what this means.</p>
+</blockquote>
+<p>A <strong>mixture model</strong> treats each subject as belonging to one of <span class="math inline">\(K\)</span> unobserved subpopulations (“classes”). Class <span class="math inline">\(k\)</span> has its own set of class-specific typical values (and, optionally, its own <span class="math inline">\(\Omega\)</span> / <span class="math inline">\(\Sigma\)</span>), and a subject is assigned to a class only probabilistically, through covariate-dependent <strong>mixing probabilities</strong>. This is the ferx analogue of NONMEM’s <code>$MIXTURE</code>.</p>
+<section id="model-file" class="level2">
+<h2 class="anchored" data-anchor-id="model-file">Model file</h2>
+<p>Declare the number of classes and the mixing rule in a <code>[mixture]</code> block, and select class-specific typical values with the reserved read-only <code>MIXNUM</code> index (<code>1..=K</code>) inside <code>[individual_parameters]</code>:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb1"><pre class="sourceCode toml code-with-copy"><code class="sourceCode toml"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[parameters]</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">theta</span> <span class="dt">TVCL1</span><span class="er">(</span><span class="dt">1.0</span><span class="er">);</span> <span class="dt">theta</span> <span class="dt">TVCL2</span><span class="er">(</span><span class="dt">3.0</span><span class="er">)</span>   <span class="co"># class-specific clearance</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">theta</span> <span class="dt">TVV</span><span class="er">(</span><span class="dt">10.0</span><span class="er">)</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">theta</span> <span class="dt">MIXL</span><span class="er">(</span><span class="dt">0.0</span><span class="er">)</span>                       <span class="co"># mixing logit intercept</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>  <span class="dt">omega</span> <span class="dt">ETA_CL</span> <span class="er">~</span> <span class="dt">0.09</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>  <span class="dt">sigma</span> <span class="dt">EPS</span> <span class="er">~</span> <span class="dt">0.04</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="kw">[mixture]</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>  <span class="dt">nsub</span> <span class="op">=</span> <span class="dv">2</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>  <span class="dt">logit</span><span class="er">(</span><span class="dt">1</span><span class="er">)</span> <span class="op">=</span> <span class="dt">MIXL</span>                       <span class="co"># p(1) = σ(logit);  p(2) = 1 − p(1)</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>  <span class="co"># omega(2) ETA_CL ~ 0.15              # optional per-class Ω override</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>  <span class="co"># sigma(2) EPS ~ 0.05                 # optional per-class Σ override</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a><span class="kw">[individual_parameters]</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>  <span class="dt">CL</span> <span class="op">=</span> <span class="dt">if</span> <span class="er">(</span><span class="dt">MIXNUM</span> <span class="op">==</span> <span class="dv">1</span><span class="er">)</span> <span class="dt">TVCL1</span> <span class="er">*</span> <span class="dt">exp</span><span class="er">(</span><span class="dt">ETA_CL</span><span class="er">)</span> <span class="dt">else</span> <span class="dt">TVCL2</span> <span class="er">*</span> <span class="dt">exp</span><span class="er">(</span><span class="dt">ETA_CL</span><span class="er">)</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>  <span class="dt">V</span>  <span class="op">=</span> <span class="dt">TVV</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a><span class="kw">[structural_model]</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a>  <span class="dt">pk</span> <span class="dt">one_cpt_iv</span><span class="er">(</span><span class="dt">cl</span><span class="op">=</span><span class="dt">CL</span><span class="er">,</span> <span class="dt">v</span><span class="op">=</span><span class="dt">V</span><span class="er">)</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a><span class="kw">[error_model]</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a>  <span class="dt">DV</span> <span class="er">~</span> <span class="dt">proportional</span><span class="er">(</span><span class="dt">EPS</span><span class="er">)</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>The mixing rule may be given as a <strong>logit</strong> (<code>logit(k) = …</code>) or a <strong>probability</strong> (<code>p(k) = …</code>) expression over thetas and covariates; the remaining class’s probability is the complement. Mixing expressions must not depend on any <span class="math inline">\(\eta\)</span>.</p>
+<p>The two forms differ only in how <span class="math inline">\(p_{ik}\)</span> is formed: <code>logit(k)</code> is passed through a softmax (reference class <span class="math inline">\(K\)</span> has logit 0), while <code>p(k)</code> is used as the probability directly and the class weights are renormalised to sum to one. A constant <code>p(1) = 0.3</code> is therefore identical to <code>logit(1) = \ln(0.3/0.7)</code>. The softmax (<code>logit</code>) form has an analytic posterior-weighted outer gradient; the <code>p(k)</code> form does not, so a <code>p(k)</code> fit uses the finite-difference gradient.</p>
+</section>
+<section id="objective" class="level2">
+<h2 class="anchored" data-anchor-id="objective">Objective</h2>
+<p>Each subject’s marginal likelihood is the covariate-weighted mixture of its class-conditional likelihoods, and the population objective is the numerically stable log-sum-exp of the per-class FOCE/FOCEI negative log-likelihoods:</p>
+<p><span class="math display">\[
+p_{ik} = \operatorname{softmax}_k\big(g_k(\theta,\, \text{cov}_i)\big),
+\qquad
+L_i = \sum_{k=1}^{K} p_{ik}\, L_{ik},
+\]</span></p>
+<p><span class="math display">\[
+\text{OFV} = -2 \sum_{i=1}^{N} \log \sum_{k=1}^{K} p_{ik}\, \exp(-\text{nll}_{ik}).
+\]</span></p>
+<p><code>nll_ik</code> is the ordinary per-subject FOCE/FOCEI negative log-likelihood evaluated with class-<span class="math inline">\(k\)</span> parameters and a <strong>separate empirical Bayes solve per (subject × class)</strong>. The mixing-logit coefficients are ordinary thetas and any per-class <span class="math inline">\(\Omega\)</span>/<span class="math inline">\(\Sigma\)</span> are estimated jointly. Estimation defaults to the derivative-free BOBYQA outer optimizer; an analytic posterior-weighted outer gradient is available, so a user-selected NLopt gradient optimizer (SLSQP / L-BFGS / MMA) is honoured, with an automatic finite-difference fallback for models outside analytic scope (e.g.&nbsp;<code>MIXNUM</code>-branched typical values).</p>
+</section>
+<section id="output" class="level2">
+<h2 class="anchored" data-anchor-id="output">Output</h2>
+<p>For a mixture fit, <code>sdtab</code> gains two per-subject diagnostics, matching the NONMEM reserved variables:</p>
+<ul>
+<li><strong><code>MIXEST</code></strong> — the most-probable class <span class="math inline">\(\operatorname{argmax}_k \text{PMIX}_{ik}\)</span> (1-based).</li>
+<li><strong><code>PMIX_1 … PMIX_K</code></strong> — the posterior class-membership probabilities <span class="math inline">\(\text{PMIX}_{ik} \propto p_{ik}\exp(-\text{nll}_{ik})\)</span>, normalised over <span class="math inline">\(k\)</span>.</li>
+</ul>
+<p>Every other per-subject diagnostic is evaluated <strong>in that subject’s <code>MIXEST</code> class</strong>: the reported <span class="math inline">\(\hat\eta\)</span> are the winning class’s EBEs, and <code>IPRED</code>, <code>PRED</code>, <code>IWRES</code>, <code>CWRES</code>, <code>EBE_OFV</code>, and any <code>[derived]</code> / <code>[output]</code> column that branches on <code>MIXNUM</code> are all computed with <code>MIXNUM</code> set to that class. So a subject the fit assigns to class 2 gets class-2 typical values throughout its sdtab row, not the class-1 default.</p>
+</section>
+<section id="validation-against-nonmem" class="level2">
+<h2 class="anchored" data-anchor-id="validation-against-nonmem">Validation against NONMEM</h2>
+<p>A two-class clearance mixture (<code>tests/nonmem/mixture_iv.ctl</code> and the slow-gated <code>tests/mixture_nonmem.rs</code>) was fit by both engines on the same 30-subject IV dataset — two subpopulations with <code>CL ≈ 1</code> and <code>CL ≈ 3</code>, a constant mixing fraction, and <span class="math inline">\(\Omega\)</span>/<span class="math inline">\(\Sigma\)</span> fixed at the data-generating values (<code>METHOD=1 INTER</code> in NONMEM; FOCEI in ferx). NONMEM’s minimization was successful.</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Quantity</th>
+<th>NONMEM 7.5.1</th>
+<th>ferx</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>OFV (without constant)</td>
+<td>301.582</td>
+<td>301.600</td>
+</tr>
+<tr class="even">
+<td><code>TVCL1</code> (class 1)</td>
+<td>0.981</td>
+<td>≈ 0.98</td>
+</tr>
+<tr class="odd">
+<td><code>TVCL2</code> (class 2)</td>
+<td>2.842</td>
+<td>≈ 2.84</td>
+</tr>
+<tr class="even">
+<td><code>V</code></td>
+<td>9.979</td>
+<td>≈ 9.98</td>
+</tr>
+<tr class="odd">
+<td>mixing fraction <code>p(1)</code></td>
+<td>0.472</td>
+<td>≈ 0.47</td>
+</tr>
+<tr class="even">
+<td><code>MIXEST</code> classification</td>
+<td>—</td>
+<td><strong>30 / 30 subjects agree</strong></td>
+</tr>
+</tbody>
+</table>
+<p>The objectives agree to ~0.02 units and the per-subject <code>MIXEST</code> class assignment is identical for every subject.</p>
+<section id="standard-errors" class="level3">
+<h3 class="anchored" data-anchor-id="standard-errors">Standard errors</h3>
+<p>A mixture fit runs the covariance step like any other fit: the finite-difference Hessian is built on the <strong>mixture</strong> objective (the K-fold log-sum-exp above), and the standard errors are <span class="math inline">\(\sqrt{\operatorname{diag}(R^{-1})}\)</span>. The mixing-fraction SE is reported on the scale the mixing form is written in — the coefficients of a <code>logit(k) = …</code> form carry a logit-scale SE, a <code>p(k) = …</code> probability an SE directly on the probability scale — because those coefficients are ordinary thetas.</p>
+<p>Cross-checked against <code>$COVARIANCE MATRIX=R</code> on the same model (<code>tests/nonmem/mixture_iv_cov.ctl</code>); <code>MATRIX=R</code> is the pure Hessian-inverse estimator ferx computes (NONMEM’s default sandwich <span class="math inline">\(R^{-1}SR^{-1}\)</span> differs by the usual 10–25 % between the two estimators):</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>SE</th>
+<th>NONMEM (<code>MATRIX=R</code>)</th>
+<th>ferx</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>TVCL1</code></td>
+<td>0.1056</td>
+<td>0.1067</td>
+</tr>
+<tr class="even">
+<td><code>TVCL2</code></td>
+<td>0.2543</td>
+<td>0.2559</td>
+</tr>
+<tr class="odd">
+<td><code>V</code></td>
+<td>0.1861</td>
+<td>0.1860</td>
+</tr>
+<tr class="even">
+<td><code>p(1)</code> (delta-method)</td>
+<td>0.1026</td>
+<td>0.1030</td>
+</tr>
+</tbody>
+</table>
+<p>All four agree to <strong>&lt; 1 %</strong>. The <code>p(1)</code> row compares NONMEM’s direct <span class="math inline">\(P(1)=\theta_4\)</span> SE to ferx’s logit-scale SE mapped through <span class="math inline">\(\operatorname{SE}(p) = p(1-p)\operatorname{SE}(\text{logit})\)</span>.</p>
+</section>
+</section>
+<section id="inter-occasion-variability-under-a-mixture" class="level2">
+<h2 class="anchored" data-anchor-id="inter-occasion-variability-under-a-mixture">Inter-occasion variability under a mixture</h2>
+<p>A mixture may carry inter-occasion variability (a <code>kappa</code> on a structural parameter) — the two features compose (#985). Each class’s per-subject inner solve estimates the per-occasion κ̂ under that class’s typical values, and the FOCE/FOCEI marginal <code>L_ik</code> is the κ-augmented occasion likelihood, so the same <code>L_i = Σ_k p_ik L_ik</code> mixture is formed over IOV-aware class likelihoods. The IOV Ω is shared across classes (it sits in the base parameter block, ahead of any per-class Ω/Σ override), matching NONMEM’s <code>$OMEGA BLOCK(1) … SAME</code> occasion structure. The analytic outer gradient does not yet emit κ-slot derivatives for a mixture, so an IOV mixture optimises against a central-difference outer gradient; the covariance step runs as usual on the K-fold mixture objective.</p>
+<section id="nonmem-cross-check-testsnonmemmixture_iv_iov.ctl" class="level3">
+<h3 class="anchored" data-anchor-id="nonmem-cross-check-testsnonmemmixture_iv_iov.ctl">NONMEM cross-check (<code>tests/nonmem/mixture_iv_iov.ctl</code>)</h3>
+<p>Two-class bimodal-CL model with a per-occasion κ on CL (30 subjects × 2 occasions), IIV/IOV Ω and Σ FIXed at the data-generating values in both engines, <code>METHOD=1 INTER</code>:</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Quantity</th>
+<th>NONMEM 7.5.1</th>
+<th>ferx</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>OFV (without constant)</td>
+<td>470.814</td>
+<td>470.930</td>
+</tr>
+<tr class="even">
+<td><code>TVCL1</code> (class 1)</td>
+<td>1.057</td>
+<td>1.069</td>
+</tr>
+<tr class="odd">
+<td><code>TVCL2</code> (class 2)</td>
+<td>3.330</td>
+<td>3.275</td>
+</tr>
+<tr class="even">
+<td><code>V</code></td>
+<td>10.259</td>
+<td>10.253</td>
+</tr>
+<tr class="odd">
+<td>mixing fraction <code>p(1)</code></td>
+<td>0.526</td>
+<td>0.506</td>
+</tr>
+<tr class="even">
+<td><code>MIXEST</code> classification</td>
+<td>—</td>
+<td><strong>30 / 30 subjects agree</strong></td>
+</tr>
+</tbody>
+</table>
+<p>The objectives agree to ~0.12 units and every subject’s most-probable class matches. Standard errors are <strong>not</strong> cross-checked for this model: NONMEM’s covariance step terminates with rounding errors and substitutes the R matrix (<code>R MATRIX SUBSTITUTED: YES</code>, no printable SE block) — a known NONMEM fragility for mixture + IOV covariance — whereas ferx’s covariance step completes. The mixture SE machinery itself is anchored to <code>$COVARIANCE MATRIX=R</code> in the non-IOV <a href="#standard-errors">standard-errors</a> comparison above.</p>
+</section>
+</section>
+<section id="saem-under-a-mixture" class="level2">
+<h2 class="anchored" data-anchor-id="saem-under-a-mixture">SAEM under a mixture</h2>
+<p>Mixtures can also be estimated with <strong>SAEM</strong> (<code>method = saem</code>, #985). Where FOCE/FOCEI marginalise the latent class analytically (the log-sum-exp above), SAEM <em>samples</em> it: each E-step draws the class indicator <span class="math inline">\(z_i \sim \operatorname{Categorical}(\mathrm{PMIX}_i)\)</span> from the current per-subject posterior <span class="math inline">\(\mathrm{PMIX}_{ik} \propto p_{ik}\,e^{-\mathrm{nll}_{ik}}\)</span>, then runs the usual η-MCMC <em>within the drawn class</em> (its Ω/Σ and its <code>MIXNUM</code> branch). The M-step partitions the sufficient statistics by sampled class:</p>
+<ul>
+<li><strong>Class-switched typical values</strong> (<code>if MIXNUM == k …</code>) are estimated from each class’s own members — the ordinary θ/σ M-step run under each subject’s class gives <span class="math inline">\(\partial\text{pred}/\partial\text{TVCL}_2 = 0\)</span> for a class-1 subject, so no special handling is needed. They are <em>not</em> mu-referenced under SAEM; see <a href="#mu-referencing-under-a-mixture">Mu-referencing under a mixture</a> below.</li>
+<li><strong>Class-shared typical values</strong> (<code>V = TVV * exp(ETA_V)</code>, the same theta in every class) do take the closed-form mu-referencing shift <span class="math inline">\(\log\theta \mathrel{+}= \gamma\,\operatorname{mean}_i(\eta_i)\)</span>, exactly as in a single-population SAEM fit (#996).</li>
+<li><strong>Per-class Ω overrides</strong> (<code>omega(k)</code>) use per-class stochastic-approximation diagonal statistics.</li>
+<li><strong>Mixing coefficients</strong> are updated from a small optimisation of the SA-averaged expected complete-data mixing log-likelihood <span class="math inline">\(\sum_i \sum_k \bar r_{ik}\,\ln p_{ik}(\theta_\text{mix})\)</span>, where <span class="math inline">\(\bar r_{ik}\)</span> is the Robbins–Monro average of the sampled class indicators. This is exact for constant mixing (it recovers <span class="math inline">\(p_k = \operatorname{mean}_i \bar r_{ik}\)</span>) and for covariate-dependent logit mixing (a weighted logistic fit) alike.</li>
+</ul>
+<p>The reported OFV, per-subject <code>MIXEST</code>/<code>PMIX</code>, and standard errors are computed from the K-fold mixture marginal at the SAEM optimum, exactly as for FOCEI. Per-class <strong>σ</strong> overrides (<code>sigma(k)</code>) are the one piece not yet re-estimated under SAEM — they are held at their initial values (with a warning), and every class-<code>k</code> subject is <em>scored</em> under that held σ, so the free base σ is estimated only from the classes that actually share it. Being held, the overrides report a standard error of 0, as <code>FIX</code>ed parameters do; route the model to FOCEI if they must be fit. HMC and the conditional-distribution pass are disabled for a mixture (they are class-unaware); the MH E-step is used.</p>
+<p>Two further SAEM-specific rules follow from the separated M-step:</p>
+<ul>
+<li>A mixing theta marked <code>FIX</code> is honoured — it is excluded from the mixing M-step and stays at its declared value, so a known mixture fraction can be pinned.</li>
+<li>A theta that drives <strong>both</strong> the mixing expression and a structural typical value is rejected with an error rather than silently double-owned (SAEM estimates the mixing coefficients and the structural thetas in separate M-steps). Split it into two thetas, or fit with FOCE/FOCEI, whose joint marginal handles the shared parameter.</li>
+</ul>
+<section id="mu-referencing-under-a-mixture" class="level3">
+<h3 class="anchored" data-anchor-id="mu-referencing-under-a-mixture">Mu-referencing under a mixture</h3>
+<p>A <code>MIXNUM</code>-switched typical value pairs one η with <em>K</em> class thetas, so the classical pooled mu-referencing move <span class="math inline">\(\log\theta \mathrel{+}= \gamma\,\operatorname{mean}_i(\eta_i)\)</span> (one theta per η) does not apply to it directly. ferx detects the class-aware form at parse time — a chain of <code>MIXNUM == k</code> branches whose arms are all <code>THETA_k * exp(ETA)</code> (or <code>exp(log(THETA_k) + ETA)</code>) on the <strong>same</strong> ETA — and resolves one anchor theta per class. Anything else (mixed anchors, a different ETA per arm, an additive arm, a non-<code>MIXNUM</code> condition, an out-of-range class) falls back to the numerical M-step, and the parser says so in a warning rather than degrading silently. The warning is only raised for expressions that actually carry an ETA: a class-switched typical value written without IIV (<code>V = if (MIXNUM == 1) TVV1 else TVV2</code>) or an intermediate <code>MIXNUM</code> flag variable is not a missed mu-reference and is left alone.</p>
+<p>Each anchor theta belongs to <strong>one</strong> η. If two η are written against the same typical value, only the first keeps the closed-form shift — applying both would move that θ twice per iteration — and the other η’s θ go to the numerical / weighted M-step.</p>
+<p>What each estimator does with that anchor set differs, and the difference is empirical:</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 33%">
+<col style="width: 33%">
+<col style="width: 33%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Estimator</th>
+<th>Class-shared θ</th>
+<th>Class-switched θ</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>SAEM</td>
+<td>closed-form pooled shift</td>
+<td>numerical M-step</td>
+</tr>
+<tr class="even">
+<td>IMP / IMPMAP (estimating)</td>
+<td>closed-form shift</td>
+<td>responsibility-weighted closed-form shift</td>
+</tr>
+</tbody>
+</table>
+<p><strong>SAEM deliberately keeps the switched θ numerical.</strong> It draws one <em>hard</em> class per subject each E-step, so the per-class mean <span class="math inline">\(\operatorname{mean}_{i:c_i=k}(\eta_i)\)</span> is a classification-EM statistic: the class boundary is re-drawn from the <span class="math inline">\(\theta_k\)</span> that the shift just moved, and the two feed back. Measured on the two-class anchor (<code>tests/nonmem/mixture_iv.csv</code>, seed 20250818) the class-aware variant lands at <code>TVCL2 = 3.02</code> with OFV 305.0, against <code>2.75</code> / 302.2 for the numerical M-step — worse on every coordinate (NONMEM SAEM: 2.735; FOCEI optimum: 2.842). A Rao-Blackwellised soft-responsibility variant converges to the same wrong point, so the bias is in the hard-class sufficient statistic rather than the weighting. IMP/IMPMAP importance-samples η <em>within every class</em> and weights by the responsibilities, so it has no hard assignment and no such feedback.</p>
+<p>Setting <code>mu_referencing = false</code> disables the class-aware shift under both estimators and restores the pre-#996 behaviour (every θ through the numerical / weighted M-step). Note that for a <strong>single-population</strong> IMP/IMPMAP fit the closed-form shift is EM-mandatory and stays on regardless of that option; only the mixture path is switchable.</p>
+<p>Two further conditions turn an individual θ’s shift off, on either path, each with a warning naming the parameter:</p>
+<ul>
+<li><strong>A θ declared with a negative lower bound</strong> is packed on the identity scale, so <code>log θ += mean(η)</code> would apply <code>θ += mean(η)</code> where the closed form means <code>θ *= exp(mean(η))</code>. Give the parameter a non-negative lower bound to keep the closed-form update.</li>
+<li><strong>A class that receives no responsibility mass</strong> in an iteration has no per-class η mean to shift with. Its θ is handed back to the weighted M-step for that iteration rather than held fixed, and the fit warns at the end; a class that collapses this way usually means the mixture is over-specified.</li>
+</ul>
+<p>When the class-aware shift is off for a class θ — by any of these routes, or by <code>mu_referencing = false</code> — that θ is estimated by the importance-weighted M-step alone, which is biased for weakly-identified parameters (<a href="https://github.com/FeRx-NLME/ferx-core/issues/406">#406</a>). IMP/IMPMAP fits say so in a warning; cross-check such a fit against FOCEI.</p>
+<p>Under <strong>IOV</strong>, the per-occasion κ is sampled inside each subject’s drawn class — under that class’s <code>MIXNUM</code> branch and its Ω/Σ — so a class-switched typical value is never absorbed into κ.</p>
+</section>
+<section id="nonmem-cross-check-testsnonmemmixture_iv_saem.ctl" class="level3">
+<h3 class="anchored" data-anchor-id="nonmem-cross-check-testsnonmemmixture_iv_saem.ctl">NONMEM cross-check (<code>tests/nonmem/mixture_iv_saem.ctl</code>)</h3>
+<p>The two-class constant-mixing model above, estimated with <code>$EST METHOD=SAEM</code> (<code>NBURN=1000 NITER=1000 ISAMPLE=2</code>) followed by a <code>METHOD=IMP EONLY=1</code> objective-evaluation pass, Ω/Σ FIXed:</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Quantity</th>
+<th>NONMEM SAEM</th>
+<th>ferx SAEM</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>OFV (IMP evaluation)</td>
+<td>300.87</td>
+<td>302.17</td>
+</tr>
+<tr class="even">
+<td><code>TVCL1</code> (class 1)</td>
+<td>1.002</td>
+<td>0.982</td>
+</tr>
+<tr class="odd">
+<td><code>TVCL2</code> (class 2)</td>
+<td>2.735</td>
+<td>2.746</td>
+</tr>
+<tr class="even">
+<td><code>V</code></td>
+<td>9.993</td>
+<td>10.089</td>
+</tr>
+<tr class="odd">
+<td>mixing fraction <code>p(1)</code></td>
+<td>0.4712</td>
+<td>0.4670</td>
+</tr>
+<tr class="even">
+<td><code>MIXEST</code> classification</td>
+<td>—</td>
+<td><strong>29 / 30 agree</strong> (1 borderline)</td>
+</tr>
+</tbody>
+</table>
+<p>Estimates agree to ≤ 3 %. The single MIXEST disagreement is a subject whose posterior sits almost exactly on the class boundary, which NONMEM SAEM and ferx SAEM split marginally differently. Covariate-dependent mixing under SAEM is exercised end-to-end in <code>tests/mixture_nonmem.rs</code>.</p>
+</section>
+</section>
+<section id="bayesian-estimation-under-a-mixture" class="level2">
+<h2 class="anchored" data-anchor-id="bayesian-estimation-under-a-mixture">Bayesian estimation under a mixture</h2>
+<p>Mixtures can also be fit with full-MCMC Bayesian estimation (<code>method = bayes</code>, #985). The latent class is handled <strong>Rao-Blackwellised</strong> — marginalised out rather than sampled — so the sampler still sees a smooth continuous target: each subject’s likelihood contribution is the K-class marginal <span class="math inline">\(-\log \sum_k p_{ik}\,\exp(-\mathrm{nll}_{ik})\)</span>. Because every Gibbs block evaluates the per-subject likelihood through this one marginal, the whole Gibbs-within-MH sampler becomes mixture-aware in one place:</p>
+<ul>
+<li>the <strong>η block</strong> samples <span class="math inline">\(\eta_i\)</span> against the class-marginal posterior (a <code>chol(Ω)</code>-preconditioned random walk; HMC is disabled for mixtures because its analytic gradient is single-class);</li>
+<li>the <strong>(θ, σ) block</strong> — which also carries the mixing thetas — samples them against the marginal, so the mixing coefficients (constant <em>or</em> covariate-dependent logit mixing) are sampled with no extra machinery;</li>
+<li>the <strong>Ω block</strong> draws the (class-shared) Ω from its conjugate full conditional;</li>
+<li>the <strong>κ block</strong> (inter-occasion variability, #985) samples the per-occasion <span class="math inline">\(\kappa_{ik}\)</span> against the same marginal, so κ targets the class-marginal posterior rather than class 1’s.</li>
+</ul>
+<p>Ω/Σ are shared across classes (the classes differ only through the <code>MIXNUM</code>-switched typical values); per-class Ω/Σ overrides (<code>omega(k)</code>/<code>sigma(k)</code>) are rejected with a clear error — fit those with FOCE/FOCEI. The reported OFV, per-subject <code>MIXEST</code>/<code>PMIX</code>, and EBEs are the K-fold marginal values at the posterior mean.</p>
+<section id="priors-label-switching-and-the-reported-ofv" class="level3">
+<h3 class="anchored" data-anchor-id="priors-label-switching-and-the-reported-ofv">Priors, label switching, and the reported OFV</h3>
+<p>The population priors are weakly informative normals, <span class="math inline">\(\mathcal{N}(u_0, 10^2)\)</span> on the unconstrained scale (log θ where θ is positive, log σ), centred on the <em>initial estimates</em> <span class="math inline">\(u_0\)</span> from the model file. Any <code>[parameters]</code> bounds you declare are <strong>not</strong> enforced as a uniform prior inside the (θ, σ) Metropolis block — only the mu-referenced conjugate θ move clamps to them — so a mixing logit is kept in range by the prior, not by its declared bounds.</p>
+<p>Because the classes are identified only through those priors, a chain can <strong>swap labels</strong> (class 1 ↔︎ class 2) and the pooled posterior mean would then average across two modes and estimate neither class. The signature is a high split-R̂ on the class-switched θ; ferx emits a warning naming label switching when R̂ exceeds its convergence threshold on a mixture. Separating the classes in the initial estimates is the practical fix.</p>
+<p>The OFV reported for a Bayes <em>mixture</em> run is the Laplace K-fold marginal at the posterior mean (not the posterior-mean joint NLL ×2 that a non-mixture Bayes run reports), and — like every mixture marginal — it is the FOCE or FOCEI form depending on <code>interaction</code>. In a method chain (<code>method = [saem, bayes]</code>) that flag follows the chain’s last estimator, so compare mixture OFVs only across runs with the same interaction setting.</p>
+<p>Under diffuse priors the Bayes posterior mean concentrates at the maximum- likelihood optimum, so it recovers the same estimates the FOCEI/SAEM anchors pin (observed on <code>tests/nonmem/mixture_iv.csv</code>: posterior mean <code>TVCL1 ≈ 0.94</code>, <code>TVCL2 ≈ 2.78</code>, <code>V ≈ 10.0</code>, <code>p(1) ≈ 0.47</code>, marginal OFV ≈ 301.8, vs the FOCEI optimum 0.98 / 2.84 / 9.98 / 0.472 / 301.58; the two class means sit slightly inside the MLE pair, the direction partial label mixing pulls them). That shared optimum — already NONMEM-anchored by the FOCEI run above — is the Bayes cross-check: a direct NONMEM <code>METHOD=BAYES</code> reference is not used because NONMEM’s BAYES sampler aborts in burn-in on this model (it insists on Gibbs-sampling Ω, which is FIXed here), a known NONMEM <code>$MIX</code>+BAYES fragility. The same mixture-marginal machinery is anchored directly against NONMEM SAEM above.</p>
+</section>
+</section>
+<section id="imp-objective-evaluation-under-a-mixture" class="level2">
+<h2 class="anchored" data-anchor-id="imp-objective-evaluation-under-a-mixture">IMP objective evaluation under a mixture</h2>
+<p>Importance sampling evaluates the <strong>class-marginal</strong> likelihood for a mixture (<code>method = imp</code> with <code>imp_eval_only</code>, NONMEM <code>METHOD=IMP EONLY=1</code>, #985). For each subject and each class it runs the class-<code>k</code> MAP inner solve (under the <code>MIXNUM</code> guard), importance-samples the class-conditional marginal <span class="math inline">\(L_{ik}\)</span>, and combines them exactly as FOCEI does:</p>
+<p><span class="math display">\[
+-2\log L = -2\sum_i \log \sum_k p_{ik}\,L_{ik}.
+\]</span></p>
+<p>This is the Monte-Carlo marginal likelihood — the number to compare against NONMEM’s <code>#OBJV</code> for <code>IMP EONLY</code> — and it is what a chained fit reports on <code>FitResult.importance_sampling</code>. The reported per-subject ESS is the worst ESS among the classes that subject actually loads on (classes with <span class="math inline">\(\mathrm{PMIX}_{ik}\approx 0\)</span> are excluded, since a poor proposal there barely enters the marginal), so <code>imp_low_ess_threshold</code> flags mixture subjects the same way it does single-population ones. The usual workflow is to estimate with SAEM (or FOCE/FOCEI) and append an evaluation stage:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb2"><pre class="sourceCode toml code-with-copy"><code class="sourceCode toml"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">[fit_options]</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">method</span> <span class="op">=</span> <span class="op">[</span><span class="er">saem,</span> <span class="er">imp</span><span class="op">]</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">imp_eval_only</span> <span class="op">=</span> <span class="cn">true</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>On <code>tests/nonmem/mixture_iv.csv</code> this recovers the NONMEM <code>IMP EONLY</code> objective to well under a Monte-Carlo standard error: ferx <code>−2 log L = 300.82 ± 0.06</code> vs NONMEM <code>300.87</code> (<code>mixture_iv_saem.ctl</code>’s second <code>$EST</code>), with <code>ess_min/K = 0.82</code> and <code>ess_med/K = 0.91</code>.</p>
+<section id="estimating-imp-impmap" class="level3">
+<h3 class="anchored" data-anchor-id="estimating-imp-impmap">Estimating IMP / IMPMAP</h3>
+<p>Importance sampling also <strong>estimates</strong> a mixture (<code>method = imp</code> / <code>impmap</code> without <code>imp_eval_only</code>) via a class-partitioned MCEM. Each iteration importance- samples every subject’s η <em>within each class</em> (under the <code>MIXNUM</code> guard), forms the deterministic class responsibilities <span class="math inline">\(\mathrm{PMIX}_{ik} \propto p_{ik}L_{ik}\)</span>, then runs responsibility-weighted M-steps: the mixing coefficients from the responsibilities, the class-shared Ω from <span class="math inline">\(\sum_i\sum_k \mathrm{PMIX}_{ik}\,\widehat{\eta\eta^{\top}}_{ik}/N\)</span>, and the class-switched typical values from a responsibility- and importance-weighted observation M-step (each class’s samples scored under its own <code>MIXNUM</code>). Ω/σ are class-shared (per-class overrides are rejected); IOV / FREM / SDE are not supported (as for the single-population MCEM).</p>
+<p>The class-switched typical values are <strong>mu-referenced per class</strong> (#996). Because the MCEM importance-samples η within every class, a per-class posterior mean <span class="math inline">\(\bar\eta_{ic}\)</span> exists directly, and the EM move is the responsibility-weighted</p>
+<p><span class="math display">\[\log\theta_k \mathrel{+}= \frac{\sum_i r_{ic}\,\bar\eta_{ic}}{\sum_i r_{ic}},
+\qquad r_{ic} = \mathrm{PMIX}_{ic}\]</span></p>
+<p>summed over the classes <span class="math inline">\(\theta_k\)</span> serves. Those θ are pinned out of the weighted M-step, which then fits only σ and the remaining θ. A class-<em>shared</em> typical value repeats the same theta in every class slot, so it collapses to the pooled single-population shift. See <a href="#mu-referencing-under-a-mixture">Mu-referencing under a mixture</a> for the detection rules and for why SAEM does not do the same.</p>
+<p>This is what closes the old gap: on the two-class anchor, estimating IMPMAP now recovers <code>TVCL1 = 0.952</code>, <code>TVCL2 = 2.821</code>, <code>V = 10.008</code>, <code>p(1) = 0.472</code>, against <code>0.949 / 2.819 / 10.010 / 0.473</code> from NONMEM IMPMAP with <code>MU_1</code> assigned inside the <code>MIXNUM</code> branch (<code>tests/nonmem/mixture_iv_impmap_mu.ctl</code>, NM 7.6.0) — better than 0.5 % on every coordinate. With <code>mu_referencing = false</code> the same run falls back to the weighted M-step alone and returns <code>TVCL1 = 0.998</code>, <code>TVCL2 = 2.597</code>, which is the pre-#996 behaviour and shows how much of the accuracy the shift buys. Note that the EM estimators settle slightly below the FOCEI optimum (0.98 / 2.84) on <code>TVCL1</code>/<code>TVCL2</code>; NONMEM’s mu-referenced IMPMAP does the same.</p>
+<p>A θ whose paired ω is negligible (<code>ω &lt; 1e-3</code>) carries no mean-shift information, so it is routed to the weighted M-step with a warning, as in the single-population MCEM; so is a θ declared with a negative lower bound (identity-packed, so the additive log-scale shift is not its EM optimum). The fit also names any estimated θ that carries no ETA at all — the mixing thetas are excluded, since they are owned by the mixing M-step.</p>
+<p>The per-subject proposal machinery is the same as the single-population MCEM: each class’s draws get their own ISCALE pilot search (the guard against importance-weight collapse), and <code>impmap_mceta</code> runs its multi-start MAP within every class. Two IMPMAP options are <strong>not</strong> wired for mixtures and warn when set: <code>impmap_trace</code> (no iteration trace is produced) and <code>impmap_auto</code> / <code>imp_auto</code> (the sample count stays fixed).</p>
+</section>
+</section>
+<section id="not-yet-supported" class="level2">
+<h2 class="anchored" data-anchor-id="not-yet-supported">Not yet supported</h2>
+<p>The following error clearly rather than silently mis-fitting:</p>
+<ul>
+<li>Per-class σ overrides (<code>sigma(k)</code>) under SAEM (held at their initial values, with a warning), and per-class Ω/σ overrides under Bayes and estimating IMP/IMPMAP (rejected) — use FOCE/FOCEI to fit those.</li>
+<li>IOV / FREM / SDE under the mixture IMP paths (objective evaluation and estimation) — use FOCE/FOCEI.</li>
+<li>A theta shared between the <code>[mixture]</code> mixing expression and a structural typical value, under SAEM and under estimating IMP/IMPMAP. Both run the mixing M-step separately from the θ/σ M-step, so a shared theta would be double-owned; FOCE/FOCEI’s joint marginal handles it.</li>
+</ul>
+
+
+</section>
+</section>
+
+</main> <!-- /main -->
+<script>
+(function () {
+  var HEAD = '<div class="panel-head"><span class="dots"><i></i><i></i><i></i></span><span class="file"><span class="br">[</span>warfarin_pk.ferx<span class="br">]</span></span></div>';
+
+  function apply() {
+    var dark = document.documentElement.getAttribute('data-bs-theme') === 'dark';
+    document.querySelectorAll('div.sourceCode').forEach(function (el) {
+      if (el.parentElement && el.parentElement.closest('.code-panel')) return;
+      if (dark) {
+        if (!el.classList.contains('code-panel')) {
+          el.classList.add('code-panel');
+          el.insertAdjacentHTML('afterbegin', HEAD);
+        }
+      } else {
+        el.classList.remove('code-panel');
+        var h = el.querySelector(':scope > .panel-head');
+        if (h) h.remove();
+      }
+    });
+  }
+
+  if (document.body) apply();
+  document.addEventListener('DOMContentLoaded', apply);
+  new MutationObserver(function (ms) {
+    ms.forEach(function (m) { if (m.attributeName === 'data-bs-theme') apply(); });
+  }).observe(document.documentElement, { attributes: true });
+}());
+</script>
+<script id="quarto-html-after-body" type="application/javascript">
+  window.document.addEventListener("DOMContentLoaded", function (event) {
+    // Ensure there is a toggle, if there isn't float one in the top right
+    if (window.document.querySelector('.quarto-color-scheme-toggle') === null) {
+      const a = window.document.createElement('a');
+      a.classList.add('top-right');
+      a.classList.add('quarto-color-scheme-toggle');
+      a.href = "";
+      a.onclick = function() { try { window.quartoToggleColorScheme(); } catch {} return false; };
+      const i = window.document.createElement("i");
+      i.classList.add('bi');
+      a.appendChild(i);
+      window.document.body.appendChild(a);
+    }
+    setColorSchemeToggle(hasAlternateSentinel())
+    const icon = "";
+    const anchorJS = new window.AnchorJS();
+    anchorJS.options = {
+      placement: 'right',
+      icon: icon
+    };
+    anchorJS.add('.anchored');
+    const isCodeAnnotation = (el) => {
+      for (const clz of el.classList) {
+        if (clz.startsWith('code-annotation-')) {                     
+          return true;
+        }
+      }
+      return false;
+    }
+    const onCopySuccess = function(e) {
+      // button target
+      const button = e.trigger;
+      // don't keep focus
+      button.blur();
+      // flash "checked"
+      button.classList.add('code-copy-button-checked');
+      var currentTitle = button.getAttribute("title");
+      button.setAttribute("title", "Copied!");
+      let tooltip;
+      if (window.bootstrap) {
+        button.setAttribute("data-bs-toggle", "tooltip");
+        button.setAttribute("data-bs-placement", "left");
+        button.setAttribute("data-bs-title", "Copied!");
+        tooltip = new bootstrap.Tooltip(button, 
+          { trigger: "manual", 
+            customClass: "code-copy-button-tooltip",
+            offset: [0, -8]});
+        tooltip.show();    
+      }
+      setTimeout(function() {
+        if (tooltip) {
+          tooltip.hide();
+          button.removeAttribute("data-bs-title");
+          button.removeAttribute("data-bs-toggle");
+          button.removeAttribute("data-bs-placement");
+        }
+        button.setAttribute("title", currentTitle);
+        button.classList.remove('code-copy-button-checked');
+      }, 1000);
+      // clear code selection
+      e.clearSelection();
+    }
+    const getTextToCopy = function(trigger) {
+      const outerScaffold = trigger.parentElement.cloneNode(true);
+      const codeEl = outerScaffold.querySelector('code');
+      for (const childEl of codeEl.children) {
+        if (isCodeAnnotation(childEl)) {
+          childEl.remove();
+        }
+      }
+      return codeEl.innerText;
+    }
+    const clipboard = new window.ClipboardJS('.code-copy-button:not([data-in-quarto-modal])', {
+      text: getTextToCopy
+    });
+    clipboard.on('success', onCopySuccess);
+    if (window.document.getElementById('quarto-embedded-source-code-modal')) {
+      const clipboardModal = new window.ClipboardJS('.code-copy-button[data-in-quarto-modal]', {
+        text: getTextToCopy,
+        container: window.document.getElementById('quarto-embedded-source-code-modal')
+      });
+      clipboardModal.on('success', onCopySuccess);
+    }
+      var localhostRegex = new RegExp(/^(?:http|https):\/\/localhost\:?[0-9]*\//);
+      var mailtoRegex = new RegExp(/^mailto:/);
+        var filterRegex = new RegExp("https:\/\/ferx-nlme\.github\.io\/ferx-core\/");
+      var isInternal = (href) => {
+          return filterRegex.test(href) || localhostRegex.test(href) || mailtoRegex.test(href);
+      }
+      // Inspect non-navigation links and adorn them if external
+     var links = window.document.querySelectorAll('a[href]:not(.nav-link):not(.navbar-brand):not(.toc-action):not(.sidebar-link):not(.sidebar-item-toggle):not(.pagination-link):not(.no-external):not([aria-hidden]):not(.dropdown-item):not(.quarto-navigation-tool):not(.about-link)');
+      for (var i=0; i<links.length; i++) {
+        const link = links[i];
+        if (!isInternal(link.href)) {
+          // undo the damage that might have been done by quarto-nav.js in the case of
+          // links that we want to consider external
+          if (link.dataset.originalHref !== undefined) {
+            link.href = link.dataset.originalHref;
+          }
+        }
+      }
+    function tippyHover(el, contentFn, onTriggerFn, onUntriggerFn) {
+      const config = {
+        allowHTML: true,
+        maxWidth: 500,
+        delay: 100,
+        arrow: false,
+        appendTo: function(el) {
+            return el.parentElement;
+        },
+        interactive: true,
+        interactiveBorder: 10,
+        theme: 'quarto',
+        placement: 'bottom-start',
+      };
+      if (contentFn) {
+        config.content = contentFn;
+      }
+      if (onTriggerFn) {
+        config.onTrigger = onTriggerFn;
+      }
+      if (onUntriggerFn) {
+        config.onUntrigger = onUntriggerFn;
+      }
+      window.tippy(el, config); 
+    }
+    const noterefs = window.document.querySelectorAll('a[role="doc-noteref"]');
+    for (var i=0; i<noterefs.length; i++) {
+      const ref = noterefs[i];
+      tippyHover(ref, function() {
+        // use id or data attribute instead here
+        let href = ref.getAttribute('data-footnote-href') || ref.getAttribute('href');
+        try { href = new URL(href).hash; } catch {}
+        const id = href.replace(/^#\/?/, "");
+        const note = window.document.getElementById(id);
+        if (note) {
+          return note.innerHTML;
+        } else {
+          return "";
+        }
+      });
+    }
+    const xrefs = window.document.querySelectorAll('a.quarto-xref');
+    const processXRef = (id, note) => {
+      // Strip column container classes
+      const stripColumnClz = (el) => {
+        el.classList.remove("page-full", "page-columns");
+        if (el.children) {
+          for (const child of el.children) {
+            stripColumnClz(child);
+          }
+        }
+      }
+      stripColumnClz(note)
+      if (id === null || id.startsWith('sec-')) {
+        // Special case sections, only their first couple elements
+        const container = document.createElement("div");
+        if (note.children && note.children.length > 2) {
+          container.appendChild(note.children[0].cloneNode(true));
+          for (let i = 1; i < note.children.length; i++) {
+            const child = note.children[i];
+            if (child.tagName === "P" && child.innerText === "") {
+              continue;
+            } else {
+              container.appendChild(child.cloneNode(true));
+              break;
+            }
+          }
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(container);
+          }
+          return container.innerHTML
+        } else {
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(note);
+          }
+          return note.innerHTML;
+        }
+      } else {
+        // Remove any anchor links if they are present
+        const anchorLink = note.querySelector('a.anchorjs-link');
+        if (anchorLink) {
+          anchorLink.remove();
+        }
+        if (window.Quarto?.typesetMath) {
+          window.Quarto.typesetMath(note);
+        }
+        if (note.classList.contains("callout")) {
+          return note.outerHTML;
+        } else {
+          return note.innerHTML;
+        }
+      }
+    }
+    for (var i=0; i<xrefs.length; i++) {
+      const xref = xrefs[i];
+      tippyHover(xref, undefined, function(instance) {
+        instance.disable();
+        let url = xref.getAttribute('href');
+        let hash = undefined; 
+        if (url.startsWith('#')) {
+          hash = url;
+        } else {
+          try { hash = new URL(url).hash; } catch {}
+        }
+        if (hash) {
+          const id = hash.replace(/^#\/?/, "");
+          const note = window.document.getElementById(id);
+          if (note !== null) {
+            try {
+              const html = processXRef(id, note.cloneNode(true));
+              instance.setContent(html);
+            } finally {
+              instance.enable();
+              instance.show();
+            }
+          } else {
+            // See if we can fetch this
+            fetch(url.split('#')[0])
+            .then(res => res.text())
+            .then(html => {
+              const parser = new DOMParser();
+              const htmlDoc = parser.parseFromString(html, "text/html");
+              const note = htmlDoc.getElementById(id);
+              if (note !== null) {
+                const html = processXRef(id, note);
+                instance.setContent(html);
+              } 
+            }).finally(() => {
+              instance.enable();
+              instance.show();
+            });
+          }
+        } else {
+          // See if we can fetch a full url (with no hash to target)
+          // This is a special case and we should probably do some content thinning / targeting
+          fetch(url)
+          .then(res => res.text())
+          .then(html => {
+            const parser = new DOMParser();
+            const htmlDoc = parser.parseFromString(html, "text/html");
+            const note = htmlDoc.querySelector('main.content');
+            if (note !== null) {
+              // This should only happen for chapter cross references
+              // (since there is no id in the URL)
+              // remove the first header
+              if (note.children.length > 0 && note.children[0].tagName === "HEADER") {
+                note.children[0].remove();
+              }
+              const html = processXRef(null, note);
+              instance.setContent(html);
+            } 
+          }).finally(() => {
+            instance.enable();
+            instance.show();
+          });
+        }
+      }, function(instance) {
+      });
+    }
+        let selectedAnnoteEl;
+        const selectorForAnnotation = ( cell, annotation) => {
+          let cellAttr = 'data-code-cell="' + cell + '"';
+          let lineAttr = 'data-code-annotation="' +  annotation + '"';
+          const selector = 'span[' + cellAttr + '][' + lineAttr + ']';
+          return selector;
+        }
+        const selectCodeLines = (annoteEl) => {
+          const doc = window.document;
+          const targetCell = annoteEl.getAttribute("data-target-cell");
+          const targetAnnotation = annoteEl.getAttribute("data-target-annotation");
+          const annoteSpan = window.document.querySelector(selectorForAnnotation(targetCell, targetAnnotation));
+          const lines = annoteSpan.getAttribute("data-code-lines").split(",");
+          const lineIds = lines.map((line) => {
+            return targetCell + "-" + line;
+          })
+          let top = null;
+          let height = null;
+          let parent = null;
+          if (lineIds.length > 0) {
+              //compute the position of the single el (top and bottom and make a div)
+              const el = window.document.getElementById(lineIds[0]);
+              top = el.offsetTop;
+              height = el.offsetHeight;
+              parent = el.parentElement.parentElement;
+            if (lineIds.length > 1) {
+              const lastEl = window.document.getElementById(lineIds[lineIds.length - 1]);
+              const bottom = lastEl.offsetTop + lastEl.offsetHeight;
+              height = bottom - top;
+            }
+            if (top !== null && height !== null && parent !== null) {
+              // cook up a div (if necessary) and position it 
+              let div = window.document.getElementById("code-annotation-line-highlight");
+              if (div === null) {
+                div = window.document.createElement("div");
+                div.setAttribute("id", "code-annotation-line-highlight");
+                div.style.position = 'absolute';
+                parent.appendChild(div);
+              }
+              div.style.top = top - 2 + "px";
+              div.style.height = height + 4 + "px";
+              div.style.left = 0;
+              let gutterDiv = window.document.getElementById("code-annotation-line-highlight-gutter");
+              if (gutterDiv === null) {
+                gutterDiv = window.document.createElement("div");
+                gutterDiv.setAttribute("id", "code-annotation-line-highlight-gutter");
+                gutterDiv.style.position = 'absolute';
+                const codeCell = window.document.getElementById(targetCell);
+                const gutter = codeCell.querySelector('.code-annotation-gutter');
+                gutter.appendChild(gutterDiv);
+              }
+              gutterDiv.style.top = top - 2 + "px";
+              gutterDiv.style.height = height + 4 + "px";
+            }
+            selectedAnnoteEl = annoteEl;
+          }
+        };
+        const unselectCodeLines = () => {
+          const elementsIds = ["code-annotation-line-highlight", "code-annotation-line-highlight-gutter"];
+          elementsIds.forEach((elId) => {
+            const div = window.document.getElementById(elId);
+            if (div) {
+              div.remove();
+            }
+          });
+          selectedAnnoteEl = undefined;
+        };
+          // Handle positioning of the toggle
+      window.addEventListener(
+        "resize",
+        throttle(() => {
+          elRect = undefined;
+          if (selectedAnnoteEl) {
+            selectCodeLines(selectedAnnoteEl);
+          }
+        }, 10)
+      );
+      function throttle(fn, ms) {
+      let throttle = false;
+      let timer;
+        return (...args) => {
+          if(!throttle) { // first call gets through
+              fn.apply(this, args);
+              throttle = true;
+          } else { // all the others get throttled
+              if(timer) clearTimeout(timer); // cancel #2
+              timer = setTimeout(() => {
+                fn.apply(this, args);
+                timer = throttle = false;
+              }, ms);
+          }
+        };
+      }
+        // Attach click handler to the DT
+        const annoteDls = window.document.querySelectorAll('dt[data-target-cell]');
+        for (const annoteDlNode of annoteDls) {
+          annoteDlNode.addEventListener('click', (event) => {
+            const clickedEl = event.target;
+            if (clickedEl !== selectedAnnoteEl) {
+              unselectCodeLines();
+              const activeEl = window.document.querySelector('dt[data-target-cell].code-annotation-active');
+              if (activeEl) {
+                activeEl.classList.remove('code-annotation-active');
+              }
+              selectCodeLines(clickedEl);
+              clickedEl.classList.add('code-annotation-active');
+            } else {
+              // Unselect the line
+              unselectCodeLines();
+              clickedEl.classList.remove('code-annotation-active');
+            }
+          });
+        }
+    const findCites = (el) => {
+      const parentEl = el.parentElement;
+      if (parentEl) {
+        const cites = parentEl.dataset.cites;
+        if (cites) {
+          return {
+            el,
+            cites: cites.split(' ')
+          };
+        } else {
+          return findCites(el.parentElement)
+        }
+      } else {
+        return undefined;
+      }
+    };
+    var bibliorefs = window.document.querySelectorAll('a[role="doc-biblioref"]');
+    for (var i=0; i<bibliorefs.length; i++) {
+      const ref = bibliorefs[i];
+      const citeInfo = findCites(ref);
+      if (citeInfo) {
+        tippyHover(citeInfo.el, function() {
+          var popup = window.document.createElement('div');
+          citeInfo.cites.forEach(function(cite) {
+            var citeDiv = window.document.createElement('div');
+            citeDiv.classList.add('hanging-indent');
+            citeDiv.classList.add('csl-entry');
+            var biblioDiv = window.document.getElementById('ref-' + cite);
+            if (biblioDiv) {
+              citeDiv.innerHTML = biblioDiv.innerHTML;
+            }
+            popup.appendChild(citeDiv);
+          });
+          return popup.innerHTML;
+        });
+      }
+    }
+  });
+  </script>
+</div> <!-- /content -->
+<footer class="footer">
+  <div class="nav-footer">
+    <div class="nav-footer-left">
+<p>© 2026 FeRx-NLME · MIT licensed</p>
+</div>   
+    <div class="nav-footer-center">
+      &nbsp;
+    <div class="toc-actions d-sm-block d-md-none"><ul><li><a href="https://github.com/FeRx-NLME/ferx-core/edit/main/estimation/mixture.qmd" class="toc-action"><i class="bi bi-github"></i>Edit this page</a></li><li><a href="https://github.com/FeRx-NLME/ferx-core/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></div>
+    <div class="nav-footer-right">
+<p>Fe · 26 · Rx · 2026</p>
+</div>
+  </div>
+</footer>
+
+
+
+
+</body></html>

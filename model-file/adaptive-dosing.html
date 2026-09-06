@@ -1,0 +1,1894 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en"><head>
+
+<meta charset="utf-8">
+<meta name="generator" content="quarto-1.10.18">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+
+
+<title>Adaptive feedback dosing – ferx-core</title>
+<style>
+/* Default styles provided by pandoc.
+** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+*/
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: 1.5em;}
+div.column{flex: auto;}
+@media screen {
+div.columns{gap: min(4vw, 1.5em);}
+div.column{overflow-x: auto;}
+}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+  width: 0.8em;
+  margin: 0 0.8em 0.2em -1em; /* quarto-specific, see https://github.com/quarto-dev/quarto-cli/issues/4556 */ 
+  vertical-align: middle;
+}
+/* CSS for syntax highlighting */
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+  { counter-reset: source-line 0; }
+pre.numberSource code > span
+  { position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+  { content: counter(source-line);
+    position: relative; left: -1em; text-align: right; vertical-align: baseline;
+    border: none; display: inline-block;
+    -webkit-touch-callout: none; -webkit-user-select: none;
+    -khtml-user-select: none; -moz-user-select: none;
+    -ms-user-select: none; user-select: none;
+    padding: 0 4px; width: 4em;
+  }
+pre.numberSource { margin-left: 3em;  padding-left: 4px; }
+div.sourceCode
+  {   }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+</style>
+
+
+<script src="../site_libs/quarto-nav/quarto-nav.js"></script>
+<script src="../site_libs/quarto-nav/headroom.min.js"></script>
+<script src="../site_libs/clipboard/clipboard.min.js"></script>
+<script src="../site_libs/quarto-search/autocomplete.umd.js"></script>
+<script src="../site_libs/quarto-search/fuse.min.js"></script>
+<script src="../site_libs/quarto-search/quarto-search.js"></script>
+<meta name="quarto:offset" content="../">
+<link href="../assets/ferx-favicon.svg" rel="icon" type="image/svg+xml">
+<script src="../site_libs/quarto-html/quarto.js" type="module"></script>
+<script src="../site_libs/quarto-html/tabsets/tabsets.js" type="module"></script>
+<script src="../site_libs/quarto-html/popper.min.js"></script>
+<script src="../site_libs/quarto-html/tippy.umd.min.js"></script>
+<script src="../site_libs/quarto-html/anchor.min.js"></script>
+<link href="../site_libs/quarto-html/tippy.css" rel="stylesheet">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-51776f957f81c5a6b38322b65a6a6987.css" rel="stylesheet" class="quarto-color-scheme" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-dark-31632d092df9090a2ed68f79c078059d.css" rel="stylesheet" class="quarto-color-scheme quarto-color-alternate" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-51776f957f81c5a6b38322b65a6a6987.css" rel="stylesheet" class="quarto-color-scheme-extra" id="quarto-text-highlighting-styles">
+<script src="../site_libs/bootstrap/bootstrap.min.js"></script>
+<link href="../site_libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
+<link href="../site_libs/bootstrap/bootstrap-f5ed25dbf962e4596f9f4df24f2ade0d.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme" id="quarto-bootstrap" data-mode="light">
+<link href="../site_libs/bootstrap/bootstrap-dark-8a64b8d4793081e9872239f556c8075c.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme quarto-color-alternate" id="quarto-bootstrap" data-mode="dark">
+<link href="../site_libs/bootstrap/bootstrap-f5ed25dbf962e4596f9f4df24f2ade0d.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme-extra" id="quarto-bootstrap" data-mode="light">
+<script id="quarto-search-options" type="application/json">{
+  "location": "navbar",
+  "copy-button": false,
+  "collapse-after": 3,
+  "panel-placement": "end",
+  "type": "overlay",
+  "limit": 50,
+  "keyboard-shortcut": [
+    "f",
+    "/",
+    "s"
+  ],
+  "show-item-context": false,
+  "language": {
+    "search-no-results-text": "No results",
+    "search-matching-documents-text": "matching documents",
+    "search-copy-link-title": "Copy link to search",
+    "search-hide-matches-text": "Hide additional matches",
+    "search-more-match-text": "more match in this document",
+    "search-more-matches-text": "more matches in this document",
+    "search-clear-button-title": "Clear",
+    "search-text-placeholder": "",
+    "search-detached-cancel-button-title": "Cancel",
+    "search-submit-button-title": "Submit",
+    "search-label": "Search"
+  }
+}</script>
+
+
+<link rel="stylesheet" href="../styles.css">
+<meta property="og:title" content="Adaptive feedback dosing">
+<meta property="og:description" content="Open-source nonlinear mixed-effects modeling for population PK/PD and pharmacometrics">
+<meta property="og:site_name" content="ferx-core">
+<meta property="og:locale" content="en_US">
+<meta name="twitter:title" content="Adaptive feedback dosing">
+<meta name="twitter:description" content="Open-source nonlinear mixed-effects modeling for population PK/PD and pharmacometrics">
+<meta name="twitter:card" content="summary">
+<link rel="canonical" href="https://ferx-nlme.github.io/ferx-core/model-file/adaptive-dosing.html">
+</head>
+
+<body class="nav-sidebar floating nav-fixed quarto-light"><script id="quarto-html-before-body" type="application/javascript">
+    const toggleBodyColorMode = (bsSheetEl) => {
+      const mode = bsSheetEl.getAttribute("data-mode");
+      const bodyEl = window.document.querySelector("body");
+      if (mode === "dark") {
+        bodyEl.classList.add("quarto-dark");
+        bodyEl.classList.remove("quarto-light");
+      } else {
+        bodyEl.classList.add("quarto-light");
+        bodyEl.classList.remove("quarto-dark");
+      }
+    }
+    const toggleBodyColorPrimary = () => {
+      const bsSheetEl = window.document.querySelector("link#quarto-bootstrap:not([rel=disabled-stylesheet])");
+      if (bsSheetEl) {
+        toggleBodyColorMode(bsSheetEl);
+      }
+    }
+    const setColorSchemeToggle = (alternate) => {
+      const toggles = window.document.querySelectorAll('.quarto-color-scheme-toggle');
+      for (let i=0; i < toggles.length; i++) {
+        const toggle = toggles[i];
+        if (toggle) {
+          if (alternate) {
+            toggle.classList.add("alternate");
+          } else {
+            toggle.classList.remove("alternate");
+          }
+        }
+      }
+    };
+    const toggleColorMode = (alternate) => {
+      // Switch the stylesheets
+      const primaryStylesheets = window.document.querySelectorAll('link.quarto-color-scheme:not(.quarto-color-alternate)');
+      const alternateStylesheets = window.document.querySelectorAll('link.quarto-color-scheme.quarto-color-alternate');
+      manageTransitions('#quarto-margin-sidebar .nav-link', false);
+      if (alternate) {
+        // note: dark is layered on light, we don't disable primary!
+        enableStylesheet(alternateStylesheets);
+        for (const sheetNode of alternateStylesheets) {
+          if (sheetNode.id === "quarto-bootstrap") {
+            toggleBodyColorMode(sheetNode);
+          }
+        }
+      } else {
+        disableStylesheet(alternateStylesheets);
+        enableStylesheet(primaryStylesheets)
+        toggleBodyColorPrimary();
+      }
+      manageTransitions('#quarto-margin-sidebar .nav-link', true);
+      // Switch the toggles
+      setColorSchemeToggle(alternate)
+      // Hack to workaround the fact that safari doesn't
+      // properly recolor the scrollbar when toggling (#1455)
+      if (navigator.userAgent.indexOf('Safari') > 0 && navigator.userAgent.indexOf('Chrome') == -1) {
+        manageTransitions("body", false);
+        window.scrollTo(0, 1);
+        setTimeout(() => {
+          window.scrollTo(0, 0);
+          manageTransitions("body", true);
+        }, 40);
+      }
+    }
+    const disableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        stylesheet.rel = 'disabled-stylesheet';
+      }
+    }
+    const enableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        if(stylesheet.rel !== 'stylesheet') { // for Chrome, which will still FOUC without this check
+          stylesheet.rel = 'stylesheet';
+        }
+      }
+    }
+    const manageTransitions = (selector, allowTransitions) => {
+      const els = window.document.querySelectorAll(selector);
+      for (let i=0; i < els.length; i++) {
+        const el = els[i];
+        if (allowTransitions) {
+          el.classList.remove('notransition');
+        } else {
+          el.classList.add('notransition');
+        }
+      }
+    }
+    const isFileUrl = () => {
+      return window.location.protocol === 'file:';
+    }
+    const hasAlternateSentinel = () => {
+      let styleSentinel = getColorSchemeSentinel();
+      if (styleSentinel !== null) {
+        return styleSentinel === "alternate";
+      } else {
+        return false;
+      }
+    }
+    const setStyleSentinel = (alternate) => {
+      const value = alternate ? "alternate" : "default";
+      if (!isFileUrl()) {
+        window.localStorage.setItem("quarto-color-scheme", value);
+      } else {
+        localAlternateSentinel = value;
+      }
+    }
+    const getColorSchemeSentinel = () => {
+      if (!isFileUrl()) {
+        const storageValue = window.localStorage.getItem("quarto-color-scheme");
+        return storageValue != null ? storageValue : localAlternateSentinel;
+      } else {
+        return localAlternateSentinel;
+      }
+    }
+    const toggleGiscusIfUsed = (isAlternate, darkModeDefault) => {
+      const baseTheme = document.querySelector('#giscus-base-theme')?.value ?? 'light';
+      const alternateTheme = document.querySelector('#giscus-alt-theme')?.value ?? 'dark';
+      let newTheme = '';
+      if(authorPrefersDark) {
+        newTheme = isAlternate ? baseTheme : alternateTheme;
+      } else {
+        newTheme = isAlternate ? alternateTheme : baseTheme;
+      }
+      const changeGiscusTheme = () => {
+        // From: https://github.com/giscus/giscus/issues/336
+        const sendMessage = (message) => {
+          const iframe = document.querySelector('iframe.giscus-frame');
+          if (!iframe) return;
+          iframe.contentWindow.postMessage({ giscus: message }, 'https://giscus.app');
+        }
+        sendMessage({
+          setConfig: {
+            theme: newTheme
+          }
+        });
+      }
+      const isGiscussLoaded = window.document.querySelector('iframe.giscus-frame') !== null;
+      if (isGiscussLoaded) {
+        changeGiscusTheme();
+      }
+    };
+    const authorPrefersDark = false;
+    const darkModeDefault = authorPrefersDark;
+      document.querySelector('link#quarto-text-highlighting-styles.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+      document.querySelector('link#quarto-bootstrap.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+    let localAlternateSentinel = darkModeDefault ? 'alternate' : 'default';
+    // Dark / light mode switch
+    window.quartoToggleColorScheme = () => {
+      // Read the current dark / light value
+      let toAlternate = !hasAlternateSentinel();
+      toggleColorMode(toAlternate);
+      setStyleSentinel(toAlternate);
+      toggleGiscusIfUsed(toAlternate, darkModeDefault);
+      window.dispatchEvent(new Event('resize'));
+    };
+    // Switch to dark mode if need be
+    if (hasAlternateSentinel()) {
+      toggleColorMode(true);
+    } else {
+      toggleColorMode(false);
+    }
+  </script>
+
+<div id="quarto-search-results"></div>
+  <header id="quarto-header" class="headroom fixed-top">
+    <nav class="navbar navbar-expand-lg " data-bs-theme="dark">
+      <div class="navbar-container container-fluid">
+      <div class="navbar-brand-container mx-auto">
+    <a href="../index.html" class="navbar-brand navbar-brand-logo">
+    <img src="../assets/ferx-dsl-brackets.svg" alt="ferx" class="navbar-logo light-content">
+    <img src="../assets/ferx-dsl-brackets.svg" alt="ferx" class="navbar-logo dark-content">
+    </a>
+    <a class="navbar-brand" href="../index.html">
+    <span class="navbar-title">ferx-core</span>
+    </a>
+  </div>
+            <div id="quarto-search" class="" title="Search"></div>
+          <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarCollapse" aria-controls="navbarCollapse" role="menu" aria-expanded="false" aria-label="Toggle navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+  <span class="navbar-toggler-icon"></span>
+</button>
+          <div class="collapse navbar-collapse" id="navbarCollapse">
+            <ul class="navbar-nav navbar-nav-scroll me-auto">
+  <li class="nav-item">
+    <a class="nav-link active" href="../getting-started.html" aria-current="page"> 
+<span class="menu-text">Get started</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/features.html"> 
+<span class="menu-text">Features</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/changelog.html"> 
+<span class="menu-text">Changelog</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/roadmap.html"> 
+<span class="menu-text">Roadmap</span></a>
+  </li>  
+</ul>
+            <ul class="navbar-nav navbar-nav-scroll ms-auto">
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/ferx-core/"> 
+<span class="menu-text">ferx-core</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/ferx-book/"> 
+<span class="menu-text">ferx-r</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/reference/"> 
+<span class="menu-text">Reference</span></a>
+  </li>  
+  <li class="nav-item compact">
+    <a class="nav-link" href="https://github.com/FeRx-NLME"> <i class="bi bi-github" role="img" aria-label="GitHub">
+</i> 
+<span class="menu-text"></span></a>
+  </li>  
+</ul>
+          </div> <!-- /navcollapse -->
+            <div class="quarto-navbar-tools">
+  <a href="" class="quarto-color-scheme-toggle quarto-navigation-tool  px-1" onclick="window.quartoToggleColorScheme(); return false;" title="Toggle dark mode"><i class="bi"></i></a>
+</div>
+      </div> <!-- /container-fluid -->
+    </nav>
+  <nav class="quarto-secondary-nav">
+    <div class="container-fluid d-flex">
+      <button type="button" class="quarto-btn-toggle btn" data-bs-toggle="collapse" role="button" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+        <i class="bi bi-layout-text-sidebar-reverse"></i>
+      </button>
+        <nav class="quarto-page-breadcrumbs" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../model-file/index.html">Model File Reference</a></li><li class="breadcrumb-item"><a href="../model-file/adaptive-dosing.html">Adaptive (Feedback) Dosing</a></li></ol></nav>
+        <a class="flex-grow-1" role="navigation" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">      
+        </a>
+      <button type="button" class="btn quarto-search-button" aria-label="Search" onclick="window.quartoOpenSearch();">
+        <i class="bi bi-search"></i>
+      </button>
+    </div>
+  </nav>
+</header>
+<!-- content -->
+<div id="quarto-content" class="quarto-container page-columns page-rows-contents page-layout-article page-navbar">
+<!-- sidebar -->
+  <nav id="quarto-sidebar" class="sidebar collapse collapse-horizontal quarto-sidebar-collapse-item sidebar-navigation floating overflow-auto">
+    <div class="pt-lg-2 mt-2 text-left sidebar-header">
+      <a href="../index.html" class="sidebar-logo-link">
+      <img src="../assets/ferx-favicon.svg" alt="" class="sidebar-logo light-content py-0 d-lg-inline d-none">
+      <img src="../assets/ferx-favicon.svg" alt="" class="sidebar-logo dark-content py-0 d-lg-inline d-none">
+      </a>
+      </div>
+        <div class="mt-2 flex-shrink-0 align-items-center">
+        <div class="sidebar-search">
+        <div id="quarto-search" class="" title="Search"></div>
+        </div>
+        </div>
+    <div class="sidebar-menu-container"> 
+    <ul class="list-unstyled mt-1">
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Introduction</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../maturity.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Feature Maturity</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../getting-started.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Getting Started</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../installation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Installation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../quick-start.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Quick Start</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../model-file/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Model File Reference</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/parameters.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Parameters</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/iov.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Inter-Occasion Variability (IOV)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/individual-parameters.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Individual Parameters</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariates.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariates</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariate-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/structural-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Structural Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/lagtime.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Lagtime</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/steady-state.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Steady-State Doses (SS=1)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/error-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Error Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/bloq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">LOQ-Censored Observations</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/ode-models.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/absorption.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Built-in Absorption Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/scaling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Scaling</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/initial-conditions.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Initial Conditions</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/diffusion.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Stochastic Differential Equations (SDE / Diffusion)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/neural-networks.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Neural Networks</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariate-nn.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><code>[covariate_nn]</code> — Deep Compartment Models (DCM)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/data.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/data-selection.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Selection</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/derived.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Derived Columns (<code>[derived]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Output Columns (<code>[output]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/fit-options.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Fit Options</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/simulation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Simulation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/adaptive-dosing.html" class="sidebar-item-text sidebar-link active">
+ <span class="menu-text">Adaptive (Feedback) Dosing</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/event-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Time-to-Event Endpoints (<code>[event_model]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/categorical.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Categorical endpoints — <code>[binary_model]</code></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/markov-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Markov models ([markov_model])</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../estimation/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Estimation Methods</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/foce.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FOCE / FOCEI</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/agq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">AGQ — Adaptive Gaussian Quadrature</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/gauss-newton.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Gauss-Newton (BHHH)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/saem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">SAEM</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/sir.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Sampling Importance Resampling (SIR)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/importance-sampling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Importance Sampling (IMP)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/frem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FREM (Full Random Effects Model)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/impmap.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">IMPMAP — Importance Sampling assisted by Mode A Posteriori</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/bayes.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Bayesian estimation (MCMC)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/vi.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Variational Inference</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/parameterization.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Packed Parameter Space</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/optimizers.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Outer Optimizers</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/tte.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Time-to-Event (TTE) Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/categorical.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Categorical endpoints (binary / logistic)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/ctmm.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Continuous-time Markov models (CTMM)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/mixture.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Mixture Models</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false">
+ <span class="menu-text">Tools</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/bootstrap.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Bootstrap</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/gam-screening.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">GAM covariate screening</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/search.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Search configuration</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/covsearch.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate search</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/modelsearch.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Structural model search</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../data-format.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Format</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../cli.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">CLI Reference</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Output Files</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../warnings.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Warnings</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../file-formats/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">File Formats</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../file-formats/fitrx.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">The <code>.fitrx</code> Fit Bundle</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../file-formats/check-report.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Check Report (<code>ferx check --json</code>)</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../examples/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Examples</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/one-cpt-oral.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">One-Compartment Oral (Warfarin)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/two-cpt-iv.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Two-Compartment IV Bolus</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/covariates.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/ode-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Model (Michaelis-Menten)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/bloq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">BLOQ (M3 method)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/iov.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Inter-Occasion Variability (IOV)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/iov-saem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">IOV with SAEM</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/multiple-dosing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Multiple Dosing (ADDL Column)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/steady-state.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Steady-State Dosing (SS Column)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/scaling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Unit Scaling (<code>[scaling]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/derived-output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Derived Columns and Output</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/data-selection.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Selection (IGNORE / ACCEPT)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/ode-lagtime.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Model with Absorption Lag Time</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/transit-absorption.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Transit Absorption (Two-Compartment)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/sde.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Stochastic Differential Equations (SDE)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/frem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FREM (Covariate Analysis)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/multistart.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Multi-Start: Michaelis-Menten Elimination</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../api/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Rust API</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/types.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Core Types</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/fitting.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Fitting Functions</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/simulation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Simulation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/parsing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Parsing</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/model-editing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Model editing</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../faq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FAQ</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../development/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Development</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/contributing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Contributing to FeRx development</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/sdlc.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Development Lifecycle (SDLC)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/docs-lint.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Docs linter</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+    </ul>
+    </div>
+</nav>
+<div id="quarto-sidebar-glass" class="quarto-sidebar-collapse-item" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item"></div>
+<!-- margin-sidebar -->
+    <div id="quarto-margin-sidebar" class="sidebar margin-sidebar">
+        <nav id="TOC" role="doc-toc" class="toc-active">
+    <h2 id="toc-title">On this page</h2>
+   
+  <ul>
+  <li><a href="#adaptive-feedback-dosing" id="toc-adaptive-feedback-dosing" class="nav-link active" data-scroll-target="#adaptive-feedback-dosing">Adaptive (Feedback) Dosing</a>
+  <ul>
+  <li><a href="#the-declarative-adaptive_dosing-block" id="toc-the-declarative-adaptive_dosing-block" class="nav-link" data-scroll-target="#the-declarative-adaptive_dosing-block">The declarative <code>[adaptive_dosing]</code> block</a>
+  <ul class="collapse">
+  <li><a href="#keys" id="toc-keys" class="nav-link" data-scroll-target="#keys">Keys</a>
+  <ul class="collapse">
+  <li><a href="#writing-an-observe-expression" id="toc-writing-an-observe-expression" class="nav-link" data-scroll-target="#writing-an-observe-expression">Writing an <code>observe</code> expression</a></li>
+  </ul></li>
+  <li><a href="#rules-when-signal-op-value-action" id="toc-rules-when-signal-op-value-action" class="nav-link" data-scroll-target="#rules-when-signal-op-value-action">Rules — <code>when signal &lt;op&gt; &lt;value&gt; : &lt;action&gt;</code></a></li>
+  <li><a href="#running-it" id="toc-running-it" class="nav-link" data-scroll-target="#running-it">Running it</a></li>
+  </ul></li>
+  <li><a href="#the-controller" id="toc-the-controller" class="nav-link" data-scroll-target="#the-controller">The controller</a>
+  <ul class="collapse">
+  <li><a href="#one-controller-per-subject" id="toc-one-controller-per-subject" class="nav-link" data-scroll-target="#one-controller-per-subject">One controller per subject</a></li>
+  </ul></li>
+  <li><a href="#monitors" id="toc-monitors" class="nav-link" data-scroll-target="#monitors">Monitors</a></li>
+  <li><a href="#example" id="toc-example" class="nav-link" data-scroll-target="#example">Example</a></li>
+  <li><a href="#verification-on-by-default" id="toc-verification-on-by-default" class="nav-link" data-scroll-target="#verification-on-by-default">Verification (on by default)</a></li>
+  <li><a href="#validation" id="toc-validation" class="nav-link" data-scroll-target="#validation">Validation</a>
+  <ul class="collapse">
+  <li><a href="#the-platelet-ladder-anchor" id="toc-the-platelet-ladder-anchor" class="nav-link" data-scroll-target="#the-platelet-ladder-anchor">The platelet-ladder anchor</a></li>
+  <li><a href="#the-vancomycin-auc-tdm-anchor" id="toc-the-vancomycin-auc-tdm-anchor" class="nav-link" data-scroll-target="#the-vancomycin-auc-tdm-anchor">The vancomycin AUC-TDM anchor</a></li>
+  </ul></li>
+  <li><a href="#current-scope-and-limits" id="toc-current-scope-and-limits" class="nav-link" data-scroll-target="#current-scope-and-limits">Current scope and limits</a></li>
+  </ul></li>
+  </ul>
+<div class="toc-actions"><ul><li><a href="https://github.com/FeRx-NLME/ferx-core/edit/main/model-file/adaptive-dosing.qmd" class="toc-action"><i class="bi bi-github"></i>Edit this page</a></li><li><a href="https://github.com/FeRx-NLME/ferx-core/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></nav>
+    </div>
+<!-- main -->
+<main class="content" id="quarto-document-content"><header id="title-block-header" class="quarto-title-block"><nav class="quarto-page-breadcrumbs quarto-title-breadcrumbs d-none d-lg-block" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../model-file/index.html">Model File Reference</a></li><li class="breadcrumb-item"><a href="../model-file/adaptive-dosing.html">Adaptive (Feedback) Dosing</a></li></ol></nav></header>
+
+
+
+
+
+<section id="adaptive-feedback-dosing" class="level1">
+<h1>Adaptive (Feedback) Dosing</h1>
+<blockquote class="blockquote">
+<p><strong>Maturity: beta</strong> — see <a href="../maturity.html">Feature Maturity</a> for what this means.</p>
+</blockquote>
+<p>Adaptive dosing simulates regimens where <strong>future doses depend on the simulated state</strong> — therapeutic-drug-monitoring (TDM) target attainment, oncology toxicity-driven dose reduction, biomarker titration, target-controlled infusion. A plain <a href="../model-file/simulation.html">simulation</a> is a pure forward pass: every dose is fixed before integration. Here a <em>controller</em> is consulted at a schedule of decision times, reads the current state, and chooses what to do next.</p>
+<p>There are two ways to drive a controller, and they compile to the <strong>same</strong> reactive engine — the same dose ledger, decision log, RNG substreams, and frozen-replay verifier (epic #391):</p>
+<ul>
+<li>the declarative <strong><code>[adaptive_dosing]</code> model-file block</strong>, run with <a href="https://docs.rs/ferx-core"><code>simulate_adaptive_from_spec()</code></a> — the file-driven path, documented next;</li>
+<li>the <strong>programmatic</strong> <a href="https://docs.rs/ferx-core"><code>simulate_adaptive()</code></a>, which takes a hand-written controller closure — the lower-level path, documented under <a href="#the-controller">The controller</a>.</li>
+</ul>
+<p>Multi-model composition (PK + PD + safety) and an imperative <code>[dose_control]</code> block remain on the roadmap.</p>
+<section id="the-declarative-adaptive_dosing-block" class="level2">
+<h2 class="anchored" data-anchor-id="the-declarative-adaptive_dosing-block">The declarative <code>[adaptive_dosing]</code> block</h2>
+<p>Put the policy in the model file and run it with <a href="https://docs.rs/ferx-core"><code>simulate_adaptive_from_spec()</code></a>. The block is <strong>declarative</strong> — a fixed dosing <em>policy</em> (trough &lt; target → increase, grade 4 → stop), not a script — that rides with the run, never with a fitted model’s parameters.</p>
+<pre><code>[adaptive_dosing]
+  observe     = central / V              # monitored signal: a derived expression
+  at          = every 24 from 0 to 168   # decision schedule (or an explicit list)
+  start_dose  = 100                      # dose issued at the first decision
+  route       = bolus(cmt=1)             # or: infuse(cmt=1, over=2)
+  dose_bounds = [0, 400]                 # every emitted dose is clamped here
+  confirm     = 2                        # act only after 2 consecutive breaches
+  when signal &lt; 10 : increase 25%        # first matching rule wins
+  when signal &gt; 20 : decrease 25%</code></pre>
+<section id="keys" class="level3">
+<h3 class="anchored" data-anchor-id="keys">Keys</h3>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 20%">
+<col style="width: 41%">
+<col style="width: 37%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Key</th>
+<th style="text-align: center;">Required</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>observe</code></td>
+<td style="text-align: center;">signal¹</td>
+<td>The <strong>latent</strong> monitored signal — a free-form expression over states + individual parameters (e.g.&nbsp;<code>central / V</code> for concentration), titrated on with <strong>no</strong> measurement noise. Provide this <em>or</em> <code>with_assay_error</code>, never both. The <code>when</code> rules compare the keyword <code>signal</code> to its value.</td>
+</tr>
+<tr class="even">
+<td><code>at</code></td>
+<td style="text-align: center;">✓</td>
+<td>Decision schedule on the subject clock: an explicit list <code>[0, 24, 48]</code> or an arithmetic sequence <code>every &lt;Δ&gt; from &lt;t0&gt; to &lt;t1&gt;</code> (inclusive).</td>
+</tr>
+<tr class="odd">
+<td><code>start_dose</code></td>
+<td style="text-align: center;">✓</td>
+<td>The dose issued at the first decision; seeds the running dose.</td>
+</tr>
+<tr class="even">
+<td><code>route</code></td>
+<td style="text-align: center;">✓</td>
+<td><code>bolus(cmt=N)</code> or <code>infuse(cmt=N, over=T)</code> (zero-order over duration <code>T</code>).</td>
+</tr>
+<tr class="odd">
+<td><code>dose_bounds</code></td>
+<td style="text-align: center;">✓</td>
+<td>Inclusive <code>[low, high]</code> clamp applied to every emitted dose.</td>
+</tr>
+<tr class="even">
+<td><code>confirm</code></td>
+<td style="text-align: center;"></td>
+<td>Debounce: act only after this many <em>consecutive</em> matches of the same rule (default <code>1</code> = act on the first breach).</td>
+</tr>
+<tr class="odd">
+<td><code>levels</code></td>
+<td style="text-align: center;"></td>
+<td>Discrete titration ladder <code>[d1, d2, …]</code> (oncology). With <code>levels</code>, bare <code>increase</code>/<code>decrease</code> step one rung; without it, use <code>increase N%</code> / <code>decrease N%</code>.</td>
+</tr>
+<tr class="even">
+<td><code>target_window</code></td>
+<td style="text-align: center;"></td>
+<td>Therapeutic band <code>[low, high]</code> for the monitored signal, used <strong>only</strong> to report the <code>pct_time_in_window</code> outcome metric — it does <strong>not</strong> influence dosing (the <code>when</code> rules do). <code>high</code> may be <code>inf</code> for a one-sided “at or above <code>low</code>” target. Omit it to leave <code>pct_time_in_window</code> unreported, rather than guessing a band from the rule thresholds.</td>
+</tr>
+<tr class="odd">
+<td><code>auc_target</code></td>
+<td style="text-align: center;"></td>
+<td>Exposure band <code>[low, high]</code> for the <strong>area under the monitored signal</strong> over each inter-decision window (e.g.&nbsp;vancomycin AUC₂₄ when decisions are daily), used <strong>only</strong> to report the <code>auc_target_attainment</code> outcome metric — like <code>target_window</code> it does <strong>not</strong> influence dosing. <code>low</code> must be <code>≥ 0</code>; <code>high</code> may be <code>inf</code>. Declaring it turns on a signal-AUC pass that re-integrates any pre-scheduled base regimen (#702) together with the realized controller doses on a dense grid; omit it to skip that pass and leave <code>auc_target_attainment</code> unreported.</td>
+</tr>
+<tr class="even">
+<td><code>with_assay_error</code></td>
+<td style="text-align: center;">signal¹</td>
+<td>Titrate on the <strong>noised measurement</strong> of a model output (named by <code>assay_cmt</code>) instead of a latent expression (default <code>false</code>). The signal’s value comes from that output’s <code>[scaling]</code> readout and its σ from that output’s <code>[error_model]</code>, so the two are always on the same scale — there is no re-typed <code>observe</code> expression to mis-scale. Mutually exclusive with <code>observe</code>.</td>
+</tr>
+<tr class="odd">
+<td><code>assay_cmt</code></td>
+<td style="text-align: center;"></td>
+<td>The 1-based compartment of the model output measured under <code>with_assay_error</code> — its <code>[scaling]</code> readout is the signal value and its <code>[error_model]</code> σ the noise. <strong>Required</strong> with <code>with_assay_error</code>.</td>
+</tr>
+</tbody>
+</table>
+<p>¹ <strong>The signal source is exactly one of <code>observe</code> (a latent expression, un-noised) or <code>with_assay_error = true</code> + <code>assay_cmt</code> (a noised model output).</strong> Setting both, or neither, is a parse error. Titrating on a <em>measured</em> quantity uses the model’s own output (so its value and σ can never disagree on scale); titrating on a <em>derived latent</em> quantity (effect-site, a ratio — anything with no error model) uses <code>observe</code>.</p>
+<section id="writing-an-observe-expression" class="level4">
+<h4 class="anchored" data-anchor-id="writing-an-observe-expression">Writing an <code>observe</code> expression</h4>
+<div class="callout callout-style-default callout-important callout-titled">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Important</span><code>observe</code> must not read a dose attribute
+</div>
+</div>
+<div class="callout-body-container callout-body">
+<p><code>observe</code> is a prediction path, so the same rule applies as in <code>[odes]</code> and <code>[scaling]</code>: a parameter the engine already applies <strong>at the dose event</strong> — on an ODE model <code>F</code>, <code>LAGTIME</code>/<code>ALAG</code>, or an indexed <code>F{n}</code>/<code>ALAG{n}</code>/<code>LAGTIME{n}</code>; on an analytical model whatever the <code>pk(..., f=…)</code> / <code>lagtime=…</code> mapping binds — must not be read back here. Writing <code>observe = central / (V * F)</code> applies <code>F</code> once to the dose and once to the signal, so the value the <code>when</code> rules compare against is wrong by exactly <code>F</code> — and unlike a mis-scaled readout this biases the <strong>titration decision</strong>, and every dose the controller goes on to emit. Such a model is rejected at parse time with <code>E_DOSE_ATTR_DOUBLE_USE</code> (<a href="https://github.com/FeRx-NLME/ferx-core/issues/993">#993</a>, <a href="https://github.com/FeRx-NLME/ferx-core/issues/1004">#1004</a>); see <a href="../model-file/ode-models.html#reading-a-dose-attribute-is-an-error-not-a-warning">Reading a dose attribute is an error, not a warning</a>.</p>
+<p><code>D{n}</code>/<code>R{n}</code> are the exception, as everywhere: the engine only consults them for a dose that codes <code>RATE=-2</code>/<code>-1</code>, so an <code>R1</code> in <code>observe</code> is reported against the <strong>dataset</strong> rather than the model file, and only when such a dose lands on it.</p>
+</div>
+</div>
+<p><code>observe</code> compiles through the same expression compiler as a <code>[scaling]</code> Form C readout, so it shares that block’s name scope — including the <code>TIME</code> built-in (spelled <code>TIME</code> or <code>T</code>), which resolves to <strong>the decision’s own time</strong>. A protocol-time-dependent target such as <code>observe = central / V - TARGET * TIME / (TIME + T50)</code> therefore titrates against the intended ramp (<a href="https://github.com/FeRx-NLME/ferx-core/issues/1028">#1028</a>).</p>
+<p>The shared name scope includes the <code>T</code> precedence rule: a <code>T</code> (or <code>t</code>) declared in <code>[covariates]</code> is the <strong>data column</strong>, in <code>observe</code> exactly as in <code>[scaling]</code>, so one model can never read the column in one block and the clock in the other. When <code>T</code> does fold into the built-in, the warning is reported at parse time — <code>observe</code> itself is compiled at simulate time, where there is no warnings channel. See <a href="../model-file/scaling.html#if-your-dataset-has-a-column-named-t">Scaling</a>.</p>
+</section>
+</section>
+<section id="rules-when-signal-op-value-action" class="level3">
+<h3 class="anchored" data-anchor-id="rules-when-signal-op-value-action">Rules — <code>when signal &lt;op&gt; &lt;value&gt; : &lt;action&gt;</code></h3>
+<p>Rules are evaluated top to bottom and the <strong>first match wins</strong>, so order the most specific / most severe condition first. <code>&lt;op&gt;</code> is one of <code>&lt; &lt;= &gt; &gt;= ==</code>.</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 47%">
+<col style="width: 52%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Action</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>increase N%</code> / <code>decrease N%</code></td>
+<td>Scale the running dose by ±N % (continuous titration).</td>
+</tr>
+<tr class="even">
+<td><code>increase</code> / <code>decrease</code></td>
+<td>Step one rung up / down a <code>levels</code> ladder.</td>
+</tr>
+<tr class="odd">
+<td><code>hold</code></td>
+<td>Skip this decision’s dose.</td>
+</tr>
+<tr class="even">
+<td><code>stop</code></td>
+<td>Discontinue all future dosing.</td>
+</tr>
+</tbody>
+</table>
+<p>A dose change is clamped to <code>dose_bounds</code>; a level step saturates at the ends of the ladder. When no rule matches (or a matched rule has not yet <code>confirm</code>-ed), the running dose is <strong>re-issued</strong> unchanged — the regimen continues, an explicit no-op rather than a silent skip.</p>
+</section>
+<section id="running-it" class="level3">
+<h3 class="anchored" data-anchor-id="running-it">Running it</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb2"><pre class="sourceCode rust code-with-copy"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">ferx_core::</span><span class="op">{</span>parse_full_model_file<span class="op">,</span> simulate_adaptive_from_spec<span class="op">,</span> AdaptiveSimulateOptions<span class="op">};</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::path::</span><span class="dt">Path</span><span class="op">;</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> parsed <span class="op">=</span> parse_full_model_file(<span class="dt">Path</span><span class="pp">::</span>new(<span class="st">"titration.ferx"</span>))<span class="op">?;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> spec <span class="op">=</span> parsed</span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>adaptive_dosing</span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>as_ref()</span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>ok_or(<span class="st">"model has no [adaptive_dosing] block"</span>)<span class="op">?;</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="co">// The block owns the schedule and the monitor, so leave `decision_times` and</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="co">// `monitors` empty here (setting either is a typed error); `seed` / `verify` /</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="co">// `max_decisions` still apply.</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> opts <span class="op">=</span> AdaptiveSimulateOptions <span class="op">{</span> seed<span class="op">:</span> <span class="cn">Some</span>(<span class="dv">42</span>)<span class="op">,</span> <span class="op">..</span><span class="bu">Default</span><span class="pp">::</span><span class="kw">default</span>() <span class="op">};</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> result <span class="op">=</span> simulate_adaptive_from_spec(</span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>    <span class="op">&amp;</span>parsed<span class="op">.</span>model<span class="op">,</span> <span class="op">&amp;</span>population<span class="op">,</span> <span class="op">&amp;</span>parsed<span class="op">.</span>model<span class="op">.</span>default_params<span class="op">,</span> <span class="dv">100</span><span class="op">,</span> spec<span class="op">,</span> <span class="op">&amp;</span>opts<span class="op">,</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>)<span class="op">?;</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>The block compiles to exactly the controller, monitor, and engine described below, so every guarantee in <a href="#monitors">Monitors</a> and <a href="#verification-on-by-default">Verification</a> applies unchanged, and <code>result</code> is the same bundled <code>trajectories</code> / <code>ledger</code> / <code>decisions</code>. The lower-level programmatic API follows.</p>
+</section>
+</section>
+<section id="the-controller" class="level2">
+<h2 class="anchored" data-anchor-id="the-controller">The controller</h2>
+<p>A controller is a closure consulted at each decision time. It receives a read-only <a href="https://docs.rs/ferx-core"><code>ControllerCtx</code></a> — the decision time, the live ODE state, the subject’s covariates, the realized dose history, and the resolved value of every declared <em>monitor</em> — and returns a list of <a href="https://docs.rs/ferx-core"><code>DoseAction</code></a>s:</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 47%">
+<col style="width: 52%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Action</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>Bolus { amt, cmt }</code></td>
+<td>Instantaneous dose into 1-based compartment <code>cmt</code>.</td>
+</tr>
+<tr class="even">
+<td><code>Infuse { amt, cmt, rate }</code></td>
+<td>Zero-order infusion; duration is <code>amt / rate</code>.</td>
+</tr>
+<tr class="odd">
+<td><code>Hold</code></td>
+<td>Skip this decision — no dose now, the regimen continues.</td>
+</tr>
+<tr class="even">
+<td><code>Stop</code></td>
+<td>Discontinue all <strong>future controller</strong> dosing. An infusion already in flight runs to its scheduled end, and a pre-scheduled base regimen (#702) keeps dosing — <code>Stop</code> ends the controller’s augmentation, not the patient’s standing prescription.</td>
+</tr>
+</tbody>
+</table>
+<p>A <code>Stop</code> must be the final action in a decision’s list; issuing work after a <code>Stop</code> is a typed error, not a silently dropped dose.</p>
+<section id="one-controller-per-subject" class="level3">
+<h3 class="anchored" data-anchor-id="one-controller-per-subject">One controller per subject</h3>
+<p><code>simulate_adaptive()</code> takes a <strong>factory</strong> (<code>Fn() -&gt; FnMut(...)</code>), not a single shared closure. A fresh controller is built for each <code>(subject, replicate)</code>. Real controllers carry per-subject state — a debounce counter, a windowed AUC, the current rung of a titration ladder — and a single shared closure would leak that state from one subject to the next. The factory makes the isolation structural: a stateless rule is just a factory whose closure ignores its environment.</p>
+</section>
+</section>
+<section id="monitors" class="level2">
+<h2 class="anchored" data-anchor-id="monitors">Monitors</h2>
+<p>A controller reads named signals declared as <a href="https://docs.rs/ferx-core"><code>MonitorSpec</code></a>s. Each monitor observes a 1-based compartment/endpoint under an <a href="https://docs.rs/ferx-core"><code>ObserveMode</code></a>:</p>
+<ul>
+<li><code>Ipred</code> — the latent individual prediction (no measurement noise).</li>
+<li><code>Dv</code> — the realized, assay-noised measurement: <code>IPRED + ε·√(residual variance)</code>, clamped at 0, with the residual variance taken from the endpoint’s own <code>[error_model]</code>. This is the realistic TDM / titration signal — a clinician titrates on a <em>measured</em> value, not the latent truth.</li>
+</ul>
+<p>Mode is chosen <strong>per monitor</strong>, so a PK exposure target can run on <code>Ipred</code> while a safety marker (e.g.&nbsp;ANC → CTCAE grade) runs on <code>Dv</code> in the same simulation.</p>
+<p>The engine — not the controller — resolves every monitor and draws any assay noise, on a dedicated <strong>controller-assay RNG substream</strong> keyed by <code>(subject, replicate, decision, analyte)</code>. That identity keying makes the assay draws (under a fixed <code>seed</code>):</p>
+<ul>
+<li><strong>deterministic</strong> — re-running reproduces them exactly;</li>
+<li><strong>permutation-invariant</strong> — a subject’s draws do not depend on iteration order;</li>
+<li><strong>non-perturbing</strong> — adding a monitor never shifts another monitor’s (or η’s) draws, so the frozen-replay verifier stays exact.</li>
+</ul>
+<p>A <code>Dv</code> monitor on a compartment with no <code>[error_model]</code> is a typed error (never a fabricated σ), and a noised reading below zero is clamped to 0 — but <strong>only on the default bare-state readout</strong>, where non-negativity is a physical property of the quantity. Since #1039 a Form C <code>[scaling] y = &lt;expr&gt;</code> readout is exempt: the expression may be legitimately signed (a change from baseline, a z-score, a difference from comparator), so its negative samples reach the controller unchanged, exactly as they do under <code>Ipred</code>. See <a href="../model-file/scaling.html#signed-readouts-since-1020">Scaling</a>. With <code>sigma → 0</code> a <code>Dv</code> monitor therefore reproduces the <code>Ipred</code> monitor sample for sample on a Form C readout, negative samples included; on the bare-state readout the floor still applies, so the two agree only where the latent value is non-negative.</p>
+</section>
+<section id="example" class="level2">
+<h2 class="anchored" data-anchor-id="example">Example</h2>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb3"><pre class="sourceCode rust code-with-copy"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">ferx_core::</span><span class="op">{</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>    simulate_adaptive<span class="op">,</span> AdaptiveSimulateOptions<span class="op">,</span> ControllerCtx<span class="op">,</span> DoseAction<span class="op">,</span> MonitorSpec<span class="op">,</span> ObserveMode<span class="op">,</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> opts <span class="op">=</span> AdaptiveSimulateOptions <span class="op">{</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    seed<span class="op">:</span> <span class="cn">Some</span>(<span class="dv">42</span>)<span class="op">,</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    decision_times<span class="op">:</span> <span class="pp">vec!</span>[<span class="dv">0.0</span><span class="op">,</span> <span class="dv">24.0</span><span class="op">,</span> <span class="dv">48.0</span><span class="op">,</span> <span class="dv">72.0</span><span class="op">,</span> <span class="dv">96.0</span>]<span class="op">,</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>    <span class="co">// Titrate on the noisy assay (DV), as in real TDM. Use `ObserveMode::Ipred`</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>    <span class="co">// to titrate on the latent prediction instead.</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>    monitors<span class="op">:</span> <span class="pp">vec!</span>[<span class="pp">MonitorSpec::</span>new(<span class="st">"CONC"</span><span class="op">,</span> <span class="dv">1</span><span class="op">,</span> <span class="pp">ObserveMode::</span>Dv)]<span class="op">,</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">..</span><span class="bu">Default</span><span class="pp">::</span><span class="kw">default</span>() <span class="co">// verify = true, max_decisions = 10_000</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="co">// A fresh controller per subject: titrate a trough toward the [10, 20] window.</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> make_controller <span class="op">=</span> <span class="op">||</span> <span class="op">{</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>    <span class="kw">move</span> <span class="op">|</span>ctx<span class="op">:</span> <span class="op">&amp;</span>ControllerCtx<span class="op">|</span> <span class="cf">match</span> ctx<span class="op">.</span>signal(<span class="st">"CONC"</span>) <span class="op">{</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>        <span class="cn">Some</span>(c) <span class="cf">if</span> c <span class="op">&lt;</span> <span class="dv">10.0</span> <span class="op">=&gt;</span> <span class="pp">vec!</span>[<span class="pp">DoseAction::</span>Bolus <span class="op">{</span> amt<span class="op">:</span> <span class="dv">150.0</span><span class="op">,</span> cmt<span class="op">:</span> <span class="dv">1</span> <span class="op">}</span>]<span class="op">,</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>        <span class="cn">Some</span>(c) <span class="cf">if</span> c <span class="op">&gt;</span> <span class="dv">20.0</span> <span class="op">=&gt;</span> <span class="pp">vec!</span>[<span class="pp">DoseAction::</span>Hold]<span class="op">,</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>        _ <span class="op">=&gt;</span> <span class="pp">vec!</span>[<span class="pp">DoseAction::</span>Bolus <span class="op">{</span> amt<span class="op">:</span> <span class="dv">100.0</span><span class="op">,</span> cmt<span class="op">:</span> <span class="dv">1</span> <span class="op">}</span>]<span class="op">,</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> result <span class="op">=</span> simulate_adaptive(<span class="op">&amp;</span>model<span class="op">,</span> <span class="op">&amp;</span>population<span class="op">,</span> <span class="op">&amp;</span>params<span class="op">,</span> <span class="dv">100</span><span class="op">,</span> make_controller<span class="op">,</span> <span class="op">&amp;</span>opts)<span class="op">?;</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>The result bundles four tidy, long-form artifacts — each tagged by <code>(draw, sim, id)</code> so they join cleanly:</p>
+<ul>
+<li><code>trajectories</code> — per-observation predictions (<code>Vec&lt;SimulationResult&gt;</code>).</li>
+<li><code>ledger</code> — every realized dose, with provenance (the decision that produced it, observed signals, applied bioavailability).</li>
+<li><code>decisions</code> — one row per decision <strong>including holds</strong>, so non-events are on the record rather than inferred from gaps in the ledger.</li>
+<li><code>metrics</code> — one per-subject <code>AdaptiveSubjectMetrics</code> row per realized run: cumulative dose, dose-increase / -decrease / hold / discontinuation counts, time-to-discontinuation, the observed-signal summary (min / max / mean), <code>pct_time_in_window</code> when the block declares a <code>target_window</code>, and <code>auc_target_attainment</code> when it declares an <code>auc_target</code>. The point fields are derived from <code>ledger</code> + <code>decisions</code> alone, so they are auditable against those rows (no re-integration). Increases / decreases are counted by realized dose change, not by which rule fired — a <code>decrease</code> clamped at the lower bound re-issues the same dose and is not counted. The signal summary is over the troughs/peaks the controller saw at the decision times (a decision-grid summary, not a dense-trajectory extremum). <code>auc_target_attainment</code> is the one integrated-exposure field: the fraction of inter-decision windows whose area under the monitored signal falls in the <code>auc_target</code> band, computed by a separate signal-AUC pass that re-integrates the realized doses on a dense grid (it never perturbs the reactive run). It is scored over the windows between <strong>realized</strong> decisions, so if a run discontinues (a <code>Stop</code>) the later, dose-free scheduled windows are not counted — discontinuation is already its own metric, and folding it in here too would double-count it; this keeps <code>auc_target_attainment</code> on the same realized basis as <code>pct_time_in_window</code>. Population summaries <strong>with uncertainty bands</strong> ride with the uncertainty slice, where bands carry meaning.</li>
+</ul>
+</section>
+<section id="verification-on-by-default" class="level2">
+<h2 class="anchored" data-anchor-id="verification-on-by-default">Verification (on by default)</h2>
+<p>Adaptive dosing is bookkeeping-heavy (event ordering, bioavailability/lag, segment carry-over). <code>simulate_adaptive()</code> runs a <strong>frozen-schedule replay verifier</strong> after every run (<code>verify = true</code>): it rebuilds a static subject from the realized dose ledger, re-integrates it through the trusted static engine, and checks the reactive trajectory against it. Because the reactive driver and the static engine are different code, agreement proves the driver applied every dose identically to the static engine. A divergence is a typed error that taints the result — never a silent wrong number.</p>
+<p>The replay reproduces the reactive driver’s <em>segment structure</em> — the driver restarts the integrator at every decision time (holds included), so the replay feeds those same decision times back in as no-op breaks. Both engines then walk the same segments through the same integrator, so the comparison sits at the solver’s true round-off floor (a small multiple of its error control) rather than a wide held-decision slack. A real bookkeeping bug — a dropped dose, wrong compartment, double-applied bioavailability — moves a prediction by orders of magnitude more, so the tight check still catches it without ever false-positiving on a legitimate run.</p>
+<p>On the time-varying-covariate and IOV paths the driver and the replay share precomputed per-event / per-occasion PK snapshots, so replay agreement alone would only prove the two <em>consumed</em> them identically — not that the snapshots were built correctly. The verifier therefore also <strong>independently re-derives</strong> each snapshot (the per-occasion <code>kappa</code>, the per-decision PK at its LOCF covariate, the per-record PK) from the run’s primitives and bit-checks it against what the driver used, so a mis-resolved covariate or occasion fails loudly rather than being applied by both sides and slipping through unnoticed (#748).</p>
+</section>
+<section id="validation" class="level2">
+<h2 class="anchored" data-anchor-id="validation">Validation</h2>
+<p>NONMEM has <strong>no native feedback dosing</strong>, so there is no equivalent NONMEM run to anchor against — the standard NONMEM comparison does not apply to this feature family. It is validated instead by:</p>
+<ul>
+<li>a <strong>degenerate oracle</strong> — a controller that re-emits a fixed regimen reproduces a plain simulation of that regimen, bit-for-bit;</li>
+<li>the <strong>frozen-schedule replay</strong> verifier above (an exact internal bookkeeping anchor);</li>
+<li>the <strong>three-witnesses</strong> check — a declarative <code>[adaptive_dosing]</code> block and a hand-written controller closure with the identical ladder realize the identical ledger, decision log, and trajectory, byte-for-byte (so the block compiles to exactly the engine the programmatic API exercises);</li>
+<li>a <strong>closed-loop</strong> check — a titration that starts below its target band drives the trough into the band and holds it there;</li>
+<li>for genuinely reactive behaviour, reproduction of external <strong>mrgsolve</strong> dynamic-dosing runs (the apples-to-apples external comparator, since mrgsolve does do feedback dosing) — one for each titration mode: the discrete <code>levels</code> ladder, in <a href="#the-platelet-ladder-anchor">The platelet-ladder anchor</a>, and continuous (percentage) titration plus the AUC-exposure metric, in <a href="#the-vancomycin-auc-tdm-anchor">The vancomycin AUC-TDM anchor</a>.</li>
+</ul>
+<section id="the-platelet-ladder-anchor" class="level3">
+<h3 class="anchored" data-anchor-id="the-platelet-ladder-anchor">The platelet-ladder anchor</h3>
+<p>The <code>levels</code> ladder is cross-checked against <strong>mrgsolve 1.7.2</strong> on an oncology dose-modification scenario — a Friberg semi-mechanistic myelosuppression model (Friberg et al., <em>J Clin Oncol</em> 2002) driven by a 1-compartment IV drug. Circulating platelets are read at the start of each weekly cycle; the dose steps down a discrete ladder (100 → 75 → 50 → 25 mg) on thrombocytopenia, with a severe floor that stops treatment. ferx (RK45) and mrgsolve (LSODA) integrate the identical ODE system and an R loop mirrors the controller semantics exactly, so the two engines must reach the same decisions. Under the top dose the platelets fall, the controller de-escalates two levels (100 → 75 → 50 mg), and platelets recover and hold:</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th style="text-align: right;">Cycle</th>
+<th style="text-align: right;">Platelet (×10⁹/L)</th>
+<th style="text-align: right;">Dose (mg)</th>
+<th style="text-align: left;">Action</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">250.0</td>
+<td style="text-align: right;">100</td>
+<td style="text-align: left;">start</td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">169.6</td>
+<td style="text-align: right;">100</td>
+<td style="text-align: left;">continue</td>
+</tr>
+<tr class="odd">
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">94.3</td>
+<td style="text-align: right;">75</td>
+<td style="text-align: left;"><strong>decrease</strong></td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">3</td>
+<td style="text-align: right;">98.7</td>
+<td style="text-align: right;">50</td>
+<td style="text-align: left;"><strong>decrease</strong></td>
+</tr>
+<tr class="odd">
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">151.3</td>
+<td style="text-align: right;">50</td>
+<td style="text-align: left;">continue</td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">5–9</td>
+<td style="text-align: right;">158–179</td>
+<td style="text-align: right;">50</td>
+<td style="text-align: left;">continue</td>
+</tr>
+</tbody>
+</table>
+<p>ferx reproduces every dose <strong>exactly</strong> and every platelet value to &lt; 0.01 ×10⁹/L — a cross-solver difference ~3 × 10⁻⁵ relative, far below the ~25-unit margin from each decision to its rule threshold, so every dose decision is robust. The model is <code>examples/adaptive_platelet_ladder.ferx</code>; the mrgsolve model, R driver, and frozen output live in <code>tests/reference/platelet_mrgsolve/</code>, exercised by the slow-gated <code>tests/adaptive_platelet_anchor.rs</code> (nightly + on push to <code>main</code>).</p>
+</section>
+<section id="the-vancomycin-auc-tdm-anchor" class="level3">
+<h3 class="anchored" data-anchor-id="the-vancomycin-auc-tdm-anchor">The vancomycin AUC-TDM anchor</h3>
+<p>Continuous (percentage) titration <strong>and</strong> the <code>auc_target</code> exposure metric are cross-checked against <strong>mrgsolve 1.7.2</strong> on a vancomycin TDM scenario — a 1-compartment IV model dosed once daily by a 1-h infusion. At the start of each day the controller reads the pre-dose trough and titrates the dose ±25 % to hold the trough in <code>[10, 15]</code> mg/L (the control law), while the <em>reported</em> outcome is AUC₂₄ attainment against the guideline band <code>[400, 600]</code> mg·h/L — the real trough-vs-AUC vancomycin tension, where dosing follows a single timed level but efficacy is judged on the daily exposure. The empiric start is subtherapeutic, so the dose climbs (seven 25 % steps) and holds once the trough enters the band:</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th style="text-align: right;">Day</th>
+<th style="text-align: right;">Trough (mg/L)</th>
+<th style="text-align: right;">Dose (mg)</th>
+<th style="text-align: right;">AUC₂₄ (mg·h/L)</th>
+<th style="text-align: center;">On AUC target</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.0</td>
+<td style="text-align: right;">625</td>
+<td style="text-align: right;">108</td>
+<td style="text-align: center;">no</td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">6.2</td>
+<td style="text-align: right;">1526</td>
+<td style="text-align: right;">350</td>
+<td style="text-align: center;">no</td>
+</tr>
+<tr class="odd">
+<td style="text-align: right;">5</td>
+<td style="text-align: right;">7.8</td>
+<td style="text-align: right;">1907</td>
+<td style="text-align: right;">438</td>
+<td style="text-align: center;"><strong>yes</strong></td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">9.7</td>
+<td style="text-align: right;">2384</td>
+<td style="text-align: right;">548</td>
+<td style="text-align: center;"><strong>yes</strong></td>
+</tr>
+<tr class="odd">
+<td style="text-align: right;">7</td>
+<td style="text-align: right;">12.1</td>
+<td style="text-align: right;">2384</td>
+<td style="text-align: right;">581</td>
+<td style="text-align: center;"><strong>yes</strong></td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">8–12</td>
+<td style="text-align: right;">12.9–13.2</td>
+<td style="text-align: right;">2384</td>
+<td style="text-align: right;">592–596</td>
+<td style="text-align: center;"><strong>yes</strong></td>
+</tr>
+</tbody>
+</table>
+<p>ferx reproduces every dose <strong>exactly</strong> (the titration is exact <code>f64</code> arithmetic shared with the R loop), every trough to a small cross-solver tolerance, and the AUC-target attainment fraction (<strong>8 of 13 daily windows</strong>) exactly. ferx integrates the daily exposure by a 128-panel trapezoid per window while mrgsolve uses an AUC compartment; the two agree to ~10⁻⁵ relative, far inside the margin from each AUC₂₄ to the band edges, so the in/out classification — hence attainment — is identical. (The exact AUC-pass accuracy is pinned separately by an analytic unit test against the closed form <code>(D/k)(e^{-k a} − e^{-k b})</code>.) The model is <code>examples/adaptive_vanco_auc.ferx</code>; the mrgsolve model, R driver, and frozen output live in <code>tests/reference/vanco_mrgsolve/</code>, exercised by the slow-gated <code>tests/adaptive_vanco_anchor.rs</code> (nightly + on push to <code>main</code>).</p>
+</section>
+</section>
+<section id="current-scope-and-limits" class="level2">
+<h2 class="anchored" data-anchor-id="current-scope-and-limits">Current scope and limits</h2>
+<ul>
+<li><strong>ODE models only</strong> (the reactive driver runs on the ODE engine).</li>
+<li><strong>A non-empty decision schedule is required</strong> — an empty <code>decision_times</code> never consults the controller, so it is rejected rather than run as a silent dose-free simulation.</li>
+<li><strong>Pre-scheduled base regimens are supported</strong> (#702) — the base subject may carry a loading / maintenance regimen, including a steady-state (<code>SS=1</code>) dose and doses into lagged or built-in input-rate (transit / zero-order absorption) compartments, which the driver integrates and the controller augments at the decision schedule (the real TDM / MIPD workflow: start on a fixed regimen, then titrate on measured levels). Base doses flow through the same dose-resolution, break-timeline, and steady-state machinery as <code>predict()</code> / <code>simulate()</code>, and they appear in the controller’s dose <code>history</code>; the frozen-replay verifier rebuilds the base regimen alongside the realized ledger, so the pre-scheduled + reactive bookkeeping is checked bit-for-bit each run. The <code>auc_target</code> exposure metric likewise integrates the base regimen: each window’s AUC covers the base doses — a loading dose before the first window and a maintenance dose landing inside a window alike — not just the controller’s, so <code>auc_target_attainment</code> is not biased low on a base-regimen run (constant-covariate; the time-varying / IOV / reset <code>auc_target</code> caveats below are unchanged). A base dose that <strong>shares a time with a decision is observed pre-dose</strong> (the trough), symmetric with the controller’s own doses — the controller reads the level <em>before</em> the scheduled dose lands, then that dose is applied (#933); for a steady-state base dose the pre-dose readout is the steady-state trough. A base dose scheduled <strong>past a controller <code>Stop</code> still lands</strong> — the base regimen is the patient’s standing prescription, which the controller discontinues its <em>own</em> augmentation of but does not cancel. (Base doses into lagged / input-rate compartments are supported because they run the exact pre-resolved static machinery; <em>controller-issued</em> doses into those compartments are still rejected at injection, where the TAD-anchor bookkeeping for a dose discovered mid-run is a follow-up.) <em>Scope:</em> supported on constant-covariate models, on <strong>time-varying-covariate models</strong> (since #930), and on <strong>IOV models</strong> (since #931), for a plain bolus / infusion base dose, whose bioavailability <code>F</code> is resolved from its own snapshot — the covariate active at, and (under IOV) the occasion κ of, the dose’s administration time (symmetric with a controller dose, whose <code>F</code> is fixed at injection) — and which is then integrated under the per-segment PK, matching independent mrgsolve loading-dose runs (renal-decline #930, per-occasion κ #931). A base regimen also <strong>composes with system resets</strong> (EVID=3/4) on the constant-covariate path (since #932): the reset zeros the state and turns off a base infusion opened before it, and an EVID=4 reset+dose row’s dose lands after its own reset — see <em>System resets</em> below. Still a typed error, never a silent mis-integration of a delivered dose: a base regimen combined with a system reset <strong>under a time-varying covariate or IOV</strong> (a #932 follow-up), and — under a time-varying covariate or IOV — a steady-state, lagged, built-in input-rate, or modeled-<code>RATE</code> base dose (a #930 / #931 follow-up whose per-dose SS / lag / input-rate / rate-resolution bookkeeping the frozen-replay engine does not yet reproduce).</li>
+<li><strong>Time-varying covariates are supported</strong> — the driver recomputes PK per event/segment from the covariate active in that segment (the NONMEM end-of-interval convention that <code>predict()</code> / <code>simulate()</code> use), so a covariate that changes over the horizon (e.g.&nbsp;declining renal function driving clearance) correctly drives CL/V/KA, the monitored signal, and every dose decision; the frozen-replay verifier validates the per-event bookkeeping. A model whose PK reads the <code>TIME</code> built-in is covered the same way. <em>Caveat:</em> the <code>auc_target_attainment</code> metric is not yet computed per-event, so declaring <code>auc_target</code> on a time-varying-covariate subject is a typed error rather than a frozen-snapshot AUC.</li>
+<li><strong>System resets (EVID=3) are supported</strong> — the reactive driver zeros the compartments at each reset time (re-seeding any <code>init(state)=expr</code>) and turns off controller-issued infusions opened before the reset, exactly as <code>predict()</code> / <code>simulate()</code> do on the event-driven path; the frozen-replay verifier is reset-aware, so the reset is honored <em>and</em> checked each run. Since #932 a reset also composes with a <strong>pre-scheduled base regimen</strong> on the constant-covariate path: it zeros the base regimen’s state and turns off a base infusion opened before it (the reset floor), and an <strong>EVID=4</strong> reset+dose row — which records both a reset and a dose — reaches the adaptive path as a base dose landing <em>after</em> its own reset (Reset &lt; Dose), matching <code>predict()</code>. Base × reset under a time-varying covariate or IOV stays a typed error (a #932 follow-up). <em>Caveat:</em> declaring <code>auc_target</code> on a reset subject is a typed error — the exposure metric’s uniform per-window trapezoid grid has no node at the reset instant, so the one window straddling the reset would integrate the state discontinuity inaccurately (every other output is reset-aware).</li>
+<li><strong>Inter-occasion variability (IOV) is supported</strong> — a fresh occasion <code>kappa</code> is drawn per <strong>decision window</strong> (occasion = decision index) and threaded through the per-event PK, so occasion-to-occasion shifts in CL/V drive the trajectory, the monitored signal, and every reactive dose; the frozen-replay verifier validates the per-occasion bookkeeping. A <strong>pre-scheduled base regimen</strong> (a loading dose) composes with IOV (#931): each base dose’s <code>F</code> resolves under the κ of the occasion active at its administration time — see <em>Pre-scheduled base regimens</em> above. It also composes with time-varying covariates — the composition (<code>CL = TVCL·(CRCL/100)·exp(η + κ)</code> under a declining covariate <em>and</em> a per-occasion κ) is cross-validated dose-for-dose against an independent <strong>mrgsolve</strong> run (<code>tests/reference/vanco_renal_iov_mrgsolve/</code>). <code>kappa</code> is drawn on a dedicated per-(subject, replicate) substream (disjoint from the η and assay streams), so a non-IOV run is unchanged and enabling a <code>Dv</code> monitor never shifts the draws. <em>Caveat:</em> as with time-varying covariates, <code>auc_target</code> on an IOV model is a typed error (the exposure metric is not yet computed per-occasion). Between-subject η is still drawn per subject/replicate; parameter-uncertainty propagation is a later layer.</li>
+<li><strong>Deterministic ODE only</strong> — a stochastic (<code>[diffusion]</code> / SDE) model is rejected (the reactive integrator carries no process noise).</li>
+<li><strong>Diagonal assay noise</strong> — each <code>Dv</code> monitor draws independently; correlated cross-endpoint (<code>block_sigma</code>) assay noise is a follow-up.</li>
+<li><strong>One monitored signal per block</strong> — the declarative block titrates on a single <code>observe</code>; multiple named per-analyte monitors (already supported by the programmatic engine) are a declarative-surface follow-up.</li>
+<li><strong>Roadmap</strong> — population outcome summaries with uncertainty bands, the imperative <code>[dose_control]</code> block, and PK + PD + safety model composition.</li>
+</ul>
+
+
+</section>
+</section>
+
+</main> <!-- /main -->
+<script>
+(function () {
+  var HEAD = '<div class="panel-head"><span class="dots"><i></i><i></i><i></i></span><span class="file"><span class="br">[</span>warfarin_pk.ferx<span class="br">]</span></span></div>';
+
+  function apply() {
+    var dark = document.documentElement.getAttribute('data-bs-theme') === 'dark';
+    document.querySelectorAll('div.sourceCode').forEach(function (el) {
+      if (el.parentElement && el.parentElement.closest('.code-panel')) return;
+      if (dark) {
+        if (!el.classList.contains('code-panel')) {
+          el.classList.add('code-panel');
+          el.insertAdjacentHTML('afterbegin', HEAD);
+        }
+      } else {
+        el.classList.remove('code-panel');
+        var h = el.querySelector(':scope > .panel-head');
+        if (h) h.remove();
+      }
+    });
+  }
+
+  if (document.body) apply();
+  document.addEventListener('DOMContentLoaded', apply);
+  new MutationObserver(function (ms) {
+    ms.forEach(function (m) { if (m.attributeName === 'data-bs-theme') apply(); });
+  }).observe(document.documentElement, { attributes: true });
+}());
+</script>
+<script id="quarto-html-after-body" type="application/javascript">
+  window.document.addEventListener("DOMContentLoaded", function (event) {
+    // Ensure there is a toggle, if there isn't float one in the top right
+    if (window.document.querySelector('.quarto-color-scheme-toggle') === null) {
+      const a = window.document.createElement('a');
+      a.classList.add('top-right');
+      a.classList.add('quarto-color-scheme-toggle');
+      a.href = "";
+      a.onclick = function() { try { window.quartoToggleColorScheme(); } catch {} return false; };
+      const i = window.document.createElement("i");
+      i.classList.add('bi');
+      a.appendChild(i);
+      window.document.body.appendChild(a);
+    }
+    setColorSchemeToggle(hasAlternateSentinel())
+    const icon = "";
+    const anchorJS = new window.AnchorJS();
+    anchorJS.options = {
+      placement: 'right',
+      icon: icon
+    };
+    anchorJS.add('.anchored');
+    const isCodeAnnotation = (el) => {
+      for (const clz of el.classList) {
+        if (clz.startsWith('code-annotation-')) {                     
+          return true;
+        }
+      }
+      return false;
+    }
+    const onCopySuccess = function(e) {
+      // button target
+      const button = e.trigger;
+      // don't keep focus
+      button.blur();
+      // flash "checked"
+      button.classList.add('code-copy-button-checked');
+      var currentTitle = button.getAttribute("title");
+      button.setAttribute("title", "Copied!");
+      let tooltip;
+      if (window.bootstrap) {
+        button.setAttribute("data-bs-toggle", "tooltip");
+        button.setAttribute("data-bs-placement", "left");
+        button.setAttribute("data-bs-title", "Copied!");
+        tooltip = new bootstrap.Tooltip(button, 
+          { trigger: "manual", 
+            customClass: "code-copy-button-tooltip",
+            offset: [0, -8]});
+        tooltip.show();    
+      }
+      setTimeout(function() {
+        if (tooltip) {
+          tooltip.hide();
+          button.removeAttribute("data-bs-title");
+          button.removeAttribute("data-bs-toggle");
+          button.removeAttribute("data-bs-placement");
+        }
+        button.setAttribute("title", currentTitle);
+        button.classList.remove('code-copy-button-checked');
+      }, 1000);
+      // clear code selection
+      e.clearSelection();
+    }
+    const getTextToCopy = function(trigger) {
+      const outerScaffold = trigger.parentElement.cloneNode(true);
+      const codeEl = outerScaffold.querySelector('code');
+      for (const childEl of codeEl.children) {
+        if (isCodeAnnotation(childEl)) {
+          childEl.remove();
+        }
+      }
+      return codeEl.innerText;
+    }
+    const clipboard = new window.ClipboardJS('.code-copy-button:not([data-in-quarto-modal])', {
+      text: getTextToCopy
+    });
+    clipboard.on('success', onCopySuccess);
+    if (window.document.getElementById('quarto-embedded-source-code-modal')) {
+      const clipboardModal = new window.ClipboardJS('.code-copy-button[data-in-quarto-modal]', {
+        text: getTextToCopy,
+        container: window.document.getElementById('quarto-embedded-source-code-modal')
+      });
+      clipboardModal.on('success', onCopySuccess);
+    }
+      var localhostRegex = new RegExp(/^(?:http|https):\/\/localhost\:?[0-9]*\//);
+      var mailtoRegex = new RegExp(/^mailto:/);
+        var filterRegex = new RegExp("https:\/\/ferx-nlme\.github\.io\/ferx-core\/");
+      var isInternal = (href) => {
+          return filterRegex.test(href) || localhostRegex.test(href) || mailtoRegex.test(href);
+      }
+      // Inspect non-navigation links and adorn them if external
+     var links = window.document.querySelectorAll('a[href]:not(.nav-link):not(.navbar-brand):not(.toc-action):not(.sidebar-link):not(.sidebar-item-toggle):not(.pagination-link):not(.no-external):not([aria-hidden]):not(.dropdown-item):not(.quarto-navigation-tool):not(.about-link)');
+      for (var i=0; i<links.length; i++) {
+        const link = links[i];
+        if (!isInternal(link.href)) {
+          // undo the damage that might have been done by quarto-nav.js in the case of
+          // links that we want to consider external
+          if (link.dataset.originalHref !== undefined) {
+            link.href = link.dataset.originalHref;
+          }
+        }
+      }
+    function tippyHover(el, contentFn, onTriggerFn, onUntriggerFn) {
+      const config = {
+        allowHTML: true,
+        maxWidth: 500,
+        delay: 100,
+        arrow: false,
+        appendTo: function(el) {
+            return el.parentElement;
+        },
+        interactive: true,
+        interactiveBorder: 10,
+        theme: 'quarto',
+        placement: 'bottom-start',
+      };
+      if (contentFn) {
+        config.content = contentFn;
+      }
+      if (onTriggerFn) {
+        config.onTrigger = onTriggerFn;
+      }
+      if (onUntriggerFn) {
+        config.onUntrigger = onUntriggerFn;
+      }
+      window.tippy(el, config); 
+    }
+    const noterefs = window.document.querySelectorAll('a[role="doc-noteref"]');
+    for (var i=0; i<noterefs.length; i++) {
+      const ref = noterefs[i];
+      tippyHover(ref, function() {
+        // use id or data attribute instead here
+        let href = ref.getAttribute('data-footnote-href') || ref.getAttribute('href');
+        try { href = new URL(href).hash; } catch {}
+        const id = href.replace(/^#\/?/, "");
+        const note = window.document.getElementById(id);
+        if (note) {
+          return note.innerHTML;
+        } else {
+          return "";
+        }
+      });
+    }
+    const xrefs = window.document.querySelectorAll('a.quarto-xref');
+    const processXRef = (id, note) => {
+      // Strip column container classes
+      const stripColumnClz = (el) => {
+        el.classList.remove("page-full", "page-columns");
+        if (el.children) {
+          for (const child of el.children) {
+            stripColumnClz(child);
+          }
+        }
+      }
+      stripColumnClz(note)
+      if (id === null || id.startsWith('sec-')) {
+        // Special case sections, only their first couple elements
+        const container = document.createElement("div");
+        if (note.children && note.children.length > 2) {
+          container.appendChild(note.children[0].cloneNode(true));
+          for (let i = 1; i < note.children.length; i++) {
+            const child = note.children[i];
+            if (child.tagName === "P" && child.innerText === "") {
+              continue;
+            } else {
+              container.appendChild(child.cloneNode(true));
+              break;
+            }
+          }
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(container);
+          }
+          return container.innerHTML
+        } else {
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(note);
+          }
+          return note.innerHTML;
+        }
+      } else {
+        // Remove any anchor links if they are present
+        const anchorLink = note.querySelector('a.anchorjs-link');
+        if (anchorLink) {
+          anchorLink.remove();
+        }
+        if (window.Quarto?.typesetMath) {
+          window.Quarto.typesetMath(note);
+        }
+        if (note.classList.contains("callout")) {
+          return note.outerHTML;
+        } else {
+          return note.innerHTML;
+        }
+      }
+    }
+    for (var i=0; i<xrefs.length; i++) {
+      const xref = xrefs[i];
+      tippyHover(xref, undefined, function(instance) {
+        instance.disable();
+        let url = xref.getAttribute('href');
+        let hash = undefined; 
+        if (url.startsWith('#')) {
+          hash = url;
+        } else {
+          try { hash = new URL(url).hash; } catch {}
+        }
+        if (hash) {
+          const id = hash.replace(/^#\/?/, "");
+          const note = window.document.getElementById(id);
+          if (note !== null) {
+            try {
+              const html = processXRef(id, note.cloneNode(true));
+              instance.setContent(html);
+            } finally {
+              instance.enable();
+              instance.show();
+            }
+          } else {
+            // See if we can fetch this
+            fetch(url.split('#')[0])
+            .then(res => res.text())
+            .then(html => {
+              const parser = new DOMParser();
+              const htmlDoc = parser.parseFromString(html, "text/html");
+              const note = htmlDoc.getElementById(id);
+              if (note !== null) {
+                const html = processXRef(id, note);
+                instance.setContent(html);
+              } 
+            }).finally(() => {
+              instance.enable();
+              instance.show();
+            });
+          }
+        } else {
+          // See if we can fetch a full url (with no hash to target)
+          // This is a special case and we should probably do some content thinning / targeting
+          fetch(url)
+          .then(res => res.text())
+          .then(html => {
+            const parser = new DOMParser();
+            const htmlDoc = parser.parseFromString(html, "text/html");
+            const note = htmlDoc.querySelector('main.content');
+            if (note !== null) {
+              // This should only happen for chapter cross references
+              // (since there is no id in the URL)
+              // remove the first header
+              if (note.children.length > 0 && note.children[0].tagName === "HEADER") {
+                note.children[0].remove();
+              }
+              const html = processXRef(null, note);
+              instance.setContent(html);
+            } 
+          }).finally(() => {
+            instance.enable();
+            instance.show();
+          });
+        }
+      }, function(instance) {
+      });
+    }
+        let selectedAnnoteEl;
+        const selectorForAnnotation = ( cell, annotation) => {
+          let cellAttr = 'data-code-cell="' + cell + '"';
+          let lineAttr = 'data-code-annotation="' +  annotation + '"';
+          const selector = 'span[' + cellAttr + '][' + lineAttr + ']';
+          return selector;
+        }
+        const selectCodeLines = (annoteEl) => {
+          const doc = window.document;
+          const targetCell = annoteEl.getAttribute("data-target-cell");
+          const targetAnnotation = annoteEl.getAttribute("data-target-annotation");
+          const annoteSpan = window.document.querySelector(selectorForAnnotation(targetCell, targetAnnotation));
+          const lines = annoteSpan.getAttribute("data-code-lines").split(",");
+          const lineIds = lines.map((line) => {
+            return targetCell + "-" + line;
+          })
+          let top = null;
+          let height = null;
+          let parent = null;
+          if (lineIds.length > 0) {
+              //compute the position of the single el (top and bottom and make a div)
+              const el = window.document.getElementById(lineIds[0]);
+              top = el.offsetTop;
+              height = el.offsetHeight;
+              parent = el.parentElement.parentElement;
+            if (lineIds.length > 1) {
+              const lastEl = window.document.getElementById(lineIds[lineIds.length - 1]);
+              const bottom = lastEl.offsetTop + lastEl.offsetHeight;
+              height = bottom - top;
+            }
+            if (top !== null && height !== null && parent !== null) {
+              // cook up a div (if necessary) and position it 
+              let div = window.document.getElementById("code-annotation-line-highlight");
+              if (div === null) {
+                div = window.document.createElement("div");
+                div.setAttribute("id", "code-annotation-line-highlight");
+                div.style.position = 'absolute';
+                parent.appendChild(div);
+              }
+              div.style.top = top - 2 + "px";
+              div.style.height = height + 4 + "px";
+              div.style.left = 0;
+              let gutterDiv = window.document.getElementById("code-annotation-line-highlight-gutter");
+              if (gutterDiv === null) {
+                gutterDiv = window.document.createElement("div");
+                gutterDiv.setAttribute("id", "code-annotation-line-highlight-gutter");
+                gutterDiv.style.position = 'absolute';
+                const codeCell = window.document.getElementById(targetCell);
+                const gutter = codeCell.querySelector('.code-annotation-gutter');
+                gutter.appendChild(gutterDiv);
+              }
+              gutterDiv.style.top = top - 2 + "px";
+              gutterDiv.style.height = height + 4 + "px";
+            }
+            selectedAnnoteEl = annoteEl;
+          }
+        };
+        const unselectCodeLines = () => {
+          const elementsIds = ["code-annotation-line-highlight", "code-annotation-line-highlight-gutter"];
+          elementsIds.forEach((elId) => {
+            const div = window.document.getElementById(elId);
+            if (div) {
+              div.remove();
+            }
+          });
+          selectedAnnoteEl = undefined;
+        };
+          // Handle positioning of the toggle
+      window.addEventListener(
+        "resize",
+        throttle(() => {
+          elRect = undefined;
+          if (selectedAnnoteEl) {
+            selectCodeLines(selectedAnnoteEl);
+          }
+        }, 10)
+      );
+      function throttle(fn, ms) {
+      let throttle = false;
+      let timer;
+        return (...args) => {
+          if(!throttle) { // first call gets through
+              fn.apply(this, args);
+              throttle = true;
+          } else { // all the others get throttled
+              if(timer) clearTimeout(timer); // cancel #2
+              timer = setTimeout(() => {
+                fn.apply(this, args);
+                timer = throttle = false;
+              }, ms);
+          }
+        };
+      }
+        // Attach click handler to the DT
+        const annoteDls = window.document.querySelectorAll('dt[data-target-cell]');
+        for (const annoteDlNode of annoteDls) {
+          annoteDlNode.addEventListener('click', (event) => {
+            const clickedEl = event.target;
+            if (clickedEl !== selectedAnnoteEl) {
+              unselectCodeLines();
+              const activeEl = window.document.querySelector('dt[data-target-cell].code-annotation-active');
+              if (activeEl) {
+                activeEl.classList.remove('code-annotation-active');
+              }
+              selectCodeLines(clickedEl);
+              clickedEl.classList.add('code-annotation-active');
+            } else {
+              // Unselect the line
+              unselectCodeLines();
+              clickedEl.classList.remove('code-annotation-active');
+            }
+          });
+        }
+    const findCites = (el) => {
+      const parentEl = el.parentElement;
+      if (parentEl) {
+        const cites = parentEl.dataset.cites;
+        if (cites) {
+          return {
+            el,
+            cites: cites.split(' ')
+          };
+        } else {
+          return findCites(el.parentElement)
+        }
+      } else {
+        return undefined;
+      }
+    };
+    var bibliorefs = window.document.querySelectorAll('a[role="doc-biblioref"]');
+    for (var i=0; i<bibliorefs.length; i++) {
+      const ref = bibliorefs[i];
+      const citeInfo = findCites(ref);
+      if (citeInfo) {
+        tippyHover(citeInfo.el, function() {
+          var popup = window.document.createElement('div');
+          citeInfo.cites.forEach(function(cite) {
+            var citeDiv = window.document.createElement('div');
+            citeDiv.classList.add('hanging-indent');
+            citeDiv.classList.add('csl-entry');
+            var biblioDiv = window.document.getElementById('ref-' + cite);
+            if (biblioDiv) {
+              citeDiv.innerHTML = biblioDiv.innerHTML;
+            }
+            popup.appendChild(citeDiv);
+          });
+          return popup.innerHTML;
+        });
+      }
+    }
+  });
+  </script>
+</div> <!-- /content -->
+<footer class="footer">
+  <div class="nav-footer">
+    <div class="nav-footer-left">
+<p>© 2026 FeRx-NLME · MIT licensed</p>
+</div>   
+    <div class="nav-footer-center">
+      &nbsp;
+    <div class="toc-actions d-sm-block d-md-none"><ul><li><a href="https://github.com/FeRx-NLME/ferx-core/edit/main/model-file/adaptive-dosing.qmd" class="toc-action"><i class="bi bi-github"></i>Edit this page</a></li><li><a href="https://github.com/FeRx-NLME/ferx-core/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></div>
+    <div class="nav-footer-right">
+<p>Fe · 26 · Rx · 2026</p>
+</div>
+  </div>
+</footer>
+
+
+
+
+</body></html>

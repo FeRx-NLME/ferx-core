@@ -1,0 +1,2168 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en"><head>
+
+<meta charset="utf-8">
+<meta name="generator" content="quarto-1.10.18">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+
+<meta name="description" content="Fit parametric, censored, competing-risk, repeated-event, and joint PK time-to-event models with FOCEI or SAEM in ferx.">
+
+<title>Time-to-event models in ferx – ferx-core</title>
+<style>
+/* Default styles provided by pandoc.
+** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+*/
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: 1.5em;}
+div.column{flex: auto;}
+@media screen {
+div.columns{gap: min(4vw, 1.5em);}
+div.column{overflow-x: auto;}
+}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+  width: 0.8em;
+  margin: 0 0.8em 0.2em -1em; /* quarto-specific, see https://github.com/quarto-dev/quarto-cli/issues/4556 */ 
+  vertical-align: middle;
+}
+/* CSS for syntax highlighting */
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+  { counter-reset: source-line 0; }
+pre.numberSource code > span
+  { position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+  { content: counter(source-line);
+    position: relative; left: -1em; text-align: right; vertical-align: baseline;
+    border: none; display: inline-block;
+    -webkit-touch-callout: none; -webkit-user-select: none;
+    -khtml-user-select: none; -moz-user-select: none;
+    -ms-user-select: none; user-select: none;
+    padding: 0 4px; width: 4em;
+  }
+pre.numberSource { margin-left: 3em;  padding-left: 4px; }
+div.sourceCode
+  {   }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+</style>
+
+
+<script src="../site_libs/quarto-nav/quarto-nav.js"></script>
+<script src="../site_libs/quarto-nav/headroom.min.js"></script>
+<script src="../site_libs/clipboard/clipboard.min.js"></script>
+<script src="../site_libs/quarto-search/autocomplete.umd.js"></script>
+<script src="../site_libs/quarto-search/fuse.min.js"></script>
+<script src="../site_libs/quarto-search/quarto-search.js"></script>
+<meta name="quarto:offset" content="../">
+<link href="../assets/ferx-favicon.svg" rel="icon" type="image/svg+xml">
+<script src="../site_libs/quarto-html/quarto.js" type="module"></script>
+<script src="../site_libs/quarto-html/tabsets/tabsets.js" type="module"></script>
+<script src="../site_libs/quarto-html/popper.min.js"></script>
+<script src="../site_libs/quarto-html/tippy.umd.min.js"></script>
+<script src="../site_libs/quarto-html/anchor.min.js"></script>
+<link href="../site_libs/quarto-html/tippy.css" rel="stylesheet">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-51776f957f81c5a6b38322b65a6a6987.css" rel="stylesheet" class="quarto-color-scheme" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-dark-31632d092df9090a2ed68f79c078059d.css" rel="stylesheet" class="quarto-color-scheme quarto-color-alternate" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-51776f957f81c5a6b38322b65a6a6987.css" rel="stylesheet" class="quarto-color-scheme-extra" id="quarto-text-highlighting-styles">
+<script src="../site_libs/bootstrap/bootstrap.min.js"></script>
+<link href="../site_libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
+<link href="../site_libs/bootstrap/bootstrap-f5ed25dbf962e4596f9f4df24f2ade0d.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme" id="quarto-bootstrap" data-mode="light">
+<link href="../site_libs/bootstrap/bootstrap-dark-8a64b8d4793081e9872239f556c8075c.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme quarto-color-alternate" id="quarto-bootstrap" data-mode="dark">
+<link href="../site_libs/bootstrap/bootstrap-f5ed25dbf962e4596f9f4df24f2ade0d.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme-extra" id="quarto-bootstrap" data-mode="light">
+<script id="quarto-search-options" type="application/json">{
+  "location": "navbar",
+  "copy-button": false,
+  "collapse-after": 3,
+  "panel-placement": "end",
+  "type": "overlay",
+  "limit": 50,
+  "keyboard-shortcut": [
+    "f",
+    "/",
+    "s"
+  ],
+  "show-item-context": false,
+  "language": {
+    "search-no-results-text": "No results",
+    "search-matching-documents-text": "matching documents",
+    "search-copy-link-title": "Copy link to search",
+    "search-hide-matches-text": "Hide additional matches",
+    "search-more-match-text": "more match in this document",
+    "search-more-matches-text": "more matches in this document",
+    "search-clear-button-title": "Clear",
+    "search-text-placeholder": "",
+    "search-detached-cancel-button-title": "Cancel",
+    "search-submit-button-title": "Submit",
+    "search-label": "Search"
+  }
+}</script>
+
+
+<link rel="stylesheet" href="../styles.css">
+<meta property="og:title" content="Time-to-event models in ferx">
+<meta property="og:site_name" content="ferx-core">
+<meta property="og:locale" content="en_US">
+<meta name="twitter:title" content="Time-to-event models in ferx">
+<meta name="twitter:card" content="summary">
+<link rel="canonical" href="https://ferx-nlme.github.io/ferx-core/estimation/tte.html">
+</head>
+
+<body class="nav-sidebar floating nav-fixed quarto-light"><script id="quarto-html-before-body" type="application/javascript">
+    const toggleBodyColorMode = (bsSheetEl) => {
+      const mode = bsSheetEl.getAttribute("data-mode");
+      const bodyEl = window.document.querySelector("body");
+      if (mode === "dark") {
+        bodyEl.classList.add("quarto-dark");
+        bodyEl.classList.remove("quarto-light");
+      } else {
+        bodyEl.classList.add("quarto-light");
+        bodyEl.classList.remove("quarto-dark");
+      }
+    }
+    const toggleBodyColorPrimary = () => {
+      const bsSheetEl = window.document.querySelector("link#quarto-bootstrap:not([rel=disabled-stylesheet])");
+      if (bsSheetEl) {
+        toggleBodyColorMode(bsSheetEl);
+      }
+    }
+    const setColorSchemeToggle = (alternate) => {
+      const toggles = window.document.querySelectorAll('.quarto-color-scheme-toggle');
+      for (let i=0; i < toggles.length; i++) {
+        const toggle = toggles[i];
+        if (toggle) {
+          if (alternate) {
+            toggle.classList.add("alternate");
+          } else {
+            toggle.classList.remove("alternate");
+          }
+        }
+      }
+    };
+    const toggleColorMode = (alternate) => {
+      // Switch the stylesheets
+      const primaryStylesheets = window.document.querySelectorAll('link.quarto-color-scheme:not(.quarto-color-alternate)');
+      const alternateStylesheets = window.document.querySelectorAll('link.quarto-color-scheme.quarto-color-alternate');
+      manageTransitions('#quarto-margin-sidebar .nav-link', false);
+      if (alternate) {
+        // note: dark is layered on light, we don't disable primary!
+        enableStylesheet(alternateStylesheets);
+        for (const sheetNode of alternateStylesheets) {
+          if (sheetNode.id === "quarto-bootstrap") {
+            toggleBodyColorMode(sheetNode);
+          }
+        }
+      } else {
+        disableStylesheet(alternateStylesheets);
+        enableStylesheet(primaryStylesheets)
+        toggleBodyColorPrimary();
+      }
+      manageTransitions('#quarto-margin-sidebar .nav-link', true);
+      // Switch the toggles
+      setColorSchemeToggle(alternate)
+      // Hack to workaround the fact that safari doesn't
+      // properly recolor the scrollbar when toggling (#1455)
+      if (navigator.userAgent.indexOf('Safari') > 0 && navigator.userAgent.indexOf('Chrome') == -1) {
+        manageTransitions("body", false);
+        window.scrollTo(0, 1);
+        setTimeout(() => {
+          window.scrollTo(0, 0);
+          manageTransitions("body", true);
+        }, 40);
+      }
+    }
+    const disableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        stylesheet.rel = 'disabled-stylesheet';
+      }
+    }
+    const enableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        if(stylesheet.rel !== 'stylesheet') { // for Chrome, which will still FOUC without this check
+          stylesheet.rel = 'stylesheet';
+        }
+      }
+    }
+    const manageTransitions = (selector, allowTransitions) => {
+      const els = window.document.querySelectorAll(selector);
+      for (let i=0; i < els.length; i++) {
+        const el = els[i];
+        if (allowTransitions) {
+          el.classList.remove('notransition');
+        } else {
+          el.classList.add('notransition');
+        }
+      }
+    }
+    const isFileUrl = () => {
+      return window.location.protocol === 'file:';
+    }
+    const hasAlternateSentinel = () => {
+      let styleSentinel = getColorSchemeSentinel();
+      if (styleSentinel !== null) {
+        return styleSentinel === "alternate";
+      } else {
+        return false;
+      }
+    }
+    const setStyleSentinel = (alternate) => {
+      const value = alternate ? "alternate" : "default";
+      if (!isFileUrl()) {
+        window.localStorage.setItem("quarto-color-scheme", value);
+      } else {
+        localAlternateSentinel = value;
+      }
+    }
+    const getColorSchemeSentinel = () => {
+      if (!isFileUrl()) {
+        const storageValue = window.localStorage.getItem("quarto-color-scheme");
+        return storageValue != null ? storageValue : localAlternateSentinel;
+      } else {
+        return localAlternateSentinel;
+      }
+    }
+    const toggleGiscusIfUsed = (isAlternate, darkModeDefault) => {
+      const baseTheme = document.querySelector('#giscus-base-theme')?.value ?? 'light';
+      const alternateTheme = document.querySelector('#giscus-alt-theme')?.value ?? 'dark';
+      let newTheme = '';
+      if(authorPrefersDark) {
+        newTheme = isAlternate ? baseTheme : alternateTheme;
+      } else {
+        newTheme = isAlternate ? alternateTheme : baseTheme;
+      }
+      const changeGiscusTheme = () => {
+        // From: https://github.com/giscus/giscus/issues/336
+        const sendMessage = (message) => {
+          const iframe = document.querySelector('iframe.giscus-frame');
+          if (!iframe) return;
+          iframe.contentWindow.postMessage({ giscus: message }, 'https://giscus.app');
+        }
+        sendMessage({
+          setConfig: {
+            theme: newTheme
+          }
+        });
+      }
+      const isGiscussLoaded = window.document.querySelector('iframe.giscus-frame') !== null;
+      if (isGiscussLoaded) {
+        changeGiscusTheme();
+      }
+    };
+    const authorPrefersDark = false;
+    const darkModeDefault = authorPrefersDark;
+      document.querySelector('link#quarto-text-highlighting-styles.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+      document.querySelector('link#quarto-bootstrap.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+    let localAlternateSentinel = darkModeDefault ? 'alternate' : 'default';
+    // Dark / light mode switch
+    window.quartoToggleColorScheme = () => {
+      // Read the current dark / light value
+      let toAlternate = !hasAlternateSentinel();
+      toggleColorMode(toAlternate);
+      setStyleSentinel(toAlternate);
+      toggleGiscusIfUsed(toAlternate, darkModeDefault);
+      window.dispatchEvent(new Event('resize'));
+    };
+    // Switch to dark mode if need be
+    if (hasAlternateSentinel()) {
+      toggleColorMode(true);
+    } else {
+      toggleColorMode(false);
+    }
+  </script>
+
+<div id="quarto-search-results"></div>
+  <header id="quarto-header" class="headroom fixed-top">
+    <nav class="navbar navbar-expand-lg " data-bs-theme="dark">
+      <div class="navbar-container container-fluid">
+      <div class="navbar-brand-container mx-auto">
+    <a href="../index.html" class="navbar-brand navbar-brand-logo">
+    <img src="../assets/ferx-dsl-brackets.svg" alt="ferx" class="navbar-logo light-content">
+    <img src="../assets/ferx-dsl-brackets.svg" alt="ferx" class="navbar-logo dark-content">
+    </a>
+    <a class="navbar-brand" href="../index.html">
+    <span class="navbar-title">ferx-core</span>
+    </a>
+  </div>
+            <div id="quarto-search" class="" title="Search"></div>
+          <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarCollapse" aria-controls="navbarCollapse" role="menu" aria-expanded="false" aria-label="Toggle navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+  <span class="navbar-toggler-icon"></span>
+</button>
+          <div class="collapse navbar-collapse" id="navbarCollapse">
+            <ul class="navbar-nav navbar-nav-scroll me-auto">
+  <li class="nav-item">
+    <a class="nav-link active" href="../getting-started.html" aria-current="page"> 
+<span class="menu-text">Get started</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/features.html"> 
+<span class="menu-text">Features</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/changelog.html"> 
+<span class="menu-text">Changelog</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/roadmap.html"> 
+<span class="menu-text">Roadmap</span></a>
+  </li>  
+</ul>
+            <ul class="navbar-nav navbar-nav-scroll ms-auto">
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/ferx-core/"> 
+<span class="menu-text">ferx-core</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/ferx-book/"> 
+<span class="menu-text">ferx-r</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/reference/"> 
+<span class="menu-text">Reference</span></a>
+  </li>  
+  <li class="nav-item compact">
+    <a class="nav-link" href="https://github.com/FeRx-NLME"> <i class="bi bi-github" role="img" aria-label="GitHub">
+</i> 
+<span class="menu-text"></span></a>
+  </li>  
+</ul>
+          </div> <!-- /navcollapse -->
+            <div class="quarto-navbar-tools">
+  <a href="" class="quarto-color-scheme-toggle quarto-navigation-tool  px-1" onclick="window.quartoToggleColorScheme(); return false;" title="Toggle dark mode"><i class="bi"></i></a>
+</div>
+      </div> <!-- /container-fluid -->
+    </nav>
+  <nav class="quarto-secondary-nav">
+    <div class="container-fluid d-flex">
+      <button type="button" class="quarto-btn-toggle btn" data-bs-toggle="collapse" role="button" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+        <i class="bi bi-layout-text-sidebar-reverse"></i>
+      </button>
+        <nav class="quarto-page-breadcrumbs" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../estimation/index.html">Estimation Methods</a></li><li class="breadcrumb-item"><a href="../estimation/tte.html">Time-to-Event (TTE) Models</a></li></ol></nav>
+        <a class="flex-grow-1" role="navigation" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">      
+        </a>
+      <button type="button" class="btn quarto-search-button" aria-label="Search" onclick="window.quartoOpenSearch();">
+        <i class="bi bi-search"></i>
+      </button>
+    </div>
+  </nav>
+</header>
+<!-- content -->
+<div id="quarto-content" class="quarto-container page-columns page-rows-contents page-layout-article page-navbar">
+<!-- sidebar -->
+  <nav id="quarto-sidebar" class="sidebar collapse collapse-horizontal quarto-sidebar-collapse-item sidebar-navigation floating overflow-auto">
+    <div class="pt-lg-2 mt-2 text-left sidebar-header">
+      <a href="../index.html" class="sidebar-logo-link">
+      <img src="../assets/ferx-favicon.svg" alt="" class="sidebar-logo light-content py-0 d-lg-inline d-none">
+      <img src="../assets/ferx-favicon.svg" alt="" class="sidebar-logo dark-content py-0 d-lg-inline d-none">
+      </a>
+      </div>
+        <div class="mt-2 flex-shrink-0 align-items-center">
+        <div class="sidebar-search">
+        <div id="quarto-search" class="" title="Search"></div>
+        </div>
+        </div>
+    <div class="sidebar-menu-container"> 
+    <ul class="list-unstyled mt-1">
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Introduction</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../maturity.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Feature Maturity</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../getting-started.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Getting Started</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../installation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Installation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../quick-start.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Quick Start</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../model-file/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Model File Reference</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/parameters.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Parameters</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/iov.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Inter-Occasion Variability (IOV)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/individual-parameters.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Individual Parameters</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariates.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariates</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariate-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/structural-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Structural Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/lagtime.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Lagtime</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/steady-state.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Steady-State Doses (SS=1)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/error-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Error Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/bloq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">LOQ-Censored Observations</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/ode-models.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/absorption.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Built-in Absorption Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/scaling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Scaling</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/initial-conditions.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Initial Conditions</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/diffusion.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Stochastic Differential Equations (SDE / Diffusion)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/neural-networks.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Neural Networks</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariate-nn.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><code>[covariate_nn]</code> — Deep Compartment Models (DCM)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/data.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/data-selection.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Selection</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/derived.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Derived Columns (<code>[derived]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Output Columns (<code>[output]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/fit-options.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Fit Options</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/simulation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Simulation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/adaptive-dosing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Adaptive (Feedback) Dosing</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/event-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Time-to-Event Endpoints (<code>[event_model]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/categorical.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Categorical endpoints — <code>[binary_model]</code></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/markov-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Markov models ([markov_model])</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../estimation/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Estimation Methods</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/foce.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FOCE / FOCEI</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/agq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">AGQ — Adaptive Gaussian Quadrature</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/gauss-newton.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Gauss-Newton (BHHH)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/saem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">SAEM</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/sir.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Sampling Importance Resampling (SIR)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/importance-sampling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Importance Sampling (IMP)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/frem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FREM (Full Random Effects Model)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/impmap.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">IMPMAP — Importance Sampling assisted by Mode A Posteriori</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/bayes.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Bayesian estimation (MCMC)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/vi.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Variational Inference</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/parameterization.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Packed Parameter Space</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/optimizers.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Outer Optimizers</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/tte.html" class="sidebar-item-text sidebar-link active">
+ <span class="menu-text">Time-to-Event (TTE) Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/categorical.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Categorical endpoints (binary / logistic)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/ctmm.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Continuous-time Markov models (CTMM)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/mixture.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Mixture Models</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false">
+ <span class="menu-text">Tools</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/bootstrap.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Bootstrap</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/gam-screening.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">GAM covariate screening</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/search.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Search configuration</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/covsearch.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate search</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/modelsearch.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Structural model search</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../data-format.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Format</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../cli.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">CLI Reference</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Output Files</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../warnings.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Warnings</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../file-formats/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">File Formats</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../file-formats/fitrx.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">The <code>.fitrx</code> Fit Bundle</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../file-formats/check-report.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Check Report (<code>ferx check --json</code>)</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../examples/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Examples</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/one-cpt-oral.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">One-Compartment Oral (Warfarin)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/two-cpt-iv.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Two-Compartment IV Bolus</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/covariates.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/ode-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Model (Michaelis-Menten)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/bloq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">BLOQ (M3 method)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/iov.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Inter-Occasion Variability (IOV)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/iov-saem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">IOV with SAEM</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/multiple-dosing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Multiple Dosing (ADDL Column)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/steady-state.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Steady-State Dosing (SS Column)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/scaling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Unit Scaling (<code>[scaling]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/derived-output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Derived Columns and Output</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/data-selection.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Selection (IGNORE / ACCEPT)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/ode-lagtime.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Model with Absorption Lag Time</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/transit-absorption.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Transit Absorption (Two-Compartment)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/sde.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Stochastic Differential Equations (SDE)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/frem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FREM (Covariate Analysis)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/multistart.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Multi-Start: Michaelis-Menten Elimination</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../api/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Rust API</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/types.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Core Types</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/fitting.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Fitting Functions</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/simulation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Simulation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/parsing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Parsing</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/model-editing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Model editing</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../faq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FAQ</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../development/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Development</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/contributing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Contributing to FeRx development</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/sdlc.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Development Lifecycle (SDLC)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/docs-lint.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Docs linter</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+    </ul>
+    </div>
+</nav>
+<div id="quarto-sidebar-glass" class="quarto-sidebar-collapse-item" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item"></div>
+<!-- margin-sidebar -->
+    <div id="quarto-margin-sidebar" class="sidebar margin-sidebar">
+        <nav id="TOC" role="doc-toc" class="toc-active">
+    <h2 id="toc-title">On this page</h2>
+   
+  <ul>
+  <li><a href="#time-to-event-tte-models" id="toc-time-to-event-tte-models" class="nav-link active" data-scroll-target="#time-to-event-tte-models">Time-to-Event (TTE) Models</a>
+  <ul>
+  <li><a href="#overview" id="toc-overview" class="nav-link" data-scroll-target="#overview">Overview</a></li>
+  <li><a href="#model-file-syntax" id="toc-model-file-syntax" class="nav-link" data-scroll-target="#model-file-syntax">Model file syntax</a>
+  <ul class="collapse">
+  <li><a href="#structural_model-and-error_model-requirement" id="toc-structural_model-and-error_model-requirement" class="nav-link" data-scroll-target="#structural_model-and-error_model-requirement"><code>[structural_model]</code> and <code>[error_model]</code> requirement</a></li>
+  </ul></li>
+  <li><a href="#data-format" id="toc-data-format" class="nav-link" data-scroll-target="#data-format">Data format</a>
+  <ul class="collapse">
+  <li><a href="#left-truncation-delayed-entry" id="toc-left-truncation-delayed-entry" class="nav-link" data-scroll-target="#left-truncation-delayed-entry">Left truncation (delayed entry)</a></li>
+  </ul></li>
+  <li><a href="#hazard-families" id="toc-hazard-families" class="nav-link" data-scroll-target="#hazard-families">Hazard families</a></li>
+  <li><a href="#estimation" id="toc-estimation" class="nav-link" data-scroll-target="#estimation">Estimation</a></li>
+  <li><a href="#joint-pk-tte" id="toc-joint-pk-tte" class="nav-link" data-scroll-target="#joint-pk-tte">Joint PK-TTE</a>
+  <ul class="collapse">
+  <li><a href="#time-dependent-hazard" id="toc-time-dependent-hazard" class="nav-link" data-scroll-target="#time-dependent-hazard">A time-dependent hazard keeps the single shared solve</a></li>
+  <li><a href="#simulating-drug-driven-event-times" id="toc-simulating-drug-driven-event-times" class="nav-link" data-scroll-target="#simulating-drug-driven-event-times">Simulating drug-driven event times</a></li>
+  </ul></li>
+  <li><a href="#competing-risks-cause-specific-hazards" id="toc-competing-risks-cause-specific-hazards" class="nav-link" data-scroll-target="#competing-risks-cause-specific-hazards">Competing risks (cause-specific hazards)</a></li>
+  <li><a href="#rtte" id="toc-rtte" class="nav-link" data-scroll-target="#rtte">Repeated events (RTTE)</a>
+  <ul class="collapse">
+  <li><a href="#validation-constant-hazard-rtte" id="toc-validation-constant-hazard-rtte" class="nav-link" data-scroll-target="#validation-constant-hazard-rtte">Validation — constant-hazard RTTE</a></li>
+  <li><a href="#simulating-repeated-events" id="toc-simulating-repeated-events" class="nav-link" data-scroll-target="#simulating-repeated-events">Simulating repeated events</a></li>
+  </ul></li>
+  <li><a href="#comparison-with-reference-software" id="toc-comparison-with-reference-software" class="nav-link" data-scroll-target="#comparison-with-reference-software">Comparison with reference software</a>
+  <ul class="collapse">
+  <li><a href="#nlmixr2-equivalent" id="toc-nlmixr2-equivalent" class="nav-link" data-scroll-target="#nlmixr2-equivalent">nlmixr2 equivalent</a></li>
+  <li><a href="#nonmem-equivalent" id="toc-nonmem-equivalent" class="nav-link" data-scroll-target="#nonmem-equivalent">NONMEM equivalent</a></li>
+  <li><a href="#weibull-and-gompertz" id="toc-weibull-and-gompertz" class="nav-link" data-scroll-target="#weibull-and-gompertz">Weibull and Gompertz</a></li>
+  <li><a href="#joint-pk-tte-fit-and-simulation" id="toc-joint-pk-tte-fit-and-simulation" class="nav-link" data-scroll-target="#joint-pk-tte-fit-and-simulation">Joint PK-TTE — fit and simulation</a></li>
+  </ul></li>
+  <li><a href="#see-also" id="toc-see-also" class="nav-link" data-scroll-target="#see-also">See also</a></li>
+  </ul></li>
+  </ul>
+<div class="toc-actions"><ul><li><a href="https://github.com/FeRx-NLME/ferx-core/edit/main/estimation/tte.qmd" class="toc-action"><i class="bi bi-github"></i>Edit this page</a></li><li><a href="https://github.com/FeRx-NLME/ferx-core/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></nav>
+    </div>
+<!-- main -->
+<main class="content" id="quarto-document-content"><header id="title-block-header" class="quarto-title-block"><nav class="quarto-page-breadcrumbs quarto-title-breadcrumbs d-none d-lg-block" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../estimation/index.html">Estimation Methods</a></li><li class="breadcrumb-item"><a href="../estimation/tte.html">Time-to-Event (TTE) Models</a></li></ol></nav></header>
+
+
+
+
+
+<section id="time-to-event-tte-models" class="level1">
+<h1>Time-to-Event (TTE) Models</h1>
+<blockquote class="blockquote">
+<p><strong>Maturity: beta</strong> — see <a href="../maturity.html">Feature Maturity</a> for what this means.</p>
+</blockquote>
+<blockquote class="blockquote">
+<p><strong>Phase 1 (current):</strong> Parametric TTE with exponential, Weibull, and Gompertz hazard families; right-censored, exact, and interval-censored observations; left truncation via <code>TENTRY</code>; FOCEI and SAEM estimation; fixed-effects (<code>n_eta = 0</code>) and random-effects paths. <code>[structural_model]</code>, <code>[error_model]</code>, and <code>[individual_parameters]</code> are all optional for TTE-only models.</p>
+</blockquote>
+<section id="overview" class="level2">
+<h2 class="anchored" data-anchor-id="overview">Overview</h2>
+<p>TTE models describe the probability distribution of the time until a clinical event (e.g.&nbsp;first adverse event, study dropout, disease progression). ferx uses the same FOCEI Laplace objective as for continuous PK/PD data, extended to the per-subject log-likelihood contribution</p>
+<pre><code>ℓᵢ = δᵢ · log h(Tᵢ) − H(Tᵢ)</code></pre>
+<p>where δᵢ is the event indicator, h(t) the hazard function, and H(t) = ∫₀ᵗ h(s) ds the cumulative hazard.</p>
+</section>
+<section id="model-file-syntax" class="level2">
+<h2 class="anchored" data-anchor-id="model-file-syntax">Model file syntax</h2>
+<p>Add one <code>[event_model]</code> block per TTE endpoint.</p>
+<pre><code>[event_model]
+  cmt    = 2                        # data-file CMT value that carries TTE rows
+  family = exponential              # exponential | weibull | gompertz
+  scale  = TVLAMBDA * exp(ETA_LAMBDA)  # theta/eta/covariate expression</code></pre>
+<blockquote class="blockquote">
+<p><strong>Note:</strong> <code>[event_model]</code> parameter expressions are evaluated in the theta / eta / covariate namespace, and may also reference names defined in <code>[individual_parameters]</code> (e.g.&nbsp;<code>LAMBDA</code>); those are resolved per subject at evaluation time. Writing the full expression in terms of <code>theta</code> and <code>eta</code> names directly also works. A hazard may <strong>not</strong> depend on an inter-occasion (IOV/kappa) random effect — whether by referencing an <code>[individual_parameters]</code> value that uses one, or by naming a <code>kappa</code> directly in the hazard expression — because it is evaluated once per subject, with no occasion context; either is rejected with an error.</p>
+</blockquote>
+<p>For Weibull, a <code>shape</code> parameter is also required:</p>
+<pre><code>[event_model]
+  cmt    = 2
+  family = weibull
+  scale  = TVSCALE * exp(ETA_SCALE)
+  shape  = TVSHAPE</code></pre>
+<p>Gompertz uses <code>alpha</code> (baseline hazard) and <code>gamma</code> (growth rate):</p>
+<pre><code>[event_model]
+  cmt    = 2
+  family = gompertz
+  alpha  = TVALPHA
+  gamma  = TVGAMMA</code></pre>
+<p>Multiple TTE endpoints are supported by repeating the block with unique names:</p>
+<pre><code>[event_model DROPOUT]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA_DROPOUT * exp(ETA_LAMBDA)
+
+[event_model DEATH]
+  cmt    = 3
+  family = weibull
+  scale  = TVSCALE_DEATH
+  shape  = TVSHAPE_DEATH</code></pre>
+<section id="structural_model-and-error_model-requirement" class="level3">
+<h3 class="anchored" data-anchor-id="structural_model-and-error_model-requirement"><code>[structural_model]</code> and <code>[error_model]</code> requirement</h3>
+<p>The parser currently requires both blocks even for TTE-only models. Include a dummy 1-cpt block with fixed parameters:</p>
+<pre><code>[parameters]
+  theta TVLAMBDA(0.05, 0.001, 10.0)
+  theta DUMMY_CL(1.0, FIX)
+  theta DUMMY_V(1.0, FIX)
+  omega ETA_LAMBDA ~ 0.09
+  sigma SIGMA_DV ~ 0.01 FIX
+
+[individual_parameters]
+  LAMBDA = TVLAMBDA * exp(ETA_LAMBDA)
+  CL     = DUMMY_CL
+  V      = DUMMY_V
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)     # inert: no CMT-1 observations in TTE-only data
+
+[error_model]
+  DV ~ additive(SIGMA_DV)       # inert: sigma carries zero gradient
+
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA * exp(ETA_LAMBDA)  # theta/eta directly, or an [individual_parameters] name</code></pre>
+<p>This <code>[structural_model]</code> / <code>[error_model]</code> requirement will be lifted in a future release. (The separate <code>[individual_parameters]</code>-namespace restriction noted above has already been lifted — hazard expressions may reference individual parameters.)</p>
+</section>
+</section>
+<section id="data-format" class="level2">
+<h2 class="anchored" data-anchor-id="data-format">Data format</h2>
+<p>TTE rows follow the NONMEM observation convention with <code>EVID=0</code> and a CMT that matches the <code>cmt =</code> declaration in <code>[event_model]</code>:</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 13%">
+<col style="width: 86%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>DV</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>0</code></td>
+<td>Right-censored (survived past T)</td>
+</tr>
+<tr class="even">
+<td><code>1</code></td>
+<td>Exact event at T</td>
+</tr>
+<tr class="odd">
+<td><code>2</code></td>
+<td>Interval-censored: right bound (pair with preceding DV=0 row for same CMT)</td>
+</tr>
+</tbody>
+</table>
+<p>For interval-censored observations, precede the DV=2 row with a DV=0 row carrying the left bound (entry into the at-risk window):</p>
+<pre><code>ID,TIME,DV,EVID,CMT
+1, 5.0, 0, 0, 2   # left bound of interval (entry)
+1,10.0, 2, 0, 2   # right bound  →  event occurred in (5, 10]</code></pre>
+<p><strong>Loading the data.</strong> The event rows are recognised <em>by the model</em>: read the dataset with <code>read_population_for(&amp;model, …)</code> (the R entry points and the CLI do), not with the model-blind <code>read_nonmem_csv()</code>. A population read without the model carries the event rows as Gaussian observations and no event records, and <code>fit()</code> refuses it with <code>E_ENDPOINT_UNROUTED</code>; a dataset whose event CMT has no rows at all — usually a missing <code>CMT</code> column — is refused with <code>E_ENDPOINT_NO_RECORDS</code>. See the <a href="../file-formats/check-report.html#codes-data-and-dosing">check report codes</a>.</p>
+<section id="left-truncation-delayed-entry" class="level3">
+<h3 class="anchored" data-anchor-id="left-truncation-delayed-entry">Left truncation (delayed entry)</h3>
+<p>If subjects enter the study at a time &gt; 0 (e.g.&nbsp;they survived until enrolment), add a <code>TENTRY</code> column. ferx computes</p>
+<pre><code>H_eff(T) = H(T) − H(TENTRY)</code></pre>
+<p>conditioning the likelihood on survival past the entry time:</p>
+<pre><code>ID,TIME,DV,EVID,CMT,TENTRY
+1,18.3, 1, 0, 2, 5.0   # subject entered at t=5, event at t=18.3
+2,30.0, 0, 0, 2, 5.0   # entered at t=5, censored at t=30</code></pre>
+</section>
+</section>
+<section id="hazard-families" class="level2">
+<h2 class="anchored" data-anchor-id="hazard-families">Hazard families</h2>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 25%">
+<col style="width: 35%">
+<col style="width: 19%">
+<col style="width: 19%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Family</th>
+<th>Parameters</th>
+<th>h(t)</th>
+<th>H(t)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>exponential</code></td>
+<td><code>scale</code> = λ</td>
+<td>λ · exp(loghr)</td>
+<td>λ · exp(loghr) · t</td>
+</tr>
+<tr class="even">
+<td><code>weibull</code></td>
+<td><code>scale</code> = α, <code>shape</code> = γ</td>
+<td>(γ/α)(t/α)^(γ−1) · exp(loghr)</td>
+<td>(t/α)^γ · exp(loghr)</td>
+</tr>
+<tr class="odd">
+<td><code>gompertz</code></td>
+<td><code>alpha</code> = α, <code>gamma</code> = γ</td>
+<td>α · exp(γ·t) · exp(loghr)</td>
+<td>(α/γ)(exp(γ·t) − 1) · exp(loghr)</td>
+</tr>
+</tbody>
+</table>
+<p>All parameters must be positive. The optional <code>loghr</code> key adds a proportional-hazards covariate term: the entire hazard (and cumulative hazard) is multiplied by <code>exp(loghr)</code>. When <code>loghr</code> is omitted it defaults to 0 (no effect).</p>
+<pre><code># Exponential with PH covariate on sex (SEX=1 reference):
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA * exp(ETA_LAMBDA)
+  loghr  = BETA_SEX * SEX
+
+# Weibull with PH covariate on weight:
+[event_model]
+  cmt    = 2
+  family = weibull
+  scale  = TVSCALE * exp(ETA_SCALE)
+  shape  = TVSHAPE
+  loghr  = BETA_WT * WT</code></pre>
+<blockquote class="blockquote">
+<p><strong>Covariates on a hazard must be constant within each subject.</strong> Time-varying covariates on a hazard are not yet supported. A covariate referenced by a hazard — in <code>scale</code> / <code>shape</code> / <code>alpha</code> / <code>gamma</code> / <code>loghr</code>, or in a drug-driven <code>hazard =</code> expression — would otherwise be read at its baseline value (the analytic hazard families take no time argument, and the joint PK-TTE ODE hazard integrates with the PK parameters frozen at <code>t = 0</code>), silently fitting the wrong hazard. <code>fit()</code> therefore rejects such a model up front (and <code>predict()</code> / <code>simulate()</code> error), naming the covariate and the subject (#741). A time-varying covariate used only elsewhere — e.g.&nbsp;on the PK parameters of a joint model whose hazard does not reference it — is unaffected.</p>
+</blockquote>
+</section>
+<section id="estimation" class="level2">
+<h2 class="anchored" data-anchor-id="estimation">Estimation</h2>
+<p>The FOCEI Laplace objective includes a TTE-specific FD Hessian contribution:</p>
+<pre><code>OFV = −2 · Σᵢ [ ℓᵢ(η̂ᵢ) − ½ log |Ω⁻¹ + ∇²ℓᵢ(η̂ᵢ)| ]</code></pre>
+<p>where <code>∇²ℓᵢ</code> is computed via a 4-point central-difference finite-difference stencil (Shi 2021 step-size selection).</p>
+<p>Set <code>method = focei</code> in <code>[fit_options]</code>. The <code>gradient = fd</code> setting is the default and the only supported path for TTE objectives.</p>
+</section>
+<section id="joint-pk-tte" class="level2">
+<h2 class="anchored" data-anchor-id="joint-pk-tte">Joint PK-TTE</h2>
+<p>When the hazard depends on drug exposure, write it as an expression over the PK state instead of a closed-form <code>family</code>. On an ODE model, the <code>hazard</code> key in <code>[event_model]</code> is accumulated as an extra ODE compartment and estimated <strong>jointly</strong> with the PK, with shared random effects:</p>
+<pre><code>[parameters]
+  theta TVCL(1.0, 0.01, 100); theta TVV(10, 0.1, 500); theta TVKA(1, 0.01, 50)
+  theta TVH0(0.01, 1e-5, 10); theta TVBETA(0.5, -10, 10)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.05 (sd)
+
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  KA   = TVKA
+  H0   = TVH0
+  BETA = TVBETA
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+
+[event_model]
+  cmt    = 3                                  # TTE on its own CMT (PK observed on CMT 2)
+  hazard = H0 * exp(BETA * (central / V))     # log-linear hazard in concentration
+
+[error_model]
+  DV ~ proportional(PROP_ERR)                  # Gaussian PK rows (CMT 2); TTE rows (CMT 3) route to the event likelihood
+
+[fit_options]
+  method = focei</code></pre>
+<p>The parser appends <code>d/dt(__chz) = H0 * exp(BETA * (central / V))</code> (init 0) to the ODE system; the TTE likelihood reads <code>H(T)</code> from that state and <code>h(T)</code> from its derivative, combined with the Gaussian PK likelihood in one FOCEI objective (<code>central / V</code> is the concentration driving the hazard). Put the PK observation and the event on <strong>different compartments</strong> so the data reader can route Gaussian rows and TTE rows unambiguously.</p>
+<p><code>predict_survival()</code> returns <code>S(t)</code> / <code>H(t)</code> / <code>h(t)</code> for the endpoint by integrating the same augmented system at the typical values (its <code>mean_survival</code> is <code>NaN</code> — an <code>∫₀^∞ S</code> summary for ODE hazards is a follow-up; <code>median_survival</code> is interpolated from the cumulative-hazard grid).</p>
+<p><strong>A hazard time at or before the subject’s first record.</strong> A <code>TENTRY</code> (left truncation) or an interval-censored left bound below the start of the integration contributes nothing: nothing has acted on the system yet, so <code>H = 0</code> and <code>h = h(u₀)</code> there, and the left-truncated <code>H(T) − H(entry)</code> reduces to the untruncated <code>H(T)</code>. <code>predict_survival()</code> reports the same values at such a grid point. Where the clock starts is worth knowing, because it differs from NONMEM: NONMEM integrates from the subject’s first record of <em>any</em> <code>EVID</code>, ferx from the first dose or scored observation. An <code>MDV = 1</code> row is dropped by the reader, and an <code>EVID = 2</code> row only joins the timeline on a model with time-varying covariates (which a joint PK-TTE model routes away from the shared solve anyway) — neither starts the hazard clock. Put a dose or an observation record where the clock should start (<a href="https://github.com/FeRx-NLME/ferx-core/issues/1223">#1223</a>).</p>
+<section id="time-dependent-hazard" class="level3">
+<h3 class="anchored" data-anchor-id="time-dependent-hazard">A time-dependent hazard keeps the single shared solve</h3>
+<p>A Weibull or Gompertz baseline reads <code>TIME</code>, so the appended <code>d/dt(__chz_&lt;cmt&gt;)</code> line is time-dependent — but the PK block above it usually is not, and ferx now asks that question of the <strong>PK equations alone</strong>. Such a model gets both halves of the objective from one integration of the augmented system rather than two:</p>
+<pre><code>[event_model]
+  cmt    = 3
+  hazard = H0 * exp(GAM * TIME) * exp(BETA * (central / V))   # Gompertz × exposure</code></pre>
+<p>Writing <code>TIME</code> in a PK equation still splits the solve, which is correct: the two halves then genuinely need different treatment. <code>__chz_*</code> may not be read from <code>[odes]</code> or seeded with <code>init(...)</code> — see <a href="../model-file/ode-models.html#chz-is-not-your-rhs">the ODE-models page</a>.</p>
+<p>The same “the accumulator is not a compartment” reading governs steady-state dosing. An <code>SS=1</code> dose equilibrates the PK compartments to their periodic steady state, but the accumulator has none — it is a pure integrator — so it is held out of the run-in and keeps its value at the dose record. <code>H</code> therefore starts at <code>0</code> for a subject’s first dose, and a later <code>SS=1</code> dose re-loads the compartments without discarding the hazard accrued so far. NONMEM’s own steady-state routine cannot be handed such a system at all; see <a href="../model-file/steady-state.html#ss-with-an-ode-accumulated-hazard">SS with an ODE-accumulated hazard</a> for the convention, the NONMEM result, and the committed anchor.</p>
+<div class="callout callout-style-default callout-note callout-titled">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Note</span>Affects run time from ferx 0.3.0 and earlier, not results
+</div>
+</div>
+<div class="callout-body-container callout-body">
+<p>Between <a href="https://github.com/FeRx-NLME/ferx-core/issues/1124">#1124</a> and <a href="https://github.com/FeRx-NLME/ferx-core/issues/1166">#1166</a> every joint model with a time-dependent hazard declined the shared solve and integrated twice per subject per objective evaluation. Measured on a 40-subject fixture, one variable: <strong>2.1×</strong> on a single objective evaluation and <strong>2.6×</strong> over eight outer iterations. The objective itself moved only at solver-tolerance scale (4.4e-3 OFV at default tolerances, decaying with the tolerance), so earlier results do not need re-running — they were merely slow.</p>
+</div>
+</div>
+<p>Validated against NONMEM: <code>nonmem_anchor/pktte_tdep.ctl</code> (<code>ADVAN13 TOL=9</code>, <code>$OMEGA 0 FIX</code>) on 40 subjects. At <code>ode_reltol = 1e-9</code> ferx’s <code>H(t)</code> matches NONMEM’s <code>A(3)</code> to 3.6e-9 relative at every event record, and the per-subject objective matches the <code>.phi</code> <code>OBJ</code> to 6.0e-8 absolute with <strong>no</strong> additive constant between the two conventions (<code>tests/pktte_tdep_nonmem_anchor.rs</code>).</p>
+</section>
+<section id="simulating-drug-driven-event-times" class="level3">
+<h3 class="anchored" data-anchor-id="simulating-drug-driven-event-times">Simulating drug-driven event times</h3>
+<p><code>simulate()</code> draws event times from a drug-driven hazard by integrating the augmented PK + cumulative-hazard system until <code>H(T) = −log U</code> — the ODE analogue of the analytic inverse-CDF — localizing the crossing inside the solver step. Because a drug-driven hazard can vanish (the drug clears, the hazard falls toward baseline, and an event may never fire), an ODE-TTE simulation <strong>requires a finite <code>[simulation] horizon</code></strong>; a subject that has not crossed by the horizon is right-censored there. EVID-3/4 resets and left-truncated entry (<code>entry_time &gt; 0</code>) are not yet supported for ODE-TTE simulation and raise a clear error rather than mis-sampling. A negative or non-finite hazard fails loudly during sampling — it is never silently treated as a censor.</p>
+<div class="callout callout-style-default callout-note callout-titled">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Note</span>Current limitations
+</div>
+</div>
+<div class="callout-body-container callout-body">
+<p>The hazard expression lives in the <code>[odes]</code> RHS namespace (ODE states + individual parameters — route thetas/covariates through <code>[individual_parameters]</code>), and inter-occasion variability (IOV) is rejected. Joint PK-TTE is the standard NONMEM <code>$DES</code> + cumulative-hazard construct; recovery against NONMEM / nlmixr2 is tracked in issue #564. See <code>examples/pktte_joint.ferx</code>.</p>
+</div>
+</div>
+</section>
+</section>
+<section id="competing-risks-cause-specific-hazards" class="level2">
+<h2 class="anchored" data-anchor-id="competing-risks-cause-specific-hazards">Competing risks (cause-specific hazards)</h2>
+<p>When a subject is at risk of several mutually-exclusive event types, give each cause its own <code>[event_model NAME]</code> block on a distinct compartment. The blocks share the model’s random effects (a common frailty links the causes), so this is the standard <em>cause-specific hazard</em> approach:</p>
+<pre class="ferx"><code>[parameters]
+  theta TVLAMBDA_A(0.10, 0.001, 10.0)
+  theta TVLAMBDA_B(0.06, 0.001, 10.0)
+  omega ETA_F ~ 0.25
+
+[event_model cause_a]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA_A * exp(ETA_F)
+
+[event_model cause_b]
+  cmt    = 3
+  family = exponential
+  scale  = TVLAMBDA_B * exp(ETA_F)</code></pre>
+<p><strong>Data format.</strong> Each subject has one row per cause CMT. The cause that occurred is <code>DV=1</code> on its CMT; every other cause is right-censored (<code>DV=0</code>) at the <em>same</em> time, because experiencing one event removes the subject from risk of the others:</p>
+<pre><code>ID,TIME,DV,EVID,AMT,CMT,RATE,MDV
+1,12.25,1,0,0,2,0,0     # subject 1: cause A (CMT 2) at t=12.25 …
+1,12.25,0,0,0,3,0,0     #            … censored for cause B (CMT 3) at the same time
+2,9.38,0,0,0,2,0,0      # subject 2: reached the horizon with no event —
+2,9.38,0,0,0,3,0,0      #            right-censored for both causes</code></pre>
+<p>See <code>examples/tte_competing_risks.ferx</code> and <code>data/tte_competing_risks.csv</code>.</p>
+<p><strong>Prediction — cumulative incidence.</strong> <code>predict_survival()</code> reports, per cause, the cause-specific cumulative incidence <code>F_k(t) = ∫₀ᵗ h_k(u)·S_all(u) du</code> alongside the all-cause survival <code>S_all(t) = exp(−Σ_j H_j(t))</code>. In the presence of competing risks the naive <code>1 − exp(−H_k)</code> <em>over</em>-states a cause’s incidence (it ignores that the other causes remove subjects from risk); the reported CIF is the correct quantity, and across all causes <code>Σ_k F_k(t) + S_all(t) = 1</code> exactly. For a single endpoint it reduces to <code>F(t) = 1 − S(t)</code>.</p>
+<p><strong>Estimation note.</strong> The cause-specific <em>rates</em> are well-identified and recover tightly. The shared frailty variance ω² is weakly identified for TTE and reads high under FOCEI-Laplace at higher event rates (the same approximation limit as single-endpoint frailty; see below) — prefer SAEM/IMP for the variance component. Subdistribution-hazard (Fine–Gray) modelling is not currently provided; cause-specific hazard covers the standard pharmacometric use case.</p>
+<p><strong>Validation of the cumulative incidence.</strong> The CIF is anchored at three levels:</p>
+<ol type="1">
+<li><p><em>Closed form (constant hazards).</em> For two exponential causes the actuarial allocation is exact: <code>F_k(t) = (λ_k / Σλ)·(1 − e^{−Σλ·t})</code>. Asserted to machine precision in <code>cif_two_cause_exponential_closed_form</code> (<code>src/survival/mod.rs</code>).</p></li>
+<li><p><em>Independent quadrature (time-varying hazards).</em> For a Weibull + Gompertz pair the per-cause <code>F_k(t)</code> from <code>cif_curves</code> matches a high-resolution composite-Simpson integration of the defining integral <code>F_k(t) = ∫₀ᵗ h_k(u)·S_all(u) du</code> — a different numerical scheme — to within <code>1e-3</code> (<code>cif_time_varying_matches_independent_quadrature</code>).</p></li>
+<li><p><em>Nonparametric reference (R <code>cmprsk::cuminc</code>).</em> Simulating the example’s two exponential causes (<code>λ_A = 0.10</code>, <code>λ_B = 0.06</code>, administrative censoring at <code>t = 14</code>, <code>N = 200 000</code>) and estimating the cumulative incidence with the license-free <code>cmprsk::cuminc</code> reproduces ferx’s analytic CIF (max absolute difference <code>≈ 2·10⁻³</code>, i.e.&nbsp;Monte-Carlo noise):</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 20%">
+<col style="width: 20%">
+<col style="width: 20%">
+<col style="width: 20%">
+<col style="width: 20%">
+</colgroup>
+<thead>
+<tr class="header">
+<th style="text-align: right;">t</th>
+<th style="text-align: right;">cause A — <code>cmprsk</code></th>
+<th style="text-align: right;">cause A — ferx</th>
+<th style="text-align: right;">cause B — <code>cmprsk</code></th>
+<th style="text-align: right;">cause B — ferx</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">0.1708</td>
+<td style="text-align: right;">0.1712</td>
+<td style="text-align: right;">0.1032</td>
+<td style="text-align: right;">0.1027</td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">0.3848</td>
+<td style="text-align: right;">0.3857</td>
+<td style="text-align: right;">0.2324</td>
+<td style="text-align: right;">0.2314</td>
+</tr>
+<tr class="odd">
+<td style="text-align: right;">10</td>
+<td style="text-align: right;">0.4970</td>
+<td style="text-align: right;">0.4988</td>
+<td style="text-align: right;">0.3009</td>
+<td style="text-align: right;">0.2993</td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">14</td>
+<td style="text-align: right;">0.5565</td>
+<td style="text-align: right;">0.5585</td>
+<td style="text-align: right;">0.3370</td>
+<td style="text-align: right;">0.3351</td>
+</tr>
+</tbody>
+</table>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb16"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="fu">library</span>(cmprsk)</span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="fu">set.seed</span>(<span class="dv">20260625</span>)</span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a>lamA <span class="ot">&lt;-</span> <span class="fl">0.10</span>; lamB <span class="ot">&lt;-</span> <span class="fl">0.06</span>; tau <span class="ot">&lt;-</span> <span class="dv">14</span>; N <span class="ot">&lt;-</span> <span class="fl">2e5</span></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a>tA <span class="ot">&lt;-</span> <span class="fu">rexp</span>(N, lamA); tB <span class="ot">&lt;-</span> <span class="fu">rexp</span>(N, lamB)</span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a>tmin <span class="ot">&lt;-</span> <span class="fu">pmin</span>(tA, tB); cause <span class="ot">&lt;-</span> <span class="fu">ifelse</span>(tA <span class="sc">&lt;</span> tB, <span class="dv">1</span>L, <span class="dv">2</span>L)</span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a>status <span class="ot">&lt;-</span> <span class="fu">ifelse</span>(tmin <span class="sc">&lt;=</span> tau, cause, <span class="dv">0</span>L); ftime <span class="ot">&lt;-</span> <span class="fu">pmin</span>(tmin, tau)</span>
+<span id="cb16-7"><a href="#cb16-7" aria-hidden="true" tabindex="-1"></a><span class="fu">timepoints</span>(<span class="fu">cuminc</span>(ftime, status, <span class="at">cencode =</span> <span class="dv">0</span>L), <span class="fu">c</span>(<span class="dv">2</span>, <span class="dv">6</span>, <span class="dv">10</span>, <span class="dv">14</span>))<span class="sc">$</span>est</span>
+<span id="cb16-8"><a href="#cb16-8" aria-hidden="true" tabindex="-1"></a><span class="co"># ferx analytic: F_k(t) = (lam_k/(lamA+lamB)) * (1 - exp(-(lamA+lamB)*t))</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div></li>
+</ol>
+<p><strong>Simulation and VPC.</strong> <code>simulate()</code> draws the competing causes with the same earliest-cause-wins rule: a latent time is drawn per cause, the earliest is the observed event, and every other cause is right-censored at that time. For a <strong>visual predictive check</strong> the simulation needs an administrative censoring horizon that is <em>decoupled from the observed event times</em> — otherwise a re-simulated subject that already carries an event re-draws unbounded, biasing the simulated event-time distribution. Supply it with the <a href="../model-file/simulation.html#tte-simulation"><code>[simulation] horizon</code></a> key (or <code>SimulateOptions { horizon, .. }</code> on the library API); when set, it overrides each record’s per-record window so every cause censors at the planned study end:</p>
+<pre class="ferx"><code>[simulation]
+  n_subjects = 200
+  horizon    = 14     # follow each subject to t = 14, censoring survivors there
+  seed       = 12345</code></pre>
+<p>Running <code>ferx examples/tte_competing_risks.ferx --simulate</code> then generates one right-censored TTE row per cause compartment (CMT 2 and CMT 3) per synthetic subject and overwrites each with the drawn outcome. A TTE <code>[simulation]</code> block <strong>requires <code>horizon</code></strong> (there are no continuous <code>times</code> to schedule).</p>
+</section>
+<section id="rtte" class="level2">
+<h2 class="anchored" data-anchor-id="rtte">Repeated events (RTTE)</h2>
+<p>A <strong>repeated</strong> TTE model (<code>type = rtte</code> in <code>[event_model]</code>) lets one subject experience the same event several times. Add <code>type = rtte</code> and give each subject multiple <code>DV = 1</code> rows in time order, ending in a <code>DV = 0</code> administrative-censoring row:</p>
+<pre><code>[parameters]
+  theta TVLAMBDA(0.15, 0.001, 10.0)
+  omega ETA_LAMBDA ~ 0.09
+
+[event_model]
+  cmt    = 2
+  type   = rtte
+  family = exponential
+  scale  = TVLAMBDA * exp(ETA_LAMBDA)   # frailty shared across a subject's events
+
+[fit_options]
+  method = saem</code></pre>
+<p><code>clock = forward</code> (the default, Andersen–Gill total time) integrates the cumulative hazard once across the whole window (<code>Σ_k log h(t_k) − H(T)</code>); <code>clock = reset</code> (gap time) restarts the hazard clock at each event (<code>Σ_k log h(Δ_k) − Σ_k H(Δ_k)</code> over inter-event gaps). For a time-homogeneous hazard the two coincide. See <a href="../model-file/event-model.html#rtte">Repeated events</a> for the DSL details.</p>
+<p>Both clocks accept <strong>left truncation</strong> (a <code>TENTRY</code> column; see <a href="#left-truncation-delayed-entry">above</a>). Under <code>clock = forward</code> the cumulative hazard integrates from <code>H(TENTRY)</code>. Under <code>clock = reset</code> the <em>first</em> sojourn is measured from the time origin and conditioned on survival to entry — <code>H(t₁) − H(TENTRY) − log h(t₁)</code> — after which the renewal clock takes over for later gaps. This is the same delayed-entry conditioning across every survival endpoint: <code>TENTRY</code> always means “condition on survival past entry”, never “restart the clock at entry” (the two would differ for a time-varying hazard, and only the former is a standard, anchorable left-truncation model). Reset left truncation assumes the time origin <code>t = 0</code> is the renewal origin of the first sojourn (the subject was event-free and at risk from 0); it coincides with clock-forward for a memoryless (exponential) hazard.</p>
+<p><code>simulate()</code> accepts left truncation for repeated events too (#740): the stream is drawn on the same time origin conditioned on survival to <code>TENTRY</code> — clock-forward seeds its conditioning clock at <code>TENTRY</code>, clock-reset draws its first sojourn conditional on survival to entry and renews from 0 thereafter — so a simulated left-truncated stream refits under the same convention it was drawn from. <code>TENTRY = 0</code> is byte-identical to the non-truncated draw. (The simulated event rows carry the drawn times; as with single-event TTE simulation, <code>TENTRY</code> itself is a property of the input design, not re-emitted onto the output rows.)</p>
+<div class="callout callout-style-default callout-warning callout-titled">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Warning</span>Prefer SAEM/IMP for RTTE
+</div>
+</div>
+<div class="callout-body-container callout-body">
+<p>A Laplace-based fit (<code>focei</code>/<code>foce</code>) can <strong>underestimate the frailty ω²</strong> for RTTE at low event rates (Karlsson et al.&nbsp;2009: −91 % to −96 % below a 43 % event rate). ferx warns and recommends <code>method = saem</code> or <code>method = imp</code>. For an <em>event-rich</em> design the methods coincide (see the anchor below).</p>
+</div>
+</div>
+<section id="validation-constant-hazard-rtte" class="level3">
+<h3 class="anchored" data-anchor-id="validation-constant-hazard-rtte">Validation — constant-hazard RTTE</h3>
+<p>Dataset <code>tests/reference/rtte_exponential/rtte_exp.csv</code> (100 subjects; data-generating <code>TVLAMBDA = 0.15</code>, <code>ω² = 0.09</code>; censored at t = 20 → <strong>305 events, 3.05/subject</strong>). Two of the anchors are <strong>exact and license-free</strong> — for a constant hazard the RTTE likelihood factorises, so the per-subject event <em>counts</em> are <code>Poisson(λᵢ·T)</code> and a Poisson-lognormal GLMM on the counts is the exact MLE (<code>count_equivalence.R</code>).</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Method</th>
+<th style="text-align: right;">TVLAMBDA</th>
+<th style="text-align: right;">ω²(log rate)</th>
+<th style="text-align: right;">OFV</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Analytic MLE <code>D/Σt</code> (fixed)</td>
+<td style="text-align: right;"><strong>0.15250</strong></td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">1757.16</td>
+</tr>
+<tr class="even">
+<td>ferx fixed-effects</td>
+<td style="text-align: right;">0.15250</td>
+<td style="text-align: right;">—</td>
+<td style="text-align: right;">1757.16</td>
+</tr>
+<tr class="odd">
+<td>Poisson-LN GLMM (exact mixed MLE)</td>
+<td style="text-align: right;">0.14062</td>
+<td style="text-align: right;">0.16455</td>
+<td style="text-align: right;">—</td>
+</tr>
+<tr class="even">
+<td><strong>NONMEM</strong> LAPLACE</td>
+<td style="text-align: right;">0.14062</td>
+<td style="text-align: right;">0.16450</td>
+<td style="text-align: right;">1748.49</td>
+</tr>
+<tr class="odd">
+<td><strong>ferx</strong> FOCEI</td>
+<td style="text-align: right;">0.14060</td>
+<td style="text-align: right;">0.16448</td>
+<td style="text-align: right;">1748.49</td>
+</tr>
+<tr class="even">
+<td>ferx SAEM (seed 31)</td>
+<td style="text-align: right;">0.14033</td>
+<td style="text-align: right;">0.16993</td>
+<td style="text-align: right;">1748.50</td>
+</tr>
+</tbody>
+</table>
+<p>ferx FOCEI reproduces NONMEM LAPLACE to 4–5 significant figures and the OFV to the decimal (1748.49), and both land on the exact Poisson-LN GLMM MLE. The frailty ω² is well-identified here because the design is event-rich, so FOCEI, SAEM, NONMEM and the GLMM coincide — the Karlsson Laplace bias is a <em>low-event-rate</em> effect. Full write-up in <code>tests/reference/rtte_exponential/expected.md</code>.</p>
+</section>
+<section id="simulating-repeated-events" class="level3">
+<h3 class="anchored" data-anchor-id="simulating-repeated-events">Simulating repeated events</h3>
+<p><code>simulate()</code> draws a <strong>recurrent event stream</strong> per subject up to the administrative <code>[simulation] horizon</code> (analytic hazard families; RTTE with a drug-driven ODE hazard is a later slice). Under <code>clock = forward</code> each next event is drawn <em>conditional on survival past the previous one</em> — the closed-form inverse of <code>H(t) − H(t_{k−1}) = −log u</code> — so a time-varying hazard keeps accumulating across the window; under <code>clock = reset</code> each inter-event gap is a fresh draw from zero. Every subject emits its events (<code>DV = 1</code>) followed by one administrative censor (<code>DV = 0</code>) at the horizon, so simulated data round-trips straight back through the data reader. A finite horizon is required (the stream has no implicit end); left truncation, multiple RTTE causes, an RTTE cause mixed with a competing single-event cause, and EVID=3/4 resets are rejected with a clear error rather than silently mis-sampled.</p>
+<p>Unlike fitting, <code>simulate()</code> <strong>regenerates</strong> each subject’s stream from <code>t = 0</code> out of the model and drawn frailty — it never reads the input event rows. The fit-boundary input-shape checks (out-of-order, interval-censored, or non-finite event times; see <a href="../model-file/event-model.html#rtte">Repeated events</a>) therefore do <strong>not</strong> apply to simulation: such rows are simply not consulted, not rejected.</p>
+<div class="callout callout-style-default callout-note callout-titled">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Note</span>Per-subject simulation diagnostics
+</div>
+</div>
+<div class="callout-body-container callout-body">
+<p>A degenerate draw is handled <em>per subject</em>, not by aborting the run: a non-positive / non-finite analytic hazard rate produces no event (the subject is censored), and an RTTE hazard so extreme it would fire more than a million times over the window has its stream skipped (also censored). Rather than let these look like ordinary censoring, the <code>simulate_with_options_diag</code> API returns a <code>SimulationOutput { results, warnings }</code> naming the affected subjects (<code>W_TTE_DEGENERATE_HAZARD</code> / <code>W_RTTE_DEGENERATE</code>); <code>ferx … --simulate</code> echoes them alongside the fit warnings. The plain <code>simulate()</code> / <code>simulate_with_seed()</code> / <code>simulate_with_options()</code> entry points apply the same per-subject handling but return only the rows.</p>
+</div>
+</div>
+<pre><code>[simulation]
+  n_subjects = 200
+  horizon    = 20
+  seed       = 33</code></pre>
+<p>The sampler is validated four ways (all in <code>tests/tte_convergence.rs</code> except the last):</p>
+<ul>
+<li><p><em>Analytic count law (Tier-1, exact).</em> For a constant hazard the stream is a homogeneous Poisson process, so <code>N(T) ~ Poisson(λT)</code>; for clock-forward Weibull it is non-homogeneous with <code>N(T) ~ Poisson(H(T))</code>. The simulated counts match these exact laws.</p></li>
+<li><p><em>Goodness-of-fit (PIT/KS, estimation-free).</em> By the time-rescaling theorem the rescaled inter-event increments <code>H(t_k) − H(t_{k−1})</code> are iid <code>Exp(1)</code> under correct sampling; a Kolmogorov–Smirnov test of <code>V_k = exp(−ΔH_k)</code> against Uniform(0,1) passes (D ≈ 0.018), confirming the conditional forward draws reproduce <code>H(t)</code>.</p></li>
+<li><p><em>Frailty variance (method of moments, estimation-free).</em> The simulated event counts imply <code>Var(log λ_i) = ω²</code>; at a well-identified design (≈31 events/subject) the read is <code>ω² = 0.092</code> against the injected <code>0.09</code>.</p></li>
+<li><p><em>Cross-tool anchor (NONMEM, external).</em> ferx <em>simulated</em> <code>tests/reference/rtte_exponential_sim/rtte_sim.csv</code> (300 subjects; truth <code>TVLAMBDA = 0.15</code>, <code>ω² = 0.09</code>); ferx <strong>and NONMEM</strong> then both <em>fit</em> it:</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Engine</th>
+<th>Method</th>
+<th style="text-align: right;">TVLAMBDA</th>
+<th style="text-align: right;">ω²(log rate)</th>
+<th style="text-align: right;">OFV</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>NONMEM</td>
+<td>LAPLACE</td>
+<td style="text-align: right;">0.15617</td>
+<td style="text-align: right;">0.12801</td>
+<td style="text-align: right;">5557.266</td>
+</tr>
+<tr class="even">
+<td>ferx</td>
+<td>FOCEI</td>
+<td style="text-align: right;">0.15619</td>
+<td style="text-align: right;">0.12794</td>
+<td style="text-align: right;">5557.266</td>
+</tr>
+</tbody>
+</table>
+<p>An independent engine recovering the same parameters from ferx-simulated data is the external corroboration that the simulator is correct. Both land at ω² ≈ 0.128 (above the data-generating 0.09) because this single 300-subject realization is over-dispersed — a Monte-Carlo property of the drawn dataset, not the sampler, whose true injected variance the method-of-moments check pins at 0.09. Full write-up in <code>tests/reference/rtte_exponential_sim/expected.md</code>.</p></li>
+</ul>
+</section>
+</section>
+<section id="comparison-with-reference-software" class="level2">
+<h2 class="anchored" data-anchor-id="comparison-with-reference-software">Comparison with reference software</h2>
+<p>The exponential validation dataset is <code>tests/reference/tte_exponential/tte_exp.csv</code> (100 subjects; data-generating λ=0.1 h⁻¹, ω²=0.25 on log-rate; right-censored at t=24 → 82 events, 18% censored). All tools fit the same file.</p>
+<p><strong>Fixed-effects (no random effect) — exact, license-free anchor.</strong> A censored exponential MLE is the closed form λ = events/Σtime, so a ferx <code>n_eta=0</code> fit must match base-R <code>survival::survreg</code> exactly:</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Quantity</th>
+<th>ferx (fixed)</th>
+<th><code>survreg</code></th>
+<th>agreement</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>λ (rate)</td>
+<td>0.074506</td>
+<td>0.074506</td>
+<td>exact (&lt;1e‑4)</td>
+</tr>
+<tr class="even">
+<td>OFV / −2logLik</td>
+<td>589.888</td>
+<td>589.888</td>
+<td>exact</td>
+</tr>
+</tbody>
+</table>
+<p>This confirms ferx’s TTE hazard, censoring, and likelihood <strong>constants</strong> are correct.</p>
+<p><strong>Mixed-effects (frailty) — FOCEI.</strong> ferx recovers the data-generating truth under a clean large-N simulation–estimation check (N=2000): λ_pop = 0.099 (−1%), ω² = 0.232 (−7%). The small ω² shortfall is the expected mild FOCEI-Laplace bias for TTE (it grows at low event rates; SAEM/IMP reduce it). On the 100-subject file itself:</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Parameter</th>
+<th>True</th>
+<th>ferx FOCEI</th>
+<th>nlmixr2 FOCEI</th>
+<th>NONMEM (LAPLACIAN)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>TVLAMBDA (rate)</td>
+<td>0.10</td>
+<td>0.0768</td>
+<td>0.0770</td>
+<td>0.0771</td>
+</tr>
+<tr class="even">
+<td>ω²(ETA_LAMBDA)</td>
+<td>0.25</td>
+<td>0.290</td>
+<td>0.293</td>
+<td>0.286</td>
+</tr>
+<tr class="odd">
+<td>OFV (−2LL)</td>
+<td>—</td>
+<td>588.93</td>
+<td>588.94</td>
+<td>588.93</td>
+</tr>
+</tbody>
+</table>
+<p>ferx and <strong>nlmixr2</strong> FOCEI agree to ~3 digits on all parameters and the −2LL for all three families (Weibull and Gompertz likewise — see <code>tests/reference/tte_*/expected.md</code>), <strong>including the nonlinear-frailty Weibull <code>omega^2</code></strong>: ferx 0.176, nlmixr2 0.173, NONMEM LAPLACIAN 0.175. Earlier ferx read 0.204 there — not a likelihood difference but a derivative-free outer-optimizer artifact: on the near-flat ω² ridge (the whole 0.175→0.204 span is &lt;0.01 OFV) BOBYQA’s <code>ftol_rel</code> default stopped it short of ferx’s own profile minimum, which already sat at ~0.175. Tightening the TTE outer <code>ftol_rel</code> to <code>1e-8</code> (#469; auto-applied to pure-TTE models, whose hazard objective is exact) lands it on the consensus. This is separate from the FOCEI-Laplace <em>method</em> bias above (the large-N Weibull SSE still over-estimates the shape frailty, ~0.34 vs a true 0.20 — that is #440, unchanged by the optimizer fix).</p>
+<blockquote class="blockquote">
+<p>NONMEM reports <code>THETA(1)=log λ</code>; compare <code>exp(THETA(1))</code> to ferx <code>TVLAMBDA</code>. The NONMEM frailty column is from <code>nonmem_frailty.ctl</code> (<code>CONDITIONAL LAPLACIAN INTERACTION</code>). Two NONMEM gotchas for <code>F_FLAG=1</code> likelihood models: a dummy <code>$SIGMA 1 FIX</code> is required <strong>and must be referenced</strong> (<code>DUMMY = EPS(1)</code>) or NM-TRAN infers single-subject data and rejects <code>CONDITIONAL</code>; and <code>NUMERICAL SLOW</code> are required with <code>LAPLACIAN INTERACTION</code>. All three tools agree on the linear-frailty exponential (λ within 0.4%, ω² within ~2%, identical −2LL). <strong>Gompertz</strong> (fixed-effects) also matches NONMEM to OFV 3011.12. nlmixr2’s OFV constants differ (§11.3) — compare parameters.</p>
+</blockquote>
+<section id="nlmixr2-equivalent" class="level3">
+<h3 class="anchored" data-anchor-id="nlmixr2-equivalent">nlmixr2 equivalent</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb20"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a>m <span class="ot">&lt;-</span> <span class="cf">function</span>() {</span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a>  <span class="fu">ini</span>({</span>
+<span id="cb20-3"><a href="#cb20-3" aria-hidden="true" tabindex="-1"></a>    TVLAMBDA <span class="ot">&lt;-</span> <span class="fl">0.05</span></span>
+<span id="cb20-4"><a href="#cb20-4" aria-hidden="true" tabindex="-1"></a>    eta.lambda <span class="sc">~</span> <span class="fl">0.09</span></span>
+<span id="cb20-5"><a href="#cb20-5" aria-hidden="true" tabindex="-1"></a>  })</span>
+<span id="cb20-6"><a href="#cb20-6" aria-hidden="true" tabindex="-1"></a>  <span class="fu">model</span>({</span>
+<span id="cb20-7"><a href="#cb20-7" aria-hidden="true" tabindex="-1"></a>    lambda <span class="ot">&lt;-</span> TVLAMBDA <span class="sc">*</span> <span class="fu">exp</span>(eta.lambda)</span>
+<span id="cb20-8"><a href="#cb20-8" aria-hidden="true" tabindex="-1"></a>    <span class="fu">ll</span>(time.to.event) <span class="sc">~</span> event <span class="sc">*</span> <span class="fu">log</span>(lambda) <span class="sc">-</span> lambda <span class="sc">*</span> time.to.event</span>
+<span id="cb20-9"><a href="#cb20-9" aria-hidden="true" tabindex="-1"></a>  })</span>
+<span id="cb20-10"><a href="#cb20-10" aria-hidden="true" tabindex="-1"></a>}</span>
+<span id="cb20-11"><a href="#cb20-11" aria-hidden="true" tabindex="-1"></a>fit <span class="ot">&lt;-</span> <span class="fu">nlmixr</span>(m, data, <span class="at">est =</span> <span class="st">"focei"</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</section>
+<section id="nonmem-equivalent" class="level3">
+<h3 class="anchored" data-anchor-id="nonmem-equivalent">NONMEM equivalent</h3>
+<pre><code>$ESTIMATION METHOD=LAPLACIAN INTERACTION MAXEVAL=500
+$THETA (0.001, 0.05, 10)
+$OMEGA 0.09</code></pre>
+</section>
+<section id="weibull-and-gompertz" class="level3">
+<h3 class="anchored" data-anchor-id="weibull-and-gompertz">Weibull and Gompertz</h3>
+<p>The same validation kit exists for Weibull (<code>tests/reference/tte_weibull/</code>) and Gompertz (<code>tests/reference/tte_gompertz/</code>). Highlights:</p>
+<ul>
+<li><strong>Weibull</strong> fixed-effects fit matches <code>survreg</code> exactly (scale 22.18, shape 2.12); the 300-subject <strong>Gompertz</strong> RCT fixed-effects fit recovers <code>log_alpha</code>, <code>log_gamma</code> and the treatment <code>log_hr</code> essentially exactly, exercising the <code>[event_model]</code> covariate + <code>loghr</code> term.</li>
+</ul>
+<blockquote class="blockquote">
+<p><strong>Choosing an estimator for frailty TTE.</strong> When a random effect sits on a <em>nonlinear</em> hazard parameter (e.g.&nbsp;the Weibull <strong>shape</strong> or Gompertz <strong>growth rate</strong>, not the exponential rate), FOCEI-Laplace <strong>over-estimates</strong> the frailty variance <code>omega^2</code> — a clean large-N simulation–estimation check recovers the structural parameters but inflates <code>omega^2</code> (Weibull shape: 0.34 vs a true 0.20), while a SAEM fit of the same data reads lower (~0.13). This is an approximation limitation, not a likelihood error (fixed-effects fits match <code>survreg</code> exactly), and it is a property of the <em>method</em>, not of any one tool: a three-tool cross-check on the n=100 Weibull file has <strong>ferx FOCEI (ω² 0.176), nlmixr2 FOCEI (0.173) and NONMEM LAPLACIAN (0.175) all in agreement</strong> (structural params and −2LL match too, ≤0.5% / identical OFV). (ferx read 0.204 here before #469 — a derivative-free outer-optimizer convergence artifact on the flat ω² ridge, since fixed; it is unrelated to the method bias, which shows in the large-N SSE above.) Prefer <strong>SAEM/IMP</strong> for frailty TTE on nonlinear parameters, as in the standard pharmacometric guidance; FOCEI on a <em>linear</em> rate (exponential) is near-unbiased and all three tools agree there (ω² 0.286–0.293).</p>
+</blockquote>
+</section>
+<section id="joint-pk-tte-fit-and-simulation" class="level3">
+<h3 class="anchored" data-anchor-id="joint-pk-tte-fit-and-simulation">Joint PK-TTE — fit and simulation</h3>
+<p>The drug-driven joint model is anchored against NONMEM and nlmixr2 on a shared dataset (<code>tests/reference/pktte_joint/</code>, N=120; oral 1-cpt PK + <code>h = H0·exp(BETA·Cc)</code>).</p>
+<p><strong>Fit.</strong> All three tools recover the PK fixed effects and variance components closely:</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Parameter</th>
+<th style="text-align: right;">Truth</th>
+<th style="text-align: right;">ferx FOCEI</th>
+<th style="text-align: right;">nlmixr2 FOCEI</th>
+<th style="text-align: right;">NONMEM LAPLACE</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>CL</td>
+<td style="text-align: right;">1.0</td>
+<td style="text-align: right;">1.039</td>
+<td style="text-align: right;">1.026</td>
+<td style="text-align: right;">1.031</td>
+</tr>
+<tr class="even">
+<td>V</td>
+<td style="text-align: right;">10.0</td>
+<td style="text-align: right;">9.879</td>
+<td style="text-align: right;">9.946</td>
+<td style="text-align: right;">9.897</td>
+</tr>
+<tr class="odd">
+<td>KA</td>
+<td style="text-align: right;">1.0</td>
+<td style="text-align: right;">0.978</td>
+<td style="text-align: right;">0.994</td>
+<td style="text-align: right;">0.980</td>
+</tr>
+<tr class="even">
+<td>ω²(CL)</td>
+<td style="text-align: right;">0.09</td>
+<td style="text-align: right;">0.083</td>
+<td style="text-align: right;">0.080</td>
+<td style="text-align: right;">0.081</td>
+</tr>
+<tr class="odd">
+<td>H0</td>
+<td style="text-align: right;">0.015</td>
+<td style="text-align: right;">0.0145</td>
+<td style="text-align: right;">0.0210</td>
+<td style="text-align: right;">0.0149</td>
+</tr>
+<tr class="even">
+<td>BETA</td>
+<td style="text-align: right;">0.25</td>
+<td style="text-align: right;">0.256</td>
+<td style="text-align: right;">0.201</td>
+<td style="text-align: right;">0.251</td>
+</tr>
+</tbody>
+</table>
+<p>The baseline hazard <code>H0</code> and the exposure slope <code>BETA</code> are <strong>collinear</strong> — <code>H0·exp(BETA·Cc)</code> trades baseline against slope over the narrow single-occasion concentration range. ferx and NONMEM (both truth-started) sit near truth; nlmixr2 lands at the other end of the <em>same</em> flat ridge — all valid optima of an under-determined likelihood, with corr(H0, BETA) = −0.93 (ferx) / −0.91 (NONMEM). So the PK block is the cross-tool agreement check; <code>H0</code> and <code>BETA</code> are jointly, not individually, identified. (The objective value is not cross-tool comparable here — different <code>F_FLAG</code> likelihood normalization — so compare ΔOFV between nested models, not absolutes.)</p>
+<p><strong>Simulation.</strong> ferx’s <code>simulate()</code> event-time distribution is validated two ways (<code>tests/reference/pktte_joint_sim/</code>):</p>
+<ul>
+<li><em>Goodness-of-fit (in-tree, license-free):</em> simulated event times, probability-integral- transformed against the model’s own survival via an <strong>independent</strong> integrator, pass a Kolmogorov–Smirnov test against Uniform(0,1) — D = 0.040 vs the 5% critical 0.061 at N=500, ≈ the value expected for an exactly-correct sampler. This is immune to the H0/BETA ridge (no estimation), so it is the decisive sampler check.</li>
+<li><em>Cross-tool (NONMEM <code>$SIM</code>):</em> ferx’s Kaplan–Meier survival matches NONMEM’s analytic marginal survival <code>mean_i exp(−CHZ_i(t))</code> to <strong>max |ΔS(t)| = 0.044</strong> across the horizon (N=500).</li>
+</ul>
+</section>
+</section>
+<section id="see-also" class="level2">
+<h2 class="anchored" data-anchor-id="see-also">See also</h2>
+<ul>
+<li><code>examples/tte_exponential.ferx</code> — minimal worked example</li>
+<li><code>data/tte_exponential.csv</code> — small dataset (30 subjects) used by the smoke tests</li>
+<li><code>tests/reference/tte_exponential/</code> — 100-subject validation dataset (<code>tte_exp.csv</code>), reference scripts (<code>simulate.R</code>, <code>survreg.R</code>, <code>nlmixr2.R</code>, <code>nonmem.ctl</code>), <code>README.md</code> (NONMEM/nlmixr2 hand-off) and <code>expected.md</code> (filled comparison)</li>
+<li><code>examples/pktte_joint.ferx</code> — joint PK-TTE worked example (drug-driven ODE hazard)</li>
+<li><code>tests/reference/pktte_joint/</code> — joint PK-TTE <strong>fit</strong> anchor (ferx / NONMEM / nlmixr2)</li>
+<li><code>tests/reference/pktte_joint_sim/</code> — joint PK-TTE <strong>simulation</strong> anchor (ferx vs NONMEM <code>$SIM</code>: <code>make_template.py</code>, <code>sim.ctl</code>, <code>compare.R</code>, <code>expected.md</code>)</li>
+<li><code>tests/tte_smoke.rs</code> — Tier-2 parse and short-run smoke tests</li>
+<li><code>tests/tte_convergence.rs</code> — Tier-3 convergence + SSE tests (<code>--features survival,slow-tests</code>)</li>
+<li><code>plans/tte-survival-markov.md</code> — full multi-phase roadmap</li>
+</ul>
+
+
+</section>
+</section>
+
+</main> <!-- /main -->
+<script>
+(function () {
+  var HEAD = '<div class="panel-head"><span class="dots"><i></i><i></i><i></i></span><span class="file"><span class="br">[</span>warfarin_pk.ferx<span class="br">]</span></span></div>';
+
+  function apply() {
+    var dark = document.documentElement.getAttribute('data-bs-theme') === 'dark';
+    document.querySelectorAll('div.sourceCode').forEach(function (el) {
+      if (el.parentElement && el.parentElement.closest('.code-panel')) return;
+      if (dark) {
+        if (!el.classList.contains('code-panel')) {
+          el.classList.add('code-panel');
+          el.insertAdjacentHTML('afterbegin', HEAD);
+        }
+      } else {
+        el.classList.remove('code-panel');
+        var h = el.querySelector(':scope > .panel-head');
+        if (h) h.remove();
+      }
+    });
+  }
+
+  if (document.body) apply();
+  document.addEventListener('DOMContentLoaded', apply);
+  new MutationObserver(function (ms) {
+    ms.forEach(function (m) { if (m.attributeName === 'data-bs-theme') apply(); });
+  }).observe(document.documentElement, { attributes: true });
+}());
+</script>
+<script id="quarto-html-after-body" type="application/javascript">
+  window.document.addEventListener("DOMContentLoaded", function (event) {
+    // Ensure there is a toggle, if there isn't float one in the top right
+    if (window.document.querySelector('.quarto-color-scheme-toggle') === null) {
+      const a = window.document.createElement('a');
+      a.classList.add('top-right');
+      a.classList.add('quarto-color-scheme-toggle');
+      a.href = "";
+      a.onclick = function() { try { window.quartoToggleColorScheme(); } catch {} return false; };
+      const i = window.document.createElement("i");
+      i.classList.add('bi');
+      a.appendChild(i);
+      window.document.body.appendChild(a);
+    }
+    setColorSchemeToggle(hasAlternateSentinel())
+    const icon = "";
+    const anchorJS = new window.AnchorJS();
+    anchorJS.options = {
+      placement: 'right',
+      icon: icon
+    };
+    anchorJS.add('.anchored');
+    const isCodeAnnotation = (el) => {
+      for (const clz of el.classList) {
+        if (clz.startsWith('code-annotation-')) {                     
+          return true;
+        }
+      }
+      return false;
+    }
+    const onCopySuccess = function(e) {
+      // button target
+      const button = e.trigger;
+      // don't keep focus
+      button.blur();
+      // flash "checked"
+      button.classList.add('code-copy-button-checked');
+      var currentTitle = button.getAttribute("title");
+      button.setAttribute("title", "Copied!");
+      let tooltip;
+      if (window.bootstrap) {
+        button.setAttribute("data-bs-toggle", "tooltip");
+        button.setAttribute("data-bs-placement", "left");
+        button.setAttribute("data-bs-title", "Copied!");
+        tooltip = new bootstrap.Tooltip(button, 
+          { trigger: "manual", 
+            customClass: "code-copy-button-tooltip",
+            offset: [0, -8]});
+        tooltip.show();    
+      }
+      setTimeout(function() {
+        if (tooltip) {
+          tooltip.hide();
+          button.removeAttribute("data-bs-title");
+          button.removeAttribute("data-bs-toggle");
+          button.removeAttribute("data-bs-placement");
+        }
+        button.setAttribute("title", currentTitle);
+        button.classList.remove('code-copy-button-checked');
+      }, 1000);
+      // clear code selection
+      e.clearSelection();
+    }
+    const getTextToCopy = function(trigger) {
+      const outerScaffold = trigger.parentElement.cloneNode(true);
+      const codeEl = outerScaffold.querySelector('code');
+      for (const childEl of codeEl.children) {
+        if (isCodeAnnotation(childEl)) {
+          childEl.remove();
+        }
+      }
+      return codeEl.innerText;
+    }
+    const clipboard = new window.ClipboardJS('.code-copy-button:not([data-in-quarto-modal])', {
+      text: getTextToCopy
+    });
+    clipboard.on('success', onCopySuccess);
+    if (window.document.getElementById('quarto-embedded-source-code-modal')) {
+      const clipboardModal = new window.ClipboardJS('.code-copy-button[data-in-quarto-modal]', {
+        text: getTextToCopy,
+        container: window.document.getElementById('quarto-embedded-source-code-modal')
+      });
+      clipboardModal.on('success', onCopySuccess);
+    }
+      var localhostRegex = new RegExp(/^(?:http|https):\/\/localhost\:?[0-9]*\//);
+      var mailtoRegex = new RegExp(/^mailto:/);
+        var filterRegex = new RegExp("https:\/\/ferx-nlme\.github\.io\/ferx-core\/");
+      var isInternal = (href) => {
+          return filterRegex.test(href) || localhostRegex.test(href) || mailtoRegex.test(href);
+      }
+      // Inspect non-navigation links and adorn them if external
+     var links = window.document.querySelectorAll('a[href]:not(.nav-link):not(.navbar-brand):not(.toc-action):not(.sidebar-link):not(.sidebar-item-toggle):not(.pagination-link):not(.no-external):not([aria-hidden]):not(.dropdown-item):not(.quarto-navigation-tool):not(.about-link)');
+      for (var i=0; i<links.length; i++) {
+        const link = links[i];
+        if (!isInternal(link.href)) {
+          // undo the damage that might have been done by quarto-nav.js in the case of
+          // links that we want to consider external
+          if (link.dataset.originalHref !== undefined) {
+            link.href = link.dataset.originalHref;
+          }
+        }
+      }
+    function tippyHover(el, contentFn, onTriggerFn, onUntriggerFn) {
+      const config = {
+        allowHTML: true,
+        maxWidth: 500,
+        delay: 100,
+        arrow: false,
+        appendTo: function(el) {
+            return el.parentElement;
+        },
+        interactive: true,
+        interactiveBorder: 10,
+        theme: 'quarto',
+        placement: 'bottom-start',
+      };
+      if (contentFn) {
+        config.content = contentFn;
+      }
+      if (onTriggerFn) {
+        config.onTrigger = onTriggerFn;
+      }
+      if (onUntriggerFn) {
+        config.onUntrigger = onUntriggerFn;
+      }
+      window.tippy(el, config); 
+    }
+    const noterefs = window.document.querySelectorAll('a[role="doc-noteref"]');
+    for (var i=0; i<noterefs.length; i++) {
+      const ref = noterefs[i];
+      tippyHover(ref, function() {
+        // use id or data attribute instead here
+        let href = ref.getAttribute('data-footnote-href') || ref.getAttribute('href');
+        try { href = new URL(href).hash; } catch {}
+        const id = href.replace(/^#\/?/, "");
+        const note = window.document.getElementById(id);
+        if (note) {
+          return note.innerHTML;
+        } else {
+          return "";
+        }
+      });
+    }
+    const xrefs = window.document.querySelectorAll('a.quarto-xref');
+    const processXRef = (id, note) => {
+      // Strip column container classes
+      const stripColumnClz = (el) => {
+        el.classList.remove("page-full", "page-columns");
+        if (el.children) {
+          for (const child of el.children) {
+            stripColumnClz(child);
+          }
+        }
+      }
+      stripColumnClz(note)
+      if (id === null || id.startsWith('sec-')) {
+        // Special case sections, only their first couple elements
+        const container = document.createElement("div");
+        if (note.children && note.children.length > 2) {
+          container.appendChild(note.children[0].cloneNode(true));
+          for (let i = 1; i < note.children.length; i++) {
+            const child = note.children[i];
+            if (child.tagName === "P" && child.innerText === "") {
+              continue;
+            } else {
+              container.appendChild(child.cloneNode(true));
+              break;
+            }
+          }
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(container);
+          }
+          return container.innerHTML
+        } else {
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(note);
+          }
+          return note.innerHTML;
+        }
+      } else {
+        // Remove any anchor links if they are present
+        const anchorLink = note.querySelector('a.anchorjs-link');
+        if (anchorLink) {
+          anchorLink.remove();
+        }
+        if (window.Quarto?.typesetMath) {
+          window.Quarto.typesetMath(note);
+        }
+        if (note.classList.contains("callout")) {
+          return note.outerHTML;
+        } else {
+          return note.innerHTML;
+        }
+      }
+    }
+    for (var i=0; i<xrefs.length; i++) {
+      const xref = xrefs[i];
+      tippyHover(xref, undefined, function(instance) {
+        instance.disable();
+        let url = xref.getAttribute('href');
+        let hash = undefined; 
+        if (url.startsWith('#')) {
+          hash = url;
+        } else {
+          try { hash = new URL(url).hash; } catch {}
+        }
+        if (hash) {
+          const id = hash.replace(/^#\/?/, "");
+          const note = window.document.getElementById(id);
+          if (note !== null) {
+            try {
+              const html = processXRef(id, note.cloneNode(true));
+              instance.setContent(html);
+            } finally {
+              instance.enable();
+              instance.show();
+            }
+          } else {
+            // See if we can fetch this
+            fetch(url.split('#')[0])
+            .then(res => res.text())
+            .then(html => {
+              const parser = new DOMParser();
+              const htmlDoc = parser.parseFromString(html, "text/html");
+              const note = htmlDoc.getElementById(id);
+              if (note !== null) {
+                const html = processXRef(id, note);
+                instance.setContent(html);
+              } 
+            }).finally(() => {
+              instance.enable();
+              instance.show();
+            });
+          }
+        } else {
+          // See if we can fetch a full url (with no hash to target)
+          // This is a special case and we should probably do some content thinning / targeting
+          fetch(url)
+          .then(res => res.text())
+          .then(html => {
+            const parser = new DOMParser();
+            const htmlDoc = parser.parseFromString(html, "text/html");
+            const note = htmlDoc.querySelector('main.content');
+            if (note !== null) {
+              // This should only happen for chapter cross references
+              // (since there is no id in the URL)
+              // remove the first header
+              if (note.children.length > 0 && note.children[0].tagName === "HEADER") {
+                note.children[0].remove();
+              }
+              const html = processXRef(null, note);
+              instance.setContent(html);
+            } 
+          }).finally(() => {
+            instance.enable();
+            instance.show();
+          });
+        }
+      }, function(instance) {
+      });
+    }
+        let selectedAnnoteEl;
+        const selectorForAnnotation = ( cell, annotation) => {
+          let cellAttr = 'data-code-cell="' + cell + '"';
+          let lineAttr = 'data-code-annotation="' +  annotation + '"';
+          const selector = 'span[' + cellAttr + '][' + lineAttr + ']';
+          return selector;
+        }
+        const selectCodeLines = (annoteEl) => {
+          const doc = window.document;
+          const targetCell = annoteEl.getAttribute("data-target-cell");
+          const targetAnnotation = annoteEl.getAttribute("data-target-annotation");
+          const annoteSpan = window.document.querySelector(selectorForAnnotation(targetCell, targetAnnotation));
+          const lines = annoteSpan.getAttribute("data-code-lines").split(",");
+          const lineIds = lines.map((line) => {
+            return targetCell + "-" + line;
+          })
+          let top = null;
+          let height = null;
+          let parent = null;
+          if (lineIds.length > 0) {
+              //compute the position of the single el (top and bottom and make a div)
+              const el = window.document.getElementById(lineIds[0]);
+              top = el.offsetTop;
+              height = el.offsetHeight;
+              parent = el.parentElement.parentElement;
+            if (lineIds.length > 1) {
+              const lastEl = window.document.getElementById(lineIds[lineIds.length - 1]);
+              const bottom = lastEl.offsetTop + lastEl.offsetHeight;
+              height = bottom - top;
+            }
+            if (top !== null && height !== null && parent !== null) {
+              // cook up a div (if necessary) and position it 
+              let div = window.document.getElementById("code-annotation-line-highlight");
+              if (div === null) {
+                div = window.document.createElement("div");
+                div.setAttribute("id", "code-annotation-line-highlight");
+                div.style.position = 'absolute';
+                parent.appendChild(div);
+              }
+              div.style.top = top - 2 + "px";
+              div.style.height = height + 4 + "px";
+              div.style.left = 0;
+              let gutterDiv = window.document.getElementById("code-annotation-line-highlight-gutter");
+              if (gutterDiv === null) {
+                gutterDiv = window.document.createElement("div");
+                gutterDiv.setAttribute("id", "code-annotation-line-highlight-gutter");
+                gutterDiv.style.position = 'absolute';
+                const codeCell = window.document.getElementById(targetCell);
+                const gutter = codeCell.querySelector('.code-annotation-gutter');
+                gutter.appendChild(gutterDiv);
+              }
+              gutterDiv.style.top = top - 2 + "px";
+              gutterDiv.style.height = height + 4 + "px";
+            }
+            selectedAnnoteEl = annoteEl;
+          }
+        };
+        const unselectCodeLines = () => {
+          const elementsIds = ["code-annotation-line-highlight", "code-annotation-line-highlight-gutter"];
+          elementsIds.forEach((elId) => {
+            const div = window.document.getElementById(elId);
+            if (div) {
+              div.remove();
+            }
+          });
+          selectedAnnoteEl = undefined;
+        };
+          // Handle positioning of the toggle
+      window.addEventListener(
+        "resize",
+        throttle(() => {
+          elRect = undefined;
+          if (selectedAnnoteEl) {
+            selectCodeLines(selectedAnnoteEl);
+          }
+        }, 10)
+      );
+      function throttle(fn, ms) {
+      let throttle = false;
+      let timer;
+        return (...args) => {
+          if(!throttle) { // first call gets through
+              fn.apply(this, args);
+              throttle = true;
+          } else { // all the others get throttled
+              if(timer) clearTimeout(timer); // cancel #2
+              timer = setTimeout(() => {
+                fn.apply(this, args);
+                timer = throttle = false;
+              }, ms);
+          }
+        };
+      }
+        // Attach click handler to the DT
+        const annoteDls = window.document.querySelectorAll('dt[data-target-cell]');
+        for (const annoteDlNode of annoteDls) {
+          annoteDlNode.addEventListener('click', (event) => {
+            const clickedEl = event.target;
+            if (clickedEl !== selectedAnnoteEl) {
+              unselectCodeLines();
+              const activeEl = window.document.querySelector('dt[data-target-cell].code-annotation-active');
+              if (activeEl) {
+                activeEl.classList.remove('code-annotation-active');
+              }
+              selectCodeLines(clickedEl);
+              clickedEl.classList.add('code-annotation-active');
+            } else {
+              // Unselect the line
+              unselectCodeLines();
+              clickedEl.classList.remove('code-annotation-active');
+            }
+          });
+        }
+    const findCites = (el) => {
+      const parentEl = el.parentElement;
+      if (parentEl) {
+        const cites = parentEl.dataset.cites;
+        if (cites) {
+          return {
+            el,
+            cites: cites.split(' ')
+          };
+        } else {
+          return findCites(el.parentElement)
+        }
+      } else {
+        return undefined;
+      }
+    };
+    var bibliorefs = window.document.querySelectorAll('a[role="doc-biblioref"]');
+    for (var i=0; i<bibliorefs.length; i++) {
+      const ref = bibliorefs[i];
+      const citeInfo = findCites(ref);
+      if (citeInfo) {
+        tippyHover(citeInfo.el, function() {
+          var popup = window.document.createElement('div');
+          citeInfo.cites.forEach(function(cite) {
+            var citeDiv = window.document.createElement('div');
+            citeDiv.classList.add('hanging-indent');
+            citeDiv.classList.add('csl-entry');
+            var biblioDiv = window.document.getElementById('ref-' + cite);
+            if (biblioDiv) {
+              citeDiv.innerHTML = biblioDiv.innerHTML;
+            }
+            popup.appendChild(citeDiv);
+          });
+          return popup.innerHTML;
+        });
+      }
+    }
+  });
+  </script>
+</div> <!-- /content -->
+<footer class="footer">
+  <div class="nav-footer">
+    <div class="nav-footer-left">
+<p>© 2026 FeRx-NLME · MIT licensed</p>
+</div>   
+    <div class="nav-footer-center">
+      &nbsp;
+    <div class="toc-actions d-sm-block d-md-none"><ul><li><a href="https://github.com/FeRx-NLME/ferx-core/edit/main/estimation/tte.qmd" class="toc-action"><i class="bi bi-github"></i>Edit this page</a></li><li><a href="https://github.com/FeRx-NLME/ferx-core/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></div>
+    <div class="nav-footer-right">
+<p>Fe · 26 · Rx · 2026</p>
+</div>
+  </div>
+</footer>
+
+
+
+
+</body></html>

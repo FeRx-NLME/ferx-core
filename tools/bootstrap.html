@@ -1,0 +1,2005 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en"><head>
+
+<meta charset="utf-8">
+<meta name="generator" content="quarto-1.10.18">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+
+<meta name="description" content="Non-parametric case bootstrap in ferx: resample subjects, refit, and report bias, standard errors and confidence intervals — at PsN::bootstrap feature parity.">
+
+<title>Bootstrap – ferx-core</title>
+<style>
+/* Default styles provided by pandoc.
+** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+*/
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: 1.5em;}
+div.column{flex: auto;}
+@media screen {
+div.columns{gap: min(4vw, 1.5em);}
+div.column{overflow-x: auto;}
+}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+  width: 0.8em;
+  margin: 0 0.8em 0.2em -1em; /* quarto-specific, see https://github.com/quarto-dev/quarto-cli/issues/4556 */ 
+  vertical-align: middle;
+}
+/* CSS for syntax highlighting */
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+  { counter-reset: source-line 0; }
+pre.numberSource code > span
+  { position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+  { content: counter(source-line);
+    position: relative; left: -1em; text-align: right; vertical-align: baseline;
+    border: none; display: inline-block;
+    -webkit-touch-callout: none; -webkit-user-select: none;
+    -khtml-user-select: none; -moz-user-select: none;
+    -ms-user-select: none; user-select: none;
+    padding: 0 4px; width: 4em;
+  }
+pre.numberSource { margin-left: 3em;  padding-left: 4px; }
+div.sourceCode
+  {   }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+</style>
+
+
+<script src="../site_libs/quarto-nav/quarto-nav.js"></script>
+<script src="../site_libs/quarto-nav/headroom.min.js"></script>
+<script src="../site_libs/clipboard/clipboard.min.js"></script>
+<script src="../site_libs/quarto-search/autocomplete.umd.js"></script>
+<script src="../site_libs/quarto-search/fuse.min.js"></script>
+<script src="../site_libs/quarto-search/quarto-search.js"></script>
+<meta name="quarto:offset" content="../">
+<link href="../assets/ferx-favicon.svg" rel="icon" type="image/svg+xml">
+<script src="../site_libs/quarto-html/quarto.js" type="module"></script>
+<script src="../site_libs/quarto-html/tabsets/tabsets.js" type="module"></script>
+<script src="../site_libs/quarto-html/popper.min.js"></script>
+<script src="../site_libs/quarto-html/tippy.umd.min.js"></script>
+<script src="../site_libs/quarto-html/anchor.min.js"></script>
+<link href="../site_libs/quarto-html/tippy.css" rel="stylesheet">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-51776f957f81c5a6b38322b65a6a6987.css" rel="stylesheet" class="quarto-color-scheme" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-dark-31632d092df9090a2ed68f79c078059d.css" rel="stylesheet" class="quarto-color-scheme quarto-color-alternate" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-51776f957f81c5a6b38322b65a6a6987.css" rel="stylesheet" class="quarto-color-scheme-extra" id="quarto-text-highlighting-styles">
+<script src="../site_libs/bootstrap/bootstrap.min.js"></script>
+<link href="../site_libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
+<link href="../site_libs/bootstrap/bootstrap-f5ed25dbf962e4596f9f4df24f2ade0d.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme" id="quarto-bootstrap" data-mode="light">
+<link href="../site_libs/bootstrap/bootstrap-dark-8a64b8d4793081e9872239f556c8075c.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme quarto-color-alternate" id="quarto-bootstrap" data-mode="dark">
+<link href="../site_libs/bootstrap/bootstrap-f5ed25dbf962e4596f9f4df24f2ade0d.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme-extra" id="quarto-bootstrap" data-mode="light">
+<script id="quarto-search-options" type="application/json">{
+  "location": "navbar",
+  "copy-button": false,
+  "collapse-after": 3,
+  "panel-placement": "end",
+  "type": "overlay",
+  "limit": 50,
+  "keyboard-shortcut": [
+    "f",
+    "/",
+    "s"
+  ],
+  "show-item-context": false,
+  "language": {
+    "search-no-results-text": "No results",
+    "search-matching-documents-text": "matching documents",
+    "search-copy-link-title": "Copy link to search",
+    "search-hide-matches-text": "Hide additional matches",
+    "search-more-match-text": "more match in this document",
+    "search-more-matches-text": "more matches in this document",
+    "search-clear-button-title": "Clear",
+    "search-text-placeholder": "",
+    "search-detached-cancel-button-title": "Cancel",
+    "search-submit-button-title": "Submit",
+    "search-label": "Search"
+  }
+}</script>
+
+
+<link rel="stylesheet" href="../styles.css">
+<meta property="og:title" content="Bootstrap">
+<meta property="og:description" content="Open-source nonlinear mixed-effects modeling for population PK/PD and pharmacometrics">
+<meta property="og:site_name" content="ferx-core">
+<meta property="og:locale" content="en_US">
+<meta name="twitter:title" content="Bootstrap">
+<meta name="twitter:description" content="Open-source nonlinear mixed-effects modeling for population PK/PD and pharmacometrics">
+<meta name="twitter:card" content="summary">
+<link rel="canonical" href="https://ferx-nlme.github.io/ferx-core/tools/bootstrap.html">
+</head>
+
+<body class="nav-sidebar floating nav-fixed quarto-light"><script id="quarto-html-before-body" type="application/javascript">
+    const toggleBodyColorMode = (bsSheetEl) => {
+      const mode = bsSheetEl.getAttribute("data-mode");
+      const bodyEl = window.document.querySelector("body");
+      if (mode === "dark") {
+        bodyEl.classList.add("quarto-dark");
+        bodyEl.classList.remove("quarto-light");
+      } else {
+        bodyEl.classList.add("quarto-light");
+        bodyEl.classList.remove("quarto-dark");
+      }
+    }
+    const toggleBodyColorPrimary = () => {
+      const bsSheetEl = window.document.querySelector("link#quarto-bootstrap:not([rel=disabled-stylesheet])");
+      if (bsSheetEl) {
+        toggleBodyColorMode(bsSheetEl);
+      }
+    }
+    const setColorSchemeToggle = (alternate) => {
+      const toggles = window.document.querySelectorAll('.quarto-color-scheme-toggle');
+      for (let i=0; i < toggles.length; i++) {
+        const toggle = toggles[i];
+        if (toggle) {
+          if (alternate) {
+            toggle.classList.add("alternate");
+          } else {
+            toggle.classList.remove("alternate");
+          }
+        }
+      }
+    };
+    const toggleColorMode = (alternate) => {
+      // Switch the stylesheets
+      const primaryStylesheets = window.document.querySelectorAll('link.quarto-color-scheme:not(.quarto-color-alternate)');
+      const alternateStylesheets = window.document.querySelectorAll('link.quarto-color-scheme.quarto-color-alternate');
+      manageTransitions('#quarto-margin-sidebar .nav-link', false);
+      if (alternate) {
+        // note: dark is layered on light, we don't disable primary!
+        enableStylesheet(alternateStylesheets);
+        for (const sheetNode of alternateStylesheets) {
+          if (sheetNode.id === "quarto-bootstrap") {
+            toggleBodyColorMode(sheetNode);
+          }
+        }
+      } else {
+        disableStylesheet(alternateStylesheets);
+        enableStylesheet(primaryStylesheets)
+        toggleBodyColorPrimary();
+      }
+      manageTransitions('#quarto-margin-sidebar .nav-link', true);
+      // Switch the toggles
+      setColorSchemeToggle(alternate)
+      // Hack to workaround the fact that safari doesn't
+      // properly recolor the scrollbar when toggling (#1455)
+      if (navigator.userAgent.indexOf('Safari') > 0 && navigator.userAgent.indexOf('Chrome') == -1) {
+        manageTransitions("body", false);
+        window.scrollTo(0, 1);
+        setTimeout(() => {
+          window.scrollTo(0, 0);
+          manageTransitions("body", true);
+        }, 40);
+      }
+    }
+    const disableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        stylesheet.rel = 'disabled-stylesheet';
+      }
+    }
+    const enableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        if(stylesheet.rel !== 'stylesheet') { // for Chrome, which will still FOUC without this check
+          stylesheet.rel = 'stylesheet';
+        }
+      }
+    }
+    const manageTransitions = (selector, allowTransitions) => {
+      const els = window.document.querySelectorAll(selector);
+      for (let i=0; i < els.length; i++) {
+        const el = els[i];
+        if (allowTransitions) {
+          el.classList.remove('notransition');
+        } else {
+          el.classList.add('notransition');
+        }
+      }
+    }
+    const isFileUrl = () => {
+      return window.location.protocol === 'file:';
+    }
+    const hasAlternateSentinel = () => {
+      let styleSentinel = getColorSchemeSentinel();
+      if (styleSentinel !== null) {
+        return styleSentinel === "alternate";
+      } else {
+        return false;
+      }
+    }
+    const setStyleSentinel = (alternate) => {
+      const value = alternate ? "alternate" : "default";
+      if (!isFileUrl()) {
+        window.localStorage.setItem("quarto-color-scheme", value);
+      } else {
+        localAlternateSentinel = value;
+      }
+    }
+    const getColorSchemeSentinel = () => {
+      if (!isFileUrl()) {
+        const storageValue = window.localStorage.getItem("quarto-color-scheme");
+        return storageValue != null ? storageValue : localAlternateSentinel;
+      } else {
+        return localAlternateSentinel;
+      }
+    }
+    const toggleGiscusIfUsed = (isAlternate, darkModeDefault) => {
+      const baseTheme = document.querySelector('#giscus-base-theme')?.value ?? 'light';
+      const alternateTheme = document.querySelector('#giscus-alt-theme')?.value ?? 'dark';
+      let newTheme = '';
+      if(authorPrefersDark) {
+        newTheme = isAlternate ? baseTheme : alternateTheme;
+      } else {
+        newTheme = isAlternate ? alternateTheme : baseTheme;
+      }
+      const changeGiscusTheme = () => {
+        // From: https://github.com/giscus/giscus/issues/336
+        const sendMessage = (message) => {
+          const iframe = document.querySelector('iframe.giscus-frame');
+          if (!iframe) return;
+          iframe.contentWindow.postMessage({ giscus: message }, 'https://giscus.app');
+        }
+        sendMessage({
+          setConfig: {
+            theme: newTheme
+          }
+        });
+      }
+      const isGiscussLoaded = window.document.querySelector('iframe.giscus-frame') !== null;
+      if (isGiscussLoaded) {
+        changeGiscusTheme();
+      }
+    };
+    const authorPrefersDark = false;
+    const darkModeDefault = authorPrefersDark;
+      document.querySelector('link#quarto-text-highlighting-styles.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+      document.querySelector('link#quarto-bootstrap.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+    let localAlternateSentinel = darkModeDefault ? 'alternate' : 'default';
+    // Dark / light mode switch
+    window.quartoToggleColorScheme = () => {
+      // Read the current dark / light value
+      let toAlternate = !hasAlternateSentinel();
+      toggleColorMode(toAlternate);
+      setStyleSentinel(toAlternate);
+      toggleGiscusIfUsed(toAlternate, darkModeDefault);
+      window.dispatchEvent(new Event('resize'));
+    };
+    // Switch to dark mode if need be
+    if (hasAlternateSentinel()) {
+      toggleColorMode(true);
+    } else {
+      toggleColorMode(false);
+    }
+  </script>
+
+<div id="quarto-search-results"></div>
+  <header id="quarto-header" class="headroom fixed-top">
+    <nav class="navbar navbar-expand-lg " data-bs-theme="dark">
+      <div class="navbar-container container-fluid">
+      <div class="navbar-brand-container mx-auto">
+    <a href="../index.html" class="navbar-brand navbar-brand-logo">
+    <img src="../assets/ferx-dsl-brackets.svg" alt="ferx" class="navbar-logo light-content">
+    <img src="../assets/ferx-dsl-brackets.svg" alt="ferx" class="navbar-logo dark-content">
+    </a>
+    <a class="navbar-brand" href="../index.html">
+    <span class="navbar-title">ferx-core</span>
+    </a>
+  </div>
+            <div id="quarto-search" class="" title="Search"></div>
+          <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarCollapse" aria-controls="navbarCollapse" role="menu" aria-expanded="false" aria-label="Toggle navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+  <span class="navbar-toggler-icon"></span>
+</button>
+          <div class="collapse navbar-collapse" id="navbarCollapse">
+            <ul class="navbar-nav navbar-nav-scroll me-auto">
+  <li class="nav-item">
+    <a class="nav-link active" href="../getting-started.html" aria-current="page"> 
+<span class="menu-text">Get started</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/features.html"> 
+<span class="menu-text">Features</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/changelog.html"> 
+<span class="menu-text">Changelog</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/roadmap.html"> 
+<span class="menu-text">Roadmap</span></a>
+  </li>  
+</ul>
+            <ul class="navbar-nav navbar-nav-scroll ms-auto">
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/ferx-core/"> 
+<span class="menu-text">ferx-core</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/ferx-book/"> 
+<span class="menu-text">ferx-r</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.github.io/reference/"> 
+<span class="menu-text">Reference</span></a>
+  </li>  
+  <li class="nav-item compact">
+    <a class="nav-link" href="https://github.com/FeRx-NLME"> <i class="bi bi-github" role="img" aria-label="GitHub">
+</i> 
+<span class="menu-text"></span></a>
+  </li>  
+</ul>
+          </div> <!-- /navcollapse -->
+            <div class="quarto-navbar-tools">
+  <a href="" class="quarto-color-scheme-toggle quarto-navigation-tool  px-1" onclick="window.quartoToggleColorScheme(); return false;" title="Toggle dark mode"><i class="bi"></i></a>
+</div>
+      </div> <!-- /container-fluid -->
+    </nav>
+  <nav class="quarto-secondary-nav">
+    <div class="container-fluid d-flex">
+      <button type="button" class="quarto-btn-toggle btn" data-bs-toggle="collapse" role="button" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+        <i class="bi bi-layout-text-sidebar-reverse"></i>
+      </button>
+        <nav class="quarto-page-breadcrumbs" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../tools/bootstrap.html">Tools</a></li><li class="breadcrumb-item"><a href="../tools/bootstrap.html">Bootstrap</a></li></ol></nav>
+        <a class="flex-grow-1" role="navigation" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">      
+        </a>
+      <button type="button" class="btn quarto-search-button" aria-label="Search" onclick="window.quartoOpenSearch();">
+        <i class="bi bi-search"></i>
+      </button>
+    </div>
+  </nav>
+</header>
+<!-- content -->
+<div id="quarto-content" class="quarto-container page-columns page-rows-contents page-layout-article page-navbar">
+<!-- sidebar -->
+  <nav id="quarto-sidebar" class="sidebar collapse collapse-horizontal quarto-sidebar-collapse-item sidebar-navigation floating overflow-auto">
+    <div class="pt-lg-2 mt-2 text-left sidebar-header">
+      <a href="../index.html" class="sidebar-logo-link">
+      <img src="../assets/ferx-favicon.svg" alt="" class="sidebar-logo light-content py-0 d-lg-inline d-none">
+      <img src="../assets/ferx-favicon.svg" alt="" class="sidebar-logo dark-content py-0 d-lg-inline d-none">
+      </a>
+      </div>
+        <div class="mt-2 flex-shrink-0 align-items-center">
+        <div class="sidebar-search">
+        <div id="quarto-search" class="" title="Search"></div>
+        </div>
+        </div>
+    <div class="sidebar-menu-container"> 
+    <ul class="list-unstyled mt-1">
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Introduction</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../maturity.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Feature Maturity</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../getting-started.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Getting Started</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../installation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Installation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../quick-start.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Quick Start</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../model-file/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Model File Reference</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/parameters.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Parameters</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/iov.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Inter-Occasion Variability (IOV)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/individual-parameters.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Individual Parameters</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariates.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariates</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariate-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/structural-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Structural Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/lagtime.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Lagtime</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/steady-state.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Steady-State Doses (SS=1)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/error-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Error Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/bloq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">LOQ-Censored Observations</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/ode-models.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/absorption.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Built-in Absorption Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/scaling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Scaling</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/initial-conditions.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Initial Conditions</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/diffusion.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Stochastic Differential Equations (SDE / Diffusion)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/neural-networks.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Neural Networks</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariate-nn.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><code>[covariate_nn]</code> — Deep Compartment Models (DCM)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/data.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/data-selection.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Selection</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/derived.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Derived Columns (<code>[derived]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Output Columns (<code>[output]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/fit-options.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Fit Options</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/simulation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Simulation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/adaptive-dosing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Adaptive (Feedback) Dosing</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/event-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Time-to-Event Endpoints (<code>[event_model]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/categorical.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Categorical endpoints — <code>[binary_model]</code></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/markov-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Markov models ([markov_model])</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../estimation/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Estimation Methods</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/foce.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FOCE / FOCEI</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/agq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">AGQ — Adaptive Gaussian Quadrature</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/gauss-newton.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Gauss-Newton (BHHH)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/saem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">SAEM</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/sir.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Sampling Importance Resampling (SIR)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/importance-sampling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Importance Sampling (IMP)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/frem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FREM (Full Random Effects Model)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/impmap.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">IMPMAP — Importance Sampling assisted by Mode A Posteriori</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/bayes.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Bayesian estimation (MCMC)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/vi.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Variational Inference</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/parameterization.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Packed Parameter Space</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/optimizers.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Outer Optimizers</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/tte.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Time-to-Event (TTE) Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/categorical.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Categorical endpoints (binary / logistic)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/ctmm.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Continuous-time Markov models (CTMM)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/mixture.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Mixture Models</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="true">
+ <span class="menu-text">Tools</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/bootstrap.html" class="sidebar-item-text sidebar-link active">
+ <span class="menu-text">Bootstrap</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/gam-screening.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">GAM covariate screening</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/search.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Search configuration</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/covsearch.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate search</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/modelsearch.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Structural model search</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../data-format.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Format</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../cli.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">CLI Reference</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Output Files</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../warnings.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Warnings</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../file-formats/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">File Formats</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../file-formats/fitrx.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">The <code>.fitrx</code> Fit Bundle</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../file-formats/check-report.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Check Report (<code>ferx check --json</code>)</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../examples/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Examples</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/one-cpt-oral.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">One-Compartment Oral (Warfarin)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/two-cpt-iv.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Two-Compartment IV Bolus</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/covariates.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/ode-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Model (Michaelis-Menten)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/bloq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">BLOQ (M3 method)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/iov.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Inter-Occasion Variability (IOV)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/iov-saem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">IOV with SAEM</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/multiple-dosing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Multiple Dosing (ADDL Column)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/steady-state.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Steady-State Dosing (SS Column)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/scaling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Unit Scaling (<code>[scaling]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/derived-output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Derived Columns and Output</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/data-selection.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Selection (IGNORE / ACCEPT)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/ode-lagtime.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Model with Absorption Lag Time</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/transit-absorption.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Transit Absorption (Two-Compartment)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/sde.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Stochastic Differential Equations (SDE)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/frem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FREM (Covariate Analysis)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/multistart.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Multi-Start: Michaelis-Menten Elimination</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../api/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Rust API</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/types.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Core Types</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/fitting.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Fitting Functions</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/simulation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Simulation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/parsing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Parsing</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/model-editing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Model editing</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../faq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FAQ</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../development/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Development</span></a>
+          <a class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" role="navigation" aria-expanded="false" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/contributing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Contributing to FeRx development</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/sdlc.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Development Lifecycle (SDLC)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/docs-lint.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Docs linter</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+    </ul>
+    </div>
+</nav>
+<div id="quarto-sidebar-glass" class="quarto-sidebar-collapse-item" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item"></div>
+<!-- margin-sidebar -->
+    <div id="quarto-margin-sidebar" class="sidebar margin-sidebar">
+        <nav id="TOC" role="doc-toc" class="toc-active">
+    <h2 id="toc-title">On this page</h2>
+   
+  <ul>
+  <li><a href="#bootstrap" id="toc-bootstrap" class="nav-link active" data-scroll-target="#bootstrap">Bootstrap</a>
+  <ul>
+  <li><a href="#why-bootstrap-instead-of-the-covariance-step" id="toc-why-bootstrap-instead-of-the-covariance-step" class="nav-link" data-scroll-target="#why-bootstrap-instead-of-the-covariance-step">Why bootstrap instead of the covariance step</a></li>
+  <li><a href="#what-is-resampled" id="toc-what-is-resampled" class="nav-link" data-scroll-target="#what-is-resampled">What is resampled</a></li>
+  <li><a href="#which-parameters-are-bootstrapped" id="toc-which-parameters-are-bootstrapped" class="nav-link" data-scroll-target="#which-parameters-are-bootstrapped">Which parameters are bootstrapped</a></li>
+  <li><a href="#reproducibility" id="toc-reproducibility" class="nav-link" data-scroll-target="#reproducibility">Reproducibility</a></li>
+  <li><a href="#stratified-resampling" id="toc-stratified-resampling" class="nav-link" data-scroll-target="#stratified-resampling">Stratified resampling</a></li>
+  <li><a href="#which-replicates-count" id="toc-which-replicates-count" class="nav-link" data-scroll-target="#which-replicates-count">Which replicates count</a></li>
+  <li><a href="#watching-a-run" id="toc-watching-a-run" class="nav-link" data-scroll-target="#watching-a-run">Watching a run</a></li>
+  <li><a href="#recovering-an-interrupted-run" id="toc-recovering-an-interrupted-run" class="nav-link" data-scroll-target="#recovering-an-interrupted-run">Recovering an interrupted run</a>
+  <ul class="collapse">
+  <li><a href="#a-resumed-run-is-the-uninterrupted-run" id="toc-a-resumed-run-is-the-uninterrupted-run" class="nav-link" data-scroll-target="#a-resumed-run-is-the-uninterrupted-run">A resumed run is the uninterrupted run</a></li>
+  <li><a href="#failed-replicates-are-kept-unless-you-say-otherwise" id="toc-failed-replicates-are-kept-unless-you-say-otherwise" class="nav-link" data-scroll-target="#failed-replicates-are-kept-unless-you-say-otherwise">Failed replicates are kept unless you say otherwise</a></li>
+  <li><a href="#resuming-the-wrong-directory-is-refused" id="toc-resuming-the-wrong-directory-is-refused" class="nav-link" data-scroll-target="#resuming-the-wrong-directory-is-refused">Resuming the wrong directory is refused</a></li>
+  </ul></li>
+  <li><a href="#confidence-intervals" id="toc-confidence-intervals" class="nav-link" data-scroll-target="#confidence-intervals">Confidence intervals</a></li>
+  <li><a href="#δofv" id="toc-δofv" class="nav-link" data-scroll-target="#δofv">Δofv</a></li>
+  <li><a href="#output-files" id="toc-output-files" class="nav-link" data-scroll-target="#output-files">Output files</a></li>
+  <li><a href="#options" id="toc-options" class="nav-link" data-scroll-target="#options">Options</a></li>
+  <li><a href="#library-api" id="toc-library-api" class="nav-link" data-scroll-target="#library-api">Library API</a></li>
+  <li><a href="#cancelling-a-run" id="toc-cancelling-a-run" class="nav-link" data-scroll-target="#cancelling-a-run">Cancelling a run</a></li>
+  </ul></li>
+  </ul>
+<div class="toc-actions"><ul><li><a href="https://github.com/FeRx-NLME/ferx-core/edit/main/tools/bootstrap.qmd" class="toc-action"><i class="bi bi-github"></i>Edit this page</a></li><li><a href="https://github.com/FeRx-NLME/ferx-core/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></nav>
+    </div>
+<!-- main -->
+<main class="content" id="quarto-document-content"><header id="title-block-header" class="quarto-title-block"><nav class="quarto-page-breadcrumbs quarto-title-breadcrumbs d-none d-lg-block" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../tools/bootstrap.html">Tools</a></li><li class="breadcrumb-item"><a href="../tools/bootstrap.html">Bootstrap</a></li></ol></nav></header>
+
+
+
+
+
+<section id="bootstrap" class="level1">
+<h1>Bootstrap</h1>
+<blockquote class="blockquote">
+<p><strong>Maturity: beta</strong> — see <a href="../maturity.html">Feature Maturity</a> for what this means.</p>
+</blockquote>
+<p>The non-parametric <strong>case bootstrap</strong> estimates parameter uncertainty by resampling subjects with replacement, refitting the model to each replicate dataset, and reading bias, standard errors and confidence intervals off the spread of the estimates.</p>
+<p>It lives in <code>ferx-tools</code>, not in the estimation engine: a bootstrap is many fits of one model, which is precisely the <a href="../development/index.html">workspace boundary rule</a> — <em>if it calls <code>fit()</code> more than once, it is a tool.</em> Nothing about the likelihood, the optimizer or the diagnostics changes; only the data each fit sees.</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb1"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="ex">ferx</span> bootstrap warfarin.ferx <span class="at">--data</span> warfarin.csv <span class="at">--samples</span> 200 <span class="at">--seed</span> 12345 <span class="at">--threads</span> 8</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<section id="why-bootstrap-instead-of-the-covariance-step" class="level2">
+<h2 class="anchored" data-anchor-id="why-bootstrap-instead-of-the-covariance-step">Why bootstrap instead of the covariance step</h2>
+<p>ferx’s standard errors are the pure <code>R⁻¹</code> matrix — the same thing NONMEM reports under <code>$COVARIANCE MATRIX=R</code>. They are <em>asymptotic</em>: they assume the log-likelihood is locally quadratic and that the sampling distribution of every parameter is normal. That assumption is symmetric by construction, so an <code>R⁻¹</code> interval is always centred on the estimate and always the same width on both sides.</p>
+<p>The bootstrap assumes none of that. It also keeps working when the covariance step fails or returns a non-positive-definite matrix, which is common exactly where uncertainty matters most.</p>
+<p>Here is the shipped <code>examples/warfarin.ferx</code> fit both ways — 200 samples, seed 12345:</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 14%">
+<col style="width: 19%">
+<col style="width: 19%">
+<col style="width: 19%">
+<col style="width: 14%">
+<col style="width: 14%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>parameter</th>
+<th style="text-align: right;">estimate</th>
+<th style="text-align: right;">SE (<code>R⁻¹</code>)</th>
+<th style="text-align: right;">SE (bootstrap)</th>
+<th>95% percentile CI</th>
+<th>95% normal CI</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>TVCL</code></td>
+<td style="text-align: right;">0.1330</td>
+<td style="text-align: right;">0.0066</td>
+<td style="text-align: right;">0.0081</td>
+<td>0.1185 – 0.1506</td>
+<td>0.1171 – 0.1488</td>
+</tr>
+<tr class="even">
+<td><code>TVV</code></td>
+<td style="text-align: right;">7.7307</td>
+<td style="text-align: right;">0.2341</td>
+<td style="text-align: right;">0.2444</td>
+<td>7.237 – 8.127</td>
+<td>7.252 – 8.210</td>
+</tr>
+<tr class="odd">
+<td><code>TVKA</code></td>
+<td style="text-align: right;">0.7252</td>
+<td style="text-align: right;">0.1245</td>
+<td style="text-align: right;">0.1405</td>
+<td>0.4675 – 1.0641</td>
+<td>0.4499 – 1.0006</td>
+</tr>
+<tr class="even">
+<td><code>OMEGA(ETA_CL,ETA_CL)</code></td>
+<td style="text-align: right;">0.02859</td>
+<td style="text-align: right;">0.0128</td>
+<td style="text-align: right;">0.0105</td>
+<td>0.0063 – 0.0474</td>
+<td>0.0081 – 0.0491</td>
+</tr>
+<tr class="odd">
+<td><code>OMEGA(ETA_V,ETA_V)</code></td>
+<td style="text-align: right;">0.00958</td>
+<td style="text-align: right;">0.0043</td>
+<td style="text-align: right;">0.0037</td>
+<td>0.0016 – 0.0158</td>
+<td>0.0023 – 0.0169</td>
+</tr>
+<tr class="even">
+<td><code>OMEGA(ETA_KA,ETA_KA)</code></td>
+<td style="text-align: right;">0.34896</td>
+<td style="text-align: right;">0.1608</td>
+<td style="text-align: right;">0.2034</td>
+<td>0.1092 – 0.8622</td>
+<td><strong>−0.0498</strong> – 0.7477</td>
+</tr>
+<tr class="odd">
+<td><code>PROP_ERR</code></td>
+<td style="text-align: right;">0.01075</td>
+<td style="text-align: right;">0.0009</td>
+<td style="text-align: right;">0.0010</td>
+<td>0.00885 – 0.01259</td>
+<td>0.00879 – 0.01271</td>
+</tr>
+</tbody>
+</table>
+<p>Most parameters agree closely, which is the expected — and reassuring — result. The last <code>OMEGA</code> is the interesting row, and it is the argument for the whole tool:</p>
+<ul>
+<li>its bootstrap standard error is <strong>26% larger</strong> than the asymptotic one;</li>
+<li>its bootstrap distribution is strongly <strong>right-skewed</strong> (0.109 – 0.862 around 0.349), which no symmetric interval can express;</li>
+<li>and the normal-approximation interval reaches <strong>below zero</strong> — an impossible value for a variance. The percentile interval cannot, because every endpoint it reports is an estimate that some replicate actually produced.</li>
+</ul>
+<p>That is the diagnostic: where the two intervals agree, the asymptotic standard errors are fine; where they disagree, believe the bootstrap.</p>
+</section>
+<section id="what-is-resampled" class="level2">
+<h2 class="anchored" data-anchor-id="what-is-resampled">What is resampled</h2>
+<p><strong>Whole subjects.</strong> For each ID, every record is either in or out of a replicate — never split. This is what keeps the case bootstrap valid for a hierarchical model.</p>
+<p>A subject drawn more than once enters the fit as <strong>independent individuals</strong>: that is the point of sampling with replacement, and it means the copies must carry distinct identifiers. ferx keeps the original ID and appends <code>#2</code>, <code>#3</code>, … so a diagnostic can still be traced back. (PsN does the same thing by renumbering IDs while writing the replicate data file.)</p>
+</section>
+<section id="which-parameters-are-bootstrapped" class="level2">
+<h2 class="anchored" data-anchor-id="which-parameters-are-bootstrapped">Which parameters are bootstrapped</h2>
+<p>Every estimated population parameter: each theta, the free lower triangle of the between-subject Omega, each sigma, and — when the model declares <code>kappa</code> — the free lower triangle of the inter-occasion Omega, reported as <code>OMEGA_IOV(KAPPA_CL,KAPPA_CL)</code> and so on. Structural zeros (an off-diagonal between two etas that are not in the same <code>block_omega</code>) are not parameters and are not reported.</p>
+<p>The same vector is what <code>--update-inits</code> hands to the replicates and what <code>--dofv</code> evaluates, so a model’s IOV variance is started from the base fit’s estimate and evaluated at the replicate’s, exactly like every other parameter.</p>
+<p>With <code>--keep-covariance</code>, each parameter also gets a per-replicate <code>se_</code> column. A cell there is <strong>empty when core reports no standard error for that coordinate</strong> — an IOV <em>covariance</em>, for instance, since only the IOV variances have one. Empty means “not reported”, never zero.</p>
+<div class="callout callout-style-default callout-warning callout-titled">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Warning</span>Mixture models cannot be bootstrapped — use SIR
+</div>
+</div>
+<div class="callout-body-container callout-body">
+<p>A <code>[mixture]</code> model’s classes are identified only up to relabelling: replicate <em>k</em>’s “class 1” need not be the original fit’s class 1. Averaging estimates across replicates without resolving that mixes two different things, inflating the standard error toward the <strong>between-class separation</strong> — a property of the model, not a sampling uncertainty — while every replicate converges and the table looks entirely reasonable. The error grows with how well separated the classes are, so it is worst exactly when the mixture is best identified and most likely to be believed.</p>
+<p>Relabelling rules exist and would work most of the time. That is the wrong standard for the artefact a reader trusts <em>instead of</em> redoing the analysis, so <code>ferx bootstrap</code> refuses a mixture model rather than reporting a plausible-looking table. This is a settled decision, not a missing feature.</p>
+<p>For parameter uncertainty on a mixture model, use <a href="../estimation/sir.html">SIR</a> (<code>sir = true</code>). SIR never re-optimises — it samples around the maximum-likelihood estimates and reweights by the likelihood — so there is no second basin to fall into and no labelling to resolve. The covariance step is likewise well defined at a single fit’s fixed labelling.</p>
+</div>
+</div>
+<div class="callout callout-style-default callout-warning callout-titled">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Warning</span>A model that reads <code>ID</code> as a covariate cannot be bootstrapped
+</div>
+</div>
+<div class="callout-body-container callout-body">
+<p>Because the duplicate copies are necessarily renamed, a model whose predictions depend on the subject identifier would silently see different values than it did in the base fit. ferx refuses such a run with an error naming the fix. PsN documents the same hazard as a known bug and leaves it to the user to notice.</p>
+</div>
+</div>
+</section>
+<section id="reproducibility" class="level2">
+<h2 class="anchored" data-anchor-id="reproducibility">Reproducibility</h2>
+<p>Each replicate’s draw is derived from the master <code>--seed</code> <strong>and its own index</strong>, so the resampled datasets depend only on <code>--seed</code>, <code>--samples</code>, <code>--sample-size</code> and the strata. They do not depend on <code>--threads</code>, on the order replicates happen to finish in, or on whether the base model was fitted first.</p>
+<div class="callout callout-style-default callout-note callout-titled">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Note</span>This is a deliberate departure from PsN
+</div>
+</div>
+<div class="callout-body-container callout-body">
+<p>The PsN bootstrap user guide documents the opposite as a known wart: <em>“the results of two runs will be different even if the seed is the same if the lst-file of the base model is present at the start of one run but not the other”</em>, because running the base model advances one shared random-number generator. Deriving per replicate removes that coupling, and makes the draw stream something a test can pin.</p>
+</div>
+</div>
+</section>
+<section id="stratified-resampling" class="level2">
+<h2 class="anchored" data-anchor-id="stratified-resampling">Stratified resampling</h2>
+<p>If the dataset mixes populations — the classic case is 10 subjects with rich profiles and 90 with sparse steady-state samples — resample <em>within</em> each group so that every replicate keeps the same composition:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb2"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">ferx</span> bootstrap run12.ferx <span class="at">--data</span> d.csv <span class="at">--stratify-on</span> STUDY</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>The stratification column is read straight from the dataset, so it does not have to be a covariate the model declares, and its values may be non-numeric group labels. It <strong>must take exactly one value per subject</strong>; if it does not, the run stops and names the offending subject, because an individual that belongs to two strata cannot be resampled from either.</p>
+<p>By default each stratum contributes as many subjects as it has. <code>--sample-size</code> changes that in one of two ways:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb3"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># One number: strata are allocated in proportion to their size (rounded).</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="ex">ferx</span> bootstrap run12.ferx <span class="at">--stratify-on</span> STUDY <span class="at">--sample-size</span> 50</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Explicit per stratum — PsN's syntax. Every stratum must be listed.</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="ex">ferx</span> bootstrap run12.ferx <span class="at">--stratify-on</span> STUDY <span class="at">--sample-size</span> <span class="st">"1001=&gt;12,1002=&gt;24,1003=&gt;10"</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>With proportional allocation the rounded per-stratum counts need not sum exactly to the requested total; in the default case (sample size = number of subjects) they always do.</p>
+</section>
+<section id="which-replicates-count" class="level2">
+<h2 class="anchored" data-anchor-id="which-replicates-count">Which replicates count</h2>
+<p>A replicate whose fit did not converge, or whose estimate landed on a bound, is not a draw from the sampling distribution of a converged fit — including it biases the interval. Two filters are therefore <strong>on by default</strong>, matching PsN:</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 33%">
+<col style="width: 33%">
+<col style="width: 33%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>filter</th>
+<th>default</th>
+<th>drops replicates where…</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>--no-skip-minimization-terminated</code></td>
+<td>on</td>
+<td>the fit did not converge</td>
+</tr>
+<tr class="even">
+<td><code>--no-skip-estimate-near-boundary</code></td>
+<td>on</td>
+<td>an estimate sits on a bound</td>
+</tr>
+<tr class="odd">
+<td><code>--skip-covariance-step-terminated</code></td>
+<td>off</td>
+<td>the covariance step failed</td>
+</tr>
+<tr class="even">
+<td><code>--skip-with-covstep-warnings</code></td>
+<td>off</td>
+<td>the covariance step warned</td>
+</tr>
+</tbody>
+</table>
+<p>The two covariance filters read a diagnostic that only exists when the covariance step actually ran, and replicate fits skip it by default (it is most of the cost, and the bootstrap standard error comes from the spread of the estimates, not from any per-replicate <code>R⁻¹</code>). Combining them without <code>--keep-covariance</code> is an error rather than a silent no-op.</p>
+<p>Filters are applied <strong>when the statistics are computed</strong>, not when a replicate finishes. That is what makes it possible to change your mind afterwards:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb4"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">ferx</span> bootstrap <span class="at">--summarize</span> <span class="at">--directory</span> run12-bootstrap <span class="at">--no-skip-minimization-terminated</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p><code>--summarize</code> re-reads <code>raw_results.csv</code> — which carries each replicate’s diagnostics alongside its estimates — and rewrites the statistics. It refits nothing.</p>
+</section>
+<section id="watching-a-run" class="level2">
+<h2 class="anchored" data-anchor-id="watching-a-run">Watching a run</h2>
+<p>A 200-sample bootstrap is minutes to hours of fitting behind a single command, so the run reports each fit as it completes. On the command line that is a progress bar on stderr:</p>
+<pre><code>  [00:01:23] [===============&gt;              ] 97/200 replicates (ETA 00:01:28)</code></pre>
+<p>The base model gets a spinner of its own before the bar appears — it is one fit, and a bar sitting at <code>0/200</code> through it reads as a run that is stuck. <code>--dofv</code> adds a second pass over every replicate, so it gets its own bar rather than extending the first one past what it promised. A <code>--resume</code> run counts what is <em>left</em>: 10 replicates missing from a 200-sample directory is a bar of 10.</p>
+<p>The bar is drawn only when stderr is a terminal, so a run in a log file, a pipe or a scheduler is unaffected. <code>--no-progress</code> suppresses it for an interactive run you want quiet.</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb6"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">ferx</span> bootstrap run12.ferx <span class="at">--data</span> data.csv <span class="at">--samples</span> 200 <span class="at">--no-progress</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>In R the same events drive a <a href="https://cli.r-lib.org">cli</a> progress bar:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb7"><pre class="sourceCode r code-with-copy"><code class="sourceCode r"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a>bs <span class="ot">&lt;-</span> <span class="fu">ferx_bootstrap</span>(model, data, <span class="at">samples =</span> <span class="dv">200</span>, <span class="at">threads =</span> <span class="dv">8</span>, <span class="at">progress =</span> <span class="cn">TRUE</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>The progress stream is presentation only. The draws, the fits and the artefacts are identical whether or not anything is watching, so a run in a terminal and the same run in a cron job produce the same numbers from the same seed.</p>
+</section>
+<section id="recovering-an-interrupted-run" class="level2">
+<h2 class="anchored" data-anchor-id="recovering-an-interrupted-run">Recovering an interrupted run</h2>
+<p>A 200-sample bootstrap is hours of fitting, and the two ways it goes wrong need different answers. PsN’s user guide treats them as one recovery section; ferx splits them by flag.</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 50%">
+<col style="width: 50%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>what happened</th>
+<th>what to do</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>too many samples were filtered out</td>
+<td><code>--summarize</code> — nothing needs refitting, only the exclusion criteria change</td>
+</tr>
+<tr class="even">
+<td>the process was killed, the machine crashed, the job hit a wall clock</td>
+<td><code>--resume</code> — refit only the samples that never finished</td>
+</tr>
+<tr class="odd">
+<td>some samples failed for a transient reason (out of memory, full disk) that has since gone away</td>
+<td><code>--resume --retry-failed</code></td>
+</tr>
+</tbody>
+</table>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb8"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co"># The run dies at sample 137 of 200.</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="ex">ferx</span> bootstrap run12.ferx <span class="at">--data</span> data.csv <span class="at">--samples</span> 200 <span class="at">--directory</span> run12-bootstrap</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Pick it up. Samples 1..136 are read back; 137..200 are fitted.</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="ex">ferx</span> bootstrap run12.ferx <span class="at">--data</span> data.csv <span class="at">--samples</span> 200 <span class="at">--directory</span> run12-bootstrap <span class="at">--resume</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>The per-replicate files are written <strong>as each replicate finishes</strong>, not at the end, so a run killed at any point leaves everything it had already completed.</p>
+<section id="a-resumed-run-is-the-uninterrupted-run" class="level3">
+<h3 class="anchored" data-anchor-id="a-resumed-run-is-the-uninterrupted-run">A resumed run is the uninterrupted run</h3>
+<p>Not “statistically equivalent” — identical. Each replicate’s draw comes from the master seed and its own index, so replicate 137 of the resumed run is fitted on exactly the dataset replicate 137 of the uninterrupted run would have seen, from exactly the same starting estimates: the base model is <strong>reused rather than refitted</strong>, because <code>--update-inits</code> starts every replicate from its results and a second base fit could land somewhere marginally different. <code>raw_results.csv</code> comes out identical either way, wall clock aside, and that is asserted as a test rather than assumed.</p>
+<p>PsN cannot promise this. Its guide documents one shared, order-dependent random-number generator, so a resumed PsN run draws a different set of datasets than an uninterrupted one would have.</p>
+</section>
+<section id="failed-replicates-are-kept-unless-you-say-otherwise" class="level3">
+<h3 class="anchored" data-anchor-id="failed-replicates-are-kept-unless-you-say-otherwise">Failed replicates are kept unless you say otherwise</h3>
+<p>A replicate whose fit <em>errored</em> is recorded with the error text and, by default, carried forward on a resume rather than refitted. This is PsN’s answer — its recovery instructions have you delete the run files you want redone — and it is the right default because a fit that failed on this dataset usually fails again, and paying for it a second time reaches the same place.</p>
+<p><code>--retry-failed</code> inverts that. Use it when the failure was a transient resource problem — an out-of-memory kill, a full disk, a lost network mount — rather than the model.</p>
+<p>Note that an errored replicate is not the same thing as a <em>filtered</em> one. A replicate that merely failed to converge fitted fine, is in <code>raw_results.csv</code> with <code>minimization_successful = 0</code>, and is dropped by a filter at summary time; <code>--retry-failed</code> does not touch it. Change your mind about those with <code>--summarize</code>.</p>
+</section>
+<section id="resuming-the-wrong-directory-is-refused" class="level3">
+<h3 class="anchored" data-anchor-id="resuming-the-wrong-directory-is-refused">Resuming the wrong directory is refused</h3>
+<p>Every run writes <code>bootstrap_run.json</code> beside its CSVs, recording the seed, sample count, sample size, stratification column, <code>--keep-covariance</code> / <code>--dofv</code>, what the replicates were started from (<code>--update-inits</code> / <code>--run-base-model</code>), the parameter names, and SHA-256 hashes of the model file and the dataset. A <code>--resume</code> whose options or inputs disagree is refused, naming the field that differs:</p>
+<pre><code>--resume: `run12-bootstrap` was created with --seed 1, but this run asks for 42.
+Resuming would mix two different runs' replicates into one raw_results.csv.
+Use a fresh --directory, or drop the conflicting option.</code></pre>
+<p>Without that check the resumed file would carry one model’s estimates under another model’s column names — a corruption nothing downstream could detect, because the file would still parse and the statistics would still compute.</p>
+<p>The subtlest case the check covers is <code>--update-inits</code>. Interrupt a default run and resume it with <code>--no-update-inits</code>, and every reused replicate was started from the base fit while every refitted one starts from the model file’s estimates. Both halves are perfectly good fits; the file holding them is a bootstrap of neither. So the starting point is pinned like everything else, and changing it means a fresh <code>--directory</code>.</p>
+<p>A run killed mid-write leaves a partial trailing row. It is dropped and that one sample refitted; only the tail is treated this way, and a malformed row anywhere else is an error, because silently dropping a row in the middle would change the statistics without saying so.</p>
+<div class="callout callout-style-default callout-note callout-titled">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Note</span><code>raw_results.csv</code> is written at full precision
+</div>
+</div>
+<div class="callout-body-container callout-body">
+<p>Its numbers are printed as the shortest decimal that reads back to the same bits, rather than rounded to a fixed number of places, because the file is the run’s checkpoint: a resumed run starts its replicates from the base fit’s estimates <em>as read back from it</em>. Rounding would perturb that starting point and the resumed run would only match the uninterrupted one to about 1e-9. The statistics files (<code>bootstrap_results.csv</code>, <code>bootstrap_diagnostics.csv</code>) keep their fixed ten decimals — nothing is ever fitted from those.</p>
+</div>
+</div>
+</section>
+</section>
+<section id="confidence-intervals" class="level2">
+<h2 class="anchored" data-anchor-id="confidence-intervals">Confidence intervals</h2>
+<p>Percentile intervals use PsN’s estimator, the weighted average at <code>x₍ₙ₊₁₎ₚ</code>:</p>
+<pre><code>n = number of samples + 1
+p = percentile / 100
+i = integer part of n·p
+f = decimal part of n·p
+percentile = (1−f)·xᵢ + f·xᵢ₊₁</code></pre>
+<p>A tail can only be reported when there is an order statistic at or below it — i.e.&nbsp;when <code>(n+1)·p ≥ 1</code>. That single condition reproduces every minimum PsN tabulates:</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>interval</th>
+<th style="text-align: right;">samples needed</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>5% – 95%</td>
+<td style="text-align: right;">19</td>
+</tr>
+<tr class="even">
+<td>2.5% – 97.5%</td>
+<td style="text-align: right;">39</td>
+</tr>
+<tr class="odd">
+<td>0.5% – 99.5%</td>
+<td style="text-align: right;">199</td>
+</tr>
+<tr class="even">
+<td>0.05% – 99.95%</td>
+<td style="text-align: right;">1999</td>
+</tr>
+</tbody>
+</table>
+<p>Below the threshold the percentile interval is left empty rather than extrapolated past the smallest observation, and only the normal-approximation interval (<code>estimate ± z·SE_bootstrap</code>) is reported. PsN’s rule of thumb — and the default — is <strong>200 samples</strong> for standard errors.</p>
+</section>
+<section id="δofv" class="level2">
+<h2 class="anchored" data-anchor-id="δofv">Δofv</h2>
+<p><code>--dofv</code> evaluates each replicate’s parameter vector on the <strong>original</strong> dataset with no estimation (<code>outer_maxiter = 0</code>, exactly NONMEM’s <code>MAXEVAL=0</code>) and reports <code>ofv_bootstrap − ofv_original</code> in <code>delta_ofv.csv</code>.</p>
+<p>Every value is necessarily positive: the original fit’s parameters minimise the objective on the original data, so any other vector scores worse. The useful comparison is against a χ² distribution with degrees of freedom equal to the number of estimated parameters (written to <code>bootstrap_diagnostics.csv</code> as <code>chi_square_df</code>, counted over the free parameter coordinates — so a free 2x2 <code>block_omega</code> contributes three, not two). In theory the bootstrap Δofv distribution should sit <strong>at or below</strong> that reference; if it does not, the bootstrap is not describing the uncertainty well and another method — <a href="../estimation/sir.html">SIR</a> — is the better choice.</p>
+</section>
+<section id="output-files" class="level2">
+<h2 class="anchored" data-anchor-id="output-files">Output files</h2>
+<p>Written to <code>--directory</code> (default <code>{model}-bootstrap</code>). Names follow PsN so existing scripts and habits transfer.</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 50%">
+<col style="width: 50%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>file</th>
+<th>contents</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>raw_results.csv</code></td>
+<td>one row per fit, <strong>first row the original dataset</strong>; estimates, OFV and termination diagnostics (plus <code>se_</code> columns under <code>--keep-covariance</code>)</td>
+</tr>
+<tr class="even">
+<td><code>bootstrap_results.csv</code></td>
+<td>one row per parameter: original, mean, bias, standard error, median, percentile CI, normal CI</td>
+</tr>
+<tr class="odd">
+<td><code>bootstrap_diagnostics.csv</code></td>
+<td>run counts, exclusion tallies, and the mean of each per-replicate diagnostic</td>
+</tr>
+<tr class="even">
+<td><code>included_individuals1.csv</code></td>
+<td>per replicate, the subject IDs drawn (repeats included), in dataset order</td>
+</tr>
+<tr class="odd">
+<td><code>included_keys1.csv</code></td>
+<td>per replicate, the internal 1..N ordinals of those subjects</td>
+</tr>
+<tr class="even">
+<td><code>sample_keys1.csv</code></td>
+<td>per replicate, one count per original subject: how many times it was drawn</td>
+</tr>
+<tr class="odd">
+<td><code>all_individuals1.csv</code></td>
+<td>every subject of the original dataset, in original order</td>
+</tr>
+<tr class="even">
+<td><code>delta_ofv.csv</code></td>
+<td><code>--dofv</code> only</td>
+</tr>
+<tr class="odd">
+<td><code>bootstrap_run.json</code></td>
+<td>the seed, options and input hashes the directory was created with — what <code>--resume</code> checks itself against</td>
+</tr>
+</tbody>
+</table>
+<p>Row <em>j</em> refers to the same replicate in <code>raw_results</code>, <code>included_individuals</code>, <code>included_keys</code> and <code>sample_keys</code>, as in PsN.</p>
+<p>The first four are written <strong>incrementally</strong>, one row per replicate as it finishes, so an interrupted run leaves what it had already done; the rest are written once at the end. A completed run’s files are always in sample order regardless of how its replicates were scheduled, or whether it was resumed. Starting a fresh run into a directory that already holds one overwrites it — add <code>--resume</code> to continue it instead.</p>
+<p>Two files depart from PsN’s layout on purpose. <code>bootstrap_results.csv</code> is <strong>tidy</strong> — one row per parameter — rather than PsN’s stacked blocks of statistics, and the run-level diagnostics live in their own file instead of as a second block inside the results file. A single CSV carrying two different header shapes cannot be read by a data frame, which defeats the point of writing it.</p>
+</section>
+<section id="options" class="level2">
+<h2 class="anchored" data-anchor-id="options">Options</h2>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 33%">
+<col style="width: 33%">
+<col style="width: 33%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>option</th>
+<th>default</th>
+<th>meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>--samples N</code></td>
+<td>200</td>
+<td>number of bootstrap datasets</td>
+</tr>
+<tr class="even">
+<td><code>--seed N</code></td>
+<td>1</td>
+<td>master seed</td>
+</tr>
+<tr class="odd">
+<td><code>--threads N</code></td>
+<td>all cores</td>
+<td>replicates fitted concurrently (each fit uses one thread)</td>
+</tr>
+<tr class="even">
+<td><code>--sample-size M</code></td>
+<td>dataset size</td>
+<td>subjects per replicate, or a per-stratum map</td>
+</tr>
+<tr class="odd">
+<td><code>--stratify-on COL</code></td>
+<td>—</td>
+<td>resample within strata from a dataset column</td>
+</tr>
+<tr class="even">
+<td><code>--directory DIR</code></td>
+<td><code>{model}-bootstrap</code></td>
+<td>where the CSVs go</td>
+</tr>
+<tr class="odd">
+<td><code>--ci LEVEL</code></td>
+<td>95</td>
+<td>two-sided confidence level, percent</td>
+</tr>
+<tr class="even">
+<td><code>--no-update-inits</code></td>
+<td>—</td>
+<td>start replicates from the model file’s inits instead of the base fit’s estimates</td>
+</tr>
+<tr class="odd">
+<td><code>--no-run-base-model</code></td>
+<td>—</td>
+<td>skip the fit on the original data (disables bias, the normal CI, <code>--update-inits</code> and <code>--dofv</code>)</td>
+</tr>
+<tr class="even">
+<td><code>--keep-covariance</code></td>
+<td>off</td>
+<td>run the covariance step for every replicate</td>
+</tr>
+<tr class="odd">
+<td><code>--dofv</code></td>
+<td>off</td>
+<td>compute Δofv against the original dataset</td>
+</tr>
+<tr class="even">
+<td><code>--summarize</code></td>
+<td>off</td>
+<td>recompute statistics from an existing run directory</td>
+</tr>
+<tr class="odd">
+<td><code>--resume</code></td>
+<td>off</td>
+<td>continue an interrupted run in <code>--directory</code>, refitting only the samples it does not already hold</td>
+</tr>
+<tr class="even">
+<td><code>--retry-failed</code></td>
+<td>off</td>
+<td>with <code>--resume</code>, also refit the samples recorded as failed</td>
+</tr>
+</tbody>
+</table>
+<p>Options in the PsN guide with no ferx analogue — <code>-allow_ignore_id</code>, <code>-copy_data</code>, <code>-mceta</code>, <code>-rplots</code>, <code>-clean</code> — are NONMEM run-directory plumbing and are not implemented. <code>-bca</code> (bias-corrected accelerated intervals, which need an additional jackknife pass) is not implemented yet.</p>
+</section>
+<section id="library-api" class="level2">
+<h2 class="anchored" data-anchor-id="library-api">Library API</h2>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb11"><pre class="sourceCode rust code-with-copy"><code class="sourceCode rust"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">ferx_core::</span>prepare_run<span class="op">;</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">ferx_tools::bootstrap::</span><span class="op">{</span>run_bootstrap<span class="op">,</span> BootstrapOptions<span class="op">};</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> prepared <span class="op">=</span> prepare_run(<span class="st">"warfarin.ferx"</span><span class="op">,</span> <span class="cn">Some</span>(<span class="st">"warfarin.csv"</span>))<span class="op">?;</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> result <span class="op">=</span> run_bootstrap(</span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">&amp;</span>prepared<span class="op">,</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a>    <span class="op">&amp;</span>BootstrapOptions <span class="op">{</span> samples<span class="op">:</span> <span class="dv">200</span><span class="op">,</span> seed<span class="op">:</span> <span class="dv">12345</span><span class="op">,</span> <span class="op">..</span><span class="bu">Default</span><span class="pp">::</span><span class="kw">default</span>() <span class="op">},</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a>)<span class="op">?;</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> p <span class="kw">in</span> <span class="op">&amp;</span>result<span class="op">.</span>summary<span class="op">.</span>parameters <span class="op">{</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a>    <span class="pp">println!</span>(<span class="st">"{}: {:.4} (SE {:.4})"</span><span class="op">,</span> p<span class="op">.</span>name<span class="op">,</span> p<span class="op">.</span>mean<span class="op">,</span> p<span class="op">.</span>standard_error)<span class="op">;</span></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p><code>prepare_run</code> is the “load a model and its data, but do not fit” entry point: it resolves the data path against the model’s <code>[data]</code> block, applies <code>[data_selection]</code>, reads the population and binds any <code>theta NAME[...]</code> level blocks — everything <code>ferx model.ferx</code> does up to the fit itself.</p>
+</section>
+<section id="cancelling-a-run" class="level2">
+<h2 class="anchored" data-anchor-id="cancelling-a-run">Cancelling a run</h2>
+<p>A 200-sample bootstrap is minutes to hours of fitting behind one call, so a library caller gets a cooperative abort: <code>BootstrapOptions::cancel</code> takes a <code>CancelFlag</code>, and setting it from another thread ends the run at the next replicate boundary.</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb12"><pre class="sourceCode rust code-with-copy"><code class="sourceCode rust"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">ferx_core::</span>CancelFlag<span class="op">;</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">ferx_tools::bootstrap::</span><span class="op">{</span>run_bootstrap<span class="op">,</span> BootstrapError<span class="op">,</span> BootstrapOptions<span class="op">};</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> flag <span class="op">=</span> <span class="pp">CancelFlag::</span>new()<span class="op">;</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> options <span class="op">=</span> BootstrapOptions <span class="op">{</span> cancel<span class="op">:</span> <span class="cn">Some</span>(flag<span class="op">.</span>clone())<span class="op">,</span> <span class="op">..</span><span class="bu">Default</span><span class="pp">::</span><span class="kw">default</span>() <span class="op">};</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="co">// … from another thread, on a Ctrl-C or a user's "stop" button:</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a>flag<span class="op">.</span>cancel()<span class="op">;</span></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a><span class="cf">match</span> run_bootstrap(<span class="op">&amp;</span>prepared<span class="op">,</span> <span class="op">&amp;</span>options) <span class="op">{</span></span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a>    <span class="cn">Ok</span>(result) <span class="op">=&gt;</span> report(result)<span class="op">,</span></span>
+<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a>    <span class="cn">Err</span>(<span class="pp">BootstrapError::</span>Cancelled) <span class="op">=&gt;</span> <span class="pp">eprintln!</span>(<span class="st">"stopped; --resume picks it up"</span>)<span class="op">,</span></span>
+<span id="cb12-13"><a href="#cb12-13" aria-hidden="true" tabindex="-1"></a>    <span class="cn">Err</span>(e) <span class="op">=&gt;</span> <span class="pp">eprintln!</span>(<span class="st">"Error: {e}"</span>)<span class="op">,</span></span>
+<span id="cb12-14"><a href="#cb12-14" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>Three things follow from where the flag is checked.</p>
+<p><strong>A cancelled run is not a failed one.</strong> The flag also reaches every replicate’s own fit, so a replicate that was mid-fit unwinds with an error of its own rather than running to completion. Those are dropped, never written to <code>raw_results.csv</code> — a recorded failure is one that <a href="#recovering-an-interrupted-run">a resume carries forward</a> instead of refitting, which would silently cost the run a replicate. What the flag stops is <em>scheduling</em>: the draws that had not started are not fitted at all.</p>
+<p><strong>Everything already finished is on disk.</strong> The journal flushes each replicate as it lands, so a cancelled run leaves the same directory an interrupted one does, and <code>--resume</code> continues it into exactly the run that was cancelled. The statistics files are the exception: a cancelled run does not write an interval over a truncated set of replicates.</p>
+<p><strong>A cancel before the run starts is a no-op on the directory.</strong> The flag is read before the journal is opened, and opening it rewrites the per-replicate files — so cancelling a mistyped command cannot destroy the artefacts of the run that is already there.</p>
+<p><code>ferx bootstrap</code> does not install a signal handler yet, so the CLI has nothing to set the flag from; on the R side, <code>ferx_bootstrap()</code> currently runs the bootstrap on the R main thread and so cannot poll for an interrupt either. Both are tracked separately — this is the engine half.</p>
+
+
+</section>
+</section>
+
+</main> <!-- /main -->
+<script>
+(function () {
+  var HEAD = '<div class="panel-head"><span class="dots"><i></i><i></i><i></i></span><span class="file"><span class="br">[</span>warfarin_pk.ferx<span class="br">]</span></span></div>';
+
+  function apply() {
+    var dark = document.documentElement.getAttribute('data-bs-theme') === 'dark';
+    document.querySelectorAll('div.sourceCode').forEach(function (el) {
+      if (el.parentElement && el.parentElement.closest('.code-panel')) return;
+      if (dark) {
+        if (!el.classList.contains('code-panel')) {
+          el.classList.add('code-panel');
+          el.insertAdjacentHTML('afterbegin', HEAD);
+        }
+      } else {
+        el.classList.remove('code-panel');
+        var h = el.querySelector(':scope > .panel-head');
+        if (h) h.remove();
+      }
+    });
+  }
+
+  if (document.body) apply();
+  document.addEventListener('DOMContentLoaded', apply);
+  new MutationObserver(function (ms) {
+    ms.forEach(function (m) { if (m.attributeName === 'data-bs-theme') apply(); });
+  }).observe(document.documentElement, { attributes: true });
+}());
+</script>
+<script id="quarto-html-after-body" type="application/javascript">
+  window.document.addEventListener("DOMContentLoaded", function (event) {
+    // Ensure there is a toggle, if there isn't float one in the top right
+    if (window.document.querySelector('.quarto-color-scheme-toggle') === null) {
+      const a = window.document.createElement('a');
+      a.classList.add('top-right');
+      a.classList.add('quarto-color-scheme-toggle');
+      a.href = "";
+      a.onclick = function() { try { window.quartoToggleColorScheme(); } catch {} return false; };
+      const i = window.document.createElement("i");
+      i.classList.add('bi');
+      a.appendChild(i);
+      window.document.body.appendChild(a);
+    }
+    setColorSchemeToggle(hasAlternateSentinel())
+    const icon = "";
+    const anchorJS = new window.AnchorJS();
+    anchorJS.options = {
+      placement: 'right',
+      icon: icon
+    };
+    anchorJS.add('.anchored');
+    const isCodeAnnotation = (el) => {
+      for (const clz of el.classList) {
+        if (clz.startsWith('code-annotation-')) {                     
+          return true;
+        }
+      }
+      return false;
+    }
+    const onCopySuccess = function(e) {
+      // button target
+      const button = e.trigger;
+      // don't keep focus
+      button.blur();
+      // flash "checked"
+      button.classList.add('code-copy-button-checked');
+      var currentTitle = button.getAttribute("title");
+      button.setAttribute("title", "Copied!");
+      let tooltip;
+      if (window.bootstrap) {
+        button.setAttribute("data-bs-toggle", "tooltip");
+        button.setAttribute("data-bs-placement", "left");
+        button.setAttribute("data-bs-title", "Copied!");
+        tooltip = new bootstrap.Tooltip(button, 
+          { trigger: "manual", 
+            customClass: "code-copy-button-tooltip",
+            offset: [0, -8]});
+        tooltip.show();    
+      }
+      setTimeout(function() {
+        if (tooltip) {
+          tooltip.hide();
+          button.removeAttribute("data-bs-title");
+          button.removeAttribute("data-bs-toggle");
+          button.removeAttribute("data-bs-placement");
+        }
+        button.setAttribute("title", currentTitle);
+        button.classList.remove('code-copy-button-checked');
+      }, 1000);
+      // clear code selection
+      e.clearSelection();
+    }
+    const getTextToCopy = function(trigger) {
+      const outerScaffold = trigger.parentElement.cloneNode(true);
+      const codeEl = outerScaffold.querySelector('code');
+      for (const childEl of codeEl.children) {
+        if (isCodeAnnotation(childEl)) {
+          childEl.remove();
+        }
+      }
+      return codeEl.innerText;
+    }
+    const clipboard = new window.ClipboardJS('.code-copy-button:not([data-in-quarto-modal])', {
+      text: getTextToCopy
+    });
+    clipboard.on('success', onCopySuccess);
+    if (window.document.getElementById('quarto-embedded-source-code-modal')) {
+      const clipboardModal = new window.ClipboardJS('.code-copy-button[data-in-quarto-modal]', {
+        text: getTextToCopy,
+        container: window.document.getElementById('quarto-embedded-source-code-modal')
+      });
+      clipboardModal.on('success', onCopySuccess);
+    }
+      var localhostRegex = new RegExp(/^(?:http|https):\/\/localhost\:?[0-9]*\//);
+      var mailtoRegex = new RegExp(/^mailto:/);
+        var filterRegex = new RegExp("https:\/\/ferx-nlme\.github\.io\/ferx-core\/");
+      var isInternal = (href) => {
+          return filterRegex.test(href) || localhostRegex.test(href) || mailtoRegex.test(href);
+      }
+      // Inspect non-navigation links and adorn them if external
+     var links = window.document.querySelectorAll('a[href]:not(.nav-link):not(.navbar-brand):not(.toc-action):not(.sidebar-link):not(.sidebar-item-toggle):not(.pagination-link):not(.no-external):not([aria-hidden]):not(.dropdown-item):not(.quarto-navigation-tool):not(.about-link)');
+      for (var i=0; i<links.length; i++) {
+        const link = links[i];
+        if (!isInternal(link.href)) {
+          // undo the damage that might have been done by quarto-nav.js in the case of
+          // links that we want to consider external
+          if (link.dataset.originalHref !== undefined) {
+            link.href = link.dataset.originalHref;
+          }
+        }
+      }
+    function tippyHover(el, contentFn, onTriggerFn, onUntriggerFn) {
+      const config = {
+        allowHTML: true,
+        maxWidth: 500,
+        delay: 100,
+        arrow: false,
+        appendTo: function(el) {
+            return el.parentElement;
+        },
+        interactive: true,
+        interactiveBorder: 10,
+        theme: 'quarto',
+        placement: 'bottom-start',
+      };
+      if (contentFn) {
+        config.content = contentFn;
+      }
+      if (onTriggerFn) {
+        config.onTrigger = onTriggerFn;
+      }
+      if (onUntriggerFn) {
+        config.onUntrigger = onUntriggerFn;
+      }
+      window.tippy(el, config); 
+    }
+    const noterefs = window.document.querySelectorAll('a[role="doc-noteref"]');
+    for (var i=0; i<noterefs.length; i++) {
+      const ref = noterefs[i];
+      tippyHover(ref, function() {
+        // use id or data attribute instead here
+        let href = ref.getAttribute('data-footnote-href') || ref.getAttribute('href');
+        try { href = new URL(href).hash; } catch {}
+        const id = href.replace(/^#\/?/, "");
+        const note = window.document.getElementById(id);
+        if (note) {
+          return note.innerHTML;
+        } else {
+          return "";
+        }
+      });
+    }
+    const xrefs = window.document.querySelectorAll('a.quarto-xref');
+    const processXRef = (id, note) => {
+      // Strip column container classes
+      const stripColumnClz = (el) => {
+        el.classList.remove("page-full", "page-columns");
+        if (el.children) {
+          for (const child of el.children) {
+            stripColumnClz(child);
+          }
+        }
+      }
+      stripColumnClz(note)
+      if (id === null || id.startsWith('sec-')) {
+        // Special case sections, only their first couple elements
+        const container = document.createElement("div");
+        if (note.children && note.children.length > 2) {
+          container.appendChild(note.children[0].cloneNode(true));
+          for (let i = 1; i < note.children.length; i++) {
+            const child = note.children[i];
+            if (child.tagName === "P" && child.innerText === "") {
+              continue;
+            } else {
+              container.appendChild(child.cloneNode(true));
+              break;
+            }
+          }
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(container);
+          }
+          return container.innerHTML
+        } else {
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(note);
+          }
+          return note.innerHTML;
+        }
+      } else {
+        // Remove any anchor links if they are present
+        const anchorLink = note.querySelector('a.anchorjs-link');
+        if (anchorLink) {
+          anchorLink.remove();
+        }
+        if (window.Quarto?.typesetMath) {
+          window.Quarto.typesetMath(note);
+        }
+        if (note.classList.contains("callout")) {
+          return note.outerHTML;
+        } else {
+          return note.innerHTML;
+        }
+      }
+    }
+    for (var i=0; i<xrefs.length; i++) {
+      const xref = xrefs[i];
+      tippyHover(xref, undefined, function(instance) {
+        instance.disable();
+        let url = xref.getAttribute('href');
+        let hash = undefined; 
+        if (url.startsWith('#')) {
+          hash = url;
+        } else {
+          try { hash = new URL(url).hash; } catch {}
+        }
+        if (hash) {
+          const id = hash.replace(/^#\/?/, "");
+          const note = window.document.getElementById(id);
+          if (note !== null) {
+            try {
+              const html = processXRef(id, note.cloneNode(true));
+              instance.setContent(html);
+            } finally {
+              instance.enable();
+              instance.show();
+            }
+          } else {
+            // See if we can fetch this
+            fetch(url.split('#')[0])
+            .then(res => res.text())
+            .then(html => {
+              const parser = new DOMParser();
+              const htmlDoc = parser.parseFromString(html, "text/html");
+              const note = htmlDoc.getElementById(id);
+              if (note !== null) {
+                const html = processXRef(id, note);
+                instance.setContent(html);
+              } 
+            }).finally(() => {
+              instance.enable();
+              instance.show();
+            });
+          }
+        } else {
+          // See if we can fetch a full url (with no hash to target)
+          // This is a special case and we should probably do some content thinning / targeting
+          fetch(url)
+          .then(res => res.text())
+          .then(html => {
+            const parser = new DOMParser();
+            const htmlDoc = parser.parseFromString(html, "text/html");
+            const note = htmlDoc.querySelector('main.content');
+            if (note !== null) {
+              // This should only happen for chapter cross references
+              // (since there is no id in the URL)
+              // remove the first header
+              if (note.children.length > 0 && note.children[0].tagName === "HEADER") {
+                note.children[0].remove();
+              }
+              const html = processXRef(null, note);
+              instance.setContent(html);
+            } 
+          }).finally(() => {
+            instance.enable();
+            instance.show();
+          });
+        }
+      }, function(instance) {
+      });
+    }
+        let selectedAnnoteEl;
+        const selectorForAnnotation = ( cell, annotation) => {
+          let cellAttr = 'data-code-cell="' + cell + '"';
+          let lineAttr = 'data-code-annotation="' +  annotation + '"';
+          const selector = 'span[' + cellAttr + '][' + lineAttr + ']';
+          return selector;
+        }
+        const selectCodeLines = (annoteEl) => {
+          const doc = window.document;
+          const targetCell = annoteEl.getAttribute("data-target-cell");
+          const targetAnnotation = annoteEl.getAttribute("data-target-annotation");
+          const annoteSpan = window.document.querySelector(selectorForAnnotation(targetCell, targetAnnotation));
+          const lines = annoteSpan.getAttribute("data-code-lines").split(",");
+          const lineIds = lines.map((line) => {
+            return targetCell + "-" + line;
+          })
+          let top = null;
+          let height = null;
+          let parent = null;
+          if (lineIds.length > 0) {
+              //compute the position of the single el (top and bottom and make a div)
+              const el = window.document.getElementById(lineIds[0]);
+              top = el.offsetTop;
+              height = el.offsetHeight;
+              parent = el.parentElement.parentElement;
+            if (lineIds.length > 1) {
+              const lastEl = window.document.getElementById(lineIds[lineIds.length - 1]);
+              const bottom = lastEl.offsetTop + lastEl.offsetHeight;
+              height = bottom - top;
+            }
+            if (top !== null && height !== null && parent !== null) {
+              // cook up a div (if necessary) and position it 
+              let div = window.document.getElementById("code-annotation-line-highlight");
+              if (div === null) {
+                div = window.document.createElement("div");
+                div.setAttribute("id", "code-annotation-line-highlight");
+                div.style.position = 'absolute';
+                parent.appendChild(div);
+              }
+              div.style.top = top - 2 + "px";
+              div.style.height = height + 4 + "px";
+              div.style.left = 0;
+              let gutterDiv = window.document.getElementById("code-annotation-line-highlight-gutter");
+              if (gutterDiv === null) {
+                gutterDiv = window.document.createElement("div");
+                gutterDiv.setAttribute("id", "code-annotation-line-highlight-gutter");
+                gutterDiv.style.position = 'absolute';
+                const codeCell = window.document.getElementById(targetCell);
+                const gutter = codeCell.querySelector('.code-annotation-gutter');
+                gutter.appendChild(gutterDiv);
+              }
+              gutterDiv.style.top = top - 2 + "px";
+              gutterDiv.style.height = height + 4 + "px";
+            }
+            selectedAnnoteEl = annoteEl;
+          }
+        };
+        const unselectCodeLines = () => {
+          const elementsIds = ["code-annotation-line-highlight", "code-annotation-line-highlight-gutter"];
+          elementsIds.forEach((elId) => {
+            const div = window.document.getElementById(elId);
+            if (div) {
+              div.remove();
+            }
+          });
+          selectedAnnoteEl = undefined;
+        };
+          // Handle positioning of the toggle
+      window.addEventListener(
+        "resize",
+        throttle(() => {
+          elRect = undefined;
+          if (selectedAnnoteEl) {
+            selectCodeLines(selectedAnnoteEl);
+          }
+        }, 10)
+      );
+      function throttle(fn, ms) {
+      let throttle = false;
+      let timer;
+        return (...args) => {
+          if(!throttle) { // first call gets through
+              fn.apply(this, args);
+              throttle = true;
+          } else { // all the others get throttled
+              if(timer) clearTimeout(timer); // cancel #2
+              timer = setTimeout(() => {
+                fn.apply(this, args);
+                timer = throttle = false;
+              }, ms);
+          }
+        };
+      }
+        // Attach click handler to the DT
+        const annoteDls = window.document.querySelectorAll('dt[data-target-cell]');
+        for (const annoteDlNode of annoteDls) {
+          annoteDlNode.addEventListener('click', (event) => {
+            const clickedEl = event.target;
+            if (clickedEl !== selectedAnnoteEl) {
+              unselectCodeLines();
+              const activeEl = window.document.querySelector('dt[data-target-cell].code-annotation-active');
+              if (activeEl) {
+                activeEl.classList.remove('code-annotation-active');
+              }
+              selectCodeLines(clickedEl);
+              clickedEl.classList.add('code-annotation-active');
+            } else {
+              // Unselect the line
+              unselectCodeLines();
+              clickedEl.classList.remove('code-annotation-active');
+            }
+          });
+        }
+    const findCites = (el) => {
+      const parentEl = el.parentElement;
+      if (parentEl) {
+        const cites = parentEl.dataset.cites;
+        if (cites) {
+          return {
+            el,
+            cites: cites.split(' ')
+          };
+        } else {
+          return findCites(el.parentElement)
+        }
+      } else {
+        return undefined;
+      }
+    };
+    var bibliorefs = window.document.querySelectorAll('a[role="doc-biblioref"]');
+    for (var i=0; i<bibliorefs.length; i++) {
+      const ref = bibliorefs[i];
+      const citeInfo = findCites(ref);
+      if (citeInfo) {
+        tippyHover(citeInfo.el, function() {
+          var popup = window.document.createElement('div');
+          citeInfo.cites.forEach(function(cite) {
+            var citeDiv = window.document.createElement('div');
+            citeDiv.classList.add('hanging-indent');
+            citeDiv.classList.add('csl-entry');
+            var biblioDiv = window.document.getElementById('ref-' + cite);
+            if (biblioDiv) {
+              citeDiv.innerHTML = biblioDiv.innerHTML;
+            }
+            popup.appendChild(citeDiv);
+          });
+          return popup.innerHTML;
+        });
+      }
+    }
+  });
+  </script>
+</div> <!-- /content -->
+<footer class="footer">
+  <div class="nav-footer">
+    <div class="nav-footer-left">
+<p>© 2026 FeRx-NLME · MIT licensed</p>
+</div>   
+    <div class="nav-footer-center">
+      &nbsp;
+    <div class="toc-actions d-sm-block d-md-none"><ul><li><a href="https://github.com/FeRx-NLME/ferx-core/edit/main/tools/bootstrap.qmd" class="toc-action"><i class="bi bi-github"></i>Edit this page</a></li><li><a href="https://github.com/FeRx-NLME/ferx-core/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></div>
+    <div class="nav-footer-right">
+<p>Fe · 26 · Rx · 2026</p>
+</div>
+  </div>
+</footer>
+
+
+
+
+</body></html>
