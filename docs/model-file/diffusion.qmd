@@ -160,6 +160,25 @@ variance goes to zero. Measured on the model above (`CL = 1`, `V = 20`, `KTAD = 
 at 0 and 12): `OFV = 14.7016` from the EKF at `central ~ 1e-14` and `14.7016` from the same
 model with the `[diffusion]` block removed.
 
+That reduction holds for the dataset above. It is **not** unconditional, because the
+EKF/SDE path does not implement every dosing feature the ODE path does. Each gap below
+raises a warning rather than failing, so check the fit's warnings before relying on the
+equivalence:
+
+| Dataset feature | Code | What the SDE path does instead |
+|---|---|---|
+| `EVID=3`/`4` system reset | `W_SDE_RESET` | the reset is ignored; compartment amounts carry through |
+| `lagtime` / `ALAGn` | `W_SDE_LAGTIME` | every dose is applied at its record time |
+| `SS=1` steady-state dose | `W_SDE_STEADY_STATE` | the record is applied as a single dose, not equilibrated |
+
+The steady-state gap is the one most likely to be mistaken for a converged answer: on a
+1-cpt model with `CL = 1`, `V = 20`, one `SS=1, II=12` record and an autonomous right-hand
+side, the EKF returns `90.48` where an explicit eleven-dose train returns `200.27`. The
+`TAD` anchor is folded into `[0, II)` for that record as though the train existed, so a
+right-hand side reading `TAD` diverges further still — `45.60` against `36.74` at `t = 150`
+for an `SS=1` infusion whose end lands inside a dosing interval. Expand the steady state
+into explicit dose records, or fit the model without `[diffusion]`.
+
 `TIME` / `T` is the integration variable itself and has always been readable here. `TAFD`
 and `TAD` are passed in two extra parameter slots, and until #1131 the EKF was handed an
 array two slots short, so both evaluated to `NaN` for the whole trajectory. That failure was

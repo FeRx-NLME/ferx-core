@@ -2356,14 +2356,31 @@ fn tad_anchor(subject: &Subject, dose_lagtimes: &[f64], t_start: f64) -> f64 {
 /// (segment start, and the pre/post sides of a saltation) — and three of them disagree
 /// on `(t_dose = 120, ALAG = 3, II = 12, t = 121)`, returning `-2.0`, `NaN` and `+1.0`.
 /// A seventh was not worth adding for the sake of a `&Subject` this engine does not have.
+///
+/// `dose_lagtimes` may be **shorter than `doses`, including empty** — a missing entry is
+/// zero lag, matching [`active_infusions`] and `api::output_columns::tad_at_time`. An
+/// engine with no lagtime concept passes `&[]`.
+///
+/// **The `ss` branch describes a periodic pulse train.** It folds the elapsed time into
+/// `[0, II)` as though virtual doses had arrived at `t_dose + k·II`, so a caller whose
+/// state was *not* built from such a train gets an anchor its own dose history does not
+/// justify — measured on #1263 as a 24.1% `ipred` divergence for one `SS=1` infusion
+/// whose end break lands past a virtual pulse. Callers that do not equilibrate an `SS`
+/// dose must warn (`W_SDE_STEADY_STATE`) rather than quietly consume this.
 #[inline]
 pub(crate) fn tad_anchor_for(doses: &[DoseEvent], dose_lagtimes: &[f64], t_start: f64) -> f64 {
+    // `.get(..).unwrap_or(0.0)`, not `dose_lagtimes[i]`: a short slice means "no lag on
+    // the remaining doses", which is what `active_infusions` (`:1520`) and
+    // `api::output_columns::tad_at_time` already spell, and it lets a caller with no
+    // lagtime concept at all pass `&[]` instead of allocating a zero-filled vector whose
+    // only job is to satisfy a length invariant enforced by a panic (#1263 review).
+    let lag_at = |i: usize| dose_lagtimes.get(i).copied().unwrap_or(0.0);
     let last_dose_eff = doses
         .iter()
         .enumerate()
-        .filter(|(i, d)| d.time + dose_lagtimes[*i] <= t_start + 1e-12)
+        .filter(|(i, d)| d.time + lag_at(*i) <= t_start + 1e-12)
         .map(|(i, d)| {
-            let lag = dose_lagtimes[i];
+            let lag = lag_at(i);
             if d.ss && d.ii > 0.0 {
                 let elapsed = t_start - (d.time + lag);
                 t_start - elapsed.rem_euclid(d.ii)
@@ -2381,7 +2398,7 @@ pub(crate) fn tad_anchor_for(doses: &[DoseEvent], dose_lagtimes: &[f64], t_start
     let first_arrival = doses
         .iter()
         .enumerate()
-        .map(|(i, d)| d.time + dose_lagtimes[i])
+        .map(|(i, d)| d.time + lag_at(i))
         .fold(f64::INFINITY, f64::min);
     if first_arrival.is_finite() {
         first_arrival

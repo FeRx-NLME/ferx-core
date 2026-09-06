@@ -297,3 +297,168 @@ fn sde_emits_experimental_warning() {
         "non-SDE model should not emit W_EXPERIMENTAL_SDE"
     );
 }
+
+/// #1263: dosing features the EKF/SDE path silently drops must **warn**, mirroring the
+/// `W_SDE_RESET` precedent, rather than return a plausible wrong number.
+///
+/// `solve_ekf` applies an `SS=1` record as a single bolus with no equilibration, and
+/// never calls `DoseAttrMap::lagtime` at all. Neither gap fails, neither is visible in
+/// `IPRED` (the likelihood takes only `p_obs` from the filter), and both are large:
+/// measured on a 1-cpt autonomous model, one `SS=1, II=12` record gives `90.48` against
+/// `200.27` for the equivalent explicit train.
+///
+/// Each case is asserted against its **own** control — the same population without the
+/// feature — so a warning that fired unconditionally would fail here too.
+mod sde_unsupported_dosing_warnings {
+    use super::*;
+
+    /// The shared SDE model with a `lagtime` bound, so `model.has_lagtime()` is true.
+    const SDE_LAG_MODEL_SRC: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVLAG(0.5, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma ADD ~ 1.0 FIX
+
+[individual_parameters]
+  CL      = TVCL * exp(ETA_CL)
+  V       = TVV
+  lagtime = TVLAG
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central
+
+[diffusion]
+  central ~ 0.5
+
+[error_model]
+  DV ~ additive(ADD)
+
+[fit_options]
+  method = foce
+"#;
+
+    /// The same, without `[diffusion]` — the non-SDE control for the lag warning.
+    const ODE_LAG_MODEL_SRC: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVLAG(0.5, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma ADD ~ 1.0 FIX
+
+[individual_parameters]
+  CL      = TVCL * exp(ETA_CL)
+  V       = TVV
+  lagtime = TVLAG
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central
+
+[error_model]
+  DV ~ additive(ADD)
+
+[fit_options]
+  method = foce
+"#;
+
+    fn codes(src: &str, pop: &Population) -> Vec<String> {
+        let parsed = parse_full_model(src).expect("model parses");
+        let m = &parsed.model;
+        super::super::check_model_data_warnings(m, pop, &m.default_params)
+            .iter()
+            .map(|d| d.code.clone())
+            .collect()
+    }
+
+    /// `make_sde_population` with every subject's dose flipped to `SS=1, II=12`.
+    fn ss_population() -> Population {
+        let mut pop = make_sde_population();
+        for s in &mut pop.subjects {
+            s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)];
+        }
+        pop
+    }
+
+    #[test]
+    fn a_lagtime_under_diffusion_warns() {
+        let pop = make_sde_population();
+        assert!(
+            codes(SDE_LAG_MODEL_SRC, &pop).contains(&"W_SDE_LAGTIME".to_string()),
+            "a [diffusion] model declaring lagtime must raise W_SDE_LAGTIME"
+        );
+        // Control 1 — the same lagtime with no [diffusion] block. Isolates the SDE half
+        // of the predicate: without this the warning could be keyed on lagtime alone.
+        assert!(
+            !codes(ODE_LAG_MODEL_SRC, &pop).contains(&"W_SDE_LAGTIME".to_string()),
+            "an ODE model with a lagtime must NOT raise W_SDE_LAGTIME"
+        );
+        // Control 2 — [diffusion] with no lagtime. Isolates the other half.
+        assert!(
+            !codes(SDE_MODEL_SRC, &pop).contains(&"W_SDE_LAGTIME".to_string()),
+            "a [diffusion] model without a lagtime must NOT raise W_SDE_LAGTIME"
+        );
+    }
+
+    #[test]
+    fn a_steady_state_dose_under_diffusion_warns() {
+        let ss = ss_population();
+        let plain = make_sde_population();
+        assert!(
+            codes(SDE_MODEL_SRC, &ss).contains(&"W_SDE_STEADY_STATE".to_string()),
+            "a [diffusion] model with SS=1 records must raise W_SDE_STEADY_STATE"
+        );
+        // Control 1 — the same model, same subjects, doses not flagged SS.
+        assert!(
+            !codes(SDE_MODEL_SRC, &plain).contains(&"W_SDE_STEADY_STATE".to_string()),
+            "a [diffusion] model with no SS record must NOT raise W_SDE_STEADY_STATE"
+        );
+        // Control 2 — the same SS records with no [diffusion] block; the ODE path does
+        // equilibrate, so there is nothing to warn about.
+        assert!(
+            !codes(BASE_MODEL_SRC, &ss).contains(&"W_SDE_STEADY_STATE".to_string()),
+            "an ODE model with SS=1 records must NOT raise W_SDE_STEADY_STATE"
+        );
+    }
+
+    /// The message has to name the workaround, not just the gap — a warning that says
+    /// only "not supported" leaves the user with a silently wrong objective and no move.
+    #[test]
+    fn the_messages_say_what_to_do_instead() {
+        let parsed = parse_full_model(SDE_MODEL_SRC).expect("model parses");
+        let m = &parsed.model;
+        let diags = super::super::check_model_data_warnings(m, &ss_population(), &m.default_params);
+        let ss = diags
+            .iter()
+            .find(|d| d.code == "W_SDE_STEADY_STATE")
+            .expect("W_SDE_STEADY_STATE present");
+        assert_eq!(ss.severity, crate::diagnostics::Severity::Warning);
+        assert!(
+            ss.message.contains("explicit dose train"),
+            "the SS warning must point at the expansion workaround: {}",
+            ss.message
+        );
+
+        let parsed_lag = parse_full_model(SDE_LAG_MODEL_SRC).expect("model parses");
+        let ml = &parsed_lag.model;
+        let lag_diags =
+            super::super::check_model_data_warnings(ml, &make_sde_population(), &ml.default_params);
+        let lag = lag_diags
+            .iter()
+            .find(|d| d.code == "W_SDE_LAGTIME")
+            .expect("W_SDE_LAGTIME present");
+        assert_eq!(lag.severity, crate::diagnostics::Severity::Warning);
+        assert!(
+            lag.message.contains("record time"),
+            "the lag warning must say what happens instead: {}",
+            lag.message
+        );
+    }
+}

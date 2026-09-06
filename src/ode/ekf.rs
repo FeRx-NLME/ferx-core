@@ -192,32 +192,69 @@ pub fn solve_ekf(
         pk_params_flat,
         crate::ode::predictions::earliest_dose_time(doses),
     );
-    // This path applies no lagtime (see `dose_f_bio` below and the `active_infusions`
-    // call), so the anchor rule is fed zero lags — the same values the rest of this
-    // function already assumes.
-    let no_lag: Vec<f64> = vec![0.0; doses.len()];
-
-    let obs_map: HashMap<u64, usize> = obs_times
-        .iter()
-        .enumerate()
-        .map(|(i, &t)| (t.to_bits(), i))
-        .collect();
-
-    // Build break times (same logic as ode_predictions)
-    let t_last = obs_times.iter().cloned().fold(0.0f64, f64::max);
-    let mut break_times: Vec<f64> = vec![0.0];
-    for dose in doses {
-        break_times.push(dose.time);
-        if is_real_infusion(dose) {
-            break_times.push(dose.time + dose.duration);
-        }
+    // Every observation index at a given time, not just the last one: multiple records
+    // can share a time (simultaneous PK/PD samples on different compartments), and a
+    // `HashMap<u64, usize>` keeps only one of them — the rest would keep the
+    // `EkfObsPoint { ipred: 0.0, p_obs: 0.0 }` prefill from above and feed a finite,
+    // plausible zero into the likelihood. The boundary-read path below was hardened for
+    // exactly this in #1226; the in-segment path was not, and measured on #1263
+    // `obs_times = [2.0, 2.0, 8.0]` returned `ipred = 0.0` for the first of the pair
+    // (#1263 review). Mirrors `predictions::build_obs_index_map`.
+    let mut obs_map: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (i, &t) in obs_times.iter().enumerate() {
+        obs_map.entry(t.to_bits()).or_default().push(i);
     }
+
     // Bioavailability resolved per dose compartment (`Fn`; issue #369), falling
     // back to the bare `F` slot. (The EKF path does not apply lagtime.)
     let dose_f_bio: Vec<f64> = doses
         .iter()
         .map(|d| dose_attr_map.f_bio(d.cmt_raw(), pk_params_flat))
         .collect();
+
+    // Build break times (same logic as ode_predictions).
+    //
+    // The first break is the subject's own integration start, **not** a literal `0.0`:
+    // for a subject whose records begin at `t > 0` a leading `[0, t_first]` segment is
+    // pure fiction, and it is not free — `propagate_covariance` runs it, so `p_mat`
+    // reaches the first observation carrying `q · t_first` of process noise the ODE path
+    // never accumulates (measured 13× on #1263), and an `init(state)` mean decays across
+    // it before the twin has started. `doses`/`obs_times` are what this engine is given,
+    // so the start is the min over them rather than `subject_integration_start`'s wider
+    // event set — the caller (`ode_predictions_ekf_with_diffusion`) passes the subject's
+    // full dose and observation lists, and pk-only/reset rows are not honoured here at
+    // all (`W_SDE_RESET`).
+    let t_first = obs_times
+        .iter()
+        .chain(doses.iter().map(|d| &d.time))
+        .cloned()
+        .fold(f64::INFINITY, f64::min);
+    // `fold(0.0, max)` matches `ode_predictions` (`:3225`), then clamped up to `t_first`.
+    // Without the clamp a subject with **no observations** — `t_last` folds to `0.0`
+    // while `t_first` is its first dose — pushes a `0.0` back into `break_times` and
+    // restores the very phantom leading segment this seed removes. Nothing is scored for
+    // such a subject, so it costs only wasted integration, but it would make the code
+    // contradict the comment above.
+    let t_last = obs_times
+        .iter()
+        .cloned()
+        .fold(0.0f64, f64::max)
+        .max(if t_first.is_finite() { t_first } else { 0.0 });
+    // `subject_integration_start`'s own dose-free fallback, spelled here because this
+    // engine holds slices rather than a `&Subject`.
+    let mut break_times: Vec<f64> = vec![if t_first.is_finite() { t_first } else { 0.0 }];
+    for (k, dose) in doses.iter().enumerate() {
+        break_times.push(dose.time);
+        if is_real_infusion(dose) {
+            // `F`-reshaped window end, matching `active_infusions`' own membership test
+            // (`predictions.rs:1520-1531`) and `collect_dose_break_times`. An unscaled
+            // `dose.duration` puts the break past the true end, so the admission test
+            // `end >= t_end - EPS` fails and the infusion is never admitted in *any*
+            // segment — measured on #1263 as `ipred = 0.0` everywhere for `F = 0.5`.
+            let (_, dur_eff) = dose.bioavailable_infusion(dose_f_bio[k]);
+            break_times.push(dose.time + dur_eff);
+        }
+    }
     break_times.push(t_last);
     break_times.sort_by(|a, b| a.total_cmp(b));
     break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
@@ -300,10 +337,10 @@ pub fn solve_ekf(
             let point = EkfObsPoint { ipred, p_obs };
             // Records sharing this exact time are one measurement instant: they take the
             // same `ipred`/`p_obs` from this single update rather than each running their
-            // own — the collapsing the old `obs_map.get(&t_start.to_bits())` did, since that
-            // map keeps one index per bit pattern. They are *filled* rather than dropped:
-            // the band excludes them from the segment `saveat` too, so a dropped index would
-            // keep its `EkfObsPoint { ipred: 0.0, p_obs: 0.0 }` prefill and feed a finite,
+            // own. The in-segment read below collapses them the same way. They are
+            // *filled* rather than dropped: the band excludes them from the segment
+            // `saveat` too, so a dropped index would keep its
+            // `EkfObsPoint { ipred: 0.0, p_obs: 0.0 }` prefill and feed a finite,
             // plausible zero into the likelihood.
             let bits = obs_times[obs_idx].to_bits();
             for &j in &boundary_obs {
@@ -332,8 +369,11 @@ pub fn solve_ekf(
         // Re-anchor TAD for this segment, *before* anything integrates with it — the
         // ODE predictors write this slot per segment too, and a write placed after the
         // solve reads the previous segment's anchor without failing to compile.
+        // `&[]`, not a zero-filled vector: this path applies no lagtime (see `dose_f_bio`
+        // above and the `active_infusions` call below), and `tad_anchor_for` reads a
+        // missing entry as zero lag.
         ext_params[crate::types::MAX_PK_PARAMS + 1] =
-            crate::ode::predictions::tad_anchor_for(doses, &no_lag, t_start);
+            crate::ode::predictions::tad_anchor_for(doses, &[], t_start);
 
         // Active infusion rates for this segment (shared with the FOCEI ODE
         // path so the F·RATE / span / lag / reset semantics stay in lockstep).
@@ -402,20 +442,33 @@ pub fn solve_ekf(
                 }
             }
 
-            if let Some(&obs_idx) = obs_map.get(&pt.t.to_bits()) {
+            if let Some(here) = obs_map.get(&pt.t.to_bits()) {
                 // Same assimilate-once mask as the boundary read: an observation sitting
                 // exactly on this segment's `t_end` is read here *and* at the next break as
                 // its `t_start`, and `kalman_update` is not idempotent.
-                if !assimilated[obs_idx] {
-                    let r = r_obs_vec.get(obs_idx).copied().unwrap_or(1.0);
+                //
+                // Records sharing this exact time are **one** measurement instant and share
+                // a single update, exactly as the boundary path above does — `solve_ekf`
+                // has one `obs_cmt_idx`, so N records here are N reads of the same
+                // compartment at the same time, and updating N times would shrink `p_mat`
+                // as though N independent measurements had arrived. Before #1263 only the
+                // last index of a shared time was in the map at all, so the others kept
+                // their `{ ipred: 0.0, p_obs: 0.0 }` prefill.
+                if let Some(&first) = here.iter().find(|&&j| !assimilated[j]) {
+                    let r = r_obs_vec.get(first).copied().unwrap_or(1.0);
                     let (p_new, p_obs) = kalman_update(&p_mat, obs_cmt_idx, r, n);
                     p_mat = p_new;
                     let v = pt.u[obs_cmt_idx];
-                    results[obs_idx] = EkfObsPoint {
+                    let point = EkfObsPoint {
                         ipred: if v.is_nan() || v < 0.0 { 0.0 } else { v },
                         p_obs,
                     };
-                    assimilated[obs_idx] = true;
+                    for &j in here {
+                        if !assimilated[j] {
+                            results[j] = point.clone();
+                            assimilated[j] = true;
+                        }
+                    }
                 }
             }
 
@@ -1363,6 +1416,497 @@ mod tests {
             got.iter().all(|p| !p.ipred.is_finite()),
             "a non-finite timeline must give non-finite EKF ipreds, not a finite pass \
              with the bad dose silently dropped"
+        );
+    }
+
+    /// **NONMEM anchor — a RATE-defined infusion under `F ≠ 1` on the EKF walk.**
+    ///
+    /// `F` reshapes an infusion's **duration**, not its rate (#419): NONMEM holds the data
+    /// `RATE` and delivers `F·AMT` over `F·AMT/RATE`. `ekf.rs` pushed an unscaled
+    /// `dose.time + dose.duration` as the window's break, so `active_infusions`'
+    /// membership test (`predictions.rs:1520-1531`, `end >= t_end - EPS`) rejected the
+    /// window in **every** segment and the infusion delivered zero mass — measured
+    /// `ipred = 0.0` at every observation for `F = 0.5`, against `27.86 / 42.08 / 31.18`
+    /// from `ode_predictions` (#1263 review).
+    ///
+    /// The reference is **NONMEM 7.6.0 PRED**, not ferx: `nonmem_anchor/oral_central_inf_advan2_f06.ctl`
+    /// (ADVAN2 TRANS2, `CL=5, V=50, KA=1, F2=0.6, S2=V`, 100 mg at `RATE=25` into `CMT=2`,
+    /// obs at `t = 1, 3, 6, 10, 16`), whose digits are also pinned in
+    /// `tests/oral_central_infusion_nonmem_anchor.rs` for the analytical paths. The system
+    /// is written here as the explicit two-state ODE twin so it reaches `solve_ekf`, which
+    /// the analytical anchor cannot.
+    ///
+    /// Non-degenerate on both sides of the quantity under test: `t = 1` is **inside** the
+    /// window (where `F` has not yet moved the answer — it is the same value as the `F = 1`
+    /// run) and `t = 3, 6, 10, 16` are all **past** the `F`-shortened end at `2.4 h`, where
+    /// an unscaled duration and a scaled one disagree. An implementation that ignored `F`
+    /// on the window would match the first point and miss the other four.
+    #[test]
+    fn ekf_infusion_under_f_matches_nonmem() {
+        // `oral_central_inf_advan2_f06.tab`, NONMEM 7.6.0 PRED at FORMAT=,1PE17.10.
+        const ADVAN2_F06: [f64; 5] = [
+            4.7581290982e-01,
+            1.0047315645e+00,
+            7.4432344989e-01,
+            4.9893492919e-01,
+            2.7382129479e-01,
+        ];
+        let (cl, v, ka, f) = (5.0f64, 50.0f64, 1.0f64, 0.6f64);
+        // Two states so this is genuinely the ADVAN2 system; the depot is never dosed
+        // (the infusion bypasses it into CMT=2), so `A1 ≡ 0` exactly as under NONMEM.
+        let rhs = move |y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+            let k = p[crate::types::PK_IDX_CL] / p[crate::types::PK_IDX_V];
+            dy[0] = -ka * y[0];
+            dy[1] = ka * y[0] - k * y[1];
+        };
+        let mut pk = make_pk(cl, v);
+        pk[crate::types::PK_IDX_F] = f;
+        let obs_times = vec![1.0, 3.0, 6.0, 10.0, 16.0];
+        // AMT=100, RATE=25 -> duration 4 h; F=0.6 shortens the window to 2.4 h.
+        let doses = vec![DoseEvent::new(0.0, 100.0, 2, 25.0, false, 0.0)];
+        let opts = OdeSolverOptions {
+            abstol: 1e-12,
+            reltol: 1e-10,
+            ..OdeSolverOptions::default()
+        };
+
+        let pts = solve_ekf(
+            &rhs,
+            2,
+            1, // observable is the central compartment
+            &[0.0, 0.0],
+            &pk,
+            &Default::default(),
+            &[],
+            &doses,
+            &obs_times,
+            &vec![0.01; obs_times.len()],
+            opts,
+        );
+
+        // Measured realised relative errors against the committed NONMEM digits:
+        // 4.84e-13 / 1.10e-11 / 1.79e-13 / 2.36e-11 / 5.24e-11 at t = 1/3/6/10/16, worst
+        // 5.24e-11. That worst case is at the reference's own resolution — the `$TABLE`
+        // prints 11 significant figures, so ~1e-11 is the floor a comparison against it
+        // can reach and a tighter bound would be pinning the last printed digit. 1e-9,
+        // i.e. 19× headroom over the realised worst case.
+        let mut worst = 0.0f64;
+        for (j, &t) in obs_times.iter().enumerate() {
+            let got = pts[j].ipred / v;
+            let want = ADVAN2_F06[j];
+            // `is_finite` before folding: `f64::max` discards `NaN`, so a solve that
+            // diverged would otherwise leave `worst` at whatever the good rows produced.
+            assert!(got.is_finite(), "non-finite EKF ipred at t={t}: {got}");
+            let rel = ((got - want) / want).abs();
+            worst = worst.max(rel);
+            assert!(
+                rel < 1e-9,
+                "t={t}: EKF {got:.10e} vs NONMEM {want:.10e} (rel {rel:.3e})"
+            );
+        }
+        assert!(
+            worst > 0.0,
+            "a zero worst-case error means the loop never compared anything"
+        );
+    }
+
+    /// **The TAFD anchor is the first dose time, not a literal zero.**
+    ///
+    /// Every other fixture in this module doses at `t = 0`, where
+    /// `earliest_dose_time(doses)` and `0.0` are the same number — so replacing the seed
+    /// with `seed_ext_params(pk_params_flat, 0.0)` left `cargo test --lib` at
+    /// **4083 passed, 0 failed** (#1263 review). This fixture's first dose is at `t = 6`,
+    /// and its closed form takes the anchor from `t1` rather than hard-coding `0.0`, so
+    /// that mutation moves the TAFD arm and the test fails.
+    ///
+    /// The `TAD` arm is carried alongside deliberately: the two anchors coincide on the
+    /// first dosing interval and separate only after the second dose, so a fixture that
+    /// scored the first interval alone could not tell them apart either.
+    #[test]
+    fn ekf_tafd_anchors_at_the_first_dose_not_at_zero() {
+        let (cl, v) = (1.0f64, 20.0f64);
+        let ke = cl / v;
+        let c = 0.05f64;
+        // First dose at t = 6, NOT at 0 — the whole point of this fixture.
+        let (t1, t2, amt) = (6.0f64, 18.0f64, 100.0f64);
+        let doses = vec![
+            DoseEvent::new(t1, amt, 1, 0.0, false, 0.0),
+            DoseEvent::new(t2, amt, 1, 0.0, false, 0.0),
+        ];
+        let obs_times = vec![8.0, 14.0, 20.0, 30.0];
+        let pk = make_pk(cl, v);
+        let opts = OdeSolverOptions {
+            abstol: 1e-12,
+            reltol: 1e-10,
+            ..OdeSolverOptions::default()
+        };
+
+        // ∫ (1 + c·u) du over the leg, with `u` measured from `anchor`.
+        let phase = |t_from: f64, t_to: f64, anchor: f64| -> f64 {
+            let (a, b) = (t_from - anchor, t_to - anchor);
+            (b - a) + c * (b * b - a * a) / 2.0
+        };
+        // `TAFD` anchors at `t1` for the whole record; `TAD` re-anchors at `t2`.
+        let closed_form = |t: f64, restarts: bool| -> f64 {
+            if t < t2 {
+                amt * (-ke * phase(t1, t, t1)).exp()
+            } else {
+                let at_t2 = amt * (-ke * phase(t1, t2, t1)).exp();
+                let anchor = if restarts { t2 } else { t1 };
+                (at_t2 + amt) * (-ke * phase(t2, t, anchor)).exp()
+            }
+        };
+
+        let mut worst = 0.0f64;
+        for (name, slot, restarts) in [
+            ("TAFD", crate::types::MAX_PK_PARAMS, false),
+            ("TAD", crate::types::MAX_PK_PARAMS + 1, true),
+        ] {
+            let rhs = time_reading_rhs(slot, c);
+            let pts = solve_ekf(
+                &rhs,
+                1,
+                0,
+                &[0.0], // zero diffusion: the mean walk reduces to plain integration
+                &pk,
+                &Default::default(),
+                &[],
+                &doses,
+                &obs_times,
+                &vec![0.01; obs_times.len()],
+                opts,
+            );
+            for (j, &t) in obs_times.iter().enumerate() {
+                let got = pts[j].ipred;
+                let want = closed_form(t, restarts);
+                assert!(got.is_finite(), "{name}: non-finite ipred at t={t}");
+                let rel = ((got - want) / want).abs();
+                worst = worst.max(rel);
+                // Measured worst realised error across both arms: 5.24e-11 (TAD, t=30);
+                // the TAFD arm's worst is 4.31e-11. Bounded at 1e-9 — 19× headroom over
+                // the realised worst case, and the same order the `reltol = 1e-10`
+                // integration above can support.
+                assert!(
+                    rel < 1e-9,
+                    "{name} at t={t}: EKF {got} vs closed form {want} (rel {rel:.3e})"
+                );
+            }
+        }
+        assert!(worst > 0.0, "the comparison loop never ran");
+
+        // The straddle: with the anchor mutated to a literal 0.0 the TAFD arm integrates
+        // `1 + c·t` instead of `1 + c·(t − 6)`, so the two spellings must actually differ
+        // here. Assert that they do, or this fixture silently becomes a tautology.
+        let at_last = obs_times[obs_times.len() - 1];
+        let with_true_anchor = closed_form(at_last, false);
+        let with_zero_anchor = {
+            let phase0 = |t_from: f64, t_to: f64| -> f64 {
+                let (a, b) = (t_from, t_to);
+                (b - a) + c * (b * b - a * a) / 2.0
+            };
+            let at_t2 = amt * (-ke * phase0(t1, t2)).exp();
+            (at_t2 + amt) * (-ke * phase0(t2, at_last)).exp()
+        };
+        let sep = ((with_true_anchor - with_zero_anchor) / with_true_anchor).abs();
+        assert!(
+            sep > 0.05,
+            "the t1=6 and t1=0 TAFD anchors must give materially different curves for \
+             this fixture to pin the anchor at all — separation {sep:.3e}"
+        );
+    }
+
+    /// **A subject whose records start after `t = 0` gets no phantom leading segment.**
+    ///
+    /// `break_times` was seeded with a literal `0.0` where the ODE path uses
+    /// `subject_integration_start`. For a first event at `t = 24` that left a `[0, 24]`
+    /// segment which `propagate_covariance` actually integrated, so `p_mat` arrived at the
+    /// first observation carrying `q · 24` of process noise the ODE twin never accumulates
+    /// — measured `p_obs = 6.5` against a true `0.5`, i.e. **13×** (#1263 review).
+    ///
+    /// The oracle is a closed form, not a twin: with `CL = 0` the drift vanishes, the
+    /// Jacobian is zero and the Riccati equation is exactly `dP/dt = Q`, so
+    /// `P(t) = q · (t − t_start)` with no solver error to absorb a wrong start.
+    #[test]
+    fn ekf_covariance_starts_at_the_first_record_not_at_zero() {
+        let q = 0.25f64;
+        let pk = make_pk(0.0, 20.0); // CL = 0 -> ke = 0 -> dP/dt = Q exactly
+        let opts = OdeSolverOptions {
+            abstol: 1e-12,
+            reltol: 1e-10,
+            ..OdeSolverOptions::default()
+        };
+
+        // One variable: the same subject, shifted. Both must give the same `p_obs` at the
+        // same elapsed time — a start-dependent answer is the defect.
+        let mut seen = Vec::new();
+        for shift in [0.0f64, 24.0] {
+            let doses = vec![DoseEvent::new(shift, 100.0, 1, 0.0, false, 0.0)];
+            let obs_times = vec![shift + 2.0, shift + 6.0];
+            let pts = solve_ekf(
+                &one_cpt_rhs,
+                1,
+                0,
+                &[q],
+                &pk,
+                &Default::default(),
+                &[],
+                &doses,
+                &obs_times,
+                &vec![0.01; obs_times.len()],
+                opts,
+            );
+            let got = pts[0].p_obs;
+            assert!(got.is_finite(), "shift={shift}: non-finite p_obs {got}");
+            // Measured error against the closed form: 0.0 exactly at both shifts.
+            let want = q * 2.0;
+            assert!(
+                (got - want).abs() < 1e-12,
+                "shift={shift}: p_obs {got} vs closed form q·Δt {want} — a leading \
+                 [0, {shift}] segment would give q·(Δt+{shift}) = {}",
+                q * (2.0 + shift)
+            );
+            seen.push(got);
+        }
+        // The straddle: the two shifts must be a real experiment. `q·2 = 0.5` and
+        // `q·26 = 6.5` are far apart, so a start-dependent implementation cannot pass
+        // both branches above by accident.
+        assert!(
+            (q * 26.0 - q * 2.0).abs() > 1.0,
+            "the shifted and unshifted expectations must differ for this to be a test"
+        );
+        assert_eq!(
+            seen[0].to_bits(),
+            seen[1].to_bits(),
+            "the same subject shifted in time must give bit-identical covariance"
+        );
+    }
+
+    /// **Records sharing an observation time inside a segment are all filled, from one
+    /// Kalman update.**
+    ///
+    /// The in-segment read looked the point up in a `HashMap<u64, usize>`, which keeps one
+    /// index per time — so for two records at the same instant the loser kept its
+    /// `EkfObsPoint { ipred: 0.0, p_obs: 0.0 }` prefill and fed a finite, plausible zero
+    /// into the likelihood. Measured: `obs_times = [2.0, 2.0, 8.0]` returned `ipred = 0.0`
+    /// for index 0 and `90.4837418037` for index 1 (#1263 review). The boundary-read path
+    /// was hardened for this in #1226; this is the same defect one branch over.
+    ///
+    /// Both halves are asserted: the duplicates are **filled**, and they share a **single**
+    /// update — `solve_ekf` has one `obs_cmt_idx`, so N records at one time are N reads of
+    /// the same compartment, and updating N times would shrink `p_mat` as though N
+    /// independent measurements had arrived.
+    #[test]
+    fn ekf_duplicate_in_segment_obs_times_share_one_update() {
+        let pk = make_pk(1.0, 20.0);
+        let opts = OdeSolverOptions {
+            abstol: 1e-12,
+            reltol: 1e-10,
+            ..OdeSolverOptions::default()
+        };
+        let doses = vec![bolus_dose(100.0)];
+        // t = 2 is strictly inside the only segment [0, 8], so this exercises the
+        // in-segment read rather than the boundary read.
+        let dup = solve_ekf(
+            &one_cpt_rhs,
+            1,
+            0,
+            &[0.1],
+            &pk,
+            &Default::default(),
+            &[],
+            &doses,
+            &[2.0, 2.0, 8.0],
+            &[0.01; 3],
+            opts,
+        );
+        // The single-record control: what one record at t = 2 gets.
+        let single = solve_ekf(
+            &one_cpt_rhs,
+            1,
+            0,
+            &[0.1],
+            &pk,
+            &Default::default(),
+            &[],
+            &doses,
+            &[2.0, 8.0],
+            &[0.01; 2],
+            opts,
+        );
+
+        for (i, p) in dup.iter().enumerate() {
+            assert!(
+                p.ipred.is_finite() && p.p_obs.is_finite(),
+                "idx {i}: non-finite point {p:?}"
+            );
+        }
+        assert!(
+            dup[0].ipred > 0.0,
+            "the first of two records at t=2 kept its 0.0 prefill: {:?}",
+            dup[0]
+        );
+        assert_eq!(
+            dup[0].ipred.to_bits(),
+            dup[1].ipred.to_bits(),
+            "records at one instant must share an ipred"
+        );
+        assert_eq!(
+            dup[0].p_obs.to_bits(),
+            dup[1].p_obs.to_bits(),
+            "records at one instant must share a p_obs"
+        );
+        // One update, not two: the duplicate pair must leave the *later* observation with
+        // exactly the covariance the single-record run gives it. Assimilating twice at
+        // t = 2 would over-shrink `p_mat` and this would come out low.
+        assert_eq!(
+            dup[2].p_obs.to_bits(),
+            single[1].p_obs.to_bits(),
+            "a duplicated observation time must not assimilate twice — p_obs at t=8 is \
+             {} with the duplicate and {} without",
+            dup[2].p_obs,
+            single[1].p_obs
+        );
+        // And the straddle: the two-update answer really is different, so the assertion
+        // above can fail.
+        let (p_new, _) = kalman_update(
+            &nalgebra::DMatrix::from_element(1, 1, dup[0].p_obs),
+            0,
+            0.01,
+            1,
+        );
+        assert!(
+            (p_new[(0, 0)] - dup[0].p_obs).abs() > 1e-9,
+            "a second update at the same instant must move p_mat, or this test is vacuous"
+        );
+    }
+
+    /// **The EKF covariance on a time-varying rate, against a quadrature oracle.**
+    ///
+    /// `time_reading_rhs_gets_finite_anchors_on_the_ekf_walk` asserts `p_obs > 0.0`. That is
+    /// a real discriminator — `is_finite()` accepts `0.0` and this rejects it, so an EKF
+    /// that never propagated fails — but it is a **floor**, not a bound: it passes for any
+    /// positive magnitude, including an over-propagating Riccati step (#1263 review). This
+    /// gives the same quantity a two-sided oracle.
+    ///
+    /// `dA/dt = -ke·A·(1 + c·TAFD)` is linear in the state with a time-varying rate
+    /// `k(t) = ke·(1 + c·t)` for a single dose at `t = 0`, so the Riccati equation is the
+    /// scalar `dP/dt = -2k(t)·P + Q` with `P(0) = 0`, whose solution is
+    ///
+    /// ```text
+    ///   P(t) = Q · e^(-2Φ(t)) · ∫₀ᵗ e^(2Φ(s)) ds,   Φ(t) = ke·(t + c·t²/2)
+    /// ```
+    ///
+    /// The inner integral is not elementary (it is an imaginary error function), so it is
+    /// evaluated here by Simpson's rule at 20 000 intervals — arithmetic outside the filter
+    /// entirely, not a second call into it. `R` is large so the Kalman update barely
+    /// contracts `P` and the comparison is against the free-drift solution, the same device
+    /// `ekf_variance_matches_analytic_linear_sde` uses for the constant-rate case.
+    ///
+    /// The `c = 0` arm is carried alongside as the degenerate control: it must reduce to the
+    /// constant-rate closed form `(Q/2ke)·(1 − e^(−2·ke·t))`, and it must differ materially
+    /// from the `c > 0` arm, or the fixture would not be testing the time-varying part at
+    /// all.
+    #[test]
+    fn ekf_covariance_matches_a_quadrature_oracle_on_a_time_varying_rate() {
+        let (cl, v) = (5.0f64, 100.0f64);
+        let ke = cl / v; // 0.05 h⁻¹
+        let q = 0.04f64;
+        let obs_times = vec![1.0, 4.0, 8.0, 12.0];
+        let pk = make_pk(cl, v);
+        let doses = vec![bolus_dose(100.0)];
+        // Large R: the update contracts P by ~Q/R per observation, i.e. negligibly, so
+        // `p_obs` tracks the free-drift solution the oracle below computes.
+        let r_obs_vec = vec![1e8f64; obs_times.len()];
+
+        // ∫₀ᵗ e^(2Φ(s)) ds by Simpson's rule. Even `n`, so the composite rule applies.
+        let simpson = |t: f64, c: f64| -> f64 {
+            let n = 20_000usize;
+            let h = t / n as f64;
+            let phi = |s: f64| ke * (s + c * s * s / 2.0);
+            let f = |s: f64| (2.0 * phi(s)).exp();
+            let mut acc = f(0.0) + f(t);
+            for i in 1..n {
+                let w = if i % 2 == 0 { 2.0 } else { 4.0 };
+                acc += w * f(i as f64 * h);
+            }
+            acc * h / 3.0
+        };
+
+        let mut worst = 0.0f64;
+        let mut at_c0 = Vec::new();
+        let mut at_c1 = Vec::new();
+        for c in [0.0f64, 0.05] {
+            let rhs = time_reading_rhs(crate::types::MAX_PK_PARAMS, c);
+            let pts = solve_ekf(
+                &rhs,
+                1,
+                0,
+                &[q],
+                &pk,
+                &Default::default(),
+                &[],
+                &doses,
+                &obs_times,
+                &r_obs_vec,
+                OdeSolverOptions::default(),
+            );
+            for (j, &t) in obs_times.iter().enumerate() {
+                let phi_t = ke * (t + c * t * t / 2.0);
+                let want = q * (-2.0 * phi_t).exp() * simpson(t, c);
+                let got = pts[j].p_obs;
+                // `is_finite` before folding — `f64::max` discards `NaN`, so a diverged
+                // Riccati step would otherwise leave `worst` at whatever the good rows gave.
+                assert!(got.is_finite(), "c={c}: non-finite p_obs at t={t}: {got}");
+                let rel = ((got - want) / want).abs();
+                worst = worst.max(rel);
+                // Measured realised errors, all eight points:
+                //   c=0.00  2.456e-2 / 2.093e-2 / 1.671e-2 / 1.317e-2  at t = 1/4/8/12
+                //   c=0.05  2.526e-2 / 2.249e-2 / 1.754e-2 / 1.171e-2
+                // Worst 2.526e-2, and it *decreases* with t — this is the forward-Euler
+                // transient in `propagate_covariance`, which steps the Riccati equation at
+                // `DT_MAX = 0.5`: at t=1 that is two steps giving exactly
+                // `0.04·0.5 + (0.04 − 2·0.05·0.02)·0.5 = 0.039` against a true 0.0380650.
+                // So the floor here is the filter's own discretisation, not the oracle;
+                // `ekf_variance_matches_analytic_linear_sde` sits at 5% for the same reason.
+                //
+                // Bounded at 4e-2 — 1.6× over the realised worst case. Loose, and it has to
+                // be, but it still bites: the defect this fixture exists to catch (an engine
+                // that ignores the model-time term, so `c=0.05` returns the `c=0` curve) is
+                // 23% wrong at t=12, six times the bound.
+                assert!(
+                    rel < 4e-2,
+                    "c={c} t={t}: EKF p_obs {got:.10e} vs quadrature {want:.10e} \
+                     (rel {rel:.3e})"
+                );
+                if c == 0.0 {
+                    at_c0.push(got);
+                    // The degenerate arm must also reduce to the elementary closed form,
+                    // which pins the quadrature itself rather than trusting it.
+                    let closed = (q / (2.0 * ke)) * (1.0 - (-2.0 * ke * t).exp());
+                    assert!(
+                        ((want - closed) / closed).abs() < 1e-9,
+                        "the c=0 quadrature must reproduce the constant-rate closed form: \
+                         {want} vs {closed}"
+                    );
+                } else {
+                    at_c1.push(got);
+                }
+            }
+        }
+        assert!(worst > 0.0, "the comparison loop never ran");
+
+        // The straddle: a time-varying rate must actually move `p_obs`, or every assertion
+        // above is satisfied by an engine that ignores the model-time term entirely — the
+        // exact failure this fixture family exists to catch.
+        let sep = at_c0
+            .iter()
+            .zip(&at_c1)
+            .map(|(a, b)| ((a - b) / a).abs())
+            .fold(0.0f64, f64::max);
+        assert!(
+            sep > 0.05,
+            "the c=0 and c=0.05 covariance curves must differ materially — worst \
+             separation {sep:.3e}"
         );
     }
 }

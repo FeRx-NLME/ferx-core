@@ -45,6 +45,8 @@
 //! | `W_STEADY_STATE_II`       | SS=1 dose with missing / non-positive II |
 //! | `W_STEADY_STATE_INFUSION` | SS=1 infusion with `T_inf > II` (overlapping pulses) |
 //! | `W_SDE_RESET`             | EVID=3/4 resets under an SDE model are not honoured |
+//! | `W_SDE_LAGTIME`           | an absorption lag time under an SDE model is not honoured |
+//! | `W_SDE_STEADY_STATE`      | an `SS=1` dose under an SDE model is not equilibrated |
 //! | `W_EXPERIMENTAL_SDE`      | an SDE (`[diffusion]`) model uses an experimental feature (see Feature Maturity docs) |
 //! | `W_EXPERIMENTAL_NN`       | a neural-network (`[covariate_nn]`) model uses an experimental feature (see Feature Maturity docs) |
 //! | `W_NEGATIVE_LAGTIME`      | a lag time is negative at the initial estimates |
