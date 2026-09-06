@@ -19577,6 +19577,20 @@ impl OdeRhsProgram {
         self.has_chz
     }
 
+    /// Does the RHS read **`TAD` specifically**?
+    ///
+    /// [`Self::uses_time_vars`] unions `T`/`TAFD`/`TAD` and [`Self::reads_model_time`]
+    /// adds the bare `TIME` built-in, so neither can separate the four spellings — and
+    /// they must not, because every "is this system autonomous?" gate wants the union
+    /// (#1124). This is the one question that is genuinely about `TAD` alone: whether a
+    /// steady-state dose carrying a lagtime hits #1126's pre-arrival referent, which no
+    /// other spelling has. Computed from the stored statements rather than cached in a
+    /// field, because it is asked once per fit from the data checks and never on the
+    /// integration path.
+    pub(crate) fn reads_tad(&self) -> bool {
+        stmts_read_slots(&self.stmts, &[self.tad_slot])
+    }
+
     /// See [`OdeRhsProgram::reads_time_builtin`]. Almost every caller wants
     /// [`Self::reads_model_time`] instead: neither this flag nor
     /// [`Self::uses_time_vars`] alone covers all four spellings, and pairing them

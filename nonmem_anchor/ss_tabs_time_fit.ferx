@@ -1,0 +1,50 @@
+# The **bare `TIME` spelling** of `ss_tabs_fit.ferx` (#1139 / #1124).
+#
+# Identical in every respect but the spelling of the built-in. It exists because the two
+# spellings compile differently: `T`/`t` resolve through a slot the program's
+# `uses_time_vars` flag can see, while a bare `TIME` compiles to `Op::PushTime` and is
+# visible only to `reads_time_builtin`. #1124 closed that asymmetry on the *gradient*
+# route; this file pins that the two also produce the same **value** under `SS=1`, which
+# nothing checked. Measured, they are bit-identical (`8.5679354785102` at t = 482).
+#
+# Runs on `ss_tabs.csv`; NONMEM's side is the same `ss_tabs.ctl`, since `$DES` has no
+# `TIME` built-in and `T` *is* the integration variable there.
+#
+# What it pins: ferx and NONMEM agree on the steady state of an absolute-clock RHS — 8.5679
+# from both, to 1.5e-9 — because both engines equilibrate on a cycle-local clock and then
+# integrate forward on absolute time, so both sit ~67% away from their own converged train
+# (5.1221) *together*. Neither is "the steady state" of a system that has none: the explicit
+# `T`-reading train does not converge at all, and `train_tabs_n21.tab` against
+# `train_tabs.tab` measures the divergence rather than a limit.
+#
+# So this file exists so that a later change to the steady-state run-in cannot quietly move
+# a number that currently matches NONMEM. Rejecting or "fixing" this configuration would
+# break a parity that holds today; whether to warn about it is #1139's remaining half.
+
+[parameters]
+  theta TVCL(1.0, FIX)
+  theta TVV(20.0, FIX)
+
+  sigma PROP ~ 0.01                # variance; NONMEM `$SIGMA 0.01`
+
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central * (1.0 + 0.003*TIME)
+
+[scaling]
+  obs_scale = V                    # the state is an AMOUNT; NONMEM's `$ERROR` divides by V
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[fit_options]
+  method     = focei
+  maxiter    = 0
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11

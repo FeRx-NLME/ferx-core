@@ -195,6 +195,29 @@ section of the SDLC for the versioning policy).
   `ferx_sir()` take), instead of computing the covariance step or SIR on the Gaussian half
   of a joint likelihood. The `.fitrx` reload (`load_fit`, used by the CLI) routes the
   bundled data by the bundled model too, so a reloaded joint fit keeps its event records.
+- **A steady-state (`SS=1`) dose on an `[odes]` right-hand side that reads `TAD` now returns
+  the periodic steady state instead of `NaN` (#1139).** The steady-state run-in handed the
+  compiled right-hand side a parameter array two slots shorter than the one it reads the
+  model-time anchors from, so `TAD` evaluated to `NaN` for the whole run-in and poisoned every
+  later prediction — including when the term's coefficient was **zero**, since `0.0 * NaN` is
+  `NaN`, so merely mentioning `TAD` broke an otherwise ordinary steady-state model. `TAD` is
+  now anchored to each run-in window's own pulse: the exact one-cycle solve, the capped pulse
+  train, the quiet window of a steady-state infusion, and the built-in-absorption train, which
+  advances its anchor per cycle. Measured against NONMEM 7.6.0 on a 1-cpt IV bolus
+  (`CL = 1`, `V = 20`, `II = 12`): ferx `8.8902009677` against NONMEM `8.8902010334`
+  (7.4e-9), and against a closed form computed outside both engines, 3.0e-10.
+  `TAFD` and `TIME`/`T` under `SS=1` are unchanged — they have no periodic steady state to
+  converge to, and `TIME`/`T` already matched NONMEM.
+- **`SS=1` combined with a lagtime on a `TAD`-reading `[odes]` right-hand side is now rejected
+  (`E_SS_LAGTIME_TAD_RHS`) instead of mis-predicted (#1139, #1126).** Raised by `fit()` and
+  `ferx check`; `simulate()` / `predict()` run a narrower validation bundle and still return
+  `NaN` for the combination. `TAD` has no referent
+  between the dose record and the lagged arrival, and because the record-time steady-state seed
+  flows to the arrival rather than being re-equilibrated there, the wrong value is carried into
+  the trough and shifts *every* prediction — measured 2.7 % on the model above with
+  `ALAG1 = 3`, not only inside that window. Remove the lagtime, drop the `TAD` term, or expand
+  the run-in with explicit dose records. A steady-state dose without a lagtime reads `TAD`
+  correctly.
 
 ### Changed
 - **The unused-fit-option warning is model-aware for the ODE solver keys (#518).** Setting

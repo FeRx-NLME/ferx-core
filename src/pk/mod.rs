@@ -63,10 +63,12 @@ pub(crate) fn model_uses_time_builtin(model: &CompiledModel) -> bool {
 /// two engines now agree.
 ///
 /// One case where the two are still **not** comparable, so no agreement is
-/// claimed for it: **a steady-state dose** on a non-autonomous RHS is wrong on
-/// *both* engines — `NaN` for `TAD`/`TAFD` (even at a zero coefficient) and 17%
-/// off an explicit 40-cycle pulse train for `T`/`TIME`. Rerouting neither causes
-/// nor cures that; see #1139.
+/// claimed for it: **a steady-state dose** whose RHS reads an *absolute* clock.
+/// `T`/`TIME` under `SS=1` sits 67% from its own explicit dose train — an absolute
+/// clock has no periodic limit for the run-in to converge to — and `TAFD` reads
+/// `NaN`; both are #1139's remaining half. `TAD` under `SS=1` *is* comparable
+/// since #1139: it reproduces its own explicit train to 3.8e-13 and NONMEM to
+/// 7.4e-9. Rerouting neither caused nor cured any of this.
 ///
 /// Regression tests: `rerouting_a_bare_tafd_rhs_does_not_move_the_predictions`
 /// and `rerouting_an_init_seeded_rhs_does_not_move_the_predictions`.

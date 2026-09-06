@@ -611,6 +611,65 @@ where
     Some(proj.embed(&u_red))
 }
 
+/// Extended parameters for **one window** of a steady-state run-in (#1139).
+///
+/// The compiled `[odes]` right-hand side reads `TAD` out of `params[MAX_PK_PARAMS + 1]`
+/// (`parser/model_parser.rs`, the model-time closure) as `t − anchor`, and `TAFD` out of
+/// `params[MAX_PK_PARAMS]`. Every SS-equilibration call site hands `solve_ode` a bare
+/// `PkParams::values`, which is exactly `MAX_PK_PARAMS` long, so both `.get()` calls
+/// returned `None`, the RHS injected `NaN`, and `0.0 * NaN = NaN` poisoned the whole
+/// run-in — merely *mentioning* `TAD` turned an otherwise ordinary `SS=1` fit into a
+/// non-finite objective.
+///
+/// `pulse_at` is the **local-clock** time of the pulse this window measures `TAD` from,
+/// in the same units the window's own `solve_ode` span uses. The run-in does not run on
+/// the subject's clock — it expands a periodic train on a clock private to each window —
+/// so this is not a `tad_anchor_for` question and the walk's own `ext_params` must not be
+/// threaded in here. Three shapes, all of them live:
+///
+/// * a window opening **at** the pulse → `0.0`. That is `(0, II)` for the exact solve's
+///   propagator probes and its forced bolus cycle, `(0, II)` again for the capped train's
+///   bolus cycle, `(0, T_inf)` for an infusion's **active** window on both of those
+///   branches, and `(0, II)` for the input-rate path's one-cycle advance;
+/// * the **quiet** window an infusion cycle re-opens at local `0` after `T_inf` of active
+///   rate → `−T_inf`, so `TAD` continues at `T_inf … II` rather than restarting at zero;
+/// * the monotone `(m·II, (m+1)·II)` segments of the capped input-rate pulse train, whose
+///   pulses sit at local `0, II, 2·II, …` → `m·II`, taken from [`tad_anchor_for`] over
+///   that train's own dose list rather than re-spelled. A flat `0.0` there reads
+///   `TAD = m·II + τ`, wrong by up to `SS_EQUILIBRATION_CYCLES − 1 = 49` whole intervals.
+///
+/// **`TAFD` is deliberately left `NaN`**, which reproduces today's answer bit-for-bit for a
+/// `TAFD`-reading model. Anchoring it at the run-in's own origin would hand back a finite,
+/// plausible number for a quantity that has no periodic steady state at all — measured, its
+/// explicit train diverges 0.294 per doubling — i.e. it would silently redefine `TAFD` as
+/// `TAD` inside the run-in, which is the very defect class this function removes. `TAFD`,
+/// `T` and `TIME` under `SS=1` are #1139's other half and are handled separately.
+///
+/// [`ss_state_at_phase_pk`]'s own three windows do **not** call this, deliberately — see the
+/// note at the top of that function. It is reachable only under a lagtime, which is #1126's
+/// unanswered pre-arrival referent, and anchoring it alone converts a loud `NaN` into a
+/// number 2.7 % wrong on every observation.
+#[inline]
+fn ss_run_in_params(
+    pk_params_flat: &[f64],
+    pulse_at: f64,
+) -> [f64; crate::types::MAX_PK_PARAMS + 2] {
+    // `seed_ext_params` copies `min(len, MAX_PK_PARAMS)` and leaves the rest `NaN`, so a
+    // short slice would turn what used to be an index panic inside the RHS into a silent
+    // `NaN` `CL` — the loud-to-silent conversion this whole change exists to reverse.
+    // Every production caller passes a `PkParams::values`, which is exactly the right
+    // length; this keeps that contract loud if one ever does not.
+    debug_assert!(
+        pk_params_flat.len() >= crate::types::MAX_PK_PARAMS,
+        "SS run-in handed {} params, needs at least {}",
+        pk_params_flat.len(),
+        crate::types::MAX_PK_PARAMS
+    );
+    let mut ext = seed_ext_params(pk_params_flat, f64::NAN);
+    ext[crate::types::MAX_PK_PARAMS + 1] = pulse_at;
+    ext
+}
+
 /// Periodic steady-state trough for an `SS=1` dose into a built-in absorption input-rate
 /// compartment (#719; nonlinear solve #867).
 ///
@@ -668,8 +727,10 @@ fn equilibrate_ss_input_rate(
     // tolerance (`ss_equilibration_opts`) so the fixed-point trough is accurate even when `ρ → 1`
     // amplifies the per-cycle solver noise — the forward walk keeps the model tolerance.
     let eq_opts = ss_equilibration_opts(opts);
+    // The cycle's pulse sits at local `0`, so `TAD = t` across the whole window (#1139).
+    let ext = ss_run_in_params(pk_params_flat, 0.0);
     let advance = |rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]), u0: &[f64]| -> Option<Vec<f64>> {
-        solve_ode(rhs, u0, (0.0, ii), pk_params_flat, &[ii], &eq_opts)
+        solve_ode(rhs, u0, (0.0, ii), &ext, &[ii], &eq_opts)
             .last()
             .map(|p| p.u.clone())
     };
@@ -897,6 +958,7 @@ where
             // (which then carries the artifact derivative; a `ρ ≈ 1` corner not reached by any
             // genuinely-contracting model).
             record_ss_equilibration_cycles(iter + 1);
+            crate::dosing::record_ss_equilibration_branch(crate::dosing::SsBranch::Anderson);
             return newton_ss_derivative_correction_g(&g, n, advance_forced).or(Some(g));
         }
         u_hist.push(u.clone());
@@ -1007,6 +1069,7 @@ where
         &advance_forced,
     ) {
         record_ss_equilibration_cycles(1);
+        crate::dosing::record_ss_equilibration_branch(crate::dosing::SsBranch::InputRateExact);
         return Some(u_ss);
     }
     anderson_ss_fixed_point_g::<T, _>(n, ii, reltol, abstol, &advance_forced)
@@ -1065,6 +1128,10 @@ fn equilibrate_ss_pk_state(
     dose: &DoseEvent,
     opts: &OdeSolverOptions,
 ) -> Vec<f64> {
+    // Clear the branch tag up front so the early returns below leave `None` rather than
+    // the previous call's value — see `crate::dosing::SsBranch`. Every completing path
+    // overwrites it; every bail-out is then honestly reported as "no branch ran".
+    crate::dosing::record_ss_equilibration_branch(crate::dosing::SsBranch::None);
     let n = ode.n_states;
     let chz = &ode.chz_state_slots[..];
     // The model's own RHS with the accumulator derivatives held at zero. Everything the
@@ -1148,6 +1215,13 @@ fn equilibrate_ss_pk_state(
             })
             .collect();
         let local_f_bio = vec![f_bio; n_pulses];
+        // One empty slice serves both callees: `wrap_rhs_with_forcings` has always read its
+        // lag slice with `.get(k)`, and since #1263's review `tad_anchor_for` does too
+        // (`lag_at`), so `&[]` means "no lag on any of these synthetic pulses" to each of
+        // them. This used to need a second, zero-filled `Vec<f64>` of length `n_pulses`
+        // purely to satisfy an index that would otherwise panic; `ss_monotone_run_in_anchor_is_the_same_with_an_empty_lag_slice`
+        // pins that the two spellings agree, so the allocation cannot creep back in on the
+        // strength of a misremembered contract.
         let no_lag: [f64; 0] = [];
         let no_zero_order: [(usize, f64); 0] = [];
         let wrapped_raw = wrap_rhs_with_forcings(
@@ -1171,14 +1245,16 @@ fn equilibrate_ss_pk_state(
         for m in 0..n_pulses {
             let seg_start = m as f64 * dose.ii;
             let seg_end = seg_start + dose.ii;
-            let sol = solve_ode(
-                &wrapped,
-                &u,
-                (seg_start, seg_end),
+            // Unlike every other run-in window this train runs on a *monotone* clock
+            // `0 … n_pulses·II`, so the `TAD` anchor advances with it: the pulse governing
+            // segment `m` is `local_doses[m]` at `m·II`. Taken from the shared rule over
+            // this train's own dose list rather than re-spelled — a flat `0.0` would read
+            // `TAD = m·II + τ`, wrong by up to 49 whole dosing intervals (#1139).
+            let ext = ss_run_in_params(
                 pk_params_flat,
-                &[seg_end],
-                opts,
+                tad_anchor_for(&local_doses, &no_lag, seg_start),
             );
+            let sol = solve_ode(&wrapped, &u, (seg_start, seg_end), &ext, &[seg_end], opts);
             if let Some(last) = sol.last() {
                 u.copy_from_slice(&last.u);
             }
@@ -1189,6 +1265,7 @@ fn equilibrate_ss_pk_state(
             }
         }
         record_ss_equilibration_cycles(cycles_run);
+        crate::dosing::record_ss_equilibration_branch(crate::dosing::SsBranch::InputRateTrain);
         // If the pulse train hit the cycle cap without converging, the returned trough may be
         // materially below the true periodic steady state — surface a warning instead of silently
         // under-reporting it (#867). Only a *nonlinear* disposition reaches this fallback (the
@@ -1213,12 +1290,26 @@ fn equilibrate_ss_pk_state(
     // solves, so it is cheap) and passes those tolerances to the linearity check, mirroring the
     // input-rate path.
     let eq_opts = ss_equilibration_opts(opts);
+    // Both closures integrate the cycle `[0, II]` on a clock whose origin *is* the pulse, so
+    // the RHS must read `TAD = t` throughout (#1139). The propagator probe carries the same
+    // anchor as the forced cycle deliberately: `periodic_ss_fixed_point_g` subtracts one from
+    // the other to build `M`, and that decomposition is only the true one-cycle map when both
+    // legs see the same clock. A state-linear but time-varying RHS still passes its linearity
+    // self-check, so this fixture takes the exact solve rather than the train below — which it
+    // could not do while the anchor was absent and every probe came back `NaN`.
+    let ext_cycle = ss_run_in_params(pk_params_flat, 0.0);
+    // The quiet window's own params are built inside each infusion arm below, not here: a
+    // bolus has no quiet window (`bioavailable_infusion` returns `t_inf = 0`), and hoisting
+    // it would either allocate an array anchored at `-0.0` that nothing reads, or make it an
+    // `Option` whose `expect` asserts an invariant two guards away. Binding it where it is
+    // used costs one 1 KB stack array per infusion cycle — against that cycle's ODE solve —
+    // and removes the invariant rather than documenting it.
     let advance_unforced = |u0: &[f64]| -> Option<Vec<f64>> {
         solve_ode(
             &base_rhs,
             u0,
             (0.0, dose.ii),
-            pk_params_flat,
+            &ext_cycle,
             &[dose.ii],
             &eq_opts,
         )
@@ -1240,7 +1331,7 @@ fn equilibrate_ss_pk_state(
                 &wrapped_rhs,
                 u0,
                 (0.0, t_inf),
-                pk_params_flat,
+                &ext_cycle,
                 &[t_inf],
                 &eq_opts,
             )
@@ -1248,16 +1339,12 @@ fn equilibrate_ss_pk_state(
             .map(|p| p.u.clone())?;
             let quiet = dose.ii - t_inf;
             if quiet > 0.0 {
-                y = solve_ode(
-                    &base_rhs,
-                    &y,
-                    (0.0, quiet),
-                    pk_params_flat,
-                    &[quiet],
-                    &eq_opts,
-                )
-                .last()
-                .map(|p| p.u.clone())?;
+                // Pulse at local `−T_inf`: this window re-opens its clock at `0` but sits
+                // `T_inf` after the cycle's pulse. See `ss_run_in_params`.
+                let ext_quiet = ss_run_in_params(pk_params_flat, -t_inf);
+                y = solve_ode(&base_rhs, &y, (0.0, quiet), &ext_quiet, &[quiet], &eq_opts)
+                    .last()
+                    .map(|p| p.u.clone())?;
             }
             Some(y)
         } else {
@@ -1267,7 +1354,7 @@ fn equilibrate_ss_pk_state(
                 &base_rhs,
                 &y,
                 (0.0, dose.ii),
-                pk_params_flat,
+                &ext_cycle,
                 &[dose.ii],
                 &eq_opts,
             )
@@ -1285,6 +1372,7 @@ fn equilibrate_ss_pk_state(
         advance_forced,
     ) {
         record_ss_equilibration_cycles(1);
+        crate::dosing::record_ss_equilibration_branch(crate::dosing::SsBranch::Exact);
         return u_ss;
     }
 
@@ -1307,21 +1395,16 @@ fn equilibrate_ss_pk_state(
                     dy[cmt_idx] += rate;
                 }
             };
-            let sol = solve_ode(
-                &wrapped_rhs,
-                &u,
-                (0.0, t_inf),
-                pk_params_flat,
-                &[t_inf],
-                opts,
-            );
+            let sol = solve_ode(&wrapped_rhs, &u, (0.0, t_inf), &ext_cycle, &[t_inf], opts);
             if let Some(last) = sol.last() {
                 u.copy_from_slice(&last.u);
             }
-            // Quiet window from end-of-infusion to end-of-cycle.
+            // Quiet window from end-of-infusion to end-of-cycle. Its local clock restarts
+            // at `0`, so its `TAD` anchor is `−T_inf`, not `0` — see `ss_run_in_params`.
             let quiet = dose.ii - t_inf;
             if quiet > 0.0 {
-                let sol = solve_ode(&base_rhs, &u, (0.0, quiet), pk_params_flat, &[quiet], opts);
+                let ext_quiet = ss_run_in_params(pk_params_flat, -t_inf);
+                let sol = solve_ode(&base_rhs, &u, (0.0, quiet), &ext_quiet, &[quiet], opts);
                 if let Some(last) = sol.last() {
                     u.copy_from_slice(&last.u);
                 }
@@ -1338,14 +1421,7 @@ fn equilibrate_ss_pk_state(
             // suppressed for an input-rate compartment and `R_in` integrated over
             // the cycle instead.
             u[cmt_idx] += f_bio * dose.amt;
-            let sol = solve_ode(
-                &base_rhs,
-                &u,
-                (0.0, dose.ii),
-                pk_params_flat,
-                &[dose.ii],
-                opts,
-            );
+            let sol = solve_ode(&base_rhs, &u, (0.0, dose.ii), &ext_cycle, &[dose.ii], opts);
             if let Some(last) = sol.last() {
                 u.copy_from_slice(&last.u);
             }
@@ -1357,6 +1433,7 @@ fn equilibrate_ss_pk_state(
         }
     }
     record_ss_equilibration_cycles(cycles_run);
+    crate::dosing::record_ss_equilibration_branch(crate::dosing::SsBranch::CappedTrain);
     // Gap 2 (#914): a capped ordinary bolus/infusion equilibration was silent (the warning was
     // wired only into the input-rate branch). Only a *nonlinear* disposition reaches this
     // fallback — the linear closed form above returned early — so this is exactly the saturable
@@ -1419,6 +1496,33 @@ fn ss_state_at_phase_pk(
     phase: f64,
     opts: &OdeSolverOptions,
 ) -> Vec<f64> {
+    // ### Why this function's own solves keep the bare slice while its sibling does not
+    //
+    // [`equilibrate_ss_pk_state`] hands every window an extended array via
+    // [`ss_run_in_params`] so a `TAD`-reading RHS reads a real anchor (#1139). The three
+    // `solve_ode` calls **below** deliberately do not, and the asymmetry is not an
+    // oversight: this function is reachable only from `ss_seeded_at_record`, which requires
+    // `lag > 0` (`crate::dosing::ss_seeded_at_record`), and that geometry is #1126 — the
+    // walk's `TAD` anchor in `[t_dose, t_dose + lag)` falls back to the *first arrival*
+    // instead of the previous cycle's pulse.
+    //
+    // Measured on `CL = 1`, `V = 20`, `AMT = 100`, `II = 12`, `ALAG = 3`, RHS
+    // `-(CL/V)·A·(1 + 0.03·TAD)`: anchoring these three windows makes the whole subject
+    // finite and **2.733 % high at every post-arrival observation**, not merely inside the
+    // pre-arrival window. The seed this function returns is already right (it matches the
+    // closed form); what corrupts the run is that #1121 lets the record-time seed *flow* to
+    // the arrival rather than re-equilibrating there (the `!ss_seeded_at_record(..)` guard
+    // on the arrival branches), so the wrong pre-arrival anchor is carried into the trough
+    // and multiplies into every later prediction by a uniform 1.0273332950.
+    //
+    // A finite 2.7 %-wrong answer is worse than the `NaN` it replaces, so the combination is
+    // rejected up front (`E_SS_LAGTIME_TAD_RHS`, `api::validation`) and these windows are
+    // left as they are. #1126 fixes the anchor and lifts the gate; both halves belong in the
+    // same change, where a mutation can show that neither alone is sufficient.
+    //
+    // Note for anyone asserting `crate::dosing::last_ss_equilibration_branch()` after this
+    // function: the tag it leaves belongs to the `equilibrate_ss_pk_state` call below, not to
+    // the phase advance, which records nothing of its own.
     let chz = &ode.chz_state_slots[..];
     let base_rhs = |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
         (ode.rhs)(y, p, t, dy);

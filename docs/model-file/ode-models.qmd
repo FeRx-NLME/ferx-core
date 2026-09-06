@@ -255,6 +255,12 @@ Such models take the event-driven ODE path, which places each dose on its timeli
 (possibly lagged) arrival so `TAD` anchors correctly. There is nothing to configure; the cost
 is that these models integrate rather than evaluate in closed form.
 
+A **steady-state** (`SS=1`) dose is a separate question, because the run-in that stands in
+for the infinite past does not integrate on the subject's clock — see
+[Steady state with a `TAD`-reading RHS](steady-state.qmd#steady-state-with-a-tad-reading-rhs).
+`TAD` is anchored per run-in window and is NONMEM-anchored; `TAFD` and `TIME`/`T` are not,
+and `SS=1` combined with a lagtime on a `TAD`-reading RHS is rejected.
+
 #### The injected joint PK-TTE hazard line does not count {#chz-is-not-your-rhs}
 
 A joint PK-TTE model's `[event_model] hazard = …` is appended to the ODE system as a

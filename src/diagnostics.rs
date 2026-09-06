@@ -42,6 +42,7 @@
 //! | `E_OPTIMIZER_AGQ`         | `optimizer = trust_region` used with a quadrature stage (`laplace`, or `focei` with `n_agq > 1`) |
 //! | `E_SIGMA_ORDER_MISMATCH`  | a single-endpoint `[error_model]` names its sigmas in an order other than the `[parameters]` declaration order |
 //! | `E_OMEGA_INIT_AT_RAIL`    | a **free** `omega` / `kappa` / `[mixture] omega(k)` variance whose initial value packs onto the optimizer's `-6` lower rail (variance ≤ 6.1e-6, `~ 0.0` included) — clamped there and not estimable; `FIX` it or start it higher (#1229) |
+//! | `E_SS_LAGTIME_TAD_RHS`    | an `SS=1` dose with a lagtime on an `[odes]` RHS that reads `TAD` — `TAD` has no referent in the pre-arrival window and the wrong value is carried into the steady-state trough, shifting every prediction (#1139 / #1126) |
 //! | `W_STEADY_STATE_II`       | SS=1 dose with missing / non-positive II |
 //! | `W_STEADY_STATE_INFUSION` | SS=1 infusion with `T_inf > II` (overlapping pulses) |
 //! | `W_SDE_RESET`             | EVID=3/4 resets under an SDE model are not honoured |

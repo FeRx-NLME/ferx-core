@@ -9184,21 +9184,31 @@ fn ode_ss_time_only_rhs_still_routes_to_fd() {
 /// `equilibrate_ss_state_g` while the identical model spelled `T` declined —
 /// the gate's own doc said to pair the two flags and this caller did not.
 ///
-/// What the gate does and does not buy, measured against an explicit 40-cycle
-/// pulse train (the oracle with no SS machinery in it at all):
+/// What the gate does and does not buy, measured on the committed anchor
+/// (`nonmem_anchor/ss_tad.ctl` and friends: 1-cpt IV bolus, `CL = 1`, `V = 20`,
+/// `II = 12`, one `SS=1` record at t = 480, read at t = 482) against the explicit
+/// 41-dose train — the oracle with no SS machinery in it at all:
 ///
-/// | RHS term      | SS=1 value | vs. pulse train |
-/// |---------------|------------|-----------------|
-/// | autonomous    | 10.027269  | `7.6e-9`        |
-/// | `0.003*T`     | 9.545089   | **17% wrong**   |
-/// | `0.003*TIME`  | 9.545089   | **17% wrong**   |
-/// | `0.03*TAD`    | `NaN`      | —               |
-/// | `0.0*TAD`     | `NaN`      | —               |
+/// | RHS term       | `SS=1` value | vs. its own train |
+/// |----------------|--------------|-------------------|
+/// | autonomous     | 10.027269    | `2.1e-11`         |
+/// | `0.03*TAD`     | 8.890201     | `3.8e-13`         |
+/// | `0.0*TAD`      | 10.027269    | `2.1e-11`         |
+/// | `0.003*T`      | 8.567935     | **67% — no periodic limit to converge to** |
+/// | `0.003*TIME`   | 8.567935     | **67%** — bit-identical to `T`, measured |
+/// | `0.003*TAFD`   | `NaN`        | — |
+///
+/// The `TAD` rows read `NaN` when this gate landed and are the half #1139 fixed;
+/// every number above is now **asserted**, in
+/// `tests/ss_model_time_nonmem_anchor.rs` and `ode/predictions_tests.rs`, because a
+/// table living on a *routing* test cannot notice when the values it describes
+/// change — and two of them did.
 ///
 /// So this gate closes an asymmetry in the **gradient** route only: `T` was
-/// already declining and its value is wrong anyway. Declining is still right —
-/// an analytic jet of a wrong value is worse than an FD one — but the value
-/// defect is separate and is not fixed here (#1139).
+/// already declining and its value is still not a steady state. Declining is right
+/// — an analytic jet of a wrong value is worse than an FD one — and it stays right
+/// for `TAD` too, whose value is now correct but whose *dual* equilibration still
+/// anchors both model-time slots at zero (#1139's remaining half).
 #[test]
 fn ode_ss_bare_time_builtin_rhs_routes_to_fd() {
     let model = tad_gate_model("TIME", "");

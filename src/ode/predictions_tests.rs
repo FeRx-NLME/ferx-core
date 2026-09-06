@@ -11056,3 +11056,758 @@ mod lag_arrival_read_1226 {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// #1139 — the steady-state run-in on a model-time-reading `[odes]` RHS.
+//
+// The compiled RHS reads `TAD` out of `params[MAX_PK_PARAMS + 1]`; every SS call site
+// hands `solve_ode` a bare `PkParams::values`, which is exactly `MAX_PK_PARAMS` long, so
+// both `.get()` calls returned `None` and the RHS injected `NaN`. `0.0 * NaN = NaN`, so
+// merely *mentioning* `TAD` turned an ordinary `SS=1` fit non-finite.
+//
+// The run-in does not integrate on the subject's clock: it expands a periodic train on a
+// clock local to each window, so the anchor is that window's own pulse time and not a
+// `tad_anchor_for` question. `ss_run_in_params` names the three shapes; the tests below
+// pin one each, against a value computed **outside the engine**.
+// ---------------------------------------------------------------------------
+
+/// The `TAD` read exactly as the compiled `[odes]` RHS spells it
+/// (`parser::model_parser`, the model-time closure): `.get(slot)`, rejected when
+/// non-finite, `NaN` otherwise.
+///
+/// Writing it any other way makes the fixture unable to reproduce the defect. The
+/// neighbouring `one_cpt_tad_ode_spec` indexes `p[MAX_PK_PARAMS + 1]` directly, so on a
+/// short slice it **panics** instead of returning `NaN` — a different failure, and one
+/// these tests must not be built on.
+#[inline]
+fn run_in_tad(p: &[f64], t: f64) -> f64 {
+    p.get(crate::types::MAX_PK_PARAMS + 1)
+        .copied()
+        .filter(|v| v.is_finite())
+        .map_or(f64::NAN, |anchor| t - anchor)
+}
+
+/// `TAFD`, the sibling slot, read the same way.
+#[inline]
+fn run_in_tafd(p: &[f64], t: f64) -> f64 {
+    p.get(crate::types::MAX_PK_PARAMS)
+        .copied()
+        .filter(|v| v.is_finite())
+        .map_or(f64::NAN, |anchor| t - anchor)
+}
+
+/// A 1-cpt spec at a tight tolerance, with `rhs` supplied by the caller.
+fn run_in_spec(
+    rhs: Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync>,
+) -> crate::ode::OdeSpec {
+    let mut ode = one_cpt_ode_spec();
+    ode.rhs = rhs;
+    ode.solver_opts.method = crate::ode::OdeMethod::Rk45;
+    ode.solver_opts.reltol = 1e-11;
+    ode.solver_opts.abstol = 1e-13;
+    ode
+}
+
+/// `∫₀^s (1 + c·τ) dτ = s + c·s²/2` — the exponent's time integral for the linear arm.
+#[inline]
+fn psi(s: f64, c: f64) -> f64 {
+    s + c * s * s / 2.0
+}
+
+/// #1139, the **exact-solve** window (`(0, II)` propagator probes and the bolus cycle).
+///
+/// `dA/dt = −k·A·(1 + c·TAD)` is linear in the state and time-varying, so its one-cycle map
+/// is affine and `periodic_ss_fixed_point_g`'s self-check accepts it — asserted here on the
+/// branch tag, because this branch **was not the one running before the fix**: the `NaN`
+/// made every propagator probe non-finite, the solve returned `None`, and the same fixture
+/// fell through to the capped train. A test that did not pin the branch would silently
+/// change which code it covers, and worse, would not notice a *mutation* of this window
+/// either — a broken exact solve declines into a correct fallback. Measured: three of the
+/// ten #1139 mutations survived the whole suite until the branch was asserted.
+///
+/// Oracle: the fixed point of `A ↦ (A + D)·Φ(II)`, `Φ(s) = exp(−k·(s + c·s²/2))`, i.e.
+/// `A* = D·Φ(II)/(1 − Φ(II))` — closed form, no integrator on either side. The same
+/// constant reproduces NONMEM 7.6.0's own `SS=1` value to 7.7e-9 (see
+/// `tests/ss_model_time_nonmem_anchor.rs`).
+#[test]
+fn ss_run_in_reads_the_cycle_local_tad_on_the_exact_solve() {
+    let (cl, v, c) = (1.0_f64, 20.0_f64, 0.03_f64);
+    let k = cl / v;
+    let (amt, ii) = (100.0_f64, 12.0_f64);
+    let ode = run_in_spec(Box::new(
+        move |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
+            let ke = p[crate::types::PK_IDX_CL] / p[crate::types::PK_IDX_V];
+            dy[0] = -ke * y[0] * (1.0 + c * run_in_tad(p, t));
+        },
+    ));
+    let dose = DoseEvent::new(480.0, amt, 1, 0.0, true, ii);
+    let pk = pk_one(cl, v);
+
+    let trough = equilibrate_ss_state(&ode, &pk.values, &dose, &ode.solver_opts, &[]);
+    assert_eq!(
+        crate::dosing::last_ss_equilibration_branch(),
+        crate::dosing::SsBranch::Exact,
+        "this fixture must take the EXACT solve, not the capped train — before #1139 the \
+         NaN broke the linearity self-check and the same model fell through to the train, \
+         so the branch under test here is not the branch that used to run"
+    );
+
+    let rho = (-k * psi(ii, c)).exp();
+    let want = amt * rho / (1.0 - rho); // 97.09422789372483
+    assert!(
+        trough[0].is_finite(),
+        "the run-in returned {} — the TAD slot is still absent from the params slice",
+        trough[0]
+    );
+    // Realised error, measured on this fixture: 4.695e-12 relative
+    // (97.0942278941807 against 97.0942278937248). Bound at 1e-10, 21x headroom — the
+    // solver's own reltol here is 1e-11 and the exact solve tightens it further, so this
+    // is an accuracy bound and not a convention bound.
+    let rel = (trough[0] - want).abs() / want;
+    assert!(
+        rel < 1e-10,
+        "cycle-local TAD trough {:.13} vs the closed form {want:.13} (rel {rel:.3e})",
+        trough[0]
+    );
+
+    // Non-degeneracy: the trough must not be the answer a *wrong* anchor gives. Anchoring
+    // the cycle at the record time instead of the pulse (`TAD = t`, i.e. 480..492) is the
+    // most plausible near-miss, and it is orders away.
+    let rho_wrong = (-k * (psi(492.0, c) - psi(480.0, c))).exp();
+    let wrong = amt * rho_wrong / (1.0 - rho_wrong);
+    assert!(
+        (want - wrong).abs() / want > 0.9,
+        "the fixture cannot separate a cycle-local anchor ({want:.6}) from a record-time \
+         one ({wrong:.6}); TAD is not live enough in this cycle to test anything"
+    );
+}
+
+/// #1139, the **capped pulse-train** window — the branch a *nonlinear* disposition takes
+/// when `periodic_ss_fixed_point_g` declines.
+///
+/// The exact-solve arm above can no longer reach this branch after the fix, so it needs its
+/// own fixture, and a mutation of the train's anchor must redden **this** test and not that
+/// one. `dA/dt = −k·A²·(1 + c·TAD)` is genuinely nonlinear yet still exactly solvable:
+/// `1/A(s) − 1/A(0) = k·Ψ(s)` with `Ψ(s) = s + c·s²/2`, so the one-cycle map is
+/// `A ↦ (A + D)/(1 + k·(A + D)·Ψ(II))` and its fixed point solves the quadratic
+/// `k·Ψ·x² − D·k·Ψ·x − D = 0` in `x = A + D`. Closed form on both counts — no second
+/// integrator, and no ferx twin that could agree with a wrong anchor.
+#[test]
+fn ss_run_in_reads_the_cycle_local_tad_on_the_capped_train() {
+    let (k, c) = (0.02_f64, 0.03_f64);
+    let (amt, ii) = (100.0_f64, 12.0_f64);
+    // `k` is carried as CL with V = 1 so the RHS reads it out of an ordinary PK slot.
+    let ode = run_in_spec(Box::new(
+        move |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
+            let ke = p[crate::types::PK_IDX_CL] / p[crate::types::PK_IDX_V];
+            dy[0] = -ke * y[0] * y[0] * (1.0 + c * run_in_tad(p, t));
+        },
+    ));
+    let dose = DoseEvent::new(480.0, amt, 1, 0.0, true, ii);
+    let pk = pk_one(k, 1.0);
+
+    let trough = equilibrate_ss_state(&ode, &pk.values, &dose, &ode.solver_opts, &[]);
+    assert_eq!(
+        crate::dosing::last_ss_equilibration_branch(),
+        crate::dosing::SsBranch::CappedTrain,
+        "this fixture must take the CAPPED TRAIN, not the exact solve — a quadratic RHS \
+         is what makes the linearity self-check decline, and if it stopped doing so this \
+         test would silently cover the other branch"
+    );
+
+    let big_psi = k * psi(ii, c);
+    // x = A + D, positive root of  big_psi·x² − D·big_psi·x − D = 0.
+    let disc = (amt * big_psi).powi(2) + 4.0 * big_psi * amt;
+    let x = (amt * big_psi + disc.sqrt()) / (2.0 * big_psi);
+    let want = x - amt;
+    assert!(
+        trough[0].is_finite(),
+        "the capped train returned {} — the TAD slot is still absent",
+        trough[0]
+    );
+    // Realised error, measured: 3.564e-12 relative (107.9378708183351 against
+    // 107.9378708179504) — the train early-stops well inside its 50-cycle cap here.
+    // Bound at 1e-9, 280x headroom.
+    let rel = (trough[0] - want).abs() / want;
+    assert!(
+        rel < 1e-9,
+        "capped-train trough {:.13} vs the closed form {want:.13} (rel {rel:.3e})",
+        trough[0]
+    );
+}
+
+/// #1139, the **quiet window** of a steady-state infusion cycle.
+///
+/// The cycle is integrated as an active window `(0, T_inf)` and then a quiet window
+/// `(0, II − T_inf)` whose local clock restarts at zero — but which sits `T_inf` after the
+/// pulse. Its anchor is therefore `−T_inf`, not `0`; a flat `0` would restart `TAD` at the
+/// end of the infusion and read `0 … II − T_inf` where the cycle is at `T_inf … II`.
+///
+/// Oracle, outside the engine: with `μ(s) = 1/Φ(s) = exp(k·(s + c·s²/2))` the variation-of-
+/// parameters solution over one cycle is `A(II) = [A(0) + R·J]/μ(II)`, `J = ∫₀^{T_inf} μ`,
+/// so the periodic trough is `A* = R·J/(μ(II) − 1)`. `J` is evaluated by composite Simpson
+/// on a smooth integrand — quadrature, not an ODE solve, so the reference shares no code
+/// and no method with either engine.
+#[test]
+fn ss_infusion_run_in_keeps_the_pulse_clock_across_the_quiet_window() {
+    let (cl, v, c) = (1.0_f64, 20.0_f64, 0.03_f64);
+    let k = cl / v;
+    let (amt, rate, ii) = (100.0_f64, 25.0_f64, 12.0_f64);
+    let t_inf = amt / rate; // 4.0
+    let ode = run_in_spec(Box::new(
+        move |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
+            let ke = p[crate::types::PK_IDX_CL] / p[crate::types::PK_IDX_V];
+            dy[0] = -ke * y[0] * (1.0 + c * run_in_tad(p, t));
+        },
+    ));
+    let dose = DoseEvent::new(480.0, amt, 1, rate, true, ii);
+    assert!(dose.is_infusion(), "the fixture must be a real SS infusion");
+    let pk = pk_one(cl, v);
+
+    let trough = equilibrate_ss_state(&ode, &pk.values, &dose, &ode.solver_opts, &[]);
+    assert_eq!(
+        crate::dosing::last_ss_equilibration_branch(),
+        crate::dosing::SsBranch::Exact,
+        "this fixture must take the EXACT solve's infusion cycle — on the capped train it \
+         would cover the *other* pair of active/quiet windows and leave these two untested"
+    );
+
+    // Composite Simpson over [0, upper] of μ(s) = exp(k·(s + c·s²/2)), 4096 panels.
+    let mu = |s: f64| (k * psi(s, c)).exp();
+    let simpson = |upper: f64| -> f64 {
+        let n = 4096usize;
+        let h = upper / n as f64;
+        let mut acc = mu(0.0) + mu(upper);
+        for i in 1..n {
+            let w = if i % 2 == 0 { 2.0 } else { 4.0 };
+            acc += w * mu(i as f64 * h);
+        }
+        acc * h / 3.0
+    };
+    let want = rate * simpson(t_inf) / (mu(ii) - 1.0);
+    assert!(
+        trough[0].is_finite(),
+        "the SS infusion run-in returned {} — the TAD slot is still absent",
+        trough[0]
+    );
+    // Realised error, measured: 3.980e-12 relative (3.4144862807293 against
+    // 3.4144862807157). Bound at 1e-9, 250x headroom. Simpson's own truncation error on
+    // this integrand at 4096 panels is far below that, so the bound measures the engine.
+    let rel = (trough[0] - want).abs() / want;
+    assert!(
+        rel < 1e-9,
+        "SS infusion trough {:.13} vs the quadrature reference {want:.13} (rel {rel:.3e})",
+        trough[0]
+    );
+
+    // The straddle: the quiet window must be *distinguishable* from an anchor of 0. That
+    // wrong spelling integrates the quiet leg with `TAD = 0 … II − T_inf`, i.e. the
+    // exponent gains `Ψ(II − T_inf)` instead of `Ψ(II) − Ψ(T_inf)`. If the two agreed this
+    // test could not see the mutation it exists for.
+    let exp_right = k * (psi(ii, c) - psi(t_inf, c));
+    let exp_wrong = k * psi(ii - t_inf, c);
+    assert!(
+        (exp_right - exp_wrong).abs() / exp_right > 0.05,
+        "the quiet window's two anchors differ by only {:.3e} in the exponent — pick a \
+         larger `c` or `T_inf` or this fixture is a tautology",
+        (exp_right - exp_wrong).abs() / exp_right
+    );
+}
+
+/// The plumbing discriminator: with the coefficient at **zero** the `TAD` term contributes
+/// nothing, so the run-in must return the autonomous trough. Before #1139 this failed for
+/// the opposite reason to the usual one — `0.0 * NaN` is `NaN`, so merely *mentioning* the
+/// built-in destroyed an otherwise ordinary steady state.
+///
+/// This checks that the slot is *present*, not that its value is right: a wrong-but-finite
+/// anchor passes it. That is why the value tests above compare against closed forms.
+#[test]
+fn a_zero_coefficient_tad_term_leaves_the_ss_run_in_unchanged() {
+    let (cl, v) = (1.0_f64, 20.0_f64);
+    let (amt, ii) = (100.0_f64, 12.0_f64);
+    let plain = run_in_spec(Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+        let ke = p[crate::types::PK_IDX_CL] / p[crate::types::PK_IDX_V];
+        dy[0] = -ke * y[0];
+    }));
+    let zero_coef = run_in_spec(Box::new(|y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
+        let ke = p[crate::types::PK_IDX_CL] / p[crate::types::PK_IDX_V];
+        dy[0] = -ke * y[0] * (1.0 + 0.0 * run_in_tad(p, t));
+    }));
+    let dose = DoseEvent::new(480.0, amt, 1, 0.0, true, ii);
+    let pk = pk_one(cl, v);
+
+    let a = equilibrate_ss_state(&plain, &pk.values, &dose, &plain.solver_opts, &[]);
+    let b = equilibrate_ss_state(&zero_coef, &pk.values, &dose, &zero_coef.solver_opts, &[]);
+    assert!(b[0].is_finite(), "`0.0 * TAD` returned {}", b[0]);
+    assert_eq!(
+        a[0].to_bits(),
+        b[0].to_bits(),
+        "an inert TAD term moved the trough: {} vs {}",
+        a[0],
+        b[0]
+    );
+
+    // …and the autonomous value is itself the closed form, so this test also pins that the
+    // #1139 change did not disturb a model reading neither built-in.
+    let rho = (-(cl / v) * ii).exp();
+    let want = amt * rho / (1.0 - rho);
+    // Realised error, measured: 2.755e-12 relative. Bound at 1e-10, 36x headroom.
+    assert!(
+        (a[0] - want).abs() / want < 1e-10,
+        "autonomous SS trough {:.13} vs the closed form {want:.13}",
+        a[0]
+    );
+}
+
+/// **Scope pin for #1139's other half.** `TAFD` inside a steady-state run-in stays `NaN`,
+/// deliberately: the run-in stands in for an infinite past, and its train has no periodic
+/// limit at all — measured, an explicit `TAFD` train diverges 0.294 per doubling of its
+/// length. Anchoring it at the run-in's own origin would hand back a finite, plausible
+/// number that is really `TAD` under another name, which is the defect class #1139 exists
+/// to remove. `TAFD` / `T` / `TIME` under `SS=1` are handled separately.
+///
+/// If this test starts failing because someone made `TAFD` finite here, that is a design
+/// change and not a bug fix — the number it would produce is not a steady state.
+#[test]
+fn tafd_stays_nan_inside_an_ss_run_in() {
+    let (cl, v) = (1.0_f64, 20.0_f64);
+    let ode = run_in_spec(Box::new(|y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
+        let ke = p[crate::types::PK_IDX_CL] / p[crate::types::PK_IDX_V];
+        dy[0] = -ke * y[0] * (1.0 + 0.003 * run_in_tafd(p, t));
+    }));
+    let dose = DoseEvent::new(480.0, 100.0, 1, 0.0, true, 12.0);
+    let pk = pk_one(cl, v);
+    let trough = equilibrate_ss_state(&ode, &pk.values, &dose, &ode.solver_opts, &[]);
+    assert!(
+        trough[0].is_nan(),
+        "TAFD inside the run-in returned {:.9}; a finite value here is TAD wearing TAFD's \
+         name — the quantity has no periodic steady state to converge to",
+        trough[0]
+    );
+}
+
+/// A converged explicit dose train through ferx's **forward walk**, for the arms where no
+/// closed form exists (a nonlinear disposition, or absorption superposition).
+///
+/// Returns the N = 2·`half` prediction vector after asserting it against the N = `half`
+/// one, so the reference certifies its own convergence — an unconverged train anchors
+/// nothing. The final pulse lands at `t_last` in both, so the two differ only in how much
+/// run-in precedes it.
+fn converged_train(
+    ode: &crate::ode::OdeSpec,
+    pk: &[f64],
+    half: usize,
+    t_last: f64,
+    ii: f64,
+    amt: f64,
+    obs: &[f64],
+) -> Vec<f64> {
+    let run = |n: usize| -> Vec<f64> {
+        let start = t_last - (n - 1) as f64 * ii;
+        let doses: Vec<DoseEvent> = (0..n)
+            .map(|m| DoseEvent::new(start + m as f64 * ii, amt, 1, 0.0, false, 0.0))
+            .collect();
+        ode_predictions(ode, pk, &[], &[], &make_subject(doses, obs.to_vec()))
+    };
+    let (short, long) = (run(half), run(2 * half));
+    for (j, (a, b)) in short.iter().zip(&long).enumerate() {
+        // `is_finite` before the fold: a `NaN` compared with `<` reads as in range.
+        assert!(a.is_finite() && b.is_finite(), "train obs {j}: {a} / {b}");
+        assert!(
+            (a - b).abs() / b < 1e-9,
+            "the reference train has not converged at obs {j} ({a:.9} at N={half} vs \
+             {b:.9} at N={}) — it cannot anchor anything until it has",
+            2 * half
+        );
+    }
+    long
+}
+
+/// #1139, the **input-rate exact solve**: a steady-state dose into a built-in absorption
+/// compartment on a *linear* disposition takes `equilibrate_ss_input_rate`'s closed-form
+/// fixed point, whose one-cycle advance runs on the cycle-local clock.
+///
+/// **The branch assertion is the point of this test, not decoration.** The three
+/// input-rate branches fall back to one another — exact → Anderson → capped train — so
+/// breaking the exact solve's clock makes it *decline* into a branch that is still correct,
+/// and a value-only assertion stays green. Measured: a mutation setting this window's
+/// anchor to `NaN` left the entire suite passing before the branch was observable.
+#[test]
+fn ss_into_absorption_exact_solve_reads_the_cycle_local_tad() {
+    let (cl, v, ka, c) = (1.0_f64, 20.0_f64, 0.7_f64, 0.03_f64);
+    let (amt, ii, t_last) = (100.0_f64, 12.0_f64, 600.0_f64);
+    let rhs = move |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
+        let ke = p[crate::types::PK_IDX_CL] / p[crate::types::PK_IDX_V];
+        dy[0] = -ke * y[0] * (1.0 + c * run_in_tad(p, t));
+    };
+    let mut ode = run_in_spec(Box::new(rhs));
+    ode.input_rate = vec![crate::pk::absorption::InputRateForcing {
+        cmt: 0,
+        kind: crate::pk::absorption::InputRateKind::FirstOrder,
+        arg_slots: vec![crate::types::PK_IDX_KA],
+        frac_slot: None,
+        lag_slot: None,
+    }];
+    let mut pk = pk_one(cl, v);
+    pk.values[crate::types::PK_IDX_KA] = ka;
+
+    let obs = vec![602.0, 605.0, 608.0, 611.0];
+    let ss_subj = make_subject(
+        vec![DoseEvent::new(t_last, amt, 1, 0.0, true, ii)],
+        obs.clone(),
+    );
+    let ss = ode_predictions(&ode, &pk.values, &[], &[], &ss_subj);
+    assert_eq!(
+        crate::dosing::last_ss_equilibration_branch(),
+        crate::dosing::SsBranch::InputRateExact,
+        "this fixture must take the EXACT **input-rate** solve — if it declines into \
+         Anderson or the capped train the answer is still right and this test silently \
+         stops covering the window it names. `InputRateExact` rather than `Exact`: the \
+         bolus/infusion closed form records the latter from a different function with \
+         different windows, and this assertion should not pass on it"
+    );
+
+    let want = converged_train(&ode, &pk.values, 31, t_last, ii, amt, &obs);
+    for (j, (&got, &w)) in ss.iter().zip(&want).enumerate() {
+        assert!(
+            got.is_finite(),
+            "SS into absorption returned {got} at obs {j}"
+        );
+        // Realised error, measured: worst 1.049e-13 relative over the four times. Bound at
+        // 1e-9, ~1e4 headroom, with room for the adaptive solver's platform step drift
+        // (#990 / #1241) rather than set from this fixture alone.
+        let rel = (got - w).abs() / w;
+        assert!(
+            rel < 1e-9,
+            "exact input-rate SS {got:.9} vs the explicit train {w:.9} at obs {j} \
+             (rel {rel:.3e})"
+        );
+    }
+}
+
+/// #1139, the infusion windows of the **capped pulse train** — the same two clocks the
+/// exact solve's infusion cycle uses (`0` for the active window, `−T_inf` for the quiet
+/// one), on the branch a nonlinear disposition takes.
+///
+/// The exact-solve infusion arm above cannot reach this branch, so a mutation of these two
+/// lines survives it; this test is what dies instead. The oracle is a converged explicit
+/// infusion train through the forward walk, which builds its infusion windows from the
+/// subject's own dose list rather than from an active/quiet split — different code, same
+/// answer only if both clocks are right.
+#[test]
+fn ss_infusion_capped_train_keeps_the_pulse_clock() {
+    let (k, c) = (0.02_f64, 0.03_f64);
+    let (amt, rate, ii, t_last) = (100.0_f64, 25.0_f64, 12.0_f64, 600.0_f64);
+    let ode = run_in_spec(Box::new(
+        move |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
+            let ke = p[crate::types::PK_IDX_CL] / p[crate::types::PK_IDX_V];
+            dy[0] = -ke * y[0] * y[0] * (1.0 + c * run_in_tad(p, t));
+        },
+    ));
+    let pk = pk_one(k, 1.0);
+    let obs = vec![602.0, 605.0, 608.0, 611.0];
+
+    let ss_dose = DoseEvent::new(t_last, amt, 1, rate, true, ii);
+    assert!(
+        ss_dose.is_infusion(),
+        "the fixture must be a real SS infusion"
+    );
+    let ss = ode_predictions(
+        &ode,
+        &pk.values,
+        &[],
+        &[],
+        &make_subject(vec![ss_dose], obs.clone()),
+    );
+    assert_eq!(
+        crate::dosing::last_ss_equilibration_branch(),
+        crate::dosing::SsBranch::CappedTrain,
+        "a quadratic RHS is what makes the linearity self-check decline; on the exact solve \
+         this test would cover the other pair of infusion windows"
+    );
+
+    // The explicit train carries the same `RATE`, so its windows are built by the walk's
+    // own `active_infusions` rather than by the run-in's active/quiet split.
+    let run = |n: usize| -> Vec<f64> {
+        let start = t_last - (n - 1) as f64 * ii;
+        let doses: Vec<DoseEvent> = (0..n)
+            .map(|m| DoseEvent::new(start + m as f64 * ii, amt, 1, rate, false, 0.0))
+            .collect();
+        ode_predictions(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &make_subject(doses, obs.clone()),
+        )
+    };
+    let (short, want) = (run(31), run(62));
+    for (j, (a, b)) in short.iter().zip(&want).enumerate() {
+        assert!(a.is_finite() && b.is_finite(), "train obs {j}: {a} / {b}");
+        assert!(
+            (a - b).abs() / b < 1e-9,
+            "the reference infusion train has not converged at obs {j} ({a:.9} vs {b:.9})"
+        );
+    }
+    for (j, (&got, &w)) in ss.iter().zip(&want).enumerate() {
+        assert!(
+            got.is_finite(),
+            "SS infusion train returned {got} at obs {j}"
+        );
+        // Realised error, measured: worst 1.688e-12 relative. Bound at 1e-8, ~6e3 headroom.
+        let rel = (got - w).abs() / w;
+        assert!(
+            rel < 1e-8,
+            "capped-train SS infusion {got:.9} vs the explicit train {w:.9} at obs {j} \
+             (rel {rel:.3e})"
+        );
+    }
+}
+
+/// #1139, the **monotone** window — the one run-in clock that does not restart each cycle.
+///
+/// When the exact fixed point and the Anderson iteration both decline, the input-rate path
+/// falls back to an explicit pulse train integrated over `0 … n·II` in one monotone sweep.
+/// Its `TAD` anchor therefore has to *advance* with the segment: the pulse governing
+/// segment `m` sits at local `m·II`, taken from `tad_anchor_for` over the train's own
+/// synthetic dose list. A flat `0` reads `TAD = m·II + τ` — up to
+/// `SS_EQUILIBRATION_CYCLES − 1 = 49` whole dosing intervals wrong.
+///
+/// **This branch is the "no periodic steady state" fallback, and the test is built on that
+/// rather than around it.** `equilibrate_ss_input_rate` returns `None` — reaching here — only
+/// for a singular `I − M`, a non-finite intermediate, or `ρ ≥ 1`: mean input at or above
+/// maximum elimination, where no steady state exists to converge to (#867 warns about
+/// exactly this). The fixture is saturable Michaelis–Menten dosed above capacity, so its
+/// output is a *truncated accumulation*, not a trough, and comparing it against a
+/// "converged" train would be meaningless — the train does not converge either.
+///
+/// What it must equal instead is exact and checkable: `SS_EQUILIBRATION_CYCLES` run-in
+/// pulses plus the record's own dose is an explicit **51-dose** train ending at the same
+/// time. Measured, it reproduces that train to **6.7e-16** — bit-level — while the
+/// neighbouring lengths sit 1.5 % away per dose, so the comparison is sharp in the length
+/// dimension too. `with_full_ss_equilibration` pins the run-in at the full budget so the
+/// matching length is 51 and not whatever the #519 early stop happened to pick.
+///
+/// The branch assertion is load-bearing, not decoration: the three input-rate branches fall
+/// back to one another, the other two anchor their windows correctly, and a mutation of
+/// *this* window survives on either of them. Measured — that is how it survived before this
+/// assertion existed.
+#[test]
+fn ss_into_absorption_monotone_train_advances_the_tad_anchor_each_cycle() {
+    let (vm, km, v, ka, c) = (6.0_f64, 4.0_f64, 20.0_f64, 0.7_f64, 0.03_f64);
+    let (amt, ii, t_last) = (100.0_f64, 12.0_f64, 600.0_f64);
+    // Saturable elimination dosed above capacity (`VM·II = 72` against `AMT = 100`), so
+    // `ρ ≥ 1` and both the exact solve and Anderson decline. `VM`/`KM` ride in the CL/V
+    // slots so the RHS reads them out of ordinary PK slots.
+    let rhs = move |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
+        let (vmax, k_m) = (p[crate::types::PK_IDX_CL], p[crate::types::PK_IDX_V]);
+        let conc = y[0] / v;
+        dy[0] = -(vmax * conc / (k_m + conc)) * (1.0 + c * run_in_tad(p, t));
+    };
+    let mut ode = run_in_spec(Box::new(rhs));
+    ode.input_rate = vec![crate::pk::absorption::InputRateForcing {
+        cmt: 0,
+        kind: crate::pk::absorption::InputRateKind::FirstOrder,
+        arg_slots: vec![crate::types::PK_IDX_KA],
+        frac_slot: None,
+        lag_slot: None,
+    }];
+    let mut pk = pk_one(vm, km);
+    pk.values[crate::types::PK_IDX_KA] = ka;
+
+    let obs = vec![602.0, 605.0, 608.0, 611.0];
+    let ss_subj = make_subject(
+        vec![DoseEvent::new(t_last, amt, 1, 0.0, true, ii)],
+        obs.clone(),
+    );
+    let ss = crate::dosing::with_full_ss_equilibration(|| {
+        ode_predictions(&ode, &pk.values, &[], &[], &ss_subj)
+    });
+    assert_eq!(
+        crate::dosing::last_ss_equilibration_branch(),
+        crate::dosing::SsBranch::InputRateTrain,
+        "this fixture must reach the MONOTONE input-rate train — the exact solve and \
+         Anderson both anchor their windows correctly, so on either of them a mutation of \
+         the monotone anchor survives"
+    );
+    assert_eq!(
+        crate::dosing::last_ss_equilibration_cycles(),
+        crate::dosing::SS_EQUILIBRATION_CYCLES,
+        "the forced full budget is what fixes the matching explicit length at 51"
+    );
+
+    let train = |n: usize| -> Vec<f64> {
+        let start = t_last - (n - 1) as f64 * ii;
+        let doses: Vec<DoseEvent> = (0..n)
+            .map(|m| DoseEvent::new(start + m as f64 * ii, amt, 1, 0.0, false, 0.0))
+            .collect();
+        ode_predictions(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &make_subject(doses, obs.clone()),
+        )
+    };
+    let want = train(crate::dosing::SS_EQUILIBRATION_CYCLES + 1);
+    for (j, (&got, &w)) in ss.iter().zip(&want).enumerate() {
+        assert!(
+            got.is_finite(),
+            "monotone-train SS returned {got} at obs {j}"
+        );
+        // Realised error, measured: worst 6.745e-16 relative — the two walks integrate the
+        // same 51 pulses on the same clock. Bound at 1e-10, ~1.5e5 headroom, left that wide
+        // only for the adaptive solver's platform step drift (#990 / #1241).
+        let rel = (got - w).abs() / w;
+        assert!(
+            rel < 1e-10,
+            "monotone-train SS {got:.9} vs the explicit 51-dose train {w:.9} at obs {j} \
+             (rel {rel:.3e})"
+        );
+    }
+
+    // The straddle: the neighbouring lengths must be far away, or "equals a 51-dose train"
+    // is satisfied by any train and the comparison says nothing about the clock. Measured:
+    // 1.5 % per dose at these parameters.
+    let neighbour = train(crate::dosing::SS_EQUILIBRATION_CYCLES);
+    let gap = (want[0] - neighbour[0]).abs() / want[0];
+    assert!(
+        gap > 1e-3,
+        "a 50- and a 51-dose train differ by only {gap:.3e} here, so this fixture cannot \
+         tell the run-in's length or its clock apart from a neighbouring one"
+    );
+}
+
+/// The branch tag reports **`None`** when an equilibration bails out, rather than leaving
+/// the previous call's value.
+///
+/// Written because the enum's doc claimed that behaviour before the code had it: the three
+/// early returns in `equilibrate_ss_pk_state` (`II <= 0`, an out-of-range dose compartment,
+/// an overlapping infusion) used to leave whatever the last completing call had recorded.
+/// A test asserting a branch after one of those would have read a stale tag and passed for
+/// the wrong reason — the un-failable-assertion class the tag exists to close, reappearing
+/// inside the tag itself.
+///
+/// The order matters and is the whole test: run a call that *does* complete first, so the
+/// cell holds a non-`None` value, and only then bail out. Asserting `None` on a fresh
+/// thread would pass on the `Default` and prove nothing.
+#[test]
+fn a_bailed_out_ss_equilibration_reports_no_branch() {
+    let (cl, v, amt, ii) = (1.0_f64, 20.0_f64, 100.0_f64, 12.0_f64);
+    let ode = run_in_spec(Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+        let ke = p[crate::types::PK_IDX_CL] / p[crate::types::PK_IDX_V];
+        dy[0] = -ke * y[0];
+    }));
+    let pk = pk_one(cl, v);
+
+    // 1. A completing call, so the cell is *not* already `None`.
+    let good = DoseEvent::new(480.0, amt, 1, 0.0, true, ii);
+    let _ = equilibrate_ss_state(&ode, &pk.values, &good, &ode.solver_opts, &[]);
+    assert_ne!(
+        crate::dosing::last_ss_equilibration_branch(),
+        crate::dosing::SsBranch::None,
+        "precondition: a completing equilibration must record a branch, or the assertion \
+         below passes on the initial value and tests nothing"
+    );
+
+    // 2. `II <= 0`: the first of the three early returns.
+    let bad_ii = DoseEvent::new(480.0, amt, 1, 0.0, true, 0.0);
+    let _ = equilibrate_ss_state(&ode, &pk.values, &bad_ii, &ode.solver_opts, &[]);
+    assert_eq!(
+        crate::dosing::last_ss_equilibration_branch(),
+        crate::dosing::SsBranch::None,
+        "an `II <= 0` bail-out must clear the tag, not inherit the previous call's"
+    );
+
+    // 3. …an out-of-range dose compartment, so the clear is at the top of the function
+    //    rather than bolted onto one branch.
+    let _ = equilibrate_ss_state(&ode, &pk.values, &good, &ode.solver_opts, &[]);
+    let bad_cmt = DoseEvent::new(480.0, amt, 9, 0.0, true, ii);
+    let _ = equilibrate_ss_state(&ode, &pk.values, &bad_cmt, &ode.solver_opts, &[]);
+    assert_eq!(
+        crate::dosing::last_ss_equilibration_branch(),
+        crate::dosing::SsBranch::None,
+        "an out-of-range dose compartment must clear the tag too"
+    );
+
+    // 4. …and the **overlapping infusion** (`T_inf > II`), the third bail-out the enum's doc
+    //    names — so the doc and the test agree on the set rather than on two thirds of it.
+    //
+    //    What this arm does *not* buy, measured rather than assumed: it is **not** the unique
+    //    catcher of a clear that migrates downward. The clear sits above all three returns, so
+    //    moving it below any of them breaks the *earliest* affected arm first — mutating it to
+    //    just above `let is_inf` was expected to leave 2 and 3 green and kill only this one,
+    //    and instead tripped arm 2 (`II <= 0`). An earlier draft of this comment claimed
+    //    otherwise. What arm 4 uniquely covers is a branch tag being *recorded* between the
+    //    compartment check and the overlap return — e.g. if resolving the infusion window ever
+    //    grows a `record_ss_equilibration_branch` of its own — which arms 2 and 3 return before
+    //    reaching.
+    let _ = equilibrate_ss_state(&ode, &pk.values, &good, &ode.solver_opts, &[]);
+    let overlapping = DoseEvent::new(480.0, amt, 1, 5.0, true, ii); // T_inf = 20 > II = 12
+    assert!(
+        overlapping.is_infusion(),
+        "precondition: this arm needs a real infusion"
+    );
+    let (_, t_inf) = overlapping.bioavailable_infusion(1.0);
+    assert!(
+        t_inf > ii,
+        "precondition: T_inf ({t_inf}) must exceed II ({ii}) to reach the third bail-out"
+    );
+    let _ = equilibrate_ss_state(&ode, &pk.values, &overlapping, &ode.solver_opts, &[]);
+    assert_eq!(
+        crate::dosing::last_ss_equilibration_branch(),
+        crate::dosing::SsBranch::None,
+        "an overlapping SS infusion must clear the tag too — this is the bail-out furthest \
+         from the clear, so it is the one that would break first if the clear moved"
+    );
+}
+
+/// The monotone run-in's `TAD` anchor is the same whether its lag slice is **empty** or a
+/// full-length vector of zeros.
+///
+/// Asked for by the #1263 review, and it pins a dependency that is otherwise invisible.
+/// `equilibrate_ss_pk_state`'s capped input-rate train hands `tad_anchor_for` a slice for a
+/// *synthetic* pulse list that is not `subject.doses`, and passes `&[]` for it. That is only
+/// correct because `tad_anchor_for` reads with `lag_at(i) = dose_lagtimes.get(i).copied()
+/// .unwrap_or(0.0)`; while it indexed, the same call needed a zero-filled `Vec<f64>` of
+/// length `n_pulses` or it panicked.
+///
+/// **What this does and does not cover.** It pins `tad_anchor_for`'s *contract* — that a
+/// short or empty lag slice reads as zero lag — which is what makes the run-in's `&[]` legal.
+/// It does **not** exercise the run-in: it calls `tad_anchor_for` directly, so re-introducing
+/// a zero-filled `Vec` at the call site would leave it green. Call-site coverage comes from
+/// `ss_into_absorption_monotone_train_advances_the_tad_anchor_each_cycle`, which drives the
+/// real branch; this exists because that fixture needs a saturable model dosed above its own
+/// capacity, and a contract this load-bearing should be checkable without one.
+///
+/// Both spellings are compared over every segment boundary the train actually uses, not
+/// just one, so a `.get()` that silently returned `None` past index 0 would still be caught.
+#[test]
+fn ss_monotone_run_in_anchor_is_the_same_with_an_empty_lag_slice() {
+    let (amt, ii) = (100.0_f64, 12.0_f64);
+    let n_pulses = crate::dosing::SS_EQUILIBRATION_CYCLES;
+    let local_doses: Vec<DoseEvent> = (0..n_pulses)
+        .map(|m| DoseEvent::new(m as f64 * ii, amt, 1, 0.0, false, 0.0))
+        .collect();
+    let zeros = vec![0.0f64; n_pulses];
+    let empty: [f64; 0] = [];
+
+    for m in 0..n_pulses {
+        let seg_start = m as f64 * ii;
+        let with_empty = tad_anchor_for(&local_doses, &empty, seg_start);
+        let with_zeros = tad_anchor_for(&local_doses, &zeros, seg_start);
+        assert_eq!(
+            with_empty.to_bits(),
+            with_zeros.to_bits(),
+            "segment {m}: `&[]` gave {with_empty} but a zero-filled slice gave {with_zeros} \
+             — the run-in's anchor now depends on which spelling it passes"
+        );
+        // …and the value is the one the monotone clock needs: the pulse governing segment
+        // `m` sits at `m·II`. Without this the test would pass on two equally wrong answers.
+        assert_eq!(
+            with_empty.to_bits(),
+            seg_start.to_bits(),
+            "segment {m}: anchor {with_empty}, expected the pulse at {seg_start}"
+        );
+    }
+}

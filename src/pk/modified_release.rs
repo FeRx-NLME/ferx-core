@@ -3510,11 +3510,14 @@ mod tests {
     /// `initial_state(&init_pk.values)` at the first record), so this is not
     /// covered by the plain-bolus case above.
     ///
-    /// Steady state is deliberately **not** in this test: on a non-autonomous RHS
-    /// both engines are wrong there — `NaN` for `TAD`/`TAFD` even at a zero
-    /// coefficient, and 17% off an explicit 40-cycle pulse train for `T`/`TIME` —
-    /// so an engine-vs-engine assert would pin agreement on a wrong answer. See
-    /// #1139; the routing neither causes nor cures it.
+    /// Steady state is deliberately **not** in this test, and only half the reason
+    /// survives #1139. `TAD` under `SS=1` is now the periodic steady state on both
+    /// engines (NONMEM-anchored), but `T`/`TIME` still sits 67% from its own explicit
+    /// dose train and `TAFD` still reads `NaN`, so an engine-vs-engine assert on those
+    /// would pin agreement on a wrong answer. See #1139; the routing neither causes nor
+    /// cures it. (`mr_scope` rejects `d.ss || d.is_infusion()` at
+    /// `pk/modified_release.rs`'s scope check before it looks at model time, so no
+    /// steady-state subject reaches the closed form regardless.)
     #[test]
     fn rerouting_an_init_seeded_rhs_does_not_move_the_predictions() {
         let src = r#"
