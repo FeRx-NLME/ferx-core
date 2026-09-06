@@ -1,0 +1,866 @@
+{
+ "pharmpy_version": "2.0.0",
+ "cases": [
+  {
+   "model": "oral",
+   "space": "ABSORPTION(FO); PERIPHERALS(0..1); LAGTIME([OFF,ON])",
+   "algorithm": "exhaustive_stepwise",
+   "input_features": "ABSORPTION(FO);ELIMINATION(FO)",
+   "base_features": "ABSORPTION(FO);ELIMINATION(FO)",
+   "base_transformations": "",
+   "funcs": [
+    "LAGTIME(ON)",
+    "PERIPHERALS(1)"
+   ],
+   "candidates": [
+    {
+     "name": "modelsearch_run1",
+     "feature": [
+      "LAGTIME(ON)"
+     ],
+     "feature_set": [
+      "LAGTIME(ON)"
+     ],
+     "parents": [],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run2",
+     "feature": [
+      "PERIPHERALS(1)"
+     ],
+     "feature_set": [
+      "PERIPHERALS(1)"
+     ],
+     "parents": [],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run3",
+     "feature": [
+      "PERIPHERALS(1)"
+     ],
+     "feature_set": [
+      "LAGTIME(ON)",
+      "PERIPHERALS(1)"
+     ],
+     "parents": [
+      "modelsearch_run1"
+     ],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run4",
+     "feature": [
+      "LAGTIME(ON)"
+     ],
+     "feature_set": [
+      "LAGTIME(ON)",
+      "PERIPHERALS(1)"
+     ],
+     "parents": [
+      "modelsearch_run2"
+     ],
+     "via_collector": false
+    }
+   ]
+  },
+  {
+   "model": "oral",
+   "space": "ABSORPTION([INST,FO]); PERIPHERALS(0..1); LAGTIME([OFF,ON])",
+   "algorithm": "exhaustive_stepwise",
+   "input_features": "ABSORPTION(FO);ELIMINATION(FO)",
+   "base_features": "ABSORPTION(FO);ELIMINATION(FO)",
+   "base_transformations": "",
+   "funcs": [
+    "ABSORPTION(INST)",
+    "LAGTIME(ON)",
+    "PERIPHERALS(1)"
+   ],
+   "candidates": [
+    {
+     "name": "modelsearch_run1",
+     "feature": [
+      "ABSORPTION(INST)"
+     ],
+     "feature_set": [
+      "ABSORPTION(INST)"
+     ],
+     "parents": [],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run2",
+     "feature": [
+      "LAGTIME(ON)"
+     ],
+     "feature_set": [
+      "LAGTIME(ON)"
+     ],
+     "parents": [],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run3",
+     "feature": [
+      "PERIPHERALS(1)"
+     ],
+     "feature_set": [
+      "PERIPHERALS(1)"
+     ],
+     "parents": [],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run4",
+     "feature": [
+      "PERIPHERALS(1)"
+     ],
+     "feature_set": [
+      "ABSORPTION(INST)",
+      "PERIPHERALS(1)"
+     ],
+     "parents": [
+      "modelsearch_run1"
+     ],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run5",
+     "feature": [
+      "PERIPHERALS(1)"
+     ],
+     "feature_set": [
+      "LAGTIME(ON)",
+      "PERIPHERALS(1)"
+     ],
+     "parents": [
+      "modelsearch_run2"
+     ],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run6",
+     "feature": [
+      "ABSORPTION(INST)"
+     ],
+     "feature_set": [
+      "ABSORPTION(INST)",
+      "PERIPHERALS(1)"
+     ],
+     "parents": [
+      "modelsearch_run3"
+     ],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run7",
+     "feature": [
+      "LAGTIME(ON)"
+     ],
+     "feature_set": [
+      "LAGTIME(ON)",
+      "PERIPHERALS(1)"
+     ],
+     "parents": [
+      "modelsearch_run3"
+     ],
+     "via_collector": false
+    }
+   ]
+  },
+  {
+   "model": "oral",
+   "space": "ABSORPTION(FO); PERIPHERALS(1..2)",
+   "algorithm": "exhaustive_stepwise",
+   "input_features": "ABSORPTION(FO);ELIMINATION(FO)",
+   "base_features": "ABSORPTION(FO);ELIMINATION(FO);PERIPHERALS(1)",
+   "base_transformations": "PERIPHERALS(1)",
+   "funcs": [
+    "PERIPHERALS(2)"
+   ],
+   "candidates": [
+    {
+     "name": "modelsearch_run1",
+     "feature": [
+      "PERIPHERALS(2)"
+     ],
+     "feature_set": [
+      "PERIPHERALS(2)"
+     ],
+     "parents": [],
+     "via_collector": false
+    }
+   ]
+  },
+  {
+   "model": "oral",
+   "space": "ABSORPTION([INST,FO]); PERIPHERALS(0..2); LAGTIME([OFF,ON])",
+   "algorithm": "reduced_stepwise",
+   "input_features": "ABSORPTION(FO);ELIMINATION(FO)",
+   "base_features": "ABSORPTION(FO);ELIMINATION(FO)",
+   "base_transformations": "",
+   "funcs": [
+    "ABSORPTION(INST)",
+    "LAGTIME(ON)",
+    "PERIPHERALS(1)",
+    "PERIPHERALS(2)"
+   ],
+   "candidates": [
+    {
+     "name": "modelsearch_run1",
+     "feature": [
+      "ABSORPTION(INST)"
+     ],
+     "feature_set": [
+      "ABSORPTION(INST)"
+     ],
+     "parents": [],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run2",
+     "feature": [
+      "LAGTIME(ON)"
+     ],
+     "feature_set": [
+      "LAGTIME(ON)"
+     ],
+     "parents": [],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run3",
+     "feature": [
+      "PERIPHERALS(1)"
+     ],
+     "feature_set": [
+      "PERIPHERALS(1)"
+     ],
+     "parents": [],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run4",
+     "feature": [
+      "PERIPHERALS(1)"
+     ],
+     "feature_set": [
+      "ABSORPTION(INST)",
+      "PERIPHERALS(1)"
+     ],
+     "parents": [
+      "modelsearch_run1"
+     ],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run5",
+     "feature": [
+      "PERIPHERALS(1)"
+     ],
+     "feature_set": [
+      "LAGTIME(ON)",
+      "PERIPHERALS(1)"
+     ],
+     "parents": [
+      "modelsearch_run2"
+     ],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run6",
+     "feature": [
+      "ABSORPTION(INST)"
+     ],
+     "feature_set": [
+      "ABSORPTION(INST)",
+      "PERIPHERALS(1)"
+     ],
+     "parents": [
+      "modelsearch_run3"
+     ],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run7",
+     "feature": [
+      "LAGTIME(ON)"
+     ],
+     "feature_set": [
+      "LAGTIME(ON)",
+      "PERIPHERALS(1)"
+     ],
+     "parents": [
+      "modelsearch_run3"
+     ],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run8",
+     "feature": [
+      "PERIPHERALS(2)"
+     ],
+     "feature_set": [
+      "PERIPHERALS(1)",
+      "PERIPHERALS(2)"
+     ],
+     "parents": [
+      "modelsearch_run3"
+     ],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run9",
+     "feature": [
+      "ABSORPTION(INST)"
+     ],
+     "feature_set": [
+      "ABSORPTION(INST)",
+      "PERIPHERALS(1)",
+      "PERIPHERALS(2)"
+     ],
+     "parents": [
+      "modelsearch_run8"
+     ],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run10",
+     "feature": [
+      "LAGTIME(ON)"
+     ],
+     "feature_set": [
+      "LAGTIME(ON)",
+      "PERIPHERALS(1)",
+      "PERIPHERALS(2)"
+     ],
+     "parents": [
+      "modelsearch_run8"
+     ],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run11",
+     "feature": [
+      "PERIPHERALS(2)"
+     ],
+     "feature_set": [
+      "ABSORPTION(INST)",
+      "PERIPHERALS(1)",
+      "PERIPHERALS(2)"
+     ],
+     "parents": [
+      "modelsearch_run4",
+      "modelsearch_run6"
+     ],
+     "via_collector": true
+    },
+    {
+     "name": "modelsearch_run12",
+     "feature": [
+      "PERIPHERALS(2)"
+     ],
+     "feature_set": [
+      "LAGTIME(ON)",
+      "PERIPHERALS(1)",
+      "PERIPHERALS(2)"
+     ],
+     "parents": [
+      "modelsearch_run5",
+      "modelsearch_run7"
+     ],
+     "via_collector": true
+    }
+   ]
+  },
+  {
+   "model": "oral",
+   "space": "ABSORPTION(FO); PERIPHERALS(0..2); LAGTIME([OFF,ON])",
+   "algorithm": "reduced_stepwise",
+   "input_features": "ABSORPTION(FO);ELIMINATION(FO)",
+   "base_features": "ABSORPTION(FO);ELIMINATION(FO)",
+   "base_transformations": "",
+   "funcs": [
+    "LAGTIME(ON)",
+    "PERIPHERALS(1)",
+    "PERIPHERALS(2)"
+   ],
+   "candidates": [
+    {
+     "name": "modelsearch_run1",
+     "feature": [
+      "LAGTIME(ON)"
+     ],
+     "feature_set": [
+      "LAGTIME(ON)"
+     ],
+     "parents": [],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run2",
+     "feature": [
+      "PERIPHERALS(1)"
+     ],
+     "feature_set": [
+      "PERIPHERALS(1)"
+     ],
+     "parents": [],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run3",
+     "feature": [
+      "PERIPHERALS(1)"
+     ],
+     "feature_set": [
+      "LAGTIME(ON)",
+      "PERIPHERALS(1)"
+     ],
+     "parents": [
+      "modelsearch_run1"
+     ],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run4",
+     "feature": [
+      "LAGTIME(ON)"
+     ],
+     "feature_set": [
+      "LAGTIME(ON)",
+      "PERIPHERALS(1)"
+     ],
+     "parents": [
+      "modelsearch_run2"
+     ],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run5",
+     "feature": [
+      "PERIPHERALS(2)"
+     ],
+     "feature_set": [
+      "PERIPHERALS(1)",
+      "PERIPHERALS(2)"
+     ],
+     "parents": [
+      "modelsearch_run2"
+     ],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run6",
+     "feature": [
+      "PERIPHERALS(2)"
+     ],
+     "feature_set": [
+      "LAGTIME(ON)",
+      "PERIPHERALS(1)",
+      "PERIPHERALS(2)"
+     ],
+     "parents": [
+      "modelsearch_run3"
+     ],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run7",
+     "feature": [
+      "PERIPHERALS(2)"
+     ],
+     "feature_set": [
+      "LAGTIME(ON)",
+      "PERIPHERALS(1)",
+      "PERIPHERALS(2)"
+     ],
+     "parents": [
+      "modelsearch_run4"
+     ],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run8",
+     "feature": [
+      "LAGTIME(ON)"
+     ],
+     "feature_set": [
+      "LAGTIME(ON)",
+      "PERIPHERALS(1)",
+      "PERIPHERALS(2)"
+     ],
+     "parents": [
+      "modelsearch_run5"
+     ],
+     "via_collector": false
+    }
+   ]
+  },
+  {
+   "model": "oral",
+   "space": "ABSORPTION(FO); PERIPHERALS(0..2); LAGTIME([OFF,ON])",
+   "algorithm": "exhaustive",
+   "input_features": "ABSORPTION(FO);ELIMINATION(FO)",
+   "base_features": "ABSORPTION(FO);ELIMINATION(FO)",
+   "base_transformations": "",
+   "funcs": [
+    "LAGTIME(ON)",
+    "PERIPHERALS(1)",
+    "PERIPHERALS(2)"
+   ],
+   "candidates": [
+    {
+     "name": "modelsearch_run1",
+     "feature": [
+      "PERIPHERALS(1)"
+     ],
+     "feature_set": [
+      "PERIPHERALS(1)"
+     ],
+     "parents": [],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run2",
+     "feature": [
+      "PERIPHERALS(2)"
+     ],
+     "feature_set": [
+      "PERIPHERALS(2)"
+     ],
+     "parents": [],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run3",
+     "feature": [
+      "LAGTIME(ON)"
+     ],
+     "feature_set": [
+      "LAGTIME(ON)"
+     ],
+     "parents": [],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run4",
+     "feature": [
+      "LAGTIME(ON)",
+      "PERIPHERALS(1)"
+     ],
+     "feature_set": [
+      "LAGTIME(ON)",
+      "PERIPHERALS(1)"
+     ],
+     "parents": [],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run5",
+     "feature": [
+      "LAGTIME(ON)",
+      "PERIPHERALS(2)"
+     ],
+     "feature_set": [
+      "LAGTIME(ON)",
+      "PERIPHERALS(2)"
+     ],
+     "parents": [],
+     "via_collector": false
+    }
+   ]
+  },
+  {
+   "model": "oral",
+   "space": "ABSORPTION([INST,FO]); PERIPHERALS(0..1); LAGTIME([OFF,ON])",
+   "algorithm": "exhaustive",
+   "input_features": "ABSORPTION(FO);ELIMINATION(FO)",
+   "base_features": "ABSORPTION(FO);ELIMINATION(FO)",
+   "base_transformations": "",
+   "funcs": [
+    "ABSORPTION(INST)",
+    "LAGTIME(ON)",
+    "PERIPHERALS(1)"
+   ],
+   "candidates": [
+    {
+     "name": "modelsearch_run1",
+     "feature": [
+      "PERIPHERALS(1)"
+     ],
+     "feature_set": [
+      "PERIPHERALS(1)"
+     ],
+     "parents": [],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run2",
+     "feature": [
+      "LAGTIME(ON)"
+     ],
+     "feature_set": [
+      "LAGTIME(ON)"
+     ],
+     "parents": [],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run3",
+     "feature": [
+      "LAGTIME(ON)",
+      "PERIPHERALS(1)"
+     ],
+     "feature_set": [
+      "LAGTIME(ON)",
+      "PERIPHERALS(1)"
+     ],
+     "parents": [],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run4",
+     "feature": [
+      "ABSORPTION(INST)"
+     ],
+     "feature_set": [
+      "ABSORPTION(INST)"
+     ],
+     "parents": [],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run5",
+     "feature": [
+      "ABSORPTION(INST)",
+      "PERIPHERALS(1)"
+     ],
+     "feature_set": [
+      "ABSORPTION(INST)",
+      "PERIPHERALS(1)"
+     ],
+     "parents": [],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run6",
+     "feature": [
+      "ABSORPTION(INST)",
+      "LAGTIME(ON)"
+     ],
+     "feature_set": [
+      "ABSORPTION(INST)",
+      "LAGTIME(ON)"
+     ],
+     "parents": [],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run7",
+     "feature": [
+      "ABSORPTION(INST)",
+      "LAGTIME(ON)",
+      "PERIPHERALS(1)"
+     ],
+     "feature_set": [
+      "ABSORPTION(INST)",
+      "LAGTIME(ON)",
+      "PERIPHERALS(1)"
+     ],
+     "parents": [],
+     "via_collector": false
+    }
+   ]
+  },
+  {
+   "model": "oral",
+   "space": "PERIPHERALS(0..2); LAGTIME([OFF,ON])",
+   "algorithm": "exhaustive_stepwise",
+   "input_features": "ABSORPTION(FO);ELIMINATION(FO)",
+   "base_features": "ABSORPTION(INST);ELIMINATION(FO)",
+   "base_transformations": "ABSORPTION(INST)",
+   "funcs": [
+    "LAGTIME(ON)",
+    "PERIPHERALS(1)",
+    "PERIPHERALS(2)"
+   ],
+   "candidates": [
+    {
+     "name": "modelsearch_run1",
+     "feature": [
+      "LAGTIME(ON)"
+     ],
+     "feature_set": [
+      "LAGTIME(ON)"
+     ],
+     "parents": [],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run2",
+     "feature": [
+      "PERIPHERALS(1)"
+     ],
+     "feature_set": [
+      "PERIPHERALS(1)"
+     ],
+     "parents": [],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run3",
+     "feature": [
+      "PERIPHERALS(1)"
+     ],
+     "feature_set": [
+      "LAGTIME(ON)",
+      "PERIPHERALS(1)"
+     ],
+     "parents": [
+      "modelsearch_run1"
+     ],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run4",
+     "feature": [
+      "LAGTIME(ON)"
+     ],
+     "feature_set": [
+      "LAGTIME(ON)",
+      "PERIPHERALS(1)"
+     ],
+     "parents": [
+      "modelsearch_run2"
+     ],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run5",
+     "feature": [
+      "PERIPHERALS(2)"
+     ],
+     "feature_set": [
+      "PERIPHERALS(1)",
+      "PERIPHERALS(2)"
+     ],
+     "parents": [
+      "modelsearch_run2"
+     ],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run6",
+     "feature": [
+      "PERIPHERALS(2)"
+     ],
+     "feature_set": [
+      "LAGTIME(ON)",
+      "PERIPHERALS(1)",
+      "PERIPHERALS(2)"
+     ],
+     "parents": [
+      "modelsearch_run3"
+     ],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run7",
+     "feature": [
+      "PERIPHERALS(2)"
+     ],
+     "feature_set": [
+      "LAGTIME(ON)",
+      "PERIPHERALS(1)",
+      "PERIPHERALS(2)"
+     ],
+     "parents": [
+      "modelsearch_run4"
+     ],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run8",
+     "feature": [
+      "LAGTIME(ON)"
+     ],
+     "feature_set": [
+      "LAGTIME(ON)",
+      "PERIPHERALS(1)",
+      "PERIPHERALS(2)"
+     ],
+     "parents": [
+      "modelsearch_run5"
+     ],
+     "via_collector": false
+    }
+   ]
+  },
+  {
+   "model": "iv",
+   "space": "ABSORPTION([INST,FO]); LAGTIME([OFF,ON])",
+   "algorithm": "exhaustive_stepwise",
+   "input_features": "ABSORPTION(INST);ELIMINATION(FO)",
+   "base_features": "ABSORPTION(INST);ELIMINATION(FO)",
+   "base_transformations": "",
+   "funcs": [
+    "ABSORPTION(FO)",
+    "LAGTIME(ON)"
+   ],
+   "candidates": [
+    {
+     "name": "modelsearch_run1",
+     "feature": [
+      "ABSORPTION(FO)"
+     ],
+     "feature_set": [
+      "ABSORPTION(FO)"
+     ],
+     "parents": [],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run2",
+     "feature": [
+      "LAGTIME(ON)"
+     ],
+     "feature_set": [
+      "LAGTIME(ON)"
+     ],
+     "parents": [],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run3",
+     "feature": [
+      "LAGTIME(ON)"
+     ],
+     "feature_set": [
+      "ABSORPTION(FO)",
+      "LAGTIME(ON)"
+     ],
+     "parents": [
+      "modelsearch_run1"
+     ],
+     "via_collector": false
+    },
+    {
+     "name": "modelsearch_run4",
+     "feature": [
+      "ABSORPTION(FO)"
+     ],
+     "feature_set": [
+      "ABSORPTION(FO)",
+      "LAGTIME(ON)"
+     ],
+     "parents": [
+      "modelsearch_run2"
+     ],
+     "via_collector": false
+    }
+   ]
+  }
+ ]
+}

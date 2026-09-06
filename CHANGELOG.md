@@ -20,6 +20,55 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **`ferx modelsearch` — structural PK model search (Pharmpy `modelsearch`) in `ferx-tools`
+  (#1181).** The space is the `ABSORPTION`, `PERIPHERALS`, `TRANSITS` and `LAGTIME` statements
+  of a `.ferxsearch` file; every candidate is one analytic `pk` template swap from its parent,
+  with the new parameters declared from the parent's estimates (Pharmpy's inits: `Q = CL`,
+  `V2 = 0.05·Vc`, a lag or mean transit time at half the first observation time) and η on
+  the absorption delay by default (`iiv_strategy`). Pharmpy's three algorithms —
+  `reduced_stepwise` (default), `exhaustive_stepwise`, `exhaustive` — and its incompatible-pair
+  rules, with the enumeration anchored against Pharmpy 2.0.0's own workflow. Candidates are
+  fitted in parallel with retries and the strictness gate, ranked on `[rank] type` (mixed BIC
+  by default) with an optional `cutoff` over the base; the table shows every model's structure,
+  criterion, rank, convergence status **and fit time**, an excluded model with its reason.
+  `ELIMINATION(ZO / MM / MIX-FO-MM)` is refused by name rather than offered as `[odes]`
+  candidates — the decision and the coverage table are on `docs/tools/modelsearch.qmd`.
+  Anchored against NONMEM 7.5 on the warfarin dataset: same OFVs, same BIC ranking.
+- **`NewParameter::fixed` in `ferx-core::edit` (#1181).** `SetStructural` can declare a new
+  parameter's θ `FIX` — a fixed transit-compartment count stated as a named parameter rather
+  than a literal binding, so the ODE twin and the estimates file still see it. **Breaking for
+  struct-literal construction**: `NewParameter` gained the field and is now `#[non_exhaustive]`;
+  build one with `NewParameter::new(name, theta, init, lower, upper)` and the `.with_iiv(...)` /
+  `.fixed()` builders, which makes the next field addition non-breaking. Its fields stay public
+  to read. No effect on `.ferx` models, the CLI or the R wrapper, none of which constructs it.
+
+### Fixed
+- **A search child seeded from a parent whose ω block is near-singular can start (#1256).** On
+  the vancomycin base the (CL, V1, V2) block's Cholesky diagonal for `ETA_V2` sat on the
+  optimizer's rail (6e-6) through its correlations, every declared variance being ordinary; the
+  three-compartment candidate seeded from it was refused by every start. The shared seed now
+  nudges that block alone by `1e-5·I` until its factor clears the rail, alongside the diagonal
+  floor; a standalone ω beside it and a `FIX`ed block are untouched, and a block that cannot be
+  repaired within the bound goes through verbatim.
+- **"All multi-start fits failed" now carries each start's reason** (`start 0: …; start 1: …`),
+  so a search table says *why* a candidate never fitted — a refused start is a different repair
+  from a diverged fit.
+- **`ferx modelsearch` never selects the input model (#1181).** The input has a row of its own
+  only when a base had to be derived from it — which happens exactly when its structure lies
+  outside the space the MFL declares — so it is ranked in the table but excluded from
+  selection; `final.ferx` can no longer be a structure the space excluded.
+- **Numbers the edit layer writes are rounded to 15 significant digits (#1181).** An estimate
+  that went through the optimizer's log/exp packing comes back one ULP off — `10.000000000000002`
+  for an evaluation at `10.0` — and `SeedInits` used to write that verbatim into a candidate or
+  `final.ferx`. Fifteen significant digits keep every value a user could type and drop the noise;
+  what is read back differs from the estimate by at most one part in 10¹⁵.
+- **A search child is seeded off a collapsed variance at the smallest startable one (#1181).**
+  A parent fit whose η collapsed to the optimizer's rail (`ω ≈ 6e-6`) used to hand every child
+  seeded from it a start the engine refuses ("starts at a variance … at or below its lower
+  bound"), so a search step failed outright; covsearch and modelsearch now floor the seed at
+  `1e-5`, the same no-variability model spelled so the child can move off it. The floor is on
+  the *child*: `SeedInits` itself still reproduces the fit it is given, so a written
+  `final.ferx` re-evaluates to the OFV in the `final-fit.yaml` beside it.
 - **`ferx covsearch` — stepwise covariate modelling (PsN `scm` forward / forward-then-backward,
   Pharmpy `covsearch`) — and `ferx allometry` in `ferx-tools` (#1180).** The first shipped
   model-space search tool: the candidate effects come from the `COVARIATE?(...)` statements

@@ -830,7 +830,14 @@ pub fn fit(
     }
 
     match best {
-        None => Err("All multi-start fits failed".to_string()),
+        // Every start failed: say *why*, or a search table reads "All
+        // multi-start fits failed" over a candidate whose model the engine
+        // refused to start at all (#1256: a seeded ω block at the rail),
+        // which is a different repair from a fit that diverged.
+        None => Err(format!(
+            "All multi-start fits failed: {}",
+            failed_starts.join("; ")
+        )),
         Some((k, mut result)) => {
             result.warnings.splice(0..0, pre_warnings);
             if !failed_starts.is_empty() {

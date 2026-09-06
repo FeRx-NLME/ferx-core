@@ -6,7 +6,7 @@
 //! so adding or dropping a candidate effect is a line insert or delete on one
 //! block and the rest of the file is invariant. Everything else the search
 //! needs already exists — [`ModelText`] to make the edit, the
-//! [`Runner`] to fit a step's candidates in parallel
+//! [`Runner`](crate::search::Runner) to fit a step's candidates in parallel
 //! with dedup, journal and strictness, and the `.ferxsearch` file
 //! ([`SearchConfig`]) to say what to search over.
 //!
@@ -75,12 +75,14 @@
 use std::path::{Path, PathBuf};
 
 use ferx_core::edit::{ModelEdit, ModelText};
-use ferx_core::{CancelFlag, FitResult, Population};
+use ferx_core::{CancelFlag, FitResult};
 use serde::Deserialize;
 
+use crate::search::fitter::{RunnerFitter, StepFitter};
+use crate::search::seed::seed_from;
 use crate::search::{
-    BaseModel, Candidate, CandidateResult, Criterion, FeatureVector, RankType, RunOptions,
-    RunReport, Runner, SearchConfig,
+    BaseModel, Candidate, CandidateResult, Criterion, FeatureVector, RankType, RunReport,
+    SearchConfig,
 };
 
 mod effects;
@@ -387,38 +389,6 @@ impl CovsearchResult {
     /// The number of steps taken, in every phase.
     pub fn n_steps(&self) -> usize {
         self.steps.iter().map(|r| r.step).max().unwrap_or(0)
-    }
-}
-
-/// Fits one step's candidates. The seam that lets the search logic be tested
-/// against scripted OFVs instead of real fits — every decision in
-/// [`search`] is a comparison of numbers the fitter returns.
-pub(crate) trait StepFitter {
-    /// `phase_dir` is the directory name a cached run would journal this
-    /// step under (`base`, `forward-1`, `backward-2`, …).
-    fn fit_step(&self, phase_dir: &str, candidates: &[Candidate]) -> Result<RunReport, String>;
-}
-
-/// The production fitter: a [`Runner`] per step, journalled under
-/// `<dir>/<phase_dir>` when there is a directory.
-struct RunnerFitter<'a> {
-    threads: usize,
-    dir: Option<PathBuf>,
-    cancel: Option<CancelFlag>,
-    data: &'a Population,
-    options: RunOptions,
-}
-
-impl StepFitter for RunnerFitter<'_> {
-    fn fit_step(&self, phase_dir: &str, candidates: &[Candidate]) -> Result<RunReport, String> {
-        let mut runner = Runner::new().threads(self.threads);
-        if let Some(dir) = &self.dir {
-            runner = runner.cache_dir(dir.join(phase_dir));
-        }
-        if let Some(flag) = &self.cancel {
-            runner = runner.cancel(flag.clone());
-        }
-        runner.run(candidates, self.data, &self.options)
     }
 }
 
@@ -800,7 +770,7 @@ impl Pass<'_> {
             for effect in remaining.iter() {
                 let mut model = parent.model.clone();
                 if let Some(fit) = &parent.fit {
-                    model.apply(ModelEdit::SeedInits(fit))?;
+                    seed_from(&mut model, fit)?;
                 }
                 model
                     .apply(ModelEdit::AddCovariateRelation(effect.relation()))
@@ -941,7 +911,7 @@ impl Pass<'_> {
             for effect in &removable {
                 let mut model = parent.model.clone();
                 if let Some(fit) = &parent.fit {
-                    model.apply(ModelEdit::SeedInits(fit))?;
+                    seed_from(&mut model, fit)?;
                 }
                 model
                     .apply(ModelEdit::DropCovariateRelation {

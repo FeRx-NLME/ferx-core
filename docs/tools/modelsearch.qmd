@@ -1,0 +1,419 @@
+---
+pagetitle: "Structural model search"
+description-meta: "Pharmpy modelsearch in ferx — a search over the analytic pk templates (absorption, peripheral compartments, transit compartments, lag time) driven by a .ferxsearch file, with Pharmpy's three algorithms, its incompatible-pair rules, and every candidate's fit time beside its rank."
+---
+
+# Structural model search
+
+> **Maturity: alpha** — see [Feature Maturity](../maturity.qmd) for what this means.
+
+`ferx modelsearch` is Pharmpy's `modelsearch`: a search over the structural
+PK model — absorption route, number of peripheral compartments, transit
+compartments and lag time — where every candidate is one `pk` template swap
+away from its parent. Where [covsearch](covsearch.qmd) inserts and deletes
+`[covariate_model]` lines, this tool rewrites the `pk` line and, with it,
+the `[parameters]` and `[individual_parameters]` declarations the new
+template needs, pruning the ones it no longer reads.
+
+```bash
+ferx modelsearch warfarin.ferxsearch --directory warfarin-modelsearch --threads 8
+```
+
+What to search over comes from a [`.ferxsearch` file](search.qmd). Its
+`ABSORPTION`, `PERIPHERALS`, `TRANSITS` and `LAGTIME` statements are the
+space, `[rank]` the criterion, and a `[modelsearch]` section picks the
+algorithm and how η is given to the parameters a candidate introduces:
+
+```toml
+base = "warfarin.ferx"
+data = "warfarin.csv"
+
+[space]
+mfl = """
+ABSORPTION([INST,FO]); PERIPHERALS(0..2)
+TRANSITS([0,1,3], NODEPOT); TRANSITS(N)
+LAGTIME([OFF,ON])
+"""
+
+[modelsearch]
+algorithm    = "reduced_stepwise"     # or "exhaustive_stepwise", "exhaustive"
+iiv_strategy = "absorption_delay"     # or "add_diagonal", "no_add"
+
+[rank]
+type   = "bic"                        # the mixed BIC, Pharmpy's default
+cutoff = 3.84                         # optional: the improvement a candidate must show over the base
+
+[strictness]
+require_converged = true
+
+[run]
+retries   = 2
+threads   = 8
+cache_dir = "warfarin-modelsearch"
+```
+
+| key | default | meaning |
+|---|---|---|
+| `algorithm` | `reduced_stepwise` | one of Pharmpy's three, [below](#the-algorithms) |
+| `iiv_strategy` | `absorption_delay` | η on a new lag time or mean transit time only; `add_diagonal` gives every new parameter an η; `no_add` none. Pharmpy's `fullblock` is not offered — a block over the new and existing η is [iivsearch](https://github.com/FeRx-NLME/ferx-core/issues/1183)'s move |
+| `[rank] type` | `bic` | any of the [rank types](search.qmd#ranking-strictness-and-run-settings); every candidate is scored on it |
+| `[rank] cutoff` | none | a candidate is selected only when it beats the base by at least this much; the base wins otherwise |
+
+## The space
+
+The four structural categories, and what each value becomes:
+
+| MFL feature | ferx | how |
+|---|---|---|
+| `ABSORPTION(INST)` | ✓ | the `*_iv` templates |
+| `ABSORPTION(FO)` | ✓ | the `*_oral` templates; `*_transit` when a chain is present |
+| `ABSORPTION(ZO / WEIBULL)` | ✗ | no `pk` template: `ZO` is a modeled duration on an IV template with `RATE=-2` **in the dataset**, `WEIBULL` the `[odes]` input function `weibull(...)` — both are the `[odes]` candidate family of [#1257](https://github.com/FeRx-NLME/ferx-core/issues/1257), split out of #1181 |
+| `ABSORPTION(SEQ-ZO-FO)` | ✗ | no template and no input function — refused by name when the file is loaded |
+| `ELIMINATION(FO)` | ✓ | every template; the statement is accepted and contributes nothing |
+| `ELIMINATION(ZO / MM / MIX-FO-MM)` | ✗ | see [the elimination gap](#the-elimination-gap) |
+| `PERIPHERALS(0 / 1 / 2)` | ✓ | `one_cpt_*` / `two_cpt_*` / `three_cpt_*` |
+| `TRANSITS(n, NODEPOT)` | ✓ | `*_transit` with a `FIX`ed count, `theta TVNTR(n, …) FIX`; `TRANSITS(0)` is a move *off* a chain |
+| `TRANSITS(N)` | ✓ | `*_transit` with the count estimated |
+| `TRANSITS(n, DEPOT)` | ✗ | needs a separate depot with its own `ka` — an `[odes]` model |
+| `LAGTIME(ON / OFF)` | ✓ | the `lagtime=` binding |
+
+Anything marked ✗ is a hard error naming the feature when the file is loaded
+— the [coverage check](search.qmd#coverage) of every `.ferxsearch` file — so
+a search never narrows itself silently. Two combinations the coverage check
+cannot see are refused per candidate, with a note in the report rather than
+a candidate: transit absorption with two peripheral compartments (there is
+no `three_cpt_transit` template), and the pairs Pharmpy itself declares
+meaningless (below).
+
+The base model must be a `pk` model — `one_cpt_oral`, `two_cpt_iv`, and so
+on. An `ode(...)` model has no template to swap and is refused; so is the
+`*_ig` family, which has no MFL coordinate. A `*_transit` base is read at
+the count its `n` binding declares: a literal (`n=3`) or a parameter behind
+a `FIX`ed θ is `TRANSITS(3)`, a parameter behind a free θ is `TRANSITS(N)`,
+and a non-integral fixed count is refused by name. A base's `f=`
+(bioavailability) binding is not a coordinate and is carried through every
+swap — every template reads it — so `F` and its θ and η survive a change of
+compartment count.
+
+## The algorithms
+
+All three are Pharmpy's (`tools/modelsearch/algorithms.py`), and the
+candidate enumeration is checked against Pharmpy's own — see
+[Compared with Pharmpy](#compared-with-pharmpy).
+
+**`exhaustive`.** Every combination of at most one feature per category,
+every one derived from the base in a single layer and fitted in parallel.
+With *k* candidate moves across *c* categories that is at most
+∏(*n*~i~ + 1) − 1 models.
+
+**`exhaustive_stepwise`.** One feature at a time, in every order. Layer 1
+applies each allowed feature to the base; layer *k* applies each feature
+still allowed to every model of layer *k* − 1, each child seeded from its
+parent's final estimates (Pharmpy's `update_initial_estimates`). Two orders
+of the same features are two candidates, because they start from different
+parents — the runner's canonical-hash dedup catches the case where two
+orders happen to render the same text. A variance the parent collapsed
+(an ω at the optimizer's rail, 6 × 10⁻⁶) is seeded at the smallest value
+the engine will start from, 10⁻⁵, so the child can still be fitted; on the
+warfarin example a lag whose η collapsed would otherwise have left every
+two-compartment lag candidate seeded from it unfittable. A `block_omega`
+can collapse the same way through its *correlations* — every declared
+variance ordinary, one Cholesky diagonal at the rail (the vancomycin base's
+`ETA_V2`) — and that block alone is nudged by 10⁻⁵ on its diagonal until
+its factor clears the rail; a standalone ω beside it, and a `FIX`ed block,
+are left as they are, and a block that does not clear the rail after a
+bounded number of nudges goes through verbatim so the engine's own message
+names it. `SeedInits` on its own stays faithful to the fit; the floor and
+the nudge belong to a search deriving a child.
+
+**`reduced_stepwise`** — the default, as in Pharmpy. As above, but before a
+layer is extended the models that carry the same feature *set* are collapsed
+to the one with the lowest OFV, and only it continues. Every model is still
+ranked at the end; the table's `continued` column says which one went on.
+
+### Which move may follow which
+
+Pharmpy's `_is_allowed`, kept verbatim so the enumeration anchors:
+
+- a category is moved along once per path — `LAGTIME(ON)` after
+  `LAGTIME(ON)`, or `ABSORPTION(INST)` after `ABSORPTION(FO)`, is never a
+  step;
+- the peripheral count starts at the smallest count in the space; a later
+  peripheral step may take any other count not yet tried;
+- `TRANSITS(0, NODEPOT)` is never a move (it is first-order absorption);
+- the pairs Pharmpy declares meaningless are never combined: a lag time or
+  a transit chain on a bolus, a lag time with a transit chain, and
+  first-order absorption with a one-transit chain.
+
+ferx applies the pair table in two places Pharmpy does not: to the
+`exhaustive` combinations (Pharmpy builds and fits `INST + LAGTIME(ON)`
+there), and to the candidate's **whole structure** rather than only to the
+features a path applied — so a base that already carries a lag time is never
+given a transit chain, and a bolus base is never given a lag. Both are
+stated [below](#deviations-from-pharmpy-stated).
+
+### The base model
+
+The base is the input model when its structure lies in the space. When it
+does not — a one-compartment input in a `PERIPHERALS(1..2)` space — the
+input is fitted first and a **base** is derived from it with Pharmpy's least
+number of transformations: for every category the space names whose values
+do not include the input's, the space's first value (its smallest count for
+`PERIPHERALS`). The base is fitted and used as the root; both appear in the
+table, and the base's own features are removed from the candidate moves, so
+a feature the base already carries is never a step.
+
+The practical consequence: **a category the space names is a set of allowed
+values, and the base is moved onto it.** `LAGTIME(ON)` alone means "every
+model has a lag time"; write `LAGTIME([OFF,ON])` to explore it. A category
+the space does not name keeps the base's value. (Pharmpy differs here — it
+fills an unnamed category with its default, so an oral base in a space
+without an `ABSORPTION` statement becomes a bolus.)
+
+### What a candidate becomes
+
+A candidate is its parent's text with the `pk` line replaced and the
+parameters reconciled. Roles the parent already binds keep their variable
+— by slot, so `v1=V` on a two-compartment line satisfies `v=V` on a
+one-compartment one, and `q=Q` becomes `q2=Q` under three compartments.
+Roles it does not bind get a default name and a declaration whose init is
+Pharmpy's (`modeling/odes.py`), scaled from the parent's **seeded**
+estimates:
+
+| role | name | init | bounds | η |
+|---|---|---|---|---|
+| first peripheral `q`, `v2` | `Q`, `V2` | `Q = CL`, `V2 = 0.05 · Vc` | `(0, 10⁶)` | `add_diagonal` only |
+| second peripheral `q3`, `v3` | `Q3`, `V3` | `Q3 = 0.9 · CL` (and a first one added alongside it `0.1 · CL`), `V3 = 0.05 · Vc` | `(0, 10⁶)` | `add_diagonal` only |
+| `ka` | `KA` | `1 / (2 · t₁)`, *t₁* the first positive observation time | `(0, 10⁶)` | `add_diagonal` only |
+| `lagtime` | `ALAG` | `t₁ / 2` | `(0, 10⁶)` | `absorption_delay`, `add_diagonal` |
+| `mtt` | `MTT` | `t₁ / 2` | `(0, 10⁶)` | `absorption_delay`, `add_diagonal` |
+| `n` | `NTR` | the count, `FIX`; or `2.0` for `TRANSITS(N)` | `(0, 64)` | never |
+
+A move that changes a chain the parent already has — another count, or
+fixed ↔ estimated — binds `n` to a **fresh** parameter (`NTR2` when the
+parent's is `NTR`) rather than rewriting the parent's declaration, and the
+old one is pruned with its θ; `MTT` is kept. Names and inits are read off
+the parent's own text after its edits and seeding, not the input's, so a
+name an earlier step pruned (a three-compartment input narrowed to one,
+then widened again) is re-declared, and a θ an earlier step added is not
+declared twice.
+
+A new η has variance 0.01, Pharmpy's initial estimate. A generated name
+that collides with a θ or η the model already declares takes a `_2` suffix;
+a parameter the model declares but does not bind (a leftover `KA` on an IV
+base) is bound as it is. A template that drops a parameter — two
+compartments back to one, or first-order absorption to a transit chain,
+which reads `MTT` in place of `KA` — drops its θ and η too; a
+`[covariate_model]` relation on a dropped parameter goes with it.
+
+That a generated candidate *is* the model a pharmacometrician would have
+typed is pinned the way the `[covariate_model]` desugar is: the search's
+two-compartment lagged candidate and its hand-written twin agree on
+`predict()` bit for bit and on the evaluated objective bit for bit
+(`crates/ferx-tools/tests/modelsearch_end_to_end.rs`).
+
+## The elimination gap
+
+`ELIMINATION(ZO)`, `MM` and `MIX-FO-MM` are refused. Non-linear elimination
+has no analytic template: a candidate using it would have to be emitted as
+an `[odes]` model, and that changes both the numerics path and the runtime
+by one to two orders of magnitude relative to its analytic siblings. Ranking
+such a candidate against analytic ones is still valid — it is the same
+likelihood — but two things would have to be handled explicitly rather than
+discovered: the runtime budget is no longer uniform across candidates, and
+Michaelis–Menten models are the canonical [local-minimum
+case](../examples/multistart.qmd), needing more starts than their siblings
+or the search rejects a correct model on a stalled fit.
+
+The decision for this version is to **refuse the feature by name** rather
+than offer it half-handled. The report already carries what the ODE case
+would need first — every candidate's wall-clock `seconds` beside its rank —
+and the coverage error points here. An elimination search over `[odes]`
+candidates, with a per-candidate start budget, is a follow-up to
+[#1175](https://github.com/FeRx-NLME/ferx-core/issues/1175).
+
+## Ranking, and convergence beside it
+
+Every fitted model — input, base, every candidate — is ranked on `[rank]
+type` among the models that pass the [`[strictness]` gate](search.qmd#the-file).
+Under automation a fit that stalled at its initial estimates (#751) or landed
+in the wrong inner-EBE mode (#864) is not a slow fit, it is a
+*model-selection error*, so every candidate gets `[run] retries` perturbed
+restarts first, then the gate, then a rank. A model that fails the gate,
+does not compile or does not fit keeps its row with the reason and no rank:
+
+```
+Base model (base): FO, 0 peripherals — OFV -286.004, bic_mixed -262.985
+Algorithm: exhaustive, 4 models fitted
+
+  model    structure                                 npar          OFV    bic_mixed         d rank seconds  status        decision
+  base     FO, 0 peripherals                            7     -286.004     -262.985    +0.000    1     0.9  ok            SELECTED
+  run1     FO, 1 peripheral                             9     -289.073     -256.653    +6.332    2     2.1  ok
+  run3     FO, 1 peripheral, lag                       11     -287.483     -252.760   +10.225    3     3.4  ok
+  run2     FO, 0 peripherals, lag                       9     -287.053     -257.427    +5.558    -     1.7  not converged stalled at the initial estimates (#751)
+```
+
+With a `cutoff`, a candidate is selected only when it beats the base by at
+least that much on the criterion; the base stays otherwise, and the ranks
+still show what came closest.
+
+The **input model is ranked but never selected**. It only has a row of its
+own when a base had to be derived from it, and that happens exactly when its
+structure lies outside the space the MFL declares — so selecting it would
+write a `final.ferx` the space excluded. Read its row to see what the move
+onto the space cost; if you want the input's structure to be selectable,
+name its value in the category concerned (`ABSORPTION([INST,FO])` rather
+than `ABSORPTION(FO)`) and it becomes the base. When the base itself fails the gate the
+candidates are ranked among themselves and the cutoff cannot apply, which
+the notes say.
+
+What a child is seeded from is never silent. A candidate the runner
+deduplicated (the same canonical text as an earlier one) is seeded from its
+representative's fit, and carries that fit out if it wins; a candidate that
+produced no fit at all extends with its own initial estimates, and the
+notes say so; and a `--resume` row whose cached `fits/<hash>.json` is
+missing or unreadable is an error naming the row and the fix (refit
+without `--resume`) rather than a search that quietly continues from the
+file's initials.
+
+The `seconds` column is deliberate. The analytic templates cost about the
+same per fit, but the column is what shows when one does not — and it is
+the first thing an `[odes]` candidate would need, should the elimination gap
+close.
+
+## Output
+
+Into `--directory` (default `{search}-modelsearch` next to the `.ferxsearch`
+file, or `[run] cache_dir`):
+
+| file | contents |
+|---|---|
+| `models.csv` | one row per fitted model: `id`, `parent`, `layer`, `path`, `absorption`, `peripherals`, `transits`, `lagtime`, `n_parameters`, `ofv`, `criterion`, `d_criterion`, `rank`, `converged`, `passed`, `failures`, `error`, `seconds`, `selected`, `continued`, `reused` |
+| `final.ferx` | the selected model, with its own estimates written into the initial values |
+| `final-fit.yaml` | its estimates |
+| `models/<id>.ferx` | every fitted model as it was fitted, so the runner-up can be read and refitted by hand |
+| `base/`, `layer-1/`, `layer-2/`, … (or `candidates/` for `exhaustive`) | one [runner directory](search.qmd) per layer: `candidates.csv`, the journal and the cached fits |
+
+The per-layer directories are what `--resume` reads. A search interrupted
+at layer 3 restarts from the same base, generates the same layers, and
+refits only what its journals do not already hold; a reused row is marked
+in the table.
+
+## Compared with Pharmpy
+
+The anchor for the enumeration is Pharmpy 2.0.0's own workflow.
+`tools/pharmpy-modelsearch-anchor/dump.py` builds, for nine (base, space,
+algorithm) cases, the base Pharmpy derives, the candidate moves it filters
+and every `create_candidate` task with its feature set and parents — without
+fitting anything — and a Tier-1 test replays the cases through ferx. The
+candidate moves agree in Pharmpy's order, the `(feature set, parent feature
+set)` edges agree as multisets through the reduced-stepwise collectors, and
+the `exhaustive` combinations agree in order, so `run{n}` is Pharmpy's
+`modelsearch_run{n}`. Where ferx differs the case is named in the test with
+its reason, and the test asserts the two sides really do differ:
+
+| case | Pharmpy 2.0.0 | ferx |
+|---|---|---|
+| a space with no `ABSORPTION` statement, oral base | fills the category with its default and derives a **bolus** base | keeps the base's absorption |
+| `LAGTIME([OFF,ON])` on an IV base | a lag time on the bolus is a candidate (the pair table sees only applied features) | never builds a lagged bolus |
+| `reduced_stepwise` with one duplicate group in a layer | does not collapse it (`len(groups) > 1`) and runs the full stepwise tree | collapses every group |
+| `exhaustive` with `INST` and `LAGTIME(ON)` in the space | builds `INST + LAGTIME(ON)` | applies the pair table to combinations too |
+
+Transit cases are absent from the anchor on purpose: Pharmpy's base
+derivation raises on a space that lists `TRANSITS(0, NODEPOT)` against a
+first-order model, and its model-feature reader counts compartments rather
+than transits, so a base derived with `TRANSITS(1)` re-applies its own chain
+as a candidate. The README in the anchor directory records both; the transit
+rules of the pair table are pinned by unit tests transcribed from
+`_is_allowed`.
+
+## Compared with NONMEM
+
+The anchor for the *numbers* is NONMEM 7.5.1 on the warfarin dataset
+(`data/warfarin.csv`, 10 subjects), FOCEI, over the space `PERIPHERALS(0..1);
+LAGTIME([OFF,ON])` run exhaustively. The base was fitted in NONMEM
+(`base.ctl`); the three candidates were written by hand the way the search
+writes them — seeded from the base's `.ext`, with `Q = CL`, `V2 = 0.05 · V`,
+`ALAG = 0.25` and an η of 0.01 on the lag — and fitted (`lag.ctl`, `p1.ctl`,
+`p1_lag.ctl`). The control streams, `.lst` and `.ext` files are under
+`crates/ferx-tools/tests/nonmem/modelsearch_anchor/`, and
+`tests/modelsearch_nonmem_anchor.rs` replays the comparison.
+
+| model | NONMEM, own run | NONMEM at ferx's estimates | ferx | mixed BIC | rank |
+|---|---:|---:|---:|---:|---|
+| base, `one_cpt_oral` | −286.0042 (successful) | — | −286.0042 | −267.488 | 1 |
+| `LAGTIME(ON)` | −287.0526 (terminated) | −287.6292 | −287.6292 | −264.508 | 2 |
+| `PERIPHERALS(1)` | −289.0727 (terminated) | −289.0986 | −289.0986 | −261.182 | 3 |
+| `LAGTIME(ON); PERIPHERALS(1)` | −287.4830 (terminated) | −287.6292 | −287.6292 | −255.107 | 4 |
+
+NONMEM's own minimiser reports `MINIMIZATION TERMINATED` on all three
+candidates: warfarin's first sample is at 0.5 h, so the lag is barely
+identified and its η collapses (ω → 10⁻⁶), and the two-compartment lag
+model's peripheral collapses with it. On those flat directions NONMEM
+stopped short, so the comparison is made **at the same point**:
+`*_eval.ctl` evaluates NONMEM's objective (`MAXEVAL=0`) at ferx's
+estimates, and the two engines agree to 1.2 × 10⁻⁹ (lag), 3.7 × 10⁻⁹
+(two-compartment) and 5.4 × 10⁻⁵ (two-compartment lag, on a corner with
+`Q = 3069` and `V2 = 9 × 10⁻⁶`). And `lag_refit.ctl` re-minimises the lag
+model *from* ferx's estimates: NONMEM declares `MINIMIZATION SUCCESSFUL`
+there, at −287.62917388 against ferx's −287.62917388 — ferx's optimum is
+one NONMEM confirms, and NONMEM's own run had stopped above it.
+
+The ranking on the mixed BIC is the same under either NONMEM reading —
+base, lag, two compartments, both — and the base is selected on both
+sides: no candidate earns its extra parameters on ten subjects. The
+smallest BIC gap the ranking depends on (2.98, base against lag) is four
+orders of magnitude above the worst OFV disagreement, so it is not a
+ranking decided by numbers finer than two engines agree on. The tolerance
+in the test is measured, not assumed: 10⁻³, twenty times the worst
+realised error.
+
+## Deviations from Pharmpy, stated
+
+- **The pair table is applied to the whole structure, and to the exhaustive
+  combinations.** Pharmpy checks its incompatible pairs against the features
+  a path *applied*, so a lag time on a bolus base, or a transit chain on a
+  base that already has a lag, is a candidate; and `exhaustive` skips the
+  check entirely. ferx never generates a model the table calls meaningless,
+  whichever way it would be reached.
+- **A category the space does not name keeps the base's value.** Pharmpy
+  fills it with the category's default (`INST`, no transits, no peripherals,
+  no lag) and moves the base there.
+- **`reduced_stepwise` collapses every duplicate group.** Pharmpy 2.0.0
+  collapses only when a layer holds two or more such groups.
+- **The collapse prefers a model that passed the gate.** Pharmpy keeps the
+  lowest OFV among the group's models that have any result; ferx keeps the
+  lowest OFV among those that passed strictness, and only when none did the
+  lowest of the rest.
+- **`TRANSITS(n)` is a `FIX`ed θ**, not a literal binding, so the count keeps
+  a name the estimates file and the ODE twin can see.
+- **`fullblock` is not offered** as an IIV strategy; that move belongs to
+  the variability search.
+- **The input model is ranked but not selectable.** Pharmpy ranks the base
+  and the candidates; ferx additionally shows the input's row when a base had
+  to be derived, and excludes that row from selection so the space binds the
+  result.
+
+## From Rust
+
+```rust
+use ferx_tools::modelsearch::{run_modelsearch, ModelsearchRun};
+use ferx_tools::search::SearchConfig;
+
+let cfg = SearchConfig::load("warfarin.ferxsearch")?;
+let base = cfg.load_base()?;
+let result = run_modelsearch(&cfg, &base, ModelsearchRun {
+    dir: Some("warfarin-modelsearch".into()),
+    ..ModelsearchRun::default()
+})?;
+for row in result.ranked() {
+    println!("{} {:?} {:.3} rank {:?} {:.1}s",
+        row.id, row.structure, row.criterion, row.rank, row.seconds);
+}
+println!("{}", result.final_model.render());
+let runner_up = &result.models["run2"];   // every fitted model's text, by id
+```
+
+`ModelsearchRun` also takes a `threads` override, a `CancelFlag` that stops
+the search between layers with what it has, and a progress callback
+(`ModelsearchEvent`).

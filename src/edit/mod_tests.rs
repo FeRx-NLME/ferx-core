@@ -830,6 +830,7 @@ fn set_structural_widens_to_two_compartments_and_declares_the_new_parameters() {
                     lower: 0.01,
                     upper: 100.0,
                     iiv: None,
+                    fixed: false,
                 },
                 NewParameter {
                     name: "V2".into(),
@@ -838,6 +839,7 @@ fn set_structural_widens_to_two_compartments_and_declares_the_new_parameters() {
                     lower: 0.1,
                     upper: 500.0,
                     iiv: Some(("ETA_V2".into(), 0.1)),
+                    fixed: false,
                 },
             ],
         }),
@@ -865,6 +867,59 @@ fn set_structural_widens_to_two_compartments_and_declares_the_new_parameters() {
         params.contains(&"omega ETA_V2 ~ 0.1".to_string()),
         "{params:?}"
     );
+}
+
+#[test]
+fn set_structural_declares_a_fixed_new_parameter_with_fix() {
+    // A structural constant stated as a parameter — modelsearch's
+    // `TRANSITS(3)` (#1181) — so the count has a name the ODE twin can bind,
+    // unlike a literal `n=3`. `SeedInits` skips `FIX` lines, so a later
+    // carry-over cannot turn the constant into an estimate.
+    let mut text = base();
+    apply(
+        &mut text,
+        ModelEdit::SetStructural(StructuralSpec {
+            template: "one_cpt_transit".into(),
+            bindings: vec![
+                ("cl".into(), "CL".into()),
+                ("v".into(), "V".into()),
+                ("n".into(), "NTR".into()),
+                ("mtt".into(), "MTT".into()),
+            ],
+            new_parameters: vec![
+                NewParameter {
+                    name: "NTR".into(),
+                    theta: "TVNTR".into(),
+                    init: 3.0,
+                    lower: 0.0,
+                    upper: 64.0,
+                    iiv: None,
+                    fixed: true,
+                },
+                NewParameter {
+                    name: "MTT".into(),
+                    theta: "TVMTT".into(),
+                    init: 0.5,
+                    lower: 0.0,
+                    upper: 100.0,
+                    iiv: None,
+                    fixed: false,
+                },
+            ],
+        }),
+    );
+    let params = text.block_lines("parameters");
+    assert!(
+        params.contains(&"theta TVNTR(3.0, 0.0, 64.0) FIX".to_string()),
+        "{params:?}"
+    );
+    assert!(
+        params.contains(&"theta TVMTT(0.5, 0.0, 100.0)".to_string()),
+        "{params:?}"
+    );
+    // The mutation this pins: dropping the `FIX` suffix makes the count a
+    // free θ, which an evaluation would not notice but a fit would estimate.
+    assert!(!params.iter().any(|l| l == "theta TVNTR(3.0, 0.0, 64.0)"));
 }
 
 #[test]
@@ -1163,6 +1218,43 @@ fn set_error_model_refuses_a_block_sigma() {
     assert!(err.contains("block_sigma"), "{err}");
 }
 
+// ── num ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn num_drops_last_ulp_packing_noise_and_keeps_every_typed_value() {
+    use super::spec::num;
+    // The noise a log/exp round trip leaves on an evaluation's estimates
+    // (measured on #1256's vancomycin dry run).
+    assert_eq!(num(3.0000000000000004), "3.0");
+    assert_eq!(num(49.99999999999999), "50.0");
+    assert_eq!(num(0.19999999999999998), "0.2");
+    assert_eq!(num(0.1 + 0.2), "0.3");
+    // Values a user types are untouched.
+    assert_eq!(num(0.2), "0.2");
+    assert_eq!(num(1e-5), "0.00001");
+    assert_eq!(num(1e6), "1000000.0");
+    assert_eq!(num(0.132695), "0.132695");
+    assert_eq!(num(-286.00421948870667), "-286.004219488707");
+    assert_eq!(num(0.0), "0.0");
+    assert_eq!(num(-0.5), "-0.5");
+    // Fifteen significant digits, not fewer: the mutation this pins is a
+    // rounding coarse enough to move a real estimate.
+    assert_eq!(num(0.123456789012345), "0.123456789012345");
+    assert_ne!(
+        num(0.1234567890123456),
+        "0.123456789012346".to_string() + "0"
+    );
+    // Non-finite values pass through to `finite()`'s rejection unchanged.
+    assert_eq!(num(f64::INFINITY), "inf");
+    // A finite value must stay finite. Rounding `f64::MAX` to 15 significant
+    // digits rounds it *up* past the maximum, and Rust's parser answers
+    // `Ok(inf)` rather than `Err`, so an unguarded `unwrap_or` wrote `inf`
+    // into the file — a bound the reader would then take literally.
+    assert_eq!(num(f64::MAX), format!("{}.0", f64::MAX));
+    assert_eq!(num(-f64::MAX), format!("-{}.0", f64::MAX));
+    assert!(num(f64::MAX).parse::<f64>().unwrap().is_finite());
+}
+
 // ── SeedInits ──────────────────────────────────────────────────────────────
 
 /// A minimal `FitResult` carrying only what `SeedInits` reads.
@@ -1239,6 +1331,65 @@ fn seed_inits_carries_estimates_over_by_name_not_position() {
 }
 
 #[test]
+fn seed_inits_writes_a_collapsed_variance_verbatim() {
+    // `SeedInits` reproduces the fit it is given, including an η that
+    // collapsed onto the optimizer's rail (6.1e-6, measured on #1181). It
+    // does *not* floor: a floor here would make the written model disagree
+    // with the `-fit.yaml` beside it, and the search that cannot start a
+    // child from a collapsed parent floors the *fit* it seeds from instead
+    // (`ferx_tools::search::seed_from`).
+    let fit = fit_with(
+        &["TVCL"],
+        &[0.35],
+        &["ETA_CL", "ETA_V", "ETA_KA"],
+        &[6.14421235332821e-6, 0.11, 1e-9],
+        &[],
+        &[],
+    );
+    let src = BASE.replace("omega ETA_KA ~ 0.30", "omega ETA_KA ~ 0.5477 (sd)");
+    let mut text = ModelText::parse(&src).unwrap();
+    apply(&mut text, ModelEdit::SeedInits(&fit));
+    let params = text.block_lines("parameters");
+    assert!(
+        params.contains(&"omega ETA_CL ~ 0.00000614421235332821".to_string()),
+        "{params:?}"
+    );
+    assert!(
+        params.contains(&"omega ETA_V  ~ 0.11".to_string()),
+        "{params:?}"
+    );
+    // `(sd)`: the estimate is a variance, written as its square root.
+    let ka = params
+        .iter()
+        .find(|l| l.starts_with("omega ETA_KA"))
+        .unwrap();
+    assert_eq!(
+        ka, "omega ETA_KA ~ 0.0000316227766016838 (sd)",
+        "{params:?}"
+    );
+    assert!(
+        params.contains(&"theta TVCL(0.35, 0.001, 10.0)".to_string()),
+        "{params:?}"
+    );
+    // A block is written verbatim too, diagonal and off-diagonal alike.
+    let src = BASE.replace(
+        "omega ETA_CL ~ 0.09\n  omega ETA_V  ~ 0.04",
+        "block_omega (ETA_CL, ETA_V) = [0.09, 0.01, 0.04]",
+    );
+    let mut fit = fit_with(&[], &[], &["ETA_CL", "ETA_V"], &[1e-9, 0.11], &[], &[]);
+    fit.omega[(1, 0)] = 1e-7;
+    fit.omega[(0, 1)] = 1e-7;
+    let mut text = ModelText::parse(&src).unwrap();
+    apply(&mut text, ModelEdit::SeedInits(&fit));
+    let params = text.block_lines("parameters");
+    assert!(
+        params
+            .contains(&"block_omega (ETA_CL, ETA_V) = [0.000000001, 0.0000001, 0.11]".to_string()),
+        "{params:?}"
+    );
+}
+
+#[test]
 fn seed_inits_writes_each_declaration_on_the_scale_it_was_written_in() {
     let src = BASE.replace("sigma PROP_ERR ~ 0.02 (sd)", "sigma PROP_ERR ~ 0.0004");
     let src = src.replace("omega ETA_CL ~ 0.09", "omega ETA_CL ~ 0.3 (sd)");
@@ -1251,9 +1402,11 @@ fn seed_inits_writes_each_declaration_on_the_scale_it_was_written_in() {
         params.contains(&"omega ETA_CL ~ 0.5 (sd)".to_string()),
         "{params:?}"
     );
-    // σ 0.05 (SD) written into a variance declaration is 0.0025.
+    // σ 0.05 (SD) written into a variance declaration is 0.0025 — and not
+    // `0.0025000000000000005`, the floating-point square: `num` writes 15
+    // significant digits.
     assert!(
-        params.contains(&"sigma PROP_ERR ~ 0.0025000000000000005".to_string()),
+        params.contains(&"sigma PROP_ERR ~ 0.0025".to_string()),
         "{params:?}"
     );
 }

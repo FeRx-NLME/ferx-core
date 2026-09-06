@@ -1,0 +1,26 @@
+# modelsearch anchor (#1181): the space NONMEM was run over, exhaustively.
+# Strictness is off so every candidate is ranked, as NONMEM's are; the
+# comparison is of OFVs and of the BIC ranking, not of the gate.
+
+base = "base.ferx"
+data = "warfarin.csv"
+
+[space]
+mfl = "PERIPHERALS(0..1); LAGTIME([OFF,ON])"
+
+[modelsearch]
+algorithm = "exhaustive"
+
+[rank]
+type = "bic"
+
+[strictness]
+require_converged    = false
+reject_init_stall    = false
+reject_on_boundary   = false
+max_condition_number = 1e300
+max_correlation      = 1.0
+
+[run]
+retries = 0
+threads = 4

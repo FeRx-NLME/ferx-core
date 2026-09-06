@@ -76,7 +76,13 @@ pub struct StructuralSpec {
 
 /// One `[individual_parameters]` value to create, with the θ (and optional η)
 /// behind it — written in the canonical `P = TVP * exp(ETA_P)` form.
+///
+/// `#[non_exhaustive]`: build one with [`NewParameter::new`] and the
+/// [`with_iiv`](NewParameter::with_iiv) / [`fixed`](NewParameter::fixed)
+/// builders, so the next field this struct grows (as `fixed` did on #1181)
+/// does not break a caller's struct literal. The fields stay public to read.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct NewParameter {
     /// The individual-parameter name, e.g. `Q`.
     pub name: String,
@@ -87,6 +93,44 @@ pub struct NewParameter {
     pub upper: f64,
     /// `(eta name, omega variance)` when the new parameter gets an η.
     pub iiv: Option<(String, f64)>,
+    /// Declare the θ `FIX`: `theta NAME(init, lower, upper) FIX`. A structural
+    /// constant stated as a parameter — a fixed transit-compartment count
+    /// (`TRANSITS(3)`) is the case — so that it still has a name the ODE twin
+    /// and the estimates file can see, unlike a literal `n=3` binding.
+    pub fixed: bool,
+}
+
+impl NewParameter {
+    /// A free θ with no η: `NAME = THETA`, `theta THETA(init, lower, upper)`.
+    pub fn new(
+        name: impl Into<String>,
+        theta: impl Into<String>,
+        init: f64,
+        lower: f64,
+        upper: f64,
+    ) -> Self {
+        NewParameter {
+            name: name.into(),
+            theta: theta.into(),
+            init,
+            lower,
+            upper,
+            iiv: None,
+            fixed: false,
+        }
+    }
+
+    /// Give the parameter an η: `NAME = THETA * exp(ETA)`, `omega ETA ~ variance`.
+    pub fn with_iiv(mut self, eta: impl Into<String>, variance: f64) -> Self {
+        self.iiv = Some((eta.into(), variance));
+        self
+    }
+
+    /// Declare the θ `FIX`.
+    pub fn fixed(mut self) -> Self {
+        self.fixed = true;
+        self
+    }
 }
 
 /// How an η enters a parameter's expression.
@@ -304,9 +348,33 @@ impl Relation {
     }
 }
 
-/// Format a float for a `.ferx` file: shortest round-tripping form, with a
-/// `.0` tail so an integral value still reads as a number rather than a count.
+/// Format a float for a `.ferx` file: the shortest round-tripping form of the
+/// value rounded to 15 significant digits, with a `.0` tail so an integral
+/// value still reads as a number rather than a count.
+///
+/// The rounding is the point. An estimate that went through the optimizer's
+/// log/exp packing comes back one ULP off the number it started from —
+/// `10.000000000000002` for an evaluation at `10.0` — and written verbatim
+/// that reads as a bug in the generated file. Fifteen significant digits
+/// keep every value a user could have typed (a `.ferx` file carries far
+/// fewer) and drop the last-ULP noise; the value that is read back can
+/// differ from the estimate by at most one part in 10¹⁵, which is below
+/// anything a fit can tell apart.
 pub(crate) fn num(v: f64) -> String {
+    let v = if v.is_finite() && v != 0.0 {
+        // `.is_finite()` on the *result*, not just the input: rounding a value
+        // within one ULP of `f64::MAX` rounds it up past the maximum, and
+        // Rust's float parser returns `Ok(f64::INFINITY)` on overflow rather
+        // than `Err`, so `unwrap_or` alone would let `inf` through and write
+        // it into the file as a bound.
+        format!("{v:.14e}")
+            .parse::<f64>()
+            .ok()
+            .filter(|r| r.is_finite())
+            .unwrap_or(v)
+    } else {
+        v
+    };
     let s = format!("{v}");
     if s.contains(['.', 'e', 'E', 'n', 'i']) {
         s

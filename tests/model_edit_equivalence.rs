@@ -141,22 +141,8 @@ fn widening_to_two_compartments_is_the_hand_written_two_compartment_model() {
             ("ka".into(), "KA".into()),
         ],
         new_parameters: vec![
-            NewParameter {
-                name: "Q".into(),
-                theta: "TVQ".into(),
-                init: 8.0,
-                lower: 0.1,
-                upper: 100.0,
-                iiv: None,
-            },
-            NewParameter {
-                name: "V2".into(),
-                theta: "TVV2".into(),
-                init: 80.0,
-                lower: 1.0,
-                upper: 500.0,
-                iiv: Some(("ETA_V2".into(), 0.08)),
-            },
+            NewParameter::new("Q", "TVQ", 8.0, 0.1, 100.0),
+            NewParameter::new("V2", "TVV2", 80.0, 1.0, 500.0).with_iiv("ETA_V2", 0.08),
         ],
     })]);
 
@@ -196,22 +182,8 @@ fn narrowing_back_to_one_compartment_restores_the_parent() {
                 ("ka".into(), "KA".into()),
             ],
             new_parameters: vec![
-                NewParameter {
-                    name: "Q".into(),
-                    theta: "TVQ".into(),
-                    init: 8.0,
-                    lower: 0.1,
-                    upper: 100.0,
-                    iiv: None,
-                },
-                NewParameter {
-                    name: "V2".into(),
-                    theta: "TVV2".into(),
-                    init: 80.0,
-                    lower: 1.0,
-                    upper: 500.0,
-                    iiv: Some(("ETA_V2".into(), 0.08)),
-                },
+                NewParameter::new("Q", "TVQ", 8.0, 0.1, 100.0),
+                NewParameter::new("V2", "TVV2", 80.0, 1.0, 500.0).with_iiv("ETA_V2", 0.08),
             ],
         }),
         ModelEdit::SetStructural(StructuralSpec {

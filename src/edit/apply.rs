@@ -141,11 +141,12 @@ fn set_structural(text: &mut ModelText, spec: &StructuralSpec) -> Result<(), Str
         text.append_to_block(
             "parameters",
             &format!(
-                "theta {}({}, {}, {})",
+                "theta {}({}, {}, {}){}",
                 p.theta,
                 num(p.init),
                 num(p.lower),
-                num(p.upper)
+                num(p.upper),
+                if p.fixed { " FIX" } else { "" }
             ),
         );
         if let Some((eta, v)) = &p.iiv {
