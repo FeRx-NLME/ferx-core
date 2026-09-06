@@ -430,6 +430,20 @@ section of the SDLC for the versioning policy).
   `minimization_successful` fraction. Re-running a bootstrap of an unchanged model can therefore
   report slightly different CIs than before; `--summarize` over a stored `raw_results.csv`
   re-applies the criteria without refitting.
+- **An `[odes]` right-hand side that reads `TAD` / `TAFD` no longer destroys the objective on an
+  SDE (`[diffusion]`) model (#1131).** The extended-Kalman-filter path handed the compiled RHS a
+  bare PK parameter array, two slots shorter than the one the ODE predictors build, so both
+  model-time anchors read as missing and the RHS injected `NaN`. The state was then clamped back
+  to a plausible-looking number while the observation variance kept the `NaN`, so `ipred` looked
+  right and the fit silently reported the diverged-subject sentinel (`OFV` ≈ `2e20`) instead of a
+  real objective. The EKF now carries the same extended array and re-anchors `TAD` per dose
+  segment by the same rule as the two ODE predictors, so an SDE fit of a time-varying RHS agrees
+  with its zero-diffusion ODE twin. A model whose RHS reads neither builtin is bit-identical to
+  before.
+- **A model with no random effects no longer panics when its objective is non-finite (#1259).**
+  The covariance step's non-finite-objective diagnostic asked for the eigenvalues of the
+  0×0 OMEGA such a model has, which `nalgebra` rejects. It now reports the non-finite objective
+  as the failure reason, which is what the diagnostic exists to say.
 
 ## [0.3.1] - 2026-09-02
 

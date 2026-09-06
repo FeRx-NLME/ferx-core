@@ -2342,8 +2342,23 @@ fn clamp_negative_predictions(readout: &OdeReadout, predictions: &mut [f64]) {
 /// (the pre-existing answer, and the sdtab convention, for that case).
 #[inline]
 fn tad_anchor(subject: &Subject, dose_lagtimes: &[f64], t_start: f64) -> f64 {
-    let last_dose_eff = subject
-        .doses
+    tad_anchor_for(&subject.doses, dose_lagtimes, t_start)
+}
+
+/// The dose-list body of [`tad_anchor`]. Split out so an engine that holds only a
+/// `&[DoseEvent]` — the EKF (`crate::ode::ekf::solve_ekf`), which has no `Subject` —
+/// anchors `TAD` by the same rule as the two ODE predictors instead of growing yet
+/// another spelling of it (#1131).
+///
+/// There are already at least six in the tree — this function, the inline duplicate
+/// further down this file, `api::output_columns::tad_at_time`, the lag-ignoring sdtab
+/// fallback in `io::output`, and the dual walk's own anchors in `sens::ode_provider`
+/// (segment start, and the pre/post sides of a saltation) — and three of them disagree
+/// on `(t_dose = 120, ALAG = 3, II = 12, t = 121)`, returning `-2.0`, `NaN` and `+1.0`.
+/// A seventh was not worth adding for the sake of a `&Subject` this engine does not have.
+#[inline]
+pub(crate) fn tad_anchor_for(doses: &[DoseEvent], dose_lagtimes: &[f64], t_start: f64) -> f64 {
+    let last_dose_eff = doses
         .iter()
         .enumerate()
         .filter(|(i, d)| d.time + dose_lagtimes[*i] <= t_start + 1e-12)
@@ -2363,8 +2378,7 @@ fn tad_anchor(subject: &Subject, dose_lagtimes: &[f64], t_start: f64) -> f64 {
     // No dose has arrived yet. `fold` over an empty dose list leaves `+∞`, which is
     // the dose-free case and must read NaN rather than propagate as an infinite
     // anchor.
-    let first_arrival = subject
-        .doses
+    let first_arrival = doses
         .iter()
         .enumerate()
         .map(|(i, d)| d.time + dose_lagtimes[i])
@@ -2398,14 +2412,15 @@ fn subject_dose_attrs(
     (dose_lagtimes, dose_f_bio)
 }
 
-/// Earliest dose record time, or `+∞` when the subject has no doses.
+/// Earliest dose record time, or `+∞` when there are no doses.
+///
+/// Takes the dose list rather than the `Subject` so the EKF
+/// (`crate::ode::ekf::solve_ekf`), which has no `Subject`, seeds its TAFD anchor from this
+/// function instead of re-spelling the fold — the same reason [`tad_anchor_for`] exists.
+/// `seed_ext_params` maps the dose-free `+∞` to `NaN`, so callers pass this straight through.
 #[inline]
-fn earliest_dose_time(subject: &Subject) -> f64 {
-    subject
-        .doses
-        .iter()
-        .map(|d| d.time)
-        .fold(f64::INFINITY, f64::min)
+pub(crate) fn earliest_dose_time(doses: &[DoseEvent]) -> f64 {
+    doses.iter().map(|d| d.time).fold(f64::INFINITY, f64::min)
 }
 
 /// Lower the reactive driver's TAFD anchor (`ext_params[MAX_PK_PARAMS]`) to `t` if `t`
@@ -2428,7 +2443,7 @@ fn update_tafd_anchor(ext_params: &mut [f64], t: f64) {
 /// dose time, NaN when there are no doses so the RHS injects NaN rather than `-∞`);
 /// slot `MAX_PK_PARAMS + 1` (TAD) is left NaN for the per-segment update.
 #[inline]
-fn seed_ext_params(
+pub(crate) fn seed_ext_params(
     pk_params_flat: &[f64],
     first_dose_time: f64,
 ) -> [f64; crate::types::MAX_PK_PARAMS + 2] {
@@ -3171,7 +3186,7 @@ fn ode_predictions_with_extra_breaks_and_stats(
 
     // Extended params: slots 0..MAX_PK_PARAMS hold the PK parameters; slots
     // MAX_PK_PARAMS and MAX_PK_PARAMS+1 carry TAFD/TAD anchors for the ODE RHS.
-    let first_dose_time = earliest_dose_time(subject);
+    let first_dose_time = earliest_dose_time(&subject.doses);
     let mut ext_params = seed_ext_params(pk_params_flat, first_dose_time);
 
     // Build obs_time → indices map. Multiple observations can share a time
@@ -4123,7 +4138,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
     let copy_n = pk_params_flat.len().min(crate::types::MAX_PK_PARAMS);
     ext_params[..copy_n].copy_from_slice(&pk_params_flat[..copy_n]);
     ext_params[crate::types::MAX_PK_PARAMS] = if n_base > 0 {
-        earliest_dose_time(&shadow)
+        earliest_dose_time(&shadow.doses)
     } else {
         f64::NAN
     };
@@ -5212,7 +5227,7 @@ fn adaptive_frozen_replay_tv(
     // NB: PK slots are left NaN here (unlike `seed_ext_params`) — the replay
     // overwrites them per-segment from each event's own snapshot before integrating.
     let mut ext_params = [f64::NAN; crate::types::MAX_PK_PARAMS + 2];
-    let first_dose_time = earliest_dose_time(subject);
+    let first_dose_time = earliest_dose_time(&subject.doses);
     ext_params[crate::types::MAX_PK_PARAMS] = if first_dose_time.is_finite() {
         first_dose_time
     } else {
@@ -6366,7 +6381,7 @@ pub fn ode_predictions_with_states(
     // this no-TV path, where every dose reads the same `pk_params_flat`.
     let (dose_lagtimes, dose_f_bio) = subject_dose_attrs(subject, ode, pk_params_flat);
 
-    let first_dose_time = earliest_dose_time(subject);
+    let first_dose_time = earliest_dose_time(&subject.doses);
     let mut ext_params = seed_ext_params(pk_params_flat, first_dose_time);
 
     let obs_map = build_obs_index_map(&subject.obs_times);
@@ -6956,7 +6971,7 @@ pub fn ode_dense_solve_states(
     // this no-TV path, where every dose reads the same `pk_params_flat`.
     let (dose_lagtimes, dose_f_bio) = subject_dose_attrs(subject, ode, pk_params_flat);
 
-    let first_dose_time = earliest_dose_time(subject);
+    let first_dose_time = earliest_dose_time(&subject.doses);
     let mut ext_params = seed_ext_params(pk_params_flat, first_dose_time);
 
     // Build saveat → index map for fast lookup.
@@ -7199,7 +7214,7 @@ pub(crate) fn ode_solve_until_chz_threshold(
 
     let (dose_lagtimes, dose_f_bio) = subject_dose_attrs(subject, ode, pk_params_flat);
 
-    let first_dose_time = earliest_dose_time(subject);
+    let first_dose_time = earliest_dose_time(&subject.doses);
     let mut ext_params = seed_ext_params(pk_params_flat, first_dose_time);
 
     // Zero-order windows, reused for the break points and the per-segment injection

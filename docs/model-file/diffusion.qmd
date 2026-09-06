@@ -140,6 +140,33 @@ the ODE alone explains the data; a large value suggests model misspecification.
 | State name not in `states = [...]` | Parse-time error |
 | Negative initial value | Parse-time error |
 
+## Model-time builtins in the RHS
+
+An `[odes]` right-hand side under `[diffusion]` may read the solver-injected builtins
+`TIME` / `T`, `TAFD` and `TAD`, with the same meaning as on the ordinary ODE path — see
+[TAD before the first dose arrives](ode-models.qmd#tad-before-the-first-dose-arrives) for
+what `TAD` reads in the window before an arrival, and for the dose-free case.
+
+```
+[odes]
+  d/dt(central) = -(CL/V) * central * (1.0 + KTAD * TAD)
+[diffusion]
+  central ~ 0.01
+```
+
+`TAD` is re-anchored at each dose segment by the same rule the two ODE predictors use, so
+an SDE fit of a time-varying right-hand side reduces to its ODE twin as the diffusion
+variance goes to zero. Measured on the model above (`CL = 1`, `V = 20`, `KTAD = 0.3`, doses
+at 0 and 12): `OFV = 14.7016` from the EKF at `central ~ 1e-14` and `14.7016` from the same
+model with the `[diffusion]` block removed.
+
+`TIME` / `T` is the integration variable itself and has always been readable here. `TAFD`
+and `TAD` are passed in two extra parameter slots, and until #1131 the EKF was handed an
+array two slots short, so both evaluated to `NaN` for the whole trajectory. That failure was
+easy to miss: `IPRED` is computed on the ordinary ODE path and stayed correct, while the
+objective — which is what the filter actually contributes — became the diverged-subject
+sentinel. A right-hand side reading neither builtin was never affected.
+
 ## ferx-r usage note
 
 When using ferx-core from R via the ferx-r package, the `[diffusion]` block is part

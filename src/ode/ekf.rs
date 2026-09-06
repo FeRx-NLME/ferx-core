@@ -181,6 +181,22 @@ pub fn solve_ekf(
         n_obs
     ];
 
+    // The compiled `[odes]` RHS reads TAFD and TAD out of `params[MAX_PK_PARAMS]` and
+    // `params[MAX_PK_PARAMS + 1]`. `pk_params_flat` is a bare `PkParams::values`, i.e.
+    // exactly `MAX_PK_PARAMS` long, so `.get()` on either slot returns `None` and the RHS
+    // injects `NaN` — which multiplies into the state and the Jacobian, and is then
+    // laundered into a plausible `0.0` by the `is_nan()` clamp below while `p_obs` keeps
+    // the `NaN` and destroys the likelihood (#1131). Carry the same extended array the
+    // ODE predictors build; the TAD slot is re-anchored per segment in the walk below.
+    let mut ext_params = crate::ode::predictions::seed_ext_params(
+        pk_params_flat,
+        crate::ode::predictions::earliest_dose_time(doses),
+    );
+    // This path applies no lagtime (see `dose_f_bio` below and the `active_infusions`
+    // call), so the anchor rule is fed zero lags — the same values the rest of this
+    // function already assumes.
+    let no_lag: Vec<f64> = vec![0.0; doses.len()];
+
     let obs_map: HashMap<u64, usize> = obs_times
         .iter()
         .enumerate()
@@ -313,6 +329,12 @@ pub fn solve_ekf(
             continue;
         }
 
+        // Re-anchor TAD for this segment, *before* anything integrates with it — the
+        // ODE predictors write this slot per segment too, and a write placed after the
+        // solve reads the previous segment's anchor without failing to compile.
+        ext_params[crate::types::MAX_PK_PARAMS + 1] =
+            crate::ode::predictions::tad_anchor_for(doses, &no_lag, t_start);
+
         // Active infusion rates for this segment (shared with the FOCEI ODE
         // path so the F·RATE / span / lag / reset semantics stay in lockstep).
         // The EKF path has no per-dose lagtimes and no system resets.
@@ -341,7 +363,7 @@ pub fn solve_ekf(
             &wrapped_rhs,
             &u,
             (t_start, t_end),
-            pk_params_flat,
+            &ext_params,
             &saveat,
             &opts,
         );
@@ -371,7 +393,7 @@ pub fn solve_ekf(
                         &wrapped_rhs,
                         &p_mat,
                         &u_mid,
-                        pk_params_flat,
+                        &ext_params,
                         t_mid,
                         dt_sub,
                         diffusion_var,
@@ -420,6 +442,32 @@ mod tests {
         let v = p[crate::types::PK_IDX_V];
         let ke = if v > 0.0 { cl / v } else { 0.0 };
         dy[0] = -ke * y[0];
+    }
+
+    /// The same 1-cpt bolus with elimination modulated by a **model-time builtin**, read
+    /// out of the extended-parameter slot the compiled `[odes]` RHS uses. `slot` is
+    /// `MAX_PK_PARAMS` for TAFD or `MAX_PK_PARAMS + 1` for TAD; `coef` scales the term.
+    ///
+    /// This mirrors `parser/model_parser.rs`'s injection exactly, including the
+    /// `.get(..).filter(is_finite).map_or(NAN, ..)` shape — so a short `params` slice
+    /// yields `NaN` here for the same reason it does in production. Writing it any other
+    /// way (e.g. indexing, or defaulting to 0.0) would make the fixture unable to
+    /// reproduce the defect at all.
+    fn time_reading_rhs(
+        slot: usize,
+        coef: f64,
+    ) -> impl Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync {
+        move |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
+            let cl = p[crate::types::PK_IDX_CL];
+            let v = p[crate::types::PK_IDX_V];
+            let ke = if v > 0.0 { cl / v } else { 0.0 };
+            let builtin = p
+                .get(slot)
+                .copied()
+                .filter(|x| x.is_finite())
+                .map_or(f64::NAN, |anchor| t - anchor);
+            dy[0] = -ke * y[0] * (1.0 + coef * builtin);
+        }
     }
 
     fn make_pk(cl: f64, v: f64) -> Vec<f64> {
@@ -507,6 +555,272 @@ mod tests {
             assert_relative_eq!(ekf.ipred, ode, epsilon = 1e-4, max_relative = 1e-4);
             assert_relative_eq!(ekf.p_obs, 0.0, epsilon = 1e-10);
         }
+    }
+
+    /// #1131: an `[odes]` RHS reading a model-time builtin poisons the EKF, because
+    /// `solve_ekf` was handed a bare `PkParams::values` — exactly `MAX_PK_PARAMS` long —
+    /// while the RHS reads TAFD/TAD from slots `MAX_PK_PARAMS` and `+1`. `.get()` returned
+    /// `None`, so both builtins evaluated to `NaN` for the whole trajectory.
+    ///
+    /// **Assert `p_obs`, never `ipred`.** The two failed differently and only one of them
+    /// can carry this test: `ipred` is clamped by `if v.is_nan() { 0.0 }` in the assimilate
+    /// branch, and by the time this was measured at `579d1e96` the sdtab column was already
+    /// reporting the correct value-path numbers — so an `ipred` assertion passes both
+    /// before and after the fix and cannot fail. `p_obs` has no such clamp, and it is what
+    /// feeds the likelihood: the defect surfaced as the `1e20` objective sentinel.
+    ///
+    /// No SS dose and no lagtime here — the defect needs neither, which is why #1131 is
+    /// not the steady-state bug it was filed alongside.
+    #[test]
+    fn time_reading_rhs_gets_finite_anchors_on_the_ekf_walk() {
+        for (name, slot) in [
+            ("TAFD", crate::types::MAX_PK_PARAMS),
+            ("TAD", crate::types::MAX_PK_PARAMS + 1),
+        ] {
+            // Two doses: under a single dose TAD == TAFD, so a one-dose fixture cannot
+            // tell the two slots apart and would agree with an engine that plumbed only
+            // one of them.
+            let doses = vec![
+                bolus_dose(100.0),
+                DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+            ];
+            let obs_times = vec![2.0, 4.0, 8.0, 24.0];
+            let pk = make_pk(1.0, 20.0);
+            let r_obs_vec: Vec<f64> = vec![0.01; obs_times.len()];
+
+            let pts = solve_ekf(
+                &time_reading_rhs(slot, 0.05),
+                1,
+                0,
+                &[0.01],
+                &pk,
+                &Default::default(),
+                &[],
+                &doses,
+                &obs_times,
+                &r_obs_vec,
+                OdeSolverOptions::default(),
+            );
+
+            assert_eq!(pts.len(), obs_times.len(), "{name}: wrong point count");
+            for (j, pt) in pts.iter().enumerate() {
+                // `is_finite` before anything else: a `NaN` compared with `<` or folded
+                // through `f64::max` silently reads as "in range".
+                assert!(
+                    pt.p_obs.is_finite(),
+                    "{name}: p_obs[{j}] = {} — the anchor slot is still absent",
+                    pt.p_obs
+                );
+                assert!(
+                    pt.p_obs > 0.0,
+                    "{name}: p_obs[{j}] = {} — a non-positive variance would also be \
+                     produced by an EKF that never propagated, so assert the positive",
+                    pt.p_obs
+                );
+                assert!(
+                    pt.ipred.is_finite() && pt.ipred > 0.0,
+                    "{name}: ipred[{j}] = {} — drug is present at every one of these times",
+                    pt.ipred
+                );
+            }
+        }
+    }
+
+    /// The discriminator for the test above: with the modulation coefficient at zero the
+    /// builtin contributes nothing, so the walk must be **bit-identical** to the plain
+    /// `one_cpt_rhs`. Before the fix this failed for the opposite reason to the usual one
+    /// — `0.0 * NaN` is `NaN`, so merely *mentioning* the builtin destroyed the run.
+    #[test]
+    fn a_zero_coefficient_model_time_term_is_bit_identical_to_omitting_it() {
+        let doses = vec![
+            bolus_dose(100.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ];
+        let obs_times = vec![2.0, 4.0, 8.0, 24.0];
+        let pk = make_pk(1.0, 20.0);
+        let r_obs_vec: Vec<f64> = vec![0.01; obs_times.len()];
+        let run = |rhs: &(dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync)| {
+            solve_ekf(
+                rhs,
+                1,
+                0,
+                &[0.01],
+                &pk,
+                &Default::default(),
+                &[],
+                &doses,
+                &obs_times,
+                &r_obs_vec,
+                OdeSolverOptions::default(),
+            )
+        };
+        let plain = run(&one_cpt_rhs);
+        for slot in [crate::types::MAX_PK_PARAMS, crate::types::MAX_PK_PARAMS + 1] {
+            let zero_coef = run(&time_reading_rhs(slot, 0.0));
+            for (j, (a, b)) in zero_coef.iter().zip(plain.iter()).enumerate() {
+                assert_eq!(
+                    a.ipred.to_bits(),
+                    b.ipred.to_bits(),
+                    "slot {slot}: ipred[{j}] {} vs {}",
+                    a.ipred,
+                    b.ipred
+                );
+                assert_eq!(
+                    a.p_obs.to_bits(),
+                    b.p_obs.to_bits(),
+                    "slot {slot}: p_obs[{j}] {} vs {}",
+                    a.p_obs,
+                    b.p_obs
+                );
+            }
+        }
+    }
+
+    /// The **value** oracle for #1131, and the strongest one available: with the diffusion
+    /// variance at zero the EKF's mean walk reduces to the ordinary ODE integration, so
+    /// `solve_ekf`'s `ipred` must equal `ode_predictions`' — on a TAD- and a TAFD-reading
+    /// RHS, the exact models the bare-slice defect destroyed.
+    ///
+    /// Both engines call `predictions::tad_anchor_for` after this fix, so this test cannot
+    /// observe a wrong *anchor rule* shared by both — that is what the NONMEM anchors in
+    /// `nonmem_anchor/` are for. What it does observe is the defect that was actually there:
+    /// the EKF passing a slice too short for the RHS to read the slot at all. Deleting
+    /// either the `seed_ext_params` call or the per-segment anchor write in `solve_ekf`
+    /// turns the EKF column into the `0.0` clamp while the ODE column stays correct.
+    ///
+    /// A third reference, independent of both engines, keeps them from agreeing on a wrong
+    /// answer. For `dA/dt = -ke·A·(1 + c·u)` the exponent integrates in closed form:
+    /// with `u = TAD` the clock restarts at each arrival, with `u = TAFD` it does not, so
+    /// the two slots have *different* closed forms after the second dose — a fixture that
+    /// plumbed one slot into both would fail here.
+    #[test]
+    fn ekf_matches_the_ode_twin_and_a_closed_form_on_a_model_time_rhs() {
+        use crate::ode::predictions::{ode_predictions, OdeSpec};
+        use crate::types::Subject;
+        use std::collections::HashMap;
+
+        let (cl, v) = (1.0f64, 20.0f64);
+        let ke = cl / v;
+        let c = 0.05f64;
+        // Two doses: after a single dose TAD ≡ TAFD, so a one-dose fixture agrees with an
+        // engine that plumbed one slot into both.
+        let (t2, amt) = (12.0f64, 100.0f64);
+        let doses = vec![
+            DoseEvent::new(0.0, amt, 1, 0.0, false, 0.0),
+            DoseEvent::new(t2, amt, 1, 0.0, false, 0.0),
+        ];
+        // Samples straddle the second dose, so the post-dose leg — where the two clocks
+        // disagree — is actually scored.
+        let obs_times = vec![2.0, 8.0, 14.0, 24.0];
+        let pk = make_pk(cl, v);
+        let opts = OdeSolverOptions {
+            abstol: 1e-12,
+            reltol: 1e-10,
+            ..OdeSolverOptions::default()
+        };
+
+        // ∫ (1 + c·u) over the leg, with `u` measured from `anchor`.
+        let phase = |t_from: f64, t_to: f64, anchor: f64| -> f64 {
+            let (a, b) = (t_from - anchor, t_to - anchor);
+            (b - a) + c * (b * b - a * a) / 2.0
+        };
+        // `TAD` restarts at `t2`; `TAFD` keeps running from the first dose.
+        let closed_form = |t: f64, restarts: bool| -> f64 {
+            if t < t2 {
+                amt * (-ke * phase(0.0, t, 0.0)).exp()
+            } else {
+                let at_t2 = amt * (-ke * phase(0.0, t2, 0.0)).exp();
+                let anchor = if restarts { t2 } else { 0.0 };
+                (at_t2 + amt) * (-ke * phase(t2, t, anchor)).exp()
+            }
+        };
+
+        for (name, slot, restarts) in [
+            ("TAFD", crate::types::MAX_PK_PARAMS, false),
+            ("TAD", crate::types::MAX_PK_PARAMS + 1, true),
+        ] {
+            let rhs = time_reading_rhs(slot, c);
+            let ekf_pts = solve_ekf(
+                &rhs,
+                1,
+                0,
+                &[0.0], // zero diffusion: the mean walk reduces to plain integration
+                &pk,
+                &Default::default(),
+                &[],
+                &doses,
+                &obs_times,
+                &vec![0.01; obs_times.len()],
+                opts,
+            );
+
+            let subj = Subject {
+                id: "1".into(),
+                doses: doses.clone(),
+                obs_times: obs_times.clone(),
+                obs_raw_times: Vec::new(),
+                observations: vec![0.0; obs_times.len()],
+                obs_cmts: vec![1; obs_times.len()],
+                covariates: HashMap::new(),
+                dose_covariates: Vec::new(),
+                obs_covariates: Vec::new(),
+                pk_only_times: Vec::new(),
+                pk_only_covariates: Vec::new(),
+                reset_times: Vec::new(),
+                reset_covariates: Vec::new(),
+                cens: vec![0; obs_times.len()],
+                occasions: Vec::new(),
+                obs_l2: Vec::new(),
+                dose_occasions: Vec::new(),
+                reset_occasions: Vec::new(),
+                fremtype: Vec::new(),
+                obs_records: vec![],
+            };
+            let ode_spec = OdeSpec {
+                chz_state_slots: Vec::new(),
+                rhs: Box::new(time_reading_rhs(slot, c)),
+                n_states: 1,
+                state_names: vec!["central".into()],
+                readout: crate::ode::OdeReadout::ObsCmt(0),
+                diffusion_var: Vec::new(),
+                init_fn: None,
+                solver_opts: opts,
+                input_rate: Vec::new(),
+                rhs_program: None,
+                readout_program: None,
+                indiv_param_program: None,
+                dose_attr_map: Default::default(),
+            };
+            let ode_preds = ode_predictions(&ode_spec, &pk, &[], &[], &subj);
+
+            for (j, &t) in obs_times.iter().enumerate() {
+                let want = closed_form(t, restarts);
+                let (ekf, ode) = (ekf_pts[j].ipred, ode_preds[j]);
+                // `is_finite` first: a `NaN` compared with `<` reads as "in range", and the
+                // `0.0` clamp in the assimilate branch would otherwise be judged only by
+                // the relative check below.
+                assert!(
+                    ekf.is_finite() && ode.is_finite(),
+                    "{name}: non-finite at t={t} — ekf {ekf}, ode {ode}"
+                );
+                assert!(
+                    ekf > 0.0,
+                    "{name}: ekf ipred at t={t} is {ekf} — the `is_nan()` clamp reports a \
+                     poisoned walk as 0.0, which is exactly the #1131 signature"
+                );
+                assert_relative_eq!(ekf, ode, epsilon = 1e-6, max_relative = 1e-6);
+                assert_relative_eq!(ekf, want, epsilon = 1e-6, max_relative = 1e-6);
+            }
+        }
+
+        // The straddle: assert the two clocks actually disagree on this fixture, so the
+        // loop above cannot quietly become the same assertion twice.
+        let (tad_24, tafd_24) = (closed_form(24.0, true), closed_form(24.0, false));
+        assert!(
+            (tad_24 - tafd_24).abs() / tad_24 > 0.1,
+            "TAD and TAFD must differ materially after the second dose \
+             ({tad_24:.6} vs {tafd_24:.6}) or this fixture cannot tell the slots apart"
+        );
     }
 
     /// #1226 on the EKF walk: an observation **one ULP after** a dose record is read
