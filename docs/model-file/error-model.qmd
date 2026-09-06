@@ -258,8 +258,13 @@ A bare sigma name keeps the legacy behaviour exactly ($m_k \equiv 1$).
   scaled sigma. It may **not** depend on a random effect (η), on an individual
   parameter, or on the prediction (`IPRED`/`PRED`/`DV`) — the multiplier must be
   independent of the inner empirical-Bayes loop. `TAD` — the data-derived time
-  after the last dose at or before the record, steady-state aware, no lag time
-  (#1182) — is available beside `TIME`; `TAFD` is not.
+  after dose, steady-state aware, no lag time (#1182) — is available beside
+  `TIME`; `TAFD` is not. `TAD` groups a dose and an observation at the same
+  `TIME` as Pharmpy's `add_time_after_dose` does: the observation belongs to
+  the *previous* dose, so a trough drawn at the dosing time reads `TAD = II`,
+  not `0` (an observation at an `SS` dose's time, or at the first dose, stays
+  with that dose). The sdtab `TAD` column keeps NONMEM's record-order
+  convention and reads `0` on that row.
 - The `TIME` fed to the expression is the raw data-file time (matching NONMEM's
   `$ERROR`).
 - A magnitude that evaluates to zero, a negative number, or a non-finite value at

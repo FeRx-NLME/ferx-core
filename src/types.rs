@@ -1094,22 +1094,66 @@ impl Subject {
             .unwrap_or_else(|| self.obs_times.get(j).copied().unwrap_or(0.0))
     }
 
-    /// Time after the last dose at or before observation `j`, from the data
-    /// alone — no lag time, steady-state aware (a `SS` dose with an interval
-    /// contributes the most recent implied dose time). This is NONMEM's
-    /// data-derived `TAD` and Pharmpy's `add_time_after_dose`, and it is what
-    /// the `TAD` built-in of an `[error_model]` magnitude expression reads
-    /// (#1182) and what the sdtab `TAD` column falls back to when no
-    /// lag-aware value was computed. `NaN` when no dose precedes the
-    /// observation (a pre-dose sample).
+    /// Time after dose at observation `j`, from the data alone — no lag time,
+    /// steady-state aware (a `SS` dose with an interval contributes the most
+    /// recent implied dose time) — with **Pharmpy's grouping of a dose and an
+    /// observation at the same time** (`get_doseid`, which
+    /// `add_time_after_dose` builds on): an observation at exactly the time of
+    /// a non-`SS` dose belongs to the *previous* dose, whichever side of the
+    /// dose record it sits on, so a trough drawn at the dosing time reads
+    /// `TAD = II` rather than `0`; an observation at the time of an `SS` dose
+    /// stays with that dose (`TAD = 0`), as does one at the time of the first
+    /// dose, which has no previous dose to belong to. This is what the `TAD`
+    /// built-in of an `[error_model]` magnitude expression reads and what
+    /// `ruvsearch` cuts its time-varying candidates on (#1182). `NaN` when no
+    /// dose is at or before the observation (a pre-dose sample).
+    ///
+    /// It is deliberately **not** the sdtab `TAD` column's convention. That
+    /// column follows NONMEM's record order — the dose is applied first at a
+    /// shared time, so the same trough reads `0` — which is also how ferx's
+    /// predictor breaks the tie; see `time_after_dose_at_or_before`.
     pub fn time_after_dose(&self, j: usize) -> f64 {
+        let strict = self.data_tad(j, false);
+        if strict.is_finite() {
+            strict
+        } else {
+            // Pharmpy's first-dose exception: nothing precedes the dose, so an
+            // observation at its time keeps it (`TAD = 0`).
+            self.data_tad(j, true)
+        }
+    }
+
+    /// The sdtab `TAD` fallback: time after the last dose **at or before**
+    /// observation `j`, NONMEM's record-order convention (a dose record ahead
+    /// of an observation at the same `TIME` is the most recent dose, `TAD =
+    /// 0`) and the same tie rule as the lag-aware `tad_at_time` in
+    /// `api/output_columns.rs`. Steady-state aware, no lag time, `NaN` before
+    /// the first dose. See [`Self::time_after_dose`] for why the `TAD`
+    /// built-in reads the same-time trough differently.
+    pub(crate) fn time_after_dose_at_or_before(&self, j: usize) -> f64 {
+        self.data_tad(j, true)
+    }
+
+    /// The one data-TAD kernel behind both conventions. `same_time_counts`
+    /// decides whether a non-`SS` dose at exactly the observation's time is
+    /// the most recent dose (`true`, NONMEM record order) or is skipped so the
+    /// observation reads from the dose before it (`false`, Pharmpy's
+    /// `get_doseid`). An `SS` dose at the observation's time counts under both
+    /// (Pharmpy: "no swap for SS dosing").
+    fn data_tad(&self, j: usize, same_time_counts: bool) -> f64 {
         let Some(&obs_t) = self.obs_times.get(j) else {
             return f64::NAN;
         };
         let last_eff = self
             .doses
             .iter()
-            .filter(|d| d.time <= obs_t + 1e-12)
+            .filter(|d| {
+                if same_time_counts || d.ss {
+                    d.time <= obs_t + 1e-12
+                } else {
+                    d.time < obs_t - 1e-12
+                }
+            })
             .map(|d| {
                 if d.ss && d.ii > 0.0 {
                     let elapsed = obs_t - d.time;
@@ -2450,8 +2494,8 @@ impl ErrorSpec {
 /// prediction beyond the built-in proportional loading, so the multiplier is
 /// constant across the inner EBE loop for a fixed θ. The covariate map must
 /// supply any model covariates the expression names; `TIME` is provided by the
-/// parser's event-time built-in and `TAD` — the data-file time after the last
-/// dose at or before the record, [`Subject::time_after_dose`] (#1182) — is
+/// parser's event-time built-in and `TAD` — the data-file time after dose with
+/// Pharmpy's same-time grouping, [`Subject::time_after_dose`] (#1182) — is
 /// the fourth argument.
 ///
 /// The same signature serves a `power(...)` exponent program

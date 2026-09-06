@@ -21259,8 +21259,14 @@ fn magnitude_expression_reads_tad() {
     assert_eq!(late[0], vec![0.0, 0.0, 0.0]);
 }
 
-/// `Subject::time_after_dose` is the data TAD: last dose at or before the
-/// record, steady-state aware, `NaN` before the first dose.
+/// `Subject::time_after_dose` is the data TAD with Pharmpy's `get_doseid`
+/// grouping: an observation at exactly a non-SS dose's time belongs to the
+/// previous dose (`dose@0, dose@24, obs@24` → `24`, not `0`), steady-state
+/// aware, `NaN` before the first dose. The sdtab fallback
+/// `time_after_dose_at_or_before` keeps NONMEM's record-order `0` on the
+/// same row. Regression for the review of #1182: with `<=` the trough at the
+/// dosing time read `0`, shifting `ruvsearch`'s TAD quantiles away from
+/// Pharmpy's.
 #[test]
 fn subject_time_after_dose_is_the_data_tad() {
     use crate::types::{DoseEvent, Subject};
@@ -21270,23 +21276,57 @@ fn subject_time_after_dose_is_the_data_tad() {
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
             DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
         ],
-        obs_times: vec![-1.0, 2.0, 23.9, 24.0, 30.0],
+        obs_times: vec![-1.0, 0.0, 2.0, 23.9, 24.0, 30.0],
         ..Default::default()
     };
-    let tad: Vec<f64> = (0..5).map(|j| subject.time_after_dose(j)).collect();
-    assert!(tad[0].is_nan());
-    assert_eq!(tad[1..], [2.0, 23.9, 0.0, 6.0]);
+    let tad: Vec<f64> = (0..6).map(|j| subject.time_after_dose(j)).collect();
+    assert!(tad[0].is_nan(), "pre-dose sample");
+    assert_eq!(
+        tad[1..],
+        [0.0, 2.0, 23.9, 24.0, 6.0],
+        "Pharmpy grouping: obs@24 belongs to dose@0; obs@0 keeps the first dose"
+    );
+    let nonmem: Vec<f64> = (0..6)
+        .map(|j| subject.time_after_dose_at_or_before(j))
+        .collect();
+    assert!(nonmem[0].is_nan());
+    assert_eq!(
+        nonmem[1..],
+        [0.0, 2.0, 23.9, 0.0, 6.0],
+        "sdtab fallback: the dose at 24 is the most recent dose"
+    );
+    // The two conventions differ on exactly the same-time row.
+    let differing: Vec<usize> = (1..6).filter(|&j| tad[j] != nonmem[j]).collect();
+    assert_eq!(differing, [4]);
+
     let ss = Subject {
         id: "2".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)],
-        obs_times: vec![26.0],
+        obs_times: vec![0.0, 26.0],
         ..Default::default()
     };
     assert_eq!(
         ss.time_after_dose(0),
+        0.0,
+        "an observation at an SS dose's time stays with that dose (no swap)"
+    );
+    assert_eq!(
+        ss.time_after_dose(1),
         2.0,
         "SS with II=12: last implied dose at 24"
     );
+    // An SS dose at the observation's time counts under Pharmpy's rule even
+    // when a non-SS dose precedes it.
+    let ss_later = Subject {
+        id: "3".into(),
+        doses: vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(48.0, 100.0, 1, 0.0, true, 12.0),
+        ],
+        obs_times: vec![48.0],
+        ..Default::default()
+    };
+    assert_eq!(ss_later.time_after_dose(0), 0.0);
 }
 
 #[test]

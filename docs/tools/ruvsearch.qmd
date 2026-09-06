@@ -70,7 +70,9 @@ search fitted is the model a user would have typed:
 `cᵢ` is the `i / groups` quantile of every observation's time after dose —
 Pharmpy's `TAD.quantile(i / groups)` — read by the
 [`TAD` built-in](../model-file/error-model.qmd#time-varying-covariate-dependent-magnitude)
-of a magnitude expression, which is the data-derived time after the last dose.
+of a magnitude expression, which is the data-derived time after the last dose
+with Pharmpy's grouping of a trough drawn at the dosing time (it belongs to the
+previous dose, `TAD = II`).
 The time-varying multiplier applies to every σ of the form, as Pharmpy
 multiplies every ε. On a later parent the features compose: after `power` is
 accepted, a time-varying candidate reads

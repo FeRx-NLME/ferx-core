@@ -12,7 +12,7 @@
 //! |---|---|---|
 //! | `IIV_on_RUV` | `additive(SIG)` + `iiv_on_ruv = ETA_RUV` | `omega ETA_RUV ~ 0.09` |
 //! | `power` | `additive(SIG * IPREDC^RUV_POW)` | `theta RUV_POW(0.1)` |
-//! | `combined` | `additive(SIG * sqrt(1 + (RUV_ADD / IPREDC)²))` | `theta RUV_ADD(√(|min IPRED| / 2))` |
+//! | `combined` | `additive(SIG * sqrt(1 + (RUV_ADD / IPREDC)²))` | `theta RUV_ADD(√(\|min IPRED\| / 2))` |
 //! | `time_varying{i}` | `additive(SIG * (if (TAD < c_i) RUV_TV else 1.0))` | `theta RUV_TV(0.1)` |
 //!
 //! These are Pharmpy's CWRES models spelled in ferx: `power` is Pharmpy's

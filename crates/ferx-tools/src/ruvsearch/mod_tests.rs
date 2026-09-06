@@ -350,6 +350,24 @@ fn tad_cutoffs_are_pandas_quantiles_over_every_observation() {
     assert!((cuts[0] - 1.5).abs() < 1e-12, "{cuts:?}");
     assert!((cuts[1] - 5.0).abs() < 1e-12, "{cuts:?}");
     assert!((cuts[2] - 12.0).abs() < 1e-12, "{cuts:?}");
+    // A trough drawn at the dosing time is grouped with the previous dose, as
+    // Pharmpy's `get_doseid` does: obs@24 with dose@24 contributes TAD = 24,
+    // not 0. Under the `<=` rule the sorted TADs would instead gain two zeros
+    // (0, 0, 1, 1, 1.5, …) and the cuts would read 1.125, 4.0, 10.5.
+    let mut troughs = population();
+    for s in &mut troughs.subjects {
+        s.obs_times.push(24.0);
+        s.observations.push(3.0);
+        s.obs_cmts.push(1);
+        s.cens.push(0);
+    }
+    // Sorted: 1, 1, 1.5, 1.5, 4, 4, 6, 6, 12, 12, 23, 23, 24, 24 (n = 14);
+    // type-7 h = 13·q → 3.25 → 1.5 + 0.25·2.5 = 2.125; 6.5 → 6.0;
+    // 9.75 → 12 + 0.75·11 = 20.25.
+    let cuts = tad_cutoffs(&troughs, 4);
+    assert!((cuts[0] - 2.125).abs() < 1e-12, "{cuts:?}");
+    assert!((cuts[1] - 6.0).abs() < 1e-12, "{cuts:?}");
+    assert!((cuts[2] - 20.25).abs() < 1e-12, "{cuts:?}");
     // A dataset with no doses has no TAD to cut.
     let mut pop = population();
     for s in &mut pop.subjects {
