@@ -90,7 +90,7 @@ mod lrt;
 mod report;
 
 pub use effects::Effect;
-pub use lrt::{chi_square_sf, Lrt};
+pub use lrt::{chi_square_isf, chi_square_sf, Lrt};
 pub use report::{final_model_path, render_summary, steps_path, write_report, STEP_COLUMNS};
 
 /// `[covsearch] algorithm`.
@@ -171,6 +171,7 @@ impl CovsearchOptions {
     /// to ignore: a file that says `type = "bic"` and gets an LRT would be
     /// lying about how its winner was chosen.
     pub fn from_config(config: &SearchConfig) -> Result<Self, String> {
+        config.require_space("covsearch", "COVARIATE / COVARIATE? statements")?;
         let options = match config.tools.get("covsearch") {
             Some(table) => table
                 .clone()

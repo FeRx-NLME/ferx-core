@@ -1,0 +1,258 @@
+---
+pagetitle: "Residual-error search"
+description-meta: "Residual-error model search in ferx — Pharmpy ruvsearch: IIV on the residual error, a power form, a combined form and a time-varying magnitude, tested by likelihood ratio from a .ferxsearch file, with an optional CWRES pre-screen."
+---
+
+# Residual-error search
+
+> **Maturity: alpha** — see [Feature Maturity](../maturity.qmd) for what this means.
+
+`ferx ruvsearch` is Pharmpy's `ruvsearch`: a search over the
+[`[error_model]`](../model-file/error-model.qmd) block. Its candidates are not
+a space of MFL features but the four residual-error structures Pharmpy tries —
+IIV on the residual error, a power form, a combined form, and a time-varying
+magnitude — each one edit away from its parent, so a candidate is the parent
+with one feature added and the rest of the file invariant. The `power(σ, P)`
+form landed in core with this tool; the other three were already expressible.
+
+```bash
+ferx ruvsearch warfarin.ferxsearch --directory warfarin-ruvsearch --threads 8
+```
+
+The [`.ferxsearch` file](search.qmd) has **no `[space]`** — there is nothing
+to declare — and a `[ruvsearch]` section for the search's own settings:
+
+```toml
+base = "warfarin.ferx"
+data = "warfarin.csv"
+
+[ruvsearch]
+groups          = 4          # time-varying candidates cut at the i/groups TAD quantiles
+p_value         = 0.001      # the likelihood-ratio level, and the final df = 1 cutoff
+skip            = []         # any of "IIV_on_RUV", "power", "combined", "time_varying"
+max_iter        = 3          # 1, 2 or 3
+cwres_prescreen = false      # Pharmpy's path: screen on the parent's CWRES first
+
+[strictness]
+require_converged = true
+
+[run]
+retries   = 2
+threads   = 8
+cache_dir = "warfarin-ruvsearch"
+```
+
+| key | default | meaning |
+|---|---|---|
+| `groups` | `4` | `groups − 1` time-varying candidates, cut at the `i / groups` quantiles of time after dose |
+| `p_value` | `0.001` | the level a candidate must reach against its parent, and the level of the final comparison's cutoff |
+| `skip` | `[]` | families never tested, in Pharmpy's spelling |
+| `max_iter` | `3` | iterations, at most one accepted feature each |
+| `cwres_prescreen` | `false` | fit the candidates to the parent's CWRES first and refit only the winner |
+
+The defaults are Pharmpy's. `[rank]` does not apply — the search selects by
+the likelihood-ratio test on the OFV and refuses a file that asks for a BIC or
+a `cutoff`, and it refuses a `[space]` too, rather than ignoring either.
+
+## The candidates
+
+Every candidate is the parent's `[error_model]` with one feature added,
+written by the same edit layer the other searches use, so the model the
+search fitted is the model a user would have typed:
+
+| candidate | on a proportional parent | new parameter, init |
+|---|---|---|
+| `IIV_on_RUV` | `iiv_on_ruv = ETA_RUV` | `omega ETA_RUV ~ 0.09` |
+| `power` | `DV ~ power(PROP_ERR, RUV_POW)` | `theta RUV_POW(1.0, 0.01, 10.0)` |
+| `combined` | `DV ~ combined(PROP_ERR, ADD_ERR)` | `sigma ADD_ERR ~ (min DV / 2)²` |
+| `time_varying{i}` | `DV ~ proportional(PROP_ERR * (if (TAD < cᵢ) RUV_TV else 1.0))` | `theta RUV_TV(1.0, 0.01, 10.0)` |
+
+`cᵢ` is the `i / groups` quantile of every observation's time after dose —
+Pharmpy's `TAD.quantile(i / groups)` — read by the
+[`TAD` built-in](../model-file/error-model.qmd#time-varying-covariate-dependent-magnitude)
+of a magnitude expression, which is the data-derived time after the last dose
+with Pharmpy's grouping of a trough drawn at the dosing time (it belongs to the
+previous dose, `TAD = II`).
+The time-varying multiplier applies to every σ of the form, as Pharmpy
+multiplies every ε. On a later parent the features compose: after `power` is
+accepted, a time-varying candidate reads
+`power(PROP_ERR * (if (TAD < cᵢ) RUV_TV else 1.0), RUV_POW)`.
+
+The inits are Pharmpy's where it states one for the full model: `0.09` for
+the residual η, `(min DV / 2)²` for the additive σ, an exponent of `1` on a
+proportional base. The time-varying θ starts at the neutral `1.0` rather than
+Pharmpy's `0.1` — that value is the CWRES model's start, and a full refit has
+no CWRES estimate to carry over; the pre-screen path does, and uses it.
+
+A candidate the parent cannot take is not generated: `power` and `combined`
+need a plain proportional parent, `IIV_on_RUV` needs a parent without one.
+Two time-varying cutoffs that coincide (a coarse time-after-dose distribution)
+give one candidate, not two identical models. `IIV_on_RUV` also needs an
+estimation method with η–ε interaction; on a `method = foce` base it is not
+tested, and the notes say why.
+
+## The algorithm
+
+**The base.** Pharmpy defines its candidates on a *proportional* base. An
+input whose `[error_model]` is anything else — additive, combined, `power`,
+or proportional with an `iiv_on_ruv` — is first rewritten as a plain
+proportional model (its proportional σ kept as declared; a new one at
+Pharmpy's `0.09` variance when it had none) and fitted. That fit is the parent
+of iteration one; the input is kept for the final comparison. A plain
+proportional input is its own base.
+
+**An iteration.** Every candidate not yet retired is derived from the parent,
+seeded with the parent's estimates, and fitted. Each is compared with the
+parent by a likelihood-ratio test at `p_value` — `df` is the number of
+parameters it adds, always one. Among the candidates that pass the
+`[strictness]` gate *and* are significant, the one with the lowest OFV becomes
+the next parent, and its family is retired; accepting `power` retires
+`combined` too, and the other way round, since Pharmpy never tests one after
+the other (they are near-equivalent in shape). An iteration that accepts
+nothing ends the search, as does `max_iter`.
+
+**The final comparison.** Pharmpy's rule, kept as it is: the selected model
+must beat the *input* by the `df = 1` χ² cutoff at `p_value` — `10.83` at the
+default — or the input is returned; when a proportional base was fitted, the
+selected model must beat that too, or the base is returned. The table shows
+every fitted model either way, and the notes say when a reversion happened.
+
+## The CWRES pre-screen
+
+Pharmpy does not fit its candidates to the data. It fits them to the
+**conditional weighted residuals** of the parent: a dataset with `DV = CWRES`,
+the parent's `IPRED` and the time after dose beside each row, and a model
+`Y = θ + η + ε` whose residual error carries the candidate structure. A fit of
+that model is a fraction of a PK fit, which is the point of the design. The
+candidate whose CWRES model improves most over the CWRES base — by more than
+the cutoff — is then built on the real model, with the shape the CWRES fit
+estimated as its initial value, and that one candidate is fitted and judged by
+the same likelihood-ratio test. If the refit is not accepted, the family is
+retired and the search goes on from the parent, as Pharmpy does.
+
+`cwres_prescreen = true` is that path. The screening models are Pharmpy's,
+spelled in ferx (the column is `IPREDC`, since `IPRED` is a reserved word in a
+magnitude expression):
+
+| candidate | screening `[error_model]` | shape parameter |
+|---|---|---|
+| `IIV_on_RUV` | `additive(SIG)` + `iiv_on_ruv = ETA_RUV` | `omega ETA_RUV ~ 0.09` |
+| `power` | `additive(SIG * IPREDC^RUV_POW)` | `theta RUV_POW(0.1)`; the refit starts at `RUV_POW + 1` |
+| `combined` | `additive(SIG * sqrt(1 + (RUV_ADD / IPREDC)²))` | `theta RUV_ADD(√(min IPRED / 2))` |
+| `time_varying{i}` | `additive(SIG * (if (TAD < cᵢ) RUV_TV else 1.0))` | `theta RUV_TV(0.1)` |
+
+Pharmpy's combined screening model is `ε_p + ε_a / IPRED`, whose variance
+`σ_p² + σ_a² / IPRED²` is the same two-parameter family as one σ with the
+ratio `σ_a / σ_p` as a θ — the spelling the magnitude grammar can carry. The
+screened `power` exponent, residual-η variance and time-varying θ are carried
+into the refit as Pharmpy carries them; the combined split is not, because its
+σ live on the CWRES scale and the refit starts from the parent's proportional
+σ and the `(min DV / 2)²` default instead.
+
+The pre-screen is off by default. The full refit is the path that is
+trivially right; the pre-screen is the one that is cheap, and it is a
+*screen* — a candidate the CWRES model does not favour is never fitted to the
+data, so a feature the residuals hide is a feature the search will not find.
+On the fixture set the two paths accept the same feature up to the
+`power`/`combined` pair (`crates/ferx-tools/tests/ruvsearch_prescreen_agreement.rs`,
+slow-gated, run nightly): the full refit prefers `power` (401.69), the screen
+picks `combined` (402.89) on a one-unit CWRES margin, and neither tests the
+other afterwards.
+
+The screen is fitted to ferx's `CWRES`, which is why that column had to be
+NONMEM's exactly. It was not: ferx standardised each residual by its own
+marginal SD, where NONMEM's `CWRES` is the residual vector decorrelated by the
+symmetric inverse square root of `HΩHᵀ + R` (with `R` at `IPRED` under an
+interaction fit) — the same only when there is no η. On the anchor dataset the
+old column was off from NONMEM's by an RMS of 0.75 and screened `IIV_on_RUV` at
+48.7 where Pharmpy saw 9.4; the corrected column agrees to 1e-4 and the screen
+reproduces Pharmpy's table (below). See the
+[output page](../model-file/output.qmd#mandatory-minimum-always-present).
+
+## Output
+
+The directory holds:
+
+- `steps.csv` — one row per fitted model: the input, the proportional base,
+  every candidate of every iteration and, with the pre-screen, every CWRES
+  screening model (`screened = true`, its `ofv` on the CWRES scale and
+  `cwres_dofv` its improvement over the CWRES base). Beside `ofv`, `dofv`,
+  `df`, `p_value` and `selected` sit `converged`, `passed` and `failures`, so
+  a candidate that looks better on OFV alone but was excluded carries its
+  reason on the row.
+- `models/<id>.ferx` — every fitted model as it was fitted: `input`, `base`,
+  `power-1`, `time_varying2-1`, `cwres-power-1`, …
+- `final.ferx` — the selected model with its own estimates written into the
+  initial values (Pharmpy's `update_inits`), so it refits as the search left
+  it.
+- `final-fit.yaml` — the selected model's estimates, from the CLI.
+- one journalled runner directory per step (`input`, `base`, `iteration-1`,
+  `screen-1`, …), so `--resume` picks an interrupted search up where it
+  stopped.
+
+## Compared with Pharmpy
+
+The candidate set, the inits, the order, the `power`/`combined` pairing, the
+retirement of a selected family, the `df = 1` cutoff, the final comparison
+against the input and the base, and the CWRES screening models are Pharmpy
+2.0's `ruvsearch`, read off its source. The deviations:
+
+- **The full-refit path.** Pharmpy has only the CWRES pre-screen. ferx fits
+  every candidate to the data by default and offers the pre-screen as
+  `cwres_prescreen = true`.
+- **The additive twin.** When `power` or `combined` is picked, Pharmpy also
+  fits an *additive* model beside it and ranks the three. ferx does not — the
+  additive model is `combined` with its proportional σ on the floor, which
+  the strictness gate reports on its own row.
+- **The time-varying start.** `1.0` on the full refit, Pharmpy's `0.1` on
+  the CWRES screen (see above).
+- **`IIV_on_RUV` on a non-interaction method** is not tested and noted,
+  rather than fitted under a method that would reject it.
+- **Strictness** is the `[strictness]` gate every search here applies, not
+  Pharmpy's `strictness` string.
+
+### The anchor
+
+`crates/ferx-tools/tests/pharmpy/ruvsearch_anchor/` holds a 40-subject oral
+dataset simulated with a power residual (`SD = 0.25·f^0.5`), a
+proportional-error input, and Pharmpy 2.2.0's run on it through NONMEM 7.5.1
+(`pharmpy_ruvsearch.json`); `tests/ruvsearch_pharmpy_anchor.rs` replays ferx
+on the same input (slow-gated). Both engines fit the input to OFV 503.002.
+Iteration 1 of the CWRES screen:
+
+| candidate | Pharmpy dOFV | ferx dOFV |
+|---|---:|---:|
+| `IIV_on_RUV` | 9.40 | 10.00 |
+| `combined` | **67.38** | **67.96** |
+| `power` | 66.40 | 66.98 |
+| `time_varying1` | 0.00 | 0.00 |
+| `time_varying2` | 9.96 | 9.87 |
+| `time_varying3` | 33.02 | 32.89 |
+
+Both pick `combined`, both refit it to OFV **402.894**, both find nothing in
+iteration 2 (largest screened dOFV 2.35 vs 2.50), both end on `combined`. The
+full-refit path fits every candidate: ferx's `combined` lands on the same
+402.894, and `power` on 401.688 — the data's generating form, preferred by
+1.2 OFV — so the full refit selects `power` where the screen selects
+`combined`, within the pair Pharmpy never separates.
+
+The `power` form itself is anchored against NONMEM 7.5 on
+the [error-model page](../model-file/error-model.qmd#power).
+
+## From Rust
+
+```rust
+use ferx_tools::ruvsearch::{run_ruvsearch, RuvsearchRun};
+use ferx_tools::search::SearchConfig;
+
+let config = SearchConfig::load("warfarin.ferxsearch")?;
+let base = config.load_base()?;
+let result = run_ruvsearch(&config, &base, RuvsearchRun::default())?;
+println!("{}", ferx_tools::ruvsearch::render_summary(&result));
+for feature in &result.features {
+    println!("added {}", feature.label());
+}
+```
+
+`RuvsearchRun` takes the directory, a thread override, a cancel flag and a
+progress callback; every field is optional.

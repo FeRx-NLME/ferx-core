@@ -155,6 +155,10 @@ struct Section {
 impl ModelsearchOptions {
     /// Read `[modelsearch]` and `[rank]` off a loaded file.
     pub fn from_config(config: &SearchConfig) -> Result<Self, String> {
+        config.require_space(
+            "modelsearch",
+            "ABSORPTION / PERIPHERALS / TRANSITS / LAGTIME statements",
+        )?;
         let section = match config.tools.get("modelsearch") {
             Some(table) => table
                 .clone()

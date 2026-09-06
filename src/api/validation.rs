@@ -395,6 +395,7 @@ pub(crate) fn check_residual_magnitude(
         return Vec::new();
     }
     let theta = &model.default_params.theta;
+    let n_sigma = model.default_params.sigma.values.len();
     for subj in &population.subjects {
         let Some(mult) = model.ruv_obs_mult(subj, theta) else {
             continue;
@@ -405,6 +406,26 @@ pub(crate) fn check_residual_magnitude(
                     continue;
                 }
                 let time = subj.obs_times.get(j).copied().unwrap_or(f64::NAN);
+                // The upper half of a row is the `power(...)` exponent per slot
+                // (#1182, `RuvMagnitude::eval_obs`); a non-positive exponent is
+                // a different mistake from a vanishing multiplier.
+                if n_sigma > 0 && row.len() == 2 * n_sigma && k >= n_sigma {
+                    return vec![Diagnostic::error(
+                        "E_RUV_MAGNITUDE_NONPOSITIVE",
+                        format!(
+                            "[error_model] the power exponent for sigma slot {} evaluates to {m} \
+                             at subject `{}`, TIME {time} — it must be strictly positive and \
+                             finite. `power(SIGMA, P)` raises the prediction to `P`; a zero or \
+                             negative exponent turns the residual SD into a constant or a \
+                             reciprocal of the prediction, which is not the model the form \
+                             declares. Start `P` above zero (Pharmpy bounds it below at 0.01), \
+                             or check the covariates its expression references.",
+                            k - n_sigma,
+                            subj.id
+                        ),
+                    )
+                    .with_block("error_model")];
+                }
                 return vec![Diagnostic::error(
                     "E_RUV_MAGNITUDE_NONPOSITIVE",
                     format!(

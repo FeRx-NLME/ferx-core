@@ -2215,9 +2215,30 @@ pub fn foce_population_nll(
     per_subj.iter().sum()
 }
 
-/// Compute CWRES (Conditional Weighted Residuals) for a subject.
-/// Censored observations get `NaN` since a weighted Gaussian residual is undefined
-/// when the observed value is censored.
+/// Compute CWRES (Conditional Weighted Residuals) for a subject — Hooker et
+/// al. (2007), NONMEM's `CWRES` table item.
+///
+/// The residual is `y − f0` with `f0 = f(η̂) − H·η̂`, the FOCE-linearized
+/// population prediction, and its covariance is `R̃ = H·Ω·Hᵀ + R`. The
+/// returned vector is the **decorrelated** residual `R̃^{-1/2}(y − f0)`, with
+/// `R̃^{-1/2}` the *symmetric* inverse square root (eigendecomposition), not
+/// `(y − f0)ⱼ / √R̃ⱼⱼ` and not the Cholesky factor. `R` is evaluated at
+/// `r_preds` when given — `IPRED` under an interaction fit, the population
+/// prediction `f(η = 0)` under FOCE without interaction, the points the
+/// respective marginals use — and at `f0` otherwise.
+///
+/// That recipe was pinned against NONMEM 7.5.1 on a 40-subject oral dataset
+/// with sizeable η (#1182): rebuilt from NONMEM's own tabled `G11..G31`,
+/// `ETA`, `IPRED` and `PRED`, the symmetric square root with `R` at `IPRED`
+/// reproduces its `CWRES` column to an RMS of 1e-4 (the table's rounding),
+/// where the marginal standardisation ferx used before was off by an RMS of
+/// 0.75 and a Cholesky decorrelation by 0.57 — differences large enough to
+/// change which residual-error form a CWRES-based screen (ruvsearch's) picks.
+/// A model with no η has `R̃` diagonal, so every recipe agrees there.
+///
+/// Censored observations get `NaN` since a weighted Gaussian residual is
+/// undefined when the observed value is censored; they are left out of the
+/// decorrelation.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_cwres(
     subject: &Subject,
@@ -2237,6 +2258,10 @@ pub fn compute_cwres(
     // the magnitude-aware OFV (the multiplier is f-independent, so the matrix
     // built at `ipred` applies unchanged at the SB-linearized `f0`).
     ruv_mult: Option<&[Vec<f64>]>,
+    // The predictions at which `R` is evaluated — `IPRED` under an interaction
+    // fit, `f(η = 0)` under FOCE — NONMEM's `CWRES`. `None` evaluates `R` at
+    // the linearized `f0`.
+    r_preds: Option<&[f64]>,
 ) -> Vec<f64> {
     let n_obs = subject.observations.len();
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
@@ -2250,10 +2275,11 @@ pub fn compute_cwres(
         .map(|(j, &ip)| ip - h_eta[j])
         .collect();
 
-    // R_tilde
+    // R_tilde, with R at the requested predictions when given (see above).
+    let r_eval: &[f64] = r_preds.unwrap_or(&f0);
     let mut r_matrix = crate::stats::residual_error::r_matrix_maybe_scaled(
         error_spec,
-        &f0,
+        r_eval,
         err_keys.as_ref(),
         subject,
         sigma_values,
@@ -2281,18 +2307,45 @@ pub fn compute_cwres(
     }
     let r_tilde = compute_r_tilde_with_r(h_matrix, &omega.matrix, &r_matrix);
 
-    // CWRES_j = (y_j - f0_j) / sqrt(R_tilde_jj), or NaN if censored.
-    (0..n_obs)
-        .map(|j| {
-            if subject.cens.get(j).copied().unwrap_or(0) != 0 {
-                f64::NAN
-            } else {
-                let resid = subject.observations[j] - f0[j];
-                let var = r_tilde[(j, j)].max(1e-12);
-                resid / var.sqrt()
-            }
-        })
-        .collect()
+    // CWRES = R̃^{-1/2} (y − f0) over the uncensored rows, with the symmetric
+    // inverse square root: R̃ = V·Λ·Vᵀ, R̃^{-1/2} = V·Λ^{-1/2}·Vᵀ. This is the
+    // decorrelation NONMEM's `CWRES` applies (see the doc comment); a Cholesky
+    // factor decorrelates too but yields a different vector, and the marginal
+    // `(y − f0)ⱼ / √R̃ⱼⱼ` a third — the three agree only when `H·Ω·Hᵀ` has no
+    // off-diagonals, i.e. with no η. Censored rows are left out of the system
+    // and reported as NaN; a non-positive eigenvalue (a hand-built pathological
+    // input) falls back to the marginal standardisation rather than panicking.
+    let live: Vec<usize> = (0..n_obs)
+        .filter(|&j| subject.cens.get(j).copied().unwrap_or(0) == 0)
+        .collect();
+    let mut out = vec![f64::NAN; n_obs];
+    if live.is_empty() {
+        return out;
+    }
+    let resid = DVector::from_iterator(
+        live.len(),
+        live.iter().map(|&j| subject.observations[j] - f0[j]),
+    );
+    let sub = r_tilde.select_rows(&live).select_columns(&live);
+    let eig = nalgebra::SymmetricEigen::new(sub);
+    if eig.eigenvalues.iter().all(|&l| l > 0.0 && l.is_finite()) {
+        let vt_r = eig.eigenvectors.transpose() * &resid;
+        let scaled = DVector::from_iterator(
+            live.len(),
+            vt_r.iter()
+                .zip(eig.eigenvalues.iter())
+                .map(|(v, l)| v / l.sqrt()),
+        );
+        let z = &eig.eigenvectors * scaled;
+        for (k, &j) in live.iter().enumerate() {
+            out[j] = z[k];
+        }
+    } else {
+        for (k, &j) in live.iter().enumerate() {
+            out[j] = resid[k] / r_tilde[(j, j)].max(1e-12).sqrt();
+        }
+    }
+    out
 }
 
 /// Group observation indices by occasion (preserving first-seen order of occasions).
@@ -3525,12 +3578,142 @@ mod tests {
             Some(&overrides),
             Some(0),
             None,
+            None,
         );
 
         let pk_expected = 1.0 / (sigma[0] * eta_hat[0].exp());
         let frem_expected = 1.0 / sigma[1];
         assert_relative_eq!(cwres[0], pk_expected, epsilon = 1e-12);
         assert_relative_eq!(cwres[1], frem_expected, epsilon = 1e-12);
+    }
+
+    /// #1182: CWRES is the *decorrelated* conditional weighted residual —
+    /// `R̃^{-1/2}(y − f0)` with the symmetric inverse square root — not each
+    /// residual over its own marginal SD. With a nonzero `H` the two differ;
+    /// the oracle is the defining identity `R̃^{1/2}·z = y − f0` (checked with
+    /// the matrix square root built independently here), plus the invariant
+    /// `zᵀz = rᵀR̃⁻¹r`. The covariance is built from `r_preds` when given.
+    #[test]
+    fn compute_cwres_decorrelates_with_the_symmetric_inverse_square_root() {
+        let subject = Subject {
+            id: "1".into(),
+            obs_times: vec![1.0, 2.0],
+            observations: vec![3.0, 5.0],
+            obs_cmts: vec![1, 1],
+            cens: vec![0, 0],
+            ..Default::default()
+        };
+        // ipred = f0 + H·η̂ with η̂ = 0.5 and H = [1, 2]ᵀ → f0 = (1, 2).
+        let ipreds = vec![1.5, 3.0];
+        let eta_hat = DVector::from_vec(vec![0.5]);
+        let h = DMatrix::from_column_slice(2, 1, &[1.0, 2.0]);
+        let omega = OmegaMatrix::from_diagonal(&[0.25], vec!["ETA".into()]);
+        let sigma = vec![0.5];
+        let spec = ErrorSpec::Single(ErrorModel::Additive);
+        let cwres = compute_cwres(
+            &subject,
+            &ipreds,
+            &eta_hat,
+            &h,
+            &omega,
+            &sigma,
+            &spec,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        );
+        // R̃ = H Ω Hᵀ + σ²I = [[0.5, 0.5], [0.5, 1.25]]; resid = (2, 3).
+        let r_tilde = DMatrix::from_row_slice(2, 2, &[0.5, 0.5, 0.5, 1.25]);
+        let resid = DVector::from_vec(vec![2.0, 3.0]);
+        let z = DVector::from_vec(cwres.clone());
+        // R̃^{1/2} via the eigendecomposition, independently of the function.
+        let eig = nalgebra::SymmetricEigen::new(r_tilde.clone());
+        let sqrt_l = DMatrix::from_diagonal(&eig.eigenvalues.map(f64::sqrt));
+        let r_half = &eig.eigenvectors * sqrt_l * eig.eigenvectors.transpose();
+        let back = r_half * &z;
+        assert_relative_eq!(back[0], resid[0], epsilon = 1e-12);
+        assert_relative_eq!(back[1], resid[1], epsilon = 1e-12);
+        let mahalanobis = (resid.transpose() * r_tilde.try_inverse().unwrap() * &resid)[(0, 0)];
+        assert_relative_eq!(z.dot(&z), mahalanobis, epsilon = 1e-12);
+        // Neither the marginal standardisation nor the Cholesky factor gives
+        // this vector: the marginal second row would be 3/√1.25, and the
+        // Cholesky first row 2/√0.5.
+        assert!((cwres[1] - 3.0 / 1.25f64.sqrt()).abs() > 0.1);
+        assert!((cwres[0] - 2.0 / 0.5f64.sqrt()).abs() > 0.1);
+
+        // A censored first row is NaN and leaves the second row standardised
+        // on its own: 3/√1.25.
+        let mut censored = subject.clone();
+        censored.cens = vec![1, 0];
+        let cw = compute_cwres(
+            &censored,
+            &ipreds,
+            &eta_hat,
+            &h,
+            &omega,
+            &sigma,
+            &spec,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(cw[0].is_nan());
+        assert_relative_eq!(cw[1], 3.0 / 1.25f64.sqrt(), epsilon = 1e-12);
+
+        // `r_preds` moves the point R is evaluated at: on a proportional model
+        // with a single row, CWRES = resid / √(HΩHᵀ + σ²·pred²).
+        let one = Subject {
+            id: "1".into(),
+            obs_times: vec![1.0],
+            observations: vec![3.0],
+            obs_cmts: vec![1],
+            cens: vec![0],
+            ..Default::default()
+        };
+        let prop = ErrorSpec::Single(ErrorModel::Proportional);
+        let h1 = DMatrix::from_column_slice(1, 1, &[1.0]);
+        let cw = compute_cwres(
+            &one,
+            &ipreds[..1],
+            &eta_hat,
+            &h1,
+            &omega,
+            &sigma,
+            &prop,
+            &[],
+            None,
+            None,
+            None,
+            Some(&[4.0]),
+        );
+        assert_relative_eq!(
+            cw[0],
+            2.0 / (0.25_f64 + 0.25 * 16.0).sqrt(),
+            epsilon = 1e-12
+        );
+        let cw_f0 = compute_cwres(
+            &one,
+            &ipreds[..1],
+            &eta_hat,
+            &h1,
+            &omega,
+            &sigma,
+            &prop,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_relative_eq!(
+            cw_f0[0],
+            2.0 / (0.25_f64 + 0.25 * 1.0).sqrt(),
+            epsilon = 1e-12
+        );
     }
 
     #[test]
@@ -3580,6 +3763,7 @@ mod tests {
             None,
             None,
             Some(&mult),
+            None,
         );
         assert_relative_eq!(cwres[0], 2.0 / (1.0 * 2.0), epsilon = 1e-12);
         assert_relative_eq!(cwres[1], 2.0 / (3.0 * 2.0), epsilon = 1e-12);

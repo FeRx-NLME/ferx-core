@@ -55,8 +55,8 @@ mod spec;
 mod tests;
 
 pub use spec::{
-    ErrorForm, ErrorSpecText, IivForm, ModelEdit, NewParameter, Relation, RelationTheta, SigmaDecl,
-    StructuralSpec,
+    ErrorForm, ErrorSpecText, EtaDecl, IivForm, ModelEdit, NewParameter, Relation, RelationTheta,
+    SigmaDecl, StructuralSpec, ThetaDecl, TimeVaryingDecl,
 };
 
 use std::collections::HashSet;

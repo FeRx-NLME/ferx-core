@@ -20,6 +20,35 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **`ferx ruvsearch` — residual-error model search (Pharmpy `ruvsearch`) in `ferx-tools`
+  (#1182).** From a `.ferxsearch` file with no `[space]` — the candidates are the four
+  residual-error forms: IIV on the residual error, a `power` form, a `combined` form and a
+  time-varying magnitude cut at the `i / groups` time-after-dose quantiles — each added to the
+  parent on its own, fitted in parallel with retries and the strictness gate, and kept when the
+  likelihood-ratio test at `[ruvsearch] p_value` says so; an input that is not plain
+  proportional is first refitted as one, and the final model must beat the input by the
+  `df = 1` cutoff or the input is returned, as in Pharmpy. `cwres_prescreen = true` is
+  Pharmpy's own path: the candidates are fitted to the parent's CWRES first and only the
+  winner is refitted. The step table shows every model's ΔOFV, p-value, convergence status
+  and decision; `models/<id>.ferx` holds every candidate as fitted. Anchored against Pharmpy
+  2.2.0's own run through NONMEM 7.5.1 on a simulated power-residual dataset: the same CWRES
+  screening dOFVs (to 0.6), the same pick, the same refit OFV, the same final model.
+- **`power(σ, P)` residual-error form (#1182).** `DV ~ power(PROP_ERR, RUV_POW)` is NONMEM's
+  `Y = F + EPS(1) * F**THETA(n)`: the proportional loading raised to an estimated θ, so the
+  variance is `σ²·|f|^{2P}` and `P = 1` is the proportional model. Every estimator, IWRES,
+  CWRES and simulation carry the exponent; the analytic FOCE/FOCEI gradients carry `∂R/∂P`
+  (pinned against finite differences); the Gauss-Newton closed forms route it to their
+  finite-difference fallback. Anchored against NONMEM 7.5 on the warfarin dataset.
+- **`TAD` in residual-magnitude expressions (#1182).** A `[error_model]` magnitude may read
+  `TAD`, the data-derived time after the last dose at or before the record (steady-state
+  aware, no lag time), beside `TIME` — `proportional(PROP_ERR * (if (TAD < 12.0) RUV_TV else 1.0))`
+  is Pharmpy's time-varying residual error.
+- **`ferx-core::edit` authors and reads back the residual-error features (#1182).**
+  `ErrorSpecText` gained `exponent`, `iiv_on_ruv` and `time_varying` (built with
+  `ErrorSpecText::new` and the `with_*` builders; the struct is now `#[non_exhaustive]`),
+  `ErrorForm::Power`, and `ErrorSpecText::read`, which turns a model's `[error_model]` back
+  into authoring form and refuses one it cannot represent. `SetErrorModel` declares the θ / ω
+  a feature needs and prunes the ones the previous error model alone referenced.
 - **`ferx modelsearch` — structural PK model search (Pharmpy `modelsearch`) in `ferx-tools`
   (#1181).** The space is the `ABSORPTION`, `PERIPHERALS`, `TRANSITS` and `LAGTIME` statements
   of a `.ferxsearch` file; every candidate is one analytic `pk` template swap from its parent,
@@ -43,6 +72,16 @@ section of the SDLC for the versioning policy).
   to read. No effect on `.ferx` models, the CLI or the R wrapper, none of which constructs it.
 
 ### Fixed
+- **`CWRES` is now NONMEM's `CWRES` (#1182).** It was each residual divided by its own
+  marginal SD, `(y − f0) / √R̃ⱼⱼ`. NONMEM's conditional weighted residual (Hooker et al. 2007)
+  is the *decorrelated* vector `R̃^{-1/2}(y − f0)` with the symmetric inverse square root of
+  `R̃ = HΩHᵀ + R`, `R` evaluated at `IPRED` under an interaction fit and at the population
+  prediction under FOCE — rebuilt from NONMEM's own tabled `G`, `ETA`, `IPRED` and `PRED` on a
+  40-subject oral dataset with sizeable η, that recipe reproduces its column to an RMS of 1e-4,
+  where the old column was off by 0.75 while `IPRED` agreed to 1e-4. The two agree only with
+  no η, so a model without random effects is unchanged (`CWRES = IWRES` there, as before);
+  censored rows stay `NaN` and are left out of the decorrelation. A CWRES-based screen such
+  as ruvsearch's pre-screen picks differently on the old column, which is how this surfaced.
 - **A search child seeded from a parent whose ω block is near-singular can start (#1256).** On
   the vancomycin base the (CL, V1, V2) block's Cholesky diagonal for `ETA_V2` sat on the
   optimizer's rail (6e-6) through its correlations, every declared variance being ordinary; the

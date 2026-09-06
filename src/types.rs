@@ -1094,6 +1094,82 @@ impl Subject {
             .unwrap_or_else(|| self.obs_times.get(j).copied().unwrap_or(0.0))
     }
 
+    /// Time after dose at observation `j`, from the data alone — no lag time,
+    /// steady-state aware (a `SS` dose with an interval contributes the most
+    /// recent implied dose time) — with **Pharmpy's grouping of a dose and an
+    /// observation at the same time** (`get_doseid`, which
+    /// `add_time_after_dose` builds on): an observation at exactly the time of
+    /// a non-`SS` dose belongs to the *previous* dose, whichever side of the
+    /// dose record it sits on, so a trough drawn at the dosing time reads
+    /// `TAD = II` rather than `0`; an observation at the time of an `SS` dose
+    /// stays with that dose (`TAD = 0`), as does one at the time of the first
+    /// dose, which has no previous dose to belong to. This is what the `TAD`
+    /// built-in of an `[error_model]` magnitude expression reads and what
+    /// `ruvsearch` cuts its time-varying candidates on (#1182). `NaN` when no
+    /// dose is at or before the observation (a pre-dose sample).
+    ///
+    /// It is deliberately **not** the sdtab `TAD` column's convention. That
+    /// column follows NONMEM's record order — the dose is applied first at a
+    /// shared time, so the same trough reads `0` — which is also how ferx's
+    /// predictor breaks the tie; see `time_after_dose_at_or_before`.
+    pub fn time_after_dose(&self, j: usize) -> f64 {
+        let strict = self.data_tad(j, false);
+        if strict.is_finite() {
+            strict
+        } else {
+            // Pharmpy's first-dose exception: nothing precedes the dose, so an
+            // observation at its time keeps it (`TAD = 0`).
+            self.data_tad(j, true)
+        }
+    }
+
+    /// The sdtab `TAD` fallback: time after the last dose **at or before**
+    /// observation `j`, NONMEM's record-order convention (a dose record ahead
+    /// of an observation at the same `TIME` is the most recent dose, `TAD =
+    /// 0`) and the same tie rule as the lag-aware `tad_at_time` in
+    /// `api/output_columns.rs`. Steady-state aware, no lag time, `NaN` before
+    /// the first dose. See [`Self::time_after_dose`] for why the `TAD`
+    /// built-in reads the same-time trough differently.
+    pub(crate) fn time_after_dose_at_or_before(&self, j: usize) -> f64 {
+        self.data_tad(j, true)
+    }
+
+    /// The one data-TAD kernel behind both conventions. `same_time_counts`
+    /// decides whether a non-`SS` dose at exactly the observation's time is
+    /// the most recent dose (`true`, NONMEM record order) or is skipped so the
+    /// observation reads from the dose before it (`false`, Pharmpy's
+    /// `get_doseid`). An `SS` dose at the observation's time counts under both
+    /// (Pharmpy: "no swap for SS dosing").
+    fn data_tad(&self, j: usize, same_time_counts: bool) -> f64 {
+        let Some(&obs_t) = self.obs_times.get(j) else {
+            return f64::NAN;
+        };
+        let last_eff = self
+            .doses
+            .iter()
+            .filter(|d| {
+                if same_time_counts || d.ss {
+                    d.time <= obs_t + 1e-12
+                } else {
+                    d.time < obs_t - 1e-12
+                }
+            })
+            .map(|d| {
+                if d.ss && d.ii > 0.0 {
+                    let elapsed = obs_t - d.time;
+                    obs_t - elapsed.rem_euclid(d.ii)
+                } else {
+                    d.time
+                }
+            })
+            .fold(f64::NEG_INFINITY, f64::max);
+        if last_eff.is_finite() {
+            obs_t - last_eff
+        } else {
+            f64::NAN
+        }
+    }
+
     /// Covariate snapshot at EVID=2 row index `m`. Same fallback as
     /// the others — for time-constant covariates this returns the
     /// subject-static map.
@@ -2411,15 +2487,21 @@ impl ErrorSpec {
 /// Per-observation multiplier for one flat sigma slot (#484).
 ///
 /// Evaluates the residual-error *magnitude factor* for a single observation
-/// from `(theta, observation-covariate map, TIME)`. The factor multiplies that
-/// sigma's loading, so the slot's variance contribution becomes
+/// from `(theta, observation-covariate map, TIME, TAD)`. The factor multiplies
+/// that sigma's loading, so the slot's variance contribution becomes
 /// `(loading · factor · sigma)²`. Inputs are deliberately limited to
 /// quantities that do **not** depend on the random effects (η) or the
 /// prediction beyond the built-in proportional loading, so the multiplier is
 /// constant across the inner EBE loop for a fixed θ. The covariate map must
 /// supply any model covariates the expression names; `TIME` is provided by the
-/// parser's event-time built-in.
-pub type RuvMagFn = Box<dyn Fn(&[f64], &HashMap<String, f64>, f64) -> f64 + Send + Sync>;
+/// parser's event-time built-in and `TAD` — the data-file time after dose with
+/// Pharmpy's same-time grouping, [`Subject::time_after_dose`] (#1182) — is
+/// the fourth argument.
+///
+/// The same signature serves a `power(...)` exponent program
+/// ([`RuvMagnitude::per_sigma_exponent`]): the closure then returns the
+/// exponent the slot's proportional loading is raised to, not a multiplier.
+pub type RuvMagFn = Box<dyn Fn(&[f64], &HashMap<String, f64>, f64, f64) -> f64 + Send + Sync>;
 
 /// Closure signature for a kappa's `weight = <expr>` (#1031): `(theta,
 /// covariates, time) -> weight`. Same inputs as [`RuvMagFn`] and for the same
@@ -2480,6 +2562,27 @@ pub struct RuvMagnitude {
     /// closure in `per_sigma` still serves every value-only caller (inner loop,
     /// IWRES, simulation).
     pub per_sigma_deriv: Vec<Option<crate::parser::model_parser::RuvMagDerivProgram>>,
+    /// The `power(σ, P)` residual form (#1182): one optional **exponent**
+    /// program per flat sigma slot, parallel to `per_sigma`. `Some(p)` on a
+    /// proportional-type slot raises that slot's loading from `f` to
+    /// `sign(f)·|f|^p` — `Y = F + EPS · F**THETA` in NONMEM — so the variance
+    /// contribution becomes `(m · |f|^p · σ)²`; `p ≡ 1` is exactly the
+    /// proportional loading. An additive slot ignores its exponent (its
+    /// loading is the constant `1`). Empty, or all `None`, when the model has
+    /// no power form.
+    ///
+    /// The exponent rides the same per-observation channel as the multiplier:
+    /// when any exponent slot is active, [`eval_obs`](Self::eval_obs) returns
+    /// a row of length `2·per_sigma.len()` — multipliers in the lower half,
+    /// exponents in the upper half — and every `_scaled` variance function in
+    /// `stats/residual_error.rs` reads the exponent of slot `k` at
+    /// `row[n_sigma + k]`. That layout, not a second matrix, is what lets the
+    /// exponent reach every estimator through the plumbing the magnitude
+    /// already has (see `residual_error::slot_exponent`).
+    pub per_sigma_exponent: Vec<Option<RuvMagFn>>,
+    /// Parallel to `per_sigma_exponent`: the `Dual1` θ-derivative program of each
+    /// exponent, so the analytic outer θ gradient carries `∂R/∂p · ∂p/∂θ`.
+    pub per_sigma_exponent_deriv: Vec<Option<crate::parser::model_parser::RuvMagDerivProgram>>,
 }
 
 impl std::fmt::Debug for RuvMagnitude {
@@ -2489,53 +2592,96 @@ impl std::fmt::Debug for RuvMagnitude {
             .iter()
             .map(|s| if s.is_some() { "expr" } else { "bare" })
             .collect();
-        write!(f, "RuvMagnitude({:?})", slots)
+        if self.has_exponent() {
+            let exps: Vec<&str> = self
+                .per_sigma_exponent
+                .iter()
+                .map(|s| if s.is_some() { "power" } else { "-" })
+                .collect();
+            write!(f, "RuvMagnitude({:?}, exponent {:?})", slots, exps)
+        } else {
+            write!(f, "RuvMagnitude({:?})", slots)
+        }
     }
 }
 
 impl RuvMagnitude {
-    /// Whether any slot carries a non-trivial multiplier. A `RuvMagnitude` whose
-    /// slots are all `None` behaves identically to no custom magnitude.
+    /// Whether any slot carries a non-trivial multiplier or a power exponent. A
+    /// `RuvMagnitude` whose slots are all `None` behaves identically to no
+    /// custom magnitude.
     pub fn is_active(&self) -> bool {
-        self.per_sigma.iter().any(|s| s.is_some())
+        self.per_sigma.iter().any(|s| s.is_some()) || self.has_exponent()
+    }
+
+    /// Whether any slot carries a `power(...)` exponent (#1182). When true,
+    /// [`eval_obs`](Self::eval_obs) rows carry the exponent half.
+    pub fn has_exponent(&self) -> bool {
+        self.per_sigma_exponent.iter().any(|s| s.is_some())
     }
 
     /// Per-sigma multiplier vector for one observation. Slot `k` evaluates its
     /// program; bare slots return `1.0`. The returned vector has length
-    /// `per_sigma.len()`.
+    /// `per_sigma.len()` — or `2·per_sigma.len()` when a power exponent is
+    /// active, the exponents (`1.0` for a slot without one) following the
+    /// multipliers. `tad` is the record's time after dose
+    /// ([`Subject::time_after_dose`]).
     pub fn eval_obs(
         &self,
         theta: &[f64],
         obs_covariates: &HashMap<String, f64>,
         time: f64,
+        tad: f64,
     ) -> Vec<f64> {
-        self.per_sigma
+        let mut out: Vec<f64> = self
+            .per_sigma
             .iter()
             .map(|slot| match slot {
-                Some(f) => f(theta, obs_covariates, time),
+                Some(f) => f(theta, obs_covariates, time, tad),
                 None => 1.0,
             })
-            .collect()
+            .collect();
+        if self.has_exponent() {
+            let n = self.per_sigma.len();
+            out.extend((0..n).map(|k| match self.per_sigma_exponent.get(k) {
+                Some(Some(f)) => f(theta, obs_covariates, time, tad),
+                _ => 1.0,
+            }));
+        }
+        out
     }
 
     /// Per-sigma `∂(multiplier)/∂θ` vector for one observation (#576/#486). Slot
     /// `k` evaluates its `Dual1` program's gradient; a bare slot (multiplier ≡ 1)
-    /// contributes an all-zero row. `None` when any active slot's program
-    /// declines (θ-axis count mismatch / beyond `MAX_RUV_MAG_AXES`) — the caller
-    /// then falls back to FD for the magnitude's direct-θ gradient channel.
+    /// contributes an all-zero row. With a power exponent active the result has
+    /// the same two-half layout as [`eval_obs`](Self::eval_obs): row `n_sigma + k`
+    /// is `∂p_k/∂θ`. `None` when any active slot's program declines (θ-axis
+    /// count mismatch / beyond `MAX_RUV_MAG_AXES`) — the caller then falls back
+    /// to FD for the magnitude's direct-θ gradient channel.
     pub fn eval_obs_theta_grad(
         &self,
         theta: &[f64],
         obs_covariates: &HashMap<String, f64>,
         time: f64,
+        tad: f64,
     ) -> Option<Vec<Vec<f64>>> {
-        self.per_sigma_deriv
+        let mut out: Vec<Vec<f64>> = self
+            .per_sigma_deriv
             .iter()
             .map(|slot| match slot {
-                Some(p) => p.theta_grad(theta, obs_covariates, time),
+                Some(p) => p.theta_grad(theta, obs_covariates, time, tad),
                 None => Some(vec![0.0; theta.len()]),
             })
-            .collect()
+            .collect::<Option<_>>()?;
+        if self.has_exponent() {
+            let n = self.per_sigma.len();
+            for k in 0..n {
+                out.push(match self.per_sigma_exponent_deriv.get(k) {
+                    Some(Some(p)) => p.theta_grad(theta, obs_covariates, time, tad)?,
+                    _ => vec![0.0; theta.len()],
+                });
+            }
+        }
+        Some(out)
     }
 }
 
@@ -4342,7 +4488,12 @@ impl CompiledModel {
         let n = subject.observations.len();
         let mut out = Vec::with_capacity(n);
         for j in 0..n {
-            out.push(rm.eval_obs(theta, subject.obs_cov(j), subject.readout_time(j)));
+            out.push(rm.eval_obs(
+                theta,
+                subject.obs_cov(j),
+                subject.readout_time(j),
+                subject.time_after_dose(j),
+            ));
         }
         Some(out)
     }
@@ -4369,7 +4520,12 @@ impl CompiledModel {
         let n = subject.observations.len();
         let mut out = Vec::with_capacity(n);
         for j in 0..n {
-            out.push(rm.eval_obs_theta_grad(theta, subject.obs_cov(j), subject.readout_time(j))?);
+            out.push(rm.eval_obs_theta_grad(
+                theta,
+                subject.obs_cov(j),
+                subject.readout_time(j),
+                subject.time_after_dose(j),
+            )?);
         }
         Some(out)
     }
@@ -4458,6 +4614,18 @@ impl CompiledModel {
         self.ruv_magnitude
             .as_ref()
             .is_some_and(|m| m.is_active() && m.theta_dependent)
+    }
+
+    /// Whether the `[error_model]` is a `power(...)` form (#1182): a
+    /// proportional-type slot raised to an exponent
+    /// ([`RuvMagnitude::per_sigma_exponent`]). The Gauss-Newton closed forms
+    /// build `∂R/∂log σ` from `f²` and route such a subject to their
+    /// magnitude-aware finite-difference fallback instead, whether or not the
+    /// exponent names a θ.
+    pub fn has_ruv_exponent(&self) -> bool {
+        self.ruv_magnitude
+            .as_ref()
+            .is_some_and(|m| m.has_exponent())
     }
 
     /// Multiplicative factor applied to the residual *variance* for a subject

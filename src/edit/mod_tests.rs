@@ -1102,10 +1102,10 @@ fn set_error_model_swaps_the_statement_and_reconciles_the_sigmas() {
     let mut text = base();
     apply(
         &mut text,
-        ModelEdit::SetErrorModel(ErrorSpecText {
-            endpoint: "DV".into(),
-            form: ErrorForm::Combined,
-            sigmas: vec![
+        ModelEdit::SetErrorModel(ErrorSpecText::new(
+            "DV",
+            ErrorForm::Combined,
+            vec![
                 SigmaDecl {
                     name: "ADD_ERR".into(),
                     init: 0.1,
@@ -1117,7 +1117,7 @@ fn set_error_model_swaps_the_statement_and_reconciles_the_sigmas() {
                     as_sd: true,
                 },
             ],
-        }),
+        )),
     );
     assert_eq!(
         text.block_lines("error_model"),
@@ -1144,15 +1144,15 @@ fn set_error_model_drops_a_sigma_nothing_references_any_more() {
     let mut text = base();
     apply(
         &mut text,
-        ModelEdit::SetErrorModel(ErrorSpecText {
-            endpoint: "DV".into(),
-            form: ErrorForm::Additive,
-            sigmas: vec![SigmaDecl {
+        ModelEdit::SetErrorModel(ErrorSpecText::new(
+            "DV",
+            ErrorForm::Additive,
+            vec![SigmaDecl {
                 name: "ADD_ERR".into(),
                 init: 0.5,
                 as_sd: true,
             }],
-        }),
+        )),
     );
     assert!(!text.render().contains("PROP_ERR"), "{}", text.render());
 }
@@ -1165,15 +1165,15 @@ fn set_error_model_refuses_a_per_cmt_block() {
     );
     let err = ModelText::parse(&src)
         .unwrap()
-        .apply(ModelEdit::SetErrorModel(ErrorSpecText {
-            endpoint: "DV".into(),
-            form: ErrorForm::Additive,
-            sigmas: vec![SigmaDecl {
+        .apply(ModelEdit::SetErrorModel(ErrorSpecText::new(
+            "DV",
+            ErrorForm::Additive,
+            vec![SigmaDecl {
                 name: "ADD_ERR".into(),
                 init: 0.5,
                 as_sd: true,
             }],
-        }))
+        )))
         .unwrap_err();
     assert!(err.contains("per-CMT"), "{err}");
 }
@@ -1181,15 +1181,15 @@ fn set_error_model_refuses_a_per_cmt_block() {
 #[test]
 fn set_error_model_checks_the_sigma_count() {
     let err = base()
-        .apply(ModelEdit::SetErrorModel(ErrorSpecText {
-            endpoint: "DV".into(),
-            form: ErrorForm::Combined,
-            sigmas: vec![SigmaDecl {
+        .apply(ModelEdit::SetErrorModel(ErrorSpecText::new(
+            "DV",
+            ErrorForm::Combined,
+            vec![SigmaDecl {
                 name: "ADD_ERR".into(),
                 init: 0.5,
                 as_sd: true,
             }],
-        }))
+        )))
         .unwrap_err();
     assert!(err.contains("takes 2 sigma(s), 1 given"), "{err}");
 }
@@ -1205,17 +1205,250 @@ fn set_error_model_refuses_a_block_sigma() {
     );
     let err = ModelText::parse(&src)
         .unwrap()
-        .apply(ModelEdit::SetErrorModel(ErrorSpecText {
-            endpoint: "DV".into(),
-            form: ErrorForm::Additive,
-            sigmas: vec![SigmaDecl {
+        .apply(ModelEdit::SetErrorModel(ErrorSpecText::new(
+            "DV",
+            ErrorForm::Additive,
+            vec![SigmaDecl {
                 name: "ADD_ERR".into(),
                 init: 0.5,
                 as_sd: true,
             }],
-        }))
+        )))
         .unwrap_err();
     assert!(err.contains("block_sigma"), "{err}");
+}
+
+// ── SetErrorModel: the #1182 residual-error features ────────────────────────
+
+fn sd(name: &str, init: f64) -> SigmaDecl {
+    SigmaDecl {
+        name: name.into(),
+        init,
+        as_sd: true,
+    }
+}
+
+#[test]
+fn set_error_model_power_writes_the_statement_and_declares_the_exponent() {
+    let mut text = base();
+    apply(
+        &mut text,
+        ModelEdit::SetErrorModel(
+            ErrorSpecText::new("DV", ErrorForm::Power, vec![sd("PROP_ERR", 0.02)])
+                .with_exponent(ThetaDecl::new("RUV_POW", 1.0, 0.01, 10.0)),
+        ),
+    );
+    assert_eq!(
+        text.block_lines("error_model"),
+        vec!["DV ~ power(PROP_ERR, RUV_POW)"]
+    );
+    let params = text.block_lines("parameters");
+    assert!(
+        params.contains(&"theta RUV_POW(1.0, 0.01, 10.0)".to_string()),
+        "{params:?}"
+    );
+    // The σ the model already had keeps its own line.
+    assert!(params.contains(&"sigma PROP_ERR ~ 0.02 (sd)".to_string()));
+    // Applying the edit again leaves the file unchanged: no duplicate θ.
+    let before = text.render();
+    apply(
+        &mut text,
+        ModelEdit::SetErrorModel(
+            ErrorSpecText::new("DV", ErrorForm::Power, vec![sd("PROP_ERR", 0.02)])
+                .with_exponent(ThetaDecl::new("RUV_POW", 1.0, 0.01, 10.0)),
+        ),
+    );
+    assert_eq!(text.render(), before);
+}
+
+#[test]
+fn set_error_model_back_to_proportional_prunes_the_exponent_theta() {
+    let mut text = base();
+    apply(
+        &mut text,
+        ModelEdit::SetErrorModel(
+            ErrorSpecText::new("DV", ErrorForm::Power, vec![sd("PROP_ERR", 0.02)])
+                .with_exponent(ThetaDecl::new("RUV_POW", 1.0, 0.01, 10.0)),
+        ),
+    );
+    apply(
+        &mut text,
+        ModelEdit::SetErrorModel(ErrorSpecText::new(
+            "DV",
+            ErrorForm::Proportional,
+            vec![sd("PROP_ERR", 0.02)],
+        )),
+    );
+    assert_eq!(
+        text.render(),
+        BASE,
+        "power → proportional must restore the base"
+    );
+}
+
+#[test]
+fn set_error_model_adds_and_removes_iiv_on_ruv() {
+    let mut text = base();
+    apply(
+        &mut text,
+        ModelEdit::SetErrorModel(
+            ErrorSpecText::new("DV", ErrorForm::Proportional, vec![sd("PROP_ERR", 0.02)])
+                .with_iiv_on_ruv(EtaDecl::new("ETA_RUV", 0.09)),
+        ),
+    );
+    assert_eq!(
+        text.block_lines("error_model"),
+        vec!["DV ~ proportional(PROP_ERR)", "iiv_on_ruv = ETA_RUV"]
+    );
+    assert!(
+        text.block_lines("parameters")
+            .contains(&"omega ETA_RUV ~ 0.09".to_string()),
+        "{:?}",
+        text.block_lines("parameters")
+    );
+    // Changing the form keeps the η line and rewrites the statement.
+    apply(
+        &mut text,
+        ModelEdit::SetErrorModel(
+            ErrorSpecText::new(
+                "DV",
+                ErrorForm::Combined,
+                vec![sd("PROP_ERR", 0.02), sd("ADD_ERR", 0.5)],
+            )
+            .with_iiv_on_ruv(EtaDecl::new("ETA_RUV", 0.09)),
+        ),
+    );
+    assert_eq!(
+        text.block_lines("error_model"),
+        vec!["DV ~ combined(PROP_ERR, ADD_ERR)", "iiv_on_ruv = ETA_RUV"]
+    );
+    // Dropping it removes both the line and the ω nothing else uses.
+    apply(
+        &mut text,
+        ModelEdit::SetErrorModel(ErrorSpecText::new(
+            "DV",
+            ErrorForm::Proportional,
+            vec![sd("PROP_ERR", 0.02)],
+        )),
+    );
+    assert_eq!(text.render(), BASE);
+}
+
+#[test]
+fn set_error_model_time_varying_writes_the_canonical_magnitude_on_every_sigma() {
+    let mut text = base();
+    apply(
+        &mut text,
+        ModelEdit::SetErrorModel(
+            ErrorSpecText::new(
+                "DV",
+                ErrorForm::Combined,
+                vec![sd("PROP_ERR", 0.02), sd("ADD_ERR", 0.5)],
+            )
+            .with_time_varying(TimeVaryingDecl::new(
+                12.0,
+                ThetaDecl::new("RUV_TV", 1.0, 0.01, 10.0),
+            )),
+        ),
+    );
+    assert_eq!(
+        text.block_lines("error_model"),
+        vec![
+            "DV ~ combined(PROP_ERR * (if (TAD < 12.0) RUV_TV else 1.0), ADD_ERR * (if (TAD < \
+             12.0) RUV_TV else 1.0))"
+        ]
+    );
+    assert!(text
+        .block_lines("parameters")
+        .contains(&"theta RUV_TV(1.0, 0.01, 10.0)".to_string()));
+}
+
+#[test]
+fn set_error_model_read_round_trips_every_feature() {
+    let mut text = base();
+    let spec = ErrorSpecText::new("DV", ErrorForm::Power, vec![sd("PROP_ERR", 0.02)])
+        .with_exponent(ThetaDecl::new("RUV_POW", 1.2, 0.01, 10.0))
+        .with_iiv_on_ruv(EtaDecl::new("ETA_RUV", 0.09))
+        .with_time_varying(TimeVaryingDecl::new(
+            6.5,
+            ThetaDecl::new("RUV_TV", 1.0, 0.01, 10.0),
+        ));
+    apply(&mut text, ModelEdit::SetErrorModel(spec.clone()));
+    assert_eq!(
+        text.block_lines("error_model"),
+        vec![
+            "DV ~ power(PROP_ERR * (if (TAD < 6.5) RUV_TV else 1.0), RUV_POW)",
+            "iiv_on_ruv = ETA_RUV"
+        ]
+    );
+    let read = ErrorSpecText::read(&text).unwrap().unwrap();
+    assert_eq!(read, spec);
+    // The plain base reads back as the plain spec, with the σ's own init.
+    let plain = ErrorSpecText::read(&base()).unwrap().unwrap();
+    assert_eq!(
+        plain,
+        ErrorSpecText::new("DV", ErrorForm::Proportional, vec![sd("PROP_ERR", 0.02)])
+    );
+    // And the edited model compiles.
+    crate::parser::model_parser::parse_full_model(&text.render())
+        .unwrap_or_else(|e| panic!("{e}\n{}", text.render()));
+}
+
+#[test]
+fn set_error_model_read_refuses_what_it_cannot_represent() {
+    let cases = [
+        (
+            "  DV ~ proportional(PROP_ERR)",
+            "  DV ~ proportional(PROP_ERR * (1.0 + TIME))",
+            "magnitude expression this cannot read",
+        ),
+        (
+            "  DV ~ proportional(PROP_ERR)",
+            "  CMT=1: DV ~ proportional(PROP_ERR)\n  CMT=2: DV ~ additive(PROP_ERR)",
+            "more than one statement",
+        ),
+        (
+            "  DV ~ proportional(PROP_ERR)",
+            "  log(DV) ~ additive(PROP_ERR)",
+            "is not `DV ~ form(...)`",
+        ),
+        (
+            "  DV ~ proportional(PROP_ERR)",
+            "  DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = ETA_NOPE",
+            "which [parameters] does not declare",
+        ),
+        (
+            "  sigma PROP_ERR ~ 0.02 (sd)",
+            "  block_sigma (PROP_ERR, ADD_ERR) = [0.02, 0.0, 0.1]",
+            "block_sigma",
+        ),
+    ];
+    for (from, to, expect) in cases {
+        let text = ModelText::parse(&BASE.replace(from, to)).unwrap();
+        let err = ErrorSpecText::read(&text).unwrap_err();
+        assert!(err.contains(expect), "for `{to}` got: {err}");
+    }
+    let no_block = ModelText::parse("[parameters]\n  theta A(1.0)\n").unwrap();
+    assert_eq!(ErrorSpecText::read(&no_block).unwrap(), None);
+}
+
+#[test]
+fn set_error_model_checks_the_exponent_against_the_form() {
+    let err = base()
+        .apply(ModelEdit::SetErrorModel(ErrorSpecText::new(
+            "DV",
+            ErrorForm::Power,
+            vec![sd("PROP_ERR", 0.02)],
+        )))
+        .unwrap_err();
+    assert!(err.contains("needs its exponent"), "{err}");
+    let err = base()
+        .apply(ModelEdit::SetErrorModel(
+            ErrorSpecText::new("DV", ErrorForm::Proportional, vec![sd("PROP_ERR", 0.02)])
+                .with_exponent(ThetaDecl::new("RUV_POW", 1.0, 0.01, 10.0)),
+        ))
+        .unwrap_err();
+    assert!(err.contains("belongs to a power error model"), "{err}");
 }
 
 // ── num ─────────────────────────────────────────────────────────────────────

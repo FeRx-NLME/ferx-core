@@ -84,6 +84,71 @@ matching Pumas). Re-seeding the additive SD to a data-scaled value (tens of
 ng/mL) reaches the correct basin.
 :::
 
+### Power {#power}
+
+```
+DV ~ power(SIGMA_NAME, EXPONENT_THETA)
+```
+
+The proportional loading raised to an estimated exponent — NONMEM's
+`Y = F + EPS(1) * F**THETA(n)`, Pharmpy's `set_power_on_ruv`:
+
+$$
+\text{Var}(DV) = \sigma^2 \cdot |f|^{2P}
+$$
+
+`P` is a **theta** declared in `[parameters]`, and `P = 1` is the proportional
+model exactly. Between additive (`P = 0`) and proportional (`P = 1`) the form
+lets the data say how the residual SD grows with the prediction, which is why
+[`ferx ruvsearch`](../tools/ruvsearch.qmd) offers it as a candidate:
+
+```
+[parameters]
+  theta RUV_POW(1.0, 0.01, 10.0)
+  sigma PROP_ERR ~ 0.1 (sd)
+
+[error_model]
+  DV ~ power(PROP_ERR, RUV_POW)
+```
+
+The exponent may also be an expression of thetas, covariates, `TIME` and
+`TAD`, never a sigma or an η. The first argument follows the same rules as a
+proportional sigma argument, including a
+[magnitude expression](#time-varying-covariate-dependent-magnitude), so a
+time-varying power model is `power(PROP_ERR * (if (TAD < 12.0) RUV_TV else 1.0), RUV_POW)`.
+Not available with per-CMT or covariate-selected error models, with
+`log(DV)` / `log_additive`, or with `weight =` (which scales an additive
+loading the form does not have). An exponent that is zero or negative at the
+initial estimates is rejected (`E_RUV_MAGNITUDE_NONPOSITIVE`).
+
+Internally the exponent travels on the residual-magnitude channel — the same
+per-observation plumbing `weight =` and the magnitude expressions use — so
+every estimator, IWRES, CWRES and the simulated draw see it, and the analytic
+FOCE/FOCEI gradients carry `∂R/∂P` exactly (pinned against finite differences
+in `sens_outer_gradient_tests.rs`). One consequence worth knowing: because the
+magnitude path assembles the variance as `((f·f)·σ)·σ` where the bare
+proportional path uses `(f·σ)·(f·σ)`, a `power(σ, 1)` fit agrees with the
+plain proportional one to about one ULP, not bit for bit.
+
+#### Comparison with NONMEM {#power-nonmem-anchor}
+
+`Y = IPRED + IPRED**THETA(4)*EPS(1)` under `METHOD=COND INTERACTION` on the
+warfarin dataset (`tests/nonmem/warfarin_power*.ctl`, exercised by
+`tests/power_nonmem_anchor.rs`). The objective function is compared at two
+points — the initial estimates with `P = 1.3`, and NONMEM's own optimum with
+`P = 1.11` and a σ two orders of magnitude smaller — so an error in how the
+exponent enters the variance could not cancel between them:
+
+| evaluation point | NONMEM 7.5.1 | ferx |
+|---|---:|---:|
+| initial estimates (`P = 1.3`, σ = 0.1) | 94.381805 | 94.381805 |
+| NONMEM's optimum (`P = 1.1124`, σ² = 7.31e-5) | −286.758823 | −286.758823 |
+
+NONMEM's own minimiser terminated on this model with `ROUNDING ERRORS
+(ERROR=134)`, as it commonly does where σ and the exponent trade off; the
+slow-gated fit in the same file asserts ferx reaches an objective no worse and
+an exponent within 0.05 of NONMEM's 1.112 (SE 0.122).
+
 ## Sigma order {#sigma-order}
 
 A single-endpoint `[error_model]` — one `DV ~ ...` line with no `CMT=` prefix and no `if/else` selector — consumes its sigmas **positionally**, from the order they are declared in `[parameters]`. The names written in the arguments are checked against the declared order and must match it:
@@ -192,8 +257,14 @@ A bare sigma name keeps the legacy behaviour exactly ($m_k \equiv 1$).
 - The magnitude may depend only on `TIME`, declared covariates, thetas, and the
   scaled sigma. It may **not** depend on a random effect (η), on an individual
   parameter, or on the prediction (`IPRED`/`PRED`/`DV`) — the multiplier must be
-  independent of the inner empirical-Bayes loop. `TAD`/`TAFD` are not yet
-  available.
+  independent of the inner empirical-Bayes loop. `TAD` — the data-derived time
+  after dose, steady-state aware, no lag time (#1182) — is available beside
+  `TIME`; `TAFD` is not. `TAD` groups a dose and an observation at the same
+  `TIME` as Pharmpy's `add_time_after_dose` does: the observation belongs to
+  the *previous* dose, so a trough drawn at the dosing time reads `TAD = II`,
+  not `0` (an observation at an `SS` dose's time, or at the first dose, stays
+  with that dose). The sdtab `TAD` column keeps NONMEM's record-order
+  convention and reads `0` on that row.
 - The `TIME` fed to the expression is the raw data-file time (matching NONMEM's
   `$ERROR`).
 - A magnitude that evaluates to zero, a negative number, or a non-finite value at

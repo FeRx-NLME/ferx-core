@@ -259,7 +259,11 @@ struct RawConfig {
     base: PathBuf,
     #[serde(default)]
     data: Option<PathBuf>,
-    space: SpaceSection,
+    /// Optional since #1182: ruvsearch's candidates are not MFL features, so
+    /// its file has no `[space]`. A tool that searches a space checks for one
+    /// itself ([`SearchConfig::require_space`]).
+    #[serde(default)]
+    space: Option<SpaceSection>,
     #[serde(default)]
     rank: RankConfig,
     #[serde(default)]
@@ -323,17 +327,30 @@ impl SearchConfig {
                 }
             }
         }
-        let mfl = Mfl::parse(&raw.space.mfl).map_err(|e| format!("[space] mfl: {e}"))?;
-        if mfl.features().next().is_none() {
-            return Err("[space] mfl: the search space is empty — no feature statement".into());
-        }
-        check_coverage(&mfl).map_err(|e| format!("[space] mfl: {e}"))?;
+        let (mfl_source, mfl) = match raw.space {
+            Some(space) => {
+                let mfl = Mfl::parse(&space.mfl).map_err(|e| format!("[space] mfl: {e}"))?;
+                if mfl.features().next().is_none() {
+                    return Err(
+                        "[space] mfl: the search space is empty — no feature statement".into(),
+                    );
+                }
+                check_coverage(&mfl).map_err(|e| format!("[space] mfl: {e}"))?;
+                (space.mfl, mfl)
+            }
+            None => (
+                String::new(),
+                Mfl {
+                    statements: Vec::new(),
+                },
+            ),
+        };
         // Fail on an unimplemented rank type at load, not after the first fit.
         raw.rank.kind_or_default().criterion()?;
         Ok(SearchConfig {
             base: dir.join(&raw.base),
             data: raw.data.map(|d| dir.join(d)),
-            mfl_source: raw.space.mfl,
+            mfl_source,
             mfl,
             rank: raw.rank,
             strictness: raw.strictness,
@@ -341,6 +358,24 @@ impl SearchConfig {
             tools,
             dir: dir.to_path_buf(),
         })
+    }
+
+    /// Whether the file has a `[space]` with at least one feature statement.
+    pub fn has_space(&self) -> bool {
+        self.mfl.features().next().is_some()
+    }
+
+    /// Refuse a file with no `[space]` on behalf of a tool that searches one
+    /// — covsearch, modelsearch — naming the tool and what its space is.
+    pub fn require_space(&self, tool: &str, what: &str) -> Result<(), String> {
+        if self.has_space() {
+            Ok(())
+        } else {
+            Err(format!(
+                "{tool} needs a [space] section: `mfl = \"...\"` with {what}. Only ruvsearch, \
+                 whose candidates are the residual-error forms, runs without one"
+            ))
+        }
     }
 
     /// The runner options this file asks for.

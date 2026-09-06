@@ -56,6 +56,7 @@ mod tests {
         let _ = assert_default::<crate::gam::GamOptions>();
         let _ = assert_default::<crate::search::RunOptions>();
         let _ = assert_default::<crate::modelsearch::ModelsearchOptions>();
+        let _ = assert_default::<crate::ruvsearch::RuvsearchOptions>();
     }
 
     #[test]
@@ -79,4 +80,5 @@ pub mod bootstrap;
 pub mod covsearch;
 pub mod gam;
 pub mod modelsearch;
+pub mod ruvsearch;
 pub mod search;

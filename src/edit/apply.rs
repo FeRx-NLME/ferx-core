@@ -11,7 +11,10 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use super::spec::{finite, num, ErrorSpecText, IivForm, ModelEdit, Relation, StructuralSpec};
+use super::spec::{
+    finite, num, ErrorForm, ErrorSpecText, EtaDecl, IivForm, ModelEdit, Relation, SigmaDecl,
+    StructuralSpec, ThetaDecl, TimeVaryingDecl,
+};
 use super::ModelText;
 use crate::types::{FitResult, PkModel};
 
@@ -49,6 +52,25 @@ static FIX_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bFIX\b").unw
 /// The `(sd)` scale annotation — `(variance)`/`(var)` are the default and need
 /// no detection.
 static SD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\(\s*sd\s*\)").unwrap());
+/// `iiv_on_ruv = ETA` in `[error_model]` — group 1 the η.
+static IIV_ON_RUV_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^iiv_on_ruv\s*=\s*(\w+)\s*$").unwrap());
+/// `DV ~ form(args)` — the single-endpoint statement `SetErrorModel` writes.
+static ERROR_STMT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(\w+)\s*~\s*(\w+)\s*\((.+)\)\s*$").unwrap());
+/// The canonical time-varying σ argument `σ * (if (TAD < c) θ else 1.0)` —
+/// groups: σ, cutoff, θ.
+static TIME_VARYING_ARG_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^(\w+)\s*\*\s*\(\s*if\s*\(\s*TAD\s*<\s*([0-9eE.+-]+)\s*\)\s*(\w+)\s+else\s+1(?:\.0*)?\s*\)$",
+    )
+    .unwrap()
+});
+/// A bare identifier and nothing else.
+static BARE_IDENT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z_]\w*$").unwrap());
+/// The two bounds after a θ init: `, lower, upper`.
+static THETA_BOUNDS_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*,\s*([0-9eE.+-]+)\s*,\s*([0-9eE.+-]+)").unwrap());
 
 pub(crate) fn apply(text: &mut ModelText, edit: ModelEdit<'_>) -> Result<(), String> {
     match edit {
@@ -539,6 +561,51 @@ fn set_error_model(text: &mut ModelText, spec: &ErrorSpecText) -> Result<(), Str
     for s in &spec.sigmas {
         finite(s.init, &format!("`sigma {}` init", s.name))?;
     }
+    match (spec.form, &spec.exponent) {
+        (ErrorForm::Power, None) => {
+            return Err("ferx-core::edit: a power error model needs its exponent θ \
+                 (`ErrorSpecText::with_exponent`)"
+                .to_string())
+        }
+        (form, Some(p)) if form != ErrorForm::Power => {
+            return Err(format!(
+                "ferx-core::edit: an exponent θ `{}` belongs to a power error model, not to {}",
+                p.name,
+                form.label()
+            ))
+        }
+        _ => {}
+    }
+    for t in spec
+        .exponent
+        .iter()
+        .chain(spec.time_varying.as_ref().map(|tv| &tv.theta))
+    {
+        finite(t.init, &format!("`theta {}` init", t.name))?;
+        // An infinite bound is "no bound"; only `NaN` cannot be written.
+        for (b, what) in [(t.lower, "lower"), (t.upper, "upper")] {
+            if b.is_nan() {
+                return Err(format!(
+                    "ferx-core::edit: `theta {}` {what} bound is NaN, which cannot be written \
+                     as a `.ferx` number",
+                    t.name
+                ));
+            }
+        }
+        if t.lower.is_finite() != t.upper.is_finite() {
+            return Err(format!(
+                "ferx-core::edit: `theta {}` has one finite and one infinite bound; a `.ferx` \
+                 declaration takes both or neither",
+                t.name
+            ));
+        }
+    }
+    if let Some(tv) = &spec.time_varying {
+        finite(tv.cutoff, "the time-varying `TAD` cutoff")?;
+    }
+    if let Some(eta) = &spec.iiv_on_ruv {
+        finite(eta.variance, &format!("`omega {}` variance", eta.name))?;
+    }
     // σ are reconciled positionally against the `sigma NAME ~ …` declarations
     // below, and `SIGMA_RE` does not match a `block_sigma` line — so a
     // correlated σ block would have the new σ *appended* beside it rather than
@@ -550,7 +617,12 @@ fn set_error_model(text: &mut ModelText, spec: &ErrorSpecText) -> Result<(), Str
              positionally and cannot reconcile a correlated σ block; edit [parameters] by hand."
         ));
     }
-    let existing = text.logical_lines("error_model");
+    // The `iiv_on_ruv = ETA` line is the spec's to set or clear; the statement
+    // line(s) are what the endpoint check below looks at.
+    let (iiv_lines, existing): (Vec<(Range<usize>, String)>, Vec<(Range<usize>, String)>) = text
+        .logical_lines("error_model")
+        .into_iter()
+        .partition(|(_, c)| IIV_ON_RUV_RE.is_match(c));
     // A per-CMT or covariate-selected block describes endpoints this edit does
     // not know about; replacing it wholesale would drop them silently.
     if existing.len() > 1
@@ -565,14 +637,17 @@ fn set_error_model(text: &mut ModelText, spec: &ErrorSpecText) -> Result<(), Str
                 .to_string(),
         );
     }
+    // What the old block referenced, so a θ / ω only it used can be pruned
+    // once the new block is in — the exponent of a power form being replaced,
+    // the η of an `iiv_on_ruv` being removed. Collected before the edit, and
+    // checked for liveness after it, against the whole file.
+    let old_idents: HashSet<String> = existing
+        .iter()
+        .chain(iiv_lines.iter())
+        .flat_map(|(_, c)| super::IDENT_RE.find_iter(c).map(|m| m.as_str().to_string()))
+        .collect();
 
-    let names: Vec<&str> = spec.sigmas.iter().map(|s| s.name.as_str()).collect();
-    let stmt = format!(
-        "{} ~ {}({})",
-        spec.endpoint,
-        spec.form.label(),
-        names.join(", ")
-    );
+    let stmt = spec.render_statement();
     match existing.first() {
         Some((span, _)) => {
             let stale = text.set_span(span, &stmt);
@@ -580,6 +655,30 @@ fn set_error_model(text: &mut ModelText, spec: &ErrorSpecText) -> Result<(), Str
         }
         None => text.append_to_block("error_model", &stmt),
     }
+    // `iiv_on_ruv`: rewrite the first line, drop any duplicate, or add / remove.
+    // Spans are re-read, since the statement edit above may have moved lines.
+    let iiv_lines: Vec<(Range<usize>, String)> = text
+        .logical_lines("error_model")
+        .into_iter()
+        .filter(|(_, c)| IIV_ON_RUV_RE.is_match(c))
+        .collect();
+    let mut stale = Vec::new();
+    match (&spec.iiv_on_ruv, iiv_lines.first()) {
+        (Some(eta), Some((span, _))) => {
+            stale.extend(text.set_span(span, &format!("iiv_on_ruv = {}", eta.name)));
+        }
+        (Some(eta), None) => {
+            text.append_to_block("error_model", &format!("iiv_on_ruv = {}", eta.name));
+        }
+        (None, _) => {}
+    }
+    for (span, _) in iiv_lines
+        .iter()
+        .skip(usize::from(spec.iiv_on_ruv.is_some()))
+    {
+        stale.extend(span.clone());
+    }
+    text.delete_lines(stale);
 
     // A single-endpoint `[error_model]` consumes its σ **positionally** from
     // the `[parameters]` declaration order — the names in `combined(a, b)` are
@@ -621,7 +720,244 @@ fn set_error_model(text: &mut ModelText, spec: &ErrorSpecText) -> Result<(), Str
     for code in wanted.iter().skip(slots.len()) {
         text.append_to_block("parameters", code);
     }
+
+    // The θ the form's features need — the power exponent, the time-varying
+    // multiplier — and the `iiv_on_ruv` ω: declared when `[parameters]` lacks
+    // them, left verbatim when it has them (their init and bounds are then the
+    // author's, as for an existing σ above).
+    for t in spec
+        .exponent
+        .iter()
+        .chain(spec.time_varying.as_ref().map(|tv| &tv.theta))
+    {
+        let declared = find_decl(text, "parameters", |c| {
+            THETA_RE.captures(c).is_some_and(|m| m[2] == t.name)
+        })
+        .is_some();
+        if !declared {
+            text.append_to_block("parameters", &t.render());
+        }
+    }
+    if let Some(eta) = &spec.iiv_on_ruv {
+        if omega_decl(text, &eta.name).is_none() && block_omega_decl(text, &eta.name).is_none() {
+            text.append_to_block("parameters", &eta.render());
+        }
+    }
+
+    // A θ or diagonal ω that only the *old* error model referenced is dead:
+    // the exponent of a power form that became proportional again, the η of
+    // an `iiv_on_ruv` that was removed. Checked against every line but its own
+    // declaration, so a θ the rest of the model also uses stays.
+    let new_idents: HashSet<String> = text
+        .logical_lines("error_model")
+        .iter()
+        .flat_map(|(_, c)| super::IDENT_RE.find_iter(c).map(|m| m.as_str().to_string()))
+        .collect();
+    let mut dead = Vec::new();
+    for name in old_idents.difference(&new_idents) {
+        let decl = find_decl(text, "parameters", |c| {
+            THETA_RE
+                .captures(c)
+                .or_else(|| OMEGA_RE.captures(c))
+                .is_some_and(|m| m[2] == *name)
+        });
+        let Some((span, _)) = decl else {
+            continue;
+        };
+        let elsewhere = text.identifiers_excluding(&span.clone().collect::<Vec<_>>());
+        if !elsewhere.contains(name) {
+            dead.extend(span);
+        }
+    }
+    text.delete_lines(dead);
     Ok(())
+}
+
+/// [`ErrorSpecText::read`]: the block back in authoring form.
+pub(crate) fn read_error_spec(text: &ModelText) -> Result<Option<ErrorSpecText>, String> {
+    let lines = text.logical_lines("error_model");
+    if lines.is_empty() && text.last_block("error_model").is_none() {
+        return Ok(None);
+    }
+    let unreadable = |what: &str| -> String {
+        format!(
+            "ferx-core::edit: [error_model] {what}; only a single-endpoint `DV ~ form(σ, …)` \
+             statement with bare σ names or the canonical time-varying magnitude \
+             `σ * (if (TAD < c) θ else 1.0)`, plus an optional `iiv_on_ruv = ETA` line, can be \
+             read back"
+        )
+    };
+    let mut iiv: Option<String> = None;
+    let mut stmt: Option<String> = None;
+    for (_, code) in &lines {
+        if let Some(c) = IIV_ON_RUV_RE.captures(code) {
+            if iiv.replace(c[1].to_string()).is_some() {
+                return Err(unreadable("has more than one `iiv_on_ruv =` line"));
+            }
+            continue;
+        }
+        if stmt.replace(code.clone()).is_some() {
+            return Err(unreadable(
+                "has more than one statement (a per-CMT or covariate-selected block)",
+            ));
+        }
+    }
+    let Some(stmt) = stmt else {
+        return Err(unreadable("has no `DV ~ form(...)` statement"));
+    };
+    let caps = ERROR_STMT_RE
+        .captures(&stmt)
+        .ok_or_else(|| unreadable(&format!("statement `{stmt}` is not `DV ~ form(...)`")))?;
+    if stmt.contains("weight") && stmt.contains('=') {
+        return Err(unreadable(&format!(
+            "statement `{stmt}` carries a `weight =` modifier"
+        )));
+    }
+    let endpoint = caps[1].to_string();
+    let form = ErrorForm::from_label(&caps[2])
+        .ok_or_else(|| unreadable(&format!("form `{}` is not one this can read", &caps[2])))?;
+    let mut args = crate::parser::model_parser::split_top_level_args(&caps[3]);
+
+    let theta_decl = |name: &str| -> Result<ThetaDecl, String> {
+        let (_, code) = find_decl(text, "parameters", |c| {
+            THETA_RE.captures(c).is_some_and(|m| m[2] == *name)
+        })
+        .ok_or_else(|| {
+            format!(
+                "ferx-core::edit: [error_model] names theta `{name}`, which [parameters] does \
+                 not declare"
+            )
+        })?;
+        let m = THETA_RE.captures(&code).expect("matched above");
+        let init: f64 = m[3]
+            .parse()
+            .map_err(|_| format!("ferx-core::edit: cannot read the init of `{code}`"))?;
+        let (lower, upper) = match THETA_BOUNDS_RE.captures(&m[4]) {
+            Some(b) => (
+                b[1].parse::<f64>()
+                    .map_err(|_| format!("ferx-core::edit: cannot read the bounds of `{code}`"))?,
+                b[2].parse::<f64>()
+                    .map_err(|_| format!("ferx-core::edit: cannot read the bounds of `{code}`"))?,
+            ),
+            None => (f64::NEG_INFINITY, f64::INFINITY),
+        };
+        Ok(ThetaDecl::new(name, init, lower, upper))
+    };
+
+    let exponent = if form == ErrorForm::Power {
+        let p = args
+            .pop()
+            .ok_or_else(|| unreadable("`power(...)` has no exponent argument"))?;
+        if !BARE_IDENT_RE.is_match(&p) {
+            return Err(unreadable(&format!(
+                "the power exponent `{p}` is an expression, not a theta name"
+            )));
+        }
+        Some(theta_decl(&p)?)
+    } else {
+        None
+    };
+    if args.len() != form.n_sigma() {
+        return Err(unreadable(&format!(
+            "`{}(...)` has {} argument(s) where {} σ are expected",
+            form.label(),
+            args.len(),
+            form.n_sigma()
+        )));
+    }
+
+    let mut sigmas = Vec::with_capacity(args.len());
+    let mut time_varying: Option<TimeVaryingDecl> = None;
+    for (i, arg) in args.iter().enumerate() {
+        let (sigma_name, tv) = if BARE_IDENT_RE.is_match(arg) {
+            (arg.clone(), None)
+        } else if let Some(m) = TIME_VARYING_ARG_RE.captures(arg) {
+            let cutoff: f64 = m[2]
+                .parse()
+                .map_err(|_| unreadable(&format!("cannot read the TAD cutoff in `{arg}`")))?;
+            (m[1].to_string(), Some((cutoff, m[3].to_string())))
+        } else {
+            return Err(unreadable(&format!(
+                "argument `{arg}` is a magnitude expression this cannot read"
+            )));
+        };
+        match (&time_varying, tv) {
+            (None, Some((cutoff, theta))) => {
+                if i != 0 {
+                    return Err(unreadable(
+                        "the time-varying magnitude is on some σ but not the first",
+                    ));
+                }
+                time_varying = Some(TimeVaryingDecl::new(cutoff, theta_decl(&theta)?));
+            }
+            (Some(have), Some((cutoff, theta))) => {
+                if have.cutoff != cutoff || have.theta.name != theta {
+                    return Err(unreadable(
+                        "the σ arguments carry different time-varying magnitudes",
+                    ));
+                }
+            }
+            (Some(_), None) => {
+                return Err(unreadable(
+                    "the time-varying magnitude is on some σ but not all",
+                ));
+            }
+            (None, None) => {}
+        }
+        let (_, code) = find_decl(text, "parameters", |c| {
+            SIGMA_RE.captures(c).is_some_and(|m| m[2] == *sigma_name)
+        })
+        .ok_or_else(|| {
+            if find_decl(text, "parameters", |c| BLOCK_SIGMA_RE.is_match(c)).is_some() {
+                unreadable(&format!("σ `{sigma_name}` is declared in a `block_sigma`"))
+            } else {
+                format!(
+                    "ferx-core::edit: [error_model] names sigma `{sigma_name}`, which \
+                     [parameters] does not declare"
+                )
+            }
+        })?;
+        let m = SIGMA_RE.captures(&code).expect("matched above");
+        let init: f64 = m[3]
+            .parse()
+            .map_err(|_| format!("ferx-core::edit: cannot read the init of `{code}`"))?;
+        sigmas.push(SigmaDecl {
+            name: sigma_name,
+            init,
+            as_sd: SD_RE.is_match(&code),
+        });
+    }
+
+    let iiv_on_ruv = match iiv {
+        None => None,
+        Some(eta) => {
+            if block_omega_decl(text, &eta).is_some() {
+                return Err(unreadable(&format!(
+                    "the `iiv_on_ruv` η `{eta}` is declared in a `block_omega`"
+                )));
+            }
+            let (_, code) = omega_decl(text, &eta).ok_or_else(|| {
+                format!(
+                    "ferx-core::edit: [error_model] names omega `{eta}`, which [parameters] \
+                     does not declare"
+                )
+            })?;
+            let value = omega_variance(&code)?;
+            Some(EtaDecl::new(eta, value))
+        }
+    };
+
+    let mut spec = ErrorSpecText::new(endpoint, form, sigmas);
+    if let Some(p) = exponent {
+        spec = spec.with_exponent(p);
+    }
+    if let Some(eta) = iiv_on_ruv {
+        spec = spec.with_iiv_on_ruv(eta);
+    }
+    if let Some(tv) = time_varying {
+        spec = spec.with_time_varying(tv);
+    }
+    Ok(Some(spec))
 }
 
 // ── Initial estimates ───────────────────────────────────────────────────────

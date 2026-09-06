@@ -1344,25 +1344,12 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
                     if !sr.per_obs_tad.is_empty() {
                         return sr.per_obs_tad[j];
                     }
-                    let obs_t = subj.obs_times[j];
-                    let last_eff = subj
-                        .doses
-                        .iter()
-                        .filter(|d| d.time <= obs_t + 1e-12)
-                        .map(|d| {
-                            if d.ss && d.ii > 0.0 {
-                                let elapsed = obs_t - d.time;
-                                obs_t - elapsed.rem_euclid(d.ii)
-                            } else {
-                                d.time
-                            }
-                        })
-                        .fold(f64::NEG_INFINITY, f64::max);
-                    if last_eff.is_finite() {
-                        obs_t - last_eff
-                    } else {
-                        f64::NAN
-                    }
+                    // The data-derived TAD under NONMEM's record-order
+                    // convention (a dose at the observation's TIME is the most
+                    // recent dose), the same tie rule as the lag-aware column
+                    // above. The `[error_model]` `TAD` built-in reads Pharmpy's
+                    // grouping instead — see `Subject::time_after_dose` (#1182).
+                    subj.time_after_dose_at_or_before(j)
                 })
             })
             .collect();

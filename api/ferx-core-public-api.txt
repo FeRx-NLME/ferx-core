@@ -165,8 +165,10 @@ pub mod ferx_core::edit
 pub enum ferx_core::edit::ErrorForm
 pub ferx_core::edit::ErrorForm::Additive
 pub ferx_core::edit::ErrorForm::Combined
+pub ferx_core::edit::ErrorForm::Power
 pub ferx_core::edit::ErrorForm::Proportional
 impl ferx_core::edit::ErrorForm
+pub fn ferx_core::edit::ErrorForm::from_label(label: &str) -> core::option::Option<ferx_core::edit::ErrorForm>
 pub fn ferx_core::edit::ErrorForm::label(&self) -> &'static str
 pub fn ferx_core::edit::ErrorForm::n_sigma(&self) -> usize
 pub enum ferx_core::edit::IivForm
@@ -199,10 +201,25 @@ pub ferx_core::edit::ModelEdit::SetFitOption::key: alloc::string::String
 pub ferx_core::edit::ModelEdit::SetFitOption::value: alloc::string::String
 pub ferx_core::edit::ModelEdit::SetOmegaBlock(alloc::vec::Vec<alloc::string::String>)
 pub ferx_core::edit::ModelEdit::SetStructural(ferx_core::edit::StructuralSpec)
-pub struct ferx_core::edit::ErrorSpecText
+#[non_exhaustive] pub struct ferx_core::edit::ErrorSpecText
 pub ferx_core::edit::ErrorSpecText::endpoint: alloc::string::String
+pub ferx_core::edit::ErrorSpecText::exponent: core::option::Option<ferx_core::edit::ThetaDecl>
 pub ferx_core::edit::ErrorSpecText::form: ferx_core::edit::ErrorForm
+pub ferx_core::edit::ErrorSpecText::iiv_on_ruv: core::option::Option<ferx_core::edit::EtaDecl>
 pub ferx_core::edit::ErrorSpecText::sigmas: alloc::vec::Vec<ferx_core::edit::SigmaDecl>
+pub ferx_core::edit::ErrorSpecText::time_varying: core::option::Option<ferx_core::edit::TimeVaryingDecl>
+impl ferx_core::edit::ErrorSpecText
+pub fn ferx_core::edit::ErrorSpecText::new(endpoint: impl core::convert::Into<alloc::string::String>, form: ferx_core::edit::ErrorForm, sigmas: alloc::vec::Vec<ferx_core::edit::SigmaDecl>) -> Self
+pub fn ferx_core::edit::ErrorSpecText::read(text: &ferx_core::edit::ModelText) -> core::result::Result<core::option::Option<Self>, alloc::string::String>
+pub fn ferx_core::edit::ErrorSpecText::render_statement(&self) -> alloc::string::String
+pub fn ferx_core::edit::ErrorSpecText::with_exponent(self, theta: ferx_core::edit::ThetaDecl) -> Self
+pub fn ferx_core::edit::ErrorSpecText::with_iiv_on_ruv(self, eta: ferx_core::edit::EtaDecl) -> Self
+pub fn ferx_core::edit::ErrorSpecText::with_time_varying(self, tv: ferx_core::edit::TimeVaryingDecl) -> Self
+pub struct ferx_core::edit::EtaDecl
+pub ferx_core::edit::EtaDecl::name: alloc::string::String
+pub ferx_core::edit::EtaDecl::variance: f64
+impl ferx_core::edit::EtaDecl
+pub fn ferx_core::edit::EtaDecl::new(name: impl core::convert::Into<alloc::string::String>, variance: f64) -> Self
 pub struct ferx_core::edit::ModelText
 impl ferx_core::edit::ModelText
 pub fn ferx_core::edit::ModelText::apply(&mut self, edit: ferx_core::edit::ModelEdit<'_>) -> core::result::Result<(), alloc::string::String>
@@ -246,6 +263,18 @@ pub struct ferx_core::edit::StructuralSpec
 pub ferx_core::edit::StructuralSpec::bindings: alloc::vec::Vec<(alloc::string::String, alloc::string::String)>
 pub ferx_core::edit::StructuralSpec::new_parameters: alloc::vec::Vec<ferx_core::edit::NewParameter>
 pub ferx_core::edit::StructuralSpec::template: alloc::string::String
+pub struct ferx_core::edit::ThetaDecl
+pub ferx_core::edit::ThetaDecl::init: f64
+pub ferx_core::edit::ThetaDecl::lower: f64
+pub ferx_core::edit::ThetaDecl::name: alloc::string::String
+pub ferx_core::edit::ThetaDecl::upper: f64
+impl ferx_core::edit::ThetaDecl
+pub fn ferx_core::edit::ThetaDecl::new(name: impl core::convert::Into<alloc::string::String>, init: f64, lower: f64, upper: f64) -> Self
+pub struct ferx_core::edit::TimeVaryingDecl
+pub ferx_core::edit::TimeVaryingDecl::cutoff: f64
+pub ferx_core::edit::TimeVaryingDecl::theta: ferx_core::edit::ThetaDecl
+impl ferx_core::edit::TimeVaryingDecl
+pub fn ferx_core::edit::TimeVaryingDecl::new(cutoff: f64, theta: ferx_core::edit::ThetaDecl) -> Self
 pub mod ferx_core::environment
 pub struct ferx_core::environment::EnvironmentInfo
 pub ferx_core::environment::EnvironmentInfo::arch: alloc::string::String
@@ -1916,7 +1945,7 @@ pub mod ferx_core::stats::likelihood
 pub fn ferx_core::stats::likelihood::apply_frem_r_overrides(r_diag: &mut [f64], overrides: &[core::option::Option<f64>])
 pub fn ferx_core::stats::likelihood::build_block_diag_omega(omega_bsv: &nalgebra::base::alias::DMatrix<f64>, omega_iov: &nalgebra::base::alias::DMatrix<f64>, n_occasions: usize) -> nalgebra::base::alias::DMatrix<f64>
 pub fn ferx_core::stats::likelihood::build_frem_r_override(frem_config: core::option::Option<&ferx_core::FremConfig>, fremtype: &[u16], sigma_values: &[f64]) -> core::option::Option<alloc::vec::Vec<core::option::Option<f64>>>
-pub fn ferx_core::stats::likelihood::compute_cwres(subject: &ferx_core::Subject, ipreds: &[f64], eta_hat: &nalgebra::base::alias::DVector<f64>, h_matrix: &nalgebra::base::alias::DMatrix<f64>, omega: &ferx_core::OmegaMatrix, sigma_values: &[f64], error_spec: &ferx_core::ErrorSpec, residual_correlations: &[ferx_core::ResidualCorrelation], frem_r_override: core::option::Option<&[core::option::Option<f64>]>, residual_error_eta: core::option::Option<usize>, ruv_mult: core::option::Option<&[alloc::vec::Vec<f64>]>) -> alloc::vec::Vec<f64>
+pub fn ferx_core::stats::likelihood::compute_cwres(subject: &ferx_core::Subject, ipreds: &[f64], eta_hat: &nalgebra::base::alias::DVector<f64>, h_matrix: &nalgebra::base::alias::DMatrix<f64>, omega: &ferx_core::OmegaMatrix, sigma_values: &[f64], error_spec: &ferx_core::ErrorSpec, residual_correlations: &[ferx_core::ResidualCorrelation], frem_r_override: core::option::Option<&[core::option::Option<f64>]>, residual_error_eta: core::option::Option<usize>, ruv_mult: core::option::Option<&[alloc::vec::Vec<f64>]>, r_preds: core::option::Option<&[f64]>) -> alloc::vec::Vec<f64>
 pub fn ferx_core::stats::likelihood::foce_population_nll(model: &ferx_core::CompiledModel, population: &ferx_core::Population, theta: &[f64], eta_hats: &[nalgebra::base::alias::DVector<f64>], h_matrices: &[nalgebra::base::alias::DMatrix<f64>], omega: &ferx_core::OmegaMatrix, sigma_values: &[f64], residual_correlations: &[ferx_core::ResidualCorrelation], interaction: bool) -> f64
 pub fn ferx_core::stats::likelihood::foce_population_nll_iov(model: &ferx_core::CompiledModel, population: &ferx_core::Population, theta: &[f64], eta_hats: &[nalgebra::base::alias::DVector<f64>], h_matrices: &[nalgebra::base::alias::DMatrix<f64>], kappas_per_subject: &[alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>], omega_bsv: &ferx_core::OmegaMatrix, omega_iov: &ferx_core::OmegaMatrix, sigma_values: &[f64], interaction: bool) -> f64
 pub fn ferx_core::stats::likelihood::foce_subject_nll(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta_hat: &nalgebra::base::alias::DVector<f64>, h_matrix: &nalgebra::base::alias::DMatrix<f64>, omega: &ferx_core::OmegaMatrix, sigma_values: &[f64], residual_correlations: &[ferx_core::ResidualCorrelation], interaction: bool) -> f64
@@ -2475,6 +2504,7 @@ pub fn ferx_core::CompiledModel::has_lagtime_on_cmt(&self, cmt: usize) -> bool
 pub fn ferx_core::CompiledModel::has_non_gaussian(&self) -> bool
 pub fn ferx_core::CompiledModel::has_residual_error_for_cmt(&self, cmt: usize, sigma: &[f64]) -> bool
 pub fn ferx_core::CompiledModel::has_rtte(&self) -> bool
+pub fn ferx_core::CompiledModel::has_ruv_exponent(&self) -> bool
 pub fn ferx_core::CompiledModel::has_theta_dependent_ruv_magnitude(&self) -> bool
 pub fn ferx_core::CompiledModel::has_tte(&self) -> bool
 pub fn ferx_core::CompiledModel::has_weighted_kappa(&self) -> bool
@@ -3064,10 +3094,13 @@ pub ferx_core::types::ResidualCorrelation::sigma_j: usize
 #[non_exhaustive] pub struct ferx_core::types::RuvMagnitude
 pub ferx_core::types::RuvMagnitude::per_sigma: alloc::vec::Vec<core::option::Option<ferx_core::RuvMagFn>>
 pub ferx_core::types::RuvMagnitude::per_sigma_deriv: alloc::vec::Vec<core::option::Option<ferx_core::parser::model_parser::RuvMagDerivProgram>>
+pub ferx_core::types::RuvMagnitude::per_sigma_exponent: alloc::vec::Vec<core::option::Option<ferx_core::RuvMagFn>>
+pub ferx_core::types::RuvMagnitude::per_sigma_exponent_deriv: alloc::vec::Vec<core::option::Option<ferx_core::parser::model_parser::RuvMagDerivProgram>>
 pub ferx_core::types::RuvMagnitude::theta_dependent: bool
 impl ferx_core::RuvMagnitude
-pub fn ferx_core::RuvMagnitude::eval_obs(&self, theta: &[f64], obs_covariates: &std::collections::hash::map::HashMap<alloc::string::String, f64>, time: f64) -> alloc::vec::Vec<f64>
-pub fn ferx_core::RuvMagnitude::eval_obs_theta_grad(&self, theta: &[f64], obs_covariates: &std::collections::hash::map::HashMap<alloc::string::String, f64>, time: f64) -> core::option::Option<alloc::vec::Vec<alloc::vec::Vec<f64>>>
+pub fn ferx_core::RuvMagnitude::eval_obs(&self, theta: &[f64], obs_covariates: &std::collections::hash::map::HashMap<alloc::string::String, f64>, time: f64, tad: f64) -> alloc::vec::Vec<f64>
+pub fn ferx_core::RuvMagnitude::eval_obs_theta_grad(&self, theta: &[f64], obs_covariates: &std::collections::hash::map::HashMap<alloc::string::String, f64>, time: f64, tad: f64) -> core::option::Option<alloc::vec::Vec<alloc::vec::Vec<f64>>>
+pub fn ferx_core::RuvMagnitude::has_exponent(&self) -> bool
 pub fn ferx_core::RuvMagnitude::is_active(&self) -> bool
 impl core::fmt::Debug for ferx_core::RuvMagnitude
 pub fn ferx_core::RuvMagnitude::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -3117,6 +3150,7 @@ pub fn ferx_core::Subject::occasion_first_dose_time(&self, obs_time: f64) -> f64
 pub fn ferx_core::Subject::pk_only_cov(&self, m: usize) -> &std::collections::hash::map::HashMap<alloc::string::String, f64>
 pub fn ferx_core::Subject::readout_time(&self, j: usize) -> f64
 pub fn ferx_core::Subject::reset_cov(&self, r: usize) -> &std::collections::hash::map::HashMap<alloc::string::String, f64>
+pub fn ferx_core::Subject::time_after_dose(&self, j: usize) -> f64
 pub fn ferx_core::Subject::time_varying_covariate_names(&self) -> alloc::vec::Vec<alloc::string::String>
 pub struct ferx_core::types::SubjectResult
 pub ferx_core::types::SubjectResult::cens: alloc::vec::Vec<i8>
@@ -3195,7 +3229,7 @@ pub type ferx_core::types::HazardParamFn = alloc::boxed::Box<(dyn core::ops::fun
 pub type ferx_core::types::KappaWeightFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>, f64) -> f64 + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::types::LinearPredictorFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>) -> f64 + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::types::PkParamFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>, f64) -> ferx_core::PkParams + core::marker::Send + core::marker::Sync)>
-pub type ferx_core::types::RuvMagFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>, f64) -> f64 + core::marker::Send + core::marker::Sync)>
+pub type ferx_core::types::RuvMagFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>, f64, f64) -> f64 + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::types::ScaleFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>, &ferx_core::PkParams) -> f64 + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::types::TvFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>) -> alloc::vec::Vec<f64> + core::marker::Send + core::marker::Sync)>
 pub enum ferx_core::AdaptiveAction
@@ -3790,6 +3824,7 @@ pub fn ferx_core::CompiledModel::has_lagtime_on_cmt(&self, cmt: usize) -> bool
 pub fn ferx_core::CompiledModel::has_non_gaussian(&self) -> bool
 pub fn ferx_core::CompiledModel::has_residual_error_for_cmt(&self, cmt: usize, sigma: &[f64]) -> bool
 pub fn ferx_core::CompiledModel::has_rtte(&self) -> bool
+pub fn ferx_core::CompiledModel::has_ruv_exponent(&self) -> bool
 pub fn ferx_core::CompiledModel::has_theta_dependent_ruv_magnitude(&self) -> bool
 pub fn ferx_core::CompiledModel::has_tte(&self) -> bool
 pub fn ferx_core::CompiledModel::has_weighted_kappa(&self) -> bool
@@ -4485,10 +4520,13 @@ pub ferx_core::ResidualCorrelation::sigma_j: usize
 #[non_exhaustive] pub struct ferx_core::RuvMagnitude
 pub ferx_core::RuvMagnitude::per_sigma: alloc::vec::Vec<core::option::Option<ferx_core::RuvMagFn>>
 pub ferx_core::RuvMagnitude::per_sigma_deriv: alloc::vec::Vec<core::option::Option<ferx_core::parser::model_parser::RuvMagDerivProgram>>
+pub ferx_core::RuvMagnitude::per_sigma_exponent: alloc::vec::Vec<core::option::Option<ferx_core::RuvMagFn>>
+pub ferx_core::RuvMagnitude::per_sigma_exponent_deriv: alloc::vec::Vec<core::option::Option<ferx_core::parser::model_parser::RuvMagDerivProgram>>
 pub ferx_core::RuvMagnitude::theta_dependent: bool
 impl ferx_core::RuvMagnitude
-pub fn ferx_core::RuvMagnitude::eval_obs(&self, theta: &[f64], obs_covariates: &std::collections::hash::map::HashMap<alloc::string::String, f64>, time: f64) -> alloc::vec::Vec<f64>
-pub fn ferx_core::RuvMagnitude::eval_obs_theta_grad(&self, theta: &[f64], obs_covariates: &std::collections::hash::map::HashMap<alloc::string::String, f64>, time: f64) -> core::option::Option<alloc::vec::Vec<alloc::vec::Vec<f64>>>
+pub fn ferx_core::RuvMagnitude::eval_obs(&self, theta: &[f64], obs_covariates: &std::collections::hash::map::HashMap<alloc::string::String, f64>, time: f64, tad: f64) -> alloc::vec::Vec<f64>
+pub fn ferx_core::RuvMagnitude::eval_obs_theta_grad(&self, theta: &[f64], obs_covariates: &std::collections::hash::map::HashMap<alloc::string::String, f64>, time: f64, tad: f64) -> core::option::Option<alloc::vec::Vec<alloc::vec::Vec<f64>>>
+pub fn ferx_core::RuvMagnitude::has_exponent(&self) -> bool
 pub fn ferx_core::RuvMagnitude::is_active(&self) -> bool
 impl core::fmt::Debug for ferx_core::RuvMagnitude
 pub fn ferx_core::RuvMagnitude::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -4573,6 +4611,7 @@ pub fn ferx_core::Subject::occasion_first_dose_time(&self, obs_time: f64) -> f64
 pub fn ferx_core::Subject::pk_only_cov(&self, m: usize) -> &std::collections::hash::map::HashMap<alloc::string::String, f64>
 pub fn ferx_core::Subject::readout_time(&self, j: usize) -> f64
 pub fn ferx_core::Subject::reset_cov(&self, r: usize) -> &std::collections::hash::map::HashMap<alloc::string::String, f64>
+pub fn ferx_core::Subject::time_after_dose(&self, j: usize) -> f64
 pub fn ferx_core::Subject::time_varying_covariate_names(&self) -> alloc::vec::Vec<alloc::string::String>
 pub struct ferx_core::SubjectResult
 pub ferx_core::SubjectResult::cens: alloc::vec::Vec<i8>
@@ -4710,6 +4749,6 @@ pub type ferx_core::HazardParamFn = alloc::boxed::Box<(dyn core::ops::function::
 pub type ferx_core::KappaWeightFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>, f64) -> f64 + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::LinearPredictorFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>) -> f64 + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::PkParamFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>, f64) -> ferx_core::PkParams + core::marker::Send + core::marker::Sync)>
-pub type ferx_core::RuvMagFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>, f64) -> f64 + core::marker::Send + core::marker::Sync)>
+pub type ferx_core::RuvMagFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>, f64, f64) -> f64 + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::ScaleFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>, &ferx_core::PkParams) -> f64 + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::TvFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>) -> alloc::vec::Vec<f64> + core::marker::Send + core::marker::Sync)>

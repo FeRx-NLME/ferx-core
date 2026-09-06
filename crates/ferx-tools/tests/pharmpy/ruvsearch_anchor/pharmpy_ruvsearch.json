@@ -1,0 +1,292 @@
+{
+ "all": {
+  "base_ofv": 503.0022585156639,
+  "cwres_models": [
+   {
+    "model": "IIV_on_RUV",
+    "dvid": 1,
+    "iteration": 1,
+    "dofv": 9.4030881176,
+    "parameters": {
+     "omega": 0.0360893
+    }
+   },
+   {
+    "model": "combined",
+    "dvid": 1,
+    "iteration": 1,
+    "dofv": 67.3799296532,
+    "parameters": {
+     "sigma_add": 3.88479,
+     "sigma_prop": 0.598303
+    }
+   },
+   {
+    "model": "power",
+    "dvid": 1,
+    "iteration": 1,
+    "dofv": 66.3978057537,
+    "parameters": {
+     "theta": -0.331609
+    }
+   },
+   {
+    "model": "time_varying1",
+    "dvid": 1,
+    "iteration": 1,
+    "dofv": 0.000340251,
+    "parameters": {
+     "theta": 1.0029
+    }
+   },
+   {
+    "model": "time_varying2",
+    "dvid": 1,
+    "iteration": 1,
+    "dofv": 9.9627155248,
+    "parameters": {
+     "theta": 0.800284
+    }
+   },
+   {
+    "model": "time_varying3",
+    "dvid": 1,
+    "iteration": 1,
+    "dofv": 33.0184049947,
+    "parameters": {
+     "theta": 0.654115
+    }
+   },
+   {
+    "model": "IIV_on_RUV",
+    "dvid": 1,
+    "iteration": 2,
+    "dofv": -0.054268049,
+    "parameters": {
+     "omega": 0.000322692
+    }
+   },
+   {
+    "model": "time_varying1",
+    "dvid": 1,
+    "iteration": 2,
+    "dofv": 0.9552578234,
+    "parameters": {
+     "theta": 1.08811
+    }
+   },
+   {
+    "model": "time_varying2",
+    "dvid": 1,
+    "iteration": 2,
+    "dofv": 0.8666046855,
+    "parameters": {
+     "theta": 1.06364
+    }
+   },
+   {
+    "model": "time_varying3",
+    "dvid": 1,
+    "iteration": 2,
+    "dofv": 2.3477476435,
+    "parameters": {
+     "theta": 1.1263
+    }
+   }
+  ],
+  "summary_tool": [
+   {
+    "step": 1,
+    "model": "best_ruvsearch_1",
+    "description": "combined",
+    "n_params": 8,
+    "d_params": 0,
+    "dofv": 0.0,
+    "ofv": 402.8942548063,
+    "rank": 1,
+    "parent_model": "input"
+   },
+   {
+    "step": 1,
+    "model": "best_ruvsearch_1_add",
+    "description": "additive",
+    "n_params": 7,
+    "d_params": -1,
+    "dofv": -56.0038857532,
+    "ofv": 458.8981405595,
+    "rank": null,
+    "parent_model": "input"
+   },
+   {
+    "step": 1,
+    "model": "input",
+    "description": "",
+    "n_params": 7,
+    "d_params": -1,
+    "dofv": -100.1080037093,
+    "ofv": 503.0022585157,
+    "rank": null,
+    "parent_model": ""
+   },
+   {
+    "step": 2,
+    "model": "best_ruvsearch_1",
+    "description": "combined",
+    "n_params": 8,
+    "d_params": 0,
+    "dofv": 0.0,
+    "ofv": 402.8942548063,
+    "rank": 1,
+    "parent_model": "input"
+   }
+  ],
+  "final_model_code": "$PROBLEM combined\n$DATA power_sim.csv IGNORE=@\n$INPUT ID TIME DV EVID AMT CMT=DROP RATE MDV\n$SUBROUTINES ADVAN2 TRANS2\n$PK\n  CL = THETA(1)*EXP(ETA(1))\n  V  = THETA(2)*EXP(ETA(2))\n  KA = THETA(3)*EXP(ETA(3))\n  S2 = V\n$ERROR\n  IPRED = F\n  Y = IPRED + EPS(1)*IPRED + EPS(2)\n$THETA (0, 0.127364)   ; TVCL\n$THETA (0, 8.0729)    ; TVV\n$THETA (0, 1.06414)    ; TVKA\n$OMEGA 0.0755006        ; ETA_CL\n$OMEGA 0.0500786        ; ETA_V\n$OMEGA 0.272757        ; ETA_KA\n$SIGMA  0.598303 ; sigma_prop\n$SIGMA  3.88479 ; sigma_add\n$ESTIMATION METHOD=COND INTERACTION MAXEVAL=9999 PRINT=5 NOABORT\n$TABLE ID TIME DV MDV IPRED CWRES NOPRINT ONEHEADER FILE=sdtab\n",
+  "final_ofv": 402.8942548063295,
+  "final_estimates": {
+   "TVCL": 0.127343,
+   "TVV": 7.99791,
+   "TVKA": 1.06434,
+   "ETA_CL": 0.0771594,
+   "ETA_V": 0.0528058,
+   "ETA_KA": 0.286143,
+   "sigma_prop": 0.00492826,
+   "sigma_add": 0.112538
+  }
+ },
+ "no_iiv": {
+  "base_ofv": 503.0022585156639,
+  "cwres_models": [
+   {
+    "model": "combined",
+    "dvid": 1,
+    "iteration": 1,
+    "dofv": 67.3799296532,
+    "parameters": {
+     "sigma_add": 3.88479,
+     "sigma_prop": 0.598303
+    }
+   },
+   {
+    "model": "power",
+    "dvid": 1,
+    "iteration": 1,
+    "dofv": 66.3978057537,
+    "parameters": {
+     "theta": -0.331609
+    }
+   },
+   {
+    "model": "time_varying1",
+    "dvid": 1,
+    "iteration": 1,
+    "dofv": 0.000340251,
+    "parameters": {
+     "theta": 1.0029
+    }
+   },
+   {
+    "model": "time_varying2",
+    "dvid": 1,
+    "iteration": 1,
+    "dofv": 9.9627155248,
+    "parameters": {
+     "theta": 0.800284
+    }
+   },
+   {
+    "model": "time_varying3",
+    "dvid": 1,
+    "iteration": 1,
+    "dofv": 33.0184049947,
+    "parameters": {
+     "theta": 0.654115
+    }
+   },
+   {
+    "model": "time_varying1",
+    "dvid": 1,
+    "iteration": 2,
+    "dofv": 0.9552578234,
+    "parameters": {
+     "theta": 1.08811
+    }
+   },
+   {
+    "model": "time_varying2",
+    "dvid": 1,
+    "iteration": 2,
+    "dofv": 0.8666046855,
+    "parameters": {
+     "theta": 1.06364
+    }
+   },
+   {
+    "model": "time_varying3",
+    "dvid": 1,
+    "iteration": 2,
+    "dofv": 2.3477476435,
+    "parameters": {
+     "theta": 1.1263
+    }
+   }
+  ],
+  "summary_tool": [
+   {
+    "step": 1,
+    "model": "best_ruvsearch_1",
+    "description": "combined",
+    "n_params": 8,
+    "d_params": 0,
+    "dofv": 0.0,
+    "ofv": 402.8942548063,
+    "rank": 1,
+    "parent_model": "input"
+   },
+   {
+    "step": 1,
+    "model": "best_ruvsearch_1_add",
+    "description": "additive",
+    "n_params": 7,
+    "d_params": -1,
+    "dofv": -56.0038857532,
+    "ofv": 458.8981405595,
+    "rank": null,
+    "parent_model": "input"
+   },
+   {
+    "step": 1,
+    "model": "input",
+    "description": "",
+    "n_params": 7,
+    "d_params": -1,
+    "dofv": -100.1080037093,
+    "ofv": 503.0022585157,
+    "rank": null,
+    "parent_model": ""
+   },
+   {
+    "step": 2,
+    "model": "best_ruvsearch_1",
+    "description": "combined",
+    "n_params": 8,
+    "d_params": 0,
+    "dofv": 0.0,
+    "ofv": 402.8942548063,
+    "rank": 1,
+    "parent_model": "input"
+   }
+  ],
+  "final_model_code": "$PROBLEM combined\n$DATA power_sim.csv IGNORE=@\n$INPUT ID TIME DV EVID AMT CMT=DROP RATE MDV\n$SUBROUTINES ADVAN2 TRANS2\n$PK\n  CL = THETA(1)*EXP(ETA(1))\n  V  = THETA(2)*EXP(ETA(2))\n  KA = THETA(3)*EXP(ETA(3))\n  S2 = V\n$ERROR\n  IPRED = F\n  Y = IPRED + EPS(1)*IPRED + EPS(2)\n$THETA (0, 0.127364)   ; TVCL\n$THETA (0, 8.0729)    ; TVV\n$THETA (0, 1.06414)    ; TVKA\n$OMEGA 0.0755006        ; ETA_CL\n$OMEGA 0.0500786        ; ETA_V\n$OMEGA 0.272757        ; ETA_KA\n$SIGMA  0.598303 ; sigma_prop\n$SIGMA  3.88479 ; sigma_add\n$ESTIMATION METHOD=COND INTERACTION MAXEVAL=9999 PRINT=5 NOABORT\n$TABLE ID TIME DV MDV IPRED CWRES NOPRINT ONEHEADER FILE=sdtab\n",
+  "final_ofv": 402.8942548063295,
+  "final_estimates": {
+   "TVCL": 0.127343,
+   "TVV": 7.99791,
+   "TVKA": 1.06434,
+   "ETA_CL": 0.0771594,
+   "ETA_V": 0.0528058,
+   "ETA_KA": 0.286143,
+   "sigma_prop": 0.00492826,
+   "sigma_add": 0.112538
+  }
+ }
+}
