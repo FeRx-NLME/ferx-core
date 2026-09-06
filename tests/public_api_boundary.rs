@@ -361,3 +361,373 @@ fn toml_comments_are_stripped_but_string_hashes_survive() {
     let name = "name = \"ferx-core\"";
     assert_eq!(strip_toml_comment(name), name);
 }
+
+// ── A4 — every `pub *Options` type implements `Default` (#529) ───────────────
+
+/// One `pub … Options` type declaration found by the source scan.
+#[derive(Debug, PartialEq, Eq)]
+struct OptionsDecl {
+    name: String,
+    /// `Default` appears in a `#[derive(...)]` attached to the declaration.
+    derives_default: bool,
+    /// 1-indexed line of the `pub struct` / `pub enum` itself.
+    line: usize,
+}
+
+/// The attributes attached to the item declared at `decl_idx`, as one string.
+///
+/// Walks back to the nearest blank line — the block rustfmt keeps contiguous
+/// above an item — and keeps only genuine attribute lines. Doc comments are
+/// **dropped on purpose**: several of the types this guard covers explain their
+/// `Default` in prose ("Derives `Default` so the wrapper can spread it"), and a
+/// substring scan that read documentation would let a comment satisfy a check
+/// about code. Continuation lines of a multi-line attribute are kept via the
+/// paren depth, so a `#[derive(` split across lines is still seen whole.
+fn attribute_block_above(lines: &[&str], decl_idx: usize) -> String {
+    let mut start = decl_idx;
+    while start > 0 && !lines[start - 1].trim().is_empty() {
+        start -= 1;
+    }
+    let mut attrs = String::new();
+    let mut depth = 0usize;
+    for line in &lines[start..decl_idx] {
+        let trimmed = line.trim();
+        if depth == 0 && !trimmed.starts_with("#[") && !trimmed.starts_with("#![") {
+            continue;
+        }
+        attrs.push_str(trimmed);
+        attrs.push('\n');
+        depth += trimmed.matches('(').count();
+        depth = depth.saturating_sub(trimmed.matches(')').count());
+    }
+    attrs
+}
+
+/// Whether `attrs` contains a `#[derive(...)]` naming `Default` **as a whole
+/// trait**, not as a substring: a hypothetical `DefaultDisplay` derive must not
+/// satisfy the guard.
+fn derive_list_names_default(attrs: &str) -> bool {
+    let mut rest = attrs;
+    while let Some(at) = rest.find("derive(") {
+        let after = &rest[at + "derive(".len()..];
+        let mut depth = 1usize;
+        let mut end = after.len();
+        for (i, c) in after.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let inner = &after[..end];
+        if inner
+            .split(',')
+            .any(|t| matches!(t.trim(), "Default" | "core::default::Default"))
+        {
+            return true;
+        }
+        rest = &after[end.min(after.len())..];
+    }
+    false
+}
+
+/// Identifier starting at the front of `s`, or `None` if `s` does not start
+/// with one.
+fn leading_ident(s: &str) -> Option<&str> {
+    let end = s
+        .find(|c: char| !c.is_alphanumeric() && c != '_')
+        .unwrap_or(s.len());
+    (end > 0).then(|| &s[..end])
+}
+
+/// Every `struct`/`enum` in `src` whose name ends in `Options`.
+///
+/// Deliberately name-driven rather than baseline-driven: `cargo public-api`
+/// omits *derived* impls, so `api/ferx-core-public-api.txt` shows no
+/// `impl Default` row for a type that derives it (only for the hand-written
+/// ones). The committed baseline therefore cannot see this convention at all,
+/// which is why it is scanned from source — the same argument that puts the
+/// `#[doc(hidden)]` ban in this file.
+fn scan_options_decls(src: &str) -> Vec<OptionsDecl> {
+    let lines: Vec<&str> = src.lines().collect();
+    let mut out = Vec::new();
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        let after_kind = trimmed
+            .strip_prefix("pub struct ")
+            .or_else(|| trimmed.strip_prefix("pub enum "));
+        let Some(after_kind) = after_kind else {
+            continue;
+        };
+        let Some(name) = leading_ident(after_kind) else {
+            continue;
+        };
+        if !name.ends_with("Options") {
+            continue;
+        }
+        out.push(OptionsDecl {
+            name: name.to_string(),
+            derives_default: derive_list_names_default(&attribute_block_above(&lines, idx)),
+            line: idx + 1,
+        });
+    }
+    out
+}
+
+/// Type names carrying a hand-written `impl Default for …` in `src`.
+///
+/// Six of the options types in this workspace implement `Default` manually
+/// (`FitOptions`, `OdeSolverOptions`, `AdaptiveSimulateOptions`,
+/// `BootstrapOptions`, `GamOptions`, `RunOptions`), so a derive-only scan would
+/// report six false offenders.
+fn scan_manual_default_impls(src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in src.lines() {
+        let trimmed = line.trim_start();
+        for prefix in ["impl Default for ", "impl core::default::Default for "] {
+            let Some(after) = trimmed.strip_prefix(prefix) else {
+                continue;
+            };
+            // Take the last path segment so `impl Default for crate::a::B` and
+            // `impl Default for B` agree, and drop any generic argument list.
+            let head = after.split(['<', ' ', '{']).next().unwrap_or(after);
+            if let Some(name) = head.rsplit("::").next().and_then(leading_ident) {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Rust sources under `dir`, skipping any `target/` build directory.
+fn rust_sources_skipping_target(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).expect("readable directory") {
+        let path = entry.expect("readable dir entry").path();
+        if path.is_dir() {
+            if path.file_name().and_then(|n| n.to_str()) == Some("target") {
+                continue;
+            }
+            rust_sources_skipping_target(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// **A4 — every `pub *Options` type in the workspace implements `Default`
+/// (#529).**
+///
+/// `ferx-r` builds these structs with exhaustive literals, so a field added
+/// here breaks the wrapper's build with `error[E0063]: missing field`. The fix
+/// is for the wrapper to spread `..Default::default()`, which it can only do if
+/// the struct implements `Default` — so "options types implement `Default`" is
+/// a cross-repo contract, not a style preference.
+///
+/// This is an **inventory** check, not a list: it discovers every `struct` /
+/// `enum` named `*Options` under `src/` and `crates/`, so a newly added one
+/// that forgets the trait fails here without anyone remembering to register it.
+/// The scan is pinned by `options_scan_flags_a_new_struct_without_default`
+/// below, which feeds it exactly that mutation.
+#[test]
+fn every_public_options_type_implements_default() {
+    let root = repo_root();
+    let mut sources = Vec::new();
+    rust_sources_skipping_target(&root.join("src"), &mut sources);
+    rust_sources_skipping_target(&root.join("crates"), &mut sources);
+    assert!(
+        !sources.is_empty(),
+        "found no sources under src/ or crates/"
+    );
+
+    let mut decls: Vec<(PathBuf, OptionsDecl)> = Vec::new();
+    let mut manual_impls: Vec<String> = Vec::new();
+    for path in &sources {
+        let src = std::fs::read_to_string(path).expect("source file is valid UTF-8");
+        manual_impls.extend(scan_manual_default_impls(&src));
+        for decl in scan_options_decls(&src) {
+            decls.push((path.clone(), decl));
+        }
+    }
+
+    // Non-degeneracy: a scan that silently found nothing, or that classified
+    // every type the same way, would pass vacuously. Both spellings of the
+    // convention must be present and correctly told apart — `SimulateOptions`
+    // derives `Default`, `FitOptions` implements it by hand.
+    let found = |name: &str| decls.iter().any(|(_, d)| d.name == name);
+    for anchor in [
+        "FitOptions",
+        "SaveFitOptions",
+        "OdeSolverOptions",
+        "SimulateOptions",
+        "SimulateUncertaintyOptions",
+        "AdaptiveSimulateOptions",
+        "BootstrapOptions",
+        "GamOptions",
+        "RunOptions",
+    ] {
+        assert!(found(anchor), "the scan did not find `{anchor}`");
+    }
+    assert!(
+        decls
+            .iter()
+            .any(|(_, d)| d.name == "SimulateOptions" && d.derives_default),
+        "`SimulateOptions` derives `Default`; the derive arm of the scan is broken"
+    );
+    assert!(
+        decls
+            .iter()
+            .any(|(_, d)| d.name == "FitOptions" && !d.derives_default),
+        "`FitOptions` implements `Default` by hand, not by derive; \
+         the scan is reading a derive that is not there"
+    );
+    assert!(
+        manual_impls.iter().any(|n| n == "FitOptions"),
+        "the manual-`impl` arm of the scan is broken"
+    );
+
+    let offenders: Vec<String> = decls
+        .iter()
+        .filter(|(_, d)| !d.derives_default && !manual_impls.contains(&d.name))
+        .map(|(path, d)| {
+            format!(
+                "{}:{} ({})",
+                path.strip_prefix(&root).unwrap_or(path).display(),
+                d.line,
+                d.name
+            )
+        })
+        .collect();
+
+    assert!(
+        offenders.is_empty(),
+        "every `pub *Options` type must implement `Default` so a wrapper can \
+         build it with `..Default::default()` and survive an added field \
+         (#529). Add `Default` to the derive list, or write an `impl Default` \
+         with meaningful values. Missing at: {offenders:?}"
+    );
+}
+
+/// The mutation the A4 guard exists to catch, run against the scan itself:
+/// introducing a `pub *Options` type with no `Default` must be reported.
+///
+/// This is the check a hand-written `assert_default::<T>()` list cannot make —
+/// adding a type does not change a hard-coded list, so such a test stays green.
+/// Here the offender is the *only* thing that differs between the two fixtures,
+/// and the guard's verdict has to flip with it.
+#[test]
+fn options_scan_flags_a_new_struct_without_default() {
+    const FIXTURE: &str = r#"
+/// Derives `Default` in prose only — this documentation must not rescue the
+/// type below, which is the point of dropping doc comments from the scan.
+#[derive(Debug, Clone)]
+pub struct ForgottenOptions {
+    pub a: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DerivedOptions {
+    pub b: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ManualOptions {
+    pub c: usize,
+}
+
+impl Default for ManualOptions {
+    fn default() -> Self {
+        Self { c: 7 }
+    }
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Default,
+)]
+pub enum SplitDeriveOptions {
+    #[default]
+    One,
+}
+
+/// Not an options type, so not this guard's business.
+#[derive(Debug)]
+pub struct Something {
+    pub d: usize,
+}
+"#;
+
+    let decls = scan_options_decls(FIXTURE);
+    let names: Vec<&str> = decls.iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "ForgottenOptions",
+            "DerivedOptions",
+            "ManualOptions",
+            "SplitDeriveOptions"
+        ],
+        "the scan must find every `pub *Options` declaration and nothing else"
+    );
+
+    let manual = scan_manual_default_impls(FIXTURE);
+    assert_eq!(manual, vec!["ManualOptions".to_string()]);
+
+    let flagged: Vec<&str> = decls
+        .iter()
+        .filter(|d| !d.derives_default && !manual.contains(&d.name))
+        .map(|d| d.name.as_str())
+        .collect();
+    assert_eq!(
+        flagged,
+        vec!["ForgottenOptions"],
+        "exactly the type that forgot `Default` must be reported — a prose \
+         mention of the trait must not satisfy the guard, and a multi-line \
+         derive must not be missed"
+    );
+
+    // The straddle: the *same* fixture with the derive fixed must come back
+    // clean, so the guard's verdict tracks the code rather than always firing.
+    let fixed = FIXTURE.replace(
+        "#[derive(Debug, Clone)]\npub struct ForgottenOptions",
+        "#[derive(Debug, Clone, Default)]\npub struct ForgottenOptions",
+    );
+    assert_ne!(
+        fixed, FIXTURE,
+        "the mutation must actually change the source"
+    );
+    let manual_fixed = scan_manual_default_impls(&fixed);
+    let still_flagged: Vec<String> = scan_options_decls(&fixed)
+        .into_iter()
+        .filter(|d| !d.derives_default && !manual_fixed.contains(&d.name))
+        .map(|d| d.name)
+        .collect();
+    assert!(
+        still_flagged.is_empty(),
+        "adding the derive must clear the finding, got {still_flagged:?}"
+    );
+}
+
+/// `Default` must be matched as a derive entry, not as a substring, and a
+/// `derive(...)` must not be read out of an unrelated attribute.
+#[test]
+fn derive_list_matches_default_exactly() {
+    assert!(derive_list_names_default("#[derive(Debug, Default)]"));
+    assert!(derive_list_names_default(
+        "#[derive(Debug,\n Default,\n Clone)]"
+    ));
+    assert!(!derive_list_names_default("#[derive(Debug, Clone)]"));
+    // A trait whose name merely starts with `Default`.
+    assert!(!derive_list_names_default("#[derive(DefaultDisplay)]"));
+    // Nested parens inside an earlier attribute must not end the scan early.
+    assert!(derive_list_names_default(
+        "#[derive(Debug)]\n#[serde(rename_all(x))]\n#[derive(Default)]"
+    ));
+    assert!(!derive_list_names_default("#[non_exhaustive]"));
+}

@@ -1558,3 +1558,93 @@ fn asymptotic_errors_without_covariance_step() {
     let err = simulate_with_uncertainty(&model, &pop, &fit, &opts).unwrap_err();
     assert!(err.contains("covariance"));
 }
+
+// ---------------------------------------------------------------------------
+// #529 — `Default` at the R boundary
+// ---------------------------------------------------------------------------
+
+/// Pin every field of the derived `Default`. The R wrapper builds this struct
+/// with `..Default::default()`, so these values are the ones a field it does
+/// *not* name silently takes.
+#[test]
+fn simulate_uncertainty_options_default_values() {
+    let d = SimulateUncertaintyOptions::default();
+    assert_eq!(d.n_uncertainty_draws, 0);
+    assert_eq!(d.n_sim_per_draw, 0);
+    assert_eq!(d.method, UncertaintyMethod::Asymptotic);
+    assert_eq!(d.seed, None);
+}
+
+/// The point of #529: a spread construction that names only the fields the
+/// caller cares about must behave identically to the exhaustive literal it
+/// replaces. Run both through `simulate_with_uncertainty` with the same seed
+/// and require bit-identical predictions — an oracle that fails if a future
+/// field's default silently changes the simulation rather than merely
+/// compiling.
+#[test]
+fn spread_default_matches_exhaustive_literal() {
+    let model = tiny_model();
+    let pop = tiny_population();
+    let fit = synthetic_fit(&model.default_params);
+
+    let exhaustive = SimulateUncertaintyOptions {
+        n_uncertainty_draws: 3,
+        n_sim_per_draw: 2,
+        method: UncertaintyMethod::Asymptotic,
+        seed: Some(42),
+    };
+    let spread = SimulateUncertaintyOptions {
+        n_uncertainty_draws: 3,
+        n_sim_per_draw: 2,
+        seed: Some(42),
+        ..Default::default()
+    };
+
+    let a = simulate_with_uncertainty(&model, &pop, &fit, &exhaustive).unwrap();
+    let b = simulate_with_uncertainty(&model, &pop, &fit, &spread).unwrap();
+
+    // Non-degenerate: the comparison is worthless on an empty or all-zero run.
+    assert_eq!(a.len(), 3 * 2 * 2 * 3);
+    assert!(a
+        .iter()
+        .all(|r| r.ipred.is_finite() && r.outcome.continuous_value().is_finite()));
+    assert!(a.iter().any(|r| r.ipred != 0.0));
+
+    assert_eq!(a.len(), b.len());
+    for (x, y) in a.iter().zip(b.iter()) {
+        assert_eq!(x.id, y.id);
+        assert_eq!(x.time, y.time);
+        assert_eq!(x.draw, y.draw);
+        assert_eq!(x.sim, y.sim);
+        assert_eq!(x.ipred.to_bits(), y.ipred.to_bits());
+        assert_eq!(
+            x.outcome.continuous_value().to_bits(),
+            y.outcome.continuous_value().to_bits()
+        );
+    }
+}
+
+/// #529, trait-level half: the options types `ferx-core` exposes at the R
+/// boundary really do resolve `Default`, so the wrapper can spread them.
+///
+/// This is a **named spot check, not the inventory guard** — the list is
+/// hand-written, so adding a new options struct does not change it and this
+/// test would stay green. Discovery is
+/// `every_public_options_type_implements_default` in
+/// `tests/public_api_boundary.rs` (A4), which scans `src/` and `crates/` for
+/// every `*Options` declaration and fails on one lacking `Default`. The two
+/// are complementary: the scan is textual and sees types nobody registered,
+/// this one is a real trait bound and would catch a `Default` that exists in
+/// source but does not apply to the type (a `cfg`-ed out impl, say).
+#[test]
+fn every_public_options_struct_implements_default() {
+    fn assert_default<T: Default>() -> T {
+        T::default()
+    }
+    let _ = assert_default::<crate::types::FitOptions>();
+    let _ = assert_default::<crate::io::fitrx::SaveFitOptions>();
+    let _ = assert_default::<crate::ode::solver::OdeSolverOptions>();
+    let _ = assert_default::<crate::api::simulate::SimulateOptions>();
+    let _ = assert_default::<SimulateUncertaintyOptions>();
+    let _ = assert_default::<crate::AdaptiveSimulateOptions>();
+}

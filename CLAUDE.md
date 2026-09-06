@@ -274,6 +274,42 @@ that no fixture could see.
 When an anchor does fail, vary **one input at a time** — the pair that differs by a
 single number is what localises the defect (`nonmem_anchor/tvcov_lag_saltation*`).
 
+**The oracle has to be more accurate than the difference you are about to call a defect.**
+An oracle outside that regime measures itself, not the thing under test — and an ODE twin at
+default tolerances is not automatically an oracle. `verify_against_ode_twin`
+(`pk/modified_release.rs`) compared the MR closed form against `ode_predictions` at
+`verify_tol = (500·reltol).max(1e-4)`, derived from `reltol` alone; but Dormand–Prince
+controls local error as `abstol + reltol·|y|`, so the twin's own
+relative accuracy is `abstol/|y| + reltol` and a state decayed to the order of `abstol` has no
+significant digits left. Measured on #1124/#1130: `central` fell to 1.3e-6 against that spec's
+`abstol = 1e-6`, the twin said 29.484, the closed form said 24.574829 — and the exact Bateman
+superposition is 24.574829, so the *twin* was 20% high and the check aborted a correct fit in
+debug. Gate the comparison on the condition for the oracle to outrank the disagreement, and
+when you cannot tell an oracle artifact from a real defect, **compute the quantity a third
+way, outside both engines** — a 30-line Bateman sum in Python settled that one after two
+wrong hypotheses reasoned from the code. Swapping oracles is changing the experiment, too:
+moving that twin to `ode_predictions_with_states` silently adopted a *wrong* reference, because
+at the time it dropped a lagged `zero_order` input rate that `ode_predictions` applied — a real
+public-API defect the swap surfaced, since fixed (#1171).
+
+**Measure the tolerance; never justify it with a story.** Run the comparison, print the worst
+realised error, put that number in the comment, and pick the bound from it with stated
+headroom. On PR #1174 a NONMEM POSTHOC sdtab anchor was set at `3e-2` with the explanation
+that the two inner optimizers "stop at slightly different η̂"; the realised error was
+**4.736e-5** — 630× tighter — and ferx's η̂ matches NONMEM's `.phi` to ~6 significant figures,
+so the stated mechanism was not conservative but wrong. A bound that loose is not safe, it is
+a test that has quietly stopped testing: at `3e-2` a regression delivering 99% of the absorbed
+mass passes green, and that was the only end-to-end `fit()` → sdtab check against an external
+reference. If the realised error surprises you, chase it — that is information.
+
+**When the bug report is "two implementations disagree", the fix is one implementation.** This
+is the `*_g<T: PkNum>` rule in *Analytic Sensitivities* below, generalised past `sens/` to any
+two engines, and it buys a *test* property: after #1223 extracted `fill_prestart_states`, one
+mutation of the helper reddens both the dense and the shared solve, where the dedicated-engine
+control had needed its own. A comment calling a second copy "the exact twin of" restores by
+prose exactly the configuration that produced the defect. If two callers genuinely cannot
+share, record the asymmetry at the call site.
+
 **A green test is not evidence that it can fail.** The rule above is about a fixture that
 cannot expose the defect; these are three ways the *assertion* cannot observe it, all three
 found on #1166 in tests that had been written, run green and believed:
@@ -297,12 +333,43 @@ found on #1166 in tests that had been written, run green and believed:
   `is_finite()` before folding. That anchor's one *direct* `(total - want).abs() < tol` was
   already safe, since any comparison against `NaN` is `false`; only the fold hides it.
   `filter_map(…ok())` and `unwrap_or(0.0)` absorb failures the same way.
+- **Two redundant gates cover for each other.** A #1229 check filtered on the coordinate's
+  *kind* inside the loop and on a second, derived per-coordinate table right after — both
+  correct, both excluding exactly the same inputs. Deleting either left the whole suite green,
+  so the test pinning that the check excludes Σ could not fail. When a
+  predicate has two conditions that reject the same inputs that is a test hole, not
+  belt-and-braces: collapse to one gate and re-run the mutation. Reading the code missed this
+  twice; only mutation found it.
+- **`is_finite()` cannot see a sentinel.** It is the right assertion for a *diverged* solve
+  (`NaN`/`inf`) and the wrong one for a subject that was **repelled**: `tte_nll_from_curves`
+  maps a `NaN` `H` to `1e20`, a perfectly finite `f64`, and #1223 measured an objective of
+  `2e20` coming back green under the mutation the test existed to catch. A test whose failure
+  mode is "the subject got repelled" must bound the magnitude instead — grep the sentinel's
+  actual value (`1e20` in `crate::survival`) and state both distances in the comment, to the
+  sentinel and to the real objective, so the bound is measured rather than picked.
 
 For each new assertion, name the regression it exists to catch and check that regression can
 actually reach it. For a regression test that means mutation; for an anchor, feeding it the
-failure it exists to catch.
+failure it exists to catch. Two things that "I mutation-tested it" does **not** cover:
 
-**Every change to an analytic sensitivity, gradient, marginal, or likelihood path requires a `Dual2`-vs-FD parity test.** The closed-form PK solutions and event-driven propagators are written once as generic `*_g<T: PkNum>` functions; instantiating `T = Dual2<M>` yields the exact `∂f/∂η` / `∂f/∂θ` that FOCE/FOCEI/HMC consume (`sens/`). A wrong sensitivity compiles and runs silently — there is no second copy of the formula to disagree with it — so when you add or modify one of these kernels, or the provider that assembles them, assert it against central finite differences of the `T = f64` production predictor, to tolerance, in a Tier-1 unit test. That parity pins the *derivative* against the value path, not the value path itself — when both share a wrong convention it passes against the exact derivative of the wrong function, which is how #1079 survived. It is an oracle for the gradient only; see the non-degeneracy rule above for what it cannot see. Follow the existing pattern: per-kernel `*_g_dual_matches_fd` checks (`sens/propagate.rs`, `sens/dual2.rs`) and the end-to-end `check_full_provider_vs_fd` harness (`sens/provider_tests.rs`). If a model is outside the analytic scope it must route to FD via the support predicates (`sens_supported` / `analytic_inner_grad_supported_model`); unit-test that routing so a scope gap fails loudly to FD instead of silently returning a wrong gradient. (This is the post-Enzyme successor to the retired `AD↔FD` parity rule — see #285 / #281.)
+- **Mutating your own fix is not enough — ask what the *smallest* edit that removes it is, and
+  which test dies.** On #1171 / PR #1174 sixteen tests across three tiers each died correctly
+  when the fix was toggled off, and the suite was called verified. A reviewer's *different*
+  minimal edit — drop both `push_route_lag_break_times` calls and have
+  `push_zero_order_break_times` emit `[w_start, w_end]` — passed the entire suite at identical
+  margins, because every fixture used `zero_order`, the one kind where the route onset
+  coincides exactly with the window start. The tests pinned a strictly weaker property than
+  the fix. If the honest answer to "which test dies" is "none", the fixture set is degenerate
+  however green it is.
+- **Mutate each side of a twin separately.** On #1223 deleting the *share* fill reddened the
+  parity test as designed, and deleting the *dense* fill left it green — the fixture never
+  reached the dense fill, because each engine folds its own horizon into `break_times` and the
+  dense builder's `saveat` was the `chz_times` themselves. A twin whose second leg is computed
+  by an unexercised path is an assertion against a constant. Require each mutation to name its
+  own side in the failure message; if one side stays green, find the fast path supplying the
+  answer and change the fixture until it does not.
+
+**Every change to an analytic sensitivity, gradient, marginal, or likelihood path requires a `Dual2`-vs-FD parity test.** The closed-form PK solutions and event-driven propagators are written once as generic `*_g<T: PkNum>` functions; instantiating `T = Dual2<M>` yields the exact `∂f/∂η` / `∂f/∂θ` that FOCE/FOCEI/HMC consume (`sens/`). A wrong sensitivity compiles and runs silently — there is no second copy of the formula to disagree with it — so when you add or modify one of these kernels, or the provider that assembles them, assert it against central finite differences of the `T = f64` production predictor, to tolerance, in a Tier-1 unit test. That parity pins the *derivative* against the value path, not the value path itself — when both share a wrong convention it passes against the exact derivative of the wrong function, which is how #1079 survived. It is an oracle for the gradient only; see the non-degeneracy rule above for what it cannot see. Follow the existing pattern: per-kernel `*_g_dual_matches_fd` checks (`sens/propagate.rs`, `sens/dual2.rs`) and the end-to-end `check_full_provider_vs_fd` harness (`sens/provider_tests.rs`). If a model is outside the analytic scope it must route to FD via the support predicates (`sens_supported` / `analytic_inner_grad_supported_model`); unit-test that routing so a scope gap fails loudly to FD instead of silently returning a wrong gradient. (This is the post-Enzyme successor to the retired `AD↔FD` parity rule — see #285 / #281.) **Before believing such a fix is complete, ask which engine each fixture actually ran on**: a fixture that routes to FD cannot observe the dual path at all, so a green anchor on it says nothing about the gradient side. Read the `FitResult` FD-fallback warning — on #1210 all seven `nonmem_anchor/ss_chz_*` arms reported "1 of 1 subjects use finite-difference inner gradients", so a green `--lib` suite and green CI never touched `sens/ode_provider.rs`'s dual SS equilibration, and only a Tier-3 convergence fit on a 300-subject joint PK-TTE population reached it. If every fixture says FD, the dual twin is untested.
 
 **Coverage is gated per PR.** A PR's changed lines must carry their own tests — the Codecov `patch` status enforces ≥90% coverage on the diff, and a 90% project floor is enforced on the weekly `main` run (see `codecov.yml`). This is the automated backstop to the rules above; slow-tests never run on PRs, so unit / Tier-2 tests are what register coverage. When excluding code from coverage, **scope `ignore`s by role, not by coverage %**: leave code out for *what it is* — dev-only tooling (e.g. `src/bin/generate_data.rs`), generated code (`build.rs`), or test scaffolding (`tests/`) — never because it reads red. (Feature-gated code that the coverage build doesn't compile reads as "missed" but is a measurement gap, not an ignore target — see #293.)
 

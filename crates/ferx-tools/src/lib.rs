@@ -36,6 +36,27 @@ pub fn core_version() -> &'static str {
 mod tests {
     use super::core_version;
 
+    /// #529, trait-level half for `ferx-tools`: this crate's options types
+    /// really do resolve `Default`, so a caller can build them with
+    /// `..Default::default()`.
+    ///
+    /// A **named spot check, not the inventory guard** — the list is
+    /// hand-written and a new options struct does not change it. Discovery for
+    /// the whole workspace (this crate included: the scan walks `crates/`) is
+    /// `every_public_options_type_implements_default` in `ferx-core`'s
+    /// `tests/public_api_boundary.rs` (A4). It lives there rather than here
+    /// because `ferx-core` must not depend on `ferx-tools`, and a source scan
+    /// needs no dependency in either direction.
+    #[test]
+    fn every_public_options_struct_implements_default() {
+        fn assert_default<T: Default>() -> T {
+            T::default()
+        }
+        let _ = assert_default::<crate::bootstrap::BootstrapOptions>();
+        let _ = assert_default::<crate::gam::GamOptions>();
+        let _ = assert_default::<crate::search::RunOptions>();
+    }
+
     #[test]
     fn core_version_is_reported_through_the_public_api() {
         let v = core_version();

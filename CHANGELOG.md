@@ -35,6 +35,14 @@ section of the SDLC for the versioning policy).
   same final relation set, OFVs within 1e-4 (`docs/tools/covsearch.qmd`). `ferx allometry` adds
   `(WT/70)^0.75` to every clearance and `(WT/70)^1.0` to every volume the `pk` line binds — as
   `[covariate_model]` lines, fixed or estimated — and fits base and scaled model side by side.
+- **`Default` on `UncertaintyMethod` and `SimulateUncertaintyOptions` (#529).** The
+  uncertainty-simulation options can now be built with `..Default::default()`
+  (`UncertaintyMethod::Asymptotic` is the default method), so wrapper code stays
+  source-compatible when a field is added. Every other `*Options` type in
+  `ferx-core` and `ferx-tools` already implemented `Default`; a new inventory
+  guard (`tests/public_api_boundary.rs`, A4) now discovers every `*Options`
+  declaration under `src/` and `crates/` and fails on one that lacks it, so the
+  convention holds for options types added later.
 - **`.ferxsearch` search configuration and an MFL search-space parser in `ferx-tools` (#1179).**
   A TOML file (`base`, `data`, `[space] mfl`, `[rank]`, `[strictness]`, `[run]`) whose space is
   written in Pharmpy's Model Feature Language, with `@IIV` / `@PK` / `@CONTINUOUS` / … resolved
@@ -63,6 +71,27 @@ section of the SDLC for the versioning policy).
   `ferx_fit(settings = list(nn_l2 = ..., nn_smooth = ...))`.
 
 ### Fixed
+- **An observation within `1e-12` after a lagged dose arrival is no longer read pre-dose
+  (#1226).** With a compartment or route lag whose arrival lands a few ULP short of a
+  sample time — reachable whenever `ALAG` is estimated or covariate-scaled, since an
+  optimizer walks it continuously — the objective, `sdtab` and the dense grid behind the
+  joint PK-TTE hazard, `[derived]` integrals and `simulate()` recorded that sample from the
+  state *before* the dose was applied, so a subject read drug-free at a sample taken after
+  its own dose (45.38 against NONMEM's 145.38 on the committed anchor — a whole 100 mg, on
+  the OFV and not only a diagnostic). The mirror sign was wrong in the opposite direction on
+  one path: the shared PK-TTE solve's cumulative-hazard boundary read used a symmetric
+  tolerance, so a hazard time just *before* an arrival was overwritten with the post-dose
+  state. Recording is now one-sided everywhere — at or up to `1e-12` after a break reads
+  post-event, anything before it reads pre-event — matching NONMEM's record ordering, which
+  is anchored on both signs (`nonmem_anchor/lag_arrival_read_{before,after}_advan{1,13}`).
+  The event-driven predictor and the analytical closed forms were always correct and are
+  unchanged. The same fix closes three pre-existing gaps found while making it: an
+  observation landing exactly on an interior dose read pre-dose on the analytic-sensitivity
+  walk while the predictor read post-dose; a dose landing on a subject's **last** observation
+  was never applied by that walk at all (the FOCEI gradient short by a whole dose while the
+  objective had it); and an observation coinciding with a dose break was assimilated **twice**
+  by the SDE/EKF filter, returning an over-confident `p_obs` at that record and a distorted
+  covariance for the rest of the subject.
 - **A joint PK-TTE subject whose `TENTRY` (or interval-censored left bound) falls at or
   before its first record no longer scores the `1e20` sentinel (#1223).** The one-solve
   shared path left such a time's ODE state `NaN`, which the TTE likelihood reads as a
@@ -125,6 +154,25 @@ section of the SDLC for the versioning policy).
   no closed-form absorption ODE twin — now warns that the key has no effect, instead of being
   dropped silently. Models that do integrate (including a closed-form transit / inverse-Gaussian
   model reaching its twin) still never warn on these keys, as of #517.
+- **A free variance declared on the optimizer's lower rail is now rejected up front
+  (#1229).** `omega ETA_CL ~ 0.0` without `FIX` — and any free `omega` / `kappa` /
+  `[mixture] omega(k)` variance ≤ 6.1e-6, since all of them pack to `ln(L) ≤ -6` — fails
+  with `E_OMEGA_INIT_AT_RAIL` from `fit()` and from `ferx check`, naming the parameter and
+  the one-keyword fix. A declared zero is regularised to `1e-8`, so its packed start
+  (`-9.21`) sits *below* its own lower bound and is clamped onto the rail; from there the
+  coordinate stays collapsed or runs away to the opposite rail, and the θ estimates move
+  with it (48% off on the #1227 fixture) while `converged` is a coin flip. NM-TRAN refuses
+  the same stream with error 76. Write `~ 0.0 FIX` for no variability, or start at ≥ 1e-5
+  to estimate it. `sigma ~ 0.0` is unaffected — measured to reach the optimum from its own
+  `-8` rail — and `predict()` / `simulate()` are untouched, so a zero-variance fixture
+  used only for prediction still works. The check applies only when an optimizer will
+  actually search: `maxiter = 0` (NONMEM `MAXEVAL=0`, as used by `ferx gam --no-fit` and by
+  `ferx-tools`' bootstrap `--dofv`, which re-evaluates each replicate at its own estimates)
+  is exempt — it clamps the start like any other run, but produces one objective and stops,
+  so nothing is trapped on the rail. Note that it therefore *evaluates* a free `~ 0.0` at
+  `exp(-12)` rather than at the declared value, which `FIX` avoids (#1251). `saem` / `imp` /
+  `impmap` / `bayes` carry their own iteration counts and are checked regardless. A near-singular `block_omega` / `block_kappa`
+  is reported as the correlation problem it is, rather than as a small variance.
 - **FREM prep refuses a model with a non-Gaussian endpoint (#1199).** `prepare_frem()` /
   `transform_dataset_for_frem()` return `E_FREM_NON_GAUSSIAN_ENDPOINT` instead of writing
   a dataset from the Gaussian rows alone; run the FREM step on the PK model without the

@@ -24,6 +24,7 @@ pub(crate) use validation::{
     check_absorption_dosing, check_absorption_flip_flop_no_twin, check_analytic_readout_support,
     check_covariates, check_dose_compartments, check_endpoint_routing, check_kappa_weights,
     check_modeled_dose_rates, check_residual_magnitude, check_simulation_data,
+    check_variance_init_rails,
 };
 #[cfg(feature = "survival")]
 pub(crate) use validation::{

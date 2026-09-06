@@ -23,10 +23,19 @@ use rand::{Rng, RngExt};
 use rand_distr::StandardNormal;
 
 /// How parameter-uncertainty draws are produced.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Default` is [`UncertaintyMethod::Asymptotic`] — the standard MVN method,
+/// which needs only a successful covariance step. `Sir` additionally requires
+/// the SIR resample pool to have been retained at fit time, so it is not a
+/// safe default. Deriving `Default` here is what lets
+/// [`crate::SimulateUncertaintyOptions`] derive it too, so out-of-crate
+/// callers (the R wrapper) can construct it with `..Default::default()` and
+/// stay source-compatible when a field is added (#529).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UncertaintyMethod {
     /// MVN in packed log-space using `FitResult.covariance_matrix`. Fast and
     /// parametric; requires a successful covariance step.
+    #[default]
     Asymptotic,
     /// Reuse the resampled parameter vectors retained from the SIR step.
     /// Requires `FitOptions.sir = true` AND `sir_keep_samples = true`.
@@ -309,6 +318,15 @@ fn draw_sir(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #529: `UncertaintyMethod` derives `Default` so
+    /// `SimulateUncertaintyOptions` can derive it too. Pin the variant — a
+    /// silent move of `#[default]` to `Sir` would make a spread-constructed
+    /// options value demand a SIR pool that most fits never retained.
+    #[test]
+    fn uncertainty_method_defaults_to_asymptotic() {
+        assert_eq!(UncertaintyMethod::default(), UncertaintyMethod::Asymptotic);
+    }
     use crate::types::{ErrorModel, OmegaMatrix, SigmaVector};
     use nalgebra::DMatrix;
     use rand::rngs::StdRng;

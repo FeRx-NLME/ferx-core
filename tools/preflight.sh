@@ -60,7 +60,44 @@ export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-nightly}"
 # current user's numeric group IDs, and it wins. The first draft used it and
 # every group name silently became a GID — `unknown group 'check' — expected one
 # of: 20 12 61 ...`.
-ALL_GROUPS=(fmt check clippy rustdoc docs public-api)
+ALL_GROUPS=(fmt check clippy rustdoc docs public-api debug-assertions)
+
+# Groups that are NOT in the default selection.
+#
+# Every other group is a compile or a lint — seconds on a warm `target/`, which
+# is what makes a no-argument run something you do before every push. A group
+# that RUNS the unit suite is a different order of cost (its own profile hash,
+# so its own full build, and then the tests), and folding it into the default
+# would turn `tools/preflight.sh` from a pre-push habit into a coffee break. So
+# it is opt-in by name — `tools/preflight.sh debug-assertions` — and CI runs it
+# as its own job, which is where it has to be green.
+#
+# `--help` and `--list` still enumerate it, and
+# `tests/preflight_owns_the_fast_gates.rs` pins both this array and the fact that
+# the corresponding CI job delegates here, so an opt-in group cannot quietly
+# become a group that nothing ever runs.
+OPT_IN_GROUPS=(debug-assertions)
+
+is_opt_in() {
+  local candidate="$1" g
+  for g in "${OPT_IN_GROUPS[@]}"; do
+    if [ "$g" = "$candidate" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# `ALL_GROUPS` minus `OPT_IN_GROUPS`, in `ALL_GROUPS` order. Derived rather than
+# written out a second time: a group added to one list and forgotten in the other
+# is the failure mode this whole script exists to avoid.
+DEFAULT_GROUPS=()
+for g in "${ALL_GROUPS[@]}"; do
+  if ! is_opt_in "$g"; then
+    DEFAULT_GROUPS+=("$g")
+  fi
+done
+
 
 usage() {
   cat <<EOF
@@ -71,12 +108,21 @@ Run the fast CI gates locally, so "green on my machine" means what CI means.
   tools/preflight.sh fmt clippy   any subset, in the order you name them
   tools/preflight.sh --list       print the commands without running them
 
-Groups: ${ALL_GROUPS[*]}  (default: all of them, in that order)
+Groups: ${ALL_GROUPS[*]}
+Default: ${DEFAULT_GROUPS[*]}  (in that order)
 
-NOT covered: the test jobs. \`cargo check --tests\` COMPILES the test targets
-but runs nothing, so \`Tests + coverage (core)\` can still go red after a green
-preflight. This gates compilation and lint, not behaviour. (The one exception is
-\`docs\`, whose gate IS its test run — a filesystem walk over \`docs/\`, not a fit.)
+Opt-in, i.e. NOT in a no-argument run: ${OPT_IN_GROUPS[*]}. \`debug-assertions\`
+RUNS the Tier-1 suite on the default \`dev\` profile (#344). Every other test job
+builds with \`ci-test\`/\`ci-fast\`, which \`inherits = "release"\` — so every
+\`debug_assert!\` in the crate is compiled to nothing and its invariant goes
+unchecked. It is a build plus a test run rather than seconds of compile, so you
+name it when you want it; CI runs it on every PR.
+
+NOT covered by the DEFAULT set: the test jobs. \`cargo check --tests\` COMPILES
+the test targets but runs nothing, so \`Tests + coverage (core)\` can still go red
+after a green preflight. The default set gates compilation and lint, not
+behaviour. Two exceptions: \`docs\`, whose gate IS its test run (a filesystem walk
+over \`docs/\`, not a fit), and the opt-in \`debug-assertions\` above.
 EOF
 }
 
@@ -120,7 +166,7 @@ done
 # Cheapest first, so a formatting slip fails in seconds rather than after a
 # full compile. CI calls one group per job, so this order only affects local runs.
 if [ ${#SELECTED[@]} -eq 0 ]; then
-  SELECTED=("${ALL_GROUPS[@]}")
+  SELECTED=("${DEFAULT_GROUPS[@]}")
 fi
 
 # ── Plumbing ────────────────────────────────────────────────────────────────
@@ -313,6 +359,62 @@ group_public_api() {
   run tools/update-public-api.sh --check
 }
 
+group_debug_assertions() {
+  CI_JOB="Tests (debug-assertions)"
+  # #344. Every OTHER test job in this repo builds with `--profile ci-test` or
+  # `--profile ci-fast`, both of which `inherits = "release"` — so
+  # `debug-assertions` is OFF and all 177 `debug_assert!` guards in the crate are
+  # compiled to nothing. They are invariant checks that CI was not running.
+  #
+  # That is not theoretical: a real off-by-one in `compute_max_stack`
+  # (`src/parser/model_parser.rs`) tripped its own `debug_assert!` on any
+  # expression containing an `if`, and four lib tests panicked under the dev
+  # profile while CI stayed green through the whole thing. It was fixed in #342;
+  # the CI blind spot that hid it is what this group closes.
+  #
+  # The DEFAULT (dev) profile, deliberately — no `--profile` flag:
+  #
+  #  * it is the profile the bug actually reproduced under, so this gate is the
+  #    literal repro rather than an approximation of it;
+  #  * it also turns on `overflow-checks`, which `release` leaves off, so integer
+  #    overflow panics instead of wrapping silently — a second class of guard the
+  #    other jobs cannot see;
+  #  * a `ci-test`-with-debug-assertions profile would be a distinct profile hash
+  #    and therefore a whole extra OPTIMISED build of the lib, which in this
+  #    compile-bound repo (93% of the build is LLVM, #969/#971) costs far more
+  #    than the unoptimised tests do. Measured here on the dev profile: 80s of
+  #    tests for `ci` (4035) and 198s for `ci,markov,nn` (4366), all green.
+  #
+  # `--lib` only: Tier-1 unit tests. The `tests/` binaries are run by
+  # `Tests + coverage (core)`, and compiling 120-odd of them again under a second
+  # profile is the cost this group is shaped to avoid. Tier-1 is also where the
+  # guards live — `debug_assert!` sits next to the invariant, in `src/`.
+  # `env FERX_REQUIRE_DEBUG_ASSERTIONS=1` in the ARGUMENT VECTOR, not as a shell
+  # assignment prefix and not an `export` up in this function. Both of those would
+  # reach the child just the same, but `run` echoes `$*`, so only this form appears
+  # in `--list` — and what `--list` prints is what the guard test can assert and
+  # what a developer can copy. Same reasoning as `RUSTDOCFLAGS` in `group_rustdoc`.
+  #
+  # It arms `debug_assertion_canary` (`src/lib_tests.rs`), which fails the run if
+  # `debug_assert!` turns out to compile to nothing. Without it this whole group is
+  # an invariant held by ABSENCE — nothing in `cargo test --lib --features ci`
+  # distinguishes a build with the guards live from one without, so a
+  # `[profile.dev] debug-assertions = false` or a `CARGO_PROFILE_DEV_DEBUG_ASSERTIONS`
+  # in the environment would neuter it with every test still green. The canary is
+  # opt-in precisely because every OTHER job legitimately runs with the guards off.
+  run env FERX_REQUIRE_DEBUG_ASSERTIONS=1 cargo test --lib --no-default-features --features ci
+
+  # The feature-gated surface, for the same non-nesting reason `check` is a matrix
+  # rather than one line: `--features ci` compiles neither `src/survival`,
+  # `src/markov`, `src/categorical` nor `src/nn`, and all four carry
+  # `debug_assert!`s. Without this line their guards would be as dead in this job
+  # as they are in every other one. `markov` implies `survival`, so
+  # `ci,markov,nn` is the union of the production cfgs — the same set `clippy` and
+  # `rustdoc` take, and for the same reason.
+  run env FERX_REQUIRE_DEBUG_ASSERTIONS=1 cargo test --lib --no-default-features \
+    --features ci,markov,nn
+}
+
 # ── Drive ───────────────────────────────────────────────────────────────────
 
 # A group named in `ALL_GROUPS` with no `group_<name>` function would print its
@@ -347,7 +449,7 @@ if [ "$LIST_ONLY" -eq 1 ]; then
   echo "(--list: nothing was executed)"
 else
   echo "preflight OK — ${SELECTED[*]}"
-  if [ ${#SELECTED[@]} -lt ${#ALL_GROUPS[@]} ]; then
+  if [ ${#SELECTED[@]} -lt ${#DEFAULT_GROUPS[@]} ]; then
     echo "note: this was a SUBSET. A full run is 'tools/preflight.sh' with no arguments."
   fi
 fi

@@ -150,6 +150,72 @@ fn a_duplicated_subject_contributes_twice() {
     );
 }
 
+/// A replicate whose Ω **collapsed onto the optimizer's lower rail** must still
+/// get a Δofv (#1229 / PR #1246 review, finding 1).
+///
+/// `compute_delta_ofv` re-enters `fit()` with each replicate's own estimates at
+/// `outer_maxiter = 0` and maps any `Err` to `None`, so a rejection here is
+/// **silent** — and it would drop precisely the replicates the Δofv
+/// distribution exists to characterise, biasing the diagnostic.
+///
+/// The rail value is not arbitrary and the round-trip is not near-miss: an
+/// optimizer clamped to the `-6` bound reports `L = exp(-6)`, hence
+/// `variance = exp(-6)² = exp(-12)`, and `variance → chol → ln(L)` gives back
+/// **bit-exactly** `-6.0` — so the free-variance check's `packed <= lower`
+/// predicate matches, and only its evaluation-only scoping keeps this working.
+///
+/// This walks the same three calls `compute_delta_ofv` does
+/// (`flatten_estimates` → `params_from_estimates` → `fit`) rather than testing
+/// the check in isolation: the existing `--dofv` tests all use ordinary models
+/// that never rail, so they pass whether or not the scoping is right.
+#[test]
+fn a_replicate_that_railed_still_gets_a_delta_ofv() {
+    let p = prepared();
+    let options = eval_options(&p.parsed.fit_options);
+    assert_eq!(
+        options.outer_maxiter, 0,
+        "premise: the Δofv sweep is an evaluation, not a fit"
+    );
+
+    let evaluated = fit(&p.parsed.model, &p.population, &p.init_params, &options).expect("eval");
+    let mut flat = flatten_estimates(&p.init_params, &evaluated);
+
+    // Overwrite the first Ω variance with what a collapsed coordinate reports.
+    // `coordinates()` lays the flat vector out as [theta…, Ω lower-tri…, …], so
+    // the first Ω entry is at `theta.len()`.
+    let railed = (-6.0f64).exp() * (-6.0f64).exp();
+    let omega_0 = p.init_params.theta.len();
+    flat[omega_0] = railed;
+
+    let rebuilt = params_from_estimates(&p.init_params, &flat);
+    assert_eq!(
+        rebuilt.omega.matrix[(0, 0)],
+        railed,
+        "the railed variance must survive the rebuild, or this tests nothing"
+    );
+
+    let out = fit(&p.parsed.model, &p.population, &rebuilt, &options);
+    assert!(
+        out.is_ok(),
+        "a railed replicate must still be evaluated — `compute_delta_ofv` turns \
+         this Err into a silent `None`: {:?}",
+        out.err()
+    );
+    assert!(
+        out.expect("evaluated").ofv.is_finite(),
+        "and the Δofv it feeds must be a real number"
+    );
+
+    // The differential half: the same parameters *are* refused by a run that
+    // actually optimises, so the exemption above is the evaluation-only scoping
+    // and not something about these values being acceptable everywhere.
+    let mut fitting = options.clone();
+    fitting.outer_maxiter = 5;
+    let err = fit(&p.parsed.model, &p.population, &rebuilt, &fitting)
+        .expect_err("a fitting run must still reject a start on the rail");
+    assert!(err.contains("ETA_CL"), "{err}");
+}
+
 #[test]
 fn the_flat_parameter_vector_round_trips_through_a_real_model() {
     // `--update-inits` and `--dofv` both rebuild `ModelParameters` from the flat

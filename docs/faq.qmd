@@ -574,6 +574,51 @@ prediction. That is true in NONMEM, and it is now true in ferx — the
 regression test asserts it. If you are ever unsure which convention a tool uses,
 that null test tells you without needing a reference implementation.
 
+### What if the arrival lands a few ULP before a sample?
+
+It is still *before* the sample, so the sample reads post-dose — the same answer
+NONMEM gives, and the same answer you get when the gap is an hour.
+
+This is not hypothetical: an estimated or covariate-scaled `ALAG` is a float sum,
+so an optimizer walking it continuously will land arrivals a handful of ULP away
+from a sample time. The rule has no tolerance in it at all — it is just the
+ordering, and it is **one-sided**:
+
+| the arrival is… | the sample reads |
+|---|---|
+| **at or before** the sample, by any amount | post-dose |
+| **after** the sample, by any amount | pre-dose |
+
+The one-sidedness is the part worth knowing: an arrival even one ULP *after* a
+sample has not happened yet at that sample, and never contributes to it.
+
+A `1e-12` tolerance appears only in *how* the first row is evaluated when the gap
+is tiny. A sample within `1e-12` after the arrival is read from the state just
+after the arrival's events (reset, then dose), rather than by integrating the
+sub-picosecond span to the sample's own time; the difference is bounded by
+`|f|·1e-12`, far below any solver tolerance. Beyond that gap the sample is read
+off the ordinary integration — same answer, arrived at the usual way.
+
+That `1e-12` is an absolute tolerance, so how many representable times it spans
+depends on where you are on the clock: 563 of them at `t = 8.2 h`, nine at
+`t = 1000 h`, and past `t ≈ 16384 h` — roughly two years — none but the sample
+time itself, because one floating-point step is already wider than the tolerance.
+The rule in the table above does not change there; only the sub-tolerance case
+stops arising, since a gap that small can no longer be represented.
+
+::: {.callout-note}
+## Changed in #1226
+
+Before that fix an arrival landing within `1e-12` **before** a sample was read
+*pre*-dose on the objective, on `sdtab`, and on the dense grid that feeds the
+joint PK-TTE hazard, `[derived]` integrals and `simulate()` — the subject read
+drug-free at a sample taken after its own dose. On the committed anchor that is
+45.38 against NONMEM's 145.38, a whole 100 mg dose, and it moved the OFV rather
+than only a diagnostic. The event-driven predictor and the analytical closed forms
+were always correct. Both signs are anchored on NONMEM 7.6.0 in
+`nonmem_anchor/lag_arrival_read_{before,after}_advan{1,13}`.
+:::
+
 ### What about a steady-state dose with a lagtime?
 
 Same rule, one extra step. `SS = 1` says "assume the patient has already been on

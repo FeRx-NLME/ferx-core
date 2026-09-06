@@ -58,7 +58,178 @@ pub(crate) const INFUSION_EPS: f64 = 1e-12;
 ///
 /// Same magnitude as [`INFUSION_EPS`], which stays separate — that is a containment
 /// epsilon on an infusion *window*, a different role.
+///
+/// # The recording rule (#1226)
+///
+/// The same tolerance decides where a *record* — an observation, a `saveat` grid point,
+/// a soft (CHZ) sample — is read, and there it is deliberately **one-sided**. For a break
+/// `t_k` and its successor `t_{k+1}`:
+///
+///  - **band** — `t_k ≤ t < t_k + EVENT_MATCH_TOL` is read **at `t_k`, after** that
+///    break's events (reset → dose → read), from the post-event state `u(t_k⁺)`; see
+///    [`reads_at_break`]. The shortcut error against the true `u(t)` is `≤ |f|·1e-12`,
+///    below every solver tolerance, and it is measured rather than argued in
+///    `lag_arrival_read_1226::band_read_is_continuous_across_the_tolerance_edge`.
+///  - **segment** — `t_k + EVENT_MATCH_TOL ≤ t ≤ t_{k+1}` is recorded off the
+///    integration of `(t_k, t_{k+1}]`; see [`reads_in_segment`].
+///
+/// Not symmetric: a record within tolerance *before* a break stays on the pre-event
+/// side, because a dose record strictly earlier than an observation record is applied
+/// first and one strictly later is not — NONMEM's ordering, anchored on both sides by
+/// `nonmem_anchor/lag_arrival_read_{before,after}_advan{1,13}`.
+///
+/// The old segment bound was `t <= t_end + 1e-12`, which handed a within-tolerance-
+/// **after** record to the segment *ending* at the break — i.e. to the state before the
+/// dose was applied. #1226: an estimated `ALAG` whose arrival landed `1.3e-13` short of a
+/// sample made `ode_predictions`, `ode_predictions_with_states` and
+/// `ode_dense_solve_states` read that subject drug-free at a post-dose sample (45.38
+/// against NONMEM's 145.38), moving the OFV and not only a diagnostic. The mirror sign
+/// was wrong in the opposite direction on one site only — the #570 shared solve's CHZ
+/// boundary read used a *symmetric* `abs() < 1e-12`, so a hazard time `1.8e-15` **before**
+/// an arrival was overwritten with the post-dose state.
+///
+/// The two predicates partition `[t_k, t_{k+1}]` whenever adjacent breaks are at least
+/// `EVENT_MATCH_TOL` apart. When two breaks are closer than that, both bands can claim a
+/// time; the loops visit breaks in ascending order, so the **later** write wins, which is
+/// the right answer (the latest break at or before `t`).
 pub(crate) const EVENT_MATCH_TOL: f64 = 1e-12;
+
+/// True when a record time `t` is read **at** the break `t_break` — from the post-event
+/// state `u(t_break⁺)` — rather than off the integration that follows it.
+///
+/// One-sided: the band is the half-open `[t_break, t_break + EVENT_MATCH_TOL)`. See
+/// [`EVENT_MATCH_TOL`] for why the *before* side must stay on the pre-event state.
+///
+/// Written as a **difference**, `t - t_break < TOL`, never as the sum `t < t_break + TOL`.
+/// `EVENT_MATCH_TOL` is absolute, so the sum rounds back to `t_break` once `ulp(t_break)`
+/// exceeds it and the half-open band becomes **empty** — the predicate then fails even at
+/// bit equality, which the exact-bit `obs_map` lookups it replaced always matched. Measured:
+///
+/// | `t_break` | `ulp` | band width, sum form | difference form |
+/// |---|---|---|---|
+/// | `8.2` | 1.776e-15 | 563 ulp | 563 ulp |
+/// | `1000.0` | 1.137e-13 | 9 ulp | 9 ulp |
+/// | `8192.0` | 1.819e-12 | 1 ulp | 1 ulp |
+/// | `16384.0` | 3.638e-12 | **0 ulp — matches nothing** | 1 ulp (bit equality) |
+/// | `17520.0` | 3.638e-12 | **0 ulp** | 1 ulp |
+///
+/// `17520` is hours in two years, so this is an ordinary study timescale, not a corner.
+/// The difference form degrades gracefully: as `ulp` grows past the tolerance the band
+/// narrows to exactly the bit-equal set and never below it. That is the same shape as the
+/// dose-application predicate (`(dose.time - t_start).abs() < EVENT_MATCH_TOL`), which is
+/// why that one never had this failure mode.
+#[inline]
+pub(crate) fn reads_at_break(t: f64, t_break: f64) -> bool {
+    t >= t_break && t - t_break < EVENT_MATCH_TOL
+}
+
+/// True when a record time `t` is recorded off the integration of `(t_start, t_end]` —
+/// the complement of [`reads_at_break`]`(t, t_start)` on `[t_start, t_end]`.
+///
+/// The upper bound is **exact**: a time up to `EVENT_MATCH_TOL` past `t_end` belongs to
+/// `t_end`'s own band, on the next iteration, after that break's events are applied.
+///
+/// The **upper** bound's exactness is hygiene rather than the fix, and that was verified by
+/// running the mutation rather than argued: restoring `t <= t_end + 1e-12` here, in
+/// `ode_predictions_with_states`, in `ode_dense_solve_states` or in `ode/ekf.rs` leaves the
+/// whole suite green (re-measured against the current suite: 4228 pass). These engines have
+/// no first-write-wins guard, so the band read at the next break simply overwrites the
+/// pre-event value the wider bound let through — the band reads are the fix. It is kept
+/// because it stops a record being written twice and stops the solver being handed a
+/// `saveat` point outside its own span; the only place where an equivalent slack is
+/// load-bearing is `sens/ode_provider.rs`, whose `recorded[j]` mask *is* first-write-wins
+/// and which therefore needed an explicit overwrite instead.
+///
+/// The **lower** bound is a different matter and is not hygiene: written as a sum it admits
+/// `t == t_start` into this segment's own `saveat` once `t_start + TOL == t_start`, and
+/// `lag_arrival_read_1226::the_band_still_matches_bit_equality_at_large_times` fails on that
+/// spelling. The difference form makes `t > t_start` structural, so the contract holds by
+/// construction rather than by a tolerance being small enough.
+///
+/// The lower bound is a **difference** for the reason [`reads_at_break`] gives, and that
+/// also keeps it strictly greater than `t_start` at every magnitude: `t - t_start >= TOL`
+/// implies `t > t_start`, so the `(t_start, t_end]` contract the surrounding `saveat`
+/// comments state holds by construction. The sum form `t >= t_start + TOL` did not — once
+/// `t_start + TOL == t_start` it admits `t == t_start` into that segment's own `saveat`,
+/// handing `solve_ode` a save point equal to `t0`, outside its span.
+#[inline]
+pub(crate) fn reads_in_segment(t: f64, t_start: f64, t_end: f64) -> bool {
+    t - t_start >= EVENT_MATCH_TOL && t <= t_end
+}
+
+/// A subject's record times sorted once, for resolving which records each break claims.
+///
+/// Built per subject and queried per break, so the whole break loop costs
+/// `O(n log n) + n_breaks·(log n + k)` instead of the `O(n_breaks · n)` a rescan per break
+/// costs. Measured over a full subject walk with `n_breaks == n_records`, this spelling
+/// against the linear scan it replaced:
+///
+/// | records | 5 | 10 | 20 | 50 | 100 | 1000 | 5000 |
+/// |---|---|---|---|---|---|---|---|
+/// | speedup | 0.20× | 0.35× | 1.03× | 2.27× | 3.91× | 16.0× | 102.8× |
+///
+/// Below ~20 records the sort does not pay for itself, but the absolute cost there is
+/// +140 ns per subject against an ODE solve of tens of microseconds. Above it the win is
+/// the one that matters: [`ode_dense_solve_states`] is driven by a *grid* — a hazard
+/// timeline, a `[derived]` integral, an AUC or `predict_survival` horizon — which routinely
+/// runs to hundreds or thousands of points.
+///
+/// This is also the one spelling of the band rule. `sens/ode_provider.rs` already resolved
+/// its boundary records by sorted binary search (#438 review); having the ODE engines rescan
+/// linearly meant the same rule was written twice, in two shapes that could drift.
+pub(crate) struct RecordIndex {
+    sorted: Vec<(f64, usize)>,
+}
+
+impl RecordIndex {
+    /// Sort `(time, index)` ascending by [`f64::total_cmp`] — a total order, so a `NaN`
+    /// record time sorts last and cannot make the sort panic (#1189).
+    pub(crate) fn new(times: &[f64]) -> Self {
+        let mut sorted: Vec<(f64, usize)> = times.iter().copied().zip(0..).collect();
+        sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+        Self { sorted }
+    }
+
+    /// The sorted `(time, index)` pairs, for callers that need a different window over the
+    /// same order (the provider's tolerant `record_at` catch-all, #410).
+    pub(crate) fn sorted(&self) -> &[(f64, usize)] {
+        &self.sorted
+    }
+
+    /// Indices of the records [`reads_at_break`] assigns to `t_break`, written into `out`
+    /// (cleared first) so the caller can hoist one allocation out of its break loop.
+    ///
+    /// This **replaces** the exact-bit `obs_map.get(&t_start.to_bits())` boundary lookups the
+    /// rescanning engines used to do — the band is a superset of the exact hit, and keeping
+    /// both would record a band member twice. `obs_map` stays for matching the solver's
+    /// returned save points, whose bits are the `saveat` entries' own.
+    ///
+    /// Indices come back in **time order** (index order within one time), not in the
+    /// caller's original record order. Every consumer but one writes by index and does not
+    /// care; `ode/ekf.rs` assimilates sequentially, and taking the earlier measurement first
+    /// is the order it should have.
+    pub(crate) fn records_at_break(&self, t_break: f64, out: &mut Vec<usize>) {
+        out.clear();
+        // `t < t_break` is false for `NaN`, so the NaN tail sits in the upper partition and
+        // is rejected by `reads_at_break` on the first comparison.
+        let lo = self.sorted.partition_point(|&(t, _)| t < t_break);
+        for &(t, j) in &self.sorted[lo..] {
+            if !reads_at_break(t, t_break) {
+                break;
+            }
+            out.push(j);
+        }
+    }
+
+    /// Whether any record is read at `t_break` — the same question [`Self::records_at_break`]
+    /// answers, without materialising the indices.
+    pub(crate) fn any_at_break(&self, t_break: f64) -> bool {
+        let lo = self.sorted.partition_point(|&(t, _)| t < t_break);
+        self.sorted
+            .get(lo)
+            .is_some_and(|&(t, _)| reads_at_break(t, t_break))
+    }
+}
 
 /// True when a subject's integration timeline carries a non-finite entry (#1189).
 ///
@@ -2511,11 +2682,14 @@ fn integrate_segment(
 ) -> Vec<Vec<f64>> {
     let opts = ode.effective_solver_opts();
 
-    // Observation times in this segment (t_start < t <= t_end)
+    // Observation times recorded off this segment's integration. `reads_in_segment` is
+    // the half-open `(t_start, t_end]` minus `t_start`'s own band: the upper bound is
+    // **exact**, so a time up to `EVENT_MATCH_TOL` past `t_end` belongs to `t_end`'s band
+    // on the next iteration, post-event, rather than to this pre-event integration (#1226).
     let mut saveat: Vec<f64> = subject
         .obs_times
         .iter()
-        .filter(|&&t| t > t_start + 1e-12 && t <= t_end + 1e-12)
+        .filter(|&&t| reads_in_segment(t, t_start, t_end))
         .cloned()
         .collect();
     // Always include t_end so u is updated for next segment
@@ -3096,6 +3270,12 @@ fn ode_predictions_with_extra_breaks_and_stats(
     // post-dose state, integration skipped by the `k + 1 < len` guard below). The
     // timeline is deduped at 1e-15, so no two adjacent breaks are equal and no break is
     // ever visited twice.
+    //
+    // Hoisted out of the loop: the records read *at* the current break (#1226). The index
+    // is sorted once per subject and binary-searched per break; the buffer is one allocation
+    // per subject rather than one per break.
+    let obs_index = RecordIndex::new(&subject.obs_times);
+    let mut boundary_obs: Vec<usize> = Vec::new();
     for k in 0..break_times.len() {
         let t_start = break_times[k];
 
@@ -3133,20 +3313,24 @@ fn ode_predictions_with_extra_breaks_and_stats(
             &mut applied,
         );
 
-        // Record observations exactly at t_start (after dose)
-        if let Some(obs_idxs) = obs_map.get(&t_start.to_bits()) {
-            record_observations(
-                ode,
-                obs_idxs,
-                &u,
-                pk_params_flat,
-                theta,
-                eta,
-                subject,
-                &mut predictions,
-                None,
-            );
-        }
+        // Record observations read *at* t_start (after the reset/dose passes above) —
+        // its whole band `[t_start, t_start + EVENT_MATCH_TOL)`, not just the exact bits
+        // (#1226). A lagged arrival is a multi-term float sum, so an observation whose
+        // time is nominally the arrival routinely misses it by a few ULP; the old
+        // exact-bit lookup handed those to the *preceding* segment, i.e. to the state
+        // before the dose was applied.
+        obs_index.records_at_break(t_start, &mut boundary_obs);
+        record_observations(
+            ode,
+            &boundary_obs,
+            &u,
+            pk_params_flat,
+            theta,
+            eta,
+            subject,
+            &mut predictions,
+            None,
+        );
 
         // #570: a soft (CHZ) time coinciding with this segment's *left* boundary is
         // read here, as the post-dose / initial state `u` — the exact analogue of the
@@ -3159,10 +3343,19 @@ fn ode_predictions_with_extra_breaks_and_stats(
         // *interior* dose time would be read pre-dose. For an interior break this
         // overwrites the previous segment's `t_end` soft sample with the post-dose state
         // — matching the dedicated path, whose next-segment `t_start` handler does the
-        // same. The `> t_start + 1e-12` filter below excludes `t == t_start`, so a soft
-        // time is never written twice within one iteration.
+        // same. `reads_in_segment` below excludes this band, so a soft time is never
+        // written twice within one iteration.
+        //
+        // **One-sided** (#1226). This was a symmetric `(t - t_start).abs() < 1e-12`, the
+        // only site in the repo that read the *before* side at a break: a hazard time
+        // 1.8e-15 earlier than a lagged arrival was overwritten with the post-dose state
+        // while the dedicated `ode_dense_solve_states` kept the pre-dose one, breaking
+        // the #570 "shared solve ≡ dedicated path" invariant on the mirror geometry.
+        // NONMEM applies a dose record strictly *later* than an observation record
+        // second (`nonmem_anchor/lag_arrival_read_after_advan{1,13}`), so before the
+        // break is pre-event.
         for (gi, &t) in chz_times.iter().enumerate() {
-            if (t - t_start).abs() < 1e-12 {
+            if reads_at_break(t, t_start) {
                 chz_states[gi] = u.clone();
             }
         }
@@ -3180,13 +3373,14 @@ fn ode_predictions_with_extra_breaks_and_stats(
         // (state-dependent) driver reuses unchanged (#391 S1.2).
         if k + 1 < break_times.len() {
             let t_end = break_times[k + 1];
-            // #570: soft (TTE) times in the *half-open* interval `(t_start, t_end]`, read
-            // off the same integration (the closed `t_start` boundary was handled above).
+            // #570: soft (TTE) times recorded off this segment's integration — the
+            // complement of the `t_start` band handled above, with an exact `t_end` upper
+            // bound so a time inside `t_end`'s own band is read there instead (#1226).
             // `chz_times` is sorted, so this slice is too.
             let seg_chz: Vec<f64> = chz_times
                 .iter()
                 .copied()
-                .filter(|&t| t > t_start + 1e-12 && t <= t_end + 1e-12)
+                .filter(|&t| reads_in_segment(t, t_start, t_end))
                 .collect();
             let soft = integrate_segment(
                 ode,
@@ -4162,6 +4356,10 @@ pub(crate) fn ode_predictions_adaptive_impl(
 
     let mut stopped = false;
 
+    // Records read *at* the current break (#1226) — sorted once, hoisted so the walk
+    // allocates once.
+    let obs_index = RecordIndex::new(&shadow.obs_times);
+    let mut boundary_obs: Vec<usize> = Vec::new();
     let mut k = 0;
     while k < break_times.len() {
         let t_start = break_times[k];
@@ -4604,10 +4802,13 @@ pub(crate) fn ode_predictions_adaptive_impl(
             &mut applied,
         );
 
-        // Record the observation exactly at t_start (post-dose), mirroring
-        // `ode_predictions`' left-boundary recording.
-        if let Some(obs_idxs) = obs_map.get(&t_start.to_bits()) {
-            for &obs_idx in obs_idxs {
+        // Record the observations read *at* t_start (post-dose), mirroring
+        // `ode_predictions`' left-boundary recording — its whole `EVENT_MATCH_TOL` band,
+        // through the same [`RecordIndex::records_at_break`] the static engine and the frozen
+        // replay call, so the three cannot drift (#1226).
+        {
+            obs_index.records_at_break(t_start, &mut boundary_obs);
+            for &obs_idx in &boundary_obs {
                 let cmt = shadow.obs_cmts.get(obs_idx).copied().unwrap_or(0);
                 // On the TV path each observation reads with its own per-event PK
                 // snapshot (`event_pk.obs[obs_idx]`), consistent with the record-at-
@@ -5070,6 +5271,9 @@ fn adaptive_frozen_replay_tv(
     // this verifier must stay bit-aligned with the driver it checks.
     let mut applied = vec![false; subject.doses.len()];
 
+    // Records read *at* the current break (#1226) — sorted once, hoisted, as in the driver.
+    let obs_index = RecordIndex::new(&subject.obs_times);
+    let mut boundary_obs: Vec<usize> = Vec::new();
     for k in 0..break_times.len() {
         let t_start = break_times[k];
 
@@ -5135,10 +5339,13 @@ fn adaptive_frozen_replay_tv(
             }
         }
 
-        // Record obs at the left boundary (post-dose) with each observation's own
-        // per-event PK (consistent with the state propagated into this boundary).
-        if let Some(obs_idxs) = obs_map.get(&t_start.to_bits()) {
-            for &obs_idx in obs_idxs {
+        // Record obs read *at* the left boundary (post-dose) with each observation's own
+        // per-event PK (consistent with the state propagated into this boundary). Same
+        // [`RecordIndex::records_at_break`] band as the reactive driver this verifier replays,
+        // which is what keeps the pair bit-identical (#1028, #1226).
+        {
+            obs_index.records_at_break(t_start, &mut boundary_obs);
+            for &obs_idx in &boundary_obs {
                 let cmt = subject.obs_cmts.get(obs_idx).copied().unwrap_or(0);
                 let obs_eta = eta_for(eta_occ, eta, if iov { obs_occ[obs_idx] } else { None });
                 predictions[obs_idx] = read_observable(
@@ -6220,6 +6427,10 @@ pub fn ode_predictions_with_states(
     let mut seed_applied = vec![false; subject.doses.len()];
     let mut applied = vec![false; subject.doses.len()];
 
+    // Records read *at* the current break (#1226) — sorted once, hoisted, as on the
+    // objective path.
+    let obs_index = RecordIndex::new(&subject.obs_times);
+    let mut boundary_obs: Vec<usize> = Vec::new();
     for k in 0..break_times.len() {
         let t_start = break_times[k];
 
@@ -6299,20 +6510,20 @@ pub fn ode_predictions_with_states(
             }
         }
 
-        // Handle obs at t_start (after dose).
-        if let Some(obs_idxs) = obs_map.get(&t_start.to_bits()) {
-            record_observations(
-                ode,
-                obs_idxs,
-                &u,
-                pk_params_flat,
-                theta,
-                eta,
-                subject,
-                &mut predictions,
-                Some(states.as_mut_slice()),
-            );
-        }
+        // Handle obs read *at* t_start (after dose) — the whole `EVENT_MATCH_TOL` band,
+        // through the same helper as the objective path (#1226).
+        obs_index.records_at_break(t_start, &mut boundary_obs);
+        record_observations(
+            ode,
+            &boundary_obs,
+            &u,
+            pk_params_flat,
+            theta,
+            eta,
+            subject,
+            &mut predictions,
+            Some(states.as_mut_slice()),
+        );
 
         // #731: integrate the open interval `(t_start, t_end]` to the next break, if
         // there is one. The final break has no successor — its dose was applied and its
@@ -6329,7 +6540,7 @@ pub fn ode_predictions_with_states(
             .obs_times
             .iter()
             .cloned()
-            .filter(|&t| t > t_start + 1e-12 && t <= t_end + 1e-12)
+            .filter(|&t| reads_in_segment(t, t_start, t_end))
             .collect();
         // Always include t_end so u is advanced to segment end, even when there
         // are no observations in the segment (e.g. two doses with no obs between
@@ -6813,10 +7024,19 @@ pub fn ode_dense_solve_states(
     // `0`, where the `0.0`-seeded horizon fold still puts the dose on the timeline)
     // has no reader. Unobservable on every other timeline: `t_last` is a `saveat`
     // whenever any point is non-negative.
+    // Grid points read *at* the current break (#1226) — sorted once, hoisted, as on the
+    // other engines. This is the engine where the index earns its keep: `saveat` is a grid
+    // (hazard timeline, `[derived]` integral, AUC, `predict_survival` horizon) and routinely
+    // runs to hundreds or thousands of points.
+    let saveat_index = RecordIndex::new(saveat);
+    let mut boundary_saveat: Vec<usize> = Vec::new();
     for k in 0..break_times.len() {
         let t_start = break_times[k];
         let next = break_times.get(k + 1).copied();
-        if next.is_none() && !saveat_map.contains_key(&t_start.to_bits()) {
+        // The band, not the exact bits: a grid point inside the final break's band is a
+        // reader for that break's visit, so the skip must ask the same question the read
+        // below does or it can break out one iteration too early (#1226).
+        if next.is_none() && !saveat_index.any_at_break(t_start) {
             break;
         }
         let t_end = next.unwrap_or(t_start);
@@ -6839,13 +7059,13 @@ pub fn ode_dense_solve_states(
             &mut applied,
         );
 
-        // Saveat points at t_start (after dose, matching ode_predictions convention).
+        // Saveat points read *at* t_start (after dose, matching ode_predictions
+        // convention) — the whole `EVENT_MATCH_TOL` band, through the same helper (#1226).
         // `u` here is the post-dose state; `apply_segment_boundary` set ext_params and
         // resolved forcings but did not touch `u` after the dose pulses.
-        if let Some(idxs) = saveat_map.get(&t_start.to_bits()) {
-            for &i in idxs {
-                result[i] = u.clone();
-            }
+        saveat_index.records_at_break(t_start, &mut boundary_saveat);
+        for &i in &boundary_saveat {
+            result[i] = u.clone();
         }
 
         let Some(t_end) = next else {
@@ -6855,7 +7075,7 @@ pub fn ode_dense_solve_states(
         let mut seg_saveat: Vec<f64> = saveat
             .iter()
             .cloned()
-            .filter(|&t| t > t_start + 1e-12 && t <= t_end + 1e-12)
+            .filter(|&t| reads_in_segment(t, t_start, t_end))
             .collect();
         // Always include t_end so u advances through empty segments (e.g. two
         // consecutive doses with no saveat points between them).

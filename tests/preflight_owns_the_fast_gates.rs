@@ -1,6 +1,6 @@
-//! Guard: the `Check`, `Clippy` and `Format` jobs in `.github/workflows/ci.yml` must run
-//! their cargo commands **through `tools/preflight.sh`**, and that script must actually
-//! fail when a gate fails (#1157).
+//! Guard: the `Check`, `Clippy`, `Format`, `Rustdoc` and `Tests (debug-assertions)` jobs
+//! in `.github/workflows/ci.yml` must run their cargo commands **through
+//! `tools/preflight.sh`**, and that script must actually fail when a gate fails (#1157).
 //!
 //! The point of the script is not documentation — it is that CI executes the same list a
 //! developer runs before pushing, so "green locally" and "green in CI" cannot mean
@@ -11,14 +11,18 @@
 //! `--features ci,nn,slow-tests` had been failing to compile for an entire commit,
 //! because the local run and the CI run were not the same set.
 //!
-//! Three invariants:
+//! Four invariants:
 //!
-//!  1. Those three jobs contain **no inline `run: cargo …` step**, and neither skip
+//!  1. Those jobs contain **no inline `run: cargo …` step**, and neither skip
 //!     themselves (`if:`) nor tolerate failure (`continue-on-error`). Each is a way for
 //!     the two lists to diverge, or for a red gate to report green.
 //!  2. Each of them **does** invoke `tools/preflight.sh <group>` with its own group.
 //!  3. A failing command makes the script exit non-zero **from every position in the
 //!     list**, not just the last one.
+//!  4. A no-argument run is `ALL_GROUPS` minus `OPT_IN_GROUPS`, and every opt-in group
+//!     is named by a job in `ci.yml` (#344). An opt-in group exists because it runs a
+//!     test suite rather than a compile — `debug-assertions` is the only one — and the
+//!     failure it invites is a gate that runs in neither place.
 //!
 //! (3) is not hypothetical. The first version of the script returned a status from `run`
 //! and propagated it through a group function and a `case … esac || { …; exit 1; }` —
@@ -52,6 +56,40 @@ fn repo_root() -> PathBuf {
 
 fn preflight() -> PathBuf {
     repo_root().join("tools").join("preflight.sh")
+}
+
+/// One `NAME=(a b c)` array literal out of `tools/preflight.sh`.
+///
+/// The script is the single owner of the group list, so these tests read the list
+/// FROM it rather than keeping a second copy. A group added to `ALL_GROUPS` is
+/// therefore covered by every assertion below the moment it is added — including
+/// the count tripwire, which is the one place a literal remains (deliberately: it
+/// is a tripwire against silent shrinkage, not a copy of the commands).
+fn script_array(name: &str) -> Vec<String> {
+    let src = std::fs::read_to_string(preflight()).expect("read tools/preflight.sh");
+    let needle = format!("\n{name}=(");
+    let start = src
+        .find(&needle)
+        .unwrap_or_else(|| panic!("`{name}=(` not found in tools/preflight.sh"))
+        + needle.len();
+    let rest = &src[start..];
+    let end = rest
+        .find(')')
+        .unwrap_or_else(|| panic!("unterminated `{name}=(` in tools/preflight.sh"));
+    rest[..end].split_whitespace().map(str::to_string).collect()
+}
+
+/// Every group the script knows about, opt-in ones included.
+fn all_groups() -> Vec<String> {
+    let groups = script_array("ALL_GROUPS");
+    assert!(!groups.is_empty(), "ALL_GROUPS parsed empty");
+    groups
+}
+
+/// The groups a no-argument run deliberately SKIPS (#344): they run a test suite
+/// rather than a compile, so they are named explicitly or run by CI.
+fn opt_in_groups() -> Vec<String> {
+    script_array("OPT_IN_GROUPS")
 }
 
 fn ci_yml() -> String {
@@ -171,6 +209,12 @@ fn the_fast_gate_jobs_delegate_to_preflight_and_never_inline_cargo() {
         ("clippy", "clippy"),
         ("fmt", "fmt"),
         ("rustdoc", "rustdoc"),
+        // #344. This one is a TEST job, not a compile/lint gate, and it is the
+        // only group a no-argument `tools/preflight.sh` skips — so the workflow
+        // is the only place it is guaranteed to run. That makes delegation
+        // matter more here, not less: an inline `cargo test` in the job would be
+        // a command no developer can reproduce with a documented local call.
+        ("debug-assertions", "debug-assertions"),
     ] {
         let body = job_body(&yml, job);
         let cmds = run_commands(&body);
@@ -244,7 +288,7 @@ fn a_failing_gate_fails_the_script_from_every_position() {
     // Every group whose commands are `cargo` invocations, so the fake below intercepts
     // them. `public-api` shells out to `tools/update-public-api.sh` instead and is covered
     // by `the_failure_diagnostic_names_the_group_that_actually_failed`.
-    for group in ["fmt", "check", "clippy", "rustdoc"] {
+    for group in ["fmt", "check", "clippy", "rustdoc", "debug-assertions"] {
         let listed = listed_commands(group);
         assert!(
             !listed.is_empty(),
@@ -509,6 +553,69 @@ fn load_bearing_flags_and_feature_coverage_survive_in_the_command_list() {
         docs.join("\n  ")
     );
 
+    // The `debug-assertions` group is a gate ONLY because it builds on the default
+    // dev profile (#344). Every named profile in this repo — `release`, `ci-test`,
+    // `ci-fast` — has `debug-assertions` off, `ci-test`/`ci-fast` by inheriting
+    // `release`, so a `--profile`/`--release` flag added to one of these commands
+    // would leave two `cargo test` lines in the list, still run 4000-odd tests,
+    // still take minutes, and compile every `debug_assert!` in the crate back down
+    // to nothing. That is the exact shape of the neutered gate this test exists for:
+    // the command list cannot show it, only its flags can.
+    let dbg = listed_commands("debug-assertions");
+    assert!(
+        !dbg.is_empty(),
+        "the `debug-assertions` group lists no commands"
+    );
+    for cmd in &dbg {
+        assert!(
+            !cmd.contains("--profile") && !cmd.contains("--release"),
+            "`{cmd}` selects an explicit profile. Every named profile in this repo \
+             inherits `release`, where `debug-assertions = false`, so the guards this \
+             group exists to execute would compile to nothing while the job stayed \
+             green (#344). Drop the flag; the dev default is the gate."
+        );
+        assert!(
+            cmd.contains("cargo test "),
+            "`{cmd}` is in the `debug-assertions` group but does not RUN anything. \
+             A `cargo check`/`clippy` line compiles the assertions and never \
+             evaluates them, which is the blind spot, not the fix (#344)."
+        );
+
+        // The POSITIVE half, and the one the flag check above cannot supply.
+        // Rejecting `--profile` only rules out the ways of turning the guards off
+        // that are VISIBLE in the command string. Two are not: `[profile.dev]
+        // debug-assertions = false` in Cargo.toml, and a
+        // `CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false` in the workflow environment.
+        // Either would leave
+        // this group's two commands intact, run all 4366 tests, and keep every
+        // assertion in this file green while the job verified nothing —
+        // an invariant held by absence is exactly what #344 was filed about.
+        // `debug_assertion_canary` (`src/lib_tests.rs`) closes that, but only when armed,
+        // so the arming has to be pinned as tightly as the flags are.
+        //
+        // `starts_with`, not `contains`: it must be the argv-leading `env` form, so
+        // `run` echoes it and `--list` tells the truth about what will run.
+        assert!(
+            cmd.starts_with("env FERX_REQUIRE_DEBUG_ASSERTIONS=1 cargo "),
+            "`{cmd}` does not arm the debug-assertions canary. Prefix it with \
+             `env FERX_REQUIRE_DEBUG_ASSERTIONS=1` (in the argument vector, so \
+             `--list` shows it): without that, `debug_assertion_canary` in \
+             src/lib_tests.rs passes vacuously and nothing in this group ever verifies \
+             that `debug_assert!` is actually live (#344)."
+        );
+    }
+
+    // Same non-nesting trap as `check`: `--features ci` compiles neither
+    // `src/survival`, `src/markov`, `src/categorical` nor `src/nn`, and all four
+    // carry `debug_assert!`s.
+    assert!(
+        dbg.iter().any(|c| c.contains("ci,markov,nn")),
+        "no `debug-assertions` command builds `ci,markov,nn`, so every guard in the \
+         feature-gated endpoint and NN code is as dead here as in the release-profile \
+         jobs:\n  {}",
+        dbg.join("\n  ")
+    );
+
     // Union of every `--features` value in the check group.
     let check = listed_commands("check");
     let mut features: Vec<String> = Vec::new();
@@ -553,9 +660,15 @@ fn preflight_is_executable_and_lists_every_group() {
         );
     }
 
+    // Every group by name, not a bare `--list`: since #344 a no-argument run is
+    // `ALL_GROUPS` minus `OPT_IN_GROUPS`, so a bare `--list` would walk past the
+    // opt-in group and it would get no count tripwire at all — exactly the
+    // silent-shrinkage hole this test exists to close. The names come from the
+    // script's own array, so there is still no second copy of the group list.
     let out = Command::new("bash")
         .arg(&script)
         .arg("--list")
+        .args(all_groups())
         .current_dir(repo_root())
         .output()
         .expect("run tools/preflight.sh --list");
@@ -578,13 +691,19 @@ fn preflight_is_executable_and_lists_every_group() {
     // commands are actually *enforced* is
     // `a_failing_gate_fails_the_script_from_every_position`; `--list` executes nothing and
     // can never show it.
-    let expected: [(&str, usize); 6] = [
+    let expected: [(&str, usize); 7] = [
         ("fmt", 1),        // cargo fmt --all -- --check
         ("check", 5),      // ci · ci,survival,slow-tests · ci,markov · ci,nn,slow-tests · members
         ("clippy", 2),     // ferx-core --all-targets · members
         ("rustdoc", 2),    // ferx-core rustdoc · members
         ("docs", 2),       // cargo test -p docs-lint · cargo clippy -p docs-lint
         ("public-api", 1), // tools/update-public-api.sh --check
+        // #344: `--features ci` · `--features ci,markov,nn`. The second line is
+        // not padding — `ci` compiles neither `src/survival`, `src/markov`,
+        // `src/categorical` nor `src/nn`, and all four carry `debug_assert!`s, so
+        // dropping it would leave those guards exactly as dead as they are in
+        // every release-profile job.
+        ("debug-assertions", 2),
     ];
 
     // Every group `--list` actually walks must have an entry above. The loop below
@@ -629,12 +748,82 @@ fn preflight_is_executable_and_lists_every_group() {
              group's dispatch or one of its `run` lines is silently doing nothing.\n{stdout}"
         );
     }
-    // The default run is the full set; a subset would silently under-check a developer
-    // who typed no arguments.
     assert!(
         stdout.contains("nothing was executed"),
         "`--list` should execute nothing:\n{stdout}"
     );
+}
+
+/// A no-argument run is **every group except the declared opt-in ones** — and an
+/// opt-in group is only legitimate because CI runs it.
+///
+/// Both halves matter and they fail in opposite directions. Drop a group from the
+/// default set without declaring it opt-in and a developer who types no arguments
+/// silently under-checks; declare one opt-in without a CI job that names it and
+/// the gate runs *nowhere*, which is strictly worse than the blind spot #344 was
+/// filed about — there the guards were at least compiled out honestly.
+#[test]
+fn the_default_run_is_every_group_that_is_not_opt_in_and_ci_runs_the_rest() {
+    let all = all_groups();
+    let opt_in = opt_in_groups();
+
+    for g in &opt_in {
+        assert!(
+            all.contains(g),
+            "`{g}` is in OPT_IN_GROUPS but not in ALL_GROUPS, so naming it is an \
+             argument error and nothing can ever run it"
+        );
+    }
+
+    let out = Command::new("bash")
+        .arg(preflight())
+        .arg("--list")
+        .current_dir(repo_root())
+        .output()
+        .expect("run tools/preflight.sh --list");
+    assert!(
+        out.status.success(),
+        "`--list` exited {:?}",
+        out.status.code()
+    );
+    let walked: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("══ "))
+        .filter_map(|l| l.split_whitespace().next())
+        .map(str::to_string)
+        .collect();
+
+    let want: Vec<String> = all
+        .iter()
+        .filter(|g| !opt_in.contains(g))
+        .cloned()
+        .collect();
+    assert_eq!(
+        walked, want,
+        "a no-argument run walks {walked:?} but ALL_GROUPS minus OPT_IN_GROUPS is \
+         {want:?}. Either a gate silently left the default run, or a group was added \
+         to ALL_GROUPS and to neither list's intent."
+    );
+
+    // The other half: each opt-in group is invoked by name in ci.yml — read from the
+    // file's parsed `run:` steps, NOT from its raw text. A YAML *comment* that merely
+    // mentions `tools/preflight.sh <group>` would satisfy a `contains` check while
+    // nothing executed the group, and this workflow is full of comments that name
+    // exactly these commands, so that check would have been self-satisfying. Applied
+    // to the whole document rather than one job body on purpose: moving the group
+    // between jobs is fine, running it nowhere is not.
+    let yml = ci_yml();
+    let executed = run_commands(&yml);
+    for g in &opt_in {
+        let want = format!("tools/preflight.sh {g}");
+        assert!(
+            executed.iter().any(|c| c == &want),
+            "group `{g}` is opt-in locally and no job in ci.yml RUNS `{want}`, so it \
+             is a gate that nothing executes. Naming it in a comment does not count — \
+             this reads the `run:` steps.\nrun steps found:\n  {}",
+            executed.join("\n  ")
+        );
+    }
 }
 
 /// `--help` is the only place a developer learns which groups exist, so it must not be
@@ -671,22 +860,13 @@ fn preflight_help_lists_every_group_and_works_from_any_cwd() {
         );
     }
 
-    // Every group the script will actually dispatch has to be documented. Naming them
-    // from the `--list` banners rather than from a literal here means a new group cannot
-    // be added without `--help` growing it too.
-    let full = Command::new("bash")
-        .arg(preflight())
-        .arg("--list")
-        .current_dir(repo_root())
-        .output()
-        .expect("run tools/preflight.sh --list");
-    let groups: Vec<String> = String::from_utf8_lossy(&full.stdout)
-        .lines()
-        .filter_map(|l| l.trim().strip_prefix("══ "))
-        .filter_map(|l| l.split_whitespace().next())
-        .map(str::to_string)
-        .collect();
-    assert!(!groups.is_empty(), "no group banners in `--list` output");
+    // Every group the script will actually dispatch has to be documented. Read from
+    // the script's own `ALL_GROUPS` rather than from a literal here, so a new group
+    // cannot be added without `--help` growing it too — and `ALL_GROUPS` rather than
+    // the `--list` banners of a no-argument run, because since #344 that run walks
+    // only the default set and an opt-in group is precisely the one a developer
+    // will never discover any other way (#344).
+    let groups = all_groups();
     for g in &groups {
         assert!(
             stdout.contains(g.as_str()),
