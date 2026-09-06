@@ -1,0 +1,17 @@
+# The PsN scm.conf next to this file, as a .ferxsearch (#1180): the same
+# four relations, one form each (PsN valid_states 1,5 = none / power), the
+# same p-values, forward then backward.
+
+base = "base.ferx"
+data = "../../../../../data/two_cpt_oral_cov.csv"
+
+[space]
+mfl = "COVARIATE?([CL,V1], [WT,CRCL], pow)"
+
+[covsearch]
+algorithm  = "scm-forward-then-backward"
+p_forward  = 0.05
+p_backward = 0.05
+
+[run]
+threads = 8

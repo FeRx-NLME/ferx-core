@@ -1031,16 +1031,26 @@ pub(crate) fn eta_shrinkage_warning(shrinkage: &[f64], eta_names: &[String]) -> 
     ))
 }
 
-/// Relative tolerance (a fraction of the packed bound range) within which a
-/// theta estimate counts as sitting on its lower/upper optimizer bound.
+/// Relative tolerance within which a theta estimate counts as sitting on its
+/// lower/upper optimizer bound: a fraction of the packed range for a
+/// log-packed theta, a fraction of the bound's own magnitude (floored at 1)
+/// for an identity-packed one.
 const BOUNDARY_REL_TOL: f64 = 1e-3;
 
 /// Which bound a theta estimate is pinned to and the **effective** natural-space
 /// bound value the optimizer actually constrains to, or `None` when the estimate
-/// is interior. Evaluated in the optimizer's *packed* space (log when the lower
-/// bound is `>= 0`, else identity) so the proximity test is scale-appropriate —
-/// a log-scaled parameter is "at" its bound within a constant factor, not a
-/// constant absolute gap.
+/// is interior.
+///
+/// A log-packed theta (lower bound `>= 0`) is judged in the optimizer's packed
+/// space, so "at" its bound means within a constant factor, not a constant
+/// absolute gap. An identity-packed theta (lower bound `< 0`) is judged by
+/// its distance to **each bound on that bound's own scale**, never by its
+/// position as a fraction of the declared range: the two are the same thing
+/// for `(-1, 1)` and very different for PsN's `scm` defaults `(-100, 1e6)`,
+/// where a range fraction would call every estimate below ~900 "at the lower
+/// bound" — which is what every `[covariate_model]` power / exponential θ
+/// carries, and what excluded every candidate of the first covsearch run
+/// (#1180).
 ///
 /// The floors/caps mirror `compute_bounds` / `pack_params`: a log-packed theta
 /// floors its estimate and lower bound at `1e-10` and caps the upper at `1e9`,
@@ -1048,24 +1058,40 @@ const BOUNDARY_REL_TOL: f64 = 1e-3;
 /// agrees with the estimate). Degenerate/non-finite bounds yield `None`.
 pub(crate) fn theta_boundary_side(est: f64, lower: f64, upper: f64) -> Option<(&'static str, f64)> {
     use crate::estimation::parameterization::theta_packs_log;
-    let (lo_eff, hi_eff, pe, pl, pu) = if theta_packs_log(lower) {
-        let lo = lower.max(1e-10);
-        let hi = upper.min(1e9);
-        (lo, hi, est.max(1e-10).ln(), lo.ln(), hi.ln())
-    } else {
-        (lower, upper, est, lower, upper)
-    };
-    let range = pu - pl;
-    if !range.is_finite() || range <= 0.0 || !pe.is_finite() {
+    if !(est.is_finite() && lower.is_finite() && upper.is_finite()) || upper <= lower {
         return None;
     }
-    let frac = (pe - pl) / range;
-    if frac <= BOUNDARY_REL_TOL {
-        Some(("lower", lo_eff))
-    } else if frac >= 1.0 - BOUNDARY_REL_TOL {
-        Some(("upper", hi_eff))
+    if theta_packs_log(lower) {
+        let lo = lower.max(1e-10);
+        let hi = upper.min(1e9);
+        let (pe, pl, pu) = (est.max(1e-10).ln(), lo.ln(), hi.ln());
+        let range = pu - pl;
+        if range <= 0.0 {
+            return None;
+        }
+        let frac = (pe - pl) / range;
+        if frac <= BOUNDARY_REL_TOL {
+            Some(("lower", lo))
+        } else if frac >= 1.0 - BOUNDARY_REL_TOL {
+            Some(("upper", hi))
+        } else {
+            None
+        }
     } else {
-        None
+        // The tolerance is a fraction of the bound's magnitude, floored at 1
+        // so a bound of zero still has one — and capped by the same fraction
+        // of the declared range, so a narrow interval (`(-1e-4, 1e-4)`) keeps
+        // its midpoint interior rather than having the floor swallow it.
+        let range = upper - lower;
+        let near =
+            |bound: f64| (est - bound).abs() <= BOUNDARY_REL_TOL * bound.abs().max(1.0).min(range);
+        if near(lower) {
+            Some(("lower", lower))
+        } else if near(upper) {
+            Some(("upper", upper))
+        } else {
+            None
+        }
     }
 }
 

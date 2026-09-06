@@ -48,7 +48,7 @@ mod output;
 pub mod resolve;
 mod runner;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 
 pub use candidate::{
     Candidate, CandidateError, CandidateResult, Criterion, FeatureVector, RunOptions,

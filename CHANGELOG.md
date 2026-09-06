@@ -20,6 +20,21 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **`ferx covsearch` — stepwise covariate modelling (PsN `scm` forward / forward-then-backward,
+  Pharmpy `covsearch`) — and `ferx allometry` in `ferx-tools` (#1180).** The first shipped
+  model-space search tool: the candidate effects come from the `COVARIATE?(...)` statements
+  of a `.ferxsearch` file, forced `COVARIATE(...)` effects go into the base model first, each
+  step fits its candidates in parallel with retries and the strictness gate, and the winner is
+  the largest OFV drop that is significant by the likelihood-ratio test at `p_forward`; the
+  backward phase removes the cheapest effect whose removal is not significant at `p_backward`.
+  Adaptive scope reduction (SCM+) and `max_steps` as in Pharmpy; each child starts from its
+  parent's estimates. The step table shows every candidate's ΔOFV, degrees of freedom and
+  p-value **beside its convergence status and strictness verdict** — an init-stalled candidate
+  is excluded with the reason, never selected on an OFV that says nothing about the model.
+  Anchored against PsN 5.7.1 + NONMEM 7.6 on the same dataset and relations: same trajectory,
+  same final relation set, OFVs within 1e-4 (`docs/tools/covsearch.qmd`). `ferx allometry` adds
+  `(WT/70)^0.75` to every clearance and `(WT/70)^1.0` to every volume the `pk` line binds — as
+  `[covariate_model]` lines, fixed or estimated — and fits base and scaled model side by side.
 - **`Default` on `UncertaintyMethod` and `SimulateUncertaintyOptions` (#529).** The
   uncertainty-simulation options can now be built with `..Default::default()`
   (`UncertaintyMethod::Asymptotic` is the default method), so wrapper code stays
@@ -85,6 +100,12 @@ section of the SDLC for the versioning policy).
   a question of resets and time-varying covariates, not of where its entry time falls.
   Both engines now agree with `predict_survival()`: `H = 0` and `h = h(u₀)` there, so a
   pre-start entry time contributes nothing.
+- **The boundary-estimate warning no longer fires on an interior estimate of a θ with a wide,
+  asymmetric range (#1180).** An identity-packed θ (lower bound below zero) was judged by its
+  position as a *fraction of the declared range*, so with PsN's `scm` defaults `(-100, 1e6)` —
+  what every `[covariate_model]` `power` / `exponential` θ carries — an estimate of 0.7 read as
+  "pinned to the lower bound" and the strictness gate excluded every covariate candidate. It is
+  now judged by its distance to each bound on that bound's own scale.
 - **A dose landing within 1e-12 of a *derived* break time is no longer applied twice
   (#1186).** A per-route absorption onset (`dose.time + ALAG + lag`) and an infusion end
   (`dose.time + AMT/RATE`) are multi-term float sums, so they routinely land one or two

@@ -104,9 +104,14 @@ pub struct SearchConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct RankConfig {
-    /// What candidates are ranked on.
+    /// What candidates are ranked on. `None` when the file does not say,
+    /// which every tool reads as its own default — the mixed BIC for a
+    /// structural or variability search, the likelihood-ratio test for
+    /// covsearch. Kept as an `Option` rather than defaulted at load so a tool
+    /// that ranks one way only can tell "unset" from "asked for something
+    /// else" and refuse the latter out loud.
     #[serde(rename = "type", default)]
-    pub kind: RankType,
+    pub kind: Option<RankType>,
     /// The improvement a candidate must show over its parent to be accepted,
     /// on the criterion's own scale. Its use is the tool's: an SCM step reads
     /// it as a ΔOFV, a BIC search as a ΔBIC. `None` leaves it to the tool's
@@ -131,6 +136,13 @@ pub enum RankType {
     /// stable, but not implemented until #1175 P6. Loading a file that asks
     /// for it is an error.
     Penalized,
+}
+
+impl RankConfig {
+    /// The rank type, with the file's silence read as [`RankType::default`].
+    pub fn kind_or_default(&self) -> RankType {
+        self.kind.unwrap_or_default()
+    }
 }
 
 impl RankType {
@@ -317,7 +329,7 @@ impl SearchConfig {
         }
         check_coverage(&mfl).map_err(|e| format!("[space] mfl: {e}"))?;
         // Fail on an unimplemented rank type at load, not after the first fit.
-        raw.rank.kind.criterion()?;
+        raw.rank.kind_or_default().criterion()?;
         Ok(SearchConfig {
             base: dir.join(&raw.base),
             data: raw.data.map(|d| dir.join(d)),
@@ -336,7 +348,7 @@ impl SearchConfig {
         RunOptions {
             criterion: self
                 .rank
-                .kind
+                .kind_or_default()
                 .criterion()
                 .expect("rank type validated at load"),
             strictness: self.strictness.strictness(),

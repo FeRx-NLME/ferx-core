@@ -1046,6 +1046,25 @@ fn theta_boundary_side_detects_bounds() {
     assert_eq!(side(0.0, -1.0, 1.0), None);
     assert_eq!(side(-1.0, -1.0, 1.0), Some("lower"));
     assert_eq!(side(1.0, -1.0, 1.0), Some("upper"));
+    // Identity-packed with PsN's scm bounds for a power / exponential
+    // covariate θ, (-100, 1e6): an estimate near 1 is interior. Judged by
+    // its distance to each bound on that bound's scale — as a fraction of
+    // the range it would sit at 1e-4 and read as "at the lower bound", which
+    // excluded every candidate of the first covsearch run (#1180).
+    assert_eq!(side(1.05, -100.0, 1e6), None);
+    assert_eq!(side(0.7, -100.0, 1e6), None);
+    assert_eq!(side(-50.0, -100.0, 1e6), None);
+    assert_eq!(side(-99.95, -100.0, 1e6), Some("lower"));
+    assert_eq!(side(999_500.0, -100.0, 1e6), Some("upper"));
+    // A bound of zero on the identity path uses an absolute tolerance.
+    assert_eq!(side(-0.0005, -5.0, 0.0), Some("upper"));
+    assert_eq!(side(-0.5, -5.0, 0.0), None);
+    // …capped by the range: on a narrow identity interval the midpoint is
+    // interior, and only the ends themselves are at a bound (review of #1238).
+    assert_eq!(side(0.0, -1e-4, 1e-4), None);
+    assert_eq!(side(-1e-4, -1e-4, 1e-4), Some("lower"));
+    assert_eq!(side(1e-4 - 1e-8, -1e-4, 1e-4), Some("upper"));
+    assert_eq!(side(0.5e-4, -1e-4, 1e-4), None);
     // Log-packed (lower >= 0): "at bound" is within a constant factor.
     assert_eq!(side(1.0, 0.001, 1000.0), None);
     assert_eq!(side(0.001, 0.001, 1000.0), Some("lower"));

@@ -15,8 +15,10 @@ ferx <model.ferx> --simulate          [--output <run.fitrx>]
 ferx check <model.ferx> [--data <data.csv>] [--json]
 ferx summary <run.fitrx> [<run2.fitrx> ...]
 ferx bootstrap <model.ferx> [--data <data.csv>] [--samples N] [--seed N] [--stratify-on COL]
+ferx covsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
+ferx allometry <model.ferx> --data <data.csv> [--covariate WT] [--reference 70] [--estimate]
 ferx --help                    # or -h; also: ferx check --help, ferx summary --help,
-                               # ferx bootstrap --help
+                               # ferx bootstrap --help, ferx covsearch --help
 ```
 
 ## Commands
@@ -103,6 +105,35 @@ ferx model.ferx --data data.csv --gam
 Treat the output as a shortlist, not a model — see
 [GAM covariate screening](tools/gam-screening.qmd) for what ΔAIC does and does
 not tell you, the shrinkage caveat, and the Xpose4 validation.
+
+### Stepwise Covariate Modelling (`covsearch`)
+
+```bash
+ferx covsearch warfarin.ferxsearch --directory warfarin-covsearch --threads 8
+```
+
+PsN `scm` forward / forward-then-backward selection — Pharmpy's `covsearch` —
+driven by a [`.ferxsearch` file](tools/search.qmd) whose `COVARIATE?(...)`
+statements are the candidate effects and whose `[covsearch]` section sets the
+algorithm, `p_forward`, `p_backward` and `max_steps`. Each step fits its
+candidates in parallel, judges them by the strictness gate and the
+likelihood-ratio test, and prints a step table with every candidate's ΔOFV,
+p-value, convergence status and decision. Writes `steps.csv`, `final.ferx` and
+`final-fit.yaml` into the directory, plus one journalled runner directory per
+step, so `--resume` picks an interrupted search up where it stopped. See
+[Covariate search](tools/covsearch.qmd), including the PsN `scm` comparison.
+
+### Allometric Scaling (`allometry`)
+
+```bash
+ferx allometry model.ferx --data data.csv                # (WT/70)^0.75 on CL, Q; ^1.0 on V1, V2
+ferx allometry model.ferx --data data.csv --estimate     # estimate the exponents instead
+ferx allometry search.ferxsearch                         # ALLOMETRY(WT, 70) in the space
+```
+
+Adds the allometric convention to the base model as `[covariate_model]` lines
+and fits the base and the scaled model side by side. Options on the
+[covariate search page](tools/covsearch.qmd#allometry).
 
 ### Validate without Fitting (`check`)
 
