@@ -220,7 +220,12 @@ impl StepFitter for Script {
                     criterion: f64::NAN,
                     seconds: 0.0,
                     error: Some(CandidateError::model("does not compile")),
-                    duplicate_of: None,
+                    // `Runner` clones the representative's verdict,
+                    // criterion *and error* into a duplicate
+                    // (`search/runner.rs`), so a duplicate of a candidate
+                    // that failed carries both fields — the shape #1256
+                    // found `resolve_fit` mishandling.
+                    duplicate_of: self.duplicates.get(&c.id).cloned(),
                     reused: false,
                 });
                 continue;
@@ -644,6 +649,33 @@ fn an_input_outside_the_space_is_fitted_then_moved_onto_it() {
 }
 
 #[test]
+fn the_input_is_ranked_but_never_selected() {
+    // The input only has a row when a base had to be derived, and that is
+    // exactly when its structure lies *outside* the declared space. So even
+    // when it wins on the criterion it cannot be the final model — the MFL
+    // would otherwise not bind the result.
+    let script = Script::new(&[(FO_BASE, 100.0), (FO_LAG, 90.0)]).by_id(&[("input", -1000.0)]);
+    let result = run(
+        &script,
+        space_of(
+            BASE_IV,
+            Structure {
+                absorption: Absorption::Inst,
+                ..fo(0)
+            },
+            "ABSORPTION(FO); LAGTIME([OFF,ON])",
+        ),
+        &options(Algorithm::ReducedStepwise),
+    );
+    // Ranked first — the table still says it scored best…
+    assert_eq!(result.row("input").unwrap().rank, Some(1));
+    // …and selected never.
+    assert_eq!(result.final_id, "run1");
+    assert!(!result.row("input").unwrap().selected);
+    assert!(result.row("run1").unwrap().selected);
+}
+
+#[test]
 fn a_derived_base_no_template_can_express_is_an_error_naming_the_fix() {
     // An IV input in a space listing only `LAGTIME(ON)` and `TRANSITS(3)`:
     // the least-transformation base would be a bolus with a lag and a
@@ -665,6 +697,37 @@ fn a_derived_base_no_template_can_express_is_an_error_naming_the_fix() {
     .unwrap_err();
     assert!(err.contains("TRANSITS(3, NODEPOT), LAGTIME(ON)"), "{err}");
     assert!(err.contains("LAGTIME([OFF,ON])"), "{err}");
+}
+
+#[test]
+fn an_input_on_the_space_that_has_no_template_blames_itself_not_a_derivation() {
+    // A bolus input that already carries a lag time, in a space it is
+    // already on: nothing is derived, so the outside-the-space message
+    // would name an empty transformation list and give advice ("list the
+    // input's own value in each category") that cannot fix it.
+    let text = ModelText::parse(BASE_IV).unwrap();
+    let features = space_features(&Mfl::parse("PERIPHERALS(0..1)").unwrap()).unwrap();
+    let d = defaults(&text);
+    let err = Space::build(
+        text,
+        Structure {
+            absorption: Absorption::Inst,
+            lagtime: true,
+            ..fo(0)
+        },
+        &features,
+        d,
+        Vec::new(),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("lies on the space") && err.contains("a lag time on a bolus dose"),
+        "{err}"
+    );
+    assert!(
+        !err.contains("()") && !err.contains("outside the space"),
+        "no empty transformation list, and no derivation to blame: {err}"
+    );
 }
 
 #[test]
@@ -1316,6 +1379,39 @@ fn a_resumed_row_without_its_cached_fit_is_an_error_naming_the_fix() {
     )
     .unwrap_err();
     assert!(err.contains("base") && err.contains("resume"), "{err}");
+}
+
+#[test]
+fn a_duplicate_of_a_failed_candidate_is_a_failed_row_not_a_dead_search() {
+    // Two candidates that canonicalise to the same model, whose
+    // representative did not fit: `Runner` gives the duplicate the
+    // representative's `error` *and* `duplicate_of`. Resolving the
+    // duplicate branch first found `fit == None` on the representative and
+    // raised an `Err` that propagated out of `search()`, killing the run —
+    // where the right outcome is the failed row the table already has.
+    let mut script = Script::new(&[(FO_BASE, 100.0)]);
+    script.erroring.push("run1".into());
+    script.erroring.push("run2".into());
+    script.duplicates.insert("run2".into(), "run1".into());
+    let result = run(
+        &script,
+        space("PERIPHERALS(0..1); LAGTIME([OFF,ON])"),
+        &options(Algorithm::ExhaustiveStepwise),
+    );
+    let run2 = result
+        .rows
+        .iter()
+        .find(|r| r.id == "run2")
+        .expect("run2 has a row");
+    assert!(run2.rank.is_none(), "a failed duplicate is not ranked");
+    assert!(
+        result
+            .rows
+            .iter()
+            .any(|r| r.parent.as_deref() == Some("run2")),
+        "and the search carried on past it: {:?}",
+        result.rows.iter().map(|r| &r.id).collect::<Vec<_>>()
+    );
 }
 
 #[test]

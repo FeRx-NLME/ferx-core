@@ -43,16 +43,22 @@ section of the SDLC for the versioning policy).
   to read. No effect on `.ferx` models, the CLI or the R wrapper, none of which constructs it.
 
 ### Fixed
+- **`ferx modelsearch` never selects the input model (#1181).** The input has a row of its own
+  only when a base had to be derived from it — which happens exactly when its structure lies
+  outside the space the MFL declares — so it is ranked in the table but excluded from
+  selection; `final.ferx` can no longer be a structure the space excluded.
 - **Numbers the edit layer writes are rounded to 15 significant digits (#1181).** An estimate
   that went through the optimizer's log/exp packing comes back one ULP off — `10.000000000000002`
   for an evaluation at `10.0` — and `SeedInits` used to write that verbatim into a candidate or
   `final.ferx`. Fifteen significant digits keep every value a user could type and drop the noise;
   what is read back differs from the estimate by at most one part in 10¹⁵.
-- **`SeedInits` floors a collapsed variance at the smallest startable one (#1181).** A parent
-  fit whose η collapsed to the optimizer's rail (`ω ≈ 6e-6`) used to hand every child seeded
-  from it a start the engine refuses ("starts at a variance … at or below its lower bound"),
-  so a search step failed outright; the seed is now floored at `1e-5`, the same
-  no-variability model spelled so the child can move off it.
+- **A search child is seeded off a collapsed variance at the smallest startable one (#1181).**
+  A parent fit whose η collapsed to the optimizer's rail (`ω ≈ 6e-6`) used to hand every child
+  seeded from it a start the engine refuses ("starts at a variance … at or below its lower
+  bound"), so a search step failed outright; covsearch and modelsearch now floor the seed at
+  `1e-5`, the same no-variability model spelled so the child can move off it. The floor is on
+  the *child*: `SeedInits` itself still reproduces the fit it is given, so a written
+  `final.ferx` re-evaluates to the OFV in the `final-fit.yaml` beside it.
 - **`ferx covsearch` — stepwise covariate modelling (PsN `scm` forward / forward-then-backward,
   Pharmpy `covsearch`) — and `ferx allometry` in `ferx-tools` (#1180).** The first shipped
   model-space search tool: the candidate effects come from the `COVARIATE?(...)` statements

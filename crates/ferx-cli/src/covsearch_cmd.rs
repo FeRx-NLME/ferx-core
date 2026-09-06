@@ -45,11 +45,18 @@ the reason in the table.
   -h, --help           print this help and exit
 ";
 
-fn flag(args: &[String], name: &str) -> bool {
+/// Is the bare flag present?
+///
+/// Shared with `modelsearch_cmd`, like [`scan_args`] and [`parse_threads`]:
+/// the two subcommands take the same four flags, and a second copy of the
+/// parser would take a fix to one of them and not the other.
+pub(crate) fn flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
 
-fn value<'a>(args: &'a [String], name: &str) -> Result<Option<&'a str>, String> {
+/// The argument after `name`, or `None` when the flag is absent. Shared with
+/// `modelsearch_cmd` — see [`flag`].
+pub(crate) fn value<'a>(args: &'a [String], name: &str) -> Result<Option<&'a str>, String> {
     let Some(i) = args.iter().position(|a| a == name) else {
         return Ok(None);
     };

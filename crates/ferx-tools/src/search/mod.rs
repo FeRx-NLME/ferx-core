@@ -48,6 +48,7 @@ pub mod mfl;
 mod output;
 pub mod resolve;
 mod runner;
+pub(crate) mod seed;
 #[cfg(test)]
 pub(crate) mod test_support;
 

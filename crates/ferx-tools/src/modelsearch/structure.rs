@@ -165,6 +165,19 @@ impl Structure {
         text: Option<&ferx_core::edit::ModelText>,
     ) -> Result<Structure, String> {
         let name = template.name.as_str();
+        if template.keyword != "pk" {
+            // Refused *here*, before the input model is fitted: the failure
+            // would otherwise come from `SetStructural`'s own `pk NAME(...)`
+            // guard, i.e. only after the expensive step this check exists to
+            // save (#1256).
+            return Err(format!(
+                "modelsearch: the base model's disposition is an `{kw} {name}(...)` line, \
+                 which the search cannot swap: a candidate is written as a `pk NAME(...)` \
+                 template, and an `{kw}` line has no analytic sibling to move to. Write the \
+                 base with `pk {name}(...)` to search over it",
+                kw = template.keyword
+            ));
+        }
         let (cpt, rest) = name
             .split_once("_cpt_")
             .or_else(|| name.split_once("_compartment_"))

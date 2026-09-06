@@ -54,7 +54,12 @@
 //! Every fitted model — input, base and candidates — is ranked on `[rank]
 //! type` (the mixed BIC by default) among those that pass the strictness
 //! gate. With a `cutoff`, a candidate is selectable only when it beats the
-//! base by at least that much; the base wins otherwise. A candidate that
+//! base by at least that much; the base wins otherwise. The **input is
+//! ranked but never selected**: it has a row of its own only when a base had
+//! to be derived, which is exactly when its structure lies outside the
+//! declared space, so selecting it would write a final model the MFL
+//! excluded. (Pharmpy ranks base and candidates only; the input row is
+//! ferx's, and it is there to be read, not chosen.) A candidate that
 //! fails the gate, does not compile or does not fit is in the table with its
 //! reason and no rank. The per-candidate wall-clock time is in the table
 //! too: the analytic templates cost about the same, but the column is what
@@ -82,6 +87,7 @@ use ferx_core::{CancelFlag, FitResult};
 use serde::Deserialize;
 
 use crate::search::fitter::{RunnerFitter, StepFitter};
+use crate::search::seed::seed_from;
 use crate::search::{
     BaseModel, Candidate, CandidateError, CandidateResult, Criterion, ModelContext, PkTemplate,
     RankType, RunReport, SearchConfig,
@@ -414,16 +420,29 @@ impl Space {
             base_structure = base_structure.apply(key);
         }
         if let Some(why) = base_structure.unbuildable() {
-            return Err(format!(
-                "modelsearch: the input model lies outside the space, and the base Pharmpy's \
-                 least number of transformations would derive from it ({}) has no template: \
-                 {why}. List the input's own value in each category the space names (e.g. \
-                 `LAGTIME([OFF,ON])`, `TRANSITS(0, NODEPOT)`) so the input can be the base",
-                onto.iter()
-                    .map(|k| k.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
+            // Two different failures, and blaming the wrong one is unhelpful
+            // advice: with `onto` empty no derivation happened at all — the
+            // input's *own* structure has no template (a lag time on a bolus
+            // dose, say), so listing its values in the space cannot fix it.
+            return Err(if onto.is_empty() {
+                format!(
+                    "modelsearch: the input model lies on the space, but its own structure \
+                     has no template to search from: {why}. Change the input model, or name \
+                     a space whose base is buildable"
+                )
+            } else {
+                format!(
+                    "modelsearch: the input model lies outside the space, and the base \
+                     Pharmpy's least number of transformations would derive from it ({}) has \
+                     no template: {why}. List the input's own value in each category the \
+                     space names (e.g. `LAGTIME([OFF,ON])`, `TRANSITS(0, NODEPOT)`) so the \
+                     input can be the base",
+                    onto.iter()
+                        .map(|k| k.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            });
         }
         if !onto.is_empty() {
             notes.push(format!(
@@ -509,16 +528,27 @@ impl Node {
 /// The fit a result stands for, so a child can be seeded from it.
 ///
 /// A result legitimately carries no fit in three cases, and they are not
-/// the same statement: a **duplicate** (`duplicate_of`) was scored by its
-/// representative, whose fit is the one to seed from; a **failed**
-/// candidate has nothing to seed from and says so through `error`; and a
-/// **resumed** row whose `fits/<hash>.json` is missing or unreadable looks
-/// eligible while having nothing to hand its children — silently starting
-/// them from the file's initials would contradict the documented seeding,
-/// so that one is an error naming the fix.
+/// the same statement: a **failed** candidate has nothing to seed from and
+/// says so through `error`; a **duplicate** (`duplicate_of`) was scored by
+/// its representative, whose fit is the one to seed from; and a **resumed**
+/// row whose `fits/<hash>.json` is missing or unreadable looks eligible
+/// while having nothing to hand its children — silently starting them from
+/// the file's initials would contradict the documented seeding, so that one
+/// is an error naming the fix.
+///
+/// `error` is tested **before** `duplicate_of`, and the order is
+/// load-bearing: `Runner` builds a duplicate by cloning the
+/// representative's verdict, criterion *and error* (`search/runner.rs`), so
+/// a duplicate of a candidate that failed to compile or fit carries both
+/// fields. Taking the duplicate branch first turns that into an `Err` that
+/// propagates out of `search()` and kills the whole run, where the right
+/// outcome is the failed row the table already has.
 fn resolve_fit(result: &CandidateResult, report: &RunReport) -> Result<Option<FitResult>, String> {
     if let Some(fit) = &result.fit {
         return Ok(Some(fit.clone()));
+    }
+    if result.error.is_some() {
+        return Ok(None);
     }
     if let Some(rep) = &result.duplicate_of {
         return report
@@ -533,9 +563,6 @@ fn resolve_fit(result: &CandidateResult, report: &RunReport) -> Result<Option<Fi
                     result.id
                 )
             });
-    }
-    if result.error.is_some() {
-        return Ok(None);
     }
     Err(format!(
         "{}: the fit is not in the journal cache (a resumed row whose `fits/<hash>.json` is \
@@ -559,7 +586,7 @@ fn derive(
     }
     let mut model = parent.model.clone();
     if let Some(fit) = &parent.fit {
-        model.apply(ModelEdit::SeedInits(fit))?;
+        seed_from(&mut model, fit)?;
     }
     // Declarations and inits come from the parent's own (seeded) text, not
     // the input's: a name an earlier step pruned is not present, a θ an
@@ -586,6 +613,10 @@ fn derive(
     Ok((candidate, target, path))
 }
 
+/// The id of the input model's row, present only when a base had to be
+/// derived from it.
+const INPUT_ID: &str = "input";
+
 /// The search proper, over an injected fitter.
 pub(crate) fn search(
     fitter: &dyn StepFitter,
@@ -608,7 +639,7 @@ pub(crate) fn search(
 
     // ── the input, and the base when it has to be derived ───────────────
     let derive_base = !space.onto.is_empty();
-    let root_id = if derive_base { "input" } else { "base" };
+    let root_id = if derive_base { INPUT_ID } else { "base" };
     emit(if derive_base {
         ModelsearchEvent::InputStarted
     } else {
@@ -655,7 +686,14 @@ pub(crate) fn search(
         if let Some(e) = &result.error {
             return Err(format!("the base model could not be fitted: {e}"));
         }
-        rows.push(row_of(result, 0, Some("input"), structure, path, criterion));
+        rows.push(row_of(
+            result,
+            0,
+            Some(INPUT_ID),
+            structure,
+            path,
+            criterion,
+        ));
         // The base is the root: its path is empty, since the candidate
         // moves are counted from it (Pharmpy filters the space by the base).
         root = Node::from_model(
@@ -867,10 +905,15 @@ pub(crate) fn search(
         (Some(c), Some(b)) => r.id == base_id || b - r.criterion >= c,
         _ => true,
     };
+    // The input is ranked but never selected. It only has a row of its own
+    // when a base had to be derived, and that happens exactly when its
+    // structure lies *outside* the declared space — so selecting it would
+    // write a `final.ferx` the user's MFL excluded, and `[space]` would not
+    // bind the result.
     let winner = order
         .iter()
         .copied()
-        .find(|i| selectable(&rows[*i]))
+        .find(|i| rows[*i].id != INPUT_ID && selectable(&rows[*i]))
         .or_else(|| rows.iter().position(|r| r.id == base_id))
         .expect("the base row exists");
     rows[winner].selected = true;

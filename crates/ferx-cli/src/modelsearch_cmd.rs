@@ -13,7 +13,7 @@ use ferx_tools::modelsearch::{
 };
 use ferx_tools::search::SearchConfig;
 
-use crate::covsearch_cmd::{parse_threads, scan_args};
+use crate::covsearch_cmd::{flag, parse_threads, scan_args, value};
 
 pub const MODELSEARCH_USAGE: &str = "\
 Usage: ferx modelsearch <search.ferxsearch> [options]
@@ -46,21 +46,6 @@ time, and an excluded model carries its reason.
 
 const VALUE_FLAGS: &[&str] = &["--directory", "--threads"];
 const BOOL_FLAGS: &[&str] = &["--resume", "--quiet", "-h", "--help"];
-
-fn flag(args: &[String], name: &str) -> bool {
-    args.iter().any(|a| a == name)
-}
-
-fn value<'a>(args: &'a [String], name: &str) -> Result<Option<&'a str>, String> {
-    let Some(i) = args.iter().position(|a| a == name) else {
-        return Ok(None);
-    };
-    match args.get(i + 1) {
-        Some(v) if !v.starts_with('-') => Ok(Some(v.as_str())),
-        Some(v) => Err(format!("{name} requires a value but got '{v}'")),
-        None => Err(format!("{name} requires a value")),
-    }
-}
 
 /// Entry point for `ferx modelsearch ...`; returns the process exit code.
 pub fn run(args: &[String]) -> i32 {

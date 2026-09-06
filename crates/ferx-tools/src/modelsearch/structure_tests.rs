@@ -93,6 +93,19 @@ fn structure_is_read_off_the_pk_line() {
     assert!(err.contains("inverse-Gaussian"), "{err}");
     let err = Structure::from_template(&template("pk mystery(cl=CL)")).unwrap_err();
     assert!(err.contains("not a `<n>_cpt_<route>` template"), "{err}");
+    // An `ode_template` line parses to the same shape and names a template
+    // the search could otherwise read a structure off — but `SetStructural`
+    // writes a `pk` line and refuses anything else, so it is refused here,
+    // before the base model is fitted (#1256).
+    let err = Structure::from_template(&template(
+        "ode_template two_cpt_oral(cl=CL, v1=V, q=Q, v2=V2, \
+                                            ka=KA)",
+    ))
+    .unwrap_err();
+    assert!(
+        err.contains("`ode_template two_cpt_oral(...)`") && err.contains("cannot swap"),
+        "{err}"
+    );
 }
 
 #[test]

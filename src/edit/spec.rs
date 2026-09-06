@@ -362,7 +362,16 @@ impl Relation {
 /// anything a fit can tell apart.
 pub(crate) fn num(v: f64) -> String {
     let v = if v.is_finite() && v != 0.0 {
-        format!("{v:.14e}").parse::<f64>().unwrap_or(v)
+        // `.is_finite()` on the *result*, not just the input: rounding a value
+        // within one ULP of `f64::MAX` rounds it up past the maximum, and
+        // Rust's float parser returns `Ok(f64::INFINITY)` on overflow rather
+        // than `Err`, so `unwrap_or` alone would let `inf` through and write
+        // it into the file as a bound.
+        format!("{v:.14e}")
+            .parse::<f64>()
+            .ok()
+            .filter(|r| r.is_finite())
+            .unwrap_or(v)
     } else {
         v
     };

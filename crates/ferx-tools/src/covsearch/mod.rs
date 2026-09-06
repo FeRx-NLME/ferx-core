@@ -79,6 +79,7 @@ use ferx_core::{CancelFlag, FitResult};
 use serde::Deserialize;
 
 use crate::search::fitter::{RunnerFitter, StepFitter};
+use crate::search::seed::seed_from;
 use crate::search::{
     BaseModel, Candidate, CandidateResult, Criterion, FeatureVector, RankType, RunReport,
     SearchConfig,
@@ -769,7 +770,7 @@ impl Pass<'_> {
             for effect in remaining.iter() {
                 let mut model = parent.model.clone();
                 if let Some(fit) = &parent.fit {
-                    model.apply(ModelEdit::SeedInits(fit))?;
+                    seed_from(&mut model, fit)?;
                 }
                 model
                     .apply(ModelEdit::AddCovariateRelation(effect.relation()))
@@ -910,7 +911,7 @@ impl Pass<'_> {
             for effect in &removable {
                 let mut model = parent.model.clone();
                 if let Some(fit) = &parent.fit {
-                    model.apply(ModelEdit::SeedInits(fit))?;
+                    seed_from(&mut model, fit)?;
                 }
                 model
                     .apply(ModelEdit::DropCovariateRelation {

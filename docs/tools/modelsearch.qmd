@@ -247,7 +247,15 @@ Algorithm: exhaustive, 4 models fitted
 
 With a `cutoff`, a candidate is selected only when it beats the base by at
 least that much on the criterion; the base stays otherwise, and the ranks
-still show what came closest. When the base itself fails the gate the
+still show what came closest.
+
+The **input model is ranked but never selected**. It only has a row of its
+own when a base had to be derived from it, and that happens exactly when its
+structure lies outside the space the MFL declares — so selecting it would
+write a `final.ferx` the space excluded. Read its row to see what the move
+onto the space cost; if you want the input's structure to be selectable,
+name its value in the category concerned (`ABSORPTION([INST,FO])` rather
+than `ABSORPTION(FO)`) and it becomes the base. When the base itself fails the gate the
 candidates are ranked among themselves and the cutoff cannot apply, which
 the notes say.
 
@@ -373,6 +381,10 @@ realised error.
   a name the estimates file and the ODE twin can see.
 - **`fullblock` is not offered** as an IIV strategy; that move belongs to
   the variability search.
+- **The input model is ranked but not selectable.** Pharmpy ranks the base
+  and the candidates; ferx additionally shows the input's row when a base had
+  to be derived, and excludes that row from selection so the space binds the
+  result.
 
 ## From Rust
 

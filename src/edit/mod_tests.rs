@@ -1246,6 +1246,13 @@ fn num_drops_last_ulp_packing_noise_and_keeps_every_typed_value() {
     );
     // Non-finite values pass through to `finite()`'s rejection unchanged.
     assert_eq!(num(f64::INFINITY), "inf");
+    // A finite value must stay finite. Rounding `f64::MAX` to 15 significant
+    // digits rounds it *up* past the maximum, and Rust's parser answers
+    // `Ok(inf)` rather than `Err`, so an unguarded `unwrap_or` wrote `inf`
+    // into the file — a bound the reader would then take literally.
+    assert_eq!(num(f64::MAX), format!("{}.0", f64::MAX));
+    assert_eq!(num(-f64::MAX), format!("-{}.0", f64::MAX));
+    assert!(num(f64::MAX).parse::<f64>().unwrap().is_finite());
 }
 
 // ── SeedInits ──────────────────────────────────────────────────────────────
@@ -1324,11 +1331,13 @@ fn seed_inits_carries_estimates_over_by_name_not_position() {
 }
 
 #[test]
-fn seed_inits_floors_a_collapsed_variance_at_the_smallest_startable_one() {
-    // A parent whose η collapsed to the optimizer's rail (6.1e-6 measured on
-    // #1181) would hand its child a start the engine refuses. The seed is
-    // floored at 1e-5, on the declaration's own scale; a healthy variance
-    // and the θ are carried unchanged.
+fn seed_inits_writes_a_collapsed_variance_verbatim() {
+    // `SeedInits` reproduces the fit it is given, including an η that
+    // collapsed onto the optimizer's rail (6.1e-6, measured on #1181). It
+    // does *not* floor: a floor here would make the written model disagree
+    // with the `-fit.yaml` beside it, and the search that cannot start a
+    // child from a collapsed parent floors the *fit* it seeds from instead
+    // (`ferx_tools::search::seed_from`).
     let fit = fit_with(
         &["TVCL"],
         &[0.35],
@@ -1342,24 +1351,27 @@ fn seed_inits_floors_a_collapsed_variance_at_the_smallest_startable_one() {
     apply(&mut text, ModelEdit::SeedInits(&fit));
     let params = text.block_lines("parameters");
     assert!(
-        params.contains(&"omega ETA_CL ~ 0.00001".to_string()),
+        params.contains(&"omega ETA_CL ~ 0.00000614421235332821".to_string()),
         "{params:?}"
     );
     assert!(
         params.contains(&"omega ETA_V  ~ 0.11".to_string()),
         "{params:?}"
     );
-    // `(sd)`: the floor is a variance, written as its square root.
+    // `(sd)`: the estimate is a variance, written as its square root.
     let ka = params
         .iter()
         .find(|l| l.starts_with("omega ETA_KA"))
         .unwrap();
-    assert_eq!(ka, "omega ETA_KA ~ 0.00316227766016838 (sd)", "{params:?}");
+    assert_eq!(
+        ka, "omega ETA_KA ~ 0.0000316227766016838 (sd)",
+        "{params:?}"
+    );
     assert!(
         params.contains(&"theta TVCL(0.35, 0.001, 10.0)".to_string()),
         "{params:?}"
     );
-    // A block's diagonal takes the same floor; its off-diagonal does not.
+    // A block is written verbatim too, diagonal and off-diagonal alike.
     let src = BASE.replace(
         "omega ETA_CL ~ 0.09\n  omega ETA_V  ~ 0.04",
         "block_omega (ETA_CL, ETA_V) = [0.09, 0.01, 0.04]",
@@ -1371,7 +1383,8 @@ fn seed_inits_floors_a_collapsed_variance_at_the_smallest_startable_one() {
     apply(&mut text, ModelEdit::SeedInits(&fit));
     let params = text.block_lines("parameters");
     assert!(
-        params.contains(&"block_omega (ETA_CL, ETA_V) = [0.00001, 0.0000001, 0.11]".to_string()),
+        params
+            .contains(&"block_omega (ETA_CL, ETA_V) = [0.000000001, 0.0000001, 0.11]".to_string()),
         "{params:?}"
     );
 }

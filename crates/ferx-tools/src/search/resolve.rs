@@ -45,6 +45,11 @@ use super::mfl::{CovariateEffect, CovariateOp, Feature, Mfl, Mode, Modes, Operan
 /// individual parameters; only the disposition's engine differs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PkTemplate {
+    /// The keyword the line opened with: `pk` or `ode_template`. A search
+    /// that *swaps* the line needs to know which — `ferx_core::edit`'s
+    /// `SetStructural` writes a `pk` line and refuses any other — so the
+    /// distinction cannot be dropped at parse time.
+    pub keyword: String,
     /// The template name, e.g. `two_cpt_oral`.
     pub name: String,
     /// `(role, value)` in source order, e.g. `[("cl", "CL"), ("v", "V")]`.
@@ -95,7 +100,11 @@ impl PkTemplate {
             };
             bindings.push((role.trim().to_ascii_lowercase(), var.trim().to_string()));
         }
-        Some(Ok(PkTemplate { name, bindings }))
+        Some(Ok(PkTemplate {
+            keyword: keyword.to_string(),
+            name,
+            bindings,
+        }))
     }
 
     fn with_roles(&self, roles: &[&str]) -> Vec<String> {
