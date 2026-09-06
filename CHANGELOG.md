@@ -20,6 +20,30 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **`ferx modelsearch` — structural PK model search (Pharmpy `modelsearch`) in `ferx-tools`
+  (#1181).** The space is the `ABSORPTION`, `PERIPHERALS`, `TRANSITS` and `LAGTIME` statements
+  of a `.ferxsearch` file; every candidate is one analytic `pk` template swap from its parent,
+  with the new parameters declared from the parent's estimates (Pharmpy's inits: `Q = CL`,
+  `V2 = 0.05·Vc`, a lag or mean transit time at half the first observation time) and η on
+  the absorption delay by default (`iiv_strategy`). Pharmpy's three algorithms —
+  `reduced_stepwise` (default), `exhaustive_stepwise`, `exhaustive` — and its incompatible-pair
+  rules, with the enumeration anchored against Pharmpy 2.0.0's own workflow. Candidates are
+  fitted in parallel with retries and the strictness gate, ranked on `[rank] type` (mixed BIC
+  by default) with an optional `cutoff` over the base; the table shows every model's structure,
+  criterion, rank, convergence status **and fit time**, an excluded model with its reason.
+  `ELIMINATION(ZO / MM / MIX-FO-MM)` is refused by name rather than offered as `[odes]`
+  candidates — the decision and the coverage table are on `docs/tools/modelsearch.qmd`.
+  Anchored against NONMEM 7.5 on the warfarin dataset: same OFVs, same BIC ranking.
+- **`NewParameter::fixed` in `ferx-core::edit` (#1181).** `SetStructural` can declare a new
+  parameter's θ `FIX` — a fixed transit-compartment count stated as a named parameter rather
+  than a literal binding, so the ODE twin and the estimates file still see it.
+
+### Fixed
+- **`SeedInits` floors a collapsed variance at the smallest startable one (#1181).** A parent
+  fit whose η collapsed to the optimizer's rail (`ω ≈ 6e-6`) used to hand every child seeded
+  from it a start the engine refuses ("starts at a variance … at or below its lower bound"),
+  so a search step failed outright; the seed is now floored at `1e-5`, the same
+  no-variability model spelled so the child can move off it.
 - **`ferx covsearch` — stepwise covariate modelling (PsN `scm` forward / forward-then-backward,
   Pharmpy `covsearch`) — and `ferx allometry` in `ferx-tools` (#1180).** The first shipped
   model-space search tool: the candidate effects come from the `COVARIATE?(...)` statements

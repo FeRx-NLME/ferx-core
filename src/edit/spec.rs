@@ -87,6 +87,11 @@ pub struct NewParameter {
     pub upper: f64,
     /// `(eta name, omega variance)` when the new parameter gets an η.
     pub iiv: Option<(String, f64)>,
+    /// Declare the θ `FIX`: `theta NAME(init, lower, upper) FIX`. A structural
+    /// constant stated as a parameter — a fixed transit-compartment count
+    /// (`TRANSITS(3)`) is the case — so that it still has a name the ODE twin
+    /// and the estimates file can see, unlike a literal `n=3` binding.
+    pub fixed: bool,
 }
 
 /// How an η enters a parameter's expression.

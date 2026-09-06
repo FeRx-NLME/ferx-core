@@ -830,6 +830,7 @@ fn set_structural_widens_to_two_compartments_and_declares_the_new_parameters() {
                     lower: 0.01,
                     upper: 100.0,
                     iiv: None,
+                    fixed: false,
                 },
                 NewParameter {
                     name: "V2".into(),
@@ -838,6 +839,7 @@ fn set_structural_widens_to_two_compartments_and_declares_the_new_parameters() {
                     lower: 0.1,
                     upper: 500.0,
                     iiv: Some(("ETA_V2".into(), 0.1)),
+                    fixed: false,
                 },
             ],
         }),
@@ -865,6 +867,59 @@ fn set_structural_widens_to_two_compartments_and_declares_the_new_parameters() {
         params.contains(&"omega ETA_V2 ~ 0.1".to_string()),
         "{params:?}"
     );
+}
+
+#[test]
+fn set_structural_declares_a_fixed_new_parameter_with_fix() {
+    // A structural constant stated as a parameter — modelsearch's
+    // `TRANSITS(3)` (#1181) — so the count has a name the ODE twin can bind,
+    // unlike a literal `n=3`. `SeedInits` skips `FIX` lines, so a later
+    // carry-over cannot turn the constant into an estimate.
+    let mut text = base();
+    apply(
+        &mut text,
+        ModelEdit::SetStructural(StructuralSpec {
+            template: "one_cpt_transit".into(),
+            bindings: vec![
+                ("cl".into(), "CL".into()),
+                ("v".into(), "V".into()),
+                ("n".into(), "NTR".into()),
+                ("mtt".into(), "MTT".into()),
+            ],
+            new_parameters: vec![
+                NewParameter {
+                    name: "NTR".into(),
+                    theta: "TVNTR".into(),
+                    init: 3.0,
+                    lower: 0.0,
+                    upper: 64.0,
+                    iiv: None,
+                    fixed: true,
+                },
+                NewParameter {
+                    name: "MTT".into(),
+                    theta: "TVMTT".into(),
+                    init: 0.5,
+                    lower: 0.0,
+                    upper: 100.0,
+                    iiv: None,
+                    fixed: false,
+                },
+            ],
+        }),
+    );
+    let params = text.block_lines("parameters");
+    assert!(
+        params.contains(&"theta TVNTR(3.0, 0.0, 64.0) FIX".to_string()),
+        "{params:?}"
+    );
+    assert!(
+        params.contains(&"theta TVMTT(0.5, 0.0, 100.0)".to_string()),
+        "{params:?}"
+    );
+    // The mutation this pins: dropping the `FIX` suffix makes the count a
+    // free θ, which an evaluation would not notice but a fit would estimate.
+    assert!(!params.iter().any(|l| l == "theta TVNTR(3.0, 0.0, 64.0)"));
 }
 
 #[test]
@@ -1234,6 +1289,62 @@ fn seed_inits_carries_estimates_over_by_name_not_position() {
     // written through unchanged.
     assert!(
         params.contains(&"sigma PROP_ERR ~ 0.05 (sd)".to_string()),
+        "{params:?}"
+    );
+}
+
+#[test]
+fn seed_inits_floors_a_collapsed_variance_at_the_smallest_startable_one() {
+    // A parent whose η collapsed to the optimizer's rail (6.1e-6 measured on
+    // #1181) would hand its child a start the engine refuses. The seed is
+    // floored at 1e-5, on the declaration's own scale; a healthy variance
+    // and the θ are carried unchanged.
+    let fit = fit_with(
+        &["TVCL"],
+        &[0.35],
+        &["ETA_CL", "ETA_V", "ETA_KA"],
+        &[6.14421235332821e-6, 0.11, 1e-9],
+        &[],
+        &[],
+    );
+    let src = BASE.replace("omega ETA_KA ~ 0.30", "omega ETA_KA ~ 0.5477 (sd)");
+    let mut text = ModelText::parse(&src).unwrap();
+    apply(&mut text, ModelEdit::SeedInits(&fit));
+    let params = text.block_lines("parameters");
+    assert!(
+        params.contains(&"omega ETA_CL ~ 0.00001".to_string()),
+        "{params:?}"
+    );
+    assert!(
+        params.contains(&"omega ETA_V  ~ 0.11".to_string()),
+        "{params:?}"
+    );
+    // `(sd)`: the floor is a variance, written as its square root.
+    let ka = params
+        .iter()
+        .find(|l| l.starts_with("omega ETA_KA"))
+        .unwrap();
+    assert_eq!(
+        ka, "omega ETA_KA ~ 0.0031622776601683794 (sd)",
+        "{params:?}"
+    );
+    assert!(
+        params.contains(&"theta TVCL(0.35, 0.001, 10.0)".to_string()),
+        "{params:?}"
+    );
+    // A block's diagonal takes the same floor; its off-diagonal does not.
+    let src = BASE.replace(
+        "omega ETA_CL ~ 0.09\n  omega ETA_V  ~ 0.04",
+        "block_omega (ETA_CL, ETA_V) = [0.09, 0.01, 0.04]",
+    );
+    let mut fit = fit_with(&[], &[], &["ETA_CL", "ETA_V"], &[1e-9, 0.11], &[], &[]);
+    fit.omega[(1, 0)] = 1e-7;
+    fit.omega[(0, 1)] = 1e-7;
+    let mut text = ModelText::parse(&src).unwrap();
+    apply(&mut text, ModelEdit::SeedInits(&fit));
+    let params = text.block_lines("parameters");
+    assert!(
+        params.contains(&"block_omega (ETA_CL, ETA_V) = [0.00001, 0.0000001, 0.11]".to_string()),
         "{params:?}"
     );
 }

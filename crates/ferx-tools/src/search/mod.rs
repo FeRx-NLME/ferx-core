@@ -42,6 +42,7 @@
 mod candidate;
 pub mod config;
 pub mod coverage;
+pub(crate) mod fitter;
 pub mod journal;
 pub mod mfl;
 mod output;

@@ -148,6 +148,7 @@ fn widening_to_two_compartments_is_the_hand_written_two_compartment_model() {
                 lower: 0.1,
                 upper: 100.0,
                 iiv: None,
+                fixed: false,
             },
             NewParameter {
                 name: "V2".into(),
@@ -156,6 +157,7 @@ fn widening_to_two_compartments_is_the_hand_written_two_compartment_model() {
                 lower: 1.0,
                 upper: 500.0,
                 iiv: Some(("ETA_V2".into(), 0.08)),
+                fixed: false,
             },
         ],
     })]);
@@ -203,6 +205,7 @@ fn narrowing_back_to_one_compartment_restores_the_parent() {
                     lower: 0.1,
                     upper: 100.0,
                     iiv: None,
+                    fixed: false,
                 },
                 NewParameter {
                     name: "V2".into(),
@@ -211,6 +214,7 @@ fn narrowing_back_to_one_compartment_restores_the_parent() {
                     lower: 1.0,
                     upper: 500.0,
                     iiv: Some(("ETA_V2".into(), 0.08)),
+                    fixed: false,
                 },
             ],
         }),

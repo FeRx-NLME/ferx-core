@@ -3,6 +3,7 @@ mod bootstrap_cmd;
 mod bootstrap_progress;
 mod covsearch_cmd;
 mod gam_cmd;
+mod modelsearch_cmd;
 
 use ferx_core::NcaInit;
 use std::env;
@@ -23,6 +24,8 @@ Usage: ferx <model.ferx> --data <data.csv> [--threads N|auto] [--output <run.fit
                                                          (see `ferx covsearch --help`)
        ferx allometry <model.ferx> --data <data.csv> [--covariate WT] [--reference 70]
                                                          (see `ferx allometry --help`)
+       ferx modelsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
+                                                         (see `ferx modelsearch --help`)
 
 Fits a NLME model and writes sdtab.csv with residuals.
 Data must be in NONMEM format (ID, TIME, DV, EVID, AMT, CMT, ...)
@@ -128,6 +131,10 @@ fn main() {
     }
     if args.get(1).map(String::as_str) == Some("allometry") {
         std::process::exit(allometry_cmd::run(&args));
+    }
+    // `ferx modelsearch` (#1181): structural PK search over the `pk` templates.
+    if args.get(1).map(String::as_str) == Some("modelsearch") {
+        std::process::exit(modelsearch_cmd::run(&args));
     }
 
     if args.len() < 2 {

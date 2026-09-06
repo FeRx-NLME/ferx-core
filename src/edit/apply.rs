@@ -141,11 +141,12 @@ fn set_structural(text: &mut ModelText, spec: &StructuralSpec) -> Result<(), Str
         text.append_to_block(
             "parameters",
             &format!(
-                "theta {}({}, {}, {})",
+                "theta {}({}, {}, {}){}",
                 p.theta,
                 num(p.init),
                 num(p.lower),
-                num(p.upper)
+                num(p.upper),
+                if p.fixed { " FIX" } else { "" }
             ),
         );
         if let Some((eta, v)) = &p.iiv {
@@ -625,6 +626,16 @@ fn set_error_model(text: &mut ModelText, spec: &ErrorSpecText) -> Result<(), Str
 
 // ── Initial estimates ───────────────────────────────────────────────────────
 
+/// The smallest variance [`ModelEdit::SeedInits`] writes for an η.
+///
+/// The optimizer packs a diagonal ω as `ln(L)` with a lower bound of −6
+/// (`estimation/parameterization.rs`), so any variance at or below
+/// `e⁻¹² ≈ 6.14e-6` starts *on* the rail and the engine refuses it
+/// (`api/validation.rs` names `1e-5` as the smallest start it accepts). A
+/// parent whose η collapsed there would otherwise hand every child a model
+/// that cannot start.
+pub(crate) const MIN_SEED_VARIANCE: f64 = 1e-5;
+
 fn seed_inits(text: &mut ModelText, fit: &FitResult) -> Result<(), String> {
     let theta: HashMap<&str, f64> = fit
         .theta_names
@@ -668,6 +679,16 @@ fn seed_inits(text: &mut ModelText, fit: &FitResult) -> Result<(), String> {
             if !var.is_finite() {
                 continue;
             }
+            // A variance the parent collapsed cannot be a start: the packed
+            // Cholesky diagonal is bounded at `ln(L) ≥ −6`, i.e. a variance
+            // of `e⁻¹² ≈ 6.1e-6`, and the engine refuses a start at or below
+            // that rail rather than clamp it silently (`api/validation.rs`).
+            // A search child seeded from a parent whose η collapsed would
+            // fail to start at all — measured on #1181, a lag whose ω fell
+            // to 6.1e-6 — so the seed is floored at the smallest startable
+            // variance, which is the same no-variability model the parent
+            // found, spelled so the child can move off it.
+            let var = var.max(MIN_SEED_VARIANCE);
             // The declaration's own scale wins: rewriting `(sd)` as a variance
             // would change the number's meaning as well as its value.
             let value = if SD_RE.is_match(&code) {
@@ -697,7 +718,14 @@ fn seed_inits(text: &mut ModelText, fit: &FitResult) -> Result<(), String> {
             let mut tri = Vec::new();
             for (a, ia) in idx.iter().enumerate() {
                 for ib in idx.iter().take(a + 1) {
-                    tri.push(fit.omega[(*ia, *ib)]);
+                    // The same floor on a block's diagonal; raising a
+                    // diagonal entry keeps the block positive-definite.
+                    let v = fit.omega[(*ia, *ib)];
+                    tri.push(if ia == ib {
+                        v.max(MIN_SEED_VARIANCE)
+                    } else {
+                        v
+                    });
                 }
             }
             if tri.iter().any(|v| !v.is_finite()) {

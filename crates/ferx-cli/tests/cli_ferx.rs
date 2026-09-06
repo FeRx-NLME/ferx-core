@@ -725,3 +725,89 @@ fn covsearch_accepts_effects_and_resumes_quietly() {
     );
     assert!(stdout.contains("2 relations"), "{stdout}");
 }
+
+// ── ferx modelsearch (#1181) ────────────────────────────────────────────────
+
+#[test]
+fn modelsearch_help_usage_and_a_file_meant_for_another_tool() {
+    let out = ferx()
+        .args(["modelsearch", "--help"])
+        .output()
+        .expect("run ferx modelsearch --help");
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    for word in [
+        "reduced_stepwise",
+        "exhaustive_stepwise",
+        "iiv_strategy",
+        "absorption_delay",
+        "--directory",
+        "--resume",
+        "cutoff",
+    ] {
+        assert!(stdout.contains(word), "help does not mention {word}");
+    }
+    let out = ferx().args(["modelsearch"]).output().expect("run");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Usage: ferx modelsearch"));
+
+    // A covariate file is refused by name, before the dataset is read.
+    let out = ferx()
+        .args([
+            "modelsearch",
+            "crates/ferx-tools/tests/psn/scm_anchor/scm.ferxsearch",
+        ])
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("not a structural statement"), "{stderr}");
+    assert!(!stderr.contains("Data:"), "{stderr}");
+}
+
+/// A whole structural search from the command line, on evaluations
+/// (`maxiter = 0`) so it is seconds: the base, one layer of three candidates,
+/// and the files a user reads afterwards.
+#[test]
+fn modelsearch_runs_a_search_and_writes_its_files() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("wt.ferx"), ONE_CPT_WT).unwrap();
+    let data = repo_root().join("data/two_cpt_oral_cov.csv");
+    let config = format!(
+        "base = \"wt.ferx\"\ndata = \"{}\"\n[space]\n\
+         mfl = \"PERIPHERALS(0..1); LAGTIME([OFF,ON])\"\n\
+         [modelsearch]\nalgorithm = \"exhaustive\"\n\
+         [strictness]\nrequire_converged = false\nreject_init_stall = false\n\
+         reject_on_boundary = false\n[run]\nretries = 0\nthreads = 2\n",
+        data.display()
+    );
+    std::fs::write(dir.path().join("wt.ferxsearch"), config).unwrap();
+
+    let out = ferx()
+        .args([
+            "modelsearch",
+            &dir.path().join("wt.ferxsearch").to_string_lossy(),
+        ])
+        .output()
+        .expect("run ferx modelsearch");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stderr: {stderr}\nstdout: {stdout}");
+    assert!(stderr.contains("Layer 1: fitting 3 candidates"), "{stderr}");
+    assert!(
+        stderr.contains("Algorithm:  exhaustive, ranked on bic_mixed"),
+        "{stderr}"
+    );
+    assert!(stdout.contains("FO, 1 peripheral, lag"), "{stdout}");
+    assert!(stdout.contains("SELECTED"), "{stdout}");
+    assert!(stdout.contains("Final model:"), "{stdout}");
+
+    let run = dir.path().join("wt-modelsearch");
+    assert!(run.join("models.csv").exists(), "{stderr}");
+    assert!(run.join("final.ferx").exists());
+    assert!(run.join("final-fit.yaml").exists());
+    assert!(run.join("base/candidates.csv").exists());
+    assert!(run.join("candidates/candidates.csv").exists());
+    let models = std::fs::read_to_string(run.join("models.csv")).unwrap();
+    assert_eq!(models.lines().count(), 5, "{models}");
+}

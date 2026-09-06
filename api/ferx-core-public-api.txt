@@ -213,6 +213,7 @@ pub fn ferx_core::edit::ModelText::canonical_hash(&self) -> [u8; 32]
 pub fn ferx_core::edit::ModelText::parse(src: &str) -> core::result::Result<Self, alloc::string::String>
 pub fn ferx_core::edit::ModelText::render(&self) -> alloc::string::String
 pub struct ferx_core::edit::NewParameter
+pub ferx_core::edit::NewParameter::fixed: bool
 pub ferx_core::edit::NewParameter::iiv: core::option::Option<(alloc::string::String, f64)>
 pub ferx_core::edit::NewParameter::init: f64
 pub ferx_core::edit::NewParameter::lower: f64

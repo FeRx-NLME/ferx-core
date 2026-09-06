@@ -16,6 +16,7 @@ ferx check <model.ferx> [--data <data.csv>] [--json]
 ferx summary <run.fitrx> [<run2.fitrx> ...]
 ferx bootstrap <model.ferx> [--data <data.csv>] [--samples N] [--seed N] [--stratify-on COL]
 ferx covsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
+ferx modelsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
 ferx allometry <model.ferx> --data <data.csv> [--covariate WT] [--reference 70] [--estimate]
 ferx --help                    # or -h; also: ferx check --help, ferx summary --help,
                                # ferx bootstrap --help, ferx covsearch --help
@@ -122,6 +123,27 @@ p-value, convergence status and decision. Writes `steps.csv`, `final.ferx` and
 `final-fit.yaml` into the directory, plus one journalled runner directory per
 step, so `--resume` picks an interrupted search up where it stopped. See
 [Covariate search](tools/covsearch.qmd), including the PsN `scm` comparison.
+
+### Structural Model Search (`modelsearch`)
+
+```bash
+ferx modelsearch warfarin.ferxsearch --directory warfarin-modelsearch --threads 8
+```
+
+Pharmpy's `modelsearch`: a search over the analytic `pk` templates — absorption
+route, peripheral compartments, transit compartments and lag time — driven by
+a [`.ferxsearch` file](tools/search.qmd) whose `ABSORPTION`, `PERIPHERALS`,
+`TRANSITS` and `LAGTIME` statements are the space and whose `[modelsearch]`
+section picks the algorithm (`reduced_stepwise`, `exhaustive_stepwise`,
+`exhaustive`) and the IIV strategy for new parameters. Each layer fits its
+candidates in parallel, judges them by the strictness gate, and the models are
+ranked on `[rank] type` (the mixed BIC by default). Prints a model table with
+every candidate's structure, criterion, rank, convergence status and fit time;
+writes `models.csv`, `final.ferx`, `final-fit.yaml` and every candidate under
+`models/` into the directory, plus one journalled runner directory per layer,
+so `--resume` picks an interrupted search up where it stopped. See
+[Structural model search](tools/modelsearch.qmd), including the Pharmpy and
+NONMEM comparisons.
 
 ### Allometric Scaling (`allometry`)
 

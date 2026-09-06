@@ -108,6 +108,7 @@ website:
           - tools/gam-screening.qmd
           - tools/search.qmd
           - tools/covsearch.qmd
+          - tools/modelsearch.qmd
       - text: "Data Format"
         href: data-format.qmd
       - text: "CLI Reference"
