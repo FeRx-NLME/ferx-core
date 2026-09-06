@@ -1218,6 +1218,36 @@ fn set_error_model_refuses_a_block_sigma() {
     assert!(err.contains("block_sigma"), "{err}");
 }
 
+// ── num ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn num_drops_last_ulp_packing_noise_and_keeps_every_typed_value() {
+    use super::spec::num;
+    // The noise a log/exp round trip leaves on an evaluation's estimates
+    // (measured on #1256's vancomycin dry run).
+    assert_eq!(num(3.0000000000000004), "3.0");
+    assert_eq!(num(49.99999999999999), "50.0");
+    assert_eq!(num(0.19999999999999998), "0.2");
+    assert_eq!(num(0.1 + 0.2), "0.3");
+    // Values a user types are untouched.
+    assert_eq!(num(0.2), "0.2");
+    assert_eq!(num(1e-5), "0.00001");
+    assert_eq!(num(1e6), "1000000.0");
+    assert_eq!(num(0.132695), "0.132695");
+    assert_eq!(num(-286.00421948870667), "-286.004219488707");
+    assert_eq!(num(0.0), "0.0");
+    assert_eq!(num(-0.5), "-0.5");
+    // Fifteen significant digits, not fewer: the mutation this pins is a
+    // rounding coarse enough to move a real estimate.
+    assert_eq!(num(0.123456789012345), "0.123456789012345");
+    assert_ne!(
+        num(0.1234567890123456),
+        "0.123456789012346".to_string() + "0"
+    );
+    // Non-finite values pass through to `finite()`'s rejection unchanged.
+    assert_eq!(num(f64::INFINITY), "inf");
+}
+
 // ── SeedInits ──────────────────────────────────────────────────────────────
 
 /// A minimal `FitResult` carrying only what `SeedInits` reads.
@@ -1324,10 +1354,7 @@ fn seed_inits_floors_a_collapsed_variance_at_the_smallest_startable_one() {
         .iter()
         .find(|l| l.starts_with("omega ETA_KA"))
         .unwrap();
-    assert_eq!(
-        ka, "omega ETA_KA ~ 0.0031622776601683794 (sd)",
-        "{params:?}"
-    );
+    assert_eq!(ka, "omega ETA_KA ~ 0.00316227766016838 (sd)", "{params:?}");
     assert!(
         params.contains(&"theta TVCL(0.35, 0.001, 10.0)".to_string()),
         "{params:?}"
@@ -1362,9 +1389,11 @@ fn seed_inits_writes_each_declaration_on_the_scale_it_was_written_in() {
         params.contains(&"omega ETA_CL ~ 0.5 (sd)".to_string()),
         "{params:?}"
     );
-    // σ 0.05 (SD) written into a variance declaration is 0.0025.
+    // σ 0.05 (SD) written into a variance declaration is 0.0025 — and not
+    // `0.0025000000000000005`, the floating-point square: `num` writes 15
+    // significant digits.
     assert!(
-        params.contains(&"sigma PROP_ERR ~ 0.0025000000000000005".to_string()),
+        params.contains(&"sigma PROP_ERR ~ 0.0025".to_string()),
         "{params:?}"
     );
 }

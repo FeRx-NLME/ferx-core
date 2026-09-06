@@ -43,6 +43,11 @@ section of the SDLC for the versioning policy).
   to read. No effect on `.ferx` models, the CLI or the R wrapper, none of which constructs it.
 
 ### Fixed
+- **Numbers the edit layer writes are rounded to 15 significant digits (#1181).** An estimate
+  that went through the optimizer's log/exp packing comes back one ULP off — `10.000000000000002`
+  for an evaluation at `10.0` — and `SeedInits` used to write that verbatim into a candidate or
+  `final.ferx`. Fifteen significant digits keep every value a user could type and drop the noise;
+  what is read back differs from the estimate by at most one part in 10¹⁵.
 - **`SeedInits` floors a collapsed variance at the smallest startable one (#1181).** A parent
   fit whose η collapsed to the optimizer's rail (`ω ≈ 6e-6`) used to hand every child seeded
   from it a start the engine refuses ("starts at a variance … at or below its lower bound"),

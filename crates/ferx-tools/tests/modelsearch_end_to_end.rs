@@ -74,6 +74,13 @@ fn write_config(dir: &Path, mfl: &str, extra: &str) -> PathBuf {
     path
 }
 
+/// What the edit layer writes for a number: 15 significant digits, so a
+/// hand-written twin's derived init (`0.05 · V`) matches the candidate's
+/// rather than carrying the floating-point product's last digit.
+fn tidy(v: f64) -> f64 {
+    format!("{v:.14e}").parse().unwrap()
+}
+
 fn run(dir: &Path, path: &Path) -> (SearchConfig, ferx_tools::modelsearch::ModelsearchResult) {
     let config = SearchConfig::load(path).unwrap();
     let base = config.load_base().unwrap();
@@ -153,7 +160,22 @@ fn a_single_point_space_returns_the_base_fit_bit_for_bit() {
         &parsed.fit_options.clone().quiet(),
     )
     .expect("re-evaluation of final.ferx");
-    assert_eq!(again.ofv.to_bits(), direct.ofv.to_bits());
+    // Not bit-for-bit: `SeedInits` writes estimates to 15 significant
+    // digits, which drops the one-ULP log/exp packing noise an evaluation
+    // leaves on them (`10.000000000000002` for `10.0`), so the re-read
+    // inits differ from the fit's θ by at most one part in 10¹⁵. The
+    // realised gap on this run is printed below; the bound is 1e-9, a
+    // million times looser than anything the rounding can produce and a
+    // million times tighter than the smallest BIC gap a search decides on.
+    let gap = (again.ofv - direct.ofv).abs();
+    assert!(gap.is_finite());
+    eprintln!("final.ferx re-evaluation |ΔOFV| = {gap:.3e}");
+    assert!(
+        gap < 1e-9,
+        "final.ferx OFV {} vs direct {}",
+        again.ofv,
+        direct.ofv
+    );
 }
 
 #[test]
@@ -337,8 +359,8 @@ fn a_generated_candidate_is_the_hand_written_model() {
   covariance = false
   checkpoint = false
 ",
-        q = seeded("TVCL"),
-        v2 = 0.05 * seeded("TVV"),
+        q = tidy(seeded("TVCL")),
+        v2 = tidy(0.05 * seeded("TVV")),
     );
     let mut twin = ModelText::parse(&hand_written).unwrap();
     twin.apply(ModelEdit::SeedInits(&base_fit_result)).unwrap();
@@ -585,8 +607,8 @@ fn an_estimated_bioavailability_is_carried_across_the_swap() {
   covariance = false
   checkpoint = false
 ",
-        q = seeded("TVCL"),
-        v2 = 0.05 * seeded("TVV"),
+        q = tidy(seeded("TVCL")),
+        v2 = tidy(0.05 * seeded("TVV")),
     );
     let mut twin = ModelText::parse(&hand_written).unwrap();
     twin.apply(ModelEdit::SeedInits(&base_fit_result)).unwrap();

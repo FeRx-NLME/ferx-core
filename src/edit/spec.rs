@@ -348,9 +348,24 @@ impl Relation {
     }
 }
 
-/// Format a float for a `.ferx` file: shortest round-tripping form, with a
-/// `.0` tail so an integral value still reads as a number rather than a count.
+/// Format a float for a `.ferx` file: the shortest round-tripping form of the
+/// value rounded to 15 significant digits, with a `.0` tail so an integral
+/// value still reads as a number rather than a count.
+///
+/// The rounding is the point. An estimate that went through the optimizer's
+/// log/exp packing comes back one ULP off the number it started from —
+/// `10.000000000000002` for an evaluation at `10.0` — and written verbatim
+/// that reads as a bug in the generated file. Fifteen significant digits
+/// keep every value a user could have typed (a `.ferx` file carries far
+/// fewer) and drop the last-ULP noise; the value that is read back can
+/// differ from the estimate by at most one part in 10¹⁵, which is below
+/// anything a fit can tell apart.
 pub(crate) fn num(v: f64) -> String {
+    let v = if v.is_finite() && v != 0.0 {
+        format!("{v:.14e}").parse::<f64>().unwrap_or(v)
+    } else {
+        v
+    };
     let s = format!("{v}");
     if s.contains(['.', 'e', 'E', 'n', 'i']) {
         s
