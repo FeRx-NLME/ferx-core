@@ -250,16 +250,25 @@ section of the SDLC for the versioning policy).
   (7.4e-9), and against a closed form computed outside both engines, 3.0e-10.
   `TAFD` and `TIME`/`T` under `SS=1` are unchanged — they have no periodic steady state to
   converge to, and `TIME`/`T` already matched NONMEM.
-- **`SS=1` combined with a lagtime on a `TAD`-reading `[odes]` right-hand side is now rejected
-  (`E_SS_LAGTIME_TAD_RHS`) instead of mis-predicted (#1139, #1126).** Raised by `fit()` and
-  `ferx check`; `simulate()` / `predict()` run a narrower validation bundle and still return
-  `NaN` for the combination. `TAD` has no referent
-  between the dose record and the lagged arrival, and because the record-time steady-state seed
-  flows to the arrival rather than being re-equilibrated there, the wrong value is carried into
-  the trough and shifts *every* prediction — measured 2.7 % on the model above with
-  `ALAG1 = 3`, not only inside that window. Remove the lagtime, drop the `TAD` term, or expand
-  the run-in with explicit dose records. A steady-state dose without a lagtime reads `TAD`
-  correctly.
+- **`SS=1` combined with a lagtime on a `TAD`-reading `[odes]` right-hand side now predicts
+  correctly (#1126).** `TAD` had no referent in the window between the dose record and the
+  lagged arrival, so every prediction of such a model was `NaN` — and because the record-time
+  steady-state seed flows to the arrival rather than being re-equilibrated there, the whole
+  subject was affected and not only that window. Since #1121 the state there is real: it is
+  the previous cycle's decaying tail, whose pulse landed at `dose.time − max(II − ALAG, 0)`,
+  and that is what `TAD` now measures from — on both ODE predictors, in the `sdtab` `TAD`
+  column (previously blank there) and in any `[derived]`/`[output]` expression reading `TAD`.
+  A lagtime of a full interval or more keeps #1121's clamped phase, so `TAD` runs `0 … ALAG`
+  across the window rather than wrapping. The referent is the one the analytical superposition
+  has used since #1121, so the two engine families now agree; an ordinary (non-steady-state)
+  lagged dose is unchanged. Measured against NONMEM 7.6.0 on a 1-cpt IV bolus (`CL = 1`,
+  `V = 20`, `II = 12`, `ALAG1 = 3`): ferx `5.5452940851` inside the window against
+  `5.5452941786` from NONMEM's explicit 41-dose lagged train (1.7e-8), and 4.7e-10 from a
+  closed form computed outside both engines. NONMEM's own `SS=1` record is **not** the
+  reference here — it sits 1.3e-2 from its own train on this model, where the same pair on an
+  autonomous right-hand side agrees to 1.1e-9. This replaces `E_SS_LAGTIME_TAD_RHS`, which was
+  added earlier in this same unreleased cycle and never shipped: the combination is served
+  rather than rejected, on every path including `simulate()` and `predict()`.
 
 ### Changed
 - **The unused-fit-option warning is model-aware for the ODE solver keys (#518).** Setting

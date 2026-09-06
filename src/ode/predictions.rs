@@ -645,10 +645,12 @@ where
 /// `TAD` inside the run-in, which is the very defect class this function removes. `TAFD`,
 /// `T` and `TIME` under `SS=1` are #1139's other half and are handled separately.
 ///
-/// [`ss_state_at_phase_pk`]'s own three windows do **not** call this, deliberately — see the
-/// note at the top of that function. It is reachable only under a lagtime, which is #1126's
-/// unanswered pre-arrival referent, and anchoring it alone converts a loud `NaN` into a
-/// number 2.7 % wrong on every observation.
+/// [`ss_state_at_phase_pk`]'s three windows call this too since #1126 — the phase advance
+/// is a run-in window like any other, opening at its cycle's pulse (`0.0`) with the same
+/// `−T_inf` quiet window for an infusion. It stayed on the bare slice for one release
+/// because anchoring it *alone* converts a loud `NaN` into a number 2.7 % wrong on every
+/// observation; see the note at the top of that function for why the other half is the
+/// walk's anchor and not this one.
 #[inline]
 fn ss_run_in_params(
     pk_params_flat: &[f64],
@@ -1496,29 +1498,26 @@ fn ss_state_at_phase_pk(
     phase: f64,
     opts: &OdeSolverOptions,
 ) -> Vec<f64> {
-    // ### Why this function's own solves keep the bare slice while its sibling does not
+    // ### The phase advance is a run-in window too, and it is the pre-arrival one
     //
-    // [`equilibrate_ss_pk_state`] hands every window an extended array via
-    // [`ss_run_in_params`] so a `TAD`-reading RHS reads a real anchor (#1139). The three
-    // `solve_ode` calls **below** deliberately do not, and the asymmetry is not an
-    // oversight: this function is reachable only from `ss_seeded_at_record`, which requires
-    // `lag > 0` (`crate::dosing::ss_seeded_at_record`), and that geometry is #1126 — the
-    // walk's `TAD` anchor in `[t_dose, t_dose + lag)` falls back to the *first arrival*
-    // instead of the previous cycle's pulse.
+    // Like [`equilibrate_ss_pk_state`]'s windows (#1139), the three `solve_ode` calls below
+    // hand the RHS an extended array via [`ss_run_in_params`] rather than a bare
+    // `PkParams::values`, so a `TAD`-reading RHS reads a real anchor instead of `NaN`.
+    // Until #1126 they did not, deliberately: this function is reachable only through
+    // `ss_seeded_at_record` (`lag > 0`), and anchoring it *alone* replaced a loud `NaN`
+    // with a plausible number **2.733 % high at every post-arrival observation** — the seed
+    // it returns was already right, but the walk then integrated `[t_dose, t_dose + lag)`
+    // under a `TAD` anchored at the *first arrival*, and #1121 flows that state to the
+    // arrival rather than re-equilibrating there, so the error multiplied into the whole
+    // subject by a uniform 1.0273332950. That measurement is why the two halves ship
+    // together: [`crate::dosing::tad_referent`] gives the walk the previous cycle's pulse,
+    // and this function stops handing it `NaN` to carry.
     //
-    // Measured on `CL = 1`, `V = 20`, `AMT = 100`, `II = 12`, `ALAG = 3`, RHS
-    // `-(CL/V)·A·(1 + 0.03·TAD)`: anchoring these three windows makes the whole subject
-    // finite and **2.733 % high at every post-arrival observation**, not merely inside the
-    // pre-arrival window. The seed this function returns is already right (it matches the
-    // closed form); what corrupts the run is that #1121 lets the record-time seed *flow* to
-    // the arrival rather than re-equilibrating there (the `!ss_seeded_at_record(..)` guard
-    // on the arrival branches), so the wrong pre-arrival anchor is carried into the trough
-    // and multiplies into every later prediction by a uniform 1.0273332950.
-    //
-    // A finite 2.7 %-wrong answer is worse than the `NaN` it replaces, so the combination is
-    // rejected up front (`E_SS_LAGTIME_TAD_RHS`, `api::validation`) and these windows are
-    // left as they are. #1126 fixes the anchor and lifts the gate; both halves belong in the
-    // same change, where a mutation can show that neither alone is sufficient.
+    // Both windows measure from the **pulse this advance starts at**, which sits at local
+    // `0`: `equilibrate_ss_pk_state` returns the pre-pulse trough and the bolus (or the
+    // infusion's first `T_inf`) lands at the origin of the spans below. An infusion's quiet
+    // window re-opens at local `0` a further `T_inf` after that pulse, so it anchors at
+    // `−T_inf`, exactly as the sibling's group-B windows do.
     //
     // Note for anyone asserting `crate::dosing::last_ss_equilibration_branch()` after this
     // function: the tag it leaves belongs to the `equilibrate_ss_pk_state` call below, not to
@@ -1559,7 +1558,7 @@ fn ss_state_at_phase_pk(
             &wrapped_rhs,
             &u,
             (0.0, active),
-            pk_params_flat,
+            &ss_run_in_params(pk_params_flat, 0.0),
             &[active],
             opts,
         );
@@ -1568,7 +1567,14 @@ fn ss_state_at_phase_pk(
         }
         if phase > t_inf {
             let quiet = phase - t_inf;
-            let sol = solve_ode(&base_rhs, &u, (0.0, quiet), pk_params_flat, &[quiet], opts);
+            let sol = solve_ode(
+                &base_rhs,
+                &u,
+                (0.0, quiet),
+                &ss_run_in_params(pk_params_flat, -t_inf),
+                &[quiet],
+                opts,
+            );
             if let Some(last) = sol.last() {
                 u.copy_from_slice(&last.u);
             }
@@ -1578,7 +1584,14 @@ fn ss_state_at_phase_pk(
         // an input-rate compartment is rejected upstream by `E_ABSORPTION_SS`;
         // see the matching note in `equilibrate_ss_state`.
         u[cmt_idx] += f_bio * dose.amt;
-        let sol = solve_ode(&base_rhs, &u, (0.0, phase), pk_params_flat, &[phase], opts);
+        let sol = solve_ode(
+            &base_rhs,
+            &u,
+            (0.0, phase),
+            &ss_run_in_params(pk_params_flat, 0.0),
+            &[phase],
+            opts,
+        );
         if let Some(last) = sol.last() {
             u.copy_from_slice(&last.u);
         }
@@ -2424,13 +2437,14 @@ fn clamp_negative_predictions(readout: &OdeReadout, predictions: &mut [f64]) {
     }
 }
 
-/// TAD anchor for `ext_params[MAX_PK_PARAMS + 1]`: the last effective dose time at
-/// or before `t_start`, SS-aware (`rem_euclid` wraps the elapsed time back into
-/// `[0, II)` so TAD stays within one dosing interval).
+/// TAD anchor for `ext_params[MAX_PK_PARAMS + 1]`: the latest referent any of the
+/// subject's doses has at `t_start`, per [`crate::dosing::tad_referent`] — which is
+/// where the SS pulse-train fold and the seeded pre-arrival window (#1126) are
+/// defined, once, for every engine.
 ///
-/// Before any dose has arrived — the window a lagged first dose opens — it falls
-/// back to the subject's **earliest lagged arrival**, exactly as the event-driven
-/// walk does (`ode_predictions_event_driven`'s `first_arrival_ed`). The two
+/// Before any dose has a referent — the window a lagged *non*-SS first dose opens —
+/// it falls back to the subject's **earliest lagged arrival**, exactly as the two
+/// production ODE predictors both now do (this is their one implementation). The two
 /// production ODE predictors are selected per subject on `has_resets()`, so a
 /// divergence here would make two subjects of the same model and the same data
 /// shape behave differently: one finite, its neighbour NaN — and a NaN anchor
@@ -2438,9 +2452,12 @@ fn clamp_negative_predictions(readout: &OdeReadout, predictions: &mut [f64]) {
 /// `[odes]` RHS reading `TAD`, turning a finite fit into the 1e20 sentinel.
 ///
 /// One value per subject, so — unlike anchoring at `t_start` — it cannot make the
-/// answer depend on where records happen to fall. What `TAD` *means* before a dose
-/// has arrived is #1110's to settle; this only guarantees it is finite and
-/// mesh-independent, and identical across both predictors, meanwhile.
+/// answer depend on where records happen to fall. What `TAD` *means* before an
+/// ordinary dose has arrived remains a convention; this only guarantees it is
+/// finite and mesh-independent, and identical across both predictors. A **seeded
+/// steady-state** dose's pre-arrival window is not that case — there the periodic
+/// fiction does have a prior pulse and the referent is determined, which is what
+/// [`crate::dosing::tad_referent`] returns (#1126).
 ///
 /// Returns NaN only for a **dose-free** subject, where `TAD` has no referent at all
 /// (the pre-existing answer, and the sdtab convention, for that case).
@@ -2454,12 +2471,17 @@ fn tad_anchor(subject: &Subject, dose_lagtimes: &[f64], t_start: f64) -> f64 {
 /// anchors `TAD` by the same rule as the two ODE predictors instead of growing yet
 /// another spelling of it (#1131).
 ///
-/// There are already at least six in the tree — this function, the inline duplicate
-/// further down this file, `api::output_columns::tad_at_time`, the lag-ignoring sdtab
-/// fallback in `io::output`, and the dual walk's own anchors in `sens::ode_provider`
-/// (segment start, and the pre/post sides of a saltation) — and three of them disagree
-/// on `(t_dose = 120, ALAG = 3, II = 12, t = 121)`, returning `-2.0`, `NaN` and `+1.0`.
-/// A seventh was not worth adding for the sake of a `&Subject` this engine does not have.
+/// **This is now the fold, and [`crate::dosing::tad_referent`] is the rule.** There used
+/// to be four hand-written copies of the per-dose arithmetic — this function, an inline
+/// duplicate further down this file, `api::output_columns::tad_at_time`, and the
+/// lag-ignoring sdtab fallback in `io::output` — and three of them disagreed on
+/// `(t_dose = 120, ALAG = 3, II = 12, t = 121)`, returning `-2.0`, `NaN` and `+1.0`.
+/// #1126 collapsed all four onto one function, because "add the pre-arrival referent"
+/// spelled four times is four chances to spell it differently. The dual walk's own
+/// anchors in `sens::ode_provider` (segment start, and the pre/post sides of a
+/// saltation) are **not** folded in: they are a different shape (a running `max` over
+/// arrivals, not a per-segment re-fold) and unreachable for this model class behind the
+/// `has_ss && reads_model_time` FD gate — see #1272, which is where that is tracked.
 ///
 /// `dose_lagtimes` may be **shorter than `doses`, including empty** — a missing entry is
 /// zero lag, matching [`active_infusions`] and `api::output_columns::tad_at_time`. An
@@ -2469,8 +2491,11 @@ fn tad_anchor(subject: &Subject, dose_lagtimes: &[f64], t_start: f64) -> f64 {
 /// `[0, II)` as though virtual doses had arrived at `t_dose + k·II`, so a caller whose
 /// state was *not* built from such a train gets an anchor its own dose history does not
 /// justify — measured on #1263 as a 24.1% `ipred` divergence for one `SS=1` infusion
-/// whose end break lands past a virtual pulse. Callers that do not equilibrate an `SS`
-/// dose must warn (`W_SDE_STEADY_STATE`) rather than quietly consume this.
+/// whose end break lands past a virtual pulse. Since #1126 that also covers the pre-arrival
+/// window of a *seeded* SS dose, whose state comes from `ss_state_at_phase`; a caller that
+/// does not perform that seed must not consume this anchor there either. Callers that do
+/// not equilibrate an `SS` dose at all must warn (`W_SDE_STEADY_STATE`) rather than
+/// quietly consume it.
 #[inline]
 pub(crate) fn tad_anchor_for(doses: &[DoseEvent], dose_lagtimes: &[f64], t_start: f64) -> f64 {
     // `.get(..).unwrap_or(0.0)`, not `dose_lagtimes[i]`: a short slice means "no lag on
@@ -2482,16 +2507,7 @@ pub(crate) fn tad_anchor_for(doses: &[DoseEvent], dose_lagtimes: &[f64], t_start
     let last_dose_eff = doses
         .iter()
         .enumerate()
-        .filter(|(i, d)| d.time + lag_at(*i) <= t_start + 1e-12)
-        .map(|(i, d)| {
-            let lag = lag_at(i);
-            if d.ss && d.ii > 0.0 {
-                let elapsed = t_start - (d.time + lag);
-                t_start - elapsed.rem_euclid(d.ii)
-            } else {
-                d.time + lag
-            }
-        })
+        .filter_map(|(i, d)| crate::dosing::tad_referent(d, lag_at(i), t_start))
         .fold(f64::NEG_INFINITY, f64::max);
     if last_dose_eff.is_finite() {
         return last_dose_eff;
@@ -5909,18 +5925,6 @@ pub fn ode_predictions_event_driven(
         .zip(pk_at_dose.iter())
         .map(|(d, p)| ode.dose_attr_map.f_bio(d.cmt_raw(), &p.values))
         .collect();
-    // Earliest lagged arrival in the subject — the TAD anchor for any segment that
-    // runs before ANY dose has arrived. One value per subject, so it cannot depend on
-    // where records happen to fall; see the fallback's own note below for why that
-    // matters. `None` for a dose-free subject, where TAD has no referent at all.
-    let first_arrival_ed: Option<f64> = subject
-        .doses
-        .iter()
-        .enumerate()
-        .map(|(k, d)| d.time + dose_lagtimes[k])
-        .fold(None, |acc: Option<f64>, t| {
-            Some(acc.map_or(t, |a| a.min(t)))
-        });
     for (k, d) in subject.doses.iter().enumerate() {
         let lag = dose_lagtimes[k];
         // The dose *record* at its own time — always pushed, lagtime or not
@@ -6073,33 +6077,20 @@ pub fn ode_predictions_event_driven(
             // Build extended params for this segment: slots 0..MAX_PK_PARAMS
             // are pk_now.values; slots MAX_PK_PARAMS and MAX_PK_PARAMS+1 carry
             // the TAFD/TAD anchors for TIME/TAFD/TAD injection in the ODE RHS.
-            // TAD anchor: shift each dose by its own resolved lag (per dose
-            // compartment), consistent with the timeline above and the
-            // non-event-driven path.
-            let last_dose_eff_ed = subject
-                .doses
-                .iter()
-                .enumerate()
-                .filter(|(i, d)| d.time + dose_lagtimes[*i] <= cur_t + 1e-12)
-                .map(|(i, d)| {
-                    let lag = dose_lagtimes[i];
-                    if d.ss && d.ii > 0.0 {
-                        let elapsed = cur_t - (d.time + lag);
-                        cur_t - elapsed.rem_euclid(d.ii)
-                    } else {
-                        d.time + lag
-                    }
-                })
-                .fold(f64::NEG_INFINITY, f64::max);
-            // No dose has arrived yet, so the fold stayed at NEG_INFINITY and `t - anchor`
-            // would be `+∞`. Anchor at the subject's FIRST arrival instead — `TAD` is then
-            // negative before the dose lands and continuous through it, which is simply
-            // `TAD(t) = t − τ` extended backwards.
             //
-            // Before #1073 this branch was reachable only when a record fell inside the
-            // pre-arrival window; splitting the dose row off from its arrival opens a real
-            // `(d.time, arrival]` segment ahead of every lagged first dose. Two properties
-            // are load-bearing there, and both were learned the hard way:
+            // `tad_anchor_for`, not a fold written out here (#1126). This walk carried
+            // its own copy of the arithmetic until then — same rule, spelled twice, on
+            // the two production ODE predictors that are selected *per subject* on
+            // `has_resets()`. So a divergence between them would make two subjects of the
+            // same model and the same data shape read different `TAD`s, and the copies
+            // had to be edited in lockstep to add the seeded-SS pre-arrival referent.
+            // It is bit-identical to what stood here: the fold shifts each dose by its
+            // own resolved lag, and the pre-any-arrival fallback is `min_k(d.time + lag_k)`,
+            // the same subject-wide earliest lagged arrival this walk used to compute for
+            // itself in a separate binding above the loop (now deleted with the copy).
+            //
+            // Two properties of that fallback are load-bearing, and both were learned the
+            // hard way:
             //
             //   * **Finite.** A NaN anchor multiplies into the state (`0.0 * NaN = NaN`)
             //     and poisons every later prediction of any `[odes]` RHS reading `TAD`,
@@ -6111,20 +6102,7 @@ pub fn ode_predictions_event_driven(
             //     that window diverged by 4.2e-4 at *every* later time, the error injected
             //     once and then carried multiplicatively. A prediction must not move
             //     because someone took an extra sample.
-            //
-            // The value is immaterial wherever the pre-arrival state is zero — every model
-            // without an `init(...)` baseline — but `init` state does decay across that
-            // window, so there it is live. What `TAD` *means* before a dose has arrived is
-            // #1110's to settle; this only guarantees it is finite and mesh-independent in
-            // the meantime, and the dense predictor answers NaN there independently of this
-            // walk.
-            let last_dose_eff_ed = if last_dose_eff_ed.is_finite() {
-                last_dose_eff_ed
-            } else {
-                // Dose-free subject: `TAD` has no referent, and NaN is the pre-existing
-                // answer for that case.
-                first_arrival_ed.unwrap_or(f64::NAN)
-            };
+            let last_dose_eff_ed = tad_anchor_for(&subject.doses, &dose_lagtimes, cur_t);
             let mut ext_params_ed = [f64::NAN; crate::types::MAX_PK_PARAMS + 2];
             ext_params_ed[..crate::types::MAX_PK_PARAMS]
                 .copy_from_slice(&pk_now.values[..crate::types::MAX_PK_PARAMS]);

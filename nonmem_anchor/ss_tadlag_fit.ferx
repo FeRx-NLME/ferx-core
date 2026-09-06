@@ -1,0 +1,61 @@
+# A **lagged** `SS=1` dose on an `[odes]` RHS that reads `TAD` (#1126, batch-T step T4).
+#
+# The ferx twin of `nonmem_anchor/ss_tadlag.ctl`, `train_tadlag.ctl` and
+# `train_tadlag_n21.ctl` — the *same* model file runs against all three datasets, which is
+# the point: `ss_tadlag.csv` carries a single `SS=1, II=12` record at t = 480,
+# `train_tadlag.csv` an explicit 41-dose train at 0, 12, …, 480, and `train_tadlag_n21.csv`
+# a 21-dose train ending at 240. `ALAG1 = 3` shifts every arrival, so the pulses sit at
+# 3, 15, …, 483 and the dose **record** at 480 opens a pre-arrival window `[480, 483)`.
+#
+# Observations at record + {1, 2, 5, 8, 11}: the first two are **inside** that window and
+# the last three past the arrival, so both sides of the boundary are live (the anchor
+# non-degeneracy rule — a fixture that only observes one side cannot see a referent that is
+# wrong on the other).
+#
+# NONMEM has no `TAD` built-in in `$DES`, so the control streams write the cycle clock by
+# hand as `TADX = MOD(T - 3.0 + 120.0, 12.0)`. The `- 3.0` is the lagtime: the pulses are at
+# `3 + 12k` and 120 is a multiple of 12, so this is exactly the time since the most recent
+# pulse at every time past the first arrival — and before it the compartment is empty, so
+# the value is inert there.
+#
+# **The oracle here is the explicit train, not NONMEM's `SS=1` record.** Measured
+# 2026-09-06 from the committed tables: with an autonomous RHS NONMEM's lagged SS agrees
+# with its own lagged train to 1.14e-9, so the lag machinery is exact; add the `TAD` read
+# and NONMEM's SS drifts 1.34e-2 from its own train inside the window and 6.61e-3 after it.
+# The lagged train, by contrast, sits 1.73e-8 from a closed form computed outside both
+# engines and converges (7.09e-7 over a doubling, `train_tadlag_n21`). See
+# `tests/ss_prearrival_tad_nonmem_anchor.rs`.
+#
+# `$THETA` all FIX and no omega (NONMEM `$OMEGA 0 FIX`), so both sides evaluate at eta = 0
+# and `IPRED == PRED`. `obs_scale = V` is NONMEM's `S1 = V`. `[fit_options]` pins the solver
+# at reltol 1e-9 (NONMEM `TOL=9`); at ferx's defaults the comparison is good only to ~1e-5.
+
+[parameters]
+  theta TVCL(1.0, FIX)
+  theta TVV(20.0, FIX)
+  theta TVLAG(3.0, FIX)
+
+  sigma PROP ~ 0.01                # variance; NONMEM `$SIGMA 0.01`
+
+[individual_parameters]
+  CL      = TVCL
+  V       = TVV
+  LAGTIME = TVLAG
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central * (1.0 + 0.03*TAD)
+
+[scaling]
+  obs_scale = V                    # the state is an AMOUNT; NONMEM's `$ERROR` divides by V
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[fit_options]
+  method     = focei
+  maxiter    = 0
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11

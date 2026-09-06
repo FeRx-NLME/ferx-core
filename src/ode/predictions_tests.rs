@@ -8513,6 +8513,107 @@ fn the_pre_arrival_tad_anchor_does_not_depend_on_the_sampling_mesh() {
     );
 }
 
+/// The `ss = true` twin of [`the_pre_arrival_tad_anchor_does_not_depend_on_the_sampling_mesh`]
+/// (#1126).
+///
+/// That test uses an ordinary lagged dose and therefore takes the *first-arrival* fallback —
+/// it structurally cannot reach the seeded steady-state referent, which is a different branch
+/// of `crate::dosing::tad_referent`. Nothing in the tree covered the `ss = true` mesh until
+/// this, and it is the property #1073 measured the hard way: a per-segment anchor keyed off
+/// the segment START restarts `TAD` at zero at each record inside the window, making the
+/// answer depend on where samples happen to fall.
+///
+/// No `init(...)` is needed here, unlike the non-SS twin: the pre-arrival state of a seeded
+/// steady-state dose is the previous cycle's tail and is live by construction, which is
+/// exactly why the referent matters at all.
+#[test]
+fn a_seeded_ss_dose_s_pre_arrival_tad_does_not_depend_on_the_sampling_mesh() {
+    let ode = one_cpt_tad_ode_spec();
+    let (v, cl, lag, ii) = (100.0, 20.0, 3.0, 12.0);
+    let pk = pk_one_lagged(cl, v, lag);
+
+    let run = |obs: Vec<f64>| -> Vec<f64> {
+        let doses = vec![DoseEvent::new(480.0, 1000.0, 1, 0.0, true, ii)];
+        let subj = make_subject(doses, obs.clone());
+        let pk_obs = vec![pk; obs.len()];
+        ode_predictions_event_driven(&ode, &subj, &[], &[], &[pk], &pk_obs, &[], &[])
+    };
+
+    // `[480, 483)` is the pre-arrival window; 481 and 482 sit inside it, 485 past the arrival.
+    let coarse = run(vec![481.0, 485.0]);
+    let fine = run(vec![481.0, 482.0, 485.0]);
+    assert!(
+        coarse.iter().chain(fine.iter()).all(|p| p.is_finite()),
+        "a non-finite TAD anchor poisoned the seeded pre-arrival window: {coarse:?} / {fine:?}"
+    );
+    assert_relative_eq!(coarse[0], fine[0], epsilon = 1e-12, max_relative = 1e-12);
+    assert_relative_eq!(coarse[1], fine[2], epsilon = 1e-12, max_relative = 1e-12);
+
+    // Guard the guard, twice over. The extra sample has to land strictly INSIDE the window,
+    // and the state there has to be live — otherwise the agreement above would hold for a
+    // trajectory the anchor cannot reach and the test would pass for the wrong reason.
+    assert!(
+        (480.0..483.0).contains(&482.0_f64),
+        "the extra sample must sit inside [dose.time, dose.time + lag)"
+    );
+    assert!(
+        fine[1] > 1e-3,
+        "the seeded pre-arrival state must be non-zero for the anchor to be observable: \
+         {fine:?}"
+    );
+}
+
+/// The pre-arrival window of a seeded steady-state dose reads `TAD` from the **previous
+/// cycle's pulse**, not from the subject's first arrival (#1126) — against a closed form
+/// computed here rather than by a second engine.
+///
+/// For `dA/dt = -k·A·(1 + c·τ)` on a cycle-local `τ`, `Φ(s) = exp(-k(s + c·s²/2))` and the
+/// periodic trough is `D·Φ(II)/(1 − Φ(II))`. A lagtime only shifts the pulse train, so the
+/// window `[t_rec, t_rec + lag)` is cycle-local `τ ∈ [II − lag, II)` and the amount there is
+/// `(trough + D)·Φ(τ)`.
+///
+/// The old anchor (the subject's first *arrival*, at 483) gives `TAD = t − 483`, i.e. −2 at
+/// t = 481 — the wrong sign and the wrong magnitude — so this is a value assertion the
+/// previous behaviour fails by 1.8 %, not a finiteness check.
+#[test]
+fn a_seeded_ss_dose_reads_tad_from_the_previous_cycles_pulse() {
+    let ode = one_cpt_tad_ode_spec();
+    let (v, cl, lag, ii, amt) = (100.0, 20.0, 3.0, 12.0, 1000.0);
+    // `one_cpt_tad_ode_spec`'s RHS hard-codes the coefficient; read it off rather than
+    // restating it, so an edit there fails loudly instead of silently re-scaling the oracle.
+    let (k, c) = (cl / v, 0.3);
+    let phi = |s: f64| (-k * (s + c * s * s / 2.0)).exp();
+    let trough = amt * phi(ii) / (1.0 - phi(ii));
+
+    let obs = vec![481.0, 482.0, 485.0];
+    let doses = vec![DoseEvent::new(480.0, amt, 1, 0.0, true, ii)];
+    let subj = make_subject(doses, obs.clone());
+    let pk = pk_one_lagged(cl, v, lag);
+    let got =
+        ode_predictions_event_driven(&ode, &subj, &[], &[], &[pk], &vec![pk; obs.len()], &[], &[]);
+
+    for (j, &t) in obs.iter().enumerate() {
+        // Cycle-local time from the pulse train at 480 + 3 + 12k, i.e. …, 471, 483, ….
+        let tau = (t - (480.0 + lag)).rem_euclid(ii);
+        let want = (trough + amt) * phi(tau);
+        assert!(got[j].is_finite(), "t={t} returned {}", got[j]);
+        assert_relative_eq!(got[j], want, max_relative = 1e-6);
+    }
+
+    // The window's two samples must genuinely straddle nothing — both are inside it — and the
+    // third must be outside, so the fixture exercises both branches of `tad_referent`.
+    assert!(obs[0] < 480.0 + lag && obs[1] < 480.0 + lag && obs[2] > 480.0 + lag);
+    // And the old anchor is a materially different answer at t = 481: `TAD = 481 − 483 = −2`
+    // makes the RHS decay *slower*, so the state comes out high. If these ever agree, this
+    // fixture has stopped being able to tell the two referents apart.
+    let old_tad = 481.0 - (480.0 + lag);
+    let new_tad = (481.0 - (480.0 + lag)).rem_euclid(ii);
+    assert!(
+        (old_tad - new_tad).abs() > 1.0,
+        "the two referents must differ at the asserted time ({old_tad} vs {new_tad})"
+    );
+}
+
 /// The `dose_form_lag_ss` anchor's `[odes]`: oral `depot → central`, reading
 /// `CL`/`V`/`KA` from the PK snapshot. Mirrors the `$DES` in
 /// `nonmem_anchor/dose_form_lag_ss.ctl` term for term.
