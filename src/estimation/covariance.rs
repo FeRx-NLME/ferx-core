@@ -482,6 +482,40 @@ pub(crate) fn assemble_score_cross_product(
             } else {
                 &[]
             };
+            if options.agq_nodes().is_some() {
+                // S and RSR need scores of the fitted quadrature objective too. Reuse
+                // its gradient dispatcher, including the reconverged-FD fallback and
+                // anchor selection. The FOCE eta-response correction below must not
+                // be added: the quadrature score already includes grid/mode movement.
+                let one_subject = Population {
+                    subjects: vec![population.subjects[i].clone()],
+                    covariate_names: population.covariate_names.clone(),
+                    dv_column: population.dv_column.clone(),
+                    input_columns: population.input_columns.clone(),
+                    exclusions: None,
+                    warnings: Vec::new(),
+                };
+                let mut eval_index = 0;
+                let mut gi = crate::estimation::outer_optimizer::population_gradient(
+                    x_hat,
+                    1,
+                    template,
+                    model,
+                    &one_subject,
+                    std::slice::from_ref(&eta_hats[i]),
+                    std::slice::from_ref(&h_matrices[i]),
+                    &[kap_i.to_vec()],
+                    bounds,
+                    options,
+                    &mut eval_index,
+                );
+                // The optimizer returns d(OFV) = 2*d(NLL); S uses NLL scores.
+                for g in &mut gi {
+                    *g *= 0.5;
+                }
+                report();
+                return gi;
+            }
             let (_, mut gi) = crate::estimation::gauss_newton::subject_nll_pop_grad(
                 x_hat,
                 template,

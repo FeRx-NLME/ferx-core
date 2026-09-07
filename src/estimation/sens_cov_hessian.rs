@@ -3356,6 +3356,109 @@ mod tests {
         }
     }
 
+    #[test]
+    fn audit_quadrature_score_matrix_uses_its_own_objective() {
+        use crate::estimation::agq::agq_population_nll;
+        use crate::estimation::covariance::assemble_score_cross_product;
+        use crate::estimation::parameterization::compute_bounds;
+        use crate::types::{EstimationMethod, FitOptions, Population};
+        let model = parse_model_string(WARFARIN).unwrap();
+        let params = &model.default_params;
+        let subject = warfarin_subject(&model, &params.theta, &[0.5, 2.0, 8.0, 24.0]);
+        let pop = Population {
+            subjects: vec![subject],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let ebe = find_ebe(&model, &pop.subjects[0], params, 200, 1e-11, None, None, 0);
+        let eta = precise_ebe(&model, &pop.subjects[0], params);
+        let x = pack_params(params);
+        let bounds = compute_bounds(params);
+        let free: Vec<usize> = (0..x.len()).collect();
+        for (method, n_agq) in [
+            (EstimationMethod::FoceI, 3),
+            (EstimationMethod::Laplace, 1),
+            (EstimationMethod::Laplace, 3),
+        ] {
+            let opts = FitOptions {
+                method,
+                n_agq,
+                interaction: true,
+                inner_tol: 1e-11,
+                inner_maxiter: 200,
+                verbose: false,
+                ..FitOptions::default()
+            };
+            let f = |xv: &[f64]| {
+                let p = unpack_params(xv, params);
+                let e = precise_ebe(&model, &pop.subjects[0], &p);
+                // S is the cross-product of NLL scores, not OFV scores.
+                agq_population_nll(
+                    &model,
+                    &pop,
+                    &p,
+                    &[DVector::from_vec(e)],
+                    &[],
+                    n_agq,
+                    opts.hessian_anchor(),
+                )
+            };
+            let mut g = DVector::zeros(x.len());
+            for k in 0..x.len() {
+                let h = 1e-4 * (1.0 + x[k].abs());
+                let mut xp = x.clone();
+                let mut xm = x.clone();
+                xp[k] += h;
+                xm[k] -= h;
+                g[k] = (f(&xp) - f(&xm)) / (2.0 * h);
+            }
+            let expected = &g * g.transpose();
+            // This fixture must distinguish quadrature from the old FOCEI score path,
+            // independently of the OFV/NLL factor-of-two convention.
+            let (_, old) = crate::estimation::gauss_newton::subject_nll_pop_grad(
+                &x,
+                params,
+                &model,
+                &pop,
+                0,
+                &DVector::from_vec(eta.clone()),
+                &ebe.h_matrix,
+                &[],
+                &bounds,
+                &opts,
+            );
+            let old = DVector::from_vec(old);
+            let old_gap = (&old * old.transpose() - &expected).amax() / expected.amax().max(1.0);
+            assert!(
+                old_gap > 1e-2,
+                "fixture must distinguish the old FOCEI NLL scores: {old_gap}"
+            );
+            for interval in [0, 1] {
+                let opts = FitOptions {
+                    reconverge_gradient_interval: interval,
+                    ..opts.clone()
+                };
+                let actual = assemble_score_cross_product(
+                    &x,
+                    params,
+                    &model,
+                    &pop,
+                    &[DVector::from_vec(eta.clone())],
+                    &[ebe.h_matrix.clone()],
+                    &[vec![]],
+                    &bounds,
+                    &opts,
+                    &free,
+                );
+                let gap = (&actual - &expected).amax() / expected.amax().max(1.0);
+                assert!(gap < 1e-3, "{method:?} n={n_agq} interval={interval}: score matrix uses a different objective, relative gap {gap}");
+            }
+        }
+    }
+
     /// Safety gate: the per-subject analytic covariance Hessian (both FOCEI and
     /// FOCE entry points) must return `None` for out-of-derivation-scope models, so
     /// `compute_covariance` drops the whole population back to the finite-difference

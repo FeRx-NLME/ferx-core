@@ -920,9 +920,10 @@ fn accumulate_fixed_b_packed_gradient_fd(
         xm[k] -= h;
         let d = (nll_at(&unpack_params(&xp, template)) - nll_at(&unpack_params(&xm, template)))
             / (2.0 * h);
-        if d.is_finite() {
-            out[k] += weight * d;
+        if !d.is_finite() {
+            return None;
         }
+        out[k] += weight * d;
     }
     Some(())
 }
@@ -1156,26 +1157,26 @@ fn accumulate_fixed_eta_packed_gradient(
     Some(())
 }
 
-/// The **grid-response** term `∂Φ/∂H · dH/dx`, the one piece the fixed-node score omits.
+/// The **grid response**: movement of both the anchor and the mode, omitted by the fixed-node score.
 ///
-/// Writing `F = Φ(x, H(x))` with the nodes built from `H`, the exact total derivative is
+/// Writing `F = Φ(x, η̂(x), H(x, η̂(x)))`, the total derivative is
 ///
 /// ```text
-///   dF/dx = ∂Φ/∂x|_H          ← the fixed-node score (analytic; see above)
+///   dF/dx = ∂Φ/∂x|_grid       ← the fixed-node score
 ///         + ∂Φ/∂H · dH/dx     ← this function
-///         + ∂Φ/∂η̂ · dη̂/dx     ← = Σ_j ŵ_j ∇_η nll(η_j), the posterior-mean score = 0
+///         + ∂Φ/∂η̂ · dη̂/dx    ← this function too
 /// ```
 ///
-/// The `∂Φ/∂η̂` factor is the posterior-mean score, which is zero by the Bartlett identity —
-/// exactly so at `n_agq = 1`, where η̂ *is* the mode. So the `H`-response is all that stands
-/// between the fixed-node score and the exact gradient. It is not a small correction: without
-/// it the gradient is 26% wrong at `n_agq = 1`.
+/// The finite-grid posterior-mean score `∂Φ/∂η̂ = Σ_j ŵ_j ∇_η nll(η_j)` is generally
+/// nonzero. Bartlett's identity for an exact integral cannot remove this term from a finite
+/// quadrature rule. At one node it vanishes by mode stationarity; the anchor still has its
+/// own mode dependence. Both responses are retained below.
 ///
 /// It is computed by central-differencing `Φ` in `x` **through the grid alone**: the grid
 /// (`η̂`, `H`) is rebuilt at the perturbed parameters while `nll` stays at the original ones,
 /// which isolates the response term from the direct dependence already covered analytically.
 ///
-/// **`H` depends on `x` twice, and both halves matter.** `H = ∂²nll/∂η²|_{η̂(x)}` varies with
+/// **`H` depends on `x` twice, and both halves matter.** The selected anchor varies with
 /// `x` explicitly (through θ/Ω/σ) *and* implicitly through the mode `η̂(x)`. Differencing only
 /// the explicit half is not a partial improvement — it is **worse than omitting the term
 /// entirely** (26% → 62% on warfarin at n = 1), because the two halves substantially cancel.
@@ -1216,8 +1217,10 @@ fn accumulate_fixed_eta_packed_gradient(
 /// old code differenced a **finite-differenced** quantity in `x`: with the analytic `h_inner`
 /// anchor, `H` is exact and the remaining FD is of an exact function.
 ///
-/// Falls back to the previous `phi_grid` re-sweep when the per-node gradient is out of the
-/// provider's scope (TTE, categorical, …) — the same all-or-nothing boundary the anchor uses.
+/// Uses the `phi_grid` re-sweep when the per-node gradient is unavailable. If a perturbed
+/// anchor/proposal or any correction is invalid, returns `None`: the outer dispatcher then
+/// finite-differences the complete quadrature objective with the same anchor. It must never
+/// silently omit a coordinate's grid response and return a partial gradient.
 #[allow(clippy::too_many_arguments)]
 fn grid_response_correction(
     model: &CompiledModel,
@@ -1296,8 +1299,13 @@ fn grid_response_correction(
             anchor_hessian(anchor, model, subject, &pp, &sp, &ep, scratch, schedule),
             anchor_hessian(anchor, model, subject, &pm, &sm, &em, scratch, schedule),
         ) else {
-            continue; // GN anchor out of scope at this perturbed point — no correction
+            return None; // let the caller difference the full quadrature objective
         };
+        // A non-finite anchor can otherwise be hidden by build_proposal's prior-scale
+        // fallback. It is not a usable input to the grid derivative.
+        if hp.iter().chain(hm.iter()).any(|v| !v.is_finite()) {
+            return None;
+        }
 
         // `nll` stays at the ORIGINAL params — the direct x-dependence is already covered
         // analytically by the fixed-η score — but the grid (centre and scale) is the
@@ -1311,7 +1319,7 @@ fn grid_response_correction(
                     build_proposal(&hp, &sp.omega_joint_inv, d),
                     build_proposal(&hm, &sm.omega_joint_inv, d),
                 ) else {
-                    continue; // degenerate perturbed Hessian contributes no correction
+                    return None;
                 };
                 let mut acc =
                     0.5 * (prop_p.log_det_inv_scale - prop_m.log_det_inv_scale) / (2.0 * step);
@@ -1361,14 +1369,15 @@ fn grid_response_correction(
                     schedule,
                 );
                 let (Some(phip), Some(phim)) = (phip, phim) else {
-                    continue; // a degenerate perturbed Hessian contributes no correction
+                    return None;
                 };
                 (phip - phim) / (2.0 * step)
             }
         };
-        if r.is_finite() {
-            out[k] += r;
+        if !r.is_finite() {
+            return None;
         }
+        out[k] += r;
     }
     Some(())
 }
@@ -1667,8 +1676,9 @@ fn agq_subject_packed_gradient(
     Some(())
 }
 
-/// Analytic packed gradient of the AGQ **OFV** (`2 · Σᵢ Fᵢ`), or `None` if any subject is
-/// outside the provider's scope (all-or-nothing, matching `population_gradient_sens`).
+/// Packed gradient of the AGQ **OFV** (`2 · Σᵢ Fᵢ`), or `None` if a complete finite gradient
+/// cannot be formed for any subject. Unavailable analytic ingredients use the numerical
+/// routes above; a failure there declines the whole gradient rather than omitting terms.
 ///
 /// Parallel over subjects; the per-subject gradients are reduced **serially in subject
 /// order** so the result cannot depend on the thread count (#703), exactly as
@@ -1732,6 +1742,114 @@ pub fn agq_population_gradient(
 mod tests {
     use super::*;
     use crate::parser::model_parser::parse_model_string;
+
+    #[test]
+    fn audit_invalid_perturbed_anchor_declines_the_gradient() {
+        use crate::estimation::inner_optimizer::find_ebe;
+        use crate::estimation::parameterization::pack_params;
+        let source = M3_MODEL.replace("TVCL(0.2,", "TVCL(0.2000001,").replace(
+            "CL = TVCL * exp(ETA_CL)",
+            "CL = (TVCL - 0.2)^0.5 * exp(ETA_CL)",
+        );
+        let model = parse_model_string(&source).unwrap();
+        let params = &model.default_params;
+        let subject = score_subject(&model, &params.theta, &[0.5, 1.0, 2.0, 4.0, 8.0]);
+        let ebe = find_ebe(&model, &subject, params, 200, 1e-11, None, None, 0);
+        let x = pack_params(params);
+        let stack = Stack::new(&model, params, 0);
+        let mut xm = x.clone();
+        xm[0] -= AGQ_GRID_FD_STEP * (1.0 + x[0].abs());
+        let pm = crate::estimation::parameterization::unpack_params(&xm, params);
+        let sm = Stack::new(&model, &pm, 0);
+        let mut scratch = pk::EventPkParams::default();
+        let hm = anchor_hessian(
+            HessianAnchor::GaussNewton,
+            &model,
+            &subject,
+            &pm,
+            &sm,
+            ebe.eta.as_slice(),
+            &mut scratch,
+            None,
+        );
+        assert!(
+            hm.is_none_or(|h| h.iter().any(|v| !v.is_finite())),
+            "fixture must actually have an invalid perturbed anchor"
+        );
+        let (nodes, weights) = gauss_hermite(3);
+        let lw: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
+        let base = agq_subject_nll(
+            &model,
+            &subject,
+            params,
+            &stack,
+            ebe.eta.as_slice(),
+            &nodes,
+            &lw,
+            HessianAnchor::GaussNewton,
+        );
+        assert!(
+            base.is_finite() && base < NLL_SENTINEL,
+            "base quadrature must be valid"
+        );
+        let mut out = vec![0.0; x.len()];
+        assert!(
+            agq_subject_packed_gradient(
+                &model,
+                &subject,
+                params,
+                params,
+                &stack,
+                &x,
+                ebe.eta.as_slice(),
+                &nodes,
+                &lw,
+                HessianAnchor::GaussNewton,
+                &mut out
+            )
+            .is_none(),
+            "an invalid perturbed anchor must not silently lose its grid response"
+        );
+        // The production fallback must still differentiate FOCEI quadrature, not FOCEI.
+        let pop = Population {
+            subjects: vec![subject],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let bounds = crate::estimation::parameterization::compute_bounds(params);
+        let gradient = |interval| {
+            let opts = crate::types::FitOptions {
+                method: crate::types::EstimationMethod::FoceI,
+                n_agq: 3,
+                reconverge_gradient_interval: interval,
+                inner_tol: 1e-11,
+                inner_maxiter: 200,
+                ..crate::types::FitOptions::default()
+            };
+            let mut index = 0;
+            crate::estimation::outer_optimizer::population_gradient(
+                &x,
+                1,
+                params,
+                &model,
+                &pop,
+                std::slice::from_ref(&ebe.eta),
+                std::slice::from_ref(&ebe.h_matrix),
+                &[vec![]],
+                &bounds,
+                &opts,
+                &mut index,
+            )
+        };
+        assert_eq!(
+            gradient(0),
+            gradient(1),
+            "analytic failure must use the explicit quadrature FD path"
+        );
+    }
 
     // --- Phase 0 (#251): the analytic fixed-b score reaches full FOCE/FOCEI scope -------
     //

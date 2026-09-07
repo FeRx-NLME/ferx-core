@@ -87,6 +87,13 @@ section of the SDLC for the versioning policy).
   to read. No effect on `.ferx` models, the CLI or the R wrapper, none of which constructs it.
 
 ### Fixed
+- Quadrature `covariance_method = s` / `rsr` now use scores of the selected AGQ
+  objective instead of FOCE/FOCEI scores. Mixture FOCEI rejects unsupported
+  `n_agq > 1`, Rust API calls reject `n_agq = 0`, and incomplete AGQ derivatives
+  fall back to full-objective finite differences instead of omitting terms.
+  An explicit AGQ likelihood readout preserves the preceding estimator's method
+  label as well as its parameters and covariance, and later quadrature stages
+  cannot bypass the IOV grid-size limit (#955).
 - **`CWRES` is now NONMEM's `CWRES` (#1182).** It was each residual divided by its own
   marginal SD, `(y − f0) / √R̃ⱼⱼ`. NONMEM's conditional weighted residual (Hooker et al. 2007)
   is the *decorrelated* vector `R̃^{-1/2}(y − f0)` with the symmetric inverse square root of

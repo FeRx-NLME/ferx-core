@@ -2939,6 +2939,22 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         );
     }
 
+    // Rust callers bypass the parser's lower bound. Zero must not disable FOCEI
+    // quadrature or be silently coerced to one-node Laplace by agq_nodes().
+    if options.n_agq == 0
+        && chain
+            .iter()
+            .any(|m| matches!(m, EstimationMethod::FoceI | EstimationMethod::Laplace))
+    {
+        diags.push(
+            Diagnostic::error(
+                "E_AGQ_NODES_ZERO",
+                "n_agq must be at least 1; use n_agq = 1 for plain FOCEI or one-node Laplace.",
+            )
+            .with_block("fit_options"),
+        );
+    }
+
     // ── Quadrature: FOCEI + n_agq > 1 is the Gauss-Newton-anchored refinement (#251) ──────
     // The GN anchor's `H̃` comes from the sensitivity provider (`score_core`), so the
     // refinement is available only where that provider reaches — the same analytic scope

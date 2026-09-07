@@ -703,7 +703,7 @@ pub(crate) fn max_scaled_deviation(a: &[f64], b: &[f64]) -> f64 {
 }
 
 /// The population objective the outer loop actually minimises: [`pop_nll`] (FOCE/FOCEI),
-/// or the AGQ marginal when the stage's method is `agq`.
+/// or the selected AGQ marginal when the stage enables quadrature via `agq_nodes()`.
 ///
 /// **Every** production site that needs "the objective for *this* fit" must call this, not
 /// `pop_nll` — the objective closures, the reconverged-FD gradient, and the covariance
@@ -726,8 +726,8 @@ pub(crate) fn pop_nll_opts(
         // stacked (η, κ₁..κ_K) under IOV — the joint marginal, not the η-only one. The modes
         // are the ones the shared inner loop already converged (`find_ebe_iov` returns the
         // joint mode); AGQ does not re-optimise them, it lays its grid around them.
-        // `h_matrices` (the ∂f/∂η Jacobian) is a FOCE artefact AGQ has no use for — it
-        // finite-differences the true posterior Hessian instead. See `crate::estimation::agq`.
+        // AGQ builds its selected anchor itself; it does not use the FOCE Jacobians
+        // in `h_matrices`. See `crate::estimation::agq` for the two anchor definitions.
         return crate::estimation::agq::agq_population_nll(
             model,
             population,
@@ -3225,7 +3225,7 @@ fn sens_check_enabled() -> bool {
 /// BFGS) on one definition of "gradient evaluation" — they can't drift apart in
 /// how they count or pick the gradient.
 #[allow(clippy::too_many_arguments)]
-fn population_gradient(
+pub(super) fn population_gradient(
     x: &[f64],
     n_subj: usize,
     init_params: &ModelParameters,

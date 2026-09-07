@@ -358,6 +358,9 @@ pub fn fit(
             );
         }
         for m in options.method_chain() {
+            if m == EstimationMethod::FoceI && options.n_agq > 1 {
+                return Err("mixture models do not yet support FOCEI quadrature (n_agq > 1); use n_agq = 1 for mixture FOCEI. The mixture objective does not evaluate the quadrature grid.".to_string());
+            }
             if !matches!(
                 m,
                 EstimationMethod::Foce
@@ -561,7 +564,14 @@ pub fn fit(
     // always passes; only `n_agq > 1` (adaptive quadrature) can trip this. `agq_nodes()`
     // fires for both quadrature methods, so name whichever the user actually wrote (#251
     // review #4) rather than hardcoding "laplace".
-    if let Some(n_nodes) = options.agq_nodes() {
+    // A later stage can request quadrature while options.method names a different
+    // estimator. Inspect the effective chain, just as check_model_options does.
+    let quadrature_stage = options.method_chain().into_iter().find_map(|method| {
+        let mut stage = options.clone();
+        stage.method = method;
+        stage.agq_nodes().map(|n| (method, n))
+    });
+    if let Some((method, n_nodes)) = quadrature_stage {
         if model.n_kappa > 0 {
             let max_occ = population
                 .subjects
@@ -572,7 +582,7 @@ pub fn fit(
             let d = model.n_eta + max_occ * model.n_kappa;
             let grid = crate::estimation::agq::grid_size(n_nodes, d);
             if grid > crate::estimation::agq::MAX_AGQ_GRID {
-                let label = if matches!(options.method, EstimationMethod::Laplace) {
+                let label = if matches!(method, EstimationMethod::Laplace) {
                     "laplace"
                 } else {
                     "focei"
@@ -2221,16 +2231,14 @@ fn fit_inner(
         }
     }
 
-    // `final_method` reports the last *estimating* stage. An evaluation-only IMP
-    // (`imp_eval_only`) doesn't produce parameters, so a chain like `[saem, imp]`
-    // surfaces as `method = SAEM`. Estimating IMP (the default) does produce
-    // parameters and is reported like any other estimator. The full chain is
-    // preserved in `method_chain`.
+    // Report the last estimating stage using the same evaluator classification as
+    // covariance and diagnostics. Neither evaluation-only IMP nor an AGQ readout
+    // changes the estimator that produced the parameters. Preserve the full chain.
     let final_method = chain
         .iter()
         .rev()
         .copied()
-        .find(|&m| !(m == EstimationMethod::Imp && options.imp_eval_only))
+        .find(|m| !eval_only_methods.contains(m))
         .unwrap_or(*chain.last().expect("chain non-empty"));
     let grad_inner =
         crate::build_info::gradient_method_inner(&crate::build_info::BUILD_INFO, model);
