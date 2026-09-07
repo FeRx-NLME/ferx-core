@@ -1207,3 +1207,79 @@ fn a_run_refused_after_it_took_the_lock_still_releases_it() {
         "a refused run left the directory locked"
     );
 }
+
+/// A per-candidate start override is part of the identity, so two candidates
+/// with the same text but different start counts are two fits (#1183).
+///
+/// The extra starts exist to reach an optimum the cheaper fit does not, so
+/// deduplicating them would silently score one model with the other's fit.
+#[test]
+fn candidates_that_differ_only_in_their_start_count_are_each_fitted() {
+    let (a, b) = same_model_two_ways();
+    assert_eq!(a.canonical_hash(), b.canonical_hash());
+    let candidates = vec![
+        Candidate::new("cheap", a),
+        Candidate::new("thorough", b).starts(7),
+    ];
+    assert_ne!(candidates[0].hash(), candidates[1].hash());
+    let recorder = Recorder::new();
+    let seen = Mutex::new(Vec::new());
+    let report = Runner::new()
+        .threads(1)
+        .run_with_fitter(&candidates, &population(&["1"]), &lenient(), |c, _| {
+            recorder.record(&c.id);
+            seen.lock().unwrap().push(c.n_starts);
+            Ok(converged_fit(100.0))
+        })
+        .expect("run");
+    assert_eq!(recorder.ids(), vec!["cheap", "thorough"]);
+    assert_eq!(report.fitted, 2);
+    assert_eq!(report.deduped, 0, "the start count is part of the identity");
+    assert!(report.results.iter().all(|r| r.duplicate_of.is_none()));
+    let seen = seen.lock().unwrap().clone();
+    assert!(seen.contains(&None) && seen.contains(&Some(7)), "{seen:?}");
+    // A candidate with no override keeps the plain canonical hash, so an
+    // existing journal still resumes against it.
+    assert_eq!(
+        candidates[0].hash(),
+        crate::search::candidate::hex(&candidates[0].model.canonical_hash())
+    );
+}
+
+/// Raising a tool's per-candidate start count re-keys the candidate, so a
+/// resume refits it instead of reusing the fit that took fewer starts
+/// (#1183). `SearchManifest` compares only the run-wide count, so nothing
+/// else would notice.
+#[test]
+fn a_resume_after_raising_the_start_override_refits_rather_than_reusing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let text = "[parameters]\ntheta CL = 1\n";
+    let (first, fitted) = run_over(
+        dir.path(),
+        &[candidate("block", text).starts(3)],
+        &lenient(),
+    );
+    assert_eq!(fitted, vec!["block"]);
+    assert_eq!(first.fitted, 1);
+
+    let options = RunOptions {
+        resume: true,
+        ..lenient()
+    };
+    // Same model, same run-wide options, more starts: the manifest is
+    // compatible and the *text* is unchanged, so only the candidate's own
+    // hash can tell these apart.
+    let (raised, fitted) = run_over(dir.path(), &[candidate("block", text).starts(9)], &options);
+    assert_eq!(
+        fitted,
+        vec!["block"],
+        "the lower-start fit was reused for a candidate that asked for more"
+    );
+    assert_eq!((raised.fitted, raised.reused), (1, 0));
+
+    // And the same count does resume, so the re-key is the override's doing
+    // and not a hash that changes on every run.
+    let (again, fitted) = run_over(dir.path(), &[candidate("block", text).starts(9)], &options);
+    assert!(fitted.is_empty(), "an unchanged override refits");
+    assert_eq!((again.fitted, again.reused), (0, 1));
+}

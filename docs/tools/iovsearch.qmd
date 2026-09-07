@@ -65,9 +65,13 @@ Pharmpy's (`tools/iovsearch/tool.py`), two steps of brute force:
 
 1. **IOV.** The input is fitted, then `run1` — the input with a κ on
    *every* candidate parameter, the full-IOV model — then one candidate per
-   non-empty proper subset of those κ **removed**, each derived from the
+   non-empty subset of the **optional** κ removed, each derived from the
    full-IOV model and seeded from its fit (smallest removals first, in
-   alphabetical order of the κ — Pharmpy's numbering). The input, the
+   alphabetical order of the κ — Pharmpy's numbering). Removing *all* of
+   them is a candidate too whenever a plain `IOV(CL, EXP)` keeps one, since
+   what is left — the forced κ alone — is not the input; with nothing forced
+   it would be the input exactly, which is already ranked, so the
+   enumeration stops at Pharmpy's proper subsets there. The input, the
    full-IOV model and the candidates are ranked together, with the input
    as reference; if the input ranks best, the search ends on it.
 2. **IIV.** From the step-1 winner, one candidate per non-empty subset of
@@ -76,8 +80,9 @@ Pharmpy's (`tools/iovsearch/tool.py`), two steps of brute force:
    and the line becomes `CL = TVCL * exp(KAPPA_CL)`. The winner and the
    candidates are ranked; the best is the final model.
 
-Three candidate parameters mean one full-IOV model, six removal candidates
-and, from a winner with one κ, one η-removal candidate. A κ named by a
+Three optional candidate parameters mean one full-IOV model, six removal
+candidates and, from a winner with one κ, one η-removal candidate; one
+forced and one optional mean the full model and the forced-only model. A κ named by a
 plain `IOV(p, EXP)` is never removed; a parameter that already carries a κ
 in the input is left as it is, with a note; an η declared `FIX` is never
 removed.

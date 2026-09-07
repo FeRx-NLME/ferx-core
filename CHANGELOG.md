@@ -32,14 +32,19 @@ section of the SDLC for the versioning policy).
   estimates; a new block starts at the parent's EBE correlations and a block over three or
   more η gets `[iivsearch] block_retries` extra starts per η. A parameter outside the canonical
   `P = TVP * exp(ETA_P)` form is refused by name before anything is fitted. Anchored against
-  Pharmpy 2.2.0 through NONMEM 7.5.1 on a simulated dataset: the same candidates in the same
-  numbering, the same winner at each step and the same final `[CL,V]` at the same BIC(iiv),
-  for all three algorithms.
+  Pharmpy 2.2.0 through NONMEM 7.5.1 on a simulated dataset: for `top_down_exhaustive` and
+  `bottom_up_stepwise`, the same candidates in the same numbering, the same winner at each
+  step and the same final `[CL,V]` at the same BIC(iiv). `simultaneous_stepwise` agrees on
+  the first step and then parts from Pharmpy, because its `[CL,V]+[KA]` candidate is a mixed
+  block + diagonal ω, which FOCE/FOCEI fit as the full block (#1018, open): ferx selects that
+  candidate where Pharmpy selects `[CL,V]`. The search notes #1018 on any such candidate, and
+  the anchor asserts the divergence so the fix turns it red.
 - **`ferx iovsearch` — inter-occasion variability search (Pharmpy `iovsearch`) in
   `ferx-tools` (#1183).** A model with a κ on every candidate parameter (`IOV?([CL,V], EXP)`
-  in the `[space]`, or every parameter with a free η by default), then every proper subset of
-  those κ removed, ranked with the input on the BIC(random); then, from the winner, every subset
-  of the η that sit beside a κ removed. The κ are declared `disjoint`, `joint`, `same-as-iiv`
+  in the `[space]`, or every parameter with a free η by default), then every subset of the
+  optional κ removed — including all of them when a plain `IOV(CL, EXP)` keeps one, since the
+  model left is not the input — ranked with the input on the BIC(random); then, from the
+  winner, every subset of the η that sit beside a κ removed. The κ are declared `disjoint`, `joint`, `same-as-iiv`
   or `explicit` (`groups`), each at a tenth of its η's fitted variance, and the base must read
   its occasions itself (`iov_column`). Anchored against Pharmpy 2.2.0 through NONMEM 7.5.1 on a
   three-occasion dataset: the same candidates, the same `IOV([CL])` winner at the same

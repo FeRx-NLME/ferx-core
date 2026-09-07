@@ -183,6 +183,116 @@ mod tests {
         list.iter().map(|s| s.to_string()).collect()
     }
 
+    /// The warfarin model over two occasions, IIV only, evaluating rather
+    /// than fitting (`maxiter = 0`), reading its occasions from `OCC`.
+    const BASE: &str = "\
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.2 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = foce
+  maxiter    = 0
+  covariance = false
+  checkpoint = false
+  iov_column = OCC
+";
+
+    fn write_config(dir: &std::path::Path, space: &str, section: &str) -> std::path::PathBuf {
+        let data =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/warfarin_iov.csv");
+        std::fs::write(dir.join("base.ferx"), BASE).unwrap();
+        let config = dir.join("search.ferxsearch");
+        std::fs::write(
+            &config,
+            format!(
+                "base = \"base.ferx\"\ndata = \"{}\"\n\n{space}{section}[strictness]\n\
+                 require_converged = false\nreject_init_stall = false\nreject_on_boundary = \
+                 false\n\n[run]\nretries = 0\nthreads = 2\n",
+                data.display()
+            ),
+        )
+        .unwrap();
+        config
+    }
+
+    /// The command end to end, then again `--quiet --resume` so the journal
+    /// is reused and the progress printer's early return is taken. One
+    /// candidate parameter keeps it to two fits.
+    #[test]
+    fn run_searches_writes_the_files_and_resumes_quietly() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_config(dir.path(), "[space]\nmfl = \"IOV?([CL],EXP)\"\n\n", "");
+        let out = dir.path().join("run");
+        let common = [
+            "ferx".to_string(),
+            "iovsearch".to_string(),
+            config.to_string_lossy().into_owned(),
+            "--directory".to_string(),
+            out.to_string_lossy().into_owned(),
+            "--threads".to_string(),
+            "2".to_string(),
+        ];
+        assert_eq!(run(&common), 0);
+        for file in ["models.csv", "final.ferx", "final-fit.yaml"] {
+            assert!(out.join(file).is_file(), "{file} missing");
+        }
+        assert!(out.join("models/run1.ferx").is_file());
+        let mut again = common.to_vec();
+        again.push("--quiet".to_string());
+        again.push("--resume".to_string());
+        assert_eq!(run(&again), 0);
+    }
+
+    /// With no `[space]` the candidates are every parameter with a free η,
+    /// which the banner says; a base that does not read its occasions is
+    /// refused with the fix named.
+    #[test]
+    fn run_defaults_the_space_and_refuses_a_base_without_an_occasion_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_config(dir.path(), "", "[iovsearch]\ndistribution = \"joint\"\n\n");
+        assert_eq!(
+            run(&args(&[
+                "ferx",
+                "iovsearch",
+                &config.to_string_lossy(),
+                "--directory",
+                &dir.path().join("run").to_string_lossy(),
+                "--quiet"
+            ])),
+            0
+        );
+
+        let no_column = dir.path().join("no-occ");
+        std::fs::create_dir(&no_column).unwrap();
+        let config = write_config(&no_column, "", "");
+        std::fs::write(
+            no_column.join("base.ferx"),
+            BASE.replace("  iov_column = OCC\n", ""),
+        )
+        .unwrap();
+        assert_eq!(
+            run(&args(&["ferx", "iovsearch", &config.to_string_lossy()])),
+            1
+        );
+    }
+
     #[test]
     fn run_rejects_two_files_and_a_missing_file_and_prints_help() {
         assert_eq!(

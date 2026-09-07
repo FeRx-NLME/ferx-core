@@ -122,6 +122,14 @@ all-diagonal model. Three η give `[CL,KA]`, `[CL,V]`, `[KA,V]` and
 `[CL,KA,V]`. This is Pharmpy's `_is_valid_block_combination`, which admits
 exactly the cliques — `[CL,V]+[KA,F]` is not a candidate.
 
+A block the input already carries that names a parameter the `COVARIANCE`
+statement does **not** is not the search's to take apart: it rides along in
+every candidate unchanged, its members are not offered to the cliques, and
+the notes say so. This is the same rule as everywhere else here — a
+parameter the space does not name is left as it is — and it is what keeps
+the block stage from quietly dissolving a correlation the modeller put in
+the base model on purpose.
+
 ### The base model
 
 The base is the input when its η structure already lies on the space.

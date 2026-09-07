@@ -13,7 +13,7 @@
 //!
 //! 1. **IOV.** The input is fitted, then a model with κ on *every* candidate
 //!    parameter (`run1`, the full-IOV model), then one candidate per
-//!    non-empty proper subset of those κ removed, each derived from the
+//!    non-empty subset of the *optional* κ removed, each derived from the
 //!    full-IOV model and seeded from its fit. The input, the full-IOV
 //!    model and the candidates are ranked together on `[rank] type`; if the
 //!    input ranks best the search ends on it.
@@ -572,6 +572,17 @@ impl Space {
                 (pv.eta.clone(), fresh_kappa_name(&variability, p)),
             );
         }
+        // Every parameter that already carries a κ is named too, at the κ it
+        // has. It is never added or removed — it is not a candidate — but it
+        // can share a `block_kappa` with one that is, and splitting or
+        // rebuilding that block has to name every member.
+        for pv in variability.with_kappa() {
+            if let Some(kappa) = &pv.kappa {
+                names
+                    .entry(pv.name.clone())
+                    .or_insert((pv.eta.clone(), kappa.clone()));
+            }
+        }
         // The κ blocks the candidates declare.
         let member = |p: &String| params.contains_key(p);
         let groups: Vec<Vec<String>> = match options.distribution {
@@ -1006,10 +1017,18 @@ fn derive(
         if survived.kappa_blocks.contains(block) {
             continue;
         }
+        // Every member is named, or the block would be written around fewer
+        // κ than it says — a different model, silently.
         let kappas: Vec<String> = block
             .iter()
-            .filter_map(|p| space.names.get(p).map(|(_, k)| k.clone()))
-            .collect();
+            .map(|p| {
+                space
+                    .names
+                    .get(p)
+                    .map(|(_, k)| k.clone())
+                    .ok_or_else(|| format!("{id}: `{p}` has no κ to block"))
+            })
+            .collect::<Result<_, _>>()?;
         model.apply(ModelEdit::SetKappaBlock(kappas)).map_err(err)?;
     }
     Ok(Candidate::new(id, model)
@@ -1107,7 +1126,7 @@ pub(crate) fn search(
         );
     }
 
-    // ── step 1: the full-IOV model, then every proper subset removed ─────
+    // ── step 1: the full-IOV model, then the removals ───────────────────
     let mut selected = input.clone();
     if !cancelled {
         let all: Vec<String> = space.params.iter().map(|(p, _)| p.clone()).collect();
@@ -1137,10 +1156,26 @@ pub(crate) fn search(
         let candidate = derive(&id, &input, &full, &space, options)?;
         let report = fitter.fit_step("iov-all", std::slice::from_ref(&candidate))?;
         notes.extend(report.warnings.iter().cloned());
-        let result = report
-            .results
-            .first()
-            .ok_or("the full-IOV model was not fitted")?;
+        // A run cancelled *during* this one fit comes back with no result at
+        // all: `Runner` drops a candidate whose `fit()` failed while the flag
+        // was set, since that failure cannot be told from the flag unwinding
+        // it. The input is already fitted, so the search returns it as the
+        // last completed model with `cancelled` set, rather than throwing the
+        // whole run away as an error (a CLI can then still exit 130).
+        let result = match report.results.first() {
+            Some(result) => result,
+            None if report.cancelled => {
+                notes.push(
+                    "the search was cancelled while the full-IOV model was being fitted; the \
+                     input is the last completed model"
+                        .into(),
+                );
+                return Ok(cancelled_at_input(
+                    options, &space, input, rows, steps, store, notes,
+                ));
+            }
+            None => return Err("the full-IOV model was not fitted".into()),
+        };
         if let Some(e) = &result.error {
             return Err(format!("the full-IOV model could not be fitted: {e}"));
         }
@@ -1172,12 +1207,24 @@ pub(crate) fn search(
 
         let mut nodes = vec![full_node.clone()];
         if !cancelled {
-            // Every non-empty proper subset of the searched κ removed,
-            // smallest removals first, from the full-IOV model.
+            // Every non-empty subset of the searched κ removed, smallest
+            // removals first, from the full-IOV model.
+            //
+            // Removing *all* of them is a candidate whenever a forced κ
+            // (`IOV(CL, EXP)`) remains, since the model that is left is not
+            // the input: with `IOV(CL,EXP); IOV?(V,EXP)` the search has to
+            // fit `[CL]` as well as `[CL,V]`. With nothing forced it is the
+            // input exactly, which is already ranked, so the bound drops to
+            // Pharmpy's proper subsets.
             let searched = space.searched();
             let kept = space.kept();
+            let max_removed = if kept.is_empty() {
+                searched.len().saturating_sub(1)
+            } else {
+                searched.len()
+            };
             let mut targets = Vec::new();
-            for size in 1..searched.len() {
+            for size in 1..=max_removed {
                 for removed in combinations(&searched, size) {
                     let kappas: Vec<String> = all
                         .iter()
@@ -1192,8 +1239,9 @@ pub(crate) fn search(
                     ));
                 }
             }
-            // With one searched κ there is no proper subset to remove; the
-            // full model is the only candidate.
+            // With one optional κ and nothing forced there is nothing to
+            // remove but the input itself, so the full model is the only
+            // candidate.
             let mut candidates = Vec::with_capacity(targets.len());
             for target in &targets {
                 let id = new_id();
@@ -1373,6 +1421,48 @@ pub(crate) fn search(
         notes,
         cancelled,
     })
+}
+
+/// The result of a search cancelled before any candidate finished: the input
+/// as the final model, `cancelled` set, and whatever rows and steps the run
+/// managed. Its own tail rather than the one below because the search
+/// returns here from inside a step, where the candidate that would have
+/// become the final model does not exist.
+fn cancelled_at_input(
+    options: &IovsearchOptions,
+    space: &Space,
+    input: Node,
+    mut rows: Vec<ModelRow>,
+    steps: Vec<StepSummary>,
+    mut store: HashMap<String, (ModelText, Option<FitResult>)>,
+    notes: Vec<String>,
+) -> IovsearchResult {
+    if let Some(r) = rows.iter_mut().find(|r| r.id == input.id) {
+        r.selected = true;
+    }
+    let models: BTreeMap<String, ModelText> = store
+        .iter()
+        .map(|(id, (text, _))| (id.clone(), text.clone()))
+        .collect();
+    let (final_model, final_fit) = store
+        .remove(&input.id)
+        .expect("the input model is stored before any candidate is fitted");
+    IovsearchResult {
+        options: options.clone(),
+        criterion: options.criterion(),
+        input_model: space.input_model.clone(),
+        input_structure: space.input_structure.clone(),
+        rows,
+        steps,
+        final_id: input.id,
+        final_model,
+        final_structure: input.structure,
+        final_fit,
+        final_criterion: input.criterion,
+        models,
+        notes,
+        cancelled: true,
+    }
 }
 
 /// Pharmpy's `rank_models` with `parent` as reference.

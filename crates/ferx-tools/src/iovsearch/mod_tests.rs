@@ -387,13 +387,15 @@ fn the_input_is_returned_when_no_iov_candidate_beats_it_and_a_kept_kappa_stays()
         .any(|n| n.contains("the input is returned")));
     assert_eq!(script.dirs(), vec!["input", "iov-all", "step-1"]);
 
-    // With one κ kept and one searched there is no proper subset to remove:
-    // the full model is the only IOV candidate.
+    // With one κ kept and one searched, removing the optional one leaves the
+    // forced `[CL]` — a candidate of its own, since it is not the input
+    // (`a_forced_kappa_gives_a_forced_only_candidate_that_can_win`).
     let script = ScriptedFitter::new(
         key,
         &[
             ("IIV([CL]+[KA]+[V]);IOV([])", 200.0),
             ("IIV([CL]+[KA]+[V]);IOV([CL]+[V])", 100.0),
+            ("IIV([CL]+[KA]+[V]);IOV([CL])", 150.0),
         ],
     );
     let result = run(
@@ -403,16 +405,19 @@ fn the_input_is_returned_when_no_iov_candidate_beats_it_and_a_kept_kappa_stays()
     );
     assert_eq!(
         fitted_in(&result, 1),
-        vec![pair("run1", "IIV([CL]+[KA]+[V]);IOV([CL]+[V])")]
+        vec![
+            pair("run1", "IIV([CL]+[KA]+[V]);IOV([CL]+[V])"),
+            pair("run2", "IIV([CL]+[KA]+[V]);IOV([CL])"),
+        ]
     );
     assert_eq!(result.steps[0].best, "run1");
     // Step 2: every subset of {CL, V}'s η.
     assert_eq!(
         fitted_in(&result, 2),
         vec![
-            pair("run2", "IIV([KA]+[V]);IOV([CL]+[V])"),
-            pair("run3", "IIV([CL]+[KA]);IOV([CL]+[V])"),
-            pair("run4", "IIV([KA]);IOV([CL]+[V])"),
+            pair("run3", "IIV([KA]+[V]);IOV([CL]+[V])"),
+            pair("run4", "IIV([CL]+[KA]);IOV([CL]+[V])"),
+            pair("run5", "IIV([KA]);IOV([CL]+[V])"),
         ]
     );
     assert_eq!(result.final_id, "run1");
@@ -605,4 +610,87 @@ fn a_kappa_the_input_already_carries_stays_in_every_candidate() {
         );
     }
     assert_eq!(result.final_id, "run2");
+}
+
+#[test]
+fn a_forced_kappa_gives_a_forced_only_candidate_that_can_win() {
+    // `IOV(CL,EXP); IOV?(V,EXP)`: removing the one optional κ leaves `[CL]`,
+    // which is *not* the input — so it is a candidate, and it can win. The
+    // mutation this pins is the exclusive bound that emitted no removal at
+    // all for this space, leaving `[CL]` unfitted.
+    let script = ScriptedFitter::new(
+        key,
+        &[
+            ("IIV([CL]+[KA]+[V]);IOV([])", 200.0),
+            ("IIV([CL]+[KA]+[V]);IOV([CL]+[V])", 120.0),
+            ("IIV([CL]+[KA]+[V]);IOV([CL])", 100.0),
+        ],
+    );
+    let result = run(
+        &script,
+        space_of(BASE, Some("IOV(CL,EXP);IOV?([V],EXP)"), &options()),
+        &options(),
+    );
+    assert_eq!(
+        fitted_in(&result, 1),
+        vec![
+            pair("run1", "IIV([CL]+[KA]+[V]);IOV([CL]+[V])"),
+            pair("run2", "IIV([CL]+[KA]+[V]);IOV([CL])"),
+        ]
+    );
+    assert_eq!(result.steps[0].best, "run2");
+    // The forced κ is in the winner; the optional one is not.
+    let model = script.model_of("step-1", "run2").render();
+    assert!(model.contains("kappa KAPPA_CL"), "{model}");
+    assert!(!model.contains("KAPPA_V"), "{model}");
+    assert_eq!(result.final_id, "run2");
+
+    // With nothing forced, removing every κ *is* the input, which is already
+    // ranked — so the bound stays at Pharmpy's proper subsets.
+    let script = ScriptedFitter::new(key, &[("IIV([CL]+[KA]+[V]);IOV([])", 200.0)]);
+    let result = run(
+        &script,
+        space_of(BASE, Some("IOV?([CL,V],EXP)"), &options()),
+        &options(),
+    );
+    let fitted = fitted_in(&result, 1);
+    assert_eq!(
+        fitted.len(),
+        3,
+        "the full model and the two single-κ ones: {fitted:?}"
+    );
+    assert!(
+        !fitted.iter().any(|(_, d)| d.ends_with("IOV([])")),
+        "the input is not refitted as a candidate: {fitted:?}"
+    );
+}
+
+#[test]
+fn a_cancellation_during_the_full_iov_fit_returns_the_input_not_an_error() {
+    // `Runner` returns a cancelled report with *no* results when the flag is
+    // flipped during the fit. The search must keep the input — the last
+    // completed model — rather than turning the cancellation into an error
+    // that loses it (and the CLI's 130).
+    let mut script = ScriptedFitter::new(key, &[("IIV([CL]+[KA]+[V]);IOV([])", 200.0)]);
+    script.cancel_empty_after = Some(2);
+    // `run` unwraps: without the guard the search returns `Err` here and the
+    // caller loses the input model entirely, which is the mutation this pins.
+    let result = run(&script, space_of(BASE, None, &options()), &options());
+    assert!(result.cancelled);
+    assert_eq!(result.final_id, "input");
+    assert_eq!(
+        result.final_structure.description(),
+        "IIV([CL]+[KA]+[V]);IOV([])"
+    );
+    assert!(result.final_fit.is_some(), "the input's fit is still there");
+    assert_eq!(result.rows.len(), 1);
+    assert!(result.row("input").unwrap().selected);
+    assert!(
+        result
+            .notes
+            .iter()
+            .any(|n| n.contains("cancelled while the full-IOV model")),
+        "{:?}",
+        result.notes
+    );
 }

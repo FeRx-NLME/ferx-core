@@ -112,6 +112,15 @@ pub(crate) struct ScriptedFitter {
     pub failing: Vec<String>,
     pub erroring: Vec<String>,
     pub cancel_after: Option<usize>,
+    /// The step (1-based) at and after which the report comes back
+    /// **cancelled with no results at all** — the shape [`Runner`] really
+    /// returns when the flag is flipped *during* a fit: a candidate whose
+    /// `fit()` failed while the flag was set is dropped rather than
+    /// journalled, because that failure cannot be told from the flag
+    /// unwinding it (`search/runner.rs`). A search that requires a result
+    /// there turns a cancellation into an error, which is what this exists
+    /// to catch.
+    pub cancel_empty_after: Option<usize>,
     calls: std::sync::Mutex<Vec<(String, Vec<Candidate>)>>,
 }
 
@@ -125,6 +134,7 @@ impl ScriptedFitter {
             failing: Vec::new(),
             erroring: Vec::new(),
             cancel_after: None,
+            cancel_empty_after: None,
             calls: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -178,6 +188,16 @@ impl crate::search::fitter::StepFitter for ScriptedFitter {
             calls.push((step_dir.to_string(), candidates.to_vec()));
             calls.len()
         };
+        if self.cancel_empty_after.is_some_and(|n| n_calls >= n) {
+            return Ok(crate::search::RunReport {
+                results: Vec::new(),
+                cancelled: true,
+                fitted: 0,
+                reused: 0,
+                deduped: 0,
+                warnings: vec![],
+            });
+        }
         let mut results = Vec::new();
         for c in candidates {
             let key = (self.key)(c);

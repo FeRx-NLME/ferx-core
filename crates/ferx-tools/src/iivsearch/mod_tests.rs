@@ -780,3 +780,102 @@ fn a_partial_block_candidate_under_focei_carries_the_1018_note() {
     let result = run(&script, self::space(ALL), &o);
     assert!(!result.notes.iter().any(|n| n.contains("#1018")));
 }
+
+/// A four-η base whose `KA`/`F` η are blocked together — a block the space's
+/// `COVARIANCE` statement does not name.
+const BASE_BLOCKED_OUTSIDE: &str = "\
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta TVF(1.0, 0.01, 1.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  block_omega (ETA_KA, ETA_F) = [0.3, 0.01, 0.02]
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+  F = TVF * exp(ETA_F)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+#[test]
+fn a_block_the_space_does_not_name_is_carried_unchanged_and_its_members_are_not_offered() {
+    // `F` is outside the space, so the `(KA, F)` block is not the search's
+    // to take apart: every candidate keeps it, `KA` is not offered to the
+    // cliques, and the note says so. The mutation this pins is the
+    // enumeration that dropped it — the block would be split and the model
+    // would carry fewer parameters than the row claims.
+    let script = ScriptedFitter::new(key, &[]);
+    let mut o = options(Algorithm::Skip);
+    o.correlation_algorithm = Some(CorrelationAlgorithm::TopDownExhaustive);
+    let space = space_of(BASE_BLOCKED_OUTSIDE, "COVARIANCE?(IIV,[CL,V,KA])");
+    assert_eq!(space.input_structure.description(), "[F,KA]+[CL]+[V]");
+    let result = run(&script, space, &o);
+
+    // One candidate: the `[CL,V]` clique beside the untouched block.
+    assert_eq!(
+        fitted_in(&result, 1),
+        vec![pair("run1", "[F,KA]+[CL,V]")],
+        "KA is committed to the untouchable block, so no clique names it"
+    );
+    let model = script.model_of("step-1", "run1");
+    let params = model.block_lines("parameters");
+    assert!(
+        params.contains(&"block_omega (ETA_KA, ETA_F) = [0.3, 0.01, 0.02]".to_string()),
+        "the out-of-space block is untouched: {params:?}"
+    );
+    assert!(
+        params
+            .iter()
+            .any(|l| l.starts_with("block_omega (ETA_CL, ETA_V)")),
+        "{params:?}"
+    );
+    assert!(
+        result
+            .notes
+            .iter()
+            .any(|n| n.contains("[F,KA]") && n.contains("carried unchanged")),
+        "{:?}",
+        result.notes
+    );
+}
+
+#[test]
+fn a_cancellation_during_the_base_fit_returns_the_input_not_an_error() {
+    // The derived-base fit is the iivsearch twin of the iovsearch case: a
+    // cancelled report with no results must leave the input standing as the
+    // last completed model, not become an error.
+    let mut script = ScriptedFitter::new(key, &[("[CL]+[KA]+[V]", 100.0)]);
+    script.cancel_empty_after = Some(2);
+    // `run` unwraps: without the guard the search returns `Err` here and the
+    // test fails on that line, which is the mutation this pins.
+    let result = run(
+        &script,
+        space(KEEP_CL),
+        &options(Algorithm::BottomUpStepwise),
+    );
+    assert!(result.cancelled);
+    assert_eq!(result.final_id, "input");
+    assert_eq!(result.final_structure.description(), "[CL]+[KA]+[V]");
+    assert!(result.final_fit.is_some(), "the input's fit is still there");
+    assert_eq!(result.rows.len(), 1, "{:?}", result.rows);
+    assert!(result.row("input").unwrap().selected);
+    assert!(result.steps.is_empty(), "no step ran: {:?}", result.steps);
+    assert!(
+        result
+            .notes
+            .iter()
+            .any(|n| n.contains("cancelled while the base model")),
+        "{:?}",
+        result.notes
+    );
+}

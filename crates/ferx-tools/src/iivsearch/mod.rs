@@ -579,6 +579,18 @@ impl Space {
             };
             eta_of.insert(p.clone(), (name, variance));
         }
+        // Every *other* parameter that carries an η is named too, at the η
+        // it already has. It is never added or dropped — the space does not
+        // name it — but it can share a `block_omega` with one that is, and
+        // splitting that block has to name every member. A lookup that
+        // silently missed one would half-split the block.
+        for pv in variability.with_eta() {
+            let eta = pv.eta.clone().expect("with_eta");
+            eta_of.entry(pv.name.clone()).or_insert((
+                eta.clone(),
+                variability.variance(&eta).unwrap_or(NEW_ETA_VARIANCE),
+            ));
+        }
         // A `FIX`ed η is a statement about the model: never removed, never
         // blocked (Pharmpy excludes fixed η from both moves).
         let mut fixed: Vec<String> = Vec::new();
@@ -1095,10 +1107,19 @@ fn derive(
         if survived.blocks.contains(block) {
             continue;
         }
+        // Every member is named, or the block would be written around fewer
+        // η than it says — a different model, silently. `Space::build` names
+        // every parameter that carries an η, so this is a guard, not a path.
         let etas: Vec<String> = block
             .iter()
-            .filter_map(|p| space.eta_of.get(p).map(|(e, _)| e.clone()))
-            .collect();
+            .map(|p| {
+                space
+                    .eta_of
+                    .get(p)
+                    .map(|(e, _)| e.clone())
+                    .ok_or_else(|| format!("{id}: `{p}` has no η to block"))
+            })
+            .collect::<Result<_, _>>()?;
         model
             .apply(ModelEdit::SetOmegaBlock(etas.clone()))
             .map_err(err)?;
@@ -1325,36 +1346,57 @@ impl Driver<'_> {
                 .fitter
                 .fit_step("base", std::slice::from_ref(&candidate))?;
             self.notes.extend(report.warnings.iter().cloned());
-            let result = report
-                .results
-                .first()
-                .ok_or("the base model was not fitted")?;
-            if let Some(e) = &result.error {
-                return Err(format!("the base model could not be fitted: {e}"));
+            // A run cancelled *during* this one fit comes back with no result
+            // at all: `Runner` drops a candidate whose `fit()` failed while
+            // the flag was set, since that failure cannot be told from the
+            // flag unwinding it. The input is already fitted, so the search
+            // keeps it as the last completed model and returns a cancelled
+            // result, rather than throwing the run away as an error (a CLI
+            // can then still exit 130).
+            match report.results.first() {
+                None if report.cancelled => {
+                    self.cancelled = true;
+                    self.push_note(
+                        "the search was cancelled while the base model was being fitted; the \
+                         input is the last completed model"
+                            .into(),
+                    );
+                }
+                None => return Err("the base model was not fitted".into()),
+                Some(result) => {
+                    if let Some(e) = &result.error {
+                        return Err(format!("the base model could not be fitted: {e}"));
+                    }
+                    let base = Node::from_result(
+                        result,
+                        &report,
+                        candidate.model.clone(),
+                        base_structure.clone(),
+                        self.criterion,
+                    )?;
+                    self.rows.push(self.row_of(
+                        result,
+                        0,
+                        Some("input"),
+                        &base.structure,
+                        &candidate,
+                    ));
+                    self.store
+                        .insert(base.id.clone(), (base.model.clone(), base.fit.clone()));
+                    self.emit(IivsearchEvent::BaseFinished {
+                        ofv: base.fit.as_ref().map(|f| f.ofv).unwrap_or(f64::NAN),
+                        criterion: base.criterion,
+                    });
+                    self.push_note(format!(
+                        "the input model ({}) is not the search's base; the base is the input \
+                         with the space's η structure ({})",
+                        describe(&input.structure),
+                        describe(&base.structure)
+                    ));
+                    self.cancelled |= report.cancelled;
+                    current = base;
+                }
             }
-            let base = Node::from_result(
-                result,
-                &report,
-                candidate.model.clone(),
-                base_structure.clone(),
-                self.criterion,
-            )?;
-            self.rows
-                .push(self.row_of(result, 0, Some("input"), &base.structure, &candidate));
-            self.store
-                .insert(base.id.clone(), (base.model.clone(), base.fit.clone()));
-            self.emit(IivsearchEvent::BaseFinished {
-                ofv: base.fit.as_ref().map(|f| f.ofv).unwrap_or(f64::NAN),
-                criterion: base.criterion,
-            });
-            self.push_note(format!(
-                "the input model ({}) is not the search's base; the base is the input with \
-                 the space's η structure ({})",
-                describe(&input.structure),
-                describe(&base.structure)
-            ));
-            self.cancelled |= report.cancelled;
-            current = base;
         }
         let base_id = current.id.clone();
         if !current.eligible {
@@ -1749,16 +1791,46 @@ impl Driver<'_> {
     /// or more of the parameters the `COVARIANCE` statement names that carry
     /// an η; the parent's own structure skipped.
     fn top_down_blocks(&mut self, parent: Node) -> Result<Node, String> {
+        // A block the parent carries that names a parameter the space does
+        // not is **not** the search's to take apart — "a parameter the space
+        // does not name is left as it is" — so it rides along in every
+        // target, and its members are not offered to the cliques below.
+        let untouchable: Vec<Vec<String>> = parent
+            .structure
+            .blocks
+            .iter()
+            .filter(|b| b.iter().any(|p| !self.space.cov.contains(p)))
+            .cloned()
+            .collect();
+        if !untouchable.is_empty() {
+            self.push_note(format!(
+                "the block{} {} name{} a parameter the space's COVARIANCE statement does not, \
+                 so {} carried unchanged into every candidate rather than restructured",
+                if untouchable.len() == 1 { "" } else { "s" },
+                untouchable
+                    .iter()
+                    .map(|b| format!("[{}]", b.join(",")))
+                    .collect::<Vec<_>>()
+                    .join(" and "),
+                if untouchable.len() == 1 { "s" } else { "" },
+                if untouchable.len() == 1 {
+                    "it is"
+                } else {
+                    "they are"
+                }
+            ));
+        }
         let members: Vec<String> = self
             .space
             .cov
             .iter()
-            .filter(|p| parent.structure.has_eta(p))
+            .filter(|p| parent.structure.has_eta(p) && !untouchable.iter().any(|b| b.contains(p)))
             .cloned()
             .collect();
         let forced = self.space.forced_blocks(&parent.structure.etas);
         let mut targets = Vec::new();
         let mut push = |blocks: Vec<Vec<String>>| {
+            let blocks = untouchable.iter().cloned().chain(blocks).collect();
             let target = IivStructure::new(parent.structure.etas.clone(), blocks);
             if target != parent.structure && !targets.contains(&target) {
                 targets.push(target);

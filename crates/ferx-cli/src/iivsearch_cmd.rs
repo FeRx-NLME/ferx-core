@@ -193,6 +193,114 @@ mod tests {
         list.iter().map(|s| s.to_string()).collect()
     }
 
+    /// The warfarin model, evaluating rather than fitting (`maxiter = 0`).
+    const BASE: &str = "\
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = foce
+  maxiter    = 0
+  covariance = false
+  checkpoint = false
+";
+
+    /// The command end to end on the warfarin model, then again
+    /// `--quiet --resume` so the journal is reused and the progress
+    /// printer's early return is taken.
+    ///
+    /// `bottom_up_stepwise` is the algorithm that reaches every event the
+    /// printer has: a derived base (the input minus the searched η), a
+    /// step, the block stage, and — since an evaluation cannot improve on
+    /// the input — the reversion to it.
+    #[test]
+    fn run_searches_writes_the_files_and_resumes_quietly() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/warfarin.csv");
+        std::fs::write(dir.path().join("base.ferx"), BASE).unwrap();
+        let config = dir.path().join("search.ferxsearch");
+        std::fs::write(
+            &config,
+            format!(
+                "base = \"base.ferx\"\ndata = \"{}\"\n\n[space]\nmfl = \"IIV(CL,EXP);\
+                 IIV?([V],EXP);COVARIANCE?(IIV,[CL,V])\"\n\n[iivsearch]\nalgorithm = \
+                 \"bottom_up_stepwise\"\n\n[strictness]\nrequire_converged = \
+                 false\nreject_init_stall = false\nreject_on_boundary = false\n\n[run]\nretries \
+                 = 0\nthreads = 2\n",
+                data.display()
+            ),
+        )
+        .unwrap();
+        let out = dir.path().join("run");
+        let common = [
+            "ferx".to_string(),
+            "iivsearch".to_string(),
+            config.to_string_lossy().into_owned(),
+            "--directory".to_string(),
+            out.to_string_lossy().into_owned(),
+            "--threads".to_string(),
+            "2".to_string(),
+        ];
+        assert_eq!(run(&common), 0);
+        for file in ["models.csv", "final.ferx", "final-fit.yaml"] {
+            assert!(out.join(file).is_file(), "{file} missing");
+        }
+        assert!(out.join("models/input.ferx").is_file());
+        let mut again = common.to_vec();
+        again.push("--quiet".to_string());
+        again.push("--resume".to_string());
+        assert_eq!(run(&again), 0);
+    }
+
+    /// A model the space cannot search is refused by name, before the
+    /// dataset is read.
+    #[test]
+    fn run_reports_a_non_canonical_parameter_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/warfarin.csv");
+        std::fs::write(
+            dir.path().join("base.ferx"),
+            BASE.replace("  V = TVV * exp(ETA_V)", "  V = TVV * (1 + ETA_V)"),
+        )
+        .unwrap();
+        let config = dir.path().join("search.ferxsearch");
+        std::fs::write(
+            &config,
+            format!(
+                "base = \"base.ferx\"\ndata = \"{}\"\n\n[space]\nmfl = \
+                 \"IIV?([CL,V],EXP)\"\n\n[run]\nretries = 0\nthreads = 2\n",
+                data.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            run(&args(&[
+                "ferx",
+                "iivsearch",
+                &config.to_string_lossy(),
+                "--quiet"
+            ])),
+            1
+        );
+    }
+
     #[test]
     fn run_rejects_two_files_and_a_missing_file_and_prints_help() {
         assert_eq!(
