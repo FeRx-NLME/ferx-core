@@ -1,3 +1,7 @@
+---
+pagetitle: "Selecting data records and subjects"
+---
+
 # Data Selection
 
 > **Maturity: beta** — see [Feature Maturity](../maturity.qmd) for what this means.

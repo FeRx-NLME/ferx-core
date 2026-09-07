@@ -1,0 +1,37 @@
+# ferx side of the lagged zero-order NONMEM anchor (#1171).
+# Mirrors nonmem_anchor/lagged_zo.ctl: ADVAN13 $DES elimination + D1=DUR, ALAG1=LAG.
+# THETA fixed at the same values NONMEM evaluated; maxiter = 0, covariance off.
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVDUR(2.0, 0.05, 24.0)
+  theta TVLAG(1.5, 0.0, 12.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+
+  sigma PROP_ERR ~ 0.15 (sd)      # sqrt(NONMEM SIGMA 0.0225)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV * exp(ETA_V)
+  DUR = TVDUR
+  LAG = TVLAG
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = zero_order(dur=DUR, lag=LAG) - CL/V*central
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 0
+  ode_reltol = 1e-9
+  ode_abstol = 1e-9

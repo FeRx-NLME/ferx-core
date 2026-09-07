@@ -1,0 +1,33 @@
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVKA(1.0, 0.05, 20.0)
+  theta WTEXP_CL(0.75, 0.01, 2.0)
+  theta WTEXP_KA(0.75, 0.01, 2.0)
+  theta TVP(0.7, 0.05, 5.0)
+  omega ETA_CL  ~ 0.09
+  omega ETA_V   ~ 0.09
+  omega ETA_LAG ~ 0.04
+  sigma PROP_ERR ~ 0.0025
+[individual_parameters]
+  CL    = TVCL * (WT/70)^WTEXP_CL * exp(ETA_CL)
+  V     = TVV * exp(ETA_V)
+  KA    = TVKA * (WT/70)^WTEXP_KA
+  ALAG1 = TVP * exp(ETA_LAG)
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+[covariates]
+  WT continuous
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  maxiter = 0
+  covariance = false
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12

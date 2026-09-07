@@ -87,6 +87,32 @@ fn resolve_outer_ftol_auto_and_override() {
     assert_eq!(resolve_outer_ftol(false, false, Some(1e-10)), 1e-10);
 }
 
+/// `ofv_is_valid` separates a real population objective from the clamped
+/// divergence sentinel. The point of the helper is that `is_finite()` alone does
+/// **not**: the inner objective clamps a blown-up value to `1e20`, which is
+/// perfectly finite, so an optimizer that guards its convergence verdict with
+/// `is_finite()` will happily report `Converged: YES` on a diverged run.
+#[test]
+fn ofv_is_valid_rejects_the_clamped_sentinel_not_just_non_finite() {
+    // Real population OFVs, both signs, and the extremes of the valid range.
+    assert!(ofv_is_valid(-286.0));
+    assert!(ofv_is_valid(0.0));
+    assert!(ofv_is_valid(12_345.678));
+    assert!(ofv_is_valid(DIVERGENCE_OFV - 1.0));
+
+    // The sentinel is finite — this is the case `is_finite()` misses.
+    assert!(1e20_f64.is_finite());
+    assert!(!ofv_is_valid(1e20));
+    assert!(!ofv_is_valid(DIVERGENCE_OFV));
+
+    // ...and the ordinary non-finite cases are still rejected.
+    assert!(!ofv_is_valid(f64::NAN));
+    assert!(!ofv_is_valid(f64::INFINITY));
+    // A large *negative* OFV is legitimate (the cutoff is one-sided).
+    assert!(ofv_is_valid(-1e15));
+    assert!(!ofv_is_valid(f64::NEG_INFINITY));
+}
+
 /// Covariance progress reporter math (the pure pieces behind `cov_progress`).
 /// Stride caps output at ~20 lines but never zero; the print predicate fires
 /// every `step` items plus the final one; the ETA extrapolates wall-clock
@@ -415,6 +441,25 @@ fn test_extract_eigenvalues_none_on_nan() {
     );
 }
 
+/// extract_eigenvalues returns None — rather than panicking — for a 0x0 matrix.
+///
+/// A model with no random effects has a 0x0 Omega, and the non-finite-objective diagnostic
+/// in `compute_covariance` inspects exactly that matrix when a fit has already gone wrong.
+/// `nalgebra`'s `SymmetricEigen::new` panics on an empty input, so before this guard an
+/// `n_eta = 0` fit whose objective went non-finite aborted with "Unable to compute the
+/// symmetric tridiagonal decomposition of an empty matrix" instead of reporting the
+/// objective. Both conjuncts are required to reach it — measured: `n_eta = 1` with a
+/// non-finite objective returns the `1e20` sentinel and does not panic, and `n_eta = 0`
+/// with a finite objective never enters this branch.
+#[test]
+fn test_extract_eigenvalues_none_on_empty_matrix() {
+    let h: DMatrix<f64> = DMatrix::zeros(0, 0);
+    assert!(
+        extract_eigenvalues(&h).is_none(),
+        "a 0x0 matrix must return None, not panic"
+    );
+}
+
 /// packed_param_label decodes the lower-triangular block-omega index correctly.
 /// Packing order (column-major lower triangle): (0,0), (1,0), (1,1).
 /// With n_theta=2, packed_idx=3 → omega_idx=1 → (row=1, col=0).
@@ -434,6 +479,8 @@ fn test_packed_param_label_block_omega() {
         free_mask,
     );
     let template = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0, 50.0],
         theta_names: vec!["TVCL".into(), "TVV".into()],
         theta_lower: vec![0.1, 5.0],
@@ -448,6 +495,7 @@ fn test_packed_param_label_block_omega() {
         sigma_fixed: vec![false],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     };
 
     // n_theta=2, so: idx=2 → omega[ETA_CL, ETA_CL], idx=3 → omega[ETA_V, ETA_CL] (off-diag),
@@ -493,6 +541,8 @@ fn test_packed_param_label_sigma() {
     use crate::types::SigmaVector;
     // n_theta=1 (diagonal omega), n_omega=1 (diagonal), n_sigma=2
     let template = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0],
         theta_names: vec!["CL".into()],
         theta_lower: vec![0.1],
@@ -507,6 +557,7 @@ fn test_packed_param_label_sigma() {
         sigma_fixed: vec![false, false],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     };
     // packed layout: [theta(0), omega(1), sigma(2), sigma(3)]
     assert_eq!(packed_param_label(2, &template), "sigma[1]");
@@ -518,6 +569,8 @@ fn test_packed_param_label_sigma() {
 fn test_packed_param_label_kappa() {
     use crate::types::SigmaVector;
     let template = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0],
         theta_names: vec!["CL".into()],
         theta_lower: vec![0.1],
@@ -535,6 +588,7 @@ fn test_packed_param_label_kappa() {
             vec!["KAPPA_CL".into()],
         )),
         kappa_fixed: vec![false],
+        mixture: None,
     };
     // packed layout: [theta(0), omega(1), sigma(2), kappa(3)]
     assert_eq!(packed_param_label(3, &template), "kappa[1]");
@@ -562,6 +616,8 @@ fn test_compute_covariance_invalid_eps() {
     let model = make_model();
     let population = make_population(1);
     let template = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0, 50.0],
         theta_names: vec!["CL".into(), "V".into()],
         theta_lower: vec![0.1, 1.0],
@@ -576,6 +632,7 @@ fn test_compute_covariance_invalid_eps() {
         sigma_fixed: vec![false],
         omega_iov: None,
         kappa_fixed: vec![],
+        mixture: None,
     };
     let x_hat: Vec<f64> = vec![
         5.0_f64.ln(),
@@ -737,6 +794,7 @@ fn fresh_state() -> NloptState {
     NloptState {
         cached_etas: Vec::new(),
         cached_h_mats: Vec::new(),
+        cached_etas_by_class: Vec::new(),
         best_ofv: 0.0,
         n_evals: 0,
         n_grad_evals: 0,
@@ -919,6 +977,8 @@ use std::collections::HashMap;
 fn make_model() -> CompiledModel {
     let omega = OmegaMatrix::from_diagonal(&[0.04], vec!["ETA_CL".into()]);
     let default_params = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0, 50.0],
         theta_names: vec!["TVCL".into(), "TVV".into()],
         theta_lower: vec![0.1, 5.0],
@@ -933,8 +993,10 @@ fn make_model() -> CompiledModel {
         sigma_fixed: vec![false],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     };
     CompiledModel {
+        covariate_model: None,
         name: "outer_test".into(),
         pk_model: PkModel::OneCptIv,
         error_model: ErrorModel::Proportional,
@@ -961,6 +1023,7 @@ fn make_model() -> CompiledModel {
         omega_init_as_sd: vec![false],
         sigma_init_as_sd: vec![false],
         kappa_init_as_sd: Vec::new(),
+        kappa_weights: Vec::new(),
         mu_refs: HashMap::new(),
         kappa_mu_refs: HashMap::new(),
         tv_fn: None,
@@ -979,6 +1042,7 @@ fn make_model() -> CompiledModel {
         has_conditional_eta_params: false,
         eta_param_info: Vec::new(),
         theta_transform: Vec::new(),
+        theta_eta_linked: Vec::new(),
         #[cfg(feature = "nn")]
         covariate_nns: Vec::new(),
         scaling: ScalingSpec::None,
@@ -994,6 +1058,7 @@ fn make_model() -> CompiledModel {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     }
 }
 
@@ -1012,10 +1077,12 @@ fn make_population(n_subj: usize) -> Population {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0, 0, 0],
             occasions: vec![1, 1, 1],
             obs_l2: Vec::new(),
             dose_occasions: vec![1],
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         })
@@ -1213,6 +1280,8 @@ fn test_outer_ad_gradient_block_omega() {
         free_mask,
     );
     let default_params = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0, 50.0],
         theta_names: vec!["TVCL".into(), "TVV".into()],
         theta_lower: vec![0.1, 5.0],
@@ -1227,8 +1296,10 @@ fn test_outer_ad_gradient_block_omega() {
         sigma_fixed: vec![false],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     };
     let model = CompiledModel {
+        covariate_model: None,
         name: "block_test".into(),
         pk_model: PkModel::OneCptIv,
         error_model: ErrorModel::Proportional,
@@ -1255,6 +1326,7 @@ fn test_outer_ad_gradient_block_omega() {
         omega_init_as_sd: vec![false; 2],
         sigma_init_as_sd: vec![false],
         kappa_init_as_sd: Vec::new(),
+        kappa_weights: Vec::new(),
         mu_refs: HashMap::new(),
         kappa_mu_refs: HashMap::new(),
         tv_fn: None,
@@ -1273,6 +1345,7 @@ fn test_outer_ad_gradient_block_omega() {
         has_conditional_eta_params: false,
         eta_param_info: Vec::new(),
         theta_transform: Vec::new(),
+        theta_eta_linked: Vec::new(),
         #[cfg(feature = "nn")]
         covariate_nns: Vec::new(),
         scaling: ScalingSpec::None,
@@ -1288,6 +1361,7 @@ fn test_outer_ad_gradient_block_omega() {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     };
     check_gradient(&model, &make_population(3), 2);
 }
@@ -1687,6 +1761,8 @@ fn test_compute_covariance_iov_runs_and_is_pd() {
     let omega = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
     let omega_iov = OmegaMatrix::from_diagonal(&[0.04], vec!["KAPPA_CL".into()]);
     let default_params = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0, 50.0],
         theta_names: vec!["TVCL".into(), "TVV".into()],
         theta_lower: vec![0.1, 5.0],
@@ -1701,14 +1777,17 @@ fn test_compute_covariance_iov_runs_and_is_pd() {
         sigma_fixed: vec![true],
         omega_iov: Some(omega_iov),
         kappa_fixed: vec![true],
+        mixture: None,
     };
     let model = CompiledModel {
+        covariate_model: None,
         frem_config: None,
         residual_error_eta: None,
         analytical_init: Vec::new(),
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
         name: "iov_cov_test".into(),
         pk_model: PkModel::OneCptIv,
         error_model: ErrorModel::Proportional,
@@ -1735,6 +1814,7 @@ fn test_compute_covariance_iov_runs_and_is_pd() {
         omega_init_as_sd: vec![false],
         sigma_init_as_sd: vec![false],
         kappa_init_as_sd: vec![false],
+        kappa_weights: Vec::new(),
         mu_refs: HashMap::new(),
         kappa_mu_refs: HashMap::new(),
         tv_fn: None,
@@ -1753,6 +1833,7 @@ fn test_compute_covariance_iov_runs_and_is_pd() {
         has_conditional_eta_params: false,
         eta_param_info: Vec::new(),
         theta_transform: Vec::new(),
+        theta_eta_linked: Vec::new(),
         #[cfg(feature = "nn")]
         covariate_nns: Vec::new(),
         scaling: ScalingSpec::None,
@@ -1780,10 +1861,12 @@ fn test_compute_covariance_iov_runs_and_is_pd() {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
             obs_l2: Vec::new(),
             dose_occasions: vec![1],
+            reset_occasions: Vec::new(),
             obs_records: vec![],
         })
         .collect();
@@ -1848,14 +1931,14 @@ fn test_compute_covariance_iov_runs_and_is_pd() {
 // AD/analytical FOCE gradient introduced in PR #48 has inf-norm ≈ 10²–10³
 // on standard PK models, while the scaled bound width is ≈ 3–9, so the
 // projected step lands at a corner of the box and the OFV explodes. The
-// `cap_slsqp_gradient` helper rescales `g` by a single scalar so the
+// `cap_scaled_gradient` helper rescales `g` by a single scalar so the
 // would-be Newton step fits inside the box on every dimension.
 
 /// Cap fires when the gradient inf-norm exceeds the per-dimension
 /// step budget, and the cap is a uniform rescale (preserves direction
 /// and relative magnitudes between components).
 #[test]
-fn test_cap_slsqp_gradient_uniformly_rescales_when_huge() {
+fn test_cap_scaled_gradient_uniformly_rescales_when_huge() {
     // Bounds chosen so each dimension's budget = clamp(half-width, 0.1, 1.0).
     //   i=0: width=2.0 → budget = clamp(1.0, …) = 1.0
     //   i=1: width=4.0 → budget = clamp(2.0, …) = 1.0 (clamped to 1.0)
@@ -1866,7 +1949,7 @@ fn test_cap_slsqp_gradient_uniformly_rescales_when_huge() {
     // Gradient with inf-norm 200 at the third component → worst_ratio = 200/0.1 = 2000.
     let mut g = vec![10.0, 100.0, 200.0];
     let g_before = g.clone();
-    let fired = cap_slsqp_gradient(&mut g, &lower, &upper);
+    let fired = cap_scaled_gradient(&mut g, &lower, &upper);
     assert!(fired, "cap should have fired for huge gradient");
 
     // Direction preserved: g[i] / g_before[i] is the same scalar across i.
@@ -1892,13 +1975,13 @@ fn test_cap_slsqp_gradient_uniformly_rescales_when_huge() {
 /// Cap is a no-op when the gradient is already within budget — preserves
 /// SLSQP convergence behaviour once it's in the basin of the optimum.
 #[test]
-fn test_cap_slsqp_gradient_noop_when_within_budget() {
+fn test_cap_scaled_gradient_noop_when_within_budget() {
     let lower = vec![-1.0, -2.0];
     let upper = vec![1.0, 2.0];
     // Per-dim budgets are both clamped to 1.0; gradient inf-norm = 0.5 < 1.0.
     let mut g = vec![0.5, -0.3];
     let g_before = g.clone();
-    let fired = cap_slsqp_gradient(&mut g, &lower, &upper);
+    let fired = cap_scaled_gradient(&mut g, &lower, &upper);
     assert!(!fired, "cap should not fire for in-budget gradient");
     assert_eq!(g, g_before, "in-budget gradient must be untouched");
 }
@@ -1907,12 +1990,12 @@ fn test_cap_slsqp_gradient_noop_when_within_budget() {
 /// log-Cholesky omega/sigma packing, where bounds span 10+ units), the
 /// budget is clamped to 1.0 so the cap still fires.
 #[test]
-fn test_cap_slsqp_gradient_clamps_wide_bounds_to_unit_budget() {
+fn test_cap_scaled_gradient_clamps_wide_bounds_to_unit_budget() {
     // Wide bounds: half-width = 5 → budget clamped to 1.0.
     let lower = vec![-10.0, -10.0];
     let upper = vec![10.0, 10.0];
     let mut g = vec![5.0, 0.0];
-    let fired = cap_slsqp_gradient(&mut g, &lower, &upper);
+    let fired = cap_scaled_gradient(&mut g, &lower, &upper);
     assert!(fired, "cap should fire: budget clamped to 1.0, |g_max| = 5");
     // Worst ratio = 5/1 = 5 → divide all by 5 → g[0] becomes 1.0.
     assert!(
@@ -1921,6 +2004,180 @@ fn test_cap_slsqp_gradient_clamps_wide_bounds_to_unit_budget() {
         g[0]
     );
     assert_eq!(g[1], 0.0);
+}
+
+/// [`should_cap_gradient`] gates the overshoot cap per-algorithm (#960, #751):
+///   - SLSQP: cap every eval (QP re-solves from the current Hessian).
+///   - L-BFGS: cap the first gradient eval always, and later evals only on the
+///     stall-retry pass (`hold_cap_at_init`), which `optimize_nlopt` runs when
+///     the default attempt never left its initial estimates. Holding the cap on
+///     by default would corrupt the `(s, y)` curvature pairs L-BFGS builds from
+///     gradient differences — the regression that blocked a uniform fix.
+///   - MMA / BOBYQA: never capped here.
+#[test]
+fn test_should_cap_gradient_per_algo_gating() {
+    use crate::estimation::outer_optimizer::should_cap_gradient;
+    use nlopt::Algorithm;
+
+    // SLSQP: every eval, including well past the first, moved or not.
+    assert!(should_cap_gradient(Algorithm::Slsqp, 1, true));
+    assert!(should_cap_gradient(Algorithm::Slsqp, 5, false));
+
+    // L-BFGS: the first gradient eval is always capped. `n_grad_evals == 1` is
+    // the first eval because `population_gradient` increments before returning.
+    assert!(should_cap_gradient(Algorithm::Lbfgs, 1, false));
+    assert!(should_cap_gradient(Algorithm::Lbfgs, 1, true));
+
+    // Later evals: capped only on the retry pass. The default pass leaves every
+    // later `(s, y)` pair built from uncapped gradients (#960); the retry keeps
+    // the identity-Hessian step tame for a fit that already stalled (#751).
+    assert!(!should_cap_gradient(Algorithm::Lbfgs, 2, false));
+    assert!(!should_cap_gradient(Algorithm::Lbfgs, 50, false));
+    assert!(should_cap_gradient(Algorithm::Lbfgs, 2, true));
+    assert!(should_cap_gradient(Algorithm::Lbfgs, 50, true));
+
+    // Derivative-free / self-safeguarding methods are never capped here.
+    assert!(!should_cap_gradient(Algorithm::Mma, 1, true));
+    assert!(!should_cap_gradient(Algorithm::Bobyqa, 1, true));
+}
+
+/// [`resolve_stall_retry`] decides whether a finished fit is re-run with the
+/// identity-Hessian cap held on, and which of the two attempts is reported
+/// (#751). Driven here with `T = f64` (the OFV itself) so every branch is
+/// exercised without running two NLopt fits.
+#[test]
+fn test_stall_retry_only_fires_for_a_stalled_lbfgs_fit() {
+    use crate::estimation::outer_optimizer::resolve_stall_retry;
+
+    let ofv = |x: &f64| *x;
+    // Retry must never run for a fit that left its initial estimates.
+    let out = resolve_stall_retry(
+        Optimizer::NloptLbfgs,
+        false,
+        (-286.0, true),
+        || panic!("retry must not run for a fit that left init"),
+        ofv,
+    );
+    assert_eq!(out, -286.0);
+
+    // ...nor for the other optimizers: SLSQP is capped on every eval already,
+    // and BOBYQA never takes an identity-Hessian step.
+    for optimizer in [Optimizer::Slsqp, Optimizer::Bobyqa, Optimizer::Mma] {
+        let out = resolve_stall_retry(
+            optimizer,
+            false,
+            (-250.87, false),
+            || panic!("retry is L-BFGS-only"),
+            ofv,
+        );
+        assert_eq!(out, -250.87);
+    }
+}
+
+#[test]
+fn test_stall_retry_keeps_the_better_attempt() {
+    use crate::estimation::outer_optimizer::resolve_stall_retry;
+
+    let ofv = |x: &f64| *x;
+    // The #751 case: the default attempt stalled at -250.87, the held-cap retry
+    // escaped and reached the true optimum. Report the retry. `verbose = true`
+    // also covers the reporting line.
+    assert_eq!(
+        resolve_stall_retry(
+            Optimizer::NloptLbfgs,
+            true,
+            (-250.87, false),
+            || (-286.0042, true),
+            ofv
+        ),
+        -286.0042
+    );
+
+    // Retry escaped but landed *worse*: keep the first result.
+    assert_eq!(
+        resolve_stall_retry(
+            Optimizer::NloptLbfgs,
+            false,
+            (-286.0042, false),
+            || (-250.87, true),
+            ofv
+        ),
+        -286.0042
+    );
+
+    // Retry stalled too, even at a nominally lower OFV: keep the first result,
+    // so a genuinely stuck fit reports as stuck instead of as a second stall.
+    assert_eq!(
+        resolve_stall_retry(
+            Optimizer::NloptLbfgs,
+            false,
+            (-250.87, false),
+            || (-260.0, false),
+            ofv
+        ),
+        -250.87
+    );
+
+    // Ties do not displace the first attempt.
+    assert_eq!(
+        resolve_stall_retry(
+            Optimizer::NloptLbfgs,
+            false,
+            (-250.87, false),
+            || (-250.87, true),
+            ofv
+        ),
+        -250.87
+    );
+}
+
+/// [`max_scaled_deviation`] is the L∞ "how far has the fit moved?" measure both
+/// the cap gate and the plateau verdict key off.
+#[test]
+fn test_max_scaled_deviation_is_l_infinity() {
+    use crate::estimation::outer_optimizer::max_scaled_deviation;
+
+    assert_eq!(max_scaled_deviation(&[1.0, 2.0], &[1.0, 2.0]), 0.0);
+    // Largest single-coordinate move wins, sign-independent.
+    assert_eq!(max_scaled_deviation(&[1.0, 2.0], &[1.5, -3.0]), 5.0);
+    // The stalled user-ODE fit's displacement (~1e-4) is below the escape step;
+    // a real first step (O(0.1)) is above it.
+    use crate::estimation::outer_optimizer::INIT_ESCAPE_STEP_S;
+    assert!(max_scaled_deviation(&[1.0], &[1.000_14]) < INIT_ESCAPE_STEP_S);
+    assert!(max_scaled_deviation(&[1.0], &[1.2]) >= INIT_ESCAPE_STEP_S);
+}
+
+/// The degenerate inputs return `NaN`, which every caller reads as "not
+/// established" because both `< INIT_ESCAPE_STEP_S` and `>= INIT_ESCAPE_STEP_S`
+/// are false for it — the conservative answer in each direction. A `f64::max`
+/// fold would instead swallow a NaN coordinate and report a poisoned iterate as
+/// sitting exactly on the initial estimates, which would let
+/// `failure_is_converged_plateau` call it converged.
+#[test]
+fn test_max_scaled_deviation_reports_degenerate_input_as_nan() {
+    use crate::estimation::outer_optimizer::max_scaled_deviation;
+    use crate::estimation::outer_optimizer::INIT_ESCAPE_STEP_S;
+
+    for (a, b) in [
+        (vec![1.0, f64::NAN], vec![1.0, 2.0]),
+        (vec![1.0, 2.0], vec![1.0, f64::INFINITY]),
+        (vec![f64::NEG_INFINITY], vec![f64::NEG_INFINITY]),
+    ] {
+        let deviation = max_scaled_deviation(&a, &b);
+        assert!(deviation.is_nan(), "expected NaN, got {deviation}");
+        // Neither the "left init" nor the "still at init" reading is granted.
+        assert!(!(deviation >= INIT_ESCAPE_STEP_S));
+        assert!(!(deviation < INIT_ESCAPE_STEP_S));
+    }
+
+    // A length mismatch is a bug, not a shorter comparison: it reports NaN rather
+    // than silently comparing the common prefix (which here would read 0.0 —
+    // "still at init" — and hide the real 9.0 deviation). Only exercisable where
+    // the `debug_assert_eq!` guarding the same invariant is compiled out; the
+    // release behaviour is the one that matters, since that is what CI and users
+    // run.
+    #[cfg(not(debug_assertions))]
+    assert!(max_scaled_deviation(&[1.0, 10.0], &[1.0]).is_nan());
 }
 
 /// Regression test for the original issue #55 symptom: SLSQP optimizing
@@ -2611,14 +2868,36 @@ fn outer_maxiter_zero_is_eval_only_and_optimizer_independent() {
     );
 }
 
-/// Non-convergence is reported directly and runs exactly one outer
-/// optimization — there is no automatic SLSQP retry from the stop point
+// The end-to-end #960 convergence fix (analytic-gradient L-BFGS leaving init on
+// warfarin FOCEI / the SS-oral fit) is guarded by the re-enabled slow tests
+// (`warfarin_covariance_nonmem`, `ss_fit_smoke`, `covariance_method_sandwich`).
+// It is deliberately *not* reproduced as a fast unit test: the synthetic
+// `make_model()` is structurally FD-only (`indiv_param_partials::empty()` ⇒
+// `analytic_outer_gradient_available` is false even under `GradientMethod::Auto`),
+// and its scaled first-step gradient never overshoots, so the cap does not change
+// its outcome — a unit "convergence" test here would pass with or without the fix
+// and guard nothing. The cap's *mechanism* is covered fast instead by
+// `should_cap_gradient` (per-algorithm gating) and the `cap_scaled_gradient_*`
+// rescale tests above; the L-BFGS call site is exercised by the non-SLSQP fit in
+// `non_convergence_reports_directly_without_second_optimization` below.
+
+/// A non-SLSQP gradient primary that stops **non-converged** runs exactly one
+/// outer optimization — there is no automatic SLSQP retry from the stop point
 /// (issue #657, which removed `should_run_slsqp_fallback` and the second
-/// `nlopt::Nlopt` run). A gradient optimizer with a tiny `outer_maxiter`
-/// stops non-converged at its eval budget; the total objective-evaluation
-/// count must stay within a *single* optimization's budget
-/// (`outer_maxiter * (n + 1)`), so a re-added second optimization from the
-/// current point would blow this bound.
+/// `nlopt::Nlopt` run). Two invariants, both on the non-converged shape the
+/// pre-#657 fallback actually fired on:
+///   1. Non-convergence surfaces the "did not converge" warning directly.
+///   2. Only one optimization runs; a re-added fallback would launch a *second*
+///      full nlopt run from the endpoint, ~doubling the eval count.
+///
+/// Non-convergence is forced fix-independently: `inner_maxiter = 1` with
+/// `max_unconverged_frac = 0.0` leaves at least one subject's EBEs unconverged
+/// every eval, so the EBE guard rejects every step, the fit never forms a flat
+/// plateau, and it terminates at the `maxeval` ceiling reported non-converged.
+/// (Pre-#960 the original of this test relied on the L-BFGS first-step stall to
+/// be non-converged; that stall is now fixed, so the shape is driven by the
+/// starved inner loop instead — otherwise the fix would have silently converted
+/// this into a converged run and dropped the coverage.)
 #[test]
 fn non_convergence_reports_directly_without_second_optimization() {
     let model = make_model();
@@ -2626,17 +2905,16 @@ fn non_convergence_reports_directly_without_second_optimization() {
     let template = &model.default_params;
     let n = pack_params(template).len();
 
-    // A non-SLSQP gradient primary (`nlopt_lbfgs`) with a tiny budget: its
-    // xtol/ftol are set unreachably tight, so `outer_maxiter * (n + 1)` evals
-    // is the stop criterion and it cannot converge. Pre-#657 exactly this
-    // shape (non-converged, non-SLSQP) is what an unguarded fallback re-add
-    // would retry with SLSQP.
-    let outer_maxiter = 2;
+    let outer_maxiter = 8;
     let o = FitOptions {
         method: EstimationMethod::FoceI,
         interaction: true,
         optimizer: Optimizer::NloptLbfgs,
         outer_maxiter,
+        // Starve the inner loop so the EBE guard rejects every outer step and the
+        // fit cannot converge (independent of the #960 first-step cap).
+        inner_maxiter: 1,
+        max_unconverged_frac: 0.0,
         run_covariance_step: false,
         mu_referencing: true,
         ..FitOptions::default()
@@ -2645,7 +2923,7 @@ fn non_convergence_reports_directly_without_second_optimization() {
 
     assert!(
         !r.converged,
-        "test setup: a {outer_maxiter}-iter budget must not converge (OFV = {})",
+        "test setup: a starved-inner-loop fit must not converge (OFV = {})",
         r.ofv
     );
     assert!(
@@ -2653,12 +2931,17 @@ fn non_convergence_reports_directly_without_second_optimization() {
         "non-convergence must surface the warning directly; got {:?}",
         r.warnings
     );
-    // One optimization only: no automatic second run from the stop point.
+    // One optimization only. NLopt LD_LBFGS checks `maxeval` only between line
+    // searches, so a single run slightly overruns `outer_maxiter * (n + 1)` (≈45
+    // on this model, budget 40); a re-added fallback would add a *second* full
+    // nlopt run from the endpoint, pushing the total toward ~2× that. Bound at
+    // `2 * budget` cleanly separates the single run (~45) from a doubling (~90).
     let single_budget = outer_maxiter as usize * (n + 1);
     assert!(
-        r.n_iterations <= single_budget,
-        "expected a single optimization (<= {single_budget} evals), got {} — \
-             a second optimization (SLSQP fallback) appears to have run",
+        r.n_iterations < 2 * single_budget,
+        "expected a single optimization (< {} evals), got {} — a second \
+         optimization (SLSQP fallback) appears to have run",
+        2 * single_budget,
         r.n_iterations
     );
 }
@@ -2670,7 +2953,8 @@ fn non_convergence_reports_directly_without_second_optimization() {
 // once its line search can no longer beat an already-flat OFV) as convergence.
 // It must accept a genuine plateau and reject a real early stall.
 
-// Signature: (feasible_evals, last_sig_feasible_eval, best_seen, final).
+// Signature: (feasible_evals, last_sig_feasible_eval, best_seen, final,
+// left_init).
 // Every eval count/index is over *feasible* (unguarded) evals only, 1-based;
 // `last_sig_feasible_eval == 1` means the last significant improvement was the
 // first feasible eval (the baseline), i.e. the fit never descended.
@@ -2685,6 +2969,7 @@ fn plateau_with_flat_tail_and_consistent_ofv_is_converged() {
         36, // last significant improvement → flat tail of 8 (≥ 5)
         Some(-286.004247),
         -286.004205, // ties best-seen to ~4e-5
+        true,        // best point is far from init
     ));
 }
 
@@ -2692,13 +2977,20 @@ fn plateau_with_flat_tail_and_consistent_ofv_is_converged() {
 fn short_descending_tail_is_not_converged() {
     // SS-oral shape: the fit quits after ~5 evals still plunging — the last
     // improvement is the final feasible eval, so there is no flat tail at all.
-    assert!(!failure_is_converged_plateau(5, 5, Some(83.26), 83.26));
+    assert!(!failure_is_converged_plateau(
+        5,
+        5,
+        Some(83.26),
+        83.26,
+        true
+    ));
     // Even one eval short of the minimum flat tail must stay unconverged.
     assert!(!failure_is_converged_plateau(
         10,
         10 - (PLATEAU_MIN_FLAT_EVALS - 1),
         Some(-100.0),
         -100.0,
+        true,
     ));
 }
 
@@ -2707,14 +2999,26 @@ fn plateau_but_inconsistent_cold_restart_is_not_converged() {
     // SS-oral warm-start artifact: the OFV trace could look flat, yet the cold
     // inner-loop restart lands far worse (best-seen 83.3 vs final 121.4) — the
     // "optimum" was an EBE warm-start artifact, so it is rejected.
-    assert!(!failure_is_converged_plateau(50, 40, Some(83.26), 121.36));
+    assert!(!failure_is_converged_plateau(
+        50,
+        40,
+        Some(83.26),
+        121.36,
+        true
+    ));
 }
 
 #[test]
 fn plateau_with_better_cold_restart_is_converged() {
     // A cold restart that ties or *improves* on best-seen is a valid minimum —
     // only the materially-worse direction signals an artifact.
-    assert!(failure_is_converged_plateau(50, 40, Some(-286.0), -286.5));
+    assert!(failure_is_converged_plateau(
+        50,
+        40,
+        Some(-286.0),
+        -286.5,
+        true
+    ));
 }
 
 #[test]
@@ -2725,6 +3029,32 @@ fn plateau_check_reaches_min_flat_tail_boundary() {
         20 - PLATEAU_MIN_FLAT_EVALS,
         Some(1.0),
         1.0,
+        true,
+    ));
+}
+
+#[test]
+fn plateau_pinned_at_init_is_not_converged() {
+    // The user-ODE warfarin twin (#751): its line search died at feasible eval 4
+    // having improved the OFV by 0.028 — enough to clear `PLATEAU_OFV_THRESHOLD`
+    // and register as "progress" — then went flat for the rest of the budget.
+    // Progress + plateau + consistency all hold, yet the fit never left its
+    // initial estimates, so it must not be reported converged (it would publish
+    // standard errors for the initial point).
+    assert!(!failure_is_converged_plateau(
+        15,
+        4,
+        Some(-250.866184),
+        -250.866178,
+        false, // never left init
+    ));
+    // Same trace, but the fit did move: that is a genuine plateau.
+    assert!(failure_is_converged_plateau(
+        15,
+        4,
+        Some(-250.866184),
+        -250.866178,
+        true,
     ));
 }
 
@@ -2732,8 +3062,8 @@ fn plateau_check_reaches_min_flat_tail_boundary() {
 fn plateau_check_handles_missing_best_seen() {
     // No best-seen point recorded → consistency cannot fail; the plateau length
     // alone decides.
-    assert!(failure_is_converged_plateau(30, 10, None, -50.0));
-    assert!(!failure_is_converged_plateau(3, 3, None, -50.0));
+    assert!(failure_is_converged_plateau(30, 10, None, -50.0, true));
+    assert!(!failure_is_converged_plateau(3, 3, None, -50.0, true));
 }
 
 #[test]
@@ -2748,10 +3078,11 @@ fn stuck_at_initial_estimate_is_not_converged() {
         12,
         1,
         Some(-250.838),
-        -250.838
+        -250.838,
+        false
     ));
     // No feasible eval at all (`feasible_evals == 0`): not converged.
-    assert!(!failure_is_converged_plateau(0, 0, None, -250.838));
+    assert!(!failure_is_converged_plateau(0, 0, None, -250.838, false));
 }
 
 #[test]
@@ -2764,7 +3095,13 @@ fn guard_rejected_first_eval_does_not_fake_progress() {
     // objective. Counting over feasible evals keeps this `converged = false`; the
     // earlier total-eval basis let the first feasible point land at index ≥ 2 and
     // wrongly satisfy `>= 2`.
-    assert!(!failure_is_converged_plateau(20, 1, Some(83.26), 83.26));
+    assert!(!failure_is_converged_plateau(
+        20,
+        1,
+        Some(83.26),
+        83.26,
+        true
+    ));
 }
 
 #[test]
@@ -2775,13 +3112,20 @@ fn guarded_tail_does_not_pad_plateau() {
     // eval (feasible_evals = 4) has a flat tail of 1 — NOT converged — even if
     // dozens of guarded evals followed. The guarded tail is invisible here by
     // construction (it never advances `feasible_evals`).
-    assert!(!failure_is_converged_plateau(4, 3, Some(-100.0), -100.0));
+    assert!(!failure_is_converged_plateau(
+        4,
+        3,
+        Some(-100.0),
+        -100.0,
+        true
+    ));
     // The same real improvement followed by ≥ 5 *feasible* flat evals does plateau.
     assert!(failure_is_converged_plateau(
         3 + PLATEAU_MIN_FLAT_EVALS,
         3,
         Some(-100.0),
-        -100.0
+        -100.0,
+        true
     ));
 }
 
@@ -2791,5 +3135,11 @@ fn genuine_progress_after_guarded_start_is_converged() {
     // then genuinely descends: a significant improvement lands at feasible-eval 5,
     // after the baseline, followed by a flat tail of 15. Real progress-then-plateau
     // — must be accepted.
-    assert!(failure_is_converged_plateau(20, 5, Some(-286.0), -286.0));
+    assert!(failure_is_converged_plateau(
+        20,
+        5,
+        Some(-286.0),
+        -286.0,
+        true
+    ));
 }

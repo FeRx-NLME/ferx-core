@@ -5,7 +5,7 @@
 //! know about (§8.7 of `plans/tte-survival-markov.md`):
 //!
 //! - **build the generator** `Q(θ, η, cov)` from the endpoint's
-//!   [`GeneratorFn`](crate::types::GeneratorFn) (the `[markov_model] transition`
+//!   [`GeneratorFn`] (the `[markov_model] transition`
 //!   intensities, diagonal filled row-sum-zero), once per subject
 //!   (time-homogeneous — a drug-driven `Q(t)` is Phase 6);
 //! - **collect the observations** — map each subject
@@ -141,9 +141,9 @@ fn ctmm_endpoint_nll(
 /// the whole matrix-exponential likelihood (#759).
 ///
 /// `Q` is rebuilt over `Dual1` with θ and η seeded
-/// ([`CtmmGeneratorProgram::eval_generator_duals`]), giving an exact `∂Q/∂(θ,η)`; the η
+/// (`CtmmGeneratorProgram::eval_generator_duals`), giving an exact `∂Q/∂(θ,η)`; the η
 /// columns are then chained through the Van Loan Fréchet derivative of `expm` by
-/// [`ctmm_data_term_grad`]. Returns `(value, ∂/∂η)` with the gradient at the **same 1×
+/// [`crate::markov::ctmm_data_term_grad`]. Returns `(value, ∂/∂η)` with the gradient at the **same 1×
 /// scale as the value** — the caller applies the objective's factor.
 ///
 /// `None` — caller falls back to FD for this point — when *any* CTMM endpoint on the
@@ -418,7 +418,7 @@ fn ctmm_endpoint_nll_inhomogeneous(
             },
             dt,
             n_states,
-            &ode.solver_opts,
+            &ode.effective_solver_opts(),
         );
         let prob = p[(obs[m].state, obs[m + 1].state)];
         // Underflowed / non-positive probability for an observed transition → repel.
@@ -464,7 +464,7 @@ pub fn validate_ctmm_states(
 /// in file order (the NONMEM convention is time-ordered input, but nothing enforces
 /// it). An out-of-order pair would make [`ctmm_data_term`] return
 /// [`MarkovError::TimeDecreased`](crate::markov::MarkovError::TimeDecreased), which
-/// [`ctmm_endpoint_nll`] maps to the [`SUBJECT_SENTINEL_NLL`] backstop — silently
+/// `ctmm_endpoint_nll` maps to the `SUBJECT_SENTINEL_NLL` backstop — silently
 /// collapsing that subject's entire likelihood to `1e20` and biasing the population
 /// fit with no diagnostic. Rejecting up front converts that silent corruption into a
 /// clear error, mirroring [`validate_ctmm_states`]. Only `DiscreteState` rows on
@@ -656,6 +656,98 @@ mod tests {
         assert!(
             ctmm_subject_eta_grad(&model, &subject, &model.default_params.theta, &[0.1]).is_none(),
             "a state-driven generator must decline the expm-based analytic gradient"
+        );
+    }
+
+    /// #1187 at this objective. The inhomogeneous CTMM path reads its drug concentration
+    /// from [`crate::ode::ode_dense_solve_states`], which resolved infusions through the
+    /// unguarded `gated_infusions` — so for a `RATE>0` dose into a built-in absorption
+    /// compartment the generator saw roughly twice the exposure and the **fitted** NLL was
+    /// wrong. Nothing else covers this surface.
+    ///
+    /// Oracle is an explicit sub-dose train: N boluses spanning the same window. That is
+    /// discriminating here precisely because a *bolus* into an input-rate compartment never
+    /// reaches `gated_infusions` at all — only real infusions enter the active list — so the
+    /// train is immune to the defect while the infusion is not.
+    #[test]
+    fn ctmm_nll_for_infusion_into_absorption_matches_a_subdose_train() {
+        use crate::types::DoseEvent;
+
+        // `first_order(ka=KA)` in central, so CMT 1 is the input-rate compartment; the
+        // transition intensity reads `central / V`, making the generator drug-driven.
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(0.6, 0.01, 50.0)
+  theta LQ01(-0.7, -6.0, 3.0)
+  theta LQ10(-1.2, -6.0, 3.0)
+  theta SLOPE(0.4, -5.0, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = first_order(ka=KA) - CL/V * central
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[markov_model]
+  type   = ctmm
+  cmt    = 5
+  states = [s0=0, s1=1]
+  transition s0 -> s1 = exp(LQ01 + SLOPE * (central / V))
+  transition s1 -> s0 = exp(LQ10)
+";
+        let model = crate::parser::model_parser::parse_model_string(src).expect("parse");
+        let theta = &model.default_params.theta;
+        let eta = [0.0_f64];
+
+        let obs = [(0.0, 0), (2.0, 1), (5.0, 0), (9.0, 1)];
+        let (amt, t_inf) = (100.0_f64, 3.0_f64);
+
+        let mut infused = ctmm_subject(&obs);
+        infused.doses = vec![DoseEvent::new(0.0, amt, 1, amt / t_inf, false, 0.0)];
+        assert!(
+            infused.doses[0].is_infusion(),
+            "fixture must carry a real infusion or it tests nothing"
+        );
+
+        let n = 300usize;
+        let mut train = ctmm_subject(&obs);
+        train.doses = (0..n)
+            .map(|k| {
+                let tk = (k as f64 + 0.5) * t_inf / n as f64;
+                DoseEvent::new(tk, amt / n as f64, 1, 0.0, false, 0.0)
+            })
+            .collect();
+
+        let nll_infused = ctmm_subject_nll(&model, &infused, theta, &eta);
+        let nll_train = ctmm_subject_nll(&model, &train, theta, &eta);
+
+        // Non-degeneracy: the drug must actually move this objective, or the comparison
+        // would hold for a generator that ignored `central` entirely.
+        let drug_free = ctmm_subject_nll(&model, &ctmm_subject(&obs), theta, &eta);
+        assert!(
+            nll_train.is_finite() && (nll_train - drug_free).abs() > 1e-2,
+            "CTMM NLL {nll_train} sits at its dose-free value {drug_free} — the concentration \
+             is not reaching the generator, so the comparison would be vacuous"
+        );
+
+        let rel = (nll_infused - nll_train).abs() / nll_train.abs().max(1.0);
+        assert!(
+            rel < 1e-3,
+            "CTMM NLL under an infusion into the absorption compartment is {nll_infused}, \
+             but the equivalent sub-dose train gives {nll_train} (rel {rel:.2e}) — the \
+             generator is seeing the wrong exposure"
         );
     }
 

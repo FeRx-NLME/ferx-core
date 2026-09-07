@@ -1,3 +1,8 @@
+---
+pagetitle: "Bayesian NLME estimation with MCMC"
+description-meta: "Use Gibbs-within-HMC Bayesian estimation in ferx for population PK/PD posterior inference, credible intervals, and convergence diagnostics."
+---
+
 # Bayesian estimation (MCMC)
 
 `method = bayes` runs full MCMC Bayesian estimation — it draws from the joint

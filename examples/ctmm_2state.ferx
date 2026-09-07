@@ -16,7 +16,7 @@
 # Requires the `markov` cargo feature.
 #
 # Run:
-#   cargo run --release --features markov -- examples/ctmm_2state.ferx --data data/ctmm_2state.csv
+#   cargo run --release -p ferx-cli --features ferx-core/markov -- examples/ctmm_2state.ferx --data data/ctmm_2state.csv
 
 [parameters]
   theta LQ01(-0.7, -6.0, 3.0)   # log intensity awake -> asleep

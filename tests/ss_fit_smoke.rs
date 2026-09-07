@@ -55,17 +55,16 @@ const SS_ORAL_MODEL: &str = r#"
 "#;
 
 #[test]
-// Unconditionally ignored (single attribute so no `unused_attributes` and no
-// stale "slow" skip reason): a slow full-fit test that is also blocked on #960 —
-// analytic-gradient NLopt L-BFGS first-step overshoot leaves this SS-oral fit
-// stuck (quits at eval 5, warm/cold EBE gap 83→121), so it never converges. Same
-// optimizer root cause as the covariance tests. Re-enable (restoring the
-// `#[cfg_attr(not(feature = "slow-tests"), ignore)]` slow gate) when the L-BFGS
-// non-convergence is fixed.
-#[ignore = "temporarily disabled — blocked on #960 (also a slow full-fit test): \
-            analytic-gradient NLopt L-BFGS first-step overshoot leaves this SS-oral \
-            fit stuck (quits at eval 5, warm/cold EBE gap 83→121), so it never \
-            converges. Re-enable when the L-BFGS non-convergence is fixed."]
+// Re-enabled (#960): the analytic-gradient NLopt L-BFGS first-step overshoot
+// that left this SS-oral fit stuck (quit at eval 5, warm/cold EBE gap 83→121) is
+// fixed by the first-step gradient cap (`cap_scaled_gradient` on the opening
+// L-BFGS eval), so it converges. This one needed only the convergence half
+// (mode 1) — no covariance step — so it re-greens independent of the analytic
+// Hessian. Back on the standard slow-tests gate.
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow full-fit smoke test (#960): opt in with --features slow-tests"
+)]
 fn fit_runs_on_ss_oral_dataset() {
     let parsed = parse_full_model(SS_ORAL_MODEL).expect("SS model parses");
     let model = parsed.model;

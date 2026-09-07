@@ -23,10 +23,19 @@ use rand::{Rng, RngExt};
 use rand_distr::StandardNormal;
 
 /// How parameter-uncertainty draws are produced.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Default` is [`UncertaintyMethod::Asymptotic`] — the standard MVN method,
+/// which needs only a successful covariance step. `Sir` additionally requires
+/// the SIR resample pool to have been retained at fit time, so it is not a
+/// safe default. Deriving `Default` here is what lets
+/// [`crate::SimulateUncertaintyOptions`] derive it too, so out-of-crate
+/// callers (the R wrapper) can construct it with `..Default::default()` and
+/// stay source-compatible when a field is added (#529).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UncertaintyMethod {
     /// MVN in packed log-space using `FitResult.covariance_matrix`. Fast and
     /// parametric; requires a successful covariance step.
+    #[default]
     Asymptotic,
     /// Reuse the resampled parameter vectors retained from the SIR step.
     /// Requires `FitOptions.sir = true` AND `sir_keep_samples = true`.
@@ -79,8 +88,22 @@ pub fn fitted_params_from_result(
             names: fit_result.sigma_names.clone(),
         },
         sigma_fixed: fit_result.sigma_fixed.clone(),
+        // Prefer the fit's own `block_sigma` correlations (#847) — they are the
+        // estimated values — and fall back to the model declaration for a
+        // FitResult written before the field existed.
+        residual_correlations: if fit_result.residual_correlations.is_empty() {
+            template.residual_correlations.clone()
+        } else {
+            fit_result.residual_correlations.clone()
+        },
+        residual_correlation_fixed: if fit_result.residual_correlation_fixed.is_empty() {
+            template.residual_correlation_fixed.clone()
+        } else {
+            fit_result.residual_correlation_fixed.clone()
+        },
         omega_iov,
         kappa_fixed: fit_result.kappa_fixed.clone(),
+        mixture: None,
     }
 }
 
@@ -295,6 +318,15 @@ fn draw_sir(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #529: `UncertaintyMethod` derives `Default` so
+    /// `SimulateUncertaintyOptions` can derive it too. Pin the variant — a
+    /// silent move of `#[default]` to `Sir` would make a spread-constructed
+    /// options value demand a SIR pool that most fits never retained.
+    #[test]
+    fn uncertainty_method_defaults_to_asymptotic() {
+        assert_eq!(UncertaintyMethod::default(), UncertaintyMethod::Asymptotic);
+    }
     use crate::types::{ErrorModel, OmegaMatrix, SigmaVector};
     use nalgebra::DMatrix;
     use rand::rngs::StdRng;
@@ -306,6 +338,8 @@ mod tests {
         let omega_matrix = DMatrix::from_diagonal(&DVector::from_vec(vec![0.04]));
         let omega = OmegaMatrix::from_matrix(omega_matrix, vec!["eta_CL".to_string()], true);
         ModelParameters {
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             theta: vec![1.0, 5.0],
             theta_names: vec!["CL".to_string(), "V".to_string()],
             theta_lower: vec![1e-3, 1e-3],
@@ -320,6 +354,7 @@ mod tests {
             sigma_fixed: vec![false],
             omega_iov: None,
             kappa_fixed: Vec::new(),
+            mixture: None,
         }
     }
 
@@ -328,6 +363,9 @@ mod tests {
     /// are filled with sensible defaults.
     fn fit_with_cov(template: &ModelParameters, cov: DMatrix<f64>) -> FitResult {
         FitResult {
+            residual_correlation_fixed: Vec::new(),
+            se_residual_correlations: None,
+            covariate_relations: Vec::new(),
             restored_from_checkpoint: false,
             method: crate::types::EstimationMethod::FoceI,
             method_chain: vec![],
@@ -343,6 +381,7 @@ mod tests {
             omega: template.omega.matrix.clone(),
             sigma: template.sigma.values.clone(),
             sigma_names: template.sigma.names.clone(),
+            residual_correlations: Vec::new(),
             error_model: ErrorModel::Proportional,
             covariance_matrix: Some(cov),
             se_theta: None,
@@ -369,10 +408,13 @@ mod tests {
             importance_sampling: None,
             impmap_trace: None,
             bayes: None,
+            vi: None,
             omega_iov: None,
             kappa_names: vec![],
             kappa_fixed: vec![],
             kappa_init_as_sd: vec![],
+            kappa_weights: Vec::new(),
+            kappa_weight_typical: Vec::new(),
             se_kappa: None,
             shrinkage_kappa: vec![],
             shrinkage_kappa_by_occ: vec![],
@@ -405,6 +447,7 @@ mod tests {
             sigma_types: vec![],
             cov_eigenvalues: None,
             cov_condition_number: None,
+            bic_inputs: Default::default(),
             eta_log_transformed: vec![],
             omega_param_corr: None,
             omega_iov_param_corr: None,
@@ -436,6 +479,9 @@ mod tests {
             covariate_table: None,
             exclusions: None,
             packed_estimate: None,
+            left_init: None,
+            omega_is_diagonal: None,
+            kappa_is_diagonal: None,
         }
     }
 

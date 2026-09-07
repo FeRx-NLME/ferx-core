@@ -1,0 +1,42 @@
+# ferx twin of nonmem_anchor/reset_init_snapshot_J.ctl (#1133).
+#
+# NONMEM's rule is that `$PK` at a reset row reads THAT ROW's data items. Arm J isolates
+# it on the `OCC` column with `WT` held flat, and `A_0` reads a THETA-selected occasion
+# multiplier rather than an ETA, so the answer is deterministic.
+#
+# In ferx an `OCC` column can reach the model two ways, and this file exercises the first:
+#
+#   * as an ordinary COVARIATE, through the reset row's covariate snapshot
+#     (`Subject::reset_cov`) — what this model does, with `1 + (OCC-1)*2` reproducing
+#     NONMEM's `IF (OCC.EQ.2) OCCF = THETA(4)`;
+#   * as the IOV OCCASION LABEL selecting a kappa, through `Subject::reset_occasions`
+#     — pinned separately in `pk::tests::iov_reset_takes_its_own_rows_occasion`, because
+#     kappa is estimated and cannot be fixed to a discriminating value from a model file.
+[parameters]
+  theta TVCL(5.0, 0.0, 1e15)
+  theta TVV(50.0, 0.0, 1e15)
+  theta TVBASE(10.0, 0.0, 1e15)
+  omega ETA_CL ~ 0.0
+  sigma PROP ~ 0.01
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  BASE = TVBASE * WT * (1 + (OCC - 1) * 2)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central)  = BASE
+  d/dt(central)  = -(CL/V) * central
+[covariates]
+  WT continuous
+  OCC continuous
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  method = focei
+  maxiter = 0
+  covariance = false
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12

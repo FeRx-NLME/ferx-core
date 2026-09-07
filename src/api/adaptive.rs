@@ -9,10 +9,9 @@ use crate::estimation::parameterization::{
 };
 use crate::estimation::saem;
 use crate::io::datareader::{
-    read_nonmem_csv_filtered_mapped, read_nonmem_csv_filtered_tte, read_nonmem_csv_mapped,
+    read_nonmem_csv_filtered_mapped, read_nonmem_csv_mapped,
     read_nonmem_csv_with_covariates_filtered_mapped, read_nonmem_csv_with_covariates_mapped,
-    read_nonmem_csv_with_covariates_tte, SelectionFilter, ERR_COV_MISSING_COLUMNS,
-    ERR_COV_NON_NUMERIC,
+    SelectionFilter, ERR_COV_MISSING_COLUMNS, ERR_COV_NON_NUMERIC,
 };
 use crate::pk;
 use crate::propensity_match::MatchMethod;
@@ -1015,6 +1014,29 @@ fn check_event_pk_records(
             ));
         }
     }
+    // EVID=3/4 rows (#1133). This one is exactly the case the guard exists for: the driver
+    // and the frozen-replay verifier BOTH read `event_pk.reset[r]` to re-seed
+    // `[odes] init(...)`, so a wrong covariate or κ in the builder is applied identically on
+    // both sides and the replay reports bit-equality on a wrong trajectory.
+    if got.reset.len() != subject.reset_times.len() {
+        return Err(format!(
+            "event_pk.reset has {} entr(ies) but the subject has {} EVID=3/4 record(s) (#1133)",
+            got.reset.len(),
+            subject.reset_times.len()
+        ));
+    }
+    for r in 0..subject.reset_times.len() {
+        let t = subject.reset_times[r];
+        let want = (model.pk_param_fn)(theta, eta_at(t), subject.reset_cov(r), t);
+        if !pk_bits_eq(&want, &got.reset[r]) {
+            return Err(format!(
+                "event_pk.reset[{r}] (EVID=3/4 record at t={t}) diverges from an independent \
+                 re-derivation — a wrong reset-row covariate or occasion κ, which the driver \
+                 and the frozen-schedule replay would both apply and neither could catch \
+                 (#748/#1133)"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1082,8 +1104,11 @@ pub fn simulate_adaptive_from_spec(
     let compiled = crate::sim::adaptive_control::compile_adaptive(model, spec)
         .map_err(|e| format!("simulate_adaptive_from_spec: {e}"))?;
     // Parity with `fit()`: model-referenced covariates (e.g. a `Selected` error
-    // model's selector) must be present too, not just the `observe` signal (#658).
-    first_error(&check_covariates(model, population))?;
+    // model's selector) must be present too, not just the `observe` signal (#658) —
+    // and a weighted κ / weighted residual must resolve to a positive weight before
+    // it silently underflows to zero (#1083). Same list every other simulate entry
+    // point runs.
+    first_error(&check_simulation_data(model, population))?;
     // A `Selected` error model keys endpoints by selector branch, not CMT, so the
     // compartment-keyed assay would draw NaN — reject it (see the helper's note, #658).
     reject_selected_error_for_adaptive(model)?;

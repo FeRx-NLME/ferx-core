@@ -102,15 +102,14 @@ fn covariance_rsr_assembles_finite_ses_fast() {
 }
 
 #[test]
-// Unconditionally ignored (single attribute so no `unused_attributes` and no
-// stale "slow" skip reason): a slow full-FOCEI-fit ×3 test that is also blocked
-// on #960. Re-enable (restoring the `#[cfg_attr(not(feature = "slow-tests"),
-// ignore)]` slow gate) when #436 (analytic Hessian) or #520 (FD-step robustness)
-// lands.
-#[ignore = "temporarily disabled — blocked on #960 (also a slow full-fit ×3 test): \
-            FD-of-OFV covariance Hessian is knife-edge at the warfarin FOCEI optimum \
-            (SE(TVCL) 0.0071↔121 on a ~3e-5 θ shift). Re-enable when #436 (analytic \
-            Hessian) or #520 (FD-step robustness) lands."]
+// Re-enabled (#960): mode 1 (L-BFGS first-step overshoot → fit stuck at init)
+// fixed by `cap_scaled_gradient` on the opening L-BFGS eval; mode 2 (FD-of-OFV
+// knife-edge, SE(TVCL) 0.0071↔121 on a ~3e-5 θ shift) cured by the analytic
+// covariance Hessian (#436, default-on). Back on the standard slow-tests gate.
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow full-FOCEI-fit ×3 covariance SE consistency check (#960): opt in with --features slow-tests"
+)]
 fn covariance_methods_produce_consistent_ses_on_warfarin() {
     let model = parse_model_string(WARFARIN_FOCEI).expect("warfarin model parses");
     assert!(
@@ -181,20 +180,18 @@ fn covariance_methods_produce_consistent_ses_on_warfarin() {
 #[test]
 // The `s` (pure cross-product) estimator is a 10-subject outer-product and is
 // inherently noisier (20% band). The RSR sandwich `R⁻¹SR⁻¹` draws its `R` from
-// the reconverged-OFV second-difference stencil (the sole R path since #639).
-// That stencil is only well-conditioned at a true stationary point, so this
-// fixture relies on the default `Auto` optimizer (→ analytic-gradient NLopt
-// L-BFGS) converging.
+// the analytic covariance Hessian (#436, default-on) — a noise-free R with no FD
+// step to condition, so it is stable near the optimum. This fixture relies on the
+// default `Auto` optimizer (→ analytic-gradient NLopt L-BFGS) converging, which
+// the #960 first-step cap now delivers.
 //
-// Unconditionally ignored (single attribute so no `unused_attributes` and no
-// stale "slow" skip reason): a slow NONMEM-anchored s/rsr cross-check (#266/#335)
-// that is also blocked on #960. Re-enable (restoring the `#[cfg_attr(not(feature
-// = "slow-tests"), ignore)]` slow gate) when #436 (analytic Hessian) or #520
-// (FD-step robustness) lands.
-#[ignore = "temporarily disabled — blocked on #960 (also a slow NONMEM-anchored \
-            s/rsr cross-check, #266/#335): FD-of-OFV covariance Hessian is knife-edge \
-            at the warfarin FOCEI optimum (SE(TVCL) 0.0071↔121 on a ~3e-5 θ shift). \
-            Re-enable when #436 (analytic Hessian) or #520 (FD-step robustness) lands."]
+// Re-enabled (#960): mode 1 fixed by `cap_scaled_gradient` on the opening L-BFGS
+// gradient eval; mode 2 (the old FD-of-OFV knife-edge) removed by the analytic
+// Hessian. Back on the standard slow-tests gate.
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow NONMEM-anchored s/rsr covariance SE cross-check (#266/#335/#960): opt in with --features slow-tests"
+)]
 fn covariance_se_matches_nonmem_s_rsr() {
     let model = parse_model_string(WARFARIN_FOCEI).expect("warfarin model parses");
     assert!(

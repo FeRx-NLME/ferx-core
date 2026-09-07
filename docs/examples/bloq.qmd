@@ -1,3 +1,7 @@
+---
+pagetitle: "BLOQ modeling example (M3 method)"
+---
+
 # BLOQ (M3 method)
 
 This example shows how to fit a model to data that contains observations below

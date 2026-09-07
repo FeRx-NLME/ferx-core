@@ -226,7 +226,7 @@ pub fn convolve_1cpt<T: PkNum, A: TiltedAbsorption<T>>(
 /// Central-compartment concentration at time `t` for a single dose absorbed into a
 /// **2-cpt** disposition through `abs`, with macro-rate constants `α ≥ β` and
 /// peripheral micro-rate `k21` (all from
-/// [`crate::sens::two_cpt::macro_rates_g`]):
+/// `crate::sens::two_cpt::macro_rates_g`):
 ///
 /// ```text
 ///   C(t) = (F·Dose/V1) · [ cα·M(α)·e^{-α t}·G(t; α) + cβ·M(β)·e^{-β t}·G(t; β) ],

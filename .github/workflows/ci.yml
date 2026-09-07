@@ -31,69 +31,43 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci
-      - name: cargo check
-        run: cargo check --tests --no-default-features --features ci
+      # The five `cargo check` feature sets live in `tools/preflight.sh` (#1157),
+      # which a developer runs before pushing. CI executes that same script rather
+      # than restating the commands, so the local gate and the CI gate cannot drift
+      # — the same contract `tools/update-public-api.sh` uses for the API baseline.
+      # The script prints each command as it runs, so a failing line is still
+      # identifiable in this log; its comments carry the per-feature-set rationale.
+      - name: cargo check (5 feature sets, via tools/preflight.sh)
+        run: tools/preflight.sh check
 
-      # `tests/tte_convergence.rs` is gated on BOTH `survival` and `slow-tests`, and
-      # no other per-PR job sets both (check/test/coverage-pr use `ci`; the survival
-      # job uses `ci,survival`) — so those Tier-3 TTE tests are compiled in *neither*.
-      # Without this step a renamed public API or changed `FitResult` field would land
-      # green and only break the nightly slow-tests run, decoupled from the offending
-      # PR. Compile-only (`cargo check`, no run — the tests themselves stay nightly per
-      # the tier rules), so it is cheap. (#441 review finding #3.)
-      - name: cargo check (survival + slow-tests gated tests)
-        run: cargo check --tests --no-default-features --features ci,survival,slow-tests
-
-      # The `markov` module (CTMM matrix-exp) is behind `#[cfg(feature = "markov")]`
-      # and compiled by neither the base `ci` check nor the survival check. A fast,
-      # uninstrumented compile-check here surfaces a break in ~1 min instead of
-      # waiting on the instrumented markov coverage job below.
-      - name: cargo check (markov-gated module + tests)
-        run: cargo check --tests --no-default-features --features ci,markov
-
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: Install nightly toolchain
-        run: rustup toolchain install nightly --profile minimal
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ci
-      # `--profile ci-test` keeps release-level optimisation (population-fit
-      # tests — SDE, IOV, FOCEI, GN-hybrid — run 5-10× faster than debug) but
-      # drops fat LTO, whose whole-program link dominated these jobs. Net:
-      # avoids the >80 min debug wall without paying the LTO compile tax.
-      - name: cargo test
-        run: cargo test --lib --no-default-features --features ci --profile ci-test
-
-      # The NONMEM-anchored per-(ID,OCC) CL cross-check for IOV (issue #238)
-      # lives in an integration test, which `--lib` above does not build or run.
-      # Run that one file explicitly so the agreement with NONMEM is guarded on
-      # every PR (not just nightly). It is a FIXed-MLE fit over 10 subjects — no
-      # convergence loop, sub-second — and self-contained (reference fixture
-      # committed at tests/nonmem/warfarin_iov_cl_reference.csv).
-      - name: cargo test (NONMEM IOV CL cross-check, issue #238)
-        run: cargo test --test warfarin_iov_nonmem --no-default-features --features ci --profile ci-test
-
-      # Analytical/ODE equivalence guard for the standard PK models (ferx-r
-      # #127). Like the IOV check above it is an integration test `--lib` does
-      # not run, but it is fast (just `predict()`, no `fit()`), so run it on
-      # every PR rather than only nightly — otherwise a regression in the
-      # analytical or ODE prediction path stays green until the slow-tests run.
-      - name: cargo test (analytical/ODE equivalence, ferx-r #127)
-        run: cargo test --test analytical_ode_equivalence --no-default-features --features ci --profile ci-test
-
-  survival:
-    name: Survival (TTE)
+  # Every default-off feature surface the `ci` build compiles out: the non-Gaussian
+  # endpoint families (TTE/survival + categorical + CTMM) and the covariate-NN /
+  # DCM stack (`nn`). This ONE job replaces the former separate `Survival (TTE)`
+  # and `Markov (CTMM)` jobs: `markov = ["survival"]` in Cargo.toml, so a
+  # `--features ci,markov` build is a strict superset of a `--features ci,survival`
+  # one — the old survival job compiled and ran nothing the markov job did not, and
+  # its lcov was a subset. All three Codecov flags are uploaded from this single
+  # report (codecov.yml still names `survival`, `markov` and `nn` separately in its
+  # patch/project statuses).
+  #
+  # `nn` rides along here rather than in a job of its own for a reason that is not
+  # just CI minutes: `tests/tte_smoke.rs` holds an nn-gated test
+  # (`event_model_referencing_nn_driven_indiv_param_is_rejected`, #442) inside a
+  # `#![cfg(feature = "survival")]` file, so it compiles only when `survival` AND
+  # `nn` are both on. A standalone `--features ci,nn` job could never measure it,
+  # and the set-equality guard below would have to grow an exemption rule to stay
+  # satisfiable. One combined feature set keeps that guard a plain set equality.
+  #
+  # NOTE: the job's display `name` is deliberately unchanged despite the widened
+  # scope — it is the string branch protection matches on.
+  endpoints:
+    name: Tests + coverage (TTE/CTMM endpoints)
     runs-on: ubuntu-latest
     # Override the global nightly: the crate has no nightly-only code, so this
-    # job (`--features ci,survival`) builds fine on stable. Stable's rustc
-    # version holds for ~6 weeks vs nightly's daily bump, so the instrumented
-    # cache (keyed on rustc version) stays warm instead of cold-rebuilding the
-    # whole dep graph under coverage RUSTFLAGS every run.
+    # job builds fine on stable. Stable's rustc version holds for ~6 weeks vs
+    # nightly's daily bump, so the instrumented cache (keyed on rustc version)
+    # stays warm instead of cold-rebuilding the whole dep graph under coverage
+    # RUSTFLAGS every run.
     env:
       RUSTUP_TOOLCHAIN: stable
     steps:
@@ -104,75 +78,132 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           # Instrumented build (coverage RUSTFLAGS) can't share the plain `ci`
-          # caches; own key, like the other coverage jobs (`coverage-pr` -> ci-cov).
-          shared-key: ci-cov-survival
+          # caches; own key, like the other coverage job (`coverage-pr` -> ci-cov).
+          shared-key: ci-cov-endpoints
       - name: Install cargo-llvm-cov
         # Prebuilt binary (no compile) so this job stays fast.
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
 
-      # All TTE/survival code is behind `#[cfg(feature = "survival")]`, so neither
-      # the default `ci` jobs nor the FD coverage jobs (`fast`/`slow` flags)
-      # compile it — Codecov reports those lines as missed even though they're
-      # exercised here, undercounting the true surface (#293). So this job both
-      # GATES the survival code (a break still fails it) and MEASURES it: it runs
-      # under `cargo llvm-cov` and uploads the `survival` flag, which Codecov
-      # merges with `fast`/`slow`. `tte_smoke` is Tier-2 (a handful of outer
-      # iterations), so `--tests` stays fast; `--profile ci-test` (no fat LTO)
-      # keeps it cheap. `--no-fail-fast` mirrors the other coverage jobs.
-      - name: Generate survival coverage report
-        run: cargo llvm-cov --tests --no-fail-fast --no-default-features --features ci,survival --profile ci-test --lcov --output-path lcov.info
+      # All TTE/categorical/CTMM code is behind `#[cfg(feature = "survival")]` or
+      # `#[cfg(feature = "markov")]`, and all covariate-NN / DCM code behind
+      # `#[cfg(feature = "nn")]`, so neither the default `ci` jobs nor the
+      # `fast`/`slow` coverage jobs compile any of it — Codecov would report those
+      # lines as missed even though they are exercised, and a survival-, markov- or
+      # nn-only PR would fail its own patch gate at 0% (#293). This job MEASURES
+      # that surface and uploads it under all three flags, which Codecov merges
+      # with `fast`/`slow` by summing hits.
+      #
+      # Explicit `--test` list instead of `--tests`: the base suite's 122
+      # integration binaries are already run — and already measured — by
+      # `Tests + coverage (core)`, so re-running them here under a second feature
+      # set bought no coverage (Codecov merges flags by summing hits) and cost
+      # ~15 min of instrumented compile.
+      #
+      # The list is EXACTLY the set of `tests/*.rs` that mention a `survival`,
+      # `markov` or `nn` cfg, and `tests/ci_workflow_endpoint_coverage.rs` asserts
+      # that equality — so adding a test file that uses any of those features
+      # without adding it here fails CI instead of silently reading as uncovered.
+      # The Tier-3 files (`tte_convergence`, `categorical_convergence`,
+      # `nn_fit_smoke`, `nn_fit_convergence`) are in the list on purpose: without
+      # `slow-tests` their tests stay `#[ignore]`d, so they cost one cheap compile
+      # each and keep the invariant a plain set equality with no exemption rule to
+      # get wrong.
+      #
+      # `--lib` stays because the unit tests for `src/survival`, `src/markov`,
+      # `src/nn`, `src/estimation/nn_theta_gradient` and the feature-gated branches
+      # of the shared modules (parser, sens provider, io/output) live there — for
+      # `nn` that is the bulk of the surface.
+      - name: Generate TTE/CTMM endpoint coverage report
+        run: |
+          cargo llvm-cov --no-fail-fast --no-default-features --features ci,markov,nn --profile ci-fast \
+            --lib \
+            --test agq \
+            --test categorical_convergence \
+            --test categorical_smoke \
+            --test dose_compartment_routing \
+            --test lagged_zero_order_break_times \
+            --test markov_nonmem \
+            --test markov_smoke \
+            --test nn_dcm_smoke \
+            --test nn_fit_convergence \
+            --test nn_fit_smoke \
+            --test nn_regularization \
+            --test pktte_prestart_entry \
+            --test pktte_tdep_nonmem_anchor \
+            --test ss_chz_nonmem_anchor \
+            --test tte_convergence \
+            --test tte_smoke \
+            --test vi_dcm_omega_recovery \
+            --test zero_omega_fit \
+            --lcov --output-path lcov.info
 
-      - name: Upload to Codecov (survival flag)
+      - name: Upload to Codecov (survival + markov + nn flags)
         uses: codecov/codecov-action@v7
         with:
           files: lcov.info
-          flags: survival
+          flags: survival,markov,nn
           fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}
 
-  markov:
-    name: Markov (CTMM)
+  # #344. Every other test job in this file builds with `--profile ci-test` or
+  # `--profile ci-fast`, and both `inherits = "release"` — so `debug-assertions`
+  # is OFF and all 177 `debug_assert!` guards in the crate compile to nothing.
+  # They are invariant checks that CI was not running.
+  #
+  # That was not theoretical. An off-by-one in `compute_max_stack`
+  # (`src/parser/model_parser.rs`) tripped its own `debug_assert!` for any
+  # expression containing an `if`, and four lib tests panicked under the dev
+  # profile while CI stayed green through the whole thing (fixed in #342; this
+  # job closes the blind spot that hid it).
+  #
+  # Deliberately a SEPARATE job rather than flipping `ci-test`: that profile
+  # exists so the population-fit tests run at release speed, and this repo is
+  # compile-bound (93% LLVM, #969/#971), so the cheap way to get the guards
+  # executed is one extra UNOPTIMISED build — not a second optimised one.
+  # Measured locally on the dev profile: 80s of tests for `--features ci` (4035
+  # tests) and 198s for `--features ci,markov,nn` (4366), all green — turning the
+  # guards on surfaced no latent failure, so this job starts green.
+  #
+  # The commands live in `tools/preflight.sh` (group `debug-assertions`) for the
+  # same reason as `Check`/`Clippy`/`Format` (#1157) — one list, so the local gate
+  # and the CI gate cannot drift. It is the one group that is opt-in locally: it
+  # runs a suite rather than a compile, so a no-argument `tools/preflight.sh`
+  # stays a pre-push habit and this job is where it has to be green.
+  #
+  # Note that "no `--profile` flag" is an invariant held by ABSENCE, and this job
+  # would be a no-op again — silently, with every test green — if a
+  # `[profile.dev] debug-assertions = false` or a
+  # `CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false` ever appeared. So the group's
+  # commands arm `debug_assertion_canary` (`src/lib_tests.rs`) via
+  # `env FERX_REQUIRE_DEBUG_ASSERTIONS=1`, and that canary fails the run if
+  # `debug_assert!` turns out to compile to nothing. Do NOT set that variable at
+  # the workflow or job level: every other job legitimately runs with the guards
+  # off, and arming it there would fail them for doing the right thing.
+  debug-assertions:
+    name: Tests (debug-assertions)
     runs-on: ubuntu-latest
-    # Same rationale as the Survival job: no nightly-only code, so pin stable to
-    # keep the instrumented (coverage-RUSTFLAGS) cache warm across runs.
+    # Stable, not the workflow-level nightly: `--features ci,markov,nn` has no
+    # nightly-only code, and stable's rustc holds for ~6 weeks against nightly's
+    # daily bump — `rust-cache` keys on `rustc -vV`, so nightly here would cold-
+    # rebuild the dep graph every day for no gate. Same reasoning as the coverage
+    # jobs. `tools/preflight.sh` honours an inherited `RUSTUP_TOOLCHAIN`.
     env:
       RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v7
       - name: Install stable toolchain
-        run: rustup toolchain install stable --profile minimal -c llvm-tools-preview
+        run: rustup toolchain install stable --profile minimal
 
       - uses: Swatinem/rust-cache@v2
         with:
-          # Instrumented build (coverage RUSTFLAGS) needs its own key, like the
-          # other coverage jobs (survival -> ci-cov-survival, coverage-pr -> ci-cov).
-          shared-key: ci-cov-markov
-      - name: Install cargo-llvm-cov
-        # Prebuilt binary (no compile) so this job stays fast.
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-llvm-cov
+          # Own key: the dev profile shares no artifacts with the `ci` (check /
+          # clippy) caches or with the instrumented coverage ones.
+          shared-key: ci-debug-assertions
 
-      # All CTMM code is behind `#[cfg(feature = "markov")]`, so neither the default
-      # `ci` jobs nor the `fast`/`slow` coverage jobs compile it — Codecov would
-      # report its lines as missed even though they're exercised, so a PR touching
-      # `src/markov` would fail its own patch gate at 0% (#293). Like the survival
-      # job, this both GATES the markov code (a break fails it) and MEASURES it,
-      # uploading the `markov` flag, which Codecov merges with `fast`/`slow`. The
-      # tests are pure matrix math (milliseconds), so `--tests --profile ci-test`
-      # stays cheap.
-      - name: Generate markov coverage report
-        run: cargo llvm-cov --tests --no-fail-fast --no-default-features --features ci,markov --profile ci-test --lcov --output-path lcov.info
-
-      - name: Upload to Codecov (markov flag)
-        uses: codecov/codecov-action@v7
-        with:
-          files: lcov.info
-          flags: markov
-          fail_ci_if_error: true
-          token: ${{ secrets.CODECOV_TOKEN }}
+      - name: cargo test --lib with debug-assertions on (via tools/preflight.sh)
+        run: tools/preflight.sh debug-assertions
 
   clippy:
     name: Clippy
@@ -185,11 +216,83 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci
-      - name: cargo clippy
-        # Include `markov` so the CTMM module is linted too (it is compiled by
-        # neither the base `ci` build nor the survival job). Survival stays out
-        # of clippy per existing precedent; markov opts in from the start.
-        run: cargo clippy --no-default-features --features ci,markov
+      # Both clippy invocations (ferx-core with `--all-targets`, then the members
+      # with package-qualified features) live in `tools/preflight.sh` (#1157). See
+      # the note in the `check` job above for why CI calls the script.
+      - name: cargo clippy (ferx-core + members, via tools/preflight.sh)
+        run: tools/preflight.sh clippy
+
+  # `cargo doc` exits 0 on link warnings, so nothing caught them until this job:
+  # the tree had accumulated 146 across three classes. An unresolved intra-doc
+  # link is not a silent no-op — it renders with its brackets intact, in rendered
+  # HTML and in rust-analyzer hover alike, so they are visible defects today
+  # regardless of whether this crate is ever published.
+  #
+  # Cheap: ~8s cold on a warm `target/`, ~0.3s when nothing changed.
+  rustdoc:
+    name: Rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install nightly toolchain
+        run: rustup toolchain install nightly --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+      # Both rustdoc invocations (ferx-core, then the members) and the
+      # `RUSTDOCFLAGS=-Dwarnings` that makes them a gate at all live in
+      # `tools/preflight.sh` (#1157). See the note in the `check` job above for
+      # why CI calls the script rather than inlining the commands.
+      - name: cargo doc (ferx-core + members, via tools/preflight.sh)
+        run: tools/preflight.sh rustdoc
+
+  # A2 of #1114 — the enforcement that keeps the ferx-core/ferx-tools boundary
+  # from becoming paperwork. `ferx-tools` can only touch `pub` items, so the way
+  # the boundary rots is `ferx-core` growing an ad-hoc `pub` in the same PR that
+  # needs it. Diffing a committed surface snapshot turns every widening into one
+  # explicit reviewable line. Doubles as semver protection for the crates.io
+  # release and for ferx-r.
+  #
+  # The script owns the pinned nightly, the pinned `cargo-public-api` version and
+  # the feature set, and CI runs that same script — so the generating command
+  # cannot drift from the verifying one.
+  public-api:
+    name: Public API baseline
+    runs-on: ubuntu-latest
+    # `rust-toolchain.toml` says a bare `nightly`, but the output is
+    # rustdoc-JSON-derived and moves with rustdoc, so an unpinned nightly would
+    # produce red diffs unrelated to any PR. The pinned date lives in the script
+    # and is READ from it here rather than repeated, so the two cannot drift.
+    steps:
+      - uses: actions/checkout@v7
+      # The workflow-level `RUSTUP_TOOLCHAIN: nightly` (top of this file) would
+      # otherwise override the pin for every later step: rustup auto-installs
+      # from that env var, so the job would silently pull a SECOND, unpinned
+      # nightly, and `rust-cache` keys `ci-public-api` off `rustc -vV` — which
+      # then changes daily, so the restore never hits and this job does a cold
+      # rustdoc build of `ferx-core` on every run. Exporting the pinned date to
+      # `$GITHUB_ENV` here (before the cache step) makes the pin actually stick.
+      - name: Install the nightly pinned by tools/update-public-api.sh
+        run: |
+          toolchain=$(grep -oE 'nightly-[0-9]{4}-[0-9]{2}-[0-9]{2}' tools/update-public-api.sh | head -1)
+          test -n "$toolchain" || { echo "no pinned nightly found in tools/update-public-api.sh"; exit 1; }
+          echo "pinned toolchain: $toolchain"
+          rustup toolchain install "$toolchain" --profile minimal
+          echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # rustdoc JSON build; own key so it does not churn the `ci` cache.
+          shared-key: ci-public-api
+      # The version is pinned in the script too; if these ever diverge the
+      # script reinstalls its own pin rather than silently using the wrong one
+      # (slower, but never a wrong baseline).
+      - name: Install cargo-public-api
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-public-api@0.51.0
+      - name: Diff the public API against the committed baseline
+        run: tools/update-public-api.sh --check
 
   fmt:
     name: Format
@@ -199,15 +302,42 @@ jobs:
       - name: Install nightly toolchain
         run: rustup toolchain install nightly --profile minimal -c rustfmt
 
-      - name: cargo fmt
-        run: cargo fmt -- --check
+      - name: cargo fmt (via tools/preflight.sh)
+        run: tools/preflight.sh fmt
+
+  docs-lint:
+    name: Docs lint
+    runs-on: ubuntu-latest
+    # Deliberately on `ci.yml` and not on `docs.yml`: that workflow only runs on
+    # a push to `main`, which is too late to block a bad page. `docs-lint`
+    # depends on nothing and never links `ferx-core`, so this job is seconds of
+    # compile, not minutes (#1163).
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install stable toolchain
+        # `-c clippy`: the `docs` group lints `docs-lint` itself, which no other
+        # job covers — the `Clippy` job is scoped to ferx-core and its members.
+        run: rustup toolchain install stable --profile minimal -c clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: docs-lint
+
+      # Unit tests (the pandoc id algorithm) plus the corpus check over
+      # `docs/**/*.qmd`, in one step — through `tools/preflight.sh` for the same
+      # reason as `Check` / `Clippy` / `Format` (#1157): the local gate and the
+      # CI gate are one list, so they cannot drift.
+      - name: cargo test -p docs-lint (via tools/preflight.sh)
+        run: tools/preflight.sh docs
 
   coverage:
-    name: Coverage (full)
+    name: Tests + coverage (full, slow-tests)
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     # Stable, not nightly: `--features ci,slow-tests` has no nightly-only code.
-    # Keeps the instrumented `ci-slow` cache warm. See survival.
+    # Keeps the instrumented `ci-slow` cache warm. See the endpoints job.
     env:
       RUSTUP_TOOLCHAIN: stable
     steps:
@@ -246,16 +376,28 @@ jobs:
           fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}
 
+  # The per-PR run of the base (`--features ci`) test suite AND the patch-coverage
+  # gate — one instrumented build serving both. It used to be paired with a
+  # separate uninstrumented `Test` job (`cargo test --lib` + two explicit
+  # `--test`s on nightly); that job was a strict subset of this one — same
+  # features, and `--tests` ⊇ `--lib` plus both of those integration files — so it
+  # was removed rather than kept paying an 11-min lib compile twice over. The
+  # nightly toolchain is still exercised per-PR by `Check`, `Clippy` and `Format`.
   coverage-pr:
-    name: Coverage (fast, patch)
+    name: Tests + coverage (core)
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    # PRs *and* pushes to `main`. The `push` half matters: the removed `Test` job
+    # had no `if:` and so ran on main pushes, and this is now the only job that
+    # executes the base suite — without `push` a merge commit would run no tests
+    # at all. (It also keeps the `fast` flag fresh on `main`, which
+    # `carryforward: false` in codecov.yml otherwise leaves empty there.)
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     permissions:
       contents: read
       pull-requests: write # for the below-floor nudge comment
     # Stable, not nightly: `--features ci` has no nightly-only code.
     # Keeps the instrumented `ci-cov` cache warm across runs
-    # (stable rustc bumps ~6-weekly vs nightly daily). See the survival job.
+    # (stable rustc bumps ~6-weekly vs nightly daily). See the endpoints job.
     env:
       RUSTUP_TOOLCHAIN: stable
     steps:
@@ -276,12 +418,29 @@ jobs:
 
       - name: Generate fast coverage report
         # Fast tier only: `--features ci` (no `slow-tests`, no `survival`). This
-        # is the per-PR patch gate; the full `ci,slow-tests` run is nightly (the
-        # `coverage` job above). Runs in parallel with the other PR jobs and,
-        # like them, builds with `--profile ci-test` (no fat LTO), so it stays
-        # within the PR wall-clock. `--tests` so the integration tests count
-        # (same rationale as the nightly job).
-        run: cargo llvm-cov --tests --no-fail-fast --no-default-features --features ci --profile ci-test --lcov --output-path lcov.info
+        # both RUNS the base suite and is the per-PR patch gate; the full
+        # `ci,slow-tests` run is nightly (the `coverage` job above) and the
+        # feature-gated endpoints are the `endpoints` job. Builds with
+        # `--profile ci-fast` (no fat LTO *and* no local ThinLTO — ~31% off the
+        # lib compile, #969) to stay within the PR wall-clock; the fast Tier-1/2
+        # fits here tolerate the ThinLTO-off fit slowdown that the nightly
+        # `coverage`/`slow-tests` jobs avoid by staying on `ci-test`. `--tests`
+        # so the integration tests both run and count (same rationale as nightly).
+        #
+        # `--workspace` + package-qualified `ferx-core/ci` (#1114): the `ferx`
+        # CLI moved from `src/bin/run_model.rs` into `crates/ferx-cli`, and its
+        # ~960 lines were measured here before the move. Root-package scoping
+        # (verified: `cargo llvm-cov` does NOT go workspace-wide on its own in a
+        # root-package workspace — an unqualified run emits 102 `SF:` records,
+        # none under `crates/`) would have dropped them from the `fast` report,
+        # lowering project coverage for a pure file move AND failing the patch
+        # gate at 0% for any later crates/-only PR — the same trap #293
+        # documents for the feature-gated surface. `--workspace` keeps the
+        # measurement continuous and runs the members' tests in the SAME
+        # instrumented build, so no third cache key and no second `ferx-core`
+        # compile. The bare `--features ci` has to become `ferx-core/ci` because
+        # `ci` is not a feature of the members.
+        run: cargo llvm-cov --workspace --tests --no-fail-fast --no-default-features --features ferx-core/ci --profile ci-fast --lcov --output-path lcov.info
 
       - name: Upload to Codecov (fast flag)
         uses: codecov/codecov-action@v7
@@ -296,8 +455,9 @@ jobs:
         # coverage on `main` is below the 90% floor the weekly run enforces,
         # post/update ONE sticky PR comment so the author is nudged to cover new
         # lines. Self-resolves once the backfill clears 90%. Never fails the PR
-        # (continue-on-error); skipped on forks (read-only token).
-        if: ${{ github.event.pull_request.head.repo.fork == false }}
+        # (continue-on-error); skipped on forks (read-only token) and on the
+        # `push` half of this job's trigger, where there is no PR to comment on.
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

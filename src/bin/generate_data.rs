@@ -103,10 +103,12 @@ fn simulate_subjects(
                 pk_only_times: Vec::new(),
                 pk_only_covariates: Vec::new(),
                 reset_times: Vec::new(),
+                reset_covariates: Vec::new(),
                 cens: vec![0; obs_times.len()],
                 occasions: Vec::new(),
                 obs_l2: Vec::new(),
                 dose_occasions: Vec::new(),
+                reset_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
             }
@@ -165,6 +167,8 @@ fn build_warfarin_model() -> CompiledModel {
         names: vec!["PROP_ERR".into()],
     };
     let default_params = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![0.134, 8.1, 1.0],
         theta_names: theta_names.clone(),
         theta_lower: vec![0.001, 0.1, 0.01],
@@ -176,6 +180,7 @@ fn build_warfarin_model() -> CompiledModel {
         sigma_fixed: vec![false; 1],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     };
     let pk_param_fn: PkParamFn = Box::new(
         |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
@@ -187,6 +192,7 @@ fn build_warfarin_model() -> CompiledModel {
         },
     );
     CompiledModel {
+        covariate_model: None,
         name: "warfarin".into(),
         pk_model: PkModel::OneCptOral,
         error_model: ErrorModel::Proportional,
@@ -202,6 +208,7 @@ fn build_warfarin_model() -> CompiledModel {
         omega_init_as_sd: vec![false; 3],
         sigma_init_as_sd: vec![false; 1],
         kappa_init_as_sd: Vec::new(),
+        kappa_weights: Vec::new(),
         tv_fn: None,
         pk_indices: vec![PK_IDX_CL, PK_IDX_V, PK_IDX_KA],
 
@@ -233,6 +240,7 @@ fn build_warfarin_model() -> CompiledModel {
         has_conditional_eta_params: false,
         eta_param_info: Vec::new(),
         theta_transform: Vec::new(),
+        theta_eta_linked: Vec::new(),
         n_kappa: 0,
         kappa_names: Vec::new(),
         indiv_param_names: vec!["CL".into(), "V".into(), "KA".into()],
@@ -252,11 +260,14 @@ fn build_warfarin_model() -> CompiledModel {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     }
 }
 
 fn build_warfarin_true_params() -> ModelParameters {
     ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![0.134, 8.1, 1.0],
         theta_names: vec!["TVCL".into(), "TVV".into(), "TVKA".into()],
         theta_lower: vec![0.001, 0.1, 0.01],
@@ -274,6 +285,7 @@ fn build_warfarin_true_params() -> ModelParameters {
         sigma_fixed: vec![false; 1],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     }
 }
 
@@ -294,6 +306,8 @@ fn generate_two_cpt_iv() {
         names: vec!["PROP_ERR".into()],
     };
     let params = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0, 15.0, 3.0, 30.0],
         theta_names: theta_names.clone(),
         theta_lower: vec![0.1, 1.0, 0.01, 1.0],
@@ -305,6 +319,7 @@ fn generate_two_cpt_iv() {
         sigma_fixed: vec![false; 1],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     };
     let pk_param_fn: PkParamFn = Box::new(
         |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
@@ -317,6 +332,7 @@ fn generate_two_cpt_iv() {
         },
     );
     let model = CompiledModel {
+        covariate_model: None,
         name: "two_cpt_iv".into(),
         pk_model: PkModel::TwoCptIv,
         error_model: ErrorModel::Proportional,
@@ -332,6 +348,7 @@ fn generate_two_cpt_iv() {
         omega_init_as_sd: vec![false; 4],
         sigma_init_as_sd: vec![false; 1],
         kappa_init_as_sd: Vec::new(),
+        kappa_weights: Vec::new(),
         tv_fn: None,
         pk_indices: vec![PK_IDX_CL, PK_IDX_V, PK_IDX_Q, PK_IDX_V2],
 
@@ -362,6 +379,7 @@ fn generate_two_cpt_iv() {
         has_conditional_eta_params: false,
         eta_param_info: Vec::new(),
         theta_transform: Vec::new(),
+        theta_eta_linked: Vec::new(),
         n_kappa: 0,
         kappa_names: Vec::new(),
         indiv_param_names: vec!["CL".into(), "V".into(), "Q".into(), "V2".into()],
@@ -381,6 +399,7 @@ fn generate_two_cpt_iv() {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     };
     let obs_times = vec![0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0, 48.0, 72.0];
     let subjects = simulate_subjects(&model, &params, 15, 100.0, 1, &obs_times, 123, None);
@@ -416,6 +435,8 @@ fn generate_two_cpt_oral_cov() {
         names: vec!["PROP_ERR".into()],
     };
     let params = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0, 50.0, 10.0, 100.0, 1.2, 0.75, 0.50],
         theta_names: theta_names.clone(),
         theta_lower: vec![0.1, 1.0, 0.1, 1.0, 0.01, 0.01, 0.01],
@@ -427,6 +448,7 @@ fn generate_two_cpt_oral_cov() {
         sigma_fixed: vec![false; 1],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     };
     let pk_param_fn: PkParamFn = Box::new(
         |theta: &[f64], eta: &[f64], cov: &HashMap<String, f64>, _t: f64| {
@@ -445,6 +467,7 @@ fn generate_two_cpt_oral_cov() {
         },
     );
     let model = CompiledModel {
+        covariate_model: None,
         name: "two_cpt_oral_cov".into(),
         pk_model: PkModel::TwoCptOral,
         error_model: ErrorModel::Proportional,
@@ -460,6 +483,7 @@ fn generate_two_cpt_oral_cov() {
         omega_init_as_sd: vec![false; 5],
         sigma_init_as_sd: vec![false; 1],
         kappa_init_as_sd: Vec::new(),
+        kappa_weights: Vec::new(),
         tv_fn: None,
         pk_indices: vec![PK_IDX_CL, PK_IDX_V, PK_IDX_Q, PK_IDX_V2, PK_IDX_KA],
 
@@ -490,6 +514,7 @@ fn generate_two_cpt_oral_cov() {
         has_conditional_eta_params: false,
         eta_param_info: Vec::new(),
         theta_transform: Vec::new(),
+        theta_eta_linked: Vec::new(),
         n_kappa: 0,
         kappa_names: Vec::new(),
         indiv_param_names: vec![
@@ -515,6 +540,7 @@ fn generate_two_cpt_oral_cov() {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     };
 
     // Generate random covariates (matching Julia seed 456)
@@ -549,10 +575,12 @@ fn generate_two_cpt_oral_cov() {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0; obs_times.len()],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         })
@@ -602,6 +630,8 @@ fn generate_mm_oral() {
         names: vec!["PROP_ERR".into()],
     };
     let params = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![4.0, 6.0, 12.0, 1.5],
         theta_names: theta_names.clone(),
         theta_lower: vec![0.1, 0.1, 1.0, 0.05],
@@ -613,6 +643,7 @@ fn generate_mm_oral() {
         sigma_fixed: vec![false; 1],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     };
     let pk_param_fn: PkParamFn = Box::new(
         |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
@@ -632,6 +663,7 @@ fn generate_mm_oral() {
             du[1] = ka * depot / v - vmax * central / (km + central);
         });
     let ode_spec = ferx_core::ode::OdeSpec {
+        chz_state_slots: Vec::new(),
         rhs: ode_rhs,
         n_states: 2,
         state_names: vec!["depot".into(), "central".into()],
@@ -646,6 +678,7 @@ fn generate_mm_oral() {
         dose_attr_map: Default::default(),
     };
     let model = CompiledModel {
+        covariate_model: None,
         name: "mm_oral".into(),
         pk_model: PkModel::OneCptOral,
         error_model: ErrorModel::Proportional,
@@ -661,6 +694,7 @@ fn generate_mm_oral() {
         omega_init_as_sd: vec![false; 2],
         sigma_init_as_sd: vec![false; 1],
         kappa_init_as_sd: Vec::new(),
+        kappa_weights: Vec::new(),
         tv_fn: None,
         pk_indices: vec![0, 2],
 
@@ -688,6 +722,7 @@ fn generate_mm_oral() {
         has_conditional_eta_params: false,
         eta_param_info: Vec::new(),
         theta_transform: Vec::new(),
+        theta_eta_linked: Vec::new(),
         n_kappa: 0,
         kappa_names: Vec::new(),
         indiv_param_names: vec!["VMAX".into(), "KM".into(), "V".into(), "KA".into()],
@@ -707,6 +742,7 @@ fn generate_mm_oral() {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     };
     let obs_times = vec![
         0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 24.0, 36.0, 48.0,

@@ -1,3 +1,7 @@
+---
+pagetitle: "Michaelis-Menten ODE model example"
+---
+
 # ODE Model (Michaelis-Menten)
 
 This example demonstrates a one-compartment oral model with saturable (Michaelis-Menten) elimination, solved using the ODE integrator.

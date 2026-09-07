@@ -1,0 +1,49 @@
+# `SS=1` dose on an `[odes]` RHS that reads the `TAD` built-in (#1139, batch-T step T2).
+#
+# The ferx twin of `nonmem_anchor/ss_tad.ctl` and `train_tad.ctl` — the *same* model file
+# runs against both datasets, which is the whole point: `ss_tad.csv` carries a single
+# `SS=1, II=12` record at t = 480, `train_tad.csv` an explicit 41-dose train at
+# 0, 12, …, 480. Same observations (482 / 485 / 488 / 491), so the steady-state run-in and
+# an explicit run-in must land on the same curve.
+#
+# NONMEM has **no `TAD` built-in in `$DES`**, so the control streams construct the
+# cycle-local clock by hand as `TADX = MOD(T + 120.0, 12.0)`. That is exactly `TAD` for
+# this dataset: the pulses sit at multiples of 12 and 120 is a multiple of 12, so
+# `MOD(T + 120, 12)` is the time since the most recent pulse at every observation. It
+# raises NONMEM's `WARNING 68` (`MOD` outside a simulation block, which matters only when
+# the value feeds a gradient) — inert here at `MAXEVAL=0` with `$OMEGA 0 FIX`, and the
+# construction is certified twice over: NONMEM's own SS run reproduces NONMEM's own train
+# to 1.28e-9, and both reproduce a closed form computed outside either engine to 7.7e-9.
+#
+# `$THETA` all FIX and no omega (NONMEM `$OMEGA 0 FIX`), so both sides evaluate at eta = 0
+# and `IPRED == PRED`. `obs_scale = V` is NONMEM's `S1 = V`. `[fit_options]` pins the
+# solver at reltol 1e-9 (NONMEM `TOL=9`); at ferx's defaults the comparison is good only to
+# ~1e-5, far looser than this anchor resolves.
+
+[parameters]
+  theta TVCL(1.0, FIX)
+  theta TVV(20.0, FIX)
+
+  sigma PROP ~ 0.01                # variance; NONMEM `$SIGMA 0.01`
+
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central * (1.0 + 0.03*TAD)
+
+[scaling]
+  obs_scale = V                    # the state is an AMOUNT; NONMEM's `$ERROR` divides by V
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[fit_options]
+  method     = focei
+  maxiter    = 0
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11

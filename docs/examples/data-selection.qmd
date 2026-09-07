@@ -1,3 +1,7 @@
+---
+pagetitle: "Data selection example (IGNORE and ACCEPT)"
+---
+
 # Data Selection (IGNORE / ACCEPT)
 
 This example shows the `[data_selection]` block, which filters dataset rows at read time without modifying the CSV. The complete model file is [`examples/warfarin_data_selection.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/warfarin_data_selection.ferx).

@@ -1,0 +1,61 @@
+# ferx side of the #1186 break-time-collision anchor.
+#
+# Mirrors nonmem_anchor/break_collision.ctl (ADVAN13 TOL=9, MAXEVAL=0, every THETA
+# FIX'd). The NONMEM stream needs an inert carrier compartment (CMT 1, F1=0) to
+# capture PODO/TDOS for its hand-written `RIN = PODO*KA*EXP(-KA*(T-ONSET))`; ferx
+# expresses the same object natively as `first_order(ka=KA, lag=LAGR)` into the
+# depot, so its compartments are one fewer and the datasets are keyed differently:
+#
+#   NONMEM (break_collision.csv)   CMT 1 = carrier, 2 = depot, 3 = central
+#   ferx   (break_collision_ferx.csv)      CMT 1 = depot,   2 = central
+#
+# The geometry under test is a float coincidence, not a modelling feature. The route
+# onset is `TDOS + ALAG1 + LAGR = (0 + 0.3) + 7.9`, which in double precision is
+# 8.200000000000001 — 1.78e-15 past the t = 8.2 central dose's own break, i.e. past
+# the timeline's 1e-15 dedup and inside the dose-arrival match. Every engine that
+# resolved its events by rescanning the timeline applied that central dose twice
+# (244.04 against a closed-form 144.04). NONMEM is event-typed and applies each dose
+# record once regardless of the coincidence, which is what makes it an oracle here.
+#
+# `y = central` (no /V): NONMEM's `$ERROR IPRED = A(3)` is the compartment AMOUNT, so
+# the two readouts are the same object and the .tab PRED can be compared directly.
+#
+#   cargo run --release -p ferx-cli -- nonmem_anchor/break_collision_fit.ferx \
+#     --data nonmem_anchor/break_collision_ferx.csv
+
+[parameters]
+  theta TVCL(1.0,   0.01, 100.0)
+  theta TVV(10.0,    0.1, 500.0)
+  theta TVKA(1.0,   0.01,  50.0)
+  theta TVLAGC(0.3,  0.0,  12.0)   # ALAG1 — the depot's compartment lag
+  theta TVLAGR(7.9,  0.0,  24.0)   # the first_order route's own lag
+
+  omega ETA_CL ~ 0.09
+
+  sigma PROP_ERR ~ 0.15 (sd)
+
+[individual_parameters]
+  CL    = TVCL * exp(ETA_CL)
+  V     = TVV
+  KA    = TVKA
+  ALAG1 = TVLAGC
+  LAGR  = TVLAGR
+
+[structural_model]
+  ode(states=[depot, central])
+
+[odes]
+  d/dt(depot)   = first_order(ka=KA, lag=LAGR) - KA*depot
+  d/dt(central) = KA*depot - CL/V*central
+
+[scaling]
+  y = central
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 0
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11

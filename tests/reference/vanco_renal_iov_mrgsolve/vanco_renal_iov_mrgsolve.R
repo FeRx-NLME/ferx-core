@@ -36,16 +36,28 @@
 # RK45 does.
 #
 # --- ferx end-of-interval / per-segment convention ----------------------------
-# ferx uses the end-of-interval (current-record) parameter convention: the segment
-# ENDING at a record is governed by that record's PK. A decision at t_g with a 1-h
-# infusion splits the day into two segments:
-#   * the infusion window (t_g, t_g + 1] carries LOCF PK forward from the obs at t_g,
-#     which belongs to occasion g -> (CRCL_g, kappa_g);
-#   * the decay window (t_g + 1, t_{g+1}] ends at the next obs record (t_{g+1}), which
-#     belongs to occasion g+1 -> (CRCL_{g+1}, kappa_{g+1}) (the end-of-interval value).
-# So each day's infusion runs on THIS occasion's (CRCL, kappa) and the between-dose
-# decay runs on the NEXT occasion's (CRCL, kappa). The R loop below integrates each
-# day as those two windows with the matching composed piecewise-constant CL.
+# ferx uses the end-of-interval convention: a segment is governed by the DATA
+# RECORD that terminates it. A decision at t_g with a 1-h infusion splits the day
+# into two integration segments, but the infusion end (t_g + 1) is a mesh break,
+# NOT a data record, so it triggers no $PK call:
+#   * the infusion window (t_g, t_g + 1] is terminated by a non-record, so it is
+#     governed by the next record ahead — the obs at t_{g+1}, which belongs to
+#     occasion g+1 -> (CRCL_{g+1}, kappa_{g+1});
+#   * the decay window (t_g + 1, t_{g+1}] ends at that same obs record -> the same
+#     (CRCL_{g+1}, kappa_{g+1}).
+# So the WHOLE day (t_g, t_{g+1}] runs on the NEXT occasion's (CRCL, kappa). The R
+# loop below still integrates it as two windows — the split is needed for the
+# infusion *rate*, not for CL — feeding both the same composed CL.
+#
+# --- why this changed (#1073) -------------------------------------------------
+# This kit used to run the infusion sub-window on (CRCL_g, kappa_g), reproducing
+# ferx's pre-#1073 LOCF carry, which stretched a dose record's snapshot across the
+# infusion end. That was a defect — NONMEM runs $PK at data records only, and an
+# infusion end is not one — anchored against NONMEM 7.6.0 at 14.9 OFV
+# (`nonmem_anchor/tvcov_lag_saltation*`). Because this reference had been written
+# to mirror ferx's behaviour rather than NONMEM's rule, the two agreed BY
+# CONSTRUCTION and the anchor could not see the defect. `expected.md` and the
+# anchor's frozen ladder were regenerated from the corrected convention.
 #
 # Regenerate:  Rscript vanco_renal_iov_mrgsolve.R   (run from this directory)
 # Requires:    mrgsolve (tested with 1.7.2) + a C/C++ toolchain (JIT compile).
@@ -95,8 +107,9 @@ stopifnot(length(kappa) == n_dec)
 eta_cl <- -0.000001382570411
 
 # Composed per-occasion clearance CL_g = TVCL * (CRCL_g/100) * exp(eta + kappa_g) —
-# the piecewise-constant CL fed to mrgsolve. cl_at[g] governs day g's infusion window
-# and, at index g+1, the preceding day's decay window (end-of-interval; see header).
+# the piecewise-constant CL fed to mrgsolve. cl_at[g+1] governs the WHOLE of day g
+# — both its infusion window and its decay window — because the infusion end is not
+# a data record (#1073; end-of-interval, see header).
 cl_at <- TVCL * (crcl / 100) * exp(eta_cl + kappa)
 
 # ferx's REALIZED dose ladder (mg/day) from the seed-20260708 reactive run. The
@@ -125,12 +138,14 @@ for (k in seq_along(dec_t)) {
                           kappa = kappa[k], cl = cl_at[k], trough = trough,
                           dose = dose_at[k])
   # Advance state across this day as TWO segments (matches ferx's per-segment PK):
-  #   1. infusion window [t0, t0 + tinf] on THIS occasion's composed CL (cl_at[k]),
-  #   2. decay window    [t0 + tinf, t0 + 24] on the NEXT occasion's composed CL
-  #      (cl_at[k+1], end-of-interval). The last decision has no following window.
+  #   1. infusion window [t0, t0 + tinf] and
+  #   2. decay window    [t0 + tinf, t0 + 24]
+  # both on the NEXT occasion's composed CL (cl_at[k+1]): the infusion end is not a
+  # data record (#1073), so the obs at t_{g+1} governs the whole day. The split
+  # exists for the infusion RATE only. The last decision has no following window.
   if (k < length(dec_t)) {
     seg1 <- as.data.frame(mod |>
-      param(CL = cl_at[k], V = V) |>
+      param(CL = cl_at[k + 1], V = V) |>
       init(CENT = st_cent) |>
       ev(amt = dose_at[k], rate = dose_at[k] / tinf, cmt = 1) |>
       mrgsim(start = 0, end = tinf, delta = tinf))

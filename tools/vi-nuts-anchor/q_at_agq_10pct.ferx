@@ -1,0 +1,34 @@
+# Anchor C, 10% arm: the variational q at the AGQ estimate of warfarin_10pct.csv, every
+# population parameter FIXed. Companion to q_at_agq.ferx, which carries the ~1% estimate.
+#
+# The 10% arm exists because ~1% proportional error is not a realistic PK residual and is the one
+# regime where VI misses sigma (+5.5%, VI_VALIDATION.md 4.15). Values below are the AGQ(9) fit of
+# warfarin_10pct.csv; regenerate them if that dataset is ever regenerated.
+#
+# Both sides of the comparison must sit at the SAME (theta, Omega, sigma) or the difference
+# between them mixes the approximation with a parameter difference. 256 draws and a high
+# iteration cap because the point is to measure how good q is, not where the optimizer stopped:
+# AGQ's -2 log L on this arm is 73.575.
+[parameters]
+  theta TVCL(0.138429, 0.001, 10.0) FIX
+  theta TVV(8.210164, 0.1, 500.0) FIX
+  theta TVKA(0.726453, 0.01, 50.0) FIX
+  omega ETA_CL ~ 0.027026 FIX
+  omega ETA_V  ~ 0.017437 FIX
+  omega ETA_KA ~ 0.331220 FIX
+  sigma PROP_ERR ~ 0.103997 (sd) FIX
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = vi
+  vi_family = full_rank
+  vi_mc_samples = 256
+  vi_omega_update = closed_form
+  vi_final_ofv = laplace
+  vi_iters = 60000

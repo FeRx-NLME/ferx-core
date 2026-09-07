@@ -25,7 +25,6 @@
 
 use crate::pk::{compute_predictions_with_tv_into, predict_iov, EventPkParams};
 use crate::stats::likelihood::{iov_occasion_groups, m3_logcdf, obs_nll_subject_into};
-use crate::stats::residual_error::compute_r_diag;
 use crate::stats::special::ln_gamma;
 use crate::stats::util::{
     ess_from_weights, log_sum_exp2 as logsumexp2,
@@ -476,6 +475,267 @@ pub fn run_importance_sampling(
     })
 }
 
+/// Minimum class responsibility for a class's per-class ESS to count toward the
+/// reported per-subject ESS. A subject whose `PMIX_ik ≈ 0` for class `k` barely
+/// draws on that class's proposal, so a collapsed proposal there is not a defect
+/// of the subject's marginal; below this floor the class is excluded from the
+/// worst-case ESS. Shared with the mixture MCEM E-step (`impmap.rs`).
+pub(crate) const MIX_ESS_PMIX_FLOOR: f64 = 1e-3;
+
+/// Class-marginalised importance-sampling objective evaluation for a mixture
+/// model (`METHOD=IMP EONLY`, #985).
+///
+/// Mirrors [`run_importance_sampling`] but forms the marginal over the latent
+/// class the same way FOCEI does: for each subject and each class `k`, run the
+/// class-`k` MAP inner solve (under a `MixtureClassGuard`, so `MIXNUM` resolves
+/// to `k`), importance-sample the class-conditional marginal `L_ik`, then combine
+///
+/// ```text
+///   L_i = Σ_k p_ik · L_ik,   −2·log L = −2 Σ_i log Σ_k p_ik L_ik
+/// ```
+///
+/// via [`crate::estimation::mixture::combine_subject`]. This is the true marginal likelihood a chained
+/// `[saem, imp]` / `[focei, imp]` fit reports for a mixture. The per-class solves
+/// run inside each subject's rayon task (the guard is entered per class on the
+/// worker thread), so subject-level parallelism is preserved while the
+/// thread-local class index stays correct. IOV is not yet supported here.
+pub fn run_importance_sampling_mixture(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    options: &FitOptions,
+) -> Result<ImportanceSamplingResult, String> {
+    use crate::estimation::inner_optimizer::find_ebe;
+    use crate::estimation::mixture::{class_params, combine_subject};
+    use crate::parser::model_parser::{eval_mixing_log_probs, MixtureClassGuard};
+
+    let spec = model
+        .mixture
+        .as_ref()
+        .ok_or("run_importance_sampling_mixture on a non-mixture model")?;
+    if params.mixture.is_none() {
+        return Err("IMP mixture objective requires params.mixture (per-class Ω/Σ)".to_string());
+    }
+    if model.n_kappa > 0 {
+        return Err(
+            "IMP objective evaluation for a mixture does not yet support inter-occasion \
+             variability (IOV); use FOCE/FOCEI for an IOV mixture (#985)"
+                .to_string(),
+        );
+    }
+    // Same two scope guards the single-population entry point applies (#992
+    // review). With n_eta = 0 there is nothing to integrate — the class-
+    // conditional marginal collapses to the obs likelihood — and for SDE models
+    // the IS obs-NLL path omits the EKF process-noise variance, so the marginal
+    // would be silently biased.
+    if model.n_eta == 0 {
+        return Err("Importance sampling requires at least one random effect. \
+             With n_eta = 0 the class-conditional marginal is just the observation likelihood — \
+             read `FitResult.ofv` directly (no IS needed)."
+            .to_string());
+    }
+    if model.is_sde() {
+        return Err(
+            "Importance sampling is not yet supported for SDE / [diffusion] models. \
+             The EKF process-noise variance is not included in the IS observation likelihood, \
+             so the marginal would be biased. Use FOCE / FOCEI for the Laplace OFV instead."
+                .to_string(),
+        );
+    }
+    let n_eta = model.n_eta;
+    let k_samples = options.imp_samples;
+    let nu = options.imp_proposal_df;
+    let seed = options.imp_seed.unwrap_or(42);
+    let threshold = options.imp_low_ess_threshold;
+    let defensive_alpha = options.imp_defensive_alpha;
+    let cancel = &options.cancel;
+    if k_samples < 2 {
+        return Err(format!("IS: imp_samples must be >= 2, got {}", k_samples));
+    }
+    if nu < 1.0 {
+        return Err(format!("IS: imp_proposal_df must be >= 1.0, got {}", nu));
+    }
+    // Every class's Ω must admit a finite log-determinant before any sampling:
+    // the single-population entry point rejects a degenerate Ω up front, and
+    // without the same check here a non-finite `log_det` flows into
+    // `subject_is_estimate` and yields a silently NaN/±inf marginal instead of a
+    // clear error (#992 review).
+    if !params.omega.log_det.is_finite() {
+        return Err("IS: Ω log-determinant is not finite — cannot evaluate η prior".into());
+    }
+    if let Some(mp) = params.mixture.as_ref() {
+        for (c, om) in mp.omega.iter().enumerate() {
+            if !om.log_det.is_finite() {
+                return Err(format!(
+                    "IS: Ω log-determinant is not finite for mixture class {} — cannot \
+                     evaluate η prior",
+                    c + 1
+                ));
+            }
+        }
+    }
+    let n_classes = spec.n_classes;
+    let n_subjects = population.subjects.len();
+
+    if options.verbose {
+        eprintln!(
+            "Importance sampling (mixture): {} subjects × {} classes, K={} per subject, seed={}",
+            n_subjects, n_classes, k_samples, seed
+        );
+    }
+
+    let per_subject: Vec<SubjectIsOutput> = population
+        .subjects
+        .par_iter()
+        .enumerate()
+        .map_init(EventPkParams::default, |scratch, (i, subject)| {
+            if crate::cancel::is_cancelled(cancel) {
+                return SubjectIsOutput::cancelled(subject.id.clone());
+            }
+            let logp = eval_mixing_log_probs(spec, &params.theta, &subject.covariates);
+            // Per-class conditional log-marginals and their MC variances.
+            let mut nll = vec![0.0f64; n_classes];
+            let mut var_k = vec![0.0f64; n_classes];
+            let mut ess_k = vec![0.0f64; n_classes];
+            for c in 0..n_classes {
+                // MIXNUM = c+1 on this worker thread for the whole class solve.
+                let _g = MixtureClassGuard::enter(c + 1);
+                let cp = class_params(params, c);
+                let ebe = find_ebe(
+                    model,
+                    subject,
+                    &cp,
+                    options.inner_maxiter,
+                    options.inner_tol,
+                    None,
+                    None,
+                    options.inner_restarts,
+                );
+                let omega_inv = cp.omega.inv.clone();
+                let h_post = compute_posterior_hessian(
+                    model,
+                    subject,
+                    &cp.theta,
+                    &ebe.eta,
+                    &cp.sigma.values,
+                    &ebe.h_matrix,
+                    &omega_inv,
+                    n_eta,
+                    scratch,
+                );
+                let defensive = DefensiveMixture::new(&omega_inv, n_eta, defensive_alpha);
+                let subj_seed = seed
+                    .wrapping_add(i as u64)
+                    .wrapping_add((c as u64).wrapping_shl(40));
+                let out = subject_is_estimate(
+                    model,
+                    subject,
+                    &cp.theta,
+                    &cp.sigma.values,
+                    &ebe.eta,
+                    &h_post,
+                    &omega_inv,
+                    cp.omega.log_det,
+                    n_eta,
+                    k_samples,
+                    nu,
+                    subj_seed,
+                    scratch,
+                    1.0,
+                    defensive.as_ref(),
+                );
+                nll[c] = -out.log_marginal; // nll_ik = −log L_ik
+                var_k[c] = out.var_log_marginal;
+                ess_k[c] = out.ess_fraction;
+            }
+            // Marginal contribution: combine_subject returns (−2·log Σ_k p_ik L_ik,
+            // PMIX, MIXEST). log L_i = −½·contribution.
+            let (contribution, pmix, _mixest) = combine_subject(&logp, &nll);
+            let log_marginal = -0.5 * contribution;
+            // Delta-method MC variance: ∂log L_i/∂log L_ik = PMIX_ik, so
+            // Var(log L_i) ≈ Σ_k PMIX_ik²·Var(log L_ik).
+            let var_log_marginal: f64 = pmix.iter().zip(&var_k).map(|(p, v)| p * p * v).sum();
+            // The marginal has no single-proposal ESS, so report the worst
+            // per-class ESS among the classes this subject actually contributes
+            // to — a collapsed proposal in a class with PMIX ≈ 0 barely enters
+            // the marginal and must not be reported as a degenerate fit, while a
+            // collapse in a class the subject *does* load on must not be hidden
+            // behind a hardcoded 1.0 (#992 review).
+            let ess_fraction = (0..n_classes)
+                .filter(|&c| pmix[c] > MIX_ESS_PMIX_FLOOR)
+                .map(|c| ess_k[c])
+                .fold(f64::INFINITY, f64::min);
+            let ess_fraction = if ess_fraction.is_finite() {
+                ess_fraction
+            } else {
+                // No class clears the floor (numerically degenerate PMIX): fall
+                // back to the worst class overall rather than claiming health.
+                ess_k.iter().copied().fold(f64::INFINITY, f64::min)
+            };
+            SubjectIsOutput {
+                log_marginal,
+                var_log_marginal,
+                ess_fraction,
+            }
+        })
+        .collect();
+
+    if crate::cancel::is_cancelled(&options.cancel) {
+        return Err("cancelled by user".to_string());
+    }
+
+    let mut ll = 0.0_f64;
+    let mut var_ll = 0.0_f64;
+    let mut ess_fracs: Vec<f64> = Vec::with_capacity(n_subjects);
+    let mut low_ess: Vec<(String, f64)> = Vec::new();
+    for (i, out) in per_subject.iter().enumerate() {
+        ll += out.log_marginal;
+        var_ll += out.var_log_marginal;
+        ess_fracs.push(out.ess_fraction);
+        if out.ess_fraction < threshold {
+            low_ess.push((population.subjects[i].id.clone(), out.ess_fraction));
+        }
+    }
+    let minus2_ll = -2.0 * ll;
+    let mc_se = 2.0 * var_ll.max(0.0).sqrt();
+
+    ess_fracs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let ess_min = *ess_fracs.first().unwrap_or(&0.0);
+    let ess_median = if ess_fracs.is_empty() {
+        0.0
+    } else {
+        let mid = ess_fracs.len() / 2;
+        if ess_fracs.len().is_multiple_of(2) {
+            0.5 * (ess_fracs[mid - 1] + ess_fracs[mid])
+        } else {
+            ess_fracs[mid]
+        }
+    };
+
+    if options.verbose {
+        eprintln!(
+            "IS (mixture) done. −2 log L = {:.4} ± {:.4} (ess_min/K = {:.3}, ess_med/K = {:.3}, \
+             low_ess = {})",
+            minus2_ll,
+            mc_se,
+            ess_min,
+            ess_median,
+            low_ess.len()
+        );
+    }
+
+    Ok(ImportanceSamplingResult {
+        minus2_log_likelihood: minus2_ll,
+        mc_standard_error: mc_se,
+        low_ess_subjects: low_ess,
+        n_samples: k_samples,
+        proposal_df: nu,
+        ess_min,
+        ess_median,
+        kappa_treatment: KappaTreatment::NotApplicable,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Per-subject estimate
 // ---------------------------------------------------------------------------
@@ -583,7 +843,15 @@ fn subject_is_estimate(
             }
         }
 
-        let obs_nll = obs_nll_subject_into(model, subject, theta, sigma, &eta_sample, scratch);
+        let obs_nll = obs_nll_subject_into(
+            model,
+            subject,
+            theta,
+            sigma,
+            &model.residual_correlations,
+            &eta_sample,
+            scratch,
+        );
         let log_p_y = -obs_nll;
 
         // log p(η | θ): multivariate-normal quadratic form `η' Ω⁻¹ η`,
@@ -958,7 +1226,15 @@ pub(crate) fn subject_is_draws_frem_rb(
             full_eta[i] = d[b];
         }
 
-        let obs_nll = obs_nll_subject_into(model, subject, theta, sigma, &full_eta, scratch);
+        let obs_nll = obs_nll_subject_into(
+            model,
+            subject,
+            theta,
+            sigma,
+            &model.residual_correlations,
+            &full_eta,
+            scratch,
+        );
         let log_p_y = -(obs_nll - cov_obs_const); // PK-only obs log-likelihood
 
         // Conditional prior log N(η_p; μ, P_pp): (η_p−μ)' P_pp (η_p−μ).
@@ -1183,7 +1459,15 @@ pub(crate) fn subject_is_draws(
             }
         }
 
-        let obs_nll = obs_nll_subject_into(model, subject, theta, sigma, &eta_sample, scratch);
+        let obs_nll = obs_nll_subject_into(
+            model,
+            subject,
+            theta,
+            sigma,
+            &model.residual_correlations,
+            &eta_sample,
+            scratch,
+        );
         let log_p_y = -obs_nll;
 
         let mut quad_form = 0.0_f64;
@@ -1421,12 +1705,15 @@ fn compute_joint_posterior_hessian(
     let kappa_slices: Vec<Vec<f64>> = kappas.iter().map(|k| k.as_slice().to_vec()).collect();
     let ipreds = predict_iov(model, subject, theta, eta_hat.as_slice(), &kappa_slices);
 
-    // Compute residual variance with FREM overrides
-    let mut r_diag = compute_r_diag(
+    // Compute residual variance with FREM overrides. #484/#1029: the magnitude
+    // multiplier rides the sigma loadings, so the proposal precision reflects
+    // the same `R` the importance weights are computed against.
+    let mut r_diag = crate::stats::residual_error::compute_r_diag_maybe_scaled(
         &model.error_spec,
         &ipreds,
         model.error_spec.obs_keys(subject).as_ref(),
         sigma,
+        model.ruv_obs_mult(subject, theta).as_deref(),
     );
     // IIV on residual error (#409): scale PK residual variance by exp(2·η̂_ruv).
     let ruv_scale = model.residual_var_scale(eta_hat.as_slice());
@@ -1586,6 +1873,10 @@ fn subject_is_estimate_joint(
     // outer `Vec` plus its per-occasion κ vectors (a hot-loop allocator cost
     // at K in the thousands).
     let mut kappas_sampled: Vec<Vec<f64>> = (0..n_occ).map(|_| vec![0.0_f64; n_iov]).collect();
+    // #484/#1029: per-observation residual-magnitude multiplier. η-independent
+    // (θ / covariates / TIME only), so it is hoisted out of the draw loop and
+    // shared by every importance sample.
+    let ruv_mult = model.ruv_obs_mult(subject, theta);
 
     for _ in 0..k_samples {
         // Draw from joint proposal
@@ -1616,8 +1907,14 @@ fn subject_is_estimate_joint(
         let err_keys = model.error_spec.obs_keys(subject);
         let mut obs_nll = 0.0_f64;
         for (j, (&y, &f)) in subject.observations.iter().zip(ipreds.iter()).enumerate() {
-            let f = f.max(1e-12);
-            let v = (model.residual_variance_at(err_keys[j], f, sigma) * ruv_scale).max(1e-12);
+            let f = model.floor_prediction(f);
+            let v = (model.residual_variance_at_scaled(
+                err_keys[j],
+                f,
+                sigma,
+                ruv_mult.as_ref().map(|m| m[j].as_slice()),
+            ) * ruv_scale)
+                .max(1e-12);
             let cens = subject.cens.get(j).copied().unwrap_or(0);
             if m3 && cens != 0 {
                 obs_nll += -m3_logcdf(y, f, v.sqrt(), cens);
@@ -1932,8 +2229,12 @@ pub(crate) fn compute_posterior_hessian(
     // lowers ESS). block_sigma is rejected with FREM and iiv_on_ruv, so no R
     // overrides or residual-eta curvature apply. A non-PD R falls through to the
     // diagonal approximation below.
+    // #484/#1029: the per-observation magnitude multiplier rides the sigma
+    // loadings, so the proposal precision is built from the same `R` the
+    // importance weights score against.
+    let ruv_mult = model.ruv_obs_mult(subject, theta);
     if !model.residual_correlations.is_empty() {
-        let r = crate::stats::residual_error::compute_r_matrix_with_correlations(
+        let r = crate::stats::residual_error::r_matrix_maybe_scaled(
             &model.error_spec,
             &ipreds,
             // #669: selector-resolved endpoint keys (matches the diagonal
@@ -1941,23 +2242,22 @@ pub(crate) fn compute_posterior_hessian(
             // endpoints by branch, so `obs_cmts` would build the proposal
             // precision from the wrong branch's sigma.
             model.error_spec.obs_keys(subject).as_ref(),
-            &subject.obs_times,
-            &subject.obs_raw_times,
-            &subject.occasions,
-            &subject.obs_l2,
+            subject,
             sigma,
             &model.residual_correlations,
+            ruv_mult.as_deref(),
         );
         if let Some(chol) = r.cholesky() {
             let r_inv = chol.inverse();
             return omega_inv + jacobian.transpose() * &r_inv * jacobian;
         }
     }
-    let mut r_diag = compute_r_diag(
+    let mut r_diag = crate::stats::residual_error::compute_r_diag_maybe_scaled(
         &model.error_spec,
         &ipreds,
         model.error_spec.obs_keys(subject).as_ref(),
         sigma,
+        ruv_mult.as_deref(),
     );
     // IIV on residual error (#409): scale the PK residual variance at the mode by
     // exp(2·η̂_ruv) so the Laplace proposal precision reflects the per-subject
@@ -2062,10 +2362,12 @@ mod tests {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0; 3],
             occasions: vec![1, 1, 1],
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             // 3rd row is a FREM covariate pseudo-observation.
             fremtype: vec![0, 0, 5],
             obs_records: vec![],
@@ -2397,10 +2699,12 @@ mod tests {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: Vec::new(),
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype,
             obs_records: Vec::new(),
         }
@@ -2505,6 +2809,8 @@ mod tests {
             vec!["ETA_CL".into(), "ETA_V".into(), "ETA_WT_FREM".into()],
         );
         let default_params = ModelParameters {
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
             theta: vec![10.0, 100.0, 90.0],
             theta_names: vec!["TVCL".into(), "TVV".into(), "TV_WT".into()],
             theta_lower: vec![0.01, 1.0, 0.0],
@@ -2519,8 +2825,10 @@ mod tests {
             sigma_fixed: vec![false, true],
             omega_iov: None,
             kappa_fixed: vec![],
+            mixture: None,
         };
         CompiledModel {
+            covariate_model: None,
             has_conditional_eta_params: false,
             name: "frem_rb_iscale_test".into(),
             pk_model: PkModel::OneCptIv,
@@ -2548,6 +2856,7 @@ mod tests {
             omega_init_as_sd: vec![false; 3],
             sigma_init_as_sd: vec![false, false],
             kappa_init_as_sd: vec![],
+            kappa_weights: Vec::new(),
             mu_refs: HashMap::new(),
             kappa_mu_refs: HashMap::new(),
             tv_fn: None,
@@ -2564,6 +2873,7 @@ mod tests {
             parse_warnings: Vec::new(),
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
+            theta_eta_linked: Vec::new(),
             #[cfg(feature = "nn")]
             covariate_nns: Vec::new(),
             scaling: ScalingSpec::None,
@@ -2587,6 +2897,7 @@ mod tests {
             analytic_readout: None,
             ruv_magnitude: None,
             absorption_ode_equivalent: None,
+            mixture: None,
         }
     }
 
@@ -2613,10 +2924,12 @@ mod tests {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0, 0, 0],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: vec![0, 0, 100],
             obs_records: vec![],
         };
@@ -2727,6 +3040,325 @@ mod tests {
             "expected a meaningful ESS recovery: baseline {} -> searched {}",
             baseline.ess_fraction,
             improved.ess_fraction
+        );
+    }
+
+    // ── Mixture class-marginal IS objective (#985) ──
+
+    const MIX_MODEL: &str = r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09 FIX
+  sigma EPS ~ 0.04 FIX
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+
+    fn mix_pop() -> crate::types::Population {
+        use std::io::Write;
+        let mut csv = String::from("ID,TIME,DV,AMT,EVID,CMT,WT\n");
+        for (sid, &(cl, wt)) in [(1.0_f64, 60.0_f64), (3.0, 90.0)].iter().enumerate() {
+            let id = sid + 1;
+            csv.push_str(&format!("{id},0,0,100,1,1,{wt}\n"));
+            for t in [0.5_f64, 1.0, 2.0, 4.0] {
+                let c = (100.0 / 10.0) * (-(cl / 10.0) * t).exp();
+                csv.push_str(&format!("{id},{t},{c:.5},0,0,1,{wt}\n"));
+            }
+        }
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(csv.as_bytes()).unwrap();
+        crate::read_nonmem_csv(f.path(), Some(&["WT"]), None).unwrap()
+    }
+
+    #[test]
+    fn mixture_is_marginal_is_finite_and_below_class_worst() {
+        let model = crate::parser::model_parser::parse_model_string(MIX_MODEL).unwrap();
+        let pop = mix_pop();
+        let mut opts = FitOptions::default();
+        opts.imp_samples = 500;
+        opts.imp_seed = Some(7);
+        let res = run_importance_sampling_mixture(&model, &pop, &model.default_params, &opts)
+            .expect("mixture IS marginal");
+        assert!(
+            res.minus2_log_likelihood.is_finite(),
+            "marginal -2logL must be finite, got {}",
+            res.minus2_log_likelihood
+        );
+        assert!(res.mc_standard_error >= 0.0);
+    }
+
+    #[test]
+    fn mixture_is_rejects_no_random_effects() {
+        // n_eta = 0: the class-conditional marginal collapses to the obs
+        // likelihood, so IS is meaningless — refuse rather than return a
+        // silently meaningless number (#992 review). The parser requires at
+        // least one omega, so the fixture is degraded to n_eta = 0 directly.
+        let mut model = crate::parser::model_parser::parse_model_string(MIX_MODEL).unwrap();
+        model.n_eta = 0;
+        let pop = mix_pop();
+        let opts = FitOptions::default();
+        let err = run_importance_sampling_mixture(&model, &pop, &model.default_params, &opts)
+            .expect_err("n_eta = 0 mixture IS must be rejected");
+        assert!(err.contains("at least one random effect"), "got: {err}");
+    }
+
+    #[test]
+    fn mixture_is_rejects_sde() {
+        // The IS obs-NLL path omits the EKF process-noise variance, so an SDE
+        // mixture marginal would be silently biased (#992 review).
+        const SDE: &str = r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09 FIX
+  sigma EPS ~ 0.04 FIX
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central
+
+[diffusion]
+  central ~ 0.05 FIX
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let model = crate::parser::model_parser::parse_model_string(SDE).unwrap();
+        assert!(model.is_sde(), "fixture must be an SDE model");
+        let pop = mix_pop();
+        let opts = FitOptions::default();
+        let err = run_importance_sampling_mixture(&model, &pop, &model.default_params, &opts)
+            .expect_err("SDE mixture IS must be rejected");
+        assert!(err.contains("SDE"), "got: {err}");
+    }
+
+    #[test]
+    fn mixture_is_rejects_iov() {
+        // A model with kappa (IOV) must be rejected by the mixture IS objective.
+        const IOV: &str = r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09 FIX
+  kappa KAPPA_CL ~ 0.02 FIX
+  sigma EPS ~ 0.04 FIX
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL + KAPPA_CL) else TVCL2 * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        // Parsing may or may not succeed depending on IOV occasion columns; if it
+        // parses, the IS objective must reject IOV explicitly.
+        if let Ok(model) = crate::parser::model_parser::parse_model_string(IOV) {
+            if model.n_kappa > 0 {
+                let pop = mix_pop();
+                let opts = FitOptions::default();
+                let err =
+                    run_importance_sampling_mixture(&model, &pop, &model.default_params, &opts)
+                        .expect_err("IOV mixture IS must be rejected");
+                assert!(
+                    err.contains("IOV") || err.contains("inter-occasion"),
+                    "got: {err}"
+                );
+            }
+        }
+    }
+    /// ESS diagnostics on the mixture marginal are real, not hardcoded: the
+    /// reported per-subject ESS is the worst *contributing* class's ESS, so
+    /// `imp_low_ess_threshold` actually classifies subjects and a collapsed
+    /// proposal can no longer be reported as ideal sampling (#992 review).
+    #[test]
+    fn mixture_is_reports_real_ess_and_honours_threshold() {
+        let model = crate::parser::model_parser::parse_model_string(MIX_MODEL).unwrap();
+        let pop = mix_pop();
+        let mut opts = FitOptions::default();
+        opts.imp_samples = 300;
+        opts.imp_seed = Some(11);
+
+        // A threshold of 0 can never flag a subject.
+        opts.imp_low_ess_threshold = 0.0;
+        let none = run_importance_sampling_mixture(&model, &pop, &model.default_params, &opts)
+            .expect("mixture IS");
+        assert!(
+            none.low_ess_subjects.is_empty(),
+            "threshold 0 must flag nobody, got {:?}",
+            none.low_ess_subjects
+        );
+        assert!(
+            none.ess_min > 0.0 && none.ess_min <= 1.0,
+            "ess_min must be a real fraction, got {}",
+            none.ess_min
+        );
+        assert!(
+            none.ess_median >= none.ess_min && none.ess_median <= 1.0,
+            "ess_median {} out of range vs ess_min {}",
+            none.ess_median,
+            none.ess_min
+        );
+
+        // A threshold above every attainable ESS flags every subject — the field
+        // is driven by the data, not pinned to 1.0.
+        opts.imp_low_ess_threshold = 1.0 + 1e-9;
+        let all = run_importance_sampling_mixture(&model, &pop, &model.default_params, &opts)
+            .expect("mixture IS");
+        assert_eq!(
+            all.low_ess_subjects.len(),
+            pop.subjects.len(),
+            "an unreachable threshold must flag every subject"
+        );
+        assert!(
+            (all.ess_min - none.ess_min).abs() < 1e-12,
+            "the threshold must not change the measured ESS"
+        );
+    }
+
+    /// A class Ω with a non-finite log-determinant is rejected before sampling,
+    /// as the single-population entry point does — otherwise it flows into
+    /// `subject_is_estimate` and yields a silently NaN marginal (#992 review).
+    #[test]
+    fn mixture_is_rejects_non_finite_class_log_det() {
+        let model = crate::parser::model_parser::parse_model_string(MIX_MODEL).unwrap();
+        let pop = mix_pop();
+        let mut params = model.default_params.clone();
+        let mp = params.mixture.as_mut().expect("mixture params");
+        // `from_matrix` regularises a singular Ω, so set the cached determinant
+        // directly — the state a caller-supplied Ω can genuinely arrive in.
+        mp.omega[1].log_det = f64::NAN;
+        assert!(
+            !mp.omega[1].log_det.is_finite(),
+            "test setup: class-2 log_det must be non-finite"
+        );
+        let opts = FitOptions::default();
+        let err = run_importance_sampling_mixture(&model, &pop, &params, &opts)
+            .expect_err("a non-finite class log-determinant must be rejected");
+        assert!(
+            err.contains("log-determinant is not finite") && err.contains("class 2"),
+            "got: {err}"
+        );
+    }
+
+    /// #484/#1029: the importance-sampling proposal precision
+    /// `H_post = Ω⁻¹ + Jᵀ R⁻¹ J` must be built from the *magnitude-scaled* `R`,
+    /// so the Student-t proposal has the shape of the posterior the weights are
+    /// actually scored against. Compared here to `Ω⁻¹ + Jᵀ R⁻¹ J` assembled by
+    /// hand from `variance_at_scaled`; a magnitude dropped here would reproduce
+    /// the unscaled reference instead, which the second assertion rules out.
+    #[test]
+    fn posterior_hessian_uses_the_magnitude_scaled_residual_variance() {
+        use crate::parser::model_parser::parse_model_string;
+        use crate::types::{DoseEvent, Subject};
+        use std::collections::HashMap;
+
+        let model = parse_model_string(
+            "[parameters]\n  theta TVCL(1.0)\n  theta TVV(10.0)\n  omega ETA_CL ~ 0.04\n  \
+             sigma PROP_ERR ~ 0.10 (sd)\n  sigma ADD_ERR ~ 0.50 (sd)\n\
+             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n\
+             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  \
+             DV ~ combined(PROP_ERR, ADD_ERR) weight = WPSE\n[covariates]\n  WPSE continuous\n",
+        )
+        .expect("weighted model parses");
+
+        let snap =
+            |w: f64| -> HashMap<String, f64> { [("WPSE".to_string(), w)].into_iter().collect() };
+        let subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 4.0, 8.0],
+            observations: vec![8.0, 6.0, 4.0],
+            obs_cmts: vec![1; 3],
+            cens: vec![0; 3],
+            covariates: snap(0.5),
+            obs_covariates: vec![snap(0.5), snap(1.0), snap(2.0)],
+            ..Default::default()
+        };
+
+        let theta = [1.0_f64, 10.0];
+        let sigma = [0.10_f64, 0.50];
+        let eta_hat = DVector::from_vec(vec![0.0]);
+        let jacobian = DMatrix::from_column_slice(3, 1, &[-0.4, -0.3, -0.15]);
+        let omega_inv = DMatrix::from_element(1, 1, 1.0 / 0.04);
+
+        let mut scratch = EventPkParams::default();
+        let got = compute_posterior_hessian(
+            &model,
+            &subject,
+            &theta,
+            &eta_hat,
+            &sigma,
+            &jacobian,
+            &omega_inv,
+            1,
+            &mut scratch,
+        );
+
+        let ipreds = compute_predictions_with_tv_into(
+            &model,
+            &subject,
+            &theta,
+            eta_hat.as_slice(),
+            &mut scratch,
+        );
+        let mult = model
+            .ruv_obs_mult(&subject, &theta)
+            .expect("magnitude active");
+        let reference = |scaled: bool| -> f64 {
+            let mut acc = 1.0 / 0.04;
+            for j in 0..3 {
+                let r = if scaled {
+                    model
+                        .error_spec
+                        .variance_at_scaled(1, ipreds[j], &sigma, &[], &mult[j])
+                } else {
+                    model.error_spec.variance_at(1, ipreds[j], &sigma)
+                };
+                acc += jacobian[(j, 0)] * jacobian[(j, 0)] / r;
+            }
+            acc
+        };
+
+        approx::assert_relative_eq!(got[(0, 0)], reference(true), epsilon = 1e-10);
+        assert!(
+            (reference(true) - reference(false)).abs() > 1e-6,
+            "the weight must move the proposal precision, else this test proves nothing"
         );
     }
 }

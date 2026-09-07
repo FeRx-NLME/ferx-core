@@ -20,22 +20,32 @@
 # controller must back the dose down — the covariate genuinely drives the ladder.
 #
 # --- ferx end-of-interval convention (the subtle part) ------------------------
-# ferx resolves each integration segment's PK from the covariate at the record
-# that ENDS the segment (NONMEM end-of-interval / $PK-runs-at-every-record), with
-# LOCF carry-forward across breaks that are not data records. A decision at t_k
-# splits that day into two segments, because the 1-h infusion end (t_k + 1) is a
-# break that is NOT a data record:
-#   * the infusion window (t_k, t_k + 1] carries the LOCF PK forward from the most
-#     recent record, which after crossing the obs at t_k is CRCL(t_k);
-#   * the decay window (t_k + 1, t_{k+1}] ends at the next obs record, so it is
-#     governed by CRCL(t_{k+1}) (the end-of-interval value).
-# So the infusion runs on CRCL AT THE DECISION time, and the between-dose decay
-# runs on CRCL AT THE NEXT decision. The R loop reproduces this exactly by
-# integrating each day as those two windows with the matching piecewise-constant
-# CL, so mrgsolve's CL trajectory is identical to ferx's per-segment PK and the
-# two engines see the same trough trajectory and reach the same dose decisions.
-# (Day 0's infusion likewise uses CRCL(0): ferx seeds its LOCF carry from the
-# earliest record, the t=0 obs.)
+# ferx resolves each integration segment's PK from the covariate at the DATA
+# RECORD that governs the segment (NONMEM end-of-interval / $PK-runs-at-every-
+# record). A decision at t_k splits that day into two integration segments,
+# because the 1-h infusion end (t_k + 1) is a mesh break — but it is NOT a data
+# record, so it triggers no $PK call and cannot change the governing covariate:
+#   * the infusion window (t_k, t_k + 1] is terminated by a NON-record, so it is
+#     governed by the next record ahead — the obs at t_{k+1} -> CRCL(t_{k+1});
+#   * the decay window (t_k + 1, t_{k+1}] ends at that same obs record, so it is
+#     governed by CRCL(t_{k+1}) too.
+# So the WHOLE day (t_k, t_{k+1}] runs on CRCL AT THE NEXT decision. The R loop
+# still integrates it as two windows — the split is needed for the infusion
+# *rate*, not for CL — feeding both the same piecewise-constant CL, so
+# mrgsolve's CL trajectory is identical to ferx's per-segment PK.
+#
+# --- why this changed (#1073) -------------------------------------------------
+# This kit used to run the infusion sub-window on CRCL(t_k), reproducing ferx's
+# pre-#1073 LOCF carry, which stretched a dose record's covariate snapshot across
+# the lagged arrival / infusion end. That was a defect: NONMEM runs $PK at data
+# records only, and the infusion end is not one. It is anchored against NONMEM
+# 7.6.0 at 14.9 OFV (`nonmem_anchor/tvcov_lag_saltation*`).
+#
+# Because this reference had been written to mirror ferx's behaviour rather than
+# NONMEM's rule, the two agreed BY CONSTRUCTION and this anchor could not see the
+# defect — the failure mode CLAUDE.md flags for fixtures, here in an external
+# reference. The convention above is the corrected one; `expected.md` and the
+# `REF_LADDER` in `tests/adaptive_vanco_renal_anchor.rs` were regenerated from it.
 #
 # The R loop mirrors ferx's controller semantics EXACTLY (confirm = 1):
 #   - read the latent signal (CENT/V) at the decision time (pre-dose trough),
@@ -103,15 +113,17 @@ for (k in seq_along(dec_t)) {
   }
   rows[[k]] <- data.frame(decision = k - 1, time = t0, crcl = crcl[k],
                           trough = trough, dose = dose, action = action)
-  # Advance state across this day as TWO segments, matching ferx's per-segment PK:
-  #   1. infusion window [t0, t0 + tinf] on CL from CRCL at THIS decision (LOCF),
-  #   2. decay window    [t0 + tinf, t0 + 24] on CL from CRCL at the NEXT decision
-  #      (end-of-interval: the next obs record governs it).
+  # Advance state across this day as TWO segments. The split exists for the
+  # infusion RATE, not for CL: the infusion end is not a data record (#1073), so
+  # the next obs record governs BOTH windows and each runs on cl_at[k + 1].
+  #   1. infusion window [t0, t0 + tinf],
+  #   2. decay window    [t0 + tinf, t0 + 24].
   # The last decision has no following window (nothing left to integrate).
   if (k < length(dec_t)) {
-    # (1) infusion sub-window on the decision-time covariate.
+    # (1) infusion sub-window — governed by the NEXT record (#1073), not the
+    #     decision-time covariate: its terminating break is not a data record.
     seg1 <- as.data.frame(mod |>
-      param(CL = cl_at[k], V = V) |>
+      param(CL = cl_at[k + 1], V = V) |>
       init(CENT = st_cent) |>
       ev(amt = dose, rate = dose / tinf, cmt = 1) |>
       mrgsim(start = 0, end = tinf, delta = tinf))

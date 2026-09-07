@@ -1,0 +1,355 @@
+Wed Sep  2 11:58:00 AM UTC 2026
+$PROBLEM Joint PK-TTE, RATE>0 into the absorption compartment -- external anchor for #1187
+; ferx's joint PK-TTE cumulative hazard has two production routes: the #570 shared single
+; solve (`ode_predictions_and_chz` -> `active_infusions`) and the two-solve fallback
+; (`ode_cumhaz_hazard` -> `ode_dense_solve_states` -> `gated_infusions`). Only the second
+; resolved infusions through the unguarded helper, so a RATE>0 dose into a built-in
+; absorption compartment was delivered TWICE on that arm -- once by the convolved
+; `R_in_inf` kernel and again as a plain `+rate`.
+;
+; NONMEM integrates the augmented system ONCE and has no such split, so it is the outside
+; reference. Identical to `../pktte-engine-split/pktte_eta0.ctl` except the dose carries
+; RATE=50 (AMT=100 -> T=2h zero-order fill of the depot). ADVAN2's zero-order-into-depot
+; behaviour is what ferx's `first_order()` + `R_in_inf` convolution reproduces, already
+; anchored by `tests/infusion_absorption_nonmem_anchor.rs`.
+;
+; Compared object is the CUMULATIVE HAZARD A(3), not the OFV: a likelihood model (F_FLAG=1)
+; carries different additive constants in NONMEM than in ferx. A(3) is constant-free.
+;
+; MAXEVAL=0 POSTHOC, every THETA FIX, OMEGA 0 FIX so both tools evaluate at eta = 0.
+
+$INPUT ID TIME DV EVID AMT CMT RATE MDV
+$DATA pktte_inf.csv IGNORE=@
+
+$SUBROUTINES ADVAN13 TOL=9
+$MODEL
+  COMP=(DEPOT,DEFDOSE)
+  COMP=(CENTRAL)
+  COMP=(CHZ)
+
+$PK
+  CL   = THETA(1)*EXP(ETA(1))
+  V    = THETA(2)
+  KA   = THETA(3)
+  H0   = THETA(4)
+  BETA = THETA(5)
+  K20  = CL/V
+
+$DES
+  CONCD   = A(2)/V
+  DADT(1) = -KA*A(1)
+  DADT(2) =  KA*A(1) - K20*A(2)
+  DADT(3) =  H0*EXP(BETA*CONCD)
+
+$ERROR
+  CONC = A(2)/V
+  HAZ  = H0*EXP(BETA*CONC)
+  CHZ  = A(3)
+  SUR  = EXP(-CHZ)
+  IPRED = CONC
+  F_FLAG = 0
+  IF (CMT.EQ.3) F_FLAG = 1
+  ; Single-level IFs only: NM-TRAN error 326 rejects a random variable assigned inside a
+  ; NESTED if-structure, so the CMT/DV test is folded into one condition per branch.
+  Y = IPRED*(1.0 + EPS(1))
+  IF (CMT.EQ.3.AND.DV.EQ.1) Y = SUR*HAZ
+  IF (CMT.EQ.3.AND.DV.EQ.0) Y = SUR
+
+$THETA
+  1.00 FIX   ; 1 CL   (L/h)
+  10.0 FIX   ; 2 V    (L)
+  1.00 FIX   ; 3 KA   (1/h)
+  0.02 FIX   ; 4 H0   baseline hazard
+  0.50 FIX   ; 5 BETA concentration effect on log-hazard
+
+$OMEGA
+  0 FIX      ; IIV CL -- zeroed so ferx and NONMEM are compared at the SAME point (eta=0)
+
+$SIGMA
+  0.01       ; proportional residual variance (0.10^2)
+
+$ESTIMATION METHOD=1 LAPLACE INTER NUMERICAL SLOW MAXEVAL=0 POSTHOC PRINT=1 NOABORT
+; FORMAT is load-bearing: $TABLE's default prints 5 significant figures, so a banked
+; reference of 1.2217E-01 carries +/-5e-6 of its own rounding = 4.1e-5 relative. That is
+; the floor on any tolerance the anchor can assert, regardless of how close ferx actually
+; is. s1PE15.8 gives 9 significant figures and moves the floor to ~1e-9.
+$TABLE ID TIME CMT DV IPRED CHZ HAZ ETA1 MDV NOPRINT ONEHEADER NOAPPEND
+       FORMAT=s1PE15.8 FILE=pktte_inf.tab
+
+NM-TRAN MESSAGES
+  
+ WARNINGS AND ERRORS (IF ANY) FOR PROBLEM    1
+             
+ (WARNING  2) NM-TRAN INFERS THAT THE DATA ARE POPULATION.
+  
+Note: Analytical 2nd Derivatives are constructed in FSUBS but are never used.
+      You may insert $ABBR DERIV2=NO after the first $PROB to save FSUBS construction and compilation time
+  
+
+License Registered to:  InsightRX
+Expiration Date:    14 AUG 2027
+Current Date:        2 SEP 2026
+Days until program expires : 347
+1NONLINEAR MIXED EFFECTS MODEL PROGRAM (NONMEM) VERSION 7.6.0 (nm760)
+ ORIGINALLY DEVELOPED BY STUART BEAL, LEWIS SHEINER, AND ALISON BOECKMANN
+ CURRENT DEVELOPERS ARE ROBERT BAUER, ICON DEVELOPMENT SOLUTIONS,
+ AND ALISON BOECKMANN. IMPLEMENTATION, EFFICIENCY, AND STANDARDIZATION
+ PERFORMED BY NOUS INFOSYSTEMS.
+
+ PROBLEM NO.:         1
+ Joint PK-TTE, RATE>0 into the absorption compartment -- external anchor
+0DATA CHECKOUT RUN:              NO
+ DATA SET LOCATED ON UNIT NO.:    2
+ THIS UNIT TO BE REWOUND:        NO
+ CREATE/ADD TO FDATA.csv:        YES
+ NO. OF DATA RECS IN DATA SET:       10
+ NO. OF DATA ITEMS IN DATA SET:   8
+ ID DATA ITEM IS DATA ITEM NO.:   1
+ DEP VARIABLE IS DATA ITEM NO.:   3
+ MDV DATA ITEM IS DATA ITEM NO.:  8
+0INDICES PASSED TO SUBROUTINE PRED:
+   4   2   5   7   0   0   6   0   0   0   0
+0LABELS FOR DATA ITEMS:
+ ID TIME DV EVID AMT CMT RATE MDV
+0(NONBLANK) LABELS FOR PRED-DEFINED ITEMS:
+ HAZ CHZ IPRED
+0FORMAT FOR DATA:
+ (8E7.0)
+
+ TOT. NO. OF OBS RECS:        9
+ TOT. NO. OF INDIVIDUALS:        1
+0LENGTH OF THETA:   5
+0DEFAULT THETA BOUNDARY TEST OMITTED:    NO
+0OMEGA HAS SIMPLE DIAGONAL FORM WITH DIMENSION:   1
+0DEFAULT OMEGA BOUNDARY TEST OMITTED:    NO
+0SIGMA HAS SIMPLE DIAGONAL FORM WITH DIMENSION:   1
+0DEFAULT SIGMA BOUNDARY TEST OMITTED:    NO
+0INITIAL ESTIMATE OF THETA:
+ LOWER BOUND    INITIAL EST    UPPER BOUND
+  0.1000E+01     0.1000E+01     0.1000E+01
+  0.1000E+02     0.1000E+02     0.1000E+02
+  0.1000E+01     0.1000E+01     0.1000E+01
+  0.2000E-01     0.2000E-01     0.2000E-01
+  0.5000E+00     0.5000E+00     0.5000E+00
+0INITIAL ESTIMATE OF OMEGA:
+ 0.0000E+00
+0OMEGA CONSTRAINED TO BE THIS INITIAL ESTIMATE
+0INITIAL ESTIMATE OF SIGMA:
+ 0.1000E-01
+0TABLES STEP OMITTED:    NO
+ NO. OF TABLES:           1
+ SEED NUMBER (SEED):    11456
+ NPDTYPE:    0
+ INTERPTYPE:    0
+ RANMETHOD:             3U
+ MC SAMPLES (ESAMPLE):    300
+ WRES SQUARE ROOT TYPE (WRESCHOL): EIGENVALUE
+0-- TABLE   1 --
+0RECORDS ONLY:    ALL
+04 COLUMNS APPENDED:    NO
+ PRINTED:                NO
+ HEADER:                YES
+ FILE TO BE FORWARDED:   NO
+ FORMAT:                s1PE15.8
+ IDFORMAT:
+ LFORMAT:
+ RFORMAT:
+ FIXED_EFFECT_ETAS:
+0USER-CHOSEN ITEMS:
+ ID TIME CMT DV IPRED CHZ HAZ ETA1 MDV
+1DOUBLE PRECISION PREDPP VERSION 7.6.0 (nm760)
+
+ GENERAL NONLINEAR KINETICS MODEL WITH STIFF/NONSTIFF EQUATIONS (LSODA, ADVAN13)
+0MODEL SUBROUTINE USER-SUPPLIED - ID NO. 9999
+0MAXIMUM NO. OF BASIC PK PARAMETERS:   5
+0COMPARTMENT ATTRIBUTES
+ COMPT. NO.   FUNCTION   INITIAL    ON/OFF      DOSE      DEFAULT    DEFAULT
+                         STATUS     ALLOWED    ALLOWED    FOR DOSE   FOR OBS.
+    1         DEPOT        ON         YES        YES        YES        NO
+    2         CENTRAL      ON         YES        YES        NO         YES
+    3         CHZ          ON         YES        YES        NO         NO
+    4         OUTPUT       OFF        YES        NO         NO         NO
+ INITIAL (BASE) TOLERANCE SETTINGS:
+ NRD (RELATIVE) VALUE(S) OF TOLERANCE:   9
+ ANRD (ABSOLUTE) VALUE(S) OF TOLERANCE:  12
+1
+ ADDITIONAL PK PARAMETERS - ASSIGNMENT OF ROWS IN GG
+ COMPT. NO.                             INDICES
+              SCALE      BIOAVAIL.   ZERO-ORDER  ZERO-ORDER  ABSORB
+                         FRACTION    RATE        DURATION    LAG
+    1            *           *           *           *           *
+    2            *           *           *           *           *
+    3            *           *           *           *           *
+    4            *           -           -           -           -
+             - PARAMETER IS NOT ALLOWED FOR THIS MODEL
+             * PARAMETER IS NOT SUPPLIED BY PK SUBROUTINE;
+               WILL DEFAULT TO ONE IF APPLICABLE
+0DATA ITEM INDICES USED BY PRED ARE:
+   EVENT ID DATA ITEM IS DATA ITEM NO.:      4
+   TIME DATA ITEM IS DATA ITEM NO.:          2
+   DOSE AMOUNT DATA ITEM IS DATA ITEM NO.:   5
+   DOSE RATE DATA ITEM IS DATA ITEM NO.:     7
+   COMPT. NO. DATA ITEM IS DATA ITEM NO.:    6
+
+0PK SUBROUTINE CALLED WITH EVERY EVENT RECORD.
+ PK SUBROUTINE NOT CALLED AT NONEVENT (ADDITIONAL OR LAGGED) DOSE TIMES.
+0ERROR SUBROUTINE CALLED WITH EVERY EVENT RECORD.
+0ERROR SUBROUTINE INDICATES THAT DERIVATIVES OF COMPARTMENT AMOUNTS ARE USED.
+0DES SUBROUTINE USES COMPACT STORAGE MODE.
+1
+
+
+ #TBLN:      1
+ #METH: Laplacian Conditional Estimation with Interaction (Evaluation)
+
+ ESTIMATION STEP OMITTED:                 YES
+ SHRINK INFO WITH EVALUATION (EVALSHRINK) NO
+ ANALYSIS TYPE:                           POPULATION
+ CONDITIONAL ESTIMATES USED:              YES
+ CENTERED ETA:                            NO
+ EPS-ETA INTERACTION:                     YES
+ LAPLACIAN OBJ. FUNC.:                    YES
+ NUMERICAL 2ND DERIVATIVES:               YES
+ NUMERICAL DERIVATIVE
+       FILE REQUEST (NUMDER):               NONE
+ MAP (ETAHAT) ESTIMATION METHOD (OPTMAP):   0
+ ETA HESSIAN EVALUATION METHOD (ETADER):    0
+ INITIAL ETA FOR MAP ESTIMATION (MCETA):    0
+ SIGDIGITS FOR MAP ESTIMATION (SIGLO):      100
+ GRADIENT SIGDIGITS OF
+       FIXED EFFECTS PARAMETERS (SIGL):     100
+ NOPRIOR SETTING (NOPRIOR):                 0
+ NOCOV SETTING (NOCOV):                     OFF
+ DERCONT SETTING (DERCONT):                 OFF
+ FINAL ETA RE-EVALUATION (FNLETA):          1
+ EXCLUDE NON-INFLUENTIAL (NON-INFL.) ETAS
+       IN SHRINKAGE (ETASTYPE):             NO
+ NON-INFL. ETA CORRECTION (NONINFETA):      0
+ RAW OUTPUT FILE (FILE): pktte_inf.ext
+ EXCLUDE TITLE (NOTITLE):                   NO
+ EXCLUDE COLUMN LABELS (NOLABEL):           NO
+ FORMAT FOR ADDITIONAL FILES (FORMAT):      S1PE12.5
+ PARAMETER ORDER FOR OUTPUTS (ORDER):       TSOL
+ KNUTHSUMOFF:                               0
+ INCLUDE LNTWOPI:                           NO
+ INCLUDE CONSTANT TERM TO PRIOR (PRIORC):   NO
+ INCLUDE CONSTANT TERM TO OMEGA (ETA) (OLNTWOPI):NO
+ ADDITIONAL CONVERGENCE TEST (CTYPE=4)?:    NO
+ EM OR BAYESIAN METHOD USED:                 NONE
+
+ TOLERANCES FOR ESTIMATION/EVALUATION STEP:
+ NRD (RELATIVE) VALUE(S) OF TOLERANCE:   9
+ ANRD (ABSOLUTE) VALUE(S) OF TOLERANCE:  12
+ TOLERANCES FOR COVARIANCE STEP:
+ NRD (RELATIVE) VALUE(S) OF TOLERANCE:   9
+ ANRD (ABSOLUTE) VALUE(S) OF TOLERANCE:  12
+ TOLERANCES FOR TABLE/SCATTER STEP:
+ NRD (RELATIVE) VALUE(S) OF TOLERANCE:   9
+ ANRD (ABSOLUTE) VALUE(S) OF TOLERANCE:  12
+
+ THE FOLLOWING LABELS ARE EQUIVALENT
+ PRED=PREDI
+ RES=RESI
+ WRES=WRESI
+ IWRS=IWRESI
+ IPRD=IPREDI
+ IRS=IRESI
+
+ Elapsed evaluation time in seconds:     0.00
+ Elapsed postprocess time in seconds:     0.00
+1
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ ************************************************************************************************************************
+ ********************                                                                                ********************
+ ********************          LAPLACIAN CONDITIONAL ESTIMATION WITH INTERACTION (EVALUATION)        ********************
+ #OBJT:**************                       MINIMUM VALUE OF OBJECTIVE FUNCTION                      ********************
+ ********************                                                                                ********************
+ ************************************************************************************************************************
+ 
+
+
+
+
+
+ #OBJV:********************************************          6782.093       *********************************************
+1
+ ************************************************************************************************************************
+ ********************                                                                                ********************
+ ********************          LAPLACIAN CONDITIONAL ESTIMATION WITH INTERACTION (EVALUATION)        ********************
+ ********************                             FINAL PARAMETER ESTIMATE                           ********************
+ ********************                                                                                ********************
+ ************************************************************************************************************************
+ 
+
+
+ THETA - VECTOR OF FIXED EFFECTS PARAMETERS   *********
+
+
+         TH 1      TH 2      TH 3      TH 4      TH 5     
+ 
+         1.00E+00  1.00E+01  1.00E+00  2.00E-02  5.00E-01
+ 
+
+
+ OMEGA - COV MATRIX FOR RANDOM EFFECTS - ETAS  ********
+
+
+         ETA1     
+ 
+ ETA1
++        0.00E+00
+ 
+
+
+ SIGMA - COV MATRIX FOR RANDOM EFFECTS - EPSILONS  ****
+
+
+         EPS1     
+ 
+ EPS1
++        1.00E-02
+ 
+1
+
+
+ OMEGA - CORR MATRIX FOR RANDOM EFFECTS - ETAS  *******
+
+
+         ETA1     
+ 
+ ETA1
++        0.00E+00
+ 
+
+
+ SIGMA - CORR MATRIX FOR RANDOM EFFECTS - EPSILONS  ***
+
+
+         EPS1     
+ 
+ EPS1
++        1.00E-01
+ 
+ Elapsed finaloutput time in seconds:     0.00
+ #CPUT: Total CPU Time in Seconds,        0.034
+Stop Time:
+Wed Sep  2 11:58:02 AM UTC 2026

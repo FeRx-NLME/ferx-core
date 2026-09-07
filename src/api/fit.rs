@@ -9,10 +9,9 @@ use crate::estimation::parameterization::{
 };
 use crate::estimation::saem;
 use crate::io::datareader::{
-    read_nonmem_csv_filtered_mapped, read_nonmem_csv_filtered_tte, read_nonmem_csv_mapped,
+    read_nonmem_csv_filtered_mapped, read_nonmem_csv_mapped,
     read_nonmem_csv_with_covariates_filtered_mapped, read_nonmem_csv_with_covariates_mapped,
-    read_nonmem_csv_with_covariates_tte, SelectionFilter, ERR_COV_MISSING_COLUMNS,
-    ERR_COV_NON_NUMERIC,
+    SelectionFilter, ERR_COV_MISSING_COLUMNS, ERR_COV_NON_NUMERIC,
 };
 use crate::pk;
 use crate::propensity_match::MatchMethod;
@@ -54,9 +53,19 @@ fn build_neural_network_infos(model: &CompiledModel) -> Vec<NeuralNetworkInfo> {
             weights_offset: nn.weights_offset,
             input_names: nn.mapper.input_names().to_vec(),
             output_names: nn.mapper.output_names().to_vec(),
+            input_center: nn.mapper.input_center().to_vec(),
+            input_scale: nn.mapper.input_scale().to_vec(),
         })
         .collect()
 }
+
+#[cfg(all(test, feature = "nn"))]
+#[path = "tests/nn_info_tests.rs"]
+mod nn_info_tests;
+
+#[cfg(all(test, feature = "nn"))]
+#[path = "tests/nn_regularization_warning_tests.rs"]
+mod nn_regularization_warning_tests;
 
 /// High-level fit: model file path + data file path → FitResult
 ///
@@ -72,8 +81,7 @@ pub fn fit_from_files(
     // Parse the full model so an authoritative `[covariates]` block is visible
     // here (the file's `[fit_options]` are still ignored — the caller's
     // `options` win, preserving historical behaviour).
-    let parsed = crate::parser::model_parser::parse_full_model_file(Path::new(model_path))?;
-    let mut model = parsed.model;
+    let mut parsed = crate::parser::model_parser::parse_full_model_file(Path::new(model_path))?;
     // A `[covariates]` declaration takes precedence over the explicit
     // `covariate_columns` argument; otherwise fall back to the argument (or
     // legacy auto-detect when both are absent).
@@ -81,8 +89,8 @@ pub fn fit_from_files(
     let sel_filter_fit = build_selection_filter_merged(&parsed.fit_options, &opts)?;
     let (data_path, data_path_warning) = resolve_data_path(parsed.data_path.as_deref(), data_path)?;
     let data_path = data_path.as_str();
-    let (population, covariate_table) = read_population_for(
-        &model,
+    let (mut population, covariate_table) = read_population_for(
+        &parsed.model,
         &parsed.covariate_decls,
         data_path,
         covariate_columns,
@@ -90,6 +98,20 @@ pub fn fit_from_files(
         sel_filter_fit.as_ref(),
         &parsed.column_map,
     )?;
+    // #1064: bind level blocks against the data before anything reads
+    // the parameter vector — the level count, and therefore `n_theta`, is a
+    // property of the dataset. Mirrors `run_model_with_data_inits`.
+    {
+        let model_text = std::fs::read_to_string(model_path)
+            .map_err(|e| format!("Failed to re-read model file for level binding: {e}"))?;
+        crate::api::bind_theta_levels(&mut parsed, &model_text, &mut population)?;
+        // #1111: resolve any symbolic `[covariate_model]` statistic
+        // (`center = median`, `ref = mode`, `levels = auto`) against the same
+        // dataset. `assert_covariate_model_bound` names this entry point as one
+        // that binds them, so it has to actually do it.
+        crate::api::bind_covariate_stats(&mut parsed, &model_text, &population)?;
+    }
+    let mut model = parsed.model;
     model.bloq_method = opts.bloq_method;
     // SDE models have no analytic-sensitivity path — force FD.
     model.gradient_method =
@@ -115,6 +137,31 @@ pub fn fit_from_files(
     result.data_hash = crate::io::hash::sha256_file(Path::new(data_path)).ok();
     result.model_text = std::fs::read_to_string(model_path).ok();
     Ok(result)
+}
+
+/// Warning for an explicit `optimizer = bobyqa` on a problem too large for it
+/// (#1064), or `None` when the choice is fine.
+///
+/// `auto` switches away from BOBYQA above [`BOBYQA_MAX_DIM`] on its own (see
+/// [`Optimizer::resolve_auto`]); an explicit `bobyqa` is the user's call and is
+/// honoured, but it must not be a silent hour. BOBYQA interpolates a quadratic
+/// over the whole parameter space, so the model it has to build grows
+/// quadratically in the parameter count.
+///
+/// A free function rather than an inline block so both branches are reachable
+/// from a unit test without running a fit with several hundred free parameters.
+pub(crate) fn bobyqa_scale_warning(optimizer: Optimizer, dim: usize) -> Option<String> {
+    if optimizer != Optimizer::Bobyqa || dim <= crate::types::BOBYQA_MAX_DIM {
+        return None;
+    }
+    Some(format!(
+        "optimizer = bobyqa with {dim} free parameters: BOBYQA builds a quadratic \
+         interpolation model over the whole parameter space, which grows \
+         quadratically in the parameter count and is unlikely to make progress at \
+         this size. `optimizer = nlopt_lbfgs` (or the default `auto`, which switches \
+         above {}) costs O(n) finite-difference passes instead.",
+        crate::types::BOBYQA_MAX_DIM
+    ))
 }
 
 /// Perturb initial parameters for multi-start optimisation.
@@ -165,16 +212,77 @@ pub(crate) fn perturb_init(
 /// The validity cutoff sits well below the ~1e20 inner-objective sentinel but
 /// far above any legitimate population OFV, so a real fit never trips it; a NaN
 /// OFV is non-finite and therefore also invalid, so it can never block a finite
-/// valid candidate.
+/// valid candidate. See `estimation::outer_optimizer::ofv_is_valid`.
 pub(crate) fn multistart_prefers(b_ofv: f64, b_conv: bool, c_ofv: f64, c_conv: bool) -> bool {
-    /// OFVs at or above this are treated as diverged/invalid (see above).
-    const DIVERGENCE_OFV: f64 = 1e14;
-    let valid = |o: f64| o.is_finite() && o < DIVERGENCE_OFV;
+    let valid = crate::estimation::outer_optimizer::ofv_is_valid;
     match (valid(b_ofv), valid(c_ofv)) {
         (false, true) => true,
         (true, false) => false,
         _ => (!b_conv && c_conv) || (b_conv == c_conv && c_ofv < b_ofv),
     }
+}
+
+/// Whether an estimation method's outer optimizer applies the covariate-NN
+/// regularization penalties (`nn_l2` / `nn_smooth`). The FOCE family does —
+/// every outer optimizer under `foce` / `focei` / `laplace` (NLopt, built-in
+/// BFGS, trust-region) and both Gauss–Newton variants. SAEM, IMP/IMPMAP, Bayes
+/// and VI do not touch the penalty.
+pub(crate) fn applies_nn_regularization(method: EstimationMethod) -> bool {
+    matches!(
+        method,
+        EstimationMethod::Foce
+            | EstimationMethod::FoceI
+            | EstimationMethod::Laplace
+            | EstimationMethod::FoceGn
+            | EstimationMethod::FoceGnHybrid
+    )
+}
+
+/// A pre-run warning when `nn_l2` / `nn_smooth` are set but the chain's final
+/// stage does not apply them (see [`applies_nn_regularization`]). `None` when
+/// both are `0.0`, when the model has no `[covariate_nn]` block (the penalty
+/// is then a no-op regardless of method), or when the final stage does apply
+/// them — an earlier non-FOCE stage in a chain like `[saem, focei]` is fine,
+/// since the regularized stage is the one whose estimates are reported.
+pub(crate) fn nn_regularization_unapplied_warning(
+    model: &CompiledModel,
+    options: &FitOptions,
+    chain: &[EstimationMethod],
+) -> Option<String> {
+    let set: Vec<&str> = [
+        ("nn_l2", options.nn_l2_lambda),
+        ("nn_smooth", options.nn_smooth_lambda),
+    ]
+    .into_iter()
+    .filter(|(_, l)| *l > 0.0)
+    .map(|(k, _)| k)
+    .collect();
+    if set.is_empty() || !model_has_covariate_nn(model) {
+        return None;
+    }
+    let last = *chain.last()?;
+    if applies_nn_regularization(last) {
+        return None;
+    }
+    Some(format!(
+        "{} {} set but the final estimation stage (`{}`) does not apply covariate-NN \
+         regularization — the fit is unregularized. The penalties are applied by the \
+         FOCE-family methods (foce, focei, laplace, gn, gn_hybrid); use one of those as the \
+         final stage, or drop the option.",
+        set.join(" / "),
+        if set.len() == 1 { "is" } else { "are" },
+        last.label(),
+    ))
+}
+
+#[cfg(feature = "nn")]
+fn model_has_covariate_nn(model: &CompiledModel) -> bool {
+    !model.covariate_nns.is_empty()
+}
+
+#[cfg(not(feature = "nn"))]
+fn model_has_covariate_nn(_model: &CompiledModel) -> bool {
+    false
 }
 
 /// Main fit entry point: CompiledModel + Population → FitResult.
@@ -201,6 +309,102 @@ pub fn fit(
     // is a no-op unless the user pinned `inner_optimizer`.
     crate::estimation::inner_optimizer::set_inner_optimizer(options.inner_optimizer);
     crate::estimation::inner_optimizer::set_ebe_warm_start(options.ebe_warm_start);
+    // #1212: carry this call's ODE solver settings the last hop to the integrator. The
+    // spec's `solver_opts` is stamped at parse time by `sync_ode_solver_opts`, every
+    // integration path reads it off the spec, and `fit` has only `&CompiledModel` — so without
+    // this a `FitOptions { ode_reltol: 1e-10, .. }` (or an `ode_method` naming a stiff stepper)
+    // ran at the parse-time value and reported success. Armed here rather than in `fit_inner`
+    // so the pre-fit validation below — which runs on this thread, before any pool — sees the
+    // same options as the fit; the guard disarms on every exit path, including an early `?`,
+    // so a later `predict` on the same model is unaffected. The fan-out is covered separately,
+    // by `install_on_fit_pool`: arming reaches this thread only, and the workers that do the
+    // integrating get the value from the pool built for it.
+    let _ode_solver_override =
+        crate::ode::solver::arm_ode_solver_override(options.ode_solver_override());
+    // #1064: a `theta NAME[...]` block has no levels until it is bound
+    // to data. Fitting one unbound would gather out of an empty level table and
+    // predict NaN everywhere; refuse, and name the two ways out.
+    if !model.theta_blocks().unbound_level_blocks().is_empty() {
+        return Err(format!(
+            "`theta {}[...]` was never bound to data, so it has no levels. Fit \
+             through a file entry point (`fit_from_files`, `run_model_with_data`, or the \
+             CLI), which binds level blocks against the dataset — or declare the block \
+             explicitly as `theta {}[N](...)` and index it with your own column.",
+            model
+                .theta_blocks()
+                .unbound_level_blocks()
+                .join("`, `theta "),
+            model.theta_blocks().unbound_level_blocks()[0],
+        ));
+    }
+    // Mixture models (#977). Phase 3 wires the K-fold log-sum-exp FOCE/FOCEI
+    // objective via the derivative-free (BOBYQA) outer optimizer. Other
+    // estimators, inter-occasion variability, and adaptive-Gauss-Hermite
+    // marginalisation are not yet supported — reject them clearly rather than
+    // silently ignoring the mixture structure.
+    if model.mixture.is_some() {
+        // The objective keys the mixture path off `params.mixture` (carried from
+        // `init_params` through `unpack_params`). If a caller passes custom
+        // `init_params` with `mixture: None` — e.g. params rebuilt from a prior
+        // `FitResult` — the fit would silently run the single-population objective
+        // with `MIXNUM` pinned to the class-1 default. Fail loudly instead: the
+        // per-class Omega/Sigma must be present.
+        if init_params.mixture.is_none() {
+            return Err(
+                "mixture model ([mixture] block, #977) requires per-class Omega/Sigma in \
+                 `init_params.mixture`; pass the parsed model's `default_params` (or rebuild \
+                 them from the model file) rather than params with `mixture: None`"
+                    .to_string(),
+            );
+        }
+        for m in options.method_chain() {
+            if !matches!(
+                m,
+                EstimationMethod::Foce
+                    | EstimationMethod::FoceI
+                    | EstimationMethod::Saem
+                    | EstimationMethod::Bayes
+                    // IMP / IMPMAP run a class-partitioned MCEM (per-class IS
+                    // E-step + responsibility-weighted M-steps) when estimating,
+                    // and form the class-marginal `−2 Σ log Σ_k p_ik L_ik` on the
+                    // objective-evaluation (EONLY) path (#985). IOV, FREM, SDE
+                    // and per-class Ω/Σ overrides are refused inside
+                    // `run_mcem_mixture`.
+                    | EstimationMethod::Imp
+                    | EstimationMethod::Impmap
+            ) {
+                return Err(format!(
+                    "mixture models (#977) currently support FOCE / FOCEI / SAEM / Bayes / IMP / \
+                     IMPMAP; the {} method is not yet wired for mixtures (#985)",
+                    m.label()
+                ));
+            }
+        }
+        // Per-class Omega/Sigma overrides under Bayes (#985): the Bayes Omega block
+        // is a single conjugate draw shared across classes, so `omega(k)`/`sigma(k)`
+        // cannot be honoured. `bayes.rs` re-checks this defensively, but reject it
+        // here — before any stage runs — so `method = [focei, bayes]` does not burn a
+        // full FOCEI fit only to fail at the hand-off.
+        if options.method_chain().contains(&EstimationMethod::Bayes) {
+            if let Some(mp) = init_params.mixture.as_ref() {
+                if !mp.omega_override_addr.is_empty() || !mp.sigma_override_addr.is_empty() {
+                    return Err(
+                        "Bayesian estimation (method = bayes) does not yet support per-class \
+                         Omega/Sigma overrides (omega(k)/sigma(k)) in a mixture; Omega/Sigma are \
+                         shared across classes. Fit with FOCE/FOCEI, or drop the per-class \
+                         overrides (#985)."
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        // Inter-occasion variability under a mixture (#985): the per-class inner
+        // solve carries per-occasion κ for the shared base `omega_iov` (each class's
+        // `class_params` keeps it), and the packed layout already interleaves the κ
+        // segment ahead of the per-class Ω/Σ override tail. The FOCE marginal uses
+        // `foce_subject_nll_iov` per class and the outer gradient routes to FD, so
+        // IOV + mixture now fits (previously rejected here).
+    }
     // Start the SS-equilibration non-convergence sink clean so a prior in-process call's residue
     // can't leak into this fit's warnings; drained back out just before `Ok(result)` (#867).
     crate::dosing::clear_ss_nonconvergence_warnings();
@@ -327,26 +531,15 @@ pub fn fit(
         // makes the residual variance η-dependent). Non-interaction FOCE/GN cannot
         // represent it — its marginal integrates the residual eta out through a
         // sensitivity column that is identically zero. Require FOCEI or a
-        // Monte-Carlo estimator (IMP/IMPMAP/SAEM).
-        let methods: Vec<EstimationMethod> = if options.methods.is_empty() {
-            vec![options.method]
-        } else {
-            options.methods.clone()
-        };
-        for m in &methods {
-            let non_interaction = match m {
-                EstimationMethod::Foce => true,
-                EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid => !options.interaction,
-                _ => false,
-            };
-            if non_interaction {
-                return Err(format!(
-                    "IIV on residual error (iiv_on_ruv) requires an interaction or \
-                     Monte-Carlo method: use method = focei, imp, impmap, or saem (got {m:?} \
-                     with interaction = false). NONMEM `Y = IPRED + EPS*EXP(ETA)` is an \
-                     INTERACTION model."
-                ));
-            }
+        // Monte-Carlo estimator (IMP/IMPMAP/SAEM), at every stage of a chain —
+        // the one predicate `ruvsearch` consults before proposing the feature.
+        if let Some(m) = options.non_interaction_stage() {
+            return Err(format!(
+                "IIV on residual error (iiv_on_ruv) requires an interaction or \
+                 Monte-Carlo method: use method = focei, imp, impmap, or saem (got {m:?} \
+                 with interaction = false). NONMEM `Y = IPRED + EPS*EXP(ETA)` is an \
+                 INTERACTION model."
+            ));
         }
     }
     // Data-dependent fatal checks (covariates present, per-CMT scaling and
@@ -432,6 +625,10 @@ pub fn fit(
             !s.dose_covariates.is_empty()
                 || !s.obs_covariates.is_empty()
                 || !s.pk_only_covariates.is_empty()
+                // EVID=3/4 snapshots count too (#1133) — `prune_irrelevant_tv_covariates`
+                // now scans and clears them, so a subject whose only populated vector is
+                // `reset_covariates` must reach it rather than being gated out here.
+                || !s.reset_covariates.is_empty()
         });
         if needs_prune || needs_dv_log || derive_occ {
             let mut p = population.clone();
@@ -517,13 +714,7 @@ pub fn fit(
         // build failure as `Err`, as before). The unpinned default reuses the shared
         // big-stack pool; if that one-time build ever failed we run on the ambient pool
         // rather than turning a previously-successful default fit into an `Err`.
-        let res = match options.threads.filter(|&n| n > 0) {
-            Some(n) => build_fit_pool(n)?.install(run),
-            None => match default_fit_pool() {
-                Some(pool) => pool.install(run),
-                None => run(),
-            },
-        };
+        let res = install_on_fit_pool(options, run)?;
         return res.map(|mut result| {
             result.warnings.splice(0..0, ltbs_warnings);
             // Surface any SS-equilibration non-convergence seen during this (default, single-start)
@@ -538,12 +729,14 @@ pub fn fit(
     }
 
     // Multi-start: run n_starts fits in parallel, return the lowest-OFV converged result.
-    // `threads` controls per-subject parallelism inside a single-start fit; in multi-start
-    // mode the shared fit pool handles both levels (outer start × inner per-subject), so we
-    // do not narrow it to `threads` here — that would cap the combined fan-out below the
-    // available cores. Running one shared pool (rather than a fresh ThreadPool per start
-    // inside the outer into_par_iter()) also avoids spawning n_starts independent pools that
-    // all compete on the same CPUs, causing oversubscription.
+    // One pool serves both levels (outer start × inner per-subject) — a fresh ThreadPool per
+    // start inside the outer into_par_iter() would spawn n_starts independent pools all
+    // competing on the same CPUs. Which pool that is follows the same rule as the
+    // single-start arm above: a pinned positive `threads` is an upper bound on the worker
+    // threads this `fit()` call uses, so it is honored here too. It has to be — a tool that
+    // pins `threads` from a `PoolPlan` and also sets `n_starts > 1` would otherwise get its
+    // replicate-level pool *and* the full-width shared pool underneath every replicate
+    // (#1115). Unpinned, the shared big-stack pool handles both levels as before.
     let base_seed: u64 = options.multi_start_seed.unwrap_or(42);
     let base_saem_seed: u64 = options.saem_seed.unwrap_or(12345);
     let base_bayes_seed: u64 = options.bayes_seed.unwrap_or(12345);
@@ -552,6 +745,9 @@ pub fn fit(
 
     // Warn once (before the parallel section) that global_search only runs on start 0.
     let mut pre_warnings: Vec<String> = ltbs_warnings;
+    if let Some(w) = bobyqa_scale_warning(options.optimizer, model.free_packed_dim()) {
+        pre_warnings.push(w);
+    }
     if options.global_search && n > 1 {
         pre_warnings.push(format!(
             "global_search = true with n_starts = {n}: CRS2-LM only runs on start 0 \
@@ -591,14 +787,18 @@ pub fn fit(
             .collect()
     };
 
-    // Run the start fan-out on the shared big-stack pool; fall back to the ambient pool
-    // only if its one-time build failed.
-    let results: Vec<(usize, Result<FitResult, String>)> = match default_fit_pool() {
-        Some(pool) => pool.install(par_starts),
-        None => par_starts(),
-    };
+    // Run the start fan-out on the pinned fit-scoped pool when `threads` is set, else on the
+    // shared big-stack pool; fall back to the ambient pool only if that one-time build failed.
+    let results: Vec<(usize, Result<FitResult, String>)> =
+        install_on_fit_pool(options, par_starts)?;
 
-    // Pick the best start (see `multistart_prefers` for the ranking).
+    // Pick the best start (see `multistart_prefers` for the ranking). Under
+    // covariate-NN regularization every start minimised the *penalized*
+    // objective, so the ranking uses it too: `FitResult.ofv` is the clean −2LL,
+    // and ranking on that alone would crown the least-regularized start — the
+    // opposite of what the penalty asks for. `+ 0.0` when unregularized.
+    let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, options);
+    let rank_ofv = |r: &FitResult| r.ofv + nn_reg.penalty_value(&r.theta);
     let mut best: Option<(usize, FitResult)> = None;
     let mut failed_starts: Vec<String> = Vec::new();
     for (k, res) in results {
@@ -606,7 +806,9 @@ pub fn fit(
             Ok(r) => {
                 let better = match &best {
                     None => true,
-                    Some((_, b)) => multistart_prefers(b.ofv, b.converged, r.ofv, r.converged),
+                    Some((_, b)) => {
+                        multistart_prefers(rank_ofv(b), b.converged, rank_ofv(&r), r.converged)
+                    }
                 };
                 if better {
                     best = Some((k, r));
@@ -617,7 +819,14 @@ pub fn fit(
     }
 
     match best {
-        None => Err("All multi-start fits failed".to_string()),
+        // Every start failed: say *why*, or a search table reads "All
+        // multi-start fits failed" over a candidate whose model the engine
+        // refused to start at all (#1256: a seeded ω block at the rail),
+        // which is a different repair from a fit that diverged.
+        None => Err(format!(
+            "All multi-start fits failed: {}",
+            failed_starts.join("; ")
+        )),
         Some((k, mut result)) => {
             result.warnings.splice(0..0, pre_warnings);
             if !failed_starts.is_empty() {
@@ -718,10 +927,21 @@ fn fit_inner(
     // Compute up-front so we can both surface the warnings before the fit
     // starts (a long-running fit shouldn't bury a "this option is unused"
     // notice at the end) and carry them through into FitResult.warnings.
-    let mut pre_run_warnings = options.unsupported_keys_warnings();
+    // Model-aware: the `ode_*` solver knobs are framework-level for every *method*
+    // but conditional on the *model* (#518) — on a model that never integrates they
+    // are silently dropped, so say so rather than staying quiet.
+    let mut pre_run_warnings = options.unsupported_keys_warnings_with_model(model);
     // Surface a "no method specified, defaulting to FOCEI" notice through the
     // same channel so it reaches both stderr and FitResult.warnings.
     if let Some(w) = options.method_default_warning() {
+        pre_run_warnings.push(w);
+    }
+    // Covariate-NN regularization is applied by the FOCE-family outer
+    // optimizers only. A programmatic caller (ferx-r sets the two fields
+    // directly, bypassing `user_set_keys`) asking for it under SAEM / IMP /
+    // Bayes / VI as the final stage would otherwise get an unregularized fit
+    // with no signal at all.
+    if let Some(w) = nn_regularization_unapplied_warning(model, options, &chain) {
         pre_run_warnings.push(w);
     }
     // Emitted whenever the chain runs SAEM, independent of `options.mu_referencing`:
@@ -789,10 +1009,18 @@ fn fit_inner(
         // coordinate. The coordinate structure (and hence the names) is fixed
         // across a method chain, so the template's names serve every stage.
         let coord_names = crate::estimation::parameterization::coordinate_names(init_params);
+        // Both outcomes follow the warning convention and go into
+        // `FitResult.warnings` rather than straight to stderr — these were the
+        // only two prints on the fit path that were not behind `verbose`
+        // (#1115). The success line has to be a warning rather than a gated
+        // `eprintln!`: the filename embeds the pid and a timestamp, so a quiet
+        // caller that asked for a trace would otherwise have no way to learn
+        // where it was written. A verbose run still sees both, via the
+        // `pre_run_warnings` dump below.
         if let Err(e) = crate::estimation::trace::init(path.clone(), &coord_names) {
-            eprintln!("[ferx] warning: could not open trace file {}: {}", path, e);
+            pre_run_warnings.push(format!("could not open trace file {}: {}", path, e));
         } else {
-            eprintln!("[ferx] optimizer trace → {}", path);
+            pre_run_warnings.push(format!("optimizer trace written to {}", path));
         }
     }
 
@@ -878,11 +1106,22 @@ fn fit_inner(
     // parser rejects Form C `y[CMT=N]` readouts on SDE models — so an SDE model
     // is always single-endpoint here, which the EKF residual-variance
     // assumption in stats/likelihood.rs relies on.)
-    first_error(&check_model_options(model, options))?;
+    let option_diags = check_model_options(model, options);
+    first_error(&option_diags)?;
 
-    // Pre-compute n_params (uses init_params, available before chain runs).
-    let fixed_mask = crate::estimation::parameterization::packed_fixed_mask(init_params);
-    let n_params_pre = fixed_mask.iter().filter(|&&b| !b).count();
+    // A free variance whose initial value packs onto the optimizer's own lower
+    // rail (#1229). Evaluated on `init_params`, not `model.default_params`:
+    // `--inits-from-nca` and the ferx-r override path both replace the parsed
+    // inits, and it is the vector the optimizer actually starts from that gets
+    // clamped. Placed here — before every population-dependent check — because
+    // the predicate needs no data and fails identically for every method.
+    first_error(&check_variance_init_rails(init_params, options))?;
+
+    // Pre-compute n_params (uses init_params, available before chain runs):
+    // the coordinates the outer optimizer actually searches — neither FIX nor
+    // a block + diagonal Ω structural zero (`CompiledModel::free_packed_dim`).
+    let held_mask = crate::estimation::parameterization::packed_held_mask(init_params);
+    let n_params_pre = held_mask.iter().filter(|&&b| !b).count();
 
     // Probe NLopt algorithm availability only when global_search will actually
     // run — otherwise the CRS2-LM warning is misleading for users who never
@@ -931,7 +1170,16 @@ fn fit_inner(
     accumulated_warnings.extend(pre_run_warnings);
     // Data-reader warnings (W_ADDL_MISSING_II, W_IOV_OCC_MISSING) accumulated
     // by read_nonmem_csv into population.warnings.
-    accumulated_warnings.extend(population.warnings.iter().cloned());
+    //
+    // Through the shared filter, so `ferx check` suppresses exactly what `fit()`
+    // does — see `reader_warning_suppressed`.
+    accumulated_warnings.extend(
+        population
+            .warnings
+            .iter()
+            .filter(|w| !crate::api::validation::reader_warning_suppressed(model, w))
+            .cloned(),
+    );
 
     // Inner-gradient FD-fallback notice for the gradient-driven methods: if some
     // (but not all) subjects fall outside the analytic provider's scope, surface
@@ -967,6 +1215,17 @@ fn fit_inner(
     // copy) and `init_params`, matching the historical inline checks.
     for d in check_model_data_warnings(model, population, init_params) {
         accumulated_warnings.push(d.message);
+    }
+    // Warning-severity *option* diagnostics (e.g. W_GN_NO_RANDOM_EFFECTS, #1006):
+    // the findings worth saying but not worth refusing, since an option *combination*
+    // may well have been chosen deliberately. `first_error` above consumes only
+    // errors, so without this a warning added to `check_model_options` is reported by
+    // `ferx check` and silently dropped by `fit()` — the same treatment
+    // `check_model_data_warnings` gets, one line up. Reuses the `option_diags` already
+    // computed for `first_error`; re-calling `check_model_options` here would emit
+    // every one of these twice.
+    for d in option_diags.iter().filter(|d| !d.is_error()) {
+        accumulated_warnings.push(d.message.clone());
     }
     // Experimental-feature notices (data-independent; see check_experimental_features).
     for d in check_experimental_features(model) {
@@ -1031,6 +1290,27 @@ fn fit_inner(
 
     let mut total_iterations: usize = 0;
     let mut is_result: Option<ImportanceSamplingResult> = None;
+    // A VI stage's result must survive later stages of a chain: `methods = vi, imp`
+    // is the *recommended* way to finish a VI fit, and reading `vi` off only the
+    // final stage would silently discard it exactly when it was used correctly.
+    let mut vi_result: Option<crate::types::ViResult> = None;
+    // Which stage produced `vi_result`, so a later *estimating* stage can be recorded on
+    // it. See `ViResult::superseded_by`: the block is kept (a trailing `agq_eval_only`
+    // readout is the recommended way to finish a VI fit) but must not read as though it
+    // described the parameters the fit ends up reporting.
+    let mut vi_stage_idx: Option<usize> = None;
+    // The methods running as pure likelihood evaluators for this fit. Chain-wide, not
+    // per-stage, so it is built once here and read both inside the loop and after it.
+    let eval_only_methods: Vec<EstimationMethod> = {
+        let mut v = Vec::new();
+        if options.imp_eval_only {
+            v.push(EstimationMethod::Imp);
+        }
+        if options.agq_eval_only {
+            v.push(EstimationMethod::Laplace);
+        }
+        v
+    };
     // Per-stage convergence wall time, parallel to `chain`/`method_chain`
     // (#713). Excludes the covariance step, which is timed separately below
     // and only ever runs on the last estimating stage.
@@ -1182,7 +1462,7 @@ fn fit_inner(
         // Run the covariance step (and SIR) only on the last *estimating* stage,
         // so a chain doesn't recompute the expensive FD covariance after every
         // method (#615). See `is_last_estimating_stage` for the eval-only-IMP rule.
-        let is_last_estimating = is_last_estimating_stage(&chain, stage_idx, options.imp_eval_only);
+        let is_last_estimating = is_last_estimating_stage(&chain, stage_idx, &eval_only_methods);
         if !is_last_estimating {
             stage_opts.run_covariance_step = false;
             stage_opts.sir = false;
@@ -1202,6 +1482,84 @@ fn fit_inner(
                 n_stages,
                 method.label()
             );
+        }
+
+        // AGQ evaluation-only stage (`agq_eval_only`): not an estimator. Reconverges the
+        // EBEs at the incoming parameters, evaluates the adaptive-Gauss–Hermite marginal
+        // there, and overwrites only the reported OFV — the preceding stage's parameters,
+        // EBEs and Hessians stay canonical.
+        //
+        // The EBEs are recomputed rather than reused because adaptive quadrature centres its
+        // grid on the conditional mode and scales it by the posterior Hessian; a mode carried
+        // over from a method that never converged one (VI reports variational means, not
+        // modes) would put the grid in the wrong place. Deterministic throughout, which is
+        // the whole point relative to `methods = ..., imp` with `imp_eval_only`.
+        if method == EstimationMethod::Laplace && stage_opts.agq_eval_only {
+            let n_nodes = stage_opts.agq_nodes().unwrap_or(1);
+            let mu_k = crate::estimation::parameterization::compute_mu_k(
+                model,
+                &stage_params.theta,
+                stage_opts.mu_referencing,
+            );
+            let (eta_hats, h_matrices, _stats, kappas) =
+                crate::estimation::inner_optimizer::run_inner_loop_warm(
+                    model,
+                    population,
+                    &stage_params,
+                    stage_opts.inner_maxiter,
+                    stage_opts.inner_tol,
+                    result.as_ref().map(|r| r.eta_hats.as_slice()),
+                    Some(&mu_k),
+                    stage_opts.min_obs_for_convergence_check as usize,
+                    stage_opts.inner_restarts,
+                );
+            let nll = crate::estimation::agq::agq_population_nll(
+                model,
+                population,
+                &stage_params,
+                &eta_hats,
+                &kappas,
+                n_nodes,
+                stage_opts.hessian_anchor(),
+            );
+            let ofv = 2.0 * nll;
+            match result.as_mut() {
+                // Chained: keep the estimator's parameters and replace only the OFV, so the
+                // reported objective is the quadrature marginal at the point it reached.
+                Some(prev) => prev.ofv = ofv,
+                // Standalone: there is nothing to preserve, so this becomes the canonical
+                // result at the (unchanged) initial parameters.
+                None => {
+                    result = Some(crate::estimation::outer_optimizer::OuterResult {
+                        params: stage_params.clone(),
+                        ofv,
+                        converged: true,
+                        n_iterations: 0,
+                        eta_hats,
+                        h_matrices,
+                        kappas,
+                        covariance_matrix: None,
+                        covariance_wall_time_secs: 0.0,
+                        warnings: Vec::new(),
+                        saem_mu_ref_m_step_evals_saved: None,
+                        saem_n_subjects_hmc: None,
+                        ebe_convergence_warnings: 0,
+                        max_unconverged_subjects: 0,
+                        total_ebe_fallbacks: 0,
+                        final_gradient: None,
+                        sir_fallback_proposal: None,
+                        impmap_trace: None,
+                        bayes: None,
+                        cond_dist: None,
+                        packed_estimate: None,
+                        left_init: None,
+                        vi: None,
+                        mixture_posteriors: None,
+                    });
+                }
+            }
+            method_wall_times_secs.push(stage_start.elapsed().as_secs_f64());
+            continue;
         }
 
         // IMP evaluation-only stage (`imp_eval_only`, NONMEM `IMP EONLY=1`): not an
@@ -1264,20 +1622,36 @@ fn fit_inner(
                     bayes: None,
                     cond_dist: None,
                     packed_estimate: None,
+                    left_init: None,
+                    mixture_posteriors: None,
+                    vi: None,
                 });
             }
             let prev = result.as_ref().expect(
                 "IMP stage: prior OuterResult must exist (synthesised above when standalone)",
             );
-            match crate::estimation::importance_sampling::run_importance_sampling(
-                model,
-                population,
-                &prev.params,
-                &prev.eta_hats,
-                &prev.h_matrices,
-                &prev.kappas,
-                &stage_opts,
-            ) {
+            // Mixture (#985): evaluate the class-marginal IS objective
+            // −2 Σ log Σ_k p_ik L_ik (per-class MAP + IS, combined), rather than
+            // the single-population marginal.
+            let is_call = if model.mixture.is_some() {
+                crate::estimation::importance_sampling::run_importance_sampling_mixture(
+                    model,
+                    population,
+                    &prev.params,
+                    &stage_opts,
+                )
+            } else {
+                crate::estimation::importance_sampling::run_importance_sampling(
+                    model,
+                    population,
+                    &prev.params,
+                    &prev.eta_hats,
+                    &prev.h_matrices,
+                    &prev.kappas,
+                    &stage_opts,
+                )
+            };
+            match is_call {
                 Ok(r) => {
                     // Surface a *separate* warning for any subject whose
                     // ESS-fraction collapsed to zero. These are already in
@@ -1368,6 +1742,9 @@ fn fit_inner(
             EstimationMethod::Bayes => {
                 crate::estimation::bayes::run_bayes(model, population, &stage_params, &stage_opts)?
             }
+            EstimationMethod::Vi => {
+                crate::estimation::vi::run_vi(model, population, &stage_params, &stage_opts)?
+            }
             _ => optimize_population(model, population, &stage_params, &stage_opts),
         };
 
@@ -1376,9 +1753,17 @@ fn fit_inner(
             .push((stage_start.elapsed().as_secs_f64() - stage_cov_secs).max(0.0));
         covariance_wall_time_secs += stage_cov_secs;
 
+        if stage_result.vi.is_some() {
+            vi_result = stage_result.vi.clone();
+            vi_stage_idx = Some(stage_idx);
+        }
         stage_params = stage_result.params.clone();
         total_iterations += stage_result.n_iterations;
-        for w in &stage_result.warnings {
+        for w in stage_result
+            .warnings
+            .iter()
+            .filter(|w| keep_gn_zero_eta_warning(w, is_last_estimating))
+        {
             accumulated_warnings.push(if n_stages > 1 {
                 format!("[{}] {}", method.label(), w)
             } else {
@@ -1413,15 +1798,22 @@ fn fit_inner(
                 let df = stage_opts.impmap_proposal_df;
                 marg_opts.imp_proposal_df = if df.is_finite() && df >= 1.0 { df } else { 5.0 };
             }
-            match crate::estimation::importance_sampling::run_importance_sampling(
-                model,
-                population,
-                &r.params,
-                &r.eta_hats,
-                &r.h_matrices,
-                &r.kappas,
-                &marg_opts,
-            ) {
+            let marg_call = if model.mixture.is_some() {
+                crate::estimation::importance_sampling::run_importance_sampling_mixture(
+                    model, population, &r.params, &marg_opts,
+                )
+            } else {
+                crate::estimation::importance_sampling::run_importance_sampling(
+                    model,
+                    population,
+                    &r.params,
+                    &r.eta_hats,
+                    &r.h_matrices,
+                    &r.kappas,
+                    &marg_opts,
+                )
+            };
+            match marg_call {
                 Ok(is) => is_result = Some(is),
                 Err(e) => accumulated_warnings.push(if n_stages > 1 {
                     format!("[{}] marginal −2 log L eval skipped: {}", method.label(), e)
@@ -1439,6 +1831,32 @@ fn fit_inner(
     let mut result = result.expect("method chain must have at least one stage");
     // Overwrite with chain-aware totals
     result.n_iterations = total_iterations;
+
+    // Mark a VI block that a later *estimating* stage has overtaken. The block is kept —
+    // a trailing `agq_eval_only` / `imp_eval_only` readout is how a VI fit is meant to be
+    // finished, and the per-subject variational covariance is the only one in the result —
+    // but on `methods = [vi, focei]` everything on it describes VI's parameter point, not
+    // the one the fit reports. `is_last_estimating_stage` is the same predicate the loop
+    // used, so trailing evaluators do not count as superseding.
+    if let (Some(vi), Some(idx)) = (vi_result.as_mut(), vi_stage_idx) {
+        if !is_last_estimating_stage(&chain, idx, &eval_only_methods) {
+            let by = chain[idx + 1..]
+                .iter()
+                .rposition(|m| !eval_only_methods.contains(m))
+                .map(|off| chain[idx + 1 + off].label().to_string());
+            if let Some(by) = by {
+                vi.superseded_by = Some(by.clone());
+                accumulated_warnings.push(format!(
+                    "VI: the reported theta/Omega/sigma come from the later {by} stage, but \
+                     the vi block (eta_means, eta_covs, ELBO, elbo_tightness_ratio) still \
+                     describes the parameter point VI ended on. Read it there, or run VI as the \
+                     last estimating stage (a trailing agq_eval_only / imp_eval_only readout does \
+                     not move the estimates)."
+                ));
+            }
+        }
+    }
+
     result.warnings = accumulated_warnings;
 
     // Thread efficiency warnings (post-chain, uses n_threads_used captured above).
@@ -1467,7 +1885,22 @@ fn fit_inner(
         }
     }
 
-    // Compute per-subject diagnostics
+    // Compute per-subject diagnostics. For a mixture (#985) each subject's
+    // diagnostics are evaluated under its own MIXEST class: `result.eta_hats` are
+    // the winning class's EBEs, so predictions built with `MIXNUM` at the class-1
+    // default would mix a class-2 η̂ with class-1 typical values.
+    let mixest_classes: Option<Vec<usize>> = result
+        .mixture_posteriors
+        .as_ref()
+        .map(|mp| mp.mixest.clone());
+    //
+    // ODE models run this pass inside a solver-statistics scope (#1080 Part B): it is the one
+    // production sweep that integrates every subject at the final estimates through the
+    // ordinary dispatch, so it is where `min_dt` clamps and `auto`'s escalation/rejection
+    // decisions can be observed without threading a stats sink through every predictor. Costs
+    // one thread-local read per segment on the ODE path and nothing at all elsewhere.
+    let solver_stats_scope =
+        integrates_odes(model).then(crate::ode::solver::SolverStatsScope::enter);
     let mut subjects = compute_subject_results(
         model,
         population,
@@ -1476,7 +1909,47 @@ fn fit_inner(
         &result.h_matrices,
         &result.kappas,
         options.interaction,
+        mixest_classes.as_deref(),
     );
+    let mut ode_solver_stats = solver_stats_scope
+        .map(|scope| scope.collected())
+        .unwrap_or_default();
+    // The prediction sweep above is `f64`, so the guard's jet-finiteness clause — the one
+    // decision only a dual solve can take (#1204) — leaves no trace in it. One analytic
+    // sensitivity solve per subject is what makes that clause reportable: the solve the fit's
+    // gradient ran throughout, run once more at the estimates the fit reports. No-ops for
+    // every model not on the analytic ODE sensitivity path, and for every FD fit.
+    //
+    // It gets its **own** scope, and exactly one field crosses back. Sharing the prediction
+    // pass's scope would double every step, clamp and escalation count across two different
+    // solves — and worse, a `min_dt` clamp that happened only in the gradient solve would
+    // fire the warning's clamp clause, which tells the user their *predictions* were
+    // freeze-padded. Only `auto_stiff_rejected_jets` describes something the prediction pass
+    // structurally cannot observe, so only it is carried over.
+    if integrates_odes(model) {
+        let sens_scope = crate::ode::solver::SolverStatsScope::enter();
+        sweep_sensitivity_solver_stats(
+            model,
+            population,
+            &result.params,
+            &result.eta_hats,
+            mixest_classes.as_deref(),
+        );
+        ode_solver_stats.auto_stiff_rejected_jets = sens_scope.collected().auto_stiff_rejected_jets;
+    }
+
+    // Mixture (#977 Phase 5): thread the converged per-subject posteriors onto
+    // each SubjectResult so output.rs can emit the PMIX_1..PMIX_K and MIXEST
+    // columns. MIXEST is stored 1-based to match the NONMEM `MIXEST` convention.
+    if let Some(mp) = &result.mixture_posteriors {
+        for (sr, (pmix, mixest)) in subjects
+            .iter_mut()
+            .zip(mp.pmix.iter().zip(mp.mixest.iter()))
+        {
+            sr.pmix = Some(pmix.clone());
+            sr.mixest = Some(mixest + 1);
+        }
+    }
 
     // Post-fit: compute [derived] and [output] columns, and populate per_obs_tad
     // (with individual lagtime) for the mandatory TAD column in output.rs.
@@ -1487,6 +1960,7 @@ fn fit_inner(
             &result.params.theta,
             &result.kappas,
             &mut subjects,
+            mixest_classes.as_deref(),
         );
     }
 
@@ -1528,10 +2002,21 @@ fn fit_inner(
     } else {
         f64::NAN
     };
+    // Delattre class tally behind the BIC variants (#1177): the same packed
+    // held mask `n_params` was counted from, split by segment.
+    let bic_inputs =
+        crate::model_selection::bic_inputs_for(model, init_params, &held_mask, n_for_bic);
+    debug_assert_eq!(
+        bic_inputs.n_free(),
+        n_params,
+        "BIC class tally must partition the free packed parameters"
+    );
 
     // Extract SEs from covariance matrix using converged parameter values
     let (se_theta, se_omega, se_sigma, se_kappa) =
         extract_standard_errors(&result.covariance_matrix, &result.params);
+    let se_residual_correlations =
+        extract_residual_correlation_se(&result.covariance_matrix, &result.params);
 
     // Optional SIR step
     let mut warnings = result.warnings;
@@ -1585,6 +2070,13 @@ fn fit_inner(
         // grid-integral path also returns NaN for affected sessions.
         // ODE models with resets are handled correctly (ode_dense_solve_states applies
         // the reset as a break-point); this warning is analytical-only.
+        //
+        // One nuance for a TV-covariate ODE subject, already inside
+        // W_DERIVED_CMT_TV_ODE's scope above: that state pass is frozen at the
+        // first-observation snapshot throughout, so an `[odes] init(...)` re-seeded at a
+        // reset uses that snapshot rather than the reset row's own, while `ipred` uses the
+        // reset row's (#1133). Self-consistent within the pass and covered by the warning,
+        // but it means the two can differ by the covariate ratio at the reset.
         if model.ode_spec.is_none() && population.subjects.iter().any(|s| s.has_resets()) {
             warnings.push(
                 "W_DERIVED_CMT_RESET_ANALYTICAL: analytical model with EVID=3/4 \
@@ -1675,26 +2167,32 @@ fn fit_inner(
                 result.ofv,
                 options,
             ) {
-                Ok(sir) => Some(sir),
+                Ok(sir) => {
+                    for w in &sir.warnings {
+                        warnings.push(format!("SIR: {}", w));
+                    }
+                    Some(sir)
+                }
                 Err(e) => {
                     warnings.push(format!("SIR failed: {}", e));
                     None
                 }
             }
         } else {
-            warnings.push(
-                "SIR requested but covariance matrix is not available. \
-                 Enable covariance = true in [fit_options]."
-                    .to_string(),
-            );
+            // No covariance matrix — but this is not the end of the road for a
+            // `sir = true` request: the non-PD fallback below is armed by
+            // `sir = true` as well as by `covariance_fallback = sir` (#972).
+            // The warning, if SIR really cannot run, is emitted after the
+            // fallback has had its chance.
             None
         }
     } else {
         None
     };
 
-    // SIR fallback: when the FD Hessian is non-PD and covariance_fallback = sir,
-    // run SIR with the rectified |eigenvalue| proposal built inside compute_covariance.
+    // SIR fallback: when the FD Hessian is non-PD and the user asked for SIR
+    // (`covariance_fallback = sir` or `sir = true`), run SIR with the rectified
+    // |eigenvalue| proposal built inside compute_covariance.
     let sir_fallback_result = resolve_sir_fallback(
         options,
         result.covariance_matrix.is_some(),
@@ -1707,6 +2205,21 @@ fn fit_inner(
         result.ofv,
         &mut warnings,
     );
+
+    // Only now, with both SIR paths resolved, can we tell a user who asked for
+    // SIR *why* they got none — and point them at the right knob (#972).
+    if !crate::cancel::is_cancelled(&options.cancel) {
+        if let Some(msg) = sir_unavailable_warning(
+            options.sir,
+            options.run_covariance_step,
+            result.bayes.is_some(),
+            result.covariance_matrix.is_some(),
+            result.sir_fallback_proposal.is_some(),
+            sir_result.is_some() || sir_fallback_result.is_some(),
+        ) {
+            warnings.push(msg);
+        }
+    }
 
     // `final_method` reports the last *estimating* stage. An evaluation-only IMP
     // (`imp_eval_only`) doesn't produce parameters, so a chain like `[saem, imp]`
@@ -1762,9 +2275,32 @@ fn fit_inner(
         warnings.push(msg);
         native_warnings.push(entry);
     }
+    // Parameter estimates pinned to hidden packed-space implementation guards.
+    // This is distinct from a user-declared theta bound: the affected result
+    // reached an implementation safety limit (#1099).
+    //
+    // An upper-guard hit also demotes `converged` (#1118). Unlike a declared
+    // THETA bound — where a boundary hit can be a valid constrained optimum — an
+    // internal ceiling cannot be, so the flag would otherwise hand a programmatic
+    // consumer a point that is by construction not an interior optimum.
+    // `result.params` holds the *final* stage's estimates, so a chained
+    // `methods = vi, focei` is gated on its last stage, like `run_covariance_step`.
+    let mut converged = result.converged;
+    if let Some((msg, entry)) = runaway_guard_warning(&mut converged, &result.params) {
+        warnings.push(msg);
+        native_warnings.push(entry);
+    }
     // Imprecisely estimated thetas (high relative standard error) — likewise
     // emitted typed at source with `details` (#781).
     if let Some((msg, entry)) = inflated_rse_warning(&se_theta, &result.params) {
+        warnings.push(msg);
+        native_warnings.push(entry);
+    }
+    // ODE-solver health at the final estimates (#1080 Part B): min-`dt` clamps, `auto`
+    // escalations, and escalations the guard discarded — none of which any production path
+    // reported before. Emitted typed at source, at `Info` severity when the only thing to
+    // report is that `auto` escalated and it worked.
+    if let Some((msg, entry)) = ode_solver_diagnostics_warning(&ode_solver_stats, options) {
         warnings.push(msg);
         native_warnings.push(entry);
     }
@@ -1891,11 +2427,14 @@ fn fit_inner(
 
     let mut fit_result = FitResult {
         restored_from_checkpoint: false,
+        // #1111: the `[covariate_model]` echo, joined to the θ this fit
+        // estimated. Filled in just below, once `fit_result` owns the θ vector.
+        covariate_relations: Vec::new(),
         method: final_method,
         method_chain: chain.clone(),
         method_wall_times_secs,
         covariance_wall_time_secs,
-        converged: result.converged,
+        converged,
         ofv,
         aic,
         bic,
@@ -1905,15 +2444,24 @@ fn fit_inner(
         omega: result.params.omega.matrix.clone(),
         sigma: result.params.sigma.values.clone(),
         sigma_names: result.params.sigma.names.clone(),
+        // The **fitted** correlations, not the model's declaration: a non-`FIX`
+        // `block_sigma` estimates its off-diagonal (#847), so reading these off
+        // `model` would report the initial value as if it were the estimate.
+        residual_correlations: result.params.residual_correlations.clone(),
+        residual_correlation_fixed: result.params.residual_correlation_fixed.clone(),
         error_model: model.error_model,
         covariance_matrix: result.covariance_matrix,
         // The optimizer's exact packed vector (FOCE/FOCEI paths), so a later
         // `run_covariance` reproduces this fit's covariance step bit-for-bit (#816
         // follow-up). `None` for estimators that don't pack in Cholesky space.
         packed_estimate: result.packed_estimate,
+        left_init: result.left_init,
+        omega_is_diagonal: Some(result.params.omega.diagonal),
+        kappa_is_diagonal: result.params.omega_iov.as_ref().map(|m| m.diagonal),
         se_theta,
         se_omega,
         se_sigma,
+        se_residual_correlations,
         theta_fixed: result.params.theta_fixed.clone(),
         omega_fixed: result.params.omega_fixed.clone(),
         sigma_fixed: result.params.sigma_fixed.clone(),
@@ -1951,10 +2499,23 @@ fn fit_inner(
         importance_sampling: is_result,
         impmap_trace: result.impmap_trace.clone(),
         bayes: result.bayes.clone(),
+        vi: vi_result.clone(),
         omega_iov: result.params.omega_iov.as_ref().map(|m| m.matrix.clone()),
         kappa_names: model.kappa_names.clone(),
         kappa_fixed: result.params.kappa_fixed.clone(),
         kappa_init_as_sd: model.kappa_init_as_sd.clone(),
+        // Left empty unless a kappa actually carries a weight, so an ordinary
+        // IOV fit's YAML/fitrx output is byte-identical to before #1031.
+        kappa_weights: if model.has_weighted_kappa() {
+            model
+                .kappa_weights
+                .iter()
+                .map(|w| w.as_ref().map(|w| w.expr.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        },
+        kappa_weight_typical: kappa_weight_typicals(model, population, &result.params.theta),
         se_kappa,
         shrinkage_kappa,
         shrinkage_kappa_by_occ,
@@ -1989,6 +2550,7 @@ fn fit_inner(
             .sigma_types(result.params.sigma.values.len()),
         cov_eigenvalues,
         cov_condition_number,
+        bic_inputs,
         eta_log_transformed,
         omega_param_corr,
         omega_iov_param_corr,
@@ -2088,5 +2650,57 @@ fn fit_inner(
         fit_result.warnings_structured.push(entry);
     }
 
+    // The `[covariate_model]` echo (#1111): the relations as declared, joined to
+    // the θ this fit estimated and their standard errors. Built here rather than
+    // in the literal above because it reads the assembled θ vector.
+    fit_result.covariate_relations = crate::api::covariate_relation_estimates(
+        model,
+        &fit_result.theta_names,
+        &fit_result.theta,
+        fit_result.se_theta.as_ref(),
+        &fit_result.theta_fixed,
+    );
+
     Ok(fit_result)
+}
+
+#[cfg(test)]
+mod bobyqa_scale_warning_tests {
+    use super::bobyqa_scale_warning;
+    use crate::types::{Optimizer, BOBYQA_MAX_DIM};
+
+    #[test]
+    fn no_warning_at_or_below_the_threshold() {
+        assert!(bobyqa_scale_warning(Optimizer::Bobyqa, BOBYQA_MAX_DIM).is_none());
+        assert!(bobyqa_scale_warning(Optimizer::Bobyqa, 1).is_none());
+    }
+
+    #[test]
+    fn an_explicit_bobyqa_above_the_threshold_warns() {
+        let w = bobyqa_scale_warning(Optimizer::Bobyqa, BOBYQA_MAX_DIM + 1)
+            .expect("an explicit bobyqa at this size must not be a silent hour");
+        assert!(w.contains("optimizer = bobyqa"), "{w}");
+        assert!(
+            w.contains("nlopt_lbfgs"),
+            "the message must name the way out: {w}"
+        );
+    }
+
+    #[test]
+    fn other_optimizers_are_never_warned_about() {
+        // `auto` resolves itself (see `Optimizer::resolve_auto`); the rest are
+        // gradient-based and cost O(n).
+        for opt in [
+            Optimizer::Auto,
+            Optimizer::NloptLbfgs,
+            Optimizer::Slsqp,
+            Optimizer::Mma,
+            Optimizer::TrustRegion,
+        ] {
+            assert!(
+                bobyqa_scale_warning(opt, BOBYQA_MAX_DIM * 10).is_none(),
+                "{opt:?} must not warn"
+            );
+        }
+    }
 }

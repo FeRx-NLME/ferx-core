@@ -11,13 +11,20 @@ use std::path::Path;
 
 // ── validation subsystem (extracted verbatim; see src/api/validation.rs) ──
 mod validation;
+// `check_covariates` / `check_kappa_weights` / `check_residual_magnitude` are the
+// *parts* of `check_simulation_data` (#1083). Production now calls the bundle, so
+// the parts are re-exported for the unit tests that pin each one's message
+// individually — hence the allow, which would otherwise fire on a non-test build.
+#[allow(unused_imports)]
 pub(crate) use validation::{
     apply_iov_occasion_rule, assert_absorption_closed_form_support,
     assert_absorption_dosing_supported, assert_absorption_flip_flop_no_twin,
-    assert_analytic_readout_support, assert_dose_compartments_supported,
-    assert_modeled_doses_supported, check_absorption_closed_form_support, check_absorption_dosing,
-    check_absorption_flip_flop_no_twin, check_analytic_readout_support, check_covariates,
-    check_dose_compartments, check_modeled_dose_rates,
+    assert_analytic_readout_support, assert_covariates_present, assert_dose_compartments_supported,
+    assert_endpoint_routing, assert_modeled_doses_supported, check_absorption_closed_form_support,
+    check_absorption_dosing, check_absorption_flip_flop_no_twin, check_analytic_readout_support,
+    check_covariates, check_dose_compartments, check_endpoint_routing, check_kappa_weights,
+    check_modeled_dose_rates, check_residual_magnitude, check_simulation_data,
+    check_variance_init_rails,
 };
 #[cfg(feature = "survival")]
 pub(crate) use validation::{
@@ -30,7 +37,9 @@ pub use validation::{
 
 // ── production submodules (peeled from this file) ──
 mod adaptive;
+mod covariate_stats;
 mod fit;
+mod levels;
 mod output_columns;
 mod pool;
 mod postfit;
@@ -42,26 +51,38 @@ pub use adaptive::{
     simulate_adaptive, simulate_adaptive_from_spec, AdaptiveSimulateOptions,
     AdaptiveSimulationResult,
 };
+pub use covariate_stats::{assert_covariate_model_bound, bind_covariate_stats};
 pub use fit::{fit, fit_from_files};
+pub use levels::{bind_theta_levels, level_map as theta_level_map};
 pub use output_columns::tafd_tad_for_subject;
 pub(crate) use output_columns::{compute_extra_output_columns, trapezoid};
-pub use pool::configure_global_thread_pool;
-pub(crate) use pool::{build_fit_pool, default_fit_pool};
+pub use pool::{configure_global_thread_pool, PoolPlan, FIT_RAYON_STACK_SIZE};
+pub(crate) use pool::{install_on_fit_pool, with_fit_ode_scope};
+// Reached only from tests (the fit paths call these from inside `pool` itself), but `pool` is
+// private to `api`, so a test elsewhere in the crate needs the re-export.
+#[cfg(test)]
+pub(crate) use pool::{default_fit_pool, ode_override_pool};
 pub(crate) use postfit::{
     absorption_flip_flop_ebe_warning, boundary_estimate_warning, compute_eps_shrinkage,
     compute_eta_shrinkage, compute_kappa_shrinkage, compute_kappa_shrinkage_by_occ,
-    compute_param_corr, compute_subject_results, cov_diagnostics, eps_shrinkage_warning,
-    eta_shrinkage_warning, extract_standard_errors, high_correlation_warning, inflated_rse_warning,
-    is_last_estimating_stage, probe_nlopt_algorithms, rebuild_warnings_structured,
-    resolve_covariance_status, resolve_sir_fallback,
+    compute_param_corr, compute_subject_results, cov_diagnostics, covariate_relation_estimates,
+    eps_shrinkage_warning, eta_shrinkage_warning, extract_residual_correlation_se,
+    extract_standard_errors, high_correlation_warning, inflated_rse_warning, integrates_odes,
+    is_last_estimating_stage, kappa_weight_typicals, keep_gn_zero_eta_warning,
+    ode_solver_diagnostics_warning, probe_nlopt_algorithms, rebuild_warnings_structured,
+    resolve_covariance_status, resolve_sir_fallback, runaway_guard_warning,
+    sir_unavailable_warning, sweep_sensitivity_solver_stats,
 };
 pub use predict::{predict, PredictionResult};
 #[cfg(feature = "survival")]
 pub use predict::{predict_categorical, predict_survival, SurvivalPredictionResult};
-pub(crate) use run::{build_selection_filter_merged, log_transform_observations};
+pub(crate) use run::{
+    build_selection_filter_merged, log_transform_observations, read_population_routed_by,
+};
 pub use run::{
-    read_population_for, resolve_data_path, run_from_file, run_model_simulate, run_model_with_data,
-    run_model_with_data_inits,
+    prepare_run, prepare_run_with_inits, read_population_for, read_population_for_simulation,
+    resolve_data_path, run_from_file, run_model_simulate, run_model_with_data,
+    run_model_with_data_inits, PreparedRun,
 };
 pub(crate) use simulate::obs_row_time;
 pub use simulate::{
@@ -84,11 +105,11 @@ pub(crate) use fit::{
 #[cfg(test)]
 pub(crate) use output_columns::build_indiv_map;
 #[cfg(test)]
-pub(crate) use pool::{cap_default_threads, default_thread_count, FIT_RAYON_STACK_SIZE};
+pub(crate) use pool::{cap_default_threads, default_thread_count, effective_default_threads};
 #[cfg(test)]
 pub(crate) use postfit::{
-    diagnostic_details, high_correlation_pairs, should_run_sir_fallback, theta_boundary_side,
-    DiagStats,
+    diagnostic_details, high_correlation_pairs, packed_guard_side, should_run_sir_fallback,
+    theta_boundary_side, DiagStats,
 };
 #[cfg(all(test, feature = "survival"))]
 pub(crate) use predict::grid_median_from_cumhaz;
@@ -158,12 +179,32 @@ mod multistart_prefers_tests;
 mod build_indiv_map_tests;
 
 #[cfg(test)]
+#[path = "tests/quiet_fit_tests.rs"]
+mod quiet_fit_tests;
+
+#[cfg(test)]
 #[path = "tests/tests.rs"]
 mod tests;
 
 #[cfg(test)]
 #[path = "tests/dose_compartment_tests.rs"]
 mod dose_compartment_tests;
+
+#[cfg(test)]
+#[path = "tests/scaling_undefined_tests.rs"]
+mod scaling_undefined_tests;
+
+#[cfg(test)]
+#[path = "tests/simulation_template_tests.rs"]
+mod simulation_template_tests;
+
+#[cfg(test)]
+#[path = "tests/simulation_design_covariates_tests.rs"]
+mod simulation_design_covariates_tests;
+
+#[cfg(test)]
+#[path = "tests/endpoint_routing_tests.rs"]
+mod endpoint_routing_tests;
 
 // ======================================================================
 // Adaptive (state-reactive / feedback) dosing — epic #391, beta.
@@ -213,6 +254,14 @@ mod tests_sir_fallback;
 mod tests_param_corr;
 
 #[cfg(test)]
+#[path = "tests/ode_solver_diagnostics_tests.rs"]
+mod ode_solver_diagnostics_tests;
+
+#[cfg(test)]
+#[path = "tests/ode_solver_options_tests.rs"]
+mod ode_solver_options_tests;
+
+#[cfg(test)]
 #[path = "tests/simulate_with_uncertainty_tests.rs"]
 mod simulate_with_uncertainty_tests;
 
@@ -225,6 +274,14 @@ mod sde_integration;
 #[cfg(test)]
 #[path = "tests/multi_start_tests.rs"]
 mod multi_start_tests;
+
+#[cfg(test)]
+#[path = "tests/tests_mixture_postfit.rs"]
+mod tests_mixture_postfit;
+
+#[cfg(test)]
+#[path = "tests/zero_omega_tests.rs"]
+mod zero_omega_tests;
 
 #[cfg(test)]
 #[path = "tests/tests_sdtab_tv_cov.rs"]

@@ -1,0 +1,35 @@
+# The near-exact reference: adaptive Gauss-Hermite quadrature on the same model.
+#
+# This is the only arm with a claim to ground truth. `n_agq = 9` reproduces both tools' FOCEI
+# sigma to six decimals (0.010565), which is what makes it usable as the arbiter: a
+# ferx-vs-nlmixr2 comparison alone cannot say which side is right, and both VI implementations
+# were wrong in the same direction until each was run to convergence.
+#
+# It anchors the per-subject figures too. plots.R builds the Laplace posterior covariance
+# H^-1 at these parameters and reads both tools' variational S against it, rather than against
+# each other.
+[parameters]
+  theta TVCL(0.13, 0.001, 10.0)
+  theta TVV(8.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+
+  sigma PROP_ERR ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method = laplace
+  n_agq = 9

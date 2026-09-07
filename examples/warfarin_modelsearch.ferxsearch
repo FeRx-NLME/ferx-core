@@ -1,0 +1,39 @@
+# Structural model search over examples/warfarin.ferx (#1181).
+#
+#   ferx modelsearch examples/warfarin_modelsearch.ferxsearch
+#
+# The space is written in Pharmpy's Model Feature Language: every category
+# lists the values a candidate may take, and the base model is moved onto
+# the space if it lies outside it (write `LAGTIME([OFF,ON])`, not
+# `LAGTIME(ON)`, to explore a lag rather than force it). Add
+# `TRANSITS([0,3], NODEPOT)` or `TRANSITS(N)` to search transit absorption
+# too — a two-compartment transit fit with the covariance step is minutes,
+# not seconds, on this dataset, which the report's `seconds` column shows.
+# See docs/tools/modelsearch.qmd for the algorithms and the coverage table.
+
+base = "warfarin.ferx"
+data = "../data/warfarin.csv"
+
+[space]
+mfl = """
+ABSORPTION(FO); PERIPHERALS(0..1); LAGTIME([OFF,ON])
+"""
+
+[modelsearch]
+algorithm    = "reduced_stepwise"     # or "exhaustive_stepwise", "exhaustive"
+iiv_strategy = "absorption_delay"     # eta on a new lag time / mean transit time only
+
+[rank]
+type   = "bic"                        # the mixed BIC, Pharmpy's default
+cutoff = 3.84                         # a candidate must beat the base by this much
+
+[strictness]
+require_converged    = true
+max_condition_number = 1000.0
+max_correlation      = 0.95
+reject_on_boundary   = true
+
+[run]
+threads   = 4
+retries   = 2
+cache_dir = ".ferx-modelsearch"

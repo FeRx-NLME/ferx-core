@@ -1,0 +1,46 @@
+# FOCEI on the MIXED-omega model -- the reference the VI block arms are read against.
+#
+# Two jobs: supply the (ETA_CL, ETA_V) correlation that VI has to recover, and re-run the
+# section-4.4 constant-convention check on *this* model, so a block-specific offset cannot be
+# mistaken for a VI disagreement.
+#
+# READ THIS BEFORE COMPARING ITS OMEGA. ferx's FOCEI does NOT honour the structural zeros
+# declared below: measured 2026-08-20 it returned cov(KA,CL) = -0.030329 and
+# cov(KA,V) = 0.019807, and reported n_parameters = 10 -- 3 theta + a FULL 6-element lower
+# triangle + 1 sigma, where an honoured mixed Omega would be 8. The VI arms on the same file
+# hold both slots at zero, as do SAEM and GN, which filter on `omega.free_mask`; the outer
+# optimizer's pack/unpack (estimation/parameterization.rs) enumerates the whole lower triangle
+# and only the covariance step consults `omega_structural_zero_mask`.
+#
+# Consequence for this harness: this fit is a FULL-Omega reference, not a mixed-Omega one. Its
+# cov(CL,V) is still the useful comparator (0.001898 here vs 0.001899 from the VI closed-form
+# arm), and its OFV bounds what correlation is in the data at all. But nlmixr2's FOCEI on the
+# same declaration DOES honour the block structure, so a ferx-vs-nlmixr2 Omega comparison on
+# this arm is comparing two different models -- do not read a disagreement there as a VI result.
+#
+# Omega mirrors src/estimation/vi/run_tests.rs::mixed_omega_fixture and
+# examples/warfarin_block_omega.ferx: ETA_KA sits outside the block, so Omega(KA,CL) and
+# Omega(KA,V) are STRUCTURAL ZEROS.
+[parameters]
+  theta TVCL(0.13, 0.001, 10.0)
+  theta TVV(8.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+
+  block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]
+  omega ETA_KA ~ 0.30
+
+  sigma PROP_ERR ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method = focei

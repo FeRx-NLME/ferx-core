@@ -1,3 +1,7 @@
+---
+pagetitle: "Steady-state doses in ferx"
+---
+
 # Steady-State Doses (SS=1)
 
 > **Maturity: stable** — see [Feature Maturity](../maturity.qmd) for what this means.
@@ -136,11 +140,16 @@ This also covers the dosing forms below (all closed by #486):
   recurrence anchored to the pulse, not wall-clock time), but a later observation's elapsed
   time since arrival still does, and the saltation captures exactly that.
 
-One SS sub-case still routes to the finite-difference fallback (and always will):
+One SS sub-case routes to the finite-difference fallback:
 
 - **SS + a non-autonomous RHS** (one that reads the `TIME`/`TAFD`/`TAD` builtins) — the
-  equilibration expands a *time-invariant* pulse train, so a time/`TAD`-dependent RHS breaks
-  the steady-state cycle recurrence; such models stay on FD.
+  *dual* equilibration anchors both model-time slots at zero and does not re-anchor them
+  per window, so its cycle recurrence is not the one the value path computes. Such models
+  stay on FD. Note this is a statement about the **gradient route only**: the value path
+  does anchor `TAD` correctly since [#1139](https://github.com/FeRx-NLME/ferx-core/issues/1139) (see
+  [Steady state with a `TAD`-reading RHS](#steady-state-with-a-tad-reading-rhs)), so these
+  models fit — with a finite-difference inner gradient, reported in
+  `FitResult.warnings`.
 
 ### Numeric cross-check against NONMEM 7.5.1 (SS + modeled-duration dose)
 
@@ -287,7 +296,7 @@ single-dose model. SS is a property of the **dataset**:
 Combine with the SS=1 dataset above and run:
 
 ```
-cargo run --release -- examples/ss_oral_q24.ferx --data data/ss_oral_q24.csv
+cargo run --release -p ferx-cli -- examples/ss_oral_q24.ferx --data data/ss_oral_q24.csv
 ```
 
 A runnable example pair ships in the repository at
@@ -318,6 +327,84 @@ the ODE solver), and the result is validated against NONMEM `ALAG1` +
 > This holds for any realistic lagtime; overlapping infusions
 > (`T_inf > II`) are rejected as described under *Limitations*.
 
+## Steady state with a `TAD`-reading RHS
+
+An `[odes]` right-hand side may read the model-time builtins `TIME`/`T`, `TAFD` and `TAD`
+(see [ODE models](ode-models.qmd)). Under `SS=1` these behave differently, because the
+steady-state run-in does not integrate on the subject's clock — it expands a periodic
+pulse train on a clock local to each cycle.
+
+`TAD` is the one of the three that has a periodic steady state at all: it is bounded
+inside one dosing interval, so an infinitely long dose train converges. ferx anchors it to
+each run-in window's own pulse, so an `SS=1` dose on a `TAD`-reading RHS returns the
+periodic solution and agrees with the same model written as an explicit dose train.
+
+```
+[odes]
+  d/dt(central) = -(CL/V) * central * (1.0 + 0.03*TAD)
+```
+
+Measured on `CL = 1`, `V = 20`, `AMT = 100`, `II = 12` with a single `SS=1` record at
+`t = 480` and samples at 482/485/488/491, against NONMEM 7.6.0 (`ADVAN13 TOL=9`, the cycle
+clock written as `MOD(T + 120, 12)` since `$DES` has no `TAD` builtin — see
+`nonmem_anchor/ss_tad.ctl`):
+
+| | t = 482 | worst relative error |
+|---|---|---|
+| ferx `SS=1` | 8.8902009677 | — |
+| NONMEM `SS=1` | 8.8902010334 | 7.4e-9 |
+| Explicit 41-dose train (both engines) | 8.8902010448 | 9.1e-9 |
+| Closed form, outside both engines | 8.8902009650 | ferx 3.0e-10 · NONMEM 8.3e-9 |
+
+Before [#1139](https://github.com/FeRx-NLME/ferx-core/issues/1139) this returned `NaN` at
+every observation and a non-finite objective —
+including when the term's coefficient was **zero**, since `0.0 * NaN` is `NaN`, so merely
+mentioning `TAD` broke an otherwise ordinary steady-state model.
+
+### Under a lagtime {#steady-state-tad-under-a-lagtime}
+
+A lagtime opens a window between the dose **record** and the lagged arrival,
+`[t_dose, t_dose + ALAG)`. Since ferx 0.3 the periodic state is loaded at the record and flows
+to the arrival, so the state in that window is the *previous* cycle's decaying tail — and `TAD`
+measures from that cycle's pulse, at `t_dose − max(II − ALAG, 0)`. It therefore runs
+`II − ALAG … II` across the window and resets to `0` when the dose lands, which is the same
+sawtooth an explicit dose train produces.
+
+The same model with `ALAG1 = 3`, one `SS=1` record at `t = 480` (so the arrival is at 483) and
+samples at 481 / 482, both **inside** the window:
+
+| | t = 481 | worst relative error |
+|---|---|---|
+| ferx `SS=1` | 5.5452940851 | — |
+| Explicit 41-dose lagged train (ferx) | 5.5452940849 | 2.5e-11 |
+| Explicit 41-dose lagged train (NONMEM) | 5.5452941786 | 1.7e-8 |
+| Closed form, outside both engines | 5.5452940825 | ferx 4.7e-10 |
+| NONMEM `SS=1` record | 5.4709357327 | **1.3e-2** |
+
+The last row is why the *train* is the reference and NONMEM's own steady-state record is not.
+With the `TAD` term removed, NONMEM's lagged `SS=1` record reproduces its own lagged train to
+1.1e-9 — so the lag geometry is not in question — but with it, NONMEM's steady-state routine
+sits 1.3 % from its own train, on both sides of the arrival. ferx reproduces the train.
+
+A lagtime of a **full interval or more** keeps the clamped phase described under
+[Lagtime](lagtime.qmd): the pulse lands on the record itself, nothing intervenes before the real
+arrival, and `TAD` runs `0 … ALAG` across the window — exceeding `II`, which is what the clamp
+means.
+
+Before ferx 0.3 this combination returned `NaN` for the **whole subject**, not only inside the
+window, because the wrong value was carried into the steady-state trough.
+
+## Steady state with `TAFD` or `TIME`
+
+`TAFD` and `TIME`/`T` are a different case and are **not** covered by the above. They read
+an absolute clock, so the dose train has no periodic limit for the run-in to converge to —
+measured, an explicit `TAFD` train moves 29 % per doubling of its length while the `TAD`
+train moves 3.5e-7. `TIME`/`T` under `SS=1` matches NONMEM (both engines equilibrate on a
+cycle-local clock and then integrate forward on absolute time, so both sit the same
+distance from their own non-convergent train), and `TAFD` under `SS=1` still reads `NaN`.
+Neither number is the steady state of a system that has one; if your model means an
+absolute clock, expand the run-in with explicit dose records instead of `SS=1`.
+
 ## Limitations
 
 For the following malformed configurations, ferx-core skips the SS
@@ -339,6 +426,37 @@ dose time, so don't interpret the fit as a steady-state fit.
   resets), still skip SS pre-equilibration here and emit the warning;
   for those, model the overlapping infusions with an `[odes]` block and
   explicit periodic dose records (without `SS=1`).
+
+### SS with an ODE-accumulated hazard {#ss-with-an-ode-accumulated-hazard}
+
+A joint PK-TTE model (`[event_model] hazard = ...`) appends a cumulative-hazard
+accumulator to the ODE system. That row is **not** a compartment: it is a pure
+integrator with no elimination term, so it has no steady state — it just counts up.
+
+`SS=1` therefore equilibrates the **PK compartments only**. The accumulator keeps
+the value it had at the dose record:
+
+- At the **first** dose of a record that value is `0`, so `H(0) = 0`. The cumulative
+  hazard is measured from the start of the subject's record; no amount of run-in
+  changes that.
+- At a **later** `SS=1` dose the value is whatever has accrued so far, and it
+  survives the re-equilibration. A second `SS=1` dose at `t = 48` re-loads the
+  compartments but keeps `H(48)` — the dose is not a reset. (`EVID=3`/`EVID=4`
+  *are*, and zero the accumulator like any other state.)
+
+Through ferx 0.3.1 the accumulator was cycled along with the compartments, so
+`H(0)` came back holding the run-in's own hazard —
+`H0 x 50 cycles x II` for a constant hazard — and every survival quantity
+downstream of it was displaced by that amount
+([#1210](https://github.com/FeRx-NLME/ferx-core/issues/1210)).
+
+**NONMEM has no native answer here.** Handing NONMEM's own steady-state routine an
+`ADVAN13` system with a hazard compartment returns `A(3) = -2.4e7` and
+`#OBJV = +INF` for a constant hazard, and `NUMERICAL DIFFICULTIES WITH STEADY STATE
+SOLUTION` / `PROGRAM TERMINATED BY OBJ` for a drug-driven one. A NONMEM user has to
+gate the hazard by hand — an explicit pulse train with `IF (T.GE.TREC) GATE = 1` in
+`$DES`. That construction is exactly what ferx's convention reproduces, and it is
+committed as the anchor for this behaviour (`nonmem_anchor/ss_chz_r2_*.ctl`).
 
 ### `SS=2`
 

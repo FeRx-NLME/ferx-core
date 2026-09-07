@@ -21,7 +21,7 @@
 # Reference (simulated): TVLAMBDA_A = 0.10 h^-1, TVLAMBDA_B = 0.06 h^-1,
 # omega(ETA_F) = 0.25, administrative censoring at t = 14 h.
 #
-# Run:  cargo run --release -- examples/tte_competing_risks.ferx --data data/tte_competing_risks.csv
+# Run:  cargo run --release -p ferx-cli -- examples/tte_competing_risks.ferx --data data/tte_competing_risks.csv
 #
 # Note: cause-specific *rates* recover tightly; the shared frailty omega^2 is
 # weakly identified and reads high under FOCEI-Laplace for TTE (prefer SAEM/IMP

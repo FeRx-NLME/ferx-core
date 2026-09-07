@@ -38,6 +38,33 @@ pub(crate) enum CovarianceStepResult {
     },
 }
 
+/// The Omega matrix to inspect when diagnosing a non-finite covariance base OFV.
+///
+/// For a mixture (#984 review) the base (class-1) Omega can be well-conditioned
+/// while a per-class `omega(k)` override has collapsed — the actual cause of the
+/// non-finite OFV. Return the worst-conditioned Omega (smallest minimum
+/// eigenvalue) across all classes, so the emitted reason names Omega collapse
+/// rather than misattributing it to a model-evaluation overflow. Non-mixture
+/// models return the single base Omega unchanged.
+fn diagnostic_omega(params_at: &ModelParameters) -> &DMatrix<f64> {
+    params_at
+        .mixture
+        .as_ref()
+        .and_then(|mp| {
+            mp.omega.iter().map(|o| &o.matrix).min_by(|a, b| {
+                let min_eig = |m| {
+                    extract_eigenvalues(m)
+                        .and_then(|ev| ev.last().copied())
+                        .unwrap_or(f64::INFINITY)
+                };
+                min_eig(a)
+                    .partial_cmp(&min_eig(b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        })
+        .unwrap_or(&params_at.omega.matrix)
+}
+
 /// Human-readable label for the packed parameter at position `packed_idx`.
 /// E.g. `"theta[CL]"`, `"omega[ETA_1, ETA_2]"`, `"sigma[1]"`.
 ///
@@ -88,9 +115,50 @@ pub(crate) fn packed_param_label(packed_idx: usize, template: &ModelParameters) 
     } else if packed_idx < n_theta + n_omega + n_sigma + n_iov {
         let idx = packed_idx - n_theta - n_omega - n_sigma + 1;
         format!("kappa[{}]", idx)
+    } else if let Some(mix) = template.mixture.as_ref().filter(|_| {
+        packed_idx < n_theta + n_omega + n_sigma + n_iov + mixture_override_len(template)
+    }) {
+        // Mixture per-class Ω/Σ override segment (#983): appended after kappa in
+        // pack order — Ω overrides first, then Σ, each `(class, eta|sigma idx)`.
+        // Label as `omega[<base>_MIX{class}]` / `sigma[<base>_MIX{class}]`, the
+        // same names `coordinate_names` emits, instead of the `packed[N]` fallback.
+        // The mixing-logit coefficients are ordinary thetas and are already
+        // labelled by the theta branch above.
+        let ov = packed_idx - (n_theta + n_omega + n_sigma + n_iov);
+        let n_omega_ov = mix.omega_override_addr.len();
+        if ov < n_omega_ov {
+            let (c, e) = mix.omega_override_addr[ov];
+            let base = template
+                .omega
+                .eta_names
+                .get(e)
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .unwrap_or_else(|| format!("OMEGA({},{})", e + 1, e + 1));
+            format!("omega[{}_MIX{}]", base, c + 1)
+        } else {
+            let (c, s) = mix.sigma_override_addr[ov - n_omega_ov];
+            let base = template
+                .sigma
+                .names
+                .get(s)
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .unwrap_or_else(|| format!("SIGMA({})", s + 1));
+            format!("sigma[{}_MIX{}]", base, c + 1)
+        }
     } else {
         format!("packed[{}]", packed_idx)
     }
+}
+
+/// Number of packed mixture-override coordinates (Ω overrides + Σ overrides),
+/// or 0 for a non-mixture `template`. Mirrors the pack-order tail appended by
+/// `pack_params`.
+fn mixture_override_len(template: &ModelParameters) -> usize {
+    template.mixture.as_ref().map_or(0, |m| {
+        m.omega_override_addr.len() + m.sigma_override_addr.len()
+    })
 }
 
 /// Format a single eigenvalue for display: `"0"`, fixed-4, or scientific-3.
@@ -109,8 +177,25 @@ fn fmt_eig(v: f64) -> String {
     }
 }
 
-/// Eigenvalues of `sym` sorted descending. Returns `None` if any eigenvalue is non-finite.
+/// Eigenvalues of `sym` sorted descending. Returns `None` if any eigenvalue is non-finite,
+/// or if `sym` is empty.
+///
+/// The empty case is reachable, not defensive: a model with **no random effects** has a
+/// 0×0 Omega, and the non-finite-objective diagnostic below asks this function to inspect
+/// it precisely when the fit has already gone wrong. `nalgebra`'s `SymmetricEigen::new`
+/// panics outright on a 0×0 input ("Unable to compute the symmetric tridiagonal
+/// decomposition of an empty matrix"), so an `n_eta = 0` fit whose objective went
+/// non-finite aborted with that message instead of reporting the objective — the diagnostic
+/// killed the run it was there to explain. `None` is the existing "cannot diagnose" signal
+/// and every caller already handles it.
+///
+/// One predicate, not `nrows() == 0 || ncols() == 0`: those two reject exactly the same
+/// inputs here, so either could be deleted with the guard still passing its own test —
+/// the redundant-gate hole from #1229 / #1255.
 pub(crate) fn extract_eigenvalues(sym: &DMatrix<f64>) -> Option<Vec<f64>> {
+    if sym.is_empty() {
+        return None;
+    }
     let eig = SymmetricEigen::new(sym.clone());
     if eig.eigenvalues.iter().any(|l| !l.is_finite()) {
         return None;
@@ -609,6 +694,10 @@ pub(crate) fn compute_covariance(
         ));
     }
     let bounds = compute_bounds(template);
+    // Mixture models (#983 Phase 6) build the FD Hessian on the K-fold mixture
+    // objective and skip the single-population reconvergence / analytic R-matrix
+    // (both single-population-only). Gated on `template.mixture`.
+    let is_mixture = template.mixture.is_some();
 
     // `h_matrices` (the H from the fit) is intentionally unused: the covariance
     // step reconverges the EBEs at every perturbed point and recomputes H there.
@@ -670,7 +759,41 @@ pub(crate) fn compute_covariance(
 
     // Covariance OFV = −2·logL at a reconverged point. For FOCEI the per-subject
     // marginal already carries ηᵀΩ⁻¹η + log|Ω|; for FOCE we add that prior here.
-    let ofv = |xv: &[f64]| -> f64 {
+    //
+    // Mixture (#983 Phase 6): the FD-of-OFV Hessian must be built on the K-fold
+    // mixture objective (`mixture_ofv`), not the single-population marginal — the
+    // per-class Ω/Σ overrides and mixing-logit thetas only enter through it.
+    // `mixture_ofv.ofv` is already on the −2·logL scale (= −2 Σᵢ log Σₖ pᵢₖ e^{−nllᵢₖ}),
+    // so it takes no ×2, and it reconverges every (subject × class) inner solve
+    // internally (cold — the FD stencil favours correctness over a warm start).
+    // Mixture: reconverge its per-class EBEs at `cov_inner_tol` too, not the fit's
+    // `inner_tol` — otherwise `cov_inner_tol` is a silent no-op on the mixture path
+    // (a loose fit + tight `cov_inner_tol` for trustworthy SEs would get bit-
+    // identical contaminated numbers), exactly the trap the single-population
+    // reconvergence above avoids. `mixture_ofv` reads its inner tolerance from the
+    // options it is handed, so pass an override clone.
+    let cov_options;
+    let mixture_cov_options = if is_mixture && cov_inner_tol != options.inner_tol {
+        cov_options = FitOptions {
+            inner_tol: cov_inner_tol,
+            ..options.clone()
+        };
+        &cov_options
+    } else {
+        options
+    };
+    let cov_ofv = |xv: &[f64]| -> f64 {
+        if is_mixture {
+            let params = unpack_params(xv, template);
+            return crate::estimation::mixture::mixture_ofv(
+                model,
+                population,
+                &params,
+                mixture_cov_options,
+                None,
+            )
+            .ofv;
+        }
         let (params, ehs, hms, kaps) = reconverge_point(xv);
         let foce_nll = pop_nll_opts(model, population, &params, &ehs, &hms, &kaps, options);
         // Covariance OFV = −2·logL = 2·pop_nll for both FOCE and FOCEI.
@@ -696,22 +819,32 @@ pub(crate) fn compute_covariance(
     // for trustworthy SEs would get bit-identical contaminated numbers with no diagnostic.
     // Reconverging here costs one population inner solve — the thing the FD stencil pays
     // `~2·n_free²` times.
-    let (base_params, base_eta_hats, base_h_matrices, base_kappas) = reconverge_point(x_hat);
-    let base_ofv = 2.0
-        * pop_nll_opts(
-            model,
-            population,
-            &base_params,
-            &base_eta_hats,
-            &base_h_matrices,
-            &base_kappas,
-            options,
-        );
+    // For a mixture the base OFV comes straight from `cov_ofv` (the K-fold
+    // objective, reconverged per class internally); the single-population
+    // reconvergence and its EBEs/H are unused (the analytic path is off), so feed
+    // empty vecs. `base_params` is still needed for the non-finite diagnostic.
+    let (base_params, base_eta_hats, base_h_matrices, base_kappas, base_ofv) = if is_mixture {
+        (
+            unpack_params(x_hat, template),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            cov_ofv(x_hat),
+        )
+    } else {
+        let (p, e, h, k) = reconverge_point(x_hat);
+        let o = 2.0 * pop_nll_opts(model, population, &p, &e, &h, &k, options);
+        (p, e, h, k, o)
+    };
+    let _ = (&base_params, &base_h_matrices, &base_kappas);
     if !base_ofv.is_finite() {
         // Diagnose: check Omega conditioning to distinguish Omega collapse from
-        // a model-evaluation overflow/underflow.
+        // a model-evaluation overflow/underflow. For a mixture the base (class-1)
+        // Omega can be well-conditioned while a per-class `omega(k)` override has
+        // collapsed — the actual cause of the non-finite OFV — so inspect the
+        // worst-conditioned Omega across all classes, not just the base.
         let params_at = unpack_params(x_hat, template);
-        let reason = match extract_eigenvalues(&params_at.omega.matrix) {
+        let reason = match extract_eigenvalues(diagnostic_omega(&params_at)) {
             Some(ref ev) if ev.last().copied().unwrap_or(1.0) <= 1e-8 => {
                 let min_eig = ev.last().copied().unwrap_or(f64::NAN);
                 // Distinguish truly negative eigenvalues from tiny-positive (near-singular).
@@ -768,7 +901,7 @@ pub(crate) fn compute_covariance(
     // have left the analytic path paying `2·n_free` reconverged population objectives for
     // nothing — most of the cost it exists to remove, and a claim of "no inner re-solve" that
     // the code did not honour.
-    let analytic_hess: Option<DMatrix<f64>> = if options.analytic_cov_hessian {
+    let analytic_hess: Option<DMatrix<f64>> = if options.analytic_cov_hessian && !is_mixture {
         // `base_eta_hats`, not `eta_hats` — the modes reconverged at `cov_inner_tol`, which
         // is what the stationarity assumption in the assembly needs (see above).
         analytic_cov_hessian(model, population, template, x_hat, &base_eta_hats, options)
@@ -788,7 +921,7 @@ pub(crate) fn compute_covariance(
     let (eps, n_halvings) = if analytic_hess.is_some() {
         (initial_eps, 0)
     } else {
-        select_fd_step(x_hat, &free_idx, initial_eps, f0, &ofv)
+        select_fd_step(x_hat, &free_idx, initial_eps, f0, &cov_ofv)
     };
     if options.verbose && n_halvings > 0 {
         eprintln!(
@@ -844,10 +977,10 @@ pub(crate) fn compute_covariance(
         // `2·pop_nll` at the same per-subject `find_ebe`, and the difference
         // formulas/assembly are unchanged; only the scheduling differs.
         let f0 = base_ofv;
-        let serial_ofv = |xv: &[f64]| -> f64 {
-            let (params, ehs, hms, kaps) = reconverge_point(xv);
-            2.0 * pop_nll_opts(model, population, &params, &ehs, &hms, &kaps, options)
-        };
+        // The FD stencil evaluates the same covariance OFV as `select_fd_step`
+        // and the base point — single-population (reconverge + pop_nll) or, for a
+        // mixture, the K-fold `mixture_ofv` — via the shared `cov_ofv`.
+        let serial_ofv = &cov_ofv;
 
         let nf = free_idx.len();
         let hsteps: Vec<f64> = free_idx
@@ -1272,6 +1405,52 @@ pub(crate) struct CovStepOutcome {
     pub sir_fallback_proposal: Option<DMatrix<f64>>,
 }
 
+/// Which covariance estimator to actually assemble at `n` free coordinates, and
+/// the warning to record for the choice (#1064).
+///
+/// The `R` matrix is a finite-difference Hessian of the objective that
+/// re-converges every subject's EBEs at each of `n(n+1)/2` stencil points —
+/// ~320,000 re-converged population objectives at `n = 800`, which will not
+/// finish. Above [`COV_HESSIAN_MAX_DIM`] a *defaulted* `Hessian` is therefore
+/// routed to the cross-product, which needs one pass. An explicit
+/// `covariance_method = r` is the user's call and is honoured, but is told what
+/// it is about to cost.
+///
+/// Split out from [`run_covariance_step_inner`] so the three branches are
+/// reachable from a unit test: exercising them through the real covariance step
+/// would mean converging a fit with several hundred free parameters.
+pub(crate) fn scale_routed_covariance_method(
+    n: usize,
+    requested: CovarianceMethod,
+    explicitly_set: bool,
+) -> (CovarianceMethod, Option<String>) {
+    if n <= crate::types::COV_HESSIAN_MAX_DIM || requested != CovarianceMethod::Hessian {
+        return (requested, None);
+    }
+    let stencil = n * (n + 1) / 2;
+    if explicitly_set {
+        (
+            requested,
+            Some(format!(
+                "covariance_method = r with {n} free parameters: the R matrix is a \
+                 finite-difference Hessian that re-converges every subject's EBEs at each \
+                 of {stencil} stencil points. Set `covariance_method = s` (the score \
+                 cross-product, one pass) if this does not finish."
+            )),
+        )
+    } else {
+        (
+            CovarianceMethod::CrossProduct,
+            Some(format!(
+                "{n} free parameters: the default covariance step (R = a \
+                 finite-difference Hessian) would need {stencil} re-converged objective \
+                 evaluations, so the score cross-product (`covariance_method = s`) was \
+                 used instead. Set `covariance_method = r` explicitly to force it."
+            )),
+        )
+    }
+}
+
 /// The covariance step WITHOUT the `run_covariance_step` gate: timer + optional
 /// verbose line + `Success/Unusable/FailedNonPd` match. Contains NO floating-point
 /// arithmetic — it only wraps `compute_covariance`, so it cannot change any numeric
@@ -1296,6 +1475,27 @@ pub(crate) fn run_covariance_step_inner(
         eprintln!("{m}");
     }
     let mut warnings = Vec::new();
+    // #1064: route away from the FD-of-OFV `R` matrix when the problem is too
+    // large for it. The decision is a pure function so it can be unit-tested
+    // without standing up a several-hundred-parameter fit.
+    let scaled_options;
+    let (routed, scale_warning) = scale_routed_covariance_method(
+        model.free_packed_dim(),
+        options.covariance_method,
+        options.covariance_method_set,
+    );
+    if let Some(w) = scale_warning {
+        warnings.push(w);
+    }
+    let options = if routed == options.covariance_method {
+        options
+    } else {
+        scaled_options = FitOptions {
+            covariance_method: routed,
+            ..options.clone()
+        };
+        &scaled_options
+    };
     let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
     let cov_timer = std::time::Instant::now();
     let matrix = match compute_covariance(
@@ -1363,4 +1563,148 @@ mod tests {
     // (they reach the moved symbols via the cross-module import added there). The
     // `run_covariance_step` gate + match is exercised end-to-end by every
     // estimator finalizer's integration/lib tests.
+    use super::{diagnostic_omega, packed_param_label, scale_routed_covariance_method};
+    use crate::types::{CovarianceMethod, COV_HESSIAN_MAX_DIM};
+
+    // ── #1064: routing the covariance step away from `R` at scale ───────────
+    //
+    // Exercised here rather than through `run_covariance_step_inner`, which
+    // would need a converged fit with several hundred free parameters.
+
+    #[test]
+    fn ordinary_dimensions_keep_the_requested_covariance_method() {
+        for method in [
+            CovarianceMethod::Hessian,
+            CovarianceMethod::CrossProduct,
+            CovarianceMethod::Sandwich,
+        ] {
+            for explicit in [false, true] {
+                let (routed, warning) =
+                    scale_routed_covariance_method(COV_HESSIAN_MAX_DIM, method, explicit);
+                assert_eq!(routed, method);
+                assert!(
+                    warning.is_none(),
+                    "no warning at the threshold: {warning:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_defaulted_hessian_routes_to_the_cross_product_at_scale() {
+        let n = COV_HESSIAN_MAX_DIM + 1;
+        let (routed, warning) = scale_routed_covariance_method(n, CovarianceMethod::Hessian, false);
+        assert_eq!(routed, CovarianceMethod::CrossProduct);
+        let warning = warning.expect("the substitution must be reported");
+        assert!(warning.contains("score cross-product"), "{warning}");
+        // The stencil count is the whole argument for switching, so it has to
+        // be in the message rather than left for the reader to work out.
+        assert!(
+            warning.contains(&(n * (n + 1) / 2).to_string()),
+            "message must name the stencil size: {warning}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_hessian_is_honoured_at_scale_but_warned_about() {
+        let n = COV_HESSIAN_MAX_DIM + 1;
+        let (routed, warning) = scale_routed_covariance_method(n, CovarianceMethod::Hessian, true);
+        assert_eq!(
+            routed,
+            CovarianceMethod::Hessian,
+            "an explicit `covariance_method = r` is the user's call"
+        );
+        let warning = warning.expect("the cost must still be reported");
+        assert!(warning.contains("covariance_method = r"), "{warning}");
+    }
+
+    #[test]
+    fn a_non_hessian_request_is_never_rerouted() {
+        // `s` and `rsr` already cost one pass; the guard has nothing to say.
+        for method in [CovarianceMethod::CrossProduct, CovarianceMethod::Sandwich] {
+            let (routed, warning) =
+                scale_routed_covariance_method(COV_HESSIAN_MAX_DIM * 8, method, false);
+            assert_eq!(routed, method);
+            assert!(warning.is_none());
+        }
+    }
+
+    /// A variance mixture (per-class Ω/Σ overrides) so the packed vector carries
+    /// the override tail. Packed order: [TVCL, TVV, MIXL, BWT | ω(ETA_CL) |
+    /// σ(EPS) | ω_MIX2 | σ_MIX2].
+    const MIX_OVERRIDE_MODEL: &str = r"
+[parameters]
+  theta TVCL(1.5, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL(0.2, -10.0, 10.0)
+  theta BWT(0.05, -5.0, 5.0)
+  omega ETA_CL ~ 0.06
+  sigma EPS ~ 0.02
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL + BWT*(WT - 75)
+  omega(2) ETA_CL ~ 0.15
+  sigma(2) EPS ~ 0.03
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+
+    #[test]
+    fn packed_param_label_names_mixture_overrides() {
+        // #983 Phase 6: the per-class Ω/Σ override coordinates must carry real
+        // `omega[<eta>_MIX{k}]` / `sigma[<sigma>_MIX{k}]` names (matching
+        // `coordinate_names`), not the old `packed[N]` fallback. The mixing-logit
+        // coefficients (MIXL, BWT) are ordinary thetas and label via the theta
+        // branch.
+        let model = crate::parser::model_parser::parse_model_string(MIX_OVERRIDE_MODEL).unwrap();
+        let t = &model.default_params;
+        // Base segment: 4 theta + 1 omega + 1 sigma = indices 0..6.
+        assert_eq!(packed_param_label(0, t), "theta[TVCL]");
+        assert_eq!(packed_param_label(2, t), "theta[MIXL]");
+        assert_eq!(packed_param_label(3, t), "theta[BWT]");
+        assert_eq!(packed_param_label(4, t), "omega[ETA_CL, ETA_CL]");
+        assert_eq!(packed_param_label(5, t), "sigma[1]");
+        // Override tail: ω(2) then σ(2), class 2 (1-based).
+        assert_eq!(packed_param_label(6, t), "omega[ETA_CL_MIX2]");
+        assert_eq!(packed_param_label(7, t), "sigma[EPS_MIX2]");
+        // Past the override tail → generic fallback (defensive).
+        assert_eq!(packed_param_label(8, t), "packed[8]");
+    }
+
+    #[test]
+    fn diagnostic_omega_picks_collapsed_class_override() {
+        // #984 regression: when a per-class `omega(k)` override collapses but the
+        // base (class-1) Omega is well-conditioned, the non-finite-OFV diagnostic
+        // must inspect the collapsed class Omega — else it misreports "numerical
+        // overflow" instead of "Omega not positive definite".
+        let model = crate::parser::model_parser::parse_model_string(MIX_OVERRIDE_MODEL).unwrap();
+        let mut params = model.default_params.clone();
+        // Base Omega stays healthy (0.06); collapse the class-2 override to negative.
+        let mix = params.mixture.as_mut().expect("mixture params");
+        mix.omega[1].matrix[(0, 0)] = -1.0;
+        let chosen = diagnostic_omega(&params);
+        assert_eq!(
+            chosen[(0, 0)],
+            -1.0,
+            "must select the collapsed class Omega"
+        );
+        assert!(
+            params.omega.matrix[(0, 0)] > 0.0,
+            "base Omega is healthy, so the base branch would have hidden the collapse"
+        );
+
+        // Non-mixture params fall back to the single base Omega unchanged.
+        let mut plain = model.default_params.clone();
+        plain.mixture = None;
+        assert_eq!(diagnostic_omega(&plain)[(0, 0)], plain.omega.matrix[(0, 0)]);
+    }
 }

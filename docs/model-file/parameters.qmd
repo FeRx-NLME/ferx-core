@@ -1,3 +1,8 @@
+---
+pagetitle: "Population parameters and random effects"
+description-meta: "Define theta fixed effects, omega between-subject variability, kappa inter-occasion variability, and sigma residual error in ferx."
+---
+
 # Parameters
 
 > **Maturity: stable** — see [Feature Maturity](../maturity.qmd) for what this means.
@@ -29,6 +34,169 @@ theta TVCL(0.134, 0.001, 10.0)
 theta TVV(8.1, 0.1, 500.0)
 theta TVKA(1.0, 0.01, 50.0)
 ```
+
+## Theta level blocks
+
+Some models need *hundreds* of fixed effects that share one declaration. The
+motivating case is an **unstructured placebo effect** in a model-based
+meta-analysis: every (study × timepoint) cell gets its own fixed effect, so that
+no parametric placebo time-course can bias the drug-effect estimate. A hundred
+studies at eight timepoints each is 800 thetas, and that is not an unusual size.
+
+Writing 800 `theta` lines is the visible problem. The deeper one is that 800
+*separate individual parameters* do not fit the engine's fixed parameter-slot
+layout at all. Both fall away once you notice that an unstructured effect is
+**indexed**: for any given observation row, exactly one of the 800 thetas is
+active — the one for that row's `(study, time)`. So it is a **gather**: one
+parameter slot, one contiguous block of thetas, one index per record.
+
+### Counted form: `theta NAME[N]`
+
+```
+[parameters]
+  theta PLACEBO[800](0.0, -10.0, 10.0)
+
+[individual_parameters]
+  PL = PLACEBO[PLA_IDX]          # PLA_IDX is a data column, 1-based
+```
+
+`theta NAME[N](...)` declares **N** thetas named `NAME[1]`…`NAME[N]`, all
+sharing the one `(init, lower, upper)` triple — and `FIX`, if given.
+`NAME[COLUMN]` reads the level that record's `COLUMN` selects.
+
+- The index is **1-based**. An index that is missing, non-integral, or outside
+  `1..=N` is rejected before the fit starts, naming the column and the offending
+  value. (A silent `0` would be indistinguishable from a legitimately estimated
+  level, so it is never treated as one.)
+- A **literal** index (`PLACEBO[3]`) is resolved at parse time and costs nothing
+  at runtime; an out-of-range literal is a parse error.
+- A **bare** `PLACEBO` is an error — there is nothing to gather on. Index it.
+
+The R package's `ferx_mbma_data()` is the natural place to build the index
+column for this form.
+
+### Data-driven form: `theta NAME[COL, ...]`
+
+```
+[parameters]
+  theta PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)
+
+[individual_parameters]
+  PL = TVPL + PLACEBO            # the index is implicit
+```
+
+Put **data columns** in the brackets instead of a count and the block declares
+**one level per observed combination** of them, discovered when the data is
+bound. With `contrast = none`, the `(init, lower, upper)` triple broadcasts to
+every level. Constrained forms estimate contrast coefficients and derive one
+level per contrast group, so they require `init = 0`; `FIX` then fixes the
+whole block at zero. Bounds apply to the free coefficients, not to a derived
+negative sum, which can lie outside them. Free coefficients are named after
+their combination, so estimates report as
+`PLACEBO[STUDY=7,TIME=4]`. A column named `TIME` is the record time; anything
+else is a covariate column, which the reader loads automatically.
+
+The two forms cannot be confused: brackets containing only digits are a level
+count, anything else is a column list.
+
+Only combinations the data actually shows become parameters — an unbalanced
+design does not acquire cells nobody measured.
+
+Because the level count is a property of the *dataset*, this form must be run
+through a file entry point (the CLI, `run_model_with_data`, `fit_from_files`, or
+`--simulate`), which reads the data and binds the block. A model handed to the
+in-memory `fit()` without that step is refused rather than silently predicting
+`NaN`; if you need the in-memory path, use the counted `theta NAME[N]` form with
+your own index column.
+
+### Identifiability
+
+`PLACEBO[STUDY, TIME]` alongside an intercept is rank-deficient — the levels sum
+to the intercept. It is *also* rank-deficient against a **random** effect at the
+same or a coarser grouping: a study's `eta` is, by construction, the mean of that
+study's own timepoint levels. That second case is not an edge case; it is the
+model this feature exists to serve. A convention is therefore always applied,
+and it is chosen by looking at both the model and the data:
+
+| Situation | Default |
+|---|---|
+| The parameter reading the block also carries a random effect, **and** the block's leading columns identify subjects one-to-one | sum-to-zero **within** each leading-column group |
+| Otherwise | sum-to-zero over **all** levels |
+
+Within-group sum-to-zero leaves each study's `eta` carrying that study's mean and
+the levels carrying deviations from it, which is what the model intends and what
+makes the two separately interpretable.
+
+Override with `contrast = ...`:
+
+```
+theta PLACEBO[STUDY, TIME, contrast = sum_to_zero](0.0, -10.0, 10.0)
+theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](...)
+theta PLACEBO[STUDY, TIME, contrast = ref](...)   # first level held at 0
+theta PLACEBO[STUDY, TIME, contrast = none](...)  # you assert identifiability
+```
+
+Whichever you pick, one degree of freedom has to go: *L* levels alongside an
+intercept is *L + 1* parameters for *L* cells, and the block and the intercept
+would otherwise slide against each other forever. The conventions differ only in
+*where* it goes.
+
+**`sum_to_zero`** makes the levels deviations *around* the grand mean, which
+stays in the intercept. The levels are symmetric, none is special, and the block
+is better conditioned — right when nobody reads the individual levels, which is
+the unstructured-placebo case.
+
+**`ref`** is dummy coding (R's `contr.treatment`, what `lm(y ~ factor(study))`
+does): one level is pinned at exactly 0 and every other θ is that level's
+*difference from it*, with the intercept absorbing the reference level's own
+value. So `PLACEBO[STUDY=1,TIME=4] = 0.3` reads as "0.3 above study 1's first
+timepoint", not "0.3 above the average". Use it when the coefficients are meant
+to be *read* rather than merely absorbed.
+
+Two limits on `ref` as it stands:
+
+- The reference is always the **first level in sort order** (the smallest
+  column-value tuple). There is no way to name a different one.
+- It is a **single** reference for the whole block, not one per group — only
+  `sum_to_zero_within` splits the levels into contrast groups. So `contrast =
+  ref` on `[STUDY, TIME]` pins one cell globally rather than each study's own
+  first timepoint.
+
+A contrast that would leave a nested group's mean free while a random effect
+also carries it is a hard error, not a warning.
+
+Both conventions are implemented as contrast coding, so the optimizer needs no
+constraint machinery: a group of *L* levels estimates *L − 1* thetas and the
+remaining level is derived (minus the sum of the others under sum-to-zero, or a
+constant 0 under `ref`). A derived level is not a parameter, so it does not
+appear in the estimate table; its value follows from the others.
+
+### Fitting at this scale
+
+Two defaults are tuned for the handful-of-parameters models everything else in
+this engine is, and switch automatically once a block makes the problem large:
+
+- **Optimizer.** `optimizer = auto` picks BOBYQA when no analytic gradient is
+  available. BOBYQA interpolates a quadratic over the whole parameter space, so
+  its model grows quadratically in the parameter count; above 64 free
+  coordinates `auto` takes `nlopt_lbfgs` instead, whose finite-difference cost
+  is linear. An explicit `optimizer = bobyqa` is still honoured, with a warning.
+- **Covariance.** The default `covariance_method = r` builds a
+  finite-difference Hessian that re-converges every subject's EBEs at each of
+  `n(n+1)/2` stencil points — around 320,000 population objectives at 800
+  parameters. Above 100 free coordinates a *defaulted* covariance method routes
+  to the score cross-product (`covariance_method = s`, one pass) with a warning.
+  Setting `covariance_method = r` explicitly forces it, and says what it costs.
+
+A block of more than 20 free coefficients also leaves the main estimate table
+and gets its own compact summary (count, min, median, max) on the console. The
+fit YAML writes every independently estimated coefficient under
+`theta_blocks:`; constrained dependent levels are derived values, not estimates.
+
+Analytic sensitivities pass straight through a gather — `∂f/∂θ_k` is exact under
+the dual-number path — so a *small* level block keeps the analytic gradient.
+Past the engine's 24-axis dual dispatch, a large block falls back to finite
+differences per subject, which is why the guards above matter.
 
 ## Omega (Between-Subject Variability)
 
@@ -62,6 +230,129 @@ Each variance represents the between-subject variability for that parameter. The
 The `(sd)` form is convenient when you're setting initial values from expected CV%, e.g. "I expect ~25% CV on CL" → `omega ETA_CL ~ 0.25 (sd)`. The fit result records which form you used so that downstream printers can annotate the estimate with `[initial specified as SD]`.
 
 Block omega (`block_omega (...) = [...]`) is variance-only — `(sd)` is not accepted there because the lower-triangle list mixes variances and covariances and a single tag would be ambiguous.
+
+::: {.callout-important}
+#### A free `omega NAME ~ 0.0` is rejected — write `FIX`
+
+To declare that a parameter carries **no** between-subject variability, the
+zero has to be fixed:
+
+```
+omega ETA_CL ~ 0.0 FIX      # correct: no IIV on CL
+omega ETA_CL ~ 0.0          # rejected: E_OMEGA_INIT_AT_RAIL
+```
+
+A *free* zero asks the optimizer to estimate a variance from a start it cannot
+leave. The optimizer works on `ln(L_ii)` (the log Cholesky diagonal), bounded
+below at `-6`; a declared zero is regularised to a variance of `1e-8`, which
+packs to `ln(L) = -9.21` — below its own bound — so the start is clamped onto
+the rail. From there the coordinate either stays collapsed or runs away to the
+opposite rail (variance ≈ 1.6e5), and the **theta** estimates move with it: on a
+one-subject fixture the same model gave `TVCL` 48% low free versus 0.09% low
+`FIX`-ed. NM-TRAN refuses the equivalent stream outright (error 76, `INITIAL
+ESTIMATE OF VARIANCE CANNOT BE ZERO UNLESS FIXED`).
+
+The check is on the **variance the optimizer starts from**, not on the literal
+zero: any free variance ≤ 6.1e-6 (`ln(√v) ≤ -6`) lands on the same rail. Start
+such a parameter at ≥ 1e-5 if you do want to estimate it.
+
+In a `block_omega` the quantity tested is the Cholesky diagonal `L_ii`, which is
+what remains of that eta's variance once the off-diagonals are accounted for — so
+a *near-singular* block trips this even when every declared variance is
+ordinary, and the fix there is to lower the declared covariances (or `FIX` the
+block), not to raise a variance that is already fine.
+
+Two things are deliberately outside the check. **Sigma**: a free
+`sigma ~ 0.0 (sd)` is clamped onto its own `-8` rail and still reaches the
+optimum, so it is not rejected. **Runs where nothing searches**: with
+`maxiter = 0` (NONMEM `MAXEVAL=0`) a zero variance is accepted — which is what
+lets `ferx gam --no-fit`, and any evaluation at fixed parameters, keep working.
+`saem`, `imp`, `impmap` and `bayes` carry their own iteration counts and are
+checked regardless of `maxiter`.
+
+::: {.callout-warning}
+## `maxiter = 0` still clamps the start
+
+An evaluation-only run clamps the packed start to the bounds exactly like a
+fitting run does — what it does not do is *hold* it there through a search, and
+that stickiness is what the check is about. The consequence is worth knowing:
+with `maxiter = 0`, a free `omega ETA_CL ~ 0.0` is **evaluated at the rail
+variance `exp(-12) ≈ 6.14e-6`**, not at the `1e-8` it is stored as, and nothing
+says so. Write `omega ETA_CL ~ 0.0 FIX` if you want the objective evaluated at
+the variance you declared — a fixed coordinate is pinned at its own packed
+start, so the clamp cannot move it.
+
+This is not specific to variances: a `theta TVCL(0.05, 0.1, 10.0)` starts at
+`0.1`, silently, on every run. A general diagnostic for a start outside its own
+bounds is tracked separately.
+:::
+
+`predict()` and `simulate()` never apply the check, so a simulation-only fixture
+with a free zero keeps working — but `ferx check` reports what `fit()` would
+refuse, so it will flag such a file. Add `maxiter = 0` to `[fit_options]` if the
+model is genuinely simulation-only. See
+[#1229](https://github.com/FeRx-NLME/ferx-core/issues/1229) and
+[`E_OMEGA_INIT_AT_RAIL`](../file-formats/check-report.qmd#codes-parameters-and-random-effects).
+:::
+
+### No omega at all — fixed-effects-only (naive-pooled) fits
+
+The `omega` block is **optional**. A model may declare no random effects, giving a
+fixed-effects-only (naive-pooled) fit in which every subject shares one set of
+parameters and `sigma` alone carries the spread:
+
+```
+[parameters]
+  theta TVCL(4.0,  0.1, 100.0)
+  theta TVV(40.0,  1.0, 500.0)
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+```
+
+With `n_eta = 0` there is no inner empirical-Bayes problem and no `log|Ω|` term, so
+FOCE/FOCEI collapse to the plain maximum-likelihood objective. `PRED` and `IPRED`
+coincide, and so do `CWRES` and `IWRES`. No `OMEGA` section is printed and no ETA
+columns are written to the sdtab. See `examples/one_cpt_iv_pooled.ferx`.
+
+Useful for naive-pooled analyses, single-subject fits, reduced models where a
+variance component has collapsed to the boundary and should be removed rather than
+fixed near zero, and for isolating a diagnostic by removing the inner problem
+entirely.
+
+**`sigma` is still required.** "No random effects" and "no residual error" are
+separate capabilities: a continuous endpoint has no likelihood without a `sigma`,
+so omitting the `[error_model]` or its `sigma` remains an error. (A pure
+`[event_model]` / `[binary_model]` endpoint legitimately has neither — that is a
+different case, not this one.)
+
+**Which estimators apply.** `foce`, `focei`, `laplace` and `gn_hybrid` all reduce
+correctly and agree to the last printed digit — all four land on OFV −269.6370 on
+the anchor below. `saem`, `imp`, `impmap` and `bayes` are all rejected by
+`ferx check` before the fit starts (`E_SAEM_NO_RANDOM_EFFECTS` /
+`E_METHOD_NO_RANDOM_EFFECTS`, #1002 / #1007). Each of the four integrates over the
+random effects, and with none declared there is nothing to integrate.
+
+**`gn` is not recommended at `n_eta = 0`.** Pure Gauss-Newton reduces correctly in
+principle, but its BHHH Hessian badly over-estimates curvature far from the
+optimum and there is no inner loop to keep it close. On this page's own example it
+stops at OFV 8670 with `Converged: NO` and 6900% RSEs — a result that is wrong
+rather than merely imprecise. Use `gn_hybrid`, whose FOCEI polish recovers it, or
+`focei`. Since #1006 `ferx check` warns about the combination
+(`W_GN_NO_RANDOM_EFFECTS`), and a pure-GN run that ends unconverged at `n_eta = 0`
+adds a warning saying the result may be wrong rather than imprecise. See
+[Gauss-Newton — fixed-effects-only models](../estimation/gauss-newton.qmd#fixed-effects-only-models).
+
+**Starting values matter more.** Without random effects there is no inner loop to
+absorb a poor `sigma` start, so a start that a mixed-effects model shrugs off can
+stall a fixed-effects one. On `examples/one_cpt_iv_pooled.ferx`'s own `0.02 (sd)`
+start `gn` does not converge within `maxiter`; from `0.13 (sd)` it reaches the
+optimum. If a fixed-effects fit stalls, check `sigma` first.
+
+For the NONMEM equivalent — and why simply omitting `$OMEGA` is *not* it — see
+[the FAQ](../faq.qmd#fixed-effects-only-fits-vs-nonmem).
 
 ### Block omega (correlated random effects)
 
@@ -136,7 +427,7 @@ omega ETA_KA ~ 0.40
 
 This estimates a 3x3 omega where ETA_CL and ETA_V are correlated (2x2 block), but ETA_KA is uncorrelated with both.
 
-### Declaration order
+### Declaration order — omegas
 
 The order of `omega` and `block_omega` lines in the `[parameters]` block determines the ETA indexing throughout the model: in the omega matrix and all output. For example:
 
@@ -164,9 +455,12 @@ Inter-Occasion Variability (IOV) is declared with `kappa` (independent per-param
 kappa NAME ~ value              # value interpreted as variance (default)
 kappa NAME ~ value (sd)         # value interpreted as standard deviation
 kappa NAME ~ value FIX
+kappa NAME ~ value weight = W   # kappa ~ N(0, value / W) — sample-size-weighted IOV
 ```
 
 Each `kappa` line adds one diagonal element to the IOV omega matrix. Occasions are independent. The `(sd)` annotation is accepted with the same semantics as for `omega`. `block_kappa` is variance-only.
+
+The optional `weight = <expr>` modifier declares a **sample-size-weighted** kappa, `κ ~ N(0, value / W)` — the between-treatment-arm variability of a longitudinal MBMA, which scales with the number of subjects in the arm. See [Sample-size-weighted IOV](iov.qmd#sample-size-weighted-iov-weight-...).
 
 Example:
 ```
@@ -174,6 +468,11 @@ kappa KAPPA_CL ~ 0.05
 kappa KAPPA_V  ~ 0.03
 kappa KAPPA_CL ~ 0.02 FIX
 ```
+
+A free `kappa NAME ~ 0.0` is rejected for the same reason a free `omega NAME ~ 0.0`
+is — Ω_IOV goes through the same builder and the same `-6` lower rail — so a kappa
+that should carry no variability needs `FIX` too. See
+[A free `omega NAME ~ 0.0` is rejected](#diagonal-omega) above.
 
 ### Block kappa — Option B (correlated IOV)
 
@@ -215,7 +514,7 @@ kappa KAPPA_KA ~ 0.10
 
 A name may not appear in both `kappa` and `block_kappa` — this is a parse error.
 
-### Declaration order
+### Declaration order — kappas
 
 Kappa declaration order determines the IOV omega matrix layout and the kappa column order in output. Kappas follow all BSV etas in the internal indexing: if a model has 3 BSV etas and 2 kappas, the kappas sit at indices 4 and 5.
 
@@ -262,6 +561,8 @@ The interpretation of sigma's role in the residual-error model depends on the er
 | Additive | Variance (or SD with `(sd)`) of additive error |
 | Proportional | Variance (or SD with `(sd)`) of the proportional coefficient |
 | Combined | First sigma = proportional coefficient, second = additive component |
+
+For a **single-endpoint** `[error_model]` ("first" and "second" above) these roles are read from the `[parameters]` **declaration order**, and the names written in the `[error_model]` arguments must match that order — a mismatch is rejected with `E_SIGMA_ORDER_MISMATCH`. Per-CMT and covariate-selected error models bind by name instead. See [Sigma order](error-model.qmd#sigma-order).
 
 > **Migration note** (pre-issue-#56 models): `sigma NAME ~ value` was previously interpreted as a standard deviation. The new default is **variance**, so a pre-#56 value `v` becomes either `v² (variance)` or `v (sd)`. The `examples/` directory uses the `(sd)` form to preserve the prior initial values verbatim.
 

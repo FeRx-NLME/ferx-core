@@ -145,7 +145,7 @@ pub fn two_cpt_infusion_g<T: PkNum>(
 /// rate `mass/dur`) generic over [`PkNum`], carrying `∂C/∂dur` (#860 Phase B).
 /// Same value formula as `two_cpt_infusion_g`, same `.val()`-branch convention
 /// at the `t == dur` boundary as every other kernel here; see
-/// [`one_cpt_zero_order_g`] for the rationale (only the domain of `dur` differs
+/// [`one_cpt_zero_order_g`](crate::sens::one_cpt::one_cpt_zero_order_g) for the rationale (only the domain of `dur` differs
 /// from the fixed-duration infusion kernel).
 #[allow(clippy::too_many_arguments)]
 pub fn two_cpt_zero_order_g<T: PkNum>(
@@ -366,7 +366,7 @@ pub fn two_cpt_ig_g<T: PkNum>(
 /// `1/(2·MAT·CV²)`; since `α ≥ β`, guarding `α < 1/(2·MAT·CV²)` suffices. Outside it —
 /// invalid params, confluent eigenvalues, or the flip-flop `α ≥ 1/(2·MAT·CV²)` — this
 /// returns `0.0` (the sibling closed forms' invalid-parameter convention), with the
-/// NaN-safe `!(α < abscissa)` form of [`ig_2cpt_domain_ok`].
+/// NaN-safe `!(α < abscissa)` form of `ig_2cpt_domain_ok`.
 #[allow(clippy::too_many_arguments)]
 pub fn two_cpt_ig_amt_g<T: PkNum>(
     amt: T,

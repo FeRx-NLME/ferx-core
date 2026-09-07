@@ -114,7 +114,7 @@ End-to-end checks, in order:
 
 1. `cargo build --features nn` and `cargo clippy --features nn` — no warnings.
 2. `cargo test --features nn` — all new unit tests pass; existing tests still pass with default features.
-3. **Sanity reproduction** (M1 deliverable): `cargo run --release --features nn -- examples/warfarin_nn_fixed.ferx --data data/warfarin.csv` with `method = nn_mse` produces NN weights whose forward pass on the training covariates matches the analytical typical values from `examples/two_cpt_oral_cov.ferx` within 5% RMSE.
+3. **Sanity reproduction** (M1 deliverable): `cargo run --release -p ferx-cli --features ferx-core/nn -- examples/warfarin_nn_fixed.ferx --data data/warfarin.csv` with `method = nn_mse` produces NN weights whose forward pass on the training covariates matches the analytical typical values from `examples/two_cpt_oral_cov.ferx` within 5% RMSE.
 4. **Mixed-effects reproduction** (M2 deliverable): the same `warfarin_nn.ferx` with `method = focei` reaches an OFV within 1 unit of the analytical model. The fit YAML's eta shrinkage and omega estimates should match the analytical fit to within numerical noise — strong evidence the NN layer is the only thing changed.
 5. **Roundtrip**: simulate 100 subjects from a known NN+omega+sigma, fit, recover NN weights within 5% and omega within 10%.
 6. **Docs build**: `quarto render docs` succeeds and the new page renders.

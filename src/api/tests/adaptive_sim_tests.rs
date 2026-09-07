@@ -109,6 +109,34 @@ const ODE_TV_COV: &str = r#"
   DV ~ proportional(PROP)
 "#;
 
+// Time-varying covariate reaching the prediction ONLY through an `init(...)` seed
+// (#1133). `CL`/`V` are plain thetas, so `CRCL` moves nothing but the baseline the
+// system starts (and restarts) from — which makes the snapshot an EVID=3 reset re-seeds
+// with directly observable in the trajectory instead of tangled with disposition.
+const ODE_TV_INIT: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL   = TVCL
+  V    = TVV
+  BASE = CRCL * 10.0
+[structural_model]
+  ode(states=[central])
+[odes]
+  init(central)  = BASE
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
 // 1-cpt IV ODE whose RHS reads TAFD (time after first dose). The extra
 // `-1e-3·TAFD·central` decay makes the trajectory depend on the TAFD anchor, so a stale
 // anchor (e.g. earliest *base* dose instead of the true global earliest) integrates
@@ -278,10 +306,12 @@ fn subj(id: &str, obs_times: Vec<f64>, doses: Vec<DoseEvent>) -> Subject {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1u32; n],
         obs_l2: Vec::new(),
         dose_occasions: vec![1u32; n_dose],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -426,6 +456,97 @@ fn adaptive_reset_matches_static_predict() {
             traj.time
         );
     }
+}
+
+/// #1133 — the adaptive driver's reset re-seed must read the reset ROW's own covariate
+/// snapshot, not the decision-time LOCF carry.
+///
+/// `adaptive_reset_matches_static_predict` above cannot see this: `ODE_NO_IIV` has no
+/// `init(...)` and no covariate, so every candidate snapshot seeds the same zeros. Here
+/// `init(central) = CRCL*10` and `CRCL` steps 100 → 40 exactly at the reset row, between
+/// records carrying 100 and 25 — so the previous record, the reset row, and the next
+/// record give three different baselines (1000 / 400 / 250).
+///
+/// Two oracles run at once, and they are independent:
+///
+///   * the **degenerate oracle** — the same realized regimen scored by `predict()`, which
+///     routes a reset subject to `ode_predictions_event_driven` (the engine anchored
+///     against NONMEM in `tests/reset_init_snapshot_nonmem_anchor.rs`);
+///   * the **frozen-replay verifier**, on by default, which rebuilds the subject from the
+///     realized dose ledger and walks it through `adaptive_frozen_replay_tv`. Its `Ok` is
+///     part of this assertion, so the driver and the replay must agree with *each other*
+///     as well as with the static engine — three engines, one convention.
+#[test]
+fn adaptive_reset_reseeds_init_from_the_reset_rows_covariates() {
+    let model = parse_model_string(ODE_TV_INIT).expect("parse TV-init ODE model");
+    let decisions = vec![0.0, 24.0, 48.0];
+    let obs = vec![6.0, 30.0, 42.0, 54.0];
+    let reset_at = 36.0;
+    let crcl = |v: f64| HashMap::from([("CRCL".to_string(), v)]);
+
+    // Records: obs at 6 and 30 carry CRCL=100; the reset row at 36 carries 40; the obs at
+    // 42 and 54 carry 25. Only the middle one may reach the re-seed.
+    let with_cov = |mut s: Subject| -> Subject {
+        s.covariates = crcl(100.0);
+        s.obs_covariates = vec![crcl(100.0), crcl(100.0), crcl(25.0), crcl(25.0)];
+        s.dose_covariates = s.doses.iter().map(|_| crcl(100.0)).collect();
+        s.reset_times = vec![reset_at];
+        s.reset_covariates = vec![crcl(40.0)];
+        s
+    };
+
+    let base = with_cov(subj("1", obs.clone(), vec![]));
+    assert!(
+        base.has_tv_covariates(),
+        "the subject must take the TV path"
+    );
+    let pop = population(vec![base]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(7),
+        decision_times: decisions.clone(),
+        ..Default::default() // verify = true
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        .expect("adaptive sim runs and passes the frozen-replay verifier");
+    assert_eq!(res.ledger.len(), 3, "a bolus at every decision");
+
+    let static_doses: Vec<DoseEvent> = decisions
+        .iter()
+        .map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
+        .collect();
+    let static_pop = population(vec![with_cov(subj("1", obs.clone(), static_doses))]);
+    let preds = predict(&model, &static_pop, &model.default_params);
+
+    assert_eq!(res.trajectories.len(), obs.len());
+    for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
+        assert!(
+            (traj.ipred - pred.pred).abs() <= 1e-6 + 1e-4 * pred.pred.abs(),
+            "adaptive IPRED {} != static predict {} at t={}: the reset re-seed read a \
+             different covariate snapshot than the static engine (#1133)",
+            traj.ipred,
+            pred.pred,
+            traj.time
+        );
+    }
+
+    // Non-degeneracy: the post-reset observation must actually carry the reset row's
+    // baseline. At t=42, six hours after the reset, the seed 400 has decayed by
+    // exp(-0.1*6) = 0.5488 to ~219.5 — while the previous record's snapshot would give
+    // ~548.8 and the next record's ~137.2. Assert the band that admits only 400.
+    let t42 = res
+        .trajectories
+        .iter()
+        .find(|t| (t.time - 42.0).abs() < 1e-9)
+        .expect("an observation at t=42");
+    let expected = 400.0 * (-(5.0 / 50.0) * 6.0f64).exp();
+    assert!(
+        (t42.ipred - expected).abs() < 1e-3,
+        "post-reset IPRED {} is not the reset row's baseline decayed ({expected:.4}); \
+         the previous record's snapshot would give {:.4} and the next record's {:.4}",
+        t42.ipred,
+        expected * 2.5,
+        expected * 0.625
+    );
 }
 
 #[test]
@@ -1229,6 +1350,143 @@ fn adaptive_base_loading_under_tv_covariate_matches_closed_form() {
         assert!(
             (traj.ipred - want).abs() <= 8.0 * (1e-6 + 1e-4 * want),
             "t={}: base loading IPRED {} != closed form {want} (per-segment CL under TV)",
+            traj.time,
+            traj.ipred
+        );
+    }
+}
+
+#[test]
+fn adaptive_base_infusion_ending_between_records_matches_static_predict() {
+    // Degenerate oracle for the #1073 record convention on the REACTIVE walk: a
+    // holding controller over a pre-scheduled base infusion must reproduce the static
+    // engine (`predict()`, which routes here to `ode_predictions_event_driven`) on the
+    // same realized regimen.
+    //
+    // The geometry is the one #1073 moved. A 1000-unit infusion at rate 200 runs
+    // `[0, 5]`, so its window **end** falls strictly between the `t = 0` record
+    // (CRCL = 100) and the `t = 6` record (CRCL = 50). An infusion end is not a data
+    // record: it subdivides the interval the `t = 6` record terminates, and both
+    // pieces run on that record's snapshot (k = 0.05/h). Resolving the `(0, 5]` piece
+    // to the *previous* record instead — the LOCF carry-forward — integrates it at
+    // k = 0.1/h.
+    //
+    // The model is eta-invariant, so the adaptive IPRED equals the eta=0 static PRED.
+    // The default-on frozen-replay verifier also runs, but it cannot see this: the
+    // driver and `adaptive_frozen_replay_tv` share the same segment resolution, so they
+    // agree with each other whichever record they pick. Only the static engine is an
+    // independent reference.
+    let model = parse_model_string(ODE_TV_COV).expect("parse TV-cov ODE model");
+    let obs = vec![0.0, 6.0, 12.0];
+    let cov = vec![
+        HashMap::from([("CRCL".to_string(), 100.0)]),
+        HashMap::from([("CRCL".to_string(), 50.0)]),
+        HashMap::from([("CRCL".to_string(), 50.0)]),
+    ];
+    // amt 1000 @ rate 200 -> a 5 h window, ending between the t=0 and t=6 records.
+    let dose = DoseEvent::new(0.0, 1000.0, 1, 200.0, false, 0.0);
+
+    let mut s = subj("1", obs.clone(), vec![dose.clone()]);
+    s.covariates = HashMap::from([("CRCL".to_string(), 100.0)]);
+    s.obs_covariates = cov.clone();
+    let mut pop = population(vec![s]);
+    pop.covariate_names = vec!["CRCL".to_string()];
+
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(11),
+        decision_times: vec![0.0, 6.0, 12.0],
+        ..Default::default()
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, hold_all, &opts)
+        .expect("base infusion x TV covariate runs");
+    assert!(res.ledger.is_empty(), "the controller holds throughout");
+
+    // Static reference: the identical subject through `predict()`.
+    let mut s2 = subj("1", obs.clone(), vec![dose]);
+    s2.covariates = HashMap::from([("CRCL".to_string(), 100.0)]);
+    s2.obs_covariates = cov;
+    let mut static_pop = population(vec![s2]);
+    static_pop.covariate_names = vec!["CRCL".to_string()];
+    let preds = predict(&model, &static_pop, &model.default_params);
+
+    assert_eq!(res.trajectories.len(), preds.len());
+    for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
+        assert!(
+            (traj.ipred - pred.pred).abs() <= 1e-6 + 1e-6 * pred.pred.abs(),
+            "t={}: adaptive IPRED {} != static predict {} - the reactive walk resolved \
+             the infusion-end segment to a different record than production (#1073)",
+            traj.time,
+            traj.ipred,
+            pred.pred
+        );
+    }
+}
+
+#[test]
+fn adaptive_locf_carry_does_not_advance_past_a_non_record_break() {
+    // Since #1073 the reactive walk resolves a segment FORWARD — a break that is not a
+    // data record takes the next record ahead. The LOCF carry must NOT follow it there.
+    //
+    // `last_pk` is the covariate a controller sees: it feeds the decision-time readout
+    // and fixes the bioavailability of any dose injected at that decision. Advancing it
+    // from the segment's own (forward-looking) snapshot would let a decision at a
+    // non-record instant read a covariate that has not been recorded yet — the walk
+    // reaching into its own future. So the carry advances only at an actual record
+    // (`records.at(t_end)`), which is also what keeps a dose arrival, an infusion end,
+    // a zero-order cutoff and an EVID=3/4 reset from disturbing it at all.
+    //
+    // Fixture: `F` reads `CRCL`, which steps 100 -> 50 at the `t = 24` record. The
+    // second decision is at `t = 12` — deliberately NOT a record — so its dose's `F`
+    // comes through `last_pk`. LOCF gives `CRCL = 100` (the `t = 0` record) and
+    // `F = 0.8`; leaking the forward resolution gives `CRCL = 50` and `F = 0.4`, a
+    // factor of two in the delivered dose that shows up at every later observation.
+    //
+    // Non-IOV on purpose: under IOV `last_pk` is overwritten by `decision_pk[g]` at the
+    // top of a decision break, which would mask the leak.
+    let model = parse_model_string(ODE_TV_F).expect("parse TV-F ODE model");
+    let obs = vec![0.0, 24.0, 48.0];
+    let mut s = subj("1", obs.clone(), vec![]);
+    s.covariates = HashMap::from([("CRCL".to_string(), 100.0)]);
+    s.obs_covariates = vec![
+        HashMap::from([("CRCL".to_string(), 100.0)]),
+        HashMap::from([("CRCL".to_string(), 50.0)]),
+        HashMap::from([("CRCL".to_string(), 50.0)]),
+    ];
+    let mut pop = population(vec![s]);
+    pop.covariate_names = vec!["CRCL".to_string()];
+
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(13),
+        // t=12 is not an observation, so the decision there is a non-record break.
+        decision_times: vec![0.0, 12.0],
+        ..Default::default()
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        .expect("TV-F subject with an off-record decision runs");
+    assert_eq!(res.ledger.len(), 2, "a 100-unit bolus at each decision");
+
+    // Both doses land under the LOCF covariate CRCL = 100, so both deliver
+    // F * 100 = 0.8 * 100 = 80 units. The leak would make the second deliver 40.
+    for (i, e) in res.ledger.iter().enumerate() {
+        assert!(
+            (e.f_applied - 0.8).abs() < 1e-12,
+            "dose {i} at t={}: F = {} (LOCF CRCL = 100 gives 0.8; the forward leak \
+             gives 0.4)",
+            e.time,
+            e.f_applied
+        );
+    }
+
+    // And the trajectory, so the assertion is not only about bookkeeping. k = CL/V =
+    // 0.1/h; 80 units at t=0 decay to t=12, 80 more land there, and the sum decays to
+    // t=24 and t=48.
+    let k: f64 = 5.0 / 50.0;
+    let a12 = 80.0 * (-12.0 * k).exp() + 80.0;
+    let expect = [80.0, a12 * (-12.0 * k).exp(), a12 * (-36.0 * k).exp()];
+    for (traj, want) in res.trajectories.iter().zip(expect.iter()) {
+        assert!(
+            (traj.ipred - want).abs() <= 8.0 * (1e-6 + 1e-4 * want),
+            "t={}: IPRED {} != closed form {want}",
             traj.time,
             traj.ipred
         );
@@ -2687,11 +2945,46 @@ const SPEC_TITRATE: &str = r#"
   when signal > 13 : decrease 25%
 "#;
 
+// Same structural core, but the controller's `observe` expression is the `TIME`
+// built-in itself (#1028). `[adaptive_dosing] observe` compiles through the same
+// `build_y_output_fn` as a `[scaling]` Form C readout, so it reads the model-time
+// thread-local — and the reactive driver calls the compiled closure directly rather
+// than through `OdeReadout::eval`, so it needs its own guard. Decisions at 0/24/48
+// with a `signal < 30` rule therefore fire at t=0 and t=24 and *not* at t=48. Had
+// the closure read a stale `TIME = 0` the rule would fire at all three, so the dose
+// ladder below discriminates the two outright.
+const SPEC_TIME_OBSERVE: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+[adaptive_dosing]
+  observe = TIME
+  at = [0, 24, 48]
+  start_dose = 100
+  route = bolus(cmt=1)
+  dose_bounds = [0, 1000]
+  when signal < 30 : increase 25%
+"#;
+
 /// A minimal valid titration spec (built directly, no file) for the rejection
 /// tests, which never reach the run loop.
 fn simple_titration_spec() -> AdaptiveDosingSpec {
     AdaptiveDosingSpec {
         observe: Some("central".to_string()),
+        observe_declared_covariates: Vec::new(),
         with_assay_error: false,
         assay_cmt: None,
         at: vec![0.0, 24.0],
@@ -3404,6 +3697,7 @@ fn from_spec_three_witnesses_equals_handwritten_closure() {
 
     let spec = AdaptiveDosingSpec {
         observe: Some("central".to_string()),
+        observe_declared_covariates: Vec::new(),
         with_assay_error: false,
         assay_cmt: None,
         at: at.clone(),
@@ -3570,6 +3864,125 @@ fn from_spec_closed_loop_converges_into_target_band() {
     assert_eq!(
         last.amt, prev.amt,
         "the maintenance dose should be steady once the trough is in band"
+    );
+}
+
+#[test]
+fn from_spec_observe_reads_the_time_builtin_at_the_decision() {
+    // #1028: `observe = TIME` must see each decision's own time. The compiled
+    // `observe` closure resolves the `TIME` built-in from the model-time
+    // thread-local, and the reactive driver evaluates it directly (not through
+    // `OdeReadout::eval`), so the driver enters the guard itself.
+    let parsed = parse_full_model(SPEC_TIME_OBSERVE).expect("observe = TIME parses");
+    let spec = parsed.adaptive_dosing.as_ref().expect("block present");
+    let pop = population(vec![subj("P", vec![60.0], vec![])]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(3),
+        ..Default::default()
+    };
+    let res = simulate_adaptive_from_spec(
+        &parsed.model,
+        &pop,
+        &parsed.model.default_params,
+        1,
+        spec,
+        &opts,
+    )
+    .expect("the TIME-driven controller runs");
+
+    // The observed signal IS the decision time.
+    let times = [0.0, 24.0, 48.0];
+    assert_eq!(res.decisions.len(), 3, "one decision per `at` entry");
+    for (d, &t) in res.decisions.iter().zip(times.iter()) {
+        approx::assert_relative_eq!(d.observed_signals[0].value, t, epsilon = 1e-9);
+    }
+
+    // …and the rule (`signal < 30 : increase 25%`) therefore fires at t=0 and t=24
+    // but not at t=48: 100 → 125 → 156.25 → held. A stale `TIME = 0` would have
+    // fired all three (100 → 125 → 156.25 → 195.3125).
+    let amts: Vec<f64> = res.ledger.iter().map(|d| d.amt).collect();
+    assert_eq!(amts.len(), 3, "one dose per decision");
+    approx::assert_relative_eq!(amts[0], 125.0, max_relative = 1e-9);
+    approx::assert_relative_eq!(amts[1], 156.25, max_relative = 1e-9);
+    approx::assert_relative_eq!(amts[2], 156.25, max_relative = 1e-9);
+}
+
+#[test]
+fn from_spec_observe_t_alias_loses_to_a_declared_covariate() {
+    // `observe` compiles through the same `build_y_output_fn` as a `[scaling]` Form C
+    // readout, so it must apply the same `T` / `t` name precedence — otherwise the
+    // *same* model reads a declared `T` as the data column in `[scaling]` and as the
+    // model-time built-in in `observe` (#1042 review of #1028). The declarations reach
+    // the simulate-time compiler via `AdaptiveDosingSpec::observe_declared_covariates`,
+    // captured at parse time.
+    //
+    // `T` is declared but referenced *only* by `observe`, which is exactly the case a
+    // `referenced_covariates`-based precedence list would have missed.
+    let src = SPEC_TIME_OBSERVE.replace("observe = TIME", "observe = T")
+        + "[covariates]\n  T continuous\n";
+    let parsed = parse_full_model(&src).expect("a declared T covariate parses");
+    let spec = parsed.adaptive_dosing.as_ref().expect("block present");
+    assert!(
+        spec.observe_declared_covariates.iter().any(|c| c == "T"),
+        "the spec must carry the [covariates] declarations, got {:?}",
+        spec.observe_declared_covariates
+    );
+
+    // The controller reads the column (60.0 for this subject), not the decision time —
+    // so `signal < 30` never fires and the dose is re-issued unchanged at all three
+    // decisions. Under the model-time reading it would have fired at t=0 and t=24.
+    let mut s = subj("P", vec![60.0], vec![]);
+    s.covariates.insert("T".to_string(), 60.0);
+    let mut pop = population(vec![s]);
+    pop.covariate_names = vec!["T".to_string()];
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(3),
+        ..Default::default()
+    };
+    let res = simulate_adaptive_from_spec(
+        &parsed.model,
+        &pop,
+        &parsed.model.default_params,
+        1,
+        spec,
+        &opts,
+    )
+    .expect("the covariate-driven controller runs");
+    for d in &res.decisions {
+        approx::assert_relative_eq!(d.observed_signals[0].value, 60.0, epsilon = 1e-9);
+    }
+    let amts: Vec<f64> = res.ledger.iter().map(|d| d.amt).collect();
+    assert_eq!(amts, vec![100.0, 100.0, 100.0], "no rule may fire on 60.0");
+}
+
+#[test]
+fn from_spec_observe_t_alias_fold_warns_at_parse_time() {
+    // `observe` is compiled at simulate time, where `parse_warnings` is long sealed
+    // and the adaptive result has no warnings channel — so the parser emits the
+    // `T`-alias note itself, from the same helper the compiler runs. Without it the
+    // fold would be silent on this one path (#1042 review of #1028).
+    let src = SPEC_TIME_OBSERVE.replace("observe = TIME", "observe = T");
+    let parsed = parse_full_model(&src).expect("the T alias parses");
+    assert!(
+        parsed
+            .model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("[adaptive_dosing] observe") && w.contains("model-time built-in")),
+        "expected a fold warning naming the block, got {:?}",
+        parsed.model.parse_warnings
+    );
+
+    // The unambiguous `TIME` spelling stays quiet.
+    let parsed_time = parse_full_model(SPEC_TIME_OBSERVE).expect("TIME parses");
+    assert!(
+        !parsed_time
+            .model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("model-time built-in")),
+        "`TIME` must not warn, got {:?}",
+        parsed_time.model.parse_warnings
     );
 }
 
@@ -3835,6 +4248,7 @@ fn from_spec_rejects_observe_covariate_absent_from_data() {
     let model = parse_model_string(ODE_NO_IIV).expect("parse");
     let spec = AdaptiveDosingSpec {
         observe: Some("central / BADCOV".to_string()),
+        observe_declared_covariates: Vec::new(),
         ..simple_titration_spec()
     };
     let pop = population(vec![subj("1", vec![6.0], vec![])]); // no covariate columns
@@ -3862,6 +4276,7 @@ fn from_spec_dv_collapses_to_ipred_as_sigma_to_zero() {
 
     let ipred_spec = AdaptiveDosingSpec {
         observe: Some("central".to_string()),
+        observe_declared_covariates: Vec::new(),
         with_assay_error: false,
         assay_cmt: None,
         at: at.clone(),
@@ -3883,6 +4298,7 @@ fn from_spec_dv_collapses_to_ipred_as_sigma_to_zero() {
     // observes) with assay noise.
     let dv_spec = AdaptiveDosingSpec {
         observe: None,
+        observe_declared_covariates: Vec::new(),
         with_assay_error: true,
         assay_cmt: Some(1),
         ..ipred_spec.clone()

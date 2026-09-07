@@ -150,15 +150,15 @@ use EstimationMethod::*;
 
 #[test]
 fn cov_stage_single_method_is_last() {
-    assert!(is_last_estimating_stage(&[Foce], 0, false));
+    assert!(is_last_estimating_stage(&[Foce], 0, &[]));
 }
 
 #[test]
 fn cov_stage_only_final_estimator_in_plain_chain() {
     // [foce, saem]: covariance only on saem (the last stage), never on foce.
     let chain = [Foce, Saem];
-    assert!(!is_last_estimating_stage(&chain, 0, false));
-    assert!(is_last_estimating_stage(&chain, 1, false));
+    assert!(!is_last_estimating_stage(&chain, 0, &[]));
+    assert!(is_last_estimating_stage(&chain, 1, &[]));
 }
 
 #[test]
@@ -167,8 +167,8 @@ fn cov_stage_estimating_imp_owns_step_not_predecessor() {
     // IMP is a real estimator and owns the covariance step, so saem must NOT
     // also run it — otherwise covariance is computed twice (#615).
     let chain = [Saem, Imp];
-    assert!(!is_last_estimating_stage(&chain, 0, false));
-    assert!(is_last_estimating_stage(&chain, 1, false));
+    assert!(!is_last_estimating_stage(&chain, 0, &[]));
+    assert!(is_last_estimating_stage(&chain, 1, &[]));
 }
 
 #[test]
@@ -176,18 +176,46 @@ fn cov_stage_eval_only_imp_cedes_step_to_predecessor() {
     // [saem, imp] with imp_eval_only = true: trailing IMP is a likelihood
     // evaluation, so saem is the last estimating stage and owns covariance.
     let chain = [Saem, Imp];
-    assert!(is_last_estimating_stage(&chain, 0, true));
+    assert!(is_last_estimating_stage(&chain, 0, &[Imp]));
     // The eval-only IMP stage itself never runs the covariance step (handled
     // by the eval-only branch in fit), but as the last stage it still reports
     // as last-estimating; gating there is a no-op since it skips covariance.
-    assert!(is_last_estimating_stage(&chain, 1, true));
+    assert!(is_last_estimating_stage(&chain, 1, &[Imp]));
 }
 
 #[test]
 fn cov_stage_three_method_chain_estimating_imp() {
     // [foce, saem, imp] estimating: only the final imp owns covariance.
     let chain = [Foce, Saem, Imp];
-    assert!(!is_last_estimating_stage(&chain, 0, false));
-    assert!(!is_last_estimating_stage(&chain, 1, false));
-    assert!(is_last_estimating_stage(&chain, 2, false));
+    assert!(!is_last_estimating_stage(&chain, 0, &[]));
+    assert!(!is_last_estimating_stage(&chain, 1, &[]));
+    assert!(is_last_estimating_stage(&chain, 2, &[]));
+}
+
+// ── keep_gn_zero_eta_warning: the chain half of the #1006 exemption ──
+
+#[test]
+fn gn_zero_eta_warning_dropped_when_a_later_stage_re_optimises() {
+    // `methods = [gn, focei]`: `run_foce_gn` sees `method = gn` and no chain
+    // (fit_inner blanks `stage_opts.methods`), so it pushes the #1006 warning
+    // unconditionally. The FOCEI stage that follows recovers the optimum, so the
+    // "result may be badly wrong" claim is false and must not reach FitResult.
+    let w = crate::estimation::gauss_newton::GN_ZERO_ETA_NONCONVERGENCE_WARNING;
+    assert!(!keep_gn_zero_eta_warning(w, false));
+    assert!(keep_gn_zero_eta_warning(w, true));
+}
+
+#[test]
+fn gn_zero_eta_filter_passes_every_other_warning_through() {
+    // Only the one #1006 string is chain-conditional; a non-terminal stage's
+    // other warnings (including GN's own generic non-convergence note) still
+    // reach the user.
+    for w in [
+        "Gauss-Newton: max iterations reached without convergence",
+        "Gauss-Newton: trust radius collapsed",
+        "Covariance step failed — SEs not available",
+    ] {
+        assert!(keep_gn_zero_eta_warning(w, false), "wrongly dropped: {w}");
+        assert!(keep_gn_zero_eta_warning(w, true), "wrongly dropped: {w}");
+    }
 }

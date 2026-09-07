@@ -1,3 +1,8 @@
+---
+pagetitle: "Time-to-event models in ferx"
+description-meta: "Fit parametric, censored, competing-risk, repeated-event, and joint PK time-to-event models with FOCEI or SAEM in ferx."
+---
+
 # Time-to-Event (TTE) Models
 
 > **Maturity: beta** — see [Feature Maturity](../maturity.qmd) for what this means.
@@ -132,6 +137,14 @@ ID,TIME,DV,EVID,CMT
 1,10.0, 2, 0, 2   # right bound  →  event occurred in (5, 10]
 ```
 
+**Loading the data.** The event rows are recognised *by the model*: read the
+dataset with `read_population_for(&model, …)` (the R entry points and the CLI do),
+not with the model-blind `read_nonmem_csv()`. A population read without the model
+carries the event rows as Gaussian observations and no event records, and `fit()`
+refuses it with `E_ENDPOINT_UNROUTED`; a dataset whose event CMT has no rows at
+all — usually a missing `CMT` column — is refused with `E_ENDPOINT_NO_RECORDS`.
+See the [check report codes](../file-formats/check-report.qmd#codes-data-and-dosing).
+
 ### Left truncation (delayed entry)
 
 If subjects enter the study at a time > 0 (e.g. they survived until enrolment),
@@ -252,6 +265,63 @@ compartments** so the data reader can route Gaussian rows and TTE rows unambiguo
 the same augmented system at the typical values (its `mean_survival` is `NaN` — an
 `∫₀^∞ S` summary for ODE hazards is a follow-up; `median_survival` is interpolated from
 the cumulative-hazard grid).
+
+**A hazard time at or before the subject's first record.** A `TENTRY` (left truncation) or
+an interval-censored left bound below the start of the integration contributes nothing:
+nothing has acted on the system yet, so `H = 0` and `h = h(u₀)` there, and the
+left-truncated `H(T) − H(entry)` reduces to the untruncated `H(T)`. `predict_survival()`
+reports the same values at such a grid point. Where the clock starts is worth knowing,
+because it differs from NONMEM: NONMEM integrates from the subject's first record of *any*
+`EVID`, ferx from the first dose or scored observation. An `MDV = 1` row is dropped by the
+reader, and an `EVID = 2` row only joins the timeline on a model with time-varying
+covariates (which a joint PK-TTE model routes away from the shared solve anyway) — neither
+starts the hazard clock. Put a dose or an observation record where the clock should start
+([#1223](https://github.com/FeRx-NLME/ferx-core/issues/1223)).
+
+### A time-dependent hazard keeps the single shared solve {#time-dependent-hazard}
+
+A Weibull or Gompertz baseline reads `TIME`, so the appended `d/dt(__chz_<cmt>)` line is
+time-dependent — but the PK block above it usually is not, and ferx now asks that
+question of the **PK equations alone**. Such a model gets both halves of the objective
+from one integration of the augmented system rather than two:
+
+```
+[event_model]
+  cmt    = 3
+  hazard = H0 * exp(GAM * TIME) * exp(BETA * (central / V))   # Gompertz × exposure
+```
+
+Writing `TIME` in a PK equation still splits the solve, which is correct: the two halves
+then genuinely need different treatment. `__chz_*` may not be read from `[odes]` or seeded
+with `init(...)` — see
+[the ODE-models page](../model-file/ode-models.qmd#chz-is-not-your-rhs).
+
+The same "the accumulator is not a compartment" reading governs steady-state dosing. An
+`SS=1` dose equilibrates the PK compartments to their periodic steady state, but the
+accumulator has none — it is a pure integrator — so it is held out of the run-in and keeps
+its value at the dose record. `H` therefore starts at `0` for a subject's first dose, and a
+later `SS=1` dose re-loads the compartments without discarding the hazard accrued so far.
+NONMEM's own steady-state routine cannot be handed such a system at all; see
+[SS with an ODE-accumulated hazard](../model-file/steady-state.qmd#ss-with-an-ode-accumulated-hazard)
+for the convention, the NONMEM result, and the committed anchor.
+
+::: {.callout-note}
+## Affects run time from ferx 0.3.0 and earlier, not results
+
+Between [#1124](https://github.com/FeRx-NLME/ferx-core/issues/1124) and
+[#1166](https://github.com/FeRx-NLME/ferx-core/issues/1166) every joint model with a
+time-dependent hazard declined the shared solve and integrated twice per subject per
+objective evaluation. Measured on a 40-subject fixture, one variable: **2.1×** on a single
+objective evaluation and **2.6×** over eight outer iterations. The objective itself moved
+only at solver-tolerance scale (4.4e-3 OFV at default tolerances, decaying with the
+tolerance), so earlier results do not need re-running — they were merely slow.
+:::
+
+Validated against NONMEM: `nonmem_anchor/pktte_tdep.ctl` (`ADVAN13 TOL=9`, `$OMEGA 0 FIX`)
+on 40 subjects. At `ode_reltol = 1e-9` ferx's `H(t)` matches NONMEM's `A(3)` to 3.6e-9
+relative at every event record, and the per-subject objective matches the `.phi` `OBJ` to
+6.0e-8 absolute with **no** additive constant between the two conventions
+(`tests/pktte_tdep_nonmem_anchor.rs`).
 
 ### Simulating drug-driven event times
 

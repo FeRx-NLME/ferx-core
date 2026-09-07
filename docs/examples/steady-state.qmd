@@ -1,3 +1,7 @@
+---
+pagetitle: "Steady-state dosing example"
+---
+
 # Steady-State Dosing (SS Column)
 
 This example demonstrates the `SS` and `II` dataset columns, which tell the engine to initialise the compartment states analytically at steady state rather than from zero. The complete model file is [`examples/warfarin_ss.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/warfarin_ss.ferx).

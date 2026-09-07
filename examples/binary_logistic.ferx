@@ -11,7 +11,7 @@
 # TH0 = -0.4, THX = 0.9, THT = 0.5). Reference glm fit:
 #   (Intercept) = -0.7752, X = 0.8701, TIME = 0.8270   (deviance 213.60).
 #
-# Run:  cargo run --release -- examples/binary_logistic.ferx --data data/binary_logistic.csv
+# Run:  cargo run --release -p ferx-cli -- examples/binary_logistic.ferx --data data/binary_logistic.csv
 
 [parameters]
   theta TH0(0.0, -10.0, 10.0)

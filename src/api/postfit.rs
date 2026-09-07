@@ -5,14 +5,14 @@ use super::*;
 use crate::diagnostics::{first_error, CheckReport, Diagnostic};
 use crate::estimation::outer_optimizer::optimize_population;
 use crate::estimation::parameterization::{
-    chol_lt_idx, lower_tri_iter, omega_packed_len, theta_packs_log,
+    chol_lt_idx, lower_tri_iter, omega_cholesky_jacobian, omega_packed_len, rho_chain,
+    rho_packed_start, theta_packs_log, PackedCoordKind,
 };
 use crate::estimation::saem;
 use crate::io::datareader::{
-    read_nonmem_csv_filtered_mapped, read_nonmem_csv_filtered_tte, read_nonmem_csv_mapped,
+    read_nonmem_csv_filtered_mapped, read_nonmem_csv_mapped,
     read_nonmem_csv_with_covariates_filtered_mapped, read_nonmem_csv_with_covariates_mapped,
-    read_nonmem_csv_with_covariates_tte, SelectionFilter, ERR_COV_MISSING_COLUMNS,
-    ERR_COV_NON_NUMERIC,
+    SelectionFilter, ERR_COV_MISSING_COLUMNS, ERR_COV_NON_NUMERIC,
 };
 use crate::pk;
 use crate::propensity_match::MatchMethod;
@@ -338,14 +338,30 @@ pub(crate) fn compute_param_corr(
 pub(crate) fn is_last_estimating_stage(
     chain: &[EstimationMethod],
     stage_idx: usize,
-    imp_eval_only: bool,
+    eval_only: &[EstimationMethod],
 ) -> bool {
     let is_last = stage_idx + 1 == chain.len();
-    let trailing_eval_only_imp = imp_eval_only
-        && chain[stage_idx + 1..]
-            .iter()
-            .all(|&m| m == EstimationMethod::Imp);
-    is_last || trailing_eval_only_imp
+    // Every remaining stage is a pure evaluator, so *this* one is the last that estimates.
+    // `eval_only` is the set of methods running in evaluation-only mode for this fit —
+    // `imp` under `imp_eval_only`, `laplace` under `agq_eval_only`. An empty slice means
+    // nothing is an evaluator, so only the literal last stage qualifies.
+    let trailing_all_eval_only = !chain[stage_idx + 1..].is_empty()
+        && chain[stage_idx + 1..].iter().all(|m| eval_only.contains(m));
+    is_last || trailing_all_eval_only
+}
+
+/// Whether a Gauss-Newton stage's warning survives into `FitResult.warnings`.
+///
+/// The #1006 post-fit warning says a fixed-effects-only GN result "may be badly
+/// wrong". That is only true if nothing re-optimises it. `run_foce_gn` exempts
+/// `gn_hybrid` itself, but it cannot exempt a hand-written `methods = [gn, focei]`
+/// chain — `fit_inner` blanks `stage_opts.methods` per stage, so the GN stage sees
+/// `method = gn` and no chain. This is the other half of that exemption, applied
+/// where the chain *is* visible: a GN stage followed by a further estimating stage
+/// drops the warning, a trailing one keeps it. Every other warning passes through.
+pub(crate) fn keep_gn_zero_eta_warning(warning: &str, is_last_estimating: bool) -> bool {
+    is_last_estimating
+        || warning != crate::estimation::gauss_newton::GN_ZERO_ETA_NONCONVERGENCE_WARNING
 }
 
 /// Resolve the reported [`CovarianceStatus`] from the three signals that
@@ -371,19 +387,105 @@ pub(crate) fn resolve_covariance_status(
 }
 
 /// Pure gate for the non-PD-Hessian SIR fallback: should it run? It fires only
-/// when the user opted in (`covariance_fallback = sir`), the FD-Hessian
-/// covariance did **not** succeed (`!has_covariance_matrix`), a normal
-/// `sir = true` run did **not** already produce intervals (`!normal_sir_ran`),
-/// and `compute_covariance` actually handed back a fallback proposal
-/// (`has_fallback_proposal`). Split out of [`resolve_sir_fallback`] so the
-/// decision is unit-testable without driving a fit to a non-PD Hessian (#264).
+/// when the user asked for SIR at all — either explicitly opting into the
+/// fallback (`covariance_fallback = sir`) **or** simply requesting SIR
+/// (`sir = true`, #972) — the FD-Hessian covariance did **not** succeed
+/// (`!has_covariance_matrix`), a normal `sir = true` run did **not** already
+/// produce intervals (`!normal_sir_ran`), and `compute_covariance` actually
+/// handed back a fallback proposal (`has_fallback_proposal`). Split out of
+/// [`resolve_sir_fallback`] so the decision is unit-testable without driving a
+/// fit to a non-PD Hessian (#264).
+///
+/// `sir_requested` arms the same fallback as `covariance_fallback = sir`
+/// because the two options were otherwise wired to independent paths: a user
+/// who set only `sir = true` and hit a non-PD Hessian got no SIR at all, even
+/// though the rectified-|λ| proposal for exactly that case had already been
+/// built (#972).
 pub(crate) fn should_run_sir_fallback(
     fallback_is_sir: bool,
+    sir_requested: bool,
     has_covariance_matrix: bool,
     normal_sir_ran: bool,
     has_fallback_proposal: bool,
 ) -> bool {
-    fallback_is_sir && !has_covariance_matrix && !normal_sir_ran && has_fallback_proposal
+    (fallback_is_sir || sir_requested)
+        && !has_covariance_matrix
+        && !normal_sir_ran
+        && has_fallback_proposal
+}
+
+/// Warning for the case where `sir = true` was requested but no SIR intervals
+/// could be produced at all — neither from an inverted covariance nor from the
+/// non-PD fallback proposal. Returns `None` whenever SIR did run, a covariance
+/// exists (so the standard path already reported its own failure), or SIR was
+/// never requested.
+///
+/// The message distinguishes the genuinely different causes, since the old
+/// single warning pointed every user at `covariance = true` even when the
+/// covariance step *had* run and failed (#972):
+///
+/// - the fit is Bayesian → the covariance/SIR steps are deliberately not run
+///   (posterior credible intervals are reported instead), so neither
+///   `covariance = true` nor anything else would produce SIR intervals;
+/// - the covariance step was never run → enabling it is the fix;
+/// - the covariance step ran and produced neither a covariance matrix nor a
+///   fallback proposal → SIR has nothing to draw from. The *cause* is whatever
+///   `compute_covariance` already reported (a divergent eigendecomposition, a
+///   flat / non-finite FD stencil, a non-finite base OFV, a singular score
+///   cross-product under `covariance_method = s`/`rsr`, …), so this message
+///   points at that warning rather than asserting one specific cause it cannot
+///   know (review #975).
+///
+/// When a proposal *was* built the fallback fired and [`resolve_sir_fallback`]
+/// has already pushed its own `"SIR fallback failed: …"` warning, so this
+/// returns `None` to avoid stacking two messages on one failure.
+pub(crate) fn sir_unavailable_warning(
+    sir_requested: bool,
+    covariance_requested: bool,
+    bayes_fit: bool,
+    has_covariance_matrix: bool,
+    has_fallback_proposal: bool,
+    sir_ran: bool,
+) -> Option<String> {
+    if !sir_requested || has_covariance_matrix || sir_ran {
+        return None;
+    }
+    // Wording note (applies to every message below): none of them may contain
+    // "covariance step failed", "covariance failed", "degenerate",
+    // "ill-conditioned" or "condition number" — `classify_warning`
+    // (src/types.rs) tests those substrings *before* "sir requested", so any of
+    // them would misroute a SIR warning to `covariance_failed` /
+    // `optimizer_health` / `condition_number`.
+    if bayes_fit {
+        // Bayesian fits report posterior credible intervals and never run the
+        // covariance step, so telling the user to enable `covariance = true`
+        // (which may well already be set) would be the same useless advice #972
+        // set out to remove.
+        return Some(
+            "SIR requested but not run: Bayesian estimation reports posterior \
+             credible intervals instead of a Hessian-based covariance, which SIR \
+             would have to draw from."
+                .to_string(),
+        );
+    }
+    if !covariance_requested {
+        return Some(
+            "SIR requested but covariance matrix is not available. \
+             Enable covariance = true in [fit_options]."
+                .to_string(),
+        );
+    }
+    if has_fallback_proposal {
+        // The non-PD fallback ran off the rectified-|λ| proposal and failed;
+        // that path reports its own error.
+        return None;
+    }
+    Some(
+        "SIR requested but the covariance step did not succeed and no usable SIR \
+         proposal could be built from it, so SIR could not run — see the \
+         covariance warning above for the cause."
+            .to_string(),
+    )
 }
 
 /// Run the non-PD-Hessian SIR fallback when [`should_run_sir_fallback`] permits.
@@ -413,6 +515,7 @@ pub(crate) fn resolve_sir_fallback(
     }
     if !should_run_sir_fallback(
         options.covariance_fallback == CovarianceFallback::Sir,
+        options.sir,
         has_covariance_matrix,
         normal_sir_ran,
         fallback_proposal.is_some(),
@@ -427,7 +530,12 @@ pub(crate) fn resolve_sir_fallback(
     match crate::estimation::sir::run_sir_core(
         model, population, params, eta_hats, proposal, ofv, options,
     ) {
-        Ok(sir) => Some(sir),
+        Ok(sir) => {
+            for w in &sir.warnings {
+                warnings.push(format!("SIR fallback: {}", w));
+            }
+            Some(sir)
+        }
         Err(e) => {
             warnings.push(format!("SIR fallback failed: {}", e));
             None
@@ -464,6 +572,14 @@ pub(crate) fn cov_diagnostics(cov: Option<&DMatrix<f64>>) -> (Option<Vec<f64>>, 
 }
 
 /// Compute per-subject diagnostics (IPRED, PRED, IWRES, CWRES)
+///
+/// `mixest` (#985) carries the fitted per-subject mixture class (0-based, from
+/// `OuterResult::mixture_posteriors`) and is `None` for every non-mixture fit.
+/// Every prediction below is evaluated under that subject's class guard: the η̂
+/// handed in are the MIXEST-class EBEs, so building predictions from them with
+/// `MIXNUM` left at its class-1 default would pair a class-2 η̂ with class-1
+/// typical values and silently corrupt IPRED/PRED/IWRES/CWRES (and the per-subject
+/// OFV) for every subject the fit assigned to another class.
 pub(crate) fn compute_subject_results(
     model: &CompiledModel,
     population: &Population,
@@ -472,12 +588,17 @@ pub(crate) fn compute_subject_results(
     h_matrices: &[DMatrix<f64>],
     kappas_per_subject: &[Vec<DVector<f64>>],
     interaction: bool,
+    mixest: Option<&[usize]>,
 ) -> Vec<SubjectResult> {
     population
         .subjects
         .iter()
         .enumerate()
         .map(|(i, subject)| {
+            // Hold this subject's fitted class for the whole per-subject block.
+            let _mix_guard = mixest
+                .and_then(|m| m.get(i))
+                .map(|&c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
             let eta = &eta_hats[i];
             let h = &h_matrices[i];
             let kappas: &[DVector<f64>] = if i < kappas_per_subject.len() {
@@ -545,7 +666,8 @@ pub(crate) fn compute_subject_results(
                 model.error_spec.obs_keys(subject).as_ref(),
                 &model.error_spec,
                 &params.sigma.values,
-                &model.residual_correlations,
+                // The fitted correlations, not the declaration (#847).
+                &params.residual_correlations,
                 ruv_mult.as_deref(),
             );
             // IIV on residual error (#409): the individual residual SD is scaled
@@ -571,6 +693,18 @@ pub(crate) fn compute_subject_results(
                 &subject.fremtype,
                 &params.sigma.values,
             );
+            // `R` where the marginal evaluates it — `IPRED` under an interaction
+            // fit, the population prediction f(η=0) under FOCE — which is what
+            // NONMEM's `CWRES` does (pinned in `compute_cwres`'s doc comment).
+            // Additive error keeps the linearized `f0` (bit-identical: `R` does
+            // not depend on the prediction).
+            let r_preds: Option<&[f64]> = if !model.error_spec.has_f_dependent_variance() {
+                None
+            } else if interaction {
+                Some(ipred.as_slice())
+            } else {
+                Some(pred.as_slice())
+            };
             let cwres = compute_cwres(
                 subject,
                 &ipred,
@@ -579,10 +713,11 @@ pub(crate) fn compute_subject_results(
                 &params.omega,
                 &params.sigma.values,
                 &model.error_spec,
-                &model.residual_correlations,
+                &params.residual_correlations,
                 frem_r_override.as_deref(),
                 model.residual_error_eta,
                 ruv_mult.as_deref(),
+                r_preds,
             );
 
             // OFV contribution
@@ -612,6 +747,7 @@ pub(crate) fn compute_subject_results(
                     h,
                     &params.omega,
                     &params.sigma.values,
+                    &params.residual_correlations,
                     interaction,
                 )
             };
@@ -629,6 +765,10 @@ pub(crate) fn compute_subject_results(
                 ofv_contribution: 2.0 * ofv_i,
                 cens: subject.cens.clone(),
                 n_obs: subject.observations.len(),
+                // Mixture posteriors (#977) are threaded on post-fit in fit.rs from
+                // the converged MixtureEval; None for every non-mixture subject.
+                pmix: None,
+                mixest: None,
                 extra_columns: vec![],
                 per_obs_tad: vec![],
                 compartment_states,
@@ -643,6 +783,50 @@ pub(crate) fn compute_subject_results(
                     eta.as_slice(),
                 ),
             }
+        })
+        .collect()
+}
+
+/// Per-kappa weight of the *median* subject-occasion in this dataset (#1031),
+/// parallel to `CompiledModel::kappa_names`; `None` for an unweighted kappa.
+///
+/// This is the arm size that makes a reported γ readable: a `weight = NARM`
+/// kappa estimated at γ = 2.0 on a logit scale looks alarming until it is
+/// divided, and `γ/√median(N)` — 0.14 at N = 200 — is the between-arm SD a
+/// reader is actually looking for. One weight is taken per subject-occasion
+/// (the occasion's first observation, or the subject's covariates when the
+/// occasion carries only doses), matching the granularity κ is drawn at.
+pub(crate) fn kappa_weight_typicals(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+) -> Vec<Option<f64>> {
+    if !model.has_weighted_kappa() {
+        return Vec::new();
+    }
+    model
+        .kappa_weights
+        .iter()
+        .map(|w| {
+            let w = w.as_ref()?;
+            let mut vals: Vec<f64> = Vec::new();
+            for subj in &population.subjects {
+                for (_occ, obs_idx) in crate::stats::likelihood::iov_occasion_groups(subj) {
+                    let (cov, time) = match obs_idx.first() {
+                        Some(&j) => (subj.obs_cov(j), subj.obs_times.get(j).copied()),
+                        None => (&subj.covariates, None),
+                    };
+                    let v = (w.eval)(theta, cov, time.unwrap_or(0.0));
+                    if v.is_finite() {
+                        vals.push(v);
+                    }
+                }
+            }
+            if vals.is_empty() {
+                return None;
+            }
+            vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            Some(vals[vals.len() / 2])
         })
         .collect()
 }
@@ -860,16 +1044,26 @@ pub(crate) fn eta_shrinkage_warning(shrinkage: &[f64], eta_names: &[String]) -> 
     ))
 }
 
-/// Relative tolerance (a fraction of the packed bound range) within which a
-/// theta estimate counts as sitting on its lower/upper optimizer bound.
+/// Relative tolerance within which a theta estimate counts as sitting on its
+/// lower/upper optimizer bound: a fraction of the packed range for a
+/// log-packed theta, a fraction of the bound's own magnitude (floored at 1)
+/// for an identity-packed one.
 const BOUNDARY_REL_TOL: f64 = 1e-3;
 
 /// Which bound a theta estimate is pinned to and the **effective** natural-space
 /// bound value the optimizer actually constrains to, or `None` when the estimate
-/// is interior. Evaluated in the optimizer's *packed* space (log when the lower
-/// bound is `>= 0`, else identity) so the proximity test is scale-appropriate —
-/// a log-scaled parameter is "at" its bound within a constant factor, not a
-/// constant absolute gap.
+/// is interior.
+///
+/// A log-packed theta (lower bound `>= 0`) is judged in the optimizer's packed
+/// space, so "at" its bound means within a constant factor, not a constant
+/// absolute gap. An identity-packed theta (lower bound `< 0`) is judged by
+/// its distance to **each bound on that bound's own scale**, never by its
+/// position as a fraction of the declared range: the two are the same thing
+/// for `(-1, 1)` and very different for PsN's `scm` defaults `(-100, 1e6)`,
+/// where a range fraction would call every estimate below ~900 "at the lower
+/// bound" — which is what every `[covariate_model]` power / exponential θ
+/// carries, and what excluded every candidate of the first covsearch run
+/// (#1180).
 ///
 /// The floors/caps mirror `compute_bounds` / `pack_params`: a log-packed theta
 /// floors its estimate and lower bound at `1e-10` and caps the upper at `1e9`,
@@ -877,24 +1071,40 @@ const BOUNDARY_REL_TOL: f64 = 1e-3;
 /// agrees with the estimate). Degenerate/non-finite bounds yield `None`.
 pub(crate) fn theta_boundary_side(est: f64, lower: f64, upper: f64) -> Option<(&'static str, f64)> {
     use crate::estimation::parameterization::theta_packs_log;
-    let (lo_eff, hi_eff, pe, pl, pu) = if theta_packs_log(lower) {
-        let lo = lower.max(1e-10);
-        let hi = upper.min(1e9);
-        (lo, hi, est.max(1e-10).ln(), lo.ln(), hi.ln())
-    } else {
-        (lower, upper, est, lower, upper)
-    };
-    let range = pu - pl;
-    if !range.is_finite() || range <= 0.0 || !pe.is_finite() {
+    if !(est.is_finite() && lower.is_finite() && upper.is_finite()) || upper <= lower {
         return None;
     }
-    let frac = (pe - pl) / range;
-    if frac <= BOUNDARY_REL_TOL {
-        Some(("lower", lo_eff))
-    } else if frac >= 1.0 - BOUNDARY_REL_TOL {
-        Some(("upper", hi_eff))
+    if theta_packs_log(lower) {
+        let lo = lower.max(1e-10);
+        let hi = upper.min(1e9);
+        let (pe, pl, pu) = (est.max(1e-10).ln(), lo.ln(), hi.ln());
+        let range = pu - pl;
+        if range <= 0.0 {
+            return None;
+        }
+        let frac = (pe - pl) / range;
+        if frac <= BOUNDARY_REL_TOL {
+            Some(("lower", lo))
+        } else if frac >= 1.0 - BOUNDARY_REL_TOL {
+            Some(("upper", hi))
+        } else {
+            None
+        }
     } else {
-        None
+        // The tolerance is a fraction of the bound's magnitude, floored at 1
+        // so a bound of zero still has one — and capped by the same fraction
+        // of the declared range, so a narrow interval (`(-1e-4, 1e-4)`) keeps
+        // its midpoint interior rather than having the floor swallow it.
+        let range = upper - lower;
+        let near =
+            |bound: f64| (est - bound).abs() <= BOUNDARY_REL_TOL * bound.abs().max(1.0).min(range);
+        if near(lower) {
+            Some(("lower", lower))
+        } else if near(upper) {
+            Some(("upper", upper))
+        } else {
+            None
+        }
     }
 }
 
@@ -910,6 +1120,23 @@ fn boundary_estimates(params: &ModelParameters) -> Vec<(String, f64, f64, &'stat
         if let Some((side, bound)) =
             theta_boundary_side(est, params.theta_lower[i], params.theta_upper[i])
         {
+            // A log-packed theta whose declared range reaches past ferx's
+            // 1e-10 / 1e9 implementation caps did not hit a user bound. Route
+            // an actual cap hit to `parameter_at_runaway_guard` instead, where
+            // the remediation does not tell the user to relax a bound they
+            // never declared (or cannot relax past the internal cap).
+            if theta_guard_is_internal(params, i, side) {
+                // Internal theta guards exist only on the log-packed path.
+                let packed_est = est.max(1e-10).ln();
+                let packed_bound = if side == "lower" {
+                    params.theta_lower[i].max(1e-10).ln()
+                } else {
+                    params.theta_upper[i].min(1e9).ln()
+                };
+                if packed_guard_eq(packed_est, packed_bound) {
+                    continue;
+                }
+            }
             let name = params
                 .theta_names
                 .get(i)
@@ -921,6 +1148,136 @@ fn boundary_estimates(params: &ModelParameters) -> Vec<(String, f64, f64, &'stat
     hits
 }
 
+/// Whether a THETA bound reported by `compute_bounds` is an implementation cap
+/// rather than the user's effective declared limit.
+fn theta_guard_is_internal(params: &ModelParameters, i: usize, side: &str) -> bool {
+    use crate::estimation::parameterization::theta_packs_log;
+    let lower = params.theta_lower.get(i).copied().unwrap_or(f64::NAN);
+    let upper = params.theta_upper.get(i).copied().unwrap_or(f64::NAN);
+    theta_packs_log(lower)
+        && match side {
+            "lower" => lower <= 1e-10,
+            "upper" => upper >= 1e9,
+            _ => false,
+        }
+}
+
+/// A free parameter coordinate pinned to one of the internal packed-space
+/// guards. `estimate` is the ordinary reporting-scale value, while the packed
+/// values identify the literal optimizer guard that was reached.
+struct RunawayGuardHit {
+    name: String,
+    estimate: f64,
+    packed_estimate: f64,
+    packed_guard: f64,
+    side: &'static str,
+    kind: PackedCoordKind,
+}
+
+impl RunawayGuardHit {
+    /// Whether the estimate *ran away* to a rail rather than *collapsed* to a
+    /// floor at zero.
+    ///
+    /// The side alone does not answer this. Ω / Ω_IOV off-diagonals are the raw
+    /// `L[i,j]` bounded symmetrically at ±10, so a correlation coordinate driven
+    /// to −10 is the same runaway as its +10 twin and nothing about it collapsed
+    /// toward zero. Only the log-packed coordinates (Theta, Ω diagonal, Σ) have a
+    /// lower rail that means collapse.
+    fn is_runaway(&self) -> bool {
+        self.side == "upper" || self.kind == PackedCoordKind::OmegaOffDiagonal
+    }
+
+    /// The word carried into both the message and `details.verdict`; the message
+    /// token `classify_warning` keys on to recover the severity from a flat
+    /// (e.g. multi-start-spliced) string.
+    fn verdict(&self) -> &'static str {
+        if self.is_runaway() {
+            "runaway"
+        } else {
+            "collapse"
+        }
+    }
+}
+
+/// Tiny packed-space tolerance for an optimizer guard hit. The optimizer may
+/// clamp exactly in scaled space, then recover the packed coordinate through
+/// `(bound / scale) * scale`; that round-trip can land a few ULPs off the literal
+/// guard. This tolerance admits that arithmetic noise without treating a value
+/// merely near a wide safety rail as a hit.
+const INTERNAL_GUARD_REL_TOL: f64 = 4.0 * f64::EPSILON;
+
+fn packed_guard_eq(estimate: f64, guard: f64) -> bool {
+    estimate == guard || (estimate - guard).abs() <= INTERNAL_GUARD_REL_TOL * guard.abs().max(1.0)
+}
+
+/// Return the bound reached by a packed coordinate, allowing only the few ULPs
+/// introduced by optimizer scaling/unscaling. Degenerate or non-finite bounds
+/// are never internal guard hits.
+pub(crate) fn packed_guard_side(
+    estimate: f64,
+    lower: f64,
+    upper: f64,
+) -> Option<(&'static str, f64)> {
+    if !estimate.is_finite() || !lower.is_finite() || !upper.is_finite() || lower >= upper {
+        return None;
+    }
+    if packed_guard_eq(estimate, lower) {
+        Some(("lower", lower))
+    } else if packed_guard_eq(estimate, upper) {
+        Some(("upper", upper))
+    } else {
+        None
+    }
+}
+
+/// Free coordinates pinned to internal packed-space guards.
+///
+/// The walk uses the same packing, bounds, names, and FIX mask as the optimizer.
+/// THETA coordinates are included only where `compute_bounds` substituted its
+/// hidden 1e-10 / 1e9 cap for the declared range; every later coordinate is an
+/// internal OMEGA/SIGMA, OMEGA_IOV, or mixture guard.
+fn runaway_guard_estimates(params: &ModelParameters) -> Vec<RunawayGuardHit> {
+    use crate::estimation::parameterization::{
+        compute_bounds, coordinate_kinds, coordinate_names, coordinate_values, pack_params,
+        packed_fixed_mask,
+    };
+
+    let packed = pack_params(params);
+    let bounds = compute_bounds(params);
+    let fixed = packed_fixed_mask(params);
+    let names = coordinate_names(params);
+    let estimates = coordinate_values(params);
+    let kinds = coordinate_kinds(params);
+    let end = packed
+        .len()
+        .min(bounds.lower.len())
+        .min(bounds.upper.len())
+        .min(names.len())
+        .min(estimates.len())
+        .min(kinds.len());
+
+    (0..end)
+        .filter(|&i| !fixed.get(i).copied().unwrap_or(false))
+        .filter_map(|i| {
+            packed_guard_side(packed[i], bounds.lower[i], bounds.upper[i]).and_then(
+                |(side, packed_guard)| {
+                    if i < params.theta.len() && !theta_guard_is_internal(params, i, side) {
+                        return None;
+                    }
+                    Some(RunawayGuardHit {
+                        name: names[i].clone(),
+                        estimate: estimates[i],
+                        packed_estimate: packed[i],
+                        packed_guard,
+                        side,
+                        kind: kinds[i],
+                    })
+                },
+            )
+        })
+        .collect()
+}
+
 /// Construct a fit-end [`WarningEntry`] with the invariant fields every native
 /// emitter shares (`severity: Warning`, `source_method: None`), varying only
 /// `category`, `message`, and `details`.
@@ -929,8 +1286,18 @@ fn warning_entry(
     message: String,
     details: Option<serde_json::Value>,
 ) -> WarningEntry {
+    warning_entry_with_severity(WarningSeverity::Warning, category, message, details)
+}
+
+/// [`warning_entry`] for the emitters whose severity depends on what they found.
+fn warning_entry_with_severity(
+    severity: WarningSeverity,
+    category: WarningCode,
+    message: String,
+    details: Option<serde_json::Value>,
+) -> WarningEntry {
     WarningEntry {
-        severity: WarningSeverity::Warning,
+        severity,
         category,
         message,
         source_method: None,
@@ -956,6 +1323,61 @@ fn list_warning<H>(
     let msg = msg(&list);
     let entry = warning_entry(category, msg.clone(), Some(details(&hits)));
     Some((msg, entry))
+}
+
+/// The `[covariate_model]` relation table echoed on [`FitResult`] (#1111),
+/// with each relation's θ estimate and standard error joined on.
+///
+/// This is what an SCM harness or an agent reads back after a fit: the
+/// covariate model that ran, the constants it resolved to, and the effect
+/// sizes. Without it the caller would have to re-derive which θ belongs to
+/// which relation by parsing θ names — exactly the string surgery this block
+/// exists to remove.
+pub(crate) fn covariate_relation_estimates(
+    model: &crate::types::CompiledModel,
+    theta_names: &[String],
+    theta: &[f64],
+    se_theta: Option<&Vec<f64>>,
+    theta_fixed: &[bool],
+) -> Vec<crate::types::CovariateRelationEstimate> {
+    let Some(spec) = model.covariate_model.as_ref() else {
+        return Vec::new();
+    };
+    spec.relations
+        .iter()
+        .map(|rel| crate::types::CovariateRelationEstimate {
+            parameter: rel.parameter.clone(),
+            covariate: rel.covariate.clone(),
+            form: rel.form.label().to_string(),
+            center_source: rel.center.map(|c| c.label()),
+            center: rel.resolved_center,
+            expression: match &rel.form {
+                crate::types::CovariateForm::Expr(text) => Some(text.clone()),
+                _ => None,
+            },
+            thetas: rel
+                .thetas
+                .iter()
+                .map(|t| {
+                    let idx = theta_names.iter().position(|n| *n == t.name);
+                    let fixed = idx.is_some_and(|i| theta_fixed.get(i).copied().unwrap_or(false));
+                    crate::types::CovariateThetaEstimate {
+                        name: t.name.clone(),
+                        estimate: idx.and_then(|i| theta.get(i).copied()).unwrap_or(t.init),
+                        // A FIXed θ has no standard error to report, and a fit
+                        // with no covariance step has none for any θ.
+                        se: if fixed {
+                            None
+                        } else {
+                            idx.and_then(|i| se_theta.and_then(|se| se.get(i).copied()))
+                        },
+                        fixed,
+                        level: t.level,
+                    }
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 /// Build the human message + native structured entry (with `details`) for
@@ -989,6 +1411,117 @@ pub(crate) fn boundary_estimate_warning(
             serde_json::json!({ "parameters": params_json })
         },
     )
+}
+
+/// Build the warning for parameter estimates pinned to an internal
+/// runaway guard, or `None` when every free coordinate is interior.
+///
+/// A *runaway* hit also demotes `converged` and reports at `Critical` (#1118):
+/// the coordinate stopped at an implementation rail, so the point is by
+/// construction not an interior optimum and a consumer keying off the boolean
+/// must not keep it. A *collapse* hit stays a plain `Warning` and leaves
+/// `converged` alone — a variance falling to the floor is usually a genuinely
+/// unsupported component for the user to remove rather than a numerical runaway,
+/// so demoting there would be noise. This mirrors `vi::run::bad_basin_warning`,
+/// which owns the same consequence for the final ELBO check.
+///
+/// Which of the two a hit is comes from [`RunawayGuardHit::is_runaway`], not
+/// from the side: an Ω off-diagonal is rail-bounded symmetrically, so its lower
+/// rail is a runaway too.
+pub(crate) fn runaway_guard_warning(
+    converged: &mut bool,
+    params: &ModelParameters,
+) -> Option<(String, WarningEntry)> {
+    let hits = runaway_guard_estimates(params);
+    if hits.is_empty() {
+        return None;
+    }
+    let list = hits
+        .iter()
+        .map(|hit| {
+            format!(
+                "{} (estimate {:.4}; packed coordinate {:.4} at {} guard, {})",
+                hit.name,
+                hit.estimate,
+                hit.packed_estimate,
+                hit.side,
+                hit.verdict()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let has_runaway = hits.iter().any(|hit| hit.is_runaway());
+    let has_collapse = hits.iter().any(|hit| !hit.is_runaway());
+    // An estimate held at an implementation rail is not a solution of the
+    // problem the user posed, whatever the outer optimizer's stop rule reported.
+    if has_runaway {
+        *converged = false;
+    }
+    let mut guidance = String::from(match (has_collapse, has_runaway) {
+        (true, false) => {
+            "The affected parameter(s) collapsed toward zero at an implementation floor \
+             rather than reaching an interior optimum; consider removing or simplifying \
+             the unsupported parameter, random effect, or error component."
+        }
+        (false, true) => {
+            "The affected parameter(s) ran to an implementation rail rather than \
+             reaching an interior optimum; do not treat the value(s) as reliable estimates. \
+             Reported converged: false. Revisit the model, data, initial estimates, or \
+             estimation method."
+        }
+        (true, true) => {
+            "Collapse hits indicate parameters falling toward zero; consider removing \
+             or simplifying those unsupported components. Runaway hits indicate estimates \
+             held at an implementation rail and are reported converged: false; revisit the \
+             model, data, initial estimates, or estimation method."
+        }
+        (false, false) => unreachable!("every guard hit is a runaway or a collapse"),
+    });
+    // The Σ ceiling (exp(5) ≈ 148 on the stored SD scale) is the one rail an
+    // otherwise sound model can legitimately reach — an additive error on
+    // unscaled DV (ng/mL, cell counts) can have a residual SD above it — and the
+    // remediation is then the data scale, not the model. Name it, because the
+    // generic advice above does not.
+    if hits
+        .iter()
+        .any(|hit| hit.is_runaway() && hit.kind == PackedCoordKind::Sigma)
+    {
+        guidance.push_str(
+            " A SIGMA at the ceiling can also mean the residual error is genuinely that \
+             large on the scale of the data: rescale DV, or use a proportional or \
+             log-transformed error model.",
+        );
+    }
+    let msg =
+        format!("Internal optimizer parameter guard reached by estimate(s): {list}. {guidance}");
+    let params_json: Vec<serde_json::Value> = hits
+        .iter()
+        .map(|hit| {
+            serde_json::json!({
+                "parameter": hit.name,
+                "estimate": hit.estimate,
+                "packed_estimate": hit.packed_estimate,
+                "packed_guard": hit.packed_guard,
+                "side": hit.side,
+                "verdict": hit.verdict(),
+            })
+        })
+        .collect();
+    let details = serde_json::json!({
+        "guard_space": "packed",
+        "parameters": params_json,
+    });
+    let entry = warning_entry_with_severity(
+        if has_runaway {
+            WarningSeverity::Critical
+        } else {
+            WarningSeverity::Warning
+        },
+        WarningCode::ParameterAtRunawayGuard,
+        msg.clone(),
+        Some(details),
+    );
+    Some((msg, entry))
 }
 
 /// Relative-standard-error threshold (percent) above which a free THETA is
@@ -1227,6 +1760,332 @@ pub(crate) fn absorption_flip_flop_ebe_warning(
     Some((msg, entry))
 }
 
+/// The `W_` token that opens the post-fit ODE-solver diagnostics message, and the string
+/// [`classify_warning`](crate::types::classify_warning) keys the `ode_solver` code off.
+const ODE_SOLVER_WARNING_TOKEN: &str = "W_ODE_SOLVER_DIAGNOSTICS";
+
+/// The token for the *informational* half — `auto` escalated and it worked.
+///
+/// A separate token rather than a shared one because severity has to survive the round trip:
+/// [`classify_warning`](crate::types::classify_warning) sees only the message text, so a
+/// consumer that re-classifies from `FitResult.warnings` (reading back a `{model}-fit.yaml`,
+/// say) would otherwise promote this note to a `Warning`.
+const ODE_SOLVER_INFO_TOKEN: &str = "W_ODE_SOLVER_ESCALATION_NOTE";
+
+/// Whether a fit integrates an `[odes]` system at all — and therefore whether the post-fit
+/// pass has any solver statistics to collect.
+///
+/// The twin matters: a closed-form transit / inverse-Gaussian model carries no `ode_spec` of
+/// its own, but its time-varying-covariate / `TIME` / IOV / SS subjects integrate the
+/// [`AbsorptionOdeEquivalent`] — which `sync_ode_solver_opts` configures with the same
+/// tolerances and the same `stiff_abort_after` budget. Gating on `ode_spec` alone would let
+/// exactly those rerouted subjects clamp, escalate, or abort with nothing reported.
+pub(crate) fn integrates_odes(model: &CompiledModel) -> bool {
+    model.ode_spec.is_some() || model.absorption_ode_equivalent.is_some()
+}
+
+/// Re-run the analytic **sensitivity** solve once per subject at the final estimates, for its
+/// solver statistics only (#1204).
+///
+/// The post-fit prediction sweep is an `f64` sweep, and one whole class of solver decision is
+/// invisible to it: the `auto` escalation guard's jet-finiteness clause can only fire on a
+/// `Dual1`/`Dual2` instantiation, because `f64` carries no jets to check. A counter that no
+/// production path could ever set would be exactly the dead diagnostic #1080 item 3 existed to
+/// remove, so the diagnostic scope has to see a dual solve as well as a scalar one.
+///
+/// This is that solve: the same analytic sensitivity the fit's gradient evaluated throughout,
+/// evaluated once more per subject, inside the caller's
+/// [`crate::ode::solver::SolverStatsScope`]. The derivatives themselves are thrown away — the
+/// fit already has its EBEs and `h_matrix` — so the only product is the counters the
+/// integration deposits in the scope.
+///
+/// It must be the **same** provider the fit ran, for two reasons. The scope gates differ:
+/// `ode_inner_grad_supported_model` describes the ODE provider's analytical reach and says
+/// nothing about `gradient_method = fd`, SDE, or the other escape hatches, so it alone would
+/// sweep a dual solve for a fit that computed every gradient by finite differences and report
+/// counters from a code path that fit never took. `analytic_inner_common_bail` is the
+/// predicate the inner loop itself consults, so it is the veto used here.
+///
+/// And the *order* matters. The overflow this exists to observe reaches the Hessian first and
+/// the gradient only later — value `7.2e303`, gradient `1.4e306`, Hessian `NaN` on the #1204
+/// repro — so a first-order `Dual1` sweep would miss exactly the case the counter is named
+/// for. When the model has an analytic **outer** gradient the sweep runs the second-order
+/// [`crate::sens::provider::subject_sensitivities`] (`Dual2`, gradient *and* Hessian), which
+/// is what FOCEI differentiates; when only the inner loop is analytic it runs the light
+/// first-order [`crate::sens::provider::subject_eta_grad`], which is all that fit computes.
+///
+/// No-ops off the analytic ODE sensitivity path entirely: a closed-form model, an FD fit, or
+/// an IOV model (`ode_analytical_supported` declines `n_kappa != 0`) has no dual ODE solve to
+/// observe.
+pub(crate) fn sweep_sensitivity_solver_stats(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    eta_hats: &[DVector<f64>],
+    mixest: Option<&[usize]>,
+) {
+    if !crate::sens::provider::ode_inner_grad_supported_model(model)
+        || crate::estimation::inner_optimizer::analytic_inner_common_bail(model)
+    {
+        return;
+    }
+    let second_order = crate::sens::provider::analytic_outer_gradient_available(model);
+    for (i, subject) in population.subjects.iter().enumerate() {
+        let Some(eta) = eta_hats.get(i) else { continue };
+        // Same class binding the prediction sweep uses: a mixture subject's η̂ belongs to its
+        // winning class, so evaluating it under the class-1 default would integrate a
+        // trajectory the fit never reported.
+        let _mix_guard = mixest
+            .and_then(|m| m.get(i))
+            .map(|&c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
+        let (theta, eta) = (&params.theta, eta.as_slice());
+        if second_order {
+            let _ = crate::sens::provider::subject_sensitivities(model, subject, theta, eta);
+        } else {
+            let _ = crate::sens::provider::subject_eta_grad(model, subject, theta, eta);
+        }
+    }
+}
+
+/// Turn the post-fit pass's [`OdeSolverStats`] into the fit's one ODE-solver warning (#1080
+/// Part B item 2).
+///
+/// Until now no production path reported solver statistics at all: `auto` could escalate a
+/// model's segments, have the escalation rejected, and re-solve explicitly, and the only trace
+/// was in counters the test suite could read and a user could not. A rejected escalation in
+/// particular is the single most actionable ODE diagnostic there is — the probe was right that
+/// the segment is stiff and wrong about which method could integrate it — and it is the user,
+/// not ferx, who can act on it by naming a different `ode_method`.
+///
+/// Two severities, because the two things being reported are not the same kind of event:
+///
+/// * **Warning** — a step clamped at `min_dt`, an escalation was discarded, its explicit
+///   fallback also failed, a segment ended before its requested horizon, or a segment was cut
+///   short by `ode_stiff_abort_after`. Each means part of some subject's trajectory was
+///   freeze-padded or re-solved, i.e. the integration was not clean.
+/// * **Info** — `auto` escalated and everything worked. Routine on a stiff model (the TMDD
+///   `cr` testdata escalates 240 of 580 segments) and not a problem, but it *is* a decision
+///   the user never asked for and could not otherwise see.
+///
+/// Every counter but one comes from the post-fit per-subject **prediction** pass, so they
+/// describe the production dispatch (TV covariates, resets, the event-driven walker, IOV) at
+/// the final estimates — one `f64` sweep, not the thousands of likelihood evaluations that
+/// preceded it.
+///
+/// The exception is `auto_stiff_rejected_jets`, which comes from
+/// [`sweep_sensitivity_solver_stats`]: `f64` carries no jets, so no prediction sweep can ever
+/// take that decision and a counter reported only from here would be permanently zero. That
+/// sweep is collected in its own scope and only this one field is copied across — mixing its
+/// steps and clamps into the prediction counters would have the clamp clause below tell a
+/// user their *predictions* were freeze-padded on the strength of a clamp that happened in a
+/// gradient solve.
+///
+/// A fit whose solver only misbehaved at parameter values the optimizer passed through and
+/// left behind therefore reads clean here, which is the honest scope: the warning is about the
+/// trajectories the fit *reports*, not about every one it visited.
+pub(crate) fn ode_solver_diagnostics_warning(
+    stats: &crate::ode::OdeSolverStats,
+    options: &FitOptions,
+) -> Option<(String, WarningEntry)> {
+    // Clamps taken inside escalations the guard discarded describe a trajectory nobody
+    // received — the explicit re-solve replaced it — so they must not drive the freeze-padding
+    // clause below. They are reported through `auto_stiff_rejected` instead. A stall *is* the
+    // rejection trigger, so without this subtraction every rejected escalation would be told
+    // its predictions were padded when the guard had just repaired them.
+    let clamped = stats
+        .min_step_clamped_steps
+        .saturating_sub(stats.discarded_clamped_steps);
+    let rejected = stats.auto_stiff_rejected;
+    // The rejections only a dual solve could have taken (#1204), carried here from the
+    // post-fit *sensitivity* sweep — `fit_inner` collects that sweep in its own scope and
+    // copies this one field across, so it is the single counter in this payload that does not
+    // describe the prediction pass. Reported as its own clause rather than folded into the
+    // rejection wording above, because the remedy is the opposite one: an ordinary rejection
+    // says "name a different stiff method", a jet rejection says naming one will not help.
+    let rejected_jets = stats.auto_stiff_rejected_jets;
+    let fallback_failed = stats.auto_fallback_failed;
+    // Like clamps, an unfinished stiff attempt that the guard discarded did not reach the
+    // caller. Only the explicit fallback (or a named/kept method) belongs in the returned-
+    // trajectory clause.
+    let unfinished_kept = stats
+        .unfinished_segments
+        .saturating_sub(stats.discarded_unfinished_segments);
+    let aborted = stats.stiff_aborted_segments;
+    // `unfinished_kept` is a roll-up: a segment abandoned by `ode_stiff_abort_after` stops
+    // while `t < tf`, so it is *also* an unfinished segment, and the abort clause below already
+    // reports it with the budget that caused it. Report only the remainder here, so the clauses
+    // partition the damaged segments instead of counting the aborted ones twice — a reader who
+    // adds them up must get the number of segments, not double it. (The clamp clause counts
+    // *steps*, so it cannot collide with a segment count the same way; its own segment-level
+    // overlap is described in the wording below.)
+    let unfinished_other = unfinished_kept.saturating_sub(aborted);
+    let escalated = stats.auto_stiff_segments;
+    // Segments whose stepper changed part-way through (#1080 Part C). Reported as a clause on
+    // the escalation note rather than as a warning of its own: a mid-segment switch is `auto`
+    // doing exactly what it is for on a model whose stiffness appears after the dose, and the
+    // thing worth telling the user is that the decision was taken *later*, not that it was
+    // taken at all.
+    let switched = stats.auto_switched_segments;
+    // Two wordings, because the two messages give the clause a different antecedent. The info
+    // message has just said "escalated N segment(s)", so "N of them" reads correctly there; the
+    // warning message ends on a list of clamped steps and abandoned segments, where "of them"
+    // would attach to whichever clause happened to come last.
+    let switched_info_clause = if switched > 0 {
+        format!(
+            " {switched} of them changed stepper part-way through the segment, because a \
+             mid-segment re-probe disagreed with the verdict the segment started on \
+             (ode_auto_switch)."
+        )
+    } else {
+        String::new()
+    };
+    let switched_warn_clause = if switched > 0 {
+        format!(
+            " {switched} segment(s) changed stepper part-way through, because a mid-segment \
+             re-probe disagreed with the verdict the segment started on (ode_auto_switch)."
+        )
+    } else {
+        String::new()
+    };
+    let unclean = clamped > 0
+        || rejected > 0
+        || rejected_jets > 0
+        || fallback_failed > 0
+        || unfinished_kept > 0
+        || aborted > 0;
+    if !unclean && escalated == 0 {
+        return None;
+    }
+
+    let details = Some(serde_json::json!({
+        "phase": "postfit_predictions",
+        "ode_method": options.ode_method.as_str(),
+        "attempted_steps": stats.attempted_steps,
+        "accepted_steps": stats.accepted_steps,
+        "rejected_steps": stats.rejected_steps,
+        "min_step_clamped_steps": stats.min_step_clamped_steps,
+        "stiff_min_step_clamped_steps": stats.stiff_min_step_clamped_steps,
+        "discarded_clamped_steps": stats.discarded_clamped_steps,
+        "kept_clamped_steps": clamped,
+        "auto_stiff_segments": escalated,
+        "auto_switched_segments": stats.auto_switched_segments,
+        "auto_stiff_rejected": rejected,
+        "auto_stiff_rejected_jets": rejected_jets,
+        "auto_fallback_failed": fallback_failed,
+        "unfinished_segments": stats.unfinished_segments,
+        "discarded_unfinished_segments": stats.discarded_unfinished_segments,
+        "kept_unfinished_segments": unfinished_kept,
+        "stiff_aborted_segments": aborted,
+    }));
+
+    if !unclean {
+        // Escalation only: the probe fired, the stiff method coped, nothing was discarded.
+        let msg = format!(
+            "{ODE_SOLVER_INFO_TOKEN}: ode_method = auto escalated {escalated} integration \
+             segment(s) to a stiff stepper at the final estimates; every other segment used \
+             {explicit}, no escalation was rejected, and no step clamped at the minimum step \
+             size.{switched_info_clause} Informational — set ode_method = {explicit} to pin the \
+             explicit stepper, or name a stiff method to pin the other half.",
+            explicit = crate::ode::OdeMethod::EXPLICIT_FALLBACK.as_str(),
+        );
+        let entry = WarningEntry {
+            severity: WarningSeverity::Info,
+            category: WarningCode::OdeSolver,
+            message: msg.clone(),
+            source_method: None,
+            details,
+        };
+        return Some((msg, entry));
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    if clamped > 0 {
+        parts.push(format!(
+            "{clamped} step(s) clamped at the minimum step size — the local-error test failed \
+             and the step was accepted anyway because dt could not shrink further, so those \
+             segments are stability-limited rather than accuracy-limited, and any output times \
+             left in a segment the solver could not finish are freeze-padded with the last \
+             state (finite, but not integrated)"
+        ));
+    }
+    if rejected > 0 {
+        parts.push(format!(
+            "{rejected} of {escalated} stiff escalation(s) chosen by ode_method = auto were \
+             discarded as unusable and re-solved with {explicit} — the stiffness probe was \
+             right that those segments are stiff and wrong that the stiff method it picked \
+             could integrate them, and the fit paid for both solves (the {discarded} step(s) \
+             those attempts clamped are not in the count above: the guard replaced the \
+             trajectory they produced); naming ode_method = rodas5p (or rosenbrock23) \
+             explicitly is the next thing to try",
+            explicit = crate::ode::OdeMethod::EXPLICIT_FALLBACK.as_str(),
+            discarded = stats.discarded_clamped_steps,
+        ));
+    }
+    if rejected_jets > 0 {
+        // Self-contained, and deliberately not "N of the M rejections above": those come from
+        // the post-fit *prediction* sweep and this counter from the post-fit *sensitivity*
+        // sweep, so the two are not nested and phrasing them as a subset would invent a
+        // relationship the numbers do not have. The remedy differs too — the clause above
+        // sends the user to another `ode_method`, and this one explicitly tells them not to
+        // bother, so the wording has to stand on its own or the two read as contradicting.
+        parts.push(format!(
+            "{rejected_jets} segment(s) of the analytic-sensitivity solve were discarded and \
+             re-solved with {explicit}: their predicted values were all finite while their \
+             analytic derivatives — the gradients FOCE/FOCEI differentiate — had overflowed to \
+             inf/NaN. The stiff method integrated those segments; the trajectory simply reached \
+             a magnitude the sensitivities cannot represent, so naming a different ode_method \
+             will not help. Check the model's units and scaling (a state in ng rather than mg, \
+             an unbounded growth term, a rate constant on the wrong clock) before trusting the \
+             estimates. This count comes from the sensitivity sweep and is separate from the \
+             escalation counts reported above",
+            explicit = crate::ode::OdeMethod::EXPLICIT_FALLBACK.as_str(),
+        ));
+    }
+    if fallback_failed > 0 {
+        // Deliberately self-contained rather than "N of those explicit re-solves": the clause
+        // it would lean on is the `rejected` one, and `parts` is joined in whatever order the
+        // counters happen to be non-zero.
+        parts.push(format!(
+            "{fallback_failed} segment(s) had both attempts fail — the discarded stiff \
+             escalation and the {explicit} re-solve that replaced it were both unusable, so no \
+             clean trajectory existed and the returned result is the unfinished or non-finite \
+             {explicit} fallback",
+            explicit = crate::ode::OdeMethod::EXPLICIT_FALLBACK.as_str(),
+        ));
+    }
+    if unfinished_other > 0 {
+        parts.push(format!(
+            "{unfinished_other} returned segment(s) stopped before their requested end time and \
+             freeze-padded the remaining output times with the last state — they exhausted \
+             ode_max_steps, or could not form a step at the minimum step size; segments \
+             abandoned by ode_stiff_abort_after are counted in their own clause instead of \
+             this one"
+        ));
+    }
+    if aborted > 0 {
+        parts.push(format!(
+            "{aborted} segment(s) were abandoned early by ode_stiff_abort_after{budget}, which \
+             bounds their cost and freeze-pads their tails",
+            budget = options
+                .ode_stiff_abort_after
+                .map(|b| format!(" = {b}"))
+                .unwrap_or_default(),
+        ));
+    }
+
+    let msg = format!(
+        "{ODE_SOLVER_WARNING_TOKEN}: the ODE solver did not integrate cleanly at the final \
+         estimates (ode_method = {method}): {body}. Counters are from the post-fit prediction \
+         pass over all subjects; consider a different ode_method, a looser ode_reltol / \
+         ode_abstol, or checking the parameter estimates that produce these dynamics.\
+         {switched_warn_clause}",
+        method = options.ode_method.as_str(),
+        body = parts.join("; "),
+    );
+    let entry = warning_entry(WarningCode::OdeSolver, msg.clone(), details);
+    Some((msg, entry))
+}
+
 /// Extract standard errors from covariance matrix on the packed parameter scale,
 /// then transform back to the original scale via delta method.
 pub(crate) fn extract_standard_errors(
@@ -1304,31 +2163,17 @@ pub(crate) fn extract_standard_errors(
             .collect()
     } else {
         let n_lt = omega_packed_len(n_eta, false);
-        let l = &template.omega.chol;
 
         // Extract omega sub-block of the full covariance matrix.
         let cov_omega = cov.view((omega_start, omega_start), (n_lt, n_lt));
 
+        // Row r of the Jacobian is ∂omega_{ij}/∂x for the r-th lower-triangle
+        // element — single source: `omega_cholesky_jacobian`, which the
+        // natural-scale correlation gate (`natural_scale_covariance`) shares.
+        let jac = omega_cholesky_jacobian(&template.omega.chol);
         let mut se_vec = Vec::with_capacity(n_lt);
-        // Column-major lower-triangle order — single source: `lower_tri_iter`.
-        for (i, j) in lower_tri_iter(n_eta, false) {
-            // Build gradient of omega_{ij} w.r.t. packed omega params.
-            // omega_{ij} = Σ_{k=0}^{j} L_{ik} * L_{jk}
-            let mut grad = vec![0.0f64; n_lt];
-            for k in 0..=j {
-                let idx_ik = chol_lt_idx(i, k, n_eta);
-                let idx_jk = chol_lt_idx(j, k, n_eta);
-                // Chain rule: ∂L_{ab}/∂x_{ab} = L_{ab} if a==b (log), else 1.
-                let chain_ik = if i == k { l[(i, k)] } else { 1.0 };
-                let chain_jk = if j == k { l[(j, k)] } else { 1.0 };
-                grad[idx_ik] += l[(j, k)] * chain_ik;
-                if i != j {
-                    grad[idx_jk] += l[(i, k)] * chain_jk;
-                } else {
-                    // i == j: both terms contribute to the same index
-                    grad[idx_ik] += l[(i, k)] * chain_ik;
-                }
-            }
+        for r in 0..n_lt {
+            let grad = jac.row(r);
             // SE²(omega_{ij}) = g^T * C_omega * g
             let mut var = 0.0;
             for a in 0..n_lt {
@@ -1388,4 +2233,49 @@ pub(crate) fn extract_standard_errors(
     });
 
     (Some(se_theta), Some(se_omega), Some(se_sigma), se_kappa)
+}
+
+/// Standard errors for the estimated `block_sigma` correlations (#847), on the
+/// natural ρ scale.
+///
+/// Kept apart from [`extract_standard_errors`] rather than widening its tuple:
+/// the ρ block is packed **last** (after Ω_IOV and the mixture overrides), so it
+/// needs its own offset — [`rho_packed_start`] — and none of that tuple's
+/// existing offsets.
+///
+/// The packed coordinate is the Fisher-z `z = atanh(ρ)`, so the delta method
+/// gives `SE(ρ) = SE(z)·|dρ/dz| = SE(z)·(1 − ρ²)`. A `FIX`ed correlation is
+/// excluded from the reduced-Hessian free set and reports `0.0`, exactly like a
+/// pinned theta/omega/sigma.
+pub(crate) fn extract_residual_correlation_se(
+    cov: &Option<DMatrix<f64>>,
+    template: &ModelParameters,
+) -> Option<Vec<f64>> {
+    if template.residual_correlations.is_empty() {
+        return None;
+    }
+    let cov = cov.as_ref()?;
+    let n = cov.nrows();
+    let start = rho_packed_start(template);
+    Some(
+        template
+            .residual_correlations
+            .iter()
+            .enumerate()
+            .map(|(k, corr)| {
+                let idx = start + k;
+                // Guard a truncated `cov` the same way the theta/omega/sigma
+                // branches above do — report 0.0, never panic away a fit.
+                if idx >= n {
+                    return 0.0;
+                }
+                let var = cov[(idx, idx)];
+                if var > 0.0 {
+                    var.sqrt() * rho_chain(corr.rho)
+                } else {
+                    0.0
+                }
+            })
+            .collect(),
+    )
 }

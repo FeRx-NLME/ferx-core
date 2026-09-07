@@ -6,13 +6,16 @@
 /// Two-phase step-size schedule (Monolix convention):
 ///   Phase 1 (exploration, k ≤ K1):  γₖ = 1          — rapid basin convergence
 ///   Phase 2 (convergence, k > K1):  γₖ = 1/(k−K1)   — almost-sure convergence to MLE
+use crate::estimation::fixed_eta_gradient::{
+    obs_nll_subject_grad, obs_nll_subject_grad_iov, obs_nll_subject_into_iov,
+};
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::outer_optimizer::{pop_nll, OuterResult};
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::pk::EventPkParams;
 use crate::stats::likelihood::{
     individual_nll, individual_nll_into, individual_nll_iov, iov_occasion_groups,
-    obs_nll_subject_from_preds, obs_nll_subject_into,
+    obs_nll_subject_into,
 };
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -86,6 +89,187 @@ const SAEM_RUV_OMEGA_LN_GROWTH: f64 = 3.0;
 /// rank-1 collapse feedback. In the convergence phase the cap is lifted and Ω
 /// uses the full decaying γ = 1/(k−k1), the same Robbins-Monro schedule as θ.
 const OMEGA_SA_MAX_STEP: f64 = 0.1;
+
+/// Maximum per-iteration stochastic-approximation step for the **numerical θ/σ
+/// M-step** during the exploration phase — the θ-side counterpart of
+/// [`OMEGA_SA_MAX_STEP`] (issue #1011).
+///
+/// A log-mu-referenced θ is updated by the closed-form `log θ += γ·mean(η)`,
+/// which is an exact Robbins-Monro average and therefore already damped. A θ
+/// with **no ETA** has no such channel: it is moved only by NLopt re-maximising
+/// the η-frozen conditional observation likelihood against a *single* MCMC draw.
+/// Assigning that maximiser outright is `argmax` of one draw, not the SA average
+/// of `E[argmax]`, so the estimate carries a Monte-Carlo bias that does not decay
+/// with iteration count — precisely the "single un-equilibrated MCMC draw"
+/// hazard [`OMEGA_SA_MAX_STEP`] exists to prevent for Ω, which the θ channel was
+/// left exposed to.
+///
+/// Measured on the FREM `iiv_on_ruv` reprex of #1011, whose absorption fraction
+/// `TVFRD1` carries no ETA (marginal −2logL optimum ≈ 0.29, NONMEM IMP 0.394):
+///
+/// | exploration cap | TVFRD1 |
+/// |---|---|
+/// | undamped (1.0, pre-#1011) | 0.039 |
+/// | 0.1 | 0.170 |
+/// | **0.03** | **0.290** |
+/// | 0.01 | 0.355 |
+/// | 0.003 | 0.357 |
+///
+/// 0.03 lands on the marginal optimum. Averaging the M-step *objective* over the
+/// last K draws instead reaches only 0.081 at K = 50, and 0.130 at K = 150 for
+/// 15× the wall time, because consecutive SAEM draws are heavily autocorrelated.
+/// Damping the iterate accumulates over every iteration rather than a K-window,
+/// so it is both the more accurate and the cheaper cure.
+///
+/// In the convergence phase the cap is lifted and the full decaying
+/// `γ = 1/(k−k1)` applies, exactly as for Ω.
+const MSTEP_SA_MAX_STEP: f64 = 0.03;
+
+/// Does this fit's numerical θ/σ M-step get the #1011 SA damping?
+///
+/// Only when NLopt is left estimating a θ that **anchors no mu-reference** — the
+/// #1011 shape, and exactly the condition the no-ETA advisory warns on.
+/// `theta_is_mu_ref_anchor` is that predicate, and it is mu-reference *detection*
+/// rather than a scan of ETA usage: an η attached in a form the parser cannot pair
+/// with a θ (an additive `X = TVX + ETA_X`, a non-log-linear covariate model,
+/// #619) counts as un-anchored here and is damped. That is deliberate — such a θ
+/// has no closed-form shift either, so the numerical M-step really is its only
+/// mover, which is the biased channel #1011 is about.
+///
+/// A θ that is `FIX`ed, or pinned out by the closed-form mu-ref shift (`pinned`),
+/// is returned unchanged by NLopt and so has nothing to damp. A free θ that *does*
+/// anchor a mu-reference is not the #1011 channel: it has the exact Robbins-Monro
+/// `log θ += γ·mean(η)` update available, and where that shift is nevertheless
+/// switched off for the fit (`mu_referencing = false`, an identity-packed θ, a
+/// negative lower bound) the numerical M-step it falls back to is the one ferx
+/// shipped before #1011. Damping those too would cap ~85 exploration M-steps at 3%
+/// on a configuration the #1011 anchors never covered, so the gate is kept to the
+/// shape that was measured; every fit whose free thetas all anchor a mu-reference
+/// stays byte-identical to its pre-#1011 result, σ included.
+///
+/// `is_mixture` vetoes it outright. A `MIXNUM`-switched typical value is
+/// estimated by this same numerical M-step (#996 routes it there deliberately,
+/// because SAEM's hard class draw makes the per-class η mean a biased
+/// statistic), but it is solving a different problem: the class typical values
+/// must *separate* from a common start, and the class assignments only stabilise
+/// once they have. Damping that excursion stalls the separation — on
+/// `tests/nonmem/mixture_iv_saem` a 0.03 exploration cap leaves `TVCL1 = 1.145`
+/// against NONMEM's 1.002, and drags the chained IMP marginal with it. Whether
+/// the #1011 bias also affects mixture class θ (it plausibly does) needs its own
+/// schedule and its own anchor, so it is left alone rather than half-fixed; the
+/// no-ETA advisory still fires for those models.
+fn damps_numerical_mstep(
+    is_mixture: bool,
+    n_theta: usize,
+    theta_fixed: &[bool],
+    pinned: &[usize],
+    theta_is_mu_ref_anchor: &[bool],
+) -> bool {
+    if is_mixture {
+        return false;
+    }
+    (0..n_theta).any(|t| {
+        !theta_fixed.get(t).copied().unwrap_or(false)
+            && !pinned.contains(&t)
+            && !theta_is_mu_ref_anchor.get(t).copied().unwrap_or(false)
+    })
+}
+
+/// SA step size for the numerical θ/σ M-step (#1011).
+///
+/// One γ for both components, because [`theta_sigma_mstep_light`] is a *single*
+/// NLopt problem over the concatenated `[θ; σ]` vector: `theta_new` and
+/// `sigma_new` are one joint maximiser of the same frozen-η conditional
+/// likelihood. Blending θ at γ and σ at 1.0 would take an inconsistent partial
+/// step — σ would jump to the value that is optimal for the θ the M-step
+/// wanted, while θ is held near the θ it had, so σ absorbs the misfit the
+/// damping just stopped θ from fixing. So the gate below reads as a θ property
+/// only because θ is what makes the *channel* biased; what it gates is the
+/// blend of the joint result, σ included.
+///
+/// * No θ for the damping to act on (see [`damps_numerical_mstep`]) → `1.0`,
+///   the undamped pre-#1011 assignment, so those fits are byte-identical.
+/// * Exploration → capped at [`MSTEP_SA_MAX_STEP`], the θ-side counterpart of
+///   the [`OMEGA_SA_MAX_STEP`] cap on Ω.
+/// * Convergence → the full decaying `γ = 1/(k−k1)`, same schedule as Ω.
+///
+/// **`cap >= 1.0` is a sentinel, not a cap value.** It disables the damping in
+/// *both* phases, so the option is deliberately discontinuous at 1.0: `0.999`
+/// still buys the full convergence schedule `γ = 1/(k−k1)`, and `1.0` buys none
+/// of it. There is no way to spell "cap exploration a little, leave convergence
+/// alone" — `cap` only ever governs exploration — and "off" has to restore the
+/// whole pre-#1011 trajectory to be worth having (lifting only the exploration
+/// cap left the reprex at TVFRD1 0.047 rather than its true undamped 0.039; the
+/// unit test below pins that regression).
+///
+/// **The first convergence iteration is undamped.** At `k = k1 + 1`,
+/// `γ = 1/(k−k1) = 1.0`, so the exploration-accumulated θ/σ is overwritten by
+/// that iteration's maximiser — the same assignment the damping exists to avoid.
+/// That is intentional and mirrors `gamma_omega`'s schedule exactly: by the end
+/// of exploration the chain is equilibrated, which is the condition the
+/// exploration cap was waiting for, and re-capping the hand-off would only delay
+/// the same step.
+fn mstep_sa_step(numerically_estimated_theta: bool, exploring: bool, gamma: f64, cap: f64) -> f64 {
+    // `cap >= 1.0` is the documented "off" switch and must restore the pre-#1011
+    // assignment in **both** phases. Returning `gamma` in convergence would still
+    // damp at `1/(k−k1)`, so "off" has to short-circuit here rather than rely on
+    // the `min` below.
+    if !numerically_estimated_theta || cap >= 1.0 {
+        return 1.0;
+    }
+    if exploring {
+        gamma.min(cap)
+    } else {
+        gamma
+    }
+}
+
+/// Sanitise the `mstep_damping` fit option at its point of use.
+///
+/// The parser rejects anything outside `(0, 1]`, but `FitOptions` is public: a
+/// Rust caller — the ferx-r glue, a test, any embedder — can build one directly
+/// and never pass through that validator. The failure would be silent and
+/// severe: a negative γ makes [`damp_mstep`] step θ and σ *away* from the M-step
+/// maximiser on every iteration, and `0.0` freezes both for the whole
+/// exploration phase, neither of which the fit would otherwise report. So clamp
+/// here as well, and return the substituted value so the caller can warn.
+///
+/// `> 1.0` becomes `1.0`, which is what any γ above 1 already meant (the
+/// documented "off" switch) — `+∞` included, since a caller writing
+/// `f64::INFINITY` means "no damping", and routing it to the *maximum* damping
+/// would be the exact opposite. `<= 0.0` (`-∞` included) and `NaN` fall back to
+/// the calibrated default rather than to a hair above zero, since a near-zero
+/// cap is itself a frozen fit. `None` means the value was already in range.
+fn sanitize_mstep_damping(cap: f64) -> Option<f64> {
+    if cap.is_nan() || cap <= 0.0 {
+        Some(MSTEP_SA_MAX_STEP)
+    } else if cap > 1.0 {
+        Some(1.0)
+    } else {
+        None
+    }
+}
+
+/// Robbins-Monro blend of a numerical M-step result into the running estimate:
+/// `cur += γ·(new − cur)`. `γ >= 1.0` reproduces the undamped assignment
+/// byte-for-byte, which is what a fit with no free numerical θ still does.
+///
+/// A pinned dimension (mu-referenced, or FIXed) is unaffected either way — NLopt
+/// returns it unchanged, so `new == cur` and the blend is a no-op regardless of
+/// γ. That is what keeps the blanket application honest on the θ side: the
+/// damped set is exactly the free, un-anchored θ the gate is about. σ has no
+/// such pinning — it is genuinely re-maximised every iteration — and is damped
+/// deliberately, because it comes out of the *same* joint NLopt solve as θ (see
+/// [`mstep_sa_step`]).
+fn damp_mstep(cur: &mut [f64], new: &[f64], gamma: f64) {
+    if gamma >= 1.0 {
+        cur.copy_from_slice(new);
+        return;
+    }
+    for (c, &n) in cur.iter_mut().zip(new.iter()) {
+        *c += gamma * (n - *c);
+    }
+}
 
 /// Raise every *free* diagonal entry of the BSV Ω that has fallen below `floor`
 /// up to `floor`. FIX-ed diagonals (`omega_fixed[i] == true`) are left untouched
@@ -407,261 +591,7 @@ pub(crate) fn mh_kappa_steps(
 }
 
 // ---------------------------------------------------------------------------
-// IOV-aware observation NLL for M-step (no priors, per-occasion predictions)
-// ---------------------------------------------------------------------------
-
-/// Compute the observation-only NLL for an IOV subject in the SAEM M-step.
-///
-/// ETAs and kappas are held fixed (sampled values from the E-step).  For each
-/// occasion k the combined `[eta, kappa_k]` vector is used to compute predictions;
-/// only the observations belonging to that occasion are scored.  No eta or kappa
-/// prior terms are included — those are handled by the SA sufficient-statistic
-/// update for Ω_bsv and Ω_iov separately.
-fn obs_nll_subject_into_iov(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma_values: &[f64],
-    eta: &[f64],
-    kappas: &[Vec<f64>],
-    _pk_scratch: &mut crate::pk::EventPkParams,
-) -> f64 {
-    use crate::stats::likelihood::m3_logcdf;
-    let m3 = matches!(model.bloq_method, BloqMethod::M3);
-    // Continuous per-occasion-aware prediction (issue #104) — same model the
-    // E-step (`individual_nll_iov`) and FOCEI use, so E and M steps stay
-    // consistent. `_pk_scratch` is retained for signature stability but unused
-    // (predict_iov manages its own per-event params).
-    let preds = crate::pk::predict_iov(model, subject, theta, eta, kappas);
-    // FREM covariate pseudo-observations (FREMTYPE > 0) use the covariate sigma
-    // (EPSCOV), not the PK residual error — otherwise their near-zero residuals
-    // drag PROP/ADD toward zero. See build_frem_r_override.
-    let frem_ov = crate::stats::likelihood::build_frem_r_override(
-        model.frem_config.as_ref(),
-        &subject.fremtype,
-        sigma_values,
-    );
-    // IIV on residual error (#409): scale the PK residual variance by
-    // exp(2·η_ruv); FREM rows keep their own variance.
-    let ruv_scale = model.residual_var_scale(eta);
-    // #658: per-observation residual endpoint keys (covariate selector or CMT).
-    let err_keys = model.error_spec.obs_keys(subject);
-    let mut total_nll = 0.0_f64;
-    for j in 0..subject.observations.len() {
-        // Floors protect log(0) in the M-step objective. individual_nll_iov
-        // (the E-step evaluator) does not floor — see obs_nll_subject_grad_iov
-        // for why the asymmetry is intentional.
-        let f = preds[j].max(1e-12);
-        let v = match frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x) {
-            Some(vv) => vv.max(1e-12),
-            None => {
-                (model.residual_variance_at(err_keys[j], f, sigma_values) * ruv_scale).max(1e-12)
-            }
-        };
-        let cens = subject.cens.get(j).copied().unwrap_or(0);
-        if m3 && cens != 0 {
-            total_nll += -m3_logcdf(subject.observations[j], f, v.sqrt(), cens);
-        } else {
-            total_nll += 0.5 * (v.ln() + (subject.observations[j] - f).powi(2) / v);
-        }
-    }
-
-    // Non-Gaussian data term at raw-NLL weight (1×) to match the true NLL (Gaussian obs
-    // already contribute at 0.5·(log v + r²/v)): TTE endpoints plus the discrete
-    // (binary/categorical) term. No joint-share on the IOV M-step path, and its analytic TTE
-    // term matches the `tte_data_term` this site inlined.
-    #[cfg(feature = "survival")]
-    if !subject.obs_records.is_empty() {
-        crate::stats::likelihood::accumulate_non_gaussian_nll(
-            model,
-            subject,
-            theta,
-            eta,
-            None,
-            1.0,
-            &mut total_nll,
-        );
-    }
-
-    total_nll
-}
-
-/// Gradient of the IOV observation NLL w.r.t. the SAEM packed vector
-/// `[log_theta | log_sigma]` for one subject with ETAs and kappas fixed.
-///
-/// Sigma gradient is analytical (same formula as the non-IOV path but summed
-/// across all occasions' observations).  Theta gradient uses forward-FD of
-/// per-occasion predictions, chain-rule'd through the per-observation obs_nll.
-#[allow(clippy::too_many_arguments)]
-fn obs_nll_subject_grad_iov(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma_values: &[f64],
-    eta: &[f64],
-    kappas: &[Vec<f64>],
-    theta_packs_log_mask: &[bool],
-    lower: &[f64],
-    upper: &[f64],
-    n_theta: usize,
-    n_sigma: usize,
-    pk_scratch: &mut crate::pk::EventPkParams,
-) -> (f64, Vec<f64>) {
-    let n = n_theta + n_sigma;
-    // IOV + block_sigma is rejected up front (E_BLOCK_SIGMA_IOV_UNSUPPORTED), so
-    // `residual_correlations` is never set on this IOV path — only M3 (and TTE,
-    // under the `survival` feature) need the full-FD fallback here.
-    let fd_all = matches!(model.bloq_method, BloqMethod::M3);
-    // Fall back to full FD when TTE endpoints are present: the analytic non-M3
-    // path is Gaussian-only and would silently zero hazard-parameter gradients.
-    #[cfg(feature = "survival")]
-    let fd_all = fd_all || !model.endpoints.is_empty();
-
-    if fd_all {
-        // M3 / TTE path: forward-FD of obs_nll_subject_into_iov.
-        let nll_base =
-            obs_nll_subject_into_iov(model, subject, theta, sigma_values, eta, kappas, pk_scratch);
-        let mut grad = vec![0.0f64; n];
-        let h = 1e-5;
-        for i in 0..n {
-            if lower[i] == upper[i] {
-                continue;
-            }
-            if i < n_theta {
-                let mut theta_p = theta.to_vec();
-                let delta = h * (1.0 + theta[i].abs());
-                theta_p[i] += delta;
-                let nll_p = obs_nll_subject_into_iov(
-                    model,
-                    subject,
-                    &theta_p,
-                    sigma_values,
-                    eta,
-                    kappas,
-                    pk_scratch,
-                );
-                let raw = (nll_p - nll_base) / delta;
-                grad[i] = if theta_packs_log_mask[i] {
-                    theta[i] * raw
-                } else {
-                    raw
-                };
-            } else {
-                let k = i - n_theta;
-                let mut sigma_p = sigma_values.to_vec();
-                let delta = h * (1.0 + sigma_values[k].abs());
-                sigma_p[k] += delta;
-                let nll_p = obs_nll_subject_into_iov(
-                    model, subject, theta, &sigma_p, eta, kappas, pk_scratch,
-                );
-                grad[i] = sigma_values[k] * (nll_p - nll_base) / delta;
-            }
-        }
-        return (nll_base, grad);
-    }
-
-    // Non-M3 path: continuous per-occasion-aware base predictions (issue #104).
-    let n_obs = subject.observations.len();
-    let preds = crate::pk::predict_iov(model, subject, theta, eta, kappas);
-    // FREM covariate rows use EPSCOV, not the PK residual error (see
-    // build_frem_r_override); their variance is η-independent so dvar_df = 0.
-    let frem_ov = crate::stats::likelihood::build_frem_r_override(
-        model.frem_config.as_ref(),
-        &subject.fremtype,
-        sigma_values,
-    );
-    // IIV on residual error (#409): per-subject `exp(2·η_ruv)` scale on the PK
-    // residual variance (FREM rows excluded). η_ruv is a BSV eta, indexed into
-    // `eta`.  See the non-IOV `obs_nll_subject_grad` for the score-consistency
-    // argument behind scaling V, dV/df, and dV/dlogσ together.
-    let ruv_scale = model.residual_var_scale(eta);
-    // #658: per-observation residual endpoint keys (covariate selector or CMT).
-    let err_keys = model.error_spec.obs_keys(subject);
-
-    let mut nll_base = 0.0_f64;
-    let mut all_preds_base = vec![0.0f64; n_obs];
-    let mut residuals = vec![0.0f64; n_obs];
-    let mut variances = vec![0.0f64; n_obs];
-    let mut d_nll_d_f = vec![0.0f64; n_obs];
-    let mut obs_var_scale = vec![1.0f64; n_obs];
-
-    for j in 0..n_obs {
-        let cmt = err_keys[j];
-        let f = preds[j].max(1e-12);
-        let frem_vj = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
-        let s = if frem_vj.is_some() { 1.0 } else { ruv_scale };
-        obs_var_scale[j] = s;
-        let v = match frem_vj {
-            Some(vv) => vv.max(1e-12),
-            None => (model.residual_variance_at(cmt, f, sigma_values) * s).max(1e-12),
-        };
-        let resid = subject.observations[j] - f;
-        nll_base += 0.5 * (v.ln() + resid * resid / v);
-        all_preds_base[j] = f;
-        residuals[j] = resid;
-        variances[j] = v;
-        let dv_df = if frem_vj.is_some() {
-            0.0
-        } else {
-            model.error_spec.dvar_df(cmt, f, sigma_values) * s
-        };
-        d_nll_d_f[j] = -resid / v + 0.5 * dv_df * (1.0 / v - resid * resid / (v * v));
-    }
-
-    let mut grad = vec![0.0f64; n];
-
-    // Theta gradient: forward-FD of the continuous prediction (one perturbed
-    // prediction per theta; κ affects later occasions via carryover so the
-    // sensitivity is captured across all rows).
-    let h_fd = 1e-5;
-    for i in 0..n_theta {
-        if lower[i] == upper[i] {
-            continue;
-        }
-        let delta = h_fd * (1.0 + theta[i].abs());
-        let mut theta_p = theta.to_vec();
-        theta_p[i] += delta;
-        let preds_p = crate::pk::predict_iov(model, subject, &theta_p, eta, kappas);
-        let mut d_obs_nll = 0.0_f64;
-        for j in 0..n_obs {
-            d_obs_nll += d_nll_d_f[j] * (preds_p[j] - all_preds_base[j]) / delta;
-        }
-        grad[i] = if theta_packs_log_mask[i] {
-            theta[i] * d_obs_nll
-        } else {
-            d_obs_nll
-        };
-    }
-
-    // Sigma gradient: analytical — same formula as non-IOV, summed over all obs.
-    for k in 0..n_sigma {
-        let i = n_theta + k;
-        if lower[i] == upper[i] {
-            continue;
-        }
-        let g: f64 = (0..n_obs)
-            .map(|j| {
-                let f = all_preds_base[j];
-                let v = variances[j];
-                let resid = residuals[j];
-                // d(v_j)/d(log sigma_k); zero unless sigma_k enters obs j's
-                // endpoint, so per-CMT each sigma picks up only its own
-                // endpoint's observations.
-                let ratio = model
-                    .error_spec
-                    .dvar_dlogsigma(err_keys[j], k, f, sigma_values)
-                    * obs_var_scale[j];
-                0.5 * ratio * (1.0 / v - resid * resid / (v * v))
-            })
-            .sum();
-        grad[i] = g;
-    }
-
-    (nll_base, grad)
-}
-
-// ---------------------------------------------------------------------------
-// Gradient of conditional observation NLL w.r.t. log(theta) and log(sigma)
+// M-step objective assembly (per-subject gradients live in `fixed_eta_gradient`)
 // ---------------------------------------------------------------------------
 
 /// Serially fold per-subject `(nll, grad)` pairs, already collected in subject
@@ -688,6 +618,41 @@ fn fold_nll_grad(per_subj: Vec<(f64, Vec<f64>)>, n: usize) -> (f64, Vec<f64>) {
 /// construction). See the run_saem comment on `theta_packs_log_mask` for
 /// motivation — without per-theta packing, any theta with `theta_lower < 0`
 /// got pinned at 1e-10 and could never be estimated.
+/// Mixture context for the θ/σ M-step (#985): each subject's drawn class plus
+/// the per-class held σ overrides.
+///
+/// The class drives the `MIXNUM` guard (so a class-switched typical value is
+/// estimated from its own members) *and* the σ vector each subject is scored
+/// under: a `sigma(k)` override is held at its init, so a class-`k` subject's
+/// residual variance does not depend on the free base σ at all. Scoring it under
+/// the base σ anyway would drag the free base estimate toward the override — the
+/// E-step samples η under `class_sigma(c)` while the M-step would optimise a
+/// different objective (#987 review).
+#[derive(Clone, Copy)]
+pub(crate) struct MixMstep<'a> {
+    /// Per-subject drawn class (0-based).
+    pub classes: &'a [usize],
+    /// Per-class held σ overrides, `[class][(sigma_index, held_value)]`.
+    pub class_sigma_over: &'a [Vec<(usize, f64)>],
+}
+
+/// Substitute a class's held σ overrides into the base σ vector. Returns `None`
+/// when the class has no override (the caller then uses the base vector as-is,
+/// avoiding a per-subject allocation on the common path).
+fn class_sigma_subst(sigma_values: &[f64], over: &[(usize, f64)]) -> Option<Vec<f64>> {
+    if over.is_empty() {
+        return None;
+    }
+    let mut v = sigma_values.to_vec();
+    for &(s, val) in over {
+        if s < v.len() {
+            v[s] = val;
+        }
+    }
+    Some(v)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn theta_sigma_mstep_light(
     model: &CompiledModel,
     population: &Population,
@@ -704,6 +669,12 @@ fn theta_sigma_mstep_light(
     maxiter: u32,
     scale_params: bool,
     theta_packs_log_mask: &[bool],
+    // Mixture (#985): per-subject drawn class + held σ overrides. When `Some`,
+    // every per-subject observation-likelihood evaluation runs under that
+    // subject's `MIXNUM` guard and its class's σ, so a class-switched typical
+    // value is estimated from its own class members and a held `sigma(k)`
+    // override does not bias the free base σ.
+    mix_mstep: Option<MixMstep<'_>>,
 ) -> (Vec<f64>, Vec<f64>) {
     let n = n_theta + n_sigma;
 
@@ -764,22 +735,44 @@ fn theta_sigma_mstep_light(
                     .par_iter()
                     .zip(etas.par_iter())
                     .zip(kappas.par_iter())
-                    .map_init(EventPkParams::default, |scratch, ((subject, eta), kaps)| {
-                        obs_nll_subject_grad_iov(
-                            model,
-                            subject,
-                            &th,
-                            &sg,
-                            eta,
-                            kaps,
-                            &theta_packs_log_mask,
-                            &lower,
-                            &upper,
-                            n_theta,
-                            n_sigma,
-                            scratch,
-                        )
-                    })
+                    .enumerate()
+                    .map_init(
+                        EventPkParams::default,
+                        |scratch, (i, ((subject, eta), kaps))| {
+                            let cls = mix_mstep.map(|m| m.classes[i]);
+                            let _g = cls.map(|c| {
+                                crate::parser::model_parser::MixtureClassGuard::enter(c + 1)
+                            });
+                            let over: &[(usize, f64)] = match (mix_mstep, cls) {
+                                (Some(m), Some(c)) => &m.class_sigma_over[c],
+                                _ => &[],
+                            };
+                            let sub_sg = class_sigma_subst(&sg, over);
+                            let sg_i: &[f64] = sub_sg.as_deref().unwrap_or(&sg);
+                            let (nll, mut grad) = obs_nll_subject_grad_iov(
+                                model,
+                                subject,
+                                &th,
+                                sg_i,
+                                eta,
+                                kaps,
+                                &theta_packs_log_mask,
+                                &lower,
+                                &upper,
+                                n_theta,
+                                n_sigma,
+                                scratch,
+                            );
+                            // A held σ override carries no information about the
+                            // free base σ — zero that subject's contribution.
+                            for &(sidx, _) in over {
+                                if n_theta + sidx < grad.len() {
+                                    grad[n_theta + sidx] = 0.0;
+                                }
+                            }
+                            (nll, grad)
+                        },
+                    )
                     .collect();
                 fold_nll_grad(per_subj, n)
             } else {
@@ -787,12 +780,22 @@ fn theta_sigma_mstep_light(
                     .subjects
                     .par_iter()
                     .zip(etas.par_iter())
-                    .map_init(EventPkParams::default, |scratch, (subject, eta)| {
-                        obs_nll_subject_grad(
+                    .enumerate()
+                    .map_init(EventPkParams::default, |scratch, (i, (subject, eta))| {
+                        let cls = mix_mstep.map(|m| m.classes[i]);
+                        let _g = cls
+                            .map(|c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
+                        let over: &[(usize, f64)] = match (mix_mstep, cls) {
+                            (Some(m), Some(c)) => &m.class_sigma_over[c],
+                            _ => &[],
+                        };
+                        let sub_sg = class_sigma_subst(&sg, over);
+                        let sg_i: &[f64] = sub_sg.as_deref().unwrap_or(&sg);
+                        let (nll, mut grad) = obs_nll_subject_grad(
                             model,
                             subject,
                             &th,
-                            &sg,
+                            sg_i,
                             eta,
                             &theta_packs_log_mask,
                             &lower,
@@ -800,7 +803,13 @@ fn theta_sigma_mstep_light(
                             n_theta,
                             n_sigma,
                             scratch,
-                        )
+                        );
+                        for &(sidx, _) in over {
+                            if n_theta + sidx < grad.len() {
+                                grad[n_theta + sidx] = 0.0;
+                            }
+                        }
+                        (nll, grad)
                     })
                     .collect();
                 fold_nll_grad(per_subj, n)
@@ -814,10 +823,13 @@ fn theta_sigma_mstep_light(
                 1e20
             }
         } else {
-            let val = if let Some(kappas) = kappas_opt {
-                obs_nll_sum_iov(model, population, &th, &sg, etas, kappas)
-            } else {
-                obs_nll_sum(model, population, &th, &sg, etas)
+            let val = match (mix_mstep, kappas_opt) {
+                (Some(mx), Some(kappas)) => {
+                    obs_nll_sum_iov_mix(model, population, &th, &sg, etas, kappas, mx)
+                }
+                (Some(mx), None) => obs_nll_sum_mix(model, population, &th, &sg, etas, mx),
+                (None, Some(kappas)) => obs_nll_sum_iov(model, population, &th, &sg, etas, kappas),
+                (None, None) => obs_nll_sum(model, population, &th, &sg, etas),
             };
             if val.is_finite() {
                 val
@@ -874,194 +886,6 @@ fn theta_sigma_mstep_light(
     (log_theta_new, log_sigma_new)
 }
 
-/// Gradient of `obs_nll` w.r.t. the SAEM packed parameter vector
-/// `[log_theta_0 … log_theta_{P-1} | log_sigma_0 … log_sigma_{Q-1}]`
-/// for a single subject with ETAs held fixed.
-///
-/// For non-M3 models:
-/// - Sigma: analytical from the residual-variance formula (no extra predict call).
-/// - Theta: forward-FD of `compute_predictions_with_tv_into` + chain rule through
-///   obs_nll (one extra predict call per non-pinned theta, not one full-subject
-///   NLL call).
-///
-/// For M3 models (complex Mills-ratio sigma gradient): forward-FD of
-/// `obs_nll_subject_into` for all parameters.
-///
-/// `lower`/`upper` are the packed-space bounds used to detect pinned dimensions
-/// (`lower[i] == upper[i]`); pinned dimensions contribute 0 to the gradient and
-/// skip their FD call.
-#[allow(clippy::too_many_arguments)]
-fn obs_nll_subject_grad(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma_values: &[f64],
-    eta: &[f64],
-    theta_packs_log_mask: &[bool],
-    lower: &[f64],
-    upper: &[f64],
-    n_theta: usize,
-    n_sigma: usize,
-    pk_scratch: &mut EventPkParams,
-) -> (f64, Vec<f64>) {
-    let n = n_theta + n_sigma;
-    let fd_all =
-        matches!(model.bloq_method, BloqMethod::M3) || !model.residual_correlations.is_empty();
-    // Fall back to the full-FD path when TTE endpoints are present: the analytic
-    // non-M3 path is Gaussian-only and would silently zero hazard-parameter gradients.
-    #[cfg(feature = "survival")]
-    let fd_all = fd_all || !model.endpoints.is_empty();
-
-    if fd_all {
-        // M3 / TTE / dense residual-covariance path: forward-FD of
-        // obs_nll_subject_into for all parameters. Predictions are σ-independent,
-        // so solve the model once and reuse the base predictions across every σ
-        // perturbation — only θ perturbations need a fresh solve (#557).
-        let preds_base =
-            crate::pk::compute_predictions_with_tv_into(model, subject, theta, eta, pk_scratch);
-        let nll_base =
-            obs_nll_subject_from_preds(model, subject, &preds_base, theta, sigma_values, eta);
-        let mut grad = vec![0.0f64; n];
-        let h = 1e-5;
-        for i in 0..n {
-            if lower[i] == upper[i] {
-                continue;
-            }
-            if i < n_theta {
-                let mut theta_p = theta.to_vec();
-                let delta = h * (1.0 + theta[i].abs());
-                theta_p[i] += delta;
-                let nll_p =
-                    obs_nll_subject_into(model, subject, &theta_p, sigma_values, eta, pk_scratch);
-                let raw = (nll_p - nll_base) / delta;
-                grad[i] = if theta_packs_log_mask[i] {
-                    theta[i] * raw
-                } else {
-                    raw
-                };
-            } else {
-                let k = i - n_theta;
-                let mut sigma_p = sigma_values.to_vec();
-                let delta = h * (1.0 + sigma_values[k].abs());
-                sigma_p[k] += delta;
-                let nll_p =
-                    obs_nll_subject_from_preds(model, subject, &preds_base, theta, &sigma_p, eta);
-                // log-packing for sigma: d/d(log_sigma_k) = sigma_k * d/d(sigma_k)
-                grad[i] = sigma_values[k] * (nll_p - nll_base) / delta;
-            }
-        }
-        return (nll_base, grad);
-    }
-
-    // Non-M3 path.
-    let preds_base =
-        crate::pk::compute_predictions_with_tv_into(model, subject, theta, eta, pk_scratch);
-
-    let mut nll_base = 0.0f64;
-    let n_obs = subject.observations.len();
-
-    // FREM covariate rows use EPSCOV, not the PK residual error (see
-    // build_frem_r_override); their variance is η-independent so dvar_df = 0.
-    let frem_ov = crate::stats::likelihood::build_frem_r_override(
-        model.frem_config.as_ref(),
-        &subject.fremtype,
-        sigma_values,
-    );
-
-    // IIV on residual error (#409): per-subject scale on the PK residual
-    // variance (`exp(2·η_ruv)`). FREM covariate rows are not scaled, so we hold
-    // a per-obs scale and apply it consistently to V, dV/df, and dV/dlogσ so the
-    // analytical score stays exact.
-    let ruv_scale = model.residual_var_scale(eta);
-    // #658: per-observation residual endpoint keys (covariate selector or CMT).
-    let err_keys = model.error_spec.obs_keys(subject);
-
-    // per-obs residual, variance, d(obs_nll)/d(f_j), and the variance scale used.
-    let mut residuals = vec![0.0f64; n_obs];
-    let mut variances = vec![0.0f64; n_obs];
-    let mut d_nll_d_f = vec![0.0f64; n_obs];
-    let mut obs_var_scale = vec![1.0f64; n_obs];
-
-    for j in 0..n_obs {
-        let cmt = err_keys[j];
-        let f = preds_base[j].max(1e-12);
-        let frem_vj = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
-        let s = if frem_vj.is_some() { 1.0 } else { ruv_scale };
-        obs_var_scale[j] = s;
-        let v = match frem_vj {
-            Some(vv) => vv.max(1e-12),
-            None => (model.residual_variance_at(cmt, f, sigma_values) * s).max(1e-12),
-        };
-        let resid = subject.observations[j] - f;
-        nll_base += 0.5 * (v.ln() + resid * resid / v);
-        residuals[j] = resid;
-        variances[j] = v;
-        // d(obs_nll_j)/d(f_j) = -resid/V + 0.5 * (dV/df) * (1/V - resid²/V²)
-        let dv_df = if frem_vj.is_some() {
-            0.0
-        } else {
-            model.error_spec.dvar_df(cmt, f, sigma_values) * s
-        };
-        d_nll_d_f[j] = -resid / v + 0.5 * dv_df * (1.0 / v - resid * resid / (v * v));
-    }
-
-    let mut grad = vec![0.0f64; n];
-
-    // Theta gradient: forward-FD of predictions, chain rule through obs_nll.
-    let h_fd = 1e-5;
-    for i in 0..n_theta {
-        if lower[i] == upper[i] {
-            continue;
-        }
-        let delta = h_fd * (1.0 + theta[i].abs());
-        let mut theta_p = theta.to_vec();
-        theta_p[i] += delta;
-        let preds_p =
-            crate::pk::compute_predictions_with_tv_into(model, subject, &theta_p, eta, pk_scratch);
-        // Difference on raw predictions — do NOT clip before differencing.
-        // Clipping both pp and pb at 1e-12 before subtracting would produce a
-        // zero difference whenever pb < 1e-12, silently zeroing the gradient.
-        let d_obs_nll: f64 = d_nll_d_f
-            .iter()
-            .zip(preds_p.iter().zip(preds_base.iter()))
-            .map(|(&dl, (&pp, &pb))| dl * (pp - pb) / delta)
-            .sum();
-        grad[i] = if theta_packs_log_mask[i] {
-            theta[i] * d_obs_nll
-        } else {
-            d_obs_nll
-        };
-    }
-
-    // Sigma gradient: analytical.
-    // d(obs_nll)/d(log_sigma_k) = Σ_j 0.5 * ratio_jk * (1/V_j - resid_j²/V_j²)
-    // where ratio_jk = sigma_k * dV_j/d_sigma_k.
-    for k in 0..n_sigma {
-        let i = n_theta + k;
-        if lower[i] == upper[i] {
-            continue;
-        }
-        let g: f64 = (0..n_obs)
-            .map(|j| {
-                let f = preds_base[j].max(1e-12);
-                let v = variances[j];
-                let resid = residuals[j];
-                // ratio = d(V_j)/d(log sigma_k); zero unless sigma_k enters
-                // obs j's endpoint (so per-CMT each sigma sums only over its
-                // own endpoint's observations).
-                let ratio = model
-                    .error_spec
-                    .dvar_dlogsigma(err_keys[j], k, f, sigma_values)
-                    * obs_var_scale[j];
-                0.5 * ratio * (1.0 / v - resid * resid / (v * v))
-            })
-            .sum();
-        grad[i] = g;
-    }
-
-    (nll_base, grad)
-}
-
 /// Sum of observation log-likelihoods with ETAs held fixed.
 ///
 /// Under M3, censored rows contribute the matching normal-tail likelihood
@@ -1074,7 +898,7 @@ fn obs_nll_subject_grad(
 /// subject the worker handles. With NLopt's central-FD gradient
 /// hitting `obs_nll_sum` `1 + 2·n_dim` times per M-step, this cuts
 /// per-call `Vec<PkParams>` churn to near-zero on TV-cov data.
-fn obs_nll_sum(
+pub(crate) fn obs_nll_sum(
     model: &CompiledModel,
     population: &Population,
     theta: &[f64],
@@ -1090,7 +914,15 @@ fn obs_nll_sum(
         .par_iter()
         .enumerate()
         .map_init(EventPkParams::default, |scratch, (i, subject)| {
-            obs_nll_subject_into(model, subject, theta, sigma_values, &etas[i], scratch)
+            obs_nll_subject_into(
+                model,
+                subject,
+                theta,
+                sigma_values,
+                &model.residual_correlations,
+                &etas[i],
+                scratch,
+            )
         })
         .collect();
     per_subj.iter().sum()
@@ -1128,6 +960,68 @@ fn obs_nll_sum_iov(
     per_subj.iter().sum()
 }
 
+/// Mixture (#985) variant of [`obs_nll_sum`]: each subject's observation NLL is
+/// evaluated under its drawn class's `MIXNUM` guard — so the class-switched
+/// typical values (`if MIXNUM == k …`) are seen — and under that class's σ, so a
+/// held `sigma(k)` override is honoured rather than replaced by the free base σ.
+fn obs_nll_sum_mix(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+    sigma_values: &[f64],
+    etas: &[Vec<f64>],
+    mix: MixMstep<'_>,
+) -> f64 {
+    use rayon::prelude::*;
+    let per_subj: Vec<f64> = population
+        .subjects
+        .par_iter()
+        .enumerate()
+        .map_init(EventPkParams::default, |scratch, (i, subject)| {
+            let c = mix.classes[i];
+            let _g = crate::parser::model_parser::MixtureClassGuard::enter(c + 1);
+            let sub_sg = class_sigma_subst(sigma_values, &mix.class_sigma_over[c]);
+            let sg_i: &[f64] = sub_sg.as_deref().unwrap_or(sigma_values);
+            obs_nll_subject_into(
+                model,
+                subject,
+                theta,
+                sg_i,
+                &model.residual_correlations,
+                &etas[i],
+                scratch,
+            )
+        })
+        .collect();
+    per_subj.iter().sum()
+}
+
+/// Mixture (#985) + IOV variant of [`obs_nll_sum_iov`], class-guarded per subject.
+fn obs_nll_sum_iov_mix(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+    sigma_values: &[f64],
+    etas: &[Vec<f64>],
+    kappas: &[Vec<Vec<f64>>],
+    mix: MixMstep<'_>,
+) -> f64 {
+    use rayon::prelude::*;
+    let per_subj: Vec<f64> = population
+        .subjects
+        .par_iter()
+        .enumerate()
+        .map_init(EventPkParams::default, |scratch, (i, subject)| {
+            let c = mix.classes[i];
+            let _g = crate::parser::model_parser::MixtureClassGuard::enter(c + 1);
+            let sub_sg = class_sigma_subst(sigma_values, &mix.class_sigma_over[c]);
+            let sg_i: &[f64] = sub_sg.as_deref().unwrap_or(sigma_values);
+            obs_nll_subject_into_iov(model, subject, theta, sg_i, &etas[i], &kappas[i], scratch)
+        })
+        .collect();
+    per_subj.iter().sum()
+}
+
 /// True when a free (non-`FIX`) additive component of a `Combined` endpoint has
 /// collapsed onto its optimizer lower bound.
 ///
@@ -1159,12 +1053,16 @@ fn combined_additive_sigma_at_floor(model: &CompiledModel, params: &ModelParamet
 /// The IIV-on-RUV parameterization writes the residual variance as
 /// `σ²·exp(2·η_RUV)`, so σ and ω_RUV trade off along a ridge; a poorly-mixing
 /// E-step can let the M-step ride σ up to its e⁵ ceiling. This returns, per σ,
-/// `Some(cap)` = `min(log σ₀ + SAEM_RUV_SIGMA_LN_GROWTH, existing log-upper)` for
-/// each *free* RUV-scaled residual σ, and `None` for any σ that must not be
-/// capped: every σ when the model has no `iiv_on_ruv` (`has_ruv_eta == false`), a
-/// FIXed σ, or the FREM covariate σ (EPSCOV — always FIX and independent of the
-/// RUV scaling). The cap is enforced as a post-M-step clamp, never as an NLopt
-/// bound, so a well-posed fit whose σ stays below the cap is unaffected.
+/// `Some(cap)` = `log σ₀ + SAEM_RUV_SIGMA_LN_GROWTH` for each *free* RUV-scaled
+/// residual σ **whose growth cap is stricter than its own NLopt upper bound**,
+/// and `None` for any σ that must not carry a growth cap: every σ when the model
+/// has no `iiv_on_ruv` (`has_ruv_eta == false`), a FIXed σ, the FREM covariate σ
+/// (EPSCOV — always FIX and independent of the RUV scaling), or a σ whose
+/// user-set upper bound is already tighter than the growth cap (the NLopt bound
+/// governs there, so a σ converging to its own bound must not be mis-flagged as a
+/// bound RUV growth cap — #903 review). The cap is enforced as a post-M-step
+/// clamp, never as an NLopt bound, so a well-posed fit whose σ stays below the cap
+/// is unaffected.
 fn compute_ruv_sigma_caps(
     has_ruv_eta: bool,
     frem_cov_sigma: Option<usize>,
@@ -1182,9 +1080,37 @@ fn compute_ruv_sigma_caps(
                 return None;
             }
             let upper = log_sigma_upper.get(i).copied().unwrap_or(f64::INFINITY);
-            Some((log_sigma_init[i] + SAEM_RUV_SIGMA_LN_GROWTH).min(upper))
+            let growth_cap = log_sigma_init[i] + SAEM_RUV_SIGMA_LN_GROWTH;
+            // If the user's own upper bound is at least as tight, NLopt already
+            // enforces it and our clamp/warning would just misattribute that bound
+            // to the RUV safeguard — so carry no growth cap here.
+            if growth_cap < upper {
+                Some(growth_cap)
+            } else {
+                None
+            }
         })
         .collect()
+}
+
+/// Whether the `iiv_on_ruv` η may be re-centered while exactly preserving each
+/// subject's residual variance (issue #904 correctness gate).
+///
+/// Re-centering shifts η_RUV by `−mean`, multiplying the *whole* residual variance
+/// `R = Σ σ_c²` by `exp(−2·mean)`, and compensates by scaling the free residual σ
+/// by `exp(mean)`. The compensation is exact only if *every* non-FREM residual σ
+/// component absorbs the shift, i.e. is free. If any RUV-scaled σ component is
+/// FIXed (e.g. a fixed additive term of a combined error), scaling only the free
+/// component leaves the fixed part uncompensated and silently perturbs `R`, so
+/// re-centering must be skipped (the σ/ω_RUV growth caps then act as the
+/// backstop; a fixed component also partially anchors the ridge). The FREM EPSCOV
+/// (always FIX and not on a real-observation row) is exempt.
+fn ruv_recenter_allowed(
+    has_ruv_eta: bool,
+    frem_cov_sigma: Option<usize>,
+    sigma_fixed: &[bool],
+) -> bool {
+    has_ruv_eta && (0..sigma_fixed.len()).all(|i| Some(i) == frem_cov_sigma || !sigma_fixed[i])
 }
 
 /// Re-center the `iiv_on_ruv` η to zero mean, absorbing the shift into the
@@ -1253,7 +1179,18 @@ fn compute_ruv_omega_cap(
 /// row/column covariances by `√(v_cap/v_old)` so every correlation with the RUV
 /// eta is preserved and the matrix stays positive-definite (#895). A no-op when
 /// the diagonal is already at or below the cap. Returns `true` when it clamped.
-fn apply_ruv_omega_cap(omega_mat: &mut DMatrix<f64>, k: usize, log_cap: f64) -> bool {
+///
+/// A FIXed off-diagonal partner `j` (`omega_fixed[j]`) is left untouched: its
+/// covariance with the RUV eta is a user-declared constant that the Ω M-step
+/// restores verbatim each iteration, so rescaling it would silently mutate a
+/// FIXed entry (#903 review). Skipping it can only *lower* the correlation the
+/// cap preserves, never break positive-definiteness (the diagonal still shrinks).
+fn apply_ruv_omega_cap(
+    omega_mat: &mut DMatrix<f64>,
+    k: usize,
+    log_cap: f64,
+    omega_fixed: &[bool],
+) -> bool {
     let v_old = omega_mat[(k, k)];
     let v_cap = log_cap.exp();
     if !(v_old > v_cap) {
@@ -1262,13 +1199,41 @@ fn apply_ruv_omega_cap(omega_mat: &mut DMatrix<f64>, k: usize, log_cap: f64) -> 
     let s = (v_cap / v_old).sqrt();
     let n = omega_mat.nrows();
     for j in 0..n {
-        if j != k {
+        if j != k && !omega_fixed.get(j).copied().unwrap_or(false) {
             omega_mat[(k, j)] *= s;
             omega_mat[(j, k)] *= s;
         }
     }
     omega_mat[(k, k)] = v_cap;
     true
+}
+
+/// Re-anchor the per-σ iiv_on_ruv growth caps to the data-informed σ reached by
+/// the end of the exploration phase (#903 review). Each cap is loosened (never
+/// tightened) to `max(existing, min(log σ_now + growth, upper))`, so a well-posed
+/// fit started from a σ guess far below the truth is not spuriously clamped and
+/// falsely flagged, while a genuine post-exploration runaway is still bounded.
+fn reanchor_ruv_sigma_caps(caps: &mut [Option<f64>], log_sigma: &[f64], log_sigma_upper: &[f64]) {
+    for (i, cap) in caps.iter_mut().enumerate() {
+        if let Some(c) = cap {
+            let upper = log_sigma_upper.get(i).copied().unwrap_or(f64::INFINITY);
+            let settled = (log_sigma[i] + SAEM_RUV_SIGMA_LN_GROWTH).min(upper);
+            *c = c.max(settled);
+        }
+    }
+}
+
+/// Re-anchor the iiv_on_ruv Ω growth cap to the ω_RUV variance reached by the end
+/// of exploration (#903 review), loosening only. `None` (no cap) stays `None`;
+/// a non-positive variance leaves the cap unchanged.
+fn reanchor_ruv_omega_cap(cap: Option<f64>, omega_ruv_var: f64) -> Option<f64> {
+    cap.map(|c| {
+        if omega_ruv_var > 0.0 {
+            c.max(omega_ruv_var.ln() + SAEM_RUV_OMEGA_LN_GROWTH)
+        } else {
+            c
+        }
+    })
 }
 
 /// Decide whether SAEM should warn that its E-step never mixed (issue #895).
@@ -1323,6 +1288,133 @@ pub(crate) fn get_mu_ref_pairs(model: &CompiledModel) -> Vec<(usize, usize)> {
         }
     }
     pairs
+}
+
+/// A class-aware (`MIXNUM`-switched) log-mu-ref pair: one eta paired with one
+/// anchor theta **per class** (#996).
+///
+/// A class-shared typical value (`V = TVV * exp(ETA_V)` in a mixture model) is
+/// represented as the same theta index repeated `n_classes` times, so both the
+/// switched and the shared case run through one update rule — and the
+/// all-classes-share-one-theta case reduces exactly to the classical pooled
+/// `log θ += γ · mean(η)` shift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MixtureMuRefPair {
+    /// Index into `model.eta_names`.
+    pub eta_idx: usize,
+    /// Anchor theta index per class; `theta_idx[c]` serves class `c` (0-based).
+    /// Length is always the mixture's `n_classes`.
+    pub theta_idx: Vec<usize>,
+}
+
+/// Build the class-aware log-mu-ref pairs for a mixture model (#996).
+///
+/// Returns empty for a non-mixture model — use [`get_mu_ref_pairs`] there.
+/// Each eta contributes at most one pair: the class-aware anchor set detected
+/// by the parser (`MixtureSpec::mu_refs`) when the typical value is
+/// `MIXNUM`-switched, otherwise the classical single-theta mu-ref broadcast
+/// across all classes. Additive (`THETA + ETA`) mu-refs are excluded for the
+/// same reason as in [`get_mu_ref_pairs`]: the closed-form shift is only valid
+/// on the log scale.
+///
+/// A theta is claimed by **at most one** pair. Two etas anchored to the same
+/// typical value (`CL = TVP*exp(ETA_CL)` and `V = TVP*exp(ETA_V)`) have no
+/// well-defined joint closed form — applying both shifts would move that θ twice
+/// in one iteration — so the first eta to claim a θ keeps it and any later pair
+/// that reuses it is dropped, leaving those θ to the numerical / weighted M-step
+/// (#996 review).
+pub(crate) fn get_mixture_mu_ref_pairs(model: &CompiledModel) -> Vec<MixtureMuRefPair> {
+    let Some(spec) = model.mixture.as_ref() else {
+        return Vec::new();
+    };
+    let k = spec.n_classes;
+    let idx_of = |name: &str| model.theta_names.iter().position(|n| n == name);
+    let mut out: Vec<MixtureMuRefPair> = Vec::new();
+    let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut push_pair = |out: &mut Vec<MixtureMuRefPair>, pair: MixtureMuRefPair| {
+        if pair.theta_idx.iter().any(|t| claimed.contains(t)) {
+            return;
+        }
+        claimed.extend(pair.theta_idx.iter().copied());
+        out.push(pair);
+    };
+    for (eta_idx, eta_name) in model.eta_names.iter().enumerate() {
+        if let Some(m) = spec.mu_refs.iter().find(|m| &m.eta_name == eta_name) {
+            if !m.log_transformed || m.theta_names.len() != k {
+                continue;
+            }
+            let Some(theta_idx) = m
+                .theta_names
+                .iter()
+                .map(|n| idx_of(n))
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
+            push_pair(&mut out, MixtureMuRefPair { eta_idx, theta_idx });
+        } else if let Some(mu_ref) = model.mu_refs.get(eta_name) {
+            if !mu_ref.log_transformed {
+                continue;
+            }
+            let Some(t) = idx_of(&mu_ref.theta_name) else {
+                continue;
+            };
+            push_pair(
+                &mut out,
+                MixtureMuRefPair {
+                    eta_idx,
+                    theta_idx: vec![t; k],
+                },
+            );
+        }
+    }
+    out
+}
+
+/// Responsibility-weighted per-class mu-ref mean shift (#996).
+///
+/// For each anchor theta `t`, returns `(Σ_i Σ_{c: θ_c = t} r_ic · η̄_ic) /
+/// (Σ_i Σ_{c: θ_c = t} r_ic)` — the EM-optimal `Δ log θ_t` for the complete-data
+/// log-likelihood of `log P_i = log θ_{c_i} + η_i` restricted to the members of
+/// the classes that theta serves. `resp[i][c]` is subject `i`'s weight in class
+/// `c`: a hard 0/1 indicator under SAEM (which draws one class per subject) and
+/// the responsibility `PMIX_ic` under IMP/IMPMAP (which importance-samples
+/// within every class). `eta_at(i, c)` supplies subject `i`'s η mean under
+/// class `c` for the eta this pair carries.
+///
+/// The result is `None` for any theta no class weight reached — the label-switch
+/// case where a class won zero subjects this iteration. The caller holds that
+/// θ_k and lets the next iteration move it, rather than dividing by zero or
+/// falling back to a pooled mean that would drag the class toward its neighbours.
+///
+/// When every class maps to the *same* theta the weights sum to one per subject
+/// and this collapses to the pooled `mean_i(η_i)` of the classical mu-ref
+/// update, in the same accumulation order — which is what makes the degenerate
+/// single-theta mixture reproduce the non-mixture path exactly.
+pub(crate) fn mixture_mu_ref_means(
+    n_theta: usize,
+    theta_idx_per_class: &[usize],
+    resp: &[Vec<f64>],
+    eta_at: impl Fn(usize, usize) -> f64,
+) -> Vec<Option<f64>> {
+    let mut numer = vec![0.0f64; n_theta];
+    let mut denom = vec![0.0f64; n_theta];
+    for (i, r_i) in resp.iter().enumerate() {
+        for (c, &t) in theta_idx_per_class.iter().enumerate() {
+            if t >= n_theta {
+                continue;
+            }
+            let r = r_i.get(c).copied().unwrap_or(0.0);
+            if r <= 0.0 {
+                continue;
+            }
+            numer[t] += r * eta_at(i, c);
+            denom[t] += r;
+        }
+    }
+    (0..n_theta)
+        .map(|t| (denom[t] > 0.0).then(|| numer[t] / denom[t]))
+        .collect()
 }
 
 /// One-line description of the SAEM E-step sampler kernel, for the startup
@@ -1382,6 +1474,11 @@ fn saem_state_to_params(
             names: init_params.sigma.names.clone(),
         },
         sigma_fixed: init_params.sigma_fixed.clone(),
+        // SAEM does not update the `block_sigma` off-diagonals (#847); carry them
+        // through so a chained estimator (e.g. `[saem, foce]`) and the result
+        // snapshot both keep the declared residual covariance structure.
+        residual_correlations: init_params.residual_correlations.clone(),
+        residual_correlation_fixed: init_params.residual_correlation_fixed.clone(),
         omega_iov: if n_kappa > 0 {
             // Use from_matrix_with_mask so the structural free_mask is preserved
             // when this snapshot is handed to a chained estimator (e.g.
@@ -1399,6 +1496,7 @@ fn saem_state_to_params(
             init_params.omega_iov.clone()
         },
         kappa_fixed: init_params.kappa_fixed.clone(),
+        mixture: None,
     }
 }
 
@@ -1463,7 +1561,12 @@ pub fn run_saem(
         && model.ode_spec.is_none()
         && model.tv_fn.is_some()
         && n_kappa == 0
-        && model.residual_error_eta.is_none();
+        && model.residual_error_eta.is_none()
+        // Mixture models (#985): the E-step must sample the class indicator and
+        // run η-MCMC within the drawn class (per-subject `MIXNUM` guard). The HMC
+        // gradient kernel is class-unaware, so disable it and use the MH kernels,
+        // which honour the class thread-local set in the E-step closure.
+        && model.mixture.is_none();
 
     let n_theta = init_params.theta.len();
     let n_sigma = init_params.sigma.values.len();
@@ -1706,7 +1809,7 @@ pub fn run_saem(
     // handed to NLopt perturbs its search path even when the optimum is interior).
     // `None` means "no cap for this σ"; a `Some(cap)` records the log-σ ceiling so
     // the update can be clamped and a run that ends pinned against it flagged.
-    let ruv_sigma_caps: Vec<Option<f64>> = compute_ruv_sigma_caps(
+    let mut ruv_sigma_caps: Vec<Option<f64>> = compute_ruv_sigma_caps(
         model.residual_error_eta.is_some(),
         model
             .frem_config
@@ -1718,13 +1821,43 @@ pub fn run_saem(
     );
 
     // #904: which residual σ absorb the iiv_on_ruv η-mean during re-centering —
-    // exactly the free, non-FREM, RUV-scaled σ (the same set that carries a growth
-    // cap). A FREM EPSCOV or a FIXed σ is never scaled.
-    let ruv_sigma_absorb: Vec<bool> = ruv_sigma_caps.iter().map(|c| c.is_some()).collect();
+    // exactly the free, non-FREM, RUV-scaled σ. Computed directly (not from
+    // `ruv_sigma_caps`, which drops a free σ whose growth cap is looser than a
+    // tight user upper bound — that σ must still absorb the shift). A FREM EPSCOV
+    // or a FIXed σ is never scaled.
+    let frem_cov_sigma_idx = model
+        .frem_config
+        .as_ref()
+        .map(|fc| fc.covariate_sigma_index);
+    let ruv_sigma_absorb: Vec<bool> = (0..n_sigma)
+        .map(|i| {
+            !init_params.sigma_fixed.get(i).copied().unwrap_or(false)
+                && Some(i) != frem_cov_sigma_idx
+        })
+        .collect();
+
+    // Re-centering scales η_RUV by −mean, which multiplies the *whole* residual
+    // variance R = Σ σ_c² (all components, e.g. additive + proportional) by
+    // exp(−2·mean). It preserves each subject's residual variance exactly only if
+    // *every* non-FREM residual σ component absorbs the shift (each scaled by
+    // exp(mean), so R → R·exp(2·mean)). If any RUV-scaled σ component is FIXed,
+    // scaling only the free ones leaves the fixed part uncompensated and silently
+    // perturbs R — so re-centering is disabled for that config and the σ/ω_RUV
+    // growth caps carry the load instead (a FIXed component also partially anchors
+    // the σ × η_RUV ridge). The FREM EPSCOV (always FIX, not on a real-obs row) is
+    // exempt from this check.
+    let ruv_recenter_ok = ruv_recenter_allowed(
+        model.residual_error_eta.is_some(),
+        model
+            .frem_config
+            .as_ref()
+            .map(|fc| fc.covariate_sigma_index),
+        &init_params.sigma_fixed,
+    );
 
     // #895: log-variance ceiling for the iiv_on_ruv Ω diagonal — the ω_RUV half
     // of the σ × ω_RUV ridge backstop (see `compute_ruv_omega_cap`).
-    let ruv_omega_cap: Option<f64> = compute_ruv_omega_cap(
+    let mut ruv_omega_cap: Option<f64> = compute_ruv_omega_cap(
         model.residual_error_eta,
         n_eta,
         &init_params.omega.matrix,
@@ -1758,7 +1891,351 @@ pub fn run_saem(
     // additive ones), since the closed-form `log_theta += γ · mean(η)` only
     // applies to log-mu-referenced thetas.
     let mu_ref_pairs: Vec<(usize, usize)> = get_mu_ref_pairs(model);
-    let use_closed_form_mstep = options.mu_referencing && !mu_ref_pairs.is_empty();
+    // Mixture: a MIXNUM-switched typical value pairs one η with several class
+    // thetas, so the *pooled* `log_theta += γ·mean(η)` update above (one theta
+    // per η) does not apply. It is well-posed per class though — SAEM draws a
+    // hard class per subject, so `log θ_k += γ·mean_{i : c_i = k}(η_i)` — and
+    // `get_mixture_mu_ref_pairs` supplies that class-resolved anchor set (#996).
+    // Any class θ the parser could not resolve to a mu-ref pattern still routes
+    // through the full NLopt θ/σ M-step, which — run under each subject's class
+    // guard — estimates every class's thetas from its own members (#985).
+    let mut saem_mix: Option<crate::estimation::saem_mixture::SaemMixture> =
+        model.mixture.as_ref().map(|_| {
+            crate::estimation::saem_mixture::SaemMixture::build(model, init_params, population)
+        });
+    if let Some(mix) = saem_mix.as_ref() {
+        if mix.has_sigma_override() {
+            warnings.push(
+                "SAEM does not yet re-estimate per-class σ overrides (sigma(k)); they are held \
+                 at their initial values. Class-switched θ, Ω overrides, and the mixing \
+                 coefficients are estimated. Route to FOCEI if the σ overrides must be fit (#985)."
+                    .to_string(),
+            );
+        }
+        // Reject a theta that drives both the mixing expression and a structural
+        // typical value: SAEM's separated M-step would estimate it from the
+        // residual likelihood and then discard that for the mixing fit, silently
+        // mis-fitting. FOCEI's joint marginal handles the shared parameter, so
+        // route there instead of guessing (#987 review).
+        let overlap = crate::estimation::saem_mixture::mixing_structural_overlap(
+            model,
+            init_params,
+            population,
+            &mix.mixing_theta_idx,
+        );
+        if !overlap.is_empty() {
+            let names: Vec<String> = overlap
+                .iter()
+                .map(|&j| {
+                    init_params
+                        .theta_names
+                        .get(j)
+                        .cloned()
+                        .unwrap_or_else(|| format!("theta[{j}]"))
+                })
+                .collect();
+            return Err(format!(
+                "SAEM cannot fit a mixture where a mixing-coefficient theta also drives the \
+                 structural model: {} appear(s) in both the [mixture] mixing expression and an \
+                 [individual_parameters] typical value. SAEM estimates the mixing coefficients \
+                 and the structural thetas in separate M-steps, so a shared parameter would be \
+                 double-owned. Split it into two thetas (one for structure, one for mixing), or \
+                 fit with FOCE/FOCEI (whose joint marginal handles the shared parameter) (#985).",
+                names.join(", ")
+            ));
+        }
+    }
+    // Per-class held σ overrides, hoisted out of the loop: they are constant
+    // under SAEM (held at their inits) and the θ/σ M-step substitutes them per
+    // subject so the free base σ is not dragged by override-class members.
+    let mix_sigma_over: Vec<Vec<(usize, f64)>> = saem_mix
+        .as_ref()
+        .map(|m| m.class_sigma_overrides())
+        .unwrap_or_default();
+    // #996 open question, confirmed: an identity-packed θ (`theta_lower < 0`,
+    // see `theta_packs_log`) reaches the closed-form loop today and would be
+    // updated as `θ += mean(η)` instead of `θ *= exp(mean(η))` — the shift is
+    // only the EM optimum on the log scale. Such a θ is dropped from the
+    // closed-form channel and estimated by the numerical M-step instead.
+    let identity_packed = |pairs: &[(usize, usize)]| -> Vec<usize> {
+        let mut v: Vec<usize> = pairs
+            .iter()
+            .filter(|&&(t, _e)| !theta_packs_log_mask[t])
+            .map(|&(t, _e)| t)
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    let dropped_identity = identity_packed(&mu_ref_pairs);
+    let mu_ref_pairs: Vec<(usize, usize)> = mu_ref_pairs
+        .into_iter()
+        .filter(|&(t, _e)| theta_packs_log_mask[t])
+        .collect();
+
+    // Class-aware mu-ref pairs for a mixture (#996). Empty for a non-mixture
+    // model, which uses `mu_ref_pairs` above.
+    //
+    // SAEM takes only the **class-shared** anchors — an η whose typical value is
+    // the same theta in every class (`V = TVV * exp(ETA_V)` inside a mixture).
+    // For those the per-class update collapses to the classical pooled
+    // `log θ += γ·mean(η)` (every class maps to one theta, so the weights sum to
+    // N), so this is a strict extension of the single-population closed form:
+    // before #996 a mixture disabled mu-referencing wholesale and even a
+    // class-shared typical value went through the numerical M-step.
+    //
+    // A genuinely `MIXNUM`-switched typical value is deliberately *not* taken
+    // here, even though `get_mixture_mu_ref_pairs` can express it. SAEM draws a
+    // hard class per subject, and the per-class mean `mean_{i : c_i = k}(η_i)`
+    // is then a classification-EM statistic: the class boundary is re-drawn from
+    // the θ_k it just moved, and the two feed back. Measured on the two-class
+    // anchor (`tests/nonmem/mixture_iv.csv`, seed 20250818) the class-aware
+    // variant lands at `TVCL2 = 3.02` with OFV 305.0 against `2.75` / 302.2 for
+    // the numerical M-step (NONMEM SAEM: 2.735; FOCEI optimum: 2.842) — worse on
+    // every coordinate — and a Rao-Blackwellised soft-responsibility variant
+    // converges to the same wrong point, so the bias is in the hard-class
+    // sufficient statistic, not the weighting. IMP/IMPMAP, which importance-
+    // samples within *every* class and weights by the responsibilities, does not
+    // have this failure mode and does use the switched anchors.
+    //
+    // All of this is conditional on `mu_referencing`: with it off every θ goes
+    // through the numerical M-step by construction, so telling the user to switch
+    // estimator to get a closed-form shift they turned off is noise (#996 review).
+    let mut mix_switched_skipped: Vec<usize> = Vec::new();
+    let mix_mu_ref_pairs: Vec<MixtureMuRefPair> = if saem_mix.is_some() && options.mu_referencing {
+        get_mixture_mu_ref_pairs(model)
+            .into_iter()
+            .filter(|p| p.theta_idx.iter().all(|&t| theta_packs_log_mask[t]))
+            .filter(|p| {
+                let shared = p.theta_idx.windows(2).all(|w| w[0] == w[1]);
+                if !shared {
+                    mix_switched_skipped.extend(p.theta_idx.iter().copied());
+                }
+                shared
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if !mix_switched_skipped.is_empty() {
+        mix_switched_skipped.sort_unstable();
+        mix_switched_skipped.dedup();
+        let names: Vec<&str> = mix_switched_skipped
+            .iter()
+            .map(|&t| model.theta_names.get(t).map(String::as_str).unwrap_or("?"))
+            .collect();
+        warnings.push(format!(
+            "SAEM: the MIXNUM-switched typical value(s) {} are estimated by the numerical \
+             M-step, not the closed-form mu-referencing shift — SAEM's hard per-subject class \
+             draw makes the per-class η mean a biased (classification-EM) statistic. Use \
+             IMP/IMPMAP if the class-aware mu-ref shift is wanted (#996).",
+            names.join(", ")
+        ));
+    }
+    let mut dropped_identity = dropped_identity;
+    if saem_mix.is_some() && options.mu_referencing {
+        for p in get_mixture_mu_ref_pairs(model) {
+            if p.theta_idx.iter().any(|&t| !theta_packs_log_mask[t]) {
+                dropped_identity.extend(p.theta_idx.iter().copied());
+            }
+        }
+        dropped_identity.sort_unstable();
+        dropped_identity.dedup();
+    }
+    // Same gate: the identity-packing advisory is about a closed-form update that
+    // does not run at all under `mu_referencing = false` (#996 review).
+    if !dropped_identity.is_empty() && options.mu_referencing {
+        let names: Vec<&str> = dropped_identity
+            .iter()
+            .map(|&t| model.theta_names.get(t).map(String::as_str).unwrap_or("?"))
+            .collect();
+        warnings.push(format!(
+            "SAEM: typical value(s) {} are log-mu-referenced but declared with a negative \
+             lower bound, so they are packed on the identity scale; the closed-form \
+             `log θ += γ·mean(η)` update does not apply and they are estimated by the \
+             numerical M-step instead. Give them a non-negative lower bound to use the \
+             closed-form update (#996).",
+            names.join(", ")
+        ));
+    }
+
+    let use_closed_form_mstep = options.mu_referencing
+        && if saem_mix.is_some() {
+            // Mixture: the class-aware shift replaces the per-θ numerical
+            // M-step for every log-mu-ref θ (#996).
+            !mix_mu_ref_pairs.is_empty()
+        } else {
+            !mu_ref_pairs.is_empty()
+        };
+
+    // STRONG advisory: an estimated θ with **no associated ETA** is not
+    // mu-referenced, so it never receives the γ-damped closed-form
+    // `log θ += γ·mean(η)` shift. It is moved only by the η-frozen numerical
+    // M-step, which re-maximises the conditional observation likelihood against
+    // a *single* MCMC η draw with no stochastic-approximation damping — the
+    // update is a random walk on a noisy surface, not an SA-averaged statistic,
+    // and it can drift a long way from the marginal optimum.
+    //
+    // Measured on the FREM `iiv_on_ruv` reprex (475 subjects, 12 ETAs, the same
+    // `FRD1` absorption fraction that motivated the IMP/IMPMAP advisory in
+    // #406): SAEM drove `TVFRD1` 0.383 → 0.039 while IMP (0.311), IMPMAP
+    // (0.318) and NONMEM IMP (0.394) agree, dragging `TVV` +6% and `TVMAT` +9%
+    // with it. The drift is not a start artifact — restarting SAEM *at* the
+    // IMPMAP solution still walked it down to 0.065 — and it is removed
+    // entirely by attaching an ETA (`FRD1 = TVFRD1*exp(ETA_FRD1)`, ω² = 0.01 →
+    // SAEM recovers 0.313) or by holding the parameter FIX (every other θ then
+    // lands within 3% of NONMEM).
+    let class_mu_ref_thetas: Vec<usize> = if use_closed_form_mstep && saem_mix.is_some() {
+        mix_mu_ref_pairs
+            .iter()
+            .flat_map(|p| p.theta_idx.iter().copied())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // Two kinds of θ are filtered out first, because "has NO associated ETA" is
+    // factually wrong for them (#1012 review):
+    //
+    // * **Mixing-coefficient θ.** The numerical θ/σ M-step does not move them at
+    //   all — they do not enter the residual/η likelihood, and `mstep_mixing`
+    //   overwrites them from the responsibilities afterwards (step 4b below).
+    //   They also *cannot* carry an η: the parser rejects a mixing expression
+    //   that depends on one. Both the diagnosis and the remedy would be wrong.
+    //   `run_mcem_mixture` drops the same set for the same reason.
+    // * **Class typical values that already earned a dedicated message.** A
+    //   MIXNUM-switched anchor, or a log-mu-ref θ dropped to the identity scale,
+    //   *does* carry an η in the model text; it sits on the numerical M-step for
+    //   a reason the two warnings above already state, and "add an ETA" on top
+    //   of that is both false and contradictory. IMP/IMPMAP split these into a
+    //   separate message (`shift_disabled` vs `thetas_without_eta`); SAEM
+    //   already pushed the equivalent, so here it is a filter, not a partition.
+    let mut already_explained: std::collections::HashSet<&str> = saem_mix
+        .as_ref()
+        .map(|m| m.mixing_theta_idx.as_slice())
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|&j| model.theta_names.get(j).map(String::as_str))
+        .collect();
+    // `dropped_identity` only carries a message when `mu_referencing` is on; with
+    // it off the θ is un-explained and stays in scope for this advisory.
+    let identity_messaged: &[usize] = if options.mu_referencing {
+        &dropped_identity
+    } else {
+        &[]
+    };
+    already_explained.extend(
+        mix_switched_skipped
+            .iter()
+            .chain(identity_messaged.iter())
+            .filter_map(|&t| model.theta_names.get(t).map(String::as_str)),
+    );
+    let thetas_without_eta: Vec<String> = crate::estimation::impmap::non_fixed_thetas_without_eta(
+        model,
+        &init_params.theta_fixed,
+        &class_mu_ref_thetas,
+    )
+    .into_iter()
+    .filter(|n| !already_explained.contains(n.as_str()))
+    .collect();
+    if !thetas_without_eta.is_empty() {
+        warnings.push(format!(
+            "SAEM: estimated parameter(s) [{}] have NO associated ETA, so they are not \
+             mu-referenced and are moved only by the η-frozen numerical M-step. That channel \
+             re-maximises against a single MCMC η draw, so it carries a Monte-Carlo bias that \
+             SA damping (#1011) reduces but does not remove, and it can still settle away from \
+             the marginal optimum. For a typical value, put it in a mu-referenceable form \
+             (`P = TVP * exp(ETA_P)` with a small, optionally FIX, omega — ferx applies \
+             mu-referencing automatically). For a parameter that has no ETA to give — a \
+             covariate coefficient, an allometric exponent, a structural constant — hold it \
+             FIX, or cross-check the fit against FOCEI/IMPMAP.",
+            thetas_without_eta.join(", ")
+        ));
+    }
+
+    // #1011: is the numerical M-step left estimating a fixed-effect-only θ this
+    // fit? A θ that is FIXed, or pinned out by the closed-form mu-ref shift, is
+    // returned unchanged by NLopt, so there is nothing for the SA damping below
+    // to act on; a free θ that anchors a mu-reference has the exact closed-form
+    // shift available to it, which is not the #1011 bias. Skipping the damping in
+    // both cases keeps those fits byte-identical to the pre-#1011 behaviour (σ
+    // included) — `thetas_without_eta` above lists exactly the θ that do trip it,
+    // under the same mu-ref-detection predicate (see `theta_is_mu_ref_anchor_mask`
+    // for what that does and does not see).
+    //
+    // **Mixtures are excluded.** A `MIXNUM`-switched typical value is estimated
+    // by this same numerical M-step (#996 routes it there deliberately, because
+    // SAEM's hard class draw makes the per-class η mean a biased statistic), but
+    // it is solving a different problem: the class typical values must *separate*
+    // from a common start, and the class assignments only stabilise once they
+    // have. Damping that excursion stalls the separation — measured on
+    // `tests/nonmem/mixture_iv_saem`, a 0.03 exploration cap leaves
+    // `TVCL1 = 1.145` against NONMEM's 1.002, and drags the chained IMP marginal
+    // with it. Whether the #1011 bias also affects mixture class θ (it plausibly
+    // does) needs its own schedule and its own anchor, so it is left alone here
+    // rather than half-fixed; the advisory above still fires for them.
+    let numerically_estimated_theta = {
+        let pinned: Vec<usize> = if !use_closed_form_mstep {
+            Vec::new()
+        } else if saem_mix.is_some() {
+            class_mu_ref_thetas.clone()
+        } else {
+            mu_ref_pairs.iter().map(|&(t, _e)| t).collect()
+        };
+        let theta_is_mu_ref_anchor =
+            crate::estimation::impmap::theta_is_mu_ref_anchor_mask(model, &class_mu_ref_thetas);
+        damps_numerical_mstep(
+            saem_mix.is_some(),
+            n_theta,
+            &init_params.theta_fixed,
+            &pinned,
+            &theta_is_mu_ref_anchor,
+        )
+    };
+
+    // #1011: exploration-phase cap on the numerical M-step's SA step. `None`
+    // takes the calibrated default; `1.0` disables the damping entirely.
+    let mstep_damping_cap = match options.saem_mstep_damping {
+        None => MSTEP_SA_MAX_STEP,
+        Some(v) => match sanitize_mstep_damping(v) {
+            None => v,
+            Some(fixed) => {
+                warnings.push(format!(
+                    "SAEM: `mstep_damping` = {v} is outside (0, 1] — using {fixed} instead. A \
+                     non-positive damping would step theta and sigma away from the M-step \
+                     optimum on every iteration, and zero would freeze them (#1011)."
+                ));
+                fixed
+            }
+        },
+    };
+    // A setting the fit cannot act on is worse than no setting: say so rather
+    // than accepting it silently.
+    if options.saem_mstep_damping.is_some() && !numerically_estimated_theta {
+        let reason = if saem_mix.is_some() {
+            "this is a mixture model, whose class typical values must separate from a common \
+             start before the class assignments settle — damping that excursion stalls it"
+        } else if !options.mu_referencing {
+            // The gate reads `theta_is_mu_ref_anchor_mask`, a *structural*
+            // property of the model text, so it stays true under
+            // `mu_referencing = false` even though no closed-form shift runs and
+            // the numerical M-step really does move every theta. Skipping the
+            // damping there is deliberate (see `damps_numerical_mstep`), but the
+            // single-population wording below would be a lie about this fit.
+            "`mu_referencing` is off, so every theta is estimated by the numerical M-step — but \
+             each one is written in a mu-referenceable form, and #1011's damping was calibrated \
+             only against thetas that have no such form at all. Damping this configuration is \
+             untested, so it is left alone; drop `mu_referencing = false` to get the closed-form \
+             shift instead"
+        } else {
+            "every estimated theta in this model is mu-referenced (so it has the exact \
+             closed-form shift available, not the biased fixed-effect-only channel) or is FIX, \
+             so the numerical M-step has no theta to damp"
+        };
+        warnings.push(format!(
+            "SAEM: `mstep_damping` was set but has no effect — {reason} (#1011)."
+        ));
+    }
+
     // Accumulator for the `obs_nll_sum` (population OFV) evaluations skipped
     // by pinning mu-ref dims out of NLopt's central-FD gradient.  Each pinned
     // dim costs `2 * mstep_maxiter` `obs_nll_sum` calls inside NLopt — that's
@@ -1801,6 +2278,22 @@ pub fn run_saem(
         // γ = 1/(k−k1), the same schedule as θ, so the SA estimate settles
         // correctly (the chain is equilibrated by then, so the single-draw
         // overwrite risk that motivated the cap no longer applies).
+        // #1011: SA step for the numerical θ/σ M-step result, mirroring
+        // `gamma_omega`. Capped during exploration so a single un-equilibrated
+        // MCMC draw cannot carry an un-mu-referenced θ away; full decaying γ in
+        // the convergence phase. Left at 1.0 (undamped, pre-#1011) when NLopt has
+        // no θ to estimate, so those fits are unchanged.
+        //
+        // Named for the M-step, not for θ: it blends the *joint* `[θ; σ]`
+        // maximiser `theta_sigma_mstep_light` returns, so both components take
+        // this same γ. See `mstep_sa_step` for why splitting them would be an
+        // inconsistent partial step.
+        let gamma_mstep = mstep_sa_step(
+            numerically_estimated_theta,
+            k <= k1,
+            gamma,
+            mstep_damping_cap,
+        );
         let gamma_omega = if k <= k1 {
             gamma.min(OMEGA_SA_MAX_STEP)
         } else {
@@ -1831,6 +2324,32 @@ pub fn run_saem(
             None
         };
 
+        // Mixture (#985): refresh every class's Ω/σ from the just-rebuilt base
+        // plus the per-class overrides, then precompute the per-class proposal
+        // Ω, σ, and componentwise SDs the E-step indexes by each subject's drawn
+        // class. `class_omegas[0]` is the base (== omega_k) for a shared-Ω model.
+        let (class_omegas, class_sigmas, class_cw_sd): (
+            Vec<OmegaMatrix>,
+            Vec<Vec<f64>>,
+            Vec<Vec<f64>>,
+        ) = if let Some(mix) = saem_mix.as_mut() {
+            mix.sync_base(&omega_k, &state.sigma_vals);
+            let n_c = mix.n_classes;
+            let omg: Vec<OmegaMatrix> = (0..n_c).map(|c| mix.class_omega(c).clone()).collect();
+            let sig: Vec<Vec<f64>> = (0..n_c).map(|c| mix.class_sigma(c).to_vec()).collect();
+            let cw: Vec<Vec<f64>> = omg
+                .iter()
+                .map(|o| {
+                    (0..n_eta)
+                        .map(|j| o.matrix[(j, j)].max(SAEM_OMEGA_DIAG_FLOOR).sqrt())
+                        .collect()
+                })
+                .collect();
+            (omg, sig, cw)
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
+
         // ---- Step 1: MH simulation (parallelized) ----
         // Symmetric random-walk MH in eta_true space, identical schedule
         // throughout exploration and convergence — the only thing that
@@ -1843,10 +2362,18 @@ pub fn run_saem(
         // is what keeps a block Ω from collapsing to rank-1 — see that fn's
         // docstring.
         {
+            use crate::parser::model_parser::MixtureClassGuard;
             use rayon::prelude::*;
             let theta_ref = &state.theta;
             let sigma_ref = &state.sigma_vals;
             let omega_ref = &omega_k;
+            // Immutable view of the mixture state for the per-subject class draw
+            // (the `sync_base` mutable borrow above has ended). The per-class
+            // proposal Ω/σ/CW-SDs precomputed above are indexed by the draw.
+            let mix_ref = saem_mix.as_ref();
+            let class_omegas_ref = &class_omegas;
+            let class_sigmas_ref = &class_sigmas;
+            let class_cw_sd_ref = &class_cw_sd;
             // Per-coordinate componentwise proposal SDs — computed once here (Ω's
             // diagonal is shared across subjects) rather than per subject inside
             // the parallel kernel. Floored to match the Ω diagonal floor.
@@ -1880,8 +2407,18 @@ pub fn run_saem(
             let omega_iov_for_eta_mh: Option<&OmegaMatrix> = omega_iov_cur_opt.as_ref();
 
             // Returns (eta_new, nll_after, n_acc_primary, n_prop_primary,
-            //          per_eta_acc_cw, n_sweeps_cw, used_hmc)
-            let results: Vec<(Vec<f64>, f64, usize, usize, Vec<usize>, usize, bool)> = state
+            //          per_eta_acc_cw, n_sweeps_cw, used_hmc, mix_class)
+            #[allow(clippy::type_complexity)]
+            let results: Vec<(
+                Vec<f64>,
+                f64,
+                usize,
+                usize,
+                Vec<usize>,
+                usize,
+                bool,
+                usize,
+            )> = state
                 .etas
                 .par_iter()
                 .zip(state.nll_cache.par_iter())
@@ -1906,9 +2443,56 @@ pub fn run_saem(
                         );
                         let kappas_mh_opt =
                             omega_iov_for_eta_mh.map(|iov| (kappas_i.as_slice(), iov));
+
+                        // ---- Mixture E-step: draw the latent class ----
+                        // Sample z_i ~ Categorical(PMIX_i) from the current
+                        // posterior at this subject's η (and κ), then run the η
+                        // moves *within* the drawn class: set the MIXNUM guard and
+                        // point the proposal Ω/σ/CW-SDs at that class (#985).
+                        // Draw the latent class; the per-subject posterior is
+                        // recomputed at the converged params after the loop (via
+                        // `mixture_ofv`), so only the sampled class is carried out.
+                        let mix_class: usize = if let Some(mix) = mix_ref {
+                            crate::estimation::saem_mixture::draw_class(
+                                model,
+                                subject,
+                                theta_ref,
+                                eta,
+                                kappas_i,
+                                mix,
+                                omega_iov_for_eta_mh,
+                                pk_scratch,
+                                &mut rng,
+                            )
+                        } else {
+                            0
+                        };
+                        let _class_guard = mix_ref.map(|_| MixtureClassGuard::enter(mix_class + 1));
+                        let (omega_ref, sigma_ref, cw_sd_ref): (&OmegaMatrix, &[f64], &[f64]) =
+                            if mix_ref.is_some() {
+                                (
+                                    &class_omegas_ref[mix_class],
+                                    &class_sigmas_ref[mix_class],
+                                    &class_cw_sd_ref[mix_class],
+                                )
+                            } else {
+                                (omega_ref, sigma_ref.as_slice(), cw_sd_ref.as_slice())
+                            };
+
                         let mut eta_work = eta.clone();
 
                         // ---- Kernel 1: primary block move ----
+                        // Baseline for the first MH acceptance ratio is the cached
+                        // NLL (as in the non-mixture path). For a mixture that value
+                        // was computed under the previous iteration's drawn class, so
+                        // on a class flip the very first proposal is scored against a
+                        // slightly mismatched baseline — but the sweep recomputes the
+                        // NLL under the current class from the next step on, so the
+                        // effect is a single self-correcting proposal. Re-deriving the
+                        // baseline at the drawn class each iteration was tried and
+                        // measurably *worsened* the fit (it lets a wrong class draw
+                        // drag η, inflating Monte-Carlo variance), so the cached
+                        // baseline is deliberate (#987 review).
                         let mut nll_cur = nll;
                         let mut n_acc_primary = 0_usize;
                         let mut n_prop_primary = 0_usize;
@@ -1982,14 +2566,22 @@ pub fn run_saem(
                             per_eta_acc_cw,
                             n_prop_cw,
                             did_hmc,
+                            mix_class,
                         )
                     },
                 )
                 .collect();
 
-            for (i, (eta_new, nll_new, n_acc, n_prop, per_eta_acc_cw, n_prop_cw, used_hmc)) in
-                results.into_iter().enumerate()
+            // Collect the drawn classes for the mixture M-step. The per-subject
+            // posterior is recomputed at the converged parameters after the loop
+            // (via `mixture_ofv`), matching what the FOCEI mixture path reports.
+            let mut drawn_classes: Vec<usize> = vec![0; n_subjects];
+            for (
+                i,
+                (eta_new, nll_new, n_acc, n_prop, per_eta_acc_cw, n_prop_cw, used_hmc, mix_class),
+            ) in results.into_iter().enumerate()
             {
+                drawn_classes[i] = mix_class;
                 state.etas[i] = eta_new;
                 state.nll_cache[i] = nll_new;
                 state.accept_counts[i] += n_acc;
@@ -2007,6 +2599,15 @@ pub fn run_saem(
                 // mixing fine, so a block-only rate is misleading.
                 iter_acc += n_acc + cw_acc_i;
                 iter_prop += n_prop + n_prop_cw;
+            }
+
+            // ---- Mixture bookkeeping (#985) ----
+            // Record the drawn classes, SA-update the responsibility average and
+            // the Ω-override statistics, and accumulate the posterior for the
+            // final output (convergence phase only, once θ/Ω have settled).
+            if let Some(mix) = saem_mix.as_mut() {
+                mix.classes = drawn_classes;
+                mix.update_rbar(gamma);
             }
         }
 
@@ -2026,6 +2627,19 @@ pub fn run_saem(
             if let Some(omega_iov_cur) = omega_iov_cur_opt.as_ref() {
                 for i in 0..n_subjects {
                     let subject = &population.subjects[i];
+                    // Mixture (#985): κ must be sampled inside the subject's drawn
+                    // class — under that class's `MIXNUM` branch and its Ω/σ.
+                    // Without the guard every subject's κ would be proposed against
+                    // the class-1 typical values and class-1 Ω/σ, corrupting
+                    // `state.kappas` (hence `s2_iov`, Ω_IOV and the θ/σ M-step)
+                    // for every class-2+ subject (#987 review).
+                    let cls = saem_mix.as_ref().map(|m| m.classes[i]);
+                    let _class_guard =
+                        cls.map(|c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
+                    let (omega_i, sigma_i): (&OmegaMatrix, &[f64]) = match cls {
+                        Some(c) => (&class_omegas[c], class_sigmas[c].as_slice()),
+                        None => (&omega_k, state.sigma_vals.as_slice()),
+                    };
                     let mut rng = StdRng::seed_from_u64(
                         master_seed
                             .wrapping_add(k as u64 * 100_000)
@@ -2046,9 +2660,9 @@ pub fn run_saem(
                         &state.theta,
                         &state.etas[i],
                         &state.kappas[i],
-                        &omega_k,
+                        omega_i,
                         Some(omega_iov_cur),
-                        &state.sigma_vals,
+                        sigma_i,
                     );
                     let (n_acc, n_prop, nll_new) = mh_kappa_steps(
                         &mut state.kappas[i],
@@ -2057,9 +2671,9 @@ pub fn run_saem(
                         model,
                         &state.theta,
                         &state.etas[i],
-                        &omega_k,
+                        omega_i,
                         omega_iov_cur,
-                        &state.sigma_vals,
+                        sigma_i,
                         state.kappa_step_scales[i],
                         &mut rng,
                     );
@@ -2083,9 +2697,11 @@ pub fn run_saem(
         // of the residual-scale typical value here: shifting η_RUV by −mean and
         // scaling every RUV-scaled σ by exp(mean) leaves each subject's residual
         // variance exactly unchanged while restoring E[η_RUV] = 0, so the next Ω
-        // M-step sees the true variance. Only done when a free RUV σ exists to
-        // absorb the shift (a FIXed σ already pins the mean — no degeneracy).
-        if let Some(kr) = model.residual_error_eta {
+        // M-step sees the true variance. Only done when every non-FREM residual σ
+        // is free to absorb the shift (`ruv_recenter_ok`); a FIXed component would
+        // leave R only partially rescaled and break the exact-invariance guarantee
+        // (it also already partially pins the mean — no full degeneracy).
+        if let (true, Some(kr)) = (ruv_recenter_ok, model.residual_error_eta) {
             recenter_ruv_eta(
                 &mut state.etas,
                 kr,
@@ -2095,14 +2711,45 @@ pub fn run_saem(
             );
         }
 
-        let mut eta_outer = DMatrix::zeros(n_eta, n_eta);
-        for eta in &state.etas {
-            let ev = DVector::from_column_slice(eta);
-            eta_outer += &ev * ev.transpose();
-        }
-        eta_outer /= n_subjects as f64;
+        // Mixture with `omega(k)` overrides (#987 review): the base Ω statistic
+        // must be built from the subjects that actually *share* the base entry —
+        // pooling an override class's members biases the base toward the
+        // mixture-wide spread. Entries with no base members keep their previous
+        // value. Without overrides this reduces to the pooled statistic below.
+        let base_partitioned = saem_mix
+            .as_ref()
+            .filter(|m| !m.mp.omega_override_addr.is_empty())
+            .map(|m| m.base_eta_outer(&state.etas, n_eta));
 
-        state.s2 = (1.0 - gamma_omega) * &state.s2 + gamma_omega * &eta_outer;
+        if let Some((mean, counts)) = base_partitioned {
+            for j in 0..n_eta {
+                for l in 0..n_eta {
+                    if counts[(j, l)] > 0 {
+                        state.s2[(j, l)] =
+                            (1.0 - gamma_omega) * state.s2[(j, l)] + gamma_omega * mean[(j, l)];
+                    }
+                }
+            }
+        } else {
+            let mut eta_outer = DMatrix::zeros(n_eta, n_eta);
+            for eta in &state.etas {
+                let ev = DVector::from_column_slice(eta);
+                eta_outer += &ev * ev.transpose();
+            }
+            eta_outer /= n_subjects as f64;
+
+            state.s2 = (1.0 - gamma_omega) * &state.s2 + gamma_omega * &eta_outer;
+        }
+
+        // Per-class Ω-override statistic: SA-updated on the *same* schedule as
+        // the base `s2` above — every iteration, including burn-in, so the first
+        // post-burn-in override update reflects the warmed-up chain rather than a
+        // single-iteration class mean. `omega_stat_active` is what gates whether
+        // `sync_base` *applies* it, mirroring the base Ω's burn-in gate below.
+        if let Some(mix) = saem_mix.as_mut() {
+            mix.mstep_omega_overrides(&state.etas, gamma_omega);
+            mix.omega_stat_active = k > omega_burnin;
+        }
 
         // ---- Step 2b: SA update for Omega_iov (IOV only) ----
         // s2_iov = (1 - γ) s2_iov + γ · (1/N_occ) Σᵢ Σₖ κᵢₖ κᵢₖᵀ
@@ -2180,7 +2827,7 @@ pub fn run_saem(
             // ω_RUV without bound (the original report saw ~49). No-op for a
             // well-posed fit; a correlation-preserving rescale keeps Ω PD.
             if let (Some(k), Some(log_cap)) = (model.residual_error_eta, ruv_omega_cap) {
-                apply_ruv_omega_cap(&mut state.omega_mat, k, log_cap);
+                apply_ruv_omega_cap(&mut state.omega_mat, k, log_cap, &init_params.omega_fixed);
             }
 
             // ---- Step 3b: Omega_iov (analytic, IOV only) ----
@@ -2228,7 +2875,7 @@ pub fn run_saem(
         if run_mstep {
             let mstep_maxiter = if k <= k1 { 3 } else { 5 }; // more precise in convergence phase
 
-            if use_closed_form_mstep {
+            if use_closed_form_mstep && saem_mix.is_none() {
                 // Closed-form EM M-step for log-mu-referenced thetas.
                 //
                 // Model: log(P_i) = log(TVP) + η_i, η_i ~ N(0, ω²).
@@ -2295,11 +2942,114 @@ pub fn run_saem(
                     mstep_maxiter,
                     options.scale_params,
                     &theta_packs_log_mask,
+                    // Closed-form branch is never taken for a mixture (disabled
+                    // above), so no class guard is needed here.
+                    None,
                 );
-                log_theta = theta_new;
-                log_sigma = sigma_new;
+                damp_mstep(&mut log_theta, &theta_new, gamma_mstep);
+                damp_mstep(&mut log_sigma, &sigma_new, gamma_mstep);
+            } else if use_closed_form_mstep {
+                // ---- Closed-form EM M-step under a mixture (#996) ----
+                //
+                // Runs the general class-resolved update
+                //     log theta_k += gamma * mean_{i : c_i = k}(eta_i)
+                // over `mix_mu_ref_pairs`, weighting each subject by a one-hot
+                // indicator of the class SAEM drew for it this E-step. That pair
+                // set is filtered to **class-shared** anchors upstream (see its
+                // construction for the measurement that rules out the switched
+                // case here), so in practice every class maps to one theta and
+                // this reduces to the pooled `mean_i(eta_i)` of the
+                // single-population branch above -- same accumulation order, same
+                // result. The class-resolved form is kept because it is what makes
+                // that reduction exact rather than a second copy of the formula.
+                let mix = saem_mix.as_ref().expect("mixture arm without saem_mix");
+                let resp: Vec<Vec<f64>> = mix
+                    .classes
+                    .iter()
+                    .map(|&c| {
+                        let mut r = vec![0.0f64; mix.n_classes];
+                        if c < r.len() {
+                            r[c] = 1.0;
+                        }
+                        r
+                    })
+                    .collect();
+                let mut temp_theta_lower = log_theta_lower.clone();
+                let mut temp_theta_upper = log_theta_upper.clone();
+                let mut n_pinned: u64 = 0;
+                for pair in &mix_mu_ref_pairs {
+                    let eta_idx = pair.eta_idx;
+                    let means = mixture_mu_ref_means(n_theta, &pair.theta_idx, &resp, |i, _c| {
+                        state.etas[i][eta_idx]
+                    });
+                    // Realised per-theta shift, so the eta re-centering below uses
+                    // the *clamped* delta (see the single-population branch).
+                    let mut delta = vec![0.0f64; n_theta];
+                    for (theta_idx, mean_eta) in means.iter().enumerate() {
+                        // `None` means no subject was drawn into any class this
+                        // theta serves (label switching, or a class that won nobody
+                        // this iteration): hold theta_k, let the next E-step move it.
+                        let Some(mean_eta) = mean_eta else { continue };
+                        if init_params
+                            .theta_fixed
+                            .get(theta_idx)
+                            .copied()
+                            .unwrap_or(false)
+                        {
+                            continue;
+                        }
+                        let before = log_theta[theta_idx];
+                        log_theta[theta_idx] = (before + gamma * mean_eta)
+                            .clamp(log_theta_lower[theta_idx], log_theta_upper[theta_idx]);
+                        delta[theta_idx] = log_theta[theta_idx] - before;
+                        // Pin so NLopt leaves the closed-form value unchanged.
+                        temp_theta_lower[theta_idx] = log_theta[theta_idx];
+                        temp_theta_upper[theta_idx] = log_theta[theta_idx];
+                        n_pinned += 1;
+                    }
+                    // Re-centre each subject by the shift applied to *its* class's
+                    // theta, so `log(P_i) = log(TVP_{c_i}) + eta_i` still holds for
+                    // the rest of this iteration's NLL cache refresh.
+                    for (i, e) in state.etas.iter_mut().enumerate() {
+                        let c = mix.classes[i];
+                        if let Some(&t) = pair.theta_idx.get(c) {
+                            e[eta_idx] -= delta[t];
+                        }
+                    }
+                }
+                mstep_grad_step_evals_saved += 2 * mstep_maxiter as u64 * n_pinned;
+
+                // NLopt for the remaining (non-mu-ref) thetas and sigma, still
+                // class-guarded so any class-switched theta outside the mu-ref set
+                // is estimated from its own members (#985).
+                let (theta_new, sigma_new) = theta_sigma_mstep_light(
+                    model,
+                    population,
+                    &state.etas,
+                    kappas_for_mstep,
+                    &log_theta,
+                    &log_sigma,
+                    &temp_theta_lower,
+                    &temp_theta_upper,
+                    &log_sigma_lower,
+                    &log_sigma_upper,
+                    n_theta,
+                    n_sigma,
+                    mstep_maxiter,
+                    options.scale_params,
+                    &theta_packs_log_mask,
+                    Some(MixMstep {
+                        classes: mix.classes.as_slice(),
+                        class_sigma_over: &mix_sigma_over,
+                    }),
+                );
+                damp_mstep(&mut log_theta, &theta_new, gamma_mstep);
+                damp_mstep(&mut log_sigma, &sigma_new, gamma_mstep);
             } else {
-                // mu_referencing = false: full NLopt M-step for all thetas + sigma (unchanged)
+                // mu_referencing = false (or a mixture whose class thetas could not
+                // be class-aware mu-referenced): full NLopt M-step for all thetas
+                // + sigma. For a mixture, `mstep_classes` guards each subject so
+                // class-switched thetas are estimated per class (#985).
                 let (theta_new, sigma_new) = theta_sigma_mstep_light(
                     model,
                     population,
@@ -2316,9 +3066,13 @@ pub fn run_saem(
                     mstep_maxiter,
                     options.scale_params,
                     &theta_packs_log_mask,
+                    saem_mix.as_ref().map(|m| MixMstep {
+                        classes: m.classes.as_slice(),
+                        class_sigma_over: &mix_sigma_over,
+                    }),
                 );
-                log_theta = theta_new;
-                log_sigma = sigma_new;
+                damp_mstep(&mut log_theta, &theta_new, gamma_mstep);
+                damp_mstep(&mut log_sigma, &sigma_new, gamma_mstep);
             }
 
             // #895: clamp any RUV-scaled residual σ that the M-step pushed past its
@@ -2337,6 +3091,30 @@ pub fn run_saem(
                 .map(|i| unpack_theta(i, log_theta[i]))
                 .collect();
             state.sigma_vals = log_sigma.iter().map(|&v| v.exp()).collect();
+
+            // ---- Step 4b: M-step for the mixing coefficients (#985) ----
+            // The mixing thetas do not enter the residual/η likelihood, so the
+            // θ/σ M-step above leaves them untouched. Update them from the SA
+            // responsibility average `r̄_ik` (constant closed form or covariate
+            // logistic fit), then re-sync `log_theta` for those indices.
+            if let Some(mix) = saem_mix.as_ref() {
+                crate::estimation::saem_mixture::mstep_mixing(
+                    model,
+                    population,
+                    mix,
+                    &mut state.theta,
+                    &init_params.theta_lower,
+                    &init_params.theta_upper,
+                    mstep_maxiter,
+                );
+                for &j in &mix.mixing_theta_idx {
+                    log_theta[j] = if theta_packs_log_mask[j] {
+                        state.theta[j].max(1e-12).ln()
+                    } else {
+                        state.theta[j]
+                    };
+                }
+            }
         }
 
         // ---- Update NLL cache (parallelized, needed for MH acceptance ratios) ----
@@ -2345,6 +3123,24 @@ pub fn run_saem(
             init_params.omega.eta_names.clone(),
             init_params.omega.diagonal,
         );
+        // Mixture (#985): refresh each class's Ω/σ from the just-updated base and
+        // evaluate every subject's cached NLL under its drawn class (guard + class
+        // Ω/σ), so the next iteration's MH acceptance baseline is class-consistent.
+        let mix_classes: Option<Vec<usize>> = saem_mix.as_ref().map(|m| m.classes.clone());
+        let (mix_omegas, mix_sigmas): (Vec<OmegaMatrix>, Vec<Vec<f64>>) =
+            if let Some(mix) = saem_mix.as_mut() {
+                mix.sync_base(&omega_upd, &state.sigma_vals);
+                (
+                    (0..mix.n_classes)
+                        .map(|c| mix.class_omega(c).clone())
+                        .collect(),
+                    (0..mix.n_classes)
+                        .map(|c| mix.class_sigma(c).to_vec())
+                        .collect(),
+                )
+            } else {
+                (Vec::new(), Vec::new())
+            };
         if n_kappa > 0 {
             // IOV NLL cache refresh — sequential rather than rayon-parallel.
             // individual_nll_iov is cheap (analytical PK, few occasions) and
@@ -2360,15 +3156,22 @@ pub fn run_saem(
             });
             let new_nlls: Vec<f64> = (0..n_subjects)
                 .map(|i| {
+                    let cls = mix_classes.as_ref().map(|c| c[i]);
+                    let _g =
+                        cls.map(|c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
+                    let (omega_i, sigma_i): (&OmegaMatrix, &[f64]) = match cls {
+                        Some(c) => (&mix_omegas[c], &mix_sigmas[c]),
+                        None => (&omega_upd, state.sigma_vals.as_slice()),
+                    };
                     individual_nll_iov(
                         model,
                         &population.subjects[i],
                         &state.theta,
                         &state.etas[i],
                         &state.kappas[i],
-                        &omega_upd,
+                        omega_i,
                         omega_iov_upd.as_ref(),
-                        &state.sigma_vals,
+                        sigma_i,
                     )
                 })
                 .collect();
@@ -2380,23 +3183,49 @@ pub fn run_saem(
             // pattern as the MH step above. Without it, the per-iter
             // refresh was allocating n_subj scratch buffers per outer
             // iter on TV-cov data.
+            let mix_omegas_ref = &mix_omegas;
+            let mix_sigmas_ref = &mix_sigmas;
+            let mix_classes_ref = mix_classes.as_ref();
             let new_nlls: Vec<f64> = state
                 .etas
                 .par_iter()
                 .enumerate()
                 .map_init(EventPkParams::default, |scratch, (i, eta)| {
+                    let cls = mix_classes_ref.map(|c| c[i]);
+                    let _g =
+                        cls.map(|c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
+                    let (omega_i, sigma_i): (&OmegaMatrix, &[f64]) = match cls {
+                        Some(c) => (&mix_omegas_ref[c], &mix_sigmas_ref[c]),
+                        None => (&omega_upd, state.sigma_vals.as_slice()),
+                    };
                     individual_nll_into(
                         model,
                         &population.subjects[i],
                         &state.theta,
                         eta,
-                        &omega_upd,
-                        &state.sigma_vals,
+                        omega_i,
+                        sigma_i,
                         scratch,
                     )
                 })
                 .collect();
             state.nll_cache = new_nlls;
+        }
+
+        // #903 review: re-anchor the iiv_on_ruv growth caps to the data-informed
+        // σ/ω_RUV reached by the end of the exploration phase, taking the *looser*
+        // of the init-based and settled-value-based ceilings. The caps are pure
+        // runaway backstops (~20× a sensible scale); anchoring them to the raw
+        // user *init* alone would spuriously clamp — and falsely warn about — a
+        // well-posed fit started from a σ/ω guess many-fold below the truth. Only
+        // ever loosens (`max`), so a genuine post-exploration runaway is still
+        // bounded, and it preserves the bit-for-bit trajectory of a fit that never
+        // approaches either ceiling.
+        if k == k1 {
+            reanchor_ruv_sigma_caps(&mut ruv_sigma_caps, &log_sigma, &log_sigma_upper);
+            if let Some(kr) = model.residual_error_eta {
+                ruv_omega_cap = reanchor_ruv_omega_cap(ruv_omega_cap, state.omega_mat[(kr, kr)]);
+            }
         }
 
         // ---- Adapt MH step sizes ----
@@ -2520,7 +3349,21 @@ pub fn run_saem(
     }
 
     // ---- Post-SAEM: build final parameters ----
-    let final_params = saem_state_to_params(&state, init_params, n_kappa);
+    let mut final_params = saem_state_to_params(&state, init_params, n_kappa);
+    // Mixture (#985): carry the estimated per-class Ω/σ overrides so the final
+    // OFV, EBEs, and covariance step see the mixture structure. `mp`'s base was
+    // synced from the final Ω/σ in the last NLL-cache refresh.
+    if let Some(mix) = saem_mix.as_ref() {
+        let mut mp = mix.mp.clone();
+        // SAEM holds the per-class σ overrides at their inits (warned above), so
+        // they are FIX as far as this fit is concerned. Marking them keeps the
+        // covariance step from building an FD-Hessian row for a coordinate SAEM
+        // never optimised — evaluated off its stationary point that row can push
+        // an otherwise-PD Hessian into the eigen-floor/SIR fallback and degrade
+        // every other SE (#987 review). Their SEs report as 0, matching FIX.
+        mp.sigma_override_fixed = vec![true; mp.sigma_override_addr.len()];
+        final_params.mixture = Some(mp);
+    }
 
     if combined_additive_sigma_at_floor(model, &final_params) {
         warnings
@@ -2582,36 +3425,62 @@ pub fn run_saem(
         }
     }
 
-    // ---- Final EBEs via inner loop (warm-started from SAEM etas) ----
-    let warm_etas: Vec<DVector<f64>> = state
-        .etas
-        .iter()
-        .map(|e| DVector::from_column_slice(e))
-        .collect();
-    let saem_final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
-    let (eta_hats, h_matrices, _, final_kappas) = run_inner_loop_warm(
-        model,
-        population,
-        &final_params,
-        options.inner_maxiter,
-        options.inner_tol,
-        Some(&warm_etas),
-        Some(&saem_final_mu_k),
-        0, // SAEM: no EBE convergence tracking
-        0, // SAEM final EBE is warm-started; no inner multi-start
-    );
-
-    // ---- Final OFV via FOCE approximation (for AIC/BIC comparability) ----
-    let ofv = 2.0
-        * pop_nll(
-            model,
-            population,
-            &final_params,
-            &eta_hats,
-            &h_matrices,
-            &final_kappas,
-            options.interaction,
-        );
+    // ---- Final EBEs + OFV ----
+    // For a mixture (#985), the population objective is the K-fold marginal
+    // `−2 Σ_i log Σ_k p_ik e^{−nll_ik}`, and the reported EBEs / κ̂ are the
+    // MIXEST class's — both produced by `mixture_ofv` (the same routine the
+    // FOCEI mixture path uses), so SAEM and FOCEI report comparable OFVs and
+    // per-subject posteriors. Otherwise the single-population FOCE approximation.
+    let (eta_hats, h_matrices, final_kappas, ofv, mixture_posteriors) =
+        if final_params.mixture.is_some() {
+            let meval = crate::estimation::mixture::mixture_ofv(
+                model,
+                population,
+                &final_params,
+                options,
+                None,
+            );
+            let posteriors = crate::estimation::outer_optimizer::MixturePosteriors {
+                pmix: meval.pmix.clone(),
+                mixest: meval.mixest.clone(),
+            };
+            (
+                meval.mixest_etas,
+                meval.mixest_h_mats,
+                meval.mixest_kappas,
+                meval.ofv,
+                Some(posteriors),
+            )
+        } else {
+            let warm_etas: Vec<DVector<f64>> = state
+                .etas
+                .iter()
+                .map(|e| DVector::from_column_slice(e))
+                .collect();
+            let saem_final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
+            let (eta_hats, h_matrices, _, final_kappas) = run_inner_loop_warm(
+                model,
+                population,
+                &final_params,
+                options.inner_maxiter,
+                options.inner_tol,
+                Some(&warm_etas),
+                Some(&saem_final_mu_k),
+                0, // SAEM: no EBE convergence tracking
+                0, // SAEM final EBE is warm-started; no inner multi-start
+            );
+            let ofv = 2.0
+                * pop_nll(
+                    model,
+                    population,
+                    &final_params,
+                    &eta_hats,
+                    &h_matrices,
+                    &final_kappas,
+                    options.interaction,
+                );
+            (eta_hats, h_matrices, final_kappas, ofv, None)
+        };
 
     // ---- Report OFV *before* the covariance step (#893) ----
     // SAEM only learns its OFV here (the final FOCE approximation); the covariance
@@ -2658,7 +3527,17 @@ pub fn run_saem(
     // ---- Post-fit conditional-distribution pass (opt-in, #257) ----
     // Characterise each subject's p(η_i | y_i; θ̂) by MCMC at the fixed
     // population parameters, warm-started from the EBE mode (`eta_hats`).
-    let cond_dist = if options.saem_conddist {
+    // The conditional-distribution pass samples p(η_i | y_i) at fixed θ̂ with a
+    // single-population target; it is not class-aware, so skip it for a mixture
+    // (#985) rather than characterise the posterior under the wrong class.
+    if options.saem_conddist && final_params.mixture.is_some() {
+        warnings.push(
+            "SAEM conditional-distribution pass (conddist) is not yet mixture-aware; skipping \
+             it for this mixture fit (#985)."
+                .to_string(),
+        );
+    }
+    let cond_dist = if options.saem_conddist && final_params.mixture.is_none() {
         if verbose {
             eprintln!(
                 "Running SAEM conditional-distribution pass ({} samples/subject, {} burn-in)...",
@@ -2704,12 +3583,538 @@ pub fn run_saem(
         bayes: None,
         cond_dist,
         packed_estimate: None,
+        left_init: None,
+        mixture_posteriors,
+        vi: None,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── #996 end-to-end helpers: a tiny 2-class mixture dataset ──────────
+    //
+    // Two weight groups with well-separated clearances, so the class draw is
+    // stable and a handful of iterations is enough to exercise the M-step.
+
+    /// Small 1-cpt IV dataset, `n_per` subjects at each of two weights.
+    fn mix996_csv(n_per: usize) -> String {
+        let mut s = String::from("ID,TIME,DV,AMT,EVID,CMT,WT\n");
+        let mut sid = 0;
+        for (g, &wt) in [60.0_f64, 90.0].iter().enumerate() {
+            let cl = if g == 0 { 1.0 } else { 3.0 };
+            for _ in 0..n_per {
+                sid += 1;
+                s.push_str(&format!("{sid},0,0,100,1,1,{wt}\n"));
+                for (ti, t) in [0.5_f64, 1.0, 2.0, 4.0].iter().enumerate() {
+                    let c = (100.0 / 10.0) * (-(cl / 10.0) * t).exp();
+                    let dv = c * (1.0 + 0.02 * ((sid + ti) as f64).sin());
+                    s.push_str(&format!("{sid},{t},{dv:.5},0,0,1,{wt}\n"));
+                }
+            }
+        }
+        s
+    }
+
+    fn mix996_pop(n_per: usize) -> Population {
+        use std::io::Write;
+        let csv = mix996_csv(n_per);
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(csv.as_bytes()).unwrap();
+        crate::io::datareader::read_nonmem_csv(f.path(), Some(&["WT"]), None).unwrap()
+    }
+
+    /// Two-class mixture. `v_expr` picks whether V carries a class-shared
+    /// mu-referenced ETA (`TVV * exp(ETA_V)`) or none (`TVV`).
+    fn mix996_model(v_expr: &str) -> CompiledModel {
+        let src = format!(
+            r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09 FIX
+  omega ETA_V ~ 0.04 FIX
+  sigma EPS ~ 0.04 FIX
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = {v_expr}
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+"
+        );
+        crate::parser::model_parser::parse_model_string(&src).expect("mixture model parses")
+    }
+
+    /// Single-population 1-cpt IV model whose `V` either carries a
+    /// mu-referenceable ETA or is a bare fixed-effect-only θ — the shape that
+    /// makes SAEM's η-frozen numerical M-step the *only* channel that can move
+    /// it (the FREM `FRD1` absorption fraction of #406).
+    fn noeta_model(v_expr: &str) -> CompiledModel {
+        let src = format!(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.09 FIX
+  omega ETA_V ~ 0.04 FIX
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = {v_expr}
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+"
+        );
+        crate::parser::model_parser::parse_model_string(&src).expect("model parses")
+    }
+
+    fn saem_noeta_warnings(v_expr: &str) -> Vec<String> {
+        let model = noeta_model(v_expr);
+        let pop = mix996_pop(3);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Saem;
+        opts.saem_n_exploration = 4;
+        opts.saem_n_convergence = 2;
+        opts.saem_seed = Some(406);
+        opts.run_covariance_step = false;
+        crate::api::fit(&model, &pop, &model.default_params, &opts)
+            .expect("SAEM Ok")
+            .warnings
+    }
+
+    /// An estimated θ with no ETA is not mu-referenced, so it never gets the
+    /// γ-damped closed-form shift and is left to the η-frozen numerical M-step.
+    /// SAEM must name it, the way IMP/IMPMAP already do (#406) — on the FREM
+    /// `iiv_on_ruv` reprex that channel drove `TVFRD1` 0.383 → 0.039 against
+    /// IMP 0.311 / IMPMAP 0.318 / NONMEM 0.394, and attaching an ETA recovered
+    /// 0.313.
+    #[test]
+    fn saem_warns_when_an_estimated_theta_has_no_eta() {
+        let ws = saem_noeta_warnings("TVV");
+        let hit = ws
+            .iter()
+            .find(|w| w.contains("NO associated ETA"))
+            .unwrap_or_else(|| panic!("expected the no-ETA advisory, got {ws:?}"));
+        assert!(
+            hit.starts_with("SAEM:") && hit.contains("TVV"),
+            "advisory must be SAEM-labelled and name TVV: {hit}"
+        );
+        assert!(
+            !hit.contains("TVCL"),
+            "TVCL is mu-referenced and must not be named: {hit}"
+        );
+    }
+
+    /// #1011 keys off the fixed-effect-only channel, not off "NLopt has some
+    /// free θ". With `mu_referencing = false` every θ goes through the numerical
+    /// M-step, but a θ that anchors a mu-reference (detected here even though the
+    /// shift is switched off) is not the biased channel — capping those at 3% for
+    /// the whole exploration phase was never anchored, so such a fit keeps the
+    /// pre-#1011 update and `mstep_damping` reports no effect.
+    #[test]
+    fn mstep_damping_is_inert_when_mu_referencing_is_off_but_every_theta_is_anchored() {
+        let model = noeta_model("TVV * exp(ETA_V)");
+        let pop = mix996_pop(3);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Saem;
+        opts.saem_n_exploration = 4;
+        opts.saem_n_convergence = 2;
+        opts.saem_seed = Some(406);
+        opts.run_covariance_step = false;
+        opts.mu_referencing = false;
+        opts.saem_mstep_damping = Some(0.01);
+        let ws = crate::api::fit(&model, &pop, &model.default_params, &opts)
+            .expect("SAEM Ok")
+            .warnings;
+        let hit = ws
+            .iter()
+            .find(|w| w.contains("`mstep_damping` was set but has no effect"))
+            .unwrap_or_else(|| panic!("expected the no-effect warning, got {ws:?}"));
+        // The reason must describe *this* fit. The single-population wording
+        // ("every estimated theta ... is mu-referenced") would be false here:
+        // `mu_referencing` is off, so nothing is mu-referenced and the numerical
+        // M-step does move every theta (#1012 review).
+        assert!(
+            hit.contains("`mu_referencing` is off"),
+            "the reason must name the mu_referencing = false case, not claim the \
+             thetas are mu-referenced: {hit}"
+        );
+    }
+
+    /// A `mstep_damping` that never passed the parser — a Rust caller building
+    /// `FitOptions` directly — must be clamped and reported, not applied: a
+    /// negative γ would walk θ/σ away from the M-step optimum every iteration.
+    #[test]
+    fn out_of_range_mstep_damping_from_a_programmatic_caller_is_clamped() {
+        let model = noeta_model("TVV");
+        let pop = mix996_pop(3);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Saem;
+        opts.saem_n_exploration = 4;
+        opts.saem_n_convergence = 2;
+        opts.saem_seed = Some(406);
+        opts.run_covariance_step = false;
+        opts.saem_mstep_damping = Some(-0.5);
+        let ws = crate::api::fit(&model, &pop, &model.default_params, &opts)
+            .expect("SAEM Ok")
+            .warnings;
+        let hit = ws
+            .iter()
+            .find(|w| w.contains("is outside (0, 1]"))
+            .unwrap_or_else(|| panic!("expected the clamp warning, got {ws:?}"));
+        assert!(
+            hit.contains("-0.5") && hit.contains(&format!("{MSTEP_SA_MAX_STEP}")),
+            "warning must name the rejected value and the substitute: {hit}"
+        );
+    }
+
+    /// The undamped assignment must be reproduced byte-for-byte at `γ >= 1.0`,
+    /// and a pinned dimension (where NLopt returns `new == cur`) must be a no-op
+    /// at every γ — those two properties are what keep a fit with no free
+    /// numerical θ identical to its pre-#1011 result.
+    #[test]
+    fn damp_mstep_is_a_robbins_monro_blend() {
+        let new = [1.0_f64, -2.0, 0.5];
+
+        // γ = 1 (and above) → straight assignment, bit-for-bit.
+        for g in [1.0_f64, 1.5] {
+            let mut cur = [10.0_f64, 10.0, 10.0];
+            damp_mstep(&mut cur, &new, g);
+            assert_eq!(cur, new, "γ = {g} must assign outright");
+        }
+
+        // 0 < γ < 1 → cur += γ·(new − cur).
+        let mut cur = [0.0_f64, 0.0, 0.0];
+        damp_mstep(&mut cur, &new, 0.25);
+        for (c, n) in cur.iter().zip(new.iter()) {
+            assert!(
+                (c - 0.25 * n).abs() < 1e-15,
+                "expected {}, got {c}",
+                0.25 * n
+            );
+        }
+
+        // γ = 0 → frozen.
+        let mut cur = [3.0_f64, 4.0, 5.0];
+        let before = cur;
+        damp_mstep(&mut cur, &new, 0.0);
+        assert_eq!(cur, before);
+
+        // A pinned dim (new == cur) is untouched at any γ — no drift from the
+        // closed-form mu-ref value the M-step was told to leave alone.
+        for g in [0.0_f64, 0.03, 0.5, 1.0] {
+            let mut cur = [7.0_f64; 3];
+            damp_mstep(&mut cur, &[7.0; 3], g);
+            assert_eq!(cur, [7.0; 3], "pinned dim moved at γ = {g}");
+        }
+    }
+
+    /// The SA schedule: off entirely when NLopt has no θ to estimate (so those
+    /// fits keep their pre-#1011 numbers), capped in exploration, full decaying
+    /// γ in convergence.
+    #[test]
+    fn mstep_sa_step_caps_exploration_and_frees_convergence() {
+        let d = MSTEP_SA_MAX_STEP;
+
+        // No numerically-estimated θ → undamped, in both phases.
+        assert_eq!(mstep_sa_step(false, true, 1.0, d), 1.0);
+        assert_eq!(mstep_sa_step(false, false, 0.002, d), 1.0);
+
+        // Exploration (γ = 1.0) is capped.
+        assert_eq!(mstep_sa_step(true, true, 1.0, d), d);
+        // ...but a γ already below the cap is not raised to it.
+        assert_eq!(mstep_sa_step(true, true, 0.001, d), 0.001);
+        // Convergence uses the full decaying γ, uncapped.
+        assert_eq!(mstep_sa_step(true, false, 0.5, d), 0.5);
+        assert_eq!(mstep_sa_step(true, false, 0.002, d), 0.002);
+
+        // `mstep_damping` overrides the cap.
+        assert_eq!(mstep_sa_step(true, true, 1.0, 0.005), 0.005);
+
+        // Its documented "off" value of 1.0 must restore the undamped pre-#1011
+        // assignment in BOTH phases — convergence included, where the schedule
+        // would otherwise still damp at γ = 1/(k−k1). Regression: `cap = 1.0`
+        // first only lifted the exploration cap, which left the reprex at
+        // TVFRD1 0.047 instead of its true undamped 0.039.
+        assert_eq!(mstep_sa_step(true, true, 1.0, 1.0), 1.0);
+        assert_eq!(mstep_sa_step(true, false, 0.002, 1.0), 1.0);
+        assert_eq!(mstep_sa_step(true, false, 0.5, 1.0), 1.0);
+
+        // The θ cap must be at least as tight as Ω's: the θ channel has no
+        // closed-form averaged alternative, so it is the more exposed of the two.
+        assert!(MSTEP_SA_MAX_STEP <= OMEGA_SA_MAX_STEP);
+    }
+
+    /// The damping gate (#1011). A mixture is vetoed outright; otherwise the
+    /// damping runs exactly when NLopt is left estimating a θ that anchors no
+    /// mu-reference, so an all-mu-referenced or all-`FIX` fit keeps its pre-#1011
+    /// numbers.
+    #[test]
+    fn damps_numerical_mstep_only_for_a_free_unanchored_theta() {
+        let free = [false, false, false];
+        let no_eta = [false, false, false];
+
+        // One free, unpinned θ anchoring no mu-reference (the #1011 shape) → damp.
+        assert!(damps_numerical_mstep(
+            false,
+            3,
+            &free,
+            &[0, 1],
+            &[true, true, false]
+        ));
+        // Every θ pinned by the closed-form mu-ref shift → nothing to damp.
+        assert!(!damps_numerical_mstep(false, 3, &free, &[0, 1, 2], &no_eta));
+        // Every θ FIXed → nothing to damp.
+        assert!(!damps_numerical_mstep(
+            false,
+            3,
+            &[true, true, true],
+            &[],
+            &no_eta
+        ));
+        // Mixed: the only unpinned θ is also FIXed → nothing to damp.
+        assert!(!damps_numerical_mstep(
+            false,
+            3,
+            &[false, false, true],
+            &[0, 1],
+            &no_eta
+        ));
+        // Nothing pinned, but every free θ anchors a mu-reference — the
+        // `mu_referencing = false` / identity-packed shape. Those θ go through
+        // the numerical M-step too, but they have the exact closed-form shift
+        // available, and damping ~85 exploration M-steps to 3% on a configuration
+        // none of the #1011 anchors covered would be a blind change: leave them
+        // undamped.
+        assert!(!damps_numerical_mstep(
+            false,
+            3,
+            &free,
+            &[],
+            &[true, true, true]
+        ));
+        // ...but an un-anchored θ in that same unpinned fit does trip it.
+        assert!(damps_numerical_mstep(
+            false,
+            3,
+            &free,
+            &[],
+            &[true, false, true]
+        ));
+        // No thetas at all (σ-only M-step) → undamped, as before #1011.
+        assert!(!damps_numerical_mstep(false, 0, &[], &[], &[]));
+
+        // A mixture is vetoed even with a free unpinned, un-anchored θ — its class
+        // typical values must separate from a common start before the class
+        // assignments settle, and damping that stalls it.
+        assert!(damps_numerical_mstep(false, 3, &free, &[], &no_eta));
+        assert!(!damps_numerical_mstep(true, 3, &free, &[], &no_eta));
+        assert!(!damps_numerical_mstep(true, 3, &free, &[0, 1], &no_eta));
+    }
+
+    /// `mstep_damping` is validated by the parser, but `FitOptions` is public:
+    /// a programmatic caller can hand `run_saem` a γ the parser would have
+    /// rejected. Those must be clamped, not applied — a negative γ steps θ/σ
+    /// away from the M-step optimum every iteration, and 0.0 freezes them.
+    #[test]
+    fn sanitize_mstep_damping_clamps_out_of_range_values() {
+        // In range → untouched.
+        for v in [f64::MIN_POSITIVE, 0.003, MSTEP_SA_MAX_STEP, 0.5, 1.0] {
+            assert_eq!(sanitize_mstep_damping(v), None, "{v} is in (0, 1]");
+        }
+        // Non-positive, or NaN → back to the calibrated default.
+        for v in [0.0, -0.0, -0.5, f64::NAN, f64::NEG_INFINITY] {
+            assert_eq!(
+                sanitize_mstep_damping(v),
+                Some(MSTEP_SA_MAX_STEP),
+                "{v} must fall back to the default"
+            );
+        }
+        // Above 1 already meant "off" → the documented off value. `+∞` belongs
+        // here, not with the fallbacks: a caller writing `f64::INFINITY` means
+        // "no damping", and the old `!is_finite()` test sent it to the *maximum*
+        // damping instead — the exact opposite of the intent (#1012 review).
+        for v in [1.0000001, 2.0, 1e9, f64::INFINITY] {
+            assert_eq!(
+                sanitize_mstep_damping(v),
+                Some(1.0),
+                "{v} must clamp to 1.0"
+            );
+        }
+        // ...and the clamped value must actually disable the damping.
+        assert_eq!(mstep_sa_step(true, true, 1.0, 1.0), 1.0);
+    }
+
+    /// ...and stays quiet once every estimated θ carries one, so the advisory
+    /// keeps its signal.
+    #[test]
+    fn saem_no_eta_advisory_silent_when_every_theta_is_mu_referenced() {
+        let ws = saem_noeta_warnings("TVV * exp(ETA_V)");
+        assert!(
+            !ws.iter().any(|w| w.contains("NO associated ETA")),
+            "no advisory when every θ is mu-referenced, got {ws:?}"
+        );
+    }
+
+    /// Warnings from a two-class mixture fit, whose `V` is either
+    /// mu-referenceable or a bare fixed-effect-only θ.
+    fn saem_mixture_warnings(v_expr: &str) -> Vec<String> {
+        let model = mix996_model(v_expr);
+        let pop = mix996_pop(3);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Saem;
+        opts.saem_n_exploration = 4;
+        opts.saem_n_convergence = 2;
+        opts.saem_seed = Some(406);
+        opts.run_covariance_step = false;
+        crate::api::fit(&model, &pop, &model.default_params, &opts)
+            .expect("SAEM Ok")
+            .warnings
+    }
+
+    /// The no-ETA advisory must not name a θ for which "add an ETA" is wrong
+    /// advice (#1012 review). Two such classes exist in `mix996_model`:
+    ///
+    /// * `MIXL` is a mixing coefficient. The numerical θ/σ M-step never moves it
+    ///   (it does not enter the residual/η likelihood, and `mstep_mixing`
+    ///   overwrites it from the responsibilities), and the parser *forbids* an η
+    ///   in a mixing expression — so both the diagnosis and the remedy are wrong.
+    /// * `TVCL1` / `TVCL2` are MIXNUM-switched class typical values. They carry
+    ///   `ETA_CL` in every arm; they are on the numerical M-step because #996
+    ///   routes them there, which the preceding advisory already says.
+    ///
+    /// With `V` mu-referenced, that leaves nothing for this advisory to say.
+    #[test]
+    fn saem_no_eta_advisory_skips_mixing_and_already_explained_class_thetas() {
+        let ws = saem_mixture_warnings("TVV * exp(ETA_V)");
+        assert!(
+            !ws.iter().any(|w| w.contains("NO associated ETA")),
+            "MIXL / TVCL1 / TVCL2 must not be flagged as ETA-less, got {ws:?}"
+        );
+        // The #996 message that explains TVCL1/TVCL2 must still be there — the
+        // filter suppresses the wrong message, not the right one.
+        assert!(
+            ws.iter()
+                .any(|w| w.contains("MIXNUM-switched typical value")
+                    && w.contains("TVCL1")
+                    && w.contains("TVCL2")),
+            "the #996 advisory must still name the switched class thetas, got {ws:?}"
+        );
+    }
+
+    /// ...and the filter keeps its signal: a genuinely fixed-effect-only θ in the
+    /// same mixture is still named, and named *alone*.
+    #[test]
+    fn saem_no_eta_advisory_still_fires_for_a_real_no_eta_theta_in_a_mixture() {
+        let ws = saem_mixture_warnings("TVV");
+        let hit = ws
+            .iter()
+            .find(|w| w.contains("NO associated ETA"))
+            .unwrap_or_else(|| panic!("expected the no-ETA advisory, got {ws:?}"));
+        assert!(hit.contains("TVV"), "must name TVV: {hit}");
+        for skipped in ["MIXL", "TVCL1", "TVCL2"] {
+            assert!(
+                !hit.contains(skipped),
+                "{skipped} must stay filtered out: {hit}"
+            );
+        }
+    }
+
+    #[test]
+    fn saem_mixture_uses_closed_form_for_class_shared_mu_ref() {
+        // Before #996 a mixture disabled mu-referencing wholesale, so even a
+        // class-*shared* typical value (V = TVV * exp(ETA_V)) went through the
+        // numerical M-step. It now takes the pooled closed-form shift, which the
+        // saved-evaluation counter reports.
+        let model = mix996_model("TVV * exp(ETA_V)");
+        let pop = mix996_pop(3);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Saem;
+        opts.saem_n_exploration = 4;
+        opts.saem_n_convergence = 2;
+        opts.saem_seed = Some(996);
+        opts.run_covariance_step = false;
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok");
+        assert!(
+            res.saem_mu_ref_m_step_evals_saved.unwrap_or(0) > 0,
+            "class-shared mu-ref must take the closed-form M-step: {:?}",
+            res.saem_mu_ref_m_step_evals_saved
+        );
+        // ...and the MIXNUM-switched clearances must be named as staying numerical.
+        assert!(
+            res.warnings.iter().any(|w| {
+                w.contains("MIXNUM-switched typical value")
+                    && w.contains("TVCL1")
+                    && w.contains("TVCL2")
+            }),
+            "expected the #996 switched-theta warning, got {:?}",
+            res.warnings
+        );
+    }
+
+    #[test]
+    fn saem_mixture_mu_referencing_off_suppresses_the_muref_advisories() {
+        // With mu_referencing off every θ goes through the numerical M-step by
+        // construction, so advising the user to switch estimator to get a
+        // closed-form shift they turned off is noise (#996 review).
+        let model = mix996_model("TVV * exp(ETA_V)");
+        let pop = mix996_pop(3);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Saem;
+        opts.saem_n_exploration = 4;
+        opts.saem_n_convergence = 2;
+        opts.saem_seed = Some(996);
+        opts.run_covariance_step = false;
+        opts.mu_referencing = false;
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok");
+        assert!(
+            !res.warnings
+                .iter()
+                .any(|w| w.contains("MIXNUM-switched typical value")),
+            "no switched-theta advisory with mu_referencing off, got {:?}",
+            res.warnings
+        );
+        assert!(
+            !res.warnings
+                .iter()
+                .any(|w| w.contains("packed on the identity scale")),
+            "no identity-pack advisory with mu_referencing off, got {:?}",
+            res.warnings
+        );
+    }
+
+    #[test]
+    fn saem_mixture_without_shared_mu_ref_stays_on_numerical_mstep() {
+        // Only the class-switched CL is mu-ref-shaped; V carries no ETA. SAEM
+        // takes no closed-form pair, so the whole θ/σ M-step stays numerical.
+        let model = mix996_model("TVV");
+        let pop = mix996_pop(3);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Saem;
+        opts.saem_n_exploration = 4;
+        opts.saem_n_convergence = 2;
+        opts.saem_seed = Some(996);
+        opts.run_covariance_step = false;
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok");
+        assert_eq!(res.saem_mu_ref_m_step_evals_saved, None);
+    }
     use crate::types::test_helpers::analytical_model;
     use crate::types::{GradientMethod, MuRef};
 
@@ -2724,6 +4129,127 @@ mod tests {
         assert_eq!(
             saem_final_ofv_report(-42.0),
             "SAEM completed. Final OFV = -42.0000"
+        );
+    }
+
+    #[test]
+    fn class_sigma_subst_is_none_without_overrides() {
+        assert!(class_sigma_subst(&[0.2, 0.3], &[]).is_none());
+    }
+
+    #[test]
+    fn class_sigma_subst_replaces_only_overridden_indices() {
+        let out = class_sigma_subst(&[0.2, 0.3, 0.4], &[(2, 0.9)]).unwrap();
+        assert_eq!(out, vec![0.2, 0.3, 0.9]);
+        // Out-of-range indices are ignored rather than panicking.
+        let out = class_sigma_subst(&[0.2], &[(7, 0.9)]).unwrap();
+        assert_eq!(out, vec![0.2]);
+    }
+
+    /// The mixture M-step objective must actually reach the `MIXNUM` branch: the
+    /// same subjects scored as class 1 vs class 2 must give different objective
+    /// values, since the model's typical clearance switches on `MIXNUM` (#987
+    /// review — this path was previously only exercised by slow-tests).
+    #[test]
+    fn obs_nll_sum_mix_class_guard_reaches_mixnum() {
+        const MIX: &str = r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(5.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS ~ 0.04
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+  sigma(2) EPS ~ 0.25
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let model = crate::parser::model_parser::parse_model_string(MIX).unwrap();
+        let mut csv = String::from(
+            "ID,TIME,DV,AMT,EVID,CMT
+",
+        );
+        for sid in 1..=2 {
+            csv.push_str(&format!(
+                "{sid},0,0,100,1,1
+"
+            ));
+            for t in [0.5_f64, 1.0, 2.0, 4.0] {
+                csv.push_str(&format!(
+                    "{sid},{t},{:.5},0,0,1
+",
+                    10.0 * (-0.1 * t).exp()
+                ));
+            }
+        }
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut f, csv.as_bytes()).unwrap();
+        let pop = crate::io::datareader::read_nonmem_csv(f.path(), None, None).unwrap();
+
+        let params = &model.default_params;
+        let etas = vec![vec![0.0], vec![0.0]];
+        let sigma = &params.sigma.values;
+        let no_over: Vec<Vec<(usize, f64)>> = vec![Vec::new(), Vec::new()];
+
+        let as_class1 = obs_nll_sum_mix(
+            &model,
+            &pop,
+            &params.theta,
+            sigma,
+            &etas,
+            MixMstep {
+                classes: &[0, 0],
+                class_sigma_over: &no_over,
+            },
+        );
+        let as_class2 = obs_nll_sum_mix(
+            &model,
+            &pop,
+            &params.theta,
+            sigma,
+            &etas,
+            MixMstep {
+                classes: &[1, 1],
+                class_sigma_over: &no_over,
+            },
+        );
+        assert!(as_class1.is_finite() && as_class2.is_finite());
+        assert!(
+            (as_class1 - as_class2).abs() > 1e-6,
+            "class guard must switch TVCL1/TVCL2: {as_class1} vs {as_class2}"
+        );
+
+        // A held `sigma(2)` override must be what a class-2 subject is scored
+        // under — not the free base σ the optimizer is moving.
+        let mix = crate::estimation::saem_mixture::SaemMixture::build(&model, params, &pop);
+        let over = mix.class_sigma_overrides();
+        assert_eq!(over[1].len(), 1, "sigma(2) override present");
+        let with_override = obs_nll_sum_mix(
+            &model,
+            &pop,
+            &params.theta,
+            sigma,
+            &etas,
+            MixMstep {
+                classes: &[1, 1],
+                class_sigma_over: &over,
+            },
+        );
+        assert!(
+            (with_override - as_class2).abs() > 1e-6,
+            "class-2 σ override must change the M-step objective"
         );
     }
 
@@ -2847,6 +4373,224 @@ mod tests {
             })
             .collect();
         m
+    }
+
+    // ── Class-aware mu-referencing for mixtures (#996) ──────────────────
+
+    /// `model_with_mu_refs` plus a `MixtureSpec` carrying `n_classes` and the
+    /// given class-aware anchors (`(eta, [theta per class])`).
+    fn model_with_mixture_mu_refs(
+        theta_names: &[&str],
+        eta_names: &[&str],
+        mu_refs: &[(&str, &str, bool)],
+        n_classes: usize,
+        class_refs: &[(&str, Vec<&str>)],
+    ) -> CompiledModel {
+        let mut m = model_with_mu_refs(theta_names, eta_names, mu_refs);
+        m.mixture = Some(crate::types::MixtureSpec {
+            n_classes,
+            mixing: Vec::new(),
+            logit_covariates: Vec::new(),
+            omega_overrides: Vec::new(),
+            sigma_overrides: Vec::new(),
+            mu_refs: class_refs
+                .iter()
+                .map(|(eta, thetas)| crate::types::MixtureMuRef {
+                    eta_name: (*eta).to_string(),
+                    theta_names: thetas.iter().map(|t| (*t).to_string()).collect(),
+                    log_transformed: true,
+                })
+                .collect(),
+        });
+        m
+    }
+
+    #[test]
+    fn mixture_mu_ref_pairs_empty_for_non_mixture() {
+        let m = model_with_mu_refs(&["TVCL"], &["ETA_CL"], &[("ETA_CL", "TVCL", true)]);
+        assert!(get_mixture_mu_ref_pairs(&m).is_empty());
+    }
+
+    #[test]
+    fn mixture_mu_ref_pairs_map_class_switched_anchors() {
+        let m = model_with_mixture_mu_refs(
+            &["TVCL1", "TVCL2", "TVV"],
+            &["ETA_CL"],
+            &[],
+            2,
+            &[("ETA_CL", vec!["TVCL1", "TVCL2"])],
+        );
+        assert_eq!(
+            get_mixture_mu_ref_pairs(&m),
+            vec![MixtureMuRefPair {
+                eta_idx: 0,
+                theta_idx: vec![0, 1]
+            }]
+        );
+    }
+
+    #[test]
+    fn mixture_mu_ref_pairs_broadcast_class_shared_theta() {
+        // A plain (non-switched) mu-ref in a mixture model becomes the same
+        // theta in every class slot, so one update rule covers both shapes.
+        let m = model_with_mixture_mu_refs(
+            &["TVCL1", "TVCL2", "TVV"],
+            &["ETA_CL", "ETA_V"],
+            &[("ETA_V", "TVV", true)],
+            3,
+            &[("ETA_CL", vec!["TVCL1", "TVCL2", "TVCL2"])],
+        );
+        assert_eq!(
+            get_mixture_mu_ref_pairs(&m),
+            vec![
+                MixtureMuRefPair {
+                    eta_idx: 0,
+                    theta_idx: vec![0, 1, 1]
+                },
+                MixtureMuRefPair {
+                    eta_idx: 1,
+                    theta_idx: vec![2, 2, 2]
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn mixture_mu_ref_pairs_drop_a_theta_claimed_by_a_second_eta() {
+        // Two etas anchored to the same typical value: the shift loops apply one
+        // update per pair, so keeping both would move TVCL twice in a single
+        // iteration. The first eta keeps it; the second pair is dropped (#996
+        // review).
+        let m = model_with_mixture_mu_refs(
+            &["TVCL", "TVV"],
+            &["ETA_CL", "ETA_V"],
+            &[("ETA_CL", "TVCL", true), ("ETA_V", "TVCL", true)],
+            2,
+            &[],
+        );
+        let pairs = get_mixture_mu_ref_pairs(&m);
+        assert_eq!(
+            pairs,
+            vec![MixtureMuRefPair {
+                eta_idx: 0,
+                theta_idx: vec![0, 0]
+            }]
+        );
+        // Every theta is claimed at most once across the whole pair set.
+        let mut all: Vec<usize> = pairs
+            .iter()
+            .flat_map(|p| p.theta_idx.iter().copied())
+            .collect();
+        all.sort_unstable();
+        let n = all.len();
+        all.dedup();
+        assert_eq!(all.len(), 1, "theta claimed once, got {n} slots");
+    }
+
+    #[test]
+    fn mixture_mu_ref_pairs_drop_a_partially_overlapping_class_anchor_set() {
+        // ETA_CL claims TVCL1/TVCL2; ETA_V's class anchors reuse TVCL2, so its
+        // whole pair is dropped rather than double-shifting that theta.
+        let m = model_with_mixture_mu_refs(
+            &["TVCL1", "TVCL2", "TVV1"],
+            &["ETA_CL", "ETA_V"],
+            &[],
+            2,
+            &[
+                ("ETA_CL", vec!["TVCL1", "TVCL2"]),
+                ("ETA_V", vec!["TVV1", "TVCL2"]),
+            ],
+        );
+        assert_eq!(
+            get_mixture_mu_ref_pairs(&m),
+            vec![MixtureMuRefPair {
+                eta_idx: 0,
+                theta_idx: vec![0, 1]
+            }]
+        );
+    }
+
+    #[test]
+    fn mixture_mu_ref_pairs_exclude_additive_and_unknown_thetas() {
+        let m = model_with_mixture_mu_refs(
+            &["TVCL1", "TVCL2", "TVV"],
+            &["ETA_CL", "ETA_V"],
+            // additive: excluded, like the single-population `get_mu_ref_pairs`
+            &[("ETA_V", "TVV", false)],
+            2,
+            &[("ETA_CL", vec!["TVCL1", "MISSING"])],
+        );
+        assert!(get_mixture_mu_ref_pairs(&m).is_empty());
+    }
+
+    #[test]
+    fn mixture_mu_ref_means_reduce_to_pooled_mean_when_theta_shared() {
+        // Degenerate oracle: every class anchors on theta 0, so the weighted
+        // per-class update must equal the classical pooled mean(η) exactly —
+        // including bit-for-bit, since the accumulation order is the same.
+        let etas = [0.3f64, -0.1, 0.7, -0.4];
+        let resp = vec![
+            vec![1.0, 0.0],
+            vec![0.0, 1.0],
+            vec![1.0, 0.0],
+            vec![0.0, 1.0],
+        ];
+        let means = mixture_mu_ref_means(2, &[0, 0], &resp, |i, _c| etas[i]);
+        let pooled = etas.iter().sum::<f64>() / etas.len() as f64;
+        assert_eq!(means[0], Some(pooled));
+        assert_eq!(means[1], None, "theta 1 is served by no class");
+    }
+
+    #[test]
+    fn mixture_mu_ref_means_reduce_to_pooled_mean_under_soft_responsibilities() {
+        // The same degeneracy under IMP-style fractional responsibilities:
+        // every subject's weights sum to 1, so the shared-theta update is the
+        // responsibility-weighted average of the per-class η means.
+        let eta = |i: usize, c: usize| [[0.2f64, 0.4], [-0.6, -0.2]][i][c];
+        let resp = vec![vec![0.75, 0.25], vec![0.4, 0.6]];
+        let means = mixture_mu_ref_means(1, &[0, 0], &resp, eta);
+        let expect = (0.75 * 0.2 + 0.25 * 0.4 + 0.4 * -0.6 + 0.6 * -0.2) / 2.0;
+        assert!((means[0].unwrap() - expect).abs() < 1e-15);
+    }
+
+    #[test]
+    fn mixture_mu_ref_means_split_by_class_membership() {
+        // Hard classes: subjects 0,2 in class 1 (theta 0); 1,3 in class 2
+        // (theta 1). Each theta moves by its own members' mean only.
+        let etas = [0.3f64, -0.1, 0.7, -0.5];
+        let resp = vec![
+            vec![1.0, 0.0],
+            vec![0.0, 1.0],
+            vec![1.0, 0.0],
+            vec![0.0, 1.0],
+        ];
+        let means = mixture_mu_ref_means(2, &[0, 1], &resp, |i, _c| etas[i]);
+        assert!((means[0].unwrap() - 0.5).abs() < 1e-15);
+        assert!((means[1].unwrap() - (-0.3)).abs() < 1e-15);
+    }
+
+    #[test]
+    fn mixture_mu_ref_means_hold_theta_for_an_empty_class() {
+        // Label switching: class 2 won zero subjects this iteration, so its
+        // theta has no η mean and must be held rather than dragged.
+        let etas = [0.2f64, 0.4];
+        let resp = vec![vec![1.0, 0.0], vec![1.0, 0.0]];
+        let means = mixture_mu_ref_means(2, &[0, 1], &resp, |i, _c| etas[i]);
+        assert!((means[0].unwrap() - 0.3).abs() < 1e-15);
+        assert_eq!(means[1], None);
+    }
+
+    #[test]
+    fn mixture_mu_ref_means_weight_classes_by_responsibility() {
+        // Soft responsibilities with distinct class thetas: each theta gets the
+        // responsibility-weighted mean of its own class's per-class η means.
+        let eta = |i: usize, c: usize| [[0.1f64, 0.9], [0.3, 0.5]][i][c];
+        let resp = vec![vec![0.8, 0.2], vec![0.25, 0.75]];
+        let means = mixture_mu_ref_means(2, &[0, 1], &resp, eta);
+        let e0 = (0.8 * 0.1 + 0.25 * 0.3) / (0.8 + 0.25);
+        let e1 = (0.2 * 0.9 + 0.75 * 0.5) / (0.2 + 0.75);
+        assert!((means[0].unwrap() - e0).abs() < 1e-15);
+        assert!((means[1].unwrap() - e1).abs() < 1e-15);
     }
 
     #[test]
@@ -3012,10 +4756,12 @@ mod tests {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0],
             occasions: vec![],
             obs_l2: Vec::new(),
             dose_occasions: vec![],
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };
@@ -3128,10 +4874,12 @@ mod tests {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0, 0],
             occasions: vec![],
             obs_l2: Vec::new(),
             dose_occasions: vec![],
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };
@@ -3203,608 +4951,6 @@ mod tests {
         assert!(unpacked[2] < 0.0);
     }
 
-    /// `obs_nll_subject_grad` summed over subjects must match the reference
-    /// forward-FD of `obs_nll_sum` to within 1e-4 relative tolerance for all
-    /// non-pinned packed parameters (theta + sigma).
-    #[test]
-    fn obs_nll_subject_grad_matches_obs_nll_sum_fd() {
-        use crate::types::{DoseEvent, Population};
-        use std::collections::HashMap;
-
-        let model = analytical_model(GradientMethod::Auto);
-
-        let make_subj = |id: &str, obs: f64| Subject {
-            id: id.into(),
-            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-            obs_times: vec![1.0, 4.0, 8.0],
-            obs_raw_times: Vec::new(),
-            observations: vec![obs, obs * 0.6, obs * 0.3],
-            obs_cmts: vec![1, 1, 1],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            cens: vec![0, 0, 0],
-            occasions: vec![],
-            obs_l2: Vec::new(),
-            dose_occasions: vec![],
-            fremtype: Vec::new(),
-            obs_records: vec![],
-        };
-
-        let population = Population {
-            subjects: vec![
-                make_subj("1", 8.0),
-                make_subj("2", 5.0),
-                make_subj("3", 11.0),
-            ],
-            covariate_names: Vec::new(),
-            dv_column: "DV".into(),
-            input_columns: vec![],
-            exclusions: None,
-            warnings: vec![],
-        };
-
-        let theta = vec![1.5f64, 20.0]; // CL, V
-        let sigma_values = vec![0.2f64]; // proportional
-        let etas: Vec<Vec<f64>> = vec![vec![0.0], vec![0.1], vec![-0.1]];
-        let n_theta = 2;
-        let n_sigma = 1;
-        let n = n_theta + n_sigma;
-
-        // Compute reference gradient via forward-FD of obs_nll_sum.
-        let f0 = obs_nll_sum(&model, &population, &theta, &sigma_values, &etas);
-        let h = 1e-5;
-        let mut ref_grad = vec![0.0f64; n];
-        // Theta perturbations (in natural scale).
-        for i in 0..n_theta {
-            let mut theta_p = theta.clone();
-            theta_p[i] += h;
-            let fp = obs_nll_sum(&model, &population, &theta_p, &sigma_values, &etas);
-            // FD in natural scale; convert to log-packed space (d/d_log = theta * d/d_theta)
-            ref_grad[i] = theta[i] * (fp - f0) / h;
-        }
-        // Sigma perturbation (in natural scale; convert to log-packed).
-        {
-            let mut sigma_p = sigma_values.clone();
-            sigma_p[0] += h;
-            let fp = obs_nll_sum(&model, &population, &theta, &sigma_p, &etas);
-            ref_grad[n_theta] = sigma_values[0] * (fp - f0) / h;
-        }
-
-        // Compute gradient via obs_nll_subject_grad summed over subjects.
-        let mask: Vec<bool> = theta.iter().map(|_| true).collect(); // all log-packed
-        let lo = vec![-1e30f64; n];
-        let hi = vec![1e30f64; n];
-        let mut total_nll = 0.0f64;
-        let mut total_grad = vec![0.0f64; n];
-        let mut scratch = EventPkParams::default();
-        for (i, subject) in population.subjects.iter().enumerate() {
-            let (nll_i, grad_i) = obs_nll_subject_grad(
-                &model,
-                subject,
-                &theta,
-                &sigma_values,
-                &etas[i],
-                &mask,
-                &lo,
-                &hi,
-                n_theta,
-                n_sigma,
-                &mut scratch,
-            );
-            total_nll += nll_i;
-            for (g, gi) in total_grad.iter_mut().zip(grad_i.iter()) {
-                *g += gi;
-            }
-        }
-
-        assert!(
-            (total_nll - f0).abs() < 1e-10,
-            "nll mismatch: {} vs {}",
-            total_nll,
-            f0
-        );
-
-        for j in 0..n {
-            let rel = if ref_grad[j].abs() > 1e-10 {
-                (total_grad[j] - ref_grad[j]).abs() / ref_grad[j].abs()
-            } else {
-                (total_grad[j] - ref_grad[j]).abs()
-            };
-            assert!(
-                rel < 1e-4,
-                "grad[{j}]: obs_nll_subject_grad={:.6e}, ref={:.6e}, rel={:.2e}",
-                total_grad[j],
-                ref_grad[j],
-                rel
-            );
-        }
-    }
-
-    /// IOV M-step gradient (`obs_nll_subject_grad_iov`) must match the forward-FD
-    /// of `obs_nll_subject_into_iov` in log-packed space. This guards the
-    /// analytical gradient that the gradient-based M-step would use — it is not
-    /// exercised by the default BOBYQA M-step (derivative-free), so without this
-    /// direct test the function is untested. Single subject, 2 occasions, κ on CL.
-    #[test]
-    fn obs_nll_subject_grad_iov_matches_fd() {
-        use crate::types::{
-            BloqMethod, CompiledModel, DoseEvent, ErrorModel, ErrorSpec, GradientMethod,
-            ModelParameters, OmegaMatrix, PkModel, PkParams, ScalingSpec, SigmaVector, Subject,
-        };
-        use std::collections::HashMap;
-
-        // Minimal IOV model: CL = TVCL·exp(ETA_CL + KAPPA_CL), V = TVV.
-        let model = CompiledModel {
-            name: "iov_grad_test".into(),
-            pk_model: PkModel::OneCptIv,
-            error_model: ErrorModel::Proportional,
-            error_spec: ErrorSpec::Single(ErrorModel::Proportional),
-            residual_correlations: Vec::new(),
-            pk_param_fn: Box::new(
-                |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
-                    let mut p = PkParams::default();
-                    let kappa = if eta.len() > 1 { eta[1] } else { 0.0 };
-                    p.values[0] = theta[0] * (eta[0] + kappa).exp();
-                    p.values[1] = theta[1];
-                    p
-                },
-            ),
-            n_theta: 2,
-            n_eta: 1,
-            n_epsilon: 1,
-            n_kappa: 1,
-            kappa_names: vec!["KAPPA_CL".into()],
-            theta_names: vec!["TVCL".into(), "TVV".into()],
-            eta_names: vec!["ETA_CL".into()],
-            indiv_param_names: vec!["CL".into(), "V".into()],
-            indiv_param_partials: crate::types::IndivParamPartials::empty(),
-            default_params: ModelParameters {
-                theta: vec![5.0, 50.0],
-                theta_names: vec!["TVCL".into(), "TVV".into()],
-                theta_lower: vec![0.1, 5.0],
-                theta_upper: vec![50.0, 500.0],
-                theta_fixed: vec![false; 2],
-                omega: OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]),
-                omega_fixed: vec![false],
-                sigma: SigmaVector {
-                    values: vec![0.05],
-                    names: vec!["PROP_ERR".into()],
-                },
-                sigma_fixed: vec![false],
-                omega_iov: Some(OmegaMatrix::from_diagonal(&[0.04], vec!["KAPPA_CL".into()])),
-                kappa_fixed: vec![false],
-            },
-            omega_init_as_sd: vec![false],
-            sigma_init_as_sd: vec![false],
-            kappa_init_as_sd: vec![false],
-            mu_refs: HashMap::new(),
-            kappa_mu_refs: HashMap::new(),
-            tv_fn: None,
-            pk_indices: vec![0, 1],
-            eta_map: vec![0],
-            pk_idx_f64: vec![0.0, 1.0],
-            sel_flat: vec![1.0, 0.0],
-            ode_spec: None,
-            dose_attr_map: Default::default(),
-            diffusion_theta_start: None,
-            diffusion_state_indices: Vec::new(),
-            bloq_method: BloqMethod::Drop,
-            referenced_covariates: Vec::new(),
-            gradient_method: GradientMethod::Fd,
-            parse_warnings: Vec::new(),
-            has_conditional_eta_params: false,
-            eta_param_info: Vec::new(),
-            theta_transform: Vec::new(),
-            #[cfg(feature = "nn")]
-            covariate_nns: Vec::new(),
-            scaling: ScalingSpec::None,
-            log_transform: false,
-            dv_pre_logged: false,
-            derived_exprs: Vec::new(),
-            output_columns: Vec::new(),
-            #[cfg(feature = "survival")]
-            endpoints: HashMap::new(),
-            frem_config: None,
-            residual_error_eta: None,
-            analytical_init: Vec::new(),
-            analytic_readout: None,
-            ruv_magnitude: None,
-            absorption_ode_equivalent: None,
-        };
-
-        // One subject, 2 occasions (times 1–3 occ 1, 4–6 occ 2), one dose each.
-        let subject = Subject {
-            id: "S1".into(),
-            doses: vec![
-                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
-                DoseEvent::new(3.5, 100.0, 1, 0.0, false, 0.0),
-            ],
-            obs_times: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-            obs_raw_times: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-            observations: vec![36.0, 28.0, 21.0, 34.0, 26.0, 19.0],
-            obs_cmts: vec![1; 6],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            cens: vec![0; 6],
-            occasions: vec![1, 1, 1, 2, 2, 2],
-            obs_l2: Vec::new(),
-            dose_occasions: vec![1, 2],
-            fremtype: Vec::new(),
-            obs_records: Vec::new(),
-        };
-
-        let theta = vec![5.0f64, 50.0];
-        let sigma = vec![0.05f64];
-        let eta = vec![0.1f64];
-        let kappas: Vec<Vec<f64>> = vec![vec![0.05], vec![-0.05]]; // one per occasion
-        let n_theta = 2;
-        let n_sigma = 1;
-        let n = n_theta + n_sigma;
-
-        let mut scratch = EventPkParams::default();
-        let (nll, grad) = obs_nll_subject_grad_iov(
-            &model,
-            &subject,
-            &theta,
-            &sigma,
-            &eta,
-            &kappas,
-            &[true, true, true],
-            &[-1e30; 3],
-            &[1e30; 3],
-            n_theta,
-            n_sigma,
-            &mut scratch,
-        );
-
-        // Reference: forward-FD of obs_nll_subject_into_iov in log-packed space.
-        let f0 = obs_nll_subject_into_iov(
-            &model,
-            &subject,
-            &theta,
-            &sigma,
-            &eta,
-            &kappas,
-            &mut scratch,
-        );
-        assert!((nll - f0).abs() < 1e-10, "nll mismatch: {nll} vs {f0}");
-
-        let h = 1e-6;
-        let mut ref_grad = vec![0.0f64; n];
-        for i in 0..n_theta {
-            let mut tp = theta.clone();
-            tp[i] += h;
-            let fp = obs_nll_subject_into_iov(
-                &model,
-                &subject,
-                &tp,
-                &sigma,
-                &eta,
-                &kappas,
-                &mut scratch,
-            );
-            ref_grad[i] = theta[i] * (fp - f0) / h; // d/d_log = theta · d/d_theta
-        }
-        {
-            let mut sp = sigma.clone();
-            sp[0] += h;
-            let fp = obs_nll_subject_into_iov(
-                &model,
-                &subject,
-                &theta,
-                &sp,
-                &eta,
-                &kappas,
-                &mut scratch,
-            );
-            ref_grad[n_theta] = sigma[0] * (fp - f0) / h;
-        }
-
-        for j in 0..n {
-            let rel = if ref_grad[j].abs() > 1e-8 {
-                (grad[j] - ref_grad[j]).abs() / ref_grad[j].abs()
-            } else {
-                (grad[j] - ref_grad[j]).abs()
-            };
-            assert!(
-                rel < 1e-4,
-                "grad[{j}]: analytical={:.6e}, fd={:.6e}, rel={:.2e}",
-                grad[j],
-                ref_grad[j],
-                rel
-            );
-        }
-    }
-
-    /// Per-CMT (multi-endpoint) M-step gradient must match the forward-FD of
-    /// `obs_nll_sum` — the correctness gate for the per-CMT `dvar_df` /
-    /// `dvar_dlogsigma` score terms. Two endpoints with *different* error
-    /// models (proportional PK on CMT=1, additive PD on CMT=2) so a single
-    /// error model would give the wrong Jacobian for one endpoint.
-    #[test]
-    fn obs_nll_subject_grad_per_cmt_matches_fd() {
-        use crate::parser::model_parser::parse_model_string;
-        use crate::types::{DoseEvent, Population};
-        use std::collections::HashMap;
-
-        let model = parse_model_string(
-            r"
-[parameters]
-  theta TVCL(1.0, 0.1, 10.0)
-  theta TVV(10.0, 1.0, 100.0)
-  theta TVKE0(0.5, 0.05, 5.0)
-  omega ETA_CL ~ 0.04
-  sigma PROP_ERR_PK ~ 0.10 (sd)
-  sigma ADD_ERR_PD  ~ 0.50 (sd)
-
-[individual_parameters]
-  CL  = TVCL * exp(ETA_CL)
-  V   = TVV
-  KE0 = TVKE0
-
-[structural_model]
-  ode(states=[central, effect])
-
-[odes]
-  d/dt(central) = -CL/V * central
-  d/dt(effect)  =  KE0 * (central/V - effect)
-
-[scaling]
-  y[CMT=1] = central / V
-  y[CMT=2] = effect
-
-[error_model]
-  CMT=1: DV ~ proportional(PROP_ERR_PK)
-  CMT=2: DV ~ additive(ADD_ERR_PD)
-",
-        )
-        .expect("per-CMT ODE model parses");
-
-        // obs at CMT=1 (PK) and CMT=2 (PD), interleaved.
-        let make_subj = |id: &str, scale: f64| Subject {
-            id: id.into(),
-            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-            obs_times: vec![1.0, 1.0, 2.0, 2.0, 4.0, 4.0],
-            obs_raw_times: Vec::new(),
-            observations: vec![
-                8.0 * scale,
-                2.0 * scale,
-                6.0 * scale,
-                3.0 * scale,
-                4.0 * scale,
-                3.5 * scale,
-            ],
-            obs_cmts: vec![1, 2, 1, 2, 1, 2],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            cens: vec![0; 6],
-            occasions: vec![],
-            obs_l2: Vec::new(),
-            dose_occasions: vec![],
-            fremtype: Vec::new(),
-            obs_records: vec![],
-        };
-        let population = Population {
-            subjects: vec![make_subj("1", 1.0), make_subj("2", 1.1)],
-            covariate_names: Vec::new(),
-            dv_column: "DV".into(),
-            input_columns: vec![],
-            exclusions: None,
-            warnings: vec![],
-        };
-
-        let theta = vec![1.0f64, 10.0, 0.5];
-        let sigma_values = vec![0.10f64, 0.50];
-        let etas: Vec<Vec<f64>> = vec![vec![0.0], vec![0.05]];
-        let n_theta = 3;
-        let n_sigma = 2;
-        let n = n_theta + n_sigma;
-
-        // Reference gradient: forward-FD of obs_nll_sum, in log-packed space.
-        let f0 = obs_nll_sum(&model, &population, &theta, &sigma_values, &etas);
-        let h = 1e-6;
-        let mut ref_grad = vec![0.0f64; n];
-        for i in 0..n_theta {
-            let mut tp = theta.clone();
-            tp[i] += h;
-            let fp = obs_nll_sum(&model, &population, &tp, &sigma_values, &etas);
-            ref_grad[i] = theta[i] * (fp - f0) / h;
-        }
-        for k in 0..n_sigma {
-            let mut sp = sigma_values.clone();
-            sp[k] += h;
-            let fp = obs_nll_sum(&model, &population, &theta, &sp, &etas);
-            ref_grad[n_theta + k] = sigma_values[k] * (fp - f0) / h;
-        }
-
-        // Analytical gradient: sum of per-subject obs_nll_subject_grad.
-        let mask = vec![true; n_theta];
-        let lo = vec![-1e30f64; n];
-        let hi = vec![1e30f64; n];
-        let mut total_nll = 0.0f64;
-        let mut total_grad = vec![0.0f64; n];
-        let mut scratch = EventPkParams::default();
-        for (i, subject) in population.subjects.iter().enumerate() {
-            let (nll_i, grad_i) = obs_nll_subject_grad(
-                &model,
-                subject,
-                &theta,
-                &sigma_values,
-                &etas[i],
-                &mask,
-                &lo,
-                &hi,
-                n_theta,
-                n_sigma,
-                &mut scratch,
-            );
-            total_nll += nll_i;
-            for (g, gi) in total_grad.iter_mut().zip(grad_i.iter()) {
-                *g += gi;
-            }
-        }
-
-        assert!(
-            (total_nll - f0).abs() < 1e-8,
-            "nll mismatch: {total_nll} vs {f0}"
-        );
-        for j in 0..n {
-            let rel = if ref_grad[j].abs() > 1e-8 {
-                (total_grad[j] - ref_grad[j]).abs() / ref_grad[j].abs()
-            } else {
-                (total_grad[j] - ref_grad[j]).abs()
-            };
-            assert!(
-                rel < 1e-3,
-                "per-CMT grad[{j}]: analytical={:.6e}, fd={:.6e}, rel={:.2e}",
-                total_grad[j],
-                ref_grad[j],
-                rel
-            );
-        }
-    }
-
-    /// Dense residual-covariance M-step gradient must match FD of the same
-    /// dense observation NLL. This exercises the `block_sigma` SAEM path, which
-    /// deliberately routes through full FD because the analytic scalar-RUV score
-    /// terms do not apply to off-diagonal R blocks.
-    #[test]
-    fn obs_nll_subject_grad_block_sigma_cross_endpoint_matches_fd() {
-        use crate::parser::model_parser::parse_model_string;
-        use crate::types::{DoseEvent, Population};
-        use std::collections::HashMap;
-
-        let model = parse_model_string(
-            r"
-[parameters]
-  theta TVCL(1.0, 0.1, 10.0)
-  theta TVV(10.0, 1.0, 100.0)
-  omega ETA_CL ~ 0.04
-  block_sigma (PROP_ERR_UNBOUND, PROP_ERR_TOTAL) = [
-    0.04,
-    0.01, 0.09
-  ]
-
-[individual_parameters]
-  CL  = TVCL * exp(ETA_CL)
-  V   = TVV
-
-[structural_model]
-  ode(states=[central])
-
-[odes]
-  d/dt(central) = -CL/V * central
-
-[scaling]
-  y[CMT=1] = 2.0 * central / V
-  y[CMT=2] = central / V
-
-[error_model]
-  CMT=1: DV ~ proportional(PROP_ERR_TOTAL)
-  CMT=2: DV ~ proportional(PROP_ERR_UNBOUND)
-",
-        )
-        .expect("cross-endpoint block_sigma ODE model parses");
-
-        let subject = Subject {
-            id: "1".into(),
-            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-            obs_times: vec![1.0, 1.0, 2.0, 2.0],
-            obs_raw_times: Vec::new(),
-            observations: vec![17.0, 8.0, 15.0, 7.0],
-            obs_cmts: vec![1, 2, 1, 2],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            cens: vec![0; 4],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-        };
-        let population = Population {
-            subjects: vec![subject.clone()],
-            covariate_names: Vec::new(),
-            dv_column: "DV".into(),
-            input_columns: vec![],
-            exclusions: None,
-            warnings: vec![],
-        };
-
-        let theta = vec![1.0f64, 10.0];
-        let sigma_values = vec![0.20f64, 0.30];
-        let etas: Vec<Vec<f64>> = vec![vec![0.05]];
-        let n_theta = 2;
-        let n_sigma = 2;
-        let n = n_theta + n_sigma;
-
-        let f0 = obs_nll_sum(&model, &population, &theta, &sigma_values, &etas);
-        let h = 1e-6;
-        let mut ref_grad = vec![0.0f64; n];
-        for i in 0..n_theta {
-            let mut tp = theta.clone();
-            tp[i] += h;
-            let fp = obs_nll_sum(&model, &population, &tp, &sigma_values, &etas);
-            ref_grad[i] = theta[i] * (fp - f0) / h;
-        }
-        for k in 0..n_sigma {
-            let mut sp = sigma_values.clone();
-            sp[k] += h;
-            let fp = obs_nll_sum(&model, &population, &theta, &sp, &etas);
-            ref_grad[n_theta + k] = sigma_values[k] * (fp - f0) / h;
-        }
-
-        let mask = vec![true; n_theta];
-        let lo = vec![-1e30f64; n];
-        let hi = vec![1e30f64; n];
-        let mut scratch = EventPkParams::default();
-        let (nll, grad) = obs_nll_subject_grad(
-            &model,
-            &subject,
-            &theta,
-            &sigma_values,
-            &etas[0],
-            &mask,
-            &lo,
-            &hi,
-            n_theta,
-            n_sigma,
-            &mut scratch,
-        );
-
-        assert!((nll - f0).abs() < 1e-8, "nll mismatch: {nll} vs {f0}");
-        for j in 0..n {
-            let rel = if ref_grad[j].abs() > 1e-8 {
-                (grad[j] - ref_grad[j]).abs() / ref_grad[j].abs()
-            } else {
-                (grad[j] - ref_grad[j]).abs()
-            };
-            assert!(
-                rel < 1e-4,
-                "block_sigma grad[{j}]: fd-path={:.6e}, ref={:.6e}, rel={:.2e}",
-                grad[j],
-                ref_grad[j],
-                rel
-            );
-        }
-    }
-
     // ── IOV kappa MH: rejection restores kappa ─────────────────────────────
 
     /// With `step_scale = 0` the proposal is always identical to the current
@@ -3831,10 +4977,12 @@ mod tests {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0; 4],
             occasions: vec![1u32, 1, 2, 2],
             obs_l2: Vec::new(),
             dose_occasions: vec![1u32],
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };
@@ -3945,10 +5093,12 @@ mod tests {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0, 0],
             occasions: vec![],
             obs_l2: Vec::new(),
             dose_occasions: vec![],
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };
@@ -4054,11 +5204,15 @@ mod tests {
     }
 
     #[test]
-    fn ruv_sigma_caps_never_loosen_existing_upper() {
-        // If the model's own upper bound is tighter than log σ₀ + growth, the cap
-        // takes the tighter of the two — it can only ever tighten σ, never loosen.
+    fn ruv_sigma_caps_defer_to_tighter_user_upper_bound() {
+        // If the model's own upper bound is tighter than log σ₀ + growth, NLopt
+        // already enforces it, so no RUV growth cap is carried — a σ converging to
+        // its own bound must not be mis-flagged as hitting the iiv_on_ruv cap (#903).
         let caps = compute_ruv_sigma_caps(true, None, &[0.0], &[1.0], &[false]);
-        assert_eq!(caps[0], Some(1.0));
+        assert_eq!(caps[0], None);
+        // A growth cap strictly below the upper bound is still carried.
+        let caps = compute_ruv_sigma_caps(true, None, &[0.0], &[5.0], &[false]);
+        assert_eq!(caps[0], Some(SAEM_RUV_SIGMA_LN_GROWTH));
     }
 
     // ---- #904: iiv_on_ruv eta re-centering ----
@@ -4097,6 +5251,23 @@ mod tests {
         }
         // Non-RUV coordinate untouched.
         assert_eq!(etas[0][0], 0.3);
+    }
+
+    #[test]
+    fn ruv_recenter_allowed_only_when_all_residual_sigma_free() {
+        // No iiv_on_ruv → never re-center.
+        assert!(!ruv_recenter_allowed(false, None, &[false]));
+        // Single free residual σ → OK.
+        assert!(ruv_recenter_allowed(true, None, &[false]));
+        // Combined error, additive FIXed (index 1) → NOT OK: scaling only the free
+        // proportional σ would leave the fixed additive part uncompensated and
+        // break the residual-variance invariance (the #903 review finding).
+        assert!(!ruv_recenter_allowed(true, None, &[false, true]));
+        // FREM EPSCOV (index 1, always FIX) is exempt — a free PK residual σ at 0
+        // still re-centers.
+        assert!(ruv_recenter_allowed(true, Some(1), &[false, true]));
+        // FREM EPSCOV exempt, but a second *real* residual σ FIXed (index 2) blocks.
+        assert!(!ruv_recenter_allowed(true, Some(1), &[false, true, true]));
     }
 
     #[test]
@@ -4141,9 +5312,34 @@ mod tests {
         let mut om = DMatrix::from_row_slice(2, 2, &[0.3, 0.05, 0.05, 0.2]);
         let before = om.clone();
         // cap = exp(log(0.3)+3) ≈ 6.0, well above 0.3 → no change.
-        let clamped = apply_ruv_omega_cap(&mut om, 0, 0.3_f64.ln() + SAEM_RUV_OMEGA_LN_GROWTH);
+        let clamped = apply_ruv_omega_cap(
+            &mut om,
+            0,
+            0.3_f64.ln() + SAEM_RUV_OMEGA_LN_GROWTH,
+            &[false, false],
+        );
         assert!(!clamped);
         assert_eq!(om, before);
+    }
+
+    #[test]
+    fn apply_ruv_omega_cap_leaves_fixed_offdiagonal_untouched() {
+        // ω_RUV (index 0) runs away to 9.0 with a covariance to a FIXed eta (index
+        // 1). The cap must pull the diagonal down but leave the user-declared FIXed
+        // covariance Ω[0,1] exactly as-is (#903 review), never silently rescale it.
+        let cov = 0.5_f64;
+        let mut om = DMatrix::from_row_slice(2, 2, &[9.0, cov, cov, 0.2]);
+        let log_cap = 0.2977886_f64.ln() + SAEM_RUV_OMEGA_LN_GROWTH;
+        let clamped = apply_ruv_omega_cap(&mut om, 0, log_cap, &[false, true]);
+        assert!(clamped);
+        assert!((om[(0, 0)] - log_cap.exp()).abs() < 1e-9);
+        // FIXed off-diagonal unchanged (both symmetric entries).
+        assert_eq!(om[(0, 1)], cov);
+        assert_eq!(om[(1, 0)], cov);
+        // Diagonal shrank while the off-diagonal held, so it stays PD here
+        // (det = 5.98·0.2 − 0.25 > 0).
+        let det = om[(0, 0)] * om[(1, 1)] - om[(0, 1)] * om[(1, 0)];
+        assert!(det > 0.0);
     }
 
     #[test]
@@ -4153,7 +5349,7 @@ mod tests {
         let mut om = DMatrix::from_row_slice(2, 2, &[9.0, cov, cov, 0.2]);
         let corr_before = om[(0, 1)] / (om[(0, 0)] * om[(1, 1)]).sqrt();
         let log_cap = 0.2977886_f64.ln() + SAEM_RUV_OMEGA_LN_GROWTH; // ≈ log(5.98)
-        let clamped = apply_ruv_omega_cap(&mut om, 0, log_cap);
+        let clamped = apply_ruv_omega_cap(&mut om, 0, log_cap, &[false, false]);
         assert!(clamped);
         // Diagonal pulled down to the cap.
         assert!((om[(0, 0)] - log_cap.exp()).abs() < 1e-9);
@@ -4164,6 +5360,49 @@ mod tests {
         assert_eq!(om[(0, 1)], om[(1, 0)]);
         let det = om[(0, 0)] * om[(1, 1)] - om[(0, 1)] * om[(1, 0)];
         assert!(det > 0.0 && om[(0, 0)] > 0.0);
+    }
+
+    // ---- #903 review: end-of-exploration cap re-anchoring ----
+
+    #[test]
+    fn reanchor_ruv_sigma_caps_loosens_for_low_init_only() {
+        // σ init 0.01 (log ≈ -4.6): init cap = -4.6 + 3 = -1.6 (≈ 0.2). If the fit
+        // legitimately settled near σ = 0.3 (log ≈ -1.2) by end of exploration, the
+        // cap must loosen to -1.2 + 3 = 1.8, not clamp the well-posed fit at 0.2.
+        let ln_init = 0.01_f64.ln();
+        let mut caps = vec![Some(ln_init + SAEM_RUV_SIGMA_LN_GROWTH)];
+        let log_sigma_settled = vec![0.3_f64.ln()];
+        reanchor_ruv_sigma_caps(&mut caps, &log_sigma_settled, &[5.0]);
+        assert!((caps[0].unwrap() - (0.3_f64.ln() + SAEM_RUV_SIGMA_LN_GROWTH)).abs() < 1e-12);
+
+        // If σ never moved above its init, the cap is unchanged (only loosens).
+        let mut caps = vec![Some(ln_init + SAEM_RUV_SIGMA_LN_GROWTH)];
+        reanchor_ruv_sigma_caps(&mut caps, &[ln_init], &[5.0]);
+        assert!((caps[0].unwrap() - (ln_init + SAEM_RUV_SIGMA_LN_GROWTH)).abs() < 1e-12);
+
+        // Never loosens past the user's own upper bound.
+        let mut caps = vec![Some(ln_init + SAEM_RUV_SIGMA_LN_GROWTH)];
+        reanchor_ruv_sigma_caps(&mut caps, &[10.0], &[2.0]);
+        assert_eq!(caps[0], Some(2.0));
+
+        // `None` (uncapped σ) stays `None`.
+        let mut caps = vec![None];
+        reanchor_ruv_sigma_caps(&mut caps, &[0.0], &[5.0]);
+        assert_eq!(caps[0], None);
+    }
+
+    #[test]
+    fn reanchor_ruv_omega_cap_loosens_only() {
+        let ln_init = 0.01_f64.ln();
+        let cap = Some(ln_init + SAEM_RUV_OMEGA_LN_GROWTH);
+        // Settled ω_RUV = 0.3 → loosen to log(0.3) + growth.
+        let out = reanchor_ruv_omega_cap(cap, 0.3);
+        assert!((out.unwrap() - (0.3_f64.ln() + SAEM_RUV_OMEGA_LN_GROWTH)).abs() < 1e-12);
+        // Settled below init → unchanged.
+        assert_eq!(reanchor_ruv_omega_cap(cap, 0.01), cap);
+        // No cap stays none; non-positive variance is a no-op.
+        assert_eq!(reanchor_ruv_omega_cap(None, 0.3), None);
+        assert_eq!(reanchor_ruv_omega_cap(cap, 0.0), cap);
     }
 
     // ---- #895: MH mixing warning ----
@@ -4198,10 +5437,12 @@ mod tests {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0],
             occasions: vec![],
             obs_l2: Vec::new(),
             dose_occasions: vec![],
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         }

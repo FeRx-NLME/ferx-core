@@ -35,19 +35,32 @@
 # is governed by that record's CL. A decision at t_g with a 1-h infusion splits the
 # day into two segments because the infusion end (t_g + 1) is a break that is NOT a
 # data record:
-#   * the infusion window (t_g, t_g + 1] carries LOCF PK forward from the obs at
-#     t_g, which belongs to occasion g -> CL_g;
-#   * the decay window (t_g + 1, t_{g+1}] ends at the next obs record (t_{g+1}),
-#     which belongs to occasion g+1 -> CL_{g+1} (the end-of-interval value).
-# So each day's infusion runs on THIS occasion's CL and the between-dose decay runs
-# on the NEXT occasion's CL. (This is the exact per-occasion analogue of the
-# renal-covariate anchor `vanco_renal_mrgsolve.R`, which does the same two-segment
-# split with a covariate-driven CL instead of an occasion-driven one; empirically
-# it is the only one of the three plausible conventions that reproduces ferx's
-# troughs — the other two miss by ~1e-2 to ~1 mg/L.) The R loop below integrates
-# each day as those two windows with the matching piecewise-constant CL, so
-# mrgsolve's CL trajectory is identical to ferx's per-segment PK and the two engines
-# see the same trough trajectory.
+#   * the infusion window (t_g, t_g + 1] is terminated by a NON-record, so it is
+#     governed by the next record ahead — the obs at t_{g+1}, which belongs to
+#     occasion g+1 -> CL_{g+1};
+#   * the decay window (t_g + 1, t_{g+1}] ends at that same obs record -> also
+#     CL_{g+1}.
+# So the WHOLE day (t_g, t_{g+1}] runs on the NEXT occasion's CL. (This is the
+# exact per-occasion analogue of the renal-covariate anchor
+# `vanco_renal_mrgsolve.R`, which applies the same rule with a covariate-driven CL
+# instead of an occasion-driven one.) The R loop below still integrates each day as
+# two windows — the split is needed for the infusion *rate*, not for CL — feeding
+# both the same piecewise-constant CL, so mrgsolve's CL trajectory is identical to
+# ferx's per-segment PK and the two engines see the same trough trajectory.#
+# --- why this changed (#1073) -------------------------------------------------
+# This kit used to run the infusion sub-window on the CURRENT occasion's CL,
+# reproducing ferx's pre-#1073 LOCF carry, which stretched a dose record's
+# snapshot across the infusion end. That was a defect: NONMEM runs $PK at data
+# records only, and an infusion end is not one, so it can neither open a new
+# occasion nor change the governing parameters. The rule is anchored against
+# NONMEM 7.6.0 at 14.9 OFV (`nonmem_anchor/tvcov_lag_saltation*`).
+#
+# The header above used to argue the old split was right because it was "the only
+# one of three plausible conventions that reproduces ferx's troughs". That is
+# selecting the reference to match the code under test — the two then agree BY
+# CONSTRUCTION and the anchor cannot see the defect. The convention is now taken
+# from NONMEM's rule instead, and `expected.md` was regenerated from it.
+
 #
 # Regenerate:  Rscript vanco_iov_mrgsolve.R   (run from this directory)
 # Requires:    mrgsolve (tested with 1.7.2) + a C/C++ toolchain (JIT compile).
@@ -118,12 +131,14 @@ for (k in seq_along(dec_t)) {
   rows[[k]] <- data.frame(decision = k - 1, time = t0, kappa = kappa[k],
                           cl = cl_at[k], trough = trough, dose = dose_at[k])
   # Advance state across this day as TWO segments (matches ferx's per-segment PK):
-  #   1. infusion window [t0, t0 + tinf] on THIS occasion's CL (cl_at[k]),
-  #   2. decay window    [t0 + tinf, t0 + 24] on the NEXT occasion's CL (cl_at[k+1],
-  #      end-of-interval). The last decision has no following window.
+  #   1. infusion window [t0, t0 + tinf] and
+  #   2. decay window    [t0 + tinf, t0 + 24]
+  # both on the NEXT occasion's CL (cl_at[k+1]): the infusion end is not a data
+  # record (#1073), so the obs at t_{g+1} governs the whole day. The split exists
+  # for the infusion RATE only. The last decision has no following window.
   if (k < length(dec_t)) {
     seg1 <- as.data.frame(mod |>
-      param(CL = cl_at[k], V = V) |>
+      param(CL = cl_at[k + 1], V = V) |>
       init(CENT = st_cent) |>
       ev(amt = dose_at[k], rate = dose_at[k] / tinf, cmt = 1) |>
       mrgsim(start = 0, end = tinf, delta = tinf))

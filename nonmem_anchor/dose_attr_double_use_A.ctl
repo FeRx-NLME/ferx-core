@@ -1,0 +1,36 @@
+$PROBLEM ferx #993 anchor A -- MODERN convention: F1 applied at the dose ONLY
+$INPUT ID TIME DV MDV EVID AMT CMT
+$DATA data.csv IGNORE=@
+
+$SUBROUTINE ADVAN13 TOL=9
+
+$MODEL
+  COMP=(DEPOT, DEFDOSE)
+  COMP=(CENTRAL)
+
+$PK
+  CL = THETA(1)
+  V  = THETA(2)
+  KA = THETA(3)
+  K  = CL/V
+  F1 = THETA(4)
+
+$DES
+  DADT(1) = -KA*A(1)
+  DADT(2) =  KA*A(1) - K*A(2)
+
+$ERROR
+  IPRED = A(2)/V
+  Y = IPRED*(1+EPS(1))
+
+$THETA
+  (5.0 FIX)   ; CL
+  (50.0 FIX)  ; V
+  (1.5 FIX)   ; KA
+  (0.5 FIX)   ; F1
+
+$OMEGA 0 FIX
+$SIGMA 0.01 FIX
+
+$ESTIMATION MAXEVAL=0 METHOD=1 INTER
+$TABLE ID TIME IPRED NOPRINT ONEHEADER FILE=sdtab.tab

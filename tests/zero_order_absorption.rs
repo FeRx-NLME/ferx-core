@@ -31,7 +31,7 @@ const ZERO_ORDER_MODEL: &str = r#"
   theta TVV(50.0,   5.0, 500.0)
   theta TVDUR(4.0, 0.05,  24.0)
 
-  omega ETA_CL ~ 0.0
+  omega ETA_CL ~ 0.0 FIX
 
   sigma PROP_ERR ~ 0.01 (sd)
 

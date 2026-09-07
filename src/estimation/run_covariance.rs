@@ -64,7 +64,7 @@ use std::path::Path;
 /// `iov_column` name from the model file's `[fit_options]` block, which does
 /// not survive on a `CompiledModel`. When the caller passes `None` for both
 /// `model` and `population`, this function parses the full model file and
-/// threads `iov_column` into `read_nonmem_csv`. When the caller supplies
+/// threads `iov_column` into the model-routed reader. When the caller supplies
 /// `Some(model)` for an IOV model but leaves `population = None`, there is no
 /// source of `iov_column`, so `run_covariance` returns an error rather than
 /// silently dropping occasion parsing. Workaround: pass both `Some(model)` and
@@ -74,12 +74,34 @@ use std::path::Path;
 /// - `fit`: the maximum-likelihood fit to compute a covariance for.
 /// - `model`: pre-compiled model. When `None`, re-parsed from `fit.model_path`.
 /// - `population`: dataset. When `None`, re-read from `fit.data_path` (with the
-///   `iov_column` constraint above for IOV models).
+///   `iov_column` constraint above for IOV models), routed by the model so a
+///   joint model's event rows come back as event records (#1199). A supplied
+///   population read without that routing is rejected (`E_ENDPOINT_UNROUTED`).
 /// - `options`: covariance-relevant fields read are `covariance_method`,
 ///   `fd_hessian_step`, `cov_inner_tol`, `interaction`, `mu_referencing`, the
 ///   inner-loop settings, and `cancel`. `run_covariance_step` on `options` is
 ///   **ignored** — calling this function is itself the request to run the step.
 pub fn run_covariance(
+    fit: &FitResult,
+    model: Option<&CompiledModel>,
+    population: Option<&Population>,
+    options: &FitOptions,
+) -> Result<FitResult, String> {
+    // #1212, same last hop as `fit()`: this call's `ode_reltol` / `ode_method` / … have to
+    // reach the integrator, and the spec they would otherwise be read off carries the
+    // parse-time values. It matters more here than almost anywhere else — the covariance step
+    // is a second difference of the reconverged OFV, so running it at a *different* accuracy
+    // than the fit that produced the estimates is exactly how a plausible-looking standard
+    // error comes out wrong. The scope covers the whole call, including the re-parse and
+    // re-read paths, and puts the per-subject fan-out on a pool whose workers carry the same
+    // settings — arming alone would reach this thread and leave the workers on the model
+    // file's.
+    crate::api::with_fit_ode_scope(options, || {
+        run_covariance_scoped(fit, model, population, options)
+    })?
+}
+
+fn run_covariance_scoped(
     fit: &FitResult,
     model: Option<&CompiledModel>,
     population: Option<&Population>,
@@ -156,9 +178,9 @@ pub fn run_covariance(
                     ));
                 }
             }
-            let p = crate::io::datareader::read_nonmem_csv_mapped(
+            let p = crate::api::read_population_routed_by(
+                model_ref,
                 Path::new(path),
-                None,
                 iov_column_from_parse.as_deref(),
                 &column_map_from_parse,
             )?;
@@ -174,6 +196,13 @@ pub fn run_covariance(
     // `Result` form used at the adaptive chokepoint rather than the
     // `predict()`/`simulate()` panic.
     crate::diagnostics::first_error(&crate::api::check_dose_compartments(model_ref, pop_ref))?;
+    // …and the endpoint-routing precondition (#1199), as `fit()` enforces it: a
+    // population read model-blind carries a joint model's event rows as Gaussian
+    // observations, and the covariance step would be taken on the Gaussian half of
+    // the likelihood. The re-read above is routed; this covers a supplied population.
+    crate::diagnostics::first_error(&crate::api::check_endpoint_routing(
+        model_ref, pop_ref, true,
+    ))?;
 
     // --- Sanity-check dimensions ------------------------------------------
     if model_ref.n_eta != fit.omega.nrows() {
@@ -287,6 +316,8 @@ pub fn run_covariance(
     // --- Build the refreshed FitResult ------------------------------------
     let (se_theta, se_omega, se_sigma, se_kappa) =
         extract_standard_errors(&covariance_matrix, &params);
+    let se_residual_correlations =
+        crate::api::extract_residual_correlation_se(&covariance_matrix, &params);
     let (cov_eigenvalues, cov_condition_number) = cov_diagnostics(covariance_matrix.as_ref());
     // Bayesian fits never run a Hessian covariance step; guard so a covariance
     // request against a Bayesian fit reports NotRequested rather than Failed.
@@ -299,6 +330,7 @@ pub fn run_covariance(
     out.se_omega = se_omega;
     out.se_sigma = se_sigma;
     out.se_kappa = se_kappa;
+    out.se_residual_correlations = se_residual_correlations;
     out.cov_eigenvalues = cov_eigenvalues;
     out.cov_condition_number = cov_condition_number;
     out.covariance_status = covariance_status;

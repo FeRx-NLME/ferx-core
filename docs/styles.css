@@ -34,12 +34,20 @@ pre code {
   max-width: 100%;
 }
 
-/* On very small screens, give the table back its normal display
-   (display:block breaks td widths for simple narrow tables) */
+/* Above the mobile breakpoint, keep the scroll container but let a narrow
+   table keep its natural width: `width: fit-content` resolves to the table's
+   max-content width when that fits, and to the available width when it does
+   not — so simple tables still size to their cells (the reason the old rule
+   reverted to `display: table`), while a table whose *min-content* is wider
+   than the column scrolls inside itself instead of running under the
+   right-hand "On this page" TOC. `overflow-x` is inert on `display: table`,
+   which is why the previous rule never actually clipped anything. */
 @media (min-width: 640px) {
   .page-columns table,
   .content table {
-    display: table;
+    display: block;
+    width: fit-content;
+    max-width: 100%;
     overflow-x: auto;
   }
 }

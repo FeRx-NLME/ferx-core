@@ -23,7 +23,7 @@
 # transitions; a real study would also observe the PK to pin CL down.
 #
 # Requires the `markov` cargo feature. Run:
-#   cargo run --release --features markov -- examples/ctmm_pd_2state.ferx --data data/ctmm_pd_2state.csv
+#   cargo run --release -p ferx-cli --features ferx-core/markov -- examples/ctmm_pd_2state.ferx --data data/ctmm_pd_2state.csv
 
 [parameters]
   theta TVCL(1.0, 0.01, 100.0)      # clearance (drives the concentration decay)

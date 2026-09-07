@@ -213,7 +213,7 @@ fn nonmem_2cpt_iv_compartment_amounts() {
   theta V1(10.0, FIX)
   theta Q(1.0, FIX)
   theta V2(20.0, FIX)
-  omega ETA_CL ~ 0.0
+  omega ETA_CL ~ 0.0 FIX
   sigma PROP   ~ 0.01
 
 [individual_parameters]
@@ -265,7 +265,7 @@ fn nonmem_3cpt_iv_compartment_amounts() {
   theta V2(20.0, FIX)
   theta Q3(1.5, FIX)
   theta V3(30.0, FIX)
-  omega ETA_CL ~ 0.0
+  omega ETA_CL ~ 0.0 FIX
   sigma PROP   ~ 0.04 (sd)
 
 [individual_parameters]
@@ -324,7 +324,7 @@ fn nonmem_2cpt_oral_compartment_amounts() {
   theta Q(1.0, FIX)
   theta V2(20.0, FIX)
   theta KA(1.0, FIX)
-  omega ETA_CL ~ 0.0
+  omega ETA_CL ~ 0.0 FIX
   sigma PROP   ~ 0.01
 
 [individual_parameters]
@@ -381,7 +381,7 @@ fn nonmem_3cpt_oral_compartment_amounts() {
   theta Q3(1.5, FIX)
   theta V3(30.0, FIX)
   theta KA(1.0, FIX)
-  omega ETA_CL ~ 0.0
+  omega ETA_CL ~ 0.0 FIX
   sigma PROP   ~ 0.04 (sd)
 
 [individual_parameters]

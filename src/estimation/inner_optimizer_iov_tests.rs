@@ -64,10 +64,12 @@ fn gradient_route_summary_reports_ode_iov_analytic_route() {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0; 4],
             occasions: vec![1, 1, 2, 2],
             obs_l2: Vec::new(),
             dose_occasions: vec![1, 2],
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         }],
@@ -191,10 +193,12 @@ fn tvcov_ltbs_reports_analytic_inner() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; 5],
         occasions: vec![1; 5],
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -258,10 +262,12 @@ fn iov_fd_fallback_warning_reports_subject_reason() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; 4],
         occasions: vec![1, 1, 2, 2],
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -282,10 +288,12 @@ fn iov_fd_fallback_warning_reports_subject_reason() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; n_wide],
         occasions: (1..=n_wide as u32).collect(),
         obs_l2: Vec::new(),
         dose_occasions: (1..=n_wide as u32).collect(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -328,10 +336,12 @@ fn iov_fd_fallback_warning_silent_for_uniform_all_fd() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; 4],
         occasions: vec![1, 1, 2, 2],
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -378,10 +388,12 @@ fn iov_inner_subject_route_admits_steady_state_lagtime() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; 4],
         occasions: vec![1, 1, 2, 2],
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -421,10 +433,12 @@ fn iov_inner_subject_route_admits_modeled_dose_steady_state() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; 4],
         occasions: vec![1, 1, 2, 2],
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -464,10 +478,12 @@ fn iov_fd_reason_attributes_modeled_dose_missing_slot() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; 4],
         occasions: vec![1, 1, 2, 2],
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -503,10 +519,12 @@ fn iov_fd_reason_attributes_ss_input_rate() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; 4],
         occasions: vec![1, 1, 2, 2],
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -545,10 +563,12 @@ fn iov_fd_reason_attributes_infusion_into_absorption() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; 4],
         occasions: vec![1, 1, 2, 2],
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -591,10 +611,12 @@ fn transit_twin_ss_forcing_is_analytic_under_iov() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; 4],
         occasions: vec![1, 1, 2, 2],
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -613,6 +635,8 @@ fn make_iov_model() -> CompiledModel {
     let omega = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
     let omega_iov = OmegaMatrix::from_diagonal(&[0.04], vec!["KAPPA_CL".into()]);
     let default_params = crate::types::ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0, 50.0],
         theta_names: vec!["TVCL".into(), "TVV".into()],
         theta_lower: vec![0.01, 1.0],
@@ -627,8 +651,10 @@ fn make_iov_model() -> CompiledModel {
         sigma_fixed: vec![false],
         omega_iov: Some(omega_iov),
         kappa_fixed: vec![false],
+        mixture: None,
     };
     CompiledModel {
+        covariate_model: None,
         name: "iov_test".into(),
         pk_model: PkModel::OneCptIv,
         error_model: ErrorModel::Proportional,
@@ -656,6 +682,7 @@ fn make_iov_model() -> CompiledModel {
         omega_init_as_sd: vec![false],
         sigma_init_as_sd: vec![false],
         kappa_init_as_sd: vec![false],
+        kappa_weights: Vec::new(),
         mu_refs: HashMap::new(),
         kappa_mu_refs: HashMap::new(),
         tv_fn: None,
@@ -674,6 +701,7 @@ fn make_iov_model() -> CompiledModel {
         has_conditional_eta_params: false,
         eta_param_info: Vec::new(),
         theta_transform: Vec::new(),
+        theta_eta_linked: Vec::new(),
         #[cfg(feature = "nn")]
         covariate_nns: Vec::new(),
         scaling: ScalingSpec::None,
@@ -689,6 +717,7 @@ fn make_iov_model() -> CompiledModel {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     }
 }
 
@@ -706,10 +735,12 @@ fn make_iov_subject() -> Subject {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; 6],
         occasions: vec![1, 1, 1, 2, 2, 2],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -766,10 +797,12 @@ fn analytic_iov_inner_grad_matches_fd_of_nll() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; 6],
         occasions: vec![1, 1, 1, 2, 2, 2],
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -855,10 +888,12 @@ fn analytic_iov_inner_grad_matches_fd_of_nll_closed_form_expr_scale() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; 6],
         occasions: vec![1, 1, 1, 2, 2, 2],
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -990,10 +1025,12 @@ fn analytic_iov_inner_grad_matches_fd_of_nll_closed_form_ltbs() {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
             obs_l2: Vec::new(),
             dose_occasions: vec![1, 2],
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };
@@ -1093,10 +1130,12 @@ fn repro555_subject22() -> Subject {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; n],
         occasions: Vec::new(),
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -1332,10 +1371,12 @@ fn inner_stall_enabled_tracks_the_effective_model() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; 2],
         occasions: Vec::new(),
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -1397,10 +1438,12 @@ fn iov_iiv_on_ruv_inner_grad_matches_fd() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; 6],
         occasions: vec![1, 1, 1, 2, 2, 2],
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -1496,12 +1539,14 @@ fn iov_m3_inner_grad_matches_fd() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         // The last two rows (occasion 2 tail) are M3 left-censored; the `−logΦ`
         // term differentiates them.
         cens: vec![0, 0, 0, 0, 1, 1],
         occasions: vec![1, 1, 1, 2, 2, 2],
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -1610,11 +1655,13 @@ fn iov_m3_right_censored_inner_grad_matches_fd() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         // Occasion-2 tail is M3 *right*-censored (above ULOQ): upper tail.
         cens: vec![0, 0, 0, 0, -1, -1],
         occasions: vec![1, 1, 1, 2, 2, 2],
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -1728,10 +1775,12 @@ fn analytic_iov_inner_gradient_m3_matches_fd_on_ode_bloq() {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0, 0, 0, 0, cens_sign, cens_sign],
             occasions: vec![1, 1, 1, 2, 2, 2],
             obs_l2: Vec::new(),
             dose_occasions: vec![1, 2],
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };
@@ -1841,10 +1890,12 @@ fn analytic_iov_inner_gradient_m3_iiv_on_ruv_matches_fd_on_ode() {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0, 0, 0, 0, cens_sign, cens_sign],
             occasions: vec![1, 1, 1, 2, 2, 2],
             obs_l2: Vec::new(),
             dose_occasions: vec![1, 2],
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };
@@ -1952,11 +2003,13 @@ fn iov_m3_iiv_on_ruv_inner_grad_matches_fd() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         // Occasion-2 tail rows M3 left-censored, co-occurring with iiv_on_ruv.
         cens: vec![0, 0, 0, 0, 1, 1],
         occasions: vec![1, 1, 1, 2, 2, 2],
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -2174,10 +2227,12 @@ fn inner_optimizer_pin_reaches_same_ebe() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; 6],
         occasions: vec![1; 6],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -2242,10 +2297,12 @@ fn analytic_eta_gradient_matches_fd_iiv_on_ruv() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; 7],
         occasions: vec![1; 7],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -2279,10 +2336,12 @@ fn analytic_eta_gradient_matches_fd_iiv_on_ruv_ode() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; 7],
         occasions: vec![1; 7],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -2362,10 +2421,12 @@ fn dense_residual_inner_grad_matches_fd() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; 5],
         occasions: vec![1; 5],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -2406,10 +2467,12 @@ fn dense_residual_ode_inner_grad_matches_fd() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; 5],
         occasions: vec![1; 5],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -2457,10 +2520,12 @@ fn dense_expression_scale_inner_grad_matches_fd() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; 5],
         occasions: vec![1; 5],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -2499,10 +2564,12 @@ fn ode_ltbs_ruv_model_and_subject() -> (CompiledModel, Subject) {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; 7],
         occasions: vec![1; 7],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -2582,10 +2649,12 @@ fn ode_custom_magnitude_takes_analytic_inner_gradient() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; 5],
         occasions: vec![1; 5],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -2644,10 +2713,12 @@ fn magnitude_inner_eta_gradient_matches_fd() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; 7],
         occasions: vec![1; 7],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -2736,10 +2807,12 @@ fn ode_ltbs_no_ruv_model_and_subject() -> (CompiledModel, Subject) {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; 7],
         occasions: vec![1; 7],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -2812,10 +2885,12 @@ fn ode_ltbs_init_cond_inner_grad_matches_fd() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; 7],
         occasions: vec![1; 7],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -2880,6 +2955,8 @@ fn ebe_warm_start_flag_round_trips() {
 fn no_iov_1cpt_model() -> CompiledModel {
     let omega = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
     let default_params = crate::types::ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0, 50.0],
         theta_names: vec!["TVCL".into(), "TVV".into()],
         theta_lower: vec![0.01, 1.0],
@@ -2894,8 +2971,10 @@ fn no_iov_1cpt_model() -> CompiledModel {
         sigma_fixed: vec![false],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     };
     CompiledModel {
+        covariate_model: None,
         name: "no_iov".into(),
         pk_model: PkModel::OneCptIv,
         error_model: ErrorModel::Proportional,
@@ -2922,6 +3001,7 @@ fn no_iov_1cpt_model() -> CompiledModel {
         omega_init_as_sd: vec![false],
         sigma_init_as_sd: vec![false],
         kappa_init_as_sd: Vec::new(),
+        kappa_weights: Vec::new(),
         mu_refs: HashMap::new(),
         kappa_mu_refs: HashMap::new(),
         tv_fn: None,
@@ -2940,6 +3020,7 @@ fn no_iov_1cpt_model() -> CompiledModel {
         has_conditional_eta_params: false,
         eta_param_info: Vec::new(),
         theta_transform: Vec::new(),
+        theta_eta_linked: Vec::new(),
         #[cfg(feature = "nn")]
         covariate_nns: Vec::new(),
         scaling: ScalingSpec::None,
@@ -2955,6 +3036,7 @@ fn no_iov_1cpt_model() -> CompiledModel {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     }
 }
 
@@ -2972,10 +3054,12 @@ fn no_iov_subject(reset_times: Vec<f64>) -> Subject {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times,
+        reset_covariates: Vec::new(),
         cens: vec![0; 3],
         occasions: Vec::new(),
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     }
@@ -3025,6 +3109,8 @@ fn test_inner_restart_unimodal_is_bit_identical() {
 fn find_ebe_noniov_invariant_to_large_mu_shift() {
     let omega = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
     let default_params = crate::types::ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0, 50.0],
         theta_names: vec!["TVCL".into(), "TVV".into()],
         theta_lower: vec![0.01, 1.0],
@@ -3039,14 +3125,17 @@ fn find_ebe_noniov_invariant_to_large_mu_shift() {
         sigma_fixed: vec![false],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     };
     let model = CompiledModel {
+        covariate_model: None,
         frem_config: None,
         residual_error_eta: None,
         analytical_init: Vec::new(),
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
         name: "noniov_mu".into(),
         has_conditional_eta_params: false,
         pk_model: PkModel::OneCptIv,
@@ -3074,6 +3163,7 @@ fn find_ebe_noniov_invariant_to_large_mu_shift() {
         omega_init_as_sd: vec![false],
         sigma_init_as_sd: vec![false],
         kappa_init_as_sd: Vec::new(),
+        kappa_weights: Vec::new(),
         mu_refs: HashMap::new(),
         kappa_mu_refs: HashMap::new(),
         tv_fn: None,
@@ -3091,6 +3181,7 @@ fn find_ebe_noniov_invariant_to_large_mu_shift() {
         parse_warnings: Vec::new(),
         eta_param_info: Vec::new(),
         theta_transform: Vec::new(),
+        theta_eta_linked: Vec::new(),
         #[cfg(feature = "nn")]
         covariate_nns: Vec::new(),
         scaling: ScalingSpec::None,
@@ -3115,10 +3206,12 @@ fn find_ebe_noniov_invariant_to_large_mu_shift() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; 3],
         occasions: Vec::new(),
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         obs_records: vec![],
     };
     let params = model.default_params.clone();
@@ -3278,4 +3371,62 @@ fn analytical_ad_unsupported_flags_each_class() {
         analytic_inner_grad_supported_model(&scaled),
         "but the LIVE inner gate serves a differentiable ExpressionScale analytically (#486)"
     );
+}
+
+/// #1182: the `power(σ, P)` form's analytic inner η-gradient must match FD of
+/// the (exponent-aware) `individual_nll` — the exponent rides the magnitude
+/// channel, so `residual_inner_obs` sees `|f|^{p}` through `dvar_df_scaled`.
+#[test]
+fn power_exponent_inner_eta_gradient_matches_fd() {
+    use crate::parser::model_parser::parse_model_string;
+    let model = parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  theta TVKA(1.5,0.01,50.0)\n  theta RUV_POW(1.3,0.01,10.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_KA ~ 0.30\n  sigma PROP_ERR ~ 0.04\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n[error_model]\n  DV ~ power(PROP_ERR, RUV_POW)\n",
+        )
+        .expect("parse power model");
+    assert!(model.has_ruv_exponent());
+    let mut subject = Subject {
+        id: "1".into(),
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 24.0, 48.0],
+        observations: vec![0.0; 7],
+        obs_cmts: vec![1; 7],
+        cens: vec![0; 7],
+        occasions: vec![1; 7],
+        ..Default::default()
+    };
+    let theta = vec![0.22, 11.0, 1.4, 1.3];
+    let preds =
+        crate::pk::compute_predictions_with_tv(&model, &subject, &theta, &[0.1, -0.1, 0.05]);
+    subject.observations = preds.iter().map(|p| p * 0.85).collect();
+    let mut params = model.default_params.clone();
+    params.theta = theta.clone();
+    let eta = [0.15_f64, -0.10, 0.20];
+    let analytic = analytic_eta_nll_gradient(
+        &model,
+        &subject,
+        &params.theta,
+        &eta,
+        &params.omega,
+        &params.sigma.values,
+    )
+    .expect("power model is in the analytic inner scope");
+    for k in 0..model.n_eta {
+        let h = 1e-6 * (1.0 + eta[k].abs());
+        let mut ep = eta;
+        ep[k] += h;
+        let mut em = eta;
+        em[k] -= h;
+        let nll = |e: &[f64]| {
+            crate::stats::likelihood::individual_nll(
+                &model,
+                &subject,
+                &params.theta,
+                e,
+                &params.omega,
+                &params.sigma.values,
+            )
+        };
+        let fd = (nll(&ep) - nll(&em)) / (2.0 * h);
+        approx::assert_relative_eq!(analytic[k], fd, max_relative = 1e-5, epsilon = 1e-6);
+    }
 }

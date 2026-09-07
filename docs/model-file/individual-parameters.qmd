@@ -1,3 +1,7 @@
+---
+pagetitle: "Individual parameter model syntax"
+---
+
 # Individual Parameters
 
 > **Maturity: beta** — see [Feature Maturity](../maturity.qmd) for what this means.
@@ -45,10 +49,55 @@ name from quietly reading as zero and collapsing the formula.
 | `log()`, `ln()` | `log(TVCL)` |
 | `sqrt()` | `sqrt(WT)` |
 | `abs()` | `abs(ETA_CL)` |
+| `min(a, b)`, `max(a, b)` | `max(TVCL * WT / 70, 0.1)` |
+| `clamp(x, lo, hi)` | `clamp(ACR20, 0.01, 0.99)` |
+| `present(x)` (condition only) | `if (present(WT)) (WT/70)^0.75 else 1.0` |
 | Parentheses | `TVCL * (WT/70)^0.75` |
 | Comparisons (in `if` conditions) | `WT > 70`, `SEX == 1`, `AGE != 0` |
 | Logical (in `if` conditions) | `&&` (and), `\|\|` (or), `!` (not) |
 | Inline conditional | `if (SEX == 1) TVCL * 1.5 else TVCL` |
+
+`min` / `max` take **exactly two** arguments and desugar to the inline
+conditional (`max(a, b)` → `if (a >= b) a else b`), so they differentiate and
+compile identically to the hand-written form. A one-argument `max(x)` is a parse
+error rather than the silent identity it used to be
+([#1030](https://github.com/FeRx-NLME/ferx-core/issues/1030)).
+
+`clamp(x, lo, hi)` takes **exactly three** arguments and is the two-sided bound:
+`clamp(ACR20, 0.01, 0.99)` says what `min(max(ACR20, 0.01), 0.99)` says, without
+the argument order flipping between the inner and outer call. It desugars to the
+same nested conditional — `if (x <= lo) lo else if (x >= hi) hi else x` — so on
+each bound the *bound* is returned and the derivative there is zero. Any other
+arity is a parse error, and literal bounds the wrong way round
+(`clamp(x, 0.9, 0.1)`) are rejected rather than silently returning `0.9` for
+every `x`; bounds that are not both literals are not checked
+([#1092](https://github.com/FeRx-NLME/ferx-core/issues/1092)).
+
+## Continuation Lines
+
+A long expression may be split across several physical lines. Two spellings work,
+and both are unambiguous because no statement can *begin* with a binary operator:
+put the operator at the start of the continued line, or at the end of the line
+being continued.
+
+```
+[individual_parameters]
+  LEMAX = LEMAX0
+          + log(OR_ABATA) * ABATA
+          + log(OR_ADALI) * ADALI
+          + ETA_EMAX
+
+  KEL   = CL /
+          V
+```
+
+This is the natural layout for an additive-on-logit covariate model — one
+covariate per line — which previously had to be collapsed onto a single line
+([#1030](https://github.com/FeRx-NLME/ferx-core/issues/1030)). A trailing `=`
+continues too, so `LEMAX =` on its own line followed by an indented expression is
+accepted. The same applies in `[odes]`, `[scaling]`, `[derived]`, and
+`[initial_conditions]`; newlines *inside* `(...)` or `[...]` have always been
+ignored and still are.
 
 ## Conditional Logic (`if` / `else`)
 
@@ -83,6 +132,35 @@ operators (`<`, `<=`, `>`, `>=`, `==`, `!=`) and logical operators (`&&`,
 
 The inline form produces a value and can appear anywhere an expression is
 allowed. Both `then` and `else` branches are required.
+
+### `present(...)` — guarding a covariate that may be missing
+
+A missing covariate value (blank, `.`, `NA` in the data) is carried as `NaN`.
+`present(X)` is true whenever `X` is not missing:
+
+```
+[individual_parameters]
+  CL = TVCL * (if (present(CRCL)) (CRCL / 100)^THETA_CRCL else 1.0) * exp(ETA_CL)
+```
+
+Guard any covariate that can be missing. Without the guard the factor above
+evaluates to `0` on a row with no `CRCL` — **not** to an error or a `NaN` you
+would notice — because division by a missing value underflows to zero here. The
+parameter is silently zeroed for that subject.
+
+`present(...)` takes any expression (`present(WT * 2)`), negates (`!present(WT)`)
+and combines (`present(WT) && WT > 100`) like any other condition. It is
+equivalent to the older idiom `X == X`, which works for the same reason (`NaN`
+compares false against itself) but reads like a typo.
+
+It is a *condition*, not a value-returning function, so `TVCL * present(WT)` is
+not valid — deliberately: as arithmetic it would produce exactly the silently
+zeroed parameter the guard exists to prevent. A covariate column actually named
+`present` is unaffected; the name is only special immediately followed by `(`
+at the head of a condition.
+
+The [`[covariate_model]`](covariate-model.qmd) block emits this guard around
+every factor it generates.
 
 ### Time-dependent parameters
 
@@ -259,7 +337,7 @@ PARAM = exp(log(THETA) + ETA)         # canonical MU form
 PARAM = THETA + ETA                   # additive
 ```
 
-ferx records the `(ETA → THETA)` mapping and uses it to re-centre the inner-loop ETA search at each outer iteration — reproducing NONMEM / nlmixr2's MU-referencing behaviour without requiring you to write an explicit `MU_i` line. See the [FAQ](../faq.qmd#do-i-need-to-use-mu-referencing-in-my-model-definitions-like-in-nonmem--nlmixr2) for details on which patterns are and are not detected, and for the `mu_referencing = false` escape hatch.
+ferx records the `(ETA → THETA)` mapping and uses it to re-centre the inner-loop ETA search at each outer iteration — reproducing NONMEM / nlmixr2's MU-referencing behaviour without requiring you to write an explicit `MU_i` line. See the [FAQ](../faq.qmd#do-i-need-to-use-mu-referencing-in-my-model-definitions-like-in-nonmem-nlmixr2) for details on which patterns are and are not detected, and for the `mu_referencing = false` escape hatch.
 
 ## Covariate Detection
 
@@ -271,6 +349,43 @@ For example, in `CL = TVCL * (WT/70)^0.75 * exp(ETA_CL)`:
 - `TVCL` matches a theta parameter
 - `ETA_CL` matches an omega parameter
 - `WT` matches neither, so it is treated as a covariate column
+
+A covariate factor like the one above can also be declared as data in
+[`[covariate_model]`](covariate-model.qmd) — `CL ~ WT power(center = 70)` —
+which desugars into exactly this expression, with the theta declaration, the
+PsN `scm` default bounds and a missing-value guard filled in. That form is worth
+reaching for when a covariate search or an agent will be rewriting the model.
+
+### Forgetting an omega declaration
+
+Because unmatched names fall through to covariates, deleting an `omega` line while
+leaving its `exp(ETA_…)` term in place turns that random effect into a covariate
+lookup. ferx catches this on the name's shape: an unresolved identifier beginning
+`ETA` or `KAPPA` is reported as an undeclared random effect rather than a missing
+covariate.
+
+```
+$ ferx check model.ferx --data data.csv
+error[E_ETA_NOT_DECLARED] parameters:1: Model references ETA_CL as a random effect
+but no `omega` / `kappa` declaration defines it. Declare the random effect in
+[parameters] (e.g. `omega ETA_CL ~ 0.09`), or — if this is meant to be a data
+column — add that column to the data file. A model with no random effects at all
+is valid (#989): to make it fixed-effects-only, drop the `exp(ETA_CL)` term as
+well as the omega line.
+    help: declare `omega ETA_CL ~ <variance>`
+invalid: model — 1 error(s), 0 warning(s)
+```
+
+(The diagnostic is one line; it is wrapped here to fit the page.)
+
+Without `--data` this is a warning rather than an error, since ferx cannot yet know
+whether the dataset carries such a column: reading a NONMEM-exported `ETA_CL`
+column as a genuine covariate is legitimate, and in that case the name resolves and
+nothing is reported.
+
+To make a model deliberately fixed-effects-only, remove the `exp(ETA_…)` term as
+well as the `omega` line — see
+[no omega at all](parameters.qmd#no-omega-at-all-fixed-effects-only-naive-pooled-fits).
 
 ## PK Parameter Names
 
@@ -287,5 +402,49 @@ The parameter names on the left side of each assignment must map to recognized P
 | `LAGTIME` (alias: `ALAG`) | Dose/absorption lagtime (default 0.0 if omitted) — see [Lagtime](lagtime.qmd) |
 
 `F` and `LAGTIME`/`ALAG` are the analytical engine's single bioavailability and lag slots. A compartment-indexed `F{n}`/`ALAG{n}`/`LAGTIME{n}` name is an [ODE-model](ode-models.qmd) dose attribute; on an analytical `pk` model you may map such a name into the single slot (`pk(..., f=F1)`), but an *unmapped* `F{n}`/`ALAG{n}` is a parse error rather than a silent no-op ([#725](https://github.com/FeRx-NLME/ferx-core/issues/725)).
+
+::: {.callout-important}
+## These names are applied to the dose, so don't read them back
+
+On an ODE model the engine consumes `F`, `LAGTIME`/`ALAG` and the indexed
+`F{n}`/`ALAG{n}`/`LAGTIME{n}` **at the dose event** — they never appear in a
+correct `[odes]` **RHS**, `[scaling]` readout, or `[adaptive_dosing] observe`
+signal. Declaring one *and* referencing it on
+the prediction path applies it twice and is rejected with
+`E_DOSE_ATTR_DOUBLE_USE` ([#993](https://github.com/FeRx-NLME/ferx-core/issues/993)).
+If you need an ordinary parameter, rename it: the name is what routes it.
+
+An `init(...)` seed is **not** one of those surfaces, on either engine: an
+initial condition is not an absorbed dose, so the engine seeds it with the raw
+value and `init(central) = F * 100` applies `F` exactly once
+([#1046](https://github.com/FeRx-NLME/ferx-core/issues/1046)).
+
+The **analytical** engine applies the same rule, with one difference: there the
+`pk(...)` mapping — not the name — is what binds a parameter to the dose
+([#1004](https://github.com/FeRx-NLME/ferx-core/issues/1004)). A model that maps
+`pk(..., f=F)` or `lagtime=TLAG` and *also* reads that parameter in `[scaling]`
+or `[adaptive_dosing] observe` is rejected with the same code. So the remedy
+differs: **drop the mapping**, not the name — renaming a mapped parameter changes
+nothing, because the mapping follows it. A parameter merely *named* `F` that no
+`pk(...)` argument maps is an ordinary parameter on this engine and stays silent.
+
+`[initial_conditions]` is *not* one of those surfaces either — the analytical
+spelling of the same carve-out: the engine deposits the amount with `F = 1` and no
+lag, so `init(depot) = F * 500` applies `F` exactly once.
+
+This is a deliberate divergence from NONMEM, which computes the same doubled
+value without a diagnostic: `$PK` defining `F1` **and** `S2 = V/F1` (rather than
+the `CL/F`, `V/F` apparent-parameter convention, where `F1` is *not* separately
+defined) runs clean under ADVAN2 and returns predictions scaled by exactly `F1`
+— measured in `tests/dose_attr_double_use_nonmem_anchor.rs`.
+
+`D{n}`/`R{n}` (modeled infusion duration/rate) carry the same reservation, but the
+engine only consults them for a dose that codes `RATE=-2`/`-1`. That check
+therefore runs against the dataset, not the model file — see
+[Reading a dose attribute is an error, not a warning](ode-models.qmd#reading-a-dose-attribute-is-an-error-not-a-warning).
+
+Reporting is unaffected: referencing any of these from `[derived]` or `[output]`
+is post-solve tabulation, not a second application, and stays silent.
+:::
 
 For ODE models, the parameter names are user-defined and passed as a flat vector to the ODE right-hand side function.

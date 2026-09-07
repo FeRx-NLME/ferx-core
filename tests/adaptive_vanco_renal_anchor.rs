@@ -17,7 +17,9 @@
 //!     dose by 1.25 / 0.75 and clamp to `dose_bounds`, no match re-issues). CRCL
 //!     declines 120 → 40 mL/min across the horizon, and — crucially — each day's
 //!     window is integrated with CL fixed from the covariate at the window's *end*
-//!     (the NONMEM end-of-interval convention ferx's per-segment PK uses).
+//!     (the NONMEM end-of-interval convention ferx's per-segment PK uses). That
+//!     includes the 1-h infusion sub-window: its terminating break is not a data
+//!     record, so the next obs record governs it too (#1073).
 //!   - `vanco_renal_subject.csv` is the dose-free subject: EVID=0 trough rows at
 //!     t = 0, 24, …, 312 h carrying the declining `CRCL` column (auto-detected by
 //!     `read_nonmem_csv` into each subject's `obs_covariates`).
@@ -29,9 +31,11 @@
 //! The model under test is `examples/adaptive_vanco_renal.ferx`. With negligible
 //! IIV it is effectively a typical-value patient whose *only* source of PK
 //! variation is the CRCL trajectory. ferx's reactive driver (RK45) recomputes PK
-//! per integration segment from the covariate active in that segment (#700) —
-//! resolving CL for segment `(t_{k-1}, t_k]` from CRCL at `t_k` — and mrgsolve's R
-//! loop (LSODA) feeds the identical piecewise-constant CL. So the two engines see
+//! per integration segment from the covariate at the data record that GOVERNS that
+//! segment (#700, #1073) — resolving CL for segment `(t_{k-1}, t_k]` from CRCL at
+//! `t_k`, and for a segment ending at a non-record break (the infusion end) from
+//! the next record ahead — and mrgsolve's R loop (LSODA) feeds the identical
+//! piecewise-constant CL. So the two engines see
 //! the *same* trough trajectory and reach the *same* dose decisions. As renal
 //! function declines, CL falls and drug accumulates: the empiric start is
 //! subtherapeutic so the controller titrates *up* early (decisions 0–4), the
@@ -63,19 +67,19 @@ use std::path::Path;
 /// `SIGNAL_TOL`).
 const REF_LADDER: [(f64, f64, f64); 14] = [
     (0.0, 0.000000, 625.0),
-    (24.0, 2.020561, 781.25),
-    (48.0, 3.291760, 976.5625),
-    (72.0, 4.860710, 1220.703125),
-    (96.0, 7.095079, 1525.87890625),
-    (120.0, 10.378132, 1525.87890625),
-    (144.0, 13.124256, 1525.87890625),
-    (168.0, 15.768755, 1144.4091796875),
-    (192.0, 15.797279, 858.306884765625),
-    (216.0, 14.777775, 858.306884765625),
-    (240.0, 14.911299, 858.306884765625),
-    (264.0, 15.539585, 643.7301635742188),
-    (288.0, 14.465452, 643.7301635742188),
-    (312.0, 13.974498, 643.7301635742188),
+    (24.0, 2.023063, 781.25),
+    (48.0, 3.299133, 976.5625),
+    (72.0, 4.877604, 1220.703125),
+    (96.0, 7.122832, 1525.87890625),
+    (120.0, 10.421810, 1525.87890625),
+    (144.0, 13.187750, 1525.87890625),
+    (168.0, 15.843894, 1144.4091796875),
+    (192.0, 15.872606, 858.306884765625),
+    (216.0, 14.849027, 858.306884765625),
+    (240.0, 14.976323, 858.306884765625),
+    (264.0, 15.597261, 643.7301635742188),
+    (288.0, 14.506703, 643.7301635742188),
+    (312.0, 14.005751, 643.7301635742188),
 ];
 
 /// The declining covariate makes the ladder reactive in *both* directions.

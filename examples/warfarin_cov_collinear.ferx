@@ -17,7 +17,7 @@
 #   "Covariance step regularized (...)"
 #
 # Run with:
-#   cargo run --release -- examples/warfarin_cov_collinear.ferx --data data/warfarin.csv
+#   cargo run --release -p ferx-cli -- examples/warfarin_cov_collinear.ferx --data data/warfarin.csv
 
 [parameters]
   theta TVCL1(1.5, 0.01, 20.0)  # ─┐ only TVCL1 * TVCL2 is identifiable

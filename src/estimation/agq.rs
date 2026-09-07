@@ -22,7 +22,7 @@
 //! 1. **`n_agq = 1` is exactly Laplace.** The one-point rule is `z = 0`, `w = √π`, so the
 //!    sum collapses to `(2π)^(d/2) · |H|^(−1/2) · exp(l_i(η̂))` — the Laplace approximation,
 //!    term for term. This is not an approximation of an approximation; it is an identity,
-//!    and [`tests::one_node_agq_equals_laplace`] pins it.
+//!    and `tests::one_node_agq_equals_laplace` pins it.
 //! 2. **No Gaussian-residual assumption.** `l_i` is evaluated through
 //!    [`individual_nll_into_with_schedule`], the model's *actual* likelihood — so
 //!    time-to-event and categorical endpoints are integrated as faithfully as Gaussian
@@ -47,7 +47,7 @@
 //!
 //! `H` is the Hessian of the *true* integrand, obtained by central differences of
 //! `individual_nll`. It is deliberately **not**
-//! [`crate::estimation::importance_sampling::compute_posterior_hessian`], which builds the
+//! `crate::estimation::importance_sampling::compute_posterior_hessian`, which builds the
 //! Gauss-Newton form `Ω⁻¹ + JᵀR⁻¹J`: that carries no curvature at all from TTE or
 //! categorical endpoints, i.e. it is blind on exactly the models AGQ is here to serve, and
 //! would scale their grids by `Ω` alone. Note the grid scaling only affects *accuracy at
@@ -268,6 +268,9 @@ impl Stack {
                 b,
                 &params.omega,
                 &params.sigma.values,
+                // AGQ holds the `block_sigma` off-diagonals at their declared
+                // value (#847); `params` carries exactly that.
+                &params.residual_correlations,
                 scratch,
                 schedule,
             );
@@ -675,7 +678,7 @@ pub(crate) fn subject_grid_and_weights(
 }
 
 /// Population AGQ objective: `Σ_i agq_subject_nll_i`. The outer loop doubles this into an
-/// OFV, exactly as it does [`crate::estimation::outer_optimizer::pop_nll`].
+/// OFV, exactly as it does `crate::estimation::outer_optimizer::pop_nll`.
 ///
 /// Parallel over subjects (the grid sweep stays serial *within* a subject, matching
 /// importance sampling), then reduced **serially in subject order** — a rayon `.sum()`
@@ -832,25 +835,42 @@ pub fn analytic_score_supported(model: &CompiledModel) -> bool {
 ///
 /// * the fixed-η score is analytic where the provider reaches
 ///   ([`analytic_score_supported`]) and finite-differenced *at fixed η* otherwise
-///   ([`accumulate_fixed_b_packed_gradient_fd`]) — the latter is correct for any likelihood
+///   (`accumulate_fixed_b_packed_gradient_fd`) — the latter is correct for any likelihood
 ///   ferx can evaluate, including TTE and categorical; and
 /// * `dη̂/dx` comes from the implicit-function theorem (`−H⁻¹·∂²nll/∂η∂x`), analytic where the
-///   provider reaches and finite-differenced otherwise ([`eta_dx`]).
+///   provider reaches and finite-differenced otherwise (`eta_dx`).
 ///
 /// Crucially **neither path re-solves the inner loop**, which is the cost that makes
 /// `reconverged_fd_gradient` expensive. Letting the models AGQ exists for — non-Gaussian
 /// endpoints, which are precisely the ones outside the `Dual2` provider — fall back to that
 /// gradient would have made the headline use case the slow one.
 ///
-/// **Node-count independent.** With [`grid_response_correction`] supplying the `∂Φ/∂H·dH/dx`
+/// **Node-count independent.** With `grid_response_correction` supplying the `∂Φ/∂H·dH/dx`
 /// term, the gradient is the exact total derivative at every `n_agq`, `n_agq = 1` included
 /// (where that term is exactly `½·d log|H|/dx`, the Laplace log-determinant).
 pub fn analytic_gradient_available(model: &CompiledModel) -> bool {
     // Kept as a predicate (rather than inlining `true`) so a future model class that genuinely
     // cannot supply `∂nll/∂x` at fixed η has one place to opt out; `population_gradient`'s
     // `reconverged_fd_gradient` fallback stays wired up behind it.
-    let _ = model;
-    true
+    //
+    // #847: an **estimated** `block_sigma` off-diagonal is exactly such a class. The AGQ score
+    // assembles θ / Ω / σ / Ω_iov blocks and nothing else — neither
+    // `accumulate_fixed_eta_packed_gradient` nor the fixed-b FD salvage
+    // (`accumulate_fixed_b_packed_gradient_fd`, which differences only the θ and σ coordinates)
+    // writes the trailing ρ slot. The quadrature objective *does* depend on ρ (`Stack::nll_at`
+    // scores at `params.residual_correlations`), so returning a gradient with a hard zero
+    // there would leave the optimizer no reason to move ρ and let it report convergence at a
+    // point that is not stationary in it. Declining sends AGQ/Laplace to
+    // `reconverged_fd_gradient`, which differences every free packed coordinate — slower, and
+    // correct. A `FIX`ed block is unaffected: its ρ carries no free coordinate to miss.
+    //
+    // Extending the score with a ρ block is tracked in #1216 alongside the estimator-threading
+    // work; until then this is the loud fallback CLAUDE.md asks a scope gap to take.
+    !model
+        .default_params
+        .residual_correlation_fixed
+        .iter()
+        .any(|&fixed| !fixed)
 }
 
 /// Finite-differenced θ/σ score at a **fixed η** — the universal fallback when the analytic
@@ -1415,6 +1435,8 @@ fn node_nll_gradient(
             b,
             &params.omega,
             &params.sigma.values,
+            // AGQ holds ρ at the declaration; `params` carries it (#847).
+            &params.residual_correlations,
             schedule,
             mult,
         )
@@ -1838,10 +1860,12 @@ mod tests {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0; n],
             occasions: vec![1; n],
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };
@@ -2034,10 +2058,12 @@ mod tests {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0; n],
             occasions: vec![1; n],
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: pk_times
                 .iter()
                 .map(|_| 0u16)
@@ -2090,6 +2116,7 @@ mod tests {
                     e,
                     &params.omega,
                     &params.sigma.values,
+                    &params.residual_correlations,
                     s,
                     None,
                 )

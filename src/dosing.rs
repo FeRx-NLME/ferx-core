@@ -19,7 +19,7 @@
 //!   declines, shared by the analytical, ODE, and sensitivity SS loops so their
 //!   troughs can't drift apart.
 
-use crate::types::Subject;
+use crate::types::{DoseEvent, Subject};
 use std::borrow::Cow;
 
 /// Resolve any modeled-`RATE` doses (#324, e.g. `RATE=-2` → modeled duration
@@ -76,6 +76,67 @@ pub(crate) fn resolve_subject_doses<'a>(
 ) -> Cow<'a, Subject> {
     resolve_subject_doses_with(subject, attr_map, |_| params)
 }
+
+/// For each slot of an ordered event timeline, the index of the **record that
+/// governs the segment ending there** (#1073).
+///
+/// NONMEM evaluates `$PK` at every data record and then advances *to* that record,
+/// so an interval is governed by the record that **terminates** it. Anything that is
+/// not a record — a lagged dose arrival, an infusion end, a zero-order cutoff, a
+/// per-route onset — supplies no parameters: it merely subdivides the interval its
+/// enclosing record terminates, and every piece of that interval runs on that
+/// record's snapshot.
+///
+/// `is_record(i)` reports whether timeline slot `i` is a record; the caller owns the
+/// mapping from a returned index back to its own snapshot type (`PkParams`,
+/// `PkDual<T>`, or a `&[T]` slice), which is why this resolves *indices* rather than
+/// values — materialising a `PkDual<Dual2<N>>` per event would put ~4.7 KB × n_events
+/// of copying on the FOCEI gradient hot path.
+///
+/// Two rules, and both must be identical in every engine — the four walks
+/// (`ode::predictions`, `pk::event_driven`, `sens::propagate`, `sens::ode_provider`)
+/// integrate the same subject, so a difference here is a silent cross-engine
+/// divergence that `Dual2`-vs-FD parity cannot see (FD perturbs a twin's own value
+/// path, so both sides move together):
+///
+/// 1. A record resolves to **itself**, and a non-record to the **next record ahead**
+///    (one backward scan — the answer for a non-record lies ahead of it in the walk).
+/// 2. Past the final record there is nothing ahead to terminate the segment, so it
+///    keeps the **last record that ran** (a forward fill). Not observable through
+///    predictions today — no observation follows such a boundary — but the four walks
+///    previously split two-and-two between the last record and the dose row here, and
+///    that becomes live the moment a trailing record, a reset, or a second pass reads
+///    the state.
+///
+/// Returns `None` in every slot only when the timeline contains no record at all — a
+/// subject with no observation, no EVID=2 row and no dose, which produces no
+/// prediction.
+pub(crate) fn governing_record_indices(
+    n_events: usize,
+    is_record: impl Fn(usize) -> bool,
+) -> Vec<Option<usize>> {
+    let mut acc: Vec<Option<usize>> = vec![None; n_events];
+    // Rule 1: backward scan. `seen` is set *before* `acc[i]` is written, so a record
+    // resolves to itself rather than to its successor.
+    let mut seen: Option<usize> = None;
+    for i in (0..n_events).rev() {
+        if is_record(i) {
+            seen = Some(i);
+        }
+        acc[i] = seen;
+    }
+    // Rule 2: forward fill the trailing tail (the only slots the backward scan left
+    // `None`, since every slot at or before the final record saw it).
+    let mut last: Option<usize> = None;
+    for slot in acc.iter_mut() {
+        match *slot {
+            Some(q) => last = Some(q),
+            None => *slot = last,
+        }
+    }
+    acc
+}
+
 /// Number of dosing cycles to simulate when pre-equilibrating an SS=1
 /// dose. With a typical t₁/₂/II ratio under 2 (the common clinical range)
 /// this is comfortably past saturation — each additional cycle adds
@@ -323,6 +384,12 @@ thread_local! {
     /// closed-form loops, and the event-driven loop.
     static LAST_SS_EQUILIBRATION_CYCLES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 
+    /// Branch the most recent SS equilibration took — see [`SsBranch`] for why the cycle
+    /// count above is not enough.
+    #[cfg(test)]
+    static LAST_SS_EQUILIBRATION_BRANCH: std::cell::Cell<SsBranch> =
+        const { std::cell::Cell::new(SsBranch::None) };
+
     /// When set, [`ss_cycle_converged`] always reports "not converged" so every path runs the
     /// full cycle budget — lets a test pin that early-stop is value-preserving vs full
     /// equilibration (#532 review #4).
@@ -332,6 +399,67 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn record_ss_equilibration_cycles(n: usize) {
     LAST_SS_EQUILIBRATION_CYCLES.with(|c| c.set(n));
+}
+
+/// Which SS-equilibration branch the most recent call took — a **test-only** observation,
+/// alongside the cycle count above.
+///
+/// The branches **fall back to one another**: the exact linear fixed point declines to
+/// Anderson, and Anderson declines to the capped pulse train. When all three are correct
+/// they return the same trough, so a value assertion cannot tell them apart — and, worse,
+/// *breaking* one silently routes to the next and the assertion stays green. That is not
+/// hypothetical: two #1139 mutations (a `NaN` anchor in `equilibrate_ss_input_rate`'s
+/// one-cycle advance, and a flat `0` anchor in the monotone input-rate train) left the whole
+/// suite passing, because the first made the exact solve decline into a correct fallback and
+/// the second sat on a branch the fixture never reached. A test that means to pin a branch's
+/// clock must assert which branch ran.
+///
+/// **One cell per thread, shared across numeric types.** The recording sites live in
+/// helpers that are generic over `T: PkNum` (`equilibrate_ss_input_rate_g`,
+/// `anderson_ss_fixed_point_g`), and `sens::ode_provider` instantiates them with a dual
+/// `T`. So a test that drives a `fit()` or the analytic provider observes whichever walk
+/// ran *last*, f64 or dual — not necessarily the value-path run-in it means to pin. Assert
+/// this only from a test that calls the f64 helpers directly, as the #1139 tests do. The
+/// neighbouring cycle counter has the same property and the same caveat.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum SsBranch {
+    /// No SS equilibration has completed on this thread since the last one started.
+    ///
+    /// Written at the top of `equilibrate_ss_pk_state`, so a call that **bails out early**
+    /// (`II <= 0`, an out-of-range compartment, overlapping infusions) leaves `None` rather
+    /// than the previous call's tag. That matters: without it a test asserting a branch
+    /// after a bail-out would read a stale value and pass for the wrong reason — the class
+    /// of un-failable assertion this enum exists to prevent.
+    #[default]
+    None,
+    /// The exact affine fixed point `(I − M)⁻¹·b` for a **bolus or infusion** dose on a
+    /// linear disposition (#914) — `equilibrate_ss_pk_state`'s `periodic_ss_fixed_point_pk`.
+    Exact,
+    /// The same closed form on the **input-rate** (built-in absorption) path,
+    /// `equilibrate_ss_input_rate`. Distinct from [`Self::Exact`] so an assertion can say
+    /// which of the two ran: they are different functions with different windows, and a
+    /// test naming one of them should not pass on the other.
+    InputRateExact,
+    /// Anderson-accelerated iteration on the same one-cycle map, for a nonlinear
+    /// disposition into a built-in absorption compartment (#867).
+    Anderson,
+    /// The capped explicit pulse train, on a clock local to each cycle (bolus/infusion).
+    CappedTrain,
+    /// The capped explicit pulse train of the input-rate path, which unlike every other
+    /// window runs on a **monotone** clock `0 … n·II` and advances its `TAD` anchor per
+    /// segment (#1139).
+    InputRateTrain,
+}
+
+#[cfg(test)]
+pub(crate) fn record_ss_equilibration_branch(b: SsBranch) {
+    LAST_SS_EQUILIBRATION_BRANCH.with(|c| c.set(b));
+}
+
+/// Branch the most recent SS equilibration took (test observation; see [`SsBranch`]).
+#[cfg(test)]
+pub(crate) fn last_ss_equilibration_branch() -> SsBranch {
+    LAST_SS_EQUILIBRATION_BRANCH.with(|c| c.get())
 }
 
 /// Cycles the most recent SS-equilibration call ran (test observation; see above).
@@ -362,6 +490,12 @@ pub(crate) fn with_full_ss_equilibration<R>(f: impl FnOnce() -> R) -> R {
 #[cfg(not(test))]
 #[inline(always)]
 pub(crate) fn record_ss_equilibration_cycles(_n: usize) {}
+
+/// The branch tag's non-test counterpart — same signature, so the call sites are
+/// unconditional. [`SsBranch`] is a fieldless enum, so naming a variant costs nothing.
+#[cfg(not(test))]
+#[inline(always)]
+pub(crate) fn record_ss_equilibration_branch(_b: SsBranch) {}
 
 /// Relative-magnitude threshold above which a **cycle-capped** SS equilibration is reported as
 /// non-converged (#867). The pulse-train equilibration
@@ -644,5 +778,612 @@ mod ss_warn_tests {
         assert_eq!(ss_max_magnitude(&[-3.0, 1.0]), 3.0);
         assert_eq!(ss_abs_increment(&[1.0, 2.0], &[1.0, 0.0]), 2.0);
         assert_eq!(ss_abs_increment(&[5.0], &[5.0]), 0.0);
+    }
+}
+
+/// `is_infusion()` only checks `rate > 0`, but a degenerate row with
+/// `rate > 0 && amt <= 0` (or NaN) yields `duration = amt/rate <= 0`
+/// (or NaN). Treating those as infusions would push an infusion-end
+/// break that sorts before the dose itself, and NaN would panic the
+/// break-time sort. Such rows fall back to the bolus branch instead
+/// (a zero/negative bolus update — visible, not silently dropped).
+pub(crate) fn is_real_infusion(d: &DoseEvent) -> bool {
+    // Tripwire (#324): every ODE entrypoint resolves modeled-RATE doses to
+    // `Fixed` (via `resolve_subject_doses*`) before any infusion logic runs, so
+    // a non-`Fixed` dose here means a path forgot to resolve — panic in debug /
+    // tests rather than silently mis-handling it (an unresolved modeled dose has
+    // `duration == 0`, so it would quietly degrade to a bolus).
+    debug_assert!(d.is_fixed(), "is_real_infusion: unresolved modeled dose");
+    d.is_infusion() && d.duration > 0.0 && d.duration.is_finite()
+}
+
+// ---------------------------------------------------------------------------
+// Where a lagged steady-state dose loads, and what the previous cycle leaves
+// running across the dose record (#1121).
+// ---------------------------------------------------------------------------
+
+/// Whether this steady-state dose's periodic state is loaded at its dose
+/// **record** and flowed forward to the lagged arrival (#1121), rather than
+/// equilibrated at the arrival itself.
+///
+/// NONMEM runs `$PK` at the dose row, loads the steady-state compartments there,
+/// and then ADVANs to the lagged arrival under the record that *terminates* that
+/// interval. Equilibrating at the arrival instead computes the trough throughout
+/// under the dose row's snapshot. The two agree exactly under flat covariates —
+/// a full-cycle propagation from phase `II − lag` returns to the trough — which
+/// is why the difference stayed invisible until a covariate changed inside the
+/// pre-arrival window.
+///
+/// `lag == 0` is excluded deliberately: record and arrival are the same instant,
+/// so there is nothing to propagate, and routing it through
+/// `ss_state_at_phase(…, II)` would integrate a full extra cycle and move every
+/// existing non-lagged SS result by solver error, for no gain.
+///
+/// Every call site reads this predicate rather than re-deriving the condition, so
+/// the seed and the arrival-side equilibration cannot drift into overlapping
+/// (double-load) or disjoint (no-load) coverage — and the analytic twin
+/// (`sens::ode_provider::integrate_tvcov_g`) shares it too, so its `K_SS_SEED`
+/// timeline break fires on exactly the doses production seeds. A twin that seeded
+/// on a wider or narrower set would disagree with production in *value*, which is
+/// the one thing the `check_vs_production` parity tests cannot forgive.
+pub(crate) fn ss_seeded_at_record(dose: &DoseEvent, lag: f64) -> bool {
+    dose.ss && dose.ii > 0.0 && lag > 0.0
+}
+
+/// Cycle phase the dose **record** sits at, for a steady-state dose seeded there.
+///
+/// The pulse preceding the record landed at `dose.time − ss_seed_phase(…)`, so a
+/// lagtime shorter than one interval puts it at `dose.time + lag − II` and the
+/// record reads the previous cycle's tail at phase `II − lag`.
+///
+/// # `lag ≥ II` clamps rather than wraps — measured, not assumed
+///
+/// A lagtime of a full interval or more has no phase `II − lag`. NONMEM 7.6.0
+/// **clamps** it to zero: the pulse lands on the record itself, so the record
+/// carries the steady-state *peak* (`nonmem_anchor/results/ss_lag_ge_ii.tab`,
+/// where an `ALAG1 = 15`, `II = 12` bolus reads `PRED(0) = 13.197 =
+/// (D/V)/(1 − e^{−k·II})`, the post-pulse peak, and decays from there with no
+/// intervening pulse before the real arrival at `t = 15`). It does **not** wrap
+/// the phase into `[0, II)`: wrapping would put `PRED(0)` at `2.1815` instead.
+///
+/// Clamping is also the only continuous choice, which matters because `ALAG` is
+/// routinely *estimated*: as `lag → II⁻` the phase tends to `0⁺` (the pulse has
+/// just landed) and at `lag = II` it is `0` (the pulse lands here), so nothing
+/// jumps as the outer optimizer walks a lagtime across the interval. Wrapping
+/// would step the whole pre-arrival window by a factor of `e^{−k·II}` at that
+/// crossing.
+pub(crate) fn ss_seed_phase(dose: &DoseEvent, lag: f64) -> f64 {
+    (dose.ii - lag).max(0.0)
+}
+
+/// End time of the previous cycle's infusion when it is **still running at the
+/// dose record** of a seeded steady-state dose — `None` when it has already
+/// finished (the ordinary case) or the dose is not an infusion.
+///
+/// The pulse before the record is at `dose.time − p` for `p = ss_seed_phase(…)`,
+/// so its infusion occupies `[dose.time − p, dose.time − p + T_inf]` and crosses
+/// the record whenever `p < T_inf`, i.e. `lag > II − T_inf`. The pre-arrival
+/// window must then carry `+rate` on `[dose.time, dose.time + (T_inf − p)]`:
+/// `ss_state_at_phase` hands back a state with the infusion mid-flight, and a
+/// walk that forgot the rate would silently resume the decay early.
+///
+/// Confirmed against NONMEM 7.6.0 (`nonmem_anchor/results/ss_lag_infusion.tab`):
+/// with `II = 12`, `T_inf = 6`, `ALAG1 = 8` the concentration *rises* from
+/// `6.5468` at the record to `6.8754` at `t = 0.5` and turns over at exactly
+/// `t = 2 = 8 − 12 + 6`.
+///
+/// Like every other infusion edge the window is `F`-reshaped (#419), so callers
+/// pass the same `f_bio` they used to build the dose's own window and the two
+/// edges cannot drift apart.
+///
+/// # `lag ≥ II` with an infusion is ferx's answer, not NONMEM's
+///
+/// Under the [`ss_seed_phase`] clamp this returns `dose.time + T_inf` — the
+/// previous cycle's infusion starting on the record, which is what the clamped
+/// phase means and is mass-balanced. NONMEM instead delivers `T_inf + (lag − II)`
+/// hours of drug for that geometry (measured: an `AMT = 600`, `RATE = 100`,
+/// `II = 12`, `ALAG1 = 14` dose infuses over `[0, 8]`, i.e. 800 mg), which is not
+/// a physical reading of a 600 mg dose. ferx does not reproduce it; see
+/// `docs/model-file/lagtime.qmd`.
+pub(crate) fn ss_residual_infusion_end(dose: &DoseEvent, lag: f64, f_bio: f64) -> Option<f64> {
+    if !ss_seeded_at_record(dose, lag) || !is_real_infusion(dose) {
+        return None;
+    }
+    let (_, t_inf) = dose.bioavailable_infusion(f_bio);
+    let phase = ss_seed_phase(dose, lag);
+    (phase < t_inf).then(|| dose.time + (t_inf - phase))
+}
+
+/// Whether flowing a seeded steady-state dose from its record to its lagged
+/// arrival lands back on the periodic **trough** — so a path that re-equilibrates
+/// at the arrival instead of propagating there gets the same number.
+///
+/// The seed sits at phase [`ss_seed_phase`] and the arrival is `lag` later, so
+/// the flowed phase is `(II − lag) + lag = II ≡ 0⁻`, the trough, for every
+/// `lag ≤ II`. Past that the clamp pins the seed at phase 0 and the arrival lands
+/// at phase `lag > II` — strictly further down the same decay than the trough —
+/// so re-equilibrating there silently *raises* the state back to a full cycle's
+/// accumulation. Measured at **+4.3 %** on an `ALAG1 = 15`, `II = 12` bolus at
+/// `t = 26` (`nonmem_anchor/results/ss_lag_ge_ii`), on the two paths that take
+/// the shortcut: the dense ODE predictor and the analytical superposition. Both
+/// event-driven walks propagate and were already right.
+///
+/// The paths that re-equilibrate keep doing so while this holds, deliberately:
+/// integrating a full extra cycle instead would move every existing SS+lagtime
+/// result by solver error for no gain.
+pub(crate) fn ss_arrival_is_trough(dose: &DoseEvent, lag: f64) -> bool {
+    lag <= dose.ii
+}
+
+/// Ordering slack shared by every [`tad_referent`] caller. `1e-12` is the value all four
+/// TAD folds already used before they were collapsed onto this function; it is deliberately
+/// *not* [`crate::ode::predictions::EVENT_MATCH_TOL`], which answers a different question
+/// (does this break time *name* this event) on a much looser scale.
+const TAD_EPS: f64 = 1e-12;
+
+/// **The** rule for what `TAD` at time `t` is measured from, for one dose — `None` when
+/// this dose has no referent at `t` yet.
+///
+/// Every **lag-aware** `TAD` fold is this function under a `max`: the dense predictor's
+/// [`crate::ode::predictions::tad_anchor_for`] (which the EKF and the event-driven walk also
+/// use) and the sdtab column's `api::output_columns::tad_at_time`, via [`tad_at`]. Before
+/// #1126 those were hand-written copies that disagreed on
+/// `(t_dose = 120, ALAG = 3, II = 12, t = 121)`, returning `-2.0`, `NaN` and `+1.0`. The
+/// referent is a property of a dose, not of an engine, so it is stated once.
+///
+/// **[`crate::types::Subject::data_tad`] is deliberately not folded in** (#1182/#1273). It
+/// answers a different question — what the *dataset* says `TAD` is, before any model, with no
+/// lagtime at all and a `same_time_counts` switch between NONMEM's record order and Pharmpy's
+/// `get_doseid` grouping. Being lag-free, the pre-arrival window this function exists for is
+/// empty there (record and arrival coincide), so it needs nothing from here; and this function
+/// has no tie-convention parameter, so it could not serve there without growing one. Two
+/// kernels, two questions — recorded rather than left to look like an oversight.
+///
+/// Three cases:
+///
+/// * **The dose has arrived** (`t ≥ dose.time + lag`). An ordinary dose is measured from its
+///   own arrival. A **steady-state** dose describes a periodic pulse train, so the elapsed
+///   time folds back into `[0, II)` — as though virtual pulses had landed at
+///   `dose.time + lag + k·II`.
+/// * **A steady-state dose's pre-arrival window** (`dose.time ≤ t < dose.time + lag`) —
+///   #1126, and the case this function exists for. Since #1121 the periodic state is loaded
+///   at the dose **record** and flows to the lagged arrival, so the state there is real: it
+///   is the previous cycle's decaying tail. That cycle's pulse is at
+///   `dose.time − ss_seed_phase(dose, lag)`, which is exactly the instant
+///   [`ss_state_at_phase`](crate::ode::predictions) advances from, so `TAD` and the state it
+///   describes are built from one number.
+/// * **Anything earlier** — no referent from this dose.
+///
+/// # Why the pre-arrival branch is gated on [`ss_seeded_at_record`] and not re-derived
+///
+/// `dose.ss && dose.ii > 0.0 && arrival > t ≥ dose.time` already implies `lag > 0`, so
+/// spelling the predicate out would be equivalent *today*. It is written as the shared
+/// predicate because it is the same question: `ss_seeded_at_record` decides whether the
+/// window carries the previous cycle's tail at all, and if that ever stops being true this
+/// referent stops being the right one in the same edit.
+///
+/// # `ss_seed_phase` is not `rem_euclid`, and the difference is the whole point
+///
+/// The post-arrival branch's `elapsed.rem_euclid(dose.ii)` would *also* return
+/// `dose.time + lag − II` for a negative `elapsed` — for `0 < lag ≤ II`. It stops agreeing at
+/// `lag > II`, where [`ss_seed_phase`] **clamps** to `0` on NONMEM evidence
+/// (`nonmem_anchor/results/ss_lag_ge_ii.tab`, measured in #1121) while `rem_euclid` wraps:
+/// at `lag = 15, II = 12` they are `9.0` apart. Reaching the pre-arrival window by relaxing
+/// the post-arrival filter — #1126's own suggested shortcut — gets that case wrong, and gets
+/// it wrong silently, because the two agree everywhere a test written for `lag < II` looks.
+///
+/// Under the clamp `TAD` runs `0 … lag` across the window and so exceeds `II`. That is what
+/// the clamp *means*: the pulse lands on the record and nothing intervenes before the real
+/// arrival, so there is no shorter elapsed time to report.
+#[inline]
+pub(crate) fn tad_referent(dose: &DoseEvent, lag: f64, t: f64) -> Option<f64> {
+    let arrival = dose.time + lag;
+    if arrival <= t + TAD_EPS {
+        if dose.ss && dose.ii > 0.0 {
+            let elapsed = t - arrival;
+            return Some(t - elapsed.rem_euclid(dose.ii));
+        }
+        return Some(arrival);
+    }
+    if ss_seeded_at_record(dose, lag) && dose.time <= t + TAD_EPS {
+        return Some(dose.time - ss_seed_phase(dose, lag));
+    }
+    None
+}
+
+/// `TAD` at `t` — [`tad_referent`] folded over a dose list, `NaN` when no dose has a referent.
+///
+/// The **reporting** answer: the per-dose rule was the interesting duplication, but the fold
+/// around it — `fold(NEG_INFINITY, f64::max)`, then `is_finite`, then `NaN` — was written out
+/// beside it too. `api::output_columns::tad_at_time` is its caller. (`io::output`'s sdtab
+/// fallback was a third copy when #1126 was written; #1273 moved that call site to
+/// [`crate::types::Subject::data_tad`] instead, for the tie rule described on
+/// [`tad_referent`], so it is not one of ours.)
+///
+/// `dose_lagtimes` may be **shorter than `doses`, including empty**; a missing entry is zero
+/// lag, matching [`crate::ode::predictions::tad_anchor_for`] and `active_infusions`.
+///
+/// [`crate::ode::predictions::tad_anchor_for`] deliberately does **not** call this. It shares
+/// the fold but not the tail: where nothing has a referent it falls back to the subject's
+/// earliest lagged arrival, because a `NaN` anchor multiplies into the integrator state and
+/// poisons every later prediction, while a *reported* `TAD` of "not dosed yet" is `NaN` by the
+/// sdtab convention and a negative number there would be worse than blank. Two different
+/// questions about the same fold, kept apart on purpose.
+///
+/// `f64::max` discards `NaN`, so a `Some(NaN)` referent would be silently dropped and the
+/// answer taken from the remaining doses. [`tad_referent`] cannot produce one — every path to
+/// `Some` returns a value built from a `dose.time`/`lag` pair that already passed a finite
+/// comparison, and a non-finite pair falls through to `None` — and
+/// `tad_referent_never_returns_a_nan_referent` pins that rather than leaving it to inspection.
+#[inline]
+pub(crate) fn tad_at(doses: &[DoseEvent], dose_lagtimes: &[f64], t: f64) -> f64 {
+    let last = doses
+        .iter()
+        .enumerate()
+        .filter_map(|(i, d)| tad_referent(d, dose_lagtimes.get(i).copied().unwrap_or(0.0), t))
+        .fold(f64::NEG_INFINITY, f64::max);
+    if last.is_finite() {
+        t - last
+    } else {
+        f64::NAN
+    }
+}
+
+#[cfg(test)]
+mod governing_record_tests {
+    use super::governing_record_indices;
+
+    /// `true` at every index in `records`.
+    fn idx(n: usize, records: &[usize]) -> Vec<Option<usize>> {
+        governing_record_indices(n, |i| records.contains(&i))
+    }
+
+    #[test]
+    fn a_record_governs_itself_and_a_non_record_takes_the_next_record_ahead() {
+        // slots:   0=DoseRecord  1=Dose(arrival)  2=Obs  3=InfusionEnd  4=Obs
+        let got = idx(5, &[0, 2, 4]);
+        assert_eq!(
+            got,
+            vec![Some(0), Some(2), Some(2), Some(4), Some(4)],
+            "a record resolves to itself; a non-record to the next record ahead"
+        );
+    }
+
+    #[test]
+    fn the_trailing_tail_keeps_the_last_record_that_ran() {
+        // Two non-records after the final record: nothing ahead terminates their
+        // segments, so both keep the last record. This is the rule the four engines
+        // used to split two-and-two on — `ode/predictions` and `sens/ode_provider`
+        // took the previous record, `pk/event_driven` and `sens/propagate` took the
+        // dose row — and it is why the resolution lives here rather than four times
+        // over. It is not observable through predictions (no observation follows such
+        // a boundary), which is exactly why it needs pinning at the resolver.
+        let got = idx(5, &[0, 2]);
+        assert_eq!(got, vec![Some(0), Some(2), Some(2), Some(2), Some(2)]);
+    }
+
+    #[test]
+    fn a_timeline_with_no_record_at_all_resolves_to_none_everywhere() {
+        // A subject with no observation, no EVID=2 row and no dose row produces no
+        // prediction; the callers fall back to their own seed snapshot there.
+        assert_eq!(idx(3, &[]), vec![None, None, None]);
+        assert_eq!(idx(0, &[]), Vec::<Option<usize>>::new());
+    }
+
+    #[test]
+    fn adjacent_records_each_govern_their_own_slot() {
+        // Co-timed records land as adjacent slots (the sort is stable and the
+        // zero-length segment between them is skipped by the walk). Each must resolve
+        // to itself, not to its neighbour — otherwise the segment arriving at a shared
+        // instant would read the wrong one of the two.
+        assert_eq!(idx(3, &[0, 1, 2]), vec![Some(0), Some(1), Some(2)]);
+    }
+
+    #[test]
+    fn a_leading_non_record_takes_the_first_record_ahead() {
+        // A dose arrival before any observation still runs on the record that
+        // terminates its interval.
+        assert_eq!(idx(3, &[2]), vec![Some(2), Some(2), Some(2)]);
+    }
+}
+
+#[cfg(test)]
+mod tad_referent_tests {
+    use super::{ss_seed_phase, tad_referent};
+    use crate::types::DoseEvent;
+
+    /// `SS=1, II=12` bolus whose **record** is at `t = 480`.
+    fn ss_dose() -> DoseEvent {
+        DoseEvent::new(480.0, 100.0, 1, 0.0, true, 12.0)
+    }
+
+    /// Ordinary bolus at `t`, no steady state.
+    fn plain(t: f64) -> DoseEvent {
+        DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0)
+    }
+
+    /// `TAD` as a caller sees it — the folds in `ode::predictions::tad_anchor_for` and
+    /// `api::output_columns::tad_at_time` both report `t - referent`, so the tests below read
+    /// in the units the model does rather than in anchor times.
+    fn tad(dose: &DoseEvent, lag: f64, t: f64) -> Option<f64> {
+        tad_referent(dose, lag, t).map(|a| t - a)
+    }
+
+    /// The window #1126 is about: `[480, 483)` with `ALAG = 3`, `II = 12`.
+    ///
+    /// The pulse that produced the state there landed at `480 + 3 − 12 = 471`, so `TAD` runs
+    /// `9 … 12` across the window and resets to `0` when the real dose arrives. Before #1126
+    /// the fold had no candidate at all here — the sdtab column came out blank and the
+    /// integrators fell back to the subject's first *arrival*, giving a negative `TAD`.
+    #[test]
+    fn a_seeded_ss_dose_measures_the_pre_arrival_window_from_the_previous_cycles_pulse() {
+        let d = ss_dose();
+        assert_eq!(
+            tad(&d, 3.0, 480.0),
+            Some(9.0),
+            "the record sits at phase II - lag"
+        );
+        assert_eq!(tad(&d, 3.0, 481.0), Some(10.0));
+        assert_eq!(tad(&d, 3.0, 482.0), Some(11.0));
+        // The instant *before* the arrival is a full interval after the previous pulse …
+        let just_before = tad(&d, 3.0, 483.0 - 1e-9).expect("inside the window");
+        assert!(
+            (just_before - 12.0).abs() < 1e-8,
+            "TAD reaches II at the end of the window, got {just_before}"
+        );
+        // … and the arrival itself restarts the cycle.
+        assert_eq!(tad(&d, 3.0, 483.0), Some(0.0));
+        assert_eq!(
+            tad(&d, 3.0, 485.0),
+            Some(2.0),
+            "back on the post-arrival fold"
+        );
+    }
+
+    /// Before the dose **record** an `SS=1` row contributes nothing: `SS=1` establishes steady
+    /// state *at* the record, so it must not leak into earlier observations. The same rule the
+    /// analytical superposition states at `crate::pk::predict_concentration`.
+    #[test]
+    fn an_ss_record_has_no_referent_before_itself() {
+        assert_eq!(tad_referent(&ss_dose(), 3.0, 479.0), None);
+        assert_eq!(tad_referent(&ss_dose(), 3.0, 0.0), None);
+    }
+
+    /// **`ss_seed_phase`, not `rem_euclid`.** This is the case that separates the two, and it
+    /// is a test rather than a comment because every `lag < II` fixture agrees either way.
+    ///
+    /// At `lag = 15, II = 12` there is no phase `II − lag`. #1121 measured NONMEM 7.6.0
+    /// **clamping** it to zero — the pulse lands on the record, which then carries the
+    /// steady-state peak and decays with nothing intervening before the real arrival
+    /// (`nonmem_anchor/results/ss_lag_ge_ii.tab`). So `TAD` runs `0 … lag` and *exceeds* `II`,
+    /// which is what the clamp means. `rem_euclid` would wrap to 471 at the record — 9.0 away,
+    /// and silently, since the two agree everywhere else.
+    #[test]
+    fn a_lagtime_of_a_full_interval_or_more_clamps_the_phase_instead_of_wrapping() {
+        let d = ss_dose();
+        let (lag, ii) = (15.0, 12.0);
+        assert_eq!(ss_seed_phase(&d, lag), 0.0, "the clamp itself");
+        assert_eq!(tad(&d, lag, 480.0), Some(0.0));
+        assert_eq!(tad(&d, lag, 485.0), Some(5.0));
+        assert_eq!(
+            tad(&d, lag, 494.0),
+            Some(14.0),
+            "TAD exceeds II under the clamp"
+        );
+        assert_eq!(tad(&d, lag, 495.0), Some(0.0), "the real arrival");
+
+        // What the rejected spelling would have returned, computed here rather than
+        // described: the post-arrival branch's wrap, evaluated inside the window.
+        let wrapped = 480.0 - (480.0 - (480.0 + lag)).rem_euclid(ii);
+        assert_eq!(wrapped, 471.0);
+        assert_eq!(
+            tad_referent(&d, lag, 480.0).expect("clamped referent") - wrapped,
+            9.0,
+            "the two spellings are 9.0 apart at lag = 15, II = 12 — a fixture with lag < II \
+             cannot tell them apart"
+        );
+    }
+
+    /// The scoping guard. #1126 suggested reaching the window by relaxing the post-arrival
+    /// filter for SS doses; applied to *every* dose it flips an ordinary lagged regimen.
+    ///
+    /// 0/24 dosing with `lag = 3`: at `t = 25` the most recent **arrival** is the first dose's,
+    /// at `t = 3`, so `TAD = 22`. The second dose's record is at 24 but it has not landed yet,
+    /// and a relaxed filter would report `25 − 27 = −2`.
+    #[test]
+    fn an_ordinary_lagged_dose_keeps_its_arrival_filter() {
+        let (d0, d1) = (plain(0.0), plain(24.0));
+        assert_eq!(tad(&d0, 3.0, 25.0), Some(22.0));
+        assert_eq!(
+            tad_referent(&d1, 3.0, 25.0),
+            None,
+            "a non-SS dose contributes nothing before it arrives — the referent added by \
+             #1126 is gated on `ss_seeded_at_record`"
+        );
+        assert_eq!(
+            tad(&d1, 3.0, 27.0),
+            Some(0.0),
+            "…and everything once it does"
+        );
+    }
+
+    /// `lag = 0` leaves no window to have a referent for, so the answer is the fold that stood
+    /// before #1126, exactly. Pinned because the new branch must not fire here: every caller
+    /// that has no lagtime concept (`ode::ekf`, the capped input-rate train) passes an empty
+    /// lag slice, and this is what makes those call sites provably unchanged.
+    #[test]
+    fn a_zero_lagtime_is_the_pre_1126_fold_exactly() {
+        let d = ss_dose();
+        assert_eq!(tad(&d, 0.0, 480.0), Some(0.0));
+        assert_eq!(tad(&d, 0.0, 485.0), Some(5.0));
+        assert_eq!(tad(&d, 0.0, 492.0), Some(0.0), "one full interval on");
+        assert_eq!(tad_referent(&d, 0.0, 479.9), None);
+    }
+
+    /// `tad_at` folds `tad_referent` and reports `NaN` where nothing has a referent — the
+    /// *reporting* tail, deliberately different from `tad_anchor_for`'s first-arrival
+    /// fallback. Both spellings of the fold used to be written out by hand beside each other.
+    #[test]
+    fn tad_at_folds_the_referents_and_reports_nan_when_none_exists() {
+        use super::tad_at;
+        let doses = [plain(0.0), ss_dose()];
+        // Inside the SS dose's pre-arrival window the SS referent (471) outranks the
+        // ordinary dose's arrival (3), so the fold must pick it rather than the max time.
+        assert_eq!(tad_at(&doses, &[3.0, 3.0], 481.0), 10.0);
+        // Past the SS arrival it is back on the periodic fold.
+        assert_eq!(tad_at(&doses, &[3.0, 3.0], 485.0), 2.0);
+        // A short slice means zero lag on the remaining doses, and `&[]` means all of them.
+        assert_eq!(
+            tad_at(&doses, &[3.0], 485.0),
+            5.0,
+            "dose 1 unlagged: pulse at 480"
+        );
+        assert_eq!(tad_at(&doses, &[], 485.0), 5.0);
+        // Nothing has a referent yet.
+        assert!(tad_at(&doses, &[3.0, 3.0], -1.0).is_nan());
+        // …and a dose-free subject.
+        assert!(tad_at(&[], &[], 5.0).is_nan());
+    }
+
+    /// `tad_at` folds with `f64::max`, which **discards** `NaN` — so a `Some(NaN)` referent
+    /// would be silently dropped and the answer taken from the other doses.
+    ///
+    /// `tad_referent` cannot produce one, and this pins that rather than leaving it to
+    /// inspection: every non-finite `dose.time`/`lag`/`ii` combination must come back `None`
+    /// (a comparison against `NaN` is `false`, so both guards fall through), and the one
+    /// infinite case that *does* pass a guard must still yield a finite referent.
+    #[test]
+    fn tad_referent_never_returns_a_nan_referent() {
+        let mut nan_time = ss_dose();
+        nan_time.time = f64::NAN;
+        assert_eq!(tad_referent(&nan_time, 3.0, 481.0), None, "NaN dose time");
+
+        let d = ss_dose();
+        assert_eq!(tad_referent(&d, f64::NAN, 481.0), None, "NaN lag");
+        assert!(
+            tad_referent(&d, 3.0, f64::NAN).is_none(),
+            "NaN observation time"
+        );
+
+        let mut nan_ii = ss_dose();
+        nan_ii.ii = f64::NAN;
+        // `ii > 0.0` is false for NaN, so this takes the ordinary-dose arm and never reaches
+        // `rem_euclid(NaN)`.
+        assert_eq!(tad_referent(&nan_ii, 3.0, 485.0), Some(483.0));
+
+        let mut inf_ii = ss_dose();
+        inf_ii.ii = f64::INFINITY;
+        // `elapsed.rem_euclid(inf)` is `elapsed` for a positive elapsed, so the referent is
+        // the arrival — finite, not NaN.
+        assert_eq!(tad_referent(&inf_ii, 3.0, 485.0), Some(483.0));
+
+        // The whole point: had any of the above returned `Some(NaN)`, this fold would have
+        // hidden it behind the ordinary dose.
+        let doses = [plain(0.0), nan_time];
+        assert_eq!(super::tad_at(&doses, &[3.0, 3.0], 481.0), 478.0);
+    }
+
+    /// **A cross-PR invariant nothing else enforces.**
+    ///
+    /// `crate::types::Subject::time_after_dose_at_or_before` (#1182/#1273) documents itself as
+    /// keeping "the same tie rule as the lag-aware `tad_at_time`" — i.e. as *this* fold under
+    /// zero lag. That is a claim about code in another module, written by another change, and
+    /// #1273's own test compares its two conventions against each other rather than against
+    /// this one. So nothing would have gone red if #1126 had moved the tie while collapsing
+    /// the folds: `tad_referent` picks `arrival <= t + TAD_EPS`, and a strict `<` there would
+    /// have been just as plausible a spelling.
+    ///
+    /// Pinned on the row where the two data conventions are known to differ from each other
+    /// (`obs@24` with `dose@0, dose@24`), so this sits exactly on the boundary rather than
+    /// somewhere every spelling agrees.
+    #[test]
+    fn the_zero_lag_fold_breaks_a_same_time_tie_the_way_the_sdtab_fallback_does() {
+        use crate::types::Subject;
+        let subject = Subject {
+            id: "1".into(),
+            doses: vec![plain(0.0), plain(24.0)],
+            obs_times: vec![0.0, 2.0, 23.9, 24.0, 30.0],
+            ..Default::default()
+        };
+        let mine: Vec<f64> = subject
+            .obs_times
+            .iter()
+            .map(|&t| super::tad_at(&subject.doses, &[], t))
+            .collect();
+        let theirs: Vec<f64> = (0..subject.obs_times.len())
+            .map(|j| subject.time_after_dose_at_or_before(j))
+            .collect();
+        assert_eq!(
+            mine, theirs,
+            "the zero-lag fold and the sdtab fallback must agree on every row, including the \
+             same-time tie at t = 24 where a dose record and an observation share a TIME"
+        );
+        // The straddle: assert the fixture actually reaches the tie, so this cannot quietly
+        // become a comparison of two functions on rows where every spelling agrees.
+        assert_eq!(
+            mine[3], 0.0,
+            "obs@24 takes the dose at 24 — NONMEM record order"
+        );
+        assert_eq!(
+            subject.time_after_dose(3),
+            24.0,
+            "…and Pharmpy's `get_doseid` convention deliberately does NOT. If this stops \
+             differing, the fixture no longer sits on the boundary and the assertion above \
+             has stopped meaning anything"
+        );
+
+        // ### The steady-state arm, which is the half that is literally duplicated
+        //
+        // `Subject::data_tad`'s SS branch is `obs_t - elapsed.rem_euclid(d.ii)` — the same
+        // expression as [`tad_referent`]'s, character for character. The non-SS rows above
+        // do not reach it, and neither does #1273's own `subject_time_after_dose_is_the_data_tad`
+        // (two plain doses). So until this block, the one genuinely copy-pasted line between
+        // the two kernels was compared by nothing at all.
+        //
+        // The two cannot be collapsed: `data_tad` needs a tie-convention switch this function
+        // has no use for, and this function needs a lag argument and the seeded pre-arrival
+        // branch `data_tad` has no use for. They stay two — so the periodic fold they share
+        // is pinned here instead, over a full cycle plus the wrap.
+        let ss_subject = Subject {
+            id: "1".into(),
+            doses: vec![ss_dose()],
+            obs_times: vec![480.0, 483.0, 485.0, 491.5, 492.0, 495.0],
+            ..Default::default()
+        };
+        let ss_mine: Vec<f64> = ss_subject
+            .obs_times
+            .iter()
+            .map(|&t| super::tad_at(&ss_subject.doses, &[], t))
+            .collect();
+        let ss_theirs: Vec<f64> = (0..ss_subject.obs_times.len())
+            .map(|j| ss_subject.time_after_dose_at_or_before(j))
+            .collect();
+        assert_eq!(
+            ss_mine, ss_theirs,
+            "the periodic SS fold is written out in both kernels; they must not drift"
+        );
+        // And the fixture has to actually wrap, or it is comparing two functions on a
+        // monotone ramp where any fold agrees.
+        assert_eq!(ss_mine[0], 0.0, "the record itself");
+        // 491.5, not 491.9: `491.9 - 480.0` is `11.899999999999977` in binary, so a
+        // literal `11.9` here fails on the float and not on the fold. Halves are exact.
+        assert_eq!(ss_mine[3], 11.5, "just before the next virtual pulse");
+        assert_eq!(ss_mine[4], 0.0, "…and the wrap back to zero at II");
+    }
+
+    /// `SS=1` with a non-positive `II` is not a periodic train — `W_STEADY_STATE_II` warns and
+    /// every engine treats the dose as an ordinary bolus. Both arms must therefore skip the SS
+    /// branches, the new one included, or the pre-arrival window would be filled from an
+    /// `ss_seed_phase` of `0 − lag`.
+    #[test]
+    fn an_ss_dose_with_no_interval_is_treated_as_an_ordinary_dose() {
+        let d = DoseEvent::new(480.0, 100.0, 1, 0.0, true, 0.0);
+        assert_eq!(tad_referent(&d, 3.0, 481.0), None, "not yet arrived");
+        assert_eq!(tad(&d, 3.0, 483.0), Some(0.0));
+        assert_eq!(
+            tad(&d, 3.0, 500.0),
+            Some(17.0),
+            "no wrap without an interval"
+        );
     }
 }

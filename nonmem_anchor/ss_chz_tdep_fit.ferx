@@ -1,0 +1,55 @@
+# SS=1 dose x ODE-accumulated cumulative hazard (#1210) — TIME-DEPENDENT arm.
+#
+# The ferx twin of `nonmem_anchor/ss_chz_r2_tdep.ctl`: the drug arm times a Gompertz
+# baseline, `H0 * exp(GAM*TIME) * exp(BETA*C)` with `GAM = 0.15`.
+#
+# This arm exists because the model clock is the thing an SS run-in displaces. The NONMEM
+# stream writes the baseline as `EXP(GAM*(T-600))`, anchored on the record start rather
+# than on the pulse train's own origin, so `TIME` here and `T - 600` there are the same
+# quantity — which is exactly the identification an SS equilibration must not disturb. It
+# is the oracle for the 2.6e9 row of #1210's before-table, where ferx's SS arm evaluated
+# the baseline 600 hours into the run-in.
+#
+# ferx time `t` corresponds to NONMEM time `600 + t`.
+
+[parameters]
+  theta TVCL(1.0, FIX)
+  theta TVV(10.0, FIX)
+  theta TVKA(1.0, FIX)
+  theta TVH0(0.02, FIX)
+  theta TVBETA(0.5, FIX)
+  theta TVGAM(0.15, FIX)
+
+  # No omega: the NONMEM twin runs `$OMEGA 0 FIX`, so both sides evaluate at eta = 0.
+  sigma PROP_ERR ~ 0.01            # variance; NONMEM `$SIGMA 0.01`
+
+[individual_parameters]
+  CL   = TVCL
+  V    = TVV
+  KA   = TVKA
+  H0   = TVH0
+  BETA = TVBETA
+  GAM  = TVGAM
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+
+[scaling]
+  obs_scale = V                    # states are AMOUNTS; NONMEM's `$ERROR` divides by V
+
+[event_model]
+  cmt    = 3
+  hazard = H0 * exp(GAM * TIME) * exp(BETA * (central / V))
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 0
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11

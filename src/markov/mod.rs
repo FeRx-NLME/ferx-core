@@ -90,7 +90,7 @@ pub struct StateObs {
 /// Structural / data-invariant violations in a CTMM data term.
 ///
 /// These are distinct from a numerically ill-defined likelihood (which returns
-/// [`SENTINEL_NLL`]): a `MarkovError` does not depend on the parameter values
+/// `SENTINEL_NLL`): a `MarkovError` does not depend on the parameter values
 /// and signals a malformed generator or malformed data — a caller bug that no
 /// amount of optimization can fix, so it fails loud instead of being buried in
 /// the objective.
@@ -407,7 +407,7 @@ pub(crate) fn has_negative_offdiagonal(q: &DMatrix<f64>) -> bool {
 /// `dq[a]` must be a valid generator *direction* (zero row sums). The caller gets that for
 /// free by differentiating the intensities — see `CtmmGeneratorProgram::eval_generator_duals`.
 ///
-/// Returns `Ok(None)` where [`ctmm_data_term`] returns [`SENTINEL_NLL`]: at a degenerate
+/// Returns `Ok(None)` where [`ctmm_data_term`] returns `SENTINEL_NLL`: at a degenerate
 /// generator the value is a flat repellent constant with no meaningful derivative, so the
 /// caller falls back to FD for that point rather than being handed a zero (or garbage)
 /// gradient. Errors mirror [`ctmm_data_term`] exactly.
@@ -486,7 +486,7 @@ pub fn ctmm_data_term_grad(
 /// - **Structural / data errors** → [`MarkovError`] (fail loud): non-square or
 ///   too-small generator, a state index out of range, a non-finite time, times
 ///   that decrease, or two different states reported at the same instant.
-/// - **Numerically degenerate likelihood** → `Ok(`[`SENTINEL_NLL`]`)`: a
+/// - **Numerically degenerate likelihood** → `Ok(SENTINEL_NLL)`: a
 ///   parameter guess under which an *observed* transition has non-positive
 ///   (underflowed) probability. This is a large finite objective that repels the
 ///   optimizer, exactly as the `survival` module does with its `1e20` sentinel.

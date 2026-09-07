@@ -30,6 +30,8 @@ fn test_sdtab_ipred_honours_tv_covariates() {
     // ── Minimal CompiledModel: 1-cpt IV bolus, CL scaled by per-event WT ──
     let omega = OmegaMatrix::from_diagonal(&[0.04], vec!["ETA_CL".into()]);
     let default_params = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0, 50.0], // TVCL = 5, TVV = 50
         theta_names: vec!["TVCL".into(), "TVV".into()],
         theta_lower: vec![0.1, 5.0],
@@ -44,8 +46,10 @@ fn test_sdtab_ipred_honours_tv_covariates() {
         sigma_fixed: vec![false],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     };
     let model = CompiledModel {
+        covariate_model: None,
         name: "tv_cov_sdtab_regression".into(),
         pk_model: PkModel::OneCptIv,
         error_model: ErrorModel::Proportional,
@@ -78,6 +82,7 @@ fn test_sdtab_ipred_honours_tv_covariates() {
         omega_init_as_sd: vec![false],
         sigma_init_as_sd: vec![false],
         kappa_init_as_sd: Vec::new(),
+        kappa_weights: Vec::new(),
         mu_refs: HashMap::new(),
         kappa_mu_refs: HashMap::new(),
         tv_fn: None,
@@ -96,6 +101,7 @@ fn test_sdtab_ipred_honours_tv_covariates() {
         has_conditional_eta_params: false,
         eta_param_info: Vec::new(),
         theta_transform: Vec::new(),
+        theta_eta_linked: Vec::new(),
         #[cfg(feature = "nn")]
         covariate_nns: Vec::new(),
         scaling: ScalingSpec::None,
@@ -111,6 +117,7 @@ fn test_sdtab_ipred_honours_tv_covariates() {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     };
 
     // Subject with TV WT: subject.covariates["WT"] = 70 (the no-TV snapshot)
@@ -142,10 +149,12 @@ fn test_sdtab_ipred_honours_tv_covariates() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0, 0, 0],
         occasions: vec![1, 1, 1],
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -219,6 +228,7 @@ fn test_sdtab_ipred_honours_tv_covariates() {
         &h_matrices,
         &kappas,
         true,
+        None,
     );
     assert_eq!(results.len(), 1);
     let sdtab_ipred = &results[0].ipred;
@@ -308,10 +318,12 @@ fn test_sdtab_iwres_uses_block_sigma_correlation() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0],
         occasions: vec![1],
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -344,6 +356,7 @@ fn test_sdtab_iwres_uses_block_sigma_correlation() {
         &h_matrices,
         &kappas,
         false,
+        None,
     );
 
     let f = ipred[0];
@@ -364,6 +377,8 @@ fn test_sdtab_iwres_uses_block_sigma_correlation() {
 #[test]
 fn test_simulate_honours_tv_covariates() {
     let default_params = ModelParameters {
+        residual_correlations: Vec::new(),
+        residual_correlation_fixed: Vec::new(),
         theta: vec![5.0, 50.0],
         theta_names: vec!["TVCL".into(), "TVV".into()],
         theta_lower: vec![0.1, 5.0],
@@ -378,8 +393,10 @@ fn test_simulate_honours_tv_covariates() {
         sigma_fixed: vec![false],
         omega_iov: None,
         kappa_fixed: Vec::new(),
+        mixture: None,
     };
     let model = CompiledModel {
+        covariate_model: None,
         name: "tv_cov_sim_regression".into(),
         pk_model: PkModel::OneCptIv,
         error_model: ErrorModel::Proportional,
@@ -407,6 +424,7 @@ fn test_simulate_honours_tv_covariates() {
         omega_init_as_sd: Vec::new(),
         sigma_init_as_sd: vec![false],
         kappa_init_as_sd: Vec::new(),
+        kappa_weights: Vec::new(),
         mu_refs: HashMap::new(),
         kappa_mu_refs: HashMap::new(),
         tv_fn: None,
@@ -425,6 +443,7 @@ fn test_simulate_honours_tv_covariates() {
         has_conditional_eta_params: false,
         eta_param_info: Vec::new(),
         theta_transform: Vec::new(),
+        theta_eta_linked: Vec::new(),
         #[cfg(feature = "nn")]
         covariate_nns: Vec::new(),
         scaling: ScalingSpec::None,
@@ -440,6 +459,7 @@ fn test_simulate_honours_tv_covariates() {
         analytic_readout: None,
         ruv_magnitude: None,
         absorption_ode_equivalent: None,
+        mixture: None,
     };
 
     let mut baseline_cov = HashMap::new();
@@ -464,10 +484,12 @@ fn test_simulate_honours_tv_covariates() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0, 0, 0],
         occasions: vec![1, 1, 1],
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };

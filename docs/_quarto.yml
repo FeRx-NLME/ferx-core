@@ -6,9 +6,12 @@ brand: _brand.yml
 
 website:
   title: "ferx-core"
-  description: "Rust nonlinear mixed effects modeling engine for ferx"
+  description: "Open-source nonlinear mixed-effects modeling for population PK/PD and pharmacometrics"
   favicon: assets/ferx-favicon.svg
   site-url: https://ferx-nlme.github.io/ferx-core/
+  open-graph:
+    locale: en_US
+  twitter-card: true
   repo-url: https://github.com/FeRx-NLME/ferx-core
   repo-actions: [edit, issue]
 
@@ -57,6 +60,7 @@ website:
           - model-file/iov.qmd
           - model-file/individual-parameters.qmd
           - model-file/covariates.qmd
+          - model-file/covariate-model.qmd
           - model-file/structural-model.qmd
           - model-file/lagtime.qmd
           - model-file/steady-state.qmd
@@ -91,10 +95,21 @@ website:
           - estimation/frem.qmd
           - estimation/impmap.qmd
           - estimation/bayes.qmd
+          - estimation/vi.qmd
+          - estimation/parameterization.qmd
           - estimation/optimizers.qmd
           - estimation/tte.qmd
           - estimation/categorical.qmd
           - estimation/ctmm.qmd
+          - estimation/mixture.qmd
+      - text: "Tools"
+        contents:
+          - tools/bootstrap.qmd
+          - tools/gam-screening.qmd
+          - tools/search.qmd
+          - tools/covsearch.qmd
+          - tools/modelsearch.qmd
+          - tools/ruvsearch.qmd
       - text: "Data Format"
         href: data-format.qmd
       - text: "CLI Reference"
@@ -135,6 +150,7 @@ website:
           - api/fitting.qmd
           - api/simulation.qmd
           - api/parsing.qmd
+          - api/model-editing.qmd
       - text: "FAQ"
         href: faq.qmd
       - text: "Development"
@@ -142,6 +158,7 @@ website:
         contents:
           - development/contributing.qmd
           - development/sdlc.qmd
+          - development/docs-lint.qmd
 
   page-footer:
     background: light
@@ -151,13 +168,19 @@ website:
 
 format:
   html:
+    canonical-url: true
     theme:
       light: [cosmo, assets/ferx.scss]
       dark: [cosmo, assets/ferx-dark.scss]
     css: styles.css
     toc: true
-    toc-depth: 3
+    toc-depth: 4
     number-sections: false
+    grid:
+      sidebar-width: 250px
+      body-width: 1000px
+      margin-width: 250px
+      gutter-width: 1.5rem
     code-link: true
     code-copy: true
     code-overflow: wrap

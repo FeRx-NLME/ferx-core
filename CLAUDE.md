@@ -12,9 +12,85 @@ The R wrapper package lives at `../ferx-r` (sibling directory). The R package's 
 
 Note that ferx-r's **CI** does not get the change automatically: it builds from the ferx-core commit pinned in `ferx-r/src/rust/Cargo.lock` (the patch only applies locally). A ferx-r PR that needs a new ferx-core commit — e.g. a newly-`pub` API — must bump that lock, via `ferx-r/tools/update-ferx-core-lock.sh` (never a bare `cargo update`, which the patch will unpin). Otherwise CI fails with `error[E0603]: ... is private`.
 
+### Downstream repos pin ferx-core *transitively* — there is no ferx-core SHA to hand out
+
+`ferxtranslate` (and anything else built on the R package) does not depend on ferx-core directly: it pins **ferx-r** at a commit, and that ferx-r commit's `src/rust/Cargo.lock` pins ferx-core. So a merge here is **not** reachable downstream until two bumps land, in order — ferx-r's `Cargo.lock`, then the downstream repo's ferx-r pin. Do not tell a downstream maintainer to "pin ferx-core at `<sha>`"; there is no such knob on their side.
+
+The trap that makes this easy to get wrong: reading `ferx-r/src/rust/Cargo.toml` alone shows `branch = "main"` and reads as *unpinned*. **The lock is the pin.** Check it, don't infer it:
+
+```bash
+git -C ../ferx-r show origin/main:src/rust/Cargo.lock | grep -A2 'name = "ferx-core"'
+```
+
+When a change here matters to a downstream consumer, tell them the two-step and the current lock rev — not a ferx-core SHA.
+
 ## Worktree isolation
 
 When working on a feature branch or any branch other than `main`, always use `EnterWorktree` at the start of the session. This prevents uncommitted WIP from one session contaminating another session on a different branch (a real problem when two chats share the same checkout directory).
+
+## Workspace layout and the public-API boundary
+
+The repo is a cargo **workspace** whose root package is `ferx-core` itself:
+
+```
+ferx-core/                       # repo root = ferx-core package + workspace root
+├─ Cargo.toml                    # [package] ferx-core + [workspace] members
+├─ src/                          # the engine
+├─ api/ferx-core-public-api.txt  # public-API baseline, diffed in CI
+└─ crates/
+   ├─ ferx-tools/                # depends on ferx-core
+   ├─ ferx-cli/                  # depends on ferx-core; [[bin]] name = "ferx"
+   └─ docs-lint/                 # dev tooling; depends on NOTHING (see Documentation)
+```
+
+`docs-lint` sits outside the layering above: it is a structural linter for
+`docs/**/*.qmd`, it depends on no crate in the workspace (not even `ferx-core`),
+and nothing may depend on it. Keeping it dependency-free is what lets its CI job
+be seconds of compile instead of landing on the `ferx-core` compile path (#969).
+
+**The root package must stay `ferx-core`.** `ferx-r/src/rust/.cargo/config.toml`
+patches `ferx-core = { path = "../../../ferx-core" }` — the repo *root*. Moving
+the package under `crates/` breaks every local ferx-r build, and breaks it
+*silently*: the patch stops applying and ferx-r quietly builds `main` instead of
+your branch.
+
+**Boundary rule.** `ferx-core` = one model, one dataset, one fit. `ferx-tools` =
+many fits, resampling, model-space search. If it calls `fit()` more than once, it
+is a tool. Statistical kernels (npde, CWRES, shrinkage, covariance/SE, SIR, FREM,
+VPC statistics) stay in core; orchestration of repeated fits goes to `ferx-tools`.
+`ferx-cli` is thin — argument parsing, printing, exit codes, no numerical or
+orchestration logic. The dependency is strictly one-way: `ferx-core` never
+depends on either member (pinned by `tests/public_api_boundary.rs`).
+
+**Widening the public API is a design step, not paperwork.** `api/ferx-core-public-api.txt`
+is a committed `cargo public-api` snapshot; the `Public API baseline` CI job
+regenerates and diffs it, so any new `pub` item fails CI until the baseline is
+updated **in the same PR**. When a change genuinely needs a wider surface:
+
+```bash
+tools/update-public-api.sh          # regenerate the baseline
+tools/update-public-api.sh --check  # what CI runs
+```
+
+and say in the PR description which tool needs each added item and why the
+existing surface does not suffice. Two rules make this stick:
+
+- **No `#[doc(hidden)] pub` escape hatch.** `cargo public-api` omits
+  `#[doc(hidden)]` items entirely, so the attribute is a *working bypass* of the
+  gate — which is why `tests/public_api_boundary.rs` bans it outright. An item is
+  either public API (documented, in the baseline, usable from ferx-r) or it stays
+  `pub(crate)` and the caller does without.
+- **The ferx-r reachability test.** Anything `ferx-tools` needs must also be
+  reachable from ferx-r, which consumes `ferx-core` as an ordinary external
+  crate. An API that only makes sense "because we're in the same workspace" is
+  the wrong API.
+
+**Feature flags belong to `ferx-core`, not to the members**, so a workspace-wide
+or member-scoped command has to write them package-qualified — `--features
+ferx-core/ci`, not `--features ci` (which fails with "none of the selected
+packages contains this feature"). Qualifying them also keeps the members linking
+the `ferx-core` rlib the other CI steps just built, instead of forcing a second
+compile under a different feature hash.
 
 ## First-time setup
 
@@ -24,20 +100,80 @@ After cloning, activate the shared pre-commit hook (blocks commits that fail `ru
 git config core.hooksPath .githooks
 ```
 
+## Before you push: `tools/preflight.sh`
+
+**A green test suite is not a green build.** The CI feature sets are *not nested*:
+`cargo test --features ci,survival` compiles neither the `nn`-gated nor the
+`slow-tests`-gated source, so a file behind those cfgs can be broken while the
+entire suite passes. On #1133 exactly that happened — one struct literal in
+`src/estimation/nn_theta_gradient_tests.rs` turned three CI jobs red after a
+local run of 158 binaries / 4634 tests reported clean.
+
+So run the fast gates before pushing:
+
+```bash
+tools/preflight.sh            # fmt, the 5 cargo check feature sets, clippy, rustdoc, docs, public-API
+tools/preflight.sh check      # just the check matrix, for a tight edit loop
+tools/preflight.sh --list     # show the commands without running them
+```
+
+`.github/workflows/ci.yml` invokes this same script for its `Check`, `Clippy`,
+`Format`, `Rustdoc` and `Docs lint` jobs, and `.githooks/pre-commit` calls its `fmt` group, so the
+local gate, the hook and the CI gate cannot drift — the same contract
+`tools/update-public-api.sh` uses for the API baseline. **Add a new gate to the
+script, not to the workflow**; groups are enumerated once, in the `ALL_GROUPS`
+array. On failure it names the CI job that would have gone red.
+
+It does **not** cover the test jobs. `cargo check --tests` compiles the test
+targets and runs nothing, so `Tests + coverage (core)` can still go red after a
+green preflight. This gates compilation and lint, not behaviour. The one
+exception is the `docs` group, which *runs* `cargo test -p docs-lint`: that
+crate's gate is its test run — a filesystem walk over `docs/`, not a fit — and
+it also carries `cargo clippy -p docs-lint`, since the `clippy` group is scoped
+to `ferx-core` and its two library members and would leave it unlinted.
+
+`rustdoc` and `docs` are two different gates and the names are easy to swap.
+`rustdoc` denies rustdoc's own warnings on `src/**` doc comments — an intra-doc
+link that does not resolve, or that resolves to a `pub(crate)` item, renders in
+the HTML with its markdown brackets intact (`[<code>name</code>]`) and in
+rust-analyzer hover the same way. Fix those at the link: inline code for an
+internal target, a resolvable path (`[`crate::run_covariance`]`) for a public
+one. Never with a crate-level `#![allow(rustdoc::...)]` in `src/lib.rs` — that
+switches the lint off for every future link too, and
+`tests/preflight_owns_the_fast_gates.rs` fails if one appears. `docs` is the
+structural linter on `docs/**/*.qmd` described below.
+
+Two traps it exists to cover: clippy runs `--all-targets` (without it, every
+`#[cfg(test)]` module and all of `tests/` goes unlinted — #1023), and the
+workspace members need **package-qualified** features (`ferx-core/ci`, not `ci`,
+which fails outright — #1114).
+
+`tests/preflight_owns_the_fast_gates.rs` pins the whole arrangement, and the
+invariant worth knowing when editing the script is that **`run` exits rather
+than returns** on failure. That is not style. The first version returned a
+status through a group function and a `case … esac || { …; exit 1; }`, and bash
+suspends `errexit` for every command of an AND-OR list but the last — then
+carries that suspension into the called function's whole body. Four of the five
+`cargo check` lines could fail with the script printing `preflight OK` and
+exiting 0. The guard now fails each command position in turn behind a fake
+`cargo` and asserts a non-zero exit, so a gate that stops gating is a red test.
+
 ## Build & Run Commands
 
 ```bash
-# Build (debug)
+# Build the library (debug)
 cargo build
 
-# Build (release, with fat LTO)
-cargo build --release
+# Build everything, including the `ferx` binary (release, with fat LTO).
+# The repo is a workspace: the root package is the `ferx-core` LIBRARY and no
+# longer carries a binary, so a bare `cargo build --release` produces no `ferx`.
+cargo build --release --workspace          # or: -p ferx-cli
 
 # Run CLI with data file
-cargo run --release -- examples/warfarin.ferx --data data/warfarin.csv
+cargo run --release -p ferx-cli -- examples/warfarin.ferx --data data/warfarin.csv
 
 # Run CLI with simulated data
-cargo run --release -- examples/warfarin.ferx --simulate
+cargo run --release -p ferx-cli -- examples/warfarin.ferx --simulate
 
 # Check compilation without building
 cargo check
@@ -91,7 +227,149 @@ These run nightly via `slow-tests.yml` and on any push to `main` that touches es
 > added when that tool is available in the environment; its absence does not block the closed-form
 > + reduction validation above.
 
-**Every change to an analytic sensitivity, gradient, marginal, or likelihood path requires a `Dual2`-vs-FD parity test.** The closed-form PK solutions and event-driven propagators are written once as generic `*_g<T: PkNum>` functions; instantiating `T = Dual2<M>` yields the exact `∂f/∂η` / `∂f/∂θ` that FOCE/FOCEI/HMC consume (`sens/`). A wrong sensitivity compiles and runs silently — there is no second copy of the formula to disagree with it — so when you add or modify one of these kernels, or the provider that assembles them, assert it against central finite differences of the `T = f64` production predictor, to tolerance, in a Tier-1 unit test. Follow the existing pattern: per-kernel `*_g_dual_matches_fd` checks (`sens/propagate.rs`, `sens/dual2.rs`) and the end-to-end `check_full_provider_vs_fd` harness (`sens/provider_tests.rs`). If a model is outside the analytic scope it must route to FD via the support predicates (`sens_supported` / `analytic_inner_grad_supported_model`); unit-test that routing so a scope gap fails loudly to FD instead of silently returning a wrong gradient. (This is the post-Enzyme successor to the retired `AD↔FD` parity rule — see #285 / #281.)
+> **Exception — a hazard time outside the span NONMEM can express.** The `TENTRY` column has no
+> NONMEM analogue for an **ODE-accumulated** (drug-driven) hazard: NONMEM has no left-truncation
+> record for `$DES`-integrated `A(chz)`, and its own steady-state routine cannot be handed the
+> augmented system at all (`nonmem_anchor/ss_chz_r1_*`, a measured negative result). So a change
+> to how a hazard time **at or before the subject's first record** is scored (#1223) has no
+> equivalent run to anchor against — the quantity is defined by where ferx starts integrating,
+> which is the very thing NONMEM spells differently (it integrates from the first record of any
+> `EVID`; ferx from the first dose or scored observation). Validate these with: (a) an **exact
+> hand-computed value** rather than a second engine — before the first event nothing has acted on
+> the system, so `H = 0` and `h = h(u₀)` are closed forms, not tolerances; (b) **agreement across
+> every production caller** of the quantity (the #570 shared solve, `ode_cumhaz_hazard`, and
+> `predict_survival`), asserted per caller so the failure names which one drifted — noting that
+> callers routing to the same engine are callers, **not** independent geometries, and the PR must
+> say which is which; and (c) a **differential pair straddling the boundary** — a pre-start time
+> must contribute nothing while a post-start one must move the objective, since either half alone
+> is satisfied by an implementation that ignores the field entirely.
+>
+> **This is not a licence to skip an anchor that is merely awkward to build**, and the
+> counter-example lives in the same subsystem: `ss_chz_r5_drug_lag` (#1220) anchors a mid-record
+> `SS=1` dose whose lag exceeds `II`, on a drug-driven hazard — an object that reads as
+> unanchorable, because NONMEM's own SS routine returns `+INF` on the augmented system and no
+> *shifted* train reproduces a clamped seed phase. It was anchored anyway, by dropping `ALAG`
+> from the NONMEM side entirely and placing a plain pulse train at the ferx side's lagged
+> **arrivals**. Reach for this exception only when the quantity has no NONMEM spelling at all —
+> not when the construction is hard to find.
+
+**An oracle — NONMEM anchor, ODE twin, or FD parity — must keep every side of the object under test non-degenerate.** A
+single-dose dataset cannot test a dose event's *incoming* side: the state is zero
+before a first arrival, so `g(x⁻) = 0` and any error there cancels rather than
+showing up. Pair every dose-event anchor with a **multi-dose** case whose later dose
+lands with residual drug present, and check that the quantity under test is actually
+live on both sides — a covariate that genuinely differs across the boundary, a
+covariate on the compartment the dose *lands in* rather than only on downstream ones,
+an `init(...)` baseline where a first dose would otherwise start from zero. The same
+applies to a fixture asserted against ferx's own predictor: it agrees with a wrong
+answer by construction whenever both paths share the convention under test, so the
+external reference is what has to see both sides. Two engines are not automatically
+two references either — a cross-engine oracle only sees a defect *downstream* of the
+point where the engines part. #1079's κ = 0 readout was catchable that way because
+each engine applies the readout itself, but the per-occasion snapshot feeding
+`ALAG`/`F`/`D{n}`/`R{n}` is built in `predict_iov` *before* the `ode_spec` branch, so
+both arms inherit it and an analytic-vs-ODE twin would agree on a wrong one. #1060
+shipped a green single-dose anchor next to a 14.9-OFV multi-dose divergence (#1073)
+that no fixture could see.
+When an anchor does fail, vary **one input at a time** — the pair that differs by a
+single number is what localises the defect (`nonmem_anchor/tvcov_lag_saltation*`).
+
+**The oracle has to be more accurate than the difference you are about to call a defect.**
+An oracle outside that regime measures itself, not the thing under test — and an ODE twin at
+default tolerances is not automatically an oracle. `verify_against_ode_twin`
+(`pk/modified_release.rs`) compared the MR closed form against `ode_predictions` at
+`verify_tol = (500·reltol).max(1e-4)`, derived from `reltol` alone; but Dormand–Prince
+controls local error as `abstol + reltol·|y|`, so the twin's own
+relative accuracy is `abstol/|y| + reltol` and a state decayed to the order of `abstol` has no
+significant digits left. Measured on #1124/#1130: `central` fell to 1.3e-6 against that spec's
+`abstol = 1e-6`, the twin said 29.484, the closed form said 24.574829 — and the exact Bateman
+superposition is 24.574829, so the *twin* was 20% high and the check aborted a correct fit in
+debug. Gate the comparison on the condition for the oracle to outrank the disagreement, and
+when you cannot tell an oracle artifact from a real defect, **compute the quantity a third
+way, outside both engines** — a 30-line Bateman sum in Python settled that one after two
+wrong hypotheses reasoned from the code. Swapping oracles is changing the experiment, too:
+moving that twin to `ode_predictions_with_states` silently adopted a *wrong* reference, because
+at the time it dropped a lagged `zero_order` input rate that `ode_predictions` applied — a real
+public-API defect the swap surfaced, since fixed (#1171).
+
+**Measure the tolerance; never justify it with a story.** Run the comparison, print the worst
+realised error, put that number in the comment, and pick the bound from it with stated
+headroom. On PR #1174 a NONMEM POSTHOC sdtab anchor was set at `3e-2` with the explanation
+that the two inner optimizers "stop at slightly different η̂"; the realised error was
+**4.736e-5** — 630× tighter — and ferx's η̂ matches NONMEM's `.phi` to ~6 significant figures,
+so the stated mechanism was not conservative but wrong. A bound that loose is not safe, it is
+a test that has quietly stopped testing: at `3e-2` a regression delivering 99% of the absorbed
+mass passes green, and that was the only end-to-end `fit()` → sdtab check against an external
+reference. If the realised error surprises you, chase it — that is information.
+
+**When the bug report is "two implementations disagree", the fix is one implementation.** This
+is the `*_g<T: PkNum>` rule in *Analytic Sensitivities* below, generalised past `sens/` to any
+two engines, and it buys a *test* property: after #1223 extracted `fill_prestart_states`, one
+mutation of the helper reddens both the dense and the shared solve, where the dedicated-engine
+control had needed its own. A comment calling a second copy "the exact twin of" restores by
+prose exactly the configuration that produced the defect. If two callers genuinely cannot
+share, record the asymmetry at the call site.
+
+**A green test is not evidence that it can fail.** The rule above is about a fixture that
+cannot expose the defect; these are three ways the *assertion* cannot observe it, all three
+found on #1166 in tests that had been written, run green and believed:
+
+- **A differential pair must straddle the gate under the OLD behaviour.** A routing oracle
+  compared `hazard = h` against `h * (1.0 + 0.0*TIME)` — the exact IEEE identity, so any
+  difference is a difference of engine — and asserted bit-identity. Both spellings read `TIME`,
+  so both took the same arm before *and* after the fix and agreed either way. Put the twins on
+  opposite sides of the predicate, and assert the straddle itself so it cannot silently become
+  a tautology again.
+- **A fast path can make the mutation unreachable.** "Filter by slot, not by name" was tested
+  on a model with no `[event_model]` — but with no injected slots the code short-circuits
+  before the filter runs, so a name-prefix mutation sailed through. If the code has an
+  `if xs.is_empty()` arm, a fixture with `xs` empty tests that arm, not the logic behind it.
+- **`f64::max` / `f64::min` discard `NaN`** — `0.0f64.max(NaN)` is `0.0` and
+  `f64::INFINITY.min(NaN)` is `inf`, verified, not recalled — so `worst = worst.max((got -
+  want).abs())` keeps whatever the *finite* records produced and the bound passes on the
+  strength of the rows that worked. Five folded accumulators across `pktte_tdep_nonmem_anchor`'s
+  three tests had that shape when it was written; a regression making the solver return `NaN` —
+  the likeliest way to break the thing being anchored — would have gone green. Assert
+  `is_finite()` before folding. That anchor's one *direct* `(total - want).abs() < tol` was
+  already safe, since any comparison against `NaN` is `false`; only the fold hides it.
+  `filter_map(…ok())` and `unwrap_or(0.0)` absorb failures the same way.
+- **Two redundant gates cover for each other.** A #1229 check filtered on the coordinate's
+  *kind* inside the loop and on a second, derived per-coordinate table right after — both
+  correct, both excluding exactly the same inputs. Deleting either left the whole suite green,
+  so the test pinning that the check excludes Σ could not fail. When a
+  predicate has two conditions that reject the same inputs that is a test hole, not
+  belt-and-braces: collapse to one gate and re-run the mutation. Reading the code missed this
+  twice; only mutation found it.
+- **`is_finite()` cannot see a sentinel.** It is the right assertion for a *diverged* solve
+  (`NaN`/`inf`) and the wrong one for a subject that was **repelled**: `tte_nll_from_curves`
+  maps a `NaN` `H` to `1e20`, a perfectly finite `f64`, and #1223 measured an objective of
+  `2e20` coming back green under the mutation the test existed to catch. A test whose failure
+  mode is "the subject got repelled" must bound the magnitude instead — grep the sentinel's
+  actual value (`1e20` in `crate::survival`) and state both distances in the comment, to the
+  sentinel and to the real objective, so the bound is measured rather than picked.
+
+For each new assertion, name the regression it exists to catch and check that regression can
+actually reach it. For a regression test that means mutation; for an anchor, feeding it the
+failure it exists to catch. Two things that "I mutation-tested it" does **not** cover:
+
+- **Mutating your own fix is not enough — ask what the *smallest* edit that removes it is, and
+  which test dies.** On #1171 / PR #1174 sixteen tests across three tiers each died correctly
+  when the fix was toggled off, and the suite was called verified. A reviewer's *different*
+  minimal edit — drop both `push_route_lag_break_times` calls and have
+  `push_zero_order_break_times` emit `[w_start, w_end]` — passed the entire suite at identical
+  margins, because every fixture used `zero_order`, the one kind where the route onset
+  coincides exactly with the window start. The tests pinned a strictly weaker property than
+  the fix. If the honest answer to "which test dies" is "none", the fixture set is degenerate
+  however green it is.
+- **Mutate each side of a twin separately.** On #1223 deleting the *share* fill reddened the
+  parity test as designed, and deleting the *dense* fill left it green — the fixture never
+  reached the dense fill, because each engine folds its own horizon into `break_times` and the
+  dense builder's `saveat` was the `chz_times` themselves. A twin whose second leg is computed
+  by an unexercised path is an assertion against a constant. Require each mutation to name its
+  own side in the failure message; if one side stays green, find the fast path supplying the
+  answer and change the fixture until it does not.
+
+**Every change to an analytic sensitivity, gradient, marginal, or likelihood path requires a `Dual2`-vs-FD parity test.** The closed-form PK solutions and event-driven propagators are written once as generic `*_g<T: PkNum>` functions; instantiating `T = Dual2<M>` yields the exact `∂f/∂η` / `∂f/∂θ` that FOCE/FOCEI/HMC consume (`sens/`). A wrong sensitivity compiles and runs silently — there is no second copy of the formula to disagree with it — so when you add or modify one of these kernels, or the provider that assembles them, assert it against central finite differences of the `T = f64` production predictor, to tolerance, in a Tier-1 unit test. That parity pins the *derivative* against the value path, not the value path itself — when both share a wrong convention it passes against the exact derivative of the wrong function, which is how #1079 survived. It is an oracle for the gradient only; see the non-degeneracy rule above for what it cannot see. Follow the existing pattern: per-kernel `*_g_dual_matches_fd` checks (`sens/propagate.rs`, `sens/dual2.rs`) and the end-to-end `check_full_provider_vs_fd` harness (`sens/provider_tests.rs`). If a model is outside the analytic scope it must route to FD via the support predicates (`sens_supported` / `analytic_inner_grad_supported_model`); unit-test that routing so a scope gap fails loudly to FD instead of silently returning a wrong gradient. (This is the post-Enzyme successor to the retired `AD↔FD` parity rule — see #285 / #281.) **Before believing such a fix is complete, ask which engine each fixture actually ran on**: a fixture that routes to FD cannot observe the dual path at all, so a green anchor on it says nothing about the gradient side. Read the `FitResult` FD-fallback warning — on #1210 all seven `nonmem_anchor/ss_chz_*` arms reported "1 of 1 subjects use finite-difference inner gradients", so a green `--lib` suite and green CI never touched `sens/ode_provider.rs`'s dual SS equilibration, and only a Tier-3 convergence fit on a 300-subject joint PK-TTE population reached it. If every fixture says FD, the dual twin is untested.
 
 **Coverage is gated per PR.** A PR's changed lines must carry their own tests — the Codecov `patch` status enforces ≥90% coverage on the diff, and a 90% project floor is enforced on the weekly `main` run (see `codecov.yml`). This is the automated backstop to the rules above; slow-tests never run on PRs, so unit / Tier-2 tests are what register coverage. When excluding code from coverage, **scope `ignore`s by role, not by coverage %**: leave code out for *what it is* — dev-only tooling (e.g. `src/bin/generate_data.rs`), generated code (`build.rs`), or test scaffolding (`tests/`) — never because it reads red. (Feature-gated code that the coverage build doesn't compile reads as "missed" but is a measurement gap, not an ignore target — see #293.)
 
@@ -110,6 +388,44 @@ Any user-visible feature (new fit option, new estimator, new file-format directi
 - `docs/model-file/individual-parameters.qmd` for DSL syntax.
 - `docs/estimation/*.qmd` for estimator-specific behaviour.
 - `docs/faq.qmd` for user-facing explanations / comparisons to NONMEM / nlmixr2.
+
+### The docs are linted at PR time — `crates/docs-lint` (#1163)
+
+`docs/**/*.qmd` has a structural gate that runs on every PR (the `Docs lint` CI
+job, via `tools/preflight.sh docs`). Run it yourself after editing a page:
+
+```bash
+cargo run -p docs-lint -- --check          # what CI runs
+cargo run -p docs-lint -- --update-baseline
+```
+
+Four rules, all structural — it checks *shape*, never prose:
+
+| | Rule |
+|---|---|
+| R1 | a section with no subsections stays under 5,000 characters (~2,000 tokens), so a retrieval hit returns a usable chunk |
+| R2 | never skip a heading level (an `h1` followed by an `h3` attaches to the wrong parent) |
+| R3 | no two headings on a page may generate the same id |
+| R4 | internal links must resolve, **including the `#anchor`** |
+
+Two things to know before you fight it:
+
+- **R4 knows what pandoc actually generates**, which is rarely what a hand-written
+  anchor assumes. `## 3. Communication` is `#communication` — the number is
+  dropped. `## A — b` is `#a-b`, a *single* hyphen, because the em-dash is
+  deleted and the spaces around it collapse. `` ## Modeled duration (`D{n}`) ``
+  is `#modeled-duration-dn`. The algorithm and its traps live in
+  `docs/development/docs-lint.qmd` and in `crates/docs-lint/src/slug.rs`; read
+  one of them before hand-writing an anchor.
+- **R1 has a baseline** (`docs/.lint-baseline`) holding the pages that were
+  already too long when the gate landed. It is a ratchet: an entry may shrink,
+  never grow, and an entry naming a section that no longer exists is itself a
+  failure. Do not add new entries — split the section instead. For a chunk that
+  genuinely cannot be split, put `<!-- lint-disable R1 -->` on the line above its
+  heading **with a reason**, and keep that rare.
+
+`docs-lint` depends on nothing, so it compiles in seconds and never touches the
+`ferx-core` build cache. Keep it that way.
 
 ## Architecture
 

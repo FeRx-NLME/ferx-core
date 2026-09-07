@@ -21,28 +21,45 @@
 //! |------|---------|
 //! | `E_PARSE`                 | the model file failed to parse |
 //! | `E_MISSING_BLOCK`         | a required `[block]` is absent |
+//! | `E_UNKNOWN_BLOCK`         | a `[block]` header is not a recognised block name |
+//! | `E_DEPRECATED_BLOCK`      | a `[block]` that was ferx syntax and is no longer read |
+//! | `E_BLOCK_INSTANCE_NAME`   | a `[block NAME]` instance name is present where none is taken, or missing where one is required |
+//! | `E_BLOCK_FEATURE_DISABLED`| a `[block]` needs a cargo feature this binary was not built with |
 //! | `E_NN_FEATURE_DISABLED`   | a `[covariate_nn]` block needs `--features nn` |
 //! | `E_MISSING_COVARIATE`     | the model references a covariate not present in the data |
 //! | `E_PER_CMT_SCALING`       | an observed compartment lacks a per-CMT scaling entry |
 //! | `E_PER_CMT_ERROR_MODEL`   | an observed compartment lacks a per-CMT `[error_model]` entry |
+//! | `E_ENDPOINT_UNROUTED`     | a CMT declared as a non-Gaussian endpoint carries Gaussian observations — the population was read without the model's endpoint routing (#1199) |
+//! | `E_ENDPOINT_NO_RECORDS`   | a declared non-Gaussian endpoint has no row routed to it (typically a missing `CMT` column) |
 //! | `E_DATA`                  | the `--data` file could not be read or parsed |
 //! | `E_SDE_INCOMPATIBLE`      | an SDE (`[diffusion]`) model used with SAEM / GN |
 //! | `E_AD_RETIRED`            | `gradient_method = ad` requested; the Enzyme AD path was retired (use `auto` / `fd`) |
 //! | `E_IMP_CHAIN`             | `imp` mis-placed in a method chain (repeated / non-terminal) |
+//! | `E_SAEM_NO_RANDOM_EFFECTS`| `method = saem` anywhere in a chain on a model with `n_eta = 0` |
+//! | `E_METHOD_NO_RANDOM_EFFECTS` | `method = imp` / `impmap` / `bayes` anywhere in a chain on a model with `n_eta = 0` |
+//! | `W_GN_NO_RANDOM_EFFECTS`  | `method = gn` as the last estimating stage on a model with `n_eta = 0` (start-sensitive; prefer `gn_hybrid`) |
 //! | `E_OPTIMIZER_IOV`         | `optimizer = trust_region` used with an IOV model |
+//! | `E_OPTIMIZER_AGQ`         | `optimizer = trust_region` used with a quadrature stage (`laplace`, or `focei` with `n_agq > 1`) |
+//! | `E_SIGMA_ORDER_MISMATCH`  | a single-endpoint `[error_model]` names its sigmas in an order other than the `[parameters]` declaration order |
+//! | `E_OMEGA_INIT_AT_RAIL`    | a **free** `omega` / `kappa` / `[mixture] omega(k)` variance whose initial value packs onto the optimizer's `-6` lower rail (variance ≤ 6.1e-6, `~ 0.0` included) — clamped there and not estimable; `FIX` it or start it higher (#1229) |
 //! | `W_STEADY_STATE_II`       | SS=1 dose with missing / non-positive II |
 //! | `W_STEADY_STATE_INFUSION` | SS=1 infusion with `T_inf > II` (overlapping pulses) |
 //! | `W_SDE_RESET`             | EVID=3/4 resets under an SDE model are not honoured |
+//! | `W_SDE_LAGTIME`           | an absorption lag time under an SDE model is not honoured |
+//! | `W_SDE_STEADY_STATE`      | an `SS=1` dose under an SDE model is not equilibrated |
 //! | `W_EXPERIMENTAL_SDE`      | an SDE (`[diffusion]`) model uses an experimental feature (see Feature Maturity docs) |
 //! | `W_EXPERIMENTAL_NN`       | a neural-network (`[covariate_nn]`) model uses an experimental feature (see Feature Maturity docs) |
 //! | `W_NEGATIVE_LAGTIME`      | a lag time is negative at the initial estimates |
 //! | `E_DERIVED_NAME_CONFLICT` | `[derived]` name clashes with a built-in sdtab column, theta, eta, or indiv-param name |
 //! | `W_DERIVED_COVARIATE_SHADOW` | `[derived]` name shadows a covariate (allowed but may be confusing) |
 //! | `W_DERIVED_STEP_IGNORED`  | `step=` given for a DV-based integral (ignored; DV integrals use observation times) |
+//! | `W_ABSORPTION_TWIN_DECLINED` | an analytic transit / IG model's ODE twin could not be built; the model stays closed-form with no ODE fallback (#1008) |
 //! | `E_OUTPUT_UNKNOWN_COLUMN` | a name in `[output]` is not recognised as any known quantity |
 //! | `W_OUTPUT_DUPLICATE`      | a name in `[output]` is already in the mandatory sdtab minimum |
 //! | `W_ADDL_MISSING_II`       | ADDL > 0 on a dose row but II is zero or missing; additional doses not expanded |
 //! | `W_MISSING_DV`            | EVID=0 observation row with a missing DV and no MDV=1; skipped rather than scored as DV=0 |
+//! | `E_COVSTAT_UNRESOLVED`    | a `[covariate_model]` relation still needs data-derived statistics (`center = median`, `levels = auto`, or a form whose default bounds come from the data) |
+//! | `W_COVSTAT_UNBOUND`       | the same, reported without a `--data` file — the model is fine, it just cannot be built until a dataset is supplied |
 
 use serde::Serialize;
 
@@ -139,6 +156,16 @@ pub struct CheckReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<String>,
     pub diagnostics: Vec<Diagnostic>,
+    /// The `[individual_parameters]` block as the `[covariate_model]` desugar
+    /// rewrote it (#1111), one line per assignment. Empty for a model that
+    /// declares no such block.
+    ///
+    /// `ferx check` prints this so the expression the block actually built is
+    /// visible — a covariate model stated declaratively is otherwise
+    /// unauditable against NONMEM, since nothing in the file spells out the
+    /// centring constant, the missing-value guard or where the factor landed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub desugared_individual_parameters: Vec<String>,
 }
 
 impl CheckReport {
@@ -155,6 +182,7 @@ impl CheckReport {
             model: model.into(),
             data,
             diagnostics,
+            desugared_individual_parameters: Vec::new(),
         }
     }
 

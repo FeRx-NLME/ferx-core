@@ -852,6 +852,97 @@ fn focei_quadrature_out_of_analytic_scope_is_rejected() {
     );
 }
 
+/// `optimizer = trust_region` must be rejected on a quadrature stage.
+///
+/// Every optimizer *scores* the quadrature marginal (`pop_nll_opts` dispatches on
+/// `agq_nodes()`), but only `optimize_nlopt` and `optimize_bfgs` route the matching
+/// gradient — both go through `population_gradient`, which hands AGQ to
+/// `agq::agq_population_gradient`. `trust_region` has its own `Gradient` impl with no such
+/// branch, so it would descend on the FOCE/Laplace closed form while reporting quadrature
+/// OFVs — the silent wrong answer `FitOptions::agq_nodes` and `population_gradient` both
+/// warn about in as many words. Rejecting at check time is the guard; #1034 review.
+#[test]
+fn trust_region_with_a_quadrature_stage_is_rejected() {
+    use ferx_core::api::check_model_options;
+    use ferx_core::Optimizer;
+
+    let model = parse_model_string(WARFARIN_SRC).expect("warfarin must parse");
+    let has_agq_guard = |opts: &FitOptions| {
+        check_model_options(&model, opts)
+            .iter()
+            .any(|d| d.code == "E_OPTIMIZER_AGQ")
+    };
+
+    // `laplace` is a quadrature stage at any node count, including the n_agq = 1 default.
+    for n_agq in [1, 3] {
+        let opts = FitOptions {
+            method: EstimationMethod::Laplace,
+            optimizer: Optimizer::TrustRegion,
+            n_agq,
+            ..FitOptions::default()
+        };
+        assert!(
+            has_agq_guard(&opts),
+            "laplace + trust_region must be rejected at n_agq = {n_agq}"
+        );
+    }
+
+    // `focei` is one only above n_agq = 1; plain FOCEI keeps working with trust_region.
+    let focei_quad = FitOptions {
+        method: EstimationMethod::FoceI,
+        optimizer: Optimizer::TrustRegion,
+        n_agq: 3,
+        ..FitOptions::default()
+    };
+    assert!(has_agq_guard(&focei_quad));
+    let plain_focei = FitOptions {
+        method: EstimationMethod::FoceI,
+        optimizer: Optimizer::TrustRegion,
+        n_agq: 1,
+        ..FitOptions::default()
+    };
+    assert!(
+        !has_agq_guard(&plain_focei),
+        "plain FOCEI (n_agq = 1) is not a quadrature stage and must stay allowed"
+    );
+
+    // The guard is about this optimizer, not about quadrature: the AGQ-aware optimizers
+    // must be untouched.
+    for optimizer in [
+        Optimizer::Bobyqa,
+        Optimizer::Slsqp,
+        Optimizer::NloptLbfgs,
+        Optimizer::Lbfgs,
+        Optimizer::Bfgs,
+        Optimizer::Mma,
+        Optimizer::Auto,
+    ] {
+        let opts = FitOptions {
+            method: EstimationMethod::Laplace,
+            optimizer,
+            n_agq: 3,
+            ..FitOptions::default()
+        };
+        assert!(
+            !has_agq_guard(&opts),
+            "{optimizer:?} routes the quadrature gradient and must not be rejected"
+        );
+    }
+
+    // A chained fit whose *later* stage is the quadrature one is caught too — the guard
+    // reads the chain, not just `method`.
+    let chained = FitOptions {
+        method: EstimationMethod::Foce,
+        methods: vec![EstimationMethod::Foce, EstimationMethod::Laplace],
+        optimizer: Optimizer::TrustRegion,
+        ..FitOptions::default()
+    };
+    assert!(
+        has_agq_guard(&chained),
+        "a laplace stage anywhere in the chain must be caught"
+    );
+}
+
 /// The runtime IOV grid cap fires for the FOCEI quadrature too, and names `focei` (not
 /// `laplace`) in the message (#251 review #4). `21^5` over the stacked (η, κ) dimension is
 /// far past `MAX_AGQ_GRID`.
@@ -1436,4 +1527,175 @@ fn agq_reports_convergence_rather_than_grinding_into_nlopt_failure() {
             r.ofv
         );
     }
+}
+
+// ── agq_eval_only: AGQ as a terminal likelihood evaluator ────────────────────
+
+/// `agq_eval_only` parses, and is only accepted on a `laplace` stage.
+#[test]
+fn agq_eval_only_parses_from_the_model_file() {
+    let opts = options_of(&with_fit_options(
+        "  method = laplace\n  n_agq = 5\n  agq_eval_only = true",
+    ));
+    assert!(opts.agq_eval_only, "agq_eval_only must round-trip");
+    assert_eq!(opts.n_agq, 5);
+
+    // Default is off, so no existing fit changes behaviour.
+    assert!(
+        !options_of(WARFARIN_SRC).agq_eval_only,
+        "agq_eval_only must default to false"
+    );
+}
+
+/// A standalone `laplace` stage with `agq_eval_only` reports exactly the OFV the ordinary
+/// eval-only path reports at the same parameters and node count.
+///
+/// This is the identity that makes the option trustworthy: it is a *reporting* route to the
+/// AGQ marginal, not a second implementation of it.
+#[test]
+fn agq_eval_only_standalone_matches_the_ordinary_agq_ofv() {
+    let population = warfarin();
+    let reference = eval_only_ofv(&population, EstimationMethod::Laplace, 3);
+
+    let model = parse_model_string(WARFARIN_SRC).expect("model must parse");
+    let opts = FitOptions {
+        method: EstimationMethod::Laplace,
+        methods: vec![],
+        n_agq: 3,
+        agq_eval_only: true,
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        ..FitOptions::default()
+    };
+    let result = fit(&model, &population, &model.default_params, &opts)
+        .expect("standalone agq_eval_only fit must succeed");
+
+    assert!(
+        (result.ofv - reference).abs() < 1e-8,
+        "agq_eval_only OFV {} != ordinary AGQ OFV {} at the same parameters",
+        result.ofv,
+        reference
+    );
+}
+
+/// Chained, the evaluator leaves the preceding stage's **parameters** untouched and replaces
+/// only the reported OFV.
+///
+/// The point of the option: the parameters stay whatever the estimator produced, while `ofv`
+/// becomes a deterministic marginal likelihood evaluated there.
+#[test]
+fn agq_eval_only_preserves_the_preceding_stages_parameters() {
+    let population = warfarin();
+    let model = parse_model_string(WARFARIN_SRC).expect("model must parse");
+
+    let base = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        ..FitOptions::default()
+    };
+    let focei = fit(&model, &population, &model.default_params, &base)
+        .expect("focei eval-only fit must succeed");
+
+    let chained = FitOptions {
+        methods: vec![EstimationMethod::FoceI, EstimationMethod::Laplace],
+        n_agq: 3,
+        agq_eval_only: true,
+        ..base.clone()
+    };
+    let result = fit(&model, &population, &model.default_params, &chained)
+        .expect("[focei, laplace] with agq_eval_only must succeed");
+
+    assert_eq!(
+        result.theta, focei.theta,
+        "an evaluator must not move theta"
+    );
+    assert_eq!(
+        result.sigma, focei.sigma,
+        "an evaluator must not move sigma"
+    );
+    assert!(
+        result.ofv.is_finite(),
+        "the reported OFV must be the finite AGQ marginal, got {}",
+        result.ofv
+    );
+    assert!(
+        (result.ofv - focei.ofv).abs() > 1e-6,
+        "with n_agq = 3 the quadrature marginal should differ from the FOCEI objective \
+         ({} vs {}); an identical value suggests the evaluator never ran",
+        result.ofv,
+        focei.ofv
+    );
+}
+
+/// Determinism: two runs of the evaluator agree bit for bit. This is what distinguishes it
+/// from the `imp_eval_only` route, whose `−2 log L` carries Monte-Carlo error.
+#[test]
+fn agq_eval_only_is_bit_reproducible() {
+    let population = warfarin();
+    let model = parse_model_string(WARFARIN_SRC).expect("model must parse");
+    let opts = FitOptions {
+        method: EstimationMethod::Laplace,
+        methods: vec![],
+        n_agq: 3,
+        agq_eval_only: true,
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        ..FitOptions::default()
+    };
+    let a = fit(&model, &population, &model.default_params, &opts).expect("first run");
+    let b = fit(&model, &population, &model.default_params, &opts).expect("second run");
+    assert_eq!(
+        a.ofv.to_bits(),
+        b.ofv.to_bits(),
+        "the AGQ evaluator must be deterministic: {} vs {}",
+        a.ofv,
+        b.ofv
+    );
+}
+
+/// `agq_eval_only` mid-chain is rejected, as is `agq_eval_only` with no `laplace` stage.
+///
+/// Driven through the Rust API rather than a model file: `[fit_options]` keys are validated
+/// against the *final* stage's allow-list, so a file placing `laplace` mid-chain trips the
+/// unknown-key check before reaching this rule. The file round-trip is covered by
+/// `agq_eval_only_parses_from_the_model_file`.
+#[test]
+fn agq_eval_only_requires_a_terminal_laplace_stage() {
+    let population = warfarin();
+    let model = parse_model_string(WARFARIN_SRC).expect("model must parse");
+    let base = FitOptions {
+        n_agq: 3,
+        agq_eval_only: true,
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        ..FitOptions::default()
+    };
+
+    let mid = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        methods: vec![EstimationMethod::Laplace, EstimationMethod::FoceI],
+        ..base.clone()
+    };
+    let err = fit(&model, &population, &model.default_params, &mid)
+        .expect_err("laplace mid-chain with agq_eval_only must be rejected");
+    assert!(
+        err.contains("final stage"),
+        "error should name the terminal-stage rule, got: {err}"
+    );
+
+    let missing = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        methods: vec![],
+        ..base
+    };
+    let err = fit(&model, &population, &model.default_params, &missing)
+        .expect_err("agq_eval_only without a laplace stage must be rejected");
+    assert!(
+        err.contains("requires a `laplace` stage"),
+        "error should name the missing stage, got: {err}"
+    );
 }

@@ -27,7 +27,7 @@
 #   CMT=2  central  — concentration (mg/L) = amount / V
 #
 # Self-contained: the [simulation] block below lets you run it with no data file
-#   cargo run --release -- examples/one_cpt_transit.ferx --simulate
+#   cargo run --release -p ferx-cli -- examples/one_cpt_transit.ferx --simulate
 # which simulates an oral 100 mg dose into CMT=1, observed as concentration, and
 # fits it back. True simulation parameters: TVCL=5, TVV=50, TVMTT=1.0, TVN=3,
 #   omega_CL=omega_V=0.09, sigma_prop=0.15.

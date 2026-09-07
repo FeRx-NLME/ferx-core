@@ -1,0 +1,56 @@
+# SS=1 dose x ODE-accumulated cumulative hazard (#1210) — CONSTANT-hazard arm.
+#
+# The ferx twin of `nonmem_anchor/ss_chz_r2_const.ctl`. Runs on `ss_chz_ss.csv`, whose
+# single dose carries `SS=1, II=12`; the NONMEM twin runs the 51-dose gated pulse train
+# `ss_chz_train.csv` instead, because NONMEM's own steady-state routine cannot be handed
+# a pure integrator (see `ss_chz_r1_const.ctl`, which does and returns `A(3) = -2.39e7`
+# with `#OBJV = +INF`). ferx time `t` corresponds to NONMEM time `600 + t`.
+#
+# `BETA` is fixed at **0**, matching the NONMEM stream's `$THETA 0.0 FIX`, so the hazard
+# collapses to the constant `H0` and `H(t) = H0 * t` in closed form. That is what makes
+# this arm the one that certifies the pulse-train construction itself: NONMEM's `A(3)` at
+# 601/604/608/612 must read 0.02/0.08/0.16/0.24, and it does, to the printed digits. The
+# drug arm (`ss_chz_drug_fit.ferx`) is then the oracle for the part no closed form sees.
+#
+# `[fit_options]` pins the solver at reltol 1e-9 / abstol 1e-11; at ferx's defaults the
+# comparison is good only to ~1e-3, far looser than this anchor resolves.
+
+[parameters]
+  theta TVCL(1.0, FIX)
+  theta TVV(10.0, FIX)
+  theta TVKA(1.0, FIX)
+  theta TVH0(0.02, FIX)
+  theta TVBETA(0.0, FIX)           # NONMEM `$THETA 0.0 FIX` — the constant-hazard arm
+
+  # No omega: the NONMEM twin runs `$OMEGA 0 FIX`, so both sides evaluate at eta = 0.
+  sigma PROP_ERR ~ 0.01            # variance; NONMEM `$SIGMA 0.01`
+
+[individual_parameters]
+  CL   = TVCL
+  V    = TVV
+  KA   = TVKA
+  H0   = TVH0
+  BETA = TVBETA
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+
+[scaling]
+  obs_scale = V                    # states are AMOUNTS; NONMEM's `$ERROR` divides by V
+
+[event_model]
+  cmt    = 3
+  hazard = H0 * exp(BETA * (central / V))
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 0
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11

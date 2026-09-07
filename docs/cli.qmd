@@ -1,3 +1,8 @@
+---
+pagetitle: "ferx command-line interface for NLME modeling"
+description: "Use the ferx CLI to validate models, fit population PK/PD data, simulate trials, and inspect NLME results."
+---
+
 # CLI Reference
 
 The `ferx` command-line tool runs population PK estimation from model files and data.
@@ -9,7 +14,13 @@ ferx <model.ferx> --data <data.csv> [--output <run.fitrx>] [--include-data] [--i
 ferx <model.ferx> --simulate          [--output <run.fitrx>]
 ferx check <model.ferx> [--data <data.csv>] [--json]
 ferx summary <run.fitrx> [<run2.fitrx> ...]
-ferx --help                    # or -h; also: ferx check --help, ferx summary --help
+ferx bootstrap <model.ferx> [--data <data.csv>] [--samples N] [--seed N] [--stratify-on COL]
+ferx covsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
+ferx modelsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
+ferx ruvsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
+ferx allometry <model.ferx> --data <data.csv> [--covariate WT] [--reference 70] [--estimate]
+ferx --help                    # or -h; also: ferx check --help, ferx summary --help,
+                               # ferx bootstrap --help, ferx covsearch --help
 ```
 
 ## Commands
@@ -29,6 +40,145 @@ ferx model.ferx --simulate
 ```
 
 Parses the model file, generates simulated data from the `[simulation]` block, and fits the model to the simulated data. Requires a `[simulation]` block in the model file.
+
+### Bootstrap (`bootstrap`)
+
+```bash
+ferx bootstrap model.ferx --data data.csv --samples 200 --seed 12345 --threads 8
+```
+
+Resamples subjects with replacement, refits the model to each replicate dataset,
+and reports bias, standard errors and confidence intervals from the spread of the
+estimates — the non-parametric case bootstrap, at `PsN::bootstrap` feature parity.
+Writes PsN-named CSV artefacts to `{model}-bootstrap/`. Progress is drawn as a bar on
+stderr while the replicates fit, when stderr is a terminal; `--no-progress` turns it off.
+
+Unlike a fit, this is a *tool*: it lives in the `ferx-tools` crate and calls the
+estimation engine many times without changing it. See
+[Bootstrap](tools/bootstrap.qmd) for the options, the stratification rules, the
+confidence-interval estimator, and a worked comparison against the covariance
+step's standard errors.
+
+### GAM Covariate Screening (`gam`)
+
+```bash
+ferx gam model.ferx --data data.csv
+```
+
+Regresses every declared covariate against every ETA and prints a table ranked by
+ΔAIC = `AIC_null − AIC_best`; a positive ΔAIC means the covariate improves the
+model for that ETA. This is the Rust equivalent of Xpose4's `xpose.gam()`.
+
+The screen needs empirical Bayes estimates, so by default it fits the model
+first. Two ways to avoid paying for that fit:
+
+```bash
+# Reuse a fit you already ran.
+ferx gam --from-fit run.fitrx
+
+# Compute EBEs at the initial estimates only (NONMEM MAXEVAL=0).
+ferx gam model.ferx --data data.csv --no-fit
+```
+
+`--from-fit` needs `--data` as well when the bundle was written without
+`--include-data`; the dataset must be the one the fit was run on, since ETAs are
+matched to covariates by subject position. `--no-fit` is refused for methods
+that would estimate anyway — SAEM, IMPMAP, Bayes, VI, and `gn_hybrid`, whose
+FOCEI polish runs a fixed 100 iterations regardless of `outer_maxiter`.
+
+| flag | default | meaning |
+|---|---|---|
+| `--no-fit` | off | compute EBEs at the initial estimates, skip the outer loop |
+| `--from-fit PATH` | — | load a `.fitrx` bundle instead of fitting |
+| `--csv PATH` | `{model}-gam.csv` | where to write the ranked table |
+| `--no-csv` | off | print the table only, write no file |
+| `--spline-df N` | `2,3` | spline degrees of freedom to try (repeatable) |
+| `--no-linear` | off | drop the linear form from the candidates |
+| `--shrink FRAC` | `0.30` | warn above this ETA shrinkage |
+| `--threads N` | auto | rayon worker count |
+
+The same screen runs as part of an ordinary fit with `--gam`, which writes
+`{model}-gam.csv` using the default options:
+
+```bash
+ferx model.ferx --data data.csv --gam
+```
+
+Treat the output as a shortlist, not a model — see
+[GAM covariate screening](tools/gam-screening.qmd) for what ΔAIC does and does
+not tell you, the shrinkage caveat, and the Xpose4 validation.
+
+### Stepwise Covariate Modelling (`covsearch`)
+
+```bash
+ferx covsearch warfarin.ferxsearch --directory warfarin-covsearch --threads 8
+```
+
+PsN `scm` forward / forward-then-backward selection — Pharmpy's `covsearch` —
+driven by a [`.ferxsearch` file](tools/search.qmd) whose `COVARIATE?(...)`
+statements are the candidate effects and whose `[covsearch]` section sets the
+algorithm, `p_forward`, `p_backward` and `max_steps`. Each step fits its
+candidates in parallel, judges them by the strictness gate and the
+likelihood-ratio test, and prints a step table with every candidate's ΔOFV,
+p-value, convergence status and decision. Writes `steps.csv`, `final.ferx` and
+`final-fit.yaml` into the directory, plus one journalled runner directory per
+step, so `--resume` picks an interrupted search up where it stopped. See
+[Covariate search](tools/covsearch.qmd), including the PsN `scm` comparison.
+
+### Structural Model Search (`modelsearch`)
+
+```bash
+ferx modelsearch warfarin.ferxsearch --directory warfarin-modelsearch --threads 8
+```
+
+Pharmpy's `modelsearch`: a search over the analytic `pk` templates — absorption
+route, peripheral compartments, transit compartments and lag time — driven by
+a [`.ferxsearch` file](tools/search.qmd) whose `ABSORPTION`, `PERIPHERALS`,
+`TRANSITS` and `LAGTIME` statements are the space and whose `[modelsearch]`
+section picks the algorithm (`reduced_stepwise`, `exhaustive_stepwise`,
+`exhaustive`) and the IIV strategy for new parameters. Each layer fits its
+candidates in parallel, judges them by the strictness gate, and the models are
+ranked on `[rank] type` (the mixed BIC by default). Prints a model table with
+every candidate's structure, criterion, rank, convergence status and fit time;
+writes `models.csv`, `final.ferx`, `final-fit.yaml` and every candidate under
+`models/` into the directory, plus one journalled runner directory per layer,
+so `--resume` picks an interrupted search up where it stopped. See
+[Structural model search](tools/modelsearch.qmd), including the Pharmpy and
+NONMEM comparisons.
+
+### Residual-Error Search (`ruvsearch`)
+
+```bash
+ferx ruvsearch warfarin.ferxsearch --directory warfarin-ruvsearch --threads 8
+```
+
+Pharmpy's `ruvsearch`: a search over the `[error_model]` block, driven by a
+[`.ferxsearch` file](tools/search.qmd) with no `[space]` — the candidates are
+the four residual-error forms: IIV on the residual error, a `power` form, a
+`combined` form, and a time-varying magnitude cut at the time-after-dose
+quantiles. Each iteration adds every remaining candidate to the parent on its
+own, fits them in parallel, judges them by the strictness gate and the
+likelihood-ratio test at `[ruvsearch] p_value`, and keeps the largest
+significant drop; the selected model must beat the input by the `df = 1`
+cutoff or the input is returned. `cwres_prescreen = true` is Pharmpy's path:
+the candidates are fitted to the parent's CWRES first and only the winner is
+refitted. Prints a step table with every model's ΔOFV, p-value, convergence
+status and decision; writes `steps.csv`, `final.ferx`, `final-fit.yaml` and
+every model under `models/`, plus one journalled runner directory per step,
+so `--resume` picks an interrupted search up where it stopped. See
+[Residual-error search](tools/ruvsearch.qmd).
+
+### Allometric Scaling (`allometry`)
+
+```bash
+ferx allometry model.ferx --data data.csv                # (WT/70)^0.75 on CL, Q; ^1.0 on V1, V2
+ferx allometry model.ferx --data data.csv --estimate     # estimate the exponents instead
+ferx allometry search.ferxsearch                         # ALLOMETRY(WT, 70) in the space
+```
+
+Adds the allometric convention to the base model as `[covariate_model]` lines
+and fits the base and the scaled model side by side. Options on the
+[covariate search page](tools/covsearch.qmd#allometry).
 
 ### Validate without Fitting (`check`)
 
@@ -251,9 +401,10 @@ ferx examples/warfarin.ferx --simulate
 ## Building
 
 ```bash
-# Build the ferx binary
-cargo build --release
+# Build the ferx binary. The repo is a cargo workspace and the root package is
+# the ferx-core library, so the binary's package has to be in scope.
+cargo build --release -p ferx-cli
 
 # Run directly via cargo
-cargo run --release --bin ferx -- model.ferx --data data.csv
+cargo run --release -p ferx-cli -- model.ferx --data data.csv
 ```

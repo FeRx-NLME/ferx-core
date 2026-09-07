@@ -7,7 +7,7 @@
 # [scaling]. Runs on data/parallel_oral.csv (every record on CMT 1), the ferx-keyed
 # copy of nonmem_anchor/parallel_oral.csv.
 #
-#   cargo run --release -- nonmem_anchor/parallel_first_order_fit.ferx \
+#   cargo run --release -p ferx-cli -- nonmem_anchor/parallel_first_order_fit.ferx \
 #     --data data/parallel_oral.csv
 #
 # The dataset is simulated FROM this parallel model (same truths), so this is a

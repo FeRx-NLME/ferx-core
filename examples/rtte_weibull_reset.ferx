@@ -14,7 +14,7 @@
 # Reference (simulated): TVSCALE = 5, TVSHAPE = 1.5, omega(ETA_SCALE) = 0.09,
 # censoring at t = 30; ~6.6 events/subject. Dataset: data/rtte_weibull_reset.csv.
 #
-# Run:  cargo run --release -- examples/rtte_weibull_reset.ferx --data data/rtte_weibull_reset.csv
+# Run:  cargo run --release -p ferx-cli -- examples/rtte_weibull_reset.ferx --data data/rtte_weibull_reset.csv
 
 [parameters]
   theta TVSCALE(5.0, 0.1, 100.0)

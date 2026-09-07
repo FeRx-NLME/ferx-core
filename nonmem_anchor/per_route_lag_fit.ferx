@@ -8,7 +8,7 @@
 # on data/per_route_lag_oral.csv (every record on CMT 1), the ferx-keyed copy of
 # nonmem_anchor/per_route_lag_oral.csv.
 #
-#   cargo run --release -- nonmem_anchor/per_route_lag_fit.ferx \
+#   cargo run --release -p ferx-cli -- nonmem_anchor/per_route_lag_fit.ferx \
 #     --data data/per_route_lag_oral.csv
 #
 # The dataset is simulated FROM this per-route-lag model (same truths), so this is a

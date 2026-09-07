@@ -3,7 +3,7 @@
 `.ferx` files in this directory show **proposed syntax** for features whose
 parser support has not yet landed. The parser smoke test in
 `src/parser/model_parser.rs` skips files that declare blocks gated behind
-unbuilt features, so running `cargo run -- examples/drafts/<file>.ferx`
+unbuilt features, so running `cargo run -p ferx-cli -- examples/drafts/<file>.ferx`
 today will fail.
 
 The point is to give reviewers something concrete to comment on while the

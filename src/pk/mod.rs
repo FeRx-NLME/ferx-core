@@ -19,6 +19,137 @@ pub(crate) fn model_uses_time_builtin(model: &CompiledModel) -> bool {
     crate::parser::model_parser::compiled_model_uses_time_builtin(model)
 }
 
+/// Does this model depend on model time *anywhere* — the individual-parameter
+/// program (as [`model_uses_time_builtin`] alone reports) **or** the `[odes]`
+/// right-hand side itself?
+///
+/// The routing guards that pick between the event-driven predictor, the
+/// modified-release closed form, and the plain dense integration used to ask
+/// only the first question. An `[odes]` RHS reading `TAD`/`TAFD`/`T`/`TIME` is
+/// just as non-autonomous, and neither of the two static paths can represent it:
+///
+///   - the **closed form** identifies the disposition by probing the RHS at two
+///     times with `tad` pinned to `0.0`, so a `TAD` term is invisible to it and
+///     was silently dropped from the predictions — 8× wrong at 12 h (#1124);
+///   - the **dense** predictor started its first segment at the dose *record*
+///     rather than the arrival, so under a lagtime its `TAD` anchor had no
+///     qualifying dose and it returned `NaN` for every observation (#1110).
+///     #1073 has since given it a pre-arrival anchor, so that path is finite
+///     too; the reroute stands on the closed-form defect above, and on keeping
+///     one engine answering a non-autonomous RHS rather than two.
+///
+/// Routing these models to the event-driven predictor — which places doses on
+/// its timeline at `d.time + lag`, so `TAD` anchors correctly — is what both
+/// defects have in common, and it is the path the NONMEM `TAD`-in-`$DES` anchors
+/// (`nonmem_anchor/tad_lag_{A,B}`) already validate.
+///
+/// **What the reroute is measured to preserve.** The predicate also moves models
+/// the closed form declined for reasons of its own — `init(...)`, a
+/// `dose_attr_map`, steady-state or infusion doses — off the *dense* path, which
+/// they were on before. Measured, dense vs event-driven, worst relative
+/// difference over the observations:
+///
+/// | model | measured |
+/// |---|---|
+/// | bare `TAFD` RHS, no lagtime, plain bolus | `6e-13` |
+/// | `init(central) = BASE` + `TAFD` RHS | `4.8e-11` |
+/// | `TAD` RHS **under a lagtime**, obs post-arrival | `5.8e-12` |
+/// | …same, `lag = 3.0` (a larger anchor shift) | `5.3e-12` |
+///
+/// The lagtime rows are only measurable since #1073: before it the dense path
+/// returned `NaN` for every observation on such a model — that being #1110, the
+/// defect this reroute exists to route around — so there was nothing to compare
+/// against. #1073 gave the dense predictor the same pre-arrival anchor, and the
+/// two engines now agree.
+///
+/// One case where the two are still **not** comparable, so no agreement is
+/// claimed for it: **a steady-state dose** whose RHS reads an *absolute* clock.
+/// `T`/`TIME` under `SS=1` sits 67% from its own explicit dose train — an absolute
+/// clock has no periodic limit for the run-in to converge to — and `TAFD` reads
+/// `NaN`; both are #1139's remaining half. `TAD` under `SS=1` *is* comparable
+/// since #1139: it reproduces its own explicit train to 3.8e-13 and NONMEM to
+/// 7.4e-9. Rerouting neither caused nor cured any of this.
+///
+/// Regression tests: `rerouting_a_bare_tafd_rhs_does_not_move_the_predictions`
+/// and `rerouting_an_init_seeded_rhs_does_not_move_the_predictions`.
+///
+/// **What the reroute costs, and why it is still whole-class.** The predicate is
+/// deliberately not narrowed to the MR-eligible shape (`!spec.input_rate.
+/// is_empty()`), even though that is the only shape #1124 itself could reach — a
+/// model with no built-in forcing was declined by `mr_scope` anyway and was
+/// already on the *dense* path. Measured, `ci-fast`, 2-state `[odes]`, two doses
+/// over 24 h at `reltol = 1e-8`, dense vs event-driven:
+///
+/// | observations | ratio |
+/// |---|---|
+/// | 8  | 1.04× |
+/// | 16 | 1.15× |
+/// | 32 | 1.38× |
+///
+/// It grows with observation density because the dense driver breaks only at
+/// dose/reset boundaries and reads observations through `saveat`, while the
+/// event-driven walk calls `solve_ode` once per record and each call restarts the
+/// step-size history. (For the MR-shaped cell the fix is actually about, the cost
+/// is far larger and unavoidable — ~40×, closed form to integration.)
+///
+/// That is paid to keep **one** engine answering a non-autonomous RHS. Both
+/// engines are correct here since #1073, but they are correct *differently*: they
+/// break the timeline at different points, so value, gradient, and the `[derived]`
+/// grid would agree only to solver tolerance and would drift apart under a
+/// lagtime. Splitting the class by `input_rate` re-creates exactly the
+/// value-vs-gradient and value-vs-`[derived]` engine splits that the gates in
+/// `stats/likelihood.rs`, `api/output_columns.rs` and `sens/ode_provider.rs` each
+/// had to be widened to close. Revisit with a measurement on a dense-sampling
+/// design if the ratio starts to matter; the predicate itself is not a hot-loop
+/// cost (both flags are resolved once in `build_ode_spec` at parse time, and this
+/// is `#[inline]` over three `bool` reads).
+/// **Which flag the `[odes]` half asks, and why it is the narrow one.** This
+/// predicate asks whether the *PK dynamics* are non-autonomous, so it asks
+/// [`OdeRhsProgram::pk_reads_model_time`] — the same walk with the injected
+/// joint-PK-TTE `d/dt(__chz_<cmt>)` hazard lines excluded (#1166). A standard
+/// joint model has a Weibull or Gompertz baseline hazard, which reads `TIME` by
+/// definition, while its PK block is time-invariant; asking the wide flag made
+/// every such model decline #570's shared solve (measured 1.82× on one objective
+/// evaluation) and leave the dense driver, for a property it does not have.
+///
+/// The **steady-state gates do not follow this narrowing** and must keep asking
+/// `reads_model_time()` directly (`estimation/inner_optimizer.rs`,
+/// `sens/ode_provider.rs`): SS equilibration integrates the *augmented* system,
+/// `__chz` included, and a time-reading hazard line breaks that state's cycle
+/// recurrence just as a time-reading PK line would.
+///
+/// The Form C `readout_program` is deliberately **not** folded in either. Both
+/// engines evaluate the readout under a `ModelTimeGuard`, so a `TIME`-reading
+/// readout is already correct on the dense driver and folding it in would decline
+/// the shared solve for nothing. `pk/modified_release.rs` hand-pairs it for a
+/// closed-form-only reason (its linearity probe cannot see the readout's time
+/// term), which does not apply here.
+///
+/// **What keeps a joint model out of the closed form is `identify_disposition`,
+/// not this predicate.** `mr_scope` asks this predicate too, so before #1166 a
+/// time-dependent hazard declined the closed form here; now it does not, and the
+/// decline rests entirely on `identify_disposition`. That bails at
+/// `n_states > 2`, which covers every joint model with two or more PK states —
+/// but a *one*-state PK block plus the injected accumulator is exactly two and
+/// reaches the probe. Measured on such a model (one state, a built-in forcing, a
+/// Form C readout, and a hazard linear in the state so it clears the "no
+/// autonomous term" check): `identify_disposition` still returns `None`, because
+/// the accumulator makes the disposition triangular — the hazard row reads the
+/// state but nothing returns from it — and that is not a disposition the closed
+/// form recognises. So the exposure is closed, by a different gate than the one
+/// that used to close it. The invariant is pinned by
+/// `pk::modified_release::tests::a_joint_pk_tte_model_never_reaches_the_closed_form`
+/// rather than enforced; whether to enforce it is #1209.
+#[inline]
+pub(crate) fn model_uses_time_anywhere(model: &CompiledModel) -> bool {
+    model_uses_time_builtin(model)
+        || model.ode_spec.as_ref().is_some_and(|s| {
+            s.rhs_program
+                .as_ref()
+                .is_some_and(|p| p.pk_reads_model_time())
+        })
+}
+
 #[inline]
 fn pk_params_at_time(
     model: &CompiledModel,
@@ -117,13 +248,13 @@ pub(crate) fn absorption_flip_flop_at(
 /// sensitivity dispatchers route through here, and within an iteration they evaluate at
 /// the same `(theta, eta)`, so they agree on the decision.
 ///
-/// A flip-flop absorption model with no ODE twin (one with a user `[odes]` / `[scaling]` /
-/// `[initial_conditions]` block, or a parameter name that shadows / collides with a reserved
-/// F/lagtime slot, which the desugar declines — a `lagtime=`/`f=` mapping alone now auto-routes,
-/// #735) has nothing to reroute to, and is rejected up front at η = 0 typical
-/// values by [`crate::api::check_absorption_flip_flop_no_twin`] (`fit()` → `Err`,
-/// `predict()`/`simulate()` panic) rather than silently returning the closed form's
-/// `0`. (This function still returns the closed form for it — the guard runs first.)
+/// A flip-flop absorption model with no ODE twin has nothing to reroute to, and is rejected
+/// up front at η = 0 typical values by [`crate::api::check_absorption_flip_flop_no_twin`]
+/// (`fit()` → `Err`, `predict()`/`simulate()` panic) rather than silently returning the closed
+/// form's `0`. (This function still returns the closed form for it — the guard runs first.)
+/// See [`crate::types::CompiledModel::absorption_ode_equivalent`] for what "no twin" covers:
+/// the desugar's by-name declines *and* a twin that was reconstructed and rejected by its own
+/// parse (#1008). Do not re-derive a closed list of causes here — the set is open-ended.
 pub(crate) fn effective_model_for_eval<'a>(
     model: &'a CompiledModel,
     subject: &Subject,
@@ -131,9 +262,9 @@ pub(crate) fn effective_model_for_eval<'a>(
     eta: &[f64],
 ) -> &'a CompiledModel {
     let structural = model.effective_for(subject);
-    // No twin to route to (a non-absorption model, or a transit/IG whose desugar declined —
-    // a user `[odes]`/`[scaling]`/`[initial_conditions]` block or a reserved-slot shadow/
-    // collision): nothing parameter-dependent to decide.
+    // No twin to route to (a non-absorption model, or a transit/IG that has none — declined by
+    // the desugar, or built and rejected by its own parse, #1008): nothing parameter-dependent
+    // to decide.
     let Some(twin) = &model.absorption_ode_equivalent else {
         return structural;
     };
@@ -144,7 +275,7 @@ pub(crate) fn effective_model_for_eval<'a>(
     if structural.ode_spec.is_some() || !absorption_flip_flop_at(model, subject, theta, eta) {
         return structural;
     }
-    twin.get_or_build()
+    twin.built()
 }
 
 /// Divide each prediction in-place by the scale derived from
@@ -252,12 +383,12 @@ pub fn apply_analytic_readout(
         return;
     };
     let n_states = ar.state_names.len();
-    if n_states == 0 {
-        return;
-    }
     // Canonical order is `["central"]` (IV) or `["depot", "central"]` (oral), so
     // the central amount lands in the last slot and the depot (if any) in slot 0.
-    let central_slot = n_states - 1;
+    // A compartment-free model (#811) has NO amounts at all: `state[]` is empty,
+    // there is no central concentration to convert, and the readout is evaluated
+    // on `θ`/`η`/individual parameters/covariates/`TIME` alone.
+    let central_slot = n_states.checked_sub(1);
     let need_depot = n_states > 1 && ar.state_names[0] == "depot";
 
     // Re-evaluate the readout's individual parameters per observation whenever a
@@ -300,23 +431,28 @@ pub fn apply_analytic_readout(
             &static_pk
         };
         // Central AMOUNT = concentration × V (concentration already carries the
-        // init impulse and per-event/SS dynamics).
-        state[central_slot] = *pred * pk_i.v();
+        // init impulse and per-event/SS dynamics). No-op for a compartment-free
+        // model, whose `state[]` is empty (#811).
+        if let Some(c) = central_slot {
+            state[c] = *pred * pk_i.v();
+        }
         if let Some(d) = &depot_amts {
             state[0] = d.get(i).copied().unwrap_or(0.0);
         }
         let cov = subject.obs_cov(i);
         let obs_cmt = subject.obs_cmts.get(i).copied().unwrap_or(0);
         // A readout referencing the `TIME` builtin resolves `Op::PushTime` from the
-        // model-time thread-local; set it to this observation's time so the readout
-        // evaluates `TIME` at the observation (the analytic providers set the matching
-        // guard around their readout eval, keeping FD parity). A no-op for a readout
-        // that does not reference `TIME`.
-        let t = subject.obs_times.get(i).copied().unwrap_or(0.0);
-        *pred = crate::parser::model_parser::with_model_time(t, || {
-            ar.readout
-                .eval(&state, &pk_i.values, theta, eta, cov, obs_cmt)
-        });
+        // model-time thread-local; `OdeReadout::eval` enters this observation's time
+        // as the guard (#1028), so the readout evaluates `TIME` at the observation
+        // here exactly as it does on the ODE predictor path. A no-op for a readout
+        // that does not reference `TIME`; the analytic providers set the matching
+        // guard around their own readout eval, keeping FD parity. `readout_time` is
+        // the raw data-file clock — the `$ERROR` convention, which differs from the
+        // integrator timeline only under stacked reset occasions.
+        let t = subject.readout_time(i);
+        *pred = ar
+            .readout
+            .eval(&state, &pk_i.values, theta, eta, cov, obs_cmt, t);
     }
 }
 
@@ -557,11 +693,22 @@ pub fn validate_per_cmt_scaling(model: &CompiledModel, subjects: &[Subject]) -> 
 
 /// Per-event PK parameter snapshots for one subject.
 ///
-/// When the subject has no time-varying covariates, all entries in `dose`
-/// and `obs` are equal (the single subject-static evaluation). The fast
-/// superposition path detects this case via `subject.has_tv_covariates()`
-/// and evaluates `pk_param_fn` only once instead of materialising the
-/// vectors — see [`compute_event_pk_params`] for details.
+/// When the subject has no time-varying covariates, all entries in `dose`,
+/// `obs`, `pk_only` **and `reset`** are equal (the single subject-static
+/// evaluation). The fast superposition path detects this case via
+/// `subject.has_tv_covariates()` and evaluates `pk_param_fn` only once
+/// instead of materialising the vectors — see [`compute_event_pk_params`]
+/// for details.
+///
+/// **All four are filled on both arms**, and each field's doc below is an
+/// invariant rather than a description. Two of them were fixed independently
+/// after the same defect: the static arm left `pk_only` empty, which failed the
+/// walkers' unconditional
+/// `assert_eq!(pk_at_pk_only.len(), subject.pk_only_times.len())` for any
+/// subject whose `pk_only_times` survived covariate pruning (#1124 review), and
+/// it left `reset` empty, which cost a reset its `init(...)` re-seed (#1133).
+/// A vector that some arm leaves short is the failure mode this type attracts —
+/// when adding a field, fill it on **both** arms.
 ///
 /// # Reusing across calls
 ///
@@ -578,9 +725,15 @@ pub struct EventPkParams {
     /// PK params at each observation event time, parallel to `subject.obs_times`.
     pub obs: Vec<PkParams>,
     /// PK params at each EVID=2 event time, parallel to
-    /// `subject.pk_only_times`. Empty when the subject has no
-    /// pk-only events (typical for non-TV-cov data).
+    /// `subject.pk_only_times`. Empty **only** when the subject has no
+    /// pk-only events (typical for non-TV-cov data) — never short, and
+    /// never empty merely because the subject is parameter-static.
     pub pk_only: Vec<PkParams>,
+    /// PK params at each EVID=3/4 reset time, parallel to `subject.reset_times`.
+    /// A reset row is a data record — `$PK` runs at it — so this is the snapshot
+    /// that re-seeds `[odes] init(...)` when the reset restarts the episode
+    /// (#1133). Empty when the subject has no resets.
+    pub reset: Vec<PkParams>,
 }
 
 impl EventPkParams {
@@ -593,6 +746,7 @@ impl EventPkParams {
             dose: Vec::with_capacity(subject.doses.len()),
             obs: Vec::with_capacity(subject.obs_times.len()),
             pk_only: Vec::with_capacity(subject.pk_only_times.len()),
+            reset: Vec::with_capacity(subject.reset_times.len()),
         }
     }
 }
@@ -632,7 +786,72 @@ pub fn compute_event_pk_params(
 pub(crate) fn subject_needs_per_event_pk(model: &CompiledModel, subject: &Subject) -> bool {
     subject.has_tv_covariates()
         || !subject.pk_only_covariates.is_empty()
+        // EVID=3/4 rows carry their own snapshot too (#1133). The reader gates all four
+        // snapshot vectors on the same `any_tv`, so this cannot fire alone on a
+        // reader-produced subject — but a hand-assembled one (FREM, the R glue, a test)
+        // can populate `reset_covariates` without the others, and without this clause it
+        // would drop to the constant branch and re-seed from the t=0 baseline.
+        || !subject.reset_covariates.is_empty()
         || model_uses_time_builtin(model)
+}
+
+/// The occasion label to evaluate an EVID=3/4 **reset row's** `$PK` under, on the
+/// `OCC`-column IOV path (#1133).
+///
+/// **The row's own `OCC` when the data carries one.** A reset row is a data record;
+/// NONMEM runs `$PK` at it under that row's occasion, measured in
+/// `nonmem_anchor/reset_init_snapshot_J.ctl`: with `WT` flat and the reset row carrying
+/// `OCC = 2` between `OCC = 1` records, `A_0` seeds under occasion 2 (42.0) and not under
+/// the preceding record's occasion 1 (14.0).
+///
+/// The scan below is the fallback for a `Subject` assembled in memory without
+/// `reset_occasions` — a fixture, FREM, or the R glue. It returns the occasion of the last
+/// record **strictly before** the reset, which under the timeline's
+/// `Reset < DoseRecord < PkOnly < Obs` tie-break is what `last_pk` held there before
+/// #1133, so such a subject keeps its previous κ rather than silently dropping to κ = 0.
+/// For a reset that is the subject's first event nothing precedes it and the old code
+/// seeded `last_pk` from `init_pk` — the *earliest* record — so that is the second
+/// fallback. `None` for a subject with no records at all, where the caller's κ = 0 default
+/// is the only snapshot that exists.
+/// Takes the reset's **index**, not its time: every caller iterates
+/// `0..reset_times.len()` and already has it, and re-deriving it by a tolerance search
+/// would alias two resets falling within that tolerance of each other.
+pub(crate) fn reset_row_occasion(subject: &Subject, r: usize) -> Option<u32> {
+    // Exact answer first: the row's own `OCC`, when the reader captured one.
+    if let Some(&occ) = subject.reset_occasions.get(r) {
+        return Some(occ);
+    }
+    let t_reset = subject.reset_times.get(r).copied()?;
+    // `>=` rather than `>` on the tie, with the kinds visited in the timeline's own
+    // `DoseRecord < PkOnly < Obs` order, so at an exact time tie the LAST record processed
+    // wins — which is the one `last_pk` held. Visiting doses first and keeping the earlier
+    // hit would pick the dose, where the walk's `last_pk` is the observation.
+    let mut best_before: Option<(f64, u32)> = None;
+    let mut earliest: Option<(f64, u32)> = None;
+    let mut consider = |t: f64, occ: Option<u32>| {
+        let Some(occ) = occ else { return };
+        if earliest.is_none_or(|(bt, _)| t < bt) {
+            earliest = Some((t, occ));
+        }
+        if t < t_reset && best_before.is_none_or(|(bt, _)| t >= bt) {
+            best_before = Some((t, occ));
+        }
+    };
+    for (k, d) in subject.doses.iter().enumerate() {
+        consider(d.time, subject.dose_occasions.get(k).copied());
+    }
+    // EVID=2 rows are records too, and they are the commonest neighbour on exactly the
+    // TV-covariate datasets #1133 targets. They carry no occasion label, so `last_pk` there
+    // was the occasion-less snapshot: report κ = 0 by yielding `u32::MAX`, which
+    // `combined_for` maps to zero κ, rather than skipping the row and reaching past it to
+    // an older record's occasion.
+    for &t in subject.pk_only_times.iter() {
+        consider(t, Some(u32::MAX));
+    }
+    for (j, &t) in subject.obs_times.iter().enumerate() {
+        consider(t, subject.occasions.get(j).copied());
+    }
+    best_before.or(earliest).map(|(_, occ)| occ)
 }
 
 /// Same as [`compute_event_pk_params`] but writes into a caller-owned
@@ -654,6 +873,7 @@ pub fn compute_event_pk_params_into(
     out.dose.clear();
     out.obs.clear();
     out.pk_only.clear();
+    out.reset.clear();
 
     if subject_needs_per_event_pk(model, subject) {
         for k in 0..subject.doses.len() {
@@ -683,17 +903,53 @@ pub fn compute_event_pk_params_into(
                 subject.pk_only_times[m],
             ));
         }
+        // EVID=3/4 rows are data records too (#1133): `$PK` runs at them, and the
+        // resulting snapshot is what re-seeds `[odes] init(...)` when the reset
+        // restarts the episode.
+        for r in 0..subject.reset_times.len() {
+            out.reset.push(pk_params_at_time(
+                model,
+                theta,
+                eta,
+                subject.reset_cov(r),
+                subject.reset_times[r],
+            ));
+        }
     } else {
         // Reached only when the subject carries no time-varying covariates (on
         // dose/obs *or* pk-only rows) and the model uses no `TIME` built-in, so a
         // single snapshot (t=0) is exact for every event.
         let p = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
-        // pk_only stays empty — see EventPkParams docstring.
+        // Every event row gets the snapshot — `pk_only` included. This arm decides
+        // only whether the snapshots *differ* between events, never how many there
+        // are: `ode_predictions_event_driven` asserts every length against the
+        // subject unconditionally (`ode/predictions.rs` — four of them since #1133
+        // added `reset`; the analytical twin in `pk/event_driven.rs` still asserts
+        // three, because it has no reset snapshot to check), so a short `pk_only`
+        // here is a length mismatch, not an optimisation.
+        //
+        // It used to be left empty, which failed the run (`assert_eq!`, so in
+        // release too) for any subject reaching the event-driven walker on a
+        // *parameter-static* model. Two routes get there: `subject.has_resets()`
+        // — reachable since EVID 3/4 resets were wired to that walker — and, since
+        // #1124, an `[odes]` RHS that reads model time. Both need only a dataset
+        // carrying EVID=2 rows, because `prune_irrelevant_tv_covariates` clears
+        // `pk_only_covariates` while leaving `pk_only_times` populated, which is
+        // exactly the state that makes `subject_needs_per_event_pk` false with
+        // `pk_only_times` non-empty.
         for _ in 0..subject.doses.len() {
             out.dose.push(p);
         }
         for _ in 0..subject.obs_times.len() {
             out.obs.push(p);
+        }
+        for _ in 0..subject.pk_only_times.len() {
+            out.pk_only.push(p);
+        }
+        // Filled even on this branch: a reset-carrying subject with constant
+        // covariates still needs a seed snapshot, and `p` is exact for it.
+        for _ in 0..subject.reset_times.len() {
+            out.reset.push(p);
         }
     }
 }
@@ -820,6 +1076,19 @@ pub(crate) fn compute_event_pk_params_iov(
             theta,
             eta_at(t),
             subject.pk_only_cov(m),
+            t,
+        ));
+    }
+    // EVID=3/4 rows are records (#1133): the reset re-seeds `[odes] init(...)` from the
+    // reset row's own `$PK`, which here means its own covariate snapshot under the κ of
+    // the decision window active at the reset — the same rule every other record follows.
+    for r in 0..subject.reset_times.len() {
+        let t = subject.reset_times[r];
+        out.reset.push(pk_params_at_time(
+            model,
+            theta,
+            eta_at(t),
+            subject.reset_cov(r),
             t,
         ));
     }
@@ -971,7 +1240,33 @@ pub fn predict_iov(
         })
         .collect();
 
-    let mut preds = if let Some(ref ode) = model.ode_spec {
+    let mut preds = if model.is_algebraic() {
+        // Compartment-free model (#811): nothing to integrate or superpose. The
+        // κ-dependence, if any, lives entirely in the individual parameters the
+        // readout reads, so it enters at the per-occasion readout pass at the
+        // bottom of this function rather than through a concentration.
+        vec![0.0; subject.obs_times.len()]
+    } else if let Some(ref ode) = model.ode_spec {
+        // EVID=3/4 rows: the reset row's own covariate snapshot (#1133), under the occasion
+        // that snapshot used to carry. The reader stores no `OCC` for a reset row, so the κ
+        // comes from [`reset_row_occasion`] — the record `last_pk` would have held there —
+        // rather than from `pk_only_combined`. Using the EVID=2 κ = 0 convention here would
+        // have traded the covariate error for a κ error: on a model with κ on a parameter
+        // the seed reads, it moves the whole post-reset trajectory by `exp(κ)`.
+        //
+        // Built inside this arm because only the ODE engine re-seeds `init(...)`; the
+        // algebraic and closed-form arms never read it, and `pk_params_at_time` runs the
+        // full individual-parameter program once per reset per eta evaluation.
+        let reset_params: Vec<PkParams> = (0..subject.reset_times.len())
+            .map(|r| {
+                let t = subject.reset_times[r];
+                let combined = match reset_row_occasion(subject, r) {
+                    Some(occ) => combined_for(occ),
+                    None => pk_only_combined.clone(),
+                };
+                pk_params_at_time(model, theta, &combined, subject.reset_cov(r), t)
+            })
+            .collect();
         crate::ode::ode_predictions_event_driven(
             ode,
             subject,
@@ -980,6 +1275,7 @@ pub fn predict_iov(
             &dose_params,
             &obs_params,
             &pk_only_params,
+            &reset_params,
         )
     } else if event_driven::supports_event_driven(model.pk_model) {
         // Resolve modeled-`RATE` doses (#324/#394) using each dose's per-occasion
@@ -1088,11 +1384,47 @@ pub fn predict_iov(
             }
         }
     }
-    // Analytic Form C readout (#650) under IOV: applied once with the BSV eta
-    // (the readout is BSV-only — a κ reference is rejected at parse). The central
-    // concentration already carries the per-occasion dynamics; the readout maps
-    // it (amount = conc × V) into the observed output. No-op unless set.
-    apply_analytic_readout(model, subject, theta, eta_bsv, &mut preds);
+    // Analytic Form C readout (#650) under IOV: evaluated **per occasion**, with that
+    // occasion's `[η_bsv, κ]` — the same split the `[scaling]` pass above uses. An
+    // individual parameter that carries a κ *is* per-occasion by definition, and the
+    // Form C readout is the analogue of NONMEM's `$ERROR`, evaluated per record with
+    // that record's occasion; the ODE path already does exactly this (the readout runs
+    // inside the integrator on the per-observation parameter snapshot). Evaluating it
+    // once with `eta_bsv` (κ = 0) silently used the *typical* value of every κ-carrying
+    // parameter the readout reads — wrong predictions and a wrong objective (#1079).
+    //
+    // The amount reconstruction stays consistent: `apply_analytic_readout` rebuilds the
+    // central amount as `conc × V`, and this occasion's `V` is the same `V` the
+    // concentration was computed with (`obs_params[j]`), so a `y = central / V` readout
+    // still cancels back to the concentration exactly — which is why that (natural)
+    // readout could not show the bug, with or without a κ on `V`.
+    //
+    // A compartment-free model (#811) has no concentration to carry the per-occasion
+    // dynamic at all, so for it the individual parameters the readout reads are the
+    // *only* place κ can enter; it takes the same loop.
+    if model.analytic_readout.is_some() && n_kappa > 0 && !subject.occasions.is_empty() {
+        // Guarded on `subject.occasions` (not `occ_groups`) for the same reason the
+        // scaling pass is: `iov_occasion_groups` appends dose-only occasions that
+        // own no observation, so a non-empty `occ_groups` does not imply every
+        // observation is labelled. Unlabelled subjects fall through to the shared
+        // κ = 0 call below, which is what the non-IOV path does too.
+        let raw = preds.clone();
+        for (occ_id, obs_indices) in &occ_groups {
+            if obs_indices.is_empty() {
+                continue;
+            }
+            let combined = combined_for(*occ_id);
+            let mut occ_preds = raw.clone();
+            apply_analytic_readout(model, subject, theta, &combined, &mut occ_preds);
+            for &j in obs_indices {
+                preds[j] = occ_preds[j];
+            }
+        }
+    } else {
+        // No readout (the no-op call), no κ (the per-occasion loop would rebuild the
+        // identical `[η_bsv]` vector), or no observation carries an occasion label.
+        apply_analytic_readout(model, subject, theta, eta_bsv, &mut preds);
+    }
     // LTBS log-wrap. The IOV dispatch above is total (ODE or event-driven), so
     // this is the single log-wrap point for the IOV path — predictions are
     // logged exactly once.
@@ -1117,11 +1449,13 @@ pub fn predict_iov(
 /// train extends infinitely into the past, so an observation between the
 /// dose *record* time and the lagged dose arrival
 /// (`dose.time ≤ t < dose.time + lagtime`) still sees the tail of the
-/// *previous* interval — the most recent pulse landed at `t_eff − II`. We
-/// recover it by wrapping the (negative) elapsed time into `[0, II)` and
-/// evaluating the SS closed form there. This matches NONMEM `ALAG1` +
-/// `SS=1` (verified against NONMEM 7.5 to 5 significant figures). Without
-/// the wrap these early samples would read 0, which is wrong at steady
+/// *previous* interval — the most recent pulse landed at
+/// `dose.time − crate::dosing::ss_seed_phase(dose, lagtime)`, which is
+/// `t_eff − II` for the ordinary `lagtime < II`. We evaluate the SS closed
+/// form at the elapsed time from that pulse. This matches NONMEM `ALAG1` +
+/// `SS=1` (verified against NONMEM 7.5 to 5 significant figures, and against
+/// 7.6.0 for the `lagtime ≥ II` clamp; `nonmem_anchor/results/ss_lag_ge_ii`).
+/// Without it these early samples would read 0, which is wrong at steady
 /// state.
 pub fn predict_concentration(
     pk_model: PkModel,
@@ -1135,19 +1469,49 @@ pub fn predict_concentration(
         let t_eff = dose.time + lagtime;
         if t_eff <= t {
             let tau = t - t_eff;
-            conc += single_dose_concentration(pk_model, dose, tau, pk_params);
+            if dose.ss && dose.ii > 0.0 && !crate::dosing::ss_arrival_is_trough(dose, lagtime) {
+                // `C_ss(t − t_eff)` treats the arrival as the train's own pulse,
+                // landing on the trough. That is an identity while the seed flows
+                // to the trough by the arrival (`ss_arrival_is_trough`) — writing
+                // `C_ss(τ) = C_ss(τ + II) + C_single(τ)` shows the two forms are
+                // the same expression — but past `lag = II` the accumulated state
+                // has decayed for `lag > II` rather than exactly one interval, and
+                // the collapsed form reads ~4 % high (#1121).
+                //
+                // Split it: the tail whose last pulse is at `dose.time − phase`,
+                // plus the ONE real dose that actually arrives at `t_eff`. The
+                // branch is deliberate rather than unifying on the split form —
+                // the two are algebraically equal for `lag ≤ II`, not bitwise, and
+                // every existing SS result is pinned to the collapsed form.
+                conc += single_dose_concentration(
+                    pk_model,
+                    dose,
+                    t - dose.time + crate::dosing::ss_seed_phase(dose, lagtime),
+                    pk_params,
+                );
+                let mut arrival = dose.clone();
+                arrival.ss = false;
+                conc += single_dose_concentration(pk_model, &arrival, tau, pk_params);
+            } else {
+                conc += single_dose_concentration(pk_model, dose, tau, pk_params);
+            }
         } else if dose.ss && dose.ii > 0.0 && t >= dose.time {
             // Pre-arrival steady-state tail (see the doc comment). Only for
             // observations at/after the dose *record* time: SS=1 establishes
             // steady state *at* the record, so a record cannot contribute to
             // times before itself (an SS dose later in the timeline must not
-            // leak into earlier observations). Wrap the negative elapsed time
-            // `t - t_eff` up into `[0, II)` by adding whole intervals — one
-            // suffices for a physical lagtime < II, but the ceil keeps it
-            // correct for any value.
-            let raw = t - t_eff;
-            let n = (-raw / dose.ii).ceil();
-            let tau = raw + n * dose.ii;
+            // leak into earlier observations).
+            //
+            // The pulse preceding the record is at `dose.time − p` for the shared
+            // seed phase `p = max(II − lagtime, 0)`, so the elapsed time to read
+            // the SS closed form at is `t − (dose.time − p)`. For the ordinary
+            // `lagtime < II` that is the old "add one interval" wrap. For
+            // `lagtime ≥ II` it CLAMPS rather than wrapping the phase into
+            // `[0, II)` — measured against NONMEM 7.6.0, which puts the pulse on
+            // the record itself there (`crate::dosing::ss_seed_phase`). Wrapping
+            // put this whole window a factor `e^{−k·II}` low and made the readout
+            // jump discontinuously as an *estimated* lagtime crossed `II`.
+            let tau = t - dose.time + crate::dosing::ss_seed_phase(dose, lagtime);
             if tau >= 0.0 {
                 conc += single_dose_concentration(pk_model, dose, tau, pk_params);
             }
@@ -1791,7 +2155,7 @@ pub fn compute_predictions_with_states(
     // superposition path, which has no valid states for those subjects and would otherwise
     // return NaN. Matches the IPRED routing in `compute_predictions_with_tv` (#486).
     let model = effective_model_for_eval(model, subject, theta, eta);
-    let uses_time = model_uses_time_builtin(model);
+    let uses_time = model_uses_time_anywhere(model);
     if let Some(ref ode) = model.ode_spec {
         // ODE path: both ipred and states come from a single ODE integration.
         // TV-covariate and reset subjects need the event-driven path (which also
@@ -1810,6 +2174,7 @@ pub fn compute_predictions_with_states(
                     &scratch.dose,
                     &scratch.obs,
                     &scratch.pk_only,
+                    &scratch.reset,
                 )
             } else {
                 // Single-pass: one ODE integration yields both ipred and states.
@@ -1828,7 +2193,14 @@ pub fn compute_predictions_with_states(
         // TV covariates); states via predict_all_states (superposition only — valid
         // for the no-reset, no-TV case).
         let ipred = compute_predictions_with_tv(model, subject, theta, eta);
-        let states = if !model.analytical_init.is_empty() {
+        let states = if model.is_algebraic() {
+            // A compartment-free model (#811) has no compartments to report. Its
+            // `pk_model` is a placeholder, so the superposition below would happily
+            // reconstruct one-compartment IV amounts — all zero, since there are no
+            // doses — and present them as this model's state. Outer-empty → NaN
+            // compartments, the same convention the reset / TV / IOV cases use.
+            vec![]
+        } else if !model.analytical_init.is_empty() {
             // [initial_conditions] baseline (#521): ipred is init-aware (the
             // closed-form baseline is layered onto the central readout), but the
             // superposition state reconstruction does not yet seed the baseline
@@ -2067,6 +2439,7 @@ pub fn compute_predictions_ode(
         let pk_dose = vec![pk; subject.doses.len()];
         let pk_obs = vec![pk; subject.obs_times.len()];
         let pk_pk_only = vec![pk; subject.pk_only_times.len()];
+        let pk_reset = vec![pk; subject.reset_times.len()];
         return crate::ode::ode_predictions_event_driven(
             ode_spec,
             subject,
@@ -2075,6 +2448,7 @@ pub fn compute_predictions_ode(
             &pk_dose,
             &pk_obs,
             &pk_pk_only,
+            &pk_reset,
         );
     }
     crate::ode::ode_predictions(ode_spec, pk_params_flat, theta, eta, subject)
@@ -2200,9 +2574,16 @@ pub fn compute_predictions_with_tv_into_with_schedule(
     // harmless); every other model is unchanged (#486).
     let model = effective_model_for_eval(model, subject, theta, eta);
     let has_tv = subject.has_tv_covariates();
-    let uses_time = model_uses_time_builtin(model);
+    let uses_time = model_uses_time_anywhere(model);
 
-    let mut preds = if let Some(ref ode) = model.ode_spec {
+    let mut preds = if model.is_algebraic() {
+        // Compartment-free model (#811): there is no state to integrate and no
+        // closed form to evaluate — the `[structural_model]` readout *is* the
+        // prediction. These zeros are never read: `apply_analytic_readout` builds
+        // an empty `state[]` for such a model (no `central = conc × V` step) and
+        // overwrites every entry with the readout's value.
+        vec![0.0; subject.obs_times.len()]
+    } else if let Some(ref ode) = model.ode_spec {
         // ODE path. Resets (EVID=3/4) need the state-propagating event-driven
         // walker too, even without time-varying covariates — the plain
         // `ode_predictions` loop has no reset event.
@@ -2216,6 +2597,7 @@ pub fn compute_predictions_with_tv_into_with_schedule(
                 &scratch.dose,
                 &scratch.obs,
                 &scratch.pk_only,
+                &scratch.reset,
             )
         } else if let Some(mr) = modified_release::mr_predictions(model, subject, theta, eta) {
             // Closed-form modified-release fast path (#860): a *static* multi-route
@@ -2226,11 +2608,24 @@ pub fn compute_predictions_with_tv_into_with_schedule(
             // parameter snapshot cannot represent a time-varying disposition — a
             // `TIME`-dependent parameter is invisible to `identify_disposition`'s
             // fixed-`p` Jacobian probe, so the branch guard, not that probe, is what
-            // excludes it. `mr_predictions` returns `None` (→ the `ode_predictions`
-            // twin below) for anything else outside scope (IOV, SS / infusion doses,
-            // flip-flop, non-linear / non-canonical disposition); the admitted result
-            // reduces to that twin to solver tolerance
-            // (`modified_release::tests::reduces_to_ode_*`).
+            // excludes it — and since #1124 that guard is `model_uses_time_anywhere`,
+            // which also excludes a model-time-reading `[odes]` RHS (the probe is
+            // equally blind to `TAD`, and to anything inside an untaken `if` branch).
+            // `mr_predictions` returns `None` (→ the `ode_predictions` twin below) for
+            // anything else outside scope (IOV, SS / infusion doses, flip-flop,
+            // non-linear / non-canonical disposition).
+            //
+            // The admitted result reduces to that twin to solver tolerance. Note what
+            // that claim is worth *here*: this branch sits before the twin, so
+            // production and the closed form are the same code and comparing them
+            // agrees by construction — the `mr_vs_prod` difference is exactly `0.0`,
+            // and #1124's 8× error was invisible from this side for that reason. The
+            // reduction is only ever established elsewhere: by
+            // `modified_release::tests::reduces_to_ode_*` on the fixture zoo, by
+            // `mr_matches_the_states_entry_point` across the two production entry points
+            // (`compute_predictions_with_states` deliberately has *no* MR branch —
+            // do not add one, it is the independent side of that check), and at
+            // runtime in debug builds by `modified_release::verify_against_ode_twin`.
             mr
         } else {
             let pk = pk_params_at_time(model, theta, eta, &subject.covariates, 0.0);
@@ -2530,6 +2925,177 @@ mod tests {
         assert_relative_eq!(c_single, c_two, epsilon = 1e-12);
     }
 
+    /// #1133, the occasion-label route. NONMEM anchor J
+    /// (`nonmem_anchor/reset_init_snapshot_J.ctl`) establishes the rule against an external
+    /// engine: with `WT` flat and only the `OCC` column moving, `$PK` at the reset row runs
+    /// under **that row's own occasion** (42.0, occasion 2) and not the preceding record's
+    /// (14.0, occasion 1). That anchor's ferx twin reaches `OCC` as a covariate, because κ
+    /// is estimated and a model file cannot fix it to a discriminating value. This test is
+    /// the other half: it drives `predict_iov` with explicit κ so the occasion LABEL is
+    /// what selects the seed.
+    ///
+    /// The record before the reset is `OCC = 1` and the reset row is `OCC = 2`, so every
+    /// rule that infers the occasion from the PRECEDING record gives 1 — which is what ferx
+    /// did before arm J was measured — and only reading `reset_occasions` gives 2.
+    #[test]
+    fn iov_reset_takes_its_own_rows_occasion() {
+        use crate::parser::model_parser::parse_model_string;
+        let model = parse_model_string(
+            "
+[parameters]
+  theta TVCL(5.0, 0.01, 100.0)
+  theta TVV(50.0, 0.1, 1000.0)
+  theta TVBASE(10.0, 0.01, 1000.0)
+  omega ETA_CL ~ 0.0
+  kappa KAPPA_B ~ 0.04
+  sigma PROP ~ 0.01
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  BASE = TVBASE * exp(KAPPA_B)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central)  = BASE
+  d/dt(central)  = -(CL/V) * central
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP)
+",
+        )
+        .expect("fixture parses");
+
+        let mut subj = Subject {
+            id: "1".to_string(),
+            doses: Vec::new(),
+            obs_times: vec![1.0, 9.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; 2],
+            obs_cmts: vec![1; 2],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: vec![8.0],
+            reset_covariates: Vec::new(),
+            // The reset row itself is occasion 2 — the occasion it STARTS. The record
+            // before it is occasion 1, which is what every neighbour-inferring rule
+            // resolves to, and what ferx used before this was measured.
+            reset_occasions: vec![2],
+            cens: vec![0; 2],
+            // t=1 is occasion 1, t=9 (after the reset) is occasion 2, so both are real
+            // kappa groups. An occasion named ONLY on a reset row is not a group at all —
+            // `iov_occasion_groups` builds them from observation and dose rows — and there
+            // is then no kappa to apply, so `combined_for` yields zero for it.
+            occasions: vec![1, 2],
+            obs_l2: Vec::new(),
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        };
+
+        let groups = crate::stats::likelihood::iov_occasion_groups(&subj);
+        assert_eq!(groups.len(), 2, "occasions 1 and 2 must both be groups");
+        let theta = model.default_params.theta.clone();
+        let eta_bsv = vec![0.0];
+        // Occasion 1 gets κ = 0, occasion 2 gets κ = ln 3 — so a seed under the reset row's
+        // own occasion is three times the one under the preceding record's.
+        let k_of = |occ: u32| groups.iter().position(|(id, _)| *id == occ).expect("group");
+        let mut kappas = vec![vec![0.0]; groups.len()];
+        kappas[k_of(2)] = vec![3.0f64.ln()];
+
+        let own = predict_iov(&model, &subj, &theta, &eta_bsv, &kappas)[1];
+
+        // Drop the row's own occasion: the fallback scan then resolves the preceding
+        // record's (occasion 1, κ = 0) and the post-reset prediction must fall by 3x.
+        subj.reset_occasions.clear();
+        let inferred = predict_iov(&model, &subj, &theta, &eta_bsv, &kappas)[1];
+
+        assert_relative_eq!(own / inferred, 3.0, epsilon = 1e-9);
+    }
+
+    /// #1133 on the adaptive (decision-window) IOV materialiser: a reset row is a record,
+    /// so its snapshot is *its own covariates* under the κ of the decision window active at
+    /// its time — the pairing every other record gets.
+    ///
+    /// The numbers are chosen so each candidate convention lands somewhere different. With
+    /// `CL = TVCL·(WT/100)·exp(ETA_CL + KAPPA_CL)`, decisions at 0 and 24, and resets at
+    /// `t = 5` (window 0, κ = 0) and `t = 30` (window 1, κ = ln 2):
+    ///
+    /// | reset | own row | previous record | next record |
+    /// |---|---|---|---|
+    /// | `t = 5`  | **0.5** (WT 50) | 1.0 (WT 100) | 0.1 (WT 10) |
+    /// | `t = 30` | **1.6** (WT 80, κ = ln 2) | 2.0 (WT 100) | 0.2 (WT 10) |
+    ///
+    /// and taking the baseline κ instead of the window's would give 0.8 for the second. No
+    /// single wrong rule reproduces both cells.
+    #[test]
+    fn iov_event_pk_seeds_each_reset_from_its_own_row_and_window() {
+        use crate::parser::model_parser::parse_model_string;
+        let model = parse_model_string(
+            "
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.0
+  kappa KAPPA_CL ~ 0.0
+  sigma PROP ~ 0.01
+[individual_parameters]
+  CL = TVCL * (WT / 100.0) * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP)
+",
+        )
+        .expect("fixture parses");
+
+        let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+        let subj = Subject {
+            id: "1".to_string(),
+            doses: Vec::new(),
+            obs_times: vec![1.0, 40.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; 2],
+            obs_cmts: vec![1; 2],
+            covariates: wt(100.0),
+            dose_covariates: Vec::new(),
+            obs_covariates: vec![wt(100.0), wt(10.0)],
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: vec![5.0, 30.0],
+            // Each reset row carries a `WT` shared with no neighbouring record, so reading
+            // one row early or late shows up in the assertions below.
+            reset_covariates: vec![wt(50.0), wt(80.0)],
+            cens: vec![0; 2],
+            occasions: Vec::new(),
+            obs_l2: Vec::new(),
+            dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        };
+
+        let theta = model.default_params.theta.clone();
+        let eta_baseline = vec![0.0, 0.0]; // [ETA_CL, KAPPA_CL], κ = 0
+        let eta_occ = vec![
+            vec![0.0, 0.0],                    // window 0 (decision at t=0): κ = 0
+            vec![0.0, std::f64::consts::LN_2], // window 1 (decision at t=24): κ = ln 2
+        ];
+        let decisions = vec![0.0, 24.0];
+        let ev =
+            compute_event_pk_params_iov(&model, &subj, &theta, &eta_baseline, &eta_occ, &decisions);
+
+        assert_eq!(ev.reset.len(), 2, "one snapshot per reset row");
+        assert_relative_eq!(ev.reset[0].values[0], 0.5, epsilon = 1e-12);
+        assert_relative_eq!(ev.reset[1].values[0], 1.6, epsilon = 1e-12);
+    }
+
     #[test]
     fn compute_predictions_routes_reset_subject_to_event_driven() {
         // A subject with a reset (EVID=3) must NOT use superposition:
@@ -2548,10 +3114,12 @@ mod tests {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: vec![5.0],
+            reset_covariates: Vec::new(),
             cens: vec![0; 2],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };
@@ -2603,10 +3171,12 @@ mod tests {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0; n_obs],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         }
@@ -2621,6 +3191,7 @@ mod tests {
             PkModel, ScalingSpec, SigmaVector,
         };
         CompiledModel {
+            covariate_model: None,
             name: "cl_from_cr".into(),
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Additive,
@@ -2641,6 +3212,8 @@ mod tests {
             eta_names: Vec::new(),
             kappa_names: Vec::new(),
             default_params: ModelParameters {
+                residual_correlations: Vec::new(),
+                residual_correlation_fixed: Vec::new(),
                 theta: vec![1.0],
                 theta_names: vec!["TVCL".into()],
                 theta_lower: vec![0.0],
@@ -2655,10 +3228,12 @@ mod tests {
                 sigma_fixed: vec![false],
                 omega_iov: None,
                 kappa_fixed: Vec::new(),
+                mixture: None,
             },
             omega_init_as_sd: Vec::new(),
             sigma_init_as_sd: vec![false],
             kappa_init_as_sd: Vec::new(),
+            kappa_weights: Vec::new(),
             mu_refs: HashMap::new(),
             kappa_mu_refs: HashMap::new(),
             tv_fn: None,
@@ -2679,6 +3254,7 @@ mod tests {
             indiv_param_names: Vec::new(),
             indiv_param_partials: crate::types::IndivParamPartials::empty(),
             theta_transform: Vec::new(),
+            theta_eta_linked: Vec::new(),
             #[cfg(feature = "nn")]
             covariate_nns: Vec::new(),
             scaling: ScalingSpec::None,
@@ -2694,6 +3270,7 @@ mod tests {
             analytic_readout: None,
             ruv_magnitude: None,
             absorption_ode_equivalent: None,
+            mixture: None,
         }
     }
 
@@ -2710,6 +3287,54 @@ mod tests {
         assert_eq!(ev.obs.len(), 3);
         // CL = theta * CR = 10 * 2 = 20 everywhere.
         for p in ev.dose.iter().chain(ev.obs.iter()) {
+            assert_relative_eq!(p.cl(), 20.0, epsilon = 1e-12);
+        }
+    }
+
+    /// The parameter-static arm must still emit one `pk_only` snapshot per
+    /// EVID=2 record.
+    ///
+    /// Both event-driven walkers — the ODE one (`ode/predictions.rs`) and the
+    /// analytical one (`pk/event_driven.rs`) — open with the same three
+    /// unconditional length asserts, so a short `pk_only` aborts the run rather
+    /// than degrading. It is `assert_eq!`, not `debug_assert_eq!`, so release
+    /// builds abort too.
+    ///
+    /// This arm used to leave `pk_only` empty while filling `dose` and `obs`,
+    /// which made the triple structurally inconsistent. It is reachable whenever
+    /// a *parameter-static* subject is routed to an event-driven walker, and two
+    /// routes do that: `subject.has_resets()` (since EVID 3/4 resets were wired
+    /// there — so this predates #1124) and, since #1124, an `[odes]` RHS that
+    /// reads model time. Both need only a dataset with EVID=2 rows, because
+    /// `prune_irrelevant_tv_covariates` clears `pk_only_covariates` while leaving
+    /// `pk_only_times` populated — precisely the state where
+    /// `subject_needs_per_event_pk` is false and `pk_only_times` is not.
+    #[test]
+    fn event_pk_params_fills_pk_only_on_the_parameter_static_arm() {
+        let mut covs = HashMap::new();
+        covs.insert("CR".to_string(), 2.0);
+        let mut subj = make_subject_with_tv(covs, Vec::new(), Vec::new(), 2, 3);
+        // An EVID=2 row that survived covariate pruning: a time, but no snapshot.
+        subj.pk_only_times = vec![0.5, 2.5];
+        subj.pk_only_covariates = Vec::new();
+        let model = cl_from_cr_model();
+        // Precondition: this is the static arm, not the per-event one. Without
+        // this the test would still pass via the `if` branch and prove nothing.
+        assert!(
+            !subject_needs_per_event_pk(&model, &subj),
+            "fixture must exercise the parameter-static arm"
+        );
+        let ev = compute_event_pk_params(&model, &subj, &[10.0], &[]);
+        assert_eq!(ev.dose.len(), subj.doses.len());
+        assert_eq!(ev.obs.len(), subj.obs_times.len());
+        assert_eq!(
+            ev.pk_only.len(),
+            subj.pk_only_times.len(),
+            "pk_only must carry one snapshot per EVID=2 record; both event-driven \
+             walkers assert this length unconditionally"
+        );
+        // CL = theta * CR = 10 * 2 = 20 on every row, pk_only included.
+        for p in ev.dose.iter().chain(&ev.obs).chain(&ev.pk_only) {
             assert_relative_eq!(p.cl(), 20.0, epsilon = 1e-12);
         }
     }
@@ -2793,10 +3418,12 @@ mod tests {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0; 4],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };
@@ -3208,6 +3835,193 @@ mod tests {
         assert_eq!(a.len(), o.len());
         for (av, ov) in a.iter().zip(o.iter()) {
             assert_relative_eq!(av, ov, max_relative = 1e-6, epsilon = 1e-9);
+        }
+    }
+
+    /// Two-occasion IOV subject for the Form C readout cross-engine checks (#1079):
+    /// a dose at t = 0 (occasion 1) and at t = 24 (occasion 2), two samples inside
+    /// each occasion. No washout, so the occasion-2 samples carry occasion-1 drug.
+    fn iov_readout_subject() -> Subject {
+        let obs_times = vec![1.0, 3.0, 25.0, 27.0];
+        let n = obs_times.len();
+        Subject {
+            id: "1".to_string(),
+            doses: vec![bolus_dose(0.0, 100.0), bolus_dose(24.0, 100.0)],
+            obs_times,
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; n],
+            obs_cmts: vec![1; n],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
+            cens: vec![0; n],
+            occasions: vec![1, 1, 2, 2],
+            obs_l2: Vec::new(),
+            dose_occasions: vec![1, 2],
+            reset_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: vec![],
+        }
+    }
+
+    /// **Regression (#1079): a Form C readout under IOV must be evaluated with the
+    /// observation's own occasion κ.**
+    ///
+    /// `apply_analytic_readout` builds the readout's individual parameters from a
+    /// `pk_param_fn` snapshot; under IOV `predict_iov` used to call it once with
+    /// `eta_bsv` — the between-subject η with **κ held at 0**. The concentration it
+    /// was handed did carry the occasion's κ (the event-driven walk uses per-occasion
+    /// PK params), but every individual parameter the readout itself read was frozen
+    /// at its typical value, so an additive κ-carrying baseline was silently dropped
+    /// from the prediction and the objective (12–20% on the reproduction below).
+    ///
+    /// The oracle is cross-engine: the hand-written ODE twin applies the same readout
+    /// inside the integrator against the per-observation parameter snapshot, which is
+    /// also NONMEM's per-record `$ERROR` convention. It is the only oracle that
+    /// catches this — a `Dual2`-vs-FD parity test passes against the wrong function,
+    /// because the analytic sensitivity path was seeded to match it (see
+    /// `iov_form_c_kappa_baseline_readout_provider_matches_fd`).
+    ///
+    /// The decomposition is checked too: `y − central/V` must equal `BASE` evaluated
+    /// at *that observation's* κ, which pins the fix to the per-occasion parameter
+    /// snapshot rather than to a compensating error elsewhere.
+    #[test]
+    fn analytic_form_c_iov_readout_uses_occasion_kappa_matching_ode_twin() {
+        use crate::parser::model_parser::parse_model_string;
+        let params = "\
+[parameters]
+  theta TVCL(3.0, 0.01, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  theta TVBASE(2.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_B ~ 0.04
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  BASE = TVBASE * exp(KAPPA_B)
+";
+        let tail = "\
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  iov_column = OCC
+  ode_reltol = 1e-12
+  ode_abstol = 1e-12
+";
+        // Closed-form and its hand-written ODE twin, same `[scaling]` readout.
+        let analytic = parse_model_string(&format!(
+            "{params}[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
+             [scaling]\n  y = central / V + BASE\n{tail}"
+        ))
+        .expect("analytic parses");
+        let ode = parse_model_string(&format!(
+            "{params}[structural_model]\n  ode(states=[central])\n\
+             [odes]\n  d/dt(central) = -(CL / V) * central\n\
+             [scaling]\n  y = central / V + BASE\n{tail}"
+        ))
+        .expect("ode twin parses");
+        // The readout's `V` divisor cancels the `conc × V` amount reconstruction, so
+        // this (natural) readout cannot show the bug — pinned below so the fix does
+        // not break the load-bearing cancellation.
+        let conc_only = parse_model_string(&format!(
+            "{params}[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
+             [scaling]\n  y = central / V\n{tail}"
+        ))
+        .expect("identity readout parses");
+        // Same model with no readout at all — the built-in concentration output.
+        let plain = parse_model_string(&format!(
+            "{params}[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n{tail}"
+        ))
+        .expect("plain parses");
+        assert_eq!(analytic.n_kappa, 1, "one occasion random effect");
+        assert!(analytic.analytic_readout.is_some() && analytic.ode_spec.is_none());
+        assert!(ode.ode_spec.is_some());
+
+        let subj = iov_readout_subject();
+        let theta = [3.0, 20.0, 2.0];
+        let eta_bsv = [0.1];
+        let kappas = vec![vec![0.5], vec![-0.4]];
+
+        let a = predict_iov(&analytic, &subj, &theta, &eta_bsv, &kappas);
+        let o = predict_iov(&ode, &subj, &theta, &eta_bsv, &kappas);
+        assert_eq!(a.len(), subj.obs_times.len());
+        for (j, (av, ov)) in a.iter().zip(o.iter()).enumerate() {
+            assert_relative_eq!(av, ov, max_relative = 1e-8, epsilon = 1e-12);
+            assert!(av.is_finite(), "obs {j} finite");
+        }
+
+        // Decomposition: the readout output minus the concentration is `BASE` at the
+        // observation's own occasion κ (`2·e^0.5` in occasion 1, `2·e^−0.4` in
+        // occasion 2), NOT the typical value `2` the κ = 0 snapshot produced.
+        let c = predict_iov(&plain, &subj, &theta, &eta_bsv, &kappas);
+        let expected_base = [
+            2.0 * 0.5_f64.exp(),
+            2.0 * 0.5_f64.exp(),
+            2.0 * (-0.4_f64).exp(),
+            2.0 * (-0.4_f64).exp(),
+        ];
+        for (j, (av, cv)) in a.iter().zip(c.iter()).enumerate() {
+            assert_relative_eq!(av - cv, expected_base[j], max_relative = 1e-10);
+            assert!(
+                (av - cv - 2.0).abs() > 0.5,
+                "obs {j}: baseline must not collapse to the κ = 0 typical value"
+            );
+        }
+
+        // The `y = central / V` cancellation still holds: the amount is rebuilt as
+        // `conc × V` with the *same* `V` the readout divides by, so the per-occasion
+        // evaluation must not perturb it (the round-trip is exact to rounding).
+        let ident = predict_iov(&conc_only, &subj, &theta, &eta_bsv, &kappas);
+        for (iv, cv) in ident.iter().zip(c.iter()) {
+            assert_relative_eq!(iv, cv, max_relative = 1e-14);
+        }
+    }
+
+    /// The `y = central / V` cancellation with a κ **on `V` itself** (#1079 fix note
+    /// 3). The predictor rebuilds the central amount as `conc × V` and the readout
+    /// divides by the same `V`; both now come from the observation's occasion, so the
+    /// two must still cancel (exactly, up to the multiply/divide round-trip). Reading
+    /// `V` from a κ = 0 snapshot on one side only would break this by `exp(κ)`.
+    #[test]
+    fn analytic_form_c_iov_identity_readout_cancels_kappa_on_v() {
+        use crate::parser::model_parser::parse_model_string;
+        let params = "\
+[parameters]
+  theta TVCL(3.0, 0.01, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_V ~ 0.04
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV * exp(KAPPA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+";
+        let tail = "\
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  iov_column = OCC
+";
+        let ident =
+            parse_model_string(&format!("{params}[scaling]\n  y = central / V\n{tail}")).unwrap();
+        let plain = parse_model_string(&format!("{params}{tail}")).unwrap();
+
+        let subj = iov_readout_subject();
+        let theta = [3.0, 20.0];
+        let eta_bsv = [0.1];
+        let kappas = vec![vec![0.5], vec![-0.4]];
+        let y = predict_iov(&ident, &subj, &theta, &eta_bsv, &kappas);
+        let c = predict_iov(&plain, &subj, &theta, &eta_bsv, &kappas);
+        assert_eq!(y.len(), c.len());
+        for (yv, cv) in y.iter().zip(c.iter()) {
+            assert_relative_eq!(yv, cv, max_relative = 1e-14);
         }
     }
 
@@ -3704,10 +4518,12 @@ mod tests {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0; n_obs],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };

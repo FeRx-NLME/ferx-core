@@ -152,10 +152,12 @@ fn subject_with_obs(model: &CompiledModel, theta: &[f64], times: &[f64]) -> Subj
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1; n],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -389,6 +391,7 @@ fn marginal_nll_foce_at(
         &h_matrix,
         &params.omega,
         &params.sigma.values,
+        &params.residual_correlations,
         false,
     )
 }
@@ -589,10 +592,12 @@ fn ruv_subject(model: &CompiledModel, theta: &[f64], times: &[f64]) -> Subject {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1; n],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -802,10 +807,12 @@ fn dense_subject(model: &CompiledModel, theta: &[f64], times: &[f64]) -> Subject
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1; n],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -832,7 +839,12 @@ fn precise_ebe_corr(
         let sens =
             crate::sens::provider::subject_sensitivities(model, subject, &params.theta, &eta)
                 .unwrap();
-        let (rv, dv, d2v) = corr_residual_diag(model, subject, &sens, sigma).unwrap();
+        // The **live** correlations (#847). Reading them off `model` here would
+        // reconverge every FD-perturbed EBE at the *declared* ρ, so the FD
+        // reference would silently omit the ρ coordinate's EBE-response term.
+        let (rv, dv, d2v) =
+            corr_residual_diag(model, subject, &sens, sigma, &params.residual_correlations)
+                .unwrap();
         let mut grad = DVector::<f64>::from_column_slice(
             &(omega_inv * DVector::from_column_slice(&eta))
                 .iter()
@@ -882,6 +894,7 @@ fn marginal_nll_dense_at(
         &h,
         &params.omega,
         &params.sigma.values,
+        &params.residual_correlations,
         true,
     )
 }
@@ -1284,10 +1297,12 @@ fn iov_ruv_2cpt_subject(model: &CompiledModel, theta: &[f64]) -> Subject {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; n],
         occasions,
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -1324,10 +1339,12 @@ fn ruv_subject_eta(
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1; n],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -1721,10 +1738,12 @@ fn reset_subject_outer(model: &CompiledModel, theta: &[f64], eta_ref: &[f64], id
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: vec![120.0],
+        reset_covariates: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1; n],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -1792,10 +1811,12 @@ fn population_packed_gradient_ode_ss_reset_matches_fd() {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: vec![60.0],
+        reset_covariates: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1; n],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -2062,7 +2083,7 @@ fn mixed_gradient_with_out_of_scope_subject_matches_fd() {
     );
     // The per-subject view keeps the in-scope subject analytic, only the
     // out-of-scope one `None`.
-    let per_sub = per_subject_packed_gradients(&model, &pop, &template, &x, &ehs, true);
+    let per_sub = per_subject_packed_gradients(&model, &pop, &template, &x, &ehs, true, None);
     assert!(per_sub[0].is_some(), "plain subject is in analytic scope");
     assert!(
         per_sub[1].is_none(),
@@ -2096,6 +2117,7 @@ fn mixed_gradient_with_out_of_scope_subject_matches_fd() {
                 &ebe.h_matrix,
                 &p.omega,
                 &p.sigma.values,
+                &p.residual_correlations,
                 true,
             )
         }
@@ -2174,10 +2196,12 @@ fn tvcov_subject_outer(
         pk_only_times,
         pk_only_covariates: pk_only_wts.iter().map(|&w| wt_map(w)).collect(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1; n],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -2347,10 +2371,12 @@ fn population_packed_gradient_init_matches_fd() {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0; n],
             occasions: vec![1; n],
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };
@@ -2452,10 +2478,12 @@ fn population_packed_gradient_lagtime_matches_fd() {
             pk_only_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
             cens: vec![0; n],
             occasions: vec![1; n],
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
         };
@@ -2599,10 +2627,12 @@ fn frem_outer_subject(model: &CompiledModel, theta: &[f64]) -> Subject {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1; n],
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
         fremtype: pk_times
             .iter()
             .map(|_| 0u16)
@@ -3177,10 +3207,12 @@ fn iov_subject_outer(model: &CompiledModel, theta: &[f64]) -> Subject {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; n],
         occasions,
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -3456,10 +3488,12 @@ fn iov_ruv_subject(model: &CompiledModel, theta: &[f64]) -> Subject {
         pk_only_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; n],
         occasions,
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -4744,10 +4778,12 @@ fn iov_tvcov_subject_outer(model: &CompiledModel, theta: &[f64]) -> Subject {
         pk_only_times: vec![18.0],
         pk_only_covariates: vec![wt_map(85.0)],
         reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
         cens: vec![0; n],
         occasions,
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
+        reset_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
     };
@@ -5258,6 +5294,43 @@ fn magnitude_theta_family_outer_gradient_matches_fd() {
     check_magnitude_outer_gradient_matches_fd(&model, &theta, &subject);
 }
 
+/// Inverse-variance weighting (#1029) rides the same magnitude channel: the
+/// modifier desugars to a covariate multiplier on the *additive* slot only, so
+/// the σ gradient must stay exact for both slots — the weighted additive one and
+/// the untouched proportional one. The weight is θ-free, so this also pins the
+/// direct-θ channel's zero rows (a `Some(mult)` slot whose `∂mult/∂θ` is 0).
+const WARFARIN_RUV_WEIGHT: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.04
+  sigma ADD_ERR ~ 0.09
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR) weight = 1.0 / sqrt(NARM)
+[covariates]
+  NARM continuous
+"#;
+
+#[test]
+fn weight_modifier_outer_gradient_matches_fd() {
+    let model = parse_model_string(WARFARIN_RUV_WEIGHT).expect("parse");
+    let theta = vec![0.22, 11.0, 1.4];
+    let times = [0.5, 1.0, 2.0, 4.0, 8.0, 24.0, 48.0];
+    let mut subject = subject_with_obs(&model, &theta, &times);
+    subject.covariates = HashMap::from([("NARM".to_string(), 9.0)]);
+    check_magnitude_outer_gradient_matches_fd(&model, &theta, &subject);
+}
+
 /// Custom / time-varying residual-magnitude combined with **`iiv_on_ruv`**
 /// (Tier-1 follow-up to #644/#659): the residual-eta `c̃`-column `d/R` is a
 /// function of θ through the magnitude, so `theta_block` adds its `m_vec[rr]` row
@@ -5652,4 +5725,89 @@ fn magnitude_with_correlated_residual_still_declines_outer_gate() {
         !crate::sens::provider::analytic_outer_gradient_available(&model),
         "block_sigma + custom magnitude must still decline the analytic outer gradient"
     );
+}
+
+// ── #1182: the `power(σ, P)` residual form ──────────────────────────────
+//
+// The exponent rides the magnitude channel, so the three FD parity checks the
+// magnitude families already have are the ones that pin it: the FOCEI outer
+// θ/σ gradient, the packed gradient, and the FOCE (Sheiner–Beal) packed
+// gradient. `RUV_POW = 1.3` keeps the exponent away from the proportional
+// value, where the new arms would be unreachable.
+
+const WARFARIN_RUV_POWER: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta RUV_POW(1.3, 0.01, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ power(PROP_ERR, RUV_POW)
+"#;
+
+#[test]
+fn power_exponent_outer_gradient_matches_fd() {
+    let model = parse_model_string(WARFARIN_RUV_POWER).expect("parse");
+    assert!(model.has_ruv_exponent());
+    let theta = vec![0.22, 11.0, 1.4, 1.3];
+    let times = [0.5, 1.0, 2.0, 4.0, 8.0, 24.0, 48.0];
+    let subject = subject_with_obs(&model, &theta, &times);
+    check_magnitude_outer_gradient_matches_fd(&model, &theta, &subject);
+}
+
+/// The exponent below one — the arm where `|f|^{p−1}` grows as `f → 0` — on
+/// the same fixture.
+#[test]
+fn power_exponent_below_one_outer_gradient_matches_fd() {
+    let model = parse_model_string(&WARFARIN_RUV_POWER.replace("RUV_POW(1.3,", "RUV_POW(0.7,"))
+        .expect("parse");
+    let theta = vec![0.22, 11.0, 1.4, 0.7];
+    let times = [0.5, 1.0, 2.0, 4.0, 8.0, 24.0, 48.0];
+    let subject = subject_with_obs(&model, &theta, &times);
+    check_magnitude_outer_gradient_matches_fd(&model, &theta, &subject);
+}
+
+#[test]
+fn power_exponent_foce_packed_matches_fd() {
+    let model = parse_model_string(WARFARIN_RUV_POWER).expect("parse");
+    let theta = vec![0.22, 11.0, 1.4, 1.3];
+    let times = [0.5, 1.0, 2.0, 4.0, 8.0, 24.0, 48.0];
+    let subject = subject_with_obs(&model, &theta, &times);
+    check_magnitude_foce_packed_matches_fd(&model, &theta, &subject);
+}
+
+/// A time-varying multiplier on `TAD` (the ruvsearch candidate) composed with
+/// the exponent: both direct-θ channels live on one slot.
+#[test]
+fn power_exponent_with_tad_multiplier_outer_gradient_matches_fd() {
+    let model = parse_model_string(
+        &WARFARIN_RUV_POWER
+            .replace(
+                "  theta RUV_POW(1.3, 0.01, 10.0)\n",
+                "  theta RUV_POW(1.3, 0.01, 10.0)\n  theta RUV_TV(1.6, 0.01, 10.0)\n",
+            )
+            .replace(
+                "DV ~ power(PROP_ERR, RUV_POW)",
+                "DV ~ power(PROP_ERR * (if (TAD < 3.0) RUV_TV else 1.0), RUV_POW)",
+            ),
+    )
+    .expect("parse");
+    let theta = vec![0.22, 11.0, 1.4, 1.3, 1.6];
+    let times = [0.5, 1.0, 2.0, 4.0, 8.0, 24.0, 48.0];
+    let subject = subject_with_obs(&model, &theta, &times);
+    // The cutoff straddles the observations: three early, four late.
+    let early = (0..7).filter(|&j| subject.time_after_dose(j) < 3.0).count();
+    assert_eq!(early, 3);
+    check_magnitude_outer_gradient_matches_fd(&model, &theta, &subject);
+    check_magnitude_foce_packed_matches_fd(&model, &theta, &subject);
 }

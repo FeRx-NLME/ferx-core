@@ -6,7 +6,7 @@
 # observations are taken within the dosing interval (t = 1, 4, 12, 23h).
 #
 # Run:
-#   cargo run --release -- examples/ss_oral_q24.ferx --data data/ss_oral_q24.csv
+#   cargo run --release -p ferx-cli -- examples/ss_oral_q24.ferx --data data/ss_oral_q24.csv
 #
 # Simulation truth: TVCL=2.0, TVV=20.0, TVKA=1.5. The initial values
 # below are intentionally biased (1.5-2x off truth in each direction)

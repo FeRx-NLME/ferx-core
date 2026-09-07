@@ -1,0 +1,30 @@
+# Anchor C: the variational q at the AGQ estimate, every population parameter FIXed.
+#
+# Both sides of the comparison must sit at the SAME (theta, Omega, sigma) or the difference
+# between them mixes the approximation with a parameter difference. 256 draws and a high
+# iteration cap because the point is to measure how good q is, not where the optimizer stopped:
+# this converges to -2*ELBO = -285.924 against AGQ's -2 log L = -285.977, a gap of 0.05 units,
+# with elbo_tightness_ratio 1.003.
+[parameters]
+  theta TVCL(0.132687, 0.001, 10.0) FIX
+  theta TVV(7.737464, 0.1, 500.0) FIX
+  theta TVKA(0.810901, 0.01, 50.0) FIX
+  omega ETA_CL ~ 0.028592 FIX
+  omega ETA_V  ~ 0.009592 FIX
+  omega ETA_KA ~ 0.336036 FIX
+  sigma PROP_ERR ~ 0.010565 (sd) FIX
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = vi
+  vi_family = full_rank
+  vi_mc_samples = 256
+  vi_omega_update = closed_form
+  vi_final_ofv = laplace
+  vi_iters = 60000
