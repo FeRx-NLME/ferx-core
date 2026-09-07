@@ -783,8 +783,8 @@ fn inner_eta_responses(
 /// differential that places the quadrature nodes, and no amount of trace information substitutes
 /// for it. Exposing them keeps one derivation — every entry here comes from the third-order
 /// `f`-sensitivities (`d3f_deta3`, `d3f_deta2_dtheta`, `d3f_deta_dtheta2`), which the provider
-/// obtains by finite-differencing the exact second-order `Dual2` jet (Shi 2021). There is no
-/// second, higher-level finite difference anywhere in this path.
+/// obtains by finite-differencing the exact second-order `Dual2` jet (Shi 2021). The anchor
+/// and mode responses are assembled directly rather than differencing reconverged gradients.
 ///
 /// # Directions
 ///
@@ -1772,6 +1772,18 @@ pub(crate) fn pack_natural_hessian(
     x: &[f64],
     template: &ModelParameters,
 ) -> DMatrix<f64> {
+    let params = unpack_params(x, template);
+    pack_natural_hessian_with_params(h_nat, g_nat, &params, template)
+}
+
+/// Apply the packing chain using an already-unpacked population parameter snapshot.
+/// AGQ reuses this snapshot across subjects rather than unpacking it for every Hessian.
+pub(crate) fn pack_natural_hessian_with_params(
+    h_nat: &DMatrix<f64>,
+    g_nat: &[f64],
+    params: &ModelParameters,
+    template: &ModelParameters,
+) -> DMatrix<f64> {
     let n_eta = template.omega.dim();
     let nt = template.theta.len();
     let entries = omega_entries(template.omega.diagonal, n_eta);
@@ -1779,7 +1791,6 @@ pub(crate) fn pack_natural_hessian(
     let n_sigma = template.sigma.values.len();
     let nw = nt + n_omega;
     let dim = nt + n_omega + n_sigma;
-    let params = unpack_params(x, template);
     let theta = &params.theta;
     let l = &params.omega.chol;
     let sigma = &params.sigma.values;
@@ -2545,6 +2556,85 @@ mod tests {
         check_m2_natural(&model, &subject, &params);
     }
 
+    #[test]
+    fn agq_cov_hessian_mode_anchor_matches_the_direct_objective_matrix() {
+        use crate::estimation::agq_cov_hessian::{prepare_mode, regularised_anchor};
+        use crate::estimation::sens_outer_gradient::score_core;
+
+        let model = parse_model_string(WARFARIN).unwrap();
+        let params = model.default_params.clone();
+        let subject = warfarin_subject(&model, &params.theta, &[0.5, 2.0, 8.0, 24.0]);
+        let eta = [0.17, -0.11, 0.23];
+        let (_, prep, anchor) = prepare_mode(&model, &subject, &params, &eta).unwrap();
+        // The objective uses the ordinary sensitivity provider and the direct ScoreCore.
+        let sens = subject_sensitivities(&model, &subject, &params.theta, &eta).unwrap();
+        let core = score_core(
+            &model,
+            &subject,
+            &params,
+            &sens,
+            model.n_eta,
+            &params.omega.inv,
+            &eta,
+            model.residual_error_eta,
+        )
+        .unwrap();
+        let expected = regularised_anchor(&core.htilde).unwrap();
+        assert_eq!(
+            anchor.s, expected.s,
+            "covariance must use the objective's exact anchor bytes"
+        );
+        let roundtrip = regularised_anchor(&prep.htilde_inv.try_inverse().unwrap()).unwrap();
+        assert_ne!(
+            roundtrip.s, expected.s,
+            "fixture must expose the old double-inversion roundoff"
+        );
+    }
+
+    #[test]
+    fn agq_cov_hessian_declines_custom_and_time_varying_magnitudes() {
+        use crate::estimation::agq_cov_hessian::{
+            node_jet, subject_agq_cov_hessian, subject_packed_agq_cov_hessian,
+        };
+        let eta = [0.17, -0.11, 0.23];
+        let grid = vec![vec![0.0; 3]];
+        let pi = vec![1.0];
+        for magnitude in [None, Some("2.0"), Some("if (TIME > 4.0) TVKA else 1.0")] {
+            let source = magnitude.map_or_else(
+                || WARFARIN.to_owned(),
+                |m| {
+                    WARFARIN.replace(
+                        "proportional(PROP_ERR)",
+                        &format!("proportional(PROP_ERR * ({m}))"),
+                    )
+                },
+            );
+            let model = parse_model_string(&source).unwrap();
+            let params = &model.default_params;
+            let subject = warfarin_subject(&model, &params.theta, &[0.5, 2.0, 8.0, 24.0]);
+            assert_eq!(
+                model.ruv_obs_mult(&subject, &params.theta).is_some(),
+                magnitude.is_some()
+            );
+            // Both assembly boundaries and the node helper decline; the otherwise
+            // identical plain fixture must remain supported.
+            let supported = magnitude.is_none();
+            assert_eq!(
+                node_jet(&model, &subject, params, &eta).is_some(),
+                supported
+            );
+            assert_eq!(
+                subject_agq_cov_hessian(&model, &subject, params, &eta, &grid, &pi).is_some(),
+                supported
+            );
+            assert_eq!(
+                subject_packed_agq_cov_hessian(&model, &subject, params, params, &eta, &grid, &pi)
+                    .is_some(),
+                supported
+            );
+        }
+    }
+
     /// The split into `C` and `M` reassembles into exactly the M2 natural block, and both halves
     /// behave the way #251's term (C) needs them to.
     ///
@@ -2822,7 +2912,7 @@ mod tests {
             "premise: the tensor grid really has more than one node"
         );
         let analytic =
-            subject_packed_agq_cov_hessian(&model, &subject, &template, &x, &eta, &grid, &pi)
+            subject_packed_agq_cov_hessian(&model, &subject, &template, &params, &eta, &grid, &pi)
                 .expect("analytic AGQ covariance is in scope");
 
         // Oracle: F_i(x) with the mode reconverged at every perturbed point.

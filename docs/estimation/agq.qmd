@@ -493,7 +493,8 @@ silently keeps the finite-difference covariance, which remains correct.
 - `method = focei` with `n_agq > 1`.
 - The model is inside the analytic covariance scope shared with FOCE/FOCEI — no
   censored (M3/BLOQ) observations, no IOV, and a Gaussian endpoint the sensitivity
-  provider reaches. TTE and categorical endpoints are outside it.
+  provider reaches. TTE, categorical endpoints, and custom or time-varying residual
+  magnitudes are outside it.
 - The subject's anchor is well conditioned. A flat or unidentifiable random-effect
   direction is declined rather than reported: the assembly would otherwise invert a
   near-singular matrix and return standard errors inflated by orders of magnitude.
@@ -526,6 +527,14 @@ own quadrature objective:
   compared against the finite-difference covariance. The test also asserts that the
   analytic dispatcher accepts each fixture, rejects exact-anchor Laplace, and declines
   a population containing a censored subject.
+- **Anchor identity** — the covariance uses the directly assembled objective anchor,
+  without recovering it by inverting its inverse. A regression checks exact matrix
+  equality and confirms that the old inverse round trip changes the fixture's entries.
+
+The derivative assembly uses finite differences of the second-order sensitivity jet
+for third-order sensitivities. Its node sigma score also centrally differences the
+residual variance at fixed predictions; the variance is quadratic in sigma within this
+scope, so that step has rounding error but no truncation error.
 
 ## Inter-occasion variability (IOV)
 

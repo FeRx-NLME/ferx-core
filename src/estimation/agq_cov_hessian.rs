@@ -293,12 +293,6 @@
 // cannot see an error here — its node is `z = 0`, so `√2` drops out — so step 4 needs a
 // multi-node check of its own.
 
-// Every item here is consumed only by this module's tests until the step-5 assembly lands.
-// Without this, `pub mod` exported nine `dead_code` warnings into every non-test build of the
-// crate and of downstream consumers (ferx-r's `src/rust`). Remove when `compute_covariance`
-// calls `regularised_anchor`.
-#![allow(dead_code)]
-
 use nalgebra::{Cholesky, DMatrix, DVector, Dyn};
 
 use crate::estimation::sens_cov_hessian::CovHessianParts;
@@ -399,11 +393,6 @@ fn half_tril(a: &DMatrix<f64>) -> DMatrix<f64> {
 }
 
 impl RegularisedAnchor {
-    /// Packed dimension `d` of the anchor.
-    pub(crate) fn dim(&self) -> usize {
-        self.coef.len()
-    }
-
     /// Whether `S` is conditioned well enough for `S⁻¹` to be contracted against its own
     /// derivatives without the result being dominated by round-off.
     ///
@@ -439,6 +428,7 @@ impl RegularisedAnchor {
     }
 
     /// `log|S|`, the quantity entering the objective as `½·log_det_inv_scale`.
+    #[cfg(test)]
     pub(crate) fn log_det(&self) -> f64 {
         let l = self.chol.l();
         2.0 * (0..self.coef.len()).map(|i| l[(i, i)].ln()).sum::<f64>()
@@ -716,8 +706,9 @@ pub(crate) fn node_jet(
         &params.omega,
         &params.sigma.values,
         &params.residual_correlations,
+        // Event-walk subjects are excluded by subject_sensitivities_cov above.
         None,
-        None,
+        core.mult.as_deref(),
     )?;
     let parts = subject_cov_hessian_parts(model, subject, params, &sens, &prep, b);
     let s = fixed_b_natural_score(model, subject, params, &sens, &prep, &core, b);
@@ -768,11 +759,14 @@ impl AgqCovTerms {
 ///
 /// # Order of accuracy
 ///
-/// **Fully analytic in the parameters.** `H̃_ζ`, `H̃_ζξ`, `b̂_ζ` and `b̂_ζξ` all come from
+/// `H̃_ζ`, `H̃_ζξ`, `b̂_ζ` and `b̂_ζξ` all come from
 /// [`AnchorDerivatives`], which #436 assembles in closed form from the third-order
 /// `f`-sensitivities. Those in turn are obtained by finite-differencing the exact second-order
-/// `Dual2` jet (Shi 2021) inside `subject_sensitivities_cov` — the *only* finite difference in
-/// this path, and the same one FOCEI's own covariance already rides on.
+/// `Dual2` jet (Shi 2021) inside `subject_sensitivities_cov`, as in FOCEI covariance.
+/// The node sigma score also centrally differences the residual variance at fixed predictions
+/// through `data_sigma_gradient`. That variance is quadratic in sigma in this scope, so this
+/// latter difference has rounding error but no truncation error. Neither operation reconverges
+/// the mode or differences the assembled quadrature objective.
 ///
 /// An earlier draft reached the two second-order objects by differencing assembled `H̃_ζ`/`b̂_ζ`
 /// over the natural parameters with the EBE reconverged at each point. That was wrong twice over:
@@ -790,8 +784,6 @@ pub(crate) fn subject_agq_cov_hessian(
     pi: &[f64],
 ) -> Option<AgqCovTerms> {
     use crate::estimation::sens_cov_hessian::{omega_entries, subject_anchor_derivatives};
-    use crate::estimation::sens_outer_gradient::prepare;
-    use crate::sens::provider::subject_sensitivities_cov;
     use std::f64::consts::SQRT_2;
 
     let n_eta = model.n_eta;
@@ -800,10 +792,7 @@ pub(crate) fn subject_agq_cov_hessian(
     let dim = n_theta + entries.len() + params.sigma.values.len();
 
     // ── at the mode ────────────────────────────────────────────────────────────────────────
-    let sens = subject_sensitivities_cov(model, subject, &params.theta, eta_hat)?;
-    let prep = prepare(model, subject, params, &sens, eta_hat)?;
-    let htilde = prep.htilde_inv.clone().try_inverse()?;
-    let anchor = regularised_anchor(&htilde)?;
+    let (sens, prep, anchor) = prepare_mode(model, subject, params, eta_hat)?;
     // The conditioning screen `regularised_anchor` deliberately does not perform (review
     // finding 1). It is owed *here*, where `S⁻¹` is actually formed: a near-zero `H̃` diagonal —
     // a flat or unidentifiable η direction — is perfectly differentiable, so `regularised_anchor`
@@ -905,6 +894,42 @@ fn eta_hat_vec(eta: &[f64]) -> DVector<f64> {
     DVector::from_column_slice(eta)
 }
 
+/// Prepare the mode once, retaining the directly assembled anchor used by the objective.
+/// The covariance provider enforces the model scope (including custom sigma magnitudes);
+/// the censored-row check belongs here so both natural and packed assemblies enforce it.
+pub(crate) fn prepare_mode(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    eta_hat: &[f64],
+) -> Option<(
+    crate::sens::provider::SubjectSens,
+    crate::estimation::sens_outer_gradient::Prep,
+    RegularisedAnchor,
+)> {
+    use crate::estimation::sens_outer_gradient::{prepare, score_core};
+    use crate::sens::provider::subject_sensitivities_cov;
+    let sens = subject_sensitivities_cov(model, subject, &params.theta, eta_hat)?;
+    let prep = prepare(model, subject, params, &sens, eta_hat)?;
+    if prep.et.iter().any(|t| t.censored) {
+        return None;
+    }
+    let core = score_core(
+        model,
+        subject,
+        params,
+        &sens,
+        model.n_eta,
+        &params.omega.inv,
+        eta_hat,
+        model.residual_error_eta,
+    )?;
+    // Do not recover this from prep.htilde_inv: inversion roundoff would change the
+    // matrix the objective factorises, especially for a poorly conditioned anchor.
+    let anchor = regularised_anchor(&core.htilde)?;
+    Some((sens, prep, anchor))
+}
+
 /// The per-subject AGQ covariance Hessian in the optimizer's **packed** space.
 ///
 /// Mirrors `sens_cov_hessian::subject_packed_cov_hessian` — same censored-row scope check, same
@@ -916,29 +941,17 @@ pub(crate) fn subject_packed_agq_cov_hessian(
     model: &CompiledModel,
     subject: &Subject,
     template: &ModelParameters,
-    x: &[f64],
+    params: &ModelParameters,
     eta_hat: &[f64],
     grid: &[Vec<f64>],
     pi: &[f64],
 ) -> Option<DMatrix<f64>> {
-    use crate::estimation::parameterization::unpack_params;
-    use crate::estimation::sens_cov_hessian::pack_natural_hessian;
-    use crate::estimation::sens_outer_gradient::prepare;
-    use crate::sens::provider::subject_sensitivities_cov;
-
-    let params = unpack_params(x, template);
-    // Censored (M3/BLOQ) rows are out of the M3 assembly's scope, and `AnchorDerivatives` is
-    // that assembly's machinery — so the same exclusion applies here.
-    let sens = subject_sensitivities_cov(model, subject, &params.theta, eta_hat)?;
-    let prep = prepare(model, subject, &params, &sens, eta_hat)?;
-    if prep.et.iter().any(|t| t.censored) {
-        return None;
-    }
-    let terms = subject_agq_cov_hessian(model, subject, &params, eta_hat, grid, pi)?;
-    Some(pack_natural_hessian(
+    use crate::estimation::sens_cov_hessian::pack_natural_hessian_with_params;
+    let terms = subject_agq_cov_hessian(model, subject, params, eta_hat, grid, pi)?;
+    Some(pack_natural_hessian_with_params(
         &terms.total(),
         &terms.grad,
-        x,
+        params,
         template,
     ))
 }

@@ -616,6 +616,12 @@ pub(super) fn analytic_cov_hessian(
     if model.n_kappa > 0 {
         return None;
     }
+    // The quadrature rule and parameter unpacking are shared by every subject.
+    let agq = agq.map(|n_agq| {
+        let (nodes, weights) = crate::estimation::agq::gauss_hermite(n_agq);
+        let params = crate::estimation::parameterization::unpack_params(x_hat, template);
+        (nodes, weights, params)
+    });
     let n = x_hat.len();
     let mut acc = DMatrix::<f64>::zeros(n, n);
     for (subject, eta_hat) in population.subjects.iter().zip(eta_hats.iter()) {
@@ -629,25 +635,23 @@ pub(super) fn analytic_cov_hessian(
         if crate::cancel::is_cancelled(&options.cancel) {
             return None;
         }
-        let h = if let Some(n_agq) = agq {
+        let h = if let Some((nodes, weights, params)) = &agq {
             // FOCEI-anchored quadrature (#251). The grid is rebuilt here from the same
             // Gauss-Hermite rule the objective used, so the Hessian differentiates the grid the
             // fit actually evaluated — the same reason the proposal jitter is carried.
-            let (nodes, weights) = crate::estimation::agq::gauss_hermite(n_agq);
-            let params = crate::estimation::parameterization::unpack_params(x_hat, template);
             let (grid, pi) = crate::estimation::agq::subject_grid_and_weights(
                 model,
                 subject,
-                &params,
+                params,
                 eta_hat.as_slice(),
-                &nodes,
-                &weights,
+                nodes,
+                weights,
             )?;
             crate::estimation::agq_cov_hessian::subject_packed_agq_cov_hessian(
                 model,
                 subject,
                 template,
-                x_hat,
+                params,
                 eta_hat.as_slice(),
                 &grid,
                 &pi,

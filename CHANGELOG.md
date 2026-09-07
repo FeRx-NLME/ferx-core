@@ -30,7 +30,8 @@ section of the SDLC for the versioning policy).
   it anchors on the exact conditional Hessian, whose second derivative would need fourth-order
   sensitivities. Models outside the analytic covariance scope (censored/M3 rows, IOV, non-Gaussian
   endpoints) also keep the existing path, and a poorly identified fit falls back rather than
-  reporting an ill-conditioned analytic result (#251, PR #955).
+  reporting an ill-conditioned analytic result. The quadrature anchor is taken directly
+  from the objective assembly, avoiding an inverse round trip (#251, PR #955).
 - **`ferx ruvsearch` — residual-error model search (Pharmpy `ruvsearch`) in `ferx-tools`
   (#1182).** From a `.ferxsearch` file with no `[space]` — the candidates are the four
   residual-error forms: IIV on the residual error, a `power` form, a `combined` form and a
