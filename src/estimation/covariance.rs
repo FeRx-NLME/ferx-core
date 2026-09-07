@@ -570,7 +570,7 @@ pub(crate) fn assemble_score_cross_product(
 /// Serial over subjects, reduced in subject order, so the result cannot depend on thread
 /// count — matching how the FD stencil and the outer gradient reduce (#703). The covariance
 /// step runs once per fit, so the per-subject assembly is not on any hot path.
-fn analytic_cov_hessian(
+pub(super) fn analytic_cov_hessian(
     model: &CompiledModel,
     population: &Population,
     template: &ModelParameters,

@@ -2376,6 +2376,7 @@ mod tests {
             &ebe.h_matrix,
             &params.omega,
             &params.sigma.values,
+            &params.residual_correlations,
             true,
         );
 

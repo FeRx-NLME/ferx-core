@@ -451,17 +451,25 @@ records in #317. `auto` picks L-BFGS for AGQ precisely to avoid it.
 
 ## The analytic covariance
 
-By default the covariance step recovers standard errors by finite-differencing the
-objective function. Under AGQ that is expensive in a specific way: the stencil needs
+The analytic R-matrix supports three estimation paths:
+
+| Fit | Covariance objective |
+|---|---|
+| `method = foce` | FOCE marginal with residual variance frozen at zero random effects |
+| `method = focei`, `n_agq = 1` | FOCEI marginal |
+| `method = focei`, `n_agq > 1` | FOCEI-anchored quadrature marginal, including movement of the nodes |
+
+Outside the analytic scope, the covariance step uses finite differences of the
+objective function. Under AGQ that is expensive: the stencil needs
 `~2·n_free²` **reconverged population objectives**, and every one of them sweeps the
-whole `n_agq^d` node grid for every subject. Doubling the node count doubles the cost
-of each of those `O(n_free²)` evaluations.
+whole `n_agq^d` node grid for every subject. Doubling the nodes per dimension
+multiplies the grid size by `2^d`.
 
 For `method = focei` with `n_agq > 1`, ferx now assembles that R-matrix analytically
 instead, in a single pass. The standard errors mean the same thing they did before —
 they describe the quadrature marginal the fit actually minimised, not the FOCEI one.
 
-### Why FOCEI only
+### Why quadrature support uses the FOCEI anchor
 
 The restriction is structural rather than a staging decision. The quadrature grid is
 scaled by a Hessian anchor, and the two methods anchor differently:
@@ -495,21 +503,29 @@ It speeds up the covariance step for Gaussian-endpoint FOCEI-anchored quadrature
 is a common and expensive case, but the non-Gaussian endpoints that motivate quadrature
 in the first place keep the existing path.
 
-### Validation
+### Covariance validation
 
-There is no NONMEM comparison for this feature, because NONMEM has no analytic
-covariance for adaptive quadrature to compare against. It is instead validated against
-the objective itself:
+The shared FOCEI covariance machinery is checked against the stored NONMEM 7.5.1
+`MATRIX=R` reference at the same parameter values, using
+`tests/covariance_se_at_nonmem_minimum.rs`. All seven checked standard errors pass
+its 6% acceptance band. This anchors FOCEI; the AGQ Hessian is checked against its
+own quadrature objective:
 
-- **A finite-difference oracle at `n_agq = 3`** — the packed Hessian is compared against
+- **Finite-difference oracles at three and five nodes** — diagonal and correlated Ω,
+  proportional and combined residual errors. The packed Hessian is compared against
   a reconverged second difference of the AGQ objective in optimizer space. This is the
   check that matters, because it sees the assembly end to end, including the `√2` node
   scaling and the softmax-response term.
 - **Reduction to FOCEI at one node** — at `n_agq = 1` the grid collapses onto the mode
-  and the assembly must reproduce the FOCE/FOCEI covariance exactly. Note this check
+  and its node-curvature term reproduces the FOCEI term; the log-determinant still
+  includes the quadrature proposal jitter. This check
   *cannot* see a `√2` error (the single node sits at `z = 0`, so the scaling drops out),
   which is why the multi-node oracle above is the primary evidence rather than a
   supplement.
+- **Production covariance dispatch** — FOCE, FOCEI, and AGQ-FOCEI standard errors are
+  compared against the finite-difference covariance. The test also asserts that the
+  analytic dispatcher accepts each fixture, rejects exact-anchor Laplace, and declines
+  a population containing a censored subject.
 
 ## Inter-occasion variability (IOV)
 

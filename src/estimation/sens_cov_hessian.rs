@@ -2770,15 +2770,38 @@ mod tests {
     /// `n_agq = 1` reduction leans on, working in the oracle's favour here.
     #[test]
     fn agq_cov_hessian_matches_fd_of_the_agq_objective_at_three_nodes() {
+        check_agq_cov_hessian_objective(WARFARIN, 3);
+    }
+
+    #[test]
+    fn agq_cov_hessian_matches_fd_with_block_omega() {
+        let model = WARFARIN.replace(
+            "omega ETA_CL ~ 0.09\n  omega ETA_V  ~ 0.04",
+            "block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]",
+        );
+        assert_ne!(model, WARFARIN);
+        check_agq_cov_hessian_objective(&model, 3);
+    }
+
+    #[test]
+    fn agq_cov_hessian_matches_fd_with_combined_error_at_five_nodes() {
+        let model = WARFARIN
+            .replace(
+                "sigma PROP_ERR ~ 0.04",
+                "sigma PROP_ERR ~ 0.04\n  sigma ADD_ERR ~ 0.1",
+            )
+            .replace("proportional(PROP_ERR)", "combined(PROP_ERR, ADD_ERR)");
+        check_agq_cov_hessian_objective(&model, 5);
+    }
+
+    fn check_agq_cov_hessian_objective(model_text: &str, n_agq: usize) {
         use crate::estimation::agq::{
             agq_subject_objective, gauss_hermite, subject_grid_and_weights,
         };
         use crate::estimation::agq_cov_hessian::subject_packed_agq_cov_hessian;
         use crate::estimation::parameterization::{pack_params, unpack_params};
 
-        const N_AGQ: usize = 3;
-
-        let model = parse_model_string(WARFARIN).expect("parse");
+        let model = parse_model_string(model_text).expect("parse");
         let theta = vec![0.2, 10.0, 1.5];
         let subject = warfarin_subject(&model, &theta, &[0.5, 2.0, 8.0, 24.0]);
         let mut params = model.default_params.clone();
@@ -2789,13 +2812,13 @@ mod tests {
 
         // Analytic, on the grid the objective evaluates.
         let eta = precise_ebe(&model, &subject, &params);
-        let (nodes, weights) = gauss_hermite(N_AGQ);
+        let (nodes, weights) = gauss_hermite(n_agq);
         let (grid, pi) =
             subject_grid_and_weights(&model, &subject, &params, &eta, &nodes, &weights)
                 .expect("warfarin is in the Gauss-Newton anchor's scope");
         assert_eq!(
             grid.len(),
-            N_AGQ.pow(model.n_eta as u32),
+            n_agq.pow(model.n_eta as u32),
             "premise: the tensor grid really has more than one node"
         );
         let analytic =
@@ -2806,7 +2829,7 @@ mod tests {
         let f = |xv: &[f64]| -> f64 {
             let q = unpack_params(xv, &template);
             let e = precise_ebe(&model, &subject, &q);
-            agq_subject_objective(&model, &subject, &q, &e, N_AGQ)
+            agq_subject_objective(&model, &subject, &q, &e, n_agq)
         };
         let f0 = f(&x);
         let step: Vec<f64> = x.iter().map(|v| 1e-4 * (1.0 + v.abs())).collect();
@@ -3078,8 +3101,10 @@ mod tests {
     /// so this is the only test that exercises the wiring rather than the mathematics.
     #[test]
     fn analytic_cov_matches_the_fd_stencil_through_compute_covariance() {
-        use crate::estimation::covariance::{compute_covariance, CovarianceStepResult};
-        use crate::types::{FitOptions, Population};
+        use crate::estimation::covariance::{
+            analytic_cov_hessian, compute_covariance, CovarianceStepResult,
+        };
+        use crate::types::{EstimationMethod, FitOptions, Population};
 
         let model = parse_model_string(WARFARIN).expect("parse");
         let theta = vec![0.2, 10.0, 1.5];
@@ -3111,13 +3136,55 @@ mod tests {
         let h_mats = vec![DMatrix::zeros(model.n_eta, model.n_eta); n_subj];
         let kappas = vec![vec![]; n_subj];
 
-        let run = |analytic: bool, interaction: bool| -> DMatrix<f64> {
+        // Exact-anchor Laplace is a different objective even at one node.
+        for n_agq in [1, 3] {
+            let opts = FitOptions {
+                method: EstimationMethod::Laplace,
+                n_agq,
+                ..FitOptions::default()
+            };
+            assert!(
+                analytic_cov_hessian(&model, &population, &params, &x_hat, &eta_hats, &opts)
+                    .is_none()
+            );
+        }
+        // One unsupported subject must decline the entire population, including AGQ.
+        let mut censored_model = parse_model_string(WARFARIN).expect("parse");
+        censored_model.bloq_method = BloqMethod::M3;
+        let mut censored_population = population.clone();
+        censored_population.subjects[1].cens[3] = 1;
+        let agq_opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            n_agq: 3,
+            ..FitOptions::default()
+        };
+        assert!(analytic_cov_hessian(
+            &censored_model,
+            &censored_population,
+            &params,
+            &x_hat,
+            &eta_hats,
+            &agq_opts
+        )
+        .is_none());
+
+        let run = |analytic: bool, interaction: bool, n_agq: usize| -> DMatrix<f64> {
             let mut opts = FitOptions {
                 analytic_cov_hessian: analytic,
                 interaction,
+                method: if interaction {
+                    EstimationMethod::FoceI
+                } else {
+                    EstimationMethod::Foce
+                },
+                n_agq,
                 ..FitOptions::default()
             };
             opts.verbose = false;
+            if analytic {
+                assert!(analytic_cov_hessian(&model, &population, &params, &x_hat, &eta_hats, &opts).is_some(),
+                    "production dispatch must select analytic covariance: interaction={interaction}, n_agq={n_agq}");
+            }
             match compute_covariance(
                 &x_hat,
                 &params,
@@ -3168,9 +3235,15 @@ mod tests {
         // true`) left the FOCE arm of that dispatch, and the OFV `×2` scaling applied to the
         // FOCE assembly, unexercised end-to-end — which is precisely the untested-wiring shape
         // that produced the √2 SE inflation on the FOCEI side.
-        for interaction in [true, false] {
-            let label = if interaction { "FOCEI" } else { "FOCE" };
-            let (se_fd, se_an) = (se(&run(false, interaction)), se(&run(true, interaction)));
+        for (interaction, n_agq, label) in [
+            (false, 1, "FOCE"),
+            (true, 1, "FOCEI"),
+            (true, 3, "AGQ-FOCEI"),
+        ] {
+            let (se_fd, se_an) = (
+                se(&run(false, interaction, n_agq)),
+                se(&run(true, interaction, n_agq)),
+            );
             let worst = se_fd
                 .iter()
                 .zip(se_an.iter())

@@ -6,9 +6,9 @@
 //! #436 assembles the second derivative of the FOCE/FOCEI marginal. AGQ minimises a
 //! *different* objective: the quadrature marginal carries a grid whose centre and scale both
 //! move with `x`, and a softmax over nodes whose weights move too. Neither has a FOCEI
-//! analogue, so `analytic_cov_hessian` declines every `agq_nodes().is_some()` fit (#953 review
-//! finding 1) rather than reporting standard errors for a likelihood the fit never optimised.
-//! This module supplies the missing object.
+//! analogue. The original `analytic_cov_hessian` therefore declined quadrature fits (#953).
+//! This module supplies their Hessian; the dispatcher keeps the separate FOCE and FOCEI
+//! assemblies for fits without quadrature.
 //!
 //! Only the **Gauss-Newton** anchor is in scope. `method = laplace` anchors on the exact
 //! conditional Hessian `H = ∂²nll/∂b²`, which already contains `∂²f/∂η²`; its second
@@ -218,8 +218,10 @@
 //!
 //! # Cost
 //!
-//! `G + O(N)` provider evaluations per subject (`G = n_agq^d` nodes, `N = n_theta + n_eta`),
-//! once per fit at the converged point. The finite-difference stencil it replaces costs
+//! One grid traversal per subject (`G = n_agq^d` nodes, `N = n_theta + n_eta`). Each node
+//! currently calls `subject_sensitivities_cov`, which uses `2N + 1` second-order provider
+//! evaluations to supply the theta-theta block as well as the third-order tensors. Thus
+//! provider work is `O(GN)`, plus the mode derivatives. The finite-difference stencil costs
 //! `~2·n_free²` reconverged population objectives, **each** of which sweeps all `G` nodes for
 //! every subject. So the saving is `O(n_free²) → O(1)` in the number of grid sweeps, which is
 //! the quantity that actually hurts as `n_agq` grows.
@@ -405,8 +407,9 @@ impl RegularisedAnchor {
     /// Whether `S` is conditioned well enough for `S⁻¹` to be contracted against its own
     /// derivatives without the result being dominated by round-off.
     ///
-    /// Estimated from the Cholesky diagonal: `cond(S) ≈ (max Lᵢᵢ / min Lᵢᵢ)²`, exact for a
-    /// diagonal `S` and a sound lower bound generally, at no extra factorisation cost.
+    /// Uses the infinity-norm condition number `‖S‖∞ · ‖S⁻¹‖∞`, solving with the cached
+    /// Cholesky factor. Cholesky diagonal ratios alone miss ill-conditioning from large
+    /// off-diagonal entries, so they cannot establish that an anchor is safe to invert.
     ///
     /// The threshold is `1e6`, and it is set by term (A), not by `f64`. `tr(S⁻¹S_ξS⁻¹S_ζ)`
     /// contracts `S⁻¹` **twice**, so round-off is amplified by `cond²`: at `cond = 1e6` the
@@ -426,14 +429,13 @@ impl RegularisedAnchor {
     /// well-defined but useless.
     pub(crate) fn is_well_conditioned(&self) -> bool {
         const MAX_COND: f64 = 1e6;
-        let l = self.chol.l();
-        let (mut lo, mut hi) = (f64::INFINITY, 0.0_f64);
-        for i in 0..self.coef.len() {
-            let d = l[(i, i)].abs();
-            lo = lo.min(d);
-            hi = hi.max(d);
-        }
-        lo > 0.0 && (hi / lo).powi(2) <= MAX_COND
+        let inf_norm = |m: &DMatrix<f64>| {
+            (0..m.nrows())
+                .map(|i| m.row(i).iter().map(|v| v.abs()).sum::<f64>())
+                .fold(0.0_f64, f64::max)
+        };
+        let condition = inf_norm(&self.s) * inf_norm(&self.chol.inverse());
+        condition.is_finite() && condition <= MAX_COND
     }
 
     /// `log|S|`, the quantity entering the objective as `½·log_det_inv_scale`.
@@ -713,6 +715,7 @@ pub(crate) fn node_jet(
         b,
         &params.omega,
         &params.sigma.values,
+        &params.residual_correlations,
         None,
         None,
     )?;
@@ -1696,6 +1699,24 @@ mod tests {
         assert!(
             cond > 1e9,
             "premise: the fixture must really be ill-conditioned; cond ≈ {cond}"
+        );
+    }
+
+    #[test]
+    fn conditioning_screen_rejects_large_off_diagonal_coupling() {
+        // Before jitter L = [[1, 0], [100, 1]]: its diagonal ratio is one,
+        // although the anchor has a condition number near 1e8.
+        let h = DMatrix::from_row_slice(2, 2, &[1.0, 100.0, 100.0, 10001.0]);
+        let reg = regularised_anchor(&h).expect("smooth positive-definite anchor");
+        let l = reg.chol.l();
+        let diagonal_ratio = (l[(1, 1)] / l[(0, 0)]).powi(2);
+        assert!(
+            diagonal_ratio < 2.0,
+            "old diagonal-only screen would admit this anchor"
+        );
+        assert!(
+            !reg.is_well_conditioned(),
+            "off-diagonal coupling must trigger FD fallback"
         );
     }
 
