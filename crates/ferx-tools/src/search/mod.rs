@@ -52,6 +52,19 @@ pub(crate) mod seed;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+/// Where a tool's run files go by default: `<config stem>-<tool>` next to the
+/// config file — `runs/warfarin.ferxsearch` → `runs/warfarin-covsearch` for
+/// `covsearch`. Each tool's `default_dir` is this with its own name.
+pub fn default_dir(config_path: &std::path::Path, tool: &str) -> std::path::PathBuf {
+    let stem = config_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("search");
+    config_path.with_file_name(format!("{stem}-{tool}"))
+}
+
+pub(crate) use output::{number, opt_number};
+
 pub use candidate::{
     Candidate, CandidateError, CandidateResult, Criterion, FeatureVector, RunOptions,
 };

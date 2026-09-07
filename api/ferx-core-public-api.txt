@@ -2807,6 +2807,7 @@ pub fn ferx_core::FitOptions::effective_inner_tol(&self, ltbs_closed_form: bool)
 pub fn ferx_core::FitOptions::hessian_anchor(&self) -> ferx_core::HessianAnchor
 pub fn ferx_core::FitOptions::method_chain(&self) -> alloc::vec::Vec<ferx_core::EstimationMethod>
 pub fn ferx_core::FitOptions::method_default_warning(&self) -> core::option::Option<alloc::string::String>
+pub fn ferx_core::FitOptions::non_interaction_stage(&self) -> core::option::Option<ferx_core::EstimationMethod>
 pub fn ferx_core::FitOptions::quiet(self) -> Self
 pub fn ferx_core::FitOptions::unsupported_keys_warnings(&self) -> alloc::vec::Vec<alloc::string::String>
 impl core::default::Default for ferx_core::FitOptions
@@ -4180,6 +4181,7 @@ pub fn ferx_core::FitOptions::effective_inner_tol(&self, ltbs_closed_form: bool)
 pub fn ferx_core::FitOptions::hessian_anchor(&self) -> ferx_core::HessianAnchor
 pub fn ferx_core::FitOptions::method_chain(&self) -> alloc::vec::Vec<ferx_core::EstimationMethod>
 pub fn ferx_core::FitOptions::method_default_warning(&self) -> core::option::Option<alloc::string::String>
+pub fn ferx_core::FitOptions::non_interaction_stage(&self) -> core::option::Option<ferx_core::EstimationMethod>
 pub fn ferx_core::FitOptions::quiet(self) -> Self
 pub fn ferx_core::FitOptions::unsupported_keys_warnings(&self) -> alloc::vec::Vec<alloc::string::String>
 impl core::default::Default for ferx_core::FitOptions

@@ -85,7 +85,7 @@ use std::path::{Path, PathBuf};
 use ferx_core::edit::{
     ErrorForm, ErrorSpecText, EtaDecl, ModelEdit, ModelText, SigmaDecl, ThetaDecl, TimeVaryingDecl,
 };
-use ferx_core::{CancelFlag, EstimationMethod, FitResult, Population};
+use ferx_core::{CancelFlag, FitResult, Population};
 use serde::Deserialize;
 
 use crate::covsearch::{chi_square_isf, Lrt};
@@ -260,7 +260,7 @@ impl RuvsearchOptions {
                     "[rank] type = \"{}\": ruvsearch selects by the likelihood-ratio test on \
                      the OFV at [ruvsearch] p_value; a BIC ranking does not apply. Remove the \
                      key, or set it to \"ofv\"",
-                    rank_label(kind)
+                    kind.label()
                 ));
             }
         }
@@ -307,19 +307,6 @@ impl RuvsearchOptions {
     /// The `df = 1` χ² cutoff at `p_value` — Pharmpy's `cutoff`.
     pub fn cutoff(&self) -> f64 {
         chi_square_isf(self.p_value, 1)
-    }
-}
-
-fn rank_label(kind: RankType) -> &'static str {
-    match kind {
-        RankType::Ofv => "ofv",
-        RankType::Aic => "aic",
-        RankType::Bic => "bic",
-        RankType::BicMixed => "bic_mixed",
-        RankType::BicIiv => "bic_iiv",
-        RankType::BicRandom => "bic_random",
-        RankType::BicFixed => "bic_fixed",
-        RankType::Penalized => "penalized",
     }
 }
 
@@ -489,11 +476,7 @@ pub fn run_ruvsearch(
 /// Where a search run's files go by default: `<config stem>-ruvsearch` next
 /// to the config file.
 pub fn default_dir(config_path: &Path) -> PathBuf {
-    let stem = config_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("search");
-    config_path.with_file_name(format!("{stem}-ruvsearch"))
+    crate::search::default_dir(config_path, "ruvsearch")
 }
 
 /// What the search knows about the data and the input before it fits
@@ -534,12 +517,17 @@ impl Space {
             ));
         }
         let population = &base.prepared.population;
-        let fo = &base.prepared.parsed.fit_options;
-        let interaction_ok = !matches!(fo.method, EstimationMethod::Foce)
-            && !(matches!(
-                fo.method,
-                EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid
-            ) && !fo.interaction);
+        // The predicate `fit()` refuses `iiv_on_ruv` with, over the *whole*
+        // method chain — `fit_options.method` alone is the last stage, so a
+        // `[foce, focei]` base would otherwise be offered a candidate core
+        // then rejects, and the row would read "could not be fitted" instead
+        // of the "not tested" note (review of #1273).
+        let interaction_ok = base
+            .prepared
+            .parsed
+            .fit_options
+            .non_interaction_stage()
+            .is_none();
         Ok(Self::build(
             base.text.clone(),
             input_spec,
@@ -561,8 +549,8 @@ impl Space {
         let tad_cutoffs = tad_cutoffs(&population, options.groups);
         if tad_cutoffs.is_empty() && !options.skip.contains(&Family::TimeVarying) {
             notes.push(
-                "time_varying not tested: no observation follows a dose, so there is no time \
-                 after dose to cut at"
+                "time_varying not tested: the dataset has no dose, so there is no time after \
+                 dose to cut at"
                     .into(),
             );
         }
@@ -587,9 +575,15 @@ impl Space {
 }
 
 /// The `i / groups` quantiles (`i = 1 .. groups − 1`) of every observation's
-/// time after dose, linearly interpolated as pandas does; empty when no
-/// observation follows a dose.
+/// time after dose, linearly interpolated as pandas does, over every
+/// observation — a pre-dose sample is Pharmpy's dose group `0` and counts at
+/// its offset from the first pre-dose record (`0` for a lone baseline). Empty
+/// when the dataset has no dose at all: `Subject::time_after_dose` would then
+/// read time since the first record, which is not a time after dose to cut.
 pub(crate) fn tad_cutoffs(population: &Population, groups: usize) -> Vec<f64> {
+    if population.subjects.iter().all(|s| s.doses.is_empty()) {
+        return Vec::new();
+    }
     let mut tads: Vec<f64> = population
         .subjects
         .iter()
@@ -687,11 +681,23 @@ fn fresh_name(model: &ModelText, base: &str) -> String {
 /// Pharmpy's inits for the four features on the full model.
 const IIV_ON_RUV_INIT: f64 = 0.09;
 const POWER_INIT: f64 = 1.0;
-const POWER_LOWER: f64 = 0.01;
-const POWER_UPPER: f64 = 10.0;
+pub(crate) const POWER_LOWER: f64 = 0.01;
+pub(crate) const POWER_UPPER: f64 = 10.0;
 const TIME_VARYING_INIT: f64 = 1.0;
-const TIME_VARYING_LOWER: f64 = 0.01;
-const TIME_VARYING_UPPER: f64 = 10.0;
+pub(crate) const TIME_VARYING_LOWER: f64 = 0.01;
+pub(crate) const TIME_VARYING_UPPER: f64 = 10.0;
+
+/// A pre-screen estimate as a full-model init: kept inside the refit's
+/// `(lower, upper)` box with a margin, `[2·lower, upper / 2]`, so the seed is
+/// never on a bound — the screening models declare wider boxes
+/// (`RUV_POW(-10, 10)`, `RUV_TV(0.001, 100)`), and an init outside the refit's
+/// box is not an error to the parser but is clamped onto the bound by the
+/// optimizer with a "pinned" warning, which defeats the seeding (review of
+/// #1273). Pharmpy floors the power at `0.02` — twice its lower bound — and
+/// this is that rule on both ends of both features.
+pub(crate) fn seed_inside(value: f64, lower: f64, upper: f64) -> f64 {
+    value.clamp(2.0 * lower, upper / 2.0)
+}
 
 /// The shape parameter a feature's candidate starts from — Pharmpy's full-model
 /// init, or the CWRES pre-screen's estimate when the screen ran.
@@ -709,7 +715,7 @@ fn derive(
     feature: RuvFeature,
     space: &Space,
     init: Option<Init>,
-) -> Result<Option<Candidate>, String> {
+) -> Result<Option<(Candidate, ErrorSpecText)>, String> {
     let mut spec = parent.spec.clone();
     let model_for_names = &parent.model;
     match feature {
@@ -770,13 +776,10 @@ fn derive(
     model
         .apply(ModelEdit::SetErrorModel(spec.clone()))
         .map_err(|e| format!("{id}: adding {}: {e}", feature.label()))?;
-    let mut features = parent.features.clone();
-    features.push(feature);
-    Ok(Some(
-        Candidate::new(id, model)
-            .parent(parent.id.clone())
-            .features(feature_vector(&spec)),
-    ))
+    let candidate = Candidate::new(id, model)
+        .parent(parent.id.clone())
+        .features(feature_vector(&spec));
+    Ok(Some((candidate, spec)))
 }
 
 /// The error model as a feature vector, for the runner's dedup and table.
@@ -1093,11 +1096,12 @@ fn full_iteration(
     models: &mut BTreeMap<String, ModelText>,
     notes: &mut Vec<String>,
 ) -> Result<Outcome, String> {
-    let mut candidates: Vec<(RuvFeature, Candidate)> = Vec::with_capacity(features.len());
+    let mut candidates: Vec<(RuvFeature, Candidate, ErrorSpecText)> =
+        Vec::with_capacity(features.len());
     for &feature in features {
         let id = format!("{}-{iteration}", feature.label());
-        if let Some(c) = derive(&id, parent, feature, space, None)? {
-            candidates.push((feature, c));
+        if let Some((c, spec)) = derive(&id, parent, feature, space, None)? {
+            candidates.push((feature, c, spec));
         }
     }
     if candidates.is_empty() {
@@ -1109,11 +1113,11 @@ fn full_iteration(
         screening: false,
     });
     let dir = format!("iteration-{iteration}");
-    let list: Vec<Candidate> = candidates.iter().map(|(_, c)| c.clone()).collect();
+    let list: Vec<Candidate> = candidates.iter().map(|(_, c, _)| c.clone()).collect();
     let report = fitter.fit_step(&dir, &list)?;
     notes.extend(report.warnings.iter().cloned());
     let mut step_rows: Vec<(RuvFeature, StepRow)> = Vec::new();
-    for (feature, c) in &candidates {
+    for (feature, c, _) in &candidates {
         if report.results.iter().any(|r| r.id == c.id) {
             step_rows.push((
                 *feature,
@@ -1161,17 +1165,15 @@ fn full_iteration(
         rows.extend(step_rows.into_iter().map(|(_, r)| r));
         return Ok(Outcome::Nothing);
     };
-    let (feature, candidate) = &candidates[i];
+    let (feature, candidate, spec) = &candidates[i];
     let result = report
         .results
         .iter()
         .find(|r| r.id == candidate.id)
         .expect("the winner is a row of the report");
-    let spec =
-        ErrorSpecText::read(&candidate.model)?.expect("a derived candidate has an [error_model]");
     let mut features = parent.features.clone();
     features.push(*feature);
-    let node = Node::from_result(result, candidate.model.clone(), spec, features);
+    let node = Node::from_result(result, candidate.model.clone(), spec.clone(), features);
     if node.fit.is_none() {
         notes.push(format!(
             "iteration {iteration}: the winning fit for {} is not in the journal cache, so the \
@@ -1320,7 +1322,7 @@ fn screened_iteration(
 
     // The refit of the pick, on the data, from the screen's estimate.
     let id = format!("{}-{iteration}", feature.label());
-    let Some(candidate) = derive(&id, parent, feature, space, init)? else {
+    let Some((candidate, spec)) = derive(&id, parent, feature, space, init)? else {
         return Ok(Outcome::Nothing);
     };
     let dir = format!("iteration-{iteration}");
@@ -1365,8 +1367,6 @@ fn screened_iteration(
         .iter()
         .find(|r| r.id == candidate.id)
         .expect("the refit is a row of the report");
-    let spec =
-        ErrorSpecText::read(&candidate.model)?.expect("a derived candidate has an [error_model]");
     let mut features = parent.features.clone();
     features.push(feature);
     Ok(Outcome::Accepted(
@@ -1462,19 +1462,27 @@ fn finish(
     cancelled: bool,
 ) -> (RuvsearchResult, Option<(String, f64)>) {
     let cutoff = options.cutoff();
+    // Both gates judge the *selected* model. Pharmpy runs the second on the
+    // result of the first, which after a reversion to the input compares the
+    // input with the base and returns a base that is merely less than a
+    // cutoff *worse* than the input — one parameter fewer and a worse OFV
+    // than the model the user supplied. Judged on the selected model, the
+    // base is returned only when the selected model beat the input but not
+    // the base, and the base then beats the input too.
+    let beats =
+        |reference: &Node| selected.id == reference.id || reference.ofv - selected.ofv >= cutoff;
+    let beats_input = beats(input);
+    let beats_base = base.map(beats).unwrap_or(true);
     let mut final_node = selected;
     let mut reverted: Option<&str> = None;
-    // The selected model must beat the input by the cutoff.
-    if final_node.id != input.id && !(input.ofv - final_node.ofv >= cutoff) {
+    if !beats_input {
+        // The selected model must beat the input by the cutoff.
         final_node = input.clone();
         reverted = Some("input");
-    }
-    // And the proportional base, when there was one.
-    if let Some(b) = base {
-        if final_node.id != b.id && !(b.ofv - final_node.ofv >= cutoff) {
-            final_node = b.clone();
-            reverted = Some("base");
-        }
+    } else if let Some(b) = base.filter(|_| !beats_base) {
+        // And the proportional base, when there was one.
+        final_node = b.clone();
+        reverted = Some("base");
     }
     if let Some(to) = reverted {
         notes.push(format!(

@@ -1105,8 +1105,19 @@ impl Subject {
     /// stays with that dose (`TAD = 0`), as does one at the time of the first
     /// dose, which has no previous dose to belong to. This is what the `TAD`
     /// built-in of an `[error_model]` magnitude expression reads and what
-    /// `ruvsearch` cuts its time-varying candidates on (#1182). `NaN` when no
-    /// dose is at or before the observation (a pre-dose sample).
+    /// `ruvsearch` cuts its time-varying candidates on (#1182).
+    ///
+    /// An observation **before the first dose** is Pharmpy's dose group `0`:
+    /// `add_time_after_dose` cumsums the time differences within each
+    /// `(ID, DOSEID)` group, so a pre-dose record reads its offset from the
+    /// subject's *first* pre-dose record — `0` for a single baseline sample,
+    /// never `NaN`. (A subject with no dose at all is one such group, so its
+    /// every observation reads time since the first record.) The pre-dose
+    /// anchor is the earliest observation, `EVID=2` or reset record ahead of
+    /// the first dose. Never `NaN` for an in-range `j`; a `NaN` here would
+    /// fail the model at `check_residual_magnitude` for a dataset with a
+    /// baseline sample, and put those rows in the late group of a
+    /// time-varying candidate.
     ///
     /// It is deliberately **not** the sdtab `TAD` column's convention. That
     /// column follows NONMEM's record order — the dose is applied first at a
@@ -1115,11 +1126,41 @@ impl Subject {
     pub fn time_after_dose(&self, j: usize) -> f64 {
         let strict = self.data_tad(j, false);
         if strict.is_finite() {
-            strict
+            return strict;
+        }
+        // Pharmpy's first-dose exception: nothing precedes the dose, so an
+        // observation at its time keeps it (`TAD = 0`).
+        let at_or_before = self.data_tad(j, true);
+        if at_or_before.is_finite() {
+            return at_or_before;
+        }
+        self.pre_dose_tad(j)
+    }
+
+    /// Pharmpy's dose group `0` for observation `j`: the time since the
+    /// subject's first record ahead of the first dose. See
+    /// [`Self::time_after_dose`].
+    fn pre_dose_tad(&self, j: usize) -> f64 {
+        let Some(&obs_t) = self.obs_times.get(j) else {
+            return f64::NAN;
+        };
+        let first_dose = self
+            .doses
+            .iter()
+            .map(|d| d.time)
+            .fold(f64::INFINITY, f64::min);
+        let first_record = self
+            .obs_times
+            .iter()
+            .chain(self.pk_only_times.iter())
+            .chain(self.reset_times.iter())
+            .copied()
+            .filter(|&t| t < first_dose - 1e-12)
+            .fold(f64::INFINITY, f64::min);
+        if first_record.is_finite() {
+            obs_t - first_record
         } else {
-            // Pharmpy's first-dose exception: nothing precedes the dose, so an
-            // observation at its time keeps it (`TAD = 0`).
-            self.data_tad(j, true)
+            f64::NAN
         }
     }
 
@@ -2583,6 +2624,13 @@ pub struct RuvMagnitude {
     /// Parallel to `per_sigma_exponent`: the `Dual1` θ-derivative program of each
     /// exponent, so the analytic outer θ gradient carries `∂R/∂p · ∂p/∂θ`.
     pub per_sigma_exponent_deriv: Vec<Option<crate::parser::model_parser::RuvMagDerivProgram>>,
+    /// Whether any multiplier or exponent expression reads the `TAD` built-in
+    /// (#1182). [`CompiledModel::ruv_obs_mult`] is the inner objective's
+    /// per-call path — BFGS line search, FD gradient, Nelder–Mead — and
+    /// [`Subject::time_after_dose`] is an `O(n_doses)` scan per observation,
+    /// so the scan runs only when an expression can see the result. Set by
+    /// the parser; `false` for every model built before this field existed.
+    pub(crate) uses_tad: bool,
 }
 
 impl std::fmt::Debug for RuvMagnitude {
@@ -2617,6 +2665,17 @@ impl RuvMagnitude {
     /// [`eval_obs`](Self::eval_obs) rows carry the exponent half.
     pub fn has_exponent(&self) -> bool {
         self.per_sigma_exponent.iter().any(|s| s.is_some())
+    }
+
+    /// The `TAD` value to feed [`eval_obs`](Self::eval_obs) for observation
+    /// `j` of `subject`: the data TAD when an expression reads it, else a
+    /// placeholder that skips the per-dose scan (`uses_tad`).
+    pub(crate) fn tad_for(&self, subject: &Subject, j: usize) -> f64 {
+        if self.uses_tad {
+            subject.time_after_dose(j)
+        } else {
+            0.0
+        }
     }
 
     /// Per-sigma multiplier vector for one observation. Slot `k` evaluates its
@@ -4492,7 +4551,7 @@ impl CompiledModel {
                 theta,
                 subject.obs_cov(j),
                 subject.readout_time(j),
-                subject.time_after_dose(j),
+                rm.tad_for(subject, j),
             ));
         }
         Some(out)
@@ -4524,7 +4583,7 @@ impl CompiledModel {
                 theta,
                 subject.obs_cov(j),
                 subject.readout_time(j),
-                subject.time_after_dose(j),
+                rm.tad_for(subject, j),
             )?);
         }
         Some(out)
@@ -4618,10 +4677,10 @@ impl CompiledModel {
 
     /// Whether the `[error_model]` is a `power(...)` form (#1182): a
     /// proportional-type slot raised to an exponent
-    /// ([`RuvMagnitude::per_sigma_exponent`]). The Gauss-Newton closed forms
-    /// build `∂R/∂log σ` from `f²` and route such a subject to their
-    /// magnitude-aware finite-difference fallback instead, whether or not the
-    /// exponent names a θ.
+    /// ([`RuvMagnitude::per_sigma_exponent`]). Every estimator reads the
+    /// exponent through the `_scaled` variance dispatch in
+    /// `stats/residual_error.rs`; an exponent that names a θ is a θ-dependent
+    /// magnitude ([`Self::has_theta_dependent_ruv_magnitude`]) like any other.
     pub fn has_ruv_exponent(&self) -> bool {
         self.ruv_magnitude
             .as_ref()
@@ -7752,6 +7811,27 @@ impl FitOptions {
         } else {
             self.methods.clone()
         }
+    }
+
+    /// The first stage of the method chain with no η–ε interaction — plain
+    /// FOCE, or Gauss-Newton without `interaction = true` — or `None` when
+    /// every stage has one (FOCEI, Laplace/AGQ, or a Monte-Carlo estimator).
+    ///
+    /// `iiv_on_ruv` (`Y = IPRED + EPS·EXP(ETA)`) makes the residual variance
+    /// η-dependent, which a non-interaction marginal cannot represent — it
+    /// integrates the residual eta out through a sensitivity column that is
+    /// identically zero. This is the **single predicate** behind that:
+    /// [`crate::fit`] refuses such a model at the stage this names, and
+    /// `ruvsearch` reads it to know whether an `IIV_on_RUV` candidate can be
+    /// tested at all (#1182). It walks the whole chain, because `method` is the
+    /// *last* stage of a chained fit: `method = [foce, focei]` reads as FOCEI
+    /// there, and is refused here at its first stage.
+    pub fn non_interaction_stage(&self) -> Option<EstimationMethod> {
+        self.method_chain().into_iter().find(|m| match m {
+            EstimationMethod::Foce => true,
+            EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid => !self.interaction,
+            _ => false,
+        })
     }
 
     /// The AGQ node count when this (stage's) method is AGQ, else `None`.

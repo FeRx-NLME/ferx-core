@@ -15,8 +15,8 @@
 //!
 //! | quantity | NONMEM 7.5.1 | ferx |
 //! |---|---:|---:|
-//! | OBJ at the initial estimates (`P = 1.3`) | 94.3818 | asserted to 5e-3 |
-//! | OBJ at NONMEM's final estimates | −286.7588 | asserted to 5e-3 |
+//! | OBJ at the initial estimates (`P = 1.3`) | 94.381804993706751 | 94.381805021236, asserted to 1e-6 (realised 2.75e-8) |
+//! | OBJ at NONMEM's final estimates | −286.75882280193639 | −286.758822780229, asserted to 1e-6 (realised 2.17e-8) |
 //! | fitted `P` (slow) | 1.1124 (SE 0.122) | asserted within 0.05 |
 //! | fitted OBJ (slow) | −286.7588 | ferx must not be worse by more than 0.5 |
 
@@ -30,6 +30,13 @@ const DATA: &str = "data/warfarin.csv";
 const NM_EVAL_OBJ: f64 = 94.381804993706751;
 /// `tests/nonmem/warfarin_power.ext`, the `-1000000000` row.
 const NM_FIT_OBJ: f64 = -286.75882280193639;
+/// The OFV bound at both evaluation points. The references are the 17-digit
+/// `.ext` values, and the realised errors are `2.75e-8` (initial estimates)
+/// and `2.17e-8` (NONMEM's optimum) — the two engines' summation order, not
+/// printing precision — so the bound sits ~40× above the measurement. A
+/// regression in how the exponent enters `R` moves the OFV by thousandths,
+/// which the first cut of `5e-3` could not see.
+const OFV_TOL: f64 = 1e-6;
 const NM_TVCL: f64 = 0.132692;
 const NM_TVV: f64 = 7.73957;
 const NM_TVKA: f64 = 0.810868;
@@ -92,9 +99,12 @@ fn evaluate(m: &ferx_core::types::CompiledModel) -> f64 {
 fn power_objective_matches_nonmem_at_the_initial_estimates() {
     let m = model([0.13, 8.0, 1.0, 1.3], [0.09, 0.04, 0.30], 0.1);
     let ofv = evaluate(&m);
-    eprintln!("power anchor, initial estimates: ferx {ofv:.6} vs NONMEM {NM_EVAL_OBJ:.6}");
+    eprintln!(
+        "power anchor, initial estimates: ferx {ofv:.12} vs NONMEM {NM_EVAL_OBJ:.12}, diff {:e}",
+        ofv - NM_EVAL_OBJ
+    );
     assert!(
-        (ofv - NM_EVAL_OBJ).abs() < 5e-3,
+        (ofv - NM_EVAL_OBJ).abs() < OFV_TOL,
         "ferx {ofv} vs NONMEM {NM_EVAL_OBJ}"
     );
 }
@@ -111,9 +121,12 @@ fn power_objective_matches_nonmem_at_its_final_estimates() {
         NM_SIGMA2.sqrt(),
     );
     let ofv = evaluate(&m);
-    eprintln!("power anchor, NONMEM optimum: ferx {ofv:.6} vs NONMEM {NM_FIT_OBJ:.6}");
+    eprintln!(
+        "power anchor, NONMEM optimum: ferx {ofv:.12} vs NONMEM {NM_FIT_OBJ:.12}, diff {:e}",
+        ofv - NM_FIT_OBJ
+    );
     assert!(
-        (ofv - NM_FIT_OBJ).abs() < 5e-3,
+        (ofv - NM_FIT_OBJ).abs() < OFV_TOL,
         "ferx {ofv} vs NONMEM {NM_FIT_OBJ}"
     );
 }

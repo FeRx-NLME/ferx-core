@@ -726,75 +726,6 @@ fn fwd_solve(chol_l: &DMatrix<f64>, rhs: &[f64]) -> Vec<f64> {
     w
 }
 
-/// d(r_j)/d(log sigma_k) for each observation, at the prediction point used
-/// to evaluate r_diag (f0 for standard, ipreds for interaction).
-///
-/// `mult` is the #484/#1029 per-observation magnitude matrix (`None` ⇒ all
-/// ones). Slot `k`'s loading carries `m_k`, so its variance contribution is
-/// `(coeff·m_k·σ_k)²` and this derivative scales by `m_k²` — with one exception:
-/// the `Proportional` branch reads the *already-scaled* `r_j` back (`∂/∂log σ` of
-/// `(f·m·σ)²` is exactly `2·r_j`), so it needs no further factor. Keeping that
-/// branch on `r_j` also preserves its exact IEEE-754 association.
-fn dr_diag_d_log_sigma(
-    error_model: ErrorModel,
-    r_diag: &[f64],
-    pred_point: &[f64], // f0 or ipreds depending on path
-    sigma_values: &[f64],
-    sigma_k: usize,
-    mult: Option<&[Vec<f64>]>,
-) -> Vec<f64> {
-    r_diag
-        .iter()
-        .zip(pred_point.iter())
-        .enumerate()
-        .map(|(j, (&r_j, &f_j))| {
-            let mk = mult.and_then(|m| m[j].get(sigma_k).copied()).unwrap_or(1.0);
-            let mk2 = mk * mk;
-            match error_model {
-                ErrorModel::Additive => {
-                    if sigma_k == 0 {
-                        2.0 * sigma_values[0] * sigma_values[0] * mk2
-                    } else {
-                        0.0
-                    }
-                }
-                ErrorModel::Proportional => {
-                    if sigma_k == 0 {
-                        2.0 * r_j
-                    } else {
-                        0.0
-                    }
-                }
-                ErrorModel::Combined => {
-                    if sigma_k == 0 {
-                        // d(sigma_prop^2 * f^2)/d(log sigma_prop) = 2 * sigma_prop^2 * f^2
-                        let sp2 = sigma_values[0] * sigma_values[0];
-                        2.0 * sp2 * f_j * f_j * mk2
-                    } else if sigma_k == 1 {
-                        // d(sigma_add^2)/d(log sigma_add) = 2 * sigma_add^2
-                        2.0 * sigma_values[1] * sigma_values[1] * mk2
-                    } else {
-                        // `ks` runs over the *whole* flat sigma vector (`for ks in
-                        // 0..n_sigma`, where `n_sigma = template.sigma.values.len()`),
-                        // not over the error model's own count. A sigma declared past
-                        // the ones a single-endpoint `[error_model]` loads — legal, and
-                        // documented as inert since #1001 — does not enter R, so ∂R/∂log
-                        // σ_k is identically zero for it. Without this arm the `else`
-                        // above answered for every `sigma_k >= 1` and handed the
-                        // trailing sigma the *additive* sigma's derivative, putting a
-                        // spurious row/column into the FOCE score (`subject_nll_pop_grad`)
-                        // and hence into the `s`/`rsr` cross-product in
-                        // `covariance.rs` — wrong sandwich SEs for every parameter, with
-                        // no diagnostic. The `Additive`/`Proportional` arms above always
-                        // guarded this; `Combined` did not.
-                        0.0
-                    }
-                }
-            }
-        })
-        .collect()
-}
-
 /// Analytical per-subject FOCE NLL gradient for non-IOV, non-ODE, non-M3 models.
 ///
 /// Returns `None` if the Cholesky of R_tilde fails (degenerate parameters) so
@@ -876,10 +807,12 @@ fn subject_nll_pop_grad_analytical(
     // A θ-*dependent* magnitude is routed to the FD fallback by the caller (this
     // chain rule has no direct `∂R/∂θ` term), so what reaches here is θ-free.
     let ruv_mult = model.ruv_obs_mult(subject, &params.theta);
+    let obs_keys = model.error_spec.obs_keys(subject);
+    let obs_keys: &[usize] = obs_keys.as_ref();
     let r_diag = crate::stats::residual_error::compute_r_diag_maybe_scaled(
         &model.error_spec,
         r_pred_point,
-        model.error_spec.obs_keys(subject).as_ref(),
+        obs_keys,
         &params.sigma.values,
         ruv_mult.as_deref(),
     );
@@ -967,34 +900,29 @@ fn subject_nll_pop_grad_analytical(
         let d_var_pred: &[f64] = if use_pop_var { &d_pop_preds } else { &d_ipreds };
 
         // d(f0) = d(ipreds); d(v) = -d(f0)
-        // For sigma-dependent r: d(r_j)/d(x[k]) via chain rule through r at r_pred_point
-        let dr: Vec<f64> = r_diag
+        // For sigma-dependent r: d(r_j)/d(x[k]) = ∂V/∂f · ∂f/∂x[k], the slope
+        // taken at r_pred_point through `residual_error`'s own `∂V/∂f` — the
+        // same magnitude-scaled, exponent-aware (#1182) dispatch the Laplace
+        // path and every other estimator use, so there is no second copy of
+        // the variance formula here to drift (a hand-rolled `2·σ²·f²·m²` did,
+        // silently, under a `power(...)` loading).
+        let dr: Vec<f64> = r_pred_point
             .iter()
-            .zip(r_pred_point.iter().zip(d_var_pred.iter()))
+            .zip(d_var_pred.iter())
             .enumerate()
-            .map(|(j, (&r_j, (&pred_j, &dp_j)))| match model.error_model {
-                ErrorModel::Additive => 0.0,
-                ErrorModel::Proportional => {
-                    // r_j = sigma^2 * pred^2 => dr/d(pred) = 2*sigma^2*pred = 2*r_j/pred.
-                    // `r_j` is the magnitude-scaled variance `(pred·m·σ)²`, so this
-                    // form already carries `m²` — no extra factor (#484/#1029).
-                    if pred_j.abs() > 1e-15 {
-                        2.0 * r_j / pred_j * dp_j
-                    } else {
-                        0.0
-                    }
-                }
-                ErrorModel::Combined => {
-                    // Only the `f`-dependent (proportional) term contributes, and it
-                    // carries the proportional slot's magnitude: the variance term is
-                    // `(pred·m₀·σ_p)²`, so `∂r/∂pred = 2·σ_p²·m₀²·pred`.
-                    let sp2 = params.sigma.values[0] * params.sigma.values[0];
-                    let m0 = ruv_mult
-                        .as_ref()
-                        .and_then(|m| m[j].first().copied())
-                        .unwrap_or(1.0);
-                    2.0 * sp2 * m0 * m0 * pred_j * dp_j
-                }
+            .map(|(j, (&pred_j, &dp_j))| {
+                let dvdf = match ruv_mult.as_deref() {
+                    Some(m) => model.error_spec.dvar_df_scaled(
+                        obs_keys[j],
+                        pred_j,
+                        &params.sigma.values,
+                        &m[j],
+                    ),
+                    None => model
+                        .error_spec
+                        .dvar_df(obs_keys[j], pred_j, &params.sigma.values),
+                };
+                dvdf * dp_j
             })
             .collect();
 
@@ -1099,14 +1027,26 @@ fn subject_nll_pop_grad_analytical(
         if fixed_mask[k] {
             continue;
         }
-        let dr_k = dr_diag_d_log_sigma(
-            model.error_model,
-            &r_diag,
-            r_pred_point,
-            &params.sigma.values,
-            ks,
-            ruv_mult.as_deref(),
-        );
+        // ∂r_j/∂log σ_ks at r_pred_point, from the one owner of that formula
+        // (`ErrorSpec::dvar_dlogsigma{,_scaled}`): a sigma the statement does
+        // not load (#1001's inert trailing sigma) reads `0`, and a `power(...)`
+        // slot's `|f|^{2p}` loading is carried (#1182).
+        let dr_k: Vec<f64> = r_pred_point
+            .iter()
+            .enumerate()
+            .map(|(j, &f_j)| match ruv_mult.as_deref() {
+                Some(m) => model.error_spec.dvar_dlogsigma_scaled(
+                    obs_keys[j],
+                    ks,
+                    f_j,
+                    &params.sigma.values,
+                    &m[j],
+                ),
+                None => model
+                    .error_spec
+                    .dvar_dlogsigma(obs_keys[j], ks, f_j, &params.sigma.values),
+            })
+            .collect();
         let g: f64 = dr_k
             .iter()
             .zip(rinv_diag.iter().zip(solved_a.iter()))
@@ -1516,8 +1456,8 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
     //   ∂R/∂log σ_s, ∂d/∂log σ_s per obs (from `dvar_dlogsigma` and the
     //   error-model dispatch — `dvar_dlogsigma` is already the right hook
     //   for ∂R/∂log σ; ∂d/∂log σ for the proportional component is 2·d
-    //   (combined or proportional), and 0 for additive — see the analytical
-    //   SB path's `dr_diag_d_log_sigma` for the matching idiom).
+    //   (combined or proportional), and 0 for additive — the analytical
+    //   SB path takes the same `dvar_dlogsigma{,_scaled}` per observation).
     //
     // Resolve SigmaType through `error_spec` (the same dispatcher every other
     // variance call uses), not `model.error_model`, so this stays internally
@@ -1781,11 +1721,11 @@ pub(crate) fn subject_nll_pop_grad(
     // neither chain rule carries — and it enters `log|H̃|` as well as the data
     // term — so route those subjects to the FD fallback below, which differences
     // `subject_nll_at` and is magnitude-aware end to end.
-    // A `power(...)` exponent (#1182) likewise: `dr_diag_d_log_sigma`'s
-    // `Combined` arm reads the proportional slot's variance as `σ²·f²·m²`,
-    // which a `|f|^{2p}` loading does not satisfy — so route it to FD too.
-    let no_theta_dep_magnitude =
-        !model.has_theta_dependent_ruv_magnitude() && !model.has_ruv_exponent();
+    // A θ-*free* `power(...)` exponent (#1182) needs no such routing: both
+    // closed forms take `R`, `∂R/∂f` and `∂R/∂log σ` from `residual_error`'s
+    // `_scaled` dispatch, which carries the `|f|^{2p}` loading. An exponent
+    // that names a θ is θ-dependent like any other magnitude and goes to FD.
+    let no_theta_dep_magnitude = !model.has_theta_dependent_ruv_magnitude();
     let no_ruv_eta = model.residual_error_eta.is_none();
     let common_ok = !matches!(model.bloq_method, BloqMethod::M3)
         && kappas.is_empty()
@@ -2229,35 +2169,47 @@ mod tests {
 
     /// A sigma declared past the ones the `[error_model]` names is inert — #1001
     /// documents it that way and accepts the spelling (FREM's trailing `EPSCOV`
-    /// is the shipped example). `dr_diag_d_log_sigma`'s `Combined` arm used a
-    /// bare `else` for `sigma_k != 0`, so the trailing sigma was handed the
-    /// *additive* sigma's derivative instead of zero, and `subject_nll_pop_grad`
-    /// (also the `s`/`rsr` score cross-product in `covariance.rs`) carried a
-    /// spurious row for a parameter that does not enter `R`.
-    ///
-    /// Mutation check: reverting the `else if sigma_k == 1` to a bare `else`
-    /// makes `combined_ignores_sigmas_past_its_own_slots` fail on the
-    /// `sigma_k = 2` row with `2·0.1² = 0.02`.
+    /// is the shipped example). The Sheiner–Beal σ-gradient once had its own
+    /// `∂R/∂log σ` whose `Combined` arm used a bare `else` for `sigma_k != 0`,
+    /// so the trailing sigma was handed the *additive* sigma's derivative
+    /// instead of zero, and `subject_nll_pop_grad` (also the `s`/`rsr` score
+    /// cross-product in `covariance.rs`) carried a spurious row for a
+    /// parameter that does not enter `R`. That path now reads
+    /// `ErrorSpec::dvar_dlogsigma`, the one owner of the formula; pin that it
+    /// returns zero for the unloaded slot on every single-endpoint error model.
     #[test]
     fn combined_ignores_sigmas_past_its_own_slots() {
-        let r_diag = [0.25_f64, 1.0];
         let pred = [2.0_f64, 4.0];
         let sigmas = [0.2_f64, 0.1, 1.0]; // prop, add, trailing/unreferenced
+        let spec = ErrorSpec::Single(ErrorModel::Combined);
 
         // Slot 0 and slot 1 keep their derivatives.
-        let d0 = dr_diag_d_log_sigma(ErrorModel::Combined, &r_diag, &pred, &sigmas, 0, None);
+        let d0: Vec<f64> = pred
+            .iter()
+            .map(|&f| spec.dvar_dlogsigma(0, 0, f, &sigmas))
+            .collect();
         assert!((d0[0] - 2.0 * 0.04 * 4.0).abs() < 1e-12, "{d0:?}");
-        let d1 = dr_diag_d_log_sigma(ErrorModel::Combined, &r_diag, &pred, &sigmas, 1, None);
+        let d1: Vec<f64> = pred
+            .iter()
+            .map(|&f| spec.dvar_dlogsigma(0, 1, f, &sigmas))
+            .collect();
         assert!(d1.iter().all(|v| (v - 2.0 * 0.01).abs() < 1e-12), "{d1:?}");
 
         // Slot 2 is not loaded by a `combined` error model, so ∂R/∂log σ₂ ≡ 0.
-        let d2 = dr_diag_d_log_sigma(ErrorModel::Combined, &r_diag, &pred, &sigmas, 2, None);
+        let d2: Vec<f64> = pred
+            .iter()
+            .map(|&f| spec.dvar_dlogsigma(0, 2, f, &sigmas))
+            .collect();
         assert!(d2.iter().all(|v| *v == 0.0), "{d2:?}");
 
-        // The other two error models always guarded this; pin that they still do,
-        // so the three arms cannot drift apart again.
+        // The other two error models load one sigma; a second one is inert
+        // for them too, so the three arms cannot drift apart.
         for em in [ErrorModel::Additive, ErrorModel::Proportional] {
-            let d = dr_diag_d_log_sigma(em, &r_diag, &pred, &sigmas, 1, None);
+            let spec = ErrorSpec::Single(em);
+            let d: Vec<f64> = pred
+                .iter()
+                .map(|&f| spec.dvar_dlogsigma(0, 1, f, &sigmas))
+                .collect();
             assert!(d.iter().all(|v| *v == 0.0), "{em:?}: {d:?}");
         }
     }
@@ -3959,6 +3911,56 @@ mod tests {
             "DV ~ combined(PROP_ERR, ADD_ERR * (1.0 + RUV_W * WPSE))",
             "  theta RUV_W(0.30, 0.01, 5.0)\n",
         );
+        assert!(model.has_theta_dependent_ruv_magnitude());
+        check_gn_grad_matches_fd(&model, true);
+        check_gn_grad_matches_fd(&model, false);
+    }
+
+    /// A θ-free `power(σ, P)` loading (#1182) stays on the closed forms — both
+    /// the Laplace and the Sheiner–Beal gradient take `R`, `∂R/∂f` and
+    /// `∂R/∂log σ` from `residual_error`'s exponent-aware `_scaled` dispatch.
+    /// Regression for the review of #1273: the SB path once built `∂R/∂log σ`
+    /// and `∂R/∂f` from a hand-rolled `σ²·f²·m²`, which a `|f|^{2p}` loading
+    /// does not satisfy, and the dispatcher papered over it by routing every
+    /// exponent to FD through a gate no test could see. One test per leg so
+    /// each closed form is observed on its own; the mutation results are on
+    /// each.
+    fn power_exponent_gn_model() -> CompiledModel {
+        let model = weighted_gn_model("DV ~ power(PROP_ERR * (1.0 + 0.5 * WPSE), 1.5)", "");
+        assert!(model.has_ruv_exponent());
+        assert!(
+            !model.has_theta_dependent_ruv_magnitude(),
+            "a literal exponent must not route to the FD fallback"
+        );
+        model
+    }
+
+    /// Mutation checks, run by hand: dropping the exponent arm of
+    /// `dvar_dlogsigma_scaled` fails this leg at `grad[3]` (σ), rel 8.3e-1;
+    /// dropping it from `dvar_df_scaled` fails at `grad[0]` (θ), rel 6.1e-1.
+    #[test]
+    fn power_exponent_gn_laplace_grad_matches_fd() {
+        check_gn_grad_matches_fd(&power_exponent_gn_model(), true);
+    }
+
+    /// Mutation checks, run by hand: dropping the exponent arm of
+    /// `dvar_dlogsigma_scaled` fails this leg at `grad[3]` (σ), rel 8.4e-1;
+    /// dropping it from `dvar_df_scaled` fails at `grad[0]` (θ), rel 6.1e-1.
+    #[test]
+    fn power_exponent_gn_sheiner_beal_grad_matches_fd() {
+        check_gn_grad_matches_fd(&power_exponent_gn_model(), false);
+    }
+
+    /// A `power(σ, θ)` exponent is a θ-dependent magnitude: the direct `∂R/∂θ`
+    /// channel routes it to the FD fallback, which differences the
+    /// exponent-aware marginal and is therefore still exact.
+    #[test]
+    fn theta_exponent_gn_grad_matches_fd_via_fallback() {
+        let model = weighted_gn_model(
+            "DV ~ power(PROP_ERR, RUV_POW)",
+            "  theta RUV_POW(1.3, 0.01, 10.0)\n",
+        );
+        assert!(model.has_ruv_exponent());
         assert!(model.has_theta_dependent_ruv_magnitude());
         check_gn_grad_matches_fd(&model, true);
         check_gn_grad_matches_fd(&model, false);

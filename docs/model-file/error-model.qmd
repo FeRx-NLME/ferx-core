@@ -263,8 +263,14 @@ A bare sigma name keeps the legacy behaviour exactly ($m_k \equiv 1$).
   `TIME` as Pharmpy's `add_time_after_dose` does: the observation belongs to
   the *previous* dose, so a trough drawn at the dosing time reads `TAD = II`,
   not `0` (an observation at an `SS` dose's time, or at the first dose, stays
-  with that dose). The sdtab `TAD` column keeps NONMEM's record-order
-  convention and reads `0` on that row.
+  with that dose). An observation **before the first dose** is Pharmpy's dose
+  group `0` and reads its offset from the subject's first pre-dose record —
+  `0` for a lone baseline sample, never a missing value. The sdtab `TAD`
+  column keeps NONMEM's record-order convention: `0` on the dosing-time row,
+  empty before the first dose. Because `TAD` here is engine-computed, a
+  dataset column of that name cannot reach the error model while every other
+  block reads it; a model that declares a `TAD` covariate *and* reads `TAD` in
+  an `[error_model]` expression is rejected at parse time.
 - The `TIME` fed to the expression is the raw data-file time (matching NONMEM's
   `$ERROR`).
 - A magnitude that evaluates to zero, a negative number, or a non-finite value at

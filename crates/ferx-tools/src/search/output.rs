@@ -51,13 +51,19 @@ pub const COLUMNS: [&str; 15] = [
 
 /// A non-finite number has no cell — an empty string beats `NaN` in a file
 /// meant to be opened in a spreadsheet, and it is what "there is no criterion"
-/// actually means.
-fn number(value: f64) -> String {
+/// actually means. Shared by every tool's `steps.csv` through
+/// `crate::search::number`.
+pub(crate) fn number(value: f64) -> String {
     if value.is_finite() {
         format!("{value:.6}")
     } else {
         String::new()
     }
+}
+
+/// [`number`] of an optional value: `None` is an empty cell too.
+pub(crate) fn opt_number(value: Option<f64>) -> String {
+    number(value.unwrap_or(f64::NAN))
 }
 
 /// Multiple reasons in one cell, `;`-joined. The CSV writer quotes the cell, so

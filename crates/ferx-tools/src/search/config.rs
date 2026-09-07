@@ -146,6 +146,20 @@ impl RankConfig {
 }
 
 impl RankType {
+    /// The `[rank] type` spelling of this variant, for messages.
+    pub fn label(&self) -> &'static str {
+        match self {
+            RankType::Ofv => "ofv",
+            RankType::Aic => "aic",
+            RankType::Bic => "bic",
+            RankType::BicMixed => "bic_mixed",
+            RankType::BicIiv => "bic_iiv",
+            RankType::BicRandom => "bic_random",
+            RankType::BicFixed => "bic_fixed",
+            RankType::Penalized => "penalized",
+        }
+    }
+
     /// The runner criterion this ranks on.
     pub fn criterion(&self) -> Result<Criterion, String> {
         Ok(match self {

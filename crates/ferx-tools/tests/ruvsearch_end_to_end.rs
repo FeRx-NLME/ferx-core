@@ -1,6 +1,8 @@
 //! Tier-2 end-to-end checks for ruvsearch (#1182), on a real model and
-//! dataset but never to convergence: every fit is an evaluation
-//! (`maxiter = 0`, ferx's `MAXEVAL=0`).
+//! dataset but never to a convergence run: every fit on the data is an
+//! evaluation (`maxiter = 0`, ferx's `MAXEVAL=0`). The CWRES pre-screen's
+//! fits are the exception — `Y = θ + η + ε` on one column of residuals, run
+//! to convergence as Pharmpy does, and under a second for all seven.
 //!
 //! The unit tests in `src/ruvsearch/mod_tests.rs` script the fitter, so they
 //! test the iteration logic and never compile a candidate. This file is the
@@ -353,4 +355,45 @@ fn the_cwres_prescreen_evaluates_every_screening_model_on_the_residuals() {
     }
     // The screening step has its own journal directory.
     assert!(dir.path().join("run").join("screen-1").exists());
+}
+
+/// A base whose method is a *chain* with a non-interaction first stage:
+/// `fit_options.method` reads the last stage (FOCEI), but `fit()` refuses
+/// `iiv_on_ruv` at the first (FOCE). ruvsearch must read the same predicate
+/// and not test `IIV_on_RUV` at all — the note, not a "could not be fitted"
+/// row (review of #1273).
+#[test]
+fn a_chained_method_with_a_foce_stage_does_not_test_iiv_on_ruv() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = BASE.replace("method     = focei", "method     = [foce, focei]");
+    let path = write_config(dir.path(), &base, "max_iter = 1\n");
+    let config = SearchConfig::load(&path).unwrap();
+    let base = config.load_base().unwrap();
+    let result = run_ruvsearch(
+        &config,
+        &base,
+        RuvsearchRun {
+            dir: Some(dir.path().join("run")),
+            ..RuvsearchRun::default()
+        },
+    )
+    .expect("search");
+    assert!(
+        result
+            .notes
+            .iter()
+            .any(|n| n.contains("IIV_on_RUV not tested")),
+        "{:?}",
+        result.notes
+    );
+    assert!(
+        result
+            .rows
+            .iter()
+            .all(|r| !r.candidate.starts_with("IIV_on_RUV")),
+        "{:?}",
+        result.rows.iter().map(|r| &r.candidate).collect::<Vec<_>>()
+    );
+    // The other families are still tested.
+    assert!(result.rows.iter().any(|r| r.candidate == "power-1"));
 }

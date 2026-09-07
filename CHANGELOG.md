@@ -36,13 +36,16 @@ section of the SDLC for the versioning policy).
 - **`power(σ, P)` residual-error form (#1182).** `DV ~ power(PROP_ERR, RUV_POW)` is NONMEM's
   `Y = F + EPS(1) * F**THETA(n)`: the proportional loading raised to an estimated θ, so the
   variance is `σ²·|f|^{2P}` and `P = 1` is the proportional model. Every estimator, IWRES,
-  CWRES and simulation carry the exponent; the analytic FOCE/FOCEI gradients carry `∂R/∂P`
-  (pinned against finite differences); the Gauss-Newton closed forms route it to their
-  finite-difference fallback. Anchored against NONMEM 7.5 on the warfarin dataset.
+  CWRES and simulation carry the exponent; the analytic FOCE/FOCEI and Gauss-Newton gradients
+  carry `∂R/∂P` (pinned against finite differences). Anchored against NONMEM 7.5 on the
+  warfarin dataset, to 1e-6 on the OFV.
 - **`TAD` in residual-magnitude expressions (#1182).** A `[error_model]` magnitude may read
-  `TAD`, the data-derived time after the last dose at or before the record (steady-state
-  aware, no lag time), beside `TIME` — `proportional(PROP_ERR * (if (TAD < 12.0) RUV_TV else 1.0))`
-  is Pharmpy's time-varying residual error.
+  `TAD`, the data-derived time after dose with Pharmpy's `add_time_after_dose` grouping
+  (steady-state aware, no lag time; a trough at the dosing time belongs to the previous
+  dose, a pre-dose sample to dose group `0`), beside `TIME` —
+  `proportional(PROP_ERR * (if (TAD < 12.0) RUV_TV else 1.0))` is Pharmpy's time-varying
+  residual error. A model that also declares a `TAD` covariate is rejected rather than
+  reading two different `TAD`s.
 - **`ferx-core::edit` authors and reads back the residual-error features (#1182).**
   `ErrorSpecText` gained `exponent`, `iiv_on_ruv` and `time_varying` (built with
   `ErrorSpecText::new` and the `with_*` builders; the struct is now `#[non_exhaustive]`),

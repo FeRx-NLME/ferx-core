@@ -281,10 +281,11 @@ pub fn init_from_screen(feature: RuvFeature, fit: &FitResult) -> Option<super::I
     };
     match feature {
         RuvFeature::Power => theta("RUV_POW").map(|p| {
-            // Pharmpy: `power = theta + 1.0`, and `if power < 0.01: power = 0.02`.
-            let p = p + 1.0;
+            // Pharmpy: `power = theta + 1.0`, and `if power < 0.01: power = 0.02`
+            // — the lower half of `seed_inside`'s rule; the upper half keeps a
+            // screen estimate past `POWER_UPPER` off that bound too.
             super::Init {
-                value: if p < 0.01 { 0.02 } else { p },
+                value: super::seed_inside(p + 1.0, super::POWER_LOWER, super::POWER_UPPER),
             }
         }),
         RuvFeature::IivOnRuv => fit
@@ -294,9 +295,9 @@ pub fn init_from_screen(feature: RuvFeature, fit: &FitResult) -> Option<super::I
             .map(|k| fit.omega[(k, k)])
             .filter(|v| v.is_finite() && *v > 0.0)
             .map(|v| super::Init { value: v }),
-        RuvFeature::TimeVarying(_) => theta("RUV_TV")
-            .filter(|v| *v > 0.0)
-            .map(|v| super::Init { value: v }),
+        RuvFeature::TimeVarying(_) => theta("RUV_TV").map(|v| super::Init {
+            value: super::seed_inside(v, super::TIME_VARYING_LOWER, super::TIME_VARYING_UPPER),
+        }),
         RuvFeature::Combined => None,
     }
 }

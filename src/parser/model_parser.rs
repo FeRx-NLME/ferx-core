@@ -15332,6 +15332,29 @@ fn validate_ruv_expr(
                 let reserved = RUV_RESERVED_VARS
                     .iter()
                     .any(|r| name.eq_ignore_ascii_case(r));
+                // `TAD` here is the engine-computed time after dose, and it
+                // resolves to the built-in *before* the covariate map is
+                // consulted — so a declared covariate of that name is
+                // unreachable from the error model while every other block
+                // reads the column. Reading two different `TAD`s in one model
+                // with no message is the worst outcome; refuse it (#1182 review).
+                if name.eq_ignore_ascii_case("TAD")
+                    && allowed_covs
+                        .is_some_and(|covs| covs.iter().any(|c| c.eq_ignore_ascii_case("TAD")))
+                {
+                    err = Some(format!(
+                        "{what} references `TAD`, which in [error_model] is the engine-computed \
+                         time after dose (Pharmpy's `add_time_after_dose` grouping), but a \
+                         covariate named `{}` is also declared in [covariates] and the rest of \
+                         the model reads that column. Rename the data column, or drop it from \
+                         [covariates] if the error model is its only reader",
+                        allowed_covs
+                            .and_then(|covs| covs.iter().find(|c| c.eq_ignore_ascii_case("TAD")))
+                            .map(String::as_str)
+                            .unwrap_or("TAD")
+                    ));
+                    return;
+                }
                 if !is_sigma && !reserved {
                     err = Some(match sigma_name {
                         Some(s) => format!(
@@ -15463,6 +15486,10 @@ fn build_ruv_magnitude(
 > {
     let mut used_thetas = std::collections::HashSet::new();
     let mut used_covs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Whether any expression reads the `TAD` built-in, so the per-observation
+    // dose scan behind it runs only for a model that can see the result
+    // (`RuvMagnitude::uses_tad`).
+    let mut uses_tad = false;
     let Some((_em, args, exponent)) = single_error_args else {
         return Ok((None, used_thetas, Vec::new()));
     };
@@ -15499,10 +15526,14 @@ fn build_ruv_magnitude(
         let expr = parse_scalar_expression(src, ctx)
             .map_err(|e| format!("[error_model] {what} `{}`: {}", src, e))?;
         validate_ruv_expr(&expr, sigma_name, allowed_covs.as_deref())?;
-        visit_expr_nodes(&expr, &mut |e: &Expression| {
-            if let Expression::Theta(i) = e {
+        visit_expr_nodes(&expr, &mut |e: &Expression| match e {
+            Expression::Theta(i) => {
                 used_thetas.insert(*i);
             }
+            Expression::Variable(name) if name.eq_ignore_ascii_case("TAD") => {
+                uses_tad = true;
+            }
+            _ => {}
         });
         collect_covariates(&expr, &mut used_covs);
         let deriv = compile_ruv_mag_deriv_program(&expr, sigma_name, theta_names.len());
@@ -15588,6 +15619,7 @@ fn build_ruv_magnitude(
         rm.theta_dependent = !used_thetas.is_empty();
         rm.per_sigma_exponent = per_sigma_exponent;
         rm.per_sigma_exponent_deriv = per_sigma_exponent_deriv;
+        rm.uses_tad = uses_tad;
         Some(rm)
     } else {
         None

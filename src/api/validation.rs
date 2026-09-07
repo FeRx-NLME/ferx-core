@@ -139,9 +139,11 @@ pub(crate) fn check_covariates(model: &CompiledModel, population: &Population) -
         String::new()
     } else {
         format!(
-            " Note: {} {} a solver-injected built-in only inside `[odes]`; anywhere else \
-             (including `[scaling]`) the name is an ordinary covariate and must be a data \
-             column. Compute it as an `[odes]` intermediate and read that state instead.",
+            " Note: {} {} a solver-injected built-in only inside `[odes]` (and `TAD` is \
+             also the engine-computed time after dose inside an `[error_model]` \
+             magnitude or exponent expression); anywhere else (including `[scaling]`) \
+             the name is an ordinary covariate and must be a data column. Compute it as \
+             an `[odes]` intermediate and read that state instead.",
             builtin_shaped.join(", "),
             if builtin_shaped.len() == 1 {
                 "is"

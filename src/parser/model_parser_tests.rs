@@ -21262,11 +21262,15 @@ fn magnitude_expression_reads_tad() {
 /// `Subject::time_after_dose` is the data TAD with Pharmpy's `get_doseid`
 /// grouping: an observation at exactly a non-SS dose's time belongs to the
 /// previous dose (`dose@0, dose@24, obs@24` → `24`, not `0`), steady-state
-/// aware, `NaN` before the first dose. The sdtab fallback
-/// `time_after_dose_at_or_before` keeps NONMEM's record-order `0` on the
-/// same row. Regression for the review of #1182: with `<=` the trough at the
-/// dosing time read `0`, shifting `ruvsearch`'s TAD quantiles away from
-/// Pharmpy's.
+/// aware, and a pre-dose observation is Pharmpy's dose group `0` — its
+/// offset from the subject's first pre-dose record, `0` for a lone baseline
+/// sample. The sdtab fallback `time_after_dose_at_or_before` keeps NONMEM's
+/// record-order `0` on the same-time row and `NaN` before the first dose.
+/// Regression for the review of #1182: with `<=` the trough at the dosing
+/// time read `0`, shifting `ruvsearch`'s TAD quantiles away from Pharmpy's;
+/// and for the review of #1273: the pre-dose row read `NaN`, which failed
+/// `fit()` at `check_residual_magnitude` for any dataset with a baseline
+/// sample and put those rows in the late group of a time-varying candidate.
 #[test]
 fn subject_time_after_dose_is_the_data_tad() {
     use crate::types::{DoseEvent, Subject};
@@ -21280,24 +21284,55 @@ fn subject_time_after_dose_is_the_data_tad() {
         ..Default::default()
     };
     let tad: Vec<f64> = (0..6).map(|j| subject.time_after_dose(j)).collect();
-    assert!(tad[0].is_nan(), "pre-dose sample");
     assert_eq!(
-        tad[1..],
-        [0.0, 2.0, 23.9, 24.0, 6.0],
-        "Pharmpy grouping: obs@24 belongs to dose@0; obs@0 keeps the first dose"
+        tad,
+        [0.0, 0.0, 2.0, 23.9, 24.0, 6.0],
+        "Pharmpy grouping: the lone pre-dose sample is group 0 at offset 0; \
+         obs@24 belongs to dose@0; obs@0 keeps the first dose"
     );
     let nonmem: Vec<f64> = (0..6)
         .map(|j| subject.time_after_dose_at_or_before(j))
         .collect();
-    assert!(nonmem[0].is_nan());
+    assert!(
+        nonmem[0].is_nan(),
+        "sdtab fallback: NaN before the first dose"
+    );
     assert_eq!(
         nonmem[1..],
         [0.0, 2.0, 23.9, 0.0, 6.0],
         "sdtab fallback: the dose at 24 is the most recent dose"
     );
-    // The two conventions differ on exactly the same-time row.
+    // The two conventions differ on exactly the same-time row (the pre-dose
+    // row is NaN on one side, so it is compared separately above).
     let differing: Vec<usize> = (1..6).filter(|&j| tad[j] != nonmem[j]).collect();
     assert_eq!(differing, [4]);
+
+    // Pharmpy's group-0 cumsum: several pre-dose records read their offset
+    // from the first of them, whichever record kind that is (an `EVID=2` row
+    // here), and a record *at* the first dose's time is that dose's, not
+    // group 0's.
+    let run_in = Subject {
+        id: "4".into(),
+        doses: vec![DoseEvent::new(10.0, 100.0, 1, 0.0, false, 0.0)],
+        pk_only_times: vec![-3.0],
+        obs_times: vec![-2.0, 0.0, 10.0, 12.0],
+        ..Default::default()
+    };
+    let tad: Vec<f64> = (0..4).map(|j| run_in.time_after_dose(j)).collect();
+    assert_eq!(tad, [1.0, 3.0, 0.0, 2.0]);
+    // A subject with no dose at all is one group-0 run: time since its first
+    // record, never NaN.
+    let undosed = Subject {
+        id: "5".into(),
+        obs_times: vec![0.0, 4.0, 9.0],
+        ..Default::default()
+    };
+    let tad: Vec<f64> = (0..3).map(|j| undosed.time_after_dose(j)).collect();
+    assert_eq!(tad, [0.0, 4.0, 9.0]);
+    assert!(
+        undosed.time_after_dose(3).is_nan(),
+        "out of range stays NaN"
+    );
 
     let ss = Subject {
         id: "2".into(),
@@ -21327,6 +21362,64 @@ fn subject_time_after_dose_is_the_data_tad() {
         ..Default::default()
     };
     assert_eq!(ss_later.time_after_dose(0), 0.0);
+}
+
+/// `TAD` inside an `[error_model]` expression is the engine-computed time
+/// after dose and resolves before the covariate map is consulted, so a
+/// declared covariate of that name would be read by every other block and
+/// silently shadowed here. Refused at parse time (review of #1273).
+#[test]
+fn error_model_tad_builtin_refuses_a_declared_tad_covariate() {
+    let with_cov = POWER_MODEL.replace(
+        "  DV ~ power(PROP_ERR, RUV_POW)\n",
+        "  DV ~ power(PROP_ERR * (if (TAD < 12.0) 1.5 else 1.0), RUV_POW)\n[covariates]\n  \
+         TAD continuous\n",
+    );
+    let err = expect_parse_err(&with_cov);
+    assert!(
+        err.contains("references `TAD`") && err.contains("covariate named `TAD`"),
+        "got: {err}"
+    );
+    // The lower-case spelling resolves to the same built-in, and a covariate
+    // of either case is the same clash.
+    let lower = with_cov.replace("(TAD < 12.0)", "(tad < 12.0)");
+    assert!(expect_parse_err(&lower).contains("references `TAD`"));
+    // A `TAD` covariate that the error model does not read is fine, and so
+    // is the built-in without the covariate.
+    let unread = POWER_MODEL.replace(
+        "  DV ~ power(PROP_ERR, RUV_POW)\n",
+        "  DV ~ power(PROP_ERR, RUV_POW)\n[covariates]\n  TAD continuous\n",
+    );
+    parse_model_string(&unread).expect("a TAD covariate the error model never reads");
+    let builtin = POWER_MODEL.replace(
+        "power(PROP_ERR, RUV_POW)",
+        "power(PROP_ERR * (if (TAD < 12.0) 1.5 else 1.0), RUV_POW)",
+    );
+    parse_model_string(&builtin).expect("the built-in without a covariate");
+}
+
+/// `RuvMagnitude::uses_tad` records whether any expression reads the `TAD`
+/// built-in, so `ruv_obs_mult` runs the per-observation dose scan only for
+/// a model that can see the result (review of #1273).
+#[test]
+fn ruv_magnitude_records_whether_it_reads_tad() {
+    let without = parse_model_string(POWER_MODEL).unwrap();
+    assert!(!without.ruv_magnitude.as_ref().unwrap().uses_tad);
+    for spelling in ["TAD", "tad"] {
+        let with = parse_model_string(&POWER_MODEL.replace(
+            "power(PROP_ERR, RUV_POW)",
+            &format!("power(PROP_ERR * (if ({spelling} < 12.0) 1.5 else 1.0), RUV_POW)"),
+        ))
+        .unwrap();
+        assert!(with.ruv_magnitude.as_ref().unwrap().uses_tad, "{spelling}");
+    }
+    // The exponent is an expression too.
+    let in_exponent = parse_model_string(&POWER_MODEL.replace(
+        "power(PROP_ERR, RUV_POW)",
+        "power(PROP_ERR, RUV_POW + 0.01 * TAD)",
+    ))
+    .unwrap();
+    assert!(in_exponent.ruv_magnitude.as_ref().unwrap().uses_tad);
 }
 
 #[test]

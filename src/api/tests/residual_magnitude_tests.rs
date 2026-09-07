@@ -97,6 +97,56 @@ fn a_model_with_no_magnitude_is_not_checked() {
         .all(|d| d.code != "E_RUV_MAGNITUDE_NONPOSITIVE"));
 }
 
+/// A `TAD`-reading magnitude on a dataset with a **pre-dose** sample (review
+/// of #1273): `Subject::time_after_dose` once returned `NaN` there, this check
+/// saw a non-finite multiplier and `fit()` refused a valid model with the
+/// covariate-cell message. The pre-dose row is Pharmpy's dose group `0` and
+/// reads a finite offset now.
+#[test]
+fn a_tad_magnitude_passes_with_a_pre_dose_sample() {
+    use crate::types::DoseEvent;
+    let model = parse_model_string(
+        "[parameters]\n  theta TVCL(0.2)\n  theta TVV(10.0)\n  theta RUV_TV(0.5, 0.01, \
+         10.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.04\n[individual_parameters]\n  \
+         CL = TVCL * exp(ETA_CL)\n  V  = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, \
+         v=V)\n[error_model]\n  DV ~ proportional(PROP_ERR * (if (TAD < 2.0) RUV_TV else \
+         1.0))\n",
+    )
+    .expect("parse");
+    assert!(model.ruv_magnitude.as_ref().unwrap().uses_tad);
+    let subject = Subject {
+        id: "1".to_string(),
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times: vec![-0.5, 1.0, 4.0],
+        observations: vec![9.0; 3],
+        obs_cmts: vec![1; 3],
+        cens: vec![0; 3],
+        ..Default::default()
+    };
+    let pop = Population {
+        subjects: vec![subject],
+        covariate_names: Vec::new(),
+        dv_column: "DV".to_string(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    };
+    let diags = check_model_data(&model, &pop);
+    assert!(
+        diags
+            .iter()
+            .all(|d| d.code != "E_RUV_MAGNITUDE_NONPOSITIVE"),
+        "{diags:?}"
+    );
+    // The pre-dose row is in the early group (TAD = 0 < 2), like Pharmpy's
+    // group 0 — not, as a NaN would have it, in the late one.
+    let mult = model
+        .ruv_obs_mult(&pop.subjects[0], &model.default_params.theta)
+        .expect("active magnitude");
+    let rows: Vec<f64> = mult.iter().map(|r| r[0]).collect();
+    assert_eq!(rows, [0.5, 0.5, 1.0]);
+}
+
 // ── simulate() parity (#1083) ────────────────────────────────────────────────
 //
 // `fit()` has rejected a non-positive magnitude since #1029, but every

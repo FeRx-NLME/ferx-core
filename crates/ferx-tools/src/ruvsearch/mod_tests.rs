@@ -477,7 +477,7 @@ fn derive_builds_each_feature_onto_the_parent_with_pharmpys_inits() {
         features: vec![],
     };
     let lines = |f: RuvFeature| -> (Vec<String>, Vec<String>) {
-        let c = derive("x", &parent, f, &sp, None).unwrap().unwrap();
+        let (c, _) = derive("x", &parent, f, &sp, None).unwrap().unwrap();
         (
             c.model.block_lines("error_model"),
             c.model.block_lines("parameters"),
@@ -508,7 +508,7 @@ fn derive_builds_each_feature_onto_the_parent_with_pharmpys_inits() {
         "{p:?}"
     );
     // An init from the pre-screen overrides the default.
-    let c = derive(
+    let (c, _) = derive(
         "x",
         &parent,
         RuvFeature::Power,
@@ -686,6 +686,48 @@ fn an_input_that_is_not_proportional_gets_a_base_and_the_final_comparison_may_re
         "{events:?}"
     );
     assert!(events.contains(&RuvsearchEvent::BaseFinished { ofv: 130.0 }));
+}
+
+/// The final comparison judges the *selected* model against the input and
+/// the base. Pharmpy's port ran the base gate on the result of the input gate,
+/// so after a reversion to the input it compared input with base and returned
+/// a base that was merely less than a cutoff worse than the input — fewer
+/// parameters, worse OFV than the model the user supplied (review of #1273).
+#[test]
+fn the_final_comparison_never_returns_a_base_worse_than_the_input() {
+    let additive = BASE
+        .replace("sigma PROP_ERR ~ 0.02 (sd)", "sigma ADD_ERR ~ 0.5 (sd)")
+        .replace("DV ~ proportional(PROP_ERR)", "DV ~ additive(ADD_ERR)");
+    let options = RuvsearchOptions {
+        skip: vec![Family::TimeVarying, Family::IivOnRuv],
+        p_value: 0.05, // cutoff 3.84
+        ..RuvsearchOptions::default()
+    };
+    // power beats the base (5 > 3.84) but not the input (3 < 3.84); the base
+    // is 2 worse than the input. Sequential gates returned the base here.
+    let script = Script::new(&[("input", 100.0), ("base", 102.0), ("power-1", 97.0)]);
+    let result = run(&script, space_from(&additive, &options, true), &options);
+    assert_eq!(selected(&result), vec![(1, "power-1".to_string())]);
+    assert_eq!(result.final_id, "input");
+    assert_eq!(result.final_ofv, 100.0);
+    assert!(result
+        .notes
+        .iter()
+        .any(|n| n.contains("did not beat the input model")));
+    // Nothing accepted: the selected model *is* the base, which does not beat
+    // the input, so the input is returned — not the base.
+    let script = Script::new(&[("input", 100.0), ("base", 102.0), ("power-1", 101.0)]);
+    let result = run(&script, space_from(&additive, &options, true), &options);
+    assert!(selected(&result).is_empty());
+    assert_eq!(result.final_id, "input");
+    // Nothing accepted and the base beats the input: the base *is* the
+    // selected model and is returned on its own merit — no reversion note.
+    let script = Script::new(&[("input", 100.0), ("base", 90.0), ("power-1", 88.0)]);
+    let result = run(&script, space_from(&additive, &options, true), &options);
+    assert!(selected(&result).is_empty(), "88 vs 90 is not significant");
+    assert_eq!(result.final_id, "base");
+    assert_eq!(result.final_ofv, 90.0);
+    assert!(!result.notes.iter().any(|n| n.contains("did not beat")));
 }
 
 #[test]
@@ -951,6 +993,43 @@ fn screen_inits_map_back_as_pharmpy_does() {
         0.7
     );
     assert!(cwres::init_from_screen(RuvFeature::Combined, &fit).is_none());
+}
+
+/// The screening models' boxes are wider than the refit's (`RUV_TV` up to
+/// 100 against 10, `RUV_POW` down to −10 against 0.01), and a seed outside
+/// the refit's box is clamped *onto* the bound by the optimizer — the screen
+/// then seeds nothing (review of #1273). Seeds stay inside with a margin.
+#[test]
+fn screen_inits_are_kept_inside_the_refit_box() {
+    let mut fit = converged_fit(1.0);
+    fit.theta_names = vec!["TVB".into(), "RUV_POW".into(), "RUV_TV".into()];
+    fit.theta = vec![0.0, 14.0, 25.0];
+    // power = 15 > POWER_UPPER (10) → upper / 2.
+    assert_eq!(
+        cwres::init_from_screen(RuvFeature::Power, &fit)
+            .unwrap()
+            .value,
+        5.0
+    );
+    // RUV_TV = 25 > TIME_VARYING_UPPER (10) → upper / 2; this seed used to be
+    // written as `theta RUV_TV(25, 0.01, 10.0)` verbatim.
+    assert_eq!(
+        cwres::init_from_screen(RuvFeature::TimeVarying(1), &fit)
+            .unwrap()
+            .value,
+        5.0
+    );
+    // A screen estimate at or below zero seeds twice the lower bound, as
+    // Pharmpy's `0.02` floor on the power does.
+    fit.theta[2] = 0.0;
+    assert_eq!(
+        cwres::init_from_screen(RuvFeature::TimeVarying(1), &fit)
+            .unwrap()
+            .value,
+        0.02
+    );
+    assert_eq!(seed_inside(0.7, 0.01, 10.0), 0.7);
+    assert_eq!(seed_inside(0.015, 0.01, 10.0), 0.02);
 }
 
 #[test]

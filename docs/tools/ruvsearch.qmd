@@ -72,7 +72,10 @@ Pharmpy's `TAD.quantile(i / groups)` — read by the
 [`TAD` built-in](../model-file/error-model.qmd#time-varying-covariate-dependent-magnitude)
 of a magnitude expression, which is the data-derived time after the last dose
 with Pharmpy's grouping of a trough drawn at the dosing time (it belongs to the
-previous dose, `TAD = II`).
+previous dose, `TAD = II`) and of a pre-dose sample (dose group `0`: its offset
+from the first pre-dose record, `0` for a lone baseline, so it counts in the
+quantiles as it does in Pharmpy's). A dataset with no dose at all has no time
+after dose to cut, and `time_varying` is not tested.
 The time-varying multiplier applies to every σ of the form, as Pharmpy
 multiplies every ε. On a later parent the features compose: after `power` is
 accepted, a time-varying candidate reads
@@ -111,11 +114,18 @@ the next parent, and its family is retired; accepting `power` retires
 the other (they are near-equivalent in shape). An iteration that accepts
 nothing ends the search, as does `max_iter`.
 
-**The final comparison.** Pharmpy's rule, kept as it is: the selected model
-must beat the *input* by the `df = 1` χ² cutoff at `p_value` — `10.83` at the
-default — or the input is returned; when a proportional base was fitted, the
-selected model must beat that too, or the base is returned. The table shows
-every fitted model either way, and the notes say when a reversion happened.
+**The final comparison.** Pharmpy's rule: the selected model must beat the
+*input* by the `df = 1` χ² cutoff at `p_value` — `10.83` at the default — or
+the input is returned; when a proportional base was fitted, the selected model
+must beat that too, or the base is returned. One reading differs from
+Pharmpy's code, deliberately: both gates judge the *selected* model. Pharmpy
+runs the base gate on the result of the input gate, so after a reversion to
+the input it compares the input with the base and returns a base that is
+merely less than a cutoff *worse* than the input — one parameter fewer and a
+worse OFV than the model the user supplied. Here the base is returned only
+when it was the selected model itself or the selected model beat the input
+but not the base. The table shows every fitted model either way, and the
+notes say when a reversion happened.
 
 ## The CWRES pre-screen
 
@@ -145,7 +155,10 @@ Pharmpy's combined screening model is `ε_p + ε_a / IPRED`, whose variance
 `σ_p² + σ_a² / IPRED²` is the same two-parameter family as one σ with the
 ratio `σ_a / σ_p` as a θ — the spelling the magnitude grammar can carry. The
 screened `power` exponent, residual-η variance and time-varying θ are carried
-into the refit as Pharmpy carries them; the combined split is not, because its
+into the refit as Pharmpy carries them — kept inside the refit's `(0.01, 10)`
+box with a margin, `[0.02, 5]`, since the screening boxes are wider and a seed
+on or past a bound is pinned there by the optimizer (Pharmpy's own `0.02` floor
+on the power is this rule's lower half); the combined split is not, because its
 σ live on the CWRES scale and the refit starts from the parent's proportional
 σ and the `(min DV / 2)²` default instead.
 
