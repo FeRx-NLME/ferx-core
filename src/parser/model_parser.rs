@@ -11783,18 +11783,16 @@ fn build_ode_spec(
     //
     // #1166 kept a second `if chz_state_slots.is_empty()` arm here, reusing the
     // already-computed `uses_time_vars || rhs_reads_time_builtin` so the common case did no
-    // walking. That saving is gone regardless: `uses_time_vars` unions all three time slots
-    // and cannot be decomposed after the fact, so the two absolute-clock flags below (#1139
-    // T3) have to walk on every model anyway. Keeping the arm would buy one walk out of
-    // four and cost a second copy of the exclusion rule.
+    // walking. That arm is gone because it cost a second copy of the exclusion rule, and the
+    // three walks below are what replaces it — one per slot group plus one built-in walk,
+    // with `pk_reads_model_time` *derived* rather than re-walked. `uses_time_vars` unions all
+    // three time slots and cannot be decomposed after the fact, so it stays its own walk.
     let pk_view: &[Statement] = if chz_state_slots.is_empty() {
         &stmts_owned
     } else {
         &pk_stmts
     };
-    let pk_reads_model_time = stmts_read_slots(pk_view, &[time_slot, tafd_slot, tad_slot])
-        || stmts_read_time_builtin(pk_view);
-    // The **absolute-clock** half of the flag above, split by spelling (#1139 T3).
+    // The **absolute-clock** half of `pk_reads_model_time`, split by spelling (#1139 T3).
     //
     // `tad_slot` is deliberately absent: `TAD` is bounded inside one dosing interval, so a
     // steady-state run-in has a periodic limit to converge to, and it is anchored per
@@ -11807,9 +11805,17 @@ fn build_ode_spec(
     // `NaN`, while `T`/`TIME` get the run-in's cycle-local clock and return a finite number
     // that matches NONMEM's own steady-state routine. The union
     // ([`OdeRhsProgram::pk_reads_absolute_time`]) is what any *gate* should ask.
+    //
+    // `pk_reads_time_builtin` is bound once: both flags need it, and `stmts_read_time_builtin`
+    // is a full walk, not an accessor.
+    let pk_reads_time_builtin = stmts_read_time_builtin(pk_view);
     let pk_reads_tafd = stmts_read_slots(pk_view, &[tafd_slot]);
-    let pk_reads_solver_time =
-        stmts_read_slots(pk_view, &[time_slot]) || stmts_read_time_builtin(pk_view);
+    let pk_reads_solver_time = stmts_read_slots(pk_view, &[time_slot]) || pk_reads_time_builtin;
+    // Composed, not re-walked: `pk_reads_model_time` is exactly the union above widened by
+    // `TAD`, which is the containment relation `pk_reads_absolute_time`'s doc comment states.
+    // Spelling it as a fourth walk let the two drift; spelling it this way cannot.
+    let pk_reads_model_time =
+        pk_reads_tafd || pk_reads_solver_time || stmts_read_slots(pk_view, &[tad_slot]);
     let rhs_program = OdeRhsProgram {
         stmts: stmts_owned.clone(),
         n_vars_total,

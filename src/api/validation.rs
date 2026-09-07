@@ -3887,28 +3887,58 @@ pub fn check_model_data_warnings(
     // reach `fit()` only — `simulate()` and `predict()` call neither this bundle nor
     // `check_model_data_rule`, and serve the same numbers unwarned.
     //
-    // Deliberately *not* suppressed when a neighbouring steady-state warning also fires.
-    // `W_STEADY_STATE_INFUSION` is a typical-value heuristic by its own comment above (a
-    // modeled SS infusion may overlap on some occasions only), so suppressing on it would
-    // drop a true finding; and under `[diffusion]` the EKF never reads `dose.ss` (#1260) so
-    // the objective skips the run-in, but `predict()` / `simulate()` on the same model do not.
-    // This is a property of the model, not of the engine serving it.
+    // **Counted per dose that actually reaches the run-in**, because the consequence sentences
+    // below name what the run-in does and are false wherever it is skipped.
+    // `equilibrate_ss_pk_state` bails before integrating anything for an overlapping SS
+    // infusion (`is_inf && t_inf > dose.ii`) and for a dose whose compartment is outside the
+    // state vector (`cmt_idx >= n_states`), leaving the ordinary finite TAFD anchor in place.
+    // Measured on `0.003*TAFD` with `AMT=100, RATE=5, II=12, SS=1` (T_inf = 20 > II): the fit
+    // returns **OFV 367.2851**, finite — so an unfiltered count would have printed "it reads
+    // NaN and the objective is non-finite" next to a `W_STEADY_STATE_INFUSION` correctly
+    // saying the record was served as a single non-SS infusion. Filtering on the *same*
+    // predicate that warning uses makes the two partition rather than contradict.
+    //
+    // Deliberately *not* suppressed when a neighbouring steady-state warning fires on a dose
+    // this one still counts: `W_STEADY_STATE_INFUSION` is a typical-value heuristic by its
+    // own comment above (a modeled SS infusion may overlap on some occasions only), so
+    // blanket suppression would drop a true finding.
+    //
+    // `[diffusion]` is **not** excluded, and the reason is measured rather than assumed.
+    // `solve_ekf` seeds a finite TAFD anchor and never equilibrates (#1260), which reads like
+    // an exemption — but `ode_predictions_ekf_with_diffusion` computes the Kalman `R` from a
+    // standard `ode_predictions` pass, and that one does run the run-in, so the `NaN` reaches
+    // the likelihood anyway: the same model plus `[diffusion] central ~ 0.01` measures
+    // `OFV: NaN`. `predict()` / `simulate()` on it likewise take the ordinary ODE path.
     if let Some(prog) = model
         .ode_spec
         .as_ref()
         .and_then(|o| o.rhs_program.as_ref())
         .filter(|p| p.pk_reads_absolute_time())
     {
-        // `has_periodic_ss_dose`, not `has_ss_doses`: with `II <= 0` the SS branch is never
-        // entered (the dose falls through to the single-dose path and `W_STEADY_STATE_II`
-        // says so), so there is no run-in whose clock could be wrong. `II <= 0` is the only
-        // input that separates the two predicates, which makes it the only input that can
-        // show this is not `has_ss_doses()` spelled the long way — the whole job of
-        // `a_steady_state_dose_with_no_interval_does_not_warn`.
+        // `d.ss && d.ii > 0.0`, not `d.ss`: with `II <= 0` the SS branch is never entered
+        // (the dose falls through to the single-dose path and `W_STEADY_STATE_II` says so),
+        // so there is no run-in whose clock could be wrong. `II <= 0` is the only input that
+        // separates those two predicates, which makes it the only input that can show this is
+        // not `has_ss_doses()` spelled the long way — the whole job of
+        // `a_steady_state_dose_with_no_interval_does_not_warn`. Spelled per dose rather than
+        // through `Subject::has_periodic_ss_dose` because the two further conjuncts below are
+        // per dose too: a subject may carry one equilibrating SS dose and one that bails.
+        let n_states = model.ode_spec.as_ref().map_or(0, |o| o.n_states);
+        let equilibrates = |s: &Subject, d: &DoseEvent| -> bool {
+            d.ss
+                && d.ii > 0.0
+                // The overlapping-infusion bail-out, on the *same* typical-value duration
+                // `W_STEADY_STATE_INFUSION` above uses, so the two findings cannot disagree
+                // about which doses are served as single infusions.
+                && !(d.is_infusion() && effective_duration(s, d) > d.ii)
+                // …and the out-of-range compartment bail-out (#899): `CMT` beyond the state
+                // vector returns the unequilibrated zero state without touching the RHS.
+                && d.cmt_idx() < n_states
+        };
         let n_ss = population
             .subjects
             .iter()
-            .filter(|s| s.has_periodic_ss_dose())
+            .filter(|s| s.doses.iter().any(|d| equilibrates(s, d)))
             .count();
         if n_ss > 0 {
             let (reads_tafd, reads_solver_time) =
@@ -3960,8 +3990,11 @@ pub fn check_model_data_warnings(
                 Diagnostic::warning("W_STEADY_STATE_ABSOLUTE_TIME", message)
                     .with_block("odes")
                     .with_suggestion(
-                        "Replace the SS=1 record with explicit dose records covering the \
-                         run-in, or use `TAD` if a per-dose clock is what the model means — \
+                        "Replace the SS=1 record with the subject's actual dose history as \
+                         explicit records — the prediction then depends on how many doses \
+                         you write, since an absolute-clock train has no limit to converge \
+                         to, and that dependence belongs to the model rather than to the \
+                         solver. Or use `TAD` if a per-dose clock is what the model means — \
                          it is bounded inside one dosing interval, so it does have a \
                          periodic steady state, and it is anchored against NONMEM. This is \
                          a property of the model and its SS=1 record rather than of the \

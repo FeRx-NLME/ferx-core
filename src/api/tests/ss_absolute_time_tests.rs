@@ -76,6 +76,14 @@ fn population(n: usize, ss: bool, ii: f64) -> Population {
     }
 }
 
+/// One subject carrying one `SS=1, II=12` dose written as an infusion of the given `rate`
+/// into the given (1-based) compartment. `rate = 0.0` is a bolus.
+fn population_with(rate: f64, cmt: usize) -> Population {
+    let mut pop = population(1, true, 12.0);
+    pop.subjects[0].doses = vec![DoseEvent::new(480.0, 100.0, cmt, rate, true, 12.0)];
+    pop
+}
+
 /// The `W_STEADY_STATE_ABSOLUTE_TIME` message, if the check raised one.
 fn warning_for(model: &crate::types::CompiledModel, pop: &Population) -> Option<String> {
     let init = model.default_params.clone();
@@ -190,6 +198,50 @@ fn a_steady_state_dose_with_no_interval_does_not_warn() {
     );
 }
 
+/// **A dose that never reaches the run-in must not be reported**, because the message names
+/// what the run-in does and would be false about it.
+///
+/// `equilibrate_ss_pk_state` returns before integrating anything in two cases, and in both
+/// the ordinary finite `TAFD` anchor stays in place: an infusion whose `T_inf` exceeds its own
+/// `II` (already reported as `W_STEADY_STATE_INFUSION` — the record is served as a single
+/// non-SS infusion), and a dose whose compartment index is outside the state vector (#899).
+///
+/// Measured end-to-end at the time this was written: the same `0.003*TAFD` model with
+/// `AMT = 100, RATE = 5, II = 12` (so `T_inf = 20 > II`) fits to **OFV 367.2851** — finite —
+/// while the bolus form of the same record returns `NaN`. Without the filter the warning fired
+/// on the finite one saying "it reads NaN and the objective is non-finite".
+///
+/// Both rows are straddles: the same dose with `RATE = 20` (`T_inf = 5 ≤ II`) and the same
+/// dose on the model's one real compartment **do** warn, so neither row can pass against a
+/// gate that has simply stopped firing on infusions or on this fixture.
+#[test]
+fn a_dose_that_never_reaches_the_run_in_is_not_reported() {
+    let m = ode_model(" + 0.003*TAFD");
+
+    assert_eq!(
+        warning_for(&m, &population_with(5.0, 1)),
+        None,
+        "T_inf = 20 > II = 12: the record is served as a single non-SS infusion, so no run-in \
+         runs and nothing about it is NaN"
+    );
+    assert!(
+        warning_for(&m, &population_with(20.0, 1)).is_some(),
+        "T_inf = 5 <= II = 12 equilibrates normally and must still warn — otherwise the row \
+         above is a statement about infusions, not about the bail-out"
+    );
+
+    // `ode_model` declares a single state, so `CMT = 2` is outside the state vector.
+    assert_eq!(
+        warning_for(&m, &population_with(0.0, 2)),
+        None,
+        "a dose outside the state vector returns the unequilibrated zero state (#899)"
+    );
+    assert!(
+        warning_for(&m, &population_with(0.0, 1)).is_some(),
+        "the same bolus on the one real compartment must warn"
+    );
+}
+
 /// An analytical model has no `[odes]` right-hand side to read a clock, so the gate's first
 /// conjunct excludes it structurally rather than by luck.
 #[test]
@@ -212,11 +264,20 @@ fn the_finding_is_a_warning_that_counts_subjects() {
         msg.starts_with("3 subject(s) have an SS=1 dose"),
         "the count must be the number of subjects carrying a periodic SS dose: {msg}"
     );
-    // Only two of the three carry one.
+    // Only two of the three carry one — and the *second* of those carries two, so the count
+    // cannot be a dose count wearing a subject count's label. Without the extra dose both
+    // readings give 2 and a `flat_map(|s| &s.doses).filter(...)` mutation survives.
     let mut mixed = population(3, true, 12.0);
+    mixed.subjects[1]
+        .doses
+        .push(DoseEvent::new(492.0, 100.0, 1, 0.0, true, 12.0));
     mixed.subjects[2].doses[0] = DoseEvent::new(480.0, 100.0, 1, 0.0, false, 12.0);
     let msg = warning_for(&m, &mixed).expect("must warn");
-    assert!(msg.starts_with("2 subject(s) "), "mixed population: {msg}");
+    assert!(
+        msg.starts_with("2 subject(s) "),
+        "two subjects carry a periodic SS dose, one of them twice — three SS doses in all: \
+         {msg}"
+    );
 
     let init = m.default_params.clone();
     let d = check_model_data_warnings(&m, &pop, &init)

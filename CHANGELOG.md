@@ -539,9 +539,12 @@ section of the SDLC for the versioning policy).
   number that matches NONMEM's own steady-state routine but sits 67 % from the same model's
   explicit dose train, and `TAFD` returns `NaN` whatever coefficient the term carries.
   `fit()` and `ferx check` both report it. No prediction, objective or diagnostic value
-  changes: previously the only warnings on such a fit were a `W_ODE_SOLVER_DIAGNOSTICS` and a
-  failed covariance step, which both point at the integrator, while `ferx check` said nothing
-  at all — those still appear, and this now names the cause alongside them. `TAD` is not
+  changes: previously the only warnings *describing the failure* were a
+  `W_ODE_SOLVER_DIAGNOSTICS` and a failed covariance step, which both point at the integrator,
+  while `ferx check` said nothing at all — those still appear, and this now names the cause
+  alongside them. It is reported per dose that actually reaches the run-in, so an `SS=1`
+  infusion longer than its own `II` — served as a single non-SS infusion, and already reported
+  as `W_STEADY_STATE_INFUSION` — is not swept up. `TAD` is not
   affected: it is bounded inside one dosing interval, so the run-in reproduces its train and
   is anchored against NONMEM.
 ### Fixed
