@@ -26,8 +26,10 @@
 //!    future change that "fixes" ferx onto it goes red.
 //! 3. **A periodic limit exists** for the lagged `TAD` train — `train_tadlag_n21` against
 //!    `train_tadlag` moves **7.09e-7** over a doubling — so the run-in has something to
-//!    converge to. (`TAFD`/`T`/`TIME` under `SS=1` do not, which is why they are T3 and are
-//!    deliberately untouched here.)
+//!    converge to. (`TAFD`/`T`/`TIME` under `SS=1` do not, which is why they are handled
+//!    separately — T3 of #1258 reports them, `W_STEADY_STATE_ABSOLUTE_TIME`, and moves no
+//!    value. The values they *do* produce stay anchored in
+//!    `tests/ss_model_time_nonmem_anchor.rs`; nothing in this file changed.)
 //! 4. **A closed form outside both engines** agrees with both. For `dA/dt = -k·A·(1 + c·τ)` on
 //!    a cycle-local `τ`, `Φ(s) = exp(-k(s + c·s²/2))` and the periodic trough is
 //!    `D·Φ(II)/(1 − Φ(II))`; the concentration at `τ` is `(trough + D)·Φ(τ)/V`. A lagtime only
@@ -657,13 +659,17 @@ fn a_lagtime_of_a_full_interval_or_more_follows_the_clamped_phase() {
     );
 }
 
-/// `TAFD` under a lagged `SS=1` dose still reads `NaN`, by design — T3 of #1258, deliberately
-/// untouched. An absolute clock has no periodic limit for a run-in to converge to (measured:
+/// `TAFD` under a lagged `SS=1` dose reads `NaN`, and that is now a **decision**, not an open
+/// question. An absolute clock has no periodic limit for a run-in to converge to (measured:
 /// 0.294 per doubling, against `TAD`'s 3.5e-7), so a finite plausible number there would be
 /// `TAD` under another name.
 ///
-/// This is a **scope pin**: it fails if a future change quietly extends the referent to `TAFD`
-/// without doing T3's work.
+/// Written on T4 as a scope pin against a change quietly extending the referent to `TAFD`
+/// without doing T3's work. T3 (#1139) has since landed and chose to move no value: the
+/// `NaN` stays and `W_STEADY_STATE_ABSOLUTE_TIME` names it, so this test kept its behaviour
+/// and gained a reason. The un-lagged twin lives in `tests/ss_model_time_nonmem_anchor.rs`
+/// (`tafd_under_an_unlagged_ss_dose_stays_nan_while_tad_does_not`), which also asserts the
+/// asymmetry against `TAD`.
 #[test]
 fn tafd_stays_nan_under_a_lagged_ss_dose() {
     let src = std::fs::read_to_string(anchor("ss_tadlag_fit.ferx")).expect("twin");
@@ -671,9 +677,15 @@ fn tafd_stays_nan_under_a_lagged_ss_dose() {
         .expect("parses")
         .model;
     let got = ferx_event_driven(&m, &population("ss_tadlag.csv"));
+    // `all()` on an empty iterator is `true`: without this the test passes for a fixture
+    // that produced no predictions at all, which is not the property it claims to pin.
+    assert!(
+        !got.is_empty(),
+        "the lagged SS fixture produced no predictions to check"
+    );
     assert!(
         got.iter().all(|(_, v)| v.is_nan()),
-        "TAFD under SS is T3's; it must still read NaN. Got {got:?}"
+        "TAFD under SS reads NaN by decision (#1139 T3); it must still. Got {got:?}"
     );
 }
 

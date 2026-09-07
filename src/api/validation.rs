@@ -3871,6 +3871,107 @@ pub fn check_model_data_warnings(
         ));
     }
 
+    // SS=1 dose on an `[odes]` right-hand side that reads an **absolute** clock (#1139).
+    //
+    // The run-in that stands in for the infinite past does not integrate on the subject's
+    // clock: it expands the periodic train on a clock local to each cycle, because that is
+    // the only clock on which the one-cycle map is the same map every cycle. `TAD` survives
+    // that — it is bounded inside one interval, so the train has a limit and #1139 anchors it
+    // per window against NONMEM. `TAFD` and `T`/`TIME` do not, and they fail differently:
+    // `T`/`TIME` come back finite, matching NONMEM's own steady-state routine (both engines
+    // share the cycle-local convention) but sitting far from the model's own explicit dose
+    // train; `TAFD` has no referent in the run-in at all — the periodic fiction has no first
+    // dose — and comes back `NaN`, poisoning the objective whatever coefficient it carries.
+    //
+    // Reported rather than rejected: one mechanism, one diagnostic, and a hard error would
+    // reach `fit()` only — `simulate()` and `predict()` call neither this bundle nor
+    // `check_model_data_rule`, and serve the same numbers unwarned.
+    //
+    // Deliberately *not* suppressed when a neighbouring steady-state warning also fires.
+    // `W_STEADY_STATE_INFUSION` is a typical-value heuristic by its own comment above (a
+    // modeled SS infusion may overlap on some occasions only), so suppressing on it would
+    // drop a true finding; and under `[diffusion]` the EKF never reads `dose.ss` (#1260) so
+    // the objective skips the run-in, but `predict()` / `simulate()` on the same model do not.
+    // This is a property of the model, not of the engine serving it.
+    if let Some(prog) = model
+        .ode_spec
+        .as_ref()
+        .and_then(|o| o.rhs_program.as_ref())
+        .filter(|p| p.pk_reads_absolute_time())
+    {
+        // `has_periodic_ss_dose`, not `has_ss_doses`: with `II <= 0` the SS branch is never
+        // entered (the dose falls through to the single-dose path and `W_STEADY_STATE_II`
+        // says so), so there is no run-in whose clock could be wrong. `II <= 0` is the only
+        // input that separates the two predicates, which makes it the only input that can
+        // show this is not `has_ss_doses()` spelled the long way — the whole job of
+        // `a_steady_state_dose_with_no_interval_does_not_warn`.
+        let n_ss = population
+            .subjects
+            .iter()
+            .filter(|s| s.has_periodic_ss_dose())
+            .count();
+        if n_ss > 0 {
+            let (reads_tafd, reads_solver_time) =
+                (prog.pk_reads_tafd(), prog.pk_reads_solver_time());
+            // The enclosing filter is `pk_reads_absolute_time()` — the OR of these two — so
+            // `(false, false)` cannot arrive. Spelled `(false, _)` rather than `_` to keep
+            // that visible, and asserted rather than trusted: were the gate and this match
+            // to drift apart, the failure is silent and specific — a message naming
+            // `T`/`TIME` with no consequence sentence appended after it.
+            debug_assert!(
+                reads_tafd || reads_solver_time,
+                "W_STEADY_STATE_ABSOLUTE_TIME reached with neither absolute-clock flag set"
+            );
+            let spellings = match (reads_tafd, reads_solver_time) {
+                (true, true) => "`TAFD` and `T`/`TIME`",
+                (true, false) => "`TAFD`",
+                (false, _) => "`T`/`TIME`",
+            };
+            // The substring "SS=1 dose" is load-bearing, not incidental phrasing: it is what
+            // routes this into `WarningCode::DataQuality` in `classify_warning`, the bucket
+            // the neighbouring steady-state warnings use and the one ferx-r already has
+            // remediation guidance for. Pinned by a test, so a reword cannot silently drop it
+            // into the `general` fallback.
+            //
+            // No measured number here on purpose — a figure embedded in a user-facing string
+            // goes stale and the tests then assert it. The magnitudes live on the
+            // steady-state docs page beside the NONMEM tables that produced them.
+            let mut message = format!(
+                "{n_ss} subject(s) have an SS=1 dose on a model whose `[odes]` right-hand \
+                 side reads an absolute clock ({spellings}). The run-in that stands in for \
+                 the infinite past expands the periodic dose train on a clock local to each \
+                 cycle rather than on the subject's, and an absolute clock has no periodic \
+                 steady state for it to converge to."
+            );
+            if reads_solver_time {
+                message.push_str(
+                    " `T`/`TIME` therefore return a finite number, matching NONMEM's own \
+                     steady-state routine because both engines share that convention — but \
+                     it is not the limit of this model's own explicit dose train.",
+                );
+            }
+            if reads_tafd {
+                message.push_str(
+                    " `TAFD` has no referent inside the run-in at all, so it reads NaN and \
+                     the objective is non-finite — whatever coefficient the term carries.",
+                );
+            }
+            diags.push(
+                Diagnostic::warning("W_STEADY_STATE_ABSOLUTE_TIME", message)
+                    .with_block("odes")
+                    .with_suggestion(
+                        "Replace the SS=1 record with explicit dose records covering the \
+                         run-in, or use `TAD` if a per-dose clock is what the model means — \
+                         it is bounded inside one dosing interval, so it does have a \
+                         periodic steady state, and it is anchored against NONMEM. This is \
+                         a property of the model and its SS=1 record rather than of the \
+                         solver serving it: it does not go away by moving the model to \
+                         `[diffusion]`.",
+                    ),
+            );
+        }
+    }
+
     // SS=1 dose combined with an [initial_conditions] baseline (#521). The SS
     // closed form already assumes an infinite periodic dose history (the system
     // is pre-equilibrated at the dose time), while the analytical init lays down a
@@ -4445,6 +4546,10 @@ fn additive_init_scale_check(
 /// (median `|DV|`) — deliberately conservative so a genuinely small-but-intended
 /// additive floor of a few % of the data does not trip the warning.
 const NEGLIGIBLE_ADD_FRACTION: f64 = 0.01;
+
+#[cfg(test)]
+#[path = "tests/ss_absolute_time_tests.rs"]
+mod ss_absolute_time_tests;
 
 #[cfg(test)]
 #[path = "tests/additive_init_scale_tests.rs"]

@@ -11777,14 +11777,39 @@ fn build_ode_spec(
             .cloned()
             .collect()
     };
-    let pk_reads_model_time = if chz_state_slots.is_empty() {
-        // No injected lines ⇒ the filter is a no-op and the narrow flag is the
-        // wide one. Kept as an explicit branch so the common case does no work.
-        uses_time_vars || rhs_reads_time_builtin
+    // The one view every PK-block-only question below is asked of, so the `__chz`
+    // exclusion has a single implementation. With no injected lines the filter is a
+    // no-op, so the *clone* is skipped and the whole program is the PK block.
+    //
+    // #1166 kept a second `if chz_state_slots.is_empty()` arm here, reusing the
+    // already-computed `uses_time_vars || rhs_reads_time_builtin` so the common case did no
+    // walking. That saving is gone regardless: `uses_time_vars` unions all three time slots
+    // and cannot be decomposed after the fact, so the two absolute-clock flags below (#1139
+    // T3) have to walk on every model anyway. Keeping the arm would buy one walk out of
+    // four and cost a second copy of the exclusion rule.
+    let pk_view: &[Statement] = if chz_state_slots.is_empty() {
+        &stmts_owned
     } else {
-        stmts_read_slots(&pk_stmts, &[time_slot, tafd_slot, tad_slot])
-            || stmts_read_time_builtin(&pk_stmts)
+        &pk_stmts
     };
+    let pk_reads_model_time = stmts_read_slots(pk_view, &[time_slot, tafd_slot, tad_slot])
+        || stmts_read_time_builtin(pk_view);
+    // The **absolute-clock** half of the flag above, split by spelling (#1139 T3).
+    //
+    // `tad_slot` is deliberately absent: `TAD` is bounded inside one dosing interval, so a
+    // steady-state run-in has a periodic limit to converge to, and it is anchored per
+    // run-in window since #1139 T2. These two spellings have no such limit — measured, an
+    // explicit absolute-clock dose train moves 0.294 per doubling of its length against
+    // `TAD`'s 3.5e-7.
+    //
+    // Two bools rather than one because the diagnostic that consumes them has to say
+    // something different about each: `TAFD` has no referent inside the run-in and reads
+    // `NaN`, while `T`/`TIME` get the run-in's cycle-local clock and return a finite number
+    // that matches NONMEM's own steady-state routine. The union
+    // ([`OdeRhsProgram::pk_reads_absolute_time`]) is what any *gate* should ask.
+    let pk_reads_tafd = stmts_read_slots(pk_view, &[tafd_slot]);
+    let pk_reads_solver_time =
+        stmts_read_slots(pk_view, &[time_slot]) || stmts_read_time_builtin(pk_view);
     let rhs_program = OdeRhsProgram {
         stmts: stmts_owned.clone(),
         n_vars_total,
@@ -11797,6 +11822,8 @@ fn build_ode_spec(
         uses_time_vars,
         reads_time_builtin: rhs_reads_time_builtin,
         pk_reads_model_time,
+        pk_reads_tafd,
+        pk_reads_solver_time,
         has_chz: !chz_state_slots.is_empty(),
     };
 
@@ -19722,6 +19749,15 @@ pub struct OdeRhsProgram {
     /// Gompertz baseline, i.e. the standard case — but whose PK dynamics are
     /// time-invariant.
     pk_reads_model_time: bool,
+    /// Does the **PK block** read `TAFD`? See [`OdeRhsProgram::pk_reads_absolute_time`],
+    /// which is the predicate a gate should ask; this one exists so a *message* can name
+    /// the spelling, since the two absolute-clock spellings fail differently (#1139 T3).
+    pk_reads_tafd: bool,
+    /// Does the **PK block** read the raw solver time axis — `T`/`t`/`time` through
+    /// `time_slot`, or the bare `TIME` built-in through `Op::PushTime`? Both disjuncts are
+    /// load-bearing: `TIME` compiles to the built-in and is structurally invisible to
+    /// `stmts_read_slots`, which is #1124. Companion to [`Self::pk_reads_tafd`].
+    pk_reads_solver_time: bool,
     /// Does this system carry injected joint-PK-TTE `d/dt(__chz_<cmt>)` accumulator rows?
     /// The `Vec<usize>` of slots lives on [`crate::ode::OdeSpec::chz_state_slots`]; the
     /// program only needs the predicate, for the dual SS equilibration's entry assertion
@@ -19791,6 +19827,52 @@ impl OdeRhsProgram {
     /// wide. Conservative in the correct direction; a dataflow cut is out of scope.
     pub(crate) fn pk_reads_model_time(&self) -> bool {
         self.pk_reads_model_time
+    }
+
+    /// See [`OdeRhsProgram::pk_reads_tafd`]. Ask [`Self::pk_reads_absolute_time`] to decide
+    /// anything; ask this only to phrase a message about `TAFD` specifically.
+    pub(crate) fn pk_reads_tafd(&self) -> bool {
+        self.pk_reads_tafd
+    }
+
+    /// See [`OdeRhsProgram::pk_reads_solver_time`]. Ask [`Self::pk_reads_absolute_time`] to
+    /// decide anything; ask this only to phrase a message about `T`/`TIME` specifically.
+    pub(crate) fn pk_reads_solver_time(&self) -> bool {
+        self.pk_reads_solver_time
+    }
+
+    /// **The PK block reads an *absolute* clock**: `TAFD`, `T`/`t`/`time`, or the bare
+    /// `TIME` built-in — [`Self::pk_reads_model_time`] with `TAD` removed.
+    ///
+    /// `TAD` is excluded because it is the one spelling bounded inside a dosing interval,
+    /// so an infinitely long dose train converges and a steady-state run-in has a periodic
+    /// limit to reproduce; it is anchored per run-in window and NONMEM-anchored (#1139).
+    /// The spellings here have no such limit, so a steady-state dose cannot equilibrate
+    /// them: `T`/`TIME` come back with the run-in's cycle-local clock — finite, matching
+    /// NONMEM, and not the limit of the model's own dose train — and `TAFD` has no referent
+    /// inside the run-in at all and comes back `NaN`. That is what
+    /// `W_STEADY_STATE_ABSOLUTE_TIME` reports, and this is its only caller.
+    ///
+    /// **Not a gradient-routing predicate.** The steady-state FD gates in
+    /// [`crate::sens`] ask the *wide* [`Self::reads_model_time`] and must keep doing so:
+    /// they decline the whole non-autonomous family, `TAD` included, and narrowing one to
+    /// this would let a `TAD`-reading steady-state model reach the dual equilibration
+    /// (#1272).
+    ///
+    /// Composed from the two accessors rather than the two fields, for the reason given on
+    /// [`Self::reads_model_time`]: neither may quietly become dead code.
+    ///
+    /// **Inherits [`Self::pk_reads_model_time`]'s documented over-decline** (#1166), and
+    /// that costs more here. A time-reading `[odes]` intermediate consumed only by the
+    /// hazard (`TT = TIME` … `hazard = f(TT)`) is a top-level `AssignBc`, not one of the
+    /// excluded derivative lines, so such a joint model reads `true` and is warned about
+    /// although its PK block is autonomous. Over-declining is free for #1166's own
+    /// consumer — a gate choosing a gradient route — and is a false positive for a
+    /// user-facing diagnostic. Accepted rather than narrowed: the dataflow cut is #1166's
+    /// deferred change, not this one's. Pinned by
+    /// `a_time_reading_intermediate_used_only_by_the_hazard_still_warns`.
+    pub(crate) fn pk_reads_absolute_time(&self) -> bool {
+        self.pk_reads_tafd() || self.pk_reads_solver_time()
     }
 
     /// Evaluate `du = f(u, p, t)` over a dual type, generic over [`PkNum`]
