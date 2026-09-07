@@ -256,13 +256,21 @@ fn an_inert_tad_term_is_accepted_under_ss_plus_lagtime() {
 ///
 /// Still accepted, and still **not** anchored: `TAFD` under `SS=1` reads `NaN` by design
 /// (T2 of #1258 — its dose train has no periodic limit for a run-in to converge to, measured
-/// at 0.294 per doubling). That is #1139's remaining half, T3, and it is deliberately
-/// untouched here. A test asserting `TAFD` is *fine* would be asserting the wrong thing.
+/// at 0.294 per doubling). T3 of #1258 has since landed and deliberately moved no value: the
+/// combination is now *reported* — `W_STEADY_STATE_ABSOLUTE_TIME` — and still served.
+///
+/// This test is unaffected by that, and the reason is structural rather than lucky:
+/// `codes()` reads `check_model_data`, the **fatal** bundle, while the new finding is a
+/// warning and lives in `check_model_data_warnings`. So this file cannot observe it in
+/// either direction, and asserting its presence here would be asserting against the wrong
+/// bundle. It is pinned where it belongs — `src/api/tests/ss_absolute_time_tests.rs` for the
+/// diagnostic and its severity, `tests/ss_model_time_nonmem_anchor.rs` for the same warning
+/// arriving through `fit()` and through `ferx check`.
 #[test]
 fn tafd_under_ss_plus_lagtime_is_not_swept_up() {
     let got = codes(LAG, "+ 0.003*TAFD", true);
     assert!(
         !got.iter().any(|c| c == RETIRED_CODE),
-        "TAFD/T/TIME under SS are a separate question (T3). Got: {got:?}"
+        "TAFD/T/TIME under SS are reported, not rejected (T3 of #1258). Got: {got:?}"
     );
 }

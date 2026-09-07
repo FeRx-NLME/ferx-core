@@ -471,6 +471,14 @@ fn absolute_time_ss_still_matches_nonmem() {
     let pop = population("ss_tabs.csv");
     let got = ferx_rows(&m, &pop, compute_predictions_with_tv);
     // Realised error, measured: 1.528e-9 relative worst. Bound at 1e-8, ~6.5x headroom.
+    //
+    // Re-measured on T3's machine: **2.615672e-9**, i.e. 3.8x headroom, not 6.5x. Recorded
+    // rather than corrected, because it is not a regression and the difference is not in
+    // ferx: the same four predictions come back bit-identical to `0596fbb9`
+    // (`8.5679354785102` / `5.9325361489014` / `4.1022138965935` / `2.8327608538595`,
+    // compared as `to_bits()`), so what moved is the machine, not the value — the adaptive
+    // solver's platform-to-platform step drift this file already notes for #990 / #1241.
+    // Quote the bound, not the realised figure, when citing this anchor off-machine.
     let worst = worst_rel_external(&got, &nonmem_ipred("ss_tabs"), "absolute-time SS vs NONMEM");
     assert!(worst < 1e-8, "worst relative error {worst:.3e}");
 }
@@ -619,5 +627,185 @@ fn the_closed_form_certifies_both_engines_and_nonmem() {
         ferx_worst < nm_worst,
         "ferx {ferx_worst:.3e} is no longer closer to the closed form than NONMEM \
          {nm_worst:.3e} — re-measure before touching any bound in this file"
+    );
+}
+
+// ── #1139 T3: the diagnostic, and the values it must not move ────────────────────────────
+
+/// The `[odes]` twin of a committed anchor model with its time term respelled.
+///
+/// `ss_tabs_fit.ferx` reads `0.003*T`; every absolute-clock spelling is the same system on
+/// this dataset except `TAFD`, whose first dose is at `t = 480` rather than `0`, so it is a
+/// genuinely different RHS and is written out rather than claimed equivalent.
+fn respelled(term: &str) -> CompiledModel {
+    let src = std::fs::read_to_string(anchor("ss_tabs_fit.ferx")).expect("twin is committed");
+    assert!(
+        src.contains("0.003*T)"),
+        "the fixture no longer spells its term `0.003*T`; this helper is rewriting nothing"
+    );
+    parse_full_model(&src.replace("0.003*T)", &format!("{term})")))
+        .expect("respelled model parses")
+        .model
+}
+
+/// **`TAFD` under an un-lagged `SS=1` dose still reads `NaN`, and `TAD` does not.**
+///
+/// T4 committed the *lagged* half of this pin (`tafd_stays_nan_under_a_lagged_ss_dose`);
+/// nothing pinned the un-lagged one, which is the configuration #1139 actually reports.
+///
+/// The assertion is the **asymmetry**, not the `NaN`. "`TAFD` is `NaN`" alone passes against
+/// a build where every prediction is `NaN` — including the pre-#1139 tree this suite exists
+/// to keep ferx away from. Pairing it with `0.0*TAD` reproducing the autonomous steady state
+/// *bit for bit* means only one of the two spellings can be broken at a time.
+///
+/// `0.0*TAFD` carries its own row because that is the case #1139 opens with: a term
+/// contributing nothing that nonetheless poisons the solve, since `0.0 * NaN` is `NaN`. T2
+/// fixed it for `TAD`; for `TAFD` it remains, deliberately — an absolute clock has no
+/// periodic limit for the run-in to converge to, so there is no value to hand back, and
+/// `W_STEADY_STATE_ABSOLUTE_TIME` names it instead.
+#[test]
+fn tafd_under_an_unlagged_ss_dose_stays_nan_while_tad_does_not() {
+    let pop = population("ss_tabs.csv");
+
+    for term in ["0.003*TAFD", "0.0*TAFD"] {
+        let got = ferx_rows(&respelled(term), &pop, compute_predictions_with_tv);
+        assert_eq!(got.len(), 4, "the fixture must produce four observations");
+        for &(t, v) in &got {
+            assert!(v.is_nan(), "`{term}` at t={t} is {v}, expected NaN");
+        }
+    }
+
+    // The other half of the asymmetry, on the same dataset: an inert `TAD` term returns the
+    // autonomous steady state rather than `NaN`. If this ever read `NaN` too, the rows above
+    // would be measuring a broken build rather than a scoped decision.
+    //
+    // Compared to a tolerance, not bit-for-bit, and the distinction is load-bearing.
+    // `0.0*TAD` still makes the PK block read model time, and `pk::model_uses_time_anywhere`
+    // gates on exactly that (`pk/mod.rs`, via `pk_reads_model_time()`), so the inert twin
+    // routes to the model-time walk while `1.0 + 0.0` stays on the plain one. Two
+    // integrators evaluating the same function agree to solver accuracy, not to the last
+    // bit. This was written as a `to_bits()` assertion first and the full suite caught it;
+    // the sibling `ss_prearrival_tad_nonmem_anchor::
+    // a_zero_coefficient_tad_term_returns_the_autonomous_steady_state` *can* be tighter only
+    // because a lagtime forces both arms onto the same walk — and even it bounds at 1e-10
+    // rather than comparing bits.
+    //
+    // Realised worst relative difference, measured: 4.633876e-12. Bound at 1e-10, ~22x
+    // headroom, matching the sibling's bound so the pair can be read together.
+    let autonomous = ferx_rows(&respelled("0.0*TAD"), &pop, compute_predictions_with_tv);
+    let plain = ferx_rows(&respelled("0.0"), &pop, compute_predictions_with_tv);
+    // `worst_rel` asserts `is_finite` on both sides before folding, so a `NaN` fails here
+    // rather than being absorbed by `f64::max` — which is the failure this half exists to
+    // separate from the `TAFD` rows above.
+    let worst = worst_rel(&autonomous, &plain, "`0.0*TAD` vs an autonomous RHS");
+    assert!(
+        worst < 1e-10,
+        "`0.0*TAD` must return the autonomous steady state, not `NaN` and not a different \
+         number; worst relative difference {worst:.3e}"
+    );
+}
+
+/// **`fit()` names the run-in.** The reported symptom of #1139 is a non-finite objective,
+/// and before this change the only warnings a user got were
+/// `W_ODE_SOLVER_DIAGNOSTICS: … 14400 step(s) clamped at the minimum step size` and a failed
+/// covariance step — both blaming the integrator. Measured at `0596fbb9`, on this model.
+///
+/// Asserted through `fit()` rather than `check_model_data_warnings` because the message
+/// reaching `FitResult.warnings` is a separate step (`api::fit` copies `d.message` out of the
+/// diagnostic), and the unit tests in `src/api/tests/ss_absolute_time_tests.rs` stop short
+/// of it.
+#[test]
+fn the_fit_warns_about_an_absolute_clock_under_steady_state() {
+    let opts = parse_full_model(
+        &std::fs::read_to_string(anchor("ss_tabs_fit.ferx")).expect("twin is committed"),
+    )
+    .expect("parses")
+    .fit_options;
+    let pop = population("ss_tabs.csv");
+
+    let fired = |m: &CompiledModel| -> Vec<String> {
+        ferx_core::fit(m, &pop, &m.default_params, &opts)
+            .expect("the fit runs")
+            .warnings
+            .into_iter()
+            .filter(|w| w.contains("reads an absolute clock"))
+            .collect()
+    };
+
+    // `T` — a finite, NONMEM-matching, silently-wrong number.
+    let w = fired(&respelled("0.003*T"));
+    assert_eq!(
+        w.len(),
+        1,
+        "expected exactly one absolute-clock warning: {w:?}"
+    );
+    assert!(
+        w[0].contains("`T`/`TIME` therefore return a finite number"),
+        "the `T` consequence must be the one reported: {}",
+        w[0]
+    );
+
+    // `TAFD` — the NaN objective #1139 reports.
+    let w = fired(&respelled("0.003*TAFD"));
+    assert_eq!(
+        w.len(),
+        1,
+        "expected exactly one absolute-clock warning: {w:?}"
+    );
+    assert!(
+        w[0].contains("`TAFD` has no referent inside the run-in"),
+        "the `TAFD` consequence must be the one reported: {}",
+        w[0]
+    );
+
+    // The negative that makes the two rows above a statement about absolute clocks rather
+    // than about steady state: the `TAD` model, which #1139 T2 anchored, stays silent.
+    assert!(
+        fired(&model("ss_tad_fit.ferx")).is_empty(),
+        "a `TAD`-reading steady-state model is anchored and must not be warned about"
+    );
+}
+
+/// **`ferx check` reports it too.** Measured at `0596fbb9`: this command returned an *empty*
+/// diagnostics list for every spelling, `--data` supplied. The two entry points share
+/// `check_model_data_warnings` precisely so they cannot disagree, and this is the assertion
+/// that keeps that true.
+///
+/// It must stay a **warning**: the report is still `valid`, so `ferx check` exits 0 and a
+/// model reading an absolute clock under `SS=1` is served rather than refused.
+#[test]
+fn ferx_check_reports_the_absolute_clock_warning_without_failing_the_report() {
+    const CODE: &str = "W_STEADY_STATE_ABSOLUTE_TIME";
+    let data = anchor("ss_tabs.csv");
+    let report = ferx_core::validate_model_file(
+        anchor("ss_tabs_fit.ferx").to_str().expect("utf-8 path"),
+        Some(data.to_str().expect("utf-8 path")),
+    );
+    let hit: Vec<_> = report
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == CODE)
+        .collect();
+    assert_eq!(
+        hit.len(),
+        1,
+        "expected one {CODE}: {:?}",
+        report.diagnostics
+    );
+    assert!(
+        report.valid,
+        "a warning must not invalidate the report — `ferx check` still exits 0"
+    );
+
+    // Same negative control as the fit test, through the other entry point.
+    let data = anchor("ss_tad.csv");
+    let report = ferx_core::validate_model_file(
+        anchor("ss_tad_fit.ferx").to_str().expect("utf-8 path"),
+        Some(data.to_str().expect("utf-8 path")),
+    );
+    assert!(
+        !report.diagnostics.iter().any(|d| d.code == CODE),
+        "the `TAD` twin must not be reported: {:?}",
+        report.diagnostics
     );
 }

@@ -3807,11 +3807,10 @@ pub fn check_model_data_warnings(
     // these are handled exactly. Only ODE models — and subjects that route to the
     // event-driven walker (EVID 3/4 resets) — still skip SS pre-equilibration.
     let analytic_handles_overlap = model.ode_spec.is_none();
-    // The effective infusion length is
-    // `d.duration` for an ordinary infusion, but for a modeled dose (RATE=-2 →
-    // `D{cmt}` duration, or RATE=-1 → `R{cmt}` rate; #324) it is unresolved here
-    // (`rate`/`duration` are 0 until `resolve_rate`), so resolve it at the
-    // typical-value point through the engine-correct `active_dose_attr_map()`.
+    // For a modeled dose (RATE=-2 → `D{cmt}` duration, or RATE=-1 → `R{cmt}` rate;
+    // #324) the `(rate, duration)` pair is unresolved here — both are 0 until
+    // `resolve_rate` — so resolve it at the typical-value point through the
+    // engine-correct `active_dose_attr_map()`.
     //
     // Resolution goes through the single-source-of-truth `DoseEvent::resolve_rate`
     // (the same rule + floor clamps the integrator applies at runtime), not a
@@ -3823,26 +3822,59 @@ pub fn check_model_data_warnings(
     // overlap may not occur on every occasion). The runtime SS-skip is the
     // backstop; this catches the common typical-value / covariate-driven overlap.
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
-    let effective_duration = |s: &Subject, d: &DoseEvent| -> f64 {
+    // This dose as the integrator will construct it, plus the `F` that reshapes it: the
+    // resolved `(rate, duration)` pair and `f_bio` for its compartment, both at the
+    // typical-value point. `None` when a modeled dose has no matching parameter — an
+    // upstream *error* (`E_MODELED_DURATION_NO_PARAM` / `E_MODELED_RATE_NO_PARAM`), but this
+    // warnings pass must stay panic-free if run on such a model rather than hit
+    // `resolve_rate`'s slot `.expect`.
+    //
+    // One resolution, two consumers: this warning and the `W_STEADY_STATE_ABSOLUTE_TIME` gate
+    // further down read the *same* resolved dose through the *same* predicate, so the two
+    // cannot drift about which doses the run-in actually serves.
+    let resolved_dose = |s: &Subject, d: &DoseEvent| -> Option<(DoseEvent, f64)> {
         use crate::types::{DoseAttr, RateMode};
-        // The dose attribute whose slot holds this modeled dose's value.
-        let attr = match d.rate_mode {
-            RateMode::Fixed => return d.duration,
-            RateMode::ModeledDuration => DoseAttr::Duration,
-            RateMode::ModeledRate => DoseAttr::Rate,
-        };
-        // Guard the slot's existence: a modeled dose with no matching parameter is
-        // an upstream *error* (`E_MODELED_DURATION_NO_PARAM` / `E_MODELED_RATE_NO_PARAM`),
-        // but this warnings pass must stay panic-free if run on such a model rather
-        // than hit `resolve_rate`'s slot `.expect`.
         let attr_map = model.active_dose_attr_map();
-        if attr_map.indexed_slot(attr, d.cmt_raw()).is_some() {
-            // Initial-estimate warning pass: typical values at t=0.
-            let pk = (model.pk_param_fn)(&init_params.theta, &zero_eta, &s.covariates, 0.0);
-            d.resolve_rate(attr_map, &pk.values).duration
-        } else {
-            0.0
+        // The dose attribute whose slot holds this modeled dose's value, if any.
+        let attr = match d.rate_mode {
+            RateMode::Fixed => None,
+            RateMode::ModeledDuration => Some(DoseAttr::Duration),
+            RateMode::ModeledRate => Some(DoseAttr::Rate),
+        };
+        if attr.is_some_and(|a| attr_map.indexed_slot(a, d.cmt_raw()).is_none()) {
+            return None;
         }
+        // Initial-estimate warning pass: typical values at t=0.
+        let pk = (model.pk_param_fn)(&init_params.theta, &zero_eta, &s.covariates, 0.0);
+        Some((
+            d.resolve_rate(attr_map, &pk.values),
+            attr_map.f_bio(d.cmt_raw(), &pk.values),
+        ))
+    };
+    // Whether the steady-state run-in **skips** this dose because its infusion outlasts its own
+    // interval. This is the integrator's own test rather than a paraphrase of it:
+    // `equilibrate_ss_pk_state` (`ode/predictions.rs`) compares
+    // `dose.bioavailable_infusion(f_bio).1` against `dose.ii`, and the event-driven
+    // equilibration reshapes its synthetic cycle dose the same way
+    // (`with_bioavailable_infusion`, #419). So `F` is part of the comparison on both engines —
+    // on a rate-defined infusion it scales the *length* (the data fixes the rate), on a
+    // duration-defined one (`RATE=-2`) it scales the rate and the length is untouched.
+    //
+    // Comparing the unscaled duration instead made both warnings below say things that were
+    // not true, in opposite directions (#1281). Measured on a 1-cpt `[odes]` model with
+    // `AMT = 100, RATE = 5, II = 12` (duration 20) and observations at 482 / 485: at
+    // `F1 = 1.0` the predictions are `9.514379031181768` / `22.093161802029634` — finite,
+    // the run-in skipped, and "applied as a single (non-SS) infusion" is true of it. At
+    // `F1 = 0.5` (`T_inf = 10 ≤ II`) the same record on a `TAFD`-reading RHS returns
+    // `NaN` / `NaN`, which nothing but the run-in can produce — so that sentence was false
+    // there, while `W_STEADY_STATE_ABSOLUTE_TIME` was suppressed on the one row that needed
+    // it. `tests/modeled_duration.rs` holds the arm that must not move: `RATE=-2` answers the
+    // same before and after, which a hand-written `F * duration` would break.
+    let run_in_skips_overlapping_infusion = |s: &Subject, d: &DoseEvent| -> bool {
+        resolved_dose(s, d).is_some_and(|(resolved, f_bio)| {
+            crate::dosing::is_real_infusion(&resolved)
+                && resolved.bioavailable_infusion(f_bio).1 > d.ii
+        })
     };
     let n_ss_overlapping_inf = population
         .subjects
@@ -3851,7 +3883,7 @@ pub fn check_model_data_warnings(
             let overlapping = s
                 .doses
                 .iter()
-                .any(|d| d.ss && d.ii > 0.0 && d.is_infusion() && effective_duration(s, d) > d.ii);
+                .any(|d| d.ss && d.ii > 0.0 && run_in_skips_overlapping_infusion(s, d));
             overlapping && (!analytic_handles_overlap || s.has_resets())
         })
         .count();
@@ -3869,6 +3901,153 @@ pub fn check_model_data_warnings(
                 n_ss_overlapping_inf
             ),
         ));
+    }
+
+    // SS=1 dose on an `[odes]` right-hand side that reads an **absolute** clock (#1139).
+    //
+    // The run-in that stands in for the infinite past does not integrate on the subject's
+    // clock: it expands the periodic train on a clock local to each cycle, because that is
+    // the only clock on which the one-cycle map is the same map every cycle. `TAD` survives
+    // that — it is bounded inside one interval, so the train has a limit and #1139 anchors it
+    // per window against NONMEM. `TAFD` and `T`/`TIME` do not, and they fail differently:
+    // `T`/`TIME` come back finite, matching NONMEM's own steady-state routine (both engines
+    // share the cycle-local convention) but sitting far from the model's own explicit dose
+    // train; `TAFD` has no referent in the run-in at all — the periodic fiction has no first
+    // dose — and comes back `NaN`, poisoning the objective whatever coefficient it carries.
+    //
+    // Reported rather than rejected: one mechanism, one diagnostic, and a hard error would
+    // reach `fit()` only — `simulate()` and `predict()` call neither this bundle nor
+    // `check_model_data_rule`, and serve the same numbers unwarned.
+    //
+    // **Counted per dose that actually reaches the run-in**, because the consequence sentences
+    // below name what the run-in does and are false wherever it is skipped.
+    // `equilibrate_ss_pk_state` bails before integrating anything for an overlapping SS
+    // infusion (`is_inf && t_inf > dose.ii`) and for a dose whose compartment is outside the
+    // state vector (`cmt_idx >= n_states`), leaving the ordinary finite TAFD anchor in place.
+    // Measured on `0.003*TAFD` with `AMT=100, RATE=5, II=12, SS=1` (T_inf = 20 > II): the fit
+    // returns **OFV 367.2851**, finite — so an unfiltered count would have printed "it reads
+    // NaN and the objective is non-finite" next to a `W_STEADY_STATE_INFUSION` correctly
+    // saying the record was served as a single non-SS infusion. Filtering on the *same*
+    // predicate that warning uses makes the two partition rather than contradict.
+    //
+    // Deliberately *not* suppressed when a neighbouring steady-state warning fires on a dose
+    // this one still counts: `W_STEADY_STATE_INFUSION` is a typical-value heuristic by its
+    // own comment above (a modeled SS infusion may overlap on some occasions only), so
+    // blanket suppression would drop a true finding.
+    //
+    // `[diffusion]` is **not** excluded, and the reason is measured rather than assumed.
+    // `solve_ekf` seeds a finite TAFD anchor and never equilibrates (#1260), which reads like
+    // an exemption — but `ode_predictions_ekf_with_diffusion` computes the Kalman `R` from a
+    // standard `ode_predictions` pass, and that one does run the run-in, so the `NaN` reaches
+    // the likelihood anyway: the same model plus `[diffusion] central ~ 0.01` measures
+    // `OFV: NaN`. `predict()` / `simulate()` on it likewise take the ordinary ODE path.
+    if let Some(prog) = model
+        .ode_spec
+        .as_ref()
+        .and_then(|o| o.rhs_program.as_ref())
+        .filter(|p| p.pk_reads_absolute_time())
+    {
+        // `d.ss && d.ii > 0.0`, not `d.ss`: with `II <= 0` the SS branch is never entered
+        // (the dose falls through to the single-dose path and `W_STEADY_STATE_II` says so),
+        // so there is no run-in whose clock could be wrong. `II <= 0` is the only input that
+        // separates those two predicates, which makes it the only input that can show this is
+        // not `has_ss_doses()` spelled the long way — the whole job of
+        // `a_steady_state_dose_with_no_interval_does_not_warn`. Spelled per dose rather than
+        // through `Subject::has_periodic_ss_dose` because the two further conjuncts below are
+        // per dose too: a subject may carry one equilibrating SS dose and one that bails.
+        let n_states = model.ode_spec.as_ref().map_or(0, |o| o.n_states);
+        let equilibrates = |s: &Subject, d: &DoseEvent| -> bool {
+            if !(d.ss && d.ii > 0.0) {
+                return false;
+            }
+            // The out-of-range compartment bail-out (#899): `CMT` beyond the state vector
+            // returns the unequilibrated zero state without touching the RHS.
+            if d.cmt_idx() >= n_states {
+                return false;
+            }
+            // The overlapping-infusion bail-out — the same predicate
+            // `W_STEADY_STATE_INFUSION` reports on, so the two findings partition the
+            // population rather than contradicting each other about which doses the run-in
+            // serves. `F` is why that had to be one function and not two spellings (#1281):
+            // it enters through `bioavailable_infusion`, and a paraphrase that compared the
+            // unscaled duration suppressed this warning on exactly the `F < 1` row whose
+            // predictions are `NaN`.
+            //
+            // Typical-value like the resolution it sits on: `F` may itself carry an η, so a
+            // dose that crosses `II` on some subjects only is judged on the typical one. The
+            // runtime bail-out is the backstop. An unresolvable modeled dose (no slot — an
+            // upstream error) counts as reaching the run-in, since the integrator will not
+            // treat it as a real infusion either.
+            !run_in_skips_overlapping_infusion(s, d)
+        };
+        let n_ss = population
+            .subjects
+            .iter()
+            .filter(|s| s.doses.iter().any(|d| equilibrates(s, d)))
+            .count();
+        if n_ss > 0 {
+            let (reads_tafd, reads_solver_time) =
+                (prog.pk_reads_tafd(), prog.pk_reads_solver_time());
+            // The enclosing filter is `pk_reads_absolute_time()` — the OR of these two — so
+            // `(false, false)` cannot arrive. Spelled `(false, _)` rather than `_` to keep
+            // that visible, and asserted rather than trusted: were the gate and this match
+            // to drift apart, the failure is silent and specific — a message naming
+            // `T`/`TIME` with no consequence sentence appended after it.
+            debug_assert!(
+                reads_tafd || reads_solver_time,
+                "W_STEADY_STATE_ABSOLUTE_TIME reached with neither absolute-clock flag set"
+            );
+            let spellings = match (reads_tafd, reads_solver_time) {
+                (true, true) => "`TAFD` and `T`/`TIME`",
+                (true, false) => "`TAFD`",
+                (false, _) => "`T`/`TIME`",
+            };
+            // The substring "SS=1 dose" is load-bearing, not incidental phrasing: it is what
+            // routes this into `WarningCode::DataQuality` in `classify_warning`, the bucket
+            // the neighbouring steady-state warnings use and the one ferx-r already has
+            // remediation guidance for. Pinned by a test, so a reword cannot silently drop it
+            // into the `general` fallback.
+            //
+            // No measured number here on purpose — a figure embedded in a user-facing string
+            // goes stale and the tests then assert it. The magnitudes live on the
+            // steady-state docs page beside the NONMEM tables that produced them.
+            let mut message = format!(
+                "{n_ss} subject(s) have an SS=1 dose on a model whose `[odes]` right-hand \
+                 side reads an absolute clock ({spellings}). The run-in that stands in for \
+                 the infinite past expands the periodic dose train on a clock local to each \
+                 cycle rather than on the subject's, and an absolute clock has no periodic \
+                 steady state for it to converge to."
+            );
+            if reads_solver_time {
+                message.push_str(
+                    " `T`/`TIME` therefore return a finite number, matching NONMEM's own \
+                     steady-state routine because both engines share that convention — but \
+                     it is not the limit of this model's own explicit dose train.",
+                );
+            }
+            if reads_tafd {
+                message.push_str(
+                    " `TAFD` has no referent inside the run-in at all, so it reads NaN and \
+                     the objective is non-finite — whatever coefficient the term carries.",
+                );
+            }
+            diags.push(
+                Diagnostic::warning("W_STEADY_STATE_ABSOLUTE_TIME", message)
+                    .with_block("odes")
+                    .with_suggestion(
+                        "Replace the SS=1 record with the subject's actual dose history as \
+                         explicit records — the prediction then depends on how many doses \
+                         you write, since an absolute-clock train has no limit to converge \
+                         to, and that dependence belongs to the model rather than to the \
+                         solver. Or use `TAD` if a per-dose clock is what the model means — \
+                         it is bounded inside one dosing interval, so it does have a \
+                         periodic steady state, and it is anchored against NONMEM. This is \
+                         a property of the model and its SS=1 record rather than of the \
+                         solver serving it: it does not go away by moving the model to \
+                         `[diffusion]`.",
+                    ),
+            );
+        }
     }
 
     // SS=1 dose combined with an [initial_conditions] baseline (#521). The SS
@@ -4445,6 +4624,10 @@ fn additive_init_scale_check(
 /// (median `|DV|`) — deliberately conservative so a genuinely small-but-intended
 /// additive floor of a few % of the data does not trip the warning.
 const NEGLIGIBLE_ADD_FRACTION: f64 = 0.01;
+
+#[cfg(test)]
+#[path = "tests/ss_absolute_time_tests.rs"]
+mod ss_absolute_time_tests;
 
 #[cfg(test)]
 #[path = "tests/additive_init_scale_tests.rs"]

@@ -75,6 +75,17 @@ section of the SDLC for the versioning policy).
   to read. No effect on `.ferx` models, the CLI or the R wrapper, none of which constructs it.
 
 ### Fixed
+- **`W_STEADY_STATE_INFUSION` no longer claims a record is served as a single non-SS infusion
+  when it is not (#1281).** The warning compared the record's own `AMT/RATE`; the steady-state
+  run-in compares the length *after bioavailability*, which on a rate-defined infusion is
+  `F · T_inf` (`F` scales the length, the data having fixed the rate) and on a duration-defined
+  one (`RATE=-2` → `D{n}`) is the duration untouched. So a bioavailability below 1 could pull a
+  nominally overlapping infusion back under `II`, and the run-in then ran while the warning said
+  it had not. Measured on a 1-cpt ODE model with `AMT=100, RATE=5, II=12`: at `F1=1.0` the
+  predictions are finite and the warning is right; at `F1=0.5` the same record predicts `NaN` on
+  a `TAFD`-reading right-hand side — which only the run-in can produce — and the warning was
+  wrong. Both steady-state warnings now ask the integrator's own predicate, so they agree about
+  which doses reach the run-in. A `RATE=-2` record's verdict is unchanged.
 - **`CWRES` is now NONMEM's `CWRES` (#1182).** It was each residual divided by its own
   marginal SD, `(y − f0) / √R̃ⱼⱼ`. NONMEM's conditional weighted residual (Hooker et al. 2007)
   is the *decorrelated* vector `R̃^{-1/2}(y − f0)` with the symmetric inverse square root of
@@ -532,6 +543,21 @@ section of the SDLC for the versioning policy).
   rather than as "every remaining replicate failed". Replicates the cancel unwound are dropped
   rather than journaled as failures, so `--resume` refits them; everything already finished stays
   on disk and resumes into exactly the run that was cancelled.
+- **`W_STEADY_STATE_ABSOLUTE_TIME` — a steady-state dose on an `[odes]` right-hand side that
+  reads an absolute clock is now named (#1139).** The run-in standing in for the infinite past
+  expands the dose train on a clock local to each cycle, so `TAFD`, `T`/`t` and the bare `TIME`
+  built-in have no periodic steady state for it to converge to: `T`/`TIME` return a finite
+  number that matches NONMEM's own steady-state routine but sits 67 % from the same model's
+  explicit dose train, and `TAFD` returns `NaN` whatever coefficient the term carries.
+  `fit()` and `ferx check` both report it. No prediction, objective or diagnostic value
+  changes: previously the only warnings *describing the failure* were a
+  `W_ODE_SOLVER_DIAGNOSTICS` and a failed covariance step, which both point at the integrator,
+  while `ferx check` said nothing at all — those still appear, and this now names the cause
+  alongside them. It is reported per dose that actually reaches the run-in, so an `SS=1`
+  infusion the run-in skips — one whose length *after bioavailability* exceeds its own `II`,
+  served as a single non-SS infusion — is not swept up. `TAD` is not
+  affected: it is bounded inside one dosing interval, so the run-in reproduces its train and
+  is anchored against NONMEM.
 ### Fixed
 - **A fit whose estimate ran to an internal safety rail no longer reports `converged: true`
   (#1118).** ferx caps a few packed coordinates internally (an implicit THETA cap, the OMEGA /

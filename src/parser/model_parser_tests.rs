@@ -20651,9 +20651,14 @@ fn present_means_exactly_what_the_self_comparison_idiom_meant() {
 /// `TIME` and the slot-backed spellings are covered by **disjoint** flags, and
 /// only [`OdeRhsProgram::reads_model_time`] sees both. Pinned structurally so a
 /// caller pairing them by hand cannot drift back into #1124's gap.
+///
+/// The fourth column is [`OdeRhsProgram::pk_reads_absolute_time`] (#1139 T3), which is the
+/// same question with `TAD` removed — so the `TAD` row is the one that separates it from
+/// `reads_model_time`, and without that row a gate wired to the wrong one of the two would
+/// pass every case here.
 #[test]
 fn reads_model_time_covers_every_spelling_and_the_flags_are_disjoint() {
-    fn flags(term: &str) -> (bool, bool, bool) {
+    fn flags(term: &str) -> (bool, bool, bool, bool) {
         let src = format!(
             r#"
 [parameters]
@@ -20684,17 +20689,108 @@ fn reads_model_time_covers_every_spelling_and_the_flags_are_disjoint() {
             p.uses_time_vars(),
             p.reads_time_builtin(),
             p.reads_model_time(),
+            p.pk_reads_absolute_time(),
         )
     }
 
     // `TIME` sets ONLY the built-in flag; the slot-backed names set ONLY the
     // broad flag. Neither flag alone covers all four — that disjointness is the
     // whole reason `reads_model_time` exists.
-    assert_eq!(flags("*(1.0 + 0.01*TIME)"), (false, true, true), "TIME");
-    assert_eq!(flags("*(1.0 + 0.01*T)"), (true, false, true), "T");
-    assert_eq!(flags("*(1.0 + 0.01*TAFD)"), (true, false, true), "TAFD");
-    assert_eq!(flags("*(1.0 + 0.01*TAD)"), (true, false, true), "TAD");
-    assert_eq!(flags(""), (false, false, false), "autonomous control");
+    assert_eq!(
+        flags("*(1.0 + 0.01*TIME)"),
+        (false, true, true, true),
+        "TIME"
+    );
+    assert_eq!(flags("*(1.0 + 0.01*T)"), (true, false, true, true), "T");
+    // The lowercase aliases resolve to the same slot (`var_idx` binds `TIME`/`time`/`T`/`t`),
+    // and nothing else pins that — a `T`-only fixture cannot tell the alias set apart.
+    assert_eq!(flags("*(1.0 + 0.01*t)"), (true, false, true, true), "t");
+    assert_eq!(
+        flags("*(1.0 + 0.01*TAFD)"),
+        (true, false, true, true),
+        "TAFD"
+    );
+    // The discriminating row: `TAD` is model time but **not** an absolute clock, so it is
+    // the only spelling on which the two predicates disagree.
+    assert_eq!(
+        flags("*(1.0 + 0.01*TAD)"),
+        (true, false, true, false),
+        "TAD"
+    );
+    // …and mentioning `TAD` must not mask an absolute read sitting beside it: the flags are
+    // a union over the block, not a classification of it.
+    assert_eq!(
+        flags("*(1.0 + 0.01*TAD + 0.01*T)"),
+        (true, false, true, true),
+        "TAD and T together"
+    );
+    assert_eq!(
+        flags(""),
+        (false, false, false, false),
+        "autonomous control"
+    );
+}
+
+/// The two halves of [`OdeRhsProgram::pk_reads_absolute_time`], asserted **separately**.
+///
+/// The union is what any gate asks, but a message has to name the spelling, because the two
+/// fail differently under `SS=1`: `TAFD` reads `NaN` inside the run-in while `T`/`TIME` come
+/// back finite and matching NONMEM. A test that only ever checked the union would pass
+/// against an implementation where one of the two flags is stuck — and against one where
+/// they are swapped.
+///
+/// Both disjuncts of `pk_reads_solver_time` are exercised on purpose: `T` reaches it through
+/// `time_slot`, a bare `TIME` only through `Op::PushTime`, and a `T`-only fixture cannot see
+/// the second (#1124).
+#[test]
+fn the_two_absolute_clock_spellings_are_tracked_separately() {
+    fn split(term: &str) -> (bool, bool) {
+        let src = format!(
+            r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V)*central{term}
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+        );
+        let m = parse_model_string(&src).expect("parse");
+        let p = m
+            .ode_spec
+            .as_ref()
+            .and_then(|o| o.rhs_program.as_ref())
+            .expect("rhs program");
+        assert_eq!(
+            p.pk_reads_absolute_time(),
+            p.pk_reads_tafd() || p.pk_reads_solver_time(),
+            "the union must stay the OR of its halves for `{term}`"
+        );
+        (p.pk_reads_tafd(), p.pk_reads_solver_time())
+    }
+
+    // (tafd, solver_time)
+    assert_eq!(split("*(1.0 + 0.01*TAFD)"), (true, false), "TAFD alone");
+    assert_eq!(split("*(1.0 + 0.01*T)"), (false, true), "T alone");
+    assert_eq!(split("*(1.0 + 0.01*TIME)"), (false, true), "TIME alone");
+    assert_eq!(
+        split("*(1.0 + 0.01*TAFD + 0.01*TIME)"),
+        (true, true),
+        "both spellings"
+    );
+    // `TAD` sets neither, which is what keeps the diagnostic off a model #1139 T2 fixed.
+    assert_eq!(split("*(1.0 + 0.01*TAD)"), (false, false), "TAD alone");
+    assert_eq!(split(""), (false, false), "autonomous control");
 }
 
 /// A joint PK-TTE model, with `{PK}` appended to the central derivative, `{PRE}`
@@ -20734,9 +20830,10 @@ fn joint_src(pk: &str, pre: &str, haz: &str) -> String {
     )
 }
 
-/// `(uses_time_vars, reads_time_builtin, reads_model_time, pk_reads_model_time)`.
+/// `(uses_time_vars, reads_time_builtin, reads_model_time, pk_reads_model_time,
+/// pk_reads_absolute_time)`.
 #[cfg(feature = "survival")]
-fn joint_flags(pk: &str, pre: &str, haz: &str) -> (bool, bool, bool, bool) {
+fn joint_flags(pk: &str, pre: &str, haz: &str) -> (bool, bool, bool, bool, bool) {
     let m = parse_model_string(&joint_src(pk, pre, haz)).expect("joint model must parse");
     let p = m
         .ode_spec
@@ -20748,6 +20845,7 @@ fn joint_flags(pk: &str, pre: &str, haz: &str) -> (bool, bool, bool, bool) {
         p.reads_time_builtin(),
         p.reads_model_time(),
         p.pk_reads_model_time(),
+        p.pk_reads_absolute_time(),
     )
 }
 
@@ -20765,11 +20863,11 @@ fn a_time_dependent_hazard_does_not_make_the_pk_block_non_autonomous() {
     // Control: nothing anywhere reads time.
     assert_eq!(
         joint_flags("", "", AUTO),
-        (false, false, false, false),
+        (false, false, false, false, false),
         "autonomous hazard, autonomous PK"
     );
 
-    // The four spellings, in the hazard: wide flags fire, the narrow one does not.
+    // The four spellings, in the hazard: wide flags fire, the narrow ones do not.
     for (term, wide) in [
         ("TIME", (false, true, true)),
         ("T", (true, false, true)),
@@ -20779,7 +20877,7 @@ fn a_time_dependent_hazard_does_not_make_the_pk_block_non_autonomous() {
         let haz = format!("H0 * exp(0.05*{term}) * exp(BETA * (central / V))");
         assert_eq!(
             joint_flags("", "", &haz),
-            (wide.0, wide.1, wide.2, false),
+            (wide.0, wide.1, wide.2, false, false),
             "`{term}` in the hazard must leave the PK block autonomous"
         );
     }
@@ -20789,12 +20887,15 @@ fn a_time_dependent_hazard_does_not_make_the_pk_block_non_autonomous() {
     // "drop every top-level derivative" rather than "drop the injected ones".
     assert_eq!(
         joint_flags("*(1.0 + 0.01*TIME)", "", AUTO),
-        (false, true, true, true),
+        (false, true, true, true, true),
         "`TIME` in the PK RHS is a genuinely non-autonomous PK block"
     );
+    // `TAD` in the PK RHS is non-autonomous but **not** an absolute clock — the one row
+    // where the two narrow flags part company, and the reason a diagnostic keyed on the
+    // absolute one stays off a model #1139 T2 already fixed.
     assert_eq!(
         joint_flags("*(1.0 + 0.01*TAD)", "", AUTO),
-        (true, false, true, true),
+        (true, false, true, true, false),
         "`TAD` in the PK RHS likewise"
     );
 
@@ -20802,13 +20903,20 @@ fn a_time_dependent_hazard_does_not_make_the_pk_block_non_autonomous() {
     // *only* by the hazard is a top-level `AssignBc`, not one of the excluded
     // derivative lines, so it still reads wide. Conservative in the safe
     // direction — pinned so a later dataflow cut is a deliberate change.
+    //
+    // `pk_reads_absolute_time` inherits it, and there it is no longer free: #1166's consumer
+    // is a gradient-routing gate, where over-declining costs speed, while #1139 T3's is a
+    // user-facing warning, where it is a false positive on a legitimate joint model.
+    // Accepted rather than narrowed here — the dataflow cut is #1166's deferred change — and
+    // the *consequence* is pinned end-to-end by
+    // `a_time_reading_intermediate_used_only_by_the_hazard_still_warns`.
     assert_eq!(
         joint_flags(
             "",
             "TT = TIME",
             "H0 * exp(0.05*TT) * exp(BETA * (central / V))"
         ),
-        (false, true, true, true),
+        (false, true, true, true, true),
         "a time-reading intermediate used only by the hazard over-declines, by design"
     );
 }
@@ -20819,7 +20927,7 @@ fn a_time_dependent_hazard_does_not_make_the_pk_block_non_autonomous() {
 /// `survival` feature this is the only shape that exists.
 #[test]
 fn without_an_event_model_the_narrow_flag_equals_the_wide_one() {
-    fn flags(term: &str) -> (bool, bool) {
+    fn flags(term: &str) -> (bool, bool, bool) {
         let src = format!(
             r"
 [parameters]
@@ -20845,13 +20953,29 @@ fn without_an_event_model_the_narrow_flag_equals_the_wide_one() {
             .as_ref()
             .and_then(|o| o.rhs_program.as_ref())
             .expect("rhs program");
-        (p.reads_model_time(), p.pk_reads_model_time())
+        (
+            p.reads_model_time(),
+            p.pk_reads_model_time(),
+            p.pk_reads_absolute_time(),
+        )
     }
-    for term in ["", "*(1.0 + 0.01*TIME)", "*(1.0 + 0.01*TAD)"] {
-        let (wide, narrow) = flags(term);
+    // `want_absolute` is asserted here rather than derived, because this is the arm of the
+    // `pk_view` selection that a model *with* an `[event_model]` never reaches: with no
+    // injected slots the filter is skipped entirely, so a mutation to it is invisible from
+    // this side and a mutation to the selection is invisible from the other.
+    for (term, want_absolute) in [
+        ("", false),
+        ("*(1.0 + 0.01*TIME)", true),
+        ("*(1.0 + 0.01*TAD)", false),
+    ] {
+        let (wide, narrow, absolute) = flags(term);
         assert_eq!(
             wide, narrow,
             "with no [event_model] the two predicates must agree (term `{term}`)"
+        );
+        assert_eq!(
+            absolute, want_absolute,
+            "pk_reads_absolute_time on `{term}` with no [event_model]"
         );
     }
 }
