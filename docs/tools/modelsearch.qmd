@@ -55,7 +55,7 @@ cache_dir = "warfarin-modelsearch"
 | key | default | meaning |
 |---|---|---|
 | `algorithm` | `reduced_stepwise` | one of Pharmpy's three, [below](#the-algorithms) |
-| `iiv_strategy` | `absorption_delay` | η on a new lag time or mean transit time only; `add_diagonal` gives every new parameter an η; `no_add` none. Pharmpy's `fullblock` is not offered — a block over the new and existing η is [iivsearch](https://github.com/FeRx-NLME/ferx-core/issues/1183)'s move |
+| `iiv_strategy` | `absorption_delay` | η on a new lag time or mean transit time only; `add_diagonal` gives every new parameter an η; `no_add` none. Pharmpy's `fullblock` is not offered — a block over the new and existing η is [iivsearch](iivsearch.qmd)'s move |
 | `[rank] type` | `bic` | any of the [rank types](search.qmd#ranking-strictness-and-run-settings); every candidate is scored on it |
 | `[rank] cutoff` | none | a candidate is selected only when it beats the base by at least this much; the base wins otherwise |
 

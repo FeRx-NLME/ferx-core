@@ -106,6 +106,12 @@ pub struct Candidate {
     pub parent: Option<String>,
     /// What distinguishes it — see [`FeatureVector`].
     pub features: FeatureVector,
+    /// This candidate's own start count, overriding [`RunOptions::n_starts`]
+    /// when set. A search that knows one candidate is harder to fit than its
+    /// siblings — a full omega block over three or more η is the case
+    /// (#1183, `docs/examples/multistart.qmd`) — asks for more starts here
+    /// rather than paying for them on every candidate of the run.
+    pub n_starts: Option<usize>,
 }
 
 impl Candidate {
@@ -116,7 +122,15 @@ impl Candidate {
             model,
             parent: None,
             features: FeatureVector::new(),
+            n_starts: None,
         }
+    }
+
+    /// Builder: fit this candidate with `n` starts instead of the run's
+    /// default. Clamped to at least 1 when applied.
+    pub fn starts(mut self, n: usize) -> Self {
+        self.n_starts = Some(n);
+        self
     }
 
     /// Builder: record the candidate this one was derived from.

@@ -35,8 +35,19 @@ pub(crate) const MIN_SEED_VARIANCE: f64 = 1e-5;
 /// The floored variance is the same no-variability model the parent found —
 /// spelled so the child can move off it.
 pub(crate) fn seed_from(model: &mut ModelText, fit: &FitResult) -> Result<(), String> {
-    let blocks = free_blocks_of(model, &fit.eta_names);
-    let floored = floor_variances(fit, &blocks);
+    let blocks = free_blocks_of(model, "block_omega", &fit.eta_names);
+    let mut floored = floor_variances(fit, &blocks);
+    // The IOV κ live in their own matrix and hit the same rail (#1183: a
+    // full-IOV parent whose κ collapsed handed every child a κ the engine
+    // refused to start).
+    if let Some(iov) = &fit.omega_iov {
+        let kappa_blocks = free_blocks_of(model, "block_kappa", &fit.kappa_names);
+        if let Some(fixed) = floor_matrix(iov, &kappa_blocks) {
+            let mut out = floored.unwrap_or_else(|| fit.clone());
+            out.omega_iov = Some(fixed);
+            floored = Some(out);
+        }
+    }
     model.apply(ModelEdit::SeedInits(floored.as_ref().unwrap_or(fit)))
 }
 
@@ -50,10 +61,10 @@ const MAX_NUDGES: usize = 16;
 /// alone and the engine exempts from the rail, so it is never nudged and
 /// never a reason to touch anything else. A block naming an η the fit does
 /// not carry is skipped too: there is nothing to seed it from.
-fn free_blocks_of(model: &ModelText, eta_names: &[String]) -> Vec<Vec<usize>> {
+fn free_blocks_of(model: &ModelText, keyword: &str, eta_names: &[String]) -> Vec<Vec<usize>> {
     let mut blocks = Vec::new();
     for line in model.block_lines("parameters") {
-        let Some(rest) = line.strip_prefix("block_omega") else {
+        let Some(rest) = line.strip_prefix(keyword) else {
             continue;
         };
         if rest
@@ -96,8 +107,20 @@ fn free_blocks_of(model: &ModelText, eta_names: &[String]) -> Vec<Vec<usize>> {
 /// slightly *indefinite* in the last digits may need more than one; the
 /// loop is bounded and, past the bound, the block goes through verbatim.
 fn floor_variances(fit: &FitResult, blocks: &[Vec<usize>]) -> Option<FitResult> {
-    let n = fit.omega.nrows();
-    let mut omega = fit.omega.clone();
+    let omega = floor_matrix(&fit.omega, blocks)?;
+    let mut out = fit.clone();
+    out.omega = omega;
+    Some(out)
+}
+
+/// [`floor_variances`] on one variance matrix — `omega` or `omega_iov` —
+/// returning the floored matrix, or `None` when nothing had to move.
+fn floor_matrix(
+    matrix: &nalgebra::DMatrix<f64>,
+    blocks: &[Vec<usize>],
+) -> Option<nalgebra::DMatrix<f64>> {
+    let n = matrix.nrows();
+    let mut omega = matrix.clone();
     let mut changed = false;
     for k in 0..n {
         let v = omega[(k, k)];
@@ -131,17 +154,12 @@ fn floor_variances(fit: &FitResult, blocks: &[Vec<usize>]) -> Option<FitResult> 
             // that still do not start. The engine's message then names it.
             for &ia in block {
                 for &ib in block {
-                    omega[(ia, ib)] = fit.omega[(ia, ib)];
+                    omega[(ia, ib)] = matrix[(ia, ib)];
                 }
             }
         }
     }
-    if !changed {
-        return None;
-    }
-    let mut out = fit.clone();
-    out.omega = omega;
-    Some(out)
+    changed.then_some(omega)
 }
 
 /// The engine's rail on a packed Cholesky diagonal, as a variance:

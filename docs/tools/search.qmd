@@ -58,7 +58,7 @@ cache_dir = ".ferx-search"
 |---|---|
 | `base` | the base model. Relative paths are taken against the `.ferxsearch` file's own directory, so the pair moves together |
 | `data` | the dataset; omit it to use the model's `[data]` block |
-| `[space] mfl` | the search space, in MFL (below). Parsed and coverage-checked when the file is loaded. Omitted for [ruvsearch](ruvsearch.qmd), whose candidates are the residual-error forms; covsearch and modelsearch refuse a file without one |
+| `[space] mfl` | the search space, in MFL (below). Parsed and coverage-checked when the file is loaded. Omitted for [ruvsearch](ruvsearch.qmd), whose candidates are the residual-error forms, and optionally for [iovsearch](iovsearch.qmd), whose default is every parameter with a free η; covsearch, modelsearch and iivsearch refuse a file without one |
 | `[rank]` | what candidates are ranked on, and the improvement one must show over its parent |
 | `[strictness]` | the gate a fit must pass before its criterion is trusted — every key is optional and overlays the engine default |
 | `[run]` | threads, retries (perturbed starts per candidate on top of the exact one, as in Pharmpy), journal directory, resume |
@@ -232,10 +232,12 @@ silently.
 | `COVARIATE(..., cat2 / custom)` | ✗ | no second categorical form; a search cannot invent an `expr(...)` |
 | `COVARIATE(..., +)` | ✗ | relations are multiplicative factors on a top-level product |
 | `ALLOMETRY(c, ref)` | ✓ | `power(center = ref, fix = 0.75)` |
-| `IIV(p, EXP / ADD / PROP)` | ✓ | `ferx-core::edit` add / drop η |
+| `IIV(p, EXP / ADD / PROP)` | ✓ | `ferx-core::edit` add / drop η; [iivsearch](iivsearch.qmd) searches the `EXP` form only |
 | `IIV(p, LOG / RE_LOG)` | ✗ | the edit layer writes `exp`, `add` and `prop` forms only |
-| `IOV(...)`, `COVARIANCE(IOV, ...)` | ✗ | expressible as a model, not yet as a searchable edit (#1175 P4) |
+| `IOV(p, EXP)` | ✓ | `ferx-core::edit` add / drop κ — `P = TVP * exp(ETA_P + KAPPA_P)`, [iovsearch](iovsearch.qmd) |
+| `IOV(p, ADD / PROP / LOG / RE_LOG)` | ✗ | a κ is written inside the exponential only, the form `[iov]` estimates |
 | `COVARIANCE(IIV, ...)` | ✓ | `block_omega` |
+| `COVARIANCE(IOV, ...)` | ✓ | `block_kappa` |
 | `DIRECTEFFECT`, `EFFECTCOMP`, `INDIRECTEFFECT` | ✗ | no PD template family |
 | `METABOLITE` | ✗ | structsearch is out of scope for v1 |
 
@@ -248,8 +250,8 @@ The error lists every gap at once and ends with a link back to this table:
 ```
 [space] mfl: the search space asks for 2 features ferx cannot build a candidate for:
   - ELIMINATION(MM): only first-order elimination has an analytic `pk` template; ...
-  - IOV(...): inter-occasion variability is expressible in a model (`[iov]`) but not yet
-    as a searchable edit — `ferx-core::edit` has no add/drop-IOV operation (#1175 P4)
+  - IOV(..., ADD): `ferx-core::edit` writes a κ inside the exponential only
+    (`P = TVP * exp(ETA + KAPPA)`), which is the form `[iov]` estimates
 See the coverage table at https://ferx-nlme.github.io/ferx-core/tools/search.html#coverage
 ```
 

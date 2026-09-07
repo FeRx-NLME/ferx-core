@@ -13,7 +13,7 @@
 
 use super::mfl::{
     AbsorptionMode, CovariateEffect, CovariateOp, DepotMode, EliminationMode, Feature, Mfl, Mode,
-    Modes, PeripheralKind, TransitCounts, VariabilityEffect, VariabilityLevel,
+    Modes, PeripheralKind, TransitCounts, VariabilityEffect,
 };
 
 /// Where the coverage table lives, appended to every gap error.
@@ -254,22 +254,21 @@ fn check_feature(feature: &Feature, gaps: &mut Vec<Gap>) {
                 }
             }
         }
-        Feature::Iov { .. } => gap(
-            gaps,
-            "IOV(...)".into(),
-            "inter-occasion variability is expressible in a model (`[iov]`) but not yet as a \
-             searchable edit — `ferx-core::edit` has no add/drop-IOV operation (#1175 P4)",
-        ),
-        Feature::Covariance { level, .. } => {
-            if level.expand().contains(&VariabilityLevel::Iov) {
-                gap(
-                    gaps,
-                    "COVARIANCE(IOV, ...)".into(),
-                    "there is no searchable IOV edit, so no IOV covariance block either \
-                     (#1175 P4)",
-                );
+        Feature::Iov { effects, .. } => {
+            for e in effects.expand() {
+                if e != VariabilityEffect::Exp {
+                    gap(
+                        gaps,
+                        format!("IOV(..., {})", e.label()),
+                        "`ferx-core::edit` writes a κ inside the exponential only \
+                         (`P = TVP * exp(ETA + KAPPA)`), which is the form `[iov]` estimates",
+                    );
+                }
             }
         }
+        // `COVARIANCE(IIV, …)` is `block_omega`, `COVARIANCE(IOV, …)` is
+        // `block_kappa` (#1183); both levels are buildable.
+        Feature::Covariance { .. } => {}
     }
 }
 
