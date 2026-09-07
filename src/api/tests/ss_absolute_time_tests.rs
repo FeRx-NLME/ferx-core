@@ -313,6 +313,13 @@ fn a_time_reading_hazard_alone_does_not_warn() {
 /// user-facing diagnostic. Narrowing it needs the dataflow cut #1166 deferred, so it is
 /// accepted here and asserted, so that the cut — whenever it lands — is a deliberate change
 /// to a known behaviour rather than an accidental one.
+///
+/// **Filed as #1279, and this test is expected to go red when it lands.** That is its
+/// purpose, so the correct response then is to flip the assertion to `is_none()` — not to
+/// weaken or delete it, and not to conclude the fix broke something. Its sibling
+/// `a_time_reading_hazard_alone_does_not_warn` (the time read written inline in `hazard =`)
+/// must stay green throughout; together they are the straddle, and #1279 is the statement
+/// that the two spellings should agree.
 #[cfg(feature = "survival")]
 #[test]
 fn a_time_reading_intermediate_used_only_by_the_hazard_still_warns() {
