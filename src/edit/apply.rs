@@ -805,14 +805,16 @@ pub(crate) fn read_error_spec(text: &ModelText) -> Result<Option<ErrorSpecText>,
     let Some(stmt) = stmt else {
         return Err(unreadable("has no `DV ~ form(...)` statement"));
     };
-    let caps = ERROR_STMT_RE
-        .captures(&stmt)
-        .ok_or_else(|| unreadable(&format!("statement `{stmt}` is not `DV ~ form(...)`")))?;
+    // Before the shape regex, which a trailing modifier fails too — the
+    // specific message beats "is not `DV ~ form(...)`".
     if stmt.contains("weight") && stmt.contains('=') {
         return Err(unreadable(&format!(
             "statement `{stmt}` carries a `weight =` modifier"
         )));
     }
+    let caps = ERROR_STMT_RE
+        .captures(&stmt)
+        .ok_or_else(|| unreadable(&format!("statement `{stmt}` is not `DV ~ form(...)`")))?;
     let endpoint = caps[1].to_string();
     let form = ErrorForm::from_label(&caps[2])
         .ok_or_else(|| unreadable(&format!("form `{}` is not one this can read", &caps[2])))?;

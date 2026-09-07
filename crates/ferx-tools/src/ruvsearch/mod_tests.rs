@@ -782,6 +782,94 @@ fn cancellation_returns_partial_rows_and_the_parent() {
     assert_eq!(script.dirs().len(), 2);
 }
 
+/// Cancellation is honoured at every fit the search runs — the input, the
+/// proportional base, the CWRES screen and the refit — and each returns the
+/// rows so far, `cancelled`, and the input as the final model.
+#[test]
+fn cancellation_at_the_input_and_base_fits_returns_the_input() {
+    let options = RuvsearchOptions::default();
+    let mut script = Script::new(&[("input", 100.0)]);
+    script.cancel_after = Some(1);
+    let result = run(&script, space(&options), &options);
+    assert!(result.cancelled);
+    assert_eq!(result.final_id, "input");
+    assert_eq!(script.dirs(), vec!["input"]);
+
+    let additive = BASE
+        .replace("sigma PROP_ERR ~ 0.02 (sd)", "sigma ADD_ERR ~ 0.5 (sd)")
+        .replace("DV ~ proportional(PROP_ERR)", "DV ~ additive(ADD_ERR)");
+    let mut script = Script::new(&[("input", 100.0), ("base", 90.0)]);
+    script.cancel_after = Some(2);
+    let result = run(&script, space_from(&additive, &options, true), &options);
+    assert!(result.cancelled);
+    assert_eq!(result.base_id, "base");
+    assert_eq!(
+        result.final_id, "input",
+        "a cancelled base cannot be the answer"
+    );
+    assert_eq!(script.dirs(), vec!["input", "base"]);
+}
+
+#[test]
+fn cancellation_during_the_screen_and_the_refit_keeps_the_rows_so_far() {
+    let options = RuvsearchOptions {
+        cwres_prescreen: true,
+        skip: vec![Family::TimeVarying],
+        ..RuvsearchOptions::default()
+    };
+    let table = [
+        ("input", 100.0),
+        ("cwres-base-1", 50.0),
+        ("cwres-IIV_on_RUV-1", 45.0),
+        ("cwres-power-1", 30.0),
+        ("cwres-combined-1", 35.0),
+        ("power-1", 85.0),
+    ];
+    // During the screen: the screened rows are kept, nothing is refitted.
+    let mut script = Script::new(&table);
+    script.cancel_after = Some(2);
+    let result = run(&script, warfarin_space(&options), &options);
+    assert!(result.cancelled);
+    assert!(result.rows.iter().any(|r| r.screened));
+    assert!(!result.rows.iter().any(|r| r.candidate == "power-1"));
+    assert_eq!(result.final_id, "input");
+    // During the refit: the refit row is kept, and it is not selected.
+    let mut script = Script::new(&table);
+    script.cancel_after = Some(3);
+    let result = run(&script, warfarin_space(&options), &options);
+    assert!(result.cancelled);
+    let refit = result
+        .rows
+        .iter()
+        .find(|r| r.candidate == "power-1")
+        .expect("the refit row");
+    assert!(!refit.selected);
+    assert_eq!(result.final_id, "input");
+}
+
+#[test]
+fn labels_p_values_and_the_default_directory() {
+    assert_eq!(Family::IivOnRuv.label(), "IIV_on_RUV");
+    assert_eq!(Family::Power.label(), "power");
+    assert_eq!(Family::Combined.label(), "combined");
+    assert_eq!(Family::TimeVarying.label(), "time_varying");
+    assert_eq!(
+        default_dir(Path::new("runs/warfarin.ferxsearch")),
+        Path::new("runs/warfarin-ruvsearch")
+    );
+    let options = RuvsearchOptions::default();
+    let script = Script::new(&[("input", 100.0), ("power-1", 80.0)]);
+    let result = run(&script, space(&options), &options);
+    let power = result
+        .rows
+        .iter()
+        .find(|r| r.candidate == "power-1")
+        .unwrap();
+    assert!(power.p_value() < 0.001, "{}", power.p_value());
+    let input = result.rows.iter().find(|r| r.candidate == "input").unwrap();
+    assert!(input.p_value().is_nan(), "no test on the input row");
+}
+
 #[test]
 fn a_base_that_fails_the_gate_is_an_error() {
     let options = RuvsearchOptions::default();

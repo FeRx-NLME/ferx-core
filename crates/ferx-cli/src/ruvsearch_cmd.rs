@@ -212,6 +212,57 @@ mod tests {
         list.iter().map(|s| s.to_string()).collect()
     }
 
+    /// The command end to end on the warfarin model, evaluating rather than
+    /// fitting (`maxiter = 0`), then again `--quiet --resume` so the journal
+    /// is reused and the progress printer's early return is taken.
+    #[test]
+    fn run_searches_writes_the_files_and_resumes_quietly() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/warfarin.csv");
+        std::fs::write(
+            dir.path().join("base.ferx"),
+            "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
+             theta TVKA(1.5, 0.01, 50.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  \
+             omega ETA_KA ~ 0.30\n  sigma PROP_ERR ~ 0.02 (sd)\n\n[individual_parameters]\n  \
+             CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA * \
+             exp(ETA_KA)\n\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, \
+             ka=KA)\n\n[error_model]\n  DV ~ proportional(PROP_ERR)\n\n[fit_options]\n  \
+             method     = focei\n  maxiter    = 0\n  covariance = false\n  checkpoint = \
+             false\n",
+        )
+        .unwrap();
+        let config = dir.path().join("search.ferxsearch");
+        std::fs::write(
+            &config,
+            format!(
+                "base = \"base.ferx\"\ndata = \"{}\"\n\n[ruvsearch]\nmax_iter = 1\nskip = \
+                 [\"time_varying\", \"combined\"]\n\n[strictness]\nrequire_converged = \
+                 false\nreject_init_stall = false\nreject_on_boundary = false\n\n[run]\nretries \
+                 = 0\nthreads = 2\n",
+                data.display()
+            ),
+        )
+        .unwrap();
+        let out = dir.path().join("run");
+        let common = [
+            "ferx".to_string(),
+            "ruvsearch".to_string(),
+            config.to_string_lossy().into_owned(),
+            "--directory".to_string(),
+            out.to_string_lossy().into_owned(),
+            "--threads".to_string(),
+            "2".to_string(),
+        ];
+        assert_eq!(run(&common), 0);
+        for file in ["steps.csv", "final.ferx", "final-fit.yaml"] {
+            assert!(out.join(file).is_file(), "{file} missing");
+        }
+        let mut again = common.to_vec();
+        again.push("--quiet".to_string());
+        again.push("--resume".to_string());
+        assert_eq!(run(&again), 0);
+    }
+
     #[test]
     fn run_rejects_two_files_and_a_missing_file_and_prints_help() {
         assert_eq!(

@@ -1422,14 +1422,92 @@ fn set_error_model_read_refuses_what_it_cannot_represent() {
             "  block_sigma (PROP_ERR, ADD_ERR) = [0.02, 0.0, 0.1]",
             "block_sigma",
         ),
+        (
+            "  DV ~ proportional(PROP_ERR)",
+            "  DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = ETA_CL\n  iiv_on_ruv = ETA_V",
+            "more than one `iiv_on_ruv =` line",
+        ),
+        (
+            "  DV ~ proportional(PROP_ERR)",
+            "  iiv_on_ruv = ETA_CL",
+            "has no `DV ~ form(...)` statement",
+        ),
+        (
+            "  DV ~ proportional(PROP_ERR)",
+            "  DV ~ additive(PROP_ERR) weight = WT",
+            "carries a `weight =` modifier",
+        ),
+        (
+            "  DV ~ proportional(PROP_ERR)",
+            "  DV ~ power(PROP_ERR, TVKA + 1.0)",
+            "is an expression, not a theta name",
+        ),
+        (
+            "  DV ~ proportional(PROP_ERR)",
+            "  DV ~ combined(PROP_ERR)",
+            "has 1 argument(s) where 2 σ are expected",
+        ),
+        (
+            "  DV ~ proportional(PROP_ERR)",
+            "  DV ~ combined(PROP_ERR, PROP_ERR * (if (TAD < 2.0) TVKA else 1.0))",
+            "on some σ but not the first",
+        ),
+        (
+            "  DV ~ proportional(PROP_ERR)",
+            "  DV ~ combined(PROP_ERR * (if (TAD < 2.0) TVKA else 1.0), PROP_ERR * (if (TAD < \
+             3.0) TVKA else 1.0))",
+            "different time-varying magnitudes",
+        ),
+        (
+            "  DV ~ proportional(PROP_ERR)",
+            "  DV ~ combined(PROP_ERR * (if (TAD < 2.0) TVKA else 1.0), PROP_ERR)",
+            "on some σ but not all",
+        ),
     ];
     for (from, to, expect) in cases {
         let text = ModelText::parse(&BASE.replace(from, to)).unwrap();
         let err = ErrorSpecText::read(&text).unwrap_err();
         assert!(err.contains(expect), "for `{to}` got: {err}");
     }
+    // An `iiv_on_ruv` η inside a `block_omega` cannot be re-declared on its own.
+    let blocked = BASE
+        .replace(
+            "  omega ETA_CL ~ 0.09\n  omega ETA_V  ~ 0.04\n",
+            "  block_omega (ETA_CL, ETA_V) = [0.09, 0.01, 0.04]\n",
+        )
+        .replace(
+            "  DV ~ proportional(PROP_ERR)",
+            "  DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = ETA_CL",
+        );
+    let err = ErrorSpecText::read(&ModelText::parse(&blocked).unwrap()).unwrap_err();
+    assert!(err.contains("declared in a `block_omega`"), "{err}");
     let no_block = ModelText::parse("[parameters]\n  theta A(1.0)\n").unwrap();
     assert_eq!(ErrorSpecText::read(&no_block).unwrap(), None);
+}
+
+/// A θ bound that cannot be written as a `.ferx` number is refused before
+/// anything is edited: `NaN` on either side, or one finite and one infinite
+/// bound (a declaration takes both or neither).
+#[test]
+fn set_error_model_refuses_unwritable_exponent_bounds() {
+    let power = |lower: f64, upper: f64| {
+        ModelEdit::SetErrorModel(
+            ErrorSpecText::new("DV", ErrorForm::Power, vec![sd("PROP_ERR", 0.02)])
+                .with_exponent(ThetaDecl::new("RUV_POW", 1.0, lower, upper)),
+        )
+    };
+    let err = base().apply(power(f64::NAN, 10.0)).unwrap_err();
+    assert!(err.contains("lower bound is NaN"), "{err}");
+    let err = base().apply(power(0.01, f64::NAN)).unwrap_err();
+    assert!(err.contains("upper bound is NaN"), "{err}");
+    let err = base().apply(power(0.01, f64::INFINITY)).unwrap_err();
+    assert!(err.contains("one finite and one infinite bound"), "{err}");
+    // Both infinite is "no bounds" and writes `theta RUV_POW(1.0)`.
+    let mut text = base();
+    text.apply(power(f64::NEG_INFINITY, f64::INFINITY)).unwrap();
+    assert!(text
+        .block_lines("parameters")
+        .contains(&"theta RUV_POW(1.0)".to_string()));
 }
 
 #[test]

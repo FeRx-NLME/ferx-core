@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use ferx_core::edit::ModelText;
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::{fit, RuvMagnitude};
-use ferx_tools::ruvsearch::{run_ruvsearch, RuvFeature, RuvsearchRun};
+use ferx_tools::ruvsearch::{render_summary, run_ruvsearch, RuvFeature, RuvsearchRun};
 use ferx_tools::search::SearchConfig;
 
 const DATA: &str = "../../data/warfarin.csv";
@@ -287,6 +287,11 @@ fn an_additive_input_is_refitted_as_proportional_first() {
         .notes
         .iter()
         .any(|n| n.contains("did not beat the input model")));
+    // What `ferx ruvsearch` prints: the base line, the iteration table, the
+    // final model.
+    let summary = render_summary(&result);
+    assert!(summary.contains("Proportional base: OFV"), "{summary}");
+    assert!(summary.contains("Final model: input"), "{summary}");
 }
 
 #[test]
@@ -322,6 +327,10 @@ fn the_cwres_prescreen_evaluates_every_screening_model_on_the_residuals() {
         .find(|r| r.candidate == "cwres-base-1")
         .unwrap();
     assert!(base_row.feature.is_none());
+    // The summary renders the screen as its own table, the base first.
+    let summary = render_summary(&result);
+    assert!(summary.contains("CWRES pre-screen (base OFV"), "{summary}");
+    assert!(summary.contains("cwres base"), "{summary}");
     // The screening models are compilable models on the result.
     for id in [
         "cwres-base-1",
