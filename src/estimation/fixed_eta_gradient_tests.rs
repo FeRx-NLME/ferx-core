@@ -784,3 +784,32 @@ fn obs_nll_subject_grad_theta_dependent_magnitude_matches_fd() {
     assert!(model.has_theta_dependent_ruv_magnitude());
     check_saem_mstep_matches_fd(&model, &[1.0, 10.0, 0.30], &[0.10, 0.50]);
 }
+
+/// #1182: the `power(σ, P)` exponent is a θ that moves the residual variance
+/// directly; the M-step θ gradient differences the whole magnitude-aware
+/// data term, and the σ gradient reads `dvar_dlogsigma_scaled`'s exponent arm.
+#[test]
+fn obs_nll_subject_grad_power_exponent_matches_fd() {
+    let model = crate::parser::model_parser::parse_model_string(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  theta RUV_POW(1.3, 0.01, 10.0)
+  omega ETA_CL ~ 0.04
+  sigma PROP_ERR ~ 0.10 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ power(PROP_ERR, RUV_POW)
+[covariates]
+  WPSE continuous
+",
+    )
+    .expect("power model parses");
+    assert!(model.has_ruv_exponent());
+    check_saem_mstep_matches_fd(&model, &[1.0, 10.0, 1.3], &[0.10]);
+}

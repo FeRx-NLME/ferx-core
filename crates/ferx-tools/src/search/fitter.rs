@@ -22,6 +22,22 @@ pub(crate) trait StepFitter {
     /// `step_dir` is the directory name a cached run would journal this step
     /// under (`base`, `forward-1`, `layer-2`, …).
     fn fit_step(&self, step_dir: &str, candidates: &[Candidate]) -> Result<RunReport, String>;
+
+    /// [`fit_step`](Self::fit_step) against a dataset other than the search's
+    /// own — ruvsearch's CWRES pre-screen (#1182) fits its screening models to
+    /// the parent's conditional weighted residuals. A fitter that serves one
+    /// dataset only declines with an error rather than fitting the wrong data.
+    fn fit_step_on(
+        &self,
+        step_dir: &str,
+        _candidates: &[Candidate],
+        _data: &Population,
+    ) -> Result<RunReport, String> {
+        Err(format!(
+            "{step_dir}: this fitter fits the search's dataset only; a step on another dataset \
+             is not supported"
+        ))
+    }
 }
 
 /// The production fitter: a [`Runner`] per step.
@@ -35,6 +51,15 @@ pub(crate) struct RunnerFitter<'a> {
 
 impl StepFitter for RunnerFitter<'_> {
     fn fit_step(&self, step_dir: &str, candidates: &[Candidate]) -> Result<RunReport, String> {
+        self.fit_step_on(step_dir, candidates, self.data)
+    }
+
+    fn fit_step_on(
+        &self,
+        step_dir: &str,
+        candidates: &[Candidate],
+        data: &Population,
+    ) -> Result<RunReport, String> {
         let mut runner = Runner::new().threads(self.threads);
         if let Some(dir) = &self.dir {
             runner = runner.cache_dir(dir.join(step_dir));
@@ -42,6 +67,6 @@ impl StepFitter for RunnerFitter<'_> {
         if let Some(flag) = &self.cancel {
             runner = runner.cancel(flag.clone());
         }
-        runner.run(candidates, self.data, &self.options)
+        runner.run(candidates, data, &self.options)
     }
 }

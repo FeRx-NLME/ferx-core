@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use ferx_core::edit::ModelEdit;
 
 use super::{ModelsearchResult, TransitCount};
+use crate::search::{number, opt_number};
 
 pub fn models_path(dir: &Path) -> PathBuf {
     dir.join("models.csv")
@@ -52,18 +53,6 @@ pub const MODEL_COLUMNS: [&str; 21] = [
     "continued",
     "reused",
 ];
-
-fn number(value: f64) -> String {
-    if value.is_finite() {
-        format!("{value:.6}")
-    } else {
-        String::new()
-    }
-}
-
-fn opt_number(value: Option<f64>) -> String {
-    number(value.unwrap_or(f64::NAN))
-}
 
 /// `TRANSITS` as the table prints it: `0`, `3` or `N`.
 fn transits(t: Option<TransitCount>) -> String {

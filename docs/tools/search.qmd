@@ -58,7 +58,7 @@ cache_dir = ".ferx-search"
 |---|---|
 | `base` | the base model. Relative paths are taken against the `.ferxsearch` file's own directory, so the pair moves together |
 | `data` | the dataset; omit it to use the model's `[data]` block |
-| `[space] mfl` | the search space, in MFL (below). Parsed and coverage-checked when the file is loaded |
+| `[space] mfl` | the search space, in MFL (below). Parsed and coverage-checked when the file is loaded. Omitted for [ruvsearch](ruvsearch.qmd), whose candidates are the residual-error forms; covsearch and modelsearch refuse a file without one |
 | `[rank]` | what candidates are ranked on, and the improvement one must show over its parent |
 | `[strictness]` | the gate a fit must pass before its criterion is trusted — every key is optional and overlays the engine default |
 | `[run]` | threads, retries (perturbed starts per candidate on top of the exact one, as in Pharmpy), journal directory, resume |

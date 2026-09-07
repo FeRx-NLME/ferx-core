@@ -139,9 +139,11 @@ pub(crate) fn check_covariates(model: &CompiledModel, population: &Population) -
         String::new()
     } else {
         format!(
-            " Note: {} {} a solver-injected built-in only inside `[odes]`; anywhere else \
-             (including `[scaling]`) the name is an ordinary covariate and must be a data \
-             column. Compute it as an `[odes]` intermediate and read that state instead.",
+            " Note: {} {} a solver-injected built-in only inside `[odes]` (and `TAD` is \
+             also the engine-computed time after dose inside an `[error_model]` \
+             magnitude or exponent expression); anywhere else (including `[scaling]`) \
+             the name is an ordinary covariate and must be a data column. Compute it as \
+             an `[odes]` intermediate and read that state instead.",
             builtin_shaped.join(", "),
             if builtin_shaped.len() == 1 {
                 "is"
@@ -395,6 +397,7 @@ pub(crate) fn check_residual_magnitude(
         return Vec::new();
     }
     let theta = &model.default_params.theta;
+    let n_sigma = model.default_params.sigma.values.len();
     for subj in &population.subjects {
         let Some(mult) = model.ruv_obs_mult(subj, theta) else {
             continue;
@@ -405,6 +408,26 @@ pub(crate) fn check_residual_magnitude(
                     continue;
                 }
                 let time = subj.obs_times.get(j).copied().unwrap_or(f64::NAN);
+                // The upper half of a row is the `power(...)` exponent per slot
+                // (#1182, `RuvMagnitude::eval_obs`); a non-positive exponent is
+                // a different mistake from a vanishing multiplier.
+                if n_sigma > 0 && row.len() == 2 * n_sigma && k >= n_sigma {
+                    return vec![Diagnostic::error(
+                        "E_RUV_MAGNITUDE_NONPOSITIVE",
+                        format!(
+                            "[error_model] the power exponent for sigma slot {} evaluates to {m} \
+                             at subject `{}`, TIME {time} — it must be strictly positive and \
+                             finite. `power(SIGMA, P)` raises the prediction to `P`; a zero or \
+                             negative exponent turns the residual SD into a constant or a \
+                             reciprocal of the prediction, which is not the model the form \
+                             declares. Start `P` above zero (Pharmpy bounds it below at 0.01), \
+                             or check the covariates its expression references.",
+                            k - n_sigma,
+                            subj.id
+                        ),
+                    )
+                    .with_block("error_model")];
+                }
                 return vec![Diagnostic::error(
                     "E_RUV_MAGNITUDE_NONPOSITIVE",
                     format!(

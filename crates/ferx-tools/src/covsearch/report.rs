@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use ferx_core::edit::ModelEdit;
 
 use super::CovsearchResult;
+use crate::search::{number, opt_number};
 
 pub fn steps_path(dir: &Path) -> PathBuf {
     dir.join("steps.csv")
@@ -42,18 +43,6 @@ pub const STEP_COLUMNS: [&str; 17] = [
     "passed",
     "failures",
 ];
-
-fn number(value: f64) -> String {
-    if value.is_finite() {
-        format!("{value:.6}")
-    } else {
-        String::new()
-    }
-}
-
-fn opt_number(value: Option<f64>) -> String {
-    number(value.unwrap_or(f64::NAN))
-}
 
 /// Write `steps.csv` and `final.ferx` into `dir`.
 ///

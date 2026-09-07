@@ -5726,3 +5726,88 @@ fn magnitude_with_correlated_residual_still_declines_outer_gate() {
         "block_sigma + custom magnitude must still decline the analytic outer gradient"
     );
 }
+
+// ── #1182: the `power(σ, P)` residual form ──────────────────────────────
+//
+// The exponent rides the magnitude channel, so the three FD parity checks the
+// magnitude families already have are the ones that pin it: the FOCEI outer
+// θ/σ gradient, the packed gradient, and the FOCE (Sheiner–Beal) packed
+// gradient. `RUV_POW = 1.3` keeps the exponent away from the proportional
+// value, where the new arms would be unreachable.
+
+const WARFARIN_RUV_POWER: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta RUV_POW(1.3, 0.01, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ power(PROP_ERR, RUV_POW)
+"#;
+
+#[test]
+fn power_exponent_outer_gradient_matches_fd() {
+    let model = parse_model_string(WARFARIN_RUV_POWER).expect("parse");
+    assert!(model.has_ruv_exponent());
+    let theta = vec![0.22, 11.0, 1.4, 1.3];
+    let times = [0.5, 1.0, 2.0, 4.0, 8.0, 24.0, 48.0];
+    let subject = subject_with_obs(&model, &theta, &times);
+    check_magnitude_outer_gradient_matches_fd(&model, &theta, &subject);
+}
+
+/// The exponent below one — the arm where `|f|^{p−1}` grows as `f → 0` — on
+/// the same fixture.
+#[test]
+fn power_exponent_below_one_outer_gradient_matches_fd() {
+    let model = parse_model_string(&WARFARIN_RUV_POWER.replace("RUV_POW(1.3,", "RUV_POW(0.7,"))
+        .expect("parse");
+    let theta = vec![0.22, 11.0, 1.4, 0.7];
+    let times = [0.5, 1.0, 2.0, 4.0, 8.0, 24.0, 48.0];
+    let subject = subject_with_obs(&model, &theta, &times);
+    check_magnitude_outer_gradient_matches_fd(&model, &theta, &subject);
+}
+
+#[test]
+fn power_exponent_foce_packed_matches_fd() {
+    let model = parse_model_string(WARFARIN_RUV_POWER).expect("parse");
+    let theta = vec![0.22, 11.0, 1.4, 1.3];
+    let times = [0.5, 1.0, 2.0, 4.0, 8.0, 24.0, 48.0];
+    let subject = subject_with_obs(&model, &theta, &times);
+    check_magnitude_foce_packed_matches_fd(&model, &theta, &subject);
+}
+
+/// A time-varying multiplier on `TAD` (the ruvsearch candidate) composed with
+/// the exponent: both direct-θ channels live on one slot.
+#[test]
+fn power_exponent_with_tad_multiplier_outer_gradient_matches_fd() {
+    let model = parse_model_string(
+        &WARFARIN_RUV_POWER
+            .replace(
+                "  theta RUV_POW(1.3, 0.01, 10.0)\n",
+                "  theta RUV_POW(1.3, 0.01, 10.0)\n  theta RUV_TV(1.6, 0.01, 10.0)\n",
+            )
+            .replace(
+                "DV ~ power(PROP_ERR, RUV_POW)",
+                "DV ~ power(PROP_ERR * (if (TAD < 3.0) RUV_TV else 1.0), RUV_POW)",
+            ),
+    )
+    .expect("parse");
+    let theta = vec![0.22, 11.0, 1.4, 1.3, 1.6];
+    let times = [0.5, 1.0, 2.0, 4.0, 8.0, 24.0, 48.0];
+    let subject = subject_with_obs(&model, &theta, &times);
+    // The cutoff straddles the observations: three early, four late.
+    let early = (0..7).filter(|&j| subject.time_after_dose(j) < 3.0).count();
+    assert_eq!(early, 3);
+    check_magnitude_outer_gradient_matches_fd(&model, &theta, &subject);
+    check_magnitude_foce_packed_matches_fd(&model, &theta, &subject);
+}

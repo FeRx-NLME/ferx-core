@@ -155,6 +155,10 @@ struct Section {
 impl ModelsearchOptions {
     /// Read `[modelsearch]` and `[rank]` off a loaded file.
     pub fn from_config(config: &SearchConfig) -> Result<Self, String> {
+        config.require_space(
+            "modelsearch",
+            "ABSORPTION / PERIPHERALS / TRANSITS / LAGTIME statements",
+        )?;
         let section = match config.tools.get("modelsearch") {
             Some(table) => table
                 .clone()
@@ -1085,14 +1089,10 @@ fn combinations(funcs: &[FeatureKey], base: &Structure) -> Vec<Vec<FeatureKey>> 
     out
 }
 
-/// Where a search run's files go by default: `<config stem>-modelsearch`
-/// next to the config file.
+/// Where a search run's files go by default: `<config stem>-modelsearch` next
+/// to the config file.
 pub fn default_dir(config_path: &Path) -> PathBuf {
-    let stem = config_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("search");
-    config_path.with_file_name(format!("{stem}-modelsearch"))
+    crate::search::default_dir(config_path, "modelsearch")
 }
 
 #[cfg(test)]

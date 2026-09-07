@@ -2908,3 +2908,67 @@ fn model_aware_warnings_keep_the_method_level_ones() {
     assert_eq!(base.len(), 1, "got: {base:?}");
     assert!(base[0].contains("n_convergence"), "got: {}", base[0]);
 }
+
+/// `FitOptions::non_interaction_stage` is the one `iiv_on_ruv` predicate
+/// `fit()` and `ruvsearch` share (#1182). It walks the whole chain — `method`
+/// is the *last* stage of a chained fit, so reading it alone lets a
+/// `[foce, focei]` chain propose a candidate `fit()` then refuses at its
+/// first stage (review of #1273).
+#[test]
+fn non_interaction_stage_walks_the_whole_method_chain() {
+    let single = |method: EstimationMethod, interaction: bool| FitOptions {
+        method,
+        interaction,
+        ..Default::default()
+    };
+    assert_eq!(
+        single(EstimationMethod::Foce, false).non_interaction_stage(),
+        Some(EstimationMethod::Foce)
+    );
+    assert_eq!(
+        single(EstimationMethod::FoceI, true).non_interaction_stage(),
+        None
+    );
+    assert_eq!(
+        single(EstimationMethod::FoceGn, false).non_interaction_stage(),
+        Some(EstimationMethod::FoceGn)
+    );
+    assert_eq!(
+        single(EstimationMethod::FoceGn, true).non_interaction_stage(),
+        None
+    );
+    assert_eq!(
+        single(EstimationMethod::FoceGnHybrid, false).non_interaction_stage(),
+        Some(EstimationMethod::FoceGnHybrid)
+    );
+    for m in [
+        EstimationMethod::Laplace,
+        EstimationMethod::Saem,
+        EstimationMethod::Imp,
+        EstimationMethod::Impmap,
+    ] {
+        assert_eq!(single(m, false).non_interaction_stage(), None, "{m:?}");
+    }
+    // A chain: the parser leaves `method` at the last stage, so the predicate
+    // must not read it alone.
+    let chain = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        methods: vec![EstimationMethod::Foce, EstimationMethod::FoceI],
+        ..Default::default()
+    };
+    assert_eq!(chain.non_interaction_stage(), Some(EstimationMethod::Foce));
+    let chain = FitOptions {
+        method: EstimationMethod::Saem,
+        methods: vec![EstimationMethod::Foce, EstimationMethod::Saem],
+        ..Default::default()
+    };
+    assert_eq!(chain.non_interaction_stage(), Some(EstimationMethod::Foce));
+    let chain = FitOptions {
+        method: EstimationMethod::Imp,
+        interaction: true,
+        methods: vec![EstimationMethod::FoceI, EstimationMethod::Imp],
+        ..Default::default()
+    };
+    assert_eq!(chain.non_interaction_stage(), None);
+}

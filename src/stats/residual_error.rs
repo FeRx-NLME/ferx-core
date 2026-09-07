@@ -3,6 +3,60 @@ use nalgebra::DMatrix;
 
 const MIN_VARIANCE: f64 = 1e-12;
 
+/// The `power(...)` exponent of sigma slot `slot` carried by a magnitude row
+/// (#1182), or `None` when the row carries none. An exponent of exactly `1`
+/// *is* returned: it is the proportional loading, and the value functions take
+/// the legacy arithmetic for it bit for bit (`scaled_loadings`), but the
+/// direct-θ derivative ([`magnitude_dvar_dtheta`]) still owes `∂R/∂p` there —
+/// a search starts every power candidate at `p = 1`, and a gradient that read
+/// `0` on the exponent axis at that point would never move it.
+///
+/// The layout is [`crate::types::RuvMagnitude::eval_obs`]'s: a row of length
+/// `2·n_sigma` holds the multipliers in `[0, n_sigma)` and the exponents in
+/// `[n_sigma, 2·n_sigma)`; any shorter row is multipliers only. `n_sigma` is
+/// the flat global sigma count, which is what every caller passes as
+/// `sigma.len()`.
+#[inline]
+pub(crate) fn slot_exponent(mult: &[f64], n_sigma: usize, slot: usize) -> Option<f64> {
+    if n_sigma == 0 || mult.len() != 2 * n_sigma {
+        return None;
+    }
+    mult.get(n_sigma + slot).copied()
+}
+
+/// The proportional loading raised to a `power(...)` exponent (#1182):
+/// `g(f) = sign(f)·|f|^p` with its first two `f`-derivatives
+/// `g' = p·|f|^(p−1)` and `g'' = p(p−1)·sign(f)·|f|^(p−2)`. `p = 1` gives
+/// `(f, 1, 0)`, the proportional loading.
+///
+/// At `f = 0` the loading is `0` and the variance sits on the `MIN_VARIANCE`
+/// floor, where every consumer treats it as locally constant — so the
+/// derivatives are reported as `0` there (`1` for the slope when `p = 1`,
+/// the proportional value) rather than the `∞` a `p < 1` power would give,
+/// which would otherwise turn `0·∞` into `NaN` in the dense-`R` assembly.
+#[inline]
+pub(crate) fn power_loading(f: f64, p: f64) -> (f64, f64, f64) {
+    let a = f.abs();
+    if a == 0.0 {
+        return (0.0, if p == 1.0 { 1.0 } else { 0.0 }, 0.0);
+    }
+    let s = if f < 0.0 { -1.0 } else { 1.0 };
+    let ap1 = a.powf(p - 1.0);
+    (s * ap1 * a, p * ap1, p * (p - 1.0) * s * ap1 / a)
+}
+
+/// One sigma slot's magnitude-scaled loading coefficient and its first two
+/// `f`-derivatives: the variance contribution is `(c·σ)²`, with `c1 = ∂c/∂f`
+/// and `c2 = ∂²c/∂f²`. `c2` is `0` for every loading except a `power(...)`
+/// slot's (#1182).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ScaledLoading {
+    pub idx: usize,
+    pub c: f64,
+    pub c1: f64,
+    pub c2: f64,
+}
+
 /// Compute residual variance for a single observation
 /// sigma_values: `[sigma1]` for additive/proportional, `[sigma1, sigma2]` for combined
 pub fn residual_variance(error_model: ErrorModel, f_pred: f64, sigma_values: &[f64]) -> f64 {
@@ -210,28 +264,21 @@ impl ErrorSpec {
         correlations: &[ResidualCorrelation],
         mult: &[f64],
     ) -> f64 {
-        let loadings = self.sigma_loadings(cmt, f_pred, sigma.len());
+        let loadings = self.scaled_loadings(cmt, f_pred, sigma.len(), mult);
         if loadings.is_empty() {
             return f64::NAN;
         }
-        let m = |idx: usize| mult.get(idx).copied().unwrap_or(1.0);
         let mut v = 0.0;
-        for &(idx, coeff) in &loadings {
-            let Some(&s) = sigma.get(idx) else {
+        for l in &loadings {
+            let Some(&s) = sigma.get(l.idx) else {
                 return f64::NAN;
             };
-            let c = coeff * m(idx);
+            let c = l.c;
             v += c * c * s * s;
         }
         for corr in correlations {
-            let ci = loadings
-                .iter()
-                .find(|(idx, _)| *idx == corr.sigma_i)
-                .map(|(_, coeff)| *coeff * m(corr.sigma_i));
-            let cj = loadings
-                .iter()
-                .find(|(idx, _)| *idx == corr.sigma_j)
-                .map(|(_, coeff)| *coeff * m(corr.sigma_j));
+            let ci = loadings.iter().find(|l| l.idx == corr.sigma_i).map(|l| l.c);
+            let cj = loadings.iter().find(|l| l.idx == corr.sigma_j).map(|l| l.c);
             let (Some(ci), Some(cj)) = (ci, cj) else {
                 continue;
             };
@@ -241,6 +288,73 @@ impl ErrorSpec {
             v += 2.0 * ci * cj * corr.rho * si * sj;
         }
         v.max(MIN_VARIANCE)
+    }
+
+    /// The magnitude-scaled loading of every sigma slot this observation loads
+    /// on, with its `f`-slope and curvature: `c = coeff·m` (`c1 = slope·m`,
+    /// `c2 = 0`) for a plain slot — the exact association every `_scaled`
+    /// function used before #1182, so a model without a power form is
+    /// unchanged bit for bit — and `(m·g, m·g', m·g'')` from
+    /// [`power_loading`] for a proportional-type slot whose row carries an
+    /// exponent ([`slot_exponent`]). Slot presence is
+    /// [`sigma_loadings`](Self::sigma_loadings)'s.
+    pub(crate) fn scaled_loadings(
+        &self,
+        cmt: usize,
+        f: f64,
+        n_sigma: usize,
+        mult: &[f64],
+    ) -> Vec<ScaledLoading> {
+        let loadings = self.sigma_loadings(cmt, f, n_sigma);
+        let slopes = self.sigma_loading_slopes(cmt, n_sigma);
+        loadings
+            .into_iter()
+            .map(|(idx, coeff)| {
+                let m = mult.get(idx).copied().unwrap_or(1.0);
+                let slope = slopes
+                    .iter()
+                    .find(|(i, _)| *i == idx)
+                    .map(|(_, s)| *s)
+                    .unwrap_or(0.0);
+                // Only a proportional-type loading (slope ≠ 0) is raised to a
+                // power; an additive slot's constant loading ignores its
+                // exponent entry.
+                match (slope != 0.0)
+                    .then(|| slot_exponent(mult, n_sigma, idx))
+                    .flatten()
+                {
+                    Some(p) if p != 1.0 => {
+                        let (g, g1, g2) = power_loading(f, p);
+                        ScaledLoading {
+                            idx,
+                            c: m * g,
+                            c1: m * g1,
+                            c2: m * g2,
+                        }
+                    }
+                    _ => ScaledLoading {
+                        idx,
+                        c: coeff * m,
+                        c1: slope * m,
+                        c2: 0.0,
+                    },
+                }
+            })
+            .collect()
+    }
+
+    /// The `power(...)` exponent of this observation's proportional slot, when
+    /// its magnitude row carries one other than `1` (#1182).
+    fn prop_slot_exponent(&self, cmt: usize, n_sigma: usize, mult: &[f64]) -> Option<f64> {
+        let slot = self.prop_sigma_slot(cmt)?;
+        // `prop_sigma_slot` is `Some(0)` for an additive `Single` too; only a
+        // slot whose loading actually slopes in `f` is raised to a power.
+        let slopes = self.sigma_loading_slopes(cmt, n_sigma);
+        let slopes_in_f = slopes.iter().any(|&(i, s)| i == slot && s != 0.0);
+        if !slopes_in_f {
+            return None;
+        }
+        slot_exponent(mult, n_sigma, slot)
     }
 
     /// `SigmaType` for each entry of the flat global sigma vector, as a `Vec`
@@ -376,6 +490,22 @@ impl ErrorSpec {
         if self.variance_at_scaled(cmt, f, sigma, &[], mult) <= MIN_VARIANCE {
             return 0.0;
         }
+        // A `power(...)` slot (#1182): `R = Σ (c·σ)²` with `c = m·sign(f)|f|^p`,
+        // so `∂R/∂f = Σ 2·c·c'·σ²` — the additive slot has `c' = 0` and drops
+        // out, exactly as it does from `dvar_df_raw`.
+        if self
+            .prop_slot_exponent(cmt, sigma.len(), mult)
+            .is_some_and(|p| p != 1.0)
+        {
+            return self
+                .scaled_loadings(cmt, f, sigma.len(), mult)
+                .iter()
+                .map(|l| {
+                    let sg = sigma.get(l.idx).copied().unwrap_or(0.0);
+                    2.0 * l.c * l.c1 * sg * sg
+                })
+                .sum();
+        }
         self.dvar_df_raw(cmt, f, sigma) * m * m
     }
 
@@ -457,6 +587,21 @@ impl ErrorSpec {
         if self.variance_at_scaled(cmt, f, sigma, &[], mult) <= MIN_VARIANCE {
             return 0.0;
         }
+        // A `power(...)` slot (#1182): `∂²(c²σ²)/∂f² = 2·(c'² + c·c'')·σ²`; the
+        // curvature `c''` is what the affine loadings never had.
+        if self
+            .prop_slot_exponent(cmt, sigma.len(), mult)
+            .is_some_and(|p| p != 1.0)
+        {
+            return self
+                .scaled_loadings(cmt, f, sigma.len(), mult)
+                .iter()
+                .map(|l| {
+                    let sg = sigma.get(l.idx).copied().unwrap_or(0.0);
+                    2.0 * (l.c1 * l.c1 + l.c * l.c2) * sg * sg
+                })
+                .sum();
+        }
         self.d2var_df2_raw(cmt, sigma) * m * m
     }
 
@@ -511,6 +656,22 @@ impl ErrorSpec {
         mult: &[f64],
     ) -> f64 {
         let m = mult.get(k).copied().unwrap_or(1.0);
+        // A `power(...)` slot (#1182): its contribution is `(c·σ_k)²` with
+        // `c = m·|f|^p`, so `∂/∂log σ_k = 2·c²·σ_k²` — the unscaled `2·σ_k²·f²`
+        // has the wrong power of `f`.
+        if self.prop_sigma_slot(cmt) == Some(k)
+            && self
+                .prop_slot_exponent(cmt, sigma.len(), mult)
+                .is_some_and(|p| p != 1.0)
+        {
+            let sk = sigma.get(k).copied().unwrap_or(0.0);
+            return self
+                .scaled_loadings(cmt, f, sigma.len(), mult)
+                .iter()
+                .find(|l| l.idx == k)
+                .map(|l| 2.0 * l.c * l.c * sk * sk)
+                .unwrap_or(0.0);
+        }
         self.dvar_dlogsigma(cmt, k, f, sigma) * m * m
     }
 
@@ -1017,11 +1178,10 @@ pub fn compute_r_matrix_with_correlations_scaled(
     let scale_loadings = |j: usize| -> Vec<(usize, f64)> {
         let f = ipreds[j];
         let cmt = obs_cmts.get(j).copied().unwrap_or(0);
-        let m = row(j);
         error_spec
-            .sigma_loadings(cmt, f, sigma_values.len())
+            .scaled_loadings(cmt, f, sigma_values.len(), row(j))
             .into_iter()
-            .map(|(idx, coeff)| (idx, coeff * m.get(idx).copied().unwrap_or(1.0)))
+            .map(|l| (l.idx, l.c))
             .collect()
     };
     let loadings: Vec<Vec<(usize, f64)>> = (0..n).map(scale_loadings).collect();
@@ -1124,30 +1284,24 @@ pub fn compute_dr_df_matrices(
             .map(|v| v.as_slice())
             .unwrap_or(&empty)
     };
-    let m_at = |j: usize, idx: usize| -> f64 { mrow(j).get(idx).copied().unwrap_or(1.0) };
     let cmt_at = |j: usize| -> usize { obs_cmts.get(j).copied().unwrap_or(0) };
 
     // Per-observation value loadings (coeff·mult) and slope loadings
     // (∂coeff/∂f·mult). The slope loadings carry the SAME slot presence as the
     // value loadings (additive slots appear with slope 0), so the bilinear
     // cross-covariance and its within-observation skip logic behave identically.
-    let vload: Vec<Vec<(usize, f64)>> = (0..n)
-        .map(|j| {
-            error_spec
-                .sigma_loadings(cmt_at(j), ipreds[j], sigma_values.len())
-                .into_iter()
-                .map(|(idx, c)| (idx, c * m_at(j, idx)))
-                .collect()
-        })
+    // A `power(...)` slot (#1182) supplies `sign(f)|f|^p` and `p|f|^(p−1)` in
+    // place of `f` and `1` (`ErrorSpec::scaled_loadings`).
+    let scaled: Vec<Vec<ScaledLoading>> = (0..n)
+        .map(|j| error_spec.scaled_loadings(cmt_at(j), ipreds[j], sigma_values.len(), mrow(j)))
         .collect();
-    let sload: Vec<Vec<(usize, f64)>> = (0..n)
-        .map(|j| {
-            error_spec
-                .sigma_loading_slopes(cmt_at(j), sigma_values.len())
-                .into_iter()
-                .map(|(idx, s)| (idx, s * m_at(j, idx)))
-                .collect()
-        })
+    let vload: Vec<Vec<(usize, f64)>> = scaled
+        .iter()
+        .map(|row| row.iter().map(|l| (l.idx, l.c)).collect())
+        .collect();
+    let sload: Vec<Vec<(usize, f64)>> = scaled
+        .iter()
+        .map(|row| row.iter().map(|l| (l.idx, l.c1)).collect())
         .collect();
 
     let pairs = match_partners(
@@ -1266,29 +1420,22 @@ pub fn compute_d2r_df2_matrices(
             .map(|v| v.as_slice())
             .unwrap_or(&empty)
     };
-    let m_at = |j: usize, idx: usize| -> f64 { mrow(j).get(idx).copied().unwrap_or(1.0) };
     let cmt_at = |j: usize| -> usize { obs_cmts.get(j).copied().unwrap_or(0) };
 
     // Value loadings gate the emptiness skip exactly as `compute_dr_df_matrices`
     // (an observation with no sigma loadings contributes nothing); slope
-    // loadings carry the math (the only nonzero second derivatives).
-    let vload: Vec<Vec<(usize, f64)>> = (0..n)
-        .map(|j| {
-            error_spec
-                .sigma_loadings(cmt_at(j), ipreds[j], sigma_values.len())
-                .into_iter()
-                .map(|(idx, c)| (idx, c * m_at(j, idx)))
-                .collect()
-        })
+    // loadings carry the math — plus, for a `power(...)` slot (#1182), the
+    // loading's own curvature `c''`, which an affine loading never has.
+    let scaled: Vec<Vec<ScaledLoading>> = (0..n)
+        .map(|j| error_spec.scaled_loadings(cmt_at(j), ipreds[j], sigma_values.len(), mrow(j)))
         .collect();
-    let sload: Vec<Vec<(usize, f64)>> = (0..n)
-        .map(|j| {
-            error_spec
-                .sigma_loading_slopes(cmt_at(j), sigma_values.len())
-                .into_iter()
-                .map(|(idx, s)| (idx, s * m_at(j, idx)))
-                .collect()
-        })
+    let vload: Vec<Vec<(usize, f64)>> = scaled
+        .iter()
+        .map(|row| row.iter().map(|l| (l.idx, l.c)).collect())
+        .collect();
+    let sload: Vec<Vec<(usize, f64)>> = scaled
+        .iter()
+        .map(|row| row.iter().map(|l| (l.idx, l.c1)).collect())
         .collect();
 
     let pairs = match_partners(
@@ -1306,7 +1453,7 @@ pub fn compute_d2r_df2_matrices(
             continue;
         }
         // Diagonal curvature ∂²R_mm/∂f_m².
-        out[m][m][(m, m)] = diag_self_second_deriv(&sload[m], sigma_values, correlations);
+        out[m][m][(m, m)] = diag_self_second_deriv(&scaled[m], sigma_values, correlations);
     }
     // Mixed partial ∂²R_jk/∂f_j∂f_k for each matched pair (both slope loadings).
     for &(j, k, _) in &pairs {
@@ -1322,35 +1469,141 @@ pub fn compute_d2r_df2_matrices(
 }
 
 /// `∂²R_mm/∂f_m²`: the second `f`-derivative of the diagonal residual variance.
-/// With value loadings affine in `f` (`c_s'' = 0`),
-/// `∂²V_mm/∂f² = Σ_s 2 (c_s')² σ_s² + Σ_corr 4 ρ σ_i σ_j c_i' c_j'`,
-/// i.e. the slope-only companion of [`diag_self_deriv`]. The slope loadings
-/// carry the same slot presence as the value loadings (additive slots appear
-/// with slope 0), so iterating them is sufficient.
+/// `∂²V_mm/∂f² = Σ_s 2 (c_s'² + c_s c_s'') σ_s² + Σ_corr 2 ρ σ_i σ_j (c_i'' c_j
+/// + 2 c_i' c_j' + c_i c_j'')`, the companion of [`diag_self_deriv`]. With the
+/// affine loadings (`c'' = 0`) this is the slope-only
+/// `Σ 2 c'² σ² + Σ 4 ρ σ σ c_i' c_j'`; a `power(...)` slot (#1182) adds the
+/// curvature terms. The loadings carry the same slot presence as the value
+/// loadings (additive slots appear with slope and curvature 0), so iterating
+/// them is sufficient.
 fn diag_self_second_deriv(
-    sload: &[(usize, f64)],
+    loads: &[ScaledLoading],
     sigma_values: &[f64],
     correlations: &[ResidualCorrelation],
 ) -> f64 {
-    let slope = |slot: usize| -> f64 {
-        sload
-            .iter()
-            .find(|(i, _)| *i == slot)
-            .map(|(_, s)| *s)
-            .unwrap_or(0.0)
-    };
+    let at = |slot: usize| -> Option<&ScaledLoading> { loads.iter().find(|l| l.idx == slot) };
     let sig = |idx: usize| -> f64 { sigma_values.get(idx).copied().unwrap_or(0.0) };
     let mut d = 0.0;
-    for &(idx, s) in sload {
-        let sg = sig(idx);
-        d += 2.0 * s * s * sg * sg;
+    for l in loads {
+        let sg = sig(l.idx);
+        d += 2.0 * (l.c1 * l.c1 + l.c * l.c2) * sg * sg;
     }
     for corr in correlations {
-        let si_s = slope(corr.sigma_i);
-        let sj_s = slope(corr.sigma_j);
-        d += 4.0 * corr.rho * sig(corr.sigma_i) * sig(corr.sigma_j) * si_s * sj_s;
+        let (Some(li), Some(lj)) = (at(corr.sigma_i), at(corr.sigma_j)) else {
+            continue;
+        };
+        let ss = sig(corr.sigma_i) * sig(corr.sigma_j);
+        d += 4.0 * corr.rho * ss * li.c1 * lj.c1;
+        if li.c2 != 0.0 || lj.c2 != 0.0 {
+            d += 2.0 * corr.rho * ss * (li.c2 * lj.c + li.c * lj.c2);
+        }
     }
     d
+}
+
+/// Direct-θ derivatives of a magnitude-scaled residual variance at prediction
+/// `f` (#484/#576/#486, and the `power(...)` exponent of #1182).
+///
+/// A custom / time-varying σ magnitude `mult(θ)` makes the per-observation
+/// variance `R_j = Σ_s (c_s·σ_s)²`, `c_s = coeff_s(f)·m_s`, depend on θ
+/// **directly** (not only through `f`); a `power(...)` exponent `p(θ)` does the
+/// same through `c_s = m_s·sign(f)|f|^{p}`. Returns `dr_dtheta`, the θ-gradient
+/// of `R_j` (length `n_theta`), and when `dd_dtheta` is `Some` also accumulates
+/// into it the θ-gradient of `d_j = ∂R_j/∂f = Σ 2 c_s c_s' σ_s²`:
+///
+/// ```text
+///   ∂R/∂θ = Σ_s 2 c_s σ_s² ∂c_s/∂θ
+///   ∂d/∂θ = Σ_s 2 σ_s² (∂c_s/∂θ · c_s' + c_s · ∂c_s'/∂θ)
+///   plain slot:  ∂c/∂θ = coeff·∂m/∂θ,            ∂c'/∂θ = slope·∂m/∂θ
+///   power slot:  ∂c/∂θ = g·∂m/∂θ + m·g·ln|f|·∂p/∂θ
+///                ∂c'/∂θ = g'·∂m/∂θ + m·|f|^{p−1}(1 + p·ln|f|)·∂p/∂θ
+/// ```
+///
+/// with `g = sign(f)|f|^p`, `g' = p|f|^{p−1}`. The plain-slot arms are written
+/// as the bilinear `2·coeff²·m·σ²·∂m/∂θ` and `4·coeff·coeff'·m·σ²·∂m/∂θ` they
+/// were before #1182, so a model without a power form is unchanged bit for
+/// bit. `ruv_scale` folds the `iiv_on_ruv` `exp(2·η_ruv)` link (`1.0` on the
+/// FOCE / non-`ruv` path). `mult_row` is the observation's magnitude row and
+/// `mult_grad_row` its per-`(slot, θ)` gradient, both in
+/// [`crate::types::RuvMagnitude::eval_obs`]'s layout, so a power slot's
+/// `∂p/∂θ` is `mult_grad_row[n_sigma + s]`. Diagonal-`R` only (`block_sigma`
+/// correlations force FD upstream). A power slot whose scaled variance sits on
+/// the `MIN_VARIANCE` floor contributes nothing, matching
+/// [`ErrorSpec::dvar_df_scaled`]'s gate — the objective is locally constant
+/// there.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn magnitude_dvar_dtheta(
+    error_spec: &ErrorSpec,
+    cmt: usize,
+    f: f64,
+    sigma: &[f64],
+    mult_row: &[f64],
+    mult_grad_row: &[Vec<f64>],
+    n_theta: usize,
+    ruv_scale: f64,
+    mut dd_dtheta: Option<&mut Vec<f64>>,
+) -> Vec<f64> {
+    let n_sigma = sigma.len();
+    let loadings = error_spec.sigma_loadings(cmt, f, n_sigma);
+    let slopes = error_spec.sigma_loading_slopes(cmt, n_sigma);
+    let slope_of = |idx: usize| -> f64 {
+        slopes
+            .iter()
+            .find(|&&(i, _)| i == idx)
+            .map(|&(_, s)| s)
+            .unwrap_or(0.0)
+    };
+    let floored = || error_spec.variance_at_scaled(cmt, f, sigma, &[], mult_row) <= MIN_VARIANCE;
+    let mut dr_dtheta = vec![0.0f64; n_theta];
+    for &(idx, coeff) in &loadings {
+        let sg = sigma.get(idx).copied().unwrap_or(0.0);
+        let mv = mult_row.get(idx).copied().unwrap_or(1.0);
+        let Some(dmi) = mult_grad_row.get(idx) else {
+            continue;
+        };
+        let slope = slope_of(idx);
+        let exponent = (slope != 0.0)
+            .then(|| slot_exponent(mult_row, n_sigma, idx))
+            .flatten();
+        match exponent {
+            None => {
+                let coeff_p = if dd_dtheta.is_some() { slope } else { 0.0 };
+                for (tm, &dmdt_raw) in dmi.iter().enumerate().take(n_theta) {
+                    let dmdt = dmdt_raw * ruv_scale;
+                    dr_dtheta[tm] += 2.0 * coeff * coeff * mv * sg * sg * dmdt;
+                    if let Some(dd) = dd_dtheta.as_deref_mut() {
+                        dd[tm] += 4.0 * coeff * coeff_p * mv * sg * sg * dmdt;
+                    }
+                }
+            }
+            Some(p) => {
+                if floored() {
+                    continue;
+                }
+                let (g, g1, _) = power_loading(f, p);
+                let a = f.abs();
+                let (ln_a, ap1) = if a > 0.0 {
+                    (a.ln(), a.powf(p - 1.0))
+                } else {
+                    (0.0, 0.0)
+                };
+                let c = mv * g;
+                let c1 = mv * g1;
+                let dp = mult_grad_row.get(n_sigma + idx);
+                for tm in 0..n_theta {
+                    let dm = dmi.get(tm).copied().unwrap_or(0.0) * ruv_scale;
+                    let dpt = dp.and_then(|v| v.get(tm)).copied().unwrap_or(0.0) * ruv_scale;
+                    let dc = g * dm + mv * g * ln_a * dpt;
+                    dr_dtheta[tm] += 2.0 * c * sg * sg * dc;
+                    if let Some(dd) = dd_dtheta.as_deref_mut() {
+                        let dc1 = g1 * dm + mv * ap1 * (1.0 + p * ln_a) * dpt;
+                        dd[tm] += 2.0 * sg * sg * (dc * c1 + c * dc1);
+                    }
+                }
+            }
+        }
+    }
+    dr_dtheta
 }
 
 /// Individual weighted residual: IWRES_j = (y_j - f_j) / sqrt(V_j)
@@ -1505,6 +1758,236 @@ mod tests {
     use crate::types::{EndpointError, GradientMethod};
     use approx::assert_relative_eq;
     use std::collections::HashMap;
+
+    // ── #1182: the `power(...)` exponent channel ─────────────────────────
+
+    /// `power_loading` at `p = 1` is the proportional loading exactly; at
+    /// `p = 1.5` it is `sign(f)|f|^p` with the closed-form derivatives.
+    #[test]
+    fn power_loading_matches_the_closed_forms() {
+        assert_eq!(power_loading(2.5, 1.0), (2.5, 1.0, 0.0));
+        assert_eq!(power_loading(-2.5, 1.0), (-2.5, 1.0, 0.0));
+        let (g, g1, g2) = power_loading(4.0, 1.5);
+        assert_relative_eq!(g, 8.0, max_relative = 1e-14);
+        assert_relative_eq!(g1, 1.5 * 2.0, max_relative = 1e-14);
+        assert_relative_eq!(g2, 1.5 * 0.5 * 0.5, max_relative = 1e-14);
+        let (g, g1, g2) = power_loading(-4.0, 1.5);
+        assert_relative_eq!(g, -8.0, max_relative = 1e-14);
+        assert_relative_eq!(g1, 3.0, max_relative = 1e-14);
+        assert_relative_eq!(g2, -0.375, max_relative = 1e-14);
+        // f = 0: the floor owns this point; no ∞ or NaN leaks.
+        assert_eq!(power_loading(0.0, 0.5), (0.0, 0.0, 0.0));
+        assert_eq!(power_loading(0.0, 1.0), (0.0, 1.0, 0.0));
+    }
+
+    /// The exponent is read only from a doubled row — and `1` is reported, not
+    /// folded into "none", so the θ-derivative sees the exponent axis at the
+    /// search's neutral start.
+    #[test]
+    fn slot_exponent_reads_only_a_doubled_row() {
+        assert_eq!(slot_exponent(&[2.0], 1, 0), None);
+        assert_eq!(slot_exponent(&[2.0, 1.0], 1, 0), Some(1.0));
+        assert_eq!(slot_exponent(&[2.0, 1.3], 1, 0), Some(1.3));
+        assert_eq!(slot_exponent(&[1.0, 1.0, 1.3, 1.0], 2, 0), Some(1.3));
+        assert_eq!(slot_exponent(&[1.0, 1.0, 1.3, 1.0], 2, 1), Some(1.0));
+        // A row of the wrong length carries no exponent half.
+        assert_eq!(slot_exponent(&[1.0, 1.0, 1.3], 2, 0), None);
+        assert_eq!(slot_exponent(&[1.3], 0, 0), None);
+    }
+
+    /// `variance_at_scaled` under an exponent is `m²σ²|f|^{2p}` (+ `σ_add²`
+    /// for combined), and an additive slot ignores its exponent entry.
+    #[test]
+    fn variance_at_scaled_with_an_exponent_is_sigma_sq_f_to_the_2p() {
+        let prop = ErrorSpec::Single(ErrorModel::Proportional);
+        let sigma = [0.2];
+        let v = prop.variance_at_scaled(0, 3.0, &sigma, &[], &[1.0, 1.4]);
+        assert_relative_eq!(v, 0.04 * 3.0f64.powf(2.8), max_relative = 1e-13);
+        // A multiplier composes with the exponent.
+        let v = prop.variance_at_scaled(0, 3.0, &sigma, &[], &[2.0, 1.4]);
+        assert_relative_eq!(v, 4.0 * 0.04 * 3.0f64.powf(2.8), max_relative = 1e-13);
+        let comb = ErrorSpec::Single(ErrorModel::Combined);
+        let sigma = [0.2, 0.5];
+        let v = comb.variance_at_scaled(0, 3.0, &sigma, &[], &[1.0, 1.0, 1.4, 1.0]);
+        assert_relative_eq!(v, 0.04 * 3.0f64.powf(2.8) + 0.25, max_relative = 1e-13);
+        // The additive slot's exponent entry is inert.
+        let v2 = comb.variance_at_scaled(0, 3.0, &sigma, &[], &[1.0, 1.0, 1.4, 7.0]);
+        assert_eq!(v, v2);
+        let add = ErrorSpec::Single(ErrorModel::Additive);
+        assert_eq!(
+            add.variance_at_scaled(0, 3.0, &[0.5], &[], &[1.0, 1.4]),
+            add.variance_at_scaled(0, 3.0, &[0.5], &[], &[1.0])
+        );
+    }
+
+    /// The analytic `f`-derivatives under an exponent are the derivatives of
+    /// `variance_at_scaled`: central FD in `f`, for proportional and combined,
+    /// for `p` below and above one.
+    #[test]
+    fn dvar_df_scaled_and_d2var_df2_scaled_match_fd_under_an_exponent() {
+        for (spec, sigma, row) in [
+            (
+                ErrorSpec::Single(ErrorModel::Proportional),
+                vec![0.2],
+                vec![1.0, 1.4],
+            ),
+            (
+                ErrorSpec::Single(ErrorModel::Proportional),
+                vec![0.2],
+                vec![1.7, 0.6],
+            ),
+            (
+                ErrorSpec::Single(ErrorModel::Combined),
+                vec![0.2, 0.5],
+                vec![1.0, 1.0, 1.4, 1.0],
+            ),
+        ] {
+            for f in [0.5, 3.0, 12.0] {
+                let h = 1e-5 * f;
+                let v = |x: f64| spec.variance_at_scaled(0, x, &sigma, &[], &row);
+                let fd1 = (v(f + h) - v(f - h)) / (2.0 * h);
+                let fd2 = (v(f + h) - 2.0 * v(f) + v(f - h)) / (h * h);
+                assert_relative_eq!(
+                    spec.dvar_df_scaled(0, f, &sigma, &row),
+                    fd1,
+                    max_relative = 1e-6
+                );
+                assert_relative_eq!(
+                    spec.d2var_df2_scaled(0, f, &sigma, &row),
+                    fd2,
+                    max_relative = 1e-4
+                );
+            }
+        }
+    }
+
+    /// `∂V/∂log σ_k` under an exponent, against FD in `log σ_k`.
+    #[test]
+    fn dvar_dlogsigma_scaled_matches_fd_under_an_exponent() {
+        let spec = ErrorSpec::Single(ErrorModel::Combined);
+        let sigma = [0.2, 0.5];
+        let row = [1.3, 1.0, 1.4, 1.0];
+        let f = 3.0;
+        for k in 0..2 {
+            let h = 1e-6;
+            let at = |d: f64| {
+                let mut s = sigma;
+                s[k] *= d.exp();
+                spec.variance_at_scaled(0, f, &s, &[], &row)
+            };
+            let fd = (at(h) - at(-h)) / (2.0 * h);
+            assert_relative_eq!(
+                spec.dvar_dlogsigma_scaled(0, k, f, &sigma, &row),
+                fd,
+                max_relative = 1e-6
+            );
+        }
+    }
+
+    /// The dense `∂R/∂f` and `∂²R/∂f²` builders agree with the diagonal closed
+    /// forms under an exponent (no correlations, so `R` is diagonal).
+    #[test]
+    fn dense_derivative_matrices_match_the_diagonal_forms_under_an_exponent() {
+        let spec = ErrorSpec::Single(ErrorModel::Proportional);
+        let sigma = [0.2];
+        let ipreds = [0.5, 3.0, 12.0];
+        let cmts = [0usize; 3];
+        let times = [1.0, 2.0, 3.0];
+        let occ = [1u32; 3];
+        let l2: [i64; 0] = [];
+        let mult = vec![vec![1.0, 1.4]; 3];
+        let dr = compute_dr_df_matrices(
+            &spec,
+            &ipreds,
+            &cmts,
+            &times,
+            &times,
+            &occ,
+            &l2,
+            &sigma,
+            &[],
+            Some(&mult),
+        );
+        let d2 = compute_d2r_df2_matrices(
+            &spec,
+            &ipreds,
+            &cmts,
+            &times,
+            &times,
+            &occ,
+            &l2,
+            &sigma,
+            &[],
+            Some(&mult),
+        );
+        for j in 0..3 {
+            assert_relative_eq!(
+                dr[j][(j, j)],
+                spec.dvar_df_scaled(0, ipreds[j], &sigma, &mult[j]),
+                max_relative = 1e-12
+            );
+            assert_relative_eq!(
+                d2[j][j][(j, j)],
+                spec.d2var_df2_scaled(0, ipreds[j], &sigma, &mult[j]),
+                max_relative = 1e-12
+            );
+        }
+    }
+
+    /// The direct-θ channel under an exponent: `∂R/∂θ` and `∂d/∂θ` against
+    /// FD in θ, where θ = (m, p) enters the row as `[m, p]`, for a plain
+    /// multiplier alone (the pre-#1182 arm) and with an exponent.
+    #[test]
+    fn magnitude_dvar_dtheta_matches_fd_in_the_multiplier_and_the_exponent() {
+        let spec = ErrorSpec::Single(ErrorModel::Proportional);
+        let sigma = [0.2];
+        let f = 3.0;
+        let ruv_scale = 1.7;
+        // θ = [m, p]; row(θ) = [m, p], so ∂row/∂θ is the identity.
+        let row_of = |th: &[f64]| vec![th[0], th[1]];
+        let grad_rows = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        for theta in [[1.3, 1.4], [0.8, 0.6], [1.0, 1.0]] {
+            let row = row_of(&theta);
+            let mut dd = vec![0.0; 2];
+            let dr = magnitude_dvar_dtheta(
+                &spec,
+                0,
+                f,
+                &sigma,
+                &row,
+                &grad_rows,
+                2,
+                ruv_scale,
+                Some(&mut dd),
+            );
+            for t in 0..2 {
+                let h = 1e-6;
+                let at = |d: f64| {
+                    let mut th = theta;
+                    th[t] += d;
+                    let r = row_of(&th);
+                    (
+                        ruv_scale * spec.variance_at_scaled(0, f, &sigma, &[], &r),
+                        ruv_scale * spec.dvar_df_scaled(0, f, &sigma, &r),
+                    )
+                };
+                let (rp, dp) = at(h);
+                let (rm, dm) = at(-h);
+                assert_relative_eq!(
+                    dr[t],
+                    (rp - rm) / (2.0 * h),
+                    max_relative = 1e-5,
+                    epsilon = 1e-9
+                );
+                assert_relative_eq!(
+                    dd[t],
+                    (dp - dm) / (2.0 * h),
+                    max_relative = 1e-5,
+                    epsilon = 1e-9
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_additive_variance() {

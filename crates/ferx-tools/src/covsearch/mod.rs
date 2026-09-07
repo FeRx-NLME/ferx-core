@@ -90,7 +90,7 @@ mod lrt;
 mod report;
 
 pub use effects::Effect;
-pub use lrt::{chi_square_sf, Lrt};
+pub use lrt::{chi_square_isf, chi_square_sf, Lrt};
 pub use report::{final_model_path, render_summary, steps_path, write_report, STEP_COLUMNS};
 
 /// `[covsearch] algorithm`.
@@ -171,6 +171,7 @@ impl CovsearchOptions {
     /// to ignore: a file that says `type = "bic"` and gets an LRT would be
     /// lying about how its winner was chosen.
     pub fn from_config(config: &SearchConfig) -> Result<Self, String> {
+        config.require_space("covsearch", "COVARIATE / COVARIATE? statements")?;
         let options = match config.tools.get("covsearch") {
             Some(table) => table
                 .clone()
@@ -185,7 +186,7 @@ impl CovsearchOptions {
                     "[rank] type = \"{}\": covsearch selects by the likelihood-ratio test on \
                      the OFV at [covsearch] p_forward / p_backward; a BIC ranking does not \
                      apply. Remove the key, or set it to \"ofv\"",
-                    rank_label(kind)
+                    kind.label()
                 ));
             }
         }
@@ -218,19 +219,6 @@ impl CovsearchOptions {
             );
         }
         Ok(())
-    }
-}
-
-fn rank_label(kind: RankType) -> &'static str {
-    match kind {
-        RankType::Ofv => "ofv",
-        RankType::Aic => "aic",
-        RankType::Bic => "bic",
-        RankType::BicMixed => "bic_mixed",
-        RankType::BicIiv => "bic_iiv",
-        RankType::BicRandom => "bic_random",
-        RankType::BicFixed => "bic_fixed",
-        RankType::Penalized => "penalized",
     }
 }
 
@@ -1109,11 +1097,7 @@ fn features_of(
 /// Where a search run's files go by default: `<config stem>-covsearch` next
 /// to the config file.
 pub fn default_dir(config_path: &Path) -> PathBuf {
-    let stem = config_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("search");
-    config_path.with_file_name(format!("{stem}-covsearch"))
+    crate::search::default_dir(config_path, "covsearch")
 }
 
 #[cfg(test)]

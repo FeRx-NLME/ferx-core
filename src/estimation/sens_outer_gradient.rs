@@ -607,6 +607,11 @@ pub(crate) fn prepare(
 /// path needs both; the FOCE (Sheiner–Beal) marginal only reads `∂R/∂θ`, so it
 /// passes `None` and skips the `slopes` lookup and the `4·coeff·coeff'·…`
 /// accumulation entirely (#486 review).
+///
+/// The formula itself lives with the rest of the residual-variance math in
+/// [`crate::stats::residual_error::magnitude_dvar_dtheta`], which since #1182
+/// also carries the `power(...)` exponent's `∂R/∂p · ∂p/∂θ` term; this is the
+/// call-site alias the three gradient paths share.
 #[allow(clippy::too_many_arguments)]
 fn mag_variance_dtheta(
     error_spec: &crate::types::ErrorSpec,
@@ -617,39 +622,19 @@ fn mag_variance_dtheta(
     mult_grad_row: &[Vec<f64>],
     n_theta: usize,
     ruv_scale: f64,
-    mut dd_dtheta: Option<&mut Vec<f64>>,
+    dd_dtheta: Option<&mut Vec<f64>>,
 ) -> Vec<f64> {
-    let loadings = error_spec.sigma_loadings(cmt, f, sigma.len());
-    let slopes = if dd_dtheta.is_some() {
-        error_spec.sigma_loading_slopes(cmt, sigma.len())
-    } else {
-        Vec::new()
-    };
-    let mut dr_dtheta = vec![0.0f64; n_theta];
-    for &(idx, coeff) in &loadings {
-        let sg = sigma.get(idx).copied().unwrap_or(0.0);
-        let mv = mult_row.get(idx).copied().unwrap_or(1.0);
-        let Some(dmi) = mult_grad_row.get(idx) else {
-            continue;
-        };
-        let coeff_p = if dd_dtheta.is_some() {
-            slopes
-                .iter()
-                .find(|&&(i, _)| i == idx)
-                .map(|&(_, s)| s)
-                .unwrap_or(0.0)
-        } else {
-            0.0
-        };
-        for (tm, &dmdt_raw) in dmi.iter().enumerate().take(n_theta) {
-            let dmdt = dmdt_raw * ruv_scale;
-            dr_dtheta[tm] += 2.0 * coeff * coeff * mv * sg * sg * dmdt;
-            if let Some(dd) = dd_dtheta.as_deref_mut() {
-                dd[tm] += 4.0 * coeff * coeff_p * mv * sg * sg * dmdt;
-            }
-        }
-    }
-    dr_dtheta
+    crate::stats::residual_error::magnitude_dvar_dtheta(
+        error_spec,
+        cmt,
+        f,
+        sigma,
+        mult_row,
+        mult_grad_row,
+        n_theta,
+        ruv_scale,
+        dd_dtheta,
+    )
 }
 
 /// The magnitude direct-θ derivative of the data-term coefficient `α` for one

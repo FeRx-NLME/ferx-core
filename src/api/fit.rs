@@ -531,26 +531,15 @@ pub fn fit(
         // makes the residual variance η-dependent). Non-interaction FOCE/GN cannot
         // represent it — its marginal integrates the residual eta out through a
         // sensitivity column that is identically zero. Require FOCEI or a
-        // Monte-Carlo estimator (IMP/IMPMAP/SAEM).
-        let methods: Vec<EstimationMethod> = if options.methods.is_empty() {
-            vec![options.method]
-        } else {
-            options.methods.clone()
-        };
-        for m in &methods {
-            let non_interaction = match m {
-                EstimationMethod::Foce => true,
-                EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid => !options.interaction,
-                _ => false,
-            };
-            if non_interaction {
-                return Err(format!(
-                    "IIV on residual error (iiv_on_ruv) requires an interaction or \
-                     Monte-Carlo method: use method = focei, imp, impmap, or saem (got {m:?} \
-                     with interaction = false). NONMEM `Y = IPRED + EPS*EXP(ETA)` is an \
-                     INTERACTION model."
-                ));
-            }
+        // Monte-Carlo estimator (IMP/IMPMAP/SAEM), at every stage of a chain —
+        // the one predicate `ruvsearch` consults before proposing the feature.
+        if let Some(m) = options.non_interaction_stage() {
+            return Err(format!(
+                "IIV on residual error (iiv_on_ruv) requires an interaction or \
+                 Monte-Carlo method: use method = focei, imp, impmap, or saem (got {m:?} \
+                 with interaction = false). NONMEM `Y = IPRED + EPS*EXP(ETA)` is an \
+                 INTERACTION model."
+            ));
         }
     }
     // Data-dependent fatal checks (covariates present, per-CMT scaling and

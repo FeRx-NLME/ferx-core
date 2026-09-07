@@ -25,8 +25,8 @@
 use std::path::Path;
 
 use ferx_core::edit::{
-    ErrorForm, ErrorSpecText, IivForm, ModelEdit, ModelText, NewParameter, Relation, RelationTheta,
-    SigmaDecl, StructuralSpec,
+    ErrorForm, ErrorSpecText, EtaDecl, IivForm, ModelEdit, ModelText, NewParameter, Relation,
+    RelationTheta, SigmaDecl, StructuralSpec, ThetaDecl, TimeVaryingDecl,
 };
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::types::{CovariateForm, CovariateStat, FitOptions};
@@ -298,10 +298,10 @@ fn blocking_two_etas_is_the_hand_written_block_omega() {
 
 #[test]
 fn switching_to_a_combined_error_model_is_the_hand_written_one() {
-    let generated = edited(vec![ModelEdit::SetErrorModel(ErrorSpecText {
-        endpoint: "DV".into(),
-        form: ErrorForm::Combined,
-        sigmas: vec![
+    let generated = edited(vec![ModelEdit::SetErrorModel(ErrorSpecText::new(
+        "DV",
+        ErrorForm::Combined,
+        vec![
             SigmaDecl {
                 name: "ADD_ERR".into(),
                 init: 0.1,
@@ -313,7 +313,7 @@ fn switching_to_a_combined_error_model_is_the_hand_written_one() {
                 as_sd: true,
             },
         ],
-    })]);
+    ))]);
     // The σ of a single-endpoint `[error_model]` are consumed *positionally*
     // from the `[parameters]` declaration order, so `ADD_ERR` has to be
     // declared first — appending it would not parse. This is the case where a
@@ -327,6 +327,91 @@ fn switching_to_a_combined_error_model_is_the_hand_written_one() {
         .replace(
             "DV ~ proportional(PROP_ERR)",
             "DV ~ combined(ADD_ERR, PROP_ERR)",
+        );
+    assert_same_model(&generated, &hand);
+}
+
+/// #1182: the three residual-error features ruvsearch proposes, each edited
+/// onto the parent and compared with the model a user would type. `RUV_POW`
+/// starts at 1.3 so the power form is not the proportional model it started
+/// from; the time-varying cutoff is inside the observation window.
+#[test]
+fn switching_to_a_power_error_model_is_the_hand_written_one() {
+    let generated = edited(vec![ModelEdit::SetErrorModel(
+        ErrorSpecText::new(
+            "DV",
+            ErrorForm::Power,
+            vec![SigmaDecl {
+                name: "PROP_ERR".into(),
+                init: 0.04,
+                as_sd: true,
+            }],
+        )
+        .with_exponent(ThetaDecl::new("RUV_POW", 1.3, 0.01, 10.0)),
+    )]);
+    let hand = PARENT
+        .replace(
+            "  sigma PROP_ERR ~ 0.04 (sd)\n",
+            "  sigma PROP_ERR ~ 0.04 (sd)\n  theta RUV_POW(1.3, 0.01, 10.0)\n",
+        )
+        .replace(
+            "DV ~ proportional(PROP_ERR)",
+            "DV ~ power(PROP_ERR, RUV_POW)",
+        );
+    assert_same_model(&generated, &hand);
+}
+
+#[test]
+fn adding_iiv_on_ruv_is_the_hand_written_one() {
+    let generated = edited(vec![ModelEdit::SetErrorModel(
+        ErrorSpecText::new(
+            "DV",
+            ErrorForm::Proportional,
+            vec![SigmaDecl {
+                name: "PROP_ERR".into(),
+                init: 0.04,
+                as_sd: true,
+            }],
+        )
+        .with_iiv_on_ruv(EtaDecl::new("ETA_RUV", 0.09)),
+    )]);
+    let hand = PARENT
+        .replace(
+            "  sigma PROP_ERR ~ 0.04 (sd)\n",
+            "  sigma PROP_ERR ~ 0.04 (sd)\n  omega ETA_RUV ~ 0.09\n",
+        )
+        .replace(
+            "DV ~ proportional(PROP_ERR)",
+            "DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = ETA_RUV",
+        );
+    assert_same_model(&generated, &hand);
+}
+
+#[test]
+fn a_time_varying_error_model_is_the_hand_written_magnitude() {
+    let generated = edited(vec![ModelEdit::SetErrorModel(
+        ErrorSpecText::new(
+            "DV",
+            ErrorForm::Proportional,
+            vec![SigmaDecl {
+                name: "PROP_ERR".into(),
+                init: 0.04,
+                as_sd: true,
+            }],
+        )
+        .with_time_varying(TimeVaryingDecl::new(
+            4.0,
+            ThetaDecl::new("RUV_TV", 1.4, 0.01, 10.0),
+        )),
+    )]);
+    let hand = PARENT
+        .replace(
+            "  sigma PROP_ERR ~ 0.04 (sd)\n",
+            "  sigma PROP_ERR ~ 0.04 (sd)\n  theta RUV_TV(1.4, 0.01, 10.0)\n",
+        )
+        .replace(
+            "DV ~ proportional(PROP_ERR)",
+            "DV ~ proportional(PROP_ERR * (if (TAD < 4.0) RUV_TV else 1.0))",
         );
     assert_same_model(&generated, &hand);
 }

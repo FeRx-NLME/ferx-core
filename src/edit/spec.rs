@@ -175,7 +175,19 @@ impl IivForm {
 /// `Text` in the name is the point: this is the *source* form, not
 /// [`crate::types::ErrorSpec`], which is the compiled one with σ resolved to
 /// indices into the global σ vector.
+///
+/// Beyond the form and its σ, the spec carries the three residual-error
+/// features a search over the error model proposes (#1182): a `power(...)`
+/// exponent, `iiv_on_ruv`, and Pharmpy's time-varying magnitude. Each renders
+/// in **one canonical spelling**, and [`ErrorSpecText::read`] reads exactly
+/// those spellings back — so a tool can take a model's `[error_model]` apart,
+/// change one feature, and write it again without knowing the block's text.
+///
+/// `#[non_exhaustive]`: build one with [`ErrorSpecText::new`] and the
+/// `with_*` builders, so the next feature added here does not break a caller's
+/// struct literal. The fields stay public to read.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ErrorSpecText {
     /// The observed quantity, almost always `DV`.
     pub endpoint: String,
@@ -183,6 +195,102 @@ pub struct ErrorSpecText {
     /// The σ the form takes, in order, with the init to declare for any that
     /// `[parameters]` does not already have.
     pub sigmas: Vec<SigmaDecl>,
+    /// The exponent θ of a [`ErrorForm::Power`] form — `DV ~ power(σ, P)`,
+    /// NONMEM's `Y = F + EPS(1) * F**THETA`. Required for that form, refused
+    /// for every other.
+    pub exponent: Option<ThetaDecl>,
+    /// `iiv_on_ruv = ETA`, with the `omega ETA ~ variance` to declare when
+    /// `[parameters]` does not already have it.
+    pub iiv_on_ruv: Option<EtaDecl>,
+    /// Pharmpy's time-varying residual error (`set_time_varying_error_model`):
+    /// every σ of the form is multiplied by `θ` for records with
+    /// `TAD < cutoff`, written as the magnitude expression
+    /// `σ * (if (TAD < cutoff) θ else 1.0)`.
+    pub time_varying: Option<TimeVaryingDecl>,
+}
+
+impl ErrorSpecText {
+    /// A plain form with its σ and none of the optional features.
+    pub fn new(endpoint: impl Into<String>, form: ErrorForm, sigmas: Vec<SigmaDecl>) -> Self {
+        ErrorSpecText {
+            endpoint: endpoint.into(),
+            form,
+            sigmas,
+            exponent: None,
+            iiv_on_ruv: None,
+            time_varying: None,
+        }
+    }
+
+    /// The exponent θ of a `power(...)` form.
+    pub fn with_exponent(mut self, theta: ThetaDecl) -> Self {
+        self.exponent = Some(theta);
+        self
+    }
+
+    /// `iiv_on_ruv = ETA`.
+    pub fn with_iiv_on_ruv(mut self, eta: EtaDecl) -> Self {
+        self.iiv_on_ruv = Some(eta);
+        self
+    }
+
+    /// The time-varying magnitude `σ * (if (TAD < cutoff) θ else 1.0)`.
+    pub fn with_time_varying(mut self, tv: TimeVaryingDecl) -> Self {
+        self.time_varying = Some(tv);
+        self
+    }
+
+    /// Read a model's `[error_model]` back into authoring form — the inverse
+    /// of [`ModelEdit::SetErrorModel`](super::ModelEdit::SetErrorModel).
+    ///
+    /// Reads exactly the spellings the edit writes: one
+    /// `DV ~ form(σ, …[, P])` statement whose σ arguments are bare names or the
+    /// canonical time-varying magnitude `σ * (if (TAD < c) θ else 1.0)`, plus
+    /// an optional `iiv_on_ruv = ETA` line, with each σ / θ / ω looked up in
+    /// `[parameters]` for its init. `Ok(None)` when the model has no
+    /// `[error_model]` block at all.
+    ///
+    /// # Errors
+    ///
+    /// A block this cannot represent — per-CMT or covariate-selected
+    /// endpoints, a log-transform, a `weight =` modifier, a hand-written
+    /// magnitude expression, a σ in a `block_sigma`, an η in a `block_omega`,
+    /// a declaration the statement names but `[parameters]` lacks — is an
+    /// error naming what was found, never a lossy reading. A tool that edits
+    /// the error model must refuse such a base rather than rewrite it.
+    pub fn read(text: &super::ModelText) -> Result<Option<Self>, String> {
+        super::apply::read_error_spec(text)
+    }
+
+    /// The σ argument of slot `i` as the block spells it — the bare name, or
+    /// the time-varying magnitude around it.
+    pub(crate) fn render_sigma_arg(&self, i: usize) -> String {
+        let name = &self.sigmas[i].name;
+        match &self.time_varying {
+            Some(tv) => format!(
+                "{name} * (if (TAD < {}) {} else 1.0)",
+                num(tv.cutoff),
+                tv.theta.name
+            ),
+            None => name.clone(),
+        }
+    }
+
+    /// The `DV ~ form(...)` statement.
+    pub fn render_statement(&self) -> String {
+        let mut args: Vec<String> = (0..self.sigmas.len())
+            .map(|i| self.render_sigma_arg(i))
+            .collect();
+        if let Some(p) = &self.exponent {
+            args.push(p.name.clone());
+        }
+        format!(
+            "{} ~ {}({})",
+            self.endpoint,
+            self.form.label(),
+            args.join(", ")
+        )
+    }
 }
 
 /// The residual-error forms `[error_model]` accepts.
@@ -191,6 +299,8 @@ pub enum ErrorForm {
     Additive,
     Proportional,
     Combined,
+    /// `power(σ, P)`: the proportional loading raised to the θ `P` (#1182).
+    Power,
 }
 
 impl ErrorForm {
@@ -200,15 +310,102 @@ impl ErrorForm {
             ErrorForm::Additive => "additive",
             ErrorForm::Proportional => "proportional",
             ErrorForm::Combined => "combined",
+            ErrorForm::Power => "power",
         }
     }
 
     /// How many σ the form takes.
     pub fn n_sigma(&self) -> usize {
         match self {
-            ErrorForm::Additive | ErrorForm::Proportional => 1,
+            ErrorForm::Additive | ErrorForm::Proportional | ErrorForm::Power => 1,
             ErrorForm::Combined => 2,
         }
+    }
+
+    /// The form spelled `label`, if any.
+    pub fn from_label(label: &str) -> Option<ErrorForm> {
+        match label.to_ascii_lowercase().as_str() {
+            "additive" => Some(ErrorForm::Additive),
+            "proportional" => Some(ErrorForm::Proportional),
+            "combined" => Some(ErrorForm::Combined),
+            "power" => Some(ErrorForm::Power),
+            _ => None,
+        }
+    }
+}
+
+/// One `theta NAME(init, lower, upper)` declaration an error-model feature
+/// needs — the `power(...)` exponent or the time-varying multiplier.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThetaDecl {
+    pub name: String,
+    pub init: f64,
+    pub lower: f64,
+    pub upper: f64,
+}
+
+impl ThetaDecl {
+    pub fn new(name: impl Into<String>, init: f64, lower: f64, upper: f64) -> Self {
+        ThetaDecl {
+            name: name.into(),
+            init,
+            lower,
+            upper,
+        }
+    }
+
+    /// `theta NAME(init, lower, upper)` — or `theta NAME(init)` when both
+    /// bounds are infinite, which is how [`ErrorSpecText::read`] reports a
+    /// declaration written without bounds.
+    pub(crate) fn render(&self) -> String {
+        if !self.lower.is_finite() && !self.upper.is_finite() {
+            return format!("theta {}({})", self.name, num(self.init));
+        }
+        format!(
+            "theta {}({}, {}, {})",
+            self.name,
+            num(self.init),
+            num(self.lower),
+            num(self.upper)
+        )
+    }
+}
+
+/// One `omega NAME ~ variance` declaration — the `iiv_on_ruv` η.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EtaDecl {
+    pub name: String,
+    /// The initial **variance**.
+    pub variance: f64,
+}
+
+impl EtaDecl {
+    pub fn new(name: impl Into<String>, variance: f64) -> Self {
+        EtaDecl {
+            name: name.into(),
+            variance,
+        }
+    }
+
+    /// `omega NAME ~ variance`.
+    pub(crate) fn render(&self) -> String {
+        format!("omega {} ~ {}", self.name, num(self.variance))
+    }
+}
+
+/// Pharmpy's time-varying residual error: the σ multiplied by `theta` for
+/// records whose time after dose is below `cutoff`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimeVaryingDecl {
+    /// The `TAD` cutoff, in the data's time unit.
+    pub cutoff: f64,
+    /// The multiplier θ.
+    pub theta: ThetaDecl,
+}
+
+impl TimeVaryingDecl {
+    pub fn new(cutoff: f64, theta: ThetaDecl) -> Self {
+        TimeVaryingDecl { cutoff, theta }
     }
 }
 

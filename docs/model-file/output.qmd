@@ -31,6 +31,15 @@ The following columns are always written to sdtab regardless of `[output]`:
 
 Listing any of these in `[output]` is harmless but will emit `W_OUTPUT_DUPLICATE`.
 
+`CWRES` is the conditional weighted residual of Hooker et al. (2007) as NONMEM
+tables it: the FOCE-linearized residual `y − f0` (`f0 = IPRED − H·η̂`)
+decorrelated by the symmetric inverse square root of its covariance
+`HΩHᵀ + R`, with `R` evaluated at `IPRED` under an interaction fit and at the
+population prediction `f(η = 0)` under FOCE. Rebuilt from NONMEM 7.5.1's own
+tabled `G`, `ETA`, `IPRED` and `PRED`, that recipe reproduces its `CWRES`
+column to 1e-4 (#1182). `IWRES` is `(y − IPRED) / SD(IPRED)`, the individual
+weighted residual. Both are `NaN` on censored records.
+
 ## Diagnostics
 
 | Code | Severity | Cause |

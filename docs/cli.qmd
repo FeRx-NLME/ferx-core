@@ -17,6 +17,7 @@ ferx summary <run.fitrx> [<run2.fitrx> ...]
 ferx bootstrap <model.ferx> [--data <data.csv>] [--samples N] [--seed N] [--stratify-on COL]
 ferx covsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
 ferx modelsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
+ferx ruvsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
 ferx allometry <model.ferx> --data <data.csv> [--covariate WT] [--reference 70] [--estimate]
 ferx --help                    # or -h; also: ferx check --help, ferx summary --help,
                                # ferx bootstrap --help, ferx covsearch --help
@@ -144,6 +145,28 @@ writes `models.csv`, `final.ferx`, `final-fit.yaml` and every candidate under
 so `--resume` picks an interrupted search up where it stopped. See
 [Structural model search](tools/modelsearch.qmd), including the Pharmpy and
 NONMEM comparisons.
+
+### Residual-Error Search (`ruvsearch`)
+
+```bash
+ferx ruvsearch warfarin.ferxsearch --directory warfarin-ruvsearch --threads 8
+```
+
+Pharmpy's `ruvsearch`: a search over the `[error_model]` block, driven by a
+[`.ferxsearch` file](tools/search.qmd) with no `[space]` — the candidates are
+the four residual-error forms: IIV on the residual error, a `power` form, a
+`combined` form, and a time-varying magnitude cut at the time-after-dose
+quantiles. Each iteration adds every remaining candidate to the parent on its
+own, fits them in parallel, judges them by the strictness gate and the
+likelihood-ratio test at `[ruvsearch] p_value`, and keeps the largest
+significant drop; the selected model must beat the input by the `df = 1`
+cutoff or the input is returned. `cwres_prescreen = true` is Pharmpy's path:
+the candidates are fitted to the parent's CWRES first and only the winner is
+refitted. Prints a step table with every model's ΔOFV, p-value, convergence
+status and decision; writes `steps.csv`, `final.ferx`, `final-fit.yaml` and
+every model under `models/`, plus one journalled runner directory per step,
+so `--resume` picks an interrupted search up where it stopped. See
+[Residual-error search](tools/ruvsearch.qmd).
 
 ### Allometric Scaling (`allometry`)
 

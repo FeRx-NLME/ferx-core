@@ -38,6 +38,42 @@ pub fn chi_square_sf(x: f64, df: usize) -> f64 {
 }
 
 /// One likelihood-ratio comparison, as a search step reports it.
+/// The χ² quantile with upper-tail probability `p` on `df` degrees of freedom
+/// — `scipy.stats.chi2.isf(p, df)`, the ΔOFV a likelihood-ratio test at level
+/// `p` has to reach. Pharmpy's ruvsearch (#1182) uses it as the fixed
+/// `cutoff` its CWRES pre-screen and final comparison apply.
+///
+/// Bisection on [`chi_square_sf`], which is monotone decreasing in `x`, to
+/// machine precision on the bracket; `NaN` for a `p` outside `(0, 1]` or
+/// `df = 0`, and `0` at `p = 1`.
+pub fn chi_square_isf(p: f64, df: usize) -> f64 {
+    if df == 0 || !(p > 0.0 && p <= 1.0) {
+        return f64::NAN;
+    }
+    if p == 1.0 {
+        return 0.0;
+    }
+    let (mut lo, mut hi) = (0.0_f64, 1.0_f64);
+    while chi_square_sf(hi, df) > p {
+        hi *= 2.0;
+        if !hi.is_finite() {
+            return f64::INFINITY;
+        }
+    }
+    for _ in 0..200 {
+        let mid = 0.5 * (lo + hi);
+        if mid == lo || mid == hi {
+            break;
+        }
+        if chi_square_sf(mid, df) > p {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    0.5 * (lo + hi)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Lrt {
     /// `OFV_reduced − OFV_extended`: positive when the extended model fits
@@ -115,6 +151,22 @@ mod tests {
         assert!((chi_square_sf(13.2767, 4) - 0.01).abs() < 1e-5);
         // chi2.sf(20.0, 3) == 0.00017
         assert!((chi_square_sf(20.0, 3) - 0.000_170_0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn chi_square_isf_inverts_the_tail() {
+        // scipy.stats.chi2.isf(q, 1): 3.841459, 6.634897, 10.827566
+        assert!((chi_square_isf(0.05, 1) - 3.841_459).abs() < 1e-5);
+        assert!((chi_square_isf(0.01, 1) - 6.634_897).abs() < 1e-5);
+        assert!((chi_square_isf(0.001, 1) - 10.827_566).abs() < 1e-5);
+        assert!((chi_square_isf(0.01, 2) - 9.210_34).abs() < 1e-4);
+        for p in [0.5, 0.05, 0.001] {
+            let x = chi_square_isf(p, 1);
+            assert!((chi_square_sf(x, 1) - p).abs() < 1e-12, "p = {p}");
+        }
+        assert_eq!(chi_square_isf(1.0, 1), 0.0);
+        assert!(chi_square_isf(0.0, 1).is_nan());
+        assert!(chi_square_isf(0.05, 0).is_nan());
     }
 
     #[test]
