@@ -41,28 +41,20 @@ use std::time::Instant;
 /// no dose has a referent at `t`. Shared by the per-observation TAD column and
 /// the model-based integral grid so both apply identical per-dose-lag logic.
 ///
-/// The per-dose rule is [`crate::dosing::tad_referent`], the one the ODE predictors
-/// integrate under, so the reported column and the injected `TAD` cannot disagree —
-/// they did before #1126: inside a seeded steady-state dose's pre-arrival window this
-/// fold had no candidate at all and the sdtab cell came out **blank**, while the
-/// predictors were integrating under an anchor of their own. What stays local here is
-/// only the *no-referent* answer: `NaN`, the sdtab convention, rather than the
-/// predictors' first-arrival fallback, which exists to keep an integration finite and
-/// would report a negative `TAD` in a column that means "not yet dosed".
+/// Delegates to [`crate::dosing::tad_at`], which folds the same per-dose
+/// [`crate::dosing::tad_referent`] the ODE predictors integrate under — so the reported
+/// column and the injected `TAD` cannot disagree. They did before #1126: inside a seeded
+/// steady-state dose's pre-arrival window this fold had no candidate at all and the sdtab
+/// cell came out **blank**, while the predictors were integrating under an anchor of their
+/// own. `tad_at`'s no-referent answer is `NaN`, the sdtab convention, rather than the
+/// predictors' first-arrival fallback, which exists to keep an integration finite and would
+/// report a negative `TAD` in a column that means "not yet dosed".
+///
+/// Kept as a named wrapper rather than inlined at its two call sites (the per-observation
+/// column and the `[derived]` integral grid, `:734`) because those call it with a `&Subject`
+/// and the doc above is what they are reading.
 fn tad_at_time(subject: &Subject, t: f64, dose_lagtimes: &[f64]) -> f64 {
-    let last_dose_eff = subject
-        .doses
-        .iter()
-        .enumerate()
-        .filter_map(|(d, dose)| {
-            crate::dosing::tad_referent(dose, dose_lagtimes.get(d).copied().unwrap_or(0.0), t)
-        })
-        .fold(f64::NEG_INFINITY, f64::max);
-    if last_dose_eff.is_finite() {
-        t - last_dose_eff
-    } else {
-        f64::NAN
-    }
+    crate::dosing::tad_at(&subject.doses, dose_lagtimes, t)
 }
 
 /// Compute TAFD (time after first dose) and TAD (time after last dose, SS-aware)

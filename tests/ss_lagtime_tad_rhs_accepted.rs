@@ -123,9 +123,18 @@ fn ss_plus_lagtime_plus_a_tad_reading_rhs_is_accepted_and_predicts_the_anchor() 
         "#1126 supplies the pre-arrival referent, so this combination must no longer be \
          rejected. Got: {got:?}"
     );
+    // …and nothing else may sweep the combination up under a *different* name either. Scoped
+    // to the SS/TAD/lagtime family rather than `got.is_empty()`: an unrelated future check
+    // firing on a 1-cpt steady-state model would otherwise fail here with a message pointing
+    // at #1126 instead of at the change that added it.
+    let swept: Vec<&String> = got
+        .iter()
+        .filter(|c| c.contains("SS") || c.contains("TAD") || c.contains("LAG"))
+        .collect();
     assert!(
-        got.is_empty(),
-        "and nothing else may sweep it up under a different code either. Got: {got:?}"
+        swept.is_empty(),
+        "no SS / TAD / lagtime diagnostic may reject this combination. Got: {swept:?} \
+         (all codes: {got:?})"
     );
 
     let model = parse_full_model(&model_src(LAG, "+ 0.03*TAD"))

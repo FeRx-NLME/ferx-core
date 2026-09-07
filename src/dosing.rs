@@ -967,6 +967,7 @@ const TAD_EPS: f64 = 1e-12;
 /// Under the clamp `TAD` runs `0 … lag` across the window and so exceeds `II`. That is what
 /// the clamp *means*: the pulse lands on the record and nothing intervenes before the real
 /// arrival, so there is no shorter elapsed time to report.
+#[inline]
 pub(crate) fn tad_referent(dose: &DoseEvent, lag: f64, t: f64) -> Option<f64> {
     let arrival = dose.time + lag;
     if arrival <= t + TAD_EPS {
@@ -980,6 +981,43 @@ pub(crate) fn tad_referent(dose: &DoseEvent, lag: f64, t: f64) -> Option<f64> {
         return Some(dose.time - ss_seed_phase(dose, lag));
     }
     None
+}
+
+/// `TAD` at `t` — [`tad_referent`] folded over a dose list, `NaN` when no dose has a referent.
+///
+/// The **reporting** answer, and the second half of collapsing #1126's four hand-written
+/// copies: the per-dose rule was the interesting duplication, but the fold around it —
+/// `fold(NEG_INFINITY, f64::max)`, then `is_finite`, then `NaN` — was written out identically
+/// beside it in `api::output_columns::tad_at_time` and `io::output`'s sdtab fallback. Both now
+/// call this.
+///
+/// `dose_lagtimes` may be **shorter than `doses`, including empty**; a missing entry is zero
+/// lag, matching [`crate::ode::predictions::tad_anchor_for`] and `active_infusions`.
+///
+/// [`crate::ode::predictions::tad_anchor_for`] deliberately does **not** call this. It shares
+/// the fold but not the tail: where nothing has a referent it falls back to the subject's
+/// earliest lagged arrival, because a `NaN` anchor multiplies into the integrator state and
+/// poisons every later prediction, while a *reported* `TAD` of "not dosed yet" is `NaN` by the
+/// sdtab convention and a negative number there would be worse than blank. Two different
+/// questions about the same fold, kept apart on purpose.
+///
+/// `f64::max` discards `NaN`, so a `Some(NaN)` referent would be silently dropped and the
+/// answer taken from the remaining doses. [`tad_referent`] cannot produce one — every path to
+/// `Some` returns a value built from a `dose.time`/`lag` pair that already passed a finite
+/// comparison, and a non-finite pair falls through to `None` — and
+/// `tad_referent_never_returns_a_nan_referent` pins that rather than leaving it to inspection.
+#[inline]
+pub(crate) fn tad_at(doses: &[DoseEvent], dose_lagtimes: &[f64], t: f64) -> f64 {
+    let last = doses
+        .iter()
+        .enumerate()
+        .filter_map(|(i, d)| tad_referent(d, dose_lagtimes.get(i).copied().unwrap_or(0.0), t))
+        .fold(f64::NEG_INFINITY, f64::max);
+    if last.is_finite() {
+        t - last
+    } else {
+        f64::NAN
+    }
 }
 
 #[cfg(test)]
@@ -1171,6 +1209,69 @@ mod tad_referent_tests {
         assert_eq!(tad(&d, 0.0, 485.0), Some(5.0));
         assert_eq!(tad(&d, 0.0, 492.0), Some(0.0), "one full interval on");
         assert_eq!(tad_referent(&d, 0.0, 479.9), None);
+    }
+
+    /// `tad_at` folds `tad_referent` and reports `NaN` where nothing has a referent — the
+    /// *reporting* tail, deliberately different from `tad_anchor_for`'s first-arrival
+    /// fallback. Both spellings of the fold used to be written out by hand beside each other.
+    #[test]
+    fn tad_at_folds_the_referents_and_reports_nan_when_none_exists() {
+        use super::tad_at;
+        let doses = [plain(0.0), ss_dose()];
+        // Inside the SS dose's pre-arrival window the SS referent (471) outranks the
+        // ordinary dose's arrival (3), so the fold must pick it rather than the max time.
+        assert_eq!(tad_at(&doses, &[3.0, 3.0], 481.0), 10.0);
+        // Past the SS arrival it is back on the periodic fold.
+        assert_eq!(tad_at(&doses, &[3.0, 3.0], 485.0), 2.0);
+        // A short slice means zero lag on the remaining doses, and `&[]` means all of them.
+        assert_eq!(
+            tad_at(&doses, &[3.0], 485.0),
+            5.0,
+            "dose 1 unlagged: pulse at 480"
+        );
+        assert_eq!(tad_at(&doses, &[], 485.0), 5.0);
+        // Nothing has a referent yet.
+        assert!(tad_at(&doses, &[3.0, 3.0], -1.0).is_nan());
+        // …and a dose-free subject.
+        assert!(tad_at(&[], &[], 5.0).is_nan());
+    }
+
+    /// `tad_at` folds with `f64::max`, which **discards** `NaN` — so a `Some(NaN)` referent
+    /// would be silently dropped and the answer taken from the other doses.
+    ///
+    /// `tad_referent` cannot produce one, and this pins that rather than leaving it to
+    /// inspection: every non-finite `dose.time`/`lag`/`ii` combination must come back `None`
+    /// (a comparison against `NaN` is `false`, so both guards fall through), and the one
+    /// infinite case that *does* pass a guard must still yield a finite referent.
+    #[test]
+    fn tad_referent_never_returns_a_nan_referent() {
+        let mut nan_time = ss_dose();
+        nan_time.time = f64::NAN;
+        assert_eq!(tad_referent(&nan_time, 3.0, 481.0), None, "NaN dose time");
+
+        let d = ss_dose();
+        assert_eq!(tad_referent(&d, f64::NAN, 481.0), None, "NaN lag");
+        assert!(
+            tad_referent(&d, 3.0, f64::NAN).is_none(),
+            "NaN observation time"
+        );
+
+        let mut nan_ii = ss_dose();
+        nan_ii.ii = f64::NAN;
+        // `ii > 0.0` is false for NaN, so this takes the ordinary-dose arm and never reaches
+        // `rem_euclid(NaN)`.
+        assert_eq!(tad_referent(&nan_ii, 3.0, 485.0), Some(483.0));
+
+        let mut inf_ii = ss_dose();
+        inf_ii.ii = f64::INFINITY;
+        // `elapsed.rem_euclid(inf)` is `elapsed` for a positive elapsed, so the referent is
+        // the arrival — finite, not NaN.
+        assert_eq!(tad_referent(&inf_ii, 3.0, 485.0), Some(483.0));
+
+        // The whole point: had any of the above returned `Some(NaN)`, this fold would have
+        // hidden it behind the ordinary dose.
+        let doses = [plain(0.0), nan_time];
+        assert_eq!(super::tad_at(&doses, &[3.0, 3.0], 481.0), 478.0);
     }
 
     /// `SS=1` with a non-positive `II` is not a periodic train — `W_STEADY_STATE_II` warns and

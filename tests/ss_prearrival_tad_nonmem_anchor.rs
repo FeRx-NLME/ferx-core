@@ -59,6 +59,7 @@ use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::pk::{compute_predictions_with_states, compute_predictions_with_tv};
 use ferx_core::types::CompiledModel;
 use ferx_core::{read_nonmem_csv, Population};
+use std::collections::HashMap;
 
 fn anchor(name: &str) -> std::path::PathBuf {
     // `CARGO_MANIFEST_DIR`, not a relative path — the sibling anchor suites all resolve this
@@ -77,8 +78,22 @@ fn model(file: &str) -> CompiledModel {
         .model
 }
 
-fn population(csv: &str) -> Population {
-    read_nonmem_csv(&anchor(csv), None, None).expect("the anchor dataset is committed")
+/// Parsed once per process and shared. Every test in this file reads two or three datasets
+/// and `closed_form_rows` reads one again by name, so the uncached form ran the NONMEM CSV
+/// parser a dozen times over the same handful of files.
+fn population(csv: &str) -> &'static Population {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, &'static Population>>> =
+        std::sync::OnceLock::new();
+    let mut guard = CACHE
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .expect("the population cache mutex is never poisoned by these tests");
+    guard.entry(csv.to_string()).or_insert_with(|| {
+        let p = read_nonmem_csv(&anchor(csv), None, None).expect("the anchor dataset is committed");
+        // Leaked deliberately: these live for the whole test binary and handing back a
+        // `&'static` keeps every call site's `&Population` borrow trivially valid.
+        Box::leak(Box::new(p))
+    })
 }
 
 /// The `IPRED` column of `results/<stream>.tab`, observation rows only (`EVID == 0`), in
@@ -146,6 +161,16 @@ fn ferx_dense_states(m: &CompiledModel, pop: &Population) -> Vec<(f64, f64)> {
     for s in &pop.subjects {
         let (_, states) = compute_predictions_with_states(m, s, &m.default_params.theta, &zero);
         assert_eq!(states.len(), s.obs_times.len());
+        // Index 0 is `central` only while these twins stay one-compartment. A fixture that
+        // gained a depot or peripheral would make this read the wrong state and compare it
+        // against `central`'s reference — a failure that reads as an engine regression
+        // rather than the fixture edit it is. `fixture_constants_…` guards every other
+        // literal this suite leans on; this is the one it cannot see.
+        assert!(
+            states.iter().all(|u| u.len() == 1),
+            "ferx_dense_states reads u[0] as the observed compartment; this twin is no \
+             longer single-state"
+        );
         out.extend(
             s.obs_times
                 .iter()
@@ -503,12 +528,19 @@ fn a_zero_coefficient_tad_term_returns_the_autonomous_steady_state() {
         ),
     ] {
         let src = std::fs::read_to_string(anchor(twin)).expect("twin");
-        let inert = parse_full_model(&src.replace("0.03*TAD", "0.0*TAD"))
-            .expect("parses")
-            .model;
-        let autonomous = parse_full_model(&src.replace(" * (1.0 + 0.03*TAD)", ""))
-            .expect("parses")
-            .model;
+        // Assert both substitutions actually matched. If a fixture edit made BOTH of them
+        // no-ops, `inert` and `autonomous` would be the same unmodified model, `worst` would
+        // be 0.0, and the assertion below would pass while comparing a model with itself —
+        // and this is the file's only plumbing discriminator, so nothing else would notice.
+        let inert_src = src.replace("0.03*TAD", "0.0*TAD");
+        let autonomous_src = src.replace(" * (1.0 + 0.03*TAD)", "");
+        assert_ne!(inert_src, src, "{tag}: `0.03*TAD` not found in {twin}");
+        assert_ne!(
+            autonomous_src, src,
+            "{tag}: ` * (1.0 + 0.03*TAD)` not found in {twin}"
+        );
+        let inert = parse_full_model(&inert_src).expect("parses").model;
+        let autonomous = parse_full_model(&autonomous_src).expect("parses").model;
         let pop = population(csv);
         let a = ferx_event_driven(&inert, &pop);
         let b = ferx_event_driven(&autonomous, &pop);
@@ -541,8 +573,8 @@ fn lagged_ss_infusions_land_on_their_explicit_infusion_trains() {
             "train_inf_tadlag.csv",
             "train_inf_tadlag",
             483.0,
-            5e-8,
-            "5.83e-9",
+            2e-8,
+            "5.8287e-9",
         ),
         (
             "ss_inf_tadlag_resid_fit.ferx",
@@ -550,8 +582,8 @@ fn lagged_ss_infusions_land_on_their_explicit_infusion_trains() {
             "train_inf_tadlag_resid.csv",
             "train_inf_tadlag_resid",
             490.0,
-            5e-8,
-            "measured in the PR table",
+            1e-8,
+            "2.4196e-9",
         ),
     ] {
         let m = model(twin);
@@ -562,7 +594,8 @@ fn lagged_ss_infusions_land_on_their_explicit_infusion_trains() {
         assert!(
             vs_nm < bound,
             "{twin}: ferx SS vs NONMEM's explicit lagged infusion train {vs_nm:.3e} \
-             (realised {realised}, bound {bound:.0e})"
+             (realised {realised}, bound {bound:.0e} — between 3x and 5x headroom, set \
+             from the realised error rather than picked round)"
         );
         let vs_own = worst_rel_all(&ss, &own_train, twin);
         assert!(vs_own < 1e-8, "{twin}: vs ferx's own train {vs_own:.3e}");
@@ -610,7 +643,7 @@ fn a_lagtime_of_a_full_interval_or_more_follows_the_clamped_phase() {
     let worst = worst_rel_external(&got, &want, "lag >= II clamp vs closed form");
     assert!(
         worst < 5e-9,
-        "realised 5.44e-10 across 481/482/485/488/491; got {worst:.3e}"
+        "realised 4.0869e-10 across 481/482/485/488/491 — 12x headroom; got {worst:.3e}"
     );
 
     // And it is genuinely a different answer from the un-clamped wrap — otherwise this test
@@ -641,6 +674,54 @@ fn tafd_stays_nan_under_a_lagged_ss_dose() {
     assert!(
         got.iter().all(|(_, v)| v.is_nan()),
         "TAFD under SS is T3's; it must still read NaN. Got {got:?}"
+    );
+}
+
+/// `simulate()` and `predict()` reach the fix too — measured, not inferred (#1126 review).
+///
+/// Both are separate public entry points from the objective path this file otherwise
+/// exercises, and the CHANGELOG makes a user-facing claim about them. T2 (#1270) measured
+/// `simulate()` on the un-lagged case rather than asserting it, for the same reason: the
+/// steady-state family has several entry points and "it plausibly routes through the fixed
+/// predictor" is a code read, not a result. Before #1126 both returned `NaN` here.
+///
+/// `predict()` is at η = 0 by construction; `simulate()` is seeded and draws residual error,
+/// so its `ipred` — the individual prediction *before* error — is what is comparable, and
+/// `omega` is empty in this twin so its η is zero too.
+#[test]
+fn simulate_and_predict_reach_the_pre_arrival_referent() {
+    let m = model("ss_tadlag_fit.ferx");
+    let pop = population("ss_tadlag.csv");
+    let want = nonmem_ipred("train_tadlag");
+
+    let preds = ferx_core::api::predict(&m, pop, &m.default_params);
+    assert_eq!(preds.len(), want.len(), "predict() row count");
+    let mut worst_pred = 0.0_f64;
+    for (p, &(t, w)) in preds.iter().zip(&want) {
+        assert!(
+            (p.time - t).abs() < 1e-9,
+            "predict() time {} vs {t}",
+            p.time
+        );
+        assert!(p.pred.is_finite(), "predict() returned {} at t={t}", p.pred);
+        worst_pred = worst_pred.max((p.pred - w).abs() / w.abs());
+    }
+    assert!(
+        worst_pred < 1e-7,
+        "predict() vs NONMEM's lagged train: {worst_pred:.3e} (realised 1.69e-8, 6x headroom)"
+    );
+
+    let sims = ferx_core::api::simulate_with_seed(&m, pop, &m.default_params, 1, 7);
+    let ipreds: Vec<f64> = sims.iter().map(|r| r.ipred).collect();
+    assert_eq!(ipreds.len(), want.len(), "simulate() row count");
+    let mut worst_sim = 0.0_f64;
+    for (&got, &(t, w)) in ipreds.iter().zip(&want) {
+        assert!(got.is_finite(), "simulate() ipred is {got} at t={t}");
+        worst_sim = worst_sim.max((got - w).abs() / w.abs());
+    }
+    assert!(
+        worst_sim < 1e-7,
+        "simulate() ipred vs NONMEM's lagged train: {worst_sim:.3e}"
     );
 }
 
