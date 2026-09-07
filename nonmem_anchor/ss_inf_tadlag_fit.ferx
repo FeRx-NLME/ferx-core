@@ -1,0 +1,47 @@
+# A lagged `SS=1` **infusion** on an `[odes]` RHS that reads `TAD` (#1126, batch-T step T4).
+#
+# The ferx twin of `nonmem_anchor/ss_inf_tadlag.ctl` and `train_inf_tadlag.ctl`. Identical to
+# `ss_tadlag_fit.ferx` except that the dataset delivers the 100 mg over `RATE = 25`, i.e.
+# `T_inf = 4 h` — which is the point. A **bolus** fixture reaches only one of the three
+# `solve_ode` windows inside the steady-state phase advance; an infusion with
+# `phase = II − ALAG = 9 > T_inf = 4` reaches the other two: the **active** window `(0, T_inf)`,
+# anchored at its own pulse, and the **quiet** window that re-opens `T_inf` later and must be
+# anchored at `−T_inf` so `TAD` continues at `4 … 9` rather than restarting at zero.
+#
+# Mutating that `−T_inf` to `0` is invisible to every bolus fixture and to every `0.0*TAD`
+# discriminator (both sides stay TAD-independent), so this arm needs a **value** oracle. It has
+# one: `lag = 3 < II`, so the explicit lagged infusion train reproduces the steady-state
+# geometry exactly — pulses at 3, 15, …, 483, each infusing for 4 h, and the window
+# `[480, 483)` quiet in both. Measured 2026-09-06, ferx's `SS=1` record lands on NONMEM's
+# 41-dose lagged infusion train to 5.8e-9, while NONMEM's own `SS=1` record sits 1.22e-2 from
+# that same train.
+
+[parameters]
+  theta TVCL(1.0, FIX)
+  theta TVV(20.0, FIX)
+  theta TVLAG(3.0, FIX)
+
+  sigma PROP ~ 0.01                # variance; NONMEM `$SIGMA 0.01`
+
+[individual_parameters]
+  CL      = TVCL
+  V       = TVV
+  LAGTIME = TVLAG
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central * (1.0 + 0.03*TAD)
+
+[scaling]
+  obs_scale = V                    # the state is an AMOUNT; NONMEM's `$ERROR` divides by V
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[fit_options]
+  method     = focei
+  maxiter    = 0
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11

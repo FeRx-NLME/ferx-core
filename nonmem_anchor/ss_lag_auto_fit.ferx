@@ -1,0 +1,45 @@
+# The **autonomous certifying control** for the lagged pre-arrival `TAD` anchor (#1126).
+#
+# Identical to `ss_tadlag_fit.ferx` in every respect but the right-hand side, which drops
+# the `TAD` term. The ferx twin of `nonmem_anchor/ss_lag_auto.ctl` and `train_lag_auto.ctl`
+# and, like its sibling, run against both datasets.
+#
+# Its job is to separate two hypotheses that a single stream cannot. If ferx's lagged `SS=1`
+# record disagreed with its own lagged train here too, the defect would be in the #1121 seed
+# geometry and `TAD` would be a red herring. Measured 2026-09-06, it does not: NONMEM's own
+# lagged SS and lagged train agree to 1.14e-9 on this RHS, and both sit within 8.9e-10 of a
+# closed form computed outside either engine. So the lag machinery is exact and anything the
+# `TAD` arm shows is about the referent.
+#
+# One-variable experiment: this file and `ss_tadlag_fit.ferx` differ by the single factor
+# `(1.0 + 0.03*TAD)`, and the datasets are byte-identical apart from their names.
+
+[parameters]
+  theta TVCL(1.0, FIX)
+  theta TVV(20.0, FIX)
+  theta TVLAG(3.0, FIX)
+
+  sigma PROP ~ 0.01                # variance; NONMEM `$SIGMA 0.01`
+
+[individual_parameters]
+  CL      = TVCL
+  V       = TVV
+  LAGTIME = TVLAG
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central
+
+[scaling]
+  obs_scale = V                    # the state is an AMOUNT; NONMEM's `$ERROR` divides by V
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[fit_options]
+  method     = focei
+  maxiter    = 0
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11

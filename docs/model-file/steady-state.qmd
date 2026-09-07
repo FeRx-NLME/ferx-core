@@ -361,6 +361,41 @@ every observation and a non-finite objective —
 including when the term's coefficient was **zero**, since `0.0 * NaN` is `NaN`, so merely
 mentioning `TAD` broke an otherwise ordinary steady-state model.
 
+### Under a lagtime {#steady-state-tad-under-a-lagtime}
+
+A lagtime opens a window between the dose **record** and the lagged arrival,
+`[t_dose, t_dose + ALAG)`. Since ferx 0.3 the periodic state is loaded at the record and flows
+to the arrival, so the state in that window is the *previous* cycle's decaying tail — and `TAD`
+measures from that cycle's pulse, at `t_dose − max(II − ALAG, 0)`. It therefore runs
+`II − ALAG … II` across the window and resets to `0` when the dose lands, which is the same
+sawtooth an explicit dose train produces.
+
+The same model with `ALAG1 = 3`, one `SS=1` record at `t = 480` (so the arrival is at 483) and
+samples at 481 / 482, both **inside** the window:
+
+| | t = 481 | worst relative error |
+|---|---|---|
+| ferx `SS=1` | 5.5452940851 | — |
+| Explicit 41-dose lagged train (ferx) | 5.5452940849 | 2.5e-11 |
+| Explicit 41-dose lagged train (NONMEM) | 5.5452941786 | 1.7e-8 |
+| Closed form, outside both engines | 5.5452940825 | ferx 4.7e-10 |
+| NONMEM `SS=1` record | 5.4709357327 | **1.3e-2** |
+
+The last row is why the *train* is the reference and NONMEM's own steady-state record is not.
+With the `TAD` term removed, NONMEM's lagged `SS=1` record reproduces its own lagged train to
+1.1e-9 — so the lag geometry is not in question — but with it, NONMEM's steady-state routine
+sits 1.3 % from its own train, on both sides of the arrival. ferx reproduces the train.
+
+A lagtime of a **full interval or more** keeps the clamped phase described under
+[Lagtime](lagtime.qmd): the pulse lands on the record itself, nothing intervenes before the real
+arrival, and `TAD` runs `0 … ALAG` across the window — exceeding `II`, which is what the clamp
+means.
+
+Before ferx 0.3 this combination returned `NaN` for the **whole subject**, not only inside the
+window, because the wrong value was carried into the steady-state trough.
+
+## Steady state with `TAFD` or `TIME`
+
 `TAFD` and `TIME`/`T` are a different case and are **not** covered by the above. They read
 an absolute clock, so the dose train has no periodic limit for the run-in to converge to —
 measured, an explicit `TAFD` train moves 29 % per doubling of its length while the `TAD`
@@ -371,18 +406,6 @@ Neither number is the steady state of a system that has one; if your model means
 absolute clock, expand the run-in with explicit dose records instead of `SS=1`.
 
 ## Limitations
-
-`SS=1` combined with a **lagtime** on a model whose `[odes]` RHS reads `TAD` is rejected by
-`fit()` and `ferx check` (`E_SS_LAGTIME_TAD_RHS`). `simulate()` and `predict()` do **not**
-run that check — they validate a narrower bundle — so on those paths the configuration is
-not rejected and still returns the `NaN` it did before; treat a non-finite simulation of
-such a model as this diagnostic in disguise. `TAD` has no referent in the window between the dose
-record and the lagged arrival, and since the record-time seed flows to the arrival rather
-than being re-equilibrated there, the wrong value is carried into the steady-state trough
-and shifts *every* prediction, not just the ones inside that window — measured 2.7 % on
-the model above with `ALAG1 = 3`. Remove the lagtime, drop the `TAD` term, or expand the
-run-in with explicit dose records. A steady-state dose **without** a lagtime reads `TAD`
-correctly, as above.
 
 For the following malformed configurations, ferx-core skips the SS
 pre-equilibration (treating the dose as a single, non-SS bolus or

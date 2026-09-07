@@ -1,0 +1,48 @@
+# A lagged `SS=1` infusion whose **previous cycle is still running at the dose record**
+# (#1126, batch-T step T4).
+#
+# The ferx twin of `nonmem_anchor/ss_inf_tadlag_resid.ctl` and `train_inf_tadlag_resid.ctl`.
+# Same 4 h infusion as `ss_inf_tadlag_fit.ferx`, but `ALAG1 = 10`, so the seed phase is
+# `II − lag = 2 < T_inf = 4`: `ss_state_at_phase` hands the walk a state with the infusion
+# **mid-flight**, the phase advance runs only its active window `(0, 2)` and no quiet window at
+# all, and `crate::dosing::ss_residual_infusion_end` carries `+rate` across `[480, 482]` of the
+# pre-arrival window.
+#
+# It is the second infusion arm on purpose: `ss_inf_tadlag_fit.ferx` (`lag = 3`) exercises the
+# active **and** quiet windows with no residual, this one the active window **with** a residual.
+# Neither subsumes the other, and each is a different branch of `ss_residual_infusion_end`.
+#
+# `lag = 10 < II = 12`, so the explicit lagged infusion train reproduces the geometry (pulses at
+# 10, 22, …, 490, each running 4 h, so the previous one covers `[478, 482]` and spans the record
+# at 480 in both) and is the oracle. Observations at 481 / 483 / 486 / 489 are inside
+# `[480, 490)` and 492 is past the arrival.
+
+[parameters]
+  theta TVCL(1.0, FIX)
+  theta TVV(20.0, FIX)
+  theta TVLAG(10.0, FIX)
+
+  sigma PROP ~ 0.01                # variance; NONMEM `$SIGMA 0.01`
+
+[individual_parameters]
+  CL      = TVCL
+  V       = TVV
+  LAGTIME = TVLAG
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central * (1.0 + 0.03*TAD)
+
+[scaling]
+  obs_scale = V                    # the state is an AMOUNT; NONMEM's `$ERROR` divides by V
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[fit_options]
+  method     = focei
+  maxiter    = 0
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11

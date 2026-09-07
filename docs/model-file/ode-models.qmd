@@ -67,9 +67,16 @@ compartment state and turned any fit of an `[odes]` RHS referencing `TAD` into
 the `1e20` objective sentinel. The value is now finite, and it depends only on
 the subject's dosing — not on where observations happen to fall — so adding a
 sample inside that window cannot move a later prediction. What `TAD` *should*
-mean before a dose has arrived is still open
-([#1110](https://github.com/FeRx-NLME/ferx-core/issues/1110)); a model that reads
-`TAD` in that window should guard it explicitly rather than rely on the sign.
+mean before an ordinary dose has arrived is a convention rather than a derivable
+answer, so a model that reads `TAD` there should guard it explicitly rather than
+rely on the sign.
+
+**A steady-state dose is the exception, and it is not a convention.** Under
+`SS=1` the periodic fiction *does* have a prior pulse, at
+`t_dose − max(II − ALAG, 0)`, and the state in the pre-arrival window is that
+cycle's decaying tail. `TAD` there is measured from that pulse, so it is positive
+and continuous with the post-arrival sawtooth rather than negative. See
+[Steady-state doses](steady-state.qmd#steady-state-tad-under-a-lagtime).
 
 A subject with **no** doses at all still reads `NaN` — `TAD` has no referent
 there — matching the sdtab column.
