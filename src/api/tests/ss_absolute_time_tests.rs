@@ -26,7 +26,7 @@
 
 use super::{check_model_data, check_model_data_warnings};
 use crate::parser::model_parser::parse_model_string;
-use crate::types::{DoseEvent, Population, Subject};
+use crate::types::{DoseEvent, Population, RateMode, Subject};
 
 const CODE: &str = "W_STEADY_STATE_ABSOLUTE_TIME";
 
@@ -95,6 +95,14 @@ fn warning_for(model: &crate::types::CompiledModel, pop: &Population) -> Option<
 
 fn warning(term: &str) -> Option<String> {
     warning_for(&ode_model(term), &population(1, true, 12.0))
+}
+
+/// Whether the check raised the given code.
+fn raised(model: &crate::types::CompiledModel, pop: &Population, code: &str) -> bool {
+    let init = model.default_params.clone();
+    check_model_data_warnings(model, pop, &init)
+        .iter()
+        .any(|d| d.code == code)
 }
 
 /// Every absolute-clock spelling fires, and the message says which failure the model has.
@@ -203,8 +211,12 @@ fn a_steady_state_dose_with_no_interval_does_not_warn() {
 ///
 /// `equilibrate_ss_pk_state` returns before integrating anything in two cases, and in both
 /// the ordinary finite `TAFD` anchor stays in place: an infusion whose `T_inf` exceeds its own
-/// `II` (already reported as `W_STEADY_STATE_INFUSION` — the record is served as a single
-/// non-SS infusion), and a dose whose compartment index is outside the state vector (#899).
+/// `II` (the record is served as a single non-SS infusion), and a dose whose compartment index
+/// is outside the state vector (#899).
+///
+/// The fixtures here carry no `F`, so `T_inf` is the record's own `AMT/RATE`. That is *not*
+/// the general condition — the run-in compares the bioavailable length, which
+/// [`the_run_in_bail_out_follows_bioavailability`] pins separately.
 ///
 /// Measured end-to-end at the time this was written: the same `0.003*TAFD` model with
 /// `AMT = 100, RATE = 5, II = 12` (so `T_inf = 20 > II`) fits to **OFV 367.2851** — finite —
@@ -396,6 +408,135 @@ fn a_time_reading_intermediate_used_only_by_the_hazard_still_warns() {
 #[cfg(feature = "survival")]
 fn joint_model(pk: &str, haz: &str) -> crate::types::CompiledModel {
     joint_src(pk, "", haz)
+}
+
+/// The same 1-cpt `[odes]` model as [`ode_model`], with a bioavailability on compartment 1.
+fn ode_model_with_f(term: &str, f: &str) -> crate::types::CompiledModel {
+    parse_model_string(&format!(
+        "[parameters]\n  theta TVCL(1.0, 0.001, 100.0)\n  theta TVV(20.0, 0.001, 500.0)\n  \
+         omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.1 (sd)\n[individual_parameters]\n  CL = TVCL * \
+         exp(ETA_CL)\n  V  = TVV\n  F1 = {f}\n[structural_model]\n  ode(obs_cmt=central, \
+         states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central * (1.0{term})\n  \
+         \n[error_model]\n  DV ~ proportional(PROP)\n"
+    ))
+    .expect("parse")
+}
+
+/// The same model with a **modeled duration** (`RATE = -2` → `D1`), so `F` reshapes the rate
+/// and leaves the infusion's length alone (`InfusionDef::DurationDefined`, #419).
+fn ode_model_with_d1(term: &str, f: &str, d1: &str) -> crate::types::CompiledModel {
+    parse_model_string(&format!(
+        "[parameters]\n  theta TVCL(1.0, 0.001, 100.0)\n  theta TVV(20.0, 0.001, 500.0)\n  \
+         theta TVD1({d1}, 0.1, 100.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.1 \
+         (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n  D1 = TVD1\n  \
+         F1 = {f}\n[structural_model]\n  ode(obs_cmt=central, states=[central])\n[odes]\n  \
+         d/dt(central) = -(CL/V) * central * (1.0{term})\n  \n[error_model]\n  DV ~ \
+         proportional(PROP)\n"
+    ))
+    .expect("parse")
+}
+
+/// **Which infusions reach the run-in is decided on the bioavailable length, not on the
+/// record's own `AMT/RATE`** — and both steady-state warnings have to ask it the same way.
+///
+/// `equilibrate_ss_pk_state` bails on `is_real_infusion(dose) && t_inf > dose.ii`, with `t_inf`
+/// from [`crate::types::DoseEvent::bioavailable_infusion`]. That is mode-aware (#419): on a
+/// **rate-defined** infusion the data fixes the rate, so `F` scales the *length*; on a
+/// **duration-defined** one (`RATE = -2` → `D{n}`) it scales the rate and the length is
+/// untouched. Comparing the unscaled duration instead made the two warnings below false in
+/// opposite directions (#1139 / #1281), so they now share one predicate.
+///
+/// Measured by reading what the same model predicts, not by reading the gate:
+///
+/// | dose | bioavailable `T_inf` vs `II = 12` | predictions | `…INFUSION` | `…ABSOLUTE_TIME` |
+/// |---|---|---|---|---|
+/// | `RATE = 5`, `F1 = 1.0` | `20 > 12`, run-in skipped | `9.514379031181768`, `22.093161802029634` | fires | silent |
+/// | `RATE = 5`, `F1 = 0.5` | `10 ≤ 12`, run-in **runs** | `NaN`, `NaN` | silent | fires |
+/// | `RATE = -2`, `D1 = 20`, `F1 = 0.5` | `20 > 12`, run-in skipped | finite | fires | silent |
+///
+/// Every row is load-bearing. Row 1 is the straddle for row 2 — same record, same `RATE`, same
+/// compartment — so a gate that had merely stopped firing on infusions fails it. Row 3 is the
+/// arm a hand-written `F * duration` breaks: it would read `0.5 · 20 = 10 ≤ 12` and flip both
+/// verdicts, which is why the predicate has to go through `bioavailable_infusion` rather than
+/// multiply. `tests/modeled_duration.rs` covers `RATE = -2` at `F = 1`, where a wrong scaling
+/// is invisible.
+///
+/// Tier 1 in cost — two observations on one subject — but it does call
+/// [`crate::api::predict`], because the property under test is *agreement with the
+/// integrator*, and a check-pass-only assertion would pin the gates against themselves.
+#[test]
+fn the_run_in_bail_out_follows_bioavailability() {
+    const INF: &str = "W_STEADY_STATE_INFUSION";
+    // `AMT = 100, RATE = 5` is a 20-hour infusion into an `II = 12` interval.
+    let pop = population_with(5.0, 1);
+
+    let full = ode_model_with_f(" + 0.003*TAFD", "1.0");
+    let preds = crate::api::predict(&full, &pop, &full.default_params.clone());
+    assert!(
+        preds.iter().all(|p| p.pred.is_finite()),
+        "F = 1 leaves T_inf = 20 > II = 12, so the run-in is skipped and TAFD keeps its \
+         ordinary anchor: {:?}",
+        preds.iter().map(|p| p.pred).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        warning_for(&full, &pop),
+        None,
+        "nothing about that fit is NaN, so the message would be false"
+    );
+    assert!(
+        raised(&full, &pop, INF),
+        "the record really is served as a single non-SS infusion here, which is what \
+         {INF} says"
+    );
+
+    let half = ode_model_with_f(" + 0.003*TAFD", "0.5");
+    let preds = crate::api::predict(&half, &pop, &half.default_params.clone());
+    assert!(
+        preds.iter().all(|p| p.pred.is_nan()),
+        "F = 0.5 makes T_inf = 10 <= II = 12, so the run-in does run and TAFD has no \
+         referent in it: {:?}",
+        preds.iter().map(|p| p.pred).collect::<Vec<_>>()
+    );
+    assert!(
+        warning_for(&half, &pop).is_some(),
+        "the same record with a bioavailability that shortens it below II must warn — \
+         comparing the unscaled duration silently drops exactly this case"
+    );
+    assert!(
+        !raised(&half, &pop, INF),
+        "and {INF} must stop claiming this record is served as a single non-SS infusion, \
+         because the NaN predictions above can only come from the run-in it says did not \
+         happen (#1281)"
+    );
+
+    // `RATE = -2`: `D1 = 20 > II = 12` regardless of `F`, because `F` reshapes the rate here.
+    let modeled = ode_model_with_d1(" + 0.003*TAFD", "0.5", "20.0");
+    let mut pop_d1 = population(1, true, 12.0);
+    pop_d1.subjects[0].doses = vec![DoseEvent::modeled(
+        480.0,
+        100.0,
+        1,
+        true,
+        12.0,
+        RateMode::ModeledDuration,
+    )];
+    let preds = crate::api::predict(&modeled, &pop_d1, &modeled.default_params.clone());
+    assert!(
+        preds.iter().all(|p| p.pred.is_finite()),
+        "a duration-defined infusion keeps its 20-hour length under F = 0.5, so the run-in \
+         is skipped exactly as at F = 1: {:?}",
+        preds.iter().map(|p| p.pred).collect::<Vec<_>>()
+    );
+    assert!(
+        raised(&modeled, &pop_d1, INF),
+        "{INF} must still fire on it"
+    );
+    assert_eq!(
+        warning_for(&modeled, &pop_d1),
+        None,
+        "and the absolute-clock gate must stay silent — an `F * duration` shortcut would \
+         read 10 <= 12 here and flip both"
+    );
 }
 
 #[cfg(feature = "survival")]
