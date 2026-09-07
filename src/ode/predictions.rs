@@ -2476,11 +2476,15 @@ fn tad_anchor(subject: &Subject, dose_lagtimes: &[f64], t_start: f64) -> f64 {
 /// duplicate further down this file, `api::output_columns::tad_at_time`, and the
 /// lag-ignoring sdtab fallback in `io::output` — and three of them disagreed on
 /// `(t_dose = 120, ALAG = 3, II = 12, t = 121)`, returning `-2.0`, `NaN` and `+1.0`.
-/// #1126 collapsed all four onto one function, because "add the pre-arrival referent"
-/// spelled four times is four chances to spell it differently. The dual walk's own
-/// anchors in `sens::ode_provider` (segment start, and the pre/post sides of a
-/// saltation) are **not** folded in: they are a different shape (a running `max` over
-/// arrivals, not a per-segment re-fold) and unreachable for this model class behind the
+/// #1126 collapsed the **lag-aware** ones onto one function, because "add the pre-arrival
+/// referent" spelled four times is four chances to spell it differently.
+///
+/// Two are deliberately outside that, and both are recorded rather than left implicit:
+/// [`crate::types::Subject::data_tad`] (#1182/#1273) answers the lag-free *data* question
+/// with its own tie-convention switch — see the note on [`crate::dosing::tad_referent`];
+/// and the dual walk's anchors in `sens::ode_provider` (segment start, and the pre/post
+/// sides of a saltation) are a different shape (a running `max` over arrivals, not a
+/// per-segment re-fold) and unreachable for this model class behind the
 /// `has_ss && reads_model_time` FD gate — see #1272, which is where that is tracked.
 ///
 /// `dose_lagtimes` may be **shorter than `doses`, including empty** — a missing entry is

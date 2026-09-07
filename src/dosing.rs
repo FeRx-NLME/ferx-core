@@ -924,12 +924,20 @@ const TAD_EPS: f64 = 1e-12;
 /// **The** rule for what `TAD` at time `t` is measured from, for one dose — `None` when
 /// this dose has no referent at `t` yet.
 ///
-/// Every `TAD` fold in the tree is this function under a `max`: the dense predictor's
-/// [`crate::ode::predictions::tad_anchor_for`] (which the EKF and the event-driven walk
-/// also use), the sdtab column's `api::output_columns::tad_at_time`, and `io::output`'s
-/// lag-ignoring fallback. Before #1126 they were four hand-written copies and three of them
-/// disagreed on `(t_dose = 120, ALAG = 3, II = 12, t = 121)`, returning `-2.0`, `NaN` and
-/// `+1.0`. The referent is a property of a dose, not of an engine, so it is stated once.
+/// Every **lag-aware** `TAD` fold is this function under a `max`: the dense predictor's
+/// [`crate::ode::predictions::tad_anchor_for`] (which the EKF and the event-driven walk also
+/// use) and the sdtab column's `api::output_columns::tad_at_time`, via [`tad_at`]. Before
+/// #1126 those were hand-written copies that disagreed on
+/// `(t_dose = 120, ALAG = 3, II = 12, t = 121)`, returning `-2.0`, `NaN` and `+1.0`. The
+/// referent is a property of a dose, not of an engine, so it is stated once.
+///
+/// **[`crate::types::Subject::data_tad`] is deliberately not folded in** (#1182/#1273). It
+/// answers a different question — what the *dataset* says `TAD` is, before any model, with no
+/// lagtime at all and a `same_time_counts` switch between NONMEM's record order and Pharmpy's
+/// `get_doseid` grouping. Being lag-free, the pre-arrival window this function exists for is
+/// empty there (record and arrival coincide), so it needs nothing from here; and this function
+/// has no tie-convention parameter, so it could not serve there without growing one. Two
+/// kernels, two questions — recorded rather than left to look like an oversight.
 ///
 /// Three cases:
 ///
@@ -985,11 +993,12 @@ pub(crate) fn tad_referent(dose: &DoseEvent, lag: f64, t: f64) -> Option<f64> {
 
 /// `TAD` at `t` — [`tad_referent`] folded over a dose list, `NaN` when no dose has a referent.
 ///
-/// The **reporting** answer, and the second half of collapsing #1126's four hand-written
-/// copies: the per-dose rule was the interesting duplication, but the fold around it —
-/// `fold(NEG_INFINITY, f64::max)`, then `is_finite`, then `NaN` — was written out identically
-/// beside it in `api::output_columns::tad_at_time` and `io::output`'s sdtab fallback. Both now
-/// call this.
+/// The **reporting** answer: the per-dose rule was the interesting duplication, but the fold
+/// around it — `fold(NEG_INFINITY, f64::max)`, then `is_finite`, then `NaN` — was written out
+/// beside it too. `api::output_columns::tad_at_time` is its caller. (`io::output`'s sdtab
+/// fallback was a third copy when #1126 was written; #1273 moved that call site to
+/// [`crate::types::Subject::data_tad`] instead, for the tie rule described on
+/// [`tad_referent`], so it is not one of ours.)
 ///
 /// `dose_lagtimes` may be **shorter than `doses`, including empty**; a missing entry is zero
 /// lag, matching [`crate::ode::predictions::tad_anchor_for`] and `active_infusions`.
@@ -1272,6 +1281,94 @@ mod tad_referent_tests {
         // hidden it behind the ordinary dose.
         let doses = [plain(0.0), nan_time];
         assert_eq!(super::tad_at(&doses, &[3.0, 3.0], 481.0), 478.0);
+    }
+
+    /// **A cross-PR invariant nothing else enforces.**
+    ///
+    /// `crate::types::Subject::time_after_dose_at_or_before` (#1182/#1273) documents itself as
+    /// keeping "the same tie rule as the lag-aware `tad_at_time`" — i.e. as *this* fold under
+    /// zero lag. That is a claim about code in another module, written by another change, and
+    /// #1273's own test compares its two conventions against each other rather than against
+    /// this one. So nothing would have gone red if #1126 had moved the tie while collapsing
+    /// the folds: `tad_referent` picks `arrival <= t + TAD_EPS`, and a strict `<` there would
+    /// have been just as plausible a spelling.
+    ///
+    /// Pinned on the row where the two data conventions are known to differ from each other
+    /// (`obs@24` with `dose@0, dose@24`), so this sits exactly on the boundary rather than
+    /// somewhere every spelling agrees.
+    #[test]
+    fn the_zero_lag_fold_breaks_a_same_time_tie_the_way_the_sdtab_fallback_does() {
+        use crate::types::Subject;
+        let subject = Subject {
+            id: "1".into(),
+            doses: vec![plain(0.0), plain(24.0)],
+            obs_times: vec![0.0, 2.0, 23.9, 24.0, 30.0],
+            ..Default::default()
+        };
+        let mine: Vec<f64> = subject
+            .obs_times
+            .iter()
+            .map(|&t| super::tad_at(&subject.doses, &[], t))
+            .collect();
+        let theirs: Vec<f64> = (0..subject.obs_times.len())
+            .map(|j| subject.time_after_dose_at_or_before(j))
+            .collect();
+        assert_eq!(
+            mine, theirs,
+            "the zero-lag fold and the sdtab fallback must agree on every row, including the \
+             same-time tie at t = 24 where a dose record and an observation share a TIME"
+        );
+        // The straddle: assert the fixture actually reaches the tie, so this cannot quietly
+        // become a comparison of two functions on rows where every spelling agrees.
+        assert_eq!(
+            mine[3], 0.0,
+            "obs@24 takes the dose at 24 — NONMEM record order"
+        );
+        assert_eq!(
+            subject.time_after_dose(3),
+            24.0,
+            "…and Pharmpy's `get_doseid` convention deliberately does NOT. If this stops \
+             differing, the fixture no longer sits on the boundary and the assertion above \
+             has stopped meaning anything"
+        );
+
+        // ### The steady-state arm, which is the half that is literally duplicated
+        //
+        // `Subject::data_tad`'s SS branch is `obs_t - elapsed.rem_euclid(d.ii)` — the same
+        // expression as [`tad_referent`]'s, character for character. The non-SS rows above
+        // do not reach it, and neither does #1273's own `subject_time_after_dose_is_the_data_tad`
+        // (two plain doses). So until this block, the one genuinely copy-pasted line between
+        // the two kernels was compared by nothing at all.
+        //
+        // The two cannot be collapsed: `data_tad` needs a tie-convention switch this function
+        // has no use for, and this function needs a lag argument and the seeded pre-arrival
+        // branch `data_tad` has no use for. They stay two — so the periodic fold they share
+        // is pinned here instead, over a full cycle plus the wrap.
+        let ss_subject = Subject {
+            id: "1".into(),
+            doses: vec![ss_dose()],
+            obs_times: vec![480.0, 483.0, 485.0, 491.5, 492.0, 495.0],
+            ..Default::default()
+        };
+        let ss_mine: Vec<f64> = ss_subject
+            .obs_times
+            .iter()
+            .map(|&t| super::tad_at(&ss_subject.doses, &[], t))
+            .collect();
+        let ss_theirs: Vec<f64> = (0..ss_subject.obs_times.len())
+            .map(|j| ss_subject.time_after_dose_at_or_before(j))
+            .collect();
+        assert_eq!(
+            ss_mine, ss_theirs,
+            "the periodic SS fold is written out in both kernels; they must not drift"
+        );
+        // And the fixture has to actually wrap, or it is comparing two functions on a
+        // monotone ramp where any fold agrees.
+        assert_eq!(ss_mine[0], 0.0, "the record itself");
+        // 491.5, not 491.9: `491.9 - 480.0` is `11.899999999999977` in binary, so a
+        // literal `11.9` here fails on the float and not on the fold. Halves are exact.
+        assert_eq!(ss_mine[3], 11.5, "just before the next virtual pulse");
+        assert_eq!(ss_mine[4], 0.0, "…and the wrap back to zero at II");
     }
 
     /// `SS=1` with a non-positive `II` is not a periodic train — `W_STEADY_STATE_II` warns and

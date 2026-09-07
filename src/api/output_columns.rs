@@ -51,8 +51,13 @@ use std::time::Instant;
 /// report a negative `TAD` in a column that means "not yet dosed".
 ///
 /// Kept as a named wrapper rather than inlined at its two call sites (the per-observation
-/// column and the `[derived]` integral grid, `:734`) because those call it with a `&Subject`
-/// and the doc above is what they are reading.
+/// column and the `[derived]` integral grid) because those call it with a `&Subject` and the
+/// doc above is what they are reading.
+///
+/// Not to be confused with `io::output`'s sdtab **fallback**, which is the branch taken when
+/// no lagged per-observation `TAD` was computed at all: that one reads
+/// [`crate::types::Subject::data_tad`], which is lag-free and carries #1182's tie convention.
+/// This is the lag-aware column those values populate.
 fn tad_at_time(subject: &Subject, t: f64, dose_lagtimes: &[f64]) -> f64 {
     crate::dosing::tad_at(&subject.doses, dose_lagtimes, t)
 }
