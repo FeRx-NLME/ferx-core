@@ -5421,7 +5421,6 @@ fn subject_sensitivities_impl(
     };
 
     let mixed_eligible = explicit_kind.is_none() && ANALYTIC_MIXED_N.contains(&slots.len());
-
     // Dispatch on the differentiated-parameter count so the dual width is
     // right-sized. The hand-written explicit kernels remain on their existing
     // path; they already avoid generic dual arithmetic. Eligible generic-walk
@@ -5465,7 +5464,7 @@ fn subject_sensitivities_impl(
     let mut sens = if mixed_eligible {
         // IIV-bearing rows have a nonzero η derivative. Put them on the leading
         // dual axes so `DualMixed<NA, N>` retains exactly the Hessian rows used
-        // by the η/θ chain. This planning runs only for transit/IG candidates;
+        // by the η/θ chain. This planning runs only for generic-walk candidates;
         // the common explicit-kernel path pays no added per-subject scan.
         let mut is_iiv = [false; MAX_CLOSED_FORM_SLOTS];
         let mut axis_buf = [0usize; MAX_CLOSED_FORM_SLOTS];
