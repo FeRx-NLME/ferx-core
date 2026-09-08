@@ -176,9 +176,14 @@ intended; prefer using only one of the two names per model.
 - A **non-finite** `lagtime` (`NaN`/`Inf`) is rejected, not warned. It makes
   `dose time + lagtime` — and every break derived from it — non-finite, so the
   subject's integration timeline cannot be ordered at all. One that is already
-  non-finite at typical values is caught at fit-init as `E_DOSE_ATTR_NONFINITE`
-  naming the subject; one produced by a mid-fit parameter excursion makes that
-  subject's predictions `NaN`, which the estimator treats as a diverged solve.
+  non-finite at typical values is caught at fit-init as `E_DOSE_ATTR_NONFINITE`,
+  naming the subject **and the dose record**: the check evaluates at each dose's
+  own covariate snapshot and its `TIME`, so a lag that is benign at the first
+  dose and overflows at a later one is caught too — as is one driven by a `TIME`
+  built-in on a model with no covariates at all
+  ([#1235](https://github.com/FeRx-NLME/ferx-core/issues/1235)). One produced by
+  a mid-fit parameter excursion instead makes that subject's predictions `NaN`,
+  which the estimator treats as a diverged solve.
 - Steady-state doses (`SS=1`) combined with non-zero `lagtime` are
   fully supported. Under linear superposition the lagged SS curve at
   time `t` equals the un-lagged SS curve evaluated at `t - lagtime`,
