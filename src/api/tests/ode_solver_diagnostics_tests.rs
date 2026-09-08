@@ -927,3 +927,75 @@ fn a_fit_over_an_unorderable_timeline_says_so() {
         result.warnings
     );
 }
+
+/// T9 — the **public** getter reports it too.
+///
+/// `ode_predictions_with_solver_stats` (`src/ode/predictions.rs`) is the only `pub fn` that
+/// returns an `OdeSolverStats`, and it is the surface #1234 item 1 was reported against. It
+/// opens no `SolverStatsScope`: it hands the engine a `&mut OdeSolverStats` out-parameter and
+/// returns it. So a recorder that writes only the thread-local sink leaves *this* function
+/// answering `abandoned_non_finite_timeline = 0` for a walk whose predictions are all `NaN` —
+/// which is the conflation the counter exists to remove, on the public surface. Measured at
+/// `335cb9e5`, before the fix: `preds` all `NaN`, every field of the returned block `0`.
+///
+/// Deliberately **not** wrapped in a scope: the scope route is T1's, and running this one
+/// inside a scope would let the sink supply the answer and hide the out-parameter defect.
+///
+/// Mutation (run): drop `stats.as_deref_mut()` back to `None` at
+/// `ode_predictions_with_extra_breaks_and_stats`' guard → this fires; T1–T4 stay green,
+/// because they all collect through the scope.
+#[test]
+fn the_public_solver_stats_surface_reports_an_abandoned_walk() {
+    let model = two_state_model(1.0);
+    let ode = model.ode_spec.as_ref().expect("ode model");
+    let theta = &model.default_params.theta;
+    let pk = [1.0, 10.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+
+    let (preds, stats) = crate::ode::ode_predictions_with_solver_stats(
+        ode,
+        &pk,
+        theta,
+        &[0.0],
+        &nan_dose_time_subject("bad"),
+    );
+    assert_eq!(
+        preds.len(),
+        4,
+        "the fixture must have observations: {preds:?}"
+    );
+    assert!(
+        preds.iter().all(|p| p.is_nan()),
+        "the fixture must actually be abandoned, got {preds:?}"
+    );
+    assert_eq!(
+        stats.abandoned_non_finite_timeline, 1,
+        "the public getter must report the abandoned walk, not hand back an all-zero block \
+         that reads like a subject with nothing to integrate: {stats:?}"
+    );
+    assert_eq!(
+        stats.attempted_steps, 0,
+        "nothing was integrated, so the step counters must stay zero: {stats:?}"
+    );
+
+    // The straddle, through the same public surface: an ordinary subject must integrate and
+    // record nothing. Without it a counter wired to fire on every call would pass above.
+    let (preds, clean) =
+        crate::ode::ode_predictions_with_solver_stats(ode, &pk, theta, &[0.0], &subject("2", 1.0));
+    assert_eq!(
+        preds.len(),
+        4,
+        "the control must have observations: {preds:?}"
+    );
+    assert!(
+        preds.iter().all(|p| p.is_finite()),
+        "the control must actually integrate, got {preds:?}"
+    );
+    assert_eq!(
+        clean.abandoned_non_finite_timeline, 0,
+        "an ordinary subject is not an abandoned walk: {clean:?}"
+    );
+    assert!(
+        clean.attempted_steps > 0,
+        "the control must actually integrate, or it separates nothing: {clean:?}"
+    );
+}

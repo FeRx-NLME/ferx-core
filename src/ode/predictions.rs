@@ -273,6 +273,42 @@ pub(crate) fn times_have_non_finite(mut times: impl Iterator<Item = f64>) -> boo
     times.any(|t| !t.is_finite())
 }
 
+/// **The engine guard: `true` when this walk must be abandoned, and the abandonment recorded.**
+///
+/// The predicate and the counter are deliberately one call (#1234). Nothing about
+/// [`timeline_has_non_finite`] makes recording structural, and the counter is only worth
+/// having if every abandoning engine bumps it: a ninth guard written as a bare predicate would
+/// compile, run, and put the diagnostic back to `0/0/0` for that walk — indistinguishable from
+/// a subject there was nothing to integrate for, which is the whole defect. Going through here
+/// makes forgetting impossible rather than conventional, and
+/// `the_bare_timeline_predicates_are_not_called_outside_this_guard` fails if a new call site
+/// takes the bare spelling.
+///
+/// `times` is an iterator so the dense builders (`break_times.iter().copied()`) and the
+/// event-driven ones (`timeline.iter().map(|e| e.0)`) share one definition; `stats` is the
+/// caller's out-parameter where it has one — `Some` only in
+/// `ode_predictions_with_extra_breaks_and_stats`, whose public wrapper
+/// [`ode_predictions_with_solver_stats`] returns it. See
+/// [`crate::ode::solver::record_abandoned_non_finite_timeline`] for why both channels are fed.
+///
+/// **Deliberately not used by the two `sens/ode_provider.rs` walks**, which carry the same
+/// predicate and do *not* record: their sweep is collected in its own scope from which
+/// `fit_inner` copies one unrelated field, so a gradient-solve event deposited here would be
+/// discarded or fire a prediction-shaped warning clause. That exclusion is the guard test's
+/// only allowance, and it is stated there.
+#[inline]
+pub(crate) fn abandon_non_finite_timeline(
+    times: impl Iterator<Item = f64>,
+    stats: Option<&mut crate::ode::solver::OdeSolverStats>,
+) -> bool {
+    if times_have_non_finite(times) {
+        crate::ode::solver::record_abandoned_non_finite_timeline(stats);
+        true
+    } else {
+        false
+    }
+}
+
 // Dose resolution + SS-equilibration primitives moved to `crate::dosing` (a neutral
 // leaf module) so pk/sens/api don't depend upward on ode/. A PRIVATE import (NOT a
 // `pub(crate) use` re-export) so these do not leak back out as `crate::ode::…` — the
@@ -3393,8 +3429,7 @@ fn ode_predictions_with_extra_breaks_and_stats(
     // Ordered **before** the #1223 fill below, deliberately: on a broken timeline every record
     // must be repelled, and filling first would hand a pre-start `TENTRY` the seeded state — a
     // scored `H = 0` — on a subject whose integration never happened.
-    if timeline_has_non_finite(&break_times) {
-        crate::ode::solver::record_abandoned_non_finite_timeline();
+    if abandon_non_finite_timeline(break_times.iter().copied(), stats.as_deref_mut()) {
         return (predictions, chz_states);
     }
 
@@ -4437,8 +4472,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // it uses that rather than returning a NaN run the caller must re-diagnose. Placed
     // before the #700 exact-bit guards below, whose message would otherwise name the
     // wrong cause for a `NaN` time.
-    if timeline_has_non_finite(&break_times) {
-        crate::ode::solver::record_abandoned_non_finite_timeline();
+    if abandon_non_finite_timeline(break_times.iter().copied(), None) {
         return Err(
             "ode_predictions_adaptive: a non-finite break time (NaN/infinite dose lagtime, \
              route lag, or infusion duration) — the subject's timeline cannot be ordered"
@@ -5417,8 +5451,7 @@ fn adaptive_frozen_replay_tv(
     break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
     // A non-finite break time makes the subject non-finite (#1189); `predictions` is
     // NaN-prefilled, matching what the driver this verifies now reports as an `Err`.
-    if timeline_has_non_finite(&break_times) {
-        crate::ode::solver::record_abandoned_non_finite_timeline();
+    if abandon_non_finite_timeline(break_times.iter().copied(), None) {
         return predictions;
     }
     if break_times.len() < 2 {
@@ -6003,8 +6036,7 @@ pub fn ode_predictions_event_driven(
     // dispatches typed events by index and so never re-applies a dose, but a `NaN` time
     // still sorts to the end and its event is silently never reached — the same silent
     // drop the dense engines get, reported the same way (`predictions` is NaN-prefilled).
-    if times_have_non_finite(timeline.iter().map(|e| e.0)) {
-        crate::ode::solver::record_abandoned_non_finite_timeline();
+    if abandon_non_finite_timeline(timeline.iter().map(|e| e.0), None) {
         return predictions;
     }
 
@@ -6542,8 +6574,7 @@ pub fn ode_predictions_with_states(
     break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
     // A non-finite break time makes the subject non-finite (#1189); both outputs are
     // NaN-prefilled, so this returns exactly that.
-    if timeline_has_non_finite(&break_times) {
-        crate::ode::solver::record_abandoned_non_finite_timeline();
+    if abandon_non_finite_timeline(break_times.iter().copied(), None) {
         return (predictions, states);
     }
 
@@ -7111,8 +7142,7 @@ pub fn ode_dense_solve_states(
     // A non-finite break time makes the subject non-finite (#1189); `result` is
     // NaN-prefilled, so the caller's finiteness guard sees a diverged solve rather than
     // a plausible-looking trajectory with the NaN-lagged dose silently missing.
-    if timeline_has_non_finite(&break_times) {
-        crate::ode::solver::record_abandoned_non_finite_timeline();
+    if abandon_non_finite_timeline(break_times.iter().copied(), None) {
         return result;
     }
 
@@ -7356,8 +7386,7 @@ pub(crate) fn ode_solve_until_chz_threshold(
     // code: the walk would proceed on a timeline the bad dose had been deleted from,
     // never apply it, and return a finite crossing time — the silent-wrong-number
     // outcome, on the one engine whose typed failure was supposed to make it loud.
-    if timeline_has_non_finite(&break_times) {
-        crate::ode::solver::record_abandoned_non_finite_timeline();
+    if abandon_non_finite_timeline(break_times.iter().copied(), None) {
         return ThresholdOutcome::SolveFailed("non-finite break time".to_string());
     }
     break_times.retain(|&t| t <= horizon + 1e-15);

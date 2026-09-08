@@ -1825,22 +1825,36 @@ fn record_to_stats_sink(stats: &OdeSolverStats) {
 /// Note that a prediction walk was abandoned before integrating, because its timeline could
 /// not be ordered ([`OdeSolverStats::abandoned_non_finite_timeline`], #1234).
 ///
-/// Bumps the active [`SolverStatsScope`] **directly** rather than merging a local
-/// `OdeSolverStats`, because the ordinary route into the sink is the tee inside
-/// [`integrate_resolved_g`] and this event is precisely the one where no integration is ever
-/// reached: the guard returns before a driver is called, so nothing would arrive there and the
-/// scope would read `0/0/0` — identical to a subject with no records at all.
+/// Reached through [`crate::ode::predictions::abandon_non_finite_timeline`], never called
+/// directly by a guard — the predicate and this record are one call so a ninth guard cannot be
+/// written without the counter.
+///
+/// **Both channels, because the guard sits before the only place that normally tees them.**
+/// A walk's counters leave by two routes: the thread-local [`SolverStatsScope`], which is how
+/// production collects (`api::fit`), and the caller's own `stats` out-parameter, which is how
+/// [`crate::ode::ode_predictions_with_solver_stats`] — the one public getter for an
+/// `OdeSolverStats` — collects. The ordinary route into both is the tee inside
+/// [`integrate_resolved_g`], and this event is precisely the one where no integration is ever
+/// reached: the guard returns before a driver is called. Recording into the sink alone left
+/// the public getter reporting `0` for an abandoned walk, which is the exact conflation this
+/// counter exists to remove, on the surface #1234 reported it against.
 ///
 /// Off the diagnostic path this is one `Cell` read, taken only inside a guard that has already
 /// fired on a subject whose predictions are `NaN` regardless.
 #[inline]
-pub(crate) fn record_abandoned_non_finite_timeline() {
-    STATS_SINK.with(|c| {
-        if let Some(mut acc) = c.get() {
-            acc.abandoned_non_finite_timeline += 1;
-            c.set(Some(acc));
-        }
-    });
+pub(crate) fn record_abandoned_non_finite_timeline(stats: Option<&mut OdeSolverStats>) {
+    // One `OdeSolverStats` through the two ordinary merge paths, rather than a second
+    // hand-written `STATS_SINK` read-modify-write next to `record_to_stats_sink`'s: this is
+    // also what makes `merge`'s `abandoned_non_finite_timeline` line reachable, since nothing
+    // else ever produces a non-scope `OdeSolverStats` carrying the field.
+    let one = OdeSolverStats {
+        abandoned_non_finite_timeline: 1,
+        ..Default::default()
+    };
+    record_to_stats_sink(&one);
+    if let Some(s) = stats {
+        s.merge(&one);
+    }
 }
 
 /// [`integrate_resolved_g_inner`] with the thread-local [`SolverStatsScope`] tee.
