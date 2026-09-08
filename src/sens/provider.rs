@@ -555,13 +555,15 @@ fn analytical_supported_core(model: &CompiledModel) -> bool {
 const MAX_CLOSED_FORM_SLOTS: usize = 9;
 
 /// Largest IIV-bearing row count specialised with [`DualMixed`] on the static
-/// analytical provider. `NA = 1/2` covers the common one- and two-IIV transit
-/// and inverse-Gaussian shapes while bounding release compile cost; wider-IIV
-/// models retain the exact full `Dual2` path.
+/// analytical provider. `NA = 1/2` covers common four- and six-parameter generic
+/// closed-form walks while bounding release compile cost; wider-IIV models
+/// retain the exact full `Dual2` path.
 const ANALYTIC_MIXED_NA_CAP: usize = 2;
+const ANALYTIC_MIXED_N: [usize; 2] = [4, 6];
 
-// The static dispatch below enumerates `NA = 1, 2` explicitly.
+// The static dispatch below enumerates `NA = 1, 2` and `N = 4, 6` explicitly.
 const _: () = assert!(ANALYTIC_MIXED_NA_CAP == 2);
+const _: () = assert!(ANALYTIC_MIXED_N[0] == 4 && ANALYTIC_MIXED_N[1] == 6);
 
 #[cfg(test)]
 thread_local! {
@@ -5418,14 +5420,11 @@ fn subject_sensitivities_impl(
         }
     };
 
-    let mixed_eligible = matches!(
-        model.pk_model,
-        PkModel::OneCptTransit | PkModel::TwoCptTransit | PkModel::OneCptIg | PkModel::TwoCptIg
-    ) && matches!(slots.len(), 4 | 6);
+    let mixed_eligible = explicit_kind.is_none() && ANALYTIC_MIXED_N.contains(&slots.len());
 
     // Dispatch on the differentiated-parameter count so the dual width is
     // right-sized. The hand-written explicit kernels remain on their existing
-    // path; they already avoid generic dual arithmetic. Eligible transit/IG
+    // path; they already avoid generic dual arithmetic. Eligible generic-walk
     // shapes use `DualMixed<NA, N>`, dropping only the IIV-free Hessian block
     // that FOCEI never consumes (issue #829).
     // Analytic Form C readout program (#650), if this model has one; the
@@ -5441,7 +5440,7 @@ fn subject_sensitivities_impl(
                 slots.len();
                 1, 2, 3, 4, 5, 6, 7, 8, 9;
                 |N| Some(SubjectSens {
-                    obs: run_obs::<N, N, true>(
+                    obs: run_obs::<N, N, false>(
                         &seed_dim,
                         &pk,
                         oral,
@@ -5488,9 +5487,11 @@ fn subject_sensitivities_impl(
         let axis_of = &axis_buf[..slots.len()];
         let mixed_seed_dim = seed_dim_from_slots_with_axes(&slots, axis_of);
         macro_rules! mixed {
-            ($na:literal, $n:literal) => {
+            ($na:literal, $n:literal) => {{
+                let axis_of: &[usize; $n] = axis_buf[..$n].try_into().expect("N-sized axes");
+                let is_iiv: &[bool; $n] = is_iiv[..$n].try_into().expect("N-sized row mask");
                 Some(SubjectSens {
-                    obs: run_obs::<$na, $n, false>(
+                    obs: run_obs::<$na, $n, true>(
                         &mixed_seed_dim,
                         &pk,
                         oral,
@@ -5503,20 +5504,24 @@ fn subject_sensitivities_impl(
                         None,
                         subject,
                         &pd,
-                        Some((axis_of, &is_iiv[..slots.len()])),
+                        Some((axis_of, is_iiv)),
                         n_eta,
                         n_theta,
                         readout,
                     ),
                 })
-            };
+            }};
         }
-        match (slots.len(), na) {
-            (4, 1) => mixed!(1, 4),
-            (4, 2) => mixed!(2, 4),
-            (6, 1) => mixed!(1, 6),
-            (6, 2) => mixed!(2, 6),
-            _ => full!(),
+        if na == 0 || na > ANALYTIC_MIXED_NA_CAP {
+            full!()
+        } else {
+            match (slots.len(), na) {
+                (4, 1) => mixed!(1, 4),
+                (4, 2) => mixed!(2, 4),
+                (6, 1) => mixed!(1, 6),
+                (6, 2) => mixed!(2, 6),
+                _ => full!(),
+            }
         }
     } else {
         full!()
@@ -5732,26 +5737,25 @@ fn apply_ltbs_transform_inner(out: &mut [ObsGrad], log_transform: bool) {
 /// identifies rows retained by a mixed-order jet; omitted rows are valid because
 /// their `dp_deta` is identically zero.
 #[allow(clippy::too_many_arguments)]
-fn chain_pk_outer_jet<const N: usize>(
+fn chain_pk_outer_jet<const NA: usize, const N: usize, const PARTIAL: bool>(
     f: f64,
     grad: &[f64; N],
-    hess_at: impl Fn(usize, usize) -> f64,
-    axis_of: &[usize],
-    has_hessian_row: &[bool],
+    hess: &[[f64; N]; NA],
+    axis_of: &[usize; N],
+    has_hessian_row: &[bool; N],
     pd: &crate::sens::ode_provider::ParamDerivs,
     n_eta: usize,
     n_theta: usize,
 ) -> ObsSens {
-    debug_assert_eq!(axis_of.len(), has_hessian_row.len());
-    debug_assert_eq!(axis_of.len(), pd.dp_deta.len());
-    let n_indiv = axis_of.len();
+    debug_assert_eq!(N, pd.dp_deta.len());
     let mut df_deta = vec![0.0; n_eta];
     let mut d2f_deta2 = vec![0.0; n_eta * n_eta];
     let mut df_dtheta = vec![0.0; n_theta];
     let mut d2f_deta_dtheta = vec![0.0; n_eta * n_theta];
 
-    for i in 0..n_indiv {
-        let gi = grad[axis_of[i]];
+    for i in 0..N {
+        let ai = if PARTIAL { axis_of[i] } else { i };
+        let gi = grad[ai];
         for k in 0..n_eta {
             df_deta[k] += gi * pd.dp_deta[i][k];
         }
@@ -5762,14 +5766,15 @@ fn chain_pk_outer_jet<const N: usize>(
     for k in 0..n_eta {
         for l in 0..n_eta {
             let mut acc = 0.0;
-            for i in 0..n_indiv {
-                if has_hessian_row[i] {
-                    for j in 0..n_indiv {
-                        acc +=
-                            hess_at(axis_of[i], axis_of[j]) * pd.dp_deta[i][k] * pd.dp_deta[j][l];
+            for i in 0..N {
+                let ai = if PARTIAL { axis_of[i] } else { i };
+                if !PARTIAL || has_hessian_row[i] {
+                    for j in 0..N {
+                        let aj = if PARTIAL { axis_of[j] } else { j };
+                        acc += hess[ai][aj] * pd.dp_deta[i][k] * pd.dp_deta[j][l];
                     }
                 }
-                acc += grad[axis_of[i]] * pd.d2p_deta2[i][k][l];
+                acc += grad[ai] * pd.d2p_deta2[i][k][l];
             }
             d2f_deta2[k * n_eta + l] = acc;
         }
@@ -5777,14 +5782,15 @@ fn chain_pk_outer_jet<const N: usize>(
     for k in 0..n_eta {
         for m in 0..n_theta {
             let mut acc = 0.0;
-            for i in 0..n_indiv {
-                if has_hessian_row[i] {
-                    for j in 0..n_indiv {
-                        acc +=
-                            hess_at(axis_of[i], axis_of[j]) * pd.dp_deta[i][k] * pd.dp_dtheta[j][m];
+            for i in 0..N {
+                let ai = if PARTIAL { axis_of[i] } else { i };
+                if !PARTIAL || has_hessian_row[i] {
+                    for j in 0..N {
+                        let aj = if PARTIAL { axis_of[j] } else { j };
+                        acc += hess[ai][aj] * pd.dp_deta[i][k] * pd.dp_dtheta[j][m];
                     }
                 }
-                acc += grad[axis_of[i]] * pd.d2p_detadtheta[i][k][m];
+                acc += grad[ai] * pd.d2p_detadtheta[i][k][m];
             }
             d2f_deta_dtheta[k * n_theta + m] = acc;
         }
@@ -5804,7 +5810,7 @@ fn chain_pk_outer_jet<const N: usize>(
 /// (= number of differentiated PK parameters) and retained Hessian-row count
 /// `NA`. `seed_dim[s]` maps each PK slot to its compact, possibly permuted axis.
 #[allow(clippy::too_many_arguments)]
-fn run_obs<const NA: usize, const N: usize, const ALLOW_EXPLICIT: bool>(
+fn run_obs<const NA: usize, const N: usize, const PARTIAL: bool>(
     seed_dim: &[Option<usize>; N_PK],
     pk: &crate::types::PkParams,
     oral: bool,
@@ -5817,18 +5823,36 @@ fn run_obs<const NA: usize, const N: usize, const ALLOW_EXPLICIT: bool>(
     explicit_kind: Option<ExKind>,
     subject: &Subject,
     pd: &crate::sens::ode_provider::ParamDerivs,
-    mixed_axes: Option<(&[usize], &[bool])>,
+    mixed_axes: Option<(&[usize; N], &[bool; N])>,
     n_eta: usize,
     n_theta: usize,
     readout: Option<&crate::parser::model_parser::OdeOutputProgram>,
 ) -> Vec<ObsSens> {
     #[cfg(test)]
-    if !ALLOW_EXPLICIT {
+    if PARTIAL {
         MIXED_ANALYTIC_RUNS.with(|runs| runs.set(runs.get() + 1));
     }
     let identity_axes = std::array::from_fn::<_, N, _>(|i| i);
     let full_hessian_rows = [true; N];
-    let (axis_of, is_iiv) = mixed_axes.unwrap_or((&identity_axes, &full_hessian_rows));
+    let (axis_of, is_iiv) = if PARTIAL {
+        mixed_axes.expect("partial jet requires an IIV-leading axis plan")
+    } else {
+        debug_assert!(mixed_axes.is_none());
+        (&identity_axes, &full_hessian_rows)
+    };
+    if PARTIAL {
+        debug_assert!(NA < N, "partial jet must drop at least one Hessian row");
+        debug_assert_eq!(is_iiv.iter().filter(|&&v| v).count(), NA);
+        debug_assert!(
+            is_iiv
+                .iter()
+                .enumerate()
+                .all(|(i, &v)| !v || axis_of[i] < NA),
+            "IIV-bearing rows must occupy the retained 0..NA axes"
+        );
+    } else {
+        debug_assert_eq!(NA, N, "full jet must retain all Hessian rows");
+    }
     let (cl, v1, q, v2, ka, f_bio, q3, v3) = (
         pk.cl(),
         pk.v(),
@@ -5868,7 +5892,7 @@ fn run_obs<const NA: usize, const N: usize, const ALLOW_EXPLICIT: bool>(
 
         // Build the compact PK-space jet from the explicit kernel when available,
         // otherwise by propagating the selected dual type through the closed form.
-        let jet = if let (true, Some(kind)) = (ALLOW_EXPLICIT, explicit_kind) {
+        let jet = if let (false, Some(kind)) = (PARTIAL, explicit_kind) {
             let mut gv = [0.0; N];
             let mut hv = [[0.0; N]; N];
             let mut val = 0.0;
@@ -5926,15 +5950,8 @@ fn run_obs<const NA: usize, const N: usize, const ALLOW_EXPLICIT: bool>(
             &mut ro_vars,
             &mut ro_stack,
         );
-        out.push(chain_pk_outer_jet(
-            y.value,
-            &y.grad,
-            |i, j| y.hess[i][j],
-            axis_of,
-            is_iiv,
-            pd,
-            n_eta,
-            n_theta,
+        out.push(chain_pk_outer_jet::<NA, N, PARTIAL>(
+            y.value, &y.grad, &y.hess, axis_of, is_iiv, pd, n_eta, n_theta,
         ));
     }
     out
