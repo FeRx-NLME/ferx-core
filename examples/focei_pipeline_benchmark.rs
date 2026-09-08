@@ -1,5 +1,5 @@
 //! Reproducible FOCEI inner/outer pipeline benchmark. Run with the same profile on
-//! both revisions: cargo run --profile ci-test --example focei_pipeline_benchmark -- LABEL
+//! both revisions: cargo run -p ferx-core --profile ci-test --example focei_pipeline_benchmark -- LABEL
 //! Optional second argument: number of measured rounds (default 7).
 use ferx_core::{fit, parser::model_parser::parse_model_string, types::*, PoolPlan};
 use rayon::prelude::*;
