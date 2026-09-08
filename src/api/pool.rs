@@ -126,95 +126,89 @@ pub(crate) fn default_fit_pool() -> Option<&'static rayon::ThreadPool> {
 
 #[path = "pool_cache.rs"]
 mod cache;
-use cache::{FitPoolLease, PoolCache};
+use cache::{FitPoolLease, PoolCache, SharedPoolCache};
 
 fn fit_pool_cache() -> &'static PoolCache {
     static CACHE: std::sync::OnceLock<PoolCache> = std::sync::OnceLock::new();
-    // Retain at most twice the automatic worker budget (at most 16 workers,
-    // 512 MiB reserved stack capacity), independently of the number of settings.
+    // Ordinarily retain at most twice the automatic worker budget (at most 16
+    // workers, 512 MiB reserved stack capacity). A single most-recent wider
+    // pool is retained so explicit wide configurations still get reuse.
     CACHE.get_or_init(|| PoolCache::new(default_thread_count() * 2))
+}
+
+fn shared_override_pool_cache() -> &'static SharedPoolCache {
+    static CACHE: std::sync::OnceLock<SharedPoolCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| SharedPoolCache::new(default_thread_count() * 2))
 }
 
 /// Lease a pool carrying exactly this override. Idle pools are reused, but active
 /// callers never share one: identical settings must not collapse a batch's
 /// independently budgeted fits onto a single pool. Workers keep immutable ODE
-/// settings for their lifetime; eviction bounds idle workers across all keys.
+/// settings for their lifetime; eviction bounds ordinary idle workers across
+/// all keys while retaining one most-recent oversized pool.
 /// Acquisition never waits for a busy pool, including inside nested fits.
 pub(crate) fn ode_override_pool(
     ov: crate::ode::solver::OdeSolverOverride,
     n_threads: usize,
-) -> Option<FitPoolLease<'static>> {
-    fit_pool_cache().acquire(n_threads, ov).ok()
+) -> Result<FitPoolLease<'static>, String> {
+    fit_pool_cache().acquire(n_threads, ov)
+}
+
+fn shared_ode_override_pool(
+    ov: crate::ode::solver::OdeSolverOverride,
+    n_threads: usize,
+) -> Result<std::sync::Arc<rayon::ThreadPool>, String> {
+    shared_override_pool_cache().acquire(n_threads, ov)
 }
 /// Run `f` with `options`' ODE solver settings reaching every thread that can integrate for
 /// it: armed on this thread, and — when the caller actually set one — on a pool whose workers
 /// carry the same value (see [`ode_override_pool`]).
 ///
 /// Used by the standalone `run_covariance` / `run_sir` / `run_sir_core` entry points, which
-/// integrate exactly as `fit` does but have no pool of their own. `fit` does not call this: it
-/// already chooses a pool (for `threads` and for its multi-start fan-out) and folds the
-/// override into that choice, so routing through here would nest a second pool inside the
-/// first.
+/// integrate exactly as `fit` does but may have no pool of their own. When `run_sir_core` is
+/// reached from inside `fit`, the current worker already carries the override and this runs
+/// inline, avoiding a second full-width pool.
 pub(crate) fn with_fit_ode_scope<R: Send>(
     options: &FitOptions,
     f: impl FnOnce() -> R + Send,
 ) -> Result<R, String> {
-    let _armed = crate::ode::solver::arm_ode_solver_override(options.ode_solver_override());
-    match ode_scope_pool(options)? {
-        Some(pool) => Ok(pool.install(f)),
-        None => Ok(f()),
-    }
-}
-
-/// The pool a call with these options must run on to keep its ODE settings, or `None` when the
-/// caller set no `ode_*` at all and any pool will do.
-///
-/// Split out so [`with_fit_ode_scope`] and `fit`'s own pool selection cannot drift: both have
-/// to consult it *before* falling back to the shared pool, and both must fail loudly rather
-/// than run unpooled, since unpooled workers integrate at the baked options and the result
-/// still looks successful.
-///
-/// A non-empty override always names its pool, even on a thread that is already a worker of
-/// that same pool. Short-circuiting there looks like a free optimisation and is not: the
-/// caller's fallback is a pool built without the override, so a nested call that pinned
-/// `threads` would land on plain workers and integrate at the model file's options. Since the
-/// cache lends idle pools exclusively, a nested call gets its own correctly configured
-/// pool. It never waits for an enclosing call to return a busy lease.
-pub(crate) fn ode_scope_pool(
-    options: &FitOptions,
-) -> Result<Option<FitPoolLease<'static>>, String> {
     let ov = options.ode_solver_override();
-    if ov.is_empty() {
-        return Ok(None);
-    }
-    let n = options
+    ov.validate()?;
+    let requested_threads = options
         .threads
         .filter(|&n| n > 0)
         .unwrap_or_else(effective_default_threads);
-    ode_override_pool(ov, n).map(Some).ok_or_else(|| {
-        format!(
-            "failed to build the {n}-thread pool this call's ODE solver settings need. \
-             Refusing to continue: without it the workers would integrate at the model \
-             file's settings and the result would look successful."
-        )
-    })
+    let already_scoped = crate::ode::solver::worker_carries_ode_override(ov)
+        && rayon::current_num_threads() == requested_threads;
+    let _armed = crate::ode::solver::arm_ode_solver_override(ov);
+    if ov.is_empty() || already_scoped {
+        return Ok(f());
+    }
+    match options.threads.filter(|&n| n > 0) {
+        Some(n) => Ok(ode_override_pool(ov, n)?.install(f)),
+        None => Ok(shared_ode_override_pool(ov, requested_threads)?.install(f)),
+    }
 }
 
 /// Run `f` on the pool this `fit()` call should use, with its ODE settings armed.
 ///
-/// Pool choice, in order: the pool carrying this call's ODE override when it set one (so the
-/// workers integrate at the requested accuracy — #1212); an exclusively leased pool sized to a pinned
-/// `threads`; otherwise the shared big-stack pool, falling back to the ambient one only if
-/// that one-time build failed, which must not turn a previously-successful default fit into an
-/// `Err`. One pool serves both levels of a multi-start fan-out, which is why this is called
-/// once per `fit()` and not per start.
+/// Pool choice, in order: a pool carrying this call's ODE override when it set one (shared for
+/// unpinned fits, exclusive for a positive `threads` budget); an exclusively leased plain pool
+/// sized to a pinned `threads`; otherwise the shared big-stack pool, falling back to the ambient
+/// one only if that one-time build failed. One pool serves both levels of a multi-start fan-out,
+/// which is why this is called once per `fit()` and not per start.
 pub(crate) fn install_on_fit_pool<R: Send>(
     options: &FitOptions,
     f: impl FnOnce() -> R + Send,
 ) -> Result<R, String> {
-    let _armed = crate::ode::solver::arm_ode_solver_override(options.ode_solver_override());
-    if let Some(pool) = ode_scope_pool(options)? {
-        return Ok(pool.install(f));
+    let ov = options.ode_solver_override();
+    ov.validate()?;
+    let _armed = crate::ode::solver::arm_ode_solver_override(ov);
+    if !ov.is_empty() {
+        return match options.threads.filter(|&n| n > 0) {
+            Some(n) => Ok(ode_override_pool(ov, n)?.install(f)),
+            None => Ok(shared_ode_override_pool(ov, effective_default_threads())?.install(f)),
+        };
     }
     match options.threads.filter(|&n| n > 0) {
         // A pinned positive `threads` leases an idle pool or builds a new one,
@@ -387,8 +381,10 @@ impl PoolPlan {
     /// Run `op` on an exclusively leased outer Rayon pool of
     /// [`replicates`](Self::replicates) workers, each with the ferx worker stack
     /// ([`FIT_RAYON_STACK_SIZE`]). Idle pools are reused within a bounded cache.
-    /// The lease lasts until `op` returns. Join any unscoped spawned work before
-    /// returning if it must finish before another caller can reuse the pool.
+    /// The lease lasts until `op` returns. `op` must not let work submitted with
+    /// `rayon::spawn` / `spawn_fifo` outlive it: after return another caller may
+    /// reuse the workers. Scoped work and parallel iterators satisfy this because
+    /// they join before returning; these are also the forms used by ferx-tools.
     ///
     /// Any `par_iter` inside `op` fans out over that pool. Returns `Err` if the
     /// pool cannot be built (e.g. resource limits).

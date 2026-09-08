@@ -1,9 +1,16 @@
 use super::*;
 use crate::ode::solver::{effective_solver_options, OdeMethod, OdeSolverOptions};
+use std::collections::HashSet;
 use std::thread;
 
 fn worker(pool: &rayon::ThreadPool) -> thread::ThreadId {
     pool.install(|| thread::current().id())
+}
+
+fn workers(pool: &rayon::ThreadPool) -> HashSet<thread::ThreadId> {
+    pool.broadcast(|_| thread::current().id())
+        .into_iter()
+        .collect()
 }
 
 #[test]
@@ -81,7 +88,7 @@ fn settings_and_width_are_part_of_the_key() {
 }
 
 #[test]
-fn idle_worker_budget_evicts_oldest_settings_and_rejects_oversized_pools() {
+fn idle_worker_budget_evicts_oldest_settings_and_keeps_one_oversized_pool() {
     let cache = PoolCache::new(2);
     for n in 1..=5 {
         let ov = OdeSolverOverride {
@@ -96,12 +103,66 @@ fn idle_worker_budget_evicts_oldest_settings_and_rejects_oversized_pools() {
         assert_eq!(idle[0].ov.max_steps, Some(4));
         assert_eq!(idle[1].ov.max_steps, Some(5));
     }
-    drop(cache.acquire(3, Default::default()).unwrap());
-    assert_eq!(cache.idle.lock().unwrap().len(), 2);
+    let wide_workers = {
+        let wide = cache.acquire(3, Default::default()).unwrap();
+        workers(&wide)
+    };
+    {
+        let idle = cache.idle.lock().unwrap();
+        assert_eq!(idle.len(), 1);
+        assert_eq!(idle[0].pool.current_num_threads(), 3);
+    }
+    let reused_wide = cache.acquire(3, Default::default()).unwrap();
+    assert_eq!(workers(&reused_wide), wide_workers);
+    drop(reused_wide);
     drop(cache.acquire(2, Default::default()).unwrap());
     let idle = cache.idle.lock().unwrap();
     assert_eq!(idle.len(), 1);
     assert_eq!(idle[0].pool.current_num_threads(), 2);
+}
+
+#[test]
+fn shared_cache_reuses_one_live_pool_for_identical_unpinned_calls() {
+    let cache = SharedPoolCache::new(4);
+    let ov = OdeSolverOverride {
+        reltol: Some(1e-9),
+        ..Default::default()
+    };
+    let first = cache.acquire(2, ov).unwrap();
+    let second = cache.acquire(2, ov).unwrap();
+    assert!(std::sync::Arc::ptr_eq(&first, &second));
+}
+
+#[test]
+fn invalid_rust_api_overrides_are_rejected_before_pool_build() {
+    let cache = PoolCache::new(4);
+    for (ov, field) in [
+        (
+            OdeSolverOverride {
+                reltol: Some(f64::NAN),
+                ..Default::default()
+            },
+            "ode_reltol",
+        ),
+        (
+            OdeSolverOverride {
+                abstol: Some(0.0),
+                ..Default::default()
+            },
+            "ode_abstol",
+        ),
+        (
+            OdeSolverOverride {
+                max_steps: Some(0),
+                ..Default::default()
+            },
+            "ode_max_steps",
+        ),
+    ] {
+        let err = cache.acquire(1, ov).err().expect("invalid override");
+        assert!(err.contains(field), "{err}");
+    }
+    assert!(cache.idle.lock().unwrap().is_empty());
 }
 
 #[test]

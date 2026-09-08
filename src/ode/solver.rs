@@ -337,6 +337,37 @@ impl OdeSolverOverride {
         *self == Self::default()
     }
 
+    /// Reject values that the model-file parser would reject before they can
+    /// reach a worker pool through the public Rust API.
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        for (name, value) in [("ode_reltol", self.reltol), ("ode_abstol", self.abstol)] {
+            if let Some(value) = value {
+                if !value.is_finite() || value <= 0.0 {
+                    return Err(format!("{name} must be finite and positive, got {value}"));
+                }
+            }
+        }
+        if self.max_steps == Some(0) {
+            return Err("ode_max_steps must be positive, got 0".to_string());
+        }
+        Ok(())
+    }
+
+    /// Cache-key equality uses the float representation explicitly. Validation
+    /// keeps NaNs and signed zero out, while bit comparison makes the key's
+    /// behavior independent of `f64`'s partial equality rules.
+    pub(crate) fn same_pool_key(&self, other: &Self) -> bool {
+        fn bits(value: Option<f64>) -> Option<u64> {
+            value.map(f64::to_bits)
+        }
+        bits(self.reltol) == bits(other.reltol)
+            && bits(self.abstol) == bits(other.abstol)
+            && self.max_steps == other.max_steps
+            && self.method == other.method
+            && self.stiff_abort_after == other.stiff_abort_after
+            && self.auto_switch == other.auto_switch
+    }
+
     /// Merge onto a spec's baked options. Unset fields keep the baked value, so a model file's
     /// `[fit_options]` still wins wherever the caller expressed no opinion.
     pub(crate) fn apply_to(&self, base: OdeSolverOptions) -> OdeSolverOptions {
@@ -404,6 +435,16 @@ pub(crate) fn effective_solver_options(baked: OdeSolverOptions) -> OdeSolverOpti
 
 pub(crate) fn install_worker_ode_override(ov: OdeSolverOverride) {
     LOCAL_OVERRIDE.set(Some(Some(ov)));
+}
+
+/// True only on a worker that already carries this non-empty override. Call
+/// before arming a nested entry point on its caller thread.
+pub(crate) fn worker_carries_ode_override(ov: OdeSolverOverride) -> bool {
+    !ov.is_empty()
+        && LOCAL_OVERRIDE
+            .get()
+            .flatten()
+            .is_some_and(|current| current.same_pool_key(&ov))
 }
 
 /// Arms `ov` on this thread until the returned guard drops, restoring whatever was in force
@@ -2148,17 +2189,13 @@ mod tests {
         // still reads its own value — so the assertions all happen while all three arms and
         // one deliberately-empty arm are live at once.
         let (armed_tx, armed) = channel::<()>();
-        let (go_tx, go) = channel::<()>();
         let arms = [Some(1e-9), Some(1e-11), Some(1e-13), None];
 
         std::thread::scope(|s| {
             let mut releases = Vec::new();
             for want in arms {
-                let (release_tx, release) = (go_tx.clone(), {
-                    let (tx, rx) = channel::<()>();
-                    releases.push(tx);
-                    rx
-                });
+                let (tx, release) = channel::<()>();
+                releases.push(tx);
                 let armed_tx = armed_tx.clone();
                 s.spawn(move || {
                     let _guard = arm_ode_solver_override(OdeSolverOverride {
@@ -2174,7 +2211,6 @@ mod tests {
                         want.unwrap_or(baked.reltol),
                         "a concurrent fit's ODE settings reached this one"
                     );
-                    drop(release_tx);
                 });
             }
             for _ in arms {

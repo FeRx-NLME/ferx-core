@@ -45,19 +45,23 @@ What runs, how long, and how it is resumed or traced.
 
 #### Worker reuse for repeated fits
 
-Default fits share a persistent worker pool.
-Fits with a positive `threads` value, or fit-level ODE overrides, exclusively
-lease a pool for the call. An idle pool with the same width and solver settings
-can be reused; concurrent fits get independent pools even when their settings
-match. This preserves the per-fit budgets assigned by `PoolPlan`.
+Default fits share a persistent worker pool. Unpinned fits with the same
+fit-level ODE overrides also share a persistent pool keyed by those solver
+settings, so changing a tolerance does not multiply worker counts for concurrent
+calls. A positive `threads` value explicitly budgets the fit and exclusively
+leases a pool for the call; an idle pool with the same width and solver settings
+can be reused, while concurrent pinned fits keep independent budgets. This
+preserves the per-fit budgets assigned by `PoolPlan`.
 This isolates worker budgets and ODE settings; concurrent fits should still use
 consistent process-wide inner-optimizer and EBE warm-start settings.
 
-Idle pools retain at most twice the automatic thread budget across all settings
-(at most 16 workers). Older idle pools are evicted, and pools wider than that
-limit are released after use. Active fits keep their requested width; this idle
-limit is not a process-wide limit on concurrent fitting. Worker stacks remain
-32 MiB each, which is reserved capacity rather than necessarily resident memory.
+The caches ordinarily retain at most twice the automatic thread budget across
+all settings (at most 16 workers each). Older entries are evicted. When a single
+pool is wider than that budget, it can remain as the sole most-recent entry so a
+repeated explicit wide configuration still avoids rebuilding its workers.
+Active fits keep their requested width; the idle limits are not process-wide
+limits on concurrent fitting. Worker stacks remain 32 MiB each, which is
+reserved capacity rather than necessarily resident memory.
 
 During FOCE/FOCEI optimization, the same pool serves the inner EBE solves and
 outer gradient evaluations. The main NLopt and built-in BFGS/L-BFGS paths evaluate
