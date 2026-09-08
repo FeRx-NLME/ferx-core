@@ -155,6 +155,53 @@ jobs:
           fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}
 
+  # The guards-OFF lane, and the counterweight to `[profile.ci-cov]` (#1293 review
+  # of #1248). Both coverage jobs now build with `debug-assertions` and
+  # `overflow-checks` ON, which is what makes the guards' condition lines coverable
+  # — but it also meant that, for one commit, NO per-PR job ran the crate the way a
+  # user's release build behaves. The remaining `ci-test` runs are scheduled,
+  # manual, or post-merge, so a release-only regression could have merged green.
+  #
+  # That is not abstract. `continuous_value()` (`src/types.rs`) and
+  # `max_scaled_deviation()` (`src/estimation/outer_optimizer.rs`) each have two
+  # correct behaviours: a misuse guard that fires where `debug_assert!` is live, and
+  # a NaN fallback that is what users actually get. Under `ci-cov` only the panic
+  # arm runs. This job is where the other arm is checked before merge.
+  #
+  # Cheap, and deliberately narrower than the coverage jobs: `--lib` only, on the
+  # `ci,markov,nn` union of production cfgs. It runs in parallel with the two
+  # coverage jobs and is shorter than either, so it adds no wall-clock to the
+  # critical path. It does NOT restore guards-off `tests/` binaries — that is the
+  # 120-odd binary compile, and `slow-tests.yml` plus the nightly coverage job
+  # still run those on `ci-test` with the guards off.
+  #
+  # Commands live in `tools/preflight.sh` (group `release-semantics`) for the same
+  # reason as `Check`/`Clippy`/`Format` (#1157), and they arm the INVERSE canary —
+  # `FERX_REQUIRE_NO_DEBUG_ASSERTIONS=1`, which fails the run if `debug_assert!`
+  # turns out to be live here after all. Without it the whole lane would rest on
+  # `ci-fast` never acquiring `debug-assertions`: it would silently become a second
+  # copy of the coverage jobs, green throughout.
+  release-semantics:
+    name: Tests (release semantics)
+    runs-on: ubuntu-latest
+    # Stable, like the coverage jobs: no nightly-only code, and `rust-cache` keys on
+    # the rustc version, so nightly would cold-rebuild the dep graph daily.
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install stable toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Own key: uninstrumented `ci-fast` shares artifacts with neither the
+          # plain `ci` (check/clippy) caches nor the instrumented `ci-cov` ones.
+          shared-key: ci-release-semantics
+
+      - name: cargo test --lib with debug-assertions OFF (via tools/preflight.sh)
+        run: tools/preflight.sh release-semantics
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest

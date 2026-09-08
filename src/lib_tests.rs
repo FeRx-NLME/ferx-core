@@ -18,6 +18,18 @@
 /// supposed to do.
 const DEMAND: &str = "FERX_REQUIRE_DEBUG_ASSERTIONS";
 
+/// The mirror image, for the `Tests (release semantics)` lane. That job exists to
+/// run the Tier-1 suite the way a *user's* build behaves — guards compiled out, no
+/// overflow checks — because #1248 moved both coverage jobs onto `ci-cov` and would
+/// otherwise have left no per-PR job exercising release semantics at all (raised by
+/// review on PR #1293). Its value is entirely in being the OTHER mode, so it needs
+/// the same protection from the opposite direction: if `ci-fast` ever acquired
+/// `debug-assertions`, the lane would silently become a duplicate of the coverage
+/// jobs, every test would stay green, and the release-only arms of
+/// `sim_outcome_category_and_count_continuous_value_is_nan` and friends would go
+/// unchecked again — the #344 failure shape with the sign flipped.
+const FORBID: &str = "FERX_REQUIRE_NO_DEBUG_ASSERTIONS";
+
 #[test]
 fn debug_assert_guards_run_when_the_gate_demands_them() {
     let demanded = std::env::var_os(DEMAND).is_some();
@@ -54,5 +66,28 @@ fn debug_assert_guards_run_when_the_gate_demands_them() {
          built: a `[profile.ci-cov] debug-assertions = false` in Cargo.toml, a \
          `CARGO_PROFILE_CI_COV_DEBUG_ASSERTIONS` in the environment, or a \
          `--profile` that reverted to `ci-fast` (#344, #1248)."
+    );
+
+    // The opposite gate, same shape: `!forbidden || !evaluated`, so the only run
+    // this can fail is one that asked for release semantics and got the guards.
+    let forbidden = std::env::var_os(FORBID).is_some();
+    assert!(
+        !forbidden || !evaluated,
+        "{FORBID} is set — this run came from `tools/preflight.sh release-semantics` \
+         or the `Tests (release semantics)` CI job, whose whole purpose is to exercise \
+         the crate the way a user's release build behaves — but `debug_assert!` IS \
+         live, so this lane is now a duplicate of the coverage jobs and nothing on \
+         the PR checks the guards-off arms. Something switched debug-assertions ON \
+         for the profile being built: a `[profile.ci-fast] debug-assertions = true` \
+         in Cargo.toml, a `CARGO_PROFILE_CI_FAST_DEBUG_ASSERTIONS` in the \
+         environment, or a `--profile` that drifted to `ci-cov` (#1293)."
+    );
+
+    // Both set at once is a caller error, not a profile problem: no build can
+    // satisfy both, so it would fail whichever way the profile went and the
+    // diagnostics above would each blame the manifest.
+    assert!(
+        !(demanded && forbidden),
+        "{DEMAND} and {FORBID} are both set; they are contradictory demands."
     );
 }

@@ -21,17 +21,24 @@
 //!     list**, not just the last one.
 //!  4. A no-argument run is `ALL_GROUPS` minus `OPT_IN_GROUPS`, and every opt-in group
 //!     is either named by a job in `ci.yml` or pinned by (5). An opt-in group exists
-//!     because it runs a test suite rather than a compile — `debug-assertions` is the
-//!     only one — and the failure it invites is a gate that runs in neither place.
-//!  5. The two per-PR coverage jobs build a profile whose `debug-assertions` is on,
-//!     and arm the canary that proves it (#1248). This is where the `debug-assertions`
-//!     group's property lives now: #344 gave it a job of its own, and #1248 retired
-//!     that job in favour of `[profile.ci-cov]`, since the guards being dead cost not
-//!     just an unrun invariant but a permanently-missed block of patch lines.
+//!     because it runs a test suite rather than a compile, and the failure it invites
+//!     is a gate that runs in neither place.
+//!  5. **Both modes are exercised per PR.** The two coverage jobs build a profile whose
+//!     `debug-assertions` is ON and arm the canary proving it (#1248); the
+//!     `release-semantics` group builds one where they are OFF and arms the inverse
+//!     canary (#1293). Each is asserted against Cargo.toml, resolving `inherits`.
 //!
-//! (5) is why (4) has an exception rather than a second delegating job: the coverage
-//! jobs run `cargo llvm-cov`, so they cannot call a preflight group without running
-//! the suite a third time — which is the 32–42 min that retiring the job saved.
+//! (5) is a pair, and the pairing is the point. #344 gave the guards a job of their own;
+//! #1248 retired it in favour of `[profile.ci-cov]`, since dead guards cost not just an
+//! unrun invariant but a permanently-missed block of patch lines. That fix, alone, left
+//! no per-PR job running the crate the way a user's build behaves — several tests assert
+//! one thing under a live guard and another without one, so a mode that no job builds is
+//! a set of assertions nothing checks. Hence the mirror lane, and hence both directions
+//! being pinned here rather than resting on nobody editing a profile.
+//!
+//! (5) is also why (4) has an exception rather than a third delegating job: the coverage
+//! jobs run `cargo llvm-cov`, so they cannot call a preflight group without running the
+//! suite again — which is the 32–42 min that retiring #344's job saved.
 //!
 //! (3) is not hypothetical. The first version of the script returned a status from `run`
 //! and propagated it through a group function and a `case … esac || { …; exit 1; }` —
@@ -688,6 +695,53 @@ fn load_bearing_flags_and_feature_coverage_survive_in_the_command_list() {
         dbg.join("\n  ")
     );
 
+    // The mirror lane (#1293). `release-semantics` is worth having ONLY while it is
+    // the other mode: guards compiled out, release overflow semantics, the way a
+    // user's build behaves. If it ever drifted onto a guarded profile it would
+    // become a second copy of the coverage jobs and the release-only arms of
+    // `continuous_value()` / `max_scaled_deviation()` would go unchecked on PRs
+    // again — green throughout, which is why this is asserted rather than assumed.
+    let rel = listed_commands("release-semantics");
+    assert!(
+        !rel.is_empty(),
+        "the `release-semantics` group lists no commands"
+    );
+    for cmd in &rel {
+        assert!(
+            cmd.contains("cargo test "),
+            "`{cmd}` is in the `release-semantics` group but does not RUN anything."
+        );
+        let profile = cmd
+            .split_whitespace()
+            .skip_while(|w| *w != "--profile")
+            .nth(1)
+            .unwrap_or_else(|| {
+                panic!(
+                    "`{cmd}` selects no `--profile`, so it builds `dev` — which has \
+                     the guards ON and no optimisation, i.e. neither of the two things \
+                     this lane exists to provide (#1293)."
+                )
+            });
+        assert!(
+            !profile_has_guards_on(profile),
+            "`{cmd}` builds `--profile {profile}`, which resolves to \
+             `debug-assertions = true` in Cargo.toml. This lane exists to be the \
+             guards-OFF half of the pair; on a guarded profile it duplicates the \
+             coverage jobs and nothing on the PR exercises release semantics (#1293)."
+        );
+
+        // The runtime half, same argument as the canary arming above: reading
+        // Cargo.toml cannot see a `CARGO_PROFILE_CI_FAST_DEBUG_ASSERTIONS=true` in
+        // the environment.
+        assert!(
+            cmd.starts_with("env FERX_REQUIRE_NO_DEBUG_ASSERTIONS=1 cargo "),
+            "`{cmd}` does not arm the inverse canary. Prefix it with \
+             `env FERX_REQUIRE_NO_DEBUG_ASSERTIONS=1` (in the argument vector, so \
+             `--list` shows it): without it `debug_assertion_canary` in \
+             src/lib_tests.rs cannot tell this lane from a guarded one (#1293)."
+        );
+    }
+
     // Union of every `--features` value in the check group.
     let check = listed_commands("check");
     let mut features: Vec<String> = Vec::new();
@@ -763,7 +817,7 @@ fn preflight_is_executable_and_lists_every_group() {
     // commands are actually *enforced* is
     // `a_failing_gate_fails_the_script_from_every_position`; `--list` executes nothing and
     // can never show it.
-    let expected: [(&str, usize); 7] = [
+    let expected: [(&str, usize); 8] = [
         ("fmt", 1),        // cargo fmt --all -- --check
         ("check", 5),      // ci · ci,survival,slow-tests · ci,markov · ci,nn,slow-tests · members
         ("clippy", 2),     // ferx-core --all-targets · members
@@ -776,6 +830,12 @@ fn preflight_is_executable_and_lists_every_group() {
         // dropping it would leave those guards exactly as dead as they are in
         // every release-profile job.
         ("debug-assertions", 2),
+        // #1293: one line, `--lib` on the `ci,markov,nn` union. Deliberately not a
+        // matrix like its guards-on twin above — this lane exists to exercise
+        // release semantics, and the union of the production cfgs is enough for
+        // that, where the twin needs both sets because it is chasing guards that
+        // live inside feature-gated modules.
+        ("release-semantics", 1),
     ];
 
     // Every group `--list` actually walks must have an entry above. The loop below

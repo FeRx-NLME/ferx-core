@@ -2186,10 +2186,12 @@ fn test_max_scaled_deviation_reports_degenerate_input_as_nan() {
     // there, it silently stops existing in the only jobs that ran it
     // (`outer_optimizer.rs:692` went from 1 hit to 0). Assert whichever the current
     // build promises instead.
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
+    //
+    // The panic hook is left alone deliberately, so the expected panic prints under
+    // a guarded profile. Swapping in a silent hook and restoring it is process-
+    // global and races with the parallel harness — see `guard_fired` in
+    // `src/types_tests.rs` for the interleaving that silences the whole process.
     let mismatched = std::panic::catch_unwind(|| max_scaled_deviation(&[1.0, 10.0], &[1.0]));
-    std::panic::set_hook(prev);
     if cfg!(debug_assertions) {
         assert!(
             mismatched.is_err(),

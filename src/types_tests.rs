@@ -32,16 +32,18 @@ fn sim_outcome_category_and_count_variants_construct() {
 /// silently stops existing, in the only jobs that ran it. Measured at the time:
 /// three tests, and `src/types.rs:3490` and `:3494` went from 2 hits to 0.
 ///
-/// The panic hook is swapped for a silent one so an expected panic does not print
-/// a backtrace into the test log. `set_hook` is process-global, so a genuinely
-/// unexpected panic in a *concurrent* test could lose its message for the duration
-/// of this call; that is the accepted cost, and the hook is restored immediately.
+/// The panic hook is left ALONE, so under a guarded profile each expected panic
+/// prints its message to the test log. That noise is deliberate. The obvious
+/// tidier version — `take_hook`, install a silent one, restore — is not merely
+/// racy in the "a concurrent failure loses its message" sense: `set_hook` is
+/// process-global and these expected-panic paths can run concurrently in the same
+/// lib-test process, so the interleaving where A takes the normal hook, B takes
+/// the *silent* hook A installed, A restores normal and B restores silent leaves
+/// the whole process permanently silenced. Restoring immediately does not help;
+/// only a shared lock would, and three expected panic messages are cheaper than
+/// that machinery. Raised by review on PR #1293.
 fn guard_fired(f: impl FnOnce() -> f64) -> Result<f64, ()> {
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-    std::panic::set_hook(prev);
-    out.map_err(|_| ())
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|_| ())
 }
 
 /// `continuous_value()` on the non-Gaussian outcomes: the misuse guard fires where

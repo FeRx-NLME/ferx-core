@@ -60,7 +60,7 @@ export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-nightly}"
 # current user's numeric group IDs, and it wins. The first draft used it and
 # every group name silently became a GID — `unknown group 'check' — expected one
 # of: 20 12 61 ...`.
-ALL_GROUPS=(fmt check clippy rustdoc docs public-api debug-assertions)
+ALL_GROUPS=(fmt check clippy rustdoc docs public-api debug-assertions release-semantics)
 
 # Groups that are NOT in the default selection.
 #
@@ -69,18 +69,27 @@ ALL_GROUPS=(fmt check clippy rustdoc docs public-api debug-assertions)
 # that RUNS the unit suite is a different order of cost (its own profile hash,
 # so its own full build, and then the tests), and folding it into the default
 # would turn `tools/preflight.sh` from a pre-push habit into a coffee break. So
-# it is opt-in by name — `tools/preflight.sh debug-assertions` — and CI covers the
-# same ground inside its coverage jobs, which is where it has to be green.
+# they are opt-in by name — `tools/preflight.sh debug-assertions` — and CI runs
+# each of them, which is where they have to be green.
 #
-# It is also the one group with NO dedicated CI job of its own since #1248 retired
+# The two are a PAIR, and the pairing is the point: `debug-assertions` builds
+# `ci-cov` (guards live), `release-semantics` builds `ci-fast` (guards compiled
+# out, release overflow semantics). Several tests assert one thing under a live
+# guard and another without one, so a mode nothing builds is a set of assertions
+# nothing checks — which is exactly what #1248 briefly did to the guards-off side
+# before review caught it (#1293).
+#
+# `debug-assertions` is the one group with NO dedicated CI job, since #1248 retired
 # `Tests (debug-assertions)`. The property it checks did not go away with the job:
 # it moved into `[profile.ci-cov]`, which both coverage jobs build under. So the
-# guard test asserts the PROFILE here rather than a job name — see
+# guard test asserts the PROFILE for it rather than a job name.
+# `release-semantics` does have a job, because no coverage job builds `ci-fast`
+# any more. Both directions are pinned in
 # `tests/preflight_owns_the_fast_gates.rs`.
 #
-# `--help` and `--list` still enumerate it, and that test pins this array, so an
+# `--help` and `--list` still enumerate them, and that test pins this array, so an
 # opt-in group cannot quietly become a group that nothing ever runs.
-OPT_IN_GROUPS=(debug-assertions)
+OPT_IN_GROUPS=(debug-assertions release-semantics)
 
 is_opt_in() {
   local candidate="$1" g
@@ -123,11 +132,17 @@ under. \`release\`, \`ci-test\` and \`ci-fast\` all leave the guards off, so eve
 is a build plus a test run rather than seconds of compile, so you name it when
 you want it; CI covers the same ground inside its coverage jobs on every PR.
 
+\`release-semantics\` is its mirror: the same Tier-1 suite on \`--profile ci-fast\`,
+where the guards are compiled out and overflow wraps — the way a user's build
+behaves. Both matter, and neither substitutes for the other: several tests assert
+one thing under a live guard and another without it. CI runs this one as
+\`Tests (release semantics)\`.
+
 NOT covered by the DEFAULT set: the test jobs. \`cargo check --tests\` COMPILES
 the test targets but runs nothing, so \`Tests + coverage (core)\` can still go red
 after a green preflight. The default set gates compilation and lint, not
-behaviour. Two exceptions: \`docs\`, whose gate IS its test run (a filesystem walk
-over \`docs/\`, not a fit), and the opt-in \`debug-assertions\` above.
+behaviour. Three exceptions: \`docs\`, whose gate IS its test run (a filesystem walk
+over \`docs/\`, not a fit), and the two opt-in suites above.
 EOF
 }
 
@@ -422,6 +437,39 @@ group_debug_assertions() {
   # is the union of the production cfgs — the same set `clippy` and `rustdoc` take,
   # and for the same reason. In CI this half is the endpoints coverage job.
   run env FERX_REQUIRE_DEBUG_ASSERTIONS=1 cargo test --lib --profile ci-cov \
+    --no-default-features --features ci,markov,nn
+}
+
+group_release_semantics() {
+  CI_JOB="Tests (release semantics)"
+  # The guards-OFF half of the pair, and the reason it exists is #1293 review
+  # feedback on #1248. Pointing both coverage jobs at `ci-cov` fixed the coverage
+  # ceiling but left NO per-PR job running the crate with `debug_assertions = false`
+  # and release overflow semantics — which is what a user actually runs. Before
+  # #1248 the coverage jobs themselves were that lane; afterwards the only
+  # guards-off runs were the scheduled/post-merge `ci-test` ones, so a release-only
+  # regression could merge green.
+  #
+  # It bites hardest on the tests #1248 rewrote. `continuous_value()` and
+  # `max_scaled_deviation()` each have two correct behaviours — panic under a live
+  # guard, NaN fallback without one — and the NaN arm is the documented user
+  # behaviour. Under `ci-cov` only the panic arm runs.
+  #
+  # `--lib` on `ci,markov,nn`: the union of the production cfgs, the same set
+  # `clippy` and `rustdoc` take and for the same non-nesting reason. That covers
+  # every `src/` unit test, which is where a `cfg!(debug_assertions)` split lives.
+  # It does NOT restore guards-off `tests/` binaries — those cost the 120-odd
+  # binary compile this lane is shaped to avoid, and `slow-tests.yml` plus the
+  # nightly coverage job still run them on `ci-test` with the guards off.
+  #
+  # `ci-fast`, explicitly rather than by omission: the point is release semantics,
+  # and the dev default would give neither those nor the optimisation.
+  #
+  # `env FERX_REQUIRE_NO_DEBUG_ASSERTIONS=1` arms the INVERSE canary
+  # (`src/lib_tests.rs`). Without it the lane's value rests on `ci-fast` never
+  # acquiring `debug-assertions`, and if it did this job would quietly become a
+  # second copy of the coverage jobs with every test still green.
+  run env FERX_REQUIRE_NO_DEBUG_ASSERTIONS=1 cargo test --lib --profile ci-fast \
     --no-default-features --features ci,markov,nn
 }
 
