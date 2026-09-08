@@ -87,6 +87,10 @@ section of the SDLC for the versioning policy).
   to read. No effect on `.ferx` models, the CLI or the R wrapper, none of which constructs it.
 
 ### Fixed
+- Quadrature S/RSR covariance rejects unavailable subject scores instead of
+  differentiating the optimizer's population EBE penalty. Numerical fallback is
+  local to each subject, honors `cov_inner_tol`, and skips zero-weight covariance
+  nodes; analytic Hessians use a deterministic parallel reduction (#955).
 - Quadrature `covariance_method = s` / `rsr` now use scores of the selected AGQ
   objective instead of FOCE/FOCEI scores. Mixture FOCEI rejects unsupported
   `n_agq > 1`, Rust API calls reject `n_agq = 0`, and incomplete AGQ derivatives

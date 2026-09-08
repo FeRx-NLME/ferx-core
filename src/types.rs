@@ -7846,16 +7846,21 @@ impl FitOptions {
     /// Reads `self.method` (the per-stage method — `api::fit_inner` rewrites it for each
     /// stage of a chain), so it is correct inside a chained fit too.
     pub fn agq_nodes(&self) -> Option<usize> {
-        match self.method {
+        Self::agq_nodes_for(self.method, self.n_agq)
+    }
+
+    /// Stage-level quadrature dispatch without cloning the surrounding fit options.
+    pub(crate) fn agq_nodes_for(method: EstimationMethod, n_agq: usize) -> Option<usize> {
+        match method {
             // Laplace is the exact-anchor quadrature: `n_agq = 1` is Laplace, `> 1` is
             // adaptive Gauss–Hermite quadrature. Both route through the same objective, the
             // same analytic gradient, and the same covariance stencil.
-            EstimationMethod::Laplace => Some(self.n_agq.max(1)),
+            EstimationMethod::Laplace => Some(n_agq.max(1)),
             // FOCEI with `n_agq > 1` is the Gauss-Newton-anchored quadrature refinement, live
             // for every in-analytic-scope model; `n_agq = 1` (the default) is plain FOCEI and
             // takes its own path (`None`). `check_model_options` rejects `focei, n_agq > 1`
             // only *outside* the analytic sensitivity scope (`E_FOCEI_NAGQ_UNSUPPORTED`).
-            EstimationMethod::FoceI if self.n_agq > 1 => Some(self.n_agq),
+            EstimationMethod::FoceI if n_agq > 1 => Some(n_agq),
             _ => None,
         }
     }

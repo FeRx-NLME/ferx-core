@@ -3199,7 +3199,7 @@ fn assemble_population_gradient(per_subj: &[Vec<f64>], np: usize) -> Vec<f64> {
 /// fires on evals `0, N, 2N, …`. The `interval != 0` guard also short-circuits
 /// the modulo, so a `0` interval can never divide by zero. IOV models
 /// reconverge unconditionally and never consult this.
-fn reconverge_this_eval(options: &FitOptions, grad_idx: usize) -> bool {
+pub(super) fn reconverge_this_eval(options: &FitOptions, grad_idx: usize) -> bool {
     let interval = options.reconverge_gradient_interval;
     interval != 0 && grad_idx % interval == 0
 }
@@ -3245,7 +3245,7 @@ pub(super) fn population_gradient(
     // the FOCE marginal — is simply the gradient of the wrong function. Feeding one to the
     // outer optimizer would not fail loudly; it would converge, smoothly, to the FOCE
     // optimum while reporting AGQ OFVs. AGQ has its own gradient.
-    if let Some(n_nodes) = options.agq_nodes() {
+    if options.agq_nodes().is_some() {
         // Preferred: AGQ's own exact gradient — the analytic posterior-weighted score over
         // the nodes (Fisher identity) plus the grid-response term — which needs no inner
         // re-solve, against the FD path's `2·n_free` *full population objective*
@@ -3253,36 +3253,27 @@ pub(super) fn population_gradient(
         // `reconverge_gradient_interval` is honoured here too: it is the documented escape
         // hatch onto the numeric path, so it must override the analytic gradient for AGQ
         // exactly as it does for FOCE/FOCEI below.
-        // `agq_population_gradient` is the analytic gradient of the quadrature objective for
+        // `population_gradient_mixed` supplies the gradient of the quadrature objective for
         // **either** anchor: the fixed-node score is anchor-independent, and the grid-response
         // term differences whichever Hessian scales the grid (exact for `laplace`,
-        // Gauss-Newton for `focei` — `anchor` selects it, matching the objective).
-        if !reconverge && crate::estimation::agq::analytic_gradient_available(model) {
-            let params = unpack_params(x, init_params);
-            if let Some(mut g) = crate::estimation::agq::agq_population_gradient(
-                model,
-                population,
-                &params,
-                init_params,
-                x,
-                ehs,
-                kappas,
-                n_nodes,
-                options.hessian_anchor(),
-            ) {
-                // Fixed coordinates carry no gradient, matching the analytic FOCE path.
-                let fixed = packed_fixed_mask(init_params);
-                for (i, gi) in g.iter_mut().enumerate() {
-                    if fixed[i] {
-                        *gi = 0.0;
-                    }
-                }
-                return g;
-            }
+        // Gauss-Newton for `focei` — `anchor` selects it, matching the objective). If an
+        // analytic subject score fails, only that subject is reconverged numerically.
+        if let Some(g) = crate::estimation::agq::population_gradient_mixed(
+            model,
+            population,
+            init_params,
+            x,
+            ehs,
+            kappas,
+            bounds,
+            options,
+            reconverge,
+        ) {
+            return g;
         }
-        // Fallback (always correct, just slower): central-difference the real objective,
-        // re-solving the inner loop at each perturbed point so the response of η̂ to the
-        // population parameters is captured too.
+        // A subject's numerical score also failed. Only the optimizer may use its
+        // guarded population objective here; covariance rejects an unavailable score
+        // rather than differentiating this penalty and squaring it into S.
         return reconverged_fd_gradient(x, init_params, model, population, ehs, bounds, options);
     }
     // M3-censored models now have an exact analytic censored gradient on both the

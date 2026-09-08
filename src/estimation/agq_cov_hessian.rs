@@ -840,6 +840,11 @@ pub(crate) fn subject_agq_cov_hessian(
     let mut node_acc = DMatrix::<f64>::zeros(dim, dim);
 
     for (j, z) in grid.iter().enumerate() {
+        if pi[j] == 0.0 {
+            // Preserve score/weight alignment without evaluating an underflowed tail.
+            u.push(vec![0.0; dim]);
+            continue;
+        }
         let zv = DVector::from_column_slice(z);
         let b_j: Vec<f64> = (eta_hat_vec(eta_hat) + SQRT_2 * (&node_scale * &zv))
             .iter()

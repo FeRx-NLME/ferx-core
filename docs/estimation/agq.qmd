@@ -598,16 +598,25 @@ reported OFV. The reported estimation method remains that preceding estimator.
 
 This applies to standard errors too. The R-matrix, the score matrix used by `s`
 and `rsr`, and SIR all evaluate the selected quadrature objective. The score matrix
-uses negative-log-likelihood scores, so optimizer OFV gradients are divided by two
-before taking their outer products. A FOCEI eta-response correction must not be
+uses subject negative-log-likelihood scores directly; the optimizer doubles these
+for its OFV gradient. A FOCEI eta-response correction must not be
 added to a quadrature score that already includes mode and grid movement.
 
 If a required derivative perturbation cannot produce a finite anchor or grid
-response, the analytic-gradient attempt is declined as a whole. The fallback
-reconverges the modes and differences the same quadrature objective rather than
-returning a gradient with missing terms. Finite-grid posterior-mean scores are
+response, only that subject's analytic score is declined first. Its numerical fallback
+reconverges the mode and differences the same quadrature objective; other subjects
+keep their analytic scores. For `s` and `rsr`, a failed inner solve, rejected start,
+or non-finite/penalty objective makes the score unavailable and the covariance step
+reports unavailable standard errors. It never squares an optimizer penalty into S,
+regardless of `max_unconverged_frac`, and uses `cov_inner_tol` for numerical scores.
+Finite-grid posterior-mean scores are
 generally nonzero; the exact-integral Bartlett identity does not remove their
 mode-response contribution.
+
+The analytic R-matrix is assembled in parallel and summed in fixed subject order.
+Zero-weight nodes are skipped before sensitivity evaluation. Grid abscissae are
+materialized only for covariance; objective and gradient sweeps reconstruct their
+indices rather than allocating another coordinate vector per node.
 
 ## References
 

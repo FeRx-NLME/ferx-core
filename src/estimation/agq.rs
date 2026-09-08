@@ -492,7 +492,7 @@ pub(crate) fn agq_subject_nll(
         return NLL_SENTINEL;
     };
 
-    let (_bs, terms, _zs) = agq_nodes_and_terms(
+    let (_bs, terms) = agq_nodes_and_terms(
         model,
         subject,
         params,
@@ -533,16 +533,12 @@ fn agq_nodes_and_terms(
     proposal: &crate::estimation::importance_sampling::Proposal,
     scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
-) -> (Vec<Vec<f64>>, Vec<f64>, Vec<Vec<f64>>) {
+) -> (Vec<Vec<f64>>, Vec<f64>) {
     let d = stack.d();
     let n = nodes.len();
     let cap = grid_size(n, d);
     let mut bs = Vec::with_capacity(cap);
     let mut terms = Vec::with_capacity(cap);
-    // The abscissae themselves: #251's covariance re-places the nodes from its own regularised
-    // anchor and must pair each `z_j` with the weight this loop computed for it. Rebuilding the
-    // odometer at the call site would risk an off-by-one pairing that is silently, exactly wrong.
-    let mut zs = Vec::with_capacity(cap);
     let mut idx = vec![0usize; d];
     let mut z = vec![0.0f64; d];
     let mut step = vec![0.0f64; d];
@@ -567,7 +563,6 @@ fn agq_nodes_and_terms(
         // which case the subject correctly reports the sentinel back.
         terms.push(log_w + z_sq - nll);
         bs.push(b);
-        zs.push(z.clone());
 
         // Mixed-radix increment over the d-dimensional tensor grid.
         let mut k = 0;
@@ -583,7 +578,7 @@ fn agq_nodes_and_terms(
             break;
         }
     }
-    (bs, terms, zs)
+    (bs, terms)
 }
 
 /// The FOCEI-anchored AGQ objective `F_i` for one subject at `n_agq` nodes.
@@ -657,7 +652,7 @@ pub(crate) fn subject_grid_and_weights(
         schedule.as_ref(),
     )?;
     let proposal = build_proposal(&h, &stack.omega_joint_inv, d)?;
-    let (_bs, terms, zs) = agq_nodes_and_terms(
+    let (_bs, terms) = agq_nodes_and_terms(
         model,
         subject,
         params,
@@ -674,6 +669,15 @@ pub(crate) fn subject_grid_and_weights(
         return None;
     }
     let pi: Vec<f64> = terms.iter().map(|&t| (t - lse).exp()).collect();
+    // Only covariance needs the abscissae. Reconstruct them in the same tested order
+    // instead of allocating a second coordinate vector on every objective sweep.
+    let zs = (0..terms.len())
+        .map(|j| {
+            let mut z = vec![0.0; d];
+            grid_z_at(j, nodes, d, &mut z);
+            z
+        })
+        .collect();
     Some((zs, pi))
 }
 
@@ -1564,7 +1568,7 @@ fn phi_grid(
 ) -> Option<f64> {
     let d = stack.d();
     let proposal = build_proposal(h_mat, omega_inv, d)?;
-    let (_bs, terms, _zs) = agq_nodes_and_terms(
+    let (_bs, terms) = agq_nodes_and_terms(
         model,
         subject,
         params,
@@ -1625,7 +1629,7 @@ fn agq_subject_packed_gradient(
 
     // Sweep the grid once, keeping each node's b and its log-term, so the softmax weights
     // and the scores are computed on exactly the same nodes the objective used.
-    let (bs, terms, _zs) = agq_nodes_and_terms(
+    let (bs, terms) = agq_nodes_and_terms(
         model,
         subject,
         params,
@@ -1674,6 +1678,183 @@ fn agq_subject_packed_gradient(
         out,
     )?;
     Some(())
+}
+
+/// Shared quadrature inputs for subject scores. No synthetic population or optimizer
+/// penalty is involved in the numerical score: failed inner solves decline the score.
+pub(crate) struct SubjectScoreContext<'a> {
+    model: &'a CompiledModel,
+    template: &'a ModelParameters,
+    x: &'a [f64],
+    options: &'a crate::types::FitOptions,
+    bounds: &'a crate::estimation::parameterization::PackedBounds,
+    params: ModelParameters,
+    nodes: Vec<f64>,
+    log_weights: Vec<f64>,
+    fixed: Vec<bool>,
+    force_fd: bool,
+}
+
+impl<'a> SubjectScoreContext<'a> {
+    pub(crate) fn new(
+        model: &'a CompiledModel,
+        template: &'a ModelParameters,
+        x: &'a [f64],
+        options: &'a crate::types::FitOptions,
+        bounds: &'a crate::estimation::parameterization::PackedBounds,
+        force_fd: bool,
+    ) -> Self {
+        let (nodes, weights) = gauss_hermite(options.agq_nodes().expect("quadrature stage"));
+        Self {
+            model,
+            template,
+            x,
+            options,
+            bounds,
+            params: crate::estimation::parameterization::unpack_params(x, template),
+            nodes,
+            log_weights: weights.iter().map(|w| w.ln()).collect(),
+            fixed: crate::estimation::parameterization::packed_fixed_mask(template),
+            force_fd: force_fd || !analytic_gradient_available(model),
+        }
+    }
+
+    /// Negative-log-likelihood score, with per-subject numerical salvage.
+    pub(crate) fn score(
+        &self,
+        subject: &Subject,
+        eta: &[f64],
+        kappas: &[nalgebra::DVector<f64>],
+    ) -> Option<Vec<f64>> {
+        if crate::cancel::is_cancelled(&self.options.cancel) {
+            return None;
+        }
+        if !self.force_fd {
+            let stack = Stack::new(self.model, &self.params, kappas.len());
+            let b = stack_mode(eta, kappas);
+            let mut g = vec![0.0; self.x.len()];
+            if agq_subject_packed_gradient(
+                self.model,
+                subject,
+                &self.params,
+                self.template,
+                &stack,
+                self.x,
+                &b,
+                &self.nodes,
+                &self.log_weights,
+                self.options.hessian_anchor(),
+                &mut g,
+            )
+            .is_some()
+                && g.iter().all(|v| v.is_finite())
+            {
+                for (g, fixed) in g.iter_mut().zip(&self.fixed) {
+                    if *fixed {
+                        *g = 0.0;
+                    }
+                }
+                return Some(g);
+            }
+        }
+        self.finite_difference_score(subject, eta)
+    }
+
+    fn reconverged_nll(&self, subject: &Subject, xv: &[f64], eta: &[f64]) -> Option<f64> {
+        use crate::estimation::parameterization::{compute_mu_k, unpack_params};
+        if crate::cancel::is_cancelled(&self.options.cancel) {
+            return None;
+        }
+        let p = unpack_params(xv, self.template);
+        let mu = compute_mu_k(self.model, &p.theta, self.options.mu_referencing);
+        let ebe = crate::estimation::inner_optimizer::find_ebe(
+            self.model,
+            subject,
+            &p,
+            self.options.inner_maxiter,
+            self.options.inner_tol,
+            Some(eta),
+            Some(&mu),
+            self.options.inner_restarts,
+        );
+        if ebe.hard_reject || !ebe.converged || !ebe.nll.is_finite() || ebe.nll >= NLL_SENTINEL {
+            return None;
+        }
+        let stack = Stack::new(self.model, &p, ebe.kappas.len());
+        let b = stack_mode(ebe.eta.as_slice(), &ebe.kappas);
+        let nll = agq_subject_nll(
+            self.model,
+            subject,
+            &p,
+            &stack,
+            &b,
+            &self.nodes,
+            &self.log_weights,
+            self.options.hessian_anchor(),
+        );
+        (nll.is_finite() && nll < NLL_SENTINEL).then_some(nll)
+    }
+
+    fn finite_difference_score(&self, subject: &Subject, eta: &[f64]) -> Option<Vec<f64>> {
+        self.reconverged_nll(subject, self.x, eta)?;
+        let mut g = vec![0.0; self.x.len()];
+        for k in 0..self.x.len() {
+            if self.fixed[k] {
+                continue;
+            }
+            let h = 1e-4 * (1.0 + self.x[k].abs());
+            let mut xp = self.x.to_vec();
+            let mut xm = self.x.to_vec();
+            xp[k] = (self.x[k] + h).min(self.bounds.upper[k]);
+            xm[k] = (self.x[k] - h).max(self.bounds.lower[k]);
+            let width = xp[k] - xm[k];
+            if width.abs() < 1e-16 {
+                continue;
+            }
+            let fp = self.reconverged_nll(subject, &xp, eta)?;
+            let fm = self.reconverged_nll(subject, &xm, eta)?;
+            g[k] = (fp - fm) / width;
+            if !g[k].is_finite() {
+                return None;
+            }
+        }
+        Some(g)
+    }
+}
+
+/// Use analytic scores where possible and reconverge only subjects needing numerical scores.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn population_gradient_mixed(
+    model: &CompiledModel,
+    population: &Population,
+    template: &ModelParameters,
+    x: &[f64],
+    eta_hats: &[nalgebra::DVector<f64>],
+    kappas: &[Vec<nalgebra::DVector<f64>>],
+    bounds: &crate::estimation::parameterization::PackedBounds,
+    options: &crate::types::FitOptions,
+    force_fd: bool,
+) -> Option<Vec<f64>> {
+    let context = SubjectScoreContext::new(model, template, x, options, bounds, force_fd);
+    let scores: Vec<_> = population
+        .subjects
+        .par_iter()
+        .enumerate()
+        .map(|(i, s)| {
+            context.score(
+                s,
+                eta_hats[i].as_slice(),
+                kappas.get(i).map(Vec::as_slice).unwrap_or(&[]),
+            )
+        })
+        .collect();
+    let mut result = vec![0.0; x.len()];
+    for score in scores {
+        for (out, g) in result.iter_mut().zip(score?) {
+            *out += 2.0 * g;
+        }
+    }
+    result.iter().all(|v| v.is_finite()).then_some(result)
 }
 
 /// Packed gradient of the AGQ **OFV** (`2 · Σᵢ Fᵢ`), or `None` if a complete finite gradient

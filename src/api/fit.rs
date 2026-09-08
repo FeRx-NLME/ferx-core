@@ -566,11 +566,10 @@ pub fn fit(
     // review #4) rather than hardcoding "laplace".
     // A later stage can request quadrature while options.method names a different
     // estimator. Inspect the effective chain, just as check_model_options does.
-    let quadrature_stage = options.method_chain().into_iter().find_map(|method| {
-        let mut stage = options.clone();
-        stage.method = method;
-        stage.agq_nodes().map(|n| (method, n))
-    });
+    let quadrature_stage = options
+        .method_chain()
+        .into_iter()
+        .find_map(|method| FitOptions::agq_nodes_for(method, options.n_agq).map(|n| (method, n)));
     if let Some((method, n_nodes)) = quadrature_stage {
         if model.n_kappa > 0 {
             let max_occ = population

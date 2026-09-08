@@ -2592,6 +2592,174 @@ mod tests {
     }
 
     #[test]
+    fn agq_cov_hessian_ignores_unusable_zero_weight_nodes() {
+        use crate::estimation::agq_cov_hessian::{node_jet, prepare_mode, subject_agq_cov_hessian};
+        let model = parse_model_string(WARFARIN).unwrap();
+        let p = &model.default_params;
+        let s = warfarin_subject(&model, &p.theta, &[0.5, 2.0, 8.0, 24.0]);
+        let eta = precise_ebe(&model, &s, p);
+        let central = vec![vec![0.0; model.n_eta]];
+        let expected = subject_agq_cov_hessian(&model, &s, p, &eta, &central, &[1.0]).unwrap();
+        let (_, _, anchor) = prepare_mode(&model, &s, p, &eta).unwrap();
+        let tail = vec![1e6; model.n_eta];
+        let bad = DVector::from_column_slice(&eta)
+            + std::f64::consts::SQRT_2 * anchor.node_scale() * DVector::from_column_slice(&tail);
+        assert!(
+            node_jet(&model, &s, p, bad.as_slice()).is_none(),
+            "tail fixture must be outside the provider's scope"
+        );
+        // Include a zero-weight tail before AND after the live node to pin alignment.
+        let actual = subject_agq_cov_hessian(
+            &model,
+            &s,
+            p,
+            &eta,
+            &[tail.clone(), central[0].clone(), tail],
+            &[0.0, 1.0, 0.0],
+        )
+        .unwrap();
+        assert_eq!(actual.total(), expected.total());
+        assert_eq!(actual.grad, expected.grad);
+    }
+
+    #[test]
+    fn agq_cov_hessian_parallel_reduction_is_bit_identical() {
+        use crate::estimation::covariance::analytic_cov_hessian;
+        use crate::types::{EstimationMethod, FitOptions, Population};
+        let model = parse_model_string(WARFARIN).unwrap();
+        let p = &model.default_params;
+        let subjects: Vec<_> = (0..5)
+            .map(|i| {
+                let mut s = warfarin_subject(&model, &p.theta, &[0.5, 2.0, 8.0, 24.0]);
+                s.id = i.to_string();
+                for y in &mut s.observations {
+                    *y *= 1.0 + 0.02 * i as f64;
+                }
+                s
+            })
+            .collect();
+        let eta: Vec<_> = subjects
+            .iter()
+            .map(|s| DVector::from_vec(precise_ebe(&model, s, p)))
+            .collect();
+        let pop = Population {
+            subjects,
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            n_agq: 3,
+            ..FitOptions::default()
+        };
+        let x = pack_params(p);
+        let run = |n| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(n)
+                .build()
+                .unwrap()
+                .install(|| analytic_cov_hessian(&model, &pop, p, &x, &eta, &opts).unwrap())
+        };
+        assert_eq!(run(1), run(3));
+    }
+
+    #[test]
+    fn agq_cov_hessian_score_failure_rejects_s_instead_of_squaring_a_penalty() {
+        use crate::estimation::covariance::{
+            assemble_score_cross_product, compute_covariance, CovarianceStepResult,
+        };
+        use crate::estimation::parameterization::compute_bounds;
+        use crate::types::{CovarianceMethod, EstimationMethod, FitOptions, Population};
+        let model = parse_model_string(WARFARIN).unwrap();
+        let p = &model.default_params;
+        let s = warfarin_subject(&model, &p.theta, &[0.5, 2.0, 8.0, 24.0]);
+        let eta = vec![DVector::from_vec(precise_ebe(&model, &s, p))];
+        let ebe = find_ebe(&model, &s, p, 200, 1e-10, None, None, 0);
+        let h = vec![ebe.h_matrix];
+        let pop = Population {
+            subjects: vec![s],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let x = pack_params(p);
+        let bounds = compute_bounds(p);
+        let free: Vec<_> = (0..x.len()).collect();
+        for fraction in [0.0, 1.0] {
+            let opts = FitOptions {
+                method: EstimationMethod::FoceI,
+                n_agq: 3,
+                inner_maxiter: 0,
+                inner_tol: 1e-12,
+                reconverge_gradient_interval: 1,
+                max_unconverged_frac: fraction,
+                covariance_method: CovarianceMethod::Sandwich,
+                verbose: false,
+                ..FitOptions::default()
+            };
+            let mut perturbed = x.clone();
+            perturbed[0] += 1e-4 * (1.0 + x[0].abs());
+            let perturbed = unpack_params(&perturbed, p);
+            let failed = find_ebe(
+                &model,
+                &pop.subjects[0],
+                &perturbed,
+                0,
+                1e-12,
+                Some(eta[0].as_slice()),
+                None,
+                0,
+            );
+            assert!(!failed.converged, "fixture must exhaust its inner budget");
+            let err = assemble_score_cross_product(
+                &x,
+                p,
+                &model,
+                &pop,
+                &eta,
+                &h,
+                &[vec![]],
+                &bounds,
+                &opts,
+                &free,
+            )
+            .unwrap_err();
+            assert!(
+                err.contains("quadrature score") && err.contains("subject 1"),
+                "{err}"
+            );
+            match compute_covariance(&x, p, &model, &pop, &eta, &h, &[vec![]], &opts) {
+                CovarianceStepResult::Unusable(reason) => {
+                    assert!(reason.contains("quadrature score"), "{reason}")
+                }
+                _ => panic!("an unavailable quadrature score must not produce covariance"),
+            }
+            let analytic = FitOptions {
+                reconverge_gradient_interval: 0,
+                ..opts
+            };
+            assert!(assemble_score_cross_product(
+                &x,
+                p,
+                &model,
+                &pop,
+                &eta,
+                &h,
+                &[vec![]],
+                &bounds,
+                &analytic,
+                &free
+            )
+            .is_ok());
+        }
+    }
+
+    #[test]
     fn agq_cov_hessian_declines_custom_and_time_varying_magnitudes() {
         use crate::estimation::agq_cov_hessian::{
             node_jet, subject_agq_cov_hessian, subject_packed_agq_cov_hessian,
@@ -3452,9 +3620,34 @@ mod tests {
                     &bounds,
                     &opts,
                     &free,
-                );
+                )
+                .expect("finite converged quadrature scores");
                 let gap = (&actual - &expected).amax() / expected.amax().max(1.0);
                 assert!(gap < 1e-3, "{method:?} n={n_agq} interval={interval}: score matrix uses a different objective, relative gap {gap}");
+                if interval == 1 {
+                    let cov_tolerance = FitOptions {
+                        inner_tol: 1e-3,
+                        cov_inner_tol: Some(opts.inner_tol),
+                        ..opts.clone()
+                    };
+                    let with_override = assemble_score_cross_product(
+                        &x,
+                        params,
+                        &model,
+                        &pop,
+                        &[DVector::from_vec(eta.clone())],
+                        &[ebe.h_matrix.clone()],
+                        &[vec![]],
+                        &bounds,
+                        &cov_tolerance,
+                        &free,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        actual, with_override,
+                        "quadrature scores must honor cov_inner_tol"
+                    );
+                }
             }
         }
     }
