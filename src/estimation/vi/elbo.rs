@@ -269,6 +269,8 @@ pub fn stacked_prior(
 /// The two failure modes therefore get different treatment, and conflating them
 /// is exactly how a scope gap turns into silently wrong estimates.
 pub fn unsupported_data_term_reason(model: &CompiledModel) -> Option<String> {
+    #[cfg(not(feature = "survival"))]
+    let _ = model;
     // The data term is `obs_nll_subject_grad`'s NLL, and
     // `obs_nll_subject_from_preds` *skips* rows belonging to a non-Gaussian
     // endpoint (#905) — they are scored through `obs_records` instead. Fitting

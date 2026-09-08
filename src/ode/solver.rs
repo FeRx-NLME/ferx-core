@@ -337,6 +337,37 @@ impl OdeSolverOverride {
         *self == Self::default()
     }
 
+    /// Reject values that the model-file parser would reject before they can
+    /// reach a worker pool through the public Rust API.
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        for (name, value) in [("ode_reltol", self.reltol), ("ode_abstol", self.abstol)] {
+            if let Some(value) = value {
+                if !value.is_finite() || value <= 0.0 {
+                    return Err(format!("{name} must be finite and positive, got {value}"));
+                }
+            }
+        }
+        if self.max_steps == Some(0) {
+            return Err("ode_max_steps must be positive, got 0".to_string());
+        }
+        Ok(())
+    }
+
+    /// Cache-key equality uses the float representation explicitly. Validation
+    /// keeps NaNs and signed zero out, while bit comparison makes the key's
+    /// behavior independent of `f64`'s partial equality rules.
+    pub(crate) fn same_pool_key(&self, other: &Self) -> bool {
+        fn bits(value: Option<f64>) -> Option<u64> {
+            value.map(f64::to_bits)
+        }
+        bits(self.reltol) == bits(other.reltol)
+            && bits(self.abstol) == bits(other.abstol)
+            && self.max_steps == other.max_steps
+            && self.method == other.method
+            && self.stiff_abort_after == other.stiff_abort_after
+            && self.auto_switch == other.auto_switch
+    }
+
     /// Merge onto a spec's baked options. Unset fields keep the baked value, so a model file's
     /// `[fit_options]` still wins wherever the caller expressed no opinion.
     pub(crate) fn apply_to(&self, base: OdeSolverOptions) -> OdeSolverOptions {
@@ -404,6 +435,16 @@ pub(crate) fn effective_solver_options(baked: OdeSolverOptions) -> OdeSolverOpti
 
 pub(crate) fn install_worker_ode_override(ov: OdeSolverOverride) {
     LOCAL_OVERRIDE.set(Some(Some(ov)));
+}
+
+/// True only on a worker that already carries this non-empty override. Call
+/// before arming a nested entry point on its caller thread.
+pub(crate) fn worker_carries_ode_override(ov: OdeSolverOverride) -> bool {
+    !ov.is_empty()
+        && LOCAL_OVERRIDE
+            .get()
+            .flatten()
+            .is_some_and(|current| current.same_pool_key(&ov))
 }
 
 /// Arms `ov` on this thread until the returned guard drops, restoring whatever was in force
@@ -2015,9 +2056,8 @@ mod tests {
     // serialising against the rest of the binary, and adding a lock would hide the very
     // property they exist to check. Two things still follow. Assert from the thread that
     // should see the value (arming thread, or inside `pool.install`), since the *absence* of
-    // an override elsewhere is half of what is being pinned. And prefer values that tighten
-    // accuracy: `ode_override_pool` caches a pool per override for the life of the process,
-    // so an exotic one costs a set of worker threads that never go away.
+    // an override elsewhere is half of what is being pinned. Idle override pools are reused
+    // within a bounded worker cache; live leases retain independent fit budgets.
 
     /// The whole merge rule rests on this: `ode_solver_override` treats "equal to the
     /// `FitOptions` default" as "the caller expressed no opinion", which is only sound
@@ -2149,17 +2189,13 @@ mod tests {
         // still reads its own value — so the assertions all happen while all three arms and
         // one deliberately-empty arm are live at once.
         let (armed_tx, armed) = channel::<()>();
-        let (go_tx, go) = channel::<()>();
         let arms = [Some(1e-9), Some(1e-11), Some(1e-13), None];
 
         std::thread::scope(|s| {
             let mut releases = Vec::new();
             for want in arms {
-                let (release_tx, release) = (go_tx.clone(), {
-                    let (tx, rx) = channel::<()>();
-                    releases.push(tx);
-                    rx
-                });
+                let (tx, release) = channel::<()>();
+                releases.push(tx);
                 let armed_tx = armed_tx.clone();
                 s.spawn(move || {
                     let _guard = arm_ode_solver_override(OdeSolverOverride {
@@ -2175,7 +2211,6 @@ mod tests {
                         want.unwrap_or(baked.reltol),
                         "a concurrent fit's ODE settings reached this one"
                     );
-                    drop(release_tx);
                 });
             }
             for _ in arms {
@@ -2323,8 +2358,8 @@ mod tests {
 
     /// The pool table is keyed by the override, so two different settings must not land on one
     /// pool — that would hand a fit another's tolerance through the very mechanism meant to
-    /// keep them apart — and the same settings must reuse one, or a bootstrap's replicate fits
-    /// would each spawn an `N × 32 MiB` pool.
+    /// keep them apart. Simultaneous leases with the same settings must also remain distinct,
+    /// or a bootstrap's independently budgeted replicate fits would share one worker budget.
     #[test]
     fn the_override_pool_table_is_keyed_by_the_override() {
         let a = OdeSolverOverride {
@@ -2339,17 +2374,22 @@ mod tests {
         let pool_b = crate::api::ode_override_pool(b, 2).expect("pool b");
         let pool_a_again = crate::api::ode_override_pool(a, 2).expect("pool a again");
         assert!(
-            std::ptr::eq(pool_a, pool_a_again),
-            "the same override built a second pool instead of reusing its own"
+            pool_a.install(|| std::thread::current().id())
+                != pool_a_again.install(|| std::thread::current().id()),
+            "concurrent fits with the same override must have independent workers"
         );
         assert!(
-            !std::ptr::eq(pool_a, pool_b),
+            pool_a.install(|| std::thread::current().id())
+                != pool_b.install(|| std::thread::current().id()),
             "two different overrides share one pool, so its workers carry the wrong one"
         );
         // Width is part of the key too: a fit that pinned `threads` must not be handed a pool
         // of some other width.
         let narrow = crate::api::ode_override_pool(a, 1).expect("pool a, one thread");
-        assert!(!std::ptr::eq(pool_a, narrow));
+        assert!(
+            pool_a.install(|| std::thread::current().id())
+                != narrow.install(|| std::thread::current().id())
+        );
         assert_eq!(narrow.current_num_threads(), 1);
     }
 

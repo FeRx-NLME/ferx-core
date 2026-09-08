@@ -1220,7 +1220,7 @@ fn sigma_closed_form_falls_back_loudly_on_combined_error() {
 /// a model that reaches `−283` once `φ` is allowed to finish.
 #[test]
 fn param_criterion_is_vacuous_when_every_population_parameter_is_fixed() {
-    let (model, _population, params) = fixture();
+    let (_model, _population, params) = fixture();
     assert!(
         super::param_criterion_applies(&params),
         "a model with free θ/Ω/σ must keep the parameter-stability criterion"

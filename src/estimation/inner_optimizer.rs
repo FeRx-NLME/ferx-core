@@ -1,6 +1,8 @@
 use crate::pk;
+#[cfg(test)]
+use crate::stats::likelihood::individual_nll_iov;
 use crate::stats::likelihood::{
-    individual_nll_into_with_schedule, individual_nll_iov, iov_occasion_groups,
+    individual_nll_into_with_schedule, individual_nll_iov_with_scratch, iov_occasion_groups,
 };
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -825,10 +827,10 @@ pub fn find_ebe(
     // to re-sort + re-allocate on every call. The EventPkParams scratch
     // recycles the per-event Vec<PkParams> backing storage.
     //
-    // Both are built only when this subject takes the TV-cov event-driven
-    // analytical path — for the no-TV fast path the schedule is None and
-    // event_driven_predictions is never called.
-    let pk_scratch_cell = RefCell::new(pk::EventPkParams::with_capacity_for(subject));
+    // Event parameter storage is allocated lazily by per-event prediction paths.
+    // The schedule is built only when cacheable_schedule permits reuse; a static
+    // fast path needs neither event storage nor a merged schedule.
+    let pk_scratch_cell = RefCell::new(pk::EventPkParams::default());
     let schedule = cacheable_schedule(model, subject);
     // Custom / time-varying residual-magnitude (#484/#576): η-independent, so
     // computed once per subject here — not inside `agrad`, which BFGS calls on
@@ -1189,17 +1191,12 @@ fn find_ebe_iov(
     // BSV mu shift (zeros when no mu-referencing). Kappas are not shifted.
     let mu: Vec<f64> = mu_k.map(|m| m.to_vec()).unwrap_or_else(|| vec![0.0; n_eta]);
 
-    // Initial flat vector: BSV portion is psi-space (warm + mu, defaulting
-    // to mu = prior mode); kappa portion starts at zero (prior mode for IOV).
-    let mut x = vec![0.0; n_flat];
-    x[..n_eta].copy_from_slice(&mu);
-    if let Some(warm) = eta_init {
-        for i in 0..n_eta.min(warm.len()) {
-            x[i] = warm[i] + mu[i];
-        }
-    }
+    let mut x = iov_initial_vector(n_eta, n_flat, &mu, eta_init);
 
     let omega_iov_ref = params.omega_iov.as_ref();
+    // One buffer set per EBE solve, shared by its serial objective/line-search/FD
+    // probes. Each probe rewrites every event; no parameter values are cached.
+    let pk_scratch = RefCell::new(pk::EventPkParams::default());
 
     let obj = |p: &[f64]| -> f64 {
         // Recover bsv_eta = psi - mu; kappas pass through unchanged.
@@ -1211,7 +1208,7 @@ fn find_ebe_iov(
         let kappas: Vec<Vec<f64>> = (0..k_occasions)
             .map(|k| p[n_eta + k * n_kappa..n_eta + (k + 1) * n_kappa].to_vec())
             .collect();
-        individual_nll_iov(
+        individual_nll_iov_with_scratch(
             model,
             subject,
             &params.theta,
@@ -1220,6 +1217,7 @@ fn find_ebe_iov(
             &params.omega,
             omega_iov_ref,
             &params.sigma.values,
+            &mut pk_scratch.borrow_mut(),
         )
     };
 
@@ -1449,6 +1447,24 @@ fn find_ebe_iov(
         kappas: kappas_vec,
         hard_reject: false,
     }
+}
+
+/// Build the IOV optimizer seed in `[psi_bsv, kappa_1, ..., kappa_K]` order.
+/// A legacy BSV-only warm start leaves kappas at their prior mode. A full joint
+/// warm start preserves fitted kappas, which is required when covariance-score
+/// finite differences reconverge the subject at nearby population parameters.
+fn iov_initial_vector(n_eta: usize, n_flat: usize, mu: &[f64], warm: Option<&[f64]>) -> Vec<f64> {
+    let mut x = vec![0.0; n_flat];
+    x[..n_eta].copy_from_slice(mu);
+    if let Some(warm) = warm {
+        for i in 0..n_eta.min(warm.len()) {
+            x[i] = warm[i] + mu[i];
+        }
+        if warm.len() == n_flat {
+            x[n_eta..].copy_from_slice(&warm[n_eta..]);
+        }
+    }
+    x
 }
 
 /// Jacobian d(pred)/d(bsv_eta) with kappas fixed. Returns an n_obs × n_eta
@@ -3366,15 +3382,54 @@ pub fn run_inner_loop_warm(
     InnerLoopStats,
     Vec<Vec<DVector<f64>>>,
 ) {
+    let (etas, h_matrices, stats, kappas, _) = run_inner_loop_warm_map(
+        model,
+        population,
+        params,
+        max_iter,
+        tol,
+        prev_etas,
+        mu_k,
+        min_obs,
+        restarts,
+        |_, _| (),
+    );
+    (etas, h_matrices, stats, kappas)
+}
+
+/// Finish subject-local work on the same worker immediately after its EBE solve,
+/// before the population barrier. The FOCE outer loop uses this to score the
+/// marginal without launching another subject pass. Results retain subject order.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub(crate) fn run_inner_loop_warm_map<T: Send>(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    max_iter: usize,
+    tol: f64,
+    prev_etas: Option<&[DVector<f64>]>,
+    mu_k: Option<&[f64]>,
+    min_obs: usize,
+    restarts: usize,
+    finish_subject: impl Fn(&Subject, &EbeResult) -> T + Sync,
+) -> (
+    Vec<DVector<f64>>,
+    Vec<DMatrix<f64>>,
+    InnerLoopStats,
+    Vec<Vec<DVector<f64>>>,
+    Vec<T>,
+) {
     use rayon::prelude::*;
 
-    let results: Vec<EbeResult> = population
+    let results: Vec<(EbeResult, T)> = population
         .subjects
         .par_iter()
         .enumerate()
         .map(|(i, subject)| {
             let init = prev_etas.map(|pe| pe[i].as_slice());
-            find_ebe(model, subject, params, max_iter, tol, init, mu_k, restarts)
+            let ebe = find_ebe(model, subject, params, max_iter, tol, init, mu_k, restarts);
+            let extra = finish_subject(subject, &ebe);
+            (ebe, extra)
         })
         .collect();
 
@@ -3382,18 +3437,27 @@ pub fn run_inner_loop_warm(
         n_unconverged: results
             .iter()
             .zip(population.subjects.iter())
-            .filter(|(r, s)| !r.converged && s.observations.len() >= min_obs.max(1))
+            .filter(|((r, _), s)| !r.converged && s.observations.len() >= min_obs.max(1))
             .count(),
-        n_fallback: results.iter().filter(|r| r.used_fallback).count(),
+        n_fallback: results.iter().filter(|(r, _)| r.used_fallback).count(),
         // No `min_obs` filter: a hard reject forces trial rejection even for a single
         // short-record subject, which the `n_unconverged` filter would otherwise drop.
-        n_start_rejected: results.iter().filter(|r| r.hard_reject).count(),
+        n_start_rejected: results.iter().filter(|(r, _)| r.hard_reject).count(),
     };
-    let eta_hats: Vec<DVector<f64>> = results.iter().map(|r| r.eta.clone()).collect();
-    let h_matrices: Vec<DMatrix<f64>> = results.iter().map(|r| r.h_matrix.clone()).collect();
-    let kappas: Vec<Vec<DVector<f64>>> = results.into_iter().map(|r| r.kappas).collect();
+    let mut eta_hats = Vec::with_capacity(results.len());
+    let mut h_matrices = Vec::with_capacity(results.len());
+    let mut kappas = Vec::with_capacity(results.len());
+    let mut extras = Vec::with_capacity(results.len());
+    for (result, extra) in results {
+        // Transfer the completed EBE buffers instead of cloning every subject's
+        // eta vector and prediction Jacobian at each outer evaluation.
+        eta_hats.push(result.eta);
+        h_matrices.push(result.h_matrix);
+        kappas.push(result.kappas);
+        extras.push(extra);
+    }
 
-    (eta_hats, h_matrices, stats, kappas)
+    (eta_hats, h_matrices, stats, kappas, extras)
 }
 
 #[cfg(test)]

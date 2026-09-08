@@ -370,9 +370,15 @@ fn censored_sigma_m_terms(
     (dg1, ruv_sig, l_sig)
 }
 
-/// Shared per-subject quantities the θ/Ω/Σ gradient blocks all consume, built
-/// once from the provider sensitivities at the EBE.
+/// Joint prior and its independent natural covariance directions for covariance assembly.
+pub(crate) struct CovariancePrior {
+    pub(crate) matrix: DMatrix<f64>,
+    pub(crate) basis: Vec<DMatrix<f64>>,
+}
+
+/// Shared per-subject quantities the theta/omega/sigma gradient blocks consume.
 pub(crate) struct Prep {
+    pub(crate) covariance_prior: Option<CovariancePrior>,
     pub(crate) n_eta: usize,
     pub(crate) n_obs: usize,
     pub(crate) et: Vec<ErrTerms>,
@@ -1117,7 +1123,7 @@ pub(crate) fn score_core(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prepare_stacked(
+pub(crate) fn prepare_stacked(
     model: &CompiledModel,
     subject: &Subject,
     params: &ModelParameters,
@@ -1253,6 +1259,7 @@ fn prepare_stacked(
     }
 
     Some(Prep {
+        covariance_prior: None,
         n_eta,
         n_obs,
         et,

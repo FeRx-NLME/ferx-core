@@ -899,7 +899,13 @@ where
     // would otherwise false-trip the convergence test. Bail so the caller falls to the capped
     // pulse train + #867 warning instead of returning garbage (e.g. a huge negative "trough").
     let seed_mag = u.iter().fold(1.0_f64, |m, x| m.max(x.val().abs()));
-    let diverged_ceiling = 1e8 * seed_mag;
+    // Tie the ceiling to the accuracy at which a genuine fixed point can still be
+    // distinguished from solver noise. The previous fixed `1e8` factor contradicted
+    // the seed-scale bound below: at the default reltol it admitted an over-capacity
+    // Anderson extrapolate more than 200,000 seeds away, where integration error hid
+    // the positive per-cycle surplus and produced a false steady state (#867).
+    let distinguishable_growth = 1.0 / reltol.sqrt().clamp(1e-8, 1.0);
+    let diverged_ceiling = distinguishable_growth * seed_mag;
     // Seed-scale residual bound (#867). The `conv_tol·max_mag` test above is *relative to the
     // current iterate*, so once Anderson inflates a divergent (no-SS, over-capacity) map to a huge
     // value the real per-cycle surplus `Δ = (mean input − max elimination)·II` — an `O(input)`

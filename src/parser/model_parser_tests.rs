@@ -12397,7 +12397,7 @@ fn test_clamp_in_individual_parameters() {
     let eta = vec![0.0];
     let mut covs = HashMap::new();
 
-    let mut cl_at = |wt: f64, covs: &mut HashMap<String, f64>| {
+    let cl_at = |wt: f64, covs: &mut HashMap<String, f64>| {
         covs.insert("WT".to_string(), wt);
         (parsed.model.pk_param_fn)(&theta, &eta, covs, 0.0).values[0]
     };

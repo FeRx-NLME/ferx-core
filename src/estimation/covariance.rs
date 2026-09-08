@@ -446,9 +446,24 @@ pub(crate) fn assemble_score_cross_product(
     bounds: &PackedBounds,
     options: &FitOptions,
     free_idx: &[usize],
-) -> DMatrix<f64> {
+) -> Result<DMatrix<f64>, String> {
     let n_free = free_idx.len();
     let n_subj = population.subjects.len();
+    let quadrature_options = options.agq_nodes().map(|_| FitOptions {
+        inner_tol: options.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner()),
+        inner_restarts: 0, // match the covariance step's reconvergence policy
+        ..options.clone()
+    });
+    let quadrature = quadrature_options.as_ref().map(|score_options| {
+        crate::estimation::agq::SubjectScoreContext::new(
+            model,
+            template,
+            x_hat,
+            score_options,
+            bounds,
+            crate::estimation::outer_optimizer::reconverge_this_eval(options, 0),
+        )
+    });
 
     // Per-subject scores in parallel (mirrors `build_gn_system`).
     //
@@ -466,7 +481,7 @@ pub(crate) fn assemble_score_cross_product(
     // term — applying this Laplace-form `tᵢ` to FOCE was tested and over-corrects
     // (warfarin FOCE RSR 1.3% → 9.8% vs NONMEM), so the correction is FOCEI-only.
     let report = cov_progress("score matrix", n_subj, options.verbose);
-    let scores: Vec<Vec<f64>> = (0..n_subj)
+    let scores: Vec<Result<Vec<f64>, String>> = (0..n_subj)
         .into_par_iter()
         .map(|i| {
             // Cooperative cancel: skip the per-subject gradient and return a
@@ -475,13 +490,21 @@ pub(crate) fn assemble_score_cross_product(
             // matrix before it is used, so the placeholder is never trusted.
             if crate::cancel::is_cancelled(&options.cancel) {
                 report();
-                return vec![0.0; x_hat.len()];
+                return Ok(vec![0.0; x_hat.len()]);
             }
             let kap_i = if i < kappas.len() {
                 kappas[i].as_slice()
             } else {
                 &[]
             };
+            if let Some(context) = &quadrature {
+                // The subject score has NLL units already and cannot contain the
+                // optimizer's population-level EBE penalty. Never square a failed row.
+                let score = context.score(&population.subjects[i], eta_hats[i].as_slice(), kap_i)
+                    .ok_or_else(|| format!("Covariance step failed: could not obtain a converged, finite quadrature score for subject {}. SE estimates not available.", population.subjects[i].id));
+                report();
+                return score;
+            }
             let (_, mut gi) = crate::estimation::gauss_newton::subject_nll_pop_grad(
                 x_hat,
                 template,
@@ -513,16 +536,23 @@ pub(crate) fn assemble_score_cross_product(
                 }
             }
             report();
-            gi
+            Ok(gi)
         })
         .collect();
 
     let mut s = DMatrix::zeros(n_free, n_free);
-    for gi in &scores {
+    for gi in scores {
+        let gi = gi?;
         let gi_free = DVector::from_iterator(n_free, free_idx.iter().map(|&k| gi[k]));
         s.ger(1.0, &gi_free, &gi_free, 1.0); // s += gi_free * gi_freeᵀ (full outer product)
     }
-    s
+    if s.iter().any(|v| !v.is_finite()) {
+        return Err(
+            "Covariance step failed: non-finite score cross-product. SE estimates not available."
+                .into(),
+        );
+    }
+    Ok(s)
 }
 
 /// Compute the parameter covariance matrix at convergence (the R-matrix:
@@ -567,15 +597,15 @@ pub(crate) fn assemble_score_cross_product(
 /// resulting SEs would be silently method-dependent per subject. The finite-difference
 /// stencil is correct for everything, so it is the honest fallback.
 ///
-/// Serial over subjects, reduced in subject order, so the result cannot depend on thread
-/// count — matching how the FD stencil and the outer gradient reduce (#703). The covariance
-/// step runs once per fit, so the per-subject assembly is not on any hot path.
-fn analytic_cov_hessian(
+/// Parallel subject assembly with a fixed-subject-order reduction, preserving deterministic
+/// results while distributing the quadrature node sweeps across workers.
+pub(super) fn analytic_cov_hessian(
     model: &CompiledModel,
     population: &Population,
     template: &ModelParameters,
     x_hat: &[f64],
     eta_hats: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
     options: &FitOptions,
 ) -> Option<DMatrix<f64>> {
     use crate::estimation::sens_cov_hessian::{
@@ -589,46 +619,100 @@ fn analytic_cov_hessian(
     // production site reports "standard errors for a likelihood it never optimised"; the
     // analytic path bypasses that helper, so it must repeat its dispatch condition here
     // (PR #953 review finding 1).
-    if options.agq_nodes().is_some() {
-        return None;
-    }
-    // IOV is out of scope: the assembly is written over the η-only random-effect block, not
-    // the stacked `[η, κ]` one. `subject_sensitivities_cov` declines `n_kappa > 0` itself,
-    // so this is a fast population-level exit, not the load-bearing check.
-    if model.n_kappa > 0 {
-        return None;
-    }
+    //
+    // #251 narrows this: `method = focei` with `n_agq > 1` **is** served, by
+    // `agq_cov_hessian`, which differentiates the quadrature marginal itself. The split is on
+    // the *anchor*, not on `agq_nodes()`:
+    //
+    //   * `HessianAnchor::GaussNewton` (FOCEI) — `H̃ = Ω⁻¹ + Σ pⱼaⱼaⱼᵀ` is built from first
+    //     derivatives of `f`, so `∂²H̃/∂x²` needs third-order sensitivities, which
+    //     `subject_sensitivities_cov` already provides.
+    //   * `HessianAnchor::Exact` (Laplace, at any node count) — `H = ∂²nll/∂b²` already carries
+    //     `∂²f/∂η²`, so its second derivative needs **fourth** order. Nothing computes those, so
+    //     Laplace keeps the FD covariance. Keying this off `agq_nodes()` instead of the anchor
+    //     would report `H̃`-derived SEs for a fit anchored on `H` — the same class of error the
+    //     bail was added for.
+    let agq = if options.agq_nodes().is_some() {
+        if options.hessian_anchor() != HessianAnchor::GaussNewton {
+            return None;
+        }
+        options.agq_nodes()
+    } else {
+        None
+    };
+    // The quadrature rule and parameter unpacking are shared by every subject.
+    let agq = agq.map(|n_agq| {
+        let (nodes, weights) = crate::estimation::agq::gauss_hermite(n_agq);
+        let params = crate::estimation::parameterization::unpack_params(x_hat, template);
+        (nodes, weights, params)
+    });
     let n = x_hat.len();
+    let per_subject: Vec<Option<DMatrix<f64>>> = population
+        .subjects
+        .par_iter()
+        .zip(eta_hats.par_iter())
+        .enumerate()
+        .map(|(i, (subject, eta_hat))| {
+            let b: std::borrow::Cow<'_, [f64]> = if model.n_kappa > 0 {
+                let kap = kappas.get(i)?;
+                if kap.len() != crate::stats::likelihood::iov_occasion_groups(subject).len()
+                    || kap.iter().any(|k| k.len() != model.n_kappa)
+                {
+                    return None;
+                }
+                std::borrow::Cow::Owned(
+                    eta_hat
+                        .iter()
+                        .copied()
+                        .chain(kap.iter().flat_map(|k| k.iter().copied()))
+                        .collect(),
+                )
+            } else {
+                std::borrow::Cow::Borrowed(eta_hat.as_slice())
+            };
+            // Cooperative cancel. The FD stencil checks on every perturbed point; this loop is
+            // `2·(n_theta+n_eta)+1` provider evaluations plus an O(n_eta³·n_obs) assembly per
+            // subject, and for the default `covariance_method = r` there is no later checkpoint
+            // — so without this, the Ctrl-C affordance `saem.rs` advertises before the
+            // covariance step (#893) was inoperative. Returning `None` alone would drop into
+            // the *more* expensive FD stencil; the caller re-checks the flag and reports
+            // cancelled instead (PR #953 review finding 10).
+            if crate::cancel::is_cancelled(&options.cancel) {
+                return None;
+            }
+            let h = if let Some((nodes, weights, params)) = &agq {
+                // FOCEI-anchored quadrature (#251). The grid is rebuilt here from the same
+                // Gauss-Hermite rule the objective used, so the Hessian differentiates the grid the
+                // fit actually evaluated — the same reason the proposal jitter is carried.
+                let (grid, pi) = crate::estimation::agq::subject_grid_and_weights(
+                    model, subject, params, &b, nodes, weights,
+                )?;
+                crate::estimation::agq_cov_hessian::subject_packed_agq_cov_hessian(
+                    model, subject, template, params, &b, &grid, &pi,
+                )
+            } else if options.interaction {
+                subject_packed_cov_hessian(model, subject, template, x_hat, &b)
+            } else {
+                subject_packed_cov_hessian_foce(model, subject, template, x_hat, &b)
+            }?;
+            if h.nrows() != n || h.ncols() != n || h.iter().any(|v| !v.is_finite()) {
+                return None;
+            }
+            // ×2 — the OFV convention, and the one place this can be silently wrong.
+            //
+            // `subject_packed_cov_hessian` is the second derivative of `subject_packed_gradient`,
+            // which is `∂Fᵢ/∂x` with `OFV = 2·Σᵢ Fᵢ` (see `population_gradient_sens`'s
+            // `grad[k] += 2.0 * gi[k]`). The stencil this replaces differences `2·pop_nll`, so
+            // `hess` here must be `∂²OFV/∂x²`, and the caller's `covariance = 2·H⁻¹` assumes it.
+            // Summing the per-subject Hessians unscaled yields exactly half of that, which inflates
+            // every standard error by √2 — with no other symptom, since the matrix stays symmetric,
+            // positive-definite and plausibly sized.
+            Some(2.0 * h)
+        })
+        .collect();
     let mut acc = DMatrix::<f64>::zeros(n, n);
-    for (subject, eta_hat) in population.subjects.iter().zip(eta_hats.iter()) {
-        // Cooperative cancel. The FD stencil checks on every perturbed point; this loop is
-        // `2·(n_theta+n_eta)+1` provider evaluations plus an O(n_eta³·n_obs) assembly per
-        // subject, and for the default `covariance_method = r` there is no later checkpoint
-        // — so without this, the Ctrl-C affordance `saem.rs` advertises before the
-        // covariance step (#893) was inoperative. Returning `None` alone would drop into
-        // the *more* expensive FD stencil; the caller re-checks the flag and reports
-        // cancelled instead (PR #953 review finding 10).
-        if crate::cancel::is_cancelled(&options.cancel) {
-            return None;
-        }
-        let h = if options.interaction {
-            subject_packed_cov_hessian(model, subject, template, x_hat, eta_hat.as_slice())
-        } else {
-            subject_packed_cov_hessian_foce(model, subject, template, x_hat, eta_hat.as_slice())
-        }?;
-        if h.nrows() != n || h.ncols() != n || h.iter().any(|v| !v.is_finite()) {
-            return None;
-        }
-        // ×2 — the OFV convention, and the one place this can be silently wrong.
-        //
-        // `subject_packed_cov_hessian` is the second derivative of `subject_packed_gradient`,
-        // which is `∂Fᵢ/∂x` with `OFV = 2·Σᵢ Fᵢ` (see `population_gradient_sens`'s
-        // `grad[k] += 2.0 * gi[k]`). The stencil this replaces differences `2·pop_nll`, so
-        // `hess` here must be `∂²OFV/∂x²`, and the caller's `covariance = 2·H⁻¹` assumes it.
-        // Summing the per-subject Hessians unscaled yields exactly half of that, which inflates
-        // every standard error by √2 — with no other symptom, since the matrix stays symmetric,
-        // positive-definite and plausibly sized.
-        acc += 2.0 * h;
+    for h in per_subject {
+        acc += h?;
     }
     Some(acc)
 }
@@ -863,7 +947,15 @@ pub(crate) fn compute_covariance(
     let analytic_hess: Option<DMatrix<f64>> = if options.analytic_cov_hessian && !is_mixture {
         // `base_eta_hats`, not `eta_hats` — the modes reconverged at `cov_inner_tol`, which
         // is what the stationarity assumption in the assembly needs (see above).
-        analytic_cov_hessian(model, population, template, x_hat, &base_eta_hats, options)
+        analytic_cov_hessian(
+            model,
+            population,
+            template,
+            x_hat,
+            &base_eta_hats,
+            &base_kappas,
+            options,
+        )
     } else {
         None
     };
@@ -1152,6 +1244,10 @@ pub(crate) fn compute_covariance(
         if crate::cancel::is_cancelled(&options.cancel) {
             return CovarianceStepResult::Unusable(COV_CANCELLED_MSG.to_string());
         }
+        let s_free = match s_free {
+            Ok(s) => s,
+            Err(reason) => return CovarianceStepResult::Unusable(reason),
+        };
         match combine_covariance(options.covariance_method, r_inv, &s_free) {
             Some(c) => c,
             None => {
