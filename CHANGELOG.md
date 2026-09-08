@@ -372,7 +372,7 @@ section of the SDLC for the versioning policy).
 
 ### Performance
 - Allocate per-event PK scratch storage only when the prediction path needs it,
-  reducing allocation traffic for static-model FOCE/FOCEI fits.
+  reducing allocation traffic for static-model FOCE/FOCEI fits (#1283).
 - IOV inner optimization reuses per-event PK parameter buffers across likelihood
   probes, reducing allocation traffic while recomputing every event at the current
   parameters, covariates, time, and occasion (#104).
