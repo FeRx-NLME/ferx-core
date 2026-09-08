@@ -112,6 +112,7 @@ website:
           - tools/ruvsearch.qmd
           - tools/iivsearch.qmd
           - tools/iovsearch.qmd
+          - tools/amd.qmd
       - text: "Data Format"
         href: data-format.qmd
       - text: "CLI Reference"

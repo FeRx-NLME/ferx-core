@@ -1,0 +1,94 @@
+{
+  "orders": {
+    "RSI": [
+      "residual",
+      "structural",
+      "iivsearch"
+    ],
+    "SIR": [
+      "structural",
+      "iivsearch",
+      "residual"
+    ],
+    "SRI": [
+      "structural",
+      "residual",
+      "iivsearch"
+    ],
+    "default": [
+      "structural",
+      "iivsearch",
+      "residual",
+      "iovsearch",
+      "allometry",
+      "covariates"
+    ],
+    "reevaluation": [
+      "structural",
+      "iivsearch",
+      "residual",
+      "iovsearch",
+      "allometry",
+      "covariates",
+      "iivsearch",
+      "residual"
+    ]
+  },
+  "pharmpy_version": "2.2.0",
+  "spaces": [
+    {
+      "allometry": {
+        "covariate": "WT",
+        "reference": 70.0
+      },
+      "covariate": "COVARIATE?(@IIV,@CONTINUOUS,[POW,LIN])",
+      "covsearch": "COVARIATE?(@IIV,@CONTINUOUS,[POW,LIN])",
+      "mfl": "ABSORPTION([INST,FO]);PERIPHERALS(0..1);LAGTIME([OFF,ON]);ALLOMETRY(WT,70);COVARIATE?(@IIV,@CONTINUOUS,[POW,LIN])",
+      "modelsearch": "ABSORPTION([INST,FO]);ELIMINATION(FO);TRANSITS(0);PERIPHERALS(0..1);LAGTIME([OFF,ON])",
+      "pk": "ABSORPTION([INST,FO]);ELIMINATION(FO);TRANSITS(0);PERIPHERALS(0..1);LAGTIME([OFF,ON])"
+    },
+    {
+      "allometry": null,
+      "covariate": "",
+      "covsearch": "COVARIATE?(@IIV,@CONTINUOUS,EXP);COVARIATE?(@IIV,@CATEGORICAL,CAT)",
+      "mfl": "ABSORPTION([INST,FO]);PERIPHERALS(0..2)",
+      "modelsearch": "ABSORPTION([INST,FO]);ELIMINATION(FO);TRANSITS(0);PERIPHERALS(0..2);LAGTIME(OFF)",
+      "pk": "ABSORPTION([INST,FO]);ELIMINATION(FO);TRANSITS(0);PERIPHERALS(0..2);LAGTIME(OFF)"
+    },
+    {
+      "allometry": null,
+      "covariate": "COVARIATE?(@IIV,@CONTINUOUS,POW);COVARIATE?(CL,SEX,CAT)",
+      "covsearch": "COVARIATE?(@IIV,@CONTINUOUS,POW);COVARIATE?(CL,SEX,CAT)",
+      "mfl": "COVARIATE?(@IIV,@CONTINUOUS,POW);COVARIATE?(CL,SEX,CAT)",
+      "modelsearch": "ABSORPTION([FO,ZO,SEQ-ZO-FO]);ELIMINATION(FO);TRANSITS([0,1,3,10],*);PERIPHERALS(0..1);LAGTIME([OFF,ON])",
+      "pk": ""
+    },
+    {
+      "allometry": null,
+      "covariate": "COVARIATE(CL,WT,POW)",
+      "covsearch": "COVARIATE(CL,WT,POW)",
+      "mfl": "ABSORPTION(FO);LAGTIME([OFF,ON]);COVARIATE(CL,WT,POW)",
+      "modelsearch": "ABSORPTION(FO);ELIMINATION(FO);TRANSITS(0);PERIPHERALS(0);LAGTIME([OFF,ON])",
+      "pk": "ABSORPTION(FO);ELIMINATION(FO);TRANSITS(0);PERIPHERALS(0);LAGTIME([OFF,ON])"
+    },
+    {
+      "allometry": {
+        "covariate": "WT",
+        "reference": 70.0
+      },
+      "covariate": "",
+      "covsearch": "COVARIATE?(@IIV,@CONTINUOUS,EXP);COVARIATE?(@IIV,@CATEGORICAL,CAT)",
+      "mfl": "PERIPHERALS(0..1);ALLOMETRY(WT,70)",
+      "modelsearch": "ABSORPTION(INST);ELIMINATION(FO);TRANSITS(0);PERIPHERALS(0..1);LAGTIME(OFF)",
+      "pk": "ABSORPTION(INST);ELIMINATION(FO);TRANSITS(0);PERIPHERALS(0..1);LAGTIME(OFF)"
+    },
+    {
+      "allometry": null,
+      "covariate": "COVARIATE?([CL,V],WT,POW)",
+      "covsearch": "COVARIATE?([CL,V],WT,POW)",
+      "mfl": "LET(P,[CL,V]);COVARIATE?(@P,WT,POW)",
+      "modelsearch": "ABSORPTION([FO,ZO,SEQ-ZO-FO]);ELIMINATION(FO);TRANSITS([0,1,3,10],*);PERIPHERALS(0..1);LAGTIME([OFF,ON])",
+      "pk": ""
+    }
+  ]
+}

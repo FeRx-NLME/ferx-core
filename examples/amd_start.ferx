@@ -1,0 +1,49 @@
+# The starting model for the AMD pipeline example (#1184).
+#
+#   ferx amd examples/amd_start.ferxsearch
+#
+# Deliberately the smallest defensible model for the dataset: one compartment,
+# first-order absorption with no η on KA, a proportional error and no covariate
+# relations at all. `data/two_cpt_oral_cov.csv` was simulated from a
+# two-compartment model with an η on KA and three covariate effects
+# (see examples/two_cpt_oral_covmodel.ferx), so every step of the pipeline has
+# something real to find — which is what makes it a worked example rather than
+# a demonstration of six no-ops.
+#
+# [covariates] declares WT and CRCL as covariate columns without relating them
+# to anything; that is what `COVARIATE?(@IIV, @CONTINUOUS, ...)` resolves
+# against.
+
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(40.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+
+  omega ETA_CL ~ 0.15
+  omega ETA_V  ~ 0.15
+
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[covariates]
+  WT   continuous
+  CRCL continuous
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 500
+  covariance = true
+  # Derivative-free outer optimizer, as in two_cpt_oral_covmodel.ferx: the
+  # gradient-based default does not leave the initial estimates on this start
+  # (an init stall of the #751 family).
+  optimizer  = bobyqa

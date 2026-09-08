@@ -67,6 +67,7 @@ pub const EXTENSION: &str = "ferxsearch";
 /// misspelt core section quietly filed under `tools` — is a gate that never
 /// runs.
 pub const TOOL_SECTIONS: &[&str] = &[
+    "amd",
     "covsearch",
     "modelsearch",
     "iivsearch",
