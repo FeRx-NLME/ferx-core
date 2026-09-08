@@ -126,9 +126,8 @@
 //! which is exactly the structure of [`crate::estimation::sens_cov_hessian`]: the fixed-`b`
 //! Hessian, minus the M2 envelope term `−M_ξᵀH⁻¹M_ζ`, plus the log-determinant curvature.
 //! The derivation therefore reduces to the covariance that shipped in #436 — the strongest
-//! available check on it. `agq_cov_hessian_reduces_to_focei_at_one_node` will be the first test
-//! written against the assembly (step 5 below), before the multi-node path is trusted at all;
-//! it does not exist yet, because the assembly does not.
+//! available check on it. `agq_cov_hessian_reduces_to_focei_at_one_node` pins that reduction,
+//! while the multi-node objective tests cover the terms that vanish at one node.
 //!
 //! # The jitter is not optional
 //!
@@ -247,16 +246,14 @@
 // placement `b_j = b̂ + √2·M·z_j` depends on them. Those come from `S_k`, `S_kl`, and
 // `S_• = H̃_• + Λ_•` requires `H̃_k`/`H̃_kl` as *actual matrices*: a Cholesky differential needs
 // the full `dS`, not contractions of it, and no other square root (symmetric or otherwise) avoids
-// that. So factoring `∂p/∂σ` and `∂Ω⁻¹/∂x_k` out of `sigma_block`/`omega_block` is still owed for
-// any `n_agq > 1`. What #787 removes is their use in term (A) only.
+// that. The assembly below therefore builds those matrix derivatives for node placement even
+// though term (A) can reuse the FOCEI log-determinant structure.
 //
 // Two consequences, both of which cut against the route as first revised:
 //
-//   * The cost argument for abandoning the **split route** — `∂²F_focei/∂x²` from #436 plus FD of
-//     the quadrature correction `Δ = F_agq − F_focei`, every ingredient of which exists today —
-//     rested on that premise and is correspondingly weaker. It deserves re-deciding on its
-//     merits before steps 2–4 are written, since under the split route they are not written at
-//     all.
+//   * The rejected **split route** — `∂²F_focei/∂x²` from #436 plus FD of the quadrature
+//     correction `Δ = F_agq − F_focei` — avoids these matrices but introduces a higher-level
+//     finite difference. This implementation keeps the sensitivity-level assembly.
 //   * Because `H̃_k` gets built regardless, carrying `Λ` into term (A) costs one diagonal scaling
 //     ([`RegularisedAnchor::propagate`]) rather than a new derivation. Reusing FOCEI's `ld`
 //     verbatim would leave a systematic `1e-6`-relative bias — FOCEI's log-det is `½log|H̃|`
@@ -275,8 +272,8 @@
 // `∂²Φ/∂ξ∂ζ − M_ξᵀH⁻¹M_ζ` — literally `subject_cov_hessian_m2_natural` — and `Cov_π` vanishes.
 // That is the same `n_agq = 1` reduction derived above, arrived at from the assembly side.
 //
-// Remaining steps, each landing behind its own FD parity test before the next builds on it (the
-// repo's analytic-sensitivity rule — a wrong sensitivity here compiles and runs silently):
+// Implemented pieces, each pinned by its own FD parity test (a wrong sensitivity here compiles
+// and runs silently):
 //
 //   2. Per-node `Φ_p` and `Φ_pq` at `b_j`, reusing `score_core_at` (#951) for `H_j` and
 //      `mixed_eta_theta` for `M_j`.
@@ -284,7 +281,7 @@
 //   4. `M_k`, `M_kl` — Cholesky-factor derivatives from `S_k`, `S_kl`. Still needed: the node
 //      placement depends on them even though `ld` does not. nlmixr2est#787 verifies its
 //      equivalent (`d2Ginv`) to 1e-9 and Clairaut-symmetric to 9e-19; match that.
-//   5. Assemble `ld + E_π[Φ_pq] − Cov_π`, gate on `hessian_anchor() == GaussNewton` plus #953's
+//   5. Assemble `ld + E_π[Φ_pq] − Cov_π`, gated on `hessian_anchor() == GaussNewton` plus #953's
 //      scope, and wire into `compute_covariance`.
 //
 // A `√2` caution from the sibling PR nlmixr2est#785 ("AGQ quadrature node scaling converges to
@@ -314,7 +311,7 @@ const JITTER_REL: f64 = 1e-6;
 /// The two `max` branches cross at `|H̃ᵢᵢ| = JITTER_FLOOR / JITTER_REL = 1e-4`.
 const JITTER_CROSSING: f64 = JITTER_FLOOR / JITTER_REL;
 
-/// How far a diagonal must sit from the branch crossing (and from zero) for `S` to be
+/// How far a diagonal must sit from the branch crossing for `S` to be
 /// differentiable in the ordinary sense.
 ///
 /// A factor of 10 either side. This is not a tolerance to be tuned: at the crossing the second
@@ -332,10 +329,10 @@ enum JitterBranch {
     ///
     /// `sign = -1.0` cannot currently reach a returned [`RegularisedAnchor`]: a negative diagonal
     /// leaves `S` indefinite, so the definiteness screen rejects it first. It is kept, and
-    /// covered by `coefficient_carries_the_sign_on_the_relative_branch`, because step 5 has to
-    /// face the indefinite anchor — and the natural way to widen that scope (a modified Cholesky
-    /// or an eigenvalue floor in place of the screen) would put this coefficient into service for
-    /// the first time. An error there flips one diagonal's jitter response at the `1e-6` relative
+    /// covered by `coefficient_carries_the_sign_on_the_relative_branch`, because a future
+    /// modified-Cholesky or eigenvalue-floor extension could admit an indefinite anchor and put
+    /// this coefficient into service for the first time. An error there flips one diagonal's
+    /// jitter response at the `1e-6` relative
     /// order, which a coarse FD parity check would not catch.
     Relative { sign: f64 },
     /// `Λᵢᵢ = JITTER_FLOOR`, a constant — so this diagonal contributes **nothing** to `S_k`.
@@ -1181,7 +1178,7 @@ mod tests {
     ///
     /// Exercised through [`JitterBranch`] directly for exactly that reason: routing it through
     /// `regularised_anchor` is impossible today, and the coefficient must not go into service
-    /// uncovered when step 5 widens the screen to a modified Cholesky. See the variant's doc.
+    /// uncovered if the screen later widens to a modified Cholesky. See the variant's doc.
     #[test]
     fn coefficient_carries_the_sign_on_the_relative_branch() {
         assert_eq!(
@@ -1521,7 +1518,7 @@ mod tests {
     ///
     /// Done on synthetic matrices rather than a fitted model deliberately: this is an algebraic
     /// identity, so a model fixture would only add EBE-convergence noise to a claim that holds
-    /// exactly. The model-level version is step 5's
+    /// exactly. The model-level version is
     /// `agq_cov_hessian_reduces_to_focei_at_one_node`.
     #[test]
     fn node_curvature_collapses_to_the_m2_envelope_at_the_mode() {
