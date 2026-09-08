@@ -1,0 +1,26 @@
+# modelsearch ODE-candidate anchor (#1257): the elimination space NONMEM was
+# run over. Both sides evaluate (`maxiter = 0`) at the same parameter vector,
+# so what is compared is the generated `[odes]` equation and nothing else.
+
+base = "mm_base.ferx"
+data = "warfarin.csv"
+
+[space]
+mfl = "ELIMINATION([FO,MM])"
+
+[modelsearch]
+algorithm = "exhaustive"
+
+[rank]
+type = "bic"
+
+[strictness]
+require_converged    = false
+reject_init_stall    = false
+reject_on_boundary   = false
+max_condition_number = 1e300
+max_correlation      = 1.0
+
+[run]
+retries = 0
+threads = 4

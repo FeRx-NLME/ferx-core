@@ -54,6 +54,34 @@ section of the SDLC for the versioning policy).
   silent where Pharmpy substitutes a default search space, and resolves a `LET` against the
   model the step starts from rather than at parse time. See `docs/tools/amd.qmd` and
   `examples/amd_start.ferxsearch`.
+- **`ferx modelsearch` searches non-linear elimination and the ODE absorptions
+  (`ELIMINATION(ZO / MM / MIX-FO-MM)`, `ABSORPTION(ZO / WEIBULL)`) (#1257).** These four MFL
+  values have no analytic `pk` template and were refused by name at config load; they are now
+  generated as `ode_template NAME(...)` candidates with **one** `[odes]` line replacing the
+  `central` equation, so the disposition, the compartment count, a transit chain and the
+  covariate model all come along unchanged. Parameterisation and initial estimates follow
+  Pharmpy (`CLMM·KM·C/(KM + C)`; `KM` at `max(DV)/2`, or fixed at `min(DV)/100` for zero-order
+  elimination; a zero-order input duration of `2·MAT` with `MAT = 2·t_first`; a Weibull scale of
+  `MAT / Γ(1 + 1/β)` at `β = 1.5`), except that the Michaelis-Menten clearance keeps the base
+  model's own `CL` name — and with it its estimate and its η — where Pharmpy renames it to
+  `CLMM`. `ABSORPTION(SEQ-ZO-FO)` is still refused: it is a depot of its own, not one input term
+  on a standard disposition. Bioavailability and the lag time are carried through every move,
+  including a second one off an ODE parent, and the Michaelis constant's observation range is
+  floored positive — Pharmpy resets a negative `min(DV)/100` to `0.01`, and ferx applies the
+  same fallback to a zero minimum and to a non-positive `max(DV)`, since `KM ≤ 0` is singular. Because these candidates cost an order of magnitude more per fit,
+  the runner now plans candidates of **equal cost together, heaviest group first** (so an ODE
+  candidate gets subject-level threads instead of running alone on one worker), and a saturable
+  elimination is fitted with at least 8 starts — a floor under `[run] retries`, never a
+  replacement — because a stalled Michaelis-Menten fit ranked against a converged first-order one
+  rejects a correct model on the strength of the optimizer. See
+  `docs/tools/modelsearch.qmd`.
+- **`ode_template NAME(...)` variants in the public API (#1257).**
+  `ferx_core::pk::ode_template::generate_variant` writes the same generated disposition with the
+  central compartment's input and elimination terms replaced (`InputForm`, `EliminationForm`),
+  and `ferx_core::edit::StructuralSpec::ode(...)` makes a structural edit write it — the
+  `ode_template` line plus the override — instead of a `pk` line. `SetStructural` now swaps in
+  both directions, clearing the `[odes]` block when a candidate moves back to an analytic
+  template.
 - **Analytic IOV and M3 covariance for FOCE, FOCEI, and FOCEI-anchored AGQ** — include all
   occasion effects, differentiate shared IOV covariance blocks once, and carry censored
   normal-tail curvature using each method's own marginal definition (PR #955).

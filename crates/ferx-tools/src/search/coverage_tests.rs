@@ -12,7 +12,9 @@ fn gaps(src: &str) -> Vec<String> {
 fn the_epic_table_supported_rows_pass() {
     for src in [
         "ABSORPTION([INST,FO])",
-        "ELIMINATION(FO)",
+        // #1257: the ODE candidate family.
+        "ABSORPTION([ZO,WEIBULL])",
+        "ELIMINATION(*)",
         "PERIPHERALS(0..2)",
         "PERIPHERALS(1,DRUG)",
         "TRANSITS(N)",
@@ -36,19 +38,19 @@ fn the_epic_table_supported_rows_pass() {
 
 #[test]
 fn the_issue_gaps_are_hard_errors_naming_the_feature() {
-    assert_eq!(gaps("ELIMINATION(MM)"), vec!["ELIMINATION(MM)"]);
-    assert_eq!(gaps("ELIMINATION(ZO)"), vec!["ELIMINATION(ZO)"]);
-    assert_eq!(
-        gaps("ELIMINATION(MIX-FO-MM)"),
-        vec!["ELIMINATION(MIX-FO-MM)"]
-    );
+    // Every elimination and every absorption but one is buildable since
+    // #1257; the exception is the one that is a *disposition* rather than an
+    // input term.
+    assert_eq!(gaps("ELIMINATION(MM)"), Vec::<String>::new());
+    assert_eq!(gaps("ELIMINATION(ZO)"), Vec::<String>::new());
+    assert_eq!(gaps("ELIMINATION(MIX-FO-MM)"), Vec::<String>::new());
+    assert_eq!(gaps("ABSORPTION(ZO)"), Vec::<String>::new());
+    assert_eq!(gaps("ABSORPTION(WEIBULL)"), Vec::<String>::new());
     assert_eq!(gaps("ABSORPTION(SEQ-ZO-FO)"), vec!["ABSORPTION(SEQ-ZO-FO)"]);
-    // ZO and WEIBULL are ODE-only input functions, not `pk` templates: the
-    // same class as SEQ-ZO-FO, and a search that admits them would fail per
-    // candidate instead of at load.
-    assert_eq!(gaps("ABSORPTION(ZO)"), vec!["ABSORPTION(ZO)"]);
-    assert_eq!(gaps("ABSORPTION(WEIBULL)"), vec!["ABSORPTION(WEIBULL)"]);
-    assert_eq!(gaps("ABSORPTION([FO,ZO])"), vec!["ABSORPTION(ZO)"]);
+    assert_eq!(
+        gaps("ABSORPTION([FO,SEQ-ZO-FO])"),
+        vec!["ABSORPTION(SEQ-ZO-FO)"]
+    );
     assert_eq!(gaps("DIRECTEFFECT(EMAX)"), vec!["DIRECTEFFECT(...)"]);
     assert_eq!(gaps("EFFECTCOMP(*)"), vec!["EFFECTCOMP(...)"]);
     assert_eq!(
@@ -59,22 +61,7 @@ fn the_issue_gaps_are_hard_errors_naming_the_feature() {
 
 #[test]
 fn wildcards_are_checked_against_their_full_expansion() {
-    assert_eq!(
-        gaps("ELIMINATION(*)"),
-        vec![
-            "ELIMINATION(ZO)",
-            "ELIMINATION(MM)",
-            "ELIMINATION(MIX-FO-MM)"
-        ]
-    );
-    assert_eq!(
-        gaps("ABSORPTION(*)"),
-        vec![
-            "ABSORPTION(ZO)",
-            "ABSORPTION(SEQ-ZO-FO)",
-            "ABSORPTION(WEIBULL)"
-        ]
-    );
+    assert_eq!(gaps("ABSORPTION(*)"), vec!["ABSORPTION(SEQ-ZO-FO)"]);
     assert_eq!(gaps("TRANSITS(1,*)"), vec!["TRANSITS(n, DEPOT)"]);
     assert_eq!(gaps("PERIPHERALS(1,*)"), vec!["PERIPHERALS(n, MET)"]);
     assert_eq!(gaps("IIV(CL,*)"), vec!["IIV(..., LOG)", "IIV(..., RE_LOG)"]);
@@ -117,8 +104,10 @@ fn the_remaining_gap_rows() {
 
 #[test]
 fn every_gap_is_reported_once_with_a_reason_and_the_docs_link() {
-    let mfl =
-        Mfl::parse("ELIMINATION([MM,MM]);ELIMINATION(MM);IOV(CL,ADD);IOV(V,ADD)").expect("parses");
+    let mfl = Mfl::parse(
+        "ABSORPTION([SEQ-ZO-FO,SEQ-ZO-FO]);ABSORPTION(SEQ-ZO-FO);IOV(CL,ADD);IOV(V,ADD)",
+    )
+    .expect("parses");
     let e = check_coverage(&mfl).expect_err("has gaps");
     assert_eq!(e.gaps.len(), 2, "{e}");
     let text = e.to_string();
@@ -127,7 +116,7 @@ fn every_gap_is_reported_once_with_a_reason_and_the_docs_link() {
         "{text}"
     );
     assert!(
-        text.contains("ELIMINATION(MM): only first-order elimination"),
+        text.contains("ABSORPTION(SEQ-ZO-FO): sequential zero-order"),
         "{text}"
     );
     assert!(
@@ -146,7 +135,7 @@ fn every_gap_is_reported_once_with_a_reason_and_the_docs_link() {
 
 #[test]
 fn singular_grammar_for_one_gap() {
-    let mfl = Mfl::parse("ELIMINATION(MM)").expect("parses");
+    let mfl = Mfl::parse("ABSORPTION(SEQ-ZO-FO)").expect("parses");
     let text = check_coverage(&mfl).expect_err("gap").to_string();
     assert!(
         text.starts_with("the search space asks for 1 feature ferx"),

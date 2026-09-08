@@ -12,8 +12,8 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use super::spec::{
-    finite, num, ErrorForm, ErrorSpecText, EtaDecl, IivForm, ModelEdit, Relation, SigmaDecl,
-    StructuralSpec, ThetaDecl, TimeVaryingDecl,
+    finite, num, ErrorForm, ErrorSpecText, EtaDecl, IivForm, ModelEdit, NewParameter, Relation,
+    SigmaDecl, StructuralEngine, StructuralSpec, ThetaDecl, TimeVaryingDecl,
 };
 use super::ModelText;
 use crate::types::{FitResult, PkModel};
@@ -54,8 +54,11 @@ static BLOCK_SIGMA_RE: LazyLock<Regex> =
 /// lookahead keeps `==` out.
 static ASSIGN_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^([A-Za-z_]\w*)\s*=\s*([^=].*)$").unwrap());
-/// `pk NAME(...)` in `[structural_model]`.
-static PK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^pk\s+(\w+)\s*\(").unwrap());
+/// The disposition line of `[structural_model]`: `pk NAME(...)` or its
+/// ODE-generating twin `ode_template NAME(...)`. Both are swappable in either
+/// direction (#1257); a hand-written `ode(...)` is not.
+static TEMPLATE_LINE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(?:pk|ode_template)\s+(\w+)\s*\(").unwrap());
 /// A `FIX` keyword anywhere on the line, as its own token.
 static FIX_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bFIX\b").unwrap());
 /// The `(sd)` scale annotation — `(variance)`/`(var)` are the default and need
@@ -108,16 +111,62 @@ pub(crate) fn apply(text: &mut ModelText, edit: ModelEdit<'_>) -> Result<(), Str
 
 // ── [structural_model] ──────────────────────────────────────────────────────
 
+/// The reserved `[individual_parameters]` spellings an ODE model's engine
+/// reads a dose attribute off (`PkParams::name_to_index`, lower-cased), by
+/// the template role a `pk` line would carry it as.
+///
+/// `ode_template NAME(...)` takes the disposition roles and nothing else —
+/// it shares the analytic signature, which has no `f` or `lagtime` slot — so
+/// an ODE model binds bioavailability and lag time *by name* instead. A
+/// binding whose variable already carries one of these spellings needs
+/// nothing; any other name gets the reserved-name alias line the ODE twin
+/// builder writes for the same reason (#735).
+fn ode_reserved_spellings(role: &str) -> Option<(&'static str, &'static [&'static str])> {
+    match role {
+        "f" => Some(("f", &["f"])),
+        "lagtime" | "alag" => Some(("lagtime", &["lagtime", "alag"])),
+        _ => None,
+    }
+}
+
+/// `true` when `name` is one of the reserved dose-attribute spellings — the
+/// names an ODE model's engine consumes without any equation mentioning them.
+pub(crate) fn is_ode_reserved_name(name: &str) -> bool {
+    matches!(name.to_ascii_lowercase().as_str(), "f" | "lagtime" | "alag")
+}
+
+/// Whether one `[individual_parameters]` assignment is a reserved-name
+/// **alias** — a bridge from an engine slot to a parameter declared under
+/// another name — rather than a declaration of the attribute itself.
+///
+/// `params` is the block's declared names. The discriminator is the
+/// right-hand side: `lagtime = TLAG` names another individual parameter and
+/// is an alias, while `ALAG = TVLAG` names a θ and *is* the model's lag time,
+/// as is `F = inv_logit(…)`. Getting this backwards deletes a real
+/// declaration and silently resets the attribute — F to 1, the lag to 0 —
+/// taking its θ and η with it through the pruner.
+fn is_reserved_alias(code: &str, params: &HashSet<String>) -> bool {
+    let Some((lhs, rhs)) = code.split_once('=') else {
+        return false;
+    };
+    let (lhs, rhs) = (lhs.trim(), rhs.trim());
+    is_ode_reserved_name(lhs) && BARE_IDENT_RE.is_match(rhs) && rhs != lhs && params.contains(rhs)
+}
+
 fn set_structural(text: &mut ModelText, spec: &StructuralSpec) -> Result<(), String> {
+    let keyword = match spec.engine {
+        StructuralEngine::Pk => "pk",
+        StructuralEngine::Ode { .. } => "ode_template",
+    };
     if PkModel::from_name(&spec.template).is_none() {
         return Err(format!(
-            "ferx-core::edit: `{}` is not a known `pk` template",
+            "ferx-core::edit: `{}` is not a known `{keyword}` template",
             spec.template
         ));
     }
     if spec.bindings.is_empty() {
         return Err(format!(
-            "ferx-core::edit: `pk {}()` binds no parameters",
+            "ferx-core::edit: `{keyword} {}()` binds no parameters",
             spec.template
         ));
     }
@@ -130,45 +179,94 @@ fn set_structural(text: &mut ModelText, spec: &StructuralSpec) -> Result<(), Str
         }
     }
 
-    let Some((pk_span, _)) = find_decl(text, "structural_model", |c| PK_RE.is_match(c)) else {
+    let Some((line_span, old_line)) =
+        find_decl(text, "structural_model", |c| TEMPLATE_LINE_RE.is_match(c))
+    else {
         return Err(
-            "ferx-core::edit: SetStructural needs a `pk NAME(...)` line in [structural_model]. \
-             An `ode(...)` or algebraic model has no template to swap — edit its [odes] block \
-             directly."
+            "ferx-core::edit: SetStructural needs a `pk NAME(...)` or `ode_template NAME(...)` \
+             line in [structural_model]. A hand-written `ode(...)` or algebraic model has no \
+             template to swap — edit its [odes] block directly."
                 .to_string(),
         );
+    };
+    let was_ode_template = old_line.starts_with("ode_template");
+
+    // The `f` / `lagtime` roles do not go on an `ode_template` line; they are
+    // written as reserved-name declarations instead (see
+    // `ode_reserved_spellings`).
+    let on_line: Vec<&(String, String)> = match spec.engine {
+        StructuralEngine::Pk => spec.bindings.iter().collect(),
+        StructuralEngine::Ode { .. } => spec
+            .bindings
+            .iter()
+            .filter(|(role, _)| ode_reserved_spellings(role).is_none())
+            .collect(),
+    };
+
+    // ── The `[odes]` overrides ──────────────────────────────────────────────
+    // Exactly the generated equations the variant *changes*, found by
+    // comparing the variant against the plain generation of the same
+    // template. So the default variant writes no override at all, a saturable
+    // elimination or a replacement input writes the one `central` line, and
+    // nothing here has to know which compartment a given variant touches.
+    // Generating also validates the template's roles, which is why it runs
+    // before anything is mutated.
+    let overrides: Vec<String> = match &spec.engine {
+        StructuralEngine::Pk => Vec::new(),
+        StructuralEngine::Ode { input, elimination } => {
+            let params: std::collections::HashMap<String, String> = on_line
+                .iter()
+                .map(|(role, var)| (role.to_ascii_lowercase(), var.clone()))
+                .collect();
+            let variant = crate::pk::ode_template::generate_variant(
+                &spec.template,
+                &params,
+                input,
+                elimination,
+            )
+            .map_err(|e| format!("ferx-core::edit: {e}"))?;
+            let plain = crate::pk::ode_template::generate(&spec.template, &params)
+                .map_err(|e| format!("ferx-core::edit: {e}"))?;
+            variant
+                .odes
+                .iter()
+                .zip(plain.odes.iter())
+                .filter(|((_, a), (_, b))| a != b)
+                .map(|((_, a), _)| a.clone())
+                .collect()
+        }
     };
 
     // Every binding target must either exist already or arrive with a default.
     let existing = individual_parameter_names(text);
-    let mut to_create = Vec::new();
     for (role, var) in &spec.bindings {
-        if existing.contains(var) {
+        if existing.contains(var) || spec.new_parameters.iter().any(|p| &p.name == var) {
             continue;
         }
-        match spec.new_parameters.iter().find(|p| &p.name == var) {
-            Some(p) => to_create.push(p),
-            None => {
-                return Err(format!(
-                    "ferx-core::edit: `pk {}({role}={var})` names `{var}`, which the model does \
-                     not declare in [individual_parameters]. Supply its init and bounds in \
-                     `StructuralSpec::new_parameters` — a widening search has to choose them, \
-                     and choosing them here keeps the choice visible per candidate.",
-                    spec.template
-                ))
-            }
-        }
+        return Err(format!(
+            "ferx-core::edit: `{keyword} {}({role}={var})` names `{var}`, which the model does \
+             not declare in [individual_parameters]. Supply its init and bounds in \
+             `StructuralSpec::new_parameters` — a widening search has to choose them, and \
+             choosing them here keeps the choice visible per candidate.",
+            spec.template
+        ));
     }
+    // Every declaration the spec supplies and the model does not have — the
+    // bound ones and the ones only an `[odes]` override reads (`KM`, `BETA`).
+    let to_create: Vec<&NewParameter> = spec
+        .new_parameters
+        .iter()
+        .filter(|p| !existing.contains(&p.name))
+        .collect();
 
     // ── Mutate ──
-    let pairs: Vec<String> = spec
-        .bindings
+    let pairs: Vec<String> = on_line
         .iter()
         .map(|(role, var)| format!("{role}={var}"))
         .collect();
     let stale = text.set_span(
-        &pk_span,
-        &format!("pk {}({})", spec.template, pairs.join(", ")),
+        &line_span,
+        &format!("{keyword} {}({})", spec.template, pairs.join(", ")),
     );
     text.delete_lines(stale);
 
@@ -194,7 +292,73 @@ fn set_structural(text: &mut ModelText, spec: &StructuralSpec) -> Result<(), Str
         }
     }
 
+    // ── The reserved-name aliases ───────────────────────────────────────────
+    // Dropped and rewritten together, so a move that changes engine or drops
+    // the role cannot leave one behind — an `f = BIOAV` surviving into an
+    // analytic candidate would declare a parameter named `f` beside the `pk`
+    // line's own `f=` role.
+    //
+    // Only an **alias** is dropped, never a canonical declaration. The two
+    // are told apart by what the right-hand side names, not by the left:
+    //
+    //     lagtime = TLAG      alias — `TLAG` is another individual parameter
+    //     ALAG    = TVLAG     declaration — `TVLAG` is a θ
+    //     F       = inv_logit(logit(THETA_F) + ETA_F)   declaration
+    //
+    // A reserved name whose value is a θ or an expression *is* the model's
+    // bioavailability or lag time; deleting it would silently reset the
+    // attribute (F to 1, the lag to 0) and prune its θ and η with it. Only a
+    // reserved name standing in for another declared parameter is a bridge
+    // this layer put there and may take away.
+    if was_ode_template {
+        let params = individual_parameter_names(text);
+        let dead: Vec<usize> = text
+            .logical_lines("individual_parameters")
+            .into_iter()
+            .filter(|(_, code)| is_reserved_alias(code, &params))
+            .flat_map(|(span, _)| span)
+            .collect();
+        text.delete_lines(dead);
+    }
+    if matches!(spec.engine, StructuralEngine::Ode { .. }) {
+        for (role, var) in &spec.bindings {
+            let Some((canonical, spellings)) = ode_reserved_spellings(role) else {
+                continue;
+            };
+            // A variable already spelled `F` / `ALAG` / `LAGTIME` routes to the
+            // slot by itself; aliasing it would declare the slot twice, which
+            // `ode_param_slots` rejects.
+            if spellings.contains(&var.to_ascii_lowercase().as_str()) {
+                continue;
+            }
+            text.append_to_block("individual_parameters", &format!("{canonical} = {var}"));
+        }
+    }
+
+    set_odes_block(text, &overrides);
+
     prune_unreferenced(text)
+}
+
+/// Replace every `[odes]` block with `lines`, dropping the block entirely
+/// when there are none.
+///
+/// The block is rewritten rather than merged because it holds exactly the
+/// overrides this edit owns: an analytic candidate must carry none (an
+/// ODE-only input function beside a `pk` line is a hard parse error), and an
+/// ODE candidate's override set is derived from its variant, not accumulated
+/// across moves.
+fn set_odes_block(text: &mut ModelText, lines: &[String]) {
+    let mut dead: Vec<usize> = Vec::new();
+    for span in text.block_spans().iter().filter(|b| b.name == "odes") {
+        dead.push(span.header);
+        // Blank separators stay where the author put them; only declarations go.
+        dead.extend(span.body.clone().filter(|i| !text.code(*i).is_empty()));
+    }
+    text.delete_lines(dead);
+    for line in lines {
+        text.append_to_block("odes", line);
+    }
 }
 
 // ── [covariate_model] ───────────────────────────────────────────────────────
@@ -1677,6 +1841,26 @@ fn prune_unreferenced(text: &mut ModelText) -> Result<(), String> {
         declaration_lines.extend(span.clone());
     }
     let mut live = text.identifiers_excluding(&declaration_lines);
+
+    // An ODE model's engine reads bioavailability and the absorption lag off
+    // an `[individual_parameters]` *name* (`ode_param_slots`), not off any
+    // equation, so `F = TVF` / `lagtime = TLAG` is referenced by nothing
+    // textual and would otherwise be pruned as dead — silently taking the
+    // dose attribute, its θ and its η with it. Root those names, and only
+    // where they carry that meaning: on an analytic model the `pk` line's
+    // `f=` / `lagtime=` role *is* the reference, and a parameter the line
+    // does not bind really is unused.
+    if !text
+        .block_lines("structural_model")
+        .iter()
+        .any(|l| l.starts_with("pk "))
+    {
+        for d in &decls {
+            if is_ode_reserved_name(&d.name) {
+                live.insert(d.name.clone());
+            }
+        }
+    }
 
     // Grow the live set: a live name pulls in whatever its declaration reads.
     loop {

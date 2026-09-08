@@ -162,6 +162,15 @@ pub fn ferx_core::diagnostics::Diagnostic::with_line(self, line: usize) -> Self
 pub fn ferx_core::diagnostics::Diagnostic::with_suggestion(self, suggestion: impl core::convert::Into<alloc::string::String>) -> Self
 pub fn ferx_core::diagnostics::first_error(diagnostics: &[ferx_core::diagnostics::Diagnostic]) -> core::result::Result<(), alloc::string::String>
 pub mod ferx_core::edit
+pub enum ferx_core::edit::EliminationForm
+pub ferx_core::edit::EliminationForm::FirstOrder
+pub ferx_core::edit::EliminationForm::MichaelisMenten
+pub ferx_core::edit::EliminationForm::MichaelisMenten::km: alloc::string::String
+pub ferx_core::edit::EliminationForm::MixedFoMm
+pub ferx_core::edit::EliminationForm::MixedFoMm::clmm: alloc::string::String
+pub ferx_core::edit::EliminationForm::MixedFoMm::km: alloc::string::String
+impl ferx_core::pk::ode_template::EliminationForm
+pub fn ferx_core::pk::ode_template::EliminationForm::label(&self) -> &'static str
 pub enum ferx_core::edit::ErrorForm
 pub ferx_core::edit::ErrorForm::Additive
 pub ferx_core::edit::ErrorForm::Combined
@@ -184,6 +193,15 @@ pub ferx_core::edit::IivForm::Proportional::variance: f64
 impl ferx_core::edit::IivForm
 pub fn ferx_core::edit::IivForm::eta(&self) -> &str
 pub fn ferx_core::edit::IivForm::variance(&self) -> f64
+pub enum ferx_core::edit::InputForm
+pub ferx_core::edit::InputForm::Template
+pub ferx_core::edit::InputForm::Weibull
+pub ferx_core::edit::InputForm::Weibull::beta: alloc::string::String
+pub ferx_core::edit::InputForm::Weibull::td: alloc::string::String
+pub ferx_core::edit::InputForm::ZeroOrder
+pub ferx_core::edit::InputForm::ZeroOrder::dur: alloc::string::String
+impl ferx_core::pk::ode_template::InputForm
+pub fn ferx_core::pk::ode_template::InputForm::label(&self) -> &'static str
 pub enum ferx_core::edit::ModelEdit<'a>
 pub ferx_core::edit::ModelEdit::AddCovariateRelation(ferx_core::edit::Relation)
 pub ferx_core::edit::ModelEdit::AddIiv
@@ -210,6 +228,11 @@ pub ferx_core::edit::ModelEdit::SetOmegaBlock(alloc::vec::Vec<alloc::string::Str
 pub ferx_core::edit::ModelEdit::SetStructural(ferx_core::edit::StructuralSpec)
 pub ferx_core::edit::ModelEdit::SplitKappaBlock(alloc::vec::Vec<alloc::string::String>)
 pub ferx_core::edit::ModelEdit::SplitOmegaBlock(alloc::vec::Vec<alloc::string::String>)
+pub enum ferx_core::edit::StructuralEngine
+pub ferx_core::edit::StructuralEngine::Ode
+pub ferx_core::edit::StructuralEngine::Ode::elimination: ferx_core::pk::ode_template::EliminationForm
+pub ferx_core::edit::StructuralEngine::Ode::input: ferx_core::pk::ode_template::InputForm
+pub ferx_core::edit::StructuralEngine::Pk
 #[non_exhaustive] pub struct ferx_core::edit::ErrorSpecText
 pub ferx_core::edit::ErrorSpecText::endpoint: alloc::string::String
 pub ferx_core::edit::ErrorSpecText::exponent: core::option::Option<ferx_core::edit::ThetaDecl>
@@ -281,10 +304,14 @@ pub struct ferx_core::edit::SigmaDecl
 pub ferx_core::edit::SigmaDecl::as_sd: bool
 pub ferx_core::edit::SigmaDecl::init: f64
 pub ferx_core::edit::SigmaDecl::name: alloc::string::String
-pub struct ferx_core::edit::StructuralSpec
+#[non_exhaustive] pub struct ferx_core::edit::StructuralSpec
 pub ferx_core::edit::StructuralSpec::bindings: alloc::vec::Vec<(alloc::string::String, alloc::string::String)>
+pub ferx_core::edit::StructuralSpec::engine: ferx_core::edit::StructuralEngine
 pub ferx_core::edit::StructuralSpec::new_parameters: alloc::vec::Vec<ferx_core::edit::NewParameter>
 pub ferx_core::edit::StructuralSpec::template: alloc::string::String
+impl ferx_core::edit::StructuralSpec
+pub fn ferx_core::edit::StructuralSpec::new(template: impl core::convert::Into<alloc::string::String>, bindings: alloc::vec::Vec<(alloc::string::String, alloc::string::String)>, new_parameters: alloc::vec::Vec<ferx_core::edit::NewParameter>) -> Self
+pub fn ferx_core::edit::StructuralSpec::ode(self, input: ferx_core::pk::ode_template::InputForm, elimination: ferx_core::pk::ode_template::EliminationForm) -> Self
 pub struct ferx_core::edit::ThetaDecl
 pub ferx_core::edit::ThetaDecl::init: f64
 pub ferx_core::edit::ThetaDecl::lower: f64
@@ -1389,12 +1416,31 @@ pub fn ferx_core::pk::event_driven::event_driven_predictions_with_schedule(pk_mo
 pub fn ferx_core::pk::event_driven::profile_report()
 pub fn ferx_core::pk::event_driven::supports_event_driven(pk_model: ferx_core::PkModel) -> bool
 pub mod ferx_core::pk::ode_template
+pub enum ferx_core::pk::ode_template::EliminationForm
+pub ferx_core::pk::ode_template::EliminationForm::FirstOrder
+pub ferx_core::pk::ode_template::EliminationForm::MichaelisMenten
+pub ferx_core::pk::ode_template::EliminationForm::MichaelisMenten::km: alloc::string::String
+pub ferx_core::pk::ode_template::EliminationForm::MixedFoMm
+pub ferx_core::pk::ode_template::EliminationForm::MixedFoMm::clmm: alloc::string::String
+pub ferx_core::pk::ode_template::EliminationForm::MixedFoMm::km: alloc::string::String
+impl ferx_core::pk::ode_template::EliminationForm
+pub fn ferx_core::pk::ode_template::EliminationForm::label(&self) -> &'static str
+pub enum ferx_core::pk::ode_template::InputForm
+pub ferx_core::pk::ode_template::InputForm::Template
+pub ferx_core::pk::ode_template::InputForm::Weibull
+pub ferx_core::pk::ode_template::InputForm::Weibull::beta: alloc::string::String
+pub ferx_core::pk::ode_template::InputForm::Weibull::td: alloc::string::String
+pub ferx_core::pk::ode_template::InputForm::ZeroOrder
+pub ferx_core::pk::ode_template::InputForm::ZeroOrder::dur: alloc::string::String
+impl ferx_core::pk::ode_template::InputForm
+pub fn ferx_core::pk::ode_template::InputForm::label(&self) -> &'static str
 pub struct ferx_core::pk::ode_template::GeneratedDisposition
 pub ferx_core::pk::ode_template::GeneratedDisposition::obs_cmt: alloc::string::String
 pub ferx_core::pk::ode_template::GeneratedDisposition::obs_scale: alloc::string::String
 pub ferx_core::pk::ode_template::GeneratedDisposition::odes: alloc::vec::Vec<(alloc::string::String, alloc::string::String)>
 pub ferx_core::pk::ode_template::GeneratedDisposition::states: alloc::vec::Vec<alloc::string::String>
 pub fn ferx_core::pk::ode_template::generate(model_name: &str, params: &std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>) -> core::result::Result<ferx_core::pk::ode_template::GeneratedDisposition, alloc::string::String>
+pub fn ferx_core::pk::ode_template::generate_variant(model_name: &str, params: &std::collections::hash::map::HashMap<alloc::string::String, alloc::string::String>, input: &ferx_core::pk::ode_template::InputForm, elimination: &ferx_core::pk::ode_template::EliminationForm) -> core::result::Result<ferx_core::pk::ode_template::GeneratedDisposition, alloc::string::String>
 pub mod ferx_core::pk::one_compartment
 pub fn ferx_core::pk::one_compartment::one_cpt_ig_f(dose: &ferx_core::DoseEvent, t: f64, cl: f64, v: f64, mat: f64, cv2: f64, f_bio: f64) -> f64
 pub fn ferx_core::pk::one_compartment::one_cpt_infusion(dose: &ferx_core::DoseEvent, t: f64, cl: f64, v: f64) -> f64

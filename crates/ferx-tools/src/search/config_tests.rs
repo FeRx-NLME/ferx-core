@@ -150,12 +150,12 @@ fn every_rank_type_maps_to_a_criterion_except_penalized() {
 
 #[test]
 fn unsupported_feature_is_a_load_error_naming_it() {
-    let e = load_err("base = \"m.ferx\"\n[space]\nmfl = \"ELIMINATION([FO,MM])\"\n");
+    let e = load_err("base = \"m.ferx\"\n[space]\nmfl = \"ABSORPTION([FO,SEQ-ZO-FO])\"\n");
     assert!(
         e.starts_with("[space] mfl: the search space asks for 1 feature"),
         "{e}"
     );
-    assert!(e.contains("ELIMINATION(MM)"), "{e}");
+    assert!(e.contains("ABSORPTION(SEQ-ZO-FO)"), "{e}");
     assert!(e.contains(super::super::coverage::COVERAGE_DOCS), "{e}");
 }
 
@@ -251,7 +251,7 @@ fn load_reads_the_file_and_names_it_in_errors() {
     let path = dir.path().join("warfarin.ferxsearch");
     std::fs::write(
         &path,
-        "base = \"m.ferx\"\n[space]\nmfl = \"ELIMINATION(MM)\"\n",
+        "base = \"m.ferx\"\n[space]\nmfl = \"ABSORPTION(SEQ-ZO-FO)\"\n",
     )
     .unwrap();
     let e = SearchConfig::load(&path).expect_err("coverage gap");

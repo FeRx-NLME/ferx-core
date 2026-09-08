@@ -67,10 +67,11 @@ The four structural categories, and what each value becomes:
 |---|---|---|
 | `ABSORPTION(INST)` | ✓ | the `*_iv` templates |
 | `ABSORPTION(FO)` | ✓ | the `*_oral` templates; `*_transit` when a chain is present |
-| `ABSORPTION(ZO / WEIBULL)` | ✗ | no `pk` template: `ZO` is a modeled duration on an IV template with `RATE=-2` **in the dataset**, `WEIBULL` the `[odes]` input function `weibull(...)` — both are the `[odes]` candidate family of [#1257](https://github.com/FeRx-NLME/ferx-core/issues/1257), split out of #1181 |
-| `ABSORPTION(SEQ-ZO-FO)` | ✗ | no template and no input function — refused by name when the file is loaded |
-| `ELIMINATION(FO)` | ✓ | every template; the statement is accepted and contributes nothing |
-| `ELIMINATION(ZO / MM / MIX-FO-MM)` | ✗ | see [the elimination gap](#the-elimination-gap) |
+| `ABSORPTION(ZO)` | ✓ | the `*_iv` template with `zero_order(dur = …)` into `central` — an [`[odes]` candidate](#the-odes-candidates) |
+| `ABSORPTION(WEIBULL)` | ✓ | the `*_iv` template with `weibull(td = …, beta = …)` into `central` — an [`[odes]` candidate](#the-odes-candidates) |
+| `ABSORPTION(SEQ-ZO-FO)` | ✗ | not one input term but a depot of its own, filled at a constant rate and emptied by `ka`; no template, and the search does not generate one — refused by name when the file is loaded |
+| `ELIMINATION(FO)` | ✓ | every template's own `CL/V` |
+| `ELIMINATION(ZO / MM / MIX-FO-MM)` | ✓ | an `[odes]` override of the flux out of `central` — see [the `[odes]` candidates](#the-odes-candidates) |
 | `PERIPHERALS(0 / 1 / 2)` | ✓ | `one_cpt_*` / `two_cpt_*` / `three_cpt_*` |
 | `TRANSITS(n, NODEPOT)` | ✓ | `*_transit` with a `FIX`ed count, `theta TVNTR(n, …) FIX`; `TRANSITS(0)` is a move *off* a chain |
 | `TRANSITS(N)` | ✓ | `*_transit` with the count estimated |
@@ -212,25 +213,101 @@ two-compartment lagged candidate and its hand-written twin agree on
 `predict()` bit for bit and on the evaluated objective bit for bit
 (`crates/ferx-tools/tests/modelsearch_end_to_end.rs`).
 
-## The elimination gap
+## The `[odes]` candidates
 
-`ELIMINATION(ZO)`, `MM` and `MIX-FO-MM` are refused. Non-linear elimination
-has no analytic template: a candidate using it would have to be emitted as
-an `[odes]` model, and that changes both the numerics path and the runtime
-by one to two orders of magnitude relative to its analytic siblings. Ranking
-such a candidate against analytic ones is still valid — it is the same
-likelihood — but two things would have to be handled explicitly rather than
-discovered: the runtime budget is no longer uniform across candidates, and
-Michaelis–Menten models are the canonical [local-minimum
-case](../examples/multistart.qmd), needing more starts than their siblings
-or the search rejects a correct model on a stalled fit.
+Three of the MFL values have no analytic `pk` template at all:
+`ABSORPTION(ZO)`, `ABSORPTION(WEIBULL)` and every `ELIMINATION` other than
+`FO`. They are one family, because they are written the same way — an
+`ode_template NAME(...)` line, which generates the standard disposition
+([`ode_template`](../model-file/absorption.qmd#generating-the-disposition-ode_template)),
+plus **one** `[odes]` line replacing the `central` equation:
 
-The decision for this version is to **refuse the feature by name** rather
-than offer it half-handled. The report already carries what the ODE case
-would need first — every candidate's wall-clock `seconds` beside its rank —
-and the coverage error points here. An elimination search over `[odes]`
-candidates, with a per-candidate start budget, is a follow-up to
-[#1175](https://github.com/FeRx-NLME/ferx-core/issues/1175).
+| feature | the candidate |
+|---|---|
+| `ABSORPTION(ZO)` | `ode_template one_cpt_iv(cl=CL, v=V)` + `d/dt(central) = zero_order(dur=DUR) - (CL/V) * central` |
+| `ABSORPTION(WEIBULL)` | `ode_template one_cpt_iv(cl=CL, v=V)` + `d/dt(central) = weibull(td=TD, beta=BETA) - (CL/V) * central` |
+| `ELIMINATION(MM)` | the base's own template + `d/dt(central) = KA * depot - ((CL * KM / (KM + central / V)) / V) * central` |
+| `ELIMINATION(ZO)` | the same, with `theta TVKM(…) FIX` |
+| `ELIMINATION(MIX-FO-MM)` | `… - ((CL + CLMM * KM / (KM + central / V)) / V) * central` |
+
+Everything else about the candidate is unchanged: the disposition, the
+peripheral compartments, a transit chain, the covariate model, and the
+parameters the base already had. Only `central` changes, so `ELIMINATION`
+composes with every absorption and every compartment count — it appears in
+none of Pharmpy's incompatible pairs.
+
+Four things are worth knowing before you put one in a space.
+
+### The clearance keeps its name
+
+ Pharmpy renames `CL` to `CLMM` when it
+switches to Michaelis–Menten; ferx binds the same parameter, under the name
+the base gave it. That is what carries its initial estimate and its η across
+the move — a renamed parameter would arrive with neither. `MIX-FO-MM` is the
+one case with two clearances, and there the saturable one is a new `CLMM`
+starting at half the first-order one, exactly as Pharmpy does it.
+
+### They cost an order of magnitude more per fit
+
+A closed form is replaced
+by numerical integration, and a saturable right-hand side is stiffer again —
+one FOCEI *evaluation* of the warfarin Michaelis–Menten candidate below takes
+0.064 s against the analytic base's 0.008 s, and a fit widens that, because
+every outer iteration integrates the system again with sensitivities. The
+runner plans candidates of equal cost together, heaviest group first, so an
+ODE candidate runs with subject-level threads rather than alone on one worker
+while the rest of the machine idles — but the wall clock is still the wall
+clock, and the report's `seconds` column is the measurement.
+
+### A saturable elimination is fitted with more starts
+
+Michaelis–Menten
+models are the canonical [local-minimum case](../examples/multistart.qmd),
+and a search that ranks a stalled MM fit against a converged first-order one
+rejects a correct model on the strength of the optimizer. Those candidates —
+and only those — are given at least 8 starts, whatever `[run] retries` says;
+a run configured with more keeps them.
+
+### Initial estimates, and a floor Pharmpy does not have
+
+`ABSORPTION(ZO)` drops the depot, as Pharmpy's
+`set_zero_order_absorption` does: the dose is delivered into `central` over
+a modeled duration, so `KA` and its η are pruned with it. The duration
+starts at Pharmpy's `2·MAT` with `MAT = 2·t_first`; the Weibull scale at
+`MAT / Γ(1 + 1/β)` with `β = 1.5`; the Michaelis constant at `max(DV)/2`,
+bounded above by `1.5·max(DV)`, or fixed at `min(DV)/100` for zero-order
+elimination, which is how Pharmpy writes a zero-order elimination too.
+
+The observation range those last two read is **floored positive**, which
+Pharmpy does only half of. A Michaelis constant at or below zero is not a
+model — the saturable term `CL·KM/(KM + C)` is singular at `C = −KM`, and at
+`KM = 0` the generated right-hand side evaluates `0/0` when `central` is zero,
+which is every subject's first record — and an additive residual error puts
+negative observations in perfectly ordinary data. Pharmpy resets a negative
+`min(DV)/100` to `0.01`; ferx applies the same fallback to a zero minimum and
+to a non-positive `max(DV)`, which would otherwise give `KM` a negative upper
+bound. The fallback is the value Pharmpy uses when a model carries no dataset
+at all.
+
+### Bioavailability and the lag time survive every move
+
+Including a second one. They are not coordinates of the search, and an `ode_template` line
+cannot carry them — it takes the analytic signature, which has no `f` or
+`lagtime` slot — so an ODE candidate states them in
+`[individual_parameters]` instead: under a reserved spelling (`F`, `ALAG`,
+`LAGTIME`) when the model already uses one, and otherwise as the alias
+`lagtime = TLAG` that the engine reads the slot off. A later step recovers
+the binding from there rather than from the template line, so
+`ELIMINATION(MM)` followed by `PERIPHERALS(1)` leaves both exactly where the
+base put them.
+
+### The base must be analytic
+
+A base model whose disposition is already an `ode_template` line is
+refused: the search reads its starting coordinates off a `pk NAME(...)`
+line and cannot recover an absorption or an elimination from an arbitrary
+right-hand side. Write the base analytically and let the search generate the
+ODE candidates.
 
 ## Ranking, and convergence beside it
 
@@ -367,6 +444,32 @@ orders of magnitude above the worst OFV disagreement, so it is not a
 ranking decided by numbers finer than two engines agree on. The tolerance
 in the test is measured, not assumed: 10⁻³, twenty times the worst
 realised error.
+
+### The `[odes]` candidates, anchored on an evaluation
+
+The generated `[odes]` equation is a second numerical object, and NONMEM can
+state it exactly (`$DES` with a `CLMM·KM/(KM + C)` clearance), so it has an
+anchor of its own — `mm_base.ctl` / `mm_eval.ctl` beside the four above.
+Here both sides **evaluate** (`MAXEVAL=0` / `maxiter = 0`) at one stated
+parameter vector, the base's own θ plus `KM = max(DV)/2 = 6.9409`:
+
+| model | ferx | NONMEM 7.5.1 | \|Δ\| |
+|---|---:|---:|---:|
+| first-order elimination (analytic, the control) | −182.66670809 | −182.66670808 | 9.7 × 10⁻⁹ |
+| `ELIMINATION(MM)` (`ode_template` + one override) | 929.63056169 | 929.63055241 | 9.3 × 10⁻⁶ |
+
+An evaluation rather than a fit, on purpose: the object under test is the
+equation, and comparing two *minimisations* of a Michaelis–Menten model would
+compare two optimizers on the canonical multimodal surface instead. The
+first-order row is the control — it says the agreement on the second row
+belongs to the saturable term and is not an accident of the dataset — and the
+1112-unit gap between the two rows is what makes the anchor unable to pass on
+a candidate whose override the engine ignored. Both sides integrate to a
+stated tolerance (`TOL=9 ATOL=12` against `ode_reltol = 1e-10`,
+`ode_abstol = 1e-12`), so the 9.3 × 10⁻⁶ residual is solver error rather than
+model error; at ferx's *default* `ode_reltol = 1e-4` the same comparison is
+0.017 out, which is the FOCEI objective amplifying integration error and not
+a disagreement about the model.
 
 ## Deviations from Pharmpy, stated
 

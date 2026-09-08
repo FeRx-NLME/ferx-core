@@ -15,7 +15,7 @@ use std::sync::Mutex;
 use ferx_core::edit::ModelText;
 use ferx_core::StrictnessVerdict;
 
-use super::structure::space_features;
+use super::structure::{space_features, MM_STARTS};
 use super::*;
 use crate::search::mfl::Mfl;
 use crate::search::test_support::converged_fit;
@@ -65,6 +65,7 @@ pub(crate) const BASE_IV: &str = "\
 fn fo(peripherals: u32) -> Structure {
     Structure {
         absorption: Absorption::Fo,
+        elimination: Elimination::Fo,
         peripherals,
         transits: None,
         lagtime: false,
@@ -113,7 +114,7 @@ fn space(mfl: &str) -> Space {
 }
 
 /// The scripted fitter. OFVs are keyed by the candidate's structure (its
-/// feature vector, `ABSORPTION=FO;LAGTIME=ON;PERIPHERALS=1;TRANSITS=0`) or by
+/// feature vector, `ABSORPTION=FO;ELIMINATION=FO;LAGTIME=ON;PERIPHERALS=1;TRANSITS=0`) or by
 /// id; a candidate in neither table gets `fallback`.
 struct Script {
     ofv: HashMap<String, f64>,
@@ -305,12 +306,12 @@ fn triple(id: &str, parent: &str, path: &str) -> (String, String, String) {
     (id.into(), parent.into(), path.into())
 }
 
-const FO_LAG: &str = "ABSORPTION=FO;LAGTIME=ON;PERIPHERALS=0;TRANSITS=0";
-const FO_P1: &str = "ABSORPTION=FO;LAGTIME=OFF;PERIPHERALS=1;TRANSITS=0";
-const FO_P1_LAG: &str = "ABSORPTION=FO;LAGTIME=ON;PERIPHERALS=1;TRANSITS=0";
-const FO_P2: &str = "ABSORPTION=FO;LAGTIME=OFF;PERIPHERALS=2;TRANSITS=0";
-const FO_P2_LAG: &str = "ABSORPTION=FO;LAGTIME=ON;PERIPHERALS=2;TRANSITS=0";
-const FO_BASE: &str = "ABSORPTION=FO;LAGTIME=OFF;PERIPHERALS=0;TRANSITS=0";
+const FO_LAG: &str = "ABSORPTION=FO;ELIMINATION=FO;LAGTIME=ON;PERIPHERALS=0;TRANSITS=0";
+const FO_P1: &str = "ABSORPTION=FO;ELIMINATION=FO;LAGTIME=OFF;PERIPHERALS=1;TRANSITS=0";
+const FO_P1_LAG: &str = "ABSORPTION=FO;ELIMINATION=FO;LAGTIME=ON;PERIPHERALS=1;TRANSITS=0";
+const FO_P2: &str = "ABSORPTION=FO;ELIMINATION=FO;LAGTIME=OFF;PERIPHERALS=2;TRANSITS=0";
+const FO_P2_LAG: &str = "ABSORPTION=FO;ELIMINATION=FO;LAGTIME=ON;PERIPHERALS=2;TRANSITS=0";
+const FO_BASE: &str = "ABSORPTION=FO;ELIMINATION=FO;LAGTIME=OFF;PERIPHERALS=0;TRANSITS=0";
 
 // ── enumeration ─────────────────────────────────────────────────────────────
 
@@ -523,6 +524,7 @@ fn exhaustive_skips_pharmpys_unsupported_pairs() {
             BASE_IV,
             Structure {
                 absorption: Absorption::Inst,
+                elimination: Elimination::Fo,
                 ..fo(0)
             },
             "ABSORPTION([INST,FO]); LAGTIME([OFF,ON]); TRANSITS([0,3], NODEPOT)",
@@ -608,6 +610,7 @@ fn an_input_outside_the_space_is_fitted_then_moved_onto_it() {
             BASE_IV,
             Structure {
                 absorption: Absorption::Inst,
+                elimination: Elimination::Fo,
                 ..fo(0)
             },
             "ABSORPTION(FO); LAGTIME([OFF,ON])",
@@ -661,6 +664,7 @@ fn the_input_is_ranked_but_never_selected() {
             BASE_IV,
             Structure {
                 absorption: Absorption::Inst,
+                elimination: Elimination::Fo,
                 ..fo(0)
             },
             "ABSORPTION(FO); LAGTIME([OFF,ON])",
@@ -688,6 +692,7 @@ fn a_derived_base_no_template_can_express_is_an_error_naming_the_fix() {
         text,
         Structure {
             absorption: Absorption::Inst,
+            elimination: Elimination::Fo,
             ..fo(0)
         },
         &features,
@@ -712,6 +717,7 @@ fn an_input_on_the_space_that_has_no_template_blames_itself_not_a_derivation() {
         text,
         Structure {
             absorption: Absorption::Inst,
+            elimination: Elimination::Fo,
             lagtime: true,
             ..fo(0)
         },
@@ -1435,4 +1441,181 @@ fn a_failed_candidates_children_start_unseeded_and_the_notes_say_so() {
         "{:?}",
         result.notes
     );
+}
+
+// ── the ODE candidate family (#1257) ────────────────────────────────────────
+
+/// A space over `ELIMINATION` and the ODE absorptions enumerates candidates
+/// like any other, writes them as `ode_template` models with one `[odes]`
+/// override, and hands each its own runtime weight and start budget.
+#[test]
+fn ode_candidates_are_written_as_ode_templates_with_their_own_budget() {
+    let script = Script::new(&[]);
+    let result = run(
+        &script,
+        space("ELIMINATION([FO,MM]); ABSORPTION([FO,ZO])"),
+        &options(Algorithm::Exhaustive),
+    );
+    assert_eq!(
+        paths(&result, 1),
+        vec![
+            triple("run1", "base", "ELIMINATION(MM)"),
+            triple("run2", "base", "ABSORPTION(ZO)"),
+            triple("run3", "base", "ABSORPTION(ZO);ELIMINATION(MM)"),
+        ],
+        "elimination composes with every absorption — it is in none of \
+         Pharmpy's incompatible pairs"
+    );
+
+    let candidates = script.candidates_in("candidates");
+    // The Michaelis-Menten candidate keeps the analytic disposition and
+    // replaces only the flux out of `central`, reusing `CL` as the saturable
+    // clearance.
+    assert_eq!(
+        candidates[0].model.block_lines("structural_model"),
+        vec!["ode_template one_cpt_oral(cl=CL, v=V, ka=KA)"]
+    );
+    assert_eq!(
+        candidates[0].model.block_lines("odes"),
+        vec!["d/dt(central) = KA * depot - ((CL * KM / (KM + central / V)) / V) * central"]
+    );
+    // The zero-order one: a bolus template fed by `zero_order(...)`.
+    assert_eq!(
+        candidates[1].model.block_lines("structural_model"),
+        vec!["ode_template one_cpt_iv(cl=CL, v=V)"],
+        "`dur` is read by the override, not bound on the line"
+    );
+    assert_eq!(
+        candidates[1].model.block_lines("odes"),
+        vec!["d/dt(central) = zero_order(dur=DUR) - (CL/V) * central"]
+    );
+
+    // The budgets: the saturable candidates are heaviest and are the only
+    // ones that ask for extra starts.
+    assert_eq!(candidates[1].n_starts, None);
+    assert_eq!(candidates[0].n_starts, Some(MM_STARTS));
+    assert_eq!(candidates[2].n_starts, Some(MM_STARTS));
+    assert!(candidates[0].cost > candidates[1].cost);
+    assert!(candidates[1].cost > 1.0);
+}
+
+/// The elimination coordinate reaches the report, so a row says which model
+/// it scored rather than only which id.
+#[test]
+fn the_elimination_coordinate_is_in_the_feature_vector() {
+    let script = Script::new(&[]);
+    let result = run(
+        &script,
+        space("ELIMINATION([FO,MM])"),
+        &options(Algorithm::Exhaustive),
+    );
+    let row = result
+        .rows
+        .iter()
+        .find(|r| r.id == "run1")
+        .expect("the candidate is in the table");
+    assert_eq!(row.structure.elimination, Elimination::Mm);
+    assert!(
+        row.structure
+            .feature_vector()
+            .render()
+            .contains("ELIMINATION=MM"),
+        "{}",
+        row.structure.feature_vector().render()
+    );
+}
+
+/// A one-compartment oral base carrying both reserved dose attributes: a
+/// bioavailability under its own name and a lag time under a name that is
+/// *not* a reserved spelling, so the ODE candidate has to bridge it.
+const BASE_F_LAG: &str = "\
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta TVLAG(0.4, 0.0, 5.0)
+  theta THETA_F(0.7, 0.001, 0.999)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  KA = TVKA
+  TLAG = TVLAG
+  F = THETA_F
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=TLAG, f=F)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+/// Two stepwise moves off an ODE parent must not disturb the coordinates
+/// neither move touched (the #1292 review).
+///
+/// After `ELIMINATION(MM)` the candidate's disposition is an `ode_template`
+/// line, which cannot carry `f` or `lagtime`. Reading the child's bindings
+/// off that line alone dropped bioavailability from the second-layer spec
+/// entirely and re-minted the lag as a fresh `ALAG` at the data-derived
+/// default — two silent changes in a step whose feature was `PERIPHERALS(1)`.
+#[test]
+fn a_second_layer_off_an_ode_parent_keeps_bioavailability_and_the_lag_time() {
+    let script = Script::new(&[]);
+    let base = Structure {
+        lagtime: true,
+        ..fo(0)
+    };
+    let result = run(
+        &script,
+        space_of(BASE_F_LAG, base, "ELIMINATION([FO,MM]); PERIPHERALS(0..1)"),
+        &options(Algorithm::ExhaustiveStepwise),
+    );
+
+    // Layer 2, reached by ELIMINATION(MM) and then PERIPHERALS(1).
+    let second = result
+        .rows
+        .iter()
+        .find(|r| {
+            r.layer == 2
+                && r.structure.elimination == Elimination::Mm
+                && r.structure.peripherals == 1
+        })
+        .unwrap_or_else(|| panic!("MM → 1 peripheral is a path: {:?}", paths(&result, 2)));
+    let text = &result.models[&second.id];
+    let params = text.block_lines("individual_parameters");
+    let thetas = text.block_lines("parameters");
+
+    // Bioavailability: still declared, still under its own name, still on
+    // its own θ. `F` routes to the slot by itself, so no bridge is needed.
+    assert!(
+        params.iter().any(|l| l.starts_with("F =")),
+        "bioavailability was dropped: {params:?}"
+    );
+    assert!(
+        thetas.iter().any(|l| l.starts_with("theta THETA_F(")),
+        "{thetas:?}"
+    );
+    // The lag time: the base's `TLAG`, bridged by the alias — not a fresh
+    // `ALAG` at `t_first / 2`.
+    assert!(
+        params.iter().any(|l| l == "lagtime = TLAG"),
+        "the lag bridge is gone: {params:?}"
+    );
+    assert!(params.iter().any(|l| l.starts_with("TLAG =")), "{params:?}");
+    assert!(
+        thetas.iter().any(|l| l.starts_with("theta TVLAG(0.4")),
+        "the lag time was re-derived rather than carried: {thetas:?}"
+    );
+    assert!(
+        !params.iter().any(|l| l.starts_with("ALAG =")),
+        "a second lag parameter was minted: {params:?}"
+    );
+    // …and the layer's own move did happen.
+    assert_eq!(
+        text.block_lines("structural_model"),
+        vec!["ode_template two_cpt_oral(cl=CL, v1=V, q=Q, v2=V2, ka=KA)"]
+    );
+    assert_eq!(second.path.len(), 2);
 }
