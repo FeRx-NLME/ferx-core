@@ -84,6 +84,30 @@ fn edited(edits: Vec<ModelEdit<'_>>) -> String {
 /// Tier-2 throughout — `outer_maxiter = 2` exercises the fit path without
 /// running a convergence loop.
 fn assert_same_model(generated: &str, hand_written: &str) {
+    assert_same_model_at(generated, hand_written, 2)
+}
+
+/// [`assert_same_model`] at a stated number of outer iterations.
+///
+/// `0` is an **evaluation**: the two models are compared on their θ and η
+/// vectors, on `predict()` bit for bit, and on the objective at the point
+/// they both start from. That is the whole identity claim — two spellings of
+/// one model — and iterating only re-asserts the same equality at a second
+/// point the optimizer picked. The one thing an evaluation could miss is a
+/// difference in *parameter order*, which would move the optimizer without
+/// moving the start; the `theta_names` / `eta_names` assertions below pin
+/// that directly.
+///
+/// It matters because the ODE cases are not cheap, and the per-PR coverage
+/// job runs this file instrumented on one thread. Each outer iteration
+/// finite-differences the whole population objective once per free
+/// parameter, so an evaluation is far less work for the same claim.
+/// Measured on this file: four ODE cases at `outer_maxiter = 2` cost 402 s
+/// of its 435 s; with three of them evaluating the file is 222 s. The
+/// Michaelis-Menten case keeps its two iterations, so the optimizer path
+/// over a generated `[odes]` model is still exercised — on the variant the
+/// NONMEM anchor covers.
+fn assert_same_model_at(generated: &str, hand_written: &str, outer_maxiter: usize) {
     let gen = parse_full_model(generated)
         .unwrap_or_else(|e| panic!("the generated model must parse: {e}\n---\n{generated}"));
     let hand = parse_full_model(hand_written)
@@ -113,7 +137,7 @@ fn assert_same_model(generated: &str, hand_written: &str) {
     }
 
     let opts = FitOptions {
-        outer_maxiter: 2,
+        outer_maxiter,
         ..FitOptions::default()
     };
     let gen_fit = fit(&gen.model, &pop, &gen.model.default_params, &opts)
@@ -544,6 +568,9 @@ fn michaelis_menten_elimination_is_the_hand_written_ode_model() {
 
 {ODE_TWIN_TAIL}"
     );
+    // The one ODE case that iterates: it is the variant the NONMEM anchor
+    // covers, so the optimizer path over a generated `[odes]` model is
+    // exercised on the model whose numbers are anchored externally.
     assert_same_model(&generated, &hand);
 }
 
@@ -604,7 +631,7 @@ fn mixed_mm_fo_elimination_is_the_hand_written_ode_model() {
 
 {ODE_TWIN_TAIL}"
     );
-    assert_same_model(&generated, &hand);
+    assert_same_model_at(&generated, &hand, 0);
 }
 
 #[test]
@@ -648,7 +675,7 @@ fn zero_order_absorption_is_the_hand_written_ode_model() {
 
 {ODE_TWIN_TAIL}"
     );
-    assert_same_model(&generated, &hand);
+    assert_same_model_at(&generated, &hand, 0);
 }
 
 #[test]
@@ -712,7 +739,7 @@ fn weibull_absorption_is_the_hand_written_ode_model() {
 
 {ODE_TWIN_TAIL}"
     );
-    assert_same_model(&generated, &hand);
+    assert_same_model_at(&generated, &hand, 0);
 }
 
 /// The ODE engine's *default* variant is the numerically-integrated twin of
@@ -740,5 +767,5 @@ fn the_default_ode_variant_is_the_generated_disposition() {
          d/dt(depot)   = -KA * depot\n  d/dt(central) = KA * depot - (CL/V) * central\n\n\
          [scaling]\n  obs_scale = V",
     );
-    assert_same_model(&generated, &hand);
+    assert_same_model_at(&generated, &hand, 0);
 }
