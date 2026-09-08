@@ -641,3 +641,289 @@ fn the_sensitivity_sweep_is_a_no_op_when_the_fit_asked_for_fd_gradients() {
     assert_eq!(stats.accepted_steps, 0, "{stats:?}");
     assert_eq!(stats.attempted_steps, 0, "{stats:?}");
 }
+
+// ── abandoned non-finite timelines (#1234) ───────────────────────────────────
+//
+// Before this, the three states below were one counter reading. Measured at `cf32e1fd` on
+// the `two_state_model(1.0)` fixture inside a `SolverStatsScope`: a normal subject read
+// `attempted/accepted/rejected = 7/7/0`, while a non-finite timeline, a subject with no
+// records, and a subject with one observation at `t = 0` all read `0/0/0` — returning
+// `[NaN; 4]`, `[]` and `[0.0]` respectively. The first of those three is a fit whose
+// predictions are `NaN` by construction; the other two are ordinary.
+
+/// A subject with a `NaN` dose **time**, which is how this reaches the engines at all:
+/// `check_model_data` passes it, because #1286 checks dose *attributes* (`ALAG`/`F`/`D`/`R`)
+/// and not record times.
+fn nan_dose_time_subject(id: &str) -> Subject {
+    let mut s = subject(id, 1.0);
+    s.doses = vec![DoseEvent::new(f64::NAN, 100.0, 1, 0.0, false, 0.0)];
+    s
+}
+
+/// Nothing to integrate: no doses, no observations.
+fn no_records_subject() -> Subject {
+    let mut s = subject("empty", 1.0);
+    s.doses = Vec::new();
+    s.obs_times = Vec::new();
+    s.observations = Vec::new();
+    s.obs_cmts = Vec::new();
+    s.cens = Vec::new();
+    s
+}
+
+/// Nothing to integrate *over*: one observation at the integration start.
+fn one_obs_at_zero_subject() -> Subject {
+    let mut s = subject("one", 1.0);
+    s.doses = Vec::new();
+    s.obs_times = vec![0.0];
+    s.observations = vec![1.0];
+    s.obs_cmts = vec![1];
+    s.cens = vec![0];
+    s
+}
+
+/// Counters collected while `f` runs, through the ordinary thread-local scope production
+/// uses (`api::fit`), not through `ode_predictions_with_solver_stats` — which has no
+/// production caller and so could be "fixed" without reaching a user.
+fn stats_of<R>(f: impl FnOnce() -> R) -> (OdeSolverStats, R) {
+    let scope = crate::ode::solver::SolverStatsScope::enter();
+    let out = f();
+    (scope.collected(), out)
+}
+
+fn static_walk(subj: &Subject) -> (OdeSolverStats, Vec<f64>) {
+    let model = two_state_model(1.0);
+    let ode = model.ode_spec.as_ref().expect("ode model");
+    let theta = &model.default_params.theta;
+    let pk = [1.0, 10.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+    stats_of(|| crate::ode::ode_predictions(ode, &pk, theta, &[0.0], subj))
+}
+
+/// T1 — the three-way straddle on the **static dense** walk
+/// (`ode_predictions` → `ode_predictions_with_extra_breaks_and_stats`).
+///
+/// The straddle is the assertion: an abandoned walk and a walk with nothing to do are
+/// different states of the world, so a counter that cannot separate them is not reporting
+/// the first one. All three arms are checked in one test because pinning only the abandoned
+/// arm would pass just as well on a counter that fires on every subject.
+///
+/// Mutation (run): delete the `record_abandoned_non_finite_timeline()` call in
+/// `ode_predictions_with_extra_breaks_and_stats` → the abandoned arm reads 0 and the first
+/// assert fires, naming the static walk. T2 stays green under it.
+#[test]
+fn the_static_walk_separates_an_abandoned_timeline_from_nothing_to_integrate() {
+    let (abandoned, preds) = static_walk(&nan_dose_time_subject("bad"));
+    assert!(
+        preds.iter().all(|p| p.is_nan()),
+        "static walk: the fixture must actually be abandoned (NaN predictions), got {preds:?}"
+    );
+    assert_eq!(
+        abandoned.abandoned_non_finite_timeline, 1,
+        "static walk: a non-finite timeline must be recorded as abandoned, not left \
+         indistinguishable from a subject with nothing to integrate — got {abandoned:?}"
+    );
+    assert_eq!(
+        abandoned.attempted_steps, 0,
+        "static walk: nothing was integrated, so the step counters must stay zero — that is \
+         the whole reason this counter has to exist: {abandoned:?}"
+    );
+
+    let (empty, preds) = static_walk(&no_records_subject());
+    assert!(preds.is_empty(), "no-records fixture returned {preds:?}");
+    assert_eq!(
+        empty.abandoned_non_finite_timeline, 0,
+        "static walk: a subject with no records was not abandoned — its timeline is orderable, \
+         there is simply nothing on it: {empty:?}"
+    );
+
+    let (at_zero, preds) = static_walk(&one_obs_at_zero_subject());
+    assert_eq!(preds.len(), 1, "one-obs fixture returned {preds:?}");
+    assert!(
+        preds[0].is_finite(),
+        "one-obs fixture must be a finite reading of the initial state, got {preds:?}"
+    );
+    assert_eq!(
+        at_zero.abandoned_non_finite_timeline, 0,
+        "static walk: a single observation at t=0 was not abandoned: {at_zero:?}"
+    );
+}
+
+/// T2 — the same straddle on the **event-driven** walk (`ode_predictions_event_driven`), the
+/// engine a TV-covariate / lagtime / IOV / reset subject routes to.
+///
+/// Its own site, mutated on its own: a fixture that reaches only the dense engine cannot see
+/// this one, and the two guards return through different code (`(predictions, chz_states)`
+/// there, a bare `predictions` here) with a differently-spelled predicate
+/// (`times_have_non_finite` over `(time, kind, idx)` tuples).
+///
+/// Mutation (run): delete the `record_abandoned_non_finite_timeline()` call in
+/// `ode_predictions_event_driven` → the first assert fires, naming the event-driven walk.
+/// T1 stays green under it.
+#[test]
+fn the_event_driven_walk_separates_an_abandoned_timeline_from_nothing_to_integrate() {
+    let model = two_state_model(1.0);
+    let ode = model.ode_spec.as_ref().expect("ode model");
+    let mut pk = PkParams::default();
+    pk.values[crate::types::PK_IDX_CL] = 1.0;
+    pk.values[crate::types::PK_IDX_V] = 10.0;
+
+    let run = |subj: &Subject| {
+        let dose_pk = vec![pk; subj.doses.len()];
+        let obs_pk = vec![pk; subj.obs_times.len()];
+        stats_of(|| {
+            crate::ode::ode_predictions_event_driven(
+                ode,
+                subj,
+                &[],
+                &[],
+                &dose_pk,
+                &obs_pk,
+                &[],
+                &[],
+            )
+        })
+    };
+
+    let (abandoned, preds) = run(&nan_dose_time_subject("bad"));
+    assert!(
+        preds.iter().all(|p| p.is_nan()),
+        "event-driven walk: the fixture must actually be abandoned, got {preds:?}"
+    );
+    assert_eq!(
+        abandoned.abandoned_non_finite_timeline, 1,
+        "event-driven walk: a non-finite timeline must be recorded as abandoned here too — \
+         this engine has its own guard and its own return, and a fixture that reaches only \
+         the dense engine cannot see it: {abandoned:?}"
+    );
+    assert_eq!(
+        abandoned.attempted_steps, 0,
+        "event-driven walk: nothing was integrated, so the step counters must stay zero: \
+         {abandoned:?}"
+    );
+
+    let (empty, preds) = run(&no_records_subject());
+    assert!(preds.is_empty(), "no-records fixture returned {preds:?}");
+    assert_eq!(
+        empty.abandoned_non_finite_timeline, 0,
+        "event-driven walk: a subject with no records was not abandoned: {empty:?}"
+    );
+
+    let (at_zero, preds) = run(&one_obs_at_zero_subject());
+    assert_eq!(preds.len(), 1, "one-obs fixture returned {preds:?}");
+    assert!(
+        preds[0].is_finite(),
+        "one-obs fixture must be a finite reading of the initial state, got {preds:?}"
+    );
+    assert_eq!(
+        at_zero.abandoned_non_finite_timeline, 0,
+        "event-driven walk: a single observation at t=0 was not abandoned: {at_zero:?}"
+    );
+}
+
+/// T3 — the four counters that describe a segment which *started* must stay zero on an
+/// abandoned walk, because no segment did.
+///
+/// This is the check that the new counter is being set by the guard and not fed from
+/// something else: `abandoned_non_finite_timeline == 1` alone is satisfied by any expression
+/// that happens to equal 1 here.
+///
+/// Mutation (run): set the field from `unfinished_segments` (`acc.abandoned_non_finite_timeline
+/// += 1` → `= acc.unfinished_segments + 1`, or record inside the driver instead of the guard)
+/// → either the count or one of the four controls moves and this fires.
+#[test]
+fn an_abandoned_walk_leaves_every_started_segment_counter_at_zero() {
+    let (stats, _) = static_walk(&nan_dose_time_subject("bad"));
+    assert_eq!(stats.abandoned_non_finite_timeline, 1, "{stats:?}");
+    // All four describe a segment that began. None can fire on a walk that never called a
+    // driver, so a non-zero value here means the counter above is coming from somewhere else.
+    assert_eq!(stats.unfinished_segments, 0, "{stats:?}");
+    assert_eq!(stats.stiff_aborted_segments, 0, "{stats:?}");
+    assert_eq!(stats.discarded_clamped_steps, 0, "{stats:?}");
+    assert_eq!(stats.discarded_unfinished_segments, 0, "{stats:?}");
+}
+
+/// T4 — the wiring, end to end. `fit()` on a population carrying one `NaN`-dose-time subject
+/// must come back *saying so*.
+///
+/// Measured at `cf32e1fd`, before this change: `ofv = NaN`, five warnings, and the only
+/// substantive two were about EPS shrinkage and IWRES autocorrelation. `ode_solver` was
+/// `None`. Nothing named the subject, the timeline, or `NaN`.
+///
+/// Mutation (run): drop `|| abandoned > 0` from `unclean` in `ode_solver_diagnostics_warning`
+/// → the warning is `None` again and the first assert fires.
+#[test]
+fn a_fit_over_an_unorderable_timeline_says_so() {
+    let model = two_state_model(1.0);
+    let pop = Population {
+        subjects: vec![nan_dose_time_subject("bad"), subject("2", 1.2)],
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    };
+    // The premise: nothing upstream rejects this population, so the diagnostic is the only
+    // thing that can report it (#1286 checks dose attributes, not record times).
+    assert!(
+        crate::api::validation::check_model_data(&model, &pop).is_empty(),
+        "the fixture must reach the engines — if a data check now rejects it, this test is \
+         pinning the wrong path"
+    );
+
+    let result = fit(&model, &pop, &model.default_params, &one_iteration_opts()).expect("fit");
+    let entry = ode_solver_entry(&result)
+        .expect("a fit whose predictions are NaN by construction must carry an ode_solver warning");
+    let abandoned = entry.details.as_ref().unwrap()["abandoned_non_finite_timeline"]
+        .as_u64()
+        .unwrap();
+    // Exactly three, not `> 0`, and the difference is the point. Measured inside the fit's own
+    // `SolverStatsScope`: the one bad subject is abandoned **three times** in the post-fit
+    // sweep — twice at `ode_predictions_with_extra_breaks_and_stats` and once at
+    // `ode_predictions_with_states`. A `> 0` assertion is therefore satisfied by either site
+    // alone, so deleting either recorder would leave this test green (the redundant-gate hole);
+    // pinning the count makes each site load-bearing here too, and it is the measurement behind
+    // the message's "counts walks, not subjects" clause.
+    assert_eq!(
+        abandoned, 3,
+        "one NaN-timeline subject is abandoned once per prediction walk the post-fit sweep \
+         makes over it — measured as 3 (ode_predictions ×2, ode_predictions_with_states ×1). \
+         A different number means the sweep changed which engines it drives, or a recorder \
+         was dropped: {entry:?}"
+    );
+    assert!(
+        entry
+            .message
+            .contains(&format!("{abandoned} solver walk(s)")),
+        "the message must name the count, not only the details payload: {}",
+        entry.message
+    );
+    assert!(
+        entry.message.contains("could not be ordered"),
+        "the message must say what happened: {}",
+        entry.message
+    );
+    assert_eq!(
+        entry.severity,
+        WarningSeverity::Warning,
+        "NaN predictions are not an informational note: {entry:?}"
+    );
+    // The controls again, through the real fit rather than a hand-built stats block.
+    let d = entry.details.as_ref().unwrap();
+    for key in [
+        "unfinished_segments",
+        "stiff_aborted_segments",
+        "discarded_clamped_steps",
+        "discarded_unfinished_segments",
+    ] {
+        assert_eq!(
+            d[key].as_u64().unwrap(),
+            0,
+            "{key} must stay zero on an abandoned walk: {entry:?}"
+        );
+    }
+    assert!(
+        result.warnings.iter().any(|w| w.contains("W_ODE_SOLVER_")),
+        "the plain-text warnings must carry it too: {:?}",
+        result.warnings
+    );
+}

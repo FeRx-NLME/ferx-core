@@ -642,6 +642,36 @@ pub struct OdeSolverStats {
     /// Of [`unfinished_segments`](Self::unfinished_segments), the attempts discarded by the
     /// `auto` escalation guard before it re-solved the segment explicitly.
     pub discarded_unfinished_segments: usize,
+    /// Engine walks abandoned **before integrating** because their timeline could not be
+    /// ordered — a `NaN`/`inf` dose time, lagtime, route lag or infusion duration
+    /// (`ode::predictions::timeline_has_non_finite`, #1189).
+    ///
+    /// The odd one out, and deliberately: every other counter here reports work that *happened*,
+    /// so an abandoned walk leaves all of them at zero. That reading is not distinguishable from
+    /// a subject there was nothing to integrate for — measured on one model in a
+    /// `SolverStatsScope`, a normal subject read `attempted/accepted/rejected = 7/7/0` while a
+    /// non-finite timeline, a subject with no records, and a subject with a single observation at
+    /// `t = 0` all read `0/0/0`, returning `[NaN, NaN, NaN, NaN]`, `[]` and `[0.0]` respectively
+    /// (#1234). This counter is what separates the first of those three from the other two.
+    ///
+    /// Counted **once per abandoned walk**, not per subject and not per segment — the honest
+    /// count of trajectories that were never integrated. A post-fit sweep drives more than one
+    /// engine over the same subject, so one bad subject contributes more than one: measured at
+    /// **3** on a plain two-subject FOCEI fit (`ode_predictions` twice,
+    /// `ode_predictions_with_states` once). Zero on every well-formed fit, so any non-zero value
+    /// means some subject's predictions are `NaN` by construction.
+    ///
+    /// Recorded on all eight `f64` engine sites — the four dense / event-driven prediction
+    /// walks, the adaptive driver and its frozen replay, the EKF walk, and
+    /// `ode_solve_until_chz_threshold`'s event-time solve, which is not a prediction walk but is
+    /// abandoned for the same reason and would otherwise be the one silent hole. The two
+    /// analytic-sensitivity walks
+    /// (`sens::ode_provider`) carry the same guard but deliberately do **not** bump it: their
+    /// sweep is collected in its own scope from which `fit_inner` copies exactly one field
+    /// ([`auto_stiff_rejected_jets`](Self::auto_stiff_rejected_jets)), so a gradient-solve event
+    /// deposited here would either be discarded or — if that copy were widened — fire a warning
+    /// clause about predictions.
+    pub abandoned_non_finite_timeline: usize,
 }
 
 impl OdeSolverStats {
@@ -682,6 +712,7 @@ impl OdeSolverStats {
             stiff_aborted_segments,
             discarded_clamped_steps,
             discarded_unfinished_segments,
+            abandoned_non_finite_timeline,
         } = *other;
         self.attempted_steps += attempted_steps;
         self.accepted_steps += accepted_steps;
@@ -697,6 +728,7 @@ impl OdeSolverStats {
         self.stiff_aborted_segments += stiff_aborted_segments;
         self.discarded_clamped_steps += discarded_clamped_steps;
         self.discarded_unfinished_segments += discarded_unfinished_segments;
+        self.abandoned_non_finite_timeline += abandoned_non_finite_timeline;
     }
 
     /// Record an attempt that produced no usable step at `min_dt` (a singular Rosenbrock
@@ -1785,6 +1817,27 @@ fn record_to_stats_sink(stats: &OdeSolverStats) {
     STATS_SINK.with(|c| {
         if let Some(mut acc) = c.get() {
             acc.merge(stats);
+            c.set(Some(acc));
+        }
+    });
+}
+
+/// Note that a prediction walk was abandoned before integrating, because its timeline could
+/// not be ordered ([`OdeSolverStats::abandoned_non_finite_timeline`], #1234).
+///
+/// Bumps the active [`SolverStatsScope`] **directly** rather than merging a local
+/// `OdeSolverStats`, because the ordinary route into the sink is the tee inside
+/// [`integrate_resolved_g`] and this event is precisely the one where no integration is ever
+/// reached: the guard returns before a driver is called, so nothing would arrive there and the
+/// scope would read `0/0/0` — identical to a subject with no records at all.
+///
+/// Off the diagnostic path this is one `Cell` read, taken only inside a guard that has already
+/// fired on a subject whose predictions are `NaN` regardless.
+#[inline]
+pub(crate) fn record_abandoned_non_finite_timeline() {
+    STATS_SINK.with(|c| {
+        if let Some(mut acc) = c.get() {
+            acc.abandoned_non_finite_timeline += 1;
             c.set(Some(acc));
         }
     });

@@ -650,8 +650,9 @@ warning (see [Warnings](../warnings.qmd#warning-codes)). It fires when a step cl
 minimum
 step size, when a returned segment stopped before its requested end, when an `auto` escalation
 had to be discarded and re-solved explicitly, when that explicit fallback also failed, when an
-escalation was discarded because its derivatives overflowed, or when `ode_stiff_abort_after`
-cut a segment short — and, at `Info` severity, when `auto` escalated
+escalation was discarded because its derivatives overflowed, when `ode_stiff_abort_after`
+cut a segment short, or when a walk was abandoned *before integrating* because the subject's
+timeline could not be ordered — and, at `Info` severity, when `auto` escalated
 and everything worked, so an escalation is never invisible. Either way it says how many
 segments changed stepper part-way through, because that changes how the step counts above it
 read: the steps before a switch were taken by a different method than the ones after it. Clamps taken inside an escalation
@@ -661,6 +662,16 @@ most actionable line ferx prints about the solver: the probe was right that the 
 stiff and wrong about which stiff method could integrate it, which is the case for naming
 `ode_method = rodas5p` (or `rosenbrock23`) by hand. The counters ride along in the warning's
 `details` payload.
+
+The abandoned-walk case is the odd one out, and has its own counter
+(`abandoned_non_finite_timeline`) for that reason. A `NaN` or infinite dose time, lagtime,
+route lag or infusion duration makes the timeline unsortable, so ferx returns `NaN`
+predictions for that subject rather than silently dropping the offending dose and reporting
+the remaining, drug-free trajectory as valid. Nothing is integrated, so such a subject
+contributes nothing to any other counter in the payload — which, before this counter existed,
+read exactly like a subject there was nothing to integrate for. It is not an `ode_method`
+problem and no solver setting fixes it: check the dose records, and any exponential covariate
+model on `ALAG` / `F` / `D` / `R` that can overflow at typical covariate values.
 
 #### When the derivatives overflow but the predictions do not
 

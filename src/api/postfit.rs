@@ -1860,9 +1860,11 @@ pub(crate) fn sweep_sensitivity_solver_stats(
 /// Two severities, because the two things being reported are not the same kind of event:
 ///
 /// * **Warning** — a step clamped at `min_dt`, an escalation was discarded, its explicit
-///   fallback also failed, a segment ended before its requested horizon, or a segment was cut
-///   short by `ode_stiff_abort_after`. Each means part of some subject's trajectory was
-///   freeze-padded or re-solved, i.e. the integration was not clean.
+///   fallback also failed, a segment ended before its requested horizon, a segment was cut
+///   short by `ode_stiff_abort_after`, or a walk was abandoned before integrating because its
+///   timeline could not be ordered (#1234). Each means part of some subject's trajectory was
+///   freeze-padded, re-solved, or — in the last case — never produced at all, i.e. the
+///   integration was not clean.
 /// * **Info** — `auto` escalated and everything worked. Routine on a stiff model (the TMDD
 ///   `cr` testdata escalates 240 of 580 segments) and not a problem, but it *is* a decision
 ///   the user never asked for and could not otherwise see.
@@ -1919,6 +1921,15 @@ pub(crate) fn ode_solver_diagnostics_warning(
     // *steps*, so it cannot collide with a segment count the same way; its own segment-level
     // overlap is described in the wording below.)
     let unfinished_other = unfinished_kept.saturating_sub(aborted);
+    // Walks abandoned before a driver was ever called, because the timeline could not be
+    // ordered (#1189, counted since #1234). Disjoint from every counter above by construction:
+    // those all describe a segment that *started*, and here none did — which is exactly why it
+    // needs its own clause. Without it this is the one damaged outcome that leaves the whole
+    // stats block at zero and so reads identical to a subject there was nothing to integrate
+    // for. It is not part of the `unfinished_kept` roll-up either — an abandoned walk has no
+    // segments at all, so folding it in would report it as a segment that started and stopped,
+    // which is a different (and less alarming) failure than the one that happened.
+    let abandoned = stats.abandoned_non_finite_timeline;
     let escalated = stats.auto_stiff_segments;
     // Segments whose stepper changed part-way through (#1080 Part C). Reported as a clause on
     // the escalation note rather than as a warning of its own: a mid-segment switch is `auto`
@@ -1952,7 +1963,8 @@ pub(crate) fn ode_solver_diagnostics_warning(
         || rejected_jets > 0
         || fallback_failed > 0
         || unfinished_kept > 0
-        || aborted > 0;
+        || aborted > 0
+        || abandoned > 0;
     if !unclean && escalated == 0 {
         return None;
     }
@@ -1976,6 +1988,7 @@ pub(crate) fn ode_solver_diagnostics_warning(
         "discarded_unfinished_segments": stats.discarded_unfinished_segments,
         "kept_unfinished_segments": unfinished_kept,
         "stiff_aborted_segments": aborted,
+        "abandoned_non_finite_timeline": abandoned,
     }));
 
     if !unclean {
@@ -1999,6 +2012,22 @@ pub(crate) fn ode_solver_diagnostics_warning(
     }
 
     let mut parts: Vec<String> = Vec::new();
+    // First, because it is the only clause here that reports predictions which are `NaN` rather
+    // than merely inaccurate: every other outcome returns a finite trajectory that was
+    // freeze-padded or re-solved, and this one returns no trajectory at all.
+    if abandoned > 0 {
+        parts.push(format!(
+            "{abandoned} solver walk(s) were abandoned before integrating because the \
+             subject's timeline could not be ordered — a NaN or infinite dose time, lagtime, \
+             route lag, or infusion duration at the final estimates — so those subjects' \
+             predictions are NaN by construction, and they contributed nothing to any other \
+             counter in this payload because nothing was integrated for them. This counts \
+             walks, not subjects: one subject reaches more than one engine in this pass (its \
+             predictions and its [odes] state readout are separate walks), so it contributes \
+             more than one. Check the dose records and any exponential covariate model on ALAG \
+             / F / D / R for a value that overflows at typical covariates"
+        ));
+    }
     if clamped > 0 {
         parts.push(format!(
             "{clamped} step(s) clamped at the minimum step size — the local-error test failed \

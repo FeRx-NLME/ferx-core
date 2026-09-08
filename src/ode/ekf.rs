@@ -263,6 +263,7 @@ pub fn solve_ekf(
     // caller's default point, so overwrite it with NaN ipreds rather than returning a
     // finite-looking filter pass built on a timeline that could not be ordered.
     if crate::ode::predictions::timeline_has_non_finite(&break_times) {
+        crate::ode::solver::record_abandoned_non_finite_timeline();
         // `fill`, not a per-field loop: one spelling of the struct, so a field added to
         // `EkfObsPoint` cannot be left at its default here while the others go NaN.
         results.fill(EkfObsPoint {

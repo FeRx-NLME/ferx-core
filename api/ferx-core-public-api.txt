@@ -1135,6 +1135,7 @@ pub ferx_core::ode::solver::OdeSolverOptions::stiff_abort_after: core::option::O
 impl core::default::Default for ferx_core::ode::OdeSolverOptions
 pub fn ferx_core::ode::OdeSolverOptions::default() -> Self
 pub struct ferx_core::ode::solver::OdeSolverStats
+pub ferx_core::ode::solver::OdeSolverStats::abandoned_non_finite_timeline: usize
 pub ferx_core::ode::solver::OdeSolverStats::accepted_steps: usize
 pub ferx_core::ode::solver::OdeSolverStats::attempted_steps: usize
 pub ferx_core::ode::solver::OdeSolverStats::auto_fallback_failed: usize
@@ -1203,6 +1204,7 @@ pub ferx_core::ode::OdeSolverOptions::stiff_abort_after: core::option::Option<u3
 impl core::default::Default for ferx_core::ode::OdeSolverOptions
 pub fn ferx_core::ode::OdeSolverOptions::default() -> Self
 pub struct ferx_core::ode::OdeSolverStats
+pub ferx_core::ode::OdeSolverStats::abandoned_non_finite_timeline: usize
 pub ferx_core::ode::OdeSolverStats::accepted_steps: usize
 pub ferx_core::ode::OdeSolverStats::attempted_steps: usize
 pub ferx_core::ode::OdeSolverStats::auto_fallback_failed: usize

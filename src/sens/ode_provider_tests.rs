@@ -10143,3 +10143,286 @@ fn joint_ss_subject(ss: bool) -> Subject {
     s.obs_cmts = vec![2; s.obs_times.len()];
     s
 }
+
+// ── the two non-finite exits of the analytic walks (#1234) ───────────────────
+//
+// `integrate_g` has two failure exits and they answer different questions:
+//
+// * `Some` carrying a non-finite fill — *the walk ran and the subject is diverged.* The
+//   timeline itself could not be ordered, so FD would reproduce the same `NaN` one solve per
+//   perturbation more expensively.
+// * `None` — *the walk declines to answer.* An observation was never captured, so the state it
+//   would report is the zero-initialised placeholder and FD really can do better.
+//
+// `integrate_tvcov_g`, the event-driven twin, returns a bare `Vec<Vec<T>>` with no `None`
+// channel at all and NaN-fills the identical condition — so `Some(non-finite)` is already the
+// cross-walk convention, and collapsing the first exit to `None` would create the asymmetry
+// rather than remove it. The tests below pin each exit separately, with a message naming its
+// own side.
+
+/// A bare-state readout: `obs_cmt = central`, **no `[scaling]` block**. The readout is the
+/// whole point — see `the_scaled_readout_is_what_masked_the_zero_jets` below.
+const BARE_STATE_ODE: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// The same model with the ordinary `y = central / V` readout and η on `V`.
+const SCALED_ODE: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// [`bolus_subject`] whose single dose time is `NaN`. No lagtime and no covariates, so this
+/// routes to the **static** walk (`integrate_g`) — asserted per test with
+/// `ode_tvcov_supported`, not inferred from the fixture's shape.
+fn nan_dose_time_subject(times: &[f64]) -> Subject {
+    let mut s = bolus_subject(times);
+    s.doses = vec![DoseEvent::new(f64::NAN, 100.0, 1, 0.0, false, 0.0)];
+    s
+}
+
+/// T5 — the **static** walk's non-finite exit, asserted on the **jets**.
+///
+/// `is_finite()` on the value is the wrong assertion here and would pass either way: the value
+/// is `NaN` on both sides of every change this test could see. The guard's comment used to
+/// promise non-finite *derivatives* as well, which it never delivered — `T::from_f64(NAN)` lifts
+/// a constant, so `Dual1<1>` comes back `value = NaN, grad = [0.0]` and `PkNum::jets_finite()` is
+/// `true`. #1234 corrected the comment to say that; this test is what holds it to it.
+///
+/// So this pins the measured asymmetry rather than an aspiration: `f` is `NaN` and `∂f/∂η` is
+/// a **finite zero**. That is a real gap — a subject the walk knows is diverged handing FOCEI a
+/// gradient that claims to be fine — but repairing it is a behaviour change, not a comment fix:
+/// measured on a 2-subject FOCEI fit with one such subject, filling real NaN jets moves `ofv`
+/// from `NaN` to `2e20`, the outer iteration count from 4 to 12, `converged` from `true` to
+/// `false`, and the *healthy* subject's η̂ from 1.000846558216595 to 0.8822190053957163. It is
+/// tracked as the #1234 follow-up, and **this assertion is what makes that fix visible**: it
+/// goes red the moment the fill delivers non-finite jets (verified by applying that repair).
+///
+/// Mutation (run): delete `integrate_g`'s `timeline_has_non_finite` guard → the `NaN` dose
+/// never matches a break, is never applied, and the walk returns a finite drug-free `f`; the
+/// first assert fires naming the static walk. T7 stays green under it.
+#[test]
+fn the_static_walk_returns_a_non_finite_value_with_finite_zero_jets() {
+    let m = parse_model_string(BARE_STATE_ODE).expect("parse");
+    let s = nan_dose_time_subject(&[1.0, 2.0, 4.0, 8.0]);
+    // Which engine this fixture runs on, asserted rather than inferred: the same dispatch
+    // `ode_subject_sensitivities` uses. Without it a fixture that quietly started routing to the
+    // event-driven walk would test T7's site twice and leave this one uncovered.
+    assert!(
+        !ode_tvcov_supported(&m, &s),
+        "this fixture must run on the STATIC walk (integrate_g); it is routing to the \
+         event-driven one, so it is testing T7's guard rather than this one"
+    );
+    let sens = ode_subject_sensitivities(&m, &s, &[1.0, 10.0], &[0.0])
+        .expect("the static walk answers Some for a diverged subject — it does not decline");
+
+    for (j, o) in sens.obs.iter().enumerate() {
+        assert!(
+            o.f.is_nan(),
+            "static walk, obs {j}: a subject whose timeline could not be ordered came back \
+             with a finite value ({}), which means the NaN-timed dose was silently never \
+             applied and a drug-free trajectory was reported as valid",
+            o.f
+        );
+        // The jets, not the value. Pinned as measured — and known wrong; see the doc above.
+        assert_eq!(
+            o.df_deta,
+            vec![0.0],
+            "static walk, obs {j}: the non-finite fill's ∂f/∂η is a finite zero, not NaN — \
+             `T::from_f64(NAN)` lifts a *constant*. If this is now [NaN] the #1234 follow-up \
+             has landed and this assertion (and the guard's comment) must be inverted"
+        );
+    }
+}
+
+/// T6 — the control that explains why nobody saw T5's gap for so long.
+///
+/// It exists to **not** distinguish. With `y = central / V` and η on `V`, the readout computes
+/// `d(central/V) = (dc·V − c·dV)/V²`, which multiplies the fill's `NaN` value into the jets
+/// *downstream* of the fill — so `df_deta` is `[NaN, NaN]` whatever the fill puts there. Every
+/// fixture written on a scaled model therefore agrees with the "NaN jets" claim by arithmetic,
+/// including `nan_lagtime_sens_walk_is_non_finite_not_a_panic`
+/// (`sens/provider_tests.rs`), which additionally asserts only `o.f`.
+///
+/// Mutation: none. A control that could tell the two fills apart would not be a control — and
+/// that is the assertion: if this ever *starts* distinguishing them, the masking mechanism has
+/// changed and T5's reasoning needs re-deriving.
+#[test]
+fn the_scaled_readout_is_what_masked_the_zero_jets() {
+    let m = parse_model_string(SCALED_ODE).expect("parse");
+    let s = nan_dose_time_subject(&[1.0, 2.0, 4.0, 8.0]);
+    let sens = ode_subject_sensitivities(&m, &s, &[1.0, 10.0], &[0.0, 0.0]).expect("Some");
+
+    for (j, o) in sens.obs.iter().enumerate() {
+        assert!(o.f.is_nan(), "scaled readout, obs {j}: f = {}", o.f);
+        assert!(
+            o.df_deta.iter().all(|d| d.is_nan()),
+            "scaled readout, obs {j}: ∂f/∂η = {:?}. The `/V` readout multiplies the fill's NaN \
+             value into the jets, so this is NaN regardless of what the fill writes — that is \
+             what hid the zero jets T5 pins. If this is no longer NaN, the masking mechanism \
+             changed and T5's premise must be re-measured",
+            o.df_deta
+        );
+    }
+}
+
+/// T7 — the **event-driven** walk's non-finite exit (`integrate_tvcov_g`), its own site,
+/// mutated on its own.
+///
+/// An estimated lagtime routes here and never to `integrate_g`, so a fixture that reaches the
+/// static walk cannot see this guard at all — and this walk's return type has no `None` channel,
+/// so it cannot even spell the other exit. `WT = 1000` gives `LAGTIME = 0.3·exp(1000) = +inf`:
+/// `exp` on an unscaled covariate is how a lag actually goes non-finite at typical values, and
+/// `+inf` (rather than `NaN`) is the shape where dropping the guard is *silently* wrong — the
+/// event sorts to the end and is simply never reached, returning a finite drug-free gradient.
+///
+/// Mutation (run): delete `integrate_tvcov_g`'s `times_have_non_finite` guard → finite `f` and
+/// the first assert fires naming the event-driven walk. T5 stays green under it.
+#[test]
+fn the_event_driven_walk_returns_a_non_finite_value_with_finite_zero_jets() {
+    const BARE_STATE_LAG_ODE: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  theta TVLAG(0.3, 0.0, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  LAGTIME = TVLAG * exp(WT)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+    let m = parse_model_string(BARE_STATE_LAG_ODE).expect("parse");
+    let times: Vec<f64> = (1..=8).map(|i| i as f64).collect();
+    let mut s = bolus_subject(&times);
+    s.doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(4.5, 100.0, 1, 0.0, false, 0.0),
+    ];
+    s.covariates.insert("WT".to_string(), 1000.0);
+    // The mirror of T5's routing assertion, and the reason the two are separable at all.
+    assert!(
+        ode_tvcov_supported(&m, &s),
+        "this fixture must run on the EVENT-DRIVEN walk (integrate_tvcov_g); it is routing to \
+         the static one, so it is testing T5's guard rather than this one"
+    );
+
+    let sens = ode_subject_sensitivities(&m, &s, &[1.0, 10.0, 0.3], &[0.0]).expect(
+        "the event-driven walk itself has no None channel (it returns a bare Vec), so a None \
+         here is the dispatch above it declining — not this guard, and this fixture is then \
+         testing nothing",
+    );
+
+    for (j, o) in sens.obs.iter().enumerate() {
+        assert!(
+            o.f.is_nan(),
+            "event-driven walk, obs {j}: an +inf-lagged subject came back finite ({}) — the \
+             lagged doses sorted to the end of the timeline, were never applied, and a \
+             drug-free trajectory was reported as a valid gradient",
+            o.f
+        );
+        assert_eq!(
+            o.df_deta,
+            vec![0.0],
+            "event-driven walk, obs {j}: the fill's ∂f/∂η is a finite zero here too, for the \
+             same reason as the static twin. If this is now [NaN] the #1234 follow-up has \
+             landed and both arms must be inverted together"
+        );
+    }
+}
+
+/// T8 — the discriminator: which exit answers which question, and what the caller does with
+/// the answer.
+///
+/// `integrate_g` has two failure exits and swapping either for the other is silent:
+///
+/// * a non-finite `Some` means *the walk ran and the subject is diverged*. FD cannot improve
+///   on it — the timeline is unorderable at any perturbation — so declining here would spend
+///   `N+1` solves reproducing a `NaN` the model guarantees, and would report the subject under
+///   an "outside the analytic provider's scope" warning whose remedy has nothing to do with
+///   its actual problem.
+/// * `None` (the `recorded` check at the end of that function) means *the walk declines to
+///   answer*: an observation was never captured, so its state would be the zero-initialised
+///   placeholder and FD really can do better.
+///
+/// **The `None` half is a defensive backstop with no reachable fixture from this entry point
+/// today**, and that was measured, not assumed: nine shapes aimed at it — an observation below
+/// the timeline floor, an all-negative observation grid, observations `5e-13` after the
+/// integration start and after a dose, duplicate and `1e-16`-apart observation times, a single
+/// observation at `t = 0`, observations entirely before the first dose, and no doses at all —
+/// every one returns `Some`. `subject_integration_start` (#573) is why the doc-comment's own
+/// example no longer reaches it: a negative observation time *becomes* the first break rather
+/// than falling below it. So this test pins the reachable half and the contract it buys.
+///
+/// Two assertions, and they are not redundant: the first is about what the provider returns,
+/// the second about how `fd_fallback_warning` reads it. A change to either side fires its own.
+///
+/// Mutation (run): return `None` from `integrate_g`'s `timeline_has_non_finite` guard → the
+/// DIVERGED assertion fires. The FD-ACCOUNTING one was checked *separately* under the same
+/// mutation, with DIVERGED temporarily made non-panicking, and fires on its own — otherwise
+/// "they are not redundant" would be a claim about a line that never ran.
+#[test]
+fn a_diverged_subject_answers_some_rather_than_declining_to_fd() {
+    let m = parse_model_string(BARE_STATE_ODE).expect("parse");
+    let s = nan_dose_time_subject(&[1.0, 2.0, 4.0]);
+    let theta = [1.0, 10.0];
+
+    let sens = ode_subject_sensitivities(&m, &s, &theta, &[0.0]).expect(
+        "DIVERGED: a subject whose timeline could not be ordered must answer `Some` carrying a \
+         non-finite fill, not decline. FD would reproduce the same NaN one solve per \
+         perturbation more expensively, and `integrate_tvcov_g` — the event-driven twin that \
+         an estimated lagtime routes to — returns a bare Vec with no `None` channel at all, so \
+         `None` here would create the cross-walk asymmetry rather than remove one",
+    );
+    assert!(
+        sens.obs.iter().all(|o| o.f.is_nan()),
+        "DIVERGED: the `Some` must carry the non-finite fill, or it is a *wrong* answer rather \
+         than a diverged one: {:?}",
+        sens.obs.iter().map(|o| o.f).collect::<Vec<_>>()
+    );
+
+    // What the discriminator buys, at the caller. `fd_fallback_warning` counts a subject as FD
+    // **iff** this returns `None`, and reports it under "outside the analytic provider's scope
+    // … their results are correct but slower" — a sentence that would be doubly wrong here:
+    // the subject is not out of scope, and its results are not correct.
+    assert!(
+        crate::sens::provider::subject_eta_grad(&m, &s, &theta, &[0.0]).is_some(),
+        "FD-ACCOUNTING: a diverged subject must not be counted as a finite-difference \
+         fallback — `fd_fallback_warning` keys on exactly this `is_none()`, so declining here \
+         mislabels an unorderable timeline as an analytic-scope gap"
+    );
+}

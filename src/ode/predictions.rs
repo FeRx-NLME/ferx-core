@@ -3394,6 +3394,7 @@ fn ode_predictions_with_extra_breaks_and_stats(
     // must be repelled, and filling first would hand a pre-start `TENTRY` the seeded state — a
     // scored `H = 0` — on a subject whose integration never happened.
     if timeline_has_non_finite(&break_times) {
+        crate::ode::solver::record_abandoned_non_finite_timeline();
         return (predictions, chz_states);
     }
 
@@ -4437,6 +4438,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // before the #700 exact-bit guards below, whose message would otherwise name the
     // wrong cause for a `NaN` time.
     if timeline_has_non_finite(&break_times) {
+        crate::ode::solver::record_abandoned_non_finite_timeline();
         return Err(
             "ode_predictions_adaptive: a non-finite break time (NaN/infinite dose lagtime, \
              route lag, or infusion duration) — the subject's timeline cannot be ordered"
@@ -5416,6 +5418,7 @@ fn adaptive_frozen_replay_tv(
     // A non-finite break time makes the subject non-finite (#1189); `predictions` is
     // NaN-prefilled, matching what the driver this verifies now reports as an `Err`.
     if timeline_has_non_finite(&break_times) {
+        crate::ode::solver::record_abandoned_non_finite_timeline();
         return predictions;
     }
     if break_times.len() < 2 {
@@ -6001,6 +6004,7 @@ pub fn ode_predictions_event_driven(
     // still sorts to the end and its event is silently never reached — the same silent
     // drop the dense engines get, reported the same way (`predictions` is NaN-prefilled).
     if times_have_non_finite(timeline.iter().map(|e| e.0)) {
+        crate::ode::solver::record_abandoned_non_finite_timeline();
         return predictions;
     }
 
@@ -6539,6 +6543,7 @@ pub fn ode_predictions_with_states(
     // A non-finite break time makes the subject non-finite (#1189); both outputs are
     // NaN-prefilled, so this returns exactly that.
     if timeline_has_non_finite(&break_times) {
+        crate::ode::solver::record_abandoned_non_finite_timeline();
         return (predictions, states);
     }
 
@@ -7107,6 +7112,7 @@ pub fn ode_dense_solve_states(
     // NaN-prefilled, so the caller's finiteness guard sees a diverged solve rather than
     // a plausible-looking trajectory with the NaN-lagged dose silently missing.
     if timeline_has_non_finite(&break_times) {
+        crate::ode::solver::record_abandoned_non_finite_timeline();
         return result;
     }
 
@@ -7351,6 +7357,7 @@ pub(crate) fn ode_solve_until_chz_threshold(
     // never apply it, and return a finite crossing time — the silent-wrong-number
     // outcome, on the one engine whose typed failure was supposed to make it loud.
     if timeline_has_non_finite(&break_times) {
+        crate::ode::solver::record_abandoned_non_finite_timeline();
         return ThresholdOutcome::SolveFailed("non-finite break time".to_string());
     }
     break_times.retain(|&t| t <= horizon + 1e-15);
