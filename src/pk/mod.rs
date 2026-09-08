@@ -854,6 +854,71 @@ pub(crate) fn reset_row_occasion(subject: &Subject, r: usize) -> Option<u32> {
     best_before.or(earliest).map(|(_, occ)| occ)
 }
 
+/// Fill `out` with one `$PK` snapshot per dose — **the** single spelling of "where the
+/// engine resolves a dose attribute", shared verbatim by
+/// [`compute_event_pk_params_into`] (which passes the arm it has already decided) and by
+/// [`compute_dose_pk_params_into`].
+///
+/// `constant` is `Some(p)` for a parameter-static subject, so a caller that has already
+/// evaluated that snapshot for its *other* event vectors hands it in rather than paying
+/// for a second evaluation. That is not a micro-optimisation: the per-event materializer
+/// runs inside SAEM's MH loop and the FOCE objective, where one extra `$PK` call per
+/// subject per evaluation is a real cost, and it is the reason this takes the snapshot as
+/// an argument instead of re-deciding the arm itself.
+#[inline]
+fn fill_dose_pk_params(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    constant: Option<PkParams>,
+    out: &mut Vec<PkParams>,
+) {
+    out.clear();
+    match constant {
+        Some(p) => out.resize(subject.doses.len(), p),
+        None => {
+            for k in 0..subject.doses.len() {
+                out.push(pk_params_at_time(
+                    model,
+                    theta,
+                    eta,
+                    subject.dose_cov(k),
+                    subject.doses[k].time,
+                ));
+            }
+        }
+    }
+}
+
+/// Just the **dose** snapshots of [`compute_event_pk_params_into`], for a caller that
+/// reads only those: the fit-init dose-attribute check (`E_DOSE_ATTR_NONFINITE`), which
+/// validates lag / `F` / `D{n}` / `R{n}` — quantities the engine resolves at
+/// `pk_at_dose[k]` and nowhere else.
+///
+/// **Identical to `compute_event_pk_params(..).dose` by construction**, not by review: it
+/// takes the same [`subject_needs_per_event_pk`] gate and delegates to the same
+/// [`fill_dose_pk_params`] body. Pinned bit-for-bit on both arms by
+/// `tests::dose_only_snapshots_match_the_full_event_builder`.
+///
+/// It exists for cost. The full builder resolves `$PK` at every record, and a
+/// rich-sampling population is dominated by observations, so routing a doses-only caller
+/// through it pays for snapshots it never reads. Measured on a synthetic 1000 subjects ×
+/// (2 doses + 100 observations) with a time-varying covariate: 2,000 evaluations here
+/// against 102,000 through the full builder — 9.9 ms of `check_model_data` against
+/// 111.7 ms, where the whole check costs 9.0 ms before #1235 widened it (#1235).
+pub(crate) fn compute_dose_pk_params_into(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    out: &mut Vec<PkParams>,
+) {
+    let constant = (!subject_needs_per_event_pk(model, subject))
+        .then(|| (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0));
+    fill_dose_pk_params(model, subject, theta, eta, constant, out);
+}
+
 /// Same as [`compute_event_pk_params`] but writes into a caller-owned
 /// buffer. Used by SAEM's MH loop and the FOCE objective closure where
 /// the buffer is allocated once per subject and reused across many
@@ -884,15 +949,9 @@ pub fn compute_event_pk_params_into(
     out.reset.reserve_exact(subject.reset_times.len());
 
     if subject_needs_per_event_pk(model, subject) {
-        for k in 0..subject.doses.len() {
-            out.dose.push(pk_params_at_time(
-                model,
-                theta,
-                eta,
-                subject.dose_cov(k),
-                subject.doses[k].time,
-            ));
-        }
+        // Shared with `compute_dose_pk_params_into` so the doses-only caller cannot
+        // drift from this one (#1235).
+        fill_dose_pk_params(model, subject, theta, eta, None, &mut out.dose);
         for j in 0..subject.obs_times.len() {
             out.obs.push(pk_params_at_time(
                 model,
@@ -945,9 +1004,9 @@ pub fn compute_event_pk_params_into(
         // `pk_only_covariates` while leaving `pk_only_times` populated, which is
         // exactly the state that makes `subject_needs_per_event_pk` false with
         // `pk_only_times` non-empty.
-        for _ in 0..subject.doses.len() {
-            out.dose.push(p);
-        }
+        // `p` is handed to the shared filler rather than re-derived inside it, so this
+        // hot-loop arm still costs exactly one `$PK` evaluation (#1235).
+        fill_dose_pk_params(model, subject, theta, eta, Some(p), &mut out.dose);
         for _ in 0..subject.obs_times.len() {
             out.obs.push(p);
         }
@@ -2766,6 +2825,128 @@ mod tests {
         p.values[0] = cl;
         p.values[1] = v;
         p
+    }
+
+    // ── the doses-only materializer is the full one's `dose` vector (#1235) ──
+
+    /// `compute_dose_pk_params_into` must be **bit-identical** to
+    /// `compute_event_pk_params(..).dose` — it exists only to skip the observation
+    /// snapshots a doses-only caller never reads, never to answer differently.
+    ///
+    /// Both arms of the gate are exercised, and the subjects below straddle it —
+    /// **asserted, not assumed**, so this cannot silently become a one-arm test.
+    ///
+    /// **What this can and cannot see, measured rather than assumed.** The two callers
+    /// share `fill_dose_pk_params`, so a mutation *inside the shared body* moves both
+    /// sides of the comparison together and a bit-equality test is blind to it by
+    /// construction — the tautological-twin shape. Running the three mutations:
+    ///
+    /// | mutation | this test | `tests/typical_value_snapshot_sets.rs` |
+    /// |---|---|---|
+    /// | shared body reads `&subject.covariates` | **dies** — on the `assert_ne!` below, not the bit compare | arm A + both `D`/`R` arms |
+    /// | shared body reads `0.0` for the time | **survives** — a true tautology on that axis | arm B |
+    /// | the two callers diverge (doses-only always freezes) | **dies** | arms A, B + both `D`/`R` |
+    ///
+    /// So the `assert_ne!` non-degeneracy check is not decoration: it is the only reason
+    /// row 1 is visible here at all. And row 2 is the honest limit — the time axis is
+    /// covered by arm B, not by this test. This is not the sole guard against row 3
+    /// either; it is the Tier-1 statement of the contract at the code's own site, where
+    /// `cargo test --lib` reaches it.
+    #[test]
+    fn dose_only_snapshots_match_the_full_event_builder() {
+        let src = r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL) * (WT/70)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let model = crate::parser::model_parser::parse_full_model(src)
+            .expect("the parity fixture parses")
+            .model;
+        let theta = model.default_params.theta.clone();
+        let eta = vec![0.1_f64; model.n_eta + model.n_kappa];
+
+        let base = |doses: Vec<DoseEvent>| Subject {
+            id: "1".into(),
+            doses,
+            obs_times: vec![1.0, 4.0, 26.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![1.0; 3],
+            obs_cmts: vec![1; 3],
+            covariates: HashMap::from([("WT".to_string(), 70.0)]),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
+            cens: vec![0; 3],
+            occasions: Vec::new(),
+            obs_l2: Vec::new(),
+            dose_occasions: Vec::new(),
+            reset_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: Vec::new(),
+        };
+
+        let static_subject = base(vec![bolus_dose(0.0, 100.0), bolus_dose(24.0, 100.0)]);
+        let mut tv_subject = base(vec![bolus_dose(0.0, 100.0), bolus_dose(24.0, 100.0)]);
+        tv_subject.dose_covariates = vec![
+            HashMap::from([("WT".to_string(), 70.0)]),
+            HashMap::from([("WT".to_string(), 95.0)]),
+        ];
+        tv_subject.obs_covariates = vec![
+            HashMap::from([("WT".to_string(), 70.0)]),
+            HashMap::from([("WT".to_string(), 70.0)]),
+            HashMap::from([("WT".to_string(), 95.0)]),
+        ];
+
+        // The straddle itself: without it a later change to the gate could quietly put
+        // both subjects on one arm and this would still pass.
+        assert!(
+            !subject_needs_per_event_pk(&model, &static_subject),
+            "the static subject must take the constant arm"
+        );
+        assert!(
+            subject_needs_per_event_pk(&model, &tv_subject),
+            "the TV-covariate subject must take the per-event arm"
+        );
+
+        let mut doses_only = Vec::new();
+        for (arm, subject) in [("static", &static_subject), ("per-event", &tv_subject)] {
+            let full = compute_event_pk_params(&model, subject, &theta, &eta);
+            compute_dose_pk_params_into(&model, subject, &theta, &eta, &mut doses_only);
+            assert_eq!(
+                doses_only.len(),
+                full.dose.len(),
+                "{arm} arm: dose snapshot count must match the full builder"
+            );
+            for (k, (a, b)) in doses_only.iter().zip(full.dose.iter()).enumerate() {
+                assert_eq!(
+                    a.values.map(f64::to_bits),
+                    b.values.map(f64::to_bits),
+                    "{arm} arm: dose {k} snapshot differs from the full builder's"
+                );
+            }
+        }
+
+        // Non-degeneracy: on the per-event arm the two doses must actually *differ*,
+        // or every bit comparison above is satisfied by a builder that froze the
+        // snapshot — the exact defect #1235 is about.
+        compute_dose_pk_params_into(&model, &tv_subject, &theta, &eta, &mut doses_only);
+        assert_ne!(
+            doses_only[0].values.map(f64::to_bits),
+            doses_only[1].values.map(f64::to_bits),
+            "the per-event fixture must resolve different params at its two doses"
+        );
     }
 
     // ── analytical [initial_conditions] (issue #521) ──

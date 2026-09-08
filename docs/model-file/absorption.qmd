@@ -90,11 +90,18 @@ delivers the mass.
 
 The domain is `mtt > 0` and `n ≥ 0`. It is enforced in two places:
 
-- **Typical values** (η = 0, per subject, so covariate relationships are
-  included) are validated at fit time. A non-finite or out-of-domain typical
-  value is rejected with `E_ABSORPTION_DOMAIN` — a clear error, not an opaque
-  `NaN` fit failure. Constrain the parameter so it stays in range, e.g.
-  `MTT = TVMTT * exp(ETA_MTT)` keeps `MTT > 0`.
+- **Typical values** (η = κ = 0) are validated at fit time, at **every dose,
+  observation and EVID=2 record's own snapshot** — that record's covariate values
+  and its `TIME` — because the engine rebuilds this forcing per segment from the
+  last event's snapshot, so a parameter that only leaves the domain at a later
+  observation is one it really does apply
+  ([#1235](https://github.com/FeRx-NLME/ferx-core/issues/1235)). EVID=3/4 **reset**
+  rows are not in that set: the segment ending at a reset is discarded by the
+  re-seed, so a value reached only there is never applied and is not rejected. A
+  non-finite or out-of-domain typical value is rejected with
+  `E_ABSORPTION_DOMAIN` — a clear error, not an opaque `NaN` fit failure — and
+  the message names the record. Constrain the parameter so it stays in range,
+  e.g. `MTT = TVMTT * exp(ETA_MTT)` keeps `MTT > 0`.
 - **Transient mid-fit excursions** are clamped. With an additive
   parameterisation (`MTT = TVMTT + ETA_MTT`), the inner EBE search or a
   finite-difference step can momentarily push `mtt ≤ 0` / `n < 0` even though the
@@ -490,8 +497,9 @@ convention:
 - **Bioavailability `F`, lagtime, multiple-dose superposition, and IOV** behave
   exactly as for `transit`. Do not multiply `igd(...)` by `F`.
 - **Parameter domains** `mat > 0`, `cv2 > 0` are validated at typical values
-  (`E_ABSORPTION_DOMAIN`) and clamped for transient mid-fit excursions — a
-  log-normal parameterisation avoids excursions and is recommended.
+  (`E_ABSORPTION_DOMAIN`), at **every dose, observation and EVID=2 record's own
+  snapshot** exactly as for `transit` above, and clamped for transient mid-fit
+  excursions — a log-normal parameterisation avoids excursions and is recommended.
 - Steady-state (`SS=1`) dosing and an infusion (`RATE>0`) into the input-rate
   compartment are now **supported** (#719 — SS through a periodic-sum `R_in`,
   infusion as a zero-order source feeding the kernel); a `[diffusion]` block
@@ -537,9 +545,13 @@ Rules for the fraction multiplier:
   is rejected — a single pathway is written bare). This *structural* rule is checked
   at **parse time**, so it fires for every entry point. The *value* checks — each
   fraction in `(0, 1]` and the fractions summing to ≈ 1 (`E_ABSORPTION_FRACTION`) —
-  are evaluated at typical values by `fit()` / `ferx check`, and enforced on
-  `predict()` / `simulate()` as well (#588). Two pathways together still deliver
-  exactly `F·Dose` (`∫ Σ FRᵢ·R_inᵢ dt = F·Dose`).
+  are evaluated at typical values by `fit()` / `ferx check`, at **every record's own
+  snapshot** as for the domain checks above, and enforced on `predict()` /
+  `simulate()` as well (#588, #1235). On a compartment that mixes a `zero_order`
+  pathway with a density one the sum is checked at **dose records only**, because
+  that is the one record kind at which the engine reads both fractions — the
+  density's per segment, the zero-order's at dose time. Two pathways together still
+  deliver exactly `F·Dose` (`∫ Σ FRᵢ·R_inᵢ dt = F·Dose`).
 - The same multiplier works for `transit`/`weibull`/`first_order` terms, and on
   `zero_order(...)` as part of a `mixed` model — see
   [Parallel / mixed absorption](#parallel-mixed)
@@ -620,8 +632,9 @@ Add `weibull(...)` to the **central** compartment's ODE, writing the state as an
 - **Bioavailability `F`, lagtime, multiple-dose superposition, and IOV** behave
   exactly as for `transit`. Do not multiply `weibull(...)` by `F`.
 - **Parameter domains** `td > 0`, `beta > 0` are validated at typical values
-  (`E_ABSORPTION_DOMAIN`) and clamped for transient mid-fit excursions — a
-  log-normal parameterisation avoids excursions and is recommended.
+  (`E_ABSORPTION_DOMAIN`), at **every dose, observation and EVID=2 record's own
+  snapshot** exactly as for `transit` above, and clamped for transient mid-fit
+  excursions — a log-normal parameterisation avoids excursions and is recommended.
 - Steady-state (`SS=1`) dosing and an infusion (`RATE>0`) into the input-rate
   compartment are now **supported** (#719 — SS through a periodic-sum `R_in`,
   infusion as a zero-order source feeding the kernel); a `[diffusion]` block
@@ -707,7 +720,13 @@ term (there is no separate `sequential` keyword):
   exactly as for the other input rates (`F` scales the rate `F·Dose/dur`; the
   window stays `dur`). Do not multiply `zero_order(...)` by `F`.
 - **Parameter domain** `dur > 0` is validated at typical values
-  (`E_ABSORPTION_DOMAIN`) and clamped for transient mid-fit excursions.
+  (`E_ABSORPTION_DOMAIN`) and clamped for transient mid-fit excursions. Unlike the
+  density kernels above, `dur` is checked at **each dose's own snapshot and nowhere
+  else**: a zero-order input is a spanning window rather than a pointwise density,
+  so the engine fixes its width, pathway fraction and per-route lag at dose time —
+  which is what makes the delivered mass exact under a time-varying covariate. A
+  `dur` that only leaves the domain at a later observation is therefore never read,
+  and is not rejected.
 - Steady-state (`SS=1`) dosing and an infusion (`RATE>0`) into the input-rate
   compartment are now **supported** (#719 — SS through a periodic-sum `R_in`,
   infusion as a zero-order source feeding the kernel); a `[diffusion]` block
