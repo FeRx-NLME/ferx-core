@@ -71,26 +71,28 @@ pub use types::*;
 #[cfg(feature = "survival")]
 pub use api::{predict_categorical, predict_survival, SurvivalPredictionResult};
 
-/// Positive proof that the `debug_assert!` guards in this crate are LIVE (#344).
+/// Positive proof that the `debug_assert!` guards in this crate are LIVE
+/// (#344, #1248).
 ///
-/// Every other test job builds with `ci-test`/`ci-fast`, both of which
-/// `inherits = "release"`, so all ~180 `debug_assert!`s compile to nothing. The
-/// `Tests (debug-assertions)` job exists to run them, and it does that by simply
-/// omitting `--profile` — the dev default has them on.
+/// `release`, `ci-test` and `ci-fast` all leave `debug-assertions` off, so all ~180
+/// `debug_assert!`s compile to nothing there. `[profile.ci-cov]` turns them on, and
+/// the two per-PR coverage jobs build under it — which both runs the guards and
+/// stops their condition lines being regions that can never execute, the
+/// permanently-missed patch lines of #1248.
 ///
-/// That is an invariant held by *absence*, which is the fragile kind. Nothing in the
-/// command string distinguishes a build with the guards live from one without: a
-/// `[profile.dev] debug-assertions = false` in `Cargo.toml`, or a
-/// `CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false` in the workflow environment, would
-/// neuter the whole job while all 4366 tests, all nine preflight-contract tests and
-/// both `cargo test` commands stayed green. The gate would then be exactly the no-op
-/// it was filed to replace.
+/// That is an invariant held by *absence*, which is the fragile kind. Nothing in a
+/// test result distinguishes a build with the guards live from one without: a
+/// `[profile.ci-cov] debug-assertions = false` in `Cargo.toml`, a
+/// `CARGO_PROFILE_CI_COV_DEBUG_ASSERTIONS=false` in the workflow environment, or a
+/// `--profile` that quietly reverted to `ci-fast` would neuter the whole thing while
+/// all 4366 tests and every preflight-contract test stayed green. The gate would
+/// then be exactly the no-op #344 was filed to replace.
 ///
-/// So the group arms this canary through its own argument vector
-/// (`env FERX_REQUIRE_DEBUG_ASSERTIONS=1 cargo test …`, visible in
-/// `tools/preflight.sh --list` and asserted by
-/// `tests/preflight_owns_the_fast_gates.rs`), and the canary fails the run when the
-/// guards turn out to be dead.
+/// So each caller arms this canary explicitly — `FERX_REQUIRE_DEBUG_ASSERTIONS=1`,
+/// on the coverage steps in `ci.yml` and in the argument vector of
+/// `tools/preflight.sh`'s `debug-assertions` group (visible in `--list`, and
+/// asserted by `tests/preflight_owns_the_fast_gates.rs`) — and the canary fails the
+/// run when the guards turn out to be dead.
 #[cfg(test)]
 #[path = "lib_tests.rs"]
 mod debug_assertion_canary;

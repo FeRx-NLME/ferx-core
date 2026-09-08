@@ -2176,12 +2176,34 @@ fn test_max_scaled_deviation_reports_degenerate_input_as_nan() {
 
     // A length mismatch is a bug, not a shorter comparison: it reports NaN rather
     // than silently comparing the common prefix (which here would read 0.0 —
-    // "still at init" — and hide the real 9.0 deviation). Only exercisable where
-    // the `debug_assert_eq!` guarding the same invariant is compiled out; the
-    // release behaviour is the one that matters, since that is what CI and users
-    // run.
-    #[cfg(not(debug_assertions))]
-    assert!(max_scaled_deviation(&[1.0, 10.0], &[1.0]).is_nan());
+    // "still at init" — and hide the real 9.0 deviation).
+    //
+    // Both behaviours are correct and which one you get is a property of the
+    // profile: the `debug_assert_eq!` guarding the same invariant fires where it is
+    // live, and the NaN fallback is what a release build (and a user) gets. This
+    // was `#[cfg(not(debug_assertions))]` until #1248 pointed the coverage jobs at
+    // `ci-cov`, where the guards ARE live — a cfg-gated assertion does not fail
+    // there, it silently stops existing in the only jobs that ran it
+    // (`outer_optimizer.rs:692` went from 1 hit to 0). Assert whichever the current
+    // build promises instead.
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let mismatched = std::panic::catch_unwind(|| max_scaled_deviation(&[1.0, 10.0], &[1.0]));
+    std::panic::set_hook(prev);
+    if cfg!(debug_assertions) {
+        assert!(
+            mismatched.is_err(),
+            "the `debug_assert_eq!` on the length invariant did not fire, even \
+             though this build has debug-assertions on"
+        );
+    } else {
+        assert!(
+            mismatched
+                .expect("no guard in a release-derived build")
+                .is_nan(),
+            "a length mismatch must report NaN once the guard is compiled out"
+        );
+    }
 }
 
 /// Regression test for the original issue #55 symptom: SLSQP optimizing

@@ -69,13 +69,17 @@ ALL_GROUPS=(fmt check clippy rustdoc docs public-api debug-assertions)
 # that RUNS the unit suite is a different order of cost (its own profile hash,
 # so its own full build, and then the tests), and folding it into the default
 # would turn `tools/preflight.sh` from a pre-push habit into a coffee break. So
-# it is opt-in by name — `tools/preflight.sh debug-assertions` — and CI runs it
-# as its own job, which is where it has to be green.
+# it is opt-in by name — `tools/preflight.sh debug-assertions` — and CI covers the
+# same ground inside its coverage jobs, which is where it has to be green.
 #
-# `--help` and `--list` still enumerate it, and
-# `tests/preflight_owns_the_fast_gates.rs` pins both this array and the fact that
-# the corresponding CI job delegates here, so an opt-in group cannot quietly
-# become a group that nothing ever runs.
+# It is also the one group with NO dedicated CI job of its own since #1248 retired
+# `Tests (debug-assertions)`. The property it checks did not go away with the job:
+# it moved into `[profile.ci-cov]`, which both coverage jobs build under. So the
+# guard test asserts the PROFILE here rather than a job name — see
+# `tests/preflight_owns_the_fast_gates.rs`.
+#
+# `--help` and `--list` still enumerate it, and that test pins this array, so an
+# opt-in group cannot quietly become a group that nothing ever runs.
 OPT_IN_GROUPS=(debug-assertions)
 
 is_opt_in() {
@@ -112,11 +116,12 @@ Groups: ${ALL_GROUPS[*]}
 Default: ${DEFAULT_GROUPS[*]}  (in that order)
 
 Opt-in, i.e. NOT in a no-argument run: ${OPT_IN_GROUPS[*]}. \`debug-assertions\`
-RUNS the Tier-1 suite on the default \`dev\` profile (#344). Every other test job
-builds with \`ci-test\`/\`ci-fast\`, which \`inherits = "release"\` — so every
-\`debug_assert!\` in the crate is compiled to nothing and its invariant goes
-unchecked. It is a build plus a test run rather than seconds of compile, so you
-name it when you want it; CI runs it on every PR.
+RUNS the Tier-1 suite on \`--profile ci-cov\` (#344, #1248) — \`ci-fast\` plus
+\`debug-assertions\`/\`overflow-checks\`, the profile the two coverage jobs build
+under. \`release\`, \`ci-test\` and \`ci-fast\` all leave the guards off, so every
+\`debug_assert!\` compiles to nothing there and its invariant goes unchecked. It
+is a build plus a test run rather than seconds of compile, so you name it when
+you want it; CI covers the same ground inside its coverage jobs on every PR.
 
 NOT covered by the DEFAULT set: the test jobs. \`cargo check --tests\` COMPILES
 the test targets but runs nothing, so \`Tests + coverage (core)\` can still go red
@@ -360,35 +365,38 @@ group_public_api() {
 }
 
 group_debug_assertions() {
-  CI_JOB="Tests (debug-assertions)"
-  # #344. Every OTHER test job in this repo builds with `--profile ci-test` or
-  # `--profile ci-fast`, both of which `inherits = "release"` — so
-  # `debug-assertions` is OFF and all 177 `debug_assert!` guards in the crate are
-  # compiled to nothing. They are invariant checks that CI was not running.
+  CI_JOB="Tests + coverage (core) / Tests + coverage (TTE/CTMM endpoints)"
+  # #344, as folded into #1248. The `debug_assert!` guards used to be dead in
+  # every CI job: `ci-test` and `ci-fast` both `inherits = "release"`, so all ~180
+  # of them compiled to nothing. That was not theoretical — a real off-by-one in
+  # `compute_max_stack` (`src/parser/model_parser.rs`) tripped its own
+  # `debug_assert!` on any expression containing an `if`, and four lib tests
+  # panicked under the dev profile while CI stayed green through the whole thing
+  # (fixed in #342).
   #
-  # That is not theoretical: a real off-by-one in `compute_max_stack`
-  # (`src/parser/model_parser.rs`) tripped its own `debug_assert!` on any
-  # expression containing an `if`, and four lib tests panicked under the dev
-  # profile while CI stayed green through the whole thing. It was fixed in #342;
-  # the CI blind spot that hid it is what this group closes.
+  # #344 closed that with a dedicated `Tests (debug-assertions)` job on the DEV
+  # profile. #1248 retired that job and put the guards where the coverage is
+  # measured instead, via `[profile.ci-cov]` (`ci-fast` + `debug-assertions` +
+  # `overflow-checks`). Two reasons, both measured:
   #
-  # The DEFAULT (dev) profile, deliberately — no `--profile` flag:
+  #  * the dev-profile job cost 32-42 min of CI, the critical path and ~2x the
+  #    next-longest job, while `ci-cov` costs essentially nothing on top of the
+  #    coverage jobs that had to run anyway (`--workspace --tests`: 133 s with the
+  #    guards off, 133 s with `debug-assertions`, 147 s with `overflow-checks` too);
+  #  * on a release-derived profile the guards' condition lines are regions that
+  #    can never execute, so every multi-line `debug_assert!` was permanently-missed
+  #    patch lines against the 90% Codecov gate (#1248). Running them under the
+  #    coverage profile flips 63 such lines from 0 to >0 in `--lib` scope alone.
   #
-  #  * it is the profile the bug actually reproduced under, so this gate is the
-  #    literal repro rather than an approximation of it;
-  #  * it also turns on `overflow-checks`, which `release` leaves off, so integer
-  #    overflow panics instead of wrapping silently — a second class of guard the
-  #    other jobs cannot see;
-  #  * a `ci-test`-with-debug-assertions profile would be a distinct profile hash
-  #    and therefore a whole extra OPTIMISED build of the lib, which in this
-  #    compile-bound repo (93% of the build is LLVM, #969/#971) costs far more
-  #    than the unoptimised tests do. Measured here on the dev profile: 80s of
-  #    tests for `ci` (4035) and 198s for `ci,markov,nn` (4366), all green.
+  # So this group now builds `--profile ci-cov` — the SAME profile CI measures
+  # under — rather than the dev default. It is also why the group is much cheaper
+  # than it was: release-optimised fits, not unoptimised ones.
   #
-  # `--lib` only: Tier-1 unit tests. The `tests/` binaries are run by
-  # `Tests + coverage (core)`, and compiling 120-odd of them again under a second
-  # profile is the cost this group is shaped to avoid. Tier-1 is also where the
-  # guards live — `debug_assert!` sits next to the invariant, in `src/`.
+  # `--lib` only: Tier-1 unit tests, which is where the guards live
+  # (`debug_assert!` sits next to the invariant, in `src/`). CI additionally runs
+  # them across the `tests/` binaries, because its coverage jobs pass `--tests`
+  # anyway; compiling 120-odd of those locally is the cost this group avoids.
+  #
   # `env FERX_REQUIRE_DEBUG_ASSERTIONS=1` in the ARGUMENT VECTOR, not as a shell
   # assignment prefix and not an `export` up in this function. Both of those would
   # reach the child just the same, but `run` echoes `$*`, so only this form appears
@@ -399,20 +407,22 @@ group_debug_assertions() {
   # `debug_assert!` turns out to compile to nothing. Without it this whole group is
   # an invariant held by ABSENCE — nothing in `cargo test --lib --features ci`
   # distinguishes a build with the guards live from one without, so a
-  # `[profile.dev] debug-assertions = false` or a `CARGO_PROFILE_DEV_DEBUG_ASSERTIONS`
-  # in the environment would neuter it with every test still green. The canary is
-  # opt-in precisely because every OTHER job legitimately runs with the guards off.
-  run env FERX_REQUIRE_DEBUG_ASSERTIONS=1 cargo test --lib --no-default-features --features ci
+  # `[profile.ci-cov] debug-assertions = false`, a stray
+  # `CARGO_PROFILE_CI_COV_DEBUG_ASSERTIONS`, or a `--profile` that quietly reverted
+  # to `ci-fast` would neuter it with every test still green. The canary is opt-in
+  # precisely because every OTHER job legitimately runs with the guards off.
+  run env FERX_REQUIRE_DEBUG_ASSERTIONS=1 cargo test --lib --profile ci-cov \
+    --no-default-features --features ci
 
   # The feature-gated surface, for the same non-nesting reason `check` is a matrix
   # rather than one line: `--features ci` compiles neither `src/survival`,
   # `src/markov`, `src/categorical` nor `src/nn`, and all four carry
-  # `debug_assert!`s. Without this line their guards would be as dead in this job
-  # as they are in every other one. `markov` implies `survival`, so
-  # `ci,markov,nn` is the union of the production cfgs — the same set `clippy` and
-  # `rustdoc` take, and for the same reason.
-  run env FERX_REQUIRE_DEBUG_ASSERTIONS=1 cargo test --lib --no-default-features \
-    --features ci,markov,nn
+  # `debug_assert!`s. Without this line their guards would be as dead here as they
+  # were in every job before #1248. `markov` implies `survival`, so `ci,markov,nn`
+  # is the union of the production cfgs — the same set `clippy` and `rustdoc` take,
+  # and for the same reason. In CI this half is the endpoints coverage job.
+  run env FERX_REQUIRE_DEBUG_ASSERTIONS=1 cargo test --lib --profile ci-cov \
+    --no-default-features --features ci,markov,nn
 }
 
 # ── Drive ───────────────────────────────────────────────────────────────────
