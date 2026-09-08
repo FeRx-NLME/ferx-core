@@ -7,8 +7,8 @@
 //!   * `∂f/∂η`, `∂²f/∂η²`,
 //!   * `∂f/∂θ`, `∂²f/∂η∂θ`
 //!
-//! built by seeding the PK parameters as [`Dual2`] variables
-//! through the closed-form PK solution (exact `∂f/∂pk`, `∂²f/∂pk²`) and then
+//! built by seeding the PK parameters as [`Dual2`] or mixed-order [`DualMixed`]
+//! variables through the closed-form PK solution (exact `∂f/∂pk`, `∂²f/∂pk²`) and then
 //! applying the **closed-form η/θ chain rule**: the model exposes the relation
 //! `pk_i = tv_i·exp(Σ_k sel[i,k]·η_k)`, so
 //!
@@ -33,6 +33,7 @@
 
 use super::dual1::Dual1;
 use super::dual2::Dual2;
+use super::dual_mixed::DualMixed;
 use super::num::PkNum;
 use super::one_cpt::{one_cpt_conc_g, one_cpt_ig_conc_g, one_cpt_transit_conc_g};
 use super::three_cpt::three_cpt_conc_g;
@@ -552,6 +553,20 @@ fn analytical_supported_core(model: &CompiledModel) -> bool {
 /// arm. **Keep these three in step** — raising this constant without adding the matching
 /// `const_dispatch!` arms would re-open the misreport below.
 const MAX_CLOSED_FORM_SLOTS: usize = 9;
+
+/// Largest IIV-bearing row count specialised with [`DualMixed`] on the static
+/// analytical provider. `NA = 1/2` covers the common one- and two-IIV transit
+/// and inverse-Gaussian shapes while bounding release compile cost; wider-IIV
+/// models retain the exact full `Dual2` path.
+const ANALYTIC_MIXED_NA_CAP: usize = 2;
+
+// The static dispatch below enumerates `NA = 1, 2` explicitly.
+const _: () = assert!(ANALYTIC_MIXED_NA_CAP == 2);
+
+#[cfg(test)]
+thread_local! {
+    static MIXED_ANALYTIC_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Whether the model's differentiated-slot count fits the closed-form dispatch tables.
 ///
@@ -1179,6 +1194,20 @@ pub(crate) fn seed_dim_from_slots(slots: &[usize]) -> [Option<usize>; N_PK] {
     for (i, &slot) in slots.iter().enumerate() {
         if slot < N_PK {
             seed_dim[slot] = Some(i);
+        }
+    }
+    seed_dim
+}
+
+/// PK slot → permuted dual axis for a `pd` whose rows follow `slots` order.
+/// `axis_of[i]` is the dual axis assigned to differentiated row `i`; mixed-order
+/// outer jets use this to place IIV-bearing rows first.
+fn seed_dim_from_slots_with_axes(slots: &[usize], axis_of: &[usize]) -> [Option<usize>; N_PK] {
+    debug_assert_eq!(slots.len(), axis_of.len());
+    let mut seed_dim = [None; N_PK];
+    for (i, &slot) in slots.iter().enumerate() {
+        if slot < N_PK {
+            seed_dim[slot] = Some(axis_of[i]);
         }
     }
     seed_dim
@@ -5389,8 +5418,16 @@ fn subject_sensitivities_impl(
         }
     };
 
+    let mixed_eligible = matches!(
+        model.pk_model,
+        PkModel::OneCptTransit | PkModel::TwoCptTransit | PkModel::OneCptIg | PkModel::TwoCptIg
+    ) && matches!(slots.len(), 4 | 6);
+
     // Dispatch on the differentiated-parameter count so the dual width is
-    // right-sized. `pk_indices.len()` ≤ `N_PK` (the fixed PK slot table).
+    // right-sized. The hand-written explicit kernels remain on their existing
+    // path; they already avoid generic dual arithmetic. Eligible transit/IG
+    // shapes use `DualMixed<NA, N>`, dropping only the IIV-free Hessian block
+    // that FOCEI never consumes (issue #829).
     // Analytic Form C readout program (#650), if this model has one; the
     // `analytical_supported` gate guarantees it is `Single` + dual-evaluable and
     // does not read the depot amount, so `run_obs` can serve it exactly.
@@ -5398,16 +5435,92 @@ fn subject_sensitivities_impl(
         .analytic_readout
         .as_ref()
         .and_then(|ar| ar.program.as_ref());
-    let mut sens = const_dispatch!(
-        slots.len();
-        1, 2, 3, 4, 5, 6, 7, 8, 9;
-        |N| Some(SubjectSens {
-            obs: run_obs::<N>(
-                &seed_dim, &pk, oral, two_cpt, three_cpt, transit, two_cpt_transit, ig,
-                two_cpt_ig, explicit_kind, subject, &pd, n_eta, n_theta, readout,
-            ),
-        })
-    )?;
+    macro_rules! full {
+        () => {
+            const_dispatch!(
+                slots.len();
+                1, 2, 3, 4, 5, 6, 7, 8, 9;
+                |N| Some(SubjectSens {
+                    obs: run_obs::<N, N, true>(
+                        &seed_dim,
+                        &pk,
+                        oral,
+                        two_cpt,
+                        three_cpt,
+                        transit,
+                        two_cpt_transit,
+                        ig,
+                        two_cpt_ig,
+                        explicit_kind,
+                        subject,
+                        &pd,
+                        None,
+                        n_eta,
+                        n_theta,
+                        readout,
+                    ),
+                })
+            )
+        };
+    }
+    let mut sens = if mixed_eligible {
+        // IIV-bearing rows have a nonzero η derivative. Put them on the leading
+        // dual axes so `DualMixed<NA, N>` retains exactly the Hessian rows used
+        // by the η/θ chain. This planning runs only for transit/IG candidates;
+        // the common explicit-kernel path pays no added per-subject scan.
+        let mut is_iiv = [false; MAX_CLOSED_FORM_SLOTS];
+        let mut axis_buf = [0usize; MAX_CLOSED_FORM_SLOTS];
+        let mut na = 0usize;
+        for i in 0..slots.len() {
+            if pd.dp_deta[i].iter().any(|&v| v != 0.0) {
+                is_iiv[i] = true;
+                axis_buf[i] = na;
+                na += 1;
+            }
+        }
+        let mut next = na;
+        for i in 0..slots.len() {
+            if !is_iiv[i] {
+                axis_buf[i] = next;
+                next += 1;
+            }
+        }
+        let axis_of = &axis_buf[..slots.len()];
+        let mixed_seed_dim = seed_dim_from_slots_with_axes(&slots, axis_of);
+        macro_rules! mixed {
+            ($na:literal, $n:literal) => {
+                Some(SubjectSens {
+                    obs: run_obs::<$na, $n, false>(
+                        &mixed_seed_dim,
+                        &pk,
+                        oral,
+                        two_cpt,
+                        three_cpt,
+                        transit,
+                        two_cpt_transit,
+                        ig,
+                        two_cpt_ig,
+                        None,
+                        subject,
+                        &pd,
+                        Some((axis_of, &is_iiv[..slots.len()])),
+                        n_eta,
+                        n_theta,
+                        readout,
+                    ),
+                })
+            };
+        }
+        match (slots.len(), na) {
+            (4, 1) => mixed!(1, 4),
+            (4, 2) => mixed!(2, 4),
+            (6, 1) => mixed!(1, 6),
+            (6, 2) => mixed!(2, 6),
+            _ => full!(),
+        }
+    } else {
+        full!()
+    }?;
     // Analytic `[initial_conditions]` impulse (#524): layer `A₀ · kernel(t, pk)`
     // and its exact `(θ, η)` jet onto every observation BEFORE scaling — the same
     // insertion order as the f64 `pk::add_analytical_init`. Dispatched on the
@@ -5614,12 +5727,84 @@ fn apply_ltbs_transform_inner(out: &mut [ObsGrad], log_transform: bool) {
     }
 }
 
-/// Per-observation value/grad/Hessian chain at a right-sized dual width `N`
-/// (= number of differentiated PK parameters). `seed_dim[s]` is the compact dual
-/// axis for PK slot `s` (`None` = constant); `pd` rows are in compact-axis order,
-/// so the chain reads `g[i]`/`h[i][j]` directly (identity dims).
+/// Chain one compact PK-space jet into the `(η, θ)` blocks consumed by FOCEI.
+/// `axis_of[i]` maps `pd` row `i` to its dual axis. `has_hessian_row[i]`
+/// identifies rows retained by a mixed-order jet; omitted rows are valid because
+/// their `dp_deta` is identically zero.
 #[allow(clippy::too_many_arguments)]
-fn run_obs<const N: usize>(
+fn chain_pk_outer_jet<const N: usize>(
+    f: f64,
+    grad: &[f64; N],
+    hess_at: impl Fn(usize, usize) -> f64,
+    axis_of: &[usize],
+    has_hessian_row: &[bool],
+    pd: &crate::sens::ode_provider::ParamDerivs,
+    n_eta: usize,
+    n_theta: usize,
+) -> ObsSens {
+    debug_assert_eq!(axis_of.len(), has_hessian_row.len());
+    debug_assert_eq!(axis_of.len(), pd.dp_deta.len());
+    let n_indiv = axis_of.len();
+    let mut df_deta = vec![0.0; n_eta];
+    let mut d2f_deta2 = vec![0.0; n_eta * n_eta];
+    let mut df_dtheta = vec![0.0; n_theta];
+    let mut d2f_deta_dtheta = vec![0.0; n_eta * n_theta];
+
+    for i in 0..n_indiv {
+        let gi = grad[axis_of[i]];
+        for k in 0..n_eta {
+            df_deta[k] += gi * pd.dp_deta[i][k];
+        }
+        for m in 0..n_theta {
+            df_dtheta[m] += gi * pd.dp_dtheta[i][m];
+        }
+    }
+    for k in 0..n_eta {
+        for l in 0..n_eta {
+            let mut acc = 0.0;
+            for i in 0..n_indiv {
+                if has_hessian_row[i] {
+                    for j in 0..n_indiv {
+                        acc +=
+                            hess_at(axis_of[i], axis_of[j]) * pd.dp_deta[i][k] * pd.dp_deta[j][l];
+                    }
+                }
+                acc += grad[axis_of[i]] * pd.d2p_deta2[i][k][l];
+            }
+            d2f_deta2[k * n_eta + l] = acc;
+        }
+    }
+    for k in 0..n_eta {
+        for m in 0..n_theta {
+            let mut acc = 0.0;
+            for i in 0..n_indiv {
+                if has_hessian_row[i] {
+                    for j in 0..n_indiv {
+                        acc +=
+                            hess_at(axis_of[i], axis_of[j]) * pd.dp_deta[i][k] * pd.dp_dtheta[j][m];
+                    }
+                }
+                acc += grad[axis_of[i]] * pd.d2p_detadtheta[i][k][m];
+            }
+            d2f_deta_dtheta[k * n_theta + m] = acc;
+        }
+    }
+
+    ObsSens {
+        f,
+        df_deta,
+        d2f_deta2,
+        df_dtheta,
+        d2f_deta_dtheta,
+        ..Default::default()
+    }
+}
+
+/// Per-observation value/grad/Hessian chain at a right-sized dual width `N`
+/// (= number of differentiated PK parameters) and retained Hessian-row count
+/// `NA`. `seed_dim[s]` maps each PK slot to its compact, possibly permuted axis.
+#[allow(clippy::too_many_arguments)]
+fn run_obs<const NA: usize, const N: usize, const ALLOW_EXPLICIT: bool>(
     seed_dim: &[Option<usize>; N_PK],
     pk: &crate::types::PkParams,
     oral: bool,
@@ -5632,10 +5817,18 @@ fn run_obs<const N: usize>(
     explicit_kind: Option<ExKind>,
     subject: &Subject,
     pd: &crate::sens::ode_provider::ParamDerivs,
+    mixed_axes: Option<(&[usize], &[bool])>,
     n_eta: usize,
     n_theta: usize,
     readout: Option<&crate::parser::model_parser::OdeOutputProgram>,
 ) -> Vec<ObsSens> {
+    #[cfg(test)]
+    if !ALLOW_EXPLICIT {
+        MIXED_ANALYTIC_RUNS.with(|runs| runs.set(runs.get() + 1));
+    }
+    let identity_axes = std::array::from_fn::<_, N, _>(|i| i);
+    let full_hessian_rows = [true; N];
+    let (axis_of, is_iiv) = mixed_axes.unwrap_or((&identity_axes, &full_hessian_rows));
     let (cl, v1, q, v2, ka, f_bio, q3, v3) = (
         pk.cl(),
         pk.v(),
@@ -5658,11 +5851,11 @@ fn run_obs<const N: usize>(
     // Analytic Form C readout (#650): the PK-parameter dual vector (indexed by PK
     // slot, so `eval_output_g` can pull `V`, binding constants, … via its
     // `indiv_to_pk` plan) and reusable scratch. Subject-static, so built once.
-    let ro_pk_duals: Option<[Dual2<N>; N_PK]> =
-        readout.map(|_| ro_pk_dual_array::<Dual2<N>>(seed_dim, pk));
-    let mut ro_state: Vec<Dual2<N>> = Vec::new();
-    let mut ro_vars: Vec<Dual2<N>> = Vec::new();
-    let mut ro_stack: Vec<Dual2<N>> = Vec::new();
+    let ro_pk_duals: Option<[DualMixed<NA, N>; N_PK]> =
+        readout.map(|_| ro_pk_dual_array::<DualMixed<NA, N>>(seed_dim, pk));
+    let mut ro_state: Vec<DualMixed<NA, N>> = Vec::new();
+    let mut ro_vars: Vec<DualMixed<NA, N>> = Vec::new();
+    let mut ro_stack: Vec<DualMixed<NA, N>> = Vec::new();
     let mut out = Vec::with_capacity(subject.obs_times.len());
     for (obs_i, &t_obs) in subject.obs_times.iter().enumerate() {
         // Reset segment: the most recent EVID=3/4 reset at or before this
@@ -5673,9 +5866,9 @@ fn run_obs<const N: usize>(
         // floor and is kept (`dose.time >= reset_floor`).
         let reset_floor = reset_floor_at(subject, t_obs);
 
-        // `(f, ∂f/∂pk, ∂²f/∂pk²)` in the compact `0..N` layout — from the explicit
-        // kernels when applicable, else the generic `Dual2<N>` path.
-        let (fval, g, h): (f64, [f64; N], [[f64; N]; N]) = if let Some(kind) = explicit_kind {
+        // Build the compact PK-space jet from the explicit kernel when available,
+        // otherwise by propagating the selected dual type through the closed form.
+        let jet = if let (true, Some(kind)) = (ALLOW_EXPLICIT, explicit_kind) {
             let mut gv = [0.0; N];
             let mut hv = [[0.0; N]; N];
             let mut val = 0.0;
@@ -5689,14 +5882,19 @@ fn run_obs<const N: usize>(
                     &mut hv,
                 );
             }
-            (val, gv, hv)
+            let mut retained = [[0.0; N]; NA];
+            retained.copy_from_slice(&hv[..NA]);
+            DualMixed {
+                value: val,
+                grad: gv,
+                hess: retained,
+            }
         } else {
-            // Seed only the differentiated PK params as `Dual2<N>` and superpose the
+            // Seed only the differentiated PK params and superpose the
             // dose contributions restricted to the current reset segment; `elapsed`
             // carries the lagtime shift and the SS pre-arrival tail wrap.
-            let seeded = SeededPkDuals::<Dual2<N>>::seed(seed_dim, pk);
-            let fd = superpose_doses(&seeded, flags, subject, t_obs, reset_floor);
-            (fd.value, fd.grad, fd.hess)
+            let seeded = SeededPkDuals::<DualMixed<NA, N>>::seed(seed_dim, pk);
+            superpose_doses(&seeded, flags, subject, t_obs, reset_floor)
         };
 
         // Match production's `conc.max(0.0)` clamp (`pk/mod.rs`): when the closed
@@ -5705,10 +5903,10 @@ fn run_obs<const N: usize>(
         // `max(f, 0)` is also 0 there. Returning the raw negative `f` and its
         // derivatives would make the analytic gradient inconsistent with the
         // objective it differentiates (PR #381 review finding #5).
-        let (fval, g, h) = if fval < 0.0 {
-            (0.0, [0.0; N], [[0.0; N]; N])
+        let jet = if jet.value < 0.0 {
+            DualMixed::constant(0.0)
         } else {
-            (fval, g, h)
+            jet
         };
 
         // Analytic Form C readout (#650): replace the central concentration jet with
@@ -5717,13 +5915,8 @@ fn run_obs<const N: usize>(
         // an additive term layers on); the readout's `∂y/∂pk` / `∂²y/∂pk²` then ride the
         // same `pd` chain to `(θ, η)` below. Covariates come from the per-observation
         // snapshot (a per-row `FREE`-style flag).
-        let conc = Dual2::<N> {
-            value: fval,
-            grad: g,
-            hess: h,
-        };
         let y = apply_readout_jet(
-            conc,
+            jet,
             readout,
             ro_pk_duals.as_ref(),
             subject,
@@ -5732,60 +5925,16 @@ fn run_obs<const N: usize>(
             &mut ro_vars,
             &mut ro_stack,
         );
-        let (fval, g, h) = (y.value, y.grad, y.hess);
-
-        let mut df_deta = vec![0.0; n_eta];
-        let mut d2f_deta2 = vec![0.0; n_eta * n_eta];
-        let mut df_dtheta = vec![0.0; n_theta];
-        let mut d2f_deta_dtheta = vec![0.0; n_eta * n_theta];
-
-        // Chain ∂f/∂p, ∂²f/∂p² (exact, from the seeded PK Dual2 in compact layout)
-        // with ∂p/∂(θ,η) (from `pd`, analytical or FD fallback):
-        //   ∂f/∂η_k      = Σ_i g[i]·pᵢ,η_k
-        //   ∂²f/∂η_k∂η_l = Σ_ij H[i][j]·pᵢ,η_k·pⱼ,η_l + Σ_i g[i]·pᵢ,η_kη_l
-        // and likewise with θ in one slot. Compact axis `i` ↔ `pd` row `i`.
-        for i in 0..N {
-            let gi = g[i];
-            for k in 0..n_eta {
-                df_deta[k] += gi * pd.dp_deta[i][k];
-            }
-            for m in 0..n_theta {
-                df_dtheta[m] += gi * pd.dp_dtheta[i][m];
-            }
-        }
-        for k in 0..n_eta {
-            for l in 0..n_eta {
-                let mut acc = 0.0;
-                for i in 0..N {
-                    for j in 0..N {
-                        acc += h[i][j] * pd.dp_deta[i][k] * pd.dp_deta[j][l];
-                    }
-                    acc += g[i] * pd.d2p_deta2[i][k][l];
-                }
-                d2f_deta2[k * n_eta + l] = acc;
-            }
-        }
-        for k in 0..n_eta {
-            for m in 0..n_theta {
-                let mut acc = 0.0;
-                for i in 0..N {
-                    for j in 0..N {
-                        acc += h[i][j] * pd.dp_deta[i][k] * pd.dp_dtheta[j][m];
-                    }
-                    acc += g[i] * pd.d2p_detadtheta[i][k][m];
-                }
-                d2f_deta_dtheta[k * n_theta + m] = acc;
-            }
-        }
-
-        out.push(ObsSens {
-            f: fval,
-            df_deta,
-            d2f_deta2,
-            df_dtheta,
-            d2f_deta_dtheta,
-            ..Default::default()
-        });
+        out.push(chain_pk_outer_jet(
+            y.value,
+            &y.grad,
+            |i, j| y.hess[i][j],
+            axis_of,
+            is_iiv,
+            pd,
+            n_eta,
+            n_theta,
+        ));
     }
     out
 }
