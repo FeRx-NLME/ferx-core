@@ -236,16 +236,20 @@ parameters the base already had. Only `central` changes, so `ELIMINATION`
 composes with every absorption and every compartment count — it appears in
 none of Pharmpy's incompatible pairs.
 
-Three consequences are worth knowing before you put one in a space.
+Four things are worth knowing before you put one in a space.
 
-**The clearance keeps its name.** Pharmpy renames `CL` to `CLMM` when it
+### The clearance keeps its name
+
+ Pharmpy renames `CL` to `CLMM` when it
 switches to Michaelis–Menten; ferx binds the same parameter, under the name
 the base gave it. That is what carries its initial estimate and its η across
 the move — a renamed parameter would arrive with neither. `MIX-FO-MM` is the
 one case with two clearances, and there the saturable one is a new `CLMM`
 starting at half the first-order one, exactly as Pharmpy does it.
 
-**They cost an order of magnitude more per fit.** A closed form is replaced
+### They cost an order of magnitude more per fit
+
+A closed form is replaced
 by numerical integration, and a saturable right-hand side is stiffer again —
 one FOCEI *evaluation* of the warfarin Michaelis–Menten candidate below takes
 0.064 s against the analytic base's 0.008 s, and a fit widens that, because
@@ -255,14 +259,18 @@ ODE candidate runs with subject-level threads rather than alone on one worker
 while the rest of the machine idles — but the wall clock is still the wall
 clock, and the report's `seconds` column is the measurement.
 
-**A saturable elimination is fitted with more starts.** Michaelis–Menten
+### A saturable elimination is fitted with more starts
+
+Michaelis–Menten
 models are the canonical [local-minimum case](../examples/multistart.qmd),
 and a search that ranks a stalled MM fit against a converged first-order one
 rejects a correct model on the strength of the optimizer. Those candidates —
 and only those — are given at least 8 starts, whatever `[run] retries` says;
 a run configured with more keeps them.
 
-**`ABSORPTION(ZO)` drops the depot**, as Pharmpy's
+### Initial estimates, and a floor Pharmpy does not have
+
+`ABSORPTION(ZO)` drops the depot, as Pharmpy's
 `set_zero_order_absorption` does: the dose is delivered into `central` over
 a modeled duration, so `KA` and its η are pruned with it. The duration
 starts at Pharmpy's `2·MAT` with `MAT = 2·t_first`; the Weibull scale at
@@ -270,8 +278,33 @@ starts at Pharmpy's `2·MAT` with `MAT = 2·t_first`; the Weibull scale at
 bounded above by `1.5·max(DV)`, or fixed at `min(DV)/100` for zero-order
 elimination, which is how Pharmpy writes a zero-order elimination too.
 
+The observation range those last two read is **floored positive**, which
+Pharmpy does only half of. A Michaelis constant at or below zero is not a
+model — the saturable term `CL·KM/(KM + C)` is singular at `C = −KM`, and at
+`KM = 0` the generated right-hand side evaluates `0/0` when `central` is zero,
+which is every subject's first record — and an additive residual error puts
+negative observations in perfectly ordinary data. Pharmpy resets a negative
+`min(DV)/100` to `0.01`; ferx applies the same fallback to a zero minimum and
+to a non-positive `max(DV)`, which would otherwise give `KM` a negative upper
+bound. The fallback is the value Pharmpy uses when a model carries no dataset
+at all.
+
+### Bioavailability and the lag time survive every move
+
+Including a second one. They are not coordinates of the search, and an `ode_template` line
+cannot carry them — it takes the analytic signature, which has no `f` or
+`lagtime` slot — so an ODE candidate states them in
+`[individual_parameters]` instead: under a reserved spelling (`F`, `ALAG`,
+`LAGTIME`) when the model already uses one, and otherwise as the alias
+`lagtime = TLAG` that the engine reads the slot off. A later step recovers
+the binding from there rather than from the template line, so
+`ELIMINATION(MM)` followed by `PERIPHERALS(1)` leaves both exactly where the
+base put them.
+
+### The base must be analytic
+
 A base model whose disposition is already an `ode_template` line is
-**refused**: the search reads its starting coordinates off a `pk NAME(...)`
+refused: the search reads its starting coordinates off a `pk NAME(...)`
 line and cannot recover an absorption or an elimination from an arbitrary
 right-hand side. Write the base analytically and let the search generate the
 ODE candidates.

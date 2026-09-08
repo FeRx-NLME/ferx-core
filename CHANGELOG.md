@@ -58,7 +58,10 @@ section of the SDLC for the versioning policy).
   `MAT / Γ(1 + 1/β)` at `β = 1.5`), except that the Michaelis-Menten clearance keeps the base
   model's own `CL` name — and with it its estimate and its η — where Pharmpy renames it to
   `CLMM`. `ABSORPTION(SEQ-ZO-FO)` is still refused: it is a depot of its own, not one input term
-  on a standard disposition. Because these candidates cost an order of magnitude more per fit,
+  on a standard disposition. Bioavailability and the lag time are carried through every move,
+  including a second one off an ODE parent, and the Michaelis constant's observation range is
+  floored positive — Pharmpy resets a negative `min(DV)/100` to `0.01`, and ferx applies the
+  same fallback to a zero minimum and to a non-positive `max(DV)`, since `KM ≤ 0` is singular. Because these candidates cost an order of magnitude more per fit,
   the runner now plans candidates of **equal cost together, heaviest group first** (so an ODE
   candidate gets subject-level threads instead of running alone on one worker), and a saturable
   elimination is fitted with at least 8 starts — a floor under `[run] retries`, never a

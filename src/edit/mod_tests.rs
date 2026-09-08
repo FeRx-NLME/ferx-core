@@ -2455,3 +2455,148 @@ fn set_structural_ode_and_pk_agree_on_everything_but_the_keyword() {
         b.render()
     );
 }
+
+/// Applying the same ODE swap twice must not consume the model's lag time
+/// (review of #1292).
+///
+/// The alias cleanup deletes a reserved-name *bridge*; `ALAG = TVLAG` is not
+/// one — it is the lag time itself, declared under a spelling the engine
+/// routes. Deleting it on the second edit left the model with no lag
+/// declaration at all (the rewrite loop skips a binding already spelled
+/// `ALAG`), and the pruner then took `TVLAG` with it: a silent reset to zero
+/// on any stepwise search that moved twice.
+#[test]
+fn a_second_ode_swap_keeps_a_canonical_reserved_declaration() {
+    let with_lag = BASE
+        .replace(
+            "  pk one_cpt_oral(cl=CL, v=V, ka=KA)",
+            "  pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=ALAG)",
+        )
+        .replace(
+            "  KA = TVKA * exp(ETA_KA)",
+            "  KA   = TVKA * exp(ETA_KA)\n  ALAG = TVLAG",
+        )
+        .replace(
+            "  theta TVKA(1.5, 0.01, 50.0)",
+            "  theta TVKA(1.5, 0.01, 50.0)\n  theta TVLAG(0.5, 0.0, 5.0)",
+        );
+    let mut text = ModelText::parse(&with_lag).unwrap();
+    let spec = || {
+        StructuralSpec::new(
+            "one_cpt_oral",
+            vec![
+                ("cl".into(), "CL".into()),
+                ("v".into(), "V".into()),
+                ("ka".into(), "KA".into()),
+                ("lagtime".into(), "ALAG".into()),
+            ],
+            vec![],
+        )
+        .ode(InputForm::Template, EliminationForm::FirstOrder)
+    };
+    apply(&mut text, ModelEdit::SetStructural(spec()));
+    let once = text.render();
+    assert!(once.contains("ALAG = TVLAG"), "{once}");
+    // The second edit is the one that used to eat it.
+    apply(&mut text, ModelEdit::SetStructural(spec()));
+    let twice = text.render();
+    assert!(twice.contains("ALAG = TVLAG"), "{twice}");
+    assert!(twice.contains("theta TVLAG("), "{twice}");
+    assert_eq!(once, twice, "an idempotent edit must be idempotent");
+}
+
+/// The same for bioavailability, in the shape that makes the discrimination
+/// load-bearing: `F = THETA_F` reads exactly like an alias — a reserved name
+/// assigned a bare identifier — and is a declaration, because what it names
+/// is a θ rather than another individual parameter.
+#[test]
+fn an_ode_swap_keeps_a_bioavailability_declaration() {
+    let with_f = BASE
+        .replace(
+            "  pk one_cpt_oral(cl=CL, v=V, ka=KA)",
+            "  pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)",
+        )
+        .replace(
+            "  KA = TVKA * exp(ETA_KA)",
+            "  KA = TVKA * exp(ETA_KA)\n  F  = THETA_F",
+        )
+        .replace(
+            "  theta TVKA(1.5, 0.01, 50.0)",
+            "  theta TVKA(1.5, 0.01, 50.0)\n  theta THETA_F(0.7, 0.001, 0.999)",
+        );
+    let mut text = ModelText::parse(&with_f).unwrap();
+    let spec = || {
+        StructuralSpec::new(
+            "one_cpt_oral",
+            vec![
+                ("cl".into(), "CL".into()),
+                ("v".into(), "V".into()),
+                ("ka".into(), "KA".into()),
+                ("f".into(), "F".into()),
+            ],
+            vec![],
+        )
+        .ode(InputForm::Template, EliminationForm::FirstOrder)
+    };
+    apply(&mut text, ModelEdit::SetStructural(spec()));
+    apply(&mut text, ModelEdit::SetStructural(spec()));
+    let out = text.render();
+    assert!(out.contains("F  = THETA_F"), "{out}");
+    assert!(out.contains("theta THETA_F("), "{out}");
+    // …and no alias was invented for a name that already routes.
+    assert!(!out.contains("\n  f = F"), "{out}");
+}
+
+/// An alias *is* still dropped when it has to be — the property the narrowed
+/// rule must not have given up. Here the second swap moves the lag time to a
+/// freshly declared `ALAG`, so the stale bridge has to go: left behind, the
+/// model would declare the lag slot twice and `ode_param_slots` would reject
+/// it.
+#[test]
+fn a_stale_alias_is_still_dropped_when_the_binding_moves() {
+    let with_lag = BASE
+        .replace(
+            "  pk one_cpt_oral(cl=CL, v=V, ka=KA)",
+            "  pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=TLAG)",
+        )
+        .replace(
+            "  KA = TVKA * exp(ETA_KA)",
+            "  KA   = TVKA * exp(ETA_KA)\n  TLAG = TVLAG",
+        )
+        .replace(
+            "  theta TVKA(1.5, 0.01, 50.0)",
+            "  theta TVKA(1.5, 0.01, 50.0)\n  theta TVLAG(0.5, 0.0, 5.0)",
+        );
+    let mut text = ModelText::parse(&with_lag).unwrap();
+    let ode = |var: &str, new: Vec<NewParameter>| {
+        StructuralSpec::new(
+            "one_cpt_oral",
+            vec![
+                ("cl".into(), "CL".into()),
+                ("v".into(), "V".into()),
+                ("ka".into(), "KA".into()),
+                ("lagtime".into(), var.to_string()),
+            ],
+            new,
+        )
+        .ode(InputForm::Template, EliminationForm::FirstOrder)
+    };
+    apply(&mut text, ModelEdit::SetStructural(ode("TLAG", vec![])));
+    assert!(text.render().contains("lagtime = TLAG"));
+    apply(
+        &mut text,
+        ModelEdit::SetStructural(ode(
+            "ALAG",
+            vec![NewParameter::new("ALAG", "TVALAG", 0.25, 0.0, 5.0)],
+        )),
+    );
+    let out = text.render();
+    assert!(out.contains("ALAG = TVALAG"), "{out}");
+    assert!(
+        !out.contains("lagtime = TLAG"),
+        "the stale bridge would declare the lag slot twice: {out}"
+    );
+    // The parameter it bridged to is unreferenced now and goes with it.
+    assert!(!out.contains("TLAG"), "{out}");
+    assert!(!out.contains("TVLAG("), "{out}");
+}

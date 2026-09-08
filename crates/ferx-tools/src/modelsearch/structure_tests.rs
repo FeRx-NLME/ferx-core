@@ -1488,3 +1488,204 @@ fn a_move_back_to_first_order_elimination_writes_an_analytic_candidate() {
     assert_eq!(spec.template, "one_cpt_oral");
     assert!(spec.new_parameters.is_empty());
 }
+
+// ── review of #1292: what survives a second step ────────────────────────────
+
+/// An `ode_template` line cannot carry `f` or `lagtime`, so a second step off
+/// an ODE parent has to recover them from its `[individual_parameters]` — in
+/// both shapes the engine accepts.
+#[test]
+fn reserved_bindings_are_recovered_from_an_ode_parents_declarations() {
+    let alias = vec![
+        "CL = TVCL * exp(ETA_CL)".to_string(),
+        "TLAG = TVLAG".to_string(),
+        "BIOAV = THETA_F".to_string(),
+        "lagtime = TLAG".to_string(),
+        "f = BIOAV".to_string(),
+    ];
+    assert_eq!(
+        reserved_binding(&alias, &["lagtime", "alag"]),
+        Some("TLAG".to_string()),
+        "an alias resolves to the parameter it bridges to"
+    );
+    assert_eq!(reserved_binding(&alias, &["f"]), Some("BIOAV".to_string()));
+    // A reserved name assigned a θ *is* the declaration, so the binding is
+    // the name itself — the same discrimination the edit layer makes.
+    let canonical = vec![
+        "CL = TVCL * exp(ETA_CL)".to_string(),
+        "ALAG = TVLAG".to_string(),
+        "F = inv_logit(THETA_F)".to_string(),
+    ];
+    assert_eq!(
+        reserved_binding(&canonical, &["lagtime", "alag"]),
+        Some("ALAG".to_string())
+    );
+    assert_eq!(reserved_binding(&canonical, &["f"]), Some("F".to_string()));
+    // Nothing to recover.
+    assert_eq!(reserved_binding(&["CL = TVCL".to_string()], &["f"]), None);
+}
+
+/// The step that #1292's review found: after `ELIMINATION(MM)`, a
+/// `PERIPHERALS(1)` move must leave bioavailability and the lag time exactly
+/// where the base put them. Reading them off the `ode_template` line alone
+/// dropped F from the child spec entirely and re-minted the lag as a fresh
+/// `ALAG` at the data-derived default, silently changing two coordinates the
+/// search never moved.
+#[test]
+fn a_second_step_off_an_ode_parent_carries_f_and_lagtime() {
+    // The parent as the first step leaves it: an `ode_template` line with the
+    // disposition roles only, the lag time bridged by an alias, F declared
+    // under its own reserved name.
+    let parent = template("ode_template one_cpt_oral(cl=CL, v=V, ka=KA)");
+    let parent_lines = vec![
+        "CL = TVCL * exp(ETA_CL)".to_string(),
+        "V = TVV * exp(ETA_V)".to_string(),
+        "KA = TVKA * exp(ETA_KA)".to_string(),
+        "TLAG = TVLAG".to_string(),
+        "KM = TVKM".to_string(),
+        "F = THETA_F".to_string(),
+        "lagtime = TLAG".to_string(),
+    ];
+    let d = Defaults {
+        parameters: vec![
+            "CL".into(),
+            "V".into(),
+            "KA".into(),
+            "TLAG".into(),
+            "KM".into(),
+            "F".into(),
+            "lagtime".into(),
+        ],
+        ..dv_defaults()
+    };
+    let from = Structure {
+        elimination: Elimination::Mm,
+        lagtime: true,
+        ..fo(0)
+    };
+    let spec = structural_spec(
+        &Structure {
+            peripherals: 1,
+            ..from
+        },
+        &from,
+        &parent,
+        &parent_lines,
+        &d,
+        IivStrategy::NoAdd,
+    )
+    .unwrap();
+    assert!(
+        spec.bindings
+            .contains(&("lagtime".to_string(), "TLAG".to_string())),
+        "the lag time is the parent's, not a fresh ALAG: {:?}",
+        spec.bindings
+    );
+    assert!(
+        spec.bindings.contains(&("f".to_string(), "F".to_string())),
+        "bioavailability must survive a move that did not touch it: {:?}",
+        spec.bindings
+    );
+    assert!(
+        spec.new_parameters.iter().all(|p| p.name != "ALAG"),
+        "no lag time was re-minted: {:?}",
+        spec.new_parameters
+    );
+    // …and the step's own move still happened.
+    assert_eq!(spec.template, "two_cpt_oral");
+    assert!(spec.new_parameters.iter().any(|p| p.name == "Q"));
+    // The elimination is unchanged, and reuses the parent's `KM`.
+    assert_eq!(
+        spec.engine,
+        StructuralEngine::Ode {
+            input: InputForm::Template,
+            elimination: EliminationForm::MichaelisMenten { km: "KM".into() },
+        }
+    );
+    assert!(spec.new_parameters.iter().all(|p| p.name != "KM"));
+}
+
+/// A dataset whose observations are not all positive must not fix `KM` at or
+/// below zero (#1292 review). The saturable term `CL·KM/(KM + C)` is singular
+/// at `C = −KM`, and `KM = 0` makes the generated right-hand side evaluate
+/// `0/0` at `central = 0` — every subject's first record. An additive
+/// residual error puts negative observations in ordinary data.
+#[test]
+fn a_non_positive_observation_range_falls_back_rather_than_fixing_km_at_zero() {
+    let ranges: &[(&str, &[f64])] = &[
+        ("a negative minimum", &[-0.4, 2.0, 8.0]),
+        ("a zero minimum", &[0.0, 2.0, 8.0]),
+        ("all non-positive", &[-3.0, -0.5, 0.0]),
+    ];
+    for (what, values) in ranges {
+        let d = Defaults::new(
+            vec!["CL".into(), "V".into(), "KA".into()],
+            vec!["TVCL".into(), "TVV".into(), "TVKA".into()],
+            vec![0.2, 10.0, 1.5],
+            vec![],
+            &observed(&[0.5, 1.0, 2.0], values),
+        );
+        assert!(d.dv_min > 0.0, "{what}: dv_min = {}", d.dv_min);
+        assert!(d.dv_max > 0.0, "{what}: dv_max = {}", d.dv_max);
+        for elimination in [Elimination::Zo, Elimination::Mm] {
+            let spec = structural_spec(
+                &with_elimination(elimination),
+                &fo(0),
+                &template("pk one_cpt_oral(cl=CL, v=V, ka=KA)"),
+                &lines(),
+                &d,
+                IivStrategy::NoAdd,
+            )
+            .unwrap();
+            let km = spec
+                .new_parameters
+                .iter()
+                .find(|p| p.name == "KM")
+                .unwrap_or_else(|| panic!("{what}: KM is declared"));
+            assert!(
+                km.init > 0.0,
+                "{what} / {}: KM init {} is not a model",
+                elimination.label(),
+                km.init
+            );
+            assert!(
+                km.upper > km.init,
+                "{what} / {}: KM upper {} does not contain its init {}",
+                elimination.label(),
+                km.upper,
+                km.init
+            );
+            assert!(km.lower >= 0.0);
+        }
+    }
+    // Pharmpy's own fallback value, on the case its guard covers: a negative
+    // `min(DV)/100` becomes `0.01` (`set_zero_order_elimination`), which is
+    // what the floored `min(DV) = 1.0` produces here.
+    let d = Defaults::new(
+        vec!["CL".into(), "V".into(), "KA".into()],
+        vec!["TVCL".into(), "TVV".into(), "TVKA".into()],
+        vec![0.2, 10.0, 1.5],
+        vec![],
+        &observed(&[0.5, 1.0, 2.0], &[-0.4, 2.0, 8.0]),
+    );
+    assert_eq!(d.dv_min, 1.0, "the floor is the no-data value");
+    let spec = structural_spec(
+        &with_elimination(Elimination::Zo),
+        &fo(0),
+        &template("pk one_cpt_oral(cl=CL, v=V, ka=KA)"),
+        &lines(),
+        &d,
+        IivStrategy::NoAdd,
+    )
+    .unwrap();
+    let km = spec
+        .new_parameters
+        .iter()
+        .find(|p| p.name == "KM")
+        .expect("KM");
+    assert_eq!(km.init, 0.01, "min(DV)/100 with min(DV) floored to 1.0");
+    assert!(km.fixed);
+    // The positive part of the range is untouched: `max(DV) = 8` still sizes
+    // the bound, so the floor does not quietly rescale a usable dataset.
+    assert_eq!(km.upper, 12.0);
+}

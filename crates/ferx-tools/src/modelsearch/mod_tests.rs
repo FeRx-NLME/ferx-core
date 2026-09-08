@@ -1524,3 +1524,98 @@ fn the_elimination_coordinate_is_in_the_feature_vector() {
         row.structure.feature_vector().render()
     );
 }
+
+/// A one-compartment oral base carrying both reserved dose attributes: a
+/// bioavailability under its own name and a lag time under a name that is
+/// *not* a reserved spelling, so the ODE candidate has to bridge it.
+const BASE_F_LAG: &str = "\
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta TVLAG(0.4, 0.0, 5.0)
+  theta THETA_F(0.7, 0.001, 0.999)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  KA = TVKA
+  TLAG = TVLAG
+  F = THETA_F
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=TLAG, f=F)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+/// Two stepwise moves off an ODE parent must not disturb the coordinates
+/// neither move touched (the #1292 review).
+///
+/// After `ELIMINATION(MM)` the candidate's disposition is an `ode_template`
+/// line, which cannot carry `f` or `lagtime`. Reading the child's bindings
+/// off that line alone dropped bioavailability from the second-layer spec
+/// entirely and re-minted the lag as a fresh `ALAG` at the data-derived
+/// default — two silent changes in a step whose feature was `PERIPHERALS(1)`.
+#[test]
+fn a_second_layer_off_an_ode_parent_keeps_bioavailability_and_the_lag_time() {
+    let script = Script::new(&[]);
+    let base = Structure {
+        lagtime: true,
+        ..fo(0)
+    };
+    let result = run(
+        &script,
+        space_of(BASE_F_LAG, base, "ELIMINATION([FO,MM]); PERIPHERALS(0..1)"),
+        &options(Algorithm::ExhaustiveStepwise),
+    );
+
+    // Layer 2, reached by ELIMINATION(MM) and then PERIPHERALS(1).
+    let second = result
+        .rows
+        .iter()
+        .find(|r| {
+            r.layer == 2
+                && r.structure.elimination == Elimination::Mm
+                && r.structure.peripherals == 1
+        })
+        .unwrap_or_else(|| panic!("MM → 1 peripheral is a path: {:?}", paths(&result, 2)));
+    let text = &result.models[&second.id];
+    let params = text.block_lines("individual_parameters");
+    let thetas = text.block_lines("parameters");
+
+    // Bioavailability: still declared, still under its own name, still on
+    // its own θ. `F` routes to the slot by itself, so no bridge is needed.
+    assert!(
+        params.iter().any(|l| l.starts_with("F =")),
+        "bioavailability was dropped: {params:?}"
+    );
+    assert!(
+        thetas.iter().any(|l| l.starts_with("theta THETA_F(")),
+        "{thetas:?}"
+    );
+    // The lag time: the base's `TLAG`, bridged by the alias — not a fresh
+    // `ALAG` at `t_first / 2`.
+    assert!(
+        params.iter().any(|l| l == "lagtime = TLAG"),
+        "the lag bridge is gone: {params:?}"
+    );
+    assert!(params.iter().any(|l| l.starts_with("TLAG =")), "{params:?}");
+    assert!(
+        thetas.iter().any(|l| l.starts_with("theta TVLAG(0.4")),
+        "the lag time was re-derived rather than carried: {thetas:?}"
+    );
+    assert!(
+        !params.iter().any(|l| l.starts_with("ALAG =")),
+        "a second lag parameter was minted: {params:?}"
+    );
+    // …and the layer's own move did happen.
+    assert_eq!(
+        text.block_lines("structural_model"),
+        vec!["ode_template two_cpt_oral(cl=CL, v1=V, q=Q, v2=V2, ka=KA)"]
+    );
+    assert_eq!(second.path.len(), 2);
+}

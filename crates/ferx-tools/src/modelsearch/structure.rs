@@ -227,6 +227,45 @@ pub enum Engine {
 /// by the generated equation.
 pub const ODE_ONLY_ROLES: &[&str] = &["dur", "td", "beta", "clmm", "km"];
 
+/// The parameter an ODE model's engine reads a reserved dose attribute off,
+/// found in its `[individual_parameters]` lines (#1257).
+///
+/// An ODE model states bioavailability and the absorption lag by **name**
+/// (`ode_param_slots`), in one of two shapes, and the right-hand side tells
+/// them apart:
+///
+/// * `ALAG = TVLAG` — the attribute itself, declared under a reserved
+///   spelling. The binding is the left-hand side.
+/// * `lagtime = TLAG` — the alias `ferx-core::edit` writes when the model's
+///   own name is not a reserved spelling. The binding is the right-hand side.
+///
+/// Read in `[individual_parameters]` order, first match wins; `None` when the
+/// model declares no such parameter.
+fn reserved_binding(lines: &[String], spellings: &[&str]) -> Option<String> {
+    let declared: Vec<&str> = lines
+        .iter()
+        .filter_map(|l| l.split_once('=').map(|(lhs, _)| lhs.trim()))
+        .collect();
+    lines.iter().find_map(|line| {
+        let (lhs, rhs) = line.split_once('=')?;
+        let (lhs, rhs) = (lhs.trim(), rhs.trim());
+        if !spellings.contains(&lhs.to_ascii_lowercase().as_str()) {
+            return None;
+        }
+        // An alias points at another declared parameter; anything else — a θ,
+        // an expression — *is* the declaration.
+        let alias = rhs != lhs
+            && rhs.chars().all(|c| c.is_alphanumeric() || c == '_')
+            && !rhs.is_empty()
+            && declared.contains(&rhs);
+        Some(if alias {
+            rhs.to_string()
+        } else {
+            lhs.to_string()
+        })
+    })
+}
+
 /// Roles that share a PK slot, so a base model's binding for one is the
 /// binding for the other: `v`/`v1`, `q`/`q2`, `lagtime`/`alag`.
 fn slot_of(role: &str) -> &str {
@@ -776,6 +815,9 @@ pub fn combination_allowed(combo: &[FeatureKey], base: &Structure) -> bool {
 /// `β = 1.5`; a Michaelis constant starts at `max(DV)/2` bounded above by
 /// `1.5·max(DV)`, or is **fixed** at `min(DV)/100` for zero-order
 /// elimination; and a mixed model's saturable clearance starts at `CL/2`.
+/// The observation range those last two read is floored positive — a
+/// Michaelis constant at or below zero is not a model, and additive residual
+/// error puts negative observations in ordinary data (see [`Defaults::new`]).
 #[derive(Debug, Clone)]
 pub struct Defaults {
     /// `[individual_parameters]` names the base declares.
@@ -788,12 +830,13 @@ pub struct Defaults {
     pub theta_init: HashMap<String, f64>,
     /// The smallest positive observation time in the data; `1.0` without data.
     pub t_first: f64,
-    /// The largest observation in the data; `1.0` without data — Pharmpy's
-    /// own fallback when a model carries no dataset.
+    /// The largest observation in the data; `1.0` without data, or when the
+    /// data's largest observation is not positive — see [`Defaults::new`],
+    /// which explains why a non-positive range is the no-data case.
     pub dv_max: f64,
-    /// The smallest observation in the data; `1.0` without data. Only a
-    /// zero-order elimination reads it, and it floors at Pharmpy's `0.01`
-    /// when the data would put the fixed Michaelis constant at or below zero.
+    /// The smallest observation in the data, under the same floor. Only a
+    /// zero-order elimination reads it, to fix a Michaelis constant far below
+    /// the observed concentrations.
     pub dv_min: f64,
 }
 
@@ -978,6 +1021,18 @@ impl Defaults {
         // (`_get_pk_observations`) and falls back to 1.0 when the model
         // carries no dataset; a population with no finite observation is the
         // same situation.
+        //
+        // A **non-positive** range is that situation too. Both values are read
+        // only to size a Michaelis constant, and `KM ≤ 0` is not a model: the
+        // saturable term `CL·KM/(KM + C)` is singular at `C = −KM`, and at
+        // `KM = 0` the generated right-hand side evaluates `0/0` when `central`
+        // is zero — which is every subject's first record. Pharmpy guards half
+        // of this (`set_zero_order_elimination` resets a negative
+        // `min(DV)/100` to `0.01`) and not the other half, where an
+        // all-negative dataset would give `KM` a negative *upper bound*. An
+        // additive residual error puts negative observations in perfectly
+        // ordinary data, so both halves are floored here, to the same 1.0 the
+        // no-dataset case uses.
         let observations = || {
             population
                 .subjects
@@ -987,6 +1042,7 @@ impl Defaults {
         };
         let dv_max = observations().fold(f64::NEG_INFINITY, f64::max);
         let dv_min = observations().fold(f64::INFINITY, f64::min);
+        let positive = |v: f64| if v.is_finite() && v > 0.0 { v } else { 1.0 };
         Defaults {
             parameters,
             theta_init: theta_names
@@ -997,8 +1053,8 @@ impl Defaults {
             theta_names,
             eta_names,
             t_first: if t_first.is_finite() { t_first } else { 1.0 },
-            dv_max: if dv_max.is_finite() { dv_max } else { 1.0 },
-            dv_min: if dv_min.is_finite() { dv_min } else { 1.0 },
+            dv_max: positive(dv_max),
+            dv_min: positive(dv_min),
         }
     }
 
@@ -1145,11 +1201,26 @@ pub fn structural_spec(
     // existing name as it is. So the count is bound to a *fresh* parameter,
     // and the parent's old one, now unreferenced, is pruned with its θ.
     let rebind_n = target.transits.is_some() && target.transits != parent.transits;
-    let bound: HashMap<&str, &str> = parent_template
+    let mut bound: HashMap<&str, String> = parent_template
         .bindings
         .iter()
-        .map(|(role, var)| (slot_of(role), var.as_str()))
+        .map(|(role, var)| (slot_of(role), var.clone()))
         .collect();
+    // An `ode_template` line takes the disposition roles only, so a parent
+    // that is itself an ODE candidate carries its bioavailability and lag
+    // time in `[individual_parameters]` instead — as the reserved name
+    // itself, or as an alias standing in for another parameter (#1257).
+    // Reading them back the way the engine resolves them is what keeps a
+    // second step from dropping F or re-deriving a lag time the search never
+    // moved: `ELIMINATION(MM)` and then `PERIPHERALS(1)` must leave both
+    // exactly where the base put them.
+    if parent_template.keyword != "pk" {
+        for (role, spellings) in [("f", &["f"][..]), ("lagtime", &["lagtime", "alag"][..])] {
+            if let Some(var) = reserved_binding(parent_lines, spellings) {
+                bound.entry(role).or_insert(var);
+            }
+        }
+    }
 
     let cl_init = bound
         .get("cl")
@@ -1181,7 +1252,7 @@ pub fn structural_spec(
         let name = if rebinding {
             // Not the parent's own `n` variable (which must go), and not a
             // name the parent declares for anything else.
-            let old = bound.get("n").copied().unwrap_or("");
+            let old = bound.get("n").map(String::as_str).unwrap_or("");
             (1..)
                 .map(|k| {
                     if k == 1 {

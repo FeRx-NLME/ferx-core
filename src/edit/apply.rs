@@ -135,6 +135,24 @@ pub(crate) fn is_ode_reserved_name(name: &str) -> bool {
     matches!(name.to_ascii_lowercase().as_str(), "f" | "lagtime" | "alag")
 }
 
+/// Whether one `[individual_parameters]` assignment is a reserved-name
+/// **alias** — a bridge from an engine slot to a parameter declared under
+/// another name — rather than a declaration of the attribute itself.
+///
+/// `params` is the block's declared names. The discriminator is the
+/// right-hand side: `lagtime = TLAG` names another individual parameter and
+/// is an alias, while `ALAG = TVLAG` names a θ and *is* the model's lag time,
+/// as is `F = inv_logit(…)`. Getting this backwards deletes a real
+/// declaration and silently resets the attribute — F to 1, the lag to 0 —
+/// taking its θ and η with it through the pruner.
+fn is_reserved_alias(code: &str, params: &HashSet<String>) -> bool {
+    let Some((lhs, rhs)) = code.split_once('=') else {
+        return false;
+    };
+    let (lhs, rhs) = (lhs.trim(), rhs.trim());
+    is_ode_reserved_name(lhs) && BARE_IDENT_RE.is_match(rhs) && rhs != lhs && params.contains(rhs)
+}
+
 fn set_structural(text: &mut ModelText, spec: &StructuralSpec) -> Result<(), String> {
     let keyword = match spec.engine {
         StructuralEngine::Pk => "pk",
@@ -278,19 +296,26 @@ fn set_structural(text: &mut ModelText, spec: &StructuralSpec) -> Result<(), Str
     // Dropped and rewritten together, so a move that changes engine or drops
     // the role cannot leave one behind — an `f = BIOAV` surviving into an
     // analytic candidate would declare a parameter named `f` beside the `pk`
-    // line's own `f=` role. Only a model whose disposition line this layer
-    // wrote is touched: a hand-written `ode(...)` model is refused above, so
-    // the only alias reachable here is one of ours.
+    // line's own `f=` role.
+    //
+    // Only an **alias** is dropped, never a canonical declaration. The two
+    // are told apart by what the right-hand side names, not by the left:
+    //
+    //     lagtime = TLAG      alias — `TLAG` is another individual parameter
+    //     ALAG    = TVLAG     declaration — `TVLAG` is a θ
+    //     F       = inv_logit(logit(THETA_F) + ETA_F)   declaration
+    //
+    // A reserved name whose value is a θ or an expression *is* the model's
+    // bioavailability or lag time; deleting it would silently reset the
+    // attribute (F to 1, the lag to 0) and prune its θ and η with it. Only a
+    // reserved name standing in for another declared parameter is a bridge
+    // this layer put there and may take away.
     if was_ode_template {
+        let params = individual_parameter_names(text);
         let dead: Vec<usize> = text
             .logical_lines("individual_parameters")
             .into_iter()
-            .filter(|(_, code)| match code.split_once('=') {
-                Some((lhs, rhs)) => {
-                    is_ode_reserved_name(lhs.trim()) && BARE_IDENT_RE.is_match(rhs.trim())
-                }
-                None => false,
-            })
+            .filter(|(_, code)| is_reserved_alias(code, &params))
             .flat_map(|(span, _)| span)
             .collect();
         text.delete_lines(dead);
