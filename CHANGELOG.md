@@ -20,6 +20,13 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Analytical covariance R matrices now cover in-scope `[odes]` models.** FOCE,
+  FOCEI, and FOCEI-anchored AGQ reuse the existing augmented `Dual2` ODE sensitivity
+  solve and obtain the required third-order prediction blocks by central differences
+  of that second-order jet, matching the closed-form covariance design. The ODE step
+  accounts for `ode_reltol`; IOV and M3 censoring can be combined. Exact-anchor
+  Laplace remains on the reconverged finite-difference covariance path because its
+  marginal requires fourth-order prediction derivatives (#436).
 - **Analytic IOV and M3 covariance for FOCE, FOCEI, and FOCEI-anchored AGQ** — include all
   occasion effects, differentiate shared IOV covariance blocks once, and carry censored
   normal-tail curvature using each method's own marginal definition (PR #955).

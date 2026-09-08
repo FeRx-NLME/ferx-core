@@ -1,5 +1,5 @@
-//! Exact analytic FOCE/FOCEI covariance Hessian (R-matrix) — the noise-free
-//! replacement for the finite-difference covariance step (issue #436).
+//! Sensitivity-assembled FOCE/FOCEI covariance Hessian (R-matrix) — the
+//! replacement for the reconverged-objective finite-difference step (issue #436).
 //!
 //! The per-subject FOCEI objective is `Fᵢ = Φ + ½ log|H̃|` with
 //!
@@ -2059,8 +2059,8 @@ fn subject_cov_hessian_foce_natural(
 /// `None` when the subject/model is outside the analytic-covariance scope (the
 /// caller then falls back to the existing FD covariance for the whole population):
 ///
-/// * `covariance_sensitivities` declines (ODE, scaling, LTBS, time-varying
-///   covariates, oral-infusion, resets, non-fixed doses, non-analytical PK);
+/// * `covariance_sensitivities` declines unsupported sensitivity-provider cases,
+///   scaling, LTBS, custom readouts/residual magnitudes, and non-Gaussian endpoints;
 /// M3/BLOQ rows use scalar derivatives of their tail likelihood while retaining
 /// the same prediction-sensitivity chain.
 ///
@@ -2371,6 +2371,111 @@ mod tests {
 [error_model]
   DV ~ proportional(PROP_ERR)
 "#;
+
+    const ODE_IV_COV: &str = r#"
+[parameters]
+  theta TVK(0.15, 0.01, 2.0)
+  omega ETA_K ~ 0.09
+  sigma ADD_ERR ~ 2.0
+[individual_parameters]
+  K = TVK * exp(ETA_K)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -K * central
+[error_model]
+  DV ~ additive(ADD_ERR)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    const ODE_IV_IOV_COV: &str = r#"
+[parameters]
+  theta TVK(0.15, 0.01, 2.0)
+  omega ETA_K ~ 0.09
+  kappa KAPPA_K ~ 0.04
+  sigma ADD_ERR ~ 2.0
+[individual_parameters]
+  K = TVK * exp(ETA_K + KAPPA_K)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -K * central
+[error_model]
+  DV ~ additive(ADD_ERR)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    const CLOSED_FORM_IV_IOV_COV: &str = r#"
+[parameters]
+  theta TVK(0.15, 0.01, 2.0)
+  omega ETA_K ~ 0.09
+  kappa KAPPA_K ~ 0.04
+  sigma ADD_ERR ~ 2.0
+[individual_parameters]
+  K = TVK * exp(ETA_K + KAPPA_K)
+  V = 1
+[structural_model]
+  pk one_cpt_iv(cl=K, v=V)
+[error_model]
+  DV ~ additive(ADD_ERR)
+"#;
+
+    fn ode_cov_subject(model: &CompiledModel, occasions: usize) -> Subject {
+        let times: Vec<_> = (0..occasions)
+            .flat_map(|k| [1.0, 3.0, 6.0, 11.0].map(|t| t + 12.0 * k as f64))
+            .collect();
+        let n = times.len();
+        let mut subject = Subject {
+            id: "ode-cov".into(),
+            doses: (0..occasions)
+                .map(|k| DoseEvent::new(12.0 * k as f64, 100.0, 1, 0.0, false, 0.0))
+                .collect(),
+            obs_times: times,
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; n],
+            obs_cmts: vec![1; n],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            reset_covariates: Vec::new(),
+            cens: vec![0; n],
+            occasions: (0..occasions)
+                .flat_map(|k| vec![(k + 1) as u32; 4])
+                .collect(),
+            dose_occasions: (1..=occasions).map(|k| k as u32).collect(),
+            reset_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_l2: Vec::new(),
+            obs_records: vec![],
+        };
+        let eta = vec![0.10; model.n_eta];
+        let preds = if model.n_kappa == 0 {
+            crate::pk::compute_predictions_with_tv(
+                model,
+                &subject,
+                &model.default_params.theta,
+                &eta,
+            )
+        } else {
+            let kappas: Vec<_> = (0..occasions)
+                .map(|k| vec![if k % 2 == 0 { 0.08 } else { -0.06 }; model.n_kappa])
+                .collect();
+            crate::pk::predict_iov(model, &subject, &model.default_params.theta, &eta, &kappas)
+        };
+        subject.observations = preds
+            .iter()
+            .enumerate()
+            .map(|(i, p)| p * (0.94 + 0.01 * (i % 3) as f64))
+            .collect();
+        subject
+    }
 
     fn iov_cov_fixture(occasions: usize, block: bool) -> (CompiledModel, Subject) {
         let mut source = WARFARIN
@@ -3147,6 +3252,133 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// ODE covariance uses the same sensitivity-level assembly as closed form: a central
+    /// difference of the augmented `Dual2` jet supplies the third-order prediction blocks.
+    /// Check both conditional (FOCEI) and linearised-marginal (FOCE) Hessians against a
+    /// reconverged-gradient oracle on a tightly solved one-state ODE.
+    #[test]
+    fn ode_cov_hessian_matches_reconverged_gradients() {
+        let model = parse_model_string(ODE_IV_COV).expect("parse ODE covariance fixture");
+        let subject = ode_cov_subject(&model, 1);
+        check_full_natural(&model, &subject, &model.default_params);
+        check_foce_full(&model, &subject, &model.default_params);
+    }
+
+    /// The ODE-specific step scaling must make the result usable at the public default
+    /// `ode_reltol`, rather than requiring users to discover a hidden tight-tolerance
+    /// prerequisite. Compare it with the same model solved at 1e-10.
+    #[test]
+    fn ode_cov_hessian_is_stable_at_default_solver_tolerance() {
+        let tight = parse_model_string(ODE_IV_COV).expect("parse tight ODE fixture");
+        let loose_text = ODE_IV_COV.replace(
+            "[fit_options]\n  ode_reltol = 1e-10\n  ode_abstol = 1e-12\n",
+            "",
+        );
+        let loose = parse_model_string(&loose_text).expect("parse default-tolerance ODE fixture");
+        let subject = ode_cov_subject(&tight, 1);
+
+        let packed = |model: &CompiledModel| {
+            let p = &model.default_params;
+            let x = pack_params(p);
+            let eta = precise_ebe(model, &subject, p);
+            subject_packed_cov_hessian(model, &subject, p, &x, &eta)
+                .expect("ODE covariance must remain analytic at the default tolerance")
+        };
+        let h_tight = packed(&tight);
+        let h_loose = packed(&loose);
+        let scale = h_tight.amax().max(1.0);
+        assert!(
+            (&h_loose - &h_tight).amax() < 2e-2 * scale,
+            "default-tolerance ODE Hessian drifted too far from tight solve: max Δ={}, scale={scale}",
+            (&h_loose - &h_tight).amax()
+        );
+    }
+
+    /// Production dispatch accepts ODE jets for every Gauss-Newton-anchored covariance
+    /// objective, including the largest shared extension: IOV + M3 under FOCE, FOCEI, and
+    /// multi-node FOCEI-AGQ. Exact-anchor Laplace remains a separate fourth-order problem.
+    #[test]
+    fn ode_cov_iov_m3_dispatch_matrix() {
+        use crate::estimation::covariance::analytic_cov_hessian;
+        use crate::types::{EstimationMethod, FitOptions, Population};
+
+        let mut model = parse_model_string(ODE_IV_IOV_COV).expect("parse ODE IOV fixture");
+        model.bloq_method = BloqMethod::M3;
+        let mut reference =
+            parse_model_string(CLOSED_FORM_IV_IOV_COV).expect("parse closed-form IOV reference");
+        reference.bloq_method = BloqMethod::M3;
+        let mut subject = ode_cov_subject(&model, 2);
+        subject.cens[2] = 1;
+        subject.cens[6] = -1;
+        let population = Population {
+            subjects: vec![subject.clone()],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let p = &model.default_params;
+        let x = pack_params(p);
+        let b = precise_iov_mode(&model, &subject, p);
+        let eta = vec![DVector::from_column_slice(&b[..model.n_eta])];
+        let kappas = vec![b[model.n_eta..]
+            .chunks(model.n_kappa)
+            .map(DVector::from_column_slice)
+            .collect::<Vec<_>>()];
+        let reference_b = precise_iov_mode(&reference, &subject, &reference.default_params);
+        let reference_eta = vec![DVector::from_column_slice(&reference_b[..reference.n_eta])];
+        let reference_kappas = vec![reference_b[reference.n_eta..]
+            .chunks(reference.n_kappa)
+            .map(DVector::from_column_slice)
+            .collect::<Vec<_>>()];
+
+        for (method, n_agq, interaction) in [
+            (EstimationMethod::Foce, 1, false),
+            (EstimationMethod::FoceI, 1, true),
+            (EstimationMethod::FoceI, 3, true),
+        ] {
+            let opts = FitOptions {
+                method,
+                n_agq,
+                interaction,
+                ..FitOptions::default()
+            };
+            let h = analytic_cov_hessian(&model, &population, p, &x, &eta, &kappas, &opts)
+                .expect("ODE IOV + M3 must stay on the analytic covariance route");
+            let h_reference = analytic_cov_hessian(
+                &reference,
+                &population,
+                &reference.default_params,
+                &pack_params(&reference.default_params),
+                &reference_eta,
+                &reference_kappas,
+                &opts,
+            )
+            .expect("closed-form IOV + M3 reference must be analytic");
+            assert_eq!((h.nrows(), h.ncols()), (x.len(), x.len()));
+            assert!(h.iter().all(|v| v.is_finite()));
+            assert!((&h - h.transpose()).amax() < 1e-8);
+            let scale = h_reference.amax().max(1.0);
+            assert!(
+                (&h - &h_reference).amax() < 3e-3 * scale,
+                "{method:?} n_agq={n_agq}: ODE covariance must match its closed-form twin; max Δ={}, scale={scale}",
+                (&h - &h_reference).amax()
+            );
+        }
+
+        let laplace = FitOptions {
+            method: EstimationMethod::Laplace,
+            n_agq: 1,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        assert!(
+            analytic_cov_hessian(&model, &population, p, &x, &eta, &kappas, &laplace).is_none(),
+            "exact-anchor Laplace still needs fourth-order prediction derivatives"
+        );
     }
 
     /// Warfarin (1-cpt, diagonal Ω): full FOCE Hessian (with mode response) vs

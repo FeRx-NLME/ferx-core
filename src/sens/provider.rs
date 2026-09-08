@@ -4281,19 +4281,19 @@ pub fn subject_sensitivities(
     r
 }
 
-/// Relative step for differencing the **exact** second-order jet to reach third order.
+/// Relative step for differencing a second-order jet to reach third order.
 ///
 /// `ε^(1/3) ≈ 6.06e-6` is the textbook optimum for a central first difference: truncation
 /// falls as `h²` and round-off grows as `ε/h`, so they balance at the cube root. That optimum
-/// is only *available* because the differenced quantity is exact to machine precision — the
-/// classic reason to avoid this trick, differencing something that is itself a finite
-/// difference, does not apply to a `Dual2` jet.
-fn third_order_fd_step(x: f64) -> f64 {
-    f64::EPSILON.cbrt() * (1.0 + x.abs())
+/// applies directly to a closed-form `Dual2` jet. An ODE jet also carries integration error,
+/// so its effective noise floor is the configured relative tolerance; capping the resulting
+/// step at 1% limits truncation error at loose solver tolerances.
+fn third_order_fd_step(x: f64, jet_noise: f64) -> f64 {
+    jet_noise.max(f64::EPSILON).cbrt().min(1e-2) * (1.0 + x.abs())
 }
 
 /// Third-order sensitivities for the analytic covariance Hessian (#436), obtained by
-/// **finite-differencing the exact `Dual2` second-order jet** along each `(θ, η)` axis.
+/// **finite-differencing the `Dual2` second-order jet** along each `(θ, η)` axis.
 ///
 /// Returns the same per-observation `(f, ∂f/∂η, ∂²f/∂η², ∂f/∂θ, ∂²f/∂η∂θ)` as
 /// [`subject_sensitivities`] — untouched, straight from the base evaluation — plus the
@@ -4302,20 +4302,20 @@ fn third_order_fd_step(x: f64) -> f64 {
 /// # Why finite differences here, and why that is not a step backwards
 ///
 /// The observed information needs one derivative more than the outer gradient, and the
-/// provider stops at second order. Two ways to close that: exact third-order sensitivity
-/// equations (a `Dual3` type and a third-order kernel through every closed form), or
-/// differencing the exact second-order jet. This is the latter.
+/// provider stops at second order. Two ways to close that are exact third-order sensitivity
+/// equations or differencing the second-order jet. This is the latter for both closed-form
+/// kernels and the augmented ODE sensitivity solve.
 ///
 /// The distinction that matters is **what** is being differenced. The covariance stencil this
 /// replaces takes a *second* difference of the reconverged OFV: error amplifies as `ε/h²`, and
 /// each of its `~2·n_free²` points re-solves every subject's inner loop. Here a *single*
-/// central difference is taken of a quantity that is exact to machine precision, so error
-/// amplifies as `ε/h` at worst, and the cost is `2N+1` provider evaluations per subject
+/// central difference is taken of an analytic second-order jet, so error amplifies as
+/// `noise/h` rather than `noise/h²`, and the cost is `2N+1` provider evaluations per subject
 /// (`N = n_theta + n_eta`) with **no inner re-solve** — the covariance step runs once per fit,
 /// so this is arithmetic, not a loop over the optimiser.
 ///
 /// Because `Dual2` carries every `(θ, η)` axis simultaneously, differencing along one axis and
-/// reading the *whole* exact second-order block yields every third-order slice containing that
+/// reading the *whole* second-order block yields every third-order slice containing that
 /// axis at once. Hence one uniform loop rather than four.
 ///
 /// `∂²f/∂θ²` comes from the same sweep (differencing `∂f/∂θ`) rather than from the base jet.
@@ -4334,7 +4334,7 @@ pub fn subject_sensitivities_cov(
     covariance_sensitivities(model, subject, theta, eta, false)
 }
 
-/// Covariance jet over the joint eta/kappa vector, using the closed-form IOV walk.
+/// Covariance jet over the joint eta/kappa vector, using the closed-form or ODE IOV walk.
 pub(crate) fn subject_sensitivities_cov_iov(
     model: &CompiledModel,
     subject: &Subject,
@@ -4351,9 +4351,18 @@ fn covariance_sensitivities(
     eta: &[f64],
     iov: bool,
 ) -> Option<SubjectSens> {
+    let model_supported = if model.ode_spec.is_some() && iov {
+        crate::sens::ode_provider::ode_iov_supported(model)
+    } else if model.ode_spec.is_some() {
+        crate::sens::ode_provider::ode_analytical_supported(model)
+    } else if iov {
+        iov_analytical_supported(model)
+    } else {
+        analytical_supported(model)
+    };
     // Scope gate. This is **not** redundant with `subject_sensitivities` returning `Some`:
     // that predicate has grown well past the covariance assembly's derivation (LTBS since
-    // #665/#673, expression scaling, Form-C readouts, IOV, the event-driven walk). Handing
+    // #665/#673, expression scaling, Form-C readouts). Handing
     // the Gaussian-endpoint assembly a jet from any of those would not fail — it would return a
     // plausible, wrong Hessian, i.e. wrong standard errors with no symptom. So the scope is
     // asserted positively here and kept deliberately narrow; everything else keeps the
@@ -4363,7 +4372,7 @@ fn covariance_sensitivities(
     // and `pop_nll_opts` already encode, rather than derived independently — PR #953 review
     // findings 2/4/5/9 were all the same mistake, a gate written from scratch that then
     // disagreed with the two predicates that had already enumerated this scope.
-    if !(if iov { iov_analytical_supported(model) } else { analytical_supported(model) })
+    if !model_supported
         // `gradient = fd` is the user's opt-out from analytic sensitivities. It is the
         // first clause of `analytic_outer_gradient_available` for the same reason: someone
         // who hit a bad `Dual2` result and set this must not still receive a covariance
@@ -4394,38 +4403,49 @@ fn covariance_sensitivities(
         || model.residual_error_eta.is_some()
         || !model.residual_correlations.is_empty()
         || model.has_custom_ruv_magnitude()
-        || (!iov && subject_routes_to_event_walk(model, subject))
-        || model
-            .indiv_param_partials
-            .indiv_param_program
-            .as_ref()
-            .is_none_or(|p| !prog_covers_required_pk_slots(model, p))
+        || (!iov && model.ode_spec.is_none() && subject_routes_to_event_walk(model, subject))
+        // Closed forms use the model-level individual-parameter program. ODE models
+        // validate their separate `ode_spec.indiv_param_program` in
+        // `ode_analytical_supported` / `ode_iov_supported` above.
+        || (model.ode_spec.is_none()
+            && model
+                .indiv_param_partials
+                .indiv_param_program
+                .as_ref()
+                .is_none_or(|p| !prog_covers_required_pk_slots(model, p)))
     {
         return None;
     }
 
-    // `subject_routes_to_event_walk` above is **not** the whole routing story, and this is
-    // the second reroute it does not see. `subject_sensitivities` calls
-    // `effective_model_for_eval`, which sends a transit/IG subject to its
-    // `absorption_ode_equivalent` whenever `absorption_flip_flop_at` holds — a
-    // *parameter-dependent* decision the model-level gate cannot make. On that route the
-    // differenced quantity is an adaptive-step RK45 solution, not a machine-precision
-    // closed form: the controller changes its step sequence discontinuously under the
-    // `h ≈ ε^(1/3)·(1+|x|) ≈ 6e-6` perturbation used here, so the difference would divide
-    // integrator noise (~`ode_reltol`) by `1.2e-5` and return the third-order tensors as
-    // noise. The `ε^(1/3)` step is only justified because the differenced quantity is
-    // exact; where that premise fails, decline (PR #953 review finding 5).
-    //
-    // Checked at every evaluated point, not just the base one — a subject sitting on the
-    // flip-flop boundary can be closed-form at `x` and rerouted at `x ± h`.
-    let closed_form_at = |t: &[f64], e: &[f64]| -> bool {
-        crate::pk::effective_model_for_eval(model, subject, t, e)
-            .ode_spec
-            .is_none()
+    // Keep every point on the same provider family. A parameter-dependent flip-flop reroute
+    // may switch a closed-form absorption model to its ODE twin. Differencing across that
+    // representation boundary is not a derivative of either route, so decline there.
+    let ode_at = |t: &[f64], e: &[f64]| -> bool {
+        if model.ode_spec.is_some() {
+            true
+        } else if iov {
+            model.effective_for(subject).ode_spec.is_some()
+        } else {
+            crate::pk::effective_model_for_eval(model, subject, t, e)
+                .ode_spec
+                .is_some()
+        }
     };
-    if !closed_form_at(theta, eta) {
-        return None;
-    }
+    let base_is_ode = ode_at(theta, eta);
+    let jet_noise = if base_is_ode {
+        if let Some(ode) = model.ode_spec.as_ref() {
+            ode.solver_opts.reltol
+        } else {
+            model
+                .effective_for(subject)
+                .ode_spec
+                .as_ref()?
+                .solver_opts
+                .reltol
+        }
+    } else {
+        f64::EPSILON
+    };
 
     let n_theta = theta.len();
     let n_eta = eta.len();
@@ -4450,18 +4470,21 @@ fn covariance_sensitivities(
         let (mut tp, mut ep) = (theta.to_vec(), eta.to_vec());
         let (mut tm, mut em) = (theta.to_vec(), eta.to_vec());
         let h = if c < n_theta {
-            let h = third_order_fd_step(theta[c]);
+            let h = third_order_fd_step(theta[c], jet_noise);
             tp[c] += h;
             tm[c] -= h;
             h
         } else {
             let k = c - n_theta;
-            let h = third_order_fd_step(eta[k]);
+            let h = third_order_fd_step(eta[k], jet_noise);
             ep[k] += h;
             em[k] -= h;
             h
         };
-        if !closed_form_at(&tp, &ep) || !closed_form_at(&tm, &em) {
+        // Do not difference across a parameter-dependent closed-form/ODE dispatch
+        // boundary: the two providers use different numerical representations and
+        // the objective is not differentiable at the route switch.
+        if ode_at(&tp, &ep) != base_is_ode || ode_at(&tm, &em) != base_is_ode {
             return None;
         }
         plus.push(evaluate(&tp, &ep)?);
