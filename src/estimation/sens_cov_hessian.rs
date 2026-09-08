@@ -2060,7 +2060,8 @@ fn subject_cov_hessian_foce_natural(
 /// caller then falls back to the existing FD covariance for the whole population):
 ///
 /// * `covariance_sensitivities` declines unsupported sensitivity-provider cases,
-///   scaling, LTBS, custom readouts/residual magnitudes, and non-Gaussian endpoints;
+///   scaling, LTBS, closed-form Form-C readouts, custom residual magnitudes, and
+///   non-Gaussian endpoints. Dual-evaluable ODE readouts are part of the ODE jet;
 /// M3/BLOQ rows use scalar derivatives of their tail likelihood while retaining
 /// the same prediction-sensitivity chain.
 ///
@@ -3260,10 +3261,18 @@ mod tests {
     /// reconverged-gradient oracle on a tightly solved one-state ODE.
     #[test]
     fn ode_cov_hessian_matches_reconverged_gradients() {
-        let model = parse_model_string(ODE_IV_COV).expect("parse ODE covariance fixture");
-        let subject = ode_cov_subject(&model, 1);
-        check_full_natural(&model, &subject, &model.default_params);
-        check_foce_full(&model, &subject, &model.default_params);
+        let form_c = ODE_IV_COV
+            .replace(
+                "ode(obs_cmt=central, states=[central])",
+                "ode(states=[central])",
+            )
+            .replace("[error_model]", "[scaling]\n  y = central\n[error_model]");
+        for source in [ODE_IV_COV, form_c.as_str()] {
+            let model = parse_model_string(source).expect("parse ODE covariance fixture");
+            let subject = ode_cov_subject(&model, 1);
+            check_full_natural(&model, &subject, &model.default_params);
+            check_foce_full(&model, &subject, &model.default_params);
+        }
     }
 
     /// The ODE-specific step scaling must make the result usable at the public default
