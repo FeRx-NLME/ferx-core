@@ -525,7 +525,7 @@ fn a_finite_modeled_duration_is_accepted_and_is_not_the_bolus_curve() {
 ///
 /// This is the assertion that stops the shared helper from collapsing the two snapshot
 /// sets: point `check_absorption_dosing` at `SnapshotSet::Doses` and only this side
-/// dies; point `check_dose_attr_finiteness` at `AllRecords` and only the false-positive
+/// dies; point `check_dose_attr_finiteness` at `Records` and only the false-positive
 /// control dies.
 #[test]
 fn an_absorption_parameter_out_of_domain_only_at_an_observation_is_rejected() {
@@ -581,6 +581,331 @@ fn a_pathway_fraction_out_of_range_only_at_an_observation_is_rejected() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// the warning half of the same attribute — #1286 review, finding 4
+// ---------------------------------------------------------------------------
+
+/// A modeled duration that a covariate can drive **to zero or below**, which
+/// `MODELED_DURATION_MODEL`'s `TVD * exp(WT)` cannot: `exp` is strictly positive, so it
+/// reaches `W_MODELED_DURATION_NONPOSITIVE` never and `E_DOSE_ATTR_NONFINITE` only by
+/// overflowing. The warning and the error are different predicates on the same slot and
+/// need different fixtures.
+const MODELED_DURATION_SIGNED_MODEL: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVD(2.0, 0.01, 48.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  D1 = TVD - WT
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// `W_MODELED_DURATION_NONPOSITIVE` reads `D{n}` out of the same `pk_at_dose[k]` as
+/// `E_DOSE_ATTR_NONFINITE`, so it must be evaluated on the same per-dose snapshots.
+/// Until #1286's review it memoized one `(subject.covariates, TIME = 0)` snapshot per
+/// subject — #1235's exact shape, three hundred lines below the code that fixed it — so a
+/// duration positive at the baseline and `≤ 0` at a later dose went unwarned.
+///
+/// The **first** dose is deliberately benign (`D1 = 2`), so a fix that still reads only
+/// the frozen baseline, or only `pk_at_dose[0]`, leaves this red. The in-domain control
+/// alongside it is what stops "warn on every modeled-`RATE` subject" from passing.
+#[test]
+fn a_modeled_duration_nonpositive_only_at_a_later_dose_is_warned() {
+    let model = parse_full_model(MODELED_DURATION_SIGNED_MODEL)
+        .expect("the signed modeled-duration model parses")
+        .model;
+    // D1 = 2 − WT: 2.0 at dose 1, −1.0 at dose 2. The subject-level baseline is 0.0, so
+    // the frozen snapshot sees D1 = 2 and says nothing.
+    let bad = modeled_dose_pop(RateMode::ModeledDuration, &[0.0, 3.0]);
+    let warns = ferx_core::api::check_model_data_warnings(&model, &bad, &model.default_params);
+    assert!(
+        warns
+            .iter()
+            .any(|d| d.code == "W_MODELED_DURATION_NONPOSITIVE"),
+        "a duration ≤ 0 at dose 2 must be warned, got {:?}",
+        codes(&warns)
+    );
+
+    let ok = modeled_dose_pop(RateMode::ModeledDuration, &[0.0, 0.5]);
+    let warns = ferx_core::api::check_model_data_warnings(&model, &ok, &model.default_params);
+    assert!(
+        !warns
+            .iter()
+            .any(|d| d.code == "W_MODELED_DURATION_NONPOSITIVE"),
+        "every dose is positive; must not warn, got {:?}",
+        codes(&warns)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// the read set is `is_record`, not "every record" — #1286 review, findings 1 and 2
+// ---------------------------------------------------------------------------
+
+/// `zero_order` absorption whose window is `TVDUR − WT`: in domain at `WT = 0`, `≤ 0`
+/// once `WT` exceeds it. Unlike the density kernels, the engine skips this kind in the
+/// per-segment RHS loop entirely and takes `dur` off the **dose**'s snapshot.
+const TV_COV_ZERO_ORDER_MODEL: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVDUR(4.0, 0.05, 24.0)
+  omega ETA_CL ~ 0.0 FIX
+  sigma PROP_ERR ~ 0.01 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  DUR = TVDUR - WT
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = zero_order(dur=DUR) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// One compartment mixing a **zero-order** pathway with a **density** one (#505), the
+/// fractions covariate-driven but summing to 1 identically at every record.
+const TV_COV_MIXED_FRACTION_MODEL: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVDUR(4.0, 0.05, 24.0)
+  theta TVKA(1.0, 0.05, 24.0)
+  omega ETA_CL ~ 0.0 FIX
+  sigma PROP_ERR ~ 0.01 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  DUR = TVDUR
+  KA  = TVKA
+  FR1 = 0.4 + WT
+  FR2 = 0.6 - WT
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = FR1*zero_order(dur=DUR) + FR2*first_order(ka=KA) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// One dose at `t = 0`, observations at 1 and 8, `WT` per record; optionally an EVID=3/4
+/// reset at `t = 4` and an EVID=2 row at `t = 4`, each with its own `WT`.
+fn transit_subject(
+    wt_dose: f64,
+    wt_obs: [f64; 2],
+    wt_reset: Option<f64>,
+    wt_pk_only: Option<f64>,
+) -> Subject {
+    let mut s = common::subject(
+        "1",
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        vec![1.0, 8.0],
+        vec![0.0; 2],
+        vec![2; 2],
+    );
+    s.covariates = wt(0.0);
+    s.dose_covariates = vec![wt(wt_dose)];
+    s.obs_covariates = wt_obs.iter().map(|&v| wt(v)).collect();
+    if let Some(v) = wt_reset {
+        s.reset_times = vec![4.0];
+        s.reset_covariates = vec![wt(v)];
+    }
+    if let Some(v) = wt_pk_only {
+        s.pk_only_times = vec![4.0];
+        s.pk_only_covariates = vec![wt(v)];
+    }
+    s
+}
+
+fn preds(model: &ferx_core::types::CompiledModel, pop: &Population) -> Vec<f64> {
+    predict(model, pop, &model.default_params)
+        .iter()
+        .map(|p| p.pred)
+        .collect()
+}
+
+/// An EVID=2 row is a governing record — `is_record` admits `Kind::PkOnly` — so an
+/// absorption parameter out of domain only there **is** applied and must be rejected.
+///
+/// Without this the `Records` set is satisfied by one that carries doses and observations
+/// only, which is a different set and wrong in the other direction. Dies if `pk_only` is
+/// dropped from `typical_event_snapshots`.
+#[test]
+fn an_absorption_parameter_out_of_domain_only_at_an_evid2_record_is_rejected() {
+    let model = parse_full_model(TV_COV_TRANSIT_MODEL)
+        .expect("the TV-covariate transit model parses")
+        .model;
+    let pop = population(transit_subject(0.0, [0.0, 0.0], None, Some(10.0)), &["WT"]);
+    let diags = check_model_data(&model, &pop);
+    let hit = find(&diags, "E_ABSORPTION_DOMAIN");
+    assert!(
+        hit.message.contains("EVID=2 record 1 at TIME=4"),
+        "must name the record: {}",
+        hit.message
+    );
+}
+
+/// **Finding 1.** An EVID=3/4 **reset** row's snapshot is not a read site for any
+/// input-rate forcing: `is_record` excludes `Kind::Reset`, `pk_now`'s reset arm takes
+/// `last_pk`, and the segment terminating at a reset is overwritten by the re-seed before
+/// any readout. So a parameter out of domain only there must **not** be rejected — and it
+/// is not merely un-rejected, the prediction is **bit-identical** to the in-domain
+/// control, which is what proves the engine never applied it.
+///
+/// The bit-identity is the load-bearing half. `is_finite()` would pass on a subject whose
+/// curve had silently moved; only equality against the control can fail for the right
+/// reason. Dies if a `reset` arm is added back to `typical_event_snapshots`.
+#[test]
+fn an_absorption_parameter_out_of_domain_only_at_a_reset_is_not_rejected_and_predicts_identically()
+{
+    let model = parse_full_model(TV_COV_TRANSIT_MODEL)
+        .expect("the TV-covariate transit model parses")
+        .model;
+    // MTT = 1 − WT: 1.0 everywhere except the reset row, where WT = 10 gives −9.
+    let bad = population(transit_subject(0.0, [0.0, 0.0], Some(10.0), None), &["WT"]);
+    let ctl = population(transit_subject(0.0, [0.0, 0.0], Some(0.0), None), &["WT"]);
+    let diags = check_model_data(&model, &bad);
+    assert!(
+        !diags.iter().any(|d| d.code == "E_ABSORPTION_DOMAIN"),
+        "a reset snapshot is not a read site, got {:?}",
+        codes(&diags)
+    );
+    let (b, c) = (preds(&model, &bad), preds(&model, &ctl));
+    assert!(
+        b.iter().all(|p| p.is_finite()),
+        "the subject must still predict finite values, got {b:?}"
+    );
+    assert_eq!(
+        b.iter().map(|p| p.to_bits()).collect::<Vec<_>>(),
+        c.iter().map(|p| p.to_bits()).collect::<Vec<_>>(),
+        "the reset-row value is never applied, so the curve must be bit-identical to the \
+         in-domain control: {b:?} vs {c:?}"
+    );
+}
+
+/// **Finding 2.** `add_prepared_input_rate_forcing` `continue`s on
+/// `InputRateKind::ZeroOrder`, and the window's `dur` comes from
+/// `zero_order_dur_and_frac_for_dose` on the dose's snapshot, so a `dur` out of domain
+/// only at an *observation* is a value the engine never reads — bit-identical to the
+/// in-domain control, and so must not be rejected.
+#[test]
+fn a_zero_order_duration_out_of_domain_only_at_an_observation_is_not_rejected() {
+    let model = parse_full_model(TV_COV_ZERO_ORDER_MODEL)
+        .expect("the TV-covariate zero-order model parses")
+        .model;
+    // DUR = 4 − WT: 4.0 at the dose, −1.0 at observation 2.
+    let bad = population(transit_subject(0.0, [0.0, 5.0], None, None), &["WT"]);
+    let ctl = population(transit_subject(0.0, [0.0, 0.0], None, None), &["WT"]);
+    let diags = check_model_data(&model, &bad);
+    assert!(
+        !diags.iter().any(|d| d.code == "E_ABSORPTION_DOMAIN"),
+        "a zero-order window is a dose-time quantity, got {:?}",
+        codes(&diags)
+    );
+    let (b, c) = (preds(&model, &bad), preds(&model, &ctl));
+    assert!(
+        b.iter().all(|p| p.is_finite()),
+        "the subject must still predict finite values, got {b:?}"
+    );
+    assert_eq!(
+        b.iter().map(|p| p.to_bits()).collect::<Vec<_>>(),
+        c.iter().map(|p| p.to_bits()).collect::<Vec<_>>(),
+        "the observation-row `dur` is never applied: {b:?} vs {c:?}"
+    );
+}
+
+/// The other side of the same gate, and the reason `forcing_is_read_at` cannot be
+/// "`ZeroOrder` is never checked": at a **dose** record the engine really does read
+/// `dur`, so an out-of-domain value there must still be rejected, naming the dose.
+///
+/// Without this arm, `forcing_is_read_at(ZeroOrder, _) = false` passes the whole file.
+#[test]
+fn a_zero_order_duration_out_of_domain_at_the_dose_is_still_rejected() {
+    let model = parse_full_model(TV_COV_ZERO_ORDER_MODEL)
+        .expect("the TV-covariate zero-order model parses")
+        .model;
+    // DUR = 4 − WT: −1.0 at the dose itself.
+    let pop = population(transit_subject(5.0, [0.0, 0.0], None, None), &["WT"]);
+    let diags = check_model_data(&model, &pop);
+    let hit = find(&diags, "E_ABSORPTION_DOMAIN");
+    assert!(
+        hit.message.contains("dose 1 at TIME=0"),
+        "must name the dose: {}",
+        hit.message
+    );
+}
+
+/// The Σ ≈ 1 completeness rule. On a compartment mixing a zero-order pathway with a
+/// density one the engine reads the two fractions at *different* snapshots, so only a
+/// dose record sees the whole partition. A model whose fractions sum to 1 identically
+/// must not be rejected at its first observation for summing to the density share alone.
+///
+/// Dies if the `zero_order_cmt_idx` skip is removed: `FR2 = 0.6 − WT` alone is 0.4 at
+/// observation 2, 0.6 away from 1.
+#[test]
+fn a_mixed_zero_order_and_density_compartment_summing_to_one_is_not_rejected() {
+    let model = parse_full_model(TV_COV_MIXED_FRACTION_MODEL)
+        .expect("the mixed zero-order/density model parses")
+        .model;
+    let pop = population(transit_subject(0.1, [0.15, 0.2], None, None), &["WT"]);
+    let diags = check_model_data(&model, &pop);
+    assert!(
+        !diags.iter().any(|d| d.code == "E_ABSORPTION_FRACTION"),
+        "FR1 + FR2 == 1 at every record, got {:?}",
+        codes(&diags)
+    );
+    let p = preds(&model, &pop);
+    assert!(
+        p.iter().all(|v| v.is_finite()),
+        "the mixed-pathway subject must predict finite values, got {p:?}"
+    );
+}
+
+/// The in-domain acceptance control for the whole `Records` set: a subject carrying
+/// **every** record kind — dose, observations, EVID=2 and a reset — with the covariate in
+/// domain at all of them must produce no absorption diagnostic at all.
+///
+/// Without it the arms above are all satisfied by a check that rejects any subject with
+/// an EVID=2 or reset row (#1286 review, finding 6).
+#[test]
+fn every_record_kind_in_domain_is_accepted_and_predicts() {
+    let model = parse_full_model(TV_COV_TRANSIT_MODEL)
+        .expect("the TV-covariate transit model parses")
+        .model;
+    let pop = population(
+        transit_subject(0.0, [0.1, 0.2], Some(0.3), Some(0.4)),
+        &["WT"],
+    );
+    let diags = check_model_data(&model, &pop);
+    assert!(
+        !diags
+            .iter()
+            .any(|d| d.code.starts_with("E_ABSORPTION") || d.code == "E_DOSE_ATTR_NONFINITE"),
+        "every snapshot is in domain, got {:?}",
+        codes(&diags)
+    );
+    let p = preds(&model, &pop);
+    assert!(
+        p.iter().all(|v| v.is_finite()),
+        "must predict finite values, got {p:?}"
+    );
+}
+
 /// **A stated behaviour change on a public entry point.** `predict()` / `simulate()` run
 /// no `check_model_data`, but they *do* call `assert_absorption_dosing_supported`, which
 /// panics on the first error `check_absorption_dosing` returns. Widening that check's
@@ -593,8 +918,15 @@ fn a_pathway_fraction_out_of_range_only_at_an_observation_is_rejected() {
 /// `E_DOSE_ATTR_NONFINITE` has no such `assert_*` twin, so the widening leaves
 /// `predict()` unchanged for it. That gap is #1280 / #898, not something to close by
 /// adding an eleventh panic wrapper here.
+///
+/// The `expected` string names the **record**, not the wrapper. `panic_if_unsupported`'s
+/// "absorption input-rate machinery cannot honour" is emitted for every
+/// `check_absorption_dosing` error there has ever been — an SS/zero-order rejection, a
+/// `[diffusion]` clash — so matching on it would let this test pass while the widening it
+/// exists to pin was gone, on a panic raised by something else entirely (#1286 review,
+/// finding 5). `observation 2 at TIME=8` can only come from the observation snapshot.
 #[test]
-#[should_panic(expected = "absorption input-rate machinery cannot honour")]
+#[should_panic(expected = "observation 2 at TIME=8")]
 fn predict_now_aborts_on_an_absorption_domain_error_reached_only_at_an_observation() {
     let model = parse_full_model(TV_COV_TRANSIT_MODEL)
         .expect("the TV-covariate transit model parses")

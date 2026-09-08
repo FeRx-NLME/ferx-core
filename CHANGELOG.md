@@ -164,7 +164,13 @@ section of the SDLC for the versioning policy).
   snapshot (#1235).** `E_ABSORPTION_DOMAIN` and `E_ABSORPTION_FRACTION` read the same frozen
   baseline snapshot; the engine rebuilds the input-rate forcing per *segment* from the last
   event's snapshot, so an `mtt` or pathway fraction driven out of range only at a later
-  observation is a value it really does apply. **Behaviour change:** `predict()` and
+  observation is a value it really does apply. The set is the engine's own record predicate —
+  dose, observation and EVID=2 rows — and **not** EVID=3/4 resets, whose segment is discarded by
+  the re-seed; a `zero_order()` window, fraction and per-route lag are checked at **dose records
+  only**, because a spanning window is fixed at dose time rather than rebuilt per segment. Both
+  narrowings are what stop an ordinary crossover or washout dataset, and an ordinary
+  covariate-driven `zero_order(dur=DUR)`, from being rejected for a value the engine never
+  reads. **Behaviour change:** `predict()` and
   `simulate()` enforce this pair as a panic (they run no data check, but do call
   `assert_absorption_dosing_supported`), so a model that previously returned numbers from an
   out-of-domain forcing now aborts there instead. `E_DOSE_ATTR_NONFINITE` has no such twin and
@@ -172,6 +178,13 @@ section of the SDLC for the versioning policy).
   change closes. The two checks deliberately read *different* snapshot sets: a lag / `F` /
   `D{n}` / `R{n}` is read at dose records only, so one going non-finite at an observation is
   **not** an error.
+- **`W_MODELED_DURATION_NONPOSITIVE` / `W_MODELED_RATE_NONPOSITIVE` are evaluated per dose
+  record too (#1235).** These warn when a modeled `D{n}` / `R{n}` is `≤ 0` at the initial
+  estimates, and read the same attribute out of the same per-dose snapshot as
+  `E_DOSE_ATTR_NONFINITE` — but they were still frozen at one `(baseline covariates, TIME = 0)`
+  point per subject, so a duration that only collapses at a later dose went unwarned. Whether
+  `≤ 0` should be an error rather than a warning, and what the mid-fit clamp does to the
+  trajectory, remains #1284.
 - **`W_STEADY_STATE_INFUSION` no longer claims a record is served as a single non-SS infusion
   when it is not (#1281).** The warning compared the record's own `AMT/RATE`; the steady-state
   run-in compares the length *after bioavailability*, which on a rate-defined infusion is
