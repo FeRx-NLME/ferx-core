@@ -115,9 +115,17 @@ jobs:
       # `src/nn`, `src/estimation/nn_theta_gradient` and the feature-gated branches
       # of the shared modules (parser, sens provider, io/output) live there — for
       # `nn` that is the bulk of the surface.
+      #
+      # `--profile ci-cov` and `FERX_REQUIRE_DEBUG_ASSERTIONS=1`: see the same pair
+      # on `Tests + coverage (core)` below. This job carries the feature set —
+      # `ci,markov,nn` — that the retired `Tests (debug-assertions)` job's second
+      # command existed for, so the guards in `src/survival`, `src/markov`,
+      # `src/categorical` and `src/nn` are live exactly here (#1248, folding #344).
       - name: Generate TTE/CTMM endpoint coverage report
+        env:
+          FERX_REQUIRE_DEBUG_ASSERTIONS: "1"
         run: |
-          cargo llvm-cov --no-fail-fast --no-default-features --features ci,markov,nn --profile ci-fast \
+          cargo llvm-cov --no-fail-fast --no-default-features --features ci,markov,nn --profile ci-cov \
             --lib \
             --test agq \
             --test categorical_convergence \
@@ -147,48 +155,37 @@ jobs:
           fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}
 
-  # #344. Every other test job in this file builds with `--profile ci-test` or
-  # `--profile ci-fast`, and both `inherits = "release"` — so `debug-assertions`
-  # is OFF and all 177 `debug_assert!` guards in the crate compile to nothing.
-  # They are invariant checks that CI was not running.
+  # The guards-OFF lane, and the counterweight to `[profile.ci-cov]` (#1293 review
+  # of #1248). Both coverage jobs now build with `debug-assertions` and
+  # `overflow-checks` ON, which is what makes the guards' condition lines coverable
+  # — but it also meant that, for one commit, NO per-PR job ran the crate the way a
+  # user's release build behaves. The remaining `ci-test` runs are scheduled,
+  # manual, or post-merge, so a release-only regression could have merged green.
   #
-  # That was not theoretical. An off-by-one in `compute_max_stack`
-  # (`src/parser/model_parser.rs`) tripped its own `debug_assert!` for any
-  # expression containing an `if`, and four lib tests panicked under the dev
-  # profile while CI stayed green through the whole thing (fixed in #342; this
-  # job closes the blind spot that hid it).
+  # That is not abstract. `continuous_value()` (`src/types.rs`) and
+  # `max_scaled_deviation()` (`src/estimation/outer_optimizer.rs`) each have two
+  # correct behaviours: a misuse guard that fires where `debug_assert!` is live, and
+  # a NaN fallback that is what users actually get. Under `ci-cov` only the panic
+  # arm runs. This job is where the other arm is checked before merge.
   #
-  # Deliberately a SEPARATE job rather than flipping `ci-test`: that profile
-  # exists so the population-fit tests run at release speed, and this repo is
-  # compile-bound (93% LLVM, #969/#971), so the cheap way to get the guards
-  # executed is one extra UNOPTIMISED build — not a second optimised one.
-  # Measured locally on the dev profile: 80s of tests for `--features ci` (4035
-  # tests) and 198s for `--features ci,markov,nn` (4366), all green — turning the
-  # guards on surfaced no latent failure, so this job starts green.
+  # Cheap, and deliberately narrower than the coverage jobs: `--lib` only, on the
+  # `ci,markov,nn` union of production cfgs. It runs in parallel with the two
+  # coverage jobs and is shorter than either, so it adds no wall-clock to the
+  # critical path. It does NOT restore guards-off `tests/` binaries — that is the
+  # 120-odd binary compile, and `slow-tests.yml` plus the nightly coverage job
+  # still run those on `ci-test` with the guards off.
   #
-  # The commands live in `tools/preflight.sh` (group `debug-assertions`) for the
-  # same reason as `Check`/`Clippy`/`Format` (#1157) — one list, so the local gate
-  # and the CI gate cannot drift. It is the one group that is opt-in locally: it
-  # runs a suite rather than a compile, so a no-argument `tools/preflight.sh`
-  # stays a pre-push habit and this job is where it has to be green.
-  #
-  # Note that "no `--profile` flag" is an invariant held by ABSENCE, and this job
-  # would be a no-op again — silently, with every test green — if a
-  # `[profile.dev] debug-assertions = false` or a
-  # `CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false` ever appeared. So the group's
-  # commands arm `debug_assertion_canary` (`src/lib_tests.rs`) via
-  # `env FERX_REQUIRE_DEBUG_ASSERTIONS=1`, and that canary fails the run if
-  # `debug_assert!` turns out to compile to nothing. Do NOT set that variable at
-  # the workflow or job level: every other job legitimately runs with the guards
-  # off, and arming it there would fail them for doing the right thing.
-  debug-assertions:
-    name: Tests (debug-assertions)
+  # Commands live in `tools/preflight.sh` (group `release-semantics`) for the same
+  # reason as `Check`/`Clippy`/`Format` (#1157), and they arm the INVERSE canary —
+  # `FERX_REQUIRE_NO_DEBUG_ASSERTIONS=1`, which fails the run if `debug_assert!`
+  # turns out to be live here after all. Without it the whole lane would rest on
+  # `ci-fast` never acquiring `debug-assertions`: it would silently become a second
+  # copy of the coverage jobs, green throughout.
+  release-semantics:
+    name: Tests (release semantics)
     runs-on: ubuntu-latest
-    # Stable, not the workflow-level nightly: `--features ci,markov,nn` has no
-    # nightly-only code, and stable's rustc holds for ~6 weeks against nightly's
-    # daily bump — `rust-cache` keys on `rustc -vV`, so nightly here would cold-
-    # rebuild the dep graph every day for no gate. Same reasoning as the coverage
-    # jobs. `tools/preflight.sh` honours an inherited `RUSTUP_TOOLCHAIN`.
+    # Stable, like the coverage jobs: no nightly-only code, and `rust-cache` keys on
+    # the rustc version, so nightly would cold-rebuild the dep graph daily.
     env:
       RUSTUP_TOOLCHAIN: stable
     steps:
@@ -198,12 +195,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          # Own key: the dev profile shares no artifacts with the `ci` (check /
-          # clippy) caches or with the instrumented coverage ones.
-          shared-key: ci-debug-assertions
+          # Own key: uninstrumented `ci-fast` shares artifacts with neither the
+          # plain `ci` (check/clippy) caches nor the instrumented `ci-cov` ones.
+          shared-key: ci-release-semantics
 
-      - name: cargo test --lib with debug-assertions on (via tools/preflight.sh)
-        run: tools/preflight.sh debug-assertions
+      - name: cargo test --lib with debug-assertions OFF (via tools/preflight.sh)
+        run: tools/preflight.sh release-semantics
 
   clippy:
     name: Clippy
@@ -421,7 +418,7 @@ jobs:
         # both RUNS the base suite and is the per-PR patch gate; the full
         # `ci,slow-tests` run is nightly (the `coverage` job above) and the
         # feature-gated endpoints are the `endpoints` job. Builds with
-        # `--profile ci-fast` (no fat LTO *and* no local ThinLTO — ~31% off the
+        # `--profile ci-cov` (no fat LTO *and* no local ThinLTO — ~31% off the
         # lib compile, #969) to stay within the PR wall-clock; the fast Tier-1/2
         # fits here tolerate the ThinLTO-off fit slowdown that the nightly
         # `coverage`/`slow-tests` jobs avoid by staying on `ci-test`. `--tests`
@@ -440,7 +437,25 @@ jobs:
         # instrumented build, so no third cache key and no second `ferx-core`
         # compile. The bare `--features ci` has to become `ferx-core/ci` because
         # `ci` is not a feature of the members.
-        run: cargo llvm-cov --workspace --tests --no-fail-fast --no-default-features --features ferx-core/ci --profile ci-fast --lcov --output-path lcov.info
+        #
+        # `--profile ci-cov` is `ci-fast` plus `debug-assertions`/`overflow-checks`
+        # (#1248). Two things follow. (1) The ~180 `debug_assert!` guards RUN here,
+        # which is what retired the separate `Tests (debug-assertions)` job: that job
+        # was `--lib` on `ci,markov,nn`, a strict subset of this `--tests` run plus
+        # the endpoints one, and it cost 32–42 min — the critical path, ~2x this job.
+        # (2) Their condition lines stop being permanently-missed patch lines, which
+        # is #1248 itself: measured 63 lines flipping 0 -> >0 in `--lib` scope alone.
+        #
+        # `FERX_REQUIRE_DEBUG_ASSERTIONS=1` arms `debug_assertion_canary`
+        # (`src/lib_tests.rs`). Without it BOTH of those properties would rest on the
+        # absence of a mistake — a `[profile.ci-cov] debug-assertions = false`, or the
+        # profile silently reverting to `ci-fast`, would leave every test green and
+        # every guard dead, which is the shape of #344 all over again. Set it on the
+        # jobs that build `ci-cov` and nowhere else: every other job legitimately runs
+        # with the guards off, and arming it there fails them for doing the right thing.
+        env:
+          FERX_REQUIRE_DEBUG_ASSERTIONS: "1"
+        run: cargo llvm-cov --workspace --tests --no-fail-fast --no-default-features --features ferx-core/ci --profile ci-cov --lcov --output-path lcov.info
 
       - name: Upload to Codecov (fast flag)
         uses: codecov/codecov-action@v7

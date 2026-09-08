@@ -150,3 +150,44 @@ lto = false
 [profile.ci-fast]
 inherits = "ci-test"
 lto = "off"
+
+
+# Used by the two per-PR *coverage* jobs only (`Tests + coverage (core)` and
+# `Tests + coverage (TTE/CTMM endpoints)`). Everything `ci-fast` gives them, plus
+# the `debug_assert!` guards actually live. This is #1248, and it subsumes #344.
+#
+# WHY A PROFILE RATHER THAN A FLIPPED `ci-fast`. `ci-fast` is not CI-only despite
+# its name — `tools/vi-nuts-anchor/run.sh` and `tools/vi-emvi-comparison/run.sh`
+# build `target/ci-fast/ferx` with it to produce NUMERICAL anchors. Flipping it
+# would put the guards (and the `#[cfg(debug_assertions)]` MR ODE-twin verifier in
+# `pk/modified_release.rs`) into those runs, which is not what a maintainer timing
+# an anchor asked for. A separate profile keeps that surface untouched.
+#
+# NAME COLLISION, deliberate and harmless: `coverage-pr`'s `rust-cache` entry is
+# also called `ci-cov`. Different namespaces (a cargo profile vs a cache key) for
+# the same pair of jobs; neither reads the other.
+#
+# It costs no extra compile in CI. Both coverage jobs already carry coverage
+# `RUSTFLAGS` and their own `rust-cache` keys (`ci-cov`, `ci-cov-endpoints`), so
+# their artifacts were never shared with any other job; this renames the profile
+# they build under rather than adding a build. Measured locally (15 cores, stable,
+# `--features ci`), clean lib rebuild: `ci-fast` 92 s / 98 s vs `ci-cov` 93 s / 87 s
+# — the within-profile spread exceeds the between-profile difference.
+#
+# `debug-assertions` — measured `--workspace --tests`: 133 s off, 133 s on; `--lib`
+# 5.76 s → 6.45 s. Free, because these profiles are release-optimised. Do NOT read
+# the 577 s figure in `pk/modified_release.rs` as the cost of turning its verifier
+# on: that was measured on the unoptimised `dev` profile, where the fits are two
+# orders slower.
+#
+# `overflow-checks` — NOT inherited from `debug-assertions`. Cargo defaults it per
+# profile (true for `dev`, false for `release`), so a `release`-derived profile that
+# sets only `debug-assertions = true` still compiles with `-C overflow-checks=off`
+# (verified via `cargo build -v`). It is set explicitly here because it is the one
+# thing the retired `Tests (debug-assertions)` job had that the coverage jobs did
+# not, and folding it in is what let that job go. Measured cost: `--workspace
+# --tests` 133 s → 147 s, 5732 passed / 0 failed.
+[profile.ci-cov]
+inherits = "ci-fast"
+debug-assertions = true
+overflow-checks = true

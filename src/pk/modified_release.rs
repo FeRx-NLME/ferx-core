@@ -806,10 +806,17 @@ pub(crate) fn mr_scope<'a>(
 ///     regimen on the same id — the case CLAUDE.md's non-degeneracy rule says
 ///     must always be checked, and the one superposition most needs checked.
 ///
-/// The gate is also `#[cfg(debug_assertions)]`, and every profile CI builds tests
-/// with inherits `release`, so none of this runs in CI or in a user's fit — that
-/// is the already-tracked #344. Treat the gate as a local development aid, not as
-/// the reason admitting a closed form is safe.
+/// The gate is `#[cfg(debug_assertions)]`. That used to mean it ran nowhere but a
+/// local dev build — the already-tracked #344 — but since #1248 the two per-PR
+/// coverage jobs build `[profile.ci-cov]`, where the guards are live, so it DOES
+/// now run in CI. Measured when that landed: `--workspace --tests` took 133 s with
+/// the gate off and 133 s with it on, because `ci-cov` is release-optimised. Do not
+/// read the 577 s figure below as its cost in CI — that was the unoptimised `dev`
+/// profile, where the fits are two orders slower.
+///
+/// It still does not run in a user's fit (release has the guards off), and the
+/// memo-key weaknesses listed above are unchanged, so it remains a development aid
+/// rather than the reason admitting a closed form is safe.
 #[cfg(debug_assertions)]
 type MrVerifyKey = (usize, String, Vec<i32>);
 
