@@ -43,7 +43,10 @@
   method     = focei
   maxiter    = 500
   covariance = true
-  # Derivative-free outer optimizer, as in two_cpt_oral_covmodel.ferx: the
-  # gradient-based default does not leave the initial estimates on this start
-  # (an init stall of the #751 family).
+  # Derivative-free outer optimizer. It was originally here because the
+  # gradient-based default did not leave the initial estimates on this start;
+  # that was the EBE warm start going path-dependent and is fixed (#1290), and
+  # the default now converges here too (OFV -172.234 against BOBYQA's -172.233).
+  # The key stays so the numbers in docs/tools/amd.qmd keep describing the run
+  # this file produces.
   optimizer  = bobyqa

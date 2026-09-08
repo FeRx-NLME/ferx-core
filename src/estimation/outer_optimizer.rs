@@ -1007,6 +1007,30 @@ fn detect_stagnation(state: &mut NloptState, n: usize, enabled: bool) -> bool {
     }
 }
 
+/// Should this evaluation's EBEs become the warm start for the next one? (#1290)
+///
+/// The inner loop is warm-started from the cached EBEs of a previous eval, and
+/// the EBE surface is multimodal (#864 / #891). Adopting the EBEs of *every*
+/// eval makes the outer objective path-dependent: a probe that lands somewhere
+/// terrible leaves the cache in a bad basin, the inner loop keeps re-finding it,
+/// and the same `xs` then evaluates worse than it did before the excursion. A
+/// line search cannot descend an objective whose value at its own starting point
+/// has moved, so NLopt L-BFGS returns a bare `Failure` on eval 1 and the fit is
+/// reported at its initial estimates.
+///
+/// Anchoring the warm start to the best point seen removes that: the EBEs fed to
+/// the inner loop always come from the incumbent, so re-evaluating the incumbent
+/// reproduces its objective.
+///
+/// A guarded eval never contributes, whatever its number: `ofv` is then
+/// `guard_penalty_value` — a synthetic distance-to-center penalty on an
+/// arbitrary scale, not a likelihood — so it can sit below `best_ofv` for a
+/// model whose objective is positive, and its EBEs come from a point the EBE
+/// guard has already rejected.
+fn adopt_warm_start(guarded: bool, ofv: f64, best_ofv: f64) -> bool {
+    !guarded && ofv < best_ofv
+}
+
 fn new_nlopt_state(n_subj: usize, n_eta: usize, x0: &[f64]) -> NloptState {
     NloptState {
         cached_etas: vec![DVector::zeros(n_eta); n_subj],
@@ -1733,6 +1757,20 @@ fn optimize_nlopt_once(
         let x: Vec<f64> = (0..n).map(|i| xs[i] * scale[i]).collect();
         let params = unpack_params(&x, init_params);
 
+        // EBE warm-start cache: the update below is withheld unless this eval
+        // improves on the best seen, so the warm start always comes from the
+        // incumbent. See `adopt_warm_start` for why the alternative deadlocks the
+        // line search (#1290). `cached_etas` needs no snapshot — the update is a
+        // plain assignment we can skip — but the mixture branch writes
+        // `cached_etas_by_class` before the objective is known, so that one has to
+        // be saved to be restored. Only for a mixture: this is the per-eval hot
+        // path, and an unconditional clone would cost an allocation per subject on
+        // every fit.
+        let warm_start_by_class = params
+            .mixture
+            .is_some()
+            .then(|| state.cached_etas_by_class.clone());
+
         // Mixture models (#977): K-fold log-sum-exp objective with a per-class
         // serial inner solve. The per-eval `kappas` slot stays empty: on the mixture
         // path the gradient reads `mixeval` (not these kappas), so the MIXEST-class κ
@@ -1941,9 +1979,17 @@ fn optimize_nlopt_once(
             }
         }
 
-        // Update state
-        state.cached_etas = ehs;
+        // Update state. The EBE cache is adopted only when this eval improved on the
+        // best objective seen; otherwise the incumbent's EBEs stay in place — kept
+        // by skipping the `cached_etas` write, restored from the snapshot for the
+        // mixture cache the branch above has already overwritten (#1290).
+        let warm_start_improved = adopt_warm_start(guarded, ofv, state.best_ofv);
         state.cached_h_mats = hms;
+        if warm_start_improved {
+            state.cached_etas = ehs;
+        } else if let Some(prev) = warm_start_by_class {
+            state.cached_etas_by_class = prev;
+        }
         state.n_evals += 1;
         n_evals_cl.fetch_add(1, Ordering::Relaxed);
         if ofv < state.best_ofv {

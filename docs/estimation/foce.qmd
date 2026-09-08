@@ -457,6 +457,8 @@ The inner loop terminates when the gradient norm falls below `inner_tol` (defaul
 
 The inner loop warm-starts EBE estimation from the previous outer iteration's EBEs. This significantly reduces computation time, especially in later iterations when parameters change slowly.
 
+The warm start is taken from the **best point seen so far**, not from whatever the optimizer evaluated last ([#1290](https://github.com/FeRx-NLME/ferx-core/issues/1290)). That distinction matters because the individual objective can be multimodal: a trial step the line search is about to reject may land somewhere the inner loop solves into a different, worse basin, and if those EBEs were carried forward, every later evaluation would inherit them. The starting point would then re-evaluate *worse* than it did a moment earlier — an objective that moves under the optimizer's feet, which no line search can descend. Anchoring the warm start to the incumbent keeps the objective at the incumbent reproducible; evaluations that do not improve on it leave the cache untouched.
+
 ## Configuration Example
 
 ```

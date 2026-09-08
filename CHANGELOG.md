@@ -157,6 +157,17 @@ section of the SDLC for the versioning policy).
   to read. No effect on `.ferx` models, the CLI or the R wrapper, none of which constructs it.
 
 ### Fixed
+- A fit no longer stops on its first evaluation and reports every parameter at its
+  initial value (#1290). The outer loop's EBE warm-start cache adopted the empirical
+  Bayes estimates of *every* evaluation, including the ones the line search rejects, so
+  a single bad trial step left the inner loop in a worse basin and the starting point
+  itself re-evaluated worse than before the excursion — an objective a line search cannot
+  descend, which NLopt reports as a bare `Failure`. The cache is now anchored to the best
+  point seen. Models with covariate thetas were the visible casualty, and with them every
+  `covsearch` / `modelsearch` / `iivsearch` candidate that differs from its parent by one
+  added parameter; `examples/two_cpt_oral_covmodel.ferx` goes from OFV -1026.35 at its
+  initial estimates to -1195.30, and `examples/two_cpt_oral_cov.ferx` from -1168.48 to
+  -1199.33 (NONMEM FOCEI: -1199.43).
 - Deeply saturated, over-capacity steady-state input-rate models no longer let
   Anderson acceleration report a huge spurious periodic state when integration
   error hides the positive per-cycle surplus (#867, PR #955).
