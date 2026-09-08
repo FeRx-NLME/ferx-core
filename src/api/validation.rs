@@ -3435,12 +3435,6 @@ impl VarianceDecl {
         }
     }
 
-    /// Is this a `block_omega` / `block_kappa` diagonal, where `L_ii` carries
-    /// the off-diagonals and no per-eta declared variance describes it?
-    fn is_block_element(&self) -> bool {
-        self.block_keyword().is_some()
-    }
-
     /// How the enclosing block is spelled in the model file, for the arm that
     /// reports a near-singular block. `None` for anything that is not a block
     /// diagonal.
