@@ -2015,9 +2015,8 @@ mod tests {
     // serialising against the rest of the binary, and adding a lock would hide the very
     // property they exist to check. Two things still follow. Assert from the thread that
     // should see the value (arming thread, or inside `pool.install`), since the *absence* of
-    // an override elsewhere is half of what is being pinned. And prefer values that tighten
-    // accuracy: `ode_override_pool` caches a pool per override for the life of the process,
-    // so an exotic one costs a set of worker threads that never go away.
+    // an override elsewhere is half of what is being pinned. Idle override pools are reused
+    // within a bounded worker cache; live leases retain independent fit budgets.
 
     /// The whole merge rule rests on this: `ode_solver_override` treats "equal to the
     /// `FitOptions` default" as "the caller expressed no opinion", which is only sound
@@ -2323,8 +2322,8 @@ mod tests {
 
     /// The pool table is keyed by the override, so two different settings must not land on one
     /// pool — that would hand a fit another's tolerance through the very mechanism meant to
-    /// keep them apart — and the same settings must reuse one, or a bootstrap's replicate fits
-    /// would each spawn an `N × 32 MiB` pool.
+    /// keep them apart. Simultaneous leases with the same settings must also remain distinct,
+    /// or a bootstrap's independently budgeted replicate fits would share one worker budget.
     #[test]
     fn the_override_pool_table_is_keyed_by_the_override() {
         let a = OdeSolverOverride {
@@ -2339,17 +2338,22 @@ mod tests {
         let pool_b = crate::api::ode_override_pool(b, 2).expect("pool b");
         let pool_a_again = crate::api::ode_override_pool(a, 2).expect("pool a again");
         assert!(
-            std::ptr::eq(pool_a, pool_a_again),
-            "the same override built a second pool instead of reusing its own"
+            pool_a.install(|| std::thread::current().id())
+                != pool_a_again.install(|| std::thread::current().id()),
+            "concurrent fits with the same override must have independent workers"
         );
         assert!(
-            !std::ptr::eq(pool_a, pool_b),
+            pool_a.install(|| std::thread::current().id())
+                != pool_b.install(|| std::thread::current().id()),
             "two different overrides share one pool, so its workers carry the wrong one"
         );
         // Width is part of the key too: a fit that pinned `threads` must not be handed a pool
         // of some other width.
         let narrow = crate::api::ode_override_pool(a, 1).expect("pool a, one thread");
-        assert!(!std::ptr::eq(pool_a, narrow));
+        assert!(
+            pool_a.install(|| std::thread::current().id())
+                != narrow.install(|| std::thread::current().id())
+        );
         assert_eq!(narrow.current_num_threads(), 1);
     }
 

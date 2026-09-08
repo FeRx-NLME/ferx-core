@@ -371,6 +371,17 @@ section of the SDLC for the versioning policy).
   silently scoring the declared value — `[saem, focei]` is fine, `[focei, imp]` needs `FIX`.
 
 ### Performance
+- Allocate per-event PK scratch storage only when the prediction path needs it,
+  reducing allocation traffic for static-model FOCE/FOCEI fits.
+- IOV inner optimization reuses per-event PK parameter buffers across likelihood
+  probes, reducing allocation traffic while recomputing every event at the current
+  parameters, covariates, time, and occasion (#104).
+- The main FOCE/FOCEI optimizer paths combine EBE solves with subject scores;
+  mixed analytic/FD gradients use one subject pass. This reduces synchronization
+  between inner and outer optimization and avoids EBE-buffer copies (#1115).
+- Reuse idle worker pools for explicitly sized fits and `PoolPlan` batches; concurrent
+  fits with identical ODE overrides retain independent worker budgets, and idle pool
+  retention is bounded across thread counts and solver settings (#1115, #1212).
 - **A joint PK-TTE model with a linear PK block now takes the exact steady-state solve
   (#1210).** The hazard accumulator's one-cycle map is the identity, so it made `I - M`
   singular and the exact `(I - M)^-1 b` fixed point (#914) declined for *every* joint model,

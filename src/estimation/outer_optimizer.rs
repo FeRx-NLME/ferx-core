@@ -1,6 +1,8 @@
-use crate::estimation::inner_optimizer::{find_ebe, run_inner_loop_warm, InnerLoopStats};
+use crate::estimation::inner_optimizer::{
+    find_ebe, run_inner_loop_warm, run_inner_loop_warm_map, InnerLoopStats,
+};
 use crate::estimation::parameterization::{compute_mu_k, *};
-use crate::stats::likelihood::{foce_population_nll, foce_population_nll_iov};
+use crate::stats::likelihood::{foce_subject_nll, foce_subject_nll_iov};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 // `SymmetricEigen` is used only by this module's `#[cfg(test)]` code (the non-PD
@@ -705,8 +707,9 @@ pub(crate) fn max_scaled_deviation(a: &[f64], b: &[f64]) -> f64 {
 /// The population objective the outer loop actually minimises: [`pop_nll`] (FOCE/FOCEI),
 /// or the AGQ marginal when the stage's method is `agq`.
 ///
-/// **Every** production site that needs "the objective for *this* fit" must call this, not
-/// `pop_nll` — the objective closures, the reconverged-FD gradient, and the covariance
+/// Production sites needing "the objective for *this* fit" use this dispatcher, or
+/// [`run_inner_loop_and_nll`] when solving EBEs too — never call `pop_nll` directly.
+/// This includes the objective closures, reconverged-FD gradient, and covariance
 /// stencil alike. An AGQ fit whose covariance step differenced the *FOCE* objective would
 /// report standard errors for a likelihood it never optimised.
 ///
@@ -760,28 +763,58 @@ pub(crate) fn pop_nll(
     kappas: &[Vec<DVector<f64>>],
     interaction: bool,
 ) -> f64 {
+    let per_subject: Vec<f64> = population
+        .subjects
+        .par_iter()
+        .enumerate()
+        .map(|(i, subject)| {
+            subject_nll(
+                model,
+                subject,
+                params,
+                &eta_hats[i],
+                &h_matrices[i],
+                kappas.get(i).map_or(&[], Vec::as_slice),
+                interaction,
+            )
+        })
+        .collect();
+    // Preserve the existing subject-index summation order, including at width 1.
+    per_subject.iter().sum()
+}
+
+/// Shared subject dispatch for separate and fused population evaluations.
+fn subject_nll(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    eta: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    kappas: &[DVector<f64>],
+    interaction: bool,
+) -> f64 {
     if model.n_kappa > 0 {
         if let Some(ref iov) = params.omega_iov {
-            return foce_population_nll_iov(
+            return foce_subject_nll_iov(
                 model,
-                population,
+                subject,
                 &params.theta,
-                eta_hats,
-                h_matrices,
-                kappas,
+                eta,
+                h_matrix,
                 &params.omega,
-                iov,
                 &params.sigma.values,
                 interaction,
+                kappas,
+                iov,
             );
         }
     }
-    foce_population_nll(
+    foce_subject_nll(
         model,
-        population,
+        subject,
         &params.theta,
-        eta_hats,
-        h_matrices,
+        eta,
+        h_matrix,
         &params.omega,
         &params.sigma.values,
         // Live `block_sigma` off-diagonals (#847): this is the objective the
@@ -790,6 +823,73 @@ pub(crate) fn pop_nll(
         &params.residual_correlations,
         interaction,
     )
+}
+
+/// Continue from each EBE directly into its marginal contribution on the same
+/// worker. Only the population sum needs a barrier. AGQ keeps its separate
+/// quadrature evaluation; it must never receive the FOCE marginal instead.
+#[allow(clippy::type_complexity)]
+fn run_inner_loop_and_nll(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    options: &FitOptions,
+    prev_etas: Option<&[DVector<f64>]>,
+    mu_k: Option<&[f64]>,
+) -> (
+    Vec<DVector<f64>>,
+    Vec<DMatrix<f64>>,
+    InnerLoopStats,
+    Vec<Vec<DVector<f64>>>,
+    f64,
+) {
+    if options.agq_nodes().is_some() {
+        let (etas, h_matrices, stats, kappas) = run_inner_loop_warm(
+            model,
+            population,
+            params,
+            options.inner_maxiter,
+            options.inner_tol,
+            prev_etas,
+            mu_k,
+            options.min_obs_for_convergence_check as usize,
+            options.inner_restarts,
+        );
+        let nll = pop_nll_opts(
+            model,
+            population,
+            params,
+            &etas,
+            &h_matrices,
+            &kappas,
+            options,
+        );
+        return (etas, h_matrices, stats, kappas, nll);
+    }
+    let (etas, h_matrices, stats, kappas, contributions) = run_inner_loop_warm_map(
+        model,
+        population,
+        params,
+        options.inner_maxiter,
+        options.inner_tol,
+        prev_etas,
+        mu_k,
+        options.min_obs_for_convergence_check as usize,
+        options.inner_restarts,
+        |subject, ebe| {
+            subject_nll(
+                model,
+                subject,
+                params,
+                &ebe.eta,
+                &ebe.h_matrix,
+                &ebe.kappas,
+                options.interaction,
+            )
+        },
+    );
+    let nll = contributions.iter().sum();
+    (etas, h_matrices, stats, kappas, nll)
 }
 
 /// State passed through NLopt's user-data mechanism
@@ -992,18 +1092,14 @@ fn run_global_presearch(
         let params = unpack_params(&x, init_params);
         let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
         let cached_zero = vec![DVector::zeros(n_eta); n_subj];
-        let (ehs, hms, ebe_stats, kappas) = run_inner_loop_warm(
+        let (_, _, ebe_stats, _, nll) = run_inner_loop_and_nll(
             model,
             population,
             &params,
-            options.inner_maxiter,
-            options.inner_tol,
+            options,
             Some(&cached_zero),
             Some(&mu_k),
-            options.min_obs_for_convergence_check as usize,
-            options.inner_restarts,
         );
-        let nll = pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
         // Penalized objective fed to the optimizer (unregularized fits unchanged).
         let raw = 2.0 * nll + nn_reg.penalty_value(&params.theta);
         let guarded = ebe_guard_rejects(&ebe_stats, n_subj, raw, options.max_unconverged_frac);
@@ -1033,19 +1129,14 @@ fn run_global_presearch(
         let params = unpack_params(&x, init_params);
         let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
 
-        let (ehs, hms, ebe_stats, kappas) = run_inner_loop_warm(
+        let (_, hms, ebe_stats, _, nll) = run_inner_loop_and_nll(
             model,
             population,
             &params,
-            options.inner_maxiter,
-            options.inner_tol,
+            options,
             Some(&state.cached_etas),
             Some(&mu_k),
-            options.min_obs_for_convergence_check as usize,
-            options.inner_restarts,
         );
-
-        let nll = pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
         // Penalized objective fed to the optimizer (unregularized fits unchanged).
         let raw_ofv = 2.0 * nll + nn_reg.penalty_value(&params.theta);
 
@@ -1689,18 +1780,14 @@ fn optimize_nlopt_once(
             }
         } else {
             let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-            let (ehs, hms, ebe_stats, kappas) = run_inner_loop_warm(
+            let (ehs, hms, ebe_stats, kappas, nll) = run_inner_loop_and_nll(
                 model,
                 population,
                 &params,
-                options.inner_maxiter,
-                options.inner_tol,
+                options,
                 Some(&state.cached_etas),
                 Some(&mu_k),
-                options.min_obs_for_convergence_check as usize,
-                options.inner_restarts,
             );
-            let nll = pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
             (ehs, hms, ebe_stats, kappas, 2.0 * nll)
         };
         // Penalized objective fed to the optimizer (unregularized fits unchanged).
@@ -2391,20 +2478,16 @@ fn optimize_bfgs(
     let f_only = |x: &[f64], prev_etas: &[DVector<f64>]| -> f64 {
         let params = unpack_params(x, init_params);
         let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-        let (ehs, hms, _, kappas) = run_inner_loop_warm(
+        let (_, _, _, _, nll) = run_inner_loop_and_nll(
             model,
             population,
             &params,
-            options.inner_maxiter,
-            options.inner_tol,
+            options,
             Some(prev_etas),
             Some(&mu_k),
-            options.min_obs_for_convergence_check as usize,
-            options.inner_restarts,
         );
         // Penalized objective fed to the optimizer (unregularized fits unchanged).
-        let ofv = 2.0 * pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options)
-            + nn_reg.penalty_value(&params.theta);
+        let ofv = 2.0 * nll + nn_reg.penalty_value(&params.theta);
         if ofv.is_finite() {
             ofv
         } else {
@@ -2418,18 +2501,15 @@ fn optimize_bfgs(
      -> (f64, Vec<f64>, Vec<DVector<f64>>, Vec<DMatrix<f64>>) {
         let params = unpack_params(x, init_params);
         let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-        let (ehs, hms, _, kappas) = run_inner_loop_warm(
+        let (ehs, hms, _, kappas, nll) = run_inner_loop_and_nll(
             model,
             population,
             &params,
-            options.inner_maxiter,
-            options.inner_tol,
+            options,
             Some(prev_etas),
             Some(&mu_k),
-            options.min_obs_for_convergence_check as usize,
-            options.inner_restarts,
         );
-        let ofv = ofv_at_fixed(x, &ehs, &hms, &kappas);
+        let ofv = 2.0 * nll;
         // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x).
         let mut g = population_gradient(
             x,
@@ -3009,31 +3089,44 @@ pub(crate) fn population_gradient_sens_mixed(
     options: &FitOptions,
 ) -> Vec<f64> {
     let np = x.len();
-    let per_sub = crate::estimation::sens_outer_gradient::per_subject_packed_gradients(
-        model,
-        population,
-        init_params,
-        x,
-        ehs,
-        options.interaction,
-        None,
-    );
-    let filled: Vec<Vec<f64>> = per_sub
-        .into_par_iter()
+    let filled: Vec<Vec<f64>> = population
+        .subjects
+        .par_iter()
         .enumerate()
-        .map(|(i, gi)| match gi {
-            // Keep the exact analytic gradient for in-scope, finite subjects.
-            Some(g) if g.iter().all(|v| v.is_finite()) => g,
-            // Out-of-scope (or non-finite analytic) → reconverged per-subject FD.
-            _ => subject_reconverged_fd_gradient(
-                x,
-                init_params,
-                model,
-                &population.subjects[i],
-                &ehs[i],
-                bounds,
-                options,
-            ),
+        .map(|(i, subject)| {
+            // Complete the fallback on this worker as soon as its analytic
+            // result is known; do not wait for a second population-wide pass.
+            let gi = if options.interaction {
+                crate::estimation::sens_outer_gradient::subject_packed_gradient(
+                    model,
+                    subject,
+                    init_params,
+                    x,
+                    ehs[i].as_slice(),
+                )
+            } else {
+                crate::estimation::sens_outer_gradient::subject_packed_gradient_foce(
+                    model,
+                    subject,
+                    init_params,
+                    x,
+                    ehs[i].as_slice(),
+                )
+            };
+            match gi {
+                // Keep the exact analytic gradient for in-scope, finite subjects.
+                Some(g) if g.iter().all(|v| v.is_finite()) => g,
+                // Out-of-scope (or non-finite analytic) → reconverged per-subject FD.
+                _ => subject_reconverged_fd_gradient(
+                    x,
+                    init_params,
+                    model,
+                    subject,
+                    &ehs[i],
+                    bounds,
+                    options,
+                ),
+            }
         })
         .collect();
     let mut grad = vec![0.0f64; np];
@@ -3071,29 +3164,44 @@ pub(crate) fn population_gradient_sens_iov_mixed(
     options: &FitOptions,
 ) -> Vec<f64> {
     let np = x.len();
-    let per_sub = crate::estimation::sens_outer_gradient::per_subject_packed_gradients_iov(
-        model,
-        population,
-        init_params,
-        x,
-        ehs,
-        kappas,
-        options.interaction,
-    );
-    let filled: Vec<Vec<f64>> = per_sub
-        .into_par_iter()
+    let filled: Vec<Vec<f64>> = population
+        .subjects
+        .par_iter()
         .enumerate()
-        .map(|(i, gi)| match gi {
-            Some(g) if g.iter().all(|v| v.is_finite()) => g,
-            _ => subject_reconverged_fd_gradient_iov(
-                x,
-                init_params,
-                model,
-                &population.subjects[i],
-                &ehs[i],
-                bounds,
-                options,
-            ),
+        .map(|(i, subject)| {
+            let mut stacked: Vec<f64> = ehs[i].iter().copied().collect();
+            for kap in &kappas[i] {
+                stacked.extend(kap.iter().copied());
+            }
+            let gi = if options.interaction {
+                crate::estimation::sens_outer_gradient::subject_packed_gradient_iov(
+                    model,
+                    subject,
+                    init_params,
+                    x,
+                    &stacked,
+                )
+            } else {
+                crate::estimation::sens_outer_gradient::subject_packed_gradient_foce_iov(
+                    model,
+                    subject,
+                    init_params,
+                    x,
+                    &stacked,
+                )
+            };
+            match gi {
+                Some(g) if g.iter().all(|v| v.is_finite()) => g,
+                _ => subject_reconverged_fd_gradient_iov(
+                    x,
+                    init_params,
+                    model,
+                    subject,
+                    &ehs[i],
+                    bounds,
+                    options,
+                ),
+            }
         })
         .collect();
     let mut grad = vec![0.0f64; np];

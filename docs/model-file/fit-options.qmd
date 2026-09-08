@@ -43,6 +43,30 @@ What runs, how long, and how it is resumed or traced.
 | `checkpoint_interval_secs` | integer | `300` | Minimum wall-clock seconds between checkpoint writes. Larger values reduce I/O overhead but lose more progress on an interrupt; smaller values save more often. Only used when `checkpoint = true`. |
 | `optimizer_trace` | `true`, `false` | `false` | Write a per-iteration CSV to `/tmp/ferx_trace_<pid>_<ts>.csv`. The path is stored in `FitResult::trace_path`. Useful for diagnosing convergence problems or comparing optimizers. See [Optimizer Trace](#optimizer-trace). |
 
+**Worker reuse for repeated fits.** Default fits share a persistent worker pool.
+Fits with a positive `threads` value, or fit-level ODE overrides, exclusively
+lease a pool for the call. An idle pool with the same width and solver settings
+can be reused; concurrent fits get independent pools even when their settings
+match. This preserves the per-fit budgets assigned by `PoolPlan`.
+
+Idle pools retain at most twice the automatic thread budget across all settings
+(at most 16 workers). Older idle pools are evicted, and pools wider than that
+limit are released after use. Active fits keep their requested width; this idle
+limit is not a process-wide limit on concurrent fitting. Worker stacks remain
+32 MiB each, which is reserved capacity rather than necessarily resident memory.
+
+During FOCE/FOCEI optimization, the same pool serves the inner EBE solves and
+outer gradient evaluations. The main NLopt and built-in BFGS/L-BFGS paths evaluate
+each subject's marginal contribution immediately after its EBE solve. The mixed
+analytic/FD gradient path also finishes each subject's fallback in the same task.
+This reduces synchronization between stages while preserving subject-order
+reductions. Workers still use Rayon's normal idle policy; pool reuse does not
+mean keeping idle CPU cores busy continuously.
+
+IOV inner solves also reuse per-event PK parameter buffer capacity between
+likelihood probes. Each probe still evaluates the current parameters and every
+event's covariates, time, and occasion; stored numerical values are not reused.
+
 ### Outer optimizer {#outer-optimizer}
 
 The population-parameter search: which algorithm, when it stops, and whether a global pre-search runs first. See [Optimizer Choices](#optimizer-choices) for how to pick one.

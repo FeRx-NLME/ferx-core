@@ -1,0 +1,119 @@
+//! Exclusive pool leases: reuse idle workers without merging concurrent fit budgets.
+use super::fit_thread_pool_builder;
+use crate::ode::solver::OdeSolverOverride;
+use std::collections::VecDeque;
+use std::ops::Deref;
+use std::sync::Mutex;
+
+struct CachedPool {
+    pool: rayon::ThreadPool,
+    ov: OdeSolverOverride,
+}
+
+/// Only idle workers count towards this cache's limit. Active callers retain
+/// their requested widths; acquisition never waits for another fit to finish,
+/// which also allows nested fits without a lease-capacity deadlock.
+pub(super) struct PoolCache {
+    idle: Mutex<VecDeque<CachedPool>>,
+    max_idle_workers: usize,
+}
+
+impl PoolCache {
+    pub(super) fn new(max_idle_workers: usize) -> Self {
+        Self {
+            idle: Mutex::new(VecDeque::new()),
+            max_idle_workers,
+        }
+    }
+
+    pub(super) fn acquire(
+        &self,
+        threads: usize,
+        ov: OdeSolverOverride,
+    ) -> Result<FitPoolLease<'_>, String> {
+        let cached = {
+            let mut idle = self
+                .idle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Search newest first to keep recently used workers hot. Validated
+            // overrides contain finite positive tolerances, so PartialEq is a
+            // complete settings key (including nested Options and false).
+            idle.iter()
+                .rposition(|p| p.pool.current_num_threads() == threads && p.ov == ov)
+                .and_then(|i| idle.remove(i))
+        };
+        let entry = match cached {
+            Some(p) => p,
+            None => CachedPool {
+                // Build outside the lock: unrelated fits can acquire/return
+                // their leases while OS threads are being started.
+                pool: fit_thread_pool_builder()
+                    .num_threads(threads)
+                    .start_handler(move |_| {
+                        if !ov.is_empty() {
+                            crate::ode::solver::install_worker_ode_override(ov);
+                        }
+                    })
+                    .build()
+                    .map_err(|e| {
+                        format!("failed to build rayon pool with {threads} threads: {e}")
+                    })?,
+                ov,
+            },
+        };
+        Ok(FitPoolLease {
+            entry: Some(entry),
+            cache: self,
+        })
+    }
+
+    fn release(&self, entry: CachedPool) {
+        if entry.pool.current_num_threads() > self.max_idle_workers {
+            return; // Oversized pools work normally, but are not retained idle.
+        }
+        let mut evicted = Vec::new();
+        {
+            let mut idle = self
+                .idle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            idle.push_back(entry);
+            let mut workers: usize = idle.iter().map(|p| p.pool.current_num_threads()).sum();
+            while workers > self.max_idle_workers {
+                let p = idle.pop_front().expect("workers counted an idle pool");
+                workers -= p.pool.current_num_threads();
+                evicted.push(p);
+            }
+        }
+        // Dropping a pool signals worker shutdown; do so without the cache lock.
+        drop(evicted);
+    }
+}
+
+/// Owns one pool until all work installed by this caller has completed. Returning
+/// it on unwind is safe too: Rayon propagates a panic after its scoped work joins.
+pub(crate) struct FitPoolLease<'a> {
+    entry: Option<CachedPool>,
+    cache: &'a PoolCache,
+}
+
+impl Deref for FitPoolLease<'_> {
+    type Target = rayon::ThreadPool;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entry.as_ref().expect("live pool lease").pool
+    }
+}
+
+impl Drop for FitPoolLease<'_> {
+    fn drop(&mut self) {
+        if let Some(entry) = self.entry.take() {
+            self.cache.release(entry);
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/pool_cache_tests.rs"]
+mod tests;

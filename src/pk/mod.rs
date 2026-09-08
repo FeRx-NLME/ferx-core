@@ -875,6 +875,14 @@ pub fn compute_event_pk_params_into(
     out.pk_only.clear();
     out.reset.clear();
 
+    // Reserve only when this materializer is actually reached. Static prediction
+    // paths can keep an empty scratch buffer without allocating event snapshots.
+    // Exact reservations avoid geometric growth of these large PkParams values.
+    out.dose.reserve_exact(subject.doses.len());
+    out.obs.reserve_exact(subject.obs_times.len());
+    out.pk_only.reserve_exact(subject.pk_only_times.len());
+    out.reset.reserve_exact(subject.reset_times.len());
+
     if subject_needs_per_event_pk(model, subject) {
         for k in 0..subject.doses.len() {
             out.dose.push(pk_params_at_time(
@@ -1166,7 +1174,38 @@ pub fn predict_iov(
     eta_bsv: &[f64],
     kappas: &[Vec<f64>],
 ) -> Vec<f64> {
+    predict_iov_with_scratch(
+        model,
+        subject,
+        theta,
+        eta_bsv,
+        kappas,
+        &mut EventPkParams::default(),
+    )
+}
+
+/// IOV predictions with caller-owned per-event parameter storage. Every event
+/// is still evaluated at its current theta, eta, kappa, covariates and time;
+/// only allocation capacity is reused, never numerical values.
+pub(crate) fn predict_iov_with_scratch(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta_bsv: &[f64],
+    kappas: &[Vec<f64>],
+    scratch: &mut EventPkParams,
+) -> Vec<f64> {
     use std::collections::HashMap;
+    let EventPkParams {
+        dose: dose_params,
+        obs: obs_params,
+        pk_only: pk_only_params,
+        reset: reset_params,
+    } = scratch;
+    dose_params.clear();
+    obs_params.clear();
+    pk_only_params.clear();
+    reset_params.clear();
     // #905: the IOV value funnel is a structural peer of
     // `compute_predictions_with_tv_into_with_schedule` and needs the same declination —
     // an analytical subject with no Gaussian observation feeds the predictor nothing,
@@ -1202,43 +1241,42 @@ pub fn predict_iov(
         c
     };
 
-    let dose_params: Vec<PkParams> = (0..subject.doses.len())
-        .map(|d| {
-            let occ = subject.dose_occasions.get(d).copied().unwrap_or(0);
-            pk_params_at_time(
-                model,
-                theta,
-                &combined_for(occ),
-                subject.dose_cov(d),
-                subject.doses[d].time,
-            )
-        })
-        .collect();
-    let obs_params: Vec<PkParams> = (0..subject.obs_times.len())
-        .map(|j| {
-            let occ = subject.occasions.get(j).copied().unwrap_or(0);
-            pk_params_at_time(
-                model,
-                theta,
-                &combined_for(occ),
-                subject.obs_cov(j),
-                subject.obs_times[j],
-            )
-        })
-        .collect();
+    // Exact initial reservations preserve the convenience API's old footprint
+    // for short vectors; later probes keep these capacities without allocating.
+    dose_params.reserve_exact(subject.doses.len());
+    dose_params.extend((0..subject.doses.len()).map(|d| {
+        let occ = subject.dose_occasions.get(d).copied().unwrap_or(0);
+        pk_params_at_time(
+            model,
+            theta,
+            &combined_for(occ),
+            subject.dose_cov(d),
+            subject.doses[d].time,
+        )
+    }));
+    obs_params.reserve_exact(subject.obs_times.len());
+    obs_params.extend((0..subject.obs_times.len()).map(|j| {
+        let occ = subject.occasions.get(j).copied().unwrap_or(0);
+        pk_params_at_time(
+            model,
+            theta,
+            &combined_for(occ),
+            subject.obs_cov(j),
+            subject.obs_times[j],
+        )
+    }));
     // EVID=2 rows carry no occasion label → BSV eta with zero kappa.
     let pk_only_combined = combined_for(u32::MAX);
-    let pk_only_params: Vec<PkParams> = (0..subject.pk_only_times.len())
-        .map(|m| {
-            pk_params_at_time(
-                model,
-                theta,
-                &pk_only_combined,
-                subject.pk_only_cov(m),
-                subject.pk_only_times[m],
-            )
-        })
-        .collect();
+    pk_only_params.reserve_exact(subject.pk_only_times.len());
+    pk_only_params.extend((0..subject.pk_only_times.len()).map(|m| {
+        pk_params_at_time(
+            model,
+            theta,
+            &pk_only_combined,
+            subject.pk_only_cov(m),
+            subject.pk_only_times[m],
+        )
+    }));
 
     let mut preds = if model.is_algebraic() {
         // Compartment-free model (#811): nothing to integrate or superpose. The
@@ -1257,25 +1295,24 @@ pub fn predict_iov(
         // Built inside this arm because only the ODE engine re-seeds `init(...)`; the
         // algebraic and closed-form arms never read it, and `pk_params_at_time` runs the
         // full individual-parameter program once per reset per eta evaluation.
-        let reset_params: Vec<PkParams> = (0..subject.reset_times.len())
-            .map(|r| {
-                let t = subject.reset_times[r];
-                let combined = match reset_row_occasion(subject, r) {
-                    Some(occ) => combined_for(occ),
-                    None => pk_only_combined.clone(),
-                };
-                pk_params_at_time(model, theta, &combined, subject.reset_cov(r), t)
-            })
-            .collect();
+        reset_params.reserve_exact(subject.reset_times.len());
+        reset_params.extend((0..subject.reset_times.len()).map(|r| {
+            let t = subject.reset_times[r];
+            let combined = match reset_row_occasion(subject, r) {
+                Some(occ) => combined_for(occ),
+                None => pk_only_combined.clone(),
+            };
+            pk_params_at_time(model, theta, &combined, subject.reset_cov(r), t)
+        }));
         crate::ode::ode_predictions_event_driven(
             ode,
             subject,
             theta,
             &pk_only_combined,
-            &dose_params,
-            &obs_params,
-            &pk_only_params,
-            &reset_params,
+            dose_params.as_slice(),
+            obs_params.as_slice(),
+            pk_only_params.as_slice(),
+            reset_params.as_slice(),
         )
     } else if event_driven::supports_event_driven(model.pk_model) {
         // Resolve modeled-`RATE` doses (#324/#394) using each dose's per-occasion
@@ -1291,9 +1328,9 @@ pub fn predict_iov(
         event_driven::event_driven_predictions(
             model.pk_model,
             &resolved,
-            &dose_params,
-            &obs_params,
-            &pk_only_params,
+            dose_params.as_slice(),
+            obs_params.as_slice(),
+            pk_only_params.as_slice(),
         )
     } else {
         // Unreachable today: every `PkModel` variant has event-driven analytical
@@ -1329,7 +1366,7 @@ pub fn predict_iov(
             theta,
             eta_bsv,
             &amount_pk,
-            Some(&obs_params),
+            Some(obs_params.as_slice()),
             &mut preds,
         );
     }
@@ -2506,9 +2543,9 @@ pub fn compute_predictions_with_tv(
     theta: &[f64],
     eta: &[f64],
 ) -> Vec<f64> {
-    // Allocate-on-each-call wrapper. Hot loops should use
-    // `compute_predictions_with_tv_into` instead.
-    let mut scratch = EventPkParams::with_capacity_for(subject);
+    // Event snapshots allocate lazily, only on paths that materialize them.
+    // Hot loops should reuse the buffer via `compute_predictions_with_tv_into`.
+    let mut scratch = EventPkParams::default();
     compute_predictions_with_tv_into(model, subject, theta, eta, &mut scratch)
 }
 
@@ -2709,6 +2746,10 @@ pub fn compute_predictions_with_tv_into_with_schedule(
     apply_frem_prediction_override(model, subject, theta, eta, &mut preds);
     preds
 }
+
+#[cfg(test)]
+#[path = "iov_scratch_tests.rs"]
+mod iov_scratch_tests;
 
 #[cfg(test)]
 mod tests {

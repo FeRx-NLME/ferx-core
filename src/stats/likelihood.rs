@@ -2482,6 +2482,33 @@ pub fn individual_nll_iov(
     omega_iov: Option<&OmegaMatrix>,
     sigma_values: &[f64],
 ) -> f64 {
+    individual_nll_iov_with_scratch(
+        model,
+        subject,
+        theta,
+        eta,
+        kappas,
+        omega,
+        omega_iov,
+        sigma_values,
+        &mut pk::EventPkParams::default(),
+    )
+}
+
+/// Inner-loop sibling that retains per-event PK buffer capacity across trial
+/// eta/kappa values. The public convenience function keeps its original API.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn individual_nll_iov_with_scratch(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    kappas: &[Vec<f64>],
+    omega: &OmegaMatrix,
+    omega_iov: Option<&OmegaMatrix>,
+    sigma_values: &[f64],
+    pk_scratch: &mut pk::EventPkParams,
+) -> f64 {
     if kappas.is_empty() {
         return individual_nll(model, subject, theta, eta, omega, sigma_values);
     }
@@ -2515,7 +2542,7 @@ pub fn individual_nll_iov(
 
     // Data NLL — single continuous prediction with per-event occasion kappa
     // (proper cross-occasion carryover; issue #104).
-    let preds = pk::predict_iov(model, subject, theta, eta, kappas);
+    let preds = pk::predict_iov_with_scratch(model, subject, theta, eta, kappas, pk_scratch);
     // FREM covariate pseudo-observations use the covariate sigma (EPSCOV), not
     // the PK residual error, so the FREM etas are sampled against the right
     // variance (mirrors the FOCE paths and the non-IOV individual_nll).

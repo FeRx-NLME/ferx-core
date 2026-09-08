@@ -168,6 +168,55 @@ fn apply_to_pins_the_inner_fit_thread_count() {
     assert_eq!(opts.threads, Some(4));
 }
 
+/// Exercise the actual routing, not just the cache: an override must not divert
+/// two independently budgeted calls to one busy worker. Timeouts only guard
+/// against regression deadlocks; successful runs do not sleep.
+#[test]
+fn identical_overrides_preserve_concurrent_fit_capacity() {
+    use std::{sync::mpsc, thread, time::Duration};
+    let options = FitOptions {
+        threads: Some(1),
+        ode_reltol: 1e-11,
+        ..Default::default()
+    };
+    let (entered_tx, entered_rx) = mpsc::channel();
+    thread::scope(|scope| {
+        let mut releases = Vec::new();
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let (tx, rx) = mpsc::channel();
+            releases.push(tx);
+            let entered = entered_tx.clone();
+            let opts = &options;
+            handles.push(scope.spawn(move || {
+                install_on_fit_pool(opts, move || {
+                    assert_eq!(rayon::current_num_threads(), 1);
+                    assert_eq!(
+                        crate::ode::solver::effective_solver_options(Default::default()).reltol,
+                        1e-11
+                    );
+                    entered.send(thread::current().id()).unwrap();
+                    rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                })
+                .unwrap();
+            }));
+        }
+        let first = entered_rx.recv_timeout(Duration::from_secs(5));
+        let second = entered_rx.recv_timeout(Duration::from_secs(2));
+        // Unblock both callers before asserting so a failing test joins cleanly.
+        for tx in releases {
+            let _ = tx.send(());
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_ne!(
+            first.unwrap(),
+            second.expect("second fit was serialized onto the first fit's pool")
+        );
+    });
+}
+
 // ── end-to-end: what the inner fit actually does with the plan ───────────────
 
 fn one_cpt_model() -> CompiledModel {
