@@ -114,7 +114,7 @@ candidate carries it. `LET(NAME, [...])` defines a symbol referenced as
 | `METABOLITE(x)` | model(s) | `BASIC`, `PSC` |
 
 Every category is *parsed*, whether or not ferx can build it, so that
-`ELIMINATION(MM)` is refused as "not expressible" rather than as an unknown
+`METABOLITE(PSC)` is refused as "not expressible" rather than as an unknown
 keyword.
 
 The MFL effect names map onto `[covariate_model]` forms as `lin` → `linear`,
@@ -220,9 +220,10 @@ silently.
 | MFL feature | ferx | how / why not |
 |---|---|---|
 | `ABSORPTION(INST / FO)` | ✓ | `pk *_iv` / `*_oral` |
-| `ABSORPTION(ZO / SEQ-ZO-FO / WEIBULL)` | ✗ | no `pk` template; `zero_order()` / `weibull()` are `[odes]` input functions, hand-writable only |
+| `ABSORPTION(ZO / WEIBULL)` | ✓ | an `ode_template *_iv` line with `zero_order()` / `weibull()` into `central` — [modelsearch's `[odes]` candidates](modelsearch.qmd#the-odes-candidates) |
+| `ABSORPTION(SEQ-ZO-FO)` | ✗ | not one input term but a depot of its own, filled at a constant rate and emptied by `ka`; no template, and the search does not generate one |
 | `ELIMINATION(FO)` | ✓ | every `pk` template |
-| `ELIMINATION(ZO / MM / MIX-FO-MM)` | ✗ | reachable only via `[odes]`, which a search cannot generate |
+| `ELIMINATION(ZO / MM / MIX-FO-MM)` | ✓ | an `[odes]` override of the flux out of `central`, on the same disposition |
 | `PERIPHERALS(0..2)` | ✓ | `one_cpt_*` / `two_cpt_*` / `three_cpt_*` |
 | `PERIPHERALS(3+)`, `PERIPHERALS(n, MET)` | ✗ | no four-compartment template; no metabolite template family |
 | `TRANSITS(N)`, `TRANSITS(n, NODEPOT)` | ✓ | `pk *_transit(n=…, mtt=…)` — `n` continuous, or fixed |
@@ -241,15 +242,15 @@ silently.
 | `DIRECTEFFECT`, `EFFECTCOMP`, `INDIRECTEFFECT` | ✗ | no PD template family |
 | `METABOLITE` | ✗ | structsearch is out of scope for v1 |
 
-Wildcards are checked against their full expansion: `ELIMINATION(*)` fails on
-`ZO`, `MM` and `MIX-FO-MM` just as the explicit list would. A wildcard is not
-a way to opt out.
+Wildcards are checked against their full expansion: `ABSORPTION(*)` fails on
+`SEQ-ZO-FO` just as the explicit list would. A wildcard is not a way to opt
+out.
 
 The error lists every gap at once and ends with a link back to this table:
 
 ```
 [space] mfl: the search space asks for 2 features ferx cannot build a candidate for:
-  - ELIMINATION(MM): only first-order elimination has an analytic `pk` template; ...
+  - ABSORPTION(SEQ-ZO-FO): sequential zero-order-then-first-order absorption is not one ...
   - IOV(..., ADD): `ferx-core::edit` writes a κ inside the exponential only
     (`P = TVP * exp(ETA + KAPPA)`), which is the form `[iov]` estimates
 See the coverage table at https://ferx-nlme.github.io/ferx-core/tools/search.html#coverage

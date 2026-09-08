@@ -92,7 +92,10 @@ impl<K: Into<String>, V: Into<String>> FromIterator<(K, V)> for FeatureVector {
 }
 
 /// One model a search wants fitted.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// No `Eq`: [`cost`](Self::cost) is an `f64` scheduling hint, and "the same
+/// cost" is not a question anything asks.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Candidate {
     /// How the search refers to this candidate. Must be unique within one
     /// [`run`](super::Runner::run) — the results are keyed by it and the table
@@ -106,12 +109,41 @@ pub struct Candidate {
     pub parent: Option<String>,
     /// What distinguishes it — see [`FeatureVector`].
     pub features: FeatureVector,
-    /// This candidate's own start count, overriding [`RunOptions::n_starts`]
-    /// when set. A search that knows one candidate is harder to fit than its
-    /// siblings — a full omega block over three or more η is the case
-    /// (#1183, `docs/examples/multistart.qmd`) — asks for more starts here
-    /// rather than paying for them on every candidate of the run.
+    /// This candidate's own start count, a **floor** under
+    /// [`RunOptions::n_starts`] when set. A search that knows one candidate
+    /// is harder to fit than its siblings — a full omega block over three or
+    /// more η (#1183), a Michaelis-Menten elimination (#1257), both in
+    /// `docs/examples/multistart.qmd` — asks for more starts here rather than
+    /// paying for them on every candidate of the run.
+    ///
+    /// A floor rather than a replacement, because it says *this candidate
+    /// needs at least this many*: a run the user configured with more
+    /// `retries` than a tool's own guess must not have them taken away by it.
     pub n_starts: Option<usize>,
+    /// What this candidate is expected to cost relative to the others in the
+    /// same run, for the thread plan. `1.0` is the run's ordinary candidate.
+    ///
+    /// The runner's split between concurrent fits and threads *per* fit is
+    /// one number for a whole batch ([`ferx_core::PoolPlan::from_budget`]), which is the
+    /// right split only when the candidates cost about the same. They do not
+    /// once a search mixes analytic templates with `[odes]` ones: a
+    /// Michaelis-Menten candidate integrates numerically where its
+    /// first-order sibling has a closed form, at one to two orders of
+    /// magnitude more per fit (#1257). Scheduled together, the expensive one
+    /// finishes long after the pool has emptied, holding the run open on a
+    /// single thread while the rest of the machine idles.
+    ///
+    /// So candidates of **equal cost are planned together**, heaviest group
+    /// first, each group getting the whole thread budget for its own split —
+    /// a handful of ODE candidates run few-at-a-time with many subject
+    /// threads each, and the analytic ones then run wide. A run whose
+    /// candidates all carry the default cost is one group and is planned
+    /// exactly as before.
+    ///
+    /// It is a *hint*, not a measurement: it only has to be right about which
+    /// candidates are the long poles. The report's per-candidate `seconds` is
+    /// the measurement.
+    pub cost: f64,
 }
 
 impl Candidate {
@@ -123,13 +155,25 @@ impl Candidate {
             parent: None,
             features: FeatureVector::new(),
             n_starts: None,
+            cost: 1.0,
         }
     }
 
-    /// Builder: fit this candidate with `n` starts instead of the run's
-    /// default. Clamped to at least 1 when applied.
+    /// Builder: fit this candidate with at least `n` starts — see
+    /// [`n_starts`](Self::n_starts). Clamped to at least 1 when applied.
     pub fn starts(mut self, n: usize) -> Self {
         self.n_starts = Some(n);
+        self
+    }
+
+    /// Builder: what this candidate costs relative to the run's ordinary one
+    /// — see [`cost`](Self::cost). A non-finite or non-positive value is
+    /// ignored, since it would make the grouping meaningless rather than
+    /// merely wrong.
+    pub fn cost(mut self, cost: f64) -> Self {
+        if cost.is_finite() && cost > 0.0 {
+            self.cost = cost;
+        }
         self
     }
 

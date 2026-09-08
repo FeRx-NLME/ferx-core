@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 
+use ferx_core::edit::{EliminationForm, InputForm, StructuralEngine};
 use ferx_core::{Population, Subject};
 
 use super::*;
@@ -17,6 +18,7 @@ fn template(line: &str) -> PkTemplate {
 fn fo(peripherals: u32) -> Structure {
     Structure {
         absorption: Absorption::Fo,
+        elimination: Elimination::Fo,
         peripherals,
         transits: None,
         lagtime: false,
@@ -81,6 +83,7 @@ fn structure_is_read_off_the_pk_line() {
             s,
             Structure {
                 absorption,
+                elimination: Elimination::Fo,
                 peripherals,
                 transits,
                 lagtime
@@ -103,7 +106,8 @@ fn structure_is_read_off_the_pk_line() {
     ))
     .unwrap_err();
     assert!(
-        err.contains("`ode_template two_cpt_oral(...)`") && err.contains("cannot swap"),
+        err.contains("`ode_template two_cpt_oral(...)`")
+            && err.contains("cannot recover them from an equation"),
         "{err}"
     );
 }
@@ -122,6 +126,7 @@ fn every_buildable_structure_names_the_parser_template_and_roles() {
     assert_eq!(t.roles, vec!["cl", "v1", "q2", "v2", "q3", "v3", "ka"]);
     let t = Structure {
         absorption: Absorption::Inst,
+        elimination: Elimination::Fo,
         peripherals: 1,
         transits: None,
         lagtime: false,
@@ -152,6 +157,7 @@ fn every_buildable_structure_names_the_parser_template_and_roles() {
 fn unbuildable_structures_name_the_reason() {
     let iv = Structure {
         absorption: Absorption::Inst,
+        elimination: Elimination::Fo,
         ..fo(0)
     };
     assert!(iv.unbuildable().is_none());
@@ -189,7 +195,7 @@ fn unbuildable_structures_name_the_reason() {
 }
 
 #[test]
-fn apply_moves_one_coordinate_and_features_lists_all_four() {
+fn apply_moves_one_coordinate_and_features_lists_all_five() {
     let s = fo(0);
     assert_eq!(s.apply(&FeatureKey::Peripherals(2)).peripherals, 2);
     assert!(s.apply(&FeatureKey::Lagtime(true)).lagtime);
@@ -205,9 +211,15 @@ fn apply_moves_one_coordinate_and_features_lists_all_four() {
         Absorption::Inst
     );
     assert_eq!(
+        s.apply(&FeatureKey::Elimination(Elimination::Mm))
+            .elimination,
+        Elimination::Mm
+    );
+    assert_eq!(
         s.features(),
         vec![
             FeatureKey::Absorption(Absorption::Fo),
+            FeatureKey::Elimination(Elimination::Fo),
             FeatureKey::Peripherals(0),
             FeatureKey::Transits(TransitCount::Count(0)),
             FeatureKey::Lagtime(false),
@@ -215,7 +227,7 @@ fn apply_moves_one_coordinate_and_features_lists_all_four() {
     );
     assert_eq!(
         s.feature_vector().render(),
-        "ABSORPTION=FO;LAGTIME=OFF;PERIPHERALS=0;TRANSITS=0"
+        "ABSORPTION=FO;ELIMINATION=FO;LAGTIME=OFF;PERIPHERALS=0;TRANSITS=0"
     );
 }
 
@@ -259,10 +271,24 @@ fn feature_keys_print_and_sort_as_pharmpy_does() {
 }
 
 #[test]
-fn space_features_accepts_elimination_fo_and_refuses_non_structural_statements() {
+fn space_features_reads_elimination_and_refuses_non_structural_statements() {
+    // `ELIMINATION(FO)` is a value like any other now (#1257): a space that
+    // names it can move a saturable candidate back to first-order.
     assert_eq!(
         keys("ELIMINATION(FO); PERIPHERALS(1)"),
-        vec![FeatureKey::Peripherals(1)]
+        vec![
+            FeatureKey::Elimination(Elimination::Fo),
+            FeatureKey::Peripherals(1)
+        ]
+    );
+    assert_eq!(
+        keys("ELIMINATION([MM,MIX-FO-MM,ZO])"),
+        vec![
+            FeatureKey::Elimination(Elimination::MixFoMm),
+            FeatureKey::Elimination(Elimination::Mm),
+            FeatureKey::Elimination(Elimination::Zo),
+        ],
+        "sorted by (category, str(argument)) as Pharmpy sorts its dictionary"
     );
     let err = space_features(&Mfl::parse("PERIPHERALS(1); COVARIATE?(CL, WT, pow)").unwrap())
         .unwrap_err();
@@ -273,8 +299,18 @@ fn space_features_accepts_elimination_fo_and_refuses_non_structural_statements()
     // A depot chain reaching here means the coverage check was bypassed.
     let err = space_features(&Mfl::parse("TRANSITS(2, DEPOT)").unwrap()).unwrap_err();
     assert!(err.contains("DEPOT"), "{err}");
-    let err = space_features(&Mfl::parse("ABSORPTION(ZO)").unwrap()).unwrap_err();
-    assert!(err.contains("ABSORPTION(ZO)"), "{err}");
+    // `ZO` and `WEIBULL` are ODE candidates now (#1257); `SEQ-ZO-FO` is the
+    // one absorption mode with no spelling at all, so it is what must still
+    // error here if the coverage check is ever bypassed.
+    assert_eq!(
+        keys("ABSORPTION([ZO,WEIBULL])"),
+        vec![
+            FeatureKey::Absorption(Absorption::Weibull),
+            FeatureKey::Absorption(Absorption::Zo),
+        ]
+    );
+    let err = space_features(&Mfl::parse("ABSORPTION(SEQ-ZO-FO)").unwrap()).unwrap_err();
+    assert!(err.contains("SEQ-ZO-FO"), "{err}");
 }
 
 // ── onto the space ──────────────────────────────────────────────────────────
@@ -297,6 +333,7 @@ fn onto_space_is_the_least_number_of_transformations() {
     // Absorption: the first listed mode.
     let iv = Structure {
         absorption: Absorption::Inst,
+        elimination: Elimination::Fo,
         ..fo(0)
     };
     assert_eq!(
@@ -403,10 +440,17 @@ fn pharmpys_unsupported_pairs_are_refused_in_either_order() {
 // ── from a structure to an edit ─────────────────────────────────────────────
 
 fn population(times: &[f64]) -> Population {
+    observed(times, &[])
+}
+
+/// A one-subject population with observation times and, when given,
+/// observations — the range the saturable-elimination inits read (#1257).
+fn observed(times: &[f64], values: &[f64]) -> Population {
     Population {
         subjects: vec![Subject {
             id: "1".into(),
             obs_times: times.to_vec(),
+            observations: values.to_vec(),
             ..Default::default()
         }],
         covariate_names: vec![],
@@ -861,6 +905,7 @@ fn a_parents_bioavailability_binding_is_carried_across_a_swap() {
     // …and to a bolus, where there is no absorption role at all.
     let iv = Structure {
         absorption: Absorption::Inst,
+        elimination: Elimination::Fo,
         ..fo(0)
     };
     let spec = structural_spec(&iv, &fo(0), &parent, &lines(), &d, IivStrategy::NoAdd).unwrap();
@@ -971,7 +1016,7 @@ fn defaults_of_text_read_the_parents_own_declarations() {
          omega ETA_CL ~ 0.1\n  block_omega (ETA_V, ETA_KA) = [0.1, 0.01, 0.2]\n\
          [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = 10\n  if (WT > 70) {\n  Q = TVQ\n  }\n",
     );
-    let d = Defaults::of_text(&m, 0.5);
+    let d = defaults().of_text(&m);
     assert_eq!(d.parameters, vec!["CL", "V", "Q"]);
     assert_eq!(d.theta_names, vec!["TVCL", "TVQ"]);
     assert_eq!(d.eta_names, vec!["ETA_CL", "ETA_V", "ETA_KA"]);
@@ -979,4 +1024,467 @@ fn defaults_of_text_read_the_parents_own_declarations() {
     assert_eq!(d.t_first, 0.5);
     let decls = theta_decls_of(&m);
     assert!(decls[1].fixed && !decls[0].fixed);
+}
+
+// ── the ODE candidate family (#1257) ────────────────────────────────────────
+
+/// `fo(peripherals)` with one coordinate moved off its analytic value.
+fn with_absorption(a: Absorption) -> Structure {
+    Structure {
+        absorption: a,
+        ..fo(0)
+    }
+}
+
+fn with_elimination(e: Elimination) -> Structure {
+    Structure {
+        elimination: e,
+        ..fo(0)
+    }
+}
+
+#[test]
+fn the_engine_is_ode_exactly_when_a_coordinate_has_no_analytic_template() {
+    assert_eq!(fo(0).engine(), Engine::Pk);
+    assert_eq!(with_absorption(Absorption::Inst).engine(), Engine::Pk);
+    assert_eq!(with_elimination(Elimination::Fo).engine(), Engine::Pk);
+    for a in [Absorption::Zo, Absorption::Weibull] {
+        assert_eq!(with_absorption(a).engine(), Engine::Ode, "{}", a.label());
+    }
+    for e in [Elimination::Zo, Elimination::Mm, Elimination::MixFoMm] {
+        assert_eq!(with_elimination(e).engine(), Engine::Ode, "{}", e.label());
+    }
+    // The template carries the engine, so a caller reading `template()` alone
+    // cannot pick the wrong one.
+    assert_eq!(fo(0).template().unwrap().engine, Engine::Pk);
+    assert_eq!(
+        with_elimination(Elimination::Mm).template().unwrap().engine,
+        Engine::Ode
+    );
+}
+
+#[test]
+fn an_ode_candidate_carries_its_own_cost_and_start_budget() {
+    // Ordering is the property the runner needs: the saturable eliminations
+    // are the long poles, then the ODE absorptions, then everything analytic.
+    assert!(with_elimination(Elimination::Mm).cost() > with_absorption(Absorption::Zo).cost());
+    assert!(with_absorption(Absorption::Zo).cost() > fo(0).cost());
+    assert_eq!(fo(0).cost(), 1.0);
+    // Only a saturable elimination asks for extra starts — a zero-order or
+    // Weibull absorption is not the multimodal case.
+    assert_eq!(fo(0).starts(), None);
+    assert_eq!(with_absorption(Absorption::Weibull).starts(), None);
+    for e in [Elimination::Zo, Elimination::Mm, Elimination::MixFoMm] {
+        assert_eq!(
+            with_elimination(e).starts(),
+            Some(MM_STARTS),
+            "{}",
+            e.label()
+        );
+    }
+}
+
+#[test]
+fn zero_order_and_weibull_absorption_render_the_bolus_template() {
+    // Both feed `central` directly, so the depot and its `ka` are gone —
+    // Pharmpy's `set_zero_order_absorption` removes the same compartment.
+    let t = with_absorption(Absorption::Zo).template().unwrap();
+    assert_eq!(t.name, "one_cpt_iv");
+    assert_eq!(t.roles, vec!["cl", "v", "dur"]);
+    let t = Structure {
+        absorption: Absorption::Weibull,
+        ..fo(1)
+    }
+    .template()
+    .unwrap();
+    assert_eq!(t.name, "two_cpt_iv");
+    assert_eq!(t.roles, vec!["cl", "v1", "q", "v2", "td", "beta"]);
+    // …and every one of the added roles is read by the `[odes]` override
+    // rather than bound on the line.
+    for role in ["dur", "td", "beta"] {
+        assert!(ODE_ONLY_ROLES.contains(&role), "{role}");
+    }
+}
+
+#[test]
+fn saturable_elimination_adds_its_parameters_to_any_template() {
+    // Elimination is orthogonal: it composes with every absorption and every
+    // compartment count, because the override replaces only `central`.
+    let mm = Structure {
+        elimination: Elimination::Mm,
+        ..fo(2)
+    }
+    .template()
+    .unwrap();
+    assert_eq!(mm.name, "three_cpt_oral");
+    assert_eq!(
+        mm.roles,
+        vec!["cl", "v1", "q2", "v2", "q3", "v3", "ka", "km"]
+    );
+    // `MIX-FO-MM` keeps `CL` first-order and adds a saturable clearance.
+    let mix = with_elimination(Elimination::MixFoMm).template().unwrap();
+    assert_eq!(mix.roles, vec!["cl", "v", "ka", "clmm", "km"]);
+    // Zero-order elimination takes the same parameters as Michaelis-Menten;
+    // only the `FIX` differs.
+    assert_eq!(
+        with_elimination(Elimination::Zo).template().unwrap().roles,
+        with_elimination(Elimination::Mm).template().unwrap().roles
+    );
+    // A transit chain and a saturable elimination are an allowed pair.
+    let transit_mm = Structure {
+        elimination: Elimination::Mm,
+        transits: Some(TransitCount::N),
+        ..fo(0)
+    }
+    .template()
+    .unwrap();
+    assert_eq!(transit_mm.name, "one_cpt_transit");
+    assert_eq!(transit_mm.roles, vec!["cl", "v", "n", "mtt", "km"]);
+}
+
+#[test]
+fn the_new_absorptions_take_pharmpys_unsupported_pairs() {
+    // ZO and WEIBULL each model the whole delay themselves, so a transit
+    // chain in front of either is refused; WEIBULL additionally refuses a
+    // lag time (Pharmpy's `not_supported_combo`), while ZO takes one.
+    for a in [Absorption::Zo, Absorption::Weibull] {
+        let why = Structure {
+            absorption: a,
+            transits: Some(TransitCount::N),
+            ..fo(0)
+        }
+        .unbuildable()
+        .unwrap_or_else(|| panic!("{} with transits must be refused", a.label()));
+        assert!(why.contains("transit chain"), "{why}");
+        assert!(why.contains(a.label()), "the reason names the mode: {why}");
+    }
+    let why = Structure {
+        absorption: Absorption::Weibull,
+        lagtime: true,
+        ..fo(0)
+    }
+    .unbuildable()
+    .expect("Weibull with a lag time is refused");
+    assert!(why.contains("lag time"), "{why}");
+    assert!(
+        Structure {
+            absorption: Absorption::Zo,
+            lagtime: true,
+            ..fo(0)
+        }
+        .unbuildable()
+        .is_none(),
+        "Pharmpy lags a zero-order infusion, and so does ferx"
+    );
+    // The move table agrees with the structure check, in both orders.
+    let funcs = keys("ABSORPTION([ZO,WEIBULL]); LAGTIME(ON); TRANSITS(N)");
+    let zo = FeatureKey::Absorption(Absorption::Zo);
+    let wb = FeatureKey::Absorption(Absorption::Weibull);
+    let lag = FeatureKey::Lagtime(true);
+    let tn = FeatureKey::Transits(TransitCount::N);
+    for (a, b) in [(zo, tn), (wb, tn), (wb, lag)] {
+        assert!(!allowed(&a, &[b], &funcs, &fo(0)), "{a} after {b}");
+        assert!(!allowed(&b, &[a], &funcs, &fo(0)), "{b} after {a}");
+        assert!(!combination_allowed(&[a, b], &fo(0)), "{a} with {b}");
+    }
+    assert!(combination_allowed(&[zo, lag], &fo(0)));
+    // Elimination is in none of the pairs.
+    let mm = FeatureKey::Elimination(Elimination::Mm);
+    for other in [zo, wb, lag, tn] {
+        assert!(combination_allowed(&[mm, other], &fo(0)), "MM with {other}");
+    }
+}
+
+#[test]
+fn onto_space_moves_elimination_in_pharmpys_position() {
+    // Pharmpy's `least_number_of_transformations` walks absorption,
+    // elimination, transits, peripherals, lagtime — so a base outside a
+    // space that names only saturable eliminations is moved onto it, and the
+    // elimination move comes second.
+    assert_eq!(
+        onto_space(&fo(0), &keys("ELIMINATION(MM)")),
+        vec![FeatureKey::Elimination(Elimination::Mm)]
+    );
+    assert_eq!(
+        onto_space(&fo(0), &keys("ABSORPTION(INST); ELIMINATION(MM)")),
+        vec![
+            FeatureKey::Absorption(Absorption::Inst),
+            FeatureKey::Elimination(Elimination::Mm),
+        ]
+    );
+    // A space that lists the base's own elimination leaves it alone.
+    assert!(onto_space(&fo(0), &keys("ELIMINATION([FO,MM])")).is_empty());
+}
+
+/// The Weibull scale init is `MAT / Γ(1 + 1/k)`, and the divisor is stored as
+/// a constant because `k` is fixed at 1.5. Pinned against ferx's own
+/// `ln_gamma` — a different implementation from the literal — so a mistyped
+/// digit or a wrong argument (Γ(1.5) = 0.8862 is 1.8% away) fails.
+#[test]
+fn weibull_scale_matches_the_gamma_identity() {
+    let want = ferx_core::stats::special::ln_gamma(1.0 + 1.0 / WEIBULL_SHAPE_INIT).exp();
+    // Realised error 1.1e-16 — one ULP of the exp round-trip, not a
+    // tolerance for disagreement.
+    assert!(
+        (GAMMA_1_PLUS_1_OVER_SHAPE - want).abs() < 1e-12,
+        "{GAMMA_1_PLUS_1_OVER_SHAPE} vs {want}"
+    );
+    assert!(want.is_finite());
+}
+
+/// A one-subject population whose observations span a known range, for the
+/// saturable-elimination inits.
+fn dv_defaults() -> Defaults {
+    Defaults::new(
+        vec!["CL".into(), "V".into(), "KA".into()],
+        vec!["TVCL".into(), "TVV".into(), "TVKA".into()],
+        vec![0.2, 10.0, 1.5],
+        vec!["ETA_CL".into(), "ETA_V".into(), "ETA_KA".into()],
+        &observed(&[0.0, 0.5, 1.0, 2.0], &[2.0, 8.0, 20.0, 5.0]),
+    )
+}
+
+#[test]
+fn michaelis_menten_reuses_the_parents_clearance_and_declares_km_from_the_data() {
+    let parent = template("pk one_cpt_oral(cl=CL, v=V, ka=KA)");
+    let d = dv_defaults();
+    assert_eq!((d.dv_min, d.dv_max), (2.0, 20.0));
+    let spec = structural_spec(
+        &with_elimination(Elimination::Mm),
+        &fo(0),
+        &parent,
+        &lines(),
+        &d,
+        IivStrategy::AbsorptionDelay,
+    )
+    .unwrap();
+    // The disposition line is unchanged — the clearance *is* the
+    // Michaelis-Menten clearance, which is what carries its estimate and its
+    // η across the move (Pharmpy renames `CL` to `CLMM`; ferx keeps the name).
+    assert_eq!(
+        spec.bindings,
+        vec![
+            ("cl".to_string(), "CL".to_string()),
+            ("v".to_string(), "V".to_string()),
+            ("ka".to_string(), "KA".to_string()),
+        ]
+    );
+    assert!(
+        !spec.bindings.iter().any(|(r, _)| r == "km"),
+        "`km` is read by the override, not bound on the line: {:?}",
+        spec.bindings
+    );
+    let km = spec
+        .new_parameters
+        .iter()
+        .find(|p| p.name == "KM")
+        .expect("KM is declared");
+    assert_eq!(km.init, 10.0, "max(DV)/2");
+    assert_eq!(km.upper, 30.0, "1.5 * max(DV)");
+    assert!(!km.fixed);
+    assert!(km.iiv.is_none(), "absorption_delay adds η to MDT only");
+    assert_eq!(
+        spec.engine,
+        StructuralEngine::Ode {
+            input: InputForm::Template,
+            elimination: EliminationForm::MichaelisMenten { km: "KM".into() },
+        }
+    );
+}
+
+#[test]
+fn zero_order_elimination_is_michaelis_menten_with_km_fixed_low() {
+    let parent = template("pk one_cpt_oral(cl=CL, v=V, ka=KA)");
+    let spec = structural_spec(
+        &with_elimination(Elimination::Zo),
+        &fo(0),
+        &parent,
+        &lines(),
+        &dv_defaults(),
+        IivStrategy::NoAdd,
+    )
+    .unwrap();
+    let km = spec
+        .new_parameters
+        .iter()
+        .find(|p| p.name == "KM")
+        .expect("KM is declared");
+    assert_eq!(km.init, 0.02, "min(DV)/100");
+    assert!(km.fixed, "a free KM here would be Michaelis-Menten, not ZO");
+    // The *term* is the same one Michaelis-Menten writes: the two differ by
+    // the `FIX`, which is a declaration rather than an equation.
+    assert_eq!(
+        spec.engine,
+        StructuralEngine::Ode {
+            input: InputForm::Template,
+            elimination: EliminationForm::MichaelisMenten { km: "KM".into() },
+        }
+    );
+}
+
+#[test]
+fn mixed_elimination_adds_a_saturable_clearance_at_half_the_first_order_one() {
+    let parent = template("pk one_cpt_oral(cl=CL, v=V, ka=KA)");
+    let spec = structural_spec(
+        &with_elimination(Elimination::MixFoMm),
+        &fo(0),
+        &parent,
+        &lines(),
+        &dv_defaults(),
+        IivStrategy::NoAdd,
+    )
+    .unwrap();
+    let clmm = spec
+        .new_parameters
+        .iter()
+        .find(|p| p.name == "CLMM")
+        .expect("CLMM is declared");
+    // `lines()` puts `CL = TVCL * exp(ETA_CL)` behind `TVCL = 0.2`.
+    assert_eq!(clmm.init, 0.1, "CL/2");
+    assert_eq!(
+        spec.engine,
+        StructuralEngine::Ode {
+            input: InputForm::Template,
+            elimination: EliminationForm::MixedFoMm {
+                clmm: "CLMM".into(),
+                km: "KM".into(),
+            },
+        }
+    );
+}
+
+#[test]
+fn zero_order_absorption_declares_pharmpys_duration_and_drops_the_depot() {
+    let parent = template("pk one_cpt_oral(cl=CL, v=V, ka=KA)");
+    let d = dv_defaults();
+    assert_eq!(d.t_first, 0.5);
+    let spec = structural_spec(
+        &with_absorption(Absorption::Zo),
+        &fo(0),
+        &parent,
+        &lines(),
+        &d,
+        IivStrategy::AbsorptionDelay,
+    )
+    .unwrap();
+    assert_eq!(spec.template, "one_cpt_iv");
+    assert_eq!(
+        spec.bindings,
+        vec![
+            ("cl".to_string(), "CL".to_string()),
+            ("v".to_string(), "V".to_string()),
+        ],
+        "`ka` is not a role of the bolus template, so the depot is gone"
+    );
+    let dur = spec
+        .new_parameters
+        .iter()
+        .find(|p| p.name == "DUR")
+        .expect("DUR is declared");
+    // Pharmpy: `D1 = 2·MAT`, `MAT = 2·t_first`.
+    assert_eq!(dur.init, 2.0 * (2.0 * 0.5));
+    assert_eq!(
+        spec.engine,
+        StructuralEngine::Ode {
+            input: InputForm::ZeroOrder { dur: "DUR".into() },
+            elimination: EliminationForm::FirstOrder,
+        }
+    );
+}
+
+#[test]
+fn weibull_absorption_declares_the_scale_and_shape() {
+    let parent = template("pk one_cpt_oral(cl=CL, v=V, ka=KA)");
+    let spec = structural_spec(
+        &with_absorption(Absorption::Weibull),
+        &fo(0),
+        &parent,
+        &lines(),
+        &dv_defaults(),
+        IivStrategy::AbsorptionDelay,
+    )
+    .unwrap();
+    let td = spec
+        .new_parameters
+        .iter()
+        .find(|p| p.name == "TD")
+        .expect("TD is declared");
+    let beta = spec
+        .new_parameters
+        .iter()
+        .find(|p| p.name == "BETA")
+        .expect("BETA is declared");
+    assert_eq!(beta.init, WEIBULL_SHAPE_INIT);
+    assert_eq!(td.init, 2.0 * 0.5 / GAMMA_1_PLUS_1_OVER_SHAPE);
+    assert_eq!(
+        spec.engine,
+        StructuralEngine::Ode {
+            input: InputForm::Weibull {
+                td: "TD".into(),
+                beta: "BETA".into(),
+            },
+            elimination: EliminationForm::FirstOrder,
+        }
+    );
+}
+
+#[test]
+fn an_ode_parameter_the_parent_already_declares_is_reused_not_redeclared() {
+    // The step that moves MM → MIX-FO-MM must keep the `KM` its parent
+    // converged on rather than re-deriving one from the data — the seeding
+    // step has already written the parent's estimate into that θ.
+    let parent = template("pk one_cpt_oral(cl=CL, v=V, ka=KA)");
+    let d = Defaults {
+        parameters: vec!["CL".into(), "V".into(), "KA".into(), "KM".into()],
+        ..dv_defaults()
+    };
+    let spec = structural_spec(
+        &with_elimination(Elimination::MixFoMm),
+        &with_elimination(Elimination::Mm),
+        &parent,
+        &lines(),
+        &d,
+        IivStrategy::NoAdd,
+    )
+    .unwrap();
+    assert!(
+        spec.new_parameters.iter().all(|p| p.name != "KM"),
+        "KM is the parent's: {:?}",
+        spec.new_parameters
+    );
+    assert!(spec.new_parameters.iter().any(|p| p.name == "CLMM"));
+    assert_eq!(
+        spec.engine,
+        StructuralEngine::Ode {
+            input: InputForm::Template,
+            elimination: EliminationForm::MixedFoMm {
+                clmm: "CLMM".into(),
+                km: "KM".into(),
+            },
+        }
+    );
+}
+
+#[test]
+fn a_move_back_to_first_order_elimination_writes_an_analytic_candidate() {
+    // The reverse move exists — `ELIMINATION([FO,MM])` names both — and it
+    // must produce a `pk` line with no override, or the candidate would carry
+    // a saturable term it no longer declares a `KM` for.
+    let parent = template("ode_template one_cpt_oral(cl=CL, v=V, ka=KA)");
+    let d = Defaults {
+        parameters: vec!["CL".into(), "V".into(), "KA".into(), "KM".into()],
+        ..dv_defaults()
+    };
+    let spec = structural_spec(
+        &fo(0),
+        &with_elimination(Elimination::Mm),
+        &parent,
+        &lines(),
+        &d,
+        IivStrategy::NoAdd,
+    )
+    .unwrap();
+    assert_eq!(spec.engine, StructuralEngine::Pk);
+    assert_eq!(spec.template, "one_cpt_oral");
+    assert!(spec.new_parameters.is_empty());
 }

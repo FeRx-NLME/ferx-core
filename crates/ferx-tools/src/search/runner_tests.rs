@@ -1283,3 +1283,127 @@ fn a_resume_after_raising_the_start_override_refits_rather_than_reusing() {
     assert!(fitted.is_empty(), "an unchanged override refits");
     assert_eq!((again.fitted, again.reused), (0, 1));
 }
+
+// ── the non-uniform thread plan (#1257) ────────────────────────────────────
+
+/// Candidates of unequal cost are planned in separate groups, heaviest first,
+/// and each group gets the whole budget for its own split — so the expensive
+/// one runs with subject-level threads instead of alone on one worker while
+/// the pool empties around it.
+#[test]
+fn candidates_of_unequal_cost_are_planned_separately_heaviest_first() {
+    let mut candidates: Vec<Candidate> = (0..4)
+        .map(|i| {
+            candidate(
+                &format!("cheap{i}"),
+                &format!("[parameters]\ntheta CL = {i}\n"),
+            )
+        })
+        .collect();
+    candidates.push(candidate("heavy", "[parameters]\ntheta CL = 9\n").cost(40.0));
+
+    let seen: Mutex<Vec<(String, usize)>> = Mutex::new(Vec::new());
+    let report = Runner::new()
+        .threads(4)
+        .run_with_fitter(&candidates, &population(&["1"]), &lenient(), |c, t| {
+            seen.lock().unwrap().push((c.id.clone(), t));
+            Ok(converged_fit(10.0))
+        })
+        .expect("run");
+    assert_eq!(report.fitted, 5);
+
+    let seen = seen.lock().unwrap().clone();
+    // The heavy group is one candidate over a four-thread budget, so it gets
+    // all four; the four cheap ones then run one thread each.
+    let heavy = seen
+        .iter()
+        .find(|(id, _)| id == "heavy")
+        .expect("heavy ran");
+    assert_eq!(
+        heavy.1, 4,
+        "the heavy candidate ran with {} threads",
+        heavy.1
+    );
+    for (id, threads) in &seen {
+        if id != "heavy" {
+            assert_eq!(*threads, 1, "{id} ran with {threads} threads");
+        }
+    }
+    // …and it ran first: every cheap fit was submitted after it, which is
+    // what makes the split a plan rather than two arbitrary passes.
+    let heavy_at = seen.iter().position(|(id, _)| id == "heavy").expect("ran");
+    assert_eq!(heavy_at, 0, "{seen:?}");
+}
+
+/// A run whose candidates all carry the default cost is one group, planned
+/// exactly as it was before per-candidate costs existed. Without this the
+/// grouping could silently narrow every ordinary run to one fit at a time.
+#[test]
+fn equal_cost_candidates_are_one_group_and_still_run_concurrently() {
+    let candidates: Vec<Candidate> = (0..6)
+        .map(|i| candidate(&format!("c{i}"), &format!("[parameters]\ntheta CL = {i}\n")))
+        .collect();
+    let gauge = Gauge::new();
+    let report = Runner::new()
+        .threads(2)
+        .run_with_fitter(&candidates, &population(&["1"]), &lenient(), |_, _| {
+            gauge.enter(Duration::from_millis(60));
+            Ok(converged_fit(10.0))
+        })
+        .expect("run");
+    assert_eq!(report.fitted, 6);
+    assert!(
+        gauge.paired.load(Ordering::SeqCst),
+        "one cost group must still run its candidates concurrently"
+    );
+    assert!(gauge.max.load(Ordering::SeqCst) <= 2);
+}
+
+/// Two candidates that *share* a raised cost stay in one group, so a search
+/// whose expensive candidates are the majority does not serialise them.
+#[test]
+fn candidates_sharing_a_cost_share_a_group() {
+    let candidates = vec![
+        candidate("a", "[parameters]\ntheta CL = 1\n").cost(40.0),
+        candidate("b", "[parameters]\ntheta CL = 2\n").cost(40.0),
+    ];
+    let gauge = Gauge::new();
+    Runner::new()
+        .threads(2)
+        .run_with_fitter(&candidates, &population(&["1"]), &lenient(), |_, _| {
+            gauge.enter(Duration::from_millis(60));
+            Ok(converged_fit(10.0))
+        })
+        .expect("run");
+    assert!(
+        gauge.paired.load(Ordering::SeqCst),
+        "two candidates of one cost were serialised"
+    );
+}
+
+/// A candidate's own start count is a floor under the run's, not a
+/// replacement: a run configured with more retries than a tool's guess keeps
+/// them (#1257). Asserted on the function `compile_and_fit` calls, since the
+/// count it computes is not observable on a `FitResult`.
+#[test]
+fn a_per_candidate_start_count_is_a_floor_under_the_runs() {
+    let options = RunOptions {
+        n_starts: 5,
+        ..lenient()
+    };
+    let plain = candidate("plain", "[parameters]\ntheta CL = 1\n");
+    assert_eq!(effective_starts(&plain, &options), 5);
+    assert_eq!(
+        effective_starts(&plain.clone().starts(2), &options),
+        5,
+        "a tool asking for fewer must not take the run's retries away"
+    );
+    assert_eq!(effective_starts(&plain.clone().starts(9), &options), 9);
+    // …and a run that asks for none still fits once.
+    let none = RunOptions {
+        n_starts: 0,
+        ..lenient()
+    };
+    assert_eq!(effective_starts(&plain, &none), 1);
+    assert_eq!(effective_starts(&plain.starts(4), &none), 4);
+}

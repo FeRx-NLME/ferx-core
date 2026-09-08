@@ -9,6 +9,13 @@
 # `TRANSITS([0,3], NODEPOT)` or `TRANSITS(N)` to search transit absorption
 # too — a two-compartment transit fit with the covariance step is minutes,
 # not seconds, on this dataset, which the report's `seconds` column shows.
+#
+# `ELIMINATION([FO,MM])` and `ABSORPTION([FO,ZO,WEIBULL])` are searchable too
+# (#1257), but each such candidate is an ODE model rather than a closed form:
+# 20-40x the runtime per fit, and a saturable elimination is multi-started on
+# top of that. They are left out of this example so it stays a few seconds;
+# add them when the question is worth the wall clock.
+#
 # See docs/tools/modelsearch.qmd for the algorithms and the coverage table.
 
 base = "warfarin.ferx"

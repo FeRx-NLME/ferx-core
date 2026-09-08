@@ -57,9 +57,16 @@ mod tests;
 
 pub use spec::{
     ErrorForm, ErrorSpecText, EtaDecl, IivForm, ModelEdit, NewParameter, ParameterVariability,
-    RandomEffectBlock, RandomEffectDecl, Relation, RelationTheta, SigmaDecl, StructuralSpec,
-    ThetaDecl, TimeVaryingDecl, VariabilityText,
+    RandomEffectBlock, RandomEffectDecl, Relation, RelationTheta, SigmaDecl, StructuralEngine,
+    StructuralSpec, ThetaDecl, TimeVaryingDecl, VariabilityText,
 };
+
+/// The central input and elimination terms an
+/// [`StructuralEngine::Ode`] disposition is written with. Re-exported from
+/// [`crate::pk::ode_template`], which owns the transcription, so a caller
+/// building a [`StructuralSpec`] does not have to reach into the PK module
+/// for two of its fields.
+pub use crate::pk::ode_template::{EliminationForm, InputForm};
 
 use std::collections::HashSet;
 use std::ops::Range;

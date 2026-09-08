@@ -24,7 +24,7 @@ use ferx_core::edit::{ModelEdit, ModelText};
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::{fit, predict};
 use ferx_tools::modelsearch::{
-    run_modelsearch, Absorption, ModelsearchRun, Structure, TransitCount,
+    run_modelsearch, Absorption, Elimination, ModelsearchRun, Structure, TransitCount,
 };
 use ferx_tools::search::SearchConfig;
 
@@ -201,15 +201,15 @@ fn every_candidate_the_search_can_reach_compiles_and_evaluates() {
     assert_eq!(
         structures,
         vec![
-            "ABSORPTION=FO;LAGTIME=OFF;PERIPHERALS=0;TRANSITS=3",
-            "ABSORPTION=FO;LAGTIME=OFF;PERIPHERALS=0;TRANSITS=N",
-            "ABSORPTION=FO;LAGTIME=OFF;PERIPHERALS=1;TRANSITS=0",
-            "ABSORPTION=FO;LAGTIME=OFF;PERIPHERALS=1;TRANSITS=3",
-            "ABSORPTION=FO;LAGTIME=OFF;PERIPHERALS=1;TRANSITS=N",
-            "ABSORPTION=FO;LAGTIME=OFF;PERIPHERALS=2;TRANSITS=0",
-            "ABSORPTION=FO;LAGTIME=ON;PERIPHERALS=0;TRANSITS=0",
-            "ABSORPTION=FO;LAGTIME=ON;PERIPHERALS=1;TRANSITS=0",
-            "ABSORPTION=FO;LAGTIME=ON;PERIPHERALS=2;TRANSITS=0",
+            "ABSORPTION=FO;ELIMINATION=FO;LAGTIME=OFF;PERIPHERALS=0;TRANSITS=3",
+            "ABSORPTION=FO;ELIMINATION=FO;LAGTIME=OFF;PERIPHERALS=0;TRANSITS=N",
+            "ABSORPTION=FO;ELIMINATION=FO;LAGTIME=OFF;PERIPHERALS=1;TRANSITS=0",
+            "ABSORPTION=FO;ELIMINATION=FO;LAGTIME=OFF;PERIPHERALS=1;TRANSITS=3",
+            "ABSORPTION=FO;ELIMINATION=FO;LAGTIME=OFF;PERIPHERALS=1;TRANSITS=N",
+            "ABSORPTION=FO;ELIMINATION=FO;LAGTIME=OFF;PERIPHERALS=2;TRANSITS=0",
+            "ABSORPTION=FO;ELIMINATION=FO;LAGTIME=ON;PERIPHERALS=0;TRANSITS=0",
+            "ABSORPTION=FO;ELIMINATION=FO;LAGTIME=ON;PERIPHERALS=1;TRANSITS=0",
+            "ABSORPTION=FO;ELIMINATION=FO;LAGTIME=ON;PERIPHERALS=2;TRANSITS=0",
         ],
         "{:?}",
         result.notes
@@ -294,6 +294,7 @@ fn a_generated_candidate_is_the_hand_written_model() {
             r.structure
                 == Structure {
                     absorption: Absorption::Fo,
+                    elimination: Elimination::Fo,
                     peripherals: 1,
                     transits: None,
                     lagtime: true,
@@ -727,4 +728,117 @@ fn a_fixed_transit_base_compiles_every_transit_move() {
         "another fixed count: same free θ"
     );
     assert_eq!(n(&candidates[2]), base_n + 1);
+}
+
+/// The `[odes]` candidate family (#1257), end to end: every absorption and
+/// every elimination that has no `pk` template, generated from an analytic
+/// base, compiled and evaluated on real data.
+///
+/// The unit tests pin the text these candidates are written as; this is what
+/// says the text is a model the engine accepts and scores. It is also where a
+/// role table that disagrees with the parser's would show up — the ODE-only
+/// roles (`dur`, `td`, `beta`, `clmm`, `km`) are declared as parameters and
+/// referenced only by the generated equation, so a name that did not match
+/// would be pruned as dead and leave the equation reading an undeclared
+/// symbol.
+#[test]
+fn every_ode_candidate_compiles_and_evaluates() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_config(
+        dir.path(),
+        "ABSORPTION([FO,ZO,WEIBULL]); ELIMINATION([FO,ZO,MM,MIX-FO-MM])",
+        "[modelsearch]\nalgorithm = \"exhaustive\"\n",
+    );
+    let (_, result) = run(dir.path(), &path);
+
+    let candidates: Vec<_> = result.layer_rows(1).collect();
+    // 3 absorptions × 4 eliminations, minus the base's own combination.
+    assert_eq!(candidates.len(), 11, "{:?}", result.notes);
+    assert!(
+        result.notes.iter().all(|n| !n.starts_with("not generated")),
+        "elimination is in none of Pharmpy's incompatible pairs, and neither \
+         ZO nor WEIBULL meets a transit chain here: {:?}",
+        result.notes
+    );
+
+    let base_ofv = result.row("base").unwrap().ofv.unwrap();
+    for r in &candidates {
+        assert!(r.error.is_none(), "{}: {:?}", r.id, r.error);
+        let ofv = r.ofv.unwrap_or_else(|| panic!("{}: no OFV", r.id));
+        assert!(ofv.is_finite(), "{}: {ofv}", r.id);
+        assert!(r.passed, "{}: {:?}", r.id, r.failures);
+        // Each candidate is a different model from the base, so the
+        // objective has to move — an override the engine ignored would leave
+        // it untouched.
+        assert_ne!(ofv.to_bits(), base_ofv.to_bits(), "{}", r.id);
+        assert!(r.rank.is_some());
+        let model = &result.models[&r.id];
+        let structural = model.block_lines("structural_model");
+        assert_eq!(structural.len(), 1, "{}: {structural:?}", r.id);
+        assert!(
+            structural[0].starts_with("ode_template "),
+            "{}: {structural:?}",
+            r.id
+        );
+        // Exactly one override — only `central` ever changes — and it names
+        // the variant's own parameters.
+        let odes = model.block_lines("odes");
+        assert_eq!(odes.len(), 1, "{}: {odes:?}", r.id);
+        assert!(
+            odes[0].starts_with("d/dt(central) = "),
+            "{}: {odes:?}",
+            r.id
+        );
+    }
+
+    // Spot-check the four elimination spellings on the base's own absorption,
+    // where the candidate differs from the base in that coordinate alone.
+    let text_of = |feature: &str| -> ferx_core::edit::ModelText {
+        let row = candidates
+            .iter()
+            .find(|r| r.path.len() == 1 && r.path[0].to_string() == feature)
+            .unwrap_or_else(|| panic!("{feature} is a candidate"));
+        result.models[&row.id].clone()
+    };
+    assert_eq!(
+        text_of("ELIMINATION(MM)").block_lines("odes"),
+        vec!["d/dt(central) = KA * depot - ((CL * KM / (KM + central / V)) / V) * central"]
+    );
+    assert_eq!(
+        text_of("ELIMINATION(ZO)").block_lines("odes"),
+        text_of("ELIMINATION(MM)").block_lines("odes"),
+        "zero-order elimination is the same term; the `FIX` is what differs"
+    );
+    let zo = text_of("ELIMINATION(ZO)");
+    assert!(
+        zo.block_lines("parameters")
+            .iter()
+            .any(|l| l.starts_with("theta TVKM(") && l.ends_with(" FIX")),
+        "{:?}",
+        zo.block_lines("parameters")
+    );
+    assert!(
+        text_of("ELIMINATION(MIX-FO-MM)").block_lines("odes")[0]
+            .contains("(CL + CLMM * KM / (KM + central / V))"),
+        "{:?}",
+        text_of("ELIMINATION(MIX-FO-MM)").block_lines("odes")
+    );
+    assert_eq!(
+        text_of("ABSORPTION(ZO)").block_lines("odes"),
+        vec!["d/dt(central) = zero_order(dur=DUR) - (CL/V) * central"]
+    );
+    assert_eq!(
+        text_of("ABSORPTION(WEIBULL)").block_lines("odes"),
+        vec!["d/dt(central) = weibull(td=TD, beta=BETA) - (CL/V) * central"]
+    );
+    // Dropping the depot takes the absorption rate and its η with it.
+    let weibull = text_of("ABSORPTION(WEIBULL)");
+    assert!(
+        !weibull
+            .block_lines("parameters")
+            .iter()
+            .any(|l| l.contains("TVKA") || l.contains("ETA_KA")),
+        "{:?}",
+        weibull.block_lines("parameters")
+    );
 }

@@ -25,8 +25,8 @@
 use std::path::Path;
 
 use ferx_core::edit::{
-    ErrorForm, ErrorSpecText, EtaDecl, IivForm, ModelEdit, ModelText, NewParameter, Relation,
-    RelationTheta, SigmaDecl, StructuralSpec, ThetaDecl, TimeVaryingDecl,
+    EliminationForm, ErrorForm, ErrorSpecText, EtaDecl, IivForm, InputForm, ModelEdit, ModelText,
+    NewParameter, Relation, RelationTheta, SigmaDecl, StructuralSpec, ThetaDecl, TimeVaryingDecl,
 };
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::types::{CovariateForm, CovariateStat, FitOptions};
@@ -131,20 +131,20 @@ fn assert_same_model(generated: &str, hand_written: &str) {
 
 #[test]
 fn widening_to_two_compartments_is_the_hand_written_two_compartment_model() {
-    let generated = edited(vec![ModelEdit::SetStructural(StructuralSpec {
-        template: "two_cpt_oral".into(),
-        bindings: vec![
+    let generated = edited(vec![ModelEdit::SetStructural(StructuralSpec::new(
+        "two_cpt_oral",
+        vec![
             ("cl".into(), "CL".into()),
             ("v1".into(), "V".into()),
             ("q".into(), "Q".into()),
             ("v2".into(), "V2".into()),
             ("ka".into(), "KA".into()),
         ],
-        new_parameters: vec![
+        vec![
             NewParameter::new("Q", "TVQ", 8.0, 0.1, 100.0),
             NewParameter::new("V2", "TVV2", 80.0, 1.0, 500.0).with_iiv("ETA_V2", 0.08),
         ],
-    })]);
+    ))]);
 
     // The θ and η the edit appends land at the end of their blocks, so the
     // hand-written twin declares them in that same order — the two parameter
@@ -172,29 +172,29 @@ fn narrowing_back_to_one_compartment_restores_the_parent() {
     // blocks must land exactly back on the model we started from. This is the
     // property a stepwise search depends on when it backs out of a step.
     let generated = edited(vec![
-        ModelEdit::SetStructural(StructuralSpec {
-            template: "two_cpt_oral".into(),
-            bindings: vec![
+        ModelEdit::SetStructural(StructuralSpec::new(
+            "two_cpt_oral",
+            vec![
                 ("cl".into(), "CL".into()),
                 ("v1".into(), "V".into()),
                 ("q".into(), "Q".into()),
                 ("v2".into(), "V2".into()),
                 ("ka".into(), "KA".into()),
             ],
-            new_parameters: vec![
+            vec![
                 NewParameter::new("Q", "TVQ", 8.0, 0.1, 100.0),
                 NewParameter::new("V2", "TVV2", 80.0, 1.0, 500.0).with_iiv("ETA_V2", 0.08),
             ],
-        }),
-        ModelEdit::SetStructural(StructuralSpec {
-            template: "one_cpt_oral".into(),
-            bindings: vec![
+        )),
+        ModelEdit::SetStructural(StructuralSpec::new(
+            "one_cpt_oral",
+            vec![
                 ("cl".into(), "CL".into()),
                 ("v".into(), "V".into()),
                 ("ka".into(), "KA".into()),
             ],
-            new_parameters: vec![],
-        }),
+            vec![],
+        )),
     ]);
     assert_same_model(&generated, PARENT);
     assert_eq!(
@@ -468,4 +468,277 @@ fn seeding_inits_starts_the_child_where_the_parent_finished() {
             "`{name}` was seeded with {got}, not the parent's {want}"
         );
     }
+}
+
+// ── SetStructural, the ODE engine (#1257) ──────────────────────────────────
+//
+// `ABSORPTION(ZO)`, `ABSORPTION(WEIBULL)` and every `ELIMINATION` other than
+// first-order have no `pk` template, so a candidate for them is an
+// `ode_template NAME(...)` line plus one `[odes]` override. The twin here is
+// the **fully hand-written** `ode(obs_cmt=…, states=[…])` model with every
+// equation typed out and `obs_scale` stated — not another `ode_template`,
+// which would compare the generator against itself.
+
+/// The hand-written `[fit_options]` / `[error_model]` / `[covariates]` tail
+/// every ODE twin below shares with [`PARENT`].
+const ODE_TWIN_TAIL: &str = "\
+[covariates]
+  WT   continuous
+  CRCL continuous
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method   = focei
+  maxiter  = 2
+  gradient = fd
+";
+
+#[test]
+fn michaelis_menten_elimination_is_the_hand_written_ode_model() {
+    let generated = edited(vec![ModelEdit::SetStructural(
+        StructuralSpec::new(
+            "one_cpt_oral",
+            vec![
+                ("cl".into(), "CL".into()),
+                ("v".into(), "V".into()),
+                ("ka".into(), "KA".into()),
+            ],
+            vec![NewParameter::new("KM", "TVKM", 5.0, 0.0, 100.0)],
+        )
+        .ode(
+            InputForm::Template,
+            EliminationForm::MichaelisMenten { km: "KM".into() },
+        ),
+    )]);
+    let hand = format!(
+        "\
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(40.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  theta TVKM(5.0, 0.0, 100.0)
+
+  omega ETA_CL ~ 0.15
+  omega ETA_V  ~ 0.15
+  omega ETA_KA ~ 0.20
+
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+  KM = TVKM
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) = KA * depot - ((CL * KM / (KM + central / V)) / V) * central
+
+[scaling]
+  obs_scale = V
+
+{ODE_TWIN_TAIL}"
+    );
+    assert_same_model(&generated, &hand);
+}
+
+#[test]
+fn mixed_mm_fo_elimination_is_the_hand_written_ode_model() {
+    let generated = edited(vec![ModelEdit::SetStructural(
+        StructuralSpec::new(
+            "one_cpt_oral",
+            vec![
+                ("cl".into(), "CL".into()),
+                ("v".into(), "V".into()),
+                ("ka".into(), "KA".into()),
+            ],
+            vec![
+                NewParameter::new("CLMM", "TVCLMM", 2.0, 0.0, 100.0),
+                NewParameter::new("KM", "TVKM", 5.0, 0.0, 100.0),
+            ],
+        )
+        .ode(
+            InputForm::Template,
+            EliminationForm::MixedFoMm {
+                clmm: "CLMM".into(),
+                km: "KM".into(),
+            },
+        ),
+    )]);
+    let hand = format!(
+        "\
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(40.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  theta TVCLMM(2.0, 0.0, 100.0)
+  theta TVKM(5.0, 0.0, 100.0)
+
+  omega ETA_CL ~ 0.15
+  omega ETA_V  ~ 0.15
+  omega ETA_KA ~ 0.20
+
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV * exp(ETA_V)
+  KA   = TVKA * exp(ETA_KA)
+  CLMM = TVCLMM
+  KM   = TVKM
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) = KA * depot - ((CL + CLMM * KM / (KM + central / V)) / V) * central
+
+[scaling]
+  obs_scale = V
+
+{ODE_TWIN_TAIL}"
+    );
+    assert_same_model(&generated, &hand);
+}
+
+#[test]
+fn zero_order_absorption_is_the_hand_written_ode_model() {
+    let generated = edited(vec![ModelEdit::SetStructural(
+        StructuralSpec::new(
+            "one_cpt_iv",
+            vec![("cl".into(), "CL".into()), ("v".into(), "V".into())],
+            vec![NewParameter::new("DUR", "TVDUR", 2.0, 0.0, 24.0)],
+        )
+        .ode(
+            InputForm::ZeroOrder { dur: "DUR".into() },
+            EliminationForm::FirstOrder,
+        ),
+    )]);
+    let hand = format!(
+        "\
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(40.0, 1.0, 500.0)
+  theta TVDUR(2.0, 0.0, 24.0)
+
+  omega ETA_CL ~ 0.15
+  omega ETA_V  ~ 0.15
+
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV * exp(ETA_V)
+  DUR = TVDUR
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = zero_order(dur=DUR) - (CL/V) * central
+
+[scaling]
+  obs_scale = V
+
+{ODE_TWIN_TAIL}"
+    );
+    assert_same_model(&generated, &hand);
+}
+
+#[test]
+fn weibull_absorption_is_the_hand_written_ode_model() {
+    let generated = edited(vec![ModelEdit::SetStructural(
+        StructuralSpec::new(
+            "two_cpt_iv",
+            vec![
+                ("cl".into(), "CL".into()),
+                ("v1".into(), "V".into()),
+                ("q".into(), "Q".into()),
+                ("v2".into(), "V2".into()),
+            ],
+            vec![
+                NewParameter::new("Q", "TVQ", 2.0, 0.0, 100.0),
+                NewParameter::new("V2", "TVV2", 20.0, 0.0, 1000.0),
+                NewParameter::new("TD", "TVTD", 2.0, 0.0, 24.0),
+                NewParameter::new("BETA", "TVBETA", 1.5, 0.0, 10.0),
+            ],
+        )
+        .ode(
+            InputForm::Weibull {
+                td: "TD".into(),
+                beta: "BETA".into(),
+            },
+            EliminationForm::FirstOrder,
+        ),
+    )]);
+    let hand = format!(
+        "\
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(40.0, 1.0, 500.0)
+  theta TVQ(2.0, 0.0, 100.0)
+  theta TVV2(20.0, 0.0, 1000.0)
+  theta TVTD(2.0, 0.0, 24.0)
+  theta TVBETA(1.5, 0.0, 10.0)
+
+  omega ETA_CL ~ 0.15
+  omega ETA_V  ~ 0.15
+
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV * exp(ETA_V)
+  Q    = TVQ
+  V2   = TVV2
+  TD   = TVTD
+  BETA = TVBETA
+
+[structural_model]
+  ode(obs_cmt=central, states=[central, periph])
+
+[odes]
+  d/dt(central) = weibull(td=TD, beta=BETA) - (CL/V + Q/V) * central + (Q/V2) * periph
+  d/dt(periph)  = (Q/V) * central - (Q/V2) * periph
+
+[scaling]
+  obs_scale = V
+
+{ODE_TWIN_TAIL}"
+    );
+    assert_same_model(&generated, &hand);
+}
+
+/// The ODE engine's *default* variant is the numerically-integrated twin of
+/// the analytic template it names — the pairing
+/// `tests/analytical_ode_equivalence.rs` validates — so it must parse, run,
+/// and write no `[odes]` override at all.
+#[test]
+fn the_default_ode_variant_is_the_generated_disposition() {
+    let generated = edited(vec![ModelEdit::SetStructural(
+        StructuralSpec::new(
+            "one_cpt_oral",
+            vec![
+                ("cl".into(), "CL".into()),
+                ("v".into(), "V".into()),
+                ("ka".into(), "KA".into()),
+            ],
+            vec![],
+        )
+        .ode(InputForm::Template, EliminationForm::FirstOrder),
+    )]);
+    assert!(!generated.contains("[odes]"), "{generated}");
+    let hand = PARENT.replace(
+        "  pk one_cpt_oral(cl=CL, v=V, ka=KA)",
+        "  ode(obs_cmt=central, states=[depot, central])\n\n[odes]\n  \
+         d/dt(depot)   = -KA * depot\n  d/dt(central) = KA * depot - (CL/V) * central\n\n\
+         [scaling]\n  obs_scale = V",
+    );
+    assert_same_model(&generated, &hand);
 }

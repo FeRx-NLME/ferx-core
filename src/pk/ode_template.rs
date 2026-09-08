@@ -41,6 +41,103 @@ pub struct GeneratedDisposition {
     pub obs_scale: String,
 }
 
+/// How the dose enters `central`, when it is not the template's own bolus,
+/// first-order depot or absorption forcing (#1257).
+///
+/// A search that proposes Pharmpy's `ABSORPTION(ZO)` or `ABSORPTION(WEIBULL)`
+/// is not swapping a `pk` template — neither has one. It is replacing the
+/// **input term** of a generated disposition with an ODE input function, and
+/// stating that as a value here keeps the transcription in one place: the
+/// caller says which model, not which text.
+///
+/// Both non-default forms feed `central` directly, so they are accepted only
+/// on a template that has no depot and no forcing of its own — the `*_iv`
+/// family. Anything else is an error naming the clash rather than a model
+/// with two input terms.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum InputForm {
+    /// Whatever the named template does: a bolus into `central` (`*_iv`), a
+    /// first-order `depot` (`*_oral`), or the transit / inverse-Gaussian
+    /// forcing of `*_transit` / `*_ig`.
+    #[default]
+    Template,
+    /// `zero_order(dur = …)` into `central` — NONMEM's modeled duration
+    /// (`RATE = −2`, `D1`), Pharmpy's `ABSORPTION(ZO)`.
+    ZeroOrder {
+        /// The `[individual_parameters]` name holding the input duration.
+        dur: String,
+    },
+    /// `weibull(td = …, beta = …)` into `central` — Pharmpy's
+    /// `ABSORPTION(WEIBULL)`, whose depot-with-a-time-varying-`KAW` spelling
+    /// integrates to the same input rate.
+    Weibull {
+        /// The Weibull scale parameter (Pharmpy's `LAMBDA`).
+        td: String,
+        /// The Weibull shape parameter (Pharmpy's `K`).
+        beta: String,
+    },
+}
+
+impl InputForm {
+    /// How the form is named in an error message.
+    pub fn label(&self) -> &'static str {
+        match self {
+            InputForm::Template => "the template's own",
+            InputForm::ZeroOrder { .. } => "zero-order",
+            InputForm::Weibull { .. } => "Weibull",
+        }
+    }
+}
+
+/// How `central` eliminates, when it is not the template's own first-order
+/// `CL/V` (#1257).
+///
+/// The saturable forms are Pharmpy's parameterisation
+/// (`modeling/odes.py::_do_michaelis_menten_elimination`): the flux out of
+/// `central` is `(CLMM·KM/(KM + C) + CL)·A/V` with `C = A/V`, i.e. the usual
+/// `Vmax·C/(KM + C)` with `Vmax = CLMM·KM`. Zero-order elimination has no
+/// variant of its own — it is [`MichaelisMenten`](Self::MichaelisMenten) with
+/// `KM` fixed far below the observed concentrations, which is also how
+/// Pharmpy writes it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum EliminationForm {
+    /// `CL/V · A`, fused into the outflow bracket with the inter-compartmental
+    /// rate constants, exactly as the template writes it.
+    #[default]
+    FirstOrder,
+    /// `CLMM·KM·C/(KM + C)` with `C = A/V`.
+    ///
+    /// The Michaelis-Menten clearance is the template's **own `cl` binding** —
+    /// there is no second name. Pharmpy renames `CL` to `CLMM` at this point;
+    /// ferx keeps the name, which is what carries the parameter's initial
+    /// estimate and its η across the move. Taking a separate name here would
+    /// leave the template's `cl` binding declared and read by nothing, i.e. a
+    /// free parameter the objective cannot see.
+    MichaelisMenten {
+        /// The `[individual_parameters]` name holding the Michaelis constant.
+        km: String,
+    },
+    /// `CL·C + CLMM·KM·C/(KM + C)` — Pharmpy's `MIX-FO-MM`. Here `CLMM` *is* a
+    /// second parameter, alongside the template's `cl`.
+    MixedFoMm {
+        /// The saturable clearance.
+        clmm: String,
+        /// The Michaelis constant.
+        km: String,
+    },
+}
+
+impl EliminationForm {
+    /// The MFL elimination mode this form spells.
+    pub fn label(&self) -> &'static str {
+        match self {
+            EliminationForm::FirstOrder => "first-order",
+            EliminationForm::MichaelisMenten { .. } => "Michaelis-Menten",
+            EliminationForm::MixedFoMm { .. } => "mixed first-order / Michaelis-Menten",
+        }
+    }
+}
+
 /// Generate the disposition ODE for `ode_template model_name(params)`.
 ///
 /// `params` maps each lowercased role (`cl`, `v1`, `ka`, …) to the user's
@@ -51,6 +148,34 @@ pub struct GeneratedDisposition {
 pub fn generate(
     model_name: &str,
     params: &HashMap<String, String>,
+) -> Result<GeneratedDisposition, String> {
+    generate_variant(
+        model_name,
+        params,
+        &InputForm::Template,
+        &EliminationForm::FirstOrder,
+    )
+}
+
+/// [`generate`], with the central compartment's input and elimination terms
+/// replaced (#1257).
+///
+/// This is the one transcription of a standard PK disposition into ODE text:
+/// [`generate`] is this function at its defaults, and the
+/// `generate_is_the_default_variant` test pins the two byte-for-byte. The
+/// variants exist because `ABSORPTION(ZO)`, `ABSORPTION(WEIBULL)` and every
+/// `ELIMINATION` other than `FO` have no analytic `pk` template at all — they
+/// are reachable only as `[odes]` text, and a model-space search has to write
+/// that text without owning a second copy of the disposition
+/// ([`crate::edit::StructuralSpec`], `ferx-tools::modelsearch`).
+///
+/// Only the `central` equation changes; the depot and peripheral equations are
+/// the template's own, which is why a caller writes exactly one override line.
+pub fn generate_variant(
+    model_name: &str,
+    params: &HashMap<String, String>,
+    input: &InputForm,
+    elimination: &EliminationForm,
 ) -> Result<GeneratedDisposition, String> {
     // Name → model and the required-role set both come from the shared analytical
     // `PkModel` tables (`from_name` / `required_pk_params`), so `ode_template`'s
@@ -100,201 +225,172 @@ pub fn generate(
 
     let dt = |state: &str, rhs: String| (state.to_string(), format!("d/dt({state}) = {rhs}"));
 
-    let (states, obs_scale, odes): (Vec<&str>, &str, Vec<(String, String)>) = match model {
-        PkModel::OneCptTransit => {
-            // The analytic `pk one_cpt_transit` desugars to the Savic transit forcing
-            // delivered straight into central (#386), the ODE analogue of the
-            // exponential-tilting closed form.
-            let (cl, v, n, mtt) = (g("cl"), g("v"), g("n"), g("mtt"));
-            (
-                vec!["central"],
-                v,
-                vec![dt(
-                    "central",
-                    format!("transit(n={n}, mtt={mtt}) - ({cl}/{v}) * central"),
-                )],
-            )
-        }
-        PkModel::OneCptIg => {
-            // The analytic `pk one_cpt_ig` desugars to the Freijer & Post
-            // inverse-Gaussian forcing `igd(mat, cv2)` delivered straight into
-            // central (#790), the ODE analogue of the exponential-tilting closed form.
-            let (cl, v, mat, cv2) = (g("cl"), g("v"), g("mat"), g("cv2"));
-            (
-                vec!["central"],
-                v,
-                vec![dt(
-                    "central",
-                    format!("igd(mat={mat}, cv2={cv2}) - ({cl}/{v}) * central"),
-                )],
-            )
-        }
-        PkModel::OneCptIv => {
-            let (cl, v) = (g("cl"), g("v"));
-            (
-                vec!["central"],
-                v,
-                vec![dt("central", format!("-({cl}/{v}) * central"))],
-            )
-        }
-        PkModel::OneCptOral => {
-            let (cl, v, ka) = (g("cl"), g("v"), g("ka"));
-            (
-                vec!["depot", "central"],
-                v,
-                vec![
-                    dt("depot", format!("-{ka} * depot")),
-                    dt("central", format!("{ka} * depot - ({cl}/{v}) * central")),
-                ],
-            )
-        }
-        PkModel::TwoCptIv => {
-            let (cl, v1, q, v2) = (g("cl"), g("v1"), g("q"), g("v2"));
-            (
-                vec!["central", "periph"],
-                v1,
-                vec![
-                    dt(
-                        "central",
-                        format!("-({cl}/{v1} + {q}/{v1}) * central + ({q}/{v2}) * periph"),
-                    ),
-                    dt(
-                        "periph",
-                        format!("({q}/{v1}) * central - ({q}/{v2}) * periph"),
-                    ),
-                ],
-            )
-        }
-        PkModel::TwoCptOral => {
-            let (cl, v1, q, v2, ka) = (g("cl"), g("v1"), g("q"), g("v2"), g("ka"));
-            (
-                vec!["depot", "central", "periph"],
-                v1,
-                vec![
-                    dt("depot", format!("-{ka} * depot")),
-                    dt(
-                        "central",
-                        format!(
-                            "{ka} * depot - ({cl}/{v1} + {q}/{v1}) * central + ({q}/{v2}) * periph"
-                        ),
-                    ),
-                    dt(
-                        "periph",
-                        format!("({q}/{v1}) * central - ({q}/{v2}) * periph"),
-                    ),
-                ],
-            )
-        }
-        PkModel::TwoCptTransit => {
-            // The analytic `pk two_cpt_transit` desugars to the Savic transit forcing
-            // delivered straight into central, on a 2-cpt disposition (#386 PR D) —
-            // the ODE analogue of the exponential-tilting closed form.
-            let (cl, v1, q, v2, n, mtt) = (g("cl"), g("v1"), g("q"), g("v2"), g("n"), g("mtt"));
-            (
-                vec!["central", "periph"],
-                v1,
-                vec![
-                    dt(
-                        "central",
-                        format!(
-                            "transit(n={n}, mtt={mtt}) \
-                             - ({cl}/{v1} + {q}/{v1}) * central + ({q}/{v2}) * periph"
-                        ),
-                    ),
-                    dt(
-                        "periph",
-                        format!("({q}/{v1}) * central - ({q}/{v2}) * periph"),
-                    ),
-                ],
-            )
-        }
-        PkModel::TwoCptIg => {
-            // The analytic `pk two_cpt_ig` desugars to the inverse-Gaussian forcing
-            // `igd(mat, cv2)` delivered straight into central, on a 2-cpt disposition
-            // (#790) — the ODE analogue of the exponential-tilting closed form.
-            let (cl, v1, q, v2, mat, cv2) = (g("cl"), g("v1"), g("q"), g("v2"), g("mat"), g("cv2"));
-            (
-                vec!["central", "periph"],
-                v1,
-                vec![
-                    dt(
-                        "central",
-                        format!(
-                            "igd(mat={mat}, cv2={cv2}) \
-                             - ({cl}/{v1} + {q}/{v1}) * central + ({q}/{v2}) * periph"
-                        ),
-                    ),
-                    dt(
-                        "periph",
-                        format!("({q}/{v1}) * central - ({q}/{v2}) * periph"),
-                    ),
-                ],
-            )
-        }
-        PkModel::ThreeCptIv => {
-            let (cl, v1, q2, v2, q3, v3) = (g("cl"), g("v1"), g("q2"), g("v2"), g("q3"), g("v3"));
-            (
-                vec!["central", "periph1", "periph2"],
-                v1,
-                vec![
-                    dt(
-                        "central",
-                        format!(
-                            "-({cl}/{v1} + {q2}/{v1} + {q3}/{v1}) * central \
-                             + ({q2}/{v2}) * periph1 + ({q3}/{v3}) * periph2"
-                        ),
-                    ),
-                    dt(
-                        "periph1",
-                        format!("({q2}/{v1}) * central - ({q2}/{v2}) * periph1"),
-                    ),
-                    dt(
-                        "periph2",
-                        format!("({q3}/{v1}) * central - ({q3}/{v3}) * periph2"),
-                    ),
-                ],
-            )
-        }
-        PkModel::ThreeCptOral => {
-            let (cl, v1, q2, v2, q3, v3, ka) = (
-                g("cl"),
-                g("v1"),
-                g("q2"),
-                g("v2"),
-                g("q3"),
-                g("v3"),
-                g("ka"),
-            );
-            (
-                vec!["depot", "central", "periph1", "periph2"],
-                v1,
-                vec![
-                    dt("depot", format!("-{ka} * depot")),
-                    dt(
-                        "central",
-                        format!(
-                            "{ka} * depot - ({cl}/{v1} + {q2}/{v1} + {q3}/{v1}) * central \
-                             + ({q2}/{v2}) * periph1 + ({q3}/{v3}) * periph2"
-                        ),
-                    ),
-                    dt(
-                        "periph1",
-                        format!("({q2}/{v1}) * central - ({q2}/{v2}) * periph1"),
-                    ),
-                    dt(
-                        "periph2",
-                        format!("({q3}/{v1}) * central - ({q3}/{v3}) * periph2"),
-                    ),
-                ],
-            )
+    // ── The topology, once ──────────────────────────────────────────────────
+    // Everything that differs between the ten templates: whether there is a
+    // depot (and its `ka`), what the template's own input term into `central`
+    // is, which volume `central` is read out on, and the peripheral chain as
+    // `(state, q, vp)`. Every equation below is composed from this, so a
+    // variant cannot disagree with the plain form about where a compartment
+    // connects — the one-implementation rule, applied to generated text.
+    #[allow(clippy::type_complexity)]
+    let (depot_ka, template_input, vc, periphs): (
+        Option<&str>,
+        String,
+        &str,
+        Vec<(&'static str, &str, &str)>,
+    ) = match model {
+        // The analytic `pk one_cpt_transit` / `pk *_ig` desugar to the Savic
+        // transit (#386) and Freijer & Post inverse-Gaussian (#790) forcings
+        // delivered straight into central — the ODE analogue of their
+        // exponential-tilting closed forms.
+        PkModel::OneCptTransit => (
+            None,
+            format!("transit(n={}, mtt={})", g("n"), g("mtt")),
+            g("v"),
+            vec![],
+        ),
+        PkModel::OneCptIg => (
+            None,
+            format!("igd(mat={}, cv2={})", g("mat"), g("cv2")),
+            g("v"),
+            vec![],
+        ),
+        PkModel::OneCptIv => (None, String::new(), g("v"), vec![]),
+        PkModel::OneCptOral => (
+            Some(g("ka")),
+            format!("{} * depot", g("ka")),
+            g("v"),
+            vec![],
+        ),
+        PkModel::TwoCptIv => (
+            None,
+            String::new(),
+            g("v1"),
+            vec![("periph", g("q"), g("v2"))],
+        ),
+        PkModel::TwoCptOral => (
+            Some(g("ka")),
+            format!("{} * depot", g("ka")),
+            g("v1"),
+            vec![("periph", g("q"), g("v2"))],
+        ),
+        PkModel::TwoCptTransit => (
+            None,
+            format!("transit(n={}, mtt={})", g("n"), g("mtt")),
+            g("v1"),
+            vec![("periph", g("q"), g("v2"))],
+        ),
+        PkModel::TwoCptIg => (
+            None,
+            format!("igd(mat={}, cv2={})", g("mat"), g("cv2")),
+            g("v1"),
+            vec![("periph", g("q"), g("v2"))],
+        ),
+        PkModel::ThreeCptIv => (
+            None,
+            String::new(),
+            g("v1"),
+            vec![("periph1", g("q2"), g("v2")), ("periph2", g("q3"), g("v3"))],
+        ),
+        PkModel::ThreeCptOral => (
+            Some(g("ka")),
+            format!("{} * depot", g("ka")),
+            g("v1"),
+            vec![("periph1", g("q2"), g("v2")), ("periph2", g("q3"), g("v3"))],
+        ),
+    };
+    let cl = g("cl");
+
+    // ── The input term ──────────────────────────────────────────────────────
+    let input_term = match input {
+        InputForm::Template => template_input,
+        other => {
+            // A replacement input feeds `central` itself, so the template must
+            // not already deliver the dose somewhere: a depot would keep its
+            // own bolus and its `ka` flux, and a `transit()` / `igd()` forcing
+            // would be a second input function on one equation. Both are
+            // rejected here rather than left to the parser, whose message would
+            // blame generated text the user never wrote.
+            if depot_ka.is_some() || !template_input.is_empty() {
+                return Err(format!(
+                    "ode_template {name}: {} absorption feeds `central` directly, so it needs a \
+                     template with no absorption of its own — the `*_iv` family. `{name}` \
+                     already delivers the dose through {}.",
+                    other.label(),
+                    if depot_ka.is_some() {
+                        "a `depot` compartment"
+                    } else {
+                        "its own input-rate function"
+                    }
+                ));
+            }
+            match other {
+                InputForm::ZeroOrder { dur } => format!("zero_order(dur={dur})"),
+                InputForm::Weibull { td, beta } => format!("weibull(td={td}, beta={beta})"),
+                InputForm::Template => unreachable!("matched above"),
+            }
         }
     };
 
+    // ── The elimination term ────────────────────────────────────────────────
+    // First-order elimination shares one bracket with the inter-compartmental
+    // rate constants, which is how the plain form has always been written; a
+    // saturable one cannot, so its distribution terms are emitted separately
+    // below. The saturable expressions are Pharmpy's rate × amount in its own
+    // parenthesisation, so the two are comparable term by term.
+    let elimination_term = match elimination {
+        EliminationForm::FirstOrder => {
+            let mut terms = format!("{cl}/{vc}");
+            for (_, q, _) in &periphs {
+                terms.push_str(&format!(" + {q}/{vc}"));
+            }
+            format!("({terms}) * central")
+        }
+        EliminationForm::MichaelisMenten { km } => {
+            format!("(({cl} * {km} / ({km} + central / {vc})) / {vc}) * central")
+        }
+        EliminationForm::MixedFoMm { clmm, km } => {
+            format!("(({cl} + {clmm} * {km} / ({km} + central / {vc})) / {vc}) * central")
+        }
+    };
+
+    // ── `central` ───────────────────────────────────────────────────────────
+    let mut central = if input_term.is_empty() {
+        format!("-{elimination_term}")
+    } else {
+        format!("{input_term} - {elimination_term}")
+    };
+    if !matches!(elimination, EliminationForm::FirstOrder) {
+        for (_, q, _) in &periphs {
+            central.push_str(&format!(" - ({q}/{vc}) * central"));
+        }
+    }
+    for (state, q, vp) in &periphs {
+        central.push_str(&format!(" + ({q}/{vp}) * {state}"));
+    }
+
+    // ── Assembly ────────────────────────────────────────────────────────────
+    let mut states: Vec<String> = Vec::with_capacity(2 + periphs.len());
+    let mut odes: Vec<(String, String)> = Vec::with_capacity(2 + periphs.len());
+    if let Some(ka) = depot_ka {
+        states.push("depot".to_string());
+        odes.push(dt("depot", format!("-{ka} * depot")));
+    }
+    states.push("central".to_string());
+    odes.push(dt("central", central));
+    for (state, q, vp) in &periphs {
+        states.push((*state).to_string());
+        odes.push(dt(
+            state,
+            format!("({q}/{vc}) * central - ({q}/{vp}) * {state}"),
+        ));
+    }
+
     Ok(GeneratedDisposition {
-        states: states.into_iter().map(String::from).collect(),
+        states,
         obs_cmt: "central".to_string(),
         odes,
-        obs_scale: obs_scale.to_string(),
+        obs_scale: vc.to_string(),
     })
 }
 
@@ -465,5 +561,290 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Every role of a template, bound to its own upper-cased name — so a
+    /// snapshot below reads as the equation a user would have written.
+    fn roles_of(name: &str) -> Vec<(String, String)> {
+        PkModel::from_name(name)
+            .unwrap_or_else(|| panic!("{name} is a template"))
+            .required_pk_params()
+            .iter()
+            .map(|(_, role)| (role.to_string(), role.to_uppercase()))
+            .collect()
+    }
+
+    fn owned(pairs: &[(String, String)]) -> HashMap<String, String> {
+        pairs.iter().cloned().collect()
+    }
+
+    /// The generated `central` line for `name` under one variant.
+    fn central_of(name: &str, input: &InputForm, elimination: &EliminationForm) -> String {
+        let g = generate_variant(name, &owned(&roles_of(name)), input, elimination)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        g.odes
+            .iter()
+            .find(|(state, _)| state == "central")
+            .map(|(_, line)| line.clone())
+            .unwrap_or_else(|| panic!("{name} generates a central equation"))
+    }
+
+    /// The regression guard for #1257's refactor: every one of the ten
+    /// templates, transcribed as it was before the disposition was composed
+    /// from one topology table rather than written out per model.
+    ///
+    /// These strings are the *previous* implementation's literal output, so
+    /// the test fails on any drift in spacing, parenthesisation or term
+    /// order — none of which changes the model, all of which would change
+    /// every generated `.ferx` file a search writes and every diff a user
+    /// reads. Byte-identity is the claim; a looser assertion would not have
+    /// caught the fused-bracket split the variants needed.
+    #[test]
+    fn plain_form_is_byte_identical_across_every_template() {
+        let expected: &[(&str, &[&str])] = &[
+            ("one_cpt_iv", &["d/dt(central) = -(CL/V) * central"]),
+            (
+                "one_cpt_oral",
+                &[
+                    "d/dt(depot) = -KA * depot",
+                    "d/dt(central) = KA * depot - (CL/V) * central",
+                ],
+            ),
+            (
+                "one_cpt_transit",
+                &["d/dt(central) = transit(n=N, mtt=MTT) - (CL/V) * central"],
+            ),
+            (
+                "one_cpt_ig",
+                &["d/dt(central) = igd(mat=MAT, cv2=CV2) - (CL/V) * central"],
+            ),
+            (
+                "two_cpt_iv",
+                &[
+                    "d/dt(central) = -(CL/V1 + Q/V1) * central + (Q/V2) * periph",
+                    "d/dt(periph) = (Q/V1) * central - (Q/V2) * periph",
+                ],
+            ),
+            (
+                "two_cpt_oral",
+                &[
+                    "d/dt(depot) = -KA * depot",
+                    "d/dt(central) = KA * depot - (CL/V1 + Q/V1) * central + (Q/V2) * periph",
+                    "d/dt(periph) = (Q/V1) * central - (Q/V2) * periph",
+                ],
+            ),
+            (
+                "two_cpt_transit",
+                &[
+                    "d/dt(central) = transit(n=N, mtt=MTT) - (CL/V1 + Q/V1) * central + (Q/V2) * periph",
+                    "d/dt(periph) = (Q/V1) * central - (Q/V2) * periph",
+                ],
+            ),
+            (
+                "two_cpt_ig",
+                &[
+                    "d/dt(central) = igd(mat=MAT, cv2=CV2) - (CL/V1 + Q/V1) * central + (Q/V2) * periph",
+                    "d/dt(periph) = (Q/V1) * central - (Q/V2) * periph",
+                ],
+            ),
+            (
+                "three_cpt_iv",
+                &[
+                    "d/dt(central) = -(CL/V1 + Q2/V1 + Q3/V1) * central + (Q2/V2) * periph1 + (Q3/V3) * periph2",
+                    "d/dt(periph1) = (Q2/V1) * central - (Q2/V2) * periph1",
+                    "d/dt(periph2) = (Q3/V1) * central - (Q3/V3) * periph2",
+                ],
+            ),
+            (
+                "three_cpt_oral",
+                &[
+                    "d/dt(depot) = -KA * depot",
+                    "d/dt(central) = KA * depot - (CL/V1 + Q2/V1 + Q3/V1) * central + (Q2/V2) * periph1 + (Q3/V3) * periph2",
+                    "d/dt(periph1) = (Q2/V1) * central - (Q2/V2) * periph1",
+                    "d/dt(periph2) = (Q3/V1) * central - (Q3/V3) * periph2",
+                ],
+            ),
+        ];
+        // Every template is covered, so a new one cannot join the family
+        // without a snapshot: `PkModel` has exactly these ten.
+        assert_eq!(expected.len(), 10, "one snapshot per `PkModel` template");
+        for (name, lines) in expected {
+            let g =
+                generate(name, &owned(&roles_of(name))).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let got: Vec<&str> = g.odes.iter().map(|(_, l)| l.as_str()).collect();
+            assert_eq!(&got, lines, "{name}");
+        }
+    }
+
+    /// `generate` is `generate_variant` at its defaults — not a second
+    /// transcription that happens to agree today.
+    #[test]
+    fn generate_is_the_default_variant() {
+        for name in [
+            "one_cpt_iv",
+            "one_cpt_oral",
+            "one_cpt_transit",
+            "one_cpt_ig",
+            "two_cpt_iv",
+            "two_cpt_oral",
+            "two_cpt_transit",
+            "two_cpt_ig",
+            "three_cpt_iv",
+            "three_cpt_oral",
+        ] {
+            let params = owned(&roles_of(name));
+            assert_eq!(
+                generate(name, &params).unwrap(),
+                generate_variant(
+                    name,
+                    &params,
+                    &InputForm::Template,
+                    &EliminationForm::FirstOrder
+                )
+                .unwrap(),
+                "{name}"
+            );
+        }
+    }
+
+    /// Zero-order and Weibull absorption replace the input term of an `*_iv`
+    /// template and leave the disposition alone.
+    #[test]
+    fn replacement_input_feeds_central() {
+        assert_eq!(
+            central_of(
+                "one_cpt_iv",
+                &InputForm::ZeroOrder { dur: "DUR".into() },
+                &EliminationForm::FirstOrder,
+            ),
+            "d/dt(central) = zero_order(dur=DUR) - (CL/V) * central"
+        );
+        assert_eq!(
+            central_of(
+                "two_cpt_iv",
+                &InputForm::Weibull {
+                    td: "TD".into(),
+                    beta: "BETA".into(),
+                },
+                &EliminationForm::FirstOrder,
+            ),
+            "d/dt(central) = weibull(td=TD, beta=BETA) - (CL/V1 + Q/V1) * central + (Q/V2) * periph"
+        );
+        // The peripheral equation is the template's own, untouched.
+        let g = generate_variant(
+            "two_cpt_iv",
+            &owned(&roles_of("two_cpt_iv")),
+            &InputForm::Weibull {
+                td: "TD".into(),
+                beta: "BETA".into(),
+            },
+            &EliminationForm::FirstOrder,
+        )
+        .unwrap();
+        assert_eq!(g.states, vec!["central", "periph"]);
+        assert_eq!(
+            g.odes[1].1,
+            "d/dt(periph) = (Q/V1) * central - (Q/V2) * periph"
+        );
+    }
+
+    /// A replacement input on a template that already absorbs is refused —
+    /// the depot would keep its own bolus, or the equation would carry two
+    /// input functions.
+    #[test]
+    fn replacement_input_needs_a_bolus_template() {
+        for name in ["one_cpt_oral", "two_cpt_oral", "three_cpt_oral"] {
+            let err = generate_variant(
+                name,
+                &owned(&roles_of(name)),
+                &InputForm::ZeroOrder { dur: "DUR".into() },
+                &EliminationForm::FirstOrder,
+            )
+            .unwrap_err();
+            assert!(err.contains("`depot` compartment"), "{name}: {err}");
+            assert!(err.contains("zero-order"), "{name}: {err}");
+        }
+        for name in ["one_cpt_transit", "two_cpt_ig"] {
+            let err = generate_variant(
+                name,
+                &owned(&roles_of(name)),
+                &InputForm::Weibull {
+                    td: "TD".into(),
+                    beta: "BETA".into(),
+                },
+                &EliminationForm::FirstOrder,
+            )
+            .unwrap_err();
+            assert!(err.contains("input-rate function"), "{name}: {err}");
+            assert!(err.contains("Weibull"), "{name}: {err}");
+        }
+    }
+
+    /// Saturable elimination: the `cl` binding becomes the Michaelis-Menten
+    /// clearance, and the distribution terms leave the (now non-linear)
+    /// elimination bracket.
+    #[test]
+    fn saturable_elimination_splits_the_outflow_bracket() {
+        assert_eq!(
+            central_of(
+                "one_cpt_iv",
+                &InputForm::Template,
+                &EliminationForm::MichaelisMenten { km: "KM".into() },
+            ),
+            "d/dt(central) = -((CL * KM / (KM + central / V)) / V) * central"
+        );
+        assert_eq!(
+            central_of(
+                "two_cpt_iv",
+                &InputForm::Template,
+                &EliminationForm::MichaelisMenten { km: "KM".into() },
+            ),
+            "d/dt(central) = -((CL * KM / (KM + central / V1)) / V1) * central \
+             - (Q/V1) * central + (Q/V2) * periph"
+        );
+        assert_eq!(
+            central_of(
+                "two_cpt_oral",
+                &InputForm::Template,
+                &EliminationForm::MixedFoMm {
+                    clmm: "CLMM".into(),
+                    km: "KM".into(),
+                },
+            ),
+            "d/dt(central) = KA * depot \
+             - ((CL + CLMM * KM / (KM + central / V1)) / V1) * central \
+             - (Q/V1) * central + (Q/V2) * periph"
+        );
+    }
+
+    /// The two replacements compose: an ODE candidate may change absorption
+    /// and elimination in the same move.
+    #[test]
+    fn input_and_elimination_compose() {
+        assert_eq!(
+            central_of(
+                "one_cpt_iv",
+                &InputForm::ZeroOrder { dur: "DUR".into() },
+                &EliminationForm::MichaelisMenten { km: "KM".into() },
+            ),
+            "d/dt(central) = zero_order(dur=DUR) - ((CL * KM / (KM + central / V)) / V) * central"
+        );
+    }
+
+    /// Saturable elimination on a forcing template keeps the forcing: the
+    /// transit chain and Michaelis-Menten elimination are an allowed pair in
+    /// Pharmpy's move table, so the composition has to be reachable.
+    #[test]
+    fn saturable_elimination_keeps_a_transit_forcing() {
+        assert_eq!(
+            central_of(
+                "two_cpt_transit",
+                &InputForm::Template,
+                &EliminationForm::MichaelisMenten { km: "KM".into() },
+            ),
+            "d/dt(central) = transit(n=N, mtt=MTT) \
+             - ((CL * KM / (KM + central / V1)) / V1) * central \
+             - (Q/V1) * central + (Q/V2) * periph"
+        );
     }
 }

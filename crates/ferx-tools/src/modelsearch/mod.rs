@@ -102,7 +102,8 @@ pub use report::{
     MODEL_COLUMNS,
 };
 pub use structure::{
-    Absorption, Defaults, FeatureKey, IivStrategy, Structure, Template, TransitCount,
+    Absorption, Defaults, Elimination, Engine, FeatureKey, IivStrategy, Structure, Template,
+    TransitCount,
 };
 
 /// `[modelsearch] algorithm`.
@@ -598,7 +599,7 @@ fn derive(
     // earlier step added is taken, and `Q = CL` is the parent's converged
     // clearance — Pharmpy updates the inits first and adds the compartment
     // second.
-    let defaults = Defaults::of_text(&model, space.defaults.t_first);
+    let defaults = space.defaults.of_text(&model);
     let spec = structure::structural_spec(
         &target,
         &parent.structure,
@@ -612,9 +613,18 @@ fn derive(
         .map_err(|e| format!("{id}: {e}"))?;
     let mut path = parent.path.clone();
     path.extend_from_slice(keys);
-    let candidate = Candidate::new(id, model)
+    // An `[odes]` candidate costs one to two orders of magnitude more per fit
+    // than its analytic siblings and, when its elimination is saturable, needs
+    // a bigger start budget to be judged on its optimum rather than on a
+    // stall (#1257). Both are per-candidate, so the rest of the space is not
+    // slowed down to accommodate them.
+    let mut candidate = Candidate::new(id, model)
         .parent(parent.id.clone())
-        .features(target.feature_vector());
+        .features(target.feature_vector())
+        .cost(target.cost());
+    if let Some(starts) = target.starts() {
+        candidate = candidate.starts(starts);
+    }
     Ok((candidate, target, path))
 }
 

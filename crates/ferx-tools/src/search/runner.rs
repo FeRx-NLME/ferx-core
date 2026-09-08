@@ -280,11 +280,14 @@ impl Runner {
             .filter(|i| !reused.contains_key(hashes[*i].as_str()))
             .collect();
 
-        let plan = PoolPlan::from_budget(self.threads, todo.len());
-        let threads_per_fit = plan.threads_per_fit();
+        // Candidates that cost alike are planned together, heaviest group
+        // first (#1257) — see [`Candidate::cost`]. One group when every
+        // candidate carries the default cost, which is every run that does
+        // not mix engines.
+        let groups = cost_groups(candidates, &todo);
         let n_fitted = AtomicUsize::new(0);
 
-        let fit_one = |&i: &usize| -> Option<(usize, CandidateResult)> {
+        let fit_one = |&(i, threads_per_fit): &(usize, usize)| -> Option<(usize, CandidateResult)> {
             // Between candidates, not inside one: this is the granularity the
             // cancellation contract promises, and it is why a cancelled run can
             // still return everything that finished.
@@ -344,11 +347,18 @@ impl Runner {
             Some((i, result))
         };
 
-        let fitted: Vec<(usize, CandidateResult)> = if todo.is_empty() {
-            Vec::new()
-        } else {
-            plan.install(|| todo.par_iter().filter_map(fit_one).collect())?
-        };
+        let mut fitted: Vec<(usize, CandidateResult)> = Vec::new();
+        for group in &groups {
+            if group.is_empty() {
+                continue;
+            }
+            let plan = PoolPlan::from_budget(self.threads, group.len());
+            let work: Vec<(usize, usize)> =
+                group.iter().map(|i| (*i, plan.threads_per_fit())).collect();
+            let done: Vec<(usize, CandidateResult)> =
+                plan.install(|| work.par_iter().filter_map(fit_one).collect())?;
+            fitted.extend(done);
+        }
 
         // Closed before the table is written, and the point at which a write
         // failure inside the parallel loop surfaces. It is a *warning*, not a
@@ -441,6 +451,47 @@ impl Runner {
             warnings,
         })
     }
+}
+
+/// The starts one candidate is fitted with.
+///
+/// A candidate's own count is a **floor** under the run's, never a
+/// replacement (#1257): it says *this candidate needs at least this many*, so
+/// a run the user configured with more `retries` than a tool's per-candidate
+/// guess keeps them. Always at least one, since zero starts is no fit.
+fn effective_starts(candidate: &Candidate, options: &RunOptions) -> usize {
+    candidate
+        .n_starts
+        .map_or(options.n_starts, |n| n.max(options.n_starts))
+        .max(1)
+}
+
+/// The indices of `todo`, split into groups of equal
+/// [`Candidate::cost`] and ordered heaviest group first (#1257).
+///
+/// Grouping on the exact value rather than on a bucketing of it is what makes
+/// this predictable: a tool states a small set of costs, each group is the
+/// candidates that share one, and a run whose candidates all carry the
+/// default is a single group planned exactly as it was before this existed.
+/// Within a group the submission order is kept, so a run stays deterministic.
+fn cost_groups(candidates: &[Candidate], todo: &[usize]) -> Vec<Vec<usize>> {
+    let mut costs: Vec<f64> = Vec::new();
+    for &i in todo {
+        let cost = candidates[i].cost;
+        if !costs.iter().any(|c| *c == cost) {
+            costs.push(cost);
+        }
+    }
+    costs.sort_by(|a, b| b.total_cmp(a));
+    costs
+        .into_iter()
+        .map(|cost| {
+            todo.iter()
+                .copied()
+                .filter(|i| candidates[*i].cost == cost)
+                .collect()
+        })
+        .collect()
 }
 
 /// Ids are how a search refers back to its candidates and how the table is
@@ -633,7 +684,7 @@ fn compile_and_fit(
 
     let init_params = parsed.model.default_params.clone();
     let mut fit_options = base.quiet();
-    fit_options.n_starts = candidate.n_starts.unwrap_or(options.n_starts).max(1);
+    fit_options.n_starts = effective_starts(candidate, options);
     fit_options.threads = Some(threads_per_fit);
     fit_options.cancel = cancel.clone();
 

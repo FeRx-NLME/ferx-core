@@ -79,15 +79,15 @@ const TWO_CPT: &str = "\
 /// Narrow a two-compartment model to `one_cpt_oral` — the edit every pruning
 /// test is about.
 fn narrow_to_one_cpt() -> ModelEdit<'static> {
-    ModelEdit::SetStructural(StructuralSpec {
-        template: "one_cpt_oral".into(),
-        bindings: vec![
+    ModelEdit::SetStructural(StructuralSpec::new(
+        "one_cpt_oral",
+        vec![
             ("cl".into(), "CL".into()),
             ("v".into(), "V1".into()),
             ("ka".into(), "KA".into()),
         ],
-        new_parameters: vec![],
-    })
+        vec![],
+    ))
 }
 
 /// [`BASE`] with `ETA_CL` and `ETA_V` blocked, written over several lines the
@@ -881,16 +881,16 @@ fn set_structural_widens_to_two_compartments_and_declares_the_new_parameters() {
     let mut text = base();
     apply(
         &mut text,
-        ModelEdit::SetStructural(StructuralSpec {
-            template: "two_cpt_oral".into(),
-            bindings: vec![
+        ModelEdit::SetStructural(StructuralSpec::new(
+            "two_cpt_oral",
+            vec![
                 ("cl".into(), "CL".into()),
                 ("v1".into(), "V".into()),
                 ("q".into(), "Q".into()),
                 ("v2".into(), "V2".into()),
                 ("ka".into(), "KA".into()),
             ],
-            new_parameters: vec![
+            vec![
                 NewParameter {
                     name: "Q".into(),
                     theta: "TVQ".into(),
@@ -910,7 +910,7 @@ fn set_structural_widens_to_two_compartments_and_declares_the_new_parameters() {
                     fixed: false,
                 },
             ],
-        }),
+        )),
     );
     assert_eq!(
         text.block_lines("structural_model"),
@@ -946,15 +946,15 @@ fn set_structural_declares_a_fixed_new_parameter_with_fix() {
     let mut text = base();
     apply(
         &mut text,
-        ModelEdit::SetStructural(StructuralSpec {
-            template: "one_cpt_transit".into(),
-            bindings: vec![
+        ModelEdit::SetStructural(StructuralSpec::new(
+            "one_cpt_transit",
+            vec![
                 ("cl".into(), "CL".into()),
                 ("v".into(), "V".into()),
                 ("n".into(), "NTR".into()),
                 ("mtt".into(), "MTT".into()),
             ],
-            new_parameters: vec![
+            vec![
                 NewParameter {
                     name: "NTR".into(),
                     theta: "TVNTR".into(),
@@ -974,7 +974,7 @@ fn set_structural_declares_a_fixed_new_parameter_with_fix() {
                     fixed: false,
                 },
             ],
-        }),
+        )),
     );
     let params = text.block_lines("parameters");
     assert!(
@@ -1019,26 +1019,26 @@ fn set_structural_prunes_the_parameters_the_new_template_no_longer_uses() {
 #[test]
 fn set_structural_rejects_an_unknown_template_and_an_undeclared_binding() {
     assert!(base()
-        .apply(ModelEdit::SetStructural(StructuralSpec {
-            template: "four_cpt_oral".into(),
-            bindings: vec![("cl".into(), "CL".into())],
-            new_parameters: vec![],
-        }))
+        .apply(ModelEdit::SetStructural(StructuralSpec::new(
+            "four_cpt_oral",
+            vec![("cl".into(), "CL".into())],
+            vec![],
+        )))
         .unwrap_err()
         .contains("not a known `pk` template"));
 
     let err = base()
-        .apply(ModelEdit::SetStructural(StructuralSpec {
-            template: "two_cpt_oral".into(),
-            bindings: vec![
+        .apply(ModelEdit::SetStructural(StructuralSpec::new(
+            "two_cpt_oral",
+            vec![
                 ("cl".into(), "CL".into()),
                 ("v1".into(), "V".into()),
                 ("q".into(), "Q".into()),
                 ("v2".into(), "V2".into()),
                 ("ka".into(), "KA".into()),
             ],
-            new_parameters: vec![],
-        }))
+            vec![],
+        )))
         .unwrap_err();
     assert!(err.contains("`Q`"), "{err}");
     assert!(err.contains("new_parameters"), "{err}");
@@ -1049,11 +1049,11 @@ fn set_structural_needs_a_pk_line() {
     let ode = "[structural_model]\n  ode(obs_cmt=1, states=[central])\n";
     let err = ModelText::parse(ode)
         .unwrap()
-        .apply(ModelEdit::SetStructural(StructuralSpec {
-            template: "one_cpt_iv".into(),
-            bindings: vec![("cl".into(), "CL".into())],
-            new_parameters: vec![],
-        }))
+        .apply(ModelEdit::SetStructural(StructuralSpec::new(
+            "one_cpt_iv",
+            vec![("cl".into(), "CL".into())],
+            vec![],
+        )))
         .unwrap_err();
     assert!(err.contains("pk NAME(...)"), "{err}");
 }
@@ -2175,4 +2175,283 @@ fn variability_text_reads_etas_kappas_blocks_and_the_canonical_flag() {
     let cl = v.parameter("CL").unwrap();
     assert!(!cl.canonical);
     assert_eq!(cl.mentions.len(), 2);
+}
+
+// ── The ODE engine (#1257) ──────────────────────────────────────────────────
+
+/// Michaelis-Menten elimination: the disposition line becomes an
+/// `ode_template`, `[odes]` carries exactly the one equation the variant
+/// changes, and the Michaelis constant is declared even though no binding
+/// names it.
+#[test]
+fn set_structural_ode_writes_the_template_line_and_one_override() {
+    let mut text = base();
+    apply(
+        &mut text,
+        ModelEdit::SetStructural(
+            StructuralSpec::new(
+                "one_cpt_oral",
+                vec![
+                    ("cl".into(), "CL".into()),
+                    ("v".into(), "V".into()),
+                    ("ka".into(), "KA".into()),
+                ],
+                vec![NewParameter::new("KM", "TVKM", 5.0, 0.0, 100.0)],
+            )
+            .ode(
+                InputForm::Template,
+                EliminationForm::MichaelisMenten { km: "KM".into() },
+            ),
+        ),
+    );
+    let out = text.render();
+    assert!(
+        out.contains("ode_template one_cpt_oral(cl=CL, v=V, ka=KA)"),
+        "{out}"
+    );
+    assert!(!out.contains("pk one_cpt_oral"), "{out}");
+    assert!(out.contains("[odes]"), "{out}");
+    // Only `central` changes: the depot equation is the template's own and
+    // must not be repeated as an override.
+    assert_eq!(text.block_lines("odes").len(), 1, "{out}");
+    assert_eq!(
+        text.block_lines("odes")[0],
+        "d/dt(central) = KA * depot - ((CL * KM / (KM + central / V)) / V) * central"
+    );
+    assert!(out.contains("KM = TVKM"), "{out}");
+    assert!(out.contains("theta TVKM(5.0, 0.0, 100.0)"), "{out}");
+}
+
+/// The default variant is the generated disposition unchanged, so it writes
+/// no override — and therefore no `[odes]` block at all.
+#[test]
+fn set_structural_ode_default_variant_writes_no_override() {
+    let mut text = base();
+    apply(
+        &mut text,
+        ModelEdit::SetStructural(
+            StructuralSpec::new(
+                "one_cpt_oral",
+                vec![
+                    ("cl".into(), "CL".into()),
+                    ("v".into(), "V".into()),
+                    ("ka".into(), "KA".into()),
+                ],
+                vec![],
+            )
+            .ode(InputForm::Template, EliminationForm::FirstOrder),
+        ),
+    );
+    let out = text.render();
+    assert!(out.contains("ode_template one_cpt_oral"), "{out}");
+    assert!(!out.contains("[odes]"), "{out}");
+}
+
+/// Zero-order absorption drops the depot: the template is the `*_iv` one, the
+/// input function feeds `central`, and `KA` — now bound by nothing — is
+/// pruned with its θ and η.
+#[test]
+fn set_structural_ode_zero_order_absorption_prunes_the_absorption_rate() {
+    let mut text = base();
+    apply(
+        &mut text,
+        ModelEdit::SetStructural(
+            StructuralSpec::new(
+                "one_cpt_iv",
+                vec![("cl".into(), "CL".into()), ("v".into(), "V".into())],
+                vec![NewParameter::new("DUR", "TVDUR", 2.0, 0.0, 24.0)],
+            )
+            .ode(
+                InputForm::ZeroOrder { dur: "DUR".into() },
+                EliminationForm::FirstOrder,
+            ),
+        ),
+    );
+    let out = text.render();
+    assert_eq!(
+        text.block_lines("odes"),
+        vec!["d/dt(central) = zero_order(dur=DUR) - (CL/V) * central"],
+        "{out}"
+    );
+    assert!(!out.contains("KA"), "the absorption rate is gone: {out}");
+    assert!(!out.contains("ETA_KA"), "{out}");
+}
+
+/// Moving back to an analytic template clears the `[odes]` block: an ODE-only
+/// input function beside a `pk` line is a hard parse error, so a stale
+/// override would make the candidate uncompilable rather than analytic.
+#[test]
+fn set_structural_back_to_pk_clears_the_odes_block() {
+    let mut text = base();
+    let ode = StructuralSpec::new(
+        "one_cpt_iv",
+        vec![("cl".into(), "CL".into()), ("v".into(), "V".into())],
+        vec![NewParameter::new("DUR", "TVDUR", 2.0, 0.0, 24.0)],
+    )
+    .ode(
+        InputForm::ZeroOrder { dur: "DUR".into() },
+        EliminationForm::FirstOrder,
+    );
+    apply(&mut text, ModelEdit::SetStructural(ode));
+    assert!(!text.block_lines("odes").is_empty());
+    apply(
+        &mut text,
+        ModelEdit::SetStructural(StructuralSpec::new(
+            "one_cpt_iv",
+            vec![("cl".into(), "CL".into()), ("v".into(), "V".into())],
+            vec![],
+        )),
+    );
+    let out = text.render();
+    assert!(out.contains("pk one_cpt_iv(cl=CL, v=V)"), "{out}");
+    assert!(!out.contains("[odes]"), "{out}");
+    assert!(!out.contains("zero_order"), "{out}");
+    // The duration is unreferenced now and goes with the override.
+    assert!(!out.contains("DUR"), "{out}");
+}
+
+/// `ode_template` takes only the disposition roles, so a bound lag time is
+/// carried as the reserved-name alias the ODE engine reads it off — and only
+/// when the bound variable is not already spelled that way.
+#[test]
+fn set_structural_ode_aliases_a_non_reserved_lagtime_binding() {
+    let with_lag = BASE.replace(
+        "  pk one_cpt_oral(cl=CL, v=V, ka=KA)",
+        "  pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=TLAG)",
+    );
+    let with_lag = with_lag.replace(
+        "  KA = TVKA * exp(ETA_KA)",
+        "  KA   = TVKA * exp(ETA_KA)\n  TLAG = TVLAG",
+    );
+    let with_lag = with_lag.replace(
+        "  theta TVKA(1.5, 0.01, 50.0)",
+        "  theta TVKA(1.5, 0.01, 50.0)\n  theta TVLAG(0.5, 0.0, 5.0)",
+    );
+    let mut text = ModelText::parse(&with_lag).unwrap();
+    apply(
+        &mut text,
+        ModelEdit::SetStructural(
+            StructuralSpec::new(
+                "one_cpt_oral",
+                vec![
+                    ("cl".into(), "CL".into()),
+                    ("v".into(), "V".into()),
+                    ("ka".into(), "KA".into()),
+                    ("lagtime".into(), "TLAG".into()),
+                ],
+                vec![],
+            )
+            .ode(InputForm::Template, EliminationForm::FirstOrder),
+        ),
+    );
+    let out = text.render();
+    assert!(
+        out.contains("ode_template one_cpt_oral(cl=CL, v=V, ka=KA)"),
+        "the lag time is not a template role: {out}"
+    );
+    assert!(out.contains("lagtime = TLAG"), "{out}");
+    // …and the alias keeps the parameter alive through the pruner, which sees
+    // no other reference to it.
+    assert!(out.contains("TLAG = TVLAG"), "{out}");
+    assert!(out.contains("theta TVLAG("), "{out}");
+
+    // Back to analytic: the alias goes, or the model would declare a
+    // parameter named `lagtime` beside the `pk` line's own role.
+    apply(
+        &mut text,
+        ModelEdit::SetStructural(StructuralSpec::new(
+            "one_cpt_oral",
+            vec![
+                ("cl".into(), "CL".into()),
+                ("v".into(), "V".into()),
+                ("ka".into(), "KA".into()),
+                ("lagtime".into(), "TLAG".into()),
+            ],
+            vec![],
+        )),
+    );
+    let out = text.render();
+    assert!(
+        out.contains("pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=TLAG)"),
+        "{out}"
+    );
+    assert!(!out.contains("lagtime = TLAG"), "{out}");
+    assert!(out.contains("TLAG = TVLAG"), "{out}");
+}
+
+/// A binding already spelled `ALAG` routes to the lag slot by itself;
+/// aliasing it would declare the slot twice, which the parser rejects.
+#[test]
+fn set_structural_ode_does_not_alias_a_reserved_spelling() {
+    let with_lag = BASE
+        .replace(
+            "  pk one_cpt_oral(cl=CL, v=V, ka=KA)",
+            "  pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=ALAG)",
+        )
+        .replace(
+            "  KA = TVKA * exp(ETA_KA)",
+            "  KA   = TVKA * exp(ETA_KA)\n  ALAG = TVLAG",
+        )
+        .replace(
+            "  theta TVKA(1.5, 0.01, 50.0)",
+            "  theta TVKA(1.5, 0.01, 50.0)\n  theta TVLAG(0.5, 0.0, 5.0)",
+        );
+    let mut text = ModelText::parse(&with_lag).unwrap();
+    apply(
+        &mut text,
+        ModelEdit::SetStructural(
+            StructuralSpec::new(
+                "one_cpt_oral",
+                vec![
+                    ("cl".into(), "CL".into()),
+                    ("v".into(), "V".into()),
+                    ("ka".into(), "KA".into()),
+                    ("lagtime".into(), "ALAG".into()),
+                ],
+                vec![],
+            )
+            .ode(InputForm::Template, EliminationForm::FirstOrder),
+        ),
+    );
+    let out = text.render();
+    assert!(!out.contains("lagtime = ALAG"), "{out}");
+    // The reserved name is what keeps it alive — nothing else mentions it.
+    assert!(out.contains("ALAG = TVLAG"), "{out}");
+}
+
+/// The one-implementation check at the edit layer: an `ode_template` swap
+/// that changes nothing about the disposition writes byte-identical text to
+/// the `pk` swap, apart from the keyword and the absent `[odes]` block.
+#[test]
+fn set_structural_ode_and_pk_agree_on_everything_but_the_keyword() {
+    let mut a = base();
+    let mut b = base();
+    let bindings = vec![
+        ("cl".into(), "CL".into()),
+        ("v1".into(), "V".into()),
+        ("q".into(), "Q".into()),
+        ("v2".into(), "V2".into()),
+        ("ka".into(), "KA".into()),
+    ];
+    let new = || {
+        vec![
+            NewParameter::new("Q", "TVQ", 2.0, 0.01, 100.0),
+            NewParameter::new("V2", "TVV2", 20.0, 0.1, 1000.0),
+        ]
+    };
+    apply(
+        &mut a,
+        ModelEdit::SetStructural(StructuralSpec::new("two_cpt_oral", bindings.clone(), new())),
+    );
+    apply(
+        &mut b,
+        ModelEdit::SetStructural(
+            StructuralSpec::new("two_cpt_oral", bindings, new())
+                .ode(InputForm::Template, EliminationForm::FirstOrder),
+        ),
+    );
+    assert_eq!(
+        a.render().replace("pk two_cpt", "ode_template two_cpt"),
+        b.render()
+    );
 }

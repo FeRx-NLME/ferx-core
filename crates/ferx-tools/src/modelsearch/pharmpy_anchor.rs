@@ -201,6 +201,7 @@ fn run_case(case: &Case) -> (Vec<String>, String, ModelsearchResult) {
             BASE,
             Structure {
                 absorption: Absorption::Fo,
+                elimination: Elimination::Fo,
                 peripherals: 0,
                 transits: None,
                 lagtime: false,
@@ -210,6 +211,7 @@ fn run_case(case: &Case) -> (Vec<String>, String, ModelsearchResult) {
             BASE_IV,
             Structure {
                 absorption: Absorption::Inst,
+                elimination: Elimination::Fo,
                 peripherals: 0,
                 transits: None,
                 lagtime: false,

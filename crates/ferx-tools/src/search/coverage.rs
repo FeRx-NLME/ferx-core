@@ -12,8 +12,8 @@
 //! links to the table.
 
 use super::mfl::{
-    AbsorptionMode, CovariateEffect, CovariateOp, DepotMode, EliminationMode, Feature, Mfl, Mode,
-    Modes, PeripheralKind, TransitCounts, VariabilityEffect,
+    AbsorptionMode, CovariateEffect, CovariateOp, DepotMode, Feature, Mfl, Mode, Modes,
+    PeripheralKind, TransitCounts, VariabilityEffect,
 };
 
 /// Where the coverage table lives, appended to every gap error.
@@ -92,50 +92,41 @@ fn gap(gaps: &mut Vec<Gap>, feature: String, reason: impl Into<String>) {
 fn check_feature(feature: &Feature, gaps: &mut Vec<Gap>) {
     match feature {
         Feature::Absorption(modes) => {
-            // The `pk` templates are `*_iv` (INST) and `*_oral` (FO), and
-            // that is all a search can switch between. `zero_order(...)` and
-            // `weibull(...)` are ODE-only input functions (the parser's
-            // `ODE_ONLY_ABSORPTION_FNS`), the same class as SEQ-ZO-FO: a
-            // candidate for them is `[odes]` text, which a search cannot
-            // generate.
+            // `INST` and `FO` are the analytic `*_iv` / `*_oral` templates;
+            // `ZO` and `WEIBULL` are the `[odes]` input functions
+            // `zero_order(...)` and `weibull(...)` on an `*_iv` disposition,
+            // which `ferx-core::edit` writes as an `ode_template` candidate
+            // (#1257).
+            //
+            // `SEQ-ZO-FO` is the one that stays out. It is not a *term* on
+            // the central equation like the other two: the dose fills a depot
+            // at a constant rate and the depot empties first-order
+            // (`examples/sequential_absorption.ferx`), which is a second
+            // compartment, its own `ka` and its own duration — a different
+            // disposition, not a different input. Generating it needs a
+            // template family that does not exist rather than an override.
             for m in modes.expand() {
                 match m {
-                    AbsorptionMode::Inst | AbsorptionMode::Fo => {}
-                    AbsorptionMode::Zo => gap(
-                        gaps,
-                        "ABSORPTION(ZO)".into(),
-                        "zero-order absorption has no `pk` template; it is the `[odes]` input \
-                         function `zero_order(...)` (or a modeled duration on an IV template), \
-                         neither of which a search can generate",
-                    ),
+                    AbsorptionMode::Inst
+                    | AbsorptionMode::Fo
+                    | AbsorptionMode::Zo
+                    | AbsorptionMode::Weibull => {}
                     AbsorptionMode::SeqZoFo => gap(
                         gaps,
                         "ABSORPTION(SEQ-ZO-FO)".into(),
-                        "sequential zero-order-then-first-order absorption has no `pk` template; \
-                         it is hand-writable as an `[odes]` model only",
-                    ),
-                    AbsorptionMode::Weibull => gap(
-                        gaps,
-                        "ABSORPTION(WEIBULL)".into(),
-                        "Weibull absorption has no `pk` template; it is the `[odes]` input \
-                         function `weibull(...)`, which a search cannot generate",
+                        "sequential zero-order-then-first-order absorption is not one input term \
+                         on a standard disposition but a depot of its own, filled at a constant \
+                         rate and emptied by `ka`; there is no template for it and the search \
+                         does not generate one. Write it by hand — \
+                         `examples/sequential_absorption.ferx` — and search around it",
                     ),
                 }
             }
         }
-        Feature::Elimination(modes) => {
-            for m in modes.expand() {
-                if m != EliminationMode::Fo {
-                    gap(
-                        gaps,
-                        format!("ELIMINATION({})", m.label()),
-                        "only first-order elimination has an analytic `pk` template; \
-                         zero-order, Michaelis-Menten and mixed elimination are reachable only \
-                         via `[odes]`, which a search cannot generate",
-                    );
-                }
-            }
-        }
+        // Every elimination is buildable (#1257): first-order is the analytic
+        // template's own, and the three saturable forms are an `[odes]`
+        // override of the `central` equation on the same disposition.
+        Feature::Elimination(_) => {}
         Feature::Peripherals { counts, kind } => {
             for n in counts.expand() {
                 if n > MAX_PERIPHERALS {

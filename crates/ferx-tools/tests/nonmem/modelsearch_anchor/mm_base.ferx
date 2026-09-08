@@ -1,0 +1,43 @@
+# modelsearch ODE-candidate anchor (#1257): the same warfarin one-compartment
+# oral base as base.ferx, but **evaluating** rather than fitting.
+#
+# The object under test is the `[odes]` text the search generates for
+# `ELIMINATION(MM)`, not an optimizer: with `maxiter = 0` both engines are
+# asked for the objective at one stated parameter vector, so any difference
+# is a difference of model. The NONMEM twin is mm_base.ctl (the base) and
+# mm_eval.ctl (the candidate).
+
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 0
+  covariance = false
+  checkpoint = false
+  # The candidate is integrated numerically where this base has a closed
+  # form, and the FOCEI objective amplifies solver error, so the tolerances
+  # are pinned tight on both sides: NONMEM's `TOL=9 ATOL=12` against these.
+  # At ferx's default `ode_reltol = 1e-4` the two engines would differ by
+  # integration error rather than by the model.
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
