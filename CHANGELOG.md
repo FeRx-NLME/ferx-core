@@ -20,6 +20,13 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Analytical covariance R matrices now cover in-scope `[odes]` models.** FOCE,
+  FOCEI, and FOCEI-anchored AGQ reuse the existing augmented `Dual2` ODE sensitivity
+  solve and obtain the required third-order prediction blocks by central differences
+  of that second-order jet, matching the closed-form covariance design. The ODE step
+  accounts for `ode_reltol`; IOV and M3 censoring can be combined. Exact-anchor
+  Laplace remains on the reconverged finite-difference covariance path because its
+  marginal requires fourth-order prediction derivatives (#436).
 - **`ferx amd` — the automatic model development pipeline (Pharmpy `amd`) in `ferx-tools`
   (#1184).** One `.ferxsearch` file drives every search tool of the epic in turn:
   **structural → IIV → residual → IOV → allometry → covariates** by default, with

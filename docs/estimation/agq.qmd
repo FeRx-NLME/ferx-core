@@ -302,7 +302,7 @@ $$
 $$
 
 so the outer gradient is a **posterior-weighted average of fixed-η scores**. Each
-`∂nll(η_j)/∂θ` is available exactly from the `Dual2` sensitivity provider (the
+`∂nll(η_j)/∂θ` is available analytically from the `Dual2` sensitivity provider (the
 same `∂f/∂θ` FOCE/FOCEI use — it makes no mode assumption, so it evaluates at any
 η). The Ω block is closed-form from the η-prior, the σ block closed-form from the
 variance model.
@@ -492,10 +492,10 @@ keeps the finite-difference covariance, subject to its numerical convergence and
 
 - `method = focei` with `n_agq > 1`.
 - The model is inside the analytic covariance scope shared with FOCE/FOCEI, with a
-  Gaussian endpoint the sensitivity provider reaches. M3/BLOQ censoring is supported;
+  Gaussian endpoint the closed-form or ODE sensitivity provider reaches. M3/BLOQ censoring is supported;
   TTE, categorical endpoints, and custom or time-varying residual
   magnitudes are outside it.
-- Closed-form IOV is supported, including correlated IOV blocks shared across
+- Closed-form and ODE IOV are supported, including correlated IOV blocks shared across
   occasions. The assembly uses the full joint mode and quadrature grid and ties
   the shared covariance derivatives across occasions. IOV with modeled lag,
   LTBS, or observation scaling remains outside this covariance scope.
