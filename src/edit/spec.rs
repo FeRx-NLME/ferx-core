@@ -38,6 +38,27 @@ pub enum ModelEdit<'a> {
     /// Replace the named ηs' diagonal `omega` declarations with one
     /// `block_omega (A, B, …) = [...]`.
     SetOmegaBlock(Vec<String>),
+    /// Give `param` a κ — inter-occasion variability — in the canonical
+    /// `TVP * exp(ETA_P + KAPPA_P)` form (`TVP * exp(KAPPA_P)` on a parameter
+    /// with no η), declaring `kappa KAPPA_P ~ variance` (#1183).
+    AddIov {
+        param: String,
+        kappa: String,
+        variance: f64,
+    },
+    /// Take `param`'s κ away: drop it from the `exp(…)` factor and drop the
+    /// `kappa` declaration that goes with it.
+    DropIov { param: String },
+    /// Replace the named κs' diagonal `kappa` declarations with one
+    /// `block_kappa (A, B, …) = [...]`.
+    SetKappaBlock(Vec<String>),
+    /// Take the named η out of whatever `block_omega` declares them, each
+    /// back to its own diagonal `omega` at the variance it had in the block
+    /// — Pharmpy's `split_joint_distribution`. The survivors keep their
+    /// block; a lone survivor becomes a diagonal declaration too.
+    SplitOmegaBlock(Vec<String>),
+    /// The same for κ and `block_kappa`.
+    SplitKappaBlock(Vec<String>),
     /// Replace the `[error_model]` block, reconciling `[parameters]` σ
     /// declarations with the σ the new model names.
     SetErrorModel(ErrorSpecText),
@@ -130,6 +151,142 @@ impl NewParameter {
     pub fn fixed(mut self) -> Self {
         self.fixed = true;
         self
+    }
+}
+
+/// A model's variability structure as it is written: which parameter
+/// carries which η and κ, and how the `omega` / `kappa` declarations are
+/// blocked (#1183).
+///
+/// The reading side of [`ModelEdit::AddIiv`] / [`ModelEdit::DropIiv`] /
+/// [`ModelEdit::SetOmegaBlock`] and their κ twins, the way
+/// [`ErrorSpecText::read`] is the reading side of
+/// [`ModelEdit::SetErrorModel`]: a search over variability structures needs
+/// to know where it stands before it can decide which edit takes it
+/// somewhere else. Each parameter reports whether its right-hand side is in
+/// the **canonical form** those edits can rewrite — a top-level product
+/// ending in `exp(ETA [+ KAPPA])` of declared random effects, or one that
+/// mentions no random effect at all — so a tool can refuse a parameter it
+/// cannot edit *by name* before it fits anything, rather than mis-edit it.
+///
+/// `#[non_exhaustive]`: read one with [`VariabilityText::read`]; the fields
+/// are public to read.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct VariabilityText {
+    /// Every top-level `[individual_parameters]` assignment, in source order.
+    pub parameters: Vec<ParameterVariability>,
+    /// Every diagonal `omega NAME ~ …` declaration, in source order.
+    pub omegas: Vec<RandomEffectDecl>,
+    /// Every `block_omega (…) = […]`, in source order.
+    pub omega_blocks: Vec<RandomEffectBlock>,
+    /// Every diagonal `kappa NAME ~ …` declaration, in source order.
+    pub kappas: Vec<RandomEffectDecl>,
+    /// Every `block_kappa (…) = […]`, in source order.
+    pub kappa_blocks: Vec<RandomEffectBlock>,
+}
+
+/// One `[individual_parameters]` assignment's random effects.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct ParameterVariability {
+    pub name: String,
+    /// The η the parameter carries, when it carries exactly one.
+    pub eta: Option<String>,
+    /// The κ the parameter carries, when it carries exactly one.
+    pub kappa: Option<String>,
+    /// The right-hand side is in the canonical form the η / κ edits can
+    /// rewrite: `HEAD * exp(ETA)`, `HEAD * exp(ETA + KAPPA)`,
+    /// `HEAD * exp(KAPPA)`, or an expression with no random effect at all
+    /// (where `HEAD` is a top-level product). `false` for anything else — an
+    /// additive or proportional η, a random effect inside a transform, two η
+    /// on one line — which the edits refuse by name.
+    pub canonical: bool,
+    /// Every declared η / κ the right-hand side mentions, in order of first
+    /// mention — what a non-canonical parameter carries.
+    pub mentions: Vec<String>,
+}
+
+/// One diagonal `omega` / `kappa` declaration.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct RandomEffectDecl {
+    pub name: String,
+    /// The initial **variance**, an `(sd)` declaration squared.
+    pub variance: f64,
+    pub fixed: bool,
+}
+
+/// One `block_omega` / `block_kappa` declaration.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct RandomEffectBlock {
+    /// The random effects, in the block's order.
+    pub names: Vec<String>,
+    pub fixed: bool,
+}
+
+impl VariabilityText {
+    /// Read a model's variability structure — see the type docs.
+    ///
+    /// # Errors
+    ///
+    /// A declaration that cannot be read at all: an `omega` / `kappa` whose
+    /// init is not a number.
+    pub fn read(text: &super::ModelText) -> Result<Self, String> {
+        super::variability::read(text)
+    }
+
+    /// The parameter named `name`, if `[individual_parameters]` assigns it.
+    pub fn parameter(&self, name: &str) -> Option<&ParameterVariability> {
+        self.parameters.iter().find(|p| p.name == name)
+    }
+
+    /// The parameters carrying an η, in source order.
+    pub fn with_eta(&self) -> impl Iterator<Item = &ParameterVariability> {
+        self.parameters.iter().filter(|p| p.eta.is_some())
+    }
+
+    /// The parameters carrying a κ, in source order.
+    pub fn with_kappa(&self) -> impl Iterator<Item = &ParameterVariability> {
+        self.parameters.iter().filter(|p| p.kappa.is_some())
+    }
+
+    /// The `block_omega` an η belongs to, if any.
+    pub fn omega_block_of(&self, eta: &str) -> Option<&RandomEffectBlock> {
+        self.omega_blocks
+            .iter()
+            .find(|b| b.names.iter().any(|n| n == eta))
+    }
+
+    /// The `block_kappa` a κ belongs to, if any.
+    pub fn kappa_block_of(&self, kappa: &str) -> Option<&RandomEffectBlock> {
+        self.kappa_blocks
+            .iter()
+            .find(|b| b.names.iter().any(|n| n == kappa))
+    }
+
+    /// Whether the η / κ is declared `FIX` — on its own line or through its
+    /// block. `false` for a name the model does not declare.
+    pub fn is_fixed(&self, name: &str) -> bool {
+        self.omegas
+            .iter()
+            .chain(self.kappas.iter())
+            .find(|d| d.name == name)
+            .map(|d| d.fixed)
+            .or_else(|| self.omega_block_of(name).map(|b| b.fixed))
+            .or_else(|| self.kappa_block_of(name).map(|b| b.fixed))
+            .unwrap_or(false)
+    }
+
+    /// The initial variance of a diagonal η / κ; `None` for a blocked one
+    /// or a name the model does not declare.
+    pub fn variance(&self, name: &str) -> Option<f64> {
+        self.omegas
+            .iter()
+            .chain(self.kappas.iter())
+            .find(|d| d.name == name)
+            .map(|d| d.variance)
     }
 }
 

@@ -49,14 +49,16 @@
 mod apply;
 mod canonical;
 mod spec;
+mod variability;
 
 #[cfg(test)]
 #[path = "mod_tests.rs"]
 mod tests;
 
 pub use spec::{
-    ErrorForm, ErrorSpecText, EtaDecl, IivForm, ModelEdit, NewParameter, Relation, RelationTheta,
-    SigmaDecl, StructuralSpec, ThetaDecl, TimeVaryingDecl,
+    ErrorForm, ErrorSpecText, EtaDecl, IivForm, ModelEdit, NewParameter, ParameterVariability,
+    RandomEffectBlock, RandomEffectDecl, Relation, RelationTheta, SigmaDecl, StructuralSpec,
+    ThetaDecl, TimeVaryingDecl, VariabilityText,
 };
 
 use std::collections::HashSet;

@@ -106,6 +106,12 @@ pub struct Candidate {
     pub parent: Option<String>,
     /// What distinguishes it — see [`FeatureVector`].
     pub features: FeatureVector,
+    /// This candidate's own start count, overriding [`RunOptions::n_starts`]
+    /// when set. A search that knows one candidate is harder to fit than its
+    /// siblings — a full omega block over three or more η is the case
+    /// (#1183, `docs/examples/multistart.qmd`) — asks for more starts here
+    /// rather than paying for them on every candidate of the run.
+    pub n_starts: Option<usize>,
 }
 
 impl Candidate {
@@ -116,7 +122,15 @@ impl Candidate {
             model,
             parent: None,
             features: FeatureVector::new(),
+            n_starts: None,
         }
+    }
+
+    /// Builder: fit this candidate with `n` starts instead of the run's
+    /// default. Clamped to at least 1 when applied.
+    pub fn starts(mut self, n: usize) -> Self {
+        self.n_starts = Some(n);
+        self
     }
 
     /// Builder: record the candidate this one was derived from.
@@ -131,12 +145,27 @@ impl Candidate {
         self
     }
 
-    /// The candidate's identity: hex [`ModelText::canonical_hash`].
+    /// The candidate's identity: hex [`ModelText::canonical_hash`], with the
+    /// per-candidate [`n_starts`](Self::n_starts) folded in when it is set.
     ///
     /// This — not the id, not the features — is the dedup and cache key, so a
     /// model reached twice by two different step orders is fitted once.
+    ///
+    /// The start count belongs in it because the key has to cover everything
+    /// that changes the *result*, and the extra starts exist precisely to
+    /// reach a different optimum: without it, two candidates carrying the
+    /// same text but different start counts would deduplicate to the cheaper
+    /// fit, and a resume after raising `block_retries` would reuse a
+    /// journalled fit that never took the extra starts —
+    /// [`SearchManifest`](super::SearchManifest) compares only the *run-wide*
+    /// count, so nothing else would notice. A candidate with no override
+    /// hashes exactly as before, so an existing journal still resumes.
     pub fn hash(&self) -> String {
-        hex(&self.model.canonical_hash())
+        let base = hex(&self.model.canonical_hash());
+        match self.n_starts {
+            None => base,
+            Some(n) => ferx_core::io::hash::sha256_bytes(format!("{base}\nstarts={n}").as_bytes()),
+        }
     }
 }
 
@@ -313,7 +342,7 @@ impl std::fmt::Display for CandidateError {
 pub struct CandidateResult {
     /// The [`Candidate::id`] this result belongs to.
     pub id: String,
-    /// Hex canonical hash — the cache key the fit was stored under.
+    /// [`Candidate::hash`] — the cache key the fit was stored under.
     pub hash: String,
     /// [`Candidate::parent`], carried through.
     pub parent: Option<String>,

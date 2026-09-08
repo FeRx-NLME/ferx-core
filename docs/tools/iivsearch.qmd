@@ -1,0 +1,287 @@
+---
+pagetitle: "Variability-structure search"
+description-meta: "Pharmpy iivsearch in ferx — which parameters carry an η and how their omegas are blocked, searched top-down, bottom-up or simultaneously from a .ferxsearch file, ranked on the BIC(iiv), with every candidate written by the η and block edits."
+---
+
+# Variability-structure search
+
+> **Maturity: alpha** — see [Feature Maturity](../maturity.qmd) for what this means.
+
+`ferx iivsearch` is Pharmpy's `iivsearch`: a search over which
+[`[individual_parameters]`](../model-file/individual-parameters.qmd) carry an
+η, and how their `omega` declarations are blocked. Where
+[covsearch](covsearch.qmd) inserts covariate lines and
+[modelsearch](modelsearch.qmd) swaps the `pk` template, this tool rewrites
+the `exp(ETA_P)` factor of a parameter and the `omega` / `block_omega`
+declarations behind it — expression surgery rather than line surgery, which
+is why it asks the model to be written in one form (below).
+
+```bash
+ferx iivsearch warfarin.ferxsearch --directory warfarin-iivsearch --threads 8
+```
+
+The [`.ferxsearch` file](search.qmd)'s `IIV` and `COVARIANCE` statements are
+the space, `[rank]` the criterion, and an `[iivsearch]` section picks the
+algorithms:
+
+```toml
+base = "warfarin.ferx"
+data = "warfarin.csv"
+
+[space]
+mfl = """
+IIV(CL, EXP); IIV?([V,KA], EXP)      # CL keeps its η; V and KA are searched
+COVARIANCE?(IIV, [CL,V,KA])          # any block among the three
+"""
+
+[iivsearch]
+algorithm             = "top_down_exhaustive"   # or "bottom_up_stepwise", "simultaneous_stepwise", "skip"
+correlation_algorithm = "top_down_exhaustive"   # or "skip"; Pharmpy's derivation when unset
+block_retries         = 2                       # extra starts per η beyond two in a block
+
+[rank]
+type = "bic"                                    # the BIC(iiv) — what `bic` means here
+
+[strictness]
+require_converged = true
+
+[run]
+retries   = 2
+threads   = 8
+cache_dir = "warfarin-iivsearch"
+```
+
+| key | default | meaning |
+|---|---|---|
+| `algorithm` | `top_down_exhaustive` | how the number of η is searched, [below](#the-algorithms); `skip` searches the blocks only |
+| `correlation_algorithm` | Pharmpy's derivation | `top_down_exhaustive` over the blocks after any algorithm but `simultaneous_stepwise`, which has no second stage; `skip` stops after the η |
+| `as_fullblock` | `false` | Pharmpy's flag: a bottom-up candidate blocks every η it carries |
+| `block_retries` | `2` | extra starts, on top of `[run] retries + 1`, per η beyond two in a candidate's largest block — a 3-block gets two more, a 4-block four |
+| `[rank] type` | `bic` | the BIC(iiv) — `OFV + n_ω·ln(n_subjects)`, Pharmpy's `bic_iiv`; `bic_mixed` for the mixed BIC, or any other [rank type](search.qmd#ranking-strictness-and-run-settings) |
+| `[rank] cutoff` | none | the improvement over its parent a candidate must show to replace it |
+
+Pharmpy's default space is `IIV?(@IIV,EXP); COVARIANCE?(IIV,@IIV)` — every
+η the input carries is searched, every correlation among them tried.
+
+## The space
+
+`IIV?(p, EXP)` names the parameters whose η is **searched**: a candidate
+may carry it or not. A plain `IIV(p, EXP)` names one that is **kept** in
+every candidate — Pharmpy's forced feature, and what a modeller means by
+"clearance always has variability". `COVARIANCE?(IIV, p)` names the
+parameters whose η may be blocked together; a plain `COVARIANCE(IIV, [A,B])`
+is a block every candidate carries. Only the exponential form is
+searchable, because it is the one the edits can reverse; `IIV?(p, ADD)` is
+refused naming the form.
+
+**The canonical form.** Every parameter the space names must be written as
+`P = TVP * exp(ETA_P)` — a top-level product ending in the exponential of
+its η — or, with inter-occasion variability, `P = TVP * exp(ETA_P +
+KAPPA_P)`. A parameter written any other way (`TVV * (1 + ETA_V)`, an η
+inside a transform, two η on one line) is refused **by name** before
+anything is fitted, never silently mis-edited:
+
+```
+Error: iivsearch: `V` is not written in the canonical form `V = TVV * exp(ETA_V)`
+(it carries `ETA_V`), so its η cannot be searched by rewriting the line. Rewrite
+`V` as a product ending in `exp(<eta>)`, or leave it out of the space
+```
+
+This is the posture [`[covariate_model]`](../model-file/covariate-model.qmd)
+takes on a non-product right-hand side. A parameter the space does not name
+is left exactly as it is, whatever its form.
+
+An η declared `FIX` is kept and never blocked, with a note. A parameter
+with no η in the input gets one at Pharmpy's 0.09 when a candidate adds it;
+one that had an η takes its input variance back.
+
+## The algorithms
+
+All Pharmpy's (`tools/iivsearch/algorithms.py`), in two stages: the
+**number of η** under `algorithm`, then the **block structure** under
+`correlation_algorithm`, on the winner of the first. Each step fits its
+candidates in parallel and ranks them with their parent; the best becomes
+the next parent.
+
+- **`top_down_exhaustive`** (the default) — the base carries every η the
+  space names; one candidate per subset of the searched η, largest subsets
+  first, lexicographic within a size, the naive-pooled model included when
+  no η is kept. Three searched η give seven candidates.
+- **`bottom_up_stepwise`** — the base carries only the kept η; each step
+  adds one η to each parameter that lacks one, and the best step model
+  becomes the next parent, until no step beats its parent.
+- **`simultaneous_stepwise`** — bottom-up, but each new η is also tried
+  *inside* each existing block and *paired* with each single η, so the
+  block structure is decided as the η are added. There is no second stage.
+- **`skip`** — the η are left as they are and only the blocks are searched.
+
+The block stage is `top_down_exhaustive`: over the parameters the
+`COVARIANCE` statement names that carry an η, one candidate per **single
+full block** of two or more of them (beside the kept blocks), plus the
+all-diagonal model. Three η give `[CL,KA]`, `[CL,V]`, `[KA,V]` and
+`[CL,KA,V]`. This is Pharmpy's `_is_valid_block_combination`, which admits
+exactly the cliques — `[CL,V]+[KA,F]` is not a candidate.
+
+A block the input already carries that names a parameter the `COVARIANCE`
+statement does **not** is not the search's to take apart: it rides along in
+every candidate unchanged, its members are not offered to the cliques, and
+the notes say so. This is the same rule as everywhere else here — a
+parameter the space does not name is left as it is — and it is what keeps
+the block stage from quietly dissolving a correlation the modeller put in
+the base model on purpose.
+
+### The base model
+
+The base is the input when its η structure already lies on the space.
+Otherwise it is derived and fitted first, and both appear in the table: for
+top-down, the input with every space η present; for bottom-up, the input
+with only the kept η. A block the input carries survives where its members
+do, and the forced blocks are added.
+
+### What a candidate becomes
+
+Every candidate is derived from its parent by the edits in
+[`ferx-core::edit`](https://github.com/FeRx-NLME/ferx-core/issues/1176) —
+`DropIiv`, `AddIiv`, `SplitOmegaBlock`, `SetOmegaBlock` — after the parent's
+estimates are written into its initial values (Pharmpy's `update_inits`),
+so the model the search fitted is the model a user would have typed:
+
+| move | edit on the parent |
+|---|---|
+| remove `KA`'s η | `KA = TVKA * exp(ETA_KA)` → `KA = TVKA`, the `omega ETA_KA` line gone; a block shrinks around its survivors |
+| add `V`'s η | `V = TVV` → `V = TVV * exp(ETA_V)`, `omega ETA_V ~ 0.04` (the input's variance, else 0.09) |
+| block `CL` and `V` | two `omega` lines → `block_omega (ETA_CL, ETA_V) = [ω_CL, c, ω_V]` |
+| unblock | the block back to its diagonal lines at their block variances |
+
+A new block's correlations `c` start from the parent's empirical Bayes
+estimates — the sample correlation of the subjects' η, capped at ±0.95,
+halved until the block is positive definite — which is what Pharmpy's
+`create_joint_distribution(individual_estimates=…)` does; the edit's own
+flat 0.1 is the fallback when the parent has no per-subject η to read. A
+block over three or more η is fitted with more starts (`block_retries` per
+η beyond two): a full block is a moderate local-minimum risk
+([multistart](../examples/multistart.qmd)), and the correlation stage
+generates exactly those models.
+
+## Ranking
+
+Each step ranks its candidates **and its parent** on `[rank] type` among
+the models that pass the `[strictness]` gate — Pharmpy's `rank_models` with
+the parent as reference. The parent wins a tie; with a `cutoff` a candidate
+must beat the parent by at least that much. The default criterion is the
+**BIC(iiv)**, `OFV + n_ω·ln(n_subjects)`: the observation-count BIC
+systematically mis-ranks variability structures (#1177), which is why this
+tool reads `type = "bic"` as Pharmpy does, as `bic_iiv`. At the end the
+selected model is compared with the **input** the same way, and the input
+is returned when it ranks better — the search never returns a model worse
+than the one it was given.
+
+A candidate that fails the gate, does not compile or does not fit is in the
+table with its reason and no rank. A step whose parent fails the gate keeps
+the parent when no candidate passes, with a note.
+
+## Output
+
+The directory holds:
+
+- `models.csv` — one row per fitted model: the input, the base, every
+  candidate of every step, with its `description` in Pharmpy's spelling
+  (`[CL,V]+[KA]`: blocks first, then the diagonal η), `criterion`,
+  `d_criterion` against its step's parent, `rank` within the step, and
+  beside them `converged`, `passed`, `failures`, the `starts` it was fitted
+  with and `seconds`.
+- `models/<id>.ferx` — every fitted model as it was fitted: `input`, `base`,
+  `run1`, `run2`, … (Pharmpy's `iivsearch_run{n}`).
+- `final.ferx` — the selected model with its own estimates written into the
+  initial values, so it refits as the search left it.
+- `final-fit.yaml` — the selected model's estimates, from the CLI.
+- one journalled runner directory per step (`input`, `base`, `step-1`, …),
+  so `--resume` picks an interrupted search up where it stopped.
+
+`ferx iivsearch` prints each step's ranking table and the final model.
+
+## Compared with Pharmpy
+
+The candidate sets, their order and numbering, the two stages, the
+reference-model ranking and the final comparison with the input are Pharmpy
+2.2's `iivsearch`, read off its source. The deviations:
+
+- **A parameter the space does not name is left as it is.** Pharmpy's
+  `transform_into_search_space` removes an η the space does not mention;
+  here a category the space does not name is not a request to change it —
+  the reading [modelsearch](modelsearch.qmd#compared-with-pharmpy) takes.
+- **The simultaneous algorithm joins a new η into an existing block as one
+  block.** Pharmpy 2.2.0 builds that candidate from pairwise covariance
+  features and, measured on the anchor below, writes `[KA,V]+[CL]` where
+  `[CL,V,KA]` was meant.
+- **`[rank] cutoff`** is an improvement over the parent; Pharmpy's `cutoff`
+  is read only by its likelihood-ratio ranking.
+- **A parent that fails the gate** is kept when nothing passes, rather than
+  aborting the run.
+- **`linearize`** (Pharmpy's linearised search) is not offered: ferx fits
+  in-process and cheaply, and the real fits are the reference the
+  linearisation approximates.
+- **Strictness** is the `[strictness]` gate every search here applies, not
+  Pharmpy's `strictness` string.
+
+### The anchor
+
+`crates/ferx-tools/tests/pharmpy/iivsearch_anchor/` holds a 40-subject oral
+dataset simulated with IIV on CL and V only, correlated (r = 0.6), and none
+on KA; a diagonal three-η input model; and Pharmpy 2.2.0's runs on it
+through NONMEM 7.5.1 (`pharmpy_iivsearch.json`) for all three algorithms.
+`tests/iivsearch_pharmpy_anchor.rs` replays ferx on the same input
+(slow-gated). Top-down, ranked on the BIC(iiv):
+
+| step | model | Pharmpy | ferx |
+|---|---|---:|---:|
+| 1 | `[CL]+[V]` (best of seven) | 697.411 | 697.411 |
+| 1 | input `[CL]+[KA]+[V]` | 701.229 | 701.102 |
+| 2 | `[CL,V]` | 666.086 | 666.086 |
+| 3 | final vs input: `[CL,V]` selected | | |
+
+The same seven-plus-one candidates in the same numbering, the same winner
+at each step, the same final model to three decimals. Bottom-up from `[CL]`
+follows the same path (`[CL]+[V]` 697.411, `[CL,V]` 666.086). The
+simultaneous algorithm agrees on step one (`[CL,V]` from `[CL]`) and parts
+on step two, for the reason below: its `[CL,V]+[KA]` candidate is a mixed
+ω, which ferx's FOCEI fits as the full block `[CL,V,KA]` (#1018) — OFV
+647.73 against NONMEM's 655.47 for the model as declared (a fit that
+terminated with unreportable significant digits) — and ferx ends on it
+where Pharmpy ends on `[CL,V]`. The anchor asserts that divergence by name,
+so the fix of #1018 turns it red and says what to flip; the search itself
+carries a note naming #1018 on the run.
+
+## Known limitation: mixed ω under FOCE / FOCEI (#1018)
+
+FOCE / FOCEI estimate the **full lower triangle** of a `block_omega` that
+sits beside a standalone `omega`: the cross-block covariances the model
+declares absent are fitted as free parameters, and the reported parameter
+count and BIC do not include them. SAEM, Gauss-Newton and VI honour the
+declared structure. Until #1018 is fixed, a block-stage candidate with a
+block beside another η — every 2-block on a three-η model — is, under
+FOCE / FOCEI, a larger block than its description says. The search adds a
+note whenever it generates one under those methods; read its rank with
+that in mind, or run the search with `method = saem` or `gn`.
+
+The BIC(iiv) itself is anchored to `pharmpy.modeling.calculate_bic` in
+core (#1177); the trajectory above re-asserts it end to end.
+
+## From Rust
+
+```rust
+use ferx_tools::iivsearch::{run_iivsearch, IivsearchRun};
+use ferx_tools::search::SearchConfig;
+
+let config = SearchConfig::load("warfarin.ferxsearch")?;
+let base = config.load_base()?;
+let result = run_iivsearch(&config, &base, IivsearchRun::default())?;
+println!("{}", ferx_tools::iivsearch::render_summary(&result));
+println!("final: {}", result.final_structure.description());
+```
+
+`IivsearchRun` takes the directory, a thread override, a cancel flag and a
+progress callback; every field is optional. The structure reader behind
+the tool, `ferx_core::edit::VariabilityText::read`, is public too: it
+reports which parameter carries which η and κ, how they are blocked, and
+whether each line is in the canonical form.

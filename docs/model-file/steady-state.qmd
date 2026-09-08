@@ -398,12 +398,63 @@ window, because the wrong value was carried into the steady-state trough.
 
 `TAFD` and `TIME`/`T` are a different case and are **not** covered by the above. They read
 an absolute clock, so the dose train has no periodic limit for the run-in to converge to —
-measured, an explicit `TAFD` train moves 29 % per doubling of its length while the `TAD`
-train moves 3.5e-7. `TIME`/`T` under `SS=1` matches NONMEM (both engines equilibrate on a
-cycle-local clock and then integrate forward on absolute time, so both sit the same
-distance from their own non-convergent train), and `TAFD` under `SS=1` still reads `NaN`.
-Neither number is the steady state of a system that has one; if your model means an
-absolute clock, expand the run-in with explicit dose records instead of `SS=1`.
+measured, an explicit absolute-clock train moves 29 % per doubling of its length while the
+`TAD` train moves 3.5e-7. There is therefore nothing for a steady-state run-in to compute,
+and the two spellings fail differently rather than alike:
+
+| `[odes]` term under `SS=1` | ferx | |
+|---|---|---|
+| `0.003*T`, `0.003*TIME` | 8.5679354785 | finite, and matches NONMEM's own `SS=1` record to better than 1e-8 |
+| the same model as an explicit 41-dose train | 5.1221001380 | 67 % away, on *both* engines |
+| `0.003*TAFD`, and `0.0*TAFD` | `NaN` | no referent inside the run-in at all |
+
+`TIME`/`T` come back finite because ferx and NONMEM share the same convention — both
+equilibrate on a clock local to each cycle and then integrate forward on absolute time — so
+both sit the same distance from their own non-convergent train. That parity is kept
+deliberately: the number matches the engine most users are porting from, and it is still not
+the steady state of a system that has one. ferx gives `TAFD` no convention at all inside the
+run-in: the periodic fiction has no first dose, so there is no finite value to hand back and
+the solve returns `NaN` — including when the term's coefficient is zero, since `0.0 * NaN` is
+`NaN`. Giving it the run-in's own origin instead would silently redefine `TAFD` as `TAD`.
+(The `TIME`/`T` row above is anchored against a committed NONMEM run; there is no `TAFD`
+control stream, so nothing here is a claim about what NONMEM does with that spelling.)
+
+Through ferx 0.3.1 this combination was served silently; it is now reported as
+`W_STEADY_STATE_ABSOLUTE_TIME` by both `fit()` and `ferx check` (see
+[Check report](../file-formats/check-report.qmd#codes-data-and-dosing)). It is a **warning**,
+not a rejection — the model still runs, and for `TIME`/`T` it still matches NONMEM.
+
+If your model means a per-dose clock, use `TAD`, which does have a periodic steady state. If
+it means an absolute clock, write the subject's dose history out as explicit records — but
+the prediction then depends on **how many** doses you write, because the train has no limit
+to converge to. Measured on `0.003*TAFD`, a 21-dose and a 41-dose train differ by
+22.7 % / 30.6 % / 37.7 % / 44.1 % at the four sample phases. That dependence is the model's,
+not the solver's; `SS=1` does not remove it, it only hides it behind one number.
+
+::: {.callout-note}
+## The warning over-reports one joint PK-TTE shape
+
+The check asks whether the **PK block** reads an absolute clock, so a `TIME`-reading hazard
+alone does not trigger it — the run-in holds the cumulative-hazard accumulator at its record
+value, so a time-dependent baseline is unaffected (see
+[SS with an ODE-accumulated hazard](#ss-with-an-ode-accumulated-hazard)).
+
+One shape slips through: an `[odes]` **intermediate** that reads time and is consumed only by
+the hazard (`TT = TIME`, then `hazard = f(TT)`) is not one of the injected derivative lines
+the filter removes, so such a model is warned about although its PK block is autonomous. It is
+safe to ignore there, and writing the time term directly in the `hazard =` expression avoids
+it. Tracked as [issue #1279](https://github.com/FeRx-NLME/ferx-core/issues/1279); the warning
+will stop appearing on this shape once that lands.
+
+It asks the `[odes]` right-hand side only, so `TIME` read from
+[`[individual_parameters]`](individual-parameters.qmd#time-dependent-parameters) is out of scope and
+is **not** reported. That case is different in kind: the run-in receives the parameter
+snapshot taken at the `SS=1` record, exactly as NONMEM's `$PK` does, so the whole infinite
+past uses one frozen value rather than a clock with no limit. It still leaves the steady state
+short of the model's own explicit train — measured on `CL = TVCL * (1.0 + 0.003*TIME)`, by
+0.2026 % on every observation against a 41-dose train, against 67 % for the same coefficient
+in the RHS.
+:::
 
 ## Limitations
 

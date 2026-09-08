@@ -386,8 +386,9 @@ impl SearchConfig {
             Ok(())
         } else {
             Err(format!(
-                "{tool} needs a [space] section: `mfl = \"...\"` with {what}. Only ruvsearch, \
-                 whose candidates are the residual-error forms, runs without one"
+                "{tool} needs a [space] section: `mfl = \"...\"` with {what}. Only ruvsearch \
+                 (whose candidates are the residual-error forms) and iovsearch (every \
+                 parameter with a free η by default) run without one"
             ))
         }
     }

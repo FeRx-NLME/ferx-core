@@ -180,7 +180,7 @@ fn seed_from_regularises_a_block_whose_cholesky_diagonal_is_at_the_rail() {
 fn seed_from_leaves_a_well_conditioned_block_alone() {
     let fit = fixture_fit();
     assert!(super::cholesky_above_rail(&fit.omega));
-    let blocks = super::free_blocks_of(&warfarin_text(), &fit.eta_names);
+    let blocks = super::free_blocks_of(&warfarin_text(), "block_omega", &fit.eta_names);
     assert!(blocks.is_empty(), "warfarin's ωs are diagonal");
     assert!(super::floor_variances(&fit, &[vec![0, 1, 2]]).is_none());
 }
@@ -277,7 +277,7 @@ fn seed_from_leaves_a_fixed_block_and_its_neighbours_alone() {
         params.contains(&"omega ETA_KA ~ 0.00002".to_string()),
         "{params:?}"
     );
-    assert!(super::free_blocks_of(&model, &names).is_empty());
+    assert!(super::free_blocks_of(&model, "block_omega", &names).is_empty());
 }
 
 /// Past `MAX_NUDGES` the block goes through verbatim — not sixteen nudges
@@ -298,7 +298,7 @@ fn seed_from_hands_an_unrepairable_block_through_verbatim() {
         "omega ETA_CL ~ 0.09\n  omega ETA_V  ~ 0.04",
         "block_omega (ETA_CL, ETA_V) = [0.09, 0.01, 0.04]",
     );
-    let blocks = super::free_blocks_of(&ModelText::parse(&src).unwrap(), &names);
+    let blocks = super::free_blocks_of(&ModelText::parse(&src).unwrap(), "block_omega", &names);
     assert_eq!(blocks, vec![vec![cl, v]]);
     let floored = super::floor_variances(&fit, &blocks);
     // Nothing else was below the floor, and the block was given back as it
@@ -313,4 +313,68 @@ fn seed_from_hands_an_unrepairable_block_through_verbatim() {
         model.block_lines("parameters"),
         verbatim.block_lines("parameters")
     );
+}
+
+/// The κ matrix hits the same rail (#1183): a full-IOV parent whose κ
+/// collapsed handed every child a `kappa` line the engine refuses to start.
+#[test]
+fn seed_from_floors_a_collapsed_kappa_and_nudges_a_singular_kappa_block() {
+    let mut fit = fixture_fit();
+    fit.kappa_names = vec!["KAPPA_CL".into(), "KAPPA_V".into(), "KAPPA_KA".into()];
+    let mut iov = nalgebra::DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![
+        0.02,
+        0.01,
+        6.144_212_353_328_21e-6,
+    ]));
+    // A (CL, V) block whose second Schur complement is on the rail.
+    iov[(0, 1)] = (0.02f64 * 0.01).sqrt() * (1.0 - 1e-7);
+    iov[(1, 0)] = iov[(0, 1)];
+    fit.omega_iov = Some(iov);
+
+    let src = std::fs::read_to_string(MODEL).unwrap();
+    let src = src
+        .replace(
+            "  CL = TVCL * exp(ETA_CL)",
+            "  CL = TVCL * exp(ETA_CL + KAPPA_CL)",
+        )
+        .replace(
+            "  V  = TVV  * exp(ETA_V)",
+            "  V  = TVV  * exp(ETA_V + KAPPA_V)",
+        )
+        .replace(
+            "  KA = TVKA * exp(ETA_KA)",
+            "  KA = TVKA * exp(ETA_KA + KAPPA_KA)",
+        )
+        .replace(
+            "  sigma PROP_ERR",
+            "  block_kappa (KAPPA_CL, KAPPA_V) = [0.02, 0.0, 0.01]\n  kappa KAPPA_KA ~ 0.01\n  \
+             sigma PROP_ERR",
+        );
+    let mut model = ModelText::parse(&src).expect("the IOV twin parses");
+    seed_from(&mut model, &fit).expect("seeding a child");
+    let params = model.block_lines("parameters");
+    assert!(
+        params.contains(&"kappa KAPPA_KA ~ 0.00001".to_string()),
+        "the collapsed κ is raised to the floor: {params:?}"
+    );
+    let block = params
+        .iter()
+        .find(|l| l.starts_with("block_kappa"))
+        .expect("the κ block is written");
+    let tri: Vec<f64> = block
+        .split_once('[')
+        .unwrap()
+        .1
+        .trim_end_matches(']')
+        .split(',')
+        .map(|s| s.trim().parse().unwrap())
+        .collect();
+    let written = nalgebra::DMatrix::from_row_slice(2, 2, &[tri[0], tri[1], tri[1], tri[2]]);
+    assert!(super::cholesky_above_rail(&written), "{block}");
+    // The mutation this pins: `SeedInits` alone writes the rail.
+    let mut verbatim = ModelText::parse(&src).unwrap();
+    verbatim.apply(ModelEdit::SeedInits(&fit)).unwrap();
+    assert!(verbatim
+        .block_lines("parameters")
+        .contains(&"kappa KAPPA_KA ~ 0.00000614421235332821".to_string()));
 }

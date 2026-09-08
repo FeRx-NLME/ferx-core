@@ -390,6 +390,11 @@ pub struct SearchManifest {
     /// of the enum, and readable when a user opens the file to see why their
     /// resume was refused.
     pub criterion: String,
+    /// The **run-wide** start count ([`RunOptions::n_starts`]). A candidate
+    /// that overrides it ([`Candidate::n_starts`](super::Candidate::n_starts))
+    /// carries the override in its own hash instead, so raising a tool's
+    /// per-candidate count re-keys those candidates and refits them rather
+    /// than reusing a fit that took fewer starts.
     pub n_starts: usize,
     pub strictness: Strictness,
     pub n_subjects: usize,

@@ -105,22 +105,20 @@ fn the_remaining_gap_rows() {
         vec!["COVARIATE(..., custom)"]
     );
     assert_eq!(gaps("COVARIATE(CL,WT,pow,+)"), vec!["COVARIATE(..., +)"]);
-    assert_eq!(gaps("IOV(CL,EXP)"), vec!["IOV(...)"]);
-    assert_eq!(gaps("COVARIANCE(IOV,[CL,V])"), vec!["COVARIANCE(IOV, ...)"]);
+    // IOV is searchable since #1183 — in the exponential form only, which is
+    // the form `[iov]` estimates; both covariance levels are blocks.
+    assert_eq!(gaps("IOV(CL,EXP)"), Vec::<String>::new());
+    assert_eq!(gaps("IOV(CL,ADD)"), vec!["IOV(..., ADD)"]);
+    assert_eq!(gaps("COVARIANCE(IOV,[CL,V])"), Vec::<String>::new());
     assert_eq!(gaps("COVARIANCE(IIV,[CL,V])"), Vec::<String>::new());
-    // An array or `*` in the level slot reaches the coverage table, not the
-    // parser: the IOV member is the named gap, the IIV member is fine.
-    assert_eq!(
-        gaps("COVARIANCE([IIV,IOV],[CL,V])"),
-        vec!["COVARIANCE(IOV, ...)"]
-    );
-    assert_eq!(gaps("COVARIANCE(*,[CL,V])"), vec!["COVARIANCE(IOV, ...)"]);
+    assert_eq!(gaps("COVARIANCE([IIV,IOV],[CL,V])"), Vec::<String>::new());
+    assert_eq!(gaps("COVARIANCE(*,[CL,V])"), Vec::<String>::new());
 }
 
 #[test]
 fn every_gap_is_reported_once_with_a_reason_and_the_docs_link() {
     let mfl =
-        Mfl::parse("ELIMINATION([MM,MM]);ELIMINATION(MM);IOV(CL,EXP);IOV(V,ADD)").expect("parses");
+        Mfl::parse("ELIMINATION([MM,MM]);ELIMINATION(MM);IOV(CL,ADD);IOV(V,ADD)").expect("parses");
     let e = check_coverage(&mfl).expect_err("has gaps");
     assert_eq!(e.gaps.len(), 2, "{e}");
     let text = e.to_string();
@@ -133,7 +131,7 @@ fn every_gap_is_reported_once_with_a_reason_and_the_docs_link() {
         "{text}"
     );
     assert!(
-        text.contains("IOV(...): inter-occasion variability"),
+        text.contains("IOV(..., ADD): `ferx-core::edit` writes a κ inside the exponential"),
         "{text}"
     );
     assert!(text.ends_with(COVERAGE_DOCS), "{text}");
