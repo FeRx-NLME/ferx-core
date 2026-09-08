@@ -302,7 +302,7 @@ $$
 $$
 
 so the outer gradient is a **posterior-weighted average of fixed-η scores**. Each
-`∂nll(η_j)/∂θ` is available exactly from the `Dual2` sensitivity provider (the
+`∂nll(η_j)/∂θ` is available analytically from the `Dual2` sensitivity provider (the
 same `∂f/∂θ` FOCE/FOCEI use — it makes no mode assumption, so it evaluates at any
 η). The Ω block is closed-form from the η-prior, the σ block closed-form from the
 variance model.

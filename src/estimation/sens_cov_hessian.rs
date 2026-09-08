@@ -1028,7 +1028,7 @@ fn inner_eta_responses(
 /// differential that places the quadrature nodes, and no amount of trace information substitutes
 /// for it. Exposing them keeps one derivation — every entry here comes from the third-order
 /// `f`-sensitivities (`d3f_deta3`, `d3f_deta2_dtheta`, `d3f_deta_dtheta2`), which the provider
-/// obtains by finite-differencing the exact second-order `Dual2` jet (Shi 2021). The anchor
+/// obtains by finite-differencing the analytic second-order `Dual2` jet (Shi 2021). The anchor
 /// and mode responses are assembled directly rather than differencing reconverged gradients.
 ///
 /// # Directions
