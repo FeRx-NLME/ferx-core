@@ -20,6 +20,33 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **`ferx amd` — the automatic model development pipeline (Pharmpy `amd`) in `ferx-tools`
+  (#1184).** One `.ferxsearch` file drives every search tool of the epic in turn:
+  **structural → IIV → residual → IOV → allometry → covariates** by default, with
+  `reevaluation`, `SIR`, `SRI` and `RSI` reordering the same components (`[amd] strategy`,
+  Pharmpy's own spellings accepted). The file's one `[space]` is **partitioned** before each
+  step, so `modelsearch` sees only `ABSORPTION` / `PERIPHERALS` / `TRANSITS` / `LAGTIME`,
+  `covsearch` only `COVARIATE`, and a `COVARIANCE(*, ...)` is narrowed to its IIV half for
+  `iivsearch` and its IOV half for `iovsearch` — every tool refuses a foreign statement by
+  name, which is what a single-space pipeline would otherwise run into. `[rank]` is narrowed
+  the same way: the criterion goes to the steps that rank on it, and the two likelihood-ratio
+  steps (`ruvsearch`, `covsearch`) keep their own p-value thresholds. Each step starts from
+  the model the last one selected, seeded from its estimates; `[amd] retries`
+  (`all_final` / `final` / `skip`) says which selected models get a perturbed-restart pass at
+  `[run] retries + 1` starts. A step the space says nothing about — or an IOV search on a
+  model with no `iov_column` — is **skipped with its reason recorded**, never run on a space
+  invented for it; a step whose tool errors is reported as *failed* and the pipeline carries
+  on from the model it was handed, exiting 1. The report is the product: `steps.csv` has one
+  row per planned step with the criterion before and after, the ΔOFV and the wall clock;
+  `candidates.csv` has **every candidate of every step** with its Δ against its parent, the
+  strictness verdict *with its reasons*, whether the fit converged and what it cost; and the
+  printed summary ends with the final model's estimates and standard errors. The sequencing
+  and the space split are anchored against Pharmpy 2.2.0's own `amd` — every strategy's
+  order, and the subspace `modelsearch` and `covsearch` are handed for a corpus of spaces —
+  with two deliberate divergences asserted as differences: ferx skips a step whose space is
+  silent where Pharmpy substitutes a default search space, and resolves a `LET` against the
+  model the step starts from rather than at parse time. See `docs/tools/amd.qmd` and
+  `examples/amd_start.ferxsearch`.
 - **`ferx iivsearch` — variability-structure search (Pharmpy `iivsearch`) in `ferx-tools`
   (#1183).** From a `.ferxsearch` file whose `[space]` names the η to search (`IIV?([V,KA],
   EXP)`; a plain `IIV(CL, EXP)` keeps that η) and the correlations to try

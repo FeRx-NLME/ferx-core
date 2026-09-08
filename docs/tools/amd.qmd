@@ -1,0 +1,386 @@
+---
+pagetitle: "Automatic model development"
+description-meta: "Pharmpy amd in ferx — the whole search pipeline from one .ferxsearch file: structural, IIV, residual, IOV, allometry and covariates in order, each seeded from the last, with one auditable report across every step."
+---
+
+# Automatic model development
+
+> **Maturity: alpha** — see [Feature Maturity](../maturity.qmd) for what this means.
+
+`ferx amd` is Pharmpy's `amd`: the search tools of the epic run one after
+another, each starting from the model the last one selected, reported as one
+object. It adds no numerics and no search of its own — every decision is made
+by [modelsearch](modelsearch.qmd), [iivsearch](iivsearch.qmd),
+[ruvsearch](ruvsearch.qmd), [iovsearch](iovsearch.qmd),
+[allometry](covsearch.qmd#allometry) and [covsearch](covsearch.qmd). What the
+pipeline owns is the sequencing, the seeding between steps, and the report.
+
+```bash
+ferx amd examples/amd_start.ferxsearch --directory amd-run --threads 8
+```
+
+One [`.ferxsearch` file](search.qmd) drives the whole thing. Its `[space]`
+holds every step's statements together; the `[rank]` criterion and the
+`[strictness]` gate are inherited by every step; and each tool's own section
+configures it exactly as it would on its own.
+
+```toml
+base = "amd_start.ferx"
+data = "../data/two_cpt_oral_cov.csv"
+
+[space]
+mfl = """
+PERIPHERALS(0..1)
+IIV(CL, EXP); IIV?(@PK, EXP)
+COVARIATE?(@IIV, @CONTINUOUS, [pow,lin])
+"""
+
+[amd]
+strategy = "default"        # or "reevaluation", "SIR", "SRI", "RSI"
+retries  = "all_final"      # or "final", "skip"
+# skip   = ["iovsearch"]    # leave a step out on purpose
+
+[iivsearch]                 # each tool's own section, read by its own step
+algorithm = "top_down_exhaustive"
+
+[ruvsearch]
+max_iter = 2
+
+[covsearch]
+algorithm = "scm-forward"
+p_forward = 0.05
+
+[rank]
+type = "bic"
+
+[strictness]
+require_converged  = true
+reject_on_boundary = true
+
+[run]
+threads = 8
+retries = 2
+```
+
+`@PK` and `@IIV` are resolved against the model **each step actually starts
+from**, not against the file's base — which is what lets `IIV?(@PK, EXP)`
+reach the `Q` and `V2` the *structural* step will create. Naming `[V,KA]`
+there instead costs ~290 OFV on this dataset, measured: the peripheral
+parameters then never get an η.
+
+| key | default | meaning |
+|---|---|---|
+| `strategy` | `default` | the step ordering; `reevaluation`, `SIR`, `SRI` and `RSI` reorder the same components. Pharmpy's own upper-case spellings are accepted |
+| `retries` | `all_final` | which selected models get the perturbed-restart pass: `all_final` every step's, `final` only the pipeline's, `skip` none |
+| `skip` | `[]` | steps to leave out, by name: `structural`, `iivsearch`, `residual`, `iovsearch`, `allometry`, `covariates`. A step the space says nothing about is skipped anyway; this is for one the space *does* describe |
+
+## The pipeline
+
+### The default order
+
+Pharmpy's, and this tool's: **structural → IIV → residual → IOV → allometry →
+covariates**. The order is not arbitrary — a variability structure decided on
+the wrong structural model is decided on the wrong residuals, and a covariate
+model built before the random effects are settled explains variability that
+was going to be absorbed anyway.
+
+### Alternative strategies
+
+| strategy | order |
+|---|---|
+| `default` | structural, iivsearch, residual, iovsearch, allometry, covariates |
+| `reevaluation` | the default order, then **iivsearch and residual again** |
+| `SIR` | structural, iivsearch, residual |
+| `SRI` | structural, residual, iivsearch |
+| `RSI` | residual, structural, iivsearch |
+
+`reevaluation` exists because the first IIV and residual passes were decided
+on a model that had not yet acquired its covariates: a covariate effect that
+explains between-subject variability can make an η redundant, and the rerun is
+the chance to notice. Its two extra steps run in their own directories
+(`07-rerun-iivsearch`, `08-rerun-ruvsearch`) so the first pass's journal is
+untouched and the two are comparable side by side.
+
+### What each step is handed
+
+Every search tool of the epic **refuses** a statement that is not its own —
+`modelsearch` on a `COVARIATE`, `covsearch` on an `ABSORPTION`, `iivsearch` on
+an `IOV`. That is deliberate: a file meant for one tool must not be half-run
+by another. It is also exactly what a pipeline driven by one `[space]` runs
+into, since the AMD space is the union of all of them.
+
+So the space is **partitioned** before a step is handed a config:
+
+| step | statements |
+|---|---|
+| `structural` | `ABSORPTION`, `ELIMINATION`, `PERIPHERALS`, `TRANSITS`, `LAGTIME` |
+| `iivsearch` | `IIV`, `COVARIANCE(IIV, ...)` |
+| `residual` | none — the candidates are the residual-error forms |
+| `iovsearch` | `IOV`, `COVARIANCE(IOV, ...)` |
+| `allometry` | `ALLOMETRY` |
+| `covariates` | `COVARIATE` |
+
+`COVARIANCE(*, ...)` names both levels, so it is *narrowed* rather than given
+to one tool or dropped: the IIV step sees `COVARIANCE(IIV, ...)` and the IOV
+step `COVARIANCE(IOV, ...)`. A `LET` travels into every subspace that has a
+statement, so the symbol it defines still resolves. A statement no step runs —
+a PD or metabolite feature, which would belong to `structsearch` — is an error
+naming it, never a narrowed search.
+
+### What `[rank]` means to each step
+
+`[rank]` is narrowed the same way, and for the same reason. `ruvsearch` and
+`covsearch` select by a **likelihood-ratio test** at their own p-values, and
+both refuse a `[rank] type` other than `ofv` and any `[rank] cutoff` rather
+than ignore one — correctly, since a BIC ranking does not describe what they
+do. But `[rank] type = "bic"` is exactly what the steps that *do* rank need,
+and it is Pharmpy's default. So the file's criterion goes to the structural,
+IIV and IOV steps, and the two likelihood-ratio steps are left at their own
+defaults; `[ruvsearch] p_value` and `[covsearch] p_forward` / `p_backward` are
+where their thresholds are set.
+
+### When a step is skipped
+
+A step is skipped, with its reason recorded in `steps.csv` and printed before
+the first fit, when:
+
+* the space says nothing it can read (the residual step is exempt: it needs no
+  space, and the IOV step needs one only to narrow its default);
+* the starting model declares no `iov_column` in `[fit_options]`, so the
+  dataset's occasions were never read and there is nothing for the IOV step to
+  search;
+* `[amd] skip` names it.
+
+A skipped step is never silently dropped and never run on a space invented for
+it. This is a deliberate difference from Pharmpy — see
+[Differences from Pharmpy](#differences-from-pharmpy).
+
+### When a step fails
+
+A step whose tool returns an error is reported as **failed** and the pipeline
+carries on from the model it was handed. On a pipeline whose steps are full
+population fits, throwing away four completed searches to re-report one error
+message is the most expensive way to deliver the least information. The failed
+step's reason is in `steps.csv`, the run's notes name it, and `ferx amd` exits
+`1` so a scripted caller can still tell.
+
+## Seeding between steps
+
+Each step is handed the model the previous step selected, with that step's
+final estimates written into its initial values — `ModelEdit::SeedInits`, with
+the [search layer's variance floor](iivsearch.qmd) applied, so an η that
+collapsed in one step still yields a model the next step can start.
+
+The step then **refits that model as its own input**, which is what makes each
+step's table self-contained: its candidates are ranked against a base fitted
+under its own settings, not against a number carried over from a different
+tool's run.
+
+That refit starts *at* the model's own optimum, which is why the pipeline
+switches one gate off inside every step. `reject_init_stall` (#751) asks
+whether a fit ever left its starting values — a question with no meaning when
+the starting values are the answer — and the tools refuse to search from an
+input that fails the gate. Measured on the example below before this was fixed:
+the residual and covariate steps both came back `failed` with "no free
+parameter moved more than 1% of its initial value", on a model that had just
+converged. So `reject_init_stall` is off inside the steps and the reason is in
+every run's notes. It still applies to the pipeline's own **start fit**, which
+begins at the file's initial estimates and is exactly what #751 is about, and
+every other gate — convergence, covariance, condition number, parameter
+correlation, boundary estimates — applies throughout. The same reasoning
+exempts the [retries pass](#retries), which starts at the optimum by design.
+
+## Retries
+
+Pharmpy's `retries` tool refits a selected model from perturbed initial
+estimates, because a search ranks models on numbers that a stalled (#751) or
+locally-trapped (#864, #891) fit invalidates. ferx has that as `n_starts` in
+core, and the runner already applies `[run] retries` to **every candidate**
+before the strictness gate — so the per-candidate half of Pharmpy's motivation
+is already inside every step.
+
+What is left is the *selected* model. After seeding, its initial estimates are
+its own optimum, so refitting it with `retries + 1` starts explores around that
+optimum rather than re-deriving it. `[amd] retries` says which selected models
+get that pass: `all_final` every step's, `final` only the pipeline's, `skip`
+none. The pass replaces the fit only when it lands at a **lower OFV** — sound
+here where it would not be between two candidates, because it is the same
+model text and therefore the same parameter count — and says so in the notes
+when it does not. With `[run] retries = 0` the pass would be a single start
+from the optimum, so it is not run and the report says why.
+
+## The report
+
+The report is the product. A pipeline that prints only its final model is
+unauditable: the reader cannot tell a step that found a real improvement from
+one whose winner beat its siblings because they stalled, and cannot tell a step
+that was skipped from one that ran and found nothing.
+
+### `steps.csv`
+
+One row per **planned** step, skipped and failed ones included:
+
+`step`, `tool`, `rerun`, `directory`, `status`, `reason`, `criterion`,
+`value_before`, `value_after`, `d_value`, `ofv_before`, `ofv_after`, `d_ofv`,
+`candidates`, `selected`, `seconds`.
+
+`criterion` is the step's own — a structural or variability search ranks on a
+BIC, the residual and covariate searches on the OFV — and `value_before` is
+that criterion evaluated on the model the pipeline handed the step, so the two
+numbers beside each other are comparable.
+
+### `candidates.csv`
+
+One row per **candidate of every step**, which is the table to read when a
+result is surprising:
+
+`step`, `tool`, `id`, `parent`, `description`, `criterion`, `value`,
+`d_value`, `ofv`, `d_ofv`, `rank`, `converged`, `passed`, `failures`, `error`,
+`note`, `seconds`, `selected`.
+
+`failures` is the strictness gate's own words, `error` is why there is no fit
+at all, and `note` carries whatever the step said about the candidate — a
+likelihood-ratio p-value, a CWRES pre-screen decision, an extra start count.
+`d_ofv` is against the candidate's parent **within its own step**; a row whose
+parent is elsewhere is left blank rather than compared against an unrelated
+model.
+
+### What else is written
+
+* `final.ferx` — the model the pipeline ended on, seeded from its own
+  estimates, so it re-reads and refits at the fit beside it.
+* `final-fit.yaml` — its estimates.
+* `NN-<tool>/` — one directory per step, holding the `input.ferx` the step was
+  handed and everything that tool writes on its own (`models.csv` /
+  `steps.csv`, `models/`, the per-step `candidates.csv` the runner journals,
+  and `final.ferx`). A resumed run reuses those journals.
+* The printed summary: the step table, every step's candidates with the reason
+  a failed one was excluded, the notes, and the final model's estimates **with
+  their standard errors**.
+
+## A worked run
+
+`examples/amd_start.ferxsearch` is the file above, run against
+`data/two_cpt_oral_cov.csv` — 30 subjects simulated from
+`examples/two_cpt_oral_covmodel.ferx`: two compartments, oral absorption, an η
+on each of `CL`, `V1`, `Q`, `V2`, `KA`, proportional error, and three
+covariate effects (`CL~WT` power 0.6, `CL~CRCL` power 0.3, `V1~WT` power 0.6).
+The starting model is deliberately the smallest defensible one: **one**
+compartment, no η on `KA`, no covariate relations.
+
+```bash
+ferx amd examples/amd_start.ferxsearch --directory amd-run --threads 8
+```
+
+```
+  #   step         criterion          before        after          d  cand  seconds  selected
+  1   structural   bic_mixed        -147.212     -660.287   -513.075     2      0.1  FO, 1 peripheral
+  2   iivsearch    bic_iiv          -689.984    -1168.447   -478.463    17      1.9  [CL]+[KA]+[Q]+[V]+[V2]
+  3   residual     ofv             -1185.453    -1185.453     +0.000     7     10.6  no residual-error feature added
+  4   iovsearch    -                       -            -          -     -        -  skipped: the starting model declares no `iov_column` in [fit_options], so the dataset's occasions were not read
+  5   allometry    -                       -            -          -     -        -  skipped: the search space has no ALLOMETRY statement
+  6   covariates   ofv             -1185.453    -1196.446    -10.994    54      5.4  CL-CRCL-linear (forward step 1); CL-WT-power (forward step 2)
+```
+
+Step by step against what the data were simulated from:
+
+| step | found | truth |
+|---|---|---|
+| structural | one peripheral compartment | two compartments |
+| IIV | an η on all five PK parameters | the same five |
+| residual | nothing added | proportional, which the start model already had |
+| IOV | skipped — no `iov_column` | no occasions in the dataset |
+| allometry | skipped — no `ALLOMETRY` statement | — |
+| covariates | `CL~CRCL`, `CL~WT` | `CL~WT`, `CL~CRCL`, `V1~WT` |
+
+The final model is at **OFV −1196.45**, against **−1199.02** for the model the
+data were simulated from (`examples/two_cpt_oral_covmodel.ferx`, whose own
+comment records that number): the pipeline recovers the structure, the
+variability and the error model, and two of the three covariate relations, in
+about 20 seconds of fitting.
+
+`V1~WT` — the model spells the central volume `V` — is the one it misses, and
+the report says why rather than leaving it to be guessed. Every forward step's
+candidates are in `candidates.csv`, and at forward step 3, the step that ended
+the search, the best `V–WT` candidate is `V-WT-power` at `dOFV = −0.66`,
+`p = 0.415`: nowhere near the `p_forward = 0.05` this file sets, and weaker
+than at step 1 (`V-WT-linear`, `dOFV = −2.94`, `p = 0.086`) because the two
+`CL` effects that entered ahead of it already absorbed part of the same
+between-subject variation. It is a real effect the data are too small to
+establish, not a bug — and reading that off the table is the difference
+between a search you can act on and a winner you have to trust.
+
+Three configuration choices in that file are worth copying, and each was
+measured rather than assumed:
+
+* **`IIV?(@PK, EXP)`, not a parameter list.** The symbol is resolved against
+  the model the IIV step starts from, so it picks up the `Q` and `V2` the
+  structural step created. A literal `[V,KA]` leaves them without an η and the
+  final model 290 OFV worse.
+* **`[covsearch] algorithm = "scm-forward"`, `p_forward = 0.05`.** At the
+  default `0.01` neither covariate effect enters; with a backward pass at the
+  default `p_backward = 0.001` both are dropped again, since backward
+  elimination keeps only what a removal makes significant at that level. On 30
+  subjects with a 40% CV on `CL`, effects of this size clear 0.05 and not 0.01.
+* **`[rank] type = "bic"` at the top level.** It reaches the structural, IIV
+  and IOV steps; the residual and covariate steps use their own p-values. See
+  [What `[rank]` means to each step](#what-rank-means-to-each-step).
+
+## Differences from Pharmpy
+
+* **No default fill.** Where the space says nothing about a step, Pharmpy
+  substitutes a whole default search space — five structural statements, or
+  two exploratory `COVARIATE?` statements. ferx skips the step and says why. A
+  search the user did not ask for is not a default, and an eight-candidate
+  structural search appearing because a `[space]` was silent is the kind of
+  surprise an overnight run should not contain.
+* **`LET` is resolved later.** Pharmpy substitutes a `LET` when it parses the
+  space; ferx carries the definition into each subspace and resolves it
+  against the model that step actually starts from, so `@IIV` means the η the
+  *parent* has.
+* **`modeltype` is `basic_pk` only.** Pharmpy's `amd` also drives
+  `structsearch` for PKPD, TMDD, drug-metabolite and KPD models. The
+  structural step here is `modelsearch`; a PD or metabolite statement in the
+  space is refused by name.
+* **Retries are already inside every step**, so `[amd] retries` governs the
+  extra pass on the *selected* model rather than the whole retry policy — see
+  [Retries](#retries).
+
+The sequencing and the space split are anchored against Pharmpy 2.2.0's own
+`amd` (`tools/pharmpy-amd-anchor/`, replayed by
+`amd::pharmpy_anchor`): every strategy's order, and the subspace each of
+`modelsearch` and `covsearch` is handed for a corpus of spaces. Both
+divergences above are asserted as differences, so one that quietly disappears
+is a red test just as a new one would be. The *numbers* are anchored where
+they are produced — each tool has its own NONMEM-driven Pharmpy anchor.
+
+## From Rust
+
+```rust
+use ferx_tools::amd::{run_amd, AmdRun};
+use ferx_tools::search::SearchConfig;
+
+let config = SearchConfig::load("amd_start.ferxsearch")?;
+let base = config.load_base()?;
+let result = run_amd(
+    &config,
+    &base,
+    AmdRun {
+        dir: "amd-run".into(),
+        threads: Some(8),
+        cancel: None,
+        progress: None,
+    },
+)?;
+
+for step in result.ran() {
+    println!("{} -> {:?}", step.step.label(), step.selected);
+}
+println!("{} candidates in all", result.rows.len());
+# Ok::<(), String>(())
+```
+
+`AmdResult` carries the input model and its fit, one `StepOutcome` per planned
+step, every `CandidateRow` of every step, and the final model with its fit.
+`plan()` computes the whole pipeline — including which steps will be skipped
+and why — before anything is fitted, which is what `ferx amd` prints up front.

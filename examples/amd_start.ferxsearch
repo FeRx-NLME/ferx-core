@@ -1,0 +1,56 @@
+# The whole pipeline from one file (#1184).
+#
+#   ferx amd examples/amd_start.ferxsearch --threads 8
+#
+# One [space] holds every step's statements; AMD hands each tool the ones its
+# own tool accepts and skips a step the space is silent about, with the reason
+# in steps.csv. The [rank] criterion and the [strictness] gate are inherited by
+# every step, and each tool's own section configures it exactly as it would on
+# its own.
+#
+# `@PK` and `@IIV` are resolved against the model each step actually starts
+# from, not against this file's base — which is what lets `IIV?(@PK, EXP)`
+# reach the Q and V2 the *structural* step will create. Naming [V,KA] here
+# instead costs ~290 OFV on this dataset, because the peripheral parameters
+# then never get an eta.
+#
+# See docs/tools/amd.qmd for the run this file produces.
+
+base = "amd_start.ferx"
+data = "../data/two_cpt_oral_cov.csv"
+
+[space]
+mfl = """
+PERIPHERALS(0..1)
+IIV(CL, EXP); IIV?(@PK, EXP)
+COVARIATE?(@IIV, @CONTINUOUS, [pow,lin])
+"""
+
+[amd]
+strategy = "default"        # or "reevaluation", "SIR", "SRI", "RSI"
+retries  = "all_final"      # or "final", "skip"
+
+[iivsearch]
+algorithm = "top_down_exhaustive"
+
+[ruvsearch]
+max_iter = 2
+
+[covsearch]
+# Forward only, at 0.05. The simulated CL~WT and CL~CRCL effects are real but
+# modest beside a 40% CV on CL, and on 30 subjects they clear 0.05 and not the
+# 0.01 default; a backward pass at the 0.001 default then drops them again,
+# since it keeps only what a removal makes significant at that level.
+algorithm = "scm-forward"
+p_forward = 0.05
+
+[rank]
+type = "bic"
+
+[strictness]
+require_converged  = true
+reject_on_boundary = true
+
+[run]
+threads = 8
+retries = 2

@@ -59,6 +59,7 @@ mod tests {
         let _ = assert_default::<crate::ruvsearch::RuvsearchOptions>();
         let _ = assert_default::<crate::iivsearch::IivsearchOptions>();
         let _ = assert_default::<crate::iovsearch::IovsearchOptions>();
+        let _ = assert_default::<crate::amd::AmdOptions>();
     }
 
     #[test]
@@ -78,6 +79,7 @@ mod tests {
 }
 
 pub mod allometry;
+pub mod amd;
 pub mod bootstrap;
 pub mod covsearch;
 pub mod gam;
