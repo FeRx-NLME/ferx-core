@@ -4435,6 +4435,12 @@ fn covariance_sensitivities(
     let jet_noise = if base_is_ode {
         if let Some(ode) = model.ode_spec.as_ref() {
             ode.effective_solver_opts().reltol
+        } else if !iov {
+            crate::pk::effective_model_for_eval(model, subject, theta, eta)
+                .ode_spec
+                .as_ref()?
+                .effective_solver_opts()
+                .reltol
         } else {
             model
                 .effective_for(subject)

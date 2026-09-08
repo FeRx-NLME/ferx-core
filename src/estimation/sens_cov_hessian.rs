@@ -2425,6 +2425,25 @@ mod tests {
   DV ~ additive(ADD_ERR)
 "#;
 
+    const FLIP_FLOP_TRANSIT_COV: &str = r#"
+[parameters]
+  theta TVCL(2.0, 0.001, 50.0)
+  theta TVV(4.0, 0.1, 500.0)
+  theta TVNTR(3.0, 0.0, 20.0)
+  theta TVMTT(20.0, 0.05, 200.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.01 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  NTR = TVNTR
+  MTT = TVMTT
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
     fn ode_cov_subject(model: &CompiledModel, occasions: usize) -> Subject {
         let times: Vec<_> = (0..occasions)
             .flat_map(|k| [1.0, 3.0, 6.0, 11.0].map(|t| t + 12.0 * k as f64))
@@ -3302,6 +3321,32 @@ mod tests {
             (&h_loose - &h_tight).amax() < 2e-2 * scale,
             "default-tolerance ODE Hessian drifted too far from tight solve: max Δ={}, scale={scale}",
             (&h_loose - &h_tight).amax()
+        );
+    }
+
+    /// A closed-form transit model can select its ODE twin only after evaluating the
+    /// current parameters. The tolerance lookup must use that same effective model;
+    /// `effective_for(subject)` alone does not see this flip-flop reroute.
+    #[test]
+    fn ode_cov_flip_flop_reroute_uses_the_selected_twins_tolerance() {
+        let model = parse_model_string(FLIP_FLOP_TRANSIT_COV).expect("parse transit fixture");
+        let subject = ode_cov_subject(&model, 1);
+        let eta = precise_ebe(&model, &subject, &model.default_params);
+        assert!(
+            crate::pk::effective_model_for_eval(
+                &model,
+                &subject,
+                &model.default_params.theta,
+                &eta,
+            )
+            .ode_spec
+            .is_some(),
+            "fixture must select the ODE twin at the fitted mode"
+        );
+        assert!(
+            subject_sensitivities_cov(&model, &subject, &model.default_params.theta, &eta)
+                .is_some(),
+            "parameter-selected ODE twin must remain in analytic covariance scope"
         );
     }
 
