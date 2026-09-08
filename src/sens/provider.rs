@@ -4354,7 +4354,7 @@ fn covariance_sensitivities(
     // Scope gate. This is **not** redundant with `subject_sensitivities` returning `Some`:
     // that predicate has grown well past the covariance assembly's derivation (LTBS since
     // #665/#673, expression scaling, Form-C readouts, IOV, the event-driven walk). Handing
-    // the Gaussian-only assembly a jet from any of those would not fail — it would return a
+    // the Gaussian-endpoint assembly a jet from any of those would not fail — it would return a
     // plausible, wrong Hessian, i.e. wrong standard errors with no symptom. So the scope is
     // asserted positively here and kept deliberately narrow; everything else keeps the
     // finite-difference covariance, which is correct for all of them.

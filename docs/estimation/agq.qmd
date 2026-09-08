@@ -491,9 +491,9 @@ The analytic route is taken when **all** of the following hold; otherwise the fi
 keeps the finite-difference covariance, subject to its numerical convergence and step-size limits.
 
 - `method = focei` with `n_agq > 1`.
-- The model is inside the analytic covariance scope shared with FOCE/FOCEI — no
-  censored (M3/BLOQ) observations, and a Gaussian endpoint the sensitivity
-  provider reaches. TTE, categorical endpoints, and custom or time-varying residual
+- The model is inside the analytic covariance scope shared with FOCE/FOCEI, with a
+  Gaussian endpoint the sensitivity provider reaches. M3/BLOQ censoring is supported;
+  TTE, categorical endpoints, and custom or time-varying residual
   magnitudes are outside it.
 - Closed-form IOV is supported, including correlated IOV blocks shared across
   occasions. The assembly uses the full joint mode and quadrature grid and ties
@@ -520,6 +520,13 @@ BSV and IOV blocks; AGQ-FOCEI is checked against its reconverged quadrature
 objective. The legacy objective stencil was numerically indefinite at this
 reference point, so it is not used as the SE reference.
 
+For M3, `bloq_m3_analytic_covariance_at_nonmem_minimum` evaluates the analytical
+FOCEI R-matrix at the stored NONMEM 7.5.1 LAPLACE M3 minimum. Fixed-effect SEs
+agree within 0.38%; residual and random-effect variance SEs differ by 5–16%,
+consistent with ferx's documented FOCEI Gauss–Newton versus NONMEM full-Laplace
+curvature difference. The regression allows 1% for fixed effects and 20% for
+variance parameters.
+
 The shared FOCEI covariance machinery is checked against the stored NONMEM 7.5.1
 `MATRIX=R` reference at the same parameter values, using
 `tests/covariance_se_at_nonmem_minimum.rs`. All seven checked standard errors pass
@@ -539,8 +546,10 @@ own quadrature objective:
   supplement.
 - **Production covariance dispatch** — FOCE, FOCEI, and AGQ-FOCEI standard errors are
   compared against the finite-difference covariance. The test also asserts that the
-  analytic dispatcher accepts each fixture, rejects exact-anchor Laplace, and declines
-  a population containing a censored subject.
+  analytic dispatcher accepts each fixture and rejects exact-anchor Laplace.
+- **Censoring combinations** — FOCE and FOCEI M3 Hessians match reconverged analytic-gradient
+  differences, including two-occasion IOV. AGQ-FOCEI M3 matches a reconverged second
+  difference of its quadrature objective, both with and without IOV.
 - **Anchor identity** — the covariance uses the directly assembled objective anchor,
   without recovering it by inverting its inverse. A regression checks exact matrix
   equality and confirms that the old inverse round trip changes the fixture's entries.

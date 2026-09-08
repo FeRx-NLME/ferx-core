@@ -20,9 +20,9 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
-- **Analytic IOV covariance for FOCE, FOCEI, and FOCEI-anchored AGQ** — include all
-  occasion effects and differentiate shared IOV covariance blocks once, including
-  correlated blocks, for supported closed-form Gaussian models (PR #955).
+- **Analytic IOV and M3 covariance for FOCE, FOCEI, and FOCEI-anchored AGQ** — include all
+  occasion effects, differentiate shared IOV covariance blocks once, and carry censored
+  normal-tail curvature using each method's own marginal definition (PR #955).
 - **Analytic covariance (standard errors) for FOCEI-anchored adaptive Gauss-Hermite
   quadrature** — `method = focei` with `n_agq > 1` now derives its R-matrix analytically instead
   of finite-differencing the objective function. The finite-difference stencil it replaces costs
@@ -31,7 +31,7 @@ section of the SDLC for the versioning policy).
   unchanged in meaning — they still describe the quadrature marginal the fit actually minimised,
   not the FOCEI one. `method = laplace` is unaffected and keeps the finite-difference covariance:
   it anchors on the exact conditional Hessian, whose second derivative would need fourth-order
-  sensitivities. Models outside the analytic covariance scope (censored/M3 rows, non-Gaussian
+  sensitivities. Models outside the analytic covariance scope (non-Gaussian
   endpoints) also keep the existing path, and a poorly identified fit falls back rather than
   reporting an ill-conditioned analytic result. The quadrature anchor is taken directly
   from the objective assembly, avoiding an inverse round trip (#251, PR #955).

@@ -909,8 +909,7 @@ fn eta_hat_vec(eta: &[f64]) -> DVector<f64> {
 }
 
 /// Prepare the mode once, retaining the directly assembled anchor used by the objective.
-/// The covariance provider enforces the model scope (including custom sigma magnitudes);
-/// the censored-row check belongs here so both natural and packed assemblies enforce it.
+/// The covariance provider enforces the model scope (including custom sigma magnitudes).
 pub(crate) fn prepare_mode(
     model: &CompiledModel,
     subject: &Subject,
@@ -925,9 +924,6 @@ pub(crate) fn prepare_mode(
     use crate::estimation::sens_outer_gradient::score_core;
     let sens = covariance_sensitivities(model, subject, &params.theta, eta_hat)?;
     let prep = prepare_covariance(model, subject, params, &sens, eta_hat)?;
-    if prep.et.iter().any(|t| t.censored) {
-        return None;
-    }
     let core = score_core(
         model,
         subject,
@@ -946,7 +942,7 @@ pub(crate) fn prepare_mode(
 
 /// The per-subject AGQ covariance Hessian in the optimizer's **packed** space.
 ///
-/// Mirrors `sens_cov_hessian::subject_packed_cov_hessian` — same censored-row scope check, same
+/// Mirrors `sens_cov_hessian::subject_packed_cov_hessian` — same model scope, same
 /// `pack_natural_hessian` chain — but pairs the AGQ Hessian with the **AGQ** natural gradient.
 /// That pairing is the point: the chain's second-order term contracts `∂²(natural)/∂(packed)²`
 /// against the gradient of the objective being differentiated, and FOCEI's differs from AGQ's by
