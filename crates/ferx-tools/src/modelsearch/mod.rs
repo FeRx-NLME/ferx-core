@@ -1,15 +1,25 @@
-//! Structural PK model search — Pharmpy `modelsearch` (#1181).
+//! Structural PK model search — Pharmpy `modelsearch` (#1181, #1257).
 //!
 //! The second search tool of the #1175 epic. Where covsearch (#1180) adds
-//! and removes `[covariate_model]` lines, this one swaps the `pk` template:
-//! absorption route, peripheral compartments, transit compartments and lag
-//! time, each a coordinate of a [`Structure`], each move a
-//! [`ModelEdit::SetStructural`] that also declares the parameters the new
-//! template needs and prunes the ones it no longer reads. Everything else is
-//! the shared machinery: [`ModelText`] for the edit, the runner (through the
-//! `StepFitter` seam) to fit a layer's candidates in parallel with dedup,
-//! journal and strictness, and the `.ferxsearch` file ([`SearchConfig`]) for
-//! the space, the criterion and the gate.
+//! and removes `[covariate_model]` lines, this one swaps the structural
+//! model: absorption route, elimination, peripheral compartments, transit
+//! compartments and lag time, each a coordinate of a [`Structure`], each
+//! move a [`ModelEdit::SetStructural`] that also declares the parameters the
+//! new template needs and prunes the ones it no longer reads.
+//!
+//! Most of the space is an analytic `pk` template swap. `ABSORPTION(ZO)`,
+//! `ABSORPTION(WEIBULL)` and every `ELIMINATION` other than `FO` have no
+//! template at all and are written instead as an `ode_template NAME(...)`
+//! line plus one `[odes]` override of the `central` equation (#1257) — see
+//! [`Structure::engine`]. Those candidates cost an order of magnitude more
+//! per fit, so they also carry their own runtime weight and start budget,
+//! which the runner reads off [`Candidate::cost`] and
+//! [`Candidate::n_starts`].
+//!
+//! Everything else is the shared machinery: [`ModelText`] for the edit, the
+//! runner (through the `StepFitter` seam) to fit a layer's candidates in
+//! parallel with dedup, journal and strictness, and the `.ferxsearch` file
+//! ([`SearchConfig`]) for the space, the criterion and the gate.
 //!
 //! # The algorithms
 //!
@@ -62,16 +72,23 @@
 //! ferx's, and it is there to be read, not chosen.) A candidate that
 //! fails the gate, does not compile or does not fit is in the table with its
 //! reason and no rank. The per-candidate wall-clock time is in the table
-//! too: the analytic templates cost about the same, but the column is what
-//! shows when one does not.
+//! too: the analytic templates cost about the same, and the column is what
+//! shows how much more an `[odes]` candidate did not.
 //!
 //! # Deviations, stated
 //!
-//! * The `ELIMINATION` gap. `ZO`, `MM` and `MIX-FO-MM` have no analytic
-//!   template and are refused by the coverage check, so an elimination
-//!   search is not offered rather than offered as `[odes]` candidates whose
-//!   runtime and multistart needs differ from their siblings by an order of
-//!   magnitude. `docs/tools/modelsearch.qmd` records the decision.
+//! * **The Michaelis-Menten clearance keeps the base model's name.** Pharmpy
+//!   renames `CL` to `CLMM` when it switches to a saturable elimination;
+//!   ferx binds the same parameter under the name the base gave it, which is
+//!   what carries its initial estimate and its η across the move (the edit
+//!   layer has no rename, and a fresh parameter would arrive with neither).
+//!   `MIX-FO-MM` is the one case with two clearances, and there the
+//!   saturable one is a new `CLMM` at half the first-order one, as in
+//!   Pharmpy.
+//! * **`ABSORPTION(SEQ-ZO-FO)` is refused.** It is not one input term on a
+//!   standard disposition but a depot of its own, filled at a constant rate
+//!   and emptied by `ka` — a template family that does not exist rather than
+//!   an override.
 //! * The reduced-stepwise collapse prefers a model that passed the gate:
 //!   Pharmpy takes the lowest OFV among the group's models that have any
 //!   result. ferx takes the lowest OFV among those that passed, and only
