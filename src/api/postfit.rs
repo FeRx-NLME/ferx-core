@@ -1958,13 +1958,17 @@ pub(crate) fn ode_solver_diagnostics_warning(
     } else {
         String::new()
     };
-    let unclean = clamped > 0
+    // Split in two (#1234 review §2). Every counter but `abandoned` describes an integration
+    // that *ran* and came back inaccurate; `abandoned` describes one that never started. The
+    // difference decides both the lead-in verb and whether the solver-knob advice applies, so
+    // the two cannot share one flag.
+    let unclean_integration = clamped > 0
         || rejected > 0
         || rejected_jets > 0
         || fallback_failed > 0
         || unfinished_kept > 0
-        || aborted > 0
-        || abandoned > 0;
+        || aborted > 0;
+    let unclean = unclean_integration || abandoned > 0;
     if !unclean && escalated == 0 {
         return None;
     }
@@ -2102,12 +2106,37 @@ pub(crate) fn ode_solver_diagnostics_warning(
         ));
     }
 
+    // The lead-in has to survive the abandoned-only case: "did not integrate cleanly"
+    // understates a walk that never integrated at all and whose predictions are every one
+    // `NaN`.
+    let lead = if unclean_integration {
+        "did not integrate cleanly"
+    } else {
+        "did not produce a usable integration"
+    };
+    // #1234 review §2: the solver-knob advice is about an integration that ran badly, and
+    // saying it unconditionally contradicted this PR's own `docs/model-file/ode-models.qmd`
+    // ("It is not an `ode_method` problem and no solver setting fixes it") — as the *last*
+    // sentence of the message and the only one naming concrete knobs. So it is attached to
+    // the counters it is true of, and an abandoned walk gets the advice that applies to it.
+    let solver_knob_advice = if unclean_integration {
+        " For the segments that did integrate, consider a different ode_method, a looser \
+         ode_reltol / ode_abstol, or checking the parameter estimates that produce these \
+         dynamics."
+    } else {
+        ""
+    };
+    let abandoned_advice = if abandoned > 0 {
+        " The abandoned walk(s) are not an ode_method or tolerance problem — nothing was \
+         integrated for them, so no solver setting changes the outcome; fix the record or \
+         the parameter that produces the non-finite time."
+    } else {
+        ""
+    };
     let msg = format!(
-        "{ODE_SOLVER_WARNING_TOKEN}: the ODE solver did not integrate cleanly at the final \
-         estimates (ode_method = {method}): {body}. Counters are from the post-fit prediction \
-         pass over all subjects; consider a different ode_method, a looser ode_reltol / \
-         ode_abstol, or checking the parameter estimates that produce these dynamics.\
-         {switched_warn_clause}",
+        "{ODE_SOLVER_WARNING_TOKEN}: the ODE solver {lead} at the final estimates \
+         (ode_method = {method}): {body}. Counters are from the post-fit prediction pass over \
+         all subjects.{solver_knob_advice}{abandoned_advice}{switched_warn_clause}",
         method = options.ode_method.as_str(),
         body = parts.join("; "),
     );

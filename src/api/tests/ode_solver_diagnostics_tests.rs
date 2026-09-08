@@ -999,3 +999,94 @@ fn the_public_solver_stats_surface_reports_an_abandoned_walk() {
         "the control must actually integrate, or it separates nothing: {clean:?}"
     );
 }
+
+/// T10 — the advice must not contradict the clause it follows (#1234 review §2).
+///
+/// The message used to end, unconditionally, with "consider a different ode_method, a looser
+/// ode_reltol / ode_abstol, or checking the parameter estimates that produce these dynamics" —
+/// the last thing the user reads and the only sentence naming concrete knobs. On an abandoned
+/// walk that is wrong, and `docs/model-file/ode-models.qmd` says so in this same change: no
+/// solver setting fixes a timeline that cannot be ordered, because nothing was integrated.
+///
+/// Three arms, because the wording is now a function of *which* counters fired and a
+/// single-arm test cannot see a branch:
+///
+/// * abandoned only → no solver-knob advice, and the lead-in must not claim an integration;
+/// * an ordinary unclean integration → the knob advice, unchanged, and no abandoned advice;
+/// * both → both, since the mixed case has segments the knobs really do apply to.
+///
+/// Mutation (run): make `solver_knob_advice` unconditional again → the first arm fires.
+/// Delete `abandoned_advice` → the first and third arms fire. Make `lead` unconditional →
+/// the first arm's lead-in assert fires.
+#[test]
+fn the_solver_knob_advice_is_attached_only_to_counters_it_applies_to() {
+    const KNOBS: &str = "looser ode_reltol";
+    const NOT_A_SOLVER_SETTING: &str = "not an ode_method or tolerance problem";
+
+    let (abandoned_only, _) = ode_solver_diagnostics_warning(
+        &OdeSolverStats {
+            abandoned_non_finite_timeline: 3,
+            ..Default::default()
+        },
+        &FitOptions::default(),
+    )
+    .expect("an abandoned walk is a warning");
+    assert!(
+        !abandoned_only.contains(KNOBS),
+        "an abandoned walk never reached the solver, so the message must not end by \
+         recommending solver settings — it contradicts the clause above it: {abandoned_only}"
+    );
+    assert!(
+        abandoned_only.contains(NOT_A_SOLVER_SETTING),
+        "…and it must say so, rather than merely omitting the advice: {abandoned_only}"
+    );
+    assert!(
+        !abandoned_only.contains("did not integrate cleanly"),
+        "the lead-in must not describe a walk that never integrated as an unclean \
+         integration: {abandoned_only}"
+    );
+
+    // The control: an ordinary unclean integration keeps the advice it always had.
+    let (integration_only, _) = ode_solver_diagnostics_warning(
+        &OdeSolverStats {
+            attempted_steps: 400,
+            accepted_steps: 380,
+            min_step_clamped_steps: 7,
+            ..Default::default()
+        },
+        &FitOptions::default(),
+    )
+    .expect("a clamped step is a warning");
+    assert!(
+        integration_only.contains(KNOBS),
+        "a segment that did integrate is exactly what the solver knobs are for: \
+         {integration_only}"
+    );
+    assert!(
+        !integration_only.contains(NOT_A_SOLVER_SETTING),
+        "nothing was abandoned here, so the abandoned advice must not appear: \
+         {integration_only}"
+    );
+    assert!(
+        integration_only.contains("did not integrate cleanly"),
+        "the lead-in for a genuinely unclean integration is unchanged: {integration_only}"
+    );
+
+    // Both: the mixed case has segments the knobs apply to *and* walks they do not.
+    let (both, _) = ode_solver_diagnostics_warning(
+        &OdeSolverStats {
+            attempted_steps: 400,
+            accepted_steps: 380,
+            min_step_clamped_steps: 7,
+            abandoned_non_finite_timeline: 1,
+            ..Default::default()
+        },
+        &FitOptions::default(),
+    )
+    .expect("a warning");
+    assert!(
+        both.contains(KNOBS) && both.contains(NOT_A_SOLVER_SETTING),
+        "the mixed case must carry both, and scope the knob advice to the segments that ran: \
+         {both}"
+    );
+}
