@@ -130,6 +130,9 @@ section of the SDLC for the versioning policy).
   to read. No effect on `.ferx` models, the CLI or the R wrapper, none of which constructs it.
 
 ### Fixed
+- Deeply saturated, over-capacity steady-state input-rate models no longer let
+  Anderson acceleration report a huge spurious periodic state when integration
+  error hides the positive per-cycle surplus (#867, PR #955).
 - Quadrature S/RSR covariance rejects unavailable subject scores instead of
   differentiating the optimizer's population EBE penalty. Numerical fallback is
   local to each subject, honors `cov_inner_tol`, and skips zero-weight covariance
