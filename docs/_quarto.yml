@@ -103,6 +103,7 @@ website:
           - estimation/ctmm.qmd
           - estimation/mixture.qmd
       - text: "Tools"
+        href: tools/index.qmd
         contents:
           - tools/bootstrap.qmd
           - tools/gam-screening.qmd

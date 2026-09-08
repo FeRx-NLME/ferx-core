@@ -1,0 +1,50 @@
+---
+pagetitle: "Model-development tools in ferx"
+description-meta: "The ferx-tools workflows that run many fits: bootstrap, GAM covariate screening, and the Pharmpy-style model-space searches (structural, IIV, IOV, residual error, covariates) up to automatic model development."
+---
+
+# Tools
+
+`ferx-core` fits one model to one dataset. Everything that calls `fit()` more
+than once — resampling, screening, searching a model space — lives in
+`ferx-tools` and is exposed as a `ferx <tool>` subcommand. Each tool carries a
+maturity tag; see [Feature Maturity](../maturity.qmd) for what the tags mean.
+
+## Uncertainty
+
+- **[Bootstrap](bootstrap.qmd)** — non-parametric case bootstrap: resample
+  subjects with replacement, refit, and read bias, standard errors and
+  confidence intervals off the spread of the estimates. PsN `bootstrap`
+  feature parity.
+
+## Covariate screening
+
+- **[GAM covariate screening](gam-screening.qmd)** — rank covariate–ETA pairs
+  by ΔAIC on the EBEs before paying for a stepwise search. The ferx
+  equivalent of Xpose4's `xpose.gam()`.
+
+## Model-space searches
+
+All searches read the same [`.ferxsearch` configuration file](search.qmd),
+whose search space is written in Pharmpy's Model Feature Language (MFL).
+
+- **[Search configuration](search.qmd)** — the `.ferxsearch` TOML file, the
+  MFL grammar ferx accepts, and the coverage table of what is and is not
+  supported.
+- **[Covariate search](covsearch.qmd)** — stepwise covariate modelling: PsN
+  `scm` forward / forward-then-backward and Pharmpy `covsearch`, plus
+  allometric scaling.
+- **[Structural model search](modelsearch.qmd)** — Pharmpy `modelsearch` over
+  absorption route, peripheral compartments, transit compartments and lag time.
+- **[Residual-error search](ruvsearch.qmd)** — Pharmpy `ruvsearch` over the
+  `[error_model]` block, tested by likelihood ratio.
+- **[Variability-structure search](iivsearch.qmd)** — Pharmpy `iivsearch`:
+  which parameters carry an η and how the omegas are blocked.
+- **[Inter-occasion variability search](iovsearch.qmd)** — Pharmpy
+  `iovsearch`: which parameters carry an occasion-level κ.
+
+## End to end
+
+- **[Automatic model development](amd.qmd)** — Pharmpy `amd`: the searches
+  above run in order from one `.ferxsearch` file, each seeded from the model
+  the last one selected, reported as one object.
